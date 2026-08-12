@@ -34,6 +34,24 @@ type statusClient struct {
 	TTLRemaining int64  `json:"ttl_remaining_seconds"`
 }
 
+type publicationDrainReport struct {
+	Available               bool    `json:"available"`
+	ID                      string  `json:"drain_id,omitempty"`
+	CheckpointID            string  `json:"checkpoint_id,omitempty"`
+	Phase                   string  `json:"phase,omitempty"`
+	TargetEvents            int64   `json:"target_events,omitempty"`
+	PublishedEvents         int64   `json:"published_events,omitempty"`
+	RemainingEvents         int64   `json:"remaining_events,omitempty"`
+	SemanticRebuildAttempts int64   `json:"semantic_rebuild_attempts,omitempty"`
+	EventFallbackCount      int64   `json:"event_fallback_count,omitempty"`
+	CommitCount             int64   `json:"commit_count,omitempty"`
+	FallbackMode            string  `json:"fallback_mode,omitempty"`
+	LastError               string  `json:"last_error,omitempty"`
+	LastProgressTS          float64 `json:"last_progress_ts,omitempty"`
+	StagedConsent           bool    `json:"staged_consent"`
+	StagedConsumed          bool    `json:"staged_consumed"`
+}
+
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
@@ -87,6 +105,7 @@ type statusReport struct {
 	WorktreeClean                 bool                      `json:"worktree_clean"`
 	AllChangesCommittedInGit      bool                      `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD      bool                      `json:"checkpoint_published_by_acd"`
+	PublicationDrain              publicationDrainReport    `json:"publication_drain"`
 }
 
 func newStatusCmd() *cobra.Command {
@@ -253,6 +272,13 @@ WHERE cp.phase='completed'
 		report.Protected = complete && report.LatestCheckpointID != "" &&
 			report.ObservationEpoch == report.CoveredEpoch &&
 			prepared == 0 && needsAction == 0
+	}
+	if schemaVersion >= 21 {
+		drain, drainErr := readStatusPublicationDrain(ctx, conn)
+		if drainErr != nil {
+			return report, drainErr
+		}
+		report.PublicationDrain = drain
 	}
 
 	// daemon_state singleton.
@@ -448,6 +474,9 @@ WHERE cp.phase='completed'
 		report.UnpublishedCheckpoints == 0 && report.PendingEvents == 0
 	report.Busy = report.Daemon == "running" && !report.Stale &&
 		(report.PendingEvents > 0 || report.SelfPublication.Phase == "active" ||
+			(report.PublicationDrain.ID != "" &&
+				report.PublicationDrain.Phase != state.PublicationDrainCompleted &&
+				report.PublicationDrain.Phase != state.PublicationDrainNeedsAction) ||
 			report.Configuration.Configuration == "validating")
 	report.OperationalState = statusOperationalState(report)
 
@@ -461,8 +490,16 @@ func statusOperationalState(report statusReport) string {
 		return "stopped"
 	case report.Configuration.Configuration == "needs_attention" ||
 		report.Replay.State == "needs_attention" ||
+		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
 		return "needs_attention"
+	case report.PublicationDrain.Phase == state.PublicationDrainEventFallback:
+		return "event_fallback"
+	case report.PublicationDrain.Phase == state.PublicationDrainNormalizing ||
+		report.PublicationDrain.Phase == state.PublicationDrainCheckpointing:
+		return "self_healing"
+	case report.PublicationDrain.Phase == state.PublicationDrainSemantic:
+		return "waiting_for_provider"
 	case report.IntentStrategy.PlannerHealth != nil &&
 		(report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
 			report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
@@ -476,6 +513,36 @@ func statusOperationalState(report statusReport) string {
 	default:
 		return "healthy_idle"
 	}
+}
+
+func readStatusPublicationDrain(
+	ctx context.Context,
+	conn *sql.DB,
+) (publicationDrainReport, error) {
+	report := publicationDrainReport{Available: true}
+	var stagedConsent, stagedConsumed int
+	err := conn.QueryRowContext(ctx, `
+SELECT id,checkpoint_id,phase,target_event_count,published_event_count,
+ semantic_rebuild_attempts,event_fallback_count,commit_count,fallback_mode,
+ last_error,last_progress_ts,staged_consent,staged_consumed
+FROM publication_drains
+ORDER BY CASE WHEN phase NOT IN ('completed','needs_action') THEN 0 ELSE 1 END,
+ updated_ts DESC,id DESC LIMIT 1`).Scan(
+		&report.ID, &report.CheckpointID, &report.Phase,
+		&report.TargetEvents, &report.PublishedEvents,
+		&report.SemanticRebuildAttempts, &report.EventFallbackCount,
+		&report.CommitCount, &report.FallbackMode, &report.LastError,
+		&report.LastProgressTS, &stagedConsent, &stagedConsumed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return report, nil
+	}
+	if err != nil {
+		return report, fmt.Errorf("publication drain: %w", err)
+	}
+	report.RemainingEvents = report.TargetEvents - report.PublishedEvents
+	report.StagedConsent = stagedConsent != 0
+	report.StagedConsumed = stagedConsumed != 0
+	return report, nil
 }
 
 func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval time.Duration) error {
@@ -625,6 +692,7 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	renderReplayObservabilityHuman(out, r.Replay)
 	renderIntentV2Human(out, r.IntentV2)
 	renderSelfPublicationHuman(out, r.SelfPublication, "")
+	renderPublicationDrainHuman(out, r.PublicationDrain)
 	fmt.Fprintf(out, "Operational state: %s", valueOrUnset(r.OperationalState))
 	if r.Busy {
 		fmt.Fprint(out, " (heartbeat fresh; work in progress)")
@@ -740,6 +808,31 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 		fmt.Fprintf(out, "Branch generation: %s\n", r.BranchGenToken)
 	}
 	return nil
+}
+
+func renderPublicationDrainHuman(out io.Writer, drain publicationDrainReport) {
+	if !drain.Available || drain.ID == "" {
+		return
+	}
+	fmt.Fprintf(out,
+		"Publication drain: %s phase=%s remaining=%d/%d commits=%d\n",
+		drain.ID, drain.Phase, drain.RemainingEvents, drain.TargetEvents,
+		drain.CommitCount)
+	if drain.FallbackMode != "" {
+		fmt.Fprintf(out, "  Fallback: %s (count=%d)\n",
+			drain.FallbackMode, drain.EventFallbackCount)
+	}
+	if drain.SemanticRebuildAttempts > 0 {
+		fmt.Fprintf(out, "  Semantic rebuild attempts: %d\n",
+			drain.SemanticRebuildAttempts)
+	}
+	if drain.LastError != "" {
+		fmt.Fprintf(out, "  Latest error: %s\n", drain.LastError)
+	}
+	if drain.StagedConsent {
+		fmt.Fprintf(out, "  Staged content consumed: %s\n",
+			yesNo(drain.StagedConsumed))
+	}
 }
 
 func formatDecisionCounts(counts map[string]int) string {

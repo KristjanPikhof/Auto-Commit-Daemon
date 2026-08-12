@@ -62,8 +62,10 @@ supervisor is unavailable. Mutations never fall back to direct unsupervised
 writes. On macOS, mutating commands first start or reuse the shared per-user
 supervisor. The owner-only socket verifies the peer UID, and the process uses
 the permissions inherited from the application that first started it. A newer
-compatible source build replaces the managed runtime automatically; schema or
-protocol changes still require full `acd setup`.
+compatible source build replaces the managed runtime automatically. State
+migrations marked safe by that runtime are backed up, applied, and checked
+before the upgrade commits. Breaking schema or protocol changes still require
+full `acd setup`.
 
 ## On and off
 
@@ -73,9 +75,14 @@ acd off
 acd off --force
 ~~~
 
-`off` requests a complete checkpoint barrier before disabling. If that barrier
-fails, the repository stays enabled and the command returns `needs_action`.
-`--force` explicitly accepts disabling without confirmed current protection.
+`on` always stops the managed worker for this repository, starts a new one,
+and verifies a checkpoint before it succeeds. It is safe to use after replacing
+the CLI binary or when doctor reports a stopped worker.
+
+`off` requests a complete checkpoint before disabling, then waits for the
+managed worker to stop. If the checkpoint fails, the repository stays enabled
+and the command returns `needs_action`. `--force` accepts disabling without a
+confirmed current checkpoint.
 
 ## History and restore
 
@@ -113,7 +120,10 @@ sequence covered by the barrier, and drains only that bounded target through
 the managed worker. Later edits cannot extend the wait. Event mode may create
 one commit per capture; Intent mode may create several semantically atomic
 commits. The command never combines everything into one commit merely because
-of its name.
+of its name. If the terminal disconnects or the worker restarts, publication
+continues and the next `acd commit-all --yes` reconnects to the same drain.
+Invalid Intent grouping gets one bounded rebuild, followed by safe
+local atomic dependency groups when needed.
 
 ## Doctor and support
 
@@ -125,6 +135,10 @@ acd support repair
 acd support repair --yes
 acd support bundle
 ~~~
+
+`doctor` shows the worker's current state, its latest safe error, and a command
+that addresses that error. Start with `acd on` for a stopped or stale managed
+worker. Use the support commands only when doctor asks for them.
 
 Support repair previews a safely provable interrupted restore and, with
 `--yes`, completes its post-restore checkpoint. It refuses if the working tree

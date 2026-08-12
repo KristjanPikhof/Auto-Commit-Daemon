@@ -127,6 +127,97 @@ func TestControlTruthStateMatrix(t *testing.T) {
 	}
 }
 
+func TestOperationalStatePublicationDrainSelfHealMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		phase string
+		want  string
+	}{
+		{state.PublicationDrainCheckpointing, "self_healing"},
+		{state.PublicationDrainSemantic, "waiting_for_provider"},
+		{state.PublicationDrainNormalizing, "self_healing"},
+		{state.PublicationDrainEventFallback, "event_fallback"},
+		{state.PublicationDrainNeedsAction, "needs_attention"},
+		{state.PublicationDrainCompleted, "healthy_idle"},
+	} {
+		report := statusReport{
+			Daemon: "running", PID: os.Getpid(),
+			PublicationDrain: publicationDrainReport{
+				Available: true, ID: "drain", Phase: tc.phase,
+			},
+		}
+		if got := statusOperationalState(report); got != tc.want {
+			t.Fatalf("phase=%s state=%s want=%s", tc.phase, got, tc.want)
+		}
+	}
+}
+
+func TestPublicationDrainStatusDiagnoseDoctorReadOnlyTruth(t *testing.T) {
+	ctx := context.Background()
+	repo, dbPath, db := makeRepoStateDB(t)
+	seqs := insertCompletedCheckpoint(t, db, "cp-truth-drain",
+		[]checkpointMemberFixture{{State: state.EventStatePending}})
+	drain := state.PublicationDrain{
+		ID: "drain-cp-truth", CheckpointID: "cp-truth-drain",
+		WorktreeID: "0123456789abcdef", BranchRef: "refs/heads/main",
+		BranchGeneration: 7, Phase: state.PublicationDrainEventFallback,
+		TargetEventCount: 1, SemanticRebuildAttempts: 1,
+		EventFallbackCount: 1, FallbackMode: "atomic_dependency_components",
+		LastError: "sanitized planner failure", StagedConsent: true,
+		StagedConsumed: true, CreatedTS: 1, UpdatedTS: 2, LastProgressTS: 2,
+		EventSeqs: seqs,
+	}
+	if created, err := state.PreparePublicationDrain(
+		ctx, db, drain); err != nil || !created {
+		t.Fatalf("prepare drain=(%t,%v)", created, err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO daemon_state(id,pid,mode,heartbeat_ts,updated_ts)
+VALUES(1,?,'running',?,?)
+ON CONFLICT(id) DO UPDATE SET pid=excluded.pid,mode=excluded.mode,
+ heartbeat_ts=excluded.heartbeat_ts,updated_ts=excluded.updated_ts`,
+		os.Getpid(), time.Now().Unix(), time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := central.RepoRecord{
+		Path: repo, StateDB: dbPath, RepoHash: "0123456789abcdef",
+	}
+	status, err := buildStatusReport(ctx, rec, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.OperationalState != "event_fallback" ||
+		status.PublicationDrain.ID != drain.ID ||
+		status.PublicationDrain.RemainingEvents != 1 ||
+		!status.PublicationDrain.StagedConsumed {
+		t.Fatalf("status drain=%+v state=%s",
+			status.PublicationDrain, status.OperationalState)
+	}
+	diagnose := diagnoseReport{}
+	diagnose.OperationalState = status.OperationalState
+	diagnose.PublicationDrain = status.PublicationDrain
+	doctor := doctorRepoReport{}
+	doctor.OperationalState = status.OperationalState
+	doctor.PublicationDrain = status.PublicationDrain
+	if diagnose.PublicationDrain != doctor.PublicationDrain ||
+		diagnose.OperationalState != doctor.OperationalState {
+		t.Fatalf("cross-command diagnose=%+v doctor=%+v", diagnose, doctor)
+	}
+	after, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("read-only status changed DB: before=%s after=%s", before, after)
+	}
+}
+
 func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

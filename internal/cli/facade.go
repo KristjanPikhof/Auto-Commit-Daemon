@@ -73,6 +73,7 @@ func newProductDoctorCmd() *cobra.Command {
 				if err := renderProductEnvelope(cmd.OutOrStdout(), envelopeFromControl(status), false); err != nil {
 					return err
 				}
+				renderProductDoctorWorker(cmd.OutOrStdout(), status)
 				renderProductDoctorSettings(cmd.OutOrStdout(), details)
 			}
 			if envelope.State == productStateNeedsAction {
@@ -84,6 +85,24 @@ func newProductDoctorCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&bundle, "bundle", false, "Write a sanitized support bundle")
 	cmd.Flags().StringVar(&output, "output", "", "Override the support bundle output directory")
 	return cmd
+}
+
+func renderProductDoctorWorker(out io.Writer, status controlResult) {
+	if status.SupervisorWorkerState == "" {
+		return
+	}
+	fmt.Fprintln(out, "\nWorker:")
+	fmt.Fprintf(out, "  State: %s", status.SupervisorWorkerState)
+	if status.SupervisorWorkerRestarts > 0 {
+		fmt.Fprintf(out, " after %d restart attempt(s)", status.SupervisorWorkerRestarts)
+	}
+	fmt.Fprintln(out)
+	if status.SupervisorWorkerError != "" {
+		fmt.Fprintf(out, "  Cause: %s\n", status.SupervisorWorkerError)
+	}
+	if status.NextAction != "" && status.NextAction != "No action needed." {
+		fmt.Fprintf(out, "  Fix: %s\n", status.NextAction)
+	}
 }
 
 func collectProductDoctorSettings(ctx context.Context, repo string) productDoctorSettings {

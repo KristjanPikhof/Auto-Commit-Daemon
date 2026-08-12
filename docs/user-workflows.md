@@ -27,6 +27,9 @@ provenance:
 | Output | Meaning |
 |---|---|
 | `retrying` | Replay hit a recoverable error and will retry automatically. A completed checkpoint remains protected. |
+| `self_healing` | ACD is normalizing or rebuilding the durable publication plan. No command is needed. |
+| `waiting_for_provider` | The frozen publication target is waiting for its bounded semantic attempt. The drain survives restart. |
+| `event_fallback` | Semantic recovery did not progress, so ACD is publishing local atomic dependency groups. |
 | `needs_attention` | A durable publication block needs inspection with `acd doctor`. |
 | `busy` with a fresh heartbeat | The worker is draining pending work or completing another bounded operation. |
 | `All changes committed in Git: yes` | The worktree is clean. This does not claim that ACD created its commits. |
@@ -46,6 +49,28 @@ Retrying planner output, deterministic fallback, and provider cooldown recover
 automatically. No restart or configuration change is required. Do not delete
 state, private refs, ownership locks, or sockets. Provider and verification
 failures do not invalidate completed checkpoints.
+
+For an explicit all-changes drain, run:
+
+~~~bash
+acd commit-all --yes
+~~~
+
+The command freezes one target, waits until it is published, and shows the
+phase, remaining events, commit count, fallback mode, and latest safe error.
+Closing the terminal only detaches the display. The worker keeps publishing,
+and the next `acd commit-all --yes` attaches to the same active drain.
+
+This command is also the staging consent boundary. ACD verifies the full
+private checkpoint before resetting the index to `HEAD`. The worktree does not
+change, and staged, unstaged, and untracked content remains represented by the
+checkpoint and frozen target. Ordinary background publication never consumes
+staged content.
+
+Later edits are protected normally but do not expand or starve the frozen
+target. ACD asks for attention only when safety proof is impossible, such as a
+detached `HEAD`, unresolved conflict, active Git operation, external `HEAD`
+race, missing Git object, or terminal replay barrier.
 
 ## Restore a checkpoint
 
@@ -76,11 +101,16 @@ acd off
 acd on
 ~~~
 
-Off performs a final checkpoint barrier. If protection cannot be confirmed it
-stays enabled; only `acd off --force` accepts that risk. Neither command deletes
-checkpoint history. On starts or upgrades the shared repository worker and
-applies safe exact-chain recovery automatically. If recovery would require
-archive-only `--force`, ACD stops and asks for explicit consent.
+`acd off` takes a final checkpoint, disables the repository, and waits for its
+managed worker to stop. If the checkpoint cannot be confirmed, ACD stays on.
+Use `acd off --force` only when you accept that risk.
+
+`acd on` always replaces the managed worker with a new one and confirms a new
+checkpoint. Use it to enable ACD, restart a stuck worker, or finish a compatible
+upgrade after installing a newer CLI binary. ACD backs up and applies safe
+state migrations during that upgrade. If it cannot prove that an upgrade or
+recovery is safe, it leaves the previous state intact and tells you what to run.
+Neither command deletes checkpoint history.
 
 ## Diagnose locally
 
@@ -91,8 +121,11 @@ acd support logs
 acd support bundle
 ~~~
 
-Normal output contains privacy-safe counts. Support output stays local and
-redacts credentials, provider responses, and raw source content by default.
+Start with `acd doctor`. It shows the worker state, the latest safe startup
+error, and the command that matches the problem. Use `acd support diagnose
+--json` when you need the full local report, and `acd support logs` when doctor
+asks you to inspect startup details. Credentials, provider responses, and raw
+source content are redacted by default.
 
 If status reports a durable publication block, preview and apply exact-chain
 recovery:

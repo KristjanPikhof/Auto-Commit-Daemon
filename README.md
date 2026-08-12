@@ -35,11 +35,12 @@ it and does not require Full Disk Access. After logout or restart, the first
 `acd on` or supported agent hook starts it again. Linux uses the persistent
 user systemd service.
 
-After the compatibility contract is installed, invoking a newer compatible
-ACD build from source upgrades the managed runtime automatically at a safe
-checkpoint boundary. Protocol, registry, or state-schema changes still require
-the full reviewed `acd setup` migration. The first release introducing this
-contract may therefore require one final full setup.
+After the compatibility contract is installed, a newer compatible ACD build
+upgrades the managed runtime at a safe checkpoint boundary. ACD also applies
+state migrations that the new runtime explicitly marks as safe. Breaking
+protocol, registry, or state changes still require the full reviewed
+`acd setup` migration. The first release with this contract may therefore need
+one final full setup.
 
 Preview without writes or supervisor/service actions:
 
@@ -95,8 +96,8 @@ Root help exposes exactly ten commands:
 |---|---|
 | `acd setup` | Install or upgrade transactionally and protect the current repository. |
 | `acd status` | Answer whether changes are enabled, protected, published, and actionable. |
-| `acd on` | Enable checkpoint protection. |
-| `acd off` | Complete a final checkpoint barrier, then disable protection. |
+| `acd on` | Enable protection, replace the managed worker, and verify a new checkpoint. |
+| `acd off` | Complete a final checkpoint, disable protection, and wait for the worker to stop. |
 | `acd list` | Show enabled repositories with protection and publication state. |
 | `acd commit-all` | Checkpoint now and drain the bounded publication target. |
 | `acd history` | List retained checkpoints and their Git publication state. |

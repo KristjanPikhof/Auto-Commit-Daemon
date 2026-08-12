@@ -381,6 +381,11 @@ func importRecoveryCheckpoint(ctx context.Context, wt gitpkg.Worktree, db *state
 	for _, member := range members {
 		eventSeqs = append(eventSeqs, member.EventSeq)
 	}
+	eventSeqs, err = state.UncheckpointedEventSeqs(ctx, db, eventSeqs)
+	if err != nil {
+		return state.Checkpoint{}, fmt.Errorf(
+			"migration: inspect recovery checkpoint ownership: %w", err)
+	}
 	head, _ := gitpkg.RevParse(ctx, wt.Root, "HEAD")
 	refOut, _ := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: wt.Root}, "symbolic-ref", "-q", "HEAD")
 	cp := state.Checkpoint{ID: id, OperationID: "op-" + id, WorktreeID: worktreeID,
@@ -424,6 +429,8 @@ func restoreBackups(plans []RepositoryPlan) error {
 		if plan.FromVersion == 0 || plan.BackupPath == "" {
 			continue
 		}
+		_ = os.Remove(plan.Record.StateDB + "-wal")
+		_ = os.Remove(plan.Record.StateDB + "-shm")
 		if err := replaceFile(plan.BackupPath, plan.Record.StateDB); err != nil {
 			combined = errors.Join(combined, err)
 		}

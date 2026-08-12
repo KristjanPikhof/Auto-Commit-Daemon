@@ -62,17 +62,21 @@ func ensureMutationSupervisorMode(ctx context.Context, roots paths.Roots, backgr
 	}
 	compatibility := runtimeCompatibility()
 	if status.Version != version.String() || status.BinaryDigest != digest {
-		if !status.Compatibility.Equal(compatibility) {
+		if !status.Compatibility.Equal(compatibility) &&
+			!installer.CanUpgradeRuntimeCompatibility(
+				status.Compatibility, compatibility) &&
+			!installer.CanProbeUnadvertisedRuntime(status, version.String()) {
 			return nil, errors.New("running ACD does not advertise the current compatibility contract; run `acd setup` once to complete the compatibility cutover")
 		}
 		if backgroundUpgrade {
 			return func() error { return startCompatibleRuntimeUpgrade(roots, executable) }, nil
 		}
 		_, err := installer.ApplyCompatibleRuntime(ctx, roots, installer.RuntimeUpgradeOptions{
-			SourceExecutable: executable,
-			SourceVersion:    version.String(),
-			Compatibility:    compatibility,
-			Integrations:     "auto",
+			SourceExecutable:  executable,
+			SourceVersion:     version.String(),
+			Compatibility:     compatibility,
+			Integrations:      "auto",
+			AllowUnadvertised: true,
 		})
 		return nil, err
 	}

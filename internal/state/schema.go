@@ -33,8 +33,9 @@ package state
 // canonical merges; v18 adds an immutable, crash-recoverable self-publication
 // journal spanning the Git-applied and SQLite-completed boundary; v19 makes
 // prepare-time publication completion semantics immutable across restart;
-// v20 adds the general operation journal and immutable checkpoint ledger.
-const SchemaVersion = 20
+// v20 adds the general operation journal and immutable checkpoint ledger;
+// v21 adds durable publication drains over immutable checkpoint membership.
+const SchemaVersion = 21
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -714,6 +715,56 @@ CREATE TABLE IF NOT EXISTS checkpoint_publications(
 
 CREATE INDEX IF NOT EXISTS idx_checkpoint_publications_commit
     ON checkpoint_publications(commit_oid, checkpoint_id);
+
+CREATE TABLE IF NOT EXISTS publication_drains(
+    id                  TEXT PRIMARY KEY,
+    checkpoint_id       TEXT NOT NULL UNIQUE,
+    worktree_id         TEXT NOT NULL,
+    branch_ref          TEXT NOT NULL,
+    branch_generation   INTEGER NOT NULL CHECK (branch_generation >= 0),
+    phase               TEXT NOT NULL CHECK (phase IN
+                           ('checkpointing','semantic','normalizing',
+                            'event_fallback','completed','needs_action')),
+    target_event_count  INTEGER NOT NULL CHECK (target_event_count >= 0),
+    published_event_count INTEGER NOT NULL DEFAULT 0
+                          CHECK (published_event_count >= 0),
+    semantic_rebuild_attempts INTEGER NOT NULL DEFAULT 0
+                              CHECK (semantic_rebuild_attempts >= 0),
+    event_fallback_count INTEGER NOT NULL DEFAULT 0
+                         CHECK (event_fallback_count >= 0),
+    commit_count        INTEGER NOT NULL DEFAULT 0 CHECK (commit_count >= 0),
+    fallback_mode       TEXT NOT NULL DEFAULT '',
+    last_error          TEXT NOT NULL DEFAULT '',
+    staged_consent      INTEGER NOT NULL DEFAULT 0 CHECK (staged_consent IN (0,1)),
+    staged_consumed     INTEGER NOT NULL DEFAULT 0 CHECK (staged_consumed IN (0,1)),
+    created_ts          REAL NOT NULL,
+    updated_ts          REAL NOT NULL,
+    last_progress_ts    REAL NOT NULL,
+    completed_ts        REAL,
+    CHECK (published_event_count <= target_event_count),
+    CHECK (length(id) BETWEEN 1 AND 128),
+    CHECK (length(worktree_id) = 16),
+    CHECK (length(branch_ref) BETWEEN 1 AND 1024),
+    CHECK (length(fallback_mode) <= 64),
+    CHECK (length(last_error) <= 2048),
+    FOREIGN KEY (checkpoint_id) REFERENCES checkpoints(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_publication_drains_active
+    ON publication_drains(phase, updated_ts, id);
+
+CREATE TABLE IF NOT EXISTS publication_drain_events(
+    drain_id            TEXT NOT NULL,
+    ord                 INTEGER NOT NULL CHECK (ord >= 0),
+    event_seq           INTEGER NOT NULL CHECK (event_seq > 0),
+    PRIMARY KEY (drain_id, ord),
+    UNIQUE (drain_id, event_seq),
+    FOREIGN KEY (drain_id) REFERENCES publication_drains(id) ON DELETE CASCADE,
+    FOREIGN KEY (event_seq) REFERENCES capture_events(seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_publication_drain_events_event
+    ON publication_drain_events(event_seq, drain_id);
 
 CREATE TRIGGER IF NOT EXISTS checkpoint_publications_track_event
 AFTER UPDATE OF state, commit_oid, published_ts ON capture_events

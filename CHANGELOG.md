@@ -4,6 +4,31 @@
 
 ### Changed
 
+- Added durable self-healing publication drains. Invalid Intent graphs are
+  normalized after candidate-ID stabilization, get one deterministic semantic
+  rebuild, and then use local atomic dependency groups without changing the
+  configured strategy or weakening Git safety checks.
+- `acd commit-all --yes` now verifies a full checkpoint before consuming staged
+  index state, keeps the worktree unchanged, and stays attached to a frozen
+  target until completion or a genuine safety block. Disconnects and daemon
+  restarts no longer cancel publication, and background ACD still never
+  consumes staging.
+- Status, diagnose, and doctor now report durable drain phase, remaining work,
+  semantic attempts, local fallback, last progress, staged consent, and the
+  latest sanitized error. Active self-healing states do not report
+  `needs_attention` unless publication reaches a true safety block.
+- Setup migration now reuses existing immutable checkpoint ownership when a
+  retained recovery snapshot contains an event protected by an earlier setup
+  attempt. Re-running setup no longer fails on duplicate event membership.
+- `acd on` now performs a checkpoint-first managed runtime handoff for forward
+  schema and integration upgrades. A strictly older unadvertised runtime must
+  first pass the checkpoint-barrier probe, so replacement remains automatic
+  without weakening the pre-upgrade protection fence. It always replaces the
+  managed repository worker and verifies the new worker before succeeding.
+- `acd off` now waits for the managed worker to stop. Doctor includes the
+  supervisor's exact worker error and a matching repair command instead of
+  sending users through a repeated `acd on` loop.
+
 - Rebuilt ACD around durable private-ref checkpoints that complete before any
   grouping, provider, verification, or Git publication work.
 - Replaced the public lifecycle model with ten root commands, including the

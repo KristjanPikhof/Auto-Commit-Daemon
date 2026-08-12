@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/globalops"
 	integrationpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/integration"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/migration"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
@@ -31,6 +34,10 @@ type RuntimeUpgradeOptions struct {
 	Compatibility    supervisor.Compatibility
 	Integrations     string
 	Force            bool
+	// AllowUnadvertised permits a strictly older runtime to prove it supports
+	// the checkpoint barrier before any binary replacement. A failed probe
+	// leaves the old runtime and every repository untouched.
+	AllowUnadvertised bool
 }
 
 func RuntimeCompatibility() supervisor.Compatibility {
@@ -40,6 +47,36 @@ func RuntimeCompatibility() supervisor.Compatibility {
 		StateSchemaVersion: state.SchemaVersion,
 		IntegrationVersion: integrationpkg.TemplateVersion,
 	}
+}
+
+// CanUpgradeRuntimeCompatibility permits a checkpoint-first managed-runtime
+// handoff when the wire and registry contracts are unchanged and the source
+// only moves durable schemas or managed integrations forward. The old worker
+// checkpoints with its own schema before replacement; only the new worker may
+// open and migrate repository databases afterward.
+func CanUpgradeRuntimeCompatibility(
+	running supervisor.Compatibility,
+	target supervisor.Compatibility,
+) bool {
+	return running != (supervisor.Compatibility{}) &&
+		target != (supervisor.Compatibility{}) &&
+		running.ProtocolVersion == target.ProtocolVersion &&
+		running.RegistryVersion == target.RegistryVersion &&
+		state.CanRuntimeMigrate(
+			running.StateSchemaVersion, target.StateSchemaVersion) &&
+		running.IntegrationVersion > 0 &&
+		running.IntegrationVersion <= target.IntegrationVersion
+}
+
+func CanProbeUnadvertisedRuntime(
+	status supervisor.Status,
+	sourceVersion string,
+) bool {
+	if status.Compatibility != (supervisor.Compatibility{}) {
+		return false
+	}
+	order, comparable := version.Compare(sourceVersion, status.Version)
+	return comparable && order > 0
 }
 
 func buildCompatibleSetupPlan(
@@ -60,7 +97,9 @@ func buildCompatibleSetupPlan(
 		return Plan{}, false, nil
 	}
 	status, err := runtimeStatus(ctx, roots)
-	if err != nil || !status.Compatibility.Equal(RuntimeCompatibility()) {
+	if err != nil || (!status.Compatibility.Equal(RuntimeCompatibility()) &&
+		!CanUpgradeRuntimeCompatibility(status.Compatibility, RuntimeCompatibility()) &&
+		!CanProbeUnadvertisedRuntime(status, version.String())) {
 		return Plan{}, false, nil
 	}
 	sourceDigest, err := version.FileDigest(executable)
@@ -68,10 +107,11 @@ func buildCompatibleSetupPlan(
 		return Plan{}, false, err
 	}
 	if _, err := shouldUpgradeRuntime(status, sourceDigest, RuntimeUpgradeOptions{
-		SourceExecutable: executable,
-		SourceVersion:    version.String(),
-		Compatibility:    RuntimeCompatibility(),
-		Force:            true,
+		SourceExecutable:  executable,
+		SourceVersion:     version.String(),
+		Compatibility:     RuntimeCompatibility(),
+		Force:             true,
+		AllowUnadvertised: true,
 	}); err != nil {
 		return Plan{}, false, err
 	}
@@ -104,7 +144,9 @@ func buildCompatibleSetupPlan(
 		OwnershipDigest: ownershipDigest, BackupRoot: roots.SetupOperationDir(opID),
 		ServiceCheckSkipped: options.SkipServiceCheck,
 	}
-	runtimeChanged := status.Version != version.String() || status.BinaryDigest != sourceDigest
+	runtimeChanged := status.Version != version.String() ||
+		status.BinaryDigest != sourceDigest ||
+		!status.Compatibility.Equal(RuntimeCompatibility())
 	if !runtimeChanged && !integrationChanged {
 		plan.RequiresExpected = false
 		plan.Actions = []Action{{Kind: "verify_compatible_runtime", Target: plan.ManagedBinary, Detail: "The managed runtime and hooks are already current"}}
@@ -209,13 +251,15 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 	defer journal.Close()
 	steps := []globalops.Step{
 		{Sequence: 1, Kind: "checkpoint", Target: "enabled repositories", Phase: "planned"},
-		{Sequence: 2, Kind: "install_binary", Target: roots.ManagedBinaryPath(), Phase: "planned"},
-		{Sequence: 3, Kind: "merge_integrations", Target: roots.IntegrationsOwnershipPath(), Phase: "planned"},
-		{Sequence: 4, Kind: "restart_supervisor", Target: roots.SupervisorSocketPath(), Phase: "planned"},
+		{Sequence: 2, Kind: "backup_state", Target: "enabled repositories", Phase: "planned"},
+		{Sequence: 3, Kind: "install_binary", Target: roots.ManagedBinaryPath(), Phase: "planned"},
+		{Sequence: 4, Kind: "merge_integrations", Target: roots.IntegrationsOwnershipPath(), Phase: "planned"},
+		{Sequence: 5, Kind: "restart_supervisor", Target: roots.SupervisorSocketPath(), Phase: "planned"},
 	}
 	if err := journal.Prepare(ctx, globalops.Operation{ID: opID, Kind: "runtime_upgrade", Phase: "planned", PlanDigest: planDigest}, steps); err != nil {
 		return false, err
 	}
+	var stateBackups []migration.RepositoryPlan
 	rollback := func(cause error) error {
 		if !locked {
 			rollbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -231,18 +275,19 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		shutdownErr := shutdownSupervisor(shutdownCtx, roots)
 		cancel()
+		stateErr := migration.Rollback(stateBackups)
 		fileErr := restoreFiles(backups)
 		if locked {
 			sessionLock.Release()
 			locked = false
 		}
 		restartErr := supervisor.EnsureSession(context.Background(), roots, roots.ManagedBinaryPath(), roots.SupervisorLogPath())
-		if shutdownErr != nil || fileErr != nil || restartErr != nil {
+		if shutdownErr != nil || stateErr != nil || fileErr != nil || restartErr != nil {
 			_ = journal.Advance(context.Background(), opID, "needs_attention", "compatible runtime rollback incomplete", true)
 		} else {
 			_ = journal.Advance(context.Background(), opID, "rolled_back", cause.Error(), true)
 		}
-		return errors.Join(cause, shutdownErr, fileErr, restartErr)
+		return errors.Join(cause, shutdownErr, stateErr, fileErr, restartErr)
 	}
 
 	if err := checkpointUpgradeRepositories(ctx, roots, registry); err != nil {
@@ -256,6 +301,14 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 		return false, rollback(err)
 	}
 	if err := waitForSupervisorStopped(ctx, roots.SupervisorSocketPath()); err != nil {
+		return false, rollback(err)
+	}
+	stateBackups, err = backupCompatibleRuntimeState(ctx, registry, backupRoot,
+		options.Compatibility.StateSchemaVersion)
+	if err != nil {
+		return false, rollback(err)
+	}
+	if err := journal.Advance(ctx, opID, "state_backed_up", "", false); err != nil {
 		return false, rollback(err)
 	}
 	sourceBody, err := os.ReadFile(options.SourceExecutable)
@@ -293,15 +346,137 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 		}
 		return false, rollback(err)
 	}
+	readyCtx, readyCancel := context.WithTimeout(ctx, time.Minute)
+	err = waitForCompatibleRuntimeWorkers(readyCtx, roots, registry)
+	readyCancel()
+	if err != nil {
+		return false, rollback(err)
+	}
 	if err := journal.Advance(ctx, opID, "committed", "", true); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
+func backupCompatibleRuntimeState(
+	ctx context.Context,
+	registry *central.Registry,
+	backupRoot string,
+	targetVersion int,
+) ([]migration.RepositoryPlan, error) {
+	if targetVersion != state.SchemaVersion {
+		return nil, fmt.Errorf("runtime upgrade: target state schema v%d does not match this binary's v%d",
+			targetVersion, state.SchemaVersion)
+	}
+	records := append([]central.RepoRecord(nil), registry.Repos...)
+	sort.Slice(records, func(i, j int) bool { return records[i].StateDB < records[j].StateDB })
+	seen := make(map[string]bool)
+	plans := make([]migration.RepositoryPlan, 0)
+	for _, record := range records {
+		if record.LifecycleDisabled() || record.StateDB == "" || seen[record.StateDB] {
+			continue
+		}
+		seen[record.StateDB] = true
+		version, err := state.ReadUserVersion(ctx, record.StateDB)
+		if err != nil {
+			return plans, fmt.Errorf("runtime upgrade: inspect state for %s: %w", record.Path, err)
+		}
+		if version == targetVersion {
+			continue
+		}
+		if !state.CanRuntimeMigrate(version, targetVersion) {
+			return plans, fmt.Errorf("runtime upgrade: %s uses state schema v%d; run `acd setup` to upgrade it safely",
+				record.Path, version)
+		}
+		digest := sha256.Sum256([]byte(record.StateDB))
+		backupPath := filepath.Join(backupRoot,
+			"state-"+hex.EncodeToString(digest[:8])+".db")
+		if err := state.BackupDatabase(ctx, record.StateDB, backupPath); err != nil {
+			return plans, fmt.Errorf("runtime upgrade: back up state for %s: %w", record.Path, err)
+		}
+		plans = append(plans, migration.RepositoryPlan{
+			Record: record, FromVersion: version, BackupPath: backupPath,
+		})
+	}
+	return plans, nil
+}
+
+func waitForCompatibleRuntimeWorkers(
+	ctx context.Context,
+	roots paths.Roots,
+	registry *central.Registry,
+) error {
+	pending := make(map[string]central.RepoRecord)
+	for _, record := range registry.Repos {
+		if record.LifecycleDisabled() || record.RepositoryID == "" || record.WorktreeID == "" {
+			continue
+		}
+		pending[record.RepositoryID+"\x00"+record.WorktreeID] = record
+	}
+	var lastErr error
+	for len(pending) > 0 {
+		if status, statusErr := runtimeStatus(ctx, roots); statusErr == nil {
+			for _, worker := range status.Workers {
+				if worker.State != "needs_action" {
+					continue
+				}
+				for _, record := range pending {
+					if record.RepositoryID == worker.RepositoryID {
+						return fmt.Errorf("runtime upgrade: worker for %s could not start: %s",
+							record.Path, worker.LastError)
+					}
+				}
+			}
+		}
+		for key, record := range pending {
+			request := supervisor.Request{
+				Version: supervisor.ProtocolVersion,
+				ID:      "runtime-upgrade-ready-" + record.WorktreeID,
+				Method:  "status", RepositoryID: record.RepositoryID,
+				WorktreeID: record.WorktreeID,
+				DeadlineMS: time.Now().Add(time.Second).UnixMilli(),
+			}
+			response, err := supervisor.DoWorker(ctx,
+				supervisor.WorkerSocketPath(roots, record.RepositoryID),
+				request, time.Second)
+			if err == nil && response.Error == nil && response.OK {
+				delete(pending, key)
+				continue
+			}
+			if err != nil {
+				lastErr = err
+			} else if response.Error != nil {
+				lastErr = errors.New(response.Error.Message)
+			}
+		}
+		if len(pending) == 0 {
+			break
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("runtime upgrade: %d worker(s) did not become ready: %w",
+				len(pending), errors.Join(ctx.Err(), lastErr))
+		case <-timer.C:
+		}
+	}
+	if err := checkpointUpgradeRepositories(ctx, roots, registry); err != nil {
+		return fmt.Errorf("runtime upgrade: verify restarted workers: %w", err)
+	}
+	return nil
+}
+
 func shouldUpgradeRuntime(status supervisor.Status, sourceDigest string, options RuntimeUpgradeOptions) (bool, error) {
-	if !status.Compatibility.Equal(options.Compatibility) {
+	compatibilityUpgrade := !status.Compatibility.Equal(options.Compatibility)
+	if compatibilityUpgrade &&
+		!CanUpgradeRuntimeCompatibility(status.Compatibility, options.Compatibility) &&
+		!(options.AllowUnadvertised &&
+			CanProbeUnadvertisedRuntime(status, options.SourceVersion)) {
 		return false, errors.New("running ACD does not advertise the current compatibility contract; run `acd setup` once to complete the compatibility cutover")
+	}
+	if compatibilityUpgrade {
+		return true, nil
 	}
 	if status.Version == options.SourceVersion {
 		if status.BinaryDigest == sourceDigest {

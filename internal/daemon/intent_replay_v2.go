@@ -145,6 +145,7 @@ func replayIntentCandidateBatch(
 		return sum, err
 	}
 	if evaluation.PlannerFailure != "" {
+		sum.PlannerFailure = evaluation.PlannerFailure
 		nowSec := float64(time.Now().UnixNano()) / 1e9
 		for _, item := range items {
 			if err := state.RecordPlannerError(ctx, db, item.event.Seq, nowSec,

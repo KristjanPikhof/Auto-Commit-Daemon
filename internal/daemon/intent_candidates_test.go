@@ -108,6 +108,34 @@ func (p *invalidIntentCandidatePlannerStub) Name() string {
 	return "intent-v2-invalid-test"
 }
 
+type selfDependentIntentCandidatePlannerStub struct {
+	calls int
+}
+
+func (p *selfDependentIntentCandidatePlannerStub) Name() string {
+	return "intent-v2-self-dependent-test"
+}
+
+func (p *selfDependentIntentCandidatePlannerStub) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	p.calls++
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID:  "candidate-self",
+			SelectedSeqs: []int64{req.OfferedCaptures[0].Seq},
+			Purpose:      "invalid self-dependent candidate",
+			Readiness:    ai.IntentCandidateReady,
+			Subject:      "Update self-dependent candidate",
+			GroupingReason: "exercise bounded structural correction " +
+				"and deterministic fallback",
+			DependsOnCandidates: []string{"candidate-self"},
+		}},
+	}, nil
+}
+
 func (p *invalidIntentCandidatePlannerStub) PlanIntentV2(
 	_ context.Context,
 	req ai.IntentPlanRequestV2,
@@ -437,6 +465,40 @@ func TestIntentCandidateEngineHonorsCorrectionRetryBudget(t *testing.T) {
 	}
 }
 
+func TestIntentCandidateEngineBoundedFallbackAfterOneCorrection(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "internal/a.go", "create", "", "a")
+	planner := &selfDependentIntentCandidatePlannerStub{}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		RetryLimit: 99, RetryLimitSet: true, Preset: config.PresetBalanced,
+		VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 2 || result.RetryCount != 1 ||
+		result.Fallback != "verified_dependency_partition" ||
+		result.PlannerFailure == "" || len(result.Decisions) != 1 ||
+		!result.Decisions[0].Publishable {
+		t.Fatalf("bounded fallback calls=%d result=%+v", planner.calls, result)
+	}
+	candidates, err := state.IntentCandidatesForPair(
+		ctx, db, "refs/heads/main", 1, state.IntentCandidateMaxOpenPerPair)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].ID == "candidate-self" {
+		t.Fatalf("durable candidates=%+v", candidates)
+	}
+}
+
 func TestIntentCandidateEnginePersistsCoalescedMembership(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
@@ -537,6 +599,115 @@ func TestStabilizeIntentCandidatePlanNamespacesRepeatedProviderIDs(t *testing.T)
 		stableIntentCandidateID(
 			"refs/heads/main", 7, []int64{1, 2, 3}); got != want {
 		t.Fatalf("order-sensitive candidate ids got=%q want=%q", got, want)
+	}
+}
+
+func TestIntentNormalizeStabilizedPlanCollapsesSatisfiedPersistedDependency(t *testing.T) {
+	const persistedID = "intent-346340d0cb795eedc5e8b7c8"
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			{
+				CandidateID: "provider-dependent", SelectedSeqs: []int64{86651},
+				Purpose:   "continue the persisted documentation change",
+				Readiness: ai.IntentCandidateReady,
+				Subject:   "Continue documentation history",
+				GroupingReason: "same-path hard dependency continues the " +
+					"persisted candidate",
+				DependsOnCandidates: []string{persistedID, persistedID},
+			},
+		},
+	}
+	stabilized, err := stabilizeIntentCandidatePlan(plan, []state.IntentCandidate{{
+		ID: persistedID, BranchRef: "refs/heads/main", BranchGeneration: 412,
+		Events: []state.IntentCandidateEvent{
+			{EventSeq: 86622, EventRole: "code"},
+			{EventSeq: 86651, EventRole: "code"},
+		},
+	}}, "refs/heads/main", 412)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stabilized.Candidates) != 1 ||
+		stabilized.Candidates[0].CandidateID != persistedID ||
+		len(stabilized.Candidates[0].DependsOnCandidates) != 0 {
+		t.Fatalf("stabilized topology=%+v", stabilized.Candidates)
+	}
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 86651, Path: "docs/history/README.md", Op: "modify",
+		}},
+		Candidates: []ai.IntentCandidateSummary{{
+			CandidateID: persistedID, Status: "active", Ready: true,
+			SelectedSeqs: []int64{86622},
+		}},
+		Dependencies: []ai.IntentCaptureDependency{{
+			FromSeq: 86622, ToSeq: 86651,
+			Strength: ai.IntentDependencyHard, Kind: "same_path_order",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ai.ValidateIntentPlanV2(req, stabilized); err != nil {
+		t.Fatalf("normalized 86622 -> 86651 plan: %v", err)
+	}
+}
+
+func TestIntentNormalizeStabilizedPlanDeduplicatesAndTopologicallyOrders(t *testing.T) {
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			{
+				CandidateID: "dependent", SelectedSeqs: []int64{20},
+				DependsOnCandidates: []string{
+					"prerequisite", "prerequisite", "persisted-external",
+				},
+			},
+			{CandidateID: "independent", SelectedSeqs: []int64{30}},
+			{CandidateID: "prerequisite", SelectedSeqs: []int64{10}},
+		},
+	}
+	stabilized, err := stabilizeIntentCandidatePlan(
+		plan, nil, "refs/heads/main", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []int64{
+		stabilized.Candidates[0].SelectedSeqs[0],
+		stabilized.Candidates[1].SelectedSeqs[0],
+		stabilized.Candidates[2].SelectedSeqs[0],
+	}; !reflect.DeepEqual(got, []int64{10, 20, 30}) {
+		t.Fatalf("stable topological order=%v", got)
+	}
+	dependencies := stabilized.Candidates[1].DependsOnCandidates
+	if len(dependencies) != 2 || dependencies[1] != "persisted-external" {
+		t.Fatalf("normalized dependencies=%v", dependencies)
+	}
+	if dependencies[0] != stabilized.Candidates[0].CandidateID {
+		t.Fatalf("internal dependency=%q prerequisite=%q",
+			dependencies[0], stabilized.Candidates[0].CandidateID)
+	}
+}
+
+func TestIntentNormalizePreservesExplicitSelfDependencyForValidation(t *testing.T) {
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "self", SelectedSeqs: []int64{1},
+			DependsOnCandidates: []string{"self"},
+		}},
+	}
+	stabilized, err := stabilizeIntentCandidatePlan(
+		plan, nil, "refs/heads/main", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stabilized.Candidates[0].DependsOnCandidates) != 1 ||
+		stabilized.Candidates[0].DependsOnCandidates[0] !=
+			stabilized.Candidates[0].CandidateID {
+		t.Fatalf("explicit self dependency was hidden: %+v",
+			stabilized.Candidates[0])
 	}
 }
 
@@ -1402,8 +1573,8 @@ func TestIntentCandidateEngineBalancedFallbackKeepsA1B1A2Atomic(
 		got = append(got, decision.Assignment.SelectedSeqs)
 	}
 	want := [][]int64{
-		{firstB.Event.Seq},
 		{firstA.Event.Seq, secondA.Event.Seq},
+		{firstB.Event.Seq},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("A1,B1,A2 fallback=%v want=%v", got, want)

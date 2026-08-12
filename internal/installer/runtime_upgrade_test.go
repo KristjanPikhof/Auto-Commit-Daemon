@@ -3,7 +3,9 @@ package installer
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -16,13 +18,19 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/migration"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
 )
 
 func TestShouldUpgradeRuntimeUsesCompatibilityAndOrdering(t *testing.T) {
 	compatibility := RuntimeCompatibility()
+	priorSchema := compatibility
+	priorSchema.StateSchemaVersion--
+	futureSchema := compatibility
+	futureSchema.StateSchemaVersion++
 	options := RuntimeUpgradeOptions{SourceVersion: "v2026-08-07-180-gabcdef0", Compatibility: compatibility}
 	tests := []struct {
 		name   string
@@ -34,6 +42,8 @@ func TestShouldUpgradeRuntimeUsesCompatibilityAndOrdering(t *testing.T) {
 		{name: "same build", status: supervisor.Status{Version: options.SourceVersion, BinaryDigest: "source", Compatibility: compatibility}},
 		{name: "same version new bytes", status: supervisor.Status{Version: options.SourceVersion, BinaryDigest: "other", Compatibility: compatibility}, want: true},
 		{name: "newer runtime", status: supervisor.Status{Version: "v2026-08-07-181-g1234567", BinaryDigest: "new", Compatibility: compatibility}},
+		{name: "additive schema upgrade", status: supervisor.Status{Version: options.SourceVersion, BinaryDigest: "source", Compatibility: priorSchema}, want: true},
+		{name: "schema downgrade", status: supervisor.Status{Version: "v2026-08-07-181-g1234567", BinaryDigest: "new", Compatibility: futureSchema}, err: "run `acd setup` once"},
 		{name: "legacy runtime", status: supervisor.Status{Version: "v2026-08-07-179-g1234567"}, err: "run `acd setup` once"},
 	}
 	for _, test := range tests {
@@ -43,6 +53,13 @@ func TestShouldUpgradeRuntimeUsesCompatibilityAndOrdering(t *testing.T) {
 				t.Fatalf("shouldUpgradeRuntime=(%v,%v), want (%v,%q)", got, err, test.want, test.err)
 			}
 		})
+	}
+	legacy := supervisor.Status{Version: "v2026-08-07-179-g1234567"}
+	legacyOptions := options
+	legacyOptions.AllowUnadvertised = true
+	if upgrade, err := shouldUpgradeRuntime(
+		legacy, "source", legacyOptions); err != nil || !upgrade {
+		t.Fatalf("probed legacy upgrade=(%t,%v), want true,nil", upgrade, err)
 	}
 }
 
@@ -166,6 +183,72 @@ func TestCheckpointUpgradeRepositoriesDoesNotDrainPublication(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
+	}
+}
+
+func TestBackupCompatibleRuntimeStateCoversEnabledSafeMigrations(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "repo", "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `PRAGMA user_version = 20`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+DROP TABLE publication_drain_events;
+DROP TABLE publication_drains;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{{
+		Path: "/repo", StateDB: dbPath, RepositoryID: "0123456789abcdef",
+		WorktreeID: "fedcba9876543210",
+	}}
+	plans, err := backupCompatibleRuntimeState(ctx, registry,
+		filepath.Join(root, "backups"), state.SchemaVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 1 || plans[0].FromVersion != 20 {
+		t.Fatalf("plans=%+v, want one v20 backup", plans)
+	}
+	if version, err := state.ReadUserVersion(ctx, plans[0].BackupPath); err != nil || version != 20 {
+		t.Fatalf("backup version=(%d,%v), want 20", version, err)
+	}
+	migrated, err := state.OpenRuntime(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migratedTable string
+	if err := migrated.ReadSQL().QueryRowContext(ctx, `
+SELECT name FROM sqlite_master WHERE type='table' AND name='publication_drains'`).
+		Scan(&migratedTable); err != nil || migratedTable != "publication_drains" {
+		t.Fatalf("migrated table=(%q,%v)", migratedTable, err)
+	}
+	if err := migrated.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := migration.Rollback(plans); err != nil {
+		t.Fatal(err)
+	}
+	if version, err := state.ReadUserVersion(ctx, dbPath); err != nil || version != 20 {
+		t.Fatalf("rolled back version=(%d,%v), want 20", version, err)
+	}
+	rolledBack, err := state.OpenReadOnly(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rolledBack.Close()
+	if err := rolledBack.ReadSQL().QueryRowContext(ctx, `
+SELECT name FROM sqlite_master WHERE type='table' AND name='publication_drains'`).
+		Scan(&migratedTable); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("rollback retained v21 table: err=%v", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -267,6 +268,45 @@ func TestLoadDaemonStateReadOnlyMissingDatabase(t *testing.T) {
 	}
 	if ok || got.Mode != "stopped" {
 		t.Fatalf("missing database = (%+v, %v), want stopped and false", got, ok)
+	}
+}
+
+func TestOpenRuntimeAppliesOnlyDeclaredSafeMigration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, dbPath := openTestDB(t)
+	if _, err := db.SQL().ExecContext(ctx, `PRAGMA user_version = 20`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := OpenRuntime(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenRuntime safe migration: %v", err)
+	}
+	version, err := migrated.UserVersion(ctx)
+	if err != nil || version != SchemaVersion {
+		t.Fatalf("migrated version=(%d,%v), want %d", version, err, SchemaVersion)
+	}
+	if err := migrated.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `PRAGMA user_version = 19`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenRuntime(ctx, dbPath); !errors.Is(err, ErrSetupRequired) {
+		t.Fatalf("OpenRuntime unsafe migration error=%v, want ErrSetupRequired", err)
 	}
 }
 

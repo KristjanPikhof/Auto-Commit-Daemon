@@ -141,6 +141,99 @@ func TestRepositoryMaintenanceLeaseRequiresOwnerTokenAndExpires(t *testing.T) {
 	}
 }
 
+func TestRestartRepositoryReplacesManagedWorker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX process signals")
+	}
+	root := t.TempDir()
+	roots := paths.Roots{
+		State: filepath.Join(root, "state", "acd"), Share: filepath.Join(root, "share", "acd"),
+		Config: filepath.Join(root, "config", "acd"),
+	}
+	const repositoryID = "0123456789abcdef"
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{{
+		Path: "/repo", StateDB: "/repo/state.db", RepositoryID: repositoryID,
+		WorktreeID: "fedcba9876543210",
+	}}
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sleep", "60")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{Roots: roots, BinaryPath: "/does/not/exist", workers: map[string]*workerProcess{
+		repositoryID: {id: repositoryID, cmd: command, signature: "registered", desired: "registered"},
+	}}
+	go reapTestWorker(server, repositoryID, command)
+	t.Cleanup(func() { _ = command.Process.Kill() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, protocolErr := server.restartRepository(ctx, repositoryID); protocolErr != nil {
+		t.Fatalf("restart repository: %+v", protocolErr)
+	}
+	if err := syscall.Kill(command.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("old worker pid %d survived restart: %v", command.Process.Pid, err)
+	}
+	server.mu.Lock()
+	worker := server.workers[repositoryID]
+	_, held := server.maintenance[repositoryID]
+	server.mu.Unlock()
+	if held || worker == nil || worker.restarts == 0 {
+		t.Fatalf("restart held=%v worker=%+v", held, worker)
+	}
+}
+
+func TestStopRepositoryWaitsForDisabledWorker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX process signals")
+	}
+	root := t.TempDir()
+	roots := paths.Roots{
+		State: filepath.Join(root, "state", "acd"), Share: filepath.Join(root, "share", "acd"),
+		Config: filepath.Join(root, "config", "acd"),
+	}
+	const repositoryID = "0123456789abcdef"
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{{
+		Path: "/repo", StateDB: "/repo/state.db", RepositoryID: repositoryID,
+		WorktreeID: "fedcba9876543210", LifecycleState: central.RepoLifecycleDisabled,
+	}}
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sleep", "60")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{Roots: roots, BinaryPath: "/does/not/exist", workers: map[string]*workerProcess{
+		repositoryID: {id: repositoryID, cmd: command, signature: "registered", desired: "registered"},
+	}}
+	go reapTestWorker(server, repositoryID, command)
+	t.Cleanup(func() { _ = command.Process.Kill() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, protocolErr := server.stopRepository(ctx, repositoryID); protocolErr != nil {
+		t.Fatalf("stop repository: %+v", protocolErr)
+	}
+	if err := syscall.Kill(command.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("worker pid %d survived stop: %v", command.Process.Pid, err)
+	}
+}
+
+func reapTestWorker(server *Server, repositoryID string, command *exec.Cmd) {
+	_ = command.Wait()
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if current := server.workers[repositoryID]; current != nil && current.cmd == command {
+		current.cmd = nil
+		current.intentional = false
+	}
+}
+
 func TestEnsureSessionLeavesNonDarwinServiceLifecycleUnchanged(t *testing.T) {
 	if runtime.GOOS == "darwin" {
 		t.Skip("non-macOS compatibility contract")

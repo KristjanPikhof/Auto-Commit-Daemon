@@ -40,6 +40,96 @@ func TestScanProtectedEntriesForMigrationRetriesTransientIncompleteScan(t *testi
 	}
 }
 
+func TestImportRecoveryCheckpointReusesExistingEventOwnership(t *testing.T) {
+	ctx := context.Background()
+	repo, wt := migrationRepo(t, ctx)
+	db, err := state.Open(ctx, state.DBPathFromGitDir(wt.GitDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tree, err := gitpkg.WriteTreeDurable(
+		ctx, repo, filepath.Join(t.TempDir(), "initial.index"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := gitpkg.CommitTreeDurable(ctx, repo, tree, "initial\n",
+		checkpoint.IdentityName, checkpoint.IdentityEmail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gitpkg.UpdateRef(ctx, repo, "refs/heads/main", head, ""); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.SQL().ExecContext(ctx, `
+INSERT INTO capture_events(
+ branch_ref,branch_generation,base_head,operation,path,fidelity,captured_ts,state
+) VALUES('refs/heads/main',7,?,'modify','owned.txt','exact',1,'recovered')`, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	existing := state.Checkpoint{
+		ID:           "cp-1786489000000-0123456789abcdef",
+		OperationID:  "op-cp-1786489000000-0123456789abcdef",
+		WorktreeID:   central.CanonicalID(wt.Root),
+		Reason:       state.CheckpointReasonMigrationRecovery,
+		ObservedHead: head, ObservedRef: "refs/heads/main",
+		TreeOID: tree, CommitOID: head,
+		Ref: "refs/acd/checkpoints/v1/" + central.CanonicalID(wt.Root) +
+			"/cp-1786489000000-0123456789abcdef",
+		CreatedTS: 1, EventSeqs: []int64{seq},
+	}
+	if created, err := state.PrepareCheckpoint(ctx, db, existing, digest); err != nil || !created {
+		t.Fatalf("prepare existing checkpoint=(%t,%v)", created, err)
+	}
+	if err := state.CompleteCheckpoint(
+		ctx, db, existing.ID, existing.Ref, existing.CommitOID, 2); err != nil {
+		t.Fatal(err)
+	}
+	snapshotResult, err := db.SQL().ExecContext(ctx, `
+INSERT INTO recovery_snapshots(
+ created_ts,outcome,branch_ref,branch_generation,first_event_seq,last_event_seq,
+ event_count,commit_oid,recovery_ref,reason
+) VALUES(3,'recovered','refs/heads/main',7,?,?,1,?,'refs/acd/recovery/already-owned','test')`,
+		seq, seq, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotID, err := snapshotResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO recovery_snapshot_events(snapshot_id,ord,event_seq) VALUES(?,0,?)`,
+		snapshotID, seq); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := importRecoveryCheckpoint(ctx, wt, db,
+		central.CanonicalID(wt.Root), daemon.RecoveryChainResult{
+			Handled: true, Outcome: state.EventStateRecovered,
+			SnapshotID: snapshotID, CommitOID: head,
+			RecoveryRef: "refs/acd/recovery/already-owned",
+			FirstSeq:    seq, LastSeq: seq, EventCount: 1,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imported.EventSeqs) != 0 {
+		t.Fatalf("imported duplicate memberships=%v", imported.EventSeqs)
+	}
+	var owner string
+	if err := db.ReadSQL().QueryRowContext(ctx,
+		`SELECT checkpoint_id FROM checkpoint_events WHERE event_seq=?`, seq).
+		Scan(&owner); err != nil || owner != existing.ID {
+		t.Fatalf("event owner=(%q,%v) want %q", owner, err, existing.ID)
+	}
+}
+
 func TestApplyAllProgressAndErrorIdentifyRepository(t *testing.T) {
 	ctx := context.Background()
 	repo, wt := migrationRepo(t, ctx)

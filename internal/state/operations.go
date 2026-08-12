@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -303,4 +304,56 @@ ORDER BY e.seq`, capturedAfter)
 		result = append(result, seq)
 	}
 	return result, rows.Err()
+}
+
+// UncheckpointedEventSeqs returns the requested event sequences that do not
+// already belong to an immutable checkpoint, preserving caller order. This is
+// used by restartable migrations that may encounter recovery snapshots whose
+// events were protected by an earlier setup attempt.
+func UncheckpointedEventSeqs(
+	ctx context.Context,
+	db *DB,
+	eventSeqs []int64,
+) ([]int64, error) {
+	if db == nil {
+		return nil, errors.New("state: uncheckpointed events require state")
+	}
+	owned := make(map[int64]struct{})
+	const batchSize = 500
+	for start := 0; start < len(eventSeqs); start += batchSize {
+		end := min(start+batchSize, len(eventSeqs))
+		placeholders := make([]string, 0, end-start)
+		args := make([]any, 0, end-start)
+		for _, seq := range eventSeqs[start:end] {
+			if seq <= 0 {
+				return nil, errors.New("state: invalid checkpoint event sequence")
+			}
+			placeholders = append(placeholders, "?")
+			args = append(args, seq)
+		}
+		rows, err := db.readSQL().QueryContext(ctx, `
+SELECT event_seq FROM checkpoint_events
+WHERE event_seq IN (`+strings.Join(placeholders, ",")+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("state: inspect checkpoint ownership: %w", err)
+		}
+		for rows.Next() {
+			var seq int64
+			if err := rows.Scan(&seq); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			owned[seq] = struct{}{}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	result := make([]int64, 0, len(eventSeqs))
+	for _, seq := range eventSeqs {
+		if _, exists := owned[seq]; !exists {
+			result = append(result, seq)
+		}
+	}
+	return result, nil
 }

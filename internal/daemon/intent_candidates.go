@@ -117,6 +117,20 @@ type IntentCandidateEvaluationResult struct {
 	VisibleCandidateIDs []string
 }
 
+// IntentSemanticFallbackRequiredError means the bounded semantic path was
+// exhausted without producing a valid candidate graph. A durable publication
+// drain may respond by switching only its frozen target to event fallback.
+type IntentSemanticFallbackRequiredError struct {
+	Failure string
+}
+
+func (e *IntentSemanticFallbackRequiredError) Error() string {
+	if e == nil || e.Failure == "" {
+		return "daemon: intent candidates: semantic fallback required"
+	}
+	return "daemon: intent candidates: semantic fallback required: " + e.Failure
+}
+
 const (
 	intentBalancedFallbackCaptureCap = 32
 	intentBalancedFallbackPathCap    = 12
@@ -262,6 +276,40 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	validationRequest := intentCandidateContinuationValidationRequest(
+		req, continuations)
+	if validationErr := ai.ValidateIntentPlanV2(validationRequest, plan); validationErr != nil {
+		if input.Preset == config.PresetQuality {
+			return result, validationErr
+		}
+		semanticFailure := ai.SanitizePlannerError(validationErr.Error())
+		if result.PlannerFailure == "" {
+			result.PlannerFailure = semanticFailure
+		} else {
+			result.PlannerFailure = ai.SanitizePlannerError(
+				result.PlannerFailure + "; normalized plan: " + semanticFailure)
+		}
+		plan = deterministicIntentCandidatePlan(req, false, false)
+		continuations, _, err = continuePersistedIntentCandidates(
+			req, &plan, intentCandidateContinuationOptions{
+				RewriteDeterministicMessage: true,
+			})
+		if err == nil {
+			plan, err = stabilizeIntentCandidatePlan(plan, existing,
+				input.BranchRef, input.BranchGeneration)
+		}
+		if err == nil {
+			validationRequest = intentCandidateContinuationValidationRequest(
+				req, continuations)
+			err = ai.ValidateIntentPlanV2(validationRequest, plan)
+		}
+		if err != nil {
+			return result, &IntentSemanticFallbackRequiredError{
+				Failure: ai.SanitizePlannerError(err.Error()),
+			}
+		}
+		result.Fallback = "deterministic_semantic_rebuild"
+	}
 
 	existingByID := make(map[string]state.IntentCandidate, len(existing))
 	for _, candidate := range existing {
@@ -285,7 +333,7 @@ func EvaluateIntentCandidates(
 			result.NeedsAttention = true
 		}
 	}
-	validationRequest := intentCandidateContinuationValidationRequest(
+	validationRequest = intentCandidateContinuationValidationRequest(
 		req, continuations)
 	if err := ai.ValidateIntentPlanV2(validationRequest, plan); err != nil {
 		return result, err
@@ -2315,6 +2363,7 @@ func stabilizeIntentCandidatePlan(
 	branchRef string,
 	generation int64,
 ) (ai.IntentPlanV2, error) {
+	originalIDs := make([]string, len(plan.Candidates))
 	overlapCounts := make(map[string]int)
 	overlapCandidate := make([]string, len(plan.Candidates))
 	for i, assignment := range plan.Candidates {
@@ -2352,6 +2401,7 @@ func stabilizeIntentCandidatePlan(
 	}
 	for i := range plan.Candidates {
 		oldID := plan.Candidates[i].CandidateID
+		originalIDs[i] = oldID
 		newID := ""
 		if _, explicitlyContinued := existingIDs[oldID]; explicitlyContinued {
 			newID = oldID
@@ -2372,13 +2422,103 @@ func stabilizeIntentCandidatePlan(
 		plan.Candidates[i].CandidateID = newID
 	}
 	for i := range plan.Candidates {
-		for j, dependencyID := range plan.Candidates[i].DependsOnCandidates {
+		dependencies := make([]string, 0,
+			len(plan.Candidates[i].DependsOnCandidates))
+		seen := make(map[string]struct{},
+			len(plan.Candidates[i].DependsOnCandidates))
+		for _, dependencyID := range plan.Candidates[i].DependsOnCandidates {
+			originalDependencyID := dependencyID
 			if replacement := remap[dependencyID]; replacement != "" {
-				plan.Candidates[i].DependsOnCandidates[j] = replacement
+				dependencyID = replacement
 			}
+			// Distinct provider candidates can stabilize to one persisted
+			// candidate. Their former dependency then becomes satisfied by
+			// that continuation and must not turn into a self edge. Preserve
+			// an explicit provider self edge so validation still rejects it.
+			if dependencyID == plan.Candidates[i].CandidateID &&
+				originalDependencyID != originalIDs[i] {
+				continue
+			}
+			if _, duplicate := seen[dependencyID]; duplicate {
+				continue
+			}
+			seen[dependencyID] = struct{}{}
+			dependencies = append(dependencies, dependencyID)
+		}
+		plan.Candidates[i].DependsOnCandidates = dependencies
+	}
+	plan.Candidates = stableTopologicalIntentCandidates(plan.Candidates)
+	return plan, nil
+}
+
+// stableTopologicalIntentCandidates puts every in-plan prerequisite before its
+// dependents. External persisted prerequisites do not participate in ordering.
+// Cycles remain in their original order so the complete validator reports the
+// structural error instead of normalization hiding it.
+func stableTopologicalIntentCandidates(
+	candidates []ai.IntentCandidateAssignment,
+) []ai.IntentCandidateAssignment {
+	indexByID := make(map[string]int, len(candidates))
+	for i := range candidates {
+		indexByID[candidates[i].CandidateID] = i
+	}
+	indegree := make([]int, len(candidates))
+	dependents := make([][]int, len(candidates))
+	for i, candidate := range candidates {
+		for _, dependencyID := range candidate.DependsOnCandidates {
+			dependencyIndex, ok := indexByID[dependencyID]
+			if !ok {
+				continue
+			}
+			indegree[i]++
+			dependents[dependencyIndex] = append(
+				dependents[dependencyIndex], i)
 		}
 	}
-	return plan, nil
+	less := func(left, right int) bool {
+		leftSeq, rightSeq := int64(0), int64(0)
+		for _, seq := range candidates[left].SelectedSeqs {
+			if leftSeq == 0 || seq < leftSeq {
+				leftSeq = seq
+			}
+		}
+		for _, seq := range candidates[right].SelectedSeqs {
+			if rightSeq == 0 || seq < rightSeq {
+				rightSeq = seq
+			}
+		}
+		if leftSeq != rightSeq {
+			return leftSeq < rightSeq
+		}
+		if candidates[left].CandidateID != candidates[right].CandidateID {
+			return candidates[left].CandidateID < candidates[right].CandidateID
+		}
+		return left < right
+	}
+	ready := make([]int, 0, len(candidates))
+	for i := range candidates {
+		if indegree[i] == 0 {
+			ready = append(ready, i)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool { return less(ready[i], ready[j]) })
+	ordered := make([]ai.IntentCandidateAssignment, 0, len(candidates))
+	for len(ready) > 0 {
+		current := ready[0]
+		ready = ready[1:]
+		ordered = append(ordered, candidates[current])
+		for _, dependent := range dependents[current] {
+			indegree[dependent]--
+			if indegree[dependent] == 0 {
+				ready = append(ready, dependent)
+			}
+		}
+		sort.Slice(ready, func(i, j int) bool { return less(ready[i], ready[j]) })
+	}
+	if len(ordered) != len(candidates) {
+		return candidates
+	}
+	return ordered
 }
 
 func stableIntentCandidateID(

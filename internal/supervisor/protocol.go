@@ -40,8 +40,10 @@ type ProtocolError struct {
 var validMethods = map[string]struct{}{
 	"status": {}, "enable_repository": {}, "disable_repository": {},
 	"checkpoint_barrier": {}, "hint": {}, "history": {},
+	"publication_drain_start": {}, "publication_drain_status": {},
 	"restore_plan": {}, "restore_apply": {}, "repair": {}, "shutdown": {},
 	"maintenance_begin": {}, "maintenance_renew": {}, "maintenance_end": {},
+	"restart_repository": {}, "stop_repository": {},
 	"worker_environment": {},
 }
 

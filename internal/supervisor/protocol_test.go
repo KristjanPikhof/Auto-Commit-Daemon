@@ -19,7 +19,7 @@ import (
 )
 
 func TestRequestValidationCoversRequiredMethods(t *testing.T) {
-	methods := []string{"status", "enable_repository", "disable_repository", "checkpoint_barrier", "hint", "history", "restore_plan", "restore_apply", "repair", "shutdown", "maintenance_begin", "maintenance_renew", "maintenance_end", "worker_environment"}
+	methods := []string{"status", "enable_repository", "disable_repository", "checkpoint_barrier", "publication_drain_start", "publication_drain_status", "hint", "history", "restore_plan", "restore_apply", "repair", "shutdown", "maintenance_begin", "maintenance_renew", "maintenance_end", "restart_repository", "stop_repository", "worker_environment"}
 	for _, method := range methods {
 		request := Request{Version: ProtocolVersion, ID: "request", Method: method}
 		if err := request.Validate(); err != nil {

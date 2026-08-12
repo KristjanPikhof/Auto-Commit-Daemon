@@ -52,9 +52,18 @@ ordering, or another structural defect.
 
 An eligible metadata error can receive one remote correction. The effective
 correction maximum is one even if an older saved setting contains a larger
-value. Fast and Balanced move directly to their validated deterministic
-fallback when local repair does not apply or the correction fails. ACD handles
-this automatically and needs no additional setup.
+value. After stable candidate IDs are assigned, ACD removes dependencies that
+became self-references only because a persisted candidate was continued,
+deduplicates the remaining edges, and puts candidates in dependency order. It
+then runs the complete validator again.
+
+If the corrected plan is still invalid, Fast and Balanced build one
+deterministic plan from the complete hard-dependency closure. Duplicate active
+candidates merge into one lineage-preserving survivor. If that plan cannot
+move the frozen target, the durable drain switches to a local atomic fallback.
+That fallback keeps every hard dependency component in one commit and still
+uses the normal scratch index, verification, exact-ref CAS, and publication
+journal. It does not change the repository's configured strategy.
 
 ACD uses `needs_attention` only when it cannot prove a safe preset outcome.
 Examples include unresolved dependency ambiguity, failed materialization or
@@ -62,6 +71,10 @@ verification, a revertibility failure, or uncertain branch ownership and
 exact-ref state. Quality also waits rather than weakening its acceptance
 rules. Provider and grouping failures that have a safe fallback remain
 retrying or waiting without changing completed checkpoints.
+
+Each explicit publication drain has a bounded semantic path. Invalid planner
+output cannot start a hot retry loop. The drain survives terminal disconnects,
+worker replacement, and daemon restart, and resumes from its durable phase.
 
 ## Publication safety
 

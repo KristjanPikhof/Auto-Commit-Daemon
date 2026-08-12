@@ -2549,12 +2549,17 @@ func Run(ctx context.Context, opts Options) error {
 			// folded into hadWork below so the scheduler resets to the base
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
+			activeDrain, drainErr := ActivePublicationDrainForPair(
+				passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
 			setupValidation, validationPending, validationErr :=
 				state.DesiredConfigValidation(ctx, opts.DB)
-			if validationErr != nil {
+			if drainErr != nil {
+				repErr = drainErr
+			} else if validationErr != nil {
 				repErr = validationErr
 			} else if validationPending &&
-				setupValidation.Status != state.ConfigValidationPassed {
+				setupValidation.Status != state.ConfigValidationPassed &&
+				activeDrain == nil {
 				repSum = ReplaySummary{
 					Skipped: true,
 					SkippedReason: "configuration_validation_" +
@@ -2566,7 +2571,7 @@ func Run(ctx context.Context, opts Options) error {
 					"config.validation.attempt": strconv.Itoa(
 						setupValidation.Attempt),
 				})
-			} else if passBundle.ReplayBlockedReason != "" {
+			} else if passBundle.ReplayBlockedReason != "" && activeDrain == nil {
 				repSum = ReplaySummary{
 					Skipped: true, SkippedReason: "intent_v2_needs_attention",
 					BaseHead: cctx.BaseHead,
@@ -2593,41 +2598,76 @@ func Run(ctx context.Context, opts Options) error {
 				if opts.replay != nil {
 					replay = opts.replay
 				}
-				runWithProgressHeartbeat(passCtx, progressHeartbeatInterval(opts), func() {
-					heartbeatNow("running", "")
-				}, func() {
-					repSum, repErr = replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-						MessageFn:                  passBundle.MessageFn,
-						GitDir:                     opts.GitDir,
-						Trace:                      tracer,
-						PromptTrace:                promptTracer,
-						Limit:                      DefaultReplayLimit,
-						CommitStrategy:             passBundle.CommitStrategy,
-						IntentWindow:               passBundle.IntentWindow,
-						IntentMinPending:           passBundle.IntentMinPending,
-						IntentSettleWindow:         passBundle.IntentSettleWindow,
-						IntentMaxPendingAge:        passBundle.IntentMaxPendingAge,
-						IntentRecentCommits:        passBundle.IntentRecentCommits,
-						IntentDeferLimit:           passBundle.IntentDeferLimit,
-						IntentRetryLimit:           &passBundle.IntentRetryLimit,
-						IntentPathCoalescing:       &passBundle.IntentPathCoalescing,
-						IntentBypassBatchWait:      logicalFlushPending,
-						IntentPlanner:              passBundle.IntentPlanner,
-						IntentHealth:               passBundle.IntentHealth,
-						IntentPlannerProvider:      passBundle.HealthIdentity.Provider,
-						IntentPlannerModel:         passBundle.Model,
-						IntentIncludeDiffs:         passBundle.IntentIncludeDiffs,
-						IntentPreset:               passBundle.IntentPreset,
-						IntentVerificationMode:     passBundle.IntentVerificationMode,
-						IntentCandidateVerify:      candidateVerify,
-						IntentRepairCommitVerify:   repairCommitVerify,
-						IntentRepairEnabled:        passBundle.IntentRepairEnabled,
-						IntentRepairHorizon:        passBundle.IntentRepairHorizon,
-						IntentRepairMaxCommits:     passBundle.IntentRepairMaxCommits,
-						SelfPublicationCheckpoint:  opts.selfPublicationCheckpoint,
-						RequireCompletedCheckpoint: true,
+				if activeDrain != nil &&
+					activeDrain.Phase == state.PublicationDrainCheckpointing {
+					resumedDrain, resumeErr := ResumePublicationDrainCheckpointing(
+						passCtx, opts.RepoPath, opts.DB, *activeDrain, time.Now().UTC())
+					if resumeErr != nil {
+						repErr = resumeErr
+					} else {
+						activeDrain = &resumedDrain
+					}
+				}
+				if repErr == nil && activeDrain != nil &&
+					activeDrain.Phase == state.PublicationDrainNormalizing {
+					resumedDrain, resumeErr := ResumePublicationDrainNormalization(
+						passCtx, opts.DB, *activeDrain, time.Now().UTC())
+					if resumeErr != nil {
+						repErr = resumeErr
+					} else {
+						activeDrain = &resumedDrain
+					}
+				}
+				if repErr == nil && (activeDrain == nil ||
+					activeDrain.Phase != state.PublicationDrainNeedsAction) {
+					runWithProgressHeartbeat(passCtx, progressHeartbeatInterval(opts), func() {
+						heartbeatNow("running", "")
+					}, func() {
+						repSum, repErr = replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+							MessageFn:                  passBundle.MessageFn,
+							GitDir:                     opts.GitDir,
+							Trace:                      tracer,
+							PromptTrace:                promptTracer,
+							Limit:                      DefaultReplayLimit,
+							CommitStrategy:             passBundle.CommitStrategy,
+							IntentWindow:               passBundle.IntentWindow,
+							IntentMinPending:           passBundle.IntentMinPending,
+							IntentSettleWindow:         passBundle.IntentSettleWindow,
+							IntentMaxPendingAge:        passBundle.IntentMaxPendingAge,
+							IntentRecentCommits:        passBundle.IntentRecentCommits,
+							IntentDeferLimit:           passBundle.IntentDeferLimit,
+							IntentRetryLimit:           &passBundle.IntentRetryLimit,
+							IntentPathCoalescing:       &passBundle.IntentPathCoalescing,
+							IntentBypassBatchWait:      logicalFlushPending || activeDrain != nil,
+							IntentPlanner:              passBundle.IntentPlanner,
+							IntentHealth:               passBundle.IntentHealth,
+							IntentPlannerProvider:      passBundle.HealthIdentity.Provider,
+							IntentPlannerModel:         passBundle.Model,
+							IntentIncludeDiffs:         passBundle.IntentIncludeDiffs,
+							IntentPreset:               passBundle.IntentPreset,
+							IntentVerificationMode:     passBundle.IntentVerificationMode,
+							IntentCandidateVerify:      candidateVerify,
+							IntentRepairCommitVerify:   repairCommitVerify,
+							IntentRepairEnabled:        passBundle.IntentRepairEnabled,
+							IntentRepairHorizon:        passBundle.IntentRepairHorizon,
+							IntentRepairMaxCommits:     passBundle.IntentRepairMaxCommits,
+							SelfPublicationCheckpoint:  opts.selfPublicationCheckpoint,
+							RequireCompletedCheckpoint: true,
+							PublicationDrain:           activeDrain,
+						})
 					})
-				})
+					if activeDrain != nil {
+						updatedDrain, updateErr := UpdatePublicationDrainAfterReplay(
+							passCtx, opts.DB, *activeDrain, repSum, repErr, time.Now().UTC())
+						if updateErr != nil {
+							repErr = errors.Join(repErr, updateErr)
+						} else if updatedDrain.Phase != state.PublicationDrainCompleted &&
+							updatedDrain.Phase != state.PublicationDrainNeedsAction {
+							repErr = nil
+							repSum.HasMore = true
+						}
+					}
+				}
 				if logicalFlushPending && repErr == nil && !repSum.Skipped {
 					logicalFlushPending = false
 				}

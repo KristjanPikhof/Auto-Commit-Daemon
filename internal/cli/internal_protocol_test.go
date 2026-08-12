@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -280,7 +281,7 @@ func TestFreezeEmptyPublicationDrainTargetUsesPreBarrierGeneration(t *testing.T)
 
 func TestCheckpointBarrierDrainsPreBarrierBacklogWithEmptyCheckpoint(t *testing.T) {
 	ctx := context.Background()
-	repo := materializeTestRepo(t, false)
+	repo := materializeTestRepo(t, true)
 	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
 	if err != nil {
 		t.Fatal(err)
@@ -302,6 +303,7 @@ INSERT INTO capture_events(
 		t.Fatal(err)
 	}
 	insertCompletedCheckpoint(t, db, "cp-empty-backlog", nil)
+	alignCheckpointHead(t, db, repo, "cp-empty-backlog")
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
 	}
@@ -403,9 +405,170 @@ func TestCommitAllCheckpointBarrierRejectsStagedIndexBeforeWake(t *testing.T) {
 	}
 }
 
-func TestCheckpointBarrierReturnsMeasuredFinalDrainProgress(t *testing.T) {
+func TestCommitAllCheckpointBarrierConsumesStagedAfterCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	repo := materializeTestRepo(t, true)
+	stagedPath := filepath.Join(repo, "staged.txt")
+	wantBody := []byte("staged content remains in the worktree\n")
+	if err := os.WriteFile(stagedPath, wantBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"add", "staged.txt"); err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	insertCompletedCheckpoint(t, db, "cp-staged-consent", nil)
+	alignCheckpointHead(t, db, repo, "cp-staged-consent")
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
+		t.Fatal(err)
+	}
+	handler := repositoryWorkerHandler{
+		runtimes: map[string]*workerRuntime{"worktree": {
+			worktree: worktree, db: db, gate: &sync.RWMutex{},
+		}},
+		wake: func(string) {
+			accepted, _, metaErr := state.MetaGet(
+				ctx, db, daemon.MetaKeyProtectionObservationEpoch)
+			if metaErr != nil {
+				t.Fatal(metaErr)
+			}
+			if err := errors.Join(
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID,
+					"cp-staged-consent"),
+			); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	params, err := json.Marshal(map[string]bool{
+		"drain_publication": true, "consume_staged": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
+		Method: "publication_drain_start", WorktreeID: "worktree", Params: params,
+	}); protocolErr != nil {
+		t.Fatal(protocolErr)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"diff", "--cached", "--quiet"); err != nil {
+		t.Fatalf("index remains staged: %v", err)
+	}
+	if body, err := os.ReadFile(stagedPath); err != nil ||
+		!reflect.DeepEqual(body, wantBody) {
+		t.Fatalf("worktree body=%q err=%v", body, err)
+	}
+	drain, ok, err := state.PublicationDrainByCheckpoint(
+		ctx, db, "cp-staged-consent")
+	if err != nil || !ok || !drain.StagedConsent || !drain.StagedConsumed {
+		t.Fatalf("drain=(%+v,%t,%v)", drain, ok, err)
+	}
+}
+
+func TestCommitAllDrainDetachAndReattachKeepsSameOperation(t *testing.T) {
 	ctx := context.Background()
 	repo := materializeTestRepo(t, false)
+	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seqs := insertCompletedCheckpoint(t, db, "cp-detach", []checkpointMemberFixture{{
+		State: state.EventStatePending,
+	}})
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
+		t.Fatal(err)
+	}
+	drain := state.PublicationDrain{
+		ID: "drain-cp-detach", CheckpointID: "cp-detach",
+		WorktreeID: "0123456789abcdef", BranchRef: "refs/heads/main",
+		BranchGeneration: 7, Phase: state.PublicationDrainSemantic,
+		TargetEventCount: 1, CreatedTS: 1, UpdatedTS: 1, LastProgressTS: 1,
+		EventSeqs: seqs,
+	}
+	if created, err := state.PreparePublicationDrain(
+		ctx, db, drain); err != nil || !created {
+		t.Fatalf("prepare drain=(%t,%v)", created, err)
+	}
+	handler := repositoryWorkerHandler{
+		runtimes: map[string]*workerRuntime{"worktree": {
+			worktree: worktree, db: db, gate: &sync.RWMutex{},
+		}},
+		wake: func(string) {},
+	}
+	detachCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	started, protocolErr := handler.HandleWorkerRequest(detachCtx, supervisor.Request{
+		Method: "publication_drain_start", WorktreeID: "worktree",
+	})
+	if protocolErr != nil {
+		t.Fatal(protocolErr)
+	}
+	startedData, ok := started.(map[string]any)
+	if !ok || startedData["drain_id"] != drain.ID ||
+		startedData["publication_drained"] != false {
+		t.Fatalf("started result=%T %v", started, started)
+	}
+	stillActive, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil || stillActive.Phase != state.PublicationDrainSemantic {
+		t.Fatalf("durable after detach=(%+v,%v)", stillActive, err)
+	}
+
+	reattachCtx, stopReattach := context.WithTimeout(ctx, 10*time.Second)
+	defer stopReattach()
+	result, protocolErr := handler.HandleWorkerRequest(reattachCtx, supervisor.Request{
+		Method: "publication_drain_start", WorktreeID: "worktree",
+	})
+	if protocolErr != nil {
+		t.Fatal(protocolErr)
+	}
+	data, ok := result.(map[string]any)
+	if !ok || data["drain_id"] != drain.ID ||
+		data["publication_drained"] != false {
+		t.Fatalf("reattach result=%T %v", result, result)
+	}
+
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state='published',commit_oid='detach-commit',published_ts=2
+WHERE seq=?`, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	current, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err == nil {
+		_, err = daemon.UpdatePublicationDrainAfterReplay(
+			ctx, db, current, daemon.ReplaySummary{Published: 1}, nil,
+			time.Unix(2, 0).UTC())
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := state.ReadPublicationDrainProjection(ctx, db.Path())
+	if err != nil || projection.Latest == nil ||
+		projection.Latest.ID != drain.ID ||
+		projection.Latest.Phase != state.PublicationDrainCompleted {
+		t.Fatalf("completed projection=(%+v,%v)", projection.Latest, err)
+	}
+}
+
+func TestCheckpointBarrierReturnsMeasuredFinalDrainProgress(t *testing.T) {
+	ctx := context.Background()
+	repo := materializeTestRepo(t, true)
 	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
 	if err != nil {
 		t.Fatal(err)
@@ -419,6 +582,7 @@ func TestCheckpointBarrierReturnsMeasuredFinalDrainProgress(t *testing.T) {
 		{State: state.EventStatePublished, CommitOID: "commit-1"},
 		{State: state.EventStatePublished, CommitOID: "commit-2"},
 	})
+	alignCheckpointHead(t, db, repo, "cp-drained")
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
 	}
@@ -515,6 +679,21 @@ INSERT INTO capture_events(
 	return seqs
 }
 
+func alignCheckpointHead(t *testing.T, db *state.DB, repo, checkpointID string) {
+	t.Helper()
+	ctx := context.Background()
+	head, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"rev-parse", "--verify", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE checkpoints SET observed_head=? WHERE id=?`,
+		strings.TrimSpace(string(head)), checkpointID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkerHintWakesOnlyAddressedWorktree(t *testing.T) {
 	ctx := context.Background()
 	open := func(name string) *state.DB {
@@ -584,7 +763,7 @@ func TestPublicationUnsafeReasonRejectsStagedIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reason, err := publicationUnsafeReason(ctx, worktree)
+	reason, err := publicationUnsafeReason(ctx, worktree, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -271,11 +271,41 @@ func (s *Server) handle(ctx context.Context, request Request) (any, *ProtocolErr
 		return s.renewMaintenance(request.RepositoryID, request.Params)
 	case "maintenance_end":
 		return s.endMaintenance(ctx, request.RepositoryID, request.Params)
+	case "restart_repository":
+		return s.restartRepository(ctx, request.RepositoryID)
+	case "stop_repository":
+		return s.stopRepository(ctx, request.RepositoryID)
 	}
 	if s.Handler == nil {
 		return nil, &ProtocolError{Code: "not_supported", Message: "request is not supported by this supervisor", Retryable: false}
 	}
 	return s.Handler.HandleSupervisorRequest(ctx, request)
+}
+
+func (s *Server) restartRepository(ctx context.Context, repositoryID string) (any, *ProtocolError) {
+	value, protocolErr := s.beginMaintenance(ctx, repositoryID)
+	if protocolErr != nil {
+		return nil, protocolErr
+	}
+	lease := value.(MaintenanceLease)
+	params, _ := json.Marshal(map[string]string{"token": lease.Token})
+	if _, protocolErr := s.endMaintenance(ctx, repositoryID, params); protocolErr != nil {
+		return nil, protocolErr
+	}
+	return MaintenanceStatus{Released: true}, nil
+}
+
+func (s *Server) stopRepository(ctx context.Context, repositoryID string) (any, *ProtocolError) {
+	if !validRepositoryID(repositoryID) {
+		return nil, &ProtocolError{Code: "invalid_repository", Message: "valid repository_id is required"}
+	}
+	if err := s.reconcile(ctx); err != nil {
+		return nil, &ProtocolError{Code: "repository_stop_failed", Message: err.Error(), Retryable: true}
+	}
+	if err := s.waitRepositoryWorkerStopped(ctx, repositoryID); err != nil {
+		return nil, &ProtocolError{Code: "repository_stop_incomplete", Message: err.Error(), Retryable: true}
+	}
+	return MaintenanceStatus{Released: true}, nil
 }
 
 const maintenanceLeaseTTL = 2 * time.Minute
@@ -380,17 +410,17 @@ func (s *Server) status() Status {
 		Workers: make([]WorkerStatus, 0, len(s.workers))}
 	for _, worker := range s.workers {
 		item := WorkerStatus{RepositoryID: worker.id, Restarts: worker.restarts, LastError: worker.lastError, State: "backoff", Version: s.Version}
-		if worker.launchd {
+		if runtimeStatus, err := ReadWorkerRuntimeStatus(s.Roots, worker.id); err == nil &&
+			(worker.launchd || worker.cmd != nil) {
+			item.PID = runtimeStatus.PID
+			item.State = runtimeStatus.State
+			item.Restarts = runtimeStatus.Restarts
+			item.LastError = runtimeStatus.LastError
+		} else if worker.launchd {
 			item.State = "starting"
-			if runtimeStatus, err := ReadWorkerRuntimeStatus(s.Roots, worker.id); err == nil {
-				item.PID = runtimeStatus.PID
-				item.State = runtimeStatus.State
-				item.Restarts = runtimeStatus.Restarts
-				item.LastError = runtimeStatus.LastError
-			}
 		} else if worker.cmd != nil && worker.cmd.Process != nil {
 			item.PID = worker.cmd.Process.Pid
-			item.State = "running"
+			item.State = "starting"
 		}
 		if item.Restarts >= 5 && item.LastError != "" {
 			item.State = "needs_action"
@@ -513,7 +543,12 @@ func startableWorkerIDs(workers map[string]*workerProcess, now time.Time, limit 
 }
 
 func (s *Server) startWorkerLocked(ctx context.Context, worker *workerProcess) {
-	args := []string{"internal", "worker", "run", "--repository-id", worker.id}
+	args := []string{
+		"internal", "worker", "supervise", "--repository-id", worker.id,
+		"--state-root", s.Roots.State,
+		"--share-root", s.Roots.Share,
+		"--config-root", s.Roots.Config,
+	}
 	if _, err := os.Stat(s.Roots.SetupPublicationHoldPath()); err == nil {
 		args = append(args, "--publication-hold", s.Roots.SetupPublicationHoldPath())
 	}
@@ -521,6 +556,7 @@ func (s *Server) startWorkerLocked(ctx context.Context, worker *workerProcess) {
 		s.startLaunchdWorkerLocked(ctx, worker, args)
 		return
 	}
+	_ = RemoveWorkerRuntimeStatus(s.Roots, worker.id)
 	cmd := exec.CommandContext(ctx, s.BinaryPath, args...)
 	cmd.Env = ProcessEnvironment(s.Roots, os.Environ())
 	cmd.Stdout = os.Stdout
@@ -567,14 +603,7 @@ func (s *Server) startLaunchdWorkerLocked(ctx context.Context, worker *workerPro
 		return
 	}
 	_ = RemoveWorkerRuntimeStatus(s.Roots, worker.id)
-	superviseArgs := append([]string(nil), args...)
-	superviseArgs[2] = "supervise"
-	superviseArgs = append(superviseArgs,
-		"--state-root", s.Roots.State,
-		"--share-root", s.Roots.Share,
-		"--config-root", s.Roots.Config,
-	)
-	content, err := renderWorkerService(s.Roots, s.BinaryPath, worker.id, superviseArgs)
+	content, err := renderWorkerService(s.Roots, s.BinaryPath, worker.id, args)
 	if err != nil {
 		s.recordWorkerStartFailure(worker, err)
 		return

@@ -85,6 +85,7 @@ type doctorRepoReport struct {
 	WorktreeClean            bool                      `json:"worktree_clean"`
 	AllChangesCommittedInGit bool                      `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
+	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
 }
 
 type doctorHarnessReport struct {
@@ -293,6 +294,7 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 				rr.WorktreeClean = status.WorktreeClean
 				rr.AllChangesCommittedInGit = status.AllChangesCommittedInGit
 				rr.CheckpointPublishedByACD = status.CheckpointPublishedByACD
+				rr.PublicationDrain = status.PublicationDrain
 			} else {
 				rr.Notes = append(rr.Notes, "status truth failed: "+statusErr.Error())
 			}
@@ -1655,6 +1657,14 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		}
 		fmt.Fprintf(out, "      clients    : %d\n", rr.Clients)
 		fmt.Fprintf(out, "      pending    : %d\n", rr.PendingEvents)
+		if rr.PublicationDrain.ID != "" {
+			fmt.Fprintf(out,
+				"      drain      : %s phase=%s remaining=%d/%d commits=%d\n",
+				rr.PublicationDrain.ID, rr.PublicationDrain.Phase,
+				rr.PublicationDrain.RemainingEvents,
+				rr.PublicationDrain.TargetEvents,
+				rr.PublicationDrain.CommitCount)
+		}
 		if rr.BlockedConflicts > 0 {
 			fmt.Fprintf(out, "      blocked    : %d\n", rr.BlockedConflicts)
 			if rr.LastReplayConflictPath != "" {
