@@ -34,8 +34,9 @@ package state
 // journal spanning the Git-applied and SQLite-completed boundary; v19 makes
 // prepare-time publication completion semantics immutable across restart;
 // v20 adds the general operation journal and immutable checkpoint ledger;
-// v21 adds durable publication drains over immutable checkpoint membership.
-const SchemaVersion = 21
+// v21 adds durable publication drains over immutable checkpoint membership;
+// v22 adds restart-stable adaptive Intent planning runs.
+const SchemaVersion = 22
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -182,6 +183,29 @@ CREATE INDEX IF NOT EXISTS idx_intent_planner_windows_ts_id
 
 CREATE INDEX IF NOT EXISTS idx_intent_planner_windows_branch_id
     ON intent_planner_windows(branch_ref, branch_generation, id);
+
+CREATE TABLE IF NOT EXISTS intent_plan_runs(
+    fingerprint              TEXT PRIMARY KEY,
+    branch_ref               TEXT NOT NULL,
+    branch_generation        INTEGER NOT NULL,
+    provider                 TEXT,
+    model                    TEXT,
+    config_revision_id       INTEGER,
+    attempt_count            INTEGER NOT NULL DEFAULT 0,
+    attempt_limit            INTEGER NOT NULL,
+    preserved_groups         TEXT NOT NULL DEFAULT '[]',
+    unresolved_seqs          TEXT NOT NULL DEFAULT '[]',
+    finding_codes            TEXT NOT NULL DEFAULT '[]',
+    normalized_partition     TEXT,
+    progress_state           TEXT,
+    resolution_mode          TEXT,
+    completed                INTEGER NOT NULL DEFAULT 0,
+    created_ts               REAL NOT NULL,
+    updated_ts               REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_plan_runs_branch_updated
+    ON intent_plan_runs(branch_ref, branch_generation, updated_ts);
 
 CREATE TABLE IF NOT EXISTS intent_planner_window_events(
     window_id  INTEGER NOT NULL,

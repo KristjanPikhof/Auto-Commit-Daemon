@@ -692,16 +692,11 @@ func ValidateIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) error {
 			}
 		}
 	}
-	for _, candidate := range plan.Candidates {
-		connectedSeqs := append([]int64(nil), candidate.SelectedSeqs...)
-		if persisted, ok := persistedByID[candidate.CandidateID]; ok {
-			connectedSeqs = append(connectedSeqs, persisted.SelectedSeqs...)
-		}
-		if len(connectedSeqs) > 1 && !seqSetConnected(connectedSeqs, adjacent) {
-			return v2ValidationError(candidate.CandidateID, IntentAtomicitySeparation, "candidate_disconnected",
-				"candidate merges captures without dependency evidence connecting every component")
-		}
-	}
+	// A model may identify semantic cohesion that the bounded local graph does
+	// not already contain. The daemon still subjects that exact membership to
+	// hard-boundary, dependency, materialization, verification, and Git gates.
+	// Evidence fallbacks remain graph-derived; this validator must not turn a
+	// missing soft edge into a provider outage.
 	return nil
 }
 
