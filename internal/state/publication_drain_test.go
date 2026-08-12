@@ -172,7 +172,7 @@ func TestReadOnlyDrainProjectionDoesNotMigrateV20(t *testing.T) {
 	}
 }
 
-func TestMigrateSchema20To21AddsPublicationDrains(t *testing.T) {
+func TestMigrateSchema20ToCurrentAddsPublicationDrains(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	db, err := Open(ctx, dbPath)
@@ -198,7 +198,7 @@ func TestMigrateSchema20To21AddsPublicationDrains(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if version, err := db.UserVersion(ctx); err != nil || version != 21 {
+	if version, err := db.UserVersion(ctx); err != nil || version != SchemaVersion {
 		t.Fatalf("version=(%d,%v)", version, err)
 	}
 	var table string

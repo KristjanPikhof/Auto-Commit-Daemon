@@ -179,6 +179,9 @@ func CanRuntimeMigrate(from, to int) bool {
 		case 20:
 			// v21 only adds the publication_drains table and indexes. It does
 			// not reinterpret existing checkpoint or publication rows.
+		case 21:
+			// v22 only adds privacy-safe adaptive planner attempt state and
+			// additive planner-window observability columns.
 		default:
 			return false
 		}

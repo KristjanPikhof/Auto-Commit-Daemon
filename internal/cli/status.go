@@ -502,7 +502,8 @@ func statusOperationalState(report statusReport) string {
 		return "waiting_for_provider"
 	case report.IntentStrategy.PlannerHealth != nil &&
 		(report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
-			report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
+			report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen) &&
+		report.PendingEvents > 0:
 		return "fallback"
 	case report.Replay.State == "degraded":
 		return "retrying"

@@ -32,7 +32,7 @@ func TestValidateIntentPlanV2AllowsDependencySafeNonContiguousCandidates(t *test
 	}
 }
 
-func TestValidateIntentPlanV2RejectsDisconnectedMegaGroup(t *testing.T) {
+func TestValidateIntentPlanV2AllowsPlannerSemanticGroupWithoutGraphPath(t *testing.T) {
 	req := mustIntentPlanRequestV2(t,
 		[]OfferedCapture{
 			{Seq: 1, Path: "internal/a.go", Op: "modify"},
@@ -49,17 +49,12 @@ func TestValidateIntentPlanV2RejectsDisconnectedMegaGroup(t *testing.T) {
 		Candidates:      []IntentCandidateAssignment{readyCandidate("mega", []int64{1, 2, 3})},
 	}
 
-	err := ValidateIntentPlanV2(req, plan)
-	var validationErr *IntentPlanV2ValidationError
-	if !errors.As(err, &validationErr) {
-		t.Fatalf("error = %T %v, want *IntentPlanV2ValidationError", err, err)
-	}
-	if got := validationErr.Findings[0]; got.Gate != IntentAtomicitySeparation || got.Code != "candidate_disconnected" {
-		t.Fatalf("finding = %#v", got)
+	if err := ValidateIntentPlanV2(req, plan); err != nil {
+		t.Fatalf("semantic group rejected before daemon safety gates: %v", err)
 	}
 }
 
-func TestValidateIntentPlanV2DoesNotTreatWeakProximityAsCohesion(t *testing.T) {
+func TestValidateIntentPlanV2LeavesWeakEvidenceDecisionToDaemonGates(t *testing.T) {
 	for _, kind := range []string{"temporal_proximity", "module_proximity"} {
 		t.Run(kind, func(t *testing.T) {
 			req := mustIntentPlanRequestV2(t,
@@ -78,10 +73,8 @@ func TestValidateIntentPlanV2DoesNotTreatWeakProximityAsCohesion(t *testing.T) {
 					readyCandidate("mega", []int64{1, 2}),
 				},
 			})
-			var validationErr *IntentPlanV2ValidationError
-			if !errors.As(err, &validationErr) ||
-				validationErr.Findings[0].Code != "candidate_disconnected" {
-				t.Fatalf("error = %T %v", err, err)
+			if err != nil {
+				t.Fatalf("structurally valid planner group rejected: %v", err)
 			}
 		})
 	}

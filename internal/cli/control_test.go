@@ -490,7 +490,7 @@ func TestApplyControlStatusPlannerCircuitDegraded(t *testing.T) {
 			res := controlResult{OK: true}
 			applyControlStatus(&res, status)
 			if res.Health != controlHealthDegraded ||
-				!strings.Contains(res.Summary, "deterministic fallback") ||
+				!strings.Contains(res.Summary, "evidence-based grouping") ||
 				!strings.Contains(res.NextAction, tc.nextText) {
 				t.Fatalf("control result=%+v", res)
 			}

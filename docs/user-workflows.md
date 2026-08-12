@@ -29,7 +29,7 @@ provenance:
 | `retrying` | Replay hit a recoverable error and will retry automatically. A completed checkpoint remains protected. |
 | `self_healing` | ACD is normalizing or rebuilding the durable publication plan. No command is needed. |
 | `waiting_for_provider` | The frozen publication target is waiting for its bounded semantic attempt. The drain survives restart. |
-| `event_fallback` | Semantic recovery did not progress, so ACD is publishing local atomic dependency groups. |
+| `event_fallback` | Semantic recovery could not prove a safe Intent partition, so the frozen drain is publishing local atomic dependency groups. |
 | `needs_attention` | A durable publication block needs inspection with `acd doctor`. |
 | `busy` with a fresh heartbeat | The worker is draining pending work or completing another bounded operation. |
 | `All changes committed in Git: yes` | The worktree is clean. This does not claim that ACD created its commits. |
@@ -45,8 +45,8 @@ for the latest completed checkpoint, not the origin of every commit in Git.
 
 Run `acd doctor`. Common waiting causes include the settle window, unsafe Git
 state, verification failure, provider retry, or worker version mismatch.
-Retrying planner output, deterministic fallback, and provider cooldown recover
-automatically. No restart or configuration change is required. Do not delete
+Local repair, partial replanning, evidence grouping, and provider cooldown
+recover automatically. No restart or configuration change is required. Do not delete
 state, private refs, ownership locks, or sockets. Provider and verification
 failures do not invalidate completed checkpoints.
 
@@ -57,7 +57,8 @@ acd commit-all --yes
 ~~~
 
 The command freezes one target, waits until it is published, and shows the
-phase, remaining events, commit count, fallback mode, and latest safe error.
+phase, remaining events, commit count, semantic group count, planning attempts,
+resolution mode, genuine singleton count, fallback mode, and latest safe error.
 Closing the terminal only detaches the display. The worker keeps publishing,
 and the next `acd commit-all --yes` attaches to the same active drain.
 

@@ -992,21 +992,27 @@ func replayPendingBatchLimit(opts ReplayOpts, cfg intentReplayConfig) int {
 }
 
 type intentReplayConfig struct {
-	enabled         bool
-	planner         ai.IntentPlanner
-	health          *IntentPlannerHealth
-	window          int
-	minPending      int
-	settleWindow    time.Duration
-	maxPendingAge   time.Duration
-	recent          int
-	deferLimit      int
-	retryLimit      *int
-	retryCount      int
-	fallbackUsed    bool
-	pathCoalescing  bool
-	includeDiffs    bool
-	bypassBatchWait bool
+	enabled                bool
+	planner                ai.IntentPlanner
+	health                 *IntentPlannerHealth
+	window                 int
+	minPending             int
+	settleWindow           time.Duration
+	maxPendingAge          time.Duration
+	recent                 int
+	deferLimit             int
+	retryLimit             *int
+	retryCount             int
+	fallbackUsed           bool
+	planFingerprint        string
+	planAttempt            int
+	planAttemptLimit       int
+	unresolvedCaptureCount int
+	preservedGroupCount    int
+	resolutionMode         string
+	pathCoalescing         bool
+	includeDiffs           bool
+	bypassBatchWait        bool
 	// candidateMode enables durable Intent v2 candidate semantics. A pending
 	// activity boundary may trigger evaluation before the legacy min-pending
 	// and quiet-time gate, but never before path quiescence or replay safety
@@ -2561,7 +2567,11 @@ func recordIntentPlannerWindow(
 	}
 
 	selectedGroups := make([]state.IntentPlannerWindowGroup, 0, len(groups))
+	singletonCount := 0
 	for i, group := range groups {
+		if len(group.SelectedSeqs) == 1 {
+			singletonCount++
+		}
 		summary := state.IntentPlannerWindowGroup{
 			SelectedSeqs:   append([]int64(nil), group.SelectedSeqs...),
 			Subject:        strings.TrimSpace(group.Subject),
@@ -2633,34 +2643,45 @@ func recordIntentPlannerWindow(
 	} else if len(plan.SelectedSeqs) > 0 && len(plan.DeferredSeqs) > 0 {
 		outcome = "mixed"
 	}
-	if validationFailure != "" {
+	if validationFailure != "" && cfg.resolutionMode != "local_repair" &&
+		cfg.resolutionMode != "partial_replan" && cfg.resolutionMode != "evidence_partition" {
 		outcome = "provider_error_fallback_" + outcome
+	} else if cfg.resolutionMode == "local_repair" ||
+		cfg.resolutionMode == "partial_replan" || cfg.resolutionMode == "evidence_partition" {
+		outcome = "recovered_" + outcome
 	}
 	_, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
-		PlannedTS:           ts,
-		Provider:            nullString(provider),
-		Model:               nullString(model),
-		BranchRef:           cctx.BranchRef,
-		BranchGeneration:    cctx.BranchGeneration,
-		Source:              nullString(strings.TrimSpace(plan.Source)),
-		CommitFormat:        nullString(string(req.CommitFormat)),
-		Forced:              forced,
-		ForcedReason:        nullString(forcedReason),
-		ValidationFailure:   nullString(ai.SanitizePlannerError(validationFailure)),
-		OfferedSeqs:         intentOfferedSeqs(req),
-		VisibleOriginalSeqs: visibleOriginalSeqs,
-		HiddenSeqs:          hiddenSeqs,
-		SelectedGroups:      selectedGroups,
-		DeferredSeqs:        append([]int64(nil), plan.DeferredSeqs...),
-		DeferredReasons:     deferredReasons,
-		Events:              rows,
-		ConfigRevisionID:    sql.NullInt64{Int64: telemetry.revisionID, Valid: telemetry.revisionID > 0},
-		ConfigProfile:       sql.NullString{String: telemetry.profile, Valid: telemetry.profile != ""},
-		DurationMS:          sql.NullInt64{Int64: plannerWindowDurationMS(ts), Valid: true},
-		RetryCount:          cfg.retryCount,
-		FallbackUsed:        fallbackUsed,
-		Outcome:             sql.NullString{String: outcome, Valid: true},
-		ExperimentID:        sql.NullInt64{Int64: telemetry.experimentID, Valid: telemetry.experimentID > 0},
+		PlannedTS:              ts,
+		Provider:               nullString(provider),
+		Model:                  nullString(model),
+		BranchRef:              cctx.BranchRef,
+		BranchGeneration:       cctx.BranchGeneration,
+		Source:                 nullString(strings.TrimSpace(plan.Source)),
+		CommitFormat:           nullString(string(req.CommitFormat)),
+		Forced:                 forced,
+		ForcedReason:           nullString(forcedReason),
+		ValidationFailure:      nullString(ai.SanitizePlannerError(validationFailure)),
+		OfferedSeqs:            intentOfferedSeqs(req),
+		VisibleOriginalSeqs:    visibleOriginalSeqs,
+		HiddenSeqs:             hiddenSeqs,
+		SelectedGroups:         selectedGroups,
+		DeferredSeqs:           append([]int64(nil), plan.DeferredSeqs...),
+		DeferredReasons:        deferredReasons,
+		Events:                 rows,
+		ConfigRevisionID:       sql.NullInt64{Int64: telemetry.revisionID, Valid: telemetry.revisionID > 0},
+		ConfigProfile:          sql.NullString{String: telemetry.profile, Valid: telemetry.profile != ""},
+		DurationMS:             sql.NullInt64{Int64: plannerWindowDurationMS(ts), Valid: true},
+		RetryCount:             cfg.retryCount,
+		FallbackUsed:           fallbackUsed,
+		Outcome:                sql.NullString{String: outcome, Valid: true},
+		PlanFingerprint:        nullString(cfg.planFingerprint),
+		PlanAttempt:            cfg.planAttempt,
+		PlanAttemptLimit:       cfg.planAttemptLimit,
+		UnresolvedCaptureCount: cfg.unresolvedCaptureCount,
+		PreservedGroupCount:    cfg.preservedGroupCount,
+		ResolutionMode:         nullString(cfg.resolutionMode),
+		SingletonCount:         singletonCount,
+		ExperimentID:           sql.NullInt64{Int64: telemetry.experimentID, Valid: telemetry.experimentID > 0},
 	})
 	return err
 }

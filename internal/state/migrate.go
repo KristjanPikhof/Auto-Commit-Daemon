@@ -75,6 +75,7 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // restart recovery cannot reinterpret repair state. v20 adds the general
 // operation/checkpoint ledger and correlates new self-publication rows with
 // it. v21 adds publication_drains without backfilling historical checkpoints.
+// v22 adds durable adaptive planner attempts and additive window summaries.
 // New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
@@ -215,6 +216,24 @@ BEGIN
     SELECT RAISE(ABORT, 'self-publication identity is immutable');
 END;`); err != nil {
 			return fmt.Errorf("state: migrate self-publication operation identity: %w", err)
+		}
+	}
+	if cur < 22 {
+		for _, col := range []struct {
+			name string
+			typ  string
+		}{
+			{"plan_fingerprint", "TEXT"},
+			{"plan_attempt", "INTEGER NOT NULL DEFAULT 0"},
+			{"plan_attempt_limit", "INTEGER NOT NULL DEFAULT 0"},
+			{"unresolved_capture_count", "INTEGER NOT NULL DEFAULT 0"},
+			{"preserved_group_count", "INTEGER NOT NULL DEFAULT 0"},
+			{"resolution_mode", "TEXT"},
+			{"singleton_count", "INTEGER NOT NULL DEFAULT 0"},
+		} {
+			if err := addColumnIfMissing(ctx, tx, "intent_planner_windows", col.name, col.typ); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

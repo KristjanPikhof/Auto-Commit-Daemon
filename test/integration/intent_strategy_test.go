@@ -6,6 +6,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -47,7 +48,7 @@ func TestIntentStrategy_RejectsDisconnectedNativeGroup(t *testing.T) {
 			"deferred_seqs":    []int64{},
 			"subject":          "Intent grouped files",
 			"body":             "Publish both captures together.",
-			"grouping_reason":  "same integration test intent",
+			"grouping_reason":  "same evaluation window",
 			"deferred_reasons": []map[string]any{},
 		}
 		writeIntentPlanResponse(t, w, "call_1", plan)
@@ -142,15 +143,15 @@ func TestIntentStrategy_RapidFiveCapturesOfferedThenSeparated(t *testing.T) {
 			http.Error(w, "expected exactly five offered captures", http.StatusBadRequest)
 			return
 		}
-		plan := map[string]any{
-			"selected_seqs":    seqs,
-			"deferred_seqs":    []int64{},
-			"subject":          "Group rapid five",
-			"body":             "Publish all rapid captures together.",
-			"grouping_reason":  "settle window collected the rapid burst",
-			"deferred_reasons": []map[string]any{},
+		candidates := make([]map[string]any, 0, len(seqs))
+		for i, seq := range seqs {
+			candidates = append(candidates, nativeReadyIntentCandidate(
+				fmt.Sprintf("rapid-%d", i+1), []int64{seq},
+				fmt.Sprintf("Publish rapid capture %d", i+1),
+				"Keep independent rapid captures separate.",
+				"planner identified an independent change"))
 		}
-		writeIntentPlanResponse(t, w, "call_rapid_five", plan)
+		writeNativeIntentCandidatesResponse(t, w, "call_rapid_five", candidates)
 	}))
 	defer server.Close()
 

@@ -127,6 +127,12 @@ func replayIntentCandidateBatch(
 	windowCfg := cfg
 	windowCfg.retryCount = evaluation.RetryCount
 	windowCfg.fallbackUsed = evaluation.Fallback != ""
+	windowCfg.planFingerprint = evaluation.PlanFingerprint
+	windowCfg.planAttempt = evaluation.PlanAttempt
+	windowCfg.planAttemptLimit = evaluation.PlanAttemptLimit
+	windowCfg.unresolvedCaptureCount = evaluation.UnresolvedCaptureCount
+	windowCfg.preservedGroupCount = evaluation.PreservedGroupCount
+	windowCfg.resolutionMode = evaluation.ResolutionMode
 	windowPlan := intentCandidatePlannerWindowPlan(
 		legacyRequest, evaluation)
 	if evaluation.PlannerFailure != "" {
@@ -144,7 +150,7 @@ func replayIntentCandidateBatch(
 	); err != nil {
 		return sum, err
 	}
-	if evaluation.PlannerFailure != "" {
+	if evaluation.PlannerFailure != "" && evaluation.NeedsAttention {
 		sum.PlannerFailure = evaluation.PlannerFailure
 		nowSec := float64(time.Now().UnixNano()) / 1e9
 		for _, item := range items {
@@ -364,6 +370,7 @@ func runtimeIntentDependencyHints(
 ) []IntentDependencyHint {
 	type features struct {
 		seq       int64
+		path      string
 		stem      string
 		module    string
 		diff      string
@@ -379,7 +386,8 @@ func runtimeIntentDependencyHints(
 	for _, capture := range ordered {
 		diff := strings.ToLower(capture.CapturedDiff)
 		item := features{
-			seq: capture.Event.Seq, stem: intentSemanticStem(capture),
+			seq: capture.Event.Seq, path: strings.ToLower(capture.Event.Path),
+			stem:   intentSemanticStem(capture),
 			module: intentCaptureModule(capture), diff: diff,
 			symbols:   runtimeIntentSymbols(diff),
 			changeIDs: runtimeIntentChangeIDs(diff),
@@ -433,6 +441,21 @@ func runtimeIntentDependencyHints(
 				(earlierBase != "" && strings.Contains(later.diff, earlierBase)) {
 				add(earlier.seq, later.seq, ai.IntentDependencyHard,
 					"generated_source", earlierBase)
+			}
+			generated, source := later, earlier
+			if earlier.generated && !later.generated {
+				generated, source = earlier, later
+			}
+			if generated.generated && !source.generated {
+				artifactBase := strings.ToLower(path.Base(generated.path))
+				if strings.Contains(source.diff, generated.path) ||
+					(len(artifactBase) >= 4 && strings.Contains(source.diff, artifactBase)) {
+					// The reference proves the semantic relationship without
+					// assuming capture order. Publication order remains governed by
+					// hard object/path dependencies.
+					add(source.seq, generated.seq, ai.IntentDependencySoft,
+						"generated_artifact_reference", generated.path)
+				}
 			}
 		}
 	}
@@ -515,11 +538,27 @@ func runtimeIntentStemBase(stem string) string {
 }
 
 func runtimeIntentGeneratedPath(value string) bool {
-	base := strings.ToLower(path.Base(value))
-	return strings.Contains(base, ".generated.") ||
+	clean := strings.ToLower(path.Clean(value))
+	base := path.Base(clean)
+	if strings.Contains(base, ".generated.") ||
 		strings.Contains(base, "_generated.") ||
 		strings.Contains(base, ".gen.") ||
-		strings.Contains(base, "_gen.")
+		strings.Contains(base, "_gen.") {
+		return true
+	}
+	ext := strings.ToLower(path.Ext(base))
+	archive := ext == ".zip" || ext == ".tgz" || ext == ".gz" ||
+		ext == ".tar" || ext == ".bz2" || ext == ".xz"
+	if !archive {
+		return false
+	}
+	for _, dir := range strings.Split(path.Dir(clean), "/") {
+		switch dir {
+		case "output", "outputs", "dist", "build", "artifacts", "archives":
+			return true
+		}
+	}
+	return false
 }
 
 func intentCandidateScratchMaterializer(

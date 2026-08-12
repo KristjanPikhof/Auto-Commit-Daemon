@@ -91,6 +91,7 @@ type IntentCandidateEvaluation struct {
 	VerificationMode  string
 	Verify            IntentCandidateVerifier
 	Now               time.Time
+	allowSemanticPlan bool
 }
 
 // IntentCandidateDecision is one persisted candidate revision plus its exact
@@ -103,14 +104,20 @@ type IntentCandidateDecision struct {
 }
 
 type IntentCandidateEvaluationResult struct {
-	ProtocolVersion string
-	Fallback        string
-	PlannerFailure  string
-	RetryCount      int
-	NeedsAttention  bool
-	Boundaries      []state.IntentActivityBoundary
-	Dependencies    []state.IntentCaptureDependency
-	Decisions       []IntentCandidateDecision
+	ProtocolVersion        string
+	Fallback               string
+	PlannerFailure         string
+	RetryCount             int
+	PlanAttempt            int
+	PlanAttemptLimit       int
+	UnresolvedCaptureCount int
+	PreservedGroupCount    int
+	ResolutionMode         string
+	PlanFingerprint        string
+	NeedsAttention         bool
+	Boundaries             []state.IntentActivityBoundary
+	Dependencies           []state.IntentCaptureDependency
+	Decisions              []IntentCandidateDecision
 	// VisibleCandidateIDs records durable nonterminal candidates included in
 	// this exact dependency/planner evaluation, including candidates whose
 	// already-published captures needed no new assignment.
@@ -197,15 +204,15 @@ func EvaluateIntentCandidates(
 		input.Provider = input.Planner.Name()
 	}
 	if !input.RetryLimitSet {
-		input.RetryLimit = 1
+		input.RetryLimit = 2
 	}
 	if input.RetryLimit < 0 {
 		input.RetryLimit = 0
-	} else if input.RetryLimit > 1 {
-		// Intent v2 permits one bounded remote correction. Keep accepting the
-		// existing setting for compatibility, but never let it create a retry
-		// loop.
-		input.RetryLimit = 1
+	} else if input.RetryLimit > 2 {
+		// The setting counts additional attempts after the initial request.
+		// Three total calls are enough to correct a plan without allowing a
+		// reconstruction loop.
+		input.RetryLimit = 2
 	}
 	nowSeconds := float64(input.Now.UnixNano()) / 1e9
 	if _, err := state.FinalizeExpiredIntentCandidates(
@@ -260,9 +267,10 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
-	plan, fallback, plannerFailure, retryCount, needsAttention, continuations, err :=
+	plan, fallback, plannerFailure, retryCount, needsAttention, continuations,
+		planRun, err :=
 		chooseIntentCandidatePlan(ctx, req, input.Planner, input.Health,
-			input.RetryLimit, input.Preset, existing)
+			input.RetryLimit, input.Preset, existing, db, input)
 	if err != nil {
 		return result, err
 	}
@@ -270,7 +278,16 @@ func EvaluateIntentCandidates(
 	result.Fallback = fallback
 	result.PlannerFailure = plannerFailure
 	result.RetryCount = retryCount
+	result.PlanAttempt = planRun.AttemptCount
+	result.PlanAttemptLimit = planRun.AttemptLimit
+	result.UnresolvedCaptureCount = len(planRun.UnresolvedSeqs)
+	result.PreservedGroupCount = len(planRun.PreservedGroups)
+	result.ResolutionMode = planRun.ResolutionMode.String
+	result.PlanFingerprint = planRun.Fingerprint
 	result.NeedsAttention = needsAttention
+	input.allowSemanticPlan = result.ResolutionMode == "provider" ||
+		result.ResolutionMode == "local_repair" ||
+		result.ResolutionMode == "partial_replan"
 	plan, err = stabilizeIntentCandidatePlan(plan, existing, input.BranchRef,
 		input.BranchGeneration)
 	if err != nil {
@@ -666,38 +683,66 @@ func chooseIntentCandidatePlan(
 	retryLimit int,
 	preset config.PresetName,
 	existing []state.IntentCandidate,
-) (ai.IntentPlanV2, string, string, int, bool, []intentCandidateContinuation, error) {
+	db *state.DB,
+	input IntentCandidateEvaluation,
+) (ai.IntentPlanV2, string, string, int, bool, []intentCandidateContinuation, state.IntentPlanRun, error) {
 	plannerFailure := ""
 	retryCount := 0
+	run := newIntentPlanRun(req, input, retryLimit+1)
 	plannerRequest := req
 	if planner != nil {
 		probe := holdIntentCandidatePlan(req)
 		continuations, _, err := continuePersistedIntentCandidates(
 			req, &probe, intentCandidateContinuationOptions{})
 		if err != nil {
-			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, err
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 		}
 		plannerRequest = intentCandidateContinuationValidationRequest(
 			req, continuations)
 	}
+	var permit IntentPlannerHealthPermit
+	permitHeld := false
 	if planner != nil {
-		var permit IntentPlannerHealthPermit
 		if health != nil {
 			var acquireErr error
 			permit, acquireErr = health.Acquire(ctx)
 			if acquireErr != nil {
 				var openErr *IntentPlannerCircuitOpenError
 				if !errors.As(acquireErr, &openErr) {
-					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, acquireErr
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, acquireErr
 				}
 				planner = nil
+			} else {
+				permitHeld = true
 			}
 		}
-		if planner != nil {
+	}
+	if planner != nil {
+		var previousSignature string
+		var lockedCandidates []ai.IntentCandidateAssignment
+		for {
+			reserved, allowed, reserveErr := state.ReserveIntentPlanAttempt(ctx, db, run)
+			if reserveErr != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, reserveErr
+			}
+			run = reserved
+			if !allowed {
+				break
+			}
+			if previousSignature == "" && run.AttemptCount > 1 &&
+				run.NormalizedPartition.Valid {
+				previousSignature = run.NormalizedPartition.String + "\x00" +
+					strings.Join(run.FindingCodes, ",")
+			}
+			retryCount = run.AttemptCount - 1
+			attemptCtx := prompttrace.WithRetryCount(ctx, retryCount)
 			plan, err := ai.PlanIntentV2WithCompatibility(
-				ctx, planner, plannerRequest)
+				attemptCtx, planner, plannerRequest)
 			if rejected, ok := ai.RejectedIntentPlanV2(err); ok {
 				plan = rejected
+			}
+			if len(lockedCandidates) > 0 {
+				plan = mergeLockedIntentCandidates(req, lockedCandidates, plan)
 			}
 			plannerCallFailed := err != nil
 			var continuations []intentCandidateContinuation
@@ -706,25 +751,44 @@ func chooseIntentCandidatePlan(
 					continuePersistedIntentCandidates(
 						req, &plan, intentCandidateContinuationOptions{})
 				if err == nil {
-					err = ai.ValidateIntentPlanV2(
-						intentCandidateContinuationValidationRequest(
-							req, continuations), plan)
+					validationReq := intentCandidateContinuationValidationRequest(
+						req, continuations)
+					err = ai.ValidateIntentPlanV2(validationReq, plan)
+					if err == nil {
+						err = validatePlannerSemanticRationale(validationReq, plan)
+					}
 				}
 				plannerCallFailed = false
 			}
 			if err == nil {
-				if health != nil {
+				run.Completed = true
+				mode := "provider"
+				if len(lockedCandidates) > 0 {
+					mode = "partial_replan"
+				}
+				run.ResolutionMode = sql.NullString{String: mode, Valid: true}
+				run.ProgressState = sql.NullString{String: "completed", Valid: true}
+				run.UnresolvedSeqs = nil
+				if len(lockedCandidates) > 0 {
+					run.PreservedGroups = intentAssignmentMembership(lockedCandidates)
+				} else {
+					run.PreservedGroups = nil
+				}
+				if updateErr := state.UpdateIntentPlanRun(ctx, db, run); updateErr != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, updateErr
+				}
+				if health != nil && permitHeld {
 					if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
-						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, healthErr
+						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
 					}
 				}
-				return plan, "", "", retryCount, false, continuations, nil
+				return plan, "", "", retryCount, false, continuations, run, nil
 			}
 			if ctx.Err() != nil {
-				if health != nil {
+				if health != nil && permitHeld {
 					_ = health.Complete(ctx, permit, err)
 				}
-				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, ctx.Err()
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, ctx.Err()
 			}
 			var validation *ai.IntentPlanV2ValidationError
 			if errors.As(err, &validation) && len(validation.Findings) > 0 {
@@ -732,131 +796,389 @@ func chooseIntentCandidatePlan(
 					intentCandidateContinuationValidationRequest(req, continuations),
 					plan,
 				); ok {
-					if health != nil {
+					run.Completed = true
+					run.ResolutionMode = sql.NullString{String: "local_repair", Valid: true}
+					run.ProgressState = sql.NullString{String: "completed", Valid: true}
+					run.UnresolvedSeqs = nil
+					run.PreservedGroups = nil
+					run.FindingCodes = intentFindingCodes(validation.Findings)
+					if updateErr := state.UpdateIntentPlanRun(ctx, db, run); updateErr != nil {
+						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, updateErr
+					}
+					if health != nil && permitHeld {
 						if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
-							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, healthErr
+							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
 						}
 					}
 					return repaired, "repaired_dependency_declarations",
 						ai.SanitizePlannerError(err.Error()), retryCount, false,
-						continuations, nil
+						continuations, run, nil
 				}
-			}
-			if retryLimit > 0 && validation != nil &&
-				ai.IntentPlanV2CorrectionEligible(validation.Findings) {
-				retry := plannerRequest
-				retry.RetryCorrection = ai.BuildIntentAtomicityCorrection(validation.Findings)
-				retryCount++
-				retryCtx := prompttrace.WithRetryCount(ctx, retryCount)
-				corrected, retryErr := ai.PlanIntentV2WithCompatibility(
-					retryCtx, planner, retry)
-				retryCallFailed := retryErr != nil
-				var correctedContinuations []intentCandidateContinuation
-				if retryErr == nil {
-					correctedContinuations, _, retryErr =
-						continuePersistedIntentCandidates(
-							req, &corrected,
-							intentCandidateContinuationOptions{})
-					if retryErr == nil {
-						retryErr = ai.ValidateIntentPlanV2(
-							intentCandidateContinuationValidationRequest(
-								req, correctedContinuations), corrected)
-					}
-					retryCallFailed = false
+				partition := intentPlanPartitionSignature(plan)
+				codes := intentFindingCodes(validation.Findings)
+				signature := partition + "\x00" + strings.Join(codes, ",")
+				run.FindingCodes = codes
+				run.UnresolvedSeqs = offeredIntentSeqs(req)
+				if preserved, partial, ok := preserveIntentPlanGroups(
+					req, plan, validation.Findings); ok &&
+					len(preserved) > len(lockedCandidates) {
+					lockedCandidates = preserved
+					plannerRequest = partial
+					run.PreservedGroups = intentAssignmentMembership(preserved)
+					run.UnresolvedSeqs = offeredIntentSeqs(partial)
 				}
-				if retryErr == nil {
-					if health != nil {
-						if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
-							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, healthErr
-						}
-					}
-					return corrected, "", "", retryCount, false,
-						correctedContinuations, nil
-				} else if ctx.Err() != nil {
-					if health != nil {
-						_ = health.Complete(ctx, permit, retryErr)
-					}
-					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, ctx.Err()
-				} else {
-					err = retryErr
-					plannerCallFailed = retryCallFailed
+				run.NormalizedPartition = sql.NullString{String: partition, Valid: partition != ""}
+				if previousSignature != "" && signature == previousSignature {
+					run.ProgressState = sql.NullString{String: "no_progress", Valid: true}
+					_ = state.UpdateIntentPlanRun(ctx, db, run)
+					plannerFailure = ai.SanitizePlannerError(err.Error())
+					break
 				}
-			}
-			if health != nil {
-				failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
-				if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
-					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, healthErr
+				previousSignature = signature
+				run.ProgressState = sql.NullString{String: "refining", Valid: true}
+				if updateErr := state.UpdateIntentPlanRun(ctx, db, run); updateErr != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, updateErr
 				}
+				plannerRequest.RetryCorrection = ai.BuildIntentAtomicityCorrection(validation.Findings)
+				if len(lockedCandidates) > 0 {
+					plannerRequest.RetryCorrection += "\nPreserve these validated locked groups: " +
+						intentPlanPartitionSignature(ai.IntentPlanV2{Candidates: lockedCandidates})
+				}
+				plannerCallFailed = false
+				plannerFailure = ai.SanitizePlannerError(err.Error())
+				continue
 			}
 			plannerFailure = ai.SanitizePlannerError(err.Error())
+			if health != nil && permitHeld {
+				failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
+				if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
+				}
+				permitHeld = false
+			}
+			break
 		}
 	}
-	switch preset {
-	case config.PresetFast:
-		plan := deterministicIntentCandidatePlan(req, false, true)
-		var messageErr error
-		plan, plannerFailure, messageErr = applyIntentFallbackMessageQuality(
-			ctx, planner, req, plan, plannerFailure)
-		if messageErr != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
-				false, nil, messageErr
+	if health != nil && permitHeld {
+		// A provider response that failed semantic validation is not a transport
+		// outage. Evidence reconstruction below is the successful terminal path.
+		if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
 		}
-		continuations, _, err := continuePersistedIntentCandidates(
-			req, &plan, intentCandidateContinuationOptions{
-				RewriteDeterministicMessage: true,
-			})
-		if err != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, err
-		}
-		return plan, "hard_dependency_component", plannerFailure, retryCount, false,
-			continuations,
-			ai.ValidateIntentPlanV2(
-				intentCandidateContinuationValidationRequest(
-					req, continuations), plan)
-	case config.PresetBalanced:
-		if plan, ok := reuseIntentCandidatePartition(req, existing); ok {
-			return plan, "last_valid_partition", plannerFailure, retryCount, false, nil, nil
-		}
-		plan, fallbackNeedsAttention := balancedIntentCandidatePlan(req)
-		var messageErr error
-		plan, plannerFailure, messageErr = applyIntentFallbackMessageQuality(
-			ctx, planner, req, plan, plannerFailure)
-		if messageErr != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
-				false, nil, messageErr
-		}
-		continuations, companionNeedsAttention, err :=
-			continuePersistedIntentCandidates(
-				req, &plan, intentCandidateContinuationOptions{
-					RewriteDeterministicMessage: true,
-					IncludePersistedCompanions:  true,
-				})
-		if err != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, err
-		}
-		return plan, "verified_dependency_partition", plannerFailure, retryCount,
-			fallbackNeedsAttention || companionNeedsAttention, continuations,
-			ai.ValidateIntentPlanV2(
-				intentCandidateContinuationValidationRequest(
-					req, continuations), plan)
-	case config.PresetQuality:
-		plan := holdIntentCandidatePlan(req)
-		continuations, _, err := continuePersistedIntentCandidates(
-			req, &plan, intentCandidateContinuationOptions{
-				RewriteDeterministicMessage: true,
-			})
-		if err != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, err
-		}
-		return plan, "needs_attention", plannerFailure, retryCount, true,
-			continuations,
-			ai.ValidateIntentPlanV2(
-				intentCandidateContinuationValidationRequest(
-					req, continuations), plan)
-	default:
-		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil,
+	}
+	if preset != config.PresetFast && preset != config.PresetBalanced && preset != config.PresetQuality {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run,
 			fmt.Errorf("daemon: intent candidates: unsupported preset %q", preset)
 	}
+	plan := deterministicIntentCandidatePlan(req, true, false)
+	fallbackNeedsAttention := false
+	if preset == config.PresetBalanced {
+		plan, fallbackNeedsAttention = balancedIntentCandidatePlan(req)
+	}
+	var messageErr error
+	plan, plannerFailure, messageErr = applyIntentFallbackMessageQuality(
+		ctx, planner, req, plan, plannerFailure)
+	if messageErr != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, messageErr
+	}
+	continuations, companionNeedsAttention, err := continuePersistedIntentCandidates(
+		req, &plan, intentCandidateContinuationOptions{
+			RewriteDeterministicMessage: true,
+			IncludePersistedCompanions:  true,
+		})
+	if err != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
+	}
+	validationErr := ai.ValidateIntentPlanV2(
+		intentCandidateContinuationValidationRequest(req, continuations), plan)
+	if validationErr != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, validationErr
+	}
+	if run.AttemptCount == 0 {
+		var ensureErr error
+		run, ensureErr = state.EnsureIntentPlanRun(ctx, db, run)
+		if ensureErr != nil {
+			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, ensureErr
+		}
+	}
+	run.Completed = true
+	run.ResolutionMode = sql.NullString{String: "evidence_partition", Valid: true}
+	run.ProgressState = sql.NullString{String: "completed", Valid: true}
+	run.UnresolvedSeqs = nil
+	run.PreservedGroups = nil
+	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
+	}
+	return plan, "evidence_partition", plannerFailure, retryCount,
+		fallbackNeedsAttention || companionNeedsAttention, continuations, run, nil
+}
+
+func validatePlannerSemanticRationale(
+	req ai.IntentPlanRequestV2,
+	plan ai.IntentPlanV2,
+) error {
+	for _, candidate := range plan.Candidates {
+		if len(candidate.SelectedSeqs) <= 1 ||
+			intentRequestSeqsConnected(candidate.SelectedSeqs, req.Dependencies) {
+			continue
+		}
+		rationale := strings.ToLower(strings.TrimSpace(
+			candidate.Purpose + " " + candidate.GroupingReason))
+		for _, weak := range []string{
+			"same evaluation window", "same window", "happened together",
+			"module directory", "directory proximity", "unrelated", "disconnected",
+		} {
+			if strings.Contains(rationale, weak) {
+				finding := ai.IntentAtomicityFinding{
+					CandidateID: candidate.CandidateID,
+					Gate:        ai.IntentAtomicitySeparation,
+					Code:        "candidate_disconnected",
+					Summary:     "semantic rationale relies on weak proximity rather than one intent",
+				}
+				return &ai.IntentPlanV2ValidationError{
+					Message:  "intent planner v2: candidate_disconnected: semantic rationale relies on weak proximity",
+					Findings: []ai.IntentAtomicityFinding{finding},
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func intentRequestSeqsConnected(
+	seqs []int64,
+	edges []ai.IntentCaptureDependency,
+) bool {
+	allowed := make(map[int64]struct{}, len(seqs))
+	for _, seq := range seqs {
+		allowed[seq] = struct{}{}
+	}
+	adj := make(map[int64][]int64, len(seqs))
+	for _, edge := range edges {
+		if edge.Strength == ai.IntentDependencySoft &&
+			!strongIntentSemanticDependency(edge.Kind) {
+			continue
+		}
+		if _, ok := allowed[edge.FromSeq]; !ok {
+			continue
+		}
+		if _, ok := allowed[edge.ToSeq]; !ok {
+			continue
+		}
+		adj[edge.FromSeq] = append(adj[edge.FromSeq], edge.ToSeq)
+		adj[edge.ToSeq] = append(adj[edge.ToSeq], edge.FromSeq)
+	}
+	seen := map[int64]struct{}{seqs[0]: {}}
+	queue := []int64{seqs[0]}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, next := range adj[current] {
+			if _, ok := seen[next]; ok {
+				continue
+			}
+			seen[next] = struct{}{}
+			queue = append(queue, next)
+		}
+	}
+	return len(seen) == len(seqs)
+}
+
+func newIntentPlanRun(
+	req ai.IntentPlanRequestV2,
+	input IntentCandidateEvaluation,
+	attemptLimit int,
+) state.IntentPlanRun {
+	if attemptLimit < 1 {
+		attemptLimit = 1
+	} else if attemptLimit > 3 {
+		attemptLimit = 3
+	}
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "v1\x00%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d\x00%t\x00%s",
+		input.BranchRef, input.BranchGeneration, input.Provider, input.Model,
+		input.Preset, input.CommitFormat, input.PresetVersion,
+		input.ConfigRevisionID.Int64, input.ConfigRevisionID.Valid,
+		input.VerificationMode)
+	for _, capture := range req.OfferedCaptures {
+		_, _ = fmt.Fprintf(h, "\x00capture:%d:%s:%s:%s:%x",
+			capture.Seq, capture.Path, capture.Op,
+			capture.Fidelity, sha256.Sum256([]byte(capture.CapturedDiff)))
+	}
+	for _, candidate := range req.Candidates {
+		_, _ = fmt.Fprintf(h, "\x00candidate:%s:%v:%s", candidate.CandidateID,
+			candidate.SelectedSeqs, candidate.Status)
+	}
+	for _, edge := range req.Dependencies {
+		_, _ = fmt.Fprintf(h, "\x00edge:%d:%d:%s:%s:%s", edge.FromSeq,
+			edge.ToSeq, edge.Strength, edge.Kind, edge.EvidenceHash)
+	}
+	return state.IntentPlanRun{
+		Fingerprint:      fmt.Sprintf("sha256:%x", h.Sum(nil)),
+		BranchRef:        input.BranchRef,
+		BranchGeneration: input.BranchGeneration,
+		Provider: sql.NullString{String: input.Provider,
+			Valid: strings.TrimSpace(input.Provider) != ""},
+		Model: sql.NullString{String: input.Model,
+			Valid: strings.TrimSpace(input.Model) != ""},
+		ConfigRevisionID: input.ConfigRevisionID,
+		AttemptLimit:     attemptLimit,
+		UnresolvedSeqs:   offeredIntentSeqs(req),
+	}
+}
+
+func offeredIntentSeqs(req ai.IntentPlanRequestV2) []int64 {
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	return seqs
+}
+
+func intentPlanMembership(plan ai.IntentPlanV2) [][]int64 {
+	groups := make([][]int64, 0, len(plan.Candidates))
+	for _, candidate := range plan.Candidates {
+		seqs := append([]int64(nil), candidate.SelectedSeqs...)
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		groups = append(groups, seqs)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if len(groups[i]) == 0 || len(groups[j]) == 0 {
+			return len(groups[i]) < len(groups[j])
+		}
+		return groups[i][0] < groups[j][0]
+	})
+	return groups
+}
+
+func intentAssignmentMembership(assignments []ai.IntentCandidateAssignment) [][]int64 {
+	return intentPlanMembership(ai.IntentPlanV2{Candidates: assignments})
+}
+
+func mergeLockedIntentCandidates(
+	req ai.IntentPlanRequestV2,
+	locked []ai.IntentCandidateAssignment,
+	replanned ai.IntentPlanV2,
+) ai.IntentPlanV2 {
+	merged := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}
+	merged.Candidates = append(merged.Candidates, cloneIntentPlanV2(
+		ai.IntentPlanV2{Candidates: locked}).Candidates...)
+	merged.Candidates = append(merged.Candidates, replanned.Candidates...)
+	addIntentCandidateDependencies(req, &merged)
+	return merged
+}
+
+// preserveIntentPlanGroups locks only structurally sound groups whose hard
+// dependency closure is complete. Everything else is returned as a smaller
+// request, so malformed membership can never be salvaged into a commit.
+func preserveIntentPlanGroups(
+	req ai.IntentPlanRequestV2,
+	plan ai.IntentPlanV2,
+	findings []ai.IntentAtomicityFinding,
+) ([]ai.IntentCandidateAssignment, ai.IntentPlanRequestV2, bool) {
+	badIDs := make(map[string]struct{}, len(findings))
+	for _, finding := range findings {
+		if finding.CandidateID != "" {
+			badIDs[finding.CandidateID] = struct{}{}
+		}
+	}
+	offered := make(map[int64]ai.OfferedCapture, len(req.OfferedCaptures))
+	counts := make(map[int64]int, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		offered[capture.Seq] = capture
+	}
+	for _, candidate := range plan.Candidates {
+		for _, seq := range candidate.SelectedSeqs {
+			counts[seq]++
+		}
+	}
+	owner := make(map[int64]string, len(offered))
+	for _, candidate := range plan.Candidates {
+		for _, seq := range candidate.SelectedSeqs {
+			owner[seq] = candidate.CandidateID
+		}
+	}
+	for _, edge := range req.Dependencies {
+		if edge.Strength != ai.IntentDependencyHard {
+			continue
+		}
+		fromID, fromOK := owner[edge.FromSeq]
+		toID, toOK := owner[edge.ToSeq]
+		if fromOK && toOK && fromID != toID {
+			badIDs[fromID] = struct{}{}
+			badIDs[toID] = struct{}{}
+		}
+	}
+	var preserved []ai.IntentCandidateAssignment
+	preservedSeq := make(map[int64]struct{})
+	for _, candidate := range plan.Candidates {
+		if _, bad := badIDs[candidate.CandidateID]; bad || candidate.CandidateID == "" ||
+			len(candidate.SelectedSeqs) == 0 {
+			continue
+		}
+		valid := true
+		for _, seq := range candidate.SelectedSeqs {
+			if _, ok := offered[seq]; !ok || counts[seq] != 1 {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		preserved = append(preserved, candidate)
+		for _, seq := range candidate.SelectedSeqs {
+			preservedSeq[seq] = struct{}{}
+		}
+	}
+	if len(preserved) == 0 || len(preservedSeq) == len(offered) {
+		return nil, ai.IntentPlanRequestV2{}, false
+	}
+	partial := req
+	partial.OfferedCaptures = make([]ai.OfferedCapture, 0,
+		len(req.OfferedCaptures)-len(preservedSeq))
+	for _, capture := range req.OfferedCaptures {
+		if _, locked := preservedSeq[capture.Seq]; !locked {
+			partial.OfferedCaptures = append(partial.OfferedCaptures, capture)
+		}
+	}
+	partial.Candidates = append([]ai.IntentCandidateSummary(nil), req.Candidates...)
+	for _, candidate := range preserved {
+		partial.Candidates = append(partial.Candidates, ai.IntentCandidateSummary{
+			CandidateID:  candidate.CandidateID,
+			Status:       "locked_ready",
+			Purpose:      candidate.Purpose,
+			SelectedSeqs: append([]int64(nil), candidate.SelectedSeqs...),
+			Ready:        candidate.Readiness == ai.IntentCandidateReady,
+		})
+	}
+	return preserved, partial, len(partial.OfferedCaptures) > 0
+}
+
+func intentPlanPartitionSignature(plan ai.IntentPlanV2) string {
+	groups := intentPlanMembership(plan)
+	parts := make([]string, 0, len(groups))
+	for _, group := range groups {
+		parts = append(parts, fmt.Sprint(group))
+	}
+	return strings.Join(parts, "|")
+}
+
+func intentFindingCodes(findings []ai.IntentAtomicityFinding) []string {
+	set := make(map[string]struct{}, len(findings))
+	for _, finding := range findings {
+		code := strings.TrimSpace(finding.Code)
+		if code != "" {
+			set[code] = struct{}{}
+		}
+	}
+	codes := make([]string, 0, len(set))
+	for code := range set {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	return codes
 }
 
 func applyIntentFallbackMessageQuality(
@@ -1019,7 +1341,8 @@ func evaluateIntentCandidateAssignment(
 			ai.IntentAtomicityCompleteness, "candidate_waiting",
 			"candidate is waiting for required companions")
 	}
-	if err := validateIntentCandidateComponent(selected, dependencies); err != nil {
+	if err := validateIntentCandidateComponent(selected, dependencies); err != nil &&
+		!input.allowSemanticPlan {
 		results[0] = failedIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityCohesion, "candidate_lacks_semantic_cohesion", err)
 		results[2] = failedIntentGate(assignment.CandidateID,
@@ -2092,6 +2415,21 @@ func intentDependencyComponents(req ai.IntentPlanRequestV2, includeSemantic bool
 			parent[rb] = ra
 		}
 	}
+	type pair struct{ left, right int64 }
+	pairKinds := make(map[pair]map[string]struct{})
+	if includeSemantic {
+		for _, edge := range req.Dependencies {
+			left, right := edge.FromSeq, edge.ToSeq
+			if left > right {
+				left, right = right, left
+			}
+			key := pair{left: left, right: right}
+			if pairKinds[key] == nil {
+				pairKinds[key] = make(map[string]struct{})
+			}
+			pairKinds[key][edge.Kind] = struct{}{}
+		}
+	}
 	for _, edge := range req.Dependencies {
 		if _, ok := parent[edge.FromSeq]; !ok {
 			continue
@@ -2099,8 +2437,12 @@ func intentDependencyComponents(req ai.IntentPlanRequestV2, includeSemantic bool
 		if _, ok := parent[edge.ToSeq]; !ok {
 			continue
 		}
-		if edge.Strength == ai.IntentDependencyHard ||
-			(includeSemantic && strongIntentSemanticDependency(edge.Kind)) {
+		left, right := edge.FromSeq, edge.ToSeq
+		if left > right {
+			left, right = right, left
+		}
+		if edge.Strength == ai.IntentDependencyHard || (includeSemantic &&
+			evidencePartitionDependency(edge.Kind, pairKinds[pair{left: left, right: right}])) {
 			union(edge.FromSeq, edge.ToSeq)
 		}
 	}
@@ -2121,6 +2463,19 @@ func intentDependencyComponents(req ai.IntentPlanRequestV2, includeSemantic bool
 		return out[i][0] < out[j][0]
 	})
 	return out
+}
+
+func evidencePartitionDependency(kind string, corroborating map[string]struct{}) bool {
+	switch kind {
+	case "activity_epoch", "temporal_proximity", "module_proximity":
+		return false
+	case "symbol_hash", "hunk_hash":
+		_, symbol := corroborating["symbol_hash"]
+		_, hunk := corroborating["hunk_hash"]
+		return symbol && hunk
+	default:
+		return true
+	}
 }
 
 func addIntentCandidateDependencies(req ai.IntentPlanRequestV2, plan *ai.IntentPlanV2) {

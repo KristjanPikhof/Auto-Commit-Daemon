@@ -692,16 +692,11 @@ func ValidateIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) error {
 			}
 		}
 	}
-	for _, candidate := range plan.Candidates {
-		connectedSeqs := append([]int64(nil), candidate.SelectedSeqs...)
-		if persisted, ok := persistedByID[candidate.CandidateID]; ok {
-			connectedSeqs = append(connectedSeqs, persisted.SelectedSeqs...)
-		}
-		if len(connectedSeqs) > 1 && !seqSetConnected(connectedSeqs, adjacent) {
-			return v2ValidationError(candidate.CandidateID, IntentAtomicitySeparation, "candidate_disconnected",
-				"candidate merges captures without dependency evidence connecting every component")
-		}
-	}
+	// A model may identify semantic cohesion that the bounded local graph does
+	// not already contain. The daemon still subjects that exact membership to
+	// hard-boundary, dependency, materialization, verification, and Git gates.
+	// Evidence fallbacks remain graph-derived; this validator must not turn a
+	// missing soft edge into a provider outage.
 	return nil
 }
 
@@ -908,7 +903,8 @@ func IntentPlannerV2SystemPrompt(format ...CommitFormat) string {
 	return "You are a semantic intent planner for atomic git commits. " +
 		"Return only a v2 candidate plan. Assign every offered seq to exactly one candidate. " +
 		"Candidate order must be topological. Non-contiguous capture groups are allowed when dependency evidence proves independence and ordering. " +
-		"Never merge disconnected semantic components. Activity epochs and temporal proximity may trigger evaluation but cannot alone prove cohesion. " +
+		"A group may add semantic cohesion not present in the dependency graph when the exact diffs prove one intent. Never group by time or directory alone. " +
+		"Activity epochs and temporal proximity may trigger evaluation but cannot alone prove cohesion. " +
 		"Mark readiness=wait when any required companion is missing. A ready candidate must not depend on a waiting candidate. " +
 		"Keep raw-source reasoning out of purpose, grouping_reason, and missing_companions. " +
 		CommitMessageFormatInstructions(selected) + " " +

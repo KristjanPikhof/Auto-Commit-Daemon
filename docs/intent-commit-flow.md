@@ -39,38 +39,35 @@ not depend on them.
 
 | Preset | Publication behavior |
 |---|---|
-| Fast | Smallest materializable hard component with deterministic fallback. |
-| Balanced | Dependency-aware partition and fast verification; bounded safe repair may be enabled. |
-| Quality | Waits for a valid high-cohesion result rather than weakening safety. |
+| Fast | Evidence-based partition with structural checks. |
+| Balanced | Evidence-based partition with fast verification and bounded safe repair. |
+| Quality | Evidence-based partition with stronger verification and bounded safe repair. |
 
 ## Planner recovery
 
-ACD repairs a missing candidate dependency only when an existing hard capture
-edge proves it. The repaired plan must pass the complete validator. It is not
-used when the plan has a cycle, an unknown owner, invalid membership, invalid
-ordering, or another structural defect.
+ACD can make three planning attempts for one unchanged capture window. The
+`intent.retry_on_invalid` setting counts extra attempts after the first call
+and is capped at two. The attempt count is tied to a durable fingerprint, so a
+restart, flush, or `acd off` followed by `acd on` cannot restart the loop.
 
-An eligible metadata error can receive one remote correction. The effective
-correction maximum is one even if an older saved setting contains a larger
-value. After stable candidate IDs are assigned, ACD removes dependencies that
-became self-references only because a persisted candidate was continued,
-deduplicates the remaining edges, and puts candidates in dependency order. It
-then runs the complete validator again.
+After each response, ACD adds dependency declarations already proved by hard
+edges. It keeps groups that are valid and have complete hard-dependency
+closure, then sends only unresolved captures back for correction. Repeated
+membership with the same findings stops the retry loop early.
 
-If the corrected plan is still invalid, Fast and Balanced build one
-deterministic plan from the complete hard-dependency closure. Duplicate active
-candidates merge into one lineage-preserving survivor. If that plan cannot
-move the frozen target, the durable drain switches to a local atomic fallback.
-That fallback keeps every hard dependency component in one commit and still
-uses the normal scratch index, verification, exact-ref CAS, and publication
-journal. It does not change the repository's configured strategy.
+If remote planning still cannot produce a valid plan, every preset builds an
+evidence-based partition. Hard path, object, and rename relationships are
+kept together. Source/test, migration/test, exact references, generated
+artifacts, persisted membership, and corroborated symbol or hunk evidence may
+join components. Time or directory proximity alone never joins them. The
+result passes the same materialization, verification, exact-ref CAS, and
+publication journal checks as a provider plan.
 
-ACD uses `needs_attention` only when it cannot prove a safe preset outcome.
+ACD uses `needs_attention` only when it cannot prove a safe outcome.
 Examples include unresolved dependency ambiguity, failed materialization or
 verification, a revertibility failure, or uncertain branch ownership and
-exact-ref state. Quality also waits rather than weakening its acceptance
-rules. Provider and grouping failures that have a safe fallback remain
-retrying or waiting without changing completed checkpoints.
+exact-ref state. A provider or grouping failure does not require attention
+when the evidence partition passes those checks.
 
 Each explicit publication drain has a bounded semantic path. Invalid planner
 output cannot start a hot retry loop. The drain survives terminal disconnects,
