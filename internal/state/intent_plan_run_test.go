@@ -48,3 +48,24 @@ func TestIntentPlanRunAttemptBudgetSurvivesReopen(t *testing.T) {
 		t.Fatalf("exhausted=(%+v,%t,%v)", exhausted, allowed, err)
 	}
 }
+
+func TestEnsureIntentPlanRunRecordsZeroAttemptResolution(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	run, err := EnsureIntentPlanRun(ctx, db, IntentPlanRun{
+		Fingerprint: "sha256:zero", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, AttemptLimit: 3,
+	})
+	if err != nil || run.AttemptCount != 0 {
+		t.Fatalf("ensure=(%+v,%v)", run, err)
+	}
+	run.Completed = true
+	run.ResolutionMode = sql.NullString{String: "evidence_partition", Valid: true}
+	if err := UpdateIntentPlanRun(ctx, db, run); err != nil {
+		t.Fatal(err)
+	}
+	loaded, allowed, err := ReserveIntentPlanAttempt(ctx, db, run)
+	if err != nil || allowed || !loaded.Completed || loaded.AttemptCount != 0 {
+		t.Fatalf("completed zero-attempt run=(%+v,%t,%v)", loaded, allowed, err)
+	}
+}

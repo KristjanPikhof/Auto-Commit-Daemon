@@ -29,6 +29,32 @@ type IntentPlanRun struct {
 	UpdatedTS           float64
 }
 
+// EnsureIntentPlanRun returns the durable row for a fingerprint without
+// consuming a remote-attempt slot. Circuit-open evidence fallback uses this
+// path so a zero-call resolution is still observable after restart.
+func EnsureIntentPlanRun(ctx context.Context, d *DB, run IntentPlanRun) (IntentPlanRun, error) {
+	if d == nil || run.Fingerprint == "" || run.BranchRef == "" || run.AttemptLimit < 1 {
+		return IntentPlanRun{}, fmt.Errorf("state: EnsureIntentPlanRun: invalid input")
+	}
+	now := nowSeconds()
+	_, err := d.conn.ExecContext(ctx, `
+INSERT OR IGNORE INTO intent_plan_runs(
+    fingerprint, branch_ref, branch_generation, provider, model,
+    config_revision_id, attempt_limit, created_ts, updated_ts
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, run.Fingerprint, run.BranchRef,
+		run.BranchGeneration, run.Provider, run.Model, run.ConfigRevisionID,
+		run.AttemptLimit, now, now)
+	if err != nil {
+		return IntentPlanRun{}, fmt.Errorf("state: ensure intent plan run: %w", err)
+	}
+	current, err := scanIntentPlanRun(d.conn.QueryRowContext(ctx,
+		intentPlanRunSelect+` WHERE fingerprint=?`, run.Fingerprint))
+	if err != nil {
+		return IntentPlanRun{}, err
+	}
+	return current, nil
+}
+
 // ReserveIntentPlanAttempt atomically consumes one remote-attempt slot. A
 // restart, flush, or off/on cycle sees the same row and cannot reset the cap.
 func ReserveIntentPlanAttempt(ctx context.Context, d *DB, run IntentPlanRun) (IntentPlanRun, bool, error) {

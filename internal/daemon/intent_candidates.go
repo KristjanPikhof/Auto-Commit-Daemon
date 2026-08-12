@@ -890,15 +890,20 @@ func chooseIntentCandidatePlan(
 	if validationErr != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, validationErr
 	}
+	if run.AttemptCount == 0 {
+		var ensureErr error
+		run, ensureErr = state.EnsureIntentPlanRun(ctx, db, run)
+		if ensureErr != nil {
+			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, ensureErr
+		}
+	}
 	run.Completed = true
 	run.ResolutionMode = sql.NullString{String: "evidence_partition", Valid: true}
 	run.ProgressState = sql.NullString{String: "completed", Valid: true}
 	run.UnresolvedSeqs = nil
 	run.PreservedGroups = nil
-	if run.AttemptCount > 0 {
-		if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
-		}
+	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
 	}
 	return plan, "evidence_partition", plannerFailure, retryCount,
 		companionNeedsAttention, continuations, run, nil
