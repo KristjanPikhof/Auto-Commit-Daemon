@@ -32,7 +32,15 @@ type configValue struct {
 func newConfigGetCmd() *cobra.Command {
 	var options configScopeOptions
 	cmd := &cobra.Command{
-		Use: "get [KEY]", Short: "Read resolved configuration", Args: cobra.MaximumNArgs(1),
+		Use: "get [KEY]", Short: "Show the settings ACD is using", Args: cobra.MaximumNArgs(1),
+		Long: `Show one setting or all resolved settings for the selected scope.
+
+The output includes where each value came from. This command does not change
+anything.`,
+		Example: `  acd config get
+  acd config get commit.strategy
+  acd config get --scope global
+  acd config get --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -50,7 +58,14 @@ func newConfigGetCmd() *cobra.Command {
 func newConfigSetCmd() *cobra.Command {
 	var options configScopeOptions
 	cmd := &cobra.Command{
-		Use: "set KEY VALUE", Short: "Save one configuration value", Args: cobra.ExactArgs(2),
+		Use: "set KEY VALUE", Short: "Save one setting", Args: cobra.ExactArgs(2),
+		Long: `Save one setting for a repository, profile, or global defaults.
+
+ACD validates the name and value before saving. The output says whether the
+change is active now or requires the background worker to restart.`,
+		Example: `  acd config set commit.strategy intent
+  acd config set commit.preset balanced
+  acd config set commit.strategy event --scope global`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -64,7 +79,14 @@ func newConfigSetCmd() *cobra.Command {
 func newConfigResetCmd() *cobra.Command {
 	var options configScopeOptions
 	cmd := &cobra.Command{
-		Use: "reset [KEY]", Short: "Reset one value or an entire configuration scope", Args: cobra.MaximumNArgs(1),
+		Use: "reset [KEY]", Short: "Remove saved settings and use inherited defaults", Args: cobra.MaximumNArgs(1),
+		Long: `Remove one saved setting, or all settings in the selected scope when
+no key is supplied. ACD then uses the next inherited value.
+
+The command shows a preview unless --yes is supplied.`,
+		Example: `  acd config reset commit.strategy
+  acd config reset commit.strategy --yes
+  acd config reset --scope global --yes`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
