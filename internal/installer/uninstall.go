@@ -204,7 +204,7 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 			if readErr != nil || sha256String(current) != item.BeforeDigest {
 				return Result{}, rollback(fmt.Errorf("uninstall: integration changed after preview: %s", item.Target))
 			}
-			if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, item.Target, item.AfterDigest); err != nil {
+			if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, item.Target, fileDigest(item.Content, 0o600)); err != nil {
 				return Result{}, rollback(err)
 			}
 			if err := writeAtomic(item.Target, item.Content, 0o600); err != nil {

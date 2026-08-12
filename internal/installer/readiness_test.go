@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -54,6 +55,33 @@ func TestWaitSupervisorWorkersReadyWaitsForEveryWorkerSocket(t *testing.T) {
 	}
 	if !slices.Contains(counts, 1) || counts[len(counts)-1] != 2 {
 		t.Fatalf("readiness progress=%v", counts)
+	}
+}
+
+func TestWaitSupervisorReadyRejectsWorkerErrorResponse(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "acd-ready-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	roots := paths.Roots{State: filepath.Join(root, "s")}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	repositoryID := "1111111111111111"
+	worker := supervisor.WorkerStatus{RepositoryID: repositoryID, PID: os.Getpid(), State: "running"}
+	startReadinessServer(t, ctx, roots.SupervisorSocketPath(), func(request supervisor.Request) supervisor.Response {
+		return supervisor.Response{Version: supervisor.ProtocolVersion, ID: request.ID, OK: true,
+			Data: supervisor.Status{Version: "test", Workers: []supervisor.WorkerStatus{worker}}}
+	})
+	startReadinessServer(t, ctx, supervisor.WorkerSocketPath(roots, repositoryID), func(request supervisor.Request) supervisor.Response {
+		return supervisor.Response{Version: supervisor.ProtocolVersion, ID: request.ID,
+			Error: &supervisor.ProtocolError{Code: "not_ready", Message: "worker is not ready", Retryable: true}}
+	})
+	processDone := make(chan struct{})
+	time.AfterFunc(300*time.Millisecond, func() { close(processDone) })
+	if err := waitSupervisorReady(ctx, roots, repositoryID, processDone); err == nil ||
+		!strings.Contains(err.Error(), "exited before becoming ready") {
+		t.Fatalf("waitSupervisorReady error=%v", err)
 	}
 }
 

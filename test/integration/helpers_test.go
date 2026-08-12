@@ -13,9 +13,7 @@ package integration_test
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -145,12 +143,7 @@ func startCheckpointSupervisorRuntime(t *testing.T, env []string, roots paths.Ro
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	command.Env = supervisor.ProcessEnvironment(roots, env)
 	if runtime.GOOS == "darwin" {
-		ownership, ownershipErr := checkpointResponsibilitySessionOwnership(context.Background())
-		if ownershipErr != nil {
-			_ = logFile.Close()
-			t.Fatalf("resolve integration supervisor ownership: %v", ownershipErr)
-		}
-		command.Env = append(command.Env, integrationSupervisorOwnership+ownership)
+		command.Env = append(command.Env, integrationSupervisorOwnership+checkpointUserOwnership())
 	}
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -239,8 +232,8 @@ func assertCheckpointRuntimeOwnership(t *testing.T, roots paths.Roots) {
 	if err != nil {
 		t.Fatalf("inspect integration supervisor ownership: %v", err)
 	}
-	if !strings.HasPrefix(status.Ownership, "session:") {
-		t.Fatalf("integration supervisor ownership=%q, want session ownership", status.Ownership)
+	if status.Ownership != checkpointUserOwnership() {
+		t.Fatalf("integration supervisor ownership=%q, want %q", status.Ownership, checkpointUserOwnership())
 	}
 }
 
@@ -559,36 +552,7 @@ func cleanupCheckpointWatchdogProcess(
 	}
 }
 
-func checkpointResponsibilitySessionOwnership(ctx context.Context) (string, error) {
-	// The general integration harness must pass each test's explicit ACD
-	// environment to its supervisor, while production EnsureSession reads the
-	// process-global environment. Mirror its responsibility identity here so
-	// direct test children remain accepted by ordinary CLI commands. The
-	// dedicated session runtime test still exercises EnsureSession itself.
-	pid := os.Getpid()
-	var command string
-	for depth := 0; depth < 64; depth++ {
-		output, err := exec.CommandContext(ctx, "/bin/ps", "-o", "ppid=,comm=", "-p", strconv.Itoa(pid)).Output()
-		if err != nil {
-			return "", err
-		}
-		fields := strings.Fields(strings.TrimSpace(string(output)))
-		if len(fields) < 2 {
-			return "", errors.New("invalid process ancestry")
-		}
-		parent, err := strconv.Atoi(fields[0])
-		if err != nil || parent < 0 {
-			return "", errors.New("invalid parent process")
-		}
-		command = strings.Join(fields[1:], " ")
-		if parent <= 1 {
-			digest := sha256.Sum256([]byte(strconv.Itoa(pid) + "\x00" + command))
-			return "session:" + hex.EncodeToString(digest[:16]), nil
-		}
-		pid = parent
-	}
-	return "", errors.New("process ancestry is too deep")
-}
+func checkpointUserOwnership() string { return "user:" + strconv.Itoa(os.Getuid()) }
 
 func captureCheckpointProcessIdentity(pid int) (checkpointProcessIdentity, error) {
 	fingerprint, err := identity.CaptureContext(context.Background(), pid)

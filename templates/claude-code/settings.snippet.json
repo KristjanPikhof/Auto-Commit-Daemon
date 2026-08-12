@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; acd internal session open --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" >/dev/null 2>>\"$LOG\" || { printf '\"'\"'[%s] session-start failed exit=%d cmd=acd-start\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; acd internal session open --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" >/dev/null 2>>\"$LOG\" || { rc=$?; printf '\"'\"'[%s] session-start failed exit=%d cmd=acd-start\\n'\"'\"' \"$(date +%FT%T%z)\" \"$rc\" >>\"$LOG\"; exit 1; }'"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; REPO=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; { acd internal session open --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd internal hint --kind wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; REPO=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; { acd internal session open --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd internal hint --kind wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { rc=$?; printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$rc\" >>\"$LOG\"; exit 1; }'"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; REPO=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; { acd internal session open --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd internal hint --kind wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$?\" >>\"$LOG\"; exit 1; }'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; REPO=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; { acd internal session open --session-id \"$SID\" --harness claude-code --watch-pid \"$PPID\" --repo \"$REPO\" >/dev/null && acd internal hint --kind wake --session-id \"$SID\" --repo \"$REPO\" >/dev/null ; } 2>>\"$LOG\" || { rc=$?; printf '\"'\"'[%s] active hook failed exit=%d cmd=acd-start-wake\\n'\"'\"' \"$(date +%FT%T%z)\" \"$rc\" >>\"$LOG\"; exit 1; }'"
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; acd internal hint --kind logical_boundary --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" >/dev/null 2>>\"$LOG\"'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; acd internal hint --kind logical_boundary --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" >/dev/null 2>>\"$LOG\" || { rc=$?; printf '\"'\"'[%s] logical-boundary failed exit=%d cmd=acd-flush-logical\\n'\"'\"' \"$(date +%FT%T%z)\" \"$rc\" >>\"$LOG\"; exit 0; }'"
           }
         ]
       }
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; acd internal session close --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" >/dev/null 2>>\"$LOG\"'"
+            "command": "bash -c 'LOG=\"${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log\"; LOG_DIR=\"$(dirname \"$LOG\")\"; [ -d \"$LOG_DIR\" ] || mkdir -p \"$LOG_DIR\" 2>/dev/null || true; SID=$(acd internal integration stdin-extract session_id <&0 2>>\"$LOG\") || exit 0; acd internal session close --session-id \"$SID\" --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" >/dev/null 2>>\"$LOG\" || { rc=$?; printf '\"'\"'[%s] session-close failed exit=%d cmd=acd-stop\\n'\"'\"' \"$(date +%FT%T%z)\" \"$rc\" >>\"$LOG\"; exit 0; }'"
           }
         ]
       }

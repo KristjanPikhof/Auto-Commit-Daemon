@@ -32,10 +32,26 @@ type WorkerStatus struct {
 }
 
 type Status struct {
-	PID       int            `json:"pid"`
-	Version   string         `json:"version"`
-	Ownership string         `json:"ownership"`
-	Workers   []WorkerStatus `json:"workers"`
+	PID           int            `json:"pid"`
+	Version       string         `json:"version"`
+	BinaryDigest  string         `json:"binary_digest,omitempty"`
+	Ownership     string         `json:"ownership"`
+	Compatibility Compatibility  `json:"compatibility"`
+	Workers       []WorkerStatus `json:"workers"`
+}
+
+// Compatibility is the explicit persisted-data and IPC contract required for
+// a lightweight binary replacement. A zero value identifies a legacy runtime
+// that must complete one final full setup before automatic upgrades are safe.
+type Compatibility struct {
+	ProtocolVersion    int `json:"protocol_version"`
+	RegistryVersion    int `json:"registry_version"`
+	StateSchemaVersion int `json:"state_schema_version"`
+	IntegrationVersion int `json:"integration_version"`
+}
+
+func (c Compatibility) Equal(other Compatibility) bool {
+	return c != (Compatibility{}) && c == other
 }
 
 type ShutdownStatus struct {
@@ -47,10 +63,12 @@ type Handler interface {
 }
 
 type Server struct {
-	Roots      paths.Roots
-	BinaryPath string
-	Version    string
-	Handler    Handler
+	Roots         paths.Roots
+	BinaryPath    string
+	Version       string
+	BinaryDigest  string
+	Compatibility Compatibility
+	Handler       Handler
 	// LaunchdWorkers is retained only for cleaning up or testing the legacy
 	// macOS worker wrapper. Product supervisors run workers as direct children
 	// so they keep the invoking session's repository access.
@@ -147,6 +165,10 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("supervisor: accept: %w", err)
 		}
+		if err := validatePeerUser(conn); err != nil {
+			_ = conn.Close()
+			continue
+		}
 		go s.serveConnection(ctx, conn)
 	}
 	s.shutdownWorkers()
@@ -240,7 +262,9 @@ func (s *Server) handle(ctx context.Context, request Request) (any, *ProtocolErr
 func (s *Server) status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	status := Status{PID: os.Getpid(), Version: s.Version, Ownership: os.Getenv(supervisorOwnershipEnv), Workers: make([]WorkerStatus, 0, len(s.workers))}
+	status := Status{PID: os.Getpid(), Version: s.Version, BinaryDigest: s.BinaryDigest,
+		Ownership: os.Getenv(supervisorOwnershipEnv), Compatibility: s.Compatibility,
+		Workers: make([]WorkerStatus, 0, len(s.workers))}
 	for _, worker := range s.workers {
 		item := WorkerStatus{RepositoryID: worker.id, Restarts: worker.restarts, LastError: worker.lastError, State: "backoff", Version: s.Version}
 		if worker.launchd {
@@ -268,6 +292,10 @@ func (s *Server) reconcile(ctx context.Context) error {
 	registry, err := central.Load(s.Roots)
 	if err != nil {
 		return fmt.Errorf("supervisor: load registry: %w", err)
+	}
+	if registry.Version != central.RegistryVersion {
+		return fmt.Errorf("supervisor: registry v%d requires `acd setup` before v%d workers can start",
+			registry.Version, central.RegistryVersion)
 	}
 	desiredRecords := make(map[string][]central.RepoRecord)
 	for _, record := range registry.Repos {

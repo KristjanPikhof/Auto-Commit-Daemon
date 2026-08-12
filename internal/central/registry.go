@@ -179,7 +179,7 @@ func Load(roots paths.Roots) (*Registry, error) {
 	}
 	if reg.Version == 0 {
 		// Treat an unstamped file as v1 (greenfield default).
-		reg.Version = RegistryVersion
+		reg.Version = 1
 	}
 	if reg.Repos == nil {
 		reg.Repos = []RepoRecord{}

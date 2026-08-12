@@ -50,6 +50,7 @@ type Action struct {
 }
 
 type Plan struct {
+	Mode                string                       `json:"mode"`
 	OperationID         string                       `json:"operation_id"`
 	Digest              string                       `json:"digest"`
 	ExistingInstall     bool                         `json:"existing_install"`
@@ -159,6 +160,11 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	if err != nil {
 		return Plan{}, err
 	}
+	if plan, ok, compatibleErr := buildCompatibleSetupPlan(ctx, roots, options, wt, executable, service, priorService, registry); compatibleErr != nil {
+		return Plan{}, compatibleErr
+	} else if ok {
+		return plan, nil
+	}
 	existing := registry.Version < central.RegistryVersion || len(registry.Repos) > 0 || fileExists(roots.ManagedBinaryPath()) || fileExists(service.Path) || fileExists(roots.ConfigPath())
 	planned, err := central.PlanRegistryV2(ctx, registry)
 	if err != nil && len(registry.Repos) > 0 {
@@ -211,6 +217,7 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 		return Plan{}, err
 	}
 	plan := Plan{
+		Mode:        "full",
 		OperationID: opID, ExistingInstall: existing, RequiresExpected: existing,
 		Repo: wt.Root, RepositoryID: registration.Record.RepositoryID, WorktreeID: registration.Record.WorktreeID,
 		ManagedBinary: roots.ManagedBinaryPath(), SourceExecutable: executable, Service: service,
@@ -261,6 +268,23 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptions) (Result, error) {
 	if plan.Digest == "" || digestPlan(plan) != plan.Digest {
 		return Result{}, errors.New("setup: plan digest mismatch")
+	}
+	if plan.Mode == "compatible_upgrade" {
+		forceReplacement := false
+		for _, integrationPlan := range plan.IntegrationPlans {
+			if integrationPlan.Changed {
+				forceReplacement = true
+				break
+			}
+		}
+		changed, err := ApplyCompatibleRuntime(ctx, roots, RuntimeUpgradeOptions{
+			SourceExecutable: plan.SourceExecutable,
+			SourceVersion:    version.String(),
+			Compatibility:    RuntimeCompatibility(),
+			Integrations:     strings.Join(plan.Integrations, ","),
+			Force:            forceReplacement,
+		})
+		return Result{OperationID: plan.OperationID, PlanDigest: plan.Digest, Changed: changed}, err
 	}
 	lifecycleLock, err := globalops.AcquireUserLock(ctx, roots.OperationsDBPath())
 	if err != nil {
@@ -358,7 +382,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err != nil {
 		return Result{}, rollbackFiles(err)
 	}
-	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, plan.ManagedBinary, sha256String(managedBody)); err != nil {
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, plan.ManagedBinary, fileDigest(managedBody, 0o755)); err != nil {
 		return Result{}, rollbackFiles(err)
 	}
 	if err := writeAtomic(plan.ManagedBinary, managedBody, 0o755); err != nil {
@@ -366,7 +390,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	holdBody, _ := json.Marshal(map[string]string{"operation_id": plan.OperationID, "plan_digest": plan.Digest})
 	holdBody = append(holdBody, '\n')
-	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.SetupPublicationHoldPath(), sha256String(holdBody)); err != nil {
+	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.SetupPublicationHoldPath(), fileDigest(holdBody, 0o600)); err != nil {
 		return Result{}, rollbackFiles(err)
 	}
 	if err := writeAtomic(roots.SetupPublicationHoldPath(), holdBody, 0o600); err != nil {
@@ -459,7 +483,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		return Result{}, rollback(err)
 	}
 	prepareConfig := func(body []byte) error {
-		return preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.ConfigPath(), sha256String(body))
+		return preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.ConfigPath(), fileDigest(body, 0o600))
 	}
 	if err := migrateRepositoryConfigKeys(roots, plan.Registry, prepareConfig); err != nil {
 		return Result{}, rollback(err)
@@ -471,7 +495,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	serviceDigest := absentFileDigest
 	if plan.Service.Platform != "session" {
-		serviceDigest = sha256String(plan.Service.Content)
+		serviceDigest = fileDigest(plan.Service.Content, 0o600)
 	}
 	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, plan.Service.Path, serviceDigest); err != nil {
 		return Result{}, rollback(err)
@@ -532,7 +556,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			if sha256String(current) != item.BeforeDigest {
 				return Result{}, rollback(fmt.Errorf("setup: integration changed after preview: %s", item.Target))
 			}
-			if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, item.Target, item.AfterDigest); err != nil {
+			if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, item.Target, fileDigest(item.Content, 0o600)); err != nil {
 				return Result{}, rollback(err)
 			}
 			if err := writeAtomic(item.Target, item.Content, 0o600); err != nil {
@@ -548,7 +572,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		if err != nil {
 			return Result{}, rollback(err)
 		}
-		if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.IntegrationsOwnershipPath(), sha256String(ownershipBody)); err != nil {
+		if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.IntegrationsOwnershipPath(), fileDigest(ownershipBody, 0o600)); err != nil {
 			return Result{}, rollback(err)
 		}
 		if err := integrationpkg.WriteOwnership(roots.IntegrationsOwnershipPath(), plan.IntegrationPlans); err != nil {
@@ -700,7 +724,7 @@ func backupFiles(root string, targets []string, priorService ServiceState) ([]fi
 			item.OwnerKnown = true
 			item.UID, item.GID = stat.Uid, stat.Gid
 		}
-		item.Digest = sha256String(body)
+		item.Digest = fileDigest(body, info.Mode())
 		item.Backup = filepath.Join(root, "files", fmt.Sprintf("%04d", i))
 		if err := writeAtomic(item.Backup, body, 0o600); err != nil {
 			return nil, err
@@ -797,7 +821,7 @@ func installBackupNoReplace(item fileBackup) error {
 	if err != nil {
 		return err
 	}
-	if sha256String(body) != item.Digest {
+	if fileDigest(body, item.Mode) != item.Digest {
 		return fmt.Errorf("setup: backup digest mismatch for %s", item.Target)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(item.Target), ".acd-rollback-restore-")
@@ -806,10 +830,6 @@ func installBackupNoReplace(item fileBackup) error {
 	}
 	name := tmp.Name()
 	defer os.Remove(name)
-	if err := tmp.Chmod(item.Mode.Perm()); err != nil {
-		tmp.Close()
-		return err
-	}
 	if _, err := tmp.Write(body); err != nil {
 		tmp.Close()
 		return err
@@ -819,6 +839,10 @@ func installBackupNoReplace(item fileBackup) error {
 			tmp.Close()
 			return fmt.Errorf("setup: restore owner for %s: %w", item.Target, err)
 		}
+	}
+	if err := tmp.Chmod(fileModeBits(item.Mode)); err != nil {
+		tmp.Close()
+		return err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
@@ -874,7 +898,7 @@ func currentFileDigest(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return sha256String(body), nil
+	return fileDigest(body, info.Mode()), nil
 }
 
 func jsonFileDigest(value any) (string, error) {
@@ -882,7 +906,7 @@ func jsonFileDigest(value any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return sha256String(append(body, '\n')), nil
+	return fileDigest(append(body, '\n'), 0o600), nil
 }
 
 func persistBackupManifest(root string, backups []fileBackup, priorService ServiceState) error {
@@ -1178,10 +1202,6 @@ func supervisorSessionRunning(ctx context.Context, roots paths.Roots) bool {
 	return err == nil && response.Error == nil
 }
 
-func waitSupervisor(ctx context.Context, roots paths.Roots, repositoryID string) error {
-	return waitSupervisorReady(ctx, roots, repositoryID, nil)
-}
-
 func waitSupervisorReady(ctx context.Context, roots paths.Roots, repositoryID string, processDone <-chan struct{}) error {
 	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
@@ -1212,7 +1232,7 @@ func waitSupervisorReady(ctx context.Context, roots paths.Roots, repositoryID st
 						supervisor.Request{Version: supervisor.ProtocolVersion,
 							ID: "setup-worker-ready", Method: "status",
 							RepositoryID: repositoryID}, time.Second)
-					if workerErr == nil && workerResponse.Version == supervisor.ProtocolVersion {
+					if workerErr == nil && workerReadinessMatches(workerResponse, worker) {
 						return nil
 					}
 				}
@@ -1255,6 +1275,13 @@ func waitSetupWorkersWithProgress(
 	}
 	if status.Version != version.String() {
 		return fmt.Errorf("setup: supervisor version %q does not match managed binary %q", status.Version, version.String())
+	}
+	managedDigest, err := version.FileDigest(roots.ManagedBinaryPath())
+	if err != nil {
+		return fmt.Errorf("setup: digest managed binary: %w", err)
+	}
+	if status.BinaryDigest != managedDigest || !status.Compatibility.Equal(RuntimeCompatibility()) {
+		return errors.New("setup: supervisor did not advertise the installed runtime compatibility contract")
 	}
 	enabledRecords := make([]central.RepoRecord, 0, len(registry.Repos))
 	for _, record := range registry.Repos {
@@ -1401,16 +1428,7 @@ func waitSupervisorWorkersReady(
 				lastProbeError[worker.RepositoryID] = workerErr.Error()
 				continue
 			}
-			if workerResponse.Version != supervisor.ProtocolVersion {
-				lastProbeError[worker.RepositoryID] = "worker protocol version mismatch"
-				continue
-			}
-			if workerResponse.Error != nil {
-				lastProbeError[worker.RepositoryID] = workerResponse.Error.Message
-				continue
-			}
-			readiness, decodeErr := decode[supervisor.WorkerReadiness](workerResponse.Data)
-			if decodeErr != nil || !readiness.Ready || readiness.PID != worker.PID || readiness.RepositoryID != worker.RepositoryID {
+			if !workerReadinessMatches(workerResponse, worker) {
 				lastProbeError[worker.RepositoryID] = "worker readiness identity mismatch"
 				continue
 			}
@@ -1436,6 +1454,15 @@ func waitSupervisorWorkersReady(
 		}
 	}
 	return nil
+}
+
+func workerReadinessMatches(response supervisor.Response, worker supervisor.WorkerStatus) bool {
+	if !response.OK || response.Version != supervisor.ProtocolVersion || response.Error != nil {
+		return false
+	}
+	readiness, err := decode[supervisor.WorkerReadiness](response.Data)
+	return err == nil && readiness.Ready && readiness.PID == worker.PID &&
+		readiness.RepositoryID == worker.RepositoryID
 }
 
 func summarizePendingWorkers(
@@ -1531,6 +1558,14 @@ func clearPlanRecordTimestamps(record *central.RepoRecord) {
 func sha256String(body []byte) string {
 	sum := sha256.Sum256(body)
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func fileDigest(body []byte, mode os.FileMode) string {
+	return sha256String([]byte(fmt.Sprintf("mode:%#o\x00%s", fileModeBits(mode), body)))
+}
+
+func fileModeBits(mode os.FileMode) os.FileMode {
+	return mode.Perm() | mode&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky)
 }
 func newOperationID(prefix string) (string, error) {
 	body := make([]byte, 8)

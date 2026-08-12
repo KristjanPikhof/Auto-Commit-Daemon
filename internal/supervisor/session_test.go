@@ -128,7 +128,7 @@ func TestEnsureSessionCleansUpNeverReadyChild(t *testing.T) {
 	}
 }
 
-func TestSessionReadyRefusesAnotherResponsibilitySession(t *testing.T) {
+func TestSessionReadyReusesOnlyMatchingUserSupervisor(t *testing.T) {
 	root, err := os.MkdirTemp("/tmp", "acd-session-owner-")
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +144,7 @@ func TestSessionReadyRefusesAnotherResponsibilitySession(t *testing.T) {
 	}
 	var advertised atomic.Value
 	advertised.Store(Status{
-		PID: os.Getpid(), Version: "v2026-08-07-161-ge473be00-dirty", Ownership: "session:owner-a",
+		PID: os.Getpid(), Version: "v2026-08-07-161-ge473be00-dirty", Ownership: "user:501",
 	})
 	done := make(chan struct{})
 	go func() {
@@ -171,22 +171,22 @@ func TestSessionReadyRefusesAnotherResponsibilitySession(t *testing.T) {
 		<-done
 	})
 
-	ready, err := sessionReady(context.Background(), roots, "owner-b")
-	if ready || err == nil || !strings.Contains(err.Error(), "another macOS application or terminal session") ||
-		!strings.Contains(err.Error(), "run `acd setup`") || strings.HasPrefix(err.Error(), "supervisor:") {
-		t.Fatalf("cross-owner readiness=(%v, %v), want refusal", ready, err)
+	ready, err := sessionReady(context.Background(), roots, "user:502")
+	if ready || err == nil || !strings.Contains(err.Error(), "incompatible with this user") ||
+		!strings.Contains(err.Error(), "run `acd setup` once") || strings.HasPrefix(err.Error(), "supervisor:") {
+		t.Fatalf("cross-user readiness=(%v, %v), want refusal", ready, err)
 	}
 
 	advertised.Store(Status{PID: os.Getpid(), Version: "v2026-08-07-161-ge473be00-dirty"})
-	ready, err = sessionReady(context.Background(), roots, "owner-a")
+	ready, err = sessionReady(context.Background(), roots, "user:501")
 	if ready || err == nil || !strings.Contains(err.Error(), "older ACD background process") ||
 		!strings.Contains(err.Error(), "v2026-08-07-161-ge473be00-dirty") ||
 		!strings.Contains(err.Error(), "run `acd setup`") || strings.HasPrefix(err.Error(), "supervisor:") {
 		t.Fatalf("old-supervisor readiness=(%v, %v), want actionable upgrade refusal", ready, err)
 	}
 
-	advertised.Store(Status{PID: os.Getpid(), Ownership: "session:owner-a"})
-	ready, err = sessionReady(context.Background(), roots, "owner-a")
+	advertised.Store(Status{PID: os.Getpid(), Ownership: "user:501"})
+	ready, err = sessionReady(context.Background(), roots, "user:501")
 	if err != nil || !ready {
 		t.Fatalf("matching-owner readiness=(%v, %v), want ready", ready, err)
 	}

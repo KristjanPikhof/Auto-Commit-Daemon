@@ -129,6 +129,19 @@ func TestSetup_JSONHarnessUninstallDocsCoverLifecycleCommands(t *testing.T) {
 	}
 }
 
+func TestSetup_TextHarnessUninstallDocsUseProductCommand(t *testing.T) {
+	for _, path := range []string{"opencode/uninstall.md", "pi/uninstall.md"} {
+		body := snippetBody(t, path)
+		if !strings.Contains(body, "acd uninstall --dry-run") ||
+			!strings.Contains(body, "acd uninstall --purge-data") {
+			t.Fatalf("%s does not document transactional uninstall:\n%s", path, body)
+		}
+		if strings.Contains(body, "acd stop --all") || strings.Contains(body, "rm -rf") {
+			t.Fatalf("%s still documents obsolete destructive cleanup:\n%s", path, body)
+		}
+	}
+}
+
 // --- per-harness happy-path tests ------------------------------------------
 
 func TestSetup_ClaudeCode_ExitsZero(t *testing.T) {

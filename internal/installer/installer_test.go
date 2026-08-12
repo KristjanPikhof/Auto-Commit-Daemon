@@ -428,7 +428,7 @@ func TestRollbackPreservesConcurrentHostEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	postDigest := sha256String([]byte("setup output"))
+	postDigest := fileDigest([]byte("setup output"), 0o600)
 	if err := preparePostMutation(filepath.Join(root, "backup"), backups, ServiceState{}, target, postDigest); err != nil {
 		t.Fatal(err)
 	}
@@ -452,9 +452,9 @@ func TestRollbackPreparedMutationCanProveNoWriteOccurred(t *testing.T) {
 		before     []byte
 		postDigest string
 	}{
-		{name: "existing file remains", before: []byte("before"), postDigest: sha256String([]byte("setup output"))},
+		{name: "existing file remains", before: []byte("before"), postDigest: fileDigest([]byte("setup output"), 0o600)},
 		{name: "prepared deletion does not run", before: []byte("before"), postDigest: absentFileDigest},
-		{name: "prepared creation does not run", postDigest: sha256String([]byte("setup output"))},
+		{name: "prepared creation does not run", postDigest: fileDigest([]byte("setup output"), 0o600)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -509,12 +509,63 @@ func TestRollbackNoReplacePreservesEditAfterClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	item := fileBackup{Target: target, Exists: true, Backup: backup,
-		Digest: sha256String([]byte("before")), Mode: 0o600}
+		Digest: fileDigest([]byte("before"), 0o600), Mode: 0o600}
 	if err := installBackupNoReplace(item); err == nil || !strings.Contains(err.Error(), "preserve concurrent edit") {
 		t.Fatalf("installBackupNoReplace error=%v", err)
 	}
 	if body, err := os.ReadFile(target); err != nil || string(body) != "concurrent edit" {
 		t.Fatalf("concurrent target=(%q,%v)", body, err)
+	}
+}
+
+func TestRollbackRestoresModeWhenContentIsUnchanged(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "acd")
+	content := []byte("same binary")
+	if err := os.WriteFile(target, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backupRoot := filepath.Join(root, "backup")
+	backups, err := backupFiles(backupRoot, []string{target}, ServiceState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preparePostMutation(backupRoot, backups, ServiceState{}, target, fileDigest(content, 0o755)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreFiles(backups); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("restored mode=%#o, want 0600", got)
+	}
+}
+
+func TestFileDigestDetectsModeOnlyDrift(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(target, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := currentFileDigest(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := currentFileDigest(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatal("mode-only drift did not change the file proof")
 	}
 }
 

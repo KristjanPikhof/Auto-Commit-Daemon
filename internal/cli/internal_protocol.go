@@ -25,6 +25,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	restorepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/restore"
@@ -41,6 +42,24 @@ func newInternalCmd() *cobra.Command {
 		Use: "run", Hidden: true, Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runSupervisor(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr())
+		},
+	})
+	supervisorCmd.AddCommand(&cobra.Command{
+		Use: "upgrade-compatible", Hidden: true, Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			roots, err := paths.Resolve()
+			if err != nil {
+				return err
+			}
+			executable, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			_, err = installer.ApplyCompatibleRuntime(cmd.Context(), roots, installer.RuntimeUpgradeOptions{
+				SourceExecutable: executable, SourceVersion: version.String(),
+				Compatibility: runtimeCompatibility(), Integrations: "auto",
+			})
+			return err
 		},
 	})
 	var repositoryID string
@@ -134,7 +153,8 @@ func sendInternalHint(ctx context.Context, repo, kind string, drain bool, sessio
 	if strings.TrimSpace(record.RepositoryID) == "" || strings.TrimSpace(record.WorktreeID) == "" {
 		return fmt.Errorf("acd internal hint: repository setup is still in progress; retry after `acd setup` completes")
 	}
-	if err := ensureMutationSupervisor(ctx, roots); err != nil {
+	triggerUpgrade, err := ensureMutationSupervisorMode(ctx, roots, true)
+	if err != nil {
 		return err
 	}
 	method := "hint"
@@ -151,6 +171,9 @@ func sendInternalHint(ctx context.Context, repo, kind string, drain bool, sessio
 	}
 	if response.Error != nil {
 		return errors.New(response.Error.Message)
+	}
+	if triggerUpgrade != nil {
+		_ = triggerUpgrade()
 	}
 	return nil
 }
@@ -287,10 +310,15 @@ func runSupervisor(ctx context.Context, _ io.Writer, _ io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("acd supervisor: resolve executable: %w", err)
 	}
+	binaryDigest, err := version.FileDigest(binary)
+	if err != nil {
+		return fmt.Errorf("acd supervisor: digest executable: %w", err)
+	}
 	cctx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	server := &supervisor.Server{
-		Roots: roots, BinaryPath: binary, Version: version.String(),
+		Roots: roots, BinaryPath: binary, Version: version.String(), BinaryDigest: binaryDigest,
+		Compatibility: runtimeCompatibility(),
 		Handler: cliSupervisorHandler{
 			roots: roots, environment: supervisor.WorkerEnvironment(os.Environ()),
 		},
