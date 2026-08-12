@@ -209,6 +209,28 @@ UPDATE capture_events SET state='failed',error='missing object' WHERE seq=?`,
 	}
 }
 
+func TestPublicationDrainRecoveredTargetIsResolved(t *testing.T) {
+	ctx := context.Background()
+	db, events, drain := openPublicationDrainTestState(t, 1, 1)
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainSemantic
+	drain, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state='recovered',commit_oid='archive-proof' WHERE seq=?`,
+		events[0].Seq); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, ReplaySummary{}, nil, time.Unix(12, 0).UTC())
+	if err != nil || completed.Phase != state.PublicationDrainCompleted ||
+		completed.PublishedEventCount != 1 {
+		t.Fatalf("completed=(%+v,%v), want completed resolved=1", completed, err)
+	}
+}
+
 func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()

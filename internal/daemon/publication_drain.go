@@ -17,6 +17,7 @@ import (
 )
 
 const publicationDrainHeadChangedPrefix = "publication drain HEAD changed after checkpoint:"
+const publicationDrainRecoveredTargetError = "frozen publication target contains a terminal event"
 
 // ActivePublicationDrainForPair returns the one durable drain owned by the
 // active branch generation. Multiple active drains for one pair fail closed.
@@ -63,9 +64,10 @@ func RestartablePublicationDrainForPair(
 	rows, err := db.ReadSQL().QueryContext(ctx, `
 SELECT id FROM publication_drains
 WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
-  AND last_error LIKE ?
+  AND (last_error LIKE ? OR last_error=? COLLATE BINARY)
 ORDER BY created_ts DESC,id DESC LIMIT 2`,
-		branchRef, generation, publicationDrainHeadChangedPrefix+"%")
+		branchRef, generation, publicationDrainHeadChangedPrefix+"%",
+		publicationDrainRecoveredTargetError)
 	if err != nil {
 		return nil, err
 	}
@@ -108,11 +110,14 @@ func ResumePublicationDrainCheckpointing(
 ) (state.PublicationDrain, error) {
 	recheckingHeadAdvance := drain.Phase == state.PublicationDrainNeedsAction &&
 		strings.HasPrefix(drain.LastError, publicationDrainHeadChangedPrefix)
-	if drain.Phase != state.PublicationDrainCheckpointing && !recheckingHeadAdvance {
+	recheckingRecoveredTarget := drain.Phase == state.PublicationDrainNeedsAction &&
+		drain.LastError == publicationDrainRecoveredTargetError
+	if drain.Phase != state.PublicationDrainCheckpointing &&
+		!recheckingHeadAdvance && !recheckingRecoveredTarget {
 		return drain, nil
 	}
 	fail := func(reason error) (state.PublicationDrain, error) {
-		if recheckingHeadAdvance {
+		if recheckingHeadAdvance || recheckingRecoveredTarget {
 			return drain, nil
 		}
 		nowTS := float64(now.UnixNano()) / 1e9
@@ -154,6 +159,15 @@ func ResumePublicationDrainCheckpointing(
 	if err != nil {
 		return fail(err)
 	}
+	if recheckingRecoveredTarget {
+		counts, countErr := publicationDrainCountsForTarget(ctx, db, drain.EventSeqs)
+		if countErr != nil {
+			return drain, countErr
+		}
+		if counts.recovered == 0 || counts.terminal != 0 {
+			return drain, nil
+		}
+	}
 	worktree, err := gitpkg.ResolveWorktree(ctx, repoRoot)
 	if err != nil {
 		return fail(err)
@@ -175,7 +189,7 @@ func ResumePublicationDrainCheckpointing(
 		}
 		return fail(err)
 	}
-	if recheckingHeadAdvance {
+	if recheckingHeadAdvance || recheckingRecoveredTarget {
 		nowTS := float64(now.UnixNano()) / 1e9
 		drain, err = state.ReopenPublicationDrainCheckpointing(
 			ctx, db, drain.ID, drain.LastError, nowTS)
@@ -183,6 +197,7 @@ func ResumePublicationDrainCheckpointing(
 			return drain, err
 		}
 		recheckingHeadAdvance = false
+		recheckingRecoveredTarget = false
 	}
 	if drain.StagedConsent && !drain.StagedConsumed {
 		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
@@ -504,6 +519,7 @@ func topologicalPublicationDrainEvents(
 
 type publicationDrainCounts struct {
 	published int64
+	recovered int64
 	terminal  int64
 	commits   int64
 }
@@ -522,7 +538,8 @@ func UpdatePublicationDrainAfterReplay(
 	if err != nil {
 		return drain, err
 	}
-	if counts.terminal == 0 && counts.published < drain.TargetEventCount {
+	resolved := counts.published + counts.recovered
+	if counts.terminal == 0 && resolved < drain.TargetEventCount {
 		blocked, blockErr := publicationDrainHasEarlierTerminal(ctx, db, drain)
 		if blockErr != nil {
 			return drain, blockErr
@@ -536,22 +553,22 @@ func UpdatePublicationDrainAfterReplay(
 		nowTS = drain.UpdatedTS
 	}
 	progressTS := drain.LastProgressTS
-	if counts.published > drain.PublishedEventCount ||
+	if resolved > drain.PublishedEventCount ||
 		counts.commits > drain.CommitCount {
 		progressTS = nowTS
 	}
 	update := PublicationDrainUpdateFrom(drain, nowTS, progressTS)
-	update.PublishedEventCount = counts.published
+	update.PublishedEventCount = resolved
 	update.CommitCount = counts.commits
 	if summary.PlannerFailure != "" {
 		update.LastError = summary.PlannerFailure
 	}
 	if counts.terminal > 0 {
 		update.Phase = state.PublicationDrainNeedsAction
-		update.LastError = "frozen publication target contains a terminal event"
+		update.LastError = publicationDrainRecoveredTargetError
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
-	if counts.published == drain.TargetEventCount {
+	if resolved == drain.TargetEventCount {
 		update.Phase = state.PublicationDrainCompleted
 		update.CompletedTS = sql.NullFloat64{Float64: nowTS, Valid: true}
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
@@ -573,7 +590,7 @@ func UpdatePublicationDrainAfterReplay(
 		update.Phase = state.PublicationDrainNeedsAction
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
-	if counts.published == drain.PublishedEventCount && !summary.HasMore {
+	if resolved == drain.PublishedEventCount && !summary.HasMore {
 		switch drain.Phase {
 		case state.PublicationDrainSemantic:
 			update.Phase = state.PublicationDrainNormalizing
@@ -663,8 +680,9 @@ WHERE seq IN (`+strings.Join(placeholders, ",")+")", args...)
 				if commitOID != "" {
 					commits[commitOID] = struct{}{}
 				}
-			case state.EventStateFailed, state.EventStateBlockedConflict,
-				state.EventStateRecovered:
+			case state.EventStateRecovered:
+				counts.recovered++
+			case state.EventStateFailed, state.EventStateBlockedConflict:
 				counts.terminal++
 			}
 		}

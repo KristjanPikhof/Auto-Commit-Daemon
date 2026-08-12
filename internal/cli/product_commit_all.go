@@ -194,6 +194,43 @@ completed:
 			return err
 		}
 	}
+	if result.PublicationDrained && result.RecoveredEvents > 0 {
+		current, inspectErr := inspectControl(ctx, lookup.Worktree.Root)
+		changes, changeErr := productWorktreeChangeCount(ctx, lookup.Worktree.Root)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if changeErr != nil {
+			return fmt.Errorf("acd commit-all: inspect recovered worktree: %w", changeErr)
+		}
+		if current.PendingEvents > 0 || changes > 0 {
+			if !quiet && !jsonOut {
+				fmt.Fprintf(progressOut,
+					"Commit all: recovery recaptured %d current event(s); draining them now\n",
+					current.PendingEvents)
+			}
+			prior := result
+			follow, followErr := startProductPublicationDrain(
+				ctx, lookup, params, time.Now())
+			if followErr != nil {
+				return fmt.Errorf("acd commit-all: start recovered follow-up drain: %w", followErr)
+			}
+			if !follow.PublicationDrained {
+				follow, followErr = waitForProductPublicationDrain(
+					ctx, lookup, follow, progressOut, quiet || jsonOut)
+				if followErr != nil {
+					return followErr
+				}
+			}
+			follow.Repo = lookup.Worktree.Root
+			follow.TargetEvents += prior.TargetEvents
+			follow.PublishedEvents += prior.PublishedEvents
+			follow.RecoveredEvents += prior.RecoveredEvents
+			follow.TerminalEvents += prior.TerminalEvents
+			follow.CommitsCreated += prior.CommitsCreated
+			result = follow
+		}
+	}
 	return finishProductCommitAll(out, result, jsonOut)
 }
 
@@ -467,8 +504,12 @@ func renderProductCommitAll(out io.Writer, result productCommitAllResult, stateN
 		return nil
 	}
 	fmt.Fprintf(out, "Protected checkpoint: %s\n", result.CheckpointID)
-	fmt.Fprintf(out, "Published target events: %d/%d in %d Git commit(s).\n",
+	fmt.Fprintf(out, "Resolved target events: %d/%d in %d Git commit(s).\n",
 		result.PublishedEvents, result.TargetEvents, result.CommitsCreated)
+	if result.RecoveredEvents > 0 {
+		fmt.Fprintf(out, "Recovered safely and recaptured: %d event(s).\n",
+			result.RecoveredEvents)
+	}
 	if result.PublicationDrained {
 		fmt.Fprintln(out, "Commit all complete.")
 	} else {

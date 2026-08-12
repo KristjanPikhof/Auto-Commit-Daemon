@@ -30,13 +30,16 @@ var (
 // event membership of CheckpointID. EventSeqs is loaded from checkpoint_events;
 // it is never duplicated into mutable drain state.
 type PublicationDrain struct {
-	ID                      string
-	CheckpointID            string
-	WorktreeID              string
-	BranchRef               string
-	BranchGeneration        int64
-	Phase                   string
-	TargetEventCount        int64
+	ID               string
+	CheckpointID     string
+	WorktreeID       string
+	BranchRef        string
+	BranchGeneration int64
+	Phase            string
+	TargetEventCount int64
+	// PublishedEventCount is the durable resolved-member count. The legacy
+	// column name also includes events preserved by exact recovery and then
+	// recaptured for a bounded follow-up drain.
 	PublishedEventCount     int64
 	SemanticRebuildAttempts int64
 	EventFallbackCount      int64
