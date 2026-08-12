@@ -634,11 +634,16 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthWaiting
 		res.Summary = "ACD capture is active while configuration validation runs."
 		res.NextAction = "No action needed; commit publishing activates after validation passes."
+	case status.PendingEvents == 0 && status.IntentStrategy.LastPlannerWindow != nil &&
+		status.IntentStrategy.LastPlannerWindow.ResolutionMode == "evidence_partition":
+		res.Health = controlHealthHealthy
+		res.Summary = "Intent plan completed using evidence-based grouping."
+		res.NextAction = "No action needed; a provider connection in cooldown will retry with the next batch."
 	case status.IntentStrategy.PlannerHealth != nil &&
 		(status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
 			status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
 		res.Health = controlHealthDegraded
-		res.Summary = "The intent planner is degraded; deterministic fallback is keeping replay moving."
+		res.Summary = "Planner connection unavailable; evidence-based grouping is keeping replay moving."
 		if status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen {
 			res.NextAction = "No immediate action needed; ACD is running the automatic provider probe. Run `acd doctor` for details."
 		} else {

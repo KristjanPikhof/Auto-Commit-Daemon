@@ -109,6 +109,12 @@ type intentStrategyReport struct {
 	LastMessageQualityReason          string                              `json:"last_message_quality_reason,omitempty"`
 	PlannerHealth                     *daemon.IntentPlannerHealthSnapshot `json:"planner_health,omitempty"`
 	PlannerHealthWarning              string                              `json:"planner_health_warning,omitempty"`
+	PlanAttempt                       int                                 `json:"plan_attempt,omitempty"`
+	PlanAttemptLimit                  int                                 `json:"plan_attempt_limit,omitempty"`
+	UnresolvedCaptureCount            int                                 `json:"unresolved_capture_count,omitempty"`
+	PreservedGroupCount               int                                 `json:"preserved_group_count,omitempty"`
+	ResolutionMode                    string                              `json:"resolution_mode,omitempty"`
+	RecoveryReady                     bool                                `json:"recovery_ready,omitempty"`
 	LastPlannerWindow                 *intentPlannerWindowSummary         `json:"last_planner_window,omitempty"`
 	// PlannerErrorRateRecent is the share of intent_planner_error rows in
 	// the most recent IntentRecentDecisionWindow decisions. The denominator
@@ -947,6 +953,12 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 			formatSeqs(win.OfferedSeqs),
 			len(win.SelectedGroups),
 			valueOrUnset(formatSeqs(win.DeferredSeqs)))
+		if win.PlanAttemptLimit > 0 || win.ResolutionMode != "" {
+			fmt.Fprintf(out, "  Plan resolution: %s attempts=%d/%d unresolved=%d preserved_groups=%d\n",
+				valueOrUnset(win.ResolutionMode), win.PlanAttempt,
+				win.PlanAttemptLimit, win.UnresolvedCaptureCount,
+				win.PreservedGroupCount)
+		}
 		if len(win.HiddenSeqs) > 0 {
 			fmt.Fprintf(out, "  Hidden/coalesced seqs: %s\n", formatSeqs(win.HiddenSeqs))
 		}
@@ -1087,6 +1099,9 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	} else {
 		report.PlannerHealth = plannerHealth
 		report.PlannerHealthWarning = warning
+		if plannerHealth != nil {
+			report.RecoveryReady = plannerHealth.RecoveryReady
+		}
 	}
 	if err := loadLastIntentPlannerError(ctx, conn, &report); err != nil {
 		return report, err
@@ -1098,6 +1113,13 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 		return report, err
 	} else {
 		report.LastPlannerWindow = lastWindow
+		if lastWindow != nil {
+			report.PlanAttempt = lastWindow.PlanAttempt
+			report.PlanAttemptLimit = lastWindow.PlanAttemptLimit
+			report.UnresolvedCaptureCount = lastWindow.UnresolvedCaptureCount
+			report.PreservedGroupCount = lastWindow.PreservedGroupCount
+			report.ResolutionMode = lastWindow.ResolutionMode
+		}
 	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")
 	if err != nil {

@@ -736,14 +736,14 @@ func diagnoseRemediation(report diagnoseReport) []string {
 				nextProbe = "at " + time.Unix(int64(health.NextProbeTS), 0).UTC().Format(time.RFC3339)
 			}
 			remediation = append(remediation,
-				fmt.Sprintf("intent planner circuit is open after %d consecutive %s failure(s); deterministic fallback remains active until the next provider probe %s. Check provider connectivity and configuration; for validation failures, review %s.",
+				fmt.Sprintf("intent planner connection is unavailable after %d consecutive %s failure(s); the next batch can retry after %s. Safe batches use evidence-based grouping meanwhile. Check provider connectivity and configuration; rejected plan summaries are in %s.",
 					health.ConsecutiveFailures,
 					valueOrUnset(string(health.LastFailureClass)),
 					nextProbe,
 					valueOrUnset(report.IntentStrategy.RejectLogPath)))
 		case daemon.IntentPlannerCircuitHalfOpen:
 			remediation = append(remediation,
-				"intent planner circuit is half-open with one provider probe in progress; deterministic fallback remains active for other planning windows until that probe succeeds.")
+				"intent planner has one connection probe in progress; other safe batches use evidence-based grouping until it succeeds.")
 		}
 	}
 	if report.IntentStrategy.LastPlannerError != "" {
