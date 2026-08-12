@@ -44,16 +44,15 @@ adapted for compatibility and cannot claim native Intent readiness.
 
 ## Failure behavior
 
-Transport, validation, safety, timeout, and provider circuit failures delay
-publication only. Completed checkpoints and `protected=true` remain intact.
-Fast and Balanced presets use bounded deterministic fallback where their
-existing gates allow it. Quality may keep publication waiting with an exact
-next action.
+Provider failures do not affect completed checkpoints or `protected=true`.
+Malformed plans are repaired locally, partially replanned, or replaced with a
+verified evidence partition. This applies to Fast, Balanced, and Quality.
 
-The provider circuit opens immediately on transport failure or after three
-validation/safety failures, uses 30-second, 2-minute, then 10-minute cooldowns,
-and permits one half-open probe. Cancellation releases a probe without
-changing provider health.
+Only connection, timeout, protocol transport, and unavailable-service failures
+open the provider circuit. It uses 30-second, 2-minute, then 10-minute
+cooldowns and permits one half-open probe. A rejected semantic plan does not
+change transport health. Cancellation releases a probe without changing
+provider health.
 
 Rejected plans are written to the exact worktree Git directory at
 `<gitDir>/acd/planner-rejects.jsonl`. Linked worktrees therefore keep separate
