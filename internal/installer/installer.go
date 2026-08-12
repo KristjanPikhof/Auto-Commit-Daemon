@@ -278,11 +278,13 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			}
 		}
 		changed, err := ApplyCompatibleRuntime(ctx, roots, RuntimeUpgradeOptions{
-			SourceExecutable: plan.SourceExecutable,
-			SourceVersion:    version.String(),
-			Compatibility:    RuntimeCompatibility(),
-			Integrations:     strings.Join(plan.Integrations, ","),
-			Force:            forceReplacement,
+			SourceExecutable:             plan.SourceExecutable,
+			SourceVersion:                version.String(),
+			Compatibility:                RuntimeCompatibility(),
+			Integrations:                 strings.Join(plan.Integrations, ","),
+			Force:                        forceReplacement,
+			AllowUnadvertised:            true,
+			AllowSameDistanceReplacement: true,
 		})
 		return Result{OperationID: plan.OperationID, PlanDigest: plan.Digest, Changed: changed}, err
 	}

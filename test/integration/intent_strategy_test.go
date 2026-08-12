@@ -264,22 +264,23 @@ func TestIntentV2MigrationMissingPrerequisitesKeepsCapturePending(t *testing.T) 
 	waitFor(t, "checkpoint protection completes while publication is blocked", 10*time.Second, func() bool {
 		return sqliteScalar(t, dbPath,
 			`SELECT value FROM daemon_meta WHERE key='protection.complete'`) == "true" &&
-			sqliteScalar(t, dbPath,
-				`SELECT COUNT(*) FROM checkpoints WHERE phase='completed'`) != "0"
+			sqliteScalar(t, dbPath, `
+SELECT COUNT(*)
+FROM checkpoint_events ce
+JOIN checkpoints cp ON cp.id=ce.checkpoint_id
+JOIN capture_events e ON e.seq=ce.event_seq
+WHERE e.path='captured-while-blocked.txt' AND cp.phase='completed'`) != "0"
 	})
 	if headAfter := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
 		t.Fatalf("blocked Intent v2 replay advanced HEAD: before=%s after=%s",
 			headBefore, headAfter)
 	}
-	var status ExecResult
-	waitFor(t, "status observes protected waiting state between scans", 10*time.Second, func() bool {
-		status = runAcd(t, ctx, envWith(env, extra...),
-			"status", "--repo", repo, "--json")
-		return status.ExitCode == 0 && strings.Contains(status.Stdout, `"state": "waiting"`) &&
-			strings.Contains(status.Stdout, `"protected": true`)
-	})
-	if status.ExitCode != 0 || !strings.Contains(status.Stdout, `"protected": true`) {
-		t.Fatalf("status did not separate durable protection from delayed publication:\n%s\n%s",
+	status := runAcd(t, ctx, envWith(env, extra...),
+		"status", "--repo", repo, "--json")
+	if (status.ExitCode != 0 && status.ExitCode != 3) ||
+		!strings.Contains(status.Stdout, `"operational_state": "needs_attention"`) ||
+		!strings.Contains(status.Stdout, `"published": false`) {
+		t.Fatalf("status did not report blocked publication truthfully:\n%s\n%s",
 			status.Stdout, status.Stderr)
 	}
 	if got := sqliteScalar(t, dbPath, `

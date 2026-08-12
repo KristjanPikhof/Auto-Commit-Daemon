@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -37,26 +38,36 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
-	OK                bool     `json:"ok"`
-	Command           string   `json:"command"`
-	Repo              string   `json:"repo"`
-	Health            string   `json:"health"`
-	Summary           string   `json:"summary"`
-	NextAction        string   `json:"next_action"`
-	Registered        bool     `json:"registered"`
-	Enabled           bool     `json:"enabled"`
-	Daemon            string   `json:"daemon"`
-	DaemonPID         int      `json:"daemon_pid"`
-	PendingEvents     int      `json:"pending_events"`
-	BlockedEvents     int      `json:"blocked_events"`
-	Changed           bool     `json:"changed"`
-	Actions           []string `json:"actions"`
-	StatePreserved    bool     `json:"state_preserved"`
-	Protected         bool     `json:"protected"`
-	Published         bool     `json:"published"`
-	CheckpointID      string   `json:"checkpoint_id,omitempty"`
-	CLIVersion        string   `json:"cli_version,omitempty"`
-	SupervisorVersion string   `json:"supervisor_version,omitempty"`
+	OK                       bool                   `json:"ok"`
+	Command                  string                 `json:"command"`
+	Repo                     string                 `json:"repo"`
+	Health                   string                 `json:"health"`
+	Summary                  string                 `json:"summary"`
+	NextAction               string                 `json:"next_action"`
+	Registered               bool                   `json:"registered"`
+	Enabled                  bool                   `json:"enabled"`
+	Daemon                   string                 `json:"daemon"`
+	DaemonPID                int                    `json:"daemon_pid"`
+	PendingEvents            int                    `json:"pending_events"`
+	BlockedEvents            int                    `json:"blocked_events"`
+	Changed                  bool                   `json:"changed"`
+	Actions                  []string               `json:"actions"`
+	StatePreserved           bool                   `json:"state_preserved"`
+	Protected                bool                   `json:"protected"`
+	Published                bool                   `json:"published"`
+	Busy                     bool                   `json:"busy"`
+	OperationalState         string                 `json:"operational_state"`
+	WorktreeClean            bool                   `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                   `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                   `json:"checkpoint_published_by_acd"`
+	CheckpointID             string                 `json:"checkpoint_id,omitempty"`
+	PublicationDrain         publicationDrainReport `json:"publication_drain"`
+	RecoveryRequired         bool                   `json:"-"`
+	CLIVersion               string                 `json:"cli_version,omitempty"`
+	SupervisorVersion        string                 `json:"supervisor_version,omitempty"`
+	SupervisorWorkerState    string                 `json:"supervisor_worker_state,omitempty"`
+	SupervisorWorkerRestarts int                    `json:"supervisor_worker_restarts,omitempty"`
+	SupervisorWorkerError    string                 `json:"supervisor_worker_error,omitempty"`
 }
 
 type controlRepoLookup struct {
@@ -73,8 +84,10 @@ func newOnCmd() *cobra.Command {
 		Long: `Enable checkpoint protection for the current repository.
 
 The command is idempotent and asks the user supervisor to reconcile the
-repository's worker. Run acd setup first when the checkpoint-first cutover has
-not been completed. Existing checkpoint history is preserved.`,
+repository's worker. It applies safe exact-chain recovery automatically after
+the initial checkpoint. Archive-only recovery still requires explicit consent.
+Run acd setup first when the checkpoint-first cutover has not been completed.
+Existing checkpoint history is preserved.`,
 		Example: `  acd on
   acd on --repo /path/to/repo
   acd on --json`,
@@ -137,7 +150,7 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 		return controlWorktreeError("on", repoFlag, err)
 	}
 
-	actions := make([]string, 0, 2)
+	actions := make([]string, 0, 3)
 	if !lookup.Registered {
 		return actionRequiredError("setup_required", "acd on: repository is not configured; run `acd setup`")
 	}
@@ -150,9 +163,11 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	}
 	if changed {
 		actions = append(actions, "enabled")
-	} else {
-		actions = append(actions, "verified")
 	}
+	if _, err := callSupervisor(ctx, lookup, "restart_repository", nil, 30*time.Second); err != nil {
+		return fmt.Errorf("acd on: restart worker: %w", err)
+	}
+	actions = append(actions, "restarted")
 	if err := waitControlWorkerReady(ctx, lookup, 10*time.Second); err != nil {
 		return err
 	}
@@ -164,6 +179,24 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	res, err := inspectControl(ctx, lookup.Worktree.Root)
 	if err != nil {
 		return err
+	}
+	if res.RecoveryRequired {
+		recoveryErr := runFix(ctx, io.Discard, lookup.Worktree.Root, false, true, false, false, true)
+		res, err = inspectControl(ctx, lookup.Worktree.Root)
+		if err != nil {
+			return err
+		}
+		if recoveryErr != nil {
+			res.Command = "on"
+			res.Changed = len(actions) > 0
+			res.Actions = append(actions, "recovery_failed")
+			res.StatePreserved = true
+			if renderErr := renderControl(out, res, jsonOut); renderErr != nil {
+				return renderErr
+			}
+			return actionRequiredError("recovery_failed", fmt.Sprintf("acd on: automatic exact-chain recovery failed: %v", recoveryErr))
+		}
+		actions = append(actions, "recovered")
 	}
 	res.Command = "on"
 	res.Changed = len(actions) > 0
@@ -199,7 +232,12 @@ func waitControlWorkerReady(ctx context.Context, lookup controlRepoLookup, timeo
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return unavailableError("acd on: worker did not become ready; run `acd doctor`")
+			message := "acd on: worker did not become ready"
+			if worker, ok := readSupervisorWorkerStatus(ctx, lookup.Roots,
+				lookup.Record.RepositoryID); ok && worker.LastError != "" {
+				message += ": " + worker.LastError
+			}
+			return unavailableError(message + "; run `acd doctor`")
 		case <-ticker.C:
 		}
 	}
@@ -228,6 +266,9 @@ func runControlOffWithForce(ctx context.Context, out io.Writer, repoFlag string,
 		return renderControl(out, res, jsonOut)
 	}
 	if lookup.Record.LifecycleDisabled() {
+		if _, err := callSupervisor(ctx, lookup, "stop_repository", nil, 30*time.Second); err != nil {
+			return fmt.Errorf("acd off: stop worker: %w", err)
+		}
 		res, inspectErr := inspectControl(ctx, lookup.Worktree.Root)
 		if inspectErr != nil {
 			return inspectErr
@@ -247,6 +288,10 @@ func runControlOffWithForce(ctx context.Context, out io.Writer, repoFlag string,
 		return fmt.Errorf("acd off: %w", err)
 	}
 	actions = append(actions, "disabled")
+	if _, err := callSupervisor(ctx, lookup, "stop_repository", nil, 30*time.Second); err != nil {
+		return fmt.Errorf("acd off: stop worker: %w", err)
+	}
+	actions = append(actions, "stopped")
 
 	res, err := inspectControl(ctx, lookup.Worktree.Root)
 	if err != nil {
@@ -333,6 +378,7 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 		return base, nil
 	}
 	if lookup.Record.LifecycleDisabled() {
+		applyDisabledControlTruth(ctx, &base, lookup)
 		base.Health = controlHealthOff
 		base.Daemon = "stopped"
 		base.Summary = "ACD is durably disabled for this repository."
@@ -359,22 +405,97 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 	}
 	applyControlStatus(&base, status)
 	if lookup.Record.RepositoryID != "" {
-		response, supervisorErr := (supervisor.Client{SocketPath: lookup.Roots.SupervisorSocketPath(), Timeout: 500 * time.Millisecond}).Do(ctx,
-			supervisor.Request{Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("status-%d", time.Now().UnixNano()), Method: "status", DeadlineMS: time.Now().Add(500 * time.Millisecond).UnixMilli()})
-		if supervisorErr == nil && response.Error == nil {
-			supervisorStatus, decodeErr := decodeProductData[supervisor.Status](response.Data)
-			if decodeErr == nil {
-				base.CLIVersion = version.String()
-				base.SupervisorVersion = supervisorStatus.Version
-				if supervisorStatus.Version != "" && supervisorStatus.Version != base.CLIVersion {
-					base.Health = controlHealthNeedsAttention
-					base.Summary = fmt.Sprintf("The CLI version %s does not match supervisor version %s.", base.CLIVersion, supervisorStatus.Version)
-					base.NextAction = "Run `acd setup` to install the matching managed binary."
+		if supervisorStatus, ok := readSupervisorStatus(ctx, lookup.Roots); ok {
+			base.CLIVersion = version.String()
+			base.SupervisorVersion = supervisorStatus.Version
+			if supervisorStatus.Version != "" && supervisorStatus.Version != base.CLIVersion {
+				base.Health = controlHealthNeedsAttention
+				base.Summary = fmt.Sprintf("The CLI version %s does not match supervisor version %s.", base.CLIVersion, supervisorStatus.Version)
+				base.NextAction = "Run `acd setup` to install the matching managed binary."
+			}
+			for _, worker := range supervisorStatus.Workers {
+				if worker.RepositoryID != lookup.Record.RepositoryID {
+					continue
 				}
+				base.SupervisorWorkerState = worker.State
+				base.SupervisorWorkerRestarts = worker.Restarts
+				base.SupervisorWorkerError = worker.LastError
+				applySupervisorWorkerFailure(&base, worker)
+				break
 			}
 		}
 	}
 	return base, nil
+}
+
+func applyDisabledControlTruth(
+	ctx context.Context,
+	result *controlResult,
+	lookup controlRepoLookup,
+) {
+	if fileExists(lookup.Record.StateDB) {
+		if status, err := buildStatusReport(ctx, lookup.Record, time.Now()); err == nil {
+			result.CheckpointPublishedByACD = status.CheckpointPublishedByACD
+			result.CheckpointID = status.LatestCheckpointID
+		}
+	}
+	body, err := git.Run(ctx, git.RunOpts{Dir: lookup.Worktree.Root},
+		"status", "--porcelain=v1", "--untracked-files=all")
+	if err == nil {
+		result.WorktreeClean = len(body) == 0
+		result.AllChangesCommittedInGit = result.WorktreeClean
+		result.Published = result.WorktreeClean
+	}
+}
+
+func readSupervisorStatus(ctx context.Context, roots paths.Roots) (supervisor.Status, bool) {
+	response, err := (supervisor.Client{
+		SocketPath: roots.SupervisorSocketPath(), Timeout: 500 * time.Millisecond,
+	}).Do(ctx, supervisor.Request{
+		Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("status-%d", time.Now().UnixNano()),
+		Method: "status", DeadlineMS: time.Now().Add(500 * time.Millisecond).UnixMilli(),
+	})
+	if err != nil || response.Error != nil {
+		return supervisor.Status{}, false
+	}
+	status, err := decodeProductData[supervisor.Status](response.Data)
+	return status, err == nil
+}
+
+func readSupervisorWorkerStatus(
+	ctx context.Context,
+	roots paths.Roots,
+	repositoryID string,
+) (supervisor.WorkerStatus, bool) {
+	status, ok := readSupervisorStatus(ctx, roots)
+	if !ok {
+		return supervisor.WorkerStatus{}, false
+	}
+	for _, worker := range status.Workers {
+		if worker.RepositoryID == repositoryID {
+			return worker, true
+		}
+	}
+	return supervisor.WorkerStatus{}, false
+}
+
+func applySupervisorWorkerFailure(result *controlResult, worker supervisor.WorkerStatus) {
+	if worker.State != "needs_action" || worker.LastError == "" {
+		return
+	}
+	result.OK = false
+	result.Health = controlHealthNeedsAttention
+	switch {
+	case strings.Contains(worker.LastError, "checkpoint-first setup required"):
+		result.Summary = "ACD could not start because its state database needs a safe schema upgrade."
+		result.NextAction = "Run `acd on`; it will back up and upgrade compatible state, then start a new worker."
+	case strings.Contains(worker.LastError, "acquire repository ownership"):
+		result.Summary = "ACD could not start because an older worker still owns this repository."
+		result.NextAction = "Run `acd on` to stop the managed worker and start a fresh one."
+	default:
+		result.Summary = "ACD tried to restart the worker, but the startup error still needs attention."
+		result.NextAction = "Run `acd on` once. If it still fails, run `acd support logs --lines 100`."
+	}
 }
 
 func loadControlRepo(ctx context.Context, repoFlag string) (controlRepoLookup, error) {
@@ -416,7 +537,13 @@ func applyControlStatus(res *controlResult, status statusReport) {
 	res.BlockedEvents = status.BlockedConflicts
 	res.Protected = status.Protected
 	res.Published = status.Protected && status.UnpublishedCheckpoints == 0 && status.PendingEvents == 0
+	res.Busy = status.Busy
+	res.OperationalState = status.OperationalState
+	res.WorktreeClean = status.WorktreeClean
+	res.AllChangesCommittedInGit = status.AllChangesCommittedInGit
+	res.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 	res.CheckpointID = status.LatestCheckpointID
+	res.PublicationDrain = status.PublicationDrain
 
 	switch {
 	case status.CheckpointRetentionOverBudget:
@@ -427,11 +554,6 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "This repository still uses the v19 protection ledger."
 		res.NextAction = "Run `acd setup` to perform the checkpoint-first cutover."
-	case status.CheckpointProtectionAvailable && !status.Protected && !manualPause:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "The latest observed changes are not yet covered by a completed checkpoint."
-		res.NextAction = "Run `acd doctor` if protection does not complete after the current scan."
 	case status.Stale:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
@@ -457,16 +579,45 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "Configuration validation needs attention; capture remains active."
 		res.NextAction = "Run `acd config edit` to retry validation or select another experience."
+	case status.PublicationDrain.Phase == state.PublicationDrainNeedsAction:
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "The durable publication drain reached a genuine safety block."
+		res.NextAction = "Run `acd doctor` to inspect the blocked drain."
+	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback:
+		res.Health = controlHealthPublishing
+		res.Summary = "ACD is draining the protected target through local atomic dependency groups."
+		res.NextAction = "No action needed; the local fallback continues automatically."
+	case status.PublicationDrain.Phase == state.PublicationDrainNormalizing ||
+		status.PublicationDrain.Phase == state.PublicationDrainCheckpointing:
+		res.Health = controlHealthPublishing
+		res.Summary = "ACD is self-healing the durable publication plan."
+		res.NextAction = "No action needed; publication recovery continues automatically."
+	case status.PublicationDrain.Phase == state.PublicationDrainSemantic:
+		res.Health = controlHealthPublishing
+		res.Summary = "ACD is building and publishing the frozen semantic target."
+		res.NextAction = "No action needed; provider waits do not cancel the drain."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
+		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "Git publication is repeatedly failing; checkpoint protection remains active."
-		res.NextAction = "Run `acd doctor` to inspect the blocked publication."
+		res.Summary = "A durable block has stopped Git publication; this blocked publication needs recovery while checkpoint protection remains active."
+		res.NextAction = "Run `acd support recover --dry-run`, then `acd support recover --yes` to apply the displayed exact-chain recovery."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
+		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A blocked publication needs recovery on the active branch."
-		res.NextAction = "Run `acd doctor` to inspect the blocker."
+		res.NextAction = "Run `acd support recover --dry-run`, then `acd support recover --yes` to apply the displayed exact-chain recovery."
+	case status.CheckpointProtectionAvailable && !status.Protected && status.Busy:
+		res.Health = controlHealthWaiting
+		res.Summary = "ACD is scanning recent changes and completing their protection checkpoint."
+		res.NextAction = "No action needed; checkpoint protection completes automatically."
+	case status.CheckpointProtectionAvailable && !status.Protected:
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "The latest observed changes are not yet covered by a completed checkpoint."
+		res.NextAction = "Run `acd doctor` if protection does not complete after the current scan."
 	case status.SelfPublication.GitAppliedCount > 0:
 		res.Health = controlHealthPublishing
 		res.Summary = "Current changes are checkpointed while ACD publishes Git commits."
@@ -499,8 +650,8 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.NextAction = "Run `acd doctor` for the safe metadata warning."
 	case status.Replay.State == "degraded":
 		res.Health = controlHealthDegraded
-		res.Summary = "Replay encountered an error and remains retryable."
-		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the error repeats."
+		res.Summary = fmt.Sprintf("Replay is retrying after %d consecutive error(s); checkpoint protection remains active.", status.Replay.ErrorRepeatCount)
+		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the retrying state persists."
 	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running with recoverable errors or deterministic fallback."

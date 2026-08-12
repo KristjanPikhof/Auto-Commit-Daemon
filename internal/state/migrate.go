@@ -74,7 +74,8 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // publishes. v19 persists prepare-time publication completion semantics so
 // restart recovery cannot reinterpret repair state. v20 adds the general
 // operation/checkpoint ledger and correlates new self-publication rows with
-// it. New tables are pure DDL;
+// it. v21 adds publication_drains without backfilling historical checkpoints.
+// New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
 // Future migrations are append-only for daily_rollups (D9) — only ALTER TABLE

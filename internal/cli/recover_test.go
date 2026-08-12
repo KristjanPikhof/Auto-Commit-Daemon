@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -102,21 +103,42 @@ func TestRecover_ClearPauseDelegatesExplicitRemoval(t *testing.T) {
 	}
 }
 
-func TestRecover_RefusesWithDaemonAlive(t *testing.T) {
+func TestRecover_QuiescesDaemonAndApplies(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
-	if err := state.SaveDaemonState(context.Background(), db, state.DaemonState{
+	ctx := context.Background()
+	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
 		PID: os.Getpid(), Mode: "running",
 		BranchRef:        sql.NullString{String: "refs/heads/main", Valid: true},
 		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
 	}); err != nil {
 		t.Fatalf("SaveDaemonState: %v", err)
 	}
+	oldPrepare := prepareFixMutationSupervisor
+	oldQuiesce := withQuiescedFixRuntime
+	t.Cleanup(func() {
+		prepareFixMutationSupervisor = oldPrepare
+		withQuiescedFixRuntime = oldQuiesce
+	})
+	prepareFixMutationSupervisor = func(context.Context, paths.Roots) error { return nil }
+	quiesceCalls := 0
+	withQuiescedFixRuntime = func(operationCtx context.Context, _ paths.Roots, _ string, operation func(context.Context) error) error {
+		quiesceCalls++
+		if err := state.SaveDaemonState(operationCtx, db, state.DaemonState{Mode: "stopped"}); err != nil {
+			return err
+		}
+		return operation(operationCtx)
+	}
 
 	var out bytes.Buffer
-	err := runRecover(context.Background(), &out, repo, true, false, true, true, false)
-	if err == nil || !strings.Contains(err.Error(), "unsafe conditions") {
-		t.Fatalf("runRecover err=%v want live-daemon refusal", err)
+	if err := runRecover(ctx, &out, repo, true, false, true, true, false); err != nil {
+		t.Fatalf("runRecover: %v\n%s", err, out.String())
 	}
+	if quiesceCalls != 1 {
+		t.Fatalf("quiesce calls=%d want 1", quiesceCalls)
+	}
+	assertFixEventState(t, ctx, db, first, state.EventStateRecovered)
+	assertFixEventState(t, ctx, db, second, state.EventStateRecovered)
 }
 
 func TestRecover_DryRunDoesNotBootstrapSchema(t *testing.T) {

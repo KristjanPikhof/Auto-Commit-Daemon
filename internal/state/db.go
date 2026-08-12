@@ -166,9 +166,29 @@ func Open(ctx context.Context, dbPath string) (*DB, error) {
 	return d, nil
 }
 
-// OpenRuntime opens a database only when setup has already committed schema
-// v20. Unlike Open, it never creates a file or runs a migration for an older
-// repository. This is the entry point for supervisor-managed workers.
+// CanRuntimeMigrate reports whether a supervisor-managed worker may apply an
+// additive schema migration while it owns the repository lock. Keep this list
+// explicit. A migration that changes checkpoint or publication meaning still
+// belongs in the reviewed setup flow.
+func CanRuntimeMigrate(from, to int) bool {
+	if from == to {
+		return true
+	}
+	for version := from; version < to; version++ {
+		switch version {
+		case 20:
+			// v21 only adds the publication_drains table and indexes. It does
+			// not reinterpret existing checkpoint or publication rows.
+		default:
+			return false
+		}
+	}
+	return from > 0 && from < to
+}
+
+// OpenRuntime opens a database for a supervisor-managed worker. Workers may
+// apply only migrations listed by CanRuntimeMigrate, after acquiring the
+// canonical repository lock. Older checkpoint formats still require setup.
 func OpenRuntime(ctx context.Context, dbPath string) (*DB, error) {
 	version, err := ReadUserVersion(ctx, dbPath)
 	if err != nil {
@@ -177,7 +197,7 @@ func OpenRuntime(ctx context.Context, dbPath string) (*DB, error) {
 		}
 		return nil, err
 	}
-	if version != SchemaVersion {
+	if !CanRuntimeMigrate(version, SchemaVersion) {
 		return nil, fmt.Errorf("%w: state database schema is v%d, want v%d",
 			ErrSetupRequired, version, SchemaVersion)
 	}

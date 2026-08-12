@@ -15,25 +15,34 @@ import (
 	"github.com/spf13/cobra"
 
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 type productCommitAllResult struct {
-	Repo               string `json:"repo"`
-	CheckpointID       string `json:"checkpoint_id,omitempty"`
-	Protected          bool   `json:"protected"`
-	PublicationDrained bool   `json:"publication_drained"`
-	TargetEventSeq     int64  `json:"target_event_seq"`
-	TargetEvents       int64  `json:"target_events"`
-	PublishedEvents    int64  `json:"published_events"`
-	RemainingEvents    int64  `json:"remaining_events"`
-	RecoveredEvents    int64  `json:"recovered_events,omitempty"`
-	TerminalEvents     int64  `json:"terminal_events,omitempty"`
-	CommitsCreated     int64  `json:"commits_created"`
-	WaitingReason      string `json:"waiting_reason,omitempty"`
-	WorktreeChanges    int    `json:"worktree_changes,omitempty"`
-	PendingEvents      int    `json:"pending_events,omitempty"`
-	DryRun             bool   `json:"dry_run,omitempty"`
+	Repo               string  `json:"repo"`
+	CheckpointID       string  `json:"checkpoint_id,omitempty"`
+	DrainID            string  `json:"drain_id,omitempty"`
+	Phase              string  `json:"phase,omitempty"`
+	Protected          bool    `json:"protected"`
+	PublicationDrained bool    `json:"publication_drained"`
+	TargetEventSeq     int64   `json:"target_event_seq"`
+	TargetEvents       int64   `json:"target_events"`
+	PublishedEvents    int64   `json:"published_events"`
+	RemainingEvents    int64   `json:"remaining_events"`
+	RecoveredEvents    int64   `json:"recovered_events,omitempty"`
+	TerminalEvents     int64   `json:"terminal_events,omitempty"`
+	CommitsCreated     int64   `json:"commits_created"`
+	WaitingReason      string  `json:"waiting_reason,omitempty"`
+	FallbackMode       string  `json:"fallback_mode,omitempty"`
+	LastError          string  `json:"last_error,omitempty"`
+	SemanticAttempts   int64   `json:"semantic_rebuild_attempts,omitempty"`
+	EventFallbackCount int64   `json:"event_fallback_count,omitempty"`
+	LastProgressTS     float64 `json:"last_progress_ts,omitempty"`
+	StagedConsumed     bool    `json:"staged_consumed,omitempty"`
+	WorktreeChanges    int     `json:"worktree_changes,omitempty"`
+	PendingEvents      int     `json:"pending_events,omitempty"`
+	DryRun             bool    `json:"dry_run,omitempty"`
 }
 
 func newProductCommitAllCmd() *cobra.Command {
@@ -114,16 +123,18 @@ func runProductCommitAll(
 
 	params, _ := json.Marshal(map[string]any{
 		"kind": "checkpoint", "drain_publication": true,
+		"consume_staged": true,
 	})
 	type callResult struct {
-		response supervisor.Response
-		err      error
+		result productCommitAllResult
+		err    error
 	}
 	resultCh := make(chan callResult, 1)
+	startedAt := time.Now()
 	go func() {
-		response, callErr := callSupervisor(ctx, lookup, "checkpoint_barrier", params,
-			supervisor.CheckpointBarrierTimeout)
-		resultCh <- callResult{response: response, err: callErr}
+		result, callErr := startProductPublicationDrain(
+			ctx, lookup, params, startedAt)
+		resultCh <- callResult{result: result, err: callErr}
 	}()
 
 	if !quiet && !jsonOut {
@@ -149,21 +160,291 @@ func runProductCommitAll(
 			if quiet || jsonOut {
 				continue
 			}
+			statusResponse, statusErr := callSupervisor(
+				ctx, lookup, "publication_drain_status", nil, 2*time.Second)
+			if statusErr == nil {
+				projection, decodeErr := decodeProductData[state.PublicationDrainReadOnlyProjection](statusResponse.Data)
+				if decodeErr == nil && projection.Latest != nil {
+					drain := projection.Latest
+					remaining := drain.TargetEventCount - drain.PublishedEventCount
+					fmt.Fprintf(progressOut,
+						"Commit all: phase=%s remaining=%d commits=%d fallback=%s error=%s\n",
+						drain.Phase, remaining, drain.CommitCount,
+						commitAllValueOr(drain.FallbackMode, "none"),
+						commitAllValueOr(drain.LastError, "none"))
+					continue
+				}
+			}
 			current, inspectErr := inspectControl(ctx, lookup.Worktree.Root)
 			if inspectErr == nil {
-				fmt.Fprintf(progressOut, "Commit all: protected=%s pending=%d; still publishing\n",
+				fmt.Fprintf(progressOut,
+					"Commit all: protected=%s pending=%d; starting durable drain\n",
 					yesNo(current.Protected), current.PendingEvents)
 			}
 		}
 	}
 
 completed:
-	result, err := decodeProductData[productCommitAllResult](call.response.Data)
-	if err != nil {
-		return fmt.Errorf("acd commit-all: decode worker result: %w", err)
-	}
+	result := call.result
 	result.Repo = lookup.Worktree.Root
+	if !result.PublicationDrained {
+		result, err = waitForProductPublicationDrain(
+			ctx, lookup, result, progressOut, quiet || jsonOut)
+		if err != nil {
+			return err
+		}
+	}
+	if result.PublicationDrained && result.RecoveredEvents > 0 {
+		current, inspectErr := inspectControl(ctx, lookup.Worktree.Root)
+		changes, changeErr := productWorktreeChangeCount(ctx, lookup.Worktree.Root)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if changeErr != nil {
+			return fmt.Errorf("acd commit-all: inspect recovered worktree: %w", changeErr)
+		}
+		if current.PendingEvents > 0 || changes > 0 {
+			if !quiet && !jsonOut {
+				fmt.Fprintf(progressOut,
+					"Commit all: recovery recaptured %d current event(s); draining them now\n",
+					current.PendingEvents)
+			}
+			prior := result
+			follow, followErr := startProductPublicationDrain(
+				ctx, lookup, params, time.Now())
+			if followErr != nil {
+				return fmt.Errorf("acd commit-all: start recovered follow-up drain: %w", followErr)
+			}
+			if !follow.PublicationDrained {
+				follow, followErr = waitForProductPublicationDrain(
+					ctx, lookup, follow, progressOut, quiet || jsonOut)
+				if followErr != nil {
+					return followErr
+				}
+			}
+			follow.Repo = lookup.Worktree.Root
+			follow.TargetEvents += prior.TargetEvents
+			follow.PublishedEvents += prior.PublishedEvents
+			follow.RecoveredEvents += prior.RecoveredEvents
+			follow.TerminalEvents += prior.TerminalEvents
+			follow.CommitsCreated += prior.CommitsCreated
+			result = follow
+		}
+	}
 	return finishProductCommitAll(out, result, jsonOut)
+}
+
+func startProductPublicationDrain(
+	ctx context.Context,
+	lookup controlRepoLookup,
+	params json.RawMessage,
+	startedAt time.Time,
+) (productCommitAllResult, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		response, err := callSupervisor(ctx, lookup, "publication_drain_start", params,
+			supervisor.CheckpointBarrierTimeout)
+		if err == nil {
+			result, decodeErr := decodeProductData[productCommitAllResult](response.Data)
+			if decodeErr != nil {
+				return productCommitAllResult{}, fmt.Errorf(
+					"acd commit-all: decode worker result: %w", decodeErr)
+			}
+			return result, nil
+		}
+		lastErr = err
+		var commandErr *CommandError
+		if errors.As(err, &commandErr) && !commandErr.Retryable {
+			return productCommitAllResult{}, err
+		}
+		if result, found := reconnectProductPublicationDrain(
+			ctx, lookup, startedAt); found {
+			return result, nil
+		}
+		if _, restartErr := callSupervisor(
+			ctx, lookup, "restart_repository", nil, 30*time.Second); restartErr != nil {
+			lastErr = errors.Join(lastErr, restartErr)
+			continue
+		}
+		if readyErr := waitControlWorkerReady(
+			ctx, lookup, 15*time.Second); readyErr != nil {
+			lastErr = errors.Join(lastErr, readyErr)
+			continue
+		}
+		if result, found := reconnectProductPublicationDrain(
+			ctx, lookup, startedAt); found {
+			return result, nil
+		}
+	}
+	return productCommitAllResult{}, fmt.Errorf(
+		"acd commit-all: worker recovery did not restore the durable publication drain: %w",
+		lastErr)
+}
+
+func reconnectProductPublicationDrain(
+	ctx context.Context,
+	lookup controlRepoLookup,
+	startedAt time.Time,
+) (productCommitAllResult, bool) {
+	response, err := callSupervisor(
+		ctx, lookup, "publication_drain_status", nil, 2*time.Second)
+	if err != nil {
+		return productCommitAllResult{}, false
+	}
+	projection, err := decodeProductData[state.PublicationDrainReadOnlyProjection](
+		response.Data)
+	if err != nil {
+		return productCommitAllResult{}, false
+	}
+	drain := selectReconnectPublicationDrain(
+		projection, lookup.Record.WorktreeID, startedAt)
+	if drain == nil {
+		return productCommitAllResult{}, false
+	}
+	return productCommitAllResultFromDrain(*drain), true
+}
+
+func selectReconnectPublicationDrain(
+	projection state.PublicationDrainReadOnlyProjection,
+	worktreeID string,
+	startedAt time.Time,
+) *state.PublicationDrain {
+	var matches []state.PublicationDrain
+	for _, drain := range projection.Active {
+		if drain.WorktreeID == worktreeID {
+			matches = append(matches, drain)
+		}
+	}
+	var drain *state.PublicationDrain
+	for index := range matches {
+		if matches[index].CreatedTS >= float64(startedAt.Add(-time.Second).UnixNano())/1e9 &&
+			(drain == nil || matches[index].CreatedTS > drain.CreatedTS) {
+			drain = &matches[index]
+		}
+	}
+	if drain == nil && projection.Latest != nil &&
+		projection.Latest.WorktreeID == worktreeID &&
+		projection.Latest.CreatedTS >= float64(startedAt.Add(-time.Second).UnixNano())/1e9 {
+		drain = projection.Latest
+	}
+	return drain
+}
+
+func productCommitAllResultFromDrain(drain state.PublicationDrain) productCommitAllResult {
+	var maxSeq int64
+	for _, seq := range drain.EventSeqs {
+		maxSeq = max(maxSeq, seq)
+	}
+	return productCommitAllResult{
+		CheckpointID: drain.CheckpointID, DrainID: drain.ID, Phase: drain.Phase,
+		Protected: true, PublicationDrained: drain.Phase == state.PublicationDrainCompleted,
+		TargetEventSeq: maxSeq, TargetEvents: drain.TargetEventCount,
+		PublishedEvents: drain.PublishedEventCount,
+		RemainingEvents: drain.TargetEventCount - drain.PublishedEventCount,
+		CommitsCreated:  drain.CommitCount, WaitingReason: drain.LastError,
+		FallbackMode: drain.FallbackMode, LastError: drain.LastError,
+		SemanticAttempts:   drain.SemanticRebuildAttempts,
+		EventFallbackCount: drain.EventFallbackCount,
+		LastProgressTS:     drain.LastProgressTS, StagedConsumed: drain.StagedConsumed,
+	}
+}
+
+func waitForProductPublicationDrain(
+	ctx context.Context,
+	lookup controlRepoLookup,
+	result productCommitAllResult,
+	progressOut io.Writer,
+	quiet bool,
+) (productCommitAllResult, error) {
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	report := time.NewTicker(5 * time.Second)
+	defer report.Stop()
+	var latest *state.PublicationDrain
+	var lastStatusErr error
+	for {
+		select {
+		case <-ctx.Done():
+			return result, ctx.Err()
+		case <-report.C:
+			if quiet {
+				continue
+			}
+			if latest == nil {
+				fmt.Fprintf(progressOut,
+					"Commit all: reconnecting to durable drain %s: %v\n",
+					result.DrainID, lastStatusErr)
+				continue
+			}
+			remaining := latest.TargetEventCount - latest.PublishedEventCount
+			fmt.Fprintf(progressOut,
+				"Commit all: phase=%s remaining=%d commits=%d fallback=%s error=%s\n",
+				latest.Phase, remaining, latest.CommitCount,
+				commitAllValueOr(latest.FallbackMode, "none"),
+				commitAllValueOr(latest.LastError, "none"))
+		case <-poll.C:
+			response, err := callSupervisor(
+				ctx, lookup, "publication_drain_status", nil, 2*time.Second)
+			if err != nil {
+				lastStatusErr = err
+				continue
+			}
+			projection, err := decodeProductData[state.PublicationDrainReadOnlyProjection](
+				response.Data)
+			if err != nil {
+				lastStatusErr = err
+				continue
+			}
+			latest = productPublicationDrainByID(projection, result.DrainID)
+			if latest == nil {
+				lastStatusErr = errors.New("durable publication drain is not visible yet")
+				continue
+			}
+			lastStatusErr = nil
+			result.Phase = latest.Phase
+			result.TargetEvents = latest.TargetEventCount
+			result.PublishedEvents = latest.PublishedEventCount
+			result.RemainingEvents = latest.TargetEventCount - latest.PublishedEventCount
+			result.CommitsCreated = latest.CommitCount
+			result.FallbackMode = latest.FallbackMode
+			result.LastError = latest.LastError
+			result.SemanticAttempts = latest.SemanticRebuildAttempts
+			result.EventFallbackCount = latest.EventFallbackCount
+			result.LastProgressTS = latest.LastProgressTS
+			result.StagedConsumed = latest.StagedConsumed
+			switch latest.Phase {
+			case state.PublicationDrainCompleted:
+				result.PublicationDrained = true
+				result.RemainingEvents = 0
+				return result, nil
+			case state.PublicationDrainNeedsAction:
+				return result, actionRequiredError(
+					"publication_needs_action", latest.LastError)
+			}
+		}
+	}
+}
+
+func productPublicationDrainByID(
+	projection state.PublicationDrainReadOnlyProjection,
+	id string,
+) *state.PublicationDrain {
+	if projection.Latest != nil && projection.Latest.ID == id {
+		return projection.Latest
+	}
+	for index := range projection.Active {
+		if projection.Active[index].ID == id {
+			return &projection.Active[index]
+		}
+	}
+	return nil
+}
+
+func commitAllValueOr(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func finishProductCommitAll(out io.Writer, result productCommitAllResult, jsonOut bool) error {
@@ -223,8 +504,12 @@ func renderProductCommitAll(out io.Writer, result productCommitAllResult, stateN
 		return nil
 	}
 	fmt.Fprintf(out, "Protected checkpoint: %s\n", result.CheckpointID)
-	fmt.Fprintf(out, "Published target events: %d/%d in %d Git commit(s).\n",
+	fmt.Fprintf(out, "Resolved target events: %d/%d in %d Git commit(s).\n",
 		result.PublishedEvents, result.TargetEvents, result.CommitsCreated)
+	if result.RecoveredEvents > 0 {
+		fmt.Fprintf(out, "Recovered safely and recaptured: %d event(s).\n",
+			result.RecoveredEvents)
+	}
 	if result.PublicationDrained {
 		fmt.Fprintln(out, "Commit all complete.")
 	} else {

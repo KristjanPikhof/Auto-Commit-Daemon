@@ -3,6 +3,8 @@ package supervisor
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +60,16 @@ type ShutdownStatus struct {
 	Stopped bool `json:"stopped"`
 }
 
+type MaintenanceLease struct {
+	RepositoryID string    `json:"repository_id"`
+	Token        string    `json:"token"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+type MaintenanceStatus struct {
+	Released bool `json:"released"`
+}
+
 type Handler interface {
 	HandleSupervisorRequest(context.Context, Request) (any, *ProtocolError)
 }
@@ -74,11 +86,12 @@ type Server struct {
 	// so they keep the invoking session's repository access.
 	LaunchdWorkers bool
 
-	mu      sync.Mutex
-	workers map[string]*workerProcess
-	closing bool
-	cancel  context.CancelFunc
-	command func(context.Context, string, ...string) ([]byte, error)
+	mu          sync.Mutex
+	workers     map[string]*workerProcess
+	maintenance map[string]MaintenanceLease
+	closing     bool
+	cancel      context.CancelFunc
+	command     func(context.Context, string, ...string) ([]byte, error)
 }
 
 type workerProcess struct {
@@ -252,11 +265,141 @@ func (s *Server) handle(ctx context.Context, request Request) (any, *ProtocolErr
 			time.AfterFunc(10*time.Millisecond, cancel)
 		}
 		return ShutdownStatus{Stopped: true}, nil
+	case "maintenance_begin":
+		return s.beginMaintenance(ctx, request.RepositoryID)
+	case "maintenance_renew":
+		return s.renewMaintenance(request.RepositoryID, request.Params)
+	case "maintenance_end":
+		return s.endMaintenance(ctx, request.RepositoryID, request.Params)
+	case "restart_repository":
+		return s.restartRepository(ctx, request.RepositoryID)
+	case "stop_repository":
+		return s.stopRepository(ctx, request.RepositoryID)
 	}
 	if s.Handler == nil {
 		return nil, &ProtocolError{Code: "not_supported", Message: "request is not supported by this supervisor", Retryable: false}
 	}
 	return s.Handler.HandleSupervisorRequest(ctx, request)
+}
+
+func (s *Server) restartRepository(ctx context.Context, repositoryID string) (any, *ProtocolError) {
+	value, protocolErr := s.beginMaintenance(ctx, repositoryID)
+	if protocolErr != nil {
+		return nil, protocolErr
+	}
+	lease := value.(MaintenanceLease)
+	params, _ := json.Marshal(map[string]string{"token": lease.Token})
+	if _, protocolErr := s.endMaintenance(ctx, repositoryID, params); protocolErr != nil {
+		return nil, protocolErr
+	}
+	return MaintenanceStatus{Released: true}, nil
+}
+
+func (s *Server) stopRepository(ctx context.Context, repositoryID string) (any, *ProtocolError) {
+	if !validRepositoryID(repositoryID) {
+		return nil, &ProtocolError{Code: "invalid_repository", Message: "valid repository_id is required"}
+	}
+	if err := s.reconcile(ctx); err != nil {
+		return nil, &ProtocolError{Code: "repository_stop_failed", Message: err.Error(), Retryable: true}
+	}
+	if err := s.waitRepositoryWorkerStopped(ctx, repositoryID); err != nil {
+		return nil, &ProtocolError{Code: "repository_stop_incomplete", Message: err.Error(), Retryable: true}
+	}
+	return MaintenanceStatus{Released: true}, nil
+}
+
+const maintenanceLeaseTTL = 2 * time.Minute
+
+func (s *Server) beginMaintenance(ctx context.Context, repositoryID string) (any, *ProtocolError) {
+	if !validRepositoryID(repositoryID) {
+		return nil, &ProtocolError{Code: "invalid_repository", Message: "valid repository_id is required"}
+	}
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return nil, &ProtocolError{Code: "maintenance_failed", Message: err.Error(), Retryable: true}
+	}
+	now := time.Now()
+	lease := MaintenanceLease{RepositoryID: repositoryID, Token: hex.EncodeToString(tokenBytes), ExpiresAt: now.Add(maintenanceLeaseTTL)}
+	s.mu.Lock()
+	if s.maintenance == nil {
+		s.maintenance = make(map[string]MaintenanceLease)
+	}
+	s.expireMaintenanceLocked(now)
+	if existing, held := s.maintenance[repositoryID]; held {
+		s.mu.Unlock()
+		return nil, &ProtocolError{Code: "maintenance_busy", Message: fmt.Sprintf("repository maintenance is already active until %s", existing.ExpiresAt.Format(time.RFC3339)), Retryable: true}
+	}
+	s.maintenance[repositoryID] = lease
+	s.mu.Unlock()
+	if err := s.reconcile(ctx); err != nil {
+		s.mu.Lock()
+		delete(s.maintenance, repositoryID)
+		s.mu.Unlock()
+		return nil, &ProtocolError{Code: "maintenance_failed", Message: err.Error(), Retryable: true}
+	}
+	if err := s.waitRepositoryWorkerStopped(ctx, repositoryID); err != nil {
+		s.mu.Lock()
+		delete(s.maintenance, repositoryID)
+		s.mu.Unlock()
+		_ = s.reconcile(context.Background())
+		return nil, &ProtocolError{Code: "maintenance_stop_incomplete", Message: err.Error(), Retryable: true}
+	}
+	return lease, nil
+}
+
+func (s *Server) renewMaintenance(repositoryID string, params json.RawMessage) (any, *ProtocolError) {
+	token, protocolErr := maintenanceToken(params)
+	if protocolErr != nil {
+		return nil, protocolErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.expireMaintenanceLocked(now)
+	lease, held := s.maintenance[repositoryID]
+	if !held || lease.Token != token {
+		return nil, &ProtocolError{Code: "maintenance_lease_lost", Message: "repository maintenance lease is not active", Retryable: false}
+	}
+	lease.ExpiresAt = now.Add(maintenanceLeaseTTL)
+	s.maintenance[repositoryID] = lease
+	return lease, nil
+}
+
+func (s *Server) endMaintenance(ctx context.Context, repositoryID string, params json.RawMessage) (any, *ProtocolError) {
+	token, protocolErr := maintenanceToken(params)
+	if protocolErr != nil {
+		return nil, protocolErr
+	}
+	s.mu.Lock()
+	lease, held := s.maintenance[repositoryID]
+	if !held || lease.Token != token {
+		s.mu.Unlock()
+		return nil, &ProtocolError{Code: "maintenance_lease_lost", Message: "repository maintenance lease is not active", Retryable: false}
+	}
+	delete(s.maintenance, repositoryID)
+	s.mu.Unlock()
+	if err := s.reconcile(ctx); err != nil {
+		return nil, &ProtocolError{Code: "maintenance_restart_failed", Message: err.Error(), Retryable: true}
+	}
+	return MaintenanceStatus{Released: true}, nil
+}
+
+func maintenanceToken(params json.RawMessage) (string, *ProtocolError) {
+	var request struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(params, &request); err != nil || request.Token == "" {
+		return "", &ProtocolError{Code: "invalid_request", Message: "maintenance token is required"}
+	}
+	return request.Token, nil
+}
+
+func (s *Server) expireMaintenanceLocked(now time.Time) {
+	for repositoryID, lease := range s.maintenance {
+		if !now.Before(lease.ExpiresAt) {
+			delete(s.maintenance, repositoryID)
+		}
+	}
 }
 
 func (s *Server) status() Status {
@@ -267,17 +410,17 @@ func (s *Server) status() Status {
 		Workers: make([]WorkerStatus, 0, len(s.workers))}
 	for _, worker := range s.workers {
 		item := WorkerStatus{RepositoryID: worker.id, Restarts: worker.restarts, LastError: worker.lastError, State: "backoff", Version: s.Version}
-		if worker.launchd {
+		if runtimeStatus, err := ReadWorkerRuntimeStatus(s.Roots, worker.id); err == nil &&
+			(worker.launchd || worker.cmd != nil) {
+			item.PID = runtimeStatus.PID
+			item.State = runtimeStatus.State
+			item.Restarts = runtimeStatus.Restarts
+			item.LastError = runtimeStatus.LastError
+		} else if worker.launchd {
 			item.State = "starting"
-			if runtimeStatus, err := ReadWorkerRuntimeStatus(s.Roots, worker.id); err == nil {
-				item.PID = runtimeStatus.PID
-				item.State = runtimeStatus.State
-				item.Restarts = runtimeStatus.Restarts
-				item.LastError = runtimeStatus.LastError
-			}
 		} else if worker.cmd != nil && worker.cmd.Process != nil {
 			item.PID = worker.cmd.Process.Pid
-			item.State = "running"
+			item.State = "starting"
 		}
 		if item.Restarts >= 5 && item.LastError != "" {
 			item.State = "needs_action"
@@ -318,6 +461,10 @@ func (s *Server) reconcile(ctx context.Context) error {
 	defer s.mu.Unlock()
 	if s.closing {
 		return nil
+	}
+	s.expireMaintenanceLocked(now)
+	for repositoryID := range s.maintenance {
+		delete(desired, repositoryID)
 	}
 	for id, worker := range s.workers {
 		if _, enabled := desired[id]; !enabled {
@@ -396,7 +543,12 @@ func startableWorkerIDs(workers map[string]*workerProcess, now time.Time, limit 
 }
 
 func (s *Server) startWorkerLocked(ctx context.Context, worker *workerProcess) {
-	args := []string{"internal", "worker", "run", "--repository-id", worker.id}
+	args := []string{
+		"internal", "worker", "supervise", "--repository-id", worker.id,
+		"--state-root", s.Roots.State,
+		"--share-root", s.Roots.Share,
+		"--config-root", s.Roots.Config,
+	}
 	if _, err := os.Stat(s.Roots.SetupPublicationHoldPath()); err == nil {
 		args = append(args, "--publication-hold", s.Roots.SetupPublicationHoldPath())
 	}
@@ -404,6 +556,7 @@ func (s *Server) startWorkerLocked(ctx context.Context, worker *workerProcess) {
 		s.startLaunchdWorkerLocked(ctx, worker, args)
 		return
 	}
+	_ = RemoveWorkerRuntimeStatus(s.Roots, worker.id)
 	cmd := exec.CommandContext(ctx, s.BinaryPath, args...)
 	cmd.Env = ProcessEnvironment(s.Roots, os.Environ())
 	cmd.Stdout = os.Stdout
@@ -450,14 +603,7 @@ func (s *Server) startLaunchdWorkerLocked(ctx context.Context, worker *workerPro
 		return
 	}
 	_ = RemoveWorkerRuntimeStatus(s.Roots, worker.id)
-	superviseArgs := append([]string(nil), args...)
-	superviseArgs[2] = "supervise"
-	superviseArgs = append(superviseArgs,
-		"--state-root", s.Roots.State,
-		"--share-root", s.Roots.Share,
-		"--config-root", s.Roots.Config,
-	)
-	content, err := renderWorkerService(s.Roots, s.BinaryPath, worker.id, superviseArgs)
+	content, err := renderWorkerService(s.Roots, s.BinaryPath, worker.id, args)
 	if err != nil {
 		s.recordWorkerStartFailure(worker, err)
 		return
@@ -570,6 +716,25 @@ func (s *Server) waitWorkersStopped(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("supervisor: %d worker(s) did not stop: %w", remaining, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) waitRepositoryWorkerStopped(ctx context.Context, repositoryID string) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		worker := s.workers[repositoryID]
+		stopped := worker == nil || (!worker.launchd && worker.cmd == nil)
+		s.mu.Unlock()
+		if stopped {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("supervisor: repository worker %s did not stop: %w", repositoryID, ctx.Err())
 		case <-ticker.C:
 		}
 	}

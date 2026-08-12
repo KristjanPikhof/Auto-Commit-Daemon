@@ -18,8 +18,10 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
 )
@@ -97,7 +99,25 @@ func TestMacOSCompatibleRuntimeUpgradeRestartsWithoutSetupMigration(t *testing.T
 	t.Setenv("XDG_STATE_HOME", filepath.Dir(roots.State))
 	t.Setenv("XDG_DATA_HOME", filepath.Dir(roots.Share))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Dir(roots.Config))
-	if err := central.Save(roots, central.NewRegistry()); err != nil {
+	repo := tempRepo(t)
+	runGitOK(t, repo, "checkout", "--quiet", "--detach", "HEAD")
+	worktree, err := gitpkg.ResolveWorktree(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(context.Background(), state.DBPathFromGitDir(worktree.GitDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	registry := central.NewRegistry()
+	registration, err := registry.RegisterResolvedRepo(worktree, "runtime-upgrade-test", time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := central.Save(roots, registry); err != nil {
 		t.Fatal(err)
 	}
 	original := buildAcdBinary(t)
@@ -123,6 +143,10 @@ func TestMacOSCompatibleRuntimeUpgradeRestartsWithoutSetupMigration(t *testing.T
 	}
 	t.Cleanup(func() { shutdownSupervisorScaleTest(roots) })
 	before := readSessionSupervisorStatus(t, ctx, roots)
+	beforeWorker := waitSessionSupervisorWorker(t, ctx, roots, registration.Record.RepositoryID, registration.Record.WorktreeID)
+	if err := os.WriteFile(filepath.Join(repo, "protected-during-upgrade.txt"), []byte("preserve me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	changed, err := installer.ApplyCompatibleRuntime(ctx, roots, installer.RuntimeUpgradeOptions{
 		SourceExecutable: source, SourceVersion: version.String(),
 		Compatibility: installer.RuntimeCompatibility(), Integrations: "none",
@@ -131,12 +155,67 @@ func TestMacOSCompatibleRuntimeUpgradeRestartsWithoutSetupMigration(t *testing.T
 		t.Fatal(err)
 	}
 	after := readSessionSupervisorStatus(t, ctx, roots)
+	afterWorker := waitSessionSupervisorWorker(t, ctx, roots, registration.Record.RepositoryID, registration.Record.WorktreeID)
 	wantDigest, err := version.FileDigest(source)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !changed || after.PID == before.PID || after.BinaryDigest != wantDigest || !after.Compatibility.Equal(installer.RuntimeCompatibility()) {
 		t.Fatalf("upgrade changed=%v before=%+v after=%+v want_digest=%s", changed, before, after, wantDigest)
+	}
+	if beforeWorker.PID <= 0 || afterWorker.PID <= 0 || beforeWorker.PID == afterWorker.PID {
+		t.Fatalf("detached worker was not replaced: before=%+v after=%+v", beforeWorker, afterWorker)
+	}
+	projection, err := state.ReadCheckpointProjection(ctx, registration.Record.StateDB, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Latest == nil || projection.Latest.Phase != state.CheckpointCompleted || projection.Latest.Ref == "" {
+		t.Fatalf("detached dirty worktree was not checkpointed before upgrade: %+v", projection)
+	}
+	if got := runGitOK(t, repo, "show", projection.Latest.Ref+":protected-during-upgrade.txt"); got != "preserve me\n" {
+		t.Fatalf("checkpointed detached content=%q want %q", got, "preserve me\\n")
+	}
+	waitProcessExited(t, before.PID, "old supervisor")
+	waitProcessExited(t, beforeWorker.PID, "old detached worker")
+}
+
+func waitProcessExited(t *testing.T, pid int, description string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s PID %d survived compatible upgrade", description, pid)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func waitSessionSupervisorWorker(t *testing.T, ctx context.Context, roots paths.Roots, repositoryID, worktreeID string) supervisor.WorkerStatus {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		status := readSessionSupervisorStatus(t, ctx, roots)
+		for _, worker := range status.Workers {
+			if worker.RepositoryID == repositoryID && worker.State == "running" && worker.PID > 0 {
+				response, err := supervisor.DoWorker(ctx, supervisor.WorkerSocketPath(roots, repositoryID), supervisor.Request{
+					Version: supervisor.ProtocolVersion,
+					ID:      fmt.Sprintf("runtime-upgrade-worker-ready-%d", time.Now().UnixNano()),
+					Method:  "status", RepositoryID: repositoryID,
+					WorktreeID: worktreeID,
+				}, time.Second)
+				if err == nil && response.OK {
+					return worker
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("supervisor worker %s did not become ready: %+v", repositoryID, status.Workers)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 

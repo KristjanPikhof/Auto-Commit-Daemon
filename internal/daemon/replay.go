@@ -178,6 +178,10 @@ type ReplayOpts struct {
 	// this; direct replay tests may leave it false when exercising legacy row
 	// fixtures without constructing a protection checkpoint.
 	RequireCompletedCheckpoint bool
+	// PublicationDrain freezes this pass to the checkpoint's immutable event
+	// membership. Event-fallback drains bypass semantic projection while still
+	// using the ordinary scratch-index, verification, CAS, and journal path.
+	PublicationDrain *state.PublicationDrain
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
 	// PromptTrace receives opt-in provider prompt records. Nil disables prompt
@@ -302,6 +306,9 @@ type ReplaySummary struct {
 	// succeeded in this pass. Multi-group Intent publication overwrites it
 	// group-by-group, so it always names the completed chain tip.
 	SelfPublicationTargetOID string
+	// PlannerFailure carries the sanitized provider or validation failure that
+	// led to a safe local plan. Durable drains retain it when they escalate.
+	PlannerFailure string
 }
 
 // Replay drains pending capture_events for the active branch into commits.
@@ -400,6 +407,18 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if closeIntentPlanner != nil {
 		defer closeIntentPlanner()
 	}
+	if opts.PublicationDrain != nil && intentCfg.enabled &&
+		opts.PublicationDrain.Phase == state.PublicationDrainEventFallback {
+		intentCfg.planner = publicationDrainAtomicFallbackPlanner{
+			commitFormat: intentCfg.commitFormat,
+		}
+		intentCfg.plannerProvider = intentCfg.planner.Name()
+		intentCfg.plannerModel = ""
+		intentCfg.health = nil
+		intentCfg.candidateMode = true
+		intentCfg.bypassBatchWait = true
+		intentCfg.pathQuiescence = 0
+	}
 
 	// Self-heal pass: probe every blocked_conflict row whose conflict class
 	// is before_state_mismatch against HEAD. When an external committer
@@ -458,9 +477,20 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if opts.RequireCompletedCheckpoint {
 		loadPending = state.PublishableEvents
 	}
-	pending, err := loadPending(ctx, db, queryLimit)
+	loadLimit := queryLimit
+	if opts.PublicationDrain != nil {
+		loadLimit = 0
+	}
+	pending, err := loadPending(ctx, db, loadLimit)
 	if err != nil {
 		return sum, fmt.Errorf("daemon: load pending: %w", err)
+	}
+	if opts.PublicationDrain != nil {
+		pending, err = publicationDrainPendingEvents(
+			ctx, db, cctx, *opts.PublicationDrain, pending)
+		if err != nil {
+			return sum, err
+		}
 	}
 	if batchLimit > 0 && len(pending) > batchLimit {
 		pending = pending[:batchLimit]
@@ -1207,7 +1237,19 @@ func replayIntentBatch(
 		}
 		return sum, nil
 	}
-	window, forced, waitReason, err := selectIntentWindow(ctx, db, pending, cfg)
+	var (
+		window     []state.CaptureEvent
+		forced     bool
+		waitReason string
+		err        error
+	)
+	if opts.PublicationDrain != nil &&
+		opts.PublicationDrain.Phase == state.PublicationDrainEventFallback {
+		window, err = publicationDrainAtomicFallbackWindow(
+			ctx, db, activeCtx, pending)
+	} else {
+		window, forced, waitReason, err = selectIntentWindow(ctx, db, pending, cfg)
+	}
 	if err != nil {
 		return sum, err
 	}
@@ -1674,9 +1716,6 @@ func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig,
 func intentBatchWaitReason(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) string {
 	if len(pending) == 0 || len(pending) >= cfg.minPending {
 		if len(pending) == 0 || cfg.settleWindow <= 0 {
-			return ""
-		}
-		if cfg.window > 0 && len(pending) >= cfg.window {
 			return ""
 		}
 		oldest := pending[0]

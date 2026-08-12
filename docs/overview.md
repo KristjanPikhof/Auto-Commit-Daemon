@@ -68,6 +68,14 @@ of SHA-256 over its canonical Git common directory. A worktree uses the same
 construction over its canonical root. Old path hashes remain migration
 metadata only.
 
+The worker daemon log is stored at
+`${XDG_STATE_HOME:-$HOME/.local/state}/acd/<repo-hash>/daemon.log`. Linked
+worktrees share that common-directory log. Each worktree record includes
+`repo_hash`, `worktree`, and `git_dir`; attached-branch records also include
+`branch_ref` and the known `branch_generation`. Planner reject logs are not
+shared. They stay under the exact worktree Git directory described in
+[AI providers](ai-providers.md#failure-behavior).
+
 ## Checkpoint store
 
 A checkpoint is a rootless Git commit whose tree contains the complete
@@ -77,10 +85,13 @@ eligible protected scope. A private ref makes its objects reachable:
 refs/acd/checkpoints/v1/<worktree-id>/cp-<milliseconds>-<random>
 ~~~
 
-SQLite v20 records immutable operation identity, checkpoint phases, exact
+SQLite v21 records immutable operation identity, checkpoint phases, exact
 capture-event membership, privacy-safe exclusion counts, publication links,
-and restore relationships. The specialized publication record remains the
-authoritative branch-ref CAS proof and links to the general operation.
+restore relationships, and durable publication drains. A drain stores one
+frozen target, progress counters, bounded semantic attempts, local fallback,
+staged consent, and restart-safe phase state. The specialized publication
+record remains the authoritative branch-ref CAS proof and links to the general
+operation.
 
 ## Publication
 
@@ -88,6 +99,12 @@ Event strategy retains one captured change per local commit. Intent strategy
 can group changes across completed checkpoints, subject to existing dependency,
 materialization, verification, revertibility, and exact-ref CAS gates. Only
 events belonging to completed checkpoints are eligible.
+
+An active drain publishes only its immutable frozen target. Later captures get
+normal checkpoint protection but wait outside that target. Planner failure can
+move the drain through normalization to local atomic dependency groups.
+Neither path bypasses materialization, verification, exact-ref CAS, or the
+self-publication journal. Client cancellation stops only the wait display.
 
 Unsafe Git states suspend publication but never protection. A checkpoint is
 published only when all member events have completed normal commit mappings.

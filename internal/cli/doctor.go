@@ -42,44 +42,50 @@ func withDoctorTarget(ctx context.Context, repo string) context.Context {
 
 // doctorRepoReport is the per-repo block inside the doctor report.
 type doctorRepoReport struct {
-	Path                   string                    `json:"path"`
-	RepoHash               string                    `json:"repo_hash"`
-	StateDB                string                    `json:"state_db"`
-	StateDBReadable        bool                      `json:"state_db_readable"`
-	DaemonPID              int                       `json:"daemon_pid"`
-	DaemonAlive            bool                      `json:"daemon_alive"`
-	DaemonProcessCount     int                       `json:"daemon_process_count,omitempty"`
-	DaemonProcessPIDs      []int                     `json:"daemon_process_pids,omitempty"`
-	DaemonMode             string                    `json:"daemon_mode"`
-	HeartbeatTS            int64                     `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeS          int64                     `json:"heartbeat_age_seconds,omitempty"`
-	HeartbeatStale         bool                      `json:"heartbeat_stale"`
-	Clients                int                       `json:"client_count"`
-	Harnesses              []string                  `json:"harnesses,omitempty"`
-	LogPath                string                    `json:"log_path"`
-	LogLines               []string                  `json:"log_tail,omitempty"`
-	FsnotifyMode           string                    `json:"fsnotify_mode,omitempty"`
-	FsnotifyWatches        int                       `json:"fsnotify_watches,omitempty"`
-	FsnotifyDropped        int                       `json:"fsnotify_dropped,omitempty"`
-	FsnotifyFallbackReason string                    `json:"fsnotify_fallback_reason,omitempty"`
-	LastCaptureError       string                    `json:"last_capture_error,omitempty"`
-	PendingEvents          int                       `json:"pending_events"`
-	BlockedConflicts       int                       `json:"blocked_conflicts"`
-	FailedEvents           int                       `json:"failed_events"`
-	FailedBlockingPending  int                       `json:"failed_blocking_pending"`
-	IntentStrategy         intentStrategyReport      `json:"intent_strategy"`
-	Configuration          configReadinessReport     `json:"configuration"`
-	Replay                 replayObservabilityReport `json:"replay"`
-	IntentV2               intentV2Report            `json:"intent_v2"`
-	SelfPublication        selfPublicationReport     `json:"self_publication"`
-	LastReplayConflictTS   int64                     `json:"last_replay_conflict_ts,omitempty"`
-	LastReplayConflictPath string                    `json:"last_replay_conflict_path,omitempty"`
-	LastReplayConflictErr  string                    `json:"last_replay_conflict_error,omitempty"`
-	LastReplayFailureTS    int64                     `json:"last_replay_failure_ts,omitempty"`
-	LastReplayFailurePath  string                    `json:"last_replay_failure_path,omitempty"`
-	LastReplayFailureErr   string                    `json:"last_replay_failure_error,omitempty"`
-	Notes                  []string                  `json:"notes,omitempty"`
-	FlushSessionID         string                    `json:"-"`
+	Path                     string                    `json:"path"`
+	RepoHash                 string                    `json:"repo_hash"`
+	StateDB                  string                    `json:"state_db"`
+	StateDBReadable          bool                      `json:"state_db_readable"`
+	DaemonPID                int                       `json:"daemon_pid"`
+	DaemonAlive              bool                      `json:"daemon_alive"`
+	DaemonProcessCount       int                       `json:"daemon_process_count,omitempty"`
+	DaemonProcessPIDs        []int                     `json:"daemon_process_pids,omitempty"`
+	DaemonMode               string                    `json:"daemon_mode"`
+	HeartbeatTS              int64                     `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeS            int64                     `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale           bool                      `json:"heartbeat_stale"`
+	Clients                  int                       `json:"client_count"`
+	Harnesses                []string                  `json:"harnesses,omitempty"`
+	LogPath                  string                    `json:"log_path"`
+	LogLines                 []string                  `json:"log_tail,omitempty"`
+	FsnotifyMode             string                    `json:"fsnotify_mode,omitempty"`
+	FsnotifyWatches          int                       `json:"fsnotify_watches,omitempty"`
+	FsnotifyDropped          int                       `json:"fsnotify_dropped,omitempty"`
+	FsnotifyFallbackReason   string                    `json:"fsnotify_fallback_reason,omitempty"`
+	LastCaptureError         string                    `json:"last_capture_error,omitempty"`
+	PendingEvents            int                       `json:"pending_events"`
+	BlockedConflicts         int                       `json:"blocked_conflicts"`
+	FailedEvents             int                       `json:"failed_events"`
+	FailedBlockingPending    int                       `json:"failed_blocking_pending"`
+	IntentStrategy           intentStrategyReport      `json:"intent_strategy"`
+	Configuration            configReadinessReport     `json:"configuration"`
+	Replay                   replayObservabilityReport `json:"replay"`
+	IntentV2                 intentV2Report            `json:"intent_v2"`
+	SelfPublication          selfPublicationReport     `json:"self_publication"`
+	LastReplayConflictTS     int64                     `json:"last_replay_conflict_ts,omitempty"`
+	LastReplayConflictPath   string                    `json:"last_replay_conflict_path,omitempty"`
+	LastReplayConflictErr    string                    `json:"last_replay_conflict_error,omitempty"`
+	LastReplayFailureTS      int64                     `json:"last_replay_failure_ts,omitempty"`
+	LastReplayFailurePath    string                    `json:"last_replay_failure_path,omitempty"`
+	LastReplayFailureErr     string                    `json:"last_replay_failure_error,omitempty"`
+	Notes                    []string                  `json:"notes,omitempty"`
+	FlushSessionID           string                    `json:"-"`
+	Busy                     bool                      `json:"busy"`
+	OperationalState         string                    `json:"operational_state"`
+	WorktreeClean            bool                      `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                      `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
+	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
 }
 
 type doctorHarnessReport struct {
@@ -282,6 +288,16 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 		// Read state.db (best-effort).
 		if fileExists(rec.StateDB) {
 			rr.StateDBReadable = readRepoState(ctx, &rr, rec.Path, rec.StateDB)
+			if status, statusErr := buildStatusReport(ctx, rec, time.Now()); statusErr == nil {
+				rr.Busy = status.Busy
+				rr.OperationalState = status.OperationalState
+				rr.WorktreeClean = status.WorktreeClean
+				rr.AllChangesCommittedInGit = status.AllChangesCommittedInGit
+				rr.CheckpointPublishedByACD = status.CheckpointPublishedByACD
+				rr.PublicationDrain = status.PublicationDrain
+			} else {
+				rr.Notes = append(rr.Notes, "status truth failed: "+statusErr.Error())
+			}
 		} else {
 			rr.Notes = append(rr.Notes, "state.db missing")
 		}
@@ -1391,7 +1407,12 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	}
 	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err == nil {
 		rr.IntentStrategy = intentStrategy
+		rr.IntentStrategy.RejectLogPath = plannerRejectLogPath(dbPath)
 		rr.Notes = append(rr.Notes, doctorIntentStrategyNotes(rr.IntentStrategy, repoPath, rr.FlushSessionID)...)
+		if rr.IntentStrategy.LastPlannerError != "" && rr.IntentStrategy.RejectLogPath != "" {
+			rr.Notes = append(rr.Notes,
+				"planner rejects for this worktree: "+rr.IntentStrategy.RejectLogPath)
+		}
 	} else {
 		rr.Notes = append(rr.Notes, "intent planner summary failed: "+err.Error())
 	}
@@ -1636,6 +1657,14 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		}
 		fmt.Fprintf(out, "      clients    : %d\n", rr.Clients)
 		fmt.Fprintf(out, "      pending    : %d\n", rr.PendingEvents)
+		if rr.PublicationDrain.ID != "" {
+			fmt.Fprintf(out,
+				"      drain      : %s phase=%s remaining=%d/%d commits=%d\n",
+				rr.PublicationDrain.ID, rr.PublicationDrain.Phase,
+				rr.PublicationDrain.RemainingEvents,
+				rr.PublicationDrain.TargetEvents,
+				rr.PublicationDrain.CommitCount)
+		}
 		if rr.BlockedConflicts > 0 {
 			fmt.Fprintf(out, "      blocked    : %d\n", rr.BlockedConflicts)
 			if rr.LastReplayConflictPath != "" {

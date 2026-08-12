@@ -85,6 +85,7 @@ const EnvClientTTLSeconds = "ACD_CLIENT_TTL_SECONDS"
 // budget is generous enough for an LSP-style flush yet short enough that
 // SIGTERM is observed within the documented ~6s envelope.
 const providerCloseTimeout = 5 * time.Second
+const daemonProgressHeartbeatInterval = time.Second
 
 // processExposer is implemented by subprocess-backed AI provider closers
 // so Run can force-kill the underlying process when Close hangs past
@@ -209,6 +210,12 @@ type Options struct {
 	// providerCloseTimeout is a test-only override for the bounded provider
 	// shutdown wait. Zero keeps the production providerCloseTimeout.
 	providerCloseTimeout time.Duration
+	// progressHeartbeatEvery is a test-only acceleration of the fixed
+	// controller-liveness heartbeat used during long replay work.
+	progressHeartbeatEvery time.Duration
+	// replay is a test-only seam for blocking long-pass and cancellation
+	// coverage. Production always uses Replay.
+	replay func(context.Context, string, *state.DB, CaptureContext, ReplayOpts) (ReplaySummary, error)
 
 	// Now lets tests inject a fake clock. Nil falls back to time.Now.
 	Now func() time.Time
@@ -331,6 +338,7 @@ func Run(ctx context.Context, opts Options) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	logger, logContext := newDaemonLogger(logger, opts)
 	// Top-level panic recover. The daemon owns long-lived resources whose
 	// cleanup runs through subsequent defers (IgnoreChecker subprocess,
 	// fsnotify watcher, central stats DB, AI provider closer, trace
@@ -445,11 +453,10 @@ func Run(ctx context.Context, opts Options) error {
 			providerCfg.APIKey = key
 		}
 	}
-	// Install the package-level rejects logger before any planner call can
-	// fire. The logger is best-effort: any write failure surfaces as a
-	// slog.Warn rather than blocking replay. ConfigureIntentRejectsLogger
-	// is idempotent and accepts re-installation across restart.
-	ai.ConfigureIntentRejectsLogger(opts.GitDir)
+	// Bind this run's reject writer to its context before any planner call can
+	// fire. Linked worktrees share a process but retain distinct Git-dir logs.
+	// Writes remain best-effort and require no provider reconfiguration.
+	ctx = withIntentRejectsWriter(ctx, opts.GitDir)
 	// Resolve ACD_PATH_QUIESCENCE_SECONDS once at startup so capture's
 	// hot-path RecordPathWrite gate is set before any capture pass runs.
 	// The replay loop also resolves the env per-pass, but doing it here
@@ -775,32 +782,19 @@ func Run(ctx context.Context, opts Options) error {
 		passCtx, passCancel := context.WithTimeout(
 			rootCtx, 5*time.Second)
 		defer passCancel()
-		progressDone := make(chan struct{})
-		progressStopped := make(chan struct{})
-		go func() {
-			defer close(progressStopped)
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-progressDone:
-					return
-				case <-passCtx.Done():
-					return
-				case <-ticker.C:
-					heartbeatNow("running", "")
-				}
-			}
-		}()
 		recover := RecoverSelfPublications
 		if opts.recoverSelfPublications != nil {
 			recover = opts.recoverSelfPublications
 		}
-		summary, recoverErr := recover(
-			passCtx, opts.RepoPath, opts.DB, recoveryCtx,
-			ReplayOpts{Limit: 1})
-		close(progressDone)
-		<-progressStopped
+		var summary SelfPublicationRecoverySummary
+		var recoverErr error
+		runWithProgressHeartbeat(passCtx, progressHeartbeatInterval(opts), func() {
+			heartbeatNow("running", "")
+		}, func() {
+			summary, recoverErr = recover(
+				passCtx, opts.RepoPath, opts.DB, recoveryCtx,
+				ReplayOpts{Limit: 1})
+		})
 		heartbeatNow("running", "")
 		return summary, recoverErr
 	}
@@ -887,6 +881,7 @@ func Run(ctx context.Context, opts Options) error {
 		branchRef = tokenBranchRef(currentToken)
 		headOID = tokenSHA(currentToken)
 	}
+	logContext.SetBranch(branchRef, persistedGen)
 	startupPublicationBlocked := false
 	startupReattachedFromDetached := false
 	if branchRef != "" && headOID != "" {
@@ -1118,6 +1113,7 @@ func Run(ctx context.Context, opts Options) error {
 		BranchGeneration: persistedGen,
 		BaseHead:         headOID,
 	}
+	logContext.SetBranch(cctx.BranchRef, cctx.BranchGeneration)
 	// Seed shadow_paths from HEAD before the first capture so files
 	// already at HEAD don't generate spurious creates.
 	if !branchTransitionBlocked && cctx.BranchRef != "" && cctx.BaseHead != "" {
@@ -1219,10 +1215,13 @@ func Run(ctx context.Context, opts Options) error {
 			headOID = persistedHead
 		}
 		cctx = CaptureContext{BranchRef: branchRef, BranchGeneration: persistedGen, BaseHead: headOID}
+		logContext.SetBranch(cctx.BranchRef, cctx.BranchGeneration)
 	}
 	if !branchTransitionBlocked && cctx.BranchRef != "" {
-		if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
-			_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
+		if transition, detachErr := syncDetachedHeadState(ctx, opts.DB, false, now()); detachErr != nil {
+			logger.Warn("sync detached HEAD state at startup", "err", detachErr.Error())
+		} else if transition == detachedHeadReattached {
+			logger.Info("HEAD reattached; capture and publication resumed for this worktree")
 			if startupReattachedFromDetached {
 				clearRewindGraceMeta(ctx, opts.DB, opts.RepoPath, cctx, tracer, logger,
 					"detached HEAD reattached before startup acceptance")
@@ -1811,6 +1810,7 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			currentToken = oldToken
 			cctx = oldCctx
+			logContext.SetBranch(cctx.BranchRef, cctx.BranchGeneration)
 			branchRef = oldBranchRef
 			headOID = oldHeadOID
 			if opts.afterBranchTransitionRollback != nil {
@@ -1859,6 +1859,7 @@ func Run(ctx context.Context, opts Options) error {
 				return false
 			}
 			lastStampedBranchHead = cctx.BaseHead
+			logContext.SetBranch(cctx.BranchRef, cctx.BranchGeneration)
 			for _, event := range pendingTransitionTraces {
 				recordTrace(tracer, event)
 			}
@@ -1873,7 +1874,6 @@ func Run(ctx context.Context, opts Options) error {
 		cctx.BaseHead = headOID
 		currentToken = newToken
 		reattaching := false
-		detaching := false
 		clearGraceAfterAccept := false
 		clearManualResumeAfterAccept := false
 		pruneShadowAfterAccept := false
@@ -1913,7 +1913,6 @@ func Run(ctx context.Context, opts Options) error {
 			// reseeding from HEAD the next capture would classify every
 			// tracked file as a phantom `create`.
 			if cctx.BranchRef == "" {
-				detaching = true
 			} else {
 				// Detached -> attached transition can land here when the
 				// reattach branch at line 1057 races with this Diverged
@@ -2097,14 +2096,7 @@ func Run(ctx context.Context, opts Options) error {
 						result.EventCount, []string{oldCctx.BranchRef})
 				}
 			}
-			if detaching {
-				_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
-				logger.Warn("detached HEAD detected; capture/replay paused")
-			}
 			if reattaching {
-				if _, ok, _ := state.MetaGet(ctx, opts.DB, MetaKeyDetachedHeadPaused); ok {
-					_, _ = state.MetaDelete(ctx, opts.DB, MetaKeyDetachedHeadPaused)
-				}
 				clearGraceAfterAccept = true
 			}
 			if clearGraceAfterAccept {
@@ -2450,6 +2442,18 @@ func Run(ctx context.Context, opts Options) error {
 			pauseErr   error
 		)
 		detachedHeadPaused := cctx.BranchRef == ""
+		if transition, detachErr := syncDetachedHeadState(
+			ctx, opts.DB, detachedHeadPaused, now(),
+		); detachErr != nil {
+			logger.Warn("sync detached HEAD state", "err", detachErr.Error())
+		} else {
+			switch transition {
+			case detachedHeadEntered:
+				logger.Warn("detached HEAD detected; capture and publication paused for this worktree")
+			case detachedHeadReattached:
+				logger.Info("HEAD reattached; capture and publication resumed for this worktree")
+			}
+		}
 		if !branchTransitionBlocked && !operationPaused && !detachedHeadPaused {
 			daemonPaus, pauseErr = daemonPauseStateFn(ctx, opts.GitDir, opts.DB)
 			if pauseErr != nil {
@@ -2474,11 +2478,7 @@ func Run(ctx context.Context, opts Options) error {
 		} else if operationPaused {
 			logger.Warn("git operation in progress; publication paused and protection remains active",
 				"operation", operationName)
-		} else if detachedHeadPaused {
-			ts := strconv.FormatFloat(float64(now().UnixNano())/1e9, 'f', -1, 64)
-			_ = state.MetaSet(ctx, opts.DB, MetaKeyDetachedHeadPaused, ts)
-			logger.Warn("detached HEAD detected; publication paused and protection remains active")
-		} else if daemonPaused {
+		} else if daemonPaused && !detachedHeadPaused {
 			logger.Warn("publication paused; protection remains active",
 				"source", daemonPaus.Source, "reason", daemonPaus.Reason)
 			traceCapturePaused(tracer, opts.RepoPath, cctx, daemonPaus)
@@ -2549,12 +2549,17 @@ func Run(ctx context.Context, opts Options) error {
 			// folded into hadWork below so the scheduler resets to the base
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
+			activeDrain, drainErr := ActivePublicationDrainForPair(
+				passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
 			setupValidation, validationPending, validationErr :=
 				state.DesiredConfigValidation(ctx, opts.DB)
-			if validationErr != nil {
+			if drainErr != nil {
+				repErr = drainErr
+			} else if validationErr != nil {
 				repErr = validationErr
 			} else if validationPending &&
-				setupValidation.Status != state.ConfigValidationPassed {
+				setupValidation.Status != state.ConfigValidationPassed &&
+				activeDrain == nil {
 				repSum = ReplaySummary{
 					Skipped: true,
 					SkippedReason: "configuration_validation_" +
@@ -2566,7 +2571,7 @@ func Run(ctx context.Context, opts Options) error {
 					"config.validation.attempt": strconv.Itoa(
 						setupValidation.Attempt),
 				})
-			} else if passBundle.ReplayBlockedReason != "" {
+			} else if passBundle.ReplayBlockedReason != "" && activeDrain == nil {
 				repSum = ReplaySummary{
 					Skipped: true, SkippedReason: "intent_v2_needs_attention",
 					BaseHead: cctx.BaseHead,
@@ -2589,37 +2594,80 @@ func Run(ctx context.Context, opts Options) error {
 						opts.RepoPath, passBundle.RevisionID,
 						passBundle.IntentVerificationCommand)
 				}
-				repSum, repErr = Replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
-					MessageFn:                  passBundle.MessageFn,
-					GitDir:                     opts.GitDir,
-					Trace:                      tracer,
-					PromptTrace:                promptTracer,
-					Limit:                      DefaultReplayLimit,
-					CommitStrategy:             passBundle.CommitStrategy,
-					IntentWindow:               passBundle.IntentWindow,
-					IntentMinPending:           passBundle.IntentMinPending,
-					IntentSettleWindow:         passBundle.IntentSettleWindow,
-					IntentMaxPendingAge:        passBundle.IntentMaxPendingAge,
-					IntentRecentCommits:        passBundle.IntentRecentCommits,
-					IntentDeferLimit:           passBundle.IntentDeferLimit,
-					IntentRetryLimit:           &passBundle.IntentRetryLimit,
-					IntentPathCoalescing:       &passBundle.IntentPathCoalescing,
-					IntentBypassBatchWait:      logicalFlushPending,
-					IntentPlanner:              passBundle.IntentPlanner,
-					IntentHealth:               passBundle.IntentHealth,
-					IntentPlannerProvider:      passBundle.HealthIdentity.Provider,
-					IntentPlannerModel:         passBundle.Model,
-					IntentIncludeDiffs:         passBundle.IntentIncludeDiffs,
-					IntentPreset:               passBundle.IntentPreset,
-					IntentVerificationMode:     passBundle.IntentVerificationMode,
-					IntentCandidateVerify:      candidateVerify,
-					IntentRepairCommitVerify:   repairCommitVerify,
-					IntentRepairEnabled:        passBundle.IntentRepairEnabled,
-					IntentRepairHorizon:        passBundle.IntentRepairHorizon,
-					IntentRepairMaxCommits:     passBundle.IntentRepairMaxCommits,
-					SelfPublicationCheckpoint:  opts.selfPublicationCheckpoint,
-					RequireCompletedCheckpoint: true,
-				})
+				replay := Replay
+				if opts.replay != nil {
+					replay = opts.replay
+				}
+				if activeDrain != nil &&
+					activeDrain.Phase == state.PublicationDrainCheckpointing {
+					resumedDrain, resumeErr := ResumePublicationDrainCheckpointing(
+						passCtx, opts.RepoPath, opts.DB, *activeDrain, time.Now().UTC())
+					if resumeErr != nil {
+						repErr = resumeErr
+					} else {
+						activeDrain = &resumedDrain
+					}
+				}
+				if repErr == nil && activeDrain != nil &&
+					activeDrain.Phase == state.PublicationDrainNormalizing {
+					resumedDrain, resumeErr := ResumePublicationDrainNormalization(
+						passCtx, opts.DB, *activeDrain, time.Now().UTC())
+					if resumeErr != nil {
+						repErr = resumeErr
+					} else {
+						activeDrain = &resumedDrain
+					}
+				}
+				if repErr == nil && (activeDrain == nil ||
+					activeDrain.Phase != state.PublicationDrainNeedsAction) {
+					runWithProgressHeartbeat(passCtx, progressHeartbeatInterval(opts), func() {
+						heartbeatNow("running", "")
+					}, func() {
+						repSum, repErr = replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+							MessageFn:                  passBundle.MessageFn,
+							GitDir:                     opts.GitDir,
+							Trace:                      tracer,
+							PromptTrace:                promptTracer,
+							Limit:                      DefaultReplayLimit,
+							CommitStrategy:             passBundle.CommitStrategy,
+							IntentWindow:               passBundle.IntentWindow,
+							IntentMinPending:           passBundle.IntentMinPending,
+							IntentSettleWindow:         passBundle.IntentSettleWindow,
+							IntentMaxPendingAge:        passBundle.IntentMaxPendingAge,
+							IntentRecentCommits:        passBundle.IntentRecentCommits,
+							IntentDeferLimit:           passBundle.IntentDeferLimit,
+							IntentRetryLimit:           &passBundle.IntentRetryLimit,
+							IntentPathCoalescing:       &passBundle.IntentPathCoalescing,
+							IntentBypassBatchWait:      logicalFlushPending || activeDrain != nil,
+							IntentPlanner:              passBundle.IntentPlanner,
+							IntentHealth:               passBundle.IntentHealth,
+							IntentPlannerProvider:      passBundle.HealthIdentity.Provider,
+							IntentPlannerModel:         passBundle.Model,
+							IntentIncludeDiffs:         passBundle.IntentIncludeDiffs,
+							IntentPreset:               passBundle.IntentPreset,
+							IntentVerificationMode:     passBundle.IntentVerificationMode,
+							IntentCandidateVerify:      candidateVerify,
+							IntentRepairCommitVerify:   repairCommitVerify,
+							IntentRepairEnabled:        passBundle.IntentRepairEnabled,
+							IntentRepairHorizon:        passBundle.IntentRepairHorizon,
+							IntentRepairMaxCommits:     passBundle.IntentRepairMaxCommits,
+							SelfPublicationCheckpoint:  opts.selfPublicationCheckpoint,
+							RequireCompletedCheckpoint: true,
+							PublicationDrain:           activeDrain,
+						})
+					})
+					if activeDrain != nil {
+						updatedDrain, updateErr := UpdatePublicationDrainAfterReplay(
+							passCtx, opts.DB, *activeDrain, repSum, repErr, time.Now().UTC())
+						if updateErr != nil {
+							repErr = errors.Join(repErr, updateErr)
+						} else if updatedDrain.Phase != state.PublicationDrainCompleted &&
+							updatedDrain.Phase != state.PublicationDrainNeedsAction {
+							repErr = nil
+							repSum.HasMore = true
+						}
+					}
+				}
 				if logicalFlushPending && repErr == nil && !repSum.Skipped {
 					logicalFlushPending = false
 				}
@@ -2845,6 +2893,131 @@ func Run(ctx context.Context, opts Options) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func withIntentRejectsWriter(ctx context.Context, gitDir string) context.Context {
+	return ai.WithIntentRejectsWriter(ctx,
+		ai.NewIntentRejectsWriter(filepath.Join(gitDir, "acd"), time.Now))
+}
+
+type daemonLogContext struct {
+	mu         sync.RWMutex
+	branchRef  string
+	generation int64
+}
+
+func newDaemonLogger(logger *slog.Logger, opts Options) (*slog.Logger, *daemonLogContext) {
+	repoHash := opts.RepoHash
+	if repoHash == "" {
+		var hashErr error
+		repoHash, hashErr = paths.RepoHash(opts.RepoPath)
+		if hashErr != nil {
+			repoHash = central.CanonicalID(opts.RepoPath)
+		}
+	}
+	logContext := &daemonLogContext{}
+	return slog.New(&daemonContextHandler{
+		next: logger.With(
+			"repo_hash", repoHash,
+			"worktree", opts.RepoPath,
+			"git_dir", opts.GitDir,
+		).Handler(),
+		context: logContext,
+	}), logContext
+}
+
+func (c *daemonLogContext) SetBranch(branchRef string, generation int64) {
+	c.mu.Lock()
+	c.branchRef = branchRef
+	c.generation = generation
+	c.mu.Unlock()
+}
+
+func (c *daemonLogContext) Attrs() []slog.Attr {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	attrs := make([]slog.Attr, 0, 2)
+	if c.branchRef != "" {
+		attrs = append(attrs, slog.String("branch_ref", c.branchRef))
+	}
+	if c.generation > 0 {
+		attrs = append(attrs, slog.Int64("branch_generation", c.generation))
+	}
+	return attrs
+}
+
+type daemonContextHandler struct {
+	next    slog.Handler
+	context *daemonLogContext
+}
+
+func (h *daemonContextHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.next.Enabled(ctx, level)
+}
+
+func (h *daemonContextHandler) Handle(ctx context.Context, record slog.Record) error {
+	present := make(map[string]struct{}, record.NumAttrs())
+	record.Attrs(func(attr slog.Attr) bool {
+		present[attr.Key] = struct{}{}
+		return true
+	})
+	for _, attr := range h.context.Attrs() {
+		if _, exists := present[attr.Key]; !exists {
+			record.AddAttrs(attr)
+		}
+	}
+	return h.next.Handle(ctx, record)
+}
+
+func (h *daemonContextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &daemonContextHandler{next: h.next.WithAttrs(attrs), context: h.context}
+}
+
+func (h *daemonContextHandler) WithGroup(name string) slog.Handler {
+	return &daemonContextHandler{next: h.next.WithGroup(name), context: h.context}
+}
+
+func progressHeartbeatInterval(opts Options) time.Duration {
+	if opts.progressHeartbeatEvery > 0 {
+		return opts.progressHeartbeatEvery
+	}
+	return daemonProgressHeartbeatInterval
+}
+
+// runWithProgressHeartbeat keeps the controller-visible heartbeat fresh while
+// work blocks inside replay or recovery. The deferred stop always joins the
+// helper goroutine, including error returns, cancellation, and panic unwinds.
+func runWithProgressHeartbeat(
+	ctx context.Context,
+	interval time.Duration,
+	heartbeat func(),
+	work func(),
+) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
+				heartbeat()
+			}
+		}
+	}()
+	defer func() {
+		close(done)
+		<-stopped
+	}()
+	work()
 }
 
 func replayNeedsImmediateFollowup(sum ReplaySummary) bool {

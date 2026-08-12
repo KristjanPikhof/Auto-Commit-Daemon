@@ -25,6 +25,7 @@ type replayObservabilityReport struct {
 	State            string   `json:"state"`
 	LastError        string   `json:"last_error,omitempty"`
 	ErrorRepeatCount int      `json:"error_repeat_count,omitempty"`
+	ErrorLastSeenTS  int64    `json:"error_last_seen_ts,omitempty"`
 	BlockedSeq       int64    `json:"blocked_seq,omitempty"`
 	CandidateIDs     []string `json:"candidate_ids,omitempty"`
 	LastFallbackMode string   `json:"last_fallback_mode,omitempty"`
@@ -37,6 +38,13 @@ func loadReplayObservabilityReport(
 ) (replayObservabilityReport, error) {
 	report := replayObservabilityReport{State: "active"}
 	if conn == nil {
+		return report, nil
+	}
+	hasMeta, err := sqliteTableExists(ctx, conn, "daemon_meta")
+	if err != nil {
+		return report, fmt.Errorf("daemon metadata table check: %w", err)
+	}
+	if !hasMeta {
 		return report, nil
 	}
 	if value, ok, err := metaLookup(ctx, conn, "last_replay_error"); err != nil {
@@ -62,11 +70,27 @@ func loadReplayObservabilityReport(
 		}
 	}
 	if report.LastError != "" {
-		report.State = "degraded"
-		if report.ErrorRepeatCount >= 2 {
-			report.State = "needs_attention"
+		if value, ok, err := metaLookup(
+			ctx, conn, "replay.error_last_seen_ts",
+		); err != nil {
+			return report, fmt.Errorf("replay error last seen time: %w", err)
+		} else if ok {
+			if seen, parseErr := strconv.ParseInt(
+				strings.TrimSpace(value), 10, 64,
+			); parseErr == nil && seen > 0 {
+				report.ErrorLastSeenTS = seen
+			}
 		}
+		report.State = "degraded"
 		report.BlockedSeq = replayErrorSeq(report.LastError)
+	}
+	durableAttention := false
+	if value, ok, err := metaLookup(
+		ctx, conn, "intent.v2.needs_attention",
+	); err != nil {
+		return report, fmt.Errorf("intent replay blocked reason: %w", err)
+	} else if ok && sanitizeObservabilityText(value) != "" {
+		durableAttention = true
 	}
 
 	hasCandidates, err := sqliteTableExists(ctx, conn, "intent_candidates")
@@ -102,6 +126,23 @@ WHERE e.state='pending'
 		if err != nil {
 			return report, err
 		}
+	}
+	if hasCandidates && hasMembership && hasEvents {
+		blockedSeq, blocked, blockErr := durableReplayAttention(
+			ctx, conn,
+		)
+		if blockErr != nil {
+			return report, blockErr
+		}
+		if blocked {
+			durableAttention = true
+			if report.BlockedSeq == 0 {
+				report.BlockedSeq = blockedSeq
+			}
+		}
+	}
+	if durableAttention {
+		report.State = "needs_attention"
 	}
 
 	hasWindows, err := sqliteTableExists(ctx, conn, "intent_planner_windows")
@@ -139,6 +180,119 @@ ORDER BY id DESC LIMIT 1`).Scan(&outcome, &source, &selectedGroups)
 		}
 	}
 	return report, nil
+}
+
+// durableReplayAttention returns only persisted publication barriers. A
+// repeated replay error is deliberately absent: the daemon is still retrying
+// until one of these durable predicates says otherwise.
+func durableReplayAttention(
+	ctx context.Context,
+	conn *sql.DB,
+) (int64, bool, error) {
+	branchRef, branchGeneration, ok, err := currentReplayPair(ctx, conn)
+	if err != nil {
+		return 0, false, err
+	}
+	if !ok {
+		return 0, false, nil
+	}
+	var seq sql.NullInt64
+	err = conn.QueryRowContext(ctx, `
+SELECT MIN(seq) FROM (
+    SELECT terminal.seq AS seq
+    FROM capture_events terminal
+    WHERE terminal.state IN ('blocked_conflict','failed')
+      AND terminal.branch_ref=?
+      AND terminal.branch_generation=?
+    UNION ALL
+    SELECT pending.seq AS seq
+    FROM intent_candidates candidate
+    JOIN intent_candidate_events membership
+      ON membership.candidate_id=candidate.id
+     AND membership.membership_state='active'
+    JOIN capture_events pending
+      ON pending.seq=membership.event_seq
+     AND pending.state='pending'
+    WHERE (candidate.status='blocked'
+       OR candidate.verification_status IN
+          ('failed','timed_out','needs_attention'))
+      AND candidate.branch_ref=?
+      AND candidate.branch_generation=?
+)`, branchRef, branchGeneration, branchRef, branchGeneration).Scan(&seq)
+	if err != nil {
+		return 0, false, fmt.Errorf("durable replay attention: %w", err)
+	}
+	return seq.Int64, seq.Valid, nil
+}
+
+// currentReplayPair reads the durable branch observation maintained by the
+// run loop. Production heartbeat writes leave daemon_state's branch columns
+// NULL, so those columns are only a compatibility fallback for older state.
+func currentReplayPair(
+	ctx context.Context,
+	conn *sql.DB,
+) (string, int64, bool, error) {
+	var token, rawGeneration sql.NullString
+	var tokenPresent, generationPresent int
+	err := conn.QueryRowContext(ctx, `
+SELECT
+    (SELECT value FROM daemon_meta WHERE key='branch_token'),
+    EXISTS(SELECT 1 FROM daemon_meta WHERE key='branch_token'),
+    (SELECT value FROM daemon_meta WHERE key='branch.generation'),
+    EXISTS(SELECT 1 FROM daemon_meta WHERE key='branch.generation')`,
+	).Scan(&token, &tokenPresent, &rawGeneration, &generationPresent)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("current replay metadata: %w", err)
+	}
+	if tokenPresent != 0 {
+		// A present durable token is authoritative, including a valid
+		// detached token. Incomplete or malformed durable metadata fails
+		// closed instead of reviving a stale legacy daemon_state pair.
+		if !token.Valid || generationPresent == 0 || !rawGeneration.Valid {
+			return "", 0, false, nil
+		}
+		branchRef := replayTokenBranchRef(token.String)
+		generation, parseErr := strconv.ParseInt(
+			strings.TrimSpace(rawGeneration.String), 10, 64,
+		)
+		if branchRef != "" && parseErr == nil && generation >= 1 {
+			return branchRef, generation, true, nil
+		}
+		return "", 0, false, nil
+	}
+
+	var branchRef sql.NullString
+	var generation sql.NullInt64
+	err = conn.QueryRowContext(ctx, `
+SELECT branch_ref, branch_generation
+FROM daemon_state
+WHERE id=1`).Scan(&branchRef, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, false, nil
+	}
+	if err != nil {
+		return "", 0, false, fmt.Errorf("legacy replay branch anchor: %w", err)
+	}
+	if !branchRef.Valid || strings.TrimSpace(branchRef.String) == "" ||
+		!generation.Valid || generation.Int64 < 1 {
+		return "", 0, false, nil
+	}
+	return branchRef.String, generation.Int64, true, nil
+}
+
+func replayTokenBranchRef(token string) string {
+	token = strings.TrimSpace(token)
+	if rest, ok := strings.CutPrefix(token, "rev:"); ok {
+		_, branchRef, found := strings.Cut(rest, " ")
+		if found {
+			return strings.TrimSpace(branchRef)
+		}
+		return ""
+	}
+	if rest, ok := strings.CutPrefix(token, "missing "); ok {
+		return strings.TrimSpace(rest)
+	}
+	return ""
 }
 
 func replayErrorSeq(value string) int64 {
@@ -235,6 +389,9 @@ func renderReplayObservabilityHuman(
 	fmt.Fprintf(out, "Replay: %s", valueOrUnset(report.State))
 	if report.ErrorRepeatCount > 0 {
 		fmt.Fprintf(out, " repeats=%d", report.ErrorRepeatCount)
+	}
+	if report.ErrorLastSeenTS > 0 {
+		fmt.Fprintf(out, " last_seen=%d", report.ErrorLastSeenTS)
 	}
 	if report.BlockedSeq > 0 {
 		fmt.Fprintf(out, " blocked_seq=%d", report.BlockedSeq)

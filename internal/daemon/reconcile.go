@@ -1167,11 +1167,15 @@ func materializeRecoveryTree(
 		}
 		byPath[entry.Path] = entry
 	}
+	lastUnpublishedBase := make(map[string]string)
 	for _, item := range ordered {
 		if err := ctx.Err(); err != nil {
 			return "", nil, err
 		}
-		if conflict := applyRecoveryOpsInMemory(byPath, item.Ops); conflict != "" {
+		_, unpublished := chainSeqs[item.Event.Seq]
+		if conflict, err := applyRecoveryEventInMemory(ctx, repoRoot, byPath, item, unpublished, lastUnpublishedBase); err != nil {
+			return "", nil, fmt.Errorf("daemon: reconcile recovery chain: prove seq=%d base state: %w", item.Event.Seq, err)
+		} else if conflict != "" {
 			return "", nil, fmt.Errorf("daemon: reconcile recovery chain: provenance mismatch seq=%d: %s", item.Event.Seq, conflict)
 		}
 	}
@@ -1260,11 +1264,15 @@ func materializeRecoveryState(
 		}
 		byPath[entry.Path] = git.IndexEntry{Mode: entry.Mode, OID: entry.OID, Path: entry.Path}
 	}
+	lastUnpublishedBase := make(map[string]string)
 	for _, item := range ordered {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if conflict := applyRecoveryOpsInMemory(byPath, item.Ops); conflict != "" {
+		_, unpublished := chainSeqs[item.Event.Seq]
+		if conflict, err := applyRecoveryEventInMemory(ctx, repoRoot, byPath, item, unpublished, lastUnpublishedBase); err != nil {
+			return nil, fmt.Errorf("daemon: prove recovery chain: prove seq=%d base state: %w", item.Event.Seq, err)
+		} else if conflict != "" {
 			return nil, fmt.Errorf("daemon: prove recovery chain: provenance mismatch seq=%d: %s", item.Event.Seq, conflict)
 		}
 	}
@@ -1283,12 +1291,69 @@ func materializeRecoveryState(
 	return finalState, nil
 }
 
+// applyRecoveryEventInMemory accepts a later full-file recapture after a base
+// change only when that base tree proves the recapture's exact before-state.
+// This lets an authoritative recapture supersede unpublished work from an
+// abandoned checkpoint branch without weakening ordinary mismatch checks.
+func applyRecoveryEventInMemory(
+	ctx context.Context,
+	repoRoot string,
+	index map[string]git.IndexEntry,
+	item state.RecoveryChainEvent,
+	unpublished bool,
+	lastUnpublishedBase map[string]string,
+) (string, error) {
+	next := make(map[string]git.IndexEntry, len(index))
+	for path, entry := range index {
+		next[path] = entry
+	}
+	for _, op := range item.Ops {
+		conflict := applyRecoveryOpsInMemory(next, []state.CaptureOp{op})
+		if conflict != "" {
+			previousBase, previouslyCaptured := lastUnpublishedBase[op.Path]
+			canReset := unpublished && previouslyCaptured && previousBase != item.Event.BaseHead &&
+				(op.Op == "modify" || op.Op == "mode")
+			if !canReset {
+				return conflict, nil
+			}
+			entries, err := git.LsTree(ctx, repoRoot, item.Event.BaseHead, false, git.LiteralPathspecs([]string{op.Path})...)
+			if err != nil {
+				return "", err
+			}
+			if len(entries) != 1 || entries[0].Path != op.Path ||
+				entries[0].Mode != op.BeforeMode.String || entries[0].OID != op.BeforeOID.String {
+				return conflict, nil
+			}
+			next[op.Path] = git.IndexEntry{
+				Path: op.Path,
+				Mode: entries[0].Mode,
+				OID:  entries[0].OID,
+			}
+			if conflict = applyRecoveryOpsInMemory(next, []state.CaptureOp{op}); conflict != "" {
+				return conflict, nil
+			}
+		}
+	}
+	clear(index)
+	for path, entry := range next {
+		index[path] = entry
+	}
+	if unpublished {
+		for _, path := range touchedPaths(item.Ops) {
+			lastUnpublishedBase[path] = item.Event.BaseHead
+		}
+	}
+	return "", nil
+}
+
 func applyRecoveryOpsInMemory(index map[string]git.IndexEntry, ops []state.CaptureOp) string {
 	for _, op := range ops {
-		beforeMatches := func(path string) bool {
+		matches := func(path, mode, oid string) bool {
 			entry, ok := index[path]
-			return ok && entry.Mode == op.BeforeMode.String && entry.OID == op.BeforeOID.String
+			return ok && entry.Mode == mode && entry.OID == oid
 		}
+		beforeMatches := func(path string) bool { return matches(path, op.BeforeMode.String, op.BeforeOID.String) }
+		afterMatches := func(path string) bool { return matches(path, op.AfterMode.String, op.AfterOID.String) }
 		after := git.IndexEntry{Mode: op.AfterMode.String, OID: op.AfterOID.String, Path: op.Path}
 		switch op.Op {
 		case "create":
@@ -1297,17 +1362,26 @@ func applyRecoveryOpsInMemory(index map[string]git.IndexEntry, ops []state.Captu
 			}
 			index[op.Path] = after
 		case "modify", "mode":
+			if afterMatches(op.Path) {
+				continue
+			}
 			if !beforeMatches(op.Path) {
 				return fmt.Sprintf("%s before-state mismatch for %s", op.Op, op.Path)
 			}
 			index[op.Path] = after
 		case "delete":
+			if _, present := index[op.Path]; !present {
+				continue
+			}
 			if !beforeMatches(op.Path) {
 				return fmt.Sprintf("delete before-state mismatch for %s", op.Path)
 			}
 			delete(index, op.Path)
 		case "rename":
 			oldPath := op.OldPath.String
+			if _, sourcePresent := index[oldPath]; !sourcePresent && afterMatches(op.Path) {
+				continue
+			}
 			if !beforeMatches(oldPath) {
 				return fmt.Sprintf("rename source mismatch for %s", oldPath)
 			}

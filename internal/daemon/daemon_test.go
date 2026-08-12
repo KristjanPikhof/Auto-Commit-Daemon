@@ -75,6 +75,56 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+func TestWorktreeRejectWritersStayInExactGitDir(t *testing.T) {
+	repo, mainGitDir := initDaemonLockRepo(t)
+	linked := filepath.Join(t.TempDir(), "linked")
+	runDaemonLockGit(t, repo, "worktree", "add", "-b", "linked-reject-log-test", linked)
+	linkedGitDir := strings.TrimSpace(runDaemonLockGit(t, linked, "rev-parse", "--absolute-git-dir"))
+	if linkedGitDir == mainGitDir {
+		t.Fatalf("linked git dir unexpectedly equals main git dir %q", mainGitDir)
+	}
+
+	type run struct {
+		name   string
+		ctx    context.Context
+		gitDir string
+		start  int64
+	}
+	runs := []run{
+		{name: "main", ctx: withIntentRejectsWriter(context.Background(), mainGitDir), gitDir: mainGitDir, start: 1},
+		{name: "linked", ctx: withIntentRejectsWriter(context.Background(), linkedGitDir), gitDir: linkedGitDir, start: 101},
+	}
+	var wg sync.WaitGroup
+	for _, current := range runs {
+		current := current
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := int64(0); i < 40; i++ {
+				ai.LogRejectedIntentPlan(current.ctx, current.name,
+					ai.IntentPlanRequest{OfferedCaptures: []ai.OfferedCapture{{Seq: current.start + i}}},
+					`{"selected_seqs":[]}`, errors.New("worktree reject"))
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, current := range runs {
+		path := filepath.Join(current.gitDir, "acd", ai.IntentRejectsFileName)
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s rejects at %s: %v", current.name, path, err)
+		}
+		if got := strings.Count(string(body), "\n"); got != 40 {
+			t.Fatalf("%s rows=%d want 40 at %s", current.name, got, path)
+		}
+		other := map[string]string{"main": "linked", "linked": "main"}[current.name]
+		if strings.Contains(string(body), `"provider":"`+other+`"`) {
+			t.Fatalf("%s rejects contain %s cross-directory row", current.name, other)
+		}
+	}
+}
+
 // daemonFixture wires up a temp git repo + open per-repo state DB so the
 // run-loop tests don't have to repeat the boilerplate. Mirrors the
 // captureFixture pattern but exposes the absolute git dir + database.
@@ -799,6 +849,233 @@ func TestRun_DetachedHeadPausesCaptureReplay(t *testing.T) {
 	wg.Wait()
 	if runErr != nil {
 		t.Fatalf("Run returned %v", runErr)
+	}
+}
+
+func TestRun_DetachedReattachLogsOnceWithContext(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	logSink := &captureLogHandler{level: slog.LevelInfo}
+	logger := slog.New(logSink)
+	wakeCh := make(chan struct{}, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Logger: logger, Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			WakeCh: wakeCh, ShutdownCh: make(chan struct{}, 1), SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+
+	branchOut, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "--short", "HEAD")
+	if err != nil {
+		t.Fatalf("resolve attached branch: %v", err)
+	}
+	branch := strings.TrimSpace(string(branchOut))
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", "--detach", head); err != nil {
+		t.Fatalf("detach HEAD: %v", err)
+	}
+	wakeCh <- struct{}{}
+	waitFor(t, 3*time.Second, "single detached transition log", func() bool {
+		return countLogMessage(logSink.Records(), "detached HEAD detected; capture and publication paused for this worktree") == 1
+	})
+	for i := 0; i < 6; i++ {
+		wakeCh <- struct{}{}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := countLogMessage(logSink.Records(), "detached HEAD detected; capture and publication paused for this worktree"); got != 1 {
+		t.Fatalf("detached transition logs=%d want 1", got)
+	}
+
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "checkout", branch); err != nil {
+		t.Fatalf("reattach HEAD: %v", err)
+	}
+	wakeCh <- struct{}{}
+	waitFor(t, 3*time.Second, "single reattach transition log", func() bool {
+		return countLogMessage(logSink.Records(), "HEAD reattached; capture and publication resumed for this worktree") == 1
+	})
+
+	records := logSink.Records()
+	for _, record := range records {
+		if record.Attrs["repo_hash"] == "" || record.Attrs["worktree"] != f.dir || record.Attrs["git_dir"] != f.gitDir {
+			t.Fatalf("daemon record %q missing stable context: %v", record.Message, record.Attrs)
+		}
+	}
+	for _, message := range []string{
+		"detached HEAD detected; capture and publication paused for this worktree",
+		"HEAD reattached; capture and publication resumed for this worktree",
+	} {
+		matched := recordsByMessage(records, message)
+		if len(matched) != 1 {
+			t.Fatalf("%q records=%d want 1", message, len(matched))
+		}
+		attrs := matched[0].Attrs
+		if attrs["repo_hash"] == "" || attrs["worktree"] != f.dir || attrs["git_dir"] != f.gitDir {
+			t.Fatalf("%q context=%v", message, attrs)
+		}
+		if generation, ok := attrs["branch_generation"].(int64); !ok || generation < 1 {
+			t.Fatalf("%q branch_generation=%v", message, attrs["branch_generation"])
+		}
+	}
+	reattach := recordsByMessage(records,
+		"HEAD reattached; capture and publication resumed for this worktree")[0]
+	if reattach.Attrs["branch_ref"] != "refs/heads/"+branch {
+		t.Fatalf("reattach branch_ref=%v want refs/heads/%s", reattach.Attrs["branch_ref"], branch)
+	}
+}
+
+func TestWorktreeLogContextDistinguishesDetachedRuns(t *testing.T) {
+	logSink := &captureLogHandler{level: slog.LevelInfo}
+	base := slog.New(logSink)
+	type worktree struct {
+		path   string
+		gitDir string
+		logger *slog.Logger
+	}
+	runs := make([]worktree, 0, 2)
+	for _, name := range []string{"main", "linked"} {
+		path := filepath.Join(t.TempDir(), name)
+		gitDir := filepath.Join(path, ".git")
+		logger, logContext := newDaemonLogger(base, Options{RepoPath: path, GitDir: gitDir})
+		logContext.SetBranch("", 3)
+		runs = append(runs, worktree{path: path, gitDir: gitDir, logger: logger})
+	}
+	var wg sync.WaitGroup
+	for _, current := range runs {
+		current := current
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			current.logger.Warn("detached worktree")
+		}()
+	}
+	wg.Wait()
+
+	records := recordsByMessage(logSink.Records(), "detached worktree")
+	if len(records) != 2 {
+		t.Fatalf("detached records=%d want 2", len(records))
+	}
+	seen := make(map[string]bool)
+	for _, record := range records {
+		worktreePath, _ := record.Attrs["worktree"].(string)
+		gitDir, _ := record.Attrs["git_dir"].(string)
+		repoHash, _ := record.Attrs["repo_hash"].(string)
+		if worktreePath == "" || gitDir == "" || repoHash == "" || record.Attrs["branch_generation"] != int64(3) {
+			t.Fatalf("incomplete detached context: %v", record.Attrs)
+		}
+		seen[worktreePath+"|"+gitDir+"|"+repoHash] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("worktree contexts are not distinguishable: %v", seen)
+	}
+}
+
+func TestRun_LongReplayHeartbeatStaysFreshAndJoinsOnCancellation(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	started := make(chan struct{})
+	returned := make(chan struct{})
+	var once sync.Once
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			WakeCh: make(chan struct{}, 1), ShutdownCh: make(chan struct{}, 1), SkipSignals: true,
+			progressHeartbeatEvery: 10 * time.Millisecond,
+			replay: func(replayCtx context.Context, _ string, _ *state.DB, _ CaptureContext, _ ReplayOpts) (ReplaySummary, error) {
+				once.Do(func() { close(started) })
+				<-replayCtx.Done()
+				close(returned)
+				return ReplaySummary{}, replayCtx.Err()
+			},
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("long replay did not start")
+	}
+	before, ok, err := state.LoadDaemonState(context.Background(), f.db)
+	if err != nil || !ok {
+		cancel()
+		t.Fatalf("load heartbeat before wait: ok=%v err=%v", ok, err)
+	}
+	waitFor(t, time.Second, "heartbeat during blocked replay", func() bool {
+		current, found, loadErr := state.LoadDaemonState(context.Background(), f.db)
+		return loadErr == nil && found && current.HeartbeatTS > before.HeartbeatTS
+	})
+	current, _, err := state.LoadDaemonState(context.Background(), f.db)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	maxAge := time.Since(time.Unix(0, int64(current.HeartbeatTS*1e9)))
+	if maxAge < 0 || maxAge > 250*time.Millisecond {
+		cancel()
+		t.Fatalf("blocked replay heartbeat age=%v want <=250ms", maxAge)
+	}
+
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("mock planner did not observe cancellation")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not join long-replay heartbeat on shutdown")
+	}
+	stopped, ok, err := state.LoadDaemonState(context.Background(), f.db)
+	if err != nil || !ok || stopped.Mode != "stopped" {
+		t.Fatalf("stopped state: %+v ok=%v err=%v", stopped, ok, err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	after, _, err := state.LoadDaemonState(context.Background(), f.db)
+	if err != nil || after.HeartbeatTS != stopped.HeartbeatTS {
+		t.Fatalf("heartbeat continued after joined shutdown: before=%f after=%f err=%v",
+			stopped.HeartbeatTS, after.HeartbeatTS, err)
+	}
+}
+
+func TestRun_LongReplayHeartbeatGuardJoinsOnPanic(t *testing.T) {
+	var beats atomic.Int64
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic")
+			}
+		}()
+		runWithProgressHeartbeat(context.Background(), 5*time.Millisecond, func() {
+			beats.Add(1)
+		}, func() {
+			time.Sleep(15 * time.Millisecond)
+			panic("test panic")
+		})
+	}()
+	joined := beats.Load()
+	if joined == 0 {
+		t.Fatal("heartbeat did not run before panic")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if after := beats.Load(); after != joined {
+		t.Fatalf("heartbeat goroutine leaked after panic: before=%d after=%d", joined, after)
 	}
 }
 
@@ -3841,6 +4118,8 @@ type captureLogHandler struct {
 	mu      sync.Mutex
 	level   slog.Level
 	records []loggedRecord
+	root    *captureLogHandler
+	attrs   []slog.Attr
 }
 
 func (h *captureLogHandler) Enabled(_ context.Context, lvl slog.Level) bool {
@@ -3853,26 +4132,61 @@ func (h *captureLogHandler) Handle(_ context.Context, r slog.Record) error {
 		Message: r.Message,
 		Attrs:   make(map[string]any, r.NumAttrs()),
 	}
+	for _, attr := range h.attrs {
+		rec.Attrs[attr.Key] = attr.Value.Any()
+	}
 	r.Attrs(func(a slog.Attr) bool {
 		rec.Attrs[a.Key] = a.Value.Any()
 		return true
 	})
-	h.mu.Lock()
-	h.records = append(h.records, rec)
-	h.mu.Unlock()
+	root := h.sharedRoot()
+	root.mu.Lock()
+	root.records = append(root.records, rec)
+	root.mu.Unlock()
 	return nil
 }
 
-func (h *captureLogHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
-func (h *captureLogHandler) WithGroup(_ string) slog.Handler      { return h }
+func (h *captureLogHandler) sharedRoot() *captureLogHandler {
+	if h.root != nil {
+		return h.root
+	}
+	return h
+}
+
+func (h *captureLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	combined := make([]slog.Attr, 0, len(h.attrs)+len(attrs))
+	combined = append(combined, h.attrs...)
+	combined = append(combined, attrs...)
+	return &captureLogHandler{
+		level: h.level,
+		root:  h.sharedRoot(),
+		attrs: combined,
+	}
+}
+func (h *captureLogHandler) WithGroup(_ string) slog.Handler { return h }
 
 // Records returns a snapshot copy of the captured log records.
 func (h *captureLogHandler) Records() []loggedRecord {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]loggedRecord, len(h.records))
-	copy(out, h.records)
+	root := h.sharedRoot()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	out := make([]loggedRecord, len(root.records))
+	copy(out, root.records)
 	return out
+}
+
+func recordsByMessage(records []loggedRecord, message string) []loggedRecord {
+	out := make([]loggedRecord, 0, 1)
+	for _, record := range records {
+		if record.Message == message {
+			out = append(out, record)
+		}
+	}
+	return out
+}
+
+func countLogMessage(records []loggedRecord, message string) int {
+	return len(recordsByMessage(records, message))
 }
 
 // countFlushByStatus counts flush_requests rows in the given status.

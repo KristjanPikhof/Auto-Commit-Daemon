@@ -648,6 +648,7 @@ func TestList_IntentSettleWaitShowsCountdown(t *testing.T) {
 	}
 	for k, v := range map[string]string{
 		"commit.strategy":        "intent",
+		"intent.window":          "2",
 		"intent.min_pending":     "2",
 		"intent.settle_window":   "1m",
 		"intent.max_pending_age": "2m",

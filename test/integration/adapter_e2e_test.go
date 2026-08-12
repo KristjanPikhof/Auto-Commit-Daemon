@@ -1054,7 +1054,7 @@ func runCodexLegacyTOMLAutoDetect(t *testing.T, bin string) {
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	res := runAcd(t, ctx, env, "setup")
+	res := runAcdFromDir(t, ctx, env, tempRepo(t), "setup")
 	if res.ExitCode != 0 {
 		t.Fatalf("acd setup auto-detect with legacy codex TOML exit=%d\nstdout=%s\nstderr=%s",
 			res.ExitCode, res.Stdout, res.Stderr)

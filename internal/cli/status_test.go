@@ -89,7 +89,7 @@ func TestStatus_RegisteredRepoWithClientsAndCommit(t *testing.T) {
 	}
 }
 
-func TestStatus_RepeatedReplayErrorIsNotActive(t *testing.T) {
+func TestStatus_RepeatedReplayErrorIsRetrying(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 	repo, dbPath, d := makeRepoStateDB(t)
@@ -121,6 +121,7 @@ func TestStatus_RepeatedReplayErrorIsNotActive(t *testing.T) {
 	if err := state.MetaSetMany(ctx, d, map[string]string{
 		"last_replay_error":         lastError,
 		"replay.error_repeat_count": "3",
+		"replay.error_last_seen_ts": "1786464200",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -148,15 +149,17 @@ func TestStatus_RepeatedReplayErrorIsNotActive(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Replay.State != "needs_attention" ||
+	if report.Replay.State != "degraded" ||
 		report.Replay.ErrorRepeatCount != 3 ||
+		report.Replay.ErrorLastSeenTS != 1786464200 ||
 		report.Replay.BlockedSeq != seq ||
 		report.Replay.LastFallbackMode != "provider_error_fallback_selected" ||
 		report.Replay.LastFallbackSize != 2 {
 		t.Fatalf("replay report=%+v", report.Replay)
 	}
-	if report.IntentV2.ReplayState == "active" {
-		t.Fatalf("Intent v2 falsely active: %+v", report.IntentV2)
+	if report.IntentV2.ReplayState != "degraded" {
+		t.Fatalf("Intent v2 replay state=%q, want degraded: %+v",
+			report.IntentV2.ReplayState, report.IntentV2)
 	}
 	if len(report.Replay.CandidateIDs) != 2 {
 		t.Fatalf("candidate IDs=%v", report.Replay.CandidateIDs)
@@ -167,7 +170,7 @@ func TestStatus_RepeatedReplayErrorIsNotActive(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"Replay: needs_attention", "repeats=3",
+		"Replay: degraded", "repeats=3", "last_seen=1786464200",
 		fmt.Sprintf("blocked_seq=%d", seq),
 		"candidate-a", "candidate-b",
 		"fallback=provider_error_fallback_selected size=2",
@@ -1558,7 +1561,7 @@ func TestStatus_IntentStrategyReportsSettleWaitState(t *testing.T) {
 	}
 	for k, v := range map[string]string{
 		"commit.strategy":        "intent",
-		"intent.window":          "7",
+		"intent.window":          "2",
 		"intent.min_pending":     "2",
 		"intent.settle_window":   "1m",
 		"intent.max_pending_age": "2m",
@@ -1584,6 +1587,7 @@ func TestStatus_IntentStrategyReportsSettleWaitState(t *testing.T) {
 		rep.IntentStrategy.BatchWaitReason != "skipped_due_intent_settle_window" ||
 		rep.IntentStrategy.VisiblePendingEvents != 2 ||
 		rep.IntentStrategy.MinPending != 2 ||
+		rep.IntentStrategy.Window != 2 ||
 		rep.IntentStrategy.SettleWindowSeconds != 60 ||
 		rep.IntentStrategy.NewestPendingEventSeq != newest {
 		t.Fatalf("intent strategy = %+v, want active settle wait", rep.IntentStrategy)

@@ -101,6 +101,46 @@ const EnvRewindGraceSeconds = "ACD_REWIND_GRACE_SECONDS"
 
 const defaultRewindGrace = 60 * time.Second
 
+type detachedHeadStateTransition int
+
+const (
+	detachedHeadUnchanged detachedHeadStateTransition = iota
+	detachedHeadEntered
+	detachedHeadReattached
+)
+
+// syncDetachedHeadState persists only detached-state transitions. It lets the
+// run loop emit one matching log record per transition instead of warning on
+// every steady-state poll.
+func syncDetachedHeadState(
+	ctx context.Context,
+	db *state.DB,
+	detached bool,
+	now time.Time,
+) (detachedHeadStateTransition, error) {
+	_, marked, err := state.MetaGet(ctx, db, MetaKeyDetachedHeadPaused)
+	if err != nil {
+		return detachedHeadUnchanged, err
+	}
+	if detached {
+		if marked {
+			return detachedHeadUnchanged, nil
+		}
+		stamp := strconv.FormatFloat(float64(now.UnixNano())/1e9, 'f', -1, 64)
+		if err := state.MetaSet(ctx, db, MetaKeyDetachedHeadPaused, stamp); err != nil {
+			return detachedHeadUnchanged, err
+		}
+		return detachedHeadEntered, nil
+	}
+	if !marked {
+		return detachedHeadUnchanged, nil
+	}
+	if _, err := state.MetaDelete(ctx, db, MetaKeyDetachedHeadPaused); err != nil {
+		return detachedHeadUnchanged, err
+	}
+	return detachedHeadReattached, nil
+}
+
 // TokenTransition classifies how the active branch ref moved between two
 // observations of HEAD.
 type TokenTransition int

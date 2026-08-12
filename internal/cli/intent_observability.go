@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -99,6 +100,7 @@ type intentStrategyReport struct {
 	LastPlannerErrorEventSeq          int64                               `json:"last_planner_error_event_seq,omitempty"`
 	LastPlannerErrorPath              string                              `json:"last_planner_error_path,omitempty"`
 	LastPlannerError                  string                              `json:"last_planner_error,omitempty"`
+	RejectLogPath                     string                              `json:"reject_log_path,omitempty"`
 	MessageQualityRewriteCountRecent  int                                 `json:"message_quality_rewrite_count_recent,omitempty"`
 	MessageQualityFallbackCountRecent int                                 `json:"message_quality_fallback_count_recent,omitempty"`
 	LastMessageQualityEventSeq        int64                               `json:"last_message_quality_event_seq,omitempty"`
@@ -211,6 +213,8 @@ type intentV2Report struct {
 	RepairEnabled            bool   `json:"repair_enabled,omitempty"`
 	RepairHorizon            string `json:"repair_horizon,omitempty"`
 	RepairMaxCommits         int    `json:"repair_max_commits,omitempty"`
+	ConfiguredRetryOnInvalid int    `json:"configured_retry_on_invalid,omitempty"`
+	EffectiveCorrectionMax   int    `json:"effective_correction_max,omitempty"`
 	OpenCandidates           int    `json:"open_candidates,omitempty"`
 	ReadyCandidates          int    `json:"ready_candidates,omitempty"`
 	WaitingCandidates        int    `json:"waiting_candidates,omitempty"`
@@ -574,7 +578,10 @@ ORDER BY updated_ts DESC, id DESC LIMIT 1`).Scan(
 		case "needs_attention":
 			report.ReplayState = "needs_attention"
 			if report.NeedsAttention == "" {
-				report.NeedsAttention = "Repeated replay error: " + replay.LastError
+				report.NeedsAttention = "Durable replay publication block"
+				if replay.LastError != "" {
+					report.NeedsAttention += ": " + replay.LastError
+				}
 			}
 		case "degraded":
 			if report.ReplayState == "" || report.ReplayState == "active" {
@@ -603,6 +610,12 @@ func decodeIntentV2Snapshot(snapshot string, report *intentV2Report) {
 	report.Customized = decodeIntentV2SnapshotBool(values["customized"])
 	_ = json.Unmarshal(values[config.FieldIntentVerification],
 		&report.VerificationMode)
+	report.ConfiguredRetryOnInvalid = decodeIntentV2SnapshotInt(
+		values[config.FieldIntentRetryOnInvalid])
+	report.EffectiveCorrectionMax = report.ConfiguredRetryOnInvalid
+	if report.EffectiveCorrectionMax > 1 {
+		report.EffectiveCorrectionMax = 1
+	}
 	report.RepairEnabled = decodeIntentV2SnapshotBool(
 		values[config.FieldIntentRepairEnabled])
 	if report.RepairHorizon == "" {
@@ -620,6 +633,32 @@ func decodeIntentV2Snapshot(snapshot string, report *intentV2Report) {
 	report.PresetID = sanitizeObservabilityText(report.PresetID)
 	report.VerificationMode = sanitizeObservabilityText(report.VerificationMode)
 	report.RepairHorizon = sanitizeObservabilityText(report.RepairHorizon)
+}
+
+func decodeIntentV2SnapshotInt(raw json.RawMessage) int {
+	var value int
+	if json.Unmarshal(raw, &value) == nil {
+		if value < 0 {
+			return 0
+		}
+		return value
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return 0
+	}
+	value, _ = strconv.Atoi(strings.TrimSpace(text))
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func plannerRejectLogPath(stateDB string) string {
+	if strings.TrimSpace(stateDB) == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(stateDB), ai.IntentRejectsFileName)
 }
 
 func decodeIntentV2SnapshotBool(raw json.RawMessage) bool {
@@ -646,10 +685,12 @@ func renderIntentV2Human(out io.Writer, report intentV2Report) {
 		customized = " customized"
 	}
 	fmt.Fprintf(out,
-		"Intent v2: %s migration=%s preset=%s@%d%s verification=%s repair=%t/%s/%d candidates=%d ready=%d waiting=%d blocked=%d soft=%d verification_attention=%d recoverable_repairs=%d\n",
+		"Intent v2: %s migration=%s preset=%s@%d%s verification=%s correction=%d/%d repair=%t/%s/%d candidates=%d ready=%d waiting=%d blocked=%d soft=%d verification_attention=%d recoverable_repairs=%d\n",
 		valueOrUnset(report.ReplayState), valueOrUnset(report.MigrationState),
 		valueOrUnset(report.PresetID), report.PresetVersion, customized,
-		valueOrUnset(report.VerificationMode), report.RepairEnabled,
+		valueOrUnset(report.VerificationMode),
+		report.ConfiguredRetryOnInvalid, report.EffectiveCorrectionMax,
+		report.RepairEnabled,
 		valueOrUnset(report.RepairHorizon), report.RepairMaxCommits,
 		report.OpenCandidates,
 		report.ReadyCandidates, report.WaitingCandidates,
@@ -864,6 +905,9 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 		if r.LastPlannerError != "" {
 			fmt.Fprintf(out, "  Last planner error: seq %d %s (%s)\n",
 				r.LastPlannerErrorEventSeq, valueOrUnset(r.LastPlannerErrorPath), r.LastPlannerError)
+			if r.RejectLogPath != "" {
+				fmt.Fprintf(out, "  Planner rejects: %s\n", r.RejectLogPath)
+			}
 		}
 	}
 	if r.MessageQualityRewriteCountRecent > 0 || r.MessageQualityFallbackCountRecent > 0 || r.LastMessageQualityReason != "" {
@@ -1289,7 +1333,7 @@ func loadLastIntentPlannerError(ctx context.Context, conn *sql.DB, report *inten
 SELECT event_seq, path, COALESCE(NULLIF(reason, ''), NULLIF(user_message, ''), NULLIF(action_taken, ''))
 FROM decision_records
 WHERE kind = ?
-ORDER BY id DESC
+ORDER BY decision_ts DESC, id DESC
 LIMIT 1`, state.DecisionKindIntentPlannerError).Scan(&lastErrorSeq, &lastErrorPath, &lastError)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("planner last error: %w", err)
@@ -1484,7 +1528,6 @@ FROM visible_pending`, state.EventStateBlockedConflict, state.EventStateFailed, 
 	} else if report.Active &&
 		report.ForcedAgingReady == 0 &&
 		report.VisiblePendingEvents >= report.MinPending &&
-		(report.Window <= 0 || report.VisiblePendingEvents < report.Window) &&
 		report.SettleWindowSeconds > 0 &&
 		report.OldestPendingAgeSeconds < report.MaxPendingAgeSeconds &&
 		report.NewestPendingAgeSeconds < report.SettleWindowSeconds {

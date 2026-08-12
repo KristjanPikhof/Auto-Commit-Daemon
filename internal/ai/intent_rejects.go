@@ -11,10 +11,10 @@ package ai
 // back to deterministic commits" without durably retaining raw planner
 // payloads unless the operator explicitly asks for that debugging mode.
 //
-// Path layout follows the project convention (DBPathFromGitDir et al.) and
-// is configured once at daemon startup via ConfigureIntentRejectsLogger.
-// The CLI / tests can leave it unset; LogRejectedIntentPlan is a no-op
-// when no logger is configured so unit tests never write to disk.
+// Path layout follows the project convention (DBPathFromGitDir et al.). Each
+// daemon run binds its worktree's writer to the request context. The CLI and
+// tests can leave it unset; LogRejectedIntentPlan is a no-op when the context
+// carries no writer, so callers never inherit another run's destination.
 //
 // Rotation:
 //
@@ -33,10 +33,8 @@ package ai
 //   - The writer holds a sync.Mutex for the entire append+rotate
 //     operation. Multiple provider goroutines (composed primary + fallback,
 //     concurrent intent windows) can call LogRejectedIntentPlan safely.
-//   - The package-level configuration RWMutex separates "swap the active
-//     logger" from "log into the active logger". Tests use
-//     SetIntentRejectsLoggerForTest to inject a writer rooted in a
-//     t.TempDir() and can assert on file contents without racing.
+//   - Each writer has its own lock, while context binding keeps concurrent
+//     worktree runs isolated without a process-wide registry or singleton.
 
 import (
 	"context"
@@ -231,49 +229,32 @@ func (w *IntentRejectsWriter) rotateIfNeededLocked(current string, incoming int6
 	return nil
 }
 
-var (
-	intentRejectsMu     sync.RWMutex
-	intentRejectsWriter *IntentRejectsWriter
-)
+type intentRejectsWriterContextKey struct{}
+type intentRejectsWriterBinding struct {
+	writer *IntentRejectsWriter
+}
 
-// ConfigureIntentRejectsLogger installs the package-level rejects writer
-// rooted at <gitDir>/acd/planner-rejects.jsonl. Called by the daemon at
-// startup. Passing an empty gitDir disables the logger (subsequent
-// LogRejectedIntentPlan calls become no-ops). Safe to call multiple times.
-func ConfigureIntentRejectsLogger(gitDir string) {
-	intentRejectsMu.Lock()
-	defer intentRejectsMu.Unlock()
-	if gitDir == "" {
-		intentRejectsWriter = nil
-		return
+// WithIntentRejectsWriter returns a child context that routes rejected plans
+// to w. A nil writer deliberately disables logging for that context.
+func WithIntentRejectsWriter(ctx context.Context, w *IntentRejectsWriter) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	intentRejectsWriter = NewIntentRejectsWriter(filepath.Join(gitDir, "acd"), time.Now)
+	return context.WithValue(ctx, intentRejectsWriterContextKey{}, intentRejectsWriterBinding{writer: w})
 }
 
-// SetIntentRejectsLoggerForTest swaps the package-level writer. Tests use
-// this to install a writer rooted in t.TempDir() and to restore the prior
-// writer on cleanup. The previous writer is returned so the caller can
-// defer its restoration.
-func SetIntentRejectsLoggerForTest(w *IntentRejectsWriter) *IntentRejectsWriter {
-	intentRejectsMu.Lock()
-	defer intentRejectsMu.Unlock()
-	prev := intentRejectsWriter
-	intentRejectsWriter = w
-	return prev
-}
-
-// IntentRejectsLoggerForTest exposes the active writer for tests that need
-// to assert on Path() or call Append directly. Returns nil when unset.
-func IntentRejectsLoggerForTest() *IntentRejectsWriter {
-	intentRejectsMu.RLock()
-	defer intentRejectsMu.RUnlock()
-	return intentRejectsWriter
+func intentRejectsWriterFromContext(ctx context.Context) *IntentRejectsWriter {
+	if ctx == nil {
+		return nil
+	}
+	binding, _ := ctx.Value(intentRejectsWriterContextKey{}).(intentRejectsWriterBinding)
+	return binding.writer
 }
 
 // LogRejectedIntentPlan persists one validator-rejected planner response to
 // the rotating JSONL log. Best-effort: failures are logged at warn level and
 // the function returns without surfacing the error so the planner path
-// stays unblocked. The function is a no-op when no logger is configured.
+// stays unblocked. The function is a no-op when ctx carries no writer.
 //
 // `provider` identifies the source (e.g. "openai-compat", "subprocess:foo").
 // `req` supplies the offered seqs. `raw` is the verbatim model output (HTTP
@@ -288,18 +269,11 @@ func IntentRejectsLoggerForTest() *IntentRejectsWriter {
 //	    LogRejectedIntentPlan(ctx, p.Name(), req, raw, err)
 //	    return IntentPlan{}, err
 //	}
-//
-// The logger ignores ctx today (writes are short and synchronous) but the
-// signature reserves it for future cancellation if rotation ever moves to a
-// background goroutine.
 func LogRejectedIntentPlan(ctx context.Context, provider string, req IntentPlanRequest, raw string, valErr error) {
-	_ = ctx
 	if valErr == nil {
 		return
 	}
-	intentRejectsMu.RLock()
-	w := intentRejectsWriter
-	intentRejectsMu.RUnlock()
+	w := intentRejectsWriterFromContext(ctx)
 	if w == nil {
 		return
 	}
@@ -349,13 +323,10 @@ func LogRejectedIntentPlan(ctx context.Context, provider string, req IntentPlanR
 // and best-effort policy to native candidate-plan failures. The legacy numeric
 // code remains "unknown"; the bounded v2 finding code is retained in Message.
 func LogRejectedIntentPlanV2(ctx context.Context, provider string, req IntentPlanRequestV2, raw string, valErr error) {
-	_ = ctx
 	if valErr == nil {
 		return
 	}
-	intentRejectsMu.RLock()
-	w := intentRejectsWriter
-	intentRejectsMu.RUnlock()
+	w := intentRejectsWriterFromContext(ctx)
 	if w == nil {
 		return
 	}

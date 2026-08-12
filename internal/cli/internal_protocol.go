@@ -58,6 +58,7 @@ func newInternalCmd() *cobra.Command {
 			_, err = installer.ApplyCompatibleRuntime(cmd.Context(), roots, installer.RuntimeUpgradeOptions{
 				SourceExecutable: executable, SourceVersion: version.String(),
 				Compatibility: runtimeCompatibility(), Integrations: "auto",
+				AllowUnadvertised: true,
 			})
 			return err
 		},
@@ -802,6 +803,19 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 	if err != nil {
 		return nil, protocolFailure("worktree_not_found", err, false)
 	}
+	publicationDrainStart := request.Method == "publication_drain_start"
+	if publicationDrainStart {
+		request.Method = "checkpoint_barrier"
+		var params map[string]any
+		if len(request.Params) > 0 {
+			_ = json.Unmarshal(request.Params, &params)
+		}
+		if params == nil {
+			params = make(map[string]any)
+		}
+		params["drain_publication"] = true
+		request.Params, _ = json.Marshal(params)
+	}
 	if sessionErr := applyWorkerSessionParams(ctx, runtime.db, request.Params); sessionErr != nil {
 		return nil, protocolFailure("session_update_failed", sessionErr, true)
 	}
@@ -823,15 +837,25 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		}
 		h.wake(request.WorktreeID)
 		return map[string]bool{"accepted": true}, nil
+	case "publication_drain_status":
+		projection, projectionErr := state.ReadPublicationDrainProjection(
+			ctx, runtime.db.Path())
+		if projectionErr != nil {
+			return nil, protocolFailure(
+				"publication_status_failed", projectionErr, true)
+		}
+		return projection, nil
 	case "checkpoint_barrier":
 		var params struct {
 			DrainPublication bool `json:"drain_publication"`
+			ConsumeStaged    bool `json:"consume_staged"`
 		}
 		_ = json.Unmarshal(request.Params, &params)
 		var drainAnchor publicationDrainTarget
 		runtime.gate.Lock()
 		if params.DrainPublication {
-			reason, unsafeErr := publicationUnsafeReason(ctx, runtime.worktree)
+			reason, unsafeErr := publicationUnsafeReason(
+				ctx, runtime.worktree, params.ConsumeStaged)
 			if unsafeErr != nil {
 				runtime.gate.Unlock()
 				return nil, protocolFailure("publication_status_failed", unsafeErr, true)
@@ -846,6 +870,32 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 				return nil, protocolFailure("publication_status_failed", branchErr, true)
 			}
 			generation, anchorErr := daemon.LoadBranchGeneration(ctx, runtime.db)
+			if anchorErr == nil {
+				activeDrain, activeErr := daemon.ActivePublicationDrainForPair(
+					ctx, runtime.db, branchRef, generation)
+				if activeErr != nil {
+					anchorErr = activeErr
+				} else if activeDrain == nil {
+					activeDrain, anchorErr = daemon.RestartablePublicationDrainForPair(
+						ctx, runtime.db, branchRef, generation)
+				}
+				if anchorErr == nil && activeDrain != nil {
+					*activeDrain, anchorErr = daemon.ResumePublicationDrainCheckpointing(
+						ctx, runtime.worktree.Root, runtime.db, *activeDrain, time.Now())
+					if anchorErr != nil {
+						runtime.gate.Unlock()
+						return nil, protocolFailure(
+							"publication_status_failed", anchorErr, true)
+					}
+					runtime.gate.Unlock()
+					h.wake(request.WorktreeID)
+					if publicationDrainStart {
+						return publicationDrainOperationResult(ctx, runtime.db, *activeDrain)
+					}
+					return waitForPublicationDrain(
+						ctx, runtime.db, *activeDrain)
+				}
+			}
 			if anchorErr == nil {
 				drainAnchor, anchorErr = snapshotPublicationDrainTarget(
 					ctx, runtime.db, branchRef, generation)
@@ -873,9 +923,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		var lastCovered, lastComplete, lastCheckpoint string
 		var lastReadErr error
 		var drainTarget publicationDrainTarget
-		var lastRemaining int64
 		var lastUnsafeCheck time.Time
-		lastProgress := time.Now()
 		for {
 			select {
 			case <-ctx.Done():
@@ -896,13 +944,64 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 						if drainTarget.EventSeqs == nil {
 							lastUnsafeCheck = time.Now()
 							runtime.gate.Lock()
-							reason, unsafeErr := publicationUnsafeReason(ctx, runtime.worktree)
+							reason, unsafeErr := publicationUnsafeReason(
+								ctx, runtime.worktree, params.ConsumeStaged)
 							if unsafeErr == nil && reason == "" {
 								drainTarget, unsafeErr = freezePublicationDrainTarget(
 									ctx, runtime.db, runtime.worktree.Root, lastCheckpoint, drainAnchor)
 								if unsafeErr == nil {
-									lastRemaining = int64(len(drainTarget.EventSeqs))
-									lastProgress = time.Now()
+									nowTS := float64(time.Now().UnixNano()) / 1e9
+									worktreeID := runtime.record.WorktreeID
+									if len(worktreeID) != 16 {
+										unsafeErr = runtime.db.ReadSQL().QueryRowContext(
+											ctx, `SELECT worktree_id FROM checkpoints WHERE id=?`,
+											lastCheckpoint).Scan(&worktreeID)
+									}
+									preparedDrain := state.PublicationDrain{
+										ID:               "drain-" + lastCheckpoint,
+										CheckpointID:     lastCheckpoint,
+										WorktreeID:       worktreeID,
+										BranchRef:        drainTarget.BranchRef,
+										BranchGeneration: drainTarget.Generation,
+										Phase:            state.PublicationDrainCheckpointing,
+										TargetEventCount: int64(len(drainTarget.EventSeqs)),
+										CreatedTS:        nowTS, UpdatedTS: nowTS,
+										LastProgressTS: nowTS,
+										StagedConsent:  params.ConsumeStaged,
+										EventSeqs:      append([]int64(nil), drainTarget.EventSeqs...),
+									}
+									if unsafeErr == nil {
+										_, unsafeErr = state.PreparePublicationDrain(
+											ctx, runtime.db, preparedDrain)
+									}
+									if unsafeErr == nil {
+										persistedDrain, loadErr := state.PublicationDrainByID(
+											ctx, runtime.db, preparedDrain.ID)
+										if loadErr != nil {
+											unsafeErr = loadErr
+										} else {
+											var activeDrain state.PublicationDrain
+											activeDrain, unsafeErr = daemon.ResumePublicationDrainCheckpointing(
+												ctx, runtime.worktree.Root, runtime.db,
+												persistedDrain, time.Now().UTC())
+											if unsafeErr == nil &&
+												activeDrain.Phase == state.PublicationDrainNeedsAction {
+												runtime.gate.Unlock()
+												return nil, protocolFailure(
+													"publication_needs_action",
+													errors.New(activeDrain.LastError), false)
+											}
+											if unsafeErr == nil && publicationDrainStart {
+												h.wake(request.WorktreeID)
+												runtime.gate.Unlock()
+												return publicationDrainOperationResult(
+													ctx, runtime.db, activeDrain)
+											}
+										}
+									}
+								}
+								if unsafeErr == nil {
+									h.wake(request.WorktreeID)
 								}
 							}
 							runtime.gate.Unlock()
@@ -915,7 +1014,8 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 						} else if time.Since(lastUnsafeCheck) >= time.Second {
 							lastUnsafeCheck = time.Now()
 							runtime.gate.Lock()
-							reason, unsafeErr := publicationUnsafeReason(ctx, runtime.worktree)
+							reason, unsafeErr := publicationUnsafeReason(
+								ctx, runtime.worktree, params.ConsumeStaged)
 							runtime.gate.Unlock()
 							if unsafeErr != nil {
 								return nil, protocolFailure("publication_status_failed", unsafeErr, true)
@@ -934,14 +1034,6 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 								progress.Recovered, progress.Terminal), false)
 						}
 						if progress.Remaining > 0 {
-							if progress.Remaining < lastRemaining {
-								lastRemaining = progress.Remaining
-								lastProgress = time.Now()
-							}
-							if time.Since(lastProgress) >= 30*time.Second {
-								return publicationDrainResult(lastCheckpoint, drainTarget, progress, false,
-									"publication made no progress for 30 seconds; ACD will keep retrying"), nil
-							}
 							continue
 						}
 						// Publishing settles its durable rows before finishing guarded
@@ -950,6 +1042,26 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 						// running.
 						runtime.gate.Lock()
 						runtime.gate.Unlock()
+						if durableDrain, ok, loadErr := state.PublicationDrainByCheckpoint(
+							ctx, runtime.db, lastCheckpoint); loadErr != nil {
+							return nil, protocolFailure(
+								"publication_status_failed", loadErr, true)
+						} else if ok && durableDrain.Phase != state.PublicationDrainCompleted {
+							nowTS := float64(time.Now().UnixNano()) / 1e9
+							update := daemon.PublicationDrainUpdateFrom(
+								durableDrain, nowTS, nowTS)
+							update.Phase = state.PublicationDrainCompleted
+							update.PublishedEventCount = durableDrain.TargetEventCount
+							update.CommitCount = progress.Commits
+							update.CompletedTS = sql.NullFloat64{
+								Float64: nowTS, Valid: true,
+							}
+							if _, advanceErr := state.AdvancePublicationDrain(
+								ctx, runtime.db, durableDrain.ID, update); advanceErr != nil {
+								return nil, protocolFailure(
+									"publication_status_failed", advanceErr, true)
+							}
+						}
 						return publicationDrainResult(lastCheckpoint, drainTarget, progress, true, ""), nil
 					}
 					return map[string]any{
@@ -1216,6 +1328,81 @@ func publicationDrainResult(
 	}
 }
 
+func publicationDrainOperationResult(
+	ctx context.Context,
+	db *state.DB,
+	drain state.PublicationDrain,
+) (any, *supervisor.ProtocolError) {
+	target := publicationDrainTarget{
+		BranchRef: drain.BranchRef, Generation: drain.BranchGeneration,
+		EventSeqs: append([]int64(nil), drain.EventSeqs...),
+	}
+	for _, seq := range target.EventSeqs {
+		target.MaxSeq = max(target.MaxSeq, seq)
+	}
+	progress, err := publicationDrainStatus(ctx, db, target)
+	if err != nil {
+		return nil, protocolFailure("publication_status_failed", err, true)
+	}
+	result := publicationDrainResult(
+		drain.CheckpointID, target, progress,
+		drain.Phase == state.PublicationDrainCompleted, drain.LastError)
+	result["drain_id"] = drain.ID
+	result["phase"] = drain.Phase
+	result["fallback_mode"] = drain.FallbackMode
+	result["last_error"] = drain.LastError
+	result["semantic_rebuild_attempts"] = drain.SemanticRebuildAttempts
+	result["event_fallback_count"] = drain.EventFallbackCount
+	result["last_progress_ts"] = drain.LastProgressTS
+	result["staged_consumed"] = drain.StagedConsumed
+	return result, nil
+}
+
+func waitForPublicationDrain(
+	ctx context.Context,
+	db *state.DB,
+	drain state.PublicationDrain,
+) (any, *supervisor.ProtocolError) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, protocolFailure("publication_wait_detached", fmt.Errorf(
+				"client wait ended while durable publication drain %s continues: %w",
+				drain.ID, ctx.Err()), true)
+		case <-ticker.C:
+			current, err := state.PublicationDrainByID(ctx, db, drain.ID)
+			if err != nil {
+				return nil, protocolFailure("publication_status_failed", err, true)
+			}
+			target := publicationDrainTarget{
+				BranchRef: current.BranchRef, Generation: current.BranchGeneration,
+				EventSeqs: append([]int64(nil), current.EventSeqs...),
+			}
+			for _, seq := range target.EventSeqs {
+				target.MaxSeq = max(target.MaxSeq, seq)
+			}
+			progress, err := publicationDrainStatus(ctx, db, target)
+			if err != nil {
+				return nil, protocolFailure("publication_status_failed", err, true)
+			}
+			switch current.Phase {
+			case state.PublicationDrainCompleted:
+				result := publicationDrainResult(
+					current.CheckpointID, target, progress, true, "")
+				result["drain_id"] = current.ID
+				result["phase"] = current.Phase
+				result["fallback_mode"] = current.FallbackMode
+				return result, nil
+			case state.PublicationDrainNeedsAction:
+				return nil, protocolFailure("publication_needs_action",
+					errors.New(current.LastError), false)
+			}
+		}
+	}
+}
+
 func publicationDrainStatus(ctx context.Context, db *state.DB, target publicationDrainTarget) (publicationDrainProgress, error) {
 	var progress publicationDrainProgress
 	commits := map[string]struct{}{}
@@ -1269,7 +1456,11 @@ WHERE seq IN (`+strings.Join(placeholders, ",")+`)
 	return progress, nil
 }
 
-func publicationUnsafeReason(ctx context.Context, worktree git.Worktree) (string, error) {
+func publicationUnsafeReason(
+	ctx context.Context,
+	worktree git.Worktree,
+	allowStaged bool,
+) (string, error) {
 	branchRef, err := git.RunBranchRef(ctx, worktree.Root)
 	if err != nil {
 		return "", err
@@ -1297,7 +1488,7 @@ func publicationUnsafeReason(ctx context.Context, worktree git.Worktree) (string
 		if strings.Contains(xy, "U") || xy == "AA" || xy == "DD" {
 			return "publication is paused by unresolved Git conflicts; resolve them and run `acd commit-all --yes` again", nil
 		}
-		if xy[0] != ' ' && xy[0] != '?' {
+		if !allowStaged && xy[0] != ' ' && xy[0] != '?' {
 			return "publication is paused because the Git index contains staged changes; unstage them and run `acd commit-all --yes` again", nil
 		}
 	}
@@ -1435,7 +1626,8 @@ func (h cliSupervisorHandler) HandleSupervisorRequest(ctx context.Context, reque
 			return nil, protocolFailure("repository_update_failed", err, false)
 		}
 		return result, nil
-	case "hint", "checkpoint_barrier":
+	case "hint", "checkpoint_barrier", "publication_drain_start",
+		"publication_drain_status":
 		fallthrough
 	case "history", "restore_plan", "restore_apply", "repair":
 		workerTimeout := 30 * time.Second

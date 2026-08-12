@@ -988,9 +988,14 @@ func (b *synchronizedBuffer) contains(value string) bool {
 // need an isolated XDG layout should set ACD_TEST_HOME via env when
 // appropriate (we don't reach for this in v1).
 func runAcd(t *testing.T, ctx context.Context, env []string, args ...string) ExecResult {
+	return runAcdFromDir(t, ctx, env, "", args...)
+}
+
+func runAcdFromDir(t *testing.T, ctx context.Context, env []string, dir string, args ...string) ExecResult {
 	t.Helper()
 	bin := buildAcdBinary(t)
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = dir
 	if env != nil {
 		cmd.Env = env
 	} else {

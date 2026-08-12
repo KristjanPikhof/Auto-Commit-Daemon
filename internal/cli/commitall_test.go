@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
@@ -66,6 +67,47 @@ func TestCommitAll_IncompleteTargetRendersThenExitsThree(t *testing.T) {
 				t.Fatalf("output omitted wait reason: %s", out.String())
 			}
 		})
+	}
+}
+
+func TestCommitAllReconnectSelectsOnlyTheCurrentWorktreeDrain(t *testing.T) {
+	startedAt := time.Unix(100, 0)
+	projection := state.PublicationDrainReadOnlyProjection{
+		Active: []state.PublicationDrain{
+			{ID: "other", WorktreeID: "other-worktree", CreatedTS: 101},
+			{ID: "current", WorktreeID: "current-worktree", CreatedTS: 102},
+		},
+	}
+	drain := selectReconnectPublicationDrain(
+		projection, "current-worktree", startedAt)
+	if drain == nil || drain.ID != "current" {
+		t.Fatalf("selected=%+v, want current worktree drain", drain)
+	}
+
+	projection.Active = nil
+	projection.Latest = &state.PublicationDrain{
+		ID: "completed-after-disconnect", WorktreeID: "current-worktree",
+		Phase: state.PublicationDrainCompleted, CreatedTS: 100.5,
+	}
+	drain = selectReconnectPublicationDrain(
+		projection, "current-worktree", startedAt)
+	if drain == nil || drain.ID != "completed-after-disconnect" {
+		t.Fatalf("selected completed=%+v", drain)
+	}
+
+	projection.Latest.CreatedTS = 90
+	if drain := selectReconnectPublicationDrain(
+		projection, "current-worktree", startedAt); drain != nil {
+		t.Fatalf("selected stale completed drain=%+v", drain)
+	}
+
+	projection.Latest = nil
+	projection.Active = []state.PublicationDrain{{
+		ID: "stale-active", WorktreeID: "current-worktree", CreatedTS: 90,
+	}}
+	if drain := selectReconnectPublicationDrain(
+		projection, "current-worktree", startedAt); drain != nil {
+		t.Fatalf("selected stale active drain=%+v", drain)
 	}
 }
 

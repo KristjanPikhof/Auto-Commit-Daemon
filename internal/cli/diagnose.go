@@ -18,7 +18,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -101,13 +100,19 @@ type diagnoseReport struct {
 	// stamp last_run_ts to the wall-clock unix-second the recovery ran and
 	// last_count >= 1). The slice keeps `omitempty` so an empty list
 	// serializes as absent rather than `null`/`[]`.
-	DeadBranchPruneLastRunTS int64    `json:"dead_branch_prune_last_run_ts"`
-	DeadBranchPruneLastCount int      `json:"dead_branch_prune_last_count"`
-	DeadBranchPruneLastRefs  []string `json:"dead_branch_prune_last_refs,omitempty"`
-	Remediation              []string `json:"remediation"`
-	StateDBChecksumBefore    string   `json:"state_db_checksum_before"`
-	StateDBChecksumAfter     string   `json:"state_db_checksum_after"`
-	StateDBChecksumVerified  bool     `json:"state_db_checksum_verified"`
+	DeadBranchPruneLastRunTS int64                  `json:"dead_branch_prune_last_run_ts"`
+	DeadBranchPruneLastCount int                    `json:"dead_branch_prune_last_count"`
+	DeadBranchPruneLastRefs  []string               `json:"dead_branch_prune_last_refs,omitempty"`
+	Remediation              []string               `json:"remediation"`
+	StateDBChecksumBefore    string                 `json:"state_db_checksum_before"`
+	StateDBChecksumAfter     string                 `json:"state_db_checksum_after"`
+	StateDBChecksumVerified  bool                   `json:"state_db_checksum_verified"`
+	Busy                     bool                   `json:"busy"`
+	OperationalState         string                 `json:"operational_state"`
+	WorktreeClean            bool                   `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                   `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                   `json:"checkpoint_published_by_acd"`
+	PublicationDrain         publicationDrainReport `json:"publication_drain"`
 }
 
 type replayConflictMeta struct {
@@ -194,6 +199,7 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 		return report, err
 	} else {
 		report.IntentStrategy = intentStrategy
+		report.IntentStrategy.RejectLogPath = plannerRejectLogPath(rec.StateDB)
 	}
 	if runtimeConfig, err := loadRuntimeConfigReport(ctx, conn, rec.RepoHash, time.Now()); err != nil {
 		return report, err
@@ -239,6 +245,16 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	if err := diagnoseOperationMarker(ctx, conn, rec.Path, &report); err != nil {
 		return report, err
 	}
+	status, err := buildStatusReport(ctx, rec, time.Now())
+	if err != nil {
+		return report, fmt.Errorf("status truth: %w", err)
+	}
+	report.Busy = status.Busy
+	report.OperationalState = status.OperationalState
+	report.WorktreeClean = status.WorktreeClean
+	report.AllChangesCommittedInGit = status.AllChangesCommittedInGit
+	report.CheckpointPublishedByACD = status.CheckpointPublishedByACD
+	report.PublicationDrain = status.PublicationDrain
 	report.Remediation = diagnoseRemediation(report)
 
 	after, err := fileSHA256(rec.StateDB)
@@ -720,11 +736,11 @@ func diagnoseRemediation(report diagnoseReport) []string {
 				nextProbe = "at " + time.Unix(int64(health.NextProbeTS), 0).UTC().Format(time.RFC3339)
 			}
 			remediation = append(remediation,
-				fmt.Sprintf("intent planner circuit is open after %d consecutive %s failure(s); deterministic fallback remains active until the next provider probe %s. Check provider connectivity and configuration; for validation failures, review .git/acd/%s.",
+				fmt.Sprintf("intent planner circuit is open after %d consecutive %s failure(s); deterministic fallback remains active until the next provider probe %s. Check provider connectivity and configuration; for validation failures, review %s.",
 					health.ConsecutiveFailures,
 					valueOrUnset(string(health.LastFailureClass)),
 					nextProbe,
-					ai.IntentRejectsFileName))
+					valueOrUnset(report.IntentStrategy.RejectLogPath)))
 		case daemon.IntentPlannerCircuitHalfOpen:
 			remediation = append(remediation,
 				"intent planner circuit is half-open with one provider probe in progress; deterministic fallback remains active for other planning windows until that probe succeeds.")
@@ -737,15 +753,15 @@ func diagnoseRemediation(report diagnoseReport) []string {
 	}
 	if report.IntentStrategy.PlannerErrorRateRecentWarn {
 		// Surfaces sustained planner-error rates above the noise floor.
-		// Operators inspecting <gitDir>/acd/planner-rejects.jsonl get the
+		// Operators inspecting the exact worktree reject path get the
 		// raw model output for the last rotation window (5 MiB current +
 		// 5 MiB .1) so they can root-cause without re-running the planner.
 		remediation = append(remediation,
-			fmt.Sprintf("planner_error_rate_recent %s exceeds %s threshold (last %d decisions); review .git/acd/%s for rejected planner outputs.",
+			fmt.Sprintf("planner_error_rate_recent %s exceeds %s threshold (last %d decisions); review %s for rejected planner outputs.",
 				strconv.FormatFloat(report.IntentStrategy.PlannerErrorRateRecent, 'f', 3, 64),
 				strconv.FormatFloat(IntentPlannerErrorRateWarnThreshold, 'f', 3, 64),
 				IntentRecentDecisionWindow,
-				ai.IntentRejectsFileName,
+				valueOrUnset(report.IntentStrategy.RejectLogPath),
 			))
 	}
 	if report.IntentStrategy.ForcedAgingReady > 0 {
@@ -837,6 +853,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 	renderReplayObservabilityHuman(out, r.Replay)
 	renderIntentV2Human(out, r.IntentV2)
 	renderSelfPublicationHuman(out, r.SelfPublication, "")
+	renderPublicationDrainHuman(out, r.PublicationDrain)
 
 	if r.OperationInProgress != "" {
 		stale := ""

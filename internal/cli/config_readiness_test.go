@@ -145,6 +145,7 @@ func TestReplayObservabilitySurfaces(t *testing.T) {
 	if err := state.MetaSetMany(ctx, d, map[string]string{
 		"last_replay_error":         "candidate planning failed",
 		"replay.error_repeat_count": "4",
+		"replay.error_last_seen_ts": "1786464200",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -156,6 +157,10 @@ func TestReplayObservabilitySurfaces(t *testing.T) {
 	var status statusReport
 	if err := json.Unmarshal(statusOut.Bytes(), &status); err != nil {
 		t.Fatal(err)
+	}
+	if status.Configuration.Configuration != "ready" {
+		t.Fatalf("retryable replay error changed configuration=%+v",
+			status.Configuration)
 	}
 
 	var diagnoseOut bytes.Buffer
@@ -196,8 +201,9 @@ func TestReplayObservabilitySurfaces(t *testing.T) {
 		"events":   events.Replay,
 		"doctor":   doctor.Repos[0].Replay,
 	} {
-		if replay.State != "needs_attention" ||
+		if replay.State != "degraded" ||
 			replay.ErrorRepeatCount != 4 ||
+			replay.ErrorLastSeenTS != 1786464200 ||
 			replay.LastError != "candidate planning failed" {
 			t.Fatalf("%s replay=%+v", name, replay)
 		}

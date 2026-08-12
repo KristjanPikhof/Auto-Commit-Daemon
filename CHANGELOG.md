@@ -4,6 +4,31 @@
 
 ### Changed
 
+- Added durable self-healing publication drains. Invalid Intent graphs are
+  normalized after candidate-ID stabilization, get one deterministic semantic
+  rebuild, and then use local atomic dependency groups without changing the
+  configured strategy or weakening Git safety checks.
+- `acd commit-all --yes` now verifies a full checkpoint before consuming staged
+  index state, keeps the worktree unchanged, and stays attached to a frozen
+  target until completion or a genuine safety block. Disconnects and daemon
+  restarts no longer cancel publication, and background ACD still never
+  consumes staging.
+- Status, diagnose, and doctor now report durable drain phase, remaining work,
+  semantic attempts, local fallback, last progress, staged consent, and the
+  latest sanitized error. Active self-healing states do not report
+  `needs_attention` unless publication reaches a true safety block.
+- Setup migration now reuses existing immutable checkpoint ownership when a
+  retained recovery snapshot contains an event protected by an earlier setup
+  attempt. Re-running setup no longer fails on duplicate event membership.
+- `acd on` now performs a checkpoint-first managed runtime handoff for forward
+  schema and integration upgrades. A strictly older unadvertised runtime must
+  first pass the checkpoint-barrier probe, so replacement remains automatic
+  without weakening the pre-upgrade protection fence. It always replaces the
+  managed repository worker and verifies the new worker before succeeding.
+- `acd off` now waits for the managed worker to stop. Doctor includes the
+  supervisor's exact worker error and a matching repair command instead of
+  sending users through a repeated `acd on` loop.
+
 - Rebuilt ACD around durable private-ref checkpoints that complete before any
   grouping, provider, verification, or Git publication work.
 - Replaced the public lifecycle model with ten root commands, including the
@@ -24,6 +49,26 @@
 - Changed fresh defaults to deterministic Intent/Fast with structural
   verification and no credential or diff egress requirement. The one-shot
   v19 to v20 cutover preserves existing effective publication settings.
+- Intent planning now repairs only mechanically proven missing dependency
+  declarations, permits at most one effective remote correction, and uses
+  validated deterministic fallback for invalid output without a retry loop.
+- A full Intent planning window now waits for the repository settle window.
+  Durable boundaries, logical flushes, dependency-safe forced aging, and the
+  maximum pending age still release work.
+- Status now distinguishes retrying replay, durable publication blocks, busy
+  workers with fresh heartbeats, clean Git state, checkpoint protection, and
+  checkpoints published by ACD.
+- Linked worktrees now keep planner reject logs in their exact Git directories.
+  Shared daemon logs include worktree and Git-directory identity on each
+  worktree record, while rejected raw responses remain redacted by default.
+- Exact-chain recovery now checkpoints enabled linked worktrees, temporarily
+  stops their shared repository worker, and restores protection automatically.
+  Repeated capture transitions that already reached their recorded result are
+  accepted without weakening mismatch checks.
+- Status now treats a fresh worker that is actively completing a protection
+  checkpoint as a normal wait instead of asking the user to intervene.
+- `acd on` now applies safe exact-chain recovery after its initial checkpoint.
+  Archive-only recovery still requires explicit consent.
 
 ### Added
 

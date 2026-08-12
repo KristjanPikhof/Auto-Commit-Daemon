@@ -248,6 +248,28 @@ func (e *IntentPlannerV2UnsupportedError) Error() string {
 type IntentPlanV2ValidationError struct {
 	Message  string
 	Findings []IntentAtomicityFinding
+	rejected *IntentPlanV2
+}
+
+func rejectedIntentPlanV2(err error, plan IntentPlanV2) error {
+	var validation *IntentPlanV2ValidationError
+	if !errors.As(err, &validation) {
+		return err
+	}
+	copy := cloneIntentPlanV2Value(plan)
+	validation.rejected = &copy
+	return err
+}
+
+// RejectedIntentPlanV2 returns the decoded native plan that failed structural
+// validation. Callers may use this transient copy only for deterministic local
+// repair; it is never persisted or logged as raw planner output.
+func RejectedIntentPlanV2(err error) (IntentPlanV2, bool) {
+	var validation *IntentPlanV2ValidationError
+	if !errors.As(err, &validation) || validation.rejected == nil {
+		return IntentPlanV2{}, false
+	}
+	return cloneIntentPlanV2Value(*validation.rejected), true
 }
 
 func (e *IntentPlanV2ValidationError) Error() string {
@@ -275,7 +297,7 @@ func DecodeIntentPlanV2(raw []byte, req IntentPlanRequestV2) (IntentPlanV2, erro
 		return IntentPlanV2{}, v2ValidationError("", IntentAtomicityCohesion, "response_trailing_data", err.Error())
 	}
 	if err := ValidateIntentPlanV2(req, plan); err != nil {
-		return IntentPlanV2{}, err
+		return plan, rejectedIntentPlanV2(err, plan)
 	}
 	return plan, nil
 }
@@ -333,7 +355,7 @@ func PlanIntentV2WithCompatibility(ctx context.Context, planner interface{ Name(
 			return AdaptIntentPlanV1(req, unsupported.LegacyPlan)
 		}
 		if err := validateNativeIntentPlanV2(req, plan); err != nil {
-			return IntentPlanV2{}, err
+			return plan, rejectedIntentPlanV2(err, plan)
 		}
 		return plan, nil
 	}
@@ -346,6 +368,20 @@ func PlanIntentV2WithCompatibility(ctx context.Context, planner interface{ Name(
 		return IntentPlanV2{}, err
 	}
 	return AdaptIntentPlanV1(req, legacy)
+}
+
+func cloneIntentPlanV2Value(plan IntentPlanV2) IntentPlanV2 {
+	clone := plan
+	clone.Candidates = append([]IntentCandidateAssignment(nil), plan.Candidates...)
+	for i := range clone.Candidates {
+		clone.Candidates[i].SelectedSeqs = append(
+			[]int64(nil), plan.Candidates[i].SelectedSeqs...)
+		clone.Candidates[i].MissingCompanions = append(
+			[]string(nil), plan.Candidates[i].MissingCompanions...)
+		clone.Candidates[i].DependsOnCandidates = append(
+			[]string(nil), plan.Candidates[i].DependsOnCandidates...)
+	}
+	return clone
 }
 
 func validateNativeIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) error {
@@ -894,6 +930,39 @@ func BuildIntentAtomicityCorrection(findings []IntentAtomicityFinding) string {
 		))
 	}
 	return NormalizeIntentAtomicityCorrection(strings.Join(lines, "\n"))
+}
+
+// IntentPlanV2CorrectionEligible reports whether one remote correction can
+// safely improve planner metadata without asking the model to reconsider
+// capture membership or dependency evidence. Structural findings fall through
+// to the deterministic preset fallback instead of consuming another model
+// call.
+func IntentPlanV2CorrectionEligible(findings []IntentAtomicityFinding) bool {
+	if len(findings) == 0 {
+		return false
+	}
+	for _, finding := range findings {
+		switch finding.Code {
+		case "protocol_invalid",
+			"candidate_id_invalid",
+			"candidate_id_duplicate",
+			"purpose_invalid",
+			"grouping_reason_invalid",
+			"missing_companions_invalid",
+			"readiness_invalid",
+			"ready_subject_empty",
+			"ready_with_missing_companions",
+			"candidate_dependency_unknown",
+			"candidate_dependency_self",
+			"candidate_dependency_duplicate",
+			"publish_order_not_topological",
+			"dependency_not_ready":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // NewIntentAtomicityReport combines planner-structural results with

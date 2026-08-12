@@ -18,6 +18,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 func makeProtectedControlRepoStateDB(t *testing.T) (repoDir, stateDB string, db *state.DB) {
@@ -100,6 +101,48 @@ func TestControlBareUncutDisabledRepositoryRecommendsSetup(t *testing.T) {
 	}
 }
 
+func TestControlBareDisabledRepositoryReportsGitTruth(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, stateDB, db := makeProtectedControlRepoStateDB(t)
+	registerProtectedControlRepo(t, roots, repo)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		result := registry.DisableRepo(central.RepoRemovalTarget{
+			Path: repo, StateDB: stateDB,
+		}, time.Now().Unix())
+		if result.NotFound {
+			return errors.New("registered repository was not found")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var cleanOut bytes.Buffer
+	if err := runControlStatus(ctx, &cleanOut, repo, true); err != nil {
+		t.Fatalf("clean disabled status: %v", err)
+	}
+	clean := decodeControlResult(t, cleanOut.Bytes())
+	if !clean.WorktreeClean || !clean.AllChangesCommittedInGit || !clean.Published {
+		t.Fatalf("clean disabled status lost Git truth: %+v", clean)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "uncommitted.txt"), []byte("dirty\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var dirtyOut bytes.Buffer
+	if err := runControlStatus(ctx, &dirtyOut, repo, true); err != nil {
+		t.Fatalf("dirty disabled status: %v", err)
+	}
+	dirty := decodeControlResult(t, dirtyOut.Bytes())
+	if dirty.WorktreeClean || dirty.AllChangesCommittedInGit || dirty.Published {
+		t.Fatalf("dirty disabled status hid Git changes: %+v", dirty)
+	}
+}
+
 func TestControlBareNonRepoReturnsClassification(t *testing.T) {
 	_ = withIsolatedHome(t)
 	nonRepo := t.TempDir()
@@ -141,7 +184,7 @@ func TestControlBareFreshHeartbeatWithDeadPIDNeedsAttention(t *testing.T) {
 	}
 }
 
-func TestApplyControlStatusRepeatedReplayErrorNeedsAttention(t *testing.T) {
+func TestApplyControlStatusDurableReplayBlockNeedsAttention(t *testing.T) {
 	status := statusReport{
 		Daemon: "running", PID: os.Getpid(),
 		Replay: replayObservabilityReport{
@@ -151,8 +194,16 @@ func TestApplyControlStatusRepeatedReplayErrorNeedsAttention(t *testing.T) {
 	result := controlResult{OK: true, Health: controlHealthHealthy}
 	applyControlStatus(&result, status)
 	if result.OK || result.Health != controlHealthNeedsAttention ||
-		!strings.Contains(result.Summary, "repeatedly failing") {
+		!strings.Contains(result.Summary, "durable block") {
 		t.Fatalf("control result=%+v", result)
+	}
+	if !result.RecoveryRequired {
+		t.Fatal("durable replay block did not request automatic recovery")
+	}
+	if !strings.Contains(result.NextAction, "acd support recover --dry-run") ||
+		!strings.Contains(result.NextAction, "acd support recover --yes") ||
+		strings.Contains(result.NextAction, "acd doctor") {
+		t.Fatalf("next action=%q", result.NextAction)
 	}
 }
 
@@ -173,6 +224,27 @@ func TestApplyControlStatusIncompleteCheckpointNeedsAttention(t *testing.T) {
 	}
 	if !strings.Contains(result.NextAction, "acd doctor") {
 		t.Fatalf("next action=%q", result.NextAction)
+	}
+}
+
+func TestApplyControlStatusBusyCheckpointCompletesAutomatically(t *testing.T) {
+	status := statusReport{
+		Daemon:                        "running",
+		PID:                           os.Getpid(),
+		Busy:                          true,
+		CheckpointProtectionAvailable: true,
+		ObservationEpoch:              7,
+		CoveredEpoch:                  6,
+	}
+	result := controlResult{OK: true, Health: controlHealthHealthy}
+
+	applyControlStatus(&result, status)
+
+	if !result.OK || result.Health != controlHealthWaiting || result.Protected {
+		t.Fatalf("busy checkpoint result=%+v", result)
+	}
+	if !strings.Contains(result.NextAction, "completes automatically") || strings.Contains(result.NextAction, "acd doctor") {
+		t.Fatalf("busy checkpoint next action=%q", result.NextAction)
 	}
 }
 
@@ -326,6 +398,10 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 			got := decodeControlResult(t, out.Bytes())
 			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "blocked publication") {
 				t.Fatalf("active tail terminal event was not surfaced: %+v", got)
+			}
+			if !strings.Contains(got.NextAction, "acd support recover --dry-run") ||
+				!strings.Contains(got.NextAction, "acd support recover --yes") {
+				t.Fatalf("active tail recovery action=%q", got.NextAction)
 			}
 		})
 	}
@@ -641,6 +717,65 @@ func TestControlOffUnknownDetachedRepoRecordsDurableOptOut(t *testing.T) {
 	}
 }
 
+func TestApplySupervisorWorkerFailureProvidesRepairThatMatchesCause(t *testing.T) {
+	tests := []struct {
+		name    string
+		error   string
+		summary string
+		next    string
+	}{
+		{
+			name:    "safe schema upgrade",
+			error:   "acd worker: open /repo: state: checkpoint-first setup required: state database schema is v20, want v21",
+			summary: "safe schema upgrade",
+			next:    "Run `acd on`",
+		},
+		{
+			name:    "old owner",
+			error:   "acd worker: acquire repository ownership: already owned",
+			summary: "older worker",
+			next:    "Run `acd on`",
+		},
+		{
+			name:    "unknown startup failure",
+			error:   "acd worker: provider configuration is invalid",
+			summary: "startup error",
+			next:    "acd support logs --lines 100",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := controlResult{OK: true, Health: controlHealthHealthy}
+			applySupervisorWorkerFailure(&result, supervisor.WorkerStatus{
+				State: "needs_action", Restarts: 5, LastError: test.error,
+			})
+			if result.OK || result.Health != controlHealthNeedsAttention ||
+				!strings.Contains(result.Summary, test.summary) ||
+				!strings.Contains(result.NextAction, test.next) {
+				t.Fatalf("result=%+v", result)
+			}
+		})
+	}
+}
+
+func TestRenderProductDoctorWorkerShowsCauseAndFix(t *testing.T) {
+	var out bytes.Buffer
+	renderProductDoctorWorker(&out, controlResult{
+		SupervisorWorkerState: "needs_action", SupervisorWorkerRestarts: 5,
+		SupervisorWorkerError: "schema is v20, want v21",
+		NextAction:            "Run `acd on` to repair it.",
+	})
+	for _, want := range []string{
+		"State: needs_action after 5 restart attempt(s)",
+		"Cause: schema is v20, want v21",
+		"Fix: Run `acd on` to repair it.",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
 func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	_ = withIsolatedHome(t)
 	repo := makeStartRepo(t)
@@ -713,9 +848,13 @@ func decodeControlResult(t *testing.T, body []byte) controlResult {
 		Registered: envelope.Data.Registered, Enabled: envelope.Data.Enabled,
 		PendingEvents: envelope.Data.PendingEvents, BlockedEvents: envelope.Data.BlockedEvents,
 		Changed: envelope.Changed, Actions: actions,
-		StatePreserved: envelope.Data.StatePreserved,
-		Protected:      envelope.Data.Protected, Published: envelope.Data.Published,
-		CheckpointID: envelope.Data.CheckpointID,
+		StatePreserved:           envelope.Data.StatePreserved,
+		Protected:                envelope.Data.Protected,
+		Published:                envelope.Data.Published,
+		WorktreeClean:            envelope.Data.WorktreeClean,
+		AllChangesCommittedInGit: envelope.Data.AllChangesCommittedInGit,
+		CheckpointPublishedByACD: envelope.Data.CheckpointPublishedByACD,
+		CheckpointID:             envelope.Data.CheckpointID,
 	}
 	return got
 }
