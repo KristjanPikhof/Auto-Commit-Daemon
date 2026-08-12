@@ -34,6 +34,10 @@ type RuntimeUpgradeOptions struct {
 	Compatibility    supervisor.Compatibility
 	Integrations     string
 	Force            bool
+	// AllowSameDistanceReplacement is reserved for explicit setup. It lets a
+	// user replace one development build with another after local history was
+	// amended, while automatic lifecycle upgrades remain order-safe.
+	AllowSameDistanceReplacement bool
 	// AllowUnadvertised permits a strictly older runtime to prove it supports
 	// the checkpoint barrier before any binary replacement. A failed probe
 	// leaves the old runtime and every repository untouched.
@@ -107,11 +111,12 @@ func buildCompatibleSetupPlan(
 		return Plan{}, false, err
 	}
 	if _, err := shouldUpgradeRuntime(status, sourceDigest, RuntimeUpgradeOptions{
-		SourceExecutable:  executable,
-		SourceVersion:     version.String(),
-		Compatibility:     RuntimeCompatibility(),
-		Force:             true,
-		AllowUnadvertised: true,
+		SourceExecutable:             executable,
+		SourceVersion:                version.String(),
+		Compatibility:                RuntimeCompatibility(),
+		Force:                        true,
+		AllowUnadvertised:            true,
+		AllowSameDistanceReplacement: true,
 	}); err != nil {
 		return Plan{}, false, err
 	}
@@ -492,6 +497,9 @@ func shouldUpgradeRuntime(status supervisor.Status, sourceDigest string, options
 		return false, nil
 	}
 	if order == 0 && status.Version != options.SourceVersion {
+		if options.AllowSameDistanceReplacement {
+			return true, nil
+		}
 		return false, fmt.Errorf("CLI version %s diverges from supervisor version %s at the same release distance; run `acd setup`", options.SourceVersion, status.Version)
 	}
 	return true, nil

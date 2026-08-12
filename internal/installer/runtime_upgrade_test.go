@@ -61,6 +61,20 @@ func TestShouldUpgradeRuntimeUsesCompatibilityAndOrdering(t *testing.T) {
 		legacy, "source", legacyOptions); err != nil || !upgrade {
 		t.Fatalf("probed legacy upgrade=(%t,%v), want true,nil", upgrade, err)
 	}
+	divergent := supervisor.Status{
+		Version: "v2026-08-07-180-g1234567", BinaryDigest: "other",
+		Compatibility: compatibility,
+	}
+	if upgrade, err := shouldUpgradeRuntime(
+		divergent, "source", options); err == nil || upgrade {
+		t.Fatalf("automatic divergent upgrade=(%t,%v), want false,error", upgrade, err)
+	}
+	setupOptions := options
+	setupOptions.AllowSameDistanceReplacement = true
+	if upgrade, err := shouldUpgradeRuntime(
+		divergent, "source", setupOptions); err != nil || !upgrade {
+		t.Fatalf("setup divergent upgrade=(%t,%v), want true,nil", upgrade, err)
+	}
 }
 
 func TestBuildPlanUsesBoundedCompatibleUpgrade(t *testing.T) {
