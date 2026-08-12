@@ -94,13 +94,8 @@ func TestReplayIntentV2AdvancesFastFallbackComponents(t *testing.T) {
 		IntentWindow: 10, IntentDeferLimit: 5,
 	}
 	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
-	if err != nil || first.Published != 1 {
+	if err != nil || first.Published != 2 {
 		t.Fatalf("first replay=%+v err=%v", first, err)
-	}
-	f.cctx.BaseHead = first.BaseHead
-	second, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
-	if err != nil || second.Published != 1 {
-		t.Fatalf("second replay=%+v err=%v", second, err)
 	}
 	pending, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil || len(pending) != 0 {

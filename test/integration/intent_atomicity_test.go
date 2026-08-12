@@ -27,12 +27,9 @@ package integration_test
 //     capture seq under the same commit_oid; decision_records carries
 //     four rows joined by that commit_oid.
 //
-//   - Pause, write three files, resume. With the planner deferring the
-//     middle file (B), publishes A and C in one grouped commit while B
-//     stays pending. This proves the daemon does NOT coalesce across
-//     planner-deferred captures even when they sit between two selected
-//     ones — the at-least-two-commits contract is the planner-decision
-//     analogue of the b1 path-boundary contract.
+//   - Pause, write three files, resume. The planner marks A and C as
+//     independent ready candidates while B waits. The daemon publishes two
+//     commits and leaves B pending, preserving the planner-defined boundary.
 
 import (
 	"context"
@@ -186,14 +183,11 @@ WHERE planner_protocol='v2' AND status='published'`); got != "1" {
 	}
 }
 
-// TestIntentAtomicity_DeferredMiddleSplitsCommit drives an A, B, C three-file
-// batch where the planner defers B and selects A+C. The daemon must publish
-// A and C as ONE grouped commit and leave B pending — proving the
-// at-least-two-commits negative arm: when the planner draws a boundary in
-// the middle of the offered window, the daemon honors it and does NOT fold
-// the prefix and suffix together. The deferred capture remains in
-// planner_state with defer_count >= 1.
-func TestIntentAtomicity_RejectsBookendsAcrossDeferredMiddle(t *testing.T) {
+// TestIntentAtomicity_HonorsDeferredMiddleBoundary drives an A, B, C three-file
+// batch where the planner defers B and selects A and C independently. The
+// daemon must publish two commits and leave B pending, proving that a planner
+// boundary in the middle of the offered window is preserved.
+func TestIntentAtomicity_HonorsDeferredMiddleBoundary(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -218,20 +212,22 @@ func TestIntentAtomicity_RejectsBookendsAcrossDeferredMiddle(t *testing.T) {
 			http.Error(w, "expected three offered captures", http.StatusBadRequest)
 			return
 		}
-		// Defer the middle seq, select the bookends. ValidateIntentPlan
-		// requires every offered seq to appear in selected or deferred and
-		// requires deferred_reasons to cover every deferred seq.
-		selected := []int64{seqs[0], seqs[2]}
-		deferred := []int64{seqs[1]}
-		plan := map[string]any{
-			"selected_seqs":    selected,
-			"deferred_seqs":    deferred,
-			"subject":          "Bookends only",
-			"body":             "Defer middle to prove no prefix/suffix coalesce.",
-			"grouping_reason":  "split: select first and third, defer middle",
-			"deferred_reasons": buildDeferredReasons(deferred),
+		candidates := []map[string]any{
+			nativeReadyIntentCandidate("split-a", []int64{seqs[0]},
+				"Publish first bookend", "Keep the first change independent.",
+				"planner-defined independent change"),
+			{
+				"candidate_id": "split-b", "selected_seqs": []int64{seqs[1]},
+				"purpose": "wait at the middle boundary", "readiness": "wait",
+				"missing_companions":    []string{"middle capture remains deferred"},
+				"depends_on_candidates": []string{}, "subject": "", "body": "",
+				"grouping_reason": "planner-defined middle boundary",
+			},
+			nativeReadyIntentCandidate("split-c", []int64{seqs[2]},
+				"Publish final bookend", "Keep the final change independent.",
+				"planner-defined independent change"),
 		}
-		writeIntentPlanResponse(t, w, "call_split", plan)
+		writeNativeIntentCandidatesResponse(t, w, "call_split", candidates)
 	}))
 	defer server.Close()
 
@@ -280,22 +276,20 @@ func TestIntentAtomicity_RejectsBookendsAcrossDeferredMiddle(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "split-a.txt", "published", 20*time.Second)
+	waitForEventState(t, dbPath, "split-c.txt", "published", 20*time.Second)
 
-	// The bookends have no dependency evidence once their middle capture is
-	// deferred. Intent v2 rejects that disconnected group and Fast publishes
-	// only its smallest safe component.
-	if got, want := commitCount(t, repo), startCount+1; got != want {
-		t.Fatalf("commit count=%d want %d (one smallest safe component)",
+	if got, want := commitCount(t, repo), startCount+2; got != want {
+		t.Fatalf("commit count=%d want %d (two independent bookends)",
 			got, want)
 	}
 
-	// Neither deferred B nor disconnected C may be folded into A.
+	// Neither deferred B nor independent C may be folded into A.
 	oidA := sqliteScalar(t, dbPath,
 		"SELECT commit_oid FROM capture_events WHERE path='split-a.txt' AND state='published'")
 	oidC := sqliteScalar(t, dbPath,
 		"SELECT commit_oid FROM capture_events WHERE path='split-c.txt' ORDER BY seq DESC LIMIT 1")
-	if oidA == "" || oidC != "" {
-		t.Fatalf("bookend commit_oids A=%q C=%q (disconnected C must remain pending)", oidA, oidC)
+	if oidA == "" || oidC == "" || oidA == oidC {
+		t.Fatalf("bookend commit_oids A=%q C=%q want separate commits", oidA, oidC)
 	}
 	stateB := sqliteScalar(t, dbPath,
 		"SELECT state FROM capture_events WHERE path='split-b.txt' ORDER BY seq DESC LIMIT 1")
@@ -307,10 +301,10 @@ SELECT COUNT(*)
 FROM intent_candidates candidate
 JOIN intent_candidate_events member ON member.candidate_id=candidate.id
 JOIN capture_events capture ON capture.seq=member.event_seq
-WHERE capture.path IN ('split-b.txt','split-c.txt')
+WHERE capture.path='split-b.txt'
   AND candidate.status='waiting'`)
-	if waiting != "2" {
-		t.Fatalf("waiting v2 candidates=%s want 2 for deferred B and disconnected C",
+	if waiting != "1" {
+		t.Fatalf("waiting v2 candidates=%s want 1 for deferred B",
 			waiting)
 	}
 

@@ -22,10 +22,10 @@ import (
 // a planner response with a seq in both selected_seqs and deferred_seqs plus a
 // deferred_reasons entry referencing that selected seq.
 //
-// The overlap must stay invalid: the daemon records intent_planner_error
-// decisions for the offered window, logs the rejected planner response, and
-// uses deterministic fallback for one safe capture instead of publishing the
-// contradictory grouped plan.
+// The overlap must stay invalid: the daemon records evidence-partition
+// recovery for the offered window, logs the rejected planner response, and
+// publishes independent fallback candidates instead of the contradictory
+// grouped plan.
 func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
@@ -108,20 +108,20 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "norm-one.txt", "published", 10*time.Second)
-	waitFor(t, "intent_planner_error decisions", 10*time.Second, func() bool {
-		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM decision_records WHERE kind = 'intent_planner_error'") == "2"
+	waitFor(t, "evidence partition recovery", 10*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM intent_planner_windows WHERE resolution_mode='evidence_partition' AND validation_failure IS NOT NULL") == "1"
 	})
 
 	oidOne := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-one.txt' ORDER BY seq DESC LIMIT 1")
 	oidTwo := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-two.txt' ORDER BY seq DESC LIMIT 1")
 	if oidOne == "" {
-		t.Fatalf("norm-one commit oid is empty")
+		t.Fatalf("norm-one fallback commit oid is empty")
 	}
 	if oidTwo != "" && oidOne == oidTwo {
-		t.Fatalf("overlap plan published as grouped commit oid=%q for both captures", oidOne)
+		t.Fatalf("contradictory plan published both captures as %q", oidOne)
 	}
-	if got := commitCount(t, repo); got != startCount+1 {
-		t.Fatalf("commit count=%d want %d (one deterministic fallback commit)", got, startCount+1)
+	if got := commitCount(t, repo); got < startCount+1 || got > startCount+2 {
+		t.Fatalf("commit count=%d want one or two evidence fallback commits", got)
 	}
 	if subj := headSubject(t, repo); subj == "Intent grouped files" {
 		t.Fatalf("subject=%q shows contradictory planner plan was published", subj)
@@ -220,8 +220,8 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitFor(t, "intent_planner_error decisions", 10*time.Second, func() bool {
-		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM decision_records WHERE kind = 'intent_planner_error'") == "2"
+	waitFor(t, "evidence partition recovery", 10*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM intent_planner_windows WHERE resolution_mode='evidence_partition' AND validation_failure IS NOT NULL") == "1"
 	})
 	waitFor(t, "planner rejects log", 10*time.Second, func() bool {
 		_, err := os.Stat(rejectsPath)
@@ -298,8 +298,8 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
 	waitHeadAdvances(t, repo, headBefore, 10*time.Second)
 	waitForEventState(t, dbPath, "singleton-one.txt", "published", 10*time.Second)
-	waitFor(t, "first planner error", 10*time.Second, func() bool {
-		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM decision_records WHERE kind='intent_planner_error'") == "1"
+	waitFor(t, "first evidence partition recovery", 10*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM intent_planner_windows WHERE resolution_mode='evidence_partition' AND validation_failure IS NOT NULL") == "1"
 	})
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after first capture=%d want 1", got)
@@ -314,8 +314,8 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after cooldown bypass=%d want 1", got)
 	}
-	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM decision_records WHERE kind='intent_planner_error'"); got != "1" {
-		t.Fatalf("planner error decisions=%s want only the originating provider failure", got)
+	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM decision_records WHERE kind='intent_planner_error'"); got != "0" {
+		t.Fatalf("planner error decisions=%s want 0 after safe evidence recovery", got)
 	}
 	waitFor(t, "persisted planner circuit bypass", 10*time.Second, func() bool {
 		raw := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")

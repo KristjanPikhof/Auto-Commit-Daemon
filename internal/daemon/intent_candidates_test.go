@@ -134,12 +134,12 @@ func (intentCandidateV1PlannerStub) PlanIntent(
 	}, nil
 }
 
-type invalidIntentCandidatePlannerStub struct {
+type semanticIntentCandidatePlannerStub struct {
 	calls int
 }
 
-func (p *invalidIntentCandidatePlannerStub) Name() string {
-	return "intent-v2-invalid-test"
+func (p *semanticIntentCandidatePlannerStub) Name() string {
+	return "intent-v2-semantic-test"
 }
 
 type selfDependentIntentCandidatePlannerStub struct {
@@ -170,7 +170,7 @@ func (p *selfDependentIntentCandidatePlannerStub) PlanIntentV2(
 	}, nil
 }
 
-func (p *invalidIntentCandidatePlannerStub) PlanIntentV2(
+func (p *semanticIntentCandidatePlannerStub) PlanIntentV2(
 	_ context.Context,
 	req ai.IntentPlanRequestV2,
 ) (ai.IntentPlanV2, error) {
@@ -183,9 +183,9 @@ func (p *invalidIntentCandidatePlannerStub) PlanIntentV2(
 				req.OfferedCaptures[0].Seq,
 				req.OfferedCaptures[1].Seq,
 			},
-			Purpose: "merge disconnected captures", Readiness: ai.IntentCandidateReady,
-			Subject:        "Merge disconnected captures",
-			GroupingReason: "invalid grouping for retry budget test",
+			Purpose: "implement shared request validation", Readiness: ai.IntentCandidateReady,
+			Subject:        "Implement shared request validation",
+			GroupingReason: "both captures implement the same validation behavior",
 		}},
 	}, nil
 }
@@ -471,7 +471,7 @@ func TestIntentCandidateEngineAcceptsSemanticGroupingWithoutGraphPath(t *testing
 				"internal/a/a.go", "create", "", "a1")
 			b := appendIntentCandidateCapture(t, db,
 				"internal/b/b.go", "create", "", "b1")
-			planner := &invalidIntentCandidatePlannerStub{}
+			planner := &semanticIntentCandidatePlannerStub{}
 			result, err := EvaluateIntentCandidates(ctx, db,
 				IntentCandidateEvaluation{
 					BranchRef: "refs/heads/main", BranchGeneration: 1,
@@ -1772,12 +1772,12 @@ func TestIntentCandidateEngineBalancedFallbackKeepsImportEvidenceSeparate(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.NeedsAttention || len(result.Decisions) != 1 {
+	if result.NeedsAttention || len(result.Decisions) != 2 {
 		t.Fatalf("import-only fallback=%+v", result)
 	}
 	for _, decision := range result.Decisions {
 		if !decision.Publishable ||
-			len(decision.Assignment.SelectedSeqs) != 2 {
+			len(decision.Assignment.SelectedSeqs) != 1 {
 			t.Fatalf("import evidence merged fallback=%+v", decision)
 		}
 	}
