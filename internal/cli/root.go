@@ -172,7 +172,7 @@ func newRootCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:           "acd",
-		Short:         "Durable checkpoints first, clean Git commits second",
+		Short:         "Protect your work and publish clear local Git commits",
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -202,10 +202,10 @@ func newRootCmd() *cobra.Command {
 	cmd.SetVersionTemplate("acd version {{.Version}}\n")
 
 	pf := cmd.PersistentFlags()
-	pf.StringVar(&repoPath, "repo", "", "Repo root (default: cwd)")
-	pf.BoolVar(&jsonOut, "json", false, "Emit JSON output")
-	pf.BoolVar(&quiet, "quiet", false, "Suppress non-essential output")
-	pf.StringVar(&logLevel, "log-level", "info", "debug|info|warn|error")
+	pf.StringVar(&repoPath, "repo", "", "Repository to use (default: current directory)")
+	pf.BoolVar(&jsonOut, "json", false, "Print machine-readable JSON")
+	pf.BoolVar(&quiet, "quiet", false, "Hide progress and other optional output")
+	pf.StringVar(&logLevel, "log-level", "info", "Log detail: debug, info, warn, or error")
 
 	repo := newProductRepoNamespaceCmd()
 	repo.Hidden = true

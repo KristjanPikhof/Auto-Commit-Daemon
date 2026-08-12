@@ -18,6 +18,14 @@ Commands:
   doctor      Explain installation and protection problems
   uninstall   Remove ACD while preserving protected data by default
 
+Common tasks:
+  Publish everything now:    acd commit-all --dry-run
+  Rewrite commit messages:   acd history rewrite --help
+  Change settings:           acd config edit
+  Manage repositories:       acd repo --help
+  Diagnose a problem:        acd doctor
+  Advanced recovery tools:   acd support --help
+
 Flags:
 {{.Flags.FlagUsages | trimTrailingWhitespaces}}
 
