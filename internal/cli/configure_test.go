@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -225,10 +226,7 @@ func TestConfigureInheritRemovesOverrideAndCreatesRevision(t *testing.T) {
 	repo := materializeTestRepo(t, true)
 	roots := withIsolatedHome(t)
 	restoreConfigureFakes(t)
-	repoHash, err := paths.RepoHash(repo)
-	if err != nil {
-		t.Fatal(err)
-	}
+	repoHash := central.CanonicalID(repo)
 	store := config.NewStore(roots)
 	if err := store.UpdateExpected(0, func(doc *config.Document) error {
 		doc.Settings.Global[config.FieldCommitStrategy] =

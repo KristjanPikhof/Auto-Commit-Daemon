@@ -88,13 +88,17 @@ func resolveShadowRetentionGenerations() int64 {
 }
 
 func pruneShadowGenerations(ctx context.Context, db *state.DB, cctx CaptureContext) (int, error) {
+	return pruneShadowGenerationsWithRetention(ctx, db, cctx, resolveShadowRetentionGenerations())
+}
+
+func pruneShadowGenerationsWithRetention(ctx context.Context, db *state.DB, cctx CaptureContext, retention int64) (int, error) {
 	if db == nil {
 		return 0, fmt.Errorf("daemon: pruneShadowGenerations: nil db")
 	}
 	if cctx.BranchRef == "" || cctx.BranchGeneration <= 0 {
 		return 0, nil
 	}
-	return state.PruneShadowGenerations(ctx, db, cctx.BranchRef, cctx.BranchGeneration, resolveShadowRetentionGenerations())
+	return state.PruneShadowGenerations(ctx, db, cctx.BranchRef, cctx.BranchGeneration, retention)
 }
 
 // IsShadowBootstrapped reports whether the (branch_ref, branch_generation)

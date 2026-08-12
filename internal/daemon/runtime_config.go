@@ -486,14 +486,18 @@ func runtimeIntentPrerequisiteBlock(
 		metadata.PresetID != "intent."+string(preset) {
 		return runtimeConfigureReason("Intent v2 preset metadata is missing")
 	}
-	if cfg.Mode == "" || cfg.Mode == "deterministic" {
-		return runtimeConfigureReason("Intent v2 requires a tested semantic provider")
-	}
-	if !cfg.DiffEgress && !strings.HasPrefix(cfg.Mode, "subprocess:") {
-		return runtimeConfigureReason("Intent v2 requires approved redacted diff context")
-	}
-	if _, ok := confirmations[string(ai.ConfirmationDiffEgress)]; !ok {
-		return runtimeConfigureReason("diff context consent is missing")
+	deterministic := cfg.Mode == "" || cfg.Mode == "deterministic"
+	if deterministic {
+		if preset != acdconfig.PresetFast {
+			return runtimeConfigureReason("Intent v2 requires a tested semantic provider")
+		}
+	} else {
+		if !cfg.DiffEgress && !strings.HasPrefix(cfg.Mode, "subprocess:") {
+			return runtimeConfigureReason("Intent v2 requires approved redacted diff context")
+		}
+		if _, ok := confirmations[string(ai.ConfirmationDiffEgress)]; !ok {
+			return runtimeConfigureReason("diff context consent is missing")
+		}
 	}
 	mode := values[acdconfig.FieldIntentVerification]
 	if preset == acdconfig.PresetBalanced || preset == acdconfig.PresetQuality {

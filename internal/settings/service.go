@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
@@ -94,10 +95,7 @@ func newService(ctx context.Context, opts Options, openState bool) (*Service, er
 	if err != nil {
 		return nil, fmt.Errorf("acd settings: resolve repository: %w", err)
 	}
-	repoHash, err := paths.RepoHash(wt.Root)
-	if err != nil {
-		return nil, fmt.Errorf("acd settings: repository identity: %w", err)
-	}
+	repoHash := central.CanonicalID(wt.Root)
 	var db *state.DB
 	if openState {
 		db, err = state.Open(ctx, state.DBPathFromGitDir(wt.GitDir))
@@ -424,11 +422,6 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 	providerValidation, err := ai.ValidateProviderConfig(cfg)
 	if err != nil {
 		return Validation{}, sanitizeError(err)
-	}
-	if resolved[config.FieldProvider] == "deterministic" &&
-		(resolved[config.FieldCommitStrategy] != "event" ||
-			resolved[config.FieldCommitPreset] != "fast") {
-		return Validation{}, errors.New("acd settings: deterministic provider is supported only by Event Fast")
 	}
 	verificationMode := resolved[config.FieldIntentVerification]
 	verificationCommand := ""

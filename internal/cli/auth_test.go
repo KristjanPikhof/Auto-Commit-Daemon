@@ -40,10 +40,13 @@ func TestAuthSetStatusAndRemove(t *testing.T) {
 	if err != nil || strings.Contains(out, "sk-cli-secret") {
 		t.Fatalf("auth status out=%q err=%v", out, err)
 	}
-	var status authStatusReport
-	if err := json.Unmarshal([]byte(out), &status); err != nil {
+	var envelope struct {
+		Data authStatusReport `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
 		t.Fatal(err)
 	}
+	status := envelope.Data
 	if status.Source != credentials.SourceFile || !status.ProtectedFileSet || status.EnvironmentSet {
 		t.Fatalf("status = %+v", status)
 	}
@@ -70,10 +73,13 @@ func TestAuthStatusEnvironmentPriorityIsSecretFree(t *testing.T) {
 	if strings.Contains(out, "sk-file-secret") || strings.Contains(out, "sk-env-secret") {
 		t.Fatalf("status leaked secret: %s", out)
 	}
-	var status authStatusReport
-	if err := json.Unmarshal([]byte(out), &status); err != nil {
+	var envelope struct {
+		Data authStatusReport `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
 		t.Fatal(err)
 	}
+	status := envelope.Data
 	if status.Source != credentials.SourceEnvironment || !status.EnvironmentSet || !status.ProtectedFileSet {
 		t.Fatalf("status = %+v", status)
 	}

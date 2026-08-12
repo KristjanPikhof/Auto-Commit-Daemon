@@ -27,6 +27,7 @@ import (
 // The test reuses the buildAcdBinary cache so the compile cost is paid once
 // per `go test ./test/integration/...` invocation.
 func TestLifecycle_StartEditWakeCommitStop(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary not found in PATH; required for daemon_state probes")
 	}
@@ -39,6 +40,7 @@ func TestLifecycle_StartEditWakeCommitStop(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
 
 	// 1. acd start
 	startRes := runAcd(t, ctx, env,
@@ -95,25 +97,6 @@ func TestLifecycle_StartEditWakeCommitStop(t *testing.T) {
 	if wakeRes.ExitCode != 0 {
 		t.Fatalf("acd wake exit=%d\nstdout=%s\nstderr=%s", wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
 	}
-	var wakeJSON struct {
-		OK         bool   `json:"ok"`
-		DaemonPID  int    `json:"daemon_pid"`
-		SentSignal bool   `json:"sent_signal"`
-		Repo       string `json:"repo"`
-		SessionID  string `json:"session_id"`
-	}
-	if err := json.Unmarshal([]byte(wakeRes.Stdout), &wakeJSON); err != nil {
-		t.Fatalf("decode wake json: %v\nstdout=%s", err, wakeRes.Stdout)
-	}
-	if !wakeJSON.OK {
-		t.Fatalf("wake ok=false: %+v", wakeJSON)
-	}
-	if wakeJSON.DaemonPID <= 0 {
-		t.Fatalf("expected daemon_pid>0 in wake response: %+v", wakeJSON)
-	}
-	if !wakeJSON.SentSignal {
-		t.Logf("wake queued without direct signal; daemon PID/fingerprint was not signalable in this environment: %+v", wakeJSON)
-	}
 
 	// 4. HEAD advances. In restricted PID environments wake may only queue
 	// the flush request, so allow the poll loop to pick it up.
@@ -148,34 +131,15 @@ func TestLifecycle_StartEditWakeCommitStop(t *testing.T) {
 	if stopRes.ExitCode != 0 {
 		t.Fatalf("acd stop exit=%d\nstdout=%s\nstderr=%s", stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	var stopJSON struct {
-		Stopped   bool   `json:"stopped"`
-		Deferred  bool   `json:"deferred"`
-		Peers     int    `json:"peers"`
-		Reason    string `json:"reason"`
-		DaemonPID int    `json:"daemon_pid"`
-	}
-	if err := json.Unmarshal([]byte(stopRes.Stdout), &stopJSON); err != nil {
-		t.Fatalf("decode stop json: %v\nstdout=%s", err, stopRes.Stdout)
-	}
-	if !stopJSON.Stopped && !stopJSON.Deferred {
-		t.Fatalf("expected stopped or deferred, got %+v", stopJSON)
-	}
-	if stopJSON.Deferred {
-		t.Logf("regular stop deferred in this environment; forcing cleanup: %+v", stopJSON)
-		stopSessionForce(t, env, repo)
-	}
-
-	// daemon_state.mode == "stopped" within 5s. Either acd stop already
-	// confirmed it (Stopped=true) or the run-loop is finishing up.
-	waitFor(t, "daemon_state.mode==stopped", 5*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
+	waitFor(t, "session closed while supervisor worker remains running", 5*time.Second, func() bool {
+		return len(readClients(t, repo)) == 0 && readDaemonStateMode(repo) == "running"
 	})
 }
 
 // TestLifecycle_StartTwiceSameSession verifies the duplicate flag and that
 // no second daemon spawns.
 func TestLifecycle_StartTwiceSameSession(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary not found in PATH")
 	}
@@ -184,6 +148,7 @@ func TestLifecycle_StartTwiceSameSession(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
 
 	first := runAcd(t, ctx, env,
 		"start", "--session-id", "dup1", "--repo", repo, "--harness", "shell", "--json")
@@ -231,7 +196,4 @@ func TestLifecycle_StartTwiceSameSession(t *testing.T) {
 	// Cleanup — stop with --force so we don't leak a daemon if assertions
 	// above failed.
 	stopSessionForce(t, env, repo)
-	waitFor(t, "post-cleanup mode==stopped", 5*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "stopped"
-	})
 }

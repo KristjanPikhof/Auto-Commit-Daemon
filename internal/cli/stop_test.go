@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -380,6 +382,28 @@ func TestStopAll_PassesCallerForceToRepoStopper(t *testing.T) {
 	}
 }
 
+func TestStopRegistrySkipsDisabledRepositories(t *testing.T) {
+	ctx := context.Background()
+	reg := &central.Registry{Repos: []central.RepoRecord{
+		{Path: "/enabled"},
+		{Path: "/missing", LifecycleState: central.RepoLifecycleDisabled},
+	}}
+	prev := stopOneRepoForAll
+	t.Cleanup(func() { stopOneRepoForAll = prev })
+	var calls []string
+	stopOneRepoForAll = func(_ context.Context, repo, _ string, force bool) (stopRepoResult, error) {
+		calls = append(calls, repo)
+		return stopRepoResult{Repo: repo, Stopped: true, Force: force}, nil
+	}
+	var out bytes.Buffer
+	if err := runStopRegistry(ctx, &out, true, false, reg); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0] != "/enabled" {
+		t.Fatalf("stop calls=%v, want only enabled repository", calls)
+	}
+}
+
 func TestStop_All_IteratesRegistry(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -516,6 +540,9 @@ func TestStopAll_RoutesFailuresToFailedBucket(t *testing.T) {
 	}
 	if got.Failed[0].DaemonPID != 12345 {
 		t.Fatalf("failed[0].DaemonPID = %d, want 12345", got.Failed[0].DaemonPID)
+	}
+	if !strings.Contains(err.Error(), got.Failed[0].Repo) || !strings.Contains(err.Error(), "fingerprint mismatch") {
+		t.Fatalf("failure error omitted actionable repository detail: %v", err)
 	}
 }
 

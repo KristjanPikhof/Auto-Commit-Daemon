@@ -130,7 +130,7 @@ The default repo is the current working directory. Diagnose opens state read-onl
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runDiagnose(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
+			return runProductDiagnose(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
 		},
 	}
 	return cmd

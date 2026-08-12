@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -82,7 +81,13 @@ func TestExplainableUX_DecisionLedgerDrivesEventsExplainAndFix(t *testing.T) {
 
 	startSession(t, ctx, env, repo, "ux-ledger-1", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
-	stopSessionForce(t, env, repo)
+	off := runAcd(t, ctx, env, "off", "--repo", repo, "--force", "--json")
+	if off.ExitCode != 0 {
+		t.Fatalf("acd off exit=%d\nstdout=%s\nstderr=%s", off.ExitCode, off.Stdout, off.Stderr)
+	}
+	if !waitStopped(repo, 5*time.Second) {
+		t.Fatal("repository worker did not stop after acd off")
+	}
 
 	writeFile(t, filepath.Join(repo, "manual.txt"), "landed outside acd\n")
 	manualHead := gitCommitAll(t, repo, "manual external commit", "manual.txt")
@@ -163,9 +168,7 @@ VALUES (last_insert_rowid(), 0, 'create', 'obsolete-blocker.txt', '%s', '100644'
 			PendingCount int    `json:"pending_count"`
 		} `json:"actions"`
 	}
-	if err := json.Unmarshal([]byte(fixDryRun.Stdout), &plan); err != nil {
-		t.Fatalf("decode fix dry-run: %v\n%s", err, fixDryRun.Stdout)
-	}
+	decodeProductEnvelopeData(t, fixDryRun.Stdout, &plan)
 	if !plan.DryRun || len(plan.Actions) != 1 ||
 		plan.Actions[0].Kind != "reconcile_unpublished_chain" ||
 		plan.Actions[0].Seq != manualSeqNumber ||
@@ -256,12 +259,14 @@ func TestExplainableUX_DaemonRecordsSupersededExternalDecision(t *testing.T) {
 		t.Skip("bash not available; slow subprocess provider requires bash")
 	}
 
-	plugDir := writePluginScript(t, "slow", `#!/usr/bin/env bash
+	providerStarted := filepath.Join(t.TempDir(), "provider-started")
+	plugDir := writePluginScript(t, "slow", fmt.Sprintf(`#!/usr/bin/env bash
 while IFS= read -r line; do
+	printf 'started\n' > %q
   sleep 10
   printf '{"version":1,"subject":"slow provider","body":"","error":""}\n'
 done
-`)
+`, providerStarted))
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
@@ -269,9 +274,11 @@ done
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	target := filepath.Join(repo, "zzz-reverted.txt")
-	writeFile(t, target, "before\n")
-	baseHead := gitCommitAll(t, repo, "baseline reverted external", "zzz-reverted.txt")
+	paths := []string{"external-race-a.txt", "external-race-b.txt"}
+	for _, path := range paths {
+		writeFile(t, filepath.Join(repo, path), "before\n")
+	}
+	baseHead := gitCommitAll(t, repo, "baseline reverted external", paths...)
 
 	slowEnv := envWith(env,
 		"ACD_AI_PROVIDER=subprocess:slow",
@@ -286,35 +293,68 @@ done
 	waitMode(t, repo, "running", 5*time.Second)
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	writeFile(t, filepath.Join(repo, "aaa-slow.txt"), "first queued event\n")
-	writeFile(t, target, "after\n")
+	for _, path := range paths {
+		writeFile(t, filepath.Join(repo, path), "after\n")
+	}
 	wakeSession(t, ctx, slowEnv, repo, "ux-superseded-daemon")
-	waitFor(t, "daemon captured superseded target before replay", 5*time.Second, func() bool {
+	waitFor(t, "daemon checkpointed both external-race captures", 10*time.Second, func() bool {
 		return sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM capture_events WHERE path = 'zzz-reverted.txt' AND state = 'pending'") != "0"
+			`SELECT COUNT(DISTINCT e.path)
+FROM capture_events e
+JOIN checkpoint_events ce ON ce.event_seq = e.seq
+JOIN checkpoints c ON c.id = ce.checkpoint_id
+WHERE e.path IN ('external-race-a.txt', 'external-race-b.txt')
+  AND e.state = 'pending'
+  AND c.phase = 'completed'`) == "2"
+	})
+	ordered := strings.Split(sqliteScalar(t, dbPath,
+		`SELECT group_concat(path, ',') FROM (
+  SELECT path FROM capture_events
+  WHERE path IN ('external-race-a.txt', 'external-race-b.txt')
+  ORDER BY seq
+)`), ",")
+	if len(ordered) != 2 {
+		t.Fatalf("captured path order=%q want two paths", ordered)
+	}
+	handledPath, supersededPath := ordered[0], ordered[1]
+	waitFor(t, "provider entered after completed checkpoint", 8*time.Second, func() bool {
+		_, err := os.Stat(providerStarted)
+		return err == nil
 	})
 
-	externalAfter := gitCommitAll(t, repo, "external after", "aaa-slow.txt", "zzz-reverted.txt")
-	writeFile(t, target, "before\n")
-	externalRevert := gitCommitAll(t, repo, "external revert", "zzz-reverted.txt")
+	externalAfter := gitCommitAll(t, repo, "external after", paths...)
+	writeFile(t, filepath.Join(repo, supersededPath), "before\n")
+	externalRevert := gitCommitAll(t, repo, "external revert", supersededPath)
 	if externalAfter == baseHead || externalRevert == externalAfter {
 		t.Fatalf("external revert history did not advance as expected: base=%s after=%s revert=%s", baseHead, externalAfter, externalRevert)
 	}
 
-	waitForEventState(t, dbPath, "aaa-slow.txt", "published", 30*time.Second)
-	if !eventStateBecomes(dbPath, "zzz-reverted.txt", "published", 20*time.Second) {
-		dump := sqliteScalar(t, dbPath,
-			"SELECT group_concat(seq || ':' || state || ':' || COALESCE(error, ''), char(10)) FROM capture_events WHERE path = 'zzz-reverted.txt' ORDER BY seq")
+	if !eventStateBecomes(dbPath, handledPath, "published", 30*time.Second) {
+		rows := sqliteScalar(t, dbPath,
+			"SELECT group_concat(seq || ':' || path || ':' || state || ':' || COALESCE(error, ''), char(10)) FROM capture_events ORDER BY seq")
 		decisions := sqliteScalar(t, dbPath,
-			"SELECT group_concat(kind || ':' || COALESCE(reason, ''), char(10)) FROM decision_records WHERE path = 'zzz-reverted.txt' ORDER BY id")
-		t.Fatalf("zzz-reverted.txt did not publish after restart\nrows:\n%s\ndecisions:\n%s", dump, decisions)
+			"SELECT group_concat(kind || ':' || COALESCE(path, '') || ':' || COALESCE(reason, ''), char(10)) FROM decision_records ORDER BY id")
+		journals := sqliteScalar(t, dbPath,
+			"SELECT group_concat(id || ':' || phase || ':' || source_head || ':' || target_commit_oid, char(10)) FROM self_publications ORDER BY id")
+		checkpoints := sqliteScalar(t, dbPath,
+			"SELECT group_concat(id || ':' || phase || ':' || reason, char(10)) FROM checkpoints ORDER BY seq")
+		t.Fatalf("%s did not publish\nrows:\n%s\ndecisions:\n%s\njournals:\n%s\ncheckpoints:\n%s",
+			handledPath, rows, decisions, journals, checkpoints)
 	}
-	waitForDecision(t, dbPath, "zzz-reverted.txt", "superseded_external", "superseded_external_current_head_matches_captured_before_state", 8*time.Second)
+	if !eventStateBecomes(dbPath, supersededPath, "published", 20*time.Second) {
+		dump := sqliteScalar(t, dbPath,
+			fmt.Sprintf("SELECT group_concat(seq || ':' || state || ':' || COALESCE(error, ''), char(10)) FROM capture_events WHERE path = %s ORDER BY seq", sqliteQuote(supersededPath)))
+		decisions := sqliteScalar(t, dbPath,
+			fmt.Sprintf("SELECT group_concat(kind || ':' || COALESCE(reason, ''), char(10)) FROM decision_records WHERE path = %s ORDER BY id", sqliteQuote(supersededPath)))
+		t.Fatalf("%s did not publish after restart\nrows:\n%s\ndecisions:\n%s", supersededPath, dump, decisions)
+	}
+	waitForDecision(t, dbPath, handledPath, "handled_external", "already_published_after_cas_exhaustion", 8*time.Second)
+	waitForDecision(t, dbPath, supersededPath, "superseded_external", "superseded_external_current_head_matches_captured_before_state", 8*time.Second)
 
-	if out, err := runGit(repo, "cat-file", "-e", "HEAD:zzz-reverted.txt"); err != nil {
+	if out, err := runGit(repo, "cat-file", "-e", "HEAD:"+supersededPath); err != nil {
 		t.Fatalf("target missing after superseded replay: %v\n%s", err, out)
 	}
-	if got := runGitOK(t, repo, "show", "HEAD:zzz-reverted.txt"); got != "before\n" {
+	if got := runGitOK(t, repo, "show", "HEAD:"+supersededPath); got != "before\n" {
 		t.Fatalf("target content=%q want before-state", got)
 	}
 	if count := strings.TrimSpace(runGitOK(t, repo, "rev-list", "--count", "HEAD")); count != "4" {
@@ -322,7 +362,7 @@ done
 		t.Fatalf("commit count=%s want 4 (seed + baseline + external after/revert only)\nlog:\n%s", count, log)
 	}
 
-	events := runAcd(t, ctx, env, "events", "--repo", repo, "--path", "zzz-reverted.txt", "--json")
+	events := runAcd(t, ctx, env, "events", "--repo", repo, "--path", supersededPath, "--json")
 	if events.ExitCode != 0 {
 		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)
 	}
@@ -393,11 +433,17 @@ func TestExplainableUX_EventsWatchStreamsAppendedDecisions(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	cursor := sqliteScalar(t, dbPath, "SELECT COALESCE(MAX(id), 0) FROM decision_records")
+	rejected := runAcd(t, ctx, env,
+		"events", "--repo", repo, "--watch", "--since", cursor, "--json")
+	if rejected.ExitCode != 2 || !strings.Contains(rejected.Stdout, "--watch does not support --json") {
+		t.Fatalf("events --watch --json exit=%d, want invalid input\nstdout=%s\nstderr=%s",
+			rejected.ExitCode, rejected.Stdout, rejected.Stderr)
+	}
 
 	watchCtx, stopWatch := context.WithCancel(ctx)
 	defer stopWatch()
 	cmd := exec.CommandContext(watchCtx, buildAcdBinary(t),
-		"events", "--repo", repo, "--watch", "--interval", "50ms", "--since", cursor, "--json")
+		"events", "--repo", repo, "--watch", "--interval", "50ms", "--since", cursor)
 	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -429,7 +475,7 @@ VALUES (%f, 'blocked', 'watch.txt', 'before-state mismatch', 'blocked_conflict',
 	for {
 		select {
 		case line := <-lines:
-			if strings.Contains(line, `"kind":"blocked"`) && strings.Contains(line, `"path":"watch.txt"`) {
+			if strings.Contains(line, "blocked") && strings.Contains(line, "watch.txt") {
 				stopWatch()
 				_ = cmd.Wait()
 				<-scanDone

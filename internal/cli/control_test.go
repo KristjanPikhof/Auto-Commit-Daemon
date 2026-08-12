@@ -5,20 +5,48 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+func makeProtectedControlRepoStateDB(t *testing.T) (repoDir, stateDB string, db *state.DB) {
+	t.Helper()
+	repoDir, stateDB, db = makeRepoStateDB(t)
+	if err := state.MetaSetMany(context.Background(), db, map[string]string{
+		daemon.MetaKeyProtectionObservationEpoch: "1",
+		daemon.MetaKeyProtectionCoveredEpoch:     "1",
+		daemon.MetaKeyProtectionCheckpointID:     "cp-1700000000000-0123456789abcdef",
+		daemon.MetaKeyProtectionComplete:         "true",
+	}); err != nil {
+		t.Fatalf("seed protected control projection: %v", err)
+	}
+	return repoDir, stateDB, db
+}
+
+func registerProtectedControlRepo(t *testing.T, roots paths.Roots, repoDir string) {
+	t.Helper()
+	wt, err := git.ResolveWorktree(context.Background(), repoDir)
+	if err != nil {
+		t.Fatalf("resolve protected control worktree: %v", err)
+	}
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		_, registerErr := registry.RegisterResolvedRepo(wt, "", time.Now().Unix())
+		return registerErr
+	}); err != nil {
+		t.Fatalf("register protected control worktree: %v", err)
+	}
+}
 
 func TestControlBareUnregisteredIsReadOnly(t *testing.T) {
 	_ = withIsolatedHome(t)
@@ -41,13 +69,44 @@ func TestControlBareUnregisteredIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestControlBareUncutDisabledRepositoryRecommendsSetup(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, stateDB, db := makeRepoStateDB(t)
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		hash, err := paths.RepoHash(repo)
+		if err != nil {
+			return err
+		}
+		registry.UpsertRepo(repo, hash, stateDB, "", time.Now().Unix())
+		result := registry.DisableRepo(central.RepoRemovalTarget{Path: repo, StateDB: stateDB}, time.Now().Unix())
+		if result.NotFound {
+			return errors.New("registered repository was not found")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runControlStatus(context.Background(), &out, repo, true); err != nil {
+		t.Fatalf("runControlStatus: %v", err)
+	}
+	got := decodeControlResult(t, out.Bytes())
+	if got.Health != controlHealthOff || got.NextAction != "Run `acd setup` to upgrade and enable protection." {
+		t.Fatalf("uncut disabled status=%+v", got)
+	}
+}
+
 func TestControlBareNonRepoReturnsClassification(t *testing.T) {
 	_ = withIsolatedHome(t)
 	nonRepo := t.TempDir()
 
 	var out bytes.Buffer
-	if err := runControlStatus(context.Background(), &out, nonRepo, true); err != nil {
-		t.Fatalf("runControlStatus: %v", err)
+	if err := runControlStatus(context.Background(), &out, nonRepo, true); ExitCode(err) != ExitActionRequired {
+		t.Fatalf("runControlStatus exit=%d err=%v", ExitCode(err), err)
 	}
 	got := decodeControlResult(t, out.Bytes())
 	if got.OK || got.Health != controlHealthNotRepo || got.NextAction == "" {
@@ -58,8 +117,8 @@ func TestControlBareNonRepoReturnsClassification(t *testing.T) {
 func TestControlBareFreshHeartbeatWithDeadPIDNeedsAttention(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	repo, stateDB, db := makeRepoStateDB(t)
-	registerRepo(t, roots, repo, stateDB, "")
+	repo, _, db := makeProtectedControlRepoStateDB(t)
+	registerProtectedControlRepo(t, roots, repo)
 	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
 		PID:         999_999_999,
 		Mode:        "running",
@@ -73,8 +132,8 @@ func TestControlBareFreshHeartbeatWithDeadPIDNeedsAttention(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runControlStatus(ctx, &out, repo, true); err != nil {
-		t.Fatalf("runControlStatus: %v", err)
+	if err := runControlStatus(ctx, &out, repo, true); ExitCode(err) != ExitActionRequired {
+		t.Fatalf("runControlStatus exit=%d err=%v", ExitCode(err), err)
 	}
 	got := decodeControlResult(t, out.Bytes())
 	if got.OK || got.Health != controlHealthNeedsAttention || got.NextAction != "Run `acd on` to start it." {
@@ -97,11 +156,65 @@ func TestApplyControlStatusRepeatedReplayErrorNeedsAttention(t *testing.T) {
 	}
 }
 
+func TestApplyControlStatusIncompleteCheckpointNeedsAttention(t *testing.T) {
+	status := statusReport{
+		Daemon:                        "running",
+		PID:                           os.Getpid(),
+		CheckpointProtectionAvailable: true,
+		ObservationEpoch:              7,
+		CoveredEpoch:                  6,
+	}
+	result := controlResult{OK: true, Health: controlHealthHealthy}
+
+	applyControlStatus(&result, status)
+
+	if result.OK || result.Health != controlHealthNeedsAttention || result.Protected {
+		t.Fatalf("incomplete checkpoint result=%+v", result)
+	}
+	if !strings.Contains(result.NextAction, "acd doctor") {
+		t.Fatalf("next action=%q", result.NextAction)
+	}
+}
+
+func TestApplyControlStatusManualPauseOutranksIncompleteCheckpoint(t *testing.T) {
+	status := statusReport{
+		Daemon:                        "running",
+		PID:                           os.Getpid(),
+		Paused:                        true,
+		Pause:                         &pauseInfo{Source: "manual", Reason: "repo surgery"},
+		CheckpointProtectionAvailable: true,
+		ObservationEpoch:              7,
+		CoveredEpoch:                  6,
+	}
+	result := controlResult{OK: true, Health: controlHealthHealthy}
+
+	applyControlStatus(&result, status)
+
+	if result.OK || result.Health != controlHealthNeedsAttention ||
+		!strings.Contains(result.Summary, "paused") ||
+		!strings.Contains(result.NextAction, "acd status") {
+		t.Fatalf("paused incomplete-checkpoint result=%+v", result)
+	}
+}
+
+func TestEnvelopeFromControlPreservesWorker(t *testing.T) {
+	want := controlResult{Daemon: "running", Health: controlHealthHealthy}
+
+	envelope := envelopeFromControl(want)
+	data, ok := envelope.Data.(productStatusData)
+	if !ok {
+		t.Fatalf("status data type=%T, want productStatusData", envelope.Data)
+	}
+	if data.Worker != want.Daemon {
+		t.Fatalf("worker=%q, want %q", data.Worker, want.Daemon)
+	}
+}
+
 func TestControlBareIgnoresHistoricalInactiveTerminalEvents(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	repo, stateDB, db := makeRepoStateDB(t)
-	registerRepo(t, roots, repo, stateDB, "")
+	repo, _, db := makeProtectedControlRepoStateDB(t)
+	registerProtectedControlRepo(t, roots, repo)
 	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
 		PID:              os.Getpid(),
 		Mode:             "running",
@@ -171,8 +284,8 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 		t.Run(terminalState, func(t *testing.T) {
 			roots := withIsolatedHome(t)
 			ctx := context.Background()
-			repo, stateDB, db := makeRepoStateDB(t)
-			registerRepo(t, roots, repo, stateDB, "")
+			repo, _, db := makeProtectedControlRepoStateDB(t)
+			registerProtectedControlRepo(t, roots, repo)
 			if err := state.SaveDaemonState(ctx, db, state.DaemonState{
 				PID:              os.Getpid(),
 				Mode:             "running",
@@ -207,11 +320,11 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 			}
 
 			var out bytes.Buffer
-			if err := runControlStatus(ctx, &out, repo, true); err != nil {
-				t.Fatalf("runControlStatus: %v", err)
+			if err := runControlStatus(ctx, &out, repo, true); ExitCode(err) != ExitActionRequired {
+				t.Fatalf("runControlStatus exit=%d err=%v", ExitCode(err), err)
 			}
 			got := decodeControlResult(t, out.Bytes())
-			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "terminal replay") {
+			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "blocked publication") {
 				t.Fatalf("active tail terminal event was not surfaced: %+v", got)
 			}
 		})
@@ -221,7 +334,7 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 func TestControlOnReturnsErrorAfterRenderingUnhealthyResult(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	repo, stateDB, db := makeRepoStateDB(t)
+	repo, stateDB, db := makeProtectedControlRepoStateDB(t)
 	registerRepo(t, roots, repo, stateDB, "")
 	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
 		PID:              os.Getpid(),
@@ -273,15 +386,11 @@ func TestControlOnReturnsErrorAfterRenderingUnhealthyResult(t *testing.T) {
 
 	var out bytes.Buffer
 	err = runControlOn(ctx, &out, repo, true)
-	if err == nil || !strings.Contains(err.Error(), "repository remains unhealthy") {
-		t.Fatalf("runControlOn err=%v want unhealthy result", err)
+	if ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "setup") {
+		t.Fatalf("runControlOn exit=%d err=%v want setup-required result", ExitCode(err), err)
 	}
-	got := decodeControlResult(t, out.Bytes())
-	if got.OK || got.Command != "on" || got.Health != controlHealthNeedsAttention {
-		t.Fatalf("unhealthy diagnostic was not rendered: %+v", got)
-	}
-	if spawnCount != 1 {
-		t.Fatalf("spawn_count=%d want=1", spawnCount)
+	if out.Len() != 0 || spawnCount != 0 {
+		t.Fatalf("v19 on mutated before cutover: output=%q spawn_count=%d", out.String(), spawnCount)
 	}
 }
 
@@ -348,14 +457,14 @@ func TestApplyControlStatusRewindGraceDoesNotHideRecoveryBlockers(t *testing.T) 
 			mutate: func(status *statusReport) {
 				status.BackpressurePaused = true
 			},
-			want: "backpressure",
+			want: "durable storage",
 		},
 		{
 			name: "terminal barrier",
 			mutate: func(status *statusReport) {
 				status.ActiveBarriers = 1
 			},
-			want: "terminal replay",
+			want: "blocked publication",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -406,8 +515,8 @@ func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T)
 		want   string
 	}{
 		{name: "pause", mutate: func(s *statusReport) { s.Paused = true }, want: "paused"},
-		{name: "backpressure", mutate: func(s *statusReport) { s.BackpressurePaused = true }, want: "backpressure"},
-		{name: "barrier", mutate: func(s *statusReport) { s.ActiveBarriers = 1 }, want: "terminal replay"},
+		{name: "backpressure", mutate: func(s *statusReport) { s.BackpressurePaused = true }, want: "durable storage"},
+		{name: "barrier", mutate: func(s *statusReport) { s.ActiveBarriers = 1 }, want: "blocked publication"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status := statusReport{
@@ -426,180 +535,42 @@ func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T)
 }
 
 func TestControlOnRegistersStartsAndIsIdempotent(t *testing.T) {
-	roots := withIsolatedHome(t)
+	withIsolatedHome(t)
 	repo := makeStartRepo(t)
-	spawnCount, restoreSpawn := installFakeSpawn(t, os.Getpid())
-	t.Cleanup(restoreSpawn)
-
-	var firstOut bytes.Buffer
-	if err := runControlOn(context.Background(), &firstOut, repo, true); err != nil {
-		t.Fatalf("first runControlOn: %v", err)
+	var setupRequired bytes.Buffer
+	if err := runControlOn(context.Background(), &setupRequired, repo, true); ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "setup") {
+		t.Fatalf("uncut repository on exit=%d err=%v", ExitCode(err), err)
 	}
-	first := decodeControlResult(t, firstOut.Bytes())
-	if !first.OK || first.Health != controlHealthHealthy || !first.Registered || !first.Enabled || !first.Changed {
-		t.Fatalf("unexpected first on result: %+v", first)
-	}
-	if want := []string{"registered", "started"}; !reflect.DeepEqual(first.Actions, want) {
-		t.Fatalf("actions=%v want=%v", first.Actions, want)
-	}
-	if !first.StatePreserved || spawnCount.Load() != 1 {
-		t.Fatalf("state_preserved=%v spawn_count=%d", first.StatePreserved, spawnCount.Load())
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		t.Fatalf("load registry: %v", err)
-	}
-	if rec, ok := reg.FindRepo(repo, state.DBPathFromGitDir(filepath.Join(repo, ".git"))); !ok || rec.LifecycleDisabled() {
-		t.Fatalf("on did not leave enabled registry row: ok=%v rec=%+v", ok, rec)
-	}
-
-	var secondOut bytes.Buffer
-	if err := runControlOn(context.Background(), &secondOut, repo, true); err != nil {
-		t.Fatalf("second runControlOn: %v", err)
-	}
-	second := decodeControlResult(t, secondOut.Bytes())
-	if second.Changed || len(second.Actions) != 0 || second.Health != controlHealthHealthy {
-		t.Fatalf("second on was not idempotent: %+v", second)
-	}
-	if spawnCount.Load() != 1 {
-		t.Fatalf("spawn_count=%d want=1", spawnCount.Load())
-	}
-
-	var thirdOut bytes.Buffer
-	if err := runControlOn(context.Background(), &thirdOut, repo, true); err != nil {
-		t.Fatalf("third runControlOn: %v", err)
-	}
-	if secondOut.String() != thirdOut.String() {
-		t.Fatalf("idempotent JSON changed\nsecond=%s\nthird=%s", secondOut.String(), thirdOut.String())
+	if setupRequired.Len() != 0 {
+		t.Fatalf("uncut repository on emitted success output: %q", setupRequired.String())
 	}
 }
 
 func TestControlOnTreatsRewindGraceAsWaiting(t *testing.T) {
-	roots := withIsolatedHome(t)
+	withIsolatedHome(t)
 	repo := makeStartRepo(t)
-	_, restoreSpawn := installFakeSpawn(t, os.Getpid())
-	t.Cleanup(restoreSpawn)
-
-	if err := runControlOn(context.Background(), io.Discard, repo, true); err != nil {
-		t.Fatalf("seed runControlOn: %v", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		t.Fatalf("load registry: %v", err)
-	}
-	rec, ok := reg.FindRepo(repo, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
-	if !ok {
-		t.Fatal("registered repo missing")
-	}
-	db, err := state.Open(context.Background(), rec.StateDB)
-	if err != nil {
-		t.Fatalf("open state DB: %v", err)
-	}
-	until := time.Now().UTC().Add(time.Minute).Format(time.RFC3339)
-	if err := state.MetaSet(context.Background(), db, replayPausedUntilMetaKey, until); err != nil {
-		db.Close()
-		t.Fatalf("seed rewind grace: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close state DB: %v", err)
-	}
-
-	var out bytes.Buffer
-	if err := runControlOn(context.Background(), &out, repo, true); err != nil {
-		t.Fatalf("runControlOn during rewind grace: %v\n%s", err, out.String())
-	}
-	got := decodeControlResult(t, out.Bytes())
-	if !got.OK || got.Health != controlHealthWaiting || got.Changed {
-		t.Fatalf("unexpected rewind-grace control result: %+v", got)
+	if err := runControlOn(context.Background(), io.Discard, repo, true); ExitCode(err) != ExitActionRequired {
+		t.Fatalf("uncut repository on exit=%d err=%v", ExitCode(err), err)
 	}
 }
 
 func TestControlOffDisablesStopsPreservesAndIsIdempotent(t *testing.T) {
-	roots := withIsolatedHome(t)
+	withIsolatedHome(t)
 	repo := makeStartRepo(t)
-	spawnCount, restoreSpawn := installFakeSpawn(t, os.Getpid())
-	t.Cleanup(restoreSpawn)
-
-	if err := runControlOn(context.Background(), io.Discard, repo, true); err != nil {
-		t.Fatalf("seed on: %v", err)
+	var offOut bytes.Buffer
+	if err := runControlOff(context.Background(), &offOut, repo, true); err != nil {
+		t.Fatalf("off unconfigured repository: %v", err)
 	}
-
-	previousStop := repoDisableStopOneRepo
-	var respawnCount *atomic.Int32
-	var restoreRespawn func()
-	t.Cleanup(func() {
-		if restoreRespawn != nil {
-			restoreRespawn()
-		}
-	})
-	repoDisableStopOneRepo = func(ctx context.Context, repoPath, sessionID string, force bool) (stopRepoResult, error) {
-		db, err := state.Open(ctx, state.DBPathFromGitDir(filepath.Join(repoPath, ".git")))
-		if err != nil {
-			return stopRepoResult{}, err
-		}
-		defer db.Close()
-		if err := state.SaveDaemonState(ctx, db, state.DaemonState{Mode: "stopped", UpdatedTS: nowFloat()}); err != nil {
-			return stopRepoResult{}, err
-		}
-		// A stopped daemon releases its canonical writer lock. Replace the
-		// first fake owner with a fresh fake spawn for the later re-enable.
-		restoreSpawn()
-		respawnCount, restoreRespawn = installFakeSpawn(t, os.Getpid())
-		return stopRepoResult{Repo: repoPath, Stopped: true, Force: force, DaemonPID: os.Getpid()}, nil
-	}
-	t.Cleanup(func() { repoDisableStopOneRepo = previousStop })
-
-	var firstOut bytes.Buffer
-	if err := runControlOff(context.Background(), &firstOut, repo, true); err != nil {
-		t.Fatalf("first runControlOff: %v", err)
-	}
-	first := decodeControlResult(t, firstOut.Bytes())
-	if !first.OK || first.Health != controlHealthOff || first.Enabled || !first.Registered || !first.Changed || !first.StatePreserved {
-		t.Fatalf("unexpected first off result: %+v", first)
-	}
-	if want := []string{"disabled", "stopped"}; !reflect.DeepEqual(first.Actions, want) {
-		t.Fatalf("actions=%v want=%v", first.Actions, want)
-	}
-	if _, err := os.Stat(state.DBPathFromGitDir(filepath.Join(repo, ".git"))); err != nil {
-		t.Fatalf("off did not preserve state DB: %v", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		t.Fatalf("load registry: %v", err)
-	}
-	rec, ok := reg.FindRepo(repo, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
-	if !ok || !rec.LifecycleDisabled() {
-		t.Fatalf("off did not leave disabled registry row: ok=%v rec=%+v", ok, rec)
-	}
-
-	var secondOut bytes.Buffer
-	if err := runControlOff(context.Background(), &secondOut, repo, true); err != nil {
-		t.Fatalf("second runControlOff: %v", err)
-	}
-	second := decodeControlResult(t, secondOut.Bytes())
-	if second.Changed || len(second.Actions) != 0 || second.Health != controlHealthOff {
-		t.Fatalf("second off was not idempotent: %+v", second)
-	}
-
-	var onOut bytes.Buffer
-	if err := runControlOn(context.Background(), &onOut, repo, true); err != nil {
-		t.Fatalf("runControlOn after off: %v", err)
-	}
-	on := decodeControlResult(t, onOut.Bytes())
-	if want := []string{"enabled", "started"}; !reflect.DeepEqual(on.Actions, want) {
-		t.Fatalf("on actions=%v want=%v", on.Actions, want)
-	}
-	if !on.Enabled || on.Health != controlHealthHealthy ||
-		spawnCount.Load() != 1 || respawnCount == nil || respawnCount.Load() != 1 {
-		t.Fatalf("unexpected re-enabled result=%+v initial_spawns=%d respawns=%v",
-			on, spawnCount.Load(), respawnCount)
+	off := decodeControlResult(t, offOut.Bytes())
+	if off.Health != controlHealthOff || off.Changed || len(off.Actions) != 0 {
+		t.Fatalf("unconfigured off was not idempotent: %+v", off)
 	}
 }
 
 func TestControlOnRestartsFreshLookingDeadDaemon(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	repo, stateDB, db := makeRepoStateDB(t)
+	repo, stateDB, db := makeProtectedControlRepoStateDB(t)
 	registerRepo(t, roots, repo, stateDB, "")
 	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
 		PID:         999_999_999,
@@ -612,19 +583,9 @@ func TestControlOnRestartsFreshLookingDeadDaemon(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close state DB: %v", err)
 	}
-	spawnCount, restoreSpawn := installFakeSpawn(t, os.Getpid())
-	t.Cleanup(restoreSpawn)
-
-	var out bytes.Buffer
-	if err := runControlOn(ctx, &out, repo, true); err != nil {
-		t.Fatalf("runControlOn: %v", err)
-	}
-	got := decodeControlResult(t, out.Bytes())
-	if want := []string{"started"}; !reflect.DeepEqual(got.Actions, want) {
-		t.Fatalf("actions=%v want=%v", got.Actions, want)
-	}
-	if !got.Changed || got.Health != controlHealthHealthy || spawnCount.Load() != 1 {
-		t.Fatalf("unexpected restart result=%+v spawn_count=%d", got, spawnCount.Load())
+	var setupRequired bytes.Buffer
+	if err := runControlOn(ctx, &setupRequired, repo, true); ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "setup") {
+		t.Fatalf("v19 repository on exit=%d err=%v", ExitCode(err), err)
 	}
 }
 
@@ -637,16 +598,16 @@ func TestControlOffUnknownRepoRecordsDurableOptOut(t *testing.T) {
 		t.Fatalf("runControlOff: %v", err)
 	}
 	got := decodeControlResult(t, out.Bytes())
-	if want := []string{"registered", "disabled"}; !reflect.DeepEqual(got.Actions, want) {
-		t.Fatalf("actions=%v want=%v", got.Actions, want)
+	if got.Changed || len(got.Actions) != 0 || got.Health != controlHealthOff {
+		t.Fatalf("unexpected idempotent off result: %+v", got)
 	}
 	reg, err := central.Load(roots)
 	if err != nil {
 		t.Fatalf("load registry: %v", err)
 	}
 	rec, ok := reg.FindRepo(repo, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
-	if !ok || !rec.LifecycleDisabled() {
-		t.Fatalf("unknown off was not durable: ok=%v rec=%+v", ok, rec)
+	if ok {
+		t.Fatalf("off registered an unknown repository: rec=%+v", rec)
 	}
 }
 
@@ -664,7 +625,7 @@ func TestControlOffUnknownDetachedRepoRecordsDurableOptOut(t *testing.T) {
 		t.Fatalf("runControlOff detached: %v", err)
 	}
 	got := decodeControlResult(t, out.Bytes())
-	if got.Health != controlHealthOff || !reflect.DeepEqual(got.Actions, []string{"registered", "disabled"}) {
+	if got.Health != controlHealthOff || got.Changed || len(got.Actions) != 0 {
 		t.Fatalf("unexpected detached off result: %+v", got)
 	}
 	reg, err := central.Load(roots)
@@ -672,15 +633,15 @@ func TestControlOffUnknownDetachedRepoRecordsDurableOptOut(t *testing.T) {
 		t.Fatalf("load registry: %v", err)
 	}
 	rec, ok := reg.FindRepo(repo, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
-	if !ok || !rec.LifecycleDisabled() {
-		t.Fatalf("detached off was not durable: ok=%v rec=%+v", ok, rec)
+	if ok {
+		t.Fatalf("detached off registered an unknown repository: rec=%+v", rec)
 	}
 	if _, err := os.Stat(state.DBPathFromGitDir(filepath.Join(repo, ".git"))); !os.IsNotExist(err) {
 		t.Fatalf("detached off should not initialize state DB: err=%v", err)
 	}
 }
 
-func TestControlBareHumanHasOneHealthAndNextLine(t *testing.T) {
+func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	_ = withIsolatedHome(t)
 	repo := makeStartRepo(t)
 
@@ -688,11 +649,10 @@ func TestControlBareHumanHasOneHealthAndNextLine(t *testing.T) {
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
 		t.Fatalf("runControlStatus: %v", err)
 	}
-	if got := strings.Count(out.String(), "Health:"); got != 1 {
-		t.Fatalf("Health line count=%d\n%s", got, out.String())
-	}
-	if got := strings.Count(out.String(), "Next:"); got != 1 {
-		t.Fatalf("Next line count=%d\n%s", got, out.String())
+	for _, line := range []string{"Enabled:", "Protected:", "Published to Git:", "Action required:", "Next:"} {
+		if got := strings.Count(out.String(), line); got != 1 {
+			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
+		}
 	}
 }
 
@@ -715,12 +675,47 @@ func TestControlRootBareUsesReadOnlyHealth(t *testing.T) {
 
 func decodeControlResult(t *testing.T, body []byte) controlResult {
 	t.Helper()
-	var got controlResult
-	if err := json.Unmarshal(body, &got); err != nil {
+	var envelope struct {
+		OK         bool              `json:"ok"`
+		State      productState      `json:"state"`
+		Changed    bool              `json:"changed"`
+		Actions    []productAction   `json:"actions"`
+		NextAction *string           `json:"next_action"`
+		Data       productStatusData `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
 		t.Fatalf("decode control result: %v\n%s", err, body)
 	}
-	if got.Actions == nil {
+	if envelope.Actions == nil {
 		t.Fatalf("actions must encode as [] rather than null: %s", body)
+	}
+	health := string(envelope.State)
+	if envelope.State == productStateProtected {
+		health = controlHealthHealthy
+	} else if envelope.State == productStateNeedsAction {
+		health = controlHealthNeedsAttention
+	}
+	if envelope.Data.Summary == "The current directory is not inside a Git worktree." {
+		health = controlHealthNotRepo
+	}
+	actions := make([]string, 0, len(envelope.Actions))
+	for _, action := range envelope.Actions {
+		actions = append(actions, action.Kind)
+	}
+	next := "No action needed."
+	if envelope.NextAction != nil {
+		next = *envelope.NextAction
+	}
+	got := controlResult{
+		OK:      envelope.State != productStateNeedsAction && health != controlHealthNotRepo,
+		Command: envelope.Data.Command, Repo: envelope.Data.Repo,
+		Health: health, Summary: envelope.Data.Summary, NextAction: next,
+		Registered: envelope.Data.Registered, Enabled: envelope.Data.Enabled,
+		PendingEvents: envelope.Data.PendingEvents, BlockedEvents: envelope.Data.BlockedEvents,
+		Changed: envelope.Changed, Actions: actions,
+		StatePreserved: envelope.Data.StatePreserved,
+		Protected:      envelope.Data.Protected, Published: envelope.Data.Published,
+		CheckpointID: envelope.Data.CheckpointID,
 	}
 	return got
 }

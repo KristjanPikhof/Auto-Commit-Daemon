@@ -1,45 +1,19 @@
-# acd adapter: claude-code
+# Claude Code integration
 
-## Install
+Install or update transactionally:
 
-1. Install acd: `curl -fsSL https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh | sh`
-2. Generate snippet: `acd setup claude-code`
-3. Merge the printed JSON into `~/.claude/settings.json` under the `hooks` key
+~~~bash
+acd setup --integrations=claude-code
+~~~
 
-   **Overwrite warning:** if you redirect `acd setup claude-code --raw` straight
-   to `~/.claude/settings.json` with `>`, the entire file is replaced. If you
-   have other settings or non-acd hooks in that file, back it up first and merge
-   the acd JSON block in manually rather than using `>`.
+ACD structurally merges its owned hook entries into
+`~/.claude/settings.json` and records their signatures separately. Unrelated
+settings and hooks remain untouched. A modified owned entry blocks a later
+overwrite or removal until a new plan is explicitly approved.
 
-4. Restart Claude Code
+The integration supplies session start/end, tool activity, and logical-boundary
+hints. Filesystem watching and complete polling remain the protection path;
+Claude hooks are optional and their absence never leaves edits uncaptured.
 
-Run `acd doctor` after setup. It compares the installed hook with the current
-template and tells you when to regenerate the ACD block with
-`acd setup claude-code`.
-
-## Verify
-
-- Open Claude Code in any git repo
-- From another shell, run `acd status`
-- The output should show one client with `harness=claude-code`
-
-`PreToolUse` and `PostToolUse` run idempotent `acd start` before `acd wake`,
-so later tool activity can recover if you manually ran `acd stop` while the
-Claude Code session stayed open. `SessionEnd` still deregisters the session
-with `acd stop --session-id`.
-
-`acd wake` refreshes the heartbeat and nudges capture/replay, but it does not
-bypass `ACD_INTENT_MIN_PENDING` or `ACD_INTENT_MAX_PENDING_AGE`. The `Stop`
-hook uses `acd flush --logical` for the prompt-end commit boundary. `acd doctor`
-reports template drift when that wiring is missing.
-
-Repo autodiscovery is enabled by default. If you disable it with
-`repo_lifecycle.autodiscovery` in `~/.config/acd/config.json` or with
-`ACD_REPO_AUTODISCOVERY=disabled`, Claude Code hooks in unregistered repos skip
-without creating `.git/acd`. Run `acd repo init` in each repo you want Claude
-Code to manage, or temporarily set `ACD_REPO_AUTODISCOVERY=enabled` before
-starting the session.
-
-## Uninstall
-
-See [uninstall.md](uninstall.md).
+Use `acd doctor` to inspect integration drift. Use `acd uninstall --dry-run`
+before removing verified owned entries.

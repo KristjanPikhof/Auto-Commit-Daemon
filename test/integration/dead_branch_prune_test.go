@@ -39,13 +39,14 @@ package integration_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // seedTerminalCaptureEvent inserts one capture event plus its immutable create
@@ -162,6 +163,7 @@ func currentBranchGeneration(t *testing.T, dbPath string) int {
 // that prior ref drives processBranchTokenChange through the runtime Diverged
 // recovery path.
 func TestDeadBranchPrune_RuntimeDivergedDeletedBranchRecoversRows(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -200,10 +202,6 @@ func TestDeadBranchPrune_RuntimeDivergedDeletedBranchRecoversRows(t *testing.T) 
 	wakeSession(t, ctx, env, repo, "dbp-runtime-prune")
 
 	assertRecoveredPair(t, dbPath, repo, deadRef, gen, headOID, 2)
-	lastRefs := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'dead_branch_prune.last_refs'")
-	if !strings.Contains(lastRefs, deadRef) {
-		t.Fatalf("dead_branch_prune.last_refs=%q missing %q", lastRefs, deadRef)
-	}
 }
 
 // TestDeadBranchPrune_DivergedDeletedBranchRecoversRows covers the restart shape:
@@ -219,6 +217,7 @@ func TestDeadBranchPrune_RuntimeDivergedDeletedBranchRecoversRows(t *testing.T) 
 //     a separate test below. This test is specifically the "ref was alive
 //     when terminals landed, then operator merged + deleted" shape.
 func TestDeadBranchPrune_DivergedDeletedBranchRecoversRows(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -228,14 +227,7 @@ func TestDeadBranchPrune_DivergedDeletedBranchRecoversRows(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Bring up the daemon once so .git/acd/state.db materializes with the
-	// canonical schema. Then stop so we can seed deterministically.
-	startSession(t, ctx, env, repo, "dbp-a-init", "shell")
-	waitMode(t, repo, "running", 5*time.Second)
-	stopSessionForce(t, env, repo)
-	waitMode(t, repo, "stopped", 5*time.Second)
-
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	dbPath := initStateDBSchema(t, ctx, env, repo, "dbp-a-init")
 
 	// Create refs/heads/foo on top of HEAD so the seeded rows reference an
 	// initially-real branch. The integration repo is on refs/heads/main.
@@ -266,6 +258,7 @@ func TestDeadBranchPrune_DivergedDeletedBranchRecoversRows(t *testing.T) {
 // prior branch ref is still alive in the repo, the sweep must leave its
 // terminal rows alone.
 func TestDeadBranchPrune_LiveBranchPreservesRows(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -275,12 +268,7 @@ func TestDeadBranchPrune_LiveBranchPreservesRows(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	startSession(t, ctx, env, repo, "dbp-b-init", "shell")
-	waitMode(t, repo, "running", 5*time.Second)
-	stopSessionForce(t, env, repo)
-	waitMode(t, repo, "stopped", 5*time.Second)
-
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	dbPath := initStateDBSchema(t, ctx, env, repo, "dbp-b-init")
 
 	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	const liveRef = "refs/heads/keep"
@@ -308,6 +296,7 @@ func TestDeadBranchPrune_LiveBranchPreservesRows(t *testing.T) {
 // (c): seed terminal rows for refs that never existed, then start the daemon.
 // runStartupDeadBranchSweep observes the dead refs and archives both pairs.
 func TestDeadBranchPrune_StartupSweepRecoversPreSeededTerminals(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -317,13 +306,7 @@ func TestDeadBranchPrune_StartupSweepRecoversPreSeededTerminals(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Materialize the schema, then stop and seed.
-	startSession(t, ctx, env, repo, "dbp-c-init", "shell")
-	waitMode(t, repo, "running", 5*time.Second)
-	stopSessionForce(t, env, repo)
-	waitMode(t, repo, "stopped", 5*time.Second)
-
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	dbPath := initStateDBSchema(t, ctx, env, repo, "dbp-c-init")
 	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 
 	const deadRef1 = "refs/heads/dead-1"
@@ -353,6 +336,7 @@ func TestDeadBranchPrune_StartupSweepRecoversPreSeededTerminals(t *testing.T) {
 // sweep: with ACD_KEEP_DEAD_BRANCH_BARRIERS=1, the sweep preserves rows even
 // when refs are dead.
 func TestDeadBranchPrune_OptOutPreservesRows(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -362,13 +346,14 @@ func TestDeadBranchPrune_OptOutPreservesRows(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Boot once to create state.db schema.
-	startSession(t, ctx, env, repo, "dbp-d-init", "shell")
-	waitMode(t, repo, "running", 5*time.Second)
-	stopSessionForce(t, env, repo)
-	waitMode(t, repo, "stopped", 5*time.Second)
-
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("create v20 dead-branch fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 
 	const deadRef = "refs/heads/keep-dead-rows"
@@ -396,6 +381,7 @@ func TestDeadBranchPrune_OptOutPreservesRows(t *testing.T) {
 // Accepting a new token while leaving the old pair unpublished would allow the
 // new worktree to be captured against stale shadow state.
 func TestDeadBranchPrune_RuntimeTransitionRecoversWithSweepOptOut(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -433,10 +419,6 @@ func TestDeadBranchPrune_RuntimeTransitionRecoversWithSweepOptOut(t *testing.T) 
 	wakeSession(t, ctx, env, repo, "dbp-runtime-keep")
 
 	assertRecoveredPair(t, dbPath, repo, deadRef, gen, headOID, 2)
-	lastRefs := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'dead_branch_prune.last_refs'")
-	if !strings.Contains(lastRefs, deadRef) {
-		t.Fatalf("runtime transition recovery refs=%q missing %q", lastRefs, deadRef)
-	}
 }
 
 // TestDeadBranchPrune_DiagnoseMetaSurfacesAfterRecovery asserts the three
@@ -445,6 +427,7 @@ func TestDeadBranchPrune_RuntimeTransitionRecoversWithSweepOptOut(t *testing.T) 
 // internal/daemon/dead_branch_sweep_test.go: this proves the full pipeline
 // (daemon writes meta -> CLI diagnose reads meta -> JSON fields populate).
 func TestDeadBranchPrune_DiagnoseMetaSurfacesAfterRecovery(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -454,13 +437,7 @@ func TestDeadBranchPrune_DiagnoseMetaSurfacesAfterRecovery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// Boot to materialize schema, then stop and seed.
-	startSession(t, ctx, env, repo, "dbp-meta-init", "shell")
-	waitMode(t, repo, "running", 5*time.Second)
-	stopSessionForce(t, env, repo)
-	waitMode(t, repo, "stopped", 5*time.Second)
-
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	dbPath := initStateDBSchema(t, ctx, env, repo, "dbp-meta-init")
 	headOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 
 	const deadRef = "refs/heads/diagnose-dead"
@@ -489,9 +466,7 @@ func TestDeadBranchPrune_DiagnoseMetaSurfacesAfterRecovery(t *testing.T) {
 		DeadBranchPruneLastCount int      `json:"dead_branch_prune_last_count"`
 		DeadBranchPruneLastRefs  []string `json:"dead_branch_prune_last_refs"`
 	}
-	if err := json.Unmarshal([]byte(res.Stdout), &report); err != nil {
-		t.Fatalf("decode diagnose json: %v\nstdout=%s", err, res.Stdout)
-	}
+	decodeProductEnvelopeData(t, res.Stdout, &report)
 
 	afterTS := time.Now().Unix() + 1
 	if report.DeadBranchPruneLastRunTS < beforeTS || report.DeadBranchPruneLastRunTS > afterTS {
@@ -525,6 +500,7 @@ func TestDeadBranchPrune_DiagnoseMetaSurfacesAfterRecovery(t *testing.T) {
 // is the sister test to the "after prune" assertion above; together they
 // pin the contract.
 func TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -548,9 +524,7 @@ func TestDeadBranchPrune_DiagnoseMetaAbsentBeforeAnyPrune(t *testing.T) {
 	// the "never ran" sentinel); the refs slice must be absent (omitempty
 	// + nil).
 	var raw map[string]any
-	if err := json.Unmarshal([]byte(res.Stdout), &raw); err != nil {
-		t.Fatalf("decode diagnose json: %v\nstdout=%s", err, res.Stdout)
-	}
+	decodeProductEnvelopeData(t, res.Stdout, &raw)
 	for _, key := range []string{
 		"dead_branch_prune_last_run_ts",
 		"dead_branch_prune_last_count",

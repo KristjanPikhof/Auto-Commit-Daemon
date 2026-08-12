@@ -68,6 +68,7 @@ type SelfPublicationMember struct {
 // SQLite phase. Members are ordered and included in MembershipDigest.
 type SelfPublication struct {
 	ID               string
+	OperationID      sql.NullString
 	BranchRef        string
 	BranchGeneration int64
 	SourceHead       string
@@ -185,13 +186,21 @@ func PrepareSelfPublication(ctx context.Context, d *DB, publication SelfPublicat
 		ts = nowSeconds()
 	}
 	if _, err := tx.ExecContext(ctx, `
+INSERT INTO operations(
+    id,kind,worktree_id,phase,status,plan_digest,error,created_ts,updated_ts
+) VALUES (?,'self_publication',NULL,?,?,?,'',?,?)`,
+		normalized.OperationID, OperationPrepared, OperationPrepared,
+		normalized.MembershipDigest, ts, ts); err != nil {
+		return false, fmt.Errorf("state: insert self-publication operation: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO self_publications(
-    id, branch_ref, branch_generation, source_head, target_commit_oid,
+    id, operation_id, branch_ref, branch_generation, source_head, target_commit_oid,
     target_tree_oid, membership_digest, member_count, phase, created_ts,
     updated_ts, error, completion_published_ts,
     completion_candidate_status, completion_soft_deadline
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`,
-		normalized.ID, normalized.BranchRef, normalized.BranchGeneration,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`,
+		normalized.ID, normalized.OperationID, normalized.BranchRef, normalized.BranchGeneration,
 		normalized.SourceHead, normalized.TargetCommitOID,
 		normalized.TargetTreeOID, normalized.MembershipDigest,
 		len(normalized.Members), SelfPublicationPrepared, ts, ts,
@@ -425,6 +434,24 @@ WHERE id=? AND phase=?
 	if n != 1 {
 		return false, ErrSelfPublicationIdentityMismatch
 	}
+	if current.OperationID.Valid {
+		res, err = tx.ExecContext(ctx, `
+UPDATE operations SET phase=?,status=?,updated_ts=?,completed_ts=?,error=''
+WHERE id=? AND status IN ('prepared','active')`, SelfPublicationCompleted,
+			OperationCompleted, completion.PublishedTS, completion.PublishedTS,
+			current.OperationID.String)
+		if err != nil {
+			return false, fmt.Errorf("state: complete self-publication operation: %w", err)
+		}
+		n, err = res.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("state: count completed self-publication operation: %w", err)
+		}
+		if n != 1 {
+			return false, fmt.Errorf("%w: completed operations=%d want=1",
+				ErrSelfPublicationOwnershipChanged, n)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("state: commit self-publication completion: %w", err)
 	}
@@ -458,6 +485,27 @@ func RecoverableSelfPublications(ctx context.Context, d *DB, limit int) ([]SelfP
 		limit = 50
 	}
 	return queryRecoverableSelfPublications(ctx, d.readSQL(), limit)
+}
+
+// FirstRecoverableSelfPublicationOutsidePair returns the oldest active crash
+// journal that cannot be reconciled under the supplied branch ownership.
+func FirstRecoverableSelfPublicationOutsidePair(ctx context.Context, d *DB, branchRef string, generation int64) (SelfPublication, bool, error) {
+	if d == nil || branchRef == "" || generation < 0 {
+		return SelfPublication{}, false, errors.New("state: invalid self-publication pair")
+	}
+	var id string
+	err := d.readSQL().QueryRowContext(ctx, `
+SELECT id FROM self_publications
+WHERE phase IN ('prepared','git_applied')
+  AND (branch_ref<>? OR branch_generation<>?)
+ORDER BY created_ts,id LIMIT 1`, branchRef, generation).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SelfPublication{}, false, nil
+	}
+	if err != nil {
+		return SelfPublication{}, false, err
+	}
+	return SelfPublicationByID(ctx, d, id)
 }
 
 // FirstUnknownRecoverableSelfPublication returns the oldest live v18-upgraded
@@ -806,6 +854,28 @@ WHERE id=? AND phase=?
 	if n != 1 {
 		return false, ErrSelfPublicationIdentityMismatch
 	}
+	if current.OperationID.Valid {
+		operationStatus := OperationActive
+		if to == SelfPublicationAbandoned {
+			operationStatus = OperationRolledBack
+		}
+		res, err = tx.ExecContext(ctx, `
+UPDATE operations SET phase=?,status=?,updated_ts=?,completed_ts=?,error=?
+WHERE id=? AND status='prepared'`, to, operationStatus, ts,
+			sql.NullFloat64{Float64: ts, Valid: to == SelfPublicationAbandoned},
+			reason, current.OperationID.String)
+		if err != nil {
+			return false, fmt.Errorf("state: advance self-publication operation: %w", err)
+		}
+		n, err = res.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("state: count self-publication operation transition: %w", err)
+		}
+		if n != 1 {
+			return false, fmt.Errorf("%w: transitioned operations=%d want=1",
+				ErrSelfPublicationOwnershipChanged, n)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("state: commit self-publication transition: %w", err)
 	}
@@ -818,6 +888,11 @@ func normalizeSelfPublication(publication SelfPublication) (SelfPublication, err
 	publication.SourceHead = strings.TrimSpace(publication.SourceHead)
 	publication.TargetCommitOID = strings.TrimSpace(publication.TargetCommitOID)
 	publication.TargetTreeOID = strings.TrimSpace(publication.TargetTreeOID)
+	if !publication.OperationID.Valid {
+		publication.OperationID = sql.NullString{
+			String: selfPublicationOperationID(publication.ID), Valid: true,
+		}
+	}
 	if publication.ID == "" || len(publication.ID) > 128 ||
 		publication.BranchRef == "" || len(publication.BranchRef) > 1024 ||
 		publication.BranchGeneration < 0 ||
@@ -862,6 +937,15 @@ func normalizeSelfPublication(publication SelfPublication) (SelfPublication, err
 		publication.Completion.SoftPublicationDeadline = sql.NullFloat64{}
 	}
 	return publication, nil
+}
+
+func selfPublicationOperationID(publicationID string) string {
+	candidate := "op_" + publicationID
+	if len(candidate) <= 128 {
+		return candidate
+	}
+	digest := sha256.Sum256([]byte(publicationID))
+	return "op_self_publication_" + hex.EncodeToString(digest[:])
 }
 
 func validateSelfPublicationOwnership(
@@ -1155,7 +1239,7 @@ type selfPublicationQueryer interface {
 }
 
 const selfPublicationSelect = `
-SELECT id, branch_ref, branch_generation, source_head, target_commit_oid,
+SELECT id, operation_id, branch_ref, branch_generation, source_head, target_commit_oid,
        target_tree_oid, membership_digest, member_count, phase, created_ts,
        updated_ts, git_applied_ts, completed_ts, abandoned_ts, error,
        completion_published_ts, completion_candidate_status,
@@ -1169,7 +1253,7 @@ func selfPublicationByIDQuery(
 ) (SelfPublication, bool, error) {
 	var publication SelfPublication
 	err := q.QueryRowContext(ctx, selfPublicationSelect+` WHERE id=?`, id).Scan(
-		&publication.ID, &publication.BranchRef,
+		&publication.ID, &publication.OperationID, &publication.BranchRef,
 		&publication.BranchGeneration, &publication.SourceHead,
 		&publication.TargetCommitOID, &publication.TargetTreeOID,
 		&publication.MembershipDigest, &publication.MemberCount,
@@ -1233,7 +1317,7 @@ func queryRecoverableSelfPublications(
 	for rows.Next() {
 		var publication SelfPublication
 		if err := rows.Scan(
-			&publication.ID, &publication.BranchRef,
+			&publication.ID, &publication.OperationID, &publication.BranchRef,
 			&publication.BranchGeneration, &publication.SourceHead,
 			&publication.TargetCommitOID, &publication.TargetTreeOID,
 			&publication.MembershipDigest, &publication.MemberCount,

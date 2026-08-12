@@ -6,17 +6,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 )
 
 func TestApplyRestartEnvironmentUsesSavedRepositorySettings(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo, _, _ := makeRepoStateDB(t)
-	repoHash, err := paths.RepoHash(repo)
+	wt, err := gitpkg.ResolveWorktree(t.Context(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
+	repoHash := central.CanonicalID(wt.Root)
 	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
 		doc.Settings.Global["capture.max_file_bytes"] = json.RawMessage(`"2048"`)
 		doc.Settings.Profiles["large"] = config.Profile{Fields: config.Overrides{

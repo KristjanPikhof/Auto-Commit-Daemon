@@ -7,69 +7,54 @@ import (
 	"testing"
 )
 
-func TestRootHelpIsCompactAndWorkflowGrouped(t *testing.T) {
+func TestRootHelpExposesExactlyTenProductCommands(t *testing.T) {
 	root := newRootCmd()
 	var out, errOut bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&errOut)
 	root.SetArgs([]string{"--help"})
-
 	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("root help: %v", err)
+		t.Fatal(err)
 	}
 	if errOut.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", errOut.String())
+		t.Fatalf("stderr=%q", errOut.String())
 	}
 	got := out.String()
-
-	for _, want := range []string{
-		"Primary controls:",
-		"Observe:",
-		"Support and recovery:",
-		"Advanced:",
-		"Hook protocol (normally managed by acd setup):",
-		"acd              Show one read-only health classification and next action",
-		"acd on",
-		"acd off",
-		"acd settings     Inspect, test, and safely activate configuration",
-		"acd status",
-		"acd setup",
-		"acd logs",
-		"acd fix",
-		"acd repo",
-		"acd start / stop / wake / touch / flush",
-		"acd diagnose",
-		"acd doctor",
-		"acd pause",
-		"acd resume",
-		"--repo string",
-		"--json",
-		"--quiet",
-		"--log-level string",
-		`Use "acd <command> --help" for command details.`,
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("root help missing %q:\n%s", want, got)
+	for _, command := range []string{"setup", "status", "on", "off", "list", "commit-all", "history", "restore", "doctor", "uninstall"} {
+		if !strings.Contains(got, "  "+command) {
+			t.Fatalf("help missing %s:\n%s", command, got)
 		}
 	}
-
-	for _, noisy := range []string{
-		"Available Commands:",
-		"acd daemon",
-		"acd hook-stdin-extract",
-		"acd completion",
-		"acd repo remove --dry-run",
-		"acd rewrite-commits --from-nr",
-		// Deprecated commands must not be advertised in the hand-written
-		// help. The cobra deprecation warnings on actual invocation still
-		// fire (recover.go / purge.go log to stderr), but the discovery
-		// path should steer new users to the supported `acd fix`
-		// entrypoint instead. Regression target: g1.
-		"acd recover",
-		"acd purge-events",
-	} {
-		if strings.Contains(got, noisy) {
-			t.Fatalf("root help contains internal/generated noise %q:\n%s", noisy, got)
+	for _, internal := range []string{"daemon", "start", "stop", "wake", "flush", "events", "configure", "settings", "support", "repo"} {
+		if strings.Contains(got, "  "+internal+" ") {
+			t.Fatalf("help exposes %s:\n%s", internal, got)
 		}
+	}
+	visible := 0
+	for _, command := range root.Commands() {
+		if !command.Hidden && command.Name() != "help" && command.Name() != "completion" {
+			visible++
+		}
+	}
+	if visible != 10 {
+		t.Fatalf("visible root commands=%d want=10", visible)
+	}
+}
+
+func TestRootVersionFlagAndHiddenAliasMatch(t *testing.T) {
+	run := func(args ...string) string {
+		t.Helper()
+		root := newRootCmd()
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(args)
+		if err := root.ExecuteContext(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	if flag, alias := run("--version"), run("version"); flag != alias {
+		t.Fatalf("version outputs differ: flag=%q alias=%q", flag, alias)
 	}
 }

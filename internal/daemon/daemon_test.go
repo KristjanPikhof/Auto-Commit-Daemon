@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -3536,6 +3537,90 @@ func TestRun_StartupStaleDetachedMarkerPreservesAttachedRewindGrace(t *testing.T
 	}
 }
 
+func TestRun_PublicationHoldSkipsStartupRecovery(t *testing.T) {
+	f := newDaemonFixture(t)
+	shutdownCh := make(chan struct{})
+	close(shutdownCh)
+	recoveryCalled := false
+	if err := Run(context.Background(), Options{
+		RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+		BootGrace: time.Hour, ShutdownCh: shutdownCh, SkipSignals: true,
+		PublicationHeld: func() bool { return true },
+		recoverSelfPublications: func(
+			context.Context, string, *state.DB, CaptureContext, ReplayOpts,
+		) (SelfPublicationRecoverySummary, error) {
+			recoveryCalled = true
+			return SelfPublicationRecoverySummary{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if recoveryCalled {
+		t.Fatal("startup recovery ran while publication was held")
+	}
+}
+
+func TestRun_PublicationHoldBlocksReplayUnderOperationGate(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx := context.Background()
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx := CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head}
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, cctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "held.txt"), []byte("held\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checker := git.NewIgnoreChecker(f.dir)
+	store := checkpointpkg.Store{DB: f.db}
+	summary, err := Capture(ctx, f.dir, f.db, cctx, CaptureOpts{
+		IgnoreChecker: checker, SensitiveMatcher: state.NewSensitiveMatcher(),
+		CheckpointStore: &store, WorktreeID: checkpointpkg.WorktreeID(f.dir),
+	})
+	_ = checker.Close()
+	if err != nil || summary.EventsAppended != 1 || summary.CheckpointID == "" {
+		t.Fatalf("capture summary=%+v err=%v", summary, err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending events=%d err=%v", len(pending), err)
+	}
+
+	shutdownCh := make(chan struct{})
+	var stopOnce sync.Once
+	gate := &sync.RWMutex{}
+	if err := Run(ctx, Options{
+		RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+		Scheduler: fastScheduler(), BootGrace: time.Hour,
+		ShutdownCh: shutdownCh, SkipSignals: true,
+		OperationGate: gate, PublicationHeld: func() bool { return true },
+		afterRunLoopWorkDecision: func(_, _ bool) {
+			stopOnce.Do(func() { close(shutdownCh) })
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	afterHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterHead != head {
+		t.Fatalf("publication hold advanced HEAD from %s to %s", head, afterHead)
+	}
+	var eventState string
+	if err := f.db.ReadSQL().QueryRowContext(ctx,
+		"SELECT state FROM capture_events WHERE seq=?", pending[0].Seq).Scan(&eventState); err != nil {
+		t.Fatal(err)
+	}
+	if eventState != state.EventStatePending {
+		t.Fatalf("held event state=%q want pending", eventState)
+	}
+}
+
 // TestRun_OperationClearedClearsStaleRewindGrace asserts the symmetric
 // behavior for the operation-in-progress marker (rebase / merge /
 // cherry-pick / bisect). When the marker disappears the run loop's
@@ -3652,6 +3737,19 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 	if !ok {
 		t.Fatal("ancestry probe expected seedHead to be ancestor of advanced")
 	}
+	advancedOID, err := git.LsTreeBlobOID(ctx, f.dir, advanced, "advanced.txt")
+	if err != nil {
+		t.Fatalf("resolve advanced.txt blob: %v", err)
+	}
+	if err := state.UpsertShadowPath(ctx, f.db, state.ShadowPath{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Path: "advanced.txt", Operation: "modify",
+		Mode:     sql.NullString{String: "100644", Valid: true},
+		OID:      sql.NullString{String: advancedOID, Valid: true},
+		BaseHead: advanced, Fidelity: "full",
+	}); err != nil {
+		t.Fatalf("seed stale published shadow row: %v", err)
+	}
 
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
@@ -3714,6 +3812,13 @@ func TestRun_SameSHARewindAcrossTicksTriggersGrace(t *testing.T) {
 			t.Fatalf("MetaGet paused_until: %v", err)
 		}
 		if ok && got != "" {
+			waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+			if _, found, shadowErr := state.GetShadowPath(ctx, f.db,
+				"refs/heads/main", 1, "advanced.txt"); shadowErr != nil {
+				t.Fatalf("read advanced.txt shadow after rewind: %v", shadowErr)
+			} else if found {
+				t.Fatal("cross-tick rewind retained shadow content from the abandoned published head")
+			}
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

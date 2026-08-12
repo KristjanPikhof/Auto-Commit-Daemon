@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -438,10 +440,7 @@ func TestIntentV2CutoverUsesAuthoredIntentWithoutLegacyDBEvidence(t *testing.T) 
 	}
 	defer db.Close()
 	roots := intentV2MigrationRoots(t)
-	repoHash, err := paths.RepoHash(repo)
-	if err != nil {
-		t.Fatal(err)
-	}
+	repoHash := central.CanonicalID(repo)
 	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
 		settings := doc.Settings.Repositories[repoHash]
 		settings.Fields = config.Overrides{}
@@ -478,10 +477,7 @@ func TestIntentV2CutoverResolvesIntentAcrossAuthoringLayers(t *testing.T) {
 			}
 			defer db.Close()
 			roots := intentV2MigrationRoots(t)
-			repoHash, err := paths.RepoHash(repo)
-			if err != nil {
-				t.Fatal(err)
-			}
+			repoHash := central.CanonicalID(repo)
 			if layer != "environment" {
 				err = config.NewStore(roots).Update(func(doc *config.Document) error {
 					value, _ := json.Marshal("intent")
@@ -632,10 +628,7 @@ func TestIntentV2CutoverInheritsMatchingGlobalSetupApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer driftDB.Close()
-	driftHash, err := paths.RepoHash(driftRepo)
-	if err != nil {
-		t.Fatal(err)
-	}
+	driftHash := central.CanonicalID(driftRepo)
 	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
 		doc.Settings.Repositories[driftHash] = config.RepositorySettings{
 			Fields: config.Overrides{
@@ -735,6 +728,57 @@ func TestRuntimeCutoverMaterializesApprovedGlobalEventDefaults(t *testing.T) {
 	}
 }
 
+func TestRuntimeCutoverHonorsAuthoredDeterministicIntentFast(t *testing.T) {
+	ctx := context.Background()
+	repo, dbPath := intentV2MigrationRepo(t)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	roots := intentV2MigrationRoots(t)
+	raw := func(value any) json.RawMessage {
+		body, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return body
+	}
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Repositories[checkpoint.WorktreeID(repo)] = config.RepositorySettings{
+			Fields: config.Overrides{
+				config.FieldProvider:            raw("deterministic"),
+				config.FieldCommitStrategy:      raw("intent"),
+				config.FieldCommitPreset:        raw("fast"),
+				config.FieldDiffEgress:          raw(false),
+				config.FieldIntentVerification:  raw("structural"),
+				config.FieldIntentRepairEnabled: raw(false),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := EnsureIntentV2RuntimeCutover(ctx, db, repo, roots, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Required || !result.Migrated || result.PresetID != "intent.fast" {
+		t.Fatalf("cutover=%+v", result)
+	}
+	revision, err := state.ConfigRevisionByID(ctx, db, result.RevisionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := (RuntimeBundleBuilder{DB: db, RepoRoot: repo}).BuildRevision(ctx, revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.ReplayBlockedReason != "" || bundle.IntentPlanner == nil {
+		t.Fatalf("bundle=%+v", bundle)
+	}
+}
+
 func TestRuntimeCutoverRejectsUntestedGlobalEventModelDrift(t *testing.T) {
 	ctx := context.Background()
 	repo, dbPath := intentV2MigrationRepo(t)
@@ -775,10 +819,7 @@ func TestRuntimeCutoverRejectsUntestedGlobalEventModelDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repoHash, err := paths.RepoHash(repo)
-	if err != nil {
-		t.Fatal(err)
-	}
+	repoHash := central.CanonicalID(repo)
 	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
 		doc.Settings.Global = global
 		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +22,7 @@ import (
 // TestCommitAll_FlagsRegistered ensures the command surfaces all required
 // flags. Full behavior coverage lives in the t-unit task.
 func TestCommitAll_FlagsRegistered(t *testing.T) {
-	cmd := newCommitAllCmd()
+	cmd := newProductCommitAllCmd()
 	for _, name := range []string{"yes", "dry-run"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Fatalf("commit-all: missing flag --%s", name)
@@ -29,8 +30,8 @@ func TestCommitAll_FlagsRegistered(t *testing.T) {
 	}
 }
 
-// TestCommitAll_HelpExposesCommand verifies the root command tree wires the
-// command in and the help text mentions it.
+// TestCommitAll_HelpExposesCommand verifies the worker-driven command is a
+// supported product surface.
 func TestCommitAll_HelpExposesCommand(t *testing.T) {
 	root := newRootCmd()
 	var out bytes.Buffer
@@ -40,8 +41,31 @@ func TestCommitAll_HelpExposesCommand(t *testing.T) {
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("root help: %v", err)
 	}
-	if !strings.Contains(out.String(), "acd commit-all") {
-		t.Fatalf("root help missing commit-all entry:\n%s", out.String())
+	if !strings.Contains(out.String(), "commit-all") {
+		t.Fatalf("root help omits commit-all:\n%s", out.String())
+	}
+	command, _, err := root.Find([]string{"commit-all"})
+	if err != nil || command == nil || command.Hidden {
+		t.Fatalf("commit-all product command missing or hidden: command=%v err=%v", command, err)
+	}
+}
+
+func TestCommitAll_IncompleteTargetRendersThenExitsThree(t *testing.T) {
+	for _, jsonOut := range []bool{false, true} {
+		t.Run(fmt.Sprintf("json=%t", jsonOut), func(t *testing.T) {
+			var out bytes.Buffer
+			err := finishProductCommitAll(&out, productCommitAllResult{
+				Repo: "/repo", CheckpointID: "cp-1", Protected: true,
+				TargetEvents: 3, PublishedEvents: 2, RemainingEvents: 1,
+				PublicationDrained: false, WaitingReason: "publication made no progress",
+			}, jsonOut)
+			if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
+				t.Fatalf("exit=%d rendered=%t err=%v", ExitCode(err), ErrorRendered(err), err)
+			}
+			if !strings.Contains(out.String(), "publication made no progress") {
+				t.Fatalf("output omitted wait reason: %s", out.String())
+			}
+		})
 	}
 }
 

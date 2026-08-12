@@ -29,9 +29,16 @@ import (
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
 )
+
+type doctorTargetContextKey struct{}
+
+func withDoctorTarget(ctx context.Context, repo string) context.Context {
+	return context.WithValue(ctx, doctorTargetContextKey{}, strings.TrimSpace(repo))
+}
 
 // doctorRepoReport is the per-repo block inside the doctor report.
 type doctorRepoReport struct {
@@ -235,26 +242,37 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 	rep.SafeIgnoreExtraEnv = os.Getenv(state.EnvSafeIgnoreExtra)
 	rep.SafeIgnoreActive = state.SafeIgnorePatterns()
 	rep.Harnesses = collectDoctorHarnesses()
-	rep.AI = collectDoctorAI()
 
 	roots, err := paths.Resolve()
 	if err != nil {
 		return rep, fmt.Errorf("resolve paths: %w", err)
+	}
+	target, _ := ctx.Value(doctorTargetContextKey{}).(string)
+	if target != "" {
+		if wt, resolveErr := gitpkg.ResolveWorktree(ctx, target); resolveErr == nil {
+			target = wt.Root
+		}
+	}
+	if target != "" {
+		rep.AI = collectDoctorAIForRepo(ctx, roots, target)
+	} else {
+		rep.AI = collectDoctorAI()
 	}
 	rep.RegistryPath = roots.RegistryPath()
 	reg, err := central.Load(roots)
 	if err != nil {
 		return rep, fmt.Errorf("load registry: %w", err)
 	}
-	rep.RegistryRepoCount = len(reg.Repos)
-
 	for _, rec := range reg.Repos {
+		if target != "" && filepath.Clean(rec.Path) != filepath.Clean(target) {
+			continue
+		}
 		rr := doctorRepoReport{
 			Path:      rec.Path,
-			RepoHash:  rec.RepoHash,
+			RepoHash:  fallback(rec.RepositoryID, rec.RepoHash),
 			StateDB:   rec.StateDB,
 			Harnesses: append([]string{}, rec.Harnesses...),
-			LogPath:   roots.RepoLogPath(rec.RepoHash),
+			LogPath:   roots.RepoLogPath(fallback(rec.RepositoryID, rec.RepoHash)),
 		}
 		rr.DaemonProcessPIDs = findDaemonProcesses(ctx, rec.Path)
 		rr.DaemonProcessCount = len(rr.DaemonProcessPIDs)
@@ -273,8 +291,43 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 		}
 		rep.Repos = append(rep.Repos, rr)
 	}
+	rep.RegistryRepoCount = len(rep.Repos)
 
 	return rep, nil
+}
+
+func collectDoctorAIForRepo(ctx context.Context, roots paths.Roots, repo string) doctorAIReport {
+	service, err := settings.NewValidationService(ctx, settings.Options{Roots: roots, RepoPath: repo})
+	if err != nil {
+		report := collectDoctorAI()
+		report.Notes = append(report.Notes, "effective repository settings unavailable: "+err.Error())
+		return report
+	}
+	cfg, err := service.AuthoringProviderConfig()
+	if err != nil {
+		report := collectDoctorAI()
+		report.Notes = append(report.Notes, "effective repository provider unavailable: "+err.Error())
+		return report
+	}
+	provider := cfg.Mode
+	if provider == "" {
+		provider = "deterministic"
+	}
+	report := doctorAIReport{Provider: provider, APIKeySet: strings.TrimSpace(cfg.APIKey) != ""}
+	if provider == "openai-compat" && !report.APIKeySet {
+		report.Notes = append(report.Notes, "effective provider requires a credential; checkpoint protection remains active")
+	}
+	if strings.HasPrefix(provider, "subprocess:") {
+		name := strings.TrimSpace(strings.TrimPrefix(provider, "subprocess:"))
+		report.ProviderCommand = "acd-provider-" + name
+		if path, lookupErr := exec.LookPath(report.ProviderCommand); lookupErr == nil {
+			report.ProviderCommandFound = true
+			report.ProviderCommandPath = path
+		} else {
+			report.Notes = append(report.Notes, report.ProviderCommand+" not found on PATH")
+		}
+	}
+	return report
 }
 
 func collectDoctorHarnesses() []doctorHarnessReport {
@@ -419,11 +472,11 @@ func codexLegacyJSONManagedKeyNote(path string) string {
 // destructive) form first, then the full-overwrite form as an alternative so
 // users with custom hooks are not surprised by silent config loss.
 var driftRemediationCommands = map[string]string{
-	"claude-code": "acd setup claude-code  # merge output into ~/.claude/settings.json; to overwrite: cp ~/.claude/settings.json ~/.claude/settings.json.bak && acd setup claude-code --raw > ~/.claude/settings.json",
-	"codex":       "acd setup codex  # merge output into ~/.codex/hooks.json; to overwrite: cp ~/.codex/hooks.json ~/.codex/hooks.json.bak && acd setup codex --raw > ~/.codex/hooks.json",
-	"cursor":      "acd setup cursor  # merge output into ~/.cursor/hooks.json; to overwrite: cp ~/.cursor/hooks.json ~/.cursor/hooks.json.bak && acd setup cursor --raw > ~/.cursor/hooks.json",
-	"opencode":    "acd setup opencode  # merge output into ~/.config/opencode/hook/hooks.yaml; to overwrite: cp ~/.config/opencode/hook/hooks.yaml ~/.config/opencode/hook/hooks.yaml.bak && acd setup opencode --raw > ~/.config/opencode/hook/hooks.yaml",
-	"pi":          "acd setup pi  # merge output into ~/.pi/agent/hook/hooks.yaml; to overwrite: cp ~/.pi/agent/hook/hooks.yaml ~/.pi/agent/hook/hooks.yaml.bak && acd setup pi --raw > ~/.pi/agent/hook/hooks.yaml",
+	"claude-code": "acd setup --integrations=claude-code",
+	"codex":       "acd setup --integrations=codex",
+	"cursor":      "acd setup --integrations=cursor",
+	"opencode":    "acd setup --integrations=opencode",
+	"pi":          "acd setup --integrations=pi",
 }
 
 // scanHookBodyDrift inspects the installed config body for the named harness
@@ -500,8 +553,12 @@ func activeHookBodyHasStartWake(harness, body string) bool {
 	if strings.Contains(body, "acd start") && strings.Contains(body, "acd wake") {
 		return true
 	}
+	if strings.Contains(body, "acd internal session open") &&
+		strings.Contains(body, "acd internal hint --kind wake") {
+		return true
+	}
 	if harness == "cursor" {
-		return cursorLifecycleCommandOK("wake", body)
+		return false
 	}
 	return false
 }
@@ -544,6 +601,9 @@ var codexTouchInvocation = regexp.MustCompile(
 )
 
 func codexStopHasSoftBoundary(command string) bool {
+	if strings.Contains(command, "acd internal hint --kind soft_boundary") {
+		return true
+	}
 	for _, invocation := range codexTouchInvocation.FindAllString(command, -1) {
 		for _, field := range strings.Fields(invocation) {
 			field = strings.Trim(field, `'"(){}[]`)
@@ -579,13 +639,15 @@ func countCursorStaleLifecycleCommands(body []byte) int {
 func cursorLifecycleCommandOK(wantSubcmd, command string) bool {
 	switch wantSubcmd {
 	case "wake":
-		return strings.Contains(command, "acd start") && strings.Contains(command, "acd wake")
+		return (strings.Contains(command, "acd start") && strings.Contains(command, "acd wake")) ||
+			(strings.Contains(command, "acd internal session open") &&
+				strings.Contains(command, "acd internal hint --kind wake"))
 	case "start":
-		return strings.Contains(command, "acd start")
+		return strings.Contains(command, "acd start") || strings.Contains(command, "acd internal session open")
 	case "flush":
-		return strings.Contains(command, "acd flush --logical")
+		return strings.Contains(command, "acd flush --logical") || strings.Contains(command, "acd internal hint --kind logical_boundary")
 	case "stop":
-		return strings.Contains(command, "acd stop")
+		return strings.Contains(command, "acd stop") || strings.Contains(command, "acd internal session close")
 	}
 	return false
 }
@@ -1751,14 +1813,30 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 		}
 	}
 
-	// registry.json — sanitize home dir prefix.
+	// registry.json mirrors the report scope so a repo-targeted bundle cannot
+	// disclose unrelated registered repository paths.
 	roots, err := paths.Resolve()
 	if err != nil {
 		return bundleResult{}, err
 	}
-	regBody, err := os.ReadFile(roots.RegistryPath())
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return bundleResult{}, fmt.Errorf("read registry: %w", err)
+	registry, err := central.Load(roots)
+	if err != nil {
+		return bundleResult{}, fmt.Errorf("load registry: %w", err)
+	}
+	included := make(map[string]struct{}, len(rep.Repos))
+	for _, repo := range rep.Repos {
+		included[filepath.Clean(repo.Path)] = struct{}{}
+	}
+	filtered := make([]central.RepoRecord, 0, len(registry.Repos))
+	for _, repo := range registry.Repos {
+		if _, ok := included[filepath.Clean(repo.Path)]; ok {
+			filtered = append(filtered, repo)
+		}
+	}
+	registry.Repos = filtered
+	regBody, err := json.MarshalIndent(registry, "", "  ")
+	if err != nil {
+		return bundleResult{}, fmt.Errorf("marshal registry: %w", err)
 	}
 	regBody = sanitizeBytes(regBody)
 	if err := add("registry.json", regBody); err != nil {

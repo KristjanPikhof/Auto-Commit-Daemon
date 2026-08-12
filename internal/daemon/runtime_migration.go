@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -55,10 +56,7 @@ func EnsureIntentV2RuntimeCutover(
 		lookupEnv = os.LookupEnv
 	}
 
-	repoHash, err := paths.RepoHash(repoRoot)
-	if err != nil {
-		return result, fmt.Errorf("daemon: Intent v2 cutover: repository identity: %w", err)
-	}
+	repoHash := checkpoint.WorktreeID(repoRoot)
 	doc, err := config.NewStore(roots).Load()
 	if err != nil {
 		return result, fmt.Errorf("daemon: Intent v2 cutover: load authoring settings: %w", err)
@@ -151,7 +149,16 @@ func EnsureIntentV2RuntimeCutover(
 	if strategy == config.StrategyIntent {
 		presetName = config.PresetBalanced
 	}
-	if explicit := config.PresetName(values[config.FieldCommitPreset]); explicit != "" {
+	explicit := config.PresetName(values[config.FieldCommitPreset])
+	if explicit == "" {
+		presetField := base[config.FieldCommitPreset]
+		switch presetField.Source {
+		case config.SourceRepository, config.SourceProfile,
+			config.SourceGlobal, config.SourceEnvironment:
+			explicit = config.PresetName(presetField.EffectiveValue())
+		}
+	}
+	if explicit != "" {
 		if _, exists := config.LookupPreset(strategy, explicit); exists {
 			presetName = explicit
 		}

@@ -8,7 +8,7 @@ hooks:
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          acd start \
+          acd internal session open \
             --session-id "$SID" \
             --harness pi \
             --watch-pid "$PPID" \
@@ -25,12 +25,12 @@ hooks:
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          { acd start \
+          { acd internal session open \
               --session-id "$SID" \
               --harness pi \
               --watch-pid "$PPID" \
               --repo "$PI_PROJECT_DIR" >/dev/null \
-            && acd wake \
+            && acd internal hint --kind wake \
               --session-id "$SID" \
               --repo "$PI_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
               printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
@@ -45,12 +45,12 @@ hooks:
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          { acd start \
+          { acd internal session open \
               --session-id "$SID" \
               --harness pi \
               --watch-pid "$PPID" \
               --repo "$PI_PROJECT_DIR" >/dev/null \
-            && acd wake \
+            && acd internal hint --kind wake \
               --session-id "$SID" \
               --repo "$PI_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
               printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$?" >>"$LOG"
@@ -65,7 +65,7 @@ hooks:
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          acd flush --logical \
+          acd internal hint --kind logical_boundary \
             --session-id "$SID" \
             --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG"
 
@@ -77,6 +77,6 @@ hooks:
           LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
           LOG_DIR="$(dirname "$LOG")"
           [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          acd stop \
+          acd internal session close \
             --session-id "$SID" \
             --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG"

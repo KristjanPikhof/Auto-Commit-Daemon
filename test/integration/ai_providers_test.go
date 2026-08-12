@@ -82,6 +82,7 @@ func waitHeadAdvances(t *testing.T, repo, start string, timeout time.Duration) s
 // new-file event must land with the deterministic "Add <basename>"
 // subject.
 func TestAI_DeterministicDefault(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -175,6 +176,7 @@ func newOpenAITestServer(t *testing.T, handler http.Handler) (*httptest.Server, 
 // whose chat/completions endpoint returns a canned tool_call. The commit
 // subject must be the value the mock returned.
 func TestAI_OpenAICompatMockSuccess(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -248,6 +250,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 // must fall back to the deterministic "Add <basename>" subject and log
 // a warning containing the upstream status.
 func TestAI_OpenAICompat5xxFallback(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -299,6 +302,7 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 // imperative subject format must not publish as-is; replay falls back to the
 // deterministic conventional message instead.
 func TestAI_OpenAICompatConventionalWrongFormatFallback(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -375,6 +379,7 @@ func TestAI_OpenAICompatConventionalWrongFormatFallback(t *testing.T) {
 // counterpart proves the full pipe — capture -> shadow -> ops_diff -> AI
 // payload — survives at runtime.
 func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -509,6 +514,7 @@ func pathPrepended(extra string) string {
 // JSONL line for every request. The first commit's subject must be the
 // plugin's response.
 func TestAI_SubprocessPluginHappyPath(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available; subprocess plugin tests skipped")
 	}
@@ -551,6 +557,7 @@ done
 // the test completes in well under 2s; the commit subject must be the
 // deterministic fallback.
 func TestAI_SubprocessPluginTimeoutFallback(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available; subprocess plugin tests skipped")
 	}
@@ -596,6 +603,7 @@ done
 // plugin response is identical across both processes; the assertion is
 // that the second event isn't dropped or wedged.
 func TestAI_SubprocessPluginCrashRespawn(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available; subprocess plugin tests skipped")
 	}

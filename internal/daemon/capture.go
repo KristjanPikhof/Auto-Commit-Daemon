@@ -12,14 +12,18 @@
 //   - Sensitive default-deny via state.SensitiveMatcher.
 //   - Generated dependency/cache tree pruning via state.SafeIgnoreMatcher.
 //   - Gitignored paths via batch git.IgnoreChecker.
-//   - Oversize regulars (> ACD_MAX_FILE_BYTES, default 5 MiB) -> meta-only.
+//   - Oversize regulars (> ACD_MAX_FILE_BYTES, default 5 MiB) are accepted
+//     only when their exact bytes already match a normal indexed Git blob;
+//     other oversized content remains incomplete/meta-only.
 //   - Regular files opened with O_NOFOLLOW + post-open lstat/fstat
 //     ino+dev+mode verification (TOCTOU defense against symlink swap).
 package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +38,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
@@ -94,6 +99,17 @@ const MetaKeyCaptureBackpressurePausedAt = "capture.backpressure_paused_at"
 // --json` so operators can detect silent loss without scraping logs.
 const MetaKeyCaptureEventsDroppedTotal = "capture.events_dropped_total"
 
+const (
+	MetaKeyProtectionObservationEpoch    = "protection.observation_epoch"
+	MetaKeyProtectionCoveredEpoch        = "protection.covered_epoch"
+	MetaKeyProtectionCheckpointID        = "protection.checkpoint_id"
+	MetaKeyProtectionComplete            = "protection.complete"
+	MetaKeyProtectionRetentionOverBudget = "protection.retention_over_budget"
+	MetaKeyProtectionFullPollTS          = "protection.full_poll_ts"
+	MetaKeyProtectionWatcherQueueDepth   = "protection.watcher_queue_depth"
+	MetaKeyProtectionTreeDigest          = "protection.tree_digest"
+)
+
 // CaptureBackpressureClearRatio is the high-water fraction of
 // ACD_MAX_PENDING_EVENTS at which capture lifts the durable backpressure
 // pause. Pending must drop strictly below cap*ratio before
@@ -148,6 +164,12 @@ type CaptureSummary struct {
 	// EventsDroppedTotal mirrors daemon_meta.capture.events_dropped_total
 	// after this pass. 0 when the cumulative counter has never advanced.
 	EventsDroppedTotal int64
+	// CheckpointID is populated only after the full live tree and all newly
+	// appended event membership are reachable through a completed private ref.
+	CheckpointID string
+	// Protected means this complete scan covers ObservationEpoch. An unchanged
+	// tree may reuse the prior checkpoint while still advancing covered_epoch.
+	Protected bool
 }
 
 // CaptureContext carries the per-pass repository identity that the legacy
@@ -176,6 +198,13 @@ type CaptureOpts struct {
 	// ACD skips internally even when they are not gitignored. Nil falls
 	// back to a fresh matcher per pass.
 	SafeIgnoreMatcher *state.SafeIgnoreMatcher
+	// CheckpointStore enables the v20 protection plane. When present, capture
+	// never applies the legacy pending-event drop gate and does not report a
+	// successful pass until the full eligible tree is durably protected.
+	CheckpointStore  *checkpoint.Store
+	WorktreeID       string
+	ObservationEpoch int64
+	CheckpointReason string
 	// SubmodulePaths is the set of repo-relative paths that are submodules
 	// (mode 160000 in HEAD's tree). Capture must not descend into them.
 	SubmodulePaths map[string]bool
@@ -513,8 +542,25 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	// CaptureBackpressureClearRatio*cap, or the operator explicitly
 	// accepts the loss via `acd resume --accept-overflow`.
 	pendingCap := resolveCaptureMaxPending(opts)
+	checkpointPendingCap := int64(0)
+	if opts.CheckpointStore != nil {
+		// A completed checkpoint must never be blocked by publication
+		// backpressure. Keep the cap for event ownership, but bypass the legacy
+		// early-return path so the full worktree snapshot still lands. Any ops
+		// above the available event capacity remain absent from shadow state and
+		// are classified again after publication drains.
+		checkpointPendingCap = pendingCap
+		pendingCap = 0
+	}
 	var summary CaptureSummary
 	pending := -1
+	if checkpointPendingCap > 0 {
+		n, perr := state.CountPendingEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
+		if perr != nil {
+			return summary, fmt.Errorf("daemon: count checkpoint pending events: %w", perr)
+		}
+		pending = n
+	}
 	if pendingCap > 0 {
 		n, perr := state.CountPendingEventsForGeneration(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
 		if perr != nil {
@@ -674,6 +720,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		submodules:    opts.SubmodulePaths,
 		maxBytes:      maxBytes,
 		db:            db,
+		durable:       opts.CheckpointStore != nil,
 	})
 	if err != nil {
 		// walkLive populates Errors/Oversize/WalkedFiles in its own summary;
@@ -724,6 +771,42 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		},
 		Generation: cctx.BranchGeneration,
 	})
+
+	if opts.CheckpointStore != nil {
+		ownedOps := ops
+		if checkpointPendingCap > 0 {
+			available := max(checkpointPendingCap-int64(pending), int64(0))
+			if int64(len(ownedOps)) > available {
+				ownedOps = ownedOps[:available]
+			}
+		}
+		if err := completeProtectionCheckpoint(ctx, repoRoot, db, cctx, opts,
+			live, protectedSkips, len(ownedOps) > 0, &summary); err != nil {
+			_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
+			return summary, err
+		}
+		captures := make([]state.CheckpointCapture, 0, len(ownedOps))
+		for _, op := range ownedOps {
+			captures = append(captures, checkpointCapture(cctx, op))
+		}
+		seqs, err := state.AttachCheckpointCaptures(ctx, db, summary.CheckpointID, captures)
+		if err != nil {
+			_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
+			return summary, fmt.Errorf("daemon: attach protected capture events: %w", err)
+		}
+		for index, seq := range seqs {
+			op := ownedOps[index]
+			recordCapturedDecision(ctx, db, cctx, seq, op)
+			recordCaptureCommitted(opts, repoRoot, cctx, seq, op)
+		}
+		summary.EventsAppended += len(seqs)
+		if pending >= 0 {
+			pending += len(seqs)
+			summary.PendingDepth = pending
+			updatePendingHighWater(ctx, db, pending)
+		}
+		ops = nil
+	}
 
 	// Persist each classified op as its own capture_events row + capture_ops
 	// child. Atomic-per-file commits (§8.3) means one event = one op. We do
@@ -879,6 +962,245 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	return summary, nil
 }
 
+// ProtectWorktree runs the universal safety path without classifying or
+// publishing capture events. Workers use it while Git state is unsafe for
+// publication (detached HEAD, conflicts, active operations, branch settle,
+// or a manual publication pause). It leaves shadow state untouched so the
+// next safe Capture pass can derive publication events normally.
+func ProtectWorktree(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts CaptureOpts) (CaptureSummary, error) {
+	if repoRoot == "" || db == nil || opts.CheckpointStore == nil {
+		return CaptureSummary{}, errors.New("daemon: ProtectWorktree requires repo, db, and checkpoint store")
+	}
+	matcher := opts.SensitiveMatcher
+	if matcher == nil {
+		matcher = state.NewSensitiveMatcher()
+	}
+	safeIgnore := opts.SafeIgnoreMatcher
+	if safeIgnore == nil {
+		safeIgnore = state.NewSafeIgnoreMatcher()
+	}
+	live, protected, summary, err := walkLive(ctx, repoRoot, walkOpts{
+		matcher:       matcher,
+		safeIgnore:    safeIgnore,
+		ignoreChecker: opts.IgnoreChecker,
+		submodules:    opts.SubmodulePaths,
+		maxBytes:      resolveMaxFileBytes(opts.MaxFileBytes),
+		db:            db,
+		durable:       true,
+	})
+	if err != nil {
+		_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
+		return summary, err
+	}
+	if err := completeProtectionCheckpoint(ctx, repoRoot, db, cctx, opts,
+		live, protected, false, &summary); err != nil {
+		_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
+		return summary, err
+	}
+	return summary, nil
+}
+
+// ScanProtectedEntries performs the same privacy and safety filtered scan used
+// by checkpoint capture without mutating SQLite, refs, the index, or shadow
+// state. Restore preview uses it to compare the live protected scope with a
+// retained checkpoint.
+func ScanProtectedEntries(ctx context.Context, repoRoot string, opts CaptureOpts) ([]checkpoint.Entry, []state.CheckpointExclusion, CaptureSummary, error) {
+	matcher := opts.SensitiveMatcher
+	if matcher == nil {
+		matcher = state.NewSensitiveMatcher()
+	}
+	safeIgnore := opts.SafeIgnoreMatcher
+	if safeIgnore == nil {
+		safeIgnore = state.NewSafeIgnoreMatcher()
+	}
+	live, protected, summary, err := walkLive(ctx, repoRoot, walkOpts{
+		matcher:       matcher,
+		safeIgnore:    safeIgnore,
+		ignoreChecker: opts.IgnoreChecker,
+		submodules:    opts.SubmodulePaths,
+		maxBytes:      resolveMaxFileBytes(opts.MaxFileBytes),
+		durable:       opts.CheckpointStore != nil,
+		hashOnly:      opts.CheckpointStore == nil,
+	})
+	if err != nil {
+		return nil, nil, summary, err
+	}
+	if summary.Errors > 0 || summary.Oversize > 0 {
+		return nil, checkpointExclusions(protected), summary,
+			fmt.Errorf("daemon: protection scan incomplete (unreadable_or_unstable=%d oversized_or_unstable=%d)", summary.Errors, summary.Oversize)
+	}
+	entries, _ := checkpointEntries(live)
+	return entries, checkpointExclusions(protected), summary, nil
+}
+
+func completeProtectionCheckpoint(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	cctx CaptureContext,
+	opts CaptureOpts,
+	live map[string]LiveEntry,
+	protectedSkips map[string]skippedPresent,
+	forceNew bool,
+	summary *CaptureSummary,
+) error {
+	epoch := opts.ObservationEpoch
+	if epoch <= 0 {
+		var err error
+		epoch, err = state.BeginOrJoinMetaEpoch(ctx, db,
+			MetaKeyProtectionObservationEpoch, MetaKeyProtectionComplete)
+		if err != nil {
+			return fmt.Errorf("daemon: begin implicit protection observation: %w", err)
+		}
+	}
+	if err := state.MetaSet(ctx, db, MetaKeyProtectionObservationEpoch,
+		strconv.FormatInt(epoch, 10)); err != nil {
+		return fmt.Errorf("daemon: persist protection observation epoch: %w", err)
+	}
+	if summary.Errors > 0 || summary.Oversize > 0 {
+		return fmt.Errorf("daemon: protection scan incomplete (unreadable_or_unstable=%d oversized_or_unstable=%d)",
+			summary.Errors, summary.Oversize)
+	}
+
+	entries, liveDigest := checkpointEntries(live)
+	projection, err := state.ReadCheckpointProjection(ctx, db.Path(), 1)
+	if err != nil {
+		return fmt.Errorf("daemon: read checkpoint projection: %w", err)
+	}
+	priorDigest, digestOK, digestErr := state.MetaGet(ctx, db, MetaKeyProtectionTreeDigest)
+	if digestErr != nil {
+		return fmt.Errorf("daemon: read protection tree digest: %w", digestErr)
+	}
+	if !forceNew && projection.Latest != nil &&
+		projection.Latest.Phase == state.CheckpointCompleted &&
+		digestOK && priorDigest == liveDigest {
+		if err := persistProtectionCoverage(ctx, db, epoch, projection.Latest.ID, liveDigest); err != nil {
+			return err
+		}
+		summary.CheckpointID = projection.Latest.ID
+		summary.Protected = true
+		return nil
+	}
+
+	exclusions := checkpointExclusions(protectedSkips)
+	reason := opts.CheckpointReason
+	if reason == "" {
+		reason = state.CheckpointReasonPoll
+	}
+	worktreeID := opts.WorktreeID
+	if worktreeID == "" {
+		worktreeID = checkpoint.WorktreeID(repoRoot)
+	}
+	result, err := opts.CheckpointStore.Create(ctx, checkpoint.Request{
+		RepoRoot:         repoRoot,
+		WorktreeID:       worktreeID,
+		Reason:           reason,
+		ObservationEpoch: epoch,
+		CoverageEpoch:    epoch,
+		ObservedHead:     cctx.BaseHead,
+		ObservedRef:      cctx.BranchRef,
+		Entries:          entries,
+		Exclusions:       exclusions,
+	})
+	if err != nil {
+		return fmt.Errorf("daemon: complete protection checkpoint: %w", err)
+	}
+	if err := persistProtectionCoverage(ctx, db, epoch, result.Checkpoint.ID, liveDigest); err != nil {
+		return err
+	}
+	summary.CheckpointID = result.Checkpoint.ID
+	summary.Protected = true
+	return nil
+}
+
+// BeginProtectionObservation marks protection incomplete before a scan or an
+// accepted semantic hint can return. Concurrent hints and the scan they wake
+// join the same incomplete epoch instead of creating artificial uncovered
+// gaps. A completed checkpoint is the only path that restores coverage.
+func BeginProtectionObservation(ctx context.Context, db *state.DB) (int64, error) {
+	if db == nil {
+		return 0, errors.New("daemon: protection observation requires state")
+	}
+	epoch, err := state.BeginOrJoinMetaEpoch(ctx, db,
+		MetaKeyProtectionObservationEpoch, MetaKeyProtectionComplete)
+	if err != nil {
+		return 0, fmt.Errorf("daemon: begin protection observation: %w", err)
+	}
+	return epoch, nil
+}
+
+func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID, liveDigest string) error {
+	values := []struct {
+		key   string
+		value string
+	}{
+		{MetaKeyProtectionCoveredEpoch, strconv.FormatInt(epoch, 10)},
+		{MetaKeyProtectionCheckpointID, checkpointID},
+		{MetaKeyProtectionTreeDigest, liveDigest},
+		{MetaKeyProtectionComplete, "true"},
+		{MetaKeyProtectionFullPollTS, strconv.FormatFloat(float64(time.Now().UnixNano())/float64(time.Second), 'f', -1, 64)},
+		{MetaKeyProtectionWatcherQueueDepth, "0"},
+	}
+	for _, value := range values {
+		if err := state.MetaSet(ctx, db, value.key, value.value); err != nil {
+			return fmt.Errorf("daemon: persist %s: %w", value.key, err)
+		}
+	}
+	return nil
+}
+
+// CompleteProtectionCoverage records that checkpointID durably covers the
+// supplied observation. Recovery paths use it only after independently
+// proving the complete protected entry set.
+func CompleteProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID string, entries []checkpoint.Entry) error {
+	return persistProtectionCoverage(ctx, db, epoch, checkpointID, ProtectionEntriesDigest(entries))
+}
+
+// ProtectionEntriesDigest returns the canonical digest used by checkpoint
+// reuse and protection status. Callers may supply entries in any order.
+func ProtectionEntriesDigest(entries []checkpoint.Entry) string {
+	entries = append([]checkpoint.Entry(nil), entries...)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	hash := sha256.New()
+	for _, entry := range entries {
+		hash.Write([]byte(entry.Path))
+		hash.Write([]byte{0})
+		hash.Write([]byte(entry.Mode))
+		hash.Write([]byte{0})
+		hash.Write([]byte(entry.OID))
+		hash.Write([]byte{0})
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func checkpointEntries(live map[string]LiveEntry) ([]checkpoint.Entry, string) {
+	entries := make([]checkpoint.Entry, 0, len(live))
+	for _, entry := range live {
+		entries = append(entries, checkpoint.Entry{Path: entry.Path, Mode: entry.Mode, OID: entry.OID})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return entries, ProtectionEntriesDigest(entries)
+}
+
+func checkpointExclusions(protectedSkips map[string]skippedPresent) []state.CheckpointExclusion {
+	counts := make(map[string]int64)
+	for _, skipped := range protectedSkips {
+		if skipped.Reason != "" {
+			counts[skipped.Reason]++
+		}
+	}
+	categories := make([]string, 0, len(counts))
+	for category := range counts {
+		categories = append(categories, category)
+	}
+	sort.Strings(categories)
+	exclusions := make([]state.CheckpointExclusion, 0, len(categories))
+	for _, category := range categories {
+		exclusions = append(exclusions, state.CheckpointExclusion{Category: category, Count: counts[category]})
+	}
+	return exclusions
+}
+
 func protectSafeIgnoreDeleteOps(ctx context.Context, db *state.DB, cctx CaptureContext, safeIgnore *state.SafeIgnoreMatcher, ops []ClassifiedOp) ([]ClassifiedOp, int, error) {
 	if safeIgnore == nil || len(ops) == 0 {
 		return ops, 0, nil
@@ -911,6 +1233,55 @@ func toStateOp(op ClassifiedOp) state.CaptureOp {
 		AfterMode:  nullString(op.AfterMode),
 		Fidelity:   op.Fidelity,
 	}
+}
+
+func checkpointCapture(cctx CaptureContext, op ClassifiedOp) state.CheckpointCapture {
+	capture := state.CheckpointCapture{
+		Event: state.CaptureEvent{
+			BranchRef: cctx.BranchRef, BranchGeneration: cctx.BranchGeneration,
+			BaseHead: cctx.BaseHead, Operation: op.Op, Path: op.Path,
+			Fidelity: op.Fidelity, OldPath: nullString(op.OldPath),
+		},
+		Ops: []state.CaptureOp{toStateOp(op)},
+	}
+	switch op.Op {
+	case "delete":
+		capture.ShadowDeletes = []string{op.Path}
+	case "rename":
+		capture.ShadowDeletes = []string{op.OldPath}
+		fallthrough
+	case "create", "modify", "mode":
+		capture.ShadowUpsert = &state.ShadowPath{
+			BranchRef: cctx.BranchRef, BranchGeneration: cctx.BranchGeneration,
+			Path: op.Path, Operation: op.Op,
+			Mode:    sql.NullString{String: op.AfterMode, Valid: op.AfterMode != ""},
+			OID:     sql.NullString{String: op.AfterOID, Valid: op.AfterOID != ""},
+			OldPath: nullString(op.OldPath), BaseHead: cctx.BaseHead,
+			Fidelity: op.Fidelity,
+		}
+	}
+	return capture
+}
+
+func recordCaptureCommitted(opts CaptureOpts, repoRoot string, cctx CaptureContext, seq int64, op ClassifiedOp) {
+	if pathQuiescenceEnabled.Load() {
+		now := pathQuiescenceNow()
+		RecordPathWrite(op.Path, now)
+		if op.OldPath != "" {
+			RecordPathWrite(op.OldPath, now)
+		}
+	}
+	recordTrace(opts.Trace, acdtrace.Event{
+		Repo: repoRoot, BranchRef: cctx.BranchRef, HeadSHA: cctx.BaseHead,
+		EventClass: "capture.event", Decision: "appended",
+		Reason: "classified op persisted with completed checkpoint ownership",
+		Input: map[string]any{
+			"op": op.Op, "path": op.Path, "old_path": op.OldPath,
+			"fidelity": op.Fidelity,
+		},
+		Output: map[string]any{"seq": seq}, Seq: seq,
+		Generation: cctx.BranchGeneration,
+	})
 }
 
 // nullString wraps an empty/non-empty string as sql.NullString.
@@ -1070,6 +1441,39 @@ type walkOpts struct {
 	submodules    map[string]bool
 	maxBytes      int64
 	db            *state.DB
+	durable       bool
+	hashOnly      bool
+	blobHasher    *git.BlobHasher
+	blobBatch     *durableBlobBatch
+}
+
+const (
+	durableBlobBatchCount = 128
+	durableBlobBatchBytes = 32 << 20
+)
+
+type durableBlobBatch struct {
+	items []git.DurableBlob
+	bytes int
+}
+
+func (b *durableBlobBatch) add(ctx context.Context, repoRoot, oid string, content []byte) error {
+	b.items = append(b.items, git.DurableBlob{OID: oid, Content: content})
+	b.bytes += len(content)
+	if len(b.items) < durableBlobBatchCount && b.bytes < durableBlobBatchBytes {
+		return nil
+	}
+	return b.flush(ctx, repoRoot)
+}
+
+func (b *durableBlobBatch) flush(ctx context.Context, repoRoot string) error {
+	if len(b.items) == 0 {
+		return nil
+	}
+	items := b.items
+	b.items = nil
+	b.bytes = 0
+	return git.EnsureBlobObjectsDurable(ctx, repoRoot, items)
 }
 
 type skippedPresent struct {
@@ -1130,6 +1534,16 @@ func classifyIgnoredBatched(ctx context.Context, ig *git.IgnoreChecker, paths []
 //   - All errors except context cancellation are soft: the daemon must keep
 //     running across permission errors or file races.
 func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]LiveEntry, map[string]skippedPresent, CaptureSummary, error) {
+	if opts.hashOnly || opts.durable {
+		hasher, err := git.NewBlobHasher(ctx, repoRoot)
+		if err != nil {
+			return nil, nil, CaptureSummary{}, err
+		}
+		opts.blobHasher = &hasher
+	}
+	if opts.durable {
+		opts.blobBatch = &durableBlobBatch{}
+	}
 	live := map[string]LiveEntry{}
 	protected := map[string]skippedPresent{}
 	var summary CaptureSummary
@@ -1346,6 +1760,11 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 		}
 		live[c.rel] = entry
 	}
+	if opts.blobBatch != nil {
+		if err := opts.blobBatch.flush(ctx, repoRoot); err != nil {
+			return nil, protected, summary, err
+		}
+	}
 
 	return live, protected, summary, nil
 }
@@ -1376,7 +1795,17 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		if rerr != nil {
 			return LiveEntry{}, false, "", rerr
 		}
-		oid, _, herr := git.HashSymlinkBlob(ctx, repoRoot, target)
+		var oid string
+		var herr error
+		content := []byte(target)
+		if opts.blobHasher != nil {
+			oid, herr = opts.blobHasher.BlobOID(content)
+			if herr == nil && opts.blobBatch != nil {
+				herr = opts.blobBatch.add(ctx, repoRoot, oid, content)
+			}
+		} else {
+			oid, _, herr = git.HashSymlinkBlob(ctx, repoRoot, target)
+		}
 		if herr != nil {
 			return LiveEntry{}, false, "", herr
 		}
@@ -1403,6 +1832,13 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		return LiveEntry{}, false, "non_regular", nil
 	}
 	if post.Size() > opts.maxBytes {
+		entry, reusable, reuseErr := reuseIndexedBlob(ctx, repoRoot, c.rel, f, post)
+		if reuseErr != nil {
+			return LiveEntry{}, false, "", reuseErr
+		}
+		if reusable {
+			return entry, true, "", nil
+		}
 		recordOversize(ctx, opts.db, c.rel, post.Size(), opts.maxBytes)
 		return LiveEntry{}, false, "oversize", nil
 	}
@@ -1416,7 +1852,16 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		recordOversize(ctx, opts.db, c.rel, int64(len(buf)), opts.maxBytes)
 		return LiveEntry{}, false, "oversize", nil
 	}
-	oid, herr := git.HashObjectStdin(ctx, repoRoot, buf)
+	var oid string
+	var herr error
+	if opts.blobHasher != nil {
+		oid, herr = opts.blobHasher.BlobOID(buf)
+		if herr == nil && opts.blobBatch != nil {
+			herr = opts.blobBatch.add(ctx, repoRoot, oid, buf)
+		}
+	} else {
+		oid, herr = git.HashObjectStdin(ctx, repoRoot, buf)
+	}
 	if herr != nil {
 		return LiveEntry{}, false, "", herr
 	}
@@ -1425,6 +1870,36 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		Mode: gitModeFor(post.Mode()),
 		OID:  oid,
 	}, true, "", nil
+}
+
+// reuseIndexedBlob accepts an oversized regular file only when hashing its
+// exact worktree bytes proves they already exist as the path's ordinary
+// stage-0 index blob. This keeps dirty and untracked oversized content
+// fail-closed while avoiding a duplicate object write for large tracked
+// assets that Git already protects.
+func reuseIndexedBlob(ctx context.Context, repoRoot, path string, file *os.File, before os.FileInfo) (LiveEntry, bool, error) {
+	entries, err := git.LsFilesStaged(ctx, repoRoot, path)
+	if err != nil {
+		return LiveEntry{}, false, err
+	}
+	if len(entries) != 1 || entries[0].Stage != 0 || entries[0].Path != path || entries[0].Mode != gitModeFor(before.Mode()) {
+		return LiveEntry{}, false, nil
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return LiveEntry{}, false, err
+	}
+	oid, err := git.HashObjectReaderReadOnly(ctx, repoRoot, file)
+	if err != nil {
+		return LiveEntry{}, false, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return LiveEntry{}, false, err
+	}
+	if !sameFileSnapshot(before, after) || oid != entries[0].OID {
+		return LiveEntry{}, false, nil
+	}
+	return LiveEntry{Path: path, Mode: entries[0].Mode, OID: entries[0].OID}, true, nil
 }
 
 // candidateLike is the minimal shape hashCandidate needs. Aliasing the
@@ -1452,6 +1927,13 @@ func sameFile(pre, post os.FileInfo) bool {
 		return false
 	}
 	return true
+}
+
+func sameFileSnapshot(pre, post os.FileInfo) bool {
+	return sameFile(pre, post) &&
+		pre.Size() == post.Size() &&
+		pre.Mode() == post.Mode() &&
+		pre.ModTime().Equal(post.ModTime())
 }
 
 // gitModeFor maps a Go fs.Mode onto a git tree mode for regular files.

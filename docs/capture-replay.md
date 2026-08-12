@@ -1,442 +1,73 @@
-# Capture, replay, and conflict resolution
-
-This page explains why ACD can keep committing while you work, and why it
-sometimes stops. For day-to-day commands, start with
-[user-workflows.md](user-workflows.md).
-
-## Storage model
-
-ACD stores metadata and content separately.
-
-| Store | Contents |
-|---|---|
-| `<git-dir>/acd/state.db` | Capture events, ops, blob OIDs, branch generation, daemon state, clients, decisions. Linked worktrees have distinct Git directories. |
-| `<git-common-dir>/acd-daemon.lock` | Stable canonical-writer lock shared by every linked worktree. |
-| `.git/objects/` | File contents written with `git hash-object -w` at capture time. |
-
-SQLite does not store file contents. It stores `before_oid` and `after_oid`.
-That keeps captures durable even when the live worktree changes again.
-
-## Event states
-
-~~~mermaid
-stateDiagram-v2
-  [*] --> pending
-  pending --> published: commit written or HEAD already matches
-  pending --> blocked_conflict: replay not safe
-  pending --> failed: replay data or git operation failed
-  blocked_conflict --> published: complete chain proven at HEAD
-  failed --> published: complete chain proven at HEAD
-  blocked_conflict --> recovered: complete chain archived
-  failed --> recovered: complete chain archived
-  pending --> recovered: branch transition archives chain
-  published --> [*]
-  recovered --> [*]
-~~~
-
-| State | Meaning |
-|---|---|
-| `pending` | Replay may publish it. |
-| `published` | ACD wrote a commit or proved the current `HEAD` already has the captured after-state. |
-| `blocked_conflict` | ACD cannot safely apply the event. Later pending rows for the same branch generation wait behind it. |
-| `failed` | Replay could not build or apply the event. It is also a terminal barrier when later pending rows exist. |
-| `recovered` | ACD preserved the complete unpublished chain as a hidden Git commit before taking it out of replay. |
-
-ACD reconciles terminal rows automatically. It operates on the complete exact
-branch-generation suffix, not one blocker in isolation. If it cannot prove or
-archive that chain without a race, missing object, or ref collision, it leaves
-the queue unchanged for inspection.
-
-## Product decisions
-
-`acd status`, `acd events`, and `acd explain` read the decision ledger, not raw
-daemon logs.
-
-| Decision | User meaning |
-|---|---|
-| `captured` | A change was queued for replay. |
-| `committed` | ACD published the queued change as a commit. |
-| `skipped` | ACD intentionally left a path uncommitted. |
-| `protected` | ACD protected a sensitive or generated path. |
-| `handled_external` | Another commit already contains the captured after-state. |
-| `handled_external_after_block` | A blocked row was promoted after an external commit landed the captured change. |
-| `superseded_external` | External history made the queued work obsolete. |
-| `recovery_published` | The complete unpublished chain was proven at stable `HEAD`. |
-| `recovery_archived` | The complete unpublished chain was preserved at a hidden recovery ref. |
-| `blocked` | Replay stopped because the next event was not provably safe. |
-| `paused` / `resumed` | Capture or replay pause state changed. |
-
-## Replay: how a pending event becomes a commit
-
-~~~mermaid
-flowchart TB
-  A["Read visible pending rows"] --> B["Seed scratch index<br/>from BaseHead"]
-  B --> C["Check branch generation"]
-  C --> D["Probe before-state<br/>in scratch index"]
-  D --> E{"HEAD already<br/>has after-state?"}
-  E -->|yes| F["Mark published<br/>at HEAD"]
-  E -->|no| G{"Before-state<br/>matches?"}
-  G -->|no| H["blocked_conflict<br/>halt pass"]
-  G -->|yes| I["Apply ops to<br/>scratch index"]
-  I --> J["write-tree<br/>commit-tree"]
-  J --> K{"update-ref CAS<br/>succeeds?"}
-  K -->|no| H
-  K -->|yes| L["Mark published<br/>with commit OID"]
-  F --> M["Next event"]
-  L --> M
-
-  classDef normal fill:#203a31,stroke:#9ece6a,color:#eaffdf
-  classDef data fill:#243447,stroke:#7aa2f7,color:#e6edf3
-  classDef decision fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
-  classDef block fill:#402b2b,stroke:#f7768e,color:#ffe8ee
-  class A,B,C,D,I,J,M data
-  class E,G,K decision
-  class F,L normal
-  class H block
-~~~
-
-The scratch index is private to the replay pass. ACD does not run broad
-`git reset`, `git checkout`, or `git read-tree` commands against your live
-index.
-
-After a publish, ACD may repair the live index for the event paths only. It
-skips anything that looks like user staging, conflict stages, intent-to-add, or
-malformed index state.
-
-## Complete an ACD self-publication
-
-ACD records its own branch update before running `git update-ref`. This
-self-publication journal lets the daemon distinguish its commit from an
-external fast-forward and finish SQLite bookkeeping after a process stop.
-
-| Journal phase | Durable meaning | Next safe action |
-|---|---|---|
-| `prepared` | The source, target commit and tree, ordered event membership, and candidate ownership were saved before the branch compare-and-swap. | If the branch still names the source, mark the attempt `abandoned`. If it names the exact target, prove the target and continue recovery. |
-| `git_applied` | ACD observed the branch compare-and-swap at the exact target, but event and candidate settlement may still be pending. | Re-prove the branch ref, commit, parent, tree, ref ownership, and journal membership, then complete SQLite state. |
-| `completed` | Event and candidate settlement, publish state, and durable branch metadata committed in one SQLite transaction. | Adopt the journal target as the run loop's current base without changing branch generation. |
-| `abandoned` | Recovery proved that the branch never left the source ref. | Release the attempt's journal ownership. Captured events remain pending. |
-
-`abandoned` does not discard or archive captured work. It only closes a
-definitely unapplied branch-update attempt. A `git_applied` row cannot be
-abandoned because the target may already be reachable.
-
-Self-publication and external transitions use different paths:
-
-| Transition | Classification |
-|---|---|
-| Journal target still matches the literal branch ref | Internal self-publication. The run loop adopts the target and keeps the same branch generation. |
-| Branch moves after journal completion | External transition. The normal branch-token classifier decides whether it is a fast-forward or divergence. |
-| Branch, target, tree, parent, ref ownership, or event membership is ambiguous | No event or candidate settlement. The journal remains recoverable and the daemon log records that recovery needs attention. |
-
-Recovery runs automatically at daemon startup and later loop boundaries. Each
-pass is bounded and keeps heartbeat and wake handling active. ACD completes
-only an exact single-parent target (or an exact parentless initial commit) that
-has no other local branch, remote-tracking ref, or tag pointing to it. It fails
-closed on merges, unexpected branch or tag ownership, missing objects, changed
-membership, and concurrent branch movement.
-
-## Branch-generation safety
-
-Every capture records `(branch_ref, branch_generation)`. This protects queued
-work from replaying on top of the wrong branch history.
-
-| HEAD movement | Classification | Effect |
-|---|---|---|
-| New HEAD descends from the previous HEAD on the same branch | Fast-forward | Generation stays the same. |
-| Rebase, reset, branch switch, or same-SHA ref switch | Diverged | ACD first proves or archives each exact unpublished pair, then accepts the new generation and reseeds shadow state. |
-| Detached HEAD | Paused/refused | `acd start` refuses and capture/replay stay disabled until HEAD is attached. |
-| Deleted old branch ref | Dead branch | Startup cleanup archives the complete unpublished pair before it can become eligible for retention pruning. |
-
-Same-branch rewinds set a short grace pause:
-
-| Setting | Default | Meaning |
-|---|---:|---|
-| `ACD_REWIND_GRACE_SECONDS` | `60` | Capture and replay pause after a same-branch rewind. |
-| `ACD_KEEP_DEAD_BRANCH_BARRIERS` | off | Truthy keeps stale deleted-branch barriers for inspection. |
-| `ACD_SHADOW_RETENTION_GENERATIONS` | `1` | Prior shadow generations retained after reseed. |
-
-Manual pause wins over rewind grace:
-
-~~~bash
-acd pause --repo . --reason "branch surgery" --yes
-# reset, rebase, switch, or inspect
-acd resume --repo . --yes
-~~~
-
-## AI diffs
-
-Provider diffs come from captured blobs, not from the live worktree.
-
-| Condition | Result |
-|---|---|
-| Provider is `deterministic` | No diff is built. |
-| Provider can use diffs but `ACD_AI_DIFF_EGRESS` is off | Metadata only. |
-| Provider can use diffs and `ACD_AI_DIFF_EGRESS=1` | Redacted captured diff is sent. |
-
-Commit-message diffs are capped at 4000 bytes. Intent planner and message
-rewrite diffs are capped at 16000 bytes.
-
-## Commit strategies
-
-| Strategy | Replay behavior |
-|---|---|
-| `event` | FIFO replay. One capture can become one commit. |
-| `intent` | Bounded evaluations revise durable candidates. Atomic candidates publish in dependency order; waiting candidates stay pending. |
-
-Intent waits for one of these:
-
-| Trigger | Meaning |
-|---|---|
-| `ACD_INTENT_MIN_PENDING` | Enough visible pending captures exist. |
-| `ACD_INTENT_SETTLE_WINDOW` | After the count gate, wait briefly for bursty edits to stop arriving. |
-| `ACD_INTENT_MAX_PENDING_AGE` | Oldest visible capture reached the age escape hatch. |
-| `acd touch --soft-boundary --session-id <active-session>` | A harness records the end of one activity epoch. |
-| `acd flush --logical --session-id <active-session>` | A registered harness session asks to drain the visible batch now. |
-| Full evaluation capacity | The preset capture window is full. |
-
-Plain `acd wake` nudges capture and replay. It does not bypass intent batch
-gates.
-
-Planner-window records are stored separately from candidate and raw prompt
-records. Candidates may survive many windows, and one candidate can contain
-non-contiguous captures when its dependency graph and scratch materialization
-prove the grouping. Prompt traces remain the opt-in source for exact provider
-requests and may contain source text.
-
-### Planner circuit breaker
-
-| Condition | Circuit action | Replay action |
-|---|---|---|
-| Transport, timeout, HTTP, or subprocess failure | Open immediately. | Record the first failure and apply the preset policy. |
-| Invalid or unsafe plan | Open after three consecutive failures. | Reject the plan and apply the preset policy. |
-| Circuit open | Wait 30 seconds, then 2 minutes, then 10 minutes after repeated probe failures. | Bypass the provider without adding repeated planner-error rows. |
-| Cooldown expired | Allow one half-open provider probe. | Other evaluations apply the preset policy. |
-| Validated probe succeeds | Close and reset the backoff. | Resume configured provider planning. |
-
-Circuit health survives daemon restarts in `daemon_meta`. Bare `acd` reports
-degraded fallback health; `acd status` and `acd diagnose` show the full circuit
-record. A restart is not required to recover from a provider outage.
-
-## One-shot capture with `commit-all`
-
-`acd commit-all` is for a dirty worktree when the daemon was off.
-
-~~~bash
-acd commit-all --dry-run
-acd commit-all --yes
-acd commit-all --yes --json
-~~~
-
-It first proves or preserves every pre-existing exact unpublished pair, then
-reseeds shadow state from `HEAD`, captures the live diff, sorts paths
-lexicographically, and replays with the configured strategy.
-
-Dry-run and a declined confirmation do not open writable state, start the AI
-provider, capture files, or create recovery refs. If unpublished rows remain at
-the end, the command exits non-zero and leaves them protected.
-
-Refusals:
-
-| Refusal | Fix |
-|---|---|
-| Detached HEAD | Check out a branch. |
-| Rebase, merge, cherry-pick, or bisect in progress | Finish the Git operation. |
-| Manual pause marker | `acd resume --yes` |
-| The daemon is running when the command is ready to write | `acd off` first. Dry-run, a declined prompt, and a clean no-op do not acquire `daemon.lock`. |
-| No initial commit | Create the first commit yourself. |
-
-## Blocked conflicts
-
-`blocked_conflict` means replay stopped before it could prove the next commit
-was safe.
-
-Common causes:
-
-| Cause | Example |
-|---|---|
-| Generation mismatch | The branch was rebased after capture. |
-| Before-state mismatch | Another tool changed the path before ACD replayed it. |
-| `update-ref` CAS failure | The branch moved while ACD was creating the commit. |
-| Ancestry failure | The replay parent is no longer reachable. |
-| Mode or symlink mismatch | File content matches, but mode or symlink target does not. |
-
-Recovery ladder:
-
-~~~bash
-acd status
-acd events
-acd explain --path path/from/status
-acd diagnose --json
-acd fix --dry-run
-acd off
-acd fix --yes
-acd on
-acd
-~~~
-
-Safe apply runs the same exact-chain proof used by the daemon and archives the
-chain when stable `HEAD` does not match. If you specifically want to save the
-chain without trying the publish proof, preview and apply
-`acd fix --force`. Both paths reconstruct the full chain at a hidden recovery
-ref before marking rows recovered. Neither path purges, retargets, or discards
-captures.
-
-Reconstruction merges only published events that touch the unpublished
-suffix. That context can include same-base prefixes, interleaved events, and
-earlier captures published after the suffix base advanced. Rename dependencies
-are followed transitively, so a later `b -> c` context keeps the earlier
-`a -> b` step needed to materialize it. Published operations are split into
-connected path components for commit proof, while the operation prefix already
-present in the recovery seed is stripped before those proofs begin. Recovery
-fails safely instead of starting unbounded work when context exceeds 4096
-events, ancestry proof traverses more than 4096 commits, or more than 64
-remaining commits require tree proof. Retention keeps an oversized exact pair
-and continues pruning unrelated pairs.
-
-## Operator commands
-
-See [commands.md](commands.md) for the full command reference. These are the
-commands most useful while reading the capture and replay internals:
-
-| Task | Command |
-|---|---|
-| Quick health and next action | `acd` |
-| Enable and start this repo | `acd on` |
-| Disable and stop while preserving state | `acd off` |
-| Current repo health | `acd status` |
-| Live status refresh | `acd status --watch` |
-| Decision ledger | `acd events` |
-| Stream new decisions | `acd events --watch` |
-| Explain one path | `acd explain --path FILE` |
-| Explain one commit | `acd explain --commit HEAD` |
-| Enabled repo dashboard | `acd list` |
-| One wide repo snapshot | `acd list --once --verbose` |
-| Machine-readable repo table | `acd list --json` |
-| Interactive repo lifecycle manager | `acd list --interactive` |
-| Raw daemon log | `acd logs --follow` |
-| Recovery report | `acd diagnose --json` |
-| Safe recovery plan | `acd fix --dry-run` |
-| Apply safe recovery plan | `acd fix --yes` |
-| Preview archive-only recovery | `acd fix --force --dry-run` |
-| Apply archive-only recovery | `acd fix --force --yes` |
-| Support zip | `acd doctor --bundle` |
-
-`acd list` compact status tokens:
-
-| Token | Meaning |
-|---|---|
-| `OK` | Running with no queued or blocked work. |
-| `wait` | Queued work remains. In intent mode this may be a normal batch wait. |
-| `blk` | A barrier remains after automatic reconciliation and needs inspection. |
-| `pause` | Manual pause or rewind grace is active. |
-| `miss` | Repo or state DB is missing. |
-| `bad` | State DB exists but cannot be read. |
-
-Disabled repos are hidden from normal `acd list` snapshots. A disabled registry
-row makes hook-driven `start`, `wake`, `touch`, and `flush` skip with
-`repo_disabled` before capture or replay state is opened. Run `acd on` for
-normal use, or use `acd repo manage` / `acd list --interactive` for registry
-administration.
-
-## Safe-ignore and sensitive paths
-
-ACD prunes generated dependency and cache trees before capture. Defaults include
-`node_modules/`, `target/`, `.venv/`, `venv/`, `__pycache__/`,
-`.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, and `.gradle/`.
-
-~~~bash
-acd explain --path .env
-acd events --path node_modules/pkg/index.js
-acd doctor
-~~~
-
-| Setting | Meaning |
-|---|---|
-| `ACD_SAFE_IGNORE=0` | Disable generated-tree pruning. |
-| `ACD_SAFE_IGNORE_EXTRA=dist/,build/` | Add generated trees. |
-| `ACD_SENSITIVE_GLOBS=...` | Replace the protected path globs. Unset or empty uses the defaults. |
-
-Restart the daemon after changing these values.
-
-Tracked generated files are different from new generated files. If a cache tree
-such as `.derivedData-provider-core/` was already committed to Git, deleting it
-can leave pending delete rows from an older ACD version or a stale queue. New
-capture passes protect those safe-ignore deletes instead of queuing them, and
-`acd diagnose --json` reports grouped `generated_pending` roots. Use
-`acd fix --dry-run` and `acd fix --yes` to clean ACD state, then review and
-commit the Git cleanup separately:
-
-~~~bash
-git status -- .derivedData-provider-core
-git add -u -- .derivedData-provider-core
-git commit -m "Remove tracked generated cache files"
-~~~
-
-## Revert and rebase workflows
-
-Pause before planned branch surgery:
-
-~~~bash
-acd pause --repo . --reason "branch surgery" --yes
-# git revert, reset, rebase, or inspect
-acd resume --repo . --yes
-acd wake --repo . --session-id "$ACD_SESSION_ID"
-~~~
-
-| Operation | What ACD sees |
-|---|---|
-| `git revert` | Fast-forward commit. Queued matching work may settle as already handled at `HEAD`. |
-| `git reset --soft` or `--mixed` | Same-branch rewind. Capture and replay pause for rewind grace. |
-| `git reset --hard` | Same rewind behavior, with worktree overwritten by Git. |
-| `git rebase -i` | Git operation marker pauses capture and replay. After rebase, the generation bumps and each exact unpublished pair is proved or archived before capture resumes. |
-
-## Trace event classes
-
-Enable trace logging:
-
-~~~bash
-ACD_TRACE=1 acd start
-~~~
-
-Trace files live under `<gitDir>/acd/trace/` and avoid full prompts and diffs.
-
-| Class | When it appears |
-|---|---|
-| `bootstrap_shadow.reseed` | Shadow state reseeded after startup or divergence. |
-| `capture.classify` | Live worktree was compared with shadow state. |
-| `capture.event` | A capture event was appended or dropped at queue cap. |
-| `capture.pause` | Capture skipped because replay is paused. |
-| `replay.commit` | A queued event published or settled at `HEAD`. |
-| `replay.self_heal` | A blocked row was promoted because `HEAD` now matches the after-state. |
-| `replay.chain_reconcile` | A complete unpublished chain was proven at `HEAD` or preserved under `refs/acd/recovery/*`. |
-| `replay.conflict` | Replay produced `blocked_conflict`. |
-| `replay.failed` | Replay produced `failed`. |
-| `replay.update_ref` | A `git update-ref` attempt ran. |
-| `replay.live_index` | Path-scoped live-index repair ran or skipped. |
-| `replay.pause` | Replay skipped because paused. |
-| `intent.batch_wait` | Intent mode waited for count, age, or flush. |
-| `intent.planner.input` | A planner window was built. |
-| `intent.planner.output` | A valid planner result returned. |
-| `intent.planner.validation_failed` | Planner output failed validation. |
-| `intent.forced_aging` | A deferred capture was forced into a one-capture window. |
-| `branch_token.transition` | HEAD movement was classified. |
-| `daemon.pause` | Git operation marker paused or resumed the daemon. |
-
-Prompt traces are separate. Enable them with `ACD_AI_PROMPT_TRACE=1` and inspect
-with `acd prompt --last` or `acd prompt --seq <seq>`. Treat those files as
-sensitive because they can contain source text.
-
-## Multi-tool coexistence
-
-If another committer lands the same captured state first, ACD marks its queued
-event as published at the external `HEAD` instead of making a duplicate commit.
-Real mismatches still become `blocked_conflict`.
-
-One ACD process is the canonical writer for a repository, including all linked
-worktrees. The daemon holds `<git-common-dir>/acd-daemon.lock` for its lifetime,
-then also holds the worktree-local legacy lock for mixed-version compatibility.
-Moving or replacing one worktree's `<git-dir>/acd` directory does not create a
-second writer. If the common lock is held but the local PID and heartbeat do not
-identify that owner, `acd start` refuses instead of guessing.
-
-See [multi-tool.md](multi-tool.md).
+# Protection and publication
+
+## Observation and coverage
+
+Every accepted watcher event, complete poll, or optional semantic hint advances
+`observation_epoch` and immediately marks protection incomplete. A worker may
+report `protected=true` only when:
+
+- no scan or checkpoint is in flight;
+- no eligible path failed reading or stabilization; and
+- `covered_epoch == observation_epoch`.
+
+Watcher events use a 500 ms trailing debounce with a two-second maximum batch
+delay. A complete poll, normally every two seconds and adaptive for large
+repositories, repairs watcher loss and is always the coverage authority.
+
+## Eligible scope
+
+ACD reuses its bounded ignore, sensitive-path, symlink, file-size, and TOCTOU
+checks. Git-ignored and configured sensitive paths are outside the contract.
+Unreadable, unstable, or oversized eligible paths make the observation
+unprotected until a later complete rescan succeeds.
+
+The old pending-event limit no longer caps protection. It is accepted only as
+a deprecated publication-window limit. Completed checkpoint refs, not an
+in-memory queue size, bound durability.
+
+## Durable checkpoint completion
+
+1. Scan and hash the complete eligible scope.
+2. Append low-level capture records and build a tree through a scratch index.
+3. Write Git objects with supported fsync settings and reread them exactly.
+4. Insert the operation, checkpoint, membership, exclusions, object IDs, and
+   expected private ref as `prepared` in one full-synchronous SQLite
+   transaction.
+5. Create the private ref with create-only CAS.
+6. Observe its exact target.
+7. Atomically mark the checkpoint and operation `completed`.
+8. Allow publication to consume its member changes.
+
+On recovery, absent prepared refs are retryable, exact expected refs complete
+forward, and a different target becomes durable `needs_action`. Recovery never
+guesses or deletes an ambiguous ref.
+
+## Unsafe Git states
+
+Protection continues during detached HEAD, conflicts, branch changes,
+merge/rebase/cherry-pick/bisect markers, manual publication pause, or staging
+that would be unsafe to publish. Publication resumes only after the existing
+branch-token and Git safety gates prove a stable target.
+
+## Publication behavior
+
+Only completed-checkpoint members enter publication. Existing Event and Intent
+semantics remain intact. Provider, plan, message, grouping, test, or
+verification failure sets product state to `waiting`; the completed checkpoint
+and `protected` boolean do not regress.
+
+Publication writes a specialized prepared record before branch mutation,
+uses a literal-ref compare-and-swap, observes the exact target, and atomically
+settles member changes and checkpoint publication links. Startup recovery
+proves source, parent, target, tree, membership, and ref ownership. Ambiguity
+stays `needs_action`.
+
+## Retention
+
+ACD never prunes unpublished checkpoints, restore preimages, unresolved
+operations, or the newest completed checkpoint. Published checkpoints default
+to 30 days and at least 100 retained. A soft 5 GiB budget may prune published
+checkpoints older than seven days but never below 100. Protected-only content
+over budget is retained and reported, never discarded.
+
+Expected private refs make retained objects survive `git gc --prune=now`.

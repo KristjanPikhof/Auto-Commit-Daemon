@@ -6,7 +6,6 @@ package integration_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -110,9 +109,7 @@ VALUES (last_insert_rowid(), 0, 'create', 'recover.txt', '%s', '100644', 'exact'
 		t.Fatalf("acd fix apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
 	}
 	var payload reliabilityFixPlan
-	if err := json.Unmarshal([]byte(applied.Stdout), &payload); err != nil {
-		t.Fatalf("decode fix output: %v\n%s", err, applied.Stdout)
-	}
+	decodeProductEnvelopeData(t, applied.Stdout, &payload)
 	if payload.BackupPath == "" {
 		t.Fatalf("fix output missing backup path: %s", applied.Stdout)
 	}
@@ -236,9 +233,7 @@ VALUES (last_insert_rowid(), 0, 'create', 'legacy.txt', '%s', '100644', 'exact')
 		t.Fatalf("acd fix apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
 	}
 	var payload reliabilityFixPlan
-	if err := json.Unmarshal([]byte(applied.Stdout), &payload); err != nil {
-		t.Fatalf("decode fix output: %v\n%s", err, applied.Stdout)
-	}
+	decodeProductEnvelopeData(t, applied.Stdout, &payload)
 	if len(payload.Actions) != 0 || payload.RowsChanged != 0 || payload.BackupPath != "" {
 		t.Fatalf("published-only fixture should need no fix actions: %+v\n%s", payload, applied.Stdout)
 	}

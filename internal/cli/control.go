@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,11 +18,14 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
 )
 
 const (
 	controlHealthHealthy        = "healthy"
 	controlHealthWaiting        = "waiting"
+	controlHealthPublishing     = "publishing"
 	controlHealthDegraded       = "degraded"
 	controlHealthNeedsAttention = "needs_attention"
 	controlHealthOff            = "off"
@@ -35,21 +37,26 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
-	OK             bool     `json:"ok"`
-	Command        string   `json:"command"`
-	Repo           string   `json:"repo"`
-	Health         string   `json:"health"`
-	Summary        string   `json:"summary"`
-	NextAction     string   `json:"next_action"`
-	Registered     bool     `json:"registered"`
-	Enabled        bool     `json:"enabled"`
-	Daemon         string   `json:"daemon"`
-	DaemonPID      int      `json:"daemon_pid"`
-	PendingEvents  int      `json:"pending_events"`
-	BlockedEvents  int      `json:"blocked_events"`
-	Changed        bool     `json:"changed"`
-	Actions        []string `json:"actions"`
-	StatePreserved bool     `json:"state_preserved"`
+	OK                bool     `json:"ok"`
+	Command           string   `json:"command"`
+	Repo              string   `json:"repo"`
+	Health            string   `json:"health"`
+	Summary           string   `json:"summary"`
+	NextAction        string   `json:"next_action"`
+	Registered        bool     `json:"registered"`
+	Enabled           bool     `json:"enabled"`
+	Daemon            string   `json:"daemon"`
+	DaemonPID         int      `json:"daemon_pid"`
+	PendingEvents     int      `json:"pending_events"`
+	BlockedEvents     int      `json:"blocked_events"`
+	Changed           bool     `json:"changed"`
+	Actions           []string `json:"actions"`
+	StatePreserved    bool     `json:"state_preserved"`
+	Protected         bool     `json:"protected"`
+	Published         bool     `json:"published"`
+	CheckpointID      string   `json:"checkpoint_id,omitempty"`
+	CLIVersion        string   `json:"cli_version,omitempty"`
+	SupervisorVersion string   `json:"supervisor_version,omitempty"`
 }
 
 type controlRepoLookup struct {
@@ -62,12 +69,12 @@ type controlRepoLookup struct {
 func newOnCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "on",
-		Short: "Enable ACD and ensure its daemon is running for this repo",
-		Long: `Put the current repository into ACD's enabled desired state.
+		Short: "Enable checkpoint protection for this repository",
+		Long: `Enable checkpoint protection for the current repository.
 
-The command is idempotent: it registers an unknown repo, enables a disabled
-repo, and starts or refreshes its daemon. Existing hook commands and sessions
-keep their current behavior. State is preserved throughout.`,
+The command is idempotent and asks the user supervisor to reconcile the
+repository's worker. Run acd setup first when the checkpoint-first cutover has
+not been completed. Existing checkpoint history is preserved.`,
 		Example: `  acd on
   acd on --repo /path/to/repo
   acd on --json`,
@@ -81,14 +88,15 @@ keep their current behavior. State is preserved throughout.`,
 }
 
 func newOffCmd() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+	cmd := &cobra.Command{
 		Use:   "off",
-		Short: "Durably disable ACD for this repo while preserving state",
-		Long: `Put the current repository into ACD's disabled desired state.
+		Short: "Take a final checkpoint and disable protection",
+		Long: `Complete a final durable checkpoint barrier, then disable protection.
 
-The command is idempotent: it records an opt-out even for a previously unknown
-repo, stops a live daemon, clears start caches, and preserves .git/acd state.
-Harness hooks then skip this repo until acd on is run.`,
+The command is idempotent and preserves checkpoint history and repository
+state. If the final checkpoint cannot be confirmed, ACD remains enabled and
+returns needs_action unless --force is supplied.`,
 		Example: `  acd off
   acd off --repo /path/to/repo
   acd off --json`,
@@ -96,9 +104,11 @@ Harness hooks then skip this repo until acd on is run.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runControlOff(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
+			return runControlOffWithForce(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut, force)
 		},
 	}
+	cmd.Flags().BoolVar(&force, "force", false, "Disable even when the final checkpoint cannot be confirmed")
+	return cmd
 }
 
 // runControlStatus is the read-only default action for bare `acd`. It only
@@ -109,7 +119,13 @@ func runControlStatus(ctx context.Context, out io.Writer, repoFlag string, jsonO
 	if err != nil {
 		return err
 	}
-	return renderControl(out, res, jsonOut)
+	if err := renderControl(out, res, jsonOut); err != nil {
+		return err
+	}
+	if res.Health == controlHealthNeedsAttention || res.Health == controlHealthNotRepo {
+		return actionRequiredError("needs_action", res.Summary)
+	}
+	return nil
 }
 
 func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
@@ -121,43 +137,29 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 		return controlWorktreeError("on", repoFlag, err)
 	}
 
-	actions := make([]string, 0, 3)
+	actions := make([]string, 0, 2)
 	if !lookup.Registered {
-		if err := runRepoInit(ctx, io.Discard, lookup.Worktree.Root, true); err != nil {
-			return fmt.Errorf("acd on: register repo: %w", err)
-		}
-		actions = append(actions, "registered")
-		lookup, err = loadControlRepo(ctx, lookup.Worktree.Root)
-		if err != nil || !lookup.Registered {
-			if err == nil {
-				err = errors.New("registry row missing after registration")
-			}
-			return fmt.Errorf("acd on: reload registered repo: %w", err)
-		}
+		return actionRequiredError("setup_required", "acd on: repository is not configured; run `acd setup`")
 	}
-
-	target := central.RepoRemovalTarget{
-		Path:    lookup.Worktree.Root,
-		StateDB: state.DBPathFromGitDir(lookup.Worktree.GitDir),
+	if lookup.Record.RepositoryID == "" || lookup.Record.WorktreeID == "" {
+		return actionRequiredError("setup_required", "acd on: repository requires `acd setup` checkpoint cutover")
 	}
-	if lookup.Record.LifecycleDisabled() {
-		life, err := applyRepoEnable(ctx, lookup.Roots, target)
-		if err != nil {
-			return fmt.Errorf("acd on: enable repo: %w", err)
-		}
-		if life.Updated {
-			actions = append(actions, "enabled")
-		}
-		lookup.Record = life.Record
+	changed := lookup.Record.LifecycleDisabled()
+	if _, err := callSupervisor(ctx, lookup, "enable_repository", nil, 30*time.Second); err != nil {
+		return fmt.Errorf("acd on: %w", err)
 	}
-
-	wasRunning := controlDaemonRunning(ctx, lookup.Record)
-	if err := runStart(ctx, io.Discard, lookup.Worktree.Root, "", "", 0, false); err != nil {
-		return fmt.Errorf("acd on: ensure daemon: %w", err)
+	if changed {
+		actions = append(actions, "enabled")
+	} else {
+		actions = append(actions, "verified")
 	}
-	if !wasRunning {
-		actions = append(actions, "started")
+	if err := waitControlWorkerReady(ctx, lookup, 10*time.Second); err != nil {
+		return err
 	}
+	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout); err != nil {
+		return actionRequiredError("checkpoint_barrier_failed", fmt.Sprintf("acd on: initial checkpoint barrier failed: %v; run `acd doctor`", err))
+	}
+	actions = append(actions, "checkpointed")
 
 	res, err := inspectControl(ctx, lookup.Worktree.Root)
 	if err != nil {
@@ -171,12 +173,43 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 		return err
 	}
 	if !res.OK {
-		return fmt.Errorf("acd on: repository remains unhealthy: %s", res.Summary)
+		return actionRequiredError("needs_action", fmt.Sprintf("acd on: repository remains unhealthy: %s", res.Summary))
 	}
 	return nil
 }
 
+func waitControlWorkerReady(ctx context.Context, lookup controlRepoLookup, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		response, err := supervisor.DoWorker(ctx,
+			supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID),
+			supervisor.Request{
+				Version: supervisor.ProtocolVersion,
+				ID:      fmt.Sprintf("control-worker-ready-%d", time.Now().UnixNano()),
+				Method:  "status", RepositoryID: lookup.Record.RepositoryID,
+				WorktreeID: lookup.Record.WorktreeID,
+			}, time.Second)
+		if err == nil && response.OK && response.Version == supervisor.ProtocolVersion {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return unavailableError("acd on: worker did not become ready; run `acd doctor`")
+		case <-ticker.C:
+		}
+	}
+}
+
 func runControlOff(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
+	return runControlOffWithForce(ctx, out, repoFlag, jsonOut, false)
+}
+
+func runControlOffWithForce(ctx context.Context, out io.Writer, repoFlag string, jsonOut, force bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -185,37 +218,35 @@ func runControlOff(ctx context.Context, out io.Writer, repoFlag string, jsonOut 
 		return controlWorktreeError("off", repoFlag, err)
 	}
 
-	actions := make([]string, 0, 3)
+	actions := make([]string, 0, 2)
 	if !lookup.Registered {
-		// A durable opt-out needs a registry row; otherwise the next harness
-		// start would rediscover and enable the repo again.
-		if err := registerControlOptOut(lookup); err != nil {
-			return fmt.Errorf("acd off: register opt-out: %w", err)
+		res, inspectErr := inspectControl(ctx, lookup.Worktree.Root)
+		if inspectErr != nil {
+			return inspectErr
 		}
-		actions = append(actions, "registered")
-		lookup, err = loadControlRepo(ctx, lookup.Worktree.Root)
-		if err != nil || !lookup.Registered {
-			if err == nil {
-				err = errors.New("registry row missing after registration")
-			}
-			return fmt.Errorf("acd off: reload registered repo: %w", err)
+		res.Command = "off"
+		return renderControl(out, res, jsonOut)
+	}
+	if lookup.Record.LifecycleDisabled() {
+		res, inspectErr := inspectControl(ctx, lookup.Worktree.Root)
+		if inspectErr != nil {
+			return inspectErr
 		}
+		res.Command = "off"
+		return renderControl(out, res, jsonOut)
 	}
-
-	target := central.RepoRemovalTarget{
-		Path:    lookup.Worktree.Root,
-		StateDB: state.DBPathFromGitDir(lookup.Worktree.GitDir),
+	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout); err != nil {
+		if !force {
+			return actionRequiredError("checkpoint_barrier_failed", fmt.Sprintf("acd off: final checkpoint barrier failed: %v; rerun with --force only if you accept unconfirmed protection", err))
+		}
+		actions = append(actions, "checkpoint_unconfirmed")
+	} else {
+		actions = append(actions, "checkpointed")
 	}
-	life, err := applyRepoDisable(ctx, lookup.Roots, target)
-	if err != nil {
-		return fmt.Errorf("acd off: disable repo: %w", err)
+	if _, err := callSupervisor(ctx, lookup, "disable_repository", nil, 30*time.Second); err != nil {
+		return fmt.Errorf("acd off: %w", err)
 	}
-	if life.Updated {
-		actions = append(actions, "disabled")
-	}
-	if life.Stopped != nil && life.Stopped.Stopped {
-		actions = append(actions, "stopped")
-	}
+	actions = append(actions, "disabled")
 
 	res, err := inspectControl(ctx, lookup.Worktree.Root)
 	if err != nil {
@@ -226,6 +257,27 @@ func runControlOff(ctx context.Context, out io.Writer, repoFlag string, jsonOut 
 	res.Actions = actions
 	res.StatePreserved = true
 	return renderControl(out, res, jsonOut)
+}
+
+func callSupervisor(ctx context.Context, lookup controlRepoLookup, method string, params json.RawMessage, timeout time.Duration) (supervisor.Response, error) {
+	if err := ensureMutationSupervisor(ctx, lookup.Roots); err != nil {
+		return supervisor.Response{}, unavailableError(err.Error())
+	}
+	request := supervisor.Request{Version: supervisor.ProtocolVersion,
+		ID: fmt.Sprintf("control-%s-%d", method, time.Now().UnixNano()), Method: method,
+		RepositoryID: lookup.Record.RepositoryID, WorktreeID: lookup.Record.WorktreeID,
+		DeadlineMS: time.Now().Add(timeout).UnixMilli(), Params: params}
+	response, err := (supervisor.Client{SocketPath: lookup.Roots.SupervisorSocketPath(), Timeout: timeout}).Do(ctx, request)
+	if err != nil {
+		return response, unavailableError(err.Error())
+	}
+	if response.Error != nil {
+		if response.Error.Retryable {
+			return response, unavailableError(response.Error.Message)
+		}
+		return response, &CommandError{Code: response.Error.Code, Message: response.Error.Message, Exit: ExitInternal}
+	}
+	return response, nil
 }
 
 // registerControlOptOut records lifecycle intent without opening state.db or
@@ -273,6 +325,13 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 
 	base.Registered = true
 	base.StatePreserved = true
+	if lookup.Record.RepositoryID == "" || lookup.Record.WorktreeID == "" {
+		base.Health = controlHealthOff
+		base.Daemon = "stopped"
+		base.Summary = "This repository has not completed the checkpoint-first cutover."
+		base.NextAction = "Run `acd setup` to upgrade and enable protection."
+		return base, nil
+	}
 	if lookup.Record.LifecycleDisabled() {
 		base.Health = controlHealthOff
 		base.Daemon = "stopped"
@@ -295,10 +354,26 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 		base.OK = false
 		base.Health = controlHealthNeedsAttention
 		base.Summary = "ACD could not read the current repository health."
-		base.NextAction = "Run `acd diagnose` for details."
+		base.NextAction = "Run `acd doctor` for details."
 		return base, nil
 	}
 	applyControlStatus(&base, status)
+	if lookup.Record.RepositoryID != "" {
+		response, supervisorErr := (supervisor.Client{SocketPath: lookup.Roots.SupervisorSocketPath(), Timeout: 500 * time.Millisecond}).Do(ctx,
+			supervisor.Request{Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("status-%d", time.Now().UnixNano()), Method: "status", DeadlineMS: time.Now().Add(500 * time.Millisecond).UnixMilli()})
+		if supervisorErr == nil && response.Error == nil {
+			supervisorStatus, decodeErr := decodeProductData[supervisor.Status](response.Data)
+			if decodeErr == nil {
+				base.CLIVersion = version.String()
+				base.SupervisorVersion = supervisorStatus.Version
+				if supervisorStatus.Version != "" && supervisorStatus.Version != base.CLIVersion {
+					base.Health = controlHealthNeedsAttention
+					base.Summary = fmt.Sprintf("The CLI version %s does not match supervisor version %s.", base.CLIVersion, supervisorStatus.Version)
+					base.NextAction = "Run `acd setup` to install the matching managed binary."
+				}
+			}
+		}
+	}
 	return base, nil
 }
 
@@ -334,47 +409,68 @@ func controlDaemonRunning(ctx context.Context, rec central.RepoRecord) bool {
 }
 
 func applyControlStatus(res *controlResult, status statusReport) {
+	manualPause := status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace")
 	res.Daemon = status.Daemon
 	res.DaemonPID = status.PID
 	res.PendingEvents = status.PendingEvents
 	res.BlockedEvents = status.BlockedConflicts
+	res.Protected = status.Protected
+	res.Published = status.Protected && status.UnpublishedCheckpoints == 0 && status.PendingEvents == 0
+	res.CheckpointID = status.LatestCheckpointID
 
 	switch {
+	case status.CheckpointRetentionOverBudget:
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "Protected checkpoint content exceeds the configured soft budget; no protected data was dropped."
+		res.NextAction = "Run `acd repo gc` to review retention and storage usage."
+	case status.IntentV2.SchemaVersion > 0 && !status.CheckpointProtectionAvailable:
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "This repository still uses the v19 protection ledger."
+		res.NextAction = "Run `acd setup` to perform the checkpoint-first cutover."
+	case status.CheckpointProtectionAvailable && !status.Protected && !manualPause:
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "The latest observed changes are not yet covered by a completed checkpoint."
+		res.NextAction = "Run `acd doctor` if protection does not complete after the current scan."
 	case status.Stale:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "The ACD daemon heartbeat is stale."
+		res.Summary = "ACD background protection has stopped responding."
 		res.NextAction = "Run `acd on` to restart it."
 	case status.Daemon != "running" || status.PID <= 0 || !identity.Alive(status.PID):
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD is enabled, but its daemon process is not running."
+		res.Summary = "ACD is enabled, but background protection is not running."
 		res.NextAction = "Run `acd on` to start it."
-	case status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace"):
+	case manualPause:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD capture and replay are paused."
+		res.Summary = "ACD protection and publication are paused."
 		res.NextAction = "Run `acd status` to review the pause reason."
 	case status.BackpressurePaused:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD capture is paused by durable backpressure."
-		res.NextAction = "Run `acd diagnose` before clearing backpressure."
+		res.Summary = "ACD protection is paused because durable storage is full."
+		res.NextAction = "Run `acd doctor` before clearing backpressure."
 	case status.Configuration.Configuration == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "Configuration validation needs attention; capture remains active."
-		res.NextAction = "Run `acd configure` to retry validation or select another experience."
+		res.NextAction = "Run `acd config edit` to retry validation or select another experience."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "Replay is repeatedly failing; capture remains active."
-		res.NextAction = "Run `acd diagnose` to inspect the blocked sequence and candidate context."
+		res.Summary = "Git publication is repeatedly failing; checkpoint protection remains active."
+		res.NextAction = "Run `acd doctor` to inspect the blocked publication."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "A terminal replay event needs recovery on the active branch."
-		res.NextAction = "Run `acd diagnose` to inspect the blocker."
+		res.Summary = "A blocked publication needs recovery on the active branch."
+		res.NextAction = "Run `acd doctor` to inspect the blocker."
+	case status.SelfPublication.GitAppliedCount > 0:
+		res.Health = controlHealthPublishing
+		res.Summary = "Current changes are checkpointed while ACD publishes Git commits."
+		res.NextAction = "No action needed."
 	case status.Paused && status.Pause != nil && status.Pause.Source == "rewind_grace":
 		res.Health = controlHealthWaiting
 		res.Summary = "ACD rewind safety grace is active."
@@ -393,22 +489,22 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthDegraded
 		res.Summary = "The intent planner is degraded; deterministic fallback is keeping replay moving."
 		if status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen {
-			res.NextAction = "No immediate action needed; ACD is running the automatic provider probe. Run `acd diagnose` for details."
+			res.NextAction = "No immediate action needed; ACD is running the automatic provider probe. Run `acd doctor` for details."
 		} else {
-			res.NextAction = "No immediate action needed; ACD will probe the provider automatically after cooldown. Run `acd diagnose` for details."
+			res.NextAction = "No immediate action needed; ACD will probe the provider automatically after cooldown. Run `acd doctor` for details."
 		}
 	case status.IntentStrategy.PlannerHealthWarning != "":
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running, but persisted intent planner health metadata could not be read safely."
-		res.NextAction = "Run `acd diagnose` for the safe metadata warning."
+		res.NextAction = "Run `acd doctor` for the safe metadata warning."
 	case status.Replay.State == "degraded":
 		res.Health = controlHealthDegraded
 		res.Summary = "Replay encountered an error and remains retryable."
-		res.NextAction = "Run `acd diagnose` if the error repeats."
+		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the error repeats."
 	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
 		res.Health = controlHealthDegraded
 		res.Summary = "ACD is running with recoverable errors or deterministic fallback."
-		res.NextAction = "Run `acd diagnose` if the degraded state persists."
+		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the degraded state persists."
 	case status.PendingEvents > 0 && status.IntentStrategy.Active && status.IntentStrategy.BatchWaitActive:
 		res.Health = controlHealthWaiting
 		res.Summary = fmt.Sprintf("Intent mode is waiting normally with %d pending event(s).", status.PendingEvents)
@@ -445,26 +541,5 @@ func controlRequestedPath(repoFlag string) string {
 }
 
 func renderControl(out io.Writer, res controlResult, jsonOut bool) error {
-	if res.Actions == nil {
-		res.Actions = []string{}
-	}
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(res)
-	}
-	if res.Command != "status" {
-		change := "no changes"
-		if len(res.Actions) > 0 {
-			change = strings.Join(res.Actions, ", ")
-		}
-		fmt.Fprintf(out, "ACD %s: %s\n", res.Command, change)
-	}
-	fmt.Fprintf(out, "Health: %s\n", strings.ReplaceAll(res.Health, "_", " "))
-	if res.Repo != "" {
-		fmt.Fprintf(out, "Repo: %s\n", res.Repo)
-	}
-	fmt.Fprintf(out, "Summary: %s\n", res.Summary)
-	fmt.Fprintf(out, "Next: %s\n", res.NextAction)
-	return nil
+	return renderProductEnvelope(out, envelopeFromControl(res), jsonOut)
 }

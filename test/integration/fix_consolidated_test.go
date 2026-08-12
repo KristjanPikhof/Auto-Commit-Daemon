@@ -19,6 +19,7 @@ import (
 // exact HEAD matches publish the full pair, while explicit --force archives a
 // non-matching pair without deleting or retargeting its captured rows.
 func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -120,6 +121,7 @@ func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 // immutable whole-pair recovery; purge refuses ambiguous selectors and requires
 // explicit --all before preserving every planned pair.
 func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -149,7 +151,7 @@ func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
 		t.Fatalf("acd recover --auto --yes exit=%d\nstdout=%s\nstderr=%s",
 			recover.ExitCode, recover.Stdout, recover.Stderr)
 	}
-	const wantRecoverDeprec = "acd recover is deprecated; use acd fix [--clear-pause]. See acd fix --help."
+	const wantRecoverDeprec = "warning: acd recover is a compatibility alias; use acd support recover"
 	if !strings.Contains(recover.Stderr, wantRecoverDeprec) {
 		t.Fatalf("recover stderr missing deprecation banner\nwant: %q\nstderr: %q",
 			wantRecoverDeprec, recover.Stderr)
@@ -183,7 +185,7 @@ func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
 		t.Fatalf("acd purge-events --blocked --yes unexpectedly succeeded\nstdout=%s\nstderr=%s",
 			purge.Stdout, purge.Stderr)
 	}
-	if !strings.Contains(purge.Stderr, "selective --blocked/--pending/--failed recovery is no longer supported") {
+	if !strings.Contains(purge.Stdout+purge.Stderr, "selective --blocked/--pending/--failed recovery is no longer supported") {
 		t.Fatalf("purge-events selective refusal missing\nstdout=%s\nstderr=%s",
 			purge.Stdout, purge.Stderr)
 	}
@@ -222,6 +224,7 @@ func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
 }
 
 func TestFix_GeneratedPendingCleanupKeepsGitManual(t *testing.T) {
+	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
@@ -276,6 +279,7 @@ VALUES ('refs/heads/main', %s, '%s', 'delete', 'build/output.js', 'rescan', %f, 
 	if out, err := exec.Command("sqlite3", dbPath, seedSQL).CombinedOutput(); err != nil {
 		t.Fatalf("seed generated pending rows: %v\n%s", err, out)
 	}
+	prepareCheckpointRegistration(t, env, repo)
 
 	diagnose := runAcd(t, ctx, env, "diagnose", "--repo", repo, "--json")
 	if diagnose.ExitCode != 0 {
@@ -353,10 +357,32 @@ func decodeFixPlan(t *testing.T, body string) fixPlanProbe {
 	if strings.TrimSpace(body) == "" {
 		return plan
 	}
-	if err := json.Unmarshal([]byte(body), &plan); err != nil {
-		t.Fatalf("decode fix plan json: %v\nbody=%s", err, body)
-	}
+	decodeProductEnvelopeData(t, body, &plan)
 	return plan
+}
+
+func decodeProductEnvelopeData(t *testing.T, body string, target any) {
+	t.Helper()
+	var envelope struct {
+		OK   *bool           `json:"ok"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+		t.Fatalf("decode command json: %v\nbody=%s", err, body)
+	}
+	payload := []byte(body)
+	if envelope.OK != nil {
+		if !*envelope.OK {
+			t.Fatalf("command returned an error envelope: %s", body)
+		}
+		if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+			t.Fatalf("command envelope omitted data: %s", body)
+		}
+		payload = envelope.Data
+	}
+	if err := json.Unmarshal(payload, target); err != nil {
+		t.Fatalf("decode command data: %v\nbody=%s", err, body)
+	}
 }
 
 func hasFixActionKind(actions []fixActionProbe, kind string) bool {

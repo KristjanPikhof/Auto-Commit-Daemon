@@ -98,6 +98,7 @@ type startPayload struct {
 func startSessionJSON(t *testing.T, ctx context.Context, env []string, repo, sessionID, harness string, extraEnv ...string) startPayload {
 	t.Helper()
 	full := envWith(env, extraEnv...)
+	ensureCheckpointRuntime(t, full, repo, buildAcdBinary(t))
 	res := runAcd(t, ctx, full,
 		"start",
 		"--session-id", sessionID,
@@ -124,6 +125,7 @@ func startSessionJSON(t *testing.T, ctx context.Context, env []string, repo, ses
 // and run poll-only. We verify the daemon_meta breadcrumb (mode + reason)
 // and confirm that an edit still produces a commit through the poll loop.
 func TestFsnotify_BudgetExceededFallsBackToPoll(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("fsnotify not supported on windows in v1")
 	}
@@ -165,6 +167,7 @@ func TestFsnotify_BudgetExceededFallsBackToPoll(t *testing.T) {
 // poll-only mode at watcher construction with the "disabled_by_env"
 // reason.
 func TestFsnotify_DisabledByEnvFallsBackToPoll(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("fsnotify not supported on windows in v1")
 	}
@@ -201,6 +204,7 @@ func TestFsnotify_DisabledByEnvFallsBackToPoll(t *testing.T) {
 // The dynamic re-watch path must detect the budget overshoot and degrade to
 // poll mode without losing later capture/replay work.
 func TestFsnotify_RuntimeBudgetExceededFallsBackToPoll(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("fsnotify not supported on windows in v1")
 	}
@@ -250,6 +254,7 @@ func TestFsnotify_RuntimeBudgetExceededFallsBackToPoll(t *testing.T) {
 // to 4 seconds so CI flake risk stays bounded but the path is still
 // exercised.
 func TestFsnotify_LatencyOnSmallRepo(t *testing.T) {
+	t.Parallel()
 	if runtime.GOOS == "windows" {
 		t.Skip("fsnotify not supported on windows in v1")
 	}

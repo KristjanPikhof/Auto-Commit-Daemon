@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt vet release-snapshot clean tidy
+.PHONY: build test lint fmt vet docs-check release-snapshot clean tidy
 
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || date +v%Y-%m-%d)
 GIT_SHA  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -22,8 +22,11 @@ vet:
 fmt:
 	gofmt -w .
 
-lint: vet
+lint: vet docs-check
 	@test -z "$$(gofmt -l .)" || (gofmt -d . && echo "gofmt issues above" && exit 1)
+
+docs-check:
+	go run ./internal/config/configdoc --check
 
 tidy:
 	go mod tidy

@@ -42,6 +42,7 @@ import (
 // catches a regression where the bypass plumbing depends on a network
 // provider being configured (it must not).
 func TestFlush_LogicalCommitsSingleEditWithUnavailableProvider(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -62,6 +63,7 @@ func TestFlush_LogicalCommitsSingleEditWithUnavailableProvider(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	ensureCheckpointRuntime(t, env, repo, bin)
 
 	startRes := runAcd(t, ctx, env,
 		"start", "--repo", repo,
@@ -145,6 +147,7 @@ func TestFlush_LogicalCommitsSingleEditWithUnavailableProvider(t *testing.T) {
 // Mid-test, daemon_meta.path_quiescence.gated_count must report >=1 to
 // prove the gate actually held back the offer.
 func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -177,6 +180,7 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	ensureCheckpointRuntime(t, env, repo, bin)
 
 	startRes := runAcd(t, ctx, env,
 		"start", "--repo", repo,

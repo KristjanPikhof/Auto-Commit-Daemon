@@ -39,6 +39,26 @@ func TestRecoverSelfPublicationPreparedBeforeCASAbandonsWithoutEventTransition(
 		t, ctx, f.db, publication.ID, state.SelfPublicationAbandoned)
 }
 
+func TestRecoverSelfPublicationsBeforePlanningSettlesJournal(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if err := state.MetaSetMany(ctx, f.db, map[string]string{
+		MetaKeyBranchGeneration: "1",
+		MetaKeyBranchHead:       f.cctx.BaseHead,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	publication, seq, _ := seedRecoverableSelfPublication(
+		t, ctx, f, state.SelfPublicationPrepared)
+	if err := RecoverSelfPublicationsBeforePlanning(ctx, f.dir, f.db); err != nil {
+		t.Fatal(err)
+	}
+	assertSelfPublicationRecoveryEvent(
+		t, ctx, f.db, seq, state.EventStatePending, "")
+	assertSelfPublicationRecoveryPhase(
+		t, ctx, f.db, publication.ID, state.SelfPublicationAbandoned)
+}
+
 func TestRecoverSelfPublicationsLimitReportsRemainingWork(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -805,6 +825,32 @@ func TestRecoverSelfPublicationAttentionOnOtherPairBlocksMutation(t *testing.T) 
 	if err != nil || !ok || got != attention {
 		t.Fatalf("attention=(%q,%v,%v)", got, ok, err)
 	}
+}
+
+func TestRecoverSelfPublicationsBeforePlanningBlocksOtherPairJournal(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	seq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef: "refs/heads/other", BranchGeneration: 2,
+		BaseHead: "other-source", Operation: "update",
+		Path: "other-unsettled.txt", Fidelity: "full",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := state.SelfPublication{
+		ID: "other-pair-before-planning", BranchRef: "refs/heads/other",
+		BranchGeneration: 2, SourceHead: "other-source",
+		TargetCommitOID: "other-target", TargetTreeOID: "other-tree",
+		Members: []state.SelfPublicationMember{{EventSeq: seq}},
+	}
+	if created, err := state.PrepareSelfPublication(ctx, f.db, other); err != nil || !created {
+		t.Fatalf("PrepareSelfPublication=(%t,%v)", created, err)
+	}
+	if err := RecoverSelfPublicationsBeforePlanning(ctx, f.dir, f.db); !errors.Is(err, ErrSelfPublicationRecoveryAmbiguous) {
+		t.Fatalf("err=%v want other-pair ambiguity", err)
+	}
+	assertSelfPublicationRecoveryPhase(t, ctx, f.db, other.ID, state.SelfPublicationPrepared)
 }
 
 func TestRecoveryPreservesPendingSiblingsOnPreparedAmbiguity(t *testing.T) {

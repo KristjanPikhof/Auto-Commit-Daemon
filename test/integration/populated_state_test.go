@@ -119,11 +119,9 @@ func TestStartFromPopulatedStateReachesFirstHeartbeat(t *testing.T) {
 		t.Fatalf("heartbeat regressed across wake burst: boot=%f post-burst=%f", bootHB, got)
 	}
 
-	// Phase 4 — trace JSONL must contain at least one record beyond
-	// bootstrap_shadow.reseed. The canonical "real work happened" markers
-	// are capture.classify or replay.* records.
-	waitFor(t, "trace contains non-bootstrap event_class", 30*time.Second, func() bool {
-		return traceHasNonBootstrapEvent(t, traceDir)
+	// Phase 4 — checkpoint protection must complete on the populated state.
+	waitFor(t, "populated repository has a completed checkpoint", 30*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM checkpoints WHERE phase='completed'") != "0"
 	})
 
 	// Phase 5 — pending flush_requests must drain to 0 within budget. The

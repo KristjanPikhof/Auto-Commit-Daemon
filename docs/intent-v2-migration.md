@@ -1,116 +1,50 @@
-# Migrate to Intent v2
+# v19 to v20 checkpoint cutover
 
-Intent v2 is a cutover for repositories already using Intent mode. It does not
-silently preserve the v1 planner path.
+ACD upgrades all registered repositories in one transaction through
+`acd setup`. There is no legacy engine mode, dual-read period, staged
+production rollout, or automatic post-commit downgrade.
 
-## Check the repository after upgrading
+## Preflight
 
-Build or install the new binary through your normal release process, then run:
+Setup resolves every enabled worktree, checks SQLite, dry-runs exact-chain
+proof, resolves all required refs and objects, verifies disk capacity, rejects
+unsafe Git operations, and creates one immutable plan digest over repositories,
+services, integrations, and configuration.
 
-~~~bash
-acd status
-acd diagnose
-~~~
+Missing disabled worktrees may proceed only when their database has no
+unpublished or terminal work. One unresolved or ambiguous repository blocks
+the complete cutover.
 
-The daemon migrates the repository database from schema v14 to v15 on a
-writable start. The migration is additive. It retains capture events, planner
-windows, decisions, runtime revisions, experiments, and recovery data.
-Read-only commands do not migrate the database.
+## Apply
 
-| Existing repository | Migrated mode |
-|---|---|
-| Event without an explicit preset | Current `event.fast@3` |
-| Event with explicit compatible settings | Event plus the inferred or selected preset |
-| Intent | Current `intent.balanced@3` |
+1. Start a temporary protection bridge for every enabled worktree.
+2. Stop old owners through canonical ownership checks.
+3. Acquire repository locks in sorted common-directory order.
+4. Create and verify WAL-consistent v19 database backups.
+5. Preserve provable unpublished chains as checkpoint or recovery history.
+6. Create complete migration checkpoints, including bridge-observed edits.
+7. Apply schema v20 to every repository and registry v2 globally.
+8. Install the managed binary and owned integrations, then start the macOS
+   session supervisor or install the Linux user service.
+9. Run the isolated checkpoint/publish/restore self-test.
+10. Hold new workers until schema, version, ownership, recovery, and current
+    coverage are proven.
+11. Import any final bridge checkpoint, prove no observation gap, and commit.
 
-Existing provider, model, endpoint, timeout, commit format, and explicit v1
-intent tuning remain advanced overrides. A differing preset-owned override
-marks the result `Balanced (customized)`.
+Historical published events are not fabricated into checkpoints. The cutover
+imports current full worktree states, exact unpublished chains, required
+recovery snapshots, and a bounded recent published-history projection.
 
-## Resolve migration attention
+Existing settings are preserved exactly. Fresh installations use deterministic
+Intent/Fast.
 
-Intent v2 requires a tested provider, redacted diff context, and built-in
-structural verification for Balanced. If any
-prerequisite is missing, ACD
-continues capturing changes but stops replay:
+## Rollback and recovery
 
-~~~text
-needs_attention
-run acd configure
-~~~
+Before global commit, setup stops held v20 workers, restores every preimage and
+v19 database, CAS-deletes only refs it created at their exact expected targets,
+and restores the prior session or service state. A bridge ref with otherwise
+unrepresented work is retained with a local recovery manifest.
 
-Resolve the complete configuration in one guided transaction:
-
-~~~bash
-acd configure
-~~~
-
-Global setup shows the exact diff-egress policy, tests the provider, and stores
-an optional protected credential without opening repository state. Use
-`acd configure --repo .` when a migrated repository needs an override or
-Strict Review command.
-
-Do not work around the gate by clearing diff consent or relying on v1
-environment-only grouping. Metadata-only Intent v2 is unsupported in regular
-presets, and the daemon will not fall back to it.
-
-## Keep existing credentials
-
-An existing `ACD_AI_API_KEY` continues to work and has priority over the new
-protected file. To move the value into the XDG credential file:
-
-~~~bash
-printf '%s\n' "$ACD_AI_API_KEY" | acd auth set --stdin
-acd auth status
-~~~
-
-Unset the environment variable only after `acd auth status` reports the file
-source. ACD never copies a secret automatically.
-
-## Understand repair activation
-
-Migrated Balanced repositories enable automatic repair for at most three
-eligible ACD commits within ten minutes. Repair still requires the strict
-private-history, exact-HEAD, staging, Git-operation, atomicity, and verification
-checks documented in [Intent commit flow](intent-commit-flow.md).
-
-To disable automatic repair without weakening the other Balanced gates, use
-the advanced settings editor and customize `intent.repair.enabled`. Balanced
-has no project command. Switch a Strict Review repository back to Everyday
-through `acd configure --repo .` to remove full command verification.
-
-## Roll back safely
-
-Schema v15 is additive, but an older binary refuses a newer database instead of
-guessing how to read it. Do not point a pre-v15 daemon at a repository after
-migration.
-
-If replay needs attention after upgrade, keep the v2 binary and run
-`acd configure`. Captures are already durable, so replacing the database or
-purging events is the wrong recovery path.
-
-Intent repair backup refs use `refs/acd/intent-repair/.../backup`. A crash after
-the Git ref update leaves the mapping recoverable on restart. Keep the backup
-and follow `acd status`, `acd doctor`, or `acd fix --dry-run` guidance rather
-than resetting or deleting refs by hand.
-
-## Upgrade harness boundaries
-
-Regenerate or merge the current harness snippet after upgrading:
-
-~~~bash
-acd setup codex
-acd setup claude-code
-acd setup cursor
-acd setup opencode
-acd setup pi
-~~~
-
-Codex Stop now records `acd touch --soft-boundary`. Other supported harnesses
-retain logical flush boundaries. Setup prints snippets only; it does not edit
-external hook files.
-
-## Implementation archive
-
-The implementation plan is archived as `acd-intent-v2-2026-07-26` in Trekoon
-epic `f82f0e6b-601c-4019-b9bc-1af3b54fc4dd`.
+After commit, new changes may exist only in v20 checkpoints, so downgrade is
+forbidden. Recovery proceeds forward with `acd doctor` and
+`acd support repair`.

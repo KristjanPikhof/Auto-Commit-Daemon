@@ -87,6 +87,97 @@ type recoveryLiveState struct {
 	hasHead bool
 }
 
+// ProveUnpublishedChain calculates the exact outcome of reconciling one
+// unpublished suffix without creating a scratch index, writing Git objects or
+// refs, or changing SQLite state. Setup uses this during migration preflight;
+// apply subsequently reruns the full proof under canonical repository locks.
+func ProveUnpublishedChain(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	opts RecoveryReconcileOptions,
+) (RecoveryChainResult, error) {
+	var result RecoveryChainResult
+	if repoRoot == "" || db == nil {
+		return result, fmt.Errorf("daemon: prove recovery chain: repoRoot and db required")
+	}
+	if opts.BranchRef == "" || opts.BranchGeneration < 1 || opts.FirstSeq < 1 {
+		return result, fmt.Errorf("daemon: prove recovery chain: invalid chain selector")
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+
+	chain, err := state.LoadUnpublishedRecoveryChain(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, opts.FirstSeq,
+	)
+	if err != nil {
+		return result, fmt.Errorf("daemon: prove recovery chain: load suffix: %w", err)
+	}
+	if len(chain) == 0 || chain[0].Event.Seq != opts.FirstSeq {
+		return result, nil
+	}
+	first := chain[0].Event
+	last := chain[len(chain)-1].Event
+	recoveryContext, err := state.LoadPublishedRecoveryContext(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, first.Seq, last.Seq,
+	)
+	if err != nil {
+		return result, fmt.Errorf("daemon: prove recovery chain: load published context: %w", err)
+	}
+	recoveryContext, err = excludeSupersededPublishedContext(ctx, db, recoveryContext)
+	if err != nil {
+		return result, err
+	}
+	recoveryContext, err = excludeSeedRepresentedPublishedContext(
+		ctx, repoRoot, first.BaseHead, recoveryContext,
+	)
+	if err != nil {
+		return result, err
+	}
+	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, first.BaseHead, recoveryContext)
+	if err != nil {
+		return result, err
+	}
+	recoveryContext, err = representedPublishedContext(ctx, repoRoot, recoveryContext)
+	if err != nil {
+		return result, err
+	}
+
+	live, err := currentRecoveryLiveState(ctx, repoRoot, nil, nil)
+	if err != nil {
+		return result, err
+	}
+	if !live.hasHead && !opts.ArchiveOnly {
+		return result, fmt.Errorf("daemon: prove recovery chain: HEAD is missing; archive-only mode required")
+	}
+	materialization := make([]state.RecoveryChainEvent, 0, len(recoveryContext)+len(chain))
+	materialization = append(materialization, recoveryContext...)
+	materialization = append(materialization, chain...)
+	if err := validateRecoveryObjects(ctx, repoRoot, materialization); err != nil {
+		return result, err
+	}
+	finalState, err := materializeRecoveryState(ctx, repoRoot, first.BaseHead, recoveryContext, chain)
+	if err != nil {
+		return result, err
+	}
+	matched := false
+	if live.hasHead && !opts.ArchiveOnly {
+		matched, err = recoveryChainMatchesHEAD(ctx, repoRoot, live.head, chain, finalState)
+		if err != nil {
+			return result, err
+		}
+	}
+	outcome := state.EventStateRecovered
+	if matched {
+		outcome = state.EventStatePublished
+	}
+	return RecoveryChainResult{
+		Handled: true, Outcome: outcome, FirstSeq: first.Seq, LastSeq: last.Seq,
+		EventCount: len(chain),
+	}, nil
+}
+
 // ReconcileUnpublishedChain proves or preserves the exact unpublished suffix
 // beginning at opts.FirstSeq. It never mutates HEAD, the live index, or the
 // worktree. The recovery tree is reconstructed from the first event's
@@ -1121,6 +1212,75 @@ func materializeRecoveryTree(
 		return "", nil, fmt.Errorf("daemon: reconcile recovery chain: materialized tree failed final-state verification")
 	}
 	return treeOID, finalState, nil
+}
+
+func materializeRecoveryState(
+	ctx context.Context,
+	repoRoot string,
+	baseHead string,
+	recoveryContext []state.RecoveryChainEvent,
+	chain []state.RecoveryChainEvent,
+) ([]recoveryPathState, error) {
+	ordered := make([]state.RecoveryChainEvent, 0, len(recoveryContext)+len(chain))
+	ordered = append(ordered, recoveryContext...)
+	ordered = append(ordered, chain...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].Event.Seq < ordered[j].Event.Seq
+	})
+	chainSeqs := make(map[int64]struct{}, len(chain))
+	for _, item := range chain {
+		chainSeqs[item.Event.Seq] = struct{}{}
+	}
+	allTouched := make(map[string]struct{})
+	chainTouched := make(map[string]struct{})
+	for _, item := range ordered {
+		for _, path := range touchedPaths(item.Ops) {
+			allTouched[path] = struct{}{}
+			if _, unpublished := chainSeqs[item.Event.Seq]; unpublished {
+				chainTouched[path] = struct{}{}
+			}
+		}
+	}
+	if len(chainTouched) == 0 {
+		return nil, fmt.Errorf("daemon: prove recovery chain: empty materialized chain")
+	}
+	paths := make([]string, 0, len(allTouched))
+	for path := range allTouched {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	entries, err := git.LsTree(ctx, repoRoot, baseHead, false, git.LiteralPathspecs(paths)...)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: prove recovery chain: read base tree %s: %w", baseHead, err)
+	}
+	byPath := make(map[string]git.IndexEntry, len(entries))
+	for _, entry := range entries {
+		if _, exists := byPath[entry.Path]; exists {
+			return nil, fmt.Errorf("daemon: prove recovery chain: duplicate base path %s", entry.Path)
+		}
+		byPath[entry.Path] = git.IndexEntry{Mode: entry.Mode, OID: entry.OID, Path: entry.Path}
+	}
+	for _, item := range ordered {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if conflict := applyRecoveryOpsInMemory(byPath, item.Ops); conflict != "" {
+			return nil, fmt.Errorf("daemon: prove recovery chain: provenance mismatch seq=%d: %s", item.Event.Seq, conflict)
+		}
+	}
+	chainPaths := make([]string, 0, len(chainTouched))
+	for path := range chainTouched {
+		chainPaths = append(chainPaths, path)
+	}
+	sort.Strings(chainPaths)
+	finalState := make([]recoveryPathState, 0, len(chainPaths))
+	for _, path := range chainPaths {
+		entry, present := byPath[path]
+		finalState = append(finalState, recoveryPathState{
+			Path: path, Present: present, Mode: entry.Mode, OID: entry.OID,
+		})
+	}
+	return finalState, nil
 }
 
 func applyRecoveryOpsInMemory(index map[string]git.IndexEntry, ops []state.CaptureOp) string {

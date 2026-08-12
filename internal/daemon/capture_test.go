@@ -9,9 +9,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -624,6 +626,64 @@ func TestCapture_OversizeMetaOnly(t *testing.T) {
 	}
 	if !strings.Contains(val, "size=4096") || !strings.Contains(val, "cap=2048") {
 		t.Fatalf("oversize meta value=%q, want size=4096>cap=2048", val)
+	}
+}
+
+func TestScanProtectedEntries_ReusesExactIndexedOversizeBlob(t *testing.T) {
+	f := newCaptureFixture(t)
+	path := "tracked-large.bin"
+	body := bytes.Repeat([]byte("a"), 4096)
+	if err := os.WriteFile(filepath.Join(f.dir, path), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir}, "add", "--", path); err != nil {
+		t.Fatal(err)
+	}
+	indexed, err := git.LsFilesStaged(context.Background(), f.dir, path)
+	if err != nil || len(indexed) != 1 {
+		t.Fatalf("index entries=(%+v,%v)", indexed, err)
+	}
+
+	entries, _, summary, err := ScanProtectedEntries(context.Background(), f.dir, CaptureOpts{
+		IgnoreChecker: f.ig,
+		MaxFileBytes:  2048,
+	})
+	if err != nil {
+		t.Fatalf("ScanProtectedEntries: %v", err)
+	}
+	if summary.Oversize != 0 {
+		t.Fatalf("oversize=%d want 0", summary.Oversize)
+	}
+	for _, entry := range entries {
+		if entry.Path == path {
+			if entry.OID != indexed[0].OID || entry.Mode != indexed[0].Mode {
+				t.Fatalf("entry=%+v index=%+v", entry, indexed[0])
+			}
+			return
+		}
+	}
+	t.Fatalf("missing %s in entries: %+v", path, entries)
+}
+
+func TestScanProtectedEntries_RejectsDirtyIndexedOversizeBlob(t *testing.T) {
+	f := newCaptureFixture(t)
+	path := "tracked-large.bin"
+	if err := os.WriteFile(filepath.Join(f.dir, path), bytes.Repeat([]byte("a"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir}, "add", "--", path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, path), bytes.Repeat([]byte("b"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, summary, err := ScanProtectedEntries(context.Background(), f.dir, CaptureOpts{
+		IgnoreChecker: f.ig,
+		MaxFileBytes:  2048,
+	})
+	if err == nil || summary.Oversize != 1 {
+		t.Fatalf("err=%v oversize=%d, want incomplete scan with one oversize", err, summary.Oversize)
 	}
 }
 
@@ -1595,6 +1655,143 @@ func TestCapture_DisablePendingCapOptOverride(t *testing.T) {
 	}
 }
 
+func TestCaptureCheckpointProtectsBeforeCappedEventsBecomePublishable(t *testing.T) {
+	t.Setenv(EnvMaxPendingEvents, "1")
+	f := newCaptureFixture(t)
+	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := checkpointpkg.Store{DB: f.db}
+	opts := CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		CheckpointStore:  &store,
+		WorktreeID:       checkpointpkg.WorktreeID(f.dir),
+		ObservationEpoch: 11,
+		CheckpointReason: state.CheckpointReasonPoll,
+	}
+	summary, err := Capture(context.Background(), f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Protected || summary.CheckpointID == "" {
+		t.Fatalf("summary=%+v", summary)
+	}
+	if summary.EventsDropped != 0 || summary.BackpressurePaused {
+		t.Fatalf("checkpoint capture dropped deferred events: %+v", summary)
+	}
+	if summary.EventsAppended != 1 || summary.PendingDepth != 1 {
+		t.Fatalf("checkpoint capture ignored pending cap: %+v", summary)
+	}
+	projection, err := state.ReadCheckpointProjection(context.Background(), f.db.Path(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Completed != 1 || projection.Prepared != 0 || projection.Latest == nil {
+		t.Fatalf("projection=%+v", projection)
+	}
+	publishable, err := state.PublishableEvents(context.Background(), f.db, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(publishable) != 1 {
+		t.Fatalf("publishable=%d appended=%d", len(publishable), summary.EventsAppended)
+	}
+	entries, err := git.LsTree(context.Background(), f.dir,
+		projection.Latest.CommitOID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"one.txt": false, "two.txt": false, "three.txt": false}
+	for _, entry := range entries {
+		if _, ok := want[entry.Path]; ok {
+			want[entry.Path] = true
+		}
+	}
+	for path, found := range want {
+		if !found {
+			t.Fatalf("checkpoint tree missing %s: %+v", path, entries)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(f.dir, "four.txt"), []byte("four"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts.ObservationEpoch = 12
+	second, err := Capture(context.Background(), f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Protected || second.CheckpointID == "" || second.EventsAppended != 0 {
+		t.Fatalf("saturated checkpoint did not remain protection-only: %+v", second)
+	}
+	latest, err := state.ReadCheckpointProjection(context.Background(), f.db.Path(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Latest == nil || latest.Latest.ID != second.CheckpointID || len(latest.Latest.EventSeqs) != 0 {
+		t.Fatalf("latest saturated checkpoint=%+v", latest.Latest)
+	}
+
+	opts.ObservationEpoch = 13
+	third, err := Capture(context.Background(), f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.CheckpointID != second.CheckpointID || third.EventsAppended != 0 {
+		t.Fatalf("unchanged saturated pass churned checkpoint: second=%+v third=%+v", second, third)
+	}
+}
+
+func TestProtectWorktreeCheckpointsDetachedStateWithoutPublicationEvents(t *testing.T) {
+	f := newCaptureFixture(t)
+	store := checkpointpkg.Store{DB: f.db}
+	detached := CaptureContext{BaseHead: f.cctx.BaseHead}
+	opts := CaptureOpts{
+		IgnoreChecker:    f.ig,
+		SensitiveMatcher: f.matcher,
+		CheckpointStore:  &store,
+		WorktreeID:       checkpointpkg.WorktreeID(f.dir),
+		CheckpointReason: state.CheckpointReasonPoll,
+		ObservationEpoch: 1,
+	}
+	first, err := ProtectWorktree(context.Background(), f.dir, f.db, detached, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Protected || first.CheckpointID == "" {
+		t.Fatalf("first=%+v", first)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "detached-edit.txt"), []byte("safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts.ObservationEpoch = 2
+	second, err := ProtectWorktree(context.Background(), f.dir, f.db, detached, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Protected || second.CheckpointID == first.CheckpointID {
+		t.Fatalf("second=%+v first=%+v", second, first)
+	}
+	var events int
+	if err := f.db.ReadSQL().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM capture_events`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Fatalf("protection-only pass created %d publication events", events)
+	}
+	projection, err := state.ReadCheckpointProjection(context.Background(), f.db.Path(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.Completed != 2 || projection.Latest == nil || projection.Latest.ObservedRef != "" {
+		t.Fatalf("projection=%+v", projection)
+	}
+}
+
 // TestCapture_PathQuiescenceTrackerStampsLastWriteTimes verifies that
 // running Capture stamps the per-path quiescence tracker. The capture row
 // itself is always durable — the tracker is a separate hint consulted by
@@ -1709,5 +1906,65 @@ func TestCapture_MaxPendingEventsOverrideTakesPrecedence(t *testing.T) {
 	}
 	if sum.EventsAppended != 8 {
 		t.Fatalf("EventsAppended=%d with override=8; want 8; summary=%+v", sum.EventsAppended, sum)
+	}
+}
+
+func TestBeginProtectionObservationInvalidatesPriorCoverage(t *testing.T) {
+	ctx := context.Background()
+	f := newCaptureFixture(t)
+	if err := state.MetaSetMany(ctx, f.db, map[string]string{
+		MetaKeyProtectionObservationEpoch: "7",
+		MetaKeyProtectionCoveredEpoch:     "7",
+		MetaKeyProtectionComplete:         "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := BeginProtectionObservation(ctx, f.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch != 8 {
+		t.Fatalf("epoch=%d want=8", epoch)
+	}
+	complete, _, err := state.MetaGet(ctx, f.db, MetaKeyProtectionComplete)
+	if err != nil || complete != "false" {
+		t.Fatalf("protection complete=(%q,%v), want false", complete, err)
+	}
+}
+
+func TestBeginProtectionObservationJoinsConcurrentHints(t *testing.T) {
+	ctx := context.Background()
+	f := newCaptureFixture(t)
+	if err := state.MetaSetMany(ctx, f.db, map[string]string{
+		MetaKeyProtectionObservationEpoch: "11",
+		MetaKeyProtectionComplete:         "true",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const callers = 16
+	epochs := make(chan int64, callers)
+	errs := make(chan error, callers)
+	var group sync.WaitGroup
+	for range callers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			epoch, err := BeginProtectionObservation(ctx, f.db)
+			epochs <- epoch
+			errs <- err
+		}()
+	}
+	group.Wait()
+	close(epochs)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for epoch := range epochs {
+		if epoch != 12 {
+			t.Fatalf("epoch=%d want=12", epoch)
+		}
 	}
 }

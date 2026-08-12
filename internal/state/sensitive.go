@@ -159,6 +159,18 @@ func NewSensitiveMatcher() *SensitiveMatcher {
 	return newSensitiveMatcher(sensitiveGlobConfigFromEnv())
 }
 
+// NewSensitiveMatcherFromValue builds a repository-scoped matcher without
+// mutating process environment. Empty input deliberately retains the secure
+// default deny list.
+func NewSensitiveMatcherFromValue(value string) *SensitiveMatcher {
+	if parsed := splitAndTrim(value); len(parsed) > 0 {
+		return newSensitiveMatcher(sensitiveGlobConfig{deny: expandGlobs(parsed)})
+	}
+	return newSensitiveMatcher(sensitiveGlobConfig{
+		deny: expandGlobs(DefaultSensitiveGlobs), allow: expandGlobs(DefaultSensitiveAllowGlobs),
+	})
+}
+
 func newSensitiveMatcher(cfg sensitiveGlobConfig) *SensitiveMatcher {
 	return &SensitiveMatcher{patterns: cfg.deny, allow: cfg.allow}
 }

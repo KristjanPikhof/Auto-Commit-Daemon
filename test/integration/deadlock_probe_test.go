@@ -77,7 +77,8 @@ func TestDaemon_GoroutineDeadlockProbe(t *testing.T) {
 	go func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), budget)
 		defer stopCancel()
-		res := runAcd(t, stopCtx, traceEnv, "stop", "--repo", repo, "--force", "--json")
+		res := runAcd(t, stopCtx, traceEnv,
+			"stop", "--session-id", "deadlock-1", "--repo", repo, "--force", "--json")
 		if res.ExitCode != 0 {
 			stopDone <- fmt.Errorf("acd stop exit=%d\nstdout=%s\nstderr=%s",
 				res.ExitCode, res.Stdout, res.Stderr)
@@ -94,10 +95,10 @@ func TestDaemon_GoroutineDeadlockProbe(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stop failed: %v", err)
 		}
-		if !waitStopped(repo, 5*time.Second) {
-			t.Fatalf("daemon_state.mode never reached 'stopped' after acd stop succeeded")
+		if readDaemonStateMode(repo) != "running" {
+			t.Fatalf("supervisor worker stopped after session close")
 		}
-		// Happy path — the daemon shut down cleanly inside the 30s budget.
+		// Happy path — the session mutation completed and the worker stayed responsive.
 		return
 	case <-deadline.C:
 		// Phase 4 — hang detected. Capture goroutine state by sending

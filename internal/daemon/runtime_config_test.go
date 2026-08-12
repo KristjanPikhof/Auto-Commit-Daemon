@@ -92,6 +92,40 @@ func runtimeBuilder(db *state.DB, closers map[string]*runtimeTestCloser) Runtime
 	}}
 }
 
+func TestRuntimeConfigAllowsDeterministicIntentFastWithoutCredentials(t *testing.T) {
+	db := openTestDB(t)
+	values := map[string]any{
+		config.FieldProvider:            "deterministic",
+		config.FieldDiffEgress:          false,
+		config.FieldCommitStrategy:      "intent",
+		config.FieldCommitPreset:        "fast",
+		config.FieldIntentVerification:  "structural",
+		config.FieldIntentRepairEnabled: false,
+		"preset_id":                     "intent.fast",
+		"preset_version":                config.PresetCatalogVersion,
+		"customized":                    true,
+		"confirmations":                 []string{},
+	}
+	body, err := json.Marshal(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := state.InsertConfigRevision(context.Background(), db,
+		state.ConfigRevisionInput{Snapshot: body, Profile: "default", Scope: "repository"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := (RuntimeBundleBuilder{DB: db, RepoRoot: t.TempDir()}).
+		BuildRevision(context.Background(), revision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.ReplayBlockedReason != "" || bundle.IntentPlanner == nil ||
+		bundle.PresetID != "intent.fast" || bundle.IntentPreset != config.PresetFast {
+		t.Fatalf("deterministic Intent/Fast bundle=%+v", bundle)
+	}
+}
+
 func TestRuntimeBundleLeaseKeepsOneImmutableRevision(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "test-only-key")
 	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)

@@ -6,7 +6,69 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 )
+
+// BeginOrJoinMetaEpoch atomically joins an incomplete epoch or begins the
+// next one on the serialized writer connection.
+func BeginOrJoinMetaEpoch(ctx context.Context, d *DB, epochKey, completeKey string) (int64, error) {
+	if d == nil || epochKey == "" || completeKey == "" {
+		return 0, errors.New("state: begin or join meta epoch requires state and keys")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("state: begin meta epoch: %w", err)
+	}
+	defer tx.Rollback()
+	return beginOrJoinMetaEpochTx(ctx, tx, epochKey, completeKey)
+}
+
+func beginOrJoinMetaEpochTx(ctx context.Context, tx *sql.Tx, epochKey, completeKey string) (int64, error) {
+	read := func(key string) (string, bool, error) {
+		var value string
+		err := tx.QueryRowContext(ctx, `SELECT value FROM daemon_meta WHERE key=?`, key).Scan(&value)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return value, err == nil, err
+	}
+	complete, _, err := read(completeKey)
+	if err != nil {
+		return 0, fmt.Errorf("state: read meta epoch completion: %w", err)
+	}
+	rawEpoch, epochExists, err := read(epochKey)
+	if err != nil {
+		return 0, fmt.Errorf("state: read meta epoch: %w", err)
+	}
+	current, parseErr := strconv.ParseInt(rawEpoch, 10, 64)
+	if complete == "false" && epochExists && parseErr == nil && current > 0 {
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("state: join meta epoch: %w", err)
+		}
+		return current, nil
+	}
+	if parseErr != nil || current < 0 {
+		current = 0
+	}
+	return writeNextMetaEpoch(ctx, tx, epochKey, completeKey, current+1)
+}
+
+func writeNextMetaEpoch(ctx context.Context, tx *sql.Tx, epochKey, completeKey string, next int64) (int64, error) {
+	const upsert = `
+INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_ts=excluded.updated_ts`
+	ts := nowSeconds()
+	if _, err := tx.ExecContext(ctx, upsert, epochKey, strconv.FormatInt(next, 10), ts); err != nil {
+		return 0, fmt.Errorf("state: write meta epoch: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, upsert, completeKey, "false", ts); err != nil {
+		return 0, fmt.Errorf("state: write meta epoch completion: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("state: commit meta epoch: %w", err)
+	}
+	return next, nil
+}
 
 // MetaGet reads a single key from daemon_meta. Returns ("", false, nil) when
 // the key is absent. The daemon uses this for the branch-generation token,

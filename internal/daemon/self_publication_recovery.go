@@ -116,6 +116,67 @@ func RecoverSelfPublications(
 	return summary, nil
 }
 
+// RecoverSelfPublicationsBeforePlanning settles every crash journal before a
+// v20 worker or migration reconciles Intent candidate membership.
+func RecoverSelfPublicationsBeforePlanning(ctx context.Context, repoRoot string, db *state.DB) error {
+	recoverable, err := state.RecoverableSelfPublications(ctx, db, 1)
+	if err != nil {
+		return err
+	}
+	_, unknown, err := state.FirstUnknownRecoverableSelfPublication(ctx, db)
+	if err != nil {
+		return err
+	}
+	if len(recoverable) == 0 && !unknown {
+		return nil
+	}
+	branchRef, err := git.RunBranchRef(ctx, repoRoot)
+	if err != nil {
+		return fmt.Errorf("daemon: recover self-publications before planning: active branch required: %w", err)
+	}
+	if branchRef == "" {
+		return errors.New("daemon: recover self-publications before planning: active branch required")
+	}
+	generation, err := LoadBranchGeneration(ctx, db)
+	if err != nil {
+		return err
+	}
+	baseHead, err := LoadBranchHead(ctx, db)
+	if err != nil {
+		return err
+	}
+	other, ok, err := state.FirstRecoverableSelfPublicationOutsidePair(
+		ctx, db, branchRef, generation)
+	if err != nil {
+		return fmt.Errorf("daemon: inspect other-pair self-publication: %w", err)
+	}
+	if ok {
+		result := SelfPublicationRecoveryResult{
+			ID: other.ID, Phase: other.Phase, TargetOID: other.TargetCommitOID,
+		}
+		recoverErr := ambiguousSelfPublication(other,
+			"recoverable journal belongs to another exact branch pair", nil)
+		if persistErr := persistSelfPublicationRecoveryAttention(ctx, db, result); persistErr != nil {
+			return errors.Join(recoverErr, persistErr)
+		}
+		return recoverErr
+	}
+	for {
+		summary, err := RecoverSelfPublications(ctx, repoRoot, db, CaptureContext{
+			BranchRef: branchRef, BranchGeneration: generation, BaseHead: baseHead,
+		}, ReplayOpts{Limit: 50})
+		if err != nil {
+			return err
+		}
+		if summary.FinalTargetOID != "" {
+			baseHead = summary.FinalTargetOID
+		}
+		if !summary.HasMore {
+			return nil
+		}
+	}
+}
+
 func preflightSelfPublicationRecovery(
 	ctx context.Context,
 	db *state.DB,

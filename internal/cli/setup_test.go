@@ -14,6 +14,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
@@ -104,15 +105,15 @@ func TestSetup_JSONHarnessUninstallDocsCoverLifecycleCommands(t *testing.T) {
 	}{
 		{
 			path: "claude-code/uninstall.md",
-			want: []string{"acd hook-stdin-extract", "acd start", "acd wake", "acd flush --logical", "acd stop"},
+			want: []string{"acd internal integration stdin-extract", "acd internal session open", "acd internal hint --kind wake", "acd internal hint --kind logical_boundary", "acd internal session close"},
 		},
 		{
 			path: "codex/uninstall.md",
-			want: []string{"acd hook-stdin-extract", "acd start", "acd wake", "acd touch --soft-boundary"},
+			want: []string{"acd internal integration stdin-extract", "acd internal session open", "acd internal hint --kind wake", "acd internal hint --kind soft_boundary"},
 		},
 		{
 			path: "cursor/uninstall.md",
-			want: []string{"acd hook-cursor-extract", "acd start", "acd wake", "acd flush --logical", "acd stop"},
+			want: []string{"acd internal integration cursor-extract", "acd internal session open", "acd internal hint --kind wake", "acd internal hint --kind logical_boundary", "acd internal session close"},
 		},
 	}
 	for _, tc := range cases {
@@ -242,7 +243,7 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 					t.Errorf("event %q entry %d hook %d: command is empty", ev, i, j)
 				}
 				if (ev == "PreToolUse" || ev == "PostToolUse") &&
-					(!strings.Contains(h.Command, "acd start") || !strings.Contains(h.Command, "acd wake")) {
+					(!strings.Contains(h.Command, "acd internal session open") || !strings.Contains(h.Command, "acd internal hint --kind wake")) {
 					t.Errorf("event %q entry %d hook %d: active hook must start before wake: %s", ev, i, j, h.Command)
 				}
 			}
@@ -315,7 +316,7 @@ func TestSetup_ClaudeCode_SessionStartFailSoft(t *testing.T) {
 	for _, want := range []string{
 		`LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log"`,
 		`mkdir -p`,
-		`acd hook-stdin-extract session_id`,
+		`acd internal integration stdin-extract session_id`,
 		`|| exit 0`,
 		`2>>"$LOG"`,
 	} {
@@ -443,7 +444,7 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 		}
 	}
 	if start := settings.Hooks["sessionStart"]; len(start) > 0 {
-		if !strings.Contains(start[0].Command, "acd start --harness cursor") {
+		if !strings.Contains(start[0].Command, "acd internal session open") {
 			t.Errorf("sessionStart hook must call acd start: %s", start[0].Command)
 		}
 	}
@@ -452,17 +453,17 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 		if len(entries) == 0 {
 			continue
 		}
-		if !strings.Contains(entries[0].Command, "acd start --harness cursor") || !strings.Contains(entries[0].Command, "acd wake") {
+		if !strings.Contains(entries[0].Command, "acd internal session open") || !strings.Contains(entries[0].Command, "acd internal hint --kind wake") {
 			t.Errorf("%s hook must call acd start+wake: %s", ev, entries[0].Command)
 		}
 	}
 	if stop := settings.Hooks["stop"]; len(stop) > 0 {
-		if !strings.Contains(stop[0].Command, "acd flush --logical") {
+		if !strings.Contains(stop[0].Command, "acd internal hint --kind logical_boundary") {
 			t.Errorf("stop hook must call acd flush --logical: %s", stop[0].Command)
 		}
 	}
 	if sessionEnd := settings.Hooks["sessionEnd"]; len(sessionEnd) > 0 {
-		if !strings.Contains(sessionEnd[0].Command, "acd stop") {
+		if !strings.Contains(sessionEnd[0].Command, "acd internal session close") {
 			t.Errorf("sessionEnd hook must call acd stop: %s", sessionEnd[0].Command)
 		}
 	}
@@ -615,7 +616,7 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 				if h.Timeout <= 0 {
 					t.Errorf("event %q entry %d hook %d: timeout must be positive, got %d", ev, i, j, h.Timeout)
 				}
-				if !strings.Contains(h.Command, "acd hook-stdin-extract session_id cwd") {
+				if !strings.Contains(h.Command, "acd internal integration stdin-extract session_id cwd") {
 					t.Errorf("event %q entry %d hook %d: command missing multi-arg hook-stdin-extract: %s", ev, i, j, h.Command)
 				}
 			}
@@ -625,7 +626,7 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	// requests evaluation without bypassing Intent v2 safety gates.
 	if stop := settings.Hooks["Stop"]; len(stop) > 0 && len(stop[0].Hooks) > 0 {
 		command := stop[0].Hooks[0].Command
-		if !strings.Contains(command, "acd touch --soft-boundary") {
+		if !strings.Contains(command, "acd internal hint --kind soft_boundary") {
 			t.Errorf("Stop hook must call acd touch --soft-boundary: %s", command)
 		}
 		if strings.Contains(command, "acd flush --logical") {
@@ -671,10 +672,10 @@ func TestSetup_Codex_HelperFailureExplicitlyLogged(t *testing.T) {
 				// distinguish helper failure from start failure. The old
 				// shape used `{ read -r SID; read -r CWD; } < <(...) || exit 0`
 				// which dropped helper exit on the floor.
-				if strings.Contains(cmd, "< <(acd hook-stdin-extract") {
+				if strings.Contains(cmd, "< <(acd internal integration stdin-extract") {
 					t.Errorf("%s entry %d hook %d: must not use process substitution + read for helper (drops helper exit): %s", ev, i, j, cmd)
 				}
-				if !strings.Contains(cmd, "OUT=$(acd hook-stdin-extract") {
+				if !strings.Contains(cmd, "OUT=$(acd internal integration stdin-extract") {
 					t.Errorf("%s entry %d hook %d: must capture helper output via OUT=$(acd hook-stdin-extract ...): %s", ev, i, j, cmd)
 				}
 				// Helper failure path must log with cmd=acd-hook-stdin-extract
@@ -739,10 +740,10 @@ func TestSetup_Codex_ActiveHooksSelfHeal(t *testing.T) {
 		for i, entry := range entries {
 			for j, h := range entry.Hooks {
 				cmd := h.Command
-				if !strings.Contains(cmd, "acd start") || !strings.Contains(cmd, "acd wake") {
+				if !strings.Contains(cmd, "acd internal session open") || !strings.Contains(cmd, "acd internal hint --kind wake") {
 					t.Errorf("%s entry %d hook %d: must call both acd start and acd wake: %s", ev, i, j, cmd)
 				}
-				if strings.Index(cmd, "acd start") > strings.Index(cmd, "acd wake") {
+				if strings.Index(cmd, "acd internal session open") > strings.Index(cmd, "acd internal hint --kind wake") {
 					t.Errorf("%s entry %d hook %d: acd start must precede acd wake: %s", ev, i, j, cmd)
 				}
 				assertActiveHookAndChainAndLogFallback(t, ev, i, j, cmd, "codex-hook.log")
@@ -799,10 +800,10 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
 		block := yamlHookBlock(t, body, id)
-		if !strings.Contains(block, "acd start") || !strings.Contains(block, "acd wake") {
+		if !strings.Contains(block, "acd internal session open") || !strings.Contains(block, "acd internal hint --kind wake") {
 			t.Fatalf("%s must run acd start before acd wake:\n%s", id, block)
 		}
-		if strings.Index(block, "acd start") > strings.Index(block, "acd wake") {
+		if strings.Index(block, "acd internal session open") > strings.Index(block, "acd internal hint --kind wake") {
 			t.Fatalf("%s runs acd wake before acd start:\n%s", id, block)
 		}
 	}
@@ -839,7 +840,7 @@ func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
 		t.Fatalf("Stop hook missing")
 	}
 	cmd := stop[0].Hooks[0].Command
-	if !strings.Contains(cmd, "acd flush --logical") {
+	if !strings.Contains(cmd, "acd internal hint --kind logical_boundary") {
 		t.Errorf("Stop hook must call `acd flush --logical`, got: %s", cmd)
 	}
 	if strings.Contains(cmd, "acd touch") {
@@ -870,7 +871,7 @@ func TestSetup_OpenCode_IdleHookCallsFlushLogical(t *testing.T) {
 		t.Errorf("opencode snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
 	}
 	block := yamlHookBlock(t, body, "acd-flush-idle")
-	if !strings.Contains(block, "acd flush --logical") {
+	if !strings.Contains(block, "acd internal hint --kind logical_boundary") {
 		t.Errorf("opencode acd-flush-idle must call `acd flush --logical`:\n%s", block)
 	}
 	if !strings.Contains(block, "session.idle") {
@@ -890,7 +891,7 @@ func TestSetup_Pi_IdleHookCallsFlushLogical(t *testing.T) {
 		t.Errorf("pi snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
 	}
 	block := yamlHookBlock(t, body, "acd-flush-idle")
-	if !strings.Contains(block, "acd flush --logical") {
+	if !strings.Contains(block, "acd internal hint --kind logical_boundary") {
 		t.Errorf("pi acd-flush-idle must call `acd flush --logical`:\n%s", block)
 	}
 	if !strings.Contains(block, "session.idle") {
@@ -991,10 +992,10 @@ func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testin
 	// without pulling in uuidgen.
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
 		block := yamlHookBlock(t, body, id)
-		if !strings.Contains(block, "acd start") || !strings.Contains(block, "acd wake") {
+		if !strings.Contains(block, "acd internal session open") || !strings.Contains(block, "acd internal hint --kind wake") {
 			t.Fatalf("%s must run acd start before acd wake:\n%s", id, block)
 		}
-		if strings.Index(block, "acd start") > strings.Index(block, "acd wake") {
+		if strings.Index(block, "acd internal session open") > strings.Index(block, "acd internal hint --kind wake") {
 			t.Fatalf("%s runs acd wake before acd start:\n%s", id, block)
 		}
 		if !strings.Contains(block, `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`) || !strings.Contains(block, `--session-id "$SID"`) {
@@ -1188,8 +1189,8 @@ func TestSetup_Shell_BashSyntaxCheck(t *testing.T) {
 func assertActiveHookAndChainAndLogFallback(t *testing.T, ev string, i, j int, cmd, logFile string) {
 	t.Helper()
 	// Order: acd start before acd wake.
-	startIdx := strings.Index(cmd, "acd start")
-	wakeIdx := strings.Index(cmd, "acd wake")
+	startIdx := strings.Index(cmd, "acd internal session open")
+	wakeIdx := strings.Index(cmd, "acd internal hint --kind wake")
 	if startIdx < 0 || wakeIdx < 0 {
 		t.Errorf("%s entry %d hook %d: must call both acd start and acd wake: %s", ev, i, j, cmd)
 		return
@@ -1224,8 +1225,8 @@ func assertActiveHookAndChainAndLogFallback(t *testing.T, ev string, i, j int, c
 // counterpart for opencode and pi snippets.
 func assertYAMLActiveHookAndChainAndLogFallback(t *testing.T, id, block, logFile string) {
 	t.Helper()
-	startIdx := strings.Index(block, "acd start")
-	wakeIdx := strings.Index(block, "acd wake")
+	startIdx := strings.Index(block, "acd internal session open")
+	wakeIdx := strings.Index(block, "acd internal hint --kind wake")
 	if startIdx < 0 || wakeIdx < 0 {
 		t.Errorf("%s: must call both acd start and acd wake:\n%s", id, block)
 		return
@@ -1291,7 +1292,7 @@ func TestSetup_ApplyFlag_NonZero(t *testing.T) {
 	if out != "" {
 		t.Errorf("--apply should not render snippet stdout, got:\n%s", out)
 	}
-	if !strings.Contains(stderr, "--apply is not implemented") {
+	if !strings.Contains(stderr, "unknown flag: --apply") {
 		t.Errorf("--apply stderr should explain rejection, got: %q", stderr)
 	}
 }
@@ -1312,9 +1313,8 @@ func TestSetup_NoArg_AutoDetectsSingleHarness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected auto-detected setup to exit 0, got: %v\nstderr:\n%s", err, stderr)
 	}
-	want := snippetBody(t, "claude-code/settings.snippet.json")
-	if !strings.Contains(out, strings.TrimSpace(want)) {
-		t.Errorf("auto-detected setup did not render claude-code snippet.\nwant:\n%s\ngot:\n%s", want, out)
+	if !strings.Contains(out, "merge_integration: claude-code") {
+		t.Errorf("transactional plan did not include detected claude-code integration:\n%s", out)
 	}
 }
 
@@ -1323,8 +1323,11 @@ func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	repo := t.TempDir()
-	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o700); err != nil {
-		t.Fatalf("mkdir .git: %v", err)
+	if out, err := exec.Command("git", "-C", repo, "init").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", repo, "symbolic-ref", "HEAD", "refs/heads/main").CombinedOutput(); err != nil {
+		t.Fatalf("set main: %v: %s", err, out)
 	}
 	hooks := filepath.Join(repo, ".codex", "hooks.json")
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
@@ -1339,9 +1342,8 @@ func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected repo-local codex auto-detect to exit 0, got: %v\nstderr:\n%s", err, stderr)
 	}
-	want := snippetBody(t, "codex/hooks.json")
-	if !strings.Contains(out, strings.TrimSpace(want)) {
-		t.Errorf("auto-detected setup did not render codex snippet.\nwant:\n%s\ngot:\n%s", want, out)
+	if strings.Contains(out, "merge_integration: codex") {
+		t.Errorf("transactional setup must not treat repo-local hooks as a user-level owned integration:\n%s", out)
 	}
 }
 
@@ -1351,7 +1353,7 @@ func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 
 	files := map[string]string{
 		filepath.Join(home, ".claude", "settings.json"): `{"_acd_managed": true}`,
-		filepath.Join(home, ".codex", "config.toml"):    "# acd-managed: true\n",
+		filepath.Join(home, ".codex", "hooks.json"):     `{"hooks":{}}`,
 	}
 	for path, body := range files {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -1363,15 +1365,12 @@ func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 	}
 
 	out, stderr, err := runSetupCmd(t)
-	if err == nil {
-		t.Fatalf("expected multiple detected harnesses to fail, got nil\nstdout:\n%s", out)
-	}
-	if out != "" {
-		t.Errorf("multi-detect should not render snippet stdout, got:\n%s", out)
+	if err != nil {
+		t.Fatalf("transactional setup should merge all detected integrations: %v\nstderr:\n%s", err, stderr)
 	}
 	for _, want := range []string{"claude-code", "codex"} {
-		if !strings.Contains(stderr, want) {
-			t.Errorf("multi-detect stderr missing %q: %q", want, stderr)
+		if !strings.Contains(out, "merge_integration: "+want) {
+			t.Errorf("multi-detect plan missing %q: %q", want, out)
 		}
 	}
 }
@@ -1379,17 +1378,12 @@ func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 // --- alias tests ------------------------------------------------------------
 
 // TestSetup_InitAliasStillWorks verifies that invoking the command via the
-// "init" alias still produces the snippet on stdout and emits a deprecation
+// hidden "init" compatibility command still produces the snippet on stdout and emits a deprecation
 // warning on stderr.
 func TestSetup_InitAliasStillWorks(t *testing.T) {
 	var outBuf, errBuf bytes.Buffer
-	cmd := newSetupCmd()
-	cmd.SetOut(&outBuf)
-	cmd.SetErr(&errBuf)
 	// Simulate the user running: acd init claude-code
-	// CalledAs() only returns the alias name when cobra routes via the alias,
-	// which requires the command to be added to a parent. Build a minimal
-	// parent so Cobra resolves "init" as an alias.
+	// Build the real root so Cobra resolves the hidden compatibility command.
 	root := newRootCmd()
 	root.SetOut(&outBuf)
 	root.SetErr(&errBuf)
@@ -1409,7 +1403,7 @@ func TestSetup_InitAliasStillWorks(t *testing.T) {
 	}
 
 	// A deprecation warning must appear in stderr.
-	if !strings.Contains(stderr, "deprecated") {
+	if !strings.Contains(stderr, "compatibility alias") {
 		t.Errorf("init alias did not emit deprecation warning on stderr.\ngot stderr: %q", stderr)
 	}
 }
@@ -1418,10 +1412,8 @@ func TestSetup_InitAliasStillWorks(t *testing.T) {
 // "acd setup" in the Setup section and does not list "acd init" as a separate
 // visible command row.
 //
-// Design note: Cobra includes aliases in per-command help (e.g. "acd setup
-// --help" will show "Aliases: init"), but the root help is rendered via our
-// custom rootHelpTemplate which hard-codes the Setup table — so the alias
-// cannot appear there as a separate row. This test guards that invariant.
+// The compatibility command remains callable but is hidden from both root and
+// setup help. This test guards the root-help half of that contract.
 func TestSetup_HelpHidesInitAlias(t *testing.T) {
 	root := newRootCmd()
 	var outBuf, errBuf bytes.Buffer
@@ -1434,7 +1426,7 @@ func TestSetup_HelpHidesInitAlias(t *testing.T) {
 	got := outBuf.String()
 
 	// The Setup section must mention "acd setup".
-	if !strings.Contains(got, "acd setup") {
+	if !strings.Contains(got, "setup       Install or upgrade ACD transactionally") {
 		t.Errorf("root help missing 'acd setup' in Setup section:\n%s", got)
 	}
 
@@ -1442,5 +1434,63 @@ func TestSetup_HelpHidesInitAlias(t *testing.T) {
 	// row — the alias must not appear as a separate entry in the Setup table.
 	if strings.Contains(got, "acd init   ") {
 		t.Errorf("root help contains a standalone 'acd init' row; alias should be hidden from root help listing:\n%s", got)
+	}
+}
+
+func TestSetup_HelpHidesCompatibilitySyntax(t *testing.T) {
+	cmd := newSetupCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("setup help: %v", err)
+	}
+	if got := out.String(); strings.Contains(got, "Aliases:") || strings.Contains(got, "[harness]") {
+		t.Fatalf("setup help exposed compatibility syntax:\n%s", got)
+	}
+}
+
+func TestSetupProgressShowsPhaseAndHeartbeat(t *testing.T) {
+	var out bytes.Buffer
+	progress := newSetupProgress(&out, false, 5*time.Millisecond)
+	progress.Update(installer.Progress{Phase: "bridge", Detail: "Scanning registered repositories"})
+	time.Sleep(25 * time.Millisecond)
+	progress.Close()
+
+	got := out.String()
+	if !strings.Contains(got, "Setup: Scanning registered repositories\n") {
+		t.Fatalf("missing phase progress: %q", got)
+	}
+	if !strings.Contains(got, "Setup: still working on scanning registered repositories") {
+		t.Fatalf("missing heartbeat: %q", got)
+	}
+	if strings.Contains(got, "(0s elapsed)") {
+		t.Fatalf("zero-duration heartbeat: %q", got)
+	}
+}
+
+func TestSetupProgressIsSilentForQuietOrJSON(t *testing.T) {
+	var out bytes.Buffer
+	progress := newSetupProgress(&out, true, time.Millisecond)
+	progress.Update(installer.Progress{Phase: "bridge", Detail: "Scanning registered repositories"})
+	progress.Close()
+	if out.Len() != 0 {
+		t.Fatalf("silent progress wrote %q", out.String())
+	}
+}
+
+func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
+	cmd := newSetupCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, required := range []string{"macOS", "does not require Full Disk", "deterministic provider"} {
+		if !strings.Contains(got, required) {
+			t.Fatalf("setup help missing %q:\n%s", required, got)
+		}
 	}
 }

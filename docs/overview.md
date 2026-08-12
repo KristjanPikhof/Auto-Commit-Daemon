@@ -1,85 +1,102 @@
-# acd overview
+# Architecture overview
 
-`acd` captures worktree changes, stores durable metadata in the repo, and
-replays those captures as Git commits. Event mode commits one capture at a
-time. Intent v2 maintains semantic candidates across evaluations and publishes
-them only after dependency, atomicity, materialization, and preset verification
-checks pass.
+ACD separates durable protection from Git publication.
 
-~~~mermaid
-flowchart LR
-  subgraph Tool["AI tool or shell"]
-    Hook["hooks call<br/>acd start / wake / flush"]
-  end
-
-  subgraph Repo["Git repo"]
-    Daemon["acd daemon"]
-    State[("state.db")]
-    Objects[("git object database")]
-    Scratch["scratch index"]
-    Branch["branch ref"]
-  end
-
-  Hook --> Daemon
-  Daemon -->|capture metadata| State
-  Daemon -->|hash file contents| Objects
-  State --> Scratch
-  Objects --> Scratch
-  Scratch -->|commit-tree| Branch
-
-  classDef outside fill:#243447,stroke:#7aa2f7,color:#e6edf3
-  classDef process fill:#203a31,stroke:#9ece6a,color:#eaffdf
-  classDef data fill:#3d2f1f,stroke:#f6c177,color:#fff4d6
-  class Hook outside
-  class Daemon,Scratch process
-  class State,Objects,Branch data
+~~~text
+filesystem watch + complete poll + optional hints
+                    |
+                    v
+          protection scheduler
+                    |
+        completed private checkpoint ref
+                    |
+                    v
+          publication scheduler
+     group -> verify -> message -> Git CAS
+                    |
+                    v
+          ordinary local Git commit
 ~~~
 
-## How it works
+Provider, grouping, test, or verification failures can delay the lower half;
+they cannot prevent a successful protection scan from completing the upper
+half.
 
-| Step | What ACD does | Where to look |
-|---|---|---|
-| Capture | Walks the worktree, filters ignored or sensitive paths, writes file contents as Git blobs, and records ops in `<gitDir>/acd/state.db`. | `acd events`, `acd explain --path FILE` |
-| Replay | Applies pending ops to a private scratch index, creates commits with `git commit-tree`, and advances the branch with `git update-ref`. | `acd status`, `acd logs --follow` |
-| Reconcile | Proves a complete unpublished chain already landed, or preserves its reconstructed tree at a hidden recovery ref before reseeding and recapturing. | `acd events`, `acd diagnose` |
-| Block | Stops behind `blocked_conflict` or `failed` only when ACD cannot complete an all-or-none proof or archive safely. | `acd diagnose --json`, `acd fix --dry-run` |
+## Process boundaries
 
-## Commit strategies
+One user-level supervisor owns desired state. It groups linked worktrees by
+canonical Git common directory and runs one isolated worker for each group.
+The supervisor never opens repository SQLite as a writer. Workers own their
+repositories under the canonical common-directory lock.
 
-| Strategy | Behavior |
-|---|---|
-| `event` | FIFO replay. One capture can produce one commit. This is the default. |
-| `intent` | Bounded evaluations revise durable semantic candidates. Ready candidates publish in topological order after the atomicity gate. |
+On macOS the supervisor and workers are descendants of the authorized
+Terminal or agent session. ACD therefore needs no Full Disk Access and does
+not install a launchd service. Mutating commands and supported integration
+hints start the session supervisor when it is absent; after logout or reboot,
+protection resumes on that first invocation. Linux uses a persistent systemd
+user service.
 
-Both strategies use the same capture rows and replay safety checks. Intent mode
-changes grouping, not durability.
+Local newline-delimited JSON IPC uses schema v1, request IDs, strict method
+validation, worktree identity, and bounded deadlines. Mutations fail closed if
+the supervisor or worker is unavailable. Read-only status may use an existing
+SQLite projection.
 
-Intent mode also has a persisted provider circuit breaker. Fast and Balanced
-apply bounded dependency-aware fallback policies during a provider outage.
-Quality retains candidates and reports `needs_attention`. Capture continues in
-all three cases.
+The supervisor restarts a crashed worker after 1, 2, 5, 10, then 30 seconds.
+Backoff resets after five healthy minutes. Repeated crashes surface as
+`needs_action` while bounded retries continue.
 
-## Data boundaries
+## Repository identity
 
-| Data | Stored in | Leaves the machine by default? |
-|---|---|---|
-| File contents | Git object database | No |
-| Capture metadata | `<gitDir>/acd/state.db` | No |
-| Commit-message metadata | AI provider request | Only when a non-deterministic provider is configured |
-| Captured diffs | Rebuilt from captured blobs | Only when the provider needs diffs and `ACD_AI_DIFF_EGRESS=1` is set |
-| Prompt traces | `<gitDir>/acd/prompt-trace/` | No automatic upload, but the files may contain source text |
-| Provider credential | `${XDG_CONFIG_HOME:-$HOME/.config}/acd/credentials.json` | Only to the configured provider; environment wins over this file |
-| Candidate verification | Ephemeral detached worktree | No, unless the approved command itself performs network access |
+Registry v2 identifies a repository by the first 16 lowercase hex characters
+of SHA-256 over its canonical Git common directory. A worktree uses the same
+construction over its canonical root. Old path hashes remain migration
+metadata only.
 
-## Start here
+## Checkpoint store
 
-| Task | Doc |
-|---|---|
-| Install and set up hooks | [README](../README.md) |
-| Find the right command | [commands.md](commands.md) |
-| Recover from a stuck queue | [user-workflows.md](user-workflows.md) |
-| Understand replay safety | [capture-replay.md](capture-replay.md) |
-| Configure AI providers | [ai-providers.md](ai-providers.md) |
-| Use intent grouping | [intent-commit-flow.md](intent-commit-flow.md) |
-| Migrate an existing Intent repo | [intent-v2-migration.md](intent-v2-migration.md) |
-| Rewrite local commit messages | [intent-commit-rewrite-flow.md](intent-commit-rewrite-flow.md) |
+A checkpoint is a rootless Git commit whose tree contains the complete
+eligible protected scope. A private ref makes its objects reachable:
+
+~~~text
+refs/acd/checkpoints/v1/<worktree-id>/cp-<milliseconds>-<random>
+~~~
+
+SQLite v20 records immutable operation identity, checkpoint phases, exact
+capture-event membership, privacy-safe exclusion counts, publication links,
+and restore relationships. The specialized publication record remains the
+authoritative branch-ref CAS proof and links to the general operation.
+
+## Publication
+
+Event strategy retains one captured change per local commit. Intent strategy
+can group changes across completed checkpoints, subject to existing dependency,
+materialization, verification, revertibility, and exact-ref CAS gates. Only
+events belonging to completed checkpoints are eligible.
+
+Unsafe Git states suspend publication but never protection. A checkpoint is
+published only when all member events have completed normal commit mappings.
+No component pushes automatically.
+
+## Restore
+
+Restore computes a full-tree plan, checkpoints the current state, journals
+filesystem preimages, applies same-directory atomic replacements, preserves
+the index and `HEAD`, then checkpoints the result. The pre-restore checkpoint
+is the undo target.
+
+If files were applied but the final checkpoint failed, forward repair proves
+the current protected tree equals the target before creating the missing
+checkpoint and completing the operation.
+
+## Global transactions
+
+Setup, upgrade, uninstall, configuration, registry, integration, and platform
+lifecycle mutations are recorded in the global operations database. Plans have
+immutable SHA-256 digests. Every touched file has a type/mode/owner/digest
+preimage and prior platform lifecycle state.
+
+The v19 to v20 cutover spans every registered repository. A temporary
+protection bridge covers concurrent edits, repository locks are acquired in
+sorted common-directory order, and held v20 workers must prove current
+coverage before global commit. Any ambiguous legacy proof aborts the entire
+transaction.

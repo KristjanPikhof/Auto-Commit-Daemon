@@ -14,9 +14,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -123,10 +123,7 @@ func TestRewriteCommitsPlanGenerationUsesPersistedSettings(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, "event")
 	t.Setenv(ai.EnvProvider, "deterministic")
 
-	repoHash, err := paths.RepoHash(repo)
-	if err != nil {
-		t.Fatalf("repo hash: %v", err)
-	}
+	repoHash := central.CanonicalID(repo)
 	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
 		doc.Settings.Repositories[repoHash] = config.RepositorySettings{
 			Fields: config.Overrides{
@@ -140,7 +137,7 @@ func TestRewriteCommitsPlanGenerationUsesPersistedSettings(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
 		selection: git.RewriteSelectionOptions{Last: 1},
 		planOnly:  true,
 	}, false)
@@ -978,7 +975,7 @@ func TestRewriteCommitsProgressModesKeepJSONStdoutClean(t *testing.T) {
 		if err != nil {
 			t.Fatalf("runRewriteCommits: %v", err)
 		}
-		if !strings.Contains(stderr.String(), "rewrite-commits: selection: selected 1 commit") {
+		if !strings.Contains(stderr.String(), "rewrite-commits: selection [1/1]: selected 1 commit") {
 			t.Fatalf("stderr missing plain progress:\n%s", stderr.String())
 		}
 		if err := json.Unmarshal(stdout.Bytes(), &rewriteSelectionReport{}); err != nil {
@@ -1005,6 +1002,38 @@ func TestRewriteCommitsProgressModesKeepJSONStdoutClean(t *testing.T) {
 	err := normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, progress: "loud"})
 	if err == nil || !strings.Contains(err.Error(), "--progress") {
 		t.Fatalf("progress validation err = %v", err)
+	}
+}
+
+func TestRewriteProgressPlainIncludesBoundedCounts(t *testing.T) {
+	var out bytes.Buffer
+	sink, err := newRewriteProgressSink("plain", false, &out)
+	if err != nil {
+		t.Fatalf("create plain progress sink: %v", err)
+	}
+	events := []rewriteProgressEvent{
+		{Phase: "proposal", Message: "requesting proposal", Current: 42, Total: 169},
+		{Phase: "proposal", Message: "proposal accepted", Current: 42, Total: 169},
+		{Phase: "apply_recreate_selected", Message: "recreated selected commit", Current: 42, Total: 169},
+		{Phase: "apply_recreate_unchanged", Message: "recreated unchanged descendant", Current: 2, Total: 3},
+		{Phase: "validation", Message: "status valid", Current: 1},
+	}
+	for _, event := range events {
+		if err := sink.Emit(event); err != nil {
+			t.Fatalf("emit %+v: %v", event, err)
+		}
+	}
+
+	want := strings.Join([]string{
+		"rewrite-commits: proposal [42/169]: requesting proposal",
+		"rewrite-commits: proposal [42/169]: proposal accepted",
+		"rewrite-commits: apply_recreate_selected [42/169]: recreated selected commit",
+		"rewrite-commits: apply_recreate_unchanged [2/3]: recreated unchanged descendant",
+		"rewrite-commits: validation: status valid",
+		"",
+	}, "\n")
+	if got := out.String(); got != want {
+		t.Fatalf("plain progress:\n%s\nwant:\n%s", got, want)
 	}
 }
 

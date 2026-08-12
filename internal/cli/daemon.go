@@ -148,6 +148,10 @@ func resolveDaemonWorktree(ctx context.Context, repoFlag, gitDirFlag string) (st
 }
 
 func buildDaemonRunOptions(repo, gitDir string, db *state.DB, _ io.Writer) (daemon.Options, io.Closer, error) {
+	return buildDaemonRunOptionsWithID(repo, gitDir, db, "")
+}
+
+func buildDaemonRunOptionsWithID(repo, gitDir string, db *state.DB, repositoryID string) (daemon.Options, io.Closer, error) {
 	fsEnabled := false
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ACD_FSNOTIFY_ENABLED"))); v != "" && v != "0" && v != "false" {
 		fsEnabled = true
@@ -157,9 +161,12 @@ func buildDaemonRunOptions(repo, gitDir string, db *state.DB, _ io.Writer) (daem
 	if err != nil {
 		return daemon.Options{}, nil, fmt.Errorf("acd daemon run: resolve paths: %w", err)
 	}
-	repoHash, err := paths.RepoHash(repo)
-	if err != nil {
-		return daemon.Options{}, nil, fmt.Errorf("acd daemon run: compute repo hash: %w", err)
+	repoHash := strings.TrimSpace(repositoryID)
+	if repoHash == "" {
+		repoHash, err = paths.RepoHash(repo)
+		if err != nil {
+			return daemon.Options{}, nil, fmt.Errorf("acd daemon run: compute repo hash: %w", err)
+		}
 	}
 	runLogger, logCloser, err := acdlogger.New(acdlogger.Options{Path: roots.RepoLogPath(repoHash)})
 	if err != nil {

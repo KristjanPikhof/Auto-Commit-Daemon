@@ -173,6 +173,11 @@ type ReplayOpts struct {
 	// the queue still contains pending work so the run loop can schedule an
 	// immediate follow-up wake instead of waiting for the next poll tick.
 	Limit int
+	// RequireCompletedCheckpoint prevents publication from observing capture
+	// rows in the cross-store prepared window. Production workers always set
+	// this; direct replay tests may leave it false when exercising legacy row
+	// fixtures without constructing a protection checkpoint.
+	RequireCompletedCheckpoint bool
 	// Trace receives best-effort decision records. Nil disables tracing.
 	Trace acdtrace.Logger
 	// PromptTrace receives opt-in provider prompt records. Nil disables prompt
@@ -449,7 +454,11 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if queryLimit > 0 {
 		queryLimit++
 	}
-	pending, err := state.PendingEvents(ctx, db, queryLimit)
+	loadPending := state.PendingEvents
+	if opts.RequireCompletedCheckpoint {
+		loadPending = state.PublishableEvents
+	}
+	pending, err := loadPending(ctx, db, queryLimit)
 	if err != nil {
 		return sum, fmt.Errorf("daemon: load pending: %w", err)
 	}

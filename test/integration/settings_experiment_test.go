@@ -18,6 +18,7 @@ import (
 )
 
 func TestSettingsExperimentExactlyTenWindowsRestartAndRevert(t *testing.T) {
+	t.Parallel()
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	var hits atomic.Int32
@@ -55,11 +56,13 @@ func TestSettingsExperimentExactlyTenWindowsRestartAndRevert(t *testing.T) {
 		name := fmt.Sprintf("experiment-%02d.txt", window)
 		writeFile(t, filepath.Join(repo, name), fmt.Sprintf("window %d\n", window))
 		wakeSession(t, ctx, fullEnv, repo, sessionID)
+		if flushed := runAcd(t, ctx, fullEnv, "flush", "--logical", "--session-id", sessionID, "--repo", repo); flushed.ExitCode != 0 {
+			t.Fatalf("experiment window %d logical boundary failed: %s", window, flushed.Stderr)
+		}
 		waitForEventState(t, dbPath, name, "published", 12*time.Second)
 		waitExperimentWindows(t, db, experiment.ID, window, 8*time.Second)
 		if window == 4 {
 			stopSessionForce(t, fullEnv, repo)
-			waitMode(t, repo, "stopped", 5*time.Second)
 			sessionID = "settings-exp-ten-b"
 			startSession(t, ctx, env, repo, sessionID, "shell", extra...)
 			waitMode(t, repo, "running", 5*time.Second)
