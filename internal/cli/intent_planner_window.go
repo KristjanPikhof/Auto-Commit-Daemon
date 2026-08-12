@@ -153,6 +153,9 @@ LIMIT 1`, eventSeq)
 	if len(windows) == 0 {
 		return nil, nil
 	}
+	if err := enrichIntentPlannerWindowRun(ctx, conn, &windows[0]); err != nil {
+		return nil, err
+	}
 	return &windows[0], nil
 }
 

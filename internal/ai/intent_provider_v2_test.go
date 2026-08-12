@@ -185,28 +185,31 @@ func TestOpenAIPlanIntentV2RedactsDiffAndTracesExactRequest(t *testing.T) {
 	}
 }
 
-func TestComposedPlanIntentV2ReturnsAtomicityFailureWithoutFallback(t *testing.T) {
+func TestComposedPlanIntentV2AcceptsSemanticGroupWithoutFallback(t *testing.T) {
 	req := sampleIntentPlanV2Request(t)
-	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
+	p, _, _ := newOpenAIMock(t, func(request capturedReq) (int, string) {
+		if strings.Contains(string(request.rawBody), `"name":"commit_message"`) {
+			return 200, cannedToolCall("Update checkout behavior",
+				"- Keep checkout source and tests in one atomic change")
+		}
 		mega := IntentPlanV2{
 			ProtocolVersion: IntentPlannerProtocolV2,
 			Candidates: []IntentCandidateAssignment{{
 				CandidateID:    "mega",
 				SelectedSeqs:   []int64{101, 102},
-				Purpose:        "combine all work",
+				Purpose:        "update checkout behavior",
 				Readiness:      IntentCandidateReady,
-				Subject:        "Combine checkout changes",
-				GroupingReason: "captures happened together",
+				Subject:        "Update checkout behavior",
+				GroupingReason: "source and tests implement the same checkout change",
 			}},
 		}
 		return 200, cannedIntentPlanV2ToolCall(mega)
 	})
 	composed := Compose(p, DeterministicProvider{})
 	ctx, counter := WithIntentAttemptCounter(context.Background())
-	_, err := composed.(IntentPlannerV2).PlanIntentV2(ctx, req)
-	var typed *IntentPlanV2ValidationError
-	if !errors.As(err, &typed) {
-		t.Fatalf("error=%T %v", err, err)
+	plan, err := composed.(IntentPlannerV2).PlanIntentV2(ctx, req)
+	if err != nil || len(plan.Candidates) != 1 {
+		t.Fatalf("semantic plan=(%+v,%v)", plan, err)
 	}
 	if counter.RetryCount() != 0 {
 		t.Fatalf("provider layer performed a retry: %d", counter.RetryCount())

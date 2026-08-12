@@ -174,6 +174,13 @@ CREATE TABLE IF NOT EXISTS intent_planner_windows(
     retry_count           INTEGER NOT NULL DEFAULT 0,
     fallback_used         INTEGER NOT NULL DEFAULT 0,
     outcome               TEXT,
+    plan_fingerprint      TEXT,
+    plan_attempt          INTEGER NOT NULL DEFAULT 0,
+    plan_attempt_limit    INTEGER NOT NULL DEFAULT 0,
+    unresolved_capture_count INTEGER NOT NULL DEFAULT 0,
+    preserved_group_count INTEGER NOT NULL DEFAULT 0,
+    resolution_mode       TEXT,
+    singleton_count       INTEGER NOT NULL DEFAULT 0,
     experiment_id         INTEGER,
     experiment_consumed   INTEGER NOT NULL DEFAULT 0
 );

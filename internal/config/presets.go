@@ -88,7 +88,7 @@ var presetCatalog = []PresetDefinition{
 	},
 	{
 		Strategy: StrategyIntent, Name: PresetFast, Version: PresetCatalogVersion,
-		ProviderTestRequired: true, DiffContextRequired: true, PlannerFallback: "hard_dependency_component",
+		ProviderTestRequired: true, DiffContextRequired: true, PlannerFallback: "evidence_partition",
 		Values: map[string]string{
 			FieldDiffEgress: "true", FieldIntentWindow: "10",
 			FieldIntentMinPending: "10", FieldIntentSettleWindow: "10s",
@@ -100,7 +100,7 @@ var presetCatalog = []PresetDefinition{
 	},
 	{
 		Strategy: StrategyIntent, Name: PresetBalanced, Version: PresetCatalogVersion,
-		ProviderTestRequired: true, DiffContextRequired: true, PlannerFallback: "verified_dependency_partition",
+		ProviderTestRequired: true, DiffContextRequired: true, PlannerFallback: "evidence_partition",
 		Values: map[string]string{
 			FieldDiffEgress: "true", FieldIntentWindow: "20",
 			FieldIntentMinPending: "20", FieldIntentSettleWindow: "30s",
@@ -114,7 +114,7 @@ var presetCatalog = []PresetDefinition{
 	{
 		Strategy: StrategyIntent, Name: PresetQuality, Version: PresetCatalogVersion,
 		ProviderTestRequired: true, DiffContextRequired: true, HardBoundaryPreferred: true,
-		PlannerFallback: "needs_attention",
+		PlannerFallback: "evidence_partition",
 		Values: map[string]string{
 			FieldDiffEgress: "true", FieldIntentWindow: "30",
 			FieldIntentMinPending: "30", FieldIntentSettleWindow: "60s",

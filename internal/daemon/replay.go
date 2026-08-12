@@ -2643,8 +2643,12 @@ func recordIntentPlannerWindow(
 	} else if len(plan.SelectedSeqs) > 0 && len(plan.DeferredSeqs) > 0 {
 		outcome = "mixed"
 	}
-	if validationFailure != "" {
+	if validationFailure != "" && cfg.resolutionMode != "local_repair" &&
+		cfg.resolutionMode != "partial_replan" && cfg.resolutionMode != "evidence_partition" {
 		outcome = "provider_error_fallback_" + outcome
+	} else if cfg.resolutionMode == "local_repair" ||
+		cfg.resolutionMode == "partial_replan" || cfg.resolutionMode == "evidence_partition" {
+		outcome = "recovered_" + outcome
 	}
 	_, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
 		PlannedTS:              ts,

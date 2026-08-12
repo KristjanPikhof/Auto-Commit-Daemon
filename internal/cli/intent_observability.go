@@ -619,8 +619,8 @@ func decodeIntentV2Snapshot(snapshot string, report *intentV2Report) {
 	report.ConfiguredRetryOnInvalid = decodeIntentV2SnapshotInt(
 		values[config.FieldIntentRetryOnInvalid])
 	report.EffectiveCorrectionMax = report.ConfiguredRetryOnInvalid
-	if report.EffectiveCorrectionMax > 1 {
-		report.EffectiveCorrectionMax = 1
+	if report.EffectiveCorrectionMax > 2 {
+		report.EffectiveCorrectionMax = 2
 	}
 	report.RepairEnabled = decodeIntentV2SnapshotBool(
 		values[config.FieldIntentRepairEnabled])

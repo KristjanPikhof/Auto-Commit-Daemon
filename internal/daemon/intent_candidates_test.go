@@ -40,6 +40,40 @@ type correctingIntentCandidatePlannerStub struct {
 	reqs  []ai.IntentPlanRequestV2
 }
 
+type partialReplanIntentCandidatePlannerStub struct {
+	calls int
+	reqs  []ai.IntentPlanRequestV2
+}
+
+func (p *partialReplanIntentCandidatePlannerStub) Name() string { return "intent-v2-partial-test" }
+
+func (p *partialReplanIntentCandidatePlannerStub) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	p.calls++
+	p.reqs = append(p.reqs, req)
+	if p.calls == 1 {
+		return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+			Candidates: []ai.IntentCandidateAssignment{
+				{CandidateID: "locked-a", SelectedSeqs: []int64{req.OfferedCaptures[0].Seq},
+					Purpose: "keep valid source change", Readiness: ai.IntentCandidateReady,
+					Subject: "Update source change", GroupingReason: "complete source intent"},
+				{CandidateID: "invalid-b", SelectedSeqs: []int64{req.OfferedCaptures[1].Seq},
+					Purpose: "repair test change", Readiness: ai.IntentCandidateReady,
+					Subject: "Update test change", GroupingReason: "invalid dependency metadata",
+					DependsOnCandidates: []string{"invalid-b"}},
+			}}, nil
+	}
+	capture := req.OfferedCaptures[0]
+	return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "replanned-b", SelectedSeqs: []int64{capture.Seq},
+			Purpose: "complete test change", Readiness: ai.IntentCandidateReady,
+			Subject: "Update test change", GroupingReason: "corrected unresolved capture",
+		}}}, nil
+}
+
 func (p *correctingIntentCandidatePlannerStub) Name() string { return "intent-v2-correcting-test" }
 
 func (p *correctingIntentCandidatePlannerStub) PlanIntentV2(
@@ -409,8 +443,9 @@ INSERT INTO capture_events(
 			ready++
 		}
 	}
-	if ready != 1 {
-		t.Fatalf("Fast fallback publishable candidates=%d want=1", ready)
+	if ready != configuredWindow {
+		t.Fatalf("Fast evidence fallback publishable candidates=%d want=%d",
+			ready, configuredWindow)
 	}
 	after, err := state.CountAllPendingCaptureEvents(ctx, db)
 	if err != nil {
@@ -427,7 +462,7 @@ INSERT INTO capture_events(
 	}
 }
 
-func TestIntentCandidateEngineHonorsCorrectionRetryBudget(t *testing.T) {
+func TestIntentCandidateEngineAcceptsSemanticGroupingWithoutGraphPath(t *testing.T) {
 	for _, retryLimit := range []int{0, 2} {
 		t.Run(fmt.Sprintf("retry_limit_%d", retryLimit), func(t *testing.T) {
 			ctx := context.Background()
@@ -457,9 +492,9 @@ func TestIntentCandidateEngineHonorsCorrectionRetryBudget(t *testing.T) {
 				t.Fatalf("structural planner calls=%d want=1",
 					planner.calls)
 			}
-			if result.Fallback != "hard_dependency_component" ||
-				result.PlannerFailure == "" {
-				t.Fatalf("fallback result=%+v", result)
+			if result.Fallback != "" || result.PlannerFailure != "" ||
+				result.ResolutionMode != "provider" {
+				t.Fatalf("semantic result=%+v", result)
 			}
 		})
 	}
@@ -484,7 +519,7 @@ func TestIntentCandidateEngineBoundedFallbackAfterOneCorrection(t *testing.T) {
 		t.Fatal(err)
 	}
 	if planner.calls != 2 || result.RetryCount != 1 ||
-		result.Fallback != "verified_dependency_partition" ||
+		result.Fallback != "evidence_partition" ||
 		result.PlannerFailure == "" || len(result.Decisions) != 1 ||
 		!result.Decisions[0].Publishable {
 		t.Fatalf("bounded fallback calls=%d result=%+v", planner.calls, result)
@@ -496,6 +531,77 @@ func TestIntentCandidateEngineBoundedFallbackAfterOneCorrection(t *testing.T) {
 	}
 	if len(candidates) != 1 || candidates[0].ID == "candidate-self" {
 		t.Fatalf("durable candidates=%+v", candidates)
+	}
+}
+
+func TestIntentCandidateEngineStopsRepeatedInvalidPlanEarly(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(t, db, "a.go", "create", "", "a")
+	planner := &selfDependentIntentCandidatePlannerStub{}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		RetryLimit: 2, RetryLimitSet: true, Preset: config.PresetFast,
+		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 2 || result.PlanAttempt != 2 ||
+		result.PlanAttemptLimit != 3 || result.ResolutionMode != "evidence_partition" {
+		t.Fatalf("no-progress fallback calls=%d result=%+v", planner.calls, result)
+	}
+}
+
+func TestIntentCandidateValidationFallbackKeepsTransportCircuitClosed(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(t, db, "a.go", "create", "", "a")
+	planner := &selfDependentIntentCandidatePlannerStub{}
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{
+		Provider: IntentPlannerProviderIdentity{Provider: planner.Name()},
+	})
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner, Health: health,
+		RetryLimit: 2, RetryLimitSet: true, Preset: config.PresetQuality,
+		VerificationMode: "structural",
+		Materialize:      func(context.Context, []IntentCandidateCapture) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ResolutionMode != "evidence_partition" || planner.calls != 2 {
+		t.Fatalf("validation recovery calls=%d result=%+v", planner.calls, result)
+	}
+	if snapshot := health.Snapshot(); snapshot.State != IntentPlannerCircuitClosed ||
+		snapshot.ConsecutiveFailures != 0 {
+		t.Fatalf("semantic validation changed transport health: %+v", snapshot)
+	}
+}
+
+func TestIntentCandidateEnginePreservesValidGroupsDuringPartialReplan(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	first := appendIntentCandidateCapture(t, db, "source.go", "create", "", "a")
+	second := appendIntentCandidateCapture(t, db, "source_test.go", "create", "", "b")
+	planner := &partialReplanIntentCandidatePlannerStub{}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{first, second}, Planner: planner,
+		RetryLimit: 2, RetryLimitSet: true, Preset: config.PresetBalanced,
+		VerificationMode: "structural",
+		Materialize:      func(context.Context, []IntentCandidateCapture) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 2 || len(planner.reqs[1].OfferedCaptures) != 1 ||
+		planner.reqs[1].OfferedCaptures[0].Seq != second.Event.Seq ||
+		result.ResolutionMode != "partial_replan" || result.PreservedGroupCount != 1 ||
+		len(result.Decisions) != 2 {
+		t.Fatalf("partial replan requests=%+v result=%+v", planner.reqs, result)
 	}
 }
 
@@ -744,7 +850,7 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 		t.Fatal(err)
 	}
 	if second.PlannerFailure != "" ||
-		second.Fallback != "hard_dependency_component" ||
+		second.Fallback != "evidence_partition" ||
 		planner.calls != 1 {
 		t.Fatalf("circuit bypass=%+v calls=%d", second, planner.calls)
 	}
@@ -993,7 +1099,7 @@ func TestIntentCandidateEngineCorrectsDisconnectedMegaGroupWithBalancedFallback(
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates: %v", err)
 	}
-	if result.Fallback != "verified_dependency_partition" {
+	if result.Fallback != "evidence_partition" {
 		t.Fatalf("fallback=%q", result.Fallback)
 	}
 	if len(result.Decisions) != 2 || verifyCalls != 2 {
@@ -1033,10 +1139,10 @@ func TestIntentCandidateEngineRejectsSameDirectoryMegaGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Fallback != "hard_dependency_component" ||
+	if result.Fallback != "evidence_partition" ||
 		len(result.Decisions) != 2 ||
 		!result.Decisions[0].Publishable ||
-		result.Decisions[1].Publishable {
+		!result.Decisions[1].Publishable {
 		t.Fatalf("same-directory mega-group was not split safely: %+v", result)
 	}
 	for _, decision := range result.Decisions {
@@ -1077,7 +1183,7 @@ func TestIntentCandidateEngineAdvancesFastFallbackComponents(t *testing.T) {
 	initial := evaluate([]IntentCandidateCapture{first, second})
 	if len(initial.Decisions) != 2 ||
 		!initial.Decisions[0].Publishable ||
-		initial.Decisions[1].Publishable {
+		!initial.Decisions[1].Publishable {
 		t.Fatalf("initial fallback=%+v", initial)
 	}
 	firstID := initial.Decisions[0].Candidate.ID
@@ -1116,16 +1222,17 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	}{
 		{
 			name: "fast", preset: config.PresetFast,
-			wantFallback: "hard_dependency_component", wantReady: 1,
+			wantFallback: "evidence_partition", wantReady: 2,
 		},
 		{
 			name: "balanced", preset: config.PresetBalanced,
-			wantFallback: "verified_dependency_partition", wantReady: 2,
+			wantFallback: "evidence_partition", wantReady: 2,
 			wantVerifyCall: 2,
 		},
 		{
 			name: "quality", preset: config.PresetQuality,
-			wantFallback: "needs_attention", wantAttention: true,
+			wantFallback: "evidence_partition", wantReady: 2,
+			wantVerifyCall: 2,
 		},
 	} {
 		tc := tc
@@ -1271,7 +1378,7 @@ func TestIntentCandidateEngineFallbackContinuesPersistedDependent(t *testing.T) 
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates: %v", err)
 	}
-	if result.Fallback != "verified_dependency_partition" ||
+	if result.Fallback != "evidence_partition" ||
 		len(result.Decisions) != 1 {
 		t.Fatalf("fallback result=%+v", result)
 	}
@@ -1330,7 +1437,7 @@ func TestIntentCandidateEngineFallbackContinuesPersistedPrerequisite(t *testing.
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates: %v", err)
 	}
-	if result.Fallback != "verified_dependency_partition" ||
+	if result.Fallback != "evidence_partition" ||
 		len(result.Decisions) != 1 {
 		t.Fatalf("fallback result=%+v", result)
 	}
@@ -1416,7 +1523,7 @@ func TestIntentCandidateEngineFallbackMergesHardBridgeBetweenSoftCandidates(
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates hard bridge: %v", err)
 	}
-	if result.Fallback != "verified_dependency_partition" ||
+	if result.Fallback != "evidence_partition" ||
 		result.NeedsAttention || len(result.Decisions) != 1 ||
 		!result.Decisions[0].Publishable {
 		t.Fatalf("hard bridge result=%+v", result)
@@ -1665,12 +1772,12 @@ func TestIntentCandidateEngineBalancedFallbackKeepsImportEvidenceSeparate(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.NeedsAttention || len(result.Decisions) != 2 {
+	if result.NeedsAttention || len(result.Decisions) != 1 {
 		t.Fatalf("import-only fallback=%+v", result)
 	}
 	for _, decision := range result.Decisions {
 		if !decision.Publishable ||
-			len(decision.Assignment.SelectedSeqs) != 1 {
+			len(decision.Assignment.SelectedSeqs) != 2 {
 			t.Fatalf("import evidence merged fallback=%+v", decision)
 		}
 	}
@@ -1758,7 +1865,7 @@ func TestIntentCandidateEngineBalancedFallbackContinuesPersistedTestCompanion(
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates: %v", err)
 	}
-	if result.Fallback != "verified_dependency_partition" ||
+	if result.Fallback != "evidence_partition" ||
 		result.NeedsAttention || len(result.Decisions) != 1 {
 		t.Fatalf("fallback result=%+v", result)
 	}
@@ -2608,6 +2715,32 @@ func TestRuntimeIntentDependencyHintsUseSourceEvidence(t *testing.T) {
 		kinds["import_reference"] != ai.IntentDependencySoft ||
 		kinds["generated_source"] != ai.IntentDependencyHard {
 		t.Fatalf("runtime hints=%+v", hints)
+	}
+}
+
+func TestRuntimeIntentDependencyHintsFindOutputArchiveReferencesInEitherOrder(t *testing.T) {
+	t.Parallel()
+	archive := intentCandidateCaptureFixture(
+		1, "output/gitlab-to-teams.zip", "create", "", "archive")
+	archive.CapturedDiff = "Binary files differ\n"
+	verifier := intentCandidateCaptureFixture(
+		2, "scripts/verify-release.sh", "create", "", "verifier")
+	verifier.CapturedDiff = "+unzip -t output/gitlab-to-teams.zip\n"
+	for _, captures := range [][]IntentCandidateCapture{
+		{archive, verifier}, {verifier, archive},
+	} {
+		hints := runtimeIntentDependencyHints(captures)
+		found := false
+		for _, hint := range hints {
+			if hint.Kind == "generated_artifact_reference" &&
+				hint.PrerequisiteSeq == verifier.Event.Seq &&
+				hint.DependentSeq == archive.Event.Seq {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("generated artifact reference missing: %+v", hints)
+		}
 	}
 }
 

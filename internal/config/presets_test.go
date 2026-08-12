@@ -35,21 +35,21 @@ func TestPresetCatalogV3Contract(t *testing.T) {
 			FieldIntentWindow: "10", FieldIntentSettleWindow: "10s",
 			FieldIntentMaxPendingAge: "1m30s", FieldIntentDeferLimit: "1",
 			FieldIntentVerification: "none", FieldIntentRepairEnabled: "false",
-		}, "hard_dependency_component", false},
+		}, "evidence_partition", false},
 		{StrategyIntent, PresetBalanced, map[string]string{
 			FieldIntentWindow: "20", FieldIntentSettleWindow: "30s",
 			FieldIntentMaxPendingAge: "3m0s", FieldIntentDeferLimit: "2",
 			FieldIntentVerification: "structural", FieldIntentRepairEnabled: "true",
 			FieldIntentRepairHorizon: "10m0s", FieldIntentRepairMaxCommits: "3",
 			FieldVerificationFastTimeout: "2m0s",
-		}, "verified_dependency_partition", false},
+		}, "evidence_partition", false},
 		{StrategyIntent, PresetQuality, map[string]string{
 			FieldIntentWindow: "30", FieldIntentSettleWindow: "1m0s",
 			FieldIntentMaxPendingAge: "10m0s", FieldIntentDeferLimit: "3",
 			FieldIntentVerification: "full", FieldIntentRepairEnabled: "true",
 			FieldIntentRepairHorizon: "30m0s", FieldIntentRepairMaxCommits: "5",
 			FieldVerificationFullTimeout: "10m0s",
-		}, "needs_attention", true},
+		}, "evidence_partition", true},
 	}
 	for _, tt := range tests {
 		tt := tt

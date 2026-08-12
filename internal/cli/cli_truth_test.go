@@ -68,7 +68,7 @@ func TestIntentObservabilityReportsEffectiveCorrectionMaximum(t *testing.T) {
 		configured int
 		effective  int
 	}{
-		{raw: `{"intent.retry_on_invalid":"9"}`, configured: 9, effective: 1},
+		{raw: `{"intent.retry_on_invalid":"9"}`, configured: 9, effective: 2},
 		{raw: `{"intent.retry_on_invalid":"0"}`, configured: 0, effective: 0},
 	} {
 		var report intentV2Report
@@ -99,7 +99,8 @@ func TestControlTruthStateMatrix(t *testing.T) {
 		}, wantState: "needs_attention", wantHealth: controlHealthNeedsAttention, wantText: "durable block"},
 		{name: "circuit fallback", mutate: func(s *statusReport) {
 			s.IntentStrategy.PlannerHealth = healthOpen
-		}, wantState: "fallback", wantHealth: controlHealthDegraded, wantText: "fallback"},
+			s.PendingEvents = 1
+		}, wantState: "fallback", wantHealth: controlHealthDegraded, wantText: "evidence-based"},
 		{name: "batch wait", mutate: func(s *statusReport) {
 			s.PendingEvents = 2
 			s.IntentStrategy = intentStrategyReport{Active: true, BatchWaitActive: true}

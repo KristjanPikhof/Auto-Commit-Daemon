@@ -75,6 +75,7 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // restart recovery cannot reinterpret repair state. v20 adds the general
 // operation/checkpoint ledger and correlates new self-publication rows with
 // it. v21 adds publication_drains without backfilling historical checkpoints.
+// v22 adds durable adaptive planner attempts and additive window summaries.
 // New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.

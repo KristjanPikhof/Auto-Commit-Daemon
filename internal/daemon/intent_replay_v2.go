@@ -127,6 +127,12 @@ func replayIntentCandidateBatch(
 	windowCfg := cfg
 	windowCfg.retryCount = evaluation.RetryCount
 	windowCfg.fallbackUsed = evaluation.Fallback != ""
+	windowCfg.planFingerprint = evaluation.PlanFingerprint
+	windowCfg.planAttempt = evaluation.PlanAttempt
+	windowCfg.planAttemptLimit = evaluation.PlanAttemptLimit
+	windowCfg.unresolvedCaptureCount = evaluation.UnresolvedCaptureCount
+	windowCfg.preservedGroupCount = evaluation.PreservedGroupCount
+	windowCfg.resolutionMode = evaluation.ResolutionMode
 	windowPlan := intentCandidatePlannerWindowPlan(
 		legacyRequest, evaluation)
 	if evaluation.PlannerFailure != "" {
@@ -144,7 +150,7 @@ func replayIntentCandidateBatch(
 	); err != nil {
 		return sum, err
 	}
-	if evaluation.PlannerFailure != "" {
+	if evaluation.PlannerFailure != "" && evaluation.NeedsAttention {
 		sum.PlannerFailure = evaluation.PlannerFailure
 		nowSec := float64(time.Now().UnixNano()) / 1e9
 		for _, item := range items {
