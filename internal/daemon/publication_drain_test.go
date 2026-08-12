@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -208,7 +209,7 @@ UPDATE capture_events SET state='failed',error='missing object' WHERE seq=?`,
 	}
 }
 
-func TestPublicationDrainAcceptsOnlyProvenOwnedHeadAdvance(t *testing.T) {
+func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
 	if err := gitpkg.Init(ctx, repo); err != nil {
@@ -238,15 +239,41 @@ func TestPublicationDrainAcceptsOnlyProvenOwnedHeadAdvance(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	base := commit("base\n", "base")
-	ownedHead := commit("owned\n", "owned")
-	db, events, drain := openPublicationDrainTestState(t, 1, 1)
-	if _, err := db.SQL().ExecContext(ctx, `
-UPDATE capture_events SET state='published',commit_oid=?,published_ts=11 WHERE seq=?`,
-		ownedHead, events[0].Seq); err != nil {
-		t.Fatal(err)
+	db, events, drain := openPublicationDrainTestState(t, 70, 1)
+	previous := base
+	for i := 0; i < 65; i++ {
+		target := commit(strings.Repeat("owned\n", i+1), "owned")
+		treeOutput, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+			"rev-parse", target+"^{tree}")
+		if err != nil {
+			t.Fatal(err)
+		}
+		publication := state.SelfPublication{
+			ID:        fmt.Sprintf("sp-owned-%d", i),
+			BranchRef: drain.BranchRef, BranchGeneration: drain.BranchGeneration,
+			SourceHead: previous, TargetCommitOID: target,
+			TargetTreeOID: strings.TrimSpace(string(treeOutput)),
+			Members:       []state.SelfPublicationMember{{EventSeq: events[i].Seq}},
+			Completion: state.SelfPublicationCompletion{
+				PublishedTS: float64(i + 11),
+			},
+		}
+		if created, err := state.PrepareSelfPublication(
+			ctx, db, publication); err != nil || !created {
+			t.Fatalf("PrepareSelfPublication %d=(%t,%v)", i, created, err)
+		}
+		if changed, err := state.MarkSelfPublicationGitApplied(
+			ctx, db, publication, float64(i+11)); err != nil || !changed {
+			t.Fatalf("MarkSelfPublicationGitApplied %d=(%t,%v)", i, changed, err)
+		}
+		if completed, err := state.CompleteSelfPublication(
+			ctx, db, publication, publication.Completion); err != nil || !completed {
+			t.Fatalf("CompleteSelfPublication %d=(%t,%v)", i, completed, err)
+		}
+		previous = target
 	}
 	if safe, err := publicationDrainOwnsHeadAdvance(
-		ctx, repo, db, drain, base, ownedHead); err != nil || !safe {
+		ctx, repo, db, drain, base, previous); err != nil || !safe {
 		t.Fatalf("owned advance=(%t,%v), want true,nil", safe, err)
 	}
 	externalHead := commit("external\n", "external")

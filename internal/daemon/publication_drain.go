@@ -144,7 +144,7 @@ func publicationDrainOwnsHeadAdvance(
 	observedHead string,
 	currentHead string,
 ) (bool, error) {
-	if observedHead == "" || currentHead == "" || len(drain.EventSeqs) == 0 {
+	if observedHead == "" || currentHead == "" {
 		return false, nil
 	}
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
@@ -152,48 +152,51 @@ func publicationDrainOwnsHeadAdvance(
 		return false, nil
 	}
 	output, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
-		"rev-list", "--first-parent", "--reverse", "--max-count=65",
+		"rev-list", "--first-parent", "--reverse", "--max-count=4097",
 		observedHead+".."+currentHead)
 	if err != nil {
 		return false, err
 	}
 	commits := strings.Fields(string(output))
-	if len(commits) == 0 || len(commits) > 64 {
+	if len(commits) == 0 || len(commits) > 4096 {
 		return false, nil
 	}
-	published := make(map[string]struct{}, len(commits))
-	const batchSize = 500
-	for start := 0; start < len(drain.EventSeqs); start += batchSize {
-		end := min(start+batchSize, len(drain.EventSeqs))
+	sources := make(map[string]string, len(commits))
+	const batchSize = 400
+	for start := 0; start < len(commits); start += batchSize {
+		end := min(start+batchSize, len(commits))
 		placeholders := make([]string, 0, end-start)
-		args := make([]any, 0, end-start)
-		for _, seq := range drain.EventSeqs[start:end] {
+		args := make([]any, 0, end-start+2)
+		args = append(args, drain.BranchRef, drain.BranchGeneration)
+		for _, commit := range commits[start:end] {
 			placeholders = append(placeholders, "?")
-			args = append(args, seq)
+			args = append(args, commit)
 		}
 		rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT DISTINCT commit_oid FROM capture_events
-WHERE seq IN (`+strings.Join(placeholders, ",")+`)
-  AND state='published' AND commit_oid IS NOT NULL`, args...)
+SELECT target_commit_oid,source_head FROM self_publications
+WHERE branch_ref=? AND branch_generation=? AND phase='completed'
+  AND target_commit_oid IN (`+strings.Join(placeholders, ",")+`)`, args...)
 		if err != nil {
 			return false, err
 		}
 		for rows.Next() {
-			var oid string
-			if err := rows.Scan(&oid); err != nil {
+			var target, source string
+			if err := rows.Scan(&target, &source); err != nil {
 				rows.Close()
 				return false, err
 			}
-			published[oid] = struct{}{}
+			sources[target] = source
 		}
 		if err := rows.Close(); err != nil {
 			return false, err
 		}
 	}
+	expectedSource := observedHead
 	for _, commit := range commits {
-		if _, ok := published[commit]; !ok {
+		if sources[commit] != expectedSource {
 			return false, nil
 		}
+		expectedSource = commit
 	}
 	return true, nil
 }
