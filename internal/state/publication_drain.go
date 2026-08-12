@@ -301,6 +301,41 @@ WHERE id=? AND phase=?`, update.Phase, update.PublishedEventCount,
 	return PublicationDrainByID(ctx, db, id)
 }
 
+// ReopenPublicationDrainCheckpointing retries one previously blocked
+// checkpoint transition after the caller has independently proved that the
+// recorded safety error is no longer applicable. The exact error match keeps
+// unrelated needs-action drains terminal.
+func ReopenPublicationDrainCheckpointing(
+	ctx context.Context,
+	db *DB,
+	id string,
+	expectedError string,
+	updatedTS float64,
+) (PublicationDrain, error) {
+	if db == nil {
+		return PublicationDrain{}, errors.New(
+			"state: ReopenPublicationDrainCheckpointing: nil db")
+	}
+	result, err := db.conn.ExecContext(ctx, `
+UPDATE publication_drains
+SET phase='checkpointing',last_error='',updated_ts=?
+WHERE id=? AND phase='needs_action' AND last_error=? AND updated_ts<=?`,
+		updatedTS, id, sanitizePublicationDrainError(expectedError), updatedTS)
+	if err != nil {
+		return PublicationDrain{}, fmt.Errorf(
+			"state: reopen publication drain checkpointing: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return PublicationDrain{}, fmt.Errorf(
+			"state: count reopened publication drain: %w", err)
+	}
+	if changed != 1 {
+		return PublicationDrain{}, ErrPublicationDrainPhase
+	}
+	return PublicationDrainByID(ctx, db, id)
+}
+
 func PublicationDrainByID(
 	ctx context.Context,
 	db *DB,

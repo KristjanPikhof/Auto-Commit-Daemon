@@ -276,6 +276,29 @@ func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
 		ctx, repo, db, drain, base, previous); err != nil || !safe {
 		t.Fatalf("owned advance=(%t,%v), want true,nil", safe, err)
 	}
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE checkpoints SET observed_head=? WHERE id=?`,
+		base, drain.CheckpointID); err != nil {
+		t.Fatal(err)
+	}
+	blockedUpdate := PublicationDrainUpdateFrom(drain, 100, drain.LastProgressTS)
+	blockedUpdate.Phase = state.PublicationDrainNeedsAction
+	blockedUpdate.LastError = fmt.Sprintf(
+		publicationDrainHeadChangedPrefix+" observed=%s current=%s", base, previous)
+	blocked, err := state.AdvancePublicationDrain(ctx, db, drain.ID, blockedUpdate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartable, err := RestartablePublicationDrainForPair(
+		ctx, db, drain.BranchRef, drain.BranchGeneration)
+	if err != nil || restartable == nil || restartable.ID != drain.ID {
+		t.Fatalf("restartable=(%+v,%v), want %s", restartable, err, drain.ID)
+	}
+	resumed, err := ResumePublicationDrainCheckpointing(
+		ctx, repo, db, blocked, time.Unix(101, 0))
+	if err != nil || resumed.Phase != state.PublicationDrainSemantic {
+		t.Fatalf("resumed=(phase=%q err=%v), want semantic,nil", resumed.Phase, err)
+	}
 	externalHead := commit("external\n", "external")
 	if safe, err := publicationDrainOwnsHeadAdvance(
 		ctx, repo, db, drain, base, externalHead); err != nil || safe {

@@ -875,11 +875,13 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 					ctx, runtime.db, branchRef, generation)
 				if activeErr != nil {
 					anchorErr = activeErr
-				} else if activeDrain != nil {
-					if activeDrain.Phase == state.PublicationDrainCheckpointing {
-						*activeDrain, anchorErr = daemon.ResumePublicationDrainCheckpointing(
-							ctx, runtime.worktree.Root, runtime.db, *activeDrain, time.Now())
-					}
+				} else if activeDrain == nil {
+					activeDrain, anchorErr = daemon.RestartablePublicationDrainForPair(
+						ctx, runtime.db, branchRef, generation)
+				}
+				if anchorErr == nil && activeDrain != nil {
+					*activeDrain, anchorErr = daemon.ResumePublicationDrainCheckpointing(
+						ctx, runtime.worktree.Root, runtime.db, *activeDrain, time.Now())
 					if anchorErr != nil {
 						runtime.gate.Unlock()
 						return nil, protocolFailure(

@@ -16,6 +16,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+const publicationDrainHeadChangedPrefix = "publication drain HEAD changed after checkpoint:"
+
 // ActivePublicationDrainForPair returns the one durable drain owned by the
 // active branch generation. Multiple active drains for one pair fail closed.
 func ActivePublicationDrainForPair(
@@ -48,6 +50,51 @@ func ActivePublicationDrainForPair(
 	return active, nil
 }
 
+// RestartablePublicationDrainForPair returns the latest HEAD-change block
+// that a new consented commit-all invocation may re-prove. Ordinary daemon
+// replay must not use this lookup because needs-action drains remain terminal
+// until the user retries the operation.
+func RestartablePublicationDrainForPair(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+) (*state.PublicationDrain, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+  AND last_error LIKE ?
+ORDER BY created_ts DESC,id DESC LIMIT 2`,
+		branchRef, generation, publicationDrainHeadChangedPrefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if len(ids) > 1 {
+		return nil, errors.New(
+			"daemon: multiple restartable publication drains for branch generation")
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, ids[0])
+	if err != nil {
+		return nil, err
+	}
+	return &drain, nil
+}
+
 // ResumePublicationDrainCheckpointing completes the only mutable Git step
 // authorized by commit-all --yes. It rechecks branch, HEAD, Git operations,
 // and conflicts before resetting the index, so restart recovery remains
@@ -59,10 +106,15 @@ func ResumePublicationDrainCheckpointing(
 	drain state.PublicationDrain,
 	now time.Time,
 ) (state.PublicationDrain, error) {
-	if drain.Phase != state.PublicationDrainCheckpointing {
+	recheckingHeadAdvance := drain.Phase == state.PublicationDrainNeedsAction &&
+		strings.HasPrefix(drain.LastError, publicationDrainHeadChangedPrefix)
+	if drain.Phase != state.PublicationDrainCheckpointing && !recheckingHeadAdvance {
 		return drain, nil
 	}
 	fail := func(reason error) (state.PublicationDrain, error) {
+		if recheckingHeadAdvance {
+			return drain, nil
+		}
 		nowTS := float64(now.UnixNano()) / 1e9
 		update := PublicationDrainUpdateFrom(drain, nowTS, drain.LastProgressTS)
 		update.Phase = state.PublicationDrainNeedsAction
@@ -95,7 +147,7 @@ func ResumePublicationDrainCheckpointing(
 			ctx, repoRoot, db, drain, observedHead, currentHeadText)
 		if err == nil && !safe {
 			err = fmt.Errorf(
-				"publication drain HEAD changed after checkpoint: observed=%s current=%s",
+				publicationDrainHeadChangedPrefix+" observed=%s current=%s",
 				observedHead, currentHeadText)
 		}
 	}
@@ -122,6 +174,15 @@ func ResumePublicationDrainCheckpointing(
 			err = errors.New("publication drain encountered unresolved conflicts")
 		}
 		return fail(err)
+	}
+	if recheckingHeadAdvance {
+		nowTS := float64(now.UnixNano()) / 1e9
+		drain, err = state.ReopenPublicationDrainCheckpointing(
+			ctx, db, drain.ID, drain.LastError, nowTS)
+		if err != nil {
+			return drain, err
+		}
+		recheckingHeadAdvance = false
 	}
 	if drain.StagedConsent && !drain.StagedConsumed {
 		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
