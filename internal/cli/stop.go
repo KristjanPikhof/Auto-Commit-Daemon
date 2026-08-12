@@ -171,7 +171,7 @@ func runStopRegistry(ctx context.Context, out io.Writer, force, jsonOut bool, re
 			if reason == "" {
 				reason = "daemon still running"
 			}
-			fmt.Fprintf(out, "  failed: %s (pid %d) — %s\n", r.Repo, r.DaemonPID, reason)
+			fmt.Fprintf(out, "  failed: %s (pid %d): %s\n", r.Repo, r.DaemonPID, reason)
 		}
 	}
 	if len(out_all.Failed) > 0 {

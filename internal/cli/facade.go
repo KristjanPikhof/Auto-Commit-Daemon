@@ -34,8 +34,16 @@ type productDoctorSettings struct {
 func newProductStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Show whether this repository is protected and published",
-		Args:  cobra.NoArgs,
+		Short: "Show protection, Git publication, and the next step",
+		Long: `Show whether ACD is running, whether current changes are protected,
+and whether those changes have been published to local Git.
+
+The command does not change anything. If action is needed, the last line gives
+the exact next command to run.`,
+		Example: `  acd status
+  acd status --repo /path/to/repo
+  acd status --json`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -49,8 +57,19 @@ func newProductDoctorCmd() *cobra.Command {
 	var output string
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "Explain installation and protection problems",
-		Args:  cobra.NoArgs,
+		Short: "Explain ACD problems and show how to fix them",
+		Long: `Check the installation, background worker, protection state, and
+active configuration for one repository.
+
+Doctor does not change anything. It explains the current problem and prints a
+safe next step. Use --bundle only when you need a sanitized archive for
+support.`,
+		Example: `  acd doctor
+  acd doctor --repo /path/to/repo
+  acd doctor --bundle
+  acd doctor --bundle --output /path/to/folder
+  acd doctor --json`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -82,8 +101,8 @@ func newProductDoctorCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&bundle, "bundle", false, "Write a sanitized support bundle")
-	cmd.Flags().StringVar(&output, "output", "", "Override the support bundle output directory")
+	cmd.Flags().BoolVar(&bundle, "bundle", false, "Create a sanitized support archive")
+	cmd.Flags().StringVar(&output, "output", "", "Folder for the support archive")
 	return cmd
 }
 
@@ -92,7 +111,7 @@ func renderProductDoctorWorker(out io.Writer, status controlResult) {
 		return
 	}
 	fmt.Fprintln(out, "\nWorker:")
-	fmt.Fprintf(out, "  State: %s", status.SupervisorWorkerState)
+	fmt.Fprintf(out, "  State: %s", strings.ReplaceAll(status.SupervisorWorkerState, "_", " "))
 	if status.SupervisorWorkerRestarts > 0 {
 		fmt.Fprintf(out, " after %d restart attempt(s)", status.SupervisorWorkerRestarts)
 	}
@@ -135,16 +154,17 @@ func collectProductDoctorSettings(ctx context.Context, repo string) productDocto
 }
 
 func renderProductDoctorSettings(out io.Writer, details productDoctorSettings) {
-	fmt.Fprintln(out, "\nPublication settings:")
-	fmt.Fprintf(out, "  Provider: %s (%s)\n", valueOrUnset(details.Provider), valueOrUnset(details.ProviderSource))
-	fmt.Fprintf(out, "  Strategy: %s / %s (%s)\n", valueOrUnset(details.Strategy),
+	fmt.Fprintln(out, "\nCommit settings:")
+	fmt.Fprintf(out, "  AI provider: %s (from %s)\n", valueOrUnset(details.Provider), valueOrUnset(details.ProviderSource))
+	fmt.Fprintf(out, "  Commit style: %s / %s (from %s)\n", valueOrUnset(details.Strategy),
 		valueOrUnset(details.Preset), valueOrUnset(details.StrategySource))
-	fmt.Fprintf(out, "  Verification: %s; repair=%s; diff egress=%s\n",
-		valueOrUnset(details.Verification), yesNo(details.RepairEnabled), yesNo(details.DiffEgressEnabled))
+	fmt.Fprintf(out, "  Project checks: %s\n", valueOrUnset(details.Verification))
+	fmt.Fprintf(out, "  Automatic repair: %s\n", yesNo(details.RepairEnabled))
+	fmt.Fprintf(out, "  Share file differences with AI: %s\n", yesNo(details.DiffEgressEnabled))
 	for _, note := range details.ConfigurationNotes {
 		fmt.Fprintf(out, "  Note: %s\n", note)
 	}
-	fmt.Fprintln(out, "More detail: acd support diagnose")
+	fmt.Fprintln(out, "More detail: Run `acd support diagnose`.")
 }
 
 func runProductDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut bool) error {
@@ -288,8 +308,18 @@ func newHistoryCmd() *cobra.Command {
 	var activity bool
 	cmd := &cobra.Command{
 		Use:   "history",
-		Short: "Show protected checkpoints and their Git publication state",
-		Args:  cobra.NoArgs,
+		Short: "Show checkpoints and whether Git contains them",
+		Long: `Show recent protected checkpoints for this repository and whether
+each checkpoint has been published to local Git.
+
+Use the subcommands to inspect activity, explain a decision, or safely rewrite
+commit messages. History commands do not rewrite commits unless you explicitly
+apply a reviewed rewrite plan.`,
+		Example: `  acd history
+  acd history --activity
+  acd history explain --last
+  acd history rewrite --help`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -317,7 +347,8 @@ func newHistoryCmd() *cobra.Command {
 	explain := newHistoryExplainCmd()
 	activityCommand := newHistoryActivityCmd()
 	rewrite := newRewriteCommitsCmd()
-	rewrite.Use = "rewrite"
+	rewrite.Use = "rewrite [selection flags]"
+	rewrite.Aliases = nil
 	cmd.AddCommand(activityCommand, explain, withInvocationCapabilities(rewrite,
 		commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}))
 	return cmd
@@ -378,7 +409,8 @@ LIMIT 100`)
 		return encoder.Encode(envelope)
 	}
 	if len(entries) == 0 {
-		fmt.Fprintln(out, "No checkpoints yet.")
+		fmt.Fprintln(out, "Status: No checkpoints yet.")
+		fmt.Fprintln(out, "Next: No action needed. A checkpoint will appear after ACD protects a change.")
 		return nil
 	}
 	fmt.Fprintln(out, "CHECKPOINT\tWHEN\tREASON\tGIT")
@@ -394,9 +426,15 @@ LIMIT 100`)
 }
 
 func newConfigNamespaceCmd() *cobra.Command {
-	cmd := &cobra.Command{Use: "config", Short: "Manage ACD configuration", Hidden: true}
+	cmd := &cobra.Command{Use: "config", Short: "View or change ACD settings", Hidden: true,
+		Long: `View resolved settings, change one value, open guided setup, reset
+saved values, or manage the optional AI provider credential.`,
+		Example: `  acd config get
+  acd config edit
+  acd config credentials status`}
 	edit := newConfigureCmd()
 	edit.Use = "edit"
+	edit.Example = strings.ReplaceAll(edit.Example, "acd configure", "acd config edit")
 	cmd.AddCommand(
 		withInvocationCapabilities(newConfigGetCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newConfigSetCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
@@ -411,6 +449,9 @@ func newConfigCredentialsCmd() *cobra.Command {
 	credentials := newAuthCmd()
 	credentials.Use = "credentials"
 	credentials.Short = "Manage the protected provider credential"
+	credentials.Example = `  acd config credentials status
+  acd config credentials set
+  acd config credentials remove`
 	credentials.RunE = func(command *cobra.Command, _ []string) error {
 		jsonOut, _ := command.Flags().GetBool("json")
 		return runProductCredentialStatus(command.OutOrStdout(), jsonOut)
@@ -428,14 +469,26 @@ func newConfigCredentialsCmd() *cobra.Command {
 }
 
 func newSupportNamespaceCmd() *cobra.Command {
-	cmd := &cobra.Command{Use: "support", Short: "Advanced diagnostics and repair", Hidden: true}
+	cmd := &cobra.Command{Use: "support", Short: "Inspect and safely repair ACD problems", Hidden: true,
+		Long: `Use read-only diagnostics first. Recovery and repair commands show a
+preview before they change anything and require explicit confirmation.`,
+		Example: `  acd support diagnose
+  acd support logs --lines 100
+  acd support recover --dry-run`}
 	diagnose := newSupportDiagnoseCmd()
 	logs := newSupportLogsCmd()
 	repair := withInvocationCapabilities(newProductRepairCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true})
 	bundle := &cobra.Command{
 		Use:   "bundle",
-		Short: "Create a sanitized support bundle",
-		Args:  cobra.NoArgs,
+		Short: "Create a sanitized support archive",
+		Long: `Create a sanitized archive with ACD diagnostics for one repository.
+
+The archive removes known home-directory paths and secrets. Review it before
+sharing it. This command does not change repository state.`,
+		Example: `  acd support bundle
+  acd support bundle --repo /path/to/repo
+  acd support bundle --output /path/to/folder`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -444,7 +497,7 @@ func newSupportNamespaceCmd() *cobra.Command {
 				cmd.OutOrStdout(), output, jsonOut)
 		},
 	}
-	bundle.Flags().String("output", "", "Override the output directory")
+	bundle.Flags().String("output", "", "Folder for the support archive")
 	cmd.AddCommand(diagnose, logs, repair, newSupportRecoverCmd(), newSupportPromptCmd(),
 		withInvocationCapabilities(bundle, commandCapabilities{Repository: true, JSON: true, Quiet: true}))
 	return cmd
@@ -453,11 +506,13 @@ func newSupportNamespaceCmd() *cobra.Command {
 func newSupportDiagnoseCmd() *cobra.Command {
 	command := newDiagnoseCmd()
 	command.Use = "diagnose"
-	command.Long = `Inspect replay blockers, pending depth, branch anchors, Git-operation
-markers, and remediation hints for one repository without mutating state.
+	command.Short = "Inspect why protection or Git publication is stuck"
+	command.Long = `Inspect one repository without changing anything. The report
+shows whether ACD is protecting changes, what is delaying Git publication, and
+the safest next step.
 
-Use acd support recover --dry-run to preview exact-chain recovery when diagnose
-reports a terminal publication barrier.`
+If the report finds a safety block, use acd support recover --dry-run to preview
+recovery before applying it.`
 	command.Example = `  acd support diagnose
   acd support diagnose --repo /path/to/repo
   acd support diagnose --json
@@ -468,11 +523,12 @@ reports a terminal publication barrier.`
 func newSupportLogsCmd() *cobra.Command {
 	command := newLogsCmd()
 	command.Use = "logs"
-	command.Long = `Print one repository's raw daemon JSONL log tail.
+	command.Short = "Show recent background-worker log entries"
+	command.Long = `Print recent background-worker log entries for one repository.
 
 Use --lines to choose the initial tail or --follow to stream appended lines.
-Use acd support bundle for a sanitized shareable archive and acd support prompt
-for locally recorded AI prompt traces.`
+The log is raw JSONL and may contain local paths, so review it before sharing.
+Use acd support bundle for a sanitized archive.`
 	command.Example = `  acd support logs
   acd support logs --lines 200
   acd support logs --follow
@@ -496,10 +552,11 @@ func newHistoryActivityCmd() *cobra.Command {
 	command := newEventsCmd()
 	command.Use = "activity"
 	command.Short = "Show capture and publication activity"
-	command.Long = `Show product-facing capture and publication decisions for one repository.
+	command.Long = `Show when ACD protected a change, published a commit, waited,
+or stopped at a safety check.
 
-Use --path to focus on one path, --since to resume from a decision cursor, and
---watch to stream activity until interrupted.`
+Use --path to focus on one file, --since to continue after an activity number,
+or --watch to keep showing new activity until interrupted.`
 	command.Example = `  acd history activity
   acd history activity --path internal/state/schema.go
   acd history activity --since 42 --limit 100
@@ -521,6 +578,8 @@ Use --path to focus on one path, --since to resume from a decision cursor, and
 		return runProductEvents(ctx, cmd.OutOrStdout(), repo, path,
 			since, limit, watch, interval, jsonOut)
 	}
+	command.Flags().Lookup("since").Usage = "Show activity after this activity number"
+	command.Flags().Lookup("watch").Usage = "Keep showing new activity until interrupted"
 	return withInvocationCapabilities(command,
 		commandCapabilities{Repository: true, JSON: true, Quiet: true, Streaming: true})
 }
@@ -528,11 +587,12 @@ Use --path to focus on one path, --since to resume from a decision cursor, and
 func newSupportPromptCmd() *cobra.Command {
 	command := newPromptCmd()
 	command.Use = "prompt"
-	command.Short = "Inspect locally recorded AI prompt traces"
-	command.Long = `Inspect locally recorded AI prompt traces for one repository.
+	command.Short = "Show a recorded AI request for troubleshooting"
+	command.Long = `Show a locally recorded AI request for one repository.
 
-Prompt traces exist only when ACD_AI_PROMPT_TRACE is enabled. With no selector,
-the newest trace is shown; use --seq for one captured event or intent sequence.`
+These records exist only when AI prompt tracing was enabled. They can contain
+sensitive source context, so review them before sharing. With no selector, ACD
+shows the newest record. Use --seq to select one protected change or batch.`
 	command.Example = `  acd support prompt
   acd support prompt --last
   acd support prompt --seq 42
@@ -544,17 +604,20 @@ the newest trace is shown; use --seq for one captured event or intent sequence.`
 		seq, _ := cmd.Flags().GetInt64("seq")
 		return runProductPrompt(cmd.Context(), cmd.OutOrStdout(), repo, last, seq, jsonOut)
 	}
+	command.Flags().Lookup("seq").Usage = "Show the newest record for this protected change or batch number"
 	return withInvocationCapabilities(command, commandCapabilities{Repository: true, JSON: true, Quiet: true})
 }
 
 func newSupportRecoverCmd() *cobra.Command {
 	command := newFixCmd()
 	command.Use = "recover"
-	command.Short = "Preview or apply exact-chain recovery"
-	command.Long = `Preview or apply exact-chain recovery for one repository.
+	command.Short = "Preview or recover protected work that cannot publish"
+	command.Long = `Preview or recover protected work when Git publication cannot
+continue safely.
 
-Without --yes, recovery is read-only. --yes applies only proved recovery;
---force selects archive-only protection for otherwise unresolved pairs.`
+The default is read-only. Add --yes only after reviewing the plan. ACD applies
+recovery only when it can prove the result. Use --force to preserve unresolved
+work in a private recovery archive instead of trying to publish it.`
 	command.Example = `  acd support recover --dry-run
   acd support recover --yes
   acd support recover --force --dry-run
@@ -569,11 +632,23 @@ Without --yes, recovery is read-only. --yes applies only proved recovery;
 		return runProductFix(cmd.Context(), cmd.OutOrStdout(), repo,
 			dryRun, yes, force, clearPause, jsonOut)
 	}
+	command.Flags().Lookup("dry-run").Usage = "Show the recovery plan without changing anything"
+	command.Flags().Lookup("yes").Usage = "Apply the displayed recovery plan"
+	command.Flags().Lookup("force").Usage = "Preserve unresolved protected work in a private recovery archive"
+	command.Flags().Lookup("clear-pause").Usage = "Also remove a manual pause after recovery"
 	return withInvocationCapabilities(command, commandCapabilities{Repository: true, JSON: true, Quiet: true})
 }
 
 func newProductRepoNamespaceCmd() *cobra.Command {
-	cmd := &cobra.Command{Use: "repo", Short: "Manage protected repositories", Hidden: true, Args: cobra.NoArgs}
+	cmd := &cobra.Command{Use: "repo", Short: "Manage registered repositories", Hidden: true, Args: cobra.NoArgs,
+		Long: `List every registered repository, remove an old registration, clean
+up missing entries, or view activity totals.
+
+Use acd list for the everyday protection dashboard. These commands are for
+registration and storage maintenance.`,
+		Example: `  acd repo list
+  acd repo remove --dry-run
+  acd repo gc`}
 	initCompat := &cobra.Command{
 		Use:    "init",
 		Hidden: true,

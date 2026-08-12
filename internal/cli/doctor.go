@@ -1420,7 +1420,7 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 		rr.IntentV2 = intentV2
 		if intentV2.NeedsAttention != "" {
 			rr.Notes = append(rr.Notes,
-				"Intent v2 replay stopped; capture remains durable; run acd configure")
+				"Intent v2 replay stopped; capture remains durable; run acd config edit")
 		}
 	} else {
 		rr.Notes = append(rr.Notes, "Intent v2 summary failed: "+err.Error())
@@ -1450,7 +1450,7 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 		rr.Configuration = readiness
 		if readiness.Configuration == "needs_attention" {
 			rr.Notes = append(rr.Notes,
-				"configuration validation needs attention; run acd configure")
+				"configuration validation needs attention; run acd config edit")
 		}
 	} else {
 		rr.Notes = append(rr.Notes,
@@ -1585,7 +1585,7 @@ func tailLogLines(path string, n int) []string {
 
 // renderDoctorHuman writes a human-readable report.
 func renderDoctorHuman(out io.Writer, r doctorReport) error {
-	fmt.Fprintf(out, "acd doctor — %s\n", r.GeneratedAt)
+	fmt.Fprintf(out, "acd doctor: %s\n", r.GeneratedAt)
 	fmt.Fprintf(out, "  acd version : %s\n", r.ACDVersion)
 	fmt.Fprintf(out, "  go          : %s (%s/%s)\n", r.GoVersion, r.GoOS, r.GoArch)
 	if r.GitVersion != "" {

@@ -18,37 +18,33 @@ acd
 acd history
 ~~~
 
-`waiting` with `Protected: yes` means work is safe and publication is delayed.
-The final `Next:` line gives the exact command only when action is necessary.
+`waiting` with `Current changes protected: yes` means work is safe and Git
+publication is delayed. The final `Next:` line gives the exact command only
+when action is necessary.
 
-Status separates checkpoint protection from Git state and publication
-provenance:
+The human status output keeps the main questions separate:
 
 | Output | Meaning |
 |---|---|
-| `retrying` | Replay hit a recoverable error and will retry automatically. A completed checkpoint remains protected. |
-| `self_healing` | ACD is normalizing or rebuilding the durable publication plan. No command is needed. |
-| `waiting_for_provider` | The frozen publication target is waiting for its bounded semantic attempt. The drain survives restart. |
-| `event_fallback` | Semantic recovery could not prove a safe Intent partition, so the frozen drain is publishing local atomic dependency groups. |
-| `needs_attention` | A durable publication block needs inspection with `acd doctor`. |
-| `busy` with a fresh heartbeat | The worker is draining pending work or completing another bounded operation. |
-| `All changes committed in Git: yes` | The worktree is clean. This does not claim that ACD created its commits. |
-| `Protected: yes` | The latest observed eligible tree is covered by a completed checkpoint. |
-| `Latest protection checkpoint published by ACD: yes` | No checkpoint or pending event remains unpublished behind that checkpoint. |
+| `State` | Overall state: `off`, `protected`, `waiting`, `publishing`, or `needs_action`. |
+| `ACD protection` | Whether background protection is on. |
+| `Current changes protected` | Whether the latest eligible changes have a completed durable checkpoint. |
+| `Published to Git` | Whether all protected changes are now in local Git commits. |
+| `Action needed` | Whether you need to do anything now. |
+| `Status` | What ACD is doing or why it stopped. |
+| `Next` | The next command, or `No action needed.` |
 
-These fields are independent. A clean worktree can be committed in Git by a
-person or another tool. A completed checkpoint can remain protected while Git
-publication is waiting. The `Published by ACD` result reports ACD provenance
-for the latest completed checkpoint, not the origin of every commit in Git.
+These fields are independent. Current changes can remain protected while Git
+publication is waiting or needs recovery.
 
 ## Publication is delayed
 
-Run `acd doctor`. Common waiting causes include the settle window, unsafe Git
-state, verification failure, provider retry, or worker version mismatch.
-Local repair, partial replanning, evidence grouping, and provider cooldown
-recover automatically. No restart or configuration change is required. Do not delete
-state, private refs, ownership locks, or sockets. Provider and verification
-failures do not invalidate completed checkpoints.
+Run `acd doctor`. ACD may be waiting to group related changes, for a Git
+operation to finish, for a project check to pass, or for an AI provider to
+recover. It handles ordinary delays automatically. Doctor tells you when a
+restart or another command is required. Do not delete ACD databases, private
+refs, ownership locks, or sockets. Completed checkpoints remain protected
+while publication waits.
 
 For an explicit all-changes drain, run:
 
@@ -56,17 +52,16 @@ For an explicit all-changes drain, run:
 acd commit-all --yes
 ~~~
 
-The command freezes one target, waits until it is published, and shows the
-phase, remaining events, commit count, semantic group count, planning attempts,
-resolution mode, genuine singleton count, fallback mode, and latest safe error.
-Closing the terminal only detaches the display. The worker keeps publishing,
-and the next `acd commit-all --yes` attaches to the same active drain.
+The command freezes one target, waits until it is published, and shows how many
+protected changes remain and how many commits have been created. Closing the
+terminal only detaches the display. The background worker keeps publishing,
+and the next `acd commit-all --yes` reconnects to the same run.
 
-This command is also the staging consent boundary. ACD verifies the full
-private checkpoint before resetting the index to `HEAD`. The worktree does not
-change, and staged, unstaged, and untracked content remains represented by the
-checkpoint and frozen target. Ordinary background publication never consumes
-staged content.
+This command is also the normal way to let ACD include staged changes. ACD
+verifies the full private checkpoint before clearing the staging area back to
+`HEAD`. Working files do not change. The checkpoint still contains staged,
+unstaged, and untracked content. Ordinary background publication never clears
+staged changes.
 
 Later edits are protected normally but do not expand or starve the frozen
 target. ACD asks for attention only when safety proof is impossible, such as a

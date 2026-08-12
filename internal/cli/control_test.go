@@ -194,7 +194,7 @@ func TestApplyControlStatusDurableReplayBlockNeedsAttention(t *testing.T) {
 	result := controlResult{OK: true, Health: controlHealthHealthy}
 	applyControlStatus(&result, status)
 	if result.OK || result.Health != controlHealthNeedsAttention ||
-		!strings.Contains(result.Summary, "durable block") {
+		!strings.Contains(result.Summary, "safety block") {
 		t.Fatalf("control result=%+v", result)
 	}
 	if !result.RecoveryRequired {
@@ -396,7 +396,7 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 				t.Fatalf("runControlStatus exit=%d err=%v", ExitCode(err), err)
 			}
 			got := decodeControlResult(t, out.Bytes())
-			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "blocked publication") {
+			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "safety block") {
 				t.Fatalf("active tail terminal event was not surfaced: %+v", got)
 			}
 			if !strings.Contains(got.NextAction, "acd support recover --dry-run") ||
@@ -490,7 +490,7 @@ func TestApplyControlStatusPlannerCircuitDegraded(t *testing.T) {
 			res := controlResult{OK: true}
 			applyControlStatus(&res, status)
 			if res.Health != controlHealthDegraded ||
-				!strings.Contains(res.Summary, "evidence-based grouping") ||
+				!strings.Contains(res.Summary, "safe local grouping") ||
 				!strings.Contains(res.NextAction, tc.nextText) {
 				t.Fatalf("control result=%+v", res)
 			}
@@ -533,7 +533,7 @@ func TestApplyControlStatusRewindGraceDoesNotHideRecoveryBlockers(t *testing.T) 
 			mutate: func(status *statusReport) {
 				status.BackpressurePaused = true
 			},
-			want: "durable storage",
+			want: "protected storage",
 		},
 		{
 			name: "terminal barrier",
@@ -591,7 +591,7 @@ func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T)
 		want   string
 	}{
 		{name: "pause", mutate: func(s *statusReport) { s.Paused = true }, want: "paused"},
-		{name: "backpressure", mutate: func(s *statusReport) { s.BackpressurePaused = true }, want: "durable storage"},
+		{name: "backpressure", mutate: func(s *statusReport) { s.BackpressurePaused = true }, want: "protected storage"},
 		{name: "barrier", mutate: func(s *statusReport) { s.ActiveBarriers = 1 }, want: "blocked publication"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -766,7 +766,7 @@ func TestRenderProductDoctorWorkerShowsCauseAndFix(t *testing.T) {
 		NextAction:            "Run `acd on` to repair it.",
 	})
 	for _, want := range []string{
-		"State: needs_action after 5 restart attempt(s)",
+		"State: needs action after 5 restart attempt(s)",
 		"Cause: schema is v20, want v21",
 		"Fix: Run `acd on` to repair it.",
 	} {
@@ -784,7 +784,7 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
 		t.Fatalf("runControlStatus: %v", err)
 	}
-	for _, line := range []string{"Enabled:", "Protected:", "Published to Git:", "Action required:", "Next:"} {
+	for _, line := range []string{"State:", "ACD protection:", "Current changes protected:", "Published to Git:", "Action needed:", "Status:", "Next:"} {
 		if got := strings.Count(out.String(), line); got != 1 {
 			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
 		}

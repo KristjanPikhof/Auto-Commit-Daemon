@@ -60,56 +60,37 @@ func newRewriteCommitsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "rewrite-commits (--from-nr <n> | --from-sha <sha> | --range-nr <start-end> | --range-sha <base>..<head> | --last <n>) [--plan-out FILE] | --edit <plan-id-or-file>",
 		Aliases: []string{"edit-commits", "edit-commit"},
-		Short:   "Generate, review, edit, and optionally apply an AI commit rewrite plan for the current branch",
-		Long: `Generate, review, edit, and apply an AI-generated commit-message
-rewrite plan for a linear range on the current branch.
+		Short:   "Review and improve commit messages on this branch",
+		Long: `Create a reviewable plan that improves commit messages in a linear
+part of the current branch. Normal ACD protection never runs this command.
 
-Safe workflow:
-  1. Choose commits with --from-nr, --from-sha, --range-nr, --range-sha, or --last.
-  2. Generate a plan with --plan-only or --plan-out.
-  3. Review with --show-plan or --edit.
-  4. Dry-run apply, then apply with --yes.
+Recommended workflow:
+  1. Select commits with --last, --from-sha, --from-nr, --range-sha, or
+     --range-nr.
+  2. Save a plan with --plan-only or --plan-out.
+  3. Review it with --show-plan or --edit.
+  4. Preview the apply with --dry-run, then confirm it with --yes.
 
-Progress goes to stderr. Command results stay on stdout, so --json output remains
-parseable. Use --progress json for JSONL progress events, --progress plain for
-stable text progress, --progress off to disable progress, or --quiet to suppress
-non-essential output.
+Applying a plan rewrites Git history. ACD first verifies that the selected
+commits are safe to rewrite and creates a private backup ref. Merge commits are
+not supported. Working-tree files are not changed.
 
-Plan generation uses the repository's effective ACD settings. The commit
-strategy must resolve to intent and the provider must resolve to a usable
-non-deterministic planner (openai-compat with a configured credential, or
-subprocess:<name>). Environment variables remain compatibility overrides when
-no higher-priority saved setting exists; ACD_COMMIT_STRATEGY and
-ACD_AI_PROVIDER retain their existing names. Deterministic fallback is not
-enough for rewrite planning. Showing, editing, or applying a previously saved
-plan may bypass the provider gate because no new plan is generated.
+Creating a new plan requires Intent mode and a configured AI provider. Showing,
+editing, or applying a saved plan does not create a new AI request.
 
-Use --edit <plan-id-or-file> to reopen a saved rewrite plan in $EDITOR. The
-editor uses --format text by default, or --format json. Edit only the proposed
-commit message text. When the target is a saved plan id, changed edits are
-validated and saved as a new plan revision, and the new plan id is printed.
-When the target is a standalone JSON plan file, changed edits are written back
-to that file. Unchanged edits are accepted. After editing, ACD asks whether to
-apply the plan unless --plan-only is set; --yes applies after edit, and --dry-run
-validates/previews apply without rewriting commits.
+Use --edit with a saved plan ID or file to review messages in $EDITOR. Editing a
+saved plan ID creates a new revision; editing a standalone plan file updates
+that file. The command prints the plan ID or file it saved.
 
-v1 scope: current branch linear ranges only; merge commit rewrites are refused;
-there is no daemon automation.`,
-		Example: `  acd configure
-  acd rewrite-commits --from-sha 8f4c2a1 --plan-out rewrite.json
-  acd rewrite-commits --from-nr 5 --plan-only
-  acd rewrite-commits --range-nr 5-12 --review --format text
-  acd rewrite-commits --range-sha main~12..main~4 --format json
-  acd rewrite-commits --last 4 --no-review --yes
-  acd rewrite-commits --from 5 --plan-only        # compatibility alias
-  acd rewrite-commits --git-range main~12..main~4 --format json
-  acd rewrite-commits --show-plan rewrite.json
-  acd rewrite-commits --edit <plan-id-or-file> --format text --plan-only
-  acd rewrite-commits --edit <plan-id-or-file> --dry-run
-  acd rewrite-commits --edit <plan-id-or-file> --yes
-  acd rewrite-commits --apply-plan rewrite.json --dry-run
-  acd rewrite-commits --apply <plan-id> --yes
-  git reset --hard refs/acd/rewrite-backups/<plan-id>  # backup recovery if apply output says to use this ref`,
+Progress is written to stderr so stdout stays usable for command results and
+--json. Use --progress plain for copyable progress, or --quiet to hide it.`,
+		Example: `  acd config edit
+  acd history rewrite --last 5 --plan-only
+  acd history rewrite --from-sha 8f4c2a1 --plan-out rewrite.json
+  acd history rewrite --show-plan rewrite.json
+  acd history rewrite --edit rewrite.json --plan-only
+  acd history rewrite --apply rewrite.json --dry-run
+  acd history rewrite --apply rewrite.json --yes`,
 
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
@@ -130,19 +111,22 @@ there is no daemon automation.`,
 	cmd.Flags().StringVar(&opts.base, "base", "", "Deprecated alias for --git-range <base>..<head>: exclusive base revision")
 	cmd.Flags().StringVar(&opts.head, "head", "", "Deprecated alias for --git-range <base>..<head>: inclusive head revision (default HEAD when --base is set)")
 	cmd.Flags().StringVar(&opts.planOut, "plan-out", "", "Write the generated rewrite plan to FILE")
-	cmd.Flags().StringVar(&opts.showPlan, "show-plan", "", "Display a saved rewrite plan without checking the AI provider gate")
-	cmd.Flags().StringVar(&opts.editPlan, "edit", "", "Edit a saved rewrite plan by plan id or file path without checking the AI provider gate")
+	cmd.Flags().StringVar(&opts.showPlan, "show-plan", "", "Display a saved plan without creating a new AI request")
+	cmd.Flags().StringVar(&opts.editPlan, "edit", "", "Edit a saved plan by plan ID or file path")
 	cmd.Flags().StringVar(&opts.applyPlan, "apply-plan", "", "Apply a saved rewrite plan file; bypasses the plan-generation provider gate")
-	cmd.Flags().StringVar(&opts.applyPlan, "apply", "", "Apply a saved rewrite plan by plan id or file path (alias for --apply-plan when given a file)")
-	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "Validate and preview only; do not rewrite commits")
-	cmd.Flags().BoolVar(&opts.yes, "yes", false, "Answer yes to apply prompts and skip confirmation in noninteractive runs")
+	cmd.Flags().StringVar(&opts.applyPlan, "apply", "", "Apply a saved plan by plan ID or file path")
+	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "Check and preview the apply without rewriting commits")
+	cmd.Flags().BoolVar(&opts.yes, "yes", false, "Apply the reviewed plan without another confirmation")
 	cmd.Flags().BoolVar(&opts.review, "review", false, "Open EDITOR to review/edit proposed commit messages before apply")
 	cmd.Flags().BoolVar(&opts.noReview, "no-review", false, "Skip the review/edit prompt and leave proposed messages unchanged")
 	cmd.Flags().BoolVar(&opts.planOnly, "plan-only", false, "Generate or edit and save the rewrite plan without prompting to apply")
 	cmd.Flags().StringVar(&opts.progress, "progress", string(rewriteProgressModeAuto), "Progress output mode: auto, plain, json, or off")
 	cmd.Flags().StringVar(&opts.editFormat, "format", rewriteEditFormatText, "Review edit format: text or json")
 	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD; prefer --from-sha or --from-nr")
-	cmd.Flags().IntVar(&opts.selection.Last, "last", 0, "Compatibility selector: select the newest n commits")
+	cmd.Flags().IntVar(&opts.selection.Last, "last", 0, "Select the newest n commits")
+	for _, name := range []string{"range", "git-range", "base", "head", "from", "apply-plan"} {
+		_ = cmd.Flags().MarkHidden(name)
+	}
 	return cmd
 }
 
@@ -205,13 +189,13 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	}
 	provider, closer, err := ai.BuildProvider(cfg)
 	if err != nil {
-		return fmt.Errorf("acd rewrite-commits: build provider: %w", err)
+		return fmt.Errorf("acd history rewrite: build provider: %w", err)
 	}
 	if closer != nil {
 		defer func() { _ = closer.Close() }()
 	}
 	if err := ai.CheckRewritePlanGenerationGate(cfg, provider); err != nil {
-		return fmt.Errorf("acd rewrite-commits: %w", err)
+		return fmt.Errorf("acd history rewrite: %w", err)
 	}
 	if err := progress.Emit(rewriteProgressEvent{Phase: "provider", Message: fmt.Sprintf("using %s", ai.PrimaryProviderName(provider))}); err != nil {
 		return err
@@ -243,7 +227,7 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	}
 	if plan.ValidationStatus == state.RewritePlanValidationInvalid {
 		fmt.Fprintln(out, "No commits were rewritten.")
-		return errors.New("acd rewrite-commits: AI proposal validation failed; invalid plan saved and apply is blocked")
+		return errors.New("acd history rewrite: AI proposal validation failed; invalid plan saved and apply is blocked")
 	}
 	if opts.planOnly {
 		planRef := plan.ID
@@ -263,7 +247,7 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 
 	review := opts.review
 	if opts.review && opts.noReview {
-		return errors.New("acd rewrite-commits: choose only one of --review or --no-review")
+		return errors.New("acd history rewrite: choose only one of --review or --no-review")
 	}
 	if !opts.yes && !opts.review && !opts.noReview {
 		var err error
@@ -310,18 +294,18 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 func resolveRewriteProviderConfig(ctx context.Context, repo string) (ai.ProviderConfig, error) {
 	roots, err := paths.Resolve()
 	if err != nil {
-		return ai.ProviderConfig{}, fmt.Errorf("acd rewrite-commits: resolve config paths: %w", err)
+		return ai.ProviderConfig{}, fmt.Errorf("acd history rewrite: resolve config paths: %w", err)
 	}
 	service, err := settings.NewValidationService(ctx, settings.Options{
 		Roots:    roots,
 		RepoPath: repo,
 	})
 	if err != nil {
-		return ai.ProviderConfig{}, fmt.Errorf("acd rewrite-commits: resolve settings: %w", err)
+		return ai.ProviderConfig{}, fmt.Errorf("acd history rewrite: resolve settings: %w", err)
 	}
 	cfg, err := service.AuthoringProviderConfig()
 	if err != nil {
-		return ai.ProviderConfig{}, fmt.Errorf("acd rewrite-commits: resolve settings: %w", err)
+		return ai.ProviderConfig{}, fmt.Errorf("acd history rewrite: resolve settings: %w", err)
 	}
 	return cfg, nil
 }
@@ -344,9 +328,9 @@ func rewritePlanRefArg(ref string) string {
 func printRewritePlanNextSteps(out io.Writer, planRef string) {
 	arg := rewritePlanRefArg(planRef)
 	fmt.Fprintln(out, "Next:")
-	fmt.Fprintf(out, "  acd rewrite-commits --show-plan %s\n", arg)
-	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --dry-run\n", arg)
-	fmt.Fprintf(out, "  acd rewrite-commits --apply-plan %s --yes\n", arg)
+	fmt.Fprintf(out, "  acd history rewrite --show-plan %s\n", arg)
+	fmt.Fprintf(out, "  acd history rewrite --apply-plan %s --dry-run\n", arg)
+	fmt.Fprintf(out, "  acd history rewrite --apply-plan %s --yes\n", arg)
 }
 
 func printRewriteSelectionSummary(out io.Writer, report rewriteSelectionReport) {
@@ -371,7 +355,7 @@ func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, o
 	}
 	plan, err := readRewritePlanRef(ctx, repo, opts.editPlan)
 	if err != nil {
-		return fmt.Errorf("acd rewrite-commits: read edit plan: %w", err)
+		return fmt.Errorf("acd history rewrite: read edit plan: %w", err)
 	}
 	commits, changed, err := editRewritePlanWithEditor(plan, opts.editFormat)
 	if err != nil {
@@ -438,7 +422,7 @@ func isRewritePlanFileRef(ref string) bool {
 
 func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, opts rewriteCommitsOptions) error {
 	if !opts.yes && !opts.dryRun {
-		return errors.New("acd rewrite-commits: --apply-plan requires --yes or --dry-run")
+		return errors.New("acd history rewrite: --apply-plan requires --yes or --dry-run")
 	}
 	progress, err := newRewriteProgressSink(opts.progress, opts.quiet, opts.progressTo)
 	if err != nil {
@@ -450,7 +434,7 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	}
 	plan, err := readRewritePlanRef(ctx, repo, opts.applyPlan)
 	if err != nil {
-		return fmt.Errorf("acd rewrite-commits: read apply plan: %w", err)
+		return fmt.Errorf("acd history rewrite: read apply plan: %w", err)
 	}
 	if err := validateRewritePlanReadyForApply(plan); err != nil {
 		return err
@@ -461,21 +445,21 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	}
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
-		return fmt.Errorf("acd rewrite-commits: open state db: %w", err)
+		return fmt.Errorf("acd history rewrite: open state db: %w", err)
 	}
 	defer db.Close()
 	if daemonState, _, err := state.LoadDaemonState(ctx, db); err != nil {
-		return fmt.Errorf("acd rewrite-commits: inspect daemon state: %w", err)
+		return fmt.Errorf("acd history rewrite: inspect daemon state: %w", err)
 	} else if daemonState.Mode != "" && daemonState.Mode != "stopped" {
-		return fmt.Errorf("acd rewrite-commits: daemon must be stopped before applying rewrite plan (current mode: %s)", daemonState.Mode)
+		return fmt.Errorf("acd history rewrite: ACD must be off before applying this plan (current state: %s); run `acd off`, then try again", daemonState.Mode)
 	}
 	if !opts.dryRun {
 		pending, err := state.CountAllPendingCaptureEvents(ctx, db)
 		if err != nil {
-			return fmt.Errorf("acd rewrite-commits: inspect pending capture queue: %w", err)
+			return fmt.Errorf("acd history rewrite: inspect pending capture queue: %w", err)
 		}
 		if pending.Count > 0 {
-			return fmt.Errorf("acd rewrite-commits: refusing to rewrite while capture queue has pending event(s); flush or clear the ACD queue first (pending: %d, oldest seq: %d)", pending.Count, pending.OldestSeq)
+			return fmt.Errorf("acd history rewrite: %d protected change(s) are still waiting to be published; run `acd commit-all`, then try again", pending.Count)
 		}
 	}
 
@@ -508,21 +492,25 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		return err
 	}
 
-	fmt.Fprintf(out, "rewrite-commits saved plan apply: %s\n", opts.applyPlan)
-	fmt.Fprintln(out, "Saved plan apply loaded without AI provider check; no second AI call was made.")
+	fmt.Fprintf(out, "History rewrite plan: %s\n", opts.applyPlan)
+	fmt.Fprintln(out, "The saved messages were reused. No new AI request was made.")
 	if opts.dryRun {
-		fmt.Fprintf(out, "Dry run: plan can apply to %s at %s; no commits were rewritten.\n", plan.BranchRef, shortenSHA(plan.ExpectedHead))
+		fmt.Fprintf(out, "Changed: no\n")
+		fmt.Fprintf(out, "Status: This plan can be applied to %s at %s.\n", plan.BranchRef, shortenSHA(plan.ExpectedHead))
+		fmt.Fprintf(out, "Next: Review the plan, then apply it with `acd history rewrite --apply-plan %s --yes`.\n", opts.applyPlan)
 		return nil
 	}
-	fmt.Fprintf(out, "Applied rewrite plan to %s: %s -> %s (%d commit(s) recreated).\n", plan.BranchRef, shortenSHA(res.OldHead), shortenSHA(res.NewHead), res.RecreatedCount)
-	fmt.Fprintf(out, "Backup branch: %s\n", res.BackupBranchRef)
+	fmt.Fprintln(out, "History rewrite complete.")
+	fmt.Fprintf(out, "Commits updated: %d\n", res.RecreatedCount)
+	fmt.Fprintf(out, "Branch: %s (%s to %s)\n", plan.BranchRef, shortenSHA(res.OldHead), shortenSHA(res.NewHead))
+	fmt.Fprintf(out, "Recovery backup: %s\n", res.BackupBranchRef)
 	if res.InternalBackupRef != "" {
-		fmt.Fprintf(out, "Internal backup ref: %s\n", res.InternalBackupRef)
+		fmt.Fprintf(out, "Additional backup: %s\n", res.InternalBackupRef)
 	}
-	fmt.Fprintf(out, "Recovery: git reset --hard %s\n", res.BackupBranchRef)
+	fmt.Fprintf(out, "Undo command: git reset --hard %s\n", res.BackupBranchRef)
 	reconcile, err := state.ReconcileRewriteCommitOIDs(ctx, db, res.CommitMap)
 	if err != nil {
-		return fmt.Errorf("acd rewrite-commits: reconcile state OIDs after successful git rewrite: %w", err)
+		return fmt.Errorf("acd history rewrite: reconcile state OIDs after successful git rewrite: %w", err)
 	}
 	reconciledRows := reconcile.CaptureEvents + reconcile.DecisionRecords + reconcile.PublishTargetCommitOID + reconcile.PublishSourceHead
 	if err := progress.Emit(rewriteProgressEvent{Phase: "apply_reconcile", Message: "reconciled state OIDs", Current: int(reconciledRows)}); err != nil {
@@ -530,10 +518,11 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	}
 	if plan.ID != "" {
 		if err := markRewritePlanStatusIfPresent(ctx, db, plan.ID, state.RewritePlanApplyApplied); err != nil {
-			return fmt.Errorf("acd rewrite-commits: mark plan applied: %w", err)
+			return fmt.Errorf("acd history rewrite: mark plan applied: %w", err)
 		}
 	}
-	fmt.Fprintf(out, "State OID reconciliation: capture_events=%d decision_records=%d publish_state_target=%d publish_state_source=%d\n", reconcile.CaptureEvents, reconcile.DecisionRecords, reconcile.PublishTargetCommitOID, reconcile.PublishSourceHead)
+	fmt.Fprintln(out, "Status: Git history and ACD's records now agree.")
+	fmt.Fprintln(out, "Next: No action is needed. Keep the recovery backup until you have checked the rewritten history.")
 	return nil
 }
 
@@ -548,7 +537,7 @@ func showSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag, ref stri
 	}
 	plan, err := readRewritePlanRef(ctx, repo, ref)
 	if err != nil {
-		return fmt.Errorf("acd rewrite-commits: read show plan: %w", err)
+		return fmt.Errorf("acd history rewrite: read show plan: %w", err)
 	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
@@ -576,12 +565,12 @@ func showSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag, ref stri
 func validateRewritePlanReadyForApply(plan state.RewritePlan) error {
 	if plan.ValidationStatus != state.RewritePlanValidationValid {
 		if plan.ValidationStatus == state.RewritePlanValidationInvalid && plan.ValidationError.Valid && strings.TrimSpace(plan.ValidationError.String) != "" {
-			return fmt.Errorf("acd rewrite-commits: cannot apply rewrite plan with validation status %q: %s", plan.ValidationStatus, plan.ValidationError.String)
+			return fmt.Errorf("acd history rewrite: cannot apply rewrite plan with validation status %q: %s", plan.ValidationStatus, plan.ValidationError.String)
 		}
 		if strings.TrimSpace(plan.ValidationStatus) == "" {
-			return errors.New("acd rewrite-commits: cannot apply rewrite plan without validation status \"valid\"")
+			return errors.New("acd history rewrite: cannot apply rewrite plan without validation status \"valid\"")
 		}
-		return fmt.Errorf("acd rewrite-commits: cannot apply rewrite plan with validation status %q; expected %q", plan.ValidationStatus, state.RewritePlanValidationValid)
+		return fmt.Errorf("acd history rewrite: cannot apply rewrite plan with validation status %q; expected %q", plan.ValidationStatus, state.RewritePlanValidationValid)
 	}
 	return nil
 }
@@ -635,7 +624,7 @@ func readRewritePlanFile(path string) (state.RewritePlan, error) {
 func writeRewritePlanFile(path string, plan state.RewritePlan) error {
 	f, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("acd rewrite-commits: create plan file: %w", err)
+		return fmt.Errorf("acd history rewrite: create plan file: %w", err)
 	}
 	defer f.Close()
 	enc := json.NewEncoder(f)
@@ -650,13 +639,13 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 	}
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: open state db: %w", err)
+		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: open state db: %w", err)
 	}
 	defer db.Close()
 
 	proposer, ok := provider.(ai.CommitRewriteProposer)
 	if !ok {
-		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: provider %s cannot generate rewrite proposals", ai.PrimaryProviderName(provider))
+		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: provider %s cannot generate rewrite proposals", ai.PrimaryProviderName(provider))
 	}
 	plan := state.RewritePlan{
 		BranchRef:        selection.BranchRef,
@@ -723,7 +712,7 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 	}
 	id, err := state.SaveRewritePlan(ctx, db, plan)
 	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("acd rewrite-commits: save rewrite plan: %w", err)
+		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: save rewrite plan: %w", err)
 	}
 	plan.ID = id
 	if err := progress.Emit(rewriteProgressEvent{Phase: "save", Message: "saved plan", PlanID: plan.ID}); err != nil {
@@ -735,7 +724,7 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 func rewriteStateDBPath(ctx context.Context, repo string) (string, error) {
 	gitDir, err := git.AbsoluteGitDir(ctx, repo)
 	if err != nil {
-		return "", fmt.Errorf("acd rewrite-commits: resolve git dir: %w", err)
+		return "", fmt.Errorf("acd history rewrite: resolve git dir: %w", err)
 	}
 	return state.DBPathFromGitDir(gitDir), nil
 }
@@ -813,7 +802,7 @@ func decisionContextFromRecord(d state.DecisionRecord) ai.RewriteDecisionContext
 func gitOutputString(ctx context.Context, repo string, args ...string) (string, error) {
 	out, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultReadTimeout}, args...)
 	if err != nil {
-		return "", fmt.Errorf("acd rewrite-commits: git %s: %w", strings.Join(args, " "), err)
+		return "", fmt.Errorf("acd history rewrite: git %s: %w", strings.Join(args, " "), err)
 	}
 	return string(out), nil
 }
@@ -869,22 +858,22 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 		opts.progress = string(rewriteProgressModeAuto)
 	}
 	if opts.editFormat != rewriteEditFormatText && opts.editFormat != rewriteEditFormatJSON {
-		return fmt.Errorf("acd rewrite-commits: --format must be text or json")
+		return fmt.Errorf("acd history rewrite: --format must be text or json")
 	}
 	if !validRewriteProgressMode(opts.progress) {
-		return fmt.Errorf("acd rewrite-commits: --progress must be auto, plain, json, or off")
+		return fmt.Errorf("acd history rewrite: --progress must be auto, plain, json, or off")
 	}
 	if opts.review && opts.noReview {
-		return errors.New("acd rewrite-commits: choose only one of --review or --no-review")
+		return errors.New("acd history rewrite: choose only one of --review or --no-review")
 	}
 	if opts.planOnly && opts.applyPlan != "" {
-		return errors.New("acd rewrite-commits: choose only one of --plan-only or --apply/--apply-plan")
+		return errors.New("acd history rewrite: choose only one of --plan-only or --apply/--apply-plan")
 	}
 	if opts.editPlan != "" && (opts.review || opts.noReview) {
-		return errors.New("acd rewrite-commits: --edit cannot be combined with --review or --no-review")
+		return errors.New("acd history rewrite: --edit cannot be combined with --review or --no-review")
 	}
 	if opts.fromNR < 0 {
-		return errors.New("acd rewrite-commits: --from-nr must be positive")
+		return errors.New("acd history rewrite: --from-nr must be positive")
 	}
 	newSelectorCount := 0
 	if opts.fromSHA != "" {
@@ -913,20 +902,20 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 		compatSelectorCount++
 	}
 	if opts.selection.Last < 0 {
-		return errors.New("acd rewrite-commits: --last must be positive")
+		return errors.New("acd history rewrite: --last must be positive")
 	}
 	if newSelectorCount > 0 && compatSelectorCount > 0 {
-		return errors.New("acd rewrite-commits: use one selector family; prefer --from-sha, --from-nr, --range-nr, or --range-sha instead of mixing compatibility flags")
+		return errors.New("acd history rewrite: use one selector family; prefer --from-sha, --from-nr, --range-nr, or --range-sha instead of mixing compatibility flags")
 	}
 	if newSelectorCount > 1 {
-		return errors.New("acd rewrite-commits: choose only one of --from-sha, --from-nr, --range-nr, or --range-sha")
+		return errors.New("acd history rewrite: choose only one of --from-sha, --from-nr, --range-nr, or --range-sha")
 	}
 	if newSelectorCount > 0 && (opts.base != "" || opts.head != "") {
-		return errors.New("acd rewrite-commits: use either --from-sha/--from-nr/--range-nr/--range-sha or --base/--head, not both")
+		return errors.New("acd history rewrite: use either --from-sha/--from-nr/--range-nr/--range-sha or --base/--head, not both")
 	}
 	if opts.rangeSHA != "" {
 		if strings.ContainsAny(opts.rangeSHA, " \t\n\r") || !strings.Contains(opts.rangeSHA, "..") {
-			return errors.New("acd rewrite-commits: --range-sha must be a simple git range like base..head")
+			return errors.New("acd history rewrite: --range-sha must be a simple git range like base..head")
 		}
 		opts.selection.GitRange = opts.rangeSHA
 	}
@@ -954,19 +943,19 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 		modes++
 	}
 	if modes == 0 {
-		return errors.New("acd rewrite-commits: choose --from-sha, --from-nr, --range-nr, --range-sha, --last, --from, --range, --git-range, --base/--head, --show-plan, --edit, --apply, or --apply-plan")
+		return errors.New("acd history rewrite: choose --from-sha, --from-nr, --range-nr, --range-sha, --last, --from, --range, --git-range, --base/--head, --show-plan, --edit, --apply, or --apply-plan")
 	}
 	if modes > 1 {
-		return errors.New("acd rewrite-commits: choose only one mode: generate, --show-plan, --edit, or --apply/--apply-plan")
+		return errors.New("acd history rewrite: choose only one mode: generate, --show-plan, --edit, or --apply/--apply-plan")
 	}
 	if opts.selection.Range != "" && strings.Contains(opts.selection.Range, "..") {
-		return errors.New("acd rewrite-commits: --range-nr/--range uses 1-based positions like 2-5; use --range-sha or --git-range for git revsets")
+		return errors.New("acd history rewrite: --range-nr/--range uses 1-based positions like 2-5; use --range-sha or --git-range for git revsets")
 	}
 	if (opts.selection.Range != "" || opts.selection.GitRange != "") && (opts.base != "" || opts.head != "") {
-		return errors.New("acd rewrite-commits: use either --range-nr/--range-sha/--git-range or --base/--head, not both")
+		return errors.New("acd history rewrite: use either --range-nr/--range-sha/--git-range or --base/--head, not both")
 	}
 	if opts.head != "" && opts.base == "" {
-		return errors.New("acd rewrite-commits: --head requires --base")
+		return errors.New("acd history rewrite: --head requires --base")
 	}
 	if opts.base != "" {
 		head := opts.head

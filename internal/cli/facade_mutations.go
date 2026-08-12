@@ -29,15 +29,23 @@ func newRestoreCmd() *cobra.Command {
 	var yes bool
 	cmd := &cobra.Command{
 		Use:   "restore ID",
-		Short: "Preview or restore a checkpoint into the working tree",
-		Args:  cobra.ExactArgs(1),
+		Short: "Preview or bring back a protected checkpoint",
+		Long: `Preview the files that a checkpoint would restore into the working
+tree. Add --yes to apply the exact preview after ACD checks it again.
+
+Restore does not move Git HEAD or change the staging area. ACD creates an undo
+checkpoint before it applies the restore.`,
+		Example: `  acd history
+  acd restore cp-1234
+  acd restore cp-1234 --yes`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			return runRestore(cmd.Context(), cmd.OutOrStdout(), repo, args[0], yes, jsonOut)
 		},
 	}
-	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the exact preview after revalidation")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the displayed preview after checking it again")
 	return cmd
 }
 
@@ -93,9 +101,9 @@ func runRestore(ctx context.Context, out io.Writer, repo, id string, apply, json
 		return renderAnyProductEnvelope(out, productEnvelope{OK: true, State: productStateWaiting,
 			Changed: true, Actions: []productAction{{Kind: "restore", Status: "completed", Target: plan.CheckpointID}}, Data: result}, true)
 	}
-	fmt.Fprintf(out, "Restored checkpoint %s into the working tree.\n", result.RestoredCheckpoint)
-	fmt.Fprintf(out, "Undo with: acd restore %s\n", result.UndoCheckpoint)
-	fmt.Fprintln(out, "Git HEAD and the index were not changed.")
+	fmt.Fprintf(out, "Restored checkpoint: %s\n", result.RestoredCheckpoint)
+	fmt.Fprintln(out, "Status: Files were restored into the working tree. Git HEAD and staged changes were not changed.")
+	fmt.Fprintf(out, "Next: To undo this restore, run `acd restore %s`.\n", result.UndoCheckpoint)
 	return nil
 }
 
@@ -134,16 +142,18 @@ func renderRestorePlan(out io.Writer, plan restorepkg.Plan, jsonOut bool) error 
 		return renderAnyProductEnvelope(out, productEnvelope{OK: true, State: stateName,
 			Actions: []productAction{}, NextAction: next, Data: plan}, true)
 	}
-	fmt.Fprintf(out, "Restore preview for %s\n", plan.CheckpointID)
+	fmt.Fprintf(out, "Restore preview: %s\n", plan.CheckpointID)
 	fmt.Fprintf(out, "Create: %d  Modify: %d  Delete: %d  Mode: %d  Symlink: %d\n",
 		plan.Counts.Created, plan.Counts.Modified, plan.Counts.Deleted,
 		plan.Counts.ModeChanged, plan.Counts.Symlinks)
 	fmt.Fprintf(out, "Untracked overwrites: %d  Staged overlaps: %d\n",
 		plan.Counts.UntrackedOverwrite, plan.Counts.StagedOverlap)
 	if plan.Refusal != "" {
-		fmt.Fprintf(out, "Cannot apply: %s\n", plan.Refusal)
+		fmt.Fprintf(out, "Status: Cannot restore safely. %s\n", plan.Refusal)
+		fmt.Fprintln(out, "Next: Resolve the reported conflict, then preview the restore again.")
 	} else {
-		fmt.Fprintf(out, "Apply: acd restore %s --yes\n", plan.CheckpointID)
+		fmt.Fprintln(out, "Changed: no")
+		fmt.Fprintf(out, "Next: Run `acd restore %s --yes` to apply this preview.\n", plan.CheckpointID)
 	}
 	return nil
 }
@@ -152,15 +162,23 @@ func newProductRepairCmd() *cobra.Command {
 	var yes bool
 	cmd := &cobra.Command{
 		Use:   "repair",
-		Short: "Complete a safely provable interrupted operation",
-		Args:  cobra.NoArgs,
+		Short: "Finish an interrupted ACD operation when it is safe",
+		Long: `Check for an interrupted setup or restore operation and show whether
+ACD can finish it safely.
+
+The default is a read-only preview. Add --yes only after reviewing the plan.
+ACD refuses the repair when it cannot prove the expected state.`,
+		Example: `  acd support repair
+  acd support repair --yes
+  acd support repair --json`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			return runProductRepair(cmd.Context(), cmd.OutOrStdout(), repo, yes, jsonOut)
 		},
 	}
-	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the exact repair preview after revalidation")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the displayed repair after checking it again")
 	return cmd
 }
 
@@ -335,8 +353,17 @@ func newUninstallCmd() *cobra.Command {
 	var expectedPlan string
 	cmd := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Remove ACD while preserving protected repository data",
-		Args:  cobra.NoArgs,
+		Short: "Remove ACD and keep protected data by default",
+		Long: `Show an uninstall plan, stop ACD services, and remove the managed
+installation only after confirmation.
+
+Repository checkpoints and databases are kept by default. Start with
+--dry-run. Permanently deleting protected data requires both --purge-data and
+--confirm-purge-data.`,
+		Example: `  acd uninstall --dry-run
+  acd uninstall --yes
+  acd uninstall --dry-run --purge-data`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			if dryRun && yes {
@@ -360,13 +387,17 @@ func newUninstallCmd() *cobra.Command {
 				if jsonOut {
 					return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateOff, Actions: []productAction{}, Data: plan}, true)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "Uninstall plan %s\n", plan.Digest)
+				fmt.Fprintf(cmd.OutOrStdout(), "Uninstall plan: %s\n", plan.Digest)
 				for index, action := range plan.Actions {
-					fmt.Fprintf(cmd.OutOrStdout(), "%d. %s: %s (%s)\n", index+1, action.Kind, action.Target, action.Detail)
+					fmt.Fprintf(cmd.OutOrStdout(), "%d. %s\n", index+1, action.Detail)
+					if action.Target != "" {
+						fmt.Fprintf(cmd.OutOrStdout(), "   Target: %s\n", action.Target)
+					}
 				}
 				if purgeData && !confirmPurge {
 					fmt.Fprintln(cmd.OutOrStdout(), "Protected data purge requires --confirm-purge-data when applying.")
 				}
+				fmt.Fprintln(cmd.OutOrStdout(), "Changed: no. Review this plan before applying it.")
 				return nil
 			}
 			if nonInteractive && expectedPlan == "" {
@@ -399,18 +430,19 @@ func newUninstallCmd() *cobra.Command {
 				return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateOff, Changed: true, Actions: []productAction{{Kind: "uninstall", Status: "completed"}}, Data: result}, true)
 			}
 			if purgeData {
-				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled. All verified ACD data and private refs were permanently removed.")
+				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled. All verified checkpoints and ACD data were permanently removed.")
 			} else {
 				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled. Repository checkpoints and databases were preserved.")
 			}
+			fmt.Fprintln(cmd.OutOrStdout(), "Next: No action needed.")
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the exact uninstall plan without writes or service actions")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the uninstall plan without changing anything")
 	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the reviewed uninstall plan")
 	cmd.Flags().BoolVar(&purgeData, "purge-data", false, "Also plan removal of checkpoint data after a second confirmation")
 	cmd.Flags().BoolVar(&confirmPurge, "confirm-purge-data", false, "Second explicit confirmation for permanent protected-data deletion")
 	cmd.Flags().BoolVar(&nonInteractive, "non-interactive", false, "Disable prompts; requires --yes and --expect-plan")
-	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Require this exact sha256 plan digest")
+	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Apply only this exact plan ID")
 	return cmd
 }

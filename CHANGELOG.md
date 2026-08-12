@@ -2,89 +2,74 @@
 
 ## Unreleased
 
-### Changed
-
-- Added durable self-healing publication drains. Invalid Intent graphs are
-  normalized after candidate-ID stabilization, get one deterministic semantic
-  rebuild, and then use local atomic dependency groups without changing the
-  configured strategy or weakening Git safety checks.
-- `acd commit-all --yes` now verifies a full checkpoint before consuming staged
-  index state, keeps the worktree unchanged, and stays attached to a frozen
-  target until completion or a genuine safety block. Disconnects and daemon
-  restarts no longer cancel publication, and background ACD still never
-  consumes staging.
-- Status, diagnose, and doctor now report durable drain phase, remaining work,
-  semantic attempts, local fallback, last progress, staged consent, and the
-  latest sanitized error. Active self-healing states do not report
-  `needs_attention` unless publication reaches a true safety block.
-- Setup migration now reuses existing immutable checkpoint ownership when a
-  retained recovery snapshot contains an event protected by an earlier setup
-  attempt. Re-running setup no longer fails on duplicate event membership.
-- `acd on` now performs a checkpoint-first managed runtime handoff for forward
-  schema and integration upgrades. A strictly older unadvertised runtime must
-  first pass the checkpoint-barrier probe, so replacement remains automatic
-  without weakening the pre-upgrade protection fence. It always replaces the
-  managed repository worker and verifies the new worker before succeeding.
-- `acd off` now waits for the managed worker to stop. Doctor includes the
-  supervisor's exact worker error and a matching repair command instead of
-  sending users through a repeated `acd on` loop.
-
-- Rebuilt ACD around durable private-ref checkpoints that complete before any
-  grouping, provider, verification, or Git publication work.
-- Replaced the public lifecycle model with ten root commands, including the
-  protection dashboard and worker-driven `commit-all`, five product states,
-  one stable JSON envelope, and hidden two-release compatibility aliases.
-- Added one user-level supervisor with one isolated worker per Git common
-  directory; filesystem polling remains the universal protection path and
-  integrations provide optional hints only.
-- On macOS, share one owner-only supervisor across same-user terminals and
-  agent applications, with peer UID validation and no Full Disk Access;
-  Linux retains systemd.
-- Added journaled compatible runtime replacement and a bounded setup mode that
-  avoid repeating all-repository migration scans and self-tests after ordinary
-  source rebuilds.
-- Made integration session-start and active wake failures fail closed while
-  idle, stop, and close hints preserve the real exit code, log it, and return
-  success.
-- Changed fresh defaults to deterministic Intent/Fast with structural
-  verification and no credential or diff egress requirement. The one-shot
-  v19 to v20 cutover preserves existing effective publication settings.
-- Intent planning now repairs only mechanically proven missing dependency
-  declarations, permits at most one effective remote correction, and uses
-  validated deterministic fallback for invalid output without a retry loop.
-- A full Intent planning window now waits for the repository settle window.
-  Durable boundaries, logical flushes, dependency-safe forced aging, and the
-  maximum pending age still release work.
-- Status now distinguishes retrying replay, durable publication blocks, busy
-  workers with fresh heartbeats, clean Git state, checkpoint protection, and
-  checkpoints published by ACD.
-- Linked worktrees now keep planner reject logs in their exact Git directories.
-  Shared daemon logs include worktree and Git-directory identity on each
-  worktree record, while rejected raw responses remain redacted by default.
-- Exact-chain recovery now checkpoints enabled linked worktrees, temporarily
-  stops their shared repository worker, and restores protection automatically.
-  Repeated capture transitions that already reached their recorded result are
-  accepted without weakening mismatch checks.
-- Status now treats a fresh worker that is actively completing a protection
-  checkpoint as a normal wait instead of asking the user to intervene.
-- `acd on` now applies safe exact-chain recovery after its initial checkpoint.
-  Archive-only recovery still requires explicit consent.
-
 ### Added
 
-- Added rootless Git checkpoint commits, GC-safe private refs, observation and
-  coverage epochs, checkpoint publication links, retention, and crash recovery.
-- Added full-checkpoint restore with mandatory preview, pre-restore and result
-  checkpoints, exact filesystem preimages, unchanged `HEAD` and index, undo,
-  rollback, and forward repair.
-- Added transactional setup, all-repository migration, structured integration
-  ownership, platform lifecycle handling, isolated self-test, rollback, and
-  safe default uninstall with separately confirmed data purge.
-- Added registry v2 common-directory/worktree identities and the v20 operation,
-  checkpoint, publication, and restore records.
-- Added forward repair for migrated Intent memberships and interrupted setup
-  operations, bounded worker publication drains, and worktree-specific hint
-  wakes so protected state remains stable under concurrent integrations.
+- ACD now creates rootless checkpoint commits and GC-safe private refs before
+  work that can change repository or service state. It records checkpoint
+  coverage, publication links, retention, and data needed for crash recovery.
+- `acd restore` now starts with a mandatory preview. It records the filesystem
+  exactly before and after the restore, leaves `HEAD` and the index alone, and
+  supports undo, rollback, and forward repair.
+- Setup, migration, and uninstall now run as transactions with rollback and an
+  isolated self-test. Registry v2 identifies Git common directories and linked
+  worktrees, while state schemas v20 through v22 store operations, checkpoints,
+  publication drains, and adaptive Intent planning runs. Uninstall keeps
+  repository data unless the user separately confirms a purge.
+- A single user-level supervisor now owns one worker per Git common directory.
+  macOS terminals and agent applications share it through peer UID checks, with
+  no Full Disk Access requirement. Linux continues to use systemd.
+- Intent publication drains now survive disconnects and daemon restarts. They
+  freeze the approved target, retain checkpoint membership, and stop only when
+  publication finishes or reaches a proven safety block.
+- Adaptive Intent planning now records attempts and outcomes across restarts.
+  It keeps valid groups while unresolved captures are replanned and records a
+  completed outcome even when provider cooldown prevents a remote call.
+
+### Changed
+
+- The public CLI now has ten root commands, five product states, one JSON result
+  envelope, and hidden compatibility aliases. Help, configuration, status, and
+  rewrite output now use direct wording and give the next safe action.
+- `acd on` now checkpoints the repository, replaces the managed worker, waits
+  for readiness, and runs safe exact-chain recovery. Forward schema upgrades
+  must pass the checkpoint barrier first. `acd off` waits for the worker to
+  stop, and doctor reports the worker error with the matching repair command.
+- `acd commit-all --yes` now checkpoints staged state before using it, keeps the
+  worktree unchanged, and follows one frozen target until it completes or hits
+  a safety block. Background publication still never consumes staged changes.
+- New repositories use deterministic Intent/Fast with structural verification.
+  This default needs no provider credential or diff egress. The v19 to v20
+  cutover preserves the effective publication settings of existing repos.
+- Intent planning waits for the repository settle window, then allows one
+  effective remote correction. It repairs only proven missing dependencies and
+  falls back to validated local groups when the response remains invalid.
+  Logical flushes, durable boundaries, forced aging, and maximum age can still
+  release a window.
+- Status, diagnose, and doctor now separate active recovery from a real safety
+  block. They report checkpoint progress, publication drains, planner attempts,
+  local fallback, staged consent, worker health, and sanitized errors. A fresh
+  worker completing its checkpoint is shown as normal progress.
+- Session-start and active integration hints now fail closed. Idle, stop, and
+  close hints log the real failure but return success. Filesystem polling
+  remains the protection path when a hint is missing.
+- Linked worktrees now keep planner rejects in their own Git directories, and
+  shared logs identify both the worktree and Git directory. Exact-chain repair
+  checkpoints each enabled worktree, stops the shared worker for the repair,
+  and restores protection afterward.
+
+### Fixed
+
+- Setup can reuse checkpoint ownership from an earlier attempt when the same
+  event appears in a retained recovery snapshot. Re-running setup no longer
+  fails because that event already belongs to a checkpoint.
+- Compatible runtime replacement is journaled and bounded, so ordinary source
+  rebuilds do not repeat every repository migration scan and self-test.
+- Invalid Intent graphs are normalized after candidate IDs stabilize. ACD gets
+  one semantic rebuild, then uses local atomic dependency groups without
+  changing the selected strategy or relaxing Git safety checks.
+- Recovery now resumes blocked publication drains and follows recaptured events
+  across rewritten bases. Repeated transitions that already reached their
+  recorded result are accepted only after the existing proof checks pass.
 
 ## v2026-08-07
 

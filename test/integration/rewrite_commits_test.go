@@ -73,18 +73,18 @@ func TestRewriteCommitsApplyPlanCLI(t *testing.T) {
 		},
 	})
 
-	res := runAcd(t, context.Background(), envWith(withIsolatedHome(t), "ACD_AI_PROVIDER=openai-compat"), "--repo", repo, "rewrite-commits", "--apply-plan", planPath, "--yes")
+	res := runAcd(t, context.Background(), envWith(withIsolatedHome(t), "ACD_AI_PROVIDER=openai-compat"), "--repo", repo, "history", "rewrite", "--apply", planPath, "--yes")
 	if res.ExitCode != 0 {
 		t.Fatalf("acd apply failed exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
 	}
-	if !strings.Contains(res.Stdout, "no second AI call") || !strings.Contains(res.Stdout, "Backup branch:") || !strings.Contains(res.Stdout, "Recovery: git reset --hard") {
+	if !strings.Contains(res.Stdout, "No new AI request was made") || !strings.Contains(res.Stdout, "Recovery backup:") || !strings.Contains(res.Stdout, "Undo command: git reset --hard") {
 		t.Fatalf("apply output missing safety/recovery details:\n%s", res.Stdout)
 	}
 	if got := strings.TrimSpace(runGitOK(t, repo, "log", "--format=%s", "-n", "3")); got != "three\ntwo rewritten\none rewritten" {
 		t.Fatalf("rewritten log subjects:\n%s", got)
 	}
-	backupRef := firstOutputLineWithPrefix(res.Stdout, "Backup branch: ")
-	backupOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", strings.TrimPrefix(backupRef, "Backup branch: ")))
+	backupRef := firstOutputLineWithPrefix(res.Stdout, "Recovery backup: ")
+	backupOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", strings.TrimPrefix(backupRef, "Recovery backup: ")))
 	if backupOID != three {
 		t.Fatalf("backup oid=%s want original head %s", backupOID, three)
 	}

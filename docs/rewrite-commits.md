@@ -1,10 +1,18 @@
 # Rewrite commit messages
 
-Use the explicit advanced command to improve messages on a provable
-ACD-authored suffix:
+Use the explicit history command to improve messages on a safe linear range:
 
 ~~~bash
 acd history rewrite
+~~~
+
+Start with a saved plan:
+
+~~~bash
+acd history rewrite --last 5 --plan-only
+acd history rewrite --show-plan <plan-id-or-file>
+acd history rewrite --apply <plan-id-or-file> --dry-run
+acd history rewrite --apply <plan-id-or-file> --yes
 ~~~
 
 The command is never automatic and is isolated from normal checkpoint
@@ -23,14 +31,14 @@ Imperative subjects are at most 50 characters with no period, followed by a
 blank line and `- ` context bullets wrapped at 72. Conventional mode accepts
 scope-less supported types and the same body contract.
 
-Progress defaults to `--progress auto`, which writes human-readable progress
-when stderr is a terminal and stays silent otherwise. Use `--progress plain`,
-`--progress json`, or `--progress off` to override it. Human-readable proposal
-and recreation events include the current and total commit counts:
+Progress defaults to `--progress auto`, which writes readable progress when
+stderr is a terminal and stays silent otherwise. Use `--progress plain`,
+`--progress json`, or `--progress off` to override it. Progress includes the
+current and total commit counts:
 
 ~~~text
-rewrite-commits: proposal [42/169]: proposal accepted
-rewrite-commits: apply_recreate_selected [42/169]: recreated selected commit
+History rewrite: Commit messages [42/169]: message ready
+History rewrite: Applying messages [42/169]: applied the new message
 ~~~
 
 JSONL progress is written to stderr so stdout remains the single command

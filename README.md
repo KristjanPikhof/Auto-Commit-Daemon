@@ -66,12 +66,13 @@ and repair settings during the one-shot v19 to v20 cutover.
 Bare `acd` and `acd status` are equivalent and read-only:
 
 ~~~text
-Enabled: yes
-Protected: yes
+State: waiting
+ACD protection: on
+Current changes protected: yes
 Published to Git: no
-Action required: no
-Next: No action needed.
+Action needed: no
 Status: Current changes are checkpointed; publication is waiting for a safe boundary.
+Next: No action needed.
 ~~~
 
 The five product states are:
@@ -84,13 +85,13 @@ The five product states are:
 | `publishing` | A selected checkpoint group is being published as a local Git commit. |
 | `needs_action` | Protection is incomplete or a safely recoverable condition needs user action. |
 
-`protected` is also reported as an independent boolean. It may remain `true`
-while publication is `waiting`, `publishing`, or blocked by an unrelated
-repair.
+`Current changes protected` is reported separately from the overall state. It
+may remain `yes` while publication is `waiting`, `publishing`, or blocked by an
+unrelated repair.
 
 ## Commands
 
-Root help exposes exactly ten commands:
+Root help lists ten everyday commands:
 
 | Command | Purpose |
 |---|---|
@@ -104,6 +105,16 @@ Root help exposes exactly ten commands:
 | `acd restore ID` | Preview a full-checkpoint restore; add `--yes` to apply it. |
 | `acd doctor` | Explain installation or protection problems and the exact next command. |
 | `acd uninstall` | Remove managed components while preserving protected data by default. |
+
+It also links directly to common tasks:
+
+~~~text
+acd commit-all --dry-run
+acd history rewrite --help
+acd config edit
+acd repo --help
+acd support --help
+~~~
 
 Advanced commands are callable under hidden namespaces:
 

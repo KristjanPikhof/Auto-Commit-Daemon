@@ -172,7 +172,7 @@ func newRootCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:           "acd",
-		Short:         "Durable checkpoints first, clean Git commits second",
+		Short:         "Protect your work and publish clear local Git commits",
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -202,10 +202,10 @@ func newRootCmd() *cobra.Command {
 	cmd.SetVersionTemplate("acd version {{.Version}}\n")
 
 	pf := cmd.PersistentFlags()
-	pf.StringVar(&repoPath, "repo", "", "Repo root (default: cwd)")
-	pf.BoolVar(&jsonOut, "json", false, "Emit JSON output")
-	pf.BoolVar(&quiet, "quiet", false, "Suppress non-essential output")
-	pf.StringVar(&logLevel, "log-level", "info", "debug|info|warn|error")
+	pf.StringVar(&repoPath, "repo", "", "Repository to use (default: current directory)")
+	pf.BoolVar(&jsonOut, "json", false, "Print machine-readable JSON")
+	pf.BoolVar(&quiet, "quiet", false, "Hide progress and other optional output")
+	pf.StringVar(&logLevel, "log-level", "info", "Log detail: debug, info, warn, or error")
 
 	repo := newProductRepoNamespaceCmd()
 	repo.Hidden = true
@@ -255,10 +255,31 @@ func newRootCmd() *cobra.Command {
 		hideCompatibility(newHookCursorExtractCmd(), "acd internal integration cursor-extract", true),
 		hideCompatibility(withInvocationCapabilities(newGCCmd(), commandCapabilities{JSON: true, Quiet: true, Interactive: true}), "acd repo gc", false),
 		hideCompatibility(withInvocationCapabilities(newRewriteCommitsCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}), "acd history rewrite", false),
+		newRewriteAllHintCmd(),
 		hideCompatibility(withInvocationCapabilities(newCompatDaemonCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd internal worker run", true),
 	)
 
 	return cmd
+}
+
+func newRewriteAllHintCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "rewrite-all",
+		Hidden: true,
+		Short:  "Use acd history rewrite to improve commit messages",
+		Long: `ACD does not rewrite all branch history automatically because that can
+change commits you do not own or intend to edit.
+
+Use acd history rewrite with an explicit selection. Start with --plan-only,
+review the plan, preview the apply with --dry-run, and finish with --yes.`,
+		Example: `  acd history rewrite --last 5 --plan-only
+  acd history rewrite --apply <plan-id-or-file> --dry-run
+  acd history rewrite --apply <plan-id-or-file> --yes`,
+		Args: cobra.NoArgs,
+		RunE: func(*cobra.Command, []string) error {
+			return invalidCommandError("acd rewrite-all does not rewrite history automatically; run `acd history rewrite --help`")
+		},
+	}
 }
 
 func parseLogLevel(value string) (slog.Level, error) {

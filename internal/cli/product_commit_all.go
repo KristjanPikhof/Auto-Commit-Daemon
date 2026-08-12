@@ -54,14 +54,17 @@ func newProductCommitAllCmd() *cobra.Command {
 	var yes, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "commit-all",
-		Short: "Checkpoint and publish all current changes",
-		Long: `Checkpoint all current eligible changes durably, then ask the managed
-worker to publish the protected target as normal local Git commits.
+		Short: "Protect and publish all current changes",
+		Long: `Protect all current eligible changes in a durable checkpoint, then
+publish that fixed set as normal local Git commits.
 
-The target is frozen at the checkpoint barrier, so later edits do not keep the
-command running forever. Event mode preserves one capture per commit; Intent
-mode may publish several atomic commits. This command never creates one giant
-commit merely because it is named commit-all.`,
+The command does not squash everything into one commit. ACD keeps separate
+changes separate when needed and may create several commits. Changes made after
+the checkpoint are not added to the current run.
+
+Start with --dry-run. Apply with --yes. If the terminal closes, ACD keeps the
+checkpoint and continues safely; running the command again reconnects to the
+same work.`,
 		Example: `  acd commit-all --dry-run
   acd commit-all --yes
   acd commit-all --repo /path/to/repo --yes --json`,
@@ -74,8 +77,8 @@ commit merely because it is named commit-all.`,
 				cmd.InOrStdin(), repo, yes, dryRun, jsonOut, quiet)
 		},
 	}
-	cmd.Flags().BoolVar(&yes, "yes", false, "Apply without an interactive confirmation")
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview without checkpointing or publishing")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Protect and publish without asking for confirmation")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be included without changing anything")
 	return cmd
 }
 
@@ -115,7 +118,7 @@ func runProductCommitAll(
 		return renderProductCommitAll(out, preview, productStateWaiting, jsonOut)
 	}
 	if !yes {
-		fmt.Fprintf(out, "Checkpoint and publish %d changed path(s) with %d pending event(s)? [y/N] ",
+		fmt.Fprintf(out, "Protect and publish %d changed path(s), plus %d already queued change(s)? [y/N] ",
 			changes, status.PendingEvents)
 		answer, readErr := bufio.NewReader(in).ReadString('\n')
 		if readErr != nil && strings.TrimSpace(answer) == "" {
@@ -143,7 +146,7 @@ func runProductCommitAll(
 	}()
 
 	if !quiet && !jsonOut {
-		fmt.Fprintln(progressOut, "Commit all: checkpointing current changes")
+		fmt.Fprintln(progressOut, "Commit all: saving a checkpoint for current changes")
 	}
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -172,18 +175,14 @@ func runProductCommitAll(
 				if decodeErr == nil && projection.Latest != nil {
 					drain := projection.Latest
 					remaining := drain.TargetEventCount - drain.PublishedEventCount
-					fmt.Fprintf(progressOut,
-						"Commit all: phase=%s remaining=%d commits=%d fallback=%s error=%s\n",
-						drain.Phase, remaining, drain.CommitCount,
-						commitAllValueOr(drain.FallbackMode, "none"),
-						commitAllValueOr(drain.LastError, "none"))
+					writeProductCommitAllProgress(progressOut, *drain, remaining)
 					continue
 				}
 			}
 			current, inspectErr := inspectControl(ctx, lookup.Worktree.Root)
 			if inspectErr == nil {
 				fmt.Fprintf(progressOut,
-					"Commit all: protected=%s pending=%d; starting durable drain\n",
+					"Commit all: still saving current changes; protected=%s, queued=%d\n",
 					yesNo(current.Protected), current.PendingEvents)
 			}
 		}
@@ -211,7 +210,7 @@ completed:
 		if current.PendingEvents > 0 || changes > 0 {
 			if !quiet && !jsonOut {
 				fmt.Fprintf(progressOut,
-					"Commit all: recovery recaptured %d current event(s); draining them now\n",
+					"Commit all: recovery found %d current change(s); protecting and publishing them now\n",
 					current.PendingEvents)
 			}
 			prior := result
@@ -383,7 +382,6 @@ func waitForProductPublicationDrain(
 	report := time.NewTicker(5 * time.Second)
 	defer report.Stop()
 	var latest *state.PublicationDrain
-	var lastStatusErr error
 	for {
 		select {
 		case <-ctx.Done():
@@ -393,36 +391,27 @@ func waitForProductPublicationDrain(
 				continue
 			}
 			if latest == nil {
-				fmt.Fprintf(progressOut,
-					"Commit all: reconnecting to durable drain %s: %v\n",
-					result.DrainID, lastStatusErr)
+				fmt.Fprintln(progressOut,
+					"Commit all: reconnecting to the existing publication run")
 				continue
 			}
 			remaining := latest.TargetEventCount - latest.PublishedEventCount
-			fmt.Fprintf(progressOut,
-				"Commit all: phase=%s remaining=%d commits=%d fallback=%s error=%s\n",
-				latest.Phase, remaining, latest.CommitCount,
-				commitAllValueOr(latest.FallbackMode, "none"),
-				commitAllValueOr(latest.LastError, "none"))
+			writeProductCommitAllProgress(progressOut, *latest, remaining)
 		case <-poll.C:
 			response, err := callSupervisor(
 				ctx, lookup, "publication_drain_status", nil, 2*time.Second)
 			if err != nil {
-				lastStatusErr = err
 				continue
 			}
 			projection, err := decodeProductData[state.PublicationDrainReadOnlyProjection](
 				response.Data)
 			if err != nil {
-				lastStatusErr = err
 				continue
 			}
 			latest = productPublicationDrainByID(projection, result.DrainID)
 			if latest == nil {
-				lastStatusErr = errors.New("durable publication drain is not visible yet")
 				continue
 			}
-			lastStatusErr = nil
 			result.Phase = latest.Phase
 			result.TargetEvents = latest.TargetEventCount
 			result.PublishedEvents = latest.PublishedEventCount
@@ -462,11 +451,13 @@ func productPublicationDrainByID(
 	return nil
 }
 
-func commitAllValueOr(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
+func writeProductCommitAllProgress(out io.Writer, drain state.PublicationDrain, remaining int64) {
+	fmt.Fprintf(out, "Commit all: %d of %d protected change(s) left; %d commit(s) created; %s\n",
+		remaining, drain.TargetEventCount, drain.CommitCount,
+		publicationPhaseLabel(drain.Phase))
+	if drain.LastError != "" {
+		fmt.Fprintf(out, "Commit all: last issue: %s\n", drain.LastError)
 	}
-	return value
 }
 
 func finishProductCommitAll(out io.Writer, result productCommitAllResult, jsonOut bool) error {
@@ -520,28 +511,26 @@ func renderProductCommitAll(out io.Writer, result productCommitAllResult, stateN
 		}, true)
 	}
 	if result.DryRun {
-		fmt.Fprintf(out, "Commit-all preview: %d changed path(s), %d pending event(s).\n",
-			result.WorktreeChanges, result.PendingEvents)
-		fmt.Fprintln(out, "No checkpoint or Git commit was created.")
+		fmt.Fprintln(out, "Commit-all preview")
+		fmt.Fprintf(out, "Changes found: %d path(s)\n", result.WorktreeChanges)
+		fmt.Fprintf(out, "Already protected and waiting: %d change(s)\n", result.PendingEvents)
+		fmt.Fprintln(out, "Changed: no")
+		fmt.Fprintln(out, "Next: Run `acd commit-all --yes` to protect and publish this work.")
 		return nil
 	}
-	fmt.Fprintf(out, "Protected checkpoint: %s\n", result.CheckpointID)
-	fmt.Fprintf(out, "Resolved target events: %d/%d in %d Git commit(s).\n",
+	fmt.Fprintf(out, "Checkpoint: %s\n", result.CheckpointID)
+	fmt.Fprintf(out, "Published to Git: %d of %d protected change(s) in %d commit(s)\n",
 		result.PublishedEvents, result.TargetEvents, result.CommitsCreated)
-	if result.ResolutionMode != "" {
-		fmt.Fprintf(out, "Intent grouping: %d group(s), plan attempt %d/%d, resolution=%s, singletons=%d.\n",
-			result.SemanticGroupCount, result.PlanAttempt, result.PlanAttemptLimit,
-			result.ResolutionMode, result.SingletonCount)
-	}
 	if result.RecoveredEvents > 0 {
-		fmt.Fprintf(out, "Recovered safely and recaptured: %d event(s).\n",
+		fmt.Fprintf(out, "Recovered and protected again: %d change(s)\n",
 			result.RecoveredEvents)
 	}
 	if result.PublicationDrained {
-		fmt.Fprintln(out, "Commit all complete.")
+		fmt.Fprintln(out, "Status: Complete. All selected changes are protected and published.")
+		fmt.Fprintln(out, "Next: No action needed.")
 	} else {
-		fmt.Fprintf(out, "Publication is waiting: %s\n", result.WaitingReason)
-		fmt.Fprintln(out, "Your changes are protected; ACD will keep retrying.")
+		fmt.Fprintf(out, "Status: Waiting. %s\n", result.WaitingReason)
+		fmt.Fprintln(out, "Next: No action needed now. Your work is protected and ACD will keep trying.")
 	}
 	return nil
 }

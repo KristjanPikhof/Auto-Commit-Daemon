@@ -72,7 +72,11 @@ func newAuthStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: "Show the active credential source without its value",
-		Args:  cobra.NoArgs,
+		Long: `Show whether ACD is using the protected credential file, an
+environment variable, or no API key. The secret value is never printed.`,
+		Example: `  acd config credentials status
+  acd config credentials status --json`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			roots, err := paths.Resolve()
 			if err != nil {
@@ -112,8 +116,11 @@ func newAuthRemoveCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "remove",
 		Short: "Remove the protected provider credential",
-		Long:  "Remove only the protected credential file. ACD_AI_API_KEY is unchanged.",
-		Args:  cobra.NoArgs,
+		Long: `Remove only the API key stored in ACD's protected credential file.
+An ACD_AI_API_KEY environment variable is not changed.`,
+		Example: `  acd config credentials remove
+  acd config credentials remove --yes`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if !yes {
 				return errors.New("acd auth remove: refusing to remove the protected credential without --yes")
