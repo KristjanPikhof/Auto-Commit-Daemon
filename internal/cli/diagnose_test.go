@@ -731,8 +731,8 @@ func TestDiagnose_IntentPlannerHealthIsReadOnly(t *testing.T) {
 	}
 	var sawCircuitHint bool
 	for _, item := range rep.Remediation {
-		if strings.Contains(item, "intent planner circuit is open") &&
-			strings.Contains(item, "deterministic fallback remains active") &&
+		if strings.Contains(item, "intent planner connection is unavailable") &&
+			strings.Contains(item, "Safe batches use evidence-based grouping") &&
 			strings.Contains(item, "2026-07-13T04:30:00Z") {
 			sawCircuitHint = true
 			break
