@@ -41,6 +41,42 @@ func TestGC_DropsMissingRepoDir(t *testing.T) {
 	}
 }
 
+func TestGCKeepsMissingRepoWithUnresolvedState(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "base", Operation: "create", Path: "protected.txt",
+		Fidelity: "exact",
+	}, []state.CaptureOp{{
+		Op: "create", Path: "protected.txt", Fidelity: "exact",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "deleted-repo")
+	registerRepo(t, roots, missing, dbPath, "codex")
+
+	var out bytes.Buffer
+	if err := runGC(ctx, &out, true); err != nil {
+		t.Fatal(err)
+	}
+	var report gcReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Dropped) != 0 || report.Kept != 1 {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
 func TestGC_DropsMissingStateDB(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

@@ -440,6 +440,31 @@ func (s *Server) reconcile(ctx context.Context) error {
 		return fmt.Errorf("supervisor: registry v%d requires `acd setup` before v%d workers can start",
 			registry.Version, central.RegistryVersion)
 	}
+	cleanupNeeded := false
+	for _, record := range registry.Repos {
+		if record.LifecycleDisabled() ||
+			(record.FirstRegisteredTS <= 0 && record.LastSeenTS <= 0) {
+			continue
+		}
+		assessment, _ := central.AssessMissingRepo(ctx, record)
+		if assessment.Missing {
+			cleanupNeeded = true
+			break
+		}
+	}
+	if cleanupNeeded {
+		if err := central.WithLock(s.Roots, func(locked *central.Registry) error {
+			_, _, reconcileErr := locked.ReconcileMissingRepos(
+				ctx, time.Now().UTC())
+			return reconcileErr
+		}); err != nil {
+			return fmt.Errorf("supervisor: reconcile missing worktrees: %w", err)
+		}
+		registry, err = central.Load(s.Roots)
+		if err != nil {
+			return fmt.Errorf("supervisor: reload reconciled registry: %w", err)
+		}
+	}
 	desiredRecords := make(map[string][]central.RepoRecord)
 	for _, record := range registry.Repos {
 		if record.LifecycleDisabled() || record.RepositoryID == "" {
@@ -472,6 +497,7 @@ func (s *Server) reconcile(ctx context.Context) error {
 			if worker.launchd || worker.cmd != nil {
 				continue
 			}
+			_ = RemoveWorkerRuntimeStatus(s.Roots, id)
 			delete(s.workers, id)
 		}
 	}
