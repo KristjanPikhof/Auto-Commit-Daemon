@@ -2551,6 +2551,18 @@ func Run(ctx context.Context, opts Options) error {
 			// without waiting for the idle ceiling.
 			activeDrain, drainErr := ActivePublicationDrainForPair(
 				passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
+			if drainErr == nil && activeDrain == nil {
+				recoveredDrain, recoverErr := RecoverSupersededCandidatePublicationDrain(
+					passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
+					time.Now().UTC())
+				if recoverErr != nil {
+					drainErr = recoverErr
+				} else if recoveredDrain != nil {
+					activeDrain = recoveredDrain
+					logPublicationDrainTransition(
+						logger, state.PublicationDrainNeedsAction, *recoveredDrain)
+				}
+			}
 			setupValidation, validationPending, validationErr :=
 				state.DesiredConfigValidation(ctx, opts.DB)
 			if drainErr != nil {
@@ -2610,12 +2622,15 @@ func Run(ctx context.Context, opts Options) error {
 				}
 				if repErr == nil && activeDrain != nil &&
 					activeDrain.Phase == state.PublicationDrainNormalizing {
+					previousPhase := activeDrain.Phase
 					resumedDrain, resumeErr := ResumePublicationDrainNormalization(
 						passCtx, opts.DB, *activeDrain, time.Now().UTC())
 					if resumeErr != nil {
 						repErr = resumeErr
 					} else {
 						activeDrain = &resumedDrain
+						logPublicationDrainTransition(
+							logger, previousPhase, resumedDrain)
 					}
 				}
 				if repErr == nil && (activeDrain == nil ||
@@ -2661,10 +2676,14 @@ func Run(ctx context.Context, opts Options) error {
 							passCtx, opts.DB, *activeDrain, repSum, repErr, time.Now().UTC())
 						if updateErr != nil {
 							repErr = errors.Join(repErr, updateErr)
-						} else if updatedDrain.Phase != state.PublicationDrainCompleted &&
-							updatedDrain.Phase != state.PublicationDrainNeedsAction {
-							repErr = nil
-							repSum.HasMore = true
+						} else {
+							logPublicationDrainTransition(
+								logger, activeDrain.Phase, updatedDrain)
+							if updatedDrain.Phase != state.PublicationDrainCompleted &&
+								updatedDrain.Phase != state.PublicationDrainNeedsAction {
+								repErr = nil
+								repSum.HasMore = true
+							}
 						}
 					}
 				}
@@ -2924,6 +2943,23 @@ func newDaemonLogger(logger *slog.Logger, opts Options) (*slog.Logger, *daemonLo
 		).Handler(),
 		context: logContext,
 	}), logContext
+}
+
+func logPublicationDrainTransition(
+	logger *slog.Logger,
+	fromPhase string,
+	drain state.PublicationDrain,
+) {
+	if logger == nil || drain.Phase == fromPhase {
+		return
+	}
+	logger.Info("publication drain recovery transition",
+		"drain_id", drain.ID,
+		"from_phase", fromPhase,
+		"to_phase", drain.Phase,
+		"resolved_events", drain.PublishedEventCount,
+		"target_events", drain.TargetEventCount,
+		"reason", drain.LastError)
 }
 
 func (c *daemonLogContext) SetBranch(branchRef string, generation int64) {

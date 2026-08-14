@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -229,9 +230,9 @@ func replayIntentCandidateBatch(
 		}
 		if hasPublished {
 			if !opts.IntentRepairEnabled {
-				sum.Skipped = true
-				sum.SkippedReason = "intent_v2_repair_required"
-				return sum, nil
+				return recoverIntentCandidateForward(
+					ctx, repoRoot, db, activeCtx, opts, decision.Candidate.ID,
+					"repair_disabled", currentParent, sum)
 			}
 			repaired, publishedCount, repairErr := repairIntentCandidateDecision(
 				ctx, repoRoot, opts.GitDir, db, activeCtx, opts, decision,
@@ -240,11 +241,18 @@ func replayIntentCandidateBatch(
 				return sum, repairErr
 			}
 			if repaired.Status != state.IntentRepairCompleted {
+				if intentRepairSupportsForwardRecovery(repaired.Reason) {
+					return recoverIntentCandidateForward(
+						ctx, repoRoot, db, activeCtx, opts,
+						decision.Candidate.ID, repaired.Reason, currentParent, sum)
+				}
 				sum.Skipped = true
 				sum.SkippedReason = "intent_v2_repair_" + repaired.Status
 				if repaired.Reason != "" {
 					sum.SkippedReason += "_" + repaired.Reason
 				}
+				sum.Disposition, sum.DispositionReason =
+					intentRepairSkipDisposition(repaired.Reason)
 				return sum, nil
 			}
 			sum.Published += publishedCount
@@ -280,11 +288,98 @@ func replayIntentCandidateBatch(
 		sum.Skipped = true
 		if evaluation.NeedsAttention {
 			sum.SkippedReason = "intent_v2_needs_attention"
+			sum.Disposition = ReplayDispositionNeedsAttention
+			sum.DispositionReason = evaluation.PlannerFailure
 		} else {
 			sum.SkippedReason = "intent_v2_candidate_wait"
 		}
 	}
 	return sum, nil
+}
+
+func recoverIntentCandidateForward(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	activeCtx CaptureContext,
+	opts ReplayOpts,
+	candidateID string,
+	reason string,
+	currentParent string,
+	sum ReplaySummary,
+) (ReplaySummary, error) {
+	pending, changed, err := state.ForwardRecoverIntentCandidate(
+		ctx, db, state.IntentForwardRecovery{
+			BranchRef:        activeCtx.BranchRef,
+			BranchGeneration: activeCtx.BranchGeneration,
+			CandidateID:      candidateID,
+			Reason:           reason,
+		})
+	if err != nil {
+		return sum, err
+	}
+	if changed {
+		slog.Default().Info("intent candidate entered forward recovery",
+			"candidate_id", candidateID,
+			"reason", reason,
+			"pending_events", pending,
+			"branch_generation", activeCtx.BranchGeneration)
+	}
+	sum.Skipped = true
+	sum.SkippedReason = "intent_v2_forward_recovery_" + reason
+	sum.Disposition = ReplayDispositionRecoverableStall
+	sum.DispositionReason = reason
+	sum.HasMore = true
+	if !changed || opts.PublicationDrain != nil ||
+		opts.forwardRecoveryAttempted || sum.Published > 0 {
+		return sum, nil
+	}
+	opts.forwardRecoveryAttempted = true
+	retryCtx := activeCtx
+	retryCtx.BaseHead = currentParent
+	return Replay(ctx, repoRoot, db, retryCtx, opts)
+}
+
+func intentRepairSupportsForwardRecovery(reason string) bool {
+	switch reason {
+	case "repair_horizon_expired",
+		"repair_commit_outside_suffix",
+		"repair_suffix_not_acd_owned",
+		"repair_repartition_not_proven",
+		"repair_repartition_dependency",
+		"repair_repartition_path_overlap",
+		git.IntentRepairReasonNonLinearChain,
+		git.IntentRepairReasonMergeCommit,
+		git.IntentRepairReasonAlternateRef,
+		git.IntentRepairReasonStagedOverlap,
+		git.IntentRepairReasonOwnershipMissing:
+		return true
+	default:
+		return false
+	}
+}
+
+func intentRepairSkipDisposition(
+	reason string,
+) (ReplayDisposition, string) {
+	switch reason {
+	case git.IntentRepairReasonDetached,
+		git.IntentRepairReasonBranchChanged,
+		git.IntentRepairReasonHeadChanged,
+		"manual or rewind pause is active":
+		return ReplayDispositionTransientWait, reason
+	case "repair_verification_unavailable",
+		"repair_verification_needs_attention":
+		return ReplayDispositionNeedsAttention, reason
+	default:
+		if strings.Contains(reason, "Git operation in progress") {
+			return ReplayDispositionTransientWait, reason
+		}
+		if reason == "" {
+			reason = "intent repair stopped without a safe forward recovery"
+		}
+		return ReplayDispositionNeedsAttention, reason
+	}
 }
 
 func intentCandidatePlannerWindowPlan(

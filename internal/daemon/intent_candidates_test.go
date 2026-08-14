@@ -2754,6 +2754,59 @@ func openIntentCandidateTestDB(t *testing.T) *state.DB {
 	return db
 }
 
+func TestAdvanceTerminalIntentCandidateIDsUsesStableSuccessor(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "service.go", "modify", "before", "after")
+	terminal := state.IntentCandidate{
+		ID: "reused-planner-id", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: state.IntentCandidateReady,
+		Readiness: state.IntentReadinessReady,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: capture.Event.Seq, EventRole: "change",
+		}},
+	}
+	if err := state.SaveIntentCandidate(ctx, db, terminal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE candidate_id=?`, terminal.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE intent_candidates SET status='superseded' WHERE id=?`,
+		terminal.ID); err != nil {
+		t.Fatal(err)
+	}
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: terminal.ID, SelectedSeqs: []int64{capture.Event.Seq},
+			DependsOnCandidates: []string{terminal.ID},
+		}},
+	}
+	first, _, err := advanceTerminalIntentCandidateIDs(
+		ctx, db, "refs/heads/main", 1, plan, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Candidates[0].CandidateID; got == terminal.ID || !strings.HasPrefix(got, "intent-successor-") {
+		t.Fatalf("successor candidate id=%q", got)
+	}
+	if got, want := first.Candidates[0].DependsOnCandidates[0],
+		first.Candidates[0].CandidateID; got != want {
+		t.Fatalf("remapped dependency=%q want=%q", got, want)
+	}
+	second, _, err := advanceTerminalIntentCandidateIDs(
+		ctx, db, "refs/heads/main", 1, plan, nil)
+	if err != nil || second.Candidates[0].CandidateID != first.Candidates[0].CandidateID {
+		t.Fatalf("stable successor=%q first=%q err=%v",
+			second.Candidates[0].CandidateID, first.Candidates[0].CandidateID, err)
+	}
+}
+
 func appendIntentCandidateCapture(
 	t *testing.T,
 	db *state.DB,

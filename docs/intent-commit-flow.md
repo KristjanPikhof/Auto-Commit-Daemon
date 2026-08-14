@@ -73,6 +73,28 @@ Each explicit publication drain has a bounded semantic path. Invalid planner
 output cannot start a hot retry loop. The drain survives terminal disconnects,
 worker replacement, and daemon restart, and resumes from its durable phase.
 
+If a semantic pass repeats the same recoverable state, ACD stops rebuilding
+that plan. This applies even when more events remain outside the current
+planning window. The worker first records a restart-safe normalization step,
+then publishes one local hard-dependency component per pass. These components
+come from pending events only, use deterministic commit messages, and pass the
+normal materialization, verification, publication journal, exact-ref CAS, and
+index reconciliation checks. No remote provider is called during this
+fallback.
+
+History repair remains a bounded optimization. If its time horizon has expired
+or the published suffix is no longer safe to rewrite, ACD retires the blocking
+candidate and moves forward from the current `HEAD`. Published commits remain
+unchanged. Only pending memberships return to local grouping, and the durable
+recovery decision lets a restarted worker continue without reconstructing the
+old candidate.
+
+Automatic recovery does not weaken publication safety. A branch or `HEAD`
+transition, detached `HEAD`, manual pause, or active Git operation waits for
+the repository to become stable. Failed required verification, ambiguous
+self-publication, missing objects, materialization conflicts, and dependency
+cycles that cannot be proved safe stop with `needs_attention`.
+
 ## Publication safety
 
 The publication path prepares exact source, target, tree, and membership before

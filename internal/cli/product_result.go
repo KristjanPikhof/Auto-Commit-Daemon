@@ -169,7 +169,7 @@ func publicationPhaseLabel(phase string) string {
 	case "normalizing":
 		return "preparing a safe publication plan"
 	case "semantic":
-		return "grouping and publishing commits"
+		return "planning commit groups"
 	case "event_fallback":
 		return "publishing safe commit groups"
 	case "needs_action":

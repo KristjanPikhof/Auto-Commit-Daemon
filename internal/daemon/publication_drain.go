@@ -18,6 +18,8 @@ import (
 
 const publicationDrainHeadChangedPrefix = "publication drain HEAD changed after checkpoint:"
 const publicationDrainRecoveredTargetError = "frozen publication target contains a terminal event"
+const supersededCandidateDrainErrorPrefix = "state: candidate "
+const supersededCandidateDrainErrorSuffix = " is terminal in status superseded"
 
 // ActivePublicationDrainForPair returns the one durable drain owned by the
 // active branch generation. Multiple active drains for one pair fail closed.
@@ -49,6 +51,91 @@ func ActivePublicationDrainForPair(
 		active = &loaded
 	}
 	return active, nil
+}
+
+// RecoverSupersededCandidatePublicationDrain reopens only the latest drain
+// stopped by the old stable-ID collision. SaveIntentCandidate fails before Git
+// materialization, and the exact superseded candidate plus a clean frozen
+// target proves that replay may safely choose its deterministic successor.
+func RecoverSupersededCandidatePublicationDrain(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	now time.Time,
+) (*state.PublicationDrain, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id,last_error FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+  AND last_error LIKE ?
+ORDER BY created_ts DESC,id DESC LIMIT 1`,
+		branchRef, generation,
+		supersededCandidateDrainErrorPrefix+"%"+supersededCandidateDrainErrorSuffix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	var id, recordedError string
+	if err := rows.Scan(&id, &recordedError); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	candidateID, ok := strings.CutPrefix(
+		recordedError, supersededCandidateDrainErrorPrefix)
+	if !ok {
+		return nil, nil
+	}
+	candidateID, ok = strings.CutSuffix(
+		candidateID, supersededCandidateDrainErrorSuffix)
+	if !ok || strings.TrimSpace(candidateID) != candidateID || candidateID == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(candidateID, "intent-successor-") {
+		return nil, nil
+	}
+	candidate, exists, err := state.IntentCandidateByID(ctx, db, candidateID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists || candidate.Status != state.IntentCandidateSuperseded ||
+		candidate.BranchRef != branchRef || candidate.BranchGeneration != generation {
+		return nil, nil
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, id)
+	if err != nil {
+		return nil, err
+	}
+	counts, err := publicationDrainCountsForTarget(ctx, db, drain.EventSeqs)
+	if err != nil {
+		return nil, err
+	}
+	if counts.terminal != 0 {
+		return nil, nil
+	}
+	var recoverablePublication int
+	if err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM self_publications
+    WHERE branch_ref=? AND branch_generation=?
+      AND phase IN ('prepared','git_applied')
+)`, branchRef, generation).Scan(&recoverablePublication); err != nil {
+		return nil, err
+	}
+	if recoverablePublication != 0 {
+		return nil, nil
+	}
+	nowTS := float64(now.UnixNano()) / 1e9
+	reopened, err := state.ReopenPublicationDrainCheckpointing(
+		ctx, db, drain.ID, recordedError, nowTS)
+	if err != nil {
+		return nil, err
+	}
+	return &reopened, nil
 }
 
 // RestartablePublicationDrainForPair returns the latest HEAD-change block
@@ -308,6 +395,23 @@ type publicationDrainAtomicFallbackPlanner struct {
 	commitFormat ai.CommitFormat
 }
 
+func configureAtomicIntentFallback(cfg *intentReplayConfig) {
+	if cfg == nil {
+		return
+	}
+	cfg.planner = publicationDrainAtomicFallbackPlanner{
+		commitFormat: cfg.commitFormat,
+	}
+	cfg.plannerProvider = cfg.planner.Name()
+	cfg.plannerModel = ""
+	cfg.health = nil
+	cfg.candidateMode = true
+	cfg.bypassBatchWait = true
+	cfg.pathQuiescence = 0
+	cfg.window = ai.IntentCandidateCaptureCap
+	cfg.atomicFallback = true
+}
+
 // publicationDrainAtomicFallbackWindow returns the complete hard-dependency
 // component containing the first pending event. A component that exceeds the
 // candidate protocol cap fails closed instead of being split across commits.
@@ -553,13 +657,17 @@ func UpdatePublicationDrainAfterReplay(
 		nowTS = drain.UpdatedTS
 	}
 	progressTS := drain.LastProgressTS
-	if resolved > drain.PublishedEventCount ||
-		counts.commits > drain.CommitCount {
+	progressed := resolved > drain.PublishedEventCount ||
+		counts.commits > drain.CommitCount
+	if progressed {
 		progressTS = nowTS
 	}
 	update := PublicationDrainUpdateFrom(drain, nowTS, progressTS)
 	update.PublishedEventCount = resolved
 	update.CommitCount = counts.commits
+	if progressed {
+		update.LastError = ""
+	}
 	if summary.PlannerFailure != "" {
 		update.LastError = summary.PlannerFailure
 	}
@@ -570,6 +678,7 @@ func UpdatePublicationDrainAfterReplay(
 	}
 	if resolved == drain.TargetEventCount {
 		update.Phase = state.PublicationDrainCompleted
+		update.LastError = ""
 		update.CompletedTS = sql.NullFloat64{Float64: nowTS, Valid: true}
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
@@ -590,7 +699,18 @@ func UpdatePublicationDrainAfterReplay(
 		update.Phase = state.PublicationDrainNeedsAction
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
-	if resolved == drain.PublishedEventCount && !summary.HasMore {
+	if !progressed && summary.Disposition == ReplayDispositionTransientWait {
+		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	}
+	if !progressed && summary.Disposition == ReplayDispositionNeedsAttention {
+		update.Phase = state.PublicationDrainNeedsAction
+		update.LastError = publicationDrainReplayReason(summary,
+			"publication fallback needs attention")
+		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	}
+	if !progressed {
+		update.LastError = publicationDrainReplayReason(summary,
+			"publication pass made no progress")
 		switch drain.Phase {
 		case state.PublicationDrainSemantic:
 			update.Phase = state.PublicationDrainNormalizing
@@ -600,9 +720,24 @@ func UpdatePublicationDrainAfterReplay(
 			update.Phase = state.PublicationDrainEventFallback
 			update.EventFallbackCount++
 			update.FallbackMode = "atomic_dependency_components"
+		case state.PublicationDrainEventFallback:
+			update.Phase = state.PublicationDrainNeedsAction
 		}
 	}
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+}
+
+func publicationDrainReplayReason(summary ReplaySummary, fallback string) string {
+	for _, reason := range []string{
+		summary.DispositionReason,
+		summary.SkippedReason,
+		summary.PlannerFailure,
+	} {
+		if clean := strings.TrimSpace(reason); clean != "" {
+			return clean
+		}
+	}
+	return fallback
 }
 
 func publicationDrainHasEarlierTerminal(

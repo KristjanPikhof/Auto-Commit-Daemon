@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -113,6 +115,160 @@ func TestPublicationDrainFinalFallbackRefusesOversizedHardComponent(t *testing.T
 	}
 }
 
+func TestPublicationDrainAutomaticallyRecoversSupersededCandidateIDCollision(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db, events, drain := openPublicationDrainTestState(t, 1, 1)
+	candidate := state.IntentCandidate{
+		ID: "terminal-collision", BranchRef: drain.BranchRef,
+		BranchGeneration: drain.BranchGeneration,
+		Status:           state.IntentCandidateReady, Readiness: state.IntentReadinessReady,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: events[0].Seq, EventRole: "change",
+		}},
+	}
+	if err := state.SaveIntentCandidate(ctx, db, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE candidate_id=?`, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE intent_candidates SET status='superseded' WHERE id=?`,
+		candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	semantic := PublicationDrainUpdateFrom(drain, 11, 10)
+	semantic.Phase = state.PublicationDrainSemantic
+	loaded, err := state.AdvancePublicationDrain(ctx, db, drain.ID, semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := PublicationDrainUpdateFrom(loaded, 12, 10)
+	blocked.Phase = state.PublicationDrainNeedsAction
+	blocked.LastError = supersededCandidateDrainErrorPrefix + candidate.ID +
+		supersededCandidateDrainErrorSuffix
+	if _, err := state.AdvancePublicationDrain(ctx, db, drain.ID, blocked); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := RecoverSupersededCandidatePublicationDrain(
+		ctx, db, drain.BranchRef, drain.BranchGeneration, time.Unix(13, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Phase != state.PublicationDrainCheckpointing ||
+		recovered.LastError != "" {
+		t.Fatalf("recovered drain=%+v", recovered)
+	}
+}
+
+func TestPublicationDrainFallbackRetiresCandidatesAndSkipsProvider(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"first.txt":  "first\n",
+		"second.txt": "second\n",
+	}
+	for path, contents := range want {
+		if err := os.WriteFile(filepath.Join(f.dir, path),
+			[]byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	candidate := state.IntentCandidate{
+		ID: "persisted-mixed-candidate", BranchRef: f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		Status:           state.IntentCandidateReady,
+		Readiness:        state.IntentReadinessReady,
+	}
+	for _, event := range pending {
+		candidate.Events = append(candidate.Events, state.IntentCandidateEvent{
+			EventSeq: event.Seq, EventRole: "change",
+		})
+	}
+	if err := state.SaveIntentCandidate(ctx, f.db, candidate); err != nil {
+		t.Fatal(err)
+	}
+	drain := state.PublicationDrain{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		Phase: state.PublicationDrainEventFallback, TargetEventCount: 2,
+	}
+	for _, event := range pending {
+		drain.EventSeqs = append(drain.EventSeqs, event.Seq)
+	}
+	planner := &forbiddenPublicationDrainPlanner{}
+	opts := ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetFast,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+		PublicationDrain: &drain,
+	}
+	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || first.Published != 1 || planner.calls != 0 {
+		t.Fatalf("first fallback=%+v provider_calls=%d err=%v",
+			first, planner.calls, err)
+	}
+	f.cctx.BaseHead = first.BaseHead
+	second, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || second.Published != 1 || planner.calls != 0 {
+		t.Fatalf("second fallback=%+v provider_calls=%d err=%v",
+			second, planner.calls, err)
+	}
+	gotCandidate, ok, err := state.IntentCandidateByID(ctx, f.db, candidate.ID)
+	if err != nil || !ok || gotCandidate.Status != state.IntentCandidateSuperseded {
+		t.Fatalf("retired candidate=(%+v ok=%t err=%v)", gotCandidate, ok, err)
+	}
+	for path, contents := range want {
+		got, err := os.ReadFile(filepath.Join(f.dir, path))
+		if err != nil || string(got) != contents {
+			t.Fatalf("worktree %s=%q err=%v want=%q", path, got, err, contents)
+		}
+	}
+	remaining, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("remaining=%+v err=%v", remaining, err)
+	}
+}
+
+type forbiddenPublicationDrainPlanner struct {
+	calls int
+}
+
+func (*forbiddenPublicationDrainPlanner) Name() string {
+	return "forbidden-publication-drain-provider"
+}
+
+func (p *forbiddenPublicationDrainPlanner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	p.calls++
+	return ai.IntentPlan{}, errors.New("provider must not run during fallback")
+}
+
+func (p *forbiddenPublicationDrainPlanner) PlanIntentV2(
+	context.Context,
+	ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	p.calls++
+	return ai.IntentPlanV2{}, errors.New("provider must not run during fallback")
+}
+
 func TestPublicationDrainRestartEscalatesOnceAndCompletesIdempotently(
 	t *testing.T,
 ) {
@@ -183,6 +339,96 @@ WHERE seq=?`, events[1].Seq); err != nil {
 	if active, err := ActivePublicationDrainForPair(
 		ctx, db, "refs/heads/main", 7); err != nil || active != nil {
 		t.Fatalf("active after completion=(%+v,%v)", active, err)
+	}
+}
+
+func TestPublicationDrainNoProgressEscalatesWithMorePending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 152, 152)
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainSemantic
+	if _, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, loaded, ReplaySummary{
+			HasMore:           true,
+			Skipped:           true,
+			SkippedReason:     "intent_v2_forward_recovery_repair_horizon_expired",
+			Disposition:       ReplayDispositionRecoverableStall,
+			DispositionReason: "repair_horizon_expired",
+		}, nil, time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Phase != state.PublicationDrainNormalizing ||
+		normalized.SemanticRebuildAttempts != 1 ||
+		normalized.FallbackMode != "deterministic_semantic" ||
+		normalized.LastError != "repair_horizon_expired" {
+		t.Fatalf("normalized=%+v", normalized)
+	}
+}
+
+func TestReplayDispositionSeparatesTransientWaitsFromStalls(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sum  ReplaySummary
+		want ReplayDisposition
+	}{
+		{name: "batch wait", sum: ReplaySummary{
+			Skipped: true, SkippedReason: "skipped_due_intent_batch_wait",
+		}, want: ReplayDispositionTransientWait},
+		{name: "settle window", sum: ReplaySummary{
+			Skipped: true, SkippedReason: "skipped_due_intent_settle_window",
+		}, want: ReplayDispositionTransientWait},
+		{name: "expired repair", sum: ReplaySummary{
+			Skipped:       true,
+			SkippedReason: "intent_v2_forward_recovery_repair_horizon_expired",
+		}, want: ReplayDispositionRecoverableStall},
+		{name: "published", sum: ReplaySummary{
+			Published: 1,
+		}, want: ReplayDispositionProgress},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			classifyReplayDisposition(&tc.sum, nil)
+			if tc.sum.Disposition != tc.want {
+				t.Fatalf("disposition=%s want=%s summary=%+v",
+					tc.sum.Disposition, tc.want, tc.sum)
+			}
+		})
+	}
+}
+
+func TestPublicationDrainFallbackNoProgressNeedsAttention(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 2, 2)
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainEventFallback
+	update.EventFallbackCount = 1
+	if _, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, loaded, ReplaySummary{
+			Disposition:       ReplayDispositionRecoverableStall,
+			DispositionReason: "atomic dependency component made no progress",
+		}, nil, time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Phase != state.PublicationDrainNeedsAction ||
+		blocked.LastError != "atomic dependency component made no progress" {
+		t.Fatalf("blocked=%+v", blocked)
 	}
 }
 

@@ -499,7 +499,7 @@ func statusOperationalState(report statusReport) string {
 		report.PublicationDrain.Phase == state.PublicationDrainCheckpointing:
 		return "self_healing"
 	case report.PublicationDrain.Phase == state.PublicationDrainSemantic:
-		return "waiting_for_provider"
+		return "planning"
 	case report.IntentStrategy.PlannerHealth != nil &&
 		(report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
 			report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen) &&

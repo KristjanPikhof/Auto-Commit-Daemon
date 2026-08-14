@@ -57,6 +57,13 @@ protected changes remain and how many commits have been created. Closing the
 terminal only detaches the display. The background worker keeps publishing,
 and the next `acd commit-all --yes` reconnects to the same run.
 
+If semantic planning cannot make progress, the worker recovers on its own. It
+records a restart-safe transition, retires only the stalled candidate, and
+publishes pending changes in deterministic dependency-safe groups. Existing
+commits are not rewritten. This recovery also runs during normal background
+publication, so it does not require another `commit-all`, a database purge, or
+a manual Git commit.
+
 This command is also the normal way to let ACD include staged changes. ACD
 verifies the full private checkpoint before clearing the staging area back to
 `HEAD`. Working files do not change. The checkpoint still contains staged,
@@ -64,9 +71,12 @@ unstaged, and untracked content. Ordinary background publication never clears
 staged changes.
 
 Later edits are protected normally but do not expand or starve the frozen
-target. ACD asks for attention only when safety proof is impossible, such as a
-detached `HEAD`, unresolved conflict, active Git operation, external `HEAD`
-race, missing Git object, or terminal replay barrier.
+target. Status reports `planning`, `self_healing`, or `event_fallback` while no
+action is needed. ACD asks for attention only when safety proof is impossible,
+such as failed required verification, ambiguous self-publication, an
+unresolved conflict, a missing Git object, or an unsafe dependency cycle.
+Detached `HEAD`, a manual pause, and an active Git operation wait without
+discarding protected work.
 
 ## Restore a checkpoint
 

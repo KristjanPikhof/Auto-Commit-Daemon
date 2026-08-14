@@ -327,6 +327,11 @@ func EvaluateIntentCandidates(
 		}
 		result.Fallback = "deterministic_semantic_rebuild"
 	}
+	plan, continuations, err = advanceTerminalIntentCandidateIDs(
+		ctx, db, input.BranchRef, input.BranchGeneration, plan, continuations)
+	if err != nil {
+		return result, err
+	}
 
 	existingByID := make(map[string]state.IntentCandidate, len(existing))
 	for _, candidate := range existing {
@@ -408,6 +413,88 @@ func EvaluateIntentCandidates(
 		}
 	}
 	return result, nil
+}
+
+// advanceTerminalIntentCandidateIDs keeps planner-stable IDs restart-safe
+// without allowing a historical terminal candidate to block new work. The
+// first available successor is deterministic, so a crash after saving it will
+// reuse that nonterminal candidate on the next pass.
+func advanceTerminalIntentCandidateIDs(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	plan ai.IntentPlanV2,
+	continuations []intentCandidateContinuation,
+) (ai.IntentPlanV2, []intentCandidateContinuation, error) {
+	replacements := make(map[string]string)
+	for index := range plan.Candidates {
+		assignment := &plan.Candidates[index]
+		baseID := assignment.CandidateID
+		if replacement, ok := replacements[baseID]; ok {
+			assignment.CandidateID = replacement
+			continue
+		}
+		candidate, exists, err := state.IntentCandidateByID(ctx, db, baseID)
+		if err != nil {
+			return plan, continuations, err
+		}
+		if !exists || (candidate.BranchRef == branchRef &&
+			candidate.BranchGeneration == generation &&
+			!terminalIntentCandidateStatus(candidate.Status)) {
+			continue
+		}
+		for attempt := 1; attempt <= state.IntentCandidateMaxOpenPerPair; attempt++ {
+			sum := sha256.Sum256([]byte(fmt.Sprintf(
+				"%s\x00%s\x00%d\x00%v\x00%d",
+				baseID, branchRef, generation, assignment.SelectedSeqs, attempt)))
+			successorID := fmt.Sprintf("intent-successor-%x", sum[:12])
+			successor, found, loadErr := state.IntentCandidateByID(
+				ctx, db, successorID)
+			if loadErr != nil {
+				return plan, continuations, loadErr
+			}
+			if found && (successor.BranchRef != branchRef ||
+				successor.BranchGeneration != generation ||
+				terminalIntentCandidateStatus(successor.Status)) {
+				continue
+			}
+			replacements[baseID] = successorID
+			assignment.CandidateID = successorID
+			break
+		}
+		if assignment.CandidateID == baseID {
+			return plan, continuations, fmt.Errorf(
+				"daemon: intent candidates: exhausted successor IDs for %q", baseID)
+		}
+	}
+	if len(replacements) == 0 {
+		return plan, continuations, nil
+	}
+	for index := range plan.Candidates {
+		for dependencyIndex, dependencyID := range plan.Candidates[index].DependsOnCandidates {
+			if replacement := replacements[dependencyID]; replacement != "" {
+				plan.Candidates[index].DependsOnCandidates[dependencyIndex] = replacement
+			}
+		}
+	}
+	for index := range continuations {
+		if replacement := replacements[continuations[index].TargetID]; replacement != "" {
+			continuations[index].TargetID = replacement
+		}
+		for sourceIndex, sourceID := range continuations[index].SourceIDs {
+			if replacement := replacements[sourceID]; replacement != "" {
+				continuations[index].SourceIDs[sourceIndex] = replacement
+			}
+		}
+	}
+	return plan, continuations, nil
+}
+
+func terminalIntentCandidateStatus(status string) bool {
+	return status == state.IntentCandidatePublished ||
+		status == state.IntentCandidateSuperseded ||
+		status == state.IntentCandidateFailed
 }
 
 // BuildIntentCandidateDependencies creates a bounded graph from immutable

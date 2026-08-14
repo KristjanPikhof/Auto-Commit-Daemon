@@ -134,7 +134,7 @@ func TestOperationalStatePublicationDrainSelfHealMatrix(t *testing.T) {
 		want  string
 	}{
 		{state.PublicationDrainCheckpointing, "self_healing"},
-		{state.PublicationDrainSemantic, "waiting_for_provider"},
+		{state.PublicationDrainSemantic, "planning"},
 		{state.PublicationDrainNormalizing, "self_healing"},
 		{state.PublicationDrainEventFallback, "event_fallback"},
 		{state.PublicationDrainNeedsAction, "needs_attention"},

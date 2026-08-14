@@ -600,8 +600,8 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.NextAction = "No action needed. Recovery continues automatically."
 	case status.PublicationDrain.Phase == state.PublicationDrainSemantic:
 		res.Health = controlHealthPublishing
-		res.Summary = "ACD is grouping and publishing the changes selected by commit-all."
-		res.NextAction = "No action needed. A provider delay will not cancel this work."
+		res.Summary = "ACD is planning commits for the protected checkpoint."
+		res.NextAction = "No action needed. If planning stalls, ACD switches to safe local groups automatically."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.RecoveryRequired = true
