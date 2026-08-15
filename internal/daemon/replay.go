@@ -273,6 +273,10 @@ type ReplayOpts struct {
 	// SelfPublicationCheckpoint is a deterministic fault/recovery test seam.
 	// Production callers leave it nil.
 	SelfPublicationCheckpoint func(SelfPublicationCheckpointEvent) error
+
+	// forwardRecoveryAttempted bounds the internal forward-recovery retry to
+	// one local fallback attempt per Replay invocation.
+	forwardRecoveryAttempted bool
 }
 
 // DefaultReplayLimit caps a single replay pass at 64 events. Beyond this
@@ -309,6 +313,62 @@ type ReplaySummary struct {
 	// PlannerFailure carries the sanitized provider or validation failure that
 	// led to a safe local plan. Durable drains retain it when they escalate.
 	PlannerFailure string
+	// Disposition classifies the completed pass independently from HasMore.
+	// HasMore is only a scheduler hint; it must never suppress durable
+	// recovery when the visible head of the queue made no progress.
+	Disposition       ReplayDisposition
+	DispositionReason string
+	// RecoveryMode records which salvage subphase actually ran. The durable
+	// drain may have selected semantic replanning before an open provider
+	// circuit redirected the pass to a local unlock.
+	RecoveryMode       string
+	PlannerCircuitOpen bool
+}
+
+// ReplayDisposition describes the outcome of one completed replay pass.
+// Callers use it to distinguish a safe wait from a recoverable stall without
+// inferring liveness from queue depth.
+type ReplayDisposition string
+
+const (
+	ReplayDispositionIdle             ReplayDisposition = "idle"
+	ReplayDispositionProgress         ReplayDisposition = "progress"
+	ReplayDispositionTransientWait    ReplayDisposition = "transient_wait"
+	ReplayDispositionRecoverableStall ReplayDisposition = "recoverable_stall"
+	ReplayDispositionNeedsAttention   ReplayDisposition = "needs_attention"
+)
+
+func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
+	if sum == nil || sum.Disposition != "" {
+		return
+	}
+	switch {
+	case sum.Published > 0 || sum.RecaptureRequired || sum.SelfPublicationTargetOID != "":
+		sum.Disposition = ReplayDispositionProgress
+	case sum.Conflicts > 0 || sum.Failed > 0:
+		sum.Disposition = ReplayDispositionNeedsAttention
+	case replayErr != nil:
+		if errors.Is(replayErr, context.Canceled) {
+			sum.Disposition = ReplayDispositionTransientWait
+		} else {
+			sum.Disposition = ReplayDispositionNeedsAttention
+		}
+		sum.DispositionReason = ai.SanitizePlannerError(replayErr.Error())
+	case sum.Skipped:
+		sum.Disposition = ReplayDispositionRecoverableStall
+		sum.DispositionReason = sum.SkippedReason
+		if sum.SkippedReason == "" ||
+			strings.Contains(sum.SkippedReason, "pause") ||
+			strings.Contains(sum.SkippedReason, "quiescence") ||
+			strings.Contains(sum.SkippedReason, "batch_wait") ||
+			strings.Contains(sum.SkippedReason, "settle_window") ||
+			strings.Contains(sum.SkippedReason, "candidate_wait") ||
+			strings.Contains(sum.SkippedReason, "branch_transition") {
+			sum.Disposition = ReplayDispositionTransientWait
+		}
+	default:
+		sum.Disposition = ReplayDispositionIdle
+	}
 }
 
 // Replay drains pending capture_events for the active branch into commits.
@@ -332,8 +392,10 @@ type ReplaySummary struct {
 // poll tick sees those events still pending and re-attempts them only after
 // the operator has reconciled the blocker (which advances BaseHead /
 // branch_generation and lets the queue drain naturally).
-func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (ReplaySummary, error) {
-	var sum ReplaySummary
+func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (sum ReplaySummary, replayErr error) {
+	defer func() {
+		classifyReplayDisposition(&sum, replayErr)
+	}()
 	if repoRoot == "" || db == nil {
 		return sum, fmt.Errorf("daemon: Replay: repoRoot and db required")
 	}
@@ -407,17 +469,25 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if closeIntentPlanner != nil {
 		defer closeIntentPlanner()
 	}
+	forwardRecovery, forwardRecoveryActive, err :=
+		state.IntentForwardRecoveryForPair(
+			ctx, db, cctx.BranchRef, cctx.BranchGeneration)
+	if err != nil {
+		return sum, err
+	}
 	if opts.PublicationDrain != nil && intentCfg.enabled &&
 		opts.PublicationDrain.Phase == state.PublicationDrainEventFallback {
-		intentCfg.planner = publicationDrainAtomicFallbackPlanner{
-			commitFormat: intentCfg.commitFormat,
+		configureIntentSalvage(&intentCfg, opts.IntentHealth,
+			publicationDrainSalvageMode(*opts.PublicationDrain),
+			opts.PublicationDrain.EventSeqs)
+	} else if forwardRecoveryActive && intentCfg.enabled {
+		configureIntentSalvage(&intentCfg, opts.IntentHealth,
+			forwardRecovery.Stage, forwardRecovery.TargetEventSeqs)
+	}
+	if intentCfg.semanticSalvage {
+		if err := retireResolvedIntentCandidateMembership(ctx, db, cctx); err != nil {
+			return sum, err
 		}
-		intentCfg.plannerProvider = intentCfg.planner.Name()
-		intentCfg.plannerModel = ""
-		intentCfg.health = nil
-		intentCfg.candidateMode = true
-		intentCfg.bypassBatchWait = true
-		intentCfg.pathQuiescence = 0
 	}
 
 	// Self-heal pass: probe every blocked_conflict row whose conflict class
@@ -491,6 +561,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if err != nil {
 			return sum, err
 		}
+	} else if forwardRecoveryActive && len(forwardRecovery.TargetEventSeqs) > 0 {
+		pending = intentForwardRecoveryPendingEvents(
+			pending, forwardRecovery.TargetEventSeqs)
 	}
 	if batchLimit > 0 && len(pending) > batchLimit {
 		pending = pending[:batchLimit]
@@ -538,7 +611,14 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	if intentCfg.enabled {
-		return replayIntentBatch(ctx, repoRoot, db, activeCtx, opts, intentCfg, indexFile, pending, parent, parentTree, sum)
+		result, replayErr := replayIntentBatch(
+			ctx, repoRoot, db, activeCtx, opts, intentCfg, indexFile,
+			pending, parent, parentTree, sum)
+		if forwardRecoveryActive {
+			result, replayErr = updateIntentForwardRecoveryAfterReplay(
+				ctx, db, forwardRecovery, result, replayErr)
+		}
+		return result, replayErr
 	}
 
 	for _, ev := range pending {
@@ -1018,6 +1098,14 @@ type intentReplayConfig struct {
 	// and quiet-time gate, but never before path quiescence or replay safety
 	// gates.
 	candidateMode bool
+	// atomicFallback bypasses semantic windows and selects one complete hard
+	// dependency component for local deterministic publication.
+	atomicFallback bool
+	// semanticSalvage offers only the remaining forward target to the configured
+	// provider. A local evidence partition becomes a request for one explicit
+	// unlock pass instead of publishing under a misleading semantic label.
+	semanticSalvage   bool
+	salvageTargetSeqs []int64
 	// pathQuiescence is the per-path silence window read from
 	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
 	// disables the gate; any positive value defers offering pending
@@ -1212,6 +1300,14 @@ func replayIntentBatch(
 	parentTree string,
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
+	if cfg.atomicFallback {
+		sum.RecoveryMode = publicationFallbackLocalUnlock
+		circuit := opts.IntentHealth.Snapshot()
+		sum.PlannerCircuitOpen = circuit.State == IntentPlannerCircuitOpen &&
+			!circuit.RecoveryReady
+	} else if cfg.semanticSalvage {
+		sum.RecoveryMode = publicationFallbackSemanticReplan
+	}
 	// Per-path quiescence gate (ACD_PATH_QUIESCENCE_SECONDS). When non-zero
 	// we hold back pending captures whose path was written within the
 	// configured quiet window; the capture row is still durable, only the
@@ -1249,8 +1345,7 @@ func replayIntentBatch(
 		waitReason string
 		err        error
 	)
-	if opts.PublicationDrain != nil &&
-		opts.PublicationDrain.Phase == state.PublicationDrainEventFallback {
+	if cfg.atomicFallback {
 		window, err = publicationDrainAtomicFallbackWindow(
 			ctx, db, activeCtx, pending)
 	} else {
@@ -1271,6 +1366,12 @@ func replayIntentBatch(
 	preflight := intentPreflightEvents(pending, window, forced)
 	if updated, halted, err := rejectInvalidIntentWindowEvents(ctx, repoRoot, db, activeCtx, opts, parent, preflight, sum); halted || err != nil {
 		return updated, err
+	}
+	if cfg.atomicFallback {
+		if err := retireIntentCandidatesForFallbackEvents(
+			ctx, db, activeCtx, window); err != nil {
+			return sum, err
+		}
 	}
 	if len(pending) > len(window) {
 		sum.HasMore = true

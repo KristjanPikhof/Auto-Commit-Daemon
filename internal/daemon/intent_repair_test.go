@@ -298,6 +298,38 @@ func TestIntentRepairRequiredVerificationUnavailableFailsClosed(t *testing.T) {
 	}
 }
 
+func TestIntentRepairForwardRecoveryClassification(t *testing.T) {
+	t.Parallel()
+	for _, reason := range []string{
+		"repair_horizon_expired",
+		"repair_commit_outside_suffix",
+		"repair_suffix_not_acd_owned",
+		"repair_repartition_not_proven",
+		"repair_repartition_dependency",
+		"repair_repartition_path_overlap",
+		git.IntentRepairReasonNonLinearChain,
+		git.IntentRepairReasonMergeCommit,
+		git.IntentRepairReasonAlternateRef,
+		git.IntentRepairReasonStagedOverlap,
+		git.IntentRepairReasonOwnershipMissing,
+	} {
+		if !intentRepairSupportsForwardRecovery(reason) {
+			t.Fatalf("reason %q did not enable forward recovery", reason)
+		}
+	}
+	for _, reason := range []string{
+		git.IntentRepairReasonDetached,
+		git.IntentRepairReasonBranchChanged,
+		git.IntentRepairReasonHeadChanged,
+		"repair_verification_unavailable",
+		"repair_verification_needs_attention",
+	} {
+		if intentRepairSupportsForwardRecovery(reason) {
+			t.Fatalf("unsafe reason %q enabled forward recovery", reason)
+		}
+	}
+}
+
 func TestReplayIntentV2RepairsOwnedCommitSuffix(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -352,7 +384,7 @@ WHERE status='completed'`).Scan(&completed); err != nil || completed != 1 {
 	}
 }
 
-func TestReplayIntentV2SkipsRepartitionOfUnseenCandidate(t *testing.T) {
+func TestReplayIntentV2RecoversForwardWhenRepartitionIsUnproven(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -416,15 +448,29 @@ WHERE purpose LIKE '%documentation%'`); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Skipped ||
-		result.SkippedReason !=
-			"intent_v2_repair_skipped_repair_repartition_not_proven" ||
-		result.BaseHead != headBefore {
+	if result.Published != 1 || result.Skipped || result.BaseHead == headBefore ||
+		result.Disposition != ReplayDispositionProgress {
 		t.Fatalf("result=%+v headBefore=%s", result, headBefore)
 	}
 	headAfter, err := git.RevParse(ctx, f.dir, "HEAD")
-	if err != nil || headAfter != headBefore {
-		t.Fatalf("HEAD=%s err=%v want %s", headAfter, err, headBefore)
+	if err != nil || headAfter != result.BaseHead {
+		t.Fatalf("HEAD=%s err=%v want %s", headAfter, err, result.BaseHead)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+		"merge-base", "--is-ancestor", headBefore, headAfter); err != nil {
+		t.Fatalf("forward recovery rewrote published history: %v", err)
+	}
+	var decisions int
+	if err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM decision_records
+WHERE kind=? AND reason='repair_repartition_not_proven'`,
+		state.DecisionKindIntentForwardRecovery).Scan(&decisions); err != nil || decisions != 1 {
+		t.Fatalf("forward recovery decisions=%d err=%v", decisions, err)
+	}
+	if _, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
+	); err != nil || active {
+		t.Fatalf("forward recovery marker active=%t err=%v", active, err)
 	}
 }
 

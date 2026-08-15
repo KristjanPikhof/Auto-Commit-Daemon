@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -405,6 +406,163 @@ WHERE branch_ref=? AND branch_generation=?
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("daemon: commit event-strategy candidate retirement: %w", err)
+	}
+	return nil
+}
+
+// retireIntentCandidatesForFallbackEvents releases only candidates that own
+// the selected local-unlock component. Other locked semantic groups remain
+// available to the next pending-only provider replan.
+func retireIntentCandidatesForFallbackEvents(
+	ctx context.Context,
+	db *state.DB,
+	cctx CaptureContext,
+	events []state.CaptureEvent,
+) error {
+	if cctx.BranchRef == "" || len(events) == 0 {
+		return nil
+	}
+	if len(events) > state.IntentCandidateMaxCaptures {
+		return fmt.Errorf("daemon: fallback retirement exceeds %d events",
+			state.IntentCandidateMaxCaptures)
+	}
+	statuses := `('open','waiting','ready','soft_published','blocked')`
+	placeholders := make([]string, 0, len(events))
+	args := make([]any, 0, len(events)+2)
+	args = append(args, cctx.BranchRef, cctx.BranchGeneration)
+	for _, event := range events {
+		placeholders = append(placeholders, "?")
+		args = append(args, event.Seq)
+	}
+	tx, err := db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("daemon: begin targeted candidate retirement: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var recoverable int
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM self_publications
+    WHERE branch_ref=? AND branch_generation=?
+      AND phase IN ('prepared','git_applied')
+)`, cctx.BranchRef, cctx.BranchGeneration).Scan(&recoverable); err != nil {
+		return err
+	}
+	if recoverable != 0 {
+		return ErrSelfPublicationRecoveryRequired
+	}
+	rows, err := tx.QueryContext(ctx, `
+SELECT DISTINCT candidate.id
+FROM intent_candidates candidate
+JOIN intent_candidate_events member ON member.candidate_id=candidate.id
+WHERE candidate.branch_ref=? AND candidate.branch_generation=?
+  AND candidate.status IN `+statuses+`
+  AND member.membership_state='active'
+  AND member.event_seq IN (`+strings.Join(placeholders, ",")+`)
+ORDER BY candidate.id`, args...)
+	if err != nil {
+		return fmt.Errorf("daemon: find fallback candidate ownership: %w", err)
+	}
+	var candidateIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		candidateIDs = append(candidateIDs, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(candidateIDs) == 0 {
+		return nil
+	}
+	idPlaceholders := make([]string, len(candidateIDs))
+	idArgs := make([]any, len(candidateIDs))
+	for index, id := range candidateIDs {
+		idPlaceholders[index] = "?"
+		idArgs[index] = id
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE membership_state='active' AND candidate_id IN (`+
+		strings.Join(idPlaceholders, ",")+`)`, idArgs...); err != nil {
+		return fmt.Errorf("daemon: release targeted candidate membership: %w", err)
+	}
+	statusArgs := append([]any{selfPublicationNow()}, idArgs...)
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='superseded',readiness='wait',soft_publication_deadline=NULL,
+    updated_ts=?
+WHERE id IN (`+strings.Join(idPlaceholders, ",")+`)
+  AND status IN `+statuses, statusArgs...); err != nil {
+		return fmt.Errorf("daemon: retire targeted candidates: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("daemon: commit targeted candidate retirement: %w", err)
+	}
+	return nil
+}
+
+// retireResolvedIntentCandidateMembership keeps semantic salvage forward-only.
+// Pending-only locked groups survive, while published members become recent
+// history context instead of pulling a new plan back into repair.
+func retireResolvedIntentCandidateMembership(
+	ctx context.Context,
+	db *state.DB,
+	cctx CaptureContext,
+) error {
+	if cctx.BranchRef == "" {
+		return nil
+	}
+	statuses := `('open','waiting','ready','soft_published','blocked')`
+	tx, err := db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var recoverable int
+	if err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM self_publications
+    WHERE branch_ref=? AND branch_generation=?
+      AND phase IN ('prepared','git_applied')
+)`, cctx.BranchRef, cctx.BranchGeneration).Scan(&recoverable); err != nil {
+		return err
+	}
+	if recoverable != 0 {
+		return ErrSelfPublicationRecoveryRequired
+	}
+	selector := `
+SELECT candidate.id
+FROM intent_candidates candidate
+WHERE candidate.branch_ref=? AND candidate.branch_generation=?
+  AND candidate.status IN ` + statuses + `
+  AND EXISTS (
+      SELECT 1
+      FROM intent_candidate_events member
+      JOIN capture_events event ON event.seq=member.event_seq
+      WHERE member.candidate_id=candidate.id
+        AND member.membership_state='active'
+        AND event.state<>'pending'
+  )`
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE membership_state='active' AND candidate_id IN (`+selector+`)`,
+		cctx.BranchRef, cctx.BranchGeneration); err != nil {
+		return fmt.Errorf("daemon: release resolved candidate membership: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='superseded',readiness='wait',soft_publication_deadline=NULL,
+    updated_ts=?
+WHERE id IN (`+selector+`) AND status IN `+statuses,
+		selfPublicationNow(), cctx.BranchRef, cctx.BranchGeneration); err != nil {
+		return fmt.Errorf("daemon: retire resolved candidates: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("daemon: commit resolved candidate retirement: %w", err)
 	}
 	return nil
 }

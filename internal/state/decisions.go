@@ -28,6 +28,7 @@ const (
 	DecisionKindIntentDeferred            = "intent_deferred"
 	DecisionKindIntentForced              = "intent_forced"
 	DecisionKindIntentPlannerError        = "intent_planner_error"
+	DecisionKindIntentForwardRecovery     = "intent_forward_recovery"
 	DecisionKindMessageQualityRewrite     = "message_quality_rewrite"
 	DecisionKindMessageQualityFallback    = "message_quality_fallback"
 	// DecisionKindRecoveryPublished records one member of an unpublished chain

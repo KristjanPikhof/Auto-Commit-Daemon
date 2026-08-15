@@ -589,10 +589,15 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "The current commit-all run stopped at a safety check. Your work remains protected."
 		res.NextAction = "Run `acd doctor` to see what blocked publication."
+	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
+		status.PublicationDrain.FallbackMode == "semantic_replan":
+		res.Health = controlHealthPublishing
+		res.Summary = "ACD is replanning the remaining protected changes by intent."
+		res.NextAction = "No action needed. If planning stalls, ACD will publish one local group and try intent again."
 	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback:
 		res.Health = controlHealthPublishing
-		res.Summary = "ACD is publishing the protected changes in safe local groups."
-		res.NextAction = "No action needed. ACD will continue automatically."
+		res.Summary = "ACD is publishing one safe local group to unblock intent planning."
+		res.NextAction = "No action needed. ACD will return to intent planning after this group."
 	case status.PublicationDrain.Phase == state.PublicationDrainNormalizing ||
 		status.PublicationDrain.Phase == state.PublicationDrainCheckpointing:
 		res.Health = controlHealthPublishing
@@ -600,8 +605,8 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.NextAction = "No action needed. Recovery continues automatically."
 	case status.PublicationDrain.Phase == state.PublicationDrainSemantic:
 		res.Health = controlHealthPublishing
-		res.Summary = "ACD is grouping and publishing the changes selected by commit-all."
-		res.NextAction = "No action needed. A provider delay will not cancel this work."
+		res.Summary = "ACD is planning commits for the protected checkpoint."
+		res.NextAction = "No action needed. If planning stalls, ACD switches to safe local groups automatically."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.RecoveryRequired = true

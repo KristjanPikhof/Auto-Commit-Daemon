@@ -48,6 +48,26 @@ func TestReplayObservabilityRetryMatrix(t *testing.T) {
 	}
 }
 
+func TestReplayObservabilityPrefersForwardFallbackMetadata(t *testing.T) {
+	_, _, d := makeRepoStateDB(t)
+	ctx := context.Background()
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"intent.v2.last_fallback_mode": "forward_atomic_components",
+		"intent.v2.last_fallback_size": "3",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := loadReplayObservabilityReport(ctx, d.SQL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.LastFallbackMode != "forward_atomic_components" ||
+		report.LastFallbackSize != 3 {
+		t.Fatalf("forward fallback projection=%+v", report)
+	}
+}
+
 func TestReplayObservabilityDurableAttentionMatrix(t *testing.T) {
 	for _, tc := range []struct {
 		name string
