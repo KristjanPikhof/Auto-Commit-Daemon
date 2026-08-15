@@ -609,7 +609,7 @@ func runApprovedCommand(
 	status=$?
 	trap - EXIT HUP INT TERM
 	printf '%d\n' "$status" >&3
-	kill -KILL -- -$$
+	/bin/kill -KILL -- "-$$"
 	exit "$status"
 }
 trap finish EXIT
