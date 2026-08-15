@@ -64,12 +64,23 @@
   fails because that event already belongs to a checkpoint.
 - Compatible runtime replacement is journaled and bounded, so ordinary source
   rebuilds do not repeat every repository migration scan and self-test.
-- Invalid Intent graphs are normalized after candidate IDs stabilize. ACD gets
-  one semantic rebuild, then uses local atomic dependency groups without
-  changing the selected strategy or relaxing Git safety checks.
+- Intent drains now distinguish queued work from real progress. An expired or
+  unsafe history repair retires only the blocking candidate, keeps published
+  commits unchanged, and releases its pending events for forward recovery.
+  Large queues can no longer prevent recovery just because another replay pass
+  is available.
+- Forward recovery now returns to pending-only Intent planning after every
+  local unlock. When planning stalls, ACD publishes the smallest safe hard
+  dependency component, including a single event when needed, then replans the
+  remaining target from the new `HEAD`. An unavailable provider keeps recovery
+  local until its circuit allows another probe.
 - Recovery now resumes blocked publication drains and follows recaptured events
   across rewritten bases. Repeated transitions that already reached their
   recorded result are accepted only after the existing proof checks pass.
+- The supervisor now removes deleted worktrees only after proving that their
+  ACD state has no unresolved protected work. Unsafe stale registrations are
+  disabled instead of restarting missing workers, and manual registry cleanup
+  uses the same proof.
 - `acd history rewrite` now trusts the disabled repository lifecycle and the
   canonical writer lock instead of stale daemon modes or reused PIDs. Apply
   holds exclusive ownership through Git and state reconciliation, then repairs

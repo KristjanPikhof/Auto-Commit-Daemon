@@ -493,13 +493,16 @@ func statusOperationalState(report statusReport) string {
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
 		return "needs_attention"
+	case report.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
+		report.PublicationDrain.FallbackMode == "semantic_replan":
+		return "planning"
 	case report.PublicationDrain.Phase == state.PublicationDrainEventFallback:
 		return "event_fallback"
 	case report.PublicationDrain.Phase == state.PublicationDrainNormalizing ||
 		report.PublicationDrain.Phase == state.PublicationDrainCheckpointing:
 		return "self_healing"
 	case report.PublicationDrain.Phase == state.PublicationDrainSemantic:
-		return "waiting_for_provider"
+		return "planning"
 	case report.IntentStrategy.PlannerHealth != nil &&
 		(report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
 			report.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen) &&

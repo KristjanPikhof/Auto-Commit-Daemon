@@ -155,6 +155,18 @@ WHERE e.state='pending'
 		return report, fmt.Errorf("replay schema version: %w", err)
 	}
 	if hasWindows && schemaVersion >= 14 {
+		if value, ok, metaErr := metaLookup(
+			ctx, conn, "intent.v2.last_fallback_mode"); metaErr != nil {
+			return report, fmt.Errorf("last forward fallback mode: %w", metaErr)
+		} else if ok {
+			report.LastFallbackMode = sanitizeObservabilityText(value)
+		}
+		if value, ok, metaErr := metaLookup(
+			ctx, conn, "intent.v2.last_fallback_size"); metaErr != nil {
+			return report, fmt.Errorf("last forward fallback size: %w", metaErr)
+		} else if ok {
+			report.LastFallbackSize, _ = strconv.Atoi(strings.TrimSpace(value))
+		}
 		var outcome, source, selectedGroups sql.NullString
 		err = conn.QueryRowContext(ctx, `
 SELECT outcome, source, selected_groups
@@ -164,7 +176,7 @@ ORDER BY id DESC LIMIT 1`).Scan(&outcome, &source, &selectedGroups)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return report, fmt.Errorf("latest fallback window: %w", err)
 		}
-		if err == nil {
+		if err == nil && report.LastFallbackMode == "" {
 			report.LastFallbackMode = sanitizeObservabilityText(outcome.String)
 			if report.LastFallbackMode == "" {
 				report.LastFallbackMode = sanitizeObservabilityText(source.String)

@@ -148,7 +148,8 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 		fmt.Fprintf(out, "Commit-all progress: %d of %d protected change(s) left, %s\n",
 			data.PublicationDrain.RemainingEvents,
 			data.PublicationDrain.TargetEvents,
-			publicationPhaseLabel(data.PublicationDrain.Phase))
+			publicationPhaseLabel(data.PublicationDrain.Phase,
+				data.PublicationDrain.FallbackMode))
 	}
 	fmt.Fprintf(out, "Action needed: %s\n", yesNo(data.ActionRequired))
 	if data.Summary != "" {
@@ -162,15 +163,18 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	return nil
 }
 
-func publicationPhaseLabel(phase string) string {
+func publicationPhaseLabel(phase string, fallbackMode string) string {
 	switch phase {
 	case "checkpointing":
 		return "saving the checkpoint"
 	case "normalizing":
 		return "preparing a safe publication plan"
 	case "semantic":
-		return "grouping and publishing commits"
+		return "planning commit groups"
 	case "event_fallback":
+		if fallbackMode == "semantic_replan" {
+			return "replanning commit groups by intent"
+		}
 		return "publishing safe commit groups"
 	case "needs_action":
 		return "blocked and waiting for action"

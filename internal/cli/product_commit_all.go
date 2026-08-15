@@ -454,7 +454,7 @@ func productPublicationDrainByID(
 func writeProductCommitAllProgress(out io.Writer, drain state.PublicationDrain, remaining int64) {
 	fmt.Fprintf(out, "Commit all: %d of %d protected change(s) left; %d commit(s) created; %s\n",
 		remaining, drain.TargetEventCount, drain.CommitCount,
-		publicationPhaseLabel(drain.Phase))
+		publicationPhaseLabel(drain.Phase, drain.FallbackMode))
 	if drain.LastError != "" {
 		fmt.Fprintf(out, "Commit all: last issue: %s\n", drain.LastError)
 	}

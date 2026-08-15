@@ -139,6 +139,93 @@ func TestServerRefusesLegacyRegistry(t *testing.T) {
 	}
 }
 
+func TestReconcileRemovesDeletedWorktreeAndKeepsRepository(t *testing.T) {
+	root := t.TempDir()
+	roots := paths.Roots{
+		State: filepath.Join(root, "state"), Share: filepath.Join(root, "share"),
+		Config: filepath.Join(root, "config"),
+	}
+	const repositoryID = "0123456789abcdef"
+	present := t.TempDir()
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{
+		{Path: present, StateDB: filepath.Join(present, "state.db"),
+			RepositoryID: repositoryID, WorktreeID: "1111111111111111",
+			FirstRegisteredTS: 1, LastSeenTS: 1},
+		{Path: filepath.Join(t.TempDir(), "deleted"),
+			StateDB:      filepath.Join(t.TempDir(), "deleted-state.db"),
+			RepositoryID: repositoryID, WorktreeID: "2222222222222222",
+			FirstRegisteredTS: 1, LastSeenTS: 1},
+	}
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		Roots: roots, BinaryPath: "/does/not/exist",
+		workers: map[string]*workerProcess{},
+		maintenance: map[string]MaintenanceLease{
+			repositoryID: {
+				RepositoryID: repositoryID, Token: "test",
+				ExpiresAt: time.Now().Add(time.Minute),
+			},
+		},
+	}
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := central.Load(roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 1 || got.Repos[0].Path != present ||
+		got.Repos[0].RepositoryID != repositoryID {
+		t.Fatalf("registry=%+v", got.Repos)
+	}
+}
+
+func TestReconcileRemovesDeletedRepositoryWorkerState(t *testing.T) {
+	root := t.TempDir()
+	roots := paths.Roots{
+		State: filepath.Join(root, "state"), Share: filepath.Join(root, "share"),
+		Config: filepath.Join(root, "config"),
+	}
+	const repositoryID = "0123456789abcdef"
+	registry := central.NewRegistry()
+	registry.Repos = []central.RepoRecord{{
+		Path:         filepath.Join(t.TempDir(), "deleted"),
+		StateDB:      filepath.Join(t.TempDir(), "deleted-state.db"),
+		RepositoryID: repositoryID, WorktreeID: "2222222222222222",
+		FirstRegisteredTS: 1, LastSeenTS: 1,
+	}}
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: repositoryID, State: "needs_action",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		Roots: roots, BinaryPath: "/does/not/exist",
+		workers: map[string]*workerProcess{
+			repositoryID: {id: repositoryID},
+		},
+	}
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := central.Load(roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Repos) != 0 || server.workers[repositoryID] != nil {
+		t.Fatalf("registry=%+v workers=%+v", got.Repos, server.workers)
+	}
+	if _, err := os.Stat(roots.WorkerStatusPath(repositoryID)); !os.IsNotExist(err) {
+		t.Fatalf("worker status survived cleanup: %v", err)
+	}
+}
+
 func TestRestartBackoffContract(t *testing.T) {
 	want := []time.Duration{time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second, 30 * time.Second}
 	for i, expected := range want {

@@ -18,6 +18,14 @@ import (
 
 const publicationDrainHeadChangedPrefix = "publication drain HEAD changed after checkpoint:"
 const publicationDrainRecoveredTargetError = "frozen publication target contains a terminal event"
+const supersededCandidateDrainErrorPrefix = "state: candidate "
+const supersededCandidateDrainErrorSuffix = " is terminal in status superseded"
+
+const (
+	publicationFallbackSemanticReplan = "semantic_replan"
+	publicationFallbackLocalUnlock    = "local_unlock"
+	publicationFallbackLegacyAtomic   = "atomic_dependency_components"
+)
 
 // ActivePublicationDrainForPair returns the one durable drain owned by the
 // active branch generation. Multiple active drains for one pair fail closed.
@@ -49,6 +57,91 @@ func ActivePublicationDrainForPair(
 		active = &loaded
 	}
 	return active, nil
+}
+
+// RecoverSupersededCandidatePublicationDrain reopens only the latest drain
+// stopped by the old stable-ID collision. SaveIntentCandidate fails before Git
+// materialization, and the exact superseded candidate plus a clean frozen
+// target proves that replay may safely choose its deterministic successor.
+func RecoverSupersededCandidatePublicationDrain(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	now time.Time,
+) (*state.PublicationDrain, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id,last_error FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+  AND last_error LIKE ?
+ORDER BY created_ts DESC,id DESC LIMIT 1`,
+		branchRef, generation,
+		supersededCandidateDrainErrorPrefix+"%"+supersededCandidateDrainErrorSuffix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	var id, recordedError string
+	if err := rows.Scan(&id, &recordedError); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	candidateID, ok := strings.CutPrefix(
+		recordedError, supersededCandidateDrainErrorPrefix)
+	if !ok {
+		return nil, nil
+	}
+	candidateID, ok = strings.CutSuffix(
+		candidateID, supersededCandidateDrainErrorSuffix)
+	if !ok || strings.TrimSpace(candidateID) != candidateID || candidateID == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(candidateID, "intent-successor-") {
+		return nil, nil
+	}
+	candidate, exists, err := state.IntentCandidateByID(ctx, db, candidateID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists || candidate.Status != state.IntentCandidateSuperseded ||
+		candidate.BranchRef != branchRef || candidate.BranchGeneration != generation {
+		return nil, nil
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, id)
+	if err != nil {
+		return nil, err
+	}
+	counts, err := publicationDrainCountsForTarget(ctx, db, drain.EventSeqs)
+	if err != nil {
+		return nil, err
+	}
+	if counts.terminal != 0 {
+		return nil, nil
+	}
+	var recoverablePublication int
+	if err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM self_publications
+    WHERE branch_ref=? AND branch_generation=?
+      AND phase IN ('prepared','git_applied')
+)`, branchRef, generation).Scan(&recoverablePublication); err != nil {
+		return nil, err
+	}
+	if recoverablePublication != 0 {
+		return nil, nil
+	}
+	nowTS := float64(now.UnixNano()) / 1e9
+	reopened, err := state.ReopenPublicationDrainCheckpointing(
+		ctx, db, drain.ID, recordedError, nowTS)
+	if err != nil {
+		return nil, err
+	}
+	return &reopened, nil
 }
 
 // RestartablePublicationDrainForPair returns the latest HEAD-change block
@@ -277,10 +370,9 @@ WHERE branch_ref=? AND branch_generation=? AND phase='completed'
 	return true, nil
 }
 
-// ResumePublicationDrainNormalization records the bounded semantic rebuild as
-// exhausted before replay enters the local atomic fallback. Keeping this as a
-// separate durable transition makes a crash between the two phases resumable
-// without calling the provider again.
+// ResumePublicationDrainNormalization retires the stalled semantic pass at a
+// crash-safe boundary, then gives pending-only Intent planning the first chance
+// to move forward from the current HEAD.
 func ResumePublicationDrainNormalization(
 	ctx context.Context,
 	db *state.DB,
@@ -296,9 +388,22 @@ func ResumePublicationDrainNormalization(
 	}
 	update := PublicationDrainUpdateFrom(drain, nowTS, drain.LastProgressTS)
 	update.Phase = state.PublicationDrainEventFallback
-	update.EventFallbackCount++
-	update.FallbackMode = "atomic_dependency_components"
+	update.FallbackMode = publicationFallbackSemanticReplan
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+}
+
+func publicationDrainSalvageMode(drain state.PublicationDrain) string {
+	if drain.Phase != state.PublicationDrainEventFallback {
+		return ""
+	}
+	switch drain.FallbackMode {
+	case publicationFallbackSemanticReplan:
+		return publicationFallbackSemanticReplan
+	case publicationFallbackLocalUnlock, publicationFallbackLegacyAtomic, "":
+		return publicationFallbackLocalUnlock
+	default:
+		return publicationFallbackLocalUnlock
+	}
 }
 
 // publicationDrainAtomicFallbackPlanner keeps every hard dependency component
@@ -308,9 +413,45 @@ type publicationDrainAtomicFallbackPlanner struct {
 	commitFormat ai.CommitFormat
 }
 
-// publicationDrainAtomicFallbackWindow returns the complete hard-dependency
-// component containing the first pending event. A component that exceeds the
-// candidate protocol cap fails closed instead of being split across commits.
+func configureAtomicIntentFallback(cfg *intentReplayConfig) {
+	if cfg == nil {
+		return
+	}
+	cfg.planner = publicationDrainAtomicFallbackPlanner{
+		commitFormat: cfg.commitFormat,
+	}
+	cfg.plannerProvider = cfg.planner.Name()
+	cfg.plannerModel = ""
+	cfg.health = nil
+	cfg.candidateMode = true
+	cfg.bypassBatchWait = true
+	cfg.pathQuiescence = 0
+	cfg.window = ai.IntentCandidateCaptureCap
+	cfg.atomicFallback = true
+}
+
+func configureIntentSalvage(
+	cfg *intentReplayConfig,
+	health *IntentPlannerHealth,
+	stage string,
+	targetSeqs []int64,
+) {
+	circuit := health.Snapshot()
+	useLocalUnlock := stage == publicationFallbackLocalUnlock
+	if circuit.State == IntentPlannerCircuitOpen {
+		useLocalUnlock = !circuit.RecoveryReady
+	}
+	if useLocalUnlock {
+		configureAtomicIntentFallback(cfg)
+		return
+	}
+	cfg.semanticSalvage = true
+	cfg.salvageTargetSeqs = append([]int64(nil), targetSeqs...)
+}
+
+// publicationDrainAtomicFallbackWindow returns the smallest complete hard
+// dependency component. A singleton is valid when it is the least work needed
+// to give semantic planning a new HEAD and fingerprint.
 func publicationDrainAtomicFallbackWindow(
 	ctx context.Context,
 	db *state.DB,
@@ -363,31 +504,50 @@ func publicationDrainAtomicFallbackWindow(
 		adjacent[dependency.DependentSeq] = append(
 			adjacent[dependency.DependentSeq], dependency.PrerequisiteSeq)
 	}
-	component := map[int64]struct{}{pending[0].Seq: {}}
-	queue := []int64{pending[0].Seq}
-	for len(queue) > 0 {
-		seq := queue[0]
-		queue = queue[1:]
-		for _, neighbor := range adjacent[seq] {
-			if _, seen := component[neighbor]; seen {
-				continue
+	visited := make(map[int64]struct{}, len(pending))
+	var selected map[int64]struct{}
+	selectedFirst := int64(0)
+	for _, event := range pending {
+		if _, seen := visited[event.Seq]; seen {
+			continue
+		}
+		component := map[int64]struct{}{event.Seq: {}}
+		visited[event.Seq] = struct{}{}
+		queue := []int64{event.Seq}
+		first := event.Seq
+		for len(queue) > 0 {
+			seq := queue[0]
+			queue = queue[1:]
+			if seq < first {
+				first = seq
 			}
-			component[neighbor] = struct{}{}
-			if len(component) > ai.IntentCandidateCaptureCap {
-				return nil, fmt.Errorf(
-					"daemon: atomic fallback dependency component exceeds %d captures",
-					ai.IntentCandidateCaptureCap)
+			for _, neighbor := range adjacent[seq] {
+				if _, seen := visited[neighbor]; seen {
+					continue
+				}
+				visited[neighbor] = struct{}{}
+				component[neighbor] = struct{}{}
+				queue = append(queue, neighbor)
 			}
-			queue = append(queue, neighbor)
+		}
+		if selected == nil || len(component) < len(selected) ||
+			(len(component) == len(selected) && first < selectedFirst) {
+			selected = component
+			selectedFirst = first
 		}
 	}
-	window := make([]state.CaptureEvent, 0, len(component))
+	if len(selected) > ai.IntentCandidateCaptureCap {
+		return nil, fmt.Errorf(
+			"daemon: atomic fallback dependency component exceeds %d captures",
+			ai.IntentCandidateCaptureCap)
+	}
+	window := make([]state.CaptureEvent, 0, len(selected))
 	for _, event := range pending {
-		if _, ok := component[event.Seq]; ok {
+		if _, ok := selected[event.Seq]; ok {
 			window = append(window, event)
 		}
 	}
-	return window, nil
+	return topologicalPublicationDrainEvents(window, dependencies)
 }
 
 func (publicationDrainAtomicFallbackPlanner) Name() string {
@@ -447,15 +607,24 @@ func publicationDrainPendingEvents(
 		}
 		filtered = append(filtered, event)
 	}
-	if drain.Phase != state.PublicationDrainEventFallback || len(filtered) < 2 {
-		return filtered, nil
+	return filtered, nil
+}
+
+func intentForwardRecoveryPendingEvents(
+	pending []state.CaptureEvent,
+	targetSeqs []int64,
+) []state.CaptureEvent {
+	target := make(map[int64]struct{}, len(targetSeqs))
+	for _, seq := range targetSeqs {
+		target[seq] = struct{}{}
 	}
-	dependencies, err := state.IntentCaptureDependenciesForPair(
-		ctx, db, drain.BranchRef, drain.BranchGeneration)
-	if err != nil {
-		return nil, fmt.Errorf("daemon: load publication drain dependencies: %w", err)
+	filtered := make([]state.CaptureEvent, 0, len(targetSeqs))
+	for _, event := range pending {
+		if _, ok := target[event.Seq]; ok {
+			filtered = append(filtered, event)
+		}
 	}
-	return topologicalPublicationDrainEvents(filtered, dependencies)
+	return filtered
 }
 
 func topologicalPublicationDrainEvents(
@@ -553,13 +722,17 @@ func UpdatePublicationDrainAfterReplay(
 		nowTS = drain.UpdatedTS
 	}
 	progressTS := drain.LastProgressTS
-	if resolved > drain.PublishedEventCount ||
-		counts.commits > drain.CommitCount {
+	progressed := resolved > drain.PublishedEventCount ||
+		counts.commits > drain.CommitCount
+	if progressed {
 		progressTS = nowTS
 	}
 	update := PublicationDrainUpdateFrom(drain, nowTS, progressTS)
 	update.PublishedEventCount = resolved
 	update.CommitCount = counts.commits
+	if progressed {
+		update.LastError = ""
+	}
 	if summary.PlannerFailure != "" {
 		update.LastError = summary.PlannerFailure
 	}
@@ -570,6 +743,7 @@ func UpdatePublicationDrainAfterReplay(
 	}
 	if resolved == drain.TargetEventCount {
 		update.Phase = state.PublicationDrainCompleted
+		update.LastError = ""
 		update.CompletedTS = sql.NullFloat64{Float64: nowTS, Valid: true}
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
@@ -583,14 +757,38 @@ func UpdatePublicationDrainAfterReplay(
 			} else {
 				update.Phase = state.PublicationDrainEventFallback
 				update.EventFallbackCount++
-				update.FallbackMode = "atomic_dependency_components"
+				update.FallbackMode = publicationFallbackLocalUnlock
 			}
 			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 		}
 		update.Phase = state.PublicationDrainNeedsAction
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
-	if resolved == drain.PublishedEventCount && !summary.HasMore {
+	if !progressed && summary.Disposition == ReplayDispositionTransientWait {
+		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	}
+	if !progressed && summary.Disposition == ReplayDispositionNeedsAttention {
+		update.Phase = state.PublicationDrainNeedsAction
+		update.LastError = publicationDrainReplayReason(summary,
+			"publication fallback needs attention")
+		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	}
+	actualRecoveryMode := summary.RecoveryMode
+	if actualRecoveryMode == "" {
+		actualRecoveryMode = publicationDrainSalvageMode(drain)
+	}
+	if progressed && drain.Phase == state.PublicationDrainEventFallback &&
+		actualRecoveryMode == publicationFallbackLocalUnlock {
+		if summary.PlannerCircuitOpen {
+			update.FallbackMode = publicationFallbackLocalUnlock
+		} else {
+			update.FallbackMode = publicationFallbackSemanticReplan
+		}
+		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	}
+	if !progressed {
+		update.LastError = publicationDrainReplayReason(summary,
+			"publication pass made no progress")
 		switch drain.Phase {
 		case state.PublicationDrainSemantic:
 			update.Phase = state.PublicationDrainNormalizing
@@ -598,11 +796,31 @@ func UpdatePublicationDrainAfterReplay(
 			update.FallbackMode = "deterministic_semantic"
 		case state.PublicationDrainNormalizing:
 			update.Phase = state.PublicationDrainEventFallback
-			update.EventFallbackCount++
-			update.FallbackMode = "atomic_dependency_components"
+			update.FallbackMode = publicationFallbackSemanticReplan
+		case state.PublicationDrainEventFallback:
+			if publicationDrainSalvageMode(drain) ==
+				publicationFallbackSemanticReplan {
+				update.EventFallbackCount++
+				update.FallbackMode = publicationFallbackLocalUnlock
+			} else {
+				update.Phase = state.PublicationDrainNeedsAction
+			}
 		}
 	}
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+}
+
+func publicationDrainReplayReason(summary ReplaySummary, fallback string) string {
+	for _, reason := range []string{
+		summary.DispositionReason,
+		summary.SkippedReason,
+		summary.PlannerFailure,
+	} {
+		if clean := strings.TrimSpace(reason); clean != "" {
+			return clean
+		}
+	}
+	return fallback
 }
 
 func publicationDrainHasEarlierTerminal(

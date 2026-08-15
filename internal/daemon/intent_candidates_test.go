@@ -534,6 +534,34 @@ func TestIntentCandidateEngineBoundedFallbackAfterOneCorrection(t *testing.T) {
 	}
 }
 
+func TestIntentCandidateSemanticReplanDoesNotPersistLocalFallback(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "internal/a.go", "create", "", "a")
+	planner := &selfDependentIntentCandidatePlannerStub{}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		RetryLimit: 2, RetryLimitSet: true, Preset: config.PresetBalanced,
+		VerificationMode: "structural", RejectLocalFallback: true,
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	})
+	var fallbackErr *IntentSemanticFallbackRequiredError
+	if !errors.As(err, &fallbackErr) || planner.calls != 2 ||
+		result.Fallback != "evidence_partition" || len(result.Decisions) != 0 {
+		t.Fatalf("semantic fallback calls=%d result=%+v err=%v",
+			planner.calls, result, err)
+	}
+	candidates, loadErr := state.IntentCandidatesForPair(
+		ctx, db, "refs/heads/main", 1, state.IntentCandidateMaxOpenPerPair)
+	if loadErr != nil || len(candidates) != 0 {
+		t.Fatalf("persisted fallback candidates=%+v err=%v", candidates, loadErr)
+	}
+}
+
 func TestIntentCandidateEngineStopsRepeatedInvalidPlanEarly(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
@@ -2752,6 +2780,59 @@ func openIntentCandidateTestDB(t *testing.T) *state.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func TestAdvanceTerminalIntentCandidateIDsUsesStableSuccessor(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "service.go", "modify", "before", "after")
+	terminal := state.IntentCandidate{
+		ID: "reused-planner-id", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: state.IntentCandidateReady,
+		Readiness: state.IntentReadinessReady,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: capture.Event.Seq, EventRole: "change",
+		}},
+	}
+	if err := state.SaveIntentCandidate(ctx, db, terminal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE candidate_id=?`, terminal.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE intent_candidates SET status='superseded' WHERE id=?`,
+		terminal.ID); err != nil {
+		t.Fatal(err)
+	}
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: terminal.ID, SelectedSeqs: []int64{capture.Event.Seq},
+			DependsOnCandidates: []string{terminal.ID},
+		}},
+	}
+	first, _, err := advanceTerminalIntentCandidateIDs(
+		ctx, db, "refs/heads/main", 1, plan, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Candidates[0].CandidateID; got == terminal.ID || !strings.HasPrefix(got, "intent-successor-") {
+		t.Fatalf("successor candidate id=%q", got)
+	}
+	if got, want := first.Candidates[0].DependsOnCandidates[0],
+		first.Candidates[0].CandidateID; got != want {
+		t.Fatalf("remapped dependency=%q want=%q", got, want)
+	}
+	second, _, err := advanceTerminalIntentCandidateIDs(
+		ctx, db, "refs/heads/main", 1, plan, nil)
+	if err != nil || second.Candidates[0].CandidateID != first.Candidates[0].CandidateID {
+		t.Fatalf("stable successor=%q first=%q err=%v",
+			second.Candidates[0].CandidateID, first.Candidates[0].CandidateID, err)
+	}
 }
 
 func appendIntentCandidateCapture(

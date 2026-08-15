@@ -498,6 +498,33 @@ func TestApplyControlStatusPlannerCircuitDegraded(t *testing.T) {
 	}
 }
 
+func TestApplyControlStatusReportsIntentSalvageSubphase(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want string
+	}{
+		{mode: "semantic_replan", want: "replanning"},
+		{mode: "local_unlock", want: "one safe local group"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			status := statusReport{
+				Daemon: "running", PID: os.Getpid(),
+				PublicationDrain: publicationDrainReport{
+					Available: true, ID: "drain",
+					Phase:        state.PublicationDrainEventFallback,
+					FallbackMode: tc.mode,
+				},
+			}
+			res := controlResult{OK: true}
+			applyControlStatus(&res, status)
+			if res.Health != controlHealthPublishing ||
+				!strings.Contains(strings.ToLower(res.Summary), tc.want) {
+				t.Fatalf("control result=%+v", res)
+			}
+		})
+	}
+}
+
 func TestApplyControlStatusRewindGraceIsWaiting(t *testing.T) {
 	status := statusReport{
 		Daemon: "running",

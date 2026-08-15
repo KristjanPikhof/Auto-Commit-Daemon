@@ -65,33 +65,35 @@ type IntentCandidateVerifier func(
 // IntentCandidateEvaluation describes one durable planner evaluation. It does
 // not publish commits or mutate Git refs; P8 consumes the publishable decisions.
 type IntentCandidateEvaluation struct {
-	BranchRef         string
-	BranchGeneration  int64
-	Captures          []IntentCandidateCapture
-	Hints             []IntentDependencyHint
-	Planner           interface{ Name() string }
-	Health            *IntentPlannerHealth
-	RetryLimit        int
-	RetryLimitSet     bool
-	Preset            config.PresetName
-	CommitFormat      ai.CommitFormat
-	IncludeDiffs      bool
-	ForcedAging       bool
-	Provider          string
-	Model             string
-	ConfigRevisionID  sql.NullInt64
-	ConfigProfile     string
-	PresetID          string
-	PresetVersion     int
-	LatestCommit      *ai.CommitSummary
-	PathContext       []ai.PathCommitContext
-	RecentSoftCommits []ai.IntentSoftCommitSummary
-	PriorFindings     []ai.IntentAtomicityFinding
-	Materialize       IntentCandidateMaterializer
-	VerificationMode  string
-	Verify            IntentCandidateVerifier
-	Now               time.Time
-	allowSemanticPlan bool
+	BranchRef           string
+	BranchGeneration    int64
+	Captures            []IntentCandidateCapture
+	Hints               []IntentDependencyHint
+	Planner             interface{ Name() string }
+	Health              *IntentPlannerHealth
+	RetryLimit          int
+	RetryLimitSet       bool
+	Preset              config.PresetName
+	CommitFormat        ai.CommitFormat
+	IncludeDiffs        bool
+	ForcedAging         bool
+	Provider            string
+	Model               string
+	ConfigRevisionID    sql.NullInt64
+	ConfigProfile       string
+	PresetID            string
+	PresetVersion       int
+	LatestCommit        *ai.CommitSummary
+	PathContext         []ai.PathCommitContext
+	RecentSoftCommits   []ai.IntentSoftCommitSummary
+	PriorFindings       []ai.IntentAtomicityFinding
+	Materialize         IntentCandidateMaterializer
+	VerificationMode    string
+	Verify              IntentCandidateVerifier
+	Now                 time.Time
+	TargetEventSeqs     []int64
+	RejectLocalFallback bool
+	allowSemanticPlan   bool
 }
 
 // IntentCandidateDecision is one persisted candidate revision plus its exact
@@ -126,7 +128,7 @@ type IntentCandidateEvaluationResult struct {
 
 // IntentSemanticFallbackRequiredError means the bounded semantic path was
 // exhausted without producing a valid candidate graph. A durable publication
-// drain may respond by switching only its frozen target to event fallback.
+// drain may respond with one local unlock before replanning its frozen target.
 type IntentSemanticFallbackRequiredError struct {
 	Failure string
 }
@@ -226,6 +228,9 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	if len(input.TargetEventSeqs) > 0 {
+		existing = intentCandidatesWithinTarget(existing, input.TargetEventSeqs)
+	}
 	for _, candidate := range existing {
 		result.VisibleCandidateIDs = append(
 			result.VisibleCandidateIDs, candidate.ID)
@@ -285,6 +290,12 @@ func EvaluateIntentCandidates(
 	result.ResolutionMode = planRun.ResolutionMode.String
 	result.PlanFingerprint = planRun.Fingerprint
 	result.NeedsAttention = needsAttention
+	if input.RejectLocalFallback &&
+		(result.Fallback != "" || result.PlannerFailure != "") {
+		return result, &IntentSemanticFallbackRequiredError{
+			Failure: result.PlannerFailure,
+		}
+	}
 	input.allowSemanticPlan = result.ResolutionMode == "provider" ||
 		result.ResolutionMode == "local_repair" ||
 		result.ResolutionMode == "partial_replan"
@@ -306,6 +317,11 @@ func EvaluateIntentCandidates(
 			result.PlannerFailure = ai.SanitizePlannerError(
 				result.PlannerFailure + "; normalized plan: " + semanticFailure)
 		}
+		if input.RejectLocalFallback {
+			return result, &IntentSemanticFallbackRequiredError{
+				Failure: result.PlannerFailure,
+			}
+		}
 		plan = deterministicIntentCandidatePlan(req, false, false)
 		continuations, _, err = continuePersistedIntentCandidates(
 			req, &plan, intentCandidateContinuationOptions{
@@ -326,6 +342,11 @@ func EvaluateIntentCandidates(
 			}
 		}
 		result.Fallback = "deterministic_semantic_rebuild"
+	}
+	plan, continuations, err = advanceTerminalIntentCandidateIDs(
+		ctx, db, input.BranchRef, input.BranchGeneration, plan, continuations)
+	if err != nil {
+		return result, err
 	}
 
 	existingByID := make(map[string]state.IntentCandidate, len(existing))
@@ -408,6 +429,112 @@ func EvaluateIntentCandidates(
 		}
 	}
 	return result, nil
+}
+
+func intentCandidatesWithinTarget(
+	candidates []state.IntentCandidate,
+	targetSeqs []int64,
+) []state.IntentCandidate {
+	target := make(map[int64]struct{}, len(targetSeqs))
+	for _, seq := range targetSeqs {
+		target[seq] = struct{}{}
+	}
+	filtered := make([]state.IntentCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		inside := len(candidate.Events) > 0
+		for _, event := range candidate.Events {
+			if _, ok := target[event.EventSeq]; !ok {
+				inside = false
+				break
+			}
+		}
+		if inside {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
+}
+
+// advanceTerminalIntentCandidateIDs keeps planner-stable IDs restart-safe
+// without allowing a historical terminal candidate to block new work. The
+// first available successor is deterministic, so a crash after saving it will
+// reuse that nonterminal candidate on the next pass.
+func advanceTerminalIntentCandidateIDs(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	plan ai.IntentPlanV2,
+	continuations []intentCandidateContinuation,
+) (ai.IntentPlanV2, []intentCandidateContinuation, error) {
+	replacements := make(map[string]string)
+	for index := range plan.Candidates {
+		assignment := &plan.Candidates[index]
+		baseID := assignment.CandidateID
+		if replacement, ok := replacements[baseID]; ok {
+			assignment.CandidateID = replacement
+			continue
+		}
+		candidate, exists, err := state.IntentCandidateByID(ctx, db, baseID)
+		if err != nil {
+			return plan, continuations, err
+		}
+		if !exists || (candidate.BranchRef == branchRef &&
+			candidate.BranchGeneration == generation &&
+			!terminalIntentCandidateStatus(candidate.Status)) {
+			continue
+		}
+		for attempt := 1; attempt <= state.IntentCandidateMaxOpenPerPair; attempt++ {
+			sum := sha256.Sum256([]byte(fmt.Sprintf(
+				"%s\x00%s\x00%d\x00%v\x00%d",
+				baseID, branchRef, generation, assignment.SelectedSeqs, attempt)))
+			successorID := fmt.Sprintf("intent-successor-%x", sum[:12])
+			successor, found, loadErr := state.IntentCandidateByID(
+				ctx, db, successorID)
+			if loadErr != nil {
+				return plan, continuations, loadErr
+			}
+			if found && (successor.BranchRef != branchRef ||
+				successor.BranchGeneration != generation ||
+				terminalIntentCandidateStatus(successor.Status)) {
+				continue
+			}
+			replacements[baseID] = successorID
+			assignment.CandidateID = successorID
+			break
+		}
+		if assignment.CandidateID == baseID {
+			return plan, continuations, fmt.Errorf(
+				"daemon: intent candidates: exhausted successor IDs for %q", baseID)
+		}
+	}
+	if len(replacements) == 0 {
+		return plan, continuations, nil
+	}
+	for index := range plan.Candidates {
+		for dependencyIndex, dependencyID := range plan.Candidates[index].DependsOnCandidates {
+			if replacement := replacements[dependencyID]; replacement != "" {
+				plan.Candidates[index].DependsOnCandidates[dependencyIndex] = replacement
+			}
+		}
+	}
+	for index := range continuations {
+		if replacement := replacements[continuations[index].TargetID]; replacement != "" {
+			continuations[index].TargetID = replacement
+		}
+		for sourceIndex, sourceID := range continuations[index].SourceIDs {
+			if replacement := replacements[sourceID]; replacement != "" {
+				continuations[index].SourceIDs[sourceIndex] = replacement
+			}
+		}
+	}
+	return plan, continuations, nil
+}
+
+func terminalIntentCandidateStatus(status string) bool {
+	return status == state.IntentCandidatePublished ||
+		status == state.IntentCandidateSuperseded ||
+		status == state.IntentCandidateFailed
 }
 
 // BuildIntentCandidateDependencies creates a bounded graph from immutable
