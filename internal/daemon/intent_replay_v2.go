@@ -115,12 +115,18 @@ func replayIntentCandidateBatch(
 		Hints:         runtimeIntentDependencyHints(captures),
 		Materialize: intentCandidateScratchMaterializer(
 			repoRoot, opts.GitDir, parent),
-		VerificationMode: opts.IntentVerificationMode,
-		Verify:           opts.IntentCandidateVerify,
-		Now:              time.Now().UTC(),
+		VerificationMode:    opts.IntentVerificationMode,
+		Verify:              opts.IntentCandidateVerify,
+		Now:                 time.Now().UTC(),
+		TargetEventSeqs:     cfg.salvageTargetSeqs,
+		RejectLocalFallback: cfg.semanticSalvage,
 	})
-	if err != nil {
+	var semanticFallbackErr *IntentSemanticFallbackRequiredError
+	if err != nil && !errors.As(err, &semanticFallbackErr) {
 		return sum, err
+	}
+	if cfg.atomicFallback {
+		evaluation.ResolutionMode = publicationFallbackLocalUnlock
 	}
 	if counted := attemptCounter.RetryCount(); counted > evaluation.RetryCount {
 		evaluation.RetryCount = counted
@@ -150,6 +156,9 @@ func replayIntentCandidateBatch(
 		ctx, db, windowPlan, items, activeCtx, evaluationStartedTS,
 	); err != nil {
 		return sum, err
+	}
+	if semanticFallbackErr != nil {
+		return sum, semanticFallbackErr
 	}
 	if evaluation.PlannerFailure != "" && evaluation.NeedsAttention {
 		sum.PlannerFailure = evaluation.PlannerFailure
@@ -338,6 +347,105 @@ func recoverIntentCandidateForward(
 	retryCtx := activeCtx
 	retryCtx.BaseHead = currentParent
 	return Replay(ctx, repoRoot, db, retryCtx, opts)
+}
+
+func updateIntentForwardRecoveryAfterReplay(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+	sum ReplaySummary,
+	replayErr error,
+) (ReplaySummary, error) {
+	if replayErr != nil {
+		var exhausted *IntentSemanticFallbackRequiredError
+		if recovery.Stage == publicationFallbackSemanticReplan &&
+			errors.As(replayErr, &exhausted) {
+			if _, err := state.AdvanceIntentForwardRecovery(
+				ctx, db, recovery, publicationFallbackLocalUnlock, 0); err != nil {
+				return sum, errors.Join(replayErr, err)
+			}
+			logIntentForwardRecoveryTransition(
+				recovery, publicationFallbackLocalUnlock)
+			sum.Skipped = true
+			sum.SkippedReason = "intent_forward_recovery_local_unlock"
+			sum.Disposition = ReplayDispositionRecoverableStall
+			sum.DispositionReason = exhausted.Failure
+			sum.HasMore = true
+			return sum, nil
+		}
+		return sum, replayErr
+	}
+	if sum.Published > 0 {
+		if recovery.Stage == publicationFallbackLocalUnlock {
+			if sum.RecoveryMode == publicationFallbackSemanticReplan {
+				if err := state.CompleteIntentForwardRecovery(
+					ctx, db, recovery, sum.Published); err != nil {
+					return sum, err
+				}
+				logIntentForwardRecoveryCompletion(recovery, sum.Published)
+				return sum, nil
+			}
+			nextStage := publicationFallbackSemanticReplan
+			if sum.PlannerCircuitOpen {
+				nextStage = publicationFallbackLocalUnlock
+			}
+			if _, err := state.AdvanceIntentForwardRecovery(
+				ctx, db, recovery, nextStage,
+				sum.Published); err != nil {
+				return sum, err
+			}
+			logIntentForwardRecoveryTransition(recovery, nextStage)
+			sum.HasMore = true
+			return sum, nil
+		}
+		if err := state.CompleteIntentForwardRecovery(
+			ctx, db, recovery, sum.Published); err != nil {
+			return sum, err
+		}
+		logIntentForwardRecoveryCompletion(recovery, sum.Published)
+		return sum, nil
+	}
+	if recovery.Stage == publicationFallbackSemanticReplan {
+		if _, err := state.AdvanceIntentForwardRecovery(
+			ctx, db, recovery, publicationFallbackLocalUnlock, 0); err != nil {
+			return sum, err
+		}
+		logIntentForwardRecoveryTransition(
+			recovery, publicationFallbackLocalUnlock)
+		sum.Skipped = true
+		sum.SkippedReason = "intent_forward_recovery_local_unlock"
+		sum.Disposition = ReplayDispositionRecoverableStall
+		sum.DispositionReason = recovery.Reason
+		sum.HasMore = true
+	}
+	return sum, nil
+}
+
+func logIntentForwardRecoveryTransition(
+	recovery state.IntentForwardRecovery,
+	nextStage string,
+) {
+	if recovery.Stage == nextStage {
+		return
+	}
+	slog.Default().Info("intent forward recovery transition",
+		"candidate_id", recovery.CandidateID,
+		"from_mode", recovery.Stage,
+		"to_mode", nextStage,
+		"unlock_count", recovery.UnlockCount,
+		"reason", recovery.Reason)
+}
+
+func logIntentForwardRecoveryCompletion(
+	recovery state.IntentForwardRecovery,
+	published int,
+) {
+	slog.Default().Info("intent forward recovery completed",
+		"candidate_id", recovery.CandidateID,
+		"mode", recovery.Stage,
+		"published_events", published,
+		"unlock_count", recovery.UnlockCount,
+		"reason", recovery.Reason)
 }
 
 func intentRepairSupportsForwardRecovery(reason string) bool {

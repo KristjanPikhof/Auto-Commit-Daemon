@@ -21,6 +21,12 @@ const publicationDrainRecoveredTargetError = "frozen publication target contains
 const supersededCandidateDrainErrorPrefix = "state: candidate "
 const supersededCandidateDrainErrorSuffix = " is terminal in status superseded"
 
+const (
+	publicationFallbackSemanticReplan = "semantic_replan"
+	publicationFallbackLocalUnlock    = "local_unlock"
+	publicationFallbackLegacyAtomic   = "atomic_dependency_components"
+)
+
 // ActivePublicationDrainForPair returns the one durable drain owned by the
 // active branch generation. Multiple active drains for one pair fail closed.
 func ActivePublicationDrainForPair(
@@ -364,10 +370,9 @@ WHERE branch_ref=? AND branch_generation=? AND phase='completed'
 	return true, nil
 }
 
-// ResumePublicationDrainNormalization records the bounded semantic rebuild as
-// exhausted before replay enters the local atomic fallback. Keeping this as a
-// separate durable transition makes a crash between the two phases resumable
-// without calling the provider again.
+// ResumePublicationDrainNormalization retires the stalled semantic pass at a
+// crash-safe boundary, then gives pending-only Intent planning the first chance
+// to move forward from the current HEAD.
 func ResumePublicationDrainNormalization(
 	ctx context.Context,
 	db *state.DB,
@@ -383,9 +388,22 @@ func ResumePublicationDrainNormalization(
 	}
 	update := PublicationDrainUpdateFrom(drain, nowTS, drain.LastProgressTS)
 	update.Phase = state.PublicationDrainEventFallback
-	update.EventFallbackCount++
-	update.FallbackMode = "atomic_dependency_components"
+	update.FallbackMode = publicationFallbackSemanticReplan
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+}
+
+func publicationDrainSalvageMode(drain state.PublicationDrain) string {
+	if drain.Phase != state.PublicationDrainEventFallback {
+		return ""
+	}
+	switch drain.FallbackMode {
+	case publicationFallbackSemanticReplan:
+		return publicationFallbackSemanticReplan
+	case publicationFallbackLocalUnlock, publicationFallbackLegacyAtomic, "":
+		return publicationFallbackLocalUnlock
+	default:
+		return publicationFallbackLocalUnlock
+	}
 }
 
 // publicationDrainAtomicFallbackPlanner keeps every hard dependency component
@@ -412,9 +430,28 @@ func configureAtomicIntentFallback(cfg *intentReplayConfig) {
 	cfg.atomicFallback = true
 }
 
-// publicationDrainAtomicFallbackWindow returns the complete hard-dependency
-// component containing the first pending event. A component that exceeds the
-// candidate protocol cap fails closed instead of being split across commits.
+func configureIntentSalvage(
+	cfg *intentReplayConfig,
+	health *IntentPlannerHealth,
+	stage string,
+	targetSeqs []int64,
+) {
+	circuit := health.Snapshot()
+	useLocalUnlock := stage == publicationFallbackLocalUnlock
+	if circuit.State == IntentPlannerCircuitOpen {
+		useLocalUnlock = !circuit.RecoveryReady
+	}
+	if useLocalUnlock {
+		configureAtomicIntentFallback(cfg)
+		return
+	}
+	cfg.semanticSalvage = true
+	cfg.salvageTargetSeqs = append([]int64(nil), targetSeqs...)
+}
+
+// publicationDrainAtomicFallbackWindow returns the smallest complete hard
+// dependency component. A singleton is valid when it is the least work needed
+// to give semantic planning a new HEAD and fingerprint.
 func publicationDrainAtomicFallbackWindow(
 	ctx context.Context,
 	db *state.DB,
@@ -467,31 +504,50 @@ func publicationDrainAtomicFallbackWindow(
 		adjacent[dependency.DependentSeq] = append(
 			adjacent[dependency.DependentSeq], dependency.PrerequisiteSeq)
 	}
-	component := map[int64]struct{}{pending[0].Seq: {}}
-	queue := []int64{pending[0].Seq}
-	for len(queue) > 0 {
-		seq := queue[0]
-		queue = queue[1:]
-		for _, neighbor := range adjacent[seq] {
-			if _, seen := component[neighbor]; seen {
-				continue
+	visited := make(map[int64]struct{}, len(pending))
+	var selected map[int64]struct{}
+	selectedFirst := int64(0)
+	for _, event := range pending {
+		if _, seen := visited[event.Seq]; seen {
+			continue
+		}
+		component := map[int64]struct{}{event.Seq: {}}
+		visited[event.Seq] = struct{}{}
+		queue := []int64{event.Seq}
+		first := event.Seq
+		for len(queue) > 0 {
+			seq := queue[0]
+			queue = queue[1:]
+			if seq < first {
+				first = seq
 			}
-			component[neighbor] = struct{}{}
-			if len(component) > ai.IntentCandidateCaptureCap {
-				return nil, fmt.Errorf(
-					"daemon: atomic fallback dependency component exceeds %d captures",
-					ai.IntentCandidateCaptureCap)
+			for _, neighbor := range adjacent[seq] {
+				if _, seen := visited[neighbor]; seen {
+					continue
+				}
+				visited[neighbor] = struct{}{}
+				component[neighbor] = struct{}{}
+				queue = append(queue, neighbor)
 			}
-			queue = append(queue, neighbor)
+		}
+		if selected == nil || len(component) < len(selected) ||
+			(len(component) == len(selected) && first < selectedFirst) {
+			selected = component
+			selectedFirst = first
 		}
 	}
-	window := make([]state.CaptureEvent, 0, len(component))
+	if len(selected) > ai.IntentCandidateCaptureCap {
+		return nil, fmt.Errorf(
+			"daemon: atomic fallback dependency component exceeds %d captures",
+			ai.IntentCandidateCaptureCap)
+	}
+	window := make([]state.CaptureEvent, 0, len(selected))
 	for _, event := range pending {
-		if _, ok := component[event.Seq]; ok {
+		if _, ok := selected[event.Seq]; ok {
 			window = append(window, event)
 		}
 	}
-	return window, nil
+	return topologicalPublicationDrainEvents(window, dependencies)
 }
 
 func (publicationDrainAtomicFallbackPlanner) Name() string {
@@ -551,15 +607,24 @@ func publicationDrainPendingEvents(
 		}
 		filtered = append(filtered, event)
 	}
-	if drain.Phase != state.PublicationDrainEventFallback || len(filtered) < 2 {
-		return filtered, nil
+	return filtered, nil
+}
+
+func intentForwardRecoveryPendingEvents(
+	pending []state.CaptureEvent,
+	targetSeqs []int64,
+) []state.CaptureEvent {
+	target := make(map[int64]struct{}, len(targetSeqs))
+	for _, seq := range targetSeqs {
+		target[seq] = struct{}{}
 	}
-	dependencies, err := state.IntentCaptureDependenciesForPair(
-		ctx, db, drain.BranchRef, drain.BranchGeneration)
-	if err != nil {
-		return nil, fmt.Errorf("daemon: load publication drain dependencies: %w", err)
+	filtered := make([]state.CaptureEvent, 0, len(targetSeqs))
+	for _, event := range pending {
+		if _, ok := target[event.Seq]; ok {
+			filtered = append(filtered, event)
+		}
 	}
-	return topologicalPublicationDrainEvents(filtered, dependencies)
+	return filtered
 }
 
 func topologicalPublicationDrainEvents(
@@ -692,7 +757,7 @@ func UpdatePublicationDrainAfterReplay(
 			} else {
 				update.Phase = state.PublicationDrainEventFallback
 				update.EventFallbackCount++
-				update.FallbackMode = "atomic_dependency_components"
+				update.FallbackMode = publicationFallbackLocalUnlock
 			}
 			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 		}
@@ -708,6 +773,19 @@ func UpdatePublicationDrainAfterReplay(
 			"publication fallback needs attention")
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
+	actualRecoveryMode := summary.RecoveryMode
+	if actualRecoveryMode == "" {
+		actualRecoveryMode = publicationDrainSalvageMode(drain)
+	}
+	if progressed && drain.Phase == state.PublicationDrainEventFallback &&
+		actualRecoveryMode == publicationFallbackLocalUnlock {
+		if summary.PlannerCircuitOpen {
+			update.FallbackMode = publicationFallbackLocalUnlock
+		} else {
+			update.FallbackMode = publicationFallbackSemanticReplan
+		}
+		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	}
 	if !progressed {
 		update.LastError = publicationDrainReplayReason(summary,
 			"publication pass made no progress")
@@ -718,10 +796,15 @@ func UpdatePublicationDrainAfterReplay(
 			update.FallbackMode = "deterministic_semantic"
 		case state.PublicationDrainNormalizing:
 			update.Phase = state.PublicationDrainEventFallback
-			update.EventFallbackCount++
-			update.FallbackMode = "atomic_dependency_components"
+			update.FallbackMode = publicationFallbackSemanticReplan
 		case state.PublicationDrainEventFallback:
-			update.Phase = state.PublicationDrainNeedsAction
+			if publicationDrainSalvageMode(drain) ==
+				publicationFallbackSemanticReplan {
+				update.EventFallbackCount++
+				update.FallbackMode = publicationFallbackLocalUnlock
+			} else {
+				update.Phase = state.PublicationDrainNeedsAction
+			}
 		}
 	}
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)

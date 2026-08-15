@@ -41,6 +41,12 @@ func TestPublicationDrainFrozenTargetOrdersHardDependenciesAndExcludesLaterEdits
 	if err != nil {
 		t.Fatal(err)
 	}
+	filtered, err = publicationDrainAtomicFallbackWindow(ctx, db, CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+	}, filtered)
+	if err != nil {
+		t.Fatal(err)
+	}
 	got := make([]int64, 0, len(filtered))
 	for _, event := range filtered {
 		got = append(got, event.Seq)
@@ -97,6 +103,52 @@ func TestPublicationDrainFinalFallbackExpandsAcrossIntentWindow(t *testing.T) {
 	}
 	if len(window) != 11 {
 		t.Fatalf("atomic fallback window=%d, want complete 11-event component", len(window))
+	}
+}
+
+func TestPublicationDrainLocalUnlockSelectsSmallestHardComponent(t *testing.T) {
+	ctx := context.Background()
+	db, events, _ := openPublicationDrainTestState(t, 3, 3)
+	if err := state.ReplaceIntentCaptureDependencies(ctx, db,
+		"refs/heads/main", 7, []state.IntentCaptureDependency{{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			PrerequisiteSeq: events[0].Seq, DependentSeq: events[1].Seq,
+			Strength: string(ai.IntentDependencyHard), Kind: "test_source",
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	window, err := publicationDrainAtomicFallbackWindow(ctx, db, CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+	}, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(window) != 1 || window[0].Seq != events[2].Seq {
+		t.Fatalf("unlock=%+v, want smallest singleton %d", window, events[2].Seq)
+	}
+}
+
+func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	health := &IntentPlannerHealth{
+		state:   IntentPlannerCircuitOpen,
+		retryAt: now.Add(time.Minute),
+		now:     func() time.Time { return now },
+	}
+	cfg := intentReplayConfig{}
+	configureIntentSalvage(&cfg, health,
+		publicationFallbackSemanticReplan, []int64{1, 2})
+	if !cfg.atomicFallback || cfg.semanticSalvage {
+		t.Fatalf("open circuit config=%+v, want local unlock", cfg)
+	}
+
+	health.retryAt = now
+	cfg = intentReplayConfig{}
+	configureIntentSalvage(&cfg, health,
+		publicationFallbackLocalUnlock, []int64{1, 2})
+	if cfg.atomicFallback || !cfg.semanticSalvage ||
+		!reflect.DeepEqual(cfg.salvageTargetSeqs, []int64{1, 2}) {
+		t.Fatalf("half-open config=%+v, want semantic replan", cfg)
 	}
 }
 
@@ -165,7 +217,7 @@ WHERE candidate_id=?`, candidate.ID); err != nil {
 	}
 }
 
-func TestPublicationDrainFallbackRetiresCandidatesAndSkipsProvider(t *testing.T) {
+func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -190,23 +242,10 @@ func TestPublicationDrainFallbackRetiresCandidatesAndSkipsProvider(t *testing.T)
 	if err != nil || len(pending) != 2 {
 		t.Fatalf("pending=%+v err=%v", pending, err)
 	}
-	candidate := state.IntentCandidate{
-		ID: "persisted-mixed-candidate", BranchRef: f.cctx.BranchRef,
-		BranchGeneration: f.cctx.BranchGeneration,
-		Status:           state.IntentCandidateReady,
-		Readiness:        state.IntentReadinessReady,
-	}
-	for _, event := range pending {
-		candidate.Events = append(candidate.Events, state.IntentCandidateEvent{
-			EventSeq: event.Seq, EventRole: "change",
-		})
-	}
-	if err := state.SaveIntentCandidate(ctx, f.db, candidate); err != nil {
-		t.Fatal(err)
-	}
 	drain := state.PublicationDrain{
 		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
 		Phase: state.PublicationDrainEventFallback, TargetEventCount: 2,
+		FallbackMode: publicationFallbackLocalUnlock,
 	}
 	for _, event := range pending {
 		drain.EventSeqs = append(drain.EventSeqs, event.Seq)
@@ -224,14 +263,13 @@ func TestPublicationDrainFallbackRetiresCandidatesAndSkipsProvider(t *testing.T)
 			first, planner.calls, err)
 	}
 	f.cctx.BaseHead = first.BaseHead
+	drain.FallbackMode = publicationFallbackSemanticReplan
+	semanticPlanner := &recoveringPublicationDrainPlanner{}
+	opts.IntentPlanner = semanticPlanner
 	second, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
-	if err != nil || second.Published != 1 || planner.calls != 0 {
-		t.Fatalf("second fallback=%+v provider_calls=%d err=%v",
-			second, planner.calls, err)
-	}
-	gotCandidate, ok, err := state.IntentCandidateByID(ctx, f.db, candidate.ID)
-	if err != nil || !ok || gotCandidate.Status != state.IntentCandidateSuperseded {
-		t.Fatalf("retired candidate=(%+v ok=%t err=%v)", gotCandidate, ok, err)
+	if err != nil || second.Published != 1 || semanticPlanner.calls != 1 {
+		t.Fatalf("semantic replan=%+v provider_calls=%d err=%v",
+			second, semanticPlanner.calls, err)
 	}
 	for path, contents := range want {
 		got, err := os.ReadFile(filepath.Join(f.dir, path))
@@ -245,8 +283,75 @@ func TestPublicationDrainFallbackRetiresCandidatesAndSkipsProvider(t *testing.T)
 	}
 }
 
+func TestPublicationDrainLocalUnlockRetiresOnlyOverlappingCandidates(t *testing.T) {
+	ctx := context.Background()
+	db, events, drain := openPublicationDrainTestState(t, 2, 2)
+	for index, id := range []string{"overlap", "unrelated"} {
+		candidate := state.IntentCandidate{
+			ID: id, BranchRef: drain.BranchRef,
+			BranchGeneration: drain.BranchGeneration,
+			Status:           state.IntentCandidateReady, Readiness: state.IntentReadinessReady,
+			Events: []state.IntentCandidateEvent{{
+				EventSeq: events[index].Seq, EventRole: "change",
+			}},
+		}
+		if err := state.SaveIntentCandidate(ctx, db, candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := retireIntentCandidatesForFallbackEvents(ctx, db, CaptureContext{
+		BranchRef: drain.BranchRef, BranchGeneration: drain.BranchGeneration,
+	}, []state.CaptureEvent{events[0]}); err != nil {
+		t.Fatal(err)
+	}
+	overlap, _, err := state.IntentCandidateByID(ctx, db, "overlap")
+	if err != nil || overlap.Status != state.IntentCandidateSuperseded {
+		t.Fatalf("overlap=(%+v,%v)", overlap, err)
+	}
+	unrelated, _, err := state.IntentCandidateByID(ctx, db, "unrelated")
+	if err != nil || unrelated.Status != state.IntentCandidateReady {
+		t.Fatalf("unrelated=(%+v,%v)", unrelated, err)
+	}
+}
+
 type forbiddenPublicationDrainPlanner struct {
 	calls int
+}
+
+type recoveringPublicationDrainPlanner struct {
+	calls int
+}
+
+func (*recoveringPublicationDrainPlanner) Name() string {
+	return "recovering-publication-drain-provider"
+}
+
+func (p *recoveringPublicationDrainPlanner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	p.calls++
+	return ai.IntentPlan{}, errors.New("expected Intent v2 planning")
+}
+
+func (p *recoveringPublicationDrainPlanner) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	p.calls++
+	selected := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		selected = append(selected, capture.Seq)
+	}
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "semantic-after-unlock", SelectedSeqs: selected,
+			Purpose: "finish the remaining intent", Readiness: ai.IntentCandidateReady,
+			Subject:        "Finish remaining intent",
+			GroupingReason: "the remaining changes share one purpose",
+		}},
+	}, nil
 }
 
 func (*forbiddenPublicationDrainPlanner) Name() string {
@@ -308,8 +413,18 @@ func TestPublicationDrainRestartEscalatesOnceAndCompletesIdempotently(
 	}
 	if fallback.Phase != state.PublicationDrainEventFallback ||
 		fallback.SemanticRebuildAttempts != 1 ||
-		fallback.EventFallbackCount != 1 {
+		fallback.EventFallbackCount != 0 ||
+		fallback.FallbackMode != publicationFallbackSemanticReplan {
 		t.Fatalf("fallback=%+v", fallback)
+	}
+	unlock, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, fallback, ReplaySummary{
+			Disposition:       ReplayDispositionRecoverableStall,
+			DispositionReason: "provider plan remained invalid",
+		}, nil, time.Unix(13, 0).UTC())
+	if err != nil || unlock.FallbackMode != publicationFallbackLocalUnlock ||
+		unlock.EventFallbackCount != 1 {
+		t.Fatalf("unlock=(%+v,%v)", unlock, err)
 	}
 
 	if _, err := db.SQL().ExecContext(ctx, `
@@ -318,10 +433,11 @@ WHERE seq=?`, events[0].Seq); err != nil {
 		t.Fatal(err)
 	}
 	progress, err := UpdatePublicationDrainAfterReplay(
-		ctx, db, fallback, ReplaySummary{Published: 1}, nil,
+		ctx, db, unlock, ReplaySummary{Published: 1}, nil,
 		time.Unix(14, 0).UTC())
 	if err != nil || progress.PublishedEventCount != 1 ||
-		progress.Phase != state.PublicationDrainEventFallback {
+		progress.Phase != state.PublicationDrainEventFallback ||
+		progress.FallbackMode != publicationFallbackSemanticReplan {
 		t.Fatalf("progress=(%+v,%v)", progress, err)
 	}
 	if _, err := db.SQL().ExecContext(ctx, `
@@ -339,6 +455,32 @@ WHERE seq=?`, events[1].Seq); err != nil {
 	if active, err := ActivePublicationDrainForPair(
 		ctx, db, "refs/heads/main", 7); err != nil || active != nil {
 		t.Fatalf("active after completion=(%+v,%v)", active, err)
+	}
+}
+
+func TestPublicationDrainOpenCircuitKeepsLocalUnlockMode(t *testing.T) {
+	ctx := context.Background()
+	db, events, drain := openPublicationDrainTestState(t, 2, 2)
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainEventFallback
+	update.FallbackMode = publicationFallbackLocalUnlock
+	drain, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state='published',commit_oid='unlock',published_ts=12
+WHERE seq=?`, events[0].Seq); err != nil {
+		t.Fatal(err)
+	}
+	continued, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, ReplaySummary{
+			Published: 1, RecoveryMode: publicationFallbackLocalUnlock,
+			PlannerCircuitOpen: true,
+		}, nil, time.Unix(12, 0).UTC())
+	if err != nil || continued.FallbackMode != publicationFallbackLocalUnlock ||
+		continued.EventFallbackCount != drain.EventFallbackCount {
+		t.Fatalf("continued local unlock=(%+v,%v)", continued, err)
 	}
 }
 

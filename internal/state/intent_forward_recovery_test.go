@@ -2,6 +2,8 @@ package state
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -11,6 +13,7 @@ func TestForwardRecoverIntentCandidatePreservesPublishedState(t *testing.T) {
 	ctx := context.Background()
 	published := appendIntentV2Event(t, db, "refs/heads/main", 9, "feature.go")
 	pending := appendIntentV2Event(t, db, "refs/heads/main", 9, "feature_test.go")
+	linked := appendIntentV2Event(t, db, "refs/heads/main", 9, "fixture.txt")
 	if _, err := db.SQL().ExecContext(ctx, `
 UPDATE capture_events
 SET state='published',commit_oid='published-head',published_ts=1
@@ -26,6 +29,14 @@ WHERE seq=?`, published); err != nil {
 		},
 	}
 	if err := SaveIntentCandidate(ctx, db, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceIntentCaptureDependencies(ctx, db,
+		"refs/heads/main", 9, []IntentCaptureDependency{{
+			BranchRef: "refs/heads/main", BranchGeneration: 9,
+			PrerequisiteSeq: pending, DependentSeq: linked,
+			Strength: "hard", Kind: "fixture",
+		}}); err != nil {
 		t.Fatal(err)
 	}
 	recovery := IntentForwardRecovery{
@@ -47,6 +58,7 @@ WHERE seq=?`, published); err != nil {
 	for seq, want := range map[int64]string{
 		published: EventStatePublished,
 		pending:   EventStatePending,
+		linked:    EventStatePending,
 	} {
 		var eventState string
 		if err := db.ReadSQL().QueryRowContext(ctx,
@@ -67,6 +79,22 @@ WHERE seq=?`, published); err != nil {
 	if err != nil || !active || marker.CandidateID != candidate.ID {
 		t.Fatalf("forward marker=(%+v active=%t err=%v)", marker, active, err)
 	}
+	if marker.Stage != "semantic_replan" ||
+		!reflect.DeepEqual(marker.TargetEventSeqs, []int64{pending, linked}) {
+		t.Fatalf("forward marker=%+v, want frozen dependency target [%d %d]",
+			marker, pending, linked)
+	}
+	marker, err = AdvanceIntentForwardRecovery(
+		ctx, db, marker, "local_unlock", 0)
+	if err != nil || marker.Stage != "local_unlock" || marker.UnlockCount != 0 {
+		t.Fatalf("local unlock marker=(%+v,%v)", marker, err)
+	}
+	marker, err = AdvanceIntentForwardRecovery(
+		ctx, db, marker, "semantic_replan", 1)
+	if err != nil || marker.Stage != "semantic_replan" ||
+		marker.UnlockCount != 1 || marker.LastProgressTS <= 0 {
+		t.Fatalf("semantic marker=(%+v,%v)", marker, err)
+	}
 	if err := CompleteIntentForwardRecovery(ctx, db, marker, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +102,30 @@ WHERE seq=?`, published); err != nil {
 		ctx, db, recovery.BranchRef, recovery.BranchGeneration,
 	); err != nil || active {
 		t.Fatalf("marker after completion active=%t err=%v", active, err)
+	}
+}
+
+func TestIntentForwardRecoveryOldMarkerDefaultsToSemanticReplan(t *testing.T) {
+	t.Parallel()
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	legacy := IntentForwardRecovery{
+		BranchRef: "refs/heads/main", BranchGeneration: 3,
+		CandidateID: "legacy", Reason: "repair_horizon_expired",
+	}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,1)`,
+		intentForwardRecoveryMetaKey, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	got, active, err := IntentForwardRecoveryForPair(
+		ctx, db, legacy.BranchRef, legacy.BranchGeneration)
+	if err != nil || !active || got.Stage != "semantic_replan" {
+		t.Fatalf("legacy marker=(%+v active=%t err=%v)", got, active, err)
 	}
 }
 

@@ -119,19 +119,38 @@ INSERT INTO capture_events(
 	fallback, err := daemon.ResumePublicationDrainNormalization(
 		ctx, db, normalized, time.Unix(6, 0).UTC())
 	if err != nil || fallback.Phase != state.PublicationDrainEventFallback ||
-		fallback.EventFallbackCount != 1 {
+		fallback.EventFallbackCount != 0 || fallback.FallbackMode != "semantic_replan" {
 		t.Fatalf("fallback=(%+v,%v)", fallback, err)
 	}
-	for i, seq := range targetSeqs {
-		if _, err := db.SQL().ExecContext(ctx, `
-UPDATE capture_events SET state='published',commit_oid=?,published_ts=? WHERE seq=?`,
-			"commit-"+string(rune('1'+i)), 7+i, seq); err != nil {
-			t.Fatal(err)
-		}
+	unlock, err := daemon.UpdatePublicationDrainAfterReplay(
+		ctx, db, fallback, daemon.ReplaySummary{
+			Disposition: daemon.ReplayDispositionRecoverableStall,
+		}, nil, time.Unix(7, 0).UTC())
+	if err != nil || unlock.FallbackMode != "local_unlock" ||
+		unlock.EventFallbackCount != 1 {
+		t.Fatalf("unlock=(%+v,%v)", unlock, err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state='published',commit_oid='commit-1',published_ts=8
+WHERE seq=?`, targetSeqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	replanned, err := daemon.UpdatePublicationDrainAfterReplay(
+		ctx, db, unlock, daemon.ReplaySummary{
+			Published: 1, RecoveryMode: "local_unlock",
+		}, nil, time.Unix(8, 0).UTC())
+	if err != nil || replanned.FallbackMode != "semantic_replan" ||
+		replanned.PublishedEventCount != 1 {
+		t.Fatalf("replanned=(%+v,%v)", replanned, err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state='published',commit_oid='commit-2',published_ts=9
+WHERE seq=?`, targetSeqs[1]); err != nil {
+		t.Fatal(err)
 	}
 	completed, err := daemon.UpdatePublicationDrainAfterReplay(
-		ctx, db, fallback, daemon.ReplaySummary{Published: 2}, nil,
-		time.Unix(8, 0).UTC())
+		ctx, db, replanned, daemon.ReplaySummary{Published: 1}, nil,
+		time.Unix(9, 0).UTC())
 	if err != nil || completed.Phase != state.PublicationDrainCompleted ||
 		completed.PublishedEventCount != 2 {
 		t.Fatalf("completed=(%+v,%v)", completed, err)

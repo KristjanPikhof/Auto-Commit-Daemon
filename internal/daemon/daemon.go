@@ -2560,7 +2560,9 @@ func Run(ctx context.Context, opts Options) error {
 				} else if recoveredDrain != nil {
 					activeDrain = recoveredDrain
 					logPublicationDrainTransition(
-						logger, state.PublicationDrainNeedsAction, *recoveredDrain)
+						logger, state.PublicationDrain{
+							Phase: state.PublicationDrainNeedsAction,
+						}, *recoveredDrain)
 				}
 			}
 			setupValidation, validationPending, validationErr :=
@@ -2622,7 +2624,7 @@ func Run(ctx context.Context, opts Options) error {
 				}
 				if repErr == nil && activeDrain != nil &&
 					activeDrain.Phase == state.PublicationDrainNormalizing {
-					previousPhase := activeDrain.Phase
+					previousDrain := *activeDrain
 					resumedDrain, resumeErr := ResumePublicationDrainNormalization(
 						passCtx, opts.DB, *activeDrain, time.Now().UTC())
 					if resumeErr != nil {
@@ -2630,7 +2632,7 @@ func Run(ctx context.Context, opts Options) error {
 					} else {
 						activeDrain = &resumedDrain
 						logPublicationDrainTransition(
-							logger, previousPhase, resumedDrain)
+							logger, previousDrain, resumedDrain)
 					}
 				}
 				if repErr == nil && (activeDrain == nil ||
@@ -2678,7 +2680,7 @@ func Run(ctx context.Context, opts Options) error {
 							repErr = errors.Join(repErr, updateErr)
 						} else {
 							logPublicationDrainTransition(
-								logger, activeDrain.Phase, updatedDrain)
+								logger, *activeDrain, updatedDrain)
 							if updatedDrain.Phase != state.PublicationDrainCompleted &&
 								updatedDrain.Phase != state.PublicationDrainNeedsAction {
 								repErr = nil
@@ -2947,16 +2949,19 @@ func newDaemonLogger(logger *slog.Logger, opts Options) (*slog.Logger, *daemonLo
 
 func logPublicationDrainTransition(
 	logger *slog.Logger,
-	fromPhase string,
+	from state.PublicationDrain,
 	drain state.PublicationDrain,
 ) {
-	if logger == nil || drain.Phase == fromPhase {
+	if logger == nil || (drain.Phase == from.Phase &&
+		drain.FallbackMode == from.FallbackMode) {
 		return
 	}
 	logger.Info("publication drain recovery transition",
 		"drain_id", drain.ID,
-		"from_phase", fromPhase,
+		"from_phase", from.Phase,
 		"to_phase", drain.Phase,
+		"from_mode", from.FallbackMode,
+		"to_mode", drain.FallbackMode,
 		"resolved_events", drain.PublishedEventCount,
 		"target_events", drain.TargetEventCount,
 		"reason", drain.LastError)

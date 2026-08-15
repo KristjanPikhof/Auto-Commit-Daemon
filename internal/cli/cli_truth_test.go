@@ -130,20 +130,23 @@ func TestControlTruthStateMatrix(t *testing.T) {
 
 func TestOperationalStatePublicationDrainSelfHealMatrix(t *testing.T) {
 	for _, tc := range []struct {
-		phase string
-		want  string
+		phase        string
+		fallbackMode string
+		want         string
 	}{
-		{state.PublicationDrainCheckpointing, "self_healing"},
-		{state.PublicationDrainSemantic, "planning"},
-		{state.PublicationDrainNormalizing, "self_healing"},
-		{state.PublicationDrainEventFallback, "event_fallback"},
-		{state.PublicationDrainNeedsAction, "needs_attention"},
-		{state.PublicationDrainCompleted, "healthy_idle"},
+		{state.PublicationDrainCheckpointing, "", "self_healing"},
+		{state.PublicationDrainSemantic, "", "planning"},
+		{state.PublicationDrainNormalizing, "", "self_healing"},
+		{state.PublicationDrainEventFallback, "", "event_fallback"},
+		{state.PublicationDrainEventFallback, "semantic_replan", "planning"},
+		{state.PublicationDrainNeedsAction, "", "needs_attention"},
+		{state.PublicationDrainCompleted, "", "healthy_idle"},
 	} {
 		report := statusReport{
 			Daemon: "running", PID: os.Getpid(),
 			PublicationDrain: publicationDrainReport{
 				Available: true, ID: "drain", Phase: tc.phase,
+				FallbackMode: tc.fallbackMode,
 			},
 		}
 		if got := statusOperationalState(report); got != tc.want {

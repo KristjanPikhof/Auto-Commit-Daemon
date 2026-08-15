@@ -534,6 +534,34 @@ func TestIntentCandidateEngineBoundedFallbackAfterOneCorrection(t *testing.T) {
 	}
 }
 
+func TestIntentCandidateSemanticReplanDoesNotPersistLocalFallback(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "internal/a.go", "create", "", "a")
+	planner := &selfDependentIntentCandidatePlannerStub{}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		RetryLimit: 2, RetryLimitSet: true, Preset: config.PresetBalanced,
+		VerificationMode: "structural", RejectLocalFallback: true,
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	})
+	var fallbackErr *IntentSemanticFallbackRequiredError
+	if !errors.As(err, &fallbackErr) || planner.calls != 2 ||
+		result.Fallback != "evidence_partition" || len(result.Decisions) != 0 {
+		t.Fatalf("semantic fallback calls=%d result=%+v err=%v",
+			planner.calls, result, err)
+	}
+	candidates, loadErr := state.IntentCandidatesForPair(
+		ctx, db, "refs/heads/main", 1, state.IntentCandidateMaxOpenPerPair)
+	if loadErr != nil || len(candidates) != 0 {
+		t.Fatalf("persisted fallback candidates=%+v err=%v", candidates, loadErr)
+	}
+}
+
 func TestIntentCandidateEngineStopsRepeatedInvalidPlanEarly(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)

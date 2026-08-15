@@ -65,33 +65,35 @@ type IntentCandidateVerifier func(
 // IntentCandidateEvaluation describes one durable planner evaluation. It does
 // not publish commits or mutate Git refs; P8 consumes the publishable decisions.
 type IntentCandidateEvaluation struct {
-	BranchRef         string
-	BranchGeneration  int64
-	Captures          []IntentCandidateCapture
-	Hints             []IntentDependencyHint
-	Planner           interface{ Name() string }
-	Health            *IntentPlannerHealth
-	RetryLimit        int
-	RetryLimitSet     bool
-	Preset            config.PresetName
-	CommitFormat      ai.CommitFormat
-	IncludeDiffs      bool
-	ForcedAging       bool
-	Provider          string
-	Model             string
-	ConfigRevisionID  sql.NullInt64
-	ConfigProfile     string
-	PresetID          string
-	PresetVersion     int
-	LatestCommit      *ai.CommitSummary
-	PathContext       []ai.PathCommitContext
-	RecentSoftCommits []ai.IntentSoftCommitSummary
-	PriorFindings     []ai.IntentAtomicityFinding
-	Materialize       IntentCandidateMaterializer
-	VerificationMode  string
-	Verify            IntentCandidateVerifier
-	Now               time.Time
-	allowSemanticPlan bool
+	BranchRef           string
+	BranchGeneration    int64
+	Captures            []IntentCandidateCapture
+	Hints               []IntentDependencyHint
+	Planner             interface{ Name() string }
+	Health              *IntentPlannerHealth
+	RetryLimit          int
+	RetryLimitSet       bool
+	Preset              config.PresetName
+	CommitFormat        ai.CommitFormat
+	IncludeDiffs        bool
+	ForcedAging         bool
+	Provider            string
+	Model               string
+	ConfigRevisionID    sql.NullInt64
+	ConfigProfile       string
+	PresetID            string
+	PresetVersion       int
+	LatestCommit        *ai.CommitSummary
+	PathContext         []ai.PathCommitContext
+	RecentSoftCommits   []ai.IntentSoftCommitSummary
+	PriorFindings       []ai.IntentAtomicityFinding
+	Materialize         IntentCandidateMaterializer
+	VerificationMode    string
+	Verify              IntentCandidateVerifier
+	Now                 time.Time
+	TargetEventSeqs     []int64
+	RejectLocalFallback bool
+	allowSemanticPlan   bool
 }
 
 // IntentCandidateDecision is one persisted candidate revision plus its exact
@@ -126,7 +128,7 @@ type IntentCandidateEvaluationResult struct {
 
 // IntentSemanticFallbackRequiredError means the bounded semantic path was
 // exhausted without producing a valid candidate graph. A durable publication
-// drain may respond by switching only its frozen target to event fallback.
+// drain may respond with one local unlock before replanning its frozen target.
 type IntentSemanticFallbackRequiredError struct {
 	Failure string
 }
@@ -226,6 +228,9 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	if len(input.TargetEventSeqs) > 0 {
+		existing = intentCandidatesWithinTarget(existing, input.TargetEventSeqs)
+	}
 	for _, candidate := range existing {
 		result.VisibleCandidateIDs = append(
 			result.VisibleCandidateIDs, candidate.ID)
@@ -285,6 +290,12 @@ func EvaluateIntentCandidates(
 	result.ResolutionMode = planRun.ResolutionMode.String
 	result.PlanFingerprint = planRun.Fingerprint
 	result.NeedsAttention = needsAttention
+	if input.RejectLocalFallback &&
+		(result.Fallback != "" || result.PlannerFailure != "") {
+		return result, &IntentSemanticFallbackRequiredError{
+			Failure: result.PlannerFailure,
+		}
+	}
 	input.allowSemanticPlan = result.ResolutionMode == "provider" ||
 		result.ResolutionMode == "local_repair" ||
 		result.ResolutionMode == "partial_replan"
@@ -305,6 +316,11 @@ func EvaluateIntentCandidates(
 		} else {
 			result.PlannerFailure = ai.SanitizePlannerError(
 				result.PlannerFailure + "; normalized plan: " + semanticFailure)
+		}
+		if input.RejectLocalFallback {
+			return result, &IntentSemanticFallbackRequiredError{
+				Failure: result.PlannerFailure,
+			}
 		}
 		plan = deterministicIntentCandidatePlan(req, false, false)
 		continuations, _, err = continuePersistedIntentCandidates(
@@ -413,6 +429,30 @@ func EvaluateIntentCandidates(
 		}
 	}
 	return result, nil
+}
+
+func intentCandidatesWithinTarget(
+	candidates []state.IntentCandidate,
+	targetSeqs []int64,
+) []state.IntentCandidate {
+	target := make(map[int64]struct{}, len(targetSeqs))
+	for _, seq := range targetSeqs {
+		target[seq] = struct{}{}
+	}
+	filtered := make([]state.IntentCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		inside := len(candidate.Events) > 0
+		for _, event := range candidate.Events {
+			if _, ok := target[event.EventSeq]; !ok {
+				inside = false
+				break
+			}
+		}
+		if inside {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
 }
 
 // advanceTerminalIntentCandidateIDs keeps planner-stable IDs restart-safe

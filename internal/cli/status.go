@@ -493,6 +493,9 @@ func statusOperationalState(report statusReport) string {
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
 		return "needs_attention"
+	case report.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
+		report.PublicationDrain.FallbackMode == "semantic_replan":
+		return "planning"
 	case report.PublicationDrain.Phase == state.PublicationDrainEventFallback:
 		return "event_fallback"
 	case report.PublicationDrain.Phase == state.PublicationDrainNormalizing ||

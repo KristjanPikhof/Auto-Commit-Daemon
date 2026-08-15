@@ -55,9 +55,9 @@ edges. It keeps groups that are valid and have complete hard-dependency
 closure, then sends only unresolved captures back for correction. Repeated
 membership with the same findings stops the retry loop early.
 
-If remote planning still cannot produce a valid plan, every preset builds an
-evidence-based partition. Hard path, object, and rename relationships are
-kept together. Source/test, migration/test, exact references, generated
+Outside an active recovery, a bounded provider failure can still use the
+normal evidence-based partition. Hard path, object, and rename relationships
+stay together. Source/test, migration/test, exact references, generated
 artifacts, persisted membership, and corroborated symbol or hunk evidence may
 join components. Time or directory proximity alone never joins them. The
 result passes the same materialization, verification, exact-ref CAS, and
@@ -75,19 +75,35 @@ worker replacement, and daemon restart, and resumes from its durable phase.
 
 If a semantic pass repeats the same recoverable state, ACD stops rebuilding
 that plan. This applies even when more events remain outside the current
-planning window. The worker first records a restart-safe normalization step,
-then publishes one local hard-dependency component per pass. These components
-come from pending events only, use deterministic commit messages, and pass the
-normal materialization, verification, publication journal, exact-ref CAS, and
-index reconciliation checks. No remote provider is called during this
-fallback.
+planning window. The worker records a restart-safe normalization step, retires
+only mixed or overlapping candidate membership, and replans the frozen pending
+target from the current `HEAD`.
+
+Recovery then alternates between two bounded modes:
+
+1. `semantic_replan` offers only unresolved target events to the configured
+   provider. Published events satisfy dependencies and appear only as recent
+   history.
+2. If that plan stalls, `local_unlock` publishes the smallest safe hard
+   dependency component. A singleton is allowed. The next pass returns to
+   `semantic_replan` with a new `HEAD`, remaining target, and fingerprint.
+
+A local unlock uses a deterministic message but still passes materialization,
+verification, the publication journal, exact-ref CAS, and index reconciliation.
+It never calls the remote provider. If the provider circuit is open, ACD keeps
+publishing one local component per pass and resumes semantic planning at the
+next allowed half-open probe. Later captures remain outside the frozen recovery
+target.
 
 History repair remains a bounded optimization. If its time horizon has expired
 or the published suffix is no longer safe to rewrite, ACD retires the blocking
 candidate and moves forward from the current `HEAD`. Published commits remain
-unchanged. Only pending memberships return to local grouping, and the durable
-recovery decision lets a restarted worker continue without reconstructing the
-old candidate.
+unchanged. The durable recovery marker freezes the affected pending dependency
+component and records whether the next pass is `semantic_replan` or
+`local_unlock`. A restarted worker continues from that stage without
+reconstructing the old candidate. Existing markers without a stage begin with
+semantic replanning, and the older `atomic_dependency_components` drain mode
+performs one local unlock before returning to semantic planning.
 
 Automatic recovery does not weaken publication safety. A branch or `HEAD`
 transition, detached `HEAD`, manual pause, or active Git operation waits for
