@@ -116,8 +116,12 @@ func runGC(ctx context.Context, out io.Writer, jsonOut bool) error {
 // gcReason inspects a repo record and returns (reason, true) when it is a
 // pruning candidate. Order: repo dir > state.db > dead daemon.
 func gcReason(ctx context.Context, rec central.RepoRecord, now time.Time) (string, bool) {
-	if !fileExists(rec.Path) {
-		return "repo-missing", true
+	missing, err := central.AssessMissingRepo(ctx, rec)
+	if err == nil && missing.Missing {
+		return missing.Reason, missing.SafeToRemove
+	}
+	if err != nil {
+		return "", false
 	}
 	if !fileExists(rec.StateDB) {
 		return "state-db-missing", true

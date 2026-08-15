@@ -70,6 +70,10 @@
 - Recovery now resumes blocked publication drains and follows recaptured events
   across rewritten bases. Repeated transitions that already reached their
   recorded result are accepted only after the existing proof checks pass.
+- The supervisor now removes deleted worktrees only after proving that their
+  ACD state has no unresolved protected work. Unsafe stale registrations are
+  disabled instead of restarting missing workers, and manual registry cleanup
+  uses the same proof.
 
 ## v2026-08-07
 
