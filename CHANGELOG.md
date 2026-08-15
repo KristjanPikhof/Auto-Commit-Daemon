@@ -70,6 +70,10 @@
 - Recovery now resumes blocked publication drains and follows recaptured events
   across rewritten bases. Repeated transitions that already reached their
   recorded result are accepted only after the existing proof checks pass.
+- `acd history rewrite` now trusts the disabled repository lifecycle and the
+  canonical writer lock instead of stale daemon modes or reused PIDs. Apply
+  holds exclusive ownership through Git and state reconciliation, then repairs
+  stale running metadata only after proving that ACD is off.
 
 ## v2026-08-07
 
