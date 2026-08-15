@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
@@ -443,6 +444,13 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	if err != nil {
 		return err
 	}
+	rewriteLock, err := acquireRewriteApplyOwnership(ctx, repo, opts.dryRun)
+	if err != nil {
+		return err
+	}
+	if rewriteLock != nil {
+		defer func() { _ = rewriteLock.Release() }()
+	}
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("acd history rewrite: open state db: %w", err)
@@ -450,8 +458,18 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	defer db.Close()
 	if daemonState, _, err := state.LoadDaemonState(ctx, db); err != nil {
 		return fmt.Errorf("acd history rewrite: inspect daemon state: %w", err)
-	} else if daemonState.Mode != "" && daemonState.Mode != "stopped" {
-		return fmt.Errorf("acd history rewrite: ACD must be off before applying this plan (current state: %s); run `acd off`, then try again", daemonState.Mode)
+	} else if !opts.dryRun && daemonState.Mode != "" &&
+		daemonState.Mode != "stopped" {
+		if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+			Mode: "stopped",
+			Note: sql.NullString{
+				String: "history rewrite proved exclusive ownership",
+				Valid:  true,
+			},
+		}); err != nil {
+			return fmt.Errorf(
+				"acd history rewrite: repair stale daemon state: %w", err)
+		}
 	}
 	if !opts.dryRun {
 		pending, err := state.CountAllPendingCaptureEvents(ctx, db)
@@ -524,6 +542,49 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 	fmt.Fprintln(out, "Status: Git history and ACD's records now agree.")
 	fmt.Fprintln(out, "Next: No action is needed. Keep the recovery backup until you have checked the rewritten history.")
 	return nil
+}
+
+func acquireRewriteApplyOwnership(
+	ctx context.Context,
+	repo string,
+	dryRun bool,
+) (*daemon.DaemonLock, error) {
+	lookup, err := loadControlRepo(ctx, repo)
+	if err != nil {
+		return nil, fmt.Errorf("acd history rewrite: inspect ACD lifecycle: %w", err)
+	}
+	if lookup.Registered && !lookup.Record.LifecycleDisabled() {
+		return nil, errors.New(
+			"acd history rewrite: ACD must be off before applying this plan " +
+				"(current state: enabled); run `acd off`, then try again")
+	}
+	if dryRun {
+		return nil, nil
+	}
+	lock, err := daemon.AcquireDaemonLock(lookup.Worktree.GitDir)
+	if err != nil {
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return nil, errors.New(
+				"acd history rewrite: ACD must be off before applying this plan " +
+					"(a repository worker still owns the writer lock); " +
+					"run `acd off`, then try again")
+		}
+		return nil, fmt.Errorf(
+			"acd history rewrite: acquire exclusive repository ownership: %w", err)
+	}
+	confirmed, confirmErr := loadControlRepo(ctx, repo)
+	if confirmErr != nil {
+		_ = lock.Release()
+		return nil, fmt.Errorf(
+			"acd history rewrite: recheck ACD lifecycle: %w", confirmErr)
+	}
+	if confirmed.Registered && !confirmed.Record.LifecycleDisabled() {
+		_ = lock.Release()
+		return nil, errors.New(
+			"acd history rewrite: ACD became enabled while preparing the rewrite; " +
+				"run `acd off`, then try again")
+	}
+	return lock, nil
 }
 
 func showSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag, ref string, jsonOut bool) error {

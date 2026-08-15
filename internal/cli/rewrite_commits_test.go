@@ -16,6 +16,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -600,6 +601,104 @@ func TestRewriteCommitsApplyPlanRequiresConfirmationButBypassesProviderGate(t *t
 	}
 	if got := out.String(); !strings.Contains(got, "No new AI request was made") {
 		t.Fatalf("apply-plan output missing no-AI-call note: %q", got)
+	}
+}
+
+func TestRewriteApplyHealsStaleRunningStateWhenOff(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	head := mustRevParse(t, ctx, repo, "HEAD")
+	dbPath, err := rewriteStateDBPath(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		result := registry.DisableRepo(central.RepoRemovalTarget{Path: repo}, 10)
+		if result.NotFound || !result.Record.LifecycleDisabled() {
+			t.Fatalf("disable result=%+v", result)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(t.TempDir(), "rewrite.json")
+	writeRewritePlanTestFile(t, planPath, state.RewritePlan{
+		BranchRef: "refs/heads/main", ExpectedHead: head,
+		ValidationStatus: state.RewritePlanValidationValid,
+		Commits: []state.RewritePlanCommit{{
+			OldOID: head, OriginalMessage: "seed",
+			ProposedMessage: "Rewrite stale state safely",
+		}},
+	})
+
+	var out bytes.Buffer
+	if err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{
+		applyPlan: planPath, yes: true,
+	}, false); err != nil {
+		t.Fatalf("apply with stale running row: %v\n%s", err, out.String())
+	}
+	db, err = state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	daemonState, _, err := state.LoadDaemonState(ctx, db)
+	if err != nil || daemonState.Mode != "stopped" || daemonState.PID != 0 {
+		t.Fatalf("daemon state=%+v err=%v", daemonState, err)
+	}
+}
+
+func TestRewriteApplyRefusesEnabledLifecycleWithoutWriter(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := rewriteSelectionTestRepo(t)
+	dbPath, err := rewriteStateDBPath(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+
+	lock, err := acquireRewriteApplyOwnership(context.Background(), repo, false)
+	if lock != nil {
+		_ = lock.Release()
+	}
+	if err == nil || !strings.Contains(err.Error(), "current state: enabled") {
+		t.Fatalf("enabled lifecycle error=%v", err)
+	}
+}
+
+func TestRewriteApplyRefusesCanonicalWriterLock(t *testing.T) {
+	withIsolatedHome(t)
+	repo := rewriteSelectionTestRepo(t)
+	worktree, err := git.ResolveWorktree(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := daemon.AcquireDaemonLock(worktree.GitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Release()
+
+	lock, err := acquireRewriteApplyOwnership(context.Background(), repo, false)
+	if lock != nil {
+		_ = lock.Release()
+	}
+	if err == nil || !strings.Contains(err.Error(), "writer lock") {
+		t.Fatalf("writer ownership error=%v", err)
 	}
 }
 
