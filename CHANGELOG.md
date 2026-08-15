@@ -27,6 +27,19 @@
 
 ### Changed
 
+- `acd list` is again the compact live dashboard for protection health and
+  commit progress. It keeps repositories that need action or are working on
+  screen, fills the five-row default view with recent activity, and uses paused
+  repositories only when space remains. `SAFE`, `DRAIN`, `LEFT`, and `STATUS`
+  replace the registration-oriented table; `--all` shows every enabled
+  repository and `--verbose` adds operational details. `acd repo list` remains
+  the static maintenance inventory.
+- Dashboard collection now reads the registry and supervisor once per frame,
+  then reads repository databases concurrently with strict time limits and no
+  Git scans or migrations. Slow repositories cannot hold up the full view, and
+  refresh timing starts after each completed frame. JSON output remains
+  exhaustive and adds worker, operational, blocker, activity, and publication
+  drain fields without removing existing fields.
 - The public CLI now has ten root commands, five product states, one JSON result
   envelope, and hidden compatibility aliases. Help, configuration, status, and
   rewrite output now use direct wording and give the next safe action.

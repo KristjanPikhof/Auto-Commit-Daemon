@@ -5,32 +5,42 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+const productListDefaultRows = 5
+
+var productListCollect = collectProductListOverview
+
 type productListEntry struct {
-	Repo             string                 `json:"repo"`
-	Enabled          bool                   `json:"enabled"`
-	Protected        bool                   `json:"protected"`
-	Published        bool                   `json:"published"`
-	ActionRequired   bool                   `json:"action_required"`
-	State            productState           `json:"state"`
-	PendingEvents    int                    `json:"pending_events"`
-	BlockedEvents    int                    `json:"blocked_events"`
-	CheckpointID     string                 `json:"checkpoint_id,omitempty"`
-	WorkerState      string                 `json:"worker_state,omitempty"`
-	OperationalState string                 `json:"operational_state,omitempty"`
-	LastActivityAt   string                 `json:"last_activity_at,omitempty"`
-	PublicationDrain publicationDrainReport `json:"publication_drain"`
-	Summary          string                 `json:"summary"`
-	NextAction       string                 `json:"next_action,omitempty"`
-	Clients          int                    `json:"-"`
-	LastCommitOID    string                 `json:"-"`
-	lastActivity     time.Time
+	Repo              string                 `json:"repo"`
+	Enabled           bool                   `json:"enabled"`
+	Protected         bool                   `json:"protected"`
+	Published         bool                   `json:"published"`
+	ActionRequired    bool                   `json:"action_required"`
+	State             productState           `json:"state"`
+	PendingEvents     int                    `json:"pending_events"`
+	BlockedEvents     int                    `json:"blocked_events"`
+	CheckpointID      string                 `json:"checkpoint_id,omitempty"`
+	WorkerState       string                 `json:"worker_state"`
+	OperationalState  string                 `json:"operational_state"`
+	LastActivityAt    string                 `json:"last_activity_at"`
+	PublicationDrain  publicationDrainReport `json:"publication_drain"`
+	Summary           string                 `json:"summary"`
+	NextAction        string                 `json:"next_action,omitempty"`
+	RepoHash          string                 `json:"-"`
+	Clients           int                    `json:"-"`
+	LastCommitOID     string                 `json:"-"`
+	ProtectionUnknown bool                   `json:"-"`
+	lastActivity      time.Time
 }
 
 type productListData struct {
@@ -39,19 +49,21 @@ type productListData struct {
 }
 
 func newProductListCmd() *cobra.Command {
-	var watch, once, verbose, interactive bool
+	var watch, once, verbose, interactive, showAll bool
 	var interval time.Duration
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "Show protection across all enabled repositories",
-		Long: `Show whether each enabled repository is protected, published to local
-Git, or needs action.
+		Short: "Show live protection and commit progress",
+		Long: `Show repositories that need action or are processing commits, followed
+by the repositories where ACD most recently handled changes. Paused repositories
+appear only when the compact view still has room.
 
 In a terminal, the dashboard refreshes until you stop it with Ctrl-C. Use
---once for one snapshot. Use acd repo list to include disabled or missing
-registrations.`,
+--once for one snapshot, --all for every enabled repository, or --verbose for
+operational details. Use acd repo list for the static registration inventory.`,
 		Example: `  acd list
   acd list --once
+  acd list --all
   acd list --watch --interval 5s
   acd list --once --verbose
   acd list --json`,
@@ -69,8 +81,8 @@ registrations.`,
 				return invalidCommandError("acd list: --interval must be positive")
 			}
 			if interactive {
-				if jsonOut || watch || once {
-					return invalidCommandError("acd list: --interactive cannot be combined with --json, --watch, or --once")
+				if jsonOut || watch || once || showAll {
+					return invalidCommandError("acd list: --interactive cannot be combined with --json, --watch, --once, or --all")
 				}
 				return runRepoManageWithInput(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), verbose)
 			}
@@ -79,21 +91,25 @@ registrations.`,
 			}
 			stdout, _ := cmd.OutOrStdout().(*os.File)
 			if listUseWatchMode(stdout, once, watch) && !jsonOut {
-				return runProductListWatch(cmd.Context(), cmd.OutOrStdout(), interval, verbose)
+				watchCtx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+				defer stop()
+				return runProductListWatchDisplay(watchCtx, cmd.OutOrStdout(), interval,
+					verbose, showAll, listUseWatchMode(stdout, false, false))
 			}
-			return runProductListOnce(cmd.Context(), cmd.OutOrStdout(), jsonOut, verbose)
+			return runProductListOnceView(cmd.Context(), cmd.OutOrStdout(), jsonOut, verbose, showAll)
 		},
 	}
 	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh until interrupted (default on a TTY)")
 	cmd.Flags().BoolVar(&once, "once", false, "Print one snapshot and exit")
-	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include summaries and next actions")
+	cmd.Flags().BoolVar(&showAll, "all", false, "Include every enabled repository")
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include operational details and next actions")
 	cmd.Flags().BoolVar(&interactive, "interactive", false, "Open the advanced repository manager")
 	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval")
 	return cmd
 }
 
 func collectProductList(ctx context.Context) (productListData, productState, error) {
-	return collectProductListOverview(ctx)
+	return productListCollect(ctx)
 }
 
 func higherProductState(current, candidate productState) productState {
@@ -140,6 +156,10 @@ func productListShellQuote(value string) string {
 }
 
 func runProductListOnce(ctx context.Context, out io.Writer, jsonOut, verbose bool) error {
+	return runProductListOnceView(ctx, out, jsonOut, verbose, false)
+}
+
+func runProductListOnceView(ctx context.Context, out io.Writer, jsonOut, verbose, showAll bool) error {
 	data, stateName, err := collectProductList(ctx)
 	if err != nil {
 		return fmt.Errorf("acd list: %w", err)
@@ -150,7 +170,7 @@ func runProductListOnce(ctx context.Context, out io.Writer, jsonOut, verbose boo
 		}, true); err != nil {
 			return err
 		}
-	} else if err := renderProductListTable(out, data.Repos, verbose); err != nil {
+	} else if err := renderProductListDashboard(out, data.Repos, verbose, showAll); err != nil {
 		return err
 	}
 	if productListRequiresAction(data.Repos) {
@@ -174,52 +194,243 @@ func productListRequiresAction(entries []productListEntry) bool {
 }
 
 func runProductListWatch(ctx context.Context, out io.Writer, interval time.Duration, verbose bool) error {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	return runProductListWatchView(ctx, out, interval, verbose, false)
+}
+
+func runProductListWatchView(ctx context.Context, out io.Writer, interval time.Duration, verbose, showAll bool) error {
+	return runProductListWatchDisplay(ctx, out, interval, verbose, showAll, false)
+}
+
+func runProductListWatchDisplay(
+	ctx context.Context,
+	out io.Writer,
+	interval time.Duration,
+	verbose, showAll, terminalScreen bool,
+) error {
+	terminalStarted := false
+	lastKnown := make(map[string]productListEntry)
+	defer func() {
+		if terminalStarted {
+			fmt.Fprint(out, "\033[?25h\033[?1049l")
+		}
+	}()
 	for {
 		data, _, err := collectProductList(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return fmt.Errorf("acd list: %w", err)
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		stabilizeProductListFrame(data.Repos, lastKnown)
+		if terminalScreen && !terminalStarted {
+			fmt.Fprint(out, "\033[?1049h\033[?25l")
+			terminalStarted = true
 		}
 		fmt.Fprint(out, "\033[2J\033[H")
 		fmt.Fprintf(out, "Updated: %s\n\n", data.UpdatedAt)
-		if err := renderProductListTable(out, data.Repos, verbose); err != nil {
+		if err := renderProductListDashboard(out, data.Repos, verbose, showAll); err != nil {
 			return err
 		}
+
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return nil
-		case <-ticker.C:
+		case <-timer.C:
+		}
+	}
+}
+
+func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]productListEntry) {
+	for index, entry := range entries {
+		if !entry.ProtectionUnknown {
+			lastKnown[entry.Repo] = entry
+			continue
+		}
+		previous, ok := lastKnown[entry.Repo]
+		if ok && productListPriority(previous) <= productListPriority(entry) {
+			entries[index] = previous
 		}
 	}
 }
 
 func renderProductListTable(out io.Writer, entries []productListEntry, verbose bool) error {
-	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "REPOSITORY\tENABLED\tPROTECTED\tGIT\tACTION\tSTATE")
-	for _, entry := range entries {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", homeShort(entry.Repo),
-			yesNo(entry.Enabled), yesNo(entry.Protected), productListGitState(entry),
-			yesNo(entry.ActionRequired), entry.State)
-		if verbose {
-			fmt.Fprintf(tw, "  %s\t\t\t\t\t%s\n", entry.Summary, entry.NextAction)
-		}
-	}
-	if len(entries) == 0 {
-		fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t\t")
-	}
-	return tw.Flush()
+	return renderProductListDashboard(out, entries, verbose, true)
 }
 
-func productListGitState(entry productListEntry) string {
-	switch {
-	case entry.Published:
-		return "published"
-	case !entry.Enabled:
-		return "off"
-	case entry.ActionRequired || entry.State == productStateNeedsAction || !entry.Protected:
-		return "blocked"
-	default:
-		return "not-published"
+func renderProductListDashboard(out io.Writer, entries []productListEntry, verbose, showAll bool) error {
+	visible, hidden := selectProductListEntries(entries, showAll)
+	labels := productListLabels(visible)
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	if verbose {
+		fmt.Fprintln(tw, "REPOSITORY\tWORKER\tLIVE TOOLS\tSAFE\tDRAIN\tLEFT\tBLOCKED\tLAST COMMIT\tSTATUS\tDETAILS")
+	} else {
+		fmt.Fprintln(tw, "REPO\tSAFE\tDRAIN\tLEFT\tSTATUS")
 	}
+	for index, entry := range visible {
+		if verbose {
+			details := entry.Summary
+			if entry.NextAction != "" && entry.NextAction != "No action needed." {
+				details = strings.TrimSpace(details + " " + entry.NextAction)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n",
+				homeShort(entry.Repo), valueOrDash(entry.WorkerState), entry.Clients,
+				productListSafety(entry), productListDrain(entry), productListLeft(entry),
+				entry.BlockedEvents, productListLastCommit(entry.LastCommitOID),
+				productListStatus(entry), details)
+			continue
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", labels[index],
+			productListSafety(entry), productListDrain(entry), productListLeft(entry),
+			productListStatus(entry))
+	}
+	if len(visible) == 0 {
+		if verbose {
+			fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t\t\t\t\t\t")
+		} else {
+			fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t")
+		}
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if hidden > 0 {
+		_, err := fmt.Fprintf(out, "%d repositories hidden; use acd list --all\n", hidden)
+		return err
+	}
+	return nil
+}
+
+func productListSafety(entry productListEntry) string {
+	if entry.ProtectionUnknown {
+		return "-"
+	}
+	return yesNo(entry.Protected)
+}
+
+func selectProductListEntries(entries []productListEntry, showAll bool) ([]productListEntry, int) {
+	if showAll {
+		return entries, 0
+	}
+	mandatory := make([]productListEntry, 0, len(entries))
+	recent := make([]productListEntry, 0, len(entries))
+	paused := make([]productListEntry, 0, len(entries))
+	for _, entry := range entries {
+		switch productListStatus(entry) {
+		case "needs action", "working":
+			mandatory = append(mandatory, entry)
+		case "paused":
+			paused = append(paused, entry)
+		default:
+			recent = append(recent, entry)
+		}
+	}
+	visible := append([]productListEntry(nil), mandatory...)
+	remaining := productListDefaultRows - len(visible)
+	if remaining < 0 {
+		remaining = 0
+	}
+	if count := min(remaining, len(recent)); count > 0 {
+		visible = append(visible, recent[:count]...)
+		remaining -= count
+	}
+	if count := min(remaining, len(paused)); count > 0 {
+		visible = append(visible, paused[:count]...)
+	}
+	return visible, len(entries) - len(visible)
+}
+
+func productListStatus(entry productListEntry) string {
+	switch {
+	case entry.OperationalState == "paused":
+		return "paused"
+	case entry.ActionRequired || entry.State == productStateNeedsAction || entry.OperationalState == "needs_attention":
+		return "needs action"
+	case entry.OperationalState == "waiting":
+		return "waiting"
+	case productListWorkingState(entry.OperationalState):
+		return "working"
+	case entry.State == productStateWaiting:
+		return "waiting"
+	case entry.State == productStatePublishing || entry.PendingEvents > 0:
+		return "working"
+	default:
+		return "healthy"
+	}
+}
+
+func productListWorkingState(operational string) bool {
+	switch operational {
+	case "busy", "planning", "event_fallback", "self_healing", "fallback", "retrying", "validating":
+		return true
+	default:
+		return false
+	}
+}
+
+func productListDrain(entry productListEntry) string {
+	drain := entry.PublicationDrain
+	if drain.ID == "" || drain.Phase == state.PublicationDrainCompleted {
+		return "-"
+	}
+	return fmt.Sprintf("%d/%d", drain.PublishedEvents, drain.TargetEvents)
+}
+
+func productListLeft(entry productListEntry) int64 {
+	drain := entry.PublicationDrain
+	if drain.ID != "" && drain.Phase != state.PublicationDrainCompleted {
+		return drain.RemainingEvents
+	}
+	return int64(entry.PendingEvents)
+}
+
+func productListLastCommit(oid string) string {
+	if oid == "" {
+		return "-"
+	}
+	if len(oid) > 10 {
+		return oid[:10]
+	}
+	return oid
+}
+
+func valueOrDash(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+func productListLabels(entries []productListEntry) []string {
+	labels := make([]string, len(entries))
+	counts := make(map[string]int, len(entries))
+	for index, entry := range entries {
+		label := filepath.Base(entry.Repo)
+		if label == "." || label == string(filepath.Separator) || label == "" {
+			label = homeShort(entry.Repo)
+		}
+		labels[index] = label
+		counts[label]++
+	}
+	for index, label := range labels {
+		if counts[label] < 2 {
+			continue
+		}
+		hash := entries[index].RepoHash
+		if len(hash) > 6 {
+			hash = hash[:6]
+		}
+		if hash == "" {
+			hash = filepath.Base(filepath.Dir(entries[index].Repo))
+		}
+		labels[index] = fmt.Sprintf("%s [%s]", label, hash)
+	}
+	return labels
 }

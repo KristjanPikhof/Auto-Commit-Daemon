@@ -14,6 +14,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
@@ -101,7 +102,7 @@ func productListEntryFromOverview(
 	if record.RepositoryID == "" || record.WorktreeID == "" {
 		activity := time.Unix(record.LastSeenTS, 0)
 		return productListEntry{
-			Repo: record.Path, ActionRequired: true, State: productStateNeedsAction,
+			Repo: record.Path, RepoHash: record.RepoHash, ActionRequired: true, State: productStateNeedsAction,
 			OperationalState: "needs_attention", LastActivityAt: formatProductListActivity(activity),
 			Summary:      "This repository needs the current ACD protection format.",
 			NextAction:   productListTargetAction("Run `acd setup` to upgrade and enable protection.", record.Path),
@@ -109,9 +110,26 @@ func productListEntryFromOverview(
 		}
 	}
 	if readErr != nil {
+		if productListReadTransient(readErr) && worker.State != "needs_action" {
+			activity := time.Unix(record.LastSeenTS, 0)
+			stateName, operational := productStateProtected, "healthy_idle"
+			summary := "ACD is refreshing this repository's protection state."
+			if worker.State == "starting" || worker.State == "backoff" {
+				stateName, operational = productStatePublishing, "retrying"
+				summary = "ACD is starting or retrying the background worker."
+			}
+			return productListEntry{
+				Repo: record.Path, RepoHash: record.RepoHash, Enabled: true,
+				State: stateName, WorkerState: worker.State,
+				OperationalState: operational, ProtectionUnknown: true,
+				LastActivityAt: formatProductListActivity(activity),
+				Summary:        summary, NextAction: "No action needed.",
+				lastActivity: activity,
+			}
+		}
 		activity := time.Unix(record.LastSeenTS, 0)
 		return productListEntry{
-			Repo: record.Path, Enabled: true, ActionRequired: true,
+			Repo: record.Path, RepoHash: record.RepoHash, Enabled: true, ActionRequired: true,
 			State: productStateNeedsAction, WorkerState: worker.State,
 			OperationalState: "needs_attention", LastActivityAt: formatProductListActivity(activity),
 			Summary:      "ACD could not read this repository's protection state.",
@@ -126,6 +144,14 @@ func productListEntryFromOverview(
 	}
 	daemonAlive := report.Daemon == "running" && report.PID > 0 && !report.Stale
 	applyControlStatusWithDaemonAlive(&control, report, daemonAlive)
+	checkpointing := daemonAlive && report.CheckpointProtectionAvailable && !report.Protected &&
+		!productListHasIndependentAttention(report)
+	if checkpointing {
+		control.OK = true
+		control.Health = controlHealthPublishing
+		control.Summary = "ACD is checkpointing the latest observed changes."
+		control.NextAction = "No action needed."
+	}
 	if worker.RepositoryID != "" {
 		applySupervisorWorkerFailure(&control, worker)
 		if (worker.State == "starting" || worker.State == "backoff") &&
@@ -143,7 +169,9 @@ func productListEntryFromOverview(
 		entryState = productStateNeedsAction
 	}
 	operational := report.OperationalState
-	if report.Paused && report.Pause != nil && report.Pause.Source != "rewind_grace" {
+	if checkpointing {
+		operational = "busy"
+	} else if report.Paused && report.Pause != nil && report.Pause.Source != "rewind_grace" {
 		operational = "paused"
 	} else if report.Paused && report.Pause != nil && report.Pause.Source == "rewind_grace" {
 		operational = "waiting"
@@ -151,7 +179,7 @@ func productListEntryFromOverview(
 		operational = "validating"
 	}
 	entry := productListEntry{
-		Repo: record.Path, Enabled: control.Enabled, Protected: control.Protected,
+		Repo: record.Path, RepoHash: record.RepoHash, Enabled: control.Enabled, Protected: control.Protected,
 		Published: control.Published, ActionRequired: actionRequired, State: entryState,
 		PendingEvents: control.PendingEvents, BlockedEvents: control.BlockedEvents,
 		CheckpointID: control.CheckpointID, WorkerState: worker.State,
@@ -164,6 +192,17 @@ func productListEntryFromOverview(
 		entry.NextAction = productListTargetAction(*envelope.NextAction, record.Path)
 	}
 	return entry
+}
+
+func productListReadTransient(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "database is locked") ||
+		strings.Contains(message, "database table is locked") ||
+		strings.Contains(message, "sqlite_busy") ||
+		strings.Contains(message, "sqlite_locked")
 }
 
 func productListHasIndependentAttention(report statusReport) bool {
@@ -225,11 +264,11 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		overview.lastActivity = laterProductListActivity(overview.lastActivity, report.PublicationDrain.LastProgressTS)
 	}
 
-	var heartbeat, updated float64
+	var heartbeat float64
 	var branchRef sql.NullString
 	var generation sql.NullInt64
-	err = conn.QueryRowContext(ctx, `SELECT pid,mode,heartbeat_ts,branch_ref,branch_generation,updated_ts FROM daemon_state WHERE id=1`).Scan(
-		&report.PID, &report.Daemon, &heartbeat, &branchRef, &generation, &updated)
+	err = conn.QueryRowContext(ctx, `SELECT pid,mode,heartbeat_ts,branch_ref,branch_generation FROM daemon_state WHERE id=1`).Scan(
+		&report.PID, &report.Daemon, &heartbeat, &branchRef, &generation)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return overview, err
 	}
@@ -244,14 +283,11 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 			report.BranchRef = branchRef.String
 		}
 	}
-	overview.lastActivity = laterProductListActivity(overview.lastActivity, updated)
-
-	clients, newestClient, err := readProductListClients(ctx, conn, now, clientTTLForRepo(record.Path))
+	clients, _, err := readProductListClients(ctx, conn, now, clientTTLForRepo(record.Path))
 	if err != nil {
 		return overview, err
 	}
 	overview.clients = clients
-	overview.lastActivity = laterProductListActivity(overview.lastActivity, newestClient)
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE state=?`, state.EventStatePending).Scan(&report.PendingEvents); err != nil {
 		return overview, err
 	}
@@ -378,7 +414,7 @@ func readProductListClients(ctx context.Context, conn *sql.DB, now time.Time, tt
 		if seen > newest {
 			newest = seen
 		}
-		if seen >= cutoff {
+		if seen >= cutoff && (!watchPID.Valid || watchPID.Int64 <= 0 || identity.Alive(int(watchPID.Int64))) {
 			count++
 		}
 	}
@@ -417,14 +453,14 @@ func sortProductListEntries(entries []productListEntry) {
 }
 
 func productListPriority(entry productListEntry) int {
-	switch {
-	case entry.ActionRequired || entry.OperationalState == "needs_attention" || entry.OperationalState == "paused":
+	switch productListStatus(entry) {
+	case "needs action":
 		return 0
-	case entry.State == productStateWaiting || entry.OperationalState == "waiting":
-		return 2
-	case entry.State == productStatePublishing || productListWorkingState(entry.OperationalState) || entry.PendingEvents > 0:
+	case "working":
 		return 1
-	default:
+	case "paused":
 		return 3
+	default:
+		return 2
 	}
 }

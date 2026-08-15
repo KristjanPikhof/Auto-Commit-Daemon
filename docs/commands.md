@@ -105,15 +105,44 @@ worktree identity, index digest, and target ref.
 ~~~bash
 acd list
 acd list --once
+acd list --all
+acd list --verbose
 acd list --watch --interval 5s
 acd list --json
 acd commit-all --dry-run
 acd commit-all --yes
 ~~~
 
-`list` shows enabled worktrees using product states only: enabled, protected,
-published to Git, action required, state, and next action. Disabled, missing,
-and stale registry records remain available under hidden `acd repo list`.
+`list` is the live overview for repository health and commit progress. It always
+shows repositories that need action or are working. The default view fills the
+remaining five-row budget with repositories where ACD most recently handled
+changes. Paused repositories appear only when space remains after recent work.
+Use `--all` for every enabled repository and `--verbose` for worker, tool,
+safety, drain, blocker, last commit, and recovery details. A terminal refreshes
+the same screen until Ctrl-C; `--once` prints one snapshot.
+
+`SAFE` confirms that the latest checkpoint is complete. `DRAIN` shows published
+and target event counts for an active `commit-all` run. `LEFT` shows the exact
+events remaining in that drain, or ordinary pending events when no drain is
+active. A dash under `SAFE` means the checkpoint state could not be read during
+that frame.
+
+| Status | Meaning |
+|---|---|
+| `healthy` | Protection is complete and no work is pending. |
+| `working` | ACD is checkpointing, publishing, planning, validating, starting, or retrying. |
+| `waiting` | Protected work is waiting for an Intent batch delay or rewind grace period. |
+| `paused` | Protection and publication are manually paused. |
+| `needs action` | A failure or safety block requires attention. |
+
+JSON remains exhaustive regardless of the compact view. It keeps the existing
+fields and adds `worker_state`, `operational_state`, `blocked_events`,
+`last_activity_at`, and `publication_drain`. A needs-action result is printed
+before `acd list` returns exit code 3.
+
+Disabled, missing, and stale registration records remain available under hidden
+`acd repo list`. That command is the static maintenance inventory and does not
+refresh automatically.
 
 `commit-all` first completes a durable checkpoint, records the highest event
 sequence covered by the barrier, and drains only that bounded target through
