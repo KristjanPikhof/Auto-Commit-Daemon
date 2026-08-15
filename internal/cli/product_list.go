@@ -10,22 +10,27 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 type productListEntry struct {
-	Repo           string       `json:"repo"`
-	Enabled        bool         `json:"enabled"`
-	Protected      bool         `json:"protected"`
-	Published      bool         `json:"published"`
-	ActionRequired bool         `json:"action_required"`
-	State          productState `json:"state"`
-	PendingEvents  int          `json:"pending_events"`
-	CheckpointID   string       `json:"checkpoint_id,omitempty"`
-	Summary        string       `json:"summary"`
-	NextAction     string       `json:"next_action,omitempty"`
+	Repo             string                 `json:"repo"`
+	Enabled          bool                   `json:"enabled"`
+	Protected        bool                   `json:"protected"`
+	Published        bool                   `json:"published"`
+	ActionRequired   bool                   `json:"action_required"`
+	State            productState           `json:"state"`
+	PendingEvents    int                    `json:"pending_events"`
+	BlockedEvents    int                    `json:"blocked_events"`
+	CheckpointID     string                 `json:"checkpoint_id,omitempty"`
+	WorkerState      string                 `json:"worker_state,omitempty"`
+	OperationalState string                 `json:"operational_state,omitempty"`
+	LastActivityAt   string                 `json:"last_activity_at,omitempty"`
+	PublicationDrain publicationDrainReport `json:"publication_drain"`
+	Summary          string                 `json:"summary"`
+	NextAction       string                 `json:"next_action,omitempty"`
+	Clients          int                    `json:"-"`
+	LastCommitOID    string                 `json:"-"`
+	lastActivity     time.Time
 }
 
 type productListData struct {
@@ -88,49 +93,7 @@ registrations.`,
 }
 
 func collectProductList(ctx context.Context) (productListData, productState, error) {
-	roots, err := paths.Resolve()
-	if err != nil {
-		return productListData{}, productStateNeedsAction, err
-	}
-	registry, err := central.Load(roots)
-	if err != nil {
-		return productListData{}, productStateNeedsAction, err
-	}
-	data := productListData{UpdatedAt: time.Now().UTC().Format(time.RFC3339), Repos: []productListEntry{}}
-	overall := productStateProtected
-	for _, record := range registry.Repos {
-		if record.LifecycleDisabled() {
-			continue
-		}
-		control, inspectErr := inspectControl(ctx, record.Path)
-		if inspectErr != nil {
-			data.Repos = append(data.Repos, productListEntry{
-				Repo: record.Path, Enabled: true, ActionRequired: true,
-				State: productStateNeedsAction, Summary: inspectErr.Error(),
-				NextAction: productListTargetAction("Run `acd doctor` for details.", record.Path),
-			})
-			overall = productStateNeedsAction
-			continue
-		}
-		envelope := envelopeFromControl(control)
-		entryState := envelope.State
-		actionRequired := entryState == productStateNeedsAction || entryState == productStateOff
-		if actionRequired {
-			entryState = productStateNeedsAction
-		}
-		entry := productListEntry{
-			Repo: record.Path, Enabled: control.Enabled, Protected: control.Protected,
-			Published: control.Published, ActionRequired: actionRequired,
-			State: entryState, PendingEvents: control.PendingEvents,
-			CheckpointID: control.CheckpointID, Summary: control.Summary,
-		}
-		if envelope.NextAction != nil {
-			entry.NextAction = productListTargetAction(*envelope.NextAction, record.Path)
-		}
-		data.Repos = append(data.Repos, entry)
-		overall = higherProductState(overall, entry.State)
-	}
-	return data, overall, nil
+	return collectProductListOverview(ctx)
 }
 
 func higherProductState(current, candidate productState) productState {

@@ -106,6 +106,7 @@ type statusReport struct {
 	AllChangesCommittedInGit      bool                      `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD      bool                      `json:"checkpoint_published_by_acd"`
 	PublicationDrain              publicationDrainReport    `json:"publication_drain"`
+	checkpointNeedsAction         bool
 }
 
 func newStatusCmd() *cobra.Command {
@@ -484,9 +485,12 @@ WHERE cp.phase='completed'
 }
 
 func statusOperationalState(report statusReport) string {
+	return statusOperationalStateWithDaemonAlive(report, report.PID > 0 && identity.Alive(report.PID))
+}
+
+func statusOperationalStateWithDaemonAlive(report statusReport, daemonAlive bool) string {
 	switch {
-	case report.Stale || report.Daemon != "running" || report.PID <= 0 ||
-		!identity.Alive(report.PID):
+	case report.Stale || report.Daemon != "running" || !daemonAlive:
 		return "stopped"
 	case report.Configuration.Configuration == "needs_attention" ||
 		report.Replay.State == "needs_attention" ||

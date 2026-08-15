@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 func TestProductListOnceNeedsActionHumanRendersThenExitsThree(t *testing.T) {
@@ -218,6 +220,113 @@ func TestProductListPersistentFlagsAreHandled(t *testing.T) {
 			t.Fatalf("exit=%d err=%v, want %d", ExitCode(err), err, ExitInvalid)
 		}
 	})
+}
+
+func TestProductListCollectionIsBoundedAndReadsSupervisorOnce(t *testing.T) {
+	roots := withIsolatedHome(t)
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		for index := 0; index < 50; index++ {
+			path := filepath.Join(t.TempDir(), fmt.Sprintf("repo-%02d", index))
+			registry.UpsertRepo(path, fmt.Sprintf("%016x", index+1), filepath.Join(path, "state.db"), "codex", int64(index+1))
+			record := &registry.Repos[len(registry.Repos)-1]
+			record.RepositoryID = fmt.Sprintf("%016x", index+1)
+			record.WorktreeID = fmt.Sprintf("%016x", index+101)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	originalSupervisor, originalReader := productListReadSupervisor, productListReadRepo
+	t.Cleanup(func() {
+		productListReadSupervisor = originalSupervisor
+		productListReadRepo = originalReader
+	})
+	var supervisorCalls atomic.Int32
+	productListReadSupervisor = func(context.Context, paths.Roots) (supervisor.Status, bool) {
+		supervisorCalls.Add(1)
+		return supervisor.Status{}, true
+	}
+	var active, peak atomic.Int32
+	productListReadRepo = func(ctx context.Context, record central.RepoRecord, now time.Time) (productListRepoOverview, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			observed := peak.Load()
+			if current <= observed || peak.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return productListRepoOverview{}, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+		return healthyProductListOverview(record, now), nil
+	}
+
+	data, _, err := collectProductList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Repos) != 50 {
+		t.Fatalf("repos=%d, want 50", len(data.Repos))
+	}
+	if supervisorCalls.Load() != 1 {
+		t.Fatalf("supervisor calls=%d, want 1", supervisorCalls.Load())
+	}
+	if peak.Load() < 2 || peak.Load() > productListReadLimit {
+		t.Fatalf("peak concurrency=%d, want 2..%d", peak.Load(), productListReadLimit)
+	}
+}
+
+func TestProductListSlowRepositoryDoesNotBlockOtherRows(t *testing.T) {
+	roots := withIsolatedHome(t)
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		for index := 0; index < 10; index++ {
+			path := filepath.Join(t.TempDir(), fmt.Sprintf("repo-%02d", index))
+			registry.UpsertRepo(path, fmt.Sprintf("%016x", index+1), filepath.Join(path, "state.db"), "codex", int64(index+1))
+			record := &registry.Repos[len(registry.Repos)-1]
+			record.RepositoryID = fmt.Sprintf("%016x", index+1)
+			record.WorktreeID = fmt.Sprintf("%016x", index+101)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	originalReader := productListReadRepo
+	t.Cleanup(func() { productListReadRepo = originalReader })
+	productListReadRepo = func(ctx context.Context, record central.RepoRecord, now time.Time) (productListRepoOverview, error) {
+		if strings.HasSuffix(record.Path, "repo-00") {
+			<-ctx.Done()
+			return productListRepoOverview{}, ctx.Err()
+		}
+		return healthyProductListOverview(record, now), nil
+	}
+
+	started := time.Now()
+	data, stateName, err := collectProductList(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < productListReadTimeout || elapsed > time.Second {
+		t.Fatalf("elapsed=%s, want one bounded repository timeout", elapsed)
+	}
+	if len(data.Repos) != 10 || stateName != productStateNeedsAction || !data.Repos[0].ActionRequired {
+		t.Fatalf("unexpected bounded result: state=%s repos=%+v", stateName, data.Repos)
+	}
+}
+
+func healthyProductListOverview(record central.RepoRecord, now time.Time) productListRepoOverview {
+	return productListRepoOverview{
+		report: statusReport{
+			Repo: record.Path, RepoHash: record.RepoHash, Daemon: "running", PID: os.Getpid(),
+			CheckpointProtectionAvailable: true, Protected: true,
+			LatestCheckpointID: "cp-test", OperationalState: "healthy_idle",
+		},
+		lastActivity: now,
+	}
 }
 
 func registerProductListNeedsActionRepo(t *testing.T) string {
