@@ -535,6 +535,10 @@ func controlDaemonRunning(ctx context.Context, rec central.RepoRecord) bool {
 }
 
 func applyControlStatus(res *controlResult, status statusReport) {
+	applyControlStatusWithDaemonAlive(res, status, status.PID > 0 && identity.Alive(status.PID))
+}
+
+func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, daemonAlive bool) {
 	manualPause := status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace")
 	res.Daemon = status.Daemon
 	res.DaemonPID = status.PID
@@ -564,7 +568,7 @@ func applyControlStatus(res *controlResult, status statusReport) {
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "ACD background protection has stopped responding."
 		res.NextAction = "Run `acd on` to restart it."
-	case status.Daemon != "running" || status.PID <= 0 || !identity.Alive(status.PID):
+	case status.Daemon != "running" || !daemonAlive:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "ACD is enabled, but background protection is not running."

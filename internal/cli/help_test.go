@@ -16,7 +16,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"status", []string{"current changes are protected", "exact next command", "--repo"}},
 		{"on", []string{"Start ACD protection", "background worker", "--repo"}},
 		{"off", []string{"final durable checkpoint", "--force"}},
-		{"list", []string{"each enabled repository", "Ctrl-C", "--watch", "--once"}},
+		{"list", []string{"need action", "Ctrl-C", "--watch", "--once", "--all"}},
 		{"commit-all", []string{"does not squash", "--dry-run", "--yes"}},
 		{"history", []string{"recent protected checkpoints", "--activity", "activity", "rewrite"}},
 		{"restore", []string{"restore ID", "--yes"}},

@@ -99,12 +99,20 @@ Root help lists ten everyday commands:
 | `acd status` | Answer whether changes are enabled, protected, published, and actionable. |
 | `acd on` | Enable protection, replace the managed worker, and verify a new checkpoint. |
 | `acd off` | Complete a final checkpoint, disable protection, and wait for the worker to stop. |
-| `acd list` | Show enabled repositories with protection and publication state. |
+| `acd list` | Show live protection health and commit progress across repositories. |
 | `acd commit-all` | Checkpoint now and drain the bounded publication target. |
 | `acd history` | List retained checkpoints and their Git publication state. |
 | `acd restore ID` | Preview a full-checkpoint restore; add `--yes` to apply it. |
 | `acd doctor` | Explain installation or protection problems and the exact next command. |
 | `acd uninstall` | Remove managed components while preserving protected data by default. |
+
+`acd list` is the everyday overview. In a terminal it refreshes in place.
+Repositories that need action or are working stay visible, and recent
+repositories fill the rest of the five-row view. `SAFE` shows checkpoint
+coverage, `DRAIN` shows progress through an active publication target, and
+`LEFT` shows the remaining target or ordinary pending events. Use `--all` for
+every enabled repository, `--verbose` for operational details, or `--once` for
+one snapshot. `acd repo list` remains the static registration inventory.
 
 It also links directly to common tasks:
 

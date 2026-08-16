@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/mattn/go-isatty"
-	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
@@ -50,62 +49,6 @@ type listEntry struct {
 	StaleHeartbeat       bool           `json:"stale_heartbeat,omitempty"`
 	Pause                *pauseInfo     `json:"pause,omitempty"`
 	IntentV2             intentV2Report `json:"intent_v2"`
-}
-
-func newListCmd() *cobra.Command {
-	var watch bool
-	var once bool
-	var verbose bool
-	var interactive bool
-	var interval time.Duration
-
-	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List all known daemons across repos",
-		Long: `List repos registered with acd and show daemon liveness, clients, queue
-depth, blocked conflicts, waiting/draining queues, last commit, and pause/stale status.
-
-On an interactive terminal, acd list defaults to a live compact dashboard (same as
---watch) until interrupted. Pipes and non-TTY stdout print a one-shot compact table;
-use --once to force a single snapshot on a TTY. --verbose restores the wide table
-(home-short paths, CLIENTS, LAST_COMMIT, and status notes).
-
---interval controls watch refresh cadence (Go durations such as 500ms, 2s, or 1m).
-Watch mode prints plain table frames and does not support --json.`,
-		Example: `  acd list
-  acd list --once
-  acd list --once --verbose
-  acd list --watch --interval 5s
-  acd list --interactive
-  acd list --json`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			jsonOut, _ := cmd.Flags().GetBool("json")
-			if interactive {
-				if jsonOut {
-					return fmt.Errorf("acd list: --interactive does not support --json")
-				}
-				if watch {
-					return fmt.Errorf("acd list: --interactive does not support --watch")
-				}
-				return runRepoManageWithInput(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), verbose)
-			}
-			if watch && jsonOut {
-				return fmt.Errorf("acd list: --watch does not support --json")
-			}
-			stdout, _ := cmd.OutOrStdout().(*os.File)
-			useWatch := listUseWatchMode(stdout, once, watch) && !jsonOut
-			if useWatch {
-				return runListWatch(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), interval, verbose)
-			}
-			return runList(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), jsonOut, verbose)
-		},
-	}
-	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh list output until interrupted (default on TTY)")
-	cmd.Flags().BoolVar(&once, "once", false, "Print one snapshot and exit (even on a TTY)")
-	cmd.Flags().BoolVar(&verbose, "verbose", false, "Wide table with paths, CLIENTS, LAST_COMMIT, and status notes")
-	cmd.Flags().BoolVar(&interactive, "interactive", false, "Open the interactive repo lifecycle manager")
-	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for watch mode (Go duration)")
-	return cmd
 }
 
 // listUseWatchMode reports whether acd list should run the live dashboard.
