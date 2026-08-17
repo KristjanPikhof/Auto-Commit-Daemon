@@ -35,6 +35,16 @@ func (p *intentCandidatePlannerStub) PlanIntentV2(
 	return p.plan, p.err
 }
 
+func (p *intentCandidatePlannerStub) RewriteIntentMessage(
+	_ context.Context,
+	_ ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	return ai.Result{
+		Subject: "Preserve semantic fallback",
+		Body:    "- Keep deterministic membership behind a meaningful message",
+	}, nil
+}
+
 type correctingIntentCandidatePlannerStub struct {
 	calls int
 	reqs  []ai.IntentPlanRequestV2
@@ -170,6 +180,16 @@ func (p *selfDependentIntentCandidatePlannerStub) PlanIntentV2(
 	}, nil
 }
 
+func (p *selfDependentIntentCandidatePlannerStub) RewriteIntentMessage(
+	_ context.Context,
+	_ ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	return ai.Result{
+		Subject: "Preserve semantic fallback",
+		Body:    "- Recover invalid grouping with deterministic membership",
+	}, nil
+}
+
 func (p *semanticIntentCandidatePlannerStub) PlanIntentV2(
 	_ context.Context,
 	req ai.IntentPlanRequestV2,
@@ -201,6 +221,34 @@ func (p *failingIntentCandidatePlannerStub) Name() string {
 type modelWideFailingIntentCandidatePlannerStub struct {
 	plannerCalls int
 	rewriteCalls int
+}
+
+type recoveringMessageIntentCandidatePlannerStub struct {
+	messageUnavailable bool
+}
+
+func (p *recoveringMessageIntentCandidatePlannerStub) Name() string {
+	return "intent-v2-recovering-message-test"
+}
+
+func (p *recoveringMessageIntentCandidatePlannerStub) PlanIntentV2(
+	context.Context,
+	ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	return ai.IntentPlanV2{}, errors.New("semantic planning unavailable")
+}
+
+func (p *recoveringMessageIntentCandidatePlannerStub) RewriteIntentMessage(
+	context.Context,
+	ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	if p.messageUnavailable {
+		return ai.Result{}, errors.New("message provider unavailable")
+	}
+	return ai.Result{
+		Subject: "Finish dependent behavior",
+		Body:    "- Publish the recovered fallback with semantic intent",
+	}, nil
 }
 
 func (p *modelWideFailingIntentCandidatePlannerStub) Name() string {
@@ -417,7 +465,11 @@ INSERT INTO capture_events(
 	result, err := EvaluateIntentCandidates(ctx, db,
 		IntentCandidateEvaluation{
 			BranchRef: "refs/heads/main", BranchGeneration: 1,
-			Captures: captures, RetryLimit: 0, RetryLimitSet: true,
+			Captures: captures,
+			Planner: &intentCandidatePlannerStub{
+				err: errors.New("semantic planning unavailable"),
+			},
+			RetryLimit: 0, RetryLimitSet: true,
 			Preset: config.PresetFast,
 			Materialize: func(
 				context.Context,
@@ -878,7 +930,9 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 		t.Fatal(err)
 	}
 	if second.PlannerFailure != "" ||
-		second.Fallback != "evidence_partition" ||
+		second.Fallback != "waiting_message_rewrite" ||
+		second.ResolutionMode != "waiting_message_rewrite" ||
+		!second.NeedsAttention || second.Decisions[0].Publishable ||
 		planner.calls != 1 {
 		t.Fatalf("circuit bypass=%+v calls=%d", second, planner.calls)
 	}
@@ -1355,7 +1409,7 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	}
 }
 
-func TestIntentCandidateEngineModelWideFailureKeepsValidatedFallback(t *testing.T) {
+func TestIntentCandidateEngineModelWideFailureWaitsForMessage(t *testing.T) {
 	for _, preset := range []config.PresetName{
 		config.PresetFast,
 		config.PresetBalanced,
@@ -1385,8 +1439,10 @@ func TestIntentCandidateEngineModelWideFailureKeepsValidatedFallback(t *testing.
 				t.Fatalf("EvaluateIntentCandidates: %v", err)
 			}
 			if planner.plannerCalls != 1 || planner.rewriteCalls != 1 ||
-				result.RetryCount != 0 || result.Fallback == "" ||
-				result.NeedsAttention || len(result.Decisions) == 0 {
+				result.RetryCount != 0 ||
+				result.Fallback != "waiting_message_rewrite" ||
+				result.ResolutionMode != "waiting_message_rewrite" ||
+				!result.NeedsAttention || len(result.Decisions) == 0 {
 				t.Fatalf("bounded fallback planner=%d rewrite=%d result=%+v",
 					planner.plannerCalls, planner.rewriteCalls, result)
 			}
@@ -1396,20 +1452,68 @@ func TestIntentCandidateEngineModelWideFailureKeepsValidatedFallback(t *testing.
 					"message quality fallback") {
 				t.Fatalf("planner failure=%q", result.PlannerFailure)
 			}
-			publishable := 0
 			for _, decision := range result.Decisions {
-				if !decision.Publishable {
-					continue
-				}
-				publishable++
-				if decision.Assignment.Subject == "" || !decision.Atomicity.Valid {
+				if decision.Publishable ||
+					decision.Assignment.Readiness != ai.IntentCandidateWait ||
+					!containsIntentString(decision.Assignment.MissingCompanions,
+						"semantic commit message unavailable") {
 					t.Fatalf("fallback decision=%+v", decision)
 				}
 			}
-			if publishable == 0 {
-				t.Fatalf("fallback published no safe decision: %+v", result)
-			}
 		})
+	}
+}
+
+func TestIntentCandidateEnginePublishesAfterMessageRecoveryAcrossRestart(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := appendIntentCandidateCapture(
+		t, db, "internal/recovery.go", "create", "", "recovery")
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture},
+		Planner: &recoveringMessageIntentCandidatePlannerStub{
+			messageUnavailable: true,
+		},
+		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced,
+		VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	}
+	first, err := EvaluateIntentCandidates(ctx, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Fallback != "waiting_message_rewrite" ||
+		len(first.Decisions) != 1 || first.Decisions[0].Publishable {
+		t.Fatalf("message outage=%+v", first)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	input.Planner = &recoveringMessageIntentCandidatePlannerStub{}
+	second, err := EvaluateIntentCandidates(ctx, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Fallback != "evidence_partition" ||
+		second.ResolutionMode != "evidence_partition" ||
+		len(second.Decisions) != 1 || !second.Decisions[0].Publishable ||
+		second.Decisions[0].Assignment.Subject != "Finish dependent behavior" {
+		t.Fatalf("message recovery=%+v", second)
 	}
 }
 
@@ -1539,7 +1643,7 @@ func TestIntentCandidateEngineFastFallbackMergesThroughPersistedCandidate(t *tes
 		t, config.PresetFast)
 }
 
-func TestIntentCandidateEngineFallbackMergesHardBridgeBetweenSoftCandidates(
+func TestIntentCandidateEngineFallbackPreservesHardBridgeCommits(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -1592,7 +1696,7 @@ func TestIntentCandidateEngineFallbackMergesHardBridgeBetweenSoftCandidates(
 			captures []IntentCandidateCapture,
 		) error {
 			if got := intentCandidateCaptureSeqs(captures); !reflect.DeepEqual(
-				got, []int64{6097, 6098, 6105},
+				got, []int64{6098},
 			) {
 				return fmt.Errorf("materialized hard bridge=%v", got)
 			}
@@ -1603,39 +1707,40 @@ func TestIntentCandidateEngineFallbackMergesHardBridgeBetweenSoftCandidates(
 		t.Fatalf("EvaluateIntentCandidates hard bridge: %v", err)
 	}
 	if result.Fallback != "evidence_partition" ||
+		result.ResolutionMode != "dependent_message_fallback" ||
 		result.NeedsAttention || len(result.Decisions) != 1 ||
 		!result.Decisions[0].Publishable {
 		t.Fatalf("hard bridge result=%+v", result)
 	}
 	decision := result.Decisions[0]
-	if decision.Candidate.ID != "soft-left" ||
+	if decision.Candidate.ID == "soft-left" ||
+		decision.Candidate.ID == "soft-right" ||
 		!reflect.DeepEqual(intentCandidateEventSeqs(decision.Candidate.Events),
-			[]int64{6097, 6098, 6105}) {
-		t.Fatalf("canonical hard bridge=%+v", decision.Candidate)
+			[]int64{6098}) ||
+		!reflect.DeepEqual(decision.Assignment.DependsOnCandidates,
+			[]string{"soft-left", "soft-right"}) {
+		t.Fatalf("dependent hard bridge=%+v", decision)
 	}
 	leftCandidate, ok, err := state.IntentCandidateByID(
 		ctx, db, "soft-left")
-	if err != nil || !ok ||
+	if err != nil || !ok || leftCandidate.Status != state.IntentCandidateSoftPublished ||
 		!reflect.DeepEqual(intentCandidateEventSeqs(leftCandidate.Events),
-			[]int64{6097, 6098, 6105}) {
+			[]int64{6097}) {
 		t.Fatalf("persisted target=%+v ok=%v err=%v",
 			leftCandidate, ok, err)
 	}
 	rightCandidate, ok, err := state.IntentCandidateByID(
 		ctx, db, "soft-right")
 	if err != nil || !ok ||
-		rightCandidate.Status != state.IntentCandidateSuperseded ||
-		len(rightCandidate.Events) != 0 {
+		rightCandidate.Status != state.IntentCandidateSoftPublished ||
+		!reflect.DeepEqual(intentCandidateEventSeqs(rightCandidate.Events),
+			[]int64{6105}) {
 		t.Fatalf("persisted source=%+v ok=%v err=%v",
 			rightCandidate, ok, err)
 	}
 	lineage, err := state.IntentCandidateLineageForTarget(
 		ctx, db, "refs/heads/main", 1, "soft-left", 10)
-	if err != nil || len(lineage) != 1 ||
-		lineage[0].SourceCandidateID != "soft-right" ||
-		lineage[0].SourceStatus != state.IntentCandidateSoftPublished ||
-		!lineage[0].SourcePublishedCommitOID.Valid ||
-		lineage[0].SourcePublishedCommitOID.String != "right-commit" {
+	if err != nil || len(lineage) != 0 {
 		t.Fatalf("hard bridge lineage=%+v err=%v", lineage, err)
 	}
 }
@@ -1901,7 +2006,7 @@ func TestIntentCandidateEngineBalancedFallbackUsesUnambiguousTestCompanion(
 	}
 }
 
-func TestIntentCandidateEngineBalancedFallbackContinuesPersistedTestCompanion(
+func TestIntentCandidateEngineBalancedFallbackPreservesPublishedTestCompanion(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -1934,7 +2039,7 @@ func TestIntentCandidateEngineBalancedFallbackContinuesPersistedTestCompanion(
 			captures []IntentCandidateCapture,
 		) error {
 			if got := intentCandidateCaptureSeqs(captures); !reflect.DeepEqual(
-				got, []int64{source.Event.Seq, test.Event.Seq},
+				got, []int64{test.Event.Seq},
 			) {
 				return fmt.Errorf("materialized persisted companion=%v", got)
 			}
@@ -1950,21 +2055,22 @@ func TestIntentCandidateEngineBalancedFallbackContinuesPersistedTestCompanion(
 	}
 	decision := result.Decisions[0]
 	if !decision.Publishable ||
-		decision.Candidate.ID != "persisted-source" ||
+		decision.Candidate.ID == "persisted-source" ||
 		!reflect.DeepEqual(
 			intentCandidateEventSeqs(decision.Candidate.Events),
-			[]int64{source.Event.Seq, test.Event.Seq},
+			[]int64{test.Event.Seq},
 		) {
 		t.Fatalf("continued persisted companion=%+v", decision)
 	}
-	if decision.Assignment.GroupingReason !=
-		"bounded deterministic persisted companion continuation" {
-		t.Fatalf("grouping reason=%q",
-			decision.Assignment.GroupingReason)
+	persisted, ok, err := state.IntentCandidateByID(ctx, db, "persisted-source")
+	if err != nil || !ok || persisted.Status != state.IntentCandidateSoftPublished ||
+		!reflect.DeepEqual(intentCandidateEventSeqs(persisted.Events),
+			[]int64{source.Event.Seq}) {
+		t.Fatalf("persisted source=%+v ok=%v err=%v", persisted, ok, err)
 	}
 }
 
-func TestIntentCandidateEngineBalancedFallbackHoldsAmbiguousPersistedCompanion(
+func TestIntentCandidateEngineBalancedFallbackIgnoresPublishedCompanionAmbiguity(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -2006,20 +2112,21 @@ func TestIntentCandidateEngineBalancedFallbackHoldsAmbiguousPersistedCompanion(
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Now: time.Unix(120, 0),
 		Materialize: func(
-			context.Context,
-			[]IntentCandidateCapture,
+			_ context.Context,
+			captures []IntentCandidateCapture,
 		) error {
-			return errors.New("ambiguous companion must not materialize")
+			if got := intentCandidateCaptureSeqs(captures); !reflect.DeepEqual(
+				got, []int64{test.Event.Seq}) {
+				return fmt.Errorf("materialized new test=%v", got)
+			}
+			return nil
 		},
 	})
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates: %v", err)
 	}
-	if !result.NeedsAttention || len(result.Decisions) != 1 ||
-		result.Decisions[0].Publishable ||
-		!strings.Contains(strings.Join(
-			result.Decisions[0].Assignment.MissingCompanions, " "),
-			"ambiguous persisted companion") {
+	if result.NeedsAttention || len(result.Decisions) != 1 ||
+		!result.Decisions[0].Publishable {
 		t.Fatalf("ambiguous persisted companion=%+v", result)
 	}
 }
