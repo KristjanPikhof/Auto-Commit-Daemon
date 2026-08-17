@@ -47,6 +47,17 @@ func TestStoreSetReadResolveAndRemove(t *testing.T) {
 	}
 }
 
+func TestResolveRefusesInvalidEnvironmentCredentialWithoutFileFallback(t *testing.T) {
+	store := testStore(t)
+	if err := store.Set("sk-protected-value"); err != nil {
+		t.Fatal(err)
+	}
+	key, source, err := Resolve(store, func(string) (string, bool) { return "bad\nvalue", true })
+	if err == nil || key != "" || source != SourceEnvironment || strings.Contains(err.Error(), "sk-protected-value") {
+		t.Fatalf("Resolve invalid environment = source %q key set %v err %v", source, key != "", err)
+	}
+}
+
 func TestStoreRejectsInsecureFilesystemObjects(t *testing.T) {
 	t.Parallel()
 	t.Run("directory mode", func(t *testing.T) {
@@ -135,6 +146,54 @@ func TestStoreAtomicRewriteLeavesNoTemporaryFile(t *testing.T) {
 	key, err := store.Read()
 	if err != nil || key != "sk-second" {
 		t.Fatalf("rewritten key set=%v err=%v", key != "", err)
+	}
+}
+
+func TestCredentialReplacementCommitRollbackAndCrashRecovery(t *testing.T) {
+	store := testStore(t)
+	if err := store.Set("sk-before"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := store.BeginReplacement("sk-after")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.Read(); got != "sk-after" {
+		t.Fatalf("replacement = %q", got)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.Read(); got != "sk-before" {
+		t.Fatalf("rollback = %q", got)
+	}
+
+	if _, err := store.BeginReplacement("sk-interrupted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecoverPendingReplacement(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.Read(); got != "sk-before" {
+		t.Fatalf("crash recovery = %q", got)
+	}
+
+	tx, err = store.BeginReplacement("sk-committed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.Read(); got != "sk-committed" {
+		t.Fatalf("commit = %q", got)
+	}
+	entries, err := os.ReadDir(filepath.Dir(store.Path()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(store.Path()) {
+		t.Fatalf("credential directory entries = %v", entries)
 	}
 }
 

@@ -273,6 +273,7 @@ type SaveGlobalSetupRequest struct {
 	Confirmations      []ai.ConfirmationRequirement
 	ExpectedGeneration uint64
 	Replace            bool
+	Prepare            func([]byte) error
 }
 
 type SaveGlobalSetupResult struct {
@@ -329,7 +330,7 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 	if err != nil {
 		return SaveGlobalSetupResult{}, err
 	}
-	err = s.store.UpdateExpected(req.ExpectedGeneration, func(doc *config.Document) error {
+	err = s.store.UpdateExpectedPrepared(req.ExpectedGeneration, req.Prepare, func(doc *config.Document) error {
 		if req.Replace {
 			doc.Settings.Global = config.Overrides{}
 		}
@@ -371,7 +372,8 @@ func globalSetupConfirmations(values []ai.ConfirmationRequirement) ([]string, er
 			return nil, errors.New("acd settings: project verification command approval cannot be global")
 		}
 		switch value {
-		case ai.ConfirmationEndpointCredentials, ai.ConfirmationSubprocessExecution,
+		case ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials,
+			ai.ConfirmationSubprocessExecution,
 			ai.ConfirmationDiffEgress, ai.ConfirmationIntentRepair:
 		default:
 			return nil, fmt.Errorf("acd settings: unsupported global confirmation %q", cleanText(string(value)))

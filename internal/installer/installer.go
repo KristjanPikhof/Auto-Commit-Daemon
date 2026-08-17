@@ -20,13 +20,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/globalops"
 	integrationpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/integration"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/migration"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
@@ -39,6 +42,7 @@ type Options struct {
 	ExpectedPlan     string
 	Executable       string
 	SkipServiceCheck bool
+	Configuration    *SetupConfiguration
 }
 
 const setupBarrierConcurrency = 4
@@ -47,6 +51,18 @@ type Action struct {
 	Kind   string `json:"kind"`
 	Target string `json:"target"`
 	Detail string `json:"detail"`
+}
+
+// SetupConfiguration contains only reviewed, non-secret setup values. The
+// bearer token is passed separately at apply time and is never serialized.
+type SetupConfiguration struct {
+	Values             map[string]string            `json:"values"`
+	Fingerprint        string                       `json:"tested_fingerprint"`
+	Confirmations      []ai.ConfirmationRequirement `json:"confirmations"`
+	SourceGeneration   uint64                       `json:"source_generation"`
+	CredentialSource   credentials.Source           `json:"credential_source"`
+	StoreCredential    bool                         `json:"store_credential"`
+	ProviderTestStatus string                       `json:"provider_test_status"`
 }
 
 type Plan struct {
@@ -67,6 +83,7 @@ type Plan struct {
 	RecoveryManifests   []string                     `json:"recovery_manifests,omitempty"`
 	Actions             []Action                     `json:"actions"`
 	FreshDefaults       bool                         `json:"fresh_defaults"`
+	Configuration       *SetupConfiguration          `json:"configuration,omitempty"`
 	Integrations        []string                     `json:"integrations"`
 	IntegrationPlans    []integrationpkg.Plan        `json:"integration_plans"`
 	OwnershipDigest     string                       `json:"integration_ownership_digest"`
@@ -84,11 +101,12 @@ type ServiceState struct {
 }
 
 type ApplyOptions struct {
-	Executor Executor
-	Quiesce  func(context.Context) error
-	SelfTest func(context.Context, Plan) error
-	Ready    func(context.Context, paths.Roots, *central.Registry) error
-	Progress func(Progress)
+	Executor   Executor
+	Quiesce    func(context.Context) error
+	SelfTest   func(context.Context, Plan) error
+	Ready      func(context.Context, paths.Roots, *central.Registry) error
+	Progress   func(Progress)
+	Credential string
 }
 
 type Progress struct {
@@ -216,6 +234,10 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	if err != nil {
 		return Plan{}, err
 	}
+	configuration := options.Configuration
+	if existing {
+		configuration = nil
+	}
 	plan := Plan{
 		Mode:        "full",
 		OperationID: opID, ExistingInstall: existing, RequiresExpected: existing,
@@ -224,6 +246,7 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 		PriorService: priorService, Registry: planned,
 		Repositories: repoPlans, RecoveryManifests: recoveryManifests,
 		FreshDefaults: !existing, Integrations: integrations,
+		Configuration:    configuration,
 		IntegrationPlans: integrationPlans, OwnershipDigest: ownershipDigest, BackupRoot: backupRoot,
 		ServiceCheckSkipped: options.SkipServiceCheck,
 	}
@@ -238,6 +261,12 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 		Action{Kind: "enable_repository", Target: wt.Root, Detail: "Enable checkpoint protection for the current repository"},
 		Action{Kind: "self_test", Target: backupRoot, Detail: "Run isolated checkpoint, publish, and restore verification"},
 	)
+	if plan.FreshDefaults && plan.Configuration != nil {
+		plan.Actions = append(plan.Actions, Action{
+			Kind: "save_preferences", Target: roots.ConfigPath(),
+			Detail: "Save reviewed user defaults and provider approval",
+		})
+	}
 	if len(recoveryManifests) > 0 {
 		recoveryCount := 0
 		for _, repository := range repoPlans {
@@ -366,8 +395,16 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := journal.Advance(ctx, plan.OperationID, "backed_up", "", false); err != nil {
 		return Result{}, restoreQuiescedService(err)
 	}
+	var credentialReplacement *credentials.Replacement
+	rollbackCredential := func() error {
+		if credentialReplacement == nil {
+			return nil
+		}
+		return credentialReplacement.Rollback()
+	}
 	rollbackFiles := func(cause error) error {
 		emitProgress(options, "rollback", "Setup failed; restoring all backed-up state")
+		credentialErr := rollbackCredential()
 		fileErr := restoreFiles(backups)
 		serviceErr := restoreQuiescedService(nil)
 		if fileErr != nil || serviceErr != nil || errors.Is(cause, errPostMutationProof) {
@@ -377,7 +414,16 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			_ = journal.Advance(context.Background(), plan.OperationID, "rolled_back", "setup rolled back", true)
 			emitProgress(options, "rolled_back", "Rollback completed; the previous ACD state is unchanged")
 		}
-		return errors.Join(cause, fileErr, serviceErr)
+		return errors.Join(cause, credentialErr, fileErr, serviceErr)
+	}
+	if plan.Configuration != nil && plan.Configuration.StoreCredential {
+		if strings.TrimSpace(options.Credential) == "" {
+			return Result{}, rollbackFiles(errors.New("setup: reviewed provider credential is missing"))
+		}
+		credentialReplacement, err = credentials.NewStore(roots).BeginReplacement(options.Credential)
+		if err != nil {
+			return Result{}, rollbackFiles(err)
+		}
 	}
 	emitProgress(options, "install_binary", "Installing ACD for setup checks")
 	managedBody, err := os.ReadFile(plan.SourceExecutable)
@@ -435,6 +481,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 				unloadService(context.Background(), roots, options.Executor, plan.Service),
 			)
 		}
+		credentialErr := rollbackCredential()
 		fileErr := restoreFiles(backups)
 		var dbErr error
 		if migrationApplied {
@@ -442,7 +489,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		}
 		releaseSessionLock()
 		serviceErr := restoreServiceState(context.Background(), roots, options.Executor, plan.Service, plan.PriorService)
-		rollbackErr := errors.Join(stopErr, fileErr, dbErr, serviceErr, manifestErr)
+		rollbackErr := errors.Join(credentialErr, stopErr, fileErr, dbErr, serviceErr, manifestErr)
 		if rollbackErr != nil || errors.Is(cause, errPostMutationProof) {
 			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup rollback incomplete", true)
 			emitProgress(options, "needs_attention", "Rollback could not be fully verified; run `acd doctor`")
@@ -491,8 +538,24 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		return Result{}, rollback(err)
 	}
 	if plan.FreshDefaults {
-		if err := persistFreshDefaults(roots, plan.WorktreeID, prepareConfig); err != nil {
-			return Result{}, rollback(err)
+		if plan.Configuration == nil {
+			if err := persistFreshDefaults(roots, plan.WorktreeID, prepareConfig); err != nil {
+				return Result{}, rollback(err)
+			}
+		} else {
+			service, serviceErr := settings.NewGlobalService(ctx, settings.Options{Roots: roots})
+			if serviceErr != nil {
+				return Result{}, rollback(serviceErr)
+			}
+			_, saveErr := service.SaveGlobalSetup(ctx, settings.SaveGlobalSetupRequest{
+				Values: plan.Configuration.Values, TestedFingerprint: plan.Configuration.Fingerprint,
+				Confirmations:      plan.Configuration.Confirmations,
+				ExpectedGeneration: plan.Configuration.SourceGeneration,
+				Prepare:            prepareConfig,
+			})
+			if saveErr != nil {
+				return Result{}, rollback(saveErr)
+			}
 		}
 	}
 	serviceDigest := absentFileDigest
@@ -600,6 +663,12 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	if err := journal.Advance(ctx, plan.OperationID, "needs_attention", "setup final cleanup pending", false); err != nil {
 		return Result{}, rollback(err)
+	}
+	if credentialReplacement != nil {
+		if err := credentialReplacement.Commit(); err != nil {
+			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "finish protected credential transaction", true)
+			return Result{}, fmt.Errorf("setup applied but credential cleanup needs attention: %w", err)
+		}
 	}
 	if err := preparePostMutation(plan.BackupRoot, backups, plan.PriorService, roots.SetupPublicationHoldPath(), absentFileDigest); err != nil {
 		_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "record publication hold cleanup", true)
@@ -1523,6 +1592,12 @@ func parseIntegrations(value string) ([]string, error) {
 }
 func digestPlan(plan Plan) string {
 	copy := plan
+	if plan.Configuration != nil {
+		configurationCopy := *plan.Configuration
+		configurationCopy.CredentialSource = "reviewed_credential"
+		configurationCopy.StoreCredential = false
+		copy.Configuration = &configurationCopy
+	}
 	if plan.Registry != nil {
 		registryCopy := *plan.Registry
 		registryCopy.Repos = append([]central.RepoRecord(nil), plan.Registry.Repos...)
