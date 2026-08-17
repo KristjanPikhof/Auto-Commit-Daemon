@@ -227,6 +227,48 @@ type recoveringMessageIntentCandidatePlannerStub struct {
 	messageUnavailable bool
 }
 
+type repairReplanIntentCandidatePlannerStub struct {
+	calls int
+}
+
+func (p *repairReplanIntentCandidatePlannerStub) Name() string {
+	return "intent-v2-repair-replan-test"
+}
+
+func (p *repairReplanIntentCandidatePlannerStub) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	p.calls++
+	if !strings.Contains(req.RetryCorrection, "repairable private ACD suffix") {
+		return ai.IntentPlanV2{
+			ProtocolVersion: ai.IntentPlannerProtocolV2,
+			Candidates: []ai.IntentCandidateAssignment{{
+				CandidateID:  "invalid-replan",
+				SelectedSeqs: []int64{req.OfferedCaptures[0].Seq},
+				Purpose:      "invalid initial repair plan",
+				Readiness:    ai.IntentCandidateReady,
+				Subject:      "Attempt invalid repair plan",
+				GroupingReason: "force the bounded private suffix " +
+					"replanning path",
+				DependsOnCandidates: []string{"invalid-replan"},
+			}},
+		}, nil
+	}
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID:  req.Candidates[0].CandidateID,
+			SelectedSeqs: []int64{req.OfferedCaptures[0].Seq},
+			Purpose:      "complete the private semantic change",
+			Readiness:    ai.IntentCandidateReady,
+			Subject:      "Complete private semantic change",
+			GroupingReason: "the same-file capture completes the " +
+				"repairable private candidate",
+		}},
+	}, nil
+}
+
 func (p *recoveringMessageIntentCandidatePlannerStub) Name() string {
 	return "intent-v2-recovering-message-test"
 }
@@ -1514,6 +1556,46 @@ func TestIntentCandidateEnginePublishesAfterMessageRecoveryAcrossRestart(
 		len(second.Decisions) != 1 || !second.Decisions[0].Publishable ||
 		second.Decisions[0].Assignment.Subject != "Finish dependent behavior" {
 		t.Fatalf("message recovery=%+v", second)
+	}
+}
+
+func TestIntentCandidateEngineReplansRepairablePrivateSuffix(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	oldCapture := appendIntentCandidateCapture(
+		t, db, "internal/feature.go", "create", "", "first")
+	newCapture := appendIntentCandidateCapture(
+		t, db, "internal/feature.go", "modify", "first", "second")
+	saveSoftPublishedIntentCandidate(
+		t, db, "soft-feature", oldCapture, "soft-commit", 100)
+	planner := &repairReplanIntentCandidatePlannerStub{}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{newCapture}, Planner: planner,
+		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced,
+		VerificationMode: "structural", Now: time.Unix(120, 0),
+		Materialize: func(
+			_ context.Context,
+			captures []IntentCandidateCapture,
+		) error {
+			if got := intentCandidateCaptureSeqs(captures); !reflect.DeepEqual(
+				got, []int64{oldCapture.Event.Seq, newCapture.Event.Seq}) {
+				return fmt.Errorf("materialized repair replan=%v", got)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 2 || result.Fallback != "" ||
+		result.ResolutionMode != "repair_replan" ||
+		len(result.Decisions) != 1 || !result.Decisions[0].Publishable ||
+		result.Decisions[0].Candidate.ID != "soft-feature" ||
+		!reflect.DeepEqual(
+			intentCandidateEventSeqs(result.Decisions[0].Candidate.Events),
+			[]int64{oldCapture.Event.Seq, newCapture.Event.Seq}) {
+		t.Fatalf("repair replan calls=%d result=%+v", planner.calls, result)
 	}
 }
 

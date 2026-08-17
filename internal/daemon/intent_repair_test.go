@@ -384,6 +384,110 @@ WHERE status='completed'`).Scan(&completed); err != nil || completed != 1 {
 	}
 }
 
+func TestReplayIntentV2SemanticRepairReplan(t *testing.T) {
+	t.Run("repairs private suffix", func(t *testing.T) {
+		testReplayIntentV2SemanticRepairReplan(t, true)
+	})
+	t.Run("preserves suffix after failed replan", func(t *testing.T) {
+		testReplayIntentV2SemanticRepairReplan(t, false)
+	})
+}
+
+func testReplayIntentV2SemanticRepairReplan(t *testing.T, repairSucceeds bool) {
+	t.Helper()
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	retryLimit := 0
+	planner := &fallbackRepairReplanIntentV2Planner{
+		repairSucceeds: repairSucceeds,
+	}
+	opts := ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetFast,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+		IntentRetryLimit:    &retryLimit,
+		IntentRepairEnabled: true, IntentRepairHorizon: 10 * time.Minute,
+		IntentRepairMaxCommits: 3,
+	}
+	publish := func(path, contents string) ReplaySummary {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(f.dir, path),
+			[]byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+			IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		sum, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.cctx.BaseHead = sum.BaseHead
+		return sum
+	}
+	first := publish(
+		"feature.go", "package feature\n\nfunc Value() int { return 1 }\n")
+	second := publish("guide.md", "# Feature guide\n")
+	headBefore := second.BaseHead
+	third := publish(
+		"feature.go", "package feature\n\nfunc Value() int { return 2 }\n")
+	if first.Published != 1 || second.Published != 1 || third.Published != 1 {
+		t.Fatalf("replays first=%+v second=%+v third=%+v",
+			first, second, third)
+	}
+	if got := strings.TrimSpace(mustGitOutput(
+		t, f.dir, "show", "HEAD:feature.go")); !strings.Contains(got, "return 2") {
+		t.Fatalf("final feature tree=%q", got)
+	}
+	if got := strings.TrimSpace(mustGitOutput(
+		t, f.dir, "show", "HEAD:guide.md")); got != "# Feature guide" {
+		t.Fatalf("final guide tree=%q", got)
+	}
+	if status := strings.TrimSpace(mustGitOutput(
+		t, f.dir, "status", "--short")); status != "" {
+		t.Fatalf("semantic replan left worktree dirty: %s", status)
+	}
+	var resolution string
+	if err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT resolution_mode
+FROM intent_planner_windows
+ORDER BY id DESC LIMIT 1`).Scan(&resolution); err != nil {
+		t.Fatal(err)
+	}
+	if repairSucceeds {
+		if commits := strings.Fields(mustGitOutput(
+			t, f.dir, "rev-list", "--first-parent", "HEAD")); len(commits) != 3 {
+			t.Fatalf("successful repair commits=%v", commits)
+		}
+		if resolution != "repair_replan" {
+			t.Fatalf("successful repair resolution=%q", resolution)
+		}
+		var completed int
+		if err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_repairs WHERE status='completed'`).
+			Scan(&completed); err != nil || completed != 1 {
+			t.Fatalf("completed repairs=%d err=%v", completed, err)
+		}
+		return
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+		"merge-base", "--is-ancestor", headBefore, third.BaseHead); err != nil {
+		t.Fatalf("failed replan rewrote prior commits: %v", err)
+	}
+	if subject := strings.TrimSpace(mustGitOutput(
+		t, f.dir, "show", "-s", "--format=%s", "HEAD")); subject != "Complete dependent feature update" {
+		t.Fatalf("fallback subject=%q", subject)
+	}
+	if resolution != "dependent_message_fallback" {
+		t.Fatalf("failed repair resolution=%q", resolution)
+	}
+}
+
 func TestReplayIntentV2RecoversForwardWhenRepartitionIsUnproven(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -859,6 +963,16 @@ func (*disconnectedIntentV2Planner) PlanIntentV2(
 	}, nil
 }
 
+func (*disconnectedIntentV2Planner) RewriteIntentMessage(
+	context.Context,
+	ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	return ai.Result{
+		Subject: "Publish independent fallback",
+		Body:    "- Keep deterministic components semantically named",
+	}, nil
+}
+
 func (*tracedInvalidIntentV2Planner) Name() string { return "openai-compat" }
 
 func (*tracedInvalidIntentV2Planner) PlanIntent(
@@ -892,6 +1006,16 @@ func (*tracedInvalidIntentV2Planner) PlanIntentV2(
 	return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}, nil
 }
 
+func (*tracedInvalidIntentV2Planner) RewriteIntentMessage(
+	context.Context,
+	ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	return ai.Result{
+		Subject: "Publish traced fallback",
+		Body:    "- Preserve trace coverage during semantic fallback",
+	}, nil
+}
+
 func (orderedIntentV2Planner) Name() string { return "ordered-v2-test" }
 
 func (orderedIntentV2Planner) PlanIntent(
@@ -907,7 +1031,62 @@ type waitingIntentV2Planner struct{}
 
 type suffixRepairIntentV2Planner struct{}
 
+type fallbackRepairReplanIntentV2Planner struct {
+	repairSucceeds bool
+}
+
 func (*suffixRepairIntentV2Planner) Name() string { return "suffix-repair-v2-test" }
+
+func (*fallbackRepairReplanIntentV2Planner) Name() string {
+	return "fallback-repair-replan-v2-test"
+}
+
+func (*fallbackRepairReplanIntentV2Planner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
+func (p *fallbackRepairReplanIntentV2Planner) PlanIntentV2(
+	ctx context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	byPath := make(map[string]int64)
+	for _, capture := range req.OfferedCaptures {
+		byPath[capture.Path] = capture.Seq
+	}
+	if byPath["feature.go"] == 0 || len(req.RecentSoftCommits) < 2 {
+		return (&suffixRepairIntentV2Planner{}).PlanIntentV2(ctx, req)
+	}
+	if p.repairSucceeds && strings.Contains(
+		req.RetryCorrection, "repairable private ACD suffix") {
+		return (&suffixRepairIntentV2Planner{}).PlanIntentV2(ctx, req)
+	}
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID:  "invalid-private-replan",
+			SelectedSeqs: []int64{byPath["feature.go"]},
+			Purpose:      "invalid private suffix plan",
+			Readiness:    ai.IntentCandidateReady,
+			Subject:      "Attempt private suffix repair",
+			GroupingReason: "exercise semantic repair replanning before " +
+				"the protected fallback",
+			DependsOnCandidates: []string{"invalid-private-replan"},
+		}},
+	}, nil
+}
+
+func (*fallbackRepairReplanIntentV2Planner) RewriteIntentMessage(
+	context.Context,
+	ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	return ai.Result{
+		Subject: "Complete dependent feature update",
+		Body:    "- Preserve the prior semantic commits during fallback",
+	}, nil
+}
 
 func (*suffixRepairIntentV2Planner) PlanIntent(
 	context.Context,
