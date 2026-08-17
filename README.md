@@ -143,6 +143,15 @@ publication strategy create the same reviewable, atomic local commits it
 would create during normal operation. Edits made after the barrier are left
 for the next publication pass.
 
+Intent fallback preserves commits that were already published. When new work
+depends on a recent private ACD commit, ACD first tries one bounded semantic
+replan of that repairable suffix. If replanning fails, ACD keeps the existing
+commit OIDs and publishes only the new captures as a dependent commit. That new
+commit must have a meaningful generated message. If the provider is
+unavailable, publication waits and retries instead of creating a generic
+`Update <path>` commit. A completed plan is reused while its repository
+fingerprint remains unchanged.
+
 See [the command reference](docs/commands.md) for flags, JSON, exit codes, and
 the compatibility map.
 
