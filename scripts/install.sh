@@ -72,7 +72,8 @@ echo "Installed acd $VERSION to $INSTALL_DIR/acd"
 echo
 echo "Next:"
 echo "  1) Make sure $INSTALL_DIR is on your PATH"
-echo "  2) Run: acd setup <claude-code|codex|cursor|opencode|pi|shell>"
-echo "  3) Follow the printed snippet to wire up your harness"
+echo "  2) Enter the Git repository you want to protect"
+echo "  3) Run: acd setup"
+echo "     Setup explains each choice and tests your provider before writing"
 echo
 echo "Tip: set ACD_VERSION=vYYYY-MM-DD to install a specific release."

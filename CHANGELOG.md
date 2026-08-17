@@ -4,6 +4,13 @@
 
 ### Added
 
+- `acd setup` now guides a fresh user through Everyday or Maximum Speed,
+  imperative or Conventional Commit messages, and a local or OpenAI-compatible
+  provider. It reviews and tests the exact provider with synthetic content
+  before the rollback-safe install starts.
+- First setup can store an OpenAI-compatible bearer token in the protected user
+  credential file, honor `ACD_AI_API_KEY`, approve warned HTTP endpoints, and
+  save fingerprint-bound global defaults for current and future repositories.
 - ACD now creates rootless checkpoint commits and GC-safe private refs before
   work that can change repository or service state. It records checkpoint
   coverage, publication links, retention, and data needed for crash recovery.
