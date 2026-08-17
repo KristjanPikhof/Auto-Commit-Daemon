@@ -1323,7 +1323,7 @@ func TestSetup_NoArg_AutoDetectsSingleHarness(t *testing.T) {
 		t.Fatalf("write settings: %v", err)
 	}
 
-	out, stderr, err := runSetupCmd(t)
+	out, stderr, err := runSetupCmd(t, "--dry-run")
 	if err != nil {
 		t.Fatalf("expected auto-detected setup to exit 0, got: %v\nstderr:\n%s", err, stderr)
 	}
@@ -1352,7 +1352,7 @@ func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
 	}
 	chdirForTest(t, repo)
 
-	out, stderr, err := runSetupCmd(t)
+	out, stderr, err := runSetupCmd(t, "--dry-run")
 	if err != nil {
 		t.Fatalf("expected repo-local codex auto-detect to exit 0, got: %v\nstderr:\n%s", err, stderr)
 	}
@@ -1379,7 +1379,7 @@ func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 		}
 	}
 
-	out, stderr, err := runSetupCmd(t)
+	out, stderr, err := runSetupCmd(t, "--dry-run")
 	if err != nil {
 		t.Fatalf("transactional setup should merge all detected integrations: %v\nstderr:\n%s", err, stderr)
 	}

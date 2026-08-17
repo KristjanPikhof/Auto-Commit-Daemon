@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settingsui"
 )
 
 func TestSetupDryRunDefaultsAreEverydayLocalAndSecretFree(t *testing.T) {
@@ -70,6 +73,41 @@ func TestSetupDryRunOpenAIIncludesPublicConsents(t *testing.T) {
 	}
 	if state.Configuration.Values[config.FieldCommitFormat] != "conventional" {
 		t.Fatalf("commit format = %q", state.Configuration.Values[config.FieldCommitFormat])
+	}
+}
+
+func TestSetupNonTTYUsesAccessibleWizard(t *testing.T) {
+	oldWizard := runConfigureWizard
+	oldInputTTY := settingsInputTTY
+	oldOutputTTY := settingsOutputTTY
+	t.Cleanup(func() {
+		runConfigureWizard = oldWizard
+		settingsInputTTY = oldInputTTY
+		settingsOutputTTY = oldOutputTTY
+	})
+	settingsInputTTY = func(io.Reader) bool { return false }
+	settingsOutputTTY = func(io.Writer) bool { return false }
+	accessible := false
+	runConfigureWizard = func(
+		_ context.Context,
+		opts settingsui.ConfigureWizardOptions,
+	) (settingsui.ConfigureSelection, error) {
+		accessible = opts.Accessible
+		return configureSelectionFromValues(opts.Defaults), nil
+	}
+
+	cmd := newSetupCommand(false)
+	cmd.SetIn(strings.NewReader(""))
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	_, err := prepareSetupOnboarding(cmd,
+		paths.Roots{Config: filepath.Join(t.TempDir(), "acd")},
+		setupOnboardingOptions{}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accessible {
+		t.Fatal("non-terminal setup did not select the accessible wizard")
 	}
 }
 

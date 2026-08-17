@@ -104,7 +104,11 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	selection.RepairApproved = experience == "everyday"
 	interactive := !dryRun && !nonInteractive
 	if interactive {
-		accessible := opts.Accessible || strings.EqualFold(os.Getenv("TERM"), "dumb") || configureTerminalTooShort(cmd.OutOrStdout())
+		accessible := opts.Accessible ||
+			!settingsInputTTY(cmd.InOrStdin()) ||
+			!settingsOutputTTY(cmd.OutOrStdout()) ||
+			strings.EqualFold(os.Getenv("TERM"), "dumb") ||
+			configureTerminalTooShort(cmd.OutOrStdout())
 		selection, err = runConfigureWizard(cmd.Context(), settingsui.ConfigureWizardOptions{
 			Input: cmd.InOrStdin(), Output: cmd.OutOrStdout(), Accessible: accessible,
 			Defaults: values, ExplicitMode: strings.TrimSpace(opts.Experience) != "",
