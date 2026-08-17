@@ -639,6 +639,14 @@ func TestValidateProviderConfigRequiresHTTPWarningAndRejectsUnsafeURLs(t *testin
 		if err == nil || strings.Contains(err.Error(), "secret-value") {
 			t.Fatalf("unsafe endpoint %q error = %v", endpoint, err)
 		}
+		if strings.Contains(endpoint, "user:pass") {
+			if !strings.Contains(err.Error(), "embedded credentials") {
+				t.Fatalf("userinfo error = %v", err)
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "password") {
+				t.Fatalf("userinfo error must use credential-safe wording: %v", err)
+			}
+		}
 	}
 }
 

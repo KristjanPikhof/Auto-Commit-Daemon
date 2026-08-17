@@ -784,7 +784,7 @@ func normalizeOpenAIBaseURL(raw string, requireHTTPS bool) (string, error) {
 		return "", errors.New("openai-compat: ACD_AI_BASE_URL must be an absolute URL")
 	}
 	if u.User != nil {
-		return "", errors.New("openai-compat: ACD_AI_BASE_URL must not contain a username or password")
+		return "", errors.New("openai-compat: ACD_AI_BASE_URL must not contain embedded credentials")
 	}
 	if u.RawQuery != "" || u.Fragment != "" {
 		return "", errors.New("openai-compat: ACD_AI_BASE_URL must not contain a query or fragment")
