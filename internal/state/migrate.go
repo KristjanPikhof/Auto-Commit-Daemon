@@ -76,6 +76,7 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // operation/checkpoint ledger and correlates new self-publication rows with
 // it. v21 adds publication_drains without backfilling historical checkpoints.
 // v22 adds durable adaptive planner attempts and additive window summaries.
+// v23 preserves the bounded resolved plan for restart-safe reuse.
 // New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
@@ -234,6 +235,12 @@ END;`); err != nil {
 			if err := addColumnIfMissing(ctx, tx, "intent_planner_windows", col.name, col.typ); err != nil {
 				return err
 			}
+		}
+	}
+	if cur < 23 {
+		if err := addColumnIfMissing(ctx, tx, "intent_plan_runs",
+			"resolved_plan_json", "TEXT"); err != nil {
+			return err
 		}
 	}
 	return nil

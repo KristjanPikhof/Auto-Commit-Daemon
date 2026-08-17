@@ -34,9 +34,9 @@ const driverName = "sqlite"
 // DBFileName is the per-repo SQLite filename inside .git/acd/.
 const DBFileName = "state.db"
 
-// ErrSetupRequired prevents the v20 runtime from performing the repository's
-// one-shot migration as an incidental side effect. Only transactional setup
-// may create or upgrade a runtime database.
+// ErrSetupRequired prevents a worker from applying an undeclared migration as
+// an incidental side effect. Only transactional setup may create or perform a
+// non-additive runtime database upgrade.
 var ErrSetupRequired = errors.New("state: checkpoint-first setup required")
 
 // DB wraps the per-repo SQLite handles plus a small amount of derived metadata.
@@ -182,6 +182,8 @@ func CanRuntimeMigrate(from, to int) bool {
 		case 21:
 			// v22 only adds privacy-safe adaptive planner attempt state and
 			// additive planner-window observability columns.
+		case 22:
+			// v23 only adds bounded resolved-plan JSON to planner attempt state.
 		default:
 			return false
 		}
