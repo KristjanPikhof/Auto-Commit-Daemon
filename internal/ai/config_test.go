@@ -335,11 +335,6 @@ func TestBuildProvider_OpenAICompatRejectsInvalidBaseURL(t *testing.T) {
 		wantError string
 	}{
 		{
-			name:      "http rejected",
-			baseURL:   "http://gateway.example/v1",
-			wantError: "must use https",
-		},
-		{
 			name:      "relative rejected",
 			baseURL:   "/v1",
 			wantError: "must be an absolute URL",
@@ -521,7 +516,7 @@ func TestBuildStrictProviderRejectsDegradedConfiguration(t *testing.T) {
 	}{
 		{name: "unknown", cfg: ProviderConfig{Mode: "mystery"}, want: "unknown provider"},
 		{name: "missing credential", cfg: ProviderConfig{Mode: "openai-compat", Model: "model"}, want: "missing API key"},
-		{name: "invalid endpoint", cfg: ProviderConfig{Mode: "openai-compat", APIKey: "secret", Model: "model", BaseURL: "http://example.test/v1"}, want: "must use https"},
+		{name: "invalid endpoint", cfg: ProviderConfig{Mode: "openai-compat", APIKey: "secret", Model: "model", BaseURL: "ftp://example.test/v1"}, want: "unsupported ACD_AI_BASE_URL scheme"},
 		{name: "invalid model", cfg: ProviderConfig{Mode: "openai-compat", APIKey: "secret", Model: "bad\nmodel"}, want: "model is invalid"},
 		{name: "missing subprocess", cfg: ProviderConfig{Mode: "subprocess:missing", subprocessLookPath: func(string) (string, error) { return "", errors.New("not found") }}, want: "not found"},
 	}
@@ -608,6 +603,42 @@ func TestValidateProviderConfigConfirmationsAreDistinct(t *testing.T) {
 		subprocess.Confirmations[0] != ConfirmationSubprocessExecution ||
 		subprocess.Confirmations[1] != ConfirmationDiffEgress {
 		t.Fatalf("subprocess confirmations=%v", subprocess.Confirmations)
+	}
+}
+
+func TestValidateProviderConfigRequiresHTTPWarningAndRejectsUnsafeURLs(t *testing.T) {
+	validation, err := ValidateProviderConfig(ProviderConfig{
+		Mode: "openai-compat", BaseURL: "http://gateway.example/v1/",
+		APIKey: "secret-value", Model: "model",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ConfirmationRequirement{
+		ConfirmationEndpointCredentials,
+		ConfirmationInsecureEndpointCredentials,
+	}
+	if len(validation.Confirmations) != len(want) {
+		t.Fatalf("HTTP confirmations = %v", validation.Confirmations)
+	}
+	for index := range want {
+		if validation.Confirmations[index] != want[index] {
+			t.Fatalf("HTTP confirmations = %v, want %v", validation.Confirmations, want)
+		}
+	}
+	for _, endpoint := range []string{
+		"https://user:pass@example.test/v1",
+		"https://example.test/v1?token=value",
+		"https://example.test/v1#fragment",
+		"ftp://example.test/v1",
+	} {
+		_, err := ValidateProviderConfig(ProviderConfig{
+			Mode: "openai-compat", BaseURL: endpoint,
+			APIKey: "secret-value", Model: "model",
+		})
+		if err == nil || strings.Contains(err.Error(), "secret-value") {
+			t.Fatalf("unsafe endpoint %q error = %v", endpoint, err)
+		}
 	}
 }
 

@@ -783,6 +783,12 @@ func normalizeOpenAIBaseURL(raw string, requireHTTPS bool) (string, error) {
 	if !u.IsAbs() || u.Host == "" {
 		return "", errors.New("openai-compat: ACD_AI_BASE_URL must be an absolute URL")
 	}
+	if u.User != nil {
+		return "", errors.New("openai-compat: ACD_AI_BASE_URL must not contain a username or password")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.New("openai-compat: ACD_AI_BASE_URL must not contain a query or fragment")
+	}
 	if requireHTTPS && u.Scheme != "https" {
 		return "", fmt.Errorf("openai-compat: ACD_AI_BASE_URL must use https, got %q", u.Scheme)
 	}
@@ -790,6 +796,13 @@ func normalizeOpenAIBaseURL(raw string, requireHTTPS bool) (string, error) {
 		return "", fmt.Errorf("openai-compat: unsupported ACD_AI_BASE_URL scheme %q", u.Scheme)
 	}
 	return u.String(), nil
+}
+
+// NormalizeOpenAIBaseURL validates a user-authored endpoint and removes a
+// trailing slash. HTTP remains available to callers that separately collect
+// its required consent.
+func NormalizeOpenAIBaseURL(raw string) (string, error) {
+	return normalizeOpenAIBaseURL(raw, false)
 }
 
 // defaultOpenAIClient is a redirect-refusing http.Client with a sane

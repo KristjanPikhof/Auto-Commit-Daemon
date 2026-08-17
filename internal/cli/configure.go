@@ -1156,8 +1156,8 @@ func validateConfigureSelection(selection settingsui.ConfigureSelection, hasCred
 	if err != nil {
 		return err
 	}
-	if selection.Provider == "deterministic" && (strategy != "event" || preset != "fast") {
-		return errors.New("acd config edit: deterministic provider is supported only by Event Fast")
+	if selection.Provider == "deterministic" && strategy == "intent" && preset == "quality" {
+		return errors.New("acd config edit: Strict Review requires a semantic provider")
 	}
 	if selection.CommitFormat != "imperative" && selection.CommitFormat != "conventional" {
 		return fmt.Errorf("acd config edit: unsupported commit format %q", selection.CommitFormat)
@@ -1165,7 +1165,8 @@ func validateConfigureSelection(selection settingsui.ConfigureSelection, hasCred
 	if selection.Provider == "openai-compat" && !hasCredential && strings.TrimSpace(selection.Credential) == "" {
 		return errors.New("acd config edit: OpenAI-compatible provider credential is required")
 	}
-	needsDiff := strategy == "intent" || preset != "fast"
+	needsDiff := selection.Provider != "deterministic" &&
+		(strategy == "intent" || preset != "fast")
 	if needsDiff && !selection.DiffContextApproved {
 		return errors.New("acd config edit: regular selected preset requires explicit redacted diff-context approval")
 	}
@@ -1196,6 +1197,7 @@ func selectionDraft(selection settingsui.ConfigureSelection) map[string]string {
 	out[config.FieldModel] = selection.Model
 	out[config.FieldBaseURL] = selection.BaseURL
 	out[config.FieldTimeout] = selection.ProviderTimeout
+	out[config.FieldCAFile] = selection.CAFile
 	out[config.FieldDiffEgress] = fmt.Sprintf("%t", selection.DiffContextApproved)
 	out[config.FieldIntentVerification] = selection.VerificationMode
 	if selection.VerificationMode == "fast" {
@@ -1224,6 +1226,7 @@ func configureSelectionFromValues(values map[string]string) settingsui.Configure
 		Model:               fallbackConfigureValue(values[config.FieldModel], "gpt-5.4-mini"),
 		BaseURL:             baseURL,
 		ProviderTimeout:     fallbackConfigureValue(values[config.FieldTimeout], ai.DefaultProviderTimeout.String()),
+		CAFile:              strings.TrimSpace(values[config.FieldCAFile]),
 		VerificationMode:    verification,
 		ExecutionMode:       "immediate",
 		DiffContextApproved: values[config.FieldDiffEgress] == "true",
@@ -1345,6 +1348,10 @@ func selectionProviderConfirmations(selection settingsui.ConfigureSelection) []a
 	var out []ai.ConfirmationRequirement
 	if selection.EndpointCredentialsApproved {
 		out = append(out, ai.ConfirmationEndpointCredentials)
+	}
+	if selection.Provider == "openai-compat" &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(selection.BaseURL)), "http://") {
+		out = append(out, ai.ConfirmationInsecureEndpointCredentials)
 	}
 	if selection.SubprocessApproved {
 		out = append(out, ai.ConfirmationSubprocessExecution)
@@ -1492,6 +1499,7 @@ func buildResolvedConfigureReport(repo string, selection settingsui.ConfigureSel
 	effective.Model = values[config.FieldModel]
 	effective.BaseURL = values[config.FieldBaseURL]
 	effective.ProviderTimeout = values[config.FieldTimeout]
+	effective.CAFile = values[config.FieldCAFile]
 	effective.DiffContextApproved = values[config.FieldDiffEgress] == "true"
 	effective.VerificationMode = values[config.FieldIntentVerification]
 	switch effective.VerificationMode {

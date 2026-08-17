@@ -433,6 +433,7 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 
 func TestRun_IntentV2MissingPrerequisitesCapturesWithoutReplay(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
+	t.Setenv("ACD_COMMIT_PRESET", "quality")
 	t.Setenv(ai.EnvProvider, "deterministic")
 	t.Setenv(ai.EnvDiffEgress, "false")
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
