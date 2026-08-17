@@ -158,9 +158,8 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	if dryRun && selection.Provider == "openai-compat" && !hasCredential {
 		lookupSecret = "dry-run-placeholder"
 	}
-	service, err := openConfigureGlobalSettingsService(cmd.Context(), settings.Options{
-		Roots: roots, LookupEnv: configureLookupEnv(lookupSecret),
-	})
+	service, err := openConfigureGlobalSettingsService(cmd.Context(),
+		configureSettingsOptions(roots, "", configureLookupEnv(lookupSecret)))
 	if err != nil {
 		return nil, fmt.Errorf("acd setup: prepare preferences: %w", err)
 	}
@@ -215,9 +214,8 @@ func testSetupProvider(cmd *cobra.Command, state *setupOnboardingState) error {
 	if state == nil {
 		return nil
 	}
-	service, err := openConfigureGlobalSettingsService(cmd.Context(), settings.Options{
-		Roots: state.Roots, LookupEnv: configureLookupEnv(state.Credential),
-	})
+	service, err := openConfigureGlobalSettingsService(cmd.Context(),
+		configureSettingsOptions(state.Roots, "", configureLookupEnv(state.Credential)))
 	if err != nil {
 		return fmt.Errorf("acd setup: open provider test: %w", err)
 	}

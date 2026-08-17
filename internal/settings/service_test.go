@@ -156,6 +156,40 @@ func TestSettingsSnapshotReadOnlySecretSafeAndScoped(t *testing.T) {
 	}
 }
 
+func TestSettingsResolutionSeparatesProviderCredential(t *testing.T) {
+	const secret = "provider-secret-must-not-enter-settings"
+	lookup := func(name string) (string, bool) {
+		if name == ai.EnvAPIKey {
+			return secret, true
+		}
+		return "", false
+	}
+	svc, _ := testGlobalService(t, lookup, nil)
+	doc, err := svc.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, _, err := svc.resolveDraft(doc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range resolved {
+		if strings.Contains(value, secret) {
+			t.Fatalf("credential entered generic setting %q", name)
+		}
+	}
+	if got := resolved[config.FieldAPIKey]; got != "configured" {
+		t.Fatalf("safe credential marker = %q", got)
+	}
+	provider, err := svc.providerConfig(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.APIKey != secret {
+		t.Fatal("provider did not receive the credential through its dedicated lookup")
+	}
+}
+
 func TestAuthoringPreviewReportsProviderSources(t *testing.T) {
 	lookup := func(name string) (string, bool) {
 		if name == ai.EnvProvider {

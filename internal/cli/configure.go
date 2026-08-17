@@ -272,7 +272,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 
 	lookup := configureLookupEnv(string(stagedCredential))
 	previewService, err := openConfigureGlobalSettingsService(
-		cmd.Context(), settings.Options{Roots: roots, LookupEnv: lookup},
+		cmd.Context(), configureSettingsOptions(roots, "", lookup),
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -358,7 +358,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 
 	lookup = configureLookupEnv(selection.Credential)
 	service, err := openConfigureGlobalSettingsService(
-		cmd.Context(), settings.Options{Roots: roots, LookupEnv: lookup},
+		cmd.Context(), configureSettingsOptions(roots, "", lookup),
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -718,9 +718,8 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return fmt.Errorf("acd config edit: credential status: %w", err)
 	}
 	lookup := configureLookupEnv(string(stagedCredential))
-	previewService, err := openConfigureValidationService(cmd.Context(), settings.Options{
-		Roots: roots, RepoPath: repo, LookupEnv: lookup,
-	})
+	previewService, err := openConfigureValidationService(
+		cmd.Context(), configureSettingsOptions(roots, repo, lookup))
 	if err != nil {
 		return fmt.Errorf("acd config edit: prepare read-only preview: %w", err)
 	}
@@ -802,9 +801,8 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return fmt.Errorf("acd config edit: close initial preview: %w", err)
 	}
 	lookup = configureLookupEnv(selection.Credential)
-	previewService, err = openConfigureValidationService(cmd.Context(), settings.Options{
-		Roots: roots, RepoPath: repo, LookupEnv: lookup,
-	})
+	previewService, err = openConfigureValidationService(
+		cmd.Context(), configureSettingsOptions(roots, repo, lookup))
 	if err != nil {
 		return fmt.Errorf("acd config edit: resolve reviewed preview: %w", err)
 	}
@@ -868,9 +866,8 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"No configuration was changed; rerun acd config edit and approve every displayed risk.")
 	}
 
-	service, err := openConfigureSettingsService(cmd.Context(), settings.Options{
-		Roots: roots, RepoPath: repo, LookupEnv: lookup,
-	})
+	service, err := openConfigureSettingsService(
+		cmd.Context(), configureSettingsOptions(roots, repo, lookup))
 	if err != nil {
 		return progress.fail("open settings service", err, "No changes were made; rerun acd config edit.")
 	}
@@ -1254,7 +1251,7 @@ func loadGlobalConfigurePreview(
 	lookup func(string) (string, bool),
 ) (settings.AuthoringPreview, error) {
 	service, err := openConfigureGlobalSettingsService(
-		ctx, settings.Options{Roots: roots, LookupEnv: lookup},
+		ctx, configureSettingsOptions(roots, "", lookup),
 	)
 	if err != nil {
 		return settings.AuthoringPreview{}, fmt.Errorf(
@@ -2013,6 +2010,17 @@ func configureLookupEnv(secret string) func(string) (string, bool) {
 			}
 		}
 		return value, set
+	}
+}
+
+func configureSettingsOptions(
+	roots paths.Roots,
+	repo string,
+	credentialLookup func(string) (string, bool),
+) settings.Options {
+	return settings.Options{
+		Roots: roots, RepoPath: repo, LookupEnv: os.LookupEnv,
+		CredentialLookup: credentialLookup,
 	}
 }
 
