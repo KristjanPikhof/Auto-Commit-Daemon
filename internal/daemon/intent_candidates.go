@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -146,9 +147,14 @@ const (
 )
 
 type intentCandidateContinuation struct {
-	TargetID   string
-	SourceIDs  []string
-	HoldReason string
+	TargetID   string   `json:"target_id"`
+	SourceIDs  []string `json:"source_ids,omitempty"`
+	HoldReason string   `json:"hold_reason,omitempty"`
+}
+
+type resolvedIntentPlanRun struct {
+	Plan          ai.IntentPlanV2               `json:"plan"`
+	Continuations []intentCandidateContinuation `json:"continuations,omitempty"`
 }
 
 type intentCandidateContinuationOptions struct {
@@ -854,6 +860,19 @@ func chooseIntentCandidatePlan(
 			}
 			run = reserved
 			if !allowed {
+				if run.Completed && run.ResolvedPlanJSON.Valid {
+					plan, continuations, loadErr := loadResolvedIntentPlanRun(
+						req, run.ResolvedPlanJSON.String)
+					if loadErr != nil {
+						return ai.IntentPlanV2{}, "", "", retryCount, false,
+							nil, run, loadErr
+					}
+					run.ResolutionMode = sql.NullString{
+						String: "completed_plan_reuse", Valid: true,
+					}
+					return plan, "", "", retryCount, false,
+						continuations, run, nil
+				}
 				break
 			}
 			if previousSignature == "" && run.AttemptCount > 1 &&
@@ -888,6 +907,11 @@ func chooseIntentCandidatePlan(
 				plannerCallFailed = false
 			}
 			if err == nil {
+				if err := storeResolvedIntentPlanRun(
+					&run, plan, continuations); err != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false,
+						nil, run, err
+				}
 				run.Completed = true
 				mode := "provider"
 				if len(lockedCandidates) > 0 {
@@ -923,6 +947,11 @@ func chooseIntentCandidatePlan(
 					intentCandidateContinuationValidationRequest(req, continuations),
 					plan,
 				); ok {
+					if err := storeResolvedIntentPlanRun(
+						&run, repaired, continuations); err != nil {
+						return ai.IntentPlanV2{}, "", "", retryCount,
+							false, nil, run, err
+					}
 					run.Completed = true
 					run.ResolutionMode = sql.NullString{String: "local_repair", Valid: true}
 					run.ProgressState = sql.NullString{String: "completed", Valid: true}
@@ -1021,6 +1050,10 @@ func chooseIntentCandidatePlan(
 	if validationErr != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, validationErr
 	}
+	if err := storeResolvedIntentPlanRun(&run, plan, continuations); err != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false,
+			nil, run, err
+	}
 	if run.AttemptCount == 0 {
 		var ensureErr error
 		run, ensureErr = state.EnsureIntentPlanRun(ctx, db, run)
@@ -1038,6 +1071,43 @@ func chooseIntentCandidatePlan(
 	}
 	return plan, "evidence_partition", plannerFailure, retryCount,
 		fallbackNeedsAttention || companionNeedsAttention, continuations, run, nil
+}
+
+func storeResolvedIntentPlanRun(
+	run *state.IntentPlanRun,
+	plan ai.IntentPlanV2,
+	continuations []intentCandidateContinuation,
+) error {
+	raw, err := json.Marshal(resolvedIntentPlanRun{
+		Plan: plan, Continuations: continuations,
+	})
+	if err != nil {
+		return fmt.Errorf("daemon: encode resolved intent plan: %w", err)
+	}
+	if len(raw) > state.IntentResolvedPlanJSONCap {
+		return fmt.Errorf("daemon: resolved intent plan exceeds %d bytes",
+			state.IntentResolvedPlanJSONCap)
+	}
+	run.ResolvedPlanJSON = sql.NullString{String: string(raw), Valid: true}
+	return nil
+}
+
+func loadResolvedIntentPlanRun(
+	req ai.IntentPlanRequestV2,
+	raw string,
+) (ai.IntentPlanV2, []intentCandidateContinuation, error) {
+	var resolved resolvedIntentPlanRun
+	if err := json.Unmarshal([]byte(raw), &resolved); err != nil {
+		return ai.IntentPlanV2{}, nil,
+			fmt.Errorf("daemon: decode resolved intent plan: %w", err)
+	}
+	validationReq := intentCandidateContinuationValidationRequest(
+		req, resolved.Continuations)
+	if err := ai.ValidateIntentPlanV2(validationReq, resolved.Plan); err != nil {
+		return ai.IntentPlanV2{}, nil,
+			fmt.Errorf("daemon: validate resolved intent plan: %w", err)
+	}
+	return resolved.Plan, resolved.Continuations, nil
 }
 
 func validatePlannerSemanticRationale(

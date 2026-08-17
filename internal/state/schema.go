@@ -35,8 +35,9 @@ package state
 // prepare-time publication completion semantics immutable across restart;
 // v20 adds the general operation journal and immutable checkpoint ledger;
 // v21 adds durable publication drains over immutable checkpoint membership;
-// v22 adds restart-stable adaptive Intent planning runs.
-const SchemaVersion = 22
+// v22 adds restart-stable adaptive Intent planning runs; v23 preserves the
+// bounded resolved plan so a completed run can be reused after restart.
+const SchemaVersion = 23
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -206,6 +207,9 @@ CREATE TABLE IF NOT EXISTS intent_plan_runs(
     normalized_partition     TEXT,
     progress_state           TEXT,
     resolution_mode          TEXT,
+    resolved_plan_json       TEXT CHECK (
+                              resolved_plan_json IS NULL OR
+                              length(resolved_plan_json) <= 524288),
     completed                INTEGER NOT NULL DEFAULT 0,
     created_ts               REAL NOT NULL,
     updated_ts               REAL NOT NULL

@@ -1071,6 +1071,57 @@ func TestIntentCandidateEngineRepairsDependencyWithoutPlannerRetry(t *testing.T)
 	}
 }
 
+func TestIntentCandidatePlanReusesCompletedResolution(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "service.go", Op: "modify",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{1},
+			Purpose: "fix service behavior", Readiness: ai.IntentCandidateReady,
+			Subject:        "Fix service behavior",
+			GroupingReason: "the capture contains the complete service fix",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+		CommitFormat: ai.CommitFormatImperative,
+	}
+
+	first, _, _, _, _, _, firstRun, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 2, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, fallback, failure, _, _, _, secondRun, err :=
+		chooseIntentCandidatePlan(
+			ctx, req, planner, nil, 2, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want 1", planner.calls)
+	}
+	if fallback != "" || failure != "" ||
+		secondRun.ResolutionMode.String != "completed_plan_reuse" {
+		t.Fatalf("reused resolution fallback=%q failure=%q run=%+v",
+			fallback, failure, secondRun)
+	}
+	if !reflect.DeepEqual(first, second) || !firstRun.ResolvedPlanJSON.Valid {
+		t.Fatalf("reused plan differs: first=%+v second=%+v run=%+v",
+			first, second, firstRun)
+	}
+}
+
 func TestIntentCandidatePlanRefusesNonTopologicalDependencyRepair(t *testing.T) {
 	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
 		OfferedCaptures: []ai.OfferedCapture{
