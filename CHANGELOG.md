@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Updated Lip Gloss to 2.0.6 and ANSI to 0.11.8 for terminal rendering fixes.
+  SQLite 1.56.0 includes the upstream journal rollback correction, and CI and
+  release workflows now use `actions/checkout` 7.0.1.
+
 ## v2026-08-18
 
 ### Added
