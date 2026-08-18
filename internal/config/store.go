@@ -44,17 +44,24 @@ func (s *Store) Load() (*Document, error) {
 // Update serializes the complete read-modify-write transaction with a
 // dedicated advisory lock. Returning an error from fn leaves disk unchanged.
 func (s *Store) Update(fn func(*Document) error) error {
-	return s.update(nil, fn)
+	return s.update(nil, nil, fn)
 }
 
 // UpdateExpected performs a compare-and-swap update against the saved
 // generation. It lets interactive settings sessions fail visibly instead of
 // overwriting a newer concurrent edit.
 func (s *Store) UpdateExpected(expected uint64, fn func(*Document) error) error {
-	return s.update(&expected, fn)
+	return s.update(&expected, nil, fn)
 }
 
-func (s *Store) update(expected *uint64, fn func(*Document) error) error {
+// UpdateExpectedPrepared runs prepare with the exact bytes that will be
+// installed, before the atomic config write. Setup uses this to record its
+// rollback proof without duplicating configuration encoding.
+func (s *Store) UpdateExpectedPrepared(expected uint64, prepare func([]byte) error, fn func(*Document) error) error {
+	return s.update(&expected, prepare, fn)
+}
+
+func (s *Store) update(expected *uint64, prepare func([]byte) error, fn func(*Document) error) error {
 	if fn == nil {
 		return errors.New("acd config: nil update")
 	}
@@ -91,7 +98,7 @@ func (s *Store) update(expected *uint64, fn func(*Document) error) error {
 	if err := ValidateDocument(doc); err != nil {
 		return err
 	}
-	return writeDocument(s.Roots.ConfigPath(), doc)
+	return writeDocumentPrepared(s.Roots.ConfigPath(), doc, prepare)
 }
 
 func openLock(path string) (*os.File, error) {
@@ -124,11 +131,20 @@ func openLock(path string) (*os.File, error) {
 }
 
 func writeDocument(path string, doc *Document) error {
+	return writeDocumentPrepared(path, doc, nil)
+}
+
+func writeDocumentPrepared(path string, doc *Document, prepare func([]byte) error) error {
 	body, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return fmt.Errorf("acd config: marshal: %w", err)
 	}
 	body = append(body, '\n')
+	if prepare != nil {
+		if err := prepare(body); err != nil {
+			return err
+		}
+	}
 	dir, err := openParentNoFollow(path)
 	if err != nil {
 		return err

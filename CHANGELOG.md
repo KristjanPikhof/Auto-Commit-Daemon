@@ -2,8 +2,17 @@
 
 ## Unreleased
 
+## v2026-08-18
+
 ### Added
 
+- `acd setup` now guides a fresh user through Everyday or Maximum Speed,
+  imperative or Conventional Commit messages, and a local or OpenAI-compatible
+  provider. It reviews and tests the exact provider with synthetic content
+  before the rollback-safe install starts.
+- First setup can store an OpenAI-compatible bearer token in the protected user
+  credential file, honor `ACD_AI_API_KEY`, approve warned HTTP endpoints, and
+  save fingerprint-bound global defaults for current and future repositories.
 - ACD now creates rootless checkpoint commits and GC-safe private refs before
   work that can change repository or service state. It records checkpoint
   coverage, publication links, retention, and data needed for crash recovery.
@@ -12,8 +21,9 @@
   supports undo, rollback, and forward repair.
 - Setup, migration, and uninstall now run as transactions with rollback and an
   isolated self-test. Registry v2 identifies Git common directories and linked
-  worktrees, while state schemas v20 through v22 store operations, checkpoints,
-  publication drains, and adaptive Intent planning runs. Uninstall keeps
+  worktrees, while state schemas v20 through v23 store operations, checkpoints,
+  publication drains, adaptive Intent planning runs, and resolved semantic
+  plans. Uninstall keeps
   repository data unless the user separately confirms a purge.
 - A single user-level supervisor now owns one worker per Git common directory.
   macOS terminals and agent applications share it through peer UID checks, with
@@ -23,7 +33,8 @@
   publication finishes or reaches a proven safety block.
 - Adaptive Intent planning now records attempts and outcomes across restarts.
   It keeps valid groups while unresolved captures are replanned and records a
-  completed outcome even when provider cooldown prevents a remote call.
+  completed outcome even when provider cooldown prevents a remote call. A
+  completed plan is revalidated and reused while its fingerprint is unchanged.
 
 ### Changed
 
@@ -72,6 +83,12 @@
 
 ### Fixed
 
+- Fixed deterministic Intent fallback collapsing valid published candidates
+  when new captures had a same-file hard dependency. ACD now offers an eligible
+  private suffix to one bounded semantic repair replan. If replanning fails, it
+  preserves the existing commit OIDs and publishes only the new captures after
+  generating a meaningful locked message. Provider outages leave the new
+  candidate waiting across restarts instead of publishing `Update <path>`.
 - Setup can reuse checkpoint ownership from an earlier attempt when the same
   event appears in a retained recovery snapshot. Re-running setup no longer
   fails because that event already belongs to a checkpoint.

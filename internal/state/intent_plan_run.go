@@ -7,6 +7,8 @@ import (
 	"fmt"
 )
 
+const IntentResolvedPlanJSONCap = 512 * 1024
+
 // IntentPlanRun is the privacy-safe durable identity and progress record for
 // one unchanged adaptive planning window. It never stores diffs or responses.
 type IntentPlanRun struct {
@@ -24,6 +26,7 @@ type IntentPlanRun struct {
 	NormalizedPartition sql.NullString
 	ProgressState       sql.NullString
 	ResolutionMode      sql.NullString
+	ResolvedPlanJSON    sql.NullString
 	Completed           bool
 	CreatedTS           float64
 	UpdatedTS           float64
@@ -103,6 +106,11 @@ UPDATE intent_plan_runs SET attempt_count=?, updated_ts=? WHERE fingerprint=?`,
 // UpdateIntentPlanRun records normalized summaries after an attempt or final
 // evidence resolution. All collections are bounded by the Intent window caps.
 func UpdateIntentPlanRun(ctx context.Context, d *DB, run IntentPlanRun) error {
+	if run.ResolvedPlanJSON.Valid &&
+		len(run.ResolvedPlanJSON.String) > IntentResolvedPlanJSONCap {
+		return fmt.Errorf("state: resolved intent plan exceeds %d bytes",
+			IntentResolvedPlanJSONCap)
+	}
 	preserved, err := json.Marshal(run.PreservedGroups)
 	if err != nil {
 		return err
@@ -118,11 +126,12 @@ func UpdateIntentPlanRun(ctx context.Context, d *DB, run IntentPlanRun) error {
 	res, err := d.conn.ExecContext(ctx, `
 UPDATE intent_plan_runs
 SET preserved_groups=?, unresolved_seqs=?, finding_codes=?,
-    normalized_partition=?, progress_state=?, resolution_mode=?, completed=?,
+    normalized_partition=?, progress_state=?, resolution_mode=?,
+    resolved_plan_json=?, completed=?,
     updated_ts=?
 WHERE fingerprint=?`, string(preserved), string(unresolved), string(findings),
 		run.NormalizedPartition, run.ProgressState, run.ResolutionMode,
-		boolInt(run.Completed), nowSeconds(), run.Fingerprint)
+		run.ResolvedPlanJSON, boolInt(run.Completed), nowSeconds(), run.Fingerprint)
 	if err != nil {
 		return fmt.Errorf("state: update intent plan run: %w", err)
 	}
@@ -139,7 +148,8 @@ WHERE fingerprint=?`, string(preserved), string(unresolved), string(findings),
 const intentPlanRunSelect = `SELECT fingerprint, branch_ref, branch_generation,
        provider, model, config_revision_id, attempt_count, attempt_limit,
        preserved_groups, unresolved_seqs, finding_codes, normalized_partition,
-       progress_state, resolution_mode, completed, created_ts, updated_ts
+       progress_state, resolution_mode, resolved_plan_json, completed,
+       created_ts, updated_ts
 FROM intent_plan_runs`
 
 func scanIntentPlanRun(row *sql.Row) (IntentPlanRun, error) {
@@ -150,7 +160,7 @@ func scanIntentPlanRun(row *sql.Row) (IntentPlanRun, error) {
 		&run.Provider, &run.Model, &run.ConfigRevisionID, &run.AttemptCount,
 		&run.AttemptLimit, &preserved, &unresolved, &findings,
 		&run.NormalizedPartition, &run.ProgressState, &run.ResolutionMode,
-		&completed, &run.CreatedTS, &run.UpdatedTS)
+		&run.ResolvedPlanJSON, &completed, &run.CreatedTS, &run.UpdatedTS)
 	if err != nil {
 		return IntentPlanRun{}, fmt.Errorf("state: scan intent plan run: %w", err)
 	}

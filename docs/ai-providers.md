@@ -25,7 +25,8 @@ Credentials, raw provider failures, and unredacted source never enter state,
 logs, status, diagnostics, traces, plan fingerprints, or test output.
 
 Strict provider tests use fixed synthetic content and no repository source.
-Setup and its scratch self-test never call a network provider.
+First setup tests the selected provider after review and before any write. Its
+scratch self-test does not call a network provider.
 
 ## OpenAI-compatible endpoints
 
@@ -35,6 +36,12 @@ file. Environment credentials win without being persisted.
 
 Use a custom endpoint only after reviewing its data handling. A saved endpoint
 does not itself grant diff egress.
+
+HTTPS is the safe default. HTTP requires a separate warning approval because
+the bearer token and request content can be read or changed in transit. ACD
+refuses redirects and endpoint URLs with embedded credentials, query strings,
+fragments, control characters, or unsupported schemes. A custom CA certificate
+is available under the optional connection settings.
 
 ## Subprocess providers
 

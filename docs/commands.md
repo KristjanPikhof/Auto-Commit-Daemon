@@ -30,14 +30,30 @@ acd setup --yes --non-interactive --expect-plan sha256:...
 
 `--dry-run` performs no file write, command execution, supervisor or service
 action, provider call, integration change, migration, state open for writing,
-or Git ref creation. `--expect-plan` is required for noninteractive apply when
-existing installation or v19 state is detected.
+Git ref creation, or secret prompt. Fresh setup asks for an experience, commit
+format, and provider. An OpenAI-compatible provider also asks for the endpoint,
+model, and masked bearer token. The token is tested only after the final review.
+
+Automation must first run `acd setup --dry-run --json`, retain its digest, then
+apply with `--yes --non-interactive --expect-plan`. Use `--experience`,
+`--commit-format`, `--provider`, `--base-url`, `--model`, and `--ca-file` to set
+the reviewed non-secret values. A bearer token may come only from
+`ACD_AI_API_KEY` or `--credential-stdin`. Add the matching confirmation flags
+for endpoint credentials, HTTP, diff egress, and Intent repair when the plan
+requires them.
+
+HTTP endpoints need `--confirm-insecure-http`. HTTP is not encrypted, so the
+token and later requests can be read or changed in transit. Redirects and URLs
+with embedded credentials, query strings, or fragments are refused.
 
 Setup validates the OS, architecture, Git durability support, repository,
 platform lifecycle, disk space, configuration, and integration files. It backs
 up every touched file, applies one all-repository v19 to v20 cutover, runs an
 isolated self-test, and commits only after all held workers report complete
 current coverage.
+
+Existing installations skip first-run questions and keep their current
+settings.
 
 After that cutover, compatible setup plans use a bounded binary-and-hooks
 transaction. They checkpoint enabled workers but do not rescan repository

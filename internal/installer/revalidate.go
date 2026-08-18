@@ -16,6 +16,7 @@ func revalidateSetupPlan(ctx context.Context, roots paths.Roots, reviewed Plan, 
 	current, err := BuildPlan(ctx, roots, Options{
 		Repo: reviewed.Repo, Integrations: selection, Executable: reviewed.SourceExecutable,
 		SkipServiceCheck: reviewed.ServiceCheckSkipped,
+		Configuration:    reviewed.Configuration,
 	})
 	if err != nil {
 		return err

@@ -3,13 +3,21 @@
 ## First setup
 
 ~~~bash
-acd setup --dry-run
 acd setup
 acd
 ~~~
 
-The final command should report enabled and protected. Fresh setup needs no API
-credential and makes no network request.
+Choose Everyday work and the local provider for the shortest path. Review the
+repository, integrations, grouping, commit format, repair limit, and data use.
+The local provider works offline. If you choose an OpenAI-compatible provider,
+setup asks for its endpoint, model, and bearer token, then sends one fixed
+synthetic request after you approve the plan. It sends no repository content
+during that test.
+
+The final command should report protection on and current changes protected.
+Your choices are saved as user defaults for this repository and repositories
+you add later. Use `acd config edit` when you later want Strict Review or other
+advanced settings.
 
 ## Daily check
 

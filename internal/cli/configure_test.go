@@ -1111,18 +1111,17 @@ func TestConfigureDeterministicProviderContract(t *testing.T) {
 		Model: "model", BaseURL: ai.DefaultOpenAIBaseURL, ProviderTimeout: "30s",
 		VerificationMode: "none",
 	}
-	for _, mode := range [][2]string{{"event", "balanced"}, {"event", "quality"}, {"intent", "fast"}} {
+	for _, mode := range [][2]string{{"event", "fast"}, {"intent", "fast"}, {"intent", "balanced"}} {
 		candidate := base
 		candidate.Strategy, candidate.Preset = mode[0], mode[1]
-		candidate.DiffContextApproved = true
-		if err := validateConfigureSelection(candidate, true); err == nil ||
-			!strings.Contains(err.Error(), "only by Event Fast") {
+		if err := validateConfigureSelection(candidate, true); err != nil {
 			t.Fatalf("%s.%s err=%v", mode[0], mode[1], err)
 		}
 	}
-	base.Strategy, base.Preset = "event", "fast"
-	if err := validateConfigureSelection(base, false); err != nil {
-		t.Fatalf("Event Fast rejected: %v", err)
+	base.Strategy, base.Preset = "intent", "quality"
+	if err := validateConfigureSelection(base, true); err == nil ||
+		!strings.Contains(err.Error(), "Strict Review requires a semantic provider") {
+		t.Fatalf("Intent Quality err=%v", err)
 	}
 }
 

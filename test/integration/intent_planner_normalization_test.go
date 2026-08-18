@@ -314,8 +314,8 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after cooldown bypass=%d want 1", got)
 	}
-	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM decision_records WHERE kind='intent_planner_error'"); got != "0" {
-		t.Fatalf("planner error decisions=%s want 0 after safe evidence recovery", got)
+	if got := sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM decision_records WHERE kind='intent_planner_error'"); got != "1" {
+		t.Fatalf("planner error evidence=%s want durable outage record", got)
 	}
 	waitFor(t, "persisted planner circuit bypass", 10*time.Second, func() bool {
 		raw := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
