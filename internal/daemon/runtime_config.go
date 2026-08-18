@@ -488,7 +488,7 @@ func runtimeIntentPrerequisiteBlock(
 	}
 	deterministic := cfg.Mode == "" || cfg.Mode == "deterministic"
 	if deterministic {
-		if preset != acdconfig.PresetFast {
+		if preset == acdconfig.PresetQuality {
 			return runtimeConfigureReason("Intent v2 requires a tested semantic provider")
 		}
 	} else {

@@ -272,7 +272,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 
 	lookup := configureLookupEnv(string(stagedCredential))
 	previewService, err := openConfigureGlobalSettingsService(
-		cmd.Context(), settings.Options{Roots: roots, LookupEnv: lookup},
+		cmd.Context(), configureSettingsOptions(roots, "", lookup),
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -358,7 +358,7 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 
 	lookup = configureLookupEnv(selection.Credential)
 	service, err := openConfigureGlobalSettingsService(
-		cmd.Context(), settings.Options{Roots: roots, LookupEnv: lookup},
+		cmd.Context(), configureSettingsOptions(roots, "", lookup),
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -718,9 +718,8 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return fmt.Errorf("acd config edit: credential status: %w", err)
 	}
 	lookup := configureLookupEnv(string(stagedCredential))
-	previewService, err := openConfigureValidationService(cmd.Context(), settings.Options{
-		Roots: roots, RepoPath: repo, LookupEnv: lookup,
-	})
+	previewService, err := openConfigureValidationService(
+		cmd.Context(), configureSettingsOptions(roots, repo, lookup))
 	if err != nil {
 		return fmt.Errorf("acd config edit: prepare read-only preview: %w", err)
 	}
@@ -802,9 +801,8 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		return fmt.Errorf("acd config edit: close initial preview: %w", err)
 	}
 	lookup = configureLookupEnv(selection.Credential)
-	previewService, err = openConfigureValidationService(cmd.Context(), settings.Options{
-		Roots: roots, RepoPath: repo, LookupEnv: lookup,
-	})
+	previewService, err = openConfigureValidationService(
+		cmd.Context(), configureSettingsOptions(roots, repo, lookup))
 	if err != nil {
 		return fmt.Errorf("acd config edit: resolve reviewed preview: %w", err)
 	}
@@ -868,9 +866,8 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"No configuration was changed; rerun acd config edit and approve every displayed risk.")
 	}
 
-	service, err := openConfigureSettingsService(cmd.Context(), settings.Options{
-		Roots: roots, RepoPath: repo, LookupEnv: lookup,
-	})
+	service, err := openConfigureSettingsService(
+		cmd.Context(), configureSettingsOptions(roots, repo, lookup))
 	if err != nil {
 		return progress.fail("open settings service", err, "No changes were made; rerun acd config edit.")
 	}
@@ -1156,8 +1153,8 @@ func validateConfigureSelection(selection settingsui.ConfigureSelection, hasCred
 	if err != nil {
 		return err
 	}
-	if selection.Provider == "deterministic" && (strategy != "event" || preset != "fast") {
-		return errors.New("acd config edit: deterministic provider is supported only by Event Fast")
+	if selection.Provider == "deterministic" && strategy == "intent" && preset == "quality" {
+		return errors.New("acd config edit: Strict Review requires a semantic provider")
 	}
 	if selection.CommitFormat != "imperative" && selection.CommitFormat != "conventional" {
 		return fmt.Errorf("acd config edit: unsupported commit format %q", selection.CommitFormat)
@@ -1165,7 +1162,8 @@ func validateConfigureSelection(selection settingsui.ConfigureSelection, hasCred
 	if selection.Provider == "openai-compat" && !hasCredential && strings.TrimSpace(selection.Credential) == "" {
 		return errors.New("acd config edit: OpenAI-compatible provider credential is required")
 	}
-	needsDiff := strategy == "intent" || preset != "fast"
+	needsDiff := selection.Provider != "deterministic" &&
+		(strategy == "intent" || preset != "fast")
 	if needsDiff && !selection.DiffContextApproved {
 		return errors.New("acd config edit: regular selected preset requires explicit redacted diff-context approval")
 	}
@@ -1196,6 +1194,7 @@ func selectionDraft(selection settingsui.ConfigureSelection) map[string]string {
 	out[config.FieldModel] = selection.Model
 	out[config.FieldBaseURL] = selection.BaseURL
 	out[config.FieldTimeout] = selection.ProviderTimeout
+	out[config.FieldCAFile] = selection.CAFile
 	out[config.FieldDiffEgress] = fmt.Sprintf("%t", selection.DiffContextApproved)
 	out[config.FieldIntentVerification] = selection.VerificationMode
 	if selection.VerificationMode == "fast" {
@@ -1224,6 +1223,7 @@ func configureSelectionFromValues(values map[string]string) settingsui.Configure
 		Model:               fallbackConfigureValue(values[config.FieldModel], "gpt-5.4-mini"),
 		BaseURL:             baseURL,
 		ProviderTimeout:     fallbackConfigureValue(values[config.FieldTimeout], ai.DefaultProviderTimeout.String()),
+		CAFile:              strings.TrimSpace(values[config.FieldCAFile]),
 		VerificationMode:    verification,
 		ExecutionMode:       "immediate",
 		DiffContextApproved: values[config.FieldDiffEgress] == "true",
@@ -1251,7 +1251,7 @@ func loadGlobalConfigurePreview(
 	lookup func(string) (string, bool),
 ) (settings.AuthoringPreview, error) {
 	service, err := openConfigureGlobalSettingsService(
-		ctx, settings.Options{Roots: roots, LookupEnv: lookup},
+		ctx, configureSettingsOptions(roots, "", lookup),
 	)
 	if err != nil {
 		return settings.AuthoringPreview{}, fmt.Errorf(
@@ -1345,6 +1345,10 @@ func selectionProviderConfirmations(selection settingsui.ConfigureSelection) []a
 	var out []ai.ConfirmationRequirement
 	if selection.EndpointCredentialsApproved {
 		out = append(out, ai.ConfirmationEndpointCredentials)
+	}
+	if selection.Provider == "openai-compat" &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(selection.BaseURL)), "http://") {
+		out = append(out, ai.ConfirmationInsecureEndpointCredentials)
 	}
 	if selection.SubprocessApproved {
 		out = append(out, ai.ConfirmationSubprocessExecution)
@@ -1492,6 +1496,7 @@ func buildResolvedConfigureReport(repo string, selection settingsui.ConfigureSel
 	effective.Model = values[config.FieldModel]
 	effective.BaseURL = values[config.FieldBaseURL]
 	effective.ProviderTimeout = values[config.FieldTimeout]
+	effective.CAFile = values[config.FieldCAFile]
 	effective.DiffContextApproved = values[config.FieldDiffEgress] == "true"
 	effective.VerificationMode = values[config.FieldIntentVerification]
 	switch effective.VerificationMode {
@@ -2005,6 +2010,17 @@ func configureLookupEnv(secret string) func(string) (string, bool) {
 			}
 		}
 		return value, set
+	}
+}
+
+func configureSettingsOptions(
+	roots paths.Roots,
+	repo string,
+	credentialLookup func(string) (string, bool),
+) settings.Options {
+	return settings.Options{
+		Roots: roots, RepoPath: repo, LookupEnv: os.LookupEnv,
+		CredentialLookup: credentialLookup,
 	}
 }
 

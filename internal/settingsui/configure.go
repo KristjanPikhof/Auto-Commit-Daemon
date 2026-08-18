@@ -30,6 +30,8 @@ type ConfigureWizardOptions struct {
 	CredentialFromStdin  bool
 	ProviderConfigured   bool
 	OpenAIConfigured     bool
+	IncludeCommitFormat  bool
+	IncludeCAFile        bool
 }
 
 // ConfigureSelection is an in-memory draft. Callers must discard Credential
@@ -43,6 +45,7 @@ type ConfigureSelection struct {
 	Model                       string
 	BaseURL                     string
 	ProviderTimeout             string
+	CAFile                      string
 	Credential                  string
 	DiffContextApproved         bool
 	EndpointCredentialsApproved bool
@@ -74,6 +77,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		Model:           fallback(defaults["ai.model"], "gpt-5.4-mini"),
 		BaseURL:         fallback(defaults["ai.base_url"], "https://api.openai.com/v1"),
 		ProviderTimeout: fallback(defaults["ai.timeout"], "30s"),
+		CAFile:          defaults["ai.ca_file"],
 	}
 	selection.Experience = configureExperience(selection.Strategy, selection.Preset)
 	if opts.ExplicitMode && !opts.RepositoryScoped &&
@@ -84,13 +88,13 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	}
 	if !opts.ExplicitMode {
 		options := []huh.Option[string]{
-			huh.NewOption("Everyday work — semantic commits with ACD safety checks (recommended)", "everyday"),
-			huh.NewOption("Maximum speed — immediate one-change commits, no project checks", "speed"),
+			huh.NewOption("Everyday work: semantic commits with ACD safety checks (recommended)", "everyday"),
+			huh.NewOption("Maximum speed: immediate one-change commits, no project checks", "speed"),
 		}
 		description := "Everyday is the recommended balance. Project tests are not run."
 		if opts.RepositoryScoped {
 			options = append(options,
-				huh.NewOption("Strict review — semantic commits gated by the full test suite (multi-minute)", "strict"),
+				huh.NewOption("Strict review: semantic commits gated by the full test suite (multi-minute)", "strict"),
 			)
 			description = "Everyday runs no project tests. Strict Review can take several minutes."
 		} else if selection.Experience == "strict" {
@@ -106,21 +110,35 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		}
 		selection.Strategy, selection.Preset = configureExperienceMode(selection.Experience)
 	}
+	if opts.IncludeCommitFormat {
+		formatForm := huh.NewForm(huh.NewGroup(
+			huh.NewSelect[string]().Key("commit-format").Title("How should commit messages look?").
+				Description("Imperative: Fix setup retries. Conventional: fix: handle setup retries.").
+				Options(
+					huh.NewOption("Imperative (recommended)", "imperative"),
+					huh.NewOption("Conventional Commits", "conventional"),
+				).Value(&selection.CommitFormat),
+		))
+		if err := runConfigureForm(ctx, formatForm, opts); err != nil {
+			return ConfigureSelection{}, err
+		}
+	}
 
 	providerKind, subprocessName := configureProviderParts(selection.Provider)
 	providerReady := opts.ProviderConfigured && (providerKind == "subprocess" ||
 		(providerKind == "openai-compat" && opts.HasCredential) ||
 		(providerKind == "deterministic" &&
-			selection.Strategy == "event" && selection.Preset == "fast"))
+			!(selection.Strategy == "intent" && selection.Preset == "quality")))
 	providerSelected := false
 	if !providerReady {
 		options := []huh.Option[string]{
 			huh.NewOption("OpenAI-compatible network provider", "openai-compat"),
 			huh.NewOption("Local subprocess provider", "subprocess"),
 		}
-		if selection.Strategy == "event" && selection.Preset == "fast" {
-			options = append(options,
-				huh.NewOption("Deterministic messages", "deterministic"))
+		if !(selection.Strategy == "intent" && selection.Preset == "quality") {
+			options = append([]huh.Option[string]{
+				huh.NewOption("Local rules (recommended)", "deterministic"),
+			}, options...)
 		}
 		providerForm := huh.NewForm(huh.NewGroup(
 			huh.NewSelect[string]().Key("provider").Title("Commit message provider").
@@ -149,6 +167,28 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 			}
 			selection.BaseURL = strings.TrimSpace(selection.BaseURL)
 			selection.Model = strings.TrimSpace(selection.Model)
+		}
+		if opts.IncludeCAFile {
+			advanced := strings.TrimSpace(selection.CAFile) != ""
+			advancedForm := huh.NewForm(huh.NewGroup(
+				huh.NewConfirm().Key("custom-ca").Title("More connection options?").
+					Description("Choose this only when the endpoint needs a custom CA certificate.").Value(&advanced),
+			))
+			if err := runConfigureForm(ctx, advancedForm, opts); err != nil {
+				return ConfigureSelection{}, err
+			}
+			if advanced {
+				caForm := huh.NewForm(huh.NewGroup(
+					huh.NewInput().Key("ca-file").Title("CA certificate file").
+						Description("Enter the PEM file used to trust this endpoint.").Value(&selection.CAFile),
+				))
+				if err := runConfigureForm(ctx, caForm, opts); err != nil {
+					return ConfigureSelection{}, err
+				}
+				selection.CAFile = strings.TrimSpace(selection.CAFile)
+			} else {
+				selection.CAFile = ""
+			}
 		}
 		if !opts.HasCredential && !opts.CredentialFromStdin {
 			credential, readErr := readConfigureSecret(opts.Input, opts.Output)
@@ -205,10 +245,10 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 
 	needsDiff := selection.Strategy == "intent" ||
 		(selection.Strategy == "event" && selection.Preset != "fast")
-	networkDiff := needsDiff && !strings.HasPrefix(selection.Provider, "subprocess:")
+	diffContext := needsDiff && selection.Provider != "deterministic"
 	customEndpoint := selection.Provider == "openai-compat" &&
 		strings.TrimRight(strings.TrimSpace(selection.BaseURL), "/") != "https://api.openai.com/v1"
-	selection.DiffContextApproved = needsDiff || networkDiff
+	selection.DiffContextApproved = diffContext
 	selection.EndpointCredentialsApproved = customEndpoint
 	selection.SubprocessApproved = strings.HasPrefix(selection.Provider, "subprocess:")
 	return selection, nil

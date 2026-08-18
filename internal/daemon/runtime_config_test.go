@@ -126,6 +126,50 @@ func TestRuntimeConfigAllowsDeterministicIntentFastWithoutCredentials(t *testing
 	}
 }
 
+func TestRuntimeConfigAllowsDeterministicEverydayButBlocksQuality(t *testing.T) {
+	db := openTestDB(t)
+	build := func(t *testing.T, preset string) *RuntimeBundle {
+		t.Helper()
+		values := map[string]any{
+			config.FieldProvider:            "deterministic",
+			config.FieldDiffEgress:          false,
+			config.FieldCommitStrategy:      "intent",
+			config.FieldCommitPreset:        preset,
+			config.FieldIntentVerification:  "structural",
+			config.FieldIntentRepairEnabled: preset == "balanced",
+			"preset_id":                     "intent." + preset,
+			"preset_version":                config.PresetCatalogVersion,
+			"customized":                    true,
+			"confirmations":                 []string{"intent_repair"},
+		}
+		body, err := json.Marshal(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		revision, err := state.InsertConfigRevision(context.Background(), db,
+			state.ConfigRevisionInput{Snapshot: body, Profile: "default", Scope: "repository"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bundle, err := (RuntimeBundleBuilder{DB: db, RepoRoot: t.TempDir()}).
+			BuildRevision(context.Background(), revision, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return bundle
+	}
+
+	everyday := build(t, "balanced")
+	if everyday.ReplayBlockedReason != "" || everyday.IntentPlanner == nil ||
+		everyday.PresetID != "intent.balanced" {
+		t.Fatalf("deterministic Everyday bundle = %+v", everyday)
+	}
+	quality := build(t, "quality")
+	if quality.ReplayBlockedReason == "" {
+		t.Fatalf("deterministic Quality unexpectedly active = %+v", quality)
+	}
+}
+
 func TestRuntimeBundleLeaseKeepsOneImmutableRevision(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "test-only-key")
 	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)

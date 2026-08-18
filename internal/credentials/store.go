@@ -174,8 +174,11 @@ func Resolve(store Store, lookupEnv func(string) (string, bool)) (string, Source
 	}
 	if value, ok := lookupEnv("ACD_AI_API_KEY"); ok {
 		value = strings.TrimSpace(value)
-		if validSecret(value) {
+		if value != "" && validSecret(value) {
 			return value, SourceEnvironment, nil
+		}
+		if value != "" {
+			return "", SourceEnvironment, errors.New("acd credentials: ACD_AI_API_KEY is invalid; fix or unset it")
 		}
 	}
 	value, err := store.Read()

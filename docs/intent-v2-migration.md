@@ -35,8 +35,9 @@ Historical published events are not fabricated into checkpoints. The cutover
 imports current full worktree states, exact unpublished chains, required
 recovery snapshots, and a bounded recent published-history projection.
 
-Existing settings are preserved exactly. Fresh installations use deterministic
-Intent/Fast.
+Existing settings are preserved exactly and skip first-run onboarding. Fresh
+installations use Everyday Intent/Balanced with the deterministic provider,
+structural checks, and bounded private repair.
 
 ## Rollback and recovery
 

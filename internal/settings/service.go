@@ -39,25 +39,27 @@ type ProbeFunc func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult,
 type NudgeFunc func(context.Context, state.DaemonState) error
 
 type Options struct {
-	Roots     paths.Roots
-	RepoPath  string
-	LookupEnv func(string) (string, bool)
-	Probe     ProbeFunc
-	Nudge     NudgeFunc
-	Now       func() time.Time
+	Roots            paths.Roots
+	RepoPath         string
+	LookupEnv        func(string) (string, bool)
+	CredentialLookup func(string) (string, bool)
+	Probe            ProbeFunc
+	Nudge            NudgeFunc
+	Now              func() time.Time
 }
 
 type Service struct {
-	store       *config.Store
-	db          *state.DB
-	worktree    gitpkg.Worktree
-	repoHash    string
-	globalOnly  bool
-	lookupEnv   func(string) (string, bool)
-	probe       ProbeFunc
-	nudge       NudgeFunc
-	now         func() time.Time
-	credentials credentials.Store
+	store            *config.Store
+	db               *state.DB
+	worktree         gitpkg.Worktree
+	repoHash         string
+	globalOnly       bool
+	lookupEnv        func(string) (string, bool)
+	credentialLookup func(string) (string, bool)
+	probe            ProbeFunc
+	nudge            NudgeFunc
+	now              func() time.Time
+	credentials      credentials.Store
 }
 
 func NewService(ctx context.Context, opts Options) (*Service, error) {
@@ -75,15 +77,16 @@ func NewValidationService(ctx context.Context, opts Options) (*Service, error) {
 // repository or opening repository state. Only global authoring operations are
 // available on the returned service.
 func NewGlobalService(_ context.Context, opts Options) (*Service, error) {
-	lookup, probe, nudge, now := serviceDefaults(opts)
+	lookup, credentialLookup, probe, nudge, now := serviceDefaults(opts)
 	return &Service{
-		store:       config.NewStore(opts.Roots),
-		globalOnly:  true,
-		lookupEnv:   lookup,
-		probe:       probe,
-		nudge:       nudge,
-		now:         now,
-		credentials: credentials.NewStore(opts.Roots),
+		store:            config.NewStore(opts.Roots),
+		globalOnly:       true,
+		lookupEnv:        lookup,
+		credentialLookup: credentialLookup,
+		probe:            probe,
+		nudge:            nudge,
+		now:              now,
+		credentials:      credentials.NewStore(opts.Roots),
 	}, nil
 }
 
@@ -103,17 +106,29 @@ func newService(ctx context.Context, opts Options, openState bool) (*Service, er
 			return nil, fmt.Errorf("acd settings: open state: %w", err)
 		}
 	}
-	lookup, probe, nudge, now := serviceDefaults(opts)
+	lookup, credentialLookup, probe, nudge, now := serviceDefaults(opts)
 	return &Service{store: config.NewStore(opts.Roots), db: db, worktree: wt,
-		repoHash: repoHash, lookupEnv: lookup, probe: probe, nudge: nudge, now: now,
+		repoHash: repoHash, lookupEnv: lookup, credentialLookup: credentialLookup,
+		probe: probe, nudge: nudge, now: now,
 		credentials: credentials.NewStore(opts.Roots)}, nil
 }
 
-func serviceDefaults(opts Options) (func(string) (string, bool), ProbeFunc, NudgeFunc, func() time.Time) {
-	lookup := opts.LookupEnv
-	if lookup == nil {
-		lookup = os.LookupEnv
+func serviceDefaults(opts Options) (
+	func(string) (string, bool),
+	func(string) (string, bool),
+	ProbeFunc,
+	NudgeFunc,
+	func() time.Time,
+) {
+	rawLookup := opts.LookupEnv
+	if rawLookup == nil {
+		rawLookup = os.LookupEnv
 	}
+	credentialLookup := opts.CredentialLookup
+	if credentialLookup == nil {
+		credentialLookup = rawLookup
+	}
+	lookup := settingsLookup(rawLookup)
 	probe := opts.Probe
 	if probe == nil {
 		probe = ai.ProbeProviderConfig
@@ -126,7 +141,23 @@ func serviceDefaults(opts Options) (func(string) (string, bool), ProbeFunc, Nudg
 	if now == nil {
 		now = time.Now
 	}
-	return lookup, probe, nudge, now
+	return lookup, credentialLookup, probe, nudge, now
+}
+
+// settingsLookup keeps the provider credential out of the generic settings
+// resolver. The resolver only needs to know whether the environment value is
+// present; provider construction resolves the actual value separately.
+func settingsLookup(lookup func(string) (string, bool)) func(string) (string, bool) {
+	return func(name string) (string, bool) {
+		if name != ai.EnvAPIKey {
+			return lookup(name)
+		}
+		value, set := lookup(name)
+		if !set || strings.TrimSpace(value) == "" {
+			return "", false
+		}
+		return "configured", true
+	}
 }
 
 type AuthoringPreview struct {
@@ -273,6 +304,7 @@ type SaveGlobalSetupRequest struct {
 	Confirmations      []ai.ConfirmationRequirement
 	ExpectedGeneration uint64
 	Replace            bool
+	Prepare            func([]byte) error
 }
 
 type SaveGlobalSetupResult struct {
@@ -329,7 +361,7 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 	if err != nil {
 		return SaveGlobalSetupResult{}, err
 	}
-	err = s.store.UpdateExpected(req.ExpectedGeneration, func(doc *config.Document) error {
+	err = s.store.UpdateExpectedPrepared(req.ExpectedGeneration, req.Prepare, func(doc *config.Document) error {
 		if req.Replace {
 			doc.Settings.Global = config.Overrides{}
 		}
@@ -371,7 +403,8 @@ func globalSetupConfirmations(values []ai.ConfirmationRequirement) ([]string, er
 			return nil, errors.New("acd settings: project verification command approval cannot be global")
 		}
 		switch value {
-		case ai.ConfirmationEndpointCredentials, ai.ConfirmationSubprocessExecution,
+		case ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials,
+			ai.ConfirmationSubprocessExecution,
 			ai.ConfirmationDiffEgress, ai.ConfirmationIntentRepair:
 		default:
 			return nil, fmt.Errorf("acd settings: unsupported global confirmation %q", cleanText(string(value)))
@@ -635,7 +668,7 @@ func (s *Service) providerConfig(values map[string]string) (ai.ProviderConfig, e
 	base.IntentMaxPendingAge, _ = time.ParseDuration(values[config.FieldIntentMaxPendingAge])
 	base.IntentRecentCommits, _ = strconv.Atoi(values[config.FieldIntentRecentCommits])
 	base.IntentDeferLimit, _ = strconv.Atoi(values[config.FieldIntentDeferLimit])
-	key, _, err := credentials.Resolve(s.credentials, s.lookupEnv)
+	key, _, err := credentials.Resolve(s.credentials, s.credentialLookup)
 	if err != nil {
 		return ai.ProviderConfig{}, sanitizeError(err)
 	}

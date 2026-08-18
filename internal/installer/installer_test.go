@@ -10,11 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/globalops"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
@@ -70,6 +73,90 @@ func TestBuildPlanIsReadOnlyAndStableForDigest(t *testing.T) {
 	}
 	if plan.Registry.Repos[0].LastSeenTS == 0 {
 		t.Fatalf("digest normalization cleared live registry timestamps: %+v", plan.Registry.Repos[0])
+	}
+}
+
+func TestSetupPlanDigestTracksPreferencesButNotCredentialReplacement(t *testing.T) {
+	base := Plan{Configuration: &SetupConfiguration{
+		Values:      map[string]string{"ai.provider": "openai-compat", "ai.model": "model-one"},
+		Fingerprint: "fingerprint", CredentialSource: "protected_file", StoreCredential: true,
+	}}
+	first := digestPlan(base)
+	replacement := base
+	configuration := *base.Configuration
+	configuration.CredentialSource = "environment"
+	configuration.StoreCredential = false
+	replacement.Configuration = &configuration
+	if got := digestPlan(replacement); got != first {
+		t.Fatalf("credential source changed digest: %s != %s", got, first)
+	}
+	configuration.Values = map[string]string{"ai.provider": "openai-compat", "ai.model": "model-two"}
+	if got := digestPlan(replacement); got == first {
+		t.Fatal("public model change did not invalidate setup digest")
+	}
+}
+
+func TestSetupRollbackRestoresConfigurationAndCredentialTogether(t *testing.T) {
+	ctx := context.Background()
+	roots, repo, executable := installerFixture(t, ctx)
+	store := credentials.NewStore(roots)
+	if err := store.Set("sk-before"); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{
+		config.FieldCommitStrategy:      "event",
+		config.FieldCommitPreset:        "fast",
+		config.FieldCommitFormat:        "imperative",
+		config.FieldProvider:            "openai-compat",
+		config.FieldBaseURL:             ai.DefaultOpenAIBaseURL,
+		config.FieldModel:               "model-one",
+		config.FieldTimeout:             ai.DefaultProviderTimeout.String(),
+		config.FieldDiffEgress:          "false",
+		config.FieldIntentVerification:  "none",
+		config.FieldIntentRepairEnabled: "false",
+	}
+	service, err := settings.NewGlobalService(ctx, settings.Options{
+		Roots: roots,
+		LookupEnv: func(name string) (string, bool) {
+			if name == ai.EnvAPIKey {
+				return "sk-after", true
+			}
+			return "", false
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validation, err := service.Validate(ctx, values, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildPlan(ctx, roots, Options{
+		Repo: repo, Executable: executable, SkipServiceCheck: true,
+		Configuration: &SetupConfiguration{
+			Values: values, Fingerprint: validation.Fingerprint,
+			SourceGeneration: validation.SourceGeneration,
+			CredentialSource: credentials.SourceFile, StoreCredential: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Apply(ctx, roots, plan, ApplyOptions{
+		Executor: &recordingExecutor{}, Credential: "sk-after",
+		Ready: readyImmediately,
+		SelfTest: func(context.Context, Plan) error {
+			return errors.New("injected self-test failure")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "injected self-test failure") {
+		t.Fatalf("Apply error = %v", err)
+	}
+	if got, readErr := store.Read(); readErr != nil || got != "sk-before" {
+		t.Fatalf("credential after rollback set=%v err=%v", got != "", readErr)
+	}
+	if _, statErr := os.Stat(roots.ConfigPath()); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("config after rollback = %v", statErr)
 	}
 }
 
