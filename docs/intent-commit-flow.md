@@ -55,13 +55,31 @@ edges. It keeps groups that are valid and have complete hard-dependency
 closure, then sends only unresolved captures back for correction. Repeated
 membership with the same findings stops the retry loop early.
 
-Outside an active recovery, a bounded provider failure can still use the
-normal evidence-based partition. Hard path, object, and rename relationships
-stay together. Source/test, migration/test, exact references, generated
-artifacts, persisted membership, and corroborated symbol or hunk evidence may
-join components. Time or directory proximity alone never joins them. The
-result passes the same materialization, verification, exact-ref CAS, and
-publication journal checks as a provider plan.
+When a completed plan still matches the same fingerprint, ACD reloads and
+revalidates that plan instead of asking the provider again or rebuilding an
+evidence partition. Planner windows report this as `completed_plan_reuse`.
+
+Outside an active recovery, a bounded planning failure can still use the normal
+evidence-based partition. Hard path, object, and rename relationships stay
+together. Source/test, migration/test, exact references, generated artifacts,
+persisted membership, and corroborated symbol or hunk evidence may join new
+captures. Time or directory proximity alone never joins them.
+
+A published candidate is a firm fallback boundary. If a hard edge reaches a
+recent private ACD commit, ACD first makes one semantic repair replan. A valid
+result may merge or repartition the repairable suffix, but it must pass the
+existing repair journal, backup-ref, materialization, verification, and
+exact-ref CAS checks. Planner windows report this as `repair_replan`.
+
+If that replan fails, ACD leaves the earlier commit OIDs unchanged. It groups
+only the new captures and records the earlier candidates as dependencies. The
+new group still needs a locked message-only rewrite before it can publish.
+Planner windows report this as `dependent_message_fallback`.
+
+If message generation is unavailable, ACD does not publish a generic message
+such as `Update <path>`. The candidate remains waiting across daemon restarts
+and retries after the provider recovers. Planner windows and diagnostics report
+`waiting_message_rewrite` until a meaningful message is available.
 
 ACD uses `needs_attention` only when it cannot prove a safe outcome.
 Examples include unresolved dependency ambiguity, failed materialization or
@@ -84,16 +102,15 @@ Recovery then alternates between two bounded modes:
 1. `semantic_replan` offers only unresolved target events to the configured
    provider. Published events satisfy dependencies and appear only as recent
    history.
-2. If that plan stalls, `local_unlock` publishes the smallest safe hard
-   dependency component. A singleton is allowed. The next pass returns to
+2. If that plan stalls, `local_unlock` selects the smallest safe hard
+   dependency component. A singleton is allowed. It publishes only after a
+   locked semantic message is available. The next pass returns to
    `semantic_replan` with a new `HEAD`, remaining target, and fingerprint.
 
-A local unlock uses a deterministic message but still passes materialization,
+A local unlock uses deterministic membership and still passes materialization,
 verification, the publication journal, exact-ref CAS, and index reconciliation.
-It never calls the remote provider. If the provider circuit is open, ACD keeps
-publishing one local component per pass and resumes semantic planning at the
-next allowed half-open probe. Later captures remain outside the frozen recovery
-target.
+It waits if the provider circuit cannot supply a semantic message. Later
+captures remain outside the frozen recovery target.
 
 History repair remains a bounded optimization. If its time horizon has expired
 or the published suffix is no longer safe to rewrite, ACD retires the blocking

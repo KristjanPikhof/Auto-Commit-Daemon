@@ -197,11 +197,21 @@ func replayIntentCandidateBatch(
 			continue
 		}
 		for _, prerequisite := range decision.Assignment.DependsOnCandidates {
-			if _, ok := publishedCandidates[prerequisite]; !ok {
-				sum.Skipped = true
-				sum.SkippedReason = "intent_v2_prerequisite_pending"
-				return sum, nil
+			if _, ok := publishedCandidates[prerequisite]; ok {
+				continue
 			}
+			candidate, ok, loadErr := state.IntentCandidateByID(
+				ctx, db, prerequisite)
+			if loadErr != nil {
+				return sum, loadErr
+			}
+			if ok && (candidate.Status == state.IntentCandidateSoftPublished ||
+				candidate.Status == state.IntentCandidatePublished) {
+				continue
+			}
+			sum.Skipped = true
+			sum.SkippedReason = "intent_v2_prerequisite_pending"
+			return sum, nil
 		}
 		selected := make([]intentReplayItem, 0, len(decision.Candidate.Events))
 		hasPublished := false

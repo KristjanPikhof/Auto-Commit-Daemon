@@ -13,14 +13,21 @@ path.
 
 ## Get protected
 
-From the Git repository you want to protect:
+Install the checkpoint-first binary, enter the Git repository you want to
+protect, then run:
 
 ~~~bash
 acd setup
 ~~~
 
-The first setup inspects the machine and repository, prints an exact plan,
-asks once, and applies the plan transactionally. It configures one user-level
+First setup asks four short questions about grouping, commit messages, and the
+provider. The recommended local provider works offline. A custom
+OpenAI-compatible provider asks for its endpoint, model, and bearer token.
+ACD then shows one exact plan and explains what can leave the machine. After
+you approve it, ACD tests the provider with fixed synthetic text before it
+changes anything.
+
+Setup configures one user-level
 supervisor, enables the current repository, merges detected optional
 integrations, and runs an isolated checkpoint/publish/restore self-test. Later
 compatible upgrades use a bounded binary-and-hooks transaction without
@@ -48,16 +55,18 @@ Preview without writes or supervisor/service actions:
 acd setup --dry-run
 ~~~
 
-Noninteractive setup requires an exact reviewed plan when an installation or
-v19 repository already exists:
+Noninteractive first setup always requires an exact reviewed JSON plan:
 
 ~~~bash
 acd setup --dry-run --json
-acd setup --yes --non-interactive --expect-plan sha256:...
+acd setup --yes --non-interactive --expect-plan sha256:... \
+  --confirm-intent-repair
 ~~~
 
-Fresh installations use the deterministic provider with Intent/Fast,
-structural verification, repair disabled, and diff egress disabled. Existing
+Fresh installations use Everyday Intent/Balanced, imperative commit messages,
+the local deterministic provider, structural checks, bounded private repair,
+and no diff egress. These are user defaults inherited by this repository and
+repositories added later. Existing
 repositories retain their effective provider, strategy, preset, verification,
 and repair settings during the one-shot v19 to v20 cutover.
 
@@ -142,6 +151,15 @@ checkpoint-backed event target and lets the configured event or Intent
 publication strategy create the same reviewable, atomic local commits it
 would create during normal operation. Edits made after the barrier are left
 for the next publication pass.
+
+Intent fallback preserves commits that were already published. When new work
+depends on a recent private ACD commit, ACD first tries one bounded semantic
+replan of that repairable suffix. If replanning fails, ACD keeps the existing
+commit OIDs and publishes only the new captures as a dependent commit. That new
+commit must have a meaningful generated message. If the provider is
+unavailable, publication waits and retries instead of creating a generic
+`Update <path>` commit. A completed plan is reused while its repository
+fingerprint remains unchanged.
 
 See [the command reference](docs/commands.md) for flags, JSON, exit codes, and
 the compatibility map.

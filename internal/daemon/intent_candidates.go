@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -146,14 +147,20 @@ const (
 )
 
 type intentCandidateContinuation struct {
-	TargetID   string
-	SourceIDs  []string
-	HoldReason string
+	TargetID   string   `json:"target_id"`
+	SourceIDs  []string `json:"source_ids,omitempty"`
+	HoldReason string   `json:"hold_reason,omitempty"`
+}
+
+type resolvedIntentPlanRun struct {
+	Plan          ai.IntentPlanV2               `json:"plan"`
+	Continuations []intentCandidateContinuation `json:"continuations,omitempty"`
 }
 
 type intentCandidateContinuationOptions struct {
 	RewriteDeterministicMessage bool
 	IncludePersistedCompanions  bool
+	PreservePersistedBoundaries bool
 }
 
 // EvaluateIntentCandidates builds and persists the dependency graph, evaluates
@@ -239,6 +246,10 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	if len(input.RecentSoftCommits) == 0 {
+		input.RecentSoftCommits = recentIntentSoftCommitSummaries(
+			existing, allCaptures, input.Now)
+	}
 	dependencies, err := BuildIntentCandidateDependencies(input.BranchRef,
 		input.BranchGeneration, allCaptures, input.Hints, input.Now)
 	if err != nil {
@@ -298,14 +309,19 @@ func EvaluateIntentCandidates(
 	}
 	input.allowSemanticPlan = result.ResolutionMode == "provider" ||
 		result.ResolutionMode == "local_repair" ||
-		result.ResolutionMode == "partial_replan"
+		result.ResolutionMode == "partial_replan" ||
+		result.ResolutionMode == "repair_replan"
 	plan, err = stabilizeIntentCandidatePlan(plan, existing, input.BranchRef,
 		input.BranchGeneration)
 	if err != nil {
 		return result, err
 	}
+	validationBaseRequest := req
+	if result.Fallback != "" {
+		validationBaseRequest = normalizeIntentFallbackBoundaries(req)
+	}
 	validationRequest := intentCandidateContinuationValidationRequest(
-		req, continuations)
+		validationBaseRequest, continuations)
 	if validationErr := ai.ValidateIntentPlanV2(validationRequest, plan); validationErr != nil {
 		if input.Preset == config.PresetQuality {
 			return result, validationErr
@@ -372,7 +388,7 @@ func EvaluateIntentCandidates(
 		}
 	}
 	validationRequest = intentCandidateContinuationValidationRequest(
-		req, continuations)
+		validationBaseRequest, continuations)
 	if err := ai.ValidateIntentPlanV2(validationRequest, plan); err != nil {
 		return result, err
 	}
@@ -802,6 +818,93 @@ func buildIntentCandidateRequest(
 	})
 }
 
+func recentIntentSoftCommitSummaries(
+	candidates []state.IntentCandidate,
+	captures []IntentCandidateCapture,
+	now time.Time,
+) []ai.IntentSoftCommitSummary {
+	pathBySeq := make(map[int64]string, len(captures))
+	for _, capture := range captures {
+		pathBySeq[capture.Event.Seq] = capture.Event.Path
+	}
+	var summaries []ai.IntentSoftCommitSummary
+	for _, candidate := range candidates {
+		if candidate.Status != state.IntentCandidateSoftPublished ||
+			!candidate.PublishedCommitOID.Valid ||
+			!candidate.SoftPublicationDeadline.Valid ||
+			candidate.SoftPublicationDeadline.Float64 <=
+				float64(now.UnixNano())/1e9 {
+			continue
+		}
+		pathSet := make(map[string]struct{})
+		for _, event := range candidate.Events {
+			if path := pathBySeq[event.EventSeq]; path != "" {
+				pathSet[path] = struct{}{}
+			}
+		}
+		paths := make([]string, 0, len(pathSet))
+		for path := range pathSet {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		publishedTS := candidate.UpdatedTS
+		if candidate.ReadyTS.Valid {
+			publishedTS = candidate.ReadyTS.Float64
+		}
+		summaries = append(summaries, ai.IntentSoftCommitSummary{
+			CandidateID: candidate.ID,
+			OID:         candidate.PublishedCommitOID.String,
+			Subject:     intentBoundedLabel(candidate.Purpose, ai.SubjectCap),
+			Paths:       paths,
+			PublishedAt: secondsTime(publishedTS),
+			Deadline:    secondsTime(candidate.SoftPublicationDeadline.Float64),
+		})
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].PublishedAt.After(summaries[j].PublishedAt)
+	})
+	if len(summaries) > ai.IntentRecentSoftCommitCap {
+		summaries = summaries[:ai.IntentRecentSoftCommitCap]
+	}
+	return summaries
+}
+
+func intentRequestTouchesRepairableSuffix(req ai.IntentPlanRequestV2) bool {
+	repairable := make(map[string]struct{}, len(req.RecentSoftCommits))
+	for _, commit := range req.RecentSoftCommits {
+		repairable[commit.CandidateID] = struct{}{}
+	}
+	if len(repairable) == 0 {
+		return false
+	}
+	persistedOwner := make(map[int64]string)
+	for _, candidate := range req.Candidates {
+		if _, ok := repairable[candidate.CandidateID]; !ok {
+			continue
+		}
+		for _, seq := range candidate.SelectedSeqs {
+			persistedOwner[seq] = candidate.CandidateID
+		}
+	}
+	offered := make(map[int64]struct{}, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		offered[capture.Seq] = struct{}{}
+	}
+	for _, edge := range req.Dependencies {
+		if edge.Strength != ai.IntentDependencyHard {
+			continue
+		}
+		_, fromPersisted := persistedOwner[edge.FromSeq]
+		_, toPersisted := persistedOwner[edge.ToSeq]
+		_, fromOffered := offered[edge.FromSeq]
+		_, toOffered := offered[edge.ToSeq]
+		if (fromPersisted && toOffered) || (fromOffered && toPersisted) {
+			return true
+		}
+	}
+	return false
+}
+
 func chooseIntentCandidatePlan(
 	ctx context.Context,
 	req ai.IntentPlanRequestV2,
@@ -815,6 +918,7 @@ func chooseIntentCandidatePlan(
 ) (ai.IntentPlanV2, string, string, int, bool, []intentCandidateContinuation, state.IntentPlanRun, error) {
 	plannerFailure := ""
 	retryCount := 0
+	semanticPlanningFailed := false
 	run := newIntentPlanRun(req, input, retryLimit+1)
 	plannerRequest := req
 	if planner != nil {
@@ -854,6 +958,19 @@ func chooseIntentCandidatePlan(
 			}
 			run = reserved
 			if !allowed {
+				if run.Completed && run.ResolvedPlanJSON.Valid {
+					plan, continuations, loadErr := loadResolvedIntentPlanRun(
+						req, run.ResolvedPlanJSON.String)
+					if loadErr != nil {
+						return ai.IntentPlanV2{}, "", "", retryCount, false,
+							nil, run, loadErr
+					}
+					run.ResolutionMode = sql.NullString{
+						String: "completed_plan_reuse", Valid: true,
+					}
+					return plan, "", "", retryCount, false,
+						continuations, run, nil
+				}
 				break
 			}
 			if previousSignature == "" && run.AttemptCount > 1 &&
@@ -888,6 +1005,11 @@ func chooseIntentCandidatePlan(
 				plannerCallFailed = false
 			}
 			if err == nil {
+				if err := storeResolvedIntentPlanRun(
+					&run, plan, continuations); err != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false,
+						nil, run, err
+				}
 				run.Completed = true
 				mode := "provider"
 				if len(lockedCandidates) > 0 {
@@ -919,10 +1041,16 @@ func chooseIntentCandidatePlan(
 			}
 			var validation *ai.IntentPlanV2ValidationError
 			if errors.As(err, &validation) && len(validation.Findings) > 0 {
+				semanticPlanningFailed = true
 				if repaired, ok := repairIntentCandidateDependencies(
 					intentCandidateContinuationValidationRequest(req, continuations),
 					plan,
 				); ok {
+					if err := storeResolvedIntentPlanRun(
+						&run, repaired, continuations); err != nil {
+						return ai.IntentPlanV2{}, "", "", retryCount,
+							false, nil, run, err
+					}
 					run.Completed = true
 					run.ResolutionMode = sql.NullString{String: "local_repair", Valid: true}
 					run.ProgressState = sql.NullString{String: "completed", Valid: true}
@@ -975,6 +1103,7 @@ func chooseIntentCandidatePlan(
 				plannerFailure = ai.SanitizePlannerError(err.Error())
 				continue
 			}
+			semanticPlanningFailed = false
 			plannerFailure = ai.SanitizePlannerError(err.Error())
 			if health != nil && permitHeld {
 				failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
@@ -985,6 +1114,73 @@ func chooseIntentCandidatePlan(
 			}
 			break
 		}
+	}
+	if planner != nil && semanticPlanningFailed &&
+		intentRequestTouchesRepairableSuffix(req) {
+		repairRequest := req
+		repairRequest.RetryCorrection = strings.TrimSpace(
+			plannerRequest.RetryCorrection + "\n" +
+				"Replan the repairable private ACD suffix with the new captures. " +
+				"You may merge or repartition only the recent soft commits listed " +
+				"in this request. Preserve every other candidate boundary.")
+		repairPlan, repairErr := ai.PlanIntentV2WithCompatibility(
+			prompttrace.WithRetryCount(ctx, retryCount+1), planner, repairRequest)
+		var repairContinuations []intentCandidateContinuation
+		if repairErr == nil {
+			repairContinuations, _, repairErr = continuePersistedIntentCandidates(
+				req, &repairPlan, intentCandidateContinuationOptions{})
+			if repairErr == nil {
+				validationReq := intentCandidateContinuationValidationRequest(
+					req, repairContinuations)
+				repairErr = ai.ValidateIntentPlanV2(validationReq, repairPlan)
+				if repairErr == nil {
+					repairErr = validatePlannerSemanticRationale(
+						validationReq, repairPlan)
+				}
+			}
+		}
+		if repairErr == nil {
+			if err := storeResolvedIntentPlanRun(
+				&run, repairPlan, repairContinuations); err != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false,
+					nil, run, err
+			}
+			run.Completed = true
+			run.ResolutionMode = sql.NullString{
+				String: "repair_replan", Valid: true,
+			}
+			run.ProgressState = sql.NullString{
+				String: "completed", Valid: true,
+			}
+			run.UnresolvedSeqs = nil
+			run.PreservedGroups = nil
+			if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false,
+					nil, run, err
+			}
+			if health != nil && permitHeld {
+				if err := health.Complete(ctx, permit, nil); err != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false,
+						nil, run, err
+				}
+			}
+			return repairPlan, "", "", retryCount, false,
+				repairContinuations, run, nil
+		}
+		var validationErr *ai.IntentPlanV2ValidationError
+		if health != nil && permitHeld && !errors.As(repairErr, &validationErr) {
+			failure := classifyIntentPlannerHealthFailure(repairErr, true)
+			if err := health.Complete(ctx, permit, failure); err != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false,
+					nil, run, err
+			}
+			permitHeld = false
+		}
+		repairFailure := "repair replan: " + repairErr.Error()
+		if plannerFailure != "" {
+			repairFailure = plannerFailure + "; " + repairFailure
+		}
+		plannerFailure = ai.SanitizePlannerError(repairFailure)
 	}
 	if health != nil && permitHeld {
 		// A provider response that failed semantic validation is not a transport
@@ -1002,22 +1198,28 @@ func chooseIntentCandidatePlan(
 	if preset == config.PresetBalanced {
 		plan, fallbackNeedsAttention = balancedIntentCandidatePlan(req)
 	}
-	var messageErr error
-	plan, plannerFailure, messageErr = applyIntentFallbackMessageQuality(
-		ctx, planner, req, plan, plannerFailure)
-	if messageErr != nil {
-		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, messageErr
-	}
+	fallbackReq := normalizeIntentFallbackBoundaries(req)
 	continuations, companionNeedsAttention, err := continuePersistedIntentCandidates(
-		req, &plan, intentCandidateContinuationOptions{
-			RewriteDeterministicMessage: true,
+		fallbackReq, &plan, intentCandidateContinuationOptions{
+			PreservePersistedBoundaries: true,
 			IncludePersistedCompanions:  true,
 		})
 	if err != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
 	}
+	plan = declareIntentFallbackDependencies(
+		intentCandidateContinuationValidationRequest(fallbackReq, continuations), plan)
+	var messageErr error
+	var messageReady bool
+	plan, plannerFailure, messageReady, messageErr = applyIntentFallbackMessageQuality(
+		ctx, planner,
+		intentCandidateContinuationValidationRequest(fallbackReq, continuations),
+		plan, plannerFailure)
+	if messageErr != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, messageErr
+	}
 	validationErr := ai.ValidateIntentPlanV2(
-		intentCandidateContinuationValidationRequest(req, continuations), plan)
+		intentCandidateContinuationValidationRequest(fallbackReq, continuations), plan)
 	if validationErr != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, validationErr
 	}
@@ -1028,8 +1230,34 @@ func chooseIntentCandidatePlan(
 			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, ensureErr
 		}
 	}
+	if !messageReady {
+		holdIntentFallbackForMessage(&plan)
+		run.Completed = false
+		run.ResolutionMode = sql.NullString{
+			String: "waiting_message_rewrite", Valid: true,
+		}
+		run.ProgressState = sql.NullString{
+			String: "waiting_message_rewrite", Valid: true,
+		}
+		run.UnresolvedSeqs = offeredIntentSeqs(req)
+		run.ResolvedPlanJSON = sql.NullString{}
+		if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+			return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
+				false, nil, run, err
+		}
+		return plan, "waiting_message_rewrite", plannerFailure, retryCount,
+			true, continuations, run, nil
+	}
+	if err := storeResolvedIntentPlanRun(&run, plan, continuations); err != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false,
+			nil, run, err
+	}
 	run.Completed = true
-	run.ResolutionMode = sql.NullString{String: "evidence_partition", Valid: true}
+	resolutionMode := "evidence_partition"
+	if intentPlanDependsOnPersistedCandidate(req, plan) {
+		resolutionMode = "dependent_message_fallback"
+	}
+	run.ResolutionMode = sql.NullString{String: resolutionMode, Valid: true}
 	run.ProgressState = sql.NullString{String: "completed", Valid: true}
 	run.UnresolvedSeqs = nil
 	run.PreservedGroups = nil
@@ -1038,6 +1266,43 @@ func chooseIntentCandidatePlan(
 	}
 	return plan, "evidence_partition", plannerFailure, retryCount,
 		fallbackNeedsAttention || companionNeedsAttention, continuations, run, nil
+}
+
+func storeResolvedIntentPlanRun(
+	run *state.IntentPlanRun,
+	plan ai.IntentPlanV2,
+	continuations []intentCandidateContinuation,
+) error {
+	raw, err := json.Marshal(resolvedIntentPlanRun{
+		Plan: plan, Continuations: continuations,
+	})
+	if err != nil {
+		return fmt.Errorf("daemon: encode resolved intent plan: %w", err)
+	}
+	if len(raw) > state.IntentResolvedPlanJSONCap {
+		return fmt.Errorf("daemon: resolved intent plan exceeds %d bytes",
+			state.IntentResolvedPlanJSONCap)
+	}
+	run.ResolvedPlanJSON = sql.NullString{String: string(raw), Valid: true}
+	return nil
+}
+
+func loadResolvedIntentPlanRun(
+	req ai.IntentPlanRequestV2,
+	raw string,
+) (ai.IntentPlanV2, []intentCandidateContinuation, error) {
+	var resolved resolvedIntentPlanRun
+	if err := json.Unmarshal([]byte(raw), &resolved); err != nil {
+		return ai.IntentPlanV2{}, nil,
+			fmt.Errorf("daemon: decode resolved intent plan: %w", err)
+	}
+	validationReq := intentCandidateContinuationValidationRequest(
+		req, resolved.Continuations)
+	if err := ai.ValidateIntentPlanV2(validationReq, resolved.Plan); err != nil {
+		return ai.IntentPlanV2{}, nil,
+			fmt.Errorf("daemon: validate resolved intent plan: %w", err)
+	}
+	return resolved.Plan, resolved.Continuations, nil
 }
 
 func validatePlannerSemanticRationale(
@@ -1314,22 +1579,57 @@ func applyIntentFallbackMessageQuality(
 	req ai.IntentPlanRequestV2,
 	plan ai.IntentPlanV2,
 	plannerFailure string,
-) (ai.IntentPlanV2, string, error) {
+) (ai.IntentPlanV2, string, bool, error) {
 	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
-		return plan, plannerFailure, nil
+		return plan, plannerFailure, false, nil
 	}
 	rewritten, err := ai.ApplyIntentV2MessageQuality(ctx, planner, req, plan)
 	if err == nil {
-		return rewritten, plannerFailure, nil
+		return rewritten, plannerFailure, true, nil
 	}
 	if ctx.Err() != nil {
-		return ai.IntentPlanV2{}, plannerFailure, ctx.Err()
+		return ai.IntentPlanV2{}, plannerFailure, false, ctx.Err()
 	}
 	messageFailure := "message quality fallback: " + err.Error()
 	if plannerFailure != "" {
 		messageFailure = plannerFailure + "; " + messageFailure
 	}
-	return plan, ai.SanitizePlannerError(messageFailure), nil
+	return plan, ai.SanitizePlannerError(messageFailure), false, nil
+}
+
+func holdIntentFallbackForMessage(plan *ai.IntentPlanV2) {
+	for i := range plan.Candidates {
+		candidate := &plan.Candidates[i]
+		if candidate.Readiness != ai.IntentCandidateReady {
+			continue
+		}
+		candidate.Readiness = ai.IntentCandidateWait
+		candidate.Subject = ""
+		candidate.Body = ""
+		if !containsIntentString(candidate.MissingCompanions,
+			"semantic commit message unavailable") {
+			candidate.MissingCompanions = append(candidate.MissingCompanions,
+				"semantic commit message unavailable")
+		}
+	}
+}
+
+func intentPlanDependsOnPersistedCandidate(
+	req ai.IntentPlanRequestV2,
+	plan ai.IntentPlanV2,
+) bool {
+	persisted := make(map[string]struct{}, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		persisted[candidate.CandidateID] = struct{}{}
+	}
+	for _, candidate := range plan.Candidates {
+		for _, dependencyID := range candidate.DependsOnCandidates {
+			if _, ok := persisted[dependencyID]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // repairIntentCandidateDependencies adds only dependency declarations already
@@ -1386,6 +1686,44 @@ func repairIntentCandidateDependencies(
 		return plan, false
 	}
 	return repaired, true
+}
+
+func declareIntentFallbackDependencies(
+	req ai.IntentPlanRequestV2,
+	plan ai.IntentPlanV2,
+) ai.IntentPlanV2 {
+	repaired := cloneIntentPlanV2(plan)
+	owner := make(map[int64]string, len(req.OfferedCaptures))
+	output := make(map[string]int, len(repaired.Candidates))
+	for i, candidate := range repaired.Candidates {
+		output[candidate.CandidateID] = i
+		for _, seq := range candidate.SelectedSeqs {
+			owner[seq] = candidate.CandidateID
+		}
+	}
+	for _, candidate := range req.Candidates {
+		for _, seq := range candidate.SelectedSeqs {
+			if _, exists := owner[seq]; !exists {
+				owner[seq] = candidate.CandidateID
+			}
+		}
+	}
+	for _, edge := range req.Dependencies {
+		if edge.Strength != ai.IntentDependencyHard {
+			continue
+		}
+		fromID, fromOK := owner[edge.FromSeq]
+		toID, toOK := owner[edge.ToSeq]
+		toIndex, toIsOutput := output[toID]
+		if !fromOK || !toOK || fromID == toID || !toIsOutput ||
+			containsIntentString(
+				repaired.Candidates[toIndex].DependsOnCandidates, fromID) {
+			continue
+		}
+		repaired.Candidates[toIndex].DependsOnCandidates = append(
+			repaired.Candidates[toIndex].DependsOnCandidates, fromID)
+	}
+	return repaired
 }
 
 func cloneIntentPlanV2(plan ai.IntentPlanV2) ai.IntentPlanV2 {
@@ -1793,6 +2131,40 @@ func holdIntentCandidatePlan(req ai.IntentPlanRequestV2) ai.IntentPlanV2 {
 	return plan
 }
 
+func normalizeIntentFallbackBoundaries(
+	req ai.IntentPlanRequestV2,
+) ai.IntentPlanRequestV2 {
+	normalized := req
+	normalized.Dependencies = append(
+		[]ai.IntentCaptureDependency(nil), req.Dependencies...)
+	protected := make(map[int64]struct{})
+	for _, candidate := range req.Candidates {
+		if candidate.Status != state.IntentCandidateSoftPublished &&
+			candidate.Status != state.IntentCandidatePublished {
+			continue
+		}
+		for _, seq := range candidate.SelectedSeqs {
+			protected[seq] = struct{}{}
+		}
+	}
+	offered := make(map[int64]struct{}, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		offered[capture.Seq] = struct{}{}
+	}
+	for i := range normalized.Dependencies {
+		edge := &normalized.Dependencies[i]
+		if edge.Strength != ai.IntentDependencyHard {
+			continue
+		}
+		_, fromOffered := offered[edge.FromSeq]
+		_, toProtected := protected[edge.ToSeq]
+		if fromOffered && toProtected {
+			edge.FromSeq, edge.ToSeq = edge.ToSeq, edge.FromSeq
+		}
+	}
+	return normalized
+}
+
 // continuePersistedIntentCandidates computes the full hard closure across
 // offered assignments and durable candidates. When a bridge joins multiple
 // candidates it chooses one deterministic survivor and asks the state layer to
@@ -1835,7 +2207,12 @@ func continuePersistedIntentCandidates(
 		}
 	}
 	persistedOwner := make(map[int64]string)
+	protectedCandidate := make(map[string]struct{})
 	for _, candidate := range req.Candidates {
+		if candidate.Status == state.IntentCandidateSoftPublished ||
+			candidate.Status == state.IntentCandidatePublished {
+			protectedCandidate[candidate.CandidateID] = struct{}{}
+		}
 		var previous int64
 		for _, seq := range candidate.SelectedSeqs {
 			add(seq)
@@ -1856,15 +2233,33 @@ func continuePersistedIntentCandidates(
 		if _, rightOK := parent[edge.ToSeq]; !rightOK {
 			continue
 		}
+		if options.PreservePersistedBoundaries {
+			fromID := persistedOwner[edge.FromSeq]
+			_, toIsOutput := outputOwner[edge.ToSeq]
+			_, protected := protectedCandidate[fromID]
+			if protected && toIsOutput {
+				continue
+			}
+		}
 		union(edge.FromSeq, edge.ToSeq)
 	}
 
 	companionNeedsAttention := false
 	var companionOutputs map[int]struct{}
 	if options.IncludePersistedCompanions {
+		companionPersistedOwner := persistedOwner
+		if options.PreservePersistedBoundaries {
+			companionPersistedOwner = make(map[int64]string, len(persistedOwner))
+			for seq, candidateID := range persistedOwner {
+				if _, protected := protectedCandidate[candidateID]; !protected {
+					companionPersistedOwner[seq] = candidateID
+				}
+			}
+		}
 		companionOutputs, companionNeedsAttention =
 			connectBalancedPersistedCompanions(
-				req, plan, parent, find, union, outputOwner, persistedOwner)
+				req, plan, parent, find, union, outputOwner,
+				companionPersistedOwner)
 	}
 
 	type hardClosure struct {

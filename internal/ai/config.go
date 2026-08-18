@@ -187,11 +187,12 @@ type ProviderConfig struct {
 type ConfirmationRequirement string
 
 const (
-	ConfirmationEndpointCredentials ConfirmationRequirement = "endpoint_credentials"
-	ConfirmationSubprocessExecution ConfirmationRequirement = "subprocess_execution"
-	ConfirmationDiffEgress          ConfirmationRequirement = "diff_egress"
-	ConfirmationVerificationCommand ConfirmationRequirement = "verification_command"
-	ConfirmationIntentRepair        ConfirmationRequirement = "intent_repair"
+	ConfirmationEndpointCredentials         ConfirmationRequirement = "endpoint_credentials"
+	ConfirmationInsecureEndpointCredentials ConfirmationRequirement = "insecure_endpoint_credentials"
+	ConfirmationSubprocessExecution         ConfirmationRequirement = "subprocess_execution"
+	ConfirmationDiffEgress                  ConfirmationRequirement = "diff_egress"
+	ConfirmationVerificationCommand         ConfirmationRequirement = "verification_command"
+	ConfirmationIntentRepair                ConfirmationRequirement = "intent_repair"
 )
 
 // ProviderValidation is the non-secret result of validating provider
@@ -428,7 +429,7 @@ func ValidateProviderConfig(cfg ProviderConfig) (ProviderValidation, error) {
 	switch {
 	case mode == "deterministic":
 	case mode == "openai-compat":
-		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, true)
+		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, false)
 		if err != nil {
 			return ProviderValidation{}, sanitizeProviderError(err)
 		}
@@ -444,6 +445,9 @@ func ValidateProviderConfig(cfg ProviderConfig) (ProviderValidation, error) {
 		defaultURL, _ := normalizeOpenAIBaseURL(DefaultOpenAIBaseURL, true)
 		if baseURL != defaultURL {
 			validation.Confirmations = append(validation.Confirmations, ConfirmationEndpointCredentials)
+		}
+		if strings.HasPrefix(baseURL, "http://") {
+			validation.Confirmations = append(validation.Confirmations, ConfirmationInsecureEndpointCredentials)
 		}
 	case strings.HasPrefix(mode, "subprocess:"):
 		if strings.TrimSpace(strings.TrimPrefix(mode, "subprocess:")) == "" {
@@ -469,7 +473,7 @@ func buildPrimaryProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 		logger = slog.Default()
 	}
 	if mode == "openai-compat" {
-		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, true)
+		baseURL, err := normalizeOpenAIBaseURL(cfg.BaseURL, false)
 		if err != nil {
 			return nil, nil, err
 		}
