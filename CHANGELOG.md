@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-08-18
+
 ### Added
 
 - `acd setup` now guides a fresh user through Everyday or Maximum Speed,
