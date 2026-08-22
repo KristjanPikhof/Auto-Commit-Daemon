@@ -18,12 +18,22 @@ func withQuiescedRepositoryRuntime(
 	repositoryID string,
 	operation func(context.Context) error,
 ) error {
+	return withQuiescedRepositoryRuntimeForCommand(ctx, roots, repositoryID, "acd fix", operation)
+}
+
+func withQuiescedRepositoryRuntimeForCommand(
+	ctx context.Context,
+	roots paths.Roots,
+	repositoryID string,
+	command string,
+	operation func(context.Context) error,
+) error {
 	if operation == nil {
-		return errors.New("acd fix: nil recovery operation")
+		return fmt.Errorf("%s: nil repository maintenance operation", command)
 	}
 	registry, err := central.Load(roots)
 	if err != nil {
-		return fmt.Errorf("acd fix: load registry for runtime maintenance: %w", err)
+		return fmt.Errorf("%s: load registry for runtime maintenance: %w", command, err)
 	}
 	enabled := make([]central.RepoRecord, 0)
 	for _, record := range registry.Repos {
@@ -41,10 +51,10 @@ func withQuiescedRepositoryRuntime(
 		}
 		response, callErr := client.Do(ctx, request)
 		if callErr != nil {
-			return fmt.Errorf("acd fix: protect worktree %s before recovery: %w", record.Path, callErr)
+			return fmt.Errorf("%s: protect worktree %s before maintenance: %w", command, record.Path, callErr)
 		}
 		if response.Error != nil {
-			return fmt.Errorf("acd fix: protect worktree %s before recovery: %s", record.Path, response.Error.Message)
+			return fmt.Errorf("%s: protect worktree %s before maintenance: %s", command, record.Path, response.Error.Message)
 		}
 	}
 
@@ -54,17 +64,17 @@ func withQuiescedRepositoryRuntime(
 		DeadlineMS: time.Now().Add(30 * time.Second).UnixMilli(),
 	})
 	if err != nil {
-		return fmt.Errorf("acd fix: stop shared repository worker: %w", err)
+		return fmt.Errorf("%s: stop shared repository worker: %w", command, err)
 	}
 	if beginResponse.Error != nil {
-		return fmt.Errorf("acd fix: stop shared repository worker: %s", beginResponse.Error.Message)
+		return fmt.Errorf("%s: stop shared repository worker: %s", command, beginResponse.Error.Message)
 	}
 	lease, err := decodeProductData[supervisor.MaintenanceLease](beginResponse.Data)
 	if err != nil {
-		return fmt.Errorf("acd fix: decode repository maintenance lease: %w", err)
+		return fmt.Errorf("%s: decode repository maintenance lease: %w", command, err)
 	}
 	if lease.Token == "" {
-		return errors.New("acd fix: repository maintenance lease has no token")
+		return fmt.Errorf("%s: repository maintenance lease has no token", command)
 	}
 
 	operationCtx, cancelOperation := context.WithCancel(ctx)
@@ -89,7 +99,7 @@ func withQuiescedRepositoryRuntime(
 	}
 	endCancel()
 	if endErr != nil {
-		endErr = fmt.Errorf("acd fix: restore shared repository worker: %w", endErr)
+		endErr = fmt.Errorf("%s: restore shared repository worker: %w", command, endErr)
 	}
 	return errors.Join(operationErr, renewErr, endErr)
 }
