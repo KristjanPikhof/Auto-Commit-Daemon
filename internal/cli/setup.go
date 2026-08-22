@@ -203,7 +203,7 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 		if err := renderSetupPlan(cmd, plan, false); err != nil {
 			return err
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Status: The ACD installation is ready.")
+		fmt.Fprintln(cmd.OutOrStdout(), "Status: ACD installation is ready.")
 		renderSetupNextAction(cmd.OutOrStdout(), plan)
 		return nil
 	}
@@ -282,7 +282,7 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 			}{Result: result, Plan: plan}}, true)
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Setup complete.")
-	fmt.Fprintln(cmd.OutOrStdout(), "Status: The ACD installation is ready.")
+	fmt.Fprintln(cmd.OutOrStdout(), "Status: ACD installation is ready.")
 	fmt.Fprintln(cmd.OutOrStdout(), "Repositories: Existing enablement was preserved; no repository was added.")
 	if onboardingState != nil {
 		fmt.Fprintf(cmd.OutOrStdout(), "Preferences: %s, %s commits, %s provider.\n",
