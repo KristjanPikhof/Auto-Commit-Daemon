@@ -610,6 +610,20 @@ func TestApplyControlStatusManualPauseStillNeedsAttention(t *testing.T) {
 	}
 }
 
+func TestApplyControlStatusStorageWarningDoesNotHideRecoveryRequirement(t *testing.T) {
+	status := statusReport{
+		Daemon:                        "running",
+		PID:                           os.Getpid(),
+		CheckpointRetentionOverBudget: true,
+		ActiveBarriers:                1,
+	}
+	result := controlResult{OK: true}
+	applyControlStatus(&result, status)
+	if !result.RecoveryRequired || result.Health != controlHealthNeedsAttention {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T) {
 	health := &daemon.IntentPlannerHealthSnapshot{State: daemon.IntentPlannerCircuitOpen}
 	for _, tc := range []struct {

@@ -557,6 +557,8 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	res.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 	res.CheckpointID = status.LatestCheckpointID
 	res.PublicationDrain = status.PublicationDrain
+	res.RecoveryRequired = status.Replay.State == "needs_attention" ||
+		status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0
 
 	switch {
 	case status.CheckpointRetentionOverBudget:
@@ -617,13 +619,11 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.NextAction = "No action needed. If planning stalls, ACD switches to safe local groups automatically."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
-		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
-		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A blocked publication needs recovery on the active branch."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
