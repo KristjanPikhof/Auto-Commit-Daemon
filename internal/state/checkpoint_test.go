@@ -155,7 +155,7 @@ func TestCompletedCheckpointForBarrierMatchesExactIdentity(t *testing.T) {
 			ObservationEpoch: 10, CoverageEpoch: 10,
 			ObservedHead: "feature-head", ObservedRef: "refs/heads/feature",
 			TreeOID: "feature-tree", CommitOID: "feature-commit",
-			Ref: "refs/acd/checkpoints/v1/0123456789abcdef/cp-1786060000010-aaaaaaaaaaaaaaaa",
+			Ref:       "refs/acd/checkpoints/v1/0123456789abcdef/cp-1786060000010-aaaaaaaaaaaaaaaa",
 			CreatedTS: 10,
 		},
 		{
@@ -164,7 +164,7 @@ func TestCompletedCheckpointForBarrierMatchesExactIdentity(t *testing.T) {
 			ObservationEpoch: 11, CoverageEpoch: 11,
 			ObservedHead: "main-head", ObservedRef: "refs/heads/main",
 			TreeOID: "peer-tree", CommitOID: "peer-commit",
-			Ref: "refs/acd/checkpoints/v1/fedcba9876543210/cp-1786060000011-bbbbbbbbbbbbbbbb",
+			Ref:       "refs/acd/checkpoints/v1/fedcba9876543210/cp-1786060000011-bbbbbbbbbbbbbbbb",
 			CreatedTS: 11,
 		},
 		{
@@ -173,7 +173,7 @@ func TestCompletedCheckpointForBarrierMatchesExactIdentity(t *testing.T) {
 			ObservationEpoch: 12, CoverageEpoch: 12,
 			ObservedHead: "main-head", ObservedRef: "refs/heads/main",
 			TreeOID: "main-tree", CommitOID: "main-commit",
-			Ref: "refs/acd/checkpoints/v1/0123456789abcdef/cp-1786060000012-cccccccccccccccc",
+			Ref:       "refs/acd/checkpoints/v1/0123456789abcdef/cp-1786060000012-cccccccccccccccc",
 			CreatedTS: 12,
 		},
 	}
@@ -199,8 +199,7 @@ func TestCompletedCheckpointForBarrierMatchesExactIdentity(t *testing.T) {
 		t.Fatalf("future checkpoint=(%t,%v), want false,nil", ok, err)
 	}
 	if _, _, err := CompletedCheckpointForBarrier(
-		ctx, db, "short", 1, "refs/heads/main");
-		!errors.Is(err, ErrCheckpointIdentityMismatch) {
+		ctx, db, "short", 1, "refs/heads/main"); !errors.Is(err, ErrCheckpointIdentityMismatch) {
 		t.Fatalf("invalid identity error=%v", err)
 	}
 }

@@ -220,11 +220,12 @@ INSERT INTO capture_events(
 		{State: state.EventStateRecovered},
 		{State: state.EventStateFailed},
 	})
-	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "99"); err != nil {
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
 	}
 
-	target, err := freezePublicationDrainTarget(ctx, db, repo, checkpointID, anchor)
+	target, err := freezePublicationDrainTarget(
+		ctx, db, repo, checkpointID, "0123456789abcdef", 1, anchor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,13 +251,14 @@ INSERT INTO capture_events(
 		"symbolic-ref", "HEAD", "refs/heads/switched"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := freezePublicationDrainTarget(ctx, db, repo, checkpointID, anchor); err == nil ||
+	if _, err := freezePublicationDrainTarget(
+		ctx, db, repo, checkpointID, "0123456789abcdef", 1, anchor); err == nil ||
 		!strings.Contains(err.Error(), "branch changed") {
 		t.Fatalf("branch switch error=%v", err)
 	}
 }
 
-func TestFreezeEmptyPublicationDrainTargetUsesPreBarrierGeneration(t *testing.T) {
+func TestFreezeEmptyPublicationDrainTargetRequiresCurrentGeneration(t *testing.T) {
 	ctx := context.Background()
 	repo := materializeTestRepo(t, false)
 	db, err := state.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
@@ -268,8 +270,17 @@ func TestFreezeEmptyPublicationDrainTargetUsesPreBarrierGeneration(t *testing.T)
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "99"); err != nil {
 		t.Fatal(err)
 	}
-	target, err := freezePublicationDrainTarget(ctx, db, repo, "cp-empty",
-		publicationDrainTarget{BranchRef: "refs/heads/main", Generation: 7})
+	anchor := publicationDrainTarget{BranchRef: "refs/heads/main", Generation: 7}
+	if _, err := freezePublicationDrainTarget(
+		ctx, db, repo, "cp-empty", "0123456789abcdef", 1, anchor); err == nil ||
+		!strings.Contains(err.Error(), "generation changed") {
+		t.Fatalf("generation mismatch error=%v", err)
+	}
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
+		t.Fatal(err)
+	}
+	target, err := freezePublicationDrainTarget(
+		ctx, db, repo, "cp-empty", "0123456789abcdef", 1, anchor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,6 +322,7 @@ INSERT INTO capture_events(
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
+			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {
 			accepted, _, err := state.MetaGet(ctx, db, daemon.MetaKeyProtectionObservationEpoch)
@@ -374,6 +386,7 @@ func TestCommitAllCheckpointBarrierRejectsStagedIndexBeforeWake(t *testing.T) {
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
+			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {
 			wakeCalls++
@@ -434,6 +447,7 @@ func TestCommitAllCheckpointBarrierConsumesStagedAfterCheckpoint(t *testing.T) {
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
+			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {
 			accepted, _, metaErr := state.MetaGet(
@@ -509,6 +523,7 @@ func TestCommitAllDrainDetachAndReattachKeepsSameOperation(t *testing.T) {
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
+			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {},
 	}
@@ -590,6 +605,7 @@ func TestCheckpointBarrierReturnsMeasuredFinalDrainProgress(t *testing.T) {
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
+			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {
 			accepted, _, err := state.MetaGet(ctx, db, daemon.MetaKeyProtectionObservationEpoch)
