@@ -25,11 +25,30 @@ func ensureMutationSupervisor(ctx context.Context, roots paths.Roots) error {
 
 func ensureMutationSupervisorMode(ctx context.Context, roots paths.Roots, backgroundUpgrade bool) (func() error, error) {
 	_ = backgroundUpgrade
+	binary := roots.ManagedBinaryPath()
+	info, err := os.Stat(binary)
+	if err != nil {
+		return nil, fmt.Errorf("managed ACD binary is unavailable; run `acd setup`: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("managed ACD binary is not a regular file; run `acd setup`")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve ACD executable: %w", err)
+	}
+	sourceDigest, err := version.FileDigest(executable)
+	if err != nil {
+		return nil, fmt.Errorf("digest ACD executable: %w", err)
+	}
+	managedDigest, err := version.FileDigest(binary)
+	if err != nil {
+		return nil, fmt.Errorf("digest managed ACD binary; run `acd setup`: %w", err)
+	}
+	if managedDigest != sourceDigest {
+		return nil, errors.New("the installed ACD runtime does not match this command; run `acd setup` to review and apply the global upgrade")
+	}
 	if runtime.GOOS == "darwin" {
-		binary := roots.ManagedBinaryPath()
-		if _, err := os.Stat(binary); err != nil {
-			return nil, fmt.Errorf("managed ACD binary is unavailable; run `acd setup`: %w", err)
-		}
 		if err := supervisor.EnsureSession(ctx, roots, binary, roots.SupervisorLogPath()); err != nil {
 			return nil, err
 		}
@@ -50,16 +69,8 @@ func ensureMutationSupervisorMode(ctx context.Context, roots paths.Roots, backgr
 	if err != nil {
 		return nil, err
 	}
-	executable, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("resolve ACD executable: %w", err)
-	}
-	digest, err := version.FileDigest(executable)
-	if err != nil {
-		return nil, fmt.Errorf("digest ACD executable: %w", err)
-	}
 	compatibility := runtimeCompatibility()
-	if status.Version != version.String() || status.BinaryDigest != digest {
+	if status.Version != version.String() || status.BinaryDigest != sourceDigest {
 		return nil, errors.New("the installed ACD runtime does not match this command; run `acd setup` to review and apply the global upgrade")
 	}
 	if !status.Compatibility.Equal(compatibility) {
