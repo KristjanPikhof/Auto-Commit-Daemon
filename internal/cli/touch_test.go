@@ -17,6 +17,7 @@ func TestTouch_RefreshesLastSeenOnly(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	if err := state.RegisterClient(ctx, db, state.Client{
 		SessionID: "s1", Harness: "claude-code",
 	}); err != nil {
@@ -66,6 +67,7 @@ func TestTouch_SkipsWhenControlLockHeld(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	_ = db.Close()
 
 	// Hold the control lock for the duration of the call.
@@ -108,6 +110,7 @@ func TestTouch_LazyRegistersUnknownSession(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	_ = db.Close()
 	_, _, restore := installFakeSignal(t)
 	defer restore()
@@ -134,6 +137,7 @@ func TestTouch_SoftBoundaryPersistsRepoWideEpochAndSignals(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	if err := state.RegisterClient(ctx, db, state.Client{
 		SessionID: "codex-session", Harness: "codex",
 	}); err != nil {

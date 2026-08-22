@@ -38,6 +38,7 @@ func TestFlush_HeartbeatOnlyDoesNotEnqueueOrSignal(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	if err := state.RegisterClient(ctx, db, state.Client{
 		SessionID: "s1", Harness: "claude-code",
 	}); err != nil {
@@ -328,6 +329,7 @@ func TestFlush_SkipsWhenControlLockHeld(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	_ = db.Close()
 
 	count, _, restore := installFakeSignal(t)
@@ -362,6 +364,7 @@ func TestFlush_PropagatesUnexpectedLockError(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	_ = db.Close()
 	_, _, restore := installFakeSignal(t)
 	defer restore()
@@ -505,6 +508,7 @@ func TestFlush_SkippedJSONOmitsZeroLastSeenTS(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	_ = db.Close()
 
 	_, _, restore := installFakeSignal(t)

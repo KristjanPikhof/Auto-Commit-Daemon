@@ -88,6 +88,13 @@ func withSpawnPollSettings(t *testing.T, timeout, interval time.Duration) {
 
 func makeStartRepo(t *testing.T) string {
 	t.Helper()
+	repoDir := makeUnregisteredStartRepo(t)
+	registerEnabledStartRepo(t, repoDir)
+	return repoDir
+}
+
+func makeUnregisteredStartRepo(t *testing.T) string {
+	t.Helper()
 	ctx := context.Background()
 	repoDir := t.TempDir()
 	if err := git.Init(ctx, repoDir); err != nil {
@@ -97,6 +104,31 @@ func makeStartRepo(t *testing.T) string {
 		t.Fatalf("symbolic-ref HEAD: %v", err)
 	}
 	return repoDir
+}
+
+func registerEnabledStartRepo(t *testing.T, repoDir string) {
+	t.Helper()
+	ctx := context.Background()
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	roots, err := paths.Resolve()
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		registration, err := registry.RegisterResolvedRepo(wt, "", time.Now().Unix())
+		if err != nil {
+			return err
+		}
+		registry.EnableRepo(central.RepoRemovalTarget{
+			Path: registration.Record.Path, StateDB: registration.Record.StateDB,
+		}, time.Now().Unix())
+		return nil
+	}); err != nil {
+		t.Fatalf("register enabled repository: %v", err)
+	}
 }
 
 func openStartDB(t *testing.T, repoDir string) *state.DB {
@@ -212,13 +244,14 @@ func TestStartCanonicalWriterStartupStateConverges(t *testing.T) {
 func TestStartLinkedWorktreeOwnerRefusesSecondWriter(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	mainRepo := makeStartRepo(t)
+	mainRepo := makeUnregisteredStartRepo(t)
 	withSpawnPollSettings(t, 50*time.Millisecond, 5*time.Millisecond)
 	commitStartRepoSeed(t, mainRepo)
 	linked := filepath.Join(t.TempDir(), "linked")
 	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-owner", linked); err != nil {
 		t.Fatalf("git worktree add: %v", err)
 	}
+	registerEnabledStartRepo(t, linked)
 	mainWT, err := git.ResolveWorktree(ctx, mainRepo)
 	if err != nil {
 		t.Fatalf("resolve main worktree: %v", err)
@@ -244,12 +277,13 @@ func TestStartLinkedWorktreeOwnerRefusesSecondWriter(t *testing.T) {
 func TestStartLinkedWorktreeStalePIDDoesNotClaimOwner(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	mainRepo := makeStartRepo(t)
+	mainRepo := makeUnregisteredStartRepo(t)
 	commitStartRepoSeed(t, mainRepo)
 	linked := filepath.Join(t.TempDir(), "linked")
 	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-stale-pid", linked); err != nil {
 		t.Fatalf("git worktree add: %v", err)
 	}
+	registerEnabledStartRepo(t, linked)
 	linkedWT, err := git.ResolveWorktree(ctx, linked)
 	if err != nil {
 		t.Fatalf("resolve linked worktree: %v", err)
@@ -739,7 +773,7 @@ func TestStart_MergesLegacySubdirRegistryRowByStateDB(t *testing.T) {
 func TestStart_LinkedWorktreeGitFileCanonicalizesSubdirAndStateDB(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	mainRepo := makeStartRepo(t)
+	mainRepo := makeUnregisteredStartRepo(t)
 	for _, kv := range [][2]string{
 		{"user.email", "acd-test@example.com"},
 		{"user.name", "ACD Test"},
@@ -756,6 +790,7 @@ func TestStart_LinkedWorktreeGitFileCanonicalizesSubdirAndStateDB(t *testing.T) 
 	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-start", linked); err != nil {
 		t.Fatalf("git worktree add: %v", err)
 	}
+	registerEnabledStartRepo(t, linked)
 	if info, err := os.Stat(filepath.Join(linked, ".git")); err != nil {
 		t.Fatalf("stat linked .git: %v", err)
 	} else if info.IsDir() {

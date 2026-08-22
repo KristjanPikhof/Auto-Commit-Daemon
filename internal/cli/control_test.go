@@ -51,7 +51,7 @@ func registerProtectedControlRepo(t *testing.T, roots paths.Roots, repoDir strin
 
 func TestControlBareUnregisteredIsReadOnly(t *testing.T) {
 	_ = withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	stateDB := state.DBPathFromGitDir(filepath.Join(repo, ".git"))
 
 	var out bytes.Buffer
@@ -639,7 +639,7 @@ func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T)
 
 func TestControlOnRegistersStartsAndIsIdempotent(t *testing.T) {
 	withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	var setupRequired bytes.Buffer
 	if err := runControlOn(context.Background(), &setupRequired, repo, true); ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "setup") {
 		t.Fatalf("uncut repository on exit=%d err=%v", ExitCode(err), err)
@@ -651,7 +651,7 @@ func TestControlOnRegistersStartsAndIsIdempotent(t *testing.T) {
 
 func TestControlOnTreatsRewindGraceAsWaiting(t *testing.T) {
 	withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	if err := runControlOn(context.Background(), io.Discard, repo, true); ExitCode(err) != ExitActionRequired {
 		t.Fatalf("uncut repository on exit=%d err=%v", ExitCode(err), err)
 	}
@@ -659,7 +659,7 @@ func TestControlOnTreatsRewindGraceAsWaiting(t *testing.T) {
 
 func TestControlOffDisablesStopsPreservesAndIsIdempotent(t *testing.T) {
 	withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	var offOut bytes.Buffer
 	if err := runControlOff(context.Background(), &offOut, repo, true); err != nil {
 		t.Fatalf("off unconfigured repository: %v", err)
@@ -694,7 +694,7 @@ func TestControlOnRestartsFreshLookingDeadDaemon(t *testing.T) {
 
 func TestControlOffUnknownRepoRecordsDurableOptOut(t *testing.T) {
 	roots := withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 
 	var out bytes.Buffer
 	if err := runControlOff(context.Background(), &out, repo, true); err != nil {
@@ -717,7 +717,7 @@ func TestControlOffUnknownRepoRecordsDurableOptOut(t *testing.T) {
 func TestControlOffUnknownDetachedRepoRecordsDurableOptOut(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	commitStartRepoSeed(t, repo)
 	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "checkout", "--detach", "--quiet"); err != nil {
 		t.Fatalf("detach HEAD: %v", err)
@@ -805,7 +805,7 @@ func TestRenderProductDoctorWorkerShowsCauseAndFix(t *testing.T) {
 
 func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	_ = withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 
 	var out bytes.Buffer
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
@@ -820,7 +820,7 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 
 func TestControlRootBareUsesReadOnlyHealth(t *testing.T) {
 	_ = withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	root := newRootCmd()
 	var out, errOut bytes.Buffer
 	root.SetOut(&out)
