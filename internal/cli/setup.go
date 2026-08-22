@@ -87,7 +87,9 @@ func newSetupCommand(initCompat bool) *cobra.Command {
 		Short: "Safely install or upgrade ACD",
 		Long: `Inspect the current installation and show the exact setup plan before
 changing anything. The plan installs or upgrades ACD, starts its background
-service, and protects the current repository as one rollback-safe operation.
+service, and updates user-level integrations as one rollback-safe operation.
+It does not enable the current repository. Run acd on once in each repository
+that ACD should protect.
 
 Start with --dry-run when you want a preview. The default setup works without
 an API key. Fresh setup asks how to group and format commits, then lets you use
@@ -386,7 +388,7 @@ func (p *setupProgress) Close() {
 
 func renderSetupPlan(cmd *cobra.Command, plan installer.Plan, jsonOut bool) error {
 	if jsonOut {
-		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateOff,
+		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateReady,
 			Actions: []productAction{}, Data: plan}, true)
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Setup plan: %s\n", plan.Digest)
