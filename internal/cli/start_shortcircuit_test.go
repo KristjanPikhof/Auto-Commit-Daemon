@@ -921,8 +921,8 @@ func TestRunStart_LegacySubdirRegistryRowDoesNotRewriteConsent(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal start result: %v\n%s", err, stdout.String())
 	}
-	if !got.Skipped || got.SkipReason != repoAutodiscoverySkipRegistry || !central.SameRepoPath(got.Repo, repoDir) {
-		t.Fatalf("result=%+v want registry-error skip at canonical root", got)
+	if !got.Skipped || got.SkipReason != repoAutodiscoverySkipDisabled || !central.SameRepoPath(got.Repo, repoDir) {
+		t.Fatalf("result=%+v want activation-required skip at canonical root", got)
 	}
 	registryAfter, err := os.ReadFile(roots.RegistryPath())
 	if err != nil {

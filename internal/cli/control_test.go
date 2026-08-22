@@ -637,8 +637,8 @@ func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T)
 	}
 }
 
-func TestControlOnRegistersStartsAndIsIdempotent(t *testing.T) {
-	withIsolatedHome(t)
+func TestControlOnMissingRuntimeRefusesBeforeActivation(t *testing.T) {
+	roots := withIsolatedHome(t)
 	repo := makeUnregisteredStartRepo(t)
 	var setupRequired bytes.Buffer
 	if err := runControlOn(context.Background(), &setupRequired, repo, true); ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "setup") {
@@ -646,6 +646,12 @@ func TestControlOnRegistersStartsAndIsIdempotent(t *testing.T) {
 	}
 	if setupRequired.Len() != 0 {
 		t.Fatalf("uncut repository on emitted success output: %q", setupRequired.String())
+	}
+	if _, err := os.Stat(state.DBPathFromGitDir(filepath.Join(repo, ".git"))); !os.IsNotExist(err) {
+		t.Fatalf("acd on created repository state before runtime validation: %v", err)
+	}
+	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
+		t.Fatalf("acd on created registry before runtime validation: %v", err)
 	}
 }
 
