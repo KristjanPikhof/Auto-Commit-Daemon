@@ -42,19 +42,11 @@ func withQuiescedRepositoryRuntimeForCommand(
 		}
 	}
 	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: supervisor.CheckpointBarrierTimeout}
+	checkpointCtx, cancelCheckpoints := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelCheckpoints()
 	for _, record := range enabled {
-		request := supervisor.Request{
-			Version: supervisor.ProtocolVersion,
-			ID:      fmt.Sprintf("fix-maintenance-checkpoint-%s-%d", record.WorktreeID, time.Now().UnixNano()),
-			Method:  "checkpoint_barrier", RepositoryID: repositoryID, WorktreeID: record.WorktreeID,
-			DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli(),
-		}
-		response, callErr := client.Do(ctx, request)
-		if callErr != nil {
-			return fmt.Errorf("%s: protect worktree %s before maintenance: %w", command, record.Path, callErr)
-		}
-		if response.Error != nil {
-			return fmt.Errorf("%s: protect worktree %s before maintenance: %s", command, record.Path, response.Error.Message)
+		if err := checkpointWorktreeBeforeMaintenance(checkpointCtx, client, repositoryID, record.WorktreeID); err != nil {
+			return fmt.Errorf("%s: protect worktree %s before maintenance: %w", command, record.Path, err)
 		}
 	}
 
@@ -102,6 +94,43 @@ func withQuiescedRepositoryRuntimeForCommand(
 		endErr = fmt.Errorf("%s: restore shared repository worker: %w", command, endErr)
 	}
 	return errors.Join(operationErr, renewErr, endErr)
+}
+
+func checkpointWorktreeBeforeMaintenance(
+	ctx context.Context,
+	client supervisor.Client,
+	repositoryID, worktreeID string,
+) error {
+	var lastErr error
+	for {
+		request := supervisor.Request{
+			Version: supervisor.ProtocolVersion,
+			ID:      fmt.Sprintf("maintenance-checkpoint-%s-%d", worktreeID, time.Now().UnixNano()),
+			Method:  "checkpoint_barrier", RepositoryID: repositoryID, WorktreeID: worktreeID,
+			DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli(),
+		}
+		response, err := client.Do(ctx, request)
+		if err == nil && response.Error == nil {
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = errors.New(response.Error.Message)
+			if !response.Error.Retryable {
+				return lastErr
+			}
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func renewRepositoryMaintenance(
