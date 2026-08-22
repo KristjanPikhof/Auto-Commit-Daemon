@@ -93,9 +93,35 @@ func makeStartRepo(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("resolve paths: %v", err)
 	}
-	registerRepo(t, roots, repoDir,
-		state.DBPathFromGitDir(filepath.Join(repoDir, ".git")), "")
+	registerStartRepoFixture(t, roots, repoDir)
 	return repoDir
+}
+
+// registerStartRepoFixture gives start and pause tests explicit repository
+// consent without paying the fsync cost of a production registry mutation.
+// These tests use isolated roots and exercise registry durability separately.
+func registerStartRepoFixture(t *testing.T, roots paths.Roots, repoDir string) {
+	t.Helper()
+	registry, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry fixture: %v", err)
+	}
+	repoHash, err := paths.RepoHash(repoDir)
+	if err != nil {
+		t.Fatalf("repo hash: %v", err)
+	}
+	registry.UpsertRepo(repoDir, repoHash,
+		state.DBPathFromGitDir(filepath.Join(repoDir, ".git")), "", time.Now().Unix())
+	body, err := json.Marshal(registry)
+	if err != nil {
+		t.Fatalf("marshal registry fixture: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(roots.RegistryPath()), 0o700); err != nil {
+		t.Fatalf("create registry fixture directory: %v", err)
+	}
+	if err := os.WriteFile(roots.RegistryPath(), body, 0o600); err != nil {
+		t.Fatalf("write registry fixture: %v", err)
+	}
 }
 
 func makeUnregisteredStartRepo(t *testing.T) string {
