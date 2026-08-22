@@ -89,7 +89,12 @@ func withSpawnPollSettings(t *testing.T, timeout, interval time.Duration) {
 func makeStartRepo(t *testing.T) string {
 	t.Helper()
 	repoDir := makeUnregisteredStartRepo(t)
-	registerEnabledStartRepo(t, repoDir)
+	roots, err := paths.Resolve()
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	registerRepo(t, roots, repoDir,
+		state.DBPathFromGitDir(filepath.Join(repoDir, ".git")), "")
 	return repoDir
 }
 
