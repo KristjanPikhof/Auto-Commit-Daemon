@@ -122,7 +122,7 @@ func TestStart_RechecksDisabledAfterControlLockWait(t *testing.T) {
 	ctx := context.Background()
 	repoDir := makeUnregisteredStartRepo(t)
 	stateDB := state.DBPathFromGitDir(filepath.Join(repoDir, ".git"))
-	registerRepo(t, roots, repoDir, stateDB, "codex")
+	registerEnabledStartRepo(t, repoDir)
 
 	held, err := daemon.AcquireControlLock(filepath.Join(repoDir, ".git"))
 	if err != nil {
@@ -234,11 +234,10 @@ func TestWakeTouchFlush_DisabledRepoSkipsWithoutState(t *testing.T) {
 }
 
 func TestStart_AutodiscoveryDisabledRegisteredRepoWorks(t *testing.T) {
-	roots := disableRepoAutodiscovery(t)
+	_ = disableRepoAutodiscovery(t)
 	ctx := context.Background()
 	repoDir := makeUnregisteredStartRepo(t)
-	stateDB := state.DBPathFromGitDir(filepath.Join(repoDir, ".git"))
-	registerRepo(t, roots, repoDir, stateDB, "codex")
+	registerEnabledStartRepo(t, repoDir)
 	count, restore := installFakeSpawn(t, os.Getpid())
 	defer restore()
 

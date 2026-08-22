@@ -24,6 +24,7 @@ type repoAutodiscoveryPolicy struct {
 	Decision   config.AutodiscoveryDecision
 	Requested  string
 	Registered bool
+	Activated  bool
 	Disabled   bool
 	Record     central.RepoRecord
 }
@@ -76,6 +77,7 @@ func evaluateRepoAutodiscoveryPolicy(ctx context.Context, command, repoFlag stri
 	rec, ok := reg.FindRepo(wt.Root, state.DBPathFromGitDir(wt.GitDir))
 	if ok {
 		policy.Registered = true
+		policy.Activated = registryRecordActivatedForWorktree(rec, wt)
 		policy.Record = rec
 		policy.Disabled = rec.LifecycleDisabled()
 	}
@@ -83,7 +85,21 @@ func evaluateRepoAutodiscoveryPolicy(ctx context.Context, command, repoFlag stri
 }
 
 func (p repoAutodiscoveryPolicy) allowsImplicitState() bool {
-	return p.Registered && !p.Disabled
+	return p.Registered && p.Activated && !p.Disabled
+}
+
+func registryRecordActivatedForWorktree(rec central.RepoRecord, wt git.Worktree) bool {
+	return registryRecordHasCanonicalIdentity(rec) &&
+		central.SameRepoPath(rec.Path, wt.Root) &&
+		rec.RepositoryID == central.CanonicalID(wt.CommonDir) &&
+		rec.WorktreeID == central.CanonicalID(wt.Root)
+}
+
+func registryRecordHasCanonicalIdentity(rec central.RepoRecord) bool {
+	return rec.Path != "" && rec.CommonDir != "" &&
+		rec.RepositoryID != "" && rec.WorktreeID != "" &&
+		rec.RepositoryID == central.CanonicalID(rec.CommonDir) &&
+		rec.WorktreeID == central.CanonicalID(rec.Path)
 }
 
 func (p repoAutodiscoveryPolicy) skipReason() string {

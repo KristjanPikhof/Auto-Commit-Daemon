@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -456,13 +457,10 @@ func TestTryShortCircuitStart_HappyPath(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	repoHash, err := paths.RepoHash(repoDir)
-	if err != nil {
-		t.Fatalf("RepoHash: %v", err)
-	}
+	repoHash := central.CanonicalID(gitDir)
 	// Stamp a registry row for this repo.
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
-		reg.UpsertRepo(repoDir, repoHash, "/state/db", "claude-code", time.Now().Unix())
+		upsertActivatedRepoFixture(reg, repoDir, gitDir, "/state/db", "claude-code", time.Now().Unix())
 		return nil
 	}); err != nil {
 		t.Fatalf("registry WithLock: %v", err)
@@ -502,12 +500,9 @@ func TestTryShortCircuitStart_FingerprintMismatchEscalates(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	repoHash, err := paths.RepoHash(repoDir)
-	if err != nil {
-		t.Fatalf("RepoHash: %v", err)
-	}
+	repoHash := central.CanonicalID(gitDir)
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
-		reg.UpsertRepo(repoDir, repoHash, "/state/db", "claude-code", time.Now().Unix())
+		upsertActivatedRepoFixture(reg, repoDir, gitDir, "/state/db", "claude-code", time.Now().Unix())
 		return nil
 	}); err != nil {
 		t.Fatalf("registry WithLock: %v", err)
@@ -857,11 +852,16 @@ func TestRunStart_LegacySubdirRegistryRowDoesNotRewriteConsent(t *testing.T) {
 	if err := os.MkdirAll(subdir, 0o755); err != nil {
 		t.Fatalf("mkdir subdir: %v", err)
 	}
-	repoHash, err := paths.RepoHash(repoDir)
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	subdir = filepath.Join(wt.Root, "nested", "pkg")
+	repoHash, err := paths.RepoHash(wt.Root)
 	if err != nil {
 		t.Fatalf("RepoHash: %v", err)
 	}
-	gitDir := filepath.Join(repoDir, ".git")
+	gitDir := wt.GitDir
 	dbPath := state.DBPathFromGitDir(gitDir)
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		reg.Repos = []central.RepoRecord{{

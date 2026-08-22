@@ -15,6 +15,14 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+func makeActivatedGitRepoStateDB(t *testing.T) (repoDir, stateDB string, db *state.DB) {
+	t.Helper()
+	_ = withIsolatedHome(t)
+	repoDir, stateDB, db = makeSeededRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
+	return repoDir, stateDB, db
+}
+
 // TestFlush_SessionIDRequired guards the early-validation contract: missing
 // --session-id must short-circuit before any FS / SQLite work so a misconfigured
 // hook fails fast with a clear message instead of opening state.db unnecessarily.
@@ -86,7 +94,7 @@ func TestFlush_HeartbeatOnlyDoesNotEnqueueOrSignal(t *testing.T) {
 func TestFlush_LogicalEnqueuesAndSignals(t *testing.T) {
 	ctx := context.Background()
 	// Need an initial commit so HEAD resolves to a branch ref (not detached).
-	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	repoDir, _, _ := makeActivatedGitRepoStateDB(t)
 	dbPath := state.DBPathFromGitDir(repoDir + "/.git")
 	d2, err := state.Open(ctx, dbPath)
 	if err != nil {
@@ -162,7 +170,7 @@ func TestFlush_LogicalEnqueuesAndSignals(t *testing.T) {
 // the harness hook stays a clean no-op signal.
 func TestFlush_LogicalRefusesOnDetachedHEAD(t *testing.T) {
 	ctx := context.Background()
-	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	repoDir, _, _ := makeActivatedGitRepoStateDB(t)
 	// Pre-register the session so the new --logical security gate (P1
 	// #6) does not short-circuit before the detached-HEAD refusal
 	// fires. The refusal-by-state path is what this test exercises.
@@ -217,7 +225,7 @@ func TestFlush_LogicalRefusesOnDetachedHEAD(t *testing.T) {
 // the repo paused for surgery.
 func TestFlush_LogicalRefusesOnManualPause(t *testing.T) {
 	ctx := context.Background()
-	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	repoDir, _, _ := makeActivatedGitRepoStateDB(t)
 	// Pre-register the session — see TestFlush_LogicalRefusesOnDetachedHEAD.
 	d, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
 	if err != nil {
@@ -272,7 +280,7 @@ func TestFlush_LogicalRefusesOnManualPause(t *testing.T) {
 // pending captures published until the operation finishes.
 func TestFlush_LogicalRefusesOnGitOperation(t *testing.T) {
 	ctx := context.Background()
-	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	repoDir, _, _ := makeActivatedGitRepoStateDB(t)
 	// Pre-register the session — see TestFlush_LogicalRefusesOnDetachedHEAD.
 	d, err := state.Open(ctx, state.DBPathFromGitDir(repoDir+"/.git"))
 	if err != nil {
@@ -401,7 +409,7 @@ func TestFlush_HelpListsLogicalFlag(t *testing.T) {
 // nothing enqueued, nothing signalled).
 func TestFlush_LogicalRequiresRegisteredClient(t *testing.T) {
 	ctx := context.Background()
-	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	repoDir, _, _ := makeActivatedGitRepoStateDB(t)
 	// Note: no RegisterClient call. The session_id passed to runFlush
 	// below has never appeared in daemon_clients.
 
@@ -457,7 +465,7 @@ func TestFlush_LogicalRequiresRegisteredClient(t *testing.T) {
 // drain-bypass surface is gated.
 func TestFlush_HeartbeatOnlyStillLazyRegisters(t *testing.T) {
 	ctx := context.Background()
-	repoDir, _, _ := makeRegisteredGitRepoStateDB(t)
+	repoDir, _, _ := makeActivatedGitRepoStateDB(t)
 
 	count, _, restore := installFakeSignal(t)
 	defer restore()
