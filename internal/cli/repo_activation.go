@@ -77,6 +77,7 @@ func prepareControlRepository(ctx context.Context, lookup controlRepoLookup) (co
 
 	actions := make([]string, 0, 3)
 	operation := func(operationCtx context.Context) error {
+		var migrationPlan *migration.RepositoryPlan
 		if needsMigration {
 			backupRoot := filepath.Join(current.Roots.SetupRoot(),
 				fmt.Sprintf("repo-on-%d-%s", time.Now().UnixNano(), record.WorktreeID))
@@ -91,28 +92,41 @@ func prepareControlRepository(ctx context.Context, lookup controlRepoLookup) (co
 			if _, err := migration.ApplyAll(operationCtx, []migration.RepositoryPlan{plan}); err != nil {
 				return fmt.Errorf("acd on: upgrade repository protection data: %w", err)
 			}
-			actions = append(actions, "migrated")
+			migrationPlan = &plan
 		}
 
-		return central.WithLock(current.Roots, func(locked *central.Registry) error {
+		var inserted, enabled bool
+		registryErr := central.WithLock(current.Roots, func(locked *central.Registry) error {
 			registered, err := locked.RegisterResolvedRepo(current.Worktree, "", time.Now().Unix())
 			if err != nil {
 				return err
 			}
-			if registered.Inserted {
-				actions = append(actions, "registered")
-			}
-			enabled := locked.EnableRepo(central.RepoRemovalTarget{
+			inserted = registered.Inserted
+			enablement := locked.EnableRepo(central.RepoRemovalTarget{
 				Path: registered.Record.Path, StateDB: registered.Record.StateDB,
 			}, time.Now().Unix())
-			if enabled.NotFound {
+			if enablement.NotFound {
 				return errors.New("registered repository disappeared before enablement")
 			}
-			if enabled.Updated || current.Record.LifecycleDisabled() || !current.Registered {
-				actions = append(actions, "enabled")
-			}
+			enabled = enablement.Updated || current.Record.LifecycleDisabled() || !current.Registered
 			return nil
 		})
+		if registryErr != nil {
+			if migrationPlan != nil {
+				registryErr = errors.Join(registryErr, migration.Rollback([]migration.RepositoryPlan{*migrationPlan}))
+			}
+			return fmt.Errorf("acd on: persist repository enablement: %w", registryErr)
+		}
+		if migrationPlan != nil {
+			actions = append(actions, "migrated")
+		}
+		if inserted {
+			actions = append(actions, "registered")
+		}
+		if enabled {
+			actions = append(actions, "enabled")
+		}
+		return nil
 	}
 	if err := withQuiescedRepositoryRuntimeForCommand(ctx, current.Roots,
 		record.RepositoryID, "acd on", operation); err != nil {
