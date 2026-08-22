@@ -123,6 +123,140 @@ func TestPublicationDrainRejectsIdentityPhaseAndProgressRegression(t *testing.T)
 	}
 }
 
+func TestReconcileResolvedPublicationDrainsCompletesProvenTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		paths      []string
+		states     []string
+		wantCommit int64
+	}{
+		{name: "all published", paths: []string{"a", "b"},
+			states: []string{EventStatePublished, EventStatePublished}, wantCommit: 2},
+		{name: "published and recovered", paths: []string{"a", "b"},
+			states: []string{EventStatePublished, EventStateRecovered}, wantCommit: 1},
+		{name: "empty target"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, _ := openTestDB(t)
+			checkpoint := seedPublicationDrainCheckpoint(t, db, tc.paths)
+			drain := PublicationDrain{
+				ID: "drain-resolved", CheckpointID: checkpoint.ID,
+				WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+				BranchGeneration: 7, Phase: PublicationDrainNeedsAction,
+				TargetEventCount: int64(len(checkpoint.EventSeqs)),
+				LastError:        "forced_capture_deferred", StagedConsent: true,
+				StagedConsumed: true, CreatedTS: 10, UpdatedTS: 10,
+				LastProgressTS: 10,
+			}
+			if _, err := PreparePublicationDrain(ctx, db, drain); err != nil {
+				t.Fatal(err)
+			}
+			for i, eventState := range tc.states {
+				commitOID := any(nil)
+				if eventState == EventStatePublished {
+					commitOID = "commit-" + tc.paths[i]
+				}
+				if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state=?,commit_oid=? WHERE seq=?`,
+					eventState, commitOID, checkpoint.EventSeqs[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			candidates, err := ResolvedPublicationDrainCandidates(ctx, db.ReadSQL())
+			if err != nil || len(candidates) != 1 ||
+				candidates[0].ResolvedEvents != int64(len(tc.paths)) {
+				t.Fatalf("candidates=%+v err=%v", candidates, err)
+			}
+			reconciled, err := ReconcileResolvedPublicationDrains(ctx, db, 20)
+			if err != nil || len(reconciled) != 1 ||
+				reconciled[0].PreviousPhase != PublicationDrainNeedsAction {
+				t.Fatalf("reconciled=%+v err=%v", reconciled, err)
+			}
+			loaded, err := PublicationDrainByID(ctx, db, drain.ID)
+			if err != nil || loaded.Phase != PublicationDrainCompleted ||
+				loaded.PublishedEventCount != int64(len(tc.paths)) ||
+				loaded.CommitCount != tc.wantCommit || loaded.LastError != "" ||
+				!loaded.CompletedTS.Valid || loaded.CompletedTS.Float64 != 20 {
+				t.Fatalf("loaded=%+v err=%v", loaded, err)
+			}
+			if again, err := ReconcileResolvedPublicationDrains(ctx, db, 21); err != nil || len(again) != 0 {
+				t.Fatalf("idempotent reconcile=%+v err=%v", again, err)
+			}
+		})
+	}
+}
+
+func TestReconcileResolvedPublicationDrainsRequiresCompleteProof(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		state  string
+		mutate func(context.Context, *DB, PublicationDrain, Checkpoint)
+	}{
+		{name: "pending", state: EventStatePending},
+		{name: "failed", state: EventStateFailed},
+		{name: "blocked", state: EventStateBlockedConflict},
+		{name: "unconsumed staging", state: EventStatePublished,
+			mutate: func(ctx context.Context, db *DB, drain PublicationDrain, _ Checkpoint) {
+				if _, err := db.SQL().ExecContext(ctx,
+					`UPDATE publication_drains SET staged_consumed=0 WHERE id=?`, drain.ID); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		{name: "incomplete checkpoint", state: EventStatePublished,
+			mutate: func(ctx context.Context, db *DB, _ PublicationDrain, checkpoint Checkpoint) {
+				if _, err := db.SQL().ExecContext(ctx,
+					`UPDATE checkpoints SET phase='needs_action' WHERE id=?`, checkpoint.ID); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		{name: "membership count mismatch", state: EventStatePublished,
+			mutate: func(ctx context.Context, db *DB, drain PublicationDrain, _ Checkpoint) {
+				if _, err := db.SQL().ExecContext(ctx,
+					`UPDATE publication_drains SET target_event_count=2 WHERE id=?`, drain.ID); err != nil {
+					t.Fatal(err)
+				}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, _ := openTestDB(t)
+			checkpoint := seedPublicationDrainCheckpoint(t, db, []string{"a"})
+			drain := PublicationDrain{
+				ID: "drain-unresolved", CheckpointID: checkpoint.ID,
+				WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+				BranchGeneration: 7, Phase: PublicationDrainNeedsAction,
+				TargetEventCount: 1, LastError: "blocked", StagedConsent: true,
+				StagedConsumed: true, CreatedTS: 10, UpdatedTS: 10,
+				LastProgressTS: 10,
+			}
+			if _, err := PreparePublicationDrain(ctx, db, drain); err != nil {
+				t.Fatal(err)
+			}
+			commitOID := any(nil)
+			if tc.state == EventStatePublished {
+				commitOID = "commit-a"
+			}
+			if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state=?,commit_oid=? WHERE seq=?`,
+				tc.state, commitOID, checkpoint.EventSeqs[0]); err != nil {
+				t.Fatal(err)
+			}
+			if tc.mutate != nil {
+				tc.mutate(ctx, db, drain, checkpoint)
+			}
+			if reconciled, err := ReconcileResolvedPublicationDrains(ctx, db, 20); err != nil || len(reconciled) != 0 {
+				t.Fatalf("reconciled=%+v err=%v", reconciled, err)
+			}
+			loaded, err := PublicationDrainByID(ctx, db, drain.ID)
+			if err != nil || loaded.Phase != PublicationDrainNeedsAction {
+				t.Fatalf("loaded=%+v err=%v", loaded, err)
+			}
+		})
+	}
+}
+
 func TestPublicationDrainRequiresCompleteCheckpointMembership(t *testing.T) {
 	ctx := context.Background()
 	db, _ := openTestDB(t)
