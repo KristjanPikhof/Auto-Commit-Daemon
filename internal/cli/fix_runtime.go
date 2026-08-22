@@ -79,7 +79,7 @@ func withQuiescedRepositoryRuntimeForCommand(
 
 	operationCtx, cancelOperation := context.WithCancel(ctx)
 	renewDone := make(chan error, 1)
-	go renewRepositoryMaintenance(operationCtx, client, repositoryID, lease.Token, cancelOperation, renewDone)
+	go renewRepositoryMaintenance(operationCtx, client, repositoryID, lease.Token, command, cancelOperation, renewDone)
 	operationErr := operation(operationCtx)
 	cancelOperation()
 	renewErr := <-renewDone
@@ -107,7 +107,7 @@ func withQuiescedRepositoryRuntimeForCommand(
 func renewRepositoryMaintenance(
 	ctx context.Context,
 	client supervisor.Client,
-	repositoryID, token string,
+	repositoryID, token, command string,
 	cancel context.CancelFunc,
 	done chan<- error,
 ) {
@@ -134,7 +134,7 @@ func renewRepositoryMaintenance(
 					return
 				}
 				cancel()
-				done <- fmt.Errorf("acd fix: renew repository maintenance lease: %w", err)
+				done <- fmt.Errorf("%s: renew repository maintenance lease: %w", command, err)
 				return
 			}
 		}
