@@ -655,6 +655,27 @@ func TestControlOnMissingRuntimeRefusesBeforeActivation(t *testing.T) {
 	}
 }
 
+func TestControlOnMismatchedRuntimeRefusesBeforeActivation(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := makeUnregisteredStartRepo(t)
+	if err := os.MkdirAll(filepath.Dir(roots.ManagedBinaryPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(roots.ManagedBinaryPath(), []byte("older-acd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := runControlOn(context.Background(), io.Discard, repo, true)
+	if ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "acd setup") {
+		t.Fatalf("mismatched runtime exit=%d err=%v", ExitCode(err), err)
+	}
+	if _, err := os.Stat(state.DBPathFromGitDir(filepath.Join(repo, ".git"))); !os.IsNotExist(err) {
+		t.Fatalf("acd on created repository state before runtime validation: %v", err)
+	}
+	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
+		t.Fatalf("acd on created registry before runtime validation: %v", err)
+	}
+}
+
 func TestControlOnTreatsRewindGraceAsWaiting(t *testing.T) {
 	withIsolatedHome(t)
 	repo := makeUnregisteredStartRepo(t)
