@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -254,6 +255,56 @@ UPDATE capture_events SET state=?,commit_oid=? WHERE seq=?`,
 				t.Fatalf("loaded=%+v err=%v", loaded, err)
 			}
 		})
+	}
+}
+
+func TestReconcileResolvedPublicationDrainsIsConcurrentAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	checkpoint := seedPublicationDrainCheckpoint(t, db, []string{"a"})
+	drain := PublicationDrain{
+		ID: "drain-concurrent", CheckpointID: checkpoint.ID,
+		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: 7, Phase: PublicationDrainNeedsAction,
+		TargetEventCount: 1, LastError: "blocked",
+		CreatedTS: 10, UpdatedTS: 10, LastProgressTS: 10,
+	}
+	if _, err := PreparePublicationDrain(ctx, db, drain); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state='published',commit_oid='commit-a'
+WHERE seq=?`, checkpoint.EventSeqs[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 8
+	var wg sync.WaitGroup
+	results := make(chan []PublicationDrainReconciliation, callers)
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reconciled, err := ReconcileResolvedPublicationDrains(ctx, db, 20)
+			results <- reconciled
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent reconcile: %v", err)
+		}
+	}
+	changed := 0
+	for reconciled := range results {
+		changed += len(reconciled)
+	}
+	if changed != 1 {
+		t.Fatalf("concurrent reconciliations changed=%d want 1", changed)
 	}
 }
 
