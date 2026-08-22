@@ -62,6 +62,11 @@ settles member changes and checkpoint publication links. Startup recovery
 proves source, parent, target, tree, membership, and ref ownership. Ambiguity
 stays `needs_action`.
 
+If every member of a stopped publication run is already `published` or
+`recovered`, the worker completes the run during startup or the next recovery
+pass. The proof uses the frozen membership in SQLite and does not change HEAD,
+the index, the worktree, or another branch.
+
 ## Retention
 
 ACD never prunes unpublished checkpoints, restore preimages, unresolved

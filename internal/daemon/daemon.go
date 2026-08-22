@@ -2989,6 +2989,13 @@ func reconcileResolvedPublicationDrains(
 	trigger string,
 	now time.Time,
 ) (int, error) {
+	candidates, err := state.ResolvedPublicationDrainCandidates(ctx, db.ReadSQL())
+	if err != nil {
+		return 0, err
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
 	reconciled, err := state.ReconcileResolvedPublicationDrains(
 		ctx, db, float64(now.UnixNano())/1e9)
 	if err != nil {

@@ -431,6 +431,107 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	waitForDaemonModeFresh(t, f.db.Path(), "stopped", 5*time.Second)
 }
 
+func TestRunStartupCompletesResolvedDrainFromOlderGeneration(t *testing.T) {
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := git.RevParse(ctx, f.dir, "HEAD^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := f.db.SQL().ExecContext(ctx, `
+INSERT INTO capture_events(
+ branch_ref,branch_generation,base_head,operation,path,fidelity,captured_ts,
+ state,commit_oid,published_ts
+) VALUES('refs/heads/main',474,?,'modify','resolved.txt','exact',1,
+         'published',?,2)`, head, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const checkpointID = "cp-1787439100000-0123456789abcdef"
+	worktreeID := checkpointpkg.WorktreeID(f.dir)
+	checkpointRef := "refs/acd/checkpoints/v1/" + worktreeID + "/" + checkpointID
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+		"update-ref", checkpointRef, head); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := state.Checkpoint{
+		ID: checkpointID, OperationID: "op-daemon-startup-resolved-drain",
+		WorktreeID: worktreeID, Reason: state.CheckpointReasonManualBarrier,
+		ObservationEpoch: 1, CoverageEpoch: 1, ObservedHead: head,
+		ObservedRef: "refs/heads/main", TreeOID: tree, CommitOID: head,
+		Ref: checkpointRef, CreatedTS: 1, EventSeqs: []int64{seq},
+	}
+	if created, err := state.PrepareCheckpoint(
+		ctx, f.db, checkpoint, publicationDrainTestDigest); err != nil || !created {
+		t.Fatalf("prepare checkpoint=(%t,%v)", created, err)
+	}
+	if err := state.CompleteCheckpoint(
+		ctx, f.db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 2); err != nil {
+		t.Fatal(err)
+	}
+	drain := state.PublicationDrain{
+		ID: "drain-" + checkpointID, CheckpointID: checkpoint.ID,
+		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: 474, Phase: state.PublicationDrainNeedsAction,
+		TargetEventCount: 1, LastError: "forced_capture_deferred",
+		StagedConsent: true, StagedConsumed: true,
+		CreatedTS: 3, UpdatedTS: 3, LastProgressTS: 3,
+		EventSeqs: []int64{seq},
+	}
+	if created, err := state.PreparePublicationDrain(
+		ctx, f.db, drain); err != nil || !created {
+		t.Fatalf("prepare drain=(%t,%v)", created, err)
+	}
+	statusBefore, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "status", "--porcelain=v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shutdownCh := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn: DeterministicMessage, WakeCh: make(chan struct{}, 1),
+			ShutdownCh: shutdownCh, SkipSignals: true,
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	waitForDaemonMode(t, f.db, "running", 2*time.Second)
+	completed, err := state.PublicationDrainByID(ctx, f.db, drain.ID)
+	if err != nil || completed.Phase != state.PublicationDrainCompleted ||
+		completed.PublishedEventCount != 1 || completed.LastError != "" {
+		t.Fatalf("startup drain=%+v err=%v", completed, err)
+	}
+	headAfter, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusAfter, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "status", "--porcelain=v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headAfter != head || string(statusAfter) != string(statusBefore) {
+		t.Fatalf("startup reconciliation changed Git: head=%s want=%s status=%q want=%q",
+			headAfter, head, statusAfter, statusBefore)
+	}
+}
+
 func TestRun_IntentV2MissingPrerequisitesCapturesWithoutReplay(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
 	t.Setenv("ACD_COMMIT_PRESET", "quality")

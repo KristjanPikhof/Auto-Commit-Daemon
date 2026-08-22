@@ -219,6 +219,21 @@ func TestReconcileResolvedPublicationDrainsRequiresCompleteProof(t *testing.T) {
 					t.Fatal(err)
 				}
 			}},
+		{name: "missing member", state: EventStatePublished,
+			mutate: func(ctx context.Context, db *DB, drain PublicationDrain, _ Checkpoint) {
+				conn, err := db.SQL().Conn(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := conn.ExecContext(ctx, `
+UPDATE publication_drain_events SET event_seq=999999 WHERE drain_id=?`, drain.ID); err != nil {
+					t.Fatal(err)
+				}
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()

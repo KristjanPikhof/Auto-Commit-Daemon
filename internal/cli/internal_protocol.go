@@ -22,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -853,10 +854,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		_ = json.Unmarshal(request.Params, &params)
 		var drainAnchor publicationDrainTarget
 		var requestedPublicationBranch string
-		publicationWorktreeID := runtime.record.WorktreeID
-		if len(publicationWorktreeID) != 16 {
-			publicationWorktreeID = request.WorktreeID
-		}
+		publicationWorktreeID := checkpointpkg.WorktreeID(runtime.worktree.Root)
 		runtime.gate.Lock()
 		if params.DrainPublication {
 			reason, unsafeErr := publicationUnsafeReason(
@@ -927,6 +925,13 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 			runtime.gate.Unlock()
 			return nil, protocolFailure("observation_failed", beginErr, true)
 		}
+		if params.DrainPublication {
+			if requireErr := daemon.RequireProtectionCheckpoint(
+				ctx, runtime.db, publicationWorktreeID, acceptedEpoch); requireErr != nil {
+				runtime.gate.Unlock()
+				return nil, protocolFailure("observation_failed", requireErr, true)
+			}
+		}
 		h.wake(request.WorktreeID)
 		runtime.gate.Unlock()
 		deadline := time.NewTimer(checkpointBarrierWait(ctx))
@@ -940,7 +945,10 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		for {
 			select {
 			case <-ctx.Done():
-				return nil, protocolFailure("checkpoint_timeout", ctx.Err(), true)
+				return nil, protocolFailure("checkpoint_timeout", fmt.Errorf(
+					"checkpoint barrier interrupted (accepted_epoch=%d covered_epoch=%q complete=%q checkpoint=%q rejected_checkpoint=%q read_error=%v): %w",
+					acceptedEpoch, lastCovered, lastComplete, lastCheckpoint,
+					lastRejectedCheckpoint, lastReadErr, ctx.Err()), true)
 			case <-deadline.C:
 				return nil, protocolFailure("checkpoint_timeout", fmt.Errorf(
 					"checkpoint barrier timed out (accepted_epoch=%d covered_epoch=%q complete=%q checkpoint=%q rejected_checkpoint=%q read_error=%v)",
@@ -1583,7 +1591,12 @@ func publicationUnsafeReason(
 
 func checkpointBarrierWait(ctx context.Context) time.Duration {
 	if requestDeadline, ok := ctx.Deadline(); ok {
-		return max(time.Until(requestDeadline), time.Millisecond)
+		remaining := time.Until(requestDeadline)
+		const diagnosticHeadroom = 100 * time.Millisecond
+		if remaining > diagnosticHeadroom {
+			return remaining - diagnosticHeadroom
+		}
+		return max(remaining, time.Millisecond)
 	}
 	return supervisor.CheckpointBarrierTimeout
 }

@@ -108,8 +108,8 @@ type fixAction struct {
 	RecoveryRef       string  `json:"recovery_ref,omitempty"`
 	DrainID           string  `json:"drain_id,omitempty"`
 	CheckpointID      string  `json:"checkpoint_id,omitempty"`
-	TargetEvents      int64   `json:"target_events,omitempty"`
-	ResolvedEvents    int64   `json:"resolved_events,omitempty"`
+	TargetEvents      *int64  `json:"target_events,omitempty"`
+	ResolvedEvents    *int64  `json:"resolved_events,omitempty"`
 }
 
 func newFixCmd() *cobra.Command {
@@ -321,8 +321,14 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 	if err := planGeneratedPendingCleanup(ctx, conn, repo, &plan); err != nil {
 		return fixPlan{}, err
 	}
-	if err := planResolvedPublicationDrains(ctx, conn, &plan); err != nil {
-		return fixPlan{}, err
+	hasPublicationDrains, err := sqliteTableExists(ctx, conn, "publication_drains")
+	if err != nil {
+		return fixPlan{}, fmt.Errorf("acd fix: check publication drain ledger: %w", err)
+	}
+	if hasPublicationDrains {
+		if err := planResolvedPublicationDrains(ctx, conn, &plan); err != nil {
+			return fixPlan{}, err
+		}
 	}
 	if err := planUnpublishedChainReconciliation(ctx, conn, branchRef, plan.Generation, head, force, hasDecisionRecords, &plan); err != nil {
 		return fixPlan{}, err
@@ -340,6 +346,8 @@ func planResolvedPublicationDrains(
 		return fmt.Errorf("acd fix: inspect resolved publication drains: %w", err)
 	}
 	for _, candidate := range candidates {
+		targetEvents := candidate.TargetEvents
+		resolvedEvents := candidate.ResolvedEvents
 		plan.Actions = append(plan.Actions, fixAction{
 			ID:             fixActionCompleteResolvedDrain + ":" + candidate.ID,
 			Kind:           fixActionCompleteResolvedDrain,
@@ -347,8 +355,8 @@ func planResolvedPublicationDrains(
 			Reason:         "every frozen member is already published or safely recovered",
 			DrainID:        candidate.ID,
 			CheckpointID:   candidate.CheckpointID,
-			TargetEvents:   candidate.TargetEvents,
-			ResolvedEvents: candidate.ResolvedEvents,
+			TargetEvents:   &targetEvents,
+			ResolvedEvents: &resolvedEvents,
 		})
 	}
 	return nil
@@ -756,6 +764,8 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 			break
 		}
 		if !matched {
+			targetEvents := drain.TargetEvents
+			resolvedEvents := drain.ResolvedEvents
 			plan.Actions = append(plan.Actions, fixAction{
 				ID:             fixActionCompleteResolvedDrain + ":" + drain.ID,
 				Kind:           fixActionCompleteResolvedDrain,
@@ -763,8 +773,8 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 				Reason:         "exact-chain recovery resolved every frozen member",
 				DrainID:        drain.ID,
 				CheckpointID:   drain.CheckpointID,
-				TargetEvents:   drain.TargetEvents,
-				ResolvedEvents: drain.ResolvedEvents,
+				TargetEvents:   &targetEvents,
+				ResolvedEvents: &resolvedEvents,
 				RowsChanged:    1,
 				Applied:        true,
 			})
@@ -927,14 +937,20 @@ func revalidateFixPauseState(plan *fixPlan) error {
 
 func verifyFixPostApply(ctx context.Context, conn *sql.DB, plan *fixPlan) error {
 	var errs []string
-	resolvedDrains, err := state.ResolvedPublicationDrainCandidates(ctx, conn)
+	hasPublicationDrains, err := sqliteTableExists(ctx, conn, "publication_drains")
 	if err != nil {
-		return fmt.Errorf("acd fix: verify resolved publication drains: %w", err)
+		return fmt.Errorf("acd fix: verify publication drain ledger: %w", err)
 	}
-	if len(resolvedDrains) > 0 {
-		errs = append(errs, fmt.Sprintf(
-			"%d resolved publication drain(s) still need completion",
-			len(resolvedDrains)))
+	if hasPublicationDrains {
+		resolvedDrains, err := state.ResolvedPublicationDrainCandidates(ctx, conn)
+		if err != nil {
+			return fmt.Errorf("acd fix: verify resolved publication drains: %w", err)
+		}
+		if len(resolvedDrains) > 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%d resolved publication drain(s) still need completion",
+				len(resolvedDrains)))
+		}
 	}
 	counts, err := loadRecoveryBlockerCounts(ctx, conn, plan.CurrentBranchRef, plan.Generation)
 	if err != nil {
@@ -1223,7 +1239,11 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintf(out, "Backup: %s\n", plan.BackupPath)
 	}
 	if len(plan.Actions) == 0 {
-		fmt.Fprintln(out, "Repository state does not need a proven recovery change.")
+		if len(plan.Unsafe) == 0 && !plan.Incomplete {
+			fmt.Fprintln(out, "Repository recovery state is healthy; no changes are needed.")
+		} else {
+			fmt.Fprintln(out, "ACD found no recovery change it can safely apply.")
+		}
 	} else {
 		fmt.Fprintln(out, "Actions:")
 		for _, action := range plan.Actions {
@@ -1241,7 +1261,7 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 				target = fmt.Sprintf(
 					" drain=%s checkpoint=%s resolved=%d/%d",
 					action.DrainID, action.CheckpointID,
-					action.ResolvedEvents, action.TargetEvents)
+					valueOrZero(action.ResolvedEvents), valueOrZero(action.TargetEvents))
 			} else if action.Seq > 0 {
 				target = fmt.Sprintf(" seq=%d", action.Seq)
 			}
@@ -1293,4 +1313,11 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintf(out, "(dry-run; %s)\n", hint)
 	}
 	return nil
+}
+
+func valueOrZero(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }

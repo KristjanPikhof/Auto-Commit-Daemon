@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -215,7 +217,8 @@ INSERT INTO capture_events(
 	if err != nil {
 		t.Fatal(err)
 	}
-	seqs := insertCompletedCheckpoint(t, db, checkpointID, []checkpointMemberFixture{
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	seqs := insertCompletedCheckpoint(t, db, checkpointID, worktreeID, []checkpointMemberFixture{
 		{State: state.EventStatePublished, CommitOID: "commit-1"},
 		{State: state.EventStateRecovered},
 		{State: state.EventStateFailed},
@@ -225,7 +228,7 @@ INSERT INTO capture_events(
 	}
 
 	target, err := freezePublicationDrainTarget(
-		ctx, db, repo, checkpointID, "0123456789abcdef", 1, anchor)
+		ctx, db, repo, checkpointID, worktreeID, 1, anchor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +255,7 @@ INSERT INTO capture_events(
 		t.Fatal(err)
 	}
 	if _, err := freezePublicationDrainTarget(
-		ctx, db, repo, checkpointID, "0123456789abcdef", 1, anchor); err == nil ||
+		ctx, db, repo, checkpointID, worktreeID, 1, anchor); err == nil ||
 		!strings.Contains(err.Error(), "branch changed") {
 		t.Fatalf("branch switch error=%v", err)
 	}
@@ -266,13 +269,14 @@ func TestFreezeEmptyPublicationDrainTargetRequiresCurrentGeneration(t *testing.T
 		t.Fatal(err)
 	}
 	defer db.Close()
-	insertCompletedCheckpoint(t, db, "cp-empty", nil)
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	insertCompletedCheckpoint(t, db, "cp-empty", worktreeID, nil)
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "99"); err != nil {
 		t.Fatal(err)
 	}
 	anchor := publicationDrainTarget{BranchRef: "refs/heads/main", Generation: 7}
 	if _, err := freezePublicationDrainTarget(
-		ctx, db, repo, "cp-empty", "0123456789abcdef", 1, anchor); err == nil ||
+		ctx, db, repo, "cp-empty", worktreeID, 1, anchor); err == nil ||
 		!strings.Contains(err.Error(), "generation changed") {
 		t.Fatalf("generation mismatch error=%v", err)
 	}
@@ -280,7 +284,7 @@ func TestFreezeEmptyPublicationDrainTargetRequiresCurrentGeneration(t *testing.T
 		t.Fatal(err)
 	}
 	target, err := freezePublicationDrainTarget(
-		ctx, db, repo, "cp-empty", "0123456789abcdef", 1, anchor)
+		ctx, db, repo, "cp-empty", worktreeID, 1, anchor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +317,8 @@ INSERT INTO capture_events(
 	if err != nil {
 		t.Fatal(err)
 	}
-	insertCompletedCheckpoint(t, db, "cp-empty-backlog", nil)
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	insertCompletedCheckpoint(t, db, "cp-empty-backlog", worktreeID, nil)
 	alignCheckpointHead(t, db, repo, "cp-empty-backlog")
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
@@ -322,7 +327,6 @@ INSERT INTO capture_events(
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
-			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {
 			accepted, _, err := state.MetaGet(ctx, db, daemon.MetaKeyProtectionObservationEpoch)
@@ -360,6 +364,216 @@ UPDATE capture_events SET state='published',commit_oid='backlog-commit' WHERE se
 	}
 }
 
+func TestCheckpointBarrierWaitsForMatchingBranchCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	repo := materializeTestRepo(t, true)
+	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	insertCompletedCheckpoint(t, db, "cp-stale-feature", worktreeID, nil)
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE checkpoints SET observed_ref='refs/heads/feature'
+WHERE id='cp-stale-feature'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
+		t.Fatal(err)
+	}
+	head, err := gitpkg.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := gitpkg.RevParse(ctx, repo, "HEAD^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wakeCalls := 0
+	handler := repositoryWorkerHandler{
+		runtimes: map[string]*workerRuntime{"worktree": {
+			worktree: worktree, db: db, gate: &sync.RWMutex{},
+		}},
+		wake: func(string) {
+			wakeCalls++
+			accepted, _, metaErr := state.MetaGet(
+				ctx, db, daemon.MetaKeyProtectionObservationEpoch)
+			if metaErr != nil {
+				t.Fatal(metaErr)
+			}
+			if err := errors.Join(
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID,
+					"cp-stale-feature"),
+			); err != nil {
+				t.Fatal(err)
+			}
+			if wakeCalls != 2 {
+				return
+			}
+			coverage, err := strconv.ParseInt(accepted, 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const checkpointID = "cp-1787439200000-0123456789abcdef"
+			checkpoint := state.Checkpoint{
+				ID: checkpointID, OperationID: "op-matching-main-checkpoint",
+				WorktreeID: worktreeID, Reason: state.CheckpointReasonPoll,
+				ObservationEpoch: coverage, CoverageEpoch: coverage,
+				ObservedHead: head, ObservedRef: "refs/heads/main",
+				TreeOID: tree, CommitOID: head,
+				Ref:       "refs/acd/checkpoints/v1/" + worktreeID + "/" + checkpointID,
+				CreatedTS: 2,
+			}
+			if created, err := state.PrepareCheckpoint(
+				ctx, db, checkpoint, fixCheckpointTestDigest); err != nil || !created {
+				t.Fatalf("prepare matching checkpoint=(%t,%v)", created, err)
+			}
+			if err := state.CompleteCheckpoint(
+				ctx, db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 3); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	params, err := json.Marshal(map[string]bool{"drain_publication": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
+		Method: "publication_drain_start", WorktreeID: "worktree", Params: params,
+	})
+	if protocolErr != nil {
+		t.Fatal(protocolErr)
+	}
+	data, ok := result.(map[string]any)
+	if !ok || data["checkpoint_id"] != "cp-1787439200000-0123456789abcdef" {
+		t.Fatalf("publication result=%T %v", result, result)
+	}
+	if wakeCalls < 2 {
+		t.Fatalf("worker wakes=%d want at least 2", wakeCalls)
+	}
+	if _, ok, err := state.PublicationDrainByCheckpoint(
+		ctx, db, "cp-stale-feature"); err != nil || ok {
+		t.Fatalf("stale checkpoint drain=(%t,%v)", ok, err)
+	}
+}
+
+func TestCheckpointBarrierTimeoutReportsRejectedCheckpoint(t *testing.T) {
+	repo := materializeTestRepo(t, true)
+	worktree, err := gitpkg.ResolveWorktree(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	insertCompletedCheckpoint(t, db, "cp-stale-feature", worktreeID, nil)
+	if _, err := db.SQL().ExecContext(context.Background(), `
+UPDATE checkpoints SET observed_ref='refs/heads/feature'
+WHERE id='cp-stale-feature'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSet(
+		context.Background(), db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := repositoryWorkerHandler{
+		runtimes: map[string]*workerRuntime{"worktree": {
+			worktree: worktree, db: db, gate: &sync.RWMutex{},
+		}},
+		wake: func(string) {
+			ctx := context.Background()
+			accepted, _, metaErr := state.MetaGet(
+				ctx, db, daemon.MetaKeyProtectionObservationEpoch)
+			if metaErr != nil {
+				t.Fatal(metaErr)
+			}
+			if err := errors.Join(
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
+				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID,
+					"cp-stale-feature"),
+			); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	params, err := json.Marshal(map[string]bool{"drain_publication": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
+		Method: "publication_drain_start", WorktreeID: "worktree", Params: params,
+	})
+	if protocolErr == nil || protocolErr.Code != "checkpoint_timeout" ||
+		!strings.Contains(protocolErr.Message, `rejected_checkpoint="cp-stale-feature"`) {
+		t.Fatalf("checkpoint timeout=%+v", protocolErr)
+	}
+}
+
+func TestCheckpointBarrierRefusesBranchChangeWhileWaiting(t *testing.T) {
+	ctx := context.Background()
+	repo := materializeTestRepo(t, true)
+	worktree, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	handler := repositoryWorkerHandler{
+		runtimes: map[string]*workerRuntime{"worktree": {
+			worktree: worktree, db: db, gate: &sync.RWMutex{},
+		}},
+		wake: func(string) {
+			once.Do(func() {
+				if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+					"switch", "-q", "-c", "feature"); err != nil {
+					t.Fatal(err)
+				}
+			})
+		},
+	}
+	params, err := json.Marshal(map[string]bool{"drain_publication": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
+		Method: "publication_drain_start", WorktreeID: "worktree", Params: params,
+	})
+	if protocolErr == nil || protocolErr.Code != "publication_needs_action" ||
+		!strings.Contains(protocolErr.Message, "branch changed") {
+		t.Fatalf("branch-change result=%+v", protocolErr)
+	}
+	var drains int
+	if err := db.ReadSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM publication_drains`).Scan(&drains); err != nil {
+		t.Fatal(err)
+	}
+	if drains != 0 {
+		t.Fatalf("branch change created %d publication drain(s)", drains)
+	}
+}
+
 func TestCommitAllCheckpointBarrierRejectsStagedIndexBeforeWake(t *testing.T) {
 	ctx := context.Background()
 	repo := materializeTestRepo(t, true)
@@ -386,7 +600,6 @@ func TestCommitAllCheckpointBarrierRejectsStagedIndexBeforeWake(t *testing.T) {
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
-			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {
 			wakeCalls++
@@ -439,7 +652,8 @@ func TestCommitAllCheckpointBarrierConsumesStagedAfterCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	insertCompletedCheckpoint(t, db, "cp-staged-consent", nil)
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	insertCompletedCheckpoint(t, db, "cp-staged-consent", worktreeID, nil)
 	alignCheckpointHead(t, db, repo, "cp-staged-consent")
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
@@ -447,7 +661,6 @@ func TestCommitAllCheckpointBarrierConsumesStagedAfterCheckpoint(t *testing.T) {
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
-			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {
 			accepted, _, metaErr := state.MetaGet(
@@ -503,7 +716,8 @@ func TestCommitAllDrainDetachAndReattachKeepsSameOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	seqs := insertCompletedCheckpoint(t, db, "cp-detach", []checkpointMemberFixture{{
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	seqs := insertCompletedCheckpoint(t, db, "cp-detach", worktreeID, []checkpointMemberFixture{{
 		State: state.EventStatePending,
 	}})
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
@@ -511,7 +725,7 @@ func TestCommitAllDrainDetachAndReattachKeepsSameOperation(t *testing.T) {
 	}
 	drain := state.PublicationDrain{
 		ID: "drain-cp-detach", CheckpointID: "cp-detach",
-		WorktreeID: "0123456789abcdef", BranchRef: "refs/heads/main",
+		WorktreeID: worktreeID, BranchRef: "refs/heads/main",
 		BranchGeneration: 7, Phase: state.PublicationDrainSemantic,
 		TargetEventCount: 1, CreatedTS: 1, UpdatedTS: 1, LastProgressTS: 1,
 		EventSeqs: seqs,
@@ -523,7 +737,6 @@ func TestCommitAllDrainDetachAndReattachKeepsSameOperation(t *testing.T) {
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
-			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {},
 	}
@@ -593,7 +806,8 @@ func TestCheckpointBarrierReturnsMeasuredFinalDrainProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	seqs := insertCompletedCheckpoint(t, db, "cp-drained", []checkpointMemberFixture{
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	seqs := insertCompletedCheckpoint(t, db, "cp-drained", worktreeID, []checkpointMemberFixture{
 		{State: state.EventStatePublished, CommitOID: "commit-1"},
 		{State: state.EventStatePublished, CommitOID: "commit-2"},
 	})
@@ -605,7 +819,6 @@ func TestCheckpointBarrierReturnsMeasuredFinalDrainProgress(t *testing.T) {
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
-			record: central.RepoRecord{WorktreeID: "0123456789abcdef"},
 		}},
 		wake: func(string) {
 			accepted, _, err := state.MetaGet(ctx, db, daemon.MetaKeyProtectionObservationEpoch)
@@ -653,12 +866,12 @@ func insertCompletedCheckpoint(
 	t *testing.T,
 	db *state.DB,
 	checkpointID string,
+	worktreeID string,
 	members []checkpointMemberFixture,
 ) []int64 {
 	t.Helper()
 	ctx := context.Background()
 	operationID := "op-" + checkpointID
-	const worktreeID = "0123456789abcdef"
 	if _, err := db.SQL().ExecContext(ctx, `
 INSERT INTO operations(id,kind,worktree_id,phase,status,created_ts,updated_ts)
 VALUES(?, 'checkpoint', ?, 'completed', 'completed', 1, 1)`, operationID, worktreeID); err != nil {

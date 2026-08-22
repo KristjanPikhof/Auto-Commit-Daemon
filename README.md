@@ -94,11 +94,15 @@ The five product states are:
 | `protected` | The latest complete observation is checkpointed and nothing waits for publication. |
 | `waiting` | Checkpoints are safe; grouping, verification, Git state, or retry is delaying publication. |
 | `publishing` | A selected checkpoint group is being published as a local Git commit. |
-| `needs_action` | Protection is incomplete or a safely recoverable condition needs user action. |
+| `needs_action` | Protection is incomplete or ACD cannot prove a safe automatic recovery. |
 
 `Current changes protected` is reported separately from the overall state. It
 may remain `yes` while publication is `waiting`, `publishing`, or blocked by an
 unrelated repair.
+
+An old publication run does not require a branch switch when all of its frozen
+changes are already published or safely recovered. ACD proves that state and
+completes the run automatically when the worker starts or processes recovery.
 
 ## Commands
 
