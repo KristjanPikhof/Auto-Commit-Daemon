@@ -98,10 +98,10 @@ func runWake(ctx context.Context, out io.Writer, repoFlag, sessionID string, jso
 			return enc.Encode(res)
 		}
 		if policy.Disabled {
-			fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)\n",
+			fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd on --repo %s` to enable protection)\n",
 				repo, policy.skipReason(), repo)
 		} else {
-			fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)\n",
+			fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd on --repo %s` to enable protection)\n",
 				repo, policy.skipReason(), repo)
 		}
 		return nil
@@ -146,7 +146,7 @@ func runWake(ctx context.Context, out io.Writer, repoFlag, sessionID string, jso
 			enc.SetIndent("", "  ")
 			return enc.Encode(res)
 		}
-		fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)\n",
+		fmt.Fprintf(out, "acd wake: skipped for %s (%s; run `acd on --repo %s` to enable protection)\n",
 			repo, repoAutodiscoverySkipRepoDisabled, repo)
 		return nil
 	}
