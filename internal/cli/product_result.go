@@ -11,6 +11,7 @@ type productState string
 
 const (
 	productStateOff         productState = "off"
+	productStateReady       productState = "ready"
 	productStateProtected   productState = "protected"
 	productStateWaiting     productState = "waiting"
 	productStatePublishing  productState = "publishing"
