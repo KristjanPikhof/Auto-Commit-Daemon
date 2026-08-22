@@ -1637,6 +1637,7 @@ func digestPlan(plan Plan) string {
 	}
 	copy.Repositories = append([]migration.RepositoryPlan(nil), plan.Repositories...)
 	copy.Actions = append([]Action(nil), plan.Actions...)
+	copy.Warnings = nil
 	copy.Digest = ""
 	copy.OperationID = ""
 	copy.BackupRoot = "<setup-operation>"

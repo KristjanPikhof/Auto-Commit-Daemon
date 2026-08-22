@@ -73,6 +73,13 @@ func TestBuildPlanIsReadOnlyAndStableForDigest(t *testing.T) {
 	if second.Digest != plan.Digest {
 		t.Fatalf("equivalent plan digest changed: first=%s second=%s", plan.Digest, second.Digest)
 	}
+	withoutRepo, err := BuildPlan(ctx, roots, Options{Executable: executable, SkipServiceCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutRepo.Digest != plan.Digest {
+		t.Fatalf("ignored --repo changed mutation digest: with=%s without=%s", plan.Digest, withoutRepo.Digest)
+	}
 	if len(plan.Actions) == 0 || plan.Actions[0].Target != plan.BackupRoot {
 		t.Fatalf("digest normalization mutated setup action target: %+v", plan.Actions)
 	}
