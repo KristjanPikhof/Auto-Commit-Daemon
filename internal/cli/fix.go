@@ -28,6 +28,7 @@ import (
 const (
 	fixActionClearExpiredManualPause   = "clear_expired_manual_pause"
 	fixActionClearDrainedBackpressure  = "clear_drained_backpressure"
+	fixActionCompleteResolvedDrain     = "complete_resolved_publication_drain"
 	fixActionDropGeneratedPending      = "drop_generated_pending"
 	fixActionReconcileUnpublishedChain = "reconcile_unpublished_chain"
 )
@@ -105,6 +106,10 @@ type fixAction struct {
 	ArchiveOnly       bool    `json:"archive_only,omitempty"`
 	InvalidateShadow  bool    `json:"invalidate_shadow,omitempty"`
 	RecoveryRef       string  `json:"recovery_ref,omitempty"`
+	DrainID           string  `json:"drain_id,omitempty"`
+	CheckpointID      string  `json:"checkpoint_id,omitempty"`
+	TargetEvents      int64   `json:"target_events,omitempty"`
+	ResolvedEvents    int64   `json:"resolved_events,omitempty"`
 }
 
 func newFixCmd() *cobra.Command {
@@ -316,10 +321,37 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 	if err := planGeneratedPendingCleanup(ctx, conn, repo, &plan); err != nil {
 		return fixPlan{}, err
 	}
+	if err := planResolvedPublicationDrains(ctx, conn, &plan); err != nil {
+		return fixPlan{}, err
+	}
 	if err := planUnpublishedChainReconciliation(ctx, conn, branchRef, plan.Generation, head, force, hasDecisionRecords, &plan); err != nil {
 		return fixPlan{}, err
 	}
 	return plan, nil
+}
+
+func planResolvedPublicationDrains(
+	ctx context.Context,
+	conn *sql.DB,
+	plan *fixPlan,
+) error {
+	candidates, err := state.ResolvedPublicationDrainCandidates(ctx, conn)
+	if err != nil {
+		return fmt.Errorf("acd fix: inspect resolved publication drains: %w", err)
+	}
+	for _, candidate := range candidates {
+		plan.Actions = append(plan.Actions, fixAction{
+			ID:             fixActionCompleteResolvedDrain + ":" + candidate.ID,
+			Kind:           fixActionCompleteResolvedDrain,
+			Description:    "complete a publication run whose protected changes are already resolved",
+			Reason:         "every frozen member is already published or safely recovered",
+			DrainID:        candidate.ID,
+			CheckpointID:   candidate.CheckpointID,
+			TargetEvents:   candidate.TargetEvents,
+			ResolvedEvents: candidate.ResolvedEvents,
+		})
+	}
+	return nil
 }
 
 type unpublishedFixPair struct {
@@ -705,10 +737,46 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 			plan.RowsChanged += int64(result.EventCount)
 		}
 	}
+	reconciledDrains, err := state.ReconcileResolvedPublicationDrains(
+		ctx, db, float64(time.Now().UTC().UnixNano())/1e9)
+	if err != nil {
+		return fmt.Errorf("acd fix: complete resolved publication drains: %w", err)
+	}
+	for _, drain := range reconciledDrains {
+		matched := false
+		for i := range plan.Actions {
+			action := &plan.Actions[i]
+			if action.Kind != fixActionCompleteResolvedDrain ||
+				action.DrainID != drain.ID {
+				continue
+			}
+			action.Applied = true
+			action.RowsChanged = 1
+			matched = true
+			break
+		}
+		if !matched {
+			plan.Actions = append(plan.Actions, fixAction{
+				ID:             fixActionCompleteResolvedDrain + ":" + drain.ID,
+				Kind:           fixActionCompleteResolvedDrain,
+				Description:    "complete a publication run whose protected changes are already resolved",
+				Reason:         "exact-chain recovery resolved every frozen member",
+				DrainID:        drain.ID,
+				CheckpointID:   drain.CheckpointID,
+				TargetEvents:   drain.TargetEvents,
+				ResolvedEvents: drain.ResolvedEvents,
+				RowsChanged:    1,
+				Applied:        true,
+			})
+		}
+		plan.RowsChanged++
+	}
 
 	transactional := false
 	for _, action := range plan.Actions {
-		if action.Kind != fixActionReconcileUnpublishedChain && action.Kind != fixActionClearExpiredManualPause {
+		if action.Kind != fixActionReconcileUnpublishedChain &&
+			action.Kind != fixActionCompleteResolvedDrain &&
+			action.Kind != fixActionClearExpiredManualPause {
 			transactional = true
 			break
 		}
@@ -730,7 +798,9 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 		var pendingResults []pendingActionResult
 		nowSec := float64(time.Now().UTC().UnixNano()) / 1e9
 		for i := range plan.Actions {
-			if plan.Actions[i].Kind == fixActionReconcileUnpublishedChain || plan.Actions[i].Kind == fixActionClearExpiredManualPause {
+			if plan.Actions[i].Kind == fixActionReconcileUnpublishedChain ||
+				plan.Actions[i].Kind == fixActionCompleteResolvedDrain ||
+				plan.Actions[i].Kind == fixActionClearExpiredManualPause {
 				continue
 			}
 			n, err := applyFixAction(ctx, tx, plan.Actions[i], nowSec)
@@ -857,6 +927,15 @@ func revalidateFixPauseState(plan *fixPlan) error {
 
 func verifyFixPostApply(ctx context.Context, conn *sql.DB, plan *fixPlan) error {
 	var errs []string
+	resolvedDrains, err := state.ResolvedPublicationDrainCandidates(ctx, conn)
+	if err != nil {
+		return fmt.Errorf("acd fix: verify resolved publication drains: %w", err)
+	}
+	if len(resolvedDrains) > 0 {
+		errs = append(errs, fmt.Sprintf(
+			"%d resolved publication drain(s) still need completion",
+			len(resolvedDrains)))
+	}
 	counts, err := loadRecoveryBlockerCounts(ctx, conn, plan.CurrentBranchRef, plan.Generation)
 	if err != nil {
 		return fmt.Errorf("acd fix: verify post-apply blockers: %w", err)
@@ -1144,7 +1223,7 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintf(out, "Backup: %s\n", plan.BackupPath)
 	}
 	if len(plan.Actions) == 0 {
-		fmt.Fprintln(out, "No safe automatic fixes found.")
+		fmt.Fprintln(out, "Repository state does not need a proven recovery change.")
 	} else {
 		fmt.Fprintln(out, "Actions:")
 		for _, action := range plan.Actions {
@@ -1158,6 +1237,11 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 				if action.ArchiveOnly {
 					target += " archive-only"
 				}
+			} else if action.Kind == fixActionCompleteResolvedDrain {
+				target = fmt.Sprintf(
+					" drain=%s checkpoint=%s resolved=%d/%d",
+					action.DrainID, action.CheckpointID,
+					action.ResolvedEvents, action.TargetEvents)
 			} else if action.Seq > 0 {
 				target = fmt.Sprintf(" seq=%d", action.Seq)
 			}
