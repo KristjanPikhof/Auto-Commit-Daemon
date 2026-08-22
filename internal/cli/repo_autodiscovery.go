@@ -55,10 +55,7 @@ func evaluateRepoAutodiscoveryPolicy(ctx context.Context, command, repoFlag stri
 	if err != nil {
 		return repoAutodiscoveryPolicy{}, fmt.Errorf("acd %s: resolve paths: %w", command, err)
 	}
-	decision, err := config.ImplicitRepoRegistrationAllowedFromRoots(caller, roots)
-	if err != nil {
-		return repoAutodiscoveryPolicy{}, err
-	}
+	decision := config.AutodiscoveryDecision{Allowed: false, Source: "explicit_repository_enablement"}
 	policy := repoAutodiscoveryPolicy{
 		Worktree:  wt,
 		Roots:     roots,
@@ -86,10 +83,7 @@ func evaluateRepoAutodiscoveryPolicy(ctx context.Context, command, repoFlag stri
 }
 
 func (p repoAutodiscoveryPolicy) allowsImplicitState() bool {
-	if p.Disabled {
-		return false
-	}
-	return p.Decision.Allowed || p.Registered
+	return p.Registered && !p.Disabled
 }
 
 func (p repoAutodiscoveryPolicy) skipReason() string {
@@ -103,7 +97,7 @@ func (p repoAutodiscoveryPolicy) skipReason() string {
 }
 
 func repoDisabledError(command string, p repoAutodiscoveryPolicy) error {
-	return fmt.Errorf("acd %s: repo %s is disabled; run `acd repo enable --repo %s` to allow ACD to manage it again",
+	return fmt.Errorf("acd %s: repo %s is disabled; run `acd on --repo %s` to enable protection again",
 		command, p.Worktree.Root, p.Requested)
 }
 
@@ -117,10 +111,6 @@ func repoDisabledAfterControlLock(p repoAutodiscoveryPolicy) bool {
 }
 
 func repoInitRequiredError(command string, p repoAutodiscoveryPolicy) error {
-	source := p.Decision.Source
-	if source == "" {
-		source = config.DecisionSourceDefault
-	}
-	return fmt.Errorf("acd %s: repo init required for %s: repo autodiscovery is disabled (source: %s); run `acd repo init --repo %s` or enable repo_lifecycle.autodiscovery in %s",
-		command, p.Worktree.Root, source, p.Requested, p.Decision.ConfigPath)
+	return fmt.Errorf("acd %s: repository protection is off for %s; run `acd on --repo %s` to enable it",
+		command, p.Worktree.Root, p.Requested)
 }
