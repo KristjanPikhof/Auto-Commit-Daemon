@@ -48,18 +48,17 @@ Backoff resets after five healthy minutes. Repeated crashes surface as
 `needs_action` while bounded retries continue.
 
 The supervisor advertises protocol, registry, repository-state, and integration
-compatibility plus the exact managed-binary digest. A newer compatible CLI
-checkpoints enabled repositories, journals and atomically replaces the binary
-and owned hooks, restarts the supervisor, and rolls back on failed readiness.
-A missing or mismatched compatibility tuple remains a fail-closed full-setup
-boundary.
+compatibility plus the exact managed-binary digest. Repository mutations and
+hooks require that runtime to match the CLI exactly. A mismatch is a
+fail-closed `acd setup` boundary; ordinary repository activity never replaces
+the binary or upgrades unrelated repositories.
 
-Integration session-start and active wake hooks fail nonzero when protection
-cannot start or wake. Idle, stop, and session-close boundary hints preserve and
-log the real command exit code but return success, because they refine commit
-grouping and cleanup rather than establish current protection. Hook-triggered
-compatible upgrades are detached only after the current hint succeeds; an
-interactive mutation waits for the same journaled replacement to finish.
+Integration hooks start or wake only repositories that are already registered
+and enabled. Unknown and disabled repositories are skipped without creating
+state; human-facing output points to `acd on`. Idle, stop, and session-close
+boundary hints preserve and log the real command exit code but return success,
+because they refine commit grouping and cleanup rather than establish current
+protection.
 
 ## Repository identity
 
@@ -128,8 +127,9 @@ lifecycle mutations are recorded in the global operations database. Plans have
 immutable SHA-256 digests. Every touched file has a type/mode/owner/digest
 preimage and prior platform lifecycle state.
 
-The v19 to v20 cutover spans every registered repository. A temporary
+An incompatible setup cutover spans enabled repositories only. A temporary
 protection bridge covers concurrent edits, repository locks are acquired in
-sorted common-directory order, and held v20 workers must prove current
-coverage before global commit. Any ambiguous legacy proof aborts the entire
-transaction.
+sorted common-directory order, and held workers must prove current coverage
+before global commit. Disabled records and database versions remain unchanged
+until their next `acd on`. Any ambiguous legacy proof in an enabled repository
+aborts the entire transaction.

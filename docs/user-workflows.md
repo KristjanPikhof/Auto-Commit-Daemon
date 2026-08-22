@@ -4,20 +4,24 @@
 
 ~~~bash
 acd setup
+cd /path/to/repository
+acd on
 acd
 ~~~
 
 Choose Everyday work and the local provider for the shortest path. Review the
-repository, integrations, grouping, commit format, repair limit, and data use.
+shared installation, integrations, grouping, commit format, repair limit, and
+data use.
 The local provider works offline. If you choose an OpenAI-compatible provider,
 setup asks for its endpoint, model, and bearer token, then sends one fixed
 synthetic request after you approve the plan. It sends no repository content
 during that test.
 
-The final command should report protection on and current changes protected.
-Your choices are saved as user defaults for this repository and repositories
-you add later. Use `acd config edit` when you later want Strict Review or other
-advanced settings.
+`acd setup` finishes with `ACD installation is ready`; it does not protect the
+current directory. `acd on` registers and enables the repository, then waits
+for a verified checkpoint. The final `acd` command should report protection on
+and current changes protected. Your setup choices are saved as user defaults
+for repositories you enable later.
 
 ## Daily check
 
@@ -126,12 +130,12 @@ acd on
 managed worker to stop. If the checkpoint cannot be confirmed, ACD stays on.
 Use `acd off --force` only when you accept that risk.
 
-`acd on` always replaces the managed worker with a new one and confirms a new
-checkpoint. Use it to enable ACD, restart a stuck worker, or finish a compatible
-upgrade after installing a newer CLI binary. ACD backs up and applies safe
-state migrations during that upgrade. If it cannot prove that an upgrade or
-recovery is safe, it leaves the previous state intact and tells you what to run.
-Neither command deletes checkpoint history.
+`acd on` registers an unknown repository or re-enables a disabled one. It
+backs up and migrates only that repository when needed, replaces its managed
+worker, and confirms a new checkpoint. If the shared runtime does not exactly
+match the CLI, run `acd setup` first. If ACD cannot prove that activation or
+recovery is safe, it leaves the repository unregistered or disabled when
+possible and tells you what to run. Neither command deletes checkpoint history.
 
 ## Diagnose locally
 
@@ -163,10 +167,11 @@ repositories keep running.
 
 ## Upgrade from v19
 
-Run `acd setup`. The plan covers every registered repository. Missing worktrees
-with unresolved captured state, failed SQLite checks, unsafe Git operations,
-missing objects, insufficient disk, or ambiguous exact-chain proof block the
-whole cutover.
+Run `acd setup`. The incompatible-upgrade plan covers enabled repositories
+only. Disabled records remain disabled and their databases are migrated later,
+one at a time, by `acd on`. Missing enabled worktrees with unresolved captured
+state, failed SQLite checks, unsafe Git operations, missing objects,
+insufficient disk, or ambiguous exact-chain proof block the global cutover.
 
 Before global commit, any failure restores database, service, integration,
 configuration, and registry preimages. A migration bridge ref containing an

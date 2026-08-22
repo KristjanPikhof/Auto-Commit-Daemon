@@ -6,7 +6,7 @@
 
 | Command | Mutates | Confirmation |
 |---|---|---|
-| `acd setup` | Binary, Linux service, registry, configuration, integrations, repository schema and checkpoint refs | Shows one exact plan and asks once. |
+| `acd setup` | Shared binary, service, configuration, integrations, and enabled repository migrations during an incompatible upgrade | Shows one exact global plan and asks once. |
 | `acd status` | Nothing | None. |
 | `acd on` | Repository desired state through the supervisor | None; idempotent. |
 | `acd off` | Final checkpoint and repository desired state | `--force` only when protection cannot be confirmed. |
@@ -26,7 +26,12 @@ acd setup --integrations=auto
 acd setup --integrations=none
 acd setup --integrations=claude-code,codex
 acd setup --yes --non-interactive --expect-plan sha256:...
+acd setup --repo /path/to/repo
 ~~~
+
+Setup is global and works outside Git. The compatibility `--repo` flag does
+not change setup scope. It prints a warning and the exact follow-up command:
+`acd on --repo /path/to/repo`.
 
 `--dry-run` performs no file write, command execution, supervisor or service
 action, provider call, integration change, migration, state open for writing,
@@ -46,18 +51,19 @@ HTTP endpoints need `--confirm-insecure-http`. HTTP is not encrypted, so the
 token and later requests can be read or changed in transit. Redirects and URLs
 with embedded credentials, query strings, or fragments are refused.
 
-Setup validates the OS, architecture, Git durability support, repository,
-platform lifecycle, disk space, configuration, and integration files. It backs
-up every touched file, applies one all-repository v19 to v20 cutover, runs an
-isolated self-test, and commits only after all held workers report complete
-current coverage.
+Setup validates the OS, architecture, platform lifecycle, disk space,
+configuration, and integration files. Fresh setup creates no repository state
+and registers no repository. During an incompatible upgrade, it checkpoints
+and migrates enabled repositories before committing the global transaction.
+Disabled repository records are preserved and their databases are left
+unchanged until their next `acd on`.
 
 Existing installations skip first-run questions and keep their current
 settings.
 
-After that cutover, compatible setup plans use a bounded binary-and-hooks
-transaction. They checkpoint enabled workers but do not rescan repository
-databases, rerun migrations, or repeat the isolated migration self-test.
+Compatible setup plans inspect only the shared runtime and integrations. They
+do not scan repository databases, rerun migrations, or repeat the isolated
+migration self-test.
 
 ## Status
 
@@ -77,11 +83,9 @@ Read-only status falls back to existing v20 SQLite projections when the
 supervisor is unavailable. Mutations never fall back to direct unsupervised
 writes. On macOS, mutating commands first start or reuse the shared per-user
 supervisor. The owner-only socket verifies the peer UID, and the process uses
-the permissions inherited from the application that first started it. A newer
-compatible source build replaces the managed runtime automatically. State
-migrations marked safe by that runtime are backed up, applied, and checked
-before the upgrade commits. Breaking schema or protocol changes still require
-full `acd setup`.
+the permissions inherited from the application that first started it. If the
+CLI and managed runtime do not match exactly, mutations stop and ask you to run
+`acd setup`.
 
 ## On and off
 
@@ -91,9 +95,10 @@ acd off
 acd off --force
 ~~~
 
-`on` always stops the managed worker for this repository, starts a new one,
-and verifies a checkpoint before it succeeds. It is safe to use after replacing
-the CLI binary or when doctor reports a stopped worker.
+`on` first requires an installed, exactly matching managed runtime. It then
+registers an unknown repository, upgrades only that repository when needed,
+enables it, starts a new worker, and verifies a checkpoint before it succeeds.
+It does not migrate or enable any other repository.
 
 `off` requests a complete checkpoint before disabling, then waits for the
 managed worker to stop. If the checkpoint fails, the repository stays enabled
