@@ -5,10 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"runtime"
-	"syscall"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
@@ -27,6 +24,7 @@ func ensureMutationSupervisor(ctx context.Context, roots paths.Roots) error {
 }
 
 func ensureMutationSupervisorMode(ctx context.Context, roots paths.Roots, backgroundUpgrade bool) (func() error, error) {
+	_ = backgroundUpgrade
 	if runtime.GOOS == "darwin" {
 		binary := roots.ManagedBinaryPath()
 		if _, err := os.Stat(binary); err != nil {
@@ -62,50 +60,10 @@ func ensureMutationSupervisorMode(ctx context.Context, roots paths.Roots, backgr
 	}
 	compatibility := runtimeCompatibility()
 	if status.Version != version.String() || status.BinaryDigest != digest {
-		if !status.Compatibility.Equal(compatibility) &&
-			!installer.CanUpgradeRuntimeCompatibility(
-				status.Compatibility, compatibility) &&
-			!installer.CanProbeUnadvertisedRuntime(status, version.String()) {
-			return nil, errors.New("running ACD does not advertise the current compatibility contract; run `acd setup` once to complete the compatibility cutover")
-		}
-		if backgroundUpgrade {
-			return func() error { return startCompatibleRuntimeUpgrade(roots, executable) }, nil
-		}
-		_, err := installer.ApplyCompatibleRuntime(ctx, roots, installer.RuntimeUpgradeOptions{
-			SourceExecutable:  executable,
-			SourceVersion:     version.String(),
-			Compatibility:     compatibility,
-			Integrations:      "auto",
-			AllowUnadvertised: true,
-		})
-		return nil, err
+		return nil, errors.New("the installed ACD runtime does not match this command; run `acd setup` to review and apply the global upgrade")
 	}
 	if !status.Compatibility.Equal(compatibility) {
 		return nil, errors.New("running ACD does not advertise the current compatibility contract; run `acd setup` once to complete the compatibility cutover")
 	}
 	return nil, nil
-}
-
-func startCompatibleRuntimeUpgrade(roots paths.Roots, executable string) error {
-	if err := os.MkdirAll(filepath.Dir(roots.SupervisorLogPath()), 0o700); err != nil {
-		return fmt.Errorf("prepare runtime upgrade log: %w", err)
-	}
-	logFile, err := os.OpenFile(roots.SupervisorLogPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return fmt.Errorf("open runtime upgrade log: %w", err)
-	}
-	command := exec.Command(executable, "internal", "supervisor", "upgrade-compatible")
-	command.Env = os.Environ()
-	command.Stdout = logFile
-	command.Stderr = logFile
-	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := command.Start(); err != nil {
-		_ = logFile.Close()
-		return fmt.Errorf("start compatible runtime upgrade: %w", err)
-	}
-	_ = logFile.Close()
-	if err := command.Process.Release(); err != nil {
-		return fmt.Errorf("release compatible runtime updater: %w", err)
-	}
-	return nil
 }
