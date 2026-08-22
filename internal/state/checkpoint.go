@@ -136,6 +136,46 @@ type CheckpointReadOnlyProjection struct {
 	Recoverable   []Checkpoint
 }
 
+// CompletedCheckpointForBarrier returns the newest completed checkpoint that
+// covers one worktree observation on the requested branch. A shared metadata
+// pointer may refer to another linked worktree, so publication barriers select
+// their checkpoint from the durable identity instead.
+func CompletedCheckpointForBarrier(
+	ctx context.Context,
+	db *DB,
+	worktreeID string,
+	minimumCoverageEpoch int64,
+	branchRef string,
+) (Checkpoint, bool, error) {
+	if db == nil {
+		return Checkpoint{}, false, errors.New(
+			"state: CompletedCheckpointForBarrier: nil db")
+	}
+	if len(worktreeID) != 16 || minimumCoverageEpoch < 0 ||
+		strings.TrimSpace(branchRef) == "" {
+		return Checkpoint{}, false, ErrCheckpointIdentityMismatch
+	}
+	var id string
+	err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT id FROM checkpoints
+WHERE phase='completed' AND worktree_id=? AND coverage_epoch>=?
+  AND observed_ref=?
+ORDER BY coverage_epoch DESC,seq DESC LIMIT 1`,
+		worktreeID, minimumCoverageEpoch, branchRef).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Checkpoint{}, false, nil
+	}
+	if err != nil {
+		return Checkpoint{}, false, fmt.Errorf(
+			"state: select completed publication checkpoint: %w", err)
+	}
+	checkpoint, ok, err := checkpointByIDQuery(ctx, db.ReadSQL(), id, true)
+	if err != nil {
+		return Checkpoint{}, false, err
+	}
+	return checkpoint, ok, nil
+}
+
 // PrepareCheckpoint persists the immutable checkpoint identity with FULL
 // SQLite synchronization before the private Git ref may be created. Reusing
 // an ID with the exact same identity is idempotent; any mismatch fails closed.
