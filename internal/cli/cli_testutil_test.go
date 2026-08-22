@@ -230,6 +230,23 @@ func registerRepo(t *testing.T, roots paths.Roots, repoDir, stateDB, harness str
 	}
 }
 
+func upsertActivatedRepoFixture(
+	registry *central.Registry,
+	root, commonDir, stateDB, harness string,
+	now int64,
+) {
+	repositoryID := central.CanonicalID(commonDir)
+	registry.UpsertRepo(root, repositoryID, stateDB, harness, now)
+	for i := range registry.Repos {
+		if central.SameRepoPath(registry.Repos[i].Path, root) {
+			registry.Repos[i].RepositoryID = repositoryID
+			registry.Repos[i].WorktreeID = central.CanonicalID(root)
+			registry.Repos[i].CommonDir = commonDir
+			return
+		}
+	}
+}
+
 // nowFloat returns the current wall-clock time as the REAL-column unix
 // seconds the schema uses for daemon_state.heartbeat_ts etc.
 func nowFloat() float64 {

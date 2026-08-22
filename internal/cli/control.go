@@ -155,19 +155,23 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 		return controlWorktreeError("on", repoFlag, err)
 	}
 
-	actions := make([]string, 0, 3)
-	if !lookup.Registered {
-		return actionRequiredError("setup_required", "acd on: repository is not configured; run `acd setup`")
+	if err := ensureMutationSupervisor(ctx, lookup.Roots); err != nil {
+		if strings.Contains(err.Error(), "run `acd setup`") {
+			return actionRequiredError("setup_required", "acd on: "+err.Error())
+		}
+		return unavailableError("acd on: " + err.Error())
 	}
-	if lookup.Record.RepositoryID == "" || lookup.Record.WorktreeID == "" {
-		return actionRequiredError("setup_required", "acd on: repository requires `acd setup` checkpoint cutover")
+	actions := make([]string, 0, 6)
+	lookup, preparationActions, err := prepareControlRepository(ctx, lookup)
+	if err != nil {
+		if errors.Is(err, state.ErrSetupRequired) || strings.Contains(err.Error(), "run `acd setup`") {
+			return actionRequiredError("setup_required", "acd on: "+err.Error())
+		}
+		return err
 	}
-	changed := lookup.Record.LifecycleDisabled()
+	actions = append(actions, preparationActions...)
 	if _, err := callSupervisor(ctx, lookup, "enable_repository", nil, 30*time.Second); err != nil {
 		return fmt.Errorf("acd on: %w", err)
-	}
-	if changed {
-		actions = append(actions, "enabled")
 	}
 	if _, err := callSupervisor(ctx, lookup, "restart_repository", nil, 30*time.Second); err != nil {
 		return fmt.Errorf("acd on: restart worker: %w", err)
@@ -553,6 +557,8 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	res.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 	res.CheckpointID = status.LatestCheckpointID
 	res.PublicationDrain = status.PublicationDrain
+	res.RecoveryRequired = status.Replay.State == "needs_attention" ||
+		status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0
 
 	switch {
 	case status.CheckpointRetentionOverBudget:
@@ -613,13 +619,11 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.NextAction = "No action needed. If planning stalls, ACD switches to safe local groups automatically."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
-		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
-		res.RecoveryRequired = true
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A blocked publication needs recovery on the active branch."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."

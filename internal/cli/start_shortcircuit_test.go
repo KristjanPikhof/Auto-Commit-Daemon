@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -456,13 +457,10 @@ func TestTryShortCircuitStart_HappyPath(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	repoHash, err := paths.RepoHash(repoDir)
-	if err != nil {
-		t.Fatalf("RepoHash: %v", err)
-	}
+	repoHash := central.CanonicalID(gitDir)
 	// Stamp a registry row for this repo.
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
-		reg.UpsertRepo(repoDir, repoHash, "/state/db", "claude-code", time.Now().Unix())
+		upsertActivatedRepoFixture(reg, repoDir, gitDir, "/state/db", "claude-code", time.Now().Unix())
 		return nil
 	}); err != nil {
 		t.Fatalf("registry WithLock: %v", err)
@@ -502,12 +500,9 @@ func TestTryShortCircuitStart_FingerprintMismatchEscalates(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(gitDir, "acd"), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	repoHash, err := paths.RepoHash(repoDir)
-	if err != nil {
-		t.Fatalf("RepoHash: %v", err)
-	}
+	repoHash := central.CanonicalID(gitDir)
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
-		reg.UpsertRepo(repoDir, repoHash, "/state/db", "claude-code", time.Now().Unix())
+		upsertActivatedRepoFixture(reg, repoDir, gitDir, "/state/db", "claude-code", time.Now().Unix())
 		return nil
 	}); err != nil {
 		t.Fatalf("registry WithLock: %v", err)
@@ -849,7 +844,7 @@ func TestMultiSession_PerSessionCacheKeepsBothOnHotPath(t *testing.T) {
 	}
 }
 
-func TestRunStart_LegacySubdirRegistryRowFallsBackAndRepairs(t *testing.T) {
+func TestRunStart_LegacySubdirRegistryRowDoesNotRewriteConsent(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir := makeStartRepo(t)
@@ -857,11 +852,16 @@ func TestRunStart_LegacySubdirRegistryRowFallsBackAndRepairs(t *testing.T) {
 	if err := os.MkdirAll(subdir, 0o755); err != nil {
 		t.Fatalf("mkdir subdir: %v", err)
 	}
-	repoHash, err := paths.RepoHash(repoDir)
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	subdir = filepath.Join(wt.Root, "nested", "pkg")
+	repoHash, err := paths.RepoHash(wt.Root)
 	if err != nil {
 		t.Fatalf("RepoHash: %v", err)
 	}
-	gitDir := filepath.Join(repoDir, ".git")
+	gitDir := wt.GitDir
 	dbPath := state.DBPathFromGitDir(gitDir)
 	if err := central.WithLock(roots, func(reg *central.Registry) error {
 		reg.Repos = []central.RepoRecord{{
@@ -875,6 +875,10 @@ func TestRunStart_LegacySubdirRegistryRowFallsBackAndRepairs(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("write legacy registry row: %v", err)
+	}
+	registryBefore, err := os.ReadFile(roots.RegistryPath())
+	if err != nil {
+		t.Fatalf("read legacy registry: %v", err)
 	}
 
 	stamped := identity.Fingerprint{StartTime: "Mon May  5 12:00:00 2026", ArgvHash: "legacy-cache-argv"}
@@ -908,28 +912,24 @@ func TestRunStart_LegacySubdirRegistryRowFallsBackAndRepairs(t *testing.T) {
 		t.Fatalf("runStart from legacy subdir: %v", err)
 	}
 	if hotTouches.Load() != 0 {
-		t.Fatalf("legacy subdir row should not use either short-circuit path; hot touches=%d", hotTouches.Load())
+		t.Fatalf("legacy registry hook touched state %d times", hotTouches.Load())
 	}
-	if count.Load() != 1 {
-		t.Fatalf("cold repair path spawn count=%d want 1", count.Load())
+	if count.Load() != 0 {
+		t.Fatalf("legacy registered row spawned a replacement daemon: count=%d", count.Load())
 	}
 	var got startResult
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal start result: %v\n%s", err, stdout.String())
 	}
-	if !central.SameRepoPath(got.Repo, repoDir) {
-		t.Fatalf("Repo=%q want canonical root %q", got.Repo, repoDir)
+	if !got.Skipped || got.SkipReason != repoAutodiscoverySkipDisabled || !central.SameRepoPath(got.Repo, repoDir) {
+		t.Fatalf("result=%+v want activation-required skip at canonical root", got)
 	}
-
-	reg, err := central.Load(roots)
+	registryAfter, err := os.ReadFile(roots.RegistryPath())
 	if err != nil {
-		t.Fatalf("load repaired registry: %v", err)
+		t.Fatalf("read registry after hook: %v", err)
 	}
-	if len(reg.Repos) != 1 {
-		t.Fatalf("registry rows=%d want 1: %+v", len(reg.Repos), reg.Repos)
-	}
-	if !central.SameRepoPath(reg.Repos[0].Path, repoDir) {
-		t.Fatalf("registry path=%q want repaired canonical root %q", reg.Repos[0].Path, repoDir)
+	if !bytes.Equal(registryAfter, registryBefore) {
+		t.Fatalf("hook rewrote legacy registry\nbefore=%s\nafter=%s", registryBefore, registryAfter)
 	}
 	if sc := readStartCache(startCachePath(gitDir, "sess-legacy-subdir")); sc == nil || sc.Version != startCacheVersion {
 		t.Fatalf("v2 start-cache was not present after fallback repair: %+v", sc)

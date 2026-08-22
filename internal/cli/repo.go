@@ -84,11 +84,9 @@ func newRepoCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "repo",
 		Short: "Manage explicit repo registration lifecycle",
-		Long: `Manage explicit acd repository registration without starting normal capture and replay workflows.
+		Long: `Manage legacy repository registration records without starting normal capture and replay workflows.
 
-Autodiscovery is enabled by default, so normal harness hooks still create repo state automatically. Use repo init to prepare the current Git worktree when autodiscovery is disabled, repo disable to stop and disable a registered repo without deleting state, repo enable to re-enable a disabled repo, repo list to inspect every registry row, and repo remove to preview or remove a repo registration.
-
-Disable implicit repo registration with repo_lifecycle.autodiscovery in ~/.config/acd/config.json or override one shell with ACD_REPO_AUTODISCOVERY=disabled.`,
+Use acd on to register or enable a repository and acd off to disable it without deleting state. Integration hooks never register unknown repositories or re-enable disabled ones. The old autodiscovery settings are deprecated and no longer grant repository consent. Use repo list to inspect registry rows and repo remove to preview or remove an old registration.`,
 		Example: `  acd repo init
   acd repo init --json
   acd repo disable --repo /path/to/repo
@@ -607,7 +605,7 @@ func repoLifecycleUnknownTargetError(action string, target central.RepoRemovalTa
 	if name == "" {
 		name = "."
 	}
-	return fmt.Errorf("acd repo %s: repo %s is not registered; run `acd repo init --repo %s` to register it or `acd repo list` to inspect registered repos", action, name, name)
+	return fmt.Errorf("acd repo %s: repo %s is not registered; run `acd on --repo %s` to register and enable it or `acd repo list` to inspect registered repos", action, name, name)
 }
 
 func runRepoRemove(ctx context.Context, out io.Writer, repoFlag string, dryRun, yes, purgeState, jsonOut bool) error {

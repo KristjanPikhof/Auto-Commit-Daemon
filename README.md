@@ -13,11 +13,12 @@ path.
 
 ## Get protected
 
-Install the checkpoint-first binary, enter the Git repository you want to
-protect, then run:
+Install ACD once, then enable each repository you want to protect:
 
 ~~~bash
 acd setup
+cd /path/to/repository
+acd on
 ~~~
 
 First setup asks four short questions about grouping, commit messages, and the
@@ -27,12 +28,16 @@ ACD then shows one exact plan and explains what can leave the machine. After
 you approve it, ACD tests the provider with fixed synthetic text before it
 changes anything.
 
-Setup configures one user-level
-supervisor, enables the current repository, merges detected optional
-integrations, and runs an isolated checkpoint/publish/restore self-test. Later
-compatible upgrades use a bounded binary-and-hooks transaction without
-rescanning or migrating every repository. On failure either path restores
-every touched file and prior process/service state.
+Setup configures one user-level supervisor, merges detected optional
+integrations, and runs an isolated checkpoint/publish/restore self-test. It
+does not enable the current directory. Run `acd on` once inside every
+repository that ACD should protect.
+
+Later compatible setup runs inspect only the shared runtime and integrations.
+An incompatible upgrade checkpoints and migrates enabled repositories as one
+reviewed transaction. Disabled repositories stay disabled and are migrated
+only when you run `acd on` for them. On failure, setup restores every touched
+file and prior process or service state.
 
 On macOS, the first ACD mutation starts one shared supervisor for the current
 user. Other terminals and agent applications reuse its owner-only socket after
@@ -42,12 +47,9 @@ it and does not require Full Disk Access. After logout or restart, the first
 `acd on` or supported agent hook starts it again. Linux uses the persistent
 user systemd service.
 
-After the compatibility contract is installed, a newer compatible ACD build
-upgrades the managed runtime at a safe checkpoint boundary. ACD also applies
-state migrations that the new runtime explicitly marks as safe. Breaking
-protocol, registry, or state changes still require the full reviewed
-`acd setup` migration. The first release with this contract may therefore need
-one final full setup.
+When the CLI and managed runtime differ, run `acd setup` to review and apply
+the upgrade. Ordinary repository commands and integration hooks never replace
+the binary or migrate other repositories.
 
 Preview without writes or supervisor/service actions:
 
@@ -104,9 +106,9 @@ Root help lists ten everyday commands:
 
 | Command | Purpose |
 |---|---|
-| `acd setup` | Install or upgrade transactionally and protect the current repository. |
+| `acd setup` | Install or upgrade the shared ACD runtime and integrations. |
 | `acd status` | Answer whether changes are enabled, protected, published, and actionable. |
-| `acd on` | Enable protection, replace the managed worker, and verify a new checkpoint. |
+| `acd on` | Register or enable this repository, start its worker, and verify a checkpoint. |
 | `acd off` | Complete a final checkpoint, disable protection, and wait for the worker to stop. |
 | `acd list` | Show live protection health and commit progress across repositories. |
 | `acd commit-all` | Checkpoint now and drain the bounded publication target. |

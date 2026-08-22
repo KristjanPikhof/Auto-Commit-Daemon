@@ -51,7 +51,7 @@ func registerProtectedControlRepo(t *testing.T, roots paths.Roots, repoDir strin
 
 func TestControlBareUnregisteredIsReadOnly(t *testing.T) {
 	_ = withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	stateDB := state.DBPathFromGitDir(filepath.Join(repo, ".git"))
 
 	var out bytes.Buffer
@@ -610,6 +610,20 @@ func TestApplyControlStatusManualPauseStillNeedsAttention(t *testing.T) {
 	}
 }
 
+func TestApplyControlStatusStorageWarningDoesNotHideRecoveryRequirement(t *testing.T) {
+	status := statusReport{
+		Daemon:                        "running",
+		PID:                           os.Getpid(),
+		CheckpointRetentionOverBudget: true,
+		ActiveBarriers:                1,
+	}
+	result := controlResult{OK: true}
+	applyControlStatus(&result, status)
+	if !result.RecoveryRequired || result.Health != controlHealthNeedsAttention {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
 func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T) {
 	health := &daemon.IntentPlannerHealthSnapshot{State: daemon.IntentPlannerCircuitOpen}
 	for _, tc := range []struct {
@@ -637,9 +651,9 @@ func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T)
 	}
 }
 
-func TestControlOnRegistersStartsAndIsIdempotent(t *testing.T) {
-	withIsolatedHome(t)
-	repo := makeStartRepo(t)
+func TestControlOnMissingRuntimeRefusesBeforeActivation(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := makeUnregisteredStartRepo(t)
 	var setupRequired bytes.Buffer
 	if err := runControlOn(context.Background(), &setupRequired, repo, true); ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "setup") {
 		t.Fatalf("uncut repository on exit=%d err=%v", ExitCode(err), err)
@@ -647,11 +661,38 @@ func TestControlOnRegistersStartsAndIsIdempotent(t *testing.T) {
 	if setupRequired.Len() != 0 {
 		t.Fatalf("uncut repository on emitted success output: %q", setupRequired.String())
 	}
+	if _, err := os.Stat(state.DBPathFromGitDir(filepath.Join(repo, ".git"))); !os.IsNotExist(err) {
+		t.Fatalf("acd on created repository state before runtime validation: %v", err)
+	}
+	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
+		t.Fatalf("acd on created registry before runtime validation: %v", err)
+	}
+}
+
+func TestControlOnMismatchedRuntimeRefusesBeforeActivation(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := makeUnregisteredStartRepo(t)
+	if err := os.MkdirAll(filepath.Dir(roots.ManagedBinaryPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(roots.ManagedBinaryPath(), []byte("older-acd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := runControlOn(context.Background(), io.Discard, repo, true)
+	if ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "acd setup") {
+		t.Fatalf("mismatched runtime exit=%d err=%v", ExitCode(err), err)
+	}
+	if _, err := os.Stat(state.DBPathFromGitDir(filepath.Join(repo, ".git"))); !os.IsNotExist(err) {
+		t.Fatalf("acd on created repository state before runtime validation: %v", err)
+	}
+	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
+		t.Fatalf("acd on created registry before runtime validation: %v", err)
+	}
 }
 
 func TestControlOnTreatsRewindGraceAsWaiting(t *testing.T) {
 	withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	if err := runControlOn(context.Background(), io.Discard, repo, true); ExitCode(err) != ExitActionRequired {
 		t.Fatalf("uncut repository on exit=%d err=%v", ExitCode(err), err)
 	}
@@ -659,7 +700,7 @@ func TestControlOnTreatsRewindGraceAsWaiting(t *testing.T) {
 
 func TestControlOffDisablesStopsPreservesAndIsIdempotent(t *testing.T) {
 	withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	var offOut bytes.Buffer
 	if err := runControlOff(context.Background(), &offOut, repo, true); err != nil {
 		t.Fatalf("off unconfigured repository: %v", err)
@@ -694,7 +735,7 @@ func TestControlOnRestartsFreshLookingDeadDaemon(t *testing.T) {
 
 func TestControlOffUnknownRepoRecordsDurableOptOut(t *testing.T) {
 	roots := withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 
 	var out bytes.Buffer
 	if err := runControlOff(context.Background(), &out, repo, true); err != nil {
@@ -717,7 +758,7 @@ func TestControlOffUnknownRepoRecordsDurableOptOut(t *testing.T) {
 func TestControlOffUnknownDetachedRepoRecordsDurableOptOut(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	commitStartRepoSeed(t, repo)
 	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "checkout", "--detach", "--quiet"); err != nil {
 		t.Fatalf("detach HEAD: %v", err)
@@ -805,7 +846,7 @@ func TestRenderProductDoctorWorkerShowsCauseAndFix(t *testing.T) {
 
 func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	_ = withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 
 	var out bytes.Buffer
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
@@ -820,7 +861,7 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 
 func TestControlRootBareUsesReadOnlyHealth(t *testing.T) {
 	_ = withIsolatedHome(t)
-	repo := makeStartRepo(t)
+	repo := makeUnregisteredStartRepo(t)
 	root := newRootCmd()
 	var out, errOut bytes.Buffer
 	root.SetOut(&out)

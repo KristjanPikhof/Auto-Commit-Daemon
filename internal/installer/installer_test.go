@@ -41,13 +41,23 @@ func TestBuildPlanIsReadOnlyAndStableForDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Digest == "" || plan.ExistingInstall || !plan.FreshDefaults || len(plan.Repositories) != 1 {
+	if plan.Digest == "" || plan.ExistingInstall || !plan.FreshDefaults || plan.Scope != "global" || len(plan.Repositories) != 0 {
 		t.Fatalf("plan=%+v", plan)
+	}
+	if len(plan.Registry.Repos) != 0 || plan.RepositoryID != "" || plan.WorktreeID != "" || plan.Repo != "" {
+		t.Fatalf("global plan contains repository identity: %+v", plan)
+	}
+	if len(plan.Warnings) != 1 || !strings.Contains(plan.Warnings[0], "acd on --repo "+repo) {
+		t.Fatalf("warnings=%v", plan.Warnings)
 	}
 	if _, err := os.Stat(roots.RegistryPath()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("planning wrote registry: %v", err)
 	}
-	if _, err := os.Stat(plan.Repositories[0].Record.StateDB); !errors.Is(err, os.ErrNotExist) {
+	wt, err := gitpkg.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(state.DBPathFromGitDir(wt.GitDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("planning wrote state DB: %v", err)
 	}
 	if got := digestPlan(plan); got != plan.Digest {
@@ -63,16 +73,31 @@ func TestBuildPlanIsReadOnlyAndStableForDigest(t *testing.T) {
 	if second.Digest != plan.Digest {
 		t.Fatalf("equivalent plan digest changed: first=%s second=%s", plan.Digest, second.Digest)
 	}
-	for _, repository := range plan.Repositories {
-		if !strings.HasPrefix(repository.BackupPath, plan.BackupRoot+string(os.PathSeparator)) {
-			t.Fatalf("digest normalization mutated backup path to %q", repository.BackupPath)
-		}
+	withoutRepo, err := BuildPlan(ctx, roots, Options{Executable: executable, SkipServiceCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutRepo.Digest != plan.Digest {
+		t.Fatalf("ignored --repo changed mutation digest: with=%s without=%s", plan.Digest, withoutRepo.Digest)
 	}
 	if len(plan.Actions) == 0 || plan.Actions[0].Target != plan.BackupRoot {
 		t.Fatalf("digest normalization mutated setup action target: %+v", plan.Actions)
 	}
-	if plan.Registry.Repos[0].LastSeenTS == 0 {
-		t.Fatalf("digest normalization cleared live registry timestamps: %+v", plan.Registry.Repos[0])
+}
+
+func TestBuildPlanDoesNotRequireRepository(t *testing.T) {
+	ctx := context.Background()
+	roots := paths.Roots{State: t.TempDir(), Share: t.TempDir(), Config: t.TempDir()}
+	executable := filepath.Join(t.TempDir(), "acd")
+	if err := os.WriteFile(executable, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildPlan(ctx, roots, Options{Executable: executable, SkipServiceCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Scope != "global" || len(plan.Repositories) != 0 || len(plan.Registry.Repos) != 0 {
+		t.Fatalf("plan=%+v", plan)
 	}
 }
 
@@ -160,7 +185,7 @@ func TestSetupRollbackRestoresConfigurationAndCredentialTogether(t *testing.T) {
 	}
 }
 
-func TestBuildPlanDisablesStaleMissingRowsAndEnablesCurrentRepo(t *testing.T) {
+func TestBuildPlanPreservesDisabledRepositories(t *testing.T) {
 	ctx := context.Background()
 	roots, repo, executable := installerFixture(t, ctx)
 	wt, err := gitpkg.ResolveWorktree(ctx, repo)
@@ -187,8 +212,8 @@ func TestBuildPlanDisablesStaleMissingRowsAndEnablesCurrentRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 	current, ok := plan.Registry.FindRepo(repo, state.DBPathFromGitDir(wt.GitDir))
-	if !ok || current.LifecycleDisabled() {
-		t.Fatalf("current repository was not enabled: %+v ok=%v", current, ok)
+	if !ok || !current.LifecycleDisabled() {
+		t.Fatalf("current repository was not preserved as disabled: %+v ok=%v", current, ok)
 	}
 	stale, ok := plan.Registry.FindRepo(missing, filepath.Join(missing, ".git", "acd", "state.db"))
 	if !ok || !stale.LifecycleDisabled() {
@@ -202,6 +227,9 @@ func TestBuildPlanDisablesStaleMissingRowsAndEnablesCurrentRepo(t *testing.T) {
 	}
 	if !wantAction {
 		t.Fatalf("plan actions do not disclose stale repository handling: %+v", plan.Actions)
+	}
+	if len(plan.Repositories) != 0 || plan.DeferredRepositories != 2 {
+		t.Fatalf("repositories=%d deferred=%d", len(plan.Repositories), plan.DeferredRepositories)
 	}
 }
 
@@ -252,7 +280,7 @@ func TestApplyFreshSetupPersistsV20AndDefaults(t *testing.T) {
 		t.Fatalf("result=%+v calls=%v", result, executor.calls)
 	}
 	if got := progressPhases(progress); !containsPhasesInOrder(got,
-		"prepare", "quiesce", "backup", "install_binary", "bridge", "migrate", "install",
+		"prepare", "quiesce", "backup", "install_binary", "bridge", "install",
 		"service", "self_test", "workers", "integrations", "finalize", "completed") {
 		t.Fatalf("progress phases=%v", got)
 	}
@@ -263,19 +291,16 @@ func TestApplyFreshSetupPersistsV20AndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if registry.Version != central.RegistryVersion || len(registry.Repos) != 1 {
+	if registry.Version != central.RegistryVersion || len(registry.Repos) != 0 {
 		t.Fatalf("registry=%+v", registry)
-	}
-	if version, err := state.ReadUserVersion(ctx, registry.Repos[0].StateDB); err != nil || version != state.SchemaVersion {
-		t.Fatalf("schema=(%d,%v)", version, err)
 	}
 	doc, err := config.NewStore(roots).Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	settings := doc.Settings.Repositories[plan.WorktreeID]
-	if string(settings.Fields[config.FieldProvider]) != `"deterministic"` || string(settings.Fields[config.FieldCommitStrategy]) != `"intent"` {
-		t.Fatalf("settings=%v", settings.Fields)
+	settings := doc.Settings.Global
+	if string(settings[config.FieldProvider]) != `"deterministic"` || string(settings[config.FieldCommitStrategy]) != `"intent"` {
+		t.Fatalf("settings=%v", settings)
 	}
 }
 
@@ -352,7 +377,11 @@ func TestApplyRollsBackFilesAndFreshDatabaseOnFailure(t *testing.T) {
 	if readErr != nil || string(body) != "{\"version\":1}\n" {
 		t.Fatalf("config=(%q,%v)", body, readErr)
 	}
-	if _, statErr := os.Stat(plan.Repositories[0].Record.StateDB); !errors.Is(statErr, os.ErrNotExist) {
+	wt, resolveErr := gitpkg.ResolveWorktree(ctx, repo)
+	if resolveErr != nil {
+		t.Fatal(resolveErr)
+	}
+	if _, statErr := os.Stat(state.DBPathFromGitDir(wt.GitDir)); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("fresh DB retained: %v", statErr)
 	}
 	phases := progressPhases(progress)

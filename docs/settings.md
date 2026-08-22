@@ -82,6 +82,15 @@ Hot fields apply between safe worker passes. Restart-required fields apply
 when the supervisor next starts that repository worker. Changing a global
 value does not start stopped repositories or fan out an implicit restart.
 
+## Repository consent
+
+Run `acd on` once in each repository that ACD should protect. Integration hooks
+do not register unknown repositories or re-enable disabled ones.
+
+`repo_lifecycle.autodiscovery` and `ACD_REPO_AUTODISCOVERY` are deprecated.
+They remain parseable so existing configuration files keep their unknown
+fields, but they no longer grant repository consent or override `acd on`.
+
 See the generated [configuration reference](configuration-reference.md) for
 every supported setting, environment variable, default, apply boundary,
 persistence rule, and sensitivity classification.

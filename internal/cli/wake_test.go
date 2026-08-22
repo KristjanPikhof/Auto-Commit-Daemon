@@ -41,6 +41,7 @@ func TestWake_RefreshesAndSignals(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	// Pre-register a session and a live daemon (PID = current process so
 	// identity.Alive returns true without spawning anything).
 	if err := state.RegisterClient(ctx, db, state.Client{
@@ -128,6 +129,7 @@ func TestWake_SkipsWhenControlLockHeld(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	if err := state.RegisterClient(ctx, db, state.Client{
 		SessionID: "s1", Harness: "claude-code",
 	}); err != nil {
@@ -187,6 +189,7 @@ func TestWake_PropagatesUnexpectedLockError(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	_ = db.Close()
 	_, _, restore := installFakeSignal(t)
 	defer restore()
@@ -208,6 +211,7 @@ func TestWake_LazyRegisterIdempotent(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
+	registerEnabledStartRepo(t, repoDir)
 	_ = db.Close()
 	_, _, restore := installFakeSignal(t)
 	defer restore()

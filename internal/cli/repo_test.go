@@ -183,7 +183,7 @@ func TestRepoLifecycle_UnknownRepoDoesNotCreateState(t *testing.T) {
 	if err == nil {
 		t.Fatalf("runRepoDisable unknown succeeded")
 	}
-	for _, want := range []string{"not registered", "acd repo init --repo " + repo, "acd repo list"} {
+	for _, want := range []string{"not registered", "acd on --repo " + repo, "acd repo list"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("unknown repo error missing %q: %v", want, err)
 		}

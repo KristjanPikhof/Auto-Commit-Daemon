@@ -349,6 +349,7 @@ func TestRewriteCommitsEditSavedPlanByIDPlanOnlyBypassesProviderGate(t *testing.
 }
 
 func TestRewriteCommitsDeclinedApplyOmitsNextFooter(t *testing.T) {
+	withIsolatedHome(t)
 	repo := rewriteSelectionTestRepo(t)
 	providerDir := t.TempDir()
 	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")

@@ -133,18 +133,18 @@ func runFlush(ctx context.Context, out io.Writer, repoFlag, sessionID string, lo
 			if policy.Disabled {
 				res.SkippedReason = repoAutodiscoverySkipRepoDisabled
 				res.RefusedReason = repoAutodiscoverySkipRepoDisabled
-				return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped logical flush for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)", repo, policy.skipReason(), repo))
+				return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped logical flush for %s (%s; run `acd on --repo %s` to enable protection)", repo, policy.skipReason(), repo))
 			}
 			res.SkippedReason = "unknown_session"
 			res.RefusedReason = "unknown_session"
-			return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped logical flush (session %s not registered; run `acd repo init --repo %s` before using logical flush)", sessionID, repo))
+			return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped logical flush (session %s not registered; run `acd on --repo %s` before using logical flush)", sessionID, repo))
 		}
 		res.SkippedReason = policy.skipReason()
 		if policy.Disabled {
-			return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)",
+			return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped for %s (%s; run `acd on --repo %s` to enable protection)",
 				repo, policy.skipReason(), repo))
 		}
-		return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped for %s (%s; run `acd repo init --repo %s` to register explicitly)",
+		return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped for %s (%s; run `acd on --repo %s` to enable protection)",
 			repo, policy.skipReason(), repo))
 	}
 
@@ -180,7 +180,7 @@ func runFlush(ctx context.Context, out io.Writer, repoFlag, sessionID string, lo
 		if logical {
 			res.RefusedReason = repoAutodiscoverySkipRepoDisabled
 		}
-		return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped for %s (%s; run `acd repo enable --repo %s` to allow ACD to manage it)",
+		return renderFlush(out, res, jsonOut, fmt.Sprintf("acd flush: skipped for %s (%s; run `acd on --repo %s` to enable protection)",
 			repo, repoAutodiscoverySkipRepoDisabled, repo))
 	}
 

@@ -451,7 +451,7 @@ func tryRegistryBackedShortCircuitStart(
 }
 
 func registryRecordLooksCanonical(rec central.RepoRecord) bool {
-	if rec.Path == "" {
+	if !registryRecordHasCanonicalIdentity(rec) || rec.LifecycleDisabled() {
 		return false
 	}
 	root := filepath.Clean(rec.Path)

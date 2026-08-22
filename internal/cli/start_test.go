@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -88,6 +87,45 @@ func withSpawnPollSettings(t *testing.T, timeout, interval time.Duration) {
 
 func makeStartRepo(t *testing.T) string {
 	t.Helper()
+	repoDir := makeUnregisteredStartRepo(t)
+	roots, err := paths.Resolve()
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	registerStartRepoFixture(t, roots, repoDir)
+	return repoDir
+}
+
+// registerStartRepoFixture gives start and pause tests explicit repository
+// consent without paying the fsync cost of a production registry mutation.
+// These tests use isolated roots and exercise registry durability separately.
+func registerStartRepoFixture(t *testing.T, roots paths.Roots, repoDir string) {
+	t.Helper()
+	registry, err := central.Load(roots)
+	if err != nil {
+		t.Fatalf("load registry fixture: %v", err)
+	}
+	root, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		t.Fatalf("resolve repository fixture: %v", err)
+	}
+	gitDir := filepath.Join(root, ".git")
+	upsertActivatedRepoFixture(registry, root, gitDir,
+		state.DBPathFromGitDir(gitDir), "", time.Now().Unix())
+	body, err := json.Marshal(registry)
+	if err != nil {
+		t.Fatalf("marshal registry fixture: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(roots.RegistryPath()), 0o700); err != nil {
+		t.Fatalf("create registry fixture directory: %v", err)
+	}
+	if err := os.WriteFile(roots.RegistryPath(), body, 0o600); err != nil {
+		t.Fatalf("write registry fixture: %v", err)
+	}
+}
+
+func makeUnregisteredStartRepo(t *testing.T) string {
+	t.Helper()
 	ctx := context.Background()
 	repoDir := t.TempDir()
 	if err := git.Init(ctx, repoDir); err != nil {
@@ -97,6 +135,31 @@ func makeStartRepo(t *testing.T) string {
 		t.Fatalf("symbolic-ref HEAD: %v", err)
 	}
 	return repoDir
+}
+
+func registerEnabledStartRepo(t *testing.T, repoDir string) {
+	t.Helper()
+	ctx := context.Background()
+	wt, err := git.ResolveWorktree(ctx, repoDir)
+	if err != nil {
+		t.Fatalf("resolve worktree: %v", err)
+	}
+	roots, err := paths.Resolve()
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		registration, err := registry.RegisterResolvedRepo(wt, "", time.Now().Unix())
+		if err != nil {
+			return err
+		}
+		registry.EnableRepo(central.RepoRemovalTarget{
+			Path: registration.Record.Path, StateDB: registration.Record.StateDB,
+		}, time.Now().Unix())
+		return nil
+	}); err != nil {
+		t.Fatalf("register enabled repository: %v", err)
+	}
 }
 
 func openStartDB(t *testing.T, repoDir string) *state.DB {
@@ -212,13 +275,14 @@ func TestStartCanonicalWriterStartupStateConverges(t *testing.T) {
 func TestStartLinkedWorktreeOwnerRefusesSecondWriter(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	mainRepo := makeStartRepo(t)
+	mainRepo := makeUnregisteredStartRepo(t)
 	withSpawnPollSettings(t, 50*time.Millisecond, 5*time.Millisecond)
 	commitStartRepoSeed(t, mainRepo)
 	linked := filepath.Join(t.TempDir(), "linked")
 	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-owner", linked); err != nil {
 		t.Fatalf("git worktree add: %v", err)
 	}
+	registerEnabledStartRepo(t, linked)
 	mainWT, err := git.ResolveWorktree(ctx, mainRepo)
 	if err != nil {
 		t.Fatalf("resolve main worktree: %v", err)
@@ -244,12 +308,13 @@ func TestStartLinkedWorktreeOwnerRefusesSecondWriter(t *testing.T) {
 func TestStartLinkedWorktreeStalePIDDoesNotClaimOwner(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
-	mainRepo := makeStartRepo(t)
+	mainRepo := makeUnregisteredStartRepo(t)
 	commitStartRepoSeed(t, mainRepo)
 	linked := filepath.Join(t.TempDir(), "linked")
 	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-stale-pid", linked); err != nil {
 		t.Fatalf("git worktree add: %v", err)
 	}
+	registerEnabledStartRepo(t, linked)
 	linkedWT, err := git.ResolveWorktree(ctx, linked)
 	if err != nil {
 		t.Fatalf("resolve linked worktree: %v", err)
@@ -675,7 +740,7 @@ func TestStart_CanonicalizesSubdirectoryForIdentityAndRegistry(t *testing.T) {
 	}
 }
 
-func TestStart_MergesLegacySubdirRegistryRowByStateDB(t *testing.T) {
+func TestStart_LegacySubdirRegistryRowRequiresActivation(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir := makeStartRepo(t)
@@ -702,6 +767,10 @@ func TestStart_MergesLegacySubdirRegistryRowByStateDB(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed legacy registry: %v", err)
 	}
+	registryBefore, err := os.ReadFile(roots.RegistryPath())
+	if err != nil {
+		t.Fatalf("read legacy registry: %v", err)
+	}
 
 	count, restore := installFakeSpawn(t, os.Getpid())
 	defer restore()
@@ -713,33 +782,25 @@ func TestStart_MergesLegacySubdirRegistryRowByStateDB(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
 		t.Fatalf("unmarshal start: %v\n%s", err, stdout.String())
 	}
-	if res.Repo != repoDir {
-		t.Fatalf("start repo=%q want canonical root %q", res.Repo, repoDir)
+	if res.Repo != repoDir || !res.Skipped || res.SkipReason != repoAutodiscoverySkipDisabled {
+		t.Fatalf("start result=%+v want activation-required skip", res)
 	}
-	if count.Load() != 1 {
-		t.Fatalf("spawn count=%d want 1", count.Load())
+	if count.Load() != 0 {
+		t.Fatalf("spawn count=%d want 0", count.Load())
 	}
-
-	reg, err := central.Load(roots)
+	registryAfter, err := os.ReadFile(roots.RegistryPath())
 	if err != nil {
-		t.Fatalf("load registry: %v", err)
+		t.Fatalf("read registry after hook: %v", err)
 	}
-	if len(reg.Repos) != 1 {
-		t.Fatalf("registry rows=%d want 1: %+v", len(reg.Repos), reg.Repos)
-	}
-	rec := reg.Repos[0]
-	if rec.Path != repoDir || rec.StateDB != stateDB {
-		t.Fatalf("registry record=%+v want canonical path %q state_db %q", rec, repoDir, stateDB)
-	}
-	if !reflect.DeepEqual(rec.Harnesses, []string{"codex", "pi"}) {
-		t.Fatalf("harnesses=%v want [codex pi]", rec.Harnesses)
+	if !bytes.Equal(registryAfter, registryBefore) {
+		t.Fatalf("hook rewrote legacy registry\nbefore=%s\nafter=%s", registryBefore, registryAfter)
 	}
 }
 
 func TestStart_LinkedWorktreeGitFileCanonicalizesSubdirAndStateDB(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	mainRepo := makeStartRepo(t)
+	mainRepo := makeUnregisteredStartRepo(t)
 	for _, kv := range [][2]string{
 		{"user.email", "acd-test@example.com"},
 		{"user.name", "ACD Test"},
@@ -756,6 +817,7 @@ func TestStart_LinkedWorktreeGitFileCanonicalizesSubdirAndStateDB(t *testing.T) 
 	if _, err := git.Run(ctx, git.RunOpts{Dir: mainRepo}, "worktree", "add", "-q", "-b", "linked-start", linked); err != nil {
 		t.Fatalf("git worktree add: %v", err)
 	}
+	registerEnabledStartRepo(t, linked)
 	if info, err := os.Stat(filepath.Join(linked, ".git")); err != nil {
 		t.Fatalf("stat linked .git: %v", err)
 	} else if info.IsDir() {

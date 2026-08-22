@@ -18,12 +18,22 @@ func withQuiescedRepositoryRuntime(
 	repositoryID string,
 	operation func(context.Context) error,
 ) error {
+	return withQuiescedRepositoryRuntimeForCommand(ctx, roots, repositoryID, "acd fix", operation)
+}
+
+func withQuiescedRepositoryRuntimeForCommand(
+	ctx context.Context,
+	roots paths.Roots,
+	repositoryID string,
+	command string,
+	operation func(context.Context) error,
+) error {
 	if operation == nil {
-		return errors.New("acd fix: nil recovery operation")
+		return fmt.Errorf("%s: nil repository maintenance operation", command)
 	}
 	registry, err := central.Load(roots)
 	if err != nil {
-		return fmt.Errorf("acd fix: load registry for runtime maintenance: %w", err)
+		return fmt.Errorf("%s: load registry for runtime maintenance: %w", command, err)
 	}
 	enabled := make([]central.RepoRecord, 0)
 	for _, record := range registry.Repos {
@@ -32,19 +42,11 @@ func withQuiescedRepositoryRuntime(
 		}
 	}
 	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: supervisor.CheckpointBarrierTimeout}
+	checkpointCtx, cancelCheckpoints := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelCheckpoints()
 	for _, record := range enabled {
-		request := supervisor.Request{
-			Version: supervisor.ProtocolVersion,
-			ID:      fmt.Sprintf("fix-maintenance-checkpoint-%s-%d", record.WorktreeID, time.Now().UnixNano()),
-			Method:  "checkpoint_barrier", RepositoryID: repositoryID, WorktreeID: record.WorktreeID,
-			DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli(),
-		}
-		response, callErr := client.Do(ctx, request)
-		if callErr != nil {
-			return fmt.Errorf("acd fix: protect worktree %s before recovery: %w", record.Path, callErr)
-		}
-		if response.Error != nil {
-			return fmt.Errorf("acd fix: protect worktree %s before recovery: %s", record.Path, response.Error.Message)
+		if err := checkpointWorktreeBeforeMaintenance(checkpointCtx, client, repositoryID, record.WorktreeID); err != nil {
+			return fmt.Errorf("%s: protect worktree %s before maintenance: %w", command, record.Path, err)
 		}
 	}
 
@@ -54,22 +56,22 @@ func withQuiescedRepositoryRuntime(
 		DeadlineMS: time.Now().Add(30 * time.Second).UnixMilli(),
 	})
 	if err != nil {
-		return fmt.Errorf("acd fix: stop shared repository worker: %w", err)
+		return fmt.Errorf("%s: stop shared repository worker: %w", command, err)
 	}
 	if beginResponse.Error != nil {
-		return fmt.Errorf("acd fix: stop shared repository worker: %s", beginResponse.Error.Message)
+		return fmt.Errorf("%s: stop shared repository worker: %s", command, beginResponse.Error.Message)
 	}
 	lease, err := decodeProductData[supervisor.MaintenanceLease](beginResponse.Data)
 	if err != nil {
-		return fmt.Errorf("acd fix: decode repository maintenance lease: %w", err)
+		return fmt.Errorf("%s: decode repository maintenance lease: %w", command, err)
 	}
 	if lease.Token == "" {
-		return errors.New("acd fix: repository maintenance lease has no token")
+		return fmt.Errorf("%s: repository maintenance lease has no token", command)
 	}
 
 	operationCtx, cancelOperation := context.WithCancel(ctx)
 	renewDone := make(chan error, 1)
-	go renewRepositoryMaintenance(operationCtx, client, repositoryID, lease.Token, cancelOperation, renewDone)
+	go renewRepositoryMaintenance(operationCtx, client, repositoryID, lease.Token, command, cancelOperation, renewDone)
 	operationErr := operation(operationCtx)
 	cancelOperation()
 	renewErr := <-renewDone
@@ -89,15 +91,52 @@ func withQuiescedRepositoryRuntime(
 	}
 	endCancel()
 	if endErr != nil {
-		endErr = fmt.Errorf("acd fix: restore shared repository worker: %w", endErr)
+		endErr = fmt.Errorf("%s: restore shared repository worker: %w", command, endErr)
 	}
 	return errors.Join(operationErr, renewErr, endErr)
+}
+
+func checkpointWorktreeBeforeMaintenance(
+	ctx context.Context,
+	client supervisor.Client,
+	repositoryID, worktreeID string,
+) error {
+	var lastErr error
+	for {
+		request := supervisor.Request{
+			Version: supervisor.ProtocolVersion,
+			ID:      fmt.Sprintf("maintenance-checkpoint-%s-%d", worktreeID, time.Now().UnixNano()),
+			Method:  "checkpoint_barrier", RepositoryID: repositoryID, WorktreeID: worktreeID,
+			DeadlineMS: time.Now().Add(supervisor.CheckpointBarrierTimeout).UnixMilli(),
+		}
+		response, err := client.Do(ctx, request)
+		if err == nil && response.Error == nil {
+			return nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = errors.New(response.Error.Message)
+			if !response.Error.Retryable {
+				return lastErr
+			}
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func renewRepositoryMaintenance(
 	ctx context.Context,
 	client supervisor.Client,
-	repositoryID, token string,
+	repositoryID, token, command string,
 	cancel context.CancelFunc,
 	done chan<- error,
 ) {
@@ -124,7 +163,7 @@ func renewRepositoryMaintenance(
 					return
 				}
 				cancel()
-				done <- fmt.Errorf("acd fix: renew repository maintenance lease: %w", err)
+				done <- fmt.Errorf("%s: renew repository maintenance lease: %w", command, err)
 				return
 			}
 		}

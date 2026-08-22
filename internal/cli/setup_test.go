@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io/fs"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
@@ -1330,6 +1332,71 @@ func TestSetup_NoArg_AutoDetectsSingleHarness(t *testing.T) {
 	if !strings.Contains(out, "Target: claude-code") {
 		t.Errorf("transactional plan did not include detected claude-code integration:\n%s", out)
 	}
+}
+
+func TestSetup_DryRunJSONWorksOutsideGitAndStaysGlobal(t *testing.T) {
+	roots := withIsolatedHome(t)
+	outside := t.TempDir()
+	chdirForTest(t, outside)
+
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"setup", "--dry-run", "--json", "--integrations=none"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	plan := decodeSetupPlanEnvelope(t, out.Bytes())
+	if plan.Scope != "global" || plan.Repo != "" || plan.RepositoryID != "" ||
+		plan.WorktreeID != "" || len(plan.Repositories) != 0 || len(plan.Registry.Repos) != 0 {
+		t.Fatalf("global setup plan=%+v", plan)
+	}
+	if _, err := os.Stat(filepath.Join(outside, ".git", "acd")); !os.IsNotExist(err) {
+		t.Fatalf("setup preview created repository state: %v", err)
+	}
+	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
+		t.Fatalf("setup preview created registry: %v", err)
+	}
+}
+
+func TestSetup_RepoFlagWarnsAndDoesNotEnableRepository(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := makeUnregisteredStartRepo(t)
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"--repo", repo, "setup", "--dry-run", "--json", "--integrations=none"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	plan := decodeSetupPlanEnvelope(t, out.Bytes())
+	if plan.Scope != "global" || len(plan.Warnings) != 1 ||
+		!strings.Contains(plan.Warnings[0], "acd on --repo "+repo) {
+		t.Fatalf("plan=%+v", plan)
+	}
+	if _, err := os.Stat(state.DBPathFromGitDir(filepath.Join(repo, ".git"))); !os.IsNotExist(err) {
+		t.Fatalf("setup preview created repository state: %v", err)
+	}
+	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
+		t.Fatalf("setup preview created registry: %v", err)
+	}
+}
+
+func decodeSetupPlanEnvelope(t *testing.T, body []byte) installer.Plan {
+	t.Helper()
+	var envelope struct {
+		State productState   `json:"state"`
+		Data  installer.Plan `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("decode setup plan: %v\n%s", err, body)
+	}
+	if envelope.State != productStateReady {
+		t.Fatalf("setup state=%q want ready", envelope.State)
+	}
+	return envelope.Data
 }
 
 func TestSetup_NoArg_AutoDetectsRepoLocalCodex(t *testing.T) {
