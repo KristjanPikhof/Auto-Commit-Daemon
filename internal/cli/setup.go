@@ -168,7 +168,7 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	}
 	planningProgress := newSetupProgress(cmd.ErrOrStderr(), jsonOut || quiet, 10*time.Second)
 	planningProgress.Update(installer.Progress{
-		Phase: "plan", Detail: "Inspecting repositories and preparing the exact setup plan",
+		Phase: "plan", Detail: "Inspecting the ACD installation and preparing the exact setup plan",
 	})
 	plan, err := installer.BuildPlan(cmd.Context(), roots, installer.Options{Repo: repo, Integrations: integrations, NonInteractive: nonInteractive, ExpectedPlan: expectedPlan})
 	planningProgress.Close()
@@ -197,14 +197,14 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	}
 	if len(plan.Actions) == 1 && plan.Actions[0].Kind == "verify_compatible_runtime" {
 		if jsonOut {
-			return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateProtected,
+			return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateReady,
 				Changed: false, Actions: []productAction{}, Data: plan}, true)
 		}
 		if err := renderSetupPlan(cmd, plan, false); err != nil {
 			return err
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Status: ACD is already up to date.")
-		fmt.Fprintln(cmd.OutOrStdout(), "Next: No action needed.")
+		fmt.Fprintln(cmd.OutOrStdout(), "Status: The ACD installation is ready.")
+		renderSetupNextAction(cmd.OutOrStdout(), plan)
 		return nil
 	}
 	if !jsonOut {
@@ -275,12 +275,15 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 		return fmt.Errorf("acd setup: %w", err)
 	}
 	if jsonOut {
-		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateProtected, Changed: true,
-			Actions: []productAction{{Kind: "setup", Status: "completed", Target: plan.Repo}}, Data: result}, true)
+		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateReady, Changed: result.Changed,
+			Actions: []productAction{{Kind: "setup", Status: "completed", Target: plan.ManagedBinary}}, Data: struct {
+				Result installer.Result `json:"result"`
+				Plan   installer.Plan   `json:"plan"`
+			}{Result: result, Plan: plan}}, true)
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Setup complete.")
-	fmt.Fprintf(cmd.OutOrStdout(), "Repository: %s\n", plan.Repo)
-	fmt.Fprintln(cmd.OutOrStdout(), "Status: ACD is installed and protection is on.")
+	fmt.Fprintln(cmd.OutOrStdout(), "Status: The ACD installation is ready.")
+	fmt.Fprintln(cmd.OutOrStdout(), "Repositories: Existing enablement was preserved; no repository was added.")
 	if onboardingState != nil {
 		fmt.Fprintf(cmd.OutOrStdout(), "Preferences: %s, %s commits, %s provider.\n",
 			setupExperience(onboardingState.Draft),
@@ -288,8 +291,22 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 			onboardingState.Selection.Provider)
 		fmt.Fprintln(cmd.OutOrStdout(), "Provider test: passed with synthetic content.")
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), "Next: Run `acd status` at any time to check protection.")
+	renderSetupNextAction(cmd.OutOrStdout(), plan)
 	return nil
+}
+
+func renderSetupNextAction(out io.Writer, plan installer.Plan) {
+	if len(plan.Warnings) > 0 {
+		for _, warning := range plan.Warnings {
+			fmt.Fprintf(out, "Warning: %s\n", warning)
+		}
+		return
+	}
+	if plan.FreshDefaults {
+		fmt.Fprintln(out, "Next: Run `acd on` inside each repository you want ACD to protect.")
+		return
+	}
+	fmt.Fprintln(out, "Next: No action needed. Run `acd on` inside any new repository you want to protect.")
 }
 
 type setupProgress struct {
@@ -402,13 +419,18 @@ func renderSetupPlan(cmd *cobra.Command, plan installer.Plan, jsonOut bool) erro
 			fmt.Fprintln(cmd.OutOrStdout(), "Credential: not needed for the local provider.")
 		}
 	}
+	for _, warning := range plan.Warnings {
+		fmt.Fprintf(cmd.OutOrStdout(), "Warning: %s\n", warning)
+	}
 	for index, action := range plan.Actions {
 		fmt.Fprintf(cmd.OutOrStdout(), "%d. %s\n", index+1, setupActionDescription(action))
 		if action.Target != "" {
 			fmt.Fprintf(cmd.OutOrStdout(), "   Target: %s\n", action.Target)
 		}
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), "Changed: no. Review this plan before applying it.")
+	fmt.Fprintln(cmd.OutOrStdout(), "No changes have been applied yet. Review this global setup plan before applying it.")
+	fmt.Fprintf(cmd.OutOrStdout(), "Repository impact: %d enabled repository database(s) will be migrated; %d disabled repository database(s) will be left unchanged.\n",
+		len(plan.Repositories), plan.DeferredRepositories)
 	return nil
 }
 
@@ -419,13 +441,13 @@ func setupActionDescription(action installer.Action) string {
 	case "install_binary":
 		return "Install the new ACD program safely"
 	case "migrate":
-		return "Upgrade registered repositories to the current protection format"
+		return "Upgrade enabled repositories to the current protection format"
+	case "defer_disabled_migrations":
+		return "Leave disabled repository protection data unchanged until its next `acd on`"
 	case "start_supervisor", "start_session_supervisor", "restart_session_supervisor", "install_service":
 		return "Start ACD's background service"
 	case "write_registry":
 		return "Update the list of protected repositories"
-	case "enable_repository":
-		return "Turn on protection for the current repository"
 	case "self_test":
 		return "Verify checkpoint protection, Git publication, and restore in an isolated test"
 	case "import_recovery_checkpoints":

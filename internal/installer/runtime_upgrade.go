@@ -87,17 +87,12 @@ func buildCompatibleSetupPlan(
 	ctx context.Context,
 	roots paths.Roots,
 	options Options,
-	wt git.Worktree,
 	executable string,
 	service supervisor.ServiceDefinition,
 	priorService ServiceState,
 	registry *central.Registry,
 ) (Plan, bool, error) {
 	if runtime.GOOS != "darwin" || service.Platform != "session" || registry.Version != central.RegistryVersion {
-		return Plan{}, false, nil
-	}
-	record, found := registry.FindRepo(wt.Root)
-	if !found || record.LifecycleDisabled() || record.RepositoryID == "" || record.WorktreeID == "" {
 		return Plan{}, false, nil
 	}
 	status, err := runtimeStatus(ctx, roots)
@@ -141,9 +136,8 @@ func buildCompatibleSetupPlan(
 		return Plan{}, false, err
 	}
 	plan := Plan{
-		Mode: "compatible_upgrade", OperationID: opID, ExistingInstall: true,
-		RequiresExpected: true, Repo: wt.Root, RepositoryID: record.RepositoryID,
-		WorktreeID: record.WorktreeID, ManagedBinary: roots.ManagedBinaryPath(),
+		Scope: "global", Mode: "compatible_upgrade", OperationID: opID, ExistingInstall: true,
+		RequiresExpected: true, ManagedBinary: roots.ManagedBinaryPath(),
 		SourceExecutable: executable, Service: service, PriorService: priorService,
 		Registry: registry, Integrations: integrations, IntegrationPlans: integrationPlans,
 		OwnershipDigest: ownershipDigest, BackupRoot: roots.SetupOperationDir(opID),

@@ -24,7 +24,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/globalops"
 	integrationpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/integration"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/migration"
@@ -66,29 +65,32 @@ type SetupConfiguration struct {
 }
 
 type Plan struct {
-	Mode                string                       `json:"mode"`
-	OperationID         string                       `json:"operation_id"`
-	Digest              string                       `json:"digest"`
-	ExistingInstall     bool                         `json:"existing_install"`
-	RequiresExpected    bool                         `json:"requires_expected_plan"`
-	Repo                string                       `json:"repo"`
-	RepositoryID        string                       `json:"repository_id"`
-	WorktreeID          string                       `json:"worktree_id"`
-	ManagedBinary       string                       `json:"managed_binary"`
-	SourceExecutable    string                       `json:"source_executable"`
-	Service             supervisor.ServiceDefinition `json:"service"`
-	PriorService        ServiceState                 `json:"prior_service"`
-	Registry            *central.Registry            `json:"registry"`
-	Repositories        []migration.RepositoryPlan   `json:"repositories"`
-	RecoveryManifests   []string                     `json:"recovery_manifests,omitempty"`
-	Actions             []Action                     `json:"actions"`
-	FreshDefaults       bool                         `json:"fresh_defaults"`
-	Configuration       *SetupConfiguration          `json:"configuration,omitempty"`
-	Integrations        []string                     `json:"integrations"`
-	IntegrationPlans    []integrationpkg.Plan        `json:"integration_plans"`
-	OwnershipDigest     string                       `json:"integration_ownership_digest"`
-	BackupRoot          string                       `json:"backup_root"`
-	ServiceCheckSkipped bool                         `json:"-"`
+	Scope                string                       `json:"scope"`
+	Warnings             []string                     `json:"warnings"`
+	Mode                 string                       `json:"mode"`
+	OperationID          string                       `json:"operation_id"`
+	Digest               string                       `json:"digest"`
+	ExistingInstall      bool                         `json:"existing_install"`
+	RequiresExpected     bool                         `json:"requires_expected_plan"`
+	Repo                 string                       `json:"repo"`
+	RepositoryID         string                       `json:"repository_id"`
+	WorktreeID           string                       `json:"worktree_id"`
+	ManagedBinary        string                       `json:"managed_binary"`
+	SourceExecutable     string                       `json:"source_executable"`
+	Service              supervisor.ServiceDefinition `json:"service"`
+	PriorService         ServiceState                 `json:"prior_service"`
+	Registry             *central.Registry            `json:"registry"`
+	Repositories         []migration.RepositoryPlan   `json:"repositories"`
+	DeferredRepositories int                          `json:"deferred_repositories"`
+	RecoveryManifests    []string                     `json:"recovery_manifests,omitempty"`
+	Actions              []Action                     `json:"actions"`
+	FreshDefaults        bool                         `json:"fresh_defaults"`
+	Configuration        *SetupConfiguration          `json:"configuration,omitempty"`
+	Integrations         []string                     `json:"integrations"`
+	IntegrationPlans     []integrationpkg.Plan        `json:"integration_plans"`
+	OwnershipDigest      string                       `json:"integration_ownership_digest"`
+	BackupRoot           string                       `json:"backup_root"`
+	ServiceCheckSkipped  bool                         `json:"-"`
 }
 
 type ServiceState struct {
@@ -142,15 +144,14 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		return Plan{}, fmt.Errorf("setup: unsupported OS %s", runtime.GOOS)
 	}
-	wt, err := git.ResolveWorktree(ctx, options.Repo)
-	if err != nil {
-		return Plan{}, err
-	}
-	if err := git.DurabilitySupport(ctx, wt.Root); err != nil {
-		return Plan{}, fmt.Errorf("setup: Git durability support: %w", err)
+	var warnings []string
+	if repo := strings.TrimSpace(options.Repo); repo != "" {
+		warnings = append(warnings,
+			fmt.Sprintf("--repo no longer enables a repository during setup; run `acd on --repo %s` after setup", repo))
 	}
 	executable := options.Executable
 	if executable == "" {
+		var err error
 		executable, err = os.Executable()
 		if err != nil {
 			return Plan{}, err
@@ -178,9 +179,11 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	if err != nil {
 		return Plan{}, err
 	}
-	if plan, ok, compatibleErr := buildCompatibleSetupPlan(ctx, roots, options, wt, executable, service, priorService, registry); compatibleErr != nil {
+	if plan, ok, compatibleErr := buildCompatibleSetupPlan(ctx, roots, options, executable, service, priorService, registry); compatibleErr != nil {
 		return Plan{}, compatibleErr
 	} else if ok {
+		plan.Warnings = warnings
+		plan.Digest = digestPlan(plan)
 		return plan, nil
 	}
 	existing := registry.Version < central.RegistryVersion || len(registry.Repos) > 0 || fileExists(roots.ManagedBinaryPath()) || fileExists(service.Path) || fileExists(roots.ConfigPath())
@@ -191,16 +194,6 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	if planned == nil {
 		planned = central.NewRegistry()
 	}
-	now := time.Now().Unix()
-	registration, err := planned.RegisterResolvedRepo(wt, "", now)
-	if err != nil {
-		return Plan{}, err
-	}
-	enabled := planned.EnableRepo(central.RepoRemovalTarget{Path: wt.Root, StateDB: registration.Record.StateDB}, now)
-	if enabled.NotFound {
-		return Plan{}, errors.New("setup: current repository disappeared from the planned registry")
-	}
-	registration.Record = enabled.Record
 	planned.Version = central.RegistryVersion
 
 	opID, err := newOperationID("setup")
@@ -209,7 +202,12 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	}
 	backupRoot := roots.SetupOperationDir(opID)
 	repoPlans := make([]migration.RepositoryPlan, 0, len(planned.Repos))
+	deferredRepositories := 0
 	for _, record := range planned.Repos {
+		if record.LifecycleDisabled() {
+			deferredRepositories++
+			continue
+		}
 		backup := filepath.Join(backupRoot, "repositories", record.WorktreeID, "state-v19.db")
 		repoPlan, preflightErr := migration.Preflight(ctx, record, backup)
 		if preflightErr != nil {
@@ -239,13 +237,15 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 		configuration = nil
 	}
 	plan := Plan{
+		Scope:       "global",
+		Warnings:    warnings,
 		Mode:        "full",
 		OperationID: opID, ExistingInstall: existing, RequiresExpected: existing,
-		Repo: wt.Root, RepositoryID: registration.Record.RepositoryID, WorktreeID: registration.Record.WorktreeID,
 		ManagedBinary: roots.ManagedBinaryPath(), SourceExecutable: executable, Service: service,
 		PriorService: priorService, Registry: planned,
-		Repositories: repoPlans, RecoveryManifests: recoveryManifests,
-		FreshDefaults: !existing, Integrations: integrations,
+		Repositories: repoPlans, DeferredRepositories: deferredRepositories,
+		RecoveryManifests: recoveryManifests,
+		FreshDefaults:     !existing, Integrations: integrations,
 		Configuration:    configuration,
 		IntegrationPlans: integrationPlans, OwnershipDigest: ownershipDigest, BackupRoot: backupRoot,
 		ServiceCheckSkipped: options.SkipServiceCheck,
@@ -254,11 +254,19 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 		{Kind: "backup", Target: backupRoot, Detail: "Back up every existing file and repository database"},
 		{Kind: "install_binary", Target: plan.ManagedBinary, Detail: "Atomically copy this ACD executable"},
 	}
+	if len(repoPlans) > 0 {
+		plan.Actions = append(plan.Actions,
+			Action{Kind: "migrate", Target: fmt.Sprintf("%d enabled repositories", len(repoPlans)), Detail: "Apply the all-or-nothing checkpoint cutover"})
+	}
+	if deferredRepositories > 0 {
+		plan.Actions = append(plan.Actions, Action{
+			Kind: "defer_disabled_migrations", Target: fmt.Sprintf("%d disabled repositories", deferredRepositories),
+			Detail: "Keep disabled repository state unchanged until its next acd on",
+		})
+	}
 	plan.Actions = append(plan.Actions,
-		Action{Kind: "migrate", Target: "registered repositories", Detail: "Apply the all-or-nothing v19 to v20 checkpoint cutover"},
 		Action{Kind: supervisorActionKind(plan.Service), Target: supervisorActionTarget(plan), Detail: supervisorActionDetail(plan.Service)},
 		Action{Kind: "write_registry", Target: roots.RegistryPath(), Detail: "Persist common-directory and worktree identities"},
-		Action{Kind: "enable_repository", Target: wt.Root, Detail: "Enable checkpoint protection for the current repository"},
 		Action{Kind: "self_test", Target: backupRoot, Detail: "Run isolated checkpoint, publish, and restore verification"},
 	)
 	if plan.FreshDefaults && plan.Configuration != nil {
@@ -539,7 +547,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	if plan.FreshDefaults {
 		if plan.Configuration == nil {
-			if err := persistFreshDefaults(roots, plan.WorktreeID, prepareConfig); err != nil {
+			if err := persistFreshGlobalDefaults(roots, prepareConfig); err != nil {
 				return Result{}, rollback(err)
 			}
 		} else {
@@ -1002,6 +1010,30 @@ func persistFreshDefaults(roots paths.Roots, repositoryID string, prepareCallbac
 			fields[key] = body
 		}
 		document.Settings.Repositories[repositoryID] = config.RepositorySettings{Fields: fields, Extra: map[string]json.RawMessage{}}
+		return nil
+	}
+	var prepare func([]byte) error
+	if len(prepareCallbacks) > 0 {
+		prepare = prepareCallbacks[0]
+	}
+	return updateConfigPrepared(store, document, mutate, prepare)
+}
+
+func persistFreshGlobalDefaults(roots paths.Roots, prepareCallbacks ...func([]byte) error) error {
+	store := config.NewStore(roots)
+	document, err := store.Load()
+	if err != nil {
+		return err
+	}
+	mutate := func(document *config.Document) error {
+		values := map[string]any{
+			config.FieldProvider: "deterministic", config.FieldCommitStrategy: "intent", config.FieldCommitPreset: "fast",
+			config.FieldIntentVerification: "structural", config.FieldIntentRepairEnabled: false, config.FieldDiffEgress: false,
+		}
+		for key, value := range values {
+			body, _ := json.Marshal(value)
+			document.Settings.Global[key] = body
+		}
 		return nil
 	}
 	var prepare func([]byte) error

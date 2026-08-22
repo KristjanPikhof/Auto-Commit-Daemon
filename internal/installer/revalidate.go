@@ -21,6 +21,8 @@ func revalidateSetupPlan(ctx context.Context, roots paths.Roots, reviewed Plan, 
 	if err != nil {
 		return err
 	}
+	current.Warnings = append([]string(nil), reviewed.Warnings...)
+	current.Digest = digestPlan(current)
 	if ignoreServiceState {
 		copyRuntimeServiceState(&current.PriorService, reviewed.PriorService)
 		current.Digest = digestPlan(current)

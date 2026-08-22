@@ -86,31 +86,7 @@ func TestBuildPlanUsesBoundedCompatibleUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	repo := filepath.Join(root, "repo")
-	if err := os.MkdirAll(repo, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	command := gitCommand(t, repo, "init")
-	if command != "" {
-		t.Fatal(command)
-	}
-	if command := gitCommand(t, repo, "symbolic-ref", "HEAD", "refs/heads/main"); command != "" {
-		t.Fatal(command)
-	}
-	wt, err := git.ResolveWorktree(context.Background(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
 	roots := paths.Roots{State: filepath.Join(root, "state", "acd"), Share: filepath.Join(root, "share", "acd"), Config: filepath.Join(root, "config", "acd")}
-	registry := central.NewRegistry()
-	registration, err := registry.RegisterResolvedRepo(wt, "", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	registry.EnableRepo(central.RepoRemovalTarget{Path: registration.Record.Path, StateDB: registration.Record.StateDB}, 1)
-	if err := central.Save(roots, registry); err != nil {
-		t.Fatal(err)
-	}
 	executable := filepath.Join(root, "acd")
 	if err := os.WriteFile(executable, []byte("compatible"), 0o755); err != nil {
 		t.Fatal(err)
@@ -122,12 +98,15 @@ func TestBuildPlanUsesBoundedCompatibleUpgrade(t *testing.T) {
 	serveRuntimeStatus(t, roots, supervisor.Status{PID: os.Getpid(), Version: version.String(), BinaryDigest: digest,
 		Ownership: userOwnershipForTest(), Compatibility: RuntimeCompatibility()})
 
-	plan, err := BuildPlan(context.Background(), roots, Options{Repo: repo, Executable: executable, Integrations: "none", SkipServiceCheck: true})
+	plan, err := BuildPlan(context.Background(), roots, Options{Executable: executable, Integrations: "none", SkipServiceCheck: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if plan.Mode != "compatible_upgrade" || len(plan.Repositories) != 0 {
 		t.Fatalf("plan mode=%q repositories=%d, want bounded compatible upgrade", plan.Mode, len(plan.Repositories))
+	}
+	if plan.Scope != "global" || plan.RepositoryID != "" || plan.WorktreeID != "" || plan.Repo != "" {
+		t.Fatalf("compatible plan is not global: %+v", plan)
 	}
 	if plan.RequiresExpected || len(plan.Actions) != 1 || plan.Actions[0].Kind != "verify_compatible_runtime" {
 		t.Fatalf("current compatible plan should be a no-op: %+v", plan.Actions)
