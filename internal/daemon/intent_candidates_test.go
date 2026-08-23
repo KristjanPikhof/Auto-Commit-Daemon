@@ -1396,6 +1396,88 @@ func TestIntentCandidatePlanPreflightSuppliesValidBaseline(t *testing.T) {
 	}
 }
 
+func TestIntentCandidatePlanRepairsForcedDeferralFromBaseline(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "new.go", Op: "create",
+		}},
+		ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "new-change", SelectedSeqs: []int64{1},
+			Purpose: "complete new change", Readiness: ai.IntentCandidateWait,
+			MissingCompanions: []string{"model-only companion.go"},
+			GroupingReason:    "wait for an unsupported companion",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+		ForcedAging: true,
+	}
+	plan, fallback, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 2, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 1 || fallback != "repaired_forced_aging" ||
+		run.ResolutionMode.String != "local_repair" ||
+		len(plan.Candidates) != 1 ||
+		plan.Candidates[0].Readiness != ai.IntentCandidateReady ||
+		len(plan.Candidates[0].MissingCompanions) != 0 {
+		t.Fatalf("calls=%d fallback=%q run=%+v plan=%+v",
+			planner.calls, fallback, run, plan)
+	}
+}
+
+func TestIntentCandidateLocalRepairKeepsWaitingHardDependency(t *testing.T) {
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 2, Path: "model.go", Op: "modify",
+		}},
+		Candidates: []ai.IntentCandidateSummary{{
+			CandidateID: "migration", Status: "waiting",
+			SelectedSeqs: []int64{1}, Ready: false,
+		}},
+		Dependencies: []ai.IntentCaptureDependency{{
+			FromSeq: 1, ToSeq: 2, Strength: ai.IntentDependencyHard,
+			Kind: "migration_before_model",
+		}},
+		ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []ai.IntentCandidateAssignment{{
+		CandidateID: "model", SelectedSeqs: []int64{2},
+		Purpose: "update model", Readiness: ai.IntentCandidateReady,
+		Subject: "Update model", GroupingReason: "complete available capture",
+		DependsOnCandidates: []string{"migration"},
+	}}
+	model := baseline[0]
+	model.Readiness = ai.IntentCandidateWait
+	model.Subject = ""
+	model.MissingCompanions = []string{"migration must become ready"}
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates:      []ai.IntentCandidateAssignment{model},
+	}
+	findings := []ai.IntentAtomicityFinding{{
+		CandidateID: "model", Code: "forced_capture_deferred",
+	}}
+	if repaired, mode, ok := repairIntentCandidatePlanLocally(
+		req, baseline, plan, findings); ok {
+		t.Fatalf("unsafe repair mode=%q plan=%+v", mode, repaired)
+	}
+}
+
 func TestIntentCandidatePlanRebuildsInvalidCompletedResolution(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)

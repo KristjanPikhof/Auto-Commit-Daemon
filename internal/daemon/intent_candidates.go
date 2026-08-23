@@ -1114,9 +1114,11 @@ func chooseIntentCandidatePlan(
 			}
 			var validation *ai.IntentPlanV2ValidationError
 			if errors.As(err, &validation) && len(validation.Findings) > 0 {
-				if repaired, ok := repairIntentCandidateDependencies(
-					intentCandidateContinuationValidationRequest(req, continuations),
-					plan,
+				localRepairReq := intentCandidateContinuationValidationRequest(
+					req, continuations)
+				if repaired, repairMode, ok := repairIntentCandidatePlanLocally(
+					localRepairReq, plannerRequest.BaselineCandidates,
+					plan, validation.Findings,
 				); ok {
 					if err := storeResolvedIntentPlanRun(
 						&run, repaired, continuations); err != nil {
@@ -1137,7 +1139,7 @@ func chooseIntentCandidatePlan(
 							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
 						}
 					}
-					return repaired, "repaired_dependency_declarations",
+					return repaired, repairMode,
 						ai.SanitizePlannerError(err.Error()), retryCount, false,
 						continuations, run, nil
 				}
@@ -1706,6 +1708,104 @@ func intentPlanDependsOnPersistedCandidate(
 		}
 	}
 	return false
+}
+
+func repairIntentCandidatePlanLocally(
+	req ai.IntentPlanRequestV2,
+	baseline []ai.IntentCandidateAssignment,
+	plan ai.IntentPlanV2,
+	findings []ai.IntentAtomicityFinding,
+) (ai.IntentPlanV2, string, bool) {
+	current := cloneIntentPlanV2(plan)
+	seen := make(map[string]struct{})
+	for pass := 0; pass < 3; pass++ {
+		signature := localIntentPlanRepairSignature(current)
+		if _, repeated := seen[signature]; repeated {
+			break
+		}
+		seen[signature] = struct{}{}
+
+		forced, forcedChanged := repairForcedIntentCandidatesFromBaseline(
+			current, baseline, findings)
+		if forcedChanged {
+			current = forced
+			if ai.ValidateIntentPlanV2(req, current) == nil {
+				return current, "repaired_forced_aging", true
+			}
+		}
+		if repaired, ok := repairIntentCandidateDependencies(req, current); ok {
+			mode := "repaired_dependency_declarations"
+			if forcedChanged {
+				mode = "repaired_forced_aging"
+			}
+			return repaired, mode, true
+		}
+		if !forcedChanged {
+			break
+		}
+	}
+	return plan, "", false
+}
+
+func repairForcedIntentCandidatesFromBaseline(
+	plan ai.IntentPlanV2,
+	baseline []ai.IntentCandidateAssignment,
+	findings []ai.IntentAtomicityFinding,
+) (ai.IntentPlanV2, bool) {
+	forcedIDs := make(map[string]struct{})
+	for _, finding := range findings {
+		if finding.Code == "forced_capture_deferred" && finding.CandidateID != "" {
+			forcedIDs[finding.CandidateID] = struct{}{}
+		}
+	}
+	if len(forcedIDs) == 0 || len(baseline) == 0 {
+		return plan, false
+	}
+	baselineByMembership := make(map[string]ai.IntentCandidateAssignment,
+		len(baseline))
+	for _, candidate := range baseline {
+		if candidate.Readiness != ai.IntentCandidateReady ||
+			len(candidate.MissingCompanions) > 0 {
+			continue
+		}
+		baselineByMembership[intentSeqMembershipKey(candidate.SelectedSeqs)] = candidate
+	}
+	repaired := cloneIntentPlanV2(plan)
+	changed := false
+	for i := range repaired.Candidates {
+		candidate := &repaired.Candidates[i]
+		if _, repair := forcedIDs[candidate.CandidateID]; !repair {
+			continue
+		}
+		baselineCandidate, ok := baselineByMembership[intentSeqMembershipKey(candidate.SelectedSeqs)]
+		if !ok {
+			continue
+		}
+		candidate.Readiness = ai.IntentCandidateReady
+		candidate.MissingCompanions = nil
+		candidate.DependsOnCandidates = append([]string(nil),
+			baselineCandidate.DependsOnCandidates...)
+		if strings.TrimSpace(candidate.Subject) == "" {
+			candidate.Subject = baselineCandidate.Subject
+		}
+		changed = true
+	}
+	return repaired, changed
+}
+
+func intentSeqMembershipKey(seqs []int64) string {
+	ordered := append([]int64(nil), seqs...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	return fmt.Sprint(ordered)
+}
+
+func localIntentPlanRepairSignature(plan ai.IntentPlanV2) string {
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		return intentPlanPartitionSignature(plan)
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x", sum)
 }
 
 // repairIntentCandidateDependencies adds only dependency declarations already
