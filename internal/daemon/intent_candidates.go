@@ -919,7 +919,11 @@ func chooseIntentCandidatePlan(
 	plannerFailure := ""
 	retryCount := 0
 	semanticPlanningFailed := false
-	run := newIntentPlanRun(req, input, retryLimit+1)
+	run, err := newIntentPlanRun(req, input, retryLimit+1)
+	if err != nil {
+		return ai.IntentPlanV2{}, "", "", retryCount, false, nil,
+			state.IntentPlanRun{}, err
+	}
 	plannerRequest := req
 	if planner != nil {
 		probe := holdIntentCandidatePlan(req)
@@ -962,8 +966,20 @@ func chooseIntentCandidatePlan(
 					plan, continuations, loadErr := loadResolvedIntentPlanRun(
 						req, run.ResolvedPlanJSON.String)
 					if loadErr != nil {
-						return ai.IntentPlanV2{}, "", "", retryCount, false,
-							nil, run, loadErr
+						run.Completed = false
+						run.ResolvedPlanJSON = sql.NullString{}
+						run.ProgressState = sql.NullString{
+							String: "local_cache_rebuild", Valid: true,
+						}
+						run.ResolutionMode = sql.NullString{}
+						run.FindingCodes = []string{"cached_plan_invalid"}
+						if updateErr := state.UpdateIntentPlanRun(
+							ctx, db, run); updateErr != nil {
+							return ai.IntentPlanV2{}, "", "", retryCount,
+								false, nil, run, updateErr
+						}
+						plannerFailure = ai.SanitizePlannerError(loadErr.Error())
+						break
 					}
 					run.ResolutionMode = sql.NullString{
 						String: "completed_plan_reuse", Valid: true,
@@ -1380,33 +1396,70 @@ func newIntentPlanRun(
 	req ai.IntentPlanRequestV2,
 	input IntentCandidateEvaluation,
 	attemptLimit int,
-) state.IntentPlanRun {
+) (state.IntentPlanRun, error) {
 	if attemptLimit < 1 {
 		attemptLimit = 1
 	} else if attemptLimit > 3 {
 		attemptLimit = 3
 	}
-	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "v1\x00%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d\x00%t\x00%s",
-		input.BranchRef, input.BranchGeneration, input.Provider, input.Model,
-		input.Preset, input.CommitFormat, input.PresetVersion,
-		input.ConfigRevisionID.Int64, input.ConfigRevisionID.Valid,
-		input.VerificationMode)
-	for _, capture := range req.OfferedCaptures {
-		_, _ = fmt.Fprintf(h, "\x00capture:%d:%s:%s:%s:%x",
-			capture.Seq, capture.Path, capture.Op,
-			capture.Fidelity, sha256.Sum256([]byte(capture.CapturedDiff)))
+	fingerprintRequest := req
+	fingerprintRequest.OfferedCaptures = append(
+		[]ai.OfferedCapture(nil), req.OfferedCaptures...)
+	for i := range fingerprintRequest.OfferedCaptures {
+		digest := sha256.Sum256([]byte(
+			fingerprintRequest.OfferedCaptures[i].CapturedDiff))
+		fingerprintRequest.OfferedCaptures[i].CapturedDiff =
+			fmt.Sprintf("sha256:%x", digest)
 	}
-	for _, candidate := range req.Candidates {
-		_, _ = fmt.Fprintf(h, "\x00candidate:%s:%v:%s", candidate.CandidateID,
-			candidate.SelectedSeqs, candidate.Status)
+	fingerprintRequest.CapturedDiffTransform = prompttrace.TransformMetadata{}
+	fingerprintRequest.RetryCorrection = ""
+	targetEventSeqs := append([]int64(nil), input.TargetEventSeqs...)
+	sort.Slice(targetEventSeqs, func(i, j int) bool {
+		return targetEventSeqs[i] < targetEventSeqs[j]
+	})
+	fingerprintInput := struct {
+		Domain               string                 `json:"domain"`
+		Request              ai.IntentPlanRequestV2 `json:"request"`
+		BranchRef            string                 `json:"branch_ref"`
+		BranchGeneration     int64                  `json:"branch_generation"`
+		Provider             string                 `json:"provider"`
+		Model                string                 `json:"model"`
+		Preset               config.PresetName      `json:"preset"`
+		CommitFormat         ai.CommitFormat        `json:"commit_format"`
+		PresetVersion        int                    `json:"preset_version"`
+		ConfigRevisionID     int64                  `json:"config_revision_id"`
+		ConfigRevisionValid  bool                   `json:"config_revision_valid"`
+		VerificationMode     string                 `json:"verification_mode"`
+		IncludeCapturedDiffs bool                   `json:"include_captured_diffs"`
+		ConfigProfile        string                 `json:"config_profile"`
+		PresetID             string                 `json:"preset_id"`
+		TargetEventSeqs      []int64                `json:"target_event_seqs"`
+		RejectLocalFallback  bool                   `json:"reject_local_fallback"`
+		AttemptLimit         int                    `json:"attempt_limit"`
+	}{
+		Domain:    "acd.intent-plan-run/v2",
+		Request:   fingerprintRequest,
+		BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
+		Provider: input.Provider, Model: input.Model, Preset: input.Preset,
+		CommitFormat: input.CommitFormat, PresetVersion: input.PresetVersion,
+		ConfigRevisionID:     input.ConfigRevisionID.Int64,
+		ConfigRevisionValid:  input.ConfigRevisionID.Valid,
+		VerificationMode:     input.VerificationMode,
+		IncludeCapturedDiffs: input.IncludeDiffs,
+		ConfigProfile:        input.ConfigProfile,
+		PresetID:             input.PresetID,
+		TargetEventSeqs:      targetEventSeqs,
+		RejectLocalFallback:  input.RejectLocalFallback,
+		AttemptLimit:         attemptLimit,
 	}
-	for _, edge := range req.Dependencies {
-		_, _ = fmt.Fprintf(h, "\x00edge:%d:%d:%s:%s:%s", edge.FromSeq,
-			edge.ToSeq, edge.Strength, edge.Kind, edge.EvidenceHash)
+	encoded, err := json.Marshal(fingerprintInput)
+	if err != nil {
+		return state.IntentPlanRun{},
+			fmt.Errorf("daemon: encode intent plan fingerprint: %w", err)
 	}
+	digest := sha256.Sum256(encoded)
 	return state.IntentPlanRun{
-		Fingerprint:      fmt.Sprintf("sha256:%x", h.Sum(nil)),
+		Fingerprint:      fmt.Sprintf("sha256:%x", digest),
 		BranchRef:        input.BranchRef,
 		BranchGeneration: input.BranchGeneration,
 		Provider: sql.NullString{String: input.Provider,
@@ -1416,7 +1469,7 @@ func newIntentPlanRun(
 		ConfigRevisionID: input.ConfigRevisionID,
 		AttemptLimit:     attemptLimit,
 		UnresolvedSeqs:   offeredIntentSeqs(req),
-	}
+	}, nil
 }
 
 func offeredIntentSeqs(req ai.IntentPlanRequestV2) []int64 {

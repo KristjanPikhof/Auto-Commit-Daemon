@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1215,6 +1216,231 @@ func TestIntentCandidatePlanReusesCompletedResolution(t *testing.T) {
 	if !reflect.DeepEqual(first, second) || !firstRun.ResolvedPlanJSON.Valid {
 		t.Fatalf("reused plan differs: first=%+v second=%+v run=%+v",
 			first, second, firstRun)
+	}
+}
+
+func TestIntentCandidatePlanFingerprintIncludesPlanningReality(t *testing.T) {
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		LatestCommit: &ai.CommitSummary{
+			OID: "head", Subject: "Previous change", Paths: []string{"a.go"},
+		},
+		PathCommitContext: []ai.PathCommitContext{{
+			Path: "a.go", Commits: []ai.CommitSummary{{
+				OID: "older", Subject: "Older change",
+			}},
+		}},
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "a.go", Op: "modify", Fidelity: "full",
+			CapturedDiff: "private diff", DeferCount: 1,
+		}, {
+			Seq: 2, Path: "b.go", Op: "modify", Fidelity: "full",
+		}},
+		Candidates: []ai.IntentCandidateSummary{{
+			CandidateID: "candidate", Status: state.IntentCandidateWaiting,
+			Purpose: "finish behavior", SelectedSeqs: []int64{1},
+			Paths: []string{"a.go"}, MissingCompanions: []string{"a_test.go"},
+		}},
+		Dependencies: []ai.IntentCaptureDependency{{
+			FromSeq: 1, ToSeq: 2, Strength: ai.IntentDependencySoft,
+			Kind: "reference", EvidenceHash: "sha256:evidence",
+		}},
+		ActivityBoundaries: []ai.IntentActivityBoundary{{
+			Epoch: "7", Kind: "soft",
+		}},
+		RecentSoftCommits: []ai.IntentSoftCommitSummary{{
+			CandidateID: "recent", OID: "commit", Subject: "Recent change",
+			Paths: []string{"a.go"},
+		}},
+		PriorAtomicityFindings: []ai.IntentAtomicityFinding{{
+			CandidateID: "candidate", Gate: ai.IntentAtomicityCompleteness,
+			Code: "candidate_waiting", Summary: "waiting for test",
+		}},
+		CommitFormat: ai.CommitFormatImperative,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 4,
+		Provider: "provider", Model: "model", Preset: config.PresetBalanced,
+		CommitFormat: ai.CommitFormatImperative, PresetVersion: 3,
+		ConfigRevisionID: sql.NullInt64{Int64: 9, Valid: true},
+		VerificationMode: "structural", IncludeDiffs: true,
+	}
+	fingerprint := func(request ai.IntentPlanRequestV2, evaluation IntentCandidateEvaluation) string {
+		t.Helper()
+		run, runErr := newIntentPlanRun(request, evaluation, 3)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		return run.Fingerprint
+	}
+	base := fingerprint(req, input)
+	if !strings.HasPrefix(base, "sha256:") || len(base) != len("sha256:")+64 {
+		t.Fatalf("fingerprint=%q want versioned sha256 token", base)
+	}
+	if got := fingerprint(req, input); got != base {
+		t.Fatalf("stable fingerprint=%q want %q", got, base)
+	}
+
+	forced := req
+	forced.ForcedAging = true
+	if got := fingerprint(forced, input); got == base {
+		t.Fatal("forced aging reused non-forced fingerprint")
+	}
+	changedCandidate := req
+	changedCandidate.Candidates = append(
+		[]ai.IntentCandidateSummary(nil), req.Candidates...)
+	changedCandidate.Candidates[0].MissingCompanions = []string{"different.go"}
+	if got := fingerprint(changedCandidate, input); got == base {
+		t.Fatal("candidate reality did not change fingerprint")
+	}
+	changedInput := input
+	changedInput.VerificationMode = "command"
+	if got := fingerprint(req, changedInput); got == base {
+		t.Fatal("verification mode did not change fingerprint")
+	}
+	changedDiff := req
+	changedDiff.OfferedCaptures = append(
+		[]ai.OfferedCapture(nil), req.OfferedCaptures...)
+	changedDiff.OfferedCaptures[0].CapturedDiff = "other private diff"
+	if got := fingerprint(changedDiff, input); got == base {
+		t.Fatal("captured diff digest did not change fingerprint")
+	}
+	if strings.Contains(base, "private diff") {
+		t.Fatalf("fingerprint leaked captured diff: %q", base)
+	}
+}
+
+func TestIntentCandidatePlanRebuildsInvalidCompletedResolution(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "service.go", Op: "modify",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{1},
+			Purpose: "fix service behavior", Readiness: ai.IntentCandidateReady,
+			Subject:        "Fix service behavior",
+			GroupingReason: "the capture contains the complete service fix",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+		CommitFormat: ai.CommitFormatImperative,
+	}
+	_, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := resolvedIntentPlanRun{Plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{99},
+			Purpose: "invalid cached membership", Readiness: ai.IntentCandidateReady,
+			Subject:        "Invalid cached membership",
+			GroupingReason: "the cached plan references an unavailable capture",
+		}},
+	}}
+	raw, err := json.Marshal(invalid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_plan_runs SET resolved_plan_json=?, completed=1
+WHERE fingerprint=?`, string(raw), run.Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+
+	result, fallback, failure, _, _, _, rebuilt, err :=
+		chooseIntentCandidatePlan(
+			ctx, req, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want cached rebuild without another call", planner.calls)
+	}
+	if fallback == "" || failure == "" || !rebuilt.Completed ||
+		len(result.Candidates) != 1 ||
+		result.Candidates[0].Readiness != ai.IntentCandidateReady {
+		t.Fatalf("rebuilt fallback=%q failure=%q run=%+v plan=%+v",
+			fallback, failure, rebuilt, result)
+	}
+}
+
+func TestIntentCandidatePlanDoesNotReuseWaitAfterForcedAging(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := ai.OfferedCapture{Seq: 1, Path: "service.go", Op: "modify"}
+	normalReq, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{capture},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{1},
+			Purpose: "wait for the matching test", Readiness: ai.IntentCandidateWait,
+			MissingCompanions: []string{"service_test.go"},
+			GroupingReason:    "the test is not captured yet",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+		CommitFormat: ai.CommitFormatImperative,
+	}
+	_, _, _, _, _, _, normalRun, err := chooseIntentCandidatePlan(
+		ctx, normalReq, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	forcedReq, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{capture}, ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner.plan = ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{1},
+			Purpose:   "finish the available service change",
+			Readiness: ai.IntentCandidateReady, Subject: "Finish service change",
+			GroupingReason: "forced aging releases the complete available capture",
+		}},
+	}
+	input.ForcedAging = true
+	result, _, _, _, _, _, forcedRun, err := chooseIntentCandidatePlan(
+		ctx, forcedReq, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 2 {
+		t.Fatalf("planner calls=%d want a fresh forced-aging call", planner.calls)
+	}
+	if normalRun.Fingerprint == forcedRun.Fingerprint ||
+		forcedRun.ResolutionMode.String == "completed_plan_reuse" {
+		t.Fatalf("normal=%q forced=%q mode=%q",
+			normalRun.Fingerprint, forcedRun.Fingerprint,
+			forcedRun.ResolutionMode.String)
+	}
+	if len(result.Candidates) != 1 ||
+		result.Candidates[0].Readiness != ai.IntentCandidateReady {
+		t.Fatalf("forced plan=%+v", result)
 	}
 }
 
