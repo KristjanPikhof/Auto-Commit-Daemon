@@ -141,6 +141,19 @@ func (e *IntentSemanticFallbackRequiredError) Error() string {
 	return "daemon: intent candidates: semantic fallback required: " + e.Failure
 }
 
+// IntentPlanPreflightError means the durable planning snapshot could not
+// produce a locally valid baseline. No provider attempt has been consumed.
+type IntentPlanPreflightError struct {
+	Failure string
+}
+
+func (e *IntentPlanPreflightError) Error() string {
+	if e == nil || e.Failure == "" {
+		return "daemon: intent candidates: preflight blocked"
+	}
+	return "daemon: intent candidates: preflight blocked: " + e.Failure
+}
+
 const (
 	intentBalancedFallbackCaptureCap = 32
 	intentBalancedFallbackPathCap    = 12
@@ -905,6 +918,34 @@ func intentRequestTouchesRepairableSuffix(req ai.IntentPlanRequestV2) bool {
 	return false
 }
 
+func preflightIntentCandidatePlan(
+	req ai.IntentPlanRequestV2,
+	preset config.PresetName,
+) (ai.IntentPlanRequestV2, []intentCandidateContinuation, error) {
+	if preset != config.PresetFast && preset != config.PresetBalanced &&
+		preset != config.PresetQuality {
+		return req, nil, fmt.Errorf(
+			"daemon: intent candidates: unsupported preset %q", preset)
+	}
+	baseline := deterministicIntentCandidatePlan(req, false, false)
+	continuations, _, err := continuePersistedIntentCandidates(
+		req, &baseline, intentCandidateContinuationOptions{})
+	if err != nil {
+		return req, continuations, err
+	}
+	plannerRequest := intentCandidateContinuationValidationRequest(
+		req, continuations)
+	baseline = declareIntentFallbackDependencies(plannerRequest, baseline)
+	if err := ai.ValidateIntentPlanV2(plannerRequest, baseline); err != nil {
+		return plannerRequest, continuations, err
+	}
+	plannerRequest.BaselineCandidates = baseline.Candidates
+	if err := ai.ValidateIntentPlanRequestV2(plannerRequest); err != nil {
+		return plannerRequest, continuations, err
+	}
+	return plannerRequest, continuations, nil
+}
+
 func chooseIntentCandidatePlan(
 	ctx context.Context,
 	req ai.IntentPlanRequestV2,
@@ -918,22 +959,36 @@ func chooseIntentCandidatePlan(
 ) (ai.IntentPlanV2, string, string, int, bool, []intentCandidateContinuation, state.IntentPlanRun, error) {
 	plannerFailure := ""
 	retryCount := 0
-	semanticPlanningFailed := false
-	run, err := newIntentPlanRun(req, input, retryLimit+1)
+	repairSuffixCorrection := false
+	plannerRequest, baselineContinuations, preflightErr :=
+		preflightIntentCandidatePlan(req, preset)
+	fingerprintRequest := req
+	fingerprintRequest.BaselineCandidates = plannerRequest.BaselineCandidates
+	run, err := newIntentPlanRun(fingerprintRequest, input, retryLimit+1)
 	if err != nil {
 		return ai.IntentPlanV2{}, "", "", retryCount, false, nil,
 			state.IntentPlanRun{}, err
 	}
-	plannerRequest := req
-	if planner != nil {
-		probe := holdIntentCandidatePlan(req)
-		continuations, _, err := continuePersistedIntentCandidates(
-			req, &probe, intentCandidateContinuationOptions{})
+	if preflightErr != nil {
+		run, err = state.EnsureIntentPlanRun(ctx, db, run)
 		if err != nil {
 			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 		}
-		plannerRequest = intentCandidateContinuationValidationRequest(
-			req, continuations)
+		run.ProgressState = sql.NullString{String: "preflight_blocked", Valid: true}
+		run.ResolutionMode = sql.NullString{String: "local_preflight", Valid: true}
+		run.UnresolvedSeqs = offeredIntentSeqs(req)
+		run.FindingCodes = []string{"preflight_invalid"}
+		var validation *ai.IntentPlanV2ValidationError
+		if errors.As(preflightErr, &validation) {
+			run.FindingCodes = intentFindingCodes(validation.Findings)
+		}
+		if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+		}
+		return ai.IntentPlanV2{}, "", "", retryCount, false,
+			baselineContinuations, run, &IntentPlanPreflightError{
+				Failure: ai.SanitizePlannerError(preflightErr.Error()),
+			}
 	}
 	var permit IntentPlannerHealthPermit
 	permitHeld := false
@@ -1030,6 +1085,8 @@ func chooseIntentCandidatePlan(
 				mode := "provider"
 				if len(lockedCandidates) > 0 {
 					mode = "partial_replan"
+				} else if repairSuffixCorrection {
+					mode = "repair_replan"
 				}
 				run.ResolutionMode = sql.NullString{String: mode, Valid: true}
 				run.ProgressState = sql.NullString{String: "completed", Valid: true}
@@ -1057,7 +1114,6 @@ func chooseIntentCandidatePlan(
 			}
 			var validation *ai.IntentPlanV2ValidationError
 			if errors.As(err, &validation) && len(validation.Findings) > 0 {
-				semanticPlanningFailed = true
 				if repaired, ok := repairIntentCandidateDependencies(
 					intentCandidateContinuationValidationRequest(req, continuations),
 					plan,
@@ -1094,7 +1150,29 @@ func chooseIntentCandidatePlan(
 					req, plan, validation.Findings); ok &&
 					len(preserved) > len(lockedCandidates) {
 					lockedCandidates = preserved
-					plannerRequest = partial
+					var partialPreflightErr error
+					plannerRequest, _, partialPreflightErr =
+						preflightIntentCandidatePlan(partial, preset)
+					if partialPreflightErr != nil {
+						run.ProgressState = sql.NullString{
+							String: "preflight_blocked", Valid: true,
+						}
+						run.ResolutionMode = sql.NullString{
+							String: "local_preflight", Valid: true,
+						}
+						run.FindingCodes = []string{"preflight_invalid"}
+						run.UnresolvedSeqs = offeredIntentSeqs(partial)
+						if updateErr := state.UpdateIntentPlanRun(
+							ctx, db, run); updateErr != nil {
+							return ai.IntentPlanV2{}, "", "", retryCount,
+								false, nil, run, updateErr
+						}
+						return ai.IntentPlanV2{}, "", "", retryCount,
+							false, nil, run, &IntentPlanPreflightError{
+								Failure: ai.SanitizePlannerError(
+									partialPreflightErr.Error()),
+							}
+					}
 					run.PreservedGroups = intentAssignmentMembership(preserved)
 					run.UnresolvedSeqs = offeredIntentSeqs(partial)
 				}
@@ -1111,6 +1189,14 @@ func chooseIntentCandidatePlan(
 					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, updateErr
 				}
 				plannerRequest.RetryCorrection = ai.BuildIntentAtomicityCorrection(validation.Findings)
+				if intentRequestTouchesRepairableSuffix(req) {
+					repairSuffixCorrection = true
+					plannerRequest.RetryCorrection = strings.TrimSpace(
+						plannerRequest.RetryCorrection + "\n" +
+							"Replan the repairable private ACD suffix with the new captures. " +
+							"You may merge or repartition only the recent soft commits listed " +
+							"in this request. Preserve every other candidate boundary.")
+				}
 				if len(lockedCandidates) > 0 {
 					plannerRequest.RetryCorrection += "\nPreserve these validated locked groups: " +
 						intentPlanPartitionSignature(ai.IntentPlanV2{Candidates: lockedCandidates})
@@ -1119,7 +1205,6 @@ func chooseIntentCandidatePlan(
 				plannerFailure = ai.SanitizePlannerError(err.Error())
 				continue
 			}
-			semanticPlanningFailed = false
 			plannerFailure = ai.SanitizePlannerError(err.Error())
 			if health != nil && permitHeld {
 				failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
@@ -1130,73 +1215,6 @@ func chooseIntentCandidatePlan(
 			}
 			break
 		}
-	}
-	if planner != nil && semanticPlanningFailed &&
-		intentRequestTouchesRepairableSuffix(req) {
-		repairRequest := req
-		repairRequest.RetryCorrection = strings.TrimSpace(
-			plannerRequest.RetryCorrection + "\n" +
-				"Replan the repairable private ACD suffix with the new captures. " +
-				"You may merge or repartition only the recent soft commits listed " +
-				"in this request. Preserve every other candidate boundary.")
-		repairPlan, repairErr := ai.PlanIntentV2WithCompatibility(
-			prompttrace.WithRetryCount(ctx, retryCount+1), planner, repairRequest)
-		var repairContinuations []intentCandidateContinuation
-		if repairErr == nil {
-			repairContinuations, _, repairErr = continuePersistedIntentCandidates(
-				req, &repairPlan, intentCandidateContinuationOptions{})
-			if repairErr == nil {
-				validationReq := intentCandidateContinuationValidationRequest(
-					req, repairContinuations)
-				repairErr = ai.ValidateIntentPlanV2(validationReq, repairPlan)
-				if repairErr == nil {
-					repairErr = validatePlannerSemanticRationale(
-						validationReq, repairPlan)
-				}
-			}
-		}
-		if repairErr == nil {
-			if err := storeResolvedIntentPlanRun(
-				&run, repairPlan, repairContinuations); err != nil {
-				return ai.IntentPlanV2{}, "", "", retryCount, false,
-					nil, run, err
-			}
-			run.Completed = true
-			run.ResolutionMode = sql.NullString{
-				String: "repair_replan", Valid: true,
-			}
-			run.ProgressState = sql.NullString{
-				String: "completed", Valid: true,
-			}
-			run.UnresolvedSeqs = nil
-			run.PreservedGroups = nil
-			if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
-				return ai.IntentPlanV2{}, "", "", retryCount, false,
-					nil, run, err
-			}
-			if health != nil && permitHeld {
-				if err := health.Complete(ctx, permit, nil); err != nil {
-					return ai.IntentPlanV2{}, "", "", retryCount, false,
-						nil, run, err
-				}
-			}
-			return repairPlan, "", "", retryCount, false,
-				repairContinuations, run, nil
-		}
-		var validationErr *ai.IntentPlanV2ValidationError
-		if health != nil && permitHeld && !errors.As(repairErr, &validationErr) {
-			failure := classifyIntentPlannerHealthFailure(repairErr, true)
-			if err := health.Complete(ctx, permit, failure); err != nil {
-				return ai.IntentPlanV2{}, "", "", retryCount, false,
-					nil, run, err
-			}
-			permitHeld = false
-		}
-		repairFailure := "repair replan: " + repairErr.Error()
-		if plannerFailure != "" {
-			repairFailure = plannerFailure + "; " + repairFailure
-		}
-		plannerFailure = ai.SanitizePlannerError(repairFailure)
 	}
 	if health != nil && permitHeld {
 		// A provider response that failed semantic validation is not a transport
@@ -1225,6 +1243,12 @@ func chooseIntentCandidatePlan(
 	}
 	plan = declareIntentFallbackDependencies(
 		intentCandidateContinuationValidationRequest(fallbackReq, continuations), plan)
+	validationReq := intentCandidateContinuationValidationRequest(
+		fallbackReq, continuations)
+	if validationErr := ai.ValidateIntentPlanV2(validationReq, plan); validationErr != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false,
+			nil, run, validationErr
+	}
 	var messageErr error
 	var messageReady bool
 	plan, plannerFailure, messageReady, messageErr = applyIntentFallbackMessageQuality(
@@ -1234,8 +1258,7 @@ func chooseIntentCandidatePlan(
 	if messageErr != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, messageErr
 	}
-	validationErr := ai.ValidateIntentPlanV2(
-		intentCandidateContinuationValidationRequest(fallbackReq, continuations), plan)
+	validationErr := ai.ValidateIntentPlanV2(validationReq, plan)
 	if validationErr != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, validationErr
 	}

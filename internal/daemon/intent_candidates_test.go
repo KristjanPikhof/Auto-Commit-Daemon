@@ -722,6 +722,9 @@ func TestIntentCandidateEnginePreservesValidGroupsDuringPartialReplan(t *testing
 	}
 	if planner.calls != 2 || len(planner.reqs[1].OfferedCaptures) != 1 ||
 		planner.reqs[1].OfferedCaptures[0].Seq != second.Event.Seq ||
+		len(planner.reqs[1].BaselineCandidates) != 1 ||
+		!reflect.DeepEqual(planner.reqs[1].BaselineCandidates[0].SelectedSeqs,
+			[]int64{second.Event.Seq}) ||
 		result.ResolutionMode != "partial_replan" || result.PreservedGroupCount != 1 ||
 		len(result.Decisions) != 2 {
 		t.Fatalf("partial replan requests=%+v result=%+v", planner.reqs, result)
@@ -1312,6 +1315,87 @@ func TestIntentCandidatePlanFingerprintIncludesPlanningReality(t *testing.T) {
 	}
 }
 
+func TestIntentCandidatePlanPreflightBlocksProviderAttempt(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	candidates := make([]ai.IntentCandidateSummary, ai.IntentOpenCandidateCap)
+	for i := range candidates {
+		candidates[i] = ai.IntentCandidateSummary{
+			CandidateID:  fmt.Sprintf("existing-%03d", i),
+			Status:       "waiting",
+			SelectedSeqs: []int64{int64(i + 1)},
+		}
+	}
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1000, Path: "new.go", Op: "create",
+		}},
+		Candidates: candidates,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetFast, Provider: planner.Name(),
+	}
+	_, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
+	var preflight *IntentPlanPreflightError
+	if !errors.As(err, &preflight) {
+		t.Fatalf("error=%T %v", err, err)
+	}
+	if planner.calls != 0 || run.AttemptCount != 0 ||
+		run.ProgressState.String != "preflight_blocked" ||
+		run.ResolutionMode.String != "local_preflight" {
+		t.Fatalf("calls=%d run=%+v", planner.calls, run)
+	}
+}
+
+func TestIntentCandidatePlanPreflightSuppliesValidBaseline(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "new.go", Op: "create",
+		}},
+		ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "new-change", SelectedSeqs: []int64{1},
+			Purpose: "complete new change", Readiness: ai.IntentCandidateReady,
+			Subject: "Add new change", GroupingReason: "one complete capture",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+	}
+	_, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 1 || run.AttemptCount != 1 ||
+		len(planner.req.BaselineCandidates) == 0 {
+		t.Fatalf("calls=%d run=%+v request=%+v", planner.calls, run, planner.req)
+	}
+	baselineReq := planner.req
+	baselineReq.BaselineCandidates = nil
+	if err := ai.ValidateIntentPlanV2(baselineReq, ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates:      planner.req.BaselineCandidates,
+	}); err != nil {
+		t.Fatalf("provider baseline invalid: %v", err)
+	}
+}
+
 func TestIntentCandidatePlanRebuildsInvalidCompletedResolution(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
@@ -1798,7 +1882,7 @@ func TestIntentCandidateEngineReplansRepairablePrivateSuffix(t *testing.T) {
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{newCapture}, Planner: planner,
-		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced,
+		RetryLimit: 1, RetryLimitSet: true, Preset: config.PresetBalanced,
 		VerificationMode: "structural", Now: time.Unix(120, 0),
 		Materialize: func(
 			_ context.Context,
