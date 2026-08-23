@@ -115,6 +115,8 @@ func replayIntentCandidateBatch(
 		Hints:         runtimeIntentDependencyHints(captures),
 		Materialize: intentCandidateScratchMaterializer(
 			repoRoot, opts.GitDir, parent),
+		PreflightMaterialize: intentCandidateScratchMaterializer(
+			repoRoot, opts.GitDir, parent),
 		VerificationMode:    opts.IntentVerificationMode,
 		Verify:              opts.IntentCandidateVerify,
 		Now:                 time.Now().UTC(),

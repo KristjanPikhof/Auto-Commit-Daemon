@@ -66,35 +66,36 @@ type IntentCandidateVerifier func(
 // IntentCandidateEvaluation describes one durable planner evaluation. It does
 // not publish commits or mutate Git refs; P8 consumes the publishable decisions.
 type IntentCandidateEvaluation struct {
-	BranchRef           string
-	BranchGeneration    int64
-	Captures            []IntentCandidateCapture
-	Hints               []IntentDependencyHint
-	Planner             interface{ Name() string }
-	Health              *IntentPlannerHealth
-	RetryLimit          int
-	RetryLimitSet       bool
-	Preset              config.PresetName
-	CommitFormat        ai.CommitFormat
-	IncludeDiffs        bool
-	ForcedAging         bool
-	Provider            string
-	Model               string
-	ConfigRevisionID    sql.NullInt64
-	ConfigProfile       string
-	PresetID            string
-	PresetVersion       int
-	LatestCommit        *ai.CommitSummary
-	PathContext         []ai.PathCommitContext
-	RecentSoftCommits   []ai.IntentSoftCommitSummary
-	PriorFindings       []ai.IntentAtomicityFinding
-	Materialize         IntentCandidateMaterializer
-	VerificationMode    string
-	Verify              IntentCandidateVerifier
-	Now                 time.Time
-	TargetEventSeqs     []int64
-	RejectLocalFallback bool
-	allowSemanticPlan   bool
+	BranchRef            string
+	BranchGeneration     int64
+	Captures             []IntentCandidateCapture
+	Hints                []IntentDependencyHint
+	Planner              interface{ Name() string }
+	Health               *IntentPlannerHealth
+	RetryLimit           int
+	RetryLimitSet        bool
+	Preset               config.PresetName
+	CommitFormat         ai.CommitFormat
+	IncludeDiffs         bool
+	ForcedAging          bool
+	Provider             string
+	Model                string
+	ConfigRevisionID     sql.NullInt64
+	ConfigProfile        string
+	PresetID             string
+	PresetVersion        int
+	LatestCommit         *ai.CommitSummary
+	PathContext          []ai.PathCommitContext
+	RecentSoftCommits    []ai.IntentSoftCommitSummary
+	PriorFindings        []ai.IntentAtomicityFinding
+	Materialize          IntentCandidateMaterializer
+	PreflightMaterialize IntentCandidateMaterializer
+	VerificationMode     string
+	Verify               IntentCandidateVerifier
+	Now                  time.Time
+	TargetEventSeqs      []int64
+	RejectLocalFallback  bool
+	allowSemanticPlan    bool
 }
 
 // IntentCandidateDecision is one persisted candidate revision plus its exact
@@ -933,8 +934,11 @@ func intentRequestTouchesRepairableSuffix(req ai.IntentPlanRequestV2) bool {
 }
 
 func preflightIntentCandidatePlan(
+	ctx context.Context,
 	req ai.IntentPlanRequestV2,
 	preset config.PresetName,
+	captures []IntentCandidateCapture,
+	materialize IntentCandidateMaterializer,
 ) (ai.IntentPlanRequestV2, []intentCandidateContinuation, error) {
 	if preset != config.PresetFast && preset != config.PresetBalanced &&
 		preset != config.PresetQuality {
@@ -953,11 +957,48 @@ func preflightIntentCandidatePlan(
 	if err := ai.ValidateIntentPlanV2(plannerRequest, baseline); err != nil {
 		return plannerRequest, continuations, err
 	}
+	if err := preflightIntentCandidateMaterialization(
+		ctx, baseline, captures, materialize); err != nil {
+		return plannerRequest, continuations, err
+	}
 	plannerRequest.BaselineCandidates = baseline.Candidates
 	if err := ai.ValidateIntentPlanRequestV2(plannerRequest); err != nil {
 		return plannerRequest, continuations, err
 	}
 	return plannerRequest, continuations, nil
+}
+
+func preflightIntentCandidateMaterialization(
+	ctx context.Context,
+	baseline ai.IntentPlanV2,
+	captures []IntentCandidateCapture,
+	materialize IntentCandidateMaterializer,
+) error {
+	if materialize == nil {
+		return nil
+	}
+	bySeq := make(map[int64]IntentCandidateCapture, len(captures))
+	for _, capture := range captures {
+		bySeq[capture.Event.Seq] = capture
+	}
+	for _, candidate := range baseline.Candidates {
+		selected := make([]IntentCandidateCapture, 0,
+			len(candidate.SelectedSeqs))
+		for _, seq := range candidate.SelectedSeqs {
+			capture, ok := bySeq[seq]
+			if !ok {
+				return fmt.Errorf(
+					"daemon: intent candidates: preflight capture %d is unavailable",
+					seq)
+			}
+			selected = append(selected, capture)
+		}
+		if err := materialize(ctx, selected); err != nil {
+			return fmt.Errorf(
+				"daemon: intent candidates: preflight materialization: %w", err)
+		}
+	}
+	return nil
 }
 
 func chooseIntentCandidatePlan(
@@ -974,8 +1015,10 @@ func chooseIntentCandidatePlan(
 	plannerFailure := ""
 	retryCount := 0
 	repairSuffixCorrection := false
+	skipSemanticPlanning := false
 	plannerRequest, baselineContinuations, preflightErr :=
-		preflightIntentCandidatePlan(req, preset)
+		preflightIntentCandidatePlan(
+			ctx, req, preset, input.Captures, input.PreflightMaterialize)
 	fingerprintRequest := req
 	fingerprintRequest.BaselineCandidates = plannerRequest.BaselineCandidates
 	run, err := newIntentPlanRun(fingerprintRequest, input, retryLimit+1)
@@ -1004,27 +1047,60 @@ func chooseIntentCandidatePlan(
 				Failure: ai.SanitizePlannerError(preflightErr.Error()),
 			}
 	}
+	run, err = state.EnsureIntentPlanRun(ctx, db, run)
+	if err != nil {
+		return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+	}
+	if run.Completed && run.ResolvedPlanJSON.Valid {
+		plan, continuations, loadErr := loadResolvedIntentPlanRun(
+			req, run.ResolvedPlanJSON.String)
+		if loadErr == nil {
+			run.ResolutionMode = sql.NullString{
+				String: "completed_plan_reuse", Valid: true,
+			}
+			return plan, "", "", retryCount, false, continuations, run, nil
+		}
+		run.Completed = false
+		run.ResolvedPlanJSON = sql.NullString{}
+		run.ProgressState = sql.NullString{
+			String: "local_cache_rebuild", Valid: true,
+		}
+		run.ResolutionMode = sql.NullString{}
+		run.FindingCodes = []string{"cached_plan_invalid"}
+		if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+		}
+		plannerFailure = ai.SanitizePlannerError(loadErr.Error())
+		skipSemanticPlanning = true
+	}
+	if run.AttemptCount >= run.AttemptLimit {
+		skipSemanticPlanning = true
+	}
 	var permit IntentPlannerHealthPermit
 	permitHeld := false
-	if planner != nil {
-		if health != nil {
-			var acquireErr error
-			permit, acquireErr = health.Acquire(ctx)
-			if acquireErr != nil {
-				var openErr *IntentPlannerCircuitOpenError
-				if !errors.As(acquireErr, &openErr) {
-					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, acquireErr
-				}
-				planner = nil
-			} else {
-				permitHeld = true
-			}
+	defer func() {
+		if health != nil && permitHeld {
+			_ = health.Complete(context.Background(), permit, nil)
 		}
-	}
-	if planner != nil {
+	}()
+	if planner != nil && !skipSemanticPlanning {
 		var previousSignature string
 		var lockedCandidates []ai.IntentCandidateAssignment
 		for {
+			if health != nil && !permitHeld {
+				permit, err = health.Acquire(ctx)
+				if err != nil {
+					var openErr *IntentPlannerCircuitOpenError
+					if !errors.As(err, &openErr) {
+						return ai.IntentPlanV2{}, "", "", retryCount,
+							false, nil, run, err
+					}
+					plannerFailure = ai.SanitizePlannerError(err.Error())
+					planner = nil
+					break
+				}
+				permitHeld = true
+			}
 			reserved, allowed, reserveErr := state.ReserveIntentPlanAttempt(ctx, db, run)
 			if reserveErr != nil {
 				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, reserveErr
@@ -1117,12 +1193,14 @@ func chooseIntentCandidatePlan(
 					if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
 						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
 					}
+					permitHeld = false
 				}
 				return plan, "", "", retryCount, false, continuations, run, nil
 			}
 			if ctx.Err() != nil {
 				if health != nil && permitHeld {
 					_ = health.Complete(ctx, permit, err)
+					permitHeld = false
 				}
 				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, ctx.Err()
 			}
@@ -1152,6 +1230,7 @@ func chooseIntentCandidatePlan(
 						if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
 							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
 						}
+						permitHeld = false
 					}
 					return repaired, repairMode,
 						ai.SanitizePlannerError(err.Error()), retryCount, false,
@@ -1168,7 +1247,9 @@ func chooseIntentCandidatePlan(
 					lockedCandidates = preserved
 					var partialPreflightErr error
 					plannerRequest, _, partialPreflightErr =
-						preflightIntentCandidatePlan(partial, preset)
+						preflightIntentCandidatePlan(
+							ctx, partial, preset, input.Captures,
+							input.PreflightMaterialize)
 					if partialPreflightErr != nil {
 						run.ProgressState = sql.NullString{
 							String: "preflight_blocked", Valid: true,
@@ -1238,6 +1319,7 @@ func chooseIntentCandidatePlan(
 		if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
 			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
 		}
+		permitHeld = false
 	}
 	if preset != config.PresetFast && preset != config.PresetBalanced && preset != config.PresetQuality {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run,
@@ -1441,9 +1523,7 @@ func newIntentPlanRun(
 	} else if attemptLimit > 3 {
 		attemptLimit = 3
 	}
-	fingerprintRequest := req
-	fingerprintRequest.OfferedCaptures = append(
-		[]ai.OfferedCapture(nil), req.OfferedCaptures...)
+	fingerprintRequest := canonicalIntentPlanFingerprintRequest(req)
 	for i := range fingerprintRequest.OfferedCaptures {
 		digest := sha256.Sum256([]byte(
 			fingerprintRequest.OfferedCaptures[i].CapturedDiff))
@@ -1509,6 +1589,146 @@ func newIntentPlanRun(
 		AttemptLimit:     attemptLimit,
 		UnresolvedSeqs:   offeredIntentSeqs(req),
 	}, nil
+}
+
+func canonicalIntentPlanFingerprintRequest(
+	req ai.IntentPlanRequestV2,
+) ai.IntentPlanRequestV2 {
+	canonical := req
+	if req.LatestCommit != nil {
+		latest := *req.LatestCommit
+		latest.Paths = append([]string(nil), req.LatestCommit.Paths...)
+		sort.Strings(latest.Paths)
+		canonical.LatestCommit = &latest
+	}
+	canonical.PathCommitContext = append([]ai.PathCommitContext(nil),
+		req.PathCommitContext...)
+	for i := range canonical.PathCommitContext {
+		canonical.PathCommitContext[i].Commits = append([]ai.CommitSummary(nil),
+			req.PathCommitContext[i].Commits...)
+		for j := range canonical.PathCommitContext[i].Commits {
+			canonical.PathCommitContext[i].Commits[j].Paths = append(
+				[]string(nil), req.PathCommitContext[i].Commits[j].Paths...)
+			sort.Strings(canonical.PathCommitContext[i].Commits[j].Paths)
+		}
+	}
+	sort.Slice(canonical.PathCommitContext, func(i, j int) bool {
+		return canonical.PathCommitContext[i].Path <
+			canonical.PathCommitContext[j].Path
+	})
+	canonical.OfferedCaptures = append([]ai.OfferedCapture(nil),
+		req.OfferedCaptures...)
+	sort.Slice(canonical.OfferedCaptures, func(i, j int) bool {
+		return canonical.OfferedCaptures[i].Seq <
+			canonical.OfferedCaptures[j].Seq
+	})
+	canonical.Candidates = append([]ai.IntentCandidateSummary(nil),
+		req.Candidates...)
+	for i := range canonical.Candidates {
+		canonical.Candidates[i].SelectedSeqs = append([]int64(nil),
+			req.Candidates[i].SelectedSeqs...)
+		sort.Slice(canonical.Candidates[i].SelectedSeqs, func(a, b int) bool {
+			return canonical.Candidates[i].SelectedSeqs[a] <
+				canonical.Candidates[i].SelectedSeqs[b]
+		})
+		canonical.Candidates[i].Paths = append([]string(nil),
+			req.Candidates[i].Paths...)
+		canonical.Candidates[i].MissingCompanions = append([]string(nil),
+			req.Candidates[i].MissingCompanions...)
+		sort.Strings(canonical.Candidates[i].Paths)
+		sort.Strings(canonical.Candidates[i].MissingCompanions)
+	}
+	sort.Slice(canonical.Candidates, func(i, j int) bool {
+		return canonical.Candidates[i].CandidateID <
+			canonical.Candidates[j].CandidateID
+	})
+	canonical.Dependencies = append([]ai.IntentCaptureDependency(nil),
+		req.Dependencies...)
+	sort.Slice(canonical.Dependencies, func(i, j int) bool {
+		left, right := canonical.Dependencies[i], canonical.Dependencies[j]
+		if left.FromSeq != right.FromSeq {
+			return left.FromSeq < right.FromSeq
+		}
+		if left.ToSeq != right.ToSeq {
+			return left.ToSeq < right.ToSeq
+		}
+		if left.Strength != right.Strength {
+			return left.Strength < right.Strength
+		}
+		if left.Kind != right.Kind {
+			return left.Kind < right.Kind
+		}
+		return left.EvidenceHash < right.EvidenceHash
+	})
+	canonical.ActivityBoundaries = append([]ai.IntentActivityBoundary(nil),
+		req.ActivityBoundaries...)
+	sort.Slice(canonical.ActivityBoundaries, func(i, j int) bool {
+		left, right := canonical.ActivityBoundaries[i],
+			canonical.ActivityBoundaries[j]
+		if !left.CreatedAt.Equal(right.CreatedAt) {
+			return left.CreatedAt.Before(right.CreatedAt)
+		}
+		if left.Epoch != right.Epoch {
+			return left.Epoch < right.Epoch
+		}
+		return left.Kind < right.Kind
+	})
+	canonical.RecentSoftCommits = append([]ai.IntentSoftCommitSummary(nil),
+		req.RecentSoftCommits...)
+	for i := range canonical.RecentSoftCommits {
+		canonical.RecentSoftCommits[i].Paths = append([]string(nil),
+			req.RecentSoftCommits[i].Paths...)
+		sort.Strings(canonical.RecentSoftCommits[i].Paths)
+	}
+	sort.Slice(canonical.RecentSoftCommits, func(i, j int) bool {
+		left, right := canonical.RecentSoftCommits[i],
+			canonical.RecentSoftCommits[j]
+		if !left.PublishedAt.Equal(right.PublishedAt) {
+			return left.PublishedAt.Before(right.PublishedAt)
+		}
+		if left.CandidateID != right.CandidateID {
+			return left.CandidateID < right.CandidateID
+		}
+		return left.OID < right.OID
+	})
+	canonical.PriorAtomicityFindings = append([]ai.IntentAtomicityFinding(nil),
+		req.PriorAtomicityFindings...)
+	sort.Slice(canonical.PriorAtomicityFindings, func(i, j int) bool {
+		left, right := canonical.PriorAtomicityFindings[i],
+			canonical.PriorAtomicityFindings[j]
+		if left.CandidateID != right.CandidateID {
+			return left.CandidateID < right.CandidateID
+		}
+		if left.Gate != right.Gate {
+			return left.Gate < right.Gate
+		}
+		if left.Code != right.Code {
+			return left.Code < right.Code
+		}
+		return left.Summary < right.Summary
+	})
+	canonical.BaselineCandidates = append([]ai.IntentCandidateAssignment(nil),
+		req.BaselineCandidates...)
+	for i := range canonical.BaselineCandidates {
+		canonical.BaselineCandidates[i].SelectedSeqs = append([]int64(nil),
+			req.BaselineCandidates[i].SelectedSeqs...)
+		sort.Slice(canonical.BaselineCandidates[i].SelectedSeqs,
+			func(a, b int) bool {
+				return canonical.BaselineCandidates[i].SelectedSeqs[a] <
+					canonical.BaselineCandidates[i].SelectedSeqs[b]
+			})
+		canonical.BaselineCandidates[i].MissingCompanions = append(
+			[]string(nil), req.BaselineCandidates[i].MissingCompanions...)
+		canonical.BaselineCandidates[i].DependsOnCandidates = append(
+			[]string(nil), req.BaselineCandidates[i].DependsOnCandidates...)
+		sort.Strings(canonical.BaselineCandidates[i].MissingCompanions)
+		sort.Strings(canonical.BaselineCandidates[i].DependsOnCandidates)
+	}
+	sort.Slice(canonical.BaselineCandidates, func(i, j int) bool {
+		return canonical.BaselineCandidates[i].CandidateID <
+			canonical.BaselineCandidates[j].CandidateID
+	})
+	return canonical
 }
 
 func offeredIntentSeqs(req ai.IntentPlanRequestV2) []int64 {
