@@ -346,20 +346,28 @@ func planResolvedPublicationDrains(
 		return fmt.Errorf("acd fix: inspect resolved publication drains: %w", err)
 	}
 	for _, candidate := range candidates {
-		targetEvents := candidate.TargetEvents
-		resolvedEvents := candidate.ResolvedEvents
-		plan.Actions = append(plan.Actions, fixAction{
-			ID:             fixActionCompleteResolvedDrain + ":" + candidate.ID,
-			Kind:           fixActionCompleteResolvedDrain,
-			Description:    "complete a publication run whose protected changes are already resolved",
-			Reason:         "every frozen member is already published or safely recovered",
-			DrainID:        candidate.ID,
-			CheckpointID:   candidate.CheckpointID,
-			TargetEvents:   &targetEvents,
-			ResolvedEvents: &resolvedEvents,
-		})
+		plan.Actions = append(plan.Actions, resolvedPublicationDrainAction(
+			candidate, "every frozen member is already published or safely recovered"))
 	}
 	return nil
+}
+
+func resolvedPublicationDrainAction(
+	drain state.PublicationDrainReconciliation,
+	reason string,
+) fixAction {
+	targetEvents := drain.TargetEvents
+	resolvedEvents := drain.ResolvedEvents
+	return fixAction{
+		ID:             fixActionCompleteResolvedDrain + ":" + drain.ID,
+		Kind:           fixActionCompleteResolvedDrain,
+		Description:    "complete a publication run whose protected changes are already resolved",
+		Reason:         reason,
+		DrainID:        drain.ID,
+		CheckpointID:   drain.CheckpointID,
+		TargetEvents:   &targetEvents,
+		ResolvedEvents: &resolvedEvents,
+	}
 }
 
 type unpublishedFixPair struct {
@@ -764,20 +772,11 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 			break
 		}
 		if !matched {
-			targetEvents := drain.TargetEvents
-			resolvedEvents := drain.ResolvedEvents
-			plan.Actions = append(plan.Actions, fixAction{
-				ID:             fixActionCompleteResolvedDrain + ":" + drain.ID,
-				Kind:           fixActionCompleteResolvedDrain,
-				Description:    "complete a publication run whose protected changes are already resolved",
-				Reason:         "exact-chain recovery resolved every frozen member",
-				DrainID:        drain.ID,
-				CheckpointID:   drain.CheckpointID,
-				TargetEvents:   &targetEvents,
-				ResolvedEvents: &resolvedEvents,
-				RowsChanged:    1,
-				Applied:        true,
-			})
+			action := resolvedPublicationDrainAction(
+				drain, "exact-chain recovery resolved every frozen member")
+			action.RowsChanged = 1
+			action.Applied = true
+			plan.Actions = append(plan.Actions, action)
 		}
 		plan.RowsChanged++
 	}
