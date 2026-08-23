@@ -22,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -852,6 +853,8 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		}
 		_ = json.Unmarshal(request.Params, &params)
 		var drainAnchor publicationDrainTarget
+		var requestedPublicationBranch string
+		publicationWorktreeID := checkpointpkg.WorktreeID(runtime.worktree.Root)
 		runtime.gate.Lock()
 		if params.DrainPublication {
 			reason, unsafeErr := publicationUnsafeReason(
@@ -897,8 +900,16 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 				}
 			}
 			if anchorErr == nil {
-				drainAnchor, anchorErr = snapshotPublicationDrainTarget(
-					ctx, runtime.db, branchRef, generation)
+				requestedPublicationBranch = branchRef
+				drainAnchor = publicationDrainTarget{BranchRef: branchRef}
+				persistedToken, tokenExists, tokenErr := state.MetaGet(
+					ctx, runtime.db, daemon.MetaKeyBranchToken)
+				if tokenErr != nil {
+					anchorErr = tokenErr
+				} else if !tokenExists || publicationTokenBranchRef(persistedToken) == branchRef {
+					drainAnchor, anchorErr = snapshotPublicationDrainTarget(
+						ctx, runtime.db, branchRef, generation)
+				}
 			}
 			if anchorErr != nil {
 				runtime.gate.Unlock()
@@ -914,24 +925,35 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 			runtime.gate.Unlock()
 			return nil, protocolFailure("observation_failed", beginErr, true)
 		}
+		if params.DrainPublication {
+			if requireErr := daemon.RequireProtectionCheckpoint(
+				ctx, runtime.db, publicationWorktreeID, acceptedEpoch); requireErr != nil {
+				runtime.gate.Unlock()
+				return nil, protocolFailure("observation_failed", requireErr, true)
+			}
+		}
 		h.wake(request.WorktreeID)
 		runtime.gate.Unlock()
 		deadline := time.NewTimer(checkpointBarrierWait(ctx))
 		defer deadline.Stop()
 		ticker := time.NewTicker(25 * time.Millisecond)
 		defer ticker.Stop()
-		var lastCovered, lastComplete, lastCheckpoint string
+		var lastCovered, lastComplete, lastCheckpoint, lastRejectedCheckpoint string
 		var lastReadErr error
 		var drainTarget publicationDrainTarget
 		var lastUnsafeCheck time.Time
 		for {
 			select {
 			case <-ctx.Done():
-				return nil, protocolFailure("checkpoint_timeout", ctx.Err(), true)
+				return nil, protocolFailure("checkpoint_timeout", fmt.Errorf(
+					"checkpoint barrier interrupted (accepted_epoch=%d covered_epoch=%q complete=%q checkpoint=%q rejected_checkpoint=%q read_error=%v): %w",
+					acceptedEpoch, lastCovered, lastComplete, lastCheckpoint,
+					lastRejectedCheckpoint, lastReadErr, ctx.Err()), true)
 			case <-deadline.C:
 				return nil, protocolFailure("checkpoint_timeout", fmt.Errorf(
-					"checkpoint barrier timed out (accepted_epoch=%d covered_epoch=%q complete=%q checkpoint=%q read_error=%v)",
-					acceptedEpoch, lastCovered, lastComplete, lastCheckpoint, lastReadErr), true)
+					"checkpoint barrier timed out (accepted_epoch=%d covered_epoch=%q complete=%q checkpoint=%q rejected_checkpoint=%q read_error=%v)",
+					acceptedEpoch, lastCovered, lastComplete, lastCheckpoint,
+					lastRejectedCheckpoint, lastReadErr), true)
 			case <-ticker.C:
 				var coveredErr, completeErr, checkpointErr error
 				lastCovered, _, coveredErr = state.MetaGet(ctx, runtime.db, daemon.MetaKeyProtectionCoveredEpoch)
@@ -939,28 +961,74 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 				lastCheckpoint, _, checkpointErr = state.MetaGet(ctx, runtime.db, daemon.MetaKeyProtectionCheckpointID)
 				lastReadErr = errors.Join(coveredErr, completeErr, checkpointErr)
 				coveredEpoch, parseErr := strconv.ParseInt(lastCovered, 10, 64)
-				if lastReadErr == nil && parseErr == nil && coveredEpoch >= acceptedEpoch && lastComplete == "true" {
+				barrierReady := lastReadErr == nil && parseErr == nil &&
+					coveredEpoch >= acceptedEpoch && lastComplete == "true"
+				if params.DrainPublication {
+					currentBranch, branchErr := git.RunBranchRef(ctx, runtime.worktree.Root)
+					if branchErr != nil {
+						return nil, protocolFailure("publication_status_failed", branchErr, true)
+					}
+					expectedBranch := requestedPublicationBranch
+					if drainTarget.EventSeqs != nil {
+						expectedBranch = drainTarget.BranchRef
+					}
+					if currentBranch != expectedBranch {
+						return nil, protocolFailure("publication_needs_action", fmt.Errorf(
+							"publication branch changed while saving work: before=%s current=%s",
+							expectedBranch, currentBranch), false)
+					}
+					if drainTarget.EventSeqs == nil {
+						checkpoint, found, selectErr := state.CompletedCheckpointForBarrier(
+							ctx, runtime.db, publicationWorktreeID, acceptedEpoch, expectedBranch)
+						if selectErr != nil {
+							return nil, protocolFailure(
+								"publication_status_failed", selectErr, true)
+						}
+						if found {
+							lastCheckpoint = checkpoint.ID
+							barrierReady = true
+						} else {
+							lastRejectedCheckpoint = lastCheckpoint
+							barrierReady = false
+							h.wake(request.WorktreeID)
+						}
+					} else if generation, generationErr := daemon.LoadBranchGeneration(
+						ctx, runtime.db); generationErr != nil {
+						return nil, protocolFailure(
+							"publication_status_failed", generationErr, true)
+					} else if generation != drainTarget.Generation {
+						return nil, protocolFailure("publication_needs_action", fmt.Errorf(
+							"publication branch generation changed while saving work: before=%d current=%d",
+							drainTarget.Generation, generation), false)
+					}
+				}
+				if barrierReady {
 					if params.DrainPublication {
 						if drainTarget.EventSeqs == nil {
 							lastUnsafeCheck = time.Now()
 							runtime.gate.Lock()
 							reason, unsafeErr := publicationUnsafeReason(
 								ctx, runtime.worktree, params.ConsumeStaged)
+							if unsafeErr == nil && reason == "" && drainAnchor.EventSeqs == nil {
+								generation, generationErr := daemon.LoadBranchGeneration(
+									ctx, runtime.db)
+								if generationErr != nil {
+									unsafeErr = generationErr
+								} else {
+									drainAnchor, unsafeErr = snapshotPublicationDrainTarget(
+										ctx, runtime.db, requestedPublicationBranch, generation)
+								}
+							}
 							if unsafeErr == nil && reason == "" {
 								drainTarget, unsafeErr = freezePublicationDrainTarget(
-									ctx, runtime.db, runtime.worktree.Root, lastCheckpoint, drainAnchor)
+									ctx, runtime.db, runtime.worktree.Root, lastCheckpoint,
+									publicationWorktreeID, acceptedEpoch, drainAnchor)
 								if unsafeErr == nil {
 									nowTS := float64(time.Now().UnixNano()) / 1e9
-									worktreeID := runtime.record.WorktreeID
-									if len(worktreeID) != 16 {
-										unsafeErr = runtime.db.ReadSQL().QueryRowContext(
-											ctx, `SELECT worktree_id FROM checkpoints WHERE id=?`,
-											lastCheckpoint).Scan(&worktreeID)
-									}
 									preparedDrain := state.PublicationDrain{
 										ID:               "drain-" + lastCheckpoint,
 										CheckpointID:     lastCheckpoint,
-										WorktreeID:       worktreeID,
+										WorktreeID:       publicationWorktreeID,
 										BranchRef:        drainTarget.BranchRef,
 										BranchGeneration: drainTarget.Generation,
 										Phase:            state.PublicationDrainCheckpointing,
@@ -1181,6 +1249,14 @@ type publicationDrainProgress struct {
 	Remaining, Published, Recovered, Terminal, Commits int64
 }
 
+func publicationTokenBranchRef(token string) string {
+	parts := strings.SplitN(strings.TrimSpace(token), " ", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
 func snapshotPublicationDrainTarget(
 	ctx context.Context,
 	db *state.DB,
@@ -1218,7 +1294,8 @@ ORDER BY seq`, branchRef, generation)
 func freezePublicationDrainTarget(
 	ctx context.Context,
 	db *state.DB,
-	repoRoot, checkpointID string,
+	repoRoot, checkpointID, worktreeID string,
+	minimumCoverageEpoch int64,
 	anchor publicationDrainTarget,
 ) (publicationDrainTarget, error) {
 	if strings.TrimSpace(checkpointID) == "" {
@@ -1235,22 +1312,44 @@ func freezePublicationDrainTarget(
 		return publicationDrainTarget{}, fmt.Errorf(
 			"publication branch changed after barrier: before=%s current=%s", anchor.BranchRef, branchRef)
 	}
+	headBefore, err := publicationHead(ctx, repoRoot)
+	if err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("resolve publication HEAD: %w", err)
+	}
 	tx, err := db.ReadSQL().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return publicationDrainTarget{}, fmt.Errorf("begin publication target snapshot: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var observedRef, phase string
+	var observedHead, observedRef, checkpointWorktreeID, phase string
+	var coverageEpoch int64
 	if err := tx.QueryRowContext(ctx, `
-SELECT observed_ref,phase FROM checkpoints WHERE id=?`, checkpointID).Scan(&observedRef, &phase); err != nil {
+SELECT observed_head,observed_ref,worktree_id,coverage_epoch,phase
+FROM checkpoints WHERE id=?`, checkpointID).Scan(
+		&observedHead, &observedRef, &checkpointWorktreeID,
+		&coverageEpoch, &phase); err != nil {
 		return publicationDrainTarget{}, fmt.Errorf("load publication checkpoint: %w", err)
 	}
 	if phase != state.CheckpointCompleted || observedRef == "" {
 		return publicationDrainTarget{}, errors.New("publication checkpoint is not a completed attached snapshot")
 	}
+	if checkpointWorktreeID != worktreeID || coverageEpoch < minimumCoverageEpoch {
+		return publicationDrainTarget{}, fmt.Errorf(
+			"publication checkpoint identity changed: worktree=%s coverage_epoch=%d",
+			checkpointWorktreeID, coverageEpoch)
+	}
 	if observedRef != anchor.BranchRef {
 		return publicationDrainTarget{}, fmt.Errorf(
 			"publication checkpoint branch changed: before=%s checkpoint=%s", anchor.BranchRef, observedRef)
+	}
+	currentGeneration, err := daemon.LoadBranchGeneration(ctx, db)
+	if err != nil {
+		return publicationDrainTarget{}, err
+	}
+	if currentGeneration != anchor.Generation {
+		return publicationDrainTarget{}, fmt.Errorf(
+			"publication branch generation changed after barrier: before=%d current=%d",
+			anchor.Generation, currentGeneration)
 	}
 
 	target := publicationDrainTarget{
@@ -1308,7 +1407,118 @@ ORDER BY ce.ord`, checkpointID)
 		return publicationDrainTarget{}, fmt.Errorf(
 			"publication branch changed while freezing target: before=%s current=%s", anchor.BranchRef, branchAfter)
 	}
+	headAfter, err := publicationHead(ctx, repoRoot)
+	if err != nil {
+		return publicationDrainTarget{}, fmt.Errorf("revalidate publication HEAD: %w", err)
+	}
+	if headAfter != headBefore {
+		return publicationDrainTarget{}, fmt.Errorf(
+			"publication HEAD changed while freezing target: before=%s current=%s",
+			headBefore, headAfter)
+	}
+	if headAfter != observedHead {
+		owned, proofErr := publicationHeadAdvanceOwnedByTarget(
+			ctx, db, observedHead, headAfter, target)
+		if proofErr != nil {
+			return publicationDrainTarget{}, fmt.Errorf(
+				"prove publication HEAD advance: %w", proofErr)
+		}
+		if !owned {
+			return publicationDrainTarget{}, fmt.Errorf(
+				"publication checkpoint HEAD changed without a completed ACD publication chain: checkpoint=%s current=%s",
+				observedHead, headAfter)
+		}
+	}
 	return target, nil
+}
+
+func publicationHead(ctx context.Context, repoRoot string) (string, error) {
+	head, err := git.RevParse(ctx, repoRoot, "HEAD")
+	if errors.Is(err, git.ErrRefNotFound) {
+		return "", nil
+	}
+	return head, err
+}
+
+func publicationHeadAdvanceOwnedByTarget(
+	ctx context.Context,
+	db *state.DB,
+	sourceHead, targetHead string,
+	target publicationDrainTarget,
+) (bool, error) {
+	unusedEvents := make(map[int64]struct{}, len(target.EventSeqs))
+	for _, seq := range target.EventSeqs {
+		unusedEvents[seq] = struct{}{}
+	}
+	seenHeads := map[string]struct{}{sourceHead: {}}
+	current := sourceHead
+	for step := 0; step < len(target.EventSeqs) && current != targetHead; step++ {
+		rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id,target_commit_oid FROM self_publications
+WHERE branch_ref=? AND branch_generation=? AND source_head=?
+  AND phase='completed'
+ORDER BY created_ts,id LIMIT 2`, target.BranchRef, target.Generation, current)
+		if err != nil {
+			return false, err
+		}
+		var transitions [][2]string
+		for rows.Next() {
+			var id, nextHead string
+			if err := rows.Scan(&id, &nextHead); err != nil {
+				rows.Close()
+				return false, err
+			}
+			transitions = append(transitions, [2]string{id, nextHead})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return false, err
+		}
+		if err := rows.Close(); err != nil {
+			return false, err
+		}
+		if len(transitions) != 1 {
+			return false, nil
+		}
+
+		publicationID, nextHead := transitions[0][0], transitions[0][1]
+		memberRows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT event_seq FROM self_publication_members
+WHERE publication_id=? ORDER BY ord`, publicationID)
+		if err != nil {
+			return false, err
+		}
+		memberCount := 0
+		for memberRows.Next() {
+			var seq int64
+			if err := memberRows.Scan(&seq); err != nil {
+				memberRows.Close()
+				return false, err
+			}
+			if _, ok := unusedEvents[seq]; !ok {
+				memberRows.Close()
+				return false, nil
+			}
+			delete(unusedEvents, seq)
+			memberCount++
+		}
+		if err := memberRows.Err(); err != nil {
+			memberRows.Close()
+			return false, err
+		}
+		if err := memberRows.Close(); err != nil {
+			return false, err
+		}
+		if memberCount == 0 {
+			return false, nil
+		}
+		if _, duplicate := seenHeads[nextHead]; duplicate {
+			return false, nil
+		}
+		seenHeads[nextHead] = struct{}{}
+		current = nextHead
+	}
+	return current == targetHead, nil
 }
 
 func publicationDrainResult(
@@ -1497,7 +1707,12 @@ func publicationUnsafeReason(
 
 func checkpointBarrierWait(ctx context.Context) time.Duration {
 	if requestDeadline, ok := ctx.Deadline(); ok {
-		return max(time.Until(requestDeadline), time.Millisecond)
+		remaining := time.Until(requestDeadline)
+		const diagnosticHeadroom = 100 * time.Millisecond
+		if remaining > diagnosticHeadroom {
+			return remaining - diagnosticHeadroom
+		}
+		return max(remaining, time.Millisecond)
 	}
 	return supervisor.CheckpointBarrierTimeout
 }

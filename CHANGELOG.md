@@ -7,6 +7,20 @@
 - Updated Lip Gloss to 2.0.6 and ANSI to 0.11.8 for terminal rendering fixes.
   SQLite 1.56.0 includes the upstream journal rollback correction, and CI and
   release workflows now use `actions/checkout` 7.0.1.
+- `acd setup` now installs or upgrades the shared runtime without enabling the
+  current repository. Run `acd on` in each repository you want to protect; it
+  registers, migrates, and enables only that repository. Other mutation
+  commands stop and ask for setup when the managed runtime is out of date.
+
+### Fixed
+
+- Publication barriers now require a new completed checkpoint for the exact
+  worktree, branch, observation, and `HEAD`. A same-branch commit can no longer
+  make stale checkpoint proof eligible for publication.
+- ACD now completes stale publication runs when every frozen event is already
+  published or safely recovered. Workers reconcile them during startup and
+  normal recovery, while `acd support recover` provides the same repair when a
+  worker cannot run.
 
 ## v2026-08-18
 

@@ -140,6 +140,70 @@ func TestCheckpointIdentityAndAmbiguityFailClosed(t *testing.T) {
 	}
 }
 
+func TestCompletedCheckpointForBarrierMatchesExactIdentity(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	checkpoints := []Checkpoint{
+		{
+			ID: "cp-1786060000010-aaaaaaaaaaaaaaaa", OperationID: "op-barrier-feature",
+			WorktreeID: "0123456789abcdef", Reason: CheckpointReasonPoll,
+			ObservationEpoch: 10, CoverageEpoch: 10,
+			ObservedHead: "feature-head", ObservedRef: "refs/heads/feature",
+			TreeOID: "feature-tree", CommitOID: "feature-commit",
+			Ref:       "refs/acd/checkpoints/v1/0123456789abcdef/cp-1786060000010-aaaaaaaaaaaaaaaa",
+			CreatedTS: 10,
+		},
+		{
+			ID: "cp-1786060000011-bbbbbbbbbbbbbbbb", OperationID: "op-barrier-peer",
+			WorktreeID: "fedcba9876543210", Reason: CheckpointReasonPoll,
+			ObservationEpoch: 11, CoverageEpoch: 11,
+			ObservedHead: "main-head", ObservedRef: "refs/heads/main",
+			TreeOID: "peer-tree", CommitOID: "peer-commit",
+			Ref:       "refs/acd/checkpoints/v1/fedcba9876543210/cp-1786060000011-bbbbbbbbbbbbbbbb",
+			CreatedTS: 11,
+		},
+		{
+			ID: "cp-1786060000012-cccccccccccccccc", OperationID: "op-barrier-main",
+			WorktreeID: "0123456789abcdef", Reason: CheckpointReasonPoll,
+			ObservationEpoch: 12, CoverageEpoch: 12,
+			ObservedHead: "main-head", ObservedRef: "refs/heads/main",
+			TreeOID: "main-tree", CommitOID: "main-commit",
+			Ref:       "refs/acd/checkpoints/v1/0123456789abcdef/cp-1786060000012-cccccccccccccccc",
+			CreatedTS: 12,
+		},
+	}
+	for _, checkpoint := range checkpoints {
+		if created, err := PrepareCheckpoint(
+			ctx, db, checkpoint, checkpointTestDigest); err != nil || !created {
+			t.Fatalf("prepare %s=(%t,%v)", checkpoint.ID, created, err)
+		}
+		if err := CompleteCheckpoint(
+			ctx, db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID,
+			checkpoint.CreatedTS+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	checkpoint, ok, err := CompletedCheckpointForBarrier(
+		ctx, db, "0123456789abcdef", 10, "refs/heads/main")
+	if err != nil || !ok || checkpoint.ID != checkpoints[2].ID {
+		t.Fatalf("checkpoint=(%+v,%t,%v)", checkpoint, ok, err)
+	}
+	if _, ok, err := CompletedCheckpointForBarrier(
+		ctx, db, "0123456789abcdef", 13, "refs/heads/main"); err != nil || ok {
+		t.Fatalf("future checkpoint=(%t,%v), want false,nil", ok, err)
+	}
+	if _, _, err := CompletedCheckpointForBarrier(
+		ctx, db, "short", 1, "refs/heads/main"); !errors.Is(err, ErrCheckpointIdentityMismatch) {
+		t.Fatalf("invalid identity error=%v", err)
+	}
+}
+
 func TestCheckpointProjectionDoesNotMigrateV19(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "v19.db")

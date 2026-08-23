@@ -110,6 +110,10 @@ const (
 	MetaKeyProtectionTreeDigest          = "protection.tree_digest"
 )
 
+func requiredProtectionCheckpointEpochKey(worktreeID string) string {
+	return "protection.required_checkpoint_epoch:" + worktreeID
+}
+
 // CaptureBackpressureClearRatio is the high-water fraction of
 // ACD_MAX_PENDING_EVENTS at which capture lifts the durable backpressure
 // pause. Pending must drop strictly below cap*ratio before
@@ -1071,6 +1075,11 @@ func completeProtectionCheckpoint(
 	if digestErr != nil {
 		return fmt.Errorf("daemon: read protection tree digest: %w", digestErr)
 	}
+	requiredEpoch, err := requiredProtectionCheckpointEpoch(ctx, db, opts.WorktreeID)
+	if err != nil {
+		return err
+	}
+	forceNew = forceNew || requiredEpoch > 0 && epoch >= requiredEpoch
 	if !forceNew && projection.Latest != nil &&
 		projection.Latest.Phase == state.CheckpointCompleted &&
 		digestOK && priorDigest == liveDigest {
@@ -1108,6 +1117,13 @@ func completeProtectionCheckpoint(
 	if err := persistProtectionCoverage(ctx, db, epoch, result.Checkpoint.ID, liveDigest); err != nil {
 		return err
 	}
+	if requiredEpoch > 0 && epoch >= requiredEpoch {
+		if _, err := db.SQL().ExecContext(ctx, `
+DELETE FROM daemon_meta WHERE key=? AND CAST(value AS INTEGER)<=?`,
+			requiredProtectionCheckpointEpochKey(opts.WorktreeID), epoch); err != nil {
+			return fmt.Errorf("daemon: clear required protection checkpoint: %w", err)
+		}
+	}
 	summary.CheckpointID = result.Checkpoint.ID
 	summary.Protected = true
 	return nil
@@ -1125,6 +1141,59 @@ func BeginProtectionObservation(ctx context.Context, db *state.DB) (int64, error
 		MetaKeyProtectionObservationEpoch, MetaKeyProtectionComplete)
 	if err != nil {
 		return 0, fmt.Errorf("daemon: begin protection observation: %w", err)
+	}
+	return epoch, nil
+}
+
+// RequireProtectionCheckpoint prevents tree-digest reuse for one accepted
+// publication barrier. The requirement is scoped to the canonical worktree
+// checkpoint identity because linked worktrees share daemon_meta.
+func RequireProtectionCheckpoint(
+	ctx context.Context,
+	db *state.DB,
+	worktreeID string,
+	epoch int64,
+) error {
+	if db == nil || len(worktreeID) != 16 || epoch <= 0 {
+		return errors.New("daemon: invalid required protection checkpoint identity")
+	}
+	key := requiredProtectionCheckpointEpochKey(worktreeID)
+	current, ok, err := state.MetaGet(ctx, db, key)
+	if err != nil {
+		return fmt.Errorf("daemon: read required protection checkpoint: %w", err)
+	}
+	if ok {
+		currentEpoch, parseErr := strconv.ParseInt(current, 10, 64)
+		if parseErr != nil {
+			return fmt.Errorf("daemon: parse required protection checkpoint: %w", parseErr)
+		}
+		if currentEpoch >= epoch {
+			return nil
+		}
+	}
+	if err := state.MetaSet(ctx, db, key, strconv.FormatInt(epoch, 10)); err != nil {
+		return fmt.Errorf("daemon: persist required protection checkpoint: %w", err)
+	}
+	return nil
+}
+
+func requiredProtectionCheckpointEpoch(
+	ctx context.Context,
+	db *state.DB,
+	worktreeID string,
+) (int64, error) {
+	if len(worktreeID) != 16 {
+		return 0, nil
+	}
+	raw, ok, err := state.MetaGet(
+		ctx, db, requiredProtectionCheckpointEpochKey(worktreeID))
+	if err != nil || !ok {
+		return 0, err
+	}
+	epoch, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || epoch <= 0 {
+		return 0, fmt.Errorf(
+			"daemon: invalid required protection checkpoint epoch %q", raw)
 	}
 	return epoch, nil
 }

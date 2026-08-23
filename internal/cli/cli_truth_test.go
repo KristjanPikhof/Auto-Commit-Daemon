@@ -158,7 +158,7 @@ func TestOperationalStatePublicationDrainSelfHealMatrix(t *testing.T) {
 func TestPublicationDrainStatusDiagnoseDoctorReadOnlyTruth(t *testing.T) {
 	ctx := context.Background()
 	repo, dbPath, db := makeRepoStateDB(t)
-	seqs := insertCompletedCheckpoint(t, db, "cp-truth-drain",
+	seqs := insertCompletedCheckpoint(t, db, "cp-truth-drain", "0123456789abcdef",
 		[]checkpointMemberFixture{{State: state.EventStatePending}})
 	drain := state.PublicationDrain{
 		ID: "drain-cp-truth", CheckpointID: "cp-truth-drain",

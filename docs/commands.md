@@ -175,6 +175,10 @@ continues and the next `acd commit-all --yes` reconnects to the same drain.
 Invalid Intent grouping gets one bounded rebuild, followed by safe
 local atomic dependency groups when needed.
 
+The barrier accepts only a completed checkpoint for the requested worktree,
+branch, generation, and observation. A checkpoint from another branch or
+linked worktree is ignored while the worker creates the matching checkpoint.
+
 ## Doctor and support
 
 ~~~bash
@@ -193,6 +197,11 @@ worker. Use the support commands only when doctor asks for them.
 Support repair previews a safely provable interrupted restore and, with
 `--yes`, completes its post-restore checkpoint. It refuses if the working tree
 no longer matches the interrupted restore target.
+
+`acd support recover` proves or preserves unpublished work. It also completes
+a stale publication run when every frozen member is already published or
+recovered. Workers perform that completion automatically during startup and
+normal branch recovery; the command is a fallback for a worker that cannot run.
 
 ## Uninstall
 

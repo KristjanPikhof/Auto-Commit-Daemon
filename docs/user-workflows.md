@@ -152,8 +152,11 @@ error, and the command that matches the problem. Use `acd support diagnose
 asks you to inspect startup details. Credentials, provider responses, and raw
 source content are redacted by default.
 
-If status reports a durable publication block, preview and apply exact-chain
-recovery:
+ACD completes an old publication run automatically when every protected change
+is already published or preserved in recovery. This also works after switching
+branches or restarting the worker.
+
+If ACD cannot prove that the run is complete, preview the remaining recovery:
 
 ~~~bash
 acd support recover --dry-run
@@ -162,8 +165,8 @@ acd support recover --yes
 
 Apply mode checkpoints every enabled linked worktree in the repository. It
 then stops the shared repository worker, rechecks the plan, performs recovery,
-and starts protection again. You do not need to run `acd off` first. Other
-repositories keep running.
+and starts protection again. You do not need to switch to an old branch or run
+`acd off` first. Other repositories keep running.
 
 ## Upgrade from v19
 

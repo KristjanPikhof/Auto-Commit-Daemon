@@ -1743,6 +1743,23 @@ func TestCaptureCheckpointProtectsBeforeCappedEventsBecomePublishable(t *testing
 	if third.CheckpointID != second.CheckpointID || third.EventsAppended != 0 {
 		t.Fatalf("unchanged saturated pass churned checkpoint: second=%+v third=%+v", second, third)
 	}
+
+	if err := RequireProtectionCheckpoint(
+		context.Background(), f.db, opts.WorktreeID, 14); err != nil {
+		t.Fatal(err)
+	}
+	opts.ObservationEpoch = 14
+	barrier, err := Capture(context.Background(), f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if barrier.CheckpointID == third.CheckpointID || barrier.EventsAppended != 0 {
+		t.Fatalf("required barrier reused checkpoint: third=%+v barrier=%+v", third, barrier)
+	}
+	if _, ok, err := state.MetaGet(context.Background(), f.db,
+		requiredProtectionCheckpointEpochKey(opts.WorktreeID)); err != nil || ok {
+		t.Fatalf("required checkpoint marker remains: ok=%t err=%v", ok, err)
+	}
 }
 
 func TestProtectWorktreeCheckpointsDetachedStateWithoutPublicationEvents(t *testing.T) {

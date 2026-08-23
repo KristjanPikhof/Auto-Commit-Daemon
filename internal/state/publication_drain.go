@@ -78,6 +78,92 @@ type PublicationDrainReadOnlyProjection struct {
 	Latest        *PublicationDrain
 }
 
+// PublicationDrainReconciliation describes a drain whose immutable target is
+// already fully resolved. PreviousPhase records the durable phase observed
+// before completion.
+type PublicationDrainReconciliation struct {
+	ID             string
+	CheckpointID   string
+	PreviousPhase  string
+	TargetEvents   int64
+	ResolvedEvents int64
+	CommitCount    int64
+}
+
+// ResolvedPublicationDrainCandidates returns drains that can be completed
+// without touching Git. Callers use this for read-only recovery planning.
+func ResolvedPublicationDrainCandidates(
+	ctx context.Context,
+	conn *sql.DB,
+) ([]PublicationDrainReconciliation, error) {
+	if conn == nil {
+		return nil, errors.New(
+			"state: ResolvedPublicationDrainCandidates: nil database")
+	}
+	return resolvedPublicationDrainCandidates(ctx, conn)
+}
+
+// ReconcileResolvedPublicationDrains completes every drain whose frozen
+// membership is already fully published or recovered. The proof and phase
+// transition share one transaction so concurrent publication cannot produce
+// a partial result.
+func ReconcileResolvedPublicationDrains(
+	ctx context.Context,
+	db *DB,
+	completedTS float64,
+) ([]PublicationDrainReconciliation, error) {
+	if db == nil {
+		return nil, errors.New(
+			"state: ReconcileResolvedPublicationDrains: nil db")
+	}
+	if completedTS <= 0 {
+		completedTS = nowSeconds()
+	}
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"state: begin resolved publication drain reconciliation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	candidates, err := resolvedPublicationDrainCandidates(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	reconciled := make([]PublicationDrainReconciliation, 0, len(candidates))
+	for _, candidate := range candidates {
+		result, err := tx.ExecContext(ctx, `
+UPDATE publication_drains
+SET phase='completed', published_event_count=?, commit_count=?,
+    last_error='', updated_ts=MAX(updated_ts,?),
+    last_progress_ts=MAX(last_progress_ts,?), completed_ts=?
+WHERE id=? AND phase=? AND target_event_count=?`,
+			candidate.ResolvedEvents, candidate.CommitCount,
+			completedTS, completedTS, completedTS, candidate.ID,
+			candidate.PreviousPhase, candidate.TargetEvents)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"state: complete resolved publication drain %s: %w",
+				candidate.ID, err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf(
+				"state: count resolved publication drain %s: %w",
+				candidate.ID, err)
+		}
+		if changed != 1 {
+			return nil, ErrPublicationDrainPhase
+		}
+		reconciled = append(reconciled, candidate)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf(
+			"state: commit resolved publication drain reconciliation: %w", err)
+	}
+	return reconciled, nil
+}
+
 // PreparePublicationDrain inserts one immutable drain identity. Repeating the
 // exact request is idempotent; a changed identity for either ID fails closed.
 func PreparePublicationDrain(
@@ -515,6 +601,58 @@ func publicationDrainsQuery(
 		drains = append(drains, drain)
 	}
 	return drains, rows.Err()
+}
+
+type publicationDrainCandidateQuery interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func resolvedPublicationDrainCandidates(
+	ctx context.Context,
+	query publicationDrainCandidateQuery,
+) ([]PublicationDrainReconciliation, error) {
+	rows, err := query.QueryContext(ctx, `
+SELECT d.id,d.checkpoint_id,d.phase,d.target_event_count,
+       COUNT(e.seq) AS resolved_events,
+       COUNT(DISTINCT CASE
+           WHEN e.state='published' AND COALESCE(e.commit_oid,'')!=''
+           THEN e.commit_oid END) AS commit_count
+FROM publication_drains d
+JOIN checkpoints c ON c.id=d.checkpoint_id
+LEFT JOIN publication_drain_events de ON de.drain_id=d.id
+LEFT JOIN capture_events e ON e.seq=de.event_seq
+WHERE d.phase!='completed'
+  AND c.phase='completed'
+  AND (d.staged_consent=0 OR d.staged_consumed=1)
+GROUP BY d.id,d.checkpoint_id,d.phase,d.target_event_count
+HAVING COUNT(de.event_seq)=d.target_event_count
+   AND COUNT(e.seq)=d.target_event_count
+   AND COUNT(CASE WHEN e.state IN ('published','recovered') THEN 1 END)=
+       d.target_event_count
+ORDER BY d.created_ts,d.id`)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"state: query resolved publication drains: %w", err)
+	}
+	defer rows.Close()
+	var candidates []PublicationDrainReconciliation
+	for rows.Next() {
+		var candidate PublicationDrainReconciliation
+		if err := rows.Scan(
+			&candidate.ID, &candidate.CheckpointID,
+			&candidate.PreviousPhase, &candidate.TargetEvents,
+			&candidate.ResolvedEvents, &candidate.CommitCount,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"state: scan resolved publication drain: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"state: iterate resolved publication drains: %w", err)
+	}
+	return candidates, nil
 }
 
 func loadPublicationDrainEvents(

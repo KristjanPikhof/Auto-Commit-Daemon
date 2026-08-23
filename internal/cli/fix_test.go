@@ -19,6 +19,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+const fixCheckpointTestDigest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func TestFix_DefaultsToDryRunWhenNoFlagsPassed(t *testing.T) {
 	repo, stateDB, _ := makeRegisteredGitRepoStateDB(t)
 	before, err := fileSHA256(stateDB)
@@ -68,6 +70,44 @@ func TestFix_DryRunPlansExactPairWithoutMutation(t *testing.T) {
 	}
 	if before != after {
 		t.Fatalf("dry-run mutated state.db: before=%s after=%s", before, after)
+	}
+}
+
+func TestFix_ReconcilesResolvedPublicationDrain(t *testing.T) {
+	ctx := context.Background()
+	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+	drainID, checkpointID := seedResolvedFixPublicationDrain(t, ctx, repo, db)
+	before, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dryRun := runFixJSON(t, repo, true, false, false, false)
+	action := findFixAction(dryRun, fixActionCompleteResolvedDrain)
+	if action == nil || action.DrainID != drainID ||
+		action.CheckpointID != checkpointID || valueOrZero(action.TargetEvents) != 1 ||
+		valueOrZero(action.ResolvedEvents) != 1 || action.Applied {
+		t.Fatalf("resolved drain dry-run action=%+v", action)
+	}
+	afterDryRun, err := fileSHA256(stateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != afterDryRun {
+		t.Fatalf("resolved drain dry-run mutated state: before=%s after=%s",
+			before, afterDryRun)
+	}
+
+	applied := runFixJSON(t, repo, false, true, false, false)
+	action = findFixAction(applied, fixActionCompleteResolvedDrain)
+	if action == nil || !action.Applied || action.RowsChanged != 1 ||
+		applied.RowsChanged != 1 || applied.BackupPath == "" {
+		t.Fatalf("resolved drain apply=%+v action=%+v", applied, action)
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, drainID)
+	if err != nil || drain.Phase != state.PublicationDrainCompleted ||
+		drain.PublishedEventCount != 1 || drain.LastError != "" {
+		t.Fatalf("resolved drain after fix=%+v err=%v", drain, err)
 	}
 }
 
@@ -1177,6 +1217,63 @@ func findFixAction(plan fixPlan, kind string) *fixAction {
 		}
 	}
 	return nil
+}
+
+func seedResolvedFixPublicationDrain(
+	t *testing.T,
+	ctx context.Context,
+	repo string,
+	db *state.DB,
+) (string, string) {
+	t.Helper()
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.SQL().ExecContext(ctx, `
+INSERT INTO capture_events(
+ branch_ref,branch_generation,base_head,operation,path,fidelity,captured_ts,
+ state,commit_oid,published_ts
+) VALUES('refs/heads/main',1,?,'modify','resolved.txt','exact',1,
+         'published',?,2)`, head, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const checkpointID = "cp-1787439000000-0123456789abcdef"
+	checkpoint := state.Checkpoint{
+		ID: checkpointID, OperationID: "op-fix-resolved-drain",
+		WorktreeID: "0123456789abcdef", Reason: state.CheckpointReasonManualBarrier,
+		ObservationEpoch: 1, CoverageEpoch: 1, ObservedHead: head,
+		ObservedRef: "refs/heads/main", TreeOID: head, CommitOID: head,
+		Ref:       "refs/acd/checkpoints/v1/0123456789abcdef/" + checkpointID,
+		CreatedTS: 1, EventSeqs: []int64{seq},
+	}
+	if created, err := state.PrepareCheckpoint(
+		ctx, db, checkpoint, fixCheckpointTestDigest); err != nil || !created {
+		t.Fatalf("prepare checkpoint=(%t,%v)", created, err)
+	}
+	if err := state.CompleteCheckpoint(
+		ctx, db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 2); err != nil {
+		t.Fatal(err)
+	}
+	const drainID = "drain-cp-1787439000000-0123456789abcdef"
+	drain := state.PublicationDrain{
+		ID: drainID, CheckpointID: checkpoint.ID,
+		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: 1, Phase: state.PublicationDrainNeedsAction,
+		TargetEventCount: 1, LastError: "forced_capture_deferred",
+		StagedConsent: true, StagedConsumed: true,
+		CreatedTS: 3, UpdatedTS: 3, LastProgressTS: 3,
+		EventSeqs: []int64{seq},
+	}
+	if created, err := state.PreparePublicationDrain(ctx, db, drain); err != nil || !created {
+		t.Fatalf("prepare drain=(%t,%v)", created, err)
+	}
+	return drainID, checkpointID
 }
 
 func commitExternalSeedChange(t *testing.T, ctx context.Context, repo string) (parent, head, beforeOID, afterOID string) {

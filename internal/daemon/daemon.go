@@ -766,6 +766,11 @@ func Run(ctx context.Context, opts Options) error {
 	if err := checkpointStore.RecoverRetention(ctx, opts.RepoPath); err != nil {
 		return fmt.Errorf("daemon: recover checkpoint retention: %w", err)
 	}
+	if _, err := reconcileResolvedPublicationDrains(
+		ctx, opts.DB, logger, "worker_startup", now(),
+	); err != nil {
+		return fmt.Errorf("daemon: reconcile resolved publication drains: %w", err)
+	}
 	// Do not advertise running until every crash journal has been recovered;
 	// setup and status use this stamp as the worker readiness barrier.
 	heartbeatNow("running", "daemon started")
@@ -2419,6 +2424,11 @@ func Run(ctx context.Context, opts Options) error {
 				branchTransitionSettleUntil = time.Time{}
 			}
 		}
+		if _, err := reconcileResolvedPublicationDrains(
+			ctx, opts.DB, logger, "run_loop", now(),
+		); err != nil {
+			logger.Warn("reconcile resolved publication drains", "err", err.Error())
+		}
 
 		// 4f. Capture pass.
 		//
@@ -2726,6 +2736,11 @@ func Run(ctx context.Context, opts Options) error {
 					}
 				}
 			}
+			if _, reconcileErr := reconcileResolvedPublicationDrains(
+				passCtx, opts.DB, logger, "replay_settled", now(),
+			); reconcileErr != nil {
+				repErr = errors.Join(repErr, reconcileErr)
+			}
 		}
 		if opts.OperationGate != nil {
 			opts.OperationGate.RUnlock()
@@ -2965,6 +2980,38 @@ func logPublicationDrainTransition(
 		"resolved_events", drain.PublishedEventCount,
 		"target_events", drain.TargetEventCount,
 		"reason", drain.LastError)
+}
+
+func reconcileResolvedPublicationDrains(
+	ctx context.Context,
+	db *state.DB,
+	logger *slog.Logger,
+	trigger string,
+	now time.Time,
+) (int, error) {
+	candidates, err := state.ResolvedPublicationDrainCandidates(ctx, db.ReadSQL())
+	if err != nil {
+		return 0, err
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+	reconciled, err := state.ReconcileResolvedPublicationDrains(
+		ctx, db, float64(now.UnixNano())/1e9)
+	if err != nil {
+		return 0, err
+	}
+	for _, drain := range reconciled {
+		if logger != nil {
+			logger.Info("completed resolved publication drain",
+				"drain_id", drain.ID,
+				"from_phase", drain.PreviousPhase,
+				"resolved_events", drain.ResolvedEvents,
+				"target_events", drain.TargetEvents,
+				"trigger", trigger)
+		}
+	}
+	return len(reconciled), nil
 }
 
 func (c *daemonLogContext) SetBranch(branchRef string, generation int64) {
