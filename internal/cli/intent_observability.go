@@ -114,6 +114,9 @@ type intentStrategyReport struct {
 	UnresolvedCaptureCount            int                                 `json:"unresolved_capture_count,omitempty"`
 	PreservedGroupCount               int                                 `json:"preserved_group_count,omitempty"`
 	ResolutionMode                    string                              `json:"resolution_mode,omitempty"`
+	PreflightState                    string                              `json:"preflight_state,omitempty"`
+	PreflightFindingCodes             []string                            `json:"preflight_finding_codes,omitempty"`
+	ProviderCallSkippedReason         string                              `json:"provider_call_skipped_reason,omitempty"`
 	RecoveryReady                     bool                                `json:"recovery_ready,omitempty"`
 	LastPlannerWindow                 *intentPlannerWindowSummary         `json:"last_planner_window,omitempty"`
 	// PlannerErrorRateRecent is the share of intent_planner_error rows in
@@ -959,6 +962,11 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 				win.PlanAttemptLimit, win.UnresolvedCaptureCount,
 				win.PreservedGroupCount)
 		}
+		if win.PreflightState != "" {
+			fmt.Fprintf(out, "  Plan preflight: %s findings=%s provider_call_skipped=%s\n",
+				win.PreflightState, valueOrUnset(strings.Join(win.FindingCodes, ",")),
+				valueOrUnset(win.ProviderCallSkipped))
+		}
 		if len(win.HiddenSeqs) > 0 {
 			fmt.Fprintf(out, "  Hidden/coalesced seqs: %s\n", formatSeqs(win.HiddenSeqs))
 		}
@@ -1119,6 +1127,10 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 			report.UnresolvedCaptureCount = lastWindow.UnresolvedCaptureCount
 			report.PreservedGroupCount = lastWindow.PreservedGroupCount
 			report.ResolutionMode = lastWindow.ResolutionMode
+			report.PreflightState = lastWindow.PreflightState
+			report.PreflightFindingCodes = append([]string(nil),
+				lastWindow.FindingCodes...)
+			report.ProviderCallSkippedReason = lastWindow.ProviderCallSkipped
 		}
 	}
 	ok, err := sqliteTableExists(ctx, conn, "planner_state")

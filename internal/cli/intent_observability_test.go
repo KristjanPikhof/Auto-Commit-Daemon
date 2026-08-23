@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +111,21 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AppendIntentPlannerWindow: %v", err)
 	}
+	run, err := state.EnsureIntentPlanRun(ctx, d, state.IntentPlanRun{
+		Fingerprint: "sha256:preflight", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Provider: sqlNullStr("openai-compat"),
+		Model:        sqlNullStr("gpt-test"),
+		AttemptLimit: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.ProgressState = sqlNullStr("preflight_blocked")
+	run.ResolutionMode = sqlNullStr("local_preflight")
+	run.FindingCodes = []string{"open_candidate_cap_exceeded"}
+	if err := state.UpdateIntentPlanRun(ctx, d, run); err != nil {
+		t.Fatal(err)
+	}
 
 	report := runStatusJSON(ctx, t, repo)
 	win := report.IntentStrategy.LastPlannerWindow
@@ -122,12 +138,18 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 		!strings.Contains(win.ValidationFailure, "[REDACTED]") {
 		t.Fatalf("last planner window seq/failure fields = %+v", win)
 	}
+	if win.PreflightState != "preflight_blocked" ||
+		win.ProviderCallSkipped != "invalid_local_baseline" ||
+		!reflect.DeepEqual(win.FindingCodes,
+			[]string{"open_candidate_cap_exceeded"}) {
+		t.Fatalf("last planner preflight fields = %+v", win)
+	}
 
 	var human bytes.Buffer
 	if err := runStatus(ctx, &human, repo, false); err != nil {
 		t.Fatalf("runStatus human: %v", err)
 	}
-	for _, want := range []string{"Last planner window", "offered=4,5", "Hidden/coalesced seqs: 6", "Validation fallback"} {
+	for _, want := range []string{"Last planner window", "offered=4,5", "Hidden/coalesced seqs: 6", "Validation fallback", "Plan preflight", "provider_call_skipped=invalid_local_baseline"} {
 		if !strings.Contains(human.String(), want) {
 			t.Fatalf("status human missing %q:\n%s", want, human.String())
 		}

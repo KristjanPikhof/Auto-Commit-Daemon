@@ -117,6 +117,9 @@ type IntentCandidateEvaluationResult struct {
 	PreservedGroupCount    int
 	ResolutionMode         string
 	PlanFingerprint        string
+	PreflightState         string
+	FindingCodes           []string
+	ProviderCallSkipped    string
 	NeedsAttention         bool
 	Boundaries             []state.IntentActivityBoundary
 	Dependencies           []state.IntentCaptureDependency
@@ -301,6 +304,17 @@ func EvaluateIntentCandidates(
 		chooseIntentCandidatePlan(ctx, req, input.Planner, input.Health,
 			input.RetryLimit, input.Preset, existing, db, input)
 	if err != nil {
+		result.PlanAttempt = planRun.AttemptCount
+		result.PlanAttemptLimit = planRun.AttemptLimit
+		result.UnresolvedCaptureCount = len(planRun.UnresolvedSeqs)
+		result.PreservedGroupCount = len(planRun.PreservedGroups)
+		result.ResolutionMode = planRun.ResolutionMode.String
+		result.PlanFingerprint = planRun.Fingerprint
+		result.PreflightState = planRun.ProgressState.String
+		result.FindingCodes = append([]string(nil), planRun.FindingCodes...)
+		if planRun.ProgressState.String == "preflight_blocked" {
+			result.ProviderCallSkipped = "invalid_local_baseline"
+		}
 		return result, err
 	}
 	result.ProtocolVersion = plan.ProtocolVersion

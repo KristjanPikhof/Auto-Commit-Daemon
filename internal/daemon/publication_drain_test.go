@@ -574,6 +574,46 @@ func TestPublicationDrainFallbackNoProgressNeedsAttention(t *testing.T) {
 	}
 }
 
+func TestPublicationDrainPreflightFailureUsesLocalRecovery(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 2, 2)
+	planRun, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
+		Fingerprint: "sha256:blocked-preflight",
+		BranchRef:   drain.BranchRef, BranchGeneration: drain.BranchGeneration,
+		AttemptLimit: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainSemantic
+	drain, err = state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, ReplaySummary{}, &IntentPlanPreflightError{
+			Failure: "open candidate cap exceeded",
+		}, time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Phase != state.PublicationDrainNormalizing ||
+		normalized.SemanticRebuildAttempts != 1 ||
+		normalized.LastError == "" {
+		t.Fatalf("normalized=%+v", normalized)
+	}
+	var attemptCount int
+	err = db.ReadSQL().QueryRowContext(ctx, `
+SELECT attempt_count FROM intent_plan_runs WHERE fingerprint=?`,
+		planRun.Fingerprint).Scan(&attemptCount)
+	if err != nil || attemptCount != 0 {
+		t.Fatalf("replay recovery consumed provider attempt: attempts=%d err=%v",
+			attemptCount, err)
+	}
+}
+
 func TestPublicationDrainTerminalBarrierNeedsAction(t *testing.T) {
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 1, 1)

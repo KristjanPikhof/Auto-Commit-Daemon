@@ -750,7 +750,9 @@ func UpdatePublicationDrainAfterReplay(
 	if replayErr != nil {
 		update.LastError = replayErr.Error()
 		var exhausted *IntentSemanticFallbackRequiredError
-		if errors.As(replayErr, &exhausted) {
+		var preflight *IntentPlanPreflightError
+		if errors.As(replayErr, &exhausted) ||
+			errors.As(replayErr, &preflight) {
 			if drain.Phase == state.PublicationDrainSemantic {
 				update.Phase = state.PublicationDrainNormalizing
 				update.SemanticRebuildAttempts++

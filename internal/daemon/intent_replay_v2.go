@@ -122,7 +122,9 @@ func replayIntentCandidateBatch(
 		RejectLocalFallback: cfg.semanticSalvage,
 	})
 	var semanticFallbackErr *IntentSemanticFallbackRequiredError
-	if err != nil && !errors.As(err, &semanticFallbackErr) {
+	var preflightErr *IntentPlanPreflightError
+	if err != nil && !errors.As(err, &semanticFallbackErr) &&
+		!errors.As(err, &preflightErr) {
 		return sum, err
 	}
 	if cfg.atomicFallback {
@@ -140,6 +142,9 @@ func replayIntentCandidateBatch(
 	windowCfg.unresolvedCaptureCount = evaluation.UnresolvedCaptureCount
 	windowCfg.preservedGroupCount = evaluation.PreservedGroupCount
 	windowCfg.resolutionMode = evaluation.ResolutionMode
+	if preflightErr != nil {
+		evaluation.PlannerFailure = preflightErr.Error()
+	}
 	windowPlan := intentCandidatePlannerWindowPlan(
 		legacyRequest, evaluation)
 	if evaluation.PlannerFailure != "" {
@@ -159,6 +164,9 @@ func replayIntentCandidateBatch(
 	}
 	if semanticFallbackErr != nil {
 		return sum, semanticFallbackErr
+	}
+	if preflightErr != nil {
+		return sum, preflightErr
 	}
 	if evaluation.PlannerFailure != "" && evaluation.NeedsAttention {
 		sum.PlannerFailure = evaluation.PlannerFailure
