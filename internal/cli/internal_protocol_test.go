@@ -195,7 +195,7 @@ INSERT INTO capture_events(
 
 func TestFreezePublicationDrainTargetUsesCheckpointPair(t *testing.T) {
 	ctx := context.Background()
-	repo := materializeTestRepo(t, false)
+	repo := materializeTestRepo(t, true)
 	db, err := state.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -223,6 +223,7 @@ INSERT INTO capture_events(
 		{State: state.EventStateRecovered},
 		{State: state.EventStateFailed},
 	})
+	alignCheckpointHead(t, db, repo, checkpointID)
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +264,7 @@ INSERT INTO capture_events(
 
 func TestFreezeEmptyPublicationDrainTargetRequiresCurrentGeneration(t *testing.T) {
 	ctx := context.Background()
-	repo := materializeTestRepo(t, false)
+	repo := materializeTestRepo(t, true)
 	db, err := state.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -271,6 +272,7 @@ func TestFreezeEmptyPublicationDrainTargetRequiresCurrentGeneration(t *testing.T
 	defer db.Close()
 	worktreeID := checkpointpkg.WorktreeID(repo)
 	insertCompletedCheckpoint(t, db, "cp-empty", worktreeID, nil)
+	alignCheckpointHead(t, db, repo, "cp-empty")
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "99"); err != nil {
 		t.Fatal(err)
 	}
@@ -291,6 +293,32 @@ func TestFreezeEmptyPublicationDrainTargetRequiresCurrentGeneration(t *testing.T
 	if target.BranchRef != "refs/heads/main" || target.Generation != 7 ||
 		len(target.EventSeqs) != 0 || target.EventSeqs == nil {
 		t.Fatalf("empty target=%+v", target)
+	}
+}
+
+func TestFreezePublicationDrainTargetRequiresCheckpointHead(t *testing.T) {
+	ctx := context.Background()
+	repo := materializeTestRepo(t, true)
+	db, err := state.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	worktreeID := checkpointpkg.WorktreeID(repo)
+	insertCompletedCheckpoint(t, db, "cp-head", worktreeID, nil)
+	alignCheckpointHead(t, db, repo, "cp-head")
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"commit", "--allow-empty", "-q", "-m", "external commit"); err != nil {
+		t.Fatal(err)
+	}
+	anchor := publicationDrainTarget{BranchRef: "refs/heads/main", Generation: 7}
+	if _, err := freezePublicationDrainTarget(
+		ctx, db, repo, "cp-head", worktreeID, 1, anchor); err == nil ||
+		!strings.Contains(err.Error(), "without a completed ACD publication chain") {
+		t.Fatalf("HEAD mismatch error=%v", err)
 	}
 }
 
