@@ -351,25 +351,48 @@ INSERT INTO capture_events(
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
 	}
+	head, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"rev-parse", "--verify", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
 	var wakeErr error
+	var freshCheckpointOnce sync.Once
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
 		}},
 		wake: func(string) {
-			accepted, _, err := state.MetaGet(ctx, db, daemon.MetaKeyProtectionObservationEpoch)
-			if err != nil {
-				wakeErr = err
-				return
-			}
-			_, publishErr := db.SQL().ExecContext(ctx, `
+			freshCheckpointOnce.Do(func() {
+				accepted, _, metaErr := state.MetaGet(
+					ctx, db, daemon.MetaKeyProtectionObservationEpoch)
+				if metaErr != nil {
+					wakeErr = metaErr
+					return
+				}
+				_, publishErr := db.SQL().ExecContext(ctx, `
 UPDATE capture_events SET state='published',commit_oid='backlog-commit' WHERE seq=?`, backlogSeq)
-			wakeErr = errors.Join(
-				publishErr,
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID, "cp-empty-backlog"),
-			)
+				_, operationErr := db.SQL().ExecContext(ctx, `
+INSERT INTO operations(id,kind,worktree_id,phase,status,created_ts,updated_ts)
+VALUES('op-cp-empty-fresh', 'checkpoint', ?, 'completed', 'completed', 2, 2)`,
+					worktreeID)
+				_, checkpointErr := db.SQL().ExecContext(ctx, `
+INSERT INTO checkpoints(
+ id,seq,operation_id,worktree_id,reason,observation_epoch,coverage_epoch,
+ observed_head,observed_ref,tree_oid,commit_oid,checkpoint_ref,phase,
+ created_ts,completed_ts
+) VALUES(
+ 'cp-empty-fresh',2,'op-cp-empty-fresh',?,'manual_barrier',?,?,?,
+ 'refs/heads/main','tree-fresh','commit-fresh',
+ 'refs/acd/checkpoints/cp-empty-fresh','completed',2,2
+)`, worktreeID, accepted, accepted, strings.TrimSpace(string(head)))
+				wakeErr = errors.Join(
+					publishErr, operationErr, checkpointErr,
+					state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
+					state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
+					state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID, "cp-empty-fresh"),
+				)
+			})
 		},
 	}
 	params, err := json.Marshal(map[string]bool{"drain_publication": true})
