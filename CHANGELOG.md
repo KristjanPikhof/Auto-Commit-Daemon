@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Intent planning now validates a local hard-dependency baseline before it
+  reserves a provider attempt. Native v2 providers can refine that baseline,
+  while invalid local state records a skipped call with its finding codes.
+- Planner diagnostics now separate provider attempts from replay-error repeats
+  and report preflight, cache rebuild, and provider-skip outcomes.
 - Updated Lip Gloss to 2.0.6 and ANSI to 0.11.8 for terminal rendering fixes.
   SQLite 1.56.0 includes the upstream journal rollback correction, and CI and
   release workflows now use `actions/checkout` 7.0.1.
@@ -14,6 +19,13 @@
 
 ### Fixed
 
+- Forced `commit-all` no longer reuses a cached non-forced waiting plan. Plan
+  identity now covers the complete planning snapshot, including forced aging
+  and hashed captured diffs.
+- Invalid planner output now keeps proven groups, repairs safe dependency and
+  forced-aging findings locally, and returns to a validated local grouping
+  after bounded corrections. Recoverable preflight failures enter local drain
+  recovery instead of immediately requiring manual action.
 - Publication barriers now require a new completed checkpoint for the exact
   worktree, branch, observation, and `HEAD`. A same-branch commit can no longer
   make stale checkpoint proof eligible for publication.

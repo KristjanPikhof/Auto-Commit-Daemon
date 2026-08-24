@@ -171,6 +171,7 @@ type IntentPlanRequestV2 struct {
 	ActivityBoundaries     []IntentActivityBoundary      `json:"activity_boundaries,omitempty"`
 	RecentSoftCommits      []IntentSoftCommitSummary     `json:"recent_soft_commits,omitempty"`
 	PriorAtomicityFindings []IntentAtomicityFinding      `json:"prior_atomicity_findings,omitempty"`
+	BaselineCandidates     []IntentCandidateAssignment   `json:"baseline_candidates,omitempty"`
 	ForcedAging            bool                          `json:"forced_aging,omitempty"`
 	CommitFormat           CommitFormat                  `json:"commit_format,omitempty"`
 	CapturedDiffTransform  prompttrace.TransformMetadata `json:"-"`
@@ -188,6 +189,7 @@ type IntentPlanRequestV2Options struct {
 	ActivityBoundaries     []IntentActivityBoundary
 	RecentSoftCommits      []IntentSoftCommitSummary
 	PriorAtomicityFindings []IntentAtomicityFinding
+	BaselineCandidates     []IntentCandidateAssignment
 	ForcedAging            bool
 	IncludeCapturedDiffs   bool
 	CommitFormat           CommitFormat
@@ -325,6 +327,7 @@ func NewIntentPlanRequestV2(opts IntentPlanRequestV2Options) (IntentPlanRequestV
 		ActivityBoundaries:     append([]IntentActivityBoundary(nil), opts.ActivityBoundaries...),
 		RecentSoftCommits:      cloneSoftCommitSummaries(opts.RecentSoftCommits),
 		PriorAtomicityFindings: normalizeAtomicityFindings(opts.PriorAtomicityFindings),
+		BaselineCandidates:     cloneIntentCandidateAssignments(opts.BaselineCandidates),
 		ForcedAging:            legacy.ForcedAging,
 		CommitFormat:           legacy.CommitFormat,
 		CapturedDiffTransform:  legacy.CapturedDiffTransform,
@@ -372,14 +375,20 @@ func PlanIntentV2WithCompatibility(ctx context.Context, planner interface{ Name(
 
 func cloneIntentPlanV2Value(plan IntentPlanV2) IntentPlanV2 {
 	clone := plan
-	clone.Candidates = append([]IntentCandidateAssignment(nil), plan.Candidates...)
-	for i := range clone.Candidates {
-		clone.Candidates[i].SelectedSeqs = append(
-			[]int64(nil), plan.Candidates[i].SelectedSeqs...)
-		clone.Candidates[i].MissingCompanions = append(
-			[]string(nil), plan.Candidates[i].MissingCompanions...)
-		clone.Candidates[i].DependsOnCandidates = append(
-			[]string(nil), plan.Candidates[i].DependsOnCandidates...)
+	clone.Candidates = cloneIntentCandidateAssignments(plan.Candidates)
+	return clone
+}
+
+func cloneIntentCandidateAssignments(
+	candidates []IntentCandidateAssignment,
+) []IntentCandidateAssignment {
+	clone := append([]IntentCandidateAssignment(nil), candidates...)
+	for i := range clone {
+		clone[i].SelectedSeqs = append([]int64(nil), candidates[i].SelectedSeqs...)
+		clone[i].MissingCompanions = append(
+			[]string(nil), candidates[i].MissingCompanions...)
+		clone[i].DependsOnCandidates = append(
+			[]string(nil), candidates[i].DependsOnCandidates...)
 	}
 	return clone
 }
@@ -530,6 +539,16 @@ func ValidateIntentPlanRequestV2(req IntentPlanRequestV2) error {
 		}
 		if err := validateContextPaths(commit.Paths); err != nil {
 			return fmt.Errorf("intent planner v2: recent_soft_commits[%d]: %w", i, err)
+		}
+	}
+	if len(req.BaselineCandidates) > 0 {
+		baselineReq := req
+		baselineReq.BaselineCandidates = nil
+		if err := ValidateIntentPlanV2(baselineReq, IntentPlanV2{
+			ProtocolVersion: IntentPlannerProtocolV2,
+			Candidates:      req.BaselineCandidates,
+		}); err != nil {
+			return fmt.Errorf("intent planner v2: baseline_candidates: %w", err)
 		}
 	}
 	return nil

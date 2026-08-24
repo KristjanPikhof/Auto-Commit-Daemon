@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -721,6 +722,9 @@ func TestIntentCandidateEnginePreservesValidGroupsDuringPartialReplan(t *testing
 	}
 	if planner.calls != 2 || len(planner.reqs[1].OfferedCaptures) != 1 ||
 		planner.reqs[1].OfferedCaptures[0].Seq != second.Event.Seq ||
+		len(planner.reqs[1].BaselineCandidates) != 1 ||
+		!reflect.DeepEqual(planner.reqs[1].BaselineCandidates[0].SelectedSeqs,
+			[]int64{second.Event.Seq}) ||
 		result.ResolutionMode != "partial_replan" || result.PreservedGroupCount != 1 ||
 		len(result.Decisions) != 2 {
 		t.Fatalf("partial replan requests=%+v result=%+v", planner.reqs, result)
@@ -971,7 +975,7 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.PlannerFailure != "" ||
+	if !strings.Contains(second.PlannerFailure, "circuit open") ||
 		second.Fallback != "waiting_message_rewrite" ||
 		second.ResolutionMode != "waiting_message_rewrite" ||
 		!second.NeedsAttention || second.Decisions[0].Publishable ||
@@ -1215,6 +1219,551 @@ func TestIntentCandidatePlanReusesCompletedResolution(t *testing.T) {
 	if !reflect.DeepEqual(first, second) || !firstRun.ResolvedPlanJSON.Valid {
 		t.Fatalf("reused plan differs: first=%+v second=%+v run=%+v",
 			first, second, firstRun)
+	}
+}
+
+func TestIntentCandidateCachedPlanDoesNotAcquireHalfOpenProbe(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	clock := newIntentHealthClock()
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "cached", SelectedSeqs: []int64{1},
+			Purpose: "cache valid plan", Readiness: ai.IntentCandidateReady,
+			Subject: "Cache valid plan", GroupingReason: "complete capture",
+		}},
+	}}
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{
+		Provider: IntentPlannerProviderIdentity{Provider: planner.Name()},
+		Now:      clock.Now,
+	})
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "a.go", Op: "modify"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetFast, Provider: planner.Name(),
+	}
+	if _, _, _, _, _, _, _, err := chooseIntentCandidatePlan(
+		ctx, req, planner, health, 0, config.PresetFast, nil, db, input); err != nil {
+		t.Fatal(err)
+	}
+	permit, err := health.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := health.Complete(ctx, permit, &IntentPlannerTransportFailure{
+		Err: errors.New("offline"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(30 * time.Second)
+	if _, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, health, 0, config.PresetFast, nil, db, input); err != nil {
+		t.Fatal(err)
+	} else if run.ResolutionMode.String != "completed_plan_reuse" {
+		t.Fatalf("run=%+v", run)
+	}
+	if snapshot := health.Snapshot(); snapshot.State != IntentPlannerCircuitOpen {
+		t.Fatalf("cached reuse changed planner health: %+v", snapshot)
+	}
+}
+
+func TestIntentCandidatePlanFingerprintIncludesPlanningReality(t *testing.T) {
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		LatestCommit: &ai.CommitSummary{
+			OID: "head", Subject: "Previous change", Paths: []string{"a.go"},
+		},
+		PathCommitContext: []ai.PathCommitContext{{
+			Path: "a.go", Commits: []ai.CommitSummary{{
+				OID: "older", Subject: "Older change",
+			}},
+		}},
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "a.go", Op: "modify", Fidelity: "full",
+			CapturedDiff: "private diff", DeferCount: 1,
+		}, {
+			Seq: 2, Path: "b.go", Op: "modify", Fidelity: "full",
+		}},
+		Candidates: []ai.IntentCandidateSummary{{
+			CandidateID: "candidate", Status: state.IntentCandidateWaiting,
+			Purpose: "finish behavior", SelectedSeqs: []int64{1},
+			Paths: []string{"a.go"}, MissingCompanions: []string{"a_test.go"},
+		}},
+		Dependencies: []ai.IntentCaptureDependency{{
+			FromSeq: 1, ToSeq: 2, Strength: ai.IntentDependencySoft,
+			Kind: "reference", EvidenceHash: "sha256:evidence",
+		}},
+		ActivityBoundaries: []ai.IntentActivityBoundary{{
+			Epoch: "7", Kind: "soft",
+		}},
+		RecentSoftCommits: []ai.IntentSoftCommitSummary{{
+			CandidateID: "recent", OID: "commit", Subject: "Recent change",
+			Paths: []string{"a.go"},
+		}},
+		PriorAtomicityFindings: []ai.IntentAtomicityFinding{{
+			CandidateID: "candidate", Gate: ai.IntentAtomicityCompleteness,
+			Code: "candidate_waiting", Summary: "waiting for test",
+		}},
+		CommitFormat: ai.CommitFormatImperative,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 4,
+		Provider: "provider", Model: "model", Preset: config.PresetBalanced,
+		CommitFormat: ai.CommitFormatImperative, PresetVersion: 3,
+		ConfigRevisionID: sql.NullInt64{Int64: 9, Valid: true},
+		VerificationMode: "structural", IncludeDiffs: true,
+	}
+	fingerprint := func(request ai.IntentPlanRequestV2, evaluation IntentCandidateEvaluation) string {
+		t.Helper()
+		run, runErr := newIntentPlanRun(request, evaluation, 3)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		return run.Fingerprint
+	}
+	base := fingerprint(req, input)
+	if !strings.HasPrefix(base, "sha256:") || len(base) != len("sha256:")+64 {
+		t.Fatalf("fingerprint=%q want versioned sha256 token", base)
+	}
+	if got := fingerprint(req, input); got != base {
+		t.Fatalf("stable fingerprint=%q want %q", got, base)
+	}
+
+	forced := req
+	forced.ForcedAging = true
+	if got := fingerprint(forced, input); got == base {
+		t.Fatal("forced aging reused non-forced fingerprint")
+	}
+	changedCandidate := req
+	changedCandidate.Candidates = append(
+		[]ai.IntentCandidateSummary(nil), req.Candidates...)
+	changedCandidate.Candidates[0].MissingCompanions = []string{"different.go"}
+	if got := fingerprint(changedCandidate, input); got == base {
+		t.Fatal("candidate reality did not change fingerprint")
+	}
+	changedInput := input
+	changedInput.VerificationMode = "command"
+	if got := fingerprint(req, changedInput); got == base {
+		t.Fatal("verification mode did not change fingerprint")
+	}
+	changedDiff := req
+	changedDiff.OfferedCaptures = append(
+		[]ai.OfferedCapture(nil), req.OfferedCaptures...)
+	changedDiff.OfferedCaptures[0].CapturedDiff = "other private diff"
+	if got := fingerprint(changedDiff, input); got == base {
+		t.Fatal("captured diff digest did not change fingerprint")
+	}
+	if strings.Contains(base, "private diff") {
+		t.Fatalf("fingerprint leaked captured diff: %q", base)
+	}
+}
+
+func TestIntentCandidatePlanFingerprintCanonicalizesEquivalentSets(t *testing.T) {
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		PathCommitContext: []ai.PathCommitContext{
+			{Path: "b.go"}, {Path: "a.go"},
+		},
+		OfferedCaptures: []ai.OfferedCapture{
+			{Seq: 2, Path: "b.go", Op: "modify"},
+			{Seq: 1, Path: "a.go", Op: "modify"},
+		},
+		Candidates: []ai.IntentCandidateSummary{
+			{CandidateID: "b", Status: "waiting"},
+			{CandidateID: "a", Status: "waiting"},
+		},
+		Dependencies: []ai.IntentCaptureDependency{
+			{FromSeq: 2, ToSeq: 1, Strength: ai.IntentDependencySoft, Kind: "reference"},
+			{FromSeq: 1, ToSeq: 2, Strength: ai.IntentDependencySoft, Kind: "test_source"},
+		},
+		ActivityBoundaries: []ai.IntentActivityBoundary{
+			{Epoch: "b", Kind: "soft"}, {Epoch: "a", Kind: "soft"},
+		},
+		RecentSoftCommits: []ai.IntentSoftCommitSummary{
+			{CandidateID: "b", OID: "b", Subject: "B"},
+			{CandidateID: "a", OID: "a", Subject: "A"},
+		},
+		PriorAtomicityFindings: []ai.IntentAtomicityFinding{
+			{CandidateID: "b", Gate: ai.IntentAtomicityCompleteness, Code: "b", Summary: "b"},
+			{CandidateID: "a", Gate: ai.IntentAtomicityCompleteness, Code: "a", Summary: "a"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.BaselineCandidates = []ai.IntentCandidateAssignment{
+		{CandidateID: "b", SelectedSeqs: []int64{2}, Purpose: "b",
+			Readiness: ai.IntentCandidateReady, Subject: "Update b",
+			GroupingReason: "complete b"},
+		{CandidateID: "a", SelectedSeqs: []int64{1}, Purpose: "a",
+			Readiness: ai.IntentCandidateReady, Subject: "Update a",
+			GroupingReason: "complete a"},
+	}
+	reordered := req
+	reordered.PathCommitContext = reverseIntentSlice(req.PathCommitContext)
+	reordered.OfferedCaptures = reverseIntentSlice(req.OfferedCaptures)
+	reordered.Candidates = reverseIntentSlice(req.Candidates)
+	reordered.Dependencies = reverseIntentSlice(req.Dependencies)
+	reordered.ActivityBoundaries = reverseIntentSlice(req.ActivityBoundaries)
+	reordered.RecentSoftCommits = reverseIntentSlice(req.RecentSoftCommits)
+	reordered.PriorAtomicityFindings = reverseIntentSlice(req.PriorAtomicityFindings)
+	reordered.BaselineCandidates = reverseIntentSlice(req.BaselineCandidates)
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetFast,
+	}
+	left, err := newIntentPlanRun(req, input, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := newIntentPlanRun(reordered, input, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left.Fingerprint != right.Fingerprint {
+		t.Fatalf("equivalent sets fingerprint differently: %s != %s",
+			left.Fingerprint, right.Fingerprint)
+	}
+}
+
+func reverseIntentSlice[T any](values []T) []T {
+	reversed := append([]T(nil), values...)
+	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
+		reversed[left], reversed[right] = reversed[right], reversed[left]
+	}
+	return reversed
+}
+
+func TestIntentCandidatePlanPreflightBlocksProviderAttempt(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	candidates := make([]ai.IntentCandidateSummary, ai.IntentOpenCandidateCap)
+	for i := range candidates {
+		candidates[i] = ai.IntentCandidateSummary{
+			CandidateID:  fmt.Sprintf("existing-%03d", i),
+			Status:       "waiting",
+			SelectedSeqs: []int64{int64(i + 1)},
+		}
+	}
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1000, Path: "new.go", Op: "create",
+		}},
+		Candidates: candidates,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetFast, Provider: planner.Name(),
+	}
+	_, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
+	var preflight *IntentPlanPreflightError
+	if !errors.As(err, &preflight) {
+		t.Fatalf("error=%T %v", err, err)
+	}
+	if planner.calls != 0 || run.AttemptCount != 0 ||
+		run.ProgressState.String != "preflight_blocked" ||
+		run.ResolutionMode.String != "local_preflight" {
+		t.Fatalf("calls=%d run=%+v", planner.calls, run)
+	}
+}
+
+func TestIntentCandidatePlanPreflightBlocksFailedMaterialization(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "missing.go", Op: "create",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetFast, Provider: planner.Name(),
+		Captures: []IntentCandidateCapture{{
+			Event: state.CaptureEvent{Seq: 1, Path: "missing.go"},
+		}},
+		PreflightMaterialize: func(context.Context, []IntentCandidateCapture) error {
+			return errors.New("missing captured object")
+		},
+	}
+	_, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
+	var preflight *IntentPlanPreflightError
+	if !errors.As(err, &preflight) || planner.calls != 0 ||
+		run.AttemptCount != 0 || run.ProgressState.String != "preflight_blocked" {
+		t.Fatalf("calls=%d run=%+v err=%v", planner.calls, run, err)
+	}
+}
+
+func TestIntentCandidatePlanPreflightSuppliesValidBaseline(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "new.go", Op: "create",
+		}},
+		ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "new-change", SelectedSeqs: []int64{1},
+			Purpose: "complete new change", Readiness: ai.IntentCandidateReady,
+			Subject: "Add new change", GroupingReason: "one complete capture",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+	}
+	_, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 1 || run.AttemptCount != 1 ||
+		len(planner.req.BaselineCandidates) == 0 {
+		t.Fatalf("calls=%d run=%+v request=%+v", planner.calls, run, planner.req)
+	}
+	baselineReq := planner.req
+	baselineReq.BaselineCandidates = nil
+	if err := ai.ValidateIntentPlanV2(baselineReq, ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates:      planner.req.BaselineCandidates,
+	}); err != nil {
+		t.Fatalf("provider baseline invalid: %v", err)
+	}
+}
+
+func TestIntentCandidatePlanRepairsForcedDeferralFromBaseline(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "new.go", Op: "create",
+		}},
+		ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "new-change", SelectedSeqs: []int64{1},
+			Purpose: "complete new change", Readiness: ai.IntentCandidateWait,
+			MissingCompanions: []string{"model-only companion.go"},
+			GroupingReason:    "wait for an unsupported companion",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+		ForcedAging: true,
+	}
+	plan, fallback, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 2, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 1 || fallback != "repaired_forced_aging" ||
+		run.ResolutionMode.String != "local_repair" ||
+		len(plan.Candidates) != 1 ||
+		plan.Candidates[0].Readiness != ai.IntentCandidateReady ||
+		len(plan.Candidates[0].MissingCompanions) != 0 {
+		t.Fatalf("calls=%d fallback=%q run=%+v plan=%+v",
+			planner.calls, fallback, run, plan)
+	}
+}
+
+func TestIntentCandidateLocalRepairKeepsWaitingHardDependency(t *testing.T) {
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 2, Path: "model.go", Op: "modify",
+		}},
+		Candidates: []ai.IntentCandidateSummary{{
+			CandidateID: "migration", Status: "waiting",
+			SelectedSeqs: []int64{1}, Ready: false,
+		}},
+		Dependencies: []ai.IntentCaptureDependency{{
+			FromSeq: 1, ToSeq: 2, Strength: ai.IntentDependencyHard,
+			Kind: "migration_before_model",
+		}},
+		ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []ai.IntentCandidateAssignment{{
+		CandidateID: "model", SelectedSeqs: []int64{2},
+		Purpose: "update model", Readiness: ai.IntentCandidateReady,
+		Subject: "Update model", GroupingReason: "complete available capture",
+		DependsOnCandidates: []string{"migration"},
+	}}
+	model := baseline[0]
+	model.Readiness = ai.IntentCandidateWait
+	model.Subject = ""
+	model.MissingCompanions = []string{"migration must become ready"}
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates:      []ai.IntentCandidateAssignment{model},
+	}
+	findings := []ai.IntentAtomicityFinding{{
+		CandidateID: "model", Code: "forced_capture_deferred",
+	}}
+	if repaired, mode, ok := repairIntentCandidatePlanLocally(
+		req, baseline, plan, findings); ok {
+		t.Fatalf("unsafe repair mode=%q plan=%+v", mode, repaired)
+	}
+}
+
+func TestIntentCandidatePlanRebuildsInvalidCompletedResolution(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "service.go", Op: "modify",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{1},
+			Purpose: "fix service behavior", Readiness: ai.IntentCandidateReady,
+			Subject:        "Fix service behavior",
+			GroupingReason: "the capture contains the complete service fix",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+		CommitFormat: ai.CommitFormatImperative,
+	}
+	_, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
+		ctx, req, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := resolvedIntentPlanRun{Plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{99},
+			Purpose: "invalid cached membership", Readiness: ai.IntentCandidateReady,
+			Subject:        "Invalid cached membership",
+			GroupingReason: "the cached plan references an unavailable capture",
+		}},
+	}}
+	raw, err := json.Marshal(invalid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_plan_runs SET resolved_plan_json=?, completed=1
+WHERE fingerprint=?`, string(raw), run.Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+
+	result, fallback, failure, _, _, _, rebuilt, err :=
+		chooseIntentCandidatePlan(
+			ctx, req, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("planner calls=%d want cached rebuild without another call", planner.calls)
+	}
+	if fallback == "" || failure == "" || !rebuilt.Completed ||
+		len(result.Candidates) != 1 ||
+		result.Candidates[0].Readiness != ai.IntentCandidateReady {
+		t.Fatalf("rebuilt fallback=%q failure=%q run=%+v plan=%+v",
+			fallback, failure, rebuilt, result)
+	}
+}
+
+func TestIntentCandidatePlanDoesNotReuseWaitAfterForcedAging(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := ai.OfferedCapture{Seq: 1, Path: "service.go", Op: "modify"}
+	normalReq, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{capture},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{1},
+			Purpose: "wait for the matching test", Readiness: ai.IntentCandidateWait,
+			MissingCompanions: []string{"service_test.go"},
+			GroupingReason:    "the test is not captured yet",
+		}},
+	}}
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Preset: config.PresetBalanced, Provider: planner.Name(),
+		CommitFormat: ai.CommitFormatImperative,
+	}
+	_, _, _, _, _, _, normalRun, err := chooseIntentCandidatePlan(
+		ctx, normalReq, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	forcedReq, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
+		OfferedCaptures: []ai.OfferedCapture{capture}, ForcedAging: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner.plan = ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "service-change", SelectedSeqs: []int64{1},
+			Purpose:   "finish the available service change",
+			Readiness: ai.IntentCandidateReady, Subject: "Finish service change",
+			GroupingReason: "forced aging releases the complete available capture",
+		}},
+	}
+	input.ForcedAging = true
+	result, _, _, _, _, _, forcedRun, err := chooseIntentCandidatePlan(
+		ctx, forcedReq, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls != 2 {
+		t.Fatalf("planner calls=%d want a fresh forced-aging call", planner.calls)
+	}
+	if normalRun.Fingerprint == forcedRun.Fingerprint ||
+		forcedRun.ResolutionMode.String == "completed_plan_reuse" {
+		t.Fatalf("normal=%q forced=%q mode=%q",
+			normalRun.Fingerprint, forcedRun.Fingerprint,
+			forcedRun.ResolutionMode.String)
+	}
+	if len(result.Candidates) != 1 ||
+		result.Candidates[0].Readiness != ai.IntentCandidateReady {
+		t.Fatalf("forced plan=%+v", result)
 	}
 }
 
@@ -1572,7 +2121,7 @@ func TestIntentCandidateEngineReplansRepairablePrivateSuffix(t *testing.T) {
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{newCapture}, Planner: planner,
-		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced,
+		RetryLimit: 1, RetryLimitSet: true, Preset: config.PresetBalanced,
 		VerificationMode: "structural", Now: time.Unix(120, 0),
 		Materialize: func(
 			_ context.Context,

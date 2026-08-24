@@ -400,7 +400,7 @@ func testReplayIntentV2SemanticRepairReplan(t *testing.T, repairSucceeds bool) {
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatal(err)
 	}
-	retryLimit := 0
+	retryLimit := 1
 	planner := &fallbackRepairReplanIntentV2Planner{
 		repairSucceeds: repairSucceeds,
 	}

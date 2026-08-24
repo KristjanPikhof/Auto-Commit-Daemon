@@ -50,14 +50,35 @@ ACD can make three planning attempts for one unchanged capture window. The
 and is capped at two. The attempt count is tied to a durable fingerprint, so a
 restart, flush, or `acd off` followed by `acd on` cannot restart the loop.
 
+Before it reserves an attempt, ACD rebuilds a local baseline from the current
+captures, candidates, dependencies, boundaries, and forced-aging state. The
+baseline must assign every visible capture, preserve hard-dependency closure,
+and pass the structural safety checks. Native v2 providers receive this
+baseline and may refine its grouping and messages.
+
+If the baseline is invalid, ACD records `preflight_blocked` and does not call
+the provider. A changed planning snapshot gets a new fingerprint and a fresh
+preflight. Unrelated maintenance warnings remain visible, but they do not block
+planning unless they make the snapshot unsafe.
+
 After each response, ACD adds dependency declarations already proved by hard
 edges. It keeps groups that are valid and have complete hard-dependency
 closure, then sends only unresolved captures back for correction. Repeated
-membership with the same findings stops the retry loop early.
+membership with the same findings stops the retry loop early. Each narrowed
+correction request receives a newly validated baseline before another attempt
+is reserved.
+
+For forced aging, ACD may discard a missing companion invented by the model
+only when an exact baseline group proves that all available hard dependencies
+are complete. A real waiting dependency, missing object, materialization
+failure, verification failure, or branch-safety problem still blocks the work.
 
 When a completed plan still matches the same fingerprint, ACD reloads and
 revalidates that plan instead of asking the provider again or rebuilding an
 evidence partition. Planner windows report this as `completed_plan_reuse`.
+The fingerprint covers all planning inputs and hashes captured diffs. If the
+cached plan no longer validates, ACD records `local_cache_rebuild`, replaces
+its grouping with the valid local baseline, and avoids a semantic replan call.
 
 Outside an active recovery, a bounded planning failure can still use the normal
 evidence-based partition. Hard path, object, and rename relationships stay
@@ -86,6 +107,11 @@ Examples include unresolved dependency ambiguity, failed materialization or
 verification, a revertibility failure, or uncertain branch ownership and
 exact-ref state. A provider or grouping failure does not require attention
 when the evidence partition passes those checks.
+
+Status, diagnose, and doctor report the preflight state, finding codes,
+provider attempts, and why a provider call was skipped. Replay-error repeats
+remain separate from provider-attempt counts, so a recovery loop cannot look
+like repeated AI usage.
 
 Each explicit publication drain has a bounded semantic path. Invalid planner
 output cannot start a hot retry loop. The drain survives terminal disconnects,
