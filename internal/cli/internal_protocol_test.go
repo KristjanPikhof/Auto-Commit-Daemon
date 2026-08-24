@@ -351,11 +351,6 @@ INSERT INTO capture_events(
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
 	}
-	head, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
-		"rev-parse", "--verify", "HEAD")
-	if err != nil {
-		t.Fatal(err)
-	}
 	var wakeErr error
 	var freshCheckpointOnce sync.Once
 	handler := repositoryWorkerHandler{
@@ -364,33 +359,12 @@ INSERT INTO capture_events(
 		}},
 		wake: func(string) {
 			freshCheckpointOnce.Do(func() {
-				accepted, _, metaErr := state.MetaGet(
-					ctx, db, daemon.MetaKeyProtectionObservationEpoch)
-				if metaErr != nil {
-					wakeErr = metaErr
-					return
-				}
 				_, publishErr := db.SQL().ExecContext(ctx, `
 UPDATE capture_events SET state='published',commit_oid='backlog-commit' WHERE seq=?`, backlogSeq)
-				_, operationErr := db.SQL().ExecContext(ctx, `
-INSERT INTO operations(id,kind,worktree_id,phase,status,created_ts,updated_ts)
-VALUES('op-cp-empty-fresh', 'checkpoint', ?, 'completed', 'completed', 2, 2)`,
-					worktreeID)
-				_, checkpointErr := db.SQL().ExecContext(ctx, `
-INSERT INTO checkpoints(
- id,seq,operation_id,worktree_id,reason,observation_epoch,coverage_epoch,
- observed_head,observed_ref,tree_oid,commit_oid,checkpoint_ref,phase,
- created_ts,completed_ts
-) VALUES(
- 'cp-empty-fresh',2,'op-cp-empty-fresh',?,'manual_barrier',?,?,?,
- 'refs/heads/main','tree-fresh','commit-fresh',
- 'refs/acd/checkpoints/cp-empty-fresh','completed',2,2
-)`, worktreeID, accepted, accepted, strings.TrimSpace(string(head)))
 				wakeErr = errors.Join(
-					publishErr, operationErr, checkpointErr,
-					state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
-					state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
-					state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID, "cp-empty-fresh"),
+					publishErr,
+					insertFreshBarrierCheckpoint(
+						ctx, db, repo, "cp-empty-fresh", worktreeID, 2),
 				)
 			})
 		},
@@ -709,24 +683,17 @@ func TestCommitAllCheckpointBarrierConsumesStagedAfterCheckpoint(t *testing.T) {
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "7"); err != nil {
 		t.Fatal(err)
 	}
+	var wakeErr error
+	var freshCheckpointOnce sync.Once
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
 		}},
 		wake: func(string) {
-			accepted, _, metaErr := state.MetaGet(
-				ctx, db, daemon.MetaKeyProtectionObservationEpoch)
-			if metaErr != nil {
-				t.Fatal(metaErr)
-			}
-			if err := errors.Join(
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID,
-					"cp-staged-consent"),
-			); err != nil {
-				t.Fatal(err)
-			}
+			freshCheckpointOnce.Do(func() {
+				wakeErr = insertFreshBarrierCheckpoint(
+					ctx, db, repo, "cp-staged-consent-fresh", worktreeID, 2)
+			})
 		},
 	}
 	params, err := json.Marshal(map[string]bool{
@@ -740,6 +707,9 @@ func TestCommitAllCheckpointBarrierConsumesStagedAfterCheckpoint(t *testing.T) {
 	}); protocolErr != nil {
 		t.Fatal(protocolErr)
 	}
+	if wakeErr != nil {
+		t.Fatal(wakeErr)
+	}
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
 		"diff", "--cached", "--quiet"); err != nil {
 		t.Fatalf("index remains staged: %v", err)
@@ -749,7 +719,7 @@ func TestCommitAllCheckpointBarrierConsumesStagedAfterCheckpoint(t *testing.T) {
 		t.Fatalf("worktree body=%q err=%v", body, err)
 	}
 	drain, ok, err := state.PublicationDrainByCheckpoint(
-		ctx, db, "cp-staged-consent")
+		ctx, db, "cp-staged-consent-fresh")
 	if err != nil || !ok || !drain.StagedConsent || !drain.StagedConsumed {
 		t.Fatalf("drain=(%+v,%t,%v)", drain, ok, err)
 	}
@@ -957,6 +927,49 @@ INSERT INTO capture_events(
 		seqs = append(seqs, seq)
 	}
 	return seqs
+}
+
+func insertFreshBarrierCheckpoint(
+	ctx context.Context,
+	db *state.DB,
+	repo string,
+	checkpointID string,
+	worktreeID string,
+	seq int64,
+) error {
+	accepted, _, err := state.MetaGet(
+		ctx, db, daemon.MetaKeyProtectionObservationEpoch)
+	if err != nil {
+		return err
+	}
+	head, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return err
+	}
+	operationID := "op-" + checkpointID
+	_, operationErr := db.SQL().ExecContext(ctx, `
+INSERT INTO operations(id,kind,worktree_id,phase,status,created_ts,updated_ts)
+VALUES(?, 'checkpoint', ?, 'completed', 'completed', ?, ?)`,
+		operationID, worktreeID, seq, seq)
+	_, checkpointErr := db.SQL().ExecContext(ctx, `
+INSERT INTO checkpoints(
+ id,seq,operation_id,worktree_id,reason,observation_epoch,coverage_epoch,
+ observed_head,observed_ref,tree_oid,commit_oid,checkpoint_ref,phase,
+ created_ts,completed_ts
+) VALUES(
+ ?,?,?,?,'manual_barrier',?,?,?,'refs/heads/main','tree-fresh','commit-fresh',
+ ?,'completed',?,?
+)`, checkpointID, seq, operationID, worktreeID, accepted, accepted,
+		strings.TrimSpace(string(head)), "refs/acd/checkpoints/"+checkpointID,
+		seq, seq)
+	return errors.Join(
+		operationErr,
+		checkpointErr,
+		state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
+		state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
+		state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID, checkpointID),
+	)
 }
 
 func alignCheckpointHead(t *testing.T, db *state.DB, repo, checkpointID string) {
