@@ -795,6 +795,14 @@ CREATE TEMP TABLE IF NOT EXISTS acd_prune_intent_events(
 	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_intent_events`); err != nil {
 		return 0, fmt.Errorf("state: clear intent prune set: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM checkpoint_events
+WHERE checkpoint_id IN (
+    SELECT id FROM checkpoints
+    WHERE retained=0 AND pruned_ts IS NOT NULL
+)`); err != nil {
+		return 0, fmt.Errorf("state: clear pruned checkpoint event membership: %w", err)
+	}
 
 	rows, err := tx.QueryContext(ctx, `
 SELECT branch_ref, branch_generation, MIN(seq), MAX(seq)
@@ -933,6 +941,11 @@ WHERE state = 'published'
   AND NOT EXISTS (
       SELECT 1
       FROM recovery_snapshot_events member
+      WHERE member.event_seq = capture_events.seq
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM checkpoint_events member
       WHERE member.event_seq = capture_events.seq
   )
   AND NOT EXISTS (
