@@ -277,6 +277,8 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	persistedDependencies = intentDependenciesWithinCaptures(
+		persistedDependencies, allCaptures)
 	dependencies, err = mergeIntentDependencies(persistedDependencies, dependencies)
 	if err != nil {
 		return result, err
@@ -3623,6 +3625,31 @@ func mergeIntentDependencies(
 		return out[i].Kind < out[j].Kind
 	})
 	return out, nil
+}
+
+// intentDependenciesWithinCaptures drops evidence whose endpoints have left
+// the active candidate context. Keeping edges for terminal, published captures
+// would make a long-lived branch generation eventually exhaust the per-pair
+// edge cap and prevent later captures from being evaluated.
+func intentDependenciesWithinCaptures(
+	dependencies []state.IntentCaptureDependency,
+	captures []IntentCandidateCapture,
+) []state.IntentCaptureDependency {
+	active := make(map[int64]struct{}, len(captures))
+	for _, capture := range captures {
+		active[capture.Event.Seq] = struct{}{}
+	}
+	kept := make([]state.IntentCaptureDependency, 0, len(dependencies))
+	for _, dependency := range dependencies {
+		if _, ok := active[dependency.PrerequisiteSeq]; !ok {
+			continue
+		}
+		if _, ok := active[dependency.DependentSeq]; !ok {
+			continue
+		}
+		kept = append(kept, dependency)
+	}
+	return kept
 }
 
 func consumableBoundariesForPair(

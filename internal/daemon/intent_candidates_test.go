@@ -448,6 +448,83 @@ func TestIntentCandidateEnginePersistsNonContiguousCandidateAcrossWindows(t *tes
 	}
 }
 
+func TestIntentCandidateEngineDropsDependenciesForPublishedCaptures(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	staleFirst := appendIntentCandidateCapture(
+		t, db, "old.go", "create", "", "old-1")
+	staleSecond := appendIntentCandidateCapture(
+		t, db, "old.go", "modify", "old-1", "old-2")
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published', published_ts=50, commit_oid='old-commit'
+WHERE seq IN (?, ?)`, staleFirst.Event.Seq, staleSecond.Event.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReplaceIntentCaptureDependencies(ctx, db,
+		"refs/heads/main", 1, []state.IntentCaptureDependency{{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			PrerequisiteSeq: staleFirst.Event.Seq,
+			DependentSeq:    staleSecond.Event.Seq,
+			Strength:        state.IntentDependencyHard,
+			Kind:            "same_path_order",
+		}}); err != nil {
+		t.Fatal(err)
+	}
+
+	currentFirst := appendIntentCandidateCapture(
+		t, db, "current.go", "create", "", "current-1")
+	currentSecond := appendIntentCandidateCapture(
+		t, db, "current.go", "modify", "current-1", "current-2")
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{currentFirst, currentSecond},
+		Planner: &intentCandidatePlannerStub{
+			err: errors.New("semantic planning unavailable"),
+		},
+		RetryLimit: 0, RetryLimitSet: true,
+		Preset: config.PresetFast,
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+		Now: time.Unix(100, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Dependencies) == 0 {
+		t.Fatal("current dependency graph is empty")
+	}
+	stale := map[int64]struct{}{
+		staleFirst.Event.Seq:  {},
+		staleSecond.Event.Seq: {},
+	}
+	for _, dependency := range result.Dependencies {
+		_, stalePrerequisite := stale[dependency.PrerequisiteSeq]
+		_, staleDependent := stale[dependency.DependentSeq]
+		if stalePrerequisite || staleDependent {
+			t.Fatalf("published dependency survived evaluation: %+v", dependency)
+		}
+	}
+	persisted, err := state.IntentCaptureDependenciesForPair(
+		ctx, db, "refs/heads/main", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != len(result.Dependencies) {
+		t.Fatalf("persisted dependency count=%d want=%d",
+			len(persisted), len(result.Dependencies))
+	}
+	for _, dependency := range persisted {
+		_, stalePrerequisite := stale[dependency.PrerequisiteSeq]
+		_, staleDependent := stale[dependency.DependentSeq]
+		if stalePrerequisite || staleDependent {
+			t.Fatalf("published dependency remained persisted: %+v", dependency)
+		}
+	}
+}
+
 func TestIntentCandidateEngineBoundsFiftyThousandPendingEvents(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)

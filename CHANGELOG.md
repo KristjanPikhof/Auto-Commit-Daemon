@@ -19,6 +19,9 @@
 
 ### Fixed
 
+- Intent planning now removes dependency edges after their captures leave the
+  active window. Long-lived branches no longer exhaust the 4,096-edge limit
+  and stall `commit-all` on already-published history.
 - Forced `commit-all` no longer reuses a cached non-forced waiting plan. Plan
   identity now covers the complete planning snapshot, including forced aging
   and hashed captured diffs.
