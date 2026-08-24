@@ -22,6 +22,9 @@
 - Intent planning now removes dependency edges after their captures leave the
   active window. Long-lived branches no longer exhaust the 4,096-edge limit
   and stall `commit-all` on already-published history.
+- Publication barriers now choose the newest eligible checkpoint even when a
+  migration resets observation epoch numbering. An older high-numbered
+  checkpoint can no longer cause a false `HEAD` mismatch.
 - Forced `commit-all` no longer reuses a cached non-forced waiting plan. Plan
   identity now covers the complete planning snapshot, including forced aging
   and hashed captured diffs.

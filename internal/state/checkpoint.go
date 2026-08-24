@@ -136,15 +136,32 @@ type CheckpointReadOnlyProjection struct {
 	Recoverable   []Checkpoint
 }
 
+// LatestCheckpointSeq returns the current durable checkpoint sequence. A
+// publication barrier records this before requesting fresh coverage so older
+// checkpoints cannot satisfy the new observation after epoch counters reset.
+func LatestCheckpointSeq(ctx context.Context, db *DB) (int64, error) {
+	if db == nil {
+		return 0, errors.New("state: LatestCheckpointSeq: nil db")
+	}
+	var seq int64
+	if err := db.ReadSQL().QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(seq),0) FROM checkpoints`).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("state: latest checkpoint sequence: %w", err)
+	}
+	return seq, nil
+}
+
 // CompletedCheckpointForBarrier returns the newest completed checkpoint that
-// covers one worktree observation on the requested branch. A shared metadata
-// pointer may refer to another linked worktree, so publication barriers select
-// their checkpoint from the durable identity instead.
+// was created after the barrier began and covers one worktree observation on
+// the requested branch. A shared metadata pointer may refer to another linked
+// worktree, so publication barriers select their checkpoint from the durable
+// identity instead.
 func CompletedCheckpointForBarrier(
 	ctx context.Context,
 	db *DB,
 	worktreeID string,
 	minimumCoverageEpoch int64,
+	minimumCheckpointSeq int64,
 	branchRef string,
 ) (Checkpoint, bool, error) {
 	if db == nil {
@@ -152,16 +169,17 @@ func CompletedCheckpointForBarrier(
 			"state: CompletedCheckpointForBarrier: nil db")
 	}
 	if len(worktreeID) != 16 || minimumCoverageEpoch < 0 ||
+		minimumCheckpointSeq < 0 ||
 		strings.TrimSpace(branchRef) == "" {
 		return Checkpoint{}, false, ErrCheckpointIdentityMismatch
 	}
 	var id string
 	err := db.ReadSQL().QueryRowContext(ctx, `
 SELECT id FROM checkpoints
-WHERE phase='completed' AND worktree_id=? AND coverage_epoch>=?
+WHERE phase='completed' AND worktree_id=? AND coverage_epoch>=? AND seq>?
   AND observed_ref=?
-ORDER BY coverage_epoch DESC,seq DESC LIMIT 1`,
-		worktreeID, minimumCoverageEpoch, branchRef).Scan(&id)
+ORDER BY seq DESC LIMIT 1`,
+		worktreeID, minimumCoverageEpoch, minimumCheckpointSeq, branchRef).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Checkpoint{}, false, nil
 	}
