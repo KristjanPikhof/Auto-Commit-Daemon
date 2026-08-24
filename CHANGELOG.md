@@ -22,6 +22,9 @@
 - Intent planning now removes dependency edges after their captures leave the
   active window. Long-lived branches no longer exhaust the 4,096-edge limit
   and stall `commit-all` on already-published history.
+- Unordered soft dependency evidence is now normalized before it reaches the
+  publication graph. References to earlier generated artifacts no longer stop
+  `commit-all` with a reverse-edge error.
 - Publication barriers now choose the newest eligible checkpoint even when a
   migration resets observation epoch numbering. An older high-numbered
   checkpoint can no longer cause a false `HEAD` mismatch.

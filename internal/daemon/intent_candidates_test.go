@@ -3571,6 +3571,50 @@ func TestBuildIntentCandidateDependenciesHashesEvidenceAndEnforcesCap(t *testing
 	}
 }
 
+func TestBuildIntentCandidateDependenciesCanonicalizesReverseSoftHints(t *testing.T) {
+	t.Parallel()
+	first := intentCandidateCaptureFixture(1, "artifact.md", "create", "", "artifact")
+	second := intentCandidateCaptureFixture(2, "source.md", "create", "", "source")
+
+	edges, err := BuildIntentCandidateDependencies(
+		"refs/heads/main", 1, []IntentCandidateCapture{first, second},
+		[]IntentDependencyHint{{
+			PrerequisiteSeq: 2, DependentSeq: 1,
+			Strength: ai.IntentDependencySoft, Kind: "generated_artifact_reference",
+			Evidence: "source references an earlier artifact",
+		}}, time.Unix(100, 0),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, edge := range edges {
+		if edge.Kind != "generated_artifact_reference" {
+			continue
+		}
+		found = true
+		if edge.PrerequisiteSeq != 1 || edge.DependentSeq != 2 ||
+			edge.Strength != state.IntentDependencySoft {
+			t.Fatalf("canonical soft edge=%+v", edge)
+		}
+	}
+	if !found {
+		t.Fatal("canonical generated artifact edge missing")
+	}
+
+	_, err = BuildIntentCandidateDependencies(
+		"refs/heads/main", 1, []IntentCandidateCapture{first, second},
+		[]IntentDependencyHint{{
+			PrerequisiteSeq: 2, DependentSeq: 1,
+			Strength: ai.IntentDependencyHard, Kind: "generated_source",
+			Evidence: "invalid reverse publication order",
+		}}, time.Unix(100, 0),
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid edge 2 -> 1") {
+		t.Fatalf("reverse hard edge error=%v", err)
+	}
+}
+
 func TestBuildIntentCandidateDependenciesKeepsDocumentationIndependent(t *testing.T) {
 	t.Parallel()
 	documentation := intentCandidateCaptureFixture(

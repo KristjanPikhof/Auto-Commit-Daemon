@@ -621,8 +621,14 @@ func BuildIntentCandidateDependencies(
 	var out []state.IntentCaptureDependency
 	seen := make(map[string]struct{})
 	add := func(from, to int64, strength, kind, evidence string) error {
-		if from <= 0 || to <= 0 || from >= to {
+		if from <= 0 || to <= 0 || from == to {
 			return fmt.Errorf("daemon: intent dependency graph: invalid edge %d -> %d", from, to)
+		}
+		if from > to {
+			if strength != state.IntentDependencySoft {
+				return fmt.Errorf("daemon: intent dependency graph: invalid edge %d -> %d", from, to)
+			}
+			from, to = to, from
 		}
 		key := fmt.Sprintf("%d\x00%d\x00%s\x00%s", from, to, strength, kind)
 		if _, ok := seen[key]; ok {
