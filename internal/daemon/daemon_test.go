@@ -1527,6 +1527,7 @@ func TestRewindGrace_DoesNotResurrectRewoundWork(t *testing.T) {
 			SkipSignals: true,
 		})
 	}()
+	waitForDaemonMode(t, f.db, "running", 5*time.Second)
 	t.Cleanup(func() {
 		cancel()
 		wg.Wait()
