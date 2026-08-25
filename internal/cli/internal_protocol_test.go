@@ -828,7 +828,8 @@ func TestCheckpointBarrierReturnsMeasuredFinalDrainProgress(t *testing.T) {
 	}
 	defer db.Close()
 	worktreeID := checkpointpkg.WorktreeID(repo)
-	seqs := insertCompletedCheckpoint(t, db, "cp-drained", worktreeID, []checkpointMemberFixture{
+	insertCompletedCheckpoint(t, db, "cp-drained", worktreeID, nil)
+	seqs := insertCaptureEvents(t, db, []checkpointMemberFixture{
 		{State: state.EventStatePublished, CommitOID: "commit-1"},
 		{State: state.EventStatePublished, CommitOID: "commit-2"},
 	})
@@ -837,21 +838,16 @@ func TestCheckpointBarrierReturnsMeasuredFinalDrainProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wakeErr error
+	var freshCheckpointOnce sync.Once
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
 		}},
 		wake: func(string) {
-			accepted, _, err := state.MetaGet(ctx, db, daemon.MetaKeyProtectionObservationEpoch)
-			if err != nil {
-				wakeErr = err
-				return
-			}
-			wakeErr = errors.Join(
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
-				state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID, "cp-drained"),
-			)
+			freshCheckpointOnce.Do(func() {
+				wakeErr = insertFreshBarrierCheckpoint(
+					ctx, db, repo, "cp-drained-fresh", worktreeID, 2, seqs...)
+			})
 		},
 	}
 	params, err := json.Marshal(map[string]bool{"drain_publication": true})
@@ -906,6 +902,23 @@ INSERT INTO checkpoints(
 		checkpointID, operationID, worktreeID, "refs/acd/checkpoints/"+checkpointID); err != nil {
 		t.Fatal(err)
 	}
+	seqs := insertCaptureEvents(t, db, members)
+	for index, seq := range seqs {
+		if _, err := db.SQL().ExecContext(ctx,
+			`INSERT INTO checkpoint_events(checkpoint_id,ord,event_seq) VALUES(?,?,?)`, checkpointID, index, seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return seqs
+}
+
+func insertCaptureEvents(
+	t *testing.T,
+	db *state.DB,
+	members []checkpointMemberFixture,
+) []int64 {
+	t.Helper()
+	ctx := context.Background()
 	seqs := make([]int64, 0, len(members))
 	for index, member := range members {
 		result, err := db.SQL().ExecContext(ctx, `
@@ -920,10 +933,6 @@ INSERT INTO capture_events(
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.SQL().ExecContext(ctx,
-			`INSERT INTO checkpoint_events(checkpoint_id,ord,event_seq) VALUES(?,?,?)`, checkpointID, index, seq); err != nil {
-			t.Fatal(err)
-		}
 		seqs = append(seqs, seq)
 	}
 	return seqs
@@ -936,6 +945,7 @@ func insertFreshBarrierCheckpoint(
 	checkpointID string,
 	worktreeID string,
 	seq int64,
+	members ...int64,
 ) error {
 	accepted, _, err := state.MetaGet(
 		ctx, db, daemon.MetaKeyProtectionObservationEpoch)
@@ -963,13 +973,20 @@ INSERT INTO checkpoints(
 )`, checkpointID, seq, operationID, worktreeID, accepted, accepted,
 		strings.TrimSpace(string(head)), "refs/acd/checkpoints/"+checkpointID,
 		seq, seq)
-	return errors.Join(
+	errs := []error{
 		operationErr,
 		checkpointErr,
 		state.MetaSet(ctx, db, daemon.MetaKeyProtectionCoveredEpoch, accepted),
 		state.MetaSet(ctx, db, daemon.MetaKeyProtectionComplete, "true"),
 		state.MetaSet(ctx, db, daemon.MetaKeyProtectionCheckpointID, checkpointID),
-	)
+	}
+	for index, eventSeq := range members {
+		_, memberErr := db.SQL().ExecContext(ctx,
+			`INSERT INTO checkpoint_events(checkpoint_id,ord,event_seq) VALUES(?,?,?)`,
+			checkpointID, index, eventSeq)
+		errs = append(errs, memberErr)
+	}
+	return errors.Join(errs...)
 }
 
 func alignCheckpointHead(t *testing.T, db *state.DB, repo, checkpointID string) {
