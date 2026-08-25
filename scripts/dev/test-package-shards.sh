@@ -9,6 +9,7 @@ fi
 package=$1
 shard_count=$2
 shift 2
+requested_shard=${ACD_TEST_SHARD_INDEX:-}
 
 if ! [[ "$shard_count" =~ ^[1-9][0-9]*$ ]]; then
   echo "invalid shard count: $shard_count" >&2
@@ -29,6 +30,11 @@ fi
 if [[ "$shard_count" -gt "$test_count" ]]; then
   shard_count=$test_count
 fi
+if [[ -n "$requested_shard" ]] &&
+  { ! [[ "$requested_shard" =~ ^[0-9]+$ ]] || [[ "$requested_shard" -ge "$shard_count" ]]; }; then
+  echo "invalid shard index $requested_shard for $shard_count shards" >&2
+  exit 2
+fi
 
 output_root=$(mktemp -d "${TMPDIR:-/tmp}/acd-test-shards.XXXXXX")
 cleanup() {
@@ -38,7 +44,13 @@ trap cleanup EXIT
 
 pids=()
 outputs=()
-for ((shard = 0; shard < shard_count; shard++)); do
+first_shard=0
+last_shard=$shard_count
+if [[ -n "$requested_shard" ]]; then
+  first_shard=$requested_shard
+  last_shard=$((requested_shard + 1))
+fi
+for ((shard = first_shard; shard < last_shard; shard++)); do
   pattern=""
   for ((index = shard; index < test_count; index += shard_count)); do
     if [[ -n "$pattern" ]]; then
@@ -52,9 +64,13 @@ for ((shard = 0; shard < shard_count; shard++)); do
   pids[$shard]=$!
 done
 
-echo "$package: running $test_count top-level tests across $shard_count shards"
+if [[ -n "$requested_shard" ]]; then
+  echo "$package: running shard $((requested_shard + 1))/$shard_count of $test_count top-level tests"
+else
+  echo "$package: running $test_count top-level tests across $shard_count shards"
+fi
 status=0
-for ((shard = 0; shard < shard_count; shard++)); do
+for ((shard = first_shard; shard < last_shard; shard++)); do
   if ! wait "${pids[$shard]}"; then
     status=1
   fi

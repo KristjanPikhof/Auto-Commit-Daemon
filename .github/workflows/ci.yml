@@ -36,19 +36,10 @@ jobs:
       - run: make test
       - run: make build
 
-  race-stress:
-    # Linux-only race lane that catches ordering bugs the macOS runners
-    # miss (real instances captured: internal/git/ignore.go cancellation
-    # goroutine racing with Check mutex). Failures here should be
-    # treated as real bugs by default; see CLAUDE.md "Pre-merge
-    # verification" for the playbook.
-    #
-    # Test selection rationale: CLAUDE.md flags a small set of
-    # timing-sensitive `internal/daemon` tests as known-flaky under
-    # broad runs. Running those at -count=3 produces deterministic red
-    # builds that get rationalized as "flake" — defeating the lane's
-    # purpose. We run the flaky list at -count=1 (still race-checked,
-    # just not stressed) and the rest at -count=3.
+  race-sensitive:
+    # Wall-clock-sensitive tests still run with the race detector, but once
+    # and without competing stress shards. Resource starvation otherwise
+    # tests runner load instead of the timeout behavior under test.
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -58,23 +49,68 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: race + count=1 on known-flaky daemon tests
+      - name: race + count=1 on timing-sensitive daemon tests
         run: |
           go test ./internal/daemon/... -race -count=1 -timeout 5m \
-            -run 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)'
-      - name: race + count=3 stress on remaining concurrency-prone packages
+            -run 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent'
+
+  race-stress-daemon:
+    # Runner-level shards preserve three complete repetitions without making
+    # Git and SQLite processes compete inside one small hosted runner.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    name: race-stress (daemon ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: race + count=3 daemon shard
+        env:
+          ACD_TEST_SHARD_INDEX: ${{ matrix.shard }}
         run: |
-          status=0
           scripts/dev/test-package-shards.sh ./internal/daemon 4 \
             -race -count=3 -timeout 10m -failfast \
-            -skip 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)' &
-          daemon_pid=$!
+            -skip 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent'
+
+  race-stress-support:
+    permissions:
+      contents: read
+    name: race-stress (git and state)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: race + count=3 support packages
+        run: |
           go test ./internal/git/... ./internal/state/... \
-            -race -count=3 -timeout 10m -failfast &
-          support_pid=$!
-          wait "$daemon_pid" || status=1
-          wait "$support_pid" || status=1
-          exit "$status"
+            -race -count=3 -timeout 10m -failfast
+
+  race-stress:
+    permissions:
+      contents: read
+    if: ${{ always() }}
+    needs: [race-sensitive, race-stress-daemon, race-stress-support]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every race lane
+        env:
+          SENSITIVE_RESULT: ${{ needs.race-sensitive.result }}
+          DAEMON_RESULT: ${{ needs.race-stress-daemon.result }}
+          SUPPORT_RESULT: ${{ needs.race-stress-support.result }}
+        run: |
+          test "$SENSITIVE_RESULT" = success
+          test "$DAEMON_RESULT" = success
+          test "$SUPPORT_RESULT" = success
 
   govulncheck:
     permissions:
