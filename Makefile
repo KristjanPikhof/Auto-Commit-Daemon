@@ -14,7 +14,7 @@ build:
 	  -o bin/acd ./cmd/acd
 
 test:
-	go test ./... -race -count=1
+	scripts/dev/test.sh
 
 vet:
 	go vet ./...

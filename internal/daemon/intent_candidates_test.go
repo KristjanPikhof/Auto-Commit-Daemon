@@ -529,30 +529,20 @@ func TestIntentCandidateEngineBoundsFiftyThousandPendingEvents(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	const totalPending = 50_000
-	tx, err := db.SQL().BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stmt, err := tx.PrepareContext(ctx, `
+	_, err := db.SQL().ExecContext(ctx, `
+WITH RECURSIVE pending(i) AS (
+  VALUES(0)
+  UNION ALL
+  SELECT i + 1 FROM pending WHERE i + 1 < ?
+)
 INSERT INTO capture_events(
   branch_ref, branch_generation, base_head, operation, path,
   fidelity, captured_ts, state
-) VALUES('refs/heads/main', 1, 'base', 'create', ?, 'full', ?, 'pending')`)
+) SELECT
+  'refs/heads/main', 1, 'base', 'create', printf('bulk/%05d.go', i),
+  'full', i + 1, 'pending'
+FROM pending`, totalPending)
 	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < totalPending; i++ {
-		if _, err := stmt.ExecContext(ctx,
-			fmt.Sprintf("bulk/%05d.go", i), float64(i+1)); err != nil {
-			_ = stmt.Close()
-			_ = tx.Rollback()
-			t.Fatalf("seed pending event %d: %v", i, err)
-		}
-	}
-	if err := stmt.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
