@@ -4,6 +4,7 @@ cd "$(dirname "$0")/../.."
 
 shard_count=${ACD_TEST_SHARDS:-2}
 package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2}
+isolated_daemon_test=TestRun_SelfTerminateNoClients
 output_root=$(mktemp -d "${TMPDIR:-/tmp}/acd-tests.XXXXXX")
 cleanup() {
   rm -rf "$output_root"
@@ -26,7 +27,8 @@ scripts/dev/test-package-shards.sh ./internal/cli "$shard_count" \
   -race -count=1 >"$output_root/cli.log" 2>&1 &
 cli_pid=$!
 scripts/dev/test-package-shards.sh ./internal/daemon "$shard_count" \
-  -race -count=1 >"$output_root/daemon.log" 2>&1 &
+  -race -count=1 -skip "^$isolated_daemon_test$" \
+  >"$output_root/daemon.log" 2>&1 &
 daemon_pid=$!
 go test -p "$package_parallelism" "${packages[@]}" \
   -race -count=1 >"$output_root/packages.log" 2>&1 &
@@ -40,4 +42,13 @@ for job in cli daemon packages; do
   fi
   cat "$output_root/$job.log"
 done
+
+# This test deliberately has a short wall-clock deadline. Run it after the
+# parallel groups so machine load cannot turn scheduler starvation into a
+# product failure.
+if ! go test ./internal/daemon -race -count=1 \
+  -run "^$isolated_daemon_test$" >"$output_root/isolated.log" 2>&1; then
+  status=1
+fi
+cat "$output_root/isolated.log"
 exit "$status"
