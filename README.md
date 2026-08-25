@@ -11,6 +11,17 @@ ACD is a static Go binary for macOS and Linux on `amd64` and `arm64`. It never
 pushes, never rewrites normal history, and needs no API key for its default
 path.
 
+## v2026-08-25
+
+This release separates machine-wide setup from repository enablement and fixes
+Intent publication stalls caused by stale dependency edges or checkpoint
+proof. It also improves planner recovery and diagnostics, and isolates large
+race-test packages so CI runs them without competing workloads.
+
+The terminal and storage dependencies now include Bubbles 2.2.0, Bubble Tea
+2.0.9, and SQLite 1.57.0. See [the changelog](CHANGELOG.md#v2026-08-25) for the
+full list.
+
 ## Get protected
 
 Install ACD once, then enable each repository you want to protect:

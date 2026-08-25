@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-08-25
+
 ### Changed
 
 - Race tests now split the two largest packages into isolated processes and
