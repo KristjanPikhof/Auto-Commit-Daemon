@@ -15,6 +15,10 @@
 - Updated Lip Gloss to 2.0.6 and ANSI to 0.11.8 for terminal rendering fixes.
   SQLite 1.56.0 includes the upstream journal rollback correction, and CI and
   release workflows now use `actions/checkout` 7.0.1.
+- Updated Bubbles to 2.2.0, Bubble Tea to 2.0.9, and SQLite to 1.57.0. The
+  terminal updates fix screen cleanup and keyboard restoration, while the
+  SQLite update adds optional connection hardening without changing existing
+  DSNs.
 - `acd setup` now installs or upgrades the shared runtime without enabling the
   current repository. Run `acd on` in each repository you want to protect; it
   registers, migrates, and enables only that repository. Other mutation
