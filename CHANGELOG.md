@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Race tests now split the two largest packages into isolated processes and
+  spread repeated stress checks across CI runners. Timing-sensitive cases still
+  run with the race detector, but without competing workloads.
 - Intent planning now validates a local hard-dependency baseline before it
   reserves a provider attempt. Native v2 providers can refine that baseline,
   while invalid local state records a skipped call with its finding codes.
