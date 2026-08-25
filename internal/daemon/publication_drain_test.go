@@ -106,6 +106,42 @@ func TestPublicationDrainFinalFallbackExpandsAcrossIntentWindow(t *testing.T) {
 	}
 }
 
+func TestPublicationDrainFinalFallbackIgnoresPublishedDependencyCapacity(t *testing.T) {
+	ctx := context.Background()
+	db, events, _ := openPublicationDrainTestState(t, 4, 4)
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published', published_ts=50, commit_oid='old-commit'
+WHERE seq IN (?, ?)`, events[0].Seq, events[1].Seq); err != nil {
+		t.Fatal(err)
+	}
+	stale := make([]state.IntentCaptureDependency, 0,
+		state.IntentDependencyMaxPerPair)
+	for i := 0; i < state.IntentDependencyMaxPerPair; i++ {
+		stale = append(stale, state.IntentCaptureDependency{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			PrerequisiteSeq: events[0].Seq, DependentSeq: events[1].Seq,
+			Strength: string(ai.IntentDependencySoft),
+			Kind:     fmt.Sprintf("stale_%04d", i),
+		})
+	}
+	if err := state.ReplaceIntentCaptureDependencies(
+		ctx, db, "refs/heads/main", 7, stale); err != nil {
+		t.Fatal(err)
+	}
+	events[2].Path = "active.go"
+	events[3].Path = "active.go"
+	window, err := publicationDrainAtomicFallbackWindow(ctx, db, CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+	}, events[2:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(window) != 2 {
+		t.Fatalf("atomic fallback window=%d, want active hard component", len(window))
+	}
+}
+
 func TestPublicationDrainLocalUnlockSelectsSmallestHardComponent(t *testing.T) {
 	ctx := context.Background()
 	db, events, _ := openPublicationDrainTestState(t, 3, 3)

@@ -150,6 +150,15 @@ func TestCompletedCheckpointForBarrierMatchesExactIdentity(t *testing.T) {
 
 	checkpoints := []Checkpoint{
 		{
+			ID: "cp-1786060000009-dddddddddddddddd", OperationID: "op-barrier-stale",
+			WorktreeID: "0123456789abcdef", Reason: CheckpointReasonPoll,
+			ObservationEpoch: 100, CoverageEpoch: 100,
+			ObservedHead: "stale-main-head", ObservedRef: "refs/heads/main",
+			TreeOID: "stale-main-tree", CommitOID: "stale-main-commit",
+			Ref:       "refs/acd/checkpoints/v1/0123456789abcdef/cp-1786060000009-dddddddddddddddd",
+			CreatedTS: 9,
+		},
+		{
 			ID: "cp-1786060000010-aaaaaaaaaaaaaaaa", OperationID: "op-barrier-feature",
 			WorktreeID: "0123456789abcdef", Reason: CheckpointReasonPoll,
 			ObservationEpoch: 10, CoverageEpoch: 10,
@@ -190,16 +199,18 @@ func TestCompletedCheckpointForBarrierMatchesExactIdentity(t *testing.T) {
 	}
 
 	checkpoint, ok, err := CompletedCheckpointForBarrier(
-		ctx, db, "0123456789abcdef", 10, "refs/heads/main")
-	if err != nil || !ok || checkpoint.ID != checkpoints[2].ID {
+		ctx, db, "0123456789abcdef", 10, 0, "refs/heads/main")
+	if err != nil || !ok || checkpoint.ID != checkpoints[3].ID {
 		t.Fatalf("checkpoint=(%+v,%t,%v)", checkpoint, ok, err)
 	}
 	if _, ok, err := CompletedCheckpointForBarrier(
-		ctx, db, "0123456789abcdef", 13, "refs/heads/main"); err != nil || ok {
+		ctx, db, "0123456789abcdef", 13, int64(len(checkpoints)),
+		"refs/heads/main"); err != nil || ok {
 		t.Fatalf("future checkpoint=(%t,%v), want false,nil", ok, err)
 	}
 	if _, _, err := CompletedCheckpointForBarrier(
-		ctx, db, "short", 1, "refs/heads/main"); !errors.Is(err, ErrCheckpointIdentityMismatch) {
+		ctx, db, "short", 1, 0,
+		"refs/heads/main"); !errors.Is(err, ErrCheckpointIdentityMismatch) {
 		t.Fatalf("invalid identity error=%v", err)
 	}
 }

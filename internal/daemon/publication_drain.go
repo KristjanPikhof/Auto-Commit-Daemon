@@ -484,6 +484,7 @@ func publicationDrainAtomicFallbackWindow(
 	if err != nil {
 		return nil, fmt.Errorf("daemon: load atomic fallback dependencies: %w", err)
 	}
+	persisted = intentDependenciesWithinCaptures(persisted, captures)
 	dependencies, err := mergeIntentDependencies(persisted, derived)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: merge atomic fallback dependencies: %w", err)

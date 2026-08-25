@@ -19,6 +19,18 @@
 
 ### Fixed
 
+- Intent planning now removes dependency edges after their captures leave the
+  active window. Long-lived branches no longer exhaust the 4,096-edge limit
+  and stall `commit-all` on already-published history.
+- Unordered soft dependency evidence is now normalized before it reaches the
+  publication graph. References to earlier generated artifacts no longer stop
+  `commit-all` with a reverse-edge error.
+- Published-event retention now keeps captures while a restore checkpoint is
+  live and retires their membership after its private ref is pruned. Cleanup
+  no longer loops on foreign-key errors or leaves stale dependency history.
+- Publication barriers now choose the newest eligible checkpoint even when a
+  migration resets observation epoch numbering. An older high-numbered
+  checkpoint can no longer cause a false `HEAD` mismatch.
 - Forced `commit-all` no longer reuses a cached non-forced waiting plan. Plan
   identity now covers the complete planning snapshot, including forced aging
   and hashed captured diffs.
