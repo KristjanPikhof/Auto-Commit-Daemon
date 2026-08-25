@@ -64,9 +64,17 @@ jobs:
             -run 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)'
       - name: race + count=3 stress on remaining concurrency-prone packages
         run: |
-          go test ./internal/daemon/... ./internal/git/... ./internal/state/... \
+          status=0
+          scripts/dev/test-package-shards.sh ./internal/daemon 4 \
             -race -count=3 -timeout 10m -failfast \
-            -skip 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)'
+            -skip 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits)' &
+          daemon_pid=$!
+          go test ./internal/git/... ./internal/state/... \
+            -race -count=3 -timeout 10m -failfast &
+          support_pid=$!
+          wait "$daemon_pid" || status=1
+          wait "$support_pid" || status=1
+          exit "$status"
 
   govulncheck:
     permissions:

@@ -12,7 +12,7 @@
 
 ~~~bash
 make build      # static bin/acd; CGO_ENABLED=0; netgo,osusergo
-make test       # go test ./... -race -count=1
+make test       # complete race suite; slow packages use isolated shards
 make lint       # go vet ./... + gofmt check
 make fmt        # gofmt -w .
 make tidy       # go mod tidy
