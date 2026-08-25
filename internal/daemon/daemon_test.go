@@ -3383,6 +3383,9 @@ func TestRun_StartupClassifyErrorDoesNotBumpGeneration(t *testing.T) {
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
 	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -3390,24 +3393,25 @@ func TestRun_StartupClassifyErrorDoesNotBumpGeneration(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		runErr = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
-			MessageFn:   DeterministicMessage,
+			RepoPath:               f.dir,
+			GitDir:                 f.gitDir,
+			DB:                     f.db,
+			Scheduler:              fastScheduler(),
+			BootGrace:              30 * time.Second,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			MessageFn:              DeterministicMessage,
+			beforeBranchTokenCheck: checkHook,
 		})
 	}()
+	t.Cleanup(func() {
+		releaseCheck()
+		cancel()
+		wg.Wait()
+	})
 
-	time.Sleep(150 * time.Millisecond)
-	cancel()
-	wg.Wait()
-	if runErr != nil {
-		t.Fatalf("Run: %v", runErr)
-	}
+	waitForBranchTokenCheckGate(t, checkEntered)
 
 	got, ok, err := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
 	if err != nil {
@@ -3418,6 +3422,13 @@ func TestRun_StartupClassifyErrorDoesNotBumpGeneration(t *testing.T) {
 	}
 	if got != "4" {
 		t.Fatalf("branch.generation=%q after classify error; want 4", got)
+	}
+
+	releaseCheck()
+	shutdownCh <- struct{}{}
+	wg.Wait()
+	if runErr != nil {
+		t.Fatalf("Run: %v", runErr)
 	}
 }
 
