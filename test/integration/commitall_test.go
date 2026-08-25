@@ -5,14 +5,94 @@ package integration_test
 
 import (
 	"context"
+	"net/http"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	var plannerCalls atomic.Int32
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(
+		w http.ResponseWriter, r *http.Request,
+	) {
+		req := decodeIntentChatRequest(t, r)
+		if req.ToolChoice.Function.Name == "commit_message" {
+			writeIntentMessageRewriteResponse(t, w, req)
+			return
+		}
+		seqs := offeredIntentSeqsLenient(t, req)
+		if len(seqs) != 1 {
+			http.Error(w, "expected one offered capture", http.StatusBadRequest)
+			return
+		}
+		if plannerCalls.Add(1) == 1 {
+			writeNativeIntentCandidatesResponse(t, w, "call_wait", []map[string]any{{
+				"candidate_id": "cached-wait", "selected_seqs": seqs,
+				"purpose": "wait for a possible companion", "readiness": "wait",
+				"missing_companions": []string{"possible_test.go"},
+				"grouping_reason":    "the first non-forced pass may wait",
+			}})
+			return
+		}
+		writeNativeIntentCandidatesResponse(t, w, "call_forced", []map[string]any{
+			nativeReadyIntentCandidate("forced-ready", seqs,
+				"Commit forced capture", "", "commit-all forces the complete capture"),
+		})
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	extra := []string{
+		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_INTENT_WINDOW=10",
+		"ACD_INTENT_MIN_PENDING=1",
+		"ACD_INTENT_SETTLE_WINDOW=0",
+		"ACD_INTENT_MAX_PENDING_AGE=5m",
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key",
+		"ACD_AI_MODEL=gpt-5.4-mini",
+		trustEnv,
+	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
+	fullEnv := envWith(env, extra...)
+	startSession(t, ctx, env, repo, "cached-wait-a", "shell", extra...)
+	writeFile(t, filepath.Join(repo, "forced.go"),
+		"package forced\n\nfunc Ready() bool { return true }\n")
+	wakeSession(t, ctx, fullEnv, repo, "cached-wait-a")
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitFor(t, "non-forced plan waits", 15*time.Second, func() bool {
+		return plannerCalls.Load() == 1 && sqliteScalar(t, dbPath,
+			"SELECT COUNT(*) FROM intent_candidates WHERE status='waiting'") == "1"
+	})
+	shutdownDaemon(t, fullEnv, repo, "cached-wait-a")
+
+	startSession(t, ctx, env, repo, "cached-wait-b", "shell", extra...)
+	t.Cleanup(func() { shutdownDaemon(t, fullEnv, repo, "cached-wait-b") })
+	result := runAcd(t, ctx, fullEnv, "commit-all", "--repo", repo, "--yes")
+	if result.ExitCode != 0 {
+		t.Fatalf("commit-all exit=%d\nstdout=%s\nstderr=%s",
+			result.ExitCode, result.Stdout, result.Stderr)
+	}
+	if got := plannerCalls.Load(); got != 2 {
+		t.Fatalf("planner calls=%d want 2; forced request reused cached wait", got)
+	}
+	if dirty := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")); dirty != "" {
+		t.Fatalf("commit-all left worktree dirty: %s", dirty)
+	}
+}
 
 // commitAllFixture seeds a tempRepo with a deterministic dirty worktree:
 // many uncommitted files spread across multiple directories with sibling

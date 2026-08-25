@@ -854,6 +854,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		_ = json.Unmarshal(request.Params, &params)
 		var drainAnchor publicationDrainTarget
 		var requestedPublicationBranch string
+		var minimumPublicationCheckpointSeq int64
 		publicationWorktreeID := checkpointpkg.WorktreeID(runtime.worktree.Root)
 		runtime.gate.Lock()
 		if params.DrainPublication {
@@ -920,6 +921,15 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 			runtime.gate.Unlock()
 			return nil, protocolFailure("hint_failed", hintErr, true)
 		}
+		if params.DrainPublication {
+			var checkpointSeqErr error
+			minimumPublicationCheckpointSeq, checkpointSeqErr = state.LatestCheckpointSeq(
+				ctx, runtime.db)
+			if checkpointSeqErr != nil {
+				runtime.gate.Unlock()
+				return nil, protocolFailure("observation_failed", checkpointSeqErr, true)
+			}
+		}
 		acceptedEpoch, beginErr := daemon.BeginProtectionObservation(ctx, runtime.db)
 		if beginErr != nil {
 			runtime.gate.Unlock()
@@ -979,7 +989,8 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 					}
 					if drainTarget.EventSeqs == nil {
 						checkpoint, found, selectErr := state.CompletedCheckpointForBarrier(
-							ctx, runtime.db, publicationWorktreeID, acceptedEpoch, expectedBranch)
+							ctx, runtime.db, publicationWorktreeID, acceptedEpoch,
+							minimumPublicationCheckpointSeq, expectedBranch)
 						if selectErr != nil {
 							return nil, protocolFailure(
 								"publication_status_failed", selectErr, true)

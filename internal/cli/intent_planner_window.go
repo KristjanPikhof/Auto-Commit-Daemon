@@ -35,6 +35,9 @@ type intentPlannerWindowSummary struct {
 	UnresolvedCaptureCount int                                           `json:"unresolved_capture_count,omitempty"`
 	PreservedGroupCount    int                                           `json:"preserved_group_count,omitempty"`
 	ResolutionMode         string                                        `json:"resolution_mode,omitempty"`
+	PreflightState         string                                        `json:"preflight_state,omitempty"`
+	FindingCodes           []string                                      `json:"finding_codes,omitempty"`
+	ProviderCallSkipped    string                                        `json:"provider_call_skipped_reason,omitempty"`
 	Event                  *intentPlannerWindowEventParticipationSummary `json:"event,omitempty"`
 }
 
@@ -81,15 +84,16 @@ func enrichIntentPlannerWindowRun(ctx context.Context, conn *sql.DB, win *intent
 	if err != nil || !ok {
 		return err
 	}
-	var resolution sql.NullString
+	var resolution, progress sql.NullString
 	err = conn.QueryRowContext(ctx, `
 SELECT attempt_count, attempt_limit, unresolved_seqs, preserved_groups,
-       resolution_mode
+       resolution_mode, progress_state, finding_codes
 FROM intent_plan_runs
 WHERE branch_ref=? AND branch_generation=?
 ORDER BY updated_ts DESC LIMIT 1`, win.BranchRef, win.BranchGeneration).Scan(
 		&win.PlanAttempt, &win.PlanAttemptLimit, newJSONArrayCount(&win.UnresolvedCaptureCount),
-		newJSONArrayCount(&win.PreservedGroupCount), &resolution)
+		newJSONArrayCount(&win.PreservedGroupCount), &resolution, &progress,
+		newJSONArrayStrings(&win.FindingCodes))
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -97,12 +101,37 @@ ORDER BY updated_ts DESC LIMIT 1`, win.BranchRef, win.BranchGeneration).Scan(
 		return fmt.Errorf("query latest intent plan run: %w", err)
 	}
 	win.ResolutionMode = resolution.String
+	win.PreflightState = progress.String
+	if progress.String == "preflight_blocked" {
+		win.ProviderCallSkipped = "invalid_local_baseline"
+	}
 	return nil
 }
 
 type jsonArrayCount struct{ target *int }
 
+type jsonArrayStrings struct{ target *[]string }
+
 func newJSONArrayCount(target *int) *jsonArrayCount { return &jsonArrayCount{target: target} }
+
+func newJSONArrayStrings(target *[]string) *jsonArrayStrings {
+	return &jsonArrayStrings{target: target}
+}
+
+func (s *jsonArrayStrings) Scan(src any) error {
+	var raw []byte
+	switch value := src.(type) {
+	case string:
+		raw = []byte(value)
+	case []byte:
+		raw = value
+	case nil:
+		raw = []byte("[]")
+	default:
+		return fmt.Errorf("scan JSON array strings from %T", src)
+	}
+	return json.Unmarshal(raw, s.target)
+}
 
 func (c *jsonArrayCount) Scan(src any) error {
 	var raw []byte

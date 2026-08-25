@@ -484,6 +484,7 @@ func publicationDrainAtomicFallbackWindow(
 	if err != nil {
 		return nil, fmt.Errorf("daemon: load atomic fallback dependencies: %w", err)
 	}
+	persisted = intentDependenciesWithinCaptures(persisted, captures)
 	dependencies, err := mergeIntentDependencies(persisted, derived)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: merge atomic fallback dependencies: %w", err)
@@ -750,7 +751,9 @@ func UpdatePublicationDrainAfterReplay(
 	if replayErr != nil {
 		update.LastError = replayErr.Error()
 		var exhausted *IntentSemanticFallbackRequiredError
-		if errors.As(replayErr, &exhausted) {
+		var preflight *IntentPlanPreflightError
+		if errors.As(replayErr, &exhausted) ||
+			errors.As(replayErr, &preflight) {
 			if drain.Phase == state.PublicationDrainSemantic {
 				update.Phase = state.PublicationDrainNormalizing
 				update.SemanticRebuildAttempts++

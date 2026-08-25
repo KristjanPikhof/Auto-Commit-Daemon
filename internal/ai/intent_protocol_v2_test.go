@@ -100,6 +100,42 @@ func TestValidateIntentPlanV2RequiresExactAssignment(t *testing.T) {
 	}
 }
 
+func TestNewIntentPlanRequestV2ClonesAndValidatesBaseline(t *testing.T) {
+	baseline := []IntentCandidateAssignment{
+		readyCandidate("baseline", []int64{1}),
+	}
+	req, err := NewIntentPlanRequestV2(IntentPlanRequestV2Options{
+		OfferedCaptures:    []OfferedCapture{{Seq: 1, Path: "a.go", Op: "modify"}},
+		BaselineCandidates: baseline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline[0].SelectedSeqs[0] = 2
+	baseline[0].MissingCompanions = []string{"mutated"}
+	if got := req.BaselineCandidates[0].SelectedSeqs[0]; got != 1 {
+		t.Fatalf("cloned baseline seq=%d want=1", got)
+	}
+	if len(req.BaselineCandidates[0].MissingCompanions) != 0 {
+		t.Fatalf("cloned baseline mutated: %+v", req.BaselineCandidates[0])
+	}
+
+	_, err = NewIntentPlanRequestV2(IntentPlanRequestV2Options{
+		OfferedCaptures: []OfferedCapture{
+			{Seq: 1, Path: "a.go", Op: "modify"},
+			{Seq: 2, Path: "b.go", Op: "modify"},
+		},
+		BaselineCandidates: []IntentCandidateAssignment{
+			readyCandidate("incomplete", []int64{1}),
+		},
+	})
+	var validation *IntentPlanV2ValidationError
+	if !errors.As(err, &validation) ||
+		validation.Findings[0].Code != "capture_unassigned" {
+		t.Fatalf("invalid baseline error=%T %v", err, err)
+	}
+}
+
 func TestValidateIntentPlanV2RejectsReadyCandidateWithMissingCompanion(t *testing.T) {
 	req := mustIntentPlanRequestV2(t,
 		[]OfferedCapture{{Seq: 1, Path: "a.go", Op: "modify"}},

@@ -106,6 +106,42 @@ func TestPublicationDrainFinalFallbackExpandsAcrossIntentWindow(t *testing.T) {
 	}
 }
 
+func TestPublicationDrainFinalFallbackIgnoresPublishedDependencyCapacity(t *testing.T) {
+	ctx := context.Background()
+	db, events, _ := openPublicationDrainTestState(t, 4, 4)
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published', published_ts=50, commit_oid='old-commit'
+WHERE seq IN (?, ?)`, events[0].Seq, events[1].Seq); err != nil {
+		t.Fatal(err)
+	}
+	stale := make([]state.IntentCaptureDependency, 0,
+		state.IntentDependencyMaxPerPair)
+	for i := 0; i < state.IntentDependencyMaxPerPair; i++ {
+		stale = append(stale, state.IntentCaptureDependency{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			PrerequisiteSeq: events[0].Seq, DependentSeq: events[1].Seq,
+			Strength: string(ai.IntentDependencySoft),
+			Kind:     fmt.Sprintf("stale_%04d", i),
+		})
+	}
+	if err := state.ReplaceIntentCaptureDependencies(
+		ctx, db, "refs/heads/main", 7, stale); err != nil {
+		t.Fatal(err)
+	}
+	events[2].Path = "active.go"
+	events[3].Path = "active.go"
+	window, err := publicationDrainAtomicFallbackWindow(ctx, db, CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+	}, events[2:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(window) != 2 {
+		t.Fatalf("atomic fallback window=%d, want active hard component", len(window))
+	}
+}
+
 func TestPublicationDrainLocalUnlockSelectsSmallestHardComponent(t *testing.T) {
 	ctx := context.Background()
 	db, events, _ := openPublicationDrainTestState(t, 3, 3)
@@ -571,6 +607,46 @@ func TestPublicationDrainFallbackNoProgressNeedsAttention(t *testing.T) {
 	if blocked.Phase != state.PublicationDrainNeedsAction ||
 		blocked.LastError != "atomic dependency component made no progress" {
 		t.Fatalf("blocked=%+v", blocked)
+	}
+}
+
+func TestPublicationDrainPreflightFailureUsesLocalRecovery(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 2, 2)
+	planRun, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
+		Fingerprint: "sha256:blocked-preflight",
+		BranchRef:   drain.BranchRef, BranchGeneration: drain.BranchGeneration,
+		AttemptLimit: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainSemantic
+	drain, err = state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, ReplaySummary{}, &IntentPlanPreflightError{
+			Failure: "open candidate cap exceeded",
+		}, time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Phase != state.PublicationDrainNormalizing ||
+		normalized.SemanticRebuildAttempts != 1 ||
+		normalized.LastError == "" {
+		t.Fatalf("normalized=%+v", normalized)
+	}
+	var attemptCount int
+	err = db.ReadSQL().QueryRowContext(ctx, `
+SELECT attempt_count FROM intent_plan_runs WHERE fingerprint=?`,
+		planRun.Fingerprint).Scan(&attemptCount)
+	if err != nil || attemptCount != 0 {
+		t.Fatalf("replay recovery consumed provider attempt: attempts=%d err=%v",
+			attemptCount, err)
 	}
 }
 

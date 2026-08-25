@@ -94,6 +94,10 @@ WHERE id=? AND checkpoint_ref=? AND commit_oid=? AND retained=1`, now, checkpoin
 			return fmt.Errorf("state: checkpoint prune identity changed")
 		}
 	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM checkpoint_events WHERE checkpoint_id=?`, checkpointID); err != nil {
+		return fmt.Errorf("state: clear checkpoint event membership: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE operation_steps SET phase='completed',completed_ts=? WHERE operation_id=? AND ord=1`, now, operationID); err != nil {
 		return err
 	}

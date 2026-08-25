@@ -4,4 +4,4 @@ cd "$(dirname "$0")/../.."
 
 go vet ./...
 gofmt -l .
-go test ./... -race -count=1
+scripts/dev/test.sh

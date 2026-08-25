@@ -4,6 +4,14 @@
 
 ### Changed
 
+- Race tests now split the two largest packages into isolated processes and
+  spread repeated stress checks across CI runners. Timing-sensitive cases still
+  run with the race detector, but without competing workloads.
+- Intent planning now validates a local hard-dependency baseline before it
+  reserves a provider attempt. Native v2 providers can refine that baseline,
+  while invalid local state records a skipped call with its finding codes.
+- Planner diagnostics now separate provider attempts from replay-error repeats
+  and report preflight, cache rebuild, and provider-skip outcomes.
 - Updated Lip Gloss to 2.0.6 and ANSI to 0.11.8 for terminal rendering fixes.
   SQLite 1.56.0 includes the upstream journal rollback correction, and CI and
   release workflows now use `actions/checkout` 7.0.1.
@@ -14,6 +22,25 @@
 
 ### Fixed
 
+- Intent planning now removes dependency edges after their captures leave the
+  active window. Long-lived branches no longer exhaust the 4,096-edge limit
+  and stall `commit-all` on already-published history.
+- Unordered soft dependency evidence is now normalized before it reaches the
+  publication graph. References to earlier generated artifacts no longer stop
+  `commit-all` with a reverse-edge error.
+- Published-event retention now keeps captures while a restore checkpoint is
+  live and retires their membership after its private ref is pruned. Cleanup
+  no longer loops on foreign-key errors or leaves stale dependency history.
+- Publication barriers now choose the newest eligible checkpoint even when a
+  migration resets observation epoch numbering. An older high-numbered
+  checkpoint can no longer cause a false `HEAD` mismatch.
+- Forced `commit-all` no longer reuses a cached non-forced waiting plan. Plan
+  identity now covers the complete planning snapshot, including forced aging
+  and hashed captured diffs.
+- Invalid planner output now keeps proven groups, repairs safe dependency and
+  forced-aging findings locally, and returns to a validated local grouping
+  after bounded corrections. Recoverable preflight failures enter local drain
+  recovery instead of immediately requiring manual action.
 - Publication barriers now require a new completed checkpoint for the exact
   worktree, branch, observation, and `HEAD`. A same-branch commit can no longer
   make stale checkpoint proof eligible for publication.
