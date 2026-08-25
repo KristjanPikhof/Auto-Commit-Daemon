@@ -11,6 +11,7 @@ cleanup() {
 trap cleanup EXIT
 
 packages=()
+package_list=$(go list ./...)
 while IFS= read -r package; do
   case "$package" in
     */internal/cli | */internal/daemon)
@@ -19,7 +20,7 @@ while IFS= read -r package; do
       packages[${#packages[@]}]=$package
       ;;
   esac
-done < <(go list ./...)
+done <<<"$package_list"
 
 scripts/dev/test-package-shards.sh ./internal/cli "$shard_count" \
   -race -count=1 >"$output_root/cli.log" 2>&1 &
