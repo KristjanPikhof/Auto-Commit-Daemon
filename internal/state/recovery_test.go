@@ -287,6 +287,129 @@ func TestRecoveryChainTransitionRecoveredIsNonBarrier(t *testing.T) {
 	}
 }
 
+func TestRecoveryChainTransitionSupersedesIntentCandidate(t *testing.T) {
+	t.Parallel()
+	d, chain := seedRecoveryTestChain(t)
+	ctx := context.Background()
+
+	// A candidate can carry prior context in addition to the rows selected by
+	// recovery. Every active membership must be released when any owned event
+	// leaves pending state, or a later plan can pull recovered rows back in.
+	contextSeq := appendRecoveryTestEvent(t, ctx, d,
+		chain[0].Event.BranchRef, chain[0].Event.BranchGeneration,
+		"context-base", "candidate-context.txt", EventStatePublished)
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID:               "recovery-candidate",
+		BranchRef:        chain[0].Event.BranchRef,
+		BranchGeneration: chain[0].Event.BranchGeneration,
+		Status:           IntentCandidateWaiting,
+		Readiness:        IntentReadinessWait,
+		Purpose:          "candidate spanning a recovered chain",
+		Events: []IntentCandidateEvent{
+			{EventSeq: chain[0].Event.Seq, EventRole: "code"},
+			{EventSeq: chain[1].Event.Seq, EventRole: "test"},
+			{EventSeq: contextSeq, EventRole: "context"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveIntentCandidate: %v", err)
+	}
+
+	if _, err := TransitionRecoveryChain(ctx, d, RecoveryChainTransition{
+		Expected:     chain,
+		TargetState:  EventStateRecovered,
+		CommitOID:    "candidate-recovery-commit",
+		RecoveryRef:  "refs/acd/recovery/candidate-membership",
+		Reason:       "candidate membership recovery",
+		TransitionTS: 45,
+	}); err != nil {
+		t.Fatalf("TransitionRecoveryChain: %v", err)
+	}
+
+	var status, readiness string
+	var deadline sql.NullFloat64
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT status,readiness,soft_publication_deadline
+FROM intent_candidates WHERE id='recovery-candidate'`).Scan(
+		&status, &readiness, &deadline); err != nil {
+		t.Fatalf("load recovery candidate: %v", err)
+	}
+	if status != IntentCandidateSuperseded || readiness != IntentReadinessWait || deadline.Valid {
+		t.Fatalf("candidate after recovery=(%q,%q,%+v), want superseded,wait,NULL",
+			status, readiness, deadline)
+	}
+	var active, superseded int
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT COALESCE(SUM(membership_state='active'),0),
+       COALESCE(SUM(membership_state='superseded'),0)
+FROM intent_candidate_events WHERE candidate_id='recovery-candidate'`).Scan(
+		&active, &superseded); err != nil {
+		t.Fatalf("count recovery candidate membership: %v", err)
+	}
+	if active != 0 || superseded != 3 {
+		t.Fatalf("candidate membership active=%d superseded=%d want 0,3",
+			active, superseded)
+	}
+}
+
+func TestRecoveryChainTransitionRollsBackCandidateRetirement(t *testing.T) {
+	t.Parallel()
+	d, chain := seedRecoveryTestChain(t)
+	ctx := context.Background()
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID:               "rollback-candidate",
+		BranchRef:        chain[0].Event.BranchRef,
+		BranchGeneration: chain[0].Event.BranchGeneration,
+		Status:           IntentCandidateWaiting,
+		Readiness:        IntentReadinessWait,
+		Purpose:          "candidate retirement rollback",
+		Events: []IntentCandidateEvent{
+			{EventSeq: chain[0].Event.Seq, EventRole: "code"},
+			{EventSeq: chain[1].Event.Seq, EventRole: "test"},
+		},
+	}); err != nil {
+		t.Fatalf("SaveIntentCandidate: %v", err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `
+CREATE TRIGGER recovery_abort_candidate_retirement
+BEFORE UPDATE OF status ON intent_candidates
+WHEN OLD.id = 'rollback-candidate' AND NEW.status = 'superseded'
+BEGIN
+    SELECT RAISE(ABORT, 'synthetic candidate retirement failure');
+END`); err != nil {
+		t.Fatalf("create candidate rollback trigger: %v", err)
+	}
+
+	_, err := TransitionRecoveryChain(ctx, d, RecoveryChainTransition{
+		Expected:     chain,
+		TargetState:  EventStateRecovered,
+		CommitOID:    "must-roll-back-candidate",
+		RecoveryRef:  "refs/acd/recovery/candidate-rollback",
+		TransitionTS: 46,
+	})
+	if err == nil {
+		t.Fatal("TransitionRecoveryChain unexpectedly retired candidate through abort trigger")
+	}
+	assertRecoveryNoPartialMutation(t, d, chain, 0)
+
+	var status string
+	var active int
+	if err := d.SQL().QueryRowContext(ctx,
+		`SELECT status FROM intent_candidates WHERE id='rollback-candidate'`).Scan(
+		&status); err != nil {
+		t.Fatalf("load rollback candidate: %v", err)
+	}
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_candidate_events
+WHERE candidate_id='rollback-candidate' AND membership_state='active'`).Scan(
+		&active); err != nil {
+		t.Fatalf("count rollback candidate membership: %v", err)
+	}
+	if status != IntentCandidateWaiting || active != 2 {
+		t.Fatalf("candidate changed despite rollback: status=%q active=%d",
+			status, active)
+	}
+}
+
 func TestRecoveryChainTransitionPreservesUnrelatedBookkeeping(t *testing.T) {
 	t.Parallel()
 	d, chain := seedRecoveryTestChain(t)
