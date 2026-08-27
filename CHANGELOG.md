@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-08-27
+
 ### Fixed
 
 - Exact-chain recovery now retires any Intent candidate that still refers to
