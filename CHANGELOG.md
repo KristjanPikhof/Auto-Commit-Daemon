@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Exact-chain recovery now retires any Intent candidate that still refers to
+  a recovered or already published capture. Later edits are planned from the
+  current branch state instead of stale before-state history.
+
 ## v2026-08-25
 
 ### Changed

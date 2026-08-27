@@ -543,6 +543,13 @@ WHERE seq = ?
 		}
 	}
 
+	if err := supersedeRecoveryIntentCandidates(
+		ctx, tx, snapshot.ID, first.BranchRef, first.BranchGeneration,
+		req.TransitionTS,
+	); err != nil {
+		return zero, err
+	}
+
 	if req.InvalidateShadow {
 		if _, err := tx.ExecContext(ctx, `
 DELETE FROM shadow_paths
@@ -581,6 +588,87 @@ WHERE branch_ref = ? AND branch_generation = ?`,
 		return zero, fmt.Errorf("state: commit recovery transition: %w", err)
 	}
 	return snapshot, nil
+}
+
+// supersedeRecoveryIntentCandidates releases every live candidate whose
+// active membership intersects the settled recovery snapshot. Recovery can
+// move only part of a candidate's membership out of pending state, so all of
+// that candidate's active memberships must be released for the remaining
+// pending captures to be planned again without stale recovered members.
+func supersedeRecoveryIntentCandidates(
+	ctx context.Context,
+	tx *sql.Tx,
+	snapshotID int64,
+	branchRef string,
+	branchGeneration int64,
+	transitionTS float64,
+) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT DISTINCT candidate.id
+FROM intent_candidates candidate
+JOIN intent_candidate_events member
+  ON member.candidate_id=candidate.id
+JOIN recovery_snapshot_events recovered
+  ON recovered.event_seq=member.event_seq
+WHERE recovered.snapshot_id=?
+  AND member.membership_state='active'
+  AND candidate.branch_ref=?
+  AND candidate.branch_generation=?
+  AND candidate.status IN ('open','waiting','ready','soft_published','blocked')
+ORDER BY candidate.id`, snapshotID, branchRef, branchGeneration)
+	if err != nil {
+		return fmt.Errorf("state: inspect recovery intent candidates: %w", err)
+	}
+	var candidateIDs []string
+	for rows.Next() {
+		var candidateID string
+		if err := rows.Scan(&candidateID); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("state: scan recovery intent candidate: %w", err)
+		}
+		candidateIDs = append(candidateIDs, candidateID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("state: iterate recovery intent candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("state: close recovery intent candidates: %w", err)
+	}
+
+	for _, candidateID := range candidateIDs {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidate_events
+SET membership_state='superseded'
+WHERE candidate_id=? AND membership_state='active'`, candidateID); err != nil {
+			return fmt.Errorf(
+				"state: supersede recovery candidate %s membership: %w",
+				candidateID, err)
+		}
+		res, err := tx.ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='superseded', readiness='wait',
+    soft_publication_deadline=NULL, updated_ts=?
+WHERE id=?
+  AND branch_ref=?
+  AND branch_generation=?
+  AND status IN ('open','waiting','ready','soft_published','blocked')`,
+			transitionTS, candidateID, branchRef, branchGeneration)
+		if err != nil {
+			return fmt.Errorf(
+				"state: supersede recovery candidate %s: %w", candidateID, err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf(
+				"state: count superseded recovery candidate %s: %w",
+				candidateID, err)
+		}
+		if affected != 1 {
+			return ErrRecoveryChainChanged
+		}
+	}
+	return nil
 }
 
 func validateRecoveryTransition(req RecoveryChainTransition) error {
