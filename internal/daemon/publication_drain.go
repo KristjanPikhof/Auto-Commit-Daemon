@@ -242,7 +242,7 @@ func ResumePublicationDrainCheckpointing(
 	if err == nil && currentHeadText != observedHead {
 		var safe bool
 		safe, err = publicationDrainOwnsHeadAdvance(
-			ctx, repoRoot, db, drain, observedHead, currentHeadText)
+			ctx, db, drain, observedHead, currentHeadText)
 		if err == nil && !safe {
 			err = fmt.Errorf(
 				publicationDrainHeadChangedPrefix+" observed=%s current=%s",
@@ -307,7 +307,6 @@ func ResumePublicationDrainCheckpointing(
 
 func publicationDrainOwnsHeadAdvance(
 	ctx context.Context,
-	repoRoot string,
 	db *state.DB,
 	drain state.PublicationDrain,
 	observedHead string,
@@ -316,58 +315,10 @@ func publicationDrainOwnsHeadAdvance(
 	if observedHead == "" || currentHead == "" {
 		return false, nil
 	}
-	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
-		"merge-base", "--is-ancestor", observedHead, currentHead); err != nil {
-		return false, nil
-	}
-	output, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
-		"rev-list", "--first-parent", "--reverse", "--max-count=4097",
-		observedHead+".."+currentHead)
-	if err != nil {
-		return false, err
-	}
-	commits := strings.Fields(string(output))
-	if len(commits) == 0 || len(commits) > 4096 {
-		return false, nil
-	}
-	sources := make(map[string]string, len(commits))
-	const batchSize = 400
-	for start := 0; start < len(commits); start += batchSize {
-		end := min(start+batchSize, len(commits))
-		placeholders := make([]string, 0, end-start)
-		args := make([]any, 0, end-start+2)
-		args = append(args, drain.BranchRef, drain.BranchGeneration)
-		for _, commit := range commits[start:end] {
-			placeholders = append(placeholders, "?")
-			args = append(args, commit)
-		}
-		rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT target_commit_oid,source_head FROM self_publications
-WHERE branch_ref=? AND branch_generation=? AND phase='completed'
-  AND target_commit_oid IN (`+strings.Join(placeholders, ",")+`)`, args...)
-		if err != nil {
-			return false, err
-		}
-		for rows.Next() {
-			var target, source string
-			if err := rows.Scan(&target, &source); err != nil {
-				rows.Close()
-				return false, err
-			}
-			sources[target] = source
-		}
-		if err := rows.Close(); err != nil {
-			return false, err
-		}
-	}
-	expectedSource := observedHead
-	for _, commit := range commits {
-		if sources[commit] != expectedSource {
-			return false, nil
-		}
-		expectedSource = commit
-	}
-	return true, nil
+	_, owned, err := state.CompletedBranchTransitionChain(
+		ctx, db, drain.BranchRef, drain.BranchGeneration,
+		observedHead, currentHead)
+	return owned, err
 }
 
 // ResumePublicationDrainNormalization retires the stalled semantic pass at a

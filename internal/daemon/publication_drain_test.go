@@ -759,7 +759,7 @@ func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
 		previous = target
 	}
 	if safe, err := publicationDrainOwnsHeadAdvance(
-		ctx, repo, db, drain, base, previous); err != nil || !safe {
+		ctx, db, drain, base, previous); err != nil || !safe {
 		t.Fatalf("owned advance=(%t,%v), want true,nil", safe, err)
 	}
 	if _, err := db.SQL().ExecContext(ctx,
@@ -787,7 +787,7 @@ func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
 	}
 	externalHead := commit("external\n", "external")
 	if safe, err := publicationDrainOwnsHeadAdvance(
-		ctx, repo, db, drain, base, externalHead); err != nil || safe {
+		ctx, db, drain, base, externalHead); err != nil || safe {
 		t.Fatalf("external advance=(%t,%v), want false,nil", safe, err)
 	}
 }
