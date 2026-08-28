@@ -743,8 +743,8 @@ WHERE repair_id=? AND ord=1`, repair.ID); err == nil ||
 	if _, err := d.SQL().ExecContext(ctx, `
 INSERT INTO intent_repair_members(
     repair_id,ord,candidate_id,event_seq,prior_state
-) VALUES (?,2,'repair-member-candidate',999,'pending')`, repair.ID); err == nil ||
-		!strings.Contains(err.Error(), "requires prepared repair") {
+	) VALUES (?,2,'repair-member-candidate',999,'pending')`, repair.ID); err == nil ||
+		!strings.Contains(err.Error(), "membership is not open") {
 		t.Fatalf("late repair membership error=%v", err)
 	}
 	if _, err := d.SQL().ExecContext(ctx,
@@ -902,18 +902,44 @@ SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&
 	}
 }
 
-func TestIntentRepairMembershipV24MigrationLeavesLegacyRowsEmpty(t *testing.T) {
+func TestIntentRepairMembershipV24RuntimeMigrationSealsLegacyRows(t *testing.T) {
 	t.Parallel()
 	d, dbPath := openTestDB(t)
 	ctx := context.Background()
-	legacy := IntentRepair{
-		ID: "legacy-v23-repair", BranchRef: "refs/heads/main",
-		BranchGeneration: 3, ExpectedHead: "legacy-head",
-		PlanDigest: testIntentRepairPlanDigest,
-		Commits:    []IntentRepairCommit{{OldOID: "legacy-head"}},
+	legacyStatuses := map[string]string{
+		"legacy-prepared":    IntentRepairPrepared,
+		"legacy-git-applied": IntentRepairGitApplied,
+		"legacy-completed":   IntentRepairCompleted,
 	}
-	if err := SaveIntentRepair(ctx, d, legacy); err != nil {
-		t.Fatal(err)
+	for id, status := range legacyStatuses {
+		if err := SaveIntentRepair(ctx, d, IntentRepair{
+			ID: id, BranchRef: "refs/heads/main", BranchGeneration: 3,
+			ExpectedHead: "old-" + id, PlanDigest: testIntentRepairPlanDigest,
+			MembershipMode: IntentRepairMembershipNone,
+			Commits: []IntentRepairCommit{{
+				CandidateID: sql.NullString{String: "candidate-" + id, Valid: true},
+				OldOID:      "old-" + id,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if status == IntentRepairPrepared {
+			continue
+		}
+		completedTS := any(nil)
+		if status == IntentRepairCompleted {
+			completedTS = 3.0
+		}
+		if _, err := d.SQL().ExecContext(ctx, `
+UPDATE intent_repairs
+SET status=?, backup_ref=?, old_head=expected_head, new_head=?,
+    git_applied_ts=2, completed_ts=?
+WHERE id=?;
+UPDATE intent_repair_commits SET new_oid=? WHERE repair_id=?`,
+			status, "refs/acd/intent-repair/legacy/"+id+"/backup",
+			"new-"+id, completedTS, id, "new-"+id, id); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
@@ -924,6 +950,7 @@ func TestIntentRepairMembershipV24MigrationLeavesLegacyRowsEmpty(t *testing.T) {
 	}
 	if _, err := raw.ExecContext(ctx, `
 DROP TABLE intent_repair_members;
+DROP TABLE intent_repair_member_seals;
 PRAGMA user_version=23;`); err != nil {
 		_ = raw.Close()
 		t.Fatal(err)
@@ -931,21 +958,29 @@ PRAGMA user_version=23;`); err != nil {
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	migrated, err := Open(ctx, dbPath)
+	migrated, err := OpenRuntime(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer migrated.Close()
-	stored, ok, err := IntentRepairByID(ctx, migrated, legacy.ID)
-	if err != nil || !ok || len(stored.Members) != 0 {
-		t.Fatalf("legacy repair=%+v ok=%v err=%v", stored, ok, err)
+	for id, status := range legacyStatuses {
+		stored, ok, err := IntentRepairByID(ctx, migrated, id)
+		if err != nil || !ok || stored.Status != status ||
+			stored.MembershipMode != IntentRepairMembershipLegacy ||
+			len(stored.Members) != 0 {
+			t.Fatalf("legacy repair %s=%+v ok=%v err=%v",
+				id, stored, ok, err)
+		}
 	}
-	var table string
-	if err := migrated.SQL().QueryRowContext(ctx, `
-SELECT name FROM sqlite_master
-WHERE type='table' AND name='intent_repair_members'`).Scan(&table); err != nil ||
-		table != "intent_repair_members" {
-		t.Fatalf("migrated member table=%q err=%v", table, err)
+	for _, table := range []string{
+		"intent_repair_members", "intent_repair_member_seals",
+	} {
+		var found string
+		if err := migrated.SQL().QueryRowContext(ctx, `
+SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).
+			Scan(&found); err != nil || found != table {
+			t.Fatalf("migrated table %s=%q err=%v", table, found, err)
+		}
 	}
 }
 
@@ -1216,5 +1251,6 @@ func intentV2TableNames() []string {
 		"intent_repairs",
 		"intent_repair_commits",
 		"intent_repair_members",
+		"intent_repair_member_seals",
 	}
 }
