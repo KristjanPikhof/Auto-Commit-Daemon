@@ -119,6 +119,11 @@ func ProveUnpublishedChain(
 	}
 	first := chain[0].Event
 	last := chain[len(chain)-1].Event
+	baseHead, err := canonicalRecoveryBase(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, first.BaseHead)
+	if err != nil {
+		return result, err
+	}
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
 		ctx, db, opts.BranchRef, opts.BranchGeneration, first.Seq, last.Seq,
 	)
@@ -130,12 +135,12 @@ func ProveUnpublishedChain(
 		return result, err
 	}
 	recoveryContext, err = excludeSeedRepresentedPublishedContext(
-		ctx, repoRoot, first.BaseHead, recoveryContext,
+		ctx, repoRoot, baseHead, recoveryContext,
 	)
 	if err != nil {
 		return result, err
 	}
-	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, first.BaseHead, recoveryContext)
+	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, baseHead, recoveryContext)
 	if err != nil {
 		return result, err
 	}
@@ -157,7 +162,7 @@ func ProveUnpublishedChain(
 	if err := validateRecoveryObjects(ctx, repoRoot, materialization); err != nil {
 		return result, err
 	}
-	finalState, err := materializeRecoveryState(ctx, repoRoot, first.BaseHead, recoveryContext, chain)
+	finalState, err := materializeRecoveryState(ctx, repoRoot, baseHead, recoveryContext, chain)
 	if err != nil {
 		return result, err
 	}
@@ -216,6 +221,11 @@ func ReconcileUnpublishedChain(
 	}
 	first := chain[0].Event
 	last := chain[len(chain)-1].Event
+	baseHead, err := canonicalRecoveryBase(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, first.BaseHead)
+	if err != nil {
+		return result, err
+	}
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
 		ctx, db, opts.BranchRef, opts.BranchGeneration,
 		first.Seq, last.Seq,
@@ -228,12 +238,12 @@ func ReconcileUnpublishedChain(
 		return result, err
 	}
 	recoveryContext, err = excludeSeedRepresentedPublishedContext(
-		ctx, repoRoot, first.BaseHead, recoveryContext,
+		ctx, repoRoot, baseHead, recoveryContext,
 	)
 	if err != nil {
 		return result, err
 	}
-	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, first.BaseHead, recoveryContext)
+	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, baseHead, recoveryContext)
 	if err != nil {
 		return result, err
 	}
@@ -262,7 +272,6 @@ func ReconcileUnpublishedChain(
 		return result, err
 	}
 
-	baseHead := chain[0].Event.BaseHead
 	materialization := make([]state.RecoveryChainEvent, 0, len(recoveryContext)+len(chain))
 	materialization = append(materialization, recoveryContext...)
 	materialization = append(materialization, chain...)
@@ -379,9 +388,30 @@ func ReconcileUnpublishedChain(
 		"first_seq":    snapshot.FirstEventSeq,
 		"last_seq":     snapshot.LastEventSeq,
 		"event_count":  snapshot.EventCount,
-		"source_head":  baseHead,
+		"source_head":  first.BaseHead,
+		"repaired_base": baseHead,
 	})
 	return result, nil
+}
+
+func canonicalRecoveryBase(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	branchGeneration int64,
+	baseHead string,
+) (string, error) {
+	canonical, mapped, err := state.CanonicalCompletedIntentRepairCommit(
+		ctx, db, branchRef, branchGeneration, baseHead)
+	if err != nil {
+		return "", fmt.Errorf(
+			"daemon: reconcile recovery chain: resolve repaired base %s: %w",
+			baseHead, err)
+	}
+	if mapped {
+		return canonical, nil
+	}
+	return baseHead, nil
 }
 
 // reconcileActiveBarrierChain uses the existence of any terminal row as its
