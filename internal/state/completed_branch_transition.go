@@ -16,7 +16,7 @@ const (
 
 	// CompletedBranchTransitionProofLimit bounds journal traversal when ACD
 	// must distinguish its own ref movement from an external Git operation.
-	CompletedBranchTransitionProofLimit = 64
+	CompletedBranchTransitionProofLimit = 4096
 )
 
 // CompletedBranchTransition is one immutable, completed ACD-authored ref
