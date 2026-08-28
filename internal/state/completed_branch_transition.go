@@ -188,6 +188,7 @@ func completedIntentRepairMappings(
 			"state: completed intent repair %s has incomplete transition proof",
 			transition.ID)
 	}
+	headMappings := 0
 	for _, mapping := range repair.Commits {
 		if mapping.OldOID == "" || !mapping.NewOID.Valid ||
 			mapping.NewOID.String == "" || !mapping.CandidateID.Valid ||
@@ -196,10 +197,12 @@ func completedIntentRepairMappings(
 				"state: completed intent repair %s has incomplete commit mapping",
 				transition.ID)
 		}
+		if mapping.OldOID == transition.SourceHead &&
+			mapping.NewOID.String == transition.TargetHead {
+			headMappings++
+		}
 	}
-	last := repair.Commits[len(repair.Commits)-1]
-	if last.OldOID != transition.SourceHead ||
-		last.NewOID.String != transition.TargetHead {
+	if headMappings != 1 {
 		return nil, fmt.Errorf(
 			"state: completed intent repair %s does not map its exact head",
 			transition.ID)

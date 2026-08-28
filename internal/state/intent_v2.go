@@ -182,8 +182,8 @@ type IntentRepairCommit struct {
 // IntentRepairMember is one immutable active candidate membership captured
 // before the repair is allowed to change Git. Legacy repairs have no members.
 type IntentRepairMember struct {
-	RepairID   string
-	Ord        int
+	RepairID    string
+	Ord         int
 	CandidateID string
 	EventSeq    int64
 	PriorState  string
@@ -1278,9 +1278,128 @@ WHERE consumed_ts IS NULL AND epoch<=?`, consumedTS, throughEpoch)
 	return n, nil
 }
 
+// SnapshotIntentRepairMembers reads the exact active membership that a new
+// repair intends to settle. SaveIntentRepair revalidates the snapshot in its
+// prepared transaction, so a concurrent membership or capture-state change
+// makes preparation fail closed.
+func SnapshotIntentRepairMembers(
+	ctx context.Context,
+	d *DB,
+	repairID, branchRef string,
+	branchGeneration int64,
+	candidateIDs []string,
+) ([]IntentRepairMember, error) {
+	if d == nil || strings.TrimSpace(repairID) == "" || branchRef == "" ||
+		branchGeneration < 0 || len(candidateIDs) == 0 ||
+		len(candidateIDs) > IntentRepairMaxCommits {
+		return nil, errors.New("state: SnapshotIntentRepairMembers: invalid input")
+	}
+	seenCandidates := make(map[string]struct{}, len(candidateIDs))
+	seenEvents := make(map[int64]struct{})
+	members := make([]IntentRepairMember, 0)
+	for _, candidateID := range candidateIDs {
+		if err := boundedIntentLabel("intent repair candidate id", candidateID,
+			128, true); err != nil {
+			return nil, err
+		}
+		if _, duplicate := seenCandidates[candidateID]; duplicate {
+			continue
+		}
+		seenCandidates[candidateID] = struct{}{}
+
+		var status string
+		if err := d.readSQL().QueryRowContext(ctx, `
+SELECT status FROM intent_candidates
+WHERE id=? AND branch_ref=? AND branch_generation=?`,
+			candidateID, branchRef, branchGeneration).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, fmt.Errorf(
+					"state: intent repair candidate %s is outside the exact branch pair",
+					candidateID)
+			}
+			return nil, fmt.Errorf("state: load intent repair candidate %s: %w",
+				candidateID, err)
+		}
+		if status != IntentCandidateReady &&
+			status != IntentCandidateSoftPublished &&
+			status != IntentCandidatePublished {
+			return nil, fmt.Errorf("state: intent repair candidate %s is %s",
+				candidateID, status)
+		}
+
+		rows, err := d.readSQL().QueryContext(ctx, `
+SELECT event.seq, event.state, event.commit_oid
+FROM intent_candidate_events membership
+JOIN capture_events event ON event.seq=membership.event_seq
+WHERE membership.candidate_id=?
+  AND membership.membership_state='active'
+  AND event.branch_ref=? AND event.branch_generation=?
+ORDER BY membership.ord, event.seq`, candidateID, branchRef, branchGeneration)
+		if err != nil {
+			return nil, fmt.Errorf("state: snapshot intent repair candidate %s: %w",
+				candidateID, err)
+		}
+		candidateMembers := 0
+		for rows.Next() {
+			var eventSeq int64
+			var priorState string
+			var commitOID sql.NullString
+			if err := rows.Scan(&eventSeq, &priorState, &commitOID); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("state: scan intent repair member: %w", err)
+			}
+			if priorState != EventStatePending && priorState != EventStatePublished {
+				_ = rows.Close()
+				return nil, fmt.Errorf(
+					"state: intent repair event %d is %s", eventSeq, priorState)
+			}
+			if (priorState == EventStatePending && commitOID.Valid) ||
+				(priorState == EventStatePublished &&
+					(!commitOID.Valid || commitOID.String == "")) {
+				_ = rows.Close()
+				return nil, fmt.Errorf(
+					"state: intent repair event %d has inconsistent commit identity",
+					eventSeq)
+			}
+			if _, duplicate := seenEvents[eventSeq]; duplicate {
+				_ = rows.Close()
+				return nil, fmt.Errorf(
+					"state: intent repair event %d has multiple active owners",
+					eventSeq)
+			}
+			seenEvents[eventSeq] = struct{}{}
+			members = append(members, IntentRepairMember{
+				RepairID: repairID, Ord: len(members), CandidateID: candidateID,
+				EventSeq: eventSeq, PriorState: priorState,
+			})
+			candidateMembers++
+			if len(members) > IntentRepairMaxMembers {
+				_ = rows.Close()
+				return nil, fmt.Errorf("state: intent repair member cap %d exceeded",
+					IntentRepairMaxMembers)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("state: iterate intent repair candidate %s: %w",
+				candidateID, err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("state: close intent repair members: %w", err)
+		}
+		if candidateMembers == 0 {
+			return nil, fmt.Errorf(
+				"state: intent repair candidate %s has no active membership",
+				candidateID)
+		}
+	}
+	return members, nil
+}
+
 // SaveIntentRepair stores the prepared row and its old-to-new mapping
-// atomically. Automatic repairs are capped at five commits regardless of
-// caller preset.
+// plus any exact membership snapshot atomically. Automatic repairs are capped
+// at five commits regardless of caller preset. Empty membership is accepted
+// only for legacy callers and historical repair compatibility.
 func SaveIntentRepair(ctx context.Context, d *DB, repair IntentRepair) error {
 	if d == nil {
 		return errors.New("state: SaveIntentRepair: nil db")
@@ -1320,6 +1439,14 @@ INSERT INTO intent_repairs(
 	}
 	if err := replaceIntentRepairCommits(ctx, tx, repair.ID, repair.Commits); err != nil {
 		return err
+	}
+	if err := insertIntentRepairMembers(ctx, tx, repair); err != nil {
+		return err
+	}
+	if len(repair.Members) > 0 {
+		if err := validateStoredIntentRepairMembers(ctx, tx, repair); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("state: commit intent repair save: %w", err)
@@ -1388,6 +1515,9 @@ WHERE id=? AND status=?`,
 		if err := replaceIntentRepairCommits(ctx, tx, id, transition.Commits); err != nil {
 			return false, err
 		}
+		if err := validateTransitionedIntentRepairMembers(ctx, tx, id); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("state: commit intent repair transition: %w", err)
@@ -1412,6 +1542,11 @@ func IntentRepairByID(ctx context.Context, d *DB, id string) (IntentRepair, bool
 		return IntentRepair{}, false, err
 	}
 	repair.Commits = commits
+	members, err := loadIntentRepairMembers(ctx, d.readSQL(), id)
+	if err != nil {
+		return IntentRepair{}, false, err
+	}
+	repair.Members = members
 	return repair, true, nil
 }
 
@@ -1440,6 +1575,11 @@ func RecoverableIntentRepairs(ctx context.Context, d *DB, limit int) ([]IntentRe
 			return nil, err
 		}
 		repair.Commits = commits
+		members, err := loadIntentRepairMembers(ctx, d.readSQL(), repair.ID)
+		if err != nil {
+			return nil, err
+		}
+		repair.Members = members
 		out = append(out, repair)
 	}
 	if err := rows.Err(); err != nil {
@@ -1497,6 +1637,175 @@ INSERT INTO intent_repair_commits(
 	return nil
 }
 
+func insertIntentRepairMembers(
+	ctx context.Context,
+	tx *sql.Tx,
+	repair IntentRepair,
+) error {
+	for _, member := range repair.Members {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO intent_repair_members(
+    repair_id, ord, candidate_id, event_seq, prior_state
+) VALUES (?, ?, ?, ?, ?)`,
+			member.RepairID, member.Ord, member.CandidateID,
+			member.EventSeq, member.PriorState); err != nil {
+			return fmt.Errorf("state: insert intent repair member %d: %w",
+				member.Ord, err)
+		}
+	}
+	return nil
+}
+
+// validateStoredIntentRepairMembers proves that the immutable rows are the
+// complete active membership for every mapped candidate and still describe
+// the exact pre-repair capture state. It runs inside the prepared transaction.
+func validateStoredIntentRepairMembers(
+	ctx context.Context,
+	q intentV2Queryer,
+	repair IntentRepair,
+) error {
+	var stored int
+	if err := q.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_repair_members WHERE repair_id=?`, repair.ID).
+		Scan(&stored); err != nil {
+		return fmt.Errorf("state: count intent repair members: %w", err)
+	}
+	if stored != len(repair.Members) {
+		return fmt.Errorf("state: intent repair member count=%d want=%d",
+			stored, len(repair.Members))
+	}
+
+	var exact int
+	if err := q.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM intent_repair_members owned
+JOIN intent_candidates candidate
+  ON candidate.id=owned.candidate_id
+ AND candidate.branch_ref=? AND candidate.branch_generation=?
+ AND candidate.status IN ('ready','soft_published','published')
+JOIN intent_candidate_events membership
+  ON membership.candidate_id=owned.candidate_id
+ AND membership.event_seq=owned.event_seq
+ AND membership.membership_state='active'
+JOIN capture_events event
+  ON event.seq=owned.event_seq
+ AND event.branch_ref=? AND event.branch_generation=?
+ AND event.state=owned.prior_state
+WHERE owned.repair_id=?
+  AND (
+      (owned.prior_state='pending' AND event.commit_oid IS NULL)
+      OR
+      (owned.prior_state='published' AND event.commit_oid IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM intent_repair_commits mapped
+           WHERE mapped.repair_id=owned.repair_id
+             AND mapped.candidate_id=owned.candidate_id
+             AND mapped.old_oid=event.commit_oid
+       ))
+  )`, repair.BranchRef, repair.BranchGeneration,
+		repair.BranchRef, repair.BranchGeneration, repair.ID).Scan(&exact); err != nil {
+		return fmt.Errorf("state: inspect exact intent repair membership: %w", err)
+	}
+	if exact != len(repair.Members) {
+		return fmt.Errorf(
+			"state: intent repair ownership changed: exact members=%d want=%d",
+			exact, len(repair.Members))
+	}
+
+	var incomplete int
+	if err := q.QueryRowContext(ctx, `
+WITH expected AS (
+    SELECT candidate_id, COUNT(*) AS member_count
+    FROM intent_repair_members
+    WHERE repair_id=?
+    GROUP BY candidate_id
+), active AS (
+    SELECT membership.candidate_id, COUNT(*) AS member_count
+    FROM intent_candidate_events membership
+    JOIN expected ON expected.candidate_id=membership.candidate_id
+    WHERE membership.membership_state='active'
+    GROUP BY membership.candidate_id
+)
+SELECT COUNT(*)
+FROM expected
+LEFT JOIN active USING(candidate_id)
+WHERE COALESCE(active.member_count, 0)<>expected.member_count`, repair.ID).
+		Scan(&incomplete); err != nil {
+		return fmt.Errorf("state: inspect complete intent repair membership: %w", err)
+	}
+	if incomplete != 0 {
+		return fmt.Errorf(
+			"state: intent repair ownership changed: %d candidates have incomplete membership",
+			incomplete)
+	}
+
+	var overlapping int
+	if err := q.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM intent_repair_members owned
+JOIN intent_repair_members other
+  ON other.event_seq=owned.event_seq AND other.repair_id<>owned.repair_id
+JOIN intent_repairs repair
+  ON repair.id=other.repair_id AND repair.status IN ('prepared','git_applied')
+WHERE owned.repair_id=?`, repair.ID).Scan(&overlapping); err != nil {
+		return fmt.Errorf("state: inspect overlapping intent repairs: %w", err)
+	}
+	if overlapping != 0 {
+		return fmt.Errorf(
+			"state: intent repair ownership changed: %d events have overlapping live repairs",
+			overlapping)
+	}
+	return nil
+}
+
+func validateTransitionedIntentRepairMembers(
+	ctx context.Context,
+	tx *sql.Tx,
+	repairID string,
+) error {
+	var repair IntentRepair
+	var memberCount int
+	if err := tx.QueryRowContext(ctx, `
+SELECT repair.branch_ref, repair.branch_generation,
+       COUNT(member.event_seq)
+FROM intent_repairs repair
+LEFT JOIN intent_repair_members member ON member.repair_id=repair.id
+WHERE repair.id=?
+GROUP BY repair.id`, repairID).Scan(
+		&repair.BranchRef, &repair.BranchGeneration, &memberCount); err != nil {
+		return fmt.Errorf("state: load transitioned intent repair membership: %w", err)
+	}
+	if memberCount == 0 {
+		return nil
+	}
+	repair.ID = repairID
+	repair.Members = make([]IntentRepairMember, memberCount)
+	if err := validateStoredIntentRepairMembers(ctx, tx, repair); err != nil {
+		return err
+	}
+	var unmapped int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM intent_repair_commits mapped
+WHERE mapped.repair_id=?
+  AND (
+      mapped.candidate_id IS NULL
+      OR NOT EXISTS (
+          SELECT 1 FROM intent_repair_members member
+          WHERE member.repair_id=mapped.repair_id
+            AND member.candidate_id=mapped.candidate_id
+      )
+  )`, repairID).Scan(&unmapped); err != nil {
+		return fmt.Errorf("state: inspect transitioned intent repair mapping: %w", err)
+	}
+	if unmapped != 0 {
+		return fmt.Errorf(
+			"state: intent repair mapping changed: %d commits have no immutable membership",
+			unmapped)
+	}
+	return nil
+}
+
 func loadIntentRepairCommits(ctx context.Context, q intentV2Queryer, repairID string) ([]IntentRepairCommit, error) {
 	rows, err := q.QueryContext(ctx, `
 SELECT repair_id, ord, candidate_id, old_oid, new_oid
@@ -1517,6 +1826,34 @@ WHERE repair_id=? ORDER BY ord`, repairID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("state: iterate intent repair commits: %w", err)
+	}
+	return out, nil
+}
+
+func loadIntentRepairMembers(
+	ctx context.Context,
+	q intentV2Queryer,
+	repairID string,
+) ([]IntentRepairMember, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT repair_id, ord, candidate_id, event_seq, prior_state
+FROM intent_repair_members
+WHERE repair_id=? ORDER BY ord`, repairID)
+	if err != nil {
+		return nil, fmt.Errorf("state: query intent repair members: %w", err)
+	}
+	defer rows.Close()
+	var out []IntentRepairMember
+	for rows.Next() {
+		var member IntentRepairMember
+		if err := rows.Scan(&member.RepairID, &member.Ord,
+			&member.CandidateID, &member.EventSeq, &member.PriorState); err != nil {
+			return nil, fmt.Errorf("state: scan intent repair member: %w", err)
+		}
+		out = append(out, member)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate intent repair members: %w", err)
 	}
 	return out, nil
 }
@@ -1751,6 +2088,62 @@ func validateIntentRepair(repair IntentRepair) error {
 	if len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxCommits {
 		return fmt.Errorf("state: intent repair requires 1..%d commits",
 			IntentRepairMaxCommits)
+	}
+	if err := validateIntentRepairMembers(repair); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateIntentRepairMembers(repair IntentRepair) error {
+	if len(repair.Members) == 0 {
+		return nil
+	}
+	if len(repair.Members) > IntentRepairMaxMembers {
+		return fmt.Errorf("state: intent repair member cap %d exceeded",
+			IntentRepairMaxMembers)
+	}
+	repairCandidates := make(map[string]struct{})
+	for _, commit := range repair.Commits {
+		if !commit.CandidateID.Valid ||
+			strings.TrimSpace(commit.CandidateID.String) == "" {
+			return errors.New(
+				"state: immutable intent repair membership requires candidate mappings")
+		}
+		repairCandidates[commit.CandidateID.String] = struct{}{}
+	}
+	memberCandidates := make(map[string]struct{})
+	seenEvents := make(map[int64]struct{}, len(repair.Members))
+	for ord, member := range repair.Members {
+		if member.RepairID != repair.ID || member.Ord != ord ||
+			member.EventSeq <= 0 {
+			return fmt.Errorf("state: invalid intent repair member %d identity", ord)
+		}
+		if err := boundedIntentLabel("intent repair member candidate id",
+			member.CandidateID, 128, true); err != nil {
+			return err
+		}
+		if member.PriorState != EventStatePending &&
+			member.PriorState != EventStatePublished {
+			return fmt.Errorf("state: invalid intent repair member %d prior state %q",
+				ord, member.PriorState)
+		}
+		if _, duplicate := seenEvents[member.EventSeq]; duplicate {
+			return fmt.Errorf("state: duplicate intent repair event %d",
+				member.EventSeq)
+		}
+		seenEvents[member.EventSeq] = struct{}{}
+		if _, mapped := repairCandidates[member.CandidateID]; !mapped {
+			return fmt.Errorf("state: intent repair member candidate %s has no commit mapping",
+				member.CandidateID)
+		}
+		memberCandidates[member.CandidateID] = struct{}{}
+	}
+	for candidateID := range repairCandidates {
+		if _, exists := memberCandidates[candidateID]; !exists {
+			return fmt.Errorf("state: intent repair candidate %s has no immutable membership",
+				candidateID)
+		}
 	}
 	return nil
 }

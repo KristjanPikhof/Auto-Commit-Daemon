@@ -124,6 +124,13 @@ func ApplyIntentRepairTransaction(
 	if !check.Eligible {
 		return persistSkippedIntentRepair(ctx, db, plan, check.Reason)
 	}
+	members, err := state.SnapshotIntentRepairMembers(
+		ctx, db, plan.ID, plan.BranchRef, plan.BranchGeneration,
+		intentRepairCandidateIDs(plan))
+	if err != nil {
+		return result, fmt.Errorf(
+			"daemon: intent repair: snapshot immutable membership: %w", err)
+	}
 
 	prepared := state.IntentRepair{
 		ID: plan.ID, BranchRef: plan.BranchRef,
@@ -132,6 +139,7 @@ func ApplyIntentRepairTransaction(
 		PlanDigest: plan.PlanDigest,
 		OldHead:    sql.NullString{String: plan.ExpectedHead, Valid: true},
 		Commits:    intentRepairStateCommits(plan, nil),
+		Members:    members,
 	}
 	if err := state.SaveIntentRepair(ctx, db, prepared); err != nil {
 		return result, fmt.Errorf("daemon: intent repair: persist prepared transaction: %w", err)
@@ -346,6 +354,25 @@ func completeIntentRepair(
 	mappings []state.IntentRepairCommit,
 	newHead string,
 ) error {
+	repair, exists, err := state.IntentRepairByID(ctx, db, repairID)
+	if err != nil {
+		return err
+	}
+	if !exists || (repair.Status != state.IntentRepairGitApplied &&
+		repair.Status != state.IntentRepairCompleted) {
+		return errors.New(
+			"daemon: complete intent repair: durable Git-applied row is unavailable")
+	}
+	if repair.BranchRef != cctx.BranchRef ||
+		repair.BranchGeneration != cctx.BranchGeneration {
+		return errors.New("daemon: complete intent repair: exact branch pair changed")
+	}
+	if repair.NewHead.Valid && repair.NewHead.String != newHead {
+		return errors.New("daemon: complete intent repair: durable new head changed")
+	}
+	if len(repair.Commits) > 0 {
+		mappings = repair.Commits
+	}
 	reconcile := make(map[string]string, len(mappings))
 	candidates := make(map[string]string)
 	for _, mapping := range mappings {
@@ -354,11 +381,18 @@ func completeIntentRepair(
 		}
 		reconcile[mapping.OldOID] = mapping.NewOID.String
 		if mapping.CandidateID.Valid {
-			candidates[mapping.CandidateID.String] = mapping.NewOID.String
+			candidateID := mapping.CandidateID.String
+			if existing := candidates[candidateID]; existing != "" &&
+				existing != mapping.NewOID.String {
+				return fmt.Errorf(
+					"daemon: complete intent repair: candidate %s maps to multiple commits",
+					candidateID)
+			}
+			candidates[candidateID] = mapping.NewOID.String
 		}
 	}
 	if err := reconcileIntentRepairLedger(ctx, db, repairID, reconcile, candidates,
-		cctx, newHead); err != nil {
+		repair.Members, cctx, newHead); err != nil {
 		return err
 	}
 	reseed := cctx
@@ -391,6 +425,7 @@ func reconcileIntentRepairLedger(
 	db *state.DB,
 	repairID string,
 	commitMap, candidateMap map[string]string,
+	members []state.IntentRepairMember,
 	cctx CaptureContext,
 	newHead string,
 ) error {
@@ -407,13 +442,36 @@ func reconcileIntentRepairLedger(
 	if status != state.IntentRepairGitApplied && status != state.IntentRepairCompleted {
 		return fmt.Errorf("daemon: intent repair ledger: transaction is %s", status)
 	}
+	memberCounts := make(map[string]int)
+	if len(members) > 0 {
+		for _, member := range members {
+			if candidateMap[member.CandidateID] == "" {
+				return fmt.Errorf(
+					"daemon: intent repair ledger: member candidate %s has no new commit",
+					member.CandidateID)
+			}
+			memberCounts[member.CandidateID]++
+		}
+		if len(memberCounts) != len(candidateMap) {
+			return errors.New(
+				"daemon: intent repair ledger: durable membership and candidate mapping differ")
+		}
+		if err := validateIntentRepairSettlement(
+			ctx, tx, repairID, len(members), cctx); err != nil {
+			return err
+		}
+	}
 	for oldOID, newOID := range commitMap {
-		for _, query := range []string{
-			`UPDATE capture_events SET commit_oid=? WHERE commit_oid=?`,
+		queries := []string{
 			`UPDATE decision_records SET commit_oid=? WHERE commit_oid=?`,
 			`UPDATE publish_state SET target_commit_oid=? WHERE target_commit_oid=?`,
 			`UPDATE publish_state SET source_head=? WHERE source_head=?`,
-		} {
+		}
+		if len(members) == 0 {
+			queries = append(queries,
+				`UPDATE capture_events SET commit_oid=? WHERE commit_oid=?`)
+		}
+		for _, query := range queries {
 			if _, err := tx.ExecContext(ctx, query, newOID, oldOID); err != nil {
 				return fmt.Errorf("daemon: intent repair ledger: reconcile oid: %w", err)
 			}
@@ -433,6 +491,32 @@ WHERE id=? AND branch_ref=? AND branch_generation=?
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			return fmt.Errorf("daemon: intent repair ledger: candidate %s is not repairable", candidateID)
+		}
+		if len(members) > 0 {
+			res, err := tx.ExecContext(ctx, `
+UPDATE capture_events
+SET state='published', commit_oid=?, published_ts=?, error=NULL
+WHERE branch_ref=? AND branch_generation=?
+  AND seq IN (
+      SELECT event_seq FROM intent_repair_members
+      WHERE repair_id=? AND candidate_id=?
+  )`, commitOID, now, cctx.BranchRef, cctx.BranchGeneration,
+				repairID, candidateID)
+			if err != nil {
+				return fmt.Errorf(
+					"daemon: intent repair ledger: settle immutable candidate captures: %w",
+					err)
+			}
+			if n, countErr := res.RowsAffected(); countErr != nil {
+				return fmt.Errorf(
+					"daemon: intent repair ledger: count immutable candidate captures: %w",
+					countErr)
+			} else if n != int64(memberCounts[candidateID]) {
+				return fmt.Errorf(
+					"daemon: intent repair ledger: settled candidate %s captures=%d want=%d",
+					candidateID, n, memberCounts[candidateID])
+			}
+			continue
 		}
 		if _, err := tx.ExecContext(ctx, `
 UPDATE capture_events
@@ -456,6 +540,142 @@ WHERE id=1 AND status='succeeded'`, newHead, newHead); err != nil {
 		return fmt.Errorf("daemon: intent repair ledger: update publish breadcrumb: %w", err)
 	}
 	return tx.Commit()
+}
+
+func validateIntentRepairSettlement(
+	ctx context.Context,
+	tx *sql.Tx,
+	repairID string,
+	memberCount int,
+	cctx CaptureContext,
+) error {
+	var invalidMappings int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM (
+    SELECT mapped.candidate_id
+    FROM intent_repair_commits mapped
+    WHERE mapped.repair_id=?
+    GROUP BY mapped.candidate_id
+    HAVING mapped.candidate_id IS NULL
+       OR COUNT(mapped.new_oid)<>COUNT(*)
+       OR COUNT(DISTINCT mapped.new_oid)<>1
+)`, repairID).Scan(&invalidMappings); err != nil {
+		return fmt.Errorf(
+			"daemon: intent repair ledger: inspect immutable candidate mappings: %w",
+			err)
+	}
+	if invalidMappings != 0 {
+		return fmt.Errorf(
+			"daemon: intent repair ledger: %d candidate mappings are incomplete",
+			invalidMappings)
+	}
+
+	var exactActive int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM intent_repair_members owned
+JOIN intent_candidates candidate
+  ON candidate.id=owned.candidate_id
+ AND candidate.branch_ref=? AND candidate.branch_generation=?
+ AND candidate.status IN ('ready','soft_published','published')
+JOIN intent_candidate_events membership
+  ON membership.candidate_id=owned.candidate_id
+ AND membership.event_seq=owned.event_seq
+ AND membership.membership_state='active'
+JOIN capture_events event
+  ON event.seq=owned.event_seq
+ AND event.branch_ref=? AND event.branch_generation=?
+WHERE owned.repair_id=?`, cctx.BranchRef, cctx.BranchGeneration,
+		cctx.BranchRef, cctx.BranchGeneration, repairID).Scan(&exactActive); err != nil {
+		return fmt.Errorf(
+			"daemon: intent repair ledger: inspect immutable active membership: %w",
+			err)
+	}
+	if exactActive != memberCount {
+		return fmt.Errorf(
+			"daemon: intent repair ledger: active membership changed: exact=%d want=%d",
+			exactActive, memberCount)
+	}
+
+	var incomplete int
+	if err := tx.QueryRowContext(ctx, `
+WITH expected AS (
+    SELECT candidate_id, COUNT(*) AS member_count
+    FROM intent_repair_members
+    WHERE repair_id=?
+    GROUP BY candidate_id
+), active AS (
+    SELECT membership.candidate_id, COUNT(*) AS member_count
+    FROM intent_candidate_events membership
+    JOIN expected ON expected.candidate_id=membership.candidate_id
+    WHERE membership.membership_state='active'
+    GROUP BY membership.candidate_id
+)
+SELECT COUNT(*)
+FROM expected
+LEFT JOIN active USING(candidate_id)
+WHERE COALESCE(active.member_count, 0)<>expected.member_count`, repairID).
+		Scan(&incomplete); err != nil {
+		return fmt.Errorf(
+			"daemon: intent repair ledger: inspect complete active membership: %w",
+			err)
+	}
+	if incomplete != 0 {
+		return fmt.Errorf(
+			"daemon: intent repair ledger: %d candidates changed active membership",
+			incomplete)
+	}
+
+	var invalidState, priorOnly, settledOnly int
+	if err := tx.QueryRowContext(ctx, `
+WITH classified AS (
+    SELECT
+        CASE
+            WHEN owned.prior_state='pending'
+             AND event.state='pending' AND event.commit_oid IS NULL THEN 1
+            WHEN owned.prior_state='published'
+             AND event.state='published'
+             AND EXISTS (
+                 SELECT 1 FROM intent_repair_commits mapped
+                 WHERE mapped.repair_id=owned.repair_id
+                   AND mapped.candidate_id=owned.candidate_id
+                   AND mapped.old_oid=event.commit_oid
+             ) THEN 1
+            ELSE 0
+        END AS prior_match,
+        CASE
+            WHEN event.state='published'
+             AND EXISTS (
+                 SELECT 1 FROM intent_repair_commits mapped
+                 WHERE mapped.repair_id=owned.repair_id
+                   AND mapped.candidate_id=owned.candidate_id
+                   AND mapped.new_oid=event.commit_oid
+             ) THEN 1
+            ELSE 0
+        END AS settled_match
+    FROM intent_repair_members owned
+    JOIN capture_events event ON event.seq=owned.event_seq
+    WHERE owned.repair_id=?
+)
+SELECT
+    COALESCE(SUM(prior_match=0 AND settled_match=0), 0),
+    COALESCE(SUM(prior_match=1 AND settled_match=0), 0),
+    COALESCE(SUM(prior_match=0 AND settled_match=1), 0)
+FROM classified`, repairID).Scan(&invalidState, &priorOnly, &settledOnly); err != nil {
+		return fmt.Errorf(
+			"daemon: intent repair ledger: inspect immutable capture state: %w", err)
+	}
+	if invalidState != 0 {
+		return fmt.Errorf(
+			"daemon: intent repair ledger: %d immutable captures changed state",
+			invalidState)
+	}
+	if priorOnly != 0 && settledOnly != 0 {
+		return errors.New(
+			"daemon: intent repair ledger: immutable capture settlement is partial")
+	}
+	return nil
 }
 
 func intentRepairMutationBarrier(ctx context.Context, gitDir string, db *state.DB) (string, error) {
@@ -605,6 +825,19 @@ func intentRepairGitReplacements(plan IntentRepairPlan) []git.IntentRepairReplac
 			TreeOID:  candidate.TreeOID, Message: candidate.Message,
 			AuthorOID: candidate.AuthorOID,
 		})
+	}
+	return out
+}
+
+func intentRepairCandidateIDs(plan IntentRepairPlan) []string {
+	seen := make(map[string]struct{}, len(plan.Candidates))
+	out := make([]string, 0, len(plan.Candidates))
+	for _, candidate := range plan.Candidates {
+		if _, exists := seen[candidate.CandidateID]; exists {
+			continue
+		}
+		seen[candidate.CandidateID] = struct{}{}
+		out = append(out, candidate.CandidateID)
 	}
 	return out
 }

@@ -381,14 +381,14 @@ func ReconcileUnpublishedChain(
 		BranchGeneration: opts.BranchGeneration,
 		BaseHead:         live.head,
 	}, first, "replay.chain_reconcile", snapshot.Outcome, trigger, map[string]any{
-		"snapshot_id":  snapshot.ID,
-		"outcome":      snapshot.Outcome,
-		"commit":       snapshot.CommitOID,
-		"recovery_ref": snapshot.RecoveryRef.String,
-		"first_seq":    snapshot.FirstEventSeq,
-		"last_seq":     snapshot.LastEventSeq,
-		"event_count":  snapshot.EventCount,
-		"source_head":  first.BaseHead,
+		"snapshot_id":   snapshot.ID,
+		"outcome":       snapshot.Outcome,
+		"commit":        snapshot.CommitOID,
+		"recovery_ref":  snapshot.RecoveryRef.String,
+		"first_seq":     snapshot.FirstEventSeq,
+		"last_seq":      snapshot.LastEventSeq,
+		"event_count":   snapshot.EventCount,
+		"source_head":   first.BaseHead,
 		"repaired_base": baseHead,
 	})
 	return result, nil

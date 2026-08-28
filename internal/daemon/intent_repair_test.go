@@ -730,6 +730,18 @@ func TestIntentRepairMergesTwoSoftPublishedCandidates(t *testing.T) {
 		result.CommitMap[oldA] != result.CommitMap[oldB] {
 		t.Fatalf("commit map=%+v", result.CommitMap)
 	}
+	repair, ok, err := state.IntentRepairByID(ctx, repo.db, result.ID)
+	if err != nil || !ok || len(repair.Members) != 3 {
+		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+	priorStates := make(map[string]int)
+	for _, member := range repair.Members {
+		priorStates[member.PriorState]++
+	}
+	if priorStates[state.EventStatePublished] != 2 ||
+		priorStates[state.EventStatePending] != 1 {
+		t.Fatalf("repair prior states=%v", priorStates)
+	}
 	lineage, err := state.IntentCandidateLineageForTarget(
 		ctx,
 		repo.db,
@@ -1238,6 +1250,19 @@ func (orderedIntentV2Planner) PlanIntentV2(
 func TestIntentRepairTransactionCompletesAndPreservesDirtyState(t *testing.T) {
 	f := newIntentRepairFixture(t, 2)
 	ctx := context.Background()
+	unrelatedSeq, err := state.AppendCaptureEvent(ctx, f.repo.db,
+		state.CaptureEvent{
+			BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+			BaseHead: f.plan.ExpectedHead, Operation: "create",
+			Path: "unrelated-ledger.txt", Fidelity: "full",
+			State: state.EventStatePublished,
+			CommitOID: sql.NullString{
+				String: f.oldCommits[0], Valid: true,
+			},
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(f.repo.dir, "unrelated.txt"),
 		[]byte("staged but unrelated\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -1268,6 +1293,16 @@ func TestIntentRepairTransactionCompletesAndPreservesDirtyState(t *testing.T) {
 		t.Fatalf("backup=%q err=%v want %s", backup, err, f.plan.ExpectedHead)
 	}
 	assertIntentRepairReconciled(t, f, result.NewHead)
+	var unrelatedOID string
+	if err := f.repo.db.SQL().QueryRowContext(ctx,
+		`SELECT commit_oid FROM capture_events WHERE seq=?`, unrelatedSeq).
+		Scan(&unrelatedOID); err != nil {
+		t.Fatal(err)
+	}
+	if unrelatedOID != f.oldCommits[0] {
+		t.Fatalf("unrelated event oid=%s want unchanged %s",
+			unrelatedOID, f.oldCommits[0])
+	}
 }
 
 func TestIntentRepairVerificationFailureLeavesPreparedRepairFailed(
@@ -1400,6 +1435,103 @@ func TestIntentRepairCrashAfterCASRecoversOnRestart(t *testing.T) {
 	if len(recovered) != 1 || !recovered[0].Recovered ||
 		recovered[0].Status != state.IntentRepairCompleted ||
 		recovered[0].NewHead != applied.NewHead {
+		t.Fatalf("recovered=%+v", recovered)
+	}
+	assertIntentRepairReconciled(t, f, applied.NewHead)
+}
+
+func TestIntentRepairRejectsMembershipDriftAfterGitCAS(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	ctx := context.Background()
+	var lateSeq int64
+	intentRepairAfterGitApply = func(IntentRepairResult) error {
+		var err error
+		lateSeq, err = state.AppendCaptureEvent(ctx, f.repo.db,
+			state.CaptureEvent{
+				BranchRef:        f.cctx.BranchRef,
+				BranchGeneration: f.cctx.BranchGeneration,
+				BaseHead:         f.plan.ExpectedHead, Operation: "create",
+				Path: "late.go", Fidelity: "full",
+				State: state.EventStatePending,
+			}, nil)
+		if err != nil {
+			return err
+		}
+		_, err = f.repo.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_candidate_events(
+    candidate_id,ord,event_seq,event_role,membership_state
+) VALUES ('candidate-repair',99,?,'test','active')`, lateSeq)
+		return err
+	}
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+
+	applied, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if err == nil || !strings.Contains(err.Error(), "incomplete membership") {
+		t.Fatalf("ApplyIntentRepairTransaction result=%+v err=%v", applied, err)
+	}
+	repair, ok, loadErr := state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
+	if loadErr != nil || !ok || repair.Status != state.IntentRepairPrepared ||
+		len(repair.Members) != len(f.eventSeqs) {
+		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, loadErr)
+	}
+	var lateState string
+	if err := f.repo.db.SQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE seq=?`, lateSeq).
+		Scan(&lateState); err != nil {
+		t.Fatal(err)
+	}
+	if lateState != state.EventStatePending {
+		t.Fatalf("late event state=%s want pending", lateState)
+	}
+}
+
+func TestIntentRepairRecoveryIsIdempotentAfterLedgerSettlement(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	ctx := context.Background()
+	crash := errors.New("simulated crash after CAS")
+	intentRepairAfterGitApply = func(IntentRepairResult) error { return crash }
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+	applied, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if !errors.Is(err, crash) {
+		t.Fatalf("ApplyIntentRepairTransaction err=%v want crash", err)
+	}
+	intentRepairAfterGitApply = nil
+	mappings := intentRepairStateCommits(f.plan, applied.CommitMap)
+	ok, err := state.TransitionIntentRepair(ctx, f.repo.db, f.plan.ID,
+		state.IntentRepairTransition{
+			ExpectedStatus: state.IntentRepairPrepared,
+			Status:         state.IntentRepairGitApplied,
+			BackupRef: sql.NullString{
+				String: applied.BackupRef, Valid: true,
+			},
+			OldHead: sql.NullString{String: applied.OldHead, Valid: true},
+			NewHead: sql.NullString{String: applied.NewHead, Valid: true},
+			Commits: mappings,
+		})
+	if err != nil || !ok {
+		t.Fatalf("git-applied transition=(%v,%v)", ok, err)
+	}
+	repair, ok, err := state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
+	if err != nil || !ok {
+		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+	candidateMap := map[string]string{
+		"candidate-repair": mappings[0].NewOID.String,
+	}
+	if err := reconcileIntentRepairLedger(ctx, f.repo.db, f.plan.ID,
+		applied.CommitMap, candidateMap, repair.Members, f.cctx,
+		applied.NewHead); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := RecoverIntentRepairs(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 1 ||
+		recovered[0].Status != state.IntentRepairCompleted {
 		t.Fatalf("recovered=%+v", recovered)
 	}
 	assertIntentRepairReconciled(t, f, applied.NewHead)
@@ -1659,6 +1791,15 @@ func assertIntentRepairReconciled(t *testing.T, f intentRepairFixture, newHead s
 	repair, ok, err := state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
 	if err != nil || !ok || repair.Status != state.IntentRepairCompleted {
 		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+	if len(repair.Members) != len(f.eventSeqs) {
+		t.Fatalf("repair members=%+v want %d", repair.Members, len(f.eventSeqs))
+	}
+	for i, member := range repair.Members {
+		if member.EventSeq != f.eventSeqs[i] ||
+			member.PriorState != state.EventStatePublished {
+			t.Fatalf("repair member %d=%+v", i, member)
+		}
 	}
 	candidate, ok, err := state.IntentCandidateByID(ctx, f.repo.db, "candidate-repair")
 	if err != nil || !ok || candidate.Status != state.IntentCandidatePublished ||

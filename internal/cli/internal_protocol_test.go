@@ -317,7 +317,7 @@ func TestFreezePublicationDrainTargetRequiresCheckpointHead(t *testing.T) {
 	anchor := publicationDrainTarget{BranchRef: "refs/heads/main", Generation: 7}
 	if _, err := freezePublicationDrainTarget(
 		ctx, db, repo, "cp-head", worktreeID, 1, anchor); err == nil ||
-		!strings.Contains(err.Error(), "without a completed ACD publication chain") {
+		!strings.Contains(err.Error(), "without a completed ACD transition chain") {
 		t.Fatalf("HEAD mismatch error=%v", err)
 	}
 }
