@@ -636,11 +636,9 @@ CREATE TABLE IF NOT EXISTS intent_repair_members(
     candidate_id        TEXT NOT NULL,
     event_seq           INTEGER NOT NULL CHECK (event_seq > 0),
     prior_state         TEXT NOT NULL CHECK (prior_state IN ('pending','published')),
-    prior_commit_oid    TEXT,
     PRIMARY KEY (repair_id, ord),
     UNIQUE (repair_id, event_seq),
     CHECK (length(candidate_id) BETWEEN 1 AND 128),
-    CHECK (prior_commit_oid IS NULL OR length(prior_commit_oid) BETWEEN 1 AND 128),
     FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
 );
 
