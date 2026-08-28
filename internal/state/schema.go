@@ -36,8 +36,9 @@ package state
 // v20 adds the general operation journal and immutable checkpoint ledger;
 // v21 adds durable publication drains over immutable checkpoint membership;
 // v22 adds restart-stable adaptive Intent planning runs; v23 preserves the
-// bounded resolved plan so a completed run can be reused after restart.
-const SchemaVersion = 23
+// bounded resolved plan so a completed run can be reused after restart; v24
+// adds immutable event membership for newly prepared Intent repairs.
+const SchemaVersion = 24
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -625,6 +626,54 @@ CREATE INDEX IF NOT EXISTS idx_intent_repair_commits_old_oid
 
 CREATE INDEX IF NOT EXISTS idx_intent_repair_commits_candidate
     ON intent_repair_commits(candidate_id, repair_id);
+
+-- v24: immutable active candidate membership captured before an Intent repair
+-- may change Git. Legacy repairs deliberately have no rows here; consumers can
+-- distinguish their weaker historical evidence without synthesizing identity.
+CREATE TABLE IF NOT EXISTS intent_repair_members(
+    repair_id           TEXT NOT NULL,
+    ord                 INTEGER NOT NULL CHECK (ord >= 0),
+    candidate_id        TEXT NOT NULL,
+    event_seq           INTEGER NOT NULL CHECK (event_seq > 0),
+    prior_state         TEXT NOT NULL CHECK (prior_state IN ('pending','published')),
+    prior_commit_oid    TEXT,
+    PRIMARY KEY (repair_id, ord),
+    UNIQUE (repair_id, event_seq),
+    CHECK (length(candidate_id) BETWEEN 1 AND 128),
+    CHECK (prior_commit_oid IS NULL OR length(prior_commit_oid) BETWEEN 1 AND 128),
+    FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intent_repair_members_candidate
+    ON intent_repair_members(repair_id, candidate_id, ord);
+
+CREATE INDEX IF NOT EXISTS idx_intent_repair_members_event
+    ON intent_repair_members(event_seq, repair_id);
+
+CREATE TRIGGER IF NOT EXISTS intent_repair_members_prepared_insert
+BEFORE INSERT ON intent_repair_members
+WHEN NOT EXISTS (
+    SELECT 1 FROM intent_repairs repair
+    WHERE repair.id = NEW.repair_id AND repair.status = 'prepared'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'intent repair membership requires prepared repair');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intent_repair_members_immutable_update
+BEFORE UPDATE ON intent_repair_members
+BEGIN
+    SELECT RAISE(ABORT, 'intent repair membership is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intent_repair_members_immutable_delete
+BEFORE DELETE ON intent_repair_members
+WHEN EXISTS (
+    SELECT 1 FROM intent_repairs repair WHERE repair.id = OLD.repair_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'intent repair membership is immutable');
+END;
 
 -- v20: one general mutation journal shared by checkpoint, publication,
 -- restore, migration, setup, and uninstall orchestration. Specialized
