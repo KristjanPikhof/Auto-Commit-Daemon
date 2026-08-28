@@ -367,7 +367,8 @@ func completeIntentRepair(
 		repair.BranchGeneration != cctx.BranchGeneration {
 		return errors.New("daemon: complete intent repair: exact branch pair changed")
 	}
-	if repair.NewHead.Valid && repair.NewHead.String != newHead {
+	if !repair.NewHead.Valid || repair.NewHead.String == "" ||
+		repair.NewHead.String != newHead {
 		return errors.New("daemon: complete intent repair: durable new head changed")
 	}
 	if len(repair.Commits) > 0 {
