@@ -41,6 +41,65 @@ func TestCompletedBranchTransitionChainRepairOnly(t *testing.T) {
 	}
 }
 
+func TestCompletedBranchTransitionChainFindsRepartitionedHeadMapping(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	const (
+		branch     = "refs/heads/main"
+		generation = int64(11)
+		source     = "old-a2"
+		target     = "new-b"
+		repairID   = "repair-repartitioned"
+	)
+	repair := IntentRepair{
+		ID: repairID, BranchRef: branch, BranchGeneration: generation,
+		Status: IntentRepairPrepared, ExpectedHead: source,
+		PlanDigest: completedBranchTransitionTestDigest,
+		OldHead:    sql.NullString{String: source, Valid: true},
+		Commits: []IntentRepairCommit{
+			{CandidateID: sql.NullString{String: "candidate-a", Valid: true}, OldOID: "old-a1"},
+			{CandidateID: sql.NullString{String: "candidate-a", Valid: true}, OldOID: source},
+			{CandidateID: sql.NullString{String: "candidate-b", Valid: true}, OldOID: "old-b1"},
+		},
+	}
+	if err := SaveIntentRepair(ctx, db, repair); err != nil {
+		t.Fatal(err)
+	}
+	mappings := []IntentRepairCommit{
+		{CandidateID: sql.NullString{String: "candidate-a", Valid: true}, OldOID: "old-a1", NewOID: sql.NullString{String: "new-a", Valid: true}},
+		{CandidateID: sql.NullString{String: "candidate-a", Valid: true}, OldOID: source, NewOID: sql.NullString{String: "new-a", Valid: true}},
+		{CandidateID: sql.NullString{String: "candidate-b", Valid: true}, OldOID: "old-b1", NewOID: sql.NullString{String: target, Valid: true}},
+	}
+	applied, err := TransitionIntentRepair(ctx, db, repairID, IntentRepairTransition{
+		ExpectedStatus: IntentRepairPrepared,
+		Status:         IntentRepairGitApplied,
+		BackupRef: sql.NullString{
+			String: "refs/acd/intent-repair/fixture/repartitioned/backup", Valid: true,
+		},
+		OldHead:      sql.NullString{String: source, Valid: true},
+		NewHead:      sql.NullString{String: target, Valid: true},
+		Commits:      mappings,
+		TransitionTS: 2,
+	})
+	if err != nil || !applied {
+		t.Fatalf("mark Git-applied=(%t, %v)", applied, err)
+	}
+	completed, err := TransitionIntentRepair(ctx, db, repairID, IntentRepairTransition{
+		ExpectedStatus: IntentRepairGitApplied,
+		Status:         IntentRepairCompleted,
+		TransitionTS:   3,
+	})
+	if err != nil || !completed {
+		t.Fatalf("complete repair=(%t, %v)", completed, err)
+	}
+
+	chain, ok, err := CompletedBranchTransitionChain(
+		ctx, db, branch, generation, source, target)
+	if err != nil || !ok || len(chain) != 1 {
+		t.Fatalf("repartitioned chain=(%+v, %t, %v)", chain, ok, err)
+	}
+}
+
 func TestCompletedBranchTransitionChainMixedSelfPublicationAndRepair(t *testing.T) {
 	db, _ := openTestDB(t)
 	ctx := context.Background()
