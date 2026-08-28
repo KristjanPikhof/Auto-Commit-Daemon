@@ -286,6 +286,7 @@ func replayIntentCandidateBatch(
 			}
 			sum.Published += publishedCount
 			sum.BaseHead = repaired.NewHead
+			sum.InternalTransitionTargetOID = repaired.NewHead
 			publishedCandidates[decision.Candidate.ID] = struct{}{}
 			publishedAny = true
 			currentParent = repaired.NewHead

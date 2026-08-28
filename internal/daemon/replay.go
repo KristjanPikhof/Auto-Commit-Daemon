@@ -310,6 +310,10 @@ type ReplaySummary struct {
 	// succeeded in this pass. Multi-group Intent publication overwrites it
 	// group-by-group, so it always names the completed chain tip.
 	SelfPublicationTargetOID string
+	// InternalTransitionTargetOID is the final branch tip proved by any
+	// completed ACD mutation journal in this pass. It includes ordinary
+	// self-publications and non-ancestral Intent repair rewrites.
+	InternalTransitionTargetOID string
 	// PlannerFailure carries the sanitized provider or validation failure that
 	// led to a safe local plan. Durable drains retain it when they escalate.
 	PlannerFailure string
@@ -343,7 +347,9 @@ func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
 		return
 	}
 	switch {
-	case sum.Published > 0 || sum.RecaptureRequired || sum.SelfPublicationTargetOID != "":
+	case sum.Published > 0 || sum.RecaptureRequired ||
+		sum.InternalTransitionTargetOID != "" ||
+		sum.SelfPublicationTargetOID != "":
 		sum.Disposition = ReplayDispositionProgress
 	case sum.Conflicts > 0 || sum.Failed > 0:
 		sum.Disposition = ReplayDispositionNeedsAttention
@@ -635,7 +641,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// silently replay — the resulting commit would chain off a stale
 		// parent and diverge from the operator's intent. Block
 		// terminally so operators can spot the mismatch and reconcile.
-		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, activeCtx); err != nil {
+		if reason, err := checkEventGeneration(ctx, repoRoot, db, parent, ev, activeCtx); err != nil {
 			return sum, err
 		} else if reason != "" {
 			errorClass := replayErrorValidation
@@ -1000,6 +1006,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		activeCtx.BaseHead = commitOID
 		sum.BaseHead = commitOID
 		sum.SelfPublicationTargetOID = commitOID
+		sum.InternalTransitionTargetOID = commitOID
 		sum.Published++
 		traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "event published", map[string]any{
 			"commit": commitOID,
@@ -1573,7 +1580,7 @@ func rejectInvalidIntentWindowEvents(
 	sum ReplaySummary,
 ) (ReplaySummary, bool, error) {
 	for _, ev := range events {
-		reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, activeCtx)
+		reason, err := checkEventGeneration(ctx, repoRoot, db, parent, ev, activeCtx)
 		if err != nil {
 			return sum, false, err
 		}
@@ -3098,7 +3105,7 @@ func publishIntentSelection(
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
-		if reason, err := checkEventGeneration(ctx, repoRoot, sourceHead, ev, activeCtx); err != nil {
+		if reason, err := checkEventGeneration(ctx, repoRoot, db, sourceHead, ev, activeCtx); err != nil {
 			return sum, err
 		} else if reason != "" {
 			errorClass := replayErrorValidation
@@ -3385,6 +3392,7 @@ func publishIntentSelection(
 	sum.Published += publishedCount
 	sum.BaseHead = commitOID
 	sum.SelfPublicationTargetOID = commitOID
+	sum.InternalTransitionTargetOID = commitOID
 	traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "intent group published", map[string]any{
 		"commit": commitOID,
 		"parent": oldOID,
@@ -4930,7 +4938,14 @@ func traceError(decision, reason string) string {
 // per published commit). When parent or ev.BaseHead is empty we skip the
 // ancestry probe — orphan repos and the very-first commit have no history
 // to compare against.
-func checkEventGeneration(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, cctx CaptureContext) (string, error) {
+func checkEventGeneration(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	parent string,
+	ev state.CaptureEvent,
+	cctx CaptureContext,
+) (string, error) {
 	if cctx.BranchRef != "" && ev.BranchRef != "" && ev.BranchRef != cctx.BranchRef {
 		return fmt.Sprintf(
 			"branch ref mismatch: event captured on %s but daemon is on %s",
@@ -4951,21 +4966,45 @@ func checkEventGeneration(ctx context.Context, repoRoot, parent string, ev state
 	if ev.BaseHead == parent {
 		return "", nil
 	}
-	ok, err := git.IsAncestor(ctx, repoRoot, ev.BaseHead, parent)
-	if err != nil {
+	ok, ancestryErr := git.IsAncestor(ctx, repoRoot, ev.BaseHead, parent)
+	if ancestryErr == nil && ok {
+		return "", nil
+	}
+	canonicalBase, mapped, mappingErr := state.CanonicalCompletedIntentRepairCommit(
+		ctx, db, ev.BranchRef, ev.BranchGeneration, ev.BaseHead)
+	if mappingErr != nil {
+		return "", fmt.Errorf(
+			"daemon: prove repaired event base %s: %w", ev.BaseHead, mappingErr)
+	}
+	if mapped {
+		if canonicalBase == parent {
+			return "", nil
+		}
+		canonicalOK, canonicalErr := git.IsAncestor(
+			ctx, repoRoot, canonicalBase, parent)
+		if canonicalErr == nil && canonicalOK {
+			return "", nil
+		}
+		if canonicalErr != nil {
+			return fmt.Sprintf(
+				"ancestry probe failed for repaired base %s (original %s): %v",
+				canonicalBase, ev.BaseHead, canonicalErr), nil
+		}
+		return fmt.Sprintf(
+			"repaired event base %s (original %s) is not an ancestor of replay head %s",
+			canonicalBase, ev.BaseHead, parent), nil
+	}
+	if ancestryErr != nil {
 		// merge-base failed — most often because ev.BaseHead is no
 		// longer in the object database (gc'd reset). Treat as a
 		// terminal block so the operator notices.
 		return fmt.Sprintf(
 			"ancestry probe failed for base %s: %v (branch likely rewritten since capture)",
-			ev.BaseHead, err), nil
+			ev.BaseHead, ancestryErr), nil
 	}
-	if !ok {
-		return fmt.Sprintf(
-			"event base %s is not an ancestor of replay head %s (branch was reset/rebased since capture)",
-			ev.BaseHead, parent), nil
-	}
-	return "", nil
+	return fmt.Sprintf(
+		"event base %s is not an ancestor of replay head %s (branch was reset/rebased since capture)",
+		ev.BaseHead, parent), nil
 }
 
 // errReplay is sentinel for fatal replay errors that should halt the pass.
