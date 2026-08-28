@@ -93,6 +93,7 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 		"intent_candidate_lineage",
 		"intent_capture_dependencies", "intent_activity_boundaries",
 		"intent_repairs", "intent_repair_commits", "intent_repair_members",
+		"intent_repair_member_seals",
 	}
 	for _, table := range tables {
 		var name string
