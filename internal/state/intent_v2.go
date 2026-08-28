@@ -53,6 +53,10 @@ const (
 	IntentRepairCompleted  = "completed"
 	IntentRepairSkipped    = "skipped"
 	IntentRepairFailed     = "failed"
+
+	IntentRepairMembershipLegacy = "legacy"
+	IntentRepairMembershipFrozen = "frozen"
+	IntentRepairMembershipNone   = "none"
 )
 
 // IntentCandidate is one durable semantic commit candidate. It contains only
@@ -167,6 +171,7 @@ type IntentRepair struct {
 	GitAppliedTS     sql.NullFloat64
 	CompletedTS      sql.NullFloat64
 	Error            string
+	MembershipMode   string
 	Commits          []IntentRepairCommit
 	Members          []IntentRepairMember
 }
@@ -1410,6 +1415,13 @@ func SaveIntentRepair(ctx context.Context, d *DB, repair IntentRepair) error {
 	if repair.Status != IntentRepairPrepared {
 		return fmt.Errorf("state: new intent repair must be %s", IntentRepairPrepared)
 	}
+	if repair.MembershipMode == "" {
+		if len(repair.Members) > 0 {
+			repair.MembershipMode = IntentRepairMembershipFrozen
+		} else {
+			repair.MembershipMode = IntentRepairMembershipNone
+		}
+	}
 	if err := validateIntentRepair(repair); err != nil {
 		return err
 	}
@@ -1448,6 +1460,13 @@ INSERT INTO intent_repairs(
 			return err
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO intent_repair_member_seals(
+    repair_id, membership_mode, member_count
+) VALUES (?, ?, ?)`, repair.ID, repair.MembershipMode,
+		len(repair.Members)); err != nil {
+		return fmt.Errorf("state: seal intent repair membership: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("state: commit intent repair save: %w", err)
 	}
@@ -1471,6 +1490,10 @@ func TransitionIntentRepair(ctx context.Context, d *DB, id string, transition In
 	if len(transition.Commits) > IntentRepairMaxCommits {
 		return false, fmt.Errorf("state: intent repair commit cap %d exceeded",
 			IntentRepairMaxCommits)
+	}
+	if transition.Status == IntentRepairGitApplied && transition.Commits == nil {
+		return false, errors.New(
+			"state: Git-applied intent repair requires exact commit mappings")
 	}
 	ts := transition.TransitionTS
 	if ts <= 0 {
@@ -1515,6 +1538,8 @@ WHERE id=? AND status=?`,
 		if err := replaceIntentRepairCommits(ctx, tx, id, transition.Commits); err != nil {
 			return false, err
 		}
+	}
+	if transition.Status == IntentRepairGitApplied {
 		if err := validateTransitionedIntentRepairMembers(ctx, tx, id); err != nil {
 			return false, err
 		}
@@ -1547,6 +1572,17 @@ func IntentRepairByID(ctx context.Context, d *DB, id string) (IntentRepair, bool
 		return IntentRepair{}, false, err
 	}
 	repair.Members = members
+	mode, sealedCount, err := loadIntentRepairMembershipSeal(
+		ctx, d.readSQL(), id)
+	if err != nil {
+		return IntentRepair{}, false, err
+	}
+	if sealedCount != len(members) {
+		return IntentRepair{}, false, fmt.Errorf(
+			"state: intent repair membership seal=%d members=%d",
+			sealedCount, len(members))
+	}
+	repair.MembershipMode = mode
 	return repair, true, nil
 }
 
@@ -1580,6 +1616,17 @@ func RecoverableIntentRepairs(ctx context.Context, d *DB, limit int) ([]IntentRe
 			return nil, err
 		}
 		repair.Members = members
+		mode, sealedCount, err := loadIntentRepairMembershipSeal(
+			ctx, d.readSQL(), repair.ID)
+		if err != nil {
+			return nil, err
+		}
+		if sealedCount != len(members) {
+			return nil, fmt.Errorf(
+				"state: intent repair membership seal=%d members=%d",
+				sealedCount, len(members))
+		}
+		repair.MembershipMode = mode
 		out = append(out, repair)
 	}
 	if err := rows.Err(); err != nil {
@@ -1764,19 +1811,41 @@ func validateTransitionedIntentRepairMembers(
 	repairID string,
 ) error {
 	var repair IntentRepair
-	var memberCount int
+	var memberCount, sealedCount int
 	if err := tx.QueryRowContext(ctx, `
 SELECT repair.branch_ref, repair.branch_generation,
-       COUNT(member.event_seq)
+       COUNT(member.event_seq), seal.membership_mode, seal.member_count
 FROM intent_repairs repair
+JOIN intent_repair_member_seals seal ON seal.repair_id=repair.id
 LEFT JOIN intent_repair_members member ON member.repair_id=repair.id
 WHERE repair.id=?
 GROUP BY repair.id`, repairID).Scan(
-		&repair.BranchRef, &repair.BranchGeneration, &memberCount); err != nil {
+		&repair.BranchRef, &repair.BranchGeneration,
+		&memberCount, &repair.MembershipMode, &sealedCount); err != nil {
 		return fmt.Errorf("state: load transitioned intent repair membership: %w", err)
 	}
-	if memberCount == 0 {
+	if memberCount != sealedCount {
+		return fmt.Errorf(
+			"state: intent repair membership seal=%d members=%d",
+			sealedCount, memberCount)
+	}
+	switch repair.MembershipMode {
+	case IntentRepairMembershipLegacy:
+		if memberCount != 0 {
+			return errors.New(
+				"state: legacy intent repair has frozen membership")
+		}
 		return nil
+	case IntentRepairMembershipFrozen:
+		if memberCount == 0 {
+			return errors.New("state: frozen intent repair membership is empty")
+		}
+	case IntentRepairMembershipNone:
+		return errors.New(
+			"state: memberless intent repair cannot transition to Git-applied")
+	default:
+		return fmt.Errorf("state: invalid intent repair membership mode %q",
+			repair.MembershipMode)
 	}
 	repair.ID = repairID
 	repair.Members = make([]IntentRepairMember, memberCount)
@@ -1856,6 +1925,23 @@ WHERE repair_id=? ORDER BY ord`, repairID)
 		return nil, fmt.Errorf("state: iterate intent repair members: %w", err)
 	}
 	return out, nil
+}
+
+func loadIntentRepairMembershipSeal(
+	ctx context.Context,
+	q intentV2Queryer,
+	repairID string,
+) (string, int, error) {
+	var mode string
+	var memberCount int
+	if err := q.QueryRowContext(ctx, `
+SELECT membership_mode, member_count
+FROM intent_repair_member_seals
+WHERE repair_id=?`, repairID).Scan(&mode, &memberCount); err != nil {
+		return "", 0, fmt.Errorf(
+			"state: load intent repair membership seal: %w", err)
+	}
+	return mode, memberCount, nil
 }
 
 // LoadIntentV2StateReadOnly projects v15+ state without running Open or any
@@ -2096,8 +2182,22 @@ func validateIntentRepair(repair IntentRepair) error {
 }
 
 func validateIntentRepairMembers(repair IntentRepair) error {
-	if len(repair.Members) == 0 {
+	switch repair.MembershipMode {
+	case IntentRepairMembershipLegacy, IntentRepairMembershipNone:
+		if len(repair.Members) != 0 {
+			return fmt.Errorf(
+				"state: intent repair membership mode %s requires no members",
+				repair.MembershipMode)
+		}
 		return nil
+	case IntentRepairMembershipFrozen:
+		if len(repair.Members) == 0 {
+			return errors.New(
+				"state: frozen intent repair membership is empty")
+		}
+	default:
+		return fmt.Errorf("state: invalid intent repair membership mode %q",
+			repair.MembershipMode)
 	}
 	if len(repair.Members) > IntentRepairMaxMembers {
 		return fmt.Errorf("state: intent repair member cap %d exceeded",

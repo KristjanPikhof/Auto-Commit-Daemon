@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,9 @@ const (
 type IntentRepairCandidatePlan struct {
 	CandidateID string
 	Replaces    []string
+	// EventSeqs is the exact active membership used to materialize TreeOID.
+	// Apply rejects any membership drift before Git can move.
+	EventSeqs []int64
 	TreeOID     string
 	Message     string
 	AuthorOID   string
@@ -131,6 +135,9 @@ func ApplyIntentRepairTransaction(
 		return result, fmt.Errorf(
 			"daemon: intent repair: snapshot immutable membership: %w", err)
 	}
+	if err := validateIntentRepairMemberSnapshot(plan, members); err != nil {
+		return result, err
+	}
 
 	prepared := state.IntentRepair{
 		ID: plan.ID, BranchRef: plan.BranchRef,
@@ -138,6 +145,7 @@ func ApplyIntentRepairTransaction(
 		Status:           state.IntentRepairPrepared, ExpectedHead: plan.ExpectedHead,
 		PlanDigest: plan.PlanDigest,
 		OldHead:    sql.NullString{String: plan.ExpectedHead, Valid: true},
+		MembershipMode: state.IntentRepairMembershipFrozen,
 		Commits:    intentRepairStateCommits(plan, nil),
 		Members:    members,
 	}
@@ -708,6 +716,8 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 	}
 	var count int
 	seen := make(map[string]struct{})
+	seenCandidates := make(map[string]struct{}, len(plan.Candidates))
+	seenEvents := make(map[int64]struct{})
 	oldPositions := make(map[string]int, len(plan.OldChain))
 	for position, oid := range plan.OldChain {
 		if oid == "" {
@@ -724,6 +734,29 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 			len(candidate.Replaces) == 0 || candidate.TreeOID == "" ||
 			strings.TrimSpace(candidate.Message) == "" {
 			return errors.New("daemon: intent repair: incomplete candidate replacement")
+		}
+		if _, duplicate := seenCandidates[candidate.CandidateID]; duplicate {
+			return fmt.Errorf(
+				"daemon: intent repair: duplicate candidate id %s",
+				candidate.CandidateID)
+		}
+		seenCandidates[candidate.CandidateID] = struct{}{}
+		if len(candidate.EventSeqs) == 0 {
+			return fmt.Errorf(
+				"daemon: intent repair: candidate %s has no materialized membership",
+				candidate.CandidateID)
+		}
+		for _, seq := range candidate.EventSeqs {
+			if seq <= 0 {
+				return fmt.Errorf(
+					"daemon: intent repair: candidate %s has invalid event %d",
+					candidate.CandidateID, seq)
+			}
+			if _, duplicate := seenEvents[seq]; duplicate {
+				return fmt.Errorf(
+					"daemon: intent repair: duplicate materialized event %d", seq)
+			}
+			seenEvents[seq] = struct{}{}
 		}
 		firstPosition := -1
 		previousPosition := -1
@@ -843,6 +876,59 @@ func intentRepairCandidateIDs(plan IntentRepairPlan) []string {
 	return out
 }
 
+func intentRepairCandidateEventSeqs(
+	events []state.IntentCandidateEvent,
+) []int64 {
+	seqs := make([]int64, 0, len(events))
+	for _, event := range events {
+		seqs = append(seqs, event.EventSeq)
+	}
+	return seqs
+}
+
+func validateIntentRepairMemberSnapshot(
+	plan IntentRepairPlan,
+	members []state.IntentRepairMember,
+) error {
+	expected := make(map[string]map[int64]struct{}, len(plan.Candidates))
+	expectedCount := 0
+	for _, candidate := range plan.Candidates {
+		seqs := make(map[int64]struct{}, len(candidate.EventSeqs))
+		for _, seq := range candidate.EventSeqs {
+			seqs[seq] = struct{}{}
+		}
+		expected[candidate.CandidateID] = seqs
+		expectedCount += len(seqs)
+	}
+	if len(members) != expectedCount {
+		return fmt.Errorf(
+			"daemon: intent repair: membership changed since materialization: got %d events, want %d",
+			len(members), expectedCount)
+	}
+	for _, member := range members {
+		seqs, ok := expected[member.CandidateID]
+		if !ok {
+			return fmt.Errorf(
+				"daemon: intent repair: membership changed since materialization: unexpected candidate %s",
+				member.CandidateID)
+		}
+		if _, ok := seqs[member.EventSeq]; !ok {
+			return fmt.Errorf(
+				"daemon: intent repair: membership changed since materialization: unexpected event %d",
+				member.EventSeq)
+		}
+		delete(seqs, member.EventSeq)
+	}
+	for candidateID, seqs := range expected {
+		if len(seqs) != 0 {
+			return fmt.Errorf(
+				"daemon: intent repair: membership changed since materialization for candidate %s",
+				candidateID)
+		}
+	}
+	return nil
+}
+
 func intentRepairStateCommits(plan IntentRepairPlan, commitMap map[string]string) []state.IntentRepairCommit {
 	var out []state.IntentRepairCommit
 	for _, candidate := range plan.Candidates {
@@ -886,6 +972,7 @@ func persistSkippedIntentRepair(ctx context.Context, db *state.DB, plan IntentRe
 		BranchGeneration: plan.BranchGeneration,
 		Status:           state.IntentRepairPrepared, ExpectedHead: plan.ExpectedHead,
 		PlanDigest: plan.PlanDigest,
+		MembershipMode: state.IntentRepairMembershipNone,
 		Commits:    intentRepairStateCommits(plan, nil),
 	}); err != nil {
 		return IntentRepairResult{}, err
@@ -985,6 +1072,7 @@ func reconstructIntentRepairMappings(
 type intentRepairDigestCandidate struct {
 	candidateID string
 	replaces    []string
+	eventSeqs   []int64
 	treeOID     string
 	message     string
 	authorOID   string
@@ -1004,6 +1092,7 @@ func intentRepairPlanDigest(
 		candidates = append(candidates, intentRepairDigestCandidate{
 			candidateID: candidate.CandidateID,
 			replaces:    append([]string(nil), candidate.Replaces...),
+			eventSeqs:   append([]int64(nil), candidate.EventSeqs...),
 			treeOID:     candidate.TreeOID,
 			message:     candidate.Message,
 			authorOID:   authorOID,
@@ -1018,6 +1107,11 @@ func recoveredIntentRepairPlanDigest(
 	repair state.IntentRepair,
 	mappings []state.IntentRepairCommit,
 ) (string, error) {
+	membersByCandidate := make(map[string][]int64)
+	for _, member := range repair.Members {
+		membersByCandidate[member.CandidateID] = append(
+			membersByCandidate[member.CandidateID], member.EventSeq)
+	}
 	var candidates []intentRepairDigestCandidate
 	for i := 0; i < len(mappings); {
 		candidateID := mappings[i].CandidateID.String
@@ -1025,6 +1119,7 @@ func recoveredIntentRepairPlanDigest(
 		candidate := intentRepairDigestCandidate{
 			candidateID: candidateID,
 			authorOID:   newOID,
+			eventSeqs:   append([]int64(nil), membersByCandidate[candidateID]...),
 		}
 		for i < len(mappings) &&
 			mappings[i].CandidateID.Valid &&
@@ -1064,7 +1159,14 @@ func hashIntentRepairCandidates(
 		_, _ = fmt.Fprintf(hash, "%d:", len(value))
 		_, _ = hash.Write([]byte(value))
 	}
-	writeField("acd-intent-repair-plan-v1")
+	version := "acd-intent-repair-plan-v1"
+	for _, candidate := range candidates {
+		if len(candidate.eventSeqs) > 0 {
+			version = "acd-intent-repair-plan-v2"
+			break
+		}
+	}
+	writeField(version)
 	for _, candidate := range candidates {
 		author, err := git.Run(ctx, git.RunOpts{
 			Dir: repoRoot, Timeout: git.DefaultReadTimeout,
@@ -1073,6 +1175,11 @@ func hashIntentRepairCandidates(
 			return "", fmt.Errorf("daemon: intent repair: read author identity: %w", err)
 		}
 		writeField(candidate.candidateID)
+		eventSeqs := append([]int64(nil), candidate.eventSeqs...)
+		sort.Slice(eventSeqs, func(i, j int) bool { return eventSeqs[i] < eventSeqs[j] })
+		for _, seq := range eventSeqs {
+			writeField(strconv.FormatInt(seq, 10))
+		}
 		for _, oldOID := range candidate.replaces {
 			writeField(oldOID)
 		}

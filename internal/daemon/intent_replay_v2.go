@@ -1002,6 +1002,7 @@ func repairIntentCandidateDecision(
 	plans := []IntentRepairCandidatePlan{{
 		CandidateID: decision.Candidate.ID,
 		Replaces:    mergedReplaces,
+		EventSeqs:   intentRepairCandidateEventSeqs(decision.Candidate.Events),
 		TreeOID:     tree, Message: message, AuthorOID: mergedReplaces[0],
 	}}
 	mergedPaths := make(map[string]struct{}, len(paths))
@@ -1078,6 +1079,7 @@ func repairIntentCandidateDecision(
 		plans = append(plans, IntentRepairCandidatePlan{
 			CandidateID: candidate.ID,
 			Replaces:    []string{oldOID},
+			EventSeqs:   intentRepairCandidateEventSeqs(candidate.Events),
 			TreeOID:     seedTree,
 			Message:     strings.TrimRight(string(oldMessage), "\n"),
 			AuthorOID:   oldOID,

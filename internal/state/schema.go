@@ -642,6 +642,18 @@ CREATE TABLE IF NOT EXISTS intent_repair_members(
     FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
 );
 
+-- Sealing happens in the same transaction that prepares a repair. Once the
+-- seal exists, neither the member set nor its recorded count can change.
+-- Migrated legacy repairs receive a zero-member seal without invented rows.
+CREATE TABLE IF NOT EXISTS intent_repair_member_seals(
+    repair_id           TEXT PRIMARY KEY,
+    membership_mode     TEXT NOT NULL CHECK (
+                            membership_mode IN ('legacy','frozen','none')),
+    member_count        INTEGER NOT NULL CHECK (
+                            member_count >= 0 AND member_count <= 1280),
+    FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_intent_repair_members_candidate
     ON intent_repair_members(repair_id, candidate_id, ord);
 
@@ -651,11 +663,15 @@ CREATE INDEX IF NOT EXISTS idx_intent_repair_members_event
 CREATE TRIGGER IF NOT EXISTS intent_repair_members_prepared_insert
 BEFORE INSERT ON intent_repair_members
 WHEN NOT EXISTS (
-    SELECT 1 FROM intent_repairs repair
-    WHERE repair.id = NEW.repair_id AND repair.status = 'prepared'
-)
+        SELECT 1 FROM intent_repairs repair
+        WHERE repair.id = NEW.repair_id AND repair.status = 'prepared'
+     )
+  OR EXISTS (
+        SELECT 1 FROM intent_repair_member_seals seal
+        WHERE seal.repair_id = NEW.repair_id
+     )
 BEGIN
-    SELECT RAISE(ABORT, 'intent repair membership requires prepared repair');
+    SELECT RAISE(ABORT, 'intent repair membership is not open');
 END;
 
 CREATE TRIGGER IF NOT EXISTS intent_repair_members_immutable_update
@@ -671,6 +687,82 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'intent repair membership is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intent_repair_member_seals_valid_insert
+BEFORE INSERT ON intent_repair_member_seals
+WHEN NOT EXISTS (
+        SELECT 1 FROM intent_repairs repair
+        WHERE repair.id = NEW.repair_id
+          AND (repair.status = 'prepared' OR
+               (NEW.membership_mode = 'legacy' AND NEW.member_count = 0))
+     )
+  OR NEW.member_count <> (
+        SELECT COUNT(*) FROM intent_repair_members member
+        WHERE member.repair_id = NEW.repair_id
+     )
+BEGIN
+    SELECT RAISE(ABORT, 'intent repair membership seal is invalid');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intent_repair_member_seals_immutable_update
+BEFORE UPDATE ON intent_repair_member_seals
+BEGIN
+    SELECT RAISE(ABORT, 'intent repair membership seal is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intent_repair_member_seals_immutable_delete
+BEFORE DELETE ON intent_repair_member_seals
+WHEN EXISTS (
+    SELECT 1 FROM intent_repairs repair WHERE repair.id = OLD.repair_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'intent repair membership seal is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intent_candidate_events_repair_lock_insert
+BEFORE INSERT ON intent_candidate_events
+WHEN EXISTS (
+    SELECT 1
+    FROM intent_repair_members member
+    JOIN intent_repairs repair ON repair.id=member.repair_id
+    JOIN intent_repair_member_seals seal ON seal.repair_id=repair.id
+    WHERE member.candidate_id=NEW.candidate_id
+      AND seal.membership_mode='frozen'
+      AND repair.status IN ('prepared','git_applied')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'intent candidate membership is locked by repair');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intent_candidate_events_repair_lock_update
+BEFORE UPDATE ON intent_candidate_events
+WHEN EXISTS (
+    SELECT 1
+    FROM intent_repair_members member
+    JOIN intent_repairs repair ON repair.id=member.repair_id
+    JOIN intent_repair_member_seals seal ON seal.repair_id=repair.id
+    WHERE member.candidate_id IN (OLD.candidate_id, NEW.candidate_id)
+      AND seal.membership_mode='frozen'
+      AND repair.status IN ('prepared','git_applied')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'intent candidate membership is locked by repair');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intent_candidate_events_repair_lock_delete
+BEFORE DELETE ON intent_candidate_events
+WHEN EXISTS (
+    SELECT 1
+    FROM intent_repair_members member
+    JOIN intent_repairs repair ON repair.id=member.repair_id
+    JOIN intent_repair_member_seals seal ON seal.repair_id=repair.id
+    WHERE member.candidate_id=OLD.candidate_id
+      AND seal.membership_mode='frozen'
+      AND repair.status IN ('prepared','git_applied')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'intent candidate membership is locked by repair');
 END;
 
 -- v20: one general mutation journal shared by checkpoint, publication,

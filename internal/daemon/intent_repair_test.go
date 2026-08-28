@@ -1355,12 +1355,14 @@ func TestValidateIntentRepairPlanAllowsNonContiguousPartition(t *testing.T) {
 			{
 				CandidateID: "candidate-a",
 				Replaces:    []string{"old-a1", "old-a2"},
+				EventSeqs:   []int64{1, 3},
 				TreeOID:     "tree-a",
 				Message:     "Complete alpha",
 			},
 			{
 				CandidateID: "candidate-b",
 				Replaces:    []string{"old-b1"},
+				EventSeqs:   []int64{2},
 				TreeOID:     "tree-b",
 				Message:     "Add beta",
 			},
@@ -1394,6 +1396,7 @@ func TestValidateIntentRepairPlanRejectsIncompleteRepartition(t *testing.T) {
 		Candidates: []IntentRepairCandidatePlan{{
 			CandidateID: "candidate-a",
 			Replaces:    []string{"old-a1", "old-a2"},
+			EventSeqs:   []int64{1, 3},
 			TreeOID:     "tree-a",
 			Message:     "Complete alpha",
 		}},
@@ -1740,6 +1743,7 @@ func newIntentRepairFixture(t *testing.T, commitCount int) intentRepairFixture {
 		Candidates: []IntentRepairCandidatePlan{{
 			CandidateID: "candidate-repair",
 			Replaces:    append([]string(nil), f.oldCommits...),
+			EventSeqs:   append([]int64(nil), f.eventSeqs...),
 			TreeOID:     tree,
 			Message:     "Combine semantic change\n\n- Keep related files atomic",
 		}},
