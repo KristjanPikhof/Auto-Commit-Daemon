@@ -281,8 +281,9 @@ type Options struct {
 	// beforeBranchTokenCheck is a test-only synchronization point immediately
 	// before the run loop samples the live branch token.
 	beforeBranchTokenCheck func()
-	// afterSelfPublicationAdoption is a test-only observation point after the
-	// journal-proved target and all in-memory/durable token fields agree.
+	// afterSelfPublicationAdoption is a test-only observation point after an
+	// ACD-journal-proved target and all in-memory/durable token fields agree.
+	// The historical name is retained for existing synchronization tests.
 	afterSelfPublicationAdoption func(CaptureContext, string, string, string)
 	// afterRunLoopWorkDecision is a test-only observation point for the
 	// scheduler input after one complete pass.
@@ -1035,6 +1036,38 @@ func Run(ctx context.Context, opts Options) error {
 			prevToken = persistedToken
 		}
 		startupPreviousToken = prevToken
+		if !branchTransitionBlocked && prevToken != currentToken &&
+			tokenBranchRef(prevToken) != "" &&
+			tokenBranchRef(prevToken) == tokenBranchRef(currentToken) &&
+			tokenSHA(prevToken) != "" && tokenSHA(currentToken) != "" {
+			chain, owned, proofErr := state.CompletedBranchTransitionChain(
+				ctx, opts.DB, tokenBranchRef(prevToken), persistedGen,
+				tokenSHA(prevToken), tokenSHA(currentToken))
+			switch {
+			case proofErr != nil:
+				logger.Warn("prove completed ACD transition at startup; will retry",
+					"old", prevToken, "new", currentToken,
+					"err", proofErr.Error())
+				branchTransitionBlocked = true
+				currentToken = prevToken
+			case owned:
+				if err := SaveBranchPublicationToken(
+					ctx, opts.DB, persistedGen, tokenSHA(currentToken), currentToken,
+				); err != nil {
+					logger.Warn("adopt completed ACD transition at startup; will retry",
+						"old", prevToken, "new", currentToken,
+						"err", err.Error())
+					branchTransitionBlocked = true
+					currentToken = prevToken
+				} else {
+					persistedHead = tokenSHA(currentToken)
+					prevToken = currentToken
+					logger.Info("adopted completed ACD transition at startup",
+						"target", persistedHead, "steps", len(chain),
+						"generation", persistedGen)
+				}
+			}
+		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, prevToken, currentToken)
 		if cErr == nil {
 			startupTransition = transition
@@ -1489,22 +1522,22 @@ func Run(ctx context.Context, opts Options) error {
 	lastStampedBranchHead := persistedHead
 	var branchTransitionSettleUntil time.Time
 	forceShadowRefresh := startupShadowRefreshRequired
-	pendingSelfPublicationTarget := ""
+	pendingInternalTransitionTarget := ""
 
-	adoptSelfPublicationTarget := func(targetOID, observedToken string) error {
+	adoptInternalTransitionTarget := func(targetOID, observedToken string) error {
 		if targetOID == "" {
-			return fmt.Errorf("daemon: adopt self-publication: empty target OID")
+			return fmt.Errorf("daemon: adopt internal transition: empty target OID")
 		}
 		if tokenSHA(observedToken) != targetOID ||
 			tokenBranchRef(observedToken) != cctx.BranchRef {
 			return fmt.Errorf(
-				"daemon: adopt self-publication: observed token %q does not match target %s on %s",
+				"daemon: adopt internal transition: observed token %q does not match target %s on %s",
 				observedToken, targetOID, cctx.BranchRef)
 		}
 		nextToken := branchTokenRev(targetOID, cctx.BranchRef)
 		if err := SaveBranchPublicationToken(
 			ctx, opts.DB, cctx.BranchGeneration, targetOID, nextToken); err != nil {
-			return fmt.Errorf("daemon: persist self-publication token: %w", err)
+			return fmt.Errorf("daemon: persist internal transition token: %w", err)
 		}
 
 		// This is one run-loop boundary: no capture, flush, wake, or branch
@@ -1514,7 +1547,7 @@ func Run(ctx context.Context, opts Options) error {
 		currentToken = nextToken
 		headOID = targetOID
 		lastStampedBranchHead = targetOID
-		pendingSelfPublicationTarget = ""
+		pendingInternalTransitionTarget = ""
 		if opts.afterSelfPublicationAdoption != nil {
 			opts.afterSelfPublicationAdoption(
 				cctx, currentToken, headOID, lastStampedBranchHead)
@@ -1541,12 +1574,12 @@ func Run(ctx context.Context, opts Options) error {
 			return recovered.HasMore, recovered.HasMore
 		}
 		targetOID := recovered.FinalTargetOID
-		pendingSelfPublicationTarget = targetOID
+		pendingInternalTransitionTarget = targetOID
 		// Recovery proved and locked the literal branch at target through
 		// SQLite completion. Adopt that exact internal boundary first. A
 		// branch move immediately after lock release remains external and is
 		// classified by the token check that follows this closure.
-		if err := adoptSelfPublicationTarget(
+		if err := adoptInternalTransitionTarget(
 			targetOID, branchTokenRev(targetOID, cctx.BranchRef)); err != nil {
 			logger.Warn("adopt recovered self-publication target",
 				"target", targetOID, "err", err.Error())
@@ -1570,15 +1603,15 @@ func Run(ctx context.Context, opts Options) error {
 			// exact internal transition in progress. Fail closed until HEAD
 			// can be sampled again; otherwise capture/replay would run against
 			// the pre-publication cctx and strand new work on a stale base.
-			return pendingSelfPublicationTarget != ""
+			return pendingInternalTransitionTarget != ""
 		}
-		if pendingSelfPublicationTarget != "" {
-			if tokenSHA(newToken) == pendingSelfPublicationTarget &&
+		if pendingInternalTransitionTarget != "" {
+			if tokenSHA(newToken) == pendingInternalTransitionTarget &&
 				tokenBranchRef(newToken) == cctx.BranchRef {
-				if err := adoptSelfPublicationTarget(
-					pendingSelfPublicationTarget, newToken); err != nil {
-					logger.Warn(logPrefix+" retry self-publication adoption",
-						"target", pendingSelfPublicationTarget,
+				if err := adoptInternalTransitionTarget(
+					pendingInternalTransitionTarget, newToken); err != nil {
+					logger.Warn(logPrefix+" retry internal transition adoption",
+						"target", pendingInternalTransitionTarget,
 						"err", err.Error())
 					return true
 				}
@@ -1587,7 +1620,7 @@ func Run(ctx context.Context, opts Options) error {
 			// HEAD no longer names the completed journal target. It is now an
 			// unknown transition and must retain the existing reconciliation
 			// and generation-classification path below.
-			pendingSelfPublicationTarget = ""
+			pendingInternalTransitionTarget = ""
 		}
 		if SameGeneration(currentToken, newToken) {
 			if forceShadowRefresh && cctx.BranchRef != "" {
@@ -1724,6 +1757,30 @@ func Run(ctx context.Context, opts Options) error {
 				}
 			}
 			return false
+		}
+		if tokenBranchRef(newToken) == cctx.BranchRef &&
+			tokenSHA(currentToken) != "" && tokenSHA(newToken) != "" {
+			chain, owned, proofErr := state.CompletedBranchTransitionChain(
+				ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
+				tokenSHA(currentToken), tokenSHA(newToken))
+			if proofErr != nil {
+				logger.Warn(logPrefix+" prove completed ACD transition; will retry",
+					"old", currentToken, "new", newToken,
+					"err", proofErr.Error())
+				return true
+			}
+			if owned {
+				if err := adoptInternalTransitionTarget(
+					tokenSHA(newToken), newToken); err != nil {
+					logger.Warn(logPrefix+" adopt completed ACD transition; will retry",
+						"target", tokenSHA(newToken), "err", err.Error())
+					return true
+				}
+				logger.Info("adopted completed ACD transition",
+					"target", tokenSHA(newToken), "steps", len(chain),
+					"generation", cctx.BranchGeneration)
+				return false
+			}
 		}
 		transition, cErr := ClassifyTokenTransition(ctx, opts.RepoPath, currentToken, newToken)
 		if cErr != nil {
@@ -2705,23 +2762,28 @@ func Run(ctx context.Context, opts Options) error {
 				_ = updateIntentV2EvaluationMeta(
 					ctx, opts.DB, passBundle, repSum, repErr)
 			}
-			if repErr == nil && repSum.SelfPublicationTargetOID != "" {
-				targetOID := repSum.SelfPublicationTargetOID
-				if repSum.BaseHead != targetOID {
+			if repErr == nil {
+				targetOID := repSum.InternalTransitionTargetOID
+				if targetOID == "" {
+					// Compatibility for injected replay seams and older callers
+					// that expose only the self-publication-specific field.
+					targetOID = repSum.SelfPublicationTargetOID
+				}
+				if targetOID != "" && repSum.BaseHead != targetOID {
 					repErr = fmt.Errorf(
-						"daemon: replay self-publication target %s disagrees with base head %s",
+						"daemon: replay internal transition target %s disagrees with base head %s",
 						targetOID, repSum.BaseHead)
-				} else {
-					pendingSelfPublicationTarget = targetOID
+				} else if targetOID != "" {
+					pendingInternalTransitionTarget = targetOID
 					observedToken, tokenErr := branchGenerationToken(
 						passCtx, opts.RepoPath)
 					if tokenErr != nil {
 						repErr = fmt.Errorf(
-							"daemon: resolve self-publication target: %w",
+							"daemon: resolve internal transition target: %w",
 							tokenErr)
 					} else if tokenSHA(observedToken) == targetOID &&
 						tokenBranchRef(observedToken) == cctx.BranchRef {
-						if adoptErr := adoptSelfPublicationTarget(
+						if adoptErr := adoptInternalTransitionTarget(
 							targetOID, observedToken); adoptErr != nil {
 							repErr = adoptErr
 						}
@@ -2729,8 +2791,8 @@ func Run(ctx context.Context, opts Options) error {
 						// An external writer moved HEAD after the journal
 						// completed. Do not bless that movement as ours; the
 						// next token check must classify it normally.
-						pendingSelfPublicationTarget = ""
-						logger.Info("HEAD moved after self-publication; deferring to transition classifier",
+						pendingInternalTransitionTarget = ""
+						logger.Info("HEAD moved after internal transition; deferring to transition classifier",
 							"journal_target", targetOID,
 							"observed_token", observedToken)
 					}
