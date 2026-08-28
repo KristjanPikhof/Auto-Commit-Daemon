@@ -725,7 +725,7 @@ func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
 		return strings.TrimSpace(string(out))
 	}
 	base := commit("base\n", "base")
-	db, events, drain := openPublicationDrainTestState(t, 70, 1)
+	db, events, drain := openPublicationDrainTestState(t, 70, 65)
 	previous := base
 	for i := 0; i < 65; i++ {
 		target := commit(strings.Repeat("owned\n", i+1), "owned")
@@ -759,7 +759,7 @@ func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
 		previous = target
 	}
 	if safe, err := publicationDrainOwnsHeadAdvance(
-		ctx, db, drain, base, previous); err != nil || !safe {
+		ctx, db, drain, base, previous, 1); err != nil || !safe {
 		t.Fatalf("owned advance=(%t,%v), want true,nil", safe, err)
 	}
 	if _, err := db.SQL().ExecContext(ctx,
@@ -787,7 +787,7 @@ func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
 	}
 	externalHead := commit("external\n", "external")
 	if safe, err := publicationDrainOwnsHeadAdvance(
-		ctx, db, drain, base, externalHead); err != nil || safe {
+		ctx, db, drain, base, externalHead, 1); err != nil || safe {
 		t.Fatalf("external advance=(%t,%v), want false,nil", safe, err)
 	}
 }

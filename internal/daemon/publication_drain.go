@@ -231,9 +231,10 @@ func ResumePublicationDrainCheckpointing(
 		return fail(err)
 	}
 	var observedHead string
+	var checkpointCreatedTS float64
 	if err := db.ReadSQL().QueryRowContext(ctx,
-		`SELECT observed_head FROM checkpoints WHERE id=?`, drain.CheckpointID).
-		Scan(&observedHead); err != nil {
+		`SELECT observed_head,created_ts FROM checkpoints WHERE id=?`,
+		drain.CheckpointID).Scan(&observedHead, &checkpointCreatedTS); err != nil {
 		return fail(err)
 	}
 	currentHead, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
@@ -242,7 +243,7 @@ func ResumePublicationDrainCheckpointing(
 	if err == nil && currentHeadText != observedHead {
 		var safe bool
 		safe, err = publicationDrainOwnsHeadAdvance(
-			ctx, db, drain, observedHead, currentHeadText)
+			ctx, db, drain, observedHead, currentHeadText, checkpointCreatedTS)
 		if err == nil && !safe {
 			err = fmt.Errorf(
 				publicationDrainHeadChangedPrefix+" observed=%s current=%s",
@@ -311,14 +312,14 @@ func publicationDrainOwnsHeadAdvance(
 	drain state.PublicationDrain,
 	observedHead string,
 	currentHead string,
+	checkpointCreatedTS float64,
 ) (bool, error) {
 	if observedHead == "" || currentHead == "" {
 		return false, nil
 	}
-	_, owned, err := state.CompletedBranchTransitionChain(
+	return state.CompletedBranchTransitionOwnsCheckpointTarget(
 		ctx, db, drain.BranchRef, drain.BranchGeneration,
-		observedHead, currentHead)
-	return owned, err
+		observedHead, currentHead, checkpointCreatedTS, drain.EventSeqs)
 }
 
 // ResumePublicationDrainNormalization retires the stalled semantic pass at a

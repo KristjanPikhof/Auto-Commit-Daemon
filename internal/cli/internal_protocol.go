@@ -1459,53 +1459,9 @@ func publicationHeadAdvanceOwnedByTarget(
 	checkpointCreatedTS float64,
 	target publicationDrainTarget,
 ) (bool, error) {
-	unusedEvents := make(map[int64]struct{}, len(target.EventSeqs))
-	for _, seq := range target.EventSeqs {
-		unusedEvents[seq] = struct{}{}
-	}
-	chain, owned, err := state.CompletedBranchTransitionChain(
-		ctx, db, target.BranchRef, target.Generation, sourceHead, targetHead)
-	if err != nil || !owned {
-		return false, err
-	}
-	for _, transition := range chain {
-		switch transition.Kind {
-		case state.CompletedBranchTransitionSelfPublication:
-			for _, seq := range transition.EventSeqs {
-				if _, ok := unusedEvents[seq]; !ok {
-					return false, nil
-				}
-				delete(unusedEvents, seq)
-			}
-		case state.CompletedBranchTransitionIntentRepair:
-			if transition.CompletedTS <= checkpointCreatedTS {
-				continue
-			}
-			repair, ok, err := state.IntentRepairByID(ctx, db, transition.ID)
-			if err != nil {
-				return false, err
-			}
-			if !ok || len(repair.Members) == 0 {
-				return false, nil
-			}
-			for _, member := range repair.Members {
-				switch member.PriorState {
-				case state.EventStatePublished:
-					continue
-				case state.EventStatePending:
-					if _, ok := unusedEvents[member.EventSeq]; !ok {
-						return false, nil
-					}
-					delete(unusedEvents, member.EventSeq)
-				default:
-					return false, nil
-				}
-			}
-		default:
-			return false, nil
-		}
-	}
-	return true, nil
+	return state.CompletedBranchTransitionOwnsCheckpointTarget(
+		ctx, db, target.BranchRef, target.Generation, sourceHead, targetHead,
+		checkpointCreatedTS, target.EventSeqs)
 }
 
 func publicationDrainResult(

@@ -272,12 +272,16 @@ func completedIntentRepairProof(
 				transition.ID)
 		}
 	}
-	if len(repair.Members) > 0 {
-		if err := validateIntentRepairMembers(repair); err != nil {
-			return IntentRepair{}, fmt.Errorf(
-				"state: completed intent repair %s has invalid membership: %w",
-				transition.ID, err)
-		}
+	if repair.MembershipMode != IntentRepairMembershipLegacy &&
+		repair.MembershipMode != IntentRepairMembershipFrozen {
+		return IntentRepair{}, fmt.Errorf(
+			"state: completed intent repair %s has invalid membership mode %q",
+			transition.ID, repair.MembershipMode)
+	}
+	if err := validateIntentRepairMembers(repair); err != nil {
+		return IntentRepair{}, fmt.Errorf(
+			"state: completed intent repair %s has invalid membership: %w",
+			transition.ID, err)
 	}
 	return repair, nil
 }

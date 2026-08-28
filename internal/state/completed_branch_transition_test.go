@@ -41,7 +41,7 @@ func TestCompletedBranchTransitionChainRepairOnly(t *testing.T) {
 	}
 }
 
-func TestCompletedBranchTransitionChainFindsRepartitionedHeadMapping(t *testing.T) {
+func TestCompletedBranchTransitionChainAcceptsNoncontiguousRepartition(t *testing.T) {
 	db, _ := openTestDB(t)
 	ctx := context.Background()
 	const (
@@ -176,6 +176,130 @@ func TestCompletedBranchTransitionChainRejectsAmbiguousOutgoing(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "ambiguous") || ok || chain != nil {
 		t.Fatalf("ambiguous chain=(%+v,%t,%v)", chain, ok, err)
 	}
+}
+
+func TestCompletedBranchTransitionOwnsCheckpointTargetUsesRepairMembers(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		legacy        bool
+		checkpointTS  float64
+		includeMember bool
+		want          bool
+	}{
+		{name: "post-checkpoint member included", checkpointTS: 1, includeMember: true, want: true},
+		{name: "post-checkpoint member outside target", checkpointTS: 1},
+		{name: "post-checkpoint legacy repair", legacy: true, checkpointTS: 1},
+		{name: "pre-checkpoint legacy repair", legacy: true, checkpointTS: 10, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, _ := openTestDB(t)
+			ctx := context.Background()
+			const (
+				branch     = "refs/heads/main"
+				generation = int64(12)
+				source     = "checkpoint-source"
+				target     = "checkpoint-target"
+			)
+			var memberSeq int64
+			if test.legacy {
+				completeIntentRepairTransition(
+					t, db, "checkpoint-legacy", branch, generation,
+					source, target, 2)
+			} else {
+				memberSeq = completeIntentRepairTransitionWithPendingMember(
+					t, db, "checkpoint-members", branch, generation,
+					source, target, 2)
+			}
+			var targetSeqs []int64
+			if test.includeMember {
+				targetSeqs = []int64{memberSeq}
+			}
+			owned, err := CompletedBranchTransitionOwnsCheckpointTarget(
+				ctx, db, branch, generation, source, target,
+				test.checkpointTS, targetSeqs)
+			if err != nil || owned != test.want {
+				t.Fatalf("owned=(%t, %v) want (%t, nil)", owned, err, test.want)
+			}
+		})
+	}
+}
+
+func completeIntentRepairTransitionWithPendingMember(
+	t *testing.T,
+	db *DB,
+	id string,
+	branch string,
+	generation int64,
+	source string,
+	target string,
+	createdTS float64,
+) int64 {
+	t.Helper()
+	ctx := context.Background()
+	seq, err := AppendCaptureEvent(ctx, db, CaptureEvent{
+		BranchRef: branch, BranchGeneration: generation,
+		BaseHead: source, Operation: "create", Path: id + ".go",
+		Fidelity: "full", State: EventStatePending,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateID := "candidate-" + id
+	if err := SaveIntentCandidate(ctx, db, IntentCandidate{
+		ID: candidateID, BranchRef: branch, BranchGeneration: generation,
+		Status: IntentCandidateReady, Readiness: IntentReadinessReady,
+		Events: []IntentCandidateEvent{{EventSeq: seq, EventRole: "code"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	members, err := SnapshotIntentRepairMembers(
+		ctx, db, id, branch, generation, []string{candidateID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveIntentRepair(ctx, db, IntentRepair{
+		ID: id, BranchRef: branch, BranchGeneration: generation,
+		Status: IntentRepairPrepared, ExpectedHead: source,
+		PlanDigest: completedBranchTransitionTestDigest,
+		OldHead:    sql.NullString{String: source, Valid: true},
+		CreatedTS:  createdTS, UpdatedTS: createdTS,
+		Commits: []IntentRepairCommit{{
+			CandidateID: sql.NullString{String: candidateID, Valid: true},
+			OldOID:      source,
+		}},
+		Members: members,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mapping := []IntentRepairCommit{{
+		CandidateID: sql.NullString{String: candidateID, Valid: true},
+		OldOID:      source,
+		NewOID:      sql.NullString{String: target, Valid: true},
+	}}
+	applied, err := TransitionIntentRepair(ctx, db, id, IntentRepairTransition{
+		ExpectedStatus: IntentRepairPrepared,
+		Status:         IntentRepairGitApplied,
+		BackupRef: sql.NullString{
+			String: "refs/acd/intent-repair/fixture/" + id + "/backup",
+			Valid:  true,
+		},
+		OldHead:      sql.NullString{String: source, Valid: true},
+		NewHead:      sql.NullString{String: target, Valid: true},
+		Commits:      mapping,
+		TransitionTS: createdTS + 1,
+	})
+	if err != nil || !applied {
+		t.Fatalf("mark Git-applied=(%t, %v)", applied, err)
+	}
+	completed, err := TransitionIntentRepair(ctx, db, id, IntentRepairTransition{
+		ExpectedStatus: IntentRepairGitApplied,
+		Status:         IntentRepairCompleted,
+		TransitionTS:   createdTS + 2,
+	})
+	if err != nil || !completed {
+		t.Fatalf("complete repair=(%t, %v)", completed, err)
+	}
+	return seq
 }
 
 func completeIntentRepairTransition(
