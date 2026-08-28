@@ -25,6 +25,7 @@ const (
 	IntentCandidateLineageMaxPerPair     = 4096
 	IntentVerificationOutputMaxBytes     = 64 * 1024
 	IntentRepairMaxCommits               = 5
+	IntentRepairMaxMembers               = IntentCandidateMaxCaptures * IntentRepairMaxCommits
 
 	IntentCandidateOpen          = "open"
 	IntentCandidateWaiting       = "waiting"
@@ -167,6 +168,7 @@ type IntentRepair struct {
 	CompletedTS      sql.NullFloat64
 	Error            string
 	Commits          []IntentRepairCommit
+	Members          []IntentRepairMember
 }
 
 type IntentRepairCommit struct {
@@ -175,6 +177,16 @@ type IntentRepairCommit struct {
 	CandidateID sql.NullString
 	OldOID      string
 	NewOID      sql.NullString
+}
+
+// IntentRepairMember is one immutable active candidate membership captured
+// before the repair is allowed to change Git. Legacy repairs have no members.
+type IntentRepairMember struct {
+	RepairID   string
+	Ord        int
+	CandidateID string
+	EventSeq    int64
+	PriorState  string
 }
 
 // IntentRepairTransition applies one compare-and-swap state transition and,
