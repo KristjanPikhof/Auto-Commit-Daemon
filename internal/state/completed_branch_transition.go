@@ -24,11 +24,13 @@ const (
 // Intent repair rewrites already-published commits and therefore consumes no
 // new capture membership.
 type CompletedBranchTransition struct {
-	Kind       CompletedBranchTransitionKind
-	ID         string
-	SourceHead string
-	TargetHead string
-	EventSeqs  []int64
+	Kind           CompletedBranchTransitionKind
+	ID             string
+	SourceHead     string
+	TargetHead     string
+	CompletedTS    float64
+	EventSeqs      []int64
+	CommitMappings []IntentRepairCommit
 }
 
 // CompletedBranchTransitionChain proves a unique completed ACD-authored path
@@ -71,6 +73,10 @@ func CompletedBranchTransitionChain(
 		}
 
 		transition := outgoing[0]
+		if transition.TargetHead == current {
+			return nil, false, fmt.Errorf(
+				"state: completed branch transition does not move %s", current)
+		}
 		if _, duplicate := seen[transition.TargetHead]; duplicate {
 			return nil, false, fmt.Errorf(
 				"state: completed branch transition cycle at %s", transition.TargetHead)
@@ -95,15 +101,16 @@ func completedBranchTransitionsFrom(
 	sourceHead string,
 ) ([]CompletedBranchTransition, error) {
 	rows, err := d.readSQL().QueryContext(ctx, `
-SELECT kind,id,target_head
+SELECT kind,id,target_head,completed_ts
 FROM (
     SELECT 'self_publication' AS kind,id,target_commit_oid AS target_head,
-           created_ts
+           created_ts,COALESCE(completed_ts,0) AS completed_ts
     FROM self_publications
     WHERE branch_ref=? AND branch_generation=? AND source_head=?
       AND phase='completed'
     UNION ALL
-    SELECT 'intent_repair' AS kind,id,new_head AS target_head,created_ts
+    SELECT 'intent_repair' AS kind,id,new_head AS target_head,created_ts,
+           COALESCE(completed_ts,0) AS completed_ts
     FROM intent_repairs
     WHERE branch_ref=? AND branch_generation=? AND old_head=?
       AND status='completed' AND new_head IS NOT NULL AND new_head<>''
@@ -122,22 +129,35 @@ LIMIT 2`,
 	for rows.Next() {
 		var transition CompletedBranchTransition
 		if err := rows.Scan(
-			&transition.Kind, &transition.ID, &transition.TargetHead); err != nil {
+			&transition.Kind, &transition.ID, &transition.TargetHead,
+			&transition.CompletedTS); err != nil {
 			return nil, fmt.Errorf(
 				"state: scan completed branch transition: %w", err)
 		}
 		transition.SourceHead = sourceHead
-		if transition.TargetHead == "" {
+		if transition.TargetHead == "" || transition.CompletedTS <= 0 {
 			return nil, errors.New(
-				"state: completed branch transition has an empty target")
+				"state: completed branch transition has incomplete completion proof")
 		}
-		if transition.Kind == CompletedBranchTransitionSelfPublication {
+		switch transition.Kind {
+		case CompletedBranchTransitionSelfPublication:
 			members, err := completedSelfPublicationMembers(
 				ctx, d, transition.ID)
 			if err != nil {
 				return nil, err
 			}
 			transition.EventSeqs = members
+		case CompletedBranchTransitionIntentRepair:
+			mappings, err := completedIntentRepairMappings(
+				ctx, d, transition)
+			if err != nil {
+				return nil, err
+			}
+			transition.CommitMappings = mappings
+		default:
+			return nil, fmt.Errorf(
+				"state: unknown completed branch transition kind %q",
+				transition.Kind)
 		}
 		transitions = append(transitions, transition)
 	}
@@ -146,6 +166,140 @@ LIMIT 2`,
 			"state: iterate completed branch transitions: %w", err)
 	}
 	return transitions, nil
+}
+
+func completedIntentRepairMappings(
+	ctx context.Context,
+	d *DB,
+	transition CompletedBranchTransition,
+) ([]IntentRepairCommit, error) {
+	repair, ok, err := IntentRepairByID(ctx, d, transition.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok || repair.Status != IntentRepairCompleted ||
+		repair.BranchRef == "" ||
+		repair.ExpectedHead != transition.SourceHead ||
+		!repair.OldHead.Valid || repair.OldHead.String != transition.SourceHead ||
+		!repair.NewHead.Valid || repair.NewHead.String != transition.TargetHead ||
+		!repair.BackupRef.Valid || repair.BackupRef.String == "" ||
+		len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxCommits {
+		return nil, fmt.Errorf(
+			"state: completed intent repair %s has incomplete transition proof",
+			transition.ID)
+	}
+	for _, mapping := range repair.Commits {
+		if mapping.OldOID == "" || !mapping.NewOID.Valid ||
+			mapping.NewOID.String == "" || !mapping.CandidateID.Valid ||
+			mapping.CandidateID.String == "" {
+			return nil, fmt.Errorf(
+				"state: completed intent repair %s has incomplete commit mapping",
+				transition.ID)
+		}
+	}
+	last := repair.Commits[len(repair.Commits)-1]
+	if last.OldOID != transition.SourceHead ||
+		last.NewOID.String != transition.TargetHead {
+		return nil, fmt.Errorf(
+			"state: completed intent repair %s does not map its exact head",
+			transition.ID)
+	}
+	return repair.Commits, nil
+}
+
+// CanonicalCompletedIntentRepairCommit follows the unique completed Intent
+// repair mapping for one commit within an exact branch pair. The caller must
+// still prove the resulting commit's Git ancestry before using it as a replay
+// or recovery base.
+func CanonicalCompletedIntentRepairCommit(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	branchGeneration int64,
+	commitOID string,
+) (string, bool, error) {
+	if d == nil || branchRef == "" || branchGeneration < 0 || commitOID == "" {
+		return "", false, errors.New(
+			"state: CanonicalCompletedIntentRepairCommit: invalid input")
+	}
+
+	current := commitOID
+	seen := map[string]struct{}{current: {}}
+	mapped := false
+	for step := 0; step < CompletedBranchTransitionProofLimit; step++ {
+		rows, err := d.readSQL().QueryContext(ctx, `
+SELECT r.id,c.new_oid
+FROM intent_repair_commits c
+JOIN intent_repairs r ON r.id=c.repair_id
+WHERE r.branch_ref=? AND r.branch_generation=?
+  AND r.status='completed' AND c.old_oid=?
+  AND c.new_oid IS NOT NULL AND c.new_oid<>''
+ORDER BY r.created_ts,r.id
+LIMIT 2`, branchRef, branchGeneration, current)
+		if err != nil {
+			return "", false, fmt.Errorf(
+				"state: query completed intent repair mapping: %w", err)
+		}
+		type repairMapping struct{ repairID, targetOID string }
+		var mappings []repairMapping
+		for rows.Next() {
+			var mapping repairMapping
+			if err := rows.Scan(&mapping.repairID, &mapping.targetOID); err != nil {
+				rows.Close()
+				return "", false, fmt.Errorf(
+					"state: scan completed intent repair mapping: %w", err)
+			}
+			mappings = append(mappings, mapping)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return "", false, fmt.Errorf(
+				"state: iterate completed intent repair mapping: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return "", false, err
+		}
+		switch len(mappings) {
+		case 0:
+			return current, mapped, nil
+		case 1:
+			// Validate the whole repair before trusting one interior mapping.
+		default:
+			return "", false, fmt.Errorf(
+				"state: completed intent repair mapping from %s is ambiguous",
+				current)
+		}
+
+		repair, ok, err := IntentRepairByID(ctx, d, mappings[0].repairID)
+		if err != nil {
+			return "", false, err
+		}
+		if !ok || !repair.OldHead.Valid || !repair.NewHead.Valid ||
+			!repair.CompletedTS.Valid {
+			return "", false, fmt.Errorf(
+				"state: completed intent repair %s has incomplete proof",
+				mappings[0].repairID)
+		}
+		transition := CompletedBranchTransition{
+			Kind: CompletedBranchTransitionIntentRepair, ID: repair.ID,
+			SourceHead: repair.OldHead.String, TargetHead: repair.NewHead.String,
+			CompletedTS: repair.CompletedTS.Float64,
+		}
+		if _, err := completedIntentRepairMappings(ctx, d, transition); err != nil {
+			return "", false, err
+		}
+		next := mappings[0].targetOID
+		if _, duplicate := seen[next]; duplicate {
+			return "", false, fmt.Errorf(
+				"state: completed intent repair mapping cycle at %s", next)
+		}
+		seen[next] = struct{}{}
+		current = next
+		mapped = true
+	}
+	return "", false, fmt.Errorf(
+		"state: completed intent repair mapping exceeds %d steps",
+		CompletedBranchTransitionProofLimit)
 }
 
 func completedSelfPublicationMembers(
