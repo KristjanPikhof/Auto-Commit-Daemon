@@ -26,6 +26,12 @@ type IntentForwardRecovery struct {
 	TargetEventSeqs  []int64 `json:"target_event_seqs,omitempty"`
 	UnlockCount      int     `json:"unlock_count,omitempty"`
 	LastProgressTS   float64 `json:"last_progress_ts,omitempty"`
+	PlanFingerprint  string  `json:"plan_fingerprint,omitempty"`
+	PrefixCursor     int     `json:"prefix_cursor,omitempty"`
+	PrefixBaseHead   string  `json:"prefix_base_head,omitempty"`
+	PrefixExhausted  bool    `json:"prefix_exhausted,omitempty"`
+	NeedsAttention   bool    `json:"needs_attention,omitempty"`
+	AttentionReason  string  `json:"attention_reason,omitempty"`
 }
 
 // OldestOverdueFailedIntentEventSeq returns the earliest pending capture held
@@ -992,6 +998,78 @@ func sameEventSeqs(left, right []int64) bool {
 	return true
 }
 
+func normalizedIntentForwardRecoveryStage(stage string) string {
+	if stage == "" {
+		return "semantic_replan"
+	}
+	return stage
+}
+
+func sameIntentForwardRecoveryMarker(
+	left IntentForwardRecovery,
+	right IntentForwardRecovery,
+) bool {
+	return left.BranchRef == right.BranchRef &&
+		left.BranchGeneration == right.BranchGeneration &&
+		left.CandidateID == right.CandidateID &&
+		left.Reason == right.Reason &&
+		normalizedIntentForwardRecoveryStage(left.Stage) ==
+			normalizedIntentForwardRecoveryStage(right.Stage) &&
+		sameEventSeqs(left.TargetEventSeqs, right.TargetEventSeqs) &&
+		left.UnlockCount == right.UnlockCount &&
+		left.LastProgressTS == right.LastProgressTS &&
+		left.PlanFingerprint == right.PlanFingerprint &&
+		left.PrefixCursor == right.PrefixCursor &&
+		left.PrefixBaseHead == right.PrefixBaseHead &&
+		left.PrefixExhausted == right.PrefixExhausted &&
+		left.NeedsAttention == right.NeedsAttention &&
+		left.AttentionReason == right.AttentionReason
+}
+
+func loadIntentForwardRecoveryForUpdate(
+	ctx context.Context,
+	tx *sql.Tx,
+) (IntentForwardRecovery, string, error) {
+	var raw string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT value FROM daemon_meta WHERE key=?`,
+		intentForwardRecoveryMetaKey).Scan(&raw); err != nil {
+		return IntentForwardRecovery{}, "", err
+	}
+	var current IntentForwardRecovery
+	if err := json.Unmarshal([]byte(raw), &current); err != nil {
+		return IntentForwardRecovery{}, "", err
+	}
+	current.Stage = normalizedIntentForwardRecoveryStage(current.Stage)
+	return current, raw, nil
+}
+
+func storeIntentForwardRecoveryCAS(
+	ctx context.Context,
+	tx *sql.Tx,
+	previousRaw string,
+	recovery IntentForwardRecovery,
+) error {
+	updated, err := json.Marshal(recovery)
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `
+UPDATE daemon_meta SET value=?,updated_ts=? WHERE key=? AND value=?`,
+		string(updated), nowSeconds(), intentForwardRecoveryMetaKey, previousRaw)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return errors.New("state: intent forward recovery marker changed")
+	}
+	return nil
+}
+
 // AdvanceIntentForwardRecovery changes the restart-safe salvage subphase
 // without changing its frozen target or branch identity.
 func AdvanceIntentForwardRecovery(
@@ -1010,33 +1088,148 @@ func AdvanceIntentForwardRecovery(
 		return recovery, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var raw string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT value FROM daemon_meta WHERE key=?`,
-		intentForwardRecoveryMetaKey).Scan(&raw); err != nil {
+	current, raw, err := loadIntentForwardRecoveryForUpdate(ctx, tx)
+	if err != nil {
 		return recovery, err
 	}
-	var current IntentForwardRecovery
-	if err := json.Unmarshal([]byte(raw), &current); err != nil {
-		return recovery, err
-	}
-	if current.BranchRef != recovery.BranchRef ||
-		current.BranchGeneration != recovery.BranchGeneration ||
-		current.CandidateID != recovery.CandidateID {
+	if !sameIntentForwardRecoveryMarker(current, recovery) {
 		return recovery, errors.New("state: intent forward recovery marker changed")
 	}
 	current.Stage = stage
 	if published > 0 {
 		current.UnlockCount++
 		current.LastProgressTS = nowSeconds()
+		current.PlanFingerprint = ""
+		current.PrefixCursor = 0
+		current.PrefixBaseHead = ""
+		current.PrefixExhausted = false
+		current.NeedsAttention = false
+		current.AttentionReason = ""
 	}
-	updated, err := json.Marshal(current)
+	if err := storeIntentForwardRecoveryCAS(ctx, tx, raw, current); err != nil {
+		return recovery, err
+	}
+	if err := tx.Commit(); err != nil {
+		return recovery, err
+	}
+	return current, nil
+}
+
+// AdvanceIntentForwardRecoveryPrefix starts or widens a semantic-prefix
+// local-unlock attempt. PrefixCursor is the next number of ordered plan
+// candidates to attempt. The plan and base HEAD stay immutable until durable
+// publication progress resets them through AdvanceIntentForwardRecovery.
+func AdvanceIntentForwardRecoveryPrefix(
+	ctx context.Context,
+	d *DB,
+	recovery IntentForwardRecovery,
+	planFingerprint string,
+	baseHead string,
+	prefixCursor int,
+) (IntentForwardRecovery, error) {
+	if d == nil || recovery.BranchRef == "" || recovery.BranchGeneration < 0 ||
+		recovery.CandidateID == "" ||
+		(normalizedIntentForwardRecoveryStage(recovery.Stage) != "semantic_replan" &&
+			normalizedIntentForwardRecoveryStage(recovery.Stage) != "local_unlock") ||
+		strings.TrimSpace(planFingerprint) == "" ||
+		planFingerprint != strings.TrimSpace(planFingerprint) ||
+		strings.TrimSpace(baseHead) == "" || baseHead != strings.TrimSpace(baseHead) ||
+		prefixCursor < 1 || prefixCursor > IntentCandidateMaxOpenPerPair ||
+		len(recovery.TargetEventSeqs) == 0 {
+		return recovery, errors.New(
+			"state: AdvanceIntentForwardRecoveryPrefix: invalid input")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return recovery, err
 	}
-	if _, err := tx.ExecContext(ctx, `
-UPDATE daemon_meta SET value=?,updated_ts=? WHERE key=?`,
-		string(updated), nowSeconds(), intentForwardRecoveryMetaKey); err != nil {
+	defer func() { _ = tx.Rollback() }()
+	current, raw, err := loadIntentForwardRecoveryForUpdate(ctx, tx)
+	if err != nil {
+		return recovery, err
+	}
+	if !sameIntentForwardRecoveryMarker(current, recovery) {
+		return recovery, errors.New(
+			"state: intent forward recovery marker changed")
+	}
+	if current.PrefixExhausted || current.NeedsAttention {
+		return recovery, errors.New(
+			"state: intent forward recovery prefix is exhausted")
+	}
+	if current.PlanFingerprint == "" {
+		if current.PrefixCursor != 0 || current.PrefixBaseHead != "" {
+			return recovery, errors.New(
+				"state: intent forward recovery prefix state is incomplete")
+		}
+		current.PlanFingerprint = planFingerprint
+		current.PrefixBaseHead = baseHead
+	} else {
+		if current.PlanFingerprint != planFingerprint ||
+			current.PrefixBaseHead != baseHead {
+			return recovery, errors.New(
+				"state: intent forward recovery plan changed before progress")
+		}
+		if prefixCursor < current.PrefixCursor {
+			return recovery, errors.New(
+				"state: intent forward recovery prefix cannot move backward")
+		}
+	}
+	current.Stage = "local_unlock"
+	current.PrefixCursor = prefixCursor
+	if err := storeIntentForwardRecoveryCAS(ctx, tx, raw, current); err != nil {
+		return recovery, err
+	}
+	if err := tx.Commit(); err != nil {
+		return recovery, err
+	}
+	return current, nil
+}
+
+// MarkIntentForwardRecoveryNeedsAttention durably stops an exhausted semantic
+// prefix at the required verification gate. It never changes the frozen target
+// or permits an unverified publication.
+func MarkIntentForwardRecoveryNeedsAttention(
+	ctx context.Context,
+	d *DB,
+	recovery IntentForwardRecovery,
+	reason string,
+) (IntentForwardRecovery, error) {
+	reason = strings.TrimSpace(reason)
+	if d == nil || recovery.BranchRef == "" || recovery.BranchGeneration < 0 ||
+		recovery.CandidateID == "" || recovery.Stage != "local_unlock" ||
+		recovery.PlanFingerprint == "" || recovery.PrefixCursor < 1 ||
+		recovery.PrefixBaseHead == "" || reason == "" ||
+		len(reason) > IntentCandidateSummaryMaxChars {
+		return recovery, errors.New(
+			"state: MarkIntentForwardRecoveryNeedsAttention: invalid input")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return recovery, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, raw, err := loadIntentForwardRecoveryForUpdate(ctx, tx)
+	if err != nil {
+		return recovery, err
+	}
+	if !sameIntentForwardRecoveryMarker(current, recovery) {
+		return recovery, errors.New(
+			"state: intent forward recovery marker changed")
+	}
+	if current.NeedsAttention {
+		if current.PrefixExhausted && current.AttentionReason == reason {
+			if err := tx.Commit(); err != nil {
+				return recovery, err
+			}
+			return current, nil
+		}
+		return recovery, errors.New(
+			"state: intent forward recovery attention reason changed")
+	}
+	current.PrefixExhausted = true
+	current.NeedsAttention = true
+	current.AttentionReason = reason
+	if err := storeIntentForwardRecoveryCAS(ctx, tx, raw, current); err != nil {
 		return recovery, err
 	}
 	if err := tx.Commit(); err != nil {
