@@ -329,7 +329,7 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 	if progress.Origin != "intent_recovery" ||
 		progress.Phase != "intent_replanning" ||
 		progress.TargetTotal != 2 || progress.TargetRemaining != 1 ||
-		progress.LastProgressTS != publishedTS {
+		progress.LastProgressTS < publishedTS {
 		t.Fatalf("intent recovery progress=%+v", progress)
 	}
 	entry := productListEntry{PublicationProgress: progress}
@@ -372,8 +372,22 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 	}
 
 	marker.Stage = "local_unlock"
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		marker); err != nil {
+		t.Fatal(err)
+	}
+	legacyLocal, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyLocal.Phase != "intent_replanning" ||
+		legacyLocal.TemporaryLocalFallback {
+		t.Fatalf("unanchored local recovery progress=%+v", legacyLocal)
+	}
+
 	marker.PlanFingerprint = "sha256:verified-plan"
 	marker.PrefixCursor = 1
+	marker.PrefixUnresolvedCount = 1
 	marker.PrefixBaseHead = "base-head"
 	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
 		marker); err != nil {
@@ -481,6 +495,137 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 	}
 	if stale.Origin == "intent_recovery" || stale.TargetTotal != 0 {
 		t.Fatalf("stale recovery marker leaked into progress=%+v", stale)
+	}
+}
+
+func TestActiveIntentRecoveryShowsOpenProviderWait(t *testing.T) {
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	now := time.Unix(1_000, 0)
+	seqs := insertCompletedCheckpoint(t, db, "cp-provider-wait-recovery",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStatePending,
+		}})
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		state.IntentForwardRecovery{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			CandidateID: "failed-candidate", Stage: "semantic_replan",
+			TargetEventSeqs: seqs, LastProgressTS: 900,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 1,
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CheckpointProtectionAvailable: true, Protected: true, Busy: true,
+		IntentStrategy: intentStrategyReport{
+			Strategy: "intent", Active: true,
+			PlannerHealth: &daemon.IntentPlannerHealthSnapshot{
+				State: daemon.IntentPlannerCircuitOpen, NextProbeTS: 1_045,
+			},
+		},
+	}
+	progress, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := productListEntry{PublicationProgress: progress}
+	if progress.Origin != "intent_recovery" || progress.Phase != "provider_wait" ||
+		progress.WaitRemainingSeconds != 45 || progress.TargetRemaining != 1 ||
+		progress.TargetTotal != 1 || productListTarget(entry) != "recover:1/1" ||
+		productListPhase(entry) != "provider-wait:45s" ||
+		productListStatus(entry) != "waiting" {
+		t.Fatalf("provider-wait recovery progress=%+v target=%q phase=%q status=%q",
+			progress, productListTarget(entry), productListPhase(entry),
+			productListStatus(entry))
+	}
+	var human bytes.Buffer
+	renderProductPublicationProgress(&human, progress)
+	for _, want := range []string{
+		"Active target: automatic Intent recovery, 1 of 1 left",
+		"Publication phase: waiting for the Intent provider retry (45s remaining)",
+	} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("provider-wait recovery status missing %q:\n%s",
+				want, human.String())
+		}
+	}
+
+	report.PublicationProgress = progress
+	result := controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.Health != controlHealthWaiting ||
+		!strings.Contains(result.Summary, "recovery target and your work remain protected") ||
+		!strings.Contains(result.NextAction, "retry in 45s") {
+		t.Fatalf("provider-wait recovery control=%+v", result)
+	}
+
+	// Half-open owns the sole provider probe lease, so the active recovery
+	// phase remains visible while that request is in flight.
+	report.IntentStrategy.PlannerHealth.State = daemon.IntentPlannerCircuitHalfOpen
+	halfOpen, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if halfOpen.Phase != "intent_replanning" ||
+		halfOpen.WaitRemainingSeconds != 0 {
+		t.Fatalf("half-open recovery progress=%+v", halfOpen)
+	}
+}
+
+func TestActiveIntentRecoveryUsesMarkerUpdateForProgress(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	now := time.Now()
+	staleTS := float64(now.Add(-5*time.Minute).UnixNano()) / 1e9
+	seqs := insertCompletedCheckpoint(t, db, "cp-marker-progress",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStatePending,
+		}})
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET captured_ts=? WHERE seq=?`, staleTS, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		state.IntentForwardRecovery{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			CandidateID: "failed-candidate", Stage: "local_unlock",
+			TargetEventSeqs: seqs, LastProgressTS: staleTS,
+			PlanFingerprint: "sha256:verified-plan", PrefixCursor: 1,
+			PrefixUnresolvedCount: 1, PrefixBaseHead: "base-head",
+		}); err != nil {
+		t.Fatal(err)
+	}
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 1,
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CheckpointProtectionAvailable: true, Protected: true, Busy: true,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+	}
+	progress, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Phase != "local_fallback" ||
+		progress.LastProgressTS <= staleTS {
+		t.Fatalf("fresh marker progress=%+v", progress)
+	}
+
+	// If the marker itself stops changing, its durable update boundary ages
+	// normally and the same recovery can still be reported as stalled.
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET updated_ts=? WHERE key=?`,
+		staleTS, "intent.v2.forward_recovery"); err != nil {
+		t.Fatal(err)
+	}
+	stalled, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled.Phase != "stalled" || stalled.LastProgressTS != staleTS ||
+		stalled.LastProgressAgeSeconds < stalled.StallThresholdSeconds {
+		t.Fatalf("aged marker progress=%+v", stalled)
 	}
 }
 

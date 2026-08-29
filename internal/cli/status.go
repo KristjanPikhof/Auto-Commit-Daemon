@@ -651,11 +651,26 @@ func buildPublicationProgressReport(
 			progress.WaitRemainingSeconds = report.Pause.RemainingSeconds
 		case report.Configuration.Configuration == "validating":
 			progress.Phase = "config_wait"
+		case activeIntentRecovery && intentProviderCallActive(report):
+			progress.Phase = "provider_call"
+			progress.WaitRemainingSeconds = 0
+			progress.TemporaryLocalFallback = false
+		case activeIntentRecovery && intentProviderWaitOverridesRecovery(report):
+			progress.Phase = "provider_wait"
+			progress.WaitRemainingSeconds = intentProviderRetryRemainingSeconds(
+				report.IntentStrategy.PlannerHealth, now)
+			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery:
 		case report.CheckpointProtectionAvailable && !report.Protected && report.Busy:
 			progress.Phase = "checkpointing"
+		case intentProviderCallActive(report):
+			progress.Phase = "provider_call"
+			progress.WaitRemainingSeconds = 0
+			progress.TemporaryLocalFallback = false
 		case intentProviderWaitActive(report):
 			progress.Phase = "provider_wait"
+			progress.WaitRemainingSeconds = intentProviderRetryRemainingSeconds(
+				report.IntentStrategy.PlannerHealth, now)
 			progress.TemporaryLocalFallback = false
 		case !activeDrain && report.PendingEvents > 0 &&
 			progress.Phase != "intent_verification_recovery" &&
@@ -695,6 +710,36 @@ func intentProviderWaitActive(report statusReport) bool {
 	return health != nil &&
 		(health.State == daemon.IntentPlannerCircuitOpen ||
 			health.State == daemon.IntentPlannerCircuitHalfOpen)
+}
+
+func intentProviderCallActive(report statusReport) bool {
+	health := report.IntentStrategy.PlannerHealth
+	return report.PendingEvents > 0 && health != nil &&
+		health.State == daemon.IntentPlannerCircuitHalfOpen
+}
+
+// An open circuit has no provider lease in flight, so its retry wait takes
+// priority over the otherwise active recovery phase.
+func intentProviderWaitOverridesRecovery(report statusReport) bool {
+	health := report.IntentStrategy.PlannerHealth
+	return health != nil && health.State == daemon.IntentPlannerCircuitOpen
+}
+
+func intentProviderRetryRemainingSeconds(
+	health *daemon.IntentPlannerHealthSnapshot,
+	now time.Time,
+) int64 {
+	if health == nil || health.State != daemon.IntentPlannerCircuitOpen ||
+		health.NextProbeTS <= 0 {
+		return 0
+	}
+	retryAt := time.Unix(0,
+		int64(health.NextProbeTS*float64(time.Second)))
+	remaining := retryAt.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	return int64((remaining + time.Second - 1) / time.Second)
 }
 
 func publicationStallThreshold(ctx context.Context, conn *sql.DB) time.Duration {
@@ -737,8 +782,16 @@ func readIntentForwardRecoveryProgress(
 	if conn == nil || strings.TrimSpace(branchRef) == "" || branchGeneration < 0 {
 		return progress, false, nil
 	}
-	raw, ok, err := metaLookup(ctx, conn, "intent.v2.forward_recovery")
-	if err != nil || !ok {
+	var raw string
+	var markerUpdatedTS float64
+	err := conn.QueryRowContext(ctx, `
+SELECT value, updated_ts
+FROM daemon_meta
+WHERE key=?`, "intent.v2.forward_recovery").Scan(&raw, &markerUpdatedTS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return progress, false, nil
+	}
+	if err != nil {
 		return progress, false, err
 	}
 	var recovery state.IntentForwardRecovery
@@ -793,10 +846,23 @@ WHERE branch_ref=? AND branch_generation=?
 	if stage == "" {
 		stage = "semantic_replan"
 	}
+	// A legacy or invalid local-unlock marker has no anchored semantic prefix.
+	// Replay sends that state back through the configured provider before any
+	// local widening can begin, so report the work that is actually happening.
+	if stage == "local_unlock" &&
+		(strings.TrimSpace(recovery.PlanFingerprint) == "" ||
+			recovery.PrefixCursor < 1 || recovery.PrefixUnresolvedCount < 1 ||
+			strings.TrimSpace(recovery.PrefixBaseHead) == "") {
+		stage = "semantic_replan"
+	}
+	lastProgressTS := recovery.LastProgressTS
+	if markerUpdatedTS > lastProgressTS {
+		lastProgressTS = markerUpdatedTS
+	}
 	return intentForwardRecoveryProgress{
 		Stage: stage, TargetTotal: existing,
 		TargetRemaining: existing - resolved,
-		LastProgressTS:  recovery.LastProgressTS,
+		LastProgressTS:  lastProgressTS,
 		NeedsAttention:  recovery.NeedsAttention,
 		AttentionReason: sanitizeObservabilityText(recovery.AttentionReason),
 	}, true, nil
