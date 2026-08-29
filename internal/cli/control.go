@@ -621,11 +621,31 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
+	case status.PublicationProgress.Phase == "provider_call":
+		res.Health = controlHealthPublishing
+		if status.PublicationProgress.Origin == "intent_recovery" {
+			res.Summary = "ACD is waiting for the current Intent provider response before continuing automatic recovery. The recovery target and your work remain protected."
+		} else {
+			res.Summary = "ACD is waiting for the current Intent provider response. Your work remains protected."
+		}
+		res.NextAction = "No action needed. ACD will continue when the provider responds."
 	case status.PendingEvents > 0 &&
 		status.IntentStrategy.ResolutionMode == "waiting_message_rewrite":
 		res.Health = controlHealthWaiting
 		res.Summary = "ACD is waiting for the Intent provider to write a semantic commit message. Your work remains protected."
 		res.NextAction = "No action needed. ACD will retry the provider automatically."
+	case status.PublicationProgress.Origin == "intent_recovery" &&
+		status.PublicationProgress.Phase == "provider_wait":
+		res.Health = controlHealthWaiting
+		res.Summary = "ACD is waiting for the Intent provider before continuing automatic recovery. The recovery target and your work remain protected."
+		if status.PublicationProgress.WaitRemainingSeconds > 0 {
+			res.NextAction = fmt.Sprintf(
+				"No action needed. ACD will retry in %s.",
+				formatDurationCompact(time.Duration(
+					status.PublicationProgress.WaitRemainingSeconds)*time.Second))
+		} else {
+			res.NextAction = "No action needed. ACD will retry the provider automatically."
+		}
 	case status.PublicationProgress.Phase == "stalled":
 		res.Health = controlHealthDegraded
 		if status.PublicationProgress.Origin == "intent_recovery" {
