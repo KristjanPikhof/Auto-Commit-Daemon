@@ -1137,6 +1137,56 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	}
 }
 
+func TestIntentCandidateSemanticReplanPreservesCircuitWaitCause(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(t, db,
+		"internal/a/a.go", "create", "", "a1")
+	planner := &failingIntentCandidatePlannerStub{}
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{
+		Provider: IntentPlannerProviderIdentity{Provider: planner.Name()},
+	})
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		Health: health, RetryLimit: 2, RetryLimitSet: true,
+		Preset: config.PresetFast, RejectLocalFallback: true,
+		Materialize: func(
+			context.Context,
+			[]IntentCandidateCapture,
+		) error {
+			return nil
+		},
+	}
+	if before := health.Snapshot(); before.State != IntentPlannerCircuitClosed {
+		t.Fatalf("new health state=%+v", before)
+	}
+	_, firstErr := EvaluateIntentCandidates(ctx, db, input)
+	var firstFallback *IntentSemanticFallbackRequiredError
+	firstIsFallback := errors.As(firstErr, &firstFallback)
+	firstIsWait := isIntentPlannerCircuitWait(firstErr)
+	if !firstIsFallback || firstIsWait {
+		t.Fatalf("initial transport failure classification=%v fallback=%t wait=%t cause=%T",
+			firstErr, firstIsFallback, firstIsWait, errors.Unwrap(firstErr))
+	}
+	if planner.calls != 1 ||
+		health.Snapshot().State != IntentPlannerCircuitOpen {
+		t.Fatalf("initial provider failure calls=%d health=%+v",
+			planner.calls, health.Snapshot())
+	}
+
+	_, err := EvaluateIntentCandidates(ctx, db, input)
+	var fallbackErr *IntentSemanticFallbackRequiredError
+	var waitErr *IntentPlannerCircuitOpenError
+	if !errors.As(err, &fallbackErr) || !errors.As(err, &waitErr) ||
+		!isIntentPlannerCircuitWait(err) {
+		t.Fatalf("semantic provider wait lost typed cause: %v", err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("open circuit invoked provider; calls=%d", planner.calls)
+	}
+}
+
 func TestIntentCandidateEngineCancellationReleasesHalfOpenProbe(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)

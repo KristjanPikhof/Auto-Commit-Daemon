@@ -54,6 +54,62 @@ func TestReplayErrorObservabilityCountsAndClearsRecovery(t *testing.T) {
 	}
 }
 
+func TestReplayErrorObservabilityClearsTypedProviderWait(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestDB(t)
+	now := time.Unix(100, 0)
+	if _, _, err := recordReplayErrorObservability(
+		ctx, db, errors.New("old replay failure"), now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	waitErr := &IntentPlannerCircuitOpenError{
+		RetryAt: now.Add(30 * time.Second),
+	}
+	replayErr := &IntentSemanticFallbackRequiredError{
+		Failure: waitErr.Error(), plannerWait: waitErr,
+	}
+	previous, repeats, providerWait, err := reconcileReplayErrorObservability(
+		ctx, db, replayErr, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !providerWait || previous != "old replay failure" || repeats != 1 {
+		t.Fatalf("provider wait reconciliation=(%q,%d,%t)",
+			previous, repeats, providerWait)
+	}
+	if value, ok, err := state.MetaGet(
+		ctx, db, metaLastReplayError,
+	); err != nil || !ok || value != "" {
+		t.Fatalf("stale replay error=%q ok=%t err=%v", value, ok, err)
+	}
+	if value, ok, err := state.MetaGet(
+		ctx, db, metaReplayErrorRepeat,
+	); err != nil || !ok || value != "0" {
+		t.Fatalf("stale replay repeat=%q ok=%t err=%v", value, ok, err)
+	}
+
+	matchingText := errors.New((&IntentPlannerCircuitOpenError{}).Error())
+	_, count, providerWait, err := reconcileReplayErrorObservability(
+		ctx, db, matchingText, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if providerWait || count != 1 {
+		t.Fatalf("untyped matching text reconciliation=(%d,%t)",
+			count, providerWait)
+	}
+
+	var summary ReplaySummary
+	classifyReplayDisposition(&summary, replayErr)
+	if summary.Disposition != ReplayDispositionTransientWait {
+		t.Fatalf("provider wait disposition=%q reason=%q",
+			summary.Disposition, summary.DispositionReason)
+	}
+}
+
 func TestReplayErrorObservabilityMarksCompletedTransitionProofAttention(
 	t *testing.T,
 ) {

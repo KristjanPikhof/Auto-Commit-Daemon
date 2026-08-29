@@ -97,6 +97,7 @@ type IntentCandidateEvaluation struct {
 	RejectLocalFallback  bool
 	RecoveryCandidateID  string
 	planFingerprint      string
+	plannerWait          **IntentPlannerCircuitOpenError
 	allowSemanticPlan    bool
 }
 
@@ -137,7 +138,8 @@ type IntentCandidateEvaluationResult struct {
 // exhausted without producing a valid candidate graph. A durable publication
 // drain may respond with one local unlock before replanning its frozen target.
 type IntentSemanticFallbackRequiredError struct {
-	Failure string
+	Failure     string
+	plannerWait *IntentPlannerCircuitOpenError
 }
 
 func (e *IntentSemanticFallbackRequiredError) Error() string {
@@ -145,6 +147,16 @@ func (e *IntentSemanticFallbackRequiredError) Error() string {
 		return "daemon: intent candidates: semantic fallback required"
 	}
 	return "daemon: intent candidates: semantic fallback required: " + e.Failure
+}
+
+func (e *IntentSemanticFallbackRequiredError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	if e.plannerWait == nil {
+		return nil
+	}
+	return e.plannerWait
 }
 
 // IntentPlanPreflightError means the durable planning snapshot could not
@@ -308,6 +320,8 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	var plannerWait *IntentPlannerCircuitOpenError
+	input.plannerWait = &plannerWait
 	plan, fallback, plannerFailure, retryCount, needsAttention, continuations,
 		planRun, err :=
 		chooseIntentCandidatePlan(ctx, req, input.Planner, input.Health,
@@ -341,7 +355,8 @@ func EvaluateIntentCandidates(
 	if input.RejectLocalFallback &&
 		(result.Fallback != "" || result.PlannerFailure != "") {
 		return result, &IntentSemanticFallbackRequiredError{
-			Failure: result.PlannerFailure,
+			Failure:     result.PlannerFailure,
+			plannerWait: plannerWait,
 		}
 	}
 	input.allowSemanticPlan = result.ResolutionMode == "provider" ||
@@ -1167,6 +1182,9 @@ func chooseIntentCandidatePlan(
 							false, nil, run, err
 					}
 					plannerFailure = ai.SanitizePlannerError(err.Error())
+					if input.plannerWait != nil {
+						*input.plannerWait = openErr
+					}
 					planner = nil
 					break
 				}

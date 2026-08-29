@@ -72,6 +72,22 @@ func readIntentHealthRecord(t *testing.T, db *state.DB) intentPlannerHealthRecor
 	return record
 }
 
+func TestIntentPlannerCircuitWaitClassificationIsStructural(t *testing.T) {
+	waitErr := &IntentPlannerCircuitOpenError{
+		RetryAt: time.Unix(100, 0).UTC(),
+	}
+	if !isIntentPlannerCircuitWait(waitErr) ||
+		!isIntentPlannerCircuitWait(fmt.Errorf("semantic planning: %w", waitErr)) {
+		t.Fatal("typed circuit wait was not classified as transient")
+	}
+	if isIntentPlannerCircuitWait(errors.New(waitErr.Error())) {
+		t.Fatal("matching error text was accepted without the typed cause")
+	}
+	if isIntentPlannerCircuitWait(errors.Join(waitErr, errors.New("database failed"))) {
+		t.Fatal("joined non-wait failure was suppressed as a circuit wait")
+	}
+}
+
 func TestIntentPlannerHealthTransportOpensImmediatelyAndBacksOff(t *testing.T) {
 	db := newIntentHealthTestDB(t)
 	clock := newIntentHealthClock()

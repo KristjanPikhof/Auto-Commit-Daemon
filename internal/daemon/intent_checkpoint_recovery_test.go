@@ -1575,6 +1575,43 @@ func TestUpdateIntentForwardRecoveryPreservesTransientWaitStage(t *testing.T) {
 	}
 }
 
+func TestUpdateIntentForwardRecoveryPreservesProviderWaitStage(t *testing.T) {
+	fixture := seedFailedCheckpointReplayFixture(t)
+	f := fixture.capture
+	ctx := context.Background()
+	recovery, changed, err := state.StartFailedIntentCheckpointRecovery(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+
+	waitErr := &IntentPlannerCircuitOpenError{
+		RetryAt: time.Unix(30, 0).UTC(),
+	}
+	waiting, err := updateIntentForwardRecoveryAfterReplay(
+		ctx, f.db, recovery, ReplaySummary{},
+		&IntentSemanticFallbackRequiredError{
+			Failure: waitErr.Error(), plannerWait: waitErr,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waiting.HasMore || !waiting.Skipped ||
+		waiting.Disposition != ReplayDispositionTransientWait ||
+		waiting.SkippedReason != "intent_v2_provider_wait" {
+		t.Fatalf("provider wait summary=%+v", waiting)
+	}
+	marker, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || !active ||
+		marker.Stage != publicationFallbackSemanticReplan ||
+		marker.UnlockCount != 0 || marker.NeedsAttention {
+		t.Fatalf("provider wait marker=(%+v active=%t err=%v)",
+			marker, active, err)
+	}
+}
+
 func TestReplayClearsResolvedOlderIntentCheckpointRecoveryAfterRestart(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
