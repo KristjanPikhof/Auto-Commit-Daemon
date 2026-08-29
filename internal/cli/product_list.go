@@ -429,11 +429,11 @@ func selectProductListEntries(entries []productListEntry, showAll bool) ([]produ
 
 func productListStatus(entry productListEntry) string {
 	switch {
+	case entry.PublicationProgress.Phase == "needs_action":
+		return "needs action"
 	case entry.OperationalState == "paused":
 		return "paused"
 	case entry.ActionRequired || entry.State == productStateNeedsAction || entry.OperationalState == "needs_attention":
-		return "needs action"
-	case entry.PublicationProgress.Phase == "needs_action":
 		return "needs action"
 	case entry.PublicationProgress.Phase == "stalled":
 		return "stalled"

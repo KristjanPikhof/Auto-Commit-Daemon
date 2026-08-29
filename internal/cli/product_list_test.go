@@ -133,6 +133,9 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 		{Repo: "/recovering", Enabled: true, Protected: true,
 			State: productStatePublishing, PendingEvents: 7,
 			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "intent_recovery", Phase: "intent_replanning", QueuePending: 7, TargetRemaining: 4, TargetTotal: 6, LastProgressTS: 1, LastProgressAgeSeconds: 12}},
+		{Repo: "/blocked", Enabled: true, Protected: true, ActionRequired: true,
+			State: productStateNeedsAction, PendingEvents: 7,
+			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "intent_recovery", Phase: "needs_action", NeedsAttention: true, QueuePending: 7, TargetRemaining: 4, TargetTotal: 6, LastProgressTS: 1, LastProgressAgeSeconds: 12}},
 		{Repo: "/completed", Enabled: true, Protected: true,
 			State:               productStateProtected,
 			PublicationDrain:    publicationDrainReport{ID: "drain", Phase: "completed", PublishedEvents: 12, TargetEvents: 12},
@@ -148,7 +151,8 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 	}{
 		{"active", "intent", "22", "commit-all:5/12", "intent-plan"},
 		{"pending", "intent", "3", "-", "wait:42s"},
-		{"recovering", "intent", "7", "replan:4/6", "intent-replan"},
+		{"recovering", "intent", "7", "recover:4/6", "intent-replan"},
+		{"blocked", "intent", "7", "recover:4/6", "blocked"},
 		{"completed", "intent", "0", "-", "idle"},
 	} {
 		line := productListLineForRepo(t, out.String(), row.repo)
@@ -161,6 +165,9 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 	}
 	if line := productListLineForRepo(t, out.String(), "completed"); !strings.Contains(line, "healthy") {
 		t.Fatalf("completed drain did not return to healthy: %s", line)
+	}
+	if line := productListLineForRepo(t, out.String(), "blocked"); !strings.Contains(line, "needs action") {
+		t.Fatalf("exhausted recovery did not require action: %s", line)
 	}
 }
 
@@ -185,6 +192,22 @@ func TestProductListDoesNotMaskActiveIntentRecoveryAsCheckpointing(t *testing.T)
 	if !strings.Contains(entry.Summary, "automatically rebuilding semantic") ||
 		strings.Contains(entry.Summary, "checkpointing") {
 		t.Fatalf("active recovery entry=%+v", entry)
+	}
+
+	overview.report.PublicationProgress.Phase = "needs_action"
+	overview.report.PublicationProgress.NeedsAttention = true
+	overview.report.PublicationProgress.AttentionReason =
+		"complete semantic prefix failed verification"
+	entry = productListEntryFromOverview(record, supervisor.WorkerStatus{
+		RepositoryID: record.RepositoryID, State: "running",
+	}, overview, nil)
+	if !entry.ActionRequired || entry.State != productStateNeedsAction ||
+		productListStatus(entry) != "needs action" ||
+		productListPhase(entry) != "blocked" ||
+		productListTarget(entry) != "recover:4/6" ||
+		entry.Summary != intentRecoveryVerificationAttentionSummary ||
+		!strings.Contains(entry.NextAction, "acd doctor") {
+		t.Fatalf("exhausted recovery entry=%+v", entry)
 	}
 }
 

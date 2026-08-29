@@ -306,13 +306,14 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 		t.Fatal(err)
 	}
 	markerTS := float64(now.Add(-30*time.Second).UnixNano()) / 1e9
+	marker := state.IntentForwardRecovery{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CandidateID: "failed-candidate", Stage: "semantic_replan",
+		TargetEventSeqs: []int64{seqs[0], seqs[1]},
+		LastProgressTS:  markerTS,
+	}
 	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
-		state.IntentForwardRecovery{
-			BranchRef: "refs/heads/main", BranchGeneration: 7,
-			CandidateID: "failed-candidate", Stage: "semantic_replan",
-			TargetEventSeqs: []int64{seqs[0], seqs[1]},
-			LastProgressTS:  markerTS,
-		}); err != nil {
+		marker); err != nil {
 		t.Fatal(err)
 	}
 	report := statusReport{
@@ -332,13 +333,13 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 		t.Fatalf("intent recovery progress=%+v", progress)
 	}
 	entry := productListEntry{PublicationProgress: progress}
-	if target, phase := productListTarget(entry), productListPhase(entry); target != "replan:1/2" || phase != "intent-replan" {
+	if target, phase := productListTarget(entry), productListPhase(entry); target != "recover:1/2" || phase != "intent-replan" {
 		t.Fatalf("intent recovery list target=%q phase=%q", target, phase)
 	}
 	var human bytes.Buffer
 	renderProductPublicationProgress(&human, progress)
 	for _, want := range []string{
-		"Active target: automatic Intent replan, 1 of 2 left",
+		"Active target: automatic Intent recovery, 1 of 2 left",
 		"Publication phase: recovering by replanning commit groups by Intent",
 	} {
 		if !strings.Contains(human.String(), want) {
@@ -368,6 +369,109 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 		label, "automatic Intent recovery active",
 	) {
 		t.Fatalf("stalled intent recovery label=%q", label)
+	}
+
+	marker.Stage = "local_unlock"
+	marker.PlanFingerprint = "sha256:verified-plan"
+	marker.PrefixCursor = 1
+	marker.PrefixBaseHead = "base-head"
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		marker); err != nil {
+		t.Fatal(err)
+	}
+	local, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.Phase != "local_fallback" || !local.TemporaryLocalFallback ||
+		productListPhase(productListEntry{PublicationProgress: local}) != "intent-widen" {
+		t.Fatalf("local Intent recovery progress=%+v", local)
+	}
+	var localHuman bytes.Buffer
+	renderProductPublicationProgress(&localHuman, local)
+	if !strings.Contains(localHuman.String(), "widening a verified Intent group") ||
+		strings.Contains(localHuman.String(), "temporary local fallback") {
+		t.Fatalf("local Intent recovery wording:\n%s", localHuman.String())
+	}
+	report.PublicationProgress = local
+	result = controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.Health != controlHealthPublishing ||
+		!strings.Contains(result.Summary, "widening a verified Intent group") {
+		t.Fatalf("local Intent recovery control=%+v", result)
+	}
+
+	marker.PrefixExhausted = true
+	marker.NeedsAttention = true
+	marker.AttentionReason = "complete semantic prefix failed verification"
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		marker); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedEntry := productListEntry{PublicationProgress: blocked}
+	if blocked.Phase != "needs_action" || !blocked.NeedsAttention ||
+		blocked.AttentionReason != marker.AttentionReason ||
+		productListTarget(blockedEntry) != "recover:1/2" ||
+		productListPhase(blockedEntry) != "blocked" ||
+		productListStatus(blockedEntry) != "needs action" {
+		t.Fatalf("exhausted Intent recovery progress=%+v target=%q phase=%q status=%q",
+			blocked, productListTarget(blockedEntry), productListPhase(blockedEntry),
+			productListStatus(blockedEntry))
+	}
+	var blockedHuman bytes.Buffer
+	renderProductPublicationProgress(&blockedHuman, blocked)
+	for _, want := range []string{
+		intentRecoveryVerificationAttentionSummary,
+		"Run `acd doctor`",
+		"Recovery reason: complete semantic prefix failed verification",
+	} {
+		if !strings.Contains(blockedHuman.String(), want) {
+			t.Fatalf("exhausted recovery status missing %q:\n%s",
+				want, blockedHuman.String())
+		}
+	}
+	if strings.Contains(blockedHuman.String(), "commit-all") {
+		t.Fatalf("exhausted recovery suggested commit-all:\n%s",
+			blockedHuman.String())
+	}
+	report.PublicationProgress = blocked
+	report.Repo = "/repo"
+	var verbose bytes.Buffer
+	if err := renderStatusHuman(&verbose, report); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(verbose.String(), intentRecoveryVerificationAttentionSummary) ||
+		!strings.Contains(verbose.String(), "Run `acd doctor`") ||
+		strings.Contains(verbose.String(), "commit-all") {
+		t.Fatalf("verbose exhausted recovery status:\n%s", verbose.String())
+	}
+	result = controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.OK || result.Health != controlHealthNeedsAttention ||
+		result.Summary != intentRecoveryVerificationAttentionSummary ||
+		!strings.Contains(result.NextAction, "acd doctor") ||
+		strings.Contains(result.NextAction, "commit-all") {
+		t.Fatalf("exhausted Intent recovery control=%+v", result)
+	}
+	var controlHuman bytes.Buffer
+	if err := renderProductEnvelope(&controlHuman,
+		envelopeFromControl(result), false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"State: needs_action",
+		"Action needed: yes",
+		"Status: " + intentRecoveryVerificationAttentionSummary,
+		"Next: " + intentRecoveryVerificationAttentionNext,
+	} {
+		if !strings.Contains(controlHuman.String(), want) {
+			t.Fatalf("control status missing %q:\n%s", want,
+				controlHuman.String())
+		}
 	}
 
 	report.BranchGeneration = 8

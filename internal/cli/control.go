@@ -583,6 +583,12 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "ACD is enabled, but background protection is not running."
 		res.NextAction = "Run `acd on` to start it."
+	case status.PublicationProgress.Origin == "intent_recovery" &&
+		status.PublicationProgress.Phase == "needs_action":
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = intentRecoveryVerificationAttentionSummary
+		res.NextAction = intentRecoveryVerificationAttentionNext
 	case manualPause:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
@@ -610,12 +616,6 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "The current commit-all run stopped at a safety check. Your work remains protected."
 		res.NextAction = "Run `acd doctor` to see what blocked publication."
-	case status.PublicationProgress.Origin == "intent_recovery" &&
-		status.PublicationProgress.Phase == "needs_action":
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = intentRecoveryVerificationAttentionSummary
-		res.NextAction = intentRecoveryVerificationAttentionNext
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
@@ -629,17 +629,14 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	case status.PublicationProgress.Phase == "stalled":
 		res.Health = controlHealthDegraded
 		if status.PublicationProgress.Origin == "intent_recovery" {
+			recoveryActivity := "Automatic Intent recovery is active"
 			if status.PublicationProgress.TemporaryLocalFallback {
-				res.Summary = fmt.Sprintf(
-					"ACD is widening a verified Intent group, but its target has not moved for %s. The worker is responsive and your work remains protected.",
-					formatDurationCompact(time.Duration(
-						status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
-			} else {
-				res.Summary = fmt.Sprintf(
-					"Automatic Intent recovery is active, but its target has not moved for %s. The worker is responsive and your work remains protected.",
-					formatDurationCompact(time.Duration(
-						status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
+				recoveryActivity = "ACD is widening a verified Intent group"
 			}
+			res.Summary = fmt.Sprintf(
+				"%s, but its target has not moved for %s. The worker is responsive and your work remains protected.",
+				recoveryActivity, formatDurationCompact(time.Duration(
+					status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
 			res.NextAction = "No action needed yet. ACD will keep replanning the exact recovery target; run `acd doctor` if this persists."
 		} else {
 			res.Summary = fmt.Sprintf(
