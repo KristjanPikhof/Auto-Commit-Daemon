@@ -64,6 +64,8 @@ type publicationProgressReport struct {
 	PlannerModel           string  `json:"planner_model,omitempty"`
 	Origin                 string  `json:"origin,omitempty"`
 	Phase                  string  `json:"phase"`
+	NeedsAttention         bool    `json:"needs_attention,omitempty"`
+	AttentionReason        string  `json:"attention_reason,omitempty"`
 	QueuePending           int     `json:"queue_pending"`
 	TargetRemaining        int64   `json:"target_remaining,omitempty"`
 	TargetTotal            int64   `json:"target_total,omitempty"`
@@ -81,7 +83,14 @@ type intentForwardRecoveryProgress struct {
 	TargetTotal     int64
 	TargetRemaining int64
 	LastProgressTS  float64
+	NeedsAttention  bool
+	AttentionReason string
 }
+
+const (
+	intentRecoveryVerificationAttentionSummary = "The complete recovery target failed required verification. Work remains protected."
+	intentRecoveryVerificationAttentionNext    = "Run `acd doctor` to inspect the verification failure and recovery state."
+)
 
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
@@ -591,12 +600,18 @@ func buildPublicationProgressReport(
 			progress.TargetRemaining = recovery.TargetRemaining
 			progress.TargetTotal = recovery.TargetTotal
 			progress.LastProgressTS = recovery.LastProgressTS
-			switch recovery.Stage {
-			case "local_unlock":
-				progress.Phase = "local_fallback"
-				progress.TemporaryLocalFallback = progress.Strategy == "intent"
-			default:
-				progress.Phase = "intent_replanning"
+			progress.NeedsAttention = recovery.NeedsAttention
+			progress.AttentionReason = recovery.AttentionReason
+			if recovery.NeedsAttention {
+				progress.Phase = "needs_action"
+			} else {
+				switch recovery.Stage {
+				case "local_unlock":
+					progress.Phase = "local_fallback"
+					progress.TemporaryLocalFallback = progress.Strategy == "intent"
+				default:
+					progress.Phase = "intent_replanning"
+				}
 			}
 		}
 		switch {
@@ -782,6 +797,8 @@ WHERE branch_ref=? AND branch_generation=?
 		Stage: stage, TargetTotal: existing,
 		TargetRemaining: existing - resolved,
 		LastProgressTS:  recovery.LastProgressTS,
+		NeedsAttention:  recovery.NeedsAttention,
+		AttentionReason: sanitizeObservabilityText(recovery.AttentionReason),
 	}, true, nil
 }
 
