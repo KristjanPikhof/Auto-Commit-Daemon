@@ -237,6 +237,244 @@ func TestRuntimeBundleLeaseKeepsOneImmutableRevision(t *testing.T) {
 	manager.Close()
 }
 
+func TestRuntimeBundleUsesFrozenDrainRevisionThenReturnsToDesired(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)
+	t.Setenv(ai.EnvDiffEgress, "false")
+	ctx := context.Background()
+	db := openTestDB(t)
+	builder := runtimeBuilder(db, map[string]*runtimeTestCloser{})
+	intentRevision := runtimeRevision(t, db, "intent", 1, map[string]any{
+		config.FieldProvider:       "openai-compat",
+		config.FieldModel:          "semantic-model",
+		config.FieldCommitStrategy: "intent",
+		config.FieldCommitFormat:   "imperative",
+	})
+	eventRevision := runtimeRevision(t, db, "event", 2, map[string]any{
+		config.FieldProvider:       "deterministic",
+		config.FieldCommitStrategy: "event",
+		config.FieldCommitFormat:   "imperative",
+	})
+	activate := func(revisionID int64, expected sql.NullInt64) {
+		t.Helper()
+		request, ok, err := state.RequestConfigActivation(
+			ctx, db, revisionID, expected)
+		if err != nil || !ok {
+			t.Fatalf("request revision %d=(%t,%v)", revisionID, ok, err)
+		}
+		if ok, err := state.AcknowledgeConfigActivation(
+			ctx, db, request.ID, revisionID); err != nil || !ok {
+			t.Fatalf("ack revision %d=(%t,%v)", revisionID, ok, err)
+		}
+		if ok, err := state.ApplyConfigActivation(
+			ctx, db, request.ID, revisionID); err != nil || !ok {
+			t.Fatalf("apply revision %d=(%t,%v)", revisionID, ok, err)
+		}
+	}
+	activate(intentRevision.ID, sql.NullInt64{})
+	activate(eventRevision.ID, sql.NullInt64{
+		Int64: intentRevision.ID, Valid: true,
+	})
+	intentBundle, err := builder.BuildRevision(ctx, intentRevision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventBundle, err := builder.BuildRevision(ctx, eventRevision, intentBundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain := state.PublicationDrain{
+		ID: "frozen-runtime", CommitStrategy: string(intentBundle.CommitStrategy),
+		CommitFormat:        string(intentBundle.CommitFormat),
+		ConfigRevisionID:    intentBundle.RevisionID,
+		Provider:            intentBundle.HealthIdentity.Provider,
+		ProviderModel:       intentBundle.Model,
+		ProviderFingerprint: intentBundle.HealthFingerprint,
+	}
+	manager := NewRuntimeBundleManager(eventBundle, builder, time.Second)
+	defer manager.Close()
+	if err := manager.ActivatePublicationDrainRevision(ctx, drain); err != nil {
+		t.Fatal(err)
+	}
+	if current := manager.Current(); current.RevisionID != intentRevision.ID ||
+		current.CommitStrategy != ai.CommitStrategyIntent ||
+		publicationDrainRuntimeBlock(drain, current) != "" {
+		t.Fatalf("frozen drain bundle=%+v", current)
+	}
+	projection, err := state.RuntimeConfigActivationState(ctx, db)
+	if err != nil || projection.AppliedRevisionID.Int64 != eventRevision.ID {
+		t.Fatalf("desired projection changed=%+v err=%v", projection, err)
+	}
+	// Reconciliation removed the frozen drain before this pass leased its
+	// runtime. The refresh must restore desired Event semantics immediately.
+	if err := refreshPublicationDrainRuntimeAfterReconcile(
+		ctx, db, manager, "refs/heads/main", 7, drain.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if current := manager.Current(); current.RevisionID != eventRevision.ID ||
+		current.CommitStrategy != ai.CommitStrategyEvent {
+		t.Fatalf("post-drain desired bundle=%+v", current)
+	}
+}
+
+func TestRuntimeBundleRejectsFrozenRevisionMismatchBeforeProviderBuild(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	revision := runtimeRevision(t, db, "intent", 1, map[string]any{
+		config.FieldProvider:       "openai-compat",
+		config.FieldModel:          "semantic-model",
+		config.FieldCommitStrategy: "intent",
+		config.FieldCommitFormat:   "imperative",
+	})
+	var builds atomic.Int32
+	builder := RuntimeBundleBuilder{DB: db, BuildProvider: func(
+		ai.ProviderConfig,
+	) (ai.Provider, io.Closer, error) {
+		builds.Add(1)
+		return &runtimeTestProvider{name: "openai-compat"}, nil, nil
+	}}
+	initial := &RuntimeBundle{
+		RevisionID: 99, CommitStrategy: ai.CommitStrategyEvent,
+		CommitFormat: ai.CommitFormatImperative,
+		Provider:     &runtimeTestProvider{name: "deterministic"},
+	}
+	manager := NewRuntimeBundleManager(initial, builder, time.Second)
+	defer manager.Close()
+	drain := state.PublicationDrain{
+		ConfigRevisionID: revision.ID, CommitStrategy: "intent",
+		CommitFormat: "imperative", Provider: "openai-compat",
+		ProviderModel: "different-model",
+	}
+	for i := 0; i < 2; i++ {
+		if err := manager.ActivatePublicationDrainRevision(ctx, drain); err == nil {
+			t.Fatal("mismatched frozen contract unexpectedly activated")
+		}
+	}
+	if builds.Load() != 0 || manager.Current() != initial {
+		t.Fatalf("provider builds=%d current=%+v", builds.Load(), manager.Current())
+	}
+}
+
+func TestRuntimeBundleDoesNotRebuildMatchingBlockedDrainProvider(t *testing.T) {
+	db := openTestDB(t)
+	var builds atomic.Int32
+	bundle := &RuntimeBundle{
+		RevisionID: 7, CommitStrategy: ai.CommitStrategyIntent,
+		CommitFormat: ai.CommitFormatImperative,
+		Provider:     &runtimeTestProvider{name: "openai-compat"},
+		HealthIdentity: IntentPlannerProviderIdentity{
+			Provider: "openai-compat", Model: "semantic-model",
+		},
+		Model: "semantic-model", HealthFingerprint: "sha256:" +
+			strings.Repeat("b", 64),
+		ReplayBlockedReason: "provider temporarily unavailable",
+	}
+	drain := state.PublicationDrain{
+		ConfigRevisionID: bundle.RevisionID, CommitStrategy: "intent",
+		CommitFormat: "imperative", Provider: "openai-compat",
+		ProviderModel:       bundle.Model,
+		ProviderFingerprint: bundle.HealthFingerprint,
+	}
+	manager := NewRuntimeBundleManager(bundle, RuntimeBundleBuilder{
+		DB: db, BuildProvider: func(ai.ProviderConfig) (
+			ai.Provider, io.Closer, error,
+		) {
+			builds.Add(1)
+			return &runtimeTestProvider{name: "openai-compat"}, nil, nil
+		},
+	}, time.Second)
+	defer manager.Close()
+	for i := 0; i < 2; i++ {
+		if err := manager.ActivatePublicationDrainRevision(
+			context.Background(), drain); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if builds.Load() != 0 || manager.Current() != bundle {
+		t.Fatalf("provider builds=%d current=%+v", builds.Load(), manager.Current())
+	}
+}
+
+func TestRuntimeStatusMetaUsesActiveBundle(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	if err := state.MetaSetMany(ctx, db, map[string]string{
+		"ai.provider":            "deterministic",
+		"ai.model":               "stale-model",
+		"ai.timeout":             "5m0s",
+		"commit.strategy":        "event",
+		"commit.format":          "conventional",
+		"intent.window":          "10",
+		"intent.min_pending":     "10",
+		"intent.settle_window":   "10s",
+		"intent.max_pending_age": "5m0s",
+		"intent.recent_commits":  "2",
+		"intent.defer_limit":     "1",
+		"intent.diff_egress":     "false",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bundle := &RuntimeBundle{
+		Provider:            &runtimeTestProvider{name: "composed-provider"},
+		HealthIdentity:      IntentPlannerProviderIdentity{Provider: "openai-compat"},
+		Model:               "gpt-test",
+		ProviderTimeout:     45 * time.Second,
+		CommitStrategy:      ai.CommitStrategyIntent,
+		CommitFormat:        ai.CommitFormatImperative,
+		IntentWindow:        20,
+		IntentMinPending:    18,
+		IntentSettleWindow:  30 * time.Second,
+		IntentMaxPendingAge: 3 * time.Minute,
+		IntentRecentCommits: 5,
+		IntentDeferLimit:    2,
+		DiffEgress:          true,
+	}
+	if err := stampRuntimeStatusMeta(ctx, db, bundle); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"ai.provider":            "openai-compat",
+		"ai.model":               "gpt-test",
+		"ai.timeout":             "45s",
+		"commit.strategy":        "intent",
+		"commit.format":          "imperative",
+		"intent.window":          "20",
+		"intent.min_pending":     "18",
+		"intent.settle_window":   "30s",
+		"intent.max_pending_age": "3m0s",
+		"intent.recent_commits":  "5",
+		"intent.defer_limit":     "2",
+		"intent.diff_egress":     "true",
+	}
+	for key, value := range want {
+		got, ok, err := state.MetaGet(ctx, db, key)
+		if err != nil || !ok || got != value {
+			t.Fatalf("%s=%q ok=%t err=%v want %q", key, got, ok, err, value)
+		}
+	}
+	blocked := *bundle
+	blocked.RevisionID = 2
+	blocked.HealthIdentity.Provider = "deterministic"
+	blocked.Provider = &runtimeTestProvider{name: "deterministic"}
+	blocked.Model = ""
+	blocked.CommitStrategy = ai.CommitStrategyEvent
+	blocked.ReplayBlockedReason = "provider unavailable"
+	if err := stampRuntimeStatusMeta(ctx, db, &blocked); err != nil {
+		t.Fatal(err)
+	}
+	ready, ok, err := state.MetaGet(ctx, db, "publication.runtime.ready")
+	if err != nil || !ok || ready != "false" {
+		t.Fatalf("blocked publication runtime ready=%q ok=%t err=%v", ready, ok, err)
+	}
+	provider, ok, err := state.MetaGet(ctx, db, "publication.runtime.provider")
+	if err != nil || !ok || provider != "openai-compat" {
+		t.Fatalf("immutable prior tuple provider=%q ok=%t err=%v", provider, ok, err)
+	}
+}
+
 func TestRuntimeBundleAllowsApprovedLocalSubprocessDiffContext(t *testing.T) {
 	t.Setenv(ai.EnvDiffEgress, "false")
 	db := openTestDB(t)
@@ -356,9 +594,13 @@ func TestRuntimeBundleProviderFailureUsesPresetPolicy(t *testing.T) {
 				t.Fatalf("blocked=%q wantBlocked=%t",
 					bundle.ReplayBlockedReason, tc.wantBlocked)
 			}
-			if bundle.IntentPlanner != nil {
-				t.Fatalf("unavailable provider became planner: %T",
+			if _, ok := bundle.IntentPlanner.(unavailableIntentPlanner); !ok {
+				t.Fatalf("planner=%T, want semantic provider wait",
 					bundle.IntentPlanner)
+			}
+			if bundle.HealthIdentity.Provider != "subprocess:unavailable" ||
+				bundle.HealthIdentity.Deterministic {
+				t.Fatalf("provider identity=%+v", bundle.HealthIdentity)
 			}
 			if bundle.IntentVerificationReady != tc.wantVerification {
 				t.Fatalf("verificationReady=%t want=%t",

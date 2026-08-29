@@ -424,10 +424,10 @@ func completeIntentRepair(
 		repair.MembershipMode, repair.Members, cctx, newHead); err != nil {
 		return err
 	}
-	reseed := cctx
-	reseed.BaseHead = newHead
-	if _, err := ReseedShadowFromHead(ctx, repoRoot, db, reseed); err != nil {
-		return fmt.Errorf("daemon: complete intent repair: reseed exact shadow pair: %w", err)
+	if _, err := state.RebaseShadowGeneration(
+		ctx, db, cctx.BranchRef, cctx.BranchGeneration, newHead,
+	); err != nil {
+		return fmt.Errorf("daemon: complete intent repair: rebase exact shadow pair: %w", err)
 	}
 	ok, err := state.TransitionIntentRepair(ctx, db, repairID,
 		state.IntentRepairTransition{

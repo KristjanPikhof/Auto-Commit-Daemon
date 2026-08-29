@@ -71,6 +71,8 @@ func pathQuiescenceSnapshotFresh(ctx context.Context, conn *sql.DB) bool {
 type intentStrategyReport struct {
 	Strategy                          string                              `json:"strategy"`
 	CommitFormat                      string                              `json:"commit_format"`
+	EffectiveProvider                 string                              `json:"effective_provider,omitempty"`
+	EffectiveModel                    string                              `json:"effective_model,omitempty"`
 	Active                            bool                                `json:"active"`
 	Window                            int                                 `json:"window,omitempty"`
 	RecentCommits                     int                                 `json:"recent_commits,omitempty"`
@@ -100,6 +102,7 @@ type intentStrategyReport struct {
 	LastPlannerErrorEventSeq          int64                               `json:"last_planner_error_event_seq,omitempty"`
 	LastPlannerErrorPath              string                              `json:"last_planner_error_path,omitempty"`
 	LastPlannerError                  string                              `json:"last_planner_error,omitempty"`
+	LastPlannerErrorTS                int64                               `json:"last_planner_error_ts,omitempty"`
 	RejectLogPath                     string                              `json:"reject_log_path,omitempty"`
 	MessageQualityRewriteCountRecent  int                                 `json:"message_quality_rewrite_count_recent,omitempty"`
 	MessageQualityFallbackCountRecent int                                 `json:"message_quality_fallback_count_recent,omitempty"`
@@ -1043,14 +1046,24 @@ func ResolveEffectiveCommitStrategy(ctx context.Context, conn *sql.DB) (ai.Commi
 
 func intentStrategyFromEnv() intentStrategyReport {
 	cfg := ai.LoadProviderConfigFromEnv()
+	provider := cfg.Mode
+	if provider == "" {
+		provider = (ai.DeterministicProvider{}).Name()
+	}
+	model := ""
+	if provider == "openai-compat" {
+		model = cfg.Model
+	}
 	return intentStrategyReport{
-		Strategy:      string(cfg.CommitStrategy),
-		CommitFormat:  string(cfg.CommitFormat),
-		Active:        cfg.CommitStrategy == ai.CommitStrategyIntent,
-		Window:        cfg.IntentWindow,
-		RecentCommits: cfg.IntentRecentCommits,
-		DeferLimit:    cfg.IntentDeferLimit,
-		MinPending:    cfg.IntentMinPending,
+		Strategy:          string(cfg.CommitStrategy),
+		CommitFormat:      string(cfg.CommitFormat),
+		EffectiveProvider: provider,
+		EffectiveModel:    model,
+		Active:            cfg.CommitStrategy == ai.CommitStrategyIntent,
+		Window:            cfg.IntentWindow,
+		RecentCommits:     cfg.IntentRecentCommits,
+		DeferLimit:        cfg.IntentDeferLimit,
+		MinPending:        cfg.IntentMinPending,
 		SettleWindowSeconds: int64(
 			cfg.IntentSettleWindow / time.Second,
 		),
@@ -1072,6 +1085,16 @@ func loadIntentStrategyReport(ctx context.Context, conn *sql.DB) (intentStrategy
 	}
 	report.Strategy = string(strategy)
 	report.Active = strategy == ai.CommitStrategyIntent
+	if v, ok, err := metaLookup(ctx, conn, "ai.provider"); err != nil {
+		return report, fmt.Errorf("ai.provider: %w", err)
+	} else if ok && strings.TrimSpace(v) != "" {
+		report.EffectiveProvider = strings.TrimSpace(v)
+	}
+	if v, ok, err := metaLookup(ctx, conn, "ai.model"); err != nil {
+		return report, fmt.Errorf("ai.model: %w", err)
+	} else if ok {
+		report.EffectiveModel = strings.TrimSpace(v)
+	}
 	if v, ok, err := metaLookup(ctx, conn, "commit.format"); err != nil {
 		return report, fmt.Errorf("commit.format: %w", err)
 	} else if ok {
@@ -1215,6 +1238,77 @@ LIMIT 1`, state.EventStatePending, state.EventStateFailed, state.EventStateBlock
 	}
 
 	return report, nil
+}
+
+func loadIntentStrategyReportForPair(
+	ctx context.Context,
+	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
+) (intentStrategyReport, error) {
+	report, err := loadIntentStrategyReport(ctx, conn)
+	if err != nil {
+		return report, err
+	}
+	errorMatches, err := intentPlannerErrorMatchesPair(
+		ctx, conn, report.LastPlannerErrorEventSeq, branchRef, branchGeneration)
+	if err != nil {
+		return report, err
+	}
+	if !errorMatches {
+		report.LastPlannerErrorEventSeq = 0
+		report.LastPlannerErrorPath = ""
+		report.LastPlannerError = ""
+		report.LastPlannerErrorTS = 0
+	}
+	report.LastPlannerWindow = nil
+	report.PlanAttempt = 0
+	report.PlanAttemptLimit = 0
+	report.UnresolvedCaptureCount = 0
+	report.PreservedGroupCount = 0
+	report.ResolutionMode = ""
+	report.PreflightState = ""
+	report.PreflightFindingCodes = nil
+	report.ProviderCallSkippedReason = ""
+	lastWindow, err := loadLastIntentPlannerWindowForPairSQL(
+		ctx, conn, branchRef, branchGeneration)
+	if err != nil {
+		return report, err
+	}
+	report.LastPlannerWindow = lastWindow
+	if lastWindow == nil {
+		return report, nil
+	}
+	report.PlanAttempt = lastWindow.PlanAttempt
+	report.PlanAttemptLimit = lastWindow.PlanAttemptLimit
+	report.UnresolvedCaptureCount = lastWindow.UnresolvedCaptureCount
+	report.PreservedGroupCount = lastWindow.PreservedGroupCount
+	report.ResolutionMode = lastWindow.ResolutionMode
+	report.PreflightState = lastWindow.PreflightState
+	report.PreflightFindingCodes = append([]string(nil), lastWindow.FindingCodes...)
+	report.ProviderCallSkippedReason = lastWindow.ProviderCallSkipped
+	return report, nil
+}
+
+func intentPlannerErrorMatchesPair(
+	ctx context.Context,
+	conn *sql.DB,
+	eventSeq int64,
+	branchRef string,
+	branchGeneration int64,
+) (bool, error) {
+	if conn == nil || eventSeq <= 0 || branchRef == "" {
+		return false, nil
+	}
+	var matches int
+	if err := conn.QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM capture_events
+    WHERE seq=? AND branch_ref=? AND branch_generation=?
+)`, eventSeq, branchRef, branchGeneration).Scan(&matches); err != nil {
+		return false, fmt.Errorf("planner error branch identity: %w", err)
+	}
+	return matches != 0, nil
 }
 
 func loadIntentPlannerHealth(ctx context.Context, conn *sql.DB) (*daemon.IntentPlannerHealthSnapshot, string, error) {
@@ -1367,13 +1461,17 @@ func loadLastIntentPlannerError(ctx context.Context, conn *sql.DB, report *inten
 		return nil
 	}
 	var lastErrorSeq sql.NullInt64
+	var lastErrorTS sql.NullFloat64
 	var lastErrorPath, lastError sql.NullString
 	err = conn.QueryRowContext(ctx, `
-SELECT event_seq, path, COALESCE(NULLIF(reason, ''), NULLIF(user_message, ''), NULLIF(action_taken, ''))
+SELECT event_seq, path,
+       COALESCE(NULLIF(reason, ''), NULLIF(user_message, ''), NULLIF(action_taken, '')),
+       decision_ts
 FROM decision_records
 WHERE kind = ?
 ORDER BY decision_ts DESC, id DESC
-LIMIT 1`, state.DecisionKindIntentPlannerError).Scan(&lastErrorSeq, &lastErrorPath, &lastError)
+LIMIT 1`, state.DecisionKindIntentPlannerError).Scan(
+		&lastErrorSeq, &lastErrorPath, &lastError, &lastErrorTS)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("planner last error: %w", err)
 	}
@@ -1385,6 +1483,9 @@ LIMIT 1`, state.DecisionKindIntentPlannerError).Scan(&lastErrorSeq, &lastErrorPa
 	}
 	if lastError.Valid {
 		report.LastPlannerError = ai.SanitizePlannerError(lastError.String)
+	}
+	if lastErrorTS.Valid {
+		report.LastPlannerErrorTS = int64(lastErrorTS.Float64)
 	}
 	return nil
 }

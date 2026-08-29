@@ -37,6 +37,36 @@ func TestStatus_PlannerErrorRateRecent_EmptyLedger(t *testing.T) {
 	}
 }
 
+func TestStatus_IntentStrategyUsesEffectiveRuntimeProvider(t *testing.T) {
+	t.Setenv(ai.EnvProvider, "deterministic")
+	t.Setenv(ai.EnvModel, "stale-model")
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "claude-code")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+		BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{
+			Int64: 1, Valid: true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"ai.provider": "openai-compat",
+		"ai.model":    "gpt-runtime",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	report := runStatusJSON(ctx, t, repo)
+	if report.IntentStrategy.EffectiveProvider != "openai-compat" ||
+		report.IntentStrategy.EffectiveModel != "gpt-runtime" {
+		t.Fatalf("intent strategy=%+v", report.IntentStrategy)
+	}
+}
+
 func TestStatus_MessageQualitySummary(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -84,6 +114,15 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 	ctx := context.Background()
 	repo, dbPath, d := makeRepoStateDB(t)
 	registerRepo(t, roots, repo, dbPath, "claude-code")
+	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+		BranchRef: sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{
+			Int64: 1, Valid: true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := state.AppendIntentPlannerWindow(ctx, d, state.IntentPlannerWindow{
 		PlannedTS:           100,
@@ -126,10 +165,33 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 	if err := state.UpdateIntentPlanRun(ctx, d, run); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := state.AppendIntentPlannerWindow(ctx, d, state.IntentPlannerWindow{
+		PlannedTS:           200,
+		BranchRef:           "refs/heads/other",
+		BranchGeneration:    2,
+		OfferedSeqs:         []int64{99},
+		VisibleOriginalSeqs: []int64{99},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	otherRun, err := state.EnsureIntentPlanRun(ctx, d, state.IntentPlanRun{
+		Fingerprint: "sha256:other", BranchRef: "refs/heads/other",
+		BranchGeneration: 2, AttemptLimit: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRun.ProgressState = sqlNullStr("waiting_message_rewrite")
+	otherRun.ResolutionMode = sqlNullStr("waiting_message_rewrite")
+	if err := state.UpdateIntentPlanRun(ctx, d, otherRun); err != nil {
+		t.Fatal(err)
+	}
 
 	report := runStatusJSON(ctx, t, repo)
 	win := report.IntentStrategy.LastPlannerWindow
-	if win == nil || win.Provider != "openai-compat" || win.Model != "gpt-test" {
+	if win == nil || win.Provider != "openai-compat" || win.Model != "gpt-test" ||
+		win.BranchRef != "refs/heads/main" ||
+		report.IntentStrategy.ResolutionMode != "local_preflight" {
 		t.Fatalf("last planner window = %+v", win)
 	}
 	if len(win.OfferedSeqs) != 2 || win.OfferedSeqs[0] != 4 ||

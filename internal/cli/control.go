@@ -38,36 +38,37 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
-	OK                       bool                   `json:"ok"`
-	Command                  string                 `json:"command"`
-	Repo                     string                 `json:"repo"`
-	Health                   string                 `json:"health"`
-	Summary                  string                 `json:"summary"`
-	NextAction               string                 `json:"next_action"`
-	Registered               bool                   `json:"registered"`
-	Enabled                  bool                   `json:"enabled"`
-	Daemon                   string                 `json:"daemon"`
-	DaemonPID                int                    `json:"daemon_pid"`
-	PendingEvents            int                    `json:"pending_events"`
-	BlockedEvents            int                    `json:"blocked_events"`
-	Changed                  bool                   `json:"changed"`
-	Actions                  []string               `json:"actions"`
-	StatePreserved           bool                   `json:"state_preserved"`
-	Protected                bool                   `json:"protected"`
-	Published                bool                   `json:"published"`
-	Busy                     bool                   `json:"busy"`
-	OperationalState         string                 `json:"operational_state"`
-	WorktreeClean            bool                   `json:"worktree_clean"`
-	AllChangesCommittedInGit bool                   `json:"all_changes_committed_in_git"`
-	CheckpointPublishedByACD bool                   `json:"checkpoint_published_by_acd"`
-	CheckpointID             string                 `json:"checkpoint_id,omitempty"`
-	PublicationDrain         publicationDrainReport `json:"publication_drain"`
-	RecoveryRequired         bool                   `json:"-"`
-	CLIVersion               string                 `json:"cli_version,omitempty"`
-	SupervisorVersion        string                 `json:"supervisor_version,omitempty"`
-	SupervisorWorkerState    string                 `json:"supervisor_worker_state,omitempty"`
-	SupervisorWorkerRestarts int                    `json:"supervisor_worker_restarts,omitempty"`
-	SupervisorWorkerError    string                 `json:"supervisor_worker_error,omitempty"`
+	OK                       bool                      `json:"ok"`
+	Command                  string                    `json:"command"`
+	Repo                     string                    `json:"repo"`
+	Health                   string                    `json:"health"`
+	Summary                  string                    `json:"summary"`
+	NextAction               string                    `json:"next_action"`
+	Registered               bool                      `json:"registered"`
+	Enabled                  bool                      `json:"enabled"`
+	Daemon                   string                    `json:"daemon"`
+	DaemonPID                int                       `json:"daemon_pid"`
+	PendingEvents            int                       `json:"pending_events"`
+	BlockedEvents            int                       `json:"blocked_events"`
+	Changed                  bool                      `json:"changed"`
+	Actions                  []string                  `json:"actions"`
+	StatePreserved           bool                      `json:"state_preserved"`
+	Protected                bool                      `json:"protected"`
+	Published                bool                      `json:"published"`
+	Busy                     bool                      `json:"busy"`
+	OperationalState         string                    `json:"operational_state"`
+	WorktreeClean            bool                      `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                      `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
+	CheckpointID             string                    `json:"checkpoint_id,omitempty"`
+	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
+	PublicationProgress      publicationProgressReport `json:"publication_progress"`
+	RecoveryRequired         bool                      `json:"-"`
+	CLIVersion               string                    `json:"cli_version,omitempty"`
+	SupervisorVersion        string                    `json:"supervisor_version,omitempty"`
+	SupervisorWorkerState    string                    `json:"supervisor_worker_state,omitempty"`
+	SupervisorWorkerRestarts int                       `json:"supervisor_worker_restarts,omitempty"`
+	SupervisorWorkerError    string                    `json:"supervisor_worker_error,omitempty"`
 }
 
 type controlRepoLookup struct {
@@ -557,6 +558,7 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	res.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 	res.CheckpointID = status.LatestCheckpointID
 	res.PublicationDrain = status.PublicationDrain
+	res.PublicationProgress = status.PublicationProgress
 	res.RecoveryRequired = status.Replay.State == "needs_attention" ||
 		status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0
 
@@ -594,6 +596,13 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "The saved configuration did not pass validation. ACD is still protecting changes."
 		res.NextAction = "Run `acd config edit` to retry validation or select another experience."
+	case status.PublicationDrain.Phase == state.PublicationDrainNeedsAction &&
+		(status.PublicationDrain.LastError == "publication_drain_runtime_contract_unavailable" ||
+			status.PublicationDrain.LastError == "publication_drain_environment_runtime_changed"):
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "ACD can no longer reconstruct the exact runtime needed to resume this commit-all run. Your captured work remains protected."
+		res.NextAction = "Run `acd fix --force --dry-run`, review the archive-only recovery plan, then run `acd fix --force --yes`."
 	case status.PublicationDrain.Phase == state.PublicationDrainNeedsAction:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
@@ -604,6 +613,18 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
+	case status.PendingEvents > 0 &&
+		status.IntentStrategy.ResolutionMode == "waiting_message_rewrite":
+		res.Health = controlHealthWaiting
+		res.Summary = "ACD is waiting for the Intent provider to write a semantic commit message. Your work remains protected."
+		res.NextAction = "No action needed. ACD will retry the provider automatically."
+	case status.PublicationProgress.Phase == "stalled":
+		res.Health = controlHealthDegraded
+		res.Summary = fmt.Sprintf(
+			"The worker is responsive, but the publication queue has not moved for %s. Your work remains protected.",
+			formatDurationCompact(time.Duration(
+				status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
+		res.NextAction = "No action needed yet. ACD will start bounded recovery automatically; run `acd doctor` if this persists."
 	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
 		status.PublicationDrain.FallbackMode == "semantic_replan":
 		res.Health = controlHealthPublishing
@@ -655,13 +676,13 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	case status.PendingEvents == 0 && status.IntentStrategy.LastPlannerWindow != nil &&
 		status.IntentStrategy.LastPlannerWindow.ResolutionMode == "evidence_partition":
 		res.Health = controlHealthHealthy
-		res.Summary = "ACD safely grouped and published the last batch without the AI provider."
-		res.NextAction = "No action needed. ACD will retry the provider with the next batch."
+		res.Summary = "ACD safely grouped and published the last batch using local dependency evidence."
+		res.NextAction = "No action needed."
 	case status.IntentStrategy.PlannerHealth != nil &&
 		(status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
 			status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
 		res.Health = controlHealthDegraded
-		res.Summary = "The AI provider is unavailable, so ACD is using safe local grouping."
+		res.Summary = "The Intent provider is temporarily unavailable, so semantic commit messages are waiting. Your work remains protected."
 		if status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen {
 			res.NextAction = "No immediate action needed; ACD is running the automatic provider probe. Run `acd doctor` for details."
 		} else {
@@ -677,7 +698,7 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the retrying state persists."
 	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
 		res.Health = controlHealthDegraded
-		res.Summary = "ACD is running with recoverable errors or deterministic fallback."
+		res.Summary = "ACD is running with recoverable capture or planning errors."
 		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the degraded state persists."
 	case status.PendingEvents > 0 && status.IntentStrategy.Active && status.IntentStrategy.BatchWaitActive:
 		res.Health = controlHealthWaiting

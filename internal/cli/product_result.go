@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 type productState string
@@ -43,30 +44,31 @@ type productEnvelope struct {
 }
 
 type productStatusData struct {
-	Repo                     string                 `json:"repo"`
-	Command                  string                 `json:"command"`
-	Registered               bool                   `json:"registered"`
-	Enabled                  bool                   `json:"enabled"`
-	Worker                   string                 `json:"worker"`
-	Protected                bool                   `json:"protected"`
-	Published                bool                   `json:"published"`
-	Busy                     bool                   `json:"busy"`
-	OperationalState         string                 `json:"operational_state"`
-	WorktreeClean            bool                   `json:"worktree_clean"`
-	AllChangesCommittedInGit bool                   `json:"all_changes_committed_in_git"`
-	CheckpointPublishedByACD bool                   `json:"checkpoint_published_by_acd"`
-	ActionRequired           bool                   `json:"action_required"`
-	CheckpointID             string                 `json:"checkpoint_id,omitempty"`
-	PublicationDrain         publicationDrainReport `json:"publication_drain"`
-	PendingEvents            int                    `json:"pending_events"`
-	BlockedEvents            int                    `json:"blocked_events"`
-	Summary                  string                 `json:"summary"`
-	StatePreserved           bool                   `json:"state_preserved"`
-	CLIVersion               string                 `json:"cli_version,omitempty"`
-	SupervisorVersion        string                 `json:"supervisor_version,omitempty"`
-	SupervisorWorkerState    string                 `json:"supervisor_worker_state,omitempty"`
-	SupervisorWorkerRestarts int                    `json:"supervisor_worker_restarts,omitempty"`
-	SupervisorWorkerError    string                 `json:"supervisor_worker_error,omitempty"`
+	Repo                     string                    `json:"repo"`
+	Command                  string                    `json:"command"`
+	Registered               bool                      `json:"registered"`
+	Enabled                  bool                      `json:"enabled"`
+	Worker                   string                    `json:"worker"`
+	Protected                bool                      `json:"protected"`
+	Published                bool                      `json:"published"`
+	Busy                     bool                      `json:"busy"`
+	OperationalState         string                    `json:"operational_state"`
+	WorktreeClean            bool                      `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                      `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
+	ActionRequired           bool                      `json:"action_required"`
+	CheckpointID             string                    `json:"checkpoint_id,omitempty"`
+	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
+	PublicationProgress      publicationProgressReport `json:"publication_progress"`
+	PendingEvents            int                       `json:"pending_events"`
+	BlockedEvents            int                       `json:"blocked_events"`
+	Summary                  string                    `json:"summary"`
+	StatePreserved           bool                      `json:"state_preserved"`
+	CLIVersion               string                    `json:"cli_version,omitempty"`
+	SupervisorVersion        string                    `json:"supervisor_version,omitempty"`
+	SupervisorWorkerState    string                    `json:"supervisor_worker_state,omitempty"`
+	SupervisorWorkerRestarts int                       `json:"supervisor_worker_restarts,omitempty"`
+	SupervisorWorkerError    string                    `json:"supervisor_worker_error,omitempty"`
 }
 
 func envelopeFromControl(result controlResult) productEnvelope {
@@ -117,6 +119,7 @@ func envelopeFromControl(result controlResult) productEnvelope {
 			ActionRequired:           actionRequired,
 			CheckpointID:             result.CheckpointID,
 			PublicationDrain:         result.PublicationDrain,
+			PublicationProgress:      result.PublicationProgress,
 			PendingEvents:            result.PendingEvents,
 			BlockedEvents:            result.BlockedEvents,
 			Summary:                  result.Summary,
@@ -145,13 +148,7 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	fmt.Fprintf(out, "ACD protection: %s\n", onOff(data.Enabled))
 	fmt.Fprintf(out, "Current changes protected: %s\n", yesNo(data.Protected))
 	fmt.Fprintf(out, "Published to Git: %s\n", yesNo(data.Published))
-	if data.PublicationDrain.ID != "" {
-		fmt.Fprintf(out, "Commit-all progress: %d of %d protected change(s) left, %s\n",
-			data.PublicationDrain.RemainingEvents,
-			data.PublicationDrain.TargetEvents,
-			publicationPhaseLabel(data.PublicationDrain.Phase,
-				data.PublicationDrain.FallbackMode))
-	}
+	renderProductPublicationProgress(out, data.PublicationProgress)
 	fmt.Fprintf(out, "Action needed: %s\n", yesNo(data.ActionRequired))
 	if data.Summary != "" {
 		fmt.Fprintf(out, "Status: %s\n", data.Summary)
@@ -162,6 +159,96 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 		fmt.Fprintf(out, "Next: %s\n", *envelope.NextAction)
 	}
 	return nil
+}
+
+func renderProductPublicationProgress(
+	out io.Writer,
+	progress publicationProgressReport,
+) {
+	if progress.Strategy == "" {
+		return
+	}
+	strategy := strings.ToUpper(progress.Strategy[:1]) + progress.Strategy[1:]
+	if progress.TemporaryLocalFallback {
+		strategy += " (temporary local fallback active)"
+	}
+	fmt.Fprintf(out, "Commit mode: %s\n", strategy)
+	if progress.PlannerProvider != "" {
+		planner := progress.PlannerProvider
+		if progress.PlannerModel != "" {
+			planner += " / " + progress.PlannerModel
+		}
+		fmt.Fprintf(out, "Intent provider: %s\n",
+			planner)
+	}
+	fmt.Fprintf(out, "Publication queue: %d protected change(s)\n",
+		progress.QueuePending)
+	if progress.Origin == "commit_all" && progress.TargetTotal > 0 {
+		fmt.Fprintf(out, "Active target: earlier commit-all request, %d of %d left\n",
+			progress.TargetRemaining, progress.TargetTotal)
+	}
+	fmt.Fprintf(out, "Publication phase: %s\n",
+		publicationProgressPhaseLabel(progress))
+	if progress.LastProgressTS > 0 {
+		fmt.Fprintf(out, "Last queue movement: %s ago\n",
+			formatDurationCompact(time.Duration(progress.LastProgressAgeSeconds)*time.Second))
+	}
+	worker := "not responsive"
+	if progress.WorkerResponsive {
+		worker = "responsive"
+		if progress.HeartbeatAgeSeconds >= 0 {
+			worker += ", heartbeat " + formatDurationCompact(
+				time.Duration(progress.HeartbeatAgeSeconds)*time.Second) + " ago"
+		}
+	}
+	fmt.Fprintf(out, "Worker liveness: %s\n", worker)
+}
+
+func publicationProgressPhaseLabel(progress publicationProgressReport) string {
+	switch progress.Phase {
+	case "idle":
+		return "idle"
+	case "checkpointing":
+		return "saving the protected checkpoint"
+	case "paused":
+		return "paused by the user"
+	case "rewind_wait":
+		if progress.WaitRemainingSeconds > 0 {
+			return fmt.Sprintf("waiting after a Git history change (%s remaining)",
+				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
+		}
+		return "waiting after a Git history change"
+	case "config_wait":
+		return "waiting for configuration validation"
+	case "intent_wait":
+		if progress.WaitRemainingSeconds > 0 {
+			return fmt.Sprintf("waiting normally for the Intent batch (%s remaining)",
+				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
+		}
+		return "waiting normally for the Intent batch"
+	case "intent_planning":
+		return "planning commit groups by Intent"
+	case "intent_replanning":
+		return "recovering by replanning commit groups by Intent"
+	case "intent_processing":
+		return "grouping and publishing by Intent"
+	case "recovering":
+		return "recovering the publication plan"
+	case "local_fallback":
+		return "publishing one safe local group, then returning to Intent"
+	case "provider_wait":
+		return "waiting for the Intent provider to write a semantic commit message"
+	case "stalled":
+		return "stalled; bounded automatic recovery is expected to start"
+	case "retrying":
+		return "retrying publication automatically"
+	case "needs_action":
+		return "stopped at a safety check"
+	case "event_publishing":
+		return "publishing captured events"
+	default:
+		return strings.ReplaceAll(progress.Phase, "_", " ")
+	}
 }
 
 func publicationPhaseLabel(phase string, fallbackMode string) string {

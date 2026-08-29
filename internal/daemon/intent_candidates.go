@@ -354,6 +354,14 @@ func EvaluateIntentCandidates(
 	if result.Fallback != "" {
 		validationBaseRequest = normalizeIntentFallbackBoundaries(req)
 	}
+	if result.Fallback == "waiting_message_rewrite" {
+		// Forced aging requires publication only when a safe commit message is
+		// available. The locally constructed wait plan deliberately keeps every
+		// candidate unpublishable until the configured semantic provider can
+		// rewrite its locked message, so do not reinterpret that hold as an
+		// invalid planner deferral and rebuild it with a deterministic message.
+		validationBaseRequest.ForcedAging = false
+	}
 	validationRequest := intentCandidateContinuationValidationRequest(
 		validationBaseRequest, continuations)
 	if validationErr := ai.ValidateIntentPlanV2(validationRequest, plan); validationErr != nil {
@@ -1952,6 +1960,27 @@ func applyIntentFallbackMessageQuality(
 	plan ai.IntentPlanV2,
 	plannerFailure string,
 ) (ai.IntentPlanV2, string, bool, error) {
+	// Deterministic is an explicit supported provider mode, not a silent
+	// downgrade from a configured semantic provider. Its locally generated
+	// fallback messages are therefore complete without a semantic rewrite.
+	if ai.PrimaryProviderName(planner) ==
+		(ai.DeterministicProvider{}).Name() {
+		return plan, plannerFailure, true, nil
+	}
+	// Publication-drain recovery wraps the configured planner so it can lock
+	// membership locally. Preserve the same explicit deterministic policy when
+	// that wrapper is active; semantic wrappers continue through the rewrite
+	// gate below and fail closed when their provider is unavailable.
+	switch fallback := planner.(type) {
+	case publicationDrainAtomicFallbackPlanner:
+		if !fallback.requireSemanticMessage {
+			return plan, plannerFailure, true, nil
+		}
+	case *publicationDrainAtomicFallbackPlanner:
+		if fallback != nil && !fallback.requireSemanticMessage {
+			return plan, plannerFailure, true, nil
+		}
+	}
 	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
 		return plan, plannerFailure, false, nil
 	}

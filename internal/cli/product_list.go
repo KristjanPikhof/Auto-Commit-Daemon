@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 const productListDefaultRows = 5
@@ -21,26 +19,27 @@ const productListDefaultRows = 5
 var productListCollect = collectProductListOverview
 
 type productListEntry struct {
-	Repo              string                 `json:"repo"`
-	Enabled           bool                   `json:"enabled"`
-	Protected         bool                   `json:"protected"`
-	Published         bool                   `json:"published"`
-	ActionRequired    bool                   `json:"action_required"`
-	State             productState           `json:"state"`
-	PendingEvents     int                    `json:"pending_events"`
-	BlockedEvents     int                    `json:"blocked_events"`
-	CheckpointID      string                 `json:"checkpoint_id,omitempty"`
-	WorkerState       string                 `json:"worker_state"`
-	OperationalState  string                 `json:"operational_state"`
-	LastActivityAt    string                 `json:"last_activity_at"`
-	PublicationDrain  publicationDrainReport `json:"publication_drain"`
-	Summary           string                 `json:"summary"`
-	NextAction        string                 `json:"next_action,omitempty"`
-	RepoHash          string                 `json:"-"`
-	Clients           int                    `json:"-"`
-	LastCommitOID     string                 `json:"-"`
-	ProtectionUnknown bool                   `json:"-"`
-	lastActivity      time.Time
+	Repo                string                    `json:"repo"`
+	Enabled             bool                      `json:"enabled"`
+	Protected           bool                      `json:"protected"`
+	Published           bool                      `json:"published"`
+	ActionRequired      bool                      `json:"action_required"`
+	State               productState              `json:"state"`
+	PendingEvents       int                       `json:"pending_events"`
+	BlockedEvents       int                       `json:"blocked_events"`
+	CheckpointID        string                    `json:"checkpoint_id,omitempty"`
+	WorkerState         string                    `json:"worker_state"`
+	OperationalState    string                    `json:"operational_state"`
+	LastActivityAt      string                    `json:"last_activity_at"`
+	PublicationDrain    publicationDrainReport    `json:"publication_drain"`
+	PublicationProgress publicationProgressReport `json:"publication_progress"`
+	Summary             string                    `json:"summary"`
+	NextAction          string                    `json:"next_action,omitempty"`
+	RepoHash            string                    `json:"-"`
+	Clients             int                       `json:"-"`
+	LastCommitOID       string                    `json:"-"`
+	ProtectionUnknown   bool                      `json:"-"`
+	lastActivity        time.Time
 }
 
 type productListData struct {
@@ -270,9 +269,9 @@ func renderProductListDashboard(out io.Writer, entries []productListEntry, verbo
 	labels := productListLabels(visible)
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	if verbose {
-		fmt.Fprintln(tw, "REPOSITORY\tWORKER\tLIVE TOOLS\tSAFE\tDRAIN\tLEFT\tBLOCKED\tLAST COMMIT\tSTATUS\tDETAILS")
+		fmt.Fprintln(tw, "REPOSITORY\tWORKER\tLIVE TOOLS\tSAFE\tMODE\tQUEUE\tTARGET\tLAST MOVE\tPHASE\tBLOCKED\tLAST COMMIT\tSTATUS\tDETAILS")
 	} else {
-		fmt.Fprintln(tw, "REPO\tSAFE\tDRAIN\tLEFT\tSTATUS")
+		fmt.Fprintln(tw, "REPO\tSAFE\tMODE\tQUEUE\tTARGET\tLAST MOVE\tPHASE\tSTATUS")
 	}
 	for index, entry := range visible {
 		if verbose {
@@ -280,22 +279,24 @@ func renderProductListDashboard(out io.Writer, entries []productListEntry, verbo
 			if entry.NextAction != "" && entry.NextAction != "No action needed." {
 				details = strings.TrimSpace(details + " " + entry.NextAction)
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n",
+			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
 				homeShort(entry.Repo), valueOrDash(entry.WorkerState), entry.Clients,
-				productListSafety(entry), productListDrain(entry), productListLeft(entry),
+				productListSafety(entry), productListMode(entry), entry.PendingEvents,
+				productListTarget(entry), productListProgressAge(entry), productListPhase(entry),
 				entry.BlockedEvents, productListLastCommit(entry.LastCommitOID),
 				productListStatus(entry), details)
 			continue
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", labels[index],
-			productListSafety(entry), productListDrain(entry), productListLeft(entry),
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", labels[index],
+			productListSafety(entry), productListMode(entry), entry.PendingEvents,
+			productListTarget(entry), productListProgressAge(entry), productListPhase(entry),
 			productListStatus(entry))
 	}
 	if len(visible) == 0 {
 		if verbose {
-			fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t\t\t\t\t\t")
+			fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t\t\t\t\t\t\t\t\t")
 		} else {
-			fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t")
+			fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t\t\t\t")
 		}
 	}
 	if err := tw.Flush(); err != nil {
@@ -306,6 +307,70 @@ func renderProductListDashboard(out io.Writer, entries []productListEntry, verbo
 		return err
 	}
 	return nil
+}
+
+func productListMode(entry productListEntry) string {
+	mode := entry.PublicationProgress.Strategy
+	if mode == "" {
+		return "-"
+	}
+	return mode
+}
+
+func productListTarget(entry productListEntry) string {
+	progress := entry.PublicationProgress
+	if progress.Origin != "commit_all" || progress.TargetTotal <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("commit-all:%d/%d", progress.TargetRemaining,
+		progress.TargetTotal)
+}
+
+func productListProgressAge(entry productListEntry) string {
+	progress := entry.PublicationProgress
+	if progress.LastProgressTS <= 0 {
+		return "-"
+	}
+	return strings.ReplaceAll(formatDurationCompact(
+		time.Duration(progress.LastProgressAgeSeconds)*time.Second), " ", "")
+}
+
+func productListPhase(entry productListEntry) string {
+	progress := entry.PublicationProgress
+	switch progress.Phase {
+	case "intent_wait":
+		if progress.WaitRemainingSeconds > 0 {
+			return "wait:" + strings.ReplaceAll(formatDurationCompact(
+				time.Duration(progress.WaitRemainingSeconds)*time.Second), " ", "")
+		}
+		return "waiting"
+	case "intent_planning":
+		return "intent-plan"
+	case "intent_replanning":
+		return "intent-replan"
+	case "intent_processing":
+		return "intent"
+	case "rewind_wait":
+		if progress.WaitRemainingSeconds > 0 {
+			return "rewind:" + strings.ReplaceAll(formatDurationCompact(
+				time.Duration(progress.WaitRemainingSeconds)*time.Second), " ", "")
+		}
+		return "rewind-wait"
+	case "config_wait":
+		return "config-wait"
+	case "local_fallback":
+		return "local-recovery"
+	case "provider_wait":
+		return "provider-wait"
+	case "event_publishing":
+		return "event"
+	case "needs_action":
+		return "blocked"
+	case "stalled":
+		return "stalled"
+	default:
+		return strings.ReplaceAll(valueOrDash(progress.Phase), "_", "-")
+	}
 }
 
 func productListSafety(entry productListEntry) string {
@@ -323,8 +388,12 @@ func selectProductListEntries(entries []productListEntry, showAll bool) ([]produ
 	recent := make([]productListEntry, 0, len(entries))
 	paused := make([]productListEntry, 0, len(entries))
 	for _, entry := range entries {
+		if entry.ActionRequired {
+			mandatory = append(mandatory, entry)
+			continue
+		}
 		switch productListStatus(entry) {
-		case "needs action", "working":
+		case "needs action", "working", "waiting", "stalled":
 			mandatory = append(mandatory, entry)
 		case "paused":
 			paused = append(paused, entry)
@@ -353,6 +422,13 @@ func productListStatus(entry productListEntry) string {
 		return "paused"
 	case entry.ActionRequired || entry.State == productStateNeedsAction || entry.OperationalState == "needs_attention":
 		return "needs action"
+	case entry.PublicationProgress.Phase == "stalled":
+		return "stalled"
+	case entry.PublicationProgress.Phase == "provider_wait" ||
+		entry.PublicationProgress.Phase == "intent_wait" ||
+		entry.PublicationProgress.Phase == "rewind_wait" ||
+		entry.PublicationProgress.Phase == "config_wait":
+		return "waiting"
 	case entry.OperationalState == "waiting":
 		return "waiting"
 	case productListWorkingState(entry.OperationalState):
@@ -373,22 +449,6 @@ func productListWorkingState(operational string) bool {
 	default:
 		return false
 	}
-}
-
-func productListDrain(entry productListEntry) string {
-	drain := entry.PublicationDrain
-	if drain.ID == "" || drain.Phase == state.PublicationDrainCompleted {
-		return "-"
-	}
-	return fmt.Sprintf("%d/%d", drain.PublishedEvents, drain.TargetEvents)
-}
-
-func productListLeft(entry productListEntry) int64 {
-	drain := entry.PublicationDrain
-	if drain.ID != "" && drain.Phase != state.PublicationDrainCompleted {
-		return drain.RemainingEvents
-	}
-	return int64(entry.PendingEvents)
 }
 
 func productListLastCommit(oid string) string {

@@ -16,8 +16,10 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 
@@ -52,6 +54,28 @@ type publicationDrainReport struct {
 	StagedConsumed          bool    `json:"staged_consumed"`
 }
 
+// publicationProgressReport is the small, shared product projection used by
+// status and list. WorkerResponsive is deliberately separate from
+// LastProgressTS: a fresh heartbeat proves that the worker is alive, not that
+// the publication frontier is moving.
+type publicationProgressReport struct {
+	Strategy               string  `json:"strategy"`
+	PlannerProvider        string  `json:"planner_provider,omitempty"`
+	PlannerModel           string  `json:"planner_model,omitempty"`
+	Origin                 string  `json:"origin,omitempty"`
+	Phase                  string  `json:"phase"`
+	QueuePending           int     `json:"queue_pending"`
+	TargetRemaining        int64   `json:"target_remaining,omitempty"`
+	TargetTotal            int64   `json:"target_total,omitempty"`
+	LastProgressTS         float64 `json:"last_progress_ts,omitempty"`
+	LastProgressAgeSeconds int64   `json:"last_progress_age_seconds,omitempty"`
+	WaitRemainingSeconds   int64   `json:"wait_remaining_seconds,omitempty"`
+	TemporaryLocalFallback bool    `json:"temporary_local_fallback,omitempty"`
+	WorkerResponsive       bool    `json:"worker_responsive"`
+	HeartbeatAgeSeconds    int64   `json:"heartbeat_age_seconds,omitempty"`
+	StallThresholdSeconds  int64   `json:"stall_threshold_seconds,omitempty"`
+}
+
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
@@ -65,6 +89,7 @@ type statusReport struct {
 	HeartbeatTS                   int64                     `json:"heartbeat_ts,omitempty"`
 	HeartbeatAgeSeconds           int64                     `json:"heartbeat_age_seconds,omitempty"`
 	BranchRef                     string                    `json:"branch_ref,omitempty"`
+	BranchGeneration              int64                     `json:"branch_generation,omitempty"`
 	BranchGenToken                string                    `json:"branch_generation_token,omitempty"`
 	Clients                       []statusClient            `json:"clients"`
 	PendingEvents                 int                       `json:"pending_events"`
@@ -106,6 +131,7 @@ type statusReport struct {
 	AllChangesCommittedInGit      bool                      `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD      bool                      `json:"checkpoint_published_by_acd"`
 	PublicationDrain              publicationDrainReport    `json:"publication_drain"`
+	PublicationProgress           publicationProgressReport `json:"publication_progress"`
 	checkpointNeedsAction         bool
 }
 
@@ -274,14 +300,6 @@ WHERE cp.phase='completed'
 			report.ObservationEpoch == report.CoveredEpoch &&
 			prepared == 0 && needsAction == 0
 	}
-	if schemaVersion >= 21 {
-		drain, drainErr := readStatusPublicationDrain(ctx, conn)
-		if drainErr != nil {
-			return report, drainErr
-		}
-		report.PublicationDrain = drain
-	}
-
 	// daemon_state singleton.
 	var pid int
 	var mode string
@@ -303,9 +321,23 @@ WHERE cp.phase='completed'
 				report.Stale = true
 			}
 		}
-		if branchRef.Valid {
-			report.BranchRef = branchRef.String
+	}
+	currentBranchRef, currentBranchGeneration, hasCurrentPair, pairErr :=
+		currentWorktreeReplayPair(ctx, conn, rec.Path)
+	if pairErr != nil {
+		return report, pairErr
+	}
+	if hasCurrentPair {
+		report.BranchRef = currentBranchRef
+		report.BranchGeneration = currentBranchGeneration
+	}
+	if schemaVersion >= 21 {
+		drain, drainErr := readStatusPublicationDrain(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+		if drainErr != nil {
+			return report, drainErr
 		}
+		report.PublicationDrain = drain
 	}
 
 	// started_ts is stored in daemon_meta (set by start.go in this lane).
@@ -363,10 +395,7 @@ WHERE cp.phase='completed'
 		state.EventStatePending).Scan(&report.PendingEvents); err != nil {
 		return report, fmt.Errorf("pending events: %w", err)
 	}
-	activeGen := int64(0)
-	if branchGeneration.Valid {
-		activeGen = branchGeneration.Int64
-	}
+	activeGen := report.BranchGeneration
 	blockers, err := loadRecoveryBlockerCounts(ctx, conn, report.BranchRef, activeGen)
 	if err != nil {
 		return report, fmt.Errorf("recovery blocker counts: %w", err)
@@ -429,7 +458,8 @@ WHERE cp.phase='completed'
 		report.Paused = true
 		report.Pause = info
 	}
-	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err != nil {
+	if intentStrategy, err := loadIntentStrategyReportForPair(
+		ctx, conn, report.BranchRef, report.BranchGeneration); err != nil {
 		return report, fmt.Errorf("intent strategy: %w", err)
 	} else {
 		report.IntentStrategy = intentStrategy
@@ -480,8 +510,225 @@ WHERE cp.phase='completed'
 				report.PublicationDrain.Phase != state.PublicationDrainNeedsAction) ||
 			report.Configuration.Configuration == "validating")
 	report.OperationalState = statusOperationalState(report)
+	progress, err := buildPublicationProgressReport(ctx, conn, report, now)
+	if err != nil {
+		return report, fmt.Errorf("publication progress: %w", err)
+	}
+	report.PublicationProgress = progress
 
 	return report, nil
+}
+
+func buildPublicationProgressReport(
+	ctx context.Context,
+	conn *sql.DB,
+	report statusReport,
+	now time.Time,
+) (publicationProgressReport, error) {
+	progress := publicationProgressReport{
+		Strategy:     report.IntentStrategy.Strategy,
+		Phase:        "idle",
+		QueuePending: report.PendingEvents,
+		WorkerResponsive: report.Daemon == "running" && !report.Stale &&
+			report.PID > 0 && identity.Alive(report.PID),
+		HeartbeatAgeSeconds: report.HeartbeatAgeSeconds,
+	}
+	if progress.Strategy == "" {
+		progress.Strategy = "event"
+	}
+	progress.PlannerProvider = report.IntentStrategy.EffectiveProvider
+	progress.PlannerModel = report.IntentStrategy.EffectiveModel
+	if progress.PlannerProvider == "" &&
+		report.IntentStrategy.LastPlannerWindow != nil {
+		progress.PlannerProvider = report.IntentStrategy.LastPlannerWindow.Provider
+		progress.PlannerModel = report.IntentStrategy.LastPlannerWindow.Model
+	}
+
+	drain := report.PublicationDrain
+	activeDrain := drain.ID != "" &&
+		drain.Phase != state.PublicationDrainCompleted
+	if activeDrain {
+		progress.Origin = "commit_all"
+		progress.TargetRemaining = drain.RemainingEvents
+		progress.TargetTotal = drain.TargetEvents
+		progress.LastProgressTS = drain.LastProgressTS
+		switch drain.Phase {
+		case state.PublicationDrainCheckpointing:
+			progress.Phase = "checkpointing"
+		case state.PublicationDrainSemantic:
+			progress.Phase = "intent_planning"
+		case state.PublicationDrainNormalizing:
+			progress.Phase = "recovering"
+		case state.PublicationDrainEventFallback:
+			if drain.FallbackMode == "semantic_replan" {
+				progress.Phase = "intent_replanning"
+			} else {
+				progress.Phase = "local_fallback"
+				progress.TemporaryLocalFallback = progress.Strategy == "intent"
+			}
+		case state.PublicationDrainNeedsAction:
+			progress.Phase = "needs_action"
+		default:
+			progress.Phase = "working"
+		}
+	} else {
+		switch {
+		case report.PendingEvents == 0:
+			progress.Phase = "idle"
+		case report.Replay.State == "needs_attention" ||
+			report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
+			progress.Phase = "needs_action"
+		case report.Replay.State == "degraded":
+			progress.Phase = "retrying"
+		case report.IntentStrategy.Active:
+			progress.Phase = "intent_processing"
+		default:
+			progress.Phase = "event_publishing"
+		}
+		lastProgress, err := regularPublicationProgressBaseline(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+		if err != nil {
+			return progress, err
+		}
+		progress.LastProgressTS = lastProgress
+	}
+	if progress.Phase != "needs_action" {
+		manualPause := report.Paused &&
+			(report.Pause == nil || report.Pause.Source != "rewind_grace")
+		switch {
+		case manualPause:
+			progress.Phase = "paused"
+		case report.Paused && report.Pause != nil &&
+			report.Pause.Source == "rewind_grace":
+			progress.Phase = "rewind_wait"
+			progress.WaitRemainingSeconds = report.Pause.RemainingSeconds
+		case report.Configuration.Configuration == "validating":
+			progress.Phase = "config_wait"
+		case report.CheckpointProtectionAvailable && !report.Protected && report.Busy:
+			progress.Phase = "checkpointing"
+		case intentProviderWaitActive(report):
+			progress.Phase = "provider_wait"
+			progress.TemporaryLocalFallback = false
+		case !activeDrain && report.PendingEvents > 0 &&
+			report.IntentStrategy.BatchWaitActive:
+			progress.Phase = "intent_wait"
+			progress.WaitRemainingSeconds = intentWaitRemainingSeconds(
+				report.IntentStrategy)
+		}
+	}
+	if progress.LastProgressTS > 0 {
+		age := now.Sub(time.Unix(0,
+			int64(progress.LastProgressTS*float64(time.Second))))
+		if age < 0 {
+			age = 0
+		}
+		progress.LastProgressAgeSeconds = int64(age / time.Second)
+	}
+	stallThreshold := publicationStallThreshold(ctx, conn)
+	progress.StallThresholdSeconds = int64(stallThreshold / time.Second)
+	if progress.WorkerResponsive && progress.QueuePending > 0 &&
+		progress.LastProgressTS > 0 && ageExceedsThreshold(
+		progress.LastProgressAgeSeconds, stallThreshold) &&
+		publicationPhaseCanStall(progress.Phase) {
+		progress.Phase = "stalled"
+	}
+	return progress, nil
+}
+
+func intentProviderWaitActive(report statusReport) bool {
+	if report.PendingEvents <= 0 {
+		return false
+	}
+	if report.IntentStrategy.ResolutionMode == "waiting_message_rewrite" {
+		return true
+	}
+	health := report.IntentStrategy.PlannerHealth
+	return health != nil &&
+		(health.State == daemon.IntentPlannerCircuitOpen ||
+			health.State == daemon.IntentPlannerCircuitHalfOpen)
+}
+
+func publicationStallThreshold(ctx context.Context, conn *sql.DB) time.Duration {
+	timeout := ai.LoadProviderConfigFromEnv().Timeout
+	if conn != nil {
+		if raw, ok, err := metaLookup(ctx, conn, "ai.timeout"); err == nil && ok {
+			if parsed, parseErr := time.ParseDuration(strings.TrimSpace(raw)); parseErr == nil && parsed > 0 {
+				timeout = parsed
+			}
+		}
+	}
+	threshold := 2*timeout + 30*time.Second
+	if threshold < 2*time.Minute {
+		threshold = 2 * time.Minute
+	}
+	return threshold
+}
+
+func ageExceedsThreshold(ageSeconds int64, threshold time.Duration) bool {
+	return time.Duration(ageSeconds)*time.Second >= threshold
+}
+
+func publicationPhaseCanStall(phase string) bool {
+	switch phase {
+	case "working", "intent_planning", "intent_processing", "event_publishing":
+		return true
+	default:
+		return false
+	}
+}
+
+func regularPublicationProgressBaseline(
+	ctx context.Context,
+	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
+) (float64, error) {
+	if conn == nil {
+		return 0, nil
+	}
+	var oldestPending sql.NullFloat64
+	pendingQuery := `SELECT MIN(captured_ts) FROM capture_events WHERE state=?`
+	pendingArgs := []any{state.EventStatePending}
+	if branchRef != "" {
+		pendingQuery += ` AND branch_ref=? AND branch_generation=?`
+		pendingArgs = append(pendingArgs, branchRef, branchGeneration)
+	}
+	if err := conn.QueryRowContext(ctx, pendingQuery,
+		pendingArgs...).Scan(&oldestPending); err != nil {
+		return 0, err
+	}
+	if !oldestPending.Valid || oldestPending.Float64 <= 0 {
+		return 0, nil
+	}
+	// The oldest still-pending capture is a conservative work-start baseline.
+	// Only durable publication after that point can move it forward. Newer
+	// captures and worker heartbeats intentionally do not reset the clock.
+	lastProgress := oldestPending.Float64
+	var latestPublished sql.NullFloat64
+	publishedQuery := `
+SELECT MAX(published_ts)
+FROM capture_events
+WHERE published_ts IS NOT NULL AND published_ts>=?`
+	publishedArgs := []any{oldestPending.Float64}
+	if branchRef != "" {
+		publishedQuery += ` AND branch_ref=? AND branch_generation=?`
+		publishedArgs = append(publishedArgs, branchRef, branchGeneration)
+	}
+	if err := conn.QueryRowContext(ctx, publishedQuery,
+		publishedArgs...).Scan(&latestPublished); err != nil {
+		return 0, err
+	}
+	if latestPublished.Valid && latestPublished.Float64 > lastProgress {
+		lastProgress = latestPublished.Float64
+	}
+	return lastProgress, nil
+}
+
+func intentWaitRemainingSeconds(report intentStrategyReport) int64 {
+	if report.BatchWaitReason == "skipped_due_intent_settle_window" {
+		return report.SettleTriggerInSeconds
+	}
+	return report.AgeTriggerInSeconds
 }
 
 func statusOperationalState(report statusReport) string {
@@ -526,16 +773,22 @@ func statusOperationalStateWithDaemonAlive(report statusReport, daemonAlive bool
 func readStatusPublicationDrain(
 	ctx context.Context,
 	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
 ) (publicationDrainReport, error) {
 	report := publicationDrainReport{Available: true}
+	if branchRef == "" {
+		return report, nil
+	}
 	var stagedConsent, stagedConsumed int
 	err := conn.QueryRowContext(ctx, `
 SELECT id,checkpoint_id,phase,target_event_count,published_event_count,
  semantic_rebuild_attempts,event_fallback_count,commit_count,fallback_mode,
- last_error,last_progress_ts,staged_consent,staged_consumed
-FROM publication_drains
-ORDER BY CASE WHEN phase NOT IN ('completed','needs_action') THEN 0 ELSE 1 END,
- updated_ts DESC,id DESC LIMIT 1`).Scan(
+	 last_error,last_progress_ts,staged_consent,staged_consumed
+	FROM publication_drains
+	WHERE branch_ref=? AND branch_generation=?
+	ORDER BY CASE WHEN phase NOT IN ('completed','needs_action') THEN 0 ELSE 1 END,
+	 updated_ts DESC,id DESC LIMIT 1`, branchRef, branchGeneration).Scan(
 		&report.ID, &report.CheckpointID, &report.Phase,
 		&report.TargetEvents, &report.PublishedEvents,
 		&report.SemanticRebuildAttempts, &report.EventFallbackCount,
@@ -551,6 +804,25 @@ ORDER BY CASE WHEN phase NOT IN ('completed','needs_action') THEN 0 ELSE 1 END,
 	report.StagedConsent = stagedConsent != 0
 	report.StagedConsumed = stagedConsumed != 0
 	return report, nil
+}
+
+func currentWorktreeReplayPair(
+	ctx context.Context,
+	conn *sql.DB,
+	repo string,
+) (string, int64, bool, error) {
+	branchRef, generation, ok, err := currentReplayPair(ctx, conn)
+	if err != nil || !ok {
+		return branchRef, generation, ok, err
+	}
+	currentBranch, err := git.RunBranchRef(ctx, repo)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("current worktree branch: %w", err)
+	}
+	if currentBranch != branchRef {
+		return "", 0, false, nil
+	}
+	return branchRef, generation, true, nil
 }
 
 func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval time.Duration) error {
@@ -701,9 +973,10 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	renderIntentV2Human(out, r.IntentV2)
 	renderSelfPublicationHuman(out, r.SelfPublication, "")
 	renderPublicationDrainHuman(out, r.PublicationDrain)
+	renderProductPublicationProgress(out, r.PublicationProgress)
 	fmt.Fprintf(out, "Operational state: %s", valueOrUnset(r.OperationalState))
 	if r.Busy {
-		fmt.Fprint(out, " (heartbeat fresh; work in progress)")
+		fmt.Fprint(out, " (worker responsive; progress shown separately)")
 	}
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "Worktree clean: %s\n", yesNo(r.WorktreeClean))
@@ -819,7 +1092,8 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 }
 
 func renderPublicationDrainHuman(out io.Writer, drain publicationDrainReport) {
-	if !drain.Available || drain.ID == "" {
+	if !drain.Available || drain.ID == "" ||
+		drain.Phase == state.PublicationDrainCompleted {
 		return
 	}
 	fmt.Fprintf(out,

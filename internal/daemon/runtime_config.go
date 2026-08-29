@@ -39,6 +39,7 @@ type RuntimeBundle struct {
 	HealthIdentity            IntentPlannerProviderIdentity
 	HealthFingerprint         string
 	Model                     string
+	ProviderTimeout           time.Duration
 	DiffEgress                bool
 	IntentIncludeDiffs        bool
 	CommitStrategy            ai.CommitStrategy
@@ -65,6 +66,53 @@ type RuntimeBundle struct {
 	ExperimentID              int64
 	ExperimentBaselineID      int64
 	ExperimentPolicy          string
+}
+
+func stampRuntimeStatusMeta(
+	ctx context.Context,
+	db *state.DB,
+	bundle *RuntimeBundle,
+) error {
+	if db == nil || bundle == nil {
+		return nil
+	}
+	provider := bundle.HealthIdentity.Provider
+	if provider == "" && bundle.Provider != nil {
+		provider = ai.PrimaryProviderName(bundle.Provider)
+	}
+	values := map[string]string{
+		"runtime.active_revision_id": strconv.FormatInt(bundle.RevisionID, 10),
+		"ai.provider":                provider,
+		"ai.model":                   bundle.Model,
+		"ai.timeout":                 bundle.ProviderTimeout.String(),
+		"commit.strategy":            string(bundle.CommitStrategy),
+		"commit.format":              string(bundle.CommitFormat),
+		"intent.window":              strconv.Itoa(bundle.IntentWindow),
+		"intent.min_pending":         strconv.Itoa(bundle.IntentMinPending),
+		"intent.settle_window":       bundle.IntentSettleWindow.String(),
+		"intent.max_pending_age":     bundle.IntentMaxPendingAge.String(),
+		"intent.recent_commits":      strconv.Itoa(bundle.IntentRecentCommits),
+		"intent.defer_limit":         strconv.Itoa(bundle.IntentDeferLimit),
+		"intent.diff_egress":         strconv.FormatBool(bundle.DiffEgress),
+		"publication.runtime.ready": strconv.FormatBool(
+			bundle.ReplayBlockedReason == ""),
+	}
+	// Publication drains freeze only a bundle that is currently allowed to
+	// publish. A blocked bundle invalidates the prepare-time projection while
+	// existing drains continue to own their immutable row-level contract.
+	if bundle.ReplayBlockedReason == "" {
+		values["publication.runtime.commit_strategy"] =
+			string(bundle.CommitStrategy)
+		values["publication.runtime.commit_format"] =
+			string(bundle.CommitFormat)
+		values["publication.runtime.config_revision_id"] =
+			strconv.FormatInt(bundle.RevisionID, 10)
+		values["publication.runtime.provider"] = provider
+		values["publication.runtime.provider_model"] = bundle.Model
+		values["publication.runtime.provider_fingerprint"] =
+			bundle.HealthFingerprint
+	}
+	return setRuntimeMetaIfChanged(ctx, db, values)
 }
 
 type runtimeBundleBuildFunc func(ai.ProviderConfig) (ai.Provider, io.Closer, error)
@@ -136,10 +184,12 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 	var provider ai.Provider
 	var closer io.Closer
 	plannerUnavailable := false
+	var plannerUnavailableErr error
 	if blockedReason == "" {
 		provider, closer, err = build(cfg)
 		if err != nil {
 			if cfg.CommitStrategy == ai.CommitStrategyIntent {
+				plannerUnavailableErr = err
 				// Fast and Balanced have explicit provider-failure fallback
 				// policies. Keep replay eligible with no planner so the
 				// candidate engine can apply those policies. Quality is
@@ -172,15 +222,32 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 	}
 	messageFn := providerMessageFnWithPromptTrace(provider, repoRoot, b.PromptTrace)
 	planner, ok := provider.(ai.IntentPlanner)
+	semanticProviderUnavailable := cfg.CommitStrategy == ai.CommitStrategyIntent &&
+		configuredIntentProviderRequiresSemanticMessages(cfg.Mode) &&
+		(blockedReason != "" || plannerUnavailable)
+	if semanticProviderUnavailable {
+		cause := plannerUnavailableErr
+		if cause == nil {
+			cause = errors.New(blockedReason)
+		}
+		planner = unavailableIntentPlanner{
+			provider: configuredIntentProviderName(cfg.Mode),
+			cause:    errors.New(ai.SanitizePlannerError(cause.Error())),
+		}
+		ok = true
+	}
 	if cfg.CommitStrategy == ai.CommitStrategyIntent && !ok &&
 		blockedReason == "" && !plannerUnavailable {
 		return nil, errors.New("runtime config: provider does not support intent planning")
 	}
-	if cfg.CommitStrategy != ai.CommitStrategyIntent || blockedReason != "" ||
-		plannerUnavailable {
+	if cfg.CommitStrategy != ai.CommitStrategyIntent ||
+		(blockedReason != "" && !semanticProviderUnavailable) {
 		planner = nil
 	}
 	providerName := ai.PrimaryProviderName(provider)
+	if semanticProviderUnavailable {
+		providerName = configuredIntentProviderName(cfg.Mode)
+	}
 	model := ""
 	if providerName == "openai-compat" {
 		model = cfg.Model
@@ -203,7 +270,8 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 		RevisionID: revision.ID, Profile: revision.Profile,
 		Provider: provider, ProviderCloser: closer, MessageFn: messageFn,
 		IntentPlanner: planner, IntentHealth: health, HealthIdentity: identity,
-		HealthFingerprint: fingerprint, Model: model, DiffEgress: cfg.DiffEgress,
+		HealthFingerprint: fingerprint, Model: model,
+		ProviderTimeout: cfg.Timeout, DiffEgress: cfg.DiffEgress,
 		IntentIncludeDiffs: intentIncludeDiffs,
 		CommitStrategy:     cfg.CommitStrategy, CommitFormat: cfg.CommitFormat,
 		PresetID: metadata.PresetID, PresetVersion: metadata.PresetVersion,
@@ -924,6 +992,83 @@ func (m *RuntimeBundleManager) ActivateDesired(ctx context.Context) error {
 		continue
 	}
 	return errors.New("runtime config: desired revision changed too frequently")
+}
+
+// ActivatePublicationDrainRevision leases an already-applied immutable
+// revision for a drain without changing the user's desired configuration.
+// Desired activation resumes after the drain completes.
+func (m *RuntimeBundleManager) ActivatePublicationDrainRevision(
+	ctx context.Context,
+	drain state.PublicationDrain,
+) error {
+	if m == nil {
+		return nil
+	}
+	current := m.Current()
+	if publicationDrainRuntimeIdentityBlock(drain, current) == "" {
+		return nil
+	}
+	if drain.ConfigRevisionID <= 0 {
+		return errors.New(
+			"runtime config: frozen environment publication contract is no longer active")
+	}
+	revision, err := state.ConfigRevisionByID(
+		ctx, m.db, drain.ConfigRevisionID)
+	if err != nil {
+		return err
+	}
+	if reason := publicationDrainRevisionIdentityBlock(
+		revision, drain); reason != "" {
+		return fmt.Errorf("runtime config: frozen publication drain contract mismatch: %s", reason)
+	}
+	candidate, err := m.builder.BuildRevision(ctx, revision, current)
+	if err != nil {
+		return err
+	}
+	if reason := publicationDrainRuntimeIdentityBlock(
+		drain, candidate); reason != "" {
+		m.closeBundle(candidate)
+		return fmt.Errorf("runtime config: frozen publication drain contract mismatch: %s", reason)
+	}
+	m.swap(candidate)
+	return nil
+}
+
+func publicationDrainRevisionIdentityBlock(
+	revision state.ConfigRevision,
+	drain state.PublicationDrain,
+) string {
+	values, _, _, err := decodeRuntimeSnapshot(revision.SnapshotJSON)
+	if err != nil {
+		return "publication_drain_runtime_revision_invalid"
+	}
+	strategy := strings.TrimSpace(values[acdconfig.FieldCommitStrategy])
+	if strategy == "" {
+		strategy = string(ai.CommitStrategyEvent)
+	}
+	format := strings.TrimSpace(values[acdconfig.FieldCommitFormat])
+	if format == "" {
+		format = string(ai.CommitFormatImperative)
+	}
+	provider := configuredIntentProviderName(values[acdconfig.FieldProvider])
+	model := ""
+	if provider == "openai-compat" {
+		model = strings.TrimSpace(values[acdconfig.FieldModel])
+	}
+	switch {
+	case revision.ID != drain.ConfigRevisionID:
+		return "publication_drain_runtime_revision_mismatch"
+	case strategy != drain.CommitStrategy:
+		return "publication_drain_runtime_strategy_mismatch"
+	case format != drain.CommitFormat:
+		return "publication_drain_runtime_format_mismatch"
+	case provider != drain.Provider:
+		return "publication_drain_runtime_provider_mismatch"
+	case model != drain.ProviderModel:
+		return "publication_drain_runtime_model_mismatch"
+	default:
+		return ""
+	}
 }
 
 // QueueExperimentRevert is called only between passes. State performs expiry

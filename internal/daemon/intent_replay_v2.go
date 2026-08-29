@@ -142,7 +142,8 @@ func replayIntentCandidateBatch(
 		!errors.As(err, &preflightErr) {
 		return sum, err
 	}
-	if cfg.atomicFallback {
+	if cfg.atomicFallback &&
+		evaluation.ResolutionMode != "waiting_message_rewrite" {
 		evaluation.ResolutionMode = publicationFallbackLocalUnlock
 	}
 	if counted := attemptCounter.RetryCount(); counted > evaluation.RetryCount {
@@ -328,7 +329,9 @@ func replayIntentCandidateBatch(
 		}
 	}
 	if !publishedAny {
-		if forced && len(items) == 1 && opts.PublicationDrain == nil &&
+		messageRewriteWait := evaluation.Fallback == "waiting_message_rewrite"
+		if !messageRewriteWait && forced && len(items) == 1 &&
+			opts.PublicationDrain == nil &&
 			intentRecoveryItemQuiescent(items[0], cfg) {
 			recovered, handled, recoveryErr :=
 				startFailedIntentCheckpointRecovery(
@@ -339,7 +342,17 @@ func replayIntentCandidateBatch(
 			}
 		}
 		sum.Skipped = true
-		if evaluation.NeedsAttention {
+		if messageRewriteWait {
+			sum.SkippedReason = "intent_v2_waiting_message_rewrite"
+			sum.Disposition = ReplayDispositionTransientWait
+			sum.DispositionReason = evaluation.PlannerFailure
+			// Active drains and forward recovery own a frozen target and need an
+			// immediate follow-up pass. Ordinary candidate windows can wait for
+			// the normal poll/circuit cooldown instead of spinning while the
+			// provider remains unavailable.
+			sum.HasMore = publicationDrainMessageRewriteWait(
+				opts, cfg, evaluation)
+		} else if evaluation.NeedsAttention {
 			sum.SkippedReason = "intent_v2_needs_attention"
 			sum.Disposition = ReplayDispositionNeedsAttention
 			sum.DispositionReason = evaluation.PlannerFailure
@@ -348,6 +361,15 @@ func replayIntentCandidateBatch(
 		}
 	}
 	return sum, nil
+}
+
+func publicationDrainMessageRewriteWait(
+	opts ReplayOpts,
+	cfg intentReplayConfig,
+	evaluation IntentCandidateEvaluationResult,
+) bool {
+	return evaluation.Fallback == "waiting_message_rewrite" &&
+		(cfg.atomicFallback || opts.PublicationDrain != nil)
 }
 
 func intentRecoveryItemQuiescent(
@@ -496,6 +518,10 @@ func updateIntentForwardRecoveryAfterReplay(
 		sum.HasMore = true
 		return sum, nil
 	}
+	if intentForwardRecoveryTransientWait(sum) {
+		sum.HasMore = true
+		return sum, nil
+	}
 	if recovery.Stage == publicationFallbackSemanticReplan {
 		if _, err := state.AdvanceIntentForwardRecovery(
 			ctx, db, recovery, publicationFallbackLocalUnlock, 0); err != nil {
@@ -510,6 +536,23 @@ func updateIntentForwardRecoveryAfterReplay(
 		sum.HasMore = true
 	}
 	return sum, nil
+}
+
+func intentForwardRecoveryTransientWait(sum ReplaySummary) bool {
+	if sum.Disposition == ReplayDispositionTransientWait {
+		return true
+	}
+	if !sum.Skipped {
+		return false
+	}
+	switch sum.SkippedReason {
+	case "skipped_due_path_quiescence",
+		"skipped_due_intent_settle_window",
+		"skipped_due_intent_batch_wait":
+		return true
+	default:
+		return false
+	}
 }
 
 func logIntentForwardRecoveryTransition(
@@ -543,6 +586,7 @@ func intentRepairSupportsForwardRecovery(reason string) bool {
 	switch reason {
 	case "repair_horizon_expired",
 		"repair_commit_outside_suffix",
+		"repair_final_tree_mismatch",
 		"repair_suffix_not_acd_owned",
 		"repair_repartition_not_proven",
 		"repair_repartition_dependency",
@@ -940,7 +984,9 @@ func materializeIntentCandidateTreeFromSeed(
 			return "", fmt.Errorf("daemon: intent v2 materialize: capture %d has no ops",
 				capture.Event.Seq)
 		}
-		if reason, err := detectConflict(ctx, repoRoot, index, capture.Ops); err != nil {
+		if reason, err := detectConflictWithIdempotentUpdates(
+			ctx, repoRoot, index, capture.Ops,
+		); err != nil {
 			return "", err
 		} else if reason != "" {
 			return "", errors.New(reason)
@@ -1047,13 +1093,16 @@ func repairIntentCandidateDecision(
 	}
 	baseParent := strings.TrimSpace(string(baseOut))
 	captures := make([]IntentCandidateCapture, 0, len(selected))
+	pendingCaptures := make([]IntentCandidateCapture, 0, len(selected))
 	paths := make(map[string]struct{})
 	pendingCount := 0
 	for _, item := range selected {
-		captures = append(captures, IntentCandidateCapture{
+		capture := IntentCandidateCapture{
 			Event: item.event, Ops: item.ops,
-		})
+		}
+		captures = append(captures, capture)
 		if item.event.State == state.EventStatePending {
+			pendingCaptures = append(pendingCaptures, capture)
 			pendingCount += 1 + coverLen(item.coalesce)
 		}
 		for _, path := range touchedPaths(item.ops) {
@@ -1166,6 +1215,28 @@ func repairIntentCandidateDecision(
 			Message:     strings.TrimRight(string(oldMessage), "\n"),
 			AuthorOID:   oldOID,
 		})
+	}
+	expectedFinalTree, err := resolveTreeOID(ctx, repoRoot, currentParent)
+	if err != nil {
+		return IntentRepairResult{}, 0, err
+	}
+	if len(pendingCaptures) > 0 {
+		expectedFinalTree, err = materializeIntentCandidateTreeFromSeed(
+			ctx, repoRoot, gitDir, currentParent, pendingCaptures, false)
+		if err != nil {
+			return IntentRepairResult{}, 0, fmt.Errorf(
+				"daemon: intent v2 repair: materialize expected final tree: %w", err)
+		}
+	}
+	// Regrouping may change commit boundaries, but its final tree must equal
+	// the current HEAD with only the still-pending captures applied. This
+	// catches stale or misattributed commit ownership before repair can drop
+	// unrelated content from the suffix.
+	if seedTree != expectedFinalTree {
+		return IntentRepairResult{
+			Status: state.IntentRepairSkipped,
+			Reason: "repair_final_tree_mismatch",
+		}, 0, nil
 	}
 	pathList := make([]string, 0, len(paths))
 	for path := range paths {

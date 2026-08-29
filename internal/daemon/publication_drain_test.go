@@ -190,6 +190,56 @@ func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
 	}
 }
 
+func TestConfigureAtomicIntentFallbackPreservesSemanticProvider(t *testing.T) {
+	planner := &recoveringPublicationDrainPlanner{}
+	health := &IntentPlannerHealth{}
+	cfg := intentReplayConfig{
+		planner: planner, health: health,
+		plannerProvider: planner.Name(), plannerModel: "semantic-model",
+		commitFormat: ai.CommitFormatImperative,
+	}
+
+	configureAtomicIntentFallback(&cfg)
+
+	wrapped, ok := cfg.planner.(publicationDrainAtomicFallbackPlanner)
+	if !ok {
+		t.Fatalf("planner=%T, want atomic fallback wrapper", cfg.planner)
+	}
+	if wrapped.messagePlanner != planner || !wrapped.requireSemanticMessage {
+		t.Fatalf("wrapper=%+v, want configured semantic planner", wrapped)
+	}
+	if cfg.plannerProvider != planner.Name() ||
+		cfg.plannerModel != "semantic-model" || cfg.health != health {
+		t.Fatalf("provider identity or health changed: %+v", cfg)
+	}
+}
+
+func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
+	t *testing.T,
+) {
+	cfg := intentReplayConfig{
+		planner: ai.DeterministicProvider{}, plannerProvider: "deterministic",
+	}
+	configureAtomicIntentFallback(&cfg)
+	planner := cfg.planner.(publicationDrainAtomicFallbackPlanner)
+	if planner.requireSemanticMessage {
+		t.Fatal("explicit deterministic provider unexpectedly requires rewrite")
+	}
+	plan, err := planner.PlanIntentV2(context.Background(), ai.IntentPlanRequestV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		OfferedCaptures: []ai.OfferedCapture{{
+			Seq: 1, Path: "replay.go", Op: "modify",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Candidates) != 1 ||
+		plan.Candidates[0].Subject != "Update replay.go" {
+		t.Fatalf("plan=%+v", plan)
+	}
+}
+
 func TestConfigureIntentForwardRecoveryPreservesPathQuiescence(t *testing.T) {
 	health := &IntentPlannerHealth{}
 	cfg := intentReplayConfig{pathQuiescence: 30 * time.Second}
@@ -299,7 +349,7 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 	for _, event := range pending {
 		drain.EventSeqs = append(drain.EventSeqs, event.Seq)
 	}
-	planner := &forbiddenPublicationDrainPlanner{}
+	planner := &recoveringPublicationDrainPlanner{}
 	opts := ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
 		IntentPlanner: planner, IntentPreset: config.PresetFast,
@@ -307,9 +357,19 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 		PublicationDrain: &drain,
 	}
 	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
-	if err != nil || first.Published != 1 || planner.calls != 0 {
-		t.Fatalf("first fallback=%+v provider_calls=%d err=%v",
-			first, planner.calls, err)
+	if err != nil || first.Published != 1 || planner.calls != 0 ||
+		planner.rewriteCalls != 1 {
+		t.Fatalf("first fallback=%+v planner_calls=%d rewrite_calls=%d err=%v",
+			first, planner.calls, planner.rewriteCalls, err)
+	}
+	if len(planner.rewriteRequests) != 1 ||
+		len(planner.rewriteRequests[0].LockedPlan.SelectedSeqs) != 1 {
+		t.Fatalf("locked rewrite requests=%+v", planner.rewriteRequests)
+	}
+	if subject := strings.TrimSpace(mustGitOutput(
+		t, f.dir, "show", "-s", "--format=%s", "HEAD",
+	)); subject != "Publish safe dependency group" {
+		t.Fatalf("local unlock subject=%q", subject)
 	}
 	f.cctx.BaseHead = first.BaseHead
 	drain.FallbackMode = publicationFallbackSemanticReplan
@@ -329,6 +389,83 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 	remaining, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil || len(remaining) != 0 {
 		t.Fatalf("remaining=%+v err=%v", remaining, err)
+	}
+}
+
+func TestPublicationDrainLocalUnlockWaitsForSemanticMessage(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "replay.go"),
+		[]byte("package replay\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	drain := state.PublicationDrain{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		Phase: state.PublicationDrainEventFallback, TargetEventCount: 1,
+		FallbackMode: publicationFallbackLocalUnlock,
+		EventSeqs:    []int64{pending[0].Seq},
+	}
+	planner := &recoveringPublicationDrainPlanner{
+		rewriteErr: errors.New("semantic provider unavailable"),
+	}
+	retryLimit := 0
+	before := f.cctx.BaseHead
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetFast,
+		IntentRetryLimit: &retryLimit, IntentBypassBatchWait: true,
+		IntentWindow: 10, PublicationDrain: &drain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Published != 0 || !sum.Skipped ||
+		sum.SkippedReason != "intent_v2_waiting_message_rewrite" ||
+		sum.Disposition != ReplayDispositionTransientWait || !sum.HasMore {
+		t.Fatalf("summary=%+v, want retryable semantic-message wait", sum)
+	}
+	if planner.calls != 0 || planner.rewriteCalls == 0 {
+		t.Fatalf("planner_calls=%d rewrite_calls=%d",
+			planner.calls, planner.rewriteCalls)
+	}
+	after, err := gitpkg.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("HEAD=%s want unchanged %s", after, before)
+	}
+	remaining, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(remaining) != 1 ||
+		remaining[0].Seq != pending[0].Seq {
+		t.Fatalf("remaining=%+v err=%v", remaining, err)
+	}
+}
+
+func TestPublicationDrainSemanticMessageWaitIsTransient(t *testing.T) {
+	drain := state.PublicationDrain{Phase: state.PublicationDrainSemantic}
+	evaluation := IntentCandidateEvaluationResult{
+		Fallback: "waiting_message_rewrite",
+	}
+	if !publicationDrainMessageRewriteWait(
+		ReplayOpts{PublicationDrain: &drain}, intentReplayConfig{}, evaluation) {
+		t.Fatal("semantic drain message wait was not retryable")
+	}
+	if publicationDrainMessageRewriteWait(
+		ReplayOpts{}, intentReplayConfig{}, evaluation) {
+		t.Fatal("ordinary candidate message failure became an unbounded wait")
 	}
 }
 
@@ -446,8 +583,11 @@ type forbiddenPublicationDrainPlanner struct {
 }
 
 type recoveringPublicationDrainPlanner struct {
-	calls    int
-	requests []ai.IntentPlanRequestV2
+	calls           int
+	rewriteCalls    int
+	requests        []ai.IntentPlanRequestV2
+	rewriteRequests []ai.IntentMessageRewriteRequest
+	rewriteErr      error
 }
 
 func (*recoveringPublicationDrainPlanner) Name() string {
@@ -480,6 +620,21 @@ func (p *recoveringPublicationDrainPlanner) PlanIntentV2(
 			Subject:        "Finish remaining intent",
 			GroupingReason: "the remaining changes share one purpose",
 		}},
+	}, nil
+}
+
+func (p *recoveringPublicationDrainPlanner) RewriteIntentMessage(
+	_ context.Context,
+	req ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	p.rewriteCalls++
+	p.rewriteRequests = append(p.rewriteRequests, req)
+	if p.rewriteErr != nil {
+		return ai.Result{}, p.rewriteErr
+	}
+	return ai.Result{
+		Subject: "Publish safe dependency group",
+		Source:  p.Name(),
 	}, nil
 }
 
@@ -610,6 +765,106 @@ WHERE seq=?`, events[0].Seq); err != nil {
 	if err != nil || continued.FallbackMode != publicationFallbackLocalUnlock ||
 		continued.EventFallbackCount != drain.EventFallbackCount {
 		t.Fatalf("continued local unlock=(%+v,%v)", continued, err)
+	}
+}
+
+func TestPublicationDrainUnknownRuntimeContractNeedsAction(t *testing.T) {
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 1, 1)
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE publication_drains
+SET commit_strategy='',commit_format='',config_revision_id=0,
+    provider='',provider_model='',provider_fingerprint=''
+WHERE id=?`, drain.ID); err != nil {
+		t.Fatal(err)
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := &RuntimeBundle{
+		Provider:       &runtimeTestProvider{name: "deterministic"},
+		CommitStrategy: ai.CommitStrategyEvent,
+		CommitFormat:   ai.CommitFormatImperative,
+	}
+	reason := publicationDrainRuntimeBlock(drain, bundle)
+	if reason != "publication_drain_runtime_contract_unavailable" {
+		t.Fatalf("runtime block=%q", reason)
+	}
+	failed, err := failPublicationDrainRuntimeContract(
+		ctx, db, drain, reason, time.Unix(12, 0).UTC())
+	if err != nil || failed.Phase != state.PublicationDrainNeedsAction ||
+		failed.LastError != reason {
+		t.Fatalf("failed drain=%+v err=%v", failed, err)
+	}
+	barrier, err := PublicationDrainBarrierForPair(
+		ctx, db, drain.BranchRef, drain.BranchGeneration)
+	if err != nil || barrier == nil || barrier.ID != drain.ID ||
+		barrier.Phase != state.PublicationDrainNeedsAction {
+		t.Fatalf("needs-action replay barrier=%+v err=%v", barrier, err)
+	}
+	if active, err := ActivePublicationDrainForPair(
+		ctx, db, drain.BranchRef, drain.BranchGeneration); err != nil || active != nil {
+		t.Fatalf("active lookup=%+v err=%v", active, err)
+	}
+	second := drain
+	second.ID = "second-drain-daemon-test"
+	second.Phase = state.PublicationDrainCheckpointing
+	second.LastError = ""
+	second.UpdatedTS = 13
+	if created, err := state.PreparePublicationDrain(ctx, db, second); created || !errors.Is(err, state.ErrPublicationDrainBarrier) {
+		t.Fatalf("second drain across needs-action barrier=(%t,%v)", created, err)
+	}
+}
+
+func TestPublicationDrainConvergingRuntimeMismatchStaysActive(t *testing.T) {
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 1, 1)
+	drain, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := publicationDrainRuntimeBlock(drain, &RuntimeBundle{
+		RevisionID:     99,
+		Provider:       &runtimeTestProvider{name: "deterministic"},
+		CommitStrategy: ai.CommitStrategyEvent,
+		CommitFormat:   ai.CommitFormatImperative,
+	})
+	if reason != "publication_drain_runtime_revision_mismatch" {
+		t.Fatalf("runtime block=%q", reason)
+	}
+	if _, err := failPublicationDrainRuntimeContract(
+		ctx, db, drain, reason, time.Unix(12, 0).UTC()); err == nil {
+		t.Fatal("converging mismatch unexpectedly terminalized")
+	}
+	loaded, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil || loaded.Phase != state.PublicationDrainCheckpointing {
+		t.Fatalf("active drain=%+v err=%v", loaded, err)
+	}
+}
+
+func TestPublicationDrainEnvironmentRuntimeChangeNeedsAction(t *testing.T) {
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 1, 1)
+	drain, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := publicationDrainRuntimeBlock(drain, &RuntimeBundle{
+		Provider:       &runtimeTestProvider{name: "openai-compat"},
+		CommitStrategy: ai.CommitStrategyIntent,
+		CommitFormat:   ai.CommitFormatImperative,
+		HealthIdentity: IntentPlannerProviderIdentity{Provider: "openai-compat"},
+	})
+	terminalReason := publicationDrainTerminalRuntimeReason(drain, reason)
+	if terminalReason != "publication_drain_environment_runtime_changed" {
+		t.Fatalf("terminal runtime reason=%q block=%q", terminalReason, reason)
+	}
+	failed, err := failPublicationDrainRuntimeContract(
+		ctx, db, drain, terminalReason, time.Unix(12, 0).UTC())
+	if err != nil || failed.Phase != state.PublicationDrainNeedsAction ||
+		failed.LastError != terminalReason {
+		t.Fatalf("failed environment drain=%+v err=%v", failed, err)
 	}
 }
 

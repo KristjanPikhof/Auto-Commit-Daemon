@@ -168,6 +168,201 @@ func TestReconcileUnpublishedChainProvesPublishedAcrossCompletedRepairs(t *testi
 	}
 }
 
+func TestReconcileUnpublishedChainUsesRestoredPreRepairContext(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	b, _ := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	c, _ := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	marker, _ := git.HashObjectStdin(ctx, f.dir, []byte("repair\n"))
+
+	base := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead,
+		"seed recovery base", git.RegularFileMode+" "+a+"\tdoc.md")
+	contextCommit := commitTreeWithIndexUpdates(t, ctx, f, base,
+		"publish intermediate state", git.RegularFileMode+" "+c+"\tdoc.md")
+	originalHead := commitTreeWithIndexUpdates(t, ctx, f, contextCommit,
+		"publish final state", git.RegularFileMode+" "+b+"\tdoc.md")
+	repairedHead := commitTreeWithIndexUpdates(t, ctx, f, contextCommit,
+		"rewrite different state", git.RegularFileMode+" "+marker+"\trepair.txt")
+	if err := git.UpdateRef(
+		ctx, f.dir, f.cctx.BranchRef, originalHead, f.cctx.BaseHead); err != nil {
+		t.Fatalf("restore original head: %v", err)
+	}
+	recordCompletedRepairMapping(
+		t, ctx, f, "completed-repair-restored-source", originalHead, repairedHead)
+
+	intermediateSeq := appendRecoveryEvent(t, ctx, f, base, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID:  sql.NullString{String: a, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: c, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := state.MarkEventPublished(ctx, f.db, intermediateSeq,
+		state.EventStatePublished,
+		sql.NullString{String: contextCommit, Valid: true},
+		sql.NullString{}, sql.NullString{}, 1); err != nil {
+		t.Fatalf("mark intermediate context published: %v", err)
+	}
+	originalSeq := appendRecoveryEvent(t, ctx, f, contextCommit, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID:  sql.NullString{String: c, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: b, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := state.MarkEventPublished(ctx, f.db, originalSeq,
+		state.EventStatePublished,
+		sql.NullString{String: originalHead, Valid: true},
+		sql.NullString{}, sql.NullString{}, 2); err != nil {
+		t.Fatalf("mark original context published: %v", err)
+	}
+	pendingSeq := appendRecoveryEvent(t, ctx, f, base, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID:  sql.NullString{String: a, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: b, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	opts := RecoveryReconcileOptions{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq: pendingSeq, GitDir: f.gitDir,
+	}
+
+	proved, err := ProveUnpublishedChain(ctx, f.dir, f.db, opts)
+	if err != nil {
+		t.Fatalf("prove restored-source recovery: %v", err)
+	}
+	if !proved.Handled || proved.Outcome != state.EventStatePublished ||
+		proved.EventCount != 1 {
+		t.Fatalf("proof=%+v want one-event published chain", proved)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, opts)
+	if err != nil {
+		t.Fatalf("reconcile restored-source recovery: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStatePublished ||
+		result.CommitOID != originalHead || result.EventCount != 1 {
+		t.Fatalf("result=%+v want published at restored head %s",
+			result, originalHead)
+	}
+	if gotState, gotOID := readEventState(
+		t, ctx, f.db, pendingSeq); gotState != state.EventStatePublished ||
+		!gotOID.Valid || gotOID.String != originalHead {
+		t.Fatalf("pending state=%q oid=%v want published at %s",
+			gotState, gotOID, originalHead)
+	}
+}
+
+func TestReconcileUnpublishedChainUsesRestoredIntermediateRepairContext(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	b, _ := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	c, _ := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	firstMarker, _ := git.HashObjectStdin(ctx, f.dir, []byte("repair one\n"))
+	secondMarker, _ := git.HashObjectStdin(ctx, f.dir, []byte("repair two\n"))
+
+	base := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead,
+		"seed recovery base", git.RegularFileMode+" "+a+"\tdoc.md")
+	contextCommit := commitTreeWithIndexUpdates(t, ctx, f, base,
+		"publish intermediate state", git.RegularFileMode+" "+c+"\tdoc.md")
+	originalHead := commitTreeWithIndexUpdates(t, ctx, f, contextCommit,
+		"publish final state", git.RegularFileMode+" "+b+"\tdoc.md")
+	intermediateRepair := commitTreeWithIndexUpdates(t, ctx, f, contextCommit,
+		"first repair",
+		git.RegularFileMode+" "+b+"\tdoc.md",
+		git.RegularFileMode+" "+firstMarker+"\trepair-one.txt")
+	finalRepair := commitTreeWithIndexUpdates(t, ctx, f, contextCommit,
+		"second repair",
+		git.RegularFileMode+" "+c+"\tdoc.md",
+		git.RegularFileMode+" "+secondMarker+"\trepair-two.txt")
+	if err := git.UpdateRef(
+		ctx, f.dir, f.cctx.BranchRef, intermediateRepair,
+		f.cctx.BaseHead); err != nil {
+		t.Fatalf("restore intermediate repair head: %v", err)
+	}
+	recordCompletedRepairMapping(
+		t, ctx, f, "completed-repair-original", originalHead,
+		intermediateRepair)
+	recordCompletedRepairMapping(
+		t, ctx, f, "completed-repair-intermediate", intermediateRepair,
+		finalRepair)
+
+	chain, err := state.CompletedIntentRepairCommitChain(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, originalHead)
+	if err != nil {
+		t.Fatalf("load completed repair chain: %v", err)
+	}
+	wantChain := []string{originalHead, intermediateRepair, finalRepair}
+	if len(chain) != len(wantChain) {
+		t.Fatalf("repair chain=%v want %v", chain, wantChain)
+	}
+	for i := range wantChain {
+		if chain[i] != wantChain[i] {
+			t.Fatalf("repair chain=%v want %v", chain, wantChain)
+		}
+	}
+
+	intermediateSeq := appendRecoveryEvent(t, ctx, f, base, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID:  sql.NullString{String: a, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: c, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := state.MarkEventPublished(ctx, f.db, intermediateSeq,
+		state.EventStatePublished,
+		sql.NullString{String: contextCommit, Valid: true},
+		sql.NullString{}, sql.NullString{}, 1); err != nil {
+		t.Fatalf("mark intermediate context published: %v", err)
+	}
+	originalSeq := appendRecoveryEvent(t, ctx, f, contextCommit, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID:  sql.NullString{String: c, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: b, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	if err := state.MarkEventPublished(ctx, f.db, originalSeq,
+		state.EventStatePublished,
+		sql.NullString{String: originalHead, Valid: true},
+		sql.NullString{}, sql.NullString{}, 2); err != nil {
+		t.Fatalf("mark original context published: %v", err)
+	}
+	pendingSeq := appendRecoveryEvent(t, ctx, f, base, state.CaptureOp{
+		Op: "modify", Path: "doc.md",
+		BeforeOID:  sql.NullString{String: a, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: b, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+	})
+	opts := RecoveryReconcileOptions{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		FirstSeq: pendingSeq, GitDir: f.gitDir,
+	}
+
+	proved, err := ProveUnpublishedChain(ctx, f.dir, f.db, opts)
+	if err != nil {
+		t.Fatalf("prove restored-intermediate recovery: %v", err)
+	}
+	if !proved.Handled || proved.Outcome != state.EventStatePublished ||
+		proved.EventCount != 1 {
+		t.Fatalf("proof=%+v want one-event published chain", proved)
+	}
+
+	result, err := ReconcileUnpublishedChain(ctx, f.dir, f.db, opts)
+	if err != nil {
+		t.Fatalf("reconcile restored-intermediate recovery: %v", err)
+	}
+	if !result.Handled || result.Outcome != state.EventStatePublished ||
+		result.CommitOID != intermediateRepair || result.EventCount != 1 {
+		t.Fatalf("result=%+v want published at restored head %s",
+			result, intermediateRepair)
+	}
+}
+
 func recordCompletedRepairMapping(
 	t *testing.T,
 	ctx context.Context,

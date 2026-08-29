@@ -480,11 +480,13 @@ func Run(ctx context.Context, opts Options) error {
 
 	msgFn := opts.MessageFn
 	provider := opts.MessageProvider
+	var providerBuildErr error
 	needsProvider := msgFn == nil || (providerCfg.CommitStrategy == ai.CommitStrategyIntent && opts.IntentPlanner == nil)
 	if provider == nil && needsProvider {
 		built, closer, err := ai.BuildProvider(providerCfg)
 		if err != nil {
-			logger.Warn("build ai provider; falling back to deterministic",
+			providerBuildErr = err
+			logger.Warn("build ai provider",
 				"err", err.Error())
 			provider = ai.DeterministicProvider{CommitFormat: providerCfg.CommitFormat}
 		} else {
@@ -524,8 +526,31 @@ func Run(ctx context.Context, opts Options) error {
 	// are reused and closed exactly once with the message provider.
 	runIntentPlanner := opts.IntentPlanner
 	if providerCfg.CommitStrategy == ai.CommitStrategyIntent && runIntentPlanner == nil {
-		if planner, ok := provider.(ai.IntentPlanner); ok {
+		if providerBuildErr != nil &&
+			configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
+			runIntentPlanner = unavailableIntentPlanner{
+				provider: configuredIntentProviderName(providerCfg.Mode),
+				cause: errors.New(ai.SanitizePlannerError(
+					providerBuildErr.Error())),
+			}
+		} else if configuredIntentProviderRequiresSemanticMessages(
+			providerCfg.Mode,
+		) && ai.PrimaryProviderName(provider) == "deterministic" {
+			runIntentPlanner = unavailableIntentPlanner{
+				provider: configuredIntentProviderName(providerCfg.Mode),
+				cause: errors.New(
+					"configured provider could not be constructed"),
+			}
+		} else if planner, ok := provider.(ai.IntentPlanner); ok {
 			runIntentPlanner = planner
+		} else if configuredIntentProviderRequiresSemanticMessages(
+			providerCfg.Mode,
+		) {
+			runIntentPlanner = unavailableIntentPlanner{
+				provider: configuredIntentProviderName(providerCfg.Mode),
+				cause: fmt.Errorf("provider %q does not implement intent planning",
+					provider.Name()),
+			}
 		} else {
 			logger.Warn("AI provider does not implement intent planning; falling back to deterministic",
 				"provider", provider.Name())
@@ -644,7 +669,8 @@ func Run(ctx context.Context, opts Options) error {
 		Provider: provider, ProviderCloser: providerCloser, MessageFn: msgFn,
 		IntentPlanner: runIntentPlanner, IntentHealth: intentHealth,
 		HealthIdentity: initialIdentity, HealthFingerprint: initialFingerprint,
-		Model: intentPlannerModel, DiffEgress: providerCfg.DiffEgress,
+		Model: intentPlannerModel, ProviderTimeout: providerCfg.Timeout,
+		DiffEgress:           providerCfg.DiffEgress,
 		CommitStrategy:       providerCfg.CommitStrategy,
 		CommitFormat:         providerCfg.CommitFormat,
 		PresetID:             initialPresetID,
@@ -678,6 +704,12 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	currentRuntime := runtimeBundles.Current()
+	var statusMetaBundle *RuntimeBundle
+	if err := stampRuntimeStatusMeta(ctx, opts.DB, currentRuntime); err != nil {
+		logger.Warn("stamp active runtime status metadata", "err", err.Error())
+	} else {
+		statusMetaBundle = currentRuntime
+	}
 	if currentRuntime != nil && currentRuntime.ReplayBlockedReason != "" {
 		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
 			"intent.v2.needs_attention": currentRuntime.ReplayBlockedReason,
@@ -2298,6 +2330,8 @@ func Run(ctx context.Context, opts Options) error {
 	for {
 		branchTransitionBlocked = false
 		recoveryFollowup := false
+		frozenRuntimeDrainID := ""
+		runtimeSelectionBlocked := false
 
 		// 4a/b. Honor ctx + shutdown signal.
 		if err := ctx.Err(); err != nil {
@@ -2331,15 +2365,30 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 		if cutoverBlock == "" {
-			if err := runtimeBundles.ActivateDesired(ctx); err != nil {
-				logger.Warn("activate desired runtime config; retaining last-known-good",
-					"err", ai.SanitizePlannerError(err.Error()))
-			}
-			if queued, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
-				logger.Warn("queue experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
-			} else if queued {
+			runtimeDrain, drainErr := PublicationDrainBarrierForPair(
+				ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
+			if drainErr != nil {
+				runtimeSelectionBlocked = true
+				logger.Warn("read publication drain runtime contract",
+					"err", ai.SanitizePlannerError(drainErr.Error()))
+			} else if runtimeDrain != nil {
+				frozenRuntimeDrainID = runtimeDrain.ID
+				if err := runtimeBundles.ActivatePublicationDrainRevision(
+					ctx, *runtimeDrain); err != nil {
+					logger.Warn("activate frozen publication drain runtime",
+						"err", ai.SanitizePlannerError(err.Error()))
+				}
+			} else {
 				if err := runtimeBundles.ActivateDesired(ctx); err != nil {
-					logger.Warn("activate experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+					logger.Warn("activate desired runtime config; retaining last-known-good",
+						"err", ai.SanitizePlannerError(err.Error()))
+				}
+				if queued, err := runtimeBundles.QueueExperimentRevert(ctx, now()); err != nil {
+					logger.Warn("queue experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+				} else if queued {
+					if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+						logger.Warn("activate experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
+					}
 				}
 			}
 		}
@@ -2609,6 +2658,19 @@ func Run(ctx context.Context, opts Options) error {
 		); err != nil {
 			logger.Warn("reconcile resolved publication drains", "err", err.Error())
 		}
+		// Reconciliation can complete the drain whose historical runtime was
+		// selected at the top of this pass. Re-select before leasing so ordinary
+		// pending work can never publish under that stale frozen contract.
+		if frozenRuntimeDrainID != "" {
+			if err := refreshPublicationDrainRuntimeAfterReconcile(
+				ctx, opts.DB, runtimeBundles, cctx.BranchRef,
+				cctx.BranchGeneration, frozenRuntimeDrainID,
+			); err != nil {
+				runtimeSelectionBlocked = true
+				logger.Warn("refresh publication drain runtime after reconciliation",
+					"err", ai.SanitizePlannerError(err.Error()))
+			}
+		}
 
 		// 4f. Capture pass.
 		//
@@ -2621,9 +2683,13 @@ func Run(ctx context.Context, opts Options) error {
 		// its own dedicated gate above.
 		runtimeLease := runtimeBundles.Lease()
 		passBundle := runtimeLease.Bundle()
-		_ = setRuntimeMetaIfChanged(ctx, opts.DB, map[string]string{
-			"commit.strategy": string(passBundle.CommitStrategy),
-		})
+		if passBundle != statusMetaBundle {
+			if err := stampRuntimeStatusMeta(ctx, opts.DB, passBundle); err != nil {
+				logger.Warn("stamp active runtime status metadata", "err", err.Error())
+			} else {
+				statusMetaBundle = passBundle
+			}
+		}
 		passCtx := withRuntimeTelemetry(ctx, passBundle)
 		var (
 			capSum     CaptureSummary
@@ -2731,7 +2797,7 @@ func Run(ctx context.Context, opts Options) error {
 			replayChecked bool
 		)
 		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused &&
-			!daemonPaused && !publicationHeld && cctx.BaseHead != "" {
+			!daemonPaused && !publicationHeld && !runtimeSelectionBlocked && cctx.BaseHead != "" {
 			replayChecked = true
 			// 4g. Replay pass. Bounded by DefaultReplayLimit so a large
 			// pending queue cannot starve flush_request claims, heartbeat
@@ -2739,9 +2805,10 @@ func Run(ctx context.Context, opts Options) error {
 			// folded into hadWork below so the scheduler resets to the base
 			// poll interval and an immediate follow-up pass drains the rest
 			// without waiting for the idle ceiling.
-			activeDrain, drainErr := ActivePublicationDrainForPair(
+			activeDrain, drainErr := PublicationDrainBarrierForPair(
 				passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
-			if drainErr == nil && activeDrain == nil {
+			if drainErr == nil && activeDrain != nil &&
+				activeDrain.Phase == state.PublicationDrainNeedsAction {
 				recoveredDrain, recoverErr := RecoverSupersededCandidatePublicationDrain(
 					passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
 					time.Now().UTC())
@@ -2757,13 +2824,29 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			setupValidation, validationPending, validationErr :=
 				state.DesiredConfigValidation(ctx, opts.DB)
+			runtimeBlockReason := ""
+			if activeDrain != nil {
+				runtimeBlockReason = publicationDrainRuntimeBlock(
+					*activeDrain, passBundle)
+			}
 			if drainErr != nil {
 				repErr = drainErr
 			} else if validationErr != nil {
 				repErr = validationErr
+			} else if activeDrain != nil &&
+				activeDrain.Phase == state.PublicationDrainNeedsAction {
+				reason := strings.TrimSpace(activeDrain.LastError)
+				if reason == "" {
+					reason = "publication_drain_needs_action"
+				}
+				repSum = ReplaySummary{
+					Skipped: true, SkippedReason: reason,
+					Disposition:       ReplayDispositionNeedsAttention,
+					DispositionReason: reason, BaseHead: cctx.BaseHead,
+				}
 			} else if validationPending &&
 				setupValidation.Status != state.ConfigValidationPassed &&
-				activeDrain == nil {
+				(activeDrain == nil || runtimeBlockReason != "") {
 				repSum = ReplaySummary{
 					Skipped: true,
 					SkippedReason: "configuration_validation_" +
@@ -2775,7 +2858,7 @@ func Run(ctx context.Context, opts Options) error {
 					"config.validation.attempt": strconv.Itoa(
 						setupValidation.Attempt),
 				})
-			} else if passBundle.ReplayBlockedReason != "" && activeDrain == nil {
+			} else if passBundle.ReplayBlockedReason != "" {
 				repSum = ReplaySummary{
 					Skipped: true, SkippedReason: "intent_v2_needs_attention",
 					BaseHead: cctx.BaseHead,
@@ -2786,6 +2869,30 @@ func Run(ctx context.Context, opts Options) error {
 					"intent.v2.preset_id":       passBundle.PresetID,
 					"intent.v2.preset_version":  strconv.Itoa(passBundle.PresetVersion),
 				})
+			} else if runtimeBlockReason != "" {
+				reason := runtimeBlockReason
+				terminalReason := publicationDrainTerminalRuntimeReason(
+					*activeDrain, reason)
+				if terminalReason != "" {
+					failedDrain, failErr := failPublicationDrainRuntimeContract(
+						passCtx, opts.DB, *activeDrain, terminalReason, time.Now().UTC())
+					if failErr != nil {
+						repErr = failErr
+					} else {
+						logPublicationDrainTransition(logger, *activeDrain, failedDrain)
+						repSum = ReplaySummary{
+							Skipped: true, SkippedReason: terminalReason,
+							Disposition:       ReplayDispositionNeedsAttention,
+							DispositionReason: terminalReason, BaseHead: cctx.BaseHead,
+						}
+					}
+				} else {
+					repSum = ReplaySummary{
+						Skipped: true, SkippedReason: reason,
+						Disposition:       ReplayDispositionTransientWait,
+						DispositionReason: reason, BaseHead: cctx.BaseHead,
+					}
+				}
 			} else {
 				var candidateVerify IntentCandidateVerifier
 				var repairCommitVerify git.IntentRepairCommitVerifier
@@ -2837,6 +2944,7 @@ func Run(ctx context.Context, opts Options) error {
 							PromptTrace:                promptTracer,
 							Limit:                      DefaultReplayLimit,
 							CommitStrategy:             passBundle.CommitStrategy,
+							CommitFormat:               passBundle.CommitFormat,
 							IntentWindow:               passBundle.IntentWindow,
 							IntentMinPending:           passBundle.IntentMinPending,
 							IntentSettleWindow:         passBundle.IntentSettleWindow,
@@ -2976,7 +3084,8 @@ func Run(ctx context.Context, opts Options) error {
 		// drain HasMore. Treat both as work so idle backoff cannot delay
 		// convergence.
 		hadWork := recoveryFollowup || flushedTotal > 0 ||
-			capSum.EventsAppended > 0 || replayNeedsImmediateFollowup(repSum)
+			capSum.EventsAppended > 0 || runtimeSelectionBlocked ||
+			replayNeedsImmediateFollowup(repSum)
 		if opts.afterRunLoopWorkDecision != nil {
 			opts.afterRunLoopWorkDecision(hadWork, recoveryFollowup)
 		}

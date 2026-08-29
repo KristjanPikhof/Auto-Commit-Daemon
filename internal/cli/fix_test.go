@@ -424,6 +424,265 @@ func TestFix_ForceArchivesWholePairWithoutPeelingBarrier(t *testing.T) {
 	}
 }
 
+func TestFix_ForceRecoversUnreconstructibleDrainAndRecaptures(t *testing.T) {
+	for _, reason := range []string{
+		"publication_drain_runtime_contract_unavailable",
+		"publication_drain_environment_runtime_changed",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
+			head, err := git.RevParse(ctx, repo, "HEAD")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			const legacyPath = "legacy-runtime.txt"
+			if err := os.WriteFile(filepath.Join(repo, legacyPath),
+				[]byte("protected legacy work\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			legacyBlob, err := git.HashObjectStdin(
+				ctx, repo, []byte("protected legacy work\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			seq := appendFixEvent(t, ctx, db, state.CaptureEvent{
+				BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+				Operation: "create", Path: legacyPath, Fidelity: "exact",
+				State: state.EventStatePending,
+			}, []state.CaptureOp{{
+				Op: "create", Path: legacyPath, Fidelity: "exact",
+				AfterOID:  sql.NullString{String: legacyBlob, Valid: true},
+				AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			}})
+			checkpoint := state.Checkpoint{
+				ID:               "cp-1787525400000-0123456789abcdef",
+				OperationID:      "op-legacy-runtime-recovery",
+				WorktreeID:       "0123456789abcdef",
+				Reason:           state.CheckpointReasonManualBarrier,
+				ObservationEpoch: 1, CoverageEpoch: 1,
+				ObservedHead: head, ObservedRef: "refs/heads/main",
+				TreeOID: head, CommitOID: head,
+				Ref:       "refs/acd/checkpoints/v1/0123456789abcdef/cp-1787525400000-0123456789abcdef",
+				CreatedTS: 1, EventSeqs: []int64{seq},
+			}
+			if created, err := state.PrepareCheckpoint(
+				ctx, db, checkpoint, fixCheckpointTestDigest); err != nil || !created {
+				t.Fatalf("prepare checkpoint=(%t,%v)", created, err)
+			}
+			if err := state.CompleteCheckpoint(
+				ctx, db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 2); err != nil {
+				t.Fatal(err)
+			}
+			const drainID = "drain-cp-1787525400000-0123456789abcdef"
+			if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO publication_drains(
+ id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
+ target_event_count,created_ts,updated_ts,last_progress_ts
+) VALUES(?,?,?,?,1,'semantic',1,3,3,3)`,
+				drainID, checkpoint.ID, checkpoint.WorktreeID,
+				checkpoint.ObservedRef); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO publication_drain_events(drain_id,ord,event_seq) VALUES(?,0,?)`,
+				drainID, seq); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.SQL().ExecContext(ctx, `PRAGMA user_version=24`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			preMigrationSHA, err := fileSHA256(stateDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			preMigrationPlan := runFixJSON(t, repo, true, false, false, false)
+			if !preMigrationPlan.ForceRequired || len(preMigrationPlan.Unsafe) == 0 ||
+				findFixAction(preMigrationPlan, fixActionReconcileUnpublishedChain) != nil {
+				t.Fatalf("pre-v25 recovery plan=%+v", preMigrationPlan)
+			}
+			postPlanSHA, err := fileSHA256(stateDB)
+			if err != nil || postPlanSHA != preMigrationSHA {
+				t.Fatalf("pre-v25 dry-run mutated DB: before=%s after=%s err=%v",
+					preMigrationSHA, postPlanSHA, err)
+			}
+			if version, err := state.ReadUserVersion(ctx, stateDB); err != nil || version != 24 {
+				t.Fatalf("pre-v25 dry-run schema=%d err=%v", version, err)
+			}
+
+			migrated, err := state.OpenRuntime(ctx, stateDB)
+			if err != nil {
+				t.Fatalf("migrate v24 drain: %v", err)
+			}
+			legacy, err := state.PublicationDrainByID(ctx, migrated, drainID)
+			if err != nil || legacy.CommitStrategy != "" ||
+				legacy.CommitFormat != "" || legacy.Provider != "" {
+				t.Fatalf("unproved migration contract=%+v err=%v", legacy, err)
+			}
+			if reason == "publication_drain_environment_runtime_changed" {
+				if _, err := migrated.SQL().ExecContext(ctx, `
+UPDATE publication_drains
+SET commit_strategy='intent',commit_format='imperative',
+    provider='openai-compat',provider_model='legacy-model'
+WHERE id=?`, drainID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := migrated.SQL().ExecContext(ctx, `
+UPDATE publication_drains SET phase='needs_action',last_error=? WHERE id=?`,
+				reason, drainID); err != nil {
+				t.Fatal(err)
+			}
+			if err := migrated.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			const stagedPath = "staged-runtime.txt"
+			if err := os.WriteFile(filepath.Join(repo, stagedPath),
+				[]byte("staged version\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "add", stagedPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, stagedPath),
+				[]byte("worktree version\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			type gitSnapshot struct {
+				head, status, cachedDiff, worktreeDiff string
+				indexSHA, legacySHA, stagedSHA         string
+			}
+			snapshot := func() gitSnapshot {
+				t.Helper()
+				gotHead, err := git.RevParse(ctx, repo, "HEAD")
+				if err != nil {
+					t.Fatal(err)
+				}
+				statusBody, err := git.Run(ctx, git.RunOpts{Dir: repo},
+					"status", "--porcelain=v1", "--untracked-files=all")
+				if err != nil {
+					t.Fatal(err)
+				}
+				cached, err := git.Run(ctx, git.RunOpts{Dir: repo},
+					"diff", "--cached", "--binary", "--no-ext-diff")
+				if err != nil {
+					t.Fatal(err)
+				}
+				worktree, err := git.Run(ctx, git.RunOpts{Dir: repo},
+					"diff", "--binary", "--no-ext-diff")
+				if err != nil {
+					t.Fatal(err)
+				}
+				indexSHA, err := fileSHA256(filepath.Join(repo, ".git", "index"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				legacySHA, err := fileSHA256(filepath.Join(repo, legacyPath))
+				if err != nil {
+					t.Fatal(err)
+				}
+				stagedSHA, err := fileSHA256(filepath.Join(repo, stagedPath))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return gitSnapshot{
+					head: gotHead, status: string(statusBody),
+					cachedDiff: string(cached), worktreeDiff: string(worktree),
+					indexSHA: indexSHA, legacySHA: legacySHA, stagedSHA: stagedSHA,
+				}
+			}
+			beforeGit := snapshot()
+			beforeDB, err := fileSHA256(stateDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			withoutForce := runFixJSON(t, repo, true, false, false, false)
+			if !withoutForce.ForceRequired || len(withoutForce.Unsafe) == 0 ||
+				findFixAction(withoutForce, fixActionReconcileUnpublishedChain) != nil {
+				t.Fatalf("non-force plan=%+v", withoutForce)
+			}
+			forceDryRun := runFixJSON(t, repo, true, false, true, false)
+			action := findFixAction(forceDryRun, fixActionReconcileUnpublishedChain)
+			if action == nil || !action.ArchiveOnly || !action.RequiresForce || action.Applied {
+				t.Fatalf("force dry-run action=%+v plan=%+v", action, forceDryRun)
+			}
+			afterDryRunDB, err := fileSHA256(stateDB)
+			if err != nil || afterDryRunDB != beforeDB || snapshot() != beforeGit {
+				t.Fatalf("dry-run mutated state: db=%s/%s err=%v git=%+v/%+v",
+					beforeDB, afterDryRunDB, err, beforeGit, snapshot())
+			}
+
+			applied := runFixJSON(t, repo, false, true, true, false)
+			action = findFixAction(applied, fixActionReconcileUnpublishedChain)
+			if action == nil || !action.Applied || action.State != state.EventStateRecovered ||
+				action.RecoveryRef == "" || action.RowsChanged != 1 {
+				t.Fatalf("applied recovery action=%+v plan=%+v", action, applied)
+			}
+			if got := snapshot(); got != beforeGit {
+				t.Fatalf("recovery changed HEAD/index/worktree: before=%+v after=%+v",
+					beforeGit, got)
+			}
+			if recoveredCommit, err := git.RevParse(ctx, repo, action.RecoveryRef); err != nil || recoveredCommit != action.CommitOID {
+				t.Fatalf("recovery ref=%s commit=%s err=%v want %s",
+					action.RecoveryRef, recoveredCommit, err, action.CommitOID)
+			}
+
+			live, err := state.Open(ctx, stateDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer live.Close()
+			assertFixEventState(t, ctx, live, seq, state.EventStateRecovered)
+			drain, err := state.PublicationDrainByID(ctx, live, drainID)
+			if err != nil || drain.Phase != state.PublicationDrainCompleted ||
+				drain.PublishedEventCount != 1 || drain.LastError != "" {
+				t.Fatalf("settled drain=%+v err=%v", drain, err)
+			}
+			barrier, err := daemon.PublicationDrainBarrierForPair(
+				ctx, live, "refs/heads/main", 1)
+			if err != nil || barrier != nil {
+				t.Fatalf("publication barrier after recovery=%+v err=%v", barrier, err)
+			}
+			if bootstrapped, err := daemon.IsShadowBootstrapped(
+				ctx, live, "refs/heads/main", 1); err != nil || bootstrapped {
+				t.Fatalf("shadow after archive=%t err=%v", bootstrapped, err)
+			}
+
+			cctx := daemon.CaptureContext{
+				BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+			}
+			if _, err := daemon.BootstrapShadow(ctx, repo, live, cctx); err != nil {
+				t.Fatal(err)
+			}
+			checker := git.NewIgnoreChecker(repo)
+			defer checker.Close()
+			if _, err := daemon.Capture(ctx, repo, live, cctx, daemon.CaptureOpts{
+				IgnoreChecker: checker, SensitiveMatcher: state.NewSensitiveMatcher(),
+			}); err != nil {
+				t.Fatalf("recapture dirty work: %v", err)
+			}
+			var recapturedSeq int64
+			if err := live.SQL().QueryRowContext(ctx, `
+SELECT seq FROM capture_events
+WHERE seq>? AND branch_ref='refs/heads/main' AND branch_generation=1
+  AND path=? AND state='pending'
+ORDER BY seq DESC LIMIT 1`, seq, legacyPath).Scan(&recapturedSeq); err != nil {
+				t.Fatalf("find recaptured legacy work: %v", err)
+			}
+			if recapturedSeq == seq {
+				t.Fatalf("legacy event was not recaptured: old=%d new=%d", seq, recapturedSeq)
+			}
+		})
+	}
+}
+
 func TestFix_BackupIncludesWALOnlyCommittedRows(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()

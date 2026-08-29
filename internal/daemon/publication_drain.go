@@ -27,6 +27,95 @@ const (
 	publicationFallbackLegacyAtomic   = "atomic_dependency_components"
 )
 
+func publicationDrainRuntimeBlock(
+	drain state.PublicationDrain,
+	bundle *RuntimeBundle,
+) string {
+	if reason := publicationDrainRuntimeIdentityBlock(drain, bundle); reason != "" {
+		return reason
+	}
+	if bundle.ReplayBlockedReason != "" {
+		return "publication_drain_runtime_unavailable"
+	}
+	return ""
+}
+
+func publicationDrainRuntimeIdentityBlock(
+	drain state.PublicationDrain,
+	bundle *RuntimeBundle,
+) string {
+	if bundle == nil {
+		return "publication_drain_runtime_unavailable"
+	}
+	if drain.CommitStrategy == "" || drain.CommitFormat == "" ||
+		drain.Provider == "" {
+		return "publication_drain_runtime_contract_unavailable"
+	}
+	if drain.CommitStrategy != string(bundle.CommitStrategy) {
+		return "publication_drain_runtime_strategy_mismatch"
+	}
+	if drain.CommitFormat != string(bundle.CommitFormat) {
+		return "publication_drain_runtime_format_mismatch"
+	}
+	if drain.ConfigRevisionID != bundle.RevisionID {
+		return "publication_drain_runtime_revision_mismatch"
+	}
+	provider := strings.TrimSpace(bundle.HealthIdentity.Provider)
+	if provider == "" && bundle.Provider != nil {
+		provider = ai.PrimaryProviderName(bundle.Provider)
+	}
+	if drain.Provider != provider {
+		return "publication_drain_runtime_provider_mismatch"
+	}
+	if drain.ProviderModel != strings.TrimSpace(bundle.Model) {
+		return "publication_drain_runtime_model_mismatch"
+	}
+	if drain.ProviderFingerprint != "" &&
+		drain.ProviderFingerprint != bundle.HealthFingerprint {
+		return "publication_drain_runtime_fingerprint_mismatch"
+	}
+	return ""
+}
+
+func failPublicationDrainRuntimeContract(
+	ctx context.Context,
+	db *state.DB,
+	drain state.PublicationDrain,
+	reason string,
+	now time.Time,
+) (state.PublicationDrain, error) {
+	if reason != "publication_drain_runtime_contract_unavailable" &&
+		reason != "publication_drain_environment_runtime_changed" {
+		return drain, errors.New("daemon: publication drain runtime failure is not terminal")
+	}
+	nowTS := float64(now.UnixNano()) / 1e9
+	if nowTS < drain.UpdatedTS {
+		nowTS = drain.UpdatedTS
+	}
+	update := PublicationDrainUpdateFrom(
+		drain, nowTS, drain.LastProgressTS)
+	update.Phase = state.PublicationDrainNeedsAction
+	update.LastError = reason
+	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+}
+
+func publicationDrainTerminalRuntimeReason(
+	drain state.PublicationDrain,
+	blockReason string,
+) string {
+	if blockReason == "publication_drain_runtime_contract_unavailable" {
+		return blockReason
+	}
+	if drain.ConfigRevisionID == 0 && blockReason != "" &&
+		blockReason != "publication_drain_runtime_unavailable" {
+		// Revision-zero contracts come only from the process environment. If
+		// that identity changed across restart there is no immutable revision
+		// to reconstruct, so retrying can never converge safely.
+		return "publication_drain_environment_runtime_changed"
+	}
+	return ""
+}
+
 // ActivePublicationDrainForPair returns the one durable drain owned by the
 // active branch generation. Multiple active drains for one pair fail closed.
 func ActivePublicationDrainForPair(
@@ -57,6 +146,77 @@ func ActivePublicationDrainForPair(
 		active = &loaded
 	}
 	return active, nil
+}
+
+// PublicationDrainBarrierForPair returns the one unresolved drain whose
+// frozen membership must keep ordinary replay out. Unlike the active lookup,
+// this includes needs_action: surfacing a durable problem must never release
+// its still-pending target captures to a different runtime contract.
+func PublicationDrainBarrierForPair(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+) (*state.PublicationDrain, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase!='completed'
+ORDER BY created_ts,id LIMIT 2`, branchRef, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if len(ids) > 1 {
+		return nil, errors.New(
+			"daemon: multiple unresolved publication drains for branch generation")
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, ids[0])
+	if err != nil {
+		return nil, err
+	}
+	return &drain, nil
+}
+
+// refreshPublicationDrainRuntimeAfterReconcile prevents a runtime frozen for
+// one drain from leaking into ordinary replay when that drain is completed by
+// reconciliation before the pass acquires its runtime lease.
+func refreshPublicationDrainRuntimeAfterReconcile(
+	ctx context.Context,
+	db *state.DB,
+	runtimes *RuntimeBundleManager,
+	branchRef string,
+	generation int64,
+	frozenDrainID string,
+) error {
+	if frozenDrainID == "" {
+		return nil
+	}
+	current, err := PublicationDrainBarrierForPair(
+		ctx, db, branchRef, generation)
+	if err != nil {
+		return err
+	}
+	if current != nil && current.ID == frozenDrainID {
+		return nil
+	}
+	if current == nil {
+		return runtimes.ActivateDesired(ctx)
+	}
+	return runtimes.ActivatePublicationDrainRevision(ctx, *current)
 }
 
 // RecoverSupersededCandidatePublicationDrain reopens only the latest drain
@@ -359,22 +519,29 @@ func publicationDrainSalvageMode(drain state.PublicationDrain) string {
 }
 
 // publicationDrainAtomicFallbackPlanner keeps every hard dependency component
-// in one commit. It is local and deterministic, so the final fallback neither
-// calls a provider nor degrades Intent publication to per-event commits.
+// in one commit. Membership is local and deterministic; a configured semantic
+// provider remains responsible for the locked commit message.
 type publicationDrainAtomicFallbackPlanner struct {
-	commitFormat ai.CommitFormat
+	commitFormat           ai.CommitFormat
+	messagePlanner         interface{ Name() string }
+	requireSemanticMessage bool
 }
 
 func configureAtomicIntentFallback(cfg *intentReplayConfig) {
 	if cfg == nil {
 		return
 	}
-	cfg.planner = publicationDrainAtomicFallbackPlanner{
-		commitFormat: cfg.commitFormat,
+	configuredPlanner := cfg.planner
+	provider := strings.TrimSpace(cfg.plannerProvider)
+	if provider == "" && configuredPlanner != nil {
+		provider = ai.PrimaryProviderName(configuredPlanner)
+		cfg.plannerProvider = provider
 	}
-	cfg.plannerProvider = cfg.planner.Name()
-	cfg.plannerModel = ""
-	cfg.health = nil
+	cfg.planner = publicationDrainAtomicFallbackPlanner{
+		commitFormat:           cfg.commitFormat,
+		messagePlanner:         configuredPlanner,
+		requireSemanticMessage: provider != "" && provider != "deterministic",
+	}
 	cfg.candidateMode = true
 	cfg.bypassBatchWait = true
 	cfg.pathQuiescence = 0
@@ -555,7 +722,57 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 		plan.Candidates[index].Subject = provider.FormatSubjectForOps(
 			plan.Candidates[index].Subject, nil)
 	}
+	if p.requireSemanticMessage {
+		return p.rewritePlanMessages(ctx, req, plan)
+	}
 	return plan, nil
+}
+
+func (p publicationDrainAtomicFallbackPlanner) RewriteIntentMessage(
+	ctx context.Context,
+	req ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	rewriter, ok := p.messagePlanner.(ai.IntentMessageRewriter)
+	if !ok {
+		provider := "configured provider"
+		if p.messagePlanner != nil && strings.TrimSpace(p.messagePlanner.Name()) != "" {
+			provider = p.messagePlanner.Name()
+		}
+		return ai.Result{}, fmt.Errorf(
+			"daemon: %s cannot rewrite a locked Intent message", provider)
+	}
+	return rewriter.RewriteIntentMessage(ctx, req)
+}
+
+func (p publicationDrainAtomicFallbackPlanner) rewritePlanMessages(
+	ctx context.Context,
+	req ai.IntentPlanRequestV2,
+	plan ai.IntentPlanV2,
+) (ai.IntentPlanV2, error) {
+	legacyReq := ai.LegacyIntentPlanRequest(req)
+	out := plan
+	for index, candidate := range plan.Candidates {
+		if candidate.Readiness != ai.IntentCandidateReady {
+			continue
+		}
+		locked := ai.IntentPlan{
+			SelectedSeqs:   append([]int64(nil), candidate.SelectedSeqs...),
+			Subject:        candidate.Subject,
+			Body:           candidate.Body,
+			GroupingReason: candidate.GroupingReason,
+		}
+		report := ai.EvaluateIntentPlanMessageQuality(legacyReq, locked)
+		result, err := p.RewriteIntentMessage(
+			ctx, ai.NewIntentMessageRewriteRequest(legacyReq, locked, report))
+		if err != nil {
+			return ai.IntentPlanV2{}, err
+		}
+		out.Candidates[index].Subject = result.Subject
+		out.Candidates[index].Body = result.Body
+	}
+	// The provider may only replace subject/body. Re-run the shared quality and
+	// shape gates so malformed output cannot escape through local unlock.
+	return ai.ApplyIntentV2MessageQuality(ctx, p, req, out)
 }
 
 func publicationDrainPendingEvents(
