@@ -2,9 +2,9 @@
 //
 // Per spec §10.4, the run loop picks a commit-message provider by reading
 // ACD_AI_* environment variables. The defaults are conservative: an empty
-// or unrecognized ACD_AI_PROVIDER falls back to the deterministic
-// generator so a misconfigured environment never silently disables
-// commit-message generation.
+// or unrecognized ACD_AI_PROVIDER falls back to the deterministic generator
+// in event mode. Intent mode keeps explicitly semantic configuration fail
+// closed so setup errors cannot silently change commit semantics.
 //
 // Selection table:
 //
@@ -13,9 +13,9 @@
 //	"" (unset)                  | DeterministicProvider
 //	"deterministic"             | DeterministicProvider
 //	"openai-compat" + APIKey    | Compose(OpenAIProvider, Deterministic)
-//	"openai-compat" no APIKey   | DeterministicProvider (warn)
+//	"openai-compat" no APIKey   | Event: deterministic; Intent: error
 //	"subprocess:<name>"         | Compose(Subprocess(name), Deterministic)
-//	any other value             | DeterministicProvider (warn)
+//	any other value             | Event: deterministic; Intent: error
 //
 // The returned io.Closer is non-nil only when the chain holds a
 // SubprocessProvider; the daemon must Close() it on shutdown so the child
@@ -343,9 +343,9 @@ func normalizeMode(raw string) string {
 // BuildProvider returns a Provider chain matching cfg. The io.Closer is
 // non-nil only when the chain owns a SubprocessProvider — the daemon must
 // call Close on shutdown so the child process is reaped cleanly. The
-// error return is reserved for future use (today every degraded path
-// resolves to deterministic rather than failing); callers should still
-// check it.
+// Event mode retains the historical deterministic degradation. Intent mode
+// fails construction when the operator explicitly selected a semantic
+// provider, preventing provider setup failures from changing commit semantics.
 //
 // Degraded paths log a single warning via cfg.Logger so an operator can
 // see why the OpenAI-compat or subprocess provider was skipped.
@@ -363,6 +363,10 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 
 	case mode == "openai-compat":
 		if strings.TrimSpace(cfg.APIKey) == "" {
+			if cfg.CommitStrategy == CommitStrategyIntent {
+				return nil, nil, errors.New(
+					"openai-compat: missing API key for Intent commits")
+			}
 			logger.Warn("ai: ACD_AI_PROVIDER=openai-compat but ACD_AI_API_KEY empty; falling back to deterministic",
 				slog.String("provider", "openai-compat"))
 			return det, nil, nil
@@ -376,6 +380,10 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 	case strings.HasPrefix(mode, "subprocess:"):
 		name := strings.TrimPrefix(mode, "subprocess:")
 		if strings.TrimSpace(name) == "" {
+			if cfg.CommitStrategy == CommitStrategyIntent {
+				return nil, nil, errors.New(
+					"subprocess: missing plugin name for Intent commits")
+			}
 			logger.Warn("ai: ACD_AI_PROVIDER=subprocess: missing plugin name; falling back to deterministic",
 				slog.String("mode", mode))
 			return det, nil, nil
@@ -387,6 +395,10 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 		return Compose(primary, det), closer, nil
 
 	default:
+		if cfg.CommitStrategy == CommitStrategyIntent {
+			return nil, nil, fmt.Errorf(
+				"unrecognized Intent provider %q", mode)
+		}
 		logger.Warn("ai: unrecognized ACD_AI_PROVIDER; falling back to deterministic",
 			slog.String("mode", mode))
 		return det, nil, nil

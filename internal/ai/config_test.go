@@ -386,6 +386,21 @@ func TestBuildProvider_OpenAICompatNoKeyDegrades(t *testing.T) {
 	}
 }
 
+func TestBuildProvider_IntentOpenAICompatNoKeyDoesNotDegrade(t *testing.T) {
+	p, closer, err := BuildProvider(ProviderConfig{
+		Mode:           "openai-compat",
+		CommitStrategy: CommitStrategyIntent,
+		Logger:         quietLogger(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing API key") {
+		t.Fatalf("error=%v, want missing API key", err)
+	}
+	if p != nil || closer != nil {
+		t.Fatalf("provider=%v closer=%v, want no deterministic degradation",
+			p, closer)
+	}
+}
+
 func TestBuildProvider_OpenAICompatNoKeyIgnoresInvalidCA(t *testing.T) {
 	h := &captureHandler{}
 	provider, closer, err := BuildProvider(ProviderConfig{
