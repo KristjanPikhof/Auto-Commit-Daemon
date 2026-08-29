@@ -21,8 +21,11 @@ acd config edit
 
 Network content is redacted and bounded. A network provider receives diffs
 only when it declares `NeedsDiff` and diff egress is explicitly enabled.
-Credentials, raw provider failures, and unredacted source never enter state,
-logs, status, diagnostics, traces, plan fingerprints, or test output.
+Credentials and unredacted source never enter state, ordinary logs, status,
+diagnostics, traces, plan fingerprints, or test output. Rejected-plan logs omit
+the raw response by default. `ACD_INTENT_REJECTS_RAW` is an explicit diagnostic
+opt-in that stores that response in the worktree-local reject log described
+below.
 
 Strict provider tests use fixed synthetic content and no repository source.
 First setup tests the selected provider after review and before any write. Its
