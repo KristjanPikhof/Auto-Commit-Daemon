@@ -262,6 +262,8 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 		return "waiting for the Intent provider to write a semantic commit message"
 	case "provider_call":
 		return "waiting for the current Intent provider response"
+	case "verifying":
+		return "verifying the semantic group"
 	case "stalled":
 		if progress.Origin == "intent_recovery" {
 			return "automatic Intent recovery active; no target movement yet"
