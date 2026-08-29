@@ -327,7 +327,7 @@ func productListTarget(entry productListEntry) string {
 		return fmt.Sprintf("commit-all:%d/%d", progress.TargetRemaining,
 			progress.TargetTotal)
 	case "intent_recovery":
-		return fmt.Sprintf("replan:%d/%d", progress.TargetRemaining,
+		return fmt.Sprintf("recover:%d/%d", progress.TargetRemaining,
 			progress.TargetTotal)
 	default:
 		return "-"
@@ -367,6 +367,9 @@ func productListPhase(entry productListEntry) string {
 	case "config_wait":
 		return "config-wait"
 	case "local_fallback":
+		if progress.Origin == "intent_recovery" {
+			return "intent-widen"
+		}
 		return "local-recovery"
 	case "provider_wait":
 		return "provider-wait"
@@ -429,6 +432,8 @@ func productListStatus(entry productListEntry) string {
 	case entry.OperationalState == "paused":
 		return "paused"
 	case entry.ActionRequired || entry.State == productStateNeedsAction || entry.OperationalState == "needs_attention":
+		return "needs action"
+	case entry.PublicationProgress.Phase == "needs_action":
 		return "needs action"
 	case entry.PublicationProgress.Phase == "stalled":
 		return "stalled"
