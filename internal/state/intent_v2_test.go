@@ -90,7 +90,7 @@ func TestMarkIntentCandidateVerificationPendingPreservesSemanticState(
 		ID: "candidate-resource-wait", BranchRef: "refs/heads/main",
 		BranchGeneration: 3, Status: IntentCandidateWaiting,
 		Readiness: IntentReadinessWait, Purpose: "preserve semantic grouping",
-		AtomicityStatus: sql.NullString{String: "failed", Valid: true},
+		AtomicityStatus:  sql.NullString{String: "failed", Valid: true},
 		AtomicitySummary: "verification workspace setup failed",
 		VerificationStatus: sql.NullString{
 			String: "needs_attention", Valid: true,
