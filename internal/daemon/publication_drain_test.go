@@ -190,6 +190,17 @@ func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
 	}
 }
 
+func TestConfigureIntentForwardRecoveryPreservesPathQuiescence(t *testing.T) {
+	health := &IntentPlannerHealth{}
+	cfg := intentReplayConfig{pathQuiescence: 30 * time.Second}
+	configureIntentForwardRecovery(
+		&cfg, health, publicationFallbackSemanticReplan, []int64{1, 2})
+	if cfg.pathQuiescence != 30*time.Second || !cfg.semanticSalvage ||
+		cfg.atomicFallback {
+		t.Fatalf("forward recovery config=%+v", cfg)
+	}
+}
+
 func TestPublicationDrainFinalFallbackRefusesOversizedHardComponent(t *testing.T) {
 	ctx := context.Background()
 	db, events, _ := openPublicationDrainTestState(

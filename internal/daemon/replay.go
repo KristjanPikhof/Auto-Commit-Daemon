@@ -491,7 +491,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			publicationDrainSalvageMode(*opts.PublicationDrain),
 			opts.PublicationDrain.EventSeqs)
 	} else if forwardRecoveryActive && intentCfg.enabled {
-		configureIntentSalvage(&intentCfg, opts.IntentHealth,
+		configureIntentForwardRecovery(&intentCfg, opts.IntentHealth,
 			forwardRecovery.Stage, forwardRecovery.TargetEventSeqs)
 	}
 	if intentCfg.semanticSalvage {
@@ -1370,7 +1370,9 @@ func replayIntentBatch(
 		}
 		headOpsByPath = map[int64][]state.CaptureOp{pending[0].Seq: headOps}
 	}
-	pending, gated := filterPendingByPathQuiescence(pending, cfg.pathQuiescence, pathQuiescenceNow(), headOpsByPath)
+	quiescenceNow := pathQuiescenceNow()
+	pending, gated := filterPendingByPathQuiescence(
+		pending, cfg.pathQuiescence, quiescenceNow, headOpsByPath)
 	persistPathQuiescenceSnapshot(ctx, db, gated, cfg.pathQuiescence)
 	if len(pending) == 0 {
 		// Everything in the visible queue is held back behind the gate;
@@ -1381,6 +1383,57 @@ func replayIntentBatch(
 			sum.SkippedReason = "skipped_due_path_quiescence"
 		}
 		return sum, nil
+	}
+	if cfg.candidateMode && !cfg.atomicFallback && !cfg.semanticSalvage &&
+		opts.PublicationDrain == nil {
+		tryRecovery := func(eventSeq int64) (ReplaySummary, bool, error) {
+			event, visible := captureEventBySeq(pending, eventSeq)
+			if !visible {
+				return sum, false, nil
+			}
+			if cfg.pathQuiescence > 0 {
+				ops, err := state.LoadCaptureOps(ctx, db, event.Seq)
+				if err != nil {
+					return sum, true, err
+				}
+				if !pathQuiescentForEvent(
+					event, ops, cfg.pathQuiescence, quiescenceNow) {
+					return sum, false, nil
+				}
+			}
+			return startFailedIntentCheckpointRecovery(
+				ctx, repoRoot, db, activeCtx, opts, event.Seq, parent, sum)
+		}
+
+		// Planner timestamps can make an unrelated newer capture the generic
+		// forced-aging winner. Prioritize the earliest overdue failed candidate
+		// by capture order so continued edits cannot starve checkpoint recovery.
+		failedSeq, ok, err := state.OldestOverdueFailedIntentEventSeq(
+			ctx, db, activeCtx.BranchRef, activeCtx.BranchGeneration,
+			cfg.deferLimit)
+		if err != nil {
+			return sum, err
+		}
+		if ok {
+			recovered, handled, recoveryErr := tryRecovery(failedSeq)
+			if recoveryErr != nil || handled {
+				return recovered, recoveryErr
+			}
+		}
+		// Keep the generic forced-aging probe as a compatibility backstop for
+		// persisted candidates that predate the strict failed-candidate shape.
+		overdue, _, ok, err := state.OldestOverduePlannerEvent(
+			ctx, db, activeCtx.BranchRef, activeCtx.BranchGeneration,
+			cfg.deferLimit)
+		if err != nil {
+			return sum, err
+		}
+		if ok {
+			recovered, handled, recoveryErr := tryRecovery(overdue.Seq)
+			if recoveryErr != nil || handled {
+				return recovered, recoveryErr
+			}
+		}
 	}
 	var (
 		window     []state.CaptureEvent
@@ -1751,6 +1804,18 @@ func captureEventTouchesAnyPath(
 		}
 	}
 	return false
+}
+
+func captureEventBySeq(
+	events []state.CaptureEvent,
+	eventSeq int64,
+) (state.CaptureEvent, bool) {
+	for _, event := range events {
+		if event.Seq == eventSeq {
+			return event, true
+		}
+	}
+	return state.CaptureEvent{}, false
 }
 
 func addCaptureEventPaths(paths map[string]struct{}, event state.CaptureEvent) {

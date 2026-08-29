@@ -97,6 +97,20 @@ WHERE seq=?`, published); err != nil {
 		marker.UnlockCount != 1 || marker.LastProgressTS <= 0 {
 		t.Fatalf("semantic marker=(%+v,%v)", marker, err)
 	}
+	if err := CompleteIntentForwardRecovery(ctx, db, marker, 1); err == nil {
+		t.Fatal("completion cleared an unresolved recovery target")
+	}
+	if _, active, err := IntentForwardRecoveryForPair(
+		ctx, db, recovery.BranchRef, recovery.BranchGeneration,
+	); err != nil || !active {
+		t.Fatalf("unresolved marker active=%t err=%v", active, err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',commit_oid='recovery-head',published_ts=2
+WHERE seq IN (?,?)`, pending, linked); err != nil {
+		t.Fatal(err)
+	}
 	if err := CompleteIntentForwardRecovery(ctx, db, marker, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +271,219 @@ SELECT COUNT(*) FROM decision_records WHERE kind=?`,
 				t.Fatalf("decision count=%d want 2", decisionCount)
 			}
 		})
+	}
+}
+
+func TestOldestOverdueFailedIntentEventStopsAtTerminalBarrier(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	barrierSeq := appendIntentV2Event(
+		t, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "terminal.go")
+	heldSeq := appendIntentV2Event(
+		t, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "held.go")
+	seedFailedIntentCompletedCheckpoint(t, db, "main", []int64{heldSeq})
+	const candidateID = "failed-behind-terminal"
+	if err := SaveIntentCandidate(ctx, db, IntentCandidate{
+		ID: candidateID, BranchRef: failedIntentCheckpointBranch,
+		BranchGeneration: failedIntentCheckpointGeneration,
+		Status:           IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Purpose: "failed candidate behind terminal event",
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{{
+			EventSeq: heldSeq, EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordPlannerDefer(
+		ctx, db, heldSeq, 1, "verification failed"); err != nil {
+		t.Fatal(err)
+	}
+	if seq, ok, err := OldestOverdueFailedIntentEventSeq(
+		ctx, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, 1,
+	); err != nil || !ok || seq != heldSeq {
+		t.Fatalf("visible failed event=(%d,%t,%v), want %d", seq, ok, err, heldSeq)
+	}
+	if err := MarkEventPublished(
+		ctx, db, barrierSeq, EventStateFailed, sql.NullString{},
+		sql.NullString{String: "terminal barrier", Valid: true},
+		sql.NullString{}, 2,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if seq, ok, err := OldestOverdueFailedIntentEventSeq(
+		ctx, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, 1,
+	); err != nil || ok || seq != 0 {
+		t.Fatalf("failed event behind barrier=(%d,%t,%v), want hidden", seq, ok, err)
+	}
+	candidate, ok, err := IntentCandidateByID(ctx, db, candidateID)
+	if err != nil || !ok || candidate.Status != IntentCandidateWaiting ||
+		len(candidate.Events) != 1 {
+		t.Fatalf("candidate changed behind barrier=(%+v,%t,%v)", candidate, ok, err)
+	}
+	if _, active, err := IntentForwardRecoveryForPair(
+		ctx, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration,
+	); err != nil || active {
+		t.Fatalf("recovery marker behind barrier active=%t err=%v", active, err)
+	}
+}
+
+func TestStartFailedIntentCheckpointRecoveryFreezesOnlyPendingCheckpointRows(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 5, 2)
+	ctx := context.Background()
+	execFailedIntentCheckpointTest(t, fixture.db, `
+UPDATE capture_events
+SET state='published',commit_oid='published-before-recovery',published_ts=2
+WHERE seq=?`, fixture.seqs[2])
+	execFailedIntentCheckpointTest(t, fixture.db, `
+UPDATE capture_events SET state='recovered',published_ts=2 WHERE seq=?`,
+		fixture.seqs[3])
+
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("mixed checkpoint recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	wantTarget := []int64{fixture.seqs[0], fixture.seqs[1], fixture.seqs[4]}
+	if !reflect.DeepEqual(recovery.TargetEventSeqs, wantTarget) {
+		t.Fatalf("recovery target=%v want pending rows %v",
+			recovery.TargetEventSeqs, wantTarget)
+	}
+	wantStates := map[int64]string{
+		fixture.seqs[0]: EventStatePending,
+		fixture.seqs[1]: EventStatePending,
+		fixture.seqs[2]: EventStatePublished,
+		fixture.seqs[3]: EventStateRecovered,
+		fixture.seqs[4]: EventStatePending,
+	}
+	for seq, want := range wantStates {
+		var got string
+		if err := fixture.db.ReadSQL().QueryRowContext(ctx,
+			`SELECT state FROM capture_events WHERE seq=?`, seq).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("event %d state=%q want %q", seq, got, want)
+		}
+	}
+	candidate, ok, err := IntentCandidateByID(ctx, fixture.db, fixture.candidateID)
+	if err != nil || !ok || candidate.Status != IntentCandidateSuperseded ||
+		len(candidate.Events) != 0 {
+		t.Fatalf("candidate=(%+v ok=%t err=%v)", candidate, ok, err)
+	}
+}
+
+func TestStartFailedIntentCheckpointRecoveryExpandsFailedClosure(t *testing.T) {
+	fixture := seedFailedIntentCheckpointClosureFixture(t, false)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("checkpoint closure recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	if recovery.CandidateID != fixture.rootCandidateID ||
+		recovery.Reason != failedIntentCheckpointRecoveryReason ||
+		recovery.Stage != "semantic_replan" ||
+		!reflect.DeepEqual(recovery.TargetEventSeqs, fixture.seqs) {
+		t.Fatalf("recovery=%+v want complete closure %v", recovery, fixture.seqs)
+	}
+	for _, candidateID := range []string{
+		fixture.rootCandidateID,
+		fixture.overlapCandidateID,
+	} {
+		candidate, ok, err := IntentCandidateByID(ctx, fixture.db, candidateID)
+		if err != nil || !ok || candidate.Status != IntentCandidateSuperseded ||
+			len(candidate.Events) != 0 {
+			t.Fatalf("candidate %s=(%+v ok=%t err=%v)",
+				candidateID, candidate, ok, err)
+		}
+	}
+	var decisions int
+	if err := fixture.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM decision_records WHERE kind=?`,
+		DecisionKindIntentForwardRecovery).Scan(&decisions); err != nil {
+		t.Fatal(err)
+	}
+	if decisions != 5 {
+		t.Fatalf("closure decisions=%d want 5 candidate members", decisions)
+	}
+	for _, seq := range fixture.seqs {
+		var eventState string
+		if err := fixture.db.ReadSQL().QueryRowContext(ctx,
+			`SELECT state FROM capture_events WHERE seq=?`, seq).
+			Scan(&eventState); err != nil {
+			t.Fatal(err)
+		}
+		if eventState != EventStatePending {
+			t.Fatalf("event %d state=%q want pending", seq, eventState)
+		}
+	}
+}
+
+func TestStartFailedIntentCheckpointRecoveryRejectsHealthyClosureCandidate(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointClosureFixture(t, true)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || changed || recovery.CandidateID != "" {
+		t.Fatalf("healthy closure recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	for candidateID, want := range map[string]struct {
+		status string
+		active int
+	}{
+		fixture.rootCandidateID:    {IntentCandidateWaiting, 2},
+		fixture.overlapCandidateID: {IntentCandidateReady, 3},
+	} {
+		var status string
+		var active int
+		if err := fixture.db.ReadSQL().QueryRowContext(ctx,
+			`SELECT status FROM intent_candidates WHERE id=?`, candidateID).
+			Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if err := fixture.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_candidate_events
+WHERE candidate_id=? AND membership_state='active'`, candidateID).
+			Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if status != want.status || active != want.active {
+			t.Fatalf("candidate %s status=%q active=%d want %q/%d",
+				candidateID, status, active, want.status, want.active)
+		}
+	}
+	var markers, decisions int
+	if err := fixture.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM daemon_meta WHERE key=?`,
+		intentForwardRecoveryMetaKey).Scan(&markers); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM decision_records WHERE kind=?`,
+		DecisionKindIntentForwardRecovery).Scan(&decisions); err != nil {
+		t.Fatal(err)
+	}
+	if markers != 0 || decisions != 0 {
+		t.Fatalf("healthy closure markers=%d decisions=%d want 0/0",
+			markers, decisions)
 	}
 }
 
@@ -468,15 +695,6 @@ UPDATE capture_events SET state='published',commit_oid='published' WHERE seq=?`,
 			},
 		},
 		{
-			name: "candidate members span checkpoints",
-			mutate: func(t *testing.T, fixture failedIntentCheckpointFixture) {
-				execFailedIntentCheckpointTest(t, fixture.db,
-					`DELETE FROM checkpoint_events WHERE event_seq=?`, fixture.seqs[1])
-				seedFailedIntentCompletedCheckpoint(
-					t, fixture.db, "split", []int64{fixture.seqs[1]})
-			},
-		},
-		{
 			name: "checkpoint is not completed",
 			mutate: func(t *testing.T, fixture failedIntentCheckpointFixture) {
 				execFailedIntentCheckpointTest(t, fixture.db,
@@ -485,10 +703,18 @@ UPDATE capture_events SET state='published',commit_oid='published' WHERE seq=?`,
 			},
 		},
 		{
-			name: "checkpoint member is not pending",
+			name: "checkpoint member failed",
 			mutate: func(t *testing.T, fixture failedIntentCheckpointFixture) {
-				execFailedIntentCheckpointTest(t, fixture.db, `
-UPDATE capture_events SET state='published',commit_oid='published' WHERE seq=?`,
+				execFailedIntentCheckpointTest(t, fixture.db,
+					`UPDATE capture_events SET state='failed' WHERE seq=?`,
+					fixture.seqs[2])
+			},
+		},
+		{
+			name: "checkpoint member blocked",
+			mutate: func(t *testing.T, fixture failedIntentCheckpointFixture) {
+				execFailedIntentCheckpointTest(t, fixture.db,
+					`UPDATE capture_events SET state='blocked_conflict' WHERE seq=?`,
 					fixture.seqs[2])
 			},
 		},
@@ -632,6 +858,78 @@ type failedIntentCheckpointFixture struct {
 	memberCount int
 }
 
+type failedIntentCheckpointClosureFixture struct {
+	db                 *DB
+	rootCandidateID    string
+	overlapCandidateID string
+	seqs               []int64
+}
+
+func seedFailedIntentCheckpointClosureFixture(
+	t *testing.T,
+	healthyOverlap bool,
+) failedIntentCheckpointClosureFixture {
+	t.Helper()
+	db, _ := openTestDB(t)
+	seqs := make([]int64, 0, 6)
+	for index := range 6 {
+		seqs = append(seqs, appendIntentV2Event(
+			t, db, failedIntentCheckpointBranch,
+			failedIntentCheckpointGeneration,
+			fmt.Sprintf("closure-%03d.go", index)))
+	}
+	seedFailedIntentCompletedCheckpoint(t, db, "closure-a", seqs[:3])
+	seedFailedIntentCompletedCheckpoint(t, db, "closure-b", seqs[3:5])
+	seedFailedIntentCompletedCheckpoint(t, db, "closure-c", seqs[5:])
+
+	const rootCandidateID = "failed-closure-root"
+	if err := SaveIntentCandidate(context.Background(), db, IntentCandidate{
+		ID: rootCandidateID, BranchRef: failedIntentCheckpointBranch,
+		BranchGeneration: failedIntentCheckpointGeneration,
+		Status:           IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Purpose: "failed root candidate",
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{
+			{EventSeq: seqs[0], EventRole: "implementation"},
+			{EventSeq: seqs[1], EventRole: "implementation"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const overlapCandidateID = "failed-closure-overlap"
+	overlapStatus := IntentCandidateWaiting
+	overlapReadiness := IntentReadinessWait
+	overlapVerification := "failed"
+	if healthyOverlap {
+		overlapStatus = IntentCandidateReady
+		overlapReadiness = IntentReadinessReady
+		overlapVerification = "passed"
+	}
+	if err := SaveIntentCandidate(context.Background(), db, IntentCandidate{
+		ID: overlapCandidateID, BranchRef: failedIntentCheckpointBranch,
+		BranchGeneration: failedIntentCheckpointGeneration,
+		Status:           overlapStatus, Readiness: overlapReadiness,
+		Purpose: "checkpoint-spanning candidate",
+		VerificationStatus: sql.NullString{
+			String: overlapVerification, Valid: true,
+		},
+		Events: []IntentCandidateEvent{
+			{EventSeq: seqs[2], EventRole: "implementation"},
+			{EventSeq: seqs[3], EventRole: "implementation"},
+			{EventSeq: seqs[5], EventRole: "verification"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return failedIntentCheckpointClosureFixture{
+		db: db, rootCandidateID: rootCandidateID,
+		overlapCandidateID: overlapCandidateID, seqs: seqs,
+	}
+}
+
 func seedFailedIntentCheckpointFixture(
 	t *testing.T,
 	eventCount int,
@@ -682,9 +980,19 @@ func seedFailedIntentCompletedCheckpoint(
 	t.Helper()
 	checkpointNumber := "1788000000000"
 	checkpointHex := "aaaaaaaaaaaaaaaa"
-	if suffix == "split" {
+	switch suffix {
+	case "split":
 		checkpointNumber = "1788000000001"
 		checkpointHex = "bbbbbbbbbbbbbbbb"
+	case "closure-a":
+		checkpointNumber = "1788000000002"
+		checkpointHex = "cccccccccccccccc"
+	case "closure-b":
+		checkpointNumber = "1788000000003"
+		checkpointHex = "dddddddddddddddd"
+	case "closure-c":
+		checkpointNumber = "1788000000004"
+		checkpointHex = "eeeeeeeeeeeeeeee"
 	}
 	checkpointID := "cp-" + checkpointNumber + "-" + checkpointHex
 	checkpoint := Checkpoint{

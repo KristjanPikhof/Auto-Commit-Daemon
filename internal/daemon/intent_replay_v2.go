@@ -54,7 +54,8 @@ func replayIntentCandidateBatch(
 	// invalid before candidate evaluation returns a decision. Give the strict
 	// checkpoint recovery proof a chance to release that terminal candidate
 	// before asking the planner to continue it.
-	if forced && len(items) == 1 && opts.PublicationDrain == nil {
+	if forced && len(items) == 1 && opts.PublicationDrain == nil &&
+		intentRecoveryItemQuiescent(items[0], cfg) {
 		recovered, handled, recoveryErr := startFailedIntentCheckpointRecovery(
 			ctx, repoRoot, db, activeCtx, opts,
 			items[0].event.Seq, parent, sum)
@@ -327,7 +328,8 @@ func replayIntentCandidateBatch(
 		}
 	}
 	if !publishedAny {
-		if forced && len(items) == 1 && opts.PublicationDrain == nil {
+		if forced && len(items) == 1 && opts.PublicationDrain == nil &&
+			intentRecoveryItemQuiescent(items[0], cfg) {
 			recovered, handled, recoveryErr :=
 				startFailedIntentCheckpointRecovery(
 					ctx, repoRoot, db, activeCtx, opts,
@@ -346,6 +348,14 @@ func replayIntentCandidateBatch(
 		}
 	}
 	return sum, nil
+}
+
+func intentRecoveryItemQuiescent(
+	item intentReplayItem,
+	cfg intentReplayConfig,
+) bool {
+	return cfg.pathQuiescence <= 0 || pathQuiescentForEvent(
+		item.event, item.ops, cfg.pathQuiescence, pathQuiescenceNow())
 }
 
 func startFailedIntentCheckpointRecovery(
@@ -458,15 +468,16 @@ func updateIntentForwardRecoveryAfterReplay(
 		return sum, replayErr
 	}
 	if sum.Published > 0 {
+		completed, err := state.CompleteResolvedIntentForwardRecovery(
+			ctx, db, recovery)
+		if err != nil {
+			return sum, err
+		}
+		if completed {
+			logIntentForwardRecoveryCompletion(recovery, sum.Published)
+			return sum, nil
+		}
 		if recovery.Stage == publicationFallbackLocalUnlock {
-			if sum.RecoveryMode == publicationFallbackSemanticReplan {
-				if err := state.CompleteIntentForwardRecovery(
-					ctx, db, recovery, sum.Published); err != nil {
-					return sum, err
-				}
-				logIntentForwardRecoveryCompletion(recovery, sum.Published)
-				return sum, nil
-			}
 			nextStage := publicationFallbackSemanticReplan
 			if sum.PlannerCircuitOpen {
 				nextStage = publicationFallbackLocalUnlock
@@ -480,11 +491,9 @@ func updateIntentForwardRecoveryAfterReplay(
 			sum.HasMore = true
 			return sum, nil
 		}
-		if err := state.CompleteIntentForwardRecovery(
-			ctx, db, recovery, sum.Published); err != nil {
-			return sum, err
-		}
-		logIntentForwardRecoveryCompletion(recovery, sum.Published)
+		// Semantic recovery may publish several independently verified groups.
+		// Keep the frozen target until every member is durably resolved.
+		sum.HasMore = true
 		return sum, nil
 	}
 	if recovery.Stage == publicationFallbackSemanticReplan {

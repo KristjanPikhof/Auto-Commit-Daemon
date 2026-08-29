@@ -28,10 +28,73 @@ type IntentForwardRecovery struct {
 	LastProgressTS   float64 `json:"last_progress_ts,omitempty"`
 }
 
-// StartFailedIntentCheckpointRecovery atomically releases the failed
-// candidate holding one pending capture and freezes its complete checkpoint
-// for a bounded semantic replan. It deliberately refuses to infer a target
-// across checkpoints or while another Git/state transition is active.
+// OldestOverdueFailedIntentEventSeq returns the earliest pending capture held
+// by a failed, unpublished candidate after that capture reaches the configured
+// defer limit. Capture order wins over planner timestamps so unrelated newer
+// work cannot starve checkpoint recovery.
+func OldestOverdueFailedIntentEventSeq(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	branchGeneration int64,
+	deferLimit int,
+) (int64, bool, error) {
+	if d == nil || strings.TrimSpace(branchRef) == "" || branchGeneration < 0 {
+		return 0, false, errors.New(
+			"state: OldestOverdueFailedIntentEventSeq: invalid input")
+	}
+	if deferLimit < 0 {
+		deferLimit = 0
+	}
+	var seq int64
+	err := d.readSQL().QueryRowContext(ctx, `
+WITH barrier AS (
+    SELECT MIN(seq) AS first_seq
+    FROM capture_events
+    WHERE branch_ref=?
+      AND branch_generation=?
+      AND state IN (?,?)
+)
+SELECT event.seq
+FROM intent_candidate_events membership
+JOIN intent_candidates candidate ON candidate.id=membership.candidate_id
+JOIN capture_events event ON event.seq=membership.event_seq
+JOIN planner_state planner ON planner.event_seq=event.seq
+JOIN checkpoint_events checkpoint_event ON checkpoint_event.event_seq=event.seq
+JOIN checkpoints checkpoint ON checkpoint.id=checkpoint_event.checkpoint_id
+CROSS JOIN barrier
+WHERE membership.membership_state='active'
+  AND candidate.branch_ref=?
+  AND candidate.branch_generation=?
+  AND candidate.status IN ('waiting','blocked')
+  AND candidate.verification_status='failed'
+  AND candidate.published_commit_oid IS NULL
+  AND candidate.soft_publication_deadline IS NULL
+  AND event.branch_ref=?
+  AND event.branch_generation=?
+  AND event.state='pending'
+  AND planner.defer_count>=?
+  AND checkpoint.phase='completed'
+  AND (barrier.first_seq IS NULL OR event.seq<barrier.first_seq)
+ORDER BY event.seq
+LIMIT 1`, branchRef, branchGeneration, EventStateBlockedConflict,
+		EventStateFailed, branchRef, branchGeneration, branchRef,
+		branchGeneration, deferLimit).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf(
+			"state: find overdue failed intent event: %w", err)
+	}
+	return seq, true, nil
+}
+
+// StartFailedIntentCheckpointRecovery atomically releases the bounded closure
+// of failed candidates and completed checkpoints containing one held capture,
+// then freezes that exact pending target for a semantic replan. It refuses any
+// closure containing a healthy candidate, resolved capture, mixed branch pair,
+// or active Git/state transition.
 func StartFailedIntentCheckpointRecovery(
 	ctx context.Context,
 	d *DB,
@@ -77,6 +140,10 @@ SELECT value FROM daemon_meta WHERE key=?`,
 			"state: inspect existing intent forward recovery: %w", err)
 	}
 
+	type candidateMember struct {
+		seq  int64
+		path string
+	}
 	type candidateRecord struct {
 		id           string
 		status       string
@@ -85,42 +152,86 @@ SELECT value FROM daemon_meta WHERE key=?`,
 		deadline     sql.NullFloat64
 		revision     sql.NullInt64
 		profile      sql.NullString
+		members      []candidateMember
 	}
-	var candidate candidateRecord
-	err = tx.QueryRowContext(ctx, `
-SELECT candidate.id,candidate.status,candidate.verification_status,
-       candidate.published_commit_oid,candidate.soft_publication_deadline,
-       candidate.config_revision_id,candidate.config_profile
+	rootRows, err := tx.QueryContext(ctx, `
+SELECT candidate.id
 FROM intent_candidate_events membership
 JOIN intent_candidates candidate ON candidate.id=membership.candidate_id
 WHERE membership.event_seq=? AND membership.membership_state='active'
-  AND candidate.branch_ref=? AND candidate.branch_generation=?`,
-		heldEventSeq, branchRef, branchGeneration).Scan(
-		&candidate.id, &candidate.status, &candidate.verification,
-		&candidate.published, &candidate.deadline, &candidate.revision,
-		&candidate.profile)
-	if errors.Is(err, sql.ErrNoRows) {
-		return recovery, false, nil
-	}
+ORDER BY candidate.id`, heldEventSeq)
 	if err != nil {
 		return recovery, false, fmt.Errorf(
 			"state: load held intent candidate: %w", err)
 	}
-	if (candidate.status != IntentCandidateWaiting &&
-		candidate.status != IntentCandidateBlocked) ||
-		!candidate.verification.Valid ||
-		candidate.verification.String != "failed" ||
-		candidate.published.Valid || candidate.deadline.Valid {
+	var rootCandidateIDs []string
+	for rootRows.Next() {
+		var candidateID string
+		if err := rootRows.Scan(&candidateID); err != nil {
+			_ = rootRows.Close()
+			return recovery, false, fmt.Errorf(
+				"state: scan held intent candidate: %w", err)
+		}
+		rootCandidateIDs = append(rootCandidateIDs, candidateID)
+	}
+	if err := rootRows.Err(); err != nil {
+		_ = rootRows.Close()
+		return recovery, false, fmt.Errorf(
+			"state: iterate held intent candidates: %w", err)
+	}
+	if err := rootRows.Close(); err != nil {
+		return recovery, false, fmt.Errorf(
+			"state: close held intent candidates: %w", err)
+	}
+	if len(rootCandidateIDs) != 1 {
 		return recovery, false, nil
 	}
 
-	type candidateMember struct {
-		seq  int64
-		path string
-	}
-	var members []candidateMember
-	checkpointID := ""
-	memberRows, err := tx.QueryContext(ctx, `
+	candidates := make(map[string]candidateRecord)
+	candidateQueued := map[string]struct{}{rootCandidateIDs[0]: {}}
+	candidateQueue := []string{rootCandidateIDs[0]}
+	checkpointSeen := make(map[string]struct{})
+	checkpointQueued := make(map[string]struct{})
+	var checkpointQueue []string
+	targetEvents := make(map[int64]struct{})
+
+	for len(candidateQueue) > 0 || len(checkpointQueue) > 0 {
+		if len(candidateQueue) > 0 {
+			candidateID := candidateQueue[0]
+			candidateQueue = candidateQueue[1:]
+			if _, loaded := candidates[candidateID]; loaded {
+				continue
+			}
+			var candidate candidateRecord
+			var candidateBranch string
+			var candidateGeneration int64
+			err := tx.QueryRowContext(ctx, `
+SELECT id,branch_ref,branch_generation,status,verification_status,
+       published_commit_oid,soft_publication_deadline,
+       config_revision_id,config_profile
+FROM intent_candidates WHERE id=?`, candidateID).Scan(
+				&candidate.id, &candidateBranch, &candidateGeneration,
+				&candidate.status, &candidate.verification,
+				&candidate.published, &candidate.deadline,
+				&candidate.revision, &candidate.profile)
+			if errors.Is(err, sql.ErrNoRows) {
+				return IntentForwardRecovery{}, false, nil
+			}
+			if err != nil {
+				return IntentForwardRecovery{}, false, fmt.Errorf(
+					"state: load failed intent closure candidate: %w", err)
+			}
+			if candidateBranch != branchRef ||
+				candidateGeneration != branchGeneration ||
+				(candidate.status != IntentCandidateWaiting &&
+					candidate.status != IntentCandidateBlocked) ||
+				!candidate.verification.Valid ||
+				candidate.verification.String != "failed" ||
+				candidate.published.Valid || candidate.deadline.Valid {
+				return IntentForwardRecovery{}, false, nil
+			}
+
+			memberRows, err := tx.QueryContext(ctx, `
 SELECT membership.event_seq,event.path,event.state,event.branch_ref,
        event.branch_generation,checkpoint_event.checkpoint_id
 FROM intent_candidate_events membership
@@ -128,51 +239,60 @@ JOIN capture_events event ON event.seq=membership.event_seq
 LEFT JOIN checkpoint_events checkpoint_event
   ON checkpoint_event.event_seq=membership.event_seq
 WHERE membership.candidate_id=? AND membership.membership_state='active'
-ORDER BY membership.ord,membership.event_seq`, candidate.id)
-	if err != nil {
-		return recovery, false, fmt.Errorf(
-			"state: load failed intent candidate members: %w", err)
-	}
-	for memberRows.Next() {
-		var member candidateMember
-		var eventState, eventBranchRef string
-		var eventGeneration int64
-		var memberCheckpoint sql.NullString
-		if err := memberRows.Scan(
-			&member.seq, &member.path, &eventState, &eventBranchRef,
-			&eventGeneration, &memberCheckpoint); err != nil {
-			_ = memberRows.Close()
-			return recovery, false, fmt.Errorf(
-				"state: scan failed intent candidate member: %w", err)
+ORDER BY membership.ord,membership.event_seq`, candidateID)
+			if err != nil {
+				return IntentForwardRecovery{}, false, fmt.Errorf(
+					"state: load failed intent closure members: %w", err)
+			}
+			for memberRows.Next() {
+				var member candidateMember
+				var eventState, eventBranchRef string
+				var eventGeneration int64
+				var checkpointID sql.NullString
+				if err := memberRows.Scan(
+					&member.seq, &member.path, &eventState, &eventBranchRef,
+					&eventGeneration, &checkpointID); err != nil {
+					_ = memberRows.Close()
+					return IntentForwardRecovery{}, false, fmt.Errorf(
+						"state: scan failed intent closure member: %w", err)
+				}
+				if eventState != EventStatePending || eventBranchRef != branchRef ||
+					eventGeneration != branchGeneration || !checkpointID.Valid ||
+					strings.TrimSpace(checkpointID.String) == "" {
+					_ = memberRows.Close()
+					return IntentForwardRecovery{}, false, nil
+				}
+				candidate.members = append(candidate.members, member)
+				if _, seen := checkpointSeen[checkpointID.String]; !seen {
+					if _, queued := checkpointQueued[checkpointID.String]; !queued {
+						checkpointQueued[checkpointID.String] = struct{}{}
+						checkpointQueue = append(checkpointQueue, checkpointID.String)
+					}
+				}
+			}
+			if err := memberRows.Err(); err != nil {
+				_ = memberRows.Close()
+				return IntentForwardRecovery{}, false, fmt.Errorf(
+					"state: iterate failed intent closure members: %w", err)
+			}
+			if err := memberRows.Close(); err != nil {
+				return IntentForwardRecovery{}, false, fmt.Errorf(
+					"state: close failed intent closure members: %w", err)
+			}
+			if len(candidate.members) == 0 {
+				return IntentForwardRecovery{}, false, nil
+			}
+			candidates[candidateID] = candidate
+			continue
 		}
-		if eventState != EventStatePending || eventBranchRef != branchRef ||
-			eventGeneration != branchGeneration || !memberCheckpoint.Valid ||
-			strings.TrimSpace(memberCheckpoint.String) == "" {
-			_ = memberRows.Close()
-			return recovery, false, nil
-		}
-		if checkpointID == "" {
-			checkpointID = memberCheckpoint.String
-		} else if checkpointID != memberCheckpoint.String {
-			_ = memberRows.Close()
-			return recovery, false, nil
-		}
-		members = append(members, member)
-	}
-	if err := memberRows.Err(); err != nil {
-		_ = memberRows.Close()
-		return recovery, false, fmt.Errorf(
-			"state: iterate failed intent candidate members: %w", err)
-	}
-	if err := memberRows.Close(); err != nil {
-		return recovery, false, fmt.Errorf(
-			"state: close failed intent candidate members: %w", err)
-	}
-	if len(members) == 0 || checkpointID == "" {
-		return recovery, false, nil
-	}
 
-	targetRows, err := tx.QueryContext(ctx, `
+		checkpointID := checkpointQueue[0]
+		checkpointQueue = checkpointQueue[1:]
+		if _, seen := checkpointSeen[checkpointID]; seen {
+			continue
+		}
+		checkpointSeen[checkpointID] = struct{}{}
+		targetRows, err := tx.QueryContext(ctx, `
 SELECT checkpoint_event.event_seq,event.state,event.branch_ref,
        event.branch_generation,checkpoint.phase
 FROM checkpoint_events checkpoint_event
@@ -180,43 +300,106 @@ JOIN checkpoints checkpoint ON checkpoint.id=checkpoint_event.checkpoint_id
 JOIN capture_events event ON event.seq=checkpoint_event.event_seq
 WHERE checkpoint_event.checkpoint_id=?
 ORDER BY checkpoint_event.ord`, checkpointID)
-	if err != nil {
-		return recovery, false, fmt.Errorf(
-			"state: load failed intent checkpoint target: %w", err)
-	}
-	for targetRows.Next() {
-		var seq, eventGeneration int64
-		var eventState, eventBranchRef, checkpointPhase string
-		if err := targetRows.Scan(
-			&seq, &eventState, &eventBranchRef, &eventGeneration,
-			&checkpointPhase); err != nil {
-			_ = targetRows.Close()
-			return recovery, false, fmt.Errorf(
-				"state: scan failed intent checkpoint target: %w", err)
+		if err != nil {
+			return IntentForwardRecovery{}, false, fmt.Errorf(
+				"state: load failed intent closure checkpoint: %w", err)
 		}
-		if checkpointPhase != CheckpointCompleted ||
-			eventState != EventStatePending || eventBranchRef != branchRef ||
-			eventGeneration != branchGeneration {
-			_ = targetRows.Close()
-			return recovery, false, nil
+		var checkpointEvents []int64
+		for targetRows.Next() {
+			var seq, eventGeneration int64
+			var eventState, eventBranchRef, checkpointPhase string
+			if err := targetRows.Scan(
+				&seq, &eventState, &eventBranchRef, &eventGeneration,
+				&checkpointPhase); err != nil {
+				_ = targetRows.Close()
+				return IntentForwardRecovery{}, false, fmt.Errorf(
+					"state: scan failed intent closure checkpoint: %w", err)
+			}
+			if checkpointPhase != CheckpointCompleted ||
+				eventBranchRef != branchRef ||
+				eventGeneration != branchGeneration {
+				_ = targetRows.Close()
+				return IntentForwardRecovery{}, false, nil
+			}
+			switch eventState {
+			case EventStatePublished, EventStateRecovered:
+				// A prior bounded recovery may already have settled part of this
+				// checkpoint. Keep that proof intact and replan only the durable
+				// pending remainder.
+				continue
+			case EventStatePending:
+			default:
+				_ = targetRows.Close()
+				return IntentForwardRecovery{}, false, nil
+			}
+			checkpointEvents = append(checkpointEvents, seq)
+			targetEvents[seq] = struct{}{}
+			if len(targetEvents) > IntentCandidateMaxCaptures {
+				_ = targetRows.Close()
+				return IntentForwardRecovery{}, false, nil
+			}
 		}
-		recovery.TargetEventSeqs = append(recovery.TargetEventSeqs, seq)
-		if len(recovery.TargetEventSeqs) > IntentCandidateMaxCaptures {
+		if err := targetRows.Err(); err != nil {
 			_ = targetRows.Close()
+			return IntentForwardRecovery{}, false, fmt.Errorf(
+				"state: iterate failed intent closure checkpoint: %w", err)
+		}
+		if err := targetRows.Close(); err != nil {
+			return IntentForwardRecovery{}, false, fmt.Errorf(
+				"state: close failed intent closure checkpoint: %w", err)
+		}
+		if len(checkpointEvents) == 0 {
 			return IntentForwardRecovery{}, false, nil
 		}
+		for _, seq := range checkpointEvents {
+			ownerRows, err := tx.QueryContext(ctx, `
+SELECT candidate_id FROM intent_candidate_events
+WHERE event_seq=? AND membership_state='active'
+ORDER BY candidate_id`, seq)
+			if err != nil {
+				return IntentForwardRecovery{}, false, fmt.Errorf(
+					"state: load failed intent closure owners: %w", err)
+			}
+			for ownerRows.Next() {
+				var ownerID string
+				if err := ownerRows.Scan(&ownerID); err != nil {
+					_ = ownerRows.Close()
+					return IntentForwardRecovery{}, false, fmt.Errorf(
+						"state: scan failed intent closure owner: %w", err)
+				}
+				if _, queued := candidateQueued[ownerID]; queued {
+					continue
+				}
+				candidateQueued[ownerID] = struct{}{}
+				if len(candidateQueued) > IntentCandidateMaxOpenPerPair {
+					_ = ownerRows.Close()
+					return IntentForwardRecovery{}, false, nil
+				}
+				candidateQueue = append(candidateQueue, ownerID)
+			}
+			if err := ownerRows.Err(); err != nil {
+				_ = ownerRows.Close()
+				return IntentForwardRecovery{}, false, fmt.Errorf(
+					"state: iterate failed intent closure owners: %w", err)
+			}
+			if err := ownerRows.Close(); err != nil {
+				return IntentForwardRecovery{}, false, fmt.Errorf(
+					"state: close failed intent closure owners: %w", err)
+			}
+		}
 	}
-	if err := targetRows.Err(); err != nil {
-		_ = targetRows.Close()
-		return IntentForwardRecovery{}, false, fmt.Errorf(
-			"state: iterate failed intent checkpoint target: %w", err)
+
+	if len(candidates) == 0 || len(targetEvents) == 0 {
+		return IntentForwardRecovery{}, false, nil
 	}
-	if err := targetRows.Close(); err != nil {
-		return IntentForwardRecovery{}, false, fmt.Errorf(
-			"state: close failed intent checkpoint target: %w", err)
+	recovery.TargetEventSeqs = make([]int64, 0, len(targetEvents))
+	for seq := range targetEvents {
+		recovery.TargetEventSeqs = append(recovery.TargetEventSeqs, seq)
 	}
-	if len(recovery.TargetEventSeqs) == 0 ||
-		!containsEventSeq(recovery.TargetEventSeqs, heldEventSeq) {
+	sort.Slice(recovery.TargetEventSeqs, func(i, j int) bool {
+		return recovery.TargetEventSeqs[i] < recovery.TargetEventSeqs[j]
+	})
+	if !containsEventSeq(recovery.TargetEventSeqs, heldEventSeq) {
 		return IntentForwardRecovery{}, false, nil
 	}
 
@@ -258,7 +441,14 @@ SELECT
 	}
 
 	now := nowSeconds()
-	result, err := tx.ExecContext(ctx, `
+	candidateIDs := make([]string, 0, len(candidates))
+	for candidateID := range candidates {
+		candidateIDs = append(candidateIDs, candidateID)
+	}
+	sort.Strings(candidateIDs)
+	for _, candidateID := range candidateIDs {
+		candidate := candidates[candidateID]
+		result, err := tx.ExecContext(ctx, `
 UPDATE intent_candidates
 SET status='superseded',readiness='wait',soft_publication_deadline=NULL,
     updated_ts=?
@@ -267,68 +457,72 @@ WHERE id=? AND branch_ref=? AND branch_generation=?
   AND verification_status='failed'
   AND published_commit_oid IS NULL
   AND soft_publication_deadline IS NULL`,
-		now, candidate.id, branchRef, branchGeneration)
-	if err != nil {
-		return IntentForwardRecovery{}, false, fmt.Errorf(
-			"state: retire failed intent checkpoint candidate: %w", err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return IntentForwardRecovery{}, false, err
-	}
-	if changed != 1 {
-		return IntentForwardRecovery{}, false, nil
-	}
-	result, err = tx.ExecContext(ctx, `
+			now, candidate.id, branchRef, branchGeneration)
+		if err != nil {
+			return IntentForwardRecovery{}, false, fmt.Errorf(
+				"state: retire failed intent checkpoint candidate: %w", err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return IntentForwardRecovery{}, false, err
+		}
+		if changed != 1 {
+			return IntentForwardRecovery{}, false, nil
+		}
+		result, err = tx.ExecContext(ctx, `
 UPDATE intent_candidate_events
-SET membership_state='superseded'
-WHERE candidate_id=? AND membership_state='active'`, candidate.id)
-	if err != nil {
-		return IntentForwardRecovery{}, false, fmt.Errorf(
-			"state: release failed intent checkpoint membership: %w", err)
-	}
-	released, err := result.RowsAffected()
-	if err != nil {
-		return IntentForwardRecovery{}, false, err
-	}
-	if released != int64(len(members)) {
-		return IntentForwardRecovery{}, false, errors.New(
-			"state: failed intent checkpoint membership changed")
+	SET membership_state='superseded'
+	WHERE candidate_id=? AND membership_state='active'`, candidate.id)
+		if err != nil {
+			return IntentForwardRecovery{}, false, fmt.Errorf(
+				"state: release failed intent checkpoint membership: %w", err)
+		}
+		released, err := result.RowsAffected()
+		if err != nil {
+			return IntentForwardRecovery{}, false, err
+		}
+		if released != int64(len(candidate.members)) {
+			return IntentForwardRecovery{}, false, errors.New(
+				"state: failed intent checkpoint membership changed")
+		}
 	}
 
 	recovery.BranchRef = branchRef
 	recovery.BranchGeneration = branchGeneration
-	recovery.CandidateID = candidate.id
+	recovery.CandidateID = rootCandidateIDs[0]
 	recovery.Reason = failedIntentCheckpointRecoveryReason
 	recovery.Stage = "semantic_replan"
 	recovery.LastProgressTS = now
-	for _, member := range members {
-		if _, err := appendDecision(ctx, tx, DecisionRecord{
-			DecisionTS:       now,
-			Kind:             DecisionKindIntentForwardRecovery,
-			Path:             sql.NullString{String: member.path, Valid: member.path != ""},
-			Reason:           sql.NullString{String: recovery.Reason, Valid: true},
-			EventSeq:         sql.NullInt64{Int64: member.seq, Valid: true},
-			BranchRef:        sql.NullString{String: branchRef, Valid: true},
-			BranchGeneration: sql.NullInt64{Int64: branchGeneration, Valid: true},
-			ActionTaken: sql.NullString{
-				String: "retired_failed_candidate_for_checkpoint_recovery", Valid: true,
-			},
-			UserMessage: sql.NullString{
-				String: "ACD released the failed commit group and will replan the complete protected checkpoint.",
-				Valid:  true,
-			},
-			ConfigRevisionID: candidate.revision,
-			ConfigProfile:    candidate.profile,
-		}); err != nil {
-			return IntentForwardRecovery{}, false, err
+	for _, candidateID := range candidateIDs {
+		candidate := candidates[candidateID]
+		for _, member := range candidate.members {
+			if _, err := appendDecision(ctx, tx, DecisionRecord{
+				DecisionTS:       now,
+				Kind:             DecisionKindIntentForwardRecovery,
+				Path:             sql.NullString{String: member.path, Valid: member.path != ""},
+				Reason:           sql.NullString{String: recovery.Reason, Valid: true},
+				EventSeq:         sql.NullInt64{Int64: member.seq, Valid: true},
+				BranchRef:        sql.NullString{String: branchRef, Valid: true},
+				BranchGeneration: sql.NullInt64{Int64: branchGeneration, Valid: true},
+				ActionTaken: sql.NullString{
+					String: "retired_failed_candidate_for_checkpoint_recovery", Valid: true,
+				},
+				UserMessage: sql.NullString{
+					String: "ACD released the failed commit groups and will replan their complete protected checkpoints.",
+					Valid:  true,
+				},
+				ConfigRevisionID: candidate.revision,
+				ConfigProfile:    candidate.profile,
+			}); err != nil {
+				return IntentForwardRecovery{}, false, err
+			}
 		}
 	}
 	markerRawBytes, err := json.Marshal(recovery)
 	if err != nil {
 		return IntentForwardRecovery{}, false, err
 	}
-	result, err = tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
 INSERT INTO daemon_meta(key,value,updated_ts)
 VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`,
 		intentForwardRecoveryMetaKey, string(markerRawBytes), now)
@@ -791,8 +985,9 @@ UPDATE daemon_meta SET value=?,updated_ts=? WHERE key=?`,
 	return current, nil
 }
 
-// CompleteIntentForwardRecovery clears the marker and records the successful
-// recovery mode for read-only diagnostics.
+// CompleteIntentForwardRecovery clears the marker only after the frozen target
+// is fully resolved. The published count remains an API guard for callers that
+// observed progress; durable event state is the completion proof.
 func CompleteIntentForwardRecovery(
 	ctx context.Context,
 	d *DB,
@@ -803,46 +998,13 @@ func CompleteIntentForwardRecovery(
 		published <= 0 {
 		return errors.New("state: CompleteIntentForwardRecovery: invalid input")
 	}
-	tx, err := d.conn.BeginTx(ctx, nil)
+	completed, err := CompleteResolvedIntentForwardRecovery(ctx, d, recovery)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-	var raw string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT value FROM daemon_meta WHERE key=?`,
-		intentForwardRecoveryMetaKey).Scan(&raw); err != nil {
-		return err
+	if !completed {
+		return errors.New(
+			"state: intent forward recovery target remains unresolved")
 	}
-	var current IntentForwardRecovery
-	if err := json.Unmarshal([]byte(raw), &current); err != nil {
-		return err
-	}
-	if current.BranchRef != recovery.BranchRef ||
-		current.BranchGeneration != recovery.BranchGeneration ||
-		current.CandidateID != recovery.CandidateID {
-		return errors.New("state: intent forward recovery marker changed")
-	}
-	now := nowSeconds()
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM daemon_meta WHERE key=?`, intentForwardRecoveryMetaKey); err != nil {
-		return err
-	}
-	mode := recovery.Stage
-	if mode == "" {
-		mode = "semantic_replan"
-	}
-	for key, value := range map[string]string{
-		"intent.v2.last_fallback_mode":   mode,
-		"intent.v2.last_fallback_size":   strconv.Itoa(published),
-		"intent.v2.last_fallback_reason": recovery.Reason,
-	} {
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,?)
-ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_ts=excluded.updated_ts`,
-			key, value, now); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return nil
 }

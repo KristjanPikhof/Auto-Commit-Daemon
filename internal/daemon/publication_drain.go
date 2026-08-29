@@ -413,6 +413,19 @@ func configureIntentSalvage(
 	cfg.semanticSalvage = true
 }
 
+func configureIntentForwardRecovery(
+	cfg *intentReplayConfig,
+	health *IntentPlannerHealth,
+	stage string,
+	targetSeqs []int64,
+) {
+	quiescence := cfg.pathQuiescence
+	configureIntentSalvage(cfg, health, stage, targetSeqs)
+	// A forward marker proves target membership, not that its paths are quiet.
+	// Keep the configured gate across recursive and restart recovery passes.
+	cfg.pathQuiescence = quiescence
+}
+
 // publicationDrainAtomicFallbackWindow returns the smallest complete hard
 // dependency component. A singleton is valid when it is the least work needed
 // to give semantic planning a new HEAD and fingerprint.
