@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -30,6 +31,29 @@ type IntentPlanRun struct {
 	Completed           bool
 	CreatedTS           float64
 	UpdatedTS           float64
+}
+
+// IntentPlanRunByFingerprint loads one exact durable planning result without
+// creating, reserving, or updating a run. Recovery callers can then validate
+// and parse ResolvedPlanJSON through the same planner path that created it.
+func IntentPlanRunByFingerprint(
+	ctx context.Context,
+	d *DB,
+	fingerprint string,
+) (IntentPlanRun, bool, error) {
+	if d == nil || fingerprint == "" {
+		return IntentPlanRun{}, false,
+			fmt.Errorf("state: IntentPlanRunByFingerprint: invalid input")
+	}
+	run, err := scanIntentPlanRun(d.readSQL().QueryRowContext(
+		ctx, intentPlanRunSelect+` WHERE fingerprint=?`, fingerprint))
+	if errors.Is(err, sql.ErrNoRows) {
+		return IntentPlanRun{}, false, nil
+	}
+	if err != nil {
+		return IntentPlanRun{}, false, err
+	}
+	return run, true, nil
 }
 
 // EnsureIntentPlanRun returns the durable row for a fingerprint without
