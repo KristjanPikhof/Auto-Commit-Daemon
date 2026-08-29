@@ -1005,8 +1005,25 @@ func PruneRecoverySnapshotEventsBefore(ctx context.Context, d *DB, snapshotID in
 	if d == nil || snapshotID < 1 {
 		return 0, fmt.Errorf("state: PruneRecoverySnapshotEventsBefore: invalid selector")
 	}
-	res, err := d.conn.ExecContext(ctx, `
-DELETE FROM capture_events
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("state: begin protected recovery snapshot prune: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+CREATE TEMP TABLE IF NOT EXISTS acd_prune_snapshot_events(
+    event_seq INTEGER PRIMARY KEY
+) WITHOUT ROWID`); err != nil {
+		return 0, fmt.Errorf("state: create protected recovery snapshot prune set: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_snapshot_events`); err != nil {
+		return 0, fmt.Errorf("state: clear protected recovery snapshot prune set: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO acd_prune_snapshot_events(event_seq)
+SELECT capture_events.seq
+FROM capture_events
 WHERE state IN ('published', 'recovered')
   AND captured_ts < ?
   AND EXISTS (
@@ -1014,13 +1031,54 @@ WHERE state IN ('published', 'recovered')
       FROM recovery_snapshot_events member
       WHERE member.snapshot_id = ?
         AND member.event_seq = capture_events.seq
-  )`, cutoff, snapshotID)
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM checkpoint_events member
+      WHERE member.event_seq = capture_events.seq
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM publication_drain_events member
+      WHERE member.event_seq = capture_events.seq
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM intent_candidate_events member
+      JOIN intent_candidates candidate ON candidate.id=member.candidate_id
+      WHERE member.event_seq=capture_events.seq
+        AND member.membership_state='active'
+        AND candidate.status IN
+            ('open','waiting','ready','soft_published','blocked')
+  )`, cutoff, snapshotID); err != nil {
+		return 0, fmt.Errorf("state: select protected recovery snapshot prune set: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM intent_capture_dependencies
+WHERE prerequisite_seq IN (SELECT event_seq FROM acd_prune_snapshot_events)
+   OR dependent_seq IN (SELECT event_seq FROM acd_prune_snapshot_events)`); err != nil {
+		return 0, fmt.Errorf("state: prune protected recovery snapshot intent dependencies: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM intent_candidate_events
+WHERE event_seq IN (SELECT event_seq FROM acd_prune_snapshot_events)`); err != nil {
+		return 0, fmt.Errorf("state: prune protected recovery snapshot intent membership: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+DELETE FROM capture_events
+WHERE seq IN (SELECT event_seq FROM acd_prune_snapshot_events)`)
 	if err != nil {
 		return 0, fmt.Errorf("state: prune protected recovery snapshot events: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("state: prune protected recovery snapshot event rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_prune_snapshot_events`); err != nil {
+		return 0, fmt.Errorf("state: clear completed recovery snapshot prune set: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("state: commit protected recovery snapshot prune: %w", err)
 	}
 	return int(n), nil
 }
