@@ -50,6 +50,18 @@ func replayIntentCandidateBatch(
 	forced bool,
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
+	// A persisted verification failure can make the forced-aging baseline
+	// invalid before candidate evaluation returns a decision. Give the strict
+	// checkpoint recovery proof a chance to release that terminal candidate
+	// before asking the planner to continue it.
+	if forced && len(items) == 1 && opts.PublicationDrain == nil {
+		recovered, handled, recoveryErr := startFailedIntentCheckpointRecovery(
+			ctx, repoRoot, db, activeCtx, opts,
+			items[0].event.Seq, parent, sum)
+		if recoveryErr != nil || handled {
+			return recovered, recoveryErr
+		}
+	}
 	diffBySeq := make(map[int64]string, len(legacyRequest.OfferedCaptures))
 	for _, offered := range legacyRequest.OfferedCaptures {
 		diffBySeq[offered.Seq] = offered.CapturedDiff
@@ -115,7 +127,7 @@ func replayIntentCandidateBatch(
 		Hints:         runtimeIntentDependencyHints(captures),
 		Materialize: intentCandidateScratchMaterializer(
 			repoRoot, opts.GitDir, parent),
-		PreflightMaterialize: intentCandidateScratchMaterializer(
+		PreflightMaterialize: intentCandidatePreflightMaterializer(
 			repoRoot, opts.GitDir, parent),
 		VerificationMode:    opts.IntentVerificationMode,
 		Verify:              opts.IntentCandidateVerify,
@@ -315,6 +327,15 @@ func replayIntentCandidateBatch(
 		}
 	}
 	if !publishedAny {
+		if forced && len(items) == 1 && opts.PublicationDrain == nil {
+			recovered, handled, recoveryErr :=
+				startFailedIntentCheckpointRecovery(
+					ctx, repoRoot, db, activeCtx, opts,
+					items[0].event.Seq, currentParent, sum)
+			if recoveryErr != nil || handled {
+				return recovered, recoveryErr
+			}
+		}
 		sum.Skipped = true
 		if evaluation.NeedsAttention {
 			sum.SkippedReason = "intent_v2_needs_attention"
@@ -325,6 +346,46 @@ func replayIntentCandidateBatch(
 		}
 	}
 	return sum, nil
+}
+
+func startFailedIntentCheckpointRecovery(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	activeCtx CaptureContext,
+	opts ReplayOpts,
+	heldEventSeq int64,
+	currentParent string,
+	sum ReplaySummary,
+) (ReplaySummary, bool, error) {
+	recovery, changed, err := state.StartFailedIntentCheckpointRecovery(
+		ctx, db, activeCtx.BranchRef, activeCtx.BranchGeneration,
+		heldEventSeq)
+	if err != nil {
+		return sum, true, err
+	}
+	if !changed {
+		return sum, false, nil
+	}
+	slog.Default().Info("failed intent candidate entered checkpoint recovery",
+		"candidate_id", recovery.CandidateID,
+		"reason", recovery.Reason,
+		"target_events", len(recovery.TargetEventSeqs),
+		"branch_generation", recovery.BranchGeneration)
+	sum.Skipped = true
+	sum.SkippedReason = "intent_v2_forward_recovery_" + recovery.Reason
+	sum.Disposition = ReplayDispositionRecoverableStall
+	sum.DispositionReason = recovery.Reason
+	sum.HasMore = true
+	if opts.PublicationDrain != nil || opts.forwardRecoveryAttempted ||
+		sum.Published > 0 {
+		return sum, true, nil
+	}
+	opts.forwardRecoveryAttempted = true
+	retryCtx := activeCtx
+	retryCtx.BaseHead = currentParent
+	retried, retryErr := Replay(ctx, repoRoot, db, retryCtx, opts)
+	return retried, true, retryErr
 }
 
 func recoverIntentCandidateForward(
@@ -795,6 +856,18 @@ func intentCandidateScratchMaterializer(
 		if err == nil {
 			currentSeed = tree
 		}
+		return err
+	}
+}
+
+func intentCandidatePreflightMaterializer(
+	repoRoot, gitDir, parent string,
+) IntentCandidateMaterializer {
+	// A correction can preflight a smaller request after the initial baseline.
+	// Each request starts from the pass parent, not the prior synthetic result.
+	return func(ctx context.Context, captures []IntentCandidateCapture) error {
+		_, err := materializeIntentCandidateTree(
+			ctx, repoRoot, gitDir, parent, captures)
 		return err
 	}
 }
