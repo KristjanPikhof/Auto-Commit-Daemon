@@ -78,7 +78,8 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // v22 adds durable adaptive planner attempts and additive window summaries.
 // v23 preserves the bounded resolved plan for restart-safe reuse. v24 adds
 // immutable Intent repair membership and zero-member seals for historical
-// repairs without inventing historical membership.
+// repairs without inventing historical membership. v25 freezes the runtime
+// strategy, active revision, and provider used by publication drains.
 // New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
@@ -256,6 +257,83 @@ FROM intent_repairs repair
 LEFT JOIN intent_repair_members member ON member.repair_id=repair.id
 GROUP BY repair.id`); err != nil {
 			return fmt.Errorf("state: seal legacy intent repair membership: %w", err)
+		}
+	}
+	if cur < 25 {
+		for _, col := range []struct {
+			name string
+			typ  string
+		}{
+			{"commit_strategy", "TEXT NOT NULL DEFAULT ''"},
+			{"commit_format", "TEXT NOT NULL DEFAULT ''"},
+			{"config_revision_id", "INTEGER NOT NULL DEFAULT 0"},
+			{"provider", "TEXT NOT NULL DEFAULT ''"},
+			{"provider_model", "TEXT NOT NULL DEFAULT ''"},
+			{"provider_fingerprint", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			if err := addColumnIfMissing(
+				ctx, tx, "publication_drains", col.name, col.typ); err != nil {
+				return err
+			}
+		}
+		// Legacy drains did not persist their runtime contract. Adopt one only
+		// when a completed provider plan selected a frozen target event after
+		// drain preparation and every such proof has one revision-backed tuple.
+		// Current daemon_meta is deliberately excluded because settings may have
+		// changed after drain preparation.
+		if _, err := tx.ExecContext(ctx, `
+WITH tuple_proofs AS (
+    SELECT d.id AS drain_id,
+           w.provider AS provider,
+           COALESCE(w.model, '') AS provider_model,
+           w.commit_format AS commit_format,
+           COALESCE(w.config_revision_id, 0) AS config_revision_id
+    FROM publication_drains d
+    JOIN publication_drain_events de ON de.drain_id=d.id
+    JOIN intent_planner_window_events we ON we.event_seq=de.event_seq
+    JOIN intent_planner_windows w ON w.id=we.window_id
+    JOIN config_revisions r ON r.id=w.config_revision_id
+    WHERE d.phase!='completed'
+      AND w.planned_ts>=d.created_ts
+      AND we.selected=1
+      AND w.outcome='selected'
+      AND COALESCE(w.validation_failure, '')=''
+      AND w.resolution_mode='provider'
+      AND COALESCE(w.provider, '')!=''
+      AND w.provider!='deterministic'
+      AND w.provider NOT LIKE 'publication-drain-%'
+      AND w.commit_format IN ('imperative','conventional')
+      AND w.branch_ref=d.branch_ref
+      AND w.branch_generation=d.branch_generation
+      AND w.config_revision_id>0
+      AND json_extract(r.snapshot_json, '$."commit.strategy"')='intent'
+      AND json_extract(r.snapshot_json, '$."ai.provider"')=w.provider
+      AND COALESCE(json_extract(r.snapshot_json, '$."ai.model"'), '')=
+          COALESCE(w.model, '')
+      AND json_extract(r.snapshot_json, '$."commit.format"')=w.commit_format
+    GROUP BY d.id,w.provider,COALESCE(w.model,''),w.commit_format,
+             COALESCE(w.config_revision_id,0)
+), unambiguous AS (
+    SELECT drain_id,MIN(provider) AS provider,
+           MIN(provider_model) AS provider_model,
+           MIN(commit_format) AS commit_format,
+           MIN(config_revision_id) AS config_revision_id
+    FROM tuple_proofs
+    GROUP BY drain_id
+    HAVING COUNT(*)=1
+)
+UPDATE publication_drains
+SET commit_strategy='intent',
+    commit_format=(SELECT commit_format FROM unambiguous
+                   WHERE drain_id=publication_drains.id),
+    config_revision_id=(SELECT config_revision_id FROM unambiguous
+                        WHERE drain_id=publication_drains.id),
+    provider=(SELECT provider FROM unambiguous
+              WHERE drain_id=publication_drains.id),
+    provider_model=(SELECT provider_model FROM unambiguous
+                    WHERE drain_id=publication_drains.id)
+WHERE id IN (SELECT drain_id FROM unambiguous)`); err != nil {
+			return fmt.Errorf("state: freeze publication drain runtime contract: %w", err)
 		}
 	}
 	return nil
