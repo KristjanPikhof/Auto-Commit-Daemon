@@ -51,6 +51,32 @@ type intentPlannerWindowEventParticipationSummary struct {
 }
 
 func loadLastIntentPlannerWindowSQL(ctx context.Context, conn *sql.DB) (*intentPlannerWindowSummary, error) {
+	return loadLastIntentPlannerWindowSQLWithFilter(ctx, conn, "", nil)
+}
+
+func loadLastIntentPlannerWindowForPairSQL(
+	ctx context.Context,
+	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
+) (*intentPlannerWindowSummary, error) {
+	if branchRef == "" {
+		return nil, nil
+	}
+	return loadLastIntentPlannerWindowSQLWithFilter(
+		ctx,
+		conn,
+		"WHERE w.branch_ref=? AND w.branch_generation=?",
+		[]any{branchRef, branchGeneration},
+	)
+}
+
+func loadLastIntentPlannerWindowSQLWithFilter(
+	ctx context.Context,
+	conn *sql.DB,
+	filter string,
+	args []any,
+) (*intentPlannerWindowSummary, error) {
 	ok, err := sqliteTableExists(ctx, conn, "intent_planner_windows")
 	if err != nil {
 		return nil, fmt.Errorf("intent planner windows table check: %w", err)
@@ -59,9 +85,10 @@ func loadLastIntentPlannerWindowSQL(ctx context.Context, conn *sql.DB) (*intentP
 		return nil, nil
 	}
 	rows, err := conn.QueryContext(ctx, intentPlannerWindowSelectSQL+`
-FROM intent_planner_windows w
-ORDER BY w.id DESC
-LIMIT 1`)
+	FROM intent_planner_windows w
+	`+filter+`
+	ORDER BY w.id DESC
+	LIMIT 1`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query last intent planner window: %w", err)
 	}
