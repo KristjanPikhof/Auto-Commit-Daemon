@@ -184,6 +184,14 @@ first-parent suffix at exact `HEAD`; it rejects merges, tags, other refs, Git
 operations, publication pause, staged overlap, and failed gates. Normal
 publication never rewrites history and never pushes.
 
+An internal repair preserves ACD's live capture baseline and advances only its
+recorded base `HEAD`. Dirty paths that are still pending therefore remain
+represented once instead of being captured again after the repair.
+
+If an older runtime already left repeated captures in a queue, replay compares
+each file update with the state produced so far. An exact after-state match is
+a safe no-op, so the remaining real change can continue without user cleanup.
+
 Inspect product-facing results with:
 
 ~~~bash

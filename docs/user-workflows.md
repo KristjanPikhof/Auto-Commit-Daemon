@@ -42,6 +42,12 @@ The human status output keeps the main questions separate:
 | `ACD protection` | Whether background protection is on. |
 | `Current changes protected` | Whether the latest eligible changes have a completed durable checkpoint. |
 | `Published to Git` | Whether all protected changes are now in local Git commits. |
+| `Commit mode` | The configured strategy. A temporary local recovery remains part of Intent mode. |
+| `Publication queue` | All protected changes still waiting for local Git publication. |
+| `Active target` | The bounded remainder of an earlier `commit-all` request, when one exists. |
+| `Publication phase` | The current wait, planning, recovery, or publication step. |
+| `Last queue movement` | Time since durable queue progress; worker heartbeats do not reset it. |
+| `Worker liveness` | Whether the background worker is responsive, reported separately from progress. |
 | `Action needed` | Whether you need to do anything now. |
 | `Status` | What ACD is doing or why it stopped. |
 | `Next` | The next command, or `No action needed.` |
@@ -76,10 +82,11 @@ cannot move, ACD commits the smallest safe dependency group locally, even when
 that group contains one change. It then tries Intent planning again from the
 new `HEAD`. Existing commits are not rewritten.
 
-If the provider is unavailable, ACD keeps making safe local progress and tries
-semantic planning again when the provider circuit permits a probe. Recovery
-also runs during normal background publication. It does not require another
-`commit-all`, a database purge, or a manual Git commit.
+If the configured semantic provider is unavailable, ACD keeps the selected
+local group protected and retries its locked commit message. It does not
+publish a generic filename-based message. Recovery also runs during normal
+background publication. It does not require another `commit-all`, a database
+purge, or a manual Git commit.
 
 This command is also the normal way to let ACD include staged changes. ACD
 verifies the full private checkpoint before clearing the staging area back to

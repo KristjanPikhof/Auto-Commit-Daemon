@@ -133,10 +133,12 @@ Root help lists ten everyday commands:
 | `acd uninstall` | Remove managed components while preserving protected data by default. |
 
 `acd list` is the everyday overview. In a terminal it refreshes in place.
-Repositories that need action or are working stay visible, and recent
-repositories fill the rest of the five-row view. `SAFE` shows checkpoint
-coverage, `DRAIN` shows progress through an active publication target, and
-`LEFT` shows the remaining target or ordinary pending events. Use `--all` for
+Repositories that need action or are processing work stay visible, and recent
+repositories fill the rest of the five-row view. `MODE` confirms whether ACD
+is using Intent or event commits. `QUEUE` is all pending work, while `TARGET`
+shows the bounded remainder of an earlier `commit-all` request. `LAST MOVE`
+measures real queue progress rather than worker heartbeats, and `PHASE` says
+whether ACD is waiting, planning, recovering, or publishing. Use `--all` for
 every enabled repository, `--verbose` for operational details, or `--once` for
 one snapshot. `acd repo list` remains the static registration inventory.
 
