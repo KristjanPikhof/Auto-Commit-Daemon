@@ -336,64 +336,6 @@ WHERE branch_ref=? AND branch_generation=? AND id<>?
 	return nil
 }
 
-// MarkIntentCandidateVerificationPending clears a prior terminal-looking
-// verification projection when the exact candidate could not be checked
-// because its isolated workspace ran out of host resources. It preserves the
-// semantic plan, membership, readiness, and publication state so a later pass
-// can retry the same candidate without replanning it.
-func MarkIntentCandidateVerificationPending(
-	ctx context.Context,
-	d *DB,
-	candidateID string,
-	branchRef string,
-	branchGeneration int64,
-	summary string,
-	now float64,
-) (bool, error) {
-	if d == nil {
-		return false, errors.New(
-			"state: MarkIntentCandidateVerificationPending: nil db")
-	}
-	if err := boundedIntentLabel(
-		"candidate id", candidateID, 128, true); err != nil {
-		return false, err
-	}
-	if branchRef == "" || branchGeneration < 0 {
-		return false, errors.New(
-			"state: candidate verification pending requires an exact branch pair")
-	}
-	if err := boundedIntentSummary(
-		"candidate atomicity summary", summary,
-		IntentCandidateSummaryMaxChars); err != nil {
-		return false, err
-	}
-	if now <= 0 {
-		now = nowSeconds()
-	}
-	result, err := d.conn.ExecContext(ctx, `
-UPDATE intent_candidates
-SET atomicity_status='pending', atomicity_summary=?,
-    atomicity_checked_ts=?, verification_status='pending',
-    verification_output='', verification_ts=NULL, updated_ts=?
-WHERE id=? AND branch_ref=? AND branch_generation=?
-  AND status IN ('open','waiting','ready','soft_published','blocked')`,
-		summary, now, now, candidateID, branchRef, branchGeneration)
-	if err != nil {
-		return false, fmt.Errorf(
-			"state: mark candidate verification pending: %w", err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf(
-			"state: candidate verification pending rows affected: %w", err)
-	}
-	if changed > 1 {
-		return false, errors.New(
-			"state: candidate verification pending changed multiple rows")
-	}
-	return changed == 1, nil
-}
-
 func upsertIntentCandidateRow(
 	ctx context.Context,
 	tx *sql.Tx,
