@@ -401,6 +401,69 @@ func TestSelectIntentWindowBoundaryExcludesLaterCaptures(t *testing.T) {
 	}
 }
 
+func TestSelectIntentWindowOffersFreshPathsBeforeRetryingForcedCapture(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	for _, path := range []string{"stuck.go", "definition.go", "definition_test.go"} {
+		captureOnePendingFile(t, ctx, f, path, "package sample\n")
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("pending=%d want 3", len(pending))
+	}
+	if err := state.RecordPlannerDefer(
+		ctx, f.db, pending[0].Seq, 1, "waiting for definition"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending,
+		intentReplayConfig{window: 2, deferLimit: 1})
+	if err != nil {
+		t.Fatalf("selectIntentWindow: %v", err)
+	}
+	if forced || reason != "" || len(window) != 2 ||
+		window[0].Seq != pending[1].Seq || window[1].Seq != pending[2].Seq {
+		t.Fatalf("window=%+v forced=%v reason=%q; want fresh companion paths",
+			window, forced, reason)
+	}
+}
+
+func TestSelectIntentWindowKeepsFreshSamePathBehindForcedCapture(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	seedTrackedFileCommit(t, ctx, f, "chain.go", "package sample\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	first := captureSamePathEdit(t, ctx, f, "chain.go", "package sample\n\nvar first = true\n")
+	second := captureSamePathEdit(t, ctx, f, "chain.go", "package sample\n\nvar second = true\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if err := state.RecordPlannerDefer(
+		ctx, f.db, first, 1, "waiting for companion"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+
+	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending,
+		intentReplayConfig{window: 2, deferLimit: 1})
+	if err != nil {
+		t.Fatalf("selectIntentWindow: %v", err)
+	}
+	if !forced || reason != "" || len(window) != 1 ||
+		window[0].Seq != first || window[0].Seq == second {
+		t.Fatalf("window=%+v forced=%v reason=%q; want forced predecessor",
+			window, forced, reason)
+	}
+}
+
 func TestPruneConsumedIntentActivityBoundariesKeepsBoundedTail(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
