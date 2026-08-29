@@ -421,6 +421,7 @@ func TestSelectIntentWindowOffersFreshPathsBeforeRetryingForcedCapture(t *testin
 		ctx, f.db, pending[0].Seq, 1, "waiting for definition"); err != nil {
 		t.Fatalf("RecordPlannerDefer: %v", err)
 	}
+	saveWaitingIntentCandidateForEvent(t, ctx, f, pending[0].Seq)
 
 	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending,
 		intentReplayConfig{window: 2, deferLimit: 1})
@@ -451,6 +452,7 @@ func TestSelectIntentWindowKeepsFreshSamePathBehindForcedCapture(t *testing.T) {
 		ctx, f.db, first, 1, "waiting for companion"); err != nil {
 		t.Fatalf("RecordPlannerDefer: %v", err)
 	}
+	saveWaitingIntentCandidateForEvent(t, ctx, f, first)
 
 	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending,
 		intentReplayConfig{window: 2, deferLimit: 1})
@@ -461,6 +463,31 @@ func TestSelectIntentWindowKeepsFreshSamePathBehindForcedCapture(t *testing.T) {
 		window[0].Seq != first || window[0].Seq == second {
 		t.Fatalf("window=%+v forced=%v reason=%q; want forced predecessor",
 			window, forced, reason)
+	}
+}
+
+func saveWaitingIntentCandidateForEvent(
+	t *testing.T,
+	ctx context.Context,
+	f *captureFixture,
+	eventSeq int64,
+) {
+	t.Helper()
+	if err := state.SaveIntentCandidate(ctx, f.db, state.IntentCandidate{
+		ID:               fmt.Sprintf("intent-waiting-%d", eventSeq),
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		Status:           state.IntentCandidateWaiting,
+		Purpose:          "wait for a captured companion",
+		CreatedTS:        1,
+		UpdatedTS:        1,
+		Readiness:        state.IntentReadinessWait,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq:  eventSeq,
+			EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatalf("SaveIntentCandidate: %v", err)
 	}
 }
 
