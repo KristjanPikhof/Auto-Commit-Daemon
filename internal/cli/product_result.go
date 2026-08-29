@@ -170,7 +170,11 @@ func renderProductPublicationProgress(
 	}
 	strategy := strings.ToUpper(progress.Strategy[:1]) + progress.Strategy[1:]
 	if progress.TemporaryLocalFallback {
-		strategy += " (temporary local fallback active)"
+		if progress.Origin == "intent_recovery" {
+			strategy += " (verified Intent-group widening active)"
+		} else {
+			strategy += " (temporary local fallback active)"
+		}
 	}
 	fmt.Fprintf(out, "Commit mode: %s\n", strategy)
 	if progress.PlannerProvider != "" {
@@ -187,11 +191,14 @@ func renderProductPublicationProgress(
 		fmt.Fprintf(out, "Active target: earlier commit-all request, %d of %d left\n",
 			progress.TargetRemaining, progress.TargetTotal)
 	} else if progress.Origin == "intent_recovery" && progress.TargetTotal > 0 {
-		fmt.Fprintf(out, "Active target: automatic Intent replan, %d of %d left\n",
+		fmt.Fprintf(out, "Active target: automatic Intent recovery, %d of %d left\n",
 			progress.TargetRemaining, progress.TargetTotal)
 	}
 	fmt.Fprintf(out, "Publication phase: %s\n",
 		publicationProgressPhaseLabel(progress))
+	if progress.NeedsAttention && progress.AttentionReason != "" {
+		fmt.Fprintf(out, "Recovery reason: %s\n", progress.AttentionReason)
+	}
 	if progress.LastProgressTS > 0 {
 		fmt.Fprintf(out, "Last queue movement: %s ago\n",
 			formatDurationCompact(time.Duration(progress.LastProgressAgeSeconds)*time.Second))
@@ -240,6 +247,9 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 	case "recovering":
 		return "recovering the publication plan"
 	case "local_fallback":
+		if progress.Origin == "intent_recovery" {
+			return "widening a verified Intent group to recover the protected target"
+		}
 		return "publishing one safe local group, then returning to Intent"
 	case "provider_wait":
 		return "waiting for the Intent provider to write a semantic commit message"
@@ -251,6 +261,10 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 	case "retrying":
 		return "retrying publication automatically"
 	case "needs_action":
+		if progress.Origin == "intent_recovery" {
+			return intentRecoveryVerificationAttentionSummary + " " +
+				intentRecoveryVerificationAttentionNext
+		}
 		return "stopped at a safety check"
 	case "event_publishing":
 		return "publishing captured events"
