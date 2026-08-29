@@ -2,6 +2,15 @@
 
 ACD separates durable protection from Git publication.
 
+You change files, ACD captures them, groups related changes by intent, creates
+semantic local commits, and leaves you with a clean Git history.
+
+![From file changes to clean Git history](assets/acd-workflow.png)
+
+ACD validates every grouping plan before publication. If an AI-generated plan
+is invalid or unsafe, ACD rejects it and retries or rebuilds the plan. The
+completed checkpoint remains protected throughout that loop.
+
 ~~~text
 filesystem watch + complete poll + optional hints
                     |

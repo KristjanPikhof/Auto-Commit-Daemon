@@ -72,8 +72,10 @@ echo "Installed acd $VERSION to $INSTALL_DIR/acd"
 echo
 echo "Next:"
 echo "  1) Make sure $INSTALL_DIR is on your PATH"
-echo "  2) Enter the Git repository you want to protect"
-echo "  3) Run: acd setup"
-echo "     Setup explains each choice and tests your provider before writing"
+echo "  2) Run once: acd setup"
+echo "     Setup explains each choice and installs the shared runtime"
+echo "  3) Enter each Git repository you want to protect"
+echo "  4) Run: acd on"
+echo "  5) Confirm: acd status"
 echo
 echo "Tip: set ACD_VERSION=vYYYY-MM-DD to install a specific release."
