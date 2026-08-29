@@ -41,7 +41,21 @@ func TestWorkerActivityHintCoalescerClampsTrailingWake(t *testing.T) {
 
 	coalescer.Hint("worktree")
 	assertWorkerWake(t, wakes, "worktree", 100*time.Millisecond)
+	coalescer.Hint("worktree")
 	assertWorkerWake(t, wakes, "worktree", 200*time.Millisecond)
+}
+
+func TestWorkerActivityHintCoalescerSingleHintHasNoRedundantTail(t *testing.T) {
+	wakes := make(chan string, 2)
+	coalescer := newWorkerActivityHintCoalescer(
+		20*time.Millisecond, 40*time.Millisecond,
+		func(worktreeID string) { wakes <- worktreeID },
+	)
+	t.Cleanup(coalescer.Close)
+
+	coalescer.Hint("worktree")
+	assertWorkerWake(t, wakes, "worktree", 100*time.Millisecond)
+	assertNoWorkerWake(t, wakes, 80*time.Millisecond)
 }
 
 func TestWorkerActivityHintCoalescerCloseCancelsTail(t *testing.T) {

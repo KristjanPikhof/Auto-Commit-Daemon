@@ -13,6 +13,7 @@ const (
 type workerActivityHintBurst struct {
 	started    time.Time
 	generation uint64
+	hints      int
 	timer      *time.Timer
 }
 
@@ -61,6 +62,7 @@ func (c *workerActivityHintCoalescer) Hint(worktreeID string) {
 		c.bursts[worktreeID] = burst
 		c.activeWakes++
 	}
+	burst.hints++
 	burst.generation++
 	generation := burst.generation
 	if burst.timer != nil {
@@ -95,6 +97,10 @@ func (c *workerActivityHintCoalescer) fireTrailing(
 		return
 	}
 	delete(c.bursts, worktreeID)
+	if burst.hints < 2 {
+		c.mu.Unlock()
+		return
+	}
 	c.activeWakes++
 	c.mu.Unlock()
 	c.runWake(worktreeID)
