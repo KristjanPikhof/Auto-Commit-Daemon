@@ -643,6 +643,10 @@ func activateIntentV2Runtime(t *testing.T, repo string, extra ...string) []strin
 			cleaned = append(cleaned, item)
 		}
 	}
+	if _, configured := values[ai.EnvProvider]; !configured {
+		values[ai.EnvProvider] = "deterministic"
+		cleaned = append(cleaned, ai.EnvProvider+"=deterministic")
+	}
 	lookup := func(name string) (string, bool) {
 		value, ok := values[name]
 		return value, ok
@@ -650,10 +654,6 @@ func activateIntentV2Runtime(t *testing.T, repo string, extra ...string) []strin
 	overrides := config.Overrides{}
 	overrides[config.FieldCommitStrategy], _ = json.Marshal("intent")
 	overrides[config.FieldCommitPreset], _ = json.Marshal("fast")
-	if _, configured := values[ai.EnvProvider]; !configured {
-		overrides[config.FieldProvider], _ =
-			json.Marshal("subprocess:missing-integration")
-	}
 	resolved, preset, err := config.ResolveAll(config.ResolveInput{
 		Repository: overrides, LookupEnv: lookup,
 	}, overrides)
