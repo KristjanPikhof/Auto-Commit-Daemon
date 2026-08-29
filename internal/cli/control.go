@@ -550,12 +550,12 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	res.PendingEvents = status.PendingEvents
 	res.BlockedEvents = status.BlockedConflicts
 	res.Protected = status.Protected
-	res.Published = status.Protected && status.UnpublishedCheckpoints == 0 && status.PendingEvents == 0
+	res.Published = checkpointPublishedByACD(status)
 	res.Busy = status.Busy
 	res.OperationalState = status.OperationalState
 	res.WorktreeClean = status.WorktreeClean
 	res.AllChangesCommittedInGit = status.AllChangesCommittedInGit
-	res.CheckpointPublishedByACD = status.CheckpointPublishedByACD
+	res.CheckpointPublishedByACD = res.Published
 	res.CheckpointID = status.LatestCheckpointID
 	res.PublicationDrain = status.PublicationDrain
 	res.PublicationProgress = status.PublicationProgress
