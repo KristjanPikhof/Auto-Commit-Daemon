@@ -12,7 +12,7 @@ is invalid or unsafe, ACD rejects it and retries or rebuilds the plan. The
 completed checkpoint remains protected throughout that loop.
 
 ~~~text
-filesystem watch + complete poll + optional hints
+optional filesystem watch + complete poll + optional hints
                     |
                     v
           protection scheduler
