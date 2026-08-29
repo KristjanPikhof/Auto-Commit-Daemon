@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
@@ -13,6 +14,50 @@ import (
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+func TestIntentStatusSurfacesCompletedTransitionProofAttention(t *testing.T) {
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	message := "Durable ACD transition proof needs attention: ambiguous repair"
+	if err := state.MetaSet(ctx, db,
+		daemon.MetaKeyBranchTransitionNeedsAttention, message); err != nil {
+		t.Fatal(err)
+	}
+	report, err := loadIntentV2Report(ctx, db.SQL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ReplayState != "needs_attention" ||
+		!strings.Contains(report.NeedsAttention, "ambiguous repair") {
+		t.Fatalf("Intent report=%+v", report)
+	}
+	replay, err := loadReplayObservabilityReport(ctx, db.SQL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.State != "needs_attention" ||
+		!strings.Contains(replay.LastError, "ambiguous repair") {
+		t.Fatalf("Replay report=%+v", replay)
+	}
+	status := statusReport{
+		Daemon:                        "running",
+		Replay:                        replay,
+		IntentV2:                      report,
+		CheckpointProtectionAvailable: true,
+		PublicationDrain: publicationDrainReport{
+			Phase: state.PublicationDrainSemantic,
+		},
+	}
+	if got := statusOperationalStateWithDaemonAlive(status, true); got != "needs_attention" {
+		t.Fatalf("Operational state=%q want needs_attention", got)
+	}
+	result := controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, status, true)
+	if result.OK || result.Health != controlHealthNeedsAttention ||
+		!result.RecoveryRequired || result.NextAction == "No action needed." {
+		t.Fatalf("Control result=%+v", result)
+	}
+}
 
 const completedTransitionBarrierDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -81,7 +126,22 @@ func TestFreezePublicationDrainTargetAcceptsCompletedIntentRepairWithStaleCheckp
 			OldOID: oldHead,
 		}},
 	}
-	if err := state.SaveIntentRepair(ctx, db, repair); err != nil {
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repairs(
+    id,branch_ref,branch_generation,status,expected_head,plan_digest,
+    old_head,created_ts,updated_ts,error
+) VALUES (?,?,?,?,?,?,?,?,?,'');
+INSERT INTO intent_repair_commits(
+    repair_id,ord,candidate_id,old_oid
+) VALUES (?,0,?,?);
+INSERT INTO intent_repair_member_seals(
+    repair_id,membership_mode,member_count
+) VALUES (?,'legacy',0)`,
+		repair.ID, repair.BranchRef, repair.BranchGeneration, repair.Status,
+		repair.ExpectedHead, repair.PlanDigest, repair.OldHead,
+		repair.CreatedTS, repair.UpdatedTS,
+		repair.ID, repair.Commits[0].CandidateID, repair.Commits[0].OldOID,
+		repair.ID); err != nil {
 		t.Fatal(err)
 	}
 	mapping := []state.IntentRepairCommit{{

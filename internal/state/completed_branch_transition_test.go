@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -62,9 +63,7 @@ func TestCompletedBranchTransitionChainAcceptsNoncontiguousRepartition(t *testin
 			{CandidateID: sql.NullString{String: "candidate-b", Valid: true}, OldOID: "old-b1"},
 		},
 	}
-	if err := SaveIntentRepair(ctx, db, repair); err != nil {
-		t.Fatal(err)
-	}
+	saveLegacyIntentRepair(t, db, repair)
 	mappings := []IntentRepairCommit{
 		{CandidateID: sql.NullString{String: "candidate-a", Valid: true}, OldOID: "old-a1", NewOID: sql.NullString{String: "new-a", Valid: true}},
 		{CandidateID: sql.NullString{String: "candidate-a", Valid: true}, OldOID: source, NewOID: sql.NullString{String: "new-a", Valid: true}},
@@ -173,7 +172,8 @@ func TestCompletedBranchTransitionChainRejectsAmbiguousOutgoing(t *testing.T) {
 
 	chain, ok, err := CompletedBranchTransitionChain(
 		ctx, db, branch, generation, source, "repair-target")
-	if err == nil || !strings.Contains(err.Error(), "ambiguous") || ok || chain != nil {
+	if err == nil || !errors.Is(err, ErrCompletedBranchTransitionProof) ||
+		!strings.Contains(err.Error(), "ambiguous") || ok || chain != nil {
 		t.Fatalf("ambiguous chain=(%+v,%t,%v)", chain, ok, err)
 	}
 }
@@ -189,6 +189,7 @@ func TestCompletedBranchTransitionOwnsCheckpointTargetUsesRepairMembers(t *testi
 		{name: "post-checkpoint member included", checkpointTS: 1, includeMember: true, want: true},
 		{name: "post-checkpoint member outside target", checkpointTS: 1},
 		{name: "post-checkpoint legacy repair", legacy: true, checkpointTS: 1},
+		{name: "same-time legacy repair", legacy: true, checkpointTS: 4},
 		{name: "pre-checkpoint legacy repair", legacy: true, checkpointTS: 10, want: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -221,6 +222,33 @@ func TestCompletedBranchTransitionOwnsCheckpointTargetUsesRepairMembers(t *testi
 				t.Fatalf("owned=(%t, %v) want (%t, nil)", owned, err, test.want)
 			}
 		})
+	}
+}
+
+func TestCompletedBranchTransitionOwnsCheckpointTargetIgnoresFrozenRepairClockRollback(
+	t *testing.T,
+) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	const (
+		branch       = "refs/heads/main"
+		generation   = int64(13)
+		source       = "clock-rollback-source"
+		target       = "clock-rollback-target"
+		repairID     = "clock-rollback-members"
+		checkpointTS = float64(10)
+	)
+	completeIntentRepairTransitionWithPendingMember(
+		t, db, repairID, branch, generation, source, target, 20)
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_repairs SET completed_ts=5 WHERE id=?`, repairID); err != nil {
+		t.Fatal(err)
+	}
+
+	owned, err := CompletedBranchTransitionOwnsCheckpointTarget(
+		ctx, db, branch, generation, source, target, checkpointTS, nil)
+	if err != nil || owned {
+		t.Fatalf("owned=(%t, %v) want (false, nil)", owned, err)
 	}
 }
 
@@ -325,9 +353,7 @@ func completeIntentRepairTransition(
 			OldOID:      source,
 		}},
 	}
-	if err := SaveIntentRepair(ctx, db, repair); err != nil {
-		t.Fatalf("SaveIntentRepair %s: %v", id, err)
-	}
+	saveLegacyIntentRepair(t, db, repair)
 	mapping := []IntentRepairCommit{{
 		CandidateID: sql.NullString{String: "candidate-" + id, Valid: true},
 		OldOID:      source,
@@ -404,4 +430,44 @@ func completeSelfPublicationTransition(
 		t.Fatalf("CompleteSelfPublication %s=(%t,%v)", id, completed, err)
 	}
 	return seq
+}
+
+func saveLegacyIntentRepair(t *testing.T, db *DB, repair IntentRepair) {
+	t.Helper()
+	ctx := context.Background()
+	if repair.Status == "" {
+		repair.Status = IntentRepairPrepared
+	}
+	if repair.CreatedTS <= 0 {
+		repair.CreatedTS = 1
+	}
+	if repair.UpdatedTS <= 0 {
+		repair.UpdatedTS = repair.CreatedTS
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repairs(
+    id,branch_ref,branch_generation,status,expected_head,plan_digest,
+    old_head,created_ts,updated_ts,error
+) VALUES (?,?,?,?,?,?,?,?,?,'')`,
+		repair.ID, repair.BranchRef, repair.BranchGeneration, repair.Status,
+		repair.ExpectedHead, repair.PlanDigest, repair.OldHead,
+		repair.CreatedTS, repair.UpdatedTS); err != nil {
+		t.Fatalf("insert legacy repair %s: %v", repair.ID, err)
+	}
+	for ord, commit := range repair.Commits {
+		if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repair_commits(
+    repair_id,ord,candidate_id,old_oid,new_oid
+) VALUES (?,?,?,?,?)`, repair.ID, ord, commit.CandidateID,
+			commit.OldOID, commit.NewOID); err != nil {
+			t.Fatalf("insert legacy repair commit %s/%d: %v",
+				repair.ID, ord, err)
+		}
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repair_member_seals(
+    repair_id,membership_mode,member_count
+) VALUES (?,'legacy',0)`, repair.ID); err != nil {
+		t.Fatalf("seal legacy repair %s: %v", repair.ID, err)
+	}
 }

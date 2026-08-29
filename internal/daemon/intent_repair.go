@@ -22,6 +22,19 @@ const (
 	intentRepairBackupCap       = 50
 )
 
+// ErrIntentRepairRecoveryProof marks durable repair evidence that cannot be
+// reconciled by retrying the same recovery pass. Callers use it to distinguish
+// operator-attention cases from transient Git or SQLite failures.
+var ErrIntentRepairRecoveryProof = errors.New(
+	"daemon: intent repair recovery proof is invalid")
+
+func intentRepairRecoveryProofError(format string, args ...any) error {
+	values := make([]any, 0, len(args)+1)
+	values = append(values, ErrIntentRepairRecoveryProof)
+	values = append(values, args...)
+	return fmt.Errorf("%w: "+format, values...)
+}
+
 // IntentRepairCandidatePlan is one rebuilt semantic candidate. Replaces may
 // select non-contiguous commits when IntentRepairPlan.OldChain is present,
 // but must preserve their relative order within that old chain.
@@ -31,9 +44,9 @@ type IntentRepairCandidatePlan struct {
 	// EventSeqs is the exact active membership used to materialize TreeOID.
 	// Apply rejects any membership drift before Git can move.
 	EventSeqs []int64
-	TreeOID     string
-	Message     string
-	AuthorOID   string
+	TreeOID   string
+	Message   string
+	AuthorOID string
 }
 
 // IntentRepairPlan is the fully gated input to automatic repair. The caller
@@ -143,11 +156,11 @@ func ApplyIntentRepairTransaction(
 		ID: plan.ID, BranchRef: plan.BranchRef,
 		BranchGeneration: plan.BranchGeneration,
 		Status:           state.IntentRepairPrepared, ExpectedHead: plan.ExpectedHead,
-		PlanDigest: plan.PlanDigest,
-		OldHead:    sql.NullString{String: plan.ExpectedHead, Valid: true},
+		PlanDigest:     plan.PlanDigest,
+		OldHead:        sql.NullString{String: plan.ExpectedHead, Valid: true},
 		MembershipMode: state.IntentRepairMembershipFrozen,
-		Commits:    intentRepairStateCommits(plan, nil),
-		Members:    members,
+		Commits:        intentRepairStateCommits(plan, nil),
+		Members:        members,
 	}
 	if err := state.SaveIntentRepair(ctx, db, prepared); err != nil {
 		return result, fmt.Errorf("daemon: intent repair: persist prepared transaction: %w", err)
@@ -288,7 +301,8 @@ func recoverIntentRepair(
 			return result, fmt.Errorf("daemon: recover intent repair %s: resolve branch: %w",
 				repair.ID, headErr)
 		case backupOID != repair.ExpectedHead:
-			return result, fmt.Errorf("daemon: recover intent repair %s: backup points at unexpected commit", repair.ID)
+			return result, intentRepairRecoveryProofError(
+				"repair %s backup points at an unexpected commit", repair.ID)
 		}
 		mappings, mapErr := reconstructIntentRepairMappings(ctx, repoRoot, repair, head)
 		if mapErr != nil {
@@ -300,8 +314,8 @@ func recoverIntentRepair(
 			return result, digestErr
 		}
 		if digest != repair.PlanDigest {
-			return result, fmt.Errorf(
-				"daemon: recover intent repair %s: rebuilt chain does not match prepared plan; backup retained at %s",
+			return result, intentRepairRecoveryProofError(
+				"repair %s rebuilt chain does not match prepared plan; backup retained at %s",
 				repair.ID, backupRef)
 		}
 		ok, transErr := state.TransitionIntentRepair(ctx, db, repair.ID,
@@ -325,19 +339,22 @@ func recoverIntentRepair(
 		repair.Commits = mappings
 	}
 	if !repair.NewHead.Valid || repair.NewHead.String == "" {
-		return result, errors.New("daemon: recover intent repair: Git-applied row has no new head")
+		return result, intentRepairRecoveryProofError(
+			"repair %s Git-applied row has no new head", repair.ID)
 	}
 	head, err := git.RevParse(ctx, repoRoot, repair.BranchRef)
 	if err != nil {
 		return result, err
 	}
 	if head != repair.NewHead.String {
-		return result, fmt.Errorf("daemon: recover intent repair %s: branch moved from repaired head; backup retained at %s",
+		return result, intentRepairRecoveryProofError(
+			"repair %s branch moved from repaired head; backup retained at %s",
 			repair.ID, backupRef)
 	}
 	for _, mapping := range repair.Commits {
 		if !mapping.NewOID.Valid || mapping.NewOID.String == "" {
-			return result, errors.New("daemon: recover intent repair: incomplete commit mapping")
+			return result, intentRepairRecoveryProofError(
+				"repair %s has an incomplete commit mapping", repair.ID)
 		}
 		result.CommitMap[mapping.OldOID] = mapping.NewOID.String
 		if mapping.CandidateID.Valid {
@@ -368,16 +385,18 @@ func completeIntentRepair(
 	}
 	if !exists || (repair.Status != state.IntentRepairGitApplied &&
 		repair.Status != state.IntentRepairCompleted) {
-		return errors.New(
-			"daemon: complete intent repair: durable Git-applied row is unavailable")
+		return intentRepairRecoveryProofError(
+			"repair %s durable Git-applied row is unavailable", repairID)
 	}
 	if repair.BranchRef != cctx.BranchRef ||
 		repair.BranchGeneration != cctx.BranchGeneration {
-		return errors.New("daemon: complete intent repair: exact branch pair changed")
+		return intentRepairRecoveryProofError(
+			"repair %s exact branch pair changed", repairID)
 	}
 	if !repair.NewHead.Valid || repair.NewHead.String == "" ||
 		repair.NewHead.String != newHead {
-		return errors.New("daemon: complete intent repair: durable new head changed")
+		return intentRepairRecoveryProofError(
+			"repair %s durable new head changed", repairID)
 	}
 	if len(repair.Commits) > 0 {
 		mappings = repair.Commits
@@ -386,22 +405,23 @@ func completeIntentRepair(
 	candidates := make(map[string]string)
 	for _, mapping := range mappings {
 		if !mapping.NewOID.Valid {
-			return errors.New("daemon: complete intent repair: missing new commit mapping")
+			return intentRepairRecoveryProofError(
+				"repair %s is missing a new commit mapping", repairID)
 		}
 		reconcile[mapping.OldOID] = mapping.NewOID.String
 		if mapping.CandidateID.Valid {
 			candidateID := mapping.CandidateID.String
 			if existing := candidates[candidateID]; existing != "" &&
 				existing != mapping.NewOID.String {
-				return fmt.Errorf(
-					"daemon: complete intent repair: candidate %s maps to multiple commits",
-					candidateID)
+				return intentRepairRecoveryProofError(
+					"repair %s candidate %s maps to multiple commits",
+					repairID, candidateID)
 			}
 			candidates[candidateID] = mapping.NewOID.String
 		}
 	}
 	if err := reconcileIntentRepairLedger(ctx, db, repairID, reconcile, candidates,
-		repair.Members, cctx, newHead); err != nil {
+		repair.MembershipMode, repair.Members, cctx, newHead); err != nil {
 		return err
 	}
 	reseed := cctx
@@ -423,7 +443,8 @@ func completeIntentRepair(
 			return loadErr
 		}
 		if !exists || repair.Status != state.IntentRepairCompleted {
-			return errors.New("daemon: complete intent repair: Git-applied row changed")
+			return intentRepairRecoveryProofError(
+				"repair %s Git-applied row changed", repairID)
 		}
 	}
 	return nil
@@ -434,6 +455,7 @@ func reconcileIntentRepairLedger(
 	db *state.DB,
 	repairID string,
 	commitMap, candidateMap map[string]string,
+	membershipMode string,
 	members []state.IntentRepairMember,
 	cctx CaptureContext,
 	newHead string,
@@ -449,21 +471,40 @@ func reconcileIntentRepairLedger(
 		return fmt.Errorf("daemon: intent repair ledger: load transaction: %w", err)
 	}
 	if status != state.IntentRepairGitApplied && status != state.IntentRepairCompleted {
-		return fmt.Errorf("daemon: intent repair ledger: transaction is %s", status)
+		return intentRepairRecoveryProofError(
+			"repair %s ledger transaction is %s", repairID, status)
+	}
+	frozenMembership := membershipMode == state.IntentRepairMembershipFrozen
+	switch membershipMode {
+	case state.IntentRepairMembershipFrozen:
+		if len(members) == 0 {
+			return intentRepairRecoveryProofError(
+				"repair %s frozen membership is empty", repairID)
+		}
+	case state.IntentRepairMembershipLegacy:
+		if len(members) != 0 {
+			return intentRepairRecoveryProofError(
+				"repair %s legacy repair has frozen members", repairID)
+		}
+	default:
+		return intentRepairRecoveryProofError(
+			"repair %s membership mode %q cannot publish",
+			repairID, membershipMode)
 	}
 	memberCounts := make(map[string]int)
-	if len(members) > 0 {
+	if frozenMembership {
 		for _, member := range members {
 			if candidateMap[member.CandidateID] == "" {
-				return fmt.Errorf(
-					"daemon: intent repair ledger: member candidate %s has no new commit",
-					member.CandidateID)
+				return intentRepairRecoveryProofError(
+					"repair %s member candidate %s has no new commit",
+					repairID, member.CandidateID)
 			}
 			memberCounts[member.CandidateID]++
 		}
 		if len(memberCounts) != len(candidateMap) {
-			return errors.New(
-				"daemon: intent repair ledger: durable membership and candidate mapping differ")
+			return intentRepairRecoveryProofError(
+				"repair %s durable membership and candidate mapping differ",
+				repairID)
 		}
 		if err := validateIntentRepairSettlement(
 			ctx, tx, repairID, len(members), cctx); err != nil {
@@ -476,7 +517,7 @@ func reconcileIntentRepairLedger(
 			`UPDATE publish_state SET target_commit_oid=? WHERE target_commit_oid=?`,
 			`UPDATE publish_state SET source_head=? WHERE source_head=?`,
 		}
-		if len(members) == 0 {
+		if !frozenMembership {
 			queries = append(queries,
 				`UPDATE capture_events SET commit_oid=? WHERE commit_oid=?`)
 		}
@@ -499,9 +540,11 @@ WHERE id=? AND branch_ref=? AND branch_generation=?
 			return fmt.Errorf("daemon: intent repair ledger: publish candidate: %w", err)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			return fmt.Errorf("daemon: intent repair ledger: candidate %s is not repairable", candidateID)
+			return intentRepairRecoveryProofError(
+				"repair %s candidate %s is not repairable",
+				repairID, candidateID)
 		}
-		if len(members) > 0 {
+		if frozenMembership {
 			res, err := tx.ExecContext(ctx, `
 UPDATE capture_events
 SET state='published', commit_oid=?, published_ts=?, error=NULL
@@ -521,9 +564,9 @@ WHERE branch_ref=? AND branch_generation=?
 					"daemon: intent repair ledger: count immutable candidate captures: %w",
 					countErr)
 			} else if n != int64(memberCounts[candidateID]) {
-				return fmt.Errorf(
-					"daemon: intent repair ledger: settled candidate %s captures=%d want=%d",
-					candidateID, n, memberCounts[candidateID])
+				return intentRepairRecoveryProofError(
+					"repair %s settled candidate %s captures=%d want=%d",
+					repairID, candidateID, n, memberCounts[candidateID])
 			}
 			continue
 		}
@@ -575,9 +618,9 @@ FROM (
 			err)
 	}
 	if invalidMappings != 0 {
-		return fmt.Errorf(
-			"daemon: intent repair ledger: %d candidate mappings are incomplete",
-			invalidMappings)
+		return intentRepairRecoveryProofError(
+			"repair %s has %d incomplete candidate mappings",
+			repairID, invalidMappings)
 	}
 
 	var exactActive int
@@ -602,9 +645,9 @@ WHERE owned.repair_id=?`, cctx.BranchRef, cctx.BranchGeneration,
 			err)
 	}
 	if exactActive != memberCount {
-		return fmt.Errorf(
-			"daemon: intent repair ledger: active membership changed: exact=%d want=%d",
-			exactActive, memberCount)
+		return intentRepairRecoveryProofError(
+			"repair %s active membership changed: exact=%d want=%d",
+			repairID, exactActive, memberCount)
 	}
 
 	var incomplete int
@@ -631,9 +674,9 @@ WHERE COALESCE(active.member_count, 0)<>expected.member_count`, repairID).
 			err)
 	}
 	if incomplete != 0 {
-		return fmt.Errorf(
-			"daemon: intent repair ledger: %d candidates changed active membership",
-			incomplete)
+		return intentRepairRecoveryProofError(
+			"repair %s has %d candidates with changed active membership",
+			repairID, incomplete)
 	}
 
 	var invalidState, priorOnly, settledOnly int
@@ -676,13 +719,13 @@ FROM classified`, repairID).Scan(&invalidState, &priorOnly, &settledOnly); err !
 			"daemon: intent repair ledger: inspect immutable capture state: %w", err)
 	}
 	if invalidState != 0 {
-		return fmt.Errorf(
-			"daemon: intent repair ledger: %d immutable captures changed state",
-			invalidState)
+		return intentRepairRecoveryProofError(
+			"repair %s has %d immutable captures with changed state",
+			repairID, invalidState)
 	}
 	if priorOnly != 0 && settledOnly != 0 {
-		return errors.New(
-			"daemon: intent repair ledger: immutable capture settlement is partial")
+		return intentRepairRecoveryProofError(
+			"repair %s immutable capture settlement is partial", repairID)
 	}
 	return nil
 }
@@ -971,9 +1014,9 @@ func persistSkippedIntentRepair(ctx context.Context, db *state.DB, plan IntentRe
 		ID: plan.ID, BranchRef: plan.BranchRef,
 		BranchGeneration: plan.BranchGeneration,
 		Status:           state.IntentRepairPrepared, ExpectedHead: plan.ExpectedHead,
-		PlanDigest: plan.PlanDigest,
+		PlanDigest:     plan.PlanDigest,
 		MembershipMode: state.IntentRepairMembershipNone,
-		Commits:    intentRepairStateCommits(plan, nil),
+		Commits:        intentRepairStateCommits(plan, nil),
 	}); err != nil {
 		return IntentRepairResult{}, err
 	}
@@ -1024,7 +1067,8 @@ func reconstructIntentRepairMappings(
 	head string,
 ) ([]state.IntentRepairCommit, error) {
 	if len(repair.Commits) == 0 {
-		return nil, errors.New("daemon: recover intent repair: no old commit mapping")
+		return nil, intentRepairRecoveryProofError(
+			"repair %s has no old commit mapping", repair.ID)
 	}
 	baseOut, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
 		"rev-parse", repair.Commits[0].OldOID+"^")
@@ -1046,7 +1090,8 @@ func reconstructIntentRepairMappings(
 	var groups [][]int
 	for i, mapping := range repair.Commits {
 		if !mapping.CandidateID.Valid {
-			return nil, errors.New("daemon: recover intent repair: mapping has no candidate")
+			return nil, intentRepairRecoveryProofError(
+				"repair %s mapping has no candidate", repair.ID)
 		}
 		if len(groups) == 0 ||
 			repair.Commits[groups[len(groups)-1][0]].CandidateID.String != mapping.CandidateID.String {
@@ -1055,8 +1100,9 @@ func reconstructIntentRepairMappings(
 		groups[len(groups)-1] = append(groups[len(groups)-1], i)
 	}
 	if len(newOIDs) != len(groups) {
-		return nil, fmt.Errorf("daemon: recover intent repair: rebuilt chain has %d commits, want %d",
-			len(newOIDs), len(groups))
+		return nil, intentRepairRecoveryProofError(
+			"repair %s rebuilt chain has %d commits, want %d",
+			repair.ID, len(newOIDs), len(groups))
 	}
 	mappings := append([]state.IntentRepairCommit(nil), repair.Commits...)
 	for groupIndex, positions := range groups {
@@ -1125,8 +1171,9 @@ func recoveredIntentRepairPlanDigest(
 			mappings[i].CandidateID.Valid &&
 			mappings[i].CandidateID.String == candidateID {
 			if !mappings[i].NewOID.Valid || mappings[i].NewOID.String != newOID {
-				return "", errors.New(
-					"daemon: recover intent repair: inconsistent candidate mapping")
+				return "", intentRepairRecoveryProofError(
+					"repair %s has an inconsistent candidate mapping",
+					repair.ID)
 			}
 			candidate.replaces = append(candidate.replaces, mappings[i].OldOID)
 			i++

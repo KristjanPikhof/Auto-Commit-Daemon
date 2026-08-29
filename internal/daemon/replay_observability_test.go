@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,26 @@ func TestReplayErrorObservabilityCountsAndClearsRecovery(t *testing.T) {
 	if value, ok, err := state.MetaGet(ctx, db, metaReplayErrorLastSeenTS); err != nil || !ok || value != "" {
 		t.Fatalf("cleared last-seen timestamp=%q ok=%v err=%v",
 			value, ok, err)
+	}
+}
+
+func TestReplayErrorObservabilityMarksCompletedTransitionProofAttention(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestDB(t)
+	replayErr := fmt.Errorf("canonicalize repaired event base: %w",
+		state.ErrCompletedBranchTransitionProof)
+
+	if _, _, err := recordReplayErrorObservability(
+		ctx, db, replayErr, time.Unix(100, 0)); err != nil {
+		t.Fatal(err)
+	}
+	attention, ok, err := state.MetaGet(
+		ctx, db, MetaKeyBranchTransitionNeedsAttention)
+	if err != nil || !ok || !strings.Contains(attention, "canonicalize") {
+		t.Fatalf("transition attention=(%q,%t,%v)", attention, ok, err)
 	}
 }
 

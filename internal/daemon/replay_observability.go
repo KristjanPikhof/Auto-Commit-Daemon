@@ -97,6 +97,10 @@ func recordReplayErrorObservability(
 	if err := state.MetaSetMany(ctx, db, pairs); err != nil {
 		return clean, count, err
 	}
+	if err := recordCompletedTransitionProofAttention(
+		ctx, db, replayErr); err != nil {
+		return clean, count, err
+	}
 	return clean, count, nil
 }
 

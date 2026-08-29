@@ -19,6 +19,20 @@ const (
 	CompletedBranchTransitionProofLimit = 4096
 )
 
+// ErrCompletedBranchTransitionProof marks durable journal evidence that is
+// internally contradictory or incomplete. Callers may safely distinguish it
+// from transient database errors and surface operator attention instead of
+// retrying forever with a healthy-looking status.
+var ErrCompletedBranchTransitionProof = errors.New(
+	"state: completed branch transition proof is invalid")
+
+func completedBranchTransitionProofError(format string, args ...any) error {
+	values := make([]any, 0, len(args)+1)
+	values = append(values, ErrCompletedBranchTransitionProof)
+	values = append(values, args...)
+	return fmt.Errorf("%w: "+format, values...)
+}
+
 // CompletedBranchTransition is one immutable, completed ACD-authored ref
 // movement. Ordinary self-publications expose EventSeqs. Intent repairs expose
 // their immutable membership when the repair was prepared by schema v24 or
@@ -69,18 +83,18 @@ func CompletedBranchTransitionChain(
 		case 1:
 			// Continue below.
 		default:
-			return nil, false, fmt.Errorf(
-				"state: completed branch transition from %s is ambiguous", current)
+			return nil, false, completedBranchTransitionProofError(
+				"transition from %s is ambiguous", current)
 		}
 
 		transition := outgoing[0]
 		if transition.TargetHead == current {
-			return nil, false, fmt.Errorf(
-				"state: completed branch transition does not move %s", current)
+			return nil, false, completedBranchTransitionProofError(
+				"transition does not move %s", current)
 		}
 		if _, duplicate := seen[transition.TargetHead]; duplicate {
-			return nil, false, fmt.Errorf(
-				"state: completed branch transition cycle at %s", transition.TargetHead)
+			return nil, false, completedBranchTransitionProofError(
+				"transition cycle at %s", transition.TargetHead)
 		}
 		seen[transition.TargetHead] = struct{}{}
 		chain = append(chain, transition)
@@ -89,8 +103,8 @@ func CompletedBranchTransitionChain(
 			return chain, true, nil
 		}
 	}
-	return nil, false, fmt.Errorf(
-		"state: completed branch transition proof exceeds %d steps",
+	return nil, false, completedBranchTransitionProofError(
+		"proof exceeds %d steps",
 		CompletedBranchTransitionProofLimit)
 }
 
@@ -141,10 +155,13 @@ func CompletedBranchTransitionOwnsCheckpointTarget(
 				delete(unusedEvents, seq)
 			}
 		case CompletedBranchTransitionIntentRepair:
-			if transition.CompletedTS <= checkpointCreatedTS {
-				continue
-			}
 			if len(transition.IntentRepairMembers) == 0 {
+				// Only migrated legacy repairs lack immutable membership. Their
+				// completion time is a compatibility boundary; frozen repairs
+				// always prove exact members, even if the wall clock moved back.
+				if transition.CompletedTS < checkpointCreatedTS {
+					continue
+				}
 				return false, nil
 			}
 			for _, member := range transition.IntentRepairMembers {
@@ -210,8 +227,8 @@ LIMIT 2`,
 		}
 		transition.SourceHead = sourceHead
 		if transition.TargetHead == "" || transition.CompletedTS <= 0 {
-			return nil, errors.New(
-				"state: completed branch transition has incomplete completion proof")
+			return nil, completedBranchTransitionProofError(
+				"transition has incomplete completion proof")
 		}
 		switch transition.Kind {
 		case CompletedBranchTransitionSelfPublication:
@@ -230,8 +247,8 @@ LIMIT 2`,
 			transition.CommitMappings = repair.Commits
 			transition.IntentRepairMembers = repair.Members
 		default:
-			return nil, fmt.Errorf(
-				"state: unknown completed branch transition kind %q",
+			return nil, completedBranchTransitionProofError(
+				"unknown transition kind %q",
 				transition.Kind)
 		}
 		transitions = append(transitions, transition)
@@ -259,28 +276,28 @@ func completedIntentRepairProof(
 		!repair.NewHead.Valid || repair.NewHead.String != transition.TargetHead ||
 		!repair.BackupRef.Valid || repair.BackupRef.String == "" ||
 		len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxCommits {
-		return IntentRepair{}, fmt.Errorf(
-			"state: completed intent repair %s has incomplete transition proof",
+		return IntentRepair{}, completedBranchTransitionProofError(
+			"intent repair %s has incomplete transition proof",
 			transition.ID)
 	}
 	for _, mapping := range repair.Commits {
 		if mapping.OldOID == "" || !mapping.NewOID.Valid ||
 			mapping.NewOID.String == "" || !mapping.CandidateID.Valid ||
 			mapping.CandidateID.String == "" {
-			return IntentRepair{}, fmt.Errorf(
-				"state: completed intent repair %s has incomplete commit mapping",
+			return IntentRepair{}, completedBranchTransitionProofError(
+				"intent repair %s has incomplete commit mapping",
 				transition.ID)
 		}
 	}
 	if repair.MembershipMode != IntentRepairMembershipLegacy &&
 		repair.MembershipMode != IntentRepairMembershipFrozen {
-		return IntentRepair{}, fmt.Errorf(
-			"state: completed intent repair %s has invalid membership mode %q",
+		return IntentRepair{}, completedBranchTransitionProofError(
+			"intent repair %s has invalid membership mode %q",
 			transition.ID, repair.MembershipMode)
 	}
 	if err := validateIntentRepairMembers(repair); err != nil {
-		return IntentRepair{}, fmt.Errorf(
-			"state: completed intent repair %s has invalid membership: %w",
+		return IntentRepair{}, completedBranchTransitionProofError(
+			"intent repair %s has invalid membership: %v",
 			transition.ID, err)
 	}
 	return repair, nil
@@ -344,8 +361,8 @@ LIMIT 2`, branchRef, branchGeneration, current)
 		case 1:
 			// Validate the whole repair before trusting one interior mapping.
 		default:
-			return "", false, fmt.Errorf(
-				"state: completed intent repair mapping from %s is ambiguous",
+			return "", false, completedBranchTransitionProofError(
+				"intent repair mapping from %s is ambiguous",
 				current)
 		}
 
@@ -355,8 +372,8 @@ LIMIT 2`, branchRef, branchGeneration, current)
 		}
 		if !ok || !repair.OldHead.Valid || !repair.NewHead.Valid ||
 			!repair.CompletedTS.Valid {
-			return "", false, fmt.Errorf(
-				"state: completed intent repair %s has incomplete proof",
+			return "", false, completedBranchTransitionProofError(
+				"intent repair %s has incomplete proof",
 				mappings[0].repairID)
 		}
 		transition := CompletedBranchTransition{
@@ -369,15 +386,15 @@ LIMIT 2`, branchRef, branchGeneration, current)
 		}
 		next := mappings[0].targetOID
 		if _, duplicate := seen[next]; duplicate {
-			return "", false, fmt.Errorf(
-				"state: completed intent repair mapping cycle at %s", next)
+			return "", false, completedBranchTransitionProofError(
+				"intent repair mapping cycle at %s", next)
 		}
 		seen[next] = struct{}{}
 		current = next
 		mapped = true
 	}
-	return "", false, fmt.Errorf(
-		"state: completed intent repair mapping exceeds %d steps",
+	return "", false, completedBranchTransitionProofError(
+		"intent repair mapping exceeds %d steps",
 		CompletedBranchTransitionProofLimit)
 }
 
@@ -411,8 +428,8 @@ ORDER BY ord`, publicationID)
 			"state: iterate completed publication members: %w", err)
 	}
 	if len(members) == 0 {
-		return nil, fmt.Errorf(
-			"state: completed self-publication %s has no members", publicationID)
+		return nil, completedBranchTransitionProofError(
+			"self-publication %s has no members", publicationID)
 	}
 	return members, nil
 }

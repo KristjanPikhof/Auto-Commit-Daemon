@@ -91,7 +91,8 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // migrations (such as v2→v3). v6 uses an explicit table rebuild for only
 // pre-v6 databases whose decision_records table still has the old event_seq
 // foreign key. v7, v8, v11, v12, and v13 are pure DDL migrations through
-// schemaDDL. v15, v16, v17, and v18 are additive and deliberately have no data backfill:
+// schemaDDL. v15, v16, v17, and v18 are additive and deliberately have no
+// data backfill:
 // existing intent repositories are cut over by runtime configuration
 // orchestration, not by mutating their capture ledger during schema bootstrap.
 // Migrate is wired now so future phases requiring separate data backfill have

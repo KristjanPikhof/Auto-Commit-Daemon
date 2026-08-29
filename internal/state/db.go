@@ -185,8 +185,8 @@ func CanRuntimeMigrate(from, to int) bool {
 		case 22:
 			// v23 only adds bounded resolved-plan JSON to planner attempt state.
 		case 23:
-			// v24 only adds immutable membership for newly prepared Intent
-			// repairs. Historical repairs are deliberately left unchanged.
+			// v24 adds immutable membership for new Intent repairs and marks
+			// historical repairs as legacy without inventing members.
 		default:
 			return false
 		}

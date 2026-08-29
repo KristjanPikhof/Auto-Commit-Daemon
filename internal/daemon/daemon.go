@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -985,7 +986,8 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("inspect recoverable intent repairs at startup",
 				"err", recoverErr.Error())
 			startupRepairBlocked = true
-		} else if len(recoverable) > 0 {
+		} else if hasRecoverableIntentRepairForPair(
+			recoverable, branchRef, persistedGen) {
 			recoveryCtx := CaptureContext{
 				BranchRef: branchRef, BranchGeneration: persistedGen,
 				BaseHead: headOID,
@@ -993,10 +995,21 @@ func Run(ctx context.Context, opts Options) error {
 			recovered, recoverErr := RecoverIntentRepairs(
 				ctx, opts.RepoPath, opts.GitDir, opts.DB, recoveryCtx)
 			if recoverErr != nil {
+				if attentionErr := recordIntentRepairRecoveryAttention(
+					ctx, opts.DB, recoverErr); attentionErr != nil {
+					logger.Warn("record intent repair recovery attention",
+						"err", attentionErr.Error())
+				}
 				logger.Warn("recover intent repairs before branch transition",
 					"err", recoverErr.Error())
 				startupRepairBlocked = true
 			} else {
+				if clearErr := clearIntentRepairRecoveryAttention(
+					ctx, opts.DB); clearErr != nil {
+					logger.Warn("clear settled intent repair recovery attention",
+						"err", clearErr.Error())
+					startupRepairBlocked = true
+				}
 				completed := false
 				for _, repair := range recovered {
 					if repair.Status == state.IntentRepairCompleted {
@@ -1045,6 +1058,11 @@ func Run(ctx context.Context, opts Options) error {
 				tokenSHA(prevToken), tokenSHA(currentToken))
 			switch {
 			case proofErr != nil:
+				if attentionErr := recordCompletedTransitionProofAttention(
+					ctx, opts.DB, proofErr); attentionErr != nil {
+					logger.Warn("record completed ACD transition attention",
+						"err", attentionErr.Error())
+				}
 				logger.Warn("prove completed ACD transition at startup; will retry",
 					"old", prevToken, "new", currentToken,
 					"err", proofErr.Error())
@@ -1095,6 +1113,11 @@ func Run(ctx context.Context, opts Options) error {
 			} else if result, rErr := reconcileTransitionPair(ctx, opts.RepoPath, opts.GitDir,
 				opts.DB, tokenBranchRef(prevToken), persistedGen,
 				tokenSHA(currentToken) == "", "", "startup_branch_transition", tracer); rErr != nil {
+				if attentionErr := recordCompletedTransitionProofAttention(
+					ctx, opts.DB, rErr); attentionErr != nil {
+					logger.Warn("record startup transition proof attention",
+						"err", attentionErr.Error())
+				}
 				logger.Warn("reconcile unpublished chain before startup branch transition; will retry",
 					"branch_ref", tokenBranchRef(prevToken),
 					"generation", persistedGen,
@@ -1187,9 +1210,10 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	if !branchTransitionBlocked {
 		meta := map[string]string{
-			MetaKeyBranchGeneration: strconv.FormatInt(cctx.BranchGeneration, 10),
-			MetaKeyBranchHead:       cctx.BaseHead,
-			MetaKeyBranchToken:      currentToken,
+			MetaKeyBranchGeneration:               strconv.FormatInt(cctx.BranchGeneration, 10),
+			MetaKeyBranchHead:                     cctx.BaseHead,
+			MetaKeyBranchToken:                    currentToken,
+			MetaKeyBranchTransitionNeedsAttention: "",
 		}
 		if startupTokenChanged {
 			meta[MetaKeyBranchTokenChangedAt] = startupChangedAt
@@ -1592,6 +1616,74 @@ func Run(ctx context.Context, opts Options) error {
 		return recovered.HasMore, recovered.HasMore
 	}
 
+	recoverActiveIntentRepairs := func() (blocked, recoveredWork bool) {
+		if cctx.BranchRef == "" {
+			return false, false
+		}
+		if opts.PublicationHeld != nil && opts.PublicationHeld() {
+			return true, false
+		}
+		repairs, inspectErr := state.RecoverableIntentRepairs(
+			recoveryRootCtx, opts.DB, intentRepairBackupCap)
+		if inspectErr != nil {
+			logger.Warn("inspect active intent repairs",
+				"branch_ref", cctx.BranchRef,
+				"generation", cctx.BranchGeneration,
+				"err", inspectErr.Error())
+			return true, false
+		}
+		if !hasRecoverableIntentRepairForPair(
+			repairs, cctx.BranchRef, cctx.BranchGeneration) {
+			return false, false
+		}
+
+		recovered, recoverErr := RecoverIntentRepairs(
+			recoveryRootCtx, opts.RepoPath, opts.GitDir, opts.DB, cctx)
+		if recoverErr != nil {
+			if attentionErr := recordIntentRepairRecoveryAttention(
+				recoveryRootCtx, opts.DB, recoverErr); attentionErr != nil {
+				logger.Warn("record active intent repair recovery attention",
+					"err", attentionErr.Error())
+			}
+			logger.Warn("active intent repair recovery needs attention",
+				"branch_ref", cctx.BranchRef,
+				"generation", cctx.BranchGeneration,
+				"err", recoverErr.Error())
+			return true, false
+		}
+		if clearErr := clearIntentRepairRecoveryAttention(
+			recoveryRootCtx, opts.DB); clearErr != nil {
+			logger.Warn("clear settled active intent repair recovery attention",
+				"err", clearErr.Error())
+			return true, false
+		}
+		var targetOID string
+		for _, repair := range recovered {
+			if repair.Status != state.IntentRepairCompleted ||
+				repair.NewHead == "" {
+				continue
+			}
+			targetOID = repair.NewHead
+			logger.Info("recovered intent repair during run-loop pass",
+				"repair_id", repair.ID, "new_head", repair.NewHead)
+		}
+		if targetOID == "" {
+			return false, false
+		}
+
+		pendingInternalTransitionTarget = targetOID
+		// Recovery proved that the literal branch still names this target.
+		// Adopt the completed repair before token classification can mistake
+		// its non-ancestral rewrite for an external Git operation.
+		if err := adoptInternalTransitionTarget(
+			targetOID, branchTokenRev(targetOID, cctx.BranchRef)); err != nil {
+			logger.Warn("adopt recovered intent repair target",
+				"target", targetOID, "err", err.Error())
+			return true, false
+		}
+		return false, true
+	}
+
 	processBranchTokenChange := func(logPrefix string) bool {
 		if opts.beforeBranchTokenCheck != nil {
 			opts.beforeBranchTokenCheck()
@@ -1764,6 +1856,11 @@ func Run(ctx context.Context, opts Options) error {
 				ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
 				tokenSHA(currentToken), tokenSHA(newToken))
 			if proofErr != nil {
+				if attentionErr := recordCompletedTransitionProofAttention(
+					ctx, opts.DB, proofErr); attentionErr != nil {
+					logger.Warn(logPrefix+" record completed ACD transition attention",
+						"err", attentionErr.Error())
+				}
 				logger.Warn(logPrefix+" prove completed ACD transition; will retry",
 					"old", currentToken, "new", newToken,
 					"err", proofErr.Error())
@@ -1806,6 +1903,11 @@ func Run(ctx context.Context, opts Options) error {
 			opts.DB, cctx.BranchRef, cctx.BranchGeneration,
 			tokenSHA(newToken) == "", "", "runtime_branch_transition", tracer)
 		if reconcileErr != nil {
+			if attentionErr := recordCompletedTransitionProofAttention(
+				ctx, opts.DB, reconcileErr); attentionErr != nil {
+				logger.Warn(logPrefix+" record transition proof attention",
+					"err", attentionErr.Error())
+			}
 			logger.Warn(logPrefix+" reconcile unpublished chain before branch transition; will retry",
 				"branch_ref", cctx.BranchRef,
 				"generation", cctx.BranchGeneration,
@@ -1910,10 +2012,11 @@ func Run(ctx context.Context, opts Options) error {
 				return false
 			}
 			if err := state.MetaSetMany(ctx, opts.DB, map[string]string{
-				MetaKeyBranchTokenChangedAt: ts,
-				MetaKeyBranchToken:          newToken,
-				MetaKeyBranchGeneration:     strconv.FormatInt(cctx.BranchGeneration, 10),
-				MetaKeyBranchHead:           cctx.BaseHead,
+				MetaKeyBranchTokenChangedAt:           ts,
+				MetaKeyBranchToken:                    newToken,
+				MetaKeyBranchGeneration:               strconv.FormatInt(cctx.BranchGeneration, 10),
+				MetaKeyBranchHead:                     cctx.BaseHead,
+				MetaKeyBranchTransitionNeedsAttention: "",
 			}); err != nil {
 				logger.Warn(logPrefix+" accept branch transition metadata; will retry",
 					"err", err.Error())
@@ -2365,9 +2468,29 @@ func Run(ctx context.Context, opts Options) error {
 				logger.Warn("read pause state before self-publication recovery",
 					"err", pauseErr.Error())
 				branchTransitionBlocked = true
-			} else if !pauseStatus.Active {
+			} else if pauseStatus.Active {
+				// A repair whose Git CAS already landed must be settled before
+				// its rewritten ref can be classified. Recovery itself honors
+				// the pause, so hold token classification until the pause clears.
+				repairs, inspectErr := state.RecoverableIntentRepairs(
+					ctx, opts.DB, intentRepairBackupCap)
+				if inspectErr != nil || hasRecoverableIntentRepairForPair(
+					repairs, cctx.BranchRef, cctx.BranchGeneration) {
+					branchTransitionBlocked = true
+				}
+				if inspectErr != nil {
+					logger.Warn("inspect paused active intent repairs",
+						"err", inspectErr.Error())
+				}
+			} else {
 				branchTransitionBlocked, recoveryFollowup =
 					recoverActiveSelfPublications()
+				if !branchTransitionBlocked {
+					intentBlocked, intentRecovered :=
+						recoverActiveIntentRepairs()
+					branchTransitionBlocked = intentBlocked
+					recoveryFollowup = recoveryFollowup || intentRecovered
+				}
 			}
 		}
 
@@ -2991,6 +3114,62 @@ func Run(ctx context.Context, opts Options) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func recordCompletedTransitionProofAttention(
+	ctx context.Context,
+	db *state.DB,
+	proofErr error,
+) error {
+	if !errors.Is(proofErr, state.ErrCompletedBranchTransitionProof) {
+		return nil
+	}
+	detail := ai.SanitizePlannerError(proofErr.Error())
+	return state.MetaSet(ctx, db, MetaKeyBranchTransitionNeedsAttention,
+		"Durable ACD transition proof needs attention: "+detail)
+}
+
+const intentRepairRecoveryAttentionPrefix = "Durable Intent repair recovery needs attention: "
+
+func hasRecoverableIntentRepairForPair(
+	repairs []state.IntentRepair,
+	branchRef string,
+	branchGeneration int64,
+) bool {
+	for _, repair := range repairs {
+		if repair.BranchRef == branchRef &&
+			repair.BranchGeneration == branchGeneration {
+			return true
+		}
+	}
+	return false
+}
+
+func recordIntentRepairRecoveryAttention(
+	ctx context.Context,
+	db *state.DB,
+	recoveryErr error,
+) error {
+	if !errors.Is(recoveryErr, ErrIntentRepairRecoveryProof) {
+		return nil
+	}
+	detail := ai.SanitizePlannerError(recoveryErr.Error())
+	return state.MetaSet(ctx, db, MetaKeyBranchTransitionNeedsAttention,
+		intentRepairRecoveryAttentionPrefix+detail)
+}
+
+func clearIntentRepairRecoveryAttention(
+	ctx context.Context,
+	db *state.DB,
+) error {
+	value, ok, err := state.MetaGet(
+		ctx, db, MetaKeyBranchTransitionNeedsAttention)
+	if err != nil || !ok ||
+		!strings.HasPrefix(value, intentRepairRecoveryAttentionPrefix) {
+		return err
+	}
+	return state.MetaSet(
+		ctx, db, MetaKeyBranchTransitionNeedsAttention, "")
 }
 
 func withIntentRejectsWriter(ctx context.Context, gitDir string) context.Context {

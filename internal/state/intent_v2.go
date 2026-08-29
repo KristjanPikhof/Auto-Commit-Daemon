@@ -878,6 +878,37 @@ func IntentCandidateByID(ctx context.Context, d *DB, id string) (IntentCandidate
 	return candidate, true, nil
 }
 
+// IntentEventHeldByCandidate reports whether one capture belongs to an active
+// candidate that still needs more evidence or a corrected plan before it can
+// publish. Replay uses this narrow probe to keep such a candidate from
+// starving later, unoffered companion captures.
+func IntentEventHeldByCandidate(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	branchGeneration int64,
+	eventSeq int64,
+) (bool, error) {
+	if d == nil || branchRef == "" || branchGeneration < 0 || eventSeq <= 0 {
+		return false, errors.New("state: IntentEventHeldByCandidate: invalid input")
+	}
+	var held int
+	if err := d.readSQL().QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1
+    FROM intent_candidate_events membership
+    JOIN intent_candidates candidate ON candidate.id=membership.candidate_id
+    WHERE membership.event_seq=?
+      AND membership.membership_state='active'
+      AND candidate.branch_ref=?
+      AND candidate.branch_generation=?
+      AND candidate.status IN ('open','waiting','blocked')
+)`, eventSeq, branchRef, branchGeneration).Scan(&held); err != nil {
+		return false, fmt.Errorf("state: probe held intent event: %w", err)
+	}
+	return held != 0, nil
+}
+
 // IntentCandidateByPublishedCommit resolves the semantic candidate that owns
 // one ACD-published commit on an exact branch pair.
 func IntentCandidateByPublishedCommit(
@@ -1401,10 +1432,10 @@ ORDER BY membership.ord, event.seq`, candidateID, branchRef, branchGeneration)
 	return members, nil
 }
 
-// SaveIntentRepair stores the prepared row and its old-to-new mapping
-// plus any exact membership snapshot atomically. Automatic repairs are capped
-// at five commits regardless of caller preset. Empty membership is accepted
-// only for legacy callers and historical repair compatibility.
+// SaveIntentRepair atomically stores a prepared row, its old-to-new mapping,
+// and its exact membership. Repairs that may move Git require frozen members.
+// Memberless rows are reserved for skipped or failed plans that never move
+// Git. Only migration can create legacy membership.
 func SaveIntentRepair(ctx context.Context, d *DB, repair IntentRepair) error {
 	if d == nil {
 		return errors.New("state: SaveIntentRepair: nil db")
@@ -1421,6 +1452,10 @@ func SaveIntentRepair(ctx context.Context, d *DB, repair IntentRepair) error {
 		} else {
 			repair.MembershipMode = IntentRepairMembershipNone
 		}
+	}
+	if repair.MembershipMode == IntentRepairMembershipLegacy {
+		return errors.New(
+			"state: legacy intent repair membership is migration-only")
 	}
 	if err := validateIntentRepair(repair); err != nil {
 		return err

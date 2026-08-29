@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 )
 
 const (
@@ -91,6 +93,14 @@ func loadReplayObservabilityReport(
 		return report, fmt.Errorf("intent replay blocked reason: %w", err)
 	} else if ok && sanitizeObservabilityText(value) != "" {
 		durableAttention = true
+	}
+	if value, ok, err := metaLookup(
+		ctx, conn, daemon.MetaKeyBranchTransitionNeedsAttention,
+	); err != nil {
+		return report, fmt.Errorf("branch transition blocked reason: %w", err)
+	} else if attention := sanitizeObservabilityText(value); ok && attention != "" {
+		durableAttention = true
+		report.LastError = attention
 	}
 
 	hasCandidates, err := sqliteTableExists(ctx, conn, "intent_candidates")

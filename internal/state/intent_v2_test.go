@@ -618,6 +618,29 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 	if n, err := ConsumeIntentActivityBoundaries(ctx, d, 1, 10); err != nil || n != 1 {
 		t.Fatalf("consume boundaries=(%d,%v)", n, err)
 	}
+	for _, candidate := range []IntentCandidate{
+		{
+			ID: "candidate-a", BranchRef: "refs/heads/main",
+			BranchGeneration: 9, Status: IntentCandidateReady,
+			Readiness: IntentReadinessReady,
+			Events:    []IntentCandidateEvent{{EventSeq: first, EventRole: "code"}},
+		},
+		{
+			ID: "candidate-b", BranchRef: "refs/heads/main",
+			BranchGeneration: 9, Status: IntentCandidateReady,
+			Readiness: IntentReadinessReady,
+			Events:    []IntentCandidateEvent{{EventSeq: second, EventRole: "test"}},
+		},
+	} {
+		if err := SaveIntentCandidate(ctx, d, candidate); err != nil {
+			t.Fatalf("SaveIntentCandidate %s: %v", candidate.ID, err)
+		}
+	}
+	members, err := SnapshotIntentRepairMembers(ctx, d, "repair-1",
+		"refs/heads/main", 9, []string{"candidate-a", "candidate-b"})
+	if err != nil {
+		t.Fatalf("SnapshotIntentRepairMembers: %v", err)
+	}
 
 	repair := IntentRepair{
 		ID: "repair-1", BranchRef: "refs/heads/main", BranchGeneration: 9,
@@ -627,6 +650,7 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 			{OldOID: "head-1", CandidateID: sql.NullString{String: "candidate-a", Valid: true}},
 			{OldOID: "head-2", CandidateID: sql.NullString{String: "candidate-b", Valid: true}},
 		},
+		Members: members,
 	}
 	if err := SaveIntentRepair(ctx, d, repair); err != nil {
 		t.Fatalf("SaveIntentRepair: %v", err)
@@ -637,8 +661,8 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 		OldHead:   sql.NullString{String: "head-2", Valid: true},
 		NewHead:   sql.NullString{String: "new-2", Valid: true},
 		Commits: []IntentRepairCommit{
-			{OldOID: "head-1", NewOID: sql.NullString{String: "new-1", Valid: true}},
-			{OldOID: "head-2", NewOID: sql.NullString{String: "new-2", Valid: true}},
+			{OldOID: "head-1", CandidateID: sql.NullString{String: "candidate-a", Valid: true}, NewOID: sql.NullString{String: "new-1", Valid: true}},
+			{OldOID: "head-2", CandidateID: sql.NullString{String: "candidate-b", Valid: true}, NewOID: sql.NullString{String: "new-2", Valid: true}},
 		},
 	})
 	if err != nil || !applied {

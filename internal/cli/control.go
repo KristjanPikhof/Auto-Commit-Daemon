@@ -599,6 +599,11 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "The current commit-all run stopped at a safety check. Your work remains protected."
 		res.NextAction = "Run `acd doctor` to see what blocked publication."
+	case status.Replay.State == "needs_attention":
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
+		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
 	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
 		status.PublicationDrain.FallbackMode == "semantic_replan":
 		res.Health = controlHealthPublishing
@@ -617,11 +622,6 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthPublishing
 		res.Summary = "ACD is planning commits for the protected checkpoint."
 		res.NextAction = "No action needed. If planning stalls, ACD switches to safe local groups automatically."
-	case status.Replay.State == "needs_attention":
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
-		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
 	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention

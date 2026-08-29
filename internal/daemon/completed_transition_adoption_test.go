@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,45 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+func TestCompletedTransitionProofAttentionPersistsAndClears(t *testing.T) {
+	f := newDaemonFixture(t)
+	ctx := context.Background()
+	proofErr := errors.Join(
+		state.ErrCompletedBranchTransitionProof,
+		errors.New("ambiguous completed transition"))
+	if err := recordCompletedTransitionProofAttention(
+		ctx, f.db, proofErr); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := state.MetaGet(
+		ctx, f.db, MetaKeyBranchTransitionNeedsAttention)
+	if err != nil || !ok || !strings.Contains(value, "needs attention") ||
+		!strings.Contains(value, "ambiguous completed transition") {
+		t.Fatalf("transition attention=(%q,%t,%v)", value, ok, err)
+	}
+	if err := recordCompletedTransitionProofAttention(
+		ctx, f.db, errors.New("transient database read")); err != nil {
+		t.Fatal(err)
+	}
+	if unchanged, _, _ := state.MetaGet(
+		ctx, f.db, MetaKeyBranchTransitionNeedsAttention); unchanged != value {
+		t.Fatalf("transient error replaced durable attention: %q", unchanged)
+	}
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveBranchPublicationToken(
+		ctx, f.db, 1, head,
+		branchTokenRev(head, "refs/heads/main")); err != nil {
+		t.Fatal(err)
+	}
+	if cleared, _, _ := state.MetaGet(
+		ctx, f.db, MetaKeyBranchTransitionNeedsAttention); cleared != "" {
+		t.Fatalf("transition attention not cleared after adoption: %q", cleared)
+	}
+}
 
 func TestRunAdoptsAlreadyCompletedIntentRepairBeforeStartupTransition(t *testing.T) {
 	f := newIntentRepairFixture(t, 2)
@@ -126,5 +166,61 @@ func TestCheckEventGenerationUsesCompletedRepairMappingAncestry(t *testing.T) {
 		!strings.Contains(reason, applied.NewHead) ||
 		!strings.Contains(reason, unrelated) {
 		t.Fatalf("unrelated parent reason=%q", reason)
+	}
+}
+
+func TestAmbiguousCompletedRepairMappingPersistsReplayAttention(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	oldBase := strings.Repeat("1", 40)
+	recordCompletedRepairMapping(
+		t, ctx, f, "ambiguous-repair-a", oldBase, f.cctx.BaseHead)
+
+	const secondRepair = "ambiguous-repair-b"
+	secondTarget := strings.Repeat("2", 40)
+	if _, err := f.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repairs(
+    id,branch_ref,branch_generation,status,expected_head,plan_digest,
+    backup_ref,old_head,new_head,created_ts,updated_ts,git_applied_ts,
+    completed_ts,error
+) VALUES (?,?,?,'completed',?,?,?,?,?,1,3,2,3,'')`,
+		secondRepair, f.cctx.BranchRef, f.cctx.BranchGeneration,
+		oldBase, "sha256:"+strings.Repeat("b", 64),
+		"refs/acd/intent-repair/test/ambiguous-repair-b/backup",
+		oldBase, secondTarget); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repair_commits(
+    repair_id,ord,candidate_id,old_oid,new_oid
+) VALUES (?,0,?,?,?)`, secondRepair, "candidate-b", oldBase, secondTarget); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repair_member_seals(
+    repair_id,membership_mode,member_count
+) VALUES (?,'legacy',0)`, secondRepair); err != nil {
+		t.Fatal(err)
+	}
+
+	event := state.CaptureEvent{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		BaseHead:         oldBase,
+	}
+	_, proofErr := checkEventGeneration(
+		ctx, f.dir, f.db, f.cctx.BaseHead, event, f.cctx)
+	if proofErr == nil ||
+		!errors.Is(proofErr, state.ErrCompletedBranchTransitionProof) {
+		t.Fatalf("checkEventGeneration error=%v", proofErr)
+	}
+	if _, _, err := recordReplayErrorObservability(
+		ctx, f.db, proofErr, time.Unix(100, 0)); err != nil {
+		t.Fatal(err)
+	}
+	attention, ok, err := state.MetaGet(
+		ctx, f.db, MetaKeyBranchTransitionNeedsAttention)
+	if err != nil || !ok || !strings.Contains(attention, "ambiguous") {
+		t.Fatalf("transition attention=(%q,%t,%v)", attention, ok, err)
 	}
 }

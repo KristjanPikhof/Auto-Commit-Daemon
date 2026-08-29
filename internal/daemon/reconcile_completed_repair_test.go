@@ -178,45 +178,42 @@ func recordCompletedRepairMapping(
 ) {
 	t.Helper()
 	candidateID := repairID + "-candidate"
-	if err := state.SaveIntentRepair(ctx, f.db, state.IntentRepair{
-		ID: repairID, BranchRef: f.cctx.BranchRef,
-		BranchGeneration: f.cctx.BranchGeneration,
-		Status:           state.IntentRepairPrepared,
-		ExpectedHead:     oldOID,
-		PlanDigest:       "sha256:" + strings.Repeat("a", 64),
-		OldHead:          sql.NullString{String: oldOID, Valid: true},
-		Commits: []state.IntentRepairCommit{{
-			CandidateID: sql.NullString{String: candidateID, Valid: true},
-			OldOID:      oldOID,
-		}},
-	}); err != nil {
-		t.Fatalf("save repair %s: %v", repairID, err)
+	tx, err := f.db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	applied, err := state.TransitionIntentRepair(ctx, f.db, repairID,
-		state.IntentRepairTransition{
-			ExpectedStatus: state.IntentRepairPrepared,
-			Status:         state.IntentRepairGitApplied,
-			BackupRef: sql.NullString{
-				String: "refs/acd/intent-repair/test/" + repairID + "/backup",
-				Valid:  true,
-			},
-			OldHead: sql.NullString{String: oldOID, Valid: true},
-			NewHead: sql.NullString{String: newOID, Valid: true},
-			Commits: []state.IntentRepairCommit{{
-				CandidateID: sql.NullString{String: candidateID, Valid: true},
-				OldOID:      oldOID,
-				NewOID:      sql.NullString{String: newOID, Valid: true},
-			}},
-		})
-	if err != nil || !applied {
-		t.Fatalf("mark repair %s Git-applied=(%t, %v)", repairID, applied, err)
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO intent_repairs(
+    id,branch_ref,branch_generation,status,expected_head,plan_digest,
+    backup_ref,old_head,new_head,created_ts,updated_ts,git_applied_ts,
+    completed_ts,error
+) VALUES (?,?,?,'completed',?,?,?,?,?,1,3,2,3,'')`,
+		repairID, f.cctx.BranchRef, f.cctx.BranchGeneration,
+		oldOID, "sha256:"+strings.Repeat("a", 64),
+		"refs/acd/intent-repair/test/"+repairID+"/backup",
+		oldOID, newOID); err != nil {
+		t.Fatalf("record completed legacy repair %s: %v", repairID, err)
 	}
-	completed, err := state.TransitionIntentRepair(ctx, f.db, repairID,
-		state.IntentRepairTransition{
-			ExpectedStatus: state.IntentRepairGitApplied,
-			Status:         state.IntentRepairCompleted,
-		})
-	if err != nil || !completed {
-		t.Fatalf("complete repair %s=(%t, %v)", repairID, completed, err)
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO intent_repair_commits(
+    repair_id,ord,candidate_id,old_oid,new_oid
+) VALUES (?,0,?,?,?)`, repairID, candidateID, oldOID, newOID); err != nil {
+		t.Fatalf("record completed legacy mapping %s: %v", repairID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO intent_repair_member_seals(
+    repair_id,membership_mode,member_count
+) VALUES (?,'legacy',0)`, repairID); err != nil {
+		t.Fatalf("seal completed legacy repair %s: %v", repairID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit completed legacy repair %s: %v", repairID, err)
+	}
+	canonical, mapped, err := state.CanonicalCompletedIntentRepairCommit(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, oldOID)
+	if err != nil || !mapped || canonical != newOID {
+		t.Fatalf("canonical repair %s=(%s,%t,%v), want %s",
+			repairID, canonical, mapped, err, newOID)
 	}
 }
