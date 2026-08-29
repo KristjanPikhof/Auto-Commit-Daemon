@@ -35,8 +35,9 @@
   Intent thresholds and provider details no longer look like stale startup
   settings. Completed historical drains no longer appear as current work, and
   recoverable verification failures show automatic replanning instead of a
-  false request for user action. Resolved recovery snapshots no longer leave a
-  clean, empty-queue repository at `Published to Git: no`.
+  false request for user action. Status and list now treat protected recovery
+  snapshots as resolved, while active failed captures cannot be reported as
+  published while ACD asks for recovery.
 - ACD can now prove and adopt a completed ACD-owned Intent repair after a crash
   or restart. Frozen publication targets do not absorb later captures, and the
   remaining queue continues without an `acd off` and `acd on` cycle.
