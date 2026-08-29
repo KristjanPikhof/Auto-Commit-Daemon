@@ -76,6 +76,10 @@ type semanticPrefixMessagePlanner struct {
 	rewriteSeqs [][]int64
 }
 
+type exactTargetReplanPlanner struct {
+	offeredSeqs [][]int64
+}
+
 func (*semanticPrefixMessagePlanner) Name() string {
 	return "semantic-prefix-message-test"
 }
@@ -98,6 +102,40 @@ func (p *semanticPrefixMessagePlanner) RewriteIntentMessage(
 		Subject: "Restore checkpoint compilation",
 		Body:    "- Keep the semantic dependency prefix together",
 		Source:  p.Name(),
+	}, nil
+}
+
+func (*exactTargetReplanPlanner) Name() string {
+	return "exact-target-replan-test"
+}
+
+func (*exactTargetReplanPlanner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("Intent v2 planning is required")
+}
+
+func (p *exactTargetReplanPlanner) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	p.offeredSeqs = append(p.offeredSeqs, append([]int64(nil), seqs...))
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID:  "exact-target-replanned-candidate",
+			SelectedSeqs: seqs,
+			Purpose:      "replan the remaining frozen recovery target",
+			Readiness:    ai.IntentCandidateReady,
+			Subject:      "Replan remaining recovery",
+			GroupingReason: "the remaining captures form the exact unresolved " +
+				"semantic target",
+		}},
 	}, nil
 }
 
@@ -456,6 +494,58 @@ func TestReplayLocalUnlockStopsAfterFullSemanticPrefixFailure(t *testing.T) {
 		stopped.HasMore {
 		t.Fatalf("stopped result=%+v verification_calls=%d",
 			stopped, verificationCalls)
+	}
+}
+
+func TestReplayResetsStalePrefixAfterCrashPublication(t *testing.T) {
+	fixture := seedFailedCheckpointReplayFixture(t)
+	f := fixture.capture
+	ctx := context.Background()
+	recovery, _ := seedSemanticPrefixRecovery(t, fixture)
+	if recovery.PrefixUnresolvedCount != len(fixture.seqs) {
+		t.Fatalf("prefix baseline=%d want %d",
+			recovery.PrefixUnresolvedCount, len(fixture.seqs))
+	}
+
+	mustGitOutput(t, f.dir, "add", "source_test.go")
+	mustGitOutput(t, f.dir, "commit", "-m", "Publish semantic prerequisite")
+	newHead := strings.TrimSpace(mustGitOutput(t, f.dir, "rev-parse", "HEAD"))
+	if _, err := f.db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',published_ts=2,commit_oid=?
+WHERE seq=?`, newHead, fixture.seqs[2]); err != nil {
+		t.Fatal(err)
+	}
+
+	planner := &exactTargetReplanPlanner{}
+	verify := func(
+		context.Context,
+		ai.IntentCandidateAssignment,
+		[]IntentCandidateCapture,
+	) (IntentCandidateVerification, error) {
+		return IntentCandidateVerification{}, errors.New(
+			"hold the replanned target for prefix recovery")
+	}
+	opts := semanticPrefixReplayOpts(planner, verify)
+	opts.GitDir = f.gitDir
+	restartCtx := f.cctx
+	restartCtx.BaseHead = newHead
+	result, err := Replay(ctx, f.dir, f.db, restartCtx, opts)
+	if err != nil {
+		t.Fatalf("Replay after crash boundary: %v", err)
+	}
+	marker, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || !active || marker.Stage != publicationFallbackLocalUnlock ||
+		marker.PrefixBaseHead != newHead || marker.PrefixUnresolvedCount != 2 ||
+		marker.PrefixCursor != 1 || marker.PlanFingerprint == recovery.PlanFingerprint {
+		t.Fatalf("restarted marker=(%+v active=%t err=%v)", marker, active, err)
+	}
+	wantOffered := [][]int64{{fixture.seqs[0], fixture.seqs[1]}}
+	if !reflect.DeepEqual(planner.offeredSeqs, wantOffered) ||
+		result.PlanFingerprint != marker.PlanFingerprint {
+		t.Fatalf("replan offers=%v fingerprint=(%q,%q)",
+			planner.offeredSeqs, result.PlanFingerprint, marker.PlanFingerprint)
 	}
 }
 
