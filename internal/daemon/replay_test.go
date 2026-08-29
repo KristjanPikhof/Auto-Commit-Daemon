@@ -423,8 +423,18 @@ func TestSelectIntentWindowOffersFreshPathsBeforeRetryingForcedCapture(t *testin
 	}
 	saveWaitingIntentCandidateForEvent(t, ctx, f, pending[0].Seq)
 
-	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending,
-		intentReplayConfig{window: 2, deferLimit: 1})
+	cfg := intentReplayConfig{
+		enabled: true, candidateMode: true, window: 2, deferLimit: 1,
+	}
+	batchLimit := replayPendingBatchLimit(ReplayOpts{}, cfg)
+	pending, err = state.PendingEvents(ctx, f.db, batchLimit+1)
+	if err != nil {
+		t.Fatalf("PendingEvents production window: %v", err)
+	}
+	if len(pending) > batchLimit {
+		pending = pending[:batchLimit]
+	}
+	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending, cfg)
 	if err != nil {
 		t.Fatalf("selectIntentWindow: %v", err)
 	}
@@ -432,6 +442,35 @@ func TestSelectIntentWindowOffersFreshPathsBeforeRetryingForcedCapture(t *testin
 		window[0].Seq != pending[1].Seq || window[1].Seq != pending[2].Seq {
 		t.Fatalf("window=%+v forced=%v reason=%q; want fresh companion paths",
 			window, forced, reason)
+	}
+}
+
+func TestReplayPendingBatchLimitLooksPastFullCandidate(t *testing.T) {
+	t.Parallel()
+	cfg := intentReplayConfig{
+		enabled: true, candidateMode: true, window: 20, minPending: 300,
+	}
+	if got, want := replayPendingBatchLimit(ReplayOpts{}, cfg), 300; got != want {
+		t.Fatalf("batch limit=%d want min-pending limit %d", got, want)
+	}
+	cfg.minPending = 2
+	if got, want := replayPendingBatchLimit(ReplayOpts{}, cfg),
+		state.IntentCandidateMaxCaptures+cfg.window; got != want {
+		t.Fatalf("batch limit=%d want candidate plus fresh window %d", got, want)
+	}
+}
+
+func TestSelectIntentWindowKeepsFrozenRecoveryTargetTogether(t *testing.T) {
+	t.Parallel()
+	pending := []state.CaptureEvent{{Seq: 1}, {Seq: 2}, {Seq: 3}}
+	window, forced, reason, err := selectIntentWindow(
+		context.Background(), nil, pending, intentReplayConfig{
+			window: 3, semanticSalvage: true,
+			targetEventSeqs: []int64{1, 2, 3},
+		})
+	if err != nil || forced || reason != "" || len(window) != len(pending) {
+		t.Fatalf("recovery window=%+v forced=%v reason=%q err=%v",
+			window, forced, reason, err)
 	}
 }
 
