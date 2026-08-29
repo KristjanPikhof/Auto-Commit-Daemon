@@ -10,9 +10,11 @@ report `protected=true` only when:
 - no eligible path failed reading or stabilization; and
 - `covered_epoch == observation_epoch`.
 
-Watcher events use a 500 ms trailing debounce with a two-second maximum batch
-delay. A complete poll, normally every two seconds and adaptive for large
-repositories, repairs watcher loss and is always the coverage authority.
+Watcher events wake the worker immediately. More events in the same burst use
+a 100 ms trailing debounce with a 500 ms hard limit, so continuous formatter
+activity cannot postpone observation indefinitely. The complete safety poll
+starts at 750 ms after activity and doubles while the repository stays idle,
+up to two minutes. It repairs watcher loss and remains the coverage authority.
 
 ## Eligible scope
 
