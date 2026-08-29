@@ -254,8 +254,19 @@ ORDER BY checkpoint_event.ord`, checkpointID)
 					"state: scan failed intent closure checkpoint: %w", err)
 			}
 			if checkpointPhase != CheckpointCompleted ||
-				eventState != EventStatePending || eventBranchRef != branchRef ||
+				eventBranchRef != branchRef ||
 				eventGeneration != branchGeneration {
+				_ = targetRows.Close()
+				return IntentForwardRecovery{}, false, nil
+			}
+			switch eventState {
+			case EventStatePublished, EventStateRecovered:
+				// A prior bounded recovery may already have settled part of this
+				// checkpoint. Keep that proof intact and replan only the durable
+				// pending remainder.
+				continue
+			case EventStatePending:
+			default:
 				_ = targetRows.Close()
 				return IntentForwardRecovery{}, false, nil
 			}
@@ -912,8 +923,9 @@ UPDATE daemon_meta SET value=?,updated_ts=? WHERE key=?`,
 	return current, nil
 }
 
-// CompleteIntentForwardRecovery clears the marker and records the successful
-// recovery mode for read-only diagnostics.
+// CompleteIntentForwardRecovery clears the marker only after the frozen target
+// is fully resolved. The published count remains an API guard for callers that
+// observed progress; durable event state is the completion proof.
 func CompleteIntentForwardRecovery(
 	ctx context.Context,
 	d *DB,
@@ -924,46 +936,13 @@ func CompleteIntentForwardRecovery(
 		published <= 0 {
 		return errors.New("state: CompleteIntentForwardRecovery: invalid input")
 	}
-	tx, err := d.conn.BeginTx(ctx, nil)
+	completed, err := CompleteResolvedIntentForwardRecovery(ctx, d, recovery)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-	var raw string
-	if err := tx.QueryRowContext(ctx,
-		`SELECT value FROM daemon_meta WHERE key=?`,
-		intentForwardRecoveryMetaKey).Scan(&raw); err != nil {
-		return err
+	if !completed {
+		return errors.New(
+			"state: intent forward recovery target remains unresolved")
 	}
-	var current IntentForwardRecovery
-	if err := json.Unmarshal([]byte(raw), &current); err != nil {
-		return err
-	}
-	if current.BranchRef != recovery.BranchRef ||
-		current.BranchGeneration != recovery.BranchGeneration ||
-		current.CandidateID != recovery.CandidateID {
-		return errors.New("state: intent forward recovery marker changed")
-	}
-	now := nowSeconds()
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM daemon_meta WHERE key=?`, intentForwardRecoveryMetaKey); err != nil {
-		return err
-	}
-	mode := recovery.Stage
-	if mode == "" {
-		mode = "semantic_replan"
-	}
-	for key, value := range map[string]string{
-		"intent.v2.last_fallback_mode":   mode,
-		"intent.v2.last_fallback_size":   strconv.Itoa(published),
-		"intent.v2.last_fallback_reason": recovery.Reason,
-	} {
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,?)
-ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_ts=excluded.updated_ts`,
-			key, value, now); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return nil
 }
