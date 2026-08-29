@@ -233,9 +233,10 @@ FROM intent_candidates WHERE id=?`, candidateID).Scan(
 				candidate.readiness == IntentReadinessWait &&
 				(!candidate.verification.Valid ||
 					candidate.verification.String == "pending")
+			root := candidateID == rootCandidateIDs[0]
 			if candidateBranch != branchRef ||
 				candidateGeneration != branchGeneration ||
-				(!failed && !incomplete) || candidate.published.Valid ||
+				(!failed && (root || !incomplete)) || candidate.published.Valid ||
 				candidate.deadline.Valid {
 				return IntentForwardRecovery{}, false, nil
 			}

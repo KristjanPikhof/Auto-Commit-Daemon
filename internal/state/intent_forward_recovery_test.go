@@ -523,6 +523,30 @@ WHERE id=?`, fixture.overlapCandidateID); err != nil {
 	}
 }
 
+func TestStartFailedIntentCheckpointRecoveryRejectsIncompleteRootCandidate(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates
+SET missing_companions='production companion is not in this planner window',
+    verification_status='pending'
+WHERE id=?`, fixture.candidateID); err != nil {
+		t.Fatal(err)
+	}
+
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || changed || recovery.CandidateID != "" {
+		t.Fatalf("incomplete root recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	assertFailedIntentCheckpointUnchanged(
+		t, fixture, IntentCandidateWaiting, fixture.memberCount)
+}
+
 func TestCompleteResolvedIntentForwardRecoveryProvesAndClearsMarker(t *testing.T) {
 	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
 	ctx := context.Background()
