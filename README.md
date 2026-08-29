@@ -1,228 +1,215 @@
 # ACD
 
-ACD protects meaningful working-tree changes as durable local checkpoints,
-then groups and publishes them as ordinary local Git commits.
+ACD turns the changes you make in files into clean local Git history. You work
+normally. ACD captures the changes first, groups related work by intent, and
+creates semantic commits in the background.
 
-> Capture every meaningful change durably first. Group and publish commits
-> second. Make protection status and restoration understandable without Git
-> expertise.
+![From file changes to clean Git history](docs/assets/acd-workflow.png)
 
-ACD is a static Go binary for macOS and Linux on `amd64` and `arm64`. It never
-pushes, never rewrites normal history, and needs no API key for its default
-path.
+The normal flow is simple:
 
-## v2026-08-25
+1. You change files.
+2. ACD captures those changes in a durable private checkpoint.
+3. ACD groups related changes by intent.
+4. ACD creates semantic local commits.
+5. You get a clean, reviewable Git history.
 
-This release separates machine-wide setup from repository enablement and fixes
-Intent publication stalls caused by stale dependency edges or checkpoint
-proof. It also improves planner recovery and diagnostics, and isolates large
-race-test packages so CI runs them without competing workloads.
+If an AI-generated plan is invalid or unsafe, ACD rejects it. It retries or
+rebuilds the plan while the captured checkpoint stays protected. A provider
+outage, failed check, or Git operation can delay commits, but it does not undo
+a completed checkpoint.
 
-The terminal and storage dependencies now include Bubbles 2.2.0, Bubble Tea
-2.0.9, and SQLite 1.57.0. See [the changelog](CHANGELOG.md#v2026-08-25) for the
-full list.
+ACD never pushes. You decide when and where to publish your commits.
 
-## Get protected
+## Requirements
 
-Install ACD once, then enable each repository you want to protect:
+- macOS or Linux on `arm64` or `amd64`
+- Git installed and available on `PATH`
+- A normal Git worktree on an attached branch
+- A configured Git author name and email
+- A working systemd user manager on Linux
+
+Check your Git identity:
+
+~~~bash
+git config --global user.name
+git config --global user.email
+~~~
+
+Set either value if it is missing:
+
+~~~bash
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+~~~
+
+The released binary does not require Go. The default setup does not require an
+API key, a Git remote, a GitHub account, or Full Disk Access on macOS.
+
+## Install
+
+### Homebrew
+
+~~~bash
+brew install KristjanPikhof/tap/acd
+acd --version
+~~~
+
+### Verified release installer
+
+~~~bash
+curl -fsSL \
+  https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh |
+  bash
+~~~
+
+The installer selects the correct macOS or Linux release, verifies its
+SHA-256 checksum, and installs `acd` in `$HOME/.local/bin` by default. If your
+shell cannot find it, add that directory to `PATH`:
+
+~~~bash
+export PATH="$HOME/.local/bin:$PATH"
+acd --version
+~~~
+
+The installer needs Bash, `curl`, `tar`, `install`, and either `shasum` or
+`sha256sum`. `jq` is optional.
+
+## Set up once, then enable each repository
+
+### 1. Set up ACD for your user account
 
 ~~~bash
 acd setup
-cd /path/to/repository
-acd on
 ~~~
 
-First setup asks four short questions about grouping, commit messages, and the
-provider. The recommended local provider works offline. A custom
-OpenAI-compatible provider asks for its endpoint, model, and bearer token.
-ACD then shows one exact plan and explains what can leave the machine. After
-you approve it, ACD tests the provider with fixed synthetic text before it
-changes anything.
+Setup asks how you want ACD to group changes, format commit messages, and
+choose a provider. Choose Everyday for Intent commits. The local provider
+works offline; choose an OpenAI-compatible provider for AI-generated grouping
+and semantic commit messages.
 
-Setup configures one user-level supervisor, merges detected optional
-integrations, and runs an isolated checkpoint/publish/restore self-test. It
-does not enable the current directory. Run `acd on` once inside every
-repository that ACD should protect.
+ACD shows one exact plan before changing anything. Once you approve it, setup
+installs the managed runtime, starts the background supervisor, and adds any
+integrations you selected.
 
-Later compatible setup runs inspect only the shared runtime and integrations.
-An incompatible upgrade checkpoints and migrates enabled repositories as one
-reviewed transaction. Disabled repositories stay disabled and are migrated
-only when you run `acd on` for them. On failure, setup restores every touched
-file and prior process or service state.
+Setup is user-wide. It does not enable the current repository.
 
-On macOS, the first ACD mutation starts one shared supervisor for the current
-user. Other terminals and agent applications reuse its owner-only socket after
-a same-user peer credential check, so switching applications does not require
-setup. The process inherits the permissions of the application that started
-it and does not require Full Disk Access. After logout or restart, the first
-`acd on` or supported agent hook starts it again. Linux uses the persistent
-user systemd service.
-
-When the CLI and managed runtime differ, run `acd setup` to review and apply
-the upgrade. Ordinary repository commands and integration hooks never replace
-the binary or migrate other repositories.
-
-Preview without writes or supervisor/service actions:
+To inspect the plan without making changes:
 
 ~~~bash
 acd setup --dry-run
 ~~~
 
-Noninteractive first setup always requires an exact reviewed JSON plan:
+### 2. Enable one repository
 
 ~~~bash
-acd setup --dry-run --json
-acd setup --yes --non-interactive --expect-plan sha256:... \
-  --confirm-intent-repair
+cd /path/to/repository
+acd on
 ~~~
 
-Fresh installations use Everyday Intent/Balanced, imperative commit messages,
-the local deterministic provider, structural checks, bounded private repair,
-and no diff egress. These are user defaults inherited by this repository and
-repositories added later. Existing
-repositories retain their effective provider, strategy, preset, verification,
-and repair settings during the one-shot v19 to v20 cutover.
+`acd on` registers only that repository, starts its worker, and waits until
+the current eligible files have a verified checkpoint. You can run it again
+safely.
+
+Run `acd on` once in every repository that you want ACD to protect.
+
+### 3. Confirm protection
+
+~~~bash
+acd status
+~~~
+
+Look for:
+
+~~~text
+ACD protection: on
+Current changes protected: yes
+Action needed: no
+~~~
+
+`Commit mode` should be `Intent` when you selected Everyday. The publication
+queue may still contain protected changes. `Publication phase` explains
+whether ACD is grouping, calling the provider, verifying, publishing, waiting,
+or recovering.
 
 ## Daily use
 
-Bare `acd` and `acd status` are equivalent and read-only:
+You do not need to run `git add`, `git commit`, or `acd commit-all` during
+normal work. Keep editing files and use these commands when you want to check
+what ACD is doing:
 
-~~~text
-State: waiting
-ACD protection: on
-Current changes protected: yes
-Published to Git: no
-Action needed: no
-Status: Current changes are checkpointed; publication is waiting for a safe boundary.
-Next: No action needed.
-~~~
-
-The five product states are:
-
-| State | Meaning |
+| Command | What it tells you |
 |---|---|
-| `off` | This repository is intentionally disabled or not configured. |
-| `protected` | The latest complete observation is checkpointed and nothing waits for publication. |
-| `waiting` | Checkpoints are safe; grouping, verification, Git state, or retry is delaying publication. |
-| `publishing` | A selected checkpoint group is being published as a local Git commit. |
-| `needs_action` | Protection is incomplete or ACD cannot prove a safe automatic recovery. |
+| `acd` or `acd status` | Full protection and publication state for the current repository |
+| `acd list` | Live queue and phase across repositories |
+| `acd list --once --verbose` | One detailed dashboard snapshot |
+| `acd history` | Retained checkpoints and their local Git publication state |
+| `acd history activity` | Recent capture and publication activity |
+| `acd doctor` | The problem and the next safe command when action is required |
+| `acd off` | Save a final checkpoint and stop protecting this repository |
+| `acd on` | Start protection again |
 
-`Current changes protected` is reported separately from the overall state. It
-may remain `yes` while publication is `waiting`, `publishing`, or blocked by an
-unrelated repair.
+`acd list` is the quickest fleet view:
 
-An old publication run does not require a branch switch when all of its frozen
-changes are already published or safely recovered. ACD proves that state and
-completes the run automatically when the worker starts or processes recovery.
-
-## Commands
-
-Root help lists ten everyday commands:
-
-| Command | Purpose |
+| Column | Meaning |
 |---|---|
-| `acd setup` | Install or upgrade the shared ACD runtime and integrations. |
-| `acd status` | Answer whether changes are enabled, protected, published, and actionable. |
-| `acd on` | Register or enable this repository, start its worker, and verify a checkpoint. |
-| `acd off` | Complete a final checkpoint, disable protection, and wait for the worker to stop. |
-| `acd list` | Show live protection health and commit progress across repositories. |
-| `acd commit-all` | Checkpoint now and drain the bounded publication target. |
-| `acd history` | List retained checkpoints and their Git publication state. |
-| `acd restore ID` | Preview a full-checkpoint restore; add `--yes` to apply it. |
-| `acd doctor` | Explain installation or protection problems and the exact next command. |
-| `acd uninstall` | Remove managed components while preserving protected data by default. |
+| `SAFE` | The latest complete observation has a durable checkpoint |
+| `MODE` | Intent or event commit mode |
+| `QUEUE` | Protected changes still waiting for local Git publication |
+| `TARGET` | Work left in a bounded drain or automatic recovery |
+| `LAST MOVE` | Time since durable queue progress, not a heartbeat |
+| `PHASE` | Grouping, provider call, verification, waiting, recovery, or publication |
+| `STATUS` | Healthy, working, waiting, stalled, paused, or needs action |
 
-`acd list` is the everyday overview. In a terminal it refreshes in place.
-Repositories that need action or are processing work stay visible, and recent
-repositories fill the rest of the five-row view. `MODE` confirms whether ACD
-is using Intent or event commits. `QUEUE` is all pending work, while `TARGET`
-shows the bounded remainder of `commit-all` or automatic Intent recovery.
-`LAST MOVE` measures real queue progress rather than worker heartbeats, and
-`PHASE` says whether ACD is waiting, calling the provider, verifying,
-recovering, or publishing. An open provider circuit shows its retry countdown;
-a half-open probe shows `provider-call`; an active repository check shows
-`verifying`. Use `--all` for every enabled repository, `--verbose` for
-operational details, or `--once` for one snapshot. `acd repo list` remains the
-static registration inventory.
+`working`, `waiting`, and `stalled` can all be safe states. If protection is
+`yes` and `Action needed` is `no`, leave ACD running. It will retry or repair
+the publication path itself. Use `acd doctor` only when status says that you
+need to act.
 
-It also links directly to common tasks:
+## Publish the current work now
 
-~~~text
+Normal Intent mode publishes automatically. When you explicitly want ACD to
+finish the currently protected work before you continue, preview a bounded
+drain:
+
+~~~bash
 acd commit-all --dry-run
-acd history rewrite --help
-acd config edit
-acd repo --help
-acd support --help
+acd commit-all --yes
 ~~~
 
-Advanced commands are callable under hidden namespaces:
+This does not switch to deterministic commits and does not squash everything
+into one commit. It freezes the current target and lets the configured Intent
+or event strategy publish it normally. Later edits stay outside that target.
 
-~~~text
-acd config get|set|edit|reset|credentials
-acd support diagnose|logs|repair|recover|prompt|bundle
-acd repo list|remove|gc
-acd history activity|explain|rewrite
-~~~
+Do not use `commit-all` as a repair command. Check `acd status`, `acd list`, or
+`acd doctor` instead. ACD keeps retrying in the background if your terminal
+closes.
 
-Old command names remain hidden compatibility aliases for two releases. A
-manual use prints a warning. Optional integrations use hidden local hint APIs
-without terminal noise. All aliases invoke the checkpoint-first runtime.
+## How ACD keeps work safe
 
-`acd commit-all` does not squash the worktree into one commit. It freezes the
-checkpoint-backed event target and lets the configured event or Intent
-publication strategy create the same reviewable, atomic local commits it
-would create during normal operation. Edits made after the barrier are left
-for the next publication pass.
+Protection and Git publication are separate:
 
-Intent fallback preserves commits that were already published. When new work
-depends on a recent private ACD commit, ACD first tries one bounded semantic
-replan of that repairable suffix. If replanning fails, ACD keeps the existing
-commit OIDs and publishes only the new captures as a dependent commit. That new
-commit must have a meaningful generated message. If the provider is
-unavailable, publication waits and retries instead of creating a generic
-`Update <path>` commit. A completed plan is reused while its repository
-fingerprint remains unchanged.
+1. ACD observes the worktree through file events, an adaptive safety poll, and
+   optional coding-tool hints.
+2. It writes the complete eligible state to a private Git checkpoint ref.
+3. Only completed checkpoints enter Intent planning.
+4. ACD validates grouping, dependencies, materialization, verification, and
+   the exact Git target before it publishes.
+5. Successful groups become ordinary local Git commits.
 
-See [the command reference](docs/commands.md) for flags, JSON, exit codes, and
-the compatibility map.
+An invalid or incomplete AI plan is not trusted. ACD can reject it, retry the
+provider, or rebuild the plan from the still-protected captures. If the
+provider remains unavailable, publication waits without losing the
+checkpoint.
 
-## How protection works
+Normal publication appends commits. Optional Intent repair can rewrite only a
+bounded recent suffix that ACD proves is private, unshared, and ACD-owned. It
+does not rewrite pushed or user-owned history.
 
-Filesystem watching accelerates detection and a complete poll remains the
-universal safety path. Optional tool integrations only provide semantic and
-session-boundary hints; removing every integration does not reduce capture
-coverage.
+Read [the architecture overview](docs/overview.md) and [protection and
+publication](docs/capture-replay.md) for the full durability protocol.
 
-Each completed checkpoint is a rootless Git commit containing the entire
-eligible protected worktree and is retained under:
-
-~~~text
-refs/acd/checkpoints/v1/<worktree-id>/<checkpoint-id>
-~~~
-
-The ref keeps its Git objects reachable through normal garbage collection.
-Checkpoint commits are not parented to `HEAD` or to one another, do not appear
-as user branches, and never replace ordinary Git history.
-
-Protection continues during provider failures, verification failures,
-detached HEAD, conflicts, branch transitions, and in-progress Git operations.
-Publication waits until Git is safe. A checkpoint becomes published only when
-all of its captured changes map to completed ordinary local commits.
-
-ACD excludes Git-ignored paths and configured sensitive paths. An unreadable,
-unstable, or oversized eligible path makes protection incomplete; ACD never
-silently claims the repository is protected after skipping eligible content.
-
-Default retention keeps unpublished checkpoints, restore preimages,
-unresolved operations, and the newest checkpoint indefinitely. Published
-checkpoints are retained for 30 days and at least the newest 100, with a soft
-5 GiB per-worktree content budget. A budget never silently discards
-unpublished protection.
-
-See [protection and publication](docs/capture-replay.md) for the durable
-protocol and failure behavior.
-
-## Restore
+## Restore a checkpoint
 
 Restore always previews first:
 
@@ -232,91 +219,76 @@ acd restore cp-...
 acd restore cp-... --yes
 ~~~
 
-Before changing files, ACD checkpoints the current state. It restores the
-selected checkpoint into the working tree as a new change, leaves `HEAD` and
-the index byte-for-byte unchanged, checkpoints the result, and returns the
-pre-restore checkpoint as the undo target.
+ACD checkpoints the current state before applying a restore. It leaves `HEAD`
+and the Git index unchanged and returns the pre-restore checkpoint as the undo
+target.
 
-Restore refuses conflicts, in-progress merge/rebase/cherry-pick/bisect states,
-and any staged-path overlap. Detached HEAD is allowed because restore does not
-move it. If a post-restore checkpoint is interrupted, run the previewed repair:
+See [user workflows](docs/user-workflows.md) for restore, recovery, and support
+steps.
 
-~~~bash
-acd support repair
-acd support repair --yes
-~~~
+## Privacy and providers
 
-See [user workflows](docs/user-workflows.md) for recovery and support steps.
+Fresh setup uses the local deterministic provider and needs no credential or
+network request. You can choose an OpenAI-compatible provider when you want AI
+Intent planning and semantic commit messages.
+
+Network diff egress is off until you approve it explicitly. Credentials never
+enter status, logs, diagnostics, traces, or plan fingerprints. Full provider
+payloads stay out of ordinary diagnostics. The advanced prompt-trace and raw
+reject-log options are explicit local opt-ins because their output can contain
+sensitive source text. Git-ignored files and configured sensitive paths remain
+outside the protected scope.
+
+See [AI providers](docs/ai-providers.md) for the provider and privacy contract.
 
 ## Configuration
 
-Inside a worktree, public configuration defaults to repository scope. Outside
-a worktree it defaults to global scope. Make scope explicit with
-`--scope repo|profile|global`.
-
 ~~~bash
 acd config get
-acd config set commit.preset fast
 acd config edit
 acd config credentials
 ~~~
 
-Resolution order is:
+Repository settings override profile and global defaults. Use the interactive
+editor for advanced Intent, provider, verification, repair, and retention
+settings.
 
-~~~text
-invocation override
-internal experiment
-repository
-profile
-global
-environment
-preset
-default
+See [settings](docs/settings.md) and the generated [configuration
+reference](docs/configuration-reference.md).
+
+## Upgrade and uninstall
+
+Upgrade the CLI with the same method you used to install it, then apply the
+reviewed runtime plan:
+
+~~~bash
+brew upgrade acd        # Homebrew installation
+acd setup --dry-run
+acd setup
 ~~~
 
-Credentials stay in the protected existing credential store. The deterministic
-default requires none. Diff egress remains off unless explicitly approved.
-
-See [settings](docs/settings.md), the generated
-[configuration reference](docs/configuration-reference.md), and
-[AI providers](docs/ai-providers.md).
-
-## Setup, upgrade, and uninstall safety
-
-The v19 to v20 upgrade is one global transaction across every registered
-repository. A provable unpublished chain is imported as checkpoint or
-recovery-backed history. Any ambiguous chain aborts the complete cutover and
-restores all preimages. There is no legacy runtime mode, dual-read period, or
-automatic downgrade after commit.
-
-Uninstall preserves repository databases, checkpoint/recovery refs, operation
-history, and backups by default:
+Uninstall keeps protected repository data by default:
 
 ~~~bash
 acd uninstall --dry-run
 acd uninstall
 ~~~
 
-`--purge-data` inventories every target and requires a second explicit
-confirmation. Private refs use expected-target CAS, and repository data is
-staged reversibly until the uninstall transaction commits.
+## Detailed documentation
 
-## Platform files
-
-| Purpose | Location |
-|---|---|
-| Managed binary | `${XDG_DATA_HOME:-$HOME/.local/share}/acd/bin/acd` |
-| Supervisor socket | `${XDG_STATE_HOME:-$HOME/.local/state}/acd/run/supervisor.sock` |
-| Supervisor log | `${XDG_STATE_HOME:-$HOME/.local/state}/acd/supervisor.log` |
-| Global operation history | `${XDG_DATA_HOME:-$HOME/.local/share}/acd/operations.db` |
-| Repository state | `<git-dir>/acd/state.db` |
-| macOS lifecycle | Session-owned; no installed service file |
-| Linux service | `~/.config/systemd/user/acd-supervisor.service` |
-
-Linux requires a working systemd user manager. ACD does not ship a second
-Linux lifecycle implementation.
+- [Command reference](docs/commands.md)
+- [User workflows](docs/user-workflows.md)
+- [Architecture overview](docs/overview.md)
+- [Protection and publication](docs/capture-replay.md)
+- [Intent commit flow](docs/intent-commit-flow.md)
+- [Settings](docs/settings.md)
+- [AI providers](docs/ai-providers.md)
+- [Commit-message rewriting](docs/rewrite-commits.md)
+- [Changelog](CHANGELOG.md)
 
 ## Development
+
+Building from source requires Go 1.26.6:
 
 ~~~bash
 make build

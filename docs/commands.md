@@ -116,6 +116,10 @@ acd restore cp-...
 acd restore cp-... --yes
 ~~~
 
+Creating a new rewrite plan requires Intent mode and an explicitly configured
+non-deterministic AI provider that can plan commits. Showing, editing, or
+applying an existing saved plan makes no new AI call.
+
 Checkpoint prefixes are accepted only when unique. Restore is full-checkpoint
 only. Preview reports create, modify, delete, mode, symlink, untracked-overwrite
 and staged-overlap counts. Apply revalidates the plan digest, `HEAD` token,
@@ -135,9 +139,10 @@ acd commit-all --yes
 ~~~
 
 `list` is the live overview for repository health and commit progress. It always
-shows repositories that need action or are working. The default view fills the
-remaining five-row budget with repositories where ACD most recently handled
-changes. Paused repositories appear only when space remains after recent work.
+shows repositories that need action or are working, waiting, or stalled. The
+default view fills the remaining five-row budget with repositories where ACD
+most recently handled changes. Paused repositories appear only when space
+remains after recent work.
 Use `--all` for every enabled repository and `--verbose` for worker, tool,
 blocker, last commit, and recovery details. A terminal refreshes the same
 screen until Ctrl-C; `--once` prints one snapshot.
@@ -178,8 +183,10 @@ one commit per capture; Intent mode may create several semantically atomic
 commits. The command never combines everything into one commit merely because
 of its name. If the terminal disconnects or the worker restarts, publication
 continues and the next `acd commit-all --yes` reconnects to the same drain.
-Invalid Intent grouping gets one bounded rebuild, followed by safe
-local atomic dependency groups when needed.
+Invalid Intent grouping can use the configured retry budget, capped at two
+corrections after the first plan. Repeated no-progress state then enters
+bounded replanning or a safe local unlock. A local group still requires a
+semantic commit message before publication.
 
 The barrier accepts only a completed checkpoint for the requested worktree,
 branch, generation, and observation. A checkpoint from another branch or

@@ -21,8 +21,13 @@ acd config edit
 
 Network content is redacted and bounded. A network provider receives diffs
 only when it declares `NeedsDiff` and diff egress is explicitly enabled.
-Credentials, raw provider failures, and unredacted source never enter state,
-logs, status, diagnostics, traces, plan fingerprints, or test output.
+Credentials never enter state, logs, status, diagnostics, traces, plan
+fingerprints, or test output. Full provider payloads stay out of ordinary
+diagnostics. `ACD_AI_PROMPT_TRACE` is an explicit local opt-in that records
+redacted and truncated provider requests which may still contain source text.
+Rejected-plan logs omit the raw response by default.
+`ACD_INTENT_REJECTS_RAW` is a separate opt-in that stores that response in the
+worktree-local reject log described below.
 
 Strict provider tests use fixed synthetic content and no repository source.
 First setup tests the selected provider after review and before any write. Its
@@ -54,6 +59,11 @@ adapted for compatibility and cannot claim native Intent readiness.
 Provider failures do not affect completed checkpoints or `protected=true`.
 Malformed plans are repaired locally, partially replanned, or replaced with a
 verified evidence partition. This applies to Fast, Balanced, and Quality.
+
+When Intent recovery selects a dependency-safe local group under a configured
+non-deterministic provider, that provider must still write the semantic commit
+message. An outage keeps the locked group protected and waiting for retry. ACD
+does not silently publish a deterministic or filename-based message.
 
 Only connection, timeout, protocol transport, and unavailable-service failures
 open the provider circuit. It uses 30-second, 2-minute, then 10-minute

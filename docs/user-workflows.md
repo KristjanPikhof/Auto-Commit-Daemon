@@ -1,27 +1,55 @@
 # User workflows
 
-## First setup
+## Install ACD
+
+Homebrew is the shortest installation path:
+
+~~~bash
+brew install KristjanPikhof/tap/acd
+~~~
+
+The verified release installer is the alternative:
+
+~~~bash
+curl -fsSL \
+  https://raw.githubusercontent.com/KristjanPikhof/Auto-Commit-Daemon/main/scripts/install.sh |
+  bash
+export PATH="$HOME/.local/bin:$PATH"
+~~~
+
+See the [README requirements](../README.md#requirements) before enabling your
+first repository.
+
+## Set up ACD once
 
 ~~~bash
 acd setup
-cd /path/to/repository
-acd on
-acd
 ~~~
 
-Choose Everyday work and the local provider for the shortest path. Review the
-shared installation, integrations, grouping, commit format, repair limit, and
-data use.
-The local provider works offline. If you choose an OpenAI-compatible provider,
-setup asks for its endpoint, model, and bearer token, then sends one fixed
-synthetic request after you approve the plan. It sends no repository content
-during that test.
+Setup configures the shared runtime, integrations, grouping, commit format,
+repair limit, and provider. Choose Everyday work for Intent commits. The local
+provider works offline. Choose an OpenAI-compatible provider when you want AI
+grouping and semantic commit messages.
 
-`acd setup` finishes with `ACD installation is ready`; it does not protect the
-current directory. `acd on` registers and enables the repository, then waits
-for a verified checkpoint. The final `acd` command should report protection on
-and current changes protected. Your setup choices are saved as user defaults
-for repositories you enable later.
+An OpenAI-compatible setup asks for its endpoint, model, and bearer token. It
+sends one fixed synthetic request after you approve the plan, without sending
+repository content during that test.
+
+`acd setup` finishes with `ACD installation is ready`. It does not protect the
+current directory.
+
+## Enable a repository
+
+~~~bash
+cd /path/to/repository
+acd on
+acd status
+~~~
+
+`acd on` registers and enables only that repository, then waits for a verified
+checkpoint. `acd status` should report protection on, current changes
+protected, and no action needed. Your setup choices become the defaults for
+repositories you enable later.
 
 ## Daily check
 

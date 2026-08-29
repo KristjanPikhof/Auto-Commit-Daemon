@@ -4,37 +4,51 @@
 
 ### Changed
 
-- Repository state schema v24 records the exact captures owned by each new
-  Intent history repair. Existing repair records migrate as legacy evidence
-  without inventing capture membership.
+- Repository state schema is now v25. Version 24 records the exact captures
+  owned by each new Intent repair. Version 25 freezes the commit strategy,
+  message format, configuration revision, and provider for every publication
+  drain, so restart recovery cannot reinterpret Intent work as Event work.
+  Historical repair rows remain legacy evidence without invented membership.
+- `acd list` and `acd status` now show the commit mode, full protected queue,
+  active drain or recovery target, current publication phase, and time since
+  durable queue progress. Planning, replanning, provider calls, provider
+  waits, verification, publication, and automatic recovery are visible without
+  reading daemon logs.
+- Worker activity hints now wake immediately once and coalesce follow-up hints
+  during a burst. Transient waits back off, idle safety polling can
+  stretch to two minutes, and bounded checkpoint retention runs hourly. This
+  reduces idle CPU use without weakening capture coverage.
+- The README and setup guides now explain the normal workflow from file changes
+  to protected checkpoints, Intent grouping, semantic local commits, and clean
+  Git history. They also explain that ACD rejects, retries, or rebuilds an
+  invalid AI plan while the checkpoint remains protected. Release archives
+  include the workflow image, and installer output now directs users to run
+  `acd setup` once, then `acd on` and `acd status` in each repository.
 
 ### Fixed
 
-- `acd list` and `acd status` now separate worker liveness from durable queue
-  progress. They show the configured mode, full queue, any earlier bounded
-  `commit-all` target, the current phase, and time since the queue last moved.
-  A completed old drain is no longer displayed as current work. A failed
-  candidate check is shown as automatic checkpoint replanning instead of an
-  immediate request for user action.
-- Intent local recovery now keeps deterministic dependency-safe membership but
-  requires the configured semantic provider to write the locked commit
-  message. Provider outages wait and retry instead of creating a generic
-  filename-based commit.
-- Status metadata now follows the active runtime revision, so hot-applied
-  Intent thresholds and provider details no longer look like stale startup
-  settings.
-- The daemon now recognizes a completed Intent rewrite as its own branch move,
-  including after a crash or restart. A frozen `commit-all` target cannot pull
-  in later captures, and pending work continues without an `off` and `on`
-  cycle.
+- Intent mode now fails closed when an explicitly configured semantic provider
+  cannot be built. Missing credentials, invalid provider settings, and provider
+  outages wait for recovery instead of silently creating deterministic or
+  generic filename-based commit messages.
+- ACD can now prove and adopt a completed ACD-owned Intent repair after a crash
+  or restart. Frozen publication targets do not absorb later captures, and the
+  remaining queue continues without an `acd off` and `acd on` cycle.
 - A repeatedly failed Intent candidate no longer hides later captures that may
-  complete it. ACD first looks ahead for new companion paths, then can retire
-  the unpublished failed groups and replan the bounded set of completed
-  checkpoints they overlap. Once recovery is due, capture order takes priority
-  over planner timestamps, so unrelated newer work cannot starve the failed
-  group. Recovery stays active until every frozen capture is resolved,
-  including when an earlier pass published only part of a checkpoint. Partial
-  planner retries also start from a clean scratch baseline.
+  complete it. ACD looks ahead for companion paths, replans the bounded
+  completed checkpoints in capture order, and keeps recovery active until the
+  frozen target is resolved.
+- Provider cooldowns, temporary verification resource failures, and live-index
+  reconciliation races now preserve the exact target and retry with backoff.
+  These waits no longer create a false action request or a tight replay loop.
+- Intent repair now preserves the live capture baseline, and replay recognizes
+  file updates that are already applied. Partial repairs no longer recapture
+  unchanged dirty files or stall on duplicate operations from an older drain.
+- The supervisor now starts at most two repository workers at once and releases
+  a startup slot after two minutes if its initial checkpoint is still retrying.
+  One unhealthy repository cannot block the rest of the fleet. Compatible
+  setup also waits through the bounded fleet readiness window and replaces a
+  rebuilt binary when its content changed but its source identity did not.
 
 ## v2026-08-27
 
@@ -194,12 +208,6 @@
   commits unchanged, and releases its pending events for forward recovery.
   Large queues can no longer prevent recovery just because another replay pass
   is available.
-- Intent history repair now preserves the live capture baseline while it
-  updates ACD-owned commits. Unchanged dirty files are no longer captured
-  again after a partial repair.
-- Replay now recognizes an already-applied file update inside a queued change
-  chain. Duplicate captures left by an older runtime drain as no-ops instead
-  of blocking Intent preflight on their stale before-state.
 - Forward recovery now returns to pending-only Intent planning after every
   local unlock. When planning stalls, ACD publishes the smallest safe hard
   dependency component, including a single event when needed, then replans the

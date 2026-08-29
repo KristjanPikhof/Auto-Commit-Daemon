@@ -2,8 +2,17 @@
 
 ACD separates durable protection from Git publication.
 
+You change files, ACD captures them, groups related changes by intent, creates
+semantic local commits, and leaves you with a clean Git history.
+
+![From file changes to clean Git history](assets/acd-workflow.png)
+
+ACD validates every grouping plan before publication. If an AI-generated plan
+is invalid or unsafe, ACD rejects it and retries or rebuilds the plan. The
+completed checkpoint remains protected throughout that loop.
+
 ~~~text
-filesystem watch + complete poll + optional hints
+optional filesystem watch + complete poll + optional hints
                     |
                     v
           protection scheduler
@@ -92,9 +101,13 @@ staged consent, and restart-safe phase state. The specialized publication
 record remains the authoritative branch-ref CAS proof and links to the general
 operation.
 
-SQLite v24 also freezes the capture membership of each new Intent history
-repair. Completed repairs and normal publications use the same durable branch
+SQLite v24 freezes the capture membership of each new Intent history repair.
+Completed repairs and normal publications use the same durable branch
 transition proof, so a worker can recover either ref move after a restart.
+SQLite v25 freezes each publication drain's commit strategy, message format,
+configuration revision, and provider identity. A restart therefore continues
+the same publication contract instead of reinterpreting Intent work as Event
+work.
 
 ## Publication
 

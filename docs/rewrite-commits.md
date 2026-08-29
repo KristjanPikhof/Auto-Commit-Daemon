@@ -15,10 +15,17 @@ acd history rewrite --apply <plan-id-or-file> --dry-run
 acd history rewrite --apply <plan-id-or-file> --yes
 ~~~
 
-The command is never automatic and is isolated from normal checkpoint
-protection and publication. It previews the exact commit set, preserves a
-private backup ref, verifies ownership and a stable branch, refuses staged
-overlap or unsafe Git operations, and requires explicit apply confirmation.
+Creating a new plan requires Intent mode and an explicitly configured
+non-deterministic AI provider that can produce Intent plans. Showing, editing,
+or applying an existing saved plan makes no new AI call.
+
+The command is never invoked automatically and is isolated from normal
+checkpoint protection and publication. It previews the exact commit set,
+preserves a private backup ref, verifies ownership and a stable branch, refuses
+staged overlap or unsafe Git operations, and requires explicit apply
+confirmation. Separately, enabled Intent repair may rewrite only a proved
+private, unshared, ACD-owned suffix. It never rewrites pushed or user-owned
+history.
 
 Effective repository configuration controls provider and message format:
 
