@@ -616,31 +616,39 @@ func configureIntentForwardRecovery(
 }
 
 // resolvedIntentForwardRecoveryPlan loads and revalidates the immutable plan
-// named by a recovery marker. Invalid or legacy fingerprints deliberately
-// return ok=false so recovery can create a fresh exact-target semantic plan.
+// named by a recovery marker. Invalid or legacy fingerprints are unavailable
+// so recovery creates a fresh exact-target semantic plan.
+type intentForwardRecoveryPlanStatus uint8
+
+const (
+	intentForwardRecoveryPlanUnavailable intentForwardRecoveryPlanStatus = iota
+	intentForwardRecoveryPlanReady
+	intentForwardRecoveryPlanPartial
+)
+
 func resolvedIntentForwardRecoveryPlan(
 	ctx context.Context,
 	db *state.DB,
 	recovery state.IntentForwardRecovery,
-) (ai.IntentPlanV2, bool, bool, error) {
+) (ai.IntentPlanV2, intentForwardRecoveryPlanStatus, error) {
 	fingerprint := strings.TrimSpace(recovery.PlanFingerprint)
 	if fingerprint == "" {
-		return ai.IntentPlanV2{}, false, false, nil
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 	}
 	run, ok, err := state.IntentPlanRunByFingerprint(ctx, db, fingerprint)
 	if err != nil {
-		return ai.IntentPlanV2{}, false, false, err
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, err
 	}
 	if !ok || run.Fingerprint != fingerprint ||
 		run.BranchRef != recovery.BranchRef ||
 		run.BranchGeneration != recovery.BranchGeneration ||
-		!run.Completed || !run.ResolvedPlanJSON.Valid {
-		return ai.IntentPlanV2{}, false, false, nil
+		!run.Completed || !run.ResolvedPlanJSON.Valid ||
+		!intentForwardRecoveryUsesSemanticPlan(run.ResolutionMode) {
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 	}
-	states, valid, err := intentForwardRecoveryTargetStates(
-		ctx, db, recovery)
-	if err != nil || !valid {
-		return ai.IntentPlanV2{}, false, false, err
+	states, err := intentForwardRecoveryTargetStates(ctx, db, recovery)
+	if err != nil {
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, err
 	}
 	// The durable plan JSON is the only record of the exact offered membership
 	// after a completed run clears its transient unresolved list. Peek only to
@@ -650,7 +658,7 @@ func resolvedIntentForwardRecoveryPlan(
 	if err := json.Unmarshal(
 		[]byte(run.ResolvedPlanJSON.String), &envelope,
 	); err != nil {
-		return ai.IntentPlanV2{}, false, false, nil
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 	}
 	target := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
 	for _, seq := range recovery.TargetEventSeqs {
@@ -665,7 +673,7 @@ func resolvedIntentForwardRecoveryPlan(
 	for _, candidate := range envelope.Plan.Candidates {
 		for _, seq := range candidate.SelectedSeqs {
 			if _, ok := target[seq]; !ok {
-				return ai.IntentPlanV2{}, false, false, nil
+				return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 			}
 			if _, duplicate := planSeqs[seq]; duplicate {
 				continue
@@ -681,13 +689,13 @@ func resolvedIntentForwardRecoveryPlan(
 			continue
 		}
 		if _, ok := planSeqs[seq]; !ok {
-			return ai.IntentPlanV2{}, false, false, nil
+			return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 		}
 	}
 	plan, _, err := loadResolvedIntentPlanRun(
 		request, run.ResolvedPlanJSON.String)
 	if err != nil {
-		return ai.IntentPlanV2{}, false, false, nil
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 	}
 	for _, candidate := range plan.Candidates {
 		unresolved := 0
@@ -698,19 +706,32 @@ func resolvedIntentForwardRecoveryPlan(
 			}
 		}
 		if unresolved > 0 && unresolved < len(candidate.SelectedSeqs) {
-			return ai.IntentPlanV2{}, false, true, nil
+			return ai.IntentPlanV2{}, intentForwardRecoveryPlanPartial, nil
 		}
 	}
-	return plan, true, false, nil
+	return plan, intentForwardRecoveryPlanReady, nil
+}
+
+func intentForwardRecoveryUsesSemanticPlan(mode sql.NullString) bool {
+	if !mode.Valid {
+		return false
+	}
+	switch strings.TrimSpace(mode.String) {
+	case "provider", "local_repair", "partial_replan", "repair_replan":
+		return true
+	default:
+		return false
+	}
 }
 
 func intentForwardRecoveryTargetStates(
 	ctx context.Context,
 	db *state.DB,
 	recovery state.IntentForwardRecovery,
-) (map[int64]string, bool, error) {
+) (map[int64]string, error) {
 	if len(recovery.TargetEventSeqs) == 0 {
-		return nil, false, nil
+		return nil, errors.New(
+			"daemon: intent forward recovery target is empty")
 	}
 	placeholders := strings.TrimSuffix(
 		strings.Repeat("?,", len(recovery.TargetEventSeqs)), ",")
@@ -724,7 +745,7 @@ SELECT seq,state FROM capture_events
 WHERE seq IN (`+placeholders+`) AND branch_ref=? AND branch_generation=?`,
 		args...)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer rows.Close()
 	states := make(map[int64]string, len(recovery.TargetEventSeqs))
@@ -732,20 +753,24 @@ WHERE seq IN (`+placeholders+`) AND branch_ref=? AND branch_generation=?`,
 		var seq int64
 		var eventState string
 		if err := rows.Scan(&seq, &eventState); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		states[seq] = eventState
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	return states, len(states) == len(recovery.TargetEventSeqs), nil
+	if len(states) != len(recovery.TargetEventSeqs) {
+		return nil, errors.New(
+			"daemon: intent forward recovery target membership changed")
+	}
+	return states, nil
 }
 
 type intentForwardRecoveryPrefix struct {
 	Events          []state.CaptureEvent
 	CandidateCount  int
-	RemainingGroups int
+	TotalCandidates int
 }
 
 // selectIntentForwardRecoveryPrefix anchors local verification to the first
@@ -773,9 +798,8 @@ func selectIntentForwardRecoveryPrefix(
 	resolvedIDs := make(map[string]struct{}, len(plan.Candidates))
 	for _, candidate := range plan.Candidates {
 		group := unresolvedCandidate{
-			id: candidate.CandidateID,
-			deps: append(
-				[]string(nil), candidate.DependsOnCandidates...),
+			id:   candidate.CandidateID,
+			deps: candidate.DependsOnCandidates,
 		}
 		for _, seq := range candidate.SelectedSeqs {
 			if _, ok := pendingBySeq[seq]; ok {
@@ -840,7 +864,7 @@ func selectIntentForwardRecoveryPrefix(
 	}
 	return intentForwardRecoveryPrefix{
 		Events: events, CandidateCount: width,
-		RemainingGroups: len(unresolved),
+		TotalCandidates: len(unresolved),
 	}, nil
 }
 
@@ -984,8 +1008,8 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 			Purpose:      purpose,
 			Readiness:    ai.IntentCandidateReady,
 			Subject:      subject,
-			GroupingReason: "bounded verification recovery requires the " +
-				"complete widened window",
+			GroupingReason: "bounded verification recovery preserves the " +
+				"semantic prefix",
 		}}
 	}
 	provider := ai.DeterministicProvider{CommitFormat: p.commitFormat}

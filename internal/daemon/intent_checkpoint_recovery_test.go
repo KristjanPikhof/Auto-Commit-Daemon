@@ -5,9 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -80,6 +83,10 @@ type exactTargetReplanPlanner struct {
 	offeredSeqs [][]int64
 }
 
+type expandedTargetRecoveryPlanner struct {
+	offeredSeqs [][]int64
+}
+
 func (*semanticPrefixMessagePlanner) Name() string {
 	return "semantic-prefix-message-test"
 }
@@ -139,6 +146,40 @@ func (p *exactTargetReplanPlanner) PlanIntentV2(
 	}, nil
 }
 
+func (*expandedTargetRecoveryPlanner) Name() string {
+	return "expanded-target-recovery-test"
+}
+
+func (*expandedTargetRecoveryPlanner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("Intent v2 planning is required")
+}
+
+func (p *expandedTargetRecoveryPlanner) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	p.offeredSeqs = append(p.offeredSeqs, append([]int64(nil), seqs...))
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID:  "expanded-recovery-candidate",
+			SelectedSeqs: seqs,
+			Purpose:      "complete the API transition at its latest snapshot",
+			Readiness:    ai.IntentCandidateReady,
+			Subject:      "Complete API transition",
+			GroupingReason: "the newer same-path snapshots complete the frozen " +
+				"intermediate implementation",
+		}},
+	}, nil
+}
+
 func TestIntentEvaluationAwaitingCheckpointRecovery(t *testing.T) {
 	recoverable := IntentCandidateEvaluationResult{
 		NeedsAttention: true,
@@ -189,10 +230,12 @@ func seedFailedCheckpointReplayFixture(t *testing.T) failedCheckpointReplayFixtu
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	for path, contents := range map[string]string{
+		"companion_test.go": "package source\n\nconst Companion = 1\n",
 		"fresh.go":          "package source\n\nconst Fresh = 1\n",
-		"source.go":         "package source\n\nconst Value = 1\n",
+		"source.go": "package source\n\n" +
+			"func Value() int { return 1 }\n",
 		"source_fixture.go": "package source\n\nconst Fixture = 1\n",
-		"source_test.go":    "package source\n\nconst Want = 1\n",
+		"source_test.go":    "package source\n\nvar Want = Value()\n",
 	} {
 		seedTrackedFileCommit(t, ctx, f, path, contents)
 	}
@@ -200,9 +243,12 @@ func seedFailedCheckpointReplayFixture(t *testing.T) failedCheckpointReplayFixtu
 		t.Fatal(err)
 	}
 	for path, contents := range map[string]string{
-		"source.go":         "package source\n\nconst Value = 2\n",
+		"source.go": "package source\n\n" +
+			"func Value(label string) int { return len(label) }\n",
 		"source_fixture.go": "package source\n\nconst Fixture = 2\n",
-		"source_test.go":    "package source\n\nconst Want = 2\n",
+		// This checkpoint is an intentionally incomplete API transition:
+		// Value now requires a label, while the test still calls Value().
+		"source_test.go": "package source\n\nvar Want = Value() + 1\n",
 	} {
 		if err := os.WriteFile(filepath.Join(f.dir, path), []byte(contents), 0o644); err != nil {
 			t.Fatal(err)
@@ -336,6 +382,77 @@ func seedSemanticPrefixRecovery(
 	return recovery, plan
 }
 
+func appendLaterRecoverySnapshots(
+	t *testing.T,
+	fixture failedCheckpointReplayFixture,
+) (matching []int64, checkpointSibling []int64, unrelated int64) {
+	t.Helper()
+	f := fixture.capture
+	ctx := context.Background()
+	checkpointStore := checkpointpkg.Store{DB: f.db}
+	capture := func(epoch int64, edits map[string]string) []state.CaptureEvent {
+		t.Helper()
+		for path, contents := range edits {
+			if err := os.WriteFile(
+				filepath.Join(f.dir, path), []byte(contents), 0o644,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before, err := state.PublishableEvents(ctx, f.db, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+			IgnoreChecker:     f.ig,
+			SensitiveMatcher:  f.matcher,
+			CheckpointStore:   &checkpointStore,
+			WorktreeID:        checkpointpkg.WorktreeID(f.dir),
+			ObservationEpoch:  epoch,
+			CheckpointReason:  state.CheckpointReasonPoll,
+			SortByPath:        true,
+			DisablePendingCap: true,
+		})
+		if err != nil || result.CheckpointID == "" ||
+			result.EventsAppended != len(edits) {
+			t.Fatalf("later checkpoint capture=%+v err=%v", result, err)
+		}
+		after, err := state.PublishableEvents(ctx, f.db, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return after[len(before):]
+	}
+	unrelatedEvents := capture(2, map[string]string{
+		"fresh.go": "package source\n\nconst Fresh = 2\n",
+	})
+	if len(unrelatedEvents) != 1 {
+		t.Fatalf("unrelated checkpoint events=%+v", unrelatedEvents)
+	}
+	unrelated = unrelatedEvents[0].Seq
+	bridge := capture(3, map[string]string{
+		"companion_test.go": "package source\n\nconst Companion = 2\n",
+		"source_test.go": "package source\n\n" +
+			"var Want = Value(\"complete\") + 1\n",
+	})
+	for _, event := range bridge {
+		if event.Path == "source_test.go" {
+			matching = append(matching, event.Seq)
+		} else {
+			checkpointSibling = append(checkpointSibling, event.Seq)
+		}
+	}
+	continued := capture(4, map[string]string{
+		"companion_test.go": "package source\n\nconst Companion = 3\n",
+	})
+	checkpointSibling = append(checkpointSibling, continued[0].Seq)
+	if len(matching) != 1 || len(checkpointSibling) != 2 || unrelated == 0 {
+		t.Fatalf("later matching=%v sibling=%v unrelated=%d",
+			matching, checkpointSibling, unrelated)
+	}
+	return matching, checkpointSibling, unrelated
+}
+
 func semanticPrefixReplayOpts(
 	planner ai.IntentPlanner,
 	verify IntentCandidateVerifier,
@@ -355,6 +472,23 @@ func semanticPrefixReplayOpts(
 		IntentVerificationMode:     "fast",
 		IntentCandidateVerify:      verify,
 		RequireCompletedCheckpoint: true,
+	}
+}
+
+func replaceIntentForwardRecoveryMarkerForTest(
+	t *testing.T,
+	f *captureFixture,
+	recovery state.IntentForwardRecovery,
+) {
+	t.Helper()
+	raw, err := json.Marshal(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.SQL().ExecContext(context.Background(), `
+UPDATE daemon_meta SET value=? WHERE key='intent.v2.forward_recovery'`,
+		string(raw)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -481,9 +615,19 @@ func TestReplayLocalUnlockStopsAfterFullSemanticPrefixFailure(t *testing.T) {
 		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
 	if err != nil || !active || !marker.NeedsAttention ||
 		!marker.PrefixExhausted || marker.PrefixCursor != 4 ||
-		marker.AttentionReason != intentForwardRecoveryVerificationExhausted {
+		marker.AttentionReason != intentForwardRecoveryVerificationExhausted ||
+		marker.ExpansionScannedThroughSeq != fixture.seqs[len(fixture.seqs)-1] {
 		t.Fatalf("exhausted marker=(%+v active=%t err=%v)",
 			marker, active, err)
+	}
+	if _, err := f.db.SQL().ExecContext(ctx, `DROP TABLE capture_ops`); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, scannedThrough, err :=
+		supersedingIntentForwardRecoveryTarget(ctx, f.db, marker); err != nil ||
+		changed || scannedThrough != marker.ExpansionScannedThroughSeq {
+		t.Fatalf("cached terminal scan=(changed=%t horizon=%d err=%v)",
+			changed, scannedThrough, err)
 	}
 	stopped, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil {
@@ -494,6 +638,182 @@ func TestReplayLocalUnlockStopsAfterFullSemanticPrefixFailure(t *testing.T) {
 		stopped.HasMore {
 		t.Fatalf("stopped result=%+v verification_calls=%d",
 			stopped, verificationCalls)
+	}
+}
+
+func TestSupersedingIntentForwardRecoveryTargetIncludesCompletePathChain(
+	t *testing.T,
+) {
+	fixture := seedFailedCheckpointReplayFixture(t)
+	recovery, _ := seedSemanticPrefixRecovery(t, fixture)
+	matching, siblings, unrelated := appendLaterRecoverySnapshots(t, fixture)
+
+	expanded, changed, _, err := supersedingIntentForwardRecoveryTarget(
+		context.Background(), fixture.capture.db, recovery)
+	if err != nil || !changed {
+		t.Fatalf("expanded target=(%v changed=%t err=%v)",
+			expanded, changed, err)
+	}
+	want := append(append([]int64(nil), fixture.seqs...), matching...)
+	want = append(want, siblings...)
+	sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+	if !reflect.DeepEqual(expanded, want) {
+		t.Fatalf("expanded target=%v want %v", expanded, want)
+	}
+	if slices.Contains(expanded, unrelated) {
+		t.Fatalf("expanded target included unrelated capture %d: %v",
+			unrelated, expanded)
+	}
+}
+
+func TestReplayFullSemanticPrefixExpandsToLaterCheckpointChain(t *testing.T) {
+	fixture := seedFailedCheckpointReplayFixture(t)
+	f := fixture.capture
+	ctx := context.Background()
+	_, _ = seedSemanticPrefixRecovery(t, fixture)
+	matching, siblings, unrelated := appendLaterRecoverySnapshots(t, fixture)
+	wantTarget := append(append([]int64(nil), fixture.seqs...), matching...)
+	wantTarget = append(wantTarget, siblings...)
+	sort.Slice(wantTarget, func(i, j int) bool { return wantTarget[i] < wantTarget[j] })
+
+	prefixPlanner := &semanticPrefixMessagePlanner{}
+	failVerification := func(
+		context.Context,
+		ai.IntentCandidateAssignment,
+		[]IntentCandidateCapture,
+	) (IntentCandidateVerification, error) {
+		return IntentCandidateVerification{}, errors.New(
+			"the frozen intermediate API snapshot does not compile")
+	}
+	prefixOpts := semanticPrefixReplayOpts(prefixPlanner, failVerification)
+	prefixOpts.GitDir = f.gitDir
+	var expandedSummary ReplaySummary
+	for attempt := 0; attempt < 3; attempt++ {
+		var err error
+		expandedSummary, err = Replay(ctx, f.dir, f.db, f.cctx, prefixOpts)
+		if err != nil {
+			t.Fatalf("Replay prefix attempt %d: %v", attempt+1, err)
+		}
+	}
+	if expandedSummary.SkippedReason !=
+		"intent_forward_recovery_target_expanded" ||
+		expandedSummary.Disposition != ReplayDispositionRecoverableStall ||
+		!expandedSummary.HasMore {
+		t.Fatalf("expanded prefix summary=%+v", expandedSummary)
+	}
+	marker, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || !active || marker.Stage != publicationFallbackSemanticReplan ||
+		marker.NeedsAttention || marker.PrefixExhausted ||
+		!reflect.DeepEqual(marker.TargetEventSeqs, wantTarget) {
+		t.Fatalf("expanded marker=(%+v active=%t err=%v), want target %v",
+			marker, active, err, wantTarget)
+	}
+
+	planner := &expandedTargetRecoveryPlanner{}
+	verifyComplete := func(
+		_ context.Context,
+		_ ai.IntentCandidateAssignment,
+		captures []IntentCandidateCapture,
+	) (IntentCandidateVerification, error) {
+		seqs := make([]int64, 0, len(captures))
+		for _, capture := range captures {
+			seqs = append(seqs, capture.Event.Seq)
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		if !reflect.DeepEqual(seqs, wantTarget) {
+			return IntentCandidateVerification{}, fmt.Errorf(
+				"verification saw %v, want complete target %v", seqs, wantTarget)
+		}
+		return IntentCandidateVerification{Status: "passed", CheckedTS: 1}, nil
+	}
+	replanOpts := semanticPrefixReplayOpts(planner, verifyComplete)
+	replanOpts.GitDir = f.gitDir
+	result, err := Replay(ctx, f.dir, f.db, f.cctx, replanOpts)
+	if err != nil || result.Published != len(wantTarget) || result.Failed != 0 ||
+		result.Conflicts != 0 {
+		t.Fatalf("expanded target replay=%+v err=%v", result, err)
+	}
+	if !reflect.DeepEqual(planner.offeredSeqs, [][]int64{wantTarget}) {
+		t.Fatalf("semantic replan offers=%v want %v",
+			planner.offeredSeqs, wantTarget)
+	}
+	if subject := strings.TrimSpace(mustGitOutput(
+		t, f.dir, "log", "-1", "--format=%s")); subject != "Complete API transition" {
+		t.Fatalf("expanded commit subject=%q", subject)
+	}
+	var unrelatedState string
+	if err := f.db.ReadSQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE seq=?`, unrelated).
+		Scan(&unrelatedState); err != nil {
+		t.Fatal(err)
+	}
+	if unrelatedState != state.EventStatePending {
+		t.Fatalf("unrelated capture state=%q want pending", unrelatedState)
+	}
+}
+
+func TestReplayReopensExhaustedRecoveryForLaterCheckpointChain(t *testing.T) {
+	fixture := seedFailedCheckpointReplayFixture(t)
+	f := fixture.capture
+	ctx := context.Background()
+	_, _ = seedSemanticPrefixRecovery(t, fixture)
+	prefixOpts := semanticPrefixReplayOpts(
+		&semanticPrefixMessagePlanner{},
+		func(
+			context.Context,
+			ai.IntentCandidateAssignment,
+			[]IntentCandidateCapture,
+		) (IntentCandidateVerification, error) {
+			return IntentCandidateVerification{}, errors.New(
+				"the frozen intermediate API snapshot does not compile")
+		},
+	)
+	prefixOpts.GitDir = f.gitDir
+	for attempt := 0; attempt < 3; attempt++ {
+		if _, err := Replay(ctx, f.dir, f.db, f.cctx, prefixOpts); err != nil {
+			t.Fatalf("Replay prefix attempt %d: %v", attempt+1, err)
+		}
+	}
+	exhausted, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || !active || !exhausted.NeedsAttention ||
+		!exhausted.PrefixExhausted {
+		t.Fatalf("exhausted marker=(%+v active=%t err=%v)",
+			exhausted, active, err)
+	}
+
+	matching, siblings, _ := appendLaterRecoverySnapshots(t, fixture)
+	wantTarget := append(append([]int64(nil), fixture.seqs...), matching...)
+	wantTarget = append(wantTarget, siblings...)
+	sort.Slice(wantTarget, func(i, j int) bool { return wantTarget[i] < wantTarget[j] })
+	planner := &expandedTargetRecoveryPlanner{}
+	replanOpts := semanticPrefixReplayOpts(planner, func(
+		_ context.Context,
+		_ ai.IntentCandidateAssignment,
+		captures []IntentCandidateCapture,
+	) (IntentCandidateVerification, error) {
+		if len(captures) != len(wantTarget) {
+			return IntentCandidateVerification{}, fmt.Errorf(
+				"verification capture count=%d want %d",
+				len(captures), len(wantTarget))
+		}
+		return IntentCandidateVerification{Status: "passed", CheckedTS: 1}, nil
+	})
+	replanOpts.GitDir = f.gitDir
+	result, err := Replay(ctx, f.dir, f.db, f.cctx, replanOpts)
+	if err != nil || result.Published != len(wantTarget) ||
+		result.Disposition != ReplayDispositionProgress {
+		t.Fatalf("restart expansion replay=%+v err=%v", result, err)
+	}
+	if !reflect.DeepEqual(planner.offeredSeqs, [][]int64{wantTarget}) {
+		t.Fatalf("restart semantic offers=%v want %v",
+			planner.offeredSeqs, wantTarget)
+	}
+	if _, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
+	); err != nil || active {
+		t.Fatalf("restart recovery marker active=%t err=%v", active, err)
 	}
 }
 
@@ -546,6 +866,169 @@ WHERE seq=?`, newHead, fixture.seqs[2]); err != nil {
 		result.PlanFingerprint != marker.PlanFingerprint {
 		t.Fatalf("replan offers=%v fingerprint=(%q,%q)",
 			planner.offeredSeqs, result.PlanFingerprint, marker.PlanFingerprint)
+	}
+}
+
+func TestReplayReplansPartiallyResolvedStoredCandidate(t *testing.T) {
+	fixture := seedFailedCheckpointReplayFixture(t)
+	f := fixture.capture
+	ctx := context.Background()
+	recovery, changed, err := state.StartFailedIntentCheckpointRecovery(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
+		fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	if _, err := f.db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',published_ts=1,commit_oid=?
+WHERE seq=?`, f.cctx.BaseHead, fixture.seqs[2]); err != nil {
+		t.Fatal(err)
+	}
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			semanticPlanTestCandidate(
+				"partially-resolved", fixture.seqs[2], fixture.seqs[0]),
+			semanticPlanTestCandidate("remaining", fixture.seqs[1]),
+		},
+	}
+	run, err := state.EnsureIntentPlanRun(ctx, f.db, state.IntentPlanRun{
+		Fingerprint: "partial-stored-plan", BranchRef: f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration, AttemptLimit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storeResolvedIntentPlanRun(&run, plan, nil); err != nil {
+		t.Fatal(err)
+	}
+	run.Completed = true
+	if err := state.UpdateIntentPlanRun(ctx, f.db, run); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err = state.AdvanceIntentForwardRecoveryPrefix(
+		ctx, f.db, recovery, run.Fingerprint, f.cctx.BaseHead, 1)
+	if err != nil || recovery.PrefixUnresolvedCount != 2 {
+		t.Fatalf("advance partial recovery=%+v err=%v", recovery, err)
+	}
+
+	planner := &exactTargetReplanPlanner{}
+	verify := func(
+		context.Context,
+		ai.IntentCandidateAssignment,
+		[]IntentCandidateCapture,
+	) (IntentCandidateVerification, error) {
+		return IntentCandidateVerification{}, errors.New(
+			"hold the replacement semantic plan")
+	}
+	opts := semanticPrefixReplayOpts(planner, verify)
+	opts.GitDir = f.gitDir
+	result, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatalf("Replay partial plan: %v", err)
+	}
+	marker, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || !active || marker.PlanFingerprint == run.Fingerprint ||
+		marker.PlanFingerprint == "" || marker.PrefixCursor != 1 ||
+		marker.PrefixUnresolvedCount != 2 {
+		t.Fatalf("replacement marker=(%+v active=%t err=%v)",
+			marker, active, err)
+	}
+	wantOffered := [][]int64{{fixture.seqs[0], fixture.seqs[1]}}
+	if !reflect.DeepEqual(planner.offeredSeqs, wantOffered) ||
+		result.PlanFingerprint != marker.PlanFingerprint {
+		t.Fatalf("replacement offers=%v fingerprint=(%q,%q)",
+			planner.offeredSeqs, result.PlanFingerprint, marker.PlanFingerprint)
+	}
+}
+
+func TestReplayReplansInvalidCachedPrefixMarker(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *captureFixture, state.IntentForwardRecovery)
+	}{
+		{
+			name: "missing resolved plan",
+			mutate: func(
+				t *testing.T,
+				f *captureFixture,
+				recovery state.IntentForwardRecovery,
+			) {
+				t.Helper()
+				if _, err := f.db.SQL().ExecContext(context.Background(),
+					`DELETE FROM intent_plan_runs WHERE fingerprint=?`,
+					recovery.PlanFingerprint); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "missing progress baseline",
+			mutate: func(
+				t *testing.T,
+				f *captureFixture,
+				recovery state.IntentForwardRecovery,
+			) {
+				t.Helper()
+				recovery.PrefixUnresolvedCount = 0
+				replaceIntentForwardRecoveryMarkerForTest(t, f, recovery)
+			},
+		},
+		{
+			name: "missing prefix identity",
+			mutate: func(
+				t *testing.T,
+				f *captureFixture,
+				recovery state.IntentForwardRecovery,
+			) {
+				t.Helper()
+				recovery.PrefixCursor = 0
+				recovery.PrefixBaseHead = ""
+				replaceIntentForwardRecoveryMarkerForTest(t, f, recovery)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := seedFailedCheckpointReplayFixture(t)
+			f := fixture.capture
+			ctx := context.Background()
+			recovery, _ := seedSemanticPrefixRecovery(t, fixture)
+			test.mutate(t, f, recovery)
+
+			planner := &exactTargetReplanPlanner{}
+			verify := func(
+				context.Context,
+				ai.IntentCandidateAssignment,
+				[]IntentCandidateCapture,
+			) (IntentCandidateVerification, error) {
+				return IntentCandidateVerification{}, errors.New(
+					"hold the replacement semantic plan")
+			}
+			opts := semanticPrefixReplayOpts(planner, verify)
+			opts.GitDir = f.gitDir
+			result, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+			if err != nil {
+				t.Fatalf("Replay invalid prefix: %v", err)
+			}
+			marker, active, err := state.IntentForwardRecoveryForPair(
+				ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
+			if err != nil || !active ||
+				marker.PlanFingerprint == recovery.PlanFingerprint ||
+				marker.PlanFingerprint == "" || marker.PrefixCursor != 1 ||
+				marker.PrefixUnresolvedCount != len(fixture.seqs) {
+				t.Fatalf("replacement marker=(%+v active=%t err=%v)",
+					marker, active, err)
+			}
+			if !reflect.DeepEqual(planner.offeredSeqs, [][]int64{fixture.seqs}) ||
+				result.PlanFingerprint != marker.PlanFingerprint {
+				t.Fatalf("replacement offers=%v fingerprint=(%q,%q)",
+					planner.offeredSeqs,
+					result.PlanFingerprint, marker.PlanFingerprint)
+			}
+		})
 	}
 }
 

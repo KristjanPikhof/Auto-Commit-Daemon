@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -201,33 +202,35 @@ func TestIntentForwardRecoveryPrefixFollowsSemanticTopology(t *testing.T) {
 		}
 		if !reflect.DeepEqual(got, test.want) ||
 			prefix.CandidateCount != min(test.cursor, 3) ||
-			prefix.RemainingGroups != 3 {
+			prefix.TotalCandidates != 3 {
 			t.Fatalf("cursor %d prefix=(%v,%d/%d) want %v",
 				test.cursor, got, prefix.CandidateCount,
-				prefix.RemainingGroups, test.want)
+				prefix.TotalCandidates, test.want)
 		}
 	}
 }
 
 func TestResolvedIntentForwardRecoveryPlanUsesStoredMembership(t *testing.T) {
 	for _, test := range []struct {
-		name        string
-		candidates  func([]state.CaptureEvent) []ai.IntentCandidateAssignment
-		wantValid   bool
-		wantPartial bool
+		name           string
+		resolutionMode string
+		candidates     func([]state.CaptureEvent) []ai.IntentCandidateAssignment
+		wantStatus     intentForwardRecoveryPlanStatus
 	}{
 		{
-			name: "resolved target member predates plan",
+			name:           "resolved target member predates plan",
+			resolutionMode: "provider",
 			candidates: func(events []state.CaptureEvent) []ai.IntentCandidateAssignment {
 				return []ai.IntentCandidateAssignment{
 					semanticPlanTestCandidate("remaining-a", events[1].Seq),
 					semanticPlanTestCandidate("remaining-b", events[2].Seq),
 				}
 			},
-			wantValid: true,
+			wantStatus: intentForwardRecoveryPlanReady,
 		},
 		{
-			name: "stored candidate partially resolved",
+			name:           "stored candidate partially resolved",
+			resolutionMode: "provider",
 			candidates: func(events []state.CaptureEvent) []ai.IntentCandidateAssignment {
 				return []ai.IntentCandidateAssignment{
 					semanticPlanTestCandidate(
@@ -235,7 +238,18 @@ func TestResolvedIntentForwardRecoveryPlanUsesStoredMembership(t *testing.T) {
 					semanticPlanTestCandidate("remaining", events[2].Seq),
 				}
 			},
-			wantPartial: true,
+			wantStatus: intentForwardRecoveryPlanPartial,
+		},
+		{
+			name:           "evidence fallback is not a semantic plan",
+			resolutionMode: "evidence_partition",
+			candidates: func(events []state.CaptureEvent) []ai.IntentCandidateAssignment {
+				return []ai.IntentCandidateAssignment{
+					semanticPlanTestCandidate("remaining-a", events[1].Seq),
+					semanticPlanTestCandidate("remaining-b", events[2].Seq),
+				}
+			},
+			wantStatus: intentForwardRecoveryPlanUnavailable,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -264,10 +278,13 @@ WHERE seq=?`, events[0].Seq); err != nil {
 				t.Fatal(err)
 			}
 			run.Completed = true
+			run.ResolutionMode = sql.NullString{
+				String: test.resolutionMode, Valid: true,
+			}
 			if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
 				t.Fatal(err)
 			}
-			loaded, valid, partial, err := resolvedIntentForwardRecoveryPlan(
+			loaded, status, err := resolvedIntentForwardRecoveryPlan(
 				ctx, db, state.IntentForwardRecovery{
 					BranchRef: "refs/heads/main", BranchGeneration: 7,
 					PlanFingerprint: fingerprint,
@@ -278,9 +295,9 @@ WHERE seq=?`, events[0].Seq); err != nil {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if valid != test.wantValid || partial != test.wantPartial {
-				t.Fatalf("loaded=(%+v valid=%t partial=%t)",
-					loaded, valid, partial)
+			if status != test.wantStatus {
+				t.Fatalf("loaded=(%+v status=%d want=%d)",
+					loaded, status, test.wantStatus)
 			}
 		})
 	}

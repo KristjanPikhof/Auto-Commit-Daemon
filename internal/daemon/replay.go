@@ -510,7 +510,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if forwardRecoveryActive &&
 		forwardRecovery.Stage == publicationFallbackLocalUnlock &&
 		forwardRecovery.PlanFingerprint != "" &&
-		forwardRecovery.PrefixUnresolvedCount > 0 {
+		forwardRecovery.PrefixCursor > 0 &&
+		forwardRecovery.PrefixUnresolvedCount > 0 &&
+		strings.TrimSpace(forwardRecovery.PrefixBaseHead) != "" {
 		previousRecovery := forwardRecovery
 		forwardRecovery, _, err =
 			state.ResetIntentForwardRecoveryPrefixAfterProgress(
@@ -521,6 +523,42 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if previousRecovery.Stage != forwardRecovery.Stage {
 			logIntentForwardRecoveryTransition(
 				previousRecovery, forwardRecovery.Stage)
+		}
+	}
+	if forwardRecoveryActive &&
+		(forwardRecovery.NeedsAttention || forwardRecovery.PrefixExhausted) &&
+		forwardRecovery.AttentionReason ==
+			intentForwardRecoveryVerificationExhausted {
+		previousRecovery := forwardRecovery
+		expanded, changed, scannedThrough, expandErr :=
+			expandIntentForwardRecoveryTarget(ctx, db, forwardRecovery)
+		if expandErr != nil {
+			slog.Default().Warn(
+				"exhausted intent forward recovery target expansion was not safe",
+				"candidate_id", forwardRecovery.CandidateID,
+				"err", expandErr.Error())
+		} else if changed {
+			forwardRecovery = expanded
+			logIntentForwardRecoveryTransition(
+				previousRecovery, publicationFallbackSemanticReplan)
+			slog.Default().Info("reopened intent forward recovery",
+				"candidate_id", expanded.CandidateID,
+				"previous_size", len(previousRecovery.TargetEventSeqs),
+				"expanded_size", len(expanded.TargetEventSeqs),
+				"reason", expanded.Reason)
+		} else if scannedThrough >
+			forwardRecovery.ExpansionScannedThroughSeq {
+			recorded, recordErr :=
+				state.RecordIntentForwardRecoveryExpansionScan(
+					ctx, db, forwardRecovery, scannedThrough)
+			if recordErr != nil {
+				slog.Default().Warn(
+					"intent forward recovery scan horizon changed",
+					"candidate_id", forwardRecovery.CandidateID,
+					"err", recordErr.Error())
+			} else {
+				forwardRecovery = recorded
+			}
 		}
 	}
 	if opts.PublicationDrain != nil && intentCfg.enabled {
@@ -547,22 +585,26 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 		var resolvedPlan *ai.IntentPlanV2
 		if forwardRecovery.Stage == publicationFallbackLocalUnlock {
-			plan, valid, partial, loadErr := resolvedIntentForwardRecoveryPlan(
+			plan, planStatus, loadErr := resolvedIntentForwardRecoveryPlan(
 				ctx, db, forwardRecovery)
 			if loadErr != nil {
 				return sum, loadErr
 			}
-			if partial {
+			if forwardRecovery.PlanFingerprint != "" &&
+				(planStatus != intentForwardRecoveryPlanReady ||
+					forwardRecovery.PrefixCursor < 1 ||
+					forwardRecovery.PrefixUnresolvedCount <= 0 ||
+					strings.TrimSpace(forwardRecovery.PrefixBaseHead) == "") {
 				previousRecovery := forwardRecovery
-				forwardRecovery, loadErr = state.AdvanceIntentForwardRecovery(
-					ctx, db, forwardRecovery,
-					publicationFallbackSemanticReplan, 1)
+				forwardRecovery, loadErr =
+					state.ResetIntentForwardRecoveryInvalidPlan(
+						ctx, db, forwardRecovery)
 				if loadErr != nil {
 					return sum, loadErr
 				}
 				logIntentForwardRecoveryTransition(
 					previousRecovery, publicationFallbackSemanticReplan)
-			} else if valid {
+			} else if planStatus == intentForwardRecoveryPlanReady {
 				resolvedPlan = &plan
 			}
 		}
@@ -1643,7 +1685,7 @@ func replayIntentBatch(
 			}
 			window = prefix.Events
 			sum.RecoveryPrefixCandidateCount = prefix.CandidateCount
-			sum.RecoveryPrefixTotalCandidates = prefix.RemainingGroups
+			sum.RecoveryPrefixTotalCandidates = prefix.TotalCandidates
 			fallback, ok := cfg.planner.(publicationDrainAtomicFallbackPlanner)
 			if !ok {
 				return sum, fmt.Errorf(

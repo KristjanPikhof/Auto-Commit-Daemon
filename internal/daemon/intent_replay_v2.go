@@ -605,10 +605,10 @@ func beginIntentForwardRecoveryPrefix(
 	}
 	candidate := recovery
 	candidate.PlanFingerprint = fingerprint
-	if _, valid, partial, err := resolvedIntentForwardRecoveryPlan(
+	if _, status, err := resolvedIntentForwardRecoveryPlan(
 		ctx, db, candidate); err != nil {
 		return recovery, false, err
-	} else if partial || !valid {
+	} else if status != intentForwardRecoveryPlanReady {
 		return recovery, false, nil
 	}
 	advanced, err := state.AdvanceIntentForwardRecoveryPrefix(
@@ -634,10 +634,41 @@ func updateIntentForwardRecoveryPrefixFailure(
 			"daemon: intent forward recovery prefix result is invalid")
 	}
 	if width == total {
+		expanded, changed, scannedThrough, expansionErr :=
+			expandIntentForwardRecoveryTarget(
+				ctx, db, recovery)
+		if expansionErr != nil {
+			slog.Default().Warn(
+				"intent forward recovery target expansion was not safe",
+				"candidate_id", recovery.CandidateID,
+				"err", expansionErr.Error())
+		} else if changed {
+			slog.Default().Info("expanded intent forward recovery target",
+				"candidate_id", expanded.CandidateID,
+				"previous_size", len(recovery.TargetEventSeqs),
+				"expanded_size", len(expanded.TargetEventSeqs),
+				"reason", expanded.Reason)
+			sum.Skipped = true
+			sum.SkippedReason =
+				"intent_forward_recovery_target_expanded"
+			sum.Disposition = ReplayDispositionRecoverableStall
+			sum.DispositionReason =
+				"newer protected captures expanded the semantic recovery target"
+			sum.HasMore = true
+			return sum, nil
+		}
 		marked, err := state.MarkIntentForwardRecoveryNeedsAttention(
 			ctx, db, recovery, intentForwardRecoveryVerificationExhausted)
 		if err != nil {
 			return sum, err
+		}
+		if expansionErr == nil && !changed &&
+			scannedThrough > marked.ExpansionScannedThroughSeq {
+			marked, err = state.RecordIntentForwardRecoveryExpansionScan(
+				ctx, db, marked, scannedThrough)
+			if err != nil {
+				return sum, err
+			}
 		}
 		sum.Skipped = true
 		sum.SkippedReason =
@@ -665,6 +696,336 @@ func updateIntentForwardRecoveryPrefixFailure(
 	}
 	sum.HasMore = true
 	return sum, nil
+}
+
+func expandIntentForwardRecoveryTarget(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+) (state.IntentForwardRecovery, bool, int64, error) {
+	expanded, changed, scannedThrough, err :=
+		supersedingIntentForwardRecoveryTarget(
+			ctx, db, recovery)
+	if err != nil || !changed {
+		return recovery, false, scannedThrough, err
+	}
+	updated, changed, err := state.ExpandIntentForwardRecoveryTarget(
+		ctx, db, recovery, expanded)
+	return updated, changed, scannedThrough, err
+}
+
+// supersedingIntentForwardRecoveryTarget finds the complete publishable
+// capture component that continues a frozen recovery target. A failed
+// verification can otherwise be testing an intermediate snapshot even though
+// later durable checkpoints already contain the user's complete change.
+//
+// Exact before/after object transitions connect captures on one path. A match
+// also absorbs every still-pending sibling in its completed checkpoint; those
+// siblings can in turn connect another exact path chain. The fixed point keeps
+// checkpoint protection atomic without pulling unrelated checkpoints into the
+// recovery. The caller must replace the marker target atomically before using
+// the returned membership.
+func supersedingIntentForwardRecoveryTarget(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+) ([]int64, bool, int64, error) {
+	if db == nil || strings.TrimSpace(recovery.BranchRef) == "" ||
+		recovery.BranchGeneration < 0 || len(recovery.TargetEventSeqs) == 0 ||
+		len(recovery.TargetEventSeqs) > state.IntentCandidateMaxCaptures {
+		return nil, false, 0, errors.New(
+			"daemon: invalid intent forward recovery expansion target")
+	}
+	scannedThrough, err := intentForwardRecoveryExpansionHorizon(
+		ctx, db, recovery)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	if recovery.PrefixExhausted && recovery.NeedsAttention &&
+		scannedThrough <= recovery.ExpansionScannedThroughSeq {
+		return append([]int64(nil), recovery.TargetEventSeqs...),
+			false, scannedThrough, nil
+	}
+	target := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
+	captures := make(map[int64]IntentCandidateCapture)
+	firstTarget := int64(0)
+	for _, seq := range recovery.TargetEventSeqs {
+		if seq <= 0 {
+			return nil, false, scannedThrough, errors.New(
+				"daemon: invalid intent forward recovery expansion member")
+		}
+		if _, duplicate := target[seq]; duplicate {
+			return nil, false, scannedThrough, errors.New(
+				"daemon: duplicate intent forward recovery expansion member")
+		}
+		target[seq] = struct{}{}
+		if firstTarget == 0 || seq < firstTarget {
+			firstTarget = seq
+		}
+		event, err := loadIntentCaptureEvent(ctx, db, seq)
+		if err != nil {
+			return nil, false, scannedThrough, err
+		}
+		if event.BranchRef != recovery.BranchRef ||
+			event.BranchGeneration != recovery.BranchGeneration {
+			return nil, false, scannedThrough, errors.New(
+				"daemon: intent forward recovery expansion changed branch pair")
+		}
+		ops, err := state.LoadCaptureOps(ctx, db, seq)
+		if err != nil {
+			return nil, false, scannedThrough, err
+		}
+		captures[seq] = IntentCandidateCapture{Event: event, Ops: ops}
+	}
+	pending, err := state.PublishableEvents(ctx, db, 0)
+	if err != nil {
+		return nil, false, scannedThrough, err
+	}
+	for _, event := range pending {
+		if event.Seq < firstTarget || event.BranchRef != recovery.BranchRef ||
+			event.BranchGeneration != recovery.BranchGeneration {
+			continue
+		}
+		if _, loaded := captures[event.Seq]; loaded {
+			continue
+		}
+		ops, loadErr := state.LoadCaptureOps(ctx, db, event.Seq)
+		if loadErr != nil {
+			return nil, false, scannedThrough, loadErr
+		}
+		captures[event.Seq] = IntentCandidateCapture{Event: event, Ops: ops}
+	}
+	if len(captures) == len(target) {
+		return append([]int64(nil), recovery.TargetEventSeqs...),
+			false, scannedThrough, nil
+	}
+
+	adjacent := make(map[int64][]int64)
+	pathTransitions := make(map[string][]intentForwardRecoveryPathTransition)
+	for seq, capture := range captures {
+		for _, op := range capture.Ops {
+			for _, transition := range intentForwardRecoveryOpTransitions(seq, op) {
+				pathTransitions[transition.path] = append(
+					pathTransitions[transition.path], transition)
+			}
+		}
+	}
+	for _, transitions := range pathTransitions {
+		sort.SliceStable(transitions, func(i, j int) bool {
+			return transitions[i].seq < transitions[j].seq
+		})
+		for index := 1; index < len(transitions); index++ {
+			prior, next := transitions[index-1], transitions[index]
+			if prior.seq == next.seq || prior.after != next.before {
+				continue
+			}
+			adjacent[prior.seq] = append(adjacent[prior.seq], next.seq)
+			adjacent[next.seq] = append(adjacent[next.seq], prior.seq)
+		}
+	}
+
+	checkpointMembers, checkpointBlocked, err :=
+		intentForwardRecoveryCheckpointMembers(
+			ctx, db, recovery, firstTarget, captures)
+	if err != nil {
+		return nil, false, scannedThrough, err
+	}
+	queue := append([]int64(nil), recovery.TargetEventSeqs...)
+	for len(queue) > 0 {
+		seq := queue[0]
+		queue = queue[1:]
+		if checkpointBlocked[seq] {
+			return append([]int64(nil), recovery.TargetEventSeqs...),
+				false, scannedThrough, nil
+		}
+		neighbors := append([]int64(nil), adjacent[seq]...)
+		neighbors = append(neighbors, checkpointMembers[seq]...)
+		for _, neighbor := range neighbors {
+			if _, selected := target[neighbor]; selected {
+				continue
+			}
+			target[neighbor] = struct{}{}
+			if len(target) > state.IntentCandidateMaxCaptures {
+				// Partial expansion would freeze another intermediate target.
+				return append([]int64(nil), recovery.TargetEventSeqs...),
+					false, scannedThrough, nil
+			}
+			queue = append(queue, neighbor)
+		}
+	}
+	if len(target) == len(recovery.TargetEventSeqs) {
+		return append([]int64(nil), recovery.TargetEventSeqs...),
+			false, scannedThrough, nil
+	}
+	expanded := make([]int64, 0, len(target))
+	for seq := range target {
+		expanded = append(expanded, seq)
+	}
+	sort.Slice(expanded, func(i, j int) bool { return expanded[i] < expanded[j] })
+	return expanded, true, scannedThrough, nil
+}
+
+func intentForwardRecoveryExpansionHorizon(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+) (int64, error) {
+	horizon := int64(0)
+	for _, seq := range recovery.TargetEventSeqs {
+		if seq > horizon {
+			horizon = seq
+		}
+	}
+	var latest sql.NullInt64
+	if err := db.ReadSQL().QueryRowContext(ctx, `
+WITH barrier AS (
+  SELECT MIN(seq) AS first_seq
+  FROM capture_events
+  WHERE branch_ref=? AND branch_generation=? AND state IN (?,?)
+)
+SELECT MAX(event.seq)
+FROM capture_events event
+JOIN checkpoint_events checkpoint_event
+  ON checkpoint_event.event_seq=event.seq
+JOIN checkpoints checkpoint ON checkpoint.id=checkpoint_event.checkpoint_id
+CROSS JOIN barrier
+WHERE event.branch_ref=? AND event.branch_generation=?
+  AND event.state='pending' AND checkpoint.phase='completed'
+  AND (barrier.first_seq IS NULL OR event.seq<barrier.first_seq)`,
+		recovery.BranchRef, recovery.BranchGeneration,
+		state.EventStateBlockedConflict, state.EventStateFailed,
+		recovery.BranchRef, recovery.BranchGeneration).Scan(&latest); err != nil {
+		return 0, err
+	}
+	if latest.Valid && latest.Int64 > horizon {
+		horizon = latest.Int64
+	}
+	return horizon, nil
+}
+
+type intentForwardRecoveryFileState struct {
+	present bool
+	oid     string
+	mode    string
+}
+
+type intentForwardRecoveryPathTransition struct {
+	seq    int64
+	path   string
+	before intentForwardRecoveryFileState
+	after  intentForwardRecoveryFileState
+}
+
+func intentForwardRecoveryOpTransitions(
+	seq int64,
+	op state.CaptureOp,
+) []intentForwardRecoveryPathTransition {
+	present := func(
+		oid sql.NullString,
+		mode sql.NullString,
+	) (intentForwardRecoveryFileState, bool) {
+		if !oid.Valid || !mode.Valid || strings.TrimSpace(oid.String) == "" ||
+			strings.TrimSpace(mode.String) == "" {
+			return intentForwardRecoveryFileState{}, false
+		}
+		return intentForwardRecoveryFileState{
+			present: true,
+			oid:     oid.String,
+			mode:    mode.String,
+		}, true
+	}
+	absent := intentForwardRecoveryFileState{}
+	path := normalizeIntentDependencyPath(op.Path)
+	oldPath := ""
+	if op.OldPath.Valid {
+		oldPath = normalizeIntentDependencyPath(op.OldPath.String)
+	}
+	before, beforeOK := present(op.BeforeOID, op.BeforeMode)
+	after, afterOK := present(op.AfterOID, op.AfterMode)
+	switch op.Op {
+	case "create":
+		if path != "" && afterOK {
+			return []intentForwardRecoveryPathTransition{{
+				seq: seq, path: path, before: absent, after: after,
+			}}
+		}
+	case "delete":
+		if path != "" && beforeOK {
+			return []intentForwardRecoveryPathTransition{{
+				seq: seq, path: path, before: before, after: absent,
+			}}
+		}
+	case "modify", "mode":
+		if path != "" && beforeOK && afterOK {
+			return []intentForwardRecoveryPathTransition{{
+				seq: seq, path: path, before: before, after: after,
+			}}
+		}
+	case "rename":
+		if path != "" && oldPath != "" && beforeOK && afterOK {
+			return []intentForwardRecoveryPathTransition{
+				{seq: seq, path: oldPath, before: before, after: absent},
+				{seq: seq, path: path, before: absent, after: after},
+			}
+		}
+	}
+	return nil
+}
+
+func intentForwardRecoveryCheckpointMembers(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+	firstTarget int64,
+	captures map[int64]IntentCandidateCapture,
+) (map[int64][]int64, map[int64]bool, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT checkpoint_event.checkpoint_id,event.seq,event.state
+FROM checkpoint_events checkpoint_event
+JOIN checkpoints checkpoint ON checkpoint.id=checkpoint_event.checkpoint_id
+JOIN capture_events event ON event.seq=checkpoint_event.event_seq
+WHERE checkpoint.phase='completed'
+  AND event.branch_ref=? AND event.branch_generation=? AND event.seq>=?
+ORDER BY checkpoint_event.checkpoint_id,checkpoint_event.ord`,
+		recovery.BranchRef, recovery.BranchGeneration, firstTarget)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	groups := make(map[string][]int64)
+	blockedGroups := make(map[string]bool)
+	for rows.Next() {
+		var checkpointID, eventState string
+		var seq int64
+		if err := rows.Scan(&checkpointID, &seq, &eventState); err != nil {
+			return nil, nil, err
+		}
+		switch eventState {
+		case state.EventStatePublished, state.EventStateRecovered:
+			continue
+		case state.EventStatePending:
+			if _, available := captures[seq]; !available {
+				blockedGroups[checkpointID] = true
+			}
+			groups[checkpointID] = append(groups[checkpointID], seq)
+		default:
+			blockedGroups[checkpointID] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	members := make(map[int64][]int64)
+	blocked := make(map[int64]bool)
+	for checkpointID, seqs := range groups {
+		for _, seq := range seqs {
+			members[seq] = seqs
+			if blockedGroups[checkpointID] {
+				blocked[seq] = true
+			}
+		}
+	}
+	return members, blocked, nil
 }
 
 func intentForwardRecoveryTransientWait(sum ReplaySummary) bool {
