@@ -163,7 +163,8 @@ func TestIntentForwardRecoverySemanticPrefixPersistsAndResetsAfterProgress(
 		ctx, fixture.db, recovery, "sha256:plan-one", "base-head-one", 1)
 	if err != nil || prefix.Stage != "local_unlock" ||
 		prefix.PlanFingerprint != "sha256:plan-one" ||
-		prefix.PrefixBaseHead != "base-head-one" || prefix.PrefixCursor != 1 {
+		prefix.PrefixBaseHead != "base-head-one" || prefix.PrefixCursor != 1 ||
+		prefix.PrefixUnresolvedCount != len(recovery.TargetEventSeqs) {
 		t.Fatalf("initial prefix=(%+v,%v)", prefix, err)
 	}
 	loaded, active, err := IntentForwardRecoveryForPair(
@@ -204,12 +205,19 @@ func TestIntentForwardRecoverySemanticPrefixPersistsAndResetsAfterProgress(
 	); err == nil || !strings.Contains(err.Error(), "marker changed") {
 		t.Fatalf("changed target err=%v", err)
 	}
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',commit_oid='prefix-progress',published_ts=2
+WHERE seq=?`, recovery.TargetEventSeqs[0]); err != nil {
+		t.Fatal(err)
+	}
 
 	progressed, err := AdvanceIntentForwardRecovery(
 		ctx, fixture.db, wider, "semantic_replan", 1)
 	if err != nil || progressed.Stage != "semantic_replan" ||
 		progressed.UnlockCount != 1 || progressed.LastProgressTS <= 0 ||
 		progressed.PlanFingerprint != "" || progressed.PrefixCursor != 0 ||
+		progressed.PrefixUnresolvedCount != 0 ||
 		progressed.PrefixBaseHead != "" || progressed.PrefixExhausted ||
 		progressed.NeedsAttention || progressed.AttentionReason != "" {
 		t.Fatalf("progress reset=(%+v,%v)", progressed, err)
@@ -219,6 +227,10 @@ func TestIntentForwardRecoverySemanticPrefixPersistsAndResetsAfterProgress(
 		ctx, fixture.db, progressed, "sha256:plan-two", "base-head-two", 1)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if second.PrefixUnresolvedCount != len(recovery.TargetEventSeqs)-1 {
+		t.Fatalf("second prefix baseline=%d want %d",
+			second.PrefixUnresolvedCount, len(recovery.TargetEventSeqs)-1)
 	}
 	attention, err := MarkIntentForwardRecoveryNeedsAttention(
 		ctx, fixture.db, second, "complete semantic prefix failed verification")
@@ -244,6 +256,11 @@ func TestIntentForwardRecoverySemanticPrefixPersistsAndResetsAfterProgress(
 		ctx, fixture.db, attention, "semantic_replan", 0,
 	); err == nil || !strings.Contains(err.Error(), "requires attention") {
 		t.Fatalf("exhausted stage transition err=%v", err)
+	}
+	if _, err := ResetIntentForwardRecoveryInvalidPlan(
+		ctx, fixture.db, attention,
+	); err == nil || !strings.Contains(err.Error(), "invalid input") {
+		t.Fatalf("exhausted invalid-plan reset err=%v", err)
 	}
 }
 
@@ -280,8 +297,144 @@ UPDATE daemon_meta SET value=?,updated_ts=2 WHERE key=?`,
 		ctx, fixture.db, legacy, "sha256:legacy-plan", "legacy-head", 1)
 	if err != nil || initialized.PlanFingerprint != "sha256:legacy-plan" ||
 		initialized.PrefixBaseHead != "legacy-head" ||
-		initialized.PrefixCursor != 1 {
+		initialized.PrefixCursor != 1 ||
+		initialized.PrefixUnresolvedCount != len(recovery.TargetEventSeqs) {
 		t.Fatalf("initialized legacy prefix=(%+v,%v)", initialized, err)
+	}
+}
+
+func TestResetIntentForwardRecoveryPrefixAfterDurableProgress(t *testing.T) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	prefix, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, recovery, "sha256:crash-plan", "old-prefix-head", 2)
+	if err != nil || prefix.PrefixUnresolvedCount != len(fixture.seqs) {
+		t.Fatalf("prefix=(%+v,%v)", prefix, err)
+	}
+	unchanged, progressed, err := ResetIntentForwardRecoveryPrefixAfterProgress(
+		ctx, fixture.db, prefix)
+	if err != nil || progressed || !reflect.DeepEqual(unchanged, prefix) {
+		t.Fatalf("unchanged reset=(%+v progressed=%t err=%v), want %+v",
+			unchanged, progressed, err, prefix)
+	}
+	if _, err := AdvanceIntentForwardRecovery(
+		ctx, fixture.db, prefix, "semantic_replan", 1,
+	); err == nil || !strings.Contains(err.Error(), "not durable") {
+		t.Fatalf("unproved progress err=%v", err)
+	}
+
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',commit_oid='durable-prefix-head',published_ts=2
+WHERE seq=?`, fixture.seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	loaded, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, prefix.BranchRef, prefix.BranchGeneration)
+	if err != nil || !active || !reflect.DeepEqual(loaded, prefix) {
+		t.Fatalf("crash marker=(%+v active=%t err=%v), want %+v",
+			loaded, active, err, prefix)
+	}
+	reset, progressed, err := ResetIntentForwardRecoveryPrefixAfterProgress(
+		ctx, fixture.db, loaded)
+	if err != nil || !progressed || reset.Stage != "semantic_replan" ||
+		reset.UnlockCount != prefix.UnlockCount+1 ||
+		reset.LastProgressTS <= prefix.LastProgressTS ||
+		reset.PlanFingerprint != "" || reset.PrefixCursor != 0 ||
+		reset.PrefixUnresolvedCount != 0 || reset.PrefixBaseHead != "" ||
+		reset.PrefixExhausted || reset.NeedsAttention ||
+		!reflect.DeepEqual(reset.TargetEventSeqs, prefix.TargetEventSeqs) {
+		t.Fatalf("durable progress reset=(%+v progressed=%t err=%v)",
+			reset, progressed, err)
+	}
+	if _, progressed, err := ResetIntentForwardRecoveryPrefixAfterProgress(
+		ctx, fixture.db, prefix,
+	); err == nil || progressed || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("stale crash reset progressed=%t err=%v", progressed, err)
+	}
+}
+
+func TestResetIntentForwardRecoveryInvalidPlanPreservesProgressIdentity(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	prefix, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, recovery, "sha256:invalid-plan", "same-head", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reset, err := ResetIntentForwardRecoveryInvalidPlan(ctx, fixture.db, prefix)
+	if err != nil || reset.Stage != "semantic_replan" ||
+		reset.UnlockCount != prefix.UnlockCount ||
+		reset.LastProgressTS != prefix.LastProgressTS ||
+		reset.PlanFingerprint != "" || reset.PrefixCursor != 0 ||
+		reset.PrefixUnresolvedCount != 0 || reset.PrefixBaseHead != "" ||
+		reset.PrefixExhausted || reset.NeedsAttention ||
+		!reflect.DeepEqual(reset.TargetEventSeqs, prefix.TargetEventSeqs) {
+		t.Fatalf("invalid plan reset=(%+v,%v)", reset, err)
+	}
+	if _, err := ResetIntentForwardRecoveryInvalidPlan(
+		ctx, fixture.db, prefix,
+	); err == nil || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("stale invalid plan reset err=%v", err)
+	}
+}
+
+func TestResetIntentForwardRecoveryInvalidPlanAcceptsIncompletePrefixMarker(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	recovery, err = AdvanceIntentForwardRecovery(
+		ctx, fixture.db, recovery, "local_unlock", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery.PlanFingerprint = "sha256:incomplete-prefix"
+	raw, err := json.Marshal(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET value=?,updated_ts=2 WHERE key=?`,
+		string(raw), intentForwardRecoveryMetaKey); err != nil {
+		t.Fatal(err)
+	}
+	loaded, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, recovery.BranchRef, recovery.BranchGeneration)
+	if err != nil || !active || loaded.PrefixCursor != 0 ||
+		loaded.PrefixBaseHead != "" || loaded.PrefixUnresolvedCount != 0 {
+		t.Fatalf("incomplete marker=(%+v active=%t err=%v)", loaded, active, err)
+	}
+	reset, err := ResetIntentForwardRecoveryInvalidPlan(
+		ctx, fixture.db, loaded)
+	if err != nil || reset.Stage != "semantic_replan" ||
+		reset.PlanFingerprint != "" || reset.PrefixCursor != 0 ||
+		reset.PrefixBaseHead != "" || reset.PrefixUnresolvedCount != 0 ||
+		!reflect.DeepEqual(reset.TargetEventSeqs, recovery.TargetEventSeqs) {
+		t.Fatalf("incomplete plan reset=(%+v,%v)", reset, err)
 	}
 }
 

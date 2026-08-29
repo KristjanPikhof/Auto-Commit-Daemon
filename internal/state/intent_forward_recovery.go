@@ -18,21 +18,21 @@ const failedIntentCheckpointRecoveryReason = "verification_failed_checkpoint_rep
 // IntentForwardRecovery is the durable forward-only salvage state for a
 // candidate that must be replanned without changing captured work.
 type IntentForwardRecovery struct {
-	BranchRef        string  `json:"branch_ref"`
-	BranchGeneration int64   `json:"branch_generation"`
-	CandidateID      string  `json:"candidate_id"`
-	Reason           string  `json:"reason"`
-	Stage            string  `json:"stage,omitempty"`
-	TargetEventSeqs  []int64 `json:"target_event_seqs,omitempty"`
-	UnlockCount      int     `json:"unlock_count,omitempty"`
-	LastProgressTS   float64 `json:"last_progress_ts,omitempty"`
-	PlanFingerprint  string  `json:"plan_fingerprint,omitempty"`
-	PrefixCursor     int     `json:"prefix_cursor,omitempty"`
-	PrefixUnresolvedCount int `json:"prefix_unresolved_count,omitempty"`
-	PrefixBaseHead   string  `json:"prefix_base_head,omitempty"`
-	PrefixExhausted  bool    `json:"prefix_exhausted,omitempty"`
-	NeedsAttention   bool    `json:"needs_attention,omitempty"`
-	AttentionReason  string  `json:"attention_reason,omitempty"`
+	BranchRef             string  `json:"branch_ref"`
+	BranchGeneration      int64   `json:"branch_generation"`
+	CandidateID           string  `json:"candidate_id"`
+	Reason                string  `json:"reason"`
+	Stage                 string  `json:"stage,omitempty"`
+	TargetEventSeqs       []int64 `json:"target_event_seqs,omitempty"`
+	UnlockCount           int     `json:"unlock_count,omitempty"`
+	LastProgressTS        float64 `json:"last_progress_ts,omitempty"`
+	PlanFingerprint       string  `json:"plan_fingerprint,omitempty"`
+	PrefixCursor          int     `json:"prefix_cursor,omitempty"`
+	PrefixUnresolvedCount int     `json:"prefix_unresolved_count,omitempty"`
+	PrefixBaseHead        string  `json:"prefix_base_head,omitempty"`
+	PrefixExhausted       bool    `json:"prefix_exhausted,omitempty"`
+	NeedsAttention        bool    `json:"needs_attention,omitempty"`
+	AttentionReason       string  `json:"attention_reason,omitempty"`
 }
 
 // OldestOverdueFailedIntentEventSeq returns the earliest pending capture held
@@ -1072,6 +1072,56 @@ UPDATE daemon_meta SET value=?,updated_ts=? WHERE key=? AND value=?`,
 	return nil
 }
 
+func intentForwardRecoveryUnresolvedCount(
+	ctx context.Context,
+	tx *sql.Tx,
+	recovery IntentForwardRecovery,
+) (int, error) {
+	if len(recovery.TargetEventSeqs) == 0 ||
+		len(recovery.TargetEventSeqs) > IntentCandidateMaxCaptures {
+		return 0, errors.New(
+			"state: intent forward recovery target is invalid")
+	}
+	placeholders := strings.TrimSuffix(
+		strings.Repeat("?,", len(recovery.TargetEventSeqs)), ",")
+	args := make([]any, 0, len(recovery.TargetEventSeqs)+2)
+	for _, seq := range recovery.TargetEventSeqs {
+		if seq <= 0 {
+			return 0, errors.New(
+				"state: intent forward recovery target is invalid")
+		}
+		args = append(args, seq)
+	}
+	args = append(args, recovery.BranchRef, recovery.BranchGeneration)
+	var existing, unresolved int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN state IN ('published','recovered')
+                         THEN 0 ELSE 1 END),0)
+FROM capture_events
+WHERE seq IN (`+placeholders+`)
+  AND branch_ref=? AND branch_generation=?`, args...).Scan(
+		&existing, &unresolved); err != nil {
+		return 0, fmt.Errorf(
+			"state: count unresolved intent forward recovery target: %w", err)
+	}
+	if existing != len(recovery.TargetEventSeqs) {
+		return 0, errors.New(
+			"state: intent forward recovery target membership changed")
+	}
+	return unresolved, nil
+}
+
+func clearIntentForwardRecoveryPrefix(recovery *IntentForwardRecovery) {
+	recovery.PlanFingerprint = ""
+	recovery.PrefixCursor = 0
+	recovery.PrefixUnresolvedCount = 0
+	recovery.PrefixBaseHead = ""
+	recovery.PrefixExhausted = false
+	recovery.NeedsAttention = false
+	recovery.AttentionReason = ""
+}
+
 // AdvanceIntentForwardRecovery changes the restart-safe salvage subphase
 // without changing its frozen target or branch identity.
 func AdvanceIntentForwardRecovery(
@@ -1104,14 +1154,20 @@ func AdvanceIntentForwardRecovery(
 	}
 	current.Stage = stage
 	if published > 0 {
+		if current.PrefixUnresolvedCount > 0 {
+			unresolved, err := intentForwardRecoveryUnresolvedCount(
+				ctx, tx, current)
+			if err != nil {
+				return recovery, err
+			}
+			if unresolved >= current.PrefixUnresolvedCount {
+				return recovery, errors.New(
+					"state: intent forward recovery progress is not durable")
+			}
+		}
 		current.UnlockCount++
 		current.LastProgressTS = nowSeconds()
-		current.PlanFingerprint = ""
-		current.PrefixCursor = 0
-		current.PrefixBaseHead = ""
-		current.PrefixExhausted = false
-		current.NeedsAttention = false
-		current.AttentionReason = ""
+		clearIntentForwardRecoveryPrefix(&current)
 	}
 	if err := storeIntentForwardRecoveryCAS(ctx, tx, raw, current); err != nil {
 		return recovery, err
@@ -1167,13 +1223,23 @@ func AdvanceIntentForwardRecoveryPrefix(
 		return recovery, errors.New(
 			"state: intent forward recovery prefix is exhausted")
 	}
+	unresolved, err := intentForwardRecoveryUnresolvedCount(ctx, tx, current)
+	if err != nil {
+		return recovery, err
+	}
+	if unresolved == 0 {
+		return recovery, errors.New(
+			"state: intent forward recovery target is already resolved")
+	}
 	if current.PlanFingerprint == "" {
-		if current.PrefixCursor != 0 || current.PrefixBaseHead != "" {
+		if current.PrefixCursor != 0 || current.PrefixUnresolvedCount != 0 ||
+			current.PrefixBaseHead != "" {
 			return recovery, errors.New(
 				"state: intent forward recovery prefix state is incomplete")
 		}
 		current.PlanFingerprint = planFingerprint
 		current.PrefixBaseHead = baseHead
+		current.PrefixUnresolvedCount = unresolved
 	} else {
 		if current.PlanFingerprint != planFingerprint ||
 			current.PrefixBaseHead != baseHead {
@@ -1184,9 +1250,117 @@ func AdvanceIntentForwardRecoveryPrefix(
 			return recovery, errors.New(
 				"state: intent forward recovery prefix cannot move backward")
 		}
+		if current.PrefixUnresolvedCount <= 0 {
+			return recovery, errors.New(
+				"state: intent forward recovery progress baseline is missing")
+		}
+		if unresolved != current.PrefixUnresolvedCount {
+			return recovery, errors.New(
+				"state: intent forward recovery progress must be reconciled")
+		}
 	}
 	current.Stage = "local_unlock"
 	current.PrefixCursor = prefixCursor
+	if err := storeIntentForwardRecoveryCAS(ctx, tx, raw, current); err != nil {
+		return recovery, err
+	}
+	if err := tx.Commit(); err != nil {
+		return recovery, err
+	}
+	return current, nil
+}
+
+// ResetIntentForwardRecoveryPrefixAfterProgress closes the crash window
+// between a successful prefix publication and its ordinary post-replay marker
+// update. It resets the cursor only after durable event state proves that the
+// frozen target has fewer unresolved members than when this prefix epoch began.
+func ResetIntentForwardRecoveryPrefixAfterProgress(
+	ctx context.Context,
+	d *DB,
+	recovery IntentForwardRecovery,
+) (IntentForwardRecovery, bool, error) {
+	if d == nil || recovery.BranchRef == "" || recovery.BranchGeneration < 0 ||
+		recovery.CandidateID == "" || recovery.Stage != "local_unlock" ||
+		recovery.PlanFingerprint == "" || recovery.PrefixCursor < 1 ||
+		recovery.PrefixUnresolvedCount < 1 || recovery.PrefixBaseHead == "" {
+		return recovery, false, errors.New(
+			"state: ResetIntentForwardRecoveryPrefixAfterProgress: invalid input")
+	}
+	if recovery.PrefixExhausted || recovery.NeedsAttention {
+		return recovery, false, nil
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return recovery, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, raw, err := loadIntentForwardRecoveryForUpdate(ctx, tx)
+	if err != nil {
+		return recovery, false, err
+	}
+	if !sameIntentForwardRecoveryMarker(current, recovery) {
+		return recovery, false, errors.New(
+			"state: intent forward recovery marker changed")
+	}
+	unresolved, err := intentForwardRecoveryUnresolvedCount(ctx, tx, current)
+	if err != nil {
+		return recovery, false, err
+	}
+	if unresolved > current.PrefixUnresolvedCount {
+		return recovery, false, errors.New(
+			"state: intent forward recovery unresolved target grew")
+	}
+	if unresolved == current.PrefixUnresolvedCount {
+		return current, false, nil
+	}
+	if unresolved == 0 {
+		return recovery, false, errors.New(
+			"state: intent forward recovery target is fully resolved")
+	}
+	current.Stage = "semantic_replan"
+	current.UnlockCount++
+	current.LastProgressTS = nowSeconds()
+	clearIntentForwardRecoveryPrefix(&current)
+	if err := storeIntentForwardRecoveryCAS(ctx, tx, raw, current); err != nil {
+		return recovery, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return recovery, false, err
+	}
+	return current, true, nil
+}
+
+// ResetIntentForwardRecoveryInvalidPlan discards only the cached semantic plan
+// and prefix cursor when the caller has revalidated that plan and proved it can
+// no longer represent the frozen target safely. It records no publication
+// progress and leaves the immutable target unchanged for a fresh semantic plan.
+func ResetIntentForwardRecoveryInvalidPlan(
+	ctx context.Context,
+	d *DB,
+	recovery IntentForwardRecovery,
+) (IntentForwardRecovery, error) {
+	if d == nil || recovery.BranchRef == "" || recovery.BranchGeneration < 0 ||
+		recovery.CandidateID == "" || recovery.Stage != "local_unlock" ||
+		recovery.PlanFingerprint == "" || recovery.PrefixExhausted ||
+		recovery.NeedsAttention {
+		return recovery, errors.New(
+			"state: ResetIntentForwardRecoveryInvalidPlan: invalid input")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return recovery, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, raw, err := loadIntentForwardRecoveryForUpdate(ctx, tx)
+	if err != nil {
+		return recovery, err
+	}
+	if !sameIntentForwardRecoveryMarker(current, recovery) {
+		return recovery, errors.New(
+			"state: intent forward recovery marker changed")
+	}
+	current.Stage = "semantic_replan"
+	clearIntentForwardRecoveryPrefix(&current)
 	if err := storeIntentForwardRecoveryCAS(ctx, tx, raw, current); err != nil {
 		return recovery, err
 	}
@@ -1212,7 +1386,8 @@ func MarkIntentForwardRecoveryNeedsAttention(
 	if d == nil || recovery.BranchRef == "" || recovery.BranchGeneration < 0 ||
 		recovery.CandidateID == "" || recovery.Stage != "local_unlock" ||
 		recovery.PlanFingerprint == "" || recovery.PrefixCursor < 1 ||
-		recovery.PrefixBaseHead == "" || reason == "" || reasonErr != nil {
+		recovery.PrefixUnresolvedCount < 1 || recovery.PrefixBaseHead == "" ||
+		reason == "" || reasonErr != nil {
 		return recovery, errors.New(
 			"state: MarkIntentForwardRecoveryNeedsAttention: invalid input")
 	}
@@ -1238,6 +1413,14 @@ func MarkIntentForwardRecoveryNeedsAttention(
 		}
 		return recovery, errors.New(
 			"state: intent forward recovery attention reason changed")
+	}
+	unresolved, err := intentForwardRecoveryUnresolvedCount(ctx, tx, current)
+	if err != nil {
+		return recovery, err
+	}
+	if unresolved != current.PrefixUnresolvedCount {
+		return recovery, errors.New(
+			"state: intent forward recovery progress must be reconciled")
 	}
 	current.PrefixExhausted = true
 	current.NeedsAttention = true
