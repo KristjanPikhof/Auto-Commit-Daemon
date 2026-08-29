@@ -1617,16 +1617,25 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		return nil, false, "", nil
 	}
 	var (
-		forcedEvent state.CaptureEvent
-		forcedState state.PlannerState
-		forcedOK    bool
+		forcedEvent  state.CaptureEvent
+		forcedState  state.PlannerState
+		forcedOK     bool
+		freshWindow  = make([]state.CaptureEvent, 0, cfg.window)
+		blockedPaths = make(map[string]struct{})
 	)
 	for _, ev := range pending {
 		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
 		if err != nil {
 			return nil, false, "", err
 		}
-		if !ok || ps.DeferCount < cfg.deferLimit {
+		overdue := ok && ps.DeferCount >= cfg.deferLimit
+		if !overdue {
+			if len(freshWindow) < cfg.window &&
+				!captureEventTouchesAnyPath(ev, blockedPaths) {
+				freshWindow = append(freshWindow, ev)
+				continue
+			}
+			addCaptureEventPaths(blockedPaths, ev)
 			continue
 		}
 		if !forcedOK ||
@@ -1636,8 +1645,24 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 			forcedState = ps
 			forcedOK = true
 		}
+		addCaptureEventPaths(blockedPaths, ev)
 	}
 	if forcedOK {
+		if len(freshWindow) > 0 {
+			held, err := forcedCaptureHeldByIntentCandidate(
+				ctx, db, forcedEvent)
+			if err != nil {
+				return nil, false, "", err
+			}
+			// A repeatedly deferred candidate must not monopolize the planner
+			// while later captures that may complete it have never been
+			// evaluated. Offer a bounded, non-contiguous window of fresh paths
+			// first. Same-path successors remain behind the overdue event because
+			// their before-state depends on applying that event first.
+			if held {
+				return freshWindow, false, "", nil
+			}
+		}
 		if hasEarlierPotentialPathDependency(pending, forcedEvent) {
 			n := cfg.window
 			if n > len(pending) {
@@ -1670,6 +1695,52 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		n = boundaryCaptureLimit
 	}
 	return pending[:n], false, "", nil
+}
+
+func captureEventTouchesAnyPath(
+	event state.CaptureEvent,
+	paths map[string]struct{},
+) bool {
+	for path := range captureEventPathSet(event) {
+		if _, ok := paths[path]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func addCaptureEventPaths(paths map[string]struct{}, event state.CaptureEvent) {
+	for path := range captureEventPathSet(event) {
+		paths[path] = struct{}{}
+	}
+}
+
+func forcedCaptureHeldByIntentCandidate(
+	ctx context.Context,
+	db *state.DB,
+	event state.CaptureEvent,
+) (bool, error) {
+	if event.BranchRef == "" || event.BranchGeneration < 0 {
+		return false, nil
+	}
+	candidates, err := state.IntentCandidatesForPair(
+		ctx, db, event.BranchRef, event.BranchGeneration, 0)
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range candidates {
+		if candidate.Status != state.IntentCandidateOpen &&
+			candidate.Status != state.IntentCandidateWaiting &&
+			candidate.Status != state.IntentCandidateBlocked {
+			continue
+		}
+		for _, member := range candidate.Events {
+			if member.EventSeq == event.Seq {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func intentActivityBoundaryCaptureLimit(
