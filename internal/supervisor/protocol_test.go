@@ -251,32 +251,202 @@ func TestStartableWorkerIDsBoundsAndOrdersStartupBatch(t *testing.T) {
 			id: "backoff", nextStart: now.Add(time.Minute),
 		},
 	}
-	want := []string{"repo-a", "repo-b", "repo-c", "repo-d"}
-	if got := startableWorkerIDs(workers, now, maxWorkerStartsPerReconcile); !slices.Equal(got, want) {
+	want := []string{"repo-a", "repo-b"}
+	if got := startableWorkerIDs(workers, now, maxConcurrentWorkerStarts); !slices.Equal(got, want) {
 		t.Fatalf("startable workers=%v want %v", got, want)
 	}
 }
 
-func TestStartingLaunchdWorkersBoundsConcurrentProtection(t *testing.T) {
+func TestStartingWorkersCountsDirectAndLaunchdProtection(t *testing.T) {
 	home := t.TempDir()
 	roots := paths.Roots{State: filepath.Join(home, "state"), Share: filepath.Join(home, "share"), Config: filepath.Join(home, "config")}
-	workers := make(map[string]*workerProcess)
-	for index := 0; index < maxConcurrentWorkerStarts; index++ {
-		id := fmt.Sprintf("%016d", index)
-		workers[id] = &workerProcess{id: id, launchd: true}
-		if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{RepositoryID: id, State: "starting"}); err != nil {
-			t.Fatal(err)
-		}
+	now := time.Now()
+	workers := map[string]*workerProcess{
+		"0000000000000000": {id: "0000000000000000", cmd: &exec.Cmd{}, started: now},
+		"0000000000000001": {id: "0000000000000001", launchd: true},
+		"0000000000000002": {id: "0000000000000002", cmd: &exec.Cmd{}, started: now},
 	}
-	if got := startingLaunchdWorkers(roots, workers); got != maxConcurrentWorkerStarts {
-		t.Fatalf("starting launchd workers=%d want %d", got, maxConcurrentWorkerStarts)
-	}
-	workers["9999999999999999"] = &workerProcess{id: "9999999999999999", launchd: true}
-	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{RepositoryID: "9999999999999999", State: "running"}); err != nil {
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: "0000000000000001", State: "starting",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := startingLaunchdWorkers(roots, workers); got != maxConcurrentWorkerStarts {
-		t.Fatalf("running worker consumed admission slot: got %d", got)
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: "0000000000000002", State: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := startingWorkers(roots, workers, now); got != maxConcurrentWorkerStarts {
+		t.Fatalf("starting workers=%d want %d", got, maxConcurrentWorkerStarts)
+	}
+}
+
+func TestStartingWorkersReleasesExpiredAdmission(t *testing.T) {
+	now := time.Now()
+	started := now.Add(-workerStartupAdmissionLease - time.Second)
+	worker := &workerProcess{id: "0000000000000000", cmd: &exec.Cmd{}, started: started}
+	status := WorkerRuntimeStatus{
+		RepositoryID: worker.id,
+		State:        "starting",
+		UpdatedTS:    started.UnixMilli(),
+	}
+	if workerHoldsStartupAdmission(worker, status, nil, now) {
+		t.Fatal("expired starting status still monopolized startup admission")
+	}
+	if workerHoldsStartupAdmission(worker, WorkerRuntimeStatus{}, os.ErrNotExist, now) {
+		t.Fatal("expired missing status still monopolized startup admission")
+	}
+	if workerHoldsStartupAdmission(worker, WorkerRuntimeStatus{
+		RepositoryID: worker.id,
+		State:        "starting",
+		UpdatedTS:    now.UnixMilli(),
+	}, nil, now) {
+		t.Fatal("fresh status extended an expired process admission")
+	}
+	fresh := &workerProcess{id: worker.id, cmd: &exec.Cmd{}, started: now}
+	if !workerHoldsStartupAdmission(fresh, WorkerRuntimeStatus{
+		RepositoryID: fresh.id,
+		State:        "starting",
+		UpdatedTS:    now.UnixMilli(),
+	}, nil, now) {
+		t.Fatal("fresh process did not retain startup admission")
+	}
+}
+
+func TestStatusReportsExpiredStartupAdmissionWithoutStoppingRetry(t *testing.T) {
+	roots := paths.Roots{
+		State: filepath.Join(t.TempDir(), "state"),
+		Share: filepath.Join(t.TempDir(), "share"),
+	}
+	const repositoryID = "0000000000000000"
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: repositoryID,
+		State:        "starting",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	worker := &workerProcess{
+		id: repositoryID, cmd: &exec.Cmd{},
+		started: time.Now().Add(-workerStartupAdmissionLease - time.Second),
+	}
+	server := &Server{
+		Roots: roots,
+		workers: map[string]*workerProcess{
+			repositoryID: worker,
+		},
+	}
+	status := server.status()
+	if len(status.Workers) != 1 ||
+		status.Workers[0].State != "needs_action" ||
+		status.Workers[0].LastError != workerStartupAdmissionExpiredError {
+		t.Fatalf("expired worker status=%+v", status.Workers)
+	}
+	if worker.cmd == nil {
+		t.Fatal("status projection stopped the retrying worker")
+	}
+	runtimeStatus, err := ReadWorkerRuntimeStatus(roots, repositoryID)
+	if err != nil || runtimeStatus.State != "starting" {
+		t.Fatalf("runtime status=(%+v,%v), want untouched starting state",
+			runtimeStatus, err)
+	}
+}
+
+func TestStatusBoundsMissingLaunchdStartupState(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name      string
+		started   time.Time
+		wantState string
+	}{
+		{name: "fresh", started: now, wantState: "starting"},
+		{name: "expired", started: now.Add(-workerStartupAdmissionLease - time.Second), wantState: "needs_action"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const repositoryID = "0000000000000000"
+			server := &Server{
+				Roots: paths.Roots{
+					State: filepath.Join(t.TempDir(), "state"),
+				},
+				workers: map[string]*workerProcess{
+					repositoryID: {
+						id: repositoryID, launchd: true, started: tc.started,
+					},
+				},
+			}
+			status := server.status()
+			if len(status.Workers) != 1 ||
+				status.Workers[0].State != tc.wantState {
+				t.Fatalf("worker status=%+v, want %s",
+					status.Workers, tc.wantState)
+			}
+		})
+	}
+}
+
+func TestReconcileBoundsDirectProtectionStartupAcrossCycles(t *testing.T) {
+	root := t.TempDir()
+	roots := paths.Roots{
+		State: filepath.Join(root, "state"), Share: filepath.Join(root, "share"),
+		Config: filepath.Join(root, "config"),
+	}
+	binary := filepath.Join(root, "worker")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec /bin/sleep 60\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registry := central.NewRegistry()
+	for index := range 4 {
+		id := fmt.Sprintf("%016d", index)
+		registry.Repos = append(registry.Repos, central.RepoRecord{
+			Path: "/repo-" + id, StateDB: "/state-" + id,
+			RepositoryID: id, WorktreeID: fmt.Sprintf("%016x", index+4),
+		})
+	}
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{Roots: roots, BinaryPath: binary, workers: make(map[string]*workerProcess)}
+	t.Cleanup(func() {
+		server.shutdownWorkers()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = server.waitWorkersStopped(ctx)
+	})
+
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.workers["0000000000000000"].cmd == nil ||
+		server.workers["0000000000000001"].cmd == nil ||
+		server.workers["0000000000000002"].cmd != nil {
+		t.Fatalf("first reconcile workers=%+v", server.workers)
+	}
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.workers["0000000000000002"].cmd != nil {
+		t.Fatal("second reconcile exceeded the concurrent startup limit")
+	}
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: "0000000000000000", State: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.workers["0000000000000002"].cmd == nil ||
+		server.workers["0000000000000003"].cmd != nil {
+		t.Fatal("third reconcile did not reuse exactly one ready slot")
+	}
+	server.workers["0000000000000001"].started = time.Now().Add(
+		-workerStartupAdmissionLease - time.Second)
+	server.workers["0000000000000002"].started = time.Now().Add(
+		-workerStartupAdmissionLease - time.Second)
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.workers["0000000000000003"].cmd == nil {
+		t.Fatal("expired startup admission blocked the remaining repository")
 	}
 }
 

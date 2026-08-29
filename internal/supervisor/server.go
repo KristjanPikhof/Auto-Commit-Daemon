@@ -110,11 +110,15 @@ type workerProcess struct {
 var restartDelays = []time.Duration{time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second}
 
 // Starting every registered repository at once creates a Git/process storm on
-// login and during setup cutover. Keep each reconcile batch small; the regular
-// two-second reconcile tick starts the remaining workers promptly.
+// login and during setup cutover. Two protection scans retain useful
+// parallelism while the regular reconcile tick starts each remaining worker as
+// soon as capacity is available. A worker that cannot finish its initial
+// checkpoint must eventually release admission so two unhealthy repositories
+// cannot prevent every later repository from starting.
 const (
-	maxWorkerStartsPerReconcile = 4
-	maxConcurrentWorkerStarts   = 8
+	maxConcurrentWorkerStarts          = 2
+	workerStartupAdmissionLease        = 2 * time.Minute
+	workerStartupAdmissionExpiredError = "initial protection checkpoint is still retrying after 2 minutes"
 )
 
 func (s *Server) Run(ctx context.Context) error {
@@ -405,13 +409,15 @@ func (s *Server) expireMaintenanceLocked(now time.Time) {
 func (s *Server) status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	status := Status{PID: os.Getpid(), Version: s.Version, BinaryDigest: s.BinaryDigest,
 		Ownership: os.Getenv(supervisorOwnershipEnv), Compatibility: s.Compatibility,
 		Workers: make([]WorkerStatus, 0, len(s.workers))}
 	for _, worker := range s.workers {
 		item := WorkerStatus{RepositoryID: worker.id, Restarts: worker.restarts, LastError: worker.lastError, State: "backoff", Version: s.Version}
-		if runtimeStatus, err := ReadWorkerRuntimeStatus(s.Roots, worker.id); err == nil &&
-			(worker.launchd || worker.cmd != nil) {
+		runtimeStatus, runtimeStatusErr := ReadWorkerRuntimeStatus(s.Roots, worker.id)
+		active := worker.launchd || worker.cmd != nil
+		if runtimeStatusErr == nil && active {
 			item.PID = runtimeStatus.PID
 			item.State = runtimeStatus.State
 			item.Restarts = runtimeStatus.Restarts
@@ -421,6 +427,12 @@ func (s *Server) status() Status {
 		} else if worker.cmd != nil && worker.cmd.Process != nil {
 			item.PID = worker.cmd.Process.Pid
 			item.State = "starting"
+		}
+		if active && item.State == "starting" &&
+			!workerHoldsStartupAdmission(
+				worker, runtimeStatus, runtimeStatusErr, now) {
+			item.State = "needs_action"
+			item.LastError = workerStartupAdmissionExpiredError
 		}
 		if item.Restarts >= 5 && item.LastError != "" {
 			item.State = "needs_action"
@@ -507,6 +519,12 @@ func (s *Server) reconcile(ctx context.Context) error {
 			worker = &workerProcess{id: id, signature: signature, desired: signature}
 			if s.LaunchdWorkers && runtime.GOOS == "darwin" {
 				worker.launchd = s.launchdWorkerExists(ctx, id)
+				if worker.launchd {
+					// A discovered legacy launchd worker may not have written its
+					// status file yet. Give it one bounded admission lease instead
+					// of either ignoring an active scan or blocking forever.
+					worker.started = now
+				}
 			}
 			s.workers[id] = worker
 		}
@@ -526,29 +544,57 @@ func (s *Server) reconcile(ctx context.Context) error {
 			worker.nextStart = time.Time{}
 		}
 	}
-	startLimit := maxWorkerStartsPerReconcile
-	if s.LaunchdWorkers && runtime.GOOS == "darwin" {
-		startLimit = min(startLimit, max(0,
-			maxConcurrentWorkerStarts-startingLaunchdWorkers(s.Roots, s.workers)))
-	}
+	startLimit := max(0,
+		maxConcurrentWorkerStarts-startingWorkers(s.Roots, s.workers, now))
 	for _, id := range startableWorkerIDs(s.workers, now, startLimit) {
 		s.startWorkerLocked(ctx, s.workers[id])
 	}
 	return nil
 }
 
-func startingLaunchdWorkers(roots paths.Roots, workers map[string]*workerProcess) int {
+func startingWorkers(
+	roots paths.Roots,
+	workers map[string]*workerProcess,
+	now time.Time,
+) int {
 	count := 0
 	for _, worker := range workers {
-		if worker == nil || !worker.launchd {
+		if worker == nil || (worker.cmd == nil && !worker.launchd) {
 			continue
 		}
 		status, err := ReadWorkerRuntimeStatus(roots, worker.id)
-		if err != nil || status.State == "starting" {
+		if workerHoldsStartupAdmission(worker, status, err, now) {
 			count++
 		}
 	}
 	return count
+}
+
+func workerHoldsStartupAdmission(
+	worker *workerProcess,
+	status WorkerRuntimeStatus,
+	statusErr error,
+	now time.Time,
+) bool {
+	if worker == nil {
+		return false
+	}
+	started := worker.started
+	if statusErr == nil {
+		if status.State != "starting" {
+			return false
+		}
+		if started.IsZero() && status.UpdatedTS > 0 {
+			started = time.UnixMilli(status.UpdatedTS)
+			if started.After(now) {
+				started = now
+			}
+		}
+	}
+	if started.IsZero() {
+		return false
+	}
+	return now.Before(started.Add(workerStartupAdmissionLease))
 }
 
 func startableWorkerIDs(workers map[string]*workerProcess, now time.Time, limit int) []string {

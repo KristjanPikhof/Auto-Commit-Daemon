@@ -4764,7 +4764,7 @@ func reconcileLiveIndexAfterPublish(ctx context.Context, repoRoot string, logger
 	if len(liveOps) == 0 {
 		return
 	}
-	res, err := git.ReconcileLiveIndex(ctx, repoRoot, liveOps)
+	res, err := reconcileLiveIndexWithRetry(ctx, repoRoot, liveOps)
 	if err != nil {
 		slog.Default().Warn("live index reconciliation failed", "seq", ev.Seq, "path", ev.Path, "err", err)
 		traceLiveIndexReconcile(logger, repoRoot, cctx, ev, "failed", err.Error(), nil)

@@ -10,13 +10,37 @@ import (
 )
 
 // ReachableObjectSizes returns the logical size of every object reachable
-// from one private ref. The caller combines sets across refs so shared blobs
-// count once toward a worktree checkpoint-content budget.
+// from one private ref.
 func ReachableObjectSizes(ctx context.Context, repoDir, ref string) (map[string]int64, error) {
-	out, err := RunWithLimit(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
-		256<<20, "rev-list", "--objects", "--no-object-names", ref)
+	return ReachableObjectSizesForRefs(ctx, repoDir, []string{ref})
+}
+
+// ReachableObjectSizesForRefs returns the logical size of the union of all
+// objects reachable from refs. Feeding revisions over stdin keeps the command
+// bounded when a repository retains thousands of checkpoint refs, while one
+// rev-list traversal ensures shared history is visited only once.
+func ReachableObjectSizesForRefs(ctx context.Context, repoDir string, refs []string) (map[string]int64, error) {
+	if len(refs) == 0 {
+		return map[string]int64{}, nil
+	}
+	var revisions bytes.Buffer
+	seenRefs := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		if !isValidFullRef(ref) {
+			return nil, fmt.Errorf("git: invalid inventory ref %q", ref)
+		}
+		if _, ok := seenRefs[ref]; ok {
+			continue
+		}
+		seenRefs[ref] = struct{}{}
+		revisions.WriteString(ref)
+		revisions.WriteByte('\n')
+	}
+	out, err := RunWithLimit(ctx, RunOpts{
+		Dir: repoDir, Timeout: DefaultReadTimeout, Stdin: &revisions,
+	}, 256<<20, "rev-list", "--objects", "--no-object-names", "--stdin")
 	if err != nil {
-		return nil, fmt.Errorf("git: inventory %s: %w", ref, err)
+		return nil, fmt.Errorf("git: inventory refs: %w", err)
 	}
 	oids := strings.Fields(string(out))
 	if len(oids) == 0 {

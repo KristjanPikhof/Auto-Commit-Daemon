@@ -47,6 +47,11 @@ const (
 	// DefaultPruneInterval matches the legacy PRUNE_INTERVAL_SECONDS —
 	// run the capture_events pruner roughly once per minute.
 	DefaultPruneInterval = 60 * time.Second
+	// DefaultCheckpointRetentionInterval keeps the object inventory out of
+	// the minute-level event maintenance path. Checkpoint age and budget
+	// policies operate on days, so hourly evaluation is prompt without making
+	// idle repositories repeatedly traverse Git history.
+	DefaultCheckpointRetentionInterval = time.Hour
 	// DefaultRollupInterval is the minimum gap between RunDailyRollup
 	// attempts. The aggregator is also forced once per UTC-day boundary
 	// crossing regardless of this floor.
@@ -1454,15 +1459,16 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Loop state.
 	var (
-		consecutiveErrors int
-		emptyCount        int
-		currentDelay      = opts.Scheduler.Reset()
-		lastSweep         = time.Time{}
-		lastPrune         = time.Time{}
-		lastRollup        = time.Time{}
-		lastRollupUTCDay  = ""
-		stopped           bool
-		replayErrorLogs   replayErrorLogLimiter
+		consecutiveErrors       int
+		emptyCount              int
+		currentDelay            = opts.Scheduler.Reset()
+		lastSweep               = time.Time{}
+		lastPrune               = time.Time{}
+		lastCheckpointRetention = bootTime
+		lastRollup              = time.Time{}
+		lastRollupUTCDay        = ""
+		stopped                 bool
+		replayErrorLogs         replayErrorLogLimiter
 
 		// operation_in_progress staleness tracking. opMarkerSetAt is the
 		// monotonic-ish wall-clock observation of when the current marker
@@ -3146,6 +3152,9 @@ func Run(ctx context.Context, opts Options) error {
 			} else if n > 0 {
 				logger.Info("pruned events", "rows", n)
 			}
+			lastPrune = nowTS
+		}
+		if nowTS.Sub(lastCheckpointRetention) >= DefaultCheckpointRetentionInterval {
 			retention, retentionErr := checkpointStore.ApplyRetention(ctx, opts.RepoPath,
 				checkpointpkg.WorktreeID(opts.RepoPath), nowTS)
 			if retentionErr != nil {
@@ -3163,7 +3172,7 @@ func Run(ctx context.Context, opts Options) error {
 					logger.Info("pruned published checkpoints", "checkpoints", retention.Pruned)
 				}
 			}
-			lastPrune = nowTS
+			lastCheckpointRetention = nowTS
 		}
 
 		// 4k. Phase 3 daily rollup hook (§8.10). Throttled to
@@ -3477,7 +3486,14 @@ func runWithProgressHeartbeat(
 }
 
 func replayNeedsImmediateFollowup(sum ReplaySummary) bool {
-	return sum.Published > 0 || sum.HasMore || sum.RecaptureRequired
+	if sum.Published > 0 || sum.RecaptureRequired {
+		return true
+	}
+	// A transient wait can retain a frozen publication target and therefore
+	// report HasMore, but rerunning the full capture/replay loop immediately
+	// cannot advance it. Let the idle scheduler back off until the provider,
+	// verification resource, settle window, or another wake becomes ready.
+	return sum.HasMore && sum.Disposition != ReplayDispositionTransientWait
 }
 
 // resolveBranch returns (branchRef, headOID) for the current HEAD. A detached

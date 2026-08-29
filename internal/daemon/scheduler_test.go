@@ -82,6 +82,9 @@ func TestScheduler_ResetReturnsBase(t *testing.T) {
 // production defaults.
 func TestScheduler_ZeroFieldsUseDefaults(t *testing.T) {
 	s := Scheduler{}
+	if DefaultSchedulerIdleCeiling != 2*time.Minute {
+		t.Fatalf("idle safety poll=%v want 2m", DefaultSchedulerIdleCeiling)
+	}
 	if got := s.Reset(); got != DefaultSchedulerBase {
 		t.Fatalf("default Reset=%v want %v", got, DefaultSchedulerBase)
 	}
@@ -108,12 +111,26 @@ func TestReplayRecaptureSchedulesImmediateFollowup(t *testing.T) {
 	}) {
 		t.Fatal("verification resource wait would spin instead of backing off")
 	}
-	if !replayNeedsImmediateFollowup(ReplaySummary{
+	if replayNeedsImmediateFollowup(ReplaySummary{
 		Skipped:       true,
 		SkippedReason: "intent_v2_waiting_message_rewrite",
 		Disposition:   ReplayDispositionTransientWait,
 		HasMore:       true,
 	}) {
-		t.Fatal("semantic message wait lost its explicit drain follow-up")
+		t.Fatal("semantic message wait would spin instead of backing off")
+	}
+	if replayNeedsImmediateFollowup(ReplaySummary{
+		Skipped:       true,
+		SkippedReason: "intent_v2_provider_wait",
+		Disposition:   ReplayDispositionTransientWait,
+		HasMore:       true,
+	}) {
+		t.Fatal("provider cooldown would spin instead of backing off")
+	}
+	if !replayNeedsImmediateFollowup(ReplaySummary{
+		Disposition: ReplayDispositionRecoverableStall,
+		HasMore:     true,
+	}) {
+		t.Fatal("ready recovery work lost its immediate follow-up")
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -14,10 +16,63 @@ import (
 
 const DefaultLiveIndexRepairLimit = 128
 
+var liveIndexReconcileBackoffs = []time.Duration{
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	400 * time.Millisecond,
+}
+
+type liveIndexReconcileFn func(context.Context, string, []git.LiveIndexOp) (git.LiveIndexReconcileResult, error)
+type liveIndexReconcileSleepFn func(context.Context, time.Duration) error
+
 type LiveIndexRepairSummary struct {
 	Candidates int
 	Applied    int
 	Skipped    []git.LiveIndexSkip
+}
+
+// reconcileLiveIndexWithRetry repeats the complete guarded reconciliation
+// when Git briefly owns index.lock. Each attempt re-reads the live index, so a
+// lock holder that stages user content turns the next attempt into a safe
+// mismatched_entry skip instead of being overwritten by stale observations.
+func reconcileLiveIndexWithRetry(ctx context.Context, repoRoot string, ops []git.LiveIndexOp) (git.LiveIndexReconcileResult, error) {
+	return reconcileLiveIndexWithRetryUsing(
+		ctx, repoRoot, ops, liveIndexReconcileBackoffs,
+		git.ReconcileLiveIndex, sleepWithContext,
+	)
+}
+
+func reconcileLiveIndexWithRetryUsing(
+	ctx context.Context,
+	repoRoot string,
+	ops []git.LiveIndexOp,
+	backoffs []time.Duration,
+	reconcile liveIndexReconcileFn,
+	sleep liveIndexReconcileSleepFn,
+) (git.LiveIndexReconcileResult, error) {
+	var result git.LiveIndexReconcileResult
+	for attempt := 0; ; attempt++ {
+		var err error
+		result, err = reconcile(ctx, repoRoot, ops)
+		if err == nil || !isTransientLiveIndexLockError(err) || attempt >= len(backoffs) {
+			return result, err
+		}
+		if err := sleep(ctx, backoffs[attempt]); err != nil {
+			return result, err
+		}
+	}
+}
+
+func isTransientLiveIndexLockError(err error) bool {
+	var gitErr *git.Error
+	if !errors.As(err, &gitErr) || len(gitErr.Args) == 0 ||
+		gitErr.Args[0] != "update-index" {
+		return false
+	}
+	message := strings.ToLower(gitErr.Stderr)
+	return strings.Contains(message, "index.lock") &&
+		strings.Contains(message, "file exists")
 }
 
 func RepairPublishedLiveIndex(ctx context.Context, repoRoot string, db *state.DB, head string, limit int) (LiveIndexRepairSummary, error) {
@@ -65,7 +120,7 @@ func repairPublishedLiveIndex(ctx context.Context, repoRoot string, db *state.DB
 		if !apply {
 			continue
 		}
-		res, err := git.ReconcileLiveIndex(ctx, repoRoot, liveOps)
+		res, err := reconcileLiveIndexWithRetry(ctx, repoRoot, liveOps)
 		if err != nil {
 			return sum, err
 		}

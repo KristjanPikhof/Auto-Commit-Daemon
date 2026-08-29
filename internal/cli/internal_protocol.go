@@ -459,7 +459,7 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 			errCh <- nil
 		}(wt.Root, opts)
 	}
-	workerHandler := &repositoryWorkerHandler{repositoryID: repositoryID, runtimes: runtimes, wake: func(worktreeID string) {
+	wakeWorker := func(worktreeID string) {
 		wakeMu.RLock()
 		defer wakeMu.RUnlock()
 		target, ok := wakeTargets[worktreeID]
@@ -470,13 +470,20 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		case target <- struct{}{}:
 		default:
 		}
-	}}
+	}
+	activityHints := newWorkerActivityHintCoalescer(
+		workerActivityHintQuietPeriod, workerActivityHintMaxTail, wakeWorker)
+	workerHandler := &repositoryWorkerHandler{
+		repositoryID: repositoryID, runtimes: runtimes, wake: wakeWorker,
+		activityHints: activityHints,
+	}
 	workerServerErr := make(chan error, 1)
 	go func() {
 		workerServerErr <- supervisor.ServeWorker(cctx,
 			supervisor.WorkerSocketPath(roots, repositoryID), workerHandler)
 	}()
 	defer func() {
+		activityHints.Close()
 		for i := len(closers) - 1; i >= 0; i-- {
 			_ = closers[i].Close()
 		}
@@ -784,9 +791,10 @@ type workerRuntime struct {
 }
 
 type repositoryWorkerHandler struct {
-	repositoryID string
-	runtimes     map[string]*workerRuntime
-	wake         func(string)
+	repositoryID  string
+	runtimes      map[string]*workerRuntime
+	wake          func(string)
+	activityHints *workerActivityHintCoalescer
 }
 
 func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, request supervisor.Request) (any, *supervisor.ProtocolError) {
@@ -836,7 +844,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		if _, beginErr := daemon.BeginProtectionObservation(ctx, runtime.db); beginErr != nil {
 			return nil, protocolFailure("observation_failed", beginErr, true)
 		}
-		h.wake(request.WorktreeID)
+		h.wakeActivityHint(request.WorktreeID)
 		return map[string]bool{"accepted": true}, nil
 	case "publication_drain_status":
 		projection, projectionErr := state.ReadPublicationDrainProjection(
@@ -1224,6 +1232,14 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 	default:
 		return nil, &supervisor.ProtocolError{Code: "invalid_request", Message: "unsupported worker request"}
 	}
+}
+
+func (h *repositoryWorkerHandler) wakeActivityHint(worktreeID string) {
+	if h.activityHints != nil {
+		h.activityHints.Hint(worktreeID)
+		return
+	}
+	h.wake(worktreeID)
 }
 
 func refreshRestorePublicationHold(ctx context.Context, runtime *workerRuntime) error {

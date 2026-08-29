@@ -641,6 +641,118 @@ func TestReplay_ReconcileLiveIndexPreservesUserStaging(t *testing.T) {
 	}
 }
 
+func TestLiveIndexReconcileRetriesTransientPublicationLock(t *testing.T) {
+	f, ctx, path, op, afterOID := liveIndexRetryFixture(t)
+	attempts := 0
+
+	result, err := reconcileLiveIndexWithRetryUsing(
+		ctx, f.dir, []git.LiveIndexOp{op}, []time.Duration{0},
+		func(ctx context.Context, repoRoot string, ops []git.LiveIndexOp) (git.LiveIndexReconcileResult, error) {
+			attempts++
+			if attempts == 1 {
+				return git.LiveIndexReconcileResult{}, transientLiveIndexLockError(f.gitDir)
+			}
+			return git.ReconcileLiveIndex(ctx, repoRoot, ops)
+		},
+		func(context.Context, time.Duration) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("reconcileLiveIndexWithRetryUsing: %v", err)
+	}
+	if attempts != 2 || !reflect.DeepEqual(result.Applied, []string{path}) || len(result.Skipped) != 0 {
+		t.Fatalf("retry result=%+v attempts=%d", result, attempts)
+	}
+	assertLiveIndexOID(t, ctx, f.dir, path, afterOID)
+}
+
+func TestLiveIndexReconcileRetryPreservesConcurrentUserStage(t *testing.T) {
+	f, ctx, path, op, _ := liveIndexRetryFixture(t)
+	stagedOID, err := git.HashObjectStdin(ctx, f.dir, []byte("user staged\n"))
+	if err != nil {
+		t.Fatalf("hash staged content: %v", err)
+	}
+	attempts := 0
+
+	result, err := reconcileLiveIndexWithRetryUsing(
+		ctx, f.dir, []git.LiveIndexOp{op}, []time.Duration{0},
+		func(ctx context.Context, repoRoot string, ops []git.LiveIndexOp) (git.LiveIndexReconcileResult, error) {
+			attempts++
+			if attempts == 1 {
+				return git.LiveIndexReconcileResult{}, transientLiveIndexLockError(f.gitDir)
+			}
+			return git.ReconcileLiveIndex(ctx, repoRoot, ops)
+		},
+		func(context.Context, time.Duration) error {
+			return git.UpdateIndexInfo(ctx, f.dir, "", []string{
+				git.RegularFileMode + " " + stagedOID + "\t" + path,
+			})
+		},
+	)
+	if err != nil {
+		t.Fatalf("reconcileLiveIndexWithRetryUsing: %v", err)
+	}
+	if attempts != 2 || len(result.Applied) != 0 || len(result.Skipped) != 1 ||
+		result.Skipped[0].Path != path || result.Skipped[0].Reason != "mismatched_entry" {
+		t.Fatalf("retry result=%+v attempts=%d", result, attempts)
+	}
+	assertLiveIndexOID(t, ctx, f.dir, path, stagedOID)
+}
+
+func liveIndexRetryFixture(t *testing.T) (*captureFixture, context.Context, string, git.LiveIndexOp, string) {
+	t.Helper()
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	const path = "locked-publication.txt"
+	beforeOID, err := git.HashObjectStdin(ctx, f.dir, []byte("before\n"))
+	if err != nil {
+		t.Fatalf("hash before content: %v", err)
+	}
+	afterOID, err := git.HashObjectStdin(ctx, f.dir, []byte("after\n"))
+	if err != nil {
+		t.Fatalf("hash after content: %v", err)
+	}
+	base := commitSingleFileTree(t, ctx, f.dir, path, beforeOID, "seed before", f.cctx.BaseHead)
+	if err := git.UpdateRef(ctx, f.dir, "HEAD", base, f.cctx.BaseHead); err != nil {
+		t.Fatalf("publish base: %v", err)
+	}
+	if err := git.UpdateIndexInfo(ctx, f.dir, "", []string{
+		git.RegularFileMode + " " + beforeOID + "\t" + path,
+	}); err != nil {
+		t.Fatalf("seed live index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("after\n"), 0o644); err != nil {
+		t.Fatalf("write published worktree content: %v", err)
+	}
+	target := commitSingleFileTree(t, ctx, f.dir, path, afterOID, "publish after", base)
+	if err := git.UpdateRef(ctx, f.dir, "HEAD", target, base); err != nil {
+		t.Fatalf("publish target: %v", err)
+	}
+	return f, ctx, path, git.LiveIndexOp{
+		Path: path, BeforeMode: git.RegularFileMode, BeforeOID: beforeOID,
+		AfterMode: git.RegularFileMode, AfterOID: afterOID,
+	}, afterOID
+}
+
+func transientLiveIndexLockError(gitDir string) error {
+	return &git.Error{
+		Args:     []string{"update-index", "-z", "--index-info"},
+		ExitCode: 128,
+		Stderr: fmt.Sprintf(
+			"fatal: Unable to create '%s/index.lock': File exists.", gitDir),
+	}
+}
+
+func assertLiveIndexOID(t *testing.T, ctx context.Context, repoRoot, path, want string) {
+	t.Helper()
+	entries, err := git.LsFilesStaged(ctx, repoRoot, path)
+	if err != nil {
+		t.Fatalf("read live index: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Stage != 0 || entries[0].OID != want {
+		t.Fatalf("live index entries=%+v want stage-0 oid %s", entries, want)
+	}
+}
+
 func TestRepairPublishedLiveIndexRepairsOldCreateStaleIndex(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()

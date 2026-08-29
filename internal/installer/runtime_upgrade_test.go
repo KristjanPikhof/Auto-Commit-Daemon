@@ -75,6 +75,25 @@ func TestShouldUpgradeRuntimeUsesCompatibilityAndOrdering(t *testing.T) {
 		divergent, "source", setupOptions); err != nil || !upgrade {
 		t.Fatalf("setup divergent upgrade=(%t,%v), want true,nil", upgrade, err)
 	}
+	dirtyRuntime := supervisor.Status{
+		Version: options.SourceVersion + "-dirty", BinaryDigest: "dirty",
+		Compatibility: compatibility,
+	}
+	if upgrade, err := shouldUpgradeRuntime(
+		dirtyRuntime, "source", options); err != nil || upgrade {
+		t.Fatalf("automatic clean replacement=(%t,%v), want false,nil", upgrade, err)
+	}
+	if upgrade, err := shouldUpgradeRuntime(
+		dirtyRuntime, "source", setupOptions); err != nil || !upgrade {
+		t.Fatalf("setup clean replacement=(%t,%v), want true,nil", upgrade, err)
+	}
+}
+
+func TestCompatibleRuntimeReadinessAllowsAdmissionLimitedStartup(t *testing.T) {
+	if supervisor.CheckpointBarrierTimeout <= time.Minute {
+		t.Fatalf("compatible runtime readiness timeout=%s, want more than one minute",
+			supervisor.CheckpointBarrierTimeout)
+	}
 }
 
 func TestBuildPlanUsesBoundedCompatibleUpgrade(t *testing.T) {
