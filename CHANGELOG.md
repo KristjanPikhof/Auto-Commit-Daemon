@@ -14,8 +14,8 @@
   durable queue progress. Planning, replanning, provider calls, provider
   waits, verification, publication, and automatic recovery are visible without
   reading daemon logs.
-- ACD now wakes immediately for the first file change and coalesces follow-up
-  hints during a burst. Transient waits back off, idle safety polling can
+- Worker activity hints now wake immediately once and coalesce follow-up hints
+  during a burst. Transient waits back off, idle safety polling can
   stretch to two minutes, and bounded checkpoint retention runs hourly. This
   reduces idle CPU use without weakening capture coverage.
 - The README and setup guides now explain the normal workflow from file changes

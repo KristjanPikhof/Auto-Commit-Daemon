@@ -102,7 +102,7 @@ Avoid filename-only subjects, `Update file`, `WIP`, and `changes`. Planner ratio
 - Start cache: `<gitDir>/acd/start-cache-<sha256(session_id)[:16]>.json`, schema v2, atomic temp+rename. `acd stop` removes matching/all caches.
 - Branch tokens: attached `rev:<sha> <branch-ref>`; detached `rev:<sha>`; missing `missing <branch-ref>`. Reset/rebase/switch/same-SHA ref switch bumps generation; ordinary FF keeps it, except FF during rewind grace bumps, reseeds, and clears grace.
 - Reconcile the prior exact pair before accepting any non-unchanged token transition. Dead-ref sweeps skip live refs.
-- Detached HEAD pauses capture/replay and `acd start` refuses; never fall back to `refs/heads/main` after symbolic-ref failure.
+- Detached HEAD keeps full checkpoint protection active but pauses capture-event classification and publication. `acd on` and worker start refuse activation while detached; never fall back to `refs/heads/main` after symbolic-ref failure.
 - Git-op markers: `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `BISECT_LOG`. Log non-`ErrNotExist` stat errors but treat the marker absent for that tick.
 - Same-branch rewind sets `daemon_meta.replay.paused_until`; manual `<gitDir>/acd/paused` wins.
 - `shadow_paths` key: `(branch_ref, branch_generation, path)`. Bootstrap in 5000-row chunks; write `shadow.bootstrapped:<ref>:<generation>` only after completion. Stale/partial bootstrap causes phantom creates.
@@ -130,8 +130,8 @@ Avoid filename-only subjects, `Update file`, `WIP`, and `changes`. Planner ratio
 
 Regular configuration:
 
-- `acd configure`: Everyday/Maximum speed/Strict review onboarding; adaptive prompts, one fingerprint-bound preview, synchronous provider test, one runtime revision, durable validation job, then `acd on`. `--wait` follows validation. Dry-run performs no provider call, command, write, start, or hook change.
-- `acd settings`: advanced Bubble Tea v2.0.8/Bubbles v2.1.1/Lip Gloss v2.0.5/Huh v2.0.3 lab. Preserve static builds, responsive/accessibility/no-color, `DRAFT > TESTED > QUEUED > ACTIVE`.
+- `acd setup`: first-time user-wide Everyday/Maximum Speed onboarding, commit format and provider review, synchronous provider test, managed runtime and integration install, then per-repository `acd on`. Dry-run performs no provider call, command, write, start, or hook change.
+- `acd config edit`: global or repository configuration through the Bubble Tea v2.0.9/Bubbles v2.2.0/Lip Gloss v2.0.6/Huh v2.0.3 UI. Repository scope adds Strict Review, one runtime revision, a durable validation job, and `--wait`. Preserve static builds, responsive/accessibility/no-color, `DRAFT > TESTED > QUEUED > ACTIVE`.
 - Resolution: experiment > repository > profile > global > environment > preset > default. Hot fields apply between passes; restart-required fields wait for daemon restart. Global saves do not fan out; stopped-daemon apply never starts it.
 - Credentials: `${XDG_CONFIG_HOME:-$HOME/.config}/acd/credentials.json` schema v1, regular `0600` under owner-only `0700`; reject symlinks, wrong owner/mode, malformed/multiple/future JSON. Atomic same-directory write with fsync/rename/dir-fsync. `ACD_AI_API_KEY` wins. Never expose secrets in state, logs, traces, fingerprints, status, diagnostics, errors, or test output.
 - Strict provider tests send one synthetic request without source. Endpoint credentials, subprocess execution, diff egress, and verification commands require operation-specific approval. Verification runs in bounded ephemeral detached candidate worktrees.
@@ -139,10 +139,10 @@ Regular configuration:
 ## Exact-chain recovery
 
 ~~~bash
-acd fix --dry-run
-acd fix --yes
-acd fix --force --dry-run
-acd fix --force --yes
+acd support recover --dry-run
+acd support recover --yes
+acd support recover --force --dry-run
+acd support recover --force --yes
 ~~~
 
 - Reconcile from the earliest unpublished seq for one exact `(branch_ref,generation)`. Resolve transitive rename closure; strip seed-represented prefixes; fail safely above 4096 context events, 4096 ancestry commits, or 64 proof commits. Context is materialization-only.
@@ -150,29 +150,29 @@ acd fix --force --yes
 - Recovery refs include a 96-bit SHA-256 target digest: archive hashes `baseHead + NUL + treeOID`; published hashes `commitOID`.
 - Dead-ref recovery locks proof ref and expected-absent branch in one `git update-ref --stdin` transaction held through SQLite transition.
 - Archive recovery invalidates the exact shadow pair, reseeds from HEAD, and recaptures dirty work. Reconciliation never changes live HEAD/index/worktree.
-- `acd fix` defaults dry-run. Apply acquires daemon ownership after consent, rechecks daemon/HEAD/git-op/pause, refuses a live owner, then makes a WAL-consistent `VACUUM INTO` backup verified by `PRAGMA quick_check`.
+- `acd support recover` defaults dry-run. Apply acquires daemon ownership after consent, rechecks daemon/HEAD/git-op/pause, refuses a live owner, then makes a WAL-consistent `VACUUM INTO` backup verified by `PRAGMA quick_check`.
 - `--force` is archive-only exact-chain recovery, not captured-work purge. `commit-all` reconciles before reseed.
 - Dry-run/decline/JSON without `--yes` must not open writable state, lock, create refs, capture, or build providers.
-- `acd recover` and `acd purge-events` are hidden/deprecated. Only explicit purge `--all` delegates archive-only whole-repo recovery.
+- `acd fix`, `acd recover`, and `acd purge-events` are hidden compatibility commands. Only explicit purge `--all` delegates archive-only whole-repo recovery.
 - Published pruning defaults to 7 days, preserves rename-aware recovery closure and unresolved terminals, and prunes recovered members only while their recovery ref is verified/locked.
-- `acd resume --yes` removes only manual pause. Restore/archive runbooks: `docs/user-workflows.md`.
+- `acd off` and `acd on` are the public lifecycle commands. Hidden `pause` and `resume` aliases preserve legacy manual-pause behavior; `resume --yes` removes only that manual pause. Restore/archive runbooks: `docs/user-workflows.md`.
 
 ## CLI, observability and run loop
 
 - Keep `processBranchTokenChange` before capture and after flush drain. Branch settle 100ms; flush drain 256; startup fails acknowledged flushes older than 5m.
 - fsnotify is opt-in; poll is the safety net. The first event wakes immediately; bursts use a 100ms trailing wake with a 500ms hard limit. The 750ms safety poll doubles while idle to 2m. Dispatch never blocks; rewalk/diagnostics use replaceable worker channels; budget exhaustion falls back to poll.
 - Bare `acd` is read-only health. Active-tail terminal events mean `needs_attention`; historical terminals do not. `acd on` is idempotent but returns nonzero if still unhealthy. `acd off` disables/stops and preserves state.
-- `events`, `explain`, `status`, `diagnose`, and `doctor` read paths use read-only SQLite and never migrate/create tables.
+- `acd history activity`, `acd history explain`, `acd status`, `acd support diagnose`, and `acd doctor` read paths use read-only SQLite and never migrate/create tables.
 - Status/diagnose/doctor expose self-publication phase, canonical owners, remediation (`automatic_recovery`, `stop_old_owner`, `needs_attention`), intent windows/circuit/candidates/repair, and runtime revisions/experiments.
 - Start cache/registry may bypass control lock, migration, and registry rewrite. Manual session: `human:<repoHash>`; harness starts require `--session-id`.
-- Autodiscovery defaults enabled; override `${XDG_CONFIG_HOME:-$HOME/.config}/acd/config.json` or `ACD_REPO_AUTODISCOVERY`. Invalid policy skips hooks but errors for manual callers; `acd repo init` registers explicitly.
-- `repo disable` stops, clears caches, preserves DB; hooks skip `repo_disabled`; `repo enable` only clears disabled state.
+- Repository autodiscovery settings are deprecated and never grant consent. `acd on` registers and enables one repository explicitly; integrations only start repositories already enabled.
+- `acd off` stops the worker and preserves the database; hooks skip disabled repositories. `acd on` enables the repository again.
 - Canonicalize with `git.ResolveWorktree`; reject non-worktrees. Git helper limits: read 30s, write 60s, diff 1 MiB. Ambiguous revision is `git.ErrRefAmbiguous`. Pin `ps` to `/bin/ps` on Darwin and `/usr/bin/ps` on Linux.
-- Logs: `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<repo-hash>/daemon.log`; hooks: `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log`. `logs --follow` continues from initial-tail EOF.
-- `events --watch` starts at ledger tail unless `--since`; rewrite progress uses stderr.
+- Logs: `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<repo-hash>/daemon.log`; hooks: `${XDG_STATE_HOME:-$HOME/.local/state}/acd/<harness>-hook.log`. `acd support logs --follow` continues from initial-tail EOF.
+- `acd history activity --watch` starts at ledger tail unless `--since`; rewrite progress uses stderr.
 - `ACD_TRACE=1` writes best-effort JSONL to `<gitDir>/acd/trace/YYYY-MM-DD.jsonl` or `ACD_TRACE_DIR`; never block/abort.
 - Providers declare `NeedsDiff`; network diff requires `NeedsDiff=true` and truthy `ACD_AI_DIFF_EGRESS`, after redaction/truncation. Removed `ACD_AI_SEND_DIFF` warns once.
-- Probes: `acd status --repo .`, `acd events --watch`, `acd logs --repo . --lines 50 --follow`, `acd diagnose --repo . --json`, `acd doctor --repo . --json`, `git status --short --ignored`.
+- Probes: `acd status --repo .`, `acd history activity --watch`, `acd support logs --repo . --lines 50 --follow`, `acd support diagnose --repo . --json`, `acd doctor --repo . --json`, `git status --short --ignored`.
 
 ## Harness templates
 
@@ -193,11 +193,11 @@ acd fix --force --yes
 
 ## Environment
 
-`acd configure` owns regular setup; `acd settings` persists advanced non-secret values and shows environment shadowing. Hot settings apply at the next safe boundary; restart-required fields need daemon restart.
+`acd setup` owns installation and guided onboarding; `acd config edit` persists advanced non-secret values and shows environment shadowing. Hot settings apply at the next safe boundary; restart-required fields need daemon restart.
 
 | Group | Variables/defaults |
 |---|---|
-| Repo | `ACD_REPO_AUTODISCOVERY=enabled`; durable `${XDG_CONFIG_HOME:-$HOME/.config}/acd/config.json` |
+| Repo | Deprecated `ACD_REPO_AUTODISCOVERY` never grants consent; `acd on` enables one repository; durable `${XDG_CONFIG_HOME:-$HOME/.config}/acd/config.json` |
 | Trace | `ACD_TRACE=off`; `ACD_TRACE_DIR=<gitDir>/acd/trace`; `ACD_AI_PROMPT_TRACE=off` (sensitive) |
 | Recovery | `ACD_SHADOW_RETENTION_GENERATIONS=1`; `ACD_REWIND_GRACE_SECONDS=60`; `ACD_KEEP_DEAD_BRANCH_BARRIERS` |
 | Capture | `ACD_MAX_FILE_BYTES=5 MiB`; `ACD_MAX_PENDING_EVENTS=50000`; `ACD_PATH_QUIESCENCE_SECONDS=0`; `ACD_EVENT_RETENTION_DAYS=7`; sensitive/safe-ignore variables |
