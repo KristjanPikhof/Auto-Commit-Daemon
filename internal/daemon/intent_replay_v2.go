@@ -352,6 +352,11 @@ func replayIntentCandidateBatch(
 			// provider remains unavailable.
 			sum.HasMore = publicationDrainMessageRewriteWait(
 				opts, cfg, evaluation)
+		} else if intentEvaluationAwaitingCheckpointRecovery(evaluation) {
+			sum.SkippedReason = "intent_v2_verification_recovery"
+			sum.Disposition = ReplayDispositionRecoverableStall
+			sum.DispositionReason =
+				"verification failed; automatic checkpoint replanning is pending"
 		} else if evaluation.NeedsAttention {
 			sum.SkippedReason = "intent_v2_needs_attention"
 			sum.Disposition = ReplayDispositionNeedsAttention
@@ -361,6 +366,33 @@ func replayIntentCandidateBatch(
 		}
 	}
 	return sum, nil
+}
+
+// intentEvaluationAwaitingCheckpointRecovery distinguishes an exact
+// verification miss from a terminal planning failure. A ready semantic group
+// that failed verification remains a waiting candidate; bounded deferral then
+// promotes its completed checkpoint to semantic replanning.
+func intentEvaluationAwaitingCheckpointRecovery(
+	evaluation IntentCandidateEvaluationResult,
+) bool {
+	if !evaluation.NeedsAttention || evaluation.PlannerFailure != "" {
+		return false
+	}
+	recoverable := false
+	for _, decision := range evaluation.Decisions {
+		if decision.Publishable ||
+			decision.Assignment.Readiness != ai.IntentCandidateReady {
+			continue
+		}
+		candidate := decision.Candidate
+		if candidate.Status != state.IntentCandidateWaiting ||
+			!candidate.VerificationStatus.Valid ||
+			candidate.VerificationStatus.String != "failed" {
+			return false
+		}
+		recoverable = true
+	}
+	return recoverable
 }
 
 func publicationDrainMessageRewriteWait(

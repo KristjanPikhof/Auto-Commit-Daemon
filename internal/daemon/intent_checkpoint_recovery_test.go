@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -69,6 +70,51 @@ const stalledCheckpointCandidateID = "checkpoint-stalled-candidate"
 type failedCheckpointReplayFixture struct {
 	capture *captureFixture
 	seqs    []int64
+}
+
+func TestIntentEvaluationAwaitingCheckpointRecovery(t *testing.T) {
+	recoverable := IntentCandidateEvaluationResult{
+		NeedsAttention: true,
+		Decisions: []IntentCandidateDecision{{
+			Assignment: ai.IntentCandidateAssignment{
+				Readiness: ai.IntentCandidateReady,
+			},
+			Candidate: state.IntentCandidate{
+				Status: state.IntentCandidateWaiting,
+				VerificationStatus: sql.NullString{
+					String: "failed", Valid: true,
+				},
+			},
+		}},
+	}
+	if !intentEvaluationAwaitingCheckpointRecovery(recoverable) {
+		t.Fatal("failed verification was not classified as automatic recovery")
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*IntentCandidateEvaluationResult)
+	}{
+		{name: "planner failure", mutate: func(result *IntentCandidateEvaluationResult) {
+			result.PlannerFailure = "provider rejected the plan"
+		}},
+		{name: "blocked candidate", mutate: func(result *IntentCandidateEvaluationResult) {
+			result.Decisions[0].Candidate.Status = state.IntentCandidateBlocked
+		}},
+		{name: "non-verification failure", mutate: func(result *IntentCandidateEvaluationResult) {
+			result.Decisions[0].Candidate.VerificationStatus.String = "needs_attention"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := recoverable
+			result.Decisions = append([]IntentCandidateDecision(nil),
+				recoverable.Decisions...)
+			test.mutate(&result)
+			if intentEvaluationAwaitingCheckpointRecovery(result) {
+				t.Fatalf("%s was classified as automatic recovery", test.name)
+			}
+		})
+	}
 }
 
 func seedFailedCheckpointReplayFixture(t *testing.T) failedCheckpointReplayFixture {
@@ -154,6 +200,35 @@ func TestReplayIntentCandidateRecoversBeforeForcedPreflightFailure(t *testing.T)
 	f := fixture.capture
 	seqs := fixture.seqs
 	ctx := context.Background()
+	oldSeq, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration - 1,
+		BaseHead: f.cctx.BaseHead, Operation: "modify",
+		Path: "resolved-old-generation.go", Fidelity: "exact",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state='recovered',published_ts=1 WHERE seq=?`,
+		oldSeq); err != nil {
+		t.Fatal(err)
+	}
+	oldRecovery := state.IntentForwardRecovery{
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration - 1,
+		CandidateID:      "resolved-old-generation-candidate",
+		Reason:           "repair_commit_outside_suffix", Stage: "local_unlock",
+		TargetEventSeqs: []int64{oldSeq},
+	}
+	oldRecoveryRaw, err := json.Marshal(oldRecovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.SQL().ExecContext(ctx, `
+INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,1)`,
+		"intent.v2.forward_recovery", string(oldRecoveryRaw)); err != nil {
+		t.Fatal(err)
+	}
 
 	planner := &failedCheckpointRecoveryPlanner{
 		stalledCandidateID: stalledCheckpointCandidateID,
@@ -223,6 +298,11 @@ func TestReplayIntentCandidateRecoversBeforeForcedPreflightFailure(t *testing.T)
 		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
 	); err != nil || active {
 		t.Fatalf("forward recovery marker active=%t err=%v", active, err)
+	}
+	if _, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, oldRecovery.BranchRef, oldRecovery.BranchGeneration,
+	); err != nil || active {
+		t.Fatalf("old generation recovery marker active=%t err=%v", active, err)
 	}
 	var publishedCommit string
 	for _, seq := range seqs {
@@ -610,7 +690,7 @@ func TestUpdateIntentForwardRecoveryPreservesTransientWaitStage(t *testing.T) {
 	}
 }
 
-func TestReplayClearsResolvedIntentCheckpointRecoveryAfterRestart(t *testing.T) {
+func TestReplayClearsResolvedOlderIntentCheckpointRecoveryAfterRestart(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	for path, contents := range map[string]string{
@@ -673,11 +753,13 @@ WHERE seq IN (?,?)`, seqs[0], seqs[0], f.cctx.BaseHead,
 		seqs[0], seqs[1]); err != nil {
 		t.Fatal(err)
 	}
+	newGenerationCtx := f.cctx
+	newGenerationCtx.BranchGeneration++
 
 	headBefore := strings.TrimSpace(mustGitOutput(t, f.dir, "rev-parse", "HEAD"))
 	statusBefore := mustGitOutput(t, f.dir, "status", "--porcelain")
 	diffBefore := mustGitOutput(t, f.dir, "diff", "--binary")
-	result, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+	result, err := Replay(ctx, f.dir, f.db, newGenerationCtx, ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
 		IntentPlanner: ai.DeterministicProvider{}, IntentPreset: config.PresetBalanced,
 		RequireCompletedCheckpoint: true,

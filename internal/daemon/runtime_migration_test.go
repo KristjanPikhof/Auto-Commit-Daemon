@@ -375,7 +375,7 @@ func TestSetRuntimeMetaIfChangedDoesNotRewriteEqualValues(t *testing.T) {
 	}
 }
 
-func TestIntentV2EvaluationMetaPreservesUnresolvedVerificationAttention(t *testing.T) {
+func TestIntentV2EvaluationMetaTreatsFailedVerificationAsRecovering(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 	capture := appendIntentCandidateCapture(
@@ -404,8 +404,8 @@ func TestIntentV2EvaluationMetaPreservesUnresolvedVerificationAttention(t *testi
 	}
 	attention, ok, err := state.MetaGet(
 		ctx, db, "intent.v2.needs_attention")
-	if err != nil || !ok || attention == "" {
-		t.Fatalf("verification attention=%q ok=%v err=%v",
+	if err != nil || !ok || attention != "" {
+		t.Fatalf("recoverable verification attention=%q ok=%v err=%v",
 			attention, ok, err)
 	}
 	migration, _, _ := state.MetaGet(ctx, db, metaIntentV2MigrationState)
