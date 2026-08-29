@@ -499,6 +499,7 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 }
 
 func TestActiveIntentRecoveryShowsOpenProviderWait(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
 	ctx := context.Background()
 	_, _, db := makeRepoStateDB(t)
 	now := time.Unix(1_000, 0)
@@ -510,7 +511,7 @@ func TestActiveIntentRecoveryShowsOpenProviderWait(t *testing.T) {
 		state.IntentForwardRecovery{
 			BranchRef: "refs/heads/main", BranchGeneration: 7,
 			CandidateID: "failed-candidate", Stage: "semantic_replan",
-			TargetEventSeqs: seqs, LastProgressTS: 900,
+			TargetEventSeqs: seqs, LastProgressTS: 600,
 		}); err != nil {
 		t.Fatal(err)
 	}
@@ -560,16 +561,49 @@ func TestActiveIntentRecoveryShowsOpenProviderWait(t *testing.T) {
 		t.Fatalf("provider-wait recovery control=%+v", result)
 	}
 
-	// Half-open owns the sole provider probe lease, so the active recovery
-	// phase remains visible while that request is in flight.
+	// Half-open owns the sole provider probe lease. Even an old recovery target
+	// is actively waiting on that one request, not stalled.
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET captured_ts=600 WHERE seq=?`, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET updated_ts=600 WHERE key=?`,
+		"intent.v2.forward_recovery"); err != nil {
+		t.Fatal(err)
+	}
 	report.IntentStrategy.PlannerHealth.State = daemon.IntentPlannerCircuitHalfOpen
 	halfOpen, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if halfOpen.Phase != "intent_replanning" ||
-		halfOpen.WaitRemainingSeconds != 0 {
-		t.Fatalf("half-open recovery progress=%+v", halfOpen)
+	halfOpenEntry := productListEntry{PublicationProgress: halfOpen}
+	if halfOpen.Phase != "provider_call" ||
+		halfOpen.WaitRemainingSeconds != 0 ||
+		halfOpen.LastProgressAgeSeconds < halfOpen.StallThresholdSeconds ||
+		productListTarget(halfOpenEntry) != "recover:1/1" ||
+		productListPhase(halfOpenEntry) != "provider-call" ||
+		productListStatus(halfOpenEntry) != "working" {
+		t.Fatalf("half-open recovery progress=%+v phase=%q status=%q",
+			halfOpen, productListPhase(halfOpenEntry),
+			productListStatus(halfOpenEntry))
+	}
+	var halfOpenHuman bytes.Buffer
+	renderProductPublicationProgress(&halfOpenHuman, halfOpen)
+	if !strings.Contains(halfOpenHuman.String(),
+		"waiting for the current Intent provider response") ||
+		strings.Contains(halfOpenHuman.String(), "retry") {
+		t.Fatalf("half-open recovery status:\n%s", halfOpenHuman.String())
+	}
+	report.PublicationProgress = halfOpen
+	halfOpenResult := controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&halfOpenResult, report, true)
+	if halfOpenResult.Health != controlHealthPublishing ||
+		!strings.Contains(halfOpenResult.Summary,
+			"current Intent provider response") ||
+		!strings.Contains(halfOpenResult.Summary,
+			"recovery target and your work remain protected") {
+		t.Fatalf("half-open recovery control=%+v", halfOpenResult)
 	}
 }
 
@@ -626,6 +660,130 @@ UPDATE daemon_meta SET updated_ts=? WHERE key=?`,
 	if stalled.Phase != "stalled" || stalled.LastProgressTS != staleTS ||
 		stalled.LastProgressAgeSeconds < stalled.StallThresholdSeconds {
 		t.Fatalf("aged marker progress=%+v", stalled)
+	}
+}
+
+func TestActiveIntentVerificationOverridesOldRecoveryProgress(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	now := time.Now()
+	staleTS := float64(now.Add(-5*time.Minute).UnixNano()) / 1e9
+	seqs := insertCompletedCheckpoint(t, db, "cp-active-verification",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStatePending,
+		}})
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET captured_ts=? WHERE seq=?`, staleTS, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		state.IntentForwardRecovery{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			CandidateID: "failed-candidate", Stage: "semantic_replan",
+			TargetEventSeqs: seqs, LastProgressTS: staleTS,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET updated_ts=? WHERE key=?`,
+		staleTS, "intent.v2.forward_recovery"); err != nil {
+		t.Fatal(err)
+	}
+	activity := daemon.IntentVerificationActivity{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CandidateID: "semantic-group", PlanFingerprint: "sha256:plan",
+		RecoveryCandidateID: "failed-candidate",
+		StartedTS:           float64(now.Add(-10*time.Second).UnixNano()) / 1e9,
+	}
+	if err := state.MetaSetJSON(ctx, db,
+		daemon.MetaKeyIntentVerificationActivity, activity); err != nil {
+		t.Fatal(err)
+	}
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 1,
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CheckpointProtectionAvailable: true, Protected: true, Busy: true,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+	}
+	progress, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := productListEntry{PublicationProgress: progress}
+	if progress.Origin != "intent_recovery" || progress.Phase != "verifying" ||
+		progress.TargetRemaining != 1 || progress.TargetTotal != 1 ||
+		progress.VerificationCandidate != activity.CandidateID ||
+		progress.VerificationPlan != activity.PlanFingerprint ||
+		progress.VerificationRecovery != activity.RecoveryCandidateID ||
+		progress.LastProgressAgeSeconds >= progress.StallThresholdSeconds ||
+		productListTarget(entry) != "recover:1/1" ||
+		productListPhase(entry) != "verifying" ||
+		productListStatus(entry) != "working" {
+		t.Fatalf("active verification progress=%+v phase=%q status=%q",
+			progress, productListPhase(entry), productListStatus(entry))
+	}
+	var human bytes.Buffer
+	renderProductPublicationProgress(&human, progress)
+	if !strings.Contains(human.String(), "verifying the semantic group") {
+		t.Fatalf("active verification status:\n%s", human.String())
+	}
+	report.PublicationProgress = progress
+	result := controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.Health != controlHealthPublishing ||
+		!strings.Contains(result.Summary, "verifying the semantic group") ||
+		!strings.Contains(result.Summary,
+			"recovery target and your work remain protected") {
+		t.Fatalf("active verification control=%+v", result)
+	}
+
+	// The activity marker is a progress boundary, not a permanent stall bypass.
+	activity.StartedTS = staleTS
+	if err := state.MetaSetJSON(ctx, db,
+		daemon.MetaKeyIntentVerificationActivity, activity); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET updated_ts=? WHERE key=?`,
+		staleTS, daemon.MetaKeyIntentVerificationActivity); err != nil {
+		t.Fatal(err)
+	}
+	stalled, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled.Phase != "stalled" ||
+		stalled.LastProgressAgeSeconds < stalled.StallThresholdSeconds {
+		t.Fatalf("aged verification marker progress=%+v", stalled)
+	}
+
+	activity.BranchGeneration = 8
+	activity.StartedTS = float64(now.UnixNano()) / 1e9
+	if err := state.MetaSetJSON(ctx, db,
+		daemon.MetaKeyIntentVerificationActivity, activity); err != nil {
+		t.Fatal(err)
+	}
+	mismatched, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mismatched.Phase == "verifying" {
+		t.Fatalf("mismatched verification marker trusted: %+v", mismatched)
+	}
+
+	activity.BranchGeneration = 7
+	if err := state.MetaSetJSON(ctx, db,
+		daemon.MetaKeyIntentVerificationActivity, activity); err != nil {
+		t.Fatal(err)
+	}
+	report.PID = 2_147_483_647
+	deadWorker, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadWorker.WorkerResponsive || deadWorker.Phase == "verifying" {
+		t.Fatalf("dead worker verification marker trusted: %+v", deadWorker)
 	}
 }
 

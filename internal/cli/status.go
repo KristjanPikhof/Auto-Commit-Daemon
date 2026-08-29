@@ -66,6 +66,9 @@ type publicationProgressReport struct {
 	Phase                  string  `json:"phase"`
 	NeedsAttention         bool    `json:"needs_attention,omitempty"`
 	AttentionReason        string  `json:"attention_reason,omitempty"`
+	VerificationCandidate  string  `json:"verification_candidate,omitempty"`
+	VerificationPlan       string  `json:"verification_plan,omitempty"`
+	VerificationRecovery   string  `json:"verification_recovery,omitempty"`
 	QueuePending           int     `json:"queue_pending"`
 	TargetRemaining        int64   `json:"target_remaining,omitempty"`
 	TargetTotal            int64   `json:"target_total,omitempty"`
@@ -564,6 +567,7 @@ func buildPublicationProgressReport(
 	activeDrain := drain.ID != "" &&
 		drain.Phase != state.PublicationDrainCompleted
 	activeIntentRecovery := false
+	activeIntentVerification := false
 	if activeDrain {
 		progress.Origin = "commit_all"
 		progress.TargetRemaining = drain.RemainingEvents
@@ -639,6 +643,21 @@ func buildPublicationProgressReport(
 			progress.LastProgressTS = lastProgress
 		}
 	}
+	verification, verificationUpdatedTS, verificationActive, err :=
+		readIntentVerificationActivityProgress(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+	if err != nil {
+		return progress, err
+	}
+	if verificationActive && progress.WorkerResponsive {
+		activeIntentVerification = true
+		progress.VerificationCandidate = verification.CandidateID
+		progress.VerificationPlan = verification.PlanFingerprint
+		progress.VerificationRecovery = verification.RecoveryCandidateID
+		if verificationUpdatedTS > progress.LastProgressTS {
+			progress.LastProgressTS = verificationUpdatedTS
+		}
+	}
 	if progress.Phase != "needs_action" {
 		manualPause := report.Paused &&
 			(report.Pause == nil || report.Pause.Source != "rewind_grace")
@@ -651,6 +670,10 @@ func buildPublicationProgressReport(
 			progress.WaitRemainingSeconds = report.Pause.RemainingSeconds
 		case report.Configuration.Configuration == "validating":
 			progress.Phase = "config_wait"
+		case activeIntentVerification:
+			progress.Phase = "verifying"
+			progress.WaitRemainingSeconds = 0
+			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery && intentProviderCallActive(report):
 			progress.Phase = "provider_call"
 			progress.WaitRemainingSeconds = 0
@@ -707,9 +730,7 @@ func intentProviderWaitActive(report statusReport) bool {
 		return true
 	}
 	health := report.IntentStrategy.PlannerHealth
-	return health != nil &&
-		(health.State == daemon.IntentPlannerCircuitOpen ||
-			health.State == daemon.IntentPlannerCircuitHalfOpen)
+	return health != nil && health.State == daemon.IntentPlannerCircuitOpen
 }
 
 func intentProviderCallActive(report statusReport) bool {
@@ -765,11 +786,47 @@ func ageExceedsThreshold(ageSeconds int64, threshold time.Duration) bool {
 func publicationPhaseCanStall(phase string) bool {
 	switch phase {
 	case "working", "intent_planning", "intent_replanning", "intent_processing",
-		"local_fallback", "event_publishing":
+		"local_fallback", "verifying", "event_publishing":
 		return true
 	default:
 		return false
 	}
+}
+
+func readIntentVerificationActivityProgress(
+	ctx context.Context,
+	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
+) (daemon.IntentVerificationActivity, float64, bool, error) {
+	var activity daemon.IntentVerificationActivity
+	if conn == nil || strings.TrimSpace(branchRef) == "" || branchGeneration < 0 {
+		return activity, 0, false, nil
+	}
+	var raw string
+	var updatedTS float64
+	err := conn.QueryRowContext(ctx, `
+SELECT value, updated_ts
+FROM daemon_meta
+WHERE key=?`, daemon.MetaKeyIntentVerificationActivity).Scan(&raw, &updatedTS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return activity, 0, false, nil
+	}
+	if err != nil {
+		return activity, 0, false, err
+	}
+	activity, err = daemon.DecodeIntentVerificationActivity(raw)
+	if err != nil {
+		return activity, 0, false, err
+	}
+	if activity.BranchRef != branchRef ||
+		activity.BranchGeneration != branchGeneration {
+		return activity, 0, false, nil
+	}
+	if activity.StartedTS > updatedTS {
+		updatedTS = activity.StartedTS
+	}
+	return activity, updatedTS, true, nil
 }
 
 func readIntentForwardRecoveryProgress(
