@@ -252,7 +252,16 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 		}
 		return "publishing one safe local group, then returning to Intent"
 	case "provider_wait":
+		if progress.WaitRemainingSeconds > 0 {
+			return fmt.Sprintf("waiting for the Intent provider retry (%s remaining)",
+				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
+		}
+		if progress.Origin == "intent_recovery" {
+			return "waiting for the Intent provider before continuing automatic recovery"
+		}
 		return "waiting for the Intent provider to write a semantic commit message"
+	case "provider_call":
+		return "waiting for the current Intent provider response"
 	case "stalled":
 		if progress.Origin == "intent_recovery" {
 			return "automatic Intent recovery active; no target movement yet"
