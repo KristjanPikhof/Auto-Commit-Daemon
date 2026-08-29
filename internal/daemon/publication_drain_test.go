@@ -209,6 +209,97 @@ func TestIntentForwardRecoveryPrefixFollowsSemanticTopology(t *testing.T) {
 	}
 }
 
+func TestResolvedIntentForwardRecoveryPlanUsesStoredMembership(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		candidates  func([]state.CaptureEvent) []ai.IntentCandidateAssignment
+		wantValid   bool
+		wantPartial bool
+	}{
+		{
+			name: "resolved target member predates plan",
+			candidates: func(events []state.CaptureEvent) []ai.IntentCandidateAssignment {
+				return []ai.IntentCandidateAssignment{
+					semanticPlanTestCandidate("remaining-a", events[1].Seq),
+					semanticPlanTestCandidate("remaining-b", events[2].Seq),
+				}
+			},
+			wantValid: true,
+		},
+		{
+			name: "stored candidate partially resolved",
+			candidates: func(events []state.CaptureEvent) []ai.IntentCandidateAssignment {
+				return []ai.IntentCandidateAssignment{
+					semanticPlanTestCandidate(
+						"partial", events[0].Seq, events[1].Seq),
+					semanticPlanTestCandidate("remaining", events[2].Seq),
+				}
+			},
+			wantPartial: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, events, _ := openPublicationDrainTestState(t, 3, 3)
+			if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',published_ts=1,commit_oid='already-published'
+WHERE seq=?`, events[0].Seq); err != nil {
+				t.Fatal(err)
+			}
+			fingerprint := "stored-membership-" + strings.ReplaceAll(
+				test.name, " ", "-")
+			plan := ai.IntentPlanV2{
+				ProtocolVersion: ai.IntentPlannerProtocolV2,
+				Candidates:      test.candidates(events),
+			}
+			run, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
+				Fingerprint: fingerprint, BranchRef: "refs/heads/main",
+				BranchGeneration: 7, AttemptLimit: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := storeResolvedIntentPlanRun(&run, plan, nil); err != nil {
+				t.Fatal(err)
+			}
+			run.Completed = true
+			if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+				t.Fatal(err)
+			}
+			loaded, valid, partial, err := resolvedIntentForwardRecoveryPlan(
+				ctx, db, state.IntentForwardRecovery{
+					BranchRef: "refs/heads/main", BranchGeneration: 7,
+					PlanFingerprint: fingerprint,
+					TargetEventSeqs: []int64{
+						events[0].Seq, events[1].Seq, events[2].Seq,
+					},
+				})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if valid != test.wantValid || partial != test.wantPartial {
+				t.Fatalf("loaded=(%+v valid=%t partial=%t)",
+					loaded, valid, partial)
+			}
+		})
+	}
+}
+
+func semanticPlanTestCandidate(
+	id string,
+	seqs ...int64,
+) ai.IntentCandidateAssignment {
+	return ai.IntentCandidateAssignment{
+		CandidateID: id, SelectedSeqs: seqs,
+		Purpose:   "preserve the provider semantic group",
+		Readiness: ai.IntentCandidateReady,
+		Subject:   "Preserve semantic group",
+		GroupingReason: "the provider selected this exact reviewable " +
+			"membership",
+	}
+}
+
 func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	health := &IntentPlannerHealth{
