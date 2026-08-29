@@ -6,7 +6,7 @@
 //
 // Defaults:
 //   - Base:          750ms
-//   - IdleCeiling:   30s
+//   - IdleCeiling:   2m
 //   - ErrorCeiling:  60s
 //
 // Tests can construct a Scheduler with smaller bases/ceilings to keep the
@@ -18,7 +18,7 @@ import "time"
 // Default scheduler knobs per §8.6.
 const (
 	DefaultSchedulerBase         = 750 * time.Millisecond
-	DefaultSchedulerIdleCeiling  = 30 * time.Second
+	DefaultSchedulerIdleCeiling  = 2 * time.Minute
 	DefaultSchedulerErrorCeiling = 60 * time.Second
 )
 

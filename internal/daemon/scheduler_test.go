@@ -82,6 +82,9 @@ func TestScheduler_ResetReturnsBase(t *testing.T) {
 // production defaults.
 func TestScheduler_ZeroFieldsUseDefaults(t *testing.T) {
 	s := Scheduler{}
+	if DefaultSchedulerIdleCeiling != 2*time.Minute {
+		t.Fatalf("idle safety poll=%v want 2m", DefaultSchedulerIdleCeiling)
+	}
 	if got := s.Reset(); got != DefaultSchedulerBase {
 		t.Fatalf("default Reset=%v want %v", got, DefaultSchedulerBase)
 	}
