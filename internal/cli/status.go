@@ -241,6 +241,21 @@ func matchesStateDB(actual string, expected []string) bool {
 	return false
 }
 
+func countUnresolvedCompletedCheckpoints(ctx context.Context, conn *sql.DB) (int, error) {
+	var count int
+	err := conn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM checkpoints cp
+WHERE cp.phase='completed'
+  AND EXISTS (
+      SELECT 1
+      FROM checkpoint_events ce
+      JOIN capture_events e ON e.seq=ce.event_seq
+      WHERE ce.checkpoint_id=cp.id AND e.state NOT IN (?, ?)
+  )`, state.EventStatePublished, state.EventStateRecovered).Scan(&count)
+	return count, err
+}
+
 // buildStatusReport opens the per-repo state.db read-only and projects the
 // daemon_state + daemon_clients + last commit + meta rows into a flat
 // report struct. Never mutates state.
@@ -303,20 +318,11 @@ SELECT
 FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 			return report, fmt.Errorf("checkpoint phases: %w", err)
 		}
-		if err := conn.QueryRowContext(ctx, `
-SELECT COUNT(*)
-FROM checkpoints cp
-WHERE cp.phase='completed'
-  AND EXISTS (
-      SELECT 1
-      FROM checkpoint_events ce
-      JOIN capture_events e ON e.seq=ce.event_seq
-      WHERE ce.checkpoint_id=cp.id AND e.state NOT IN (?, ?)
-  )`, state.EventStatePublished, state.EventStateRecovered).Scan(
-			&report.UnpublishedCheckpoints,
-		); err != nil {
+		unresolved, err := countUnresolvedCompletedCheckpoints(ctx, conn)
+		if err != nil {
 			return report, fmt.Errorf("unpublished checkpoints: %w", err)
 		}
+		report.UnpublishedCheckpoints = unresolved
 		report.Protected = complete && report.LatestCheckpointID != "" &&
 			report.ObservationEpoch == report.CoveredEpoch &&
 			prepared == 0 && needsAction == 0
