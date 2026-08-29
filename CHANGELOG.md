@@ -16,8 +16,9 @@
   cycle.
 - A repeatedly failed Intent candidate no longer hides later captures that may
   complete it. ACD first looks ahead for new companion paths, then can retire
-  the unpublished candidate and replan its exact completed checkpoint. Partial
-  planner retries also start from a clean scratch baseline.
+  the unpublished failed groups and replan the bounded set of completed
+  checkpoints they overlap. Partial planner retries also start from a clean
+  scratch baseline.
 
 ## v2026-08-27
 

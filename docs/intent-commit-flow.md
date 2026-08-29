@@ -170,10 +170,11 @@ after a publication target was frozen stay pending for the next semantic plan.
 
 An unpublished candidate that repeatedly fails verification cannot hold the
 queue forever. ACD lets later paths reach the planner first. If that still
-makes no progress, it can supersede only the failed candidate and replan the
-single completed checkpoint that contains it. This recovery requires every
-checkpoint capture to remain pending on the same branch generation and refuses
-to run while a publication or repair transaction is active.
+makes no progress, it follows the bounded overlap between failed groups and
+their completed checkpoints, retires those unpublished groups together, and
+replans the exact protected set. Every capture must still be pending on the
+same branch generation. A healthy overlapping group or an active publication
+or repair transaction stops recovery rather than weakening its boundary.
 
 Balanced/Quality repair is restricted to a private contiguous ACD-authored
 first-parent suffix at exact `HEAD`; it rejects merges, tags, other refs, Git
