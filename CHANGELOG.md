@@ -17,9 +17,11 @@
 - A repeatedly failed Intent candidate no longer hides later captures that may
   complete it. ACD first looks ahead for new companion paths, then can retire
   the unpublished failed groups and replan the bounded set of completed
-  checkpoints they overlap. Recovery stays active until every frozen capture
-  is resolved, including when an earlier pass published only part of a
-  checkpoint. Partial planner retries also start from a clean scratch baseline.
+  checkpoints they overlap. Once recovery is due, capture order takes priority
+  over planner timestamps, so unrelated newer work cannot starve the failed
+  group. Recovery stays active until every frozen capture is resolved,
+  including when an earlier pass published only part of a checkpoint. Partial
+  planner retries also start from a clean scratch baseline.
 
 ## v2026-08-27
 
