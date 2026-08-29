@@ -1127,13 +1127,17 @@ func AdvanceIntentForwardRecoveryPrefix(
 	baseHead string,
 	prefixCursor int,
 ) (IntentForwardRecovery, error) {
+	planLabelErr := boundedIntentLabel(
+		"intent recovery plan fingerprint", planFingerprint, 128, true)
+	baseLabelErr := boundedIntentLabel(
+		"intent recovery prefix base HEAD", baseHead, 128, true)
 	if d == nil || recovery.BranchRef == "" || recovery.BranchGeneration < 0 ||
 		recovery.CandidateID == "" ||
 		(normalizedIntentForwardRecoveryStage(recovery.Stage) != "semantic_replan" &&
 			normalizedIntentForwardRecoveryStage(recovery.Stage) != "local_unlock") ||
-		strings.TrimSpace(planFingerprint) == "" ||
+		planLabelErr != nil || baseLabelErr != nil ||
 		planFingerprint != strings.TrimSpace(planFingerprint) ||
-		strings.TrimSpace(baseHead) == "" || baseHead != strings.TrimSpace(baseHead) ||
+		baseHead != strings.TrimSpace(baseHead) ||
 		prefixCursor < 1 || prefixCursor > IntentCandidateMaxOpenPerPair ||
 		len(recovery.TargetEventSeqs) == 0 {
 		return recovery, errors.New(
@@ -1195,11 +1199,13 @@ func MarkIntentForwardRecoveryNeedsAttention(
 	reason string,
 ) (IntentForwardRecovery, error) {
 	reason = strings.TrimSpace(reason)
+	reasonErr := boundedIntentSummary(
+		"intent recovery attention reason", reason,
+		IntentCandidateSummaryMaxChars)
 	if d == nil || recovery.BranchRef == "" || recovery.BranchGeneration < 0 ||
 		recovery.CandidateID == "" || recovery.Stage != "local_unlock" ||
 		recovery.PlanFingerprint == "" || recovery.PrefixCursor < 1 ||
-		recovery.PrefixBaseHead == "" || reason == "" ||
-		len(reason) > IntentCandidateSummaryMaxChars {
+		recovery.PrefixBaseHead == "" || reason == "" || reasonErr != nil {
 		return recovery, errors.New(
 			"state: MarkIntentForwardRecoveryNeedsAttention: invalid input")
 	}
