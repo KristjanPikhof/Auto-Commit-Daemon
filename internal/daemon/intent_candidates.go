@@ -95,6 +95,8 @@ type IntentCandidateEvaluation struct {
 	Now                  time.Time
 	TargetEventSeqs      []int64
 	RejectLocalFallback  bool
+	RecoveryCandidateID  string
+	planFingerprint      string
 	allowSemanticPlan    bool
 }
 
@@ -334,6 +336,7 @@ func EvaluateIntentCandidates(
 	result.PreservedGroupCount = len(planRun.PreservedGroups)
 	result.ResolutionMode = planRun.ResolutionMode.String
 	result.PlanFingerprint = planRun.Fingerprint
+	input.planFingerprint = result.PlanFingerprint
 	result.NeedsAttention = needsAttention
 	if input.RejectLocalFallback &&
 		(result.Fallback != "" || result.PlannerFailure != "") {
@@ -453,7 +456,7 @@ func EvaluateIntentCandidates(
 			result.NeedsAttention = true
 			continue
 		}
-		decision, err := evaluateIntentCandidateAssignment(ctx, input, plan,
+		decision, err := evaluateIntentCandidateAssignment(ctx, db, input, plan,
 			assignment, evaluationDependencies, existingByID, captureBySeq)
 		if err != nil {
 			return result, err
@@ -2241,6 +2244,7 @@ func cloneIntentPlanV2(plan ai.IntentPlanV2) ai.IntentPlanV2 {
 
 func evaluateIntentCandidateAssignment(
 	ctx context.Context,
+	db *state.DB,
 	input IntentCandidateEvaluation,
 	plan ai.IntentPlanV2,
 	assignment ai.IntentCandidateAssignment,
@@ -2353,8 +2357,13 @@ func evaluateIntentCandidateAssignment(
 			"approved candidate verification has not run"))
 	} else {
 		var verifyErr error
-		verificationResult, verifyErr = input.Verify(
-			ctx, assignment, candidateCaptures)
+		verificationResult, verifyErr = runIntentCandidateVerificationWithActivity(
+			ctx, db, IntentVerificationActivity{
+				BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
+				CandidateID:         assignment.CandidateID,
+				PlanFingerprint:     input.planFingerprint,
+				RecoveryCandidateID: input.RecoveryCandidateID,
+			}, input.Verify, assignment, candidateCaptures)
 		if verifyErr != nil {
 			results = append(results, failedIntentGate(assignment.CandidateID,
 				ai.IntentAtomicityVerification, "verification_failed", verifyErr))
