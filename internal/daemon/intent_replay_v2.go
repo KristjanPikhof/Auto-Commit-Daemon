@@ -135,6 +135,7 @@ func replayIntentCandidateBatch(
 		Now:                 time.Now().UTC(),
 		TargetEventSeqs:     cfg.targetEventSeqs,
 		RejectLocalFallback: cfg.semanticSalvage,
+		RecoveryCandidateID: cfg.forwardRecoveryCandidateID,
 	})
 	sum.PlanFingerprint = evaluation.PlanFingerprint
 	if cfg.forwardRecoveryPlanFingerprint != "" {
@@ -513,6 +514,14 @@ func updateIntentForwardRecoveryAfterReplay(
 		(recovery.Stage == publicationFallbackLocalUnlock &&
 			recovery.PlanFingerprint == "")
 	if replayErr != nil {
+		if isIntentPlannerCircuitWait(replayErr) {
+			sum.Skipped = true
+			sum.SkippedReason = "intent_v2_provider_wait"
+			sum.Disposition = ReplayDispositionTransientWait
+			sum.DispositionReason = replayErr.Error()
+			sum.HasMore = true
+			return sum, nil
+		}
 		var exhausted *IntentSemanticFallbackRequiredError
 		if semanticPass && errors.As(replayErr, &exhausted) {
 			advanced, ok, err := beginIntentForwardRecoveryPrefix(

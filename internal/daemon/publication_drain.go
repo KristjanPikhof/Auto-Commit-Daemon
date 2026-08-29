@@ -598,6 +598,7 @@ func configureIntentForwardRecovery(
 	}
 	cfg.bypassBatchWait = true
 	cfg.pathQuiescence = 0
+	cfg.forwardRecoveryCandidateID = recovery.CandidateID
 	if recovery.Stage == publicationFallbackLocalUnlock && resolvedPlan != nil {
 		configureAtomicIntentFallback(cfg)
 		cfg.forwardRecoveryPlan = *resolvedPlan
@@ -1241,6 +1242,13 @@ func UpdatePublicationDrainAfterReplay(
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
 	if replayErr != nil {
+		if isIntentPlannerCircuitWait(replayErr) {
+			// An open circuit is a timed wait, not evidence that the frozen
+			// semantic target is invalid. Keep the exact phase so the next
+			// half-open probe resumes the same plan automatically.
+			update.LastError = ""
+			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+		}
 		update.LastError = replayErr.Error()
 		var exhausted *IntentSemanticFallbackRequiredError
 		var preflight *IntentPlanPreflightError

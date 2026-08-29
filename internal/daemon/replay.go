@@ -366,7 +366,8 @@ func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
 	case sum.Conflicts > 0 || sum.Failed > 0:
 		sum.Disposition = ReplayDispositionNeedsAttention
 	case replayErr != nil:
-		if errors.Is(replayErr, context.Canceled) {
+		if errors.Is(replayErr, context.Canceled) ||
+			isIntentPlannerCircuitWait(replayErr) {
 			sum.Disposition = ReplayDispositionTransientWait
 		} else {
 			sum.Disposition = ReplayDispositionNeedsAttention
