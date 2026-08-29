@@ -139,9 +139,10 @@ acd commit-all --yes
 ~~~
 
 `list` is the live overview for repository health and commit progress. It always
-shows repositories that need action or are working. The default view fills the
-remaining five-row budget with repositories where ACD most recently handled
-changes. Paused repositories appear only when space remains after recent work.
+shows repositories that need action or are working, waiting, or stalled. The
+default view fills the remaining five-row budget with repositories where ACD
+most recently handled changes. Paused repositories appear only when space
+remains after recent work.
 Use `--all` for every enabled repository and `--verbose` for worker, tool,
 blocker, last commit, and recovery details. A terminal refreshes the same
 screen until Ctrl-C; `--once` prints one snapshot.
