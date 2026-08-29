@@ -42,8 +42,67 @@ func TestIntentObservabilityNewestPlannerErrorWins(t *testing.T) {
 	}
 	if report.LastPlannerErrorEventSeq != 22 ||
 		report.LastPlannerErrorPath != "new.go" ||
-		report.LastPlannerError != "newest validation failure" {
+		report.LastPlannerError != "newest validation failure" ||
+		report.LastPlannerErrorTS != 20 {
 		t.Fatalf("planner error=%+v", report)
+	}
+}
+
+func TestDiagnosePlannerErrorRemediationTracksCurrentHealth(t *testing.T) {
+	healthy := diagnoseReport{
+		PendingDepth: 1,
+		IntentStrategy: intentStrategyReport{
+			EffectiveProvider:        "openai-compat",
+			EffectiveModel:           "gpt-test",
+			LastPlannerError:         "stale validation failure",
+			LastPlannerErrorEventSeq: 22,
+			LastPlannerErrorTS:       100,
+			PlannerHealth: &daemon.IntentPlannerHealthSnapshot{
+				State: daemon.IntentPlannerCircuitClosed,
+			},
+			LastPlannerWindow: &intentPlannerWindowSummary{
+				PlannedTS:      101,
+				Provider:       "openai-compat",
+				Model:          "gpt-test",
+				ResolutionMode: "provider",
+			},
+		},
+	}
+
+	tests := []struct {
+		name       string
+		report     diagnoseReport
+		wantWarn   bool
+		wantPhrase string
+	}{
+		{name: "later healthy provider window", report: healthy},
+		{name: "drained historical error", report: func() diagnoseReport {
+			r := healthy
+			r.PendingDepth = 0
+			return r
+		}()},
+		{name: "pending error not yet recovered", report: func() diagnoseReport {
+			r := healthy
+			window := *r.IntentStrategy.LastPlannerWindow
+			window.PlannedTS = 99
+			r.IntentStrategy.LastPlannerWindow = &window
+			return r
+		}(), wantWarn: true, wantPhrase: "evidence-based local grouping"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			found := strings.Join(diagnoseRemediation(tc.report), "\n")
+			warned := strings.Contains(found, "last failed validation")
+			if warned != tc.wantWarn {
+				t.Fatalf("remediation=%q warned=%t want %t", found, warned, tc.wantWarn)
+			}
+			if tc.wantPhrase != "" && !strings.Contains(found, tc.wantPhrase) {
+				t.Fatalf("remediation=%q missing %q", found, tc.wantPhrase)
+			}
+			if strings.Contains(found, "deterministic fallback") {
+				t.Fatalf("remediation uses obsolete fallback wording: %q", found)
+			}
+		})
 	}
 }
 
@@ -100,7 +159,7 @@ func TestControlTruthStateMatrix(t *testing.T) {
 		{name: "circuit fallback", mutate: func(s *statusReport) {
 			s.IntentStrategy.PlannerHealth = healthOpen
 			s.PendingEvents = 1
-		}, wantState: "fallback", wantHealth: controlHealthDegraded, wantText: "safe local grouping"},
+		}, wantState: "fallback", wantHealth: controlHealthDegraded, wantText: "semantic commit messages are waiting"},
 		{name: "batch wait", mutate: func(s *statusReport) {
 			s.PendingEvents = 2
 			s.IntentStrategy = intentStrategyReport{Active: true, BatchWaitActive: true}
@@ -163,7 +222,8 @@ func TestPublicationDrainStatusDiagnoseDoctorReadOnlyTruth(t *testing.T) {
 	drain := state.PublicationDrain{
 		ID: "drain-cp-truth", CheckpointID: "cp-truth-drain",
 		WorktreeID: "0123456789abcdef", BranchRef: "refs/heads/main",
-		BranchGeneration: 7, Phase: state.PublicationDrainEventFallback,
+		BranchGeneration: 7, CommitStrategy: "event", CommitFormat: "imperative",
+		Provider: "deterministic", Phase: state.PublicationDrainEventFallback,
 		TargetEventCount: 1, SemanticRebuildAttempts: 1,
 		EventFallbackCount: 1, FallbackMode: "atomic_dependency_components",
 		LastError: "sanitized planner failure", StagedConsent: true,
@@ -175,10 +235,36 @@ func TestPublicationDrainStatusDiagnoseDoctorReadOnlyTruth(t *testing.T) {
 		t.Fatalf("prepare drain=(%t,%v)", created, err)
 	}
 	if _, err := db.SQL().ExecContext(ctx, `
-INSERT INTO daemon_state(id,pid,mode,heartbeat_ts,updated_ts)
-VALUES(1,?,'running',?,?)
+INSERT INTO operations(id,kind,worktree_id,phase,status,created_ts,updated_ts)
+VALUES('op-other-drain','checkpoint','0123456789abcdef','completed','completed',3,3);
+INSERT INTO checkpoints(
+ id,seq,operation_id,worktree_id,reason,observation_epoch,coverage_epoch,
+ observed_head,observed_ref,tree_oid,commit_oid,checkpoint_ref,phase,created_ts,completed_ts
+) VALUES(
+ 'cp-other-drain',2,'op-other-drain','0123456789abcdef','manual_barrier',1,1,
+ 'head','refs/heads/other','tree','commit','refs/acd/checkpoints/cp-other-drain','completed',3,3
+)`); err != nil {
+		t.Fatal(err)
+	}
+	otherDrain := state.PublicationDrain{
+		ID: "drain-other-newer", CheckpointID: "cp-other-drain",
+		WorktreeID: "0123456789abcdef", BranchRef: "refs/heads/other",
+		BranchGeneration: 8, CommitStrategy: "event", CommitFormat: "imperative",
+		Provider: "deterministic", Phase: state.PublicationDrainSemantic,
+		CreatedTS: 3, UpdatedTS: 3, LastProgressTS: 3,
+	}
+	if created, err := state.PreparePublicationDrain(
+		ctx, db, otherDrain); err != nil || !created {
+		t.Fatalf("prepare other drain=(%t,%v)", created, err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO daemon_state(
+ id,pid,mode,heartbeat_ts,branch_ref,branch_generation,updated_ts
+)
+VALUES(1,?,'running',?,'refs/heads/main',7,?)
 ON CONFLICT(id) DO UPDATE SET pid=excluded.pid,mode=excluded.mode,
- heartbeat_ts=excluded.heartbeat_ts,updated_ts=excluded.updated_ts`,
+	heartbeat_ts=excluded.heartbeat_ts,branch_ref=excluded.branch_ref,
+	branch_generation=excluded.branch_generation,updated_ts=excluded.updated_ts`,
 		os.Getpid(), time.Now().Unix(), time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
@@ -202,6 +288,14 @@ ON CONFLICT(id) DO UPDATE SET pid=excluded.pid,mode=excluded.mode,
 		!status.PublicationDrain.StagedConsumed {
 		t.Fatalf("status drain=%+v state=%s",
 			status.PublicationDrain, status.OperationalState)
+	}
+	overview, err := readProductListRepo(ctx, rec, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.report.PublicationDrain.ID != drain.ID {
+		t.Fatalf("list drain=%+v, newer other-pair drain=%s",
+			overview.report.PublicationDrain, otherDrain.ID)
 	}
 	diagnose := diagnoseReport{}
 	diagnose.OperationalState = status.OperationalState

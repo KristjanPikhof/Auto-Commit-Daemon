@@ -42,6 +42,12 @@ The human status output keeps the main questions separate:
 | `ACD protection` | Whether background protection is on. |
 | `Current changes protected` | Whether the latest eligible changes have a completed durable checkpoint. |
 | `Published to Git` | Whether all protected changes are now in local Git commits. |
+| `Commit mode` | The configured strategy. A temporary local recovery remains part of Intent mode. |
+| `Publication queue` | All protected changes still waiting for local Git publication. |
+| `Active target` | The bounded remainder of an earlier `commit-all` request, when one exists. |
+| `Publication phase` | The current wait, planning, recovery, or publication step. |
+| `Last queue movement` | Time since durable queue progress; worker heartbeats do not reset it. |
+| `Worker liveness` | Whether the background worker is responsive, reported separately from progress. |
 | `Action needed` | Whether you need to do anything now. |
 | `Status` | What ACD is doing or why it stopped. |
 | `Next` | The next command, or `No action needed.` |
@@ -53,10 +59,11 @@ publication is waiting or needs recovery.
 
 Run `acd doctor`. ACD may be waiting to group related changes, for a Git
 operation to finish, for a project check to pass, or for an AI provider to
-recover. It handles ordinary delays automatically. Doctor tells you when a
-restart or another command is required. Do not delete ACD databases, private
-refs, ownership locks, or sockets. Completed checkpoints remain protected
-while publication waits.
+recover. A failed project check normally starts automatic checkpoint
+replanning; `Publication phase` says so while ACD keeps working. Doctor tells
+you when a restart or another command is actually required. Do not delete ACD
+databases, private refs, ownership locks, or sockets. Completed checkpoints
+remain protected while publication waits.
 
 For an explicit all-changes drain, run:
 
@@ -76,10 +83,11 @@ cannot move, ACD commits the smallest safe dependency group locally, even when
 that group contains one change. It then tries Intent planning again from the
 new `HEAD`. Existing commits are not rewritten.
 
-If the provider is unavailable, ACD keeps making safe local progress and tries
-semantic planning again when the provider circuit permits a probe. Recovery
-also runs during normal background publication. It does not require another
-`commit-all`, a database purge, or a manual Git commit.
+If the configured semantic provider is unavailable, ACD keeps the selected
+local group protected and retries its locked commit message. It does not
+publish a generic filename-based message. Recovery also runs during normal
+background publication. It does not require another `commit-all`, a database
+purge, or a manual Git commit.
 
 This command is also the normal way to let ACD include staged changes. ACD
 verifies the full private checkpoint before clearing the staging area back to
@@ -91,9 +99,9 @@ Later edits are protected normally but do not expand or starve the frozen
 target. Status reports `planning` during pending-only Intent replanning,
 `event_fallback` during one local unlock, and `self_healing` while restoring a
 restart-safe recovery stage. No action is needed in those states. ACD asks for
-attention only when safety proof is impossible, such as failed required
-verification, ambiguous self-publication, an unresolved conflict, a missing
-Git object, an oversized or cyclic hard dependency component, or unsafe branch
+attention only when safety proof is impossible, such as exhausted verification
+recovery, ambiguous self-publication, an unresolved conflict, a missing Git
+object, an oversized or cyclic hard dependency component, or unsafe branch
 ownership. Detached `HEAD`, a manual pause, and an active Git operation wait
 without discarding protected work.
 

@@ -191,6 +191,9 @@ type ReplayOpts struct {
 	// CommitStrategy selects one-event replay or intent-grouped replay. Empty
 	// resolves from ACD_COMMIT_STRATEGY, preserving event replay by default.
 	CommitStrategy ai.CommitStrategy
+	// CommitFormat pins the active immutable runtime revision's message format.
+	// Empty resolves from ACD_COMMIT_FORMAT for direct Replay callers.
+	CommitFormat ai.CommitFormat
 
 	// IntentPlanner chooses selected/deferred capture groups when
 	// CommitStrategy is intent. Nil falls back to the env-selected AI provider,
@@ -317,6 +320,10 @@ type ReplaySummary struct {
 	// PlannerFailure carries the sanitized provider or validation failure that
 	// led to a safe local plan. Durable drains retain it when they escalate.
 	PlannerFailure string
+	// PlanFingerprint names the durable resolved semantic plan evaluated in
+	// this pass. Forward recovery persists it before entering local unlock so
+	// restarts retain the provider's exact candidate ordering.
+	PlanFingerprint string
 	// Disposition classifies the completed pass independently from HasMore.
 	// HasMore is only a scheduler hint; it must never suppress durable
 	// recovery when the visible head of the queue made no progress.
@@ -327,6 +334,11 @@ type ReplaySummary struct {
 	// circuit redirected the pass to a local unlock.
 	RecoveryMode       string
 	PlannerCircuitOpen bool
+	// RecoveryPrefixCandidateCount and RecoveryPrefixTotalCandidates describe
+	// the anchored semantic prefix attempted by local unlock. They are used to
+	// widen verification without falling back to raw capture adjacency.
+	RecoveryPrefixCandidateCount  int
+	RecoveryPrefixTotalCandidates int
 }
 
 // ReplayDisposition describes the outcome of one completed replay pass.
@@ -405,6 +417,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if repoRoot == "" || db == nil {
 		return sum, fmt.Errorf("daemon: Replay: repoRoot and db required")
 	}
+	if err := clearStaleIntentVerificationActivity(ctx, db); err != nil {
+		return sum, fmt.Errorf(
+			"daemon: Replay: clear stale Intent verification activity: %w", err)
+	}
 
 	msgFn := opts.MessageFn
 	if msgFn == nil {
@@ -475,11 +491,79 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if closeIntentPlanner != nil {
 		defer closeIntentPlanner()
 	}
+	resolvedRecovery, resolvedRecoveryCompleted, err :=
+		state.CompleteAnyResolvedIntentForwardRecovery(ctx, db)
+	if err != nil {
+		return sum, err
+	}
+	if resolvedRecoveryCompleted {
+		slog.Default().Info("retired resolved intent forward recovery",
+			"branch_ref", resolvedRecovery.BranchRef,
+			"branch_generation", resolvedRecovery.BranchGeneration,
+			"candidate_id", resolvedRecovery.CandidateID,
+			"mode", resolvedRecovery.Stage,
+			"resolved_events", len(resolvedRecovery.TargetEventSeqs),
+			"reason", resolvedRecovery.Reason)
+	}
 	forwardRecovery, forwardRecoveryActive, err :=
 		state.IntentForwardRecoveryForPair(
 			ctx, db, cctx.BranchRef, cctx.BranchGeneration)
 	if err != nil {
 		return sum, err
+	}
+	if forwardRecoveryActive &&
+		forwardRecovery.Stage == publicationFallbackLocalUnlock &&
+		forwardRecovery.PlanFingerprint != "" &&
+		forwardRecovery.PrefixCursor > 0 &&
+		forwardRecovery.PrefixUnresolvedCount > 0 &&
+		strings.TrimSpace(forwardRecovery.PrefixBaseHead) != "" {
+		previousRecovery := forwardRecovery
+		forwardRecovery, _, err =
+			state.ResetIntentForwardRecoveryPrefixAfterProgress(
+				ctx, db, forwardRecovery)
+		if err != nil {
+			return sum, err
+		}
+		if previousRecovery.Stage != forwardRecovery.Stage {
+			logIntentForwardRecoveryTransition(
+				previousRecovery, forwardRecovery.Stage)
+		}
+	}
+	if forwardRecoveryActive &&
+		(forwardRecovery.NeedsAttention || forwardRecovery.PrefixExhausted) &&
+		forwardRecovery.AttentionReason ==
+			intentForwardRecoveryVerificationExhausted {
+		previousRecovery := forwardRecovery
+		expanded, changed, scannedThrough, expandErr :=
+			expandIntentForwardRecoveryTarget(ctx, db, forwardRecovery)
+		if expandErr != nil {
+			slog.Default().Warn(
+				"exhausted intent forward recovery target expansion was not safe",
+				"candidate_id", forwardRecovery.CandidateID,
+				"err", expandErr.Error())
+		} else if changed {
+			forwardRecovery = expanded
+			logIntentForwardRecoveryTransition(
+				previousRecovery, publicationFallbackSemanticReplan)
+			slog.Default().Info("reopened intent forward recovery",
+				"candidate_id", expanded.CandidateID,
+				"previous_size", len(previousRecovery.TargetEventSeqs),
+				"expanded_size", len(expanded.TargetEventSeqs),
+				"reason", expanded.Reason)
+		} else if scannedThrough >
+			forwardRecovery.ExpansionScannedThroughSeq {
+			recorded, recordErr :=
+				state.RecordIntentForwardRecoveryExpansionScan(
+					ctx, db, forwardRecovery, scannedThrough)
+			if recordErr != nil {
+				slog.Default().Warn(
+					"intent forward recovery scan horizon changed",
+					"candidate_id", forwardRecovery.CandidateID,
+					"err", recordErr.Error())
+			} else {
+				forwardRecovery = recorded
+			}
+		}
 	}
 	if opts.PublicationDrain != nil && intentCfg.enabled {
 		intentCfg.targetEventSeqs = append(
@@ -491,8 +575,44 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			publicationDrainSalvageMode(*opts.PublicationDrain),
 			opts.PublicationDrain.EventSeqs)
 	} else if forwardRecoveryActive && intentCfg.enabled {
-		configureIntentForwardRecovery(&intentCfg, opts.IntentHealth,
-			forwardRecovery.Stage, forwardRecovery.TargetEventSeqs)
+		if forwardRecovery.NeedsAttention || forwardRecovery.PrefixExhausted {
+			sum.Skipped = true
+			sum.SkippedReason =
+				"intent_forward_recovery_verification_needs_attention"
+			sum.Disposition = ReplayDispositionNeedsAttention
+			sum.DispositionReason = forwardRecovery.AttentionReason
+			if sum.DispositionReason == "" {
+				sum.DispositionReason =
+					"the complete frozen recovery target failed verification"
+			}
+			return sum, nil
+		}
+		var resolvedPlan *ai.IntentPlanV2
+		if forwardRecovery.Stage == publicationFallbackLocalUnlock {
+			plan, planStatus, loadErr := resolvedIntentForwardRecoveryPlan(
+				ctx, db, forwardRecovery)
+			if loadErr != nil {
+				return sum, loadErr
+			}
+			if forwardRecovery.PlanFingerprint != "" &&
+				(planStatus != intentForwardRecoveryPlanReady ||
+					forwardRecovery.PrefixCursor < 1 ||
+					forwardRecovery.PrefixUnresolvedCount <= 0 ||
+					strings.TrimSpace(forwardRecovery.PrefixBaseHead) == "") {
+				previousRecovery := forwardRecovery
+				forwardRecovery, loadErr =
+					state.ResetIntentForwardRecoveryInvalidPlan(
+						ctx, db, forwardRecovery)
+				if loadErr != nil {
+					return sum, loadErr
+				}
+				logIntentForwardRecoveryTransition(
+					previousRecovery, publicationFallbackSemanticReplan)
+			} else if planStatus == intentForwardRecoveryPlanReady {
+				resolvedPlan = &plan
+			}
+		}
+		configureIntentForwardRecovery(&intentCfg, forwardRecovery, resolvedPlan)
 	}
 	if intentCfg.semanticSalvage {
 		if err := retireResolvedIntentCandidateMembership(ctx, db, cctx); err != nil {
@@ -1140,7 +1260,8 @@ type intentReplayConfig struct {
 	// gates.
 	candidateMode bool
 	// atomicFallback bypasses semantic windows and selects one complete hard
-	// dependency component for local deterministic publication.
+	// dependency component locally. Non-deterministic configurations still
+	// require their provider to supply the locked semantic commit message.
 	atomicFallback bool
 	// semanticSalvage offers only the remaining forward target to the configured
 	// provider. A local evidence partition becomes a request for one explicit
@@ -1149,6 +1270,14 @@ type intentReplayConfig struct {
 	// targetEventSeqs bounds durable candidate reuse to the exact capture set
 	// owned by an active publication drain or forward-recovery marker.
 	targetEventSeqs []int64
+	// Forward recovery reuses the exact provider plan across bounded local
+	// verification attempts. PrefixCursor counts semantic candidates, not raw
+	// captures, and resets only after publication progress.
+	forwardRecoveryPlan            ai.IntentPlanV2
+	forwardRecoveryPlanFingerprint string
+	forwardRecoveryCandidateID     string
+	forwardRecoveryPrefixCursor    int
+	forwardRecoveryPrefixBaseHead  string
 	// pathQuiescence is the per-path silence window read from
 	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
 	// disables the gate; any positive value defers offering pending
@@ -1164,6 +1293,52 @@ type intentReplayConfig struct {
 	commitFormat         ai.CommitFormat
 	plannerProvider      string
 	plannerModel         string
+}
+
+type unavailableIntentPlanner struct {
+	provider string
+	cause    error
+}
+
+func (p unavailableIntentPlanner) Name() string {
+	if provider := strings.TrimSpace(p.provider); provider != "" {
+		return provider
+	}
+	return "unavailable-intent-provider"
+}
+
+func (p unavailableIntentPlanner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, p.err()
+}
+
+func (p unavailableIntentPlanner) PlanIntentV2(
+	context.Context,
+	ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	return ai.IntentPlanV2{}, p.err()
+}
+
+func (p unavailableIntentPlanner) err() error {
+	if p.cause != nil {
+		return fmt.Errorf("intent provider %q is unavailable: %w",
+			p.Name(), p.cause)
+	}
+	return fmt.Errorf("intent provider %q is unavailable", p.Name())
+}
+
+func configuredIntentProviderName(mode string) string {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		return "deterministic"
+	}
+	return mode
+}
+
+func configuredIntentProviderRequiresSemanticMessages(mode string) bool {
+	return configuredIntentProviderName(mode) != "deterministic"
 }
 
 func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), error) {
@@ -1197,6 +1372,9 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 		recentCommitAffinity: resolveRecentCommitAffinitySeconds(),
 		commitFormat:         cfg.CommitFormat,
 		health:               opts.IntentHealth,
+	}
+	if opts.CommitFormat != "" {
+		out.commitFormat = opts.CommitFormat
 	}
 	if opts.IntentWindow > 0 {
 		out.window = opts.IntentWindow
@@ -1255,15 +1433,58 @@ func resolveIntentReplayConfig(opts ReplayOpts) (intentReplayConfig, func(), err
 	}
 
 	providerCfg := cfg
+	// ReplayOpts carries the active immutable runtime revision. Keep a provider
+	// constructed by this fallback path on the same message-format contract as
+	// the rest of replay, even when the process environment is stale.
+	providerCfg.CommitFormat = out.commitFormat
+	configuredProvider := configuredIntentProviderName(providerCfg.Mode)
 	provider, closer, err := ai.BuildProvider(providerCfg)
 	if err != nil {
+		if configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
+			out.planner = unavailableIntentPlanner{
+				provider: configuredProvider,
+				cause:    errors.New(ai.SanitizePlannerError(err.Error())),
+			}
+			out.plannerProvider = configuredProvider
+			if configuredProvider == "openai-compat" {
+				out.plannerModel = providerCfg.Model
+			}
+			return out, nil, nil
+		}
 		slog.Default().Warn("build intent planner; falling back to deterministic", "err", ai.SanitizePlannerError(err.Error()))
 		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
 		out.plannerProvider = out.planner.Name()
 		return out, nil, nil
 	}
+	if configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) &&
+		ai.PrimaryProviderName(provider) == "deterministic" {
+		out.planner = unavailableIntentPlanner{
+			provider: configuredProvider,
+			cause:    errors.New("configured provider could not be constructed"),
+		}
+		out.plannerProvider = configuredProvider
+		if configuredProvider == "openai-compat" {
+			out.plannerModel = providerCfg.Model
+		}
+		if closer != nil {
+			_ = closer.Close()
+		}
+		return out, nil, nil
+	}
 	planner, ok := provider.(ai.IntentPlanner)
 	if !ok {
+		if configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
+			out.planner = unavailableIntentPlanner{
+				provider: configuredProvider,
+				cause: fmt.Errorf("provider %q does not implement intent planning",
+					provider.Name()),
+			}
+			out.plannerProvider = configuredProvider
+			if closer != nil {
+				_ = closer.Close()
+			}
+			return out, nil, nil
+		}
 		slog.Default().Warn("AI provider does not implement intent planning; falling back to deterministic", "provider", provider.Name())
 		out.planner = ai.DeterministicProvider{CommitFormat: out.commitFormat}
 		out.plannerProvider = out.planner.Name()
@@ -1351,6 +1572,21 @@ func replayIntentBatch(
 	} else if cfg.semanticSalvage {
 		sum.RecoveryMode = publicationFallbackSemanticReplan
 	}
+	quiescenceNow := pathQuiescenceNow()
+	if cfg.pathQuiescence > 0 && len(cfg.targetEventSeqs) > 0 &&
+		(cfg.semanticSalvage || cfg.atomicFallback) {
+		quiet, err := intentRecoveryTargetQuiescent(
+			ctx, db, pending, cfg.pathQuiescence, quiescenceNow)
+		if err != nil {
+			return sum, err
+		}
+		if !quiet {
+			persistPathQuiescenceSnapshot(ctx, db, 1, cfg.pathQuiescence)
+			sum.Skipped = true
+			sum.SkippedReason = "skipped_due_path_quiescence"
+			return sum, nil
+		}
+	}
 	// Per-path quiescence gate (ACD_PATH_QUIESCENCE_SECONDS). When non-zero
 	// we hold back pending captures whose path was written within the
 	// configured quiet window; the capture row is still durable, only the
@@ -1370,7 +1606,6 @@ func replayIntentBatch(
 		}
 		headOpsByPath = map[int64][]state.CaptureOp{pending[0].Seq: headOps}
 	}
-	quiescenceNow := pathQuiescenceNow()
 	pending, gated := filterPendingByPathQuiescence(
 		pending, cfg.pathQuiescence, quiescenceNow, headOpsByPath)
 	persistPathQuiescenceSnapshot(ctx, db, gated, cfg.pathQuiescence)
@@ -1442,8 +1677,31 @@ func replayIntentBatch(
 		err        error
 	)
 	if cfg.atomicFallback {
-		window, err = publicationDrainAtomicFallbackWindow(
-			ctx, db, activeCtx, pending)
+		if cfg.forwardRecoveryPlanFingerprint != "" {
+			if cfg.forwardRecoveryPrefixBaseHead != parent {
+				return sum, errors.New(
+					"daemon: intent forward recovery HEAD changed before progress")
+			}
+			prefix, prefixErr := selectIntentForwardRecoveryPrefix(
+				cfg.forwardRecoveryPlan, pending,
+				cfg.forwardRecoveryPrefixCursor)
+			if prefixErr != nil {
+				return sum, prefixErr
+			}
+			window = prefix.Events
+			sum.RecoveryPrefixCandidateCount = prefix.CandidateCount
+			sum.RecoveryPrefixTotalCandidates = prefix.TotalCandidates
+			fallback, ok := cfg.planner.(publicationDrainAtomicFallbackPlanner)
+			if !ok {
+				return sum, fmt.Errorf(
+					"daemon: atomic fallback planner has type %T", cfg.planner)
+			}
+			fallback.combineWindow = true
+			cfg.planner = fallback
+		} else {
+			window, err = publicationDrainAtomicFallbackWindow(
+				ctx, db, activeCtx, pending)
+		}
 	} else {
 		window, forced, waitReason, err = selectIntentWindow(ctx, db, pending, cfg)
 	}
@@ -1792,6 +2050,27 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		n = boundaryCaptureLimit
 	}
 	return pending[:n], false, "", nil
+}
+
+func intentRecoveryTargetQuiescent(
+	ctx context.Context,
+	db *state.DB,
+	events []state.CaptureEvent,
+	quiescence time.Duration,
+	now time.Time,
+) (bool, error) {
+	for _, event := range events {
+		ops, err := state.LoadCaptureOps(ctx, db, event.Seq)
+		if err != nil {
+			return false, fmt.Errorf(
+				"daemon: replay: load recovery target ops for quiescence gate: %w",
+				err)
+		}
+		if !pathQuiescentForEvent(event, ops, quiescence, now) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func captureEventTouchesAnyPath(
@@ -3321,7 +3600,9 @@ func publishIntentSelection(
 			return sum, nil
 		}
 
-		if reason, err := detectConflict(ctx, repoRoot, indexFile, item.ops); err != nil {
+		if reason, err := detectConflictWithIdempotentUpdates(
+			ctx, repoRoot, indexFile, item.ops,
+		); err != nil {
 			return sum, err
 		} else if reason != "" {
 			headOID, alreadyPublished, err := alreadyPublishedAtHEAD(ctx, repoRoot, sourceHead, allOps)
@@ -3334,7 +3615,7 @@ func publishIntentSelection(
 					return sum, err
 				}
 				if err := settleNonJournalIntentCandidates(
-					ctx, db, selected, headOID, opts); err != nil {
+					ctx, db, selected, headOID); err != nil {
 					return sum, err
 				}
 				reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
@@ -3383,7 +3664,7 @@ func publishIntentSelection(
 					return sum, err
 				}
 				if err := settleNonJournalIntentCandidates(
-					ctx, db, selected, sourceHead, opts); err != nil {
+					ctx, db, selected, sourceHead); err != nil {
 					return sum, err
 				}
 				if err := git.ReadTree(ctx, repoRoot, indexFile, sourceHead); err != nil {
@@ -3423,7 +3704,7 @@ func publishIntentSelection(
 			return sum, err
 		}
 		if err := settleNonJournalIntentCandidates(
-			ctx, db, selected, sourceHead, opts); err != nil {
+			ctx, db, selected, sourceHead); err != nil {
 			return sum, err
 		}
 		reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
@@ -3508,7 +3789,7 @@ func publishIntentSelection(
 				return sum, err
 			}
 			if err := settleNonJournalIntentCandidates(
-				ctx, db, selected, headOID, opts); err != nil {
+				ctx, db, selected, headOID); err != nil {
 				return sum, err
 			}
 			reconcileIntentLiveIndex(ctx, repoRoot, opts.Trace, activeCtx, selected)
@@ -3664,7 +3945,6 @@ func settleNonJournalIntentCandidates(
 	db *state.DB,
 	items []intentReplayItem,
 	commitOID string,
-	opts ReplayOpts,
 ) error {
 	candidates := make(map[string]struct{})
 	for _, item := range items {
@@ -3678,9 +3958,11 @@ func settleNonJournalIntentCandidates(
 	}
 	sort.Strings(ids)
 	for _, candidateID := range ids {
+		// Without a self-publication journal, commitOID is only evidence that
+		// the candidate's result is present at HEAD. ACD did not create that
+		// commit for this candidate, so it must never become a repair target.
 		if err := markIntentCandidatePublished(
-			ctx, db, candidateID, commitOID,
-			opts.IntentRepairEnabled, opts.IntentRepairHorizon,
+			ctx, db, candidateID, commitOID, false, 0,
 		); err != nil {
 			return err
 		}
@@ -4316,6 +4598,27 @@ func validateOps(ops []state.CaptureOp) string {
 // UpdateIndexInfo + WriteTree below); empty falls back to the live repo
 // index but the run loop never relies on that — see the comment in Replay.
 func detectConflict(ctx context.Context, repoRoot, indexFile string, ops []state.CaptureOp) (string, error) {
+	return detectConflictInIndex(ctx, repoRoot, indexFile, ops, false)
+}
+
+// detectConflictWithIdempotentUpdates accepts an operation whose exact
+// after-state is already present in the scratch index. Intent materialization
+// uses this while advancing a repeated queued chain; ordinary event replay
+// keeps detectConflict's existing classification and observability.
+func detectConflictWithIdempotentUpdates(
+	ctx context.Context,
+	repoRoot, indexFile string,
+	ops []state.CaptureOp,
+) (string, error) {
+	return detectConflictInIndex(ctx, repoRoot, indexFile, ops, true)
+}
+
+func detectConflictInIndex(
+	ctx context.Context,
+	repoRoot, indexFile string,
+	ops []state.CaptureOp,
+	allowIdempotentUpdates bool,
+) (string, error) {
 	paths := touchedPaths(ops)
 	if len(paths) == 0 {
 		return "", nil
@@ -4331,13 +4634,19 @@ func detectConflict(ctx context.Context, repoRoot, indexFile string, ops []state
 	for _, le := range staged {
 		idx[le.Path] = entry{mode: le.Mode, oid: le.OID}
 	}
+	matchesAfter := func(current entry, op state.CaptureOp) bool {
+		return op.AfterMode.Valid && op.AfterMode.String != "" &&
+			op.AfterOID.Valid && op.AfterOID.String != "" &&
+			current.mode == op.AfterMode.String &&
+			current.oid == op.AfterOID.String
+	}
 	for _, op := range ops {
 		switch op.Op {
 		case "create":
 			if e, ok := idx[op.Path]; ok {
 				// "create on existing path" is fine only when the existing
 				// entry already matches the after-state (idempotent replay).
-				if e.mode != op.AfterMode.String || e.oid != op.AfterOID.String {
+				if !matchesAfter(e, op) {
 					return fmt.Sprintf("create conflict for %s", op.Path), nil
 				}
 			}
@@ -4347,11 +4656,23 @@ func detectConflict(ctx context.Context, repoRoot, indexFile string, ops []state
 				return fmt.Sprintf("%s missing-in-index for %s", op.Op, op.Path), nil
 			}
 			if e.mode != op.BeforeMode.String || e.oid != op.BeforeOID.String {
+				// A repeated capture can describe an older before-state after a
+				// prior queued event already produced the same result. Preserve
+				// the chain and treat that exact after-state as an idempotent op.
+				if allowIdempotentUpdates && matchesAfter(e, op) {
+					continue
+				}
 				return fmt.Sprintf("%s before-state mismatch for %s", op.Op, op.Path), nil
 			}
 		case "delete":
 			e, ok := idx[op.Path]
 			if !ok {
+				// Absence is the exact after-state of a delete. Intent replay may
+				// encounter the same captured deletion more than once after an old
+				// shadow reseed; applying it again is a proven no-op.
+				if allowIdempotentUpdates {
+					continue
+				}
 				return fmt.Sprintf("delete missing-in-index for %s", op.Path), nil
 			}
 			if e.mode != op.BeforeMode.String || e.oid != op.BeforeOID.String {
@@ -4361,6 +4682,12 @@ func detectConflict(ctx context.Context, repoRoot, indexFile string, ops []state
 			old := op.OldPath.String
 			e, ok := idx[old]
 			if !ok {
+				// A completed rename has no source and an exact target. Require
+				// both facts before treating a repeated Intent capture as a no-op.
+				if target, exists := idx[op.Path]; allowIdempotentUpdates &&
+					exists && matchesAfter(target, op) {
+					continue
+				}
 				return fmt.Sprintf("rename source missing-in-index for %s", old), nil
 			}
 			if e.mode != op.BeforeMode.String || e.oid != op.BeforeOID.String {

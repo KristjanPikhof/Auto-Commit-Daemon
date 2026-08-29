@@ -543,6 +543,74 @@ func TestDoctor_IntentBatchWaitAddsOperationalNotes(t *testing.T) {
 	}
 }
 
+func TestDoctorScopesPlannerStateToDaemonBranch(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+
+	repo, dbPath, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+		BranchRef:        sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 2, Valid: true},
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/old", BranchGeneration: 1, BaseHead: "old",
+		Operation: "modify", Path: "old.go", Fidelity: "exact", CapturedTS: 90,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+		DecisionTS: 95, Kind: state.DecisionKindIntentPlannerError,
+		EventSeq: sql.NullInt64{Int64: seq, Valid: true},
+		Path:     sql.NullString{String: "old.go", Valid: true},
+		Reason:   sql.NullString{String: "old branch provider failure", Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
+		PlannedTS: 100, BranchRef: "refs/heads/old", BranchGeneration: 1,
+		OfferedSeqs: []int64{seq}, VisibleOriginalSeqs: []int64{seq},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
+		Fingerprint: "sha256:old-doctor-branch", BranchRef: "refs/heads/old",
+		BranchGeneration: 1, AttemptLimit: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.ProgressState = sql.NullString{String: "waiting_message_rewrite", Valid: true}
+	run.ResolutionMode = sql.NullString{String: "waiting_message_rewrite", Valid: true}
+	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runDoctor(ctx, &out, false, "", true); err != nil {
+		t.Fatal(err)
+	}
+	var report doctorReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Repos) != 1 {
+		t.Fatalf("repos=%d want 1", len(report.Repos))
+	}
+	strategy := report.Repos[0].IntentStrategy
+	if strategy.LastPlannerWindow != nil ||
+		strategy.ResolutionMode != "" || strategy.LastPlannerError != "" {
+		t.Fatalf("stale planner state crossed branch generation: %+v", strategy)
+	}
+}
+
 func TestDoctor_FailedBarrierSurfaced(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

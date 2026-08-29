@@ -1334,8 +1334,10 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	var pid int
 	var mode string
 	var heartbeatTS sql.NullFloat64
-	row := conn.QueryRowContext(ctx, `SELECT pid, mode, heartbeat_ts FROM daemon_state WHERE id = 1`)
-	if err := row.Scan(&pid, &mode, &heartbeatTS); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var branchRef sql.NullString
+	var branchGeneration sql.NullInt64
+	row := conn.QueryRowContext(ctx, `SELECT pid, mode, heartbeat_ts, branch_ref, branch_generation FROM daemon_state WHERE id = 1`)
+	if err := row.Scan(&pid, &mode, &heartbeatTS, &branchRef, &branchGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		rr.Notes = append(rr.Notes, "daemon_state read failed: "+err.Error())
 		return true
 	} else if err == nil {
@@ -1405,7 +1407,8 @@ func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath s
 	} else {
 		rr.Notes = append(rr.Notes, "failed blocking pending count failed: "+err.Error())
 	}
-	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err == nil {
+	if intentStrategy, err := loadIntentStrategyReportForPair(
+		ctx, conn, branchRef.String, branchGeneration.Int64); err == nil {
 		rr.IntentStrategy = intentStrategy
 		rr.IntentStrategy.RejectLogPath = plannerRejectLogPath(dbPath)
 		rr.Notes = append(rr.Notes, doctorIntentStrategyNotes(rr.IntentStrategy, repoPath, rr.FlushSessionID)...)

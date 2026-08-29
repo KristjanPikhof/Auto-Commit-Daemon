@@ -346,7 +346,8 @@ SELECT EXISTS(
     JOIN capture_events e
       ON e.seq=ce.event_seq AND e.state='pending'
     WHERE c.status='blocked'
-       OR c.verification_status IN ('failed','timed_out','needs_attention')
+       OR c.verification_status IN ('timed_out','needs_attention')
+       OR (c.verification_status='failed' AND c.status<>'waiting')
 )`).Scan(&attention)
 	if err != nil {
 		return false, err

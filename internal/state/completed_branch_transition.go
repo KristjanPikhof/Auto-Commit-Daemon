@@ -318,10 +318,42 @@ func CanonicalCompletedIntentRepairCommit(
 		return "", false, errors.New(
 			"state: CanonicalCompletedIntentRepairCommit: invalid input")
 	}
+	chain, err := completedIntentRepairCommitChain(
+		ctx, d, branchRef, branchGeneration, commitOID)
+	if err != nil {
+		return "", false, err
+	}
+	return chain[len(chain)-1], len(chain) > 1, nil
+}
 
+// CompletedIntentRepairCommitChain returns the original commit followed by
+// every uniquely validated completed Intent repair representative, oldest to
+// newest, for one exact branch pair.
+func CompletedIntentRepairCommitChain(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	branchGeneration int64,
+	commitOID string,
+) ([]string, error) {
+	if d == nil || branchRef == "" || branchGeneration < 0 || commitOID == "" {
+		return nil, errors.New(
+			"state: CompletedIntentRepairCommitChain: invalid input")
+	}
+	return completedIntentRepairCommitChain(
+		ctx, d, branchRef, branchGeneration, commitOID)
+}
+
+func completedIntentRepairCommitChain(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	branchGeneration int64,
+	commitOID string,
+) ([]string, error) {
 	current := commitOID
 	seen := map[string]struct{}{current: {}}
-	mapped := false
+	chain := []string{current}
 	for step := 0; step < CompletedBranchTransitionProofLimit; step++ {
 		rows, err := d.readSQL().QueryContext(ctx, `
 SELECT r.id,c.new_oid
@@ -333,7 +365,7 @@ WHERE r.branch_ref=? AND r.branch_generation=?
 ORDER BY r.created_ts,r.id
 LIMIT 2`, branchRef, branchGeneration, current)
 		if err != nil {
-			return "", false, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"state: query completed intent repair mapping: %w", err)
 		}
 		type repairMapping struct{ repairID, targetOID string }
@@ -342,37 +374,37 @@ LIMIT 2`, branchRef, branchGeneration, current)
 			var mapping repairMapping
 			if err := rows.Scan(&mapping.repairID, &mapping.targetOID); err != nil {
 				rows.Close()
-				return "", false, fmt.Errorf(
+				return nil, fmt.Errorf(
 					"state: scan completed intent repair mapping: %w", err)
 			}
 			mappings = append(mappings, mapping)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return "", false, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"state: iterate completed intent repair mapping: %w", err)
 		}
 		if err := rows.Close(); err != nil {
-			return "", false, err
+			return nil, err
 		}
 		switch len(mappings) {
 		case 0:
-			return current, mapped, nil
+			return chain, nil
 		case 1:
 			// Validate the whole repair before trusting one interior mapping.
 		default:
-			return "", false, completedBranchTransitionProofError(
+			return nil, completedBranchTransitionProofError(
 				"intent repair mapping from %s is ambiguous",
 				current)
 		}
 
 		repair, ok, err := IntentRepairByID(ctx, d, mappings[0].repairID)
 		if err != nil {
-			return "", false, err
+			return nil, err
 		}
 		if !ok || !repair.OldHead.Valid || !repair.NewHead.Valid ||
 			!repair.CompletedTS.Valid {
-			return "", false, completedBranchTransitionProofError(
+			return nil, completedBranchTransitionProofError(
 				"intent repair %s has incomplete proof",
 				mappings[0].repairID)
 		}
@@ -382,18 +414,18 @@ LIMIT 2`, branchRef, branchGeneration, current)
 			CompletedTS: repair.CompletedTS.Float64,
 		}
 		if _, err := completedIntentRepairProof(ctx, d, transition); err != nil {
-			return "", false, err
+			return nil, err
 		}
 		next := mappings[0].targetOID
 		if _, duplicate := seen[next]; duplicate {
-			return "", false, completedBranchTransitionProofError(
+			return nil, completedBranchTransitionProofError(
 				"intent repair mapping cycle at %s", next)
 		}
 		seen[next] = struct{}{}
 		current = next
-		mapped = true
+		chain = append(chain, current)
 	}
-	return "", false, completedBranchTransitionProofError(
+	return nil, completedBranchTransitionProofError(
 		"intent repair mapping exceeds %d steps",
 		CompletedBranchTransitionProofLimit)
 }

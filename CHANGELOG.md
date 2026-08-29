@@ -10,6 +10,19 @@
 
 ### Fixed
 
+- `acd list` and `acd status` now separate worker liveness from durable queue
+  progress. They show the configured mode, full queue, any earlier bounded
+  `commit-all` target, the current phase, and time since the queue last moved.
+  A completed old drain is no longer displayed as current work. A failed
+  candidate check is shown as automatic checkpoint replanning instead of an
+  immediate request for user action.
+- Intent local recovery now keeps deterministic dependency-safe membership but
+  requires the configured semantic provider to write the locked commit
+  message. Provider outages wait and retry instead of creating a generic
+  filename-based commit.
+- Status metadata now follows the active runtime revision, so hot-applied
+  Intent thresholds and provider details no longer look like stale startup
+  settings.
 - The daemon now recognizes a completed Intent rewrite as its own branch move,
   including after a crash or restart. A frozen `commit-all` target cannot pull
   in later captures, and pending work continues without an `off` and `on`
@@ -181,6 +194,12 @@
   commits unchanged, and releases its pending events for forward recovery.
   Large queues can no longer prevent recovery just because another replay pass
   is available.
+- Intent history repair now preserves the live capture baseline while it
+  updates ACD-owned commits. Unchanged dirty files are no longer captured
+  again after a partial repair.
+- Replay now recognizes an already-applied file update inside a queued change
+  chain. Duplicate captures left by an older runtime drain as no-ops instead
+  of blocking Intent preflight on their stale before-state.
 - Forward recovery now returns to pending-only Intent planning after every
   local unlock. When planning stalls, ACD publishes the smallest safe hard
   dependency component, including a single event when needed, then replans the

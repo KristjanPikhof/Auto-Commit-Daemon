@@ -139,20 +139,23 @@ shows repositories that need action or are working. The default view fills the
 remaining five-row budget with repositories where ACD most recently handled
 changes. Paused repositories appear only when space remains after recent work.
 Use `--all` for every enabled repository and `--verbose` for worker, tool,
-safety, drain, blocker, last commit, and recovery details. A terminal refreshes
-the same screen until Ctrl-C; `--once` prints one snapshot.
+blocker, last commit, and recovery details. A terminal refreshes the same
+screen until Ctrl-C; `--once` prints one snapshot.
 
-`SAFE` confirms that the latest checkpoint is complete. `DRAIN` shows published
-and target event counts for an active `commit-all` run. `LEFT` shows the exact
-events remaining in that drain, or ordinary pending events when no drain is
-active. A dash under `SAFE` means the checkpoint state could not be read during
-that frame.
+`SAFE` confirms that the latest checkpoint is complete. `MODE` shows the
+configured commit strategy. `QUEUE` counts all pending work. `TARGET` appears
+only for the bounded remainder of an earlier `commit-all` request; it does not
+mean the strategy changed. `LAST MOVE` is the age of durable queue progress,
+not the worker heartbeat. `PHASE` distinguishes an ordinary Intent countdown
+from planning, publication, retry, and automatic recovery. A dash means that
+field does not apply or could not be read during that frame.
 
 | Status | Meaning |
 |---|---|
 | `healthy` | Protection is complete and no work is pending. |
-| `working` | ACD is checkpointing, publishing, planning, validating, starting, or retrying. |
-| `waiting` | Protected work is waiting for an Intent batch delay or rewind grace period. |
+| `working` | ACD is checkpointing, planning, publishing, validating, starting, or retrying; `PHASE` gives the exact activity. |
+| `waiting` | Protected work is waiting for the countdown or safe condition shown in `PHASE`. |
+| `stalled` | The worker is responsive, but the queue has not made durable progress within the bounded threshold. ACD keeps retrying or recovering automatically; no action is needed unless the status changes to `needs action`. |
 | `paused` | Protection and publication are manually paused. |
 | `needs action` | A failure or safety block requires attention. |
 

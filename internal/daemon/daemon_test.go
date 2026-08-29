@@ -20,6 +20,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -529,6 +530,191 @@ INSERT INTO capture_events(
 	if headAfter != head || string(statusAfter) != string(statusBefore) {
 		t.Fatalf("startup reconciliation changed Git: head=%s want=%s status=%q want=%q",
 			headAfter, head, statusAfter, statusBefore)
+	}
+}
+
+func TestRunRestoresDesiredRuntimeWhenDrainResolvesBeforeLease(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "test-only-key")
+	t.Setenv(ai.EnvBaseURL, ai.DefaultOpenAIBaseURL)
+	t.Setenv(ai.EnvDiffEgress, "false")
+	t.Setenv(ai.EnvProvider, "deterministic")
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+
+	f := newDaemonFixture(t)
+	registerLiveClient(t, f.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	head, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := git.RevParse(ctx, f.dir, "HEAD^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const generation = int64(7)
+	if err := state.MetaSetMany(ctx, f.db, map[string]string{
+		MetaKeyBranchGeneration: strconv.FormatInt(generation, 10),
+		MetaKeyBranchHead:       head,
+		MetaKeyBranchToken:      branchTokenRev(head, "refs/heads/main"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	builder := runtimeBuilder(f.db, map[string]*runtimeTestCloser{})
+	intentRevision := runtimeRevision(t, f.db, "drain-intent", 1, map[string]any{
+		config.FieldProvider:       "openai-compat",
+		config.FieldModel:          "semantic-model",
+		config.FieldCommitStrategy: "intent",
+		config.FieldCommitFormat:   "imperative",
+	})
+	eventRevision := runtimeRevision(t, f.db, "desired-event", 2, map[string]any{
+		config.FieldProvider:       "deterministic",
+		config.FieldCommitStrategy: "event",
+		config.FieldCommitFormat:   "imperative",
+	})
+	activate := func(revisionID int64, expected sql.NullInt64) {
+		t.Helper()
+		request, ok, err := state.RequestConfigActivation(ctx, f.db, revisionID, expected)
+		if err != nil || !ok {
+			t.Fatalf("request revision %d=(%t,%v)", revisionID, ok, err)
+		}
+		if ok, err := state.AcknowledgeConfigActivation(
+			ctx, f.db, request.ID, revisionID); err != nil || !ok {
+			t.Fatalf("ack revision %d=(%t,%v)", revisionID, ok, err)
+		}
+		if ok, err := state.ApplyConfigActivation(
+			ctx, f.db, request.ID, revisionID); err != nil || !ok {
+			t.Fatalf("apply revision %d=(%t,%v)", revisionID, ok, err)
+		}
+	}
+	activate(intentRevision.ID, sql.NullInt64{})
+	intentBundle, err := builder.BuildRevision(ctx, intentRevision, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	insertEvent := func(path string) int64 {
+		t.Helper()
+		result, err := f.db.SQL().ExecContext(ctx, `
+INSERT INTO capture_events(
+ branch_ref,branch_generation,base_head,operation,path,fidelity,captured_ts,state
+) VALUES('refs/heads/main',?,?,'modify',?,'exact',1,'pending')`,
+			generation, head, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seq, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return seq
+	}
+	targetSeq := insertEvent("drain-target.go")
+	_ = insertEvent("unrelated.go")
+	const checkpointID = "cp-1787439200000-0123456789abcdef"
+	worktreeID := checkpointpkg.WorktreeID(f.dir)
+	checkpointRef := "refs/acd/checkpoints/v1/" + worktreeID + "/" + checkpointID
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+		"update-ref", checkpointRef, head); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := state.Checkpoint{
+		ID: checkpointID, OperationID: "op-runtime-drain-resolution",
+		WorktreeID: worktreeID, Reason: state.CheckpointReasonManualBarrier,
+		ObservationEpoch: 1, CoverageEpoch: 1, ObservedHead: head,
+		ObservedRef: "refs/heads/main", TreeOID: tree, CommitOID: head,
+		Ref: checkpointRef, CreatedTS: 1, EventSeqs: []int64{targetSeq},
+	}
+	if created, err := state.PrepareCheckpoint(
+		ctx, f.db, checkpoint, publicationDrainTestDigest); err != nil || !created {
+		t.Fatalf("prepare checkpoint=(%t,%v)", created, err)
+	}
+	if err := state.CompleteCheckpoint(
+		ctx, f.db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 2); err != nil {
+		t.Fatal(err)
+	}
+	drain := state.PublicationDrain{
+		ID: "drain-" + checkpointID, CheckpointID: checkpoint.ID,
+		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: generation, Phase: state.PublicationDrainSemantic,
+		TargetEventCount: 1, CreatedTS: 3, UpdatedTS: 3, LastProgressTS: 3,
+		EventSeqs:           []int64{targetSeq},
+		CommitStrategy:      string(intentBundle.CommitStrategy),
+		CommitFormat:        string(intentBundle.CommitFormat),
+		ConfigRevisionID:    intentBundle.RevisionID,
+		Provider:            intentBundle.HealthIdentity.Provider,
+		ProviderModel:       intentBundle.Model,
+		ProviderFingerprint: intentBundle.HealthFingerprint,
+	}
+	if created, err := state.PreparePublicationDrain(
+		ctx, f.db, drain); err != nil || !created {
+		t.Fatalf("prepare drain=(%t,%v)", created, err)
+	}
+	activate(eventRevision.ID, sql.NullInt64{
+		Int64: intentRevision.ID, Valid: true,
+	})
+
+	mutationErr := make(chan error, 1)
+	var resolveOnce sync.Once
+	beforeTokenCheck := func() {
+		resolveOnce.Do(func() {
+			_, err := f.db.SQL().ExecContext(context.Background(), `
+UPDATE capture_events
+SET state='published',commit_oid=?,published_ts=4
+WHERE seq=?`, head, targetSeq)
+			mutationErr <- err
+		})
+	}
+	replayed := make(chan ReplayOpts, 1)
+	shutdownCh := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			RepoPath: f.dir, GitDir: f.gitDir, DB: f.db,
+			Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+			MessageFn: DeterministicMessage, WakeCh: make(chan struct{}, 1),
+			ShutdownCh: shutdownCh, SkipSignals: true,
+			runtimeBuildProvider:   builder.BuildProvider,
+			beforeBranchTokenCheck: beforeTokenCheck,
+			replay: func(_ context.Context, _ string, _ *state.DB,
+				cctx CaptureContext, opts ReplayOpts) (ReplaySummary, error) {
+				select {
+				case replayed <- opts:
+				default:
+				}
+				return ReplaySummary{BaseHead: cctx.BaseHead, Skipped: true}, nil
+			},
+		})
+	}()
+	select {
+	case err := <-mutationErr:
+		if err != nil {
+			cancel()
+			<-done
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("run loop did not resolve drain target")
+	}
+	var replayOpts ReplayOpts
+	select {
+	case replayOpts = <-replayed:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("run loop did not reach unrelated replay")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if replayOpts.CommitStrategy != ai.CommitStrategyEvent ||
+		replayOpts.PublicationDrain != nil {
+		t.Fatalf("unrelated replay used stale drain runtime: strategy=%s drain=%+v",
+			replayOpts.CommitStrategy, replayOpts.PublicationDrain)
 	}
 }
 

@@ -190,7 +190,8 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	}
 	provider, closer, err := ai.BuildProvider(cfg)
 	if err != nil {
-		return fmt.Errorf("acd history rewrite: build provider: %w", err)
+		return fmt.Errorf("acd history rewrite: %w: %w",
+			ai.ErrRewriteRequiresAIProvider, err)
 	}
 	if closer != nil {
 		defer func() { _ = closer.Close() }()

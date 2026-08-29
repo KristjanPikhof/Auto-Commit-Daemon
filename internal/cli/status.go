@@ -16,8 +16,10 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 
@@ -52,6 +54,47 @@ type publicationDrainReport struct {
 	StagedConsumed          bool    `json:"staged_consumed"`
 }
 
+// publicationProgressReport is the small, shared product projection used by
+// status and list. WorkerResponsive is deliberately separate from
+// LastProgressTS: a fresh heartbeat proves that the worker is alive, not that
+// the publication frontier is moving.
+type publicationProgressReport struct {
+	Strategy               string  `json:"strategy"`
+	PlannerProvider        string  `json:"planner_provider,omitempty"`
+	PlannerModel           string  `json:"planner_model,omitempty"`
+	Origin                 string  `json:"origin,omitempty"`
+	Phase                  string  `json:"phase"`
+	NeedsAttention         bool    `json:"needs_attention,omitempty"`
+	AttentionReason        string  `json:"attention_reason,omitempty"`
+	VerificationCandidate  string  `json:"verification_candidate,omitempty"`
+	VerificationPlan       string  `json:"verification_plan,omitempty"`
+	VerificationRecovery   string  `json:"verification_recovery,omitempty"`
+	QueuePending           int     `json:"queue_pending"`
+	TargetRemaining        int64   `json:"target_remaining,omitempty"`
+	TargetTotal            int64   `json:"target_total,omitempty"`
+	LastProgressTS         float64 `json:"last_progress_ts,omitempty"`
+	LastProgressAgeSeconds int64   `json:"last_progress_age_seconds,omitempty"`
+	WaitRemainingSeconds   int64   `json:"wait_remaining_seconds,omitempty"`
+	TemporaryLocalFallback bool    `json:"temporary_local_fallback,omitempty"`
+	WorkerResponsive       bool    `json:"worker_responsive"`
+	HeartbeatAgeSeconds    int64   `json:"heartbeat_age_seconds,omitempty"`
+	StallThresholdSeconds  int64   `json:"stall_threshold_seconds,omitempty"`
+}
+
+type intentForwardRecoveryProgress struct {
+	Stage           string
+	TargetTotal     int64
+	TargetRemaining int64
+	LastProgressTS  float64
+	NeedsAttention  bool
+	AttentionReason string
+}
+
+const (
+	intentRecoveryVerificationAttentionSummary = "The complete recovery target failed required verification. Work remains protected."
+	intentRecoveryVerificationAttentionNext    = "Run `acd doctor` to inspect the verification failure and recovery state."
+)
+
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
@@ -65,6 +108,7 @@ type statusReport struct {
 	HeartbeatTS                   int64                     `json:"heartbeat_ts,omitempty"`
 	HeartbeatAgeSeconds           int64                     `json:"heartbeat_age_seconds,omitempty"`
 	BranchRef                     string                    `json:"branch_ref,omitempty"`
+	BranchGeneration              int64                     `json:"branch_generation,omitempty"`
 	BranchGenToken                string                    `json:"branch_generation_token,omitempty"`
 	Clients                       []statusClient            `json:"clients"`
 	PendingEvents                 int                       `json:"pending_events"`
@@ -106,6 +150,7 @@ type statusReport struct {
 	AllChangesCommittedInGit      bool                      `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD      bool                      `json:"checkpoint_published_by_acd"`
 	PublicationDrain              publicationDrainReport    `json:"publication_drain"`
+	PublicationProgress           publicationProgressReport `json:"publication_progress"`
 	checkpointNeedsAction         bool
 }
 
@@ -274,14 +319,6 @@ WHERE cp.phase='completed'
 			report.ObservationEpoch == report.CoveredEpoch &&
 			prepared == 0 && needsAction == 0
 	}
-	if schemaVersion >= 21 {
-		drain, drainErr := readStatusPublicationDrain(ctx, conn)
-		if drainErr != nil {
-			return report, drainErr
-		}
-		report.PublicationDrain = drain
-	}
-
 	// daemon_state singleton.
 	var pid int
 	var mode string
@@ -303,9 +340,23 @@ WHERE cp.phase='completed'
 				report.Stale = true
 			}
 		}
-		if branchRef.Valid {
-			report.BranchRef = branchRef.String
+	}
+	currentBranchRef, currentBranchGeneration, hasCurrentPair, pairErr :=
+		currentWorktreeReplayPair(ctx, conn, rec.Path)
+	if pairErr != nil {
+		return report, pairErr
+	}
+	if hasCurrentPair {
+		report.BranchRef = currentBranchRef
+		report.BranchGeneration = currentBranchGeneration
+	}
+	if schemaVersion >= 21 {
+		drain, drainErr := readStatusPublicationDrain(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+		if drainErr != nil {
+			return report, drainErr
 		}
+		report.PublicationDrain = drain
 	}
 
 	// started_ts is stored in daemon_meta (set by start.go in this lane).
@@ -363,10 +414,7 @@ WHERE cp.phase='completed'
 		state.EventStatePending).Scan(&report.PendingEvents); err != nil {
 		return report, fmt.Errorf("pending events: %w", err)
 	}
-	activeGen := int64(0)
-	if branchGeneration.Valid {
-		activeGen = branchGeneration.Int64
-	}
+	activeGen := report.BranchGeneration
 	blockers, err := loadRecoveryBlockerCounts(ctx, conn, report.BranchRef, activeGen)
 	if err != nil {
 		return report, fmt.Errorf("recovery blocker counts: %w", err)
@@ -429,7 +477,8 @@ WHERE cp.phase='completed'
 		report.Paused = true
 		report.Pause = info
 	}
-	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err != nil {
+	if intentStrategy, err := loadIntentStrategyReportForPair(
+		ctx, conn, report.BranchRef, report.BranchGeneration); err != nil {
 		return report, fmt.Errorf("intent strategy: %w", err)
 	} else {
 		report.IntentStrategy = intentStrategy
@@ -480,8 +529,454 @@ WHERE cp.phase='completed'
 				report.PublicationDrain.Phase != state.PublicationDrainNeedsAction) ||
 			report.Configuration.Configuration == "validating")
 	report.OperationalState = statusOperationalState(report)
+	progress, err := buildPublicationProgressReport(ctx, conn, report, now)
+	if err != nil {
+		return report, fmt.Errorf("publication progress: %w", err)
+	}
+	report.PublicationProgress = progress
 
 	return report, nil
+}
+
+func buildPublicationProgressReport(
+	ctx context.Context,
+	conn *sql.DB,
+	report statusReport,
+	now time.Time,
+) (publicationProgressReport, error) {
+	progress := publicationProgressReport{
+		Strategy:     report.IntentStrategy.Strategy,
+		Phase:        "idle",
+		QueuePending: report.PendingEvents,
+		WorkerResponsive: report.Daemon == "running" && !report.Stale &&
+			report.PID > 0 && identity.Alive(report.PID),
+		HeartbeatAgeSeconds: report.HeartbeatAgeSeconds,
+	}
+	if progress.Strategy == "" {
+		progress.Strategy = "event"
+	}
+	progress.PlannerProvider = report.IntentStrategy.EffectiveProvider
+	progress.PlannerModel = report.IntentStrategy.EffectiveModel
+	if progress.PlannerProvider == "" &&
+		report.IntentStrategy.LastPlannerWindow != nil {
+		progress.PlannerProvider = report.IntentStrategy.LastPlannerWindow.Provider
+		progress.PlannerModel = report.IntentStrategy.LastPlannerWindow.Model
+	}
+
+	drain := report.PublicationDrain
+	activeDrain := drain.ID != "" &&
+		drain.Phase != state.PublicationDrainCompleted
+	activeIntentRecovery := false
+	activeIntentVerification := false
+	if activeDrain {
+		progress.Origin = "commit_all"
+		progress.TargetRemaining = drain.RemainingEvents
+		progress.TargetTotal = drain.TargetEvents
+		progress.LastProgressTS = drain.LastProgressTS
+		switch drain.Phase {
+		case state.PublicationDrainCheckpointing:
+			progress.Phase = "checkpointing"
+		case state.PublicationDrainSemantic:
+			progress.Phase = "intent_planning"
+		case state.PublicationDrainNormalizing:
+			progress.Phase = "recovering"
+		case state.PublicationDrainEventFallback:
+			if drain.FallbackMode == "semantic_replan" {
+				progress.Phase = "intent_replanning"
+			} else {
+				progress.Phase = "local_fallback"
+				progress.TemporaryLocalFallback = progress.Strategy == "intent"
+			}
+		case state.PublicationDrainNeedsAction:
+			progress.Phase = "needs_action"
+		default:
+			progress.Phase = "working"
+		}
+	} else {
+		recovery, active, err := readIntentForwardRecoveryProgress(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+		if err != nil {
+			return progress, err
+		}
+		activeIntentRecovery = active
+		if active {
+			progress.Origin = "intent_recovery"
+			progress.TargetRemaining = recovery.TargetRemaining
+			progress.TargetTotal = recovery.TargetTotal
+			progress.LastProgressTS = recovery.LastProgressTS
+			progress.NeedsAttention = recovery.NeedsAttention
+			progress.AttentionReason = recovery.AttentionReason
+			if recovery.NeedsAttention {
+				progress.Phase = "needs_action"
+			} else {
+				switch recovery.Stage {
+				case "local_unlock":
+					progress.Phase = "local_fallback"
+					progress.TemporaryLocalFallback = progress.Strategy == "intent"
+				default:
+					progress.Phase = "intent_replanning"
+				}
+			}
+		}
+		switch {
+		case active:
+		case report.PendingEvents == 0:
+			progress.Phase = "idle"
+		case report.Replay.State == "needs_attention" ||
+			report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
+			progress.Phase = "needs_action"
+		case report.Replay.State == "degraded":
+			progress.Phase = "retrying"
+		case report.IntentV2.VerificationRecovering > 0:
+			progress.Phase = "intent_verification_recovery"
+		case report.IntentStrategy.Active:
+			progress.Phase = "intent_processing"
+		default:
+			progress.Phase = "event_publishing"
+		}
+		lastProgress, err := regularPublicationProgressBaseline(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+		if err != nil {
+			return progress, err
+		}
+		if lastProgress > progress.LastProgressTS {
+			progress.LastProgressTS = lastProgress
+		}
+	}
+	verification, verificationUpdatedTS, verificationActive, err :=
+		readIntentVerificationActivityProgress(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+	if err != nil {
+		return progress, err
+	}
+	if verificationActive && progress.WorkerResponsive {
+		activeIntentVerification = true
+		progress.VerificationCandidate = verification.CandidateID
+		progress.VerificationPlan = verification.PlanFingerprint
+		progress.VerificationRecovery = verification.RecoveryCandidateID
+		if verificationUpdatedTS > progress.LastProgressTS {
+			progress.LastProgressTS = verificationUpdatedTS
+		}
+	}
+	if progress.Phase != "needs_action" {
+		manualPause := report.Paused &&
+			(report.Pause == nil || report.Pause.Source != "rewind_grace")
+		switch {
+		case manualPause:
+			progress.Phase = "paused"
+		case report.Paused && report.Pause != nil &&
+			report.Pause.Source == "rewind_grace":
+			progress.Phase = "rewind_wait"
+			progress.WaitRemainingSeconds = report.Pause.RemainingSeconds
+		case report.Configuration.Configuration == "validating":
+			progress.Phase = "config_wait"
+		case activeIntentVerification:
+			progress.Phase = "verifying"
+			progress.WaitRemainingSeconds = 0
+			progress.TemporaryLocalFallback = false
+		case activeIntentRecovery && intentProviderCallActive(report):
+			progress.Phase = "provider_call"
+			progress.WaitRemainingSeconds = 0
+			progress.TemporaryLocalFallback = false
+		case activeIntentRecovery && intentProviderWaitOverridesRecovery(report):
+			progress.Phase = "provider_wait"
+			progress.WaitRemainingSeconds = intentProviderRetryRemainingSeconds(
+				report.IntentStrategy.PlannerHealth, now)
+			progress.TemporaryLocalFallback = false
+		case activeIntentRecovery:
+		case report.CheckpointProtectionAvailable && !report.Protected && report.Busy:
+			progress.Phase = "checkpointing"
+		case intentProviderCallActive(report):
+			progress.Phase = "provider_call"
+			progress.WaitRemainingSeconds = 0
+			progress.TemporaryLocalFallback = false
+		case intentProviderWaitActive(report):
+			progress.Phase = "provider_wait"
+			progress.WaitRemainingSeconds = intentProviderRetryRemainingSeconds(
+				report.IntentStrategy.PlannerHealth, now)
+			progress.TemporaryLocalFallback = false
+		case !activeDrain && report.PendingEvents > 0 &&
+			progress.Phase != "intent_verification_recovery" &&
+			report.IntentStrategy.BatchWaitActive:
+			progress.Phase = "intent_wait"
+			progress.WaitRemainingSeconds = intentWaitRemainingSeconds(
+				report.IntentStrategy)
+		}
+	}
+	if progress.LastProgressTS > 0 {
+		age := now.Sub(time.Unix(0,
+			int64(progress.LastProgressTS*float64(time.Second))))
+		if age < 0 {
+			age = 0
+		}
+		progress.LastProgressAgeSeconds = int64(age / time.Second)
+	}
+	stallThreshold := publicationStallThreshold(ctx, conn)
+	progress.StallThresholdSeconds = int64(stallThreshold / time.Second)
+	if progress.WorkerResponsive && progress.QueuePending > 0 &&
+		progress.LastProgressTS > 0 && ageExceedsThreshold(
+		progress.LastProgressAgeSeconds, stallThreshold) &&
+		publicationPhaseCanStall(progress.Phase) {
+		progress.Phase = "stalled"
+	}
+	return progress, nil
+}
+
+func intentProviderWaitActive(report statusReport) bool {
+	if report.PendingEvents <= 0 {
+		return false
+	}
+	if report.IntentStrategy.ResolutionMode == "waiting_message_rewrite" {
+		return true
+	}
+	health := report.IntentStrategy.PlannerHealth
+	return health != nil && health.State == daemon.IntentPlannerCircuitOpen
+}
+
+func intentProviderCallActive(report statusReport) bool {
+	health := report.IntentStrategy.PlannerHealth
+	return report.PendingEvents > 0 && health != nil &&
+		health.State == daemon.IntentPlannerCircuitHalfOpen
+}
+
+// An open circuit has no provider lease in flight, so its retry wait takes
+// priority over the otherwise active recovery phase.
+func intentProviderWaitOverridesRecovery(report statusReport) bool {
+	health := report.IntentStrategy.PlannerHealth
+	return health != nil && health.State == daemon.IntentPlannerCircuitOpen
+}
+
+func intentProviderRetryRemainingSeconds(
+	health *daemon.IntentPlannerHealthSnapshot,
+	now time.Time,
+) int64 {
+	if health == nil || health.State != daemon.IntentPlannerCircuitOpen ||
+		health.NextProbeTS <= 0 {
+		return 0
+	}
+	retryAt := time.Unix(0,
+		int64(health.NextProbeTS*float64(time.Second)))
+	remaining := retryAt.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	return int64((remaining + time.Second - 1) / time.Second)
+}
+
+func publicationStallThreshold(ctx context.Context, conn *sql.DB) time.Duration {
+	timeout := ai.LoadProviderConfigFromEnv().Timeout
+	if conn != nil {
+		if raw, ok, err := metaLookup(ctx, conn, "ai.timeout"); err == nil && ok {
+			if parsed, parseErr := time.ParseDuration(strings.TrimSpace(raw)); parseErr == nil && parsed > 0 {
+				timeout = parsed
+			}
+		}
+	}
+	threshold := 2*timeout + 30*time.Second
+	if threshold < 2*time.Minute {
+		threshold = 2 * time.Minute
+	}
+	return threshold
+}
+
+func ageExceedsThreshold(ageSeconds int64, threshold time.Duration) bool {
+	return time.Duration(ageSeconds)*time.Second >= threshold
+}
+
+func publicationPhaseCanStall(phase string) bool {
+	switch phase {
+	case "working", "intent_planning", "intent_replanning", "intent_processing",
+		"local_fallback", "verifying", "event_publishing":
+		return true
+	default:
+		return false
+	}
+}
+
+func readIntentVerificationActivityProgress(
+	ctx context.Context,
+	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
+) (daemon.IntentVerificationActivity, float64, bool, error) {
+	var activity daemon.IntentVerificationActivity
+	if conn == nil || strings.TrimSpace(branchRef) == "" || branchGeneration < 0 {
+		return activity, 0, false, nil
+	}
+	var raw string
+	var updatedTS float64
+	err := conn.QueryRowContext(ctx, `
+SELECT value, updated_ts
+FROM daemon_meta
+WHERE key=?`, daemon.MetaKeyIntentVerificationActivity).Scan(&raw, &updatedTS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return activity, 0, false, nil
+	}
+	if err != nil {
+		return activity, 0, false, err
+	}
+	activity, err = daemon.DecodeIntentVerificationActivity(raw)
+	if err != nil {
+		return activity, 0, false, err
+	}
+	if activity.BranchRef != branchRef ||
+		activity.BranchGeneration != branchGeneration {
+		return activity, 0, false, nil
+	}
+	if activity.StartedTS > updatedTS {
+		updatedTS = activity.StartedTS
+	}
+	return activity, updatedTS, true, nil
+}
+
+func readIntentForwardRecoveryProgress(
+	ctx context.Context,
+	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
+) (intentForwardRecoveryProgress, bool, error) {
+	var progress intentForwardRecoveryProgress
+	if conn == nil || strings.TrimSpace(branchRef) == "" || branchGeneration < 0 {
+		return progress, false, nil
+	}
+	var raw string
+	var markerUpdatedTS float64
+	err := conn.QueryRowContext(ctx, `
+SELECT value, updated_ts
+FROM daemon_meta
+WHERE key=?`, "intent.v2.forward_recovery").Scan(&raw, &markerUpdatedTS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return progress, false, nil
+	}
+	if err != nil {
+		return progress, false, err
+	}
+	var recovery state.IntentForwardRecovery
+	if err := json.Unmarshal([]byte(raw), &recovery); err != nil {
+		return progress, false, fmt.Errorf(
+			"parse intent forward recovery progress: %w", err)
+	}
+	if recovery.BranchRef != branchRef ||
+		recovery.BranchGeneration != branchGeneration ||
+		len(recovery.TargetEventSeqs) == 0 {
+		return progress, false, nil
+	}
+	if len(recovery.TargetEventSeqs) > state.IntentCandidateMaxCaptures {
+		return progress, false, errors.New(
+			"intent forward recovery target exceeds the capture limit")
+	}
+	seen := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
+	args := make([]any, 0, 2+len(recovery.TargetEventSeqs))
+	args = append(args, branchRef, branchGeneration)
+	placeholders := make([]string, 0, len(recovery.TargetEventSeqs))
+	for _, seq := range recovery.TargetEventSeqs {
+		if seq <= 0 {
+			return progress, false, errors.New(
+				"intent forward recovery target contains an invalid capture")
+		}
+		if _, duplicate := seen[seq]; duplicate {
+			return progress, false, errors.New(
+				"intent forward recovery target contains a duplicate capture")
+		}
+		seen[seq] = struct{}{}
+		args = append(args, seq)
+		placeholders = append(placeholders, "?")
+	}
+	query := `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN state IN ('published','recovered')
+                         THEN 1 ELSE 0 END),0)
+FROM capture_events
+WHERE branch_ref=? AND branch_generation=?
+  AND seq IN (` + strings.Join(placeholders, ",") + `)`
+	var existing, resolved int64
+	if err := conn.QueryRowContext(ctx, query, args...).Scan(
+		&existing, &resolved); err != nil {
+		return progress, false, fmt.Errorf(
+			"read intent forward recovery progress: %w", err)
+	}
+	if existing != int64(len(recovery.TargetEventSeqs)) || resolved > existing {
+		return progress, false, errors.New(
+			"intent forward recovery target cannot be proved")
+	}
+	stage := strings.TrimSpace(recovery.Stage)
+	if stage == "" {
+		stage = "semantic_replan"
+	}
+	// A legacy or invalid local-unlock marker has no anchored semantic prefix.
+	// Replay sends that state back through the configured provider before any
+	// local widening can begin, so report the work that is actually happening.
+	if stage == "local_unlock" &&
+		(strings.TrimSpace(recovery.PlanFingerprint) == "" ||
+			recovery.PrefixCursor < 1 || recovery.PrefixUnresolvedCount < 1 ||
+			strings.TrimSpace(recovery.PrefixBaseHead) == "") {
+		stage = "semantic_replan"
+	}
+	lastProgressTS := recovery.LastProgressTS
+	if markerUpdatedTS > lastProgressTS {
+		lastProgressTS = markerUpdatedTS
+	}
+	return intentForwardRecoveryProgress{
+		Stage: stage, TargetTotal: existing,
+		TargetRemaining: existing - resolved,
+		LastProgressTS:  lastProgressTS,
+		NeedsAttention:  recovery.NeedsAttention,
+		AttentionReason: sanitizeObservabilityText(recovery.AttentionReason),
+	}, true, nil
+}
+
+func regularPublicationProgressBaseline(
+	ctx context.Context,
+	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
+) (float64, error) {
+	if conn == nil {
+		return 0, nil
+	}
+	var oldestPending sql.NullFloat64
+	pendingQuery := `SELECT MIN(captured_ts) FROM capture_events WHERE state=?`
+	pendingArgs := []any{state.EventStatePending}
+	if branchRef != "" {
+		pendingQuery += ` AND branch_ref=? AND branch_generation=?`
+		pendingArgs = append(pendingArgs, branchRef, branchGeneration)
+	}
+	if err := conn.QueryRowContext(ctx, pendingQuery,
+		pendingArgs...).Scan(&oldestPending); err != nil {
+		return 0, err
+	}
+	if !oldestPending.Valid || oldestPending.Float64 <= 0 {
+		return 0, nil
+	}
+	// The oldest still-pending capture is a conservative work-start baseline.
+	// Only durable publication after that point can move it forward. Newer
+	// captures and worker heartbeats intentionally do not reset the clock.
+	lastProgress := oldestPending.Float64
+	var latestPublished sql.NullFloat64
+	publishedQuery := `
+SELECT MAX(published_ts)
+FROM capture_events
+WHERE published_ts IS NOT NULL AND published_ts>=?`
+	publishedArgs := []any{oldestPending.Float64}
+	if branchRef != "" {
+		publishedQuery += ` AND branch_ref=? AND branch_generation=?`
+		publishedArgs = append(publishedArgs, branchRef, branchGeneration)
+	}
+	if err := conn.QueryRowContext(ctx, publishedQuery,
+		publishedArgs...).Scan(&latestPublished); err != nil {
+		return 0, err
+	}
+	if latestPublished.Valid && latestPublished.Float64 > lastProgress {
+		lastProgress = latestPublished.Float64
+	}
+	return lastProgress, nil
+}
+
+func intentWaitRemainingSeconds(report intentStrategyReport) int64 {
+	if report.BatchWaitReason == "skipped_due_intent_settle_window" {
+		return report.SettleTriggerInSeconds
+	}
+	return report.AgeTriggerInSeconds
 }
 
 func statusOperationalState(report statusReport) string {
@@ -526,16 +1021,22 @@ func statusOperationalStateWithDaemonAlive(report statusReport, daemonAlive bool
 func readStatusPublicationDrain(
 	ctx context.Context,
 	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
 ) (publicationDrainReport, error) {
 	report := publicationDrainReport{Available: true}
+	if branchRef == "" {
+		return report, nil
+	}
 	var stagedConsent, stagedConsumed int
 	err := conn.QueryRowContext(ctx, `
 SELECT id,checkpoint_id,phase,target_event_count,published_event_count,
  semantic_rebuild_attempts,event_fallback_count,commit_count,fallback_mode,
- last_error,last_progress_ts,staged_consent,staged_consumed
-FROM publication_drains
-ORDER BY CASE WHEN phase NOT IN ('completed','needs_action') THEN 0 ELSE 1 END,
- updated_ts DESC,id DESC LIMIT 1`).Scan(
+	 last_error,last_progress_ts,staged_consent,staged_consumed
+	FROM publication_drains
+	WHERE branch_ref=? AND branch_generation=?
+	ORDER BY CASE WHEN phase NOT IN ('completed','needs_action') THEN 0 ELSE 1 END,
+	 updated_ts DESC,id DESC LIMIT 1`, branchRef, branchGeneration).Scan(
 		&report.ID, &report.CheckpointID, &report.Phase,
 		&report.TargetEvents, &report.PublishedEvents,
 		&report.SemanticRebuildAttempts, &report.EventFallbackCount,
@@ -551,6 +1052,25 @@ ORDER BY CASE WHEN phase NOT IN ('completed','needs_action') THEN 0 ELSE 1 END,
 	report.StagedConsent = stagedConsent != 0
 	report.StagedConsumed = stagedConsumed != 0
 	return report, nil
+}
+
+func currentWorktreeReplayPair(
+	ctx context.Context,
+	conn *sql.DB,
+	repo string,
+) (string, int64, bool, error) {
+	branchRef, generation, ok, err := currentReplayPair(ctx, conn)
+	if err != nil || !ok {
+		return branchRef, generation, ok, err
+	}
+	currentBranch, err := git.RunBranchRef(ctx, repo)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("current worktree branch: %w", err)
+	}
+	if currentBranch != branchRef {
+		return "", 0, false, nil
+	}
+	return branchRef, generation, true, nil
 }
 
 func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval time.Duration) error {
@@ -701,9 +1221,10 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	renderIntentV2Human(out, r.IntentV2)
 	renderSelfPublicationHuman(out, r.SelfPublication, "")
 	renderPublicationDrainHuman(out, r.PublicationDrain)
+	renderProductPublicationProgress(out, r.PublicationProgress)
 	fmt.Fprintf(out, "Operational state: %s", valueOrUnset(r.OperationalState))
 	if r.Busy {
-		fmt.Fprint(out, " (heartbeat fresh; work in progress)")
+		fmt.Fprint(out, " (worker responsive; progress shown separately)")
 	}
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "Worktree clean: %s\n", yesNo(r.WorktreeClean))
@@ -819,7 +1340,8 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 }
 
 func renderPublicationDrainHuman(out io.Writer, drain publicationDrainReport) {
-	if !drain.Available || drain.ID == "" {
+	if !drain.Available || drain.ID == "" ||
+		drain.Phase == state.PublicationDrainCompleted {
 		return
 	}
 	fmt.Fprintf(out,

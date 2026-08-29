@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -3963,7 +3964,10 @@ func TestPublishIntentV2JournalSkippedForHandledExternalAndNoOp(t *testing.T) {
 				t.Fatal(err)
 			}
 			sum, err := publishIntentSelection(
-				ctx, f.dir, f.db, activeCtx, ReplayOpts{}, indexFile,
+				ctx, f.dir, f.db, activeCtx, ReplayOpts{
+					IntentRepairEnabled: true,
+					IntentRepairHorizon: time.Hour,
+				}, indexFile,
 				[]intentReplayItem{{
 					event: event, ops: []state.CaptureOp{op},
 					candidateID: candidateID,
@@ -3982,7 +3986,8 @@ func TestPublishIntentV2JournalSkippedForHandledExternalAndNoOp(t *testing.T) {
 			if err != nil || !ok ||
 				candidate.Status != state.IntentCandidatePublished ||
 				!candidate.PublishedCommitOID.Valid ||
-				candidate.PublishedCommitOID.String != parent {
+				candidate.PublishedCommitOID.String != parent ||
+				candidate.SoftPublicationDeadline.Valid {
 				t.Fatalf("candidate=(%+v,%v,%v) parent=%s",
 					candidate, ok, err, parent)
 			}
@@ -4771,6 +4776,75 @@ func TestReplay_IntentStrategyForcedAgingSingletonDeterministicUsesDiffSubject(t
 	// Publish path records the intent_group_committed action via the
 	// committed decision kind plus an "intent_group:" reason prefix.
 	assertReplayDecision(t, ctx, f.db, pending[0].Seq, state.DecisionKindCommitted, "intent_group: forced-aging singleton: provider skipped")
+}
+
+func TestResolveIntentReplayConfigDoesNotDegradeSemanticProvider(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyIntent))
+	t.Setenv(ai.EnvProvider, "openai-compat")
+	t.Setenv(ai.EnvAPIKey, "")
+
+	cfg, closer, err := resolveIntentReplayConfig(ReplayOpts{
+		IntentPreset: config.PresetBalanced,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer != nil {
+		t.Fatal("unavailable semantic provider returned a closer")
+	}
+	if cfg.plannerProvider != "openai-compat" {
+		t.Fatalf("provider=%q want openai-compat", cfg.plannerProvider)
+	}
+	if _, ok := cfg.planner.(unavailableIntentPlanner); !ok {
+		t.Fatalf("planner=%T, want unavailable semantic planner", cfg.planner)
+	}
+	if _, err := cfg.planner.PlanIntent(context.Background(),
+		ai.IntentPlanRequest{}); err == nil ||
+		!strings.Contains(err.Error(), "missing API key") {
+		t.Fatalf("planner error=%v, want missing API key", err)
+	}
+}
+
+func TestResolveIntentReplayConfigPrefersInjectedCommitFormat(t *testing.T) {
+	t.Setenv(ai.EnvCommitFormat, string(ai.CommitFormatImperative))
+	t.Setenv(ai.EnvProvider, "deterministic")
+
+	for _, tc := range []struct {
+		name    string
+		planner ai.IntentPlanner
+	}{
+		{name: "injected", planner: ai.DeterministicProvider{}},
+		{name: "built from environment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, closer, err := resolveIntentReplayConfig(ReplayOpts{
+				CommitStrategy: ai.CommitStrategyIntent,
+				CommitFormat:   ai.CommitFormatConventional,
+				IntentPlanner:  tc.planner,
+				IntentPreset:   config.PresetFast,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if closer != nil {
+				t.Fatal("planner returned an unexpected closer")
+			}
+			if cfg.commitFormat != ai.CommitFormatConventional {
+				t.Fatalf("commit format=%q want active runtime format %q",
+					cfg.commitFormat, ai.CommitFormatConventional)
+			}
+			if tc.planner == nil {
+				planner, ok := cfg.planner.(ai.DeterministicProvider)
+				if !ok {
+					t.Fatalf("planner=%T want deterministic provider", cfg.planner)
+				}
+				if planner.CommitFormat != ai.CommitFormatConventional {
+					t.Fatalf("planner commit format=%q want %q",
+						planner.CommitFormat, ai.CommitFormatConventional)
+				}
+			}
+		})
+	}
 }
 
 func TestPlanIntentSingletonMessagePathConventionalDefault(t *testing.T) {

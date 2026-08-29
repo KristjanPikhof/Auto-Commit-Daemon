@@ -257,13 +257,17 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	var plannerHits atomic.Int32
+	var rewriteHits atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
 		req := decodeIntentChatRequest(t, r)
-		if writeIntentMessageRewriteResponse(t, w, req) {
+		if req.ToolChoice.Function.Name == "commit_message" {
+			rewriteHits.Add(1)
+			http.Error(w, "message rewrite temporarily unavailable",
+				http.StatusServiceUnavailable)
 			return
 		}
 		plannerHits.Add(1)
@@ -296,20 +300,38 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	headBefore := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	writeFile(t, filepath.Join(repo, "singleton-one.txt"), "one\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
-	waitHeadAdvances(t, repo, headBefore, 10*time.Second)
-	waitForEventState(t, dbPath, "singleton-one.txt", "published", 10*time.Second)
-	waitFor(t, "first evidence partition recovery", 10*time.Second, func() bool {
-		return sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM intent_planner_windows WHERE resolution_mode='evidence_partition' AND validation_failure IS NOT NULL") == "1"
+	waitForEventState(t, dbPath, "singleton-one.txt", "pending", 10*time.Second)
+	waitFor(t, "semantic message wait after transport failure", 10*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, `
+SELECT COALESCE(progress_state, '')
+FROM intent_plan_runs
+ORDER BY updated_ts DESC
+LIMIT 1`) == "waiting_message_rewrite"
+	})
+	waitFor(t, "planner circuit opens", 10*time.Second, func() bool {
+		raw := sqliteScalar(t, dbPath,
+			"SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
+		var health struct {
+			State string `json:"state"`
+		}
+		return json.Unmarshal([]byte(raw), &health) == nil &&
+			health.State == "open"
 	})
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after first capture=%d want 1", got)
 	}
+	if got := rewriteHits.Load(); got < 1 {
+		t.Fatalf("message rewrite hits=%d want at least 1", got)
+	}
+	if headAfter := strings.TrimSpace(runGitOK(
+		t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
+		t.Fatalf("semantic provider outage advanced HEAD: before=%s after=%s",
+			headBefore, headAfter)
+	}
 
-	headAfterFirst := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	writeFile(t, filepath.Join(repo, "singleton-two.txt"), "two\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
-	waitHeadAdvances(t, repo, headAfterFirst, 10*time.Second)
-	waitForEventState(t, dbPath, "singleton-two.txt", "published", 10*time.Second)
+	waitForEventState(t, dbPath, "singleton-two.txt", "pending", 10*time.Second)
 
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after cooldown bypass=%d want 1", got)
@@ -325,7 +347,18 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 		}
 		return json.Unmarshal([]byte(raw), &health) == nil && health.State == "open" && health.BypassCount >= 1
 	})
-	if got := commitCount(t, repo); got != startCount+2 {
-		t.Fatalf("commit count=%d want two deterministic fallback commits after initial HEAD", got)
+	if got := sqliteScalar(t, dbPath, `
+SELECT COUNT(*) FROM capture_events
+WHERE path IN ('singleton-one.txt','singleton-two.txt') AND state='pending'`); got != "2" {
+		t.Fatalf("pending captures=%s want 2", got)
+	}
+	if headAfter := strings.TrimSpace(runGitOK(
+		t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
+		t.Fatalf("circuit bypass advanced HEAD: before=%s after=%s",
+			headBefore, headAfter)
+	}
+	if got := commitCount(t, repo); got != startCount {
+		t.Fatalf("commit count=%d want unchanged %d during provider outage",
+			got, startCount)
 	}
 }

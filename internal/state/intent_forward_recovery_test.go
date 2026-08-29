@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -145,6 +146,502 @@ INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,1)`,
 	}
 }
 
+func TestIntentForwardRecoverySemanticPrefixPersistsAndResetsAfterProgress(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+
+	prefix, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, recovery, "sha256:plan-one", "base-head-one", 1)
+	if err != nil || prefix.Stage != "local_unlock" ||
+		prefix.PlanFingerprint != "sha256:plan-one" ||
+		prefix.PrefixBaseHead != "base-head-one" || prefix.PrefixCursor != 1 ||
+		prefix.PrefixUnresolvedCount != len(recovery.TargetEventSeqs) {
+		t.Fatalf("initial prefix=(%+v,%v)", prefix, err)
+	}
+	loaded, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, recovery.BranchRef, recovery.BranchGeneration)
+	if err != nil || !active || !reflect.DeepEqual(loaded, prefix) {
+		t.Fatalf("loaded prefix=(%+v active=%t err=%v), want %+v",
+			loaded, active, err, prefix)
+	}
+
+	wider, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, prefix, prefix.PlanFingerprint,
+		prefix.PrefixBaseHead, 2)
+	if err != nil || wider.PrefixCursor != 2 {
+		t.Fatalf("wider prefix=(%+v,%v)", wider, err)
+	}
+	if _, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, recovery, "sha256:plan-one", "base-head-one", 1,
+	); err == nil || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("stale prefix update err=%v", err)
+	}
+	if _, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, wider, "sha256:plan-two", "base-head-one", 4,
+	); err == nil || !strings.Contains(err.Error(), "plan changed") {
+		t.Fatalf("changed plan err=%v", err)
+	}
+	if _, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, wider, wider.PlanFingerprint,
+		wider.PrefixBaseHead, 1,
+	); err == nil || !strings.Contains(err.Error(), "move backward") {
+		t.Fatalf("backward prefix err=%v", err)
+	}
+	changedTarget := wider
+	changedTarget.TargetEventSeqs = append(
+		[]int64(nil), changedTarget.TargetEventSeqs[:2]...)
+	if _, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, changedTarget, changedTarget.PlanFingerprint,
+		changedTarget.PrefixBaseHead, 4,
+	); err == nil || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("changed target err=%v", err)
+	}
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',commit_oid='prefix-progress',published_ts=2
+WHERE seq=?`, recovery.TargetEventSeqs[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	progressed, err := AdvanceIntentForwardRecovery(
+		ctx, fixture.db, wider, "semantic_replan", 1)
+	if err != nil || progressed.Stage != "semantic_replan" ||
+		progressed.UnlockCount != 1 || progressed.LastProgressTS <= 0 ||
+		progressed.PlanFingerprint != "" || progressed.PrefixCursor != 0 ||
+		progressed.PrefixUnresolvedCount != 0 ||
+		progressed.PrefixBaseHead != "" || progressed.PrefixExhausted ||
+		progressed.NeedsAttention || progressed.AttentionReason != "" {
+		t.Fatalf("progress reset=(%+v,%v)", progressed, err)
+	}
+
+	second, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, progressed, "sha256:plan-two", "base-head-two", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.PrefixUnresolvedCount != len(recovery.TargetEventSeqs)-1 {
+		t.Fatalf("second prefix baseline=%d want %d",
+			second.PrefixUnresolvedCount, len(recovery.TargetEventSeqs)-1)
+	}
+	attention, err := MarkIntentForwardRecoveryNeedsAttention(
+		ctx, fixture.db, second, "complete semantic prefix failed verification")
+	if err != nil || !attention.PrefixExhausted || !attention.NeedsAttention ||
+		attention.AttentionReason !=
+			"complete semantic prefix failed verification" {
+		t.Fatalf("attention marker=(%+v,%v)", attention, err)
+	}
+	idempotent, err := MarkIntentForwardRecoveryNeedsAttention(
+		ctx, fixture.db, attention,
+		"complete semantic prefix failed verification")
+	if err != nil || !reflect.DeepEqual(idempotent, attention) {
+		t.Fatalf("idempotent attention=(%+v,%v), want %+v",
+			idempotent, err, attention)
+	}
+	if _, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, attention, attention.PlanFingerprint,
+		attention.PrefixBaseHead, 2,
+	); err == nil || !strings.Contains(err.Error(), "exhausted") {
+		t.Fatalf("exhausted prefix err=%v", err)
+	}
+	if _, err := AdvanceIntentForwardRecovery(
+		ctx, fixture.db, attention, "semantic_replan", 0,
+	); err == nil || !strings.Contains(err.Error(), "requires attention") {
+		t.Fatalf("exhausted stage transition err=%v", err)
+	}
+	if _, err := ResetIntentForwardRecoveryInvalidPlan(
+		ctx, fixture.db, attention,
+	); err == nil || !strings.Contains(err.Error(), "invalid input") {
+		t.Fatalf("exhausted invalid-plan reset err=%v", err)
+	}
+}
+
+func TestIntentForwardRecoveryPrefixInitializesLegacyLocalUnlockMarker(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	recovery.Stage = "local_unlock"
+	raw, err := json.Marshal(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET value=?,updated_ts=2 WHERE key=?`,
+		string(raw), intentForwardRecoveryMetaKey); err != nil {
+		t.Fatal(err)
+	}
+	legacy, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, recovery.BranchRef, recovery.BranchGeneration)
+	if err != nil || !active || legacy.PlanFingerprint != "" ||
+		legacy.PrefixCursor != 0 {
+		t.Fatalf("legacy local marker=(%+v active=%t err=%v)",
+			legacy, active, err)
+	}
+	initialized, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, legacy, "sha256:legacy-plan", "legacy-head", 1)
+	if err != nil || initialized.PlanFingerprint != "sha256:legacy-plan" ||
+		initialized.PrefixBaseHead != "legacy-head" ||
+		initialized.PrefixCursor != 1 ||
+		initialized.PrefixUnresolvedCount != len(recovery.TargetEventSeqs) {
+		t.Fatalf("initialized legacy prefix=(%+v,%v)", initialized, err)
+	}
+}
+
+func TestResetIntentForwardRecoveryPrefixAfterDurableProgress(t *testing.T) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	prefix, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, recovery, "sha256:crash-plan", "old-prefix-head", 2)
+	if err != nil || prefix.PrefixUnresolvedCount != len(fixture.seqs) {
+		t.Fatalf("prefix=(%+v,%v)", prefix, err)
+	}
+	unchanged, progressed, err := ResetIntentForwardRecoveryPrefixAfterProgress(
+		ctx, fixture.db, prefix)
+	if err != nil || progressed || !reflect.DeepEqual(unchanged, prefix) {
+		t.Fatalf("unchanged reset=(%+v progressed=%t err=%v), want %+v",
+			unchanged, progressed, err, prefix)
+	}
+	if _, err := AdvanceIntentForwardRecovery(
+		ctx, fixture.db, prefix, "semantic_replan", 1,
+	); err == nil || !strings.Contains(err.Error(), "not durable") {
+		t.Fatalf("unproved progress err=%v", err)
+	}
+
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',commit_oid='durable-prefix-head',published_ts=2
+WHERE seq=?`, fixture.seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	loaded, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, prefix.BranchRef, prefix.BranchGeneration)
+	if err != nil || !active || !reflect.DeepEqual(loaded, prefix) {
+		t.Fatalf("crash marker=(%+v active=%t err=%v), want %+v",
+			loaded, active, err, prefix)
+	}
+	reset, progressed, err := ResetIntentForwardRecoveryPrefixAfterProgress(
+		ctx, fixture.db, loaded)
+	if err != nil || !progressed || reset.Stage != "semantic_replan" ||
+		reset.UnlockCount != prefix.UnlockCount+1 ||
+		reset.LastProgressTS <= prefix.LastProgressTS ||
+		reset.PlanFingerprint != "" || reset.PrefixCursor != 0 ||
+		reset.PrefixUnresolvedCount != 0 || reset.PrefixBaseHead != "" ||
+		reset.PrefixExhausted || reset.NeedsAttention ||
+		!reflect.DeepEqual(reset.TargetEventSeqs, prefix.TargetEventSeqs) {
+		t.Fatalf("durable progress reset=(%+v progressed=%t err=%v)",
+			reset, progressed, err)
+	}
+	if _, progressed, err := ResetIntentForwardRecoveryPrefixAfterProgress(
+		ctx, fixture.db, prefix,
+	); err == nil || progressed || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("stale crash reset progressed=%t err=%v", progressed, err)
+	}
+}
+
+func TestResetIntentForwardRecoveryInvalidPlanPreservesProgressIdentity(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	prefix, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, recovery, "sha256:invalid-plan", "same-head", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reset, err := ResetIntentForwardRecoveryInvalidPlan(ctx, fixture.db, prefix)
+	if err != nil || reset.Stage != "semantic_replan" ||
+		reset.UnlockCount != prefix.UnlockCount ||
+		reset.LastProgressTS != prefix.LastProgressTS ||
+		reset.PlanFingerprint != "" || reset.PrefixCursor != 0 ||
+		reset.PrefixUnresolvedCount != 0 || reset.PrefixBaseHead != "" ||
+		reset.PrefixExhausted || reset.NeedsAttention ||
+		!reflect.DeepEqual(reset.TargetEventSeqs, prefix.TargetEventSeqs) {
+		t.Fatalf("invalid plan reset=(%+v,%v)", reset, err)
+	}
+	if _, err := ResetIntentForwardRecoveryInvalidPlan(
+		ctx, fixture.db, prefix,
+	); err == nil || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("stale invalid plan reset err=%v", err)
+	}
+}
+
+func TestResetIntentForwardRecoveryInvalidPlanAcceptsIncompletePrefixMarker(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	recovery, err = AdvanceIntentForwardRecovery(
+		ctx, fixture.db, recovery, "local_unlock", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery.PlanFingerprint = "sha256:incomplete-prefix"
+	raw, err := json.Marshal(recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET value=?,updated_ts=2 WHERE key=?`,
+		string(raw), intentForwardRecoveryMetaKey); err != nil {
+		t.Fatal(err)
+	}
+	loaded, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, recovery.BranchRef, recovery.BranchGeneration)
+	if err != nil || !active || loaded.PrefixCursor != 0 ||
+		loaded.PrefixBaseHead != "" || loaded.PrefixUnresolvedCount != 0 {
+		t.Fatalf("incomplete marker=(%+v active=%t err=%v)", loaded, active, err)
+	}
+	reset, err := ResetIntentForwardRecoveryInvalidPlan(
+		ctx, fixture.db, loaded)
+	if err != nil || reset.Stage != "semantic_replan" ||
+		reset.PlanFingerprint != "" || reset.PrefixCursor != 0 ||
+		reset.PrefixBaseHead != "" || reset.PrefixUnresolvedCount != 0 ||
+		!reflect.DeepEqual(reset.TargetEventSeqs, recovery.TargetEventSeqs) {
+		t.Fatalf("incomplete plan reset=(%+v,%v)", reset, err)
+	}
+}
+
+func TestExpandIntentForwardRecoveryTargetReopensExhaustedMarker(
+	t *testing.T,
+) {
+	fixture := seedExpandableIntentForwardRecovery(t)
+	ctx := context.Background()
+	scanned, err := RecordIntentForwardRecoveryExpansionScan(
+		ctx, fixture.db, fixture.recovery, fixture.original[1])
+	if err != nil || scanned.ExpansionScannedThroughSeq != fixture.original[1] {
+		t.Fatalf("record expansion scan=(%+v,%v)", scanned, err)
+	}
+	later := appendIntentV2Event(
+		t, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "later-recovery-source.go")
+	seedFailedIntentCompletedCheckpoint(t, fixture.db, "expansion", []int64{later})
+	const failedSuccessorID = "failed-expanded-recovery-successor"
+	if err := SaveIntentCandidate(ctx, fixture.db, IntentCandidate{
+		ID: failedSuccessorID, BranchRef: failedIntentCheckpointBranch,
+		BranchGeneration: failedIntentCheckpointGeneration,
+		Status:           IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Purpose: "stale recovery candidate",
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{
+			{EventSeq: fixture.original[0], EventRole: "implementation"},
+			{EventSeq: fixture.original[1], EventRole: "implementation"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	expandedTarget := []int64{
+		fixture.original[0], fixture.addition, fixture.original[1], later,
+	}
+	expanded, changed, err := ExpandIntentForwardRecoveryTarget(
+		ctx, fixture.db, scanned, expandedTarget)
+	if err != nil || !changed || expanded.Stage != "semantic_replan" ||
+		!reflect.DeepEqual(expanded.TargetEventSeqs, expandedTarget) ||
+		expanded.UnlockCount != fixture.recovery.UnlockCount ||
+		expanded.LastProgressTS != fixture.recovery.LastProgressTS ||
+		expanded.PlanFingerprint != "" || expanded.PrefixCursor != 0 ||
+		expanded.PrefixUnresolvedCount != 0 || expanded.PrefixBaseHead != "" ||
+		expanded.PrefixExhausted || expanded.NeedsAttention ||
+		expanded.AttentionReason != "" || expanded.ExpansionScannedThroughSeq != 0 {
+		t.Fatalf("expanded recovery=(%+v changed=%t err=%v)",
+			expanded, changed, err)
+	}
+	candidate, ok, err := IntentCandidateByID(ctx, fixture.db, failedSuccessorID)
+	if err != nil || !ok || candidate.Status != IntentCandidateSuperseded ||
+		len(candidate.Events) != 0 {
+		t.Fatalf("retired successor=(%+v ok=%t err=%v)", candidate, ok, err)
+	}
+	unchanged, changed, err := ExpandIntentForwardRecoveryTarget(
+		ctx, fixture.db, expanded, expandedTarget)
+	if err != nil || changed || !reflect.DeepEqual(unchanged, expanded) {
+		t.Fatalf("idempotent expansion=(%+v changed=%t err=%v), want %+v",
+			unchanged, changed, err, expanded)
+	}
+	if _, _, err := ExpandIntentForwardRecoveryTarget(
+		ctx, fixture.db, scanned, expandedTarget,
+	); err == nil || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("stale expansion err=%v", err)
+	}
+}
+
+func TestRecordIntentForwardRecoveryExpansionScanIsExactAndIdempotent(
+	t *testing.T,
+) {
+	fixture := seedExpandableIntentForwardRecovery(t)
+	ctx := context.Background()
+	horizon := fixture.original[1]
+	recorded, err := RecordIntentForwardRecoveryExpansionScan(
+		ctx, fixture.db, fixture.recovery, horizon)
+	if err != nil || recorded.ExpansionScannedThroughSeq != horizon ||
+		recorded.UnlockCount != fixture.recovery.UnlockCount ||
+		recorded.LastProgressTS != fixture.recovery.LastProgressTS {
+		t.Fatalf("recorded expansion scan=(%+v,%v)", recorded, err)
+	}
+	idempotent, err := RecordIntentForwardRecoveryExpansionScan(
+		ctx, fixture.db, recorded, horizon)
+	if err != nil || !reflect.DeepEqual(idempotent, recorded) {
+		t.Fatalf("idempotent expansion scan=(%+v,%v), want %+v",
+			idempotent, err, recorded)
+	}
+	if _, err := RecordIntentForwardRecoveryExpansionScan(
+		ctx, fixture.db, recorded, horizon+1,
+	); err == nil || !strings.Contains(err.Error(), "horizon changed") {
+		t.Fatalf("overstated expansion horizon err=%v", err)
+	}
+	if _, err := RecordIntentForwardRecoveryExpansionScan(
+		ctx, fixture.db, fixture.recovery, horizon,
+	); err == nil || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("stale expansion scan err=%v", err)
+	}
+}
+
+func TestExpandIntentForwardRecoveryTargetRejectsHealthyCandidateAtomically(
+	t *testing.T,
+) {
+	fixture := seedExpandableIntentForwardRecovery(t)
+	ctx := context.Background()
+	const healthyCandidateID = "healthy-expanded-recovery-candidate"
+	if err := SaveIntentCandidate(ctx, fixture.db, IntentCandidate{
+		ID: healthyCandidateID, BranchRef: failedIntentCheckpointBranch,
+		BranchGeneration: failedIntentCheckpointGeneration,
+		Status:           IntentCandidateReady, Readiness: IntentReadinessReady,
+		Purpose: "healthy independent candidate",
+		VerificationStatus: sql.NullString{
+			String: "passed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{{
+			EventSeq: fixture.addition, EventRole: "verification",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expandedTarget := []int64{
+		fixture.original[0], fixture.addition, fixture.original[1],
+	}
+	if _, changed, err := ExpandIntentForwardRecoveryTarget(
+		ctx, fixture.db, fixture.recovery, expandedTarget,
+	); err == nil || changed || !strings.Contains(err.Error(), "healthy") {
+		t.Fatalf("healthy candidate expansion changed=%t err=%v", changed, err)
+	}
+	loaded, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration)
+	if err != nil || !active || !reflect.DeepEqual(loaded, fixture.recovery) {
+		t.Fatalf("marker after rejected expansion=(%+v active=%t err=%v), want %+v",
+			loaded, active, err, fixture.recovery)
+	}
+	candidate, ok, err := IntentCandidateByID(
+		ctx, fixture.db, healthyCandidateID)
+	if err != nil || !ok || candidate.Status != IntentCandidateReady ||
+		len(candidate.Events) != 1 {
+		t.Fatalf("healthy candidate after rollback=(%+v ok=%t err=%v)",
+			candidate, ok, err)
+	}
+	if decisions, err := DecisionsForEvent(
+		ctx, fixture.db, fixture.addition, 10,
+	); err != nil || len(decisions) != 0 {
+		t.Fatalf("rejected addition decisions=%+v err=%v", decisions, err)
+	}
+}
+
+func TestExpandIntentForwardRecoveryTargetRejectsUncheckpointedMember(
+	t *testing.T,
+) {
+	fixture := seedExpandableIntentForwardRecovery(t)
+	ctx := context.Background()
+	uncheckpointed := appendIntentV2Event(
+		t, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "uncheckpointed.go")
+	expandedTarget := append(
+		append([]int64(nil), fixture.original...), uncheckpointed)
+	if _, changed, err := ExpandIntentForwardRecoveryTarget(
+		ctx, fixture.db, fixture.recovery, expandedTarget,
+	); err == nil || changed || !strings.Contains(err.Error(), "completed checkpoint") {
+		t.Fatalf("uncheckpointed expansion changed=%t err=%v", changed, err)
+	}
+	loaded, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration)
+	if err != nil || !active || !reflect.DeepEqual(loaded, fixture.recovery) {
+		t.Fatalf("marker after uncheckpointed expansion=(%+v active=%t err=%v)",
+			loaded, active, err)
+	}
+}
+
+func TestExpandIntentForwardRecoveryTargetRejectsMemberBehindBarrier(
+	t *testing.T,
+) {
+	fixture := seedExpandableIntentForwardRecovery(t)
+	ctx := context.Background()
+	barrier := appendIntentV2Event(
+		t, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "terminal-barrier.go")
+	addition := appendIntentV2Event(
+		t, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "behind-barrier.go")
+	seedFailedIntentCompletedCheckpoint(t, fixture.db, "barrier", []int64{addition})
+	if err := MarkEventPublished(
+		ctx, fixture.db, barrier, EventStateFailed, sql.NullString{},
+		sql.NullString{String: "terminal barrier", Valid: true},
+		sql.NullString{}, 3,
+	); err != nil {
+		t.Fatal(err)
+	}
+	expandedTarget := append(
+		append([]int64(nil), fixture.original...), addition)
+	if _, changed, err := ExpandIntentForwardRecoveryTarget(
+		ctx, fixture.db, fixture.recovery, expandedTarget,
+	); err == nil || changed || !strings.Contains(err.Error(), "terminal barrier") {
+		t.Fatalf("barrier expansion changed=%t err=%v", changed, err)
+	}
+	loaded, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration)
+	if err != nil || !active || !reflect.DeepEqual(loaded, fixture.recovery) {
+		t.Fatalf("marker after barrier expansion=(%+v active=%t err=%v)",
+			loaded, active, err)
+	}
+}
+
 func TestForwardRecoverIntentCandidateRejectsActivePublication(t *testing.T) {
 	t.Parallel()
 	db, _ := openTestDB(t)
@@ -245,7 +742,7 @@ UPDATE intent_candidates SET status=? WHERE id=?`,
 				if err != nil || len(decisions) != 1 ||
 					decisions[0].Kind != DecisionKindIntentForwardRecovery ||
 					decisions[0].ActionTaken.String !=
-						"retired_failed_candidate_for_checkpoint_recovery" {
+						"retired_checkpoint_candidate_for_recovery" {
 					t.Fatalf("event %d decisions=%+v err=%v", seq, decisions, err)
 				}
 			}
@@ -487,6 +984,65 @@ SELECT COUNT(*) FROM decision_records WHERE kind=?`,
 	}
 }
 
+func TestStartFailedIntentCheckpointRecoveryIncludesIncompleteClosureCandidate(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointClosureFixture(t, true)
+	ctx := context.Background()
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='waiting',readiness='wait',
+    missing_companions='production companion is not in this planner window',
+    verification_status='pending'
+WHERE id=?`, fixture.overlapCandidateID); err != nil {
+		t.Fatal(err)
+	}
+
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed ||
+		!reflect.DeepEqual(recovery.TargetEventSeqs, fixture.seqs) {
+		t.Fatalf("incomplete closure recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	for _, candidateID := range []string{
+		fixture.rootCandidateID,
+		fixture.overlapCandidateID,
+	} {
+		candidate, ok, err := IntentCandidateByID(ctx, fixture.db, candidateID)
+		if err != nil || !ok || candidate.Status != IntentCandidateSuperseded ||
+			len(candidate.Events) != 0 {
+			t.Fatalf("candidate %s=(%+v ok=%t err=%v)",
+				candidateID, candidate, ok, err)
+		}
+	}
+}
+
+func TestStartFailedIntentCheckpointRecoveryRejectsIncompleteRootCandidate(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates
+SET missing_companions='production companion is not in this planner window',
+    verification_status='pending'
+WHERE id=?`, fixture.candidateID); err != nil {
+		t.Fatal(err)
+	}
+
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || changed || recovery.CandidateID != "" {
+		t.Fatalf("incomplete root recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	assertFailedIntentCheckpointUnchanged(
+		t, fixture, IntentCandidateWaiting, fixture.memberCount)
+}
+
 func TestCompleteResolvedIntentForwardRecoveryProvesAndClearsMarker(t *testing.T) {
 	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
 	ctx := context.Background()
@@ -535,6 +1091,134 @@ WHERE seq IN (?,?,?)`, fixture.seqs[0], fixture.seqs[0],
 	completed, err = CompleteResolvedIntentForwardRecovery(ctx, fixture.db, loaded)
 	if err != nil || completed {
 		t.Fatalf("idempotent resolved completion=(%t,%v)", completed, err)
+	}
+}
+
+func TestCompleteAnyResolvedIntentForwardRecoveryClearsOlderGeneration(t *testing.T) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	execFailedIntentCheckpointTest(t, fixture.db, `
+UPDATE capture_events
+SET state='recovered',published_ts=2
+WHERE seq IN (?,?,?)`, fixture.seqs[0], fixture.seqs[1], fixture.seqs[2])
+
+	loaded, completed, err := CompleteAnyResolvedIntentForwardRecovery(
+		ctx, fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !completed || loaded.BranchRef != recovery.BranchRef ||
+		loaded.BranchGeneration != recovery.BranchGeneration ||
+		!sameEventSeqs(loaded.TargetEventSeqs, recovery.TargetEventSeqs) {
+		t.Fatalf("completed=%t loaded=%+v want=%+v",
+			completed, loaded, recovery)
+	}
+	if _, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, recovery.BranchRef, recovery.BranchGeneration,
+	); err != nil || active {
+		t.Fatalf("old generation marker active=%t err=%v", active, err)
+	}
+
+	newGeneration := recovery.BranchGeneration + 1
+	newSeqs := []int64{
+		appendIntentV2Event(t, fixture.db, recovery.BranchRef,
+			newGeneration, "new-source.go"),
+		appendIntentV2Event(t, fixture.db, recovery.BranchRef,
+			newGeneration, "new-source_test.go"),
+	}
+	seedFailedIntentCompletedCheckpoint(t, fixture.db, "split", newSeqs)
+	const newCandidateID = "new-generation-failed-candidate"
+	if err := SaveIntentCandidate(ctx, fixture.db, IntentCandidate{
+		ID: newCandidateID, BranchRef: recovery.BranchRef,
+		BranchGeneration: newGeneration,
+		Status:           IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Purpose: "complete the new generation change",
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{{
+			EventSeq: newSeqs[0], EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, recovery.BranchRef, newGeneration, newSeqs[0])
+	if err != nil || !changed || started.CandidateID != newCandidateID ||
+		!sameEventSeqs(started.TargetEventSeqs, newSeqs) {
+		t.Fatalf("new generation recovery=(%+v changed=%t err=%v)",
+			started, changed, err)
+	}
+}
+
+func TestCompleteAnyResolvedIntentForwardRecoveryKeepsUnresolvedMarker(t *testing.T) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+
+	loaded, completed, err := CompleteAnyResolvedIntentForwardRecovery(
+		ctx, fixture.db)
+	if err != nil || completed || !reflect.DeepEqual(loaded, recovery) {
+		t.Fatalf("unresolved completion=(%+v completed=%t err=%v), want %+v",
+			loaded, completed, err, recovery)
+	}
+	if marker, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, recovery.BranchRef, recovery.BranchGeneration,
+	); err != nil || !active || !reflect.DeepEqual(marker, recovery) {
+		t.Fatalf("unresolved marker=(%+v active=%t err=%v), want %+v",
+			marker, active, err, recovery)
+	}
+	if _, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, recovery.BranchRef,
+		recovery.BranchGeneration+1, fixture.seqs[0],
+	); err == nil || changed || !strings.Contains(err.Error(), "conflicting") {
+		t.Fatalf("new generation with unresolved marker changed=%t err=%v",
+			changed, err)
+	}
+}
+
+func TestCompleteAnyResolvedIntentForwardRecoveryKeepsLegacyTargetlessMarker(
+	t *testing.T,
+) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	legacy := IntentForwardRecovery{
+		BranchRef: "refs/heads/main", BranchGeneration: 3,
+		CandidateID: "legacy", Reason: "repair_horizon_expired",
+	}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,1)`,
+		intentForwardRecoveryMetaKey, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, completed, err := CompleteAnyResolvedIntentForwardRecovery(ctx, db)
+	if err != nil || completed || loaded.Stage != "semantic_replan" ||
+		loaded.CandidateID != legacy.CandidateID {
+		t.Fatalf("legacy completion=(%+v completed=%t err=%v)",
+			loaded, completed, err)
+	}
+	if marker, active, err := IntentForwardRecoveryForPair(
+		ctx, db, legacy.BranchRef, legacy.BranchGeneration,
+	); err != nil || !active || marker.CandidateID != legacy.CandidateID {
+		t.Fatalf("legacy marker=(%+v active=%t err=%v)", marker, active, err)
 	}
 }
 
@@ -865,6 +1549,71 @@ type failedIntentCheckpointClosureFixture struct {
 	seqs               []int64
 }
 
+type expandableIntentForwardRecoveryFixture struct {
+	db       *DB
+	recovery IntentForwardRecovery
+	original []int64
+	addition int64
+}
+
+func seedExpandableIntentForwardRecovery(
+	t *testing.T,
+) expandableIntentForwardRecoveryFixture {
+	t.Helper()
+	db, _ := openTestDB(t)
+	first := appendIntentV2Event(
+		t, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "recovery-source.go")
+	addition := appendIntentV2Event(
+		t, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "recovery-source_test.go")
+	last := appendIntentV2Event(
+		t, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "recovery-source.go")
+	seedFailedIntentCompletedCheckpoint(t, db, "main", []int64{first, last})
+	seedFailedIntentCompletedCheckpoint(t, db, "split", []int64{addition})
+	const rootCandidateID = "expandable-recovery-root"
+	if err := SaveIntentCandidate(context.Background(), db, IntentCandidate{
+		ID: rootCandidateID, BranchRef: failedIntentCheckpointBranch,
+		BranchGeneration: failedIntentCheckpointGeneration,
+		Status:           IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Purpose: "failed non-contiguous recovery root",
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{
+			{EventSeq: first, EventRole: "implementation"},
+			{EventSeq: last, EventRole: "implementation"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		context.Background(), db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, first)
+	if err != nil || !changed ||
+		!reflect.DeepEqual(recovery.TargetEventSeqs, []int64{first, last}) {
+		t.Fatalf("start expandable recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	recovery, err = AdvanceIntentForwardRecoveryPrefix(
+		context.Background(), db, recovery,
+		"sha256:exhausted-plan", "exhausted-head", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery, err = MarkIntentForwardRecoveryNeedsAttention(
+		context.Background(), db, recovery,
+		"complete semantic recovery prefix failed verification")
+	if err != nil || !recovery.NeedsAttention || !recovery.PrefixExhausted {
+		t.Fatalf("exhausted recovery=(%+v,%v)", recovery, err)
+	}
+	return expandableIntentForwardRecoveryFixture{
+		db: db, recovery: recovery,
+		original: []int64{first, last}, addition: addition,
+	}
+}
+
 func seedFailedIntentCheckpointClosureFixture(
 	t *testing.T,
 	healthyOverlap bool,
@@ -993,6 +1742,12 @@ func seedFailedIntentCompletedCheckpoint(
 	case "closure-c":
 		checkpointNumber = "1788000000004"
 		checkpointHex = "eeeeeeeeeeeeeeee"
+	case "barrier":
+		checkpointNumber = "1788000000005"
+		checkpointHex = "ffffffffffffffff"
+	case "expansion":
+		checkpointNumber = "1788000000006"
+		checkpointHex = "9999999999999999"
 	}
 	checkpointID := "cp-" + checkpointNumber + "-" + checkpointHex
 	checkpoint := Checkpoint{

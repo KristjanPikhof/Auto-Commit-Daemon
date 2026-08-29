@@ -1081,6 +1081,198 @@ INSERT INTO recovery_snapshots(
 	}
 }
 
+func TestPruneRecoverySnapshotEventsWaitsForDurableOwners(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	const (
+		branch     = "refs/heads/main"
+		generation = int64(7)
+		worktreeID = "0123456789abcdef"
+	)
+	appendEvent := func(path string) int64 {
+		t.Helper()
+		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+			BranchRef: branch, BranchGeneration: generation,
+			BaseHead: "head", Operation: "modify", Path: path,
+			Fidelity: "exact", CapturedTS: 10, State: EventStatePending,
+		}, []CaptureOp{{
+			Op: "modify", Path: path, Fidelity: "exact",
+		}})
+		if err != nil {
+			t.Fatalf("append %s: %v", path, err)
+		}
+		return seq
+	}
+	unowned := appendEvent("unowned.go")
+	checkpointOwned := appendEvent("checkpoint-owned.go")
+	drainOwned := appendEvent("drain-owned.go")
+
+	prepareCheckpoint := func(id, operationID, suffix string, seq int64) Checkpoint {
+		t.Helper()
+		checkpoint := Checkpoint{
+			ID: id, OperationID: operationID, WorktreeID: worktreeID,
+			Reason: CheckpointReasonPoll, ObservationEpoch: 1, CoverageEpoch: 1,
+			ObservedHead: "head", ObservedRef: branch,
+			TreeOID: "tree-" + suffix, CommitOID: "commit-" + suffix,
+			Ref:       "refs/acd/checkpoints/v1/" + worktreeID + "/" + id,
+			CreatedTS: 1, EventSeqs: []int64{seq},
+		}
+		created, err := PrepareCheckpoint(ctx, d, checkpoint, checkpointTestDigest)
+		if err != nil || !created {
+			t.Fatalf("prepare checkpoint %s=(%t,%v)", id, created, err)
+		}
+		if err := CompleteCheckpoint(
+			ctx, d, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 2,
+		); err != nil {
+			t.Fatalf("complete checkpoint %s: %v", id, err)
+		}
+		return checkpoint
+	}
+	checkpointOnly := prepareCheckpoint(
+		"cp-1000-aaaaaaaaaaaaaaaa", "op-checkpoint-only", "checkpoint", checkpointOwned)
+	drainCheckpoint := prepareCheckpoint(
+		"cp-1001-bbbbbbbbbbbbbbbb", "op-drain-owned", "drain", drainOwned)
+	drain := PublicationDrain{
+		ID: "drain-retention-owner", CheckpointID: drainCheckpoint.ID,
+		WorktreeID: worktreeID, BranchRef: branch, BranchGeneration: generation,
+		Phase: PublicationDrainCheckpointing, TargetEventCount: 1,
+		CreatedTS: 3, UpdatedTS: 3, LastProgressTS: 3,
+	}
+	if created, err := PreparePublicationDrain(ctx, d, drain); err != nil || !created {
+		t.Fatalf("prepare publication drain=(%t,%v)", created, err)
+	}
+
+	if _, err := d.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='recovered', published_ts=20, commit_oid='recovery'
+WHERE seq IN (?, ?, ?)`, unowned, checkpointOwned, drainOwned); err != nil {
+		t.Fatalf("recover snapshot members: %v", err)
+	}
+	if _, err := AdvancePublicationDrain(ctx, d, drain.ID, PublicationDrainUpdate{
+		ExpectedPhase: PublicationDrainCheckpointing,
+		Phase:         PublicationDrainCompleted, PublishedEventCount: 1,
+		UpdatedTS: 4, LastProgressTS: 4,
+		CompletedTS: sql.NullFloat64{Float64: 4, Valid: true},
+	}); err != nil {
+		t.Fatalf("complete publication drain: %v", err)
+	}
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "terminal-snapshot-member", BranchRef: branch,
+		BranchGeneration: generation, Status: IntentCandidatePublished,
+		Readiness:          IntentReadinessReady,
+		PublishedCommitOID: sql.NullString{String: "recovery", Valid: true},
+		Events:             []IntentCandidateEvent{{EventSeq: unowned, EventRole: "code"}},
+	}); err != nil {
+		t.Fatalf("save terminal intent candidate: %v", err)
+	}
+	if err := ReplaceIntentCaptureDependencies(ctx, d, branch, generation,
+		[]IntentCaptureDependency{{
+			PrerequisiteSeq: unowned, DependentSeq: checkpointOwned,
+			Strength: IntentDependencySoft, Kind: "module_proximity",
+		}}); err != nil {
+		t.Fatalf("save terminal intent dependency: %v", err)
+	}
+
+	res, err := d.SQL().ExecContext(ctx, `
+INSERT INTO recovery_snapshots(
+    created_ts, outcome, branch_ref, branch_generation,
+    first_event_seq, last_event_seq, event_count,
+    commit_oid, recovery_ref, reason
+) VALUES (20, 'recovered', ?, ?, ?, ?, 3, 'recovery',
+          'refs/acd/recovery/prune-owners', 'retention owner test')`,
+		branch, generation, unowned, drainOwned)
+	if err != nil {
+		t.Fatalf("insert recovery snapshot: %v", err)
+	}
+	snapshotID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("recovery snapshot id: %v", err)
+	}
+	for ord, seq := range []int64{unowned, checkpointOwned, drainOwned} {
+		if _, err := d.SQL().ExecContext(ctx, `
+INSERT INTO recovery_snapshot_events(snapshot_id, ord, event_seq)
+VALUES (?, ?, ?)`, snapshotID, ord, seq); err != nil {
+			t.Fatalf("insert recovery member %d: %v", seq, err)
+		}
+	}
+
+	assertEventCount := func(seq int64, want int) {
+		t.Helper()
+		var got int
+		if err := d.SQL().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM capture_events WHERE seq=?`, seq,
+		).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("event %d count=%d want %d", seq, got, want)
+		}
+	}
+	if pruned, err := PruneRecoverySnapshotEventsBefore(
+		ctx, d, snapshotID, 100,
+	); err != nil || pruned != 1 {
+		t.Fatalf("initial snapshot prune=(%d,%v), want (1,nil)", pruned, err)
+	}
+	assertEventCount(unowned, 0)
+	assertEventCount(checkpointOwned, 1)
+	assertEventCount(drainOwned, 1)
+	var memberships, dependencies int
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_candidate_events WHERE event_seq=?`, unowned,
+	).Scan(&memberships); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_capture_dependencies
+WHERE prerequisite_seq=? OR dependent_seq=?`, unowned, unowned,
+	).Scan(&dependencies); err != nil {
+		t.Fatal(err)
+	}
+	if memberships != 0 || dependencies != 0 {
+		t.Fatalf("terminal intent rows membership=%d dependencies=%d want 0",
+			memberships, dependencies)
+	}
+
+	completeCheckpointRetention := func(checkpoint Checkpoint) {
+		t.Helper()
+		item := RetentionCheckpoint{
+			ID: checkpoint.ID, WorktreeID: checkpoint.WorktreeID,
+			Ref: checkpoint.Ref, CommitOID: checkpoint.CommitOID,
+		}
+		operationID, err := PrepareCheckpointPrune(
+			ctx, d, item, checkpointTestDigest)
+		if err != nil {
+			t.Fatalf("prepare checkpoint retention %s: %v", checkpoint.ID, err)
+		}
+		if err := CompleteCheckpointPrune(
+			ctx, d, operationID, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID,
+		); err != nil {
+			t.Fatalf("complete checkpoint retention %s: %v", checkpoint.ID, err)
+		}
+	}
+	completeCheckpointRetention(checkpointOnly)
+	completeCheckpointRetention(drainCheckpoint)
+	if pruned, err := PruneRecoverySnapshotEventsBefore(
+		ctx, d, snapshotID, 100,
+	); err != nil || pruned != 1 {
+		t.Fatalf("post-checkpoint snapshot prune=(%d,%v), want (1,nil)", pruned, err)
+	}
+	assertEventCount(checkpointOwned, 0)
+	assertEventCount(drainOwned, 1)
+
+	if _, err := d.SQL().ExecContext(ctx,
+		`DELETE FROM publication_drains WHERE id=?`, drain.ID); err != nil {
+		t.Fatalf("expire publication drain owner: %v", err)
+	}
+	if pruned, err := PruneRecoverySnapshotEventsBefore(
+		ctx, d, snapshotID, 100,
+	); err != nil || pruned != 1 {
+		t.Fatalf("post-drain snapshot prune=(%d,%v), want (1,nil)", pruned, err)
+	}
+	assertEventCount(drainOwned, 0)
+}
+
 func TestPrunePublishedEventsPreservesRecoveryMaterializationPrefix(t *testing.T) {
 	for _, unpublishedState := range []string{
 		EventStatePending,

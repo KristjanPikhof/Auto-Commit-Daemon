@@ -68,6 +68,238 @@ func TestReplayIntentV2PublishesCandidatesInPlannerOrder(t *testing.T) {
 	}
 }
 
+func TestReplayIntentV2DrainsDuplicateRecaptureChain(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	path := "duplicate.txt"
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("A\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "--", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+		"commit", "-q", "-m", "seed duplicate chain"); err != nil {
+		t.Fatal(err)
+	}
+	base, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.cctx.BaseHead = base
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	a, err := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := git.HashObjectStdin(ctx, f.dir, []byte("B\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := git.HashObjectStdin(ctx, f.dir, []byte("C\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transition := range [][2]string{{a, b}, {a, b}, {b, c}} {
+		_, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+			BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+			BaseHead: base, Operation: "modify", Path: path, Fidelity: "full",
+		}, []state.CaptureOp{{
+			Op: "modify", Path: path, Fidelity: "full",
+			BeforeOID:  sql.NullString{String: transition[0], Valid: true},
+			BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			AfterOID:   sql.NullString{String: transition[1], Valid: true},
+			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, path), []byte("C\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: ai.DeterministicProvider{}, IntentPreset: config.PresetFast,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+	}
+	for attempt := 0; attempt < 6; attempt++ {
+		result, replayErr := Replay(ctx, f.dir, f.db, f.cctx, opts)
+		if replayErr != nil {
+			t.Fatalf("replay attempt %d=%+v err=%v", attempt, result, replayErr)
+		}
+		if result.BaseHead != "" {
+			f.cctx.BaseHead = result.BaseHead
+		}
+		pending, loadErr := state.PendingEvents(ctx, f.db, 0)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		if len(pending) == 0 {
+			break
+		}
+		if result.Published == 0 {
+			t.Fatalf("replay attempt %d made no progress: %+v pending=%+v",
+				attempt, result, pending)
+		}
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending after replay=%+v err=%v", pending, err)
+	}
+	if f.cctx.BaseHead == base {
+		t.Fatal("duplicate chain did not advance HEAD")
+	}
+	if got := mustGitOutput(t, f.dir, "show", "HEAD:"+path); got != "C\n" {
+		t.Fatalf("published contents=%q want C", got)
+	}
+}
+
+func TestReplayIntentV2DrainsDuplicateDeleteAndRenameRecaptures(t *testing.T) {
+	t.Run("delete", func(t *testing.T) {
+		f := newCaptureFixture(t)
+		ctx := context.Background()
+		path := "removed.txt"
+		contents := []byte("remove once\n")
+		if err := os.WriteFile(filepath.Join(f.dir, path), contents, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "--", path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+			"commit", "-q", "-m", "seed duplicate delete"); err != nil {
+			t.Fatal(err)
+		}
+		base, err := git.RevParse(ctx, f.dir, "HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.cctx.BaseHead = base
+		if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+			t.Fatal(err)
+		}
+		before, err := git.HashObjectStdin(ctx, f.dir, contents)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			_, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+				BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+				BaseHead: base, Operation: "delete", Path: path, Fidelity: "full",
+			}, []state.CaptureOp{{
+				Op: "delete", Path: path, Fidelity: "full",
+				BeforeOID:  sql.NullString{String: before, Valid: true},
+				BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Remove(filepath.Join(f.dir, path)); err != nil {
+			t.Fatal(err)
+		}
+		replayAllIntentPendingForTest(t, f)
+		if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+			"cat-file", "-e", "HEAD:"+path); err == nil {
+			t.Fatalf("%s still exists at HEAD", path)
+		}
+	})
+
+	t.Run("rename", func(t *testing.T) {
+		f := newCaptureFixture(t)
+		ctx := context.Background()
+		oldPath, newPath := "before.txt", "after.txt"
+		contents := []byte("rename once\n")
+		if err := os.WriteFile(filepath.Join(f.dir, oldPath), contents, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "--", oldPath); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+			"commit", "-q", "-m", "seed duplicate rename"); err != nil {
+			t.Fatal(err)
+		}
+		base, err := git.RevParse(ctx, f.dir, "HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.cctx.BaseHead = base
+		if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+			t.Fatal(err)
+		}
+		blob, err := git.HashObjectStdin(ctx, f.dir, contents)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			_, err := state.AppendCaptureEvent(ctx, f.db, state.CaptureEvent{
+				BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+				BaseHead: base, Operation: "rename", Path: newPath,
+				OldPath: sql.NullString{String: oldPath, Valid: true}, Fidelity: "full",
+			}, []state.CaptureOp{{
+				Op: "rename", Path: newPath,
+				OldPath:    sql.NullString{String: oldPath, Valid: true},
+				BeforeOID:  sql.NullString{String: blob, Valid: true},
+				BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+				AfterOID:   sql.NullString{String: blob, Valid: true},
+				AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+				Fidelity:   "full",
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Rename(filepath.Join(f.dir, oldPath),
+			filepath.Join(f.dir, newPath)); err != nil {
+			t.Fatal(err)
+		}
+		replayAllIntentPendingForTest(t, f)
+		if got := mustGitOutput(t, f.dir, "show", "HEAD:"+newPath); got != string(contents) {
+			t.Fatalf("renamed contents=%q want %q", got, contents)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+			"cat-file", "-e", "HEAD:"+oldPath); err == nil {
+			t.Fatalf("%s still exists at HEAD", oldPath)
+		}
+	})
+}
+
+func replayAllIntentPendingForTest(t *testing.T, f *captureFixture) {
+	t.Helper()
+	ctx := context.Background()
+	opts := ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: ai.DeterministicProvider{}, IntentPreset: config.PresetFast,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+	}
+	for attempt := 0; attempt < 6; attempt++ {
+		result, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+		if err != nil {
+			t.Fatalf("replay attempt %d=%+v err=%v", attempt, result, err)
+		}
+		if result.BaseHead != "" {
+			f.cctx.BaseHead = result.BaseHead
+		}
+		pending, err := state.PendingEvents(ctx, f.db, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) == 0 {
+			return
+		}
+		if result.Published == 0 {
+			t.Fatalf("replay attempt %d made no progress: %+v pending=%+v",
+				attempt, result, pending)
+		}
+	}
+	t.Fatalf("Intent replay did not drain pending captures")
+}
+
 func TestReplayIntentV2AdvancesFastFallbackComponents(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -303,6 +535,7 @@ func TestIntentRepairForwardRecoveryClassification(t *testing.T) {
 	for _, reason := range []string{
 		"repair_horizon_expired",
 		"repair_commit_outside_suffix",
+		"repair_final_tree_mismatch",
 		"repair_suffix_not_acd_owned",
 		"repair_repartition_not_proven",
 		"repair_repartition_dependency",
@@ -327,6 +560,126 @@ func TestIntentRepairForwardRecoveryClassification(t *testing.T) {
 		if intentRepairSupportsForwardRecovery(reason) {
 			t.Fatalf("unsafe reason %q enabled forward recovery", reason)
 		}
+	}
+}
+
+func TestIntentRepairRejectsFinalTreeThatDropsHeadContent(t *testing.T) {
+	ctx := context.Background()
+	repo := cloneDaemonTestRepo(t, daemonRepoTemplate)
+	beforeHead := mustCommitPath(
+		t, repo.dir, "owned.txt", "before\n", "seed owned state")
+	afterHead := mustCommitPath(
+		t, repo.dir, "owned.txt", "after\n", "publish owned state")
+	unrelatedHead := mustCommitPath(
+		t, repo.dir, "keep.txt", "keep\n", "preserve unrelated change")
+	beforeOID := mustBlobOID(t, repo.dir, beforeHead, "owned.txt")
+	afterOID := mustBlobOID(t, repo.dir, afterHead, "owned.txt")
+	op := state.CaptureOp{
+		Op: "modify", Path: "owned.txt", Fidelity: "full",
+		BeforeOID: sql.NullString{String: beforeOID, Valid: true},
+		BeforeMode: sql.NullString{
+			String: git.RegularFileMode, Valid: true,
+		},
+		AfterOID: sql.NullString{String: afterOID, Valid: true},
+		AfterMode: sql.NullString{
+			String: git.RegularFileMode, Valid: true,
+		},
+	}
+	publishedSeq, err := state.AppendCaptureEvent(ctx, repo.db,
+		state.CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			BaseHead: beforeHead, Operation: "modify", Path: "owned.txt",
+			Fidelity: "full", State: state.EventStatePublished,
+			CommitOID: sql.NullString{
+				String: unrelatedHead, Valid: true,
+			},
+			PublishedTS: sql.NullFloat64{
+				Float64: float64(time.Now().UnixNano()) / 1e9, Valid: true,
+			},
+		}, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingSeq, err := state.AppendCaptureEvent(ctx, repo.db,
+		state.CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			BaseHead: unrelatedHead, Operation: "modify", Path: "owned.txt",
+			Fidelity: "full", State: state.EventStatePending,
+		}, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const candidateID = "candidate-misowned-no-op"
+	candidate := state.IntentCandidate{
+		ID: candidateID, BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: state.IntentCandidateReady,
+		Purpose:   "reuse already published owned state",
+		Readiness: state.IntentReadinessReady,
+		PublishedCommitOID: sql.NullString{
+			String: unrelatedHead, Valid: true,
+		},
+		SoftPublicationDeadline: sql.NullFloat64{
+			Float64: float64(time.Now().Add(time.Minute).UnixNano()) / 1e9,
+			Valid:   true,
+		},
+		Events: []state.IntentCandidateEvent{
+			{EventSeq: publishedSeq, EventRole: "code"},
+			{EventSeq: pendingSeq, EventRole: "code"},
+		},
+	}
+	if err := state.SaveIntentCandidate(ctx, repo.db, candidate); err != nil {
+		t.Fatal(err)
+	}
+	selected := make([]intentReplayItem, 0, 2)
+	for _, seq := range []int64{publishedSeq, pendingSeq} {
+		event, err := loadIntentCaptureEvent(ctx, repo.db, seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ops, err := state.LoadCaptureOps(ctx, repo.db, seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected = append(selected, intentReplayItem{event: event, ops: ops})
+	}
+	result, pending, err := repairIntentCandidateDecision(
+		ctx, repo.dir, repo.gitDir, repo.db,
+		CaptureContext{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			BaseHead: unrelatedHead,
+		},
+		ReplayOpts{
+			IntentRepairEnabled: true, IntentRepairHorizon: time.Minute,
+			IntentRepairMaxCommits: 1,
+		},
+		IntentCandidateDecision{
+			Candidate: candidate,
+			Assignment: ai.IntentCandidateAssignment{
+				CandidateID:  candidateID,
+				SelectedSeqs: []int64{publishedSeq, pendingSeq},
+				Subject:      "Reuse owned state",
+			},
+		},
+		selected, unrelatedHead, map[string]struct{}{candidateID: {}},
+	)
+	if err != nil || pending != 0 ||
+		result.Status != state.IntentRepairSkipped ||
+		result.Reason != "repair_final_tree_mismatch" {
+		t.Fatalf("result=%+v pending=%d err=%v", result, pending, err)
+	}
+	head, err := git.RevParse(ctx, repo.dir, "HEAD")
+	if err != nil || head != unrelatedHead {
+		t.Fatalf("HEAD=%s err=%v want %s", head, err, unrelatedHead)
+	}
+	if got := strings.TrimSpace(mustGitOutput(
+		t, repo.dir, "show", "HEAD:keep.txt")); got != "keep" {
+		t.Fatalf("unrelated HEAD content=%q", got)
+	}
+	var repairs int
+	if err := repo.db.ReadSQL().QueryRowContext(
+		ctx, `SELECT COUNT(*) FROM intent_repairs`).Scan(&repairs); err != nil ||
+		repairs != 0 {
+		t.Fatalf("repair rows=%d err=%v", repairs, err)
 	}
 }
 
@@ -1302,6 +1655,67 @@ func TestIntentRepairTransactionCompletesAndPreservesDirtyState(t *testing.T) {
 	if unrelatedOID != f.oldCommits[0] {
 		t.Fatalf("unrelated event oid=%s want unchanged %s",
 			unrelatedOID, f.oldCommits[0])
+	}
+}
+
+func TestIntentRepairPreservesCapturedDirtyShadow(t *testing.T) {
+	f := newIntentRepairFixture(t, 2)
+	ctx := context.Background()
+	ignore := git.NewIgnoreChecker(f.repo.dir)
+	t.Cleanup(func() { _ = ignore.Close() })
+	path := "unrelated.txt"
+	if err := os.WriteFile(filepath.Join(f.repo.dir, path),
+		[]byte("captured once\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Capture(ctx, f.repo.dir, f.repo.db, f.cctx, CaptureOpts{
+		IgnoreChecker: ignore, SensitiveMatcher: state.NewSensitiveMatcher(),
+	})
+	if err != nil || first.EventsAppended != 1 {
+		t.Fatalf("first capture=%+v err=%v", first, err)
+	}
+	shadowBefore, ok, err := state.GetShadowPath(ctx, f.repo.db,
+		f.cctx.BranchRef, f.cctx.BranchGeneration, path)
+	if err != nil || !ok {
+		t.Fatalf("shadow before repair=%+v ok=%v err=%v",
+			shadowBefore, ok, err)
+	}
+	pendingBefore, err := state.CountPendingEventsForGeneration(ctx, f.repo.db,
+		f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || pendingBefore != 1 {
+		t.Fatalf("pending before repair=%d err=%v", pendingBefore, err)
+	}
+
+	result, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if err != nil || result.Status != state.IntentRepairCompleted {
+		t.Fatalf("repair=%+v err=%v", result, err)
+	}
+	shadowAfter, ok, err := state.GetShadowPath(ctx, f.repo.db,
+		f.cctx.BranchRef, f.cctx.BranchGeneration, path)
+	if err != nil || !ok {
+		t.Fatalf("shadow after repair=%+v ok=%v err=%v", shadowAfter, ok, err)
+	}
+	if shadowAfter.OID != shadowBefore.OID ||
+		shadowAfter.Mode != shadowBefore.Mode ||
+		shadowAfter.BaseHead != result.NewHead {
+		t.Fatalf("shadow after repair=%+v before=%+v new_head=%s",
+			shadowAfter, shadowBefore, result.NewHead)
+	}
+
+	repairedCtx := f.cctx
+	repairedCtx.BaseHead = result.NewHead
+	second, err := Capture(ctx, f.repo.dir, f.repo.db, repairedCtx, CaptureOpts{
+		IgnoreChecker: ignore, SensitiveMatcher: state.NewSensitiveMatcher(),
+	})
+	if err != nil || second.EventsAppended != 0 {
+		t.Fatalf("capture after unchanged repair=%+v err=%v", second, err)
+	}
+	pendingAfter, err := state.CountPendingEventsForGeneration(ctx, f.repo.db,
+		f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || pendingAfter != pendingBefore {
+		t.Fatalf("pending after repair=%d want=%d err=%v",
+			pendingAfter, pendingBefore, err)
 	}
 }
 

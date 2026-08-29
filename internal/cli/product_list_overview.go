@@ -145,6 +145,7 @@ func productListEntryFromOverview(
 	daemonAlive := report.Daemon == "running" && report.PID > 0 && !report.Stale
 	applyControlStatusWithDaemonAlive(&control, report, daemonAlive)
 	checkpointing := daemonAlive && report.CheckpointProtectionAvailable && !report.Protected &&
+		report.PublicationProgress.Origin != "intent_recovery" &&
 		!productListHasIndependentAttention(report)
 	if checkpointing {
 		control.OK = true
@@ -184,7 +185,8 @@ func productListEntryFromOverview(
 		PendingEvents: control.PendingEvents, BlockedEvents: control.BlockedEvents,
 		CheckpointID: control.CheckpointID, WorkerState: worker.State,
 		OperationalState: operational, LastActivityAt: formatProductListActivity(overview.lastActivity),
-		PublicationDrain: report.PublicationDrain, Summary: control.Summary,
+		PublicationDrain:    report.PublicationDrain,
+		PublicationProgress: report.PublicationProgress, Summary: control.Summary,
 		Clients: overview.clients, LastCommitOID: report.LastCommitOID,
 		lastActivity: overview.lastActivity,
 	}
@@ -213,6 +215,8 @@ func productListHasIndependentAttention(report statusReport) bool {
 		manualPause || report.BackpressurePaused ||
 		report.Configuration.Configuration == "needs_attention" ||
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
+		(report.PublicationProgress.Origin == "intent_recovery" &&
+			report.PublicationProgress.Phase == "needs_action") ||
 		report.Replay.State == "needs_attention" ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0
 }
@@ -256,14 +260,6 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		}
 		overview.lastActivity = laterProductListActivity(overview.lastActivity, checkpointActivity)
 	}
-	if schemaVersion >= 21 {
-		report.PublicationDrain, err = readStatusPublicationDrain(ctx, conn)
-		if err != nil {
-			return overview, err
-		}
-		overview.lastActivity = laterProductListActivity(overview.lastActivity, report.PublicationDrain.LastProgressTS)
-	}
-
 	var heartbeat float64
 	var branchRef sql.NullString
 	var generation sql.NullInt64
@@ -279,9 +275,24 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 			report.HeartbeatAgeSeconds = int64(age.Seconds())
 			report.Stale = age > clientTTLForRepo(record.Path)
 		}
-		if branchRef.Valid {
-			report.BranchRef = branchRef.String
+	}
+	currentBranchRef, currentBranchGeneration, hasCurrentPair, pairErr :=
+		currentWorktreeReplayPair(ctx, conn, record.Path)
+	if pairErr != nil {
+		return overview, pairErr
+	}
+	if hasCurrentPair {
+		report.BranchRef = currentBranchRef
+		report.BranchGeneration = currentBranchGeneration
+	}
+	if schemaVersion >= 21 {
+		report.PublicationDrain, err = readStatusPublicationDrain(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+		if err != nil {
+			return overview, err
 		}
+		overview.lastActivity = laterProductListActivity(
+			overview.lastActivity, report.PublicationDrain.LastProgressTS)
 	}
 	clients, _, err := readProductListClients(ctx, conn, now, clientTTLForRepo(record.Path))
 	if err != nil {
@@ -291,10 +302,7 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE state=?`, state.EventStatePending).Scan(&report.PendingEvents); err != nil {
 		return overview, err
 	}
-	activeGeneration := int64(0)
-	if generation.Valid {
-		activeGeneration = generation.Int64
-	}
+	activeGeneration := report.BranchGeneration
 	blockers, err := loadRecoveryBlockerCounts(ctx, conn, report.BranchRef, activeGeneration)
 	if err != nil {
 		return overview, err
@@ -343,10 +351,54 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	if schemaVersion >= 15 {
 		report.IntentV2.SchemaVersion = schemaVersion
 	}
+	strategy, strategyErr := ResolveEffectiveCommitStrategy(ctx, conn)
+	if strategyErr != nil {
+		return overview, strategyErr
+	}
+	report.IntentStrategy.Strategy = string(strategy)
+	report.IntentStrategy.Active = strategy == "intent"
+	envIntent := intentStrategyFromEnv()
+	report.IntentStrategy.EffectiveProvider = envIntent.EffectiveProvider
+	report.IntentStrategy.EffectiveModel = envIntent.EffectiveModel
+	if value, ok, providerErr := metaLookup(ctx, conn, "ai.provider"); providerErr != nil {
+		return overview, providerErr
+	} else if ok && strings.TrimSpace(value) != "" {
+		report.IntentStrategy.EffectiveProvider = strings.TrimSpace(value)
+	}
+	if value, ok, modelErr := metaLookup(ctx, conn, "ai.model"); modelErr != nil {
+		return overview, modelErr
+	} else if ok {
+		report.IntentStrategy.EffectiveModel = strings.TrimSpace(value)
+	}
+	if report.IntentStrategy.Active && report.PendingEvents > 0 {
+		plannerHealth, warning, healthErr := loadIntentPlannerHealth(ctx, conn)
+		if healthErr != nil {
+			return overview, healthErr
+		}
+		report.IntentStrategy.PlannerHealth = plannerHealth
+		report.IntentStrategy.PlannerHealthWarning = warning
+		lastWindow, windowErr := loadLastIntentPlannerWindowForPairSQL(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+		if windowErr != nil {
+			return overview, windowErr
+		}
+		report.IntentStrategy.LastPlannerWindow = lastWindow
+		if lastWindow != nil {
+			report.IntentStrategy.ResolutionMode = lastWindow.ResolutionMode
+		}
+	}
 	if wait, waitErr := loadListIntentWaitSummary(ctx, conn); waitErr != nil {
 		return overview, waitErr
 	} else if wait != nil {
 		report.IntentStrategy.BatchWaitActive = true
+		report.IntentStrategy.BatchWaitReason = wait.reason
+		report.IntentStrategy.VisiblePendingEvents = wait.visiblePending
+		report.IntentStrategy.MinPending = wait.minPending
+		if wait.reason == "skipped_due_intent_settle_window" {
+			report.IntentStrategy.SettleTriggerInSeconds = wait.waitSeconds
+		} else {
+			report.IntentStrategy.AgeTriggerInSeconds = wait.waitSeconds
+		}
 	}
 	if schemaVersion >= 18 {
 		report.SelfPublication.Available = true
@@ -365,6 +417,11 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 			report.Configuration.Configuration == "validating")
 	report.OperationalState = statusOperationalStateWithDaemonAlive(*report,
 		report.Daemon == "running" && report.PID > 0 && !report.Stale)
+	report.PublicationProgress, err = buildPublicationProgressReport(
+		ctx, conn, *report, now)
+	if err != nil {
+		return overview, err
+	}
 	return overview, nil
 }
 
@@ -453,10 +510,13 @@ func sortProductListEntries(entries []productListEntry) {
 }
 
 func productListPriority(entry productListEntry) int {
+	if entry.ActionRequired {
+		return 0
+	}
 	switch productListStatus(entry) {
 	case "needs action":
 		return 0
-	case "working":
+	case "working", "waiting", "stalled":
 		return 1
 	case "paused":
 		return 3

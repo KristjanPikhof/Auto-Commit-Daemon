@@ -490,7 +490,7 @@ func TestApplyControlStatusPlannerCircuitDegraded(t *testing.T) {
 			res := controlResult{OK: true}
 			applyControlStatus(&res, status)
 			if res.Health != controlHealthDegraded ||
-				!strings.Contains(res.Summary, "safe local grouping") ||
+				!strings.Contains(res.Summary, "semantic commit messages are waiting") ||
 				!strings.Contains(res.NextAction, tc.nextText) {
 				t.Fatalf("control result=%+v", res)
 			}
@@ -519,6 +519,33 @@ func TestApplyControlStatusReportsIntentSalvageSubphase(t *testing.T) {
 			applyControlStatus(&res, status)
 			if res.Health != controlHealthPublishing ||
 				!strings.Contains(strings.ToLower(res.Summary), tc.want) {
+				t.Fatalf("control result=%+v", res)
+			}
+		})
+	}
+}
+
+func TestApplyControlStatusUnreconstructibleDrainOffersForceRecovery(t *testing.T) {
+	for _, reason := range []string{
+		"publication_drain_runtime_contract_unavailable",
+		"publication_drain_environment_runtime_changed",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			status := statusReport{
+				Daemon: "running", PID: os.Getpid(),
+				PublicationDrain: publicationDrainReport{
+					Available: true, ID: "drain",
+					Phase: state.PublicationDrainNeedsAction, LastError: reason,
+				},
+			}
+			res := controlResult{OK: true}
+
+			applyControlStatus(&res, status)
+
+			if res.OK || res.Health != controlHealthNeedsAttention ||
+				!strings.Contains(res.Summary, "captured work remains protected") ||
+				!strings.Contains(res.NextAction, "acd fix --force --dry-run") ||
+				!strings.Contains(res.NextAction, "acd fix --force --yes") {
 				t.Fatalf("control result=%+v", res)
 			}
 		})
@@ -856,6 +883,96 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 		if got := strings.Count(out.String(), line); got != 1 {
 			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
 		}
+	}
+}
+
+func TestProductStatusShowsIntentQueueAndActiveTarget(t *testing.T) {
+	var out bytes.Buffer
+	progress := publicationProgressReport{
+		Strategy: "intent", Origin: "commit_all", Phase: "intent_planning",
+		QueuePending: 22, TargetRemaining: 2, TargetTotal: 2,
+		LastProgressTS: 1, LastProgressAgeSeconds: 3 * 60,
+		WorkerResponsive: true, HeartbeatAgeSeconds: 1,
+	}
+	envelope := productEnvelope{
+		OK: true, State: productStatePublishing, Actions: []productAction{},
+		Data: productStatusData{
+			Enabled: true, Protected: true, PublicationProgress: progress,
+			PublicationDrain: publicationDrainReport{
+				ID: "drain", Phase: state.PublicationDrainSemantic,
+				RemainingEvents: 2, TargetEvents: 2,
+			},
+		},
+	}
+	if err := renderProductEnvelope(&out, envelope, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Commit mode: Intent",
+		"Publication queue: 22 protected change(s)",
+		"Active target: earlier commit-all request, 2 of 2 left",
+		"Publication phase: planning commit groups by Intent",
+		"Last queue movement: 3m ago",
+		"Worker liveness: responsive, heartbeat 1s ago",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("status missing %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "Commit-all progress:") {
+		t.Fatalf("status duplicated active target:\n%s", out.String())
+	}
+}
+
+func TestProductStatusSuppressesCompletedDrainAndWaitHasNoTarget(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		progress publicationProgressReport
+		drain    publicationDrainReport
+		want     string
+	}{
+		{
+			name: "completed drain is history",
+			progress: publicationProgressReport{
+				Strategy: "intent", Phase: "idle", WorkerResponsive: true,
+			},
+			drain: publicationDrainReport{
+				ID: "old", Phase: state.PublicationDrainCompleted,
+				TargetEvents: 2, PublishedEvents: 2,
+			},
+			want: "Publication phase: idle",
+		},
+		{
+			name: "ordinary intent wait",
+			progress: publicationProgressReport{
+				Strategy: "intent", Phase: "intent_wait", QueuePending: 3,
+				WaitRemainingSeconds: 42, WorkerResponsive: true,
+			},
+			want: "waiting normally for the Intent batch (42s remaining)",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var out bytes.Buffer
+			envelope := productEnvelope{
+				OK: true, State: productStateWaiting,
+				Actions: []productAction{},
+				Data: productStatusData{
+					Enabled: true, Protected: true,
+					PublicationProgress: test.progress,
+					PublicationDrain:    test.drain,
+				},
+			}
+			if err := renderProductEnvelope(&out, envelope, false); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), test.want) {
+				t.Fatalf("status missing %q:\n%s", test.want, out.String())
+			}
+			if strings.Contains(out.String(), "Active target:") ||
+				strings.Contains(out.String(), "Commit-all progress:") {
+				t.Fatalf("inactive target rendered as current:\n%s", out.String())
+			}
+		})
 	}
 }
 

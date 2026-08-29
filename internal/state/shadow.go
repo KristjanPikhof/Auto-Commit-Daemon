@@ -188,6 +188,35 @@ func InvalidateShadowGeneration(ctx context.Context, d *DB, branchRef string, ge
 	return nil
 }
 
+// RebaseShadowGeneration advances the recorded HEAD for an existing shadow
+// without changing its live path snapshot. ACD-owned history repair preserves
+// the worktree and index, so rebuilding this shadow from the repaired HEAD
+// would forget already-captured dirty content and capture it again.
+func RebaseShadowGeneration(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	gen int64,
+	baseHead string,
+) (int, error) {
+	if d == nil || branchRef == "" || gen < 1 || baseHead == "" {
+		return 0, fmt.Errorf("state: RebaseShadowGeneration: invalid selector")
+	}
+	res, err := d.conn.ExecContext(ctx, `
+UPDATE shadow_paths
+SET base_head = ?
+WHERE branch_ref = ? AND branch_generation = ?`,
+		baseHead, branchRef, gen)
+	if err != nil {
+		return 0, fmt.Errorf("state: rebase shadow generation: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: rebase shadow generation rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // PruneShadowGenerations deletes shadow rows for branch generations older than
 // the configured retention window behind currentGeneration. retainBehind is the
 // number of prior generations to keep in addition to the current generation.

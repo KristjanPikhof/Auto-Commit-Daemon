@@ -35,13 +35,11 @@ import (
 	"time"
 )
 
-// TestFlush_LogicalCommitsSingleEditWithUnavailableProvider exercises the
-// d1 bypass on Intent Fast with an unavailable local provider. A single edit
-// followed by `acd flush
-// --logical` must land within the 2s budget the d1 spec asserts. This
-// catches a regression where the bypass plumbing depends on a network
-// provider being configured (it must not).
-func TestFlush_LogicalCommitsSingleEditWithUnavailableProvider(t *testing.T) {
+// TestFlush_LogicalCommitsSingleEditWithDeterministicProvider exercises the
+// d1 bypass on Intent Fast with the explicit deterministic provider. A single
+// edit followed by `acd flush --logical` must land within the 2s budget the d1
+// spec asserts without depending on a semantic provider.
+func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -54,6 +52,7 @@ func TestFlush_LogicalCommitsSingleEditWithUnavailableProvider(t *testing.T) {
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_AI_PROVIDER=deterministic",
 		"ACD_INTENT_MIN_PENDING=10",
 		"ACD_INTENT_MAX_PENDING_AGE=5m",
 		"ACD_INTENT_WINDOW=10",
@@ -134,6 +133,106 @@ func TestFlush_LogicalCommitsSingleEditWithUnavailableProvider(t *testing.T) {
 		t.Fatalf("HEAD subject=%q want %q (deterministic provider must produce Add <basename>)",
 			subj, "Add deterministic-flush.txt")
 	}
+}
+
+// TestFlush_LogicalWaitsForUnavailableSemanticProvider proves that a logical
+// flush bypasses the batching delay but not the semantic-message contract. If
+// a configured semantic provider is unavailable, the capture remains durable
+// and pending until that provider can supply the locked commit message.
+func TestFlush_LogicalWaitsForUnavailableSemanticProvider(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	bin := buildAcdBinary(t)
+	binDir := filepath.Dir(bin)
+
+	repo := tempRepo(t)
+	sessionID := "intent-flush-provider-wait"
+	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
+	extra := []string{
+		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_AI_PROVIDER=subprocess:missing-integration",
+		"ACD_INTENT_MIN_PENDING=10",
+		"ACD_INTENT_MAX_PENDING_AGE=5m",
+		"ACD_INTENT_WINDOW=10",
+		"ACD_INTENT_RETRY_ON_INVALID=0",
+	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
+	env = envWith(env, extra...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	ensureCheckpointRuntime(t, env, repo, bin)
+
+	startRes := runAcd(t, ctx, env,
+		"start", "--repo", repo,
+		"--session-id", sessionID,
+		"--harness", "claude-code",
+	)
+	if startRes.ExitCode != 0 {
+		t.Fatalf("acd start exit=%d\nstdout=%s\nstderr=%s",
+			startRes.ExitCode, startRes.Stdout, startRes.Stderr)
+	}
+	t.Cleanup(func() { shutdownDaemon(t, env, repo, sessionID) })
+	waitFor(t, "daemon mode==running", 10*time.Second, func() bool {
+		return readDaemonStateMode(repo) == "running"
+	})
+	assertIntentV2RuntimeActive(t, repo)
+
+	headBefore := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+	target := filepath.Join(repo, "semantic-provider-wait.txt")
+	writeFile(t, target, "wait for semantic message\n")
+
+	wakeRes := runAcd(t, ctx, env, "wake",
+		"--repo", repo, "--session-id", sessionID,
+	)
+	if wakeRes.ExitCode != 0 {
+		t.Fatalf("acd wake exit=%d\nstdout=%s\nstderr=%s",
+			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
+	}
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitForEventState(t, dbPath, "semantic-provider-wait.txt", "pending", 5*time.Second)
+
+	flushRes := runAcd(t, ctx, env, "flush",
+		"--repo", repo, "--session-id", sessionID, "--logical",
+	)
+	if flushRes.ExitCode != 0 {
+		t.Fatalf("acd flush --logical exit=%d\nstdout=%s\nstderr=%s",
+			flushRes.ExitCode, flushRes.Stdout, flushRes.Stderr)
+	}
+
+	messageDeadline := time.Now().Add(5 * time.Second)
+	progressState := ""
+	for time.Now().Before(messageDeadline) {
+		progressState = readDaemonStateScalar(repo, `
+SELECT COALESCE(progress_state, '')
+FROM intent_plan_runs
+ORDER BY updated_ts DESC
+LIMIT 1`)
+		if progressState == "waiting_message_rewrite" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if progressState != "waiting_message_rewrite" {
+		t.Fatalf("Intent progress_state=%q want waiting_message_rewrite; HEAD=%s; events=%s; runtime=%s",
+			progressState,
+			strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")),
+			readDaemonStateScalar(repo, `
+SELECT group_concat(seq || ':' || state || ':' || COALESCE(commit_oid, ''), ',')
+FROM capture_events`),
+			readDaemonStateScalar(repo, `
+SELECT group_concat(key || '=' || value, ',')
+FROM daemon_meta
+WHERE key IN ('runtime.active_revision_id', 'ai.provider', 'commit.strategy',
+	              'intent.v2.migration_state', 'intent.v2.needs_attention')`))
+	}
+	if headAfter := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
+		t.Fatalf("unavailable semantic provider advanced HEAD: %s -> %s",
+			headBefore, headAfter)
+	}
+	waitForEventState(t, dbPath, "semantic-provider-wait.txt", "pending", time.Second)
 }
 
 // TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture asserts the b2

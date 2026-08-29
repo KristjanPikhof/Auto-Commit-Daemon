@@ -187,6 +187,9 @@ func CanRuntimeMigrate(from, to int) bool {
 		case 23:
 			// v24 adds immutable membership for new Intent repairs and marks
 			// historical repairs as legacy without inventing members.
+		case 24:
+			// v25 adds immutable runtime identity columns to publication drains
+			// and adopts only revision-backed planner evidence for legacy drains.
 		default:
 			return false
 		}

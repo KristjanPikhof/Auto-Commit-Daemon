@@ -7,6 +7,58 @@ import (
 	"testing"
 )
 
+func TestIntentPlanRunByFingerprintLoadsExactResolvedRunReadOnly(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	run, err := EnsureIntentPlanRun(ctx, db, IntentPlanRun{
+		Fingerprint: "sha256:resolved", BranchRef: "refs/heads/main",
+		BranchGeneration: 4, AttemptLimit: 3,
+		Provider: sql.NullString{String: "semantic", Valid: true},
+		Model:    sql.NullString{String: "model", Valid: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.Completed = true
+	run.PreservedGroups = [][]int64{{11, 12}}
+	run.UnresolvedSeqs = []int64{13}
+	run.FindingCodes = []string{"verification_failed"}
+	run.ProgressState = sql.NullString{String: "completed", Valid: true}
+	run.ResolutionMode = sql.NullString{String: "semantic", Valid: true}
+	run.ResolvedPlanJSON = sql.NullString{
+		String: `{"plan":{"protocol_version":"v2","candidates":[]}}`,
+		Valid:  true,
+	}
+	if err := UpdateIntentPlanRun(ctx, db, run); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, ok, err := IntentPlanRunByFingerprint(ctx, db, run.Fingerprint)
+	if err != nil || !ok || loaded.Fingerprint != run.Fingerprint ||
+		loaded.BranchRef != run.BranchRef ||
+		loaded.BranchGeneration != run.BranchGeneration || !loaded.Completed ||
+		loaded.ResolvedPlanJSON != run.ResolvedPlanJSON ||
+		!reflect.DeepEqual(loaded.PreservedGroups, run.PreservedGroups) ||
+		!reflect.DeepEqual(loaded.UnresolvedSeqs, run.UnresolvedSeqs) ||
+		!reflect.DeepEqual(loaded.FindingCodes, run.FindingCodes) {
+		t.Fatalf("exact run=(%+v ok=%t err=%v), want %+v", loaded, ok, err, run)
+	}
+	if missing, ok, err := IntentPlanRunByFingerprint(
+		ctx, db, "sha256:missing",
+	); err != nil || ok || missing.Fingerprint != "" {
+		t.Fatalf("missing run=(%+v ok=%t err=%v)", missing, ok, err)
+	}
+	var count int
+	if err := db.ReadSQL().QueryRowContext(
+		ctx, `SELECT COUNT(*) FROM intent_plan_runs`,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("plan rows=%d want 1 after read-only lookup", count)
+	}
+}
+
 func TestIntentPlanRunAttemptBudgetSurvivesReopen(t *testing.T) {
 	ctx := context.Background()
 	db, dbPath := openTestDB(t)

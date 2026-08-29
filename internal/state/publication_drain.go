@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -24,19 +25,27 @@ var (
 	ErrPublicationDrainIdentity = errors.New("state: publication drain identity mismatch")
 	ErrPublicationDrainPhase    = errors.New("state: publication drain phase conflict")
 	ErrPublicationDrainProgress = errors.New("state: publication drain progress regression")
+	ErrPublicationDrainRuntime  = errors.New("state: publication drain runtime contract unavailable")
+	ErrPublicationDrainBarrier  = errors.New("state: unresolved publication drain blocks new drain")
 )
 
 // PublicationDrain is one resumable publication operation over the immutable
 // event membership of CheckpointID. EventSeqs is loaded from checkpoint_events;
 // it is never duplicated into mutable drain state.
 type PublicationDrain struct {
-	ID               string
-	CheckpointID     string
-	WorktreeID       string
-	BranchRef        string
-	BranchGeneration int64
-	Phase            string
-	TargetEventCount int64
+	ID                  string
+	CheckpointID        string
+	WorktreeID          string
+	BranchRef           string
+	BranchGeneration    int64
+	CommitStrategy      string
+	CommitFormat        string
+	ConfigRevisionID    int64
+	Provider            string
+	ProviderModel       string
+	ProviderFingerprint string
+	Phase               string
+	TargetEventCount    int64
 	// PublishedEventCount is the durable resolved-member count. The legacy
 	// column name also includes events preserved by exact recovery and then
 	// recaptured for a bounded follow-up drain.
@@ -174,14 +183,17 @@ func PreparePublicationDrain(
 	if db == nil {
 		return false, errors.New("state: PreparePublicationDrain: nil db")
 	}
-	if err := validatePublicationDrainIdentity(drain); err != nil {
-		return false, err
-	}
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("state: begin publication drain prepare: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := resolvePublicationDrainRuntimeContract(ctx, tx, &drain); err != nil {
+		return false, err
+	}
+	if err := validatePublicationDrainIdentity(drain); err != nil {
+		return false, err
+	}
 
 	checkpoint, ok, err := checkpointByIDQuery(ctx, tx, drain.CheckpointID, true)
 	if err != nil {
@@ -223,6 +235,19 @@ func PreparePublicationDrain(
 		}
 		return false, nil
 	}
+	var barrierID string
+	barrierErr := tx.QueryRowContext(ctx, `
+SELECT id FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase!='completed'
+  AND id<>?
+ORDER BY created_ts,id LIMIT 1`,
+		drain.BranchRef, drain.BranchGeneration, drain.ID).Scan(&barrierID)
+	if barrierErr == nil {
+		return false, ErrPublicationDrainBarrier
+	}
+	if !errors.Is(barrierErr, sql.ErrNoRows) {
+		return false, fmt.Errorf("state: inspect publication drain barrier: %w", barrierErr)
+	}
 	if _, ok, err := publicationDrainByCheckpointQuery(
 		ctx, tx, drain.CheckpointID, false); err != nil {
 		return false, err
@@ -238,13 +263,18 @@ func PreparePublicationDrain(
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO publication_drains(
- id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
+ id,checkpoint_id,worktree_id,branch_ref,branch_generation,
+ commit_strategy,commit_format,config_revision_id,provider,provider_model,
+ provider_fingerprint,phase,
  target_event_count,published_event_count,semantic_rebuild_attempts,
  event_fallback_count,commit_count,fallback_mode,last_error,staged_consent,staged_consumed,
  created_ts,updated_ts,last_progress_ts,completed_ts
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		drain.ID, drain.CheckpointID, drain.WorktreeID, drain.BranchRef,
-		drain.BranchGeneration, drain.Phase, drain.TargetEventCount,
+		drain.BranchGeneration, drain.CommitStrategy, drain.CommitFormat,
+		drain.ConfigRevisionID, drain.Provider, drain.ProviderModel,
+		drain.ProviderFingerprint,
+		drain.Phase, drain.TargetEventCount,
 		drain.PublishedEventCount, drain.SemanticRebuildAttempts,
 		drain.EventFallbackCount, drain.CommitCount, drain.FallbackMode,
 		drain.LastError, drain.StagedConsent, drain.StagedConsumed,
@@ -264,6 +294,200 @@ INSERT INTO publication_drain_events(drain_id,ord,event_seq) VALUES(?,?,?)`,
 		return false, fmt.Errorf("state: commit publication drain prepare: %w", err)
 	}
 	return true, nil
+}
+
+func resolvePublicationDrainRuntimeContract(
+	ctx context.Context,
+	tx *sql.Tx,
+	drain *PublicationDrain,
+) error {
+	if drain == nil {
+		return ErrPublicationDrainRuntime
+	}
+	// An idempotent retry keeps the original immutable contract even if the
+	// active runtime changed after the drain was first prepared.
+	if existing, ok, err := publicationDrainByIDQuery(
+		ctx, tx, drain.ID, false); err != nil {
+		return err
+	} else if ok {
+		if drain.CommitStrategy == "" {
+			drain.CommitStrategy = existing.CommitStrategy
+		}
+		if drain.CommitFormat == "" {
+			drain.CommitFormat = existing.CommitFormat
+		}
+		if drain.ConfigRevisionID == 0 {
+			drain.ConfigRevisionID = existing.ConfigRevisionID
+		}
+		if drain.Provider == "" {
+			drain.Provider = existing.Provider
+		}
+		if drain.ProviderModel == "" {
+			drain.ProviderModel = existing.ProviderModel
+		}
+		if drain.ProviderFingerprint == "" {
+			drain.ProviderFingerprint = existing.ProviderFingerprint
+		}
+		drain.CommitStrategy = strings.TrimSpace(drain.CommitStrategy)
+		drain.CommitFormat = strings.TrimSpace(drain.CommitFormat)
+		drain.Provider = strings.TrimSpace(drain.Provider)
+		drain.ProviderModel = strings.TrimSpace(drain.ProviderModel)
+		drain.ProviderFingerprint = strings.TrimSpace(
+			drain.ProviderFingerprint)
+		if publicationDrainRuntimeContractComplete(*drain) {
+			return nil
+		}
+	}
+	var runtimeReady string
+	readyErr := tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta
+WHERE key='publication.runtime.ready'`).Scan(&runtimeReady)
+	if readyErr == nil {
+		if strings.TrimSpace(runtimeReady) != "true" {
+			return ErrPublicationDrainRuntime
+		}
+	} else if !errors.Is(readyErr, sql.ErrNoRows) {
+		return fmt.Errorf("state: read publication drain runtime readiness: %w", readyErr)
+	} else {
+		// A tuple written by an older binary has no readiness proof. Refuse to
+		// freeze it: it may be the stale last usable runtime left behind after a
+		// blocked desired bundle became active.
+		var projected int
+		if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM daemon_meta
+WHERE key IN (
+ 'publication.runtime.commit_strategy',
+ 'publication.runtime.commit_format',
+ 'publication.runtime.config_revision_id',
+ 'publication.runtime.provider',
+ 'publication.runtime.provider_model',
+ 'publication.runtime.provider_fingerprint'
+)`).Scan(&projected); err != nil {
+			return fmt.Errorf("state: inspect publication drain runtime projection: %w", err)
+		}
+		if projected > 0 {
+			return ErrPublicationDrainRuntime
+		}
+	}
+	if drain.CommitStrategy == "" {
+		_ = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta
+WHERE key='publication.runtime.commit_strategy'`).Scan(
+			&drain.CommitStrategy)
+	}
+	if drain.CommitFormat == "" {
+		_ = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta
+WHERE key='publication.runtime.commit_format'`).Scan(&drain.CommitFormat)
+	}
+	if drain.ConfigRevisionID == 0 {
+		var rawRevision string
+		if err := tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta
+WHERE key='publication.runtime.config_revision_id'`).Scan(
+			&rawRevision); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("state: read publication drain runtime revision: %w", err)
+		} else if err == nil {
+			revision, parseErr := strconv.ParseInt(
+				strings.TrimSpace(rawRevision), 10, 64)
+			if parseErr != nil || revision < 0 {
+				return ErrPublicationDrainRuntime
+			}
+			drain.ConfigRevisionID = revision
+		}
+	}
+	if drain.Provider == "" {
+		_ = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta
+WHERE key='publication.runtime.provider'`).Scan(&drain.Provider)
+	}
+	if drain.ProviderModel == "" {
+		_ = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta
+WHERE key='publication.runtime.provider_model'`).Scan(&drain.ProviderModel)
+	}
+	if drain.ProviderFingerprint == "" {
+		_ = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta
+WHERE key='publication.runtime.provider_fingerprint'`).Scan(
+			&drain.ProviderFingerprint)
+	}
+	drain.CommitStrategy = strings.TrimSpace(drain.CommitStrategy)
+	drain.CommitFormat = strings.TrimSpace(drain.CommitFormat)
+	drain.Provider = strings.TrimSpace(drain.Provider)
+	drain.ProviderModel = strings.TrimSpace(drain.ProviderModel)
+	drain.ProviderFingerprint = strings.TrimSpace(drain.ProviderFingerprint)
+	if publicationDrainRuntimeContractComplete(*drain) {
+		if drain.ConfigRevisionID > 0 {
+			var applied sql.NullInt64
+			if err := tx.QueryRowContext(ctx, `
+SELECT applied_revision_id FROM runtime_config_state WHERE id=1`).Scan(
+				&applied); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("state: read applied publication runtime: %w", err)
+			}
+			if !applied.Valid || applied.Int64 != drain.ConfigRevisionID {
+				return ErrPublicationDrainRuntime
+			}
+		}
+		return nil
+	}
+
+	// Repositories without a persisted runtime revision use the legacy Event
+	// default. Once any runtime revision exists, an incomplete contract means
+	// startup or validation has not produced a publishable bundle yet and the
+	// drain must wait instead of guessing.
+	var configured int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM runtime_config_state
+WHERE id=1 AND (desired_revision_id IS NOT NULL OR
+                applied_revision_id IS NOT NULL OR
+                last_known_good_revision_id IS NOT NULL)`).Scan(
+		&configured); err != nil {
+		return fmt.Errorf("state: inspect publication drain runtime state: %w", err)
+	}
+	if configured > 0 {
+		return ErrPublicationDrainRuntime
+	}
+	if drain.CommitStrategy == "" {
+		_ = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta WHERE key='commit.strategy'`).Scan(
+			&drain.CommitStrategy)
+	}
+	if drain.Provider == "" {
+		_ = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta WHERE key='ai.provider'`).Scan(&drain.Provider)
+	}
+	if drain.CommitFormat == "" {
+		_ = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta WHERE key='commit.format'`).Scan(
+			&drain.CommitFormat)
+	}
+	if strings.TrimSpace(drain.CommitStrategy) == "" {
+		drain.CommitStrategy = "event"
+	}
+	if strings.TrimSpace(drain.Provider) == "" &&
+		drain.CommitStrategy == "event" {
+		drain.Provider = "deterministic"
+	}
+	if strings.TrimSpace(drain.CommitFormat) == "" {
+		drain.CommitFormat = "imperative"
+	}
+	drain.CommitStrategy = strings.TrimSpace(drain.CommitStrategy)
+	drain.CommitFormat = strings.TrimSpace(drain.CommitFormat)
+	drain.Provider = strings.TrimSpace(drain.Provider)
+	drain.ProviderModel = strings.TrimSpace(drain.ProviderModel)
+	drain.ProviderFingerprint = strings.TrimSpace(drain.ProviderFingerprint)
+	if !publicationDrainRuntimeContractComplete(*drain) {
+		return ErrPublicationDrainRuntime
+	}
+	return nil
+}
+
+func publicationDrainRuntimeContractComplete(drain PublicationDrain) bool {
+	return drain.CommitStrategy != "" && drain.CommitFormat != "" &&
+		drain.Provider != "" &&
+		(drain.CommitStrategy != "intent" || drain.ConfigRevisionID > 0 ||
+			drain.ProviderFingerprint != "")
 }
 
 func validatePublicationDrainEvents(
@@ -488,6 +712,21 @@ func ReadPublicationDrainProjection(
 		return projection, nil
 	}
 	projection.Available = true
+	if projection.SchemaVersion < 25 {
+		active, err := legacyPublicationDrainsQuery(ctx, conn, true)
+		if err != nil {
+			return projection, err
+		}
+		projection.Active = active
+		latest, ok, err := legacyPublicationDrainLatestQuery(ctx, conn, true)
+		if err != nil {
+			return projection, err
+		}
+		if ok {
+			projection.Latest = &latest
+		}
+		return projection, nil
+	}
 	active, err := publicationDrainsQuery(ctx, conn, true)
 	if err != nil {
 		return projection, err
@@ -504,6 +743,15 @@ func ReadPublicationDrainProjection(
 }
 
 const publicationDrainSelect = `
+SELECT id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
+ commit_strategy,commit_format,config_revision_id,provider,provider_model,
+ provider_fingerprint,
+ target_event_count,published_event_count,semantic_rebuild_attempts,
+ event_fallback_count,commit_count,fallback_mode,last_error,staged_consent,staged_consumed,
+ created_ts,updated_ts,last_progress_ts,completed_ts
+FROM publication_drains`
+
+const legacyPublicationDrainSelect = `
 SELECT id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
  target_event_count,published_event_count,semantic_rebuild_attempts,
  event_fallback_count,commit_count,fallback_mode,last_error,staged_consent,staged_consumed,
@@ -603,6 +851,56 @@ func publicationDrainsQuery(
 	return drains, rows.Err()
 }
 
+func legacyPublicationDrainsQuery(
+	ctx context.Context,
+	query interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	},
+	activeOnly bool,
+) ([]PublicationDrain, error) {
+	statement := legacyPublicationDrainSelect
+	if activeOnly {
+		statement += " WHERE phase NOT IN ('completed','needs_action')"
+	}
+	statement += " ORDER BY created_ts,id"
+	rows, err := query.QueryContext(ctx, statement)
+	if err != nil {
+		return nil, fmt.Errorf("state: query legacy publication drains: %w", err)
+	}
+	defer rows.Close()
+	var drains []PublicationDrain
+	for rows.Next() {
+		drain, err := scanLegacyPublicationDrain(rows)
+		if err != nil {
+			return nil, err
+		}
+		drains = append(drains, drain)
+	}
+	return drains, rows.Err()
+}
+
+func legacyPublicationDrainLatestQuery(
+	ctx context.Context,
+	query checkpointQuery,
+	loadEvents bool,
+) (PublicationDrain, bool, error) {
+	drain, err := scanLegacyPublicationDrain(query.QueryRowContext(
+		ctx, legacyPublicationDrainSelect+
+			" ORDER BY created_ts DESC,id DESC LIMIT 1"))
+	if errors.Is(err, sql.ErrNoRows) {
+		return PublicationDrain{}, false, nil
+	}
+	if err != nil {
+		return PublicationDrain{}, false, err
+	}
+	if loadEvents {
+		if err := loadPublicationDrainEvents(ctx, query, &drain); err != nil {
+			return PublicationDrain{}, false, err
+		}
+	}
+	return drain, true, nil
+}
+
 type publicationDrainCandidateQuery interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
@@ -687,6 +985,8 @@ func scanPublicationDrain(row checkpointRows) (PublicationDrain, error) {
 	var drain PublicationDrain
 	if err := row.Scan(&drain.ID, &drain.CheckpointID, &drain.WorktreeID,
 		&drain.BranchRef, &drain.BranchGeneration, &drain.Phase,
+		&drain.CommitStrategy, &drain.CommitFormat, &drain.ConfigRevisionID,
+		&drain.Provider, &drain.ProviderModel, &drain.ProviderFingerprint,
 		&drain.TargetEventCount, &drain.PublishedEventCount,
 		&drain.SemanticRebuildAttempts, &drain.EventFallbackCount,
 		&drain.CommitCount, &drain.FallbackMode, &drain.LastError,
@@ -697,11 +997,34 @@ func scanPublicationDrain(row checkpointRows) (PublicationDrain, error) {
 	return drain, nil
 }
 
+func scanLegacyPublicationDrain(row checkpointRows) (PublicationDrain, error) {
+	var drain PublicationDrain
+	if err := row.Scan(&drain.ID, &drain.CheckpointID, &drain.WorktreeID,
+		&drain.BranchRef, &drain.BranchGeneration, &drain.Phase,
+		&drain.TargetEventCount, &drain.PublishedEventCount,
+		&drain.SemanticRebuildAttempts, &drain.EventFallbackCount,
+		&drain.CommitCount, &drain.FallbackMode, &drain.LastError,
+		&drain.StagedConsent, &drain.StagedConsumed, &drain.CreatedTS,
+		&drain.UpdatedTS, &drain.LastProgressTS, &drain.CompletedTS); err != nil {
+		return PublicationDrain{}, err
+	}
+	return drain, nil
+}
+
 func validatePublicationDrainIdentity(drain PublicationDrain) error {
 	if strings.TrimSpace(drain.ID) == "" || len(drain.ID) > 128 ||
 		strings.TrimSpace(drain.CheckpointID) == "" ||
 		len(drain.WorktreeID) != 16 || strings.TrimSpace(drain.BranchRef) == "" ||
 		len(drain.BranchRef) > 1024 || drain.BranchGeneration < 0 ||
+		(drain.CommitStrategy != "event" && drain.CommitStrategy != "intent") ||
+		(drain.CommitFormat != "imperative" &&
+			drain.CommitFormat != "conventional") ||
+		drain.ConfigRevisionID < 0 || strings.TrimSpace(drain.Provider) == "" ||
+		len(drain.Provider) > 128 ||
+		len(drain.ProviderModel) > 256 ||
+		len(drain.ProviderFingerprint) > 71 ||
+		(drain.CommitStrategy == "intent" && drain.ConfigRevisionID == 0 &&
+			drain.ProviderFingerprint == "") ||
 		drain.TargetEventCount < 0 || drain.PublishedEventCount < 0 ||
 		drain.PublishedEventCount > drain.TargetEventCount ||
 		drain.CreatedTS <= 0 || !validPublicationDrainPhase(drain.Phase) {
@@ -714,6 +1037,12 @@ func samePublicationDrainIdentity(left, right PublicationDrain) bool {
 	return left.ID == right.ID && left.CheckpointID == right.CheckpointID &&
 		left.WorktreeID == right.WorktreeID && left.BranchRef == right.BranchRef &&
 		left.BranchGeneration == right.BranchGeneration &&
+		left.CommitStrategy == right.CommitStrategy &&
+		left.CommitFormat == right.CommitFormat &&
+		left.ConfigRevisionID == right.ConfigRevisionID &&
+		left.Provider == right.Provider &&
+		left.ProviderModel == right.ProviderModel &&
+		left.ProviderFingerprint == right.ProviderFingerprint &&
 		left.TargetEventCount == right.TargetEventCount &&
 		reflectPublicationDrainEventsEqual(left.EventSeqs, right.EventSeqs)
 }

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
@@ -86,6 +87,824 @@ func TestStatus_RegisteredRepoWithClientsAndCommit(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("output missing %q in:\n%s", want, got)
 		}
+	}
+}
+
+func TestRegularPublicationProgressBaselineTracksActiveQueueOnly(t *testing.T) {
+	_, _, db := makeRepoStateDB(t)
+	ctx := context.Background()
+	insert := func(branch string, generation int64, captured float64,
+		eventState string, published *float64) {
+		t.Helper()
+		var publishedValue any
+		if published != nil {
+			publishedValue = *published
+		}
+		if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO capture_events(
+ branch_ref,branch_generation,base_head,operation,path,fidelity,
+ captured_ts,state,commit_oid,published_ts
+) VALUES(?,?, 'head','modify',?,'exact',?,?,?,?)`,
+			branch, generation,
+			fmt.Sprintf("%s-%d-%0.f", branch, generation, captured),
+			captured, eventState,
+			func() any {
+				if published != nil {
+					return "commit"
+				}
+				return nil
+			}(), publishedValue); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mainProgress := float64(200)
+	otherProgress := float64(900)
+	insert("refs/heads/main", 7, 100, state.EventStatePending, nil)
+	insert("refs/heads/main", 7, 50, state.EventStatePublished, &mainProgress)
+	insert("refs/heads/other", 7, 50, state.EventStatePublished, &otherProgress)
+	// New work must not make an old stuck frontier look fresh.
+	insert("refs/heads/main", 7, 500, state.EventStatePending, nil)
+
+	got, err := regularPublicationProgressBaseline(
+		ctx, db.SQL(), "refs/heads/main", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != mainProgress {
+		t.Fatalf("last progress=%v, want active-branch publication %v", got,
+			mainProgress)
+	}
+}
+
+func TestStatusAndListKeepPausedDrainTargetFromDurablePair(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, db := makeRepoStateDB(t)
+	registerProtectedControlRepo(t, roots, repo)
+
+	seqs := insertCompletedCheckpoint(t, db, "cp-paused-target",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStatePending,
+		}})
+	drain := state.PublicationDrain{
+		ID: "drain-paused-target", CheckpointID: "cp-paused-target",
+		WorktreeID: "0123456789abcdef", BranchRef: "refs/heads/main",
+		BranchGeneration: 7, CommitStrategy: "intent",
+		CommitFormat: "imperative", Provider: "openai-compat",
+		ProviderFingerprint: "sha256:" + strings.Repeat("a", 64),
+		Phase:               state.PublicationDrainSemantic, TargetEventCount: 1,
+		CreatedTS: nowFloat(), UpdatedTS: nowFloat(),
+		LastProgressTS: nowFloat(), EventSeqs: seqs,
+	}
+	if created, err := state.PreparePublicationDrain(ctx, db, drain); err != nil || !created {
+		t.Fatalf("prepare drain=(%t,%v)", created, err)
+	}
+	if err := state.MetaSet(ctx, db, "commit.strategy", "intent"); err != nil {
+		t.Fatal(err)
+	}
+	seedCurrentReplayPair(t, db, drain.BranchRef, drain.BranchGeneration)
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertDaemonReplayAnchorNull(t, db)
+	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
+		Reason: "inspect publication", SetAt: time.Now().UTC().Format(time.RFC3339),
+		SetBy: "test",
+	})
+
+	record := central.RepoRecord{
+		Path: repo, StateDB: dbPath, RepoHash: "0123456789abcdef",
+		RepositoryID: "repository-id", WorktreeID: "0123456789abcdef",
+	}
+	report, err := buildStatusReport(ctx, record, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.BranchRef != drain.BranchRef ||
+		report.BranchGeneration != drain.BranchGeneration ||
+		report.PublicationDrain.ID != drain.ID ||
+		report.PublicationProgress.Phase != "paused" ||
+		report.PublicationProgress.TargetRemaining != 1 ||
+		report.PublicationProgress.TargetTotal != 1 {
+		t.Fatalf("paused status=%+v progress=%+v branch=%s/%d",
+			report.PublicationDrain, report.PublicationProgress,
+			report.BranchRef, report.BranchGeneration)
+	}
+
+	overview, err := readProductListRepo(ctx, record, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := productListEntry{PublicationProgress: overview.report.PublicationProgress}
+	if got := productListTarget(entry); got != "commit-all:1/1" {
+		t.Fatalf("paused list target=%q progress=%+v", got,
+			overview.report.PublicationProgress)
+	}
+
+	var out bytes.Buffer
+	if err := runControlStatus(ctx, &out, repo, false); ExitCode(err) != ExitActionRequired {
+		t.Fatalf("paused status exit=%d err=%v\n%s", ExitCode(err), err, out.String())
+	}
+	for _, want := range []string{
+		"Active target: earlier commit-all request, 1 of 1 left",
+		"Publication phase: paused by the user",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("paused status missing %q:\n%s", want, out.String())
+		}
+	}
+
+	// A paused worker may not have observed a manual branch switch yet. The
+	// persisted pair must match the checked-out branch before it scopes status.
+	seedCurrentReplayPair(t, db, "refs/heads/other", 8)
+	mismatched, err := buildStatusReport(ctx, record, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mismatched.BranchRef != "" || mismatched.PublicationDrain.ID != "" ||
+		mismatched.PublicationProgress.TargetTotal != 0 {
+		t.Fatalf("stale paused pair leaked drain=%+v progress=%+v branch=%q",
+			mismatched.PublicationDrain, mismatched.PublicationProgress,
+			mismatched.BranchRef)
+	}
+}
+
+func TestPublicationProgressSeparatesStallFromExpectedWait(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	now := time.Unix(1_000, 0)
+	base := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 2,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+		PublicationDrain: publicationDrainReport{
+			ID: "drain", Phase: state.PublicationDrainSemantic,
+			TargetEvents: 2, RemainingEvents: 2, LastProgressTS: 100,
+		},
+	}
+	progress, err := buildPublicationProgressReport(
+		context.Background(), nil, base, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Phase != "stalled" || !progress.WorkerResponsive ||
+		progress.LastProgressAgeSeconds != 900 {
+		t.Fatalf("stalled progress=%+v", progress)
+	}
+
+	base.PublicationDrain = publicationDrainReport{}
+	base.IntentStrategy.BatchWaitActive = true
+	base.IntentStrategy.BatchWaitReason = "skipped_due_intent_batch_wait"
+	base.IntentStrategy.AgeTriggerInSeconds = 30
+	// No DB is available for a regular queue baseline in this unit case, but
+	// the explicit wait must remain a normal wait rather than become stalled.
+	progress, err = buildPublicationProgressReport(
+		context.Background(), nil, base, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Phase != "intent_wait" || progress.WaitRemainingSeconds != 30 {
+		t.Fatalf("wait progress=%+v", progress)
+	}
+}
+
+func TestPublicationProgressShowsAutomaticVerificationRecovery(t *testing.T) {
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 7,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+		IntentV2:       intentV2Report{VerificationRecovering: 2},
+	}
+	progress, err := buildPublicationProgressReport(
+		context.Background(), nil, report, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Phase != "intent_verification_recovery" {
+		t.Fatalf("verification recovery progress=%+v", progress)
+	}
+	if label := publicationProgressPhaseLabel(progress); !strings.Contains(
+		label, "automatic checkpoint replan",
+	) {
+		t.Fatalf("verification recovery label=%q", label)
+	}
+}
+
+func TestPublicationProgressShowsActiveIntentRecoveryTarget(t *testing.T) {
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	now := time.Now()
+	seqs := insertCompletedCheckpoint(t, db, "cp-intent-recovery",
+		"0123456789abcdef", []checkpointMemberFixture{
+			{State: state.EventStatePending},
+			{State: state.EventStatePublished, CommitOID: "published-commit"},
+			{State: state.EventStatePending},
+		})
+	publishedTS := float64(now.Add(-10*time.Second).UnixNano()) / 1e9
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET published_ts=? WHERE seq=?`,
+		publishedTS, seqs[1]); err != nil {
+		t.Fatal(err)
+	}
+	markerTS := float64(now.Add(-30*time.Second).UnixNano()) / 1e9
+	marker := state.IntentForwardRecovery{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CandidateID: "failed-candidate", Stage: "semantic_replan",
+		TargetEventSeqs: []int64{seqs[0], seqs[1]},
+		LastProgressTS:  markerTS,
+	}
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		marker); err != nil {
+		t.Fatal(err)
+	}
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 2,
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CheckpointProtectionAvailable: true, Protected: false, Busy: true,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+	}
+	progress, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Origin != "intent_recovery" ||
+		progress.Phase != "intent_replanning" ||
+		progress.TargetTotal != 2 || progress.TargetRemaining != 1 ||
+		progress.LastProgressTS < publishedTS {
+		t.Fatalf("intent recovery progress=%+v", progress)
+	}
+	entry := productListEntry{PublicationProgress: progress}
+	if target, phase := productListTarget(entry), productListPhase(entry); target != "recover:1/2" || phase != "intent-replan" {
+		t.Fatalf("intent recovery list target=%q phase=%q", target, phase)
+	}
+	var human bytes.Buffer
+	renderProductPublicationProgress(&human, progress)
+	for _, want := range []string{
+		"Active target: automatic Intent recovery, 1 of 2 left",
+		"Publication phase: recovering by replanning commit groups by Intent",
+	} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("intent recovery status missing %q:\n%s", want, human.String())
+		}
+	}
+
+	report.PublicationProgress = progress
+	result := controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.Health != controlHealthPublishing ||
+		!strings.Contains(result.Summary, "automatically rebuilding semantic") ||
+		strings.Contains(result.Summary, "scanning recent changes") {
+		t.Fatalf("intent recovery control=%+v", result)
+	}
+
+	progress.Phase = "stalled"
+	report.PublicationProgress = progress
+	result = controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.Health != controlHealthDegraded ||
+		!strings.Contains(result.Summary, "Automatic Intent recovery is active") ||
+		!strings.Contains(result.NextAction, "keep replanning the exact recovery target") {
+		t.Fatalf("stalled intent recovery control=%+v", result)
+	}
+	if label := publicationProgressPhaseLabel(progress); !strings.Contains(
+		label, "automatic Intent recovery active",
+	) {
+		t.Fatalf("stalled intent recovery label=%q", label)
+	}
+
+	marker.Stage = "local_unlock"
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		marker); err != nil {
+		t.Fatal(err)
+	}
+	legacyLocal, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyLocal.Phase != "intent_replanning" ||
+		legacyLocal.TemporaryLocalFallback {
+		t.Fatalf("unanchored local recovery progress=%+v", legacyLocal)
+	}
+
+	marker.PlanFingerprint = "sha256:verified-plan"
+	marker.PrefixCursor = 1
+	marker.PrefixUnresolvedCount = 1
+	marker.PrefixBaseHead = "base-head"
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		marker); err != nil {
+		t.Fatal(err)
+	}
+	local, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.Phase != "local_fallback" || !local.TemporaryLocalFallback ||
+		productListPhase(productListEntry{PublicationProgress: local}) != "intent-widen" {
+		t.Fatalf("local Intent recovery progress=%+v", local)
+	}
+	var localHuman bytes.Buffer
+	renderProductPublicationProgress(&localHuman, local)
+	if !strings.Contains(localHuman.String(), "widening a verified Intent group") ||
+		strings.Contains(localHuman.String(), "temporary local fallback") {
+		t.Fatalf("local Intent recovery wording:\n%s", localHuman.String())
+	}
+	report.PublicationProgress = local
+	result = controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.Health != controlHealthPublishing ||
+		!strings.Contains(result.Summary, "widening a verified Intent group") {
+		t.Fatalf("local Intent recovery control=%+v", result)
+	}
+
+	marker.PrefixExhausted = true
+	marker.NeedsAttention = true
+	marker.AttentionReason = "complete semantic prefix failed verification"
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		marker); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedEntry := productListEntry{PublicationProgress: blocked}
+	if blocked.Phase != "needs_action" || !blocked.NeedsAttention ||
+		blocked.AttentionReason != marker.AttentionReason ||
+		productListTarget(blockedEntry) != "recover:1/2" ||
+		productListPhase(blockedEntry) != "blocked" ||
+		productListStatus(blockedEntry) != "needs action" {
+		t.Fatalf("exhausted Intent recovery progress=%+v target=%q phase=%q status=%q",
+			blocked, productListTarget(blockedEntry), productListPhase(blockedEntry),
+			productListStatus(blockedEntry))
+	}
+	var blockedHuman bytes.Buffer
+	renderProductPublicationProgress(&blockedHuman, blocked)
+	for _, want := range []string{
+		intentRecoveryVerificationAttentionSummary,
+		"Run `acd doctor`",
+		"Recovery reason: complete semantic prefix failed verification",
+	} {
+		if !strings.Contains(blockedHuman.String(), want) {
+			t.Fatalf("exhausted recovery status missing %q:\n%s",
+				want, blockedHuman.String())
+		}
+	}
+	if strings.Contains(blockedHuman.String(), "commit-all") {
+		t.Fatalf("exhausted recovery suggested commit-all:\n%s",
+			blockedHuman.String())
+	}
+	report.PublicationProgress = blocked
+	report.Repo = "/repo"
+	var verbose bytes.Buffer
+	if err := renderStatusHuman(&verbose, report); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(verbose.String(), intentRecoveryVerificationAttentionSummary) ||
+		!strings.Contains(verbose.String(), "Run `acd doctor`") ||
+		strings.Contains(verbose.String(), "commit-all") {
+		t.Fatalf("verbose exhausted recovery status:\n%s", verbose.String())
+	}
+	result = controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.OK || result.Health != controlHealthNeedsAttention ||
+		result.Summary != intentRecoveryVerificationAttentionSummary ||
+		!strings.Contains(result.NextAction, "acd doctor") ||
+		strings.Contains(result.NextAction, "commit-all") {
+		t.Fatalf("exhausted Intent recovery control=%+v", result)
+	}
+	var controlHuman bytes.Buffer
+	if err := renderProductEnvelope(&controlHuman,
+		envelopeFromControl(result), false); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"State: needs_action",
+		"Action needed: yes",
+		"Status: " + intentRecoveryVerificationAttentionSummary,
+		"Next: " + intentRecoveryVerificationAttentionNext,
+	} {
+		if !strings.Contains(controlHuman.String(), want) {
+			t.Fatalf("control status missing %q:\n%s", want,
+				controlHuman.String())
+		}
+	}
+
+	report.BranchGeneration = 8
+	stale, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.Origin == "intent_recovery" || stale.TargetTotal != 0 {
+		t.Fatalf("stale recovery marker leaked into progress=%+v", stale)
+	}
+}
+
+func TestActiveIntentRecoveryShowsOpenProviderWait(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	now := time.Unix(1_000, 0)
+	seqs := insertCompletedCheckpoint(t, db, "cp-provider-wait-recovery",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStatePending,
+		}})
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		state.IntentForwardRecovery{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			CandidateID: "failed-candidate", Stage: "semantic_replan",
+			TargetEventSeqs: seqs, LastProgressTS: 600,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 1,
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CheckpointProtectionAvailable: true, Protected: true, Busy: true,
+		IntentStrategy: intentStrategyReport{
+			Strategy: "intent", Active: true,
+			PlannerHealth: &daemon.IntentPlannerHealthSnapshot{
+				State: daemon.IntentPlannerCircuitOpen, NextProbeTS: 1_045,
+			},
+		},
+	}
+	progress, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := productListEntry{PublicationProgress: progress}
+	if progress.Origin != "intent_recovery" || progress.Phase != "provider_wait" ||
+		progress.WaitRemainingSeconds != 45 || progress.TargetRemaining != 1 ||
+		progress.TargetTotal != 1 || productListTarget(entry) != "recover:1/1" ||
+		productListPhase(entry) != "provider-wait:45s" ||
+		productListStatus(entry) != "waiting" {
+		t.Fatalf("provider-wait recovery progress=%+v target=%q phase=%q status=%q",
+			progress, productListTarget(entry), productListPhase(entry),
+			productListStatus(entry))
+	}
+	var human bytes.Buffer
+	renderProductPublicationProgress(&human, progress)
+	for _, want := range []string{
+		"Active target: automatic Intent recovery, 1 of 1 left",
+		"Publication phase: waiting for the Intent provider retry (45s remaining)",
+	} {
+		if !strings.Contains(human.String(), want) {
+			t.Fatalf("provider-wait recovery status missing %q:\n%s",
+				want, human.String())
+		}
+	}
+
+	report.PublicationProgress = progress
+	result := controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.Health != controlHealthWaiting ||
+		!strings.Contains(result.Summary, "recovery target and your work remain protected") ||
+		!strings.Contains(result.NextAction, "retry in 45s") {
+		t.Fatalf("provider-wait recovery control=%+v", result)
+	}
+
+	// Half-open owns the sole provider probe lease. Even an old recovery target
+	// is actively waiting on that one request, not stalled.
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET captured_ts=600 WHERE seq=?`, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET updated_ts=600 WHERE key=?`,
+		"intent.v2.forward_recovery"); err != nil {
+		t.Fatal(err)
+	}
+	report.IntentStrategy.PlannerHealth.State = daemon.IntentPlannerCircuitHalfOpen
+	halfOpen, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	halfOpenEntry := productListEntry{PublicationProgress: halfOpen}
+	if halfOpen.Phase != "provider_call" ||
+		halfOpen.WaitRemainingSeconds != 0 ||
+		halfOpen.LastProgressAgeSeconds < halfOpen.StallThresholdSeconds ||
+		productListTarget(halfOpenEntry) != "recover:1/1" ||
+		productListPhase(halfOpenEntry) != "provider-call" ||
+		productListStatus(halfOpenEntry) != "working" {
+		t.Fatalf("half-open recovery progress=%+v phase=%q status=%q",
+			halfOpen, productListPhase(halfOpenEntry),
+			productListStatus(halfOpenEntry))
+	}
+	var halfOpenHuman bytes.Buffer
+	renderProductPublicationProgress(&halfOpenHuman, halfOpen)
+	if !strings.Contains(halfOpenHuman.String(),
+		"waiting for the current Intent provider response") ||
+		strings.Contains(halfOpenHuman.String(), "retry") {
+		t.Fatalf("half-open recovery status:\n%s", halfOpenHuman.String())
+	}
+	report.PublicationProgress = halfOpen
+	halfOpenResult := controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&halfOpenResult, report, true)
+	if halfOpenResult.Health != controlHealthPublishing ||
+		!strings.Contains(halfOpenResult.Summary,
+			"current Intent provider response") ||
+		!strings.Contains(halfOpenResult.Summary,
+			"recovery target and your work remain protected") {
+		t.Fatalf("half-open recovery control=%+v", halfOpenResult)
+	}
+}
+
+func TestActiveIntentRecoveryUsesMarkerUpdateForProgress(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	now := time.Now()
+	staleTS := float64(now.Add(-5*time.Minute).UnixNano()) / 1e9
+	seqs := insertCompletedCheckpoint(t, db, "cp-marker-progress",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStatePending,
+		}})
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET captured_ts=? WHERE seq=?`, staleTS, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		state.IntentForwardRecovery{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			CandidateID: "failed-candidate", Stage: "local_unlock",
+			TargetEventSeqs: seqs, LastProgressTS: staleTS,
+			PlanFingerprint: "sha256:verified-plan", PrefixCursor: 1,
+			PrefixUnresolvedCount: 1, PrefixBaseHead: "base-head",
+		}); err != nil {
+		t.Fatal(err)
+	}
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 1,
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CheckpointProtectionAvailable: true, Protected: true, Busy: true,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+	}
+	progress, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Phase != "local_fallback" ||
+		progress.LastProgressTS <= staleTS {
+		t.Fatalf("fresh marker progress=%+v", progress)
+	}
+
+	// If the marker itself stops changing, its durable update boundary ages
+	// normally and the same recovery can still be reported as stalled.
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET updated_ts=? WHERE key=?`,
+		staleTS, "intent.v2.forward_recovery"); err != nil {
+		t.Fatal(err)
+	}
+	stalled, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled.Phase != "stalled" || stalled.LastProgressTS != staleTS ||
+		stalled.LastProgressAgeSeconds < stalled.StallThresholdSeconds {
+		t.Fatalf("aged marker progress=%+v", stalled)
+	}
+}
+
+func TestActiveIntentVerificationOverridesOldRecoveryProgress(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	now := time.Now()
+	staleTS := float64(now.Add(-5*time.Minute).UnixNano()) / 1e9
+	seqs := insertCompletedCheckpoint(t, db, "cp-active-verification",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStatePending,
+		}})
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET captured_ts=? WHERE seq=?`, staleTS, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetJSON(ctx, db, "intent.v2.forward_recovery",
+		state.IntentForwardRecovery{
+			BranchRef: "refs/heads/main", BranchGeneration: 7,
+			CandidateID: "failed-candidate", Stage: "semantic_replan",
+			TargetEventSeqs: seqs, LastProgressTS: staleTS,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET updated_ts=? WHERE key=?`,
+		staleTS, "intent.v2.forward_recovery"); err != nil {
+		t.Fatal(err)
+	}
+	activity := daemon.IntentVerificationActivity{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CandidateID: "semantic-group", PlanFingerprint: "sha256:plan",
+		RecoveryCandidateID: "failed-candidate",
+		StartedTS:           float64(now.Add(-10*time.Second).UnixNano()) / 1e9,
+	}
+	if err := state.MetaSetJSON(ctx, db,
+		daemon.MetaKeyIntentVerificationActivity, activity); err != nil {
+		t.Fatal(err)
+	}
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 1,
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		CheckpointProtectionAvailable: true, Protected: true, Busy: true,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+	}
+	progress, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := productListEntry{PublicationProgress: progress}
+	if progress.Origin != "intent_recovery" || progress.Phase != "verifying" ||
+		progress.TargetRemaining != 1 || progress.TargetTotal != 1 ||
+		progress.VerificationCandidate != activity.CandidateID ||
+		progress.VerificationPlan != activity.PlanFingerprint ||
+		progress.VerificationRecovery != activity.RecoveryCandidateID ||
+		progress.LastProgressAgeSeconds >= progress.StallThresholdSeconds ||
+		productListTarget(entry) != "recover:1/1" ||
+		productListPhase(entry) != "verifying" ||
+		productListStatus(entry) != "working" {
+		t.Fatalf("active verification progress=%+v phase=%q status=%q",
+			progress, productListPhase(entry), productListStatus(entry))
+	}
+	var human bytes.Buffer
+	renderProductPublicationProgress(&human, progress)
+	if !strings.Contains(human.String(), "verifying the semantic group") {
+		t.Fatalf("active verification status:\n%s", human.String())
+	}
+	report.PublicationProgress = progress
+	result := controlResult{OK: true}
+	applyControlStatusWithDaemonAlive(&result, report, true)
+	if result.Health != controlHealthPublishing ||
+		!strings.Contains(result.Summary, "verifying the semantic group") ||
+		!strings.Contains(result.Summary,
+			"recovery target and your work remain protected") {
+		t.Fatalf("active verification control=%+v", result)
+	}
+
+	// The activity marker is a progress boundary, not a permanent stall bypass.
+	activity.StartedTS = staleTS
+	if err := state.MetaSetJSON(ctx, db,
+		daemon.MetaKeyIntentVerificationActivity, activity); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE daemon_meta SET updated_ts=? WHERE key=?`,
+		staleTS, daemon.MetaKeyIntentVerificationActivity); err != nil {
+		t.Fatal(err)
+	}
+	stalled, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stalled.Phase != "stalled" ||
+		stalled.LastProgressAgeSeconds < stalled.StallThresholdSeconds {
+		t.Fatalf("aged verification marker progress=%+v", stalled)
+	}
+
+	activity.BranchGeneration = 8
+	activity.StartedTS = float64(now.UnixNano()) / 1e9
+	if err := state.MetaSetJSON(ctx, db,
+		daemon.MetaKeyIntentVerificationActivity, activity); err != nil {
+		t.Fatal(err)
+	}
+	mismatched, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mismatched.Phase == "verifying" {
+		t.Fatalf("mismatched verification marker trusted: %+v", mismatched)
+	}
+
+	activity.BranchGeneration = 7
+	if err := state.MetaSetJSON(ctx, db,
+		daemon.MetaKeyIntentVerificationActivity, activity); err != nil {
+		t.Fatal(err)
+	}
+	report.PID = 2_147_483_647
+	deadWorker, err := buildPublicationProgressReport(ctx, db.SQL(), report, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadWorker.WorkerResponsive || deadWorker.Phase == "verifying" {
+		t.Fatalf("dead worker verification marker trusted: %+v", deadWorker)
+	}
+}
+
+func TestStatusProjectsFailedVerificationAsAutomaticRecovery(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "recover.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveIntentCandidate(ctx, d, state.IntentCandidate{
+		ID: "verification-recovery", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: state.IntentCandidateWaiting,
+		Readiness: state.IntentReadinessWait,
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: seq, EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"commit.strategy":           "intent",
+		"intent.v2.migration_state": "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	record := central.RepoRecord{
+		Path: repo, StateDB: dbPath, RepoHash: central.CanonicalID(repo),
+	}
+	report, err := buildStatusReport(ctx, record, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.IntentV2.VerificationRecovering != 1 ||
+		report.IntentV2.VerificationAttention != 0 ||
+		report.PublicationProgress.Phase != "intent_verification_recovery" {
+		t.Fatalf("verification recovery report=%+v progress=%+v",
+			report.IntentV2, report.PublicationProgress)
+	}
+}
+
+func TestPublicationProgressPrioritizesDeliberateWaits(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	now := time.Unix(1_000, 0)
+	base := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 2,
+		Busy: true, CheckpointProtectionAvailable: true, Protected: true,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+		PublicationDrain: publicationDrainReport{
+			ID: "drain", Phase: state.PublicationDrainSemantic,
+			TargetEvents: 2, RemainingEvents: 2, LastProgressTS: 100,
+		},
+	}
+	tests := []struct {
+		name     string
+		mutate   func(*statusReport)
+		want     string
+		wantWait int64
+	}{
+		{name: "manual pause", mutate: func(report *statusReport) {
+			report.Paused = true
+			report.Pause = &pauseInfo{Source: "manual"}
+		}, want: "paused"},
+		{name: "rewind grace", mutate: func(report *statusReport) {
+			report.Paused = true
+			report.Pause = &pauseInfo{Source: "rewind_grace", RemainingSeconds: 23}
+		}, want: "rewind_wait", wantWait: 23},
+		{name: "configuration validation", mutate: func(report *statusReport) {
+			report.Configuration.Configuration = "validating"
+		}, want: "config_wait"},
+		{name: "checkpoint protection", mutate: func(report *statusReport) {
+			report.Protected = false
+		}, want: "checkpointing"},
+		{name: "provider circuit", mutate: func(report *statusReport) {
+			report.IntentStrategy.PlannerHealth = &daemon.IntentPlannerHealthSnapshot{
+				State: daemon.IntentPlannerCircuitOpen,
+			}
+		}, want: "provider_wait"},
+		{name: "ordinary intent wait", mutate: func(report *statusReport) {
+			report.PublicationDrain = publicationDrainReport{}
+			report.IntentStrategy.BatchWaitActive = true
+			report.IntentStrategy.BatchWaitReason = "skipped_due_intent_batch_wait"
+			report.IntentStrategy.AgeTriggerInSeconds = 31
+		}, want: "intent_wait", wantWait: 31},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			report := base
+			test.mutate(&report)
+			progress, err := buildPublicationProgressReport(
+				context.Background(), nil, report, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if progress.Phase != test.want ||
+				progress.WaitRemainingSeconds != test.wantWait {
+				t.Fatalf("progress=%+v, want phase=%q wait=%d",
+					progress, test.want, test.wantWait)
+			}
+		})
+	}
+}
+
+func TestRenderPublicationDrainHumanSuppressesCompletedHistory(t *testing.T) {
+	var out bytes.Buffer
+	renderPublicationDrainHuman(&out, publicationDrainReport{
+		Available: true, ID: "old-drain", Phase: state.PublicationDrainCompleted,
+		TargetEvents: 2, PublishedEvents: 2,
+	})
+	if out.Len() != 0 {
+		t.Fatalf("completed drain rendered as current work: %q", out.String())
 	}
 }
 
@@ -1613,18 +2432,28 @@ func TestStatus_IntentStrategyUsesDurablePlannerErrorLedger(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
 		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
+		BranchRef:        sql.NullString{String: "refs/heads/main", Valid: true},
+		BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
 	}); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
 	if err := state.MetaSet(ctx, d, "commit.strategy", "intent"); err != nil {
 		t.Fatalf("set commit.strategy: %v", err)
 	}
+	eventSeq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "src/app.go",
+		Fidelity: "exact", CapturedTS: 19,
+	}, nil)
+	if err != nil {
+		t.Fatalf("AppendCaptureEvent: %v", err)
+	}
 	if _, err := state.AppendDecision(ctx, d, state.DecisionRecord{
 		DecisionTS:  20,
 		Kind:        state.DecisionKindIntentPlannerError,
 		Path:        sqlNullStr("src/app.go"),
 		Reason:      sqlNullStr(`planner returned unsafe seq {"token":"legacy-secret"}`),
-		EventSeq:    sql.NullInt64{Int64: 42, Valid: true},
+		EventSeq:    sql.NullInt64{Int64: eventSeq, Valid: true},
 		ActionTaken: sqlNullStr("planner validation failed"),
 		UserMessage: sqlNullStr("fallback used"),
 	}); err != nil {
@@ -1642,7 +2471,7 @@ func TestStatus_IntentStrategyUsesDurablePlannerErrorLedger(t *testing.T) {
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
 		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
 	}
-	if rep.IntentStrategy.LastPlannerErrorEventSeq != 42 ||
+	if rep.IntentStrategy.LastPlannerErrorEventSeq != eventSeq ||
 		rep.IntentStrategy.LastPlannerErrorPath != "src/app.go" ||
 		strings.Contains(rep.IntentStrategy.LastPlannerError, "legacy-secret") ||
 		!strings.Contains(rep.IntentStrategy.LastPlannerError, "[REDACTED]") {

@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -195,7 +196,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	if err := diagnoseGeneratedPending(ctx, conn, rec.Path, &report); err != nil {
 		return report, err
 	}
-	if intentStrategy, err := loadIntentStrategyReport(ctx, conn); err != nil {
+	if intentStrategy, err := loadIntentStrategyReportForPair(
+		ctx, conn, report.Anchor.DaemonBranchRef,
+		report.Anchor.DaemonBranchGeneration); err != nil {
 		return report, err
 	} else {
 		report.IntentStrategy = intentStrategy
@@ -746,9 +749,9 @@ func diagnoseRemediation(report diagnoseReport) []string {
 				"intent planner has one connection probe in progress; other safe batches use evidence-based grouping until it succeeds.")
 		}
 	}
-	if report.IntentStrategy.LastPlannerError != "" {
+	if intentPlannerErrorNeedsRemediation(report) {
 		remediation = append(remediation,
-			fmt.Sprintf("intent planner last failed validation for seq %d (%s); replay will use deterministic fallback until planner output is valid.",
+			fmt.Sprintf("intent planner last failed validation for seq %d (%s); affected pending work can use evidence-based local grouping while ACD retries semantic planning.",
 				report.IntentStrategy.LastPlannerErrorEventSeq, report.IntentStrategy.LastPlannerError))
 	}
 	if report.IntentStrategy.PlannerErrorRateRecentWarn {
@@ -798,6 +801,36 @@ func diagnoseRemediation(report diagnoseReport) []string {
 		remediation = append(remediation, "No anchor mismatch or terminal replay barriers detected.")
 	}
 	return remediation
+}
+
+func intentPlannerErrorNeedsRemediation(report diagnoseReport) bool {
+	strategy := report.IntentStrategy
+	if strategy.LastPlannerError == "" || report.PendingDepth == 0 {
+		return false
+	}
+	window := strategy.LastPlannerWindow
+	health := strategy.PlannerHealth
+	if window == nil || health == nil ||
+		strategy.LastPlannerErrorTS <= 0 ||
+		window.PlannedTS < strategy.LastPlannerErrorTS ||
+		window.ValidationFailure != "" ||
+		window.ProviderCallSkipped != "" ||
+		health.State != daemon.IntentPlannerCircuitClosed ||
+		health.ConsecutiveFailures != 0 {
+		return true
+	}
+	if strategy.EffectiveProvider == "" ||
+		strategy.EffectiveProvider == (ai.DeterministicProvider{}).Name() ||
+		window.Provider != strategy.EffectiveProvider ||
+		window.Model != strategy.EffectiveModel {
+		return true
+	}
+	switch window.ResolutionMode {
+	case "provider", "completed_plan_reuse", "partial_replan", "repair_replan":
+		return false
+	default:
+		return true
+	}
 }
 
 func fileSHA256(path string) (string, error) {

@@ -325,12 +325,22 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 	if err != nil {
 		return fixPlan{}, fmt.Errorf("acd fix: check publication drain ledger: %w", err)
 	}
+	publicationDrainRuntimeContractAvailable := false
 	if hasPublicationDrains {
+		var schemaVersion int
+		if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
+			return fixPlan{}, fmt.Errorf("acd fix: read publication drain schema version: %w", err)
+		}
+		publicationDrainRuntimeContractAvailable = schemaVersion >= 25
 		if err := planResolvedPublicationDrains(ctx, conn, &plan); err != nil {
 			return fixPlan{}, err
 		}
 	}
-	if err := planUnpublishedChainReconciliation(ctx, conn, branchRef, plan.Generation, head, force, hasDecisionRecords, &plan); err != nil {
+	if err := planUnpublishedChainReconciliation(
+		ctx, conn, branchRef, plan.Generation, head, force,
+		hasDecisionRecords, hasPublicationDrains,
+		publicationDrainRuntimeContractAvailable, &plan,
+	); err != nil {
 		return fixPlan{}, err
 	}
 	return plan, nil
@@ -371,13 +381,14 @@ func resolvedPublicationDrainAction(
 }
 
 type unpublishedFixPair struct {
-	branchRef   string
-	generation  int64
-	firstSeq    int64
-	lastSeq     int64
-	eventCount  int
-	hasTerminal bool
-	decisionLed bool
+	branchRef              string
+	generation             int64
+	firstSeq               int64
+	lastSeq                int64
+	eventCount             int
+	hasTerminal            bool
+	decisionLed            bool
+	runtimeContractBlocked bool
 }
 
 // planUnpublishedChainReconciliation emits one action per exact provenance
@@ -392,6 +403,8 @@ func planUnpublishedChainReconciliation(
 	currentHead string,
 	force bool,
 	hasDecisionRecords bool,
+	hasPublicationDrains bool,
+	publicationDrainRuntimeContractAvailable bool,
 	plan *fixPlan,
 ) error {
 	decisionExpr := "0"
@@ -403,8 +416,32 @@ func planUnpublishedChainReconciliation(
       AND d.kind IN ('handled_external', 'handled_external_after_block', 'superseded_external')
 )`
 	}
+	runtimeContractBlockedExpr := "0"
+	if hasPublicationDrains {
+		runtimeCondition := "1"
+		if publicationDrainRuntimeContractAvailable {
+			runtimeCondition = `(
+          d.commit_strategy='' OR d.commit_format='' OR d.provider='' OR
+          d.last_error IN (
+              'publication_drain_runtime_contract_unavailable',
+              'publication_drain_environment_runtime_changed'
+          )
+      )`
+		}
+		runtimeContractBlockedExpr = `EXISTS (
+    SELECT 1
+    FROM publication_drain_events de
+    JOIN publication_drains d ON d.id=de.drain_id
+    WHERE de.event_seq=e.seq
+      AND d.branch_ref=e.branch_ref
+      AND d.branch_generation=e.branch_generation
+      AND d.phase!='completed'
+      AND ` + runtimeCondition + `
+)`
+	}
 	rows, err := conn.QueryContext(ctx, `
-SELECT e.seq, e.branch_ref, e.branch_generation, e.state, `+decisionExpr+`
+SELECT e.seq, e.branch_ref, e.branch_generation, e.state, `+decisionExpr+`,
+       `+runtimeContractBlockedExpr+`
 FROM capture_events e
 WHERE e.state IN (?, ?, ?)
 ORDER BY e.branch_ref, e.branch_generation, e.seq`,
@@ -419,8 +456,11 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 	for rows.Next() {
 		var seq, generation int64
 		var branchRef, eventState string
-		var decisionLed bool
-		if err := rows.Scan(&seq, &branchRef, &generation, &eventState, &decisionLed); err != nil {
+		var decisionLed, runtimeContractBlocked bool
+		if err := rows.Scan(
+			&seq, &branchRef, &generation, &eventState,
+			&decisionLed, &runtimeContractBlocked,
+		); err != nil {
 			return fmt.Errorf("acd fix: scan unpublished recovery row: %w", err)
 		}
 		key := fmt.Sprintf("%s\x00%d", branchRef, generation)
@@ -437,6 +477,7 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		pair.eventCount++
 		pair.hasTerminal = pair.hasTerminal || eventState == state.EventStateBlockedConflict || eventState == state.EventStateFailed
 		pair.decisionLed = pair.decisionLed || decisionLed
+		pair.runtimeContractBlocked = pair.runtimeContractBlocked || runtimeContractBlocked
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("acd fix: iterate unpublished recovery rows: %w", err)
@@ -446,11 +487,22 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		pair := pairs[key]
 		activePair := pair.branchRef == currentBranch && pair.generation == currentGeneration
 		stalePair := !activePair
-		if !pair.hasTerminal && !stalePair && !pair.decisionLed {
+		if !pair.hasTerminal && !stalePair && !pair.decisionLed &&
+			pair.runtimeContractBlocked && !force {
+			plan.ForceRequired = true
+			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf(
+				"publication drain for %s generation %d has no provable frozen runtime contract",
+				pair.branchRef, pair.generation))
+			plan.Suggestions = append(plan.Suggestions,
+				"Run `acd fix --force --dry-run` to review archive-only exact-chain recovery, then `acd fix --force --yes` to apply it without deleting captured work.")
+			continue
+		}
+		if !pair.hasTerminal && !stalePair && !pair.decisionLed &&
+			!pair.runtimeContractBlocked {
 			continue
 		}
 		archiveOnly := force || currentHead == ""
-		reasonParts := make([]string, 0, 3)
+		reasonParts := make([]string, 0, 4)
 		if pair.hasTerminal {
 			reasonParts = append(reasonParts, "terminal replay barrier")
 		}
@@ -459,6 +511,9 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		}
 		if pair.decisionLed {
 			reasonParts = append(reasonParts, "external decision evidence")
+		}
+		if pair.runtimeContractBlocked {
+			reasonParts = append(reasonParts, "publication runtime contract cannot be reconstructed")
 		}
 		plan.Actions = append(plan.Actions, fixAction{
 			ID:               fmt.Sprintf("%s:%s:%d:%d", fixActionReconcileUnpublishedChain, pair.branchRef, pair.generation, pair.firstSeq),
@@ -1306,7 +1361,9 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		}
 	} else {
 		hint := "pass --yes to apply safe actions"
-		if plan.Force {
+		if plan.ForceRequired && !plan.Force {
+			hint = "pass --force --yes to apply archive-only exact-chain recovery after reviewing the force dry-run"
+		} else if plan.Force {
 			hint = "pass --yes to apply archive-only recovery; captured work will be protected first"
 		}
 		fmt.Fprintf(out, "(dry-run; %s)\n", hint)

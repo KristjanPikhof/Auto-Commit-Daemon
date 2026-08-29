@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
@@ -116,10 +117,29 @@ func TestProductListNeedsActionDominatesMixedStates(t *testing.T) {
 }
 
 func TestProductListDrainAndPendingLabels(t *testing.T) {
+	if got := productListMode(productListEntry{PublicationProgress: publicationProgressReport{
+		Strategy: "intent", TemporaryLocalFallback: true,
+	}}); got != "intent" {
+		t.Fatalf("configured Intent mode rendered as %q during local recovery", got)
+	}
 	entries := []productListEntry{
-		{Repo: "/active", Enabled: true, Protected: true, State: productStatePublishing, PublicationDrain: publicationDrainReport{ID: "drain", Phase: "semantic", PublishedEvents: 7, TargetEvents: 12, RemainingEvents: 5}},
-		{Repo: "/pending", Enabled: true, Protected: true, State: productStatePublishing, PendingEvents: 3},
-		{Repo: "/completed", Enabled: true, Protected: true, State: productStateProtected, PublicationDrain: publicationDrainReport{ID: "drain", Phase: "completed", PublishedEvents: 12, TargetEvents: 12}},
+		{Repo: "/active", Enabled: true, Protected: true,
+			State: productStatePublishing, PendingEvents: 22,
+			PublicationDrain:    publicationDrainReport{ID: "drain", Phase: "semantic", PublishedEvents: 7, TargetEvents: 12, RemainingEvents: 5},
+			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "commit_all", Phase: "intent_planning", QueuePending: 22, TargetRemaining: 5, TargetTotal: 12, LastProgressTS: 1, LastProgressAgeSeconds: 90}},
+		{Repo: "/pending", Enabled: true, Protected: true,
+			State: productStateWaiting, PendingEvents: 3,
+			PublicationProgress: publicationProgressReport{Strategy: "intent", Phase: "intent_wait", QueuePending: 3, WaitRemainingSeconds: 42, LastProgressTS: 1, LastProgressAgeSeconds: 8}},
+		{Repo: "/recovering", Enabled: true, Protected: true,
+			State: productStatePublishing, PendingEvents: 7,
+			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "intent_recovery", Phase: "intent_replanning", QueuePending: 7, TargetRemaining: 4, TargetTotal: 6, LastProgressTS: 1, LastProgressAgeSeconds: 12}},
+		{Repo: "/blocked", Enabled: true, Protected: true, ActionRequired: true,
+			State: productStateNeedsAction, PendingEvents: 7,
+			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "intent_recovery", Phase: "needs_action", NeedsAttention: true, QueuePending: 7, TargetRemaining: 4, TargetTotal: 6, LastProgressTS: 1, LastProgressAgeSeconds: 12}},
+		{Repo: "/completed", Enabled: true, Protected: true,
+			State:               productStateProtected,
+			PublicationDrain:    publicationDrainReport{ID: "drain", Phase: "completed", PublishedEvents: 12, TargetEvents: 12},
+			PublicationProgress: publicationProgressReport{Strategy: "intent", Phase: "idle"}},
 	}
 
 	var out bytes.Buffer
@@ -127,20 +147,170 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 		t.Fatalf("render table: %v", err)
 	}
 	for _, row := range []struct {
-		repo, drain, left string
+		repo, mode, queue, target, phase string
 	}{
-		{"active", "7/12", "5"},
-		{"pending", "-", "3"},
-		{"completed", "-", "0"},
+		{"active", "intent", "22", "commit-all:5/12", "intent-plan"},
+		{"pending", "intent", "3", "-", "wait:42s"},
+		{"recovering", "intent", "7", "recover:4/6", "intent-replan"},
+		{"blocked", "intent", "7", "recover:4/6", "blocked"},
+		{"completed", "intent", "0", "-", "idle"},
 	} {
 		line := productListLineForRepo(t, out.String(), row.repo)
 		fields := strings.Fields(line)
-		if len(fields) < 4 || fields[2] != row.drain || fields[3] != row.left {
-			t.Fatalf("row %q progress=%v, want drain=%q left=%q:\n%s", row.repo, fields, row.drain, row.left, line)
+		if len(fields) < 8 || fields[2] != row.mode || fields[3] != row.queue ||
+			fields[4] != row.target || fields[6] != row.phase {
+			t.Fatalf("row %q progress=%v, want mode=%q queue=%q target=%q phase=%q:\n%s",
+				row.repo, fields, row.mode, row.queue, row.target, row.phase, line)
 		}
 	}
 	if line := productListLineForRepo(t, out.String(), "completed"); !strings.Contains(line, "healthy") {
 		t.Fatalf("completed drain did not return to healthy: %s", line)
+	}
+	if line := productListLineForRepo(t, out.String(), "blocked"); !strings.Contains(line, "needs action") {
+		t.Fatalf("exhausted recovery did not require action: %s", line)
+	}
+}
+
+func TestProductListDoesNotMaskActiveIntentRecoveryAsCheckpointing(t *testing.T) {
+	record := central.RepoRecord{
+		Path: "/repo", RepositoryID: "repo-id", WorktreeID: "worktree-id",
+	}
+	overview := productListRepoOverview{report: statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 7,
+		CheckpointProtectionAvailable: true, Protected: false, Busy: true,
+		OperationalState: "busy",
+		IntentStrategy:   intentStrategyReport{Strategy: "intent", Active: true},
+		PublicationProgress: publicationProgressReport{
+			Strategy: "intent", Origin: "intent_recovery",
+			Phase: "intent_replanning", QueuePending: 7,
+			TargetRemaining: 4, TargetTotal: 6,
+		},
+	}}
+	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
+		RepositoryID: record.RepositoryID, State: "running",
+	}, overview, nil)
+	if !strings.Contains(entry.Summary, "automatically rebuilding semantic") ||
+		strings.Contains(entry.Summary, "checkpointing") {
+		t.Fatalf("active recovery entry=%+v", entry)
+	}
+
+	overview.report.PublicationProgress.Phase = "needs_action"
+	overview.report.PublicationProgress.NeedsAttention = true
+	overview.report.PublicationProgress.AttentionReason =
+		"complete semantic prefix failed verification"
+	entry = productListEntryFromOverview(record, supervisor.WorkerStatus{
+		RepositoryID: record.RepositoryID, State: "running",
+	}, overview, nil)
+	if !entry.ActionRequired || entry.State != productStateNeedsAction ||
+		productListStatus(entry) != "needs action" ||
+		productListPhase(entry) != "blocked" ||
+		productListTarget(entry) != "recover:4/6" ||
+		entry.Summary != intentRecoveryVerificationAttentionSummary ||
+		!strings.Contains(entry.NextAction, "acd doctor") {
+		t.Fatalf("exhausted recovery entry=%+v", entry)
+	}
+}
+
+func TestProductListLoadsCurrentProviderWait(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	ctx := context.Background()
+	repo, dbPath, db := makeRepoStateDB(t)
+	now := time.Now()
+	branchRef := "refs/heads/main"
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+		PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(now.Unix()),
+		BranchRef: sql.NullString{String: branchRef, Valid: true},
+		BranchGeneration: sql.NullInt64{
+			Int64: 1, Valid: true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, db, map[string]string{
+		daemon.MetaKeyProtectionObservationEpoch: "1",
+		daemon.MetaKeyProtectionCoveredEpoch:     "1",
+		daemon.MetaKeyProtectionCheckpointID:     "checkpoint",
+		daemon.MetaKeyProtectionComplete:         "true",
+		"commit.strategy":                        "intent",
+		"ai.provider":                            "openai-compat",
+		"ai.model":                               "gpt-test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef: branchRef, BranchGeneration: 1, BaseHead: "head",
+		Operation: "modify", Path: "main.go", Fidelity: "exact",
+		CapturedTS: float64(now.Add(-10 * time.Minute).Unix()),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
+		PlannedTS: float64(now.Add(-time.Minute).Unix()),
+		Provider:  sql.NullString{String: "openai-compat", Valid: true},
+		Model:     sql.NullString{String: "gpt-test", Valid: true},
+		BranchRef: branchRef, BranchGeneration: 1,
+		OfferedSeqs: []int64{seq}, VisibleOriginalSeqs: []int64{seq},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
+		Fingerprint: "sha256:provider-wait", BranchRef: branchRef,
+		BranchGeneration: 1, AttemptLimit: 3,
+		Provider: sql.NullString{String: "openai-compat", Valid: true},
+		Model:    sql.NullString{String: "gpt-test", Valid: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.UnresolvedSeqs = []int64{seq}
+	run.ProgressState = sql.NullString{String: "waiting_message_rewrite", Valid: true}
+	run.ResolutionMode = sql.NullString{String: "waiting_message_rewrite", Valid: true}
+	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+		t.Fatal(err)
+	}
+	// A newer window on another branch must not replace the active branch's
+	// locked-message state in the repository overview.
+	if _, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
+		PlannedTS: float64(now.Unix()), BranchRef: "refs/heads/other",
+		BranchGeneration: 1, OfferedSeqs: []int64{seq + 1},
+		VisibleOriginalSeqs: []int64{seq + 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	health := daemon.IntentPlannerHealthSnapshot{
+		State:               daemon.IntentPlannerCircuitOpen,
+		ProviderFingerprint: testPlannerHealthFingerprint(),
+		ConsecutiveFailures: 1,
+	}
+	if err := state.MetaSetJSON(ctx, db, daemon.MetaKeyIntentPlannerHealth, struct {
+		Version int `json:"version"`
+		daemon.IntentPlannerHealthSnapshot
+	}{Version: 1, IntentPlannerHealthSnapshot: health}); err != nil {
+		t.Fatal(err)
+	}
+
+	record := central.RepoRecord{
+		Path: repo, StateDB: dbPath, RepositoryID: "repository-id",
+		WorktreeID: "worktree-id",
+	}
+	overview, err := readProductListRepo(ctx, record, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress := overview.report.PublicationProgress
+	if progress.Phase != "provider_wait" || progress.PlannerProvider != "openai-compat" ||
+		overview.report.IntentStrategy.LastPlannerWindow == nil ||
+		overview.report.IntentStrategy.LastPlannerWindow.BranchRef != branchRef ||
+		overview.report.IntentStrategy.ResolutionMode != "waiting_message_rewrite" {
+		t.Fatalf("provider wait overview=%+v strategy=%+v",
+			progress, overview.report.IntentStrategy)
+	}
+	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
+		RepositoryID: record.RepositoryID, State: "running",
+	}, overview, nil)
+	if got := productListStatus(entry); got != "waiting" {
+		t.Fatalf("provider wait status=%q entry=%+v", got, entry)
 	}
 }
 
@@ -259,12 +429,12 @@ func TestProductListSelectionKeepsRelevantAndFillsFive(t *testing.T) {
 	if len(visible) != productListDefaultRows || hidden != 4 {
 		t.Fatalf("visible=%d hidden=%d, want 5 and 4", len(visible), hidden)
 	}
-	for _, repo := range []string{"/broken", "/working"} {
+	for _, repo := range []string{"/broken", "/working", "/waiting"} {
 		if !productListContainsRepo(visible, repo) {
 			t.Fatalf("mandatory repository %s was hidden: %+v", repo, visible)
 		}
 	}
-	for _, repo := range []string{"/healthy-5", "/healthy-4", "/healthy-3"} {
+	for _, repo := range []string{"/healthy-5", "/healthy-4"} {
 		if !productListContainsRepo(visible, repo) {
 			t.Fatalf("recent repository %s did not fill the view: %+v", repo, visible)
 		}
@@ -288,7 +458,7 @@ func TestProductListSelectionPrefersRecentWorkOverPaused(t *testing.T) {
 	sortProductListEntries(entries)
 
 	visible, hidden := selectProductListEntries(entries, false)
-	want := []string{"/broken", "/working", "/healthy-new", "/waiting", "/healthy-old"}
+	want := []string{"/broken", "/waiting", "/working", "/healthy-new", "/healthy-old"}
 	if len(visible) != len(want) || hidden != 1 {
 		t.Fatalf("visible=%d hidden=%d, want %d and 1: %+v", len(visible), hidden, len(want), visible)
 	}
@@ -296,6 +466,32 @@ func TestProductListSelectionPrefersRecentWorkOverPaused(t *testing.T) {
 		if visible[index].Repo != repo {
 			t.Fatalf("visible[%d]=%s, want %s: %+v", index, visible[index].Repo, repo, visible)
 		}
+	}
+}
+
+func TestProductListSelectionKeepsPausedActionRequired(t *testing.T) {
+	base := time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
+	entries := []productListEntry{{
+		Repo: "/blocked-drain", State: productStateNeedsAction,
+		OperationalState: "paused", ActionRequired: true,
+		lastActivity: base,
+	}}
+	for index := 0; index < productListDefaultRows+2; index++ {
+		entries = append(entries, productListEntry{
+			Repo:  fmt.Sprintf("/healthy-%d", index),
+			State: productStateProtected, Protected: true,
+			lastActivity: base.Add(time.Duration(index+1) * time.Minute),
+		})
+	}
+	sortProductListEntries(entries)
+
+	visible, hidden := selectProductListEntries(entries, false)
+	if !productListContainsRepo(visible, "/blocked-drain") {
+		t.Fatalf("paused action-required drain was hidden: %+v", visible)
+	}
+	if len(visible) != productListDefaultRows || hidden != 3 {
+		t.Fatalf("visible=%d hidden=%d, want %d and 3",
+			len(visible), hidden, productListDefaultRows)
 	}
 }
 
@@ -556,7 +752,7 @@ func TestProductListSortingUsesSeverityThenActivity(t *testing.T) {
 		{Repo: "/paused", State: productStateNeedsAction, OperationalState: "paused", lastActivity: base.Add(5 * time.Minute)},
 	}
 	sortProductListEntries(entries)
-	want := []string{"/broken", "/working-new", "/working-old", "/healthy", "/waiting", "/paused"}
+	want := []string{"/broken", "/waiting", "/working-new", "/working-old", "/healthy", "/paused"}
 	for index := range want {
 		if entries[index].Repo != want[index] {
 			t.Fatalf("order[%d]=%s, want %s: %+v", index, entries[index].Repo, want[index], entries)

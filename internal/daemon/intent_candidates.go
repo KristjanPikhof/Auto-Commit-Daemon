@@ -95,6 +95,8 @@ type IntentCandidateEvaluation struct {
 	Now                  time.Time
 	TargetEventSeqs      []int64
 	RejectLocalFallback  bool
+	RecoveryCandidateID  string
+	planFingerprint      string
 	allowSemanticPlan    bool
 }
 
@@ -334,6 +336,7 @@ func EvaluateIntentCandidates(
 	result.PreservedGroupCount = len(planRun.PreservedGroups)
 	result.ResolutionMode = planRun.ResolutionMode.String
 	result.PlanFingerprint = planRun.Fingerprint
+	input.planFingerprint = result.PlanFingerprint
 	result.NeedsAttention = needsAttention
 	if input.RejectLocalFallback &&
 		(result.Fallback != "" || result.PlannerFailure != "") {
@@ -353,6 +356,14 @@ func EvaluateIntentCandidates(
 	validationBaseRequest := req
 	if result.Fallback != "" {
 		validationBaseRequest = normalizeIntentFallbackBoundaries(req)
+	}
+	if result.Fallback == "waiting_message_rewrite" {
+		// Forced aging requires publication only when a safe commit message is
+		// available. The locally constructed wait plan deliberately keeps every
+		// candidate unpublishable until the configured semantic provider can
+		// rewrite its locked message, so do not reinterpret that hold as an
+		// invalid planner deferral and rebuild it with a deterministic message.
+		validationBaseRequest.ForcedAging = false
 	}
 	validationRequest := intentCandidateContinuationValidationRequest(
 		validationBaseRequest, continuations)
@@ -445,7 +456,7 @@ func EvaluateIntentCandidates(
 			result.NeedsAttention = true
 			continue
 		}
-		decision, err := evaluateIntentCandidateAssignment(ctx, input, plan,
+		decision, err := evaluateIntentCandidateAssignment(ctx, db, input, plan,
 			assignment, evaluationDependencies, existingByID, captureBySeq)
 		if err != nil {
 			return result, err
@@ -1952,6 +1963,27 @@ func applyIntentFallbackMessageQuality(
 	plan ai.IntentPlanV2,
 	plannerFailure string,
 ) (ai.IntentPlanV2, string, bool, error) {
+	// Deterministic is an explicit supported provider mode, not a silent
+	// downgrade from a configured semantic provider. Its locally generated
+	// fallback messages are therefore complete without a semantic rewrite.
+	if ai.PrimaryProviderName(planner) ==
+		(ai.DeterministicProvider{}).Name() {
+		return plan, plannerFailure, true, nil
+	}
+	// Publication-drain recovery wraps the configured planner so it can lock
+	// membership locally. Preserve the same explicit deterministic policy when
+	// that wrapper is active; semantic wrappers continue through the rewrite
+	// gate below and fail closed when their provider is unavailable.
+	switch fallback := planner.(type) {
+	case publicationDrainAtomicFallbackPlanner:
+		if !fallback.requireSemanticMessage {
+			return plan, plannerFailure, true, nil
+		}
+	case *publicationDrainAtomicFallbackPlanner:
+		if fallback != nil && !fallback.requireSemanticMessage {
+			return plan, plannerFailure, true, nil
+		}
+	}
 	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
 		return plan, plannerFailure, false, nil
 	}
@@ -2212,6 +2244,7 @@ func cloneIntentPlanV2(plan ai.IntentPlanV2) ai.IntentPlanV2 {
 
 func evaluateIntentCandidateAssignment(
 	ctx context.Context,
+	db *state.DB,
 	input IntentCandidateEvaluation,
 	plan ai.IntentPlanV2,
 	assignment ai.IntentCandidateAssignment,
@@ -2324,8 +2357,13 @@ func evaluateIntentCandidateAssignment(
 			"approved candidate verification has not run"))
 	} else {
 		var verifyErr error
-		verificationResult, verifyErr = input.Verify(
-			ctx, assignment, candidateCaptures)
+		verificationResult, verifyErr = runIntentCandidateVerificationWithActivity(
+			ctx, db, IntentVerificationActivity{
+				BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
+				CandidateID:         assignment.CandidateID,
+				PlanFingerprint:     input.planFingerprint,
+				RecoveryCandidateID: input.RecoveryCandidateID,
+			}, input.Verify, assignment, candidateCaptures)
 		if verifyErr != nil {
 			results = append(results, failedIntentGate(assignment.CandidateID,
 				ai.IntentAtomicityVerification, "verification_failed", verifyErr))

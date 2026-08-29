@@ -1120,6 +1120,21 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 		snapshot.BypassCount != 1 {
 		t.Fatalf("health after bypass=%+v", snapshot)
 	}
+
+	input.ForcedAging = true
+	forced, err := EvaluateIntentCandidates(ctx, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forced.Fallback != "waiting_message_rewrite" ||
+		forced.ResolutionMode != "waiting_message_rewrite" ||
+		len(forced.Decisions) != 1 || forced.Decisions[0].Publishable ||
+		forced.Decisions[0].Assignment.Readiness != ai.IntentCandidateWait ||
+		!containsIntentString(
+			forced.Decisions[0].Assignment.MissingCompanions,
+			"semantic commit message unavailable") {
+		t.Fatalf("forced message wait=%+v", forced)
+	}
 }
 
 func TestIntentCandidateEngineCancellationReleasesHalfOpenProbe(t *testing.T) {

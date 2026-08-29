@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -26,6 +27,95 @@ const (
 	publicationFallbackLocalUnlock    = "local_unlock"
 	publicationFallbackLegacyAtomic   = "atomic_dependency_components"
 )
+
+func publicationDrainRuntimeBlock(
+	drain state.PublicationDrain,
+	bundle *RuntimeBundle,
+) string {
+	if reason := publicationDrainRuntimeIdentityBlock(drain, bundle); reason != "" {
+		return reason
+	}
+	if bundle.ReplayBlockedReason != "" {
+		return "publication_drain_runtime_unavailable"
+	}
+	return ""
+}
+
+func publicationDrainRuntimeIdentityBlock(
+	drain state.PublicationDrain,
+	bundle *RuntimeBundle,
+) string {
+	if bundle == nil {
+		return "publication_drain_runtime_unavailable"
+	}
+	if drain.CommitStrategy == "" || drain.CommitFormat == "" ||
+		drain.Provider == "" {
+		return "publication_drain_runtime_contract_unavailable"
+	}
+	if drain.CommitStrategy != string(bundle.CommitStrategy) {
+		return "publication_drain_runtime_strategy_mismatch"
+	}
+	if drain.CommitFormat != string(bundle.CommitFormat) {
+		return "publication_drain_runtime_format_mismatch"
+	}
+	if drain.ConfigRevisionID != bundle.RevisionID {
+		return "publication_drain_runtime_revision_mismatch"
+	}
+	provider := strings.TrimSpace(bundle.HealthIdentity.Provider)
+	if provider == "" && bundle.Provider != nil {
+		provider = ai.PrimaryProviderName(bundle.Provider)
+	}
+	if drain.Provider != provider {
+		return "publication_drain_runtime_provider_mismatch"
+	}
+	if drain.ProviderModel != strings.TrimSpace(bundle.Model) {
+		return "publication_drain_runtime_model_mismatch"
+	}
+	if drain.ProviderFingerprint != "" &&
+		drain.ProviderFingerprint != bundle.HealthFingerprint {
+		return "publication_drain_runtime_fingerprint_mismatch"
+	}
+	return ""
+}
+
+func failPublicationDrainRuntimeContract(
+	ctx context.Context,
+	db *state.DB,
+	drain state.PublicationDrain,
+	reason string,
+	now time.Time,
+) (state.PublicationDrain, error) {
+	if reason != "publication_drain_runtime_contract_unavailable" &&
+		reason != "publication_drain_environment_runtime_changed" {
+		return drain, errors.New("daemon: publication drain runtime failure is not terminal")
+	}
+	nowTS := float64(now.UnixNano()) / 1e9
+	if nowTS < drain.UpdatedTS {
+		nowTS = drain.UpdatedTS
+	}
+	update := PublicationDrainUpdateFrom(
+		drain, nowTS, drain.LastProgressTS)
+	update.Phase = state.PublicationDrainNeedsAction
+	update.LastError = reason
+	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+}
+
+func publicationDrainTerminalRuntimeReason(
+	drain state.PublicationDrain,
+	blockReason string,
+) string {
+	if blockReason == "publication_drain_runtime_contract_unavailable" {
+		return blockReason
+	}
+	if drain.ConfigRevisionID == 0 && blockReason != "" &&
+		blockReason != "publication_drain_runtime_unavailable" {
+		// Revision-zero contracts come only from the process environment. If
+		// that identity changed across restart there is no immutable revision
+		// to reconstruct, so retrying can never converge safely.
+		return "publication_drain_environment_runtime_changed"
+	}
+	return ""
+}
 
 // ActivePublicationDrainForPair returns the one durable drain owned by the
 // active branch generation. Multiple active drains for one pair fail closed.
@@ -57,6 +147,77 @@ func ActivePublicationDrainForPair(
 		active = &loaded
 	}
 	return active, nil
+}
+
+// PublicationDrainBarrierForPair returns the one unresolved drain whose
+// frozen membership must keep ordinary replay out. Unlike the active lookup,
+// this includes needs_action: surfacing a durable problem must never release
+// its still-pending target captures to a different runtime contract.
+func PublicationDrainBarrierForPair(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+) (*state.PublicationDrain, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase!='completed'
+ORDER BY created_ts,id LIMIT 2`, branchRef, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if len(ids) > 1 {
+		return nil, errors.New(
+			"daemon: multiple unresolved publication drains for branch generation")
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, ids[0])
+	if err != nil {
+		return nil, err
+	}
+	return &drain, nil
+}
+
+// refreshPublicationDrainRuntimeAfterReconcile prevents a runtime frozen for
+// one drain from leaking into ordinary replay when that drain is completed by
+// reconciliation before the pass acquires its runtime lease.
+func refreshPublicationDrainRuntimeAfterReconcile(
+	ctx context.Context,
+	db *state.DB,
+	runtimes *RuntimeBundleManager,
+	branchRef string,
+	generation int64,
+	frozenDrainID string,
+) error {
+	if frozenDrainID == "" {
+		return nil
+	}
+	current, err := PublicationDrainBarrierForPair(
+		ctx, db, branchRef, generation)
+	if err != nil {
+		return err
+	}
+	if current != nil && current.ID == frozenDrainID {
+		return nil
+	}
+	if current == nil {
+		return runtimes.ActivateDesired(ctx)
+	}
+	return runtimes.ActivatePublicationDrainRevision(ctx, *current)
 }
 
 // RecoverSupersededCandidatePublicationDrain reopens only the latest drain
@@ -359,22 +520,30 @@ func publicationDrainSalvageMode(drain state.PublicationDrain) string {
 }
 
 // publicationDrainAtomicFallbackPlanner keeps every hard dependency component
-// in one commit. It is local and deterministic, so the final fallback neither
-// calls a provider nor degrades Intent publication to per-event commits.
+// in one commit. Membership is local and deterministic; a configured semantic
+// provider remains responsible for the locked commit message.
 type publicationDrainAtomicFallbackPlanner struct {
-	commitFormat ai.CommitFormat
+	commitFormat           ai.CommitFormat
+	messagePlanner         interface{ Name() string }
+	requireSemanticMessage bool
+	combineWindow          bool
 }
 
 func configureAtomicIntentFallback(cfg *intentReplayConfig) {
 	if cfg == nil {
 		return
 	}
-	cfg.planner = publicationDrainAtomicFallbackPlanner{
-		commitFormat: cfg.commitFormat,
+	configuredPlanner := cfg.planner
+	provider := strings.TrimSpace(cfg.plannerProvider)
+	if provider == "" && configuredPlanner != nil {
+		provider = ai.PrimaryProviderName(configuredPlanner)
+		cfg.plannerProvider = provider
 	}
-	cfg.plannerProvider = cfg.planner.Name()
-	cfg.plannerModel = ""
-	cfg.health = nil
+	cfg.planner = publicationDrainAtomicFallbackPlanner{
+		commitFormat:           cfg.commitFormat,
+		messagePlanner:         configuredPlanner,
+		requireSemanticMessage: provider != "" && provider != "deterministic",
+	}
 	cfg.candidateMode = true
 	cfg.bypassBatchWait = true
 	cfg.pathQuiescence = 0
@@ -415,15 +584,288 @@ func configureIntentSalvage(
 
 func configureIntentForwardRecovery(
 	cfg *intentReplayConfig,
-	health *IntentPlannerHealth,
-	stage string,
-	targetSeqs []int64,
+	recovery state.IntentForwardRecovery,
+	resolvedPlan *ai.IntentPlanV2,
 ) {
 	quiescence := cfg.pathQuiescence
-	configureIntentSalvage(cfg, health, stage, targetSeqs)
+	cfg.targetEventSeqs = append(
+		[]int64(nil), recovery.TargetEventSeqs...)
+	if targetWindow := len(recovery.TargetEventSeqs); targetWindow > cfg.window {
+		if targetWindow > state.IntentCandidateMaxCaptures {
+			targetWindow = state.IntentCandidateMaxCaptures
+		}
+		cfg.window = targetWindow
+	}
+	cfg.bypassBatchWait = true
+	cfg.pathQuiescence = 0
+	if recovery.Stage == publicationFallbackLocalUnlock && resolvedPlan != nil {
+		configureAtomicIntentFallback(cfg)
+		cfg.forwardRecoveryPlan = *resolvedPlan
+		cfg.forwardRecoveryPlanFingerprint = recovery.PlanFingerprint
+		cfg.forwardRecoveryPrefixCursor = recovery.PrefixCursor
+		cfg.forwardRecoveryPrefixBaseHead = recovery.PrefixBaseHead
+	} else {
+		// A legacy local-unlock marker without a resolved semantic plan must
+		// re-enter exact-target semantic planning. Raw capture components can
+		// violate the provider's declared candidate ordering.
+		cfg.semanticSalvage = true
+	}
 	// A forward marker proves target membership, not that its paths are quiet.
 	// Keep the configured gate across recursive and restart recovery passes.
 	cfg.pathQuiescence = quiescence
+}
+
+// resolvedIntentForwardRecoveryPlan loads and revalidates the immutable plan
+// named by a recovery marker. Invalid or legacy fingerprints are unavailable
+// so recovery creates a fresh exact-target semantic plan.
+type intentForwardRecoveryPlanStatus uint8
+
+const (
+	intentForwardRecoveryPlanUnavailable intentForwardRecoveryPlanStatus = iota
+	intentForwardRecoveryPlanReady
+	intentForwardRecoveryPlanPartial
+)
+
+func resolvedIntentForwardRecoveryPlan(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+) (ai.IntentPlanV2, intentForwardRecoveryPlanStatus, error) {
+	fingerprint := strings.TrimSpace(recovery.PlanFingerprint)
+	if fingerprint == "" {
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
+	}
+	run, ok, err := state.IntentPlanRunByFingerprint(ctx, db, fingerprint)
+	if err != nil {
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, err
+	}
+	if !ok || run.Fingerprint != fingerprint ||
+		run.BranchRef != recovery.BranchRef ||
+		run.BranchGeneration != recovery.BranchGeneration ||
+		!run.Completed || !run.ResolvedPlanJSON.Valid ||
+		!intentForwardRecoveryUsesSemanticPlan(run.ResolutionMode) {
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
+	}
+	states, err := intentForwardRecoveryTargetStates(ctx, db, recovery)
+	if err != nil {
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, err
+	}
+	// The durable plan JSON is the only record of the exact offered membership
+	// after a completed run clears its transient unresolved list. Peek only to
+	// reconstruct that request; loadResolvedIntentPlanRun below remains the
+	// authoritative decoder and continuation-aware validator.
+	var envelope resolvedIntentPlanRun
+	if err := json.Unmarshal(
+		[]byte(run.ResolvedPlanJSON.String), &envelope,
+	); err != nil {
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
+	}
+	target := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
+	for _, seq := range recovery.TargetEventSeqs {
+		target[seq] = struct{}{}
+	}
+	planSeqs := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
+	request := ai.IntentPlanRequestV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		OfferedCaptures: make(
+			[]ai.OfferedCapture, 0, len(recovery.TargetEventSeqs)),
+	}
+	for _, candidate := range envelope.Plan.Candidates {
+		for _, seq := range candidate.SelectedSeqs {
+			if _, ok := target[seq]; !ok {
+				return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
+			}
+			if _, duplicate := planSeqs[seq]; duplicate {
+				continue
+			}
+			planSeqs[seq] = struct{}{}
+			request.OfferedCaptures = append(
+				request.OfferedCaptures, ai.OfferedCapture{Seq: seq})
+		}
+	}
+	for seq, eventState := range states {
+		if eventState == state.EventStatePublished ||
+			eventState == state.EventStateRecovered {
+			continue
+		}
+		if _, ok := planSeqs[seq]; !ok {
+			return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
+		}
+	}
+	plan, _, err := loadResolvedIntentPlanRun(
+		request, run.ResolvedPlanJSON.String)
+	if err != nil {
+		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
+	}
+	for _, candidate := range plan.Candidates {
+		unresolved := 0
+		for _, seq := range candidate.SelectedSeqs {
+			if eventState := states[seq]; eventState != state.EventStatePublished &&
+				eventState != state.EventStateRecovered {
+				unresolved++
+			}
+		}
+		if unresolved > 0 && unresolved < len(candidate.SelectedSeqs) {
+			return ai.IntentPlanV2{}, intentForwardRecoveryPlanPartial, nil
+		}
+	}
+	return plan, intentForwardRecoveryPlanReady, nil
+}
+
+func intentForwardRecoveryUsesSemanticPlan(mode sql.NullString) bool {
+	if !mode.Valid {
+		return false
+	}
+	switch strings.TrimSpace(mode.String) {
+	case "provider", "local_repair", "partial_replan", "repair_replan":
+		return true
+	default:
+		return false
+	}
+}
+
+func intentForwardRecoveryTargetStates(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+) (map[int64]string, error) {
+	if len(recovery.TargetEventSeqs) == 0 {
+		return nil, errors.New(
+			"daemon: intent forward recovery target is empty")
+	}
+	placeholders := strings.TrimSuffix(
+		strings.Repeat("?,", len(recovery.TargetEventSeqs)), ",")
+	args := make([]any, 0, len(recovery.TargetEventSeqs)+2)
+	for _, seq := range recovery.TargetEventSeqs {
+		args = append(args, seq)
+	}
+	args = append(args, recovery.BranchRef, recovery.BranchGeneration)
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT seq,state FROM capture_events
+WHERE seq IN (`+placeholders+`) AND branch_ref=? AND branch_generation=?`,
+		args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	states := make(map[int64]string, len(recovery.TargetEventSeqs))
+	for rows.Next() {
+		var seq int64
+		var eventState string
+		if err := rows.Scan(&seq, &eventState); err != nil {
+			return nil, err
+		}
+		states[seq] = eventState
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(states) != len(recovery.TargetEventSeqs) {
+		return nil, errors.New(
+			"daemon: intent forward recovery target membership changed")
+	}
+	return states, nil
+}
+
+type intentForwardRecoveryPrefix struct {
+	Events          []state.CaptureEvent
+	CandidateCount  int
+	TotalCandidates int
+}
+
+// selectIntentForwardRecoveryPrefix anchors local verification to the first
+// unresolved candidates in the provider's topological order. Widening adds
+// later semantic candidates while retaining every unresolved prerequisite.
+func selectIntentForwardRecoveryPrefix(
+	plan ai.IntentPlanV2,
+	pending []state.CaptureEvent,
+	prefixCursor int,
+) (intentForwardRecoveryPrefix, error) {
+	if prefixCursor < 1 {
+		return intentForwardRecoveryPrefix{}, errors.New(
+			"daemon: intent forward recovery prefix cursor is invalid")
+	}
+	pendingBySeq := make(map[int64]state.CaptureEvent, len(pending))
+	for _, event := range pending {
+		pendingBySeq[event.Seq] = event
+	}
+	type unresolvedCandidate struct {
+		id   string
+		seqs []int64
+		deps []string
+	}
+	unresolved := make([]unresolvedCandidate, 0, len(plan.Candidates))
+	resolvedIDs := make(map[string]struct{}, len(plan.Candidates))
+	for _, candidate := range plan.Candidates {
+		group := unresolvedCandidate{
+			id:   candidate.CandidateID,
+			deps: candidate.DependsOnCandidates,
+		}
+		for _, seq := range candidate.SelectedSeqs {
+			if _, ok := pendingBySeq[seq]; ok {
+				group.seqs = append(group.seqs, seq)
+			}
+		}
+		if len(group.seqs) > 0 &&
+			len(group.seqs) < len(candidate.SelectedSeqs) {
+			return intentForwardRecoveryPrefix{}, errors.New(
+				"daemon: semantic recovery candidate is partially resolved")
+		}
+		if len(group.seqs) == 0 {
+			resolvedIDs[candidate.CandidateID] = struct{}{}
+			continue
+		}
+		unresolved = append(unresolved, group)
+	}
+	if len(unresolved) == 0 {
+		if len(pending) == 0 {
+			return intentForwardRecoveryPrefix{}, nil
+		}
+		return intentForwardRecoveryPrefix{}, errors.New(
+			"daemon: resolved intent plan does not cover pending recovery target")
+	}
+	width := prefixCursor
+	if width > len(unresolved) {
+		width = len(unresolved)
+	}
+	selectedIDs := make(map[string]struct{}, width)
+	selectedSeqs := make(map[int64]struct{})
+	for index := 0; index < width; index++ {
+		group := unresolved[index]
+		for _, dependencyID := range group.deps {
+			if _, ok := resolvedIDs[dependencyID]; ok {
+				continue
+			}
+			if _, ok := selectedIDs[dependencyID]; !ok {
+				return intentForwardRecoveryPrefix{}, fmt.Errorf(
+					"daemon: semantic recovery candidate %q is missing prerequisite %q",
+					group.id, dependencyID)
+			}
+		}
+		selectedIDs[group.id] = struct{}{}
+		for _, seq := range group.seqs {
+			selectedSeqs[seq] = struct{}{}
+		}
+	}
+	if len(selectedSeqs) > ai.IntentCandidateCaptureCap {
+		return intentForwardRecoveryPrefix{}, fmt.Errorf(
+			"daemon: semantic recovery prefix exceeds %d captures",
+			ai.IntentCandidateCaptureCap)
+	}
+	events := make([]state.CaptureEvent, 0, len(selectedSeqs))
+	for _, event := range pending {
+		if _, ok := selectedSeqs[event.Seq]; ok {
+			events = append(events, event)
+		}
+	}
+	if len(events) != len(selectedSeqs) {
+		return intentForwardRecoveryPrefix{}, errors.New(
+			"daemon: semantic recovery prefix membership changed")
+	}
+	return intentForwardRecoveryPrefix{
+		Events: events, CandidateCount: width,
+		TotalCandidates: len(unresolved),
+	}, nil
 }
 
 // publicationDrainAtomicFallbackWindow returns the smallest complete hard
@@ -454,17 +896,20 @@ func publicationDrainAtomicFallbackWindow(
 	derived, err := BuildIntentCandidateDependencies(
 		cctx.BranchRef, cctx.BranchGeneration, captures, nil, time.Now().UTC())
 	if err != nil {
-		return nil, fmt.Errorf("daemon: build atomic fallback dependencies: %w", err)
+		return nil, fmt.Errorf(
+			"daemon: build atomic fallback dependencies: %w", err)
 	}
 	persisted, err := state.IntentCaptureDependenciesForPair(
 		ctx, db, cctx.BranchRef, cctx.BranchGeneration)
 	if err != nil {
-		return nil, fmt.Errorf("daemon: load atomic fallback dependencies: %w", err)
+		return nil, fmt.Errorf(
+			"daemon: load atomic fallback dependencies: %w", err)
 	}
 	persisted = intentDependenciesWithinCaptures(persisted, captures)
 	dependencies, err := mergeIntentDependencies(persisted, derived)
 	if err != nil {
-		return nil, fmt.Errorf("daemon: merge atomic fallback dependencies: %w", err)
+		return nil, fmt.Errorf(
+			"daemon: merge atomic fallback dependencies: %w", err)
 	}
 	adjacent := make(map[int64][]int64)
 	for _, dependency := range dependencies {
@@ -525,7 +970,11 @@ func publicationDrainAtomicFallbackWindow(
 			window = append(window, event)
 		}
 	}
-	return topologicalPublicationDrainEvents(window, dependencies)
+	window, err = topologicalPublicationDrainEvents(window, dependencies)
+	if err != nil {
+		return nil, err
+	}
+	return window, nil
 }
 
 func (publicationDrainAtomicFallbackPlanner) Name() string {
@@ -547,6 +996,22 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 		return ai.IntentPlanV2{}, err
 	}
 	plan := deterministicIntentCandidatePlan(req, false, true)
+	if p.combineWindow && len(plan.Candidates) > 1 {
+		selected := make([]int64, 0, len(req.OfferedCaptures))
+		for _, capture := range req.OfferedCaptures {
+			selected = append(selected, capture.Seq)
+		}
+		subject, purpose := deterministicIntentCandidateMessage(req, selected)
+		plan.Candidates = []ai.IntentCandidateAssignment{{
+			CandidateID:  stableGeneratedCandidateID(req, selected),
+			SelectedSeqs: selected,
+			Purpose:      purpose,
+			Readiness:    ai.IntentCandidateReady,
+			Subject:      subject,
+			GroupingReason: "bounded verification recovery preserves the " +
+				"semantic prefix",
+		}}
+	}
 	provider := ai.DeterministicProvider{CommitFormat: p.commitFormat}
 	for index := range plan.Candidates {
 		if plan.Candidates[index].Readiness != ai.IntentCandidateReady {
@@ -555,7 +1020,57 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 		plan.Candidates[index].Subject = provider.FormatSubjectForOps(
 			plan.Candidates[index].Subject, nil)
 	}
+	if p.requireSemanticMessage {
+		return p.rewritePlanMessages(ctx, req, plan)
+	}
 	return plan, nil
+}
+
+func (p publicationDrainAtomicFallbackPlanner) RewriteIntentMessage(
+	ctx context.Context,
+	req ai.IntentMessageRewriteRequest,
+) (ai.Result, error) {
+	rewriter, ok := p.messagePlanner.(ai.IntentMessageRewriter)
+	if !ok {
+		provider := "configured provider"
+		if p.messagePlanner != nil && strings.TrimSpace(p.messagePlanner.Name()) != "" {
+			provider = p.messagePlanner.Name()
+		}
+		return ai.Result{}, fmt.Errorf(
+			"daemon: %s cannot rewrite a locked Intent message", provider)
+	}
+	return rewriter.RewriteIntentMessage(ctx, req)
+}
+
+func (p publicationDrainAtomicFallbackPlanner) rewritePlanMessages(
+	ctx context.Context,
+	req ai.IntentPlanRequestV2,
+	plan ai.IntentPlanV2,
+) (ai.IntentPlanV2, error) {
+	legacyReq := ai.LegacyIntentPlanRequest(req)
+	out := plan
+	for index, candidate := range plan.Candidates {
+		if candidate.Readiness != ai.IntentCandidateReady {
+			continue
+		}
+		locked := ai.IntentPlan{
+			SelectedSeqs:   append([]int64(nil), candidate.SelectedSeqs...),
+			Subject:        candidate.Subject,
+			Body:           candidate.Body,
+			GroupingReason: candidate.GroupingReason,
+		}
+		report := ai.EvaluateIntentPlanMessageQuality(legacyReq, locked)
+		result, err := p.RewriteIntentMessage(
+			ctx, ai.NewIntentMessageRewriteRequest(legacyReq, locked, report))
+		if err != nil {
+			return ai.IntentPlanV2{}, err
+		}
+		out.Candidates[index].Subject = result.Subject
+		out.Candidates[index].Body = result.Body
+	}
+	// The provider may only replace subject/body. Re-run the shared quality and
+	// shape gates so malformed output cannot escape through local unlock.
+	return ai.ApplyIntentV2MessageQuality(ctx, p, req, out)
 }
 
 func publicationDrainPendingEvents(

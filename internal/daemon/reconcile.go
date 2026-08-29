@@ -119,8 +119,17 @@ func ProveUnpublishedChain(
 	}
 	first := chain[0].Event
 	last := chain[len(chain)-1].Event
+	live, err := currentRecoveryLiveState(ctx, repoRoot, nil, nil)
+	if err != nil {
+		return result, err
+	}
+	if !live.hasHead && !opts.ArchiveOnly {
+		return result, fmt.Errorf("daemon: prove recovery chain: HEAD is missing; archive-only mode required")
+	}
+	proofLiveHead := sameBranchRecoveryHead(live, opts.BranchRef)
 	proofChain, err := canonicalizeRecoveryProofEvents(
-		ctx, db, opts.BranchRef, opts.BranchGeneration, chain)
+		ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
+		proofLiveHead, chain)
 	if err != nil {
 		return result, err
 	}
@@ -136,7 +145,8 @@ func ProveUnpublishedChain(
 		return result, err
 	}
 	recoveryContext, err = canonicalizeRecoveryProofEvents(
-		ctx, db, opts.BranchRef, opts.BranchGeneration, recoveryContext)
+		ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
+		proofLiveHead, recoveryContext)
 	if err != nil {
 		return result, err
 	}
@@ -155,13 +165,6 @@ func ProveUnpublishedChain(
 		return result, err
 	}
 
-	live, err := currentRecoveryLiveState(ctx, repoRoot, nil, nil)
-	if err != nil {
-		return result, err
-	}
-	if !live.hasHead && !opts.ArchiveOnly {
-		return result, fmt.Errorf("daemon: prove recovery chain: HEAD is missing; archive-only mode required")
-	}
 	materialization := make([]state.RecoveryChainEvent, 0, len(recoveryContext)+len(chain))
 	materialization = append(materialization, recoveryContext...)
 	materialization = append(materialization, proofChain...)
@@ -171,6 +174,9 @@ func ProveUnpublishedChain(
 	finalState, err := materializeRecoveryState(
 		ctx, repoRoot, baseHead, recoveryContext, proofChain)
 	if err != nil {
+		return result, err
+	}
+	if err := requireStableRecoveryLiveState(ctx, repoRoot, live); err != nil {
 		return result, err
 	}
 	matched := false
@@ -229,8 +235,18 @@ func ReconcileUnpublishedChain(
 	}
 	first := chain[0].Event
 	last := chain[len(chain)-1].Event
+	live, err := currentRecoveryLiveState(ctx, repoRoot,
+		opts.afterInitialLiveToken, opts.beforeLiveTokenRecheck)
+	if err != nil {
+		return result, err
+	}
+	if !live.hasHead && !opts.ArchiveOnly {
+		return result, fmt.Errorf("daemon: reconcile recovery chain: HEAD is missing; archive-only mode required")
+	}
+	proofLiveHead := sameBranchRecoveryHead(live, opts.BranchRef)
 	proofChain, err := canonicalizeRecoveryProofEvents(
-		ctx, db, opts.BranchRef, opts.BranchGeneration, chain)
+		ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
+		proofLiveHead, chain)
 	if err != nil {
 		return result, err
 	}
@@ -247,7 +263,8 @@ func ReconcileUnpublishedChain(
 		return result, err
 	}
 	recoveryContext, err = canonicalizeRecoveryProofEvents(
-		ctx, db, opts.BranchRef, opts.BranchGeneration, recoveryContext)
+		ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
+		proofLiveHead, recoveryContext)
 	if err != nil {
 		return result, err
 	}
@@ -274,14 +291,6 @@ func ReconcileUnpublishedChain(
 		}
 	}
 
-	live, err := currentRecoveryLiveState(ctx, repoRoot,
-		opts.afterInitialLiveToken, opts.beforeLiveTokenRecheck)
-	if err != nil {
-		return result, err
-	}
-	if !live.hasHead && !opts.ArchiveOnly {
-		return result, fmt.Errorf("daemon: reconcile recovery chain: HEAD is missing; archive-only mode required")
-	}
 	if err := requireRecoveryRefMissing(ctx, repoRoot, opts.ExpectedMissingRef); err != nil {
 		return result, err
 	}
@@ -413,33 +422,83 @@ func ReconcileUnpublishedChain(
 
 func canonicalRecoveryCommit(
 	ctx context.Context,
+	repoRoot string,
 	db *state.DB,
 	branchRef string,
 	branchGeneration int64,
 	commitOID string,
+	liveHead string,
 ) (string, error) {
-	canonical, mapped, err := state.CanonicalCompletedIntentRepairCommit(
+	representatives, err := state.CompletedIntentRepairCommitChain(
 		ctx, db, branchRef, branchGeneration, commitOID)
 	if err != nil {
 		return "", fmt.Errorf(
 			"daemon: reconcile recovery chain: resolve repaired commit %s: %w",
 			commitOID, err)
 	}
-	if mapped {
+	if len(representatives) == 1 {
+		return commitOID, nil
+	}
+	canonical := representatives[len(representatives)-1]
+	if liveHead == "" {
 		return canonical, nil
 	}
-	return commitOID, nil
+	for i := len(representatives) - 1; i >= 0; i-- {
+		representative := representatives[i]
+		reachable, err := recoveryCommitAncestorOf(
+			ctx, repoRoot, representative, liveHead)
+		if err != nil {
+			return "", fmt.Errorf(
+				"daemon: reconcile recovery chain: prove repaired commit representative %s against live HEAD: %w",
+				representative, err)
+		}
+		if reachable {
+			return representative, nil
+		}
+	}
+	// No validated identity is on the stable live branch. Keep the newest
+	// durable repair projection so archive-only and divergent-transition proof
+	// retain their existing fail-closed behavior.
+	return canonical, nil
 }
 
-// canonicalizeRecoveryProofEvents projects immutable ledger provenance onto
-// the commit identities produced by completed Intent repairs. Callers use the
-// projection only for Git proof and materialization; the original events stay
-// unchanged for the later SQLite compare-and-swap transition.
+func sameBranchRecoveryHead(live recoveryLiveState, branchRef string) string {
+	if branchRef == "" || tokenBranchRef(live.token) != branchRef {
+		return ""
+	}
+	return live.head
+}
+
+func recoveryCommitAncestorOf(
+	ctx context.Context,
+	repoRoot string,
+	commitOID string,
+	liveHead string,
+) (bool, error) {
+	if commitOID == "" || liveHead == "" {
+		return false, nil
+	}
+	if _, err := git.RevParse(ctx, repoRoot, commitOID+"^{commit}"); err != nil {
+		if errors.Is(err, git.ErrRefNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return git.IsAncestor(ctx, repoRoot, commitOID, liveHead)
+}
+
+// canonicalizeRecoveryProofEvents resolves immutable ledger provenance against
+// completed Intent repairs. A restored original remains authoritative when it
+// is reachable on the same live branch; otherwise the durable repair mapping
+// supplies the proof identity. The original events stay unchanged for the
+// later SQLite compare-and-swap transition.
 func canonicalizeRecoveryProofEvents(
 	ctx context.Context,
+	repoRoot string,
 	db *state.DB,
 	branchRef string,
 	branchGeneration int64,
+	liveHead string,
 	events []state.RecoveryChainEvent,
 ) ([]state.RecoveryChainEvent, error) {
 	canonicalByOID := make(map[string]string)
@@ -448,7 +507,7 @@ func canonicalizeRecoveryProofEvents(
 			return canonical, nil
 		}
 		canonical, err := canonicalRecoveryCommit(
-			ctx, db, branchRef, branchGeneration, oid)
+			ctx, repoRoot, db, branchRef, branchGeneration, oid, liveHead)
 		if err != nil {
 			return "", err
 		}

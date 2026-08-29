@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -79,6 +81,270 @@ func TestPublicationDrainPersistsFrozenMembershipAndTransitions(t *testing.T) {
 	}
 	if active, err := ActivePublicationDrains(ctx, db); err != nil || len(active) != 0 {
 		t.Fatalf("active=%+v err=%v", active, err)
+	}
+}
+
+func TestPublicationDrainFreezesEnvironmentIntentRuntime(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	fingerprint := "sha256:" + strings.Repeat("a", 64)
+	for key, value := range map[string]string{
+		"publication.runtime.ready":                "true",
+		"publication.runtime.commit_strategy":      "intent",
+		"publication.runtime.commit_format":        "conventional",
+		"publication.runtime.config_revision_id":   "0",
+		"publication.runtime.provider":             "openai-compat",
+		"publication.runtime.provider_model":       "semantic-model",
+		"publication.runtime.provider_fingerprint": fingerprint,
+	} {
+		if err := MetaSet(ctx, db, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkpoint := seedPublicationDrainCheckpoint(t, db, []string{"intent.go"})
+	drain := PublicationDrain{
+		ID: "drain-env-intent", CheckpointID: checkpoint.ID,
+		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: 7, Phase: PublicationDrainCheckpointing,
+		TargetEventCount: 1, CreatedTS: 10, UpdatedTS: 10,
+		LastProgressTS: 10,
+	}
+	if created, err := PreparePublicationDrain(ctx, db, drain); err != nil || !created {
+		t.Fatalf("prepare=(%t,%v)", created, err)
+	}
+	loaded, err := PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil || loaded.CommitStrategy != "intent" ||
+		loaded.CommitFormat != "conventional" || loaded.ConfigRevisionID != 0 ||
+		loaded.Provider != "openai-compat" ||
+		loaded.ProviderModel != "semantic-model" ||
+		loaded.ProviderFingerprint != fingerprint {
+		t.Fatalf("frozen runtime=%+v err=%v", loaded, err)
+	}
+	if err := MetaSet(ctx, db, "publication.runtime.commit_strategy", "event"); err != nil {
+		t.Fatal(err)
+	}
+	if err := MetaSet(ctx, db, "publication.runtime.ready", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := PreparePublicationDrain(ctx, db, drain); err != nil || created {
+		t.Fatalf("idempotent prepare after runtime change=(%t,%v)", created, err)
+	}
+}
+
+func TestPreparePublicationDrainRejectsBlockedRuntimeProjection(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	for key, value := range map[string]string{
+		"publication.runtime.ready":                "false",
+		"publication.runtime.commit_strategy":      "intent",
+		"publication.runtime.commit_format":        "imperative",
+		"publication.runtime.config_revision_id":   "1",
+		"publication.runtime.provider":             "openai-compat",
+		"publication.runtime.provider_model":       "stale-model",
+		"publication.runtime.provider_fingerprint": "sha256:stale",
+	} {
+		if err := MetaSet(ctx, db, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkpoint := seedPublicationDrainCheckpoint(t, db, []string{"blocked.go"})
+	drain := PublicationDrain{
+		ID: "drain-blocked-runtime", CheckpointID: checkpoint.ID,
+		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: 7, Phase: PublicationDrainCheckpointing,
+		TargetEventCount: 1, CreatedTS: 10, UpdatedTS: 10,
+		LastProgressTS: 10,
+	}
+	if created, err := PreparePublicationDrain(ctx, db, drain); created || !errors.Is(err, ErrPublicationDrainRuntime) {
+		t.Fatalf("prepare blocked runtime=(%t,%v)", created, err)
+	}
+	var count int
+	if err := db.ReadSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM publication_drains WHERE id=?`, drain.ID,
+	).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("blocked drain rows=%d err=%v", count, err)
+	}
+}
+
+func TestPreparePublicationDrainRejectsStaleAppliedRevision(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	revisionA, err := InsertConfigRevision(ctx, db, ConfigRevisionInput{
+		Snapshot: []byte(`{"ai.provider":"openai-compat","commit.strategy":"intent"}`),
+		Profile:  "a", Scope: "repository", CreatedTS: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionB, err := InsertConfigRevision(ctx, db, ConfigRevisionInput{
+		Snapshot: []byte(`{"ai.provider":"deterministic","commit.strategy":"event"}`),
+		Profile:  "b", Scope: "repository", CreatedTS: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO runtime_config_state(id,applied_revision_id,updated_ts)
+VALUES(1,?,2)
+ON CONFLICT(id) DO UPDATE SET applied_revision_id=excluded.applied_revision_id,
+ updated_ts=excluded.updated_ts`, revisionB.ID); err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range map[string]string{
+		"publication.runtime.ready":                "true",
+		"publication.runtime.commit_strategy":      "intent",
+		"publication.runtime.commit_format":        "imperative",
+		"publication.runtime.config_revision_id":   strconv.FormatInt(revisionA.ID, 10),
+		"publication.runtime.provider":             "openai-compat",
+		"publication.runtime.provider_model":       "semantic-model",
+		"publication.runtime.provider_fingerprint": "sha256:stale-a",
+	} {
+		if err := MetaSet(ctx, db, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkpoint := seedPublicationDrainCheckpoint(t, db, []string{"race.go"})
+	drain := PublicationDrain{
+		ID: "drain-stale-applied", CheckpointID: checkpoint.ID,
+		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: 7, Phase: PublicationDrainCheckpointing,
+		TargetEventCount: 1, CreatedTS: 10, UpdatedTS: 10,
+		LastProgressTS: 10,
+	}
+	if created, err := PreparePublicationDrain(ctx, db, drain); created || !errors.Is(err, ErrPublicationDrainRuntime) {
+		t.Fatalf("prepare stale applied runtime=(%t,%v)", created, err)
+	}
+}
+
+func TestPreparePublicationDrainKeepsRevisionIdentityAfterRuntimeChange(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	revisionA, err := InsertConfigRevision(ctx, db, ConfigRevisionInput{
+		Snapshot: []byte(`{"ai.provider":"openai-compat","commit.strategy":"intent"}`),
+		Profile:  "a", Scope: "repository", CreatedTS: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionB, err := InsertConfigRevision(ctx, db, ConfigRevisionInput{
+		Snapshot: []byte(`{"ai.provider":"deterministic","commit.strategy":"event"}`),
+		Profile:  "b", Scope: "repository", CreatedTS: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setApplied := func(revisionID int64) {
+		t.Helper()
+		if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO runtime_config_state(id,applied_revision_id,updated_ts)
+VALUES(1,?,2)
+ON CONFLICT(id) DO UPDATE SET applied_revision_id=excluded.applied_revision_id,
+ updated_ts=excluded.updated_ts`, revisionID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setApplied(revisionA.ID)
+	for key, value := range map[string]string{
+		"publication.runtime.ready":                "true",
+		"publication.runtime.commit_strategy":      "intent",
+		"publication.runtime.commit_format":        "imperative",
+		"publication.runtime.config_revision_id":   strconv.FormatInt(revisionA.ID, 10),
+		"publication.runtime.provider":             "openai-compat",
+		"publication.runtime.provider_model":       "semantic-model",
+		"publication.runtime.provider_fingerprint": "sha256:revision-a",
+	} {
+		if err := MetaSet(ctx, db, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkpoint := seedPublicationDrainCheckpoint(t, db, []string{"idempotent.go"})
+	drain := PublicationDrain{
+		ID: "drain-revision-idempotent", CheckpointID: checkpoint.ID,
+		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: 7, Phase: PublicationDrainCheckpointing,
+		TargetEventCount: 1, CreatedTS: 10, UpdatedTS: 10,
+		LastProgressTS: 10,
+	}
+	if created, err := PreparePublicationDrain(ctx, db, drain); err != nil || !created {
+		t.Fatalf("prepare revision drain=(%t,%v)", created, err)
+	}
+	setApplied(revisionB.ID)
+	if err := MetaSet(ctx, db, "publication.runtime.ready", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := PreparePublicationDrain(ctx, db, drain); err != nil || created {
+		t.Fatalf("idempotent prepare after revision change=(%t,%v)", created, err)
+	}
+}
+
+func TestMigrationAdoptsLegacyIntentProofInsteadOfLaterEventMeta(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	checkpoint := seedPublicationDrainCheckpoint(t, db, []string{"legacy.go"})
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO publication_drains(
+ id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
+ target_event_count,created_ts,updated_ts,last_progress_ts
+) VALUES('drain-legacy-intent',? ,? ,? ,7,'semantic',1,10,10,10)`,
+		checkpoint.ID, checkpoint.WorktreeID, checkpoint.ObservedRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO publication_drain_events(drain_id,ord,event_seq)
+VALUES('drain-legacy-intent',0,?)`, checkpoint.EventSeqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	revision, err := InsertConfigRevision(ctx, db, ConfigRevisionInput{
+		Snapshot: []byte(`{"ai.provider":"openai-compat","ai.model":"semantic-model","commit.strategy":"intent","commit.format":"imperative"}`),
+		Profile:  "legacy", Scope: "repository", CreatedTS: 11,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AppendIntentPlannerWindow(ctx, db, IntentPlannerWindow{
+		PlannedTS: 12,
+		Provider:  sql.NullString{String: "openai-compat", Valid: true},
+		Model:     sql.NullString{String: "semantic-model", Valid: true},
+		BranchRef: checkpoint.ObservedRef, BranchGeneration: 7,
+		CommitFormat:        sql.NullString{String: "imperative", Valid: true},
+		OfferedSeqs:         []int64{checkpoint.EventSeqs[0]},
+		VisibleOriginalSeqs: []int64{checkpoint.EventSeqs[0]},
+		SelectedGroups: []IntentPlannerWindowGroup{{
+			SelectedSeqs: []int64{checkpoint.EventSeqs[0]},
+		}},
+		Events: []IntentPlannerWindowEvent{{
+			EventSeq: checkpoint.EventSeqs[0], Offered: true, Selected: true,
+		}},
+		ConfigRevisionID: sql.NullInt64{Int64: revision.ID, Valid: true},
+		Outcome:          sql.NullString{String: "selected", Valid: true},
+		ResolutionMode:   sql.NullString{String: "provider", Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := MetaSet(ctx, db, "commit.strategy", "event"); err != nil {
+		t.Fatal(err)
+	}
+	if err := MetaSet(ctx, db, "ai.provider", "deterministic"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyVersionedMigrations(ctx, tx, 24); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := PublicationDrainByID(ctx, db, "drain-legacy-intent")
+	if err != nil || loaded.CommitStrategy != "intent" ||
+		loaded.CommitFormat != "imperative" ||
+		loaded.ConfigRevisionID != revision.ID ||
+		loaded.Provider != "openai-compat" ||
+		loaded.ProviderModel != "semantic-model" {
+		t.Fatalf("migrated contract=%+v err=%v", loaded, err)
 	}
 }
 
