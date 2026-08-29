@@ -1351,6 +1351,27 @@ func replayIntentBatch(
 	} else if cfg.semanticSalvage {
 		sum.RecoveryMode = publicationFallbackSemanticReplan
 	}
+	if cfg.candidateMode && !cfg.atomicFallback && !cfg.semanticSalvage &&
+		opts.PublicationDrain == nil {
+		// Fresh unrelated captures may be offered ahead of an overdue held
+		// candidate. Probe the exact event that forced-aging would select so a
+		// durable verification failure cannot be starved by continued edits.
+		overdue, _, ok, err := state.OldestOverduePlannerEvent(
+			ctx, db, activeCtx.BranchRef, activeCtx.BranchGeneration,
+			cfg.deferLimit)
+		if err != nil {
+			return sum, err
+		}
+		if ok {
+			recovered, handled, recoveryErr :=
+				startFailedIntentCheckpointRecovery(
+					ctx, repoRoot, db, activeCtx, opts,
+					overdue.Seq, parent, sum)
+			if recoveryErr != nil || handled {
+				return recovered, recoveryErr
+			}
+		}
+	}
 	// Per-path quiescence gate (ACD_PATH_QUIESCENCE_SECONDS). When non-zero
 	// we hold back pending captures whose path was written within the
 	// configured quiet window; the capture row is still durable, only the
