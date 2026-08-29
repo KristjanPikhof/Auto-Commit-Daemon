@@ -274,6 +274,67 @@ SELECT COUNT(*) FROM decision_records WHERE kind=?`,
 	}
 }
 
+func TestOldestOverdueFailedIntentEventStopsAtTerminalBarrier(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	barrierSeq := appendIntentV2Event(
+		t, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "terminal.go")
+	heldSeq := appendIntentV2Event(
+		t, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, "held.go")
+	seedFailedIntentCompletedCheckpoint(t, db, "main", []int64{heldSeq})
+	const candidateID = "failed-behind-terminal"
+	if err := SaveIntentCandidate(ctx, db, IntentCandidate{
+		ID: candidateID, BranchRef: failedIntentCheckpointBranch,
+		BranchGeneration: failedIntentCheckpointGeneration,
+		Status:           IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Purpose: "failed candidate behind terminal event",
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{{
+			EventSeq: heldSeq, EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordPlannerDefer(
+		ctx, db, heldSeq, 1, "verification failed"); err != nil {
+		t.Fatal(err)
+	}
+	if seq, ok, err := OldestOverdueFailedIntentEventSeq(
+		ctx, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, 1,
+	); err != nil || !ok || seq != heldSeq {
+		t.Fatalf("visible failed event=(%d,%t,%v), want %d", seq, ok, err, heldSeq)
+	}
+	if err := MarkEventPublished(
+		ctx, db, barrierSeq, EventStateFailed, sql.NullString{},
+		sql.NullString{String: "terminal barrier", Valid: true},
+		sql.NullString{}, 2,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if seq, ok, err := OldestOverdueFailedIntentEventSeq(
+		ctx, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, 1,
+	); err != nil || ok || seq != 0 {
+		t.Fatalf("failed event behind barrier=(%d,%t,%v), want hidden", seq, ok, err)
+	}
+	candidate, ok, err := IntentCandidateByID(ctx, db, candidateID)
+	if err != nil || !ok || candidate.Status != IntentCandidateWaiting ||
+		len(candidate.Events) != 1 {
+		t.Fatalf("candidate changed behind barrier=(%+v,%t,%v)", candidate, ok, err)
+	}
+	if _, active, err := IntentForwardRecoveryForPair(
+		ctx, db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration,
+	); err != nil || active {
+		t.Fatalf("recovery marker behind barrier active=%t err=%v", active, err)
+	}
+}
+
 func TestStartFailedIntentCheckpointRecoveryFreezesOnlyPendingCheckpointRows(
 	t *testing.T,
 ) {
