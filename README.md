@@ -232,10 +232,12 @@ Fresh setup uses the local deterministic provider and needs no credential or
 network request. You can choose an OpenAI-compatible provider when you want AI
 Intent planning and semantic commit messages.
 
-Network diff egress is off until you approve it explicitly. Credentials and
-unredacted source do not enter status, logs, diagnostics, traces, or plan
-fingerprints. Git-ignored files and configured sensitive paths remain outside
-the protected scope.
+Network diff egress is off until you approve it explicitly. Credentials never
+enter status, logs, diagnostics, traces, or plan fingerprints. Full provider
+payloads stay out of ordinary diagnostics. The advanced prompt-trace and raw
+reject-log options are explicit local opt-ins because their output can contain
+sensitive source text. Git-ignored files and configured sensitive paths remain
+outside the protected scope.
 
 See [AI providers](docs/ai-providers.md) for the provider and privacy contract.
 
