@@ -256,6 +256,11 @@ WHERE cp.phase='completed'
 	return count, err
 }
 
+func checkpointPublishedByACD(report statusReport) bool {
+	return report.Protected && report.UnpublishedCheckpoints == 0 &&
+		report.PendingEvents == 0 && report.ActiveTerminalEvents == 0
+}
+
 // buildStatusReport opens the per-repo state.db read-only and projects the
 // daemon_state + daemon_clients + last commit + meta rows into a flat
 // report struct. Never mutates state.
@@ -528,8 +533,7 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 	}
 	report.WorktreeClean = changes == 0
 	report.AllChangesCommittedInGit = report.WorktreeClean
-	report.CheckpointPublishedByACD = report.Protected &&
-		report.UnpublishedCheckpoints == 0 && report.PendingEvents == 0
+	report.CheckpointPublishedByACD = checkpointPublishedByACD(report)
 	report.Busy = report.Daemon == "running" && !report.Stale &&
 		(report.PendingEvents > 0 || report.SelfPublication.Phase == "active" ||
 			(report.PublicationDrain.ID != "" &&
@@ -1238,7 +1242,7 @@ func renderStatusHuman(out io.Writer, r statusReport) error {
 	fmt.Fprintf(out, "Worktree clean: %s\n", yesNo(r.WorktreeClean))
 	fmt.Fprintf(out, "All changes committed in Git: %s\n",
 		yesNo(r.AllChangesCommittedInGit))
-	fmt.Fprintf(out, "Latest protection checkpoint published by ACD: %s\n",
+	fmt.Fprintf(out, "All protected checkpoints resolved in Git: %s\n",
 		yesNo(r.CheckpointPublishedByACD))
 
 	fmt.Fprintf(out, "Clients (%d):\n", len(r.Clients))

@@ -365,24 +365,31 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		!report.CheckpointPublishedByACD {
 		t.Fatalf("dirty truth=%+v", report)
 	}
-	if _, err := d.SQL().ExecContext(ctx,
-		`UPDATE capture_events SET state=? WHERE seq=?`,
-		state.EventStateFailed, seqs[0]); err != nil {
-		t.Fatal(err)
-	}
-	report, err = buildStatusReport(ctx, rec, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
-		t.Fatalf("failed checkpoint truth=%+v", report)
-	}
-	listReport = statusReport{}
-	if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
-		t.Fatal(err)
-	}
-	if listReport.UnpublishedCheckpoints != 1 {
-		t.Fatalf("failed list truth=%+v", listReport)
+	for _, unresolvedState := range []string{
+		state.EventStateFailed,
+		state.EventStateBlockedConflict,
+	} {
+		t.Run(unresolvedState, func(t *testing.T) {
+			if _, err := d.SQL().ExecContext(ctx,
+				`UPDATE capture_events SET state=? WHERE seq=?`,
+				unresolvedState, seqs[0]); err != nil {
+				t.Fatal(err)
+			}
+			report, err := buildStatusReport(ctx, rec, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
+				t.Fatalf("%s checkpoint truth=%+v", unresolvedState, report)
+			}
+			listReport := statusReport{}
+			if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+				t.Fatal(err)
+			}
+			if listReport.UnpublishedCheckpoints != 1 {
+				t.Fatalf("%s list truth=%+v", unresolvedState, listReport)
+			}
+		})
 	}
 }
 
