@@ -558,7 +558,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		loadPending = state.PublishableEvents
 	}
 	loadLimit := queryLimit
-	if opts.PublicationDrain != nil {
+	if opts.PublicationDrain != nil ||
+		(forwardRecoveryActive && len(forwardRecovery.TargetEventSeqs) > 0) {
+		// Frozen recovery targets are already bounded by the durable candidate
+		// cap. Load the full pending ledger before selecting that exact set so
+		// unrelated earlier checkpoints cannot hide one of its members behind
+		// the ordinary look-ahead limit.
 		loadLimit = 0
 	}
 	pending, err := loadPending(ctx, db, loadLimit)
@@ -1074,6 +1079,17 @@ WHERE consumed_ts IS NOT NULL
 func replayPendingBatchLimit(opts ReplayOpts, cfg intentReplayConfig) int {
 	if !cfg.enabled {
 		return opts.Limit
+	}
+	if cfg.candidateMode {
+		// Candidate planning still offers at most cfg.window fresh captures, but
+		// it must be able to see past a maximally sized held candidate. Keep one
+		// full fresh window beyond the durable candidate cap so a companion at
+		// position 257 cannot be starved by the stalled prefix.
+		limit := state.IntentCandidateMaxCaptures + cfg.window
+		if cfg.minPending > limit {
+			limit = cfg.minPending
+		}
+		return limit
 	}
 	limit := cfg.window
 	if cfg.minPending > limit {
@@ -1723,24 +1739,8 @@ func forcedCaptureHeldByIntentCandidate(
 	if event.BranchRef == "" || event.BranchGeneration < 0 {
 		return false, nil
 	}
-	candidates, err := state.IntentCandidatesForPair(
-		ctx, db, event.BranchRef, event.BranchGeneration, 0)
-	if err != nil {
-		return false, err
-	}
-	for _, candidate := range candidates {
-		if candidate.Status != state.IntentCandidateOpen &&
-			candidate.Status != state.IntentCandidateWaiting &&
-			candidate.Status != state.IntentCandidateBlocked {
-			continue
-		}
-		for _, member := range candidate.Events {
-			if member.EventSeq == event.Seq {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
+	return state.IntentEventHeldByCandidate(
+		ctx, db, event.BranchRef, event.BranchGeneration, event.Seq)
 }
 
 func intentActivityBoundaryCaptureLimit(
