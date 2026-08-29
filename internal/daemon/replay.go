@@ -417,6 +417,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if repoRoot == "" || db == nil {
 		return sum, fmt.Errorf("daemon: Replay: repoRoot and db required")
 	}
+	if err := clearStaleIntentVerificationActivity(ctx, db); err != nil {
+		return sum, fmt.Errorf(
+			"daemon: Replay: clear stale Intent verification activity: %w", err)
+	}
 
 	msgFn := opts.MessageFn
 	if msgFn == nil {
@@ -1271,6 +1275,7 @@ type intentReplayConfig struct {
 	// captures, and resets only after publication progress.
 	forwardRecoveryPlan            ai.IntentPlanV2
 	forwardRecoveryPlanFingerprint string
+	forwardRecoveryCandidateID     string
 	forwardRecoveryPrefixCursor    int
 	forwardRecoveryPrefixBaseHead  string
 	// pathQuiescence is the per-path silence window read from
