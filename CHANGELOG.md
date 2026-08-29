@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-08-30
+
 ### Changed
 
 - Repository state schema is now v25. Version 24 records the exact captures
