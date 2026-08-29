@@ -60,6 +60,9 @@ type Result struct {
 // writer; Store introduces no goroutines or additional ownership model.
 type Store struct {
 	DB *state.DB
+	// retentionInventory is a test seam for proving that retention work is
+	// bounded by policy decisions rather than by the number of retained refs.
+	retentionInventory func(context.Context, string, []string) (map[string]int64, error)
 }
 
 // WorktreeID returns the stable 16-hex identity derived from the canonical
