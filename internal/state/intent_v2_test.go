@@ -78,6 +78,63 @@ WHERE candidate_id=? AND event_seq=?`, candidate.ID, second).Scan(&state); err !
 	}
 }
 
+func TestMarkIntentCandidateVerificationPendingPreservesSemanticState(
+	t *testing.T,
+) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	seq := appendIntentV2Event(
+		t, d, "refs/heads/main", 3, "resource_wait.go")
+	candidate := IntentCandidate{
+		ID: "candidate-resource-wait", BranchRef: "refs/heads/main",
+		BranchGeneration: 3, Status: IntentCandidateWaiting,
+		Readiness: IntentReadinessWait, Purpose: "preserve semantic grouping",
+		AtomicityStatus: sql.NullString{String: "failed", Valid: true},
+		AtomicitySummary: "verification workspace setup failed",
+		VerificationStatus: sql.NullString{
+			String: "needs_attention", Valid: true,
+		},
+		VerificationOutput: "No space left on device",
+		VerificationTS:     sql.NullFloat64{Float64: 9, Valid: true},
+		Events: []IntentCandidateEvent{{
+			EventSeq: seq, EventRole: "implementation",
+		}},
+	}
+	if err := SaveIntentCandidate(ctx, d, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := MarkIntentCandidateVerificationPending(
+		ctx, d, candidate.ID, candidate.BranchRef, 4,
+		"verification resources unavailable", 10,
+	); err != nil || changed {
+		t.Fatalf("wrong-pair pending update=(%t,%v)", changed, err)
+	}
+	changed, err := MarkIntentCandidateVerificationPending(
+		ctx, d, candidate.ID, candidate.BranchRef,
+		candidate.BranchGeneration,
+		"verification resources unavailable", 11,
+	)
+	if err != nil || !changed {
+		t.Fatalf("pending update=(%t,%v)", changed, err)
+	}
+	got, ok, err := IntentCandidateByID(ctx, d, candidate.ID)
+	if err != nil || !ok {
+		t.Fatalf("load pending candidate=(%+v,%t,%v)", got, ok, err)
+	}
+	if got.Status != candidate.Status || got.Readiness != candidate.Readiness ||
+		got.Purpose != candidate.Purpose || len(got.Events) != 1 ||
+		got.Events[0].EventSeq != seq ||
+		!got.AtomicityStatus.Valid || got.AtomicityStatus.String != "pending" ||
+		got.AtomicitySummary != "verification resources unavailable" ||
+		!got.VerificationStatus.Valid ||
+		got.VerificationStatus.String != "pending" ||
+		got.VerificationOutput != "" || got.VerificationTS.Valid ||
+		got.UpdatedTS != 11 {
+		t.Fatalf("pending candidate=%+v", got)
+	}
+}
+
 func TestIntentCandidateMergePreservesMembershipAndLineage(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
