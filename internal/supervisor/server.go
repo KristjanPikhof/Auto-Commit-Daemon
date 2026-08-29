@@ -535,7 +535,7 @@ func (s *Server) reconcile(ctx context.Context) error {
 func startingWorkers(roots paths.Roots, workers map[string]*workerProcess) int {
 	count := 0
 	for _, worker := range workers {
-		if worker == nil || !worker.launchd && worker.cmd == nil {
+		if worker == nil || (worker.cmd == nil && !worker.launchd) {
 			continue
 		}
 		status, err := ReadWorkerRuntimeStatus(roots, worker.id)

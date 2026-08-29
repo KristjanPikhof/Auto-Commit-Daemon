@@ -257,46 +257,83 @@ func TestStartableWorkerIDsBoundsAndOrdersStartupBatch(t *testing.T) {
 	}
 }
 
-func TestStartingWorkersBoundsProtectionAcrossReconciles(t *testing.T) {
+func TestStartingWorkersCountsDirectAndLaunchdProtection(t *testing.T) {
 	home := t.TempDir()
 	roots := paths.Roots{State: filepath.Join(home, "state"), Share: filepath.Join(home, "share"), Config: filepath.Join(home, "config")}
 	workers := map[string]*workerProcess{
-		"0000000000000000": {id: "0000000000000000"},
-		"0000000000000001": {id: "0000000000000001"},
-		"0000000000000002": {id: "0000000000000002"},
-		"0000000000000003": {id: "0000000000000003"},
+		"0000000000000000": {id: "0000000000000000", cmd: &exec.Cmd{}},
+		"0000000000000001": {id: "0000000000000001", launchd: true},
+		"0000000000000002": {id: "0000000000000002", cmd: &exec.Cmd{}},
 	}
-	now := time.Now()
-	if got := startableWorkerIDs(workers, now,
-		maxConcurrentWorkerStarts-startingWorkers(roots, workers)); !slices.Equal(got, []string{"0000000000000000", "0000000000000001"}) {
-		t.Fatalf("first reconcile startable workers=%v", got)
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: "0000000000000001", State: "starting",
+	}); err != nil {
+		t.Fatal(err)
 	}
-	workers["0000000000000000"].cmd = &exec.Cmd{}
-	workers["0000000000000001"].cmd = &exec.Cmd{}
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: "0000000000000002", State: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if got := startingWorkers(roots, workers); got != maxConcurrentWorkerStarts {
-		t.Fatalf("starting direct workers=%d want %d", got, maxConcurrentWorkerStarts)
+		t.Fatalf("starting workers=%d want %d", got, maxConcurrentWorkerStarts)
 	}
-	if got := startableWorkerIDs(workers, now,
-		maxConcurrentWorkerStarts-startingWorkers(roots, workers)); len(got) != 0 {
-		t.Fatalf("second reconcile exceeded admission limit: %v", got)
+}
+
+func TestReconcileBoundsDirectProtectionStartupAcrossCycles(t *testing.T) {
+	root := t.TempDir()
+	roots := paths.Roots{
+		State: filepath.Join(root, "state"), Share: filepath.Join(root, "share"),
+		Config: filepath.Join(root, "config"),
+	}
+	binary := filepath.Join(root, "worker")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec /bin/sleep 60\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registry := central.NewRegistry()
+	for index := range 4 {
+		id := fmt.Sprintf("%016d", index)
+		registry.Repos = append(registry.Repos, central.RepoRecord{
+			Path: "/repo-" + id, StateDB: "/state-" + id,
+			RepositoryID: id, WorktreeID: fmt.Sprintf("%016x", index+4),
+		})
+	}
+	if err := central.Save(roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{Roots: roots, BinaryPath: binary, workers: make(map[string]*workerProcess)}
+	t.Cleanup(func() {
+		server.shutdownWorkers()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = server.waitWorkersStopped(ctx)
+	})
+
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.workers["0000000000000000"].cmd == nil ||
+		server.workers["0000000000000001"].cmd == nil ||
+		server.workers["0000000000000002"].cmd != nil {
+		t.Fatalf("first reconcile workers=%+v", server.workers)
+	}
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.workers["0000000000000002"].cmd != nil {
+		t.Fatal("second reconcile exceeded the concurrent startup limit")
 	}
 	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
 		RepositoryID: "0000000000000000", State: "running",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := startableWorkerIDs(workers, now,
-		maxConcurrentWorkerStarts-startingWorkers(roots, workers)); !slices.Equal(got, []string{"0000000000000002"}) {
-		t.Fatalf("third reconcile did not reuse one ready slot: %v", got)
-	}
-	workers["0000000000000002"].launchd = true
-	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
-		RepositoryID: "0000000000000002", State: "starting",
-	}); err != nil {
+	if err := server.reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := startingWorkers(roots, workers); got != maxConcurrentWorkerStarts {
-		t.Fatalf("mixed direct and launchd starts=%d want %d", got, maxConcurrentWorkerStarts)
+	if server.workers["0000000000000002"].cmd == nil ||
+		server.workers["0000000000000003"].cmd != nil {
+		t.Fatal("third reconcile did not reuse exactly one ready slot")
 	}
 }
 
