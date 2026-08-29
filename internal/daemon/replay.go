@@ -507,6 +507,22 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if err != nil {
 		return sum, err
 	}
+	if forwardRecoveryActive &&
+		forwardRecovery.Stage == publicationFallbackLocalUnlock &&
+		forwardRecovery.PlanFingerprint != "" &&
+		forwardRecovery.PrefixUnresolvedCount > 0 {
+		previousRecovery := forwardRecovery
+		forwardRecovery, _, err =
+			state.ResetIntentForwardRecoveryPrefixAfterProgress(
+				ctx, db, forwardRecovery)
+		if err != nil {
+			return sum, err
+		}
+		if previousRecovery.Stage != forwardRecovery.Stage {
+			logIntentForwardRecoveryTransition(
+				previousRecovery, forwardRecovery.Stage)
+		}
+	}
 	if opts.PublicationDrain != nil && intentCfg.enabled {
 		intentCfg.targetEventSeqs = append(
 			[]int64(nil), opts.PublicationDrain.EventSeqs...)
