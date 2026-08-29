@@ -26,18 +26,19 @@ const (
 // IntentVerificationActivity is the durable, privacy-safe proof that the
 // canonical replay writer is synchronously verifying one semantic group.
 type IntentVerificationActivity struct {
-	BranchRef             string  `json:"branch_ref"`
-	BranchGeneration      int64   `json:"branch_generation"`
-	CandidateID           string  `json:"candidate_id"`
-	PlanFingerprint       string  `json:"plan_fingerprint"`
-	RecoveryCandidateID   string  `json:"recovery_candidate_id,omitempty"`
-	StartedTS             float64 `json:"started_ts"`
+	BranchRef           string  `json:"branch_ref"`
+	BranchGeneration    int64   `json:"branch_generation"`
+	CandidateID         string  `json:"candidate_id"`
+	PlanFingerprint     string  `json:"plan_fingerprint"`
+	RecoveryCandidateID string  `json:"recovery_candidate_id,omitempty"`
+	StartedTS           float64 `json:"started_ts"`
 }
 
 func DecodeIntentVerificationActivity(raw string) (IntentVerificationActivity, error) {
 	var activity IntentVerificationActivity
 	if err := json.Unmarshal([]byte(raw), &activity); err != nil {
-		return activity, fmt.Errorf("decode Intent verification activity: %w", err)
+		return activity, fmt.Errorf(
+			"daemon: decode intent verification activity: %w", err)
 	}
 	if err := validateIntentVerificationActivity(activity); err != nil {
 		return activity, err
@@ -51,7 +52,8 @@ func validateIntentVerificationActivity(activity IntentVerificationActivity) err
 		return err
 	}
 	if activity.BranchGeneration < 0 {
-		return errors.New("Intent verification activity requires a branch generation")
+		return errors.New(
+			"daemon: intent verification activity requires a branch generation")
 	}
 	for _, identity := range []struct {
 		name     string
@@ -70,7 +72,8 @@ func validateIntentVerificationActivity(activity IntentVerificationActivity) err
 	}
 	if activity.StartedTS <= 0 || math.IsNaN(activity.StartedTS) ||
 		math.IsInf(activity.StartedTS, 0) {
-		return errors.New("Intent verification activity requires a valid start time")
+		return errors.New(
+			"daemon: intent verification activity requires a valid start time")
 	}
 	return nil
 }
@@ -86,11 +89,13 @@ func validateIntentVerificationText(
 	}
 	if strings.TrimSpace(value) == "" || len(value) > limit ||
 		!utf8.ValidString(value) {
-		return fmt.Errorf("Intent verification activity has an invalid %s", name)
+		return fmt.Errorf(
+			"daemon: intent verification activity has an invalid %s", name)
 	}
 	for _, r := range value {
 		if !unicode.IsPrint(r) || r == '\u007f' {
-			return fmt.Errorf("Intent verification activity has an invalid %s", name)
+			return fmt.Errorf(
+				"daemon: intent verification activity has an invalid %s", name)
 		}
 	}
 	return nil
@@ -105,7 +110,8 @@ func runIntentCandidateVerificationWithActivity(
 	captures []IntentCandidateCapture,
 ) (result IntentCandidateVerification, err error) {
 	if db == nil || verify == nil {
-		return result, errors.New("Intent verification activity requires state and verifier")
+		return result, errors.New(
+			"daemon: intent verification activity requires state and verifier")
 	}
 	if activity.StartedTS <= 0 {
 		activity.StartedTS = float64(time.Now().UnixNano()) / 1e9
@@ -115,7 +121,8 @@ func runIntentCandidateVerificationWithActivity(
 	}
 	if err := state.MetaSetJSON(
 		ctx, db, MetaKeyIntentVerificationActivity, activity); err != nil {
-		return result, fmt.Errorf("persist Intent verification activity: %w", err)
+		return result, fmt.Errorf(
+			"daemon: persist intent verification activity: %w", err)
 	}
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(
@@ -125,7 +132,8 @@ func runIntentCandidateVerificationWithActivity(
 			cleanupCtx, db, MetaKeyIntentVerificationActivity)
 		if cleanupErr != nil {
 			err = errors.Join(err,
-				fmt.Errorf("clear Intent verification activity: %w", cleanupErr))
+				fmt.Errorf(
+					"daemon: clear intent verification activity: %w", cleanupErr))
 		}
 	}()
 	return verify(ctx, assignment, captures)
