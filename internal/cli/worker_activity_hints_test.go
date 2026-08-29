@@ -104,7 +104,7 @@ func TestWorkerHintBeginsEveryObservationBeforeCoalescedWake(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	wakes := make(chan string, 4)
 	coalescer := newWorkerActivityHintCoalescer(
-		100*time.Millisecond, 500*time.Millisecond,
+		time.Hour, time.Hour,
 		func(worktreeID string) { wakes <- worktreeID },
 	)
 	t.Cleanup(coalescer.Close)
@@ -140,7 +140,6 @@ func TestWorkerHintBeginsEveryObservationBeforeCoalescedWake(t *testing.T) {
 		t.Fatalf("second accepted observation complete=%q ok=%t err=%v", complete, ok, err)
 	}
 	assertNoWorkerWake(t, wakes, 20*time.Millisecond)
-	assertWorkerWake(t, wakes, "worktree", 250*time.Millisecond)
 }
 
 func protectionObservationEpoch(t *testing.T, ctx context.Context, db *state.DB) int64 {

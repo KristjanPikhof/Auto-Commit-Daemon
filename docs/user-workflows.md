@@ -69,7 +69,7 @@ The human status output keeps the main questions separate:
 | `State` | Overall state: `off`, `protected`, `waiting`, `publishing`, or `needs_action`. |
 | `ACD protection` | Whether background protection is on. |
 | `Current changes protected` | Whether the latest eligible changes have a completed durable checkpoint. |
-| `Published to Git` | Whether all protected changes are now in local Git commits. |
+| `Published to Git` | Whether every protected change is resolved in Git: in local branch history or a protected recovery snapshot, with no unresolved failed or blocked capture. |
 | `Commit mode` | The configured strategy. A temporary local recovery remains part of Intent mode. |
 | `Publication queue` | All protected changes still waiting for local Git publication. |
 | `Active target` | The bounded remainder of `commit-all` or automatic Intent recovery, when one exists. |

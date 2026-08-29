@@ -446,9 +446,11 @@ func readProductListProtection(ctx context.Context, conn *sql.DB, report *status
 		return err
 	}
 	report.checkpointNeedsAction = needsAction > 0
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM checkpoints cp WHERE cp.phase='completed' AND EXISTS (SELECT 1 FROM checkpoint_events ce JOIN capture_events e ON e.seq=ce.event_seq WHERE ce.checkpoint_id=cp.id AND e.state<>'published')`).Scan(&report.UnpublishedCheckpoints); err != nil {
+	unresolved, err := countUnresolvedCompletedCheckpoints(ctx, conn)
+	if err != nil {
 		return err
 	}
+	report.UnpublishedCheckpoints = unresolved
 	report.Protected = strings.EqualFold(completeValue, "true") && report.LatestCheckpointID != "" &&
 		report.ObservationEpoch == report.CoveredEpoch && prepared == 0 && needsAction == 0
 	return nil

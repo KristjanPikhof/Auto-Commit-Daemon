@@ -396,7 +396,8 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 				t.Fatalf("runControlStatus exit=%d err=%v", ExitCode(err), err)
 			}
 			got := decodeControlResult(t, out.Bytes())
-			if got.OK || got.Health != controlHealthNeedsAttention || !strings.Contains(got.Summary, "safety block") {
+			if got.OK || got.Health != controlHealthNeedsAttention || got.Published ||
+				got.CheckpointPublishedByACD || !strings.Contains(got.Summary, "safety block") {
 				t.Fatalf("active tail terminal event was not surfaced: %+v", got)
 			}
 			if !strings.Contains(got.NextAction, "acd support recover --dry-run") ||

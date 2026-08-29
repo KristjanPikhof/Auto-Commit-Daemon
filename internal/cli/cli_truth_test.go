@@ -14,6 +14,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 func TestIntentObservabilityNewestPlannerErrorWins(t *testing.T) {
@@ -320,6 +321,10 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 	repo, dbPath, d := makeRepoStateDB(t)
+	seqs := insertCompletedCheckpoint(t, d, "cp-recovered-status",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStateRecovered, CommitOID: "recovery-commit",
+		}})
 	registerRepo(t, roots, repo, dbPath, "codex")
 	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
 		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
@@ -340,8 +345,28 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !report.WorktreeClean || !report.AllChangesCommittedInGit ||
-		!report.CheckpointPublishedByACD {
+		!report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 0 {
 		t.Fatalf("clean truth=%+v", report)
+	}
+	listReport := statusReport{}
+	if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+		t.Fatal(err)
+	}
+	if !listReport.Protected || listReport.UnpublishedCheckpoints != 0 {
+		t.Fatalf("recovered list truth=%+v", listReport)
+	}
+	control := controlResult{OK: true, Health: controlHealthHealthy}
+	applyControlStatusWithDaemonAlive(&control, report, true)
+	if !control.Published || !control.CheckpointPublishedByACD {
+		t.Fatalf("recovered control truth=%+v", control)
+	}
+	listRecord := rec
+	listRecord.RepositoryID = "repository-id"
+	listRecord.WorktreeID = "0123456789abcdef"
+	entry := productListEntryFromOverview(listRecord, supervisor.WorkerStatus{},
+		productListRepoOverview{report: report}, nil)
+	if !entry.Published {
+		t.Fatalf("recovered product list truth=%+v", entry)
 	}
 	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -353,6 +378,32 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if report.WorktreeClean || report.AllChangesCommittedInGit ||
 		!report.CheckpointPublishedByACD {
 		t.Fatalf("dirty truth=%+v", report)
+	}
+	for _, unresolvedState := range []string{
+		state.EventStateFailed,
+		state.EventStateBlockedConflict,
+	} {
+		t.Run(unresolvedState, func(t *testing.T) {
+			if _, err := d.SQL().ExecContext(ctx,
+				`UPDATE capture_events SET state=? WHERE seq=?`,
+				unresolvedState, seqs[0]); err != nil {
+				t.Fatal(err)
+			}
+			report, err := buildStatusReport(ctx, rec, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
+				t.Fatalf("%s checkpoint truth=%+v", unresolvedState, report)
+			}
+			listReport := statusReport{}
+			if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+				t.Fatal(err)
+			}
+			if listReport.UnpublishedCheckpoints != 1 {
+				t.Fatalf("%s list truth=%+v", unresolvedState, listReport)
+			}
+		})
 	}
 }
 

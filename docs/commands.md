@@ -79,6 +79,10 @@ State priority is `off`, `needs_action`, `publishing`, `waiting`, `protected`.
 The independent `protected` boolean may remain true in the middle three
 publication/repair states.
 
+`Published to Git: yes` means every protected change is resolved either in
+normal branch history or a protected recovery snapshot, with no unresolved
+failed or blocked capture.
+
 Read-only status falls back to existing v20 SQLite projections when the
 supervisor is unavailable. Mutations never fall back to direct unsupervised
 writes. On macOS, mutating commands first start or reuse the shared per-user
