@@ -61,7 +61,7 @@ func (p *failedCheckpointRecoveryPlanner) PlanIntentV2(
 	}, nil
 }
 
-func TestReplayIntentCandidateRecoversFailedCheckpointCompanion(t *testing.T) {
+func TestReplayIntentCandidateRecoversBeforeForcedPreflightFailure(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	for path, contents := range map[string]string{
@@ -172,11 +172,11 @@ func TestReplayIntentCandidateRecoversFailedCheckpointCompanion(t *testing.T) {
 	if result.Published != 3 || result.Conflicts != 0 || result.Failed != 0 {
 		t.Fatalf("replay result=%+v", result)
 	}
-	if !reflect.DeepEqual(planner.offeredCounts, []int{1, 3}) {
-		t.Fatalf("planner offered counts=%v want [1 3]", planner.offeredCounts)
+	if !reflect.DeepEqual(planner.offeredCounts, []int{3}) {
+		t.Fatalf("planner offered counts=%v want [3]", planner.offeredCounts)
 	}
-	if !reflect.DeepEqual(verifiedCounts, []int{2, 3}) {
-		t.Fatalf("verified candidate sizes=%v want [2 3]", verifiedCounts)
+	if !reflect.DeepEqual(verifiedCounts, []int{3}) {
+		t.Fatalf("verified candidate sizes=%v want [3]", verifiedCounts)
 	}
 
 	headAfter, err := git.RevParse(ctx, f.dir, "HEAD")
