@@ -590,6 +590,20 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 	}
 	if len(pending) == 0 {
+		if forwardRecoveryActive && len(forwardRecovery.TargetEventSeqs) > 0 {
+			completed, completeErr := state.CompleteResolvedIntentForwardRecovery(
+				ctx, db, forwardRecovery)
+			if completeErr != nil {
+				return sum, completeErr
+			}
+			if completed {
+				slog.Default().Info("intent forward recovery completed after restart",
+					"candidate_id", forwardRecovery.CandidateID,
+					"mode", forwardRecovery.Stage,
+					"resolved_events", len(forwardRecovery.TargetEventSeqs),
+					"reason", forwardRecovery.Reason)
+			}
+		}
 		return sum, nil
 	}
 
@@ -1632,28 +1646,32 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	if len(pending) == 0 {
 		return nil, false, "", nil
 	}
+	if cfg.semanticSalvage && len(cfg.targetEventSeqs) > 0 {
+		// Recovery owns an immutable, pre-proved target. Re-evaluate its bounded
+		// slice together instead of letting old per-event defer counters reduce
+		// the pass to the same forced singleton that previously stalled it.
+		n := cfg.window
+		if n > len(pending) {
+			n = len(pending)
+		}
+		return pending[:n], false, "", nil
+	}
 	var (
 		forcedEvent  state.CaptureEvent
 		forcedState  state.PlannerState
 		forcedOK     bool
-		freshWindow  = make([]state.CaptureEvent, 0, cfg.window)
 		blockedPaths = make(map[string]struct{})
+		overdue      = make(map[int64]bool, len(pending))
 	)
 	for _, ev := range pending {
 		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
 		if err != nil {
 			return nil, false, "", err
 		}
-		overdue := ok && ps.DeferCount >= cfg.deferLimit
-		if !overdue {
-			if len(freshWindow) < cfg.window &&
-				!captureEventTouchesAnyPath(ev, blockedPaths) {
-				freshWindow = append(freshWindow, ev)
-				continue
-			}
-			addCaptureEventPaths(blockedPaths, ev)
+		if !ok || ps.DeferCount < cfg.deferLimit {
 			continue
 		}
+		overdue[ev.Seq] = true
 		if !forcedOK ||
 			ps.LastPlannedTS < forcedState.LastPlannedTS ||
 			(ps.LastPlannedTS == forcedState.LastPlannedTS && ev.Seq < forcedEvent.Seq) {
@@ -1664,6 +1682,16 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		addCaptureEventPaths(blockedPaths, ev)
 	}
 	if forcedOK {
+		freshWindow := make([]state.CaptureEvent, 0, cfg.window)
+		for _, ev := range pending {
+			if overdue[ev.Seq] || captureEventTouchesAnyPath(ev, blockedPaths) {
+				continue
+			}
+			freshWindow = append(freshWindow, ev)
+			if len(freshWindow) == cfg.window {
+				break
+			}
+		}
 		if len(freshWindow) > 0 {
 			held, err := forcedCaptureHeldByIntentCandidate(
 				ctx, db, forcedEvent)
