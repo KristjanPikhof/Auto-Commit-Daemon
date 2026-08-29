@@ -37,8 +37,10 @@ package state
 // v21 adds durable publication drains over immutable checkpoint membership;
 // v22 adds restart-stable adaptive Intent planning runs; v23 preserves the
 // bounded resolved plan so a completed run can be reused after restart; v24
-// adds immutable event membership for newly prepared Intent repairs.
-const SchemaVersion = 24
+// adds immutable event membership for newly prepared Intent repairs; v25
+// freezes the runtime strategy and provider identity used by publication
+// drains so restart recovery cannot reinterpret an Intent drain as Event.
+const SchemaVersion = 25
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -896,6 +898,15 @@ CREATE TABLE IF NOT EXISTS publication_drains(
     worktree_id         TEXT NOT NULL,
     branch_ref          TEXT NOT NULL,
     branch_generation   INTEGER NOT NULL CHECK (branch_generation >= 0),
+    commit_strategy     TEXT NOT NULL DEFAULT ''
+                          CHECK (commit_strategy IN ('','event','intent')),
+    commit_format       TEXT NOT NULL DEFAULT ''
+                          CHECK (commit_format IN ('','imperative','conventional')),
+    config_revision_id  INTEGER NOT NULL DEFAULT 0
+                          CHECK (config_revision_id >= 0),
+    provider            TEXT NOT NULL DEFAULT '',
+    provider_model      TEXT NOT NULL DEFAULT '',
+    provider_fingerprint TEXT NOT NULL DEFAULT '',
     phase               TEXT NOT NULL CHECK (phase IN
                            ('checkpointing','semantic','normalizing',
                             'event_fallback','completed','needs_action')),
@@ -919,6 +930,9 @@ CREATE TABLE IF NOT EXISTS publication_drains(
     CHECK (length(id) BETWEEN 1 AND 128),
     CHECK (length(worktree_id) = 16),
     CHECK (length(branch_ref) BETWEEN 1 AND 1024),
+    CHECK (length(provider) <= 128),
+    CHECK (length(provider_model) <= 256),
+    CHECK (length(provider_fingerprint) <= 71),
     CHECK (length(fallback_mode) <= 64),
     CHECK (length(last_error) <= 2048),
     FOREIGN KEY (checkpoint_id) REFERENCES checkpoints(id)
