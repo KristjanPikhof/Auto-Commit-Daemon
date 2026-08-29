@@ -28,6 +28,58 @@ type IntentForwardRecovery struct {
 	LastProgressTS   float64 `json:"last_progress_ts,omitempty"`
 }
 
+// OldestOverdueFailedIntentEventSeq returns the earliest pending capture held
+// by a failed, unpublished candidate after that capture reaches the configured
+// defer limit. Capture order wins over planner timestamps so unrelated newer
+// work cannot starve checkpoint recovery.
+func OldestOverdueFailedIntentEventSeq(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	branchGeneration int64,
+	deferLimit int,
+) (int64, bool, error) {
+	if d == nil || strings.TrimSpace(branchRef) == "" || branchGeneration < 0 {
+		return 0, false, errors.New(
+			"state: OldestOverdueFailedIntentEventSeq: invalid input")
+	}
+	if deferLimit < 0 {
+		deferLimit = 0
+	}
+	var seq int64
+	err := d.readSQL().QueryRowContext(ctx, `
+SELECT event.seq
+FROM intent_candidate_events membership
+JOIN intent_candidates candidate ON candidate.id=membership.candidate_id
+JOIN capture_events event ON event.seq=membership.event_seq
+JOIN planner_state planner ON planner.event_seq=event.seq
+JOIN checkpoint_events checkpoint_event ON checkpoint_event.event_seq=event.seq
+JOIN checkpoints checkpoint ON checkpoint.id=checkpoint_event.checkpoint_id
+WHERE membership.membership_state='active'
+  AND candidate.branch_ref=?
+  AND candidate.branch_generation=?
+  AND candidate.status IN ('waiting','blocked')
+  AND candidate.verification_status='failed'
+  AND candidate.published_commit_oid IS NULL
+  AND candidate.soft_publication_deadline IS NULL
+  AND event.branch_ref=?
+  AND event.branch_generation=?
+  AND event.state='pending'
+  AND planner.defer_count>=?
+  AND checkpoint.phase='completed'
+ORDER BY event.seq
+LIMIT 1`, branchRef, branchGeneration, branchRef, branchGeneration,
+		deferLimit).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf(
+			"state: find overdue failed intent event: %w", err)
+	}
+	return seq, true, nil
+}
+
 // StartFailedIntentCheckpointRecovery atomically releases the bounded closure
 // of failed candidates and completed checkpoints containing one held capture,
 // then freezes that exact pending target for a semantic replan. It refuses any
