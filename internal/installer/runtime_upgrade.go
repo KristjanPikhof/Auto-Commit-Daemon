@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -492,6 +493,13 @@ func shouldUpgradeRuntime(status supervisor.Status, sourceDigest string, options
 		return false, fmt.Errorf("CLI version %s cannot be ordered against supervisor version %s; run `acd setup`", options.SourceVersion, status.Version)
 	}
 	if order < 0 {
+		// git describe orders a dirty build after the clean build from the same
+		// commit. Explicit setup may replace that temporary runtime with the
+		// reproducible clean binary; this is not a source-code downgrade.
+		if options.AllowSameDistanceReplacement &&
+			sameRuntimeBuildIdentity(options.SourceVersion, status.Version) {
+			return status.BinaryDigest != sourceDigest || options.Force, nil
+		}
 		return false, nil
 	}
 	if order == 0 && status.Version != options.SourceVersion {
@@ -501,6 +509,11 @@ func shouldUpgradeRuntime(status supervisor.Status, sourceDigest string, options
 		return false, fmt.Errorf("CLI version %s diverges from supervisor version %s at the same release distance; run `acd setup`", options.SourceVersion, status.Version)
 	}
 	return true, nil
+}
+
+func sameRuntimeBuildIdentity(left, right string) bool {
+	return strings.Replace(left, "-dirty", "", 1) ==
+		strings.Replace(right, "-dirty", "", 1)
 }
 
 func runtimeStatus(ctx context.Context, roots paths.Roots) (supervisor.Status, error) {
