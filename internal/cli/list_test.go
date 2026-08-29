@@ -111,7 +111,12 @@ func TestList_OnceProducesSingleSnapshot(t *testing.T) {
 	if strings.Contains(got, "Updated:") {
 		t.Fatalf("--once should not use watch frames:\n%s", got)
 	}
-	if !strings.Contains(got, "REPO") || !strings.Contains(got, "SAFE") || !strings.Contains(got, "DRAIN") || strings.Contains(got, "DAEMON") {
+	for _, want := range []string{"REPO", "SAFE", "MODE", "QUEUE", "TARGET", "LAST MOVE", "PHASE", "STATUS"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected compact table header %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "DAEMON") {
 		t.Fatalf("expected compact table header:\n%s", got)
 	}
 }
