@@ -215,6 +215,8 @@ func productListHasIndependentAttention(report statusReport) bool {
 		manualPause || report.BackpressurePaused ||
 		report.Configuration.Configuration == "needs_attention" ||
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
+		(report.PublicationProgress.Origin == "intent_recovery" &&
+			report.PublicationProgress.Phase == "needs_action") ||
 		report.Replay.State == "needs_attention" ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0
 }
