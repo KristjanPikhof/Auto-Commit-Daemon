@@ -458,15 +458,16 @@ func updateIntentForwardRecoveryAfterReplay(
 		return sum, replayErr
 	}
 	if sum.Published > 0 {
+		completed, err := state.CompleteResolvedIntentForwardRecovery(
+			ctx, db, recovery)
+		if err != nil {
+			return sum, err
+		}
+		if completed {
+			logIntentForwardRecoveryCompletion(recovery, sum.Published)
+			return sum, nil
+		}
 		if recovery.Stage == publicationFallbackLocalUnlock {
-			if sum.RecoveryMode == publicationFallbackSemanticReplan {
-				if err := state.CompleteIntentForwardRecovery(
-					ctx, db, recovery, sum.Published); err != nil {
-					return sum, err
-				}
-				logIntentForwardRecoveryCompletion(recovery, sum.Published)
-				return sum, nil
-			}
 			nextStage := publicationFallbackSemanticReplan
 			if sum.PlannerCircuitOpen {
 				nextStage = publicationFallbackLocalUnlock
@@ -480,11 +481,9 @@ func updateIntentForwardRecoveryAfterReplay(
 			sum.HasMore = true
 			return sum, nil
 		}
-		if err := state.CompleteIntentForwardRecovery(
-			ctx, db, recovery, sum.Published); err != nil {
-			return sum, err
-		}
-		logIntentForwardRecoveryCompletion(recovery, sum.Published)
+		// Semantic recovery may publish several independently verified groups.
+		// Keep the frozen target until every member is durably resolved.
+		sum.HasMore = true
 		return sum, nil
 	}
 	if recovery.Stage == publicationFallbackSemanticReplan {
