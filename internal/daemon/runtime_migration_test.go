@@ -131,8 +131,12 @@ func TestIntentV2CutoverMigratesLegacyIntentOnceAndBlocksUnsafeReplay(t *testing
 	}
 	if bundle.ReplayBlockedReason == "" ||
 		!strings.Contains(bundle.ReplayBlockedReason, "acd configure") ||
-		bundle.IntentPlanner != nil {
+		bundle.IntentPlanner == nil {
 		t.Fatalf("unsafe migrated bundle=%+v", bundle)
+	}
+	if _, ok := bundle.IntentPlanner.(unavailableIntentPlanner); !ok {
+		t.Fatalf("unsafe migration planner=%T; want unavailable semantic planner",
+			bundle.IntentPlanner)
 	}
 
 	var before int
