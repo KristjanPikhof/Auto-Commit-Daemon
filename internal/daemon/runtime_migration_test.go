@@ -435,6 +435,59 @@ func TestIntentV2EvaluationMetaTreatsFailedVerificationAsRecovering(t *testing.T
 	}
 }
 
+func TestIntentV2EvaluationMetaClearsStaleAttentionDuringResourceWait(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "resource_wait.go", "create", "", "after")
+	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
+		ID: "resource-wait-attention", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: state.IntentCandidateWaiting,
+		Readiness: state.IntentReadinessWait,
+		VerificationStatus: sql.NullString{
+			String: "needs_attention", Valid: true,
+		},
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: capture.Event.Seq, EventRole: "code",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSet(ctx, db, "intent.v2.needs_attention",
+		"older worker classified disk exhaustion as terminal"); err != nil {
+		t.Fatal(err)
+	}
+	bundle := &RuntimeBundle{
+		PresetID: "intent.balanced", PresetVersion: config.PresetCatalogVersion,
+	}
+	if err := updateIntentV2EvaluationMeta(ctx, db, bundle, ReplaySummary{
+		Skipped:       true,
+		SkippedReason: "intent_v2_verification_resource_wait",
+		Disposition:   ReplayDispositionTransientWait,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	attention, ok, err := state.MetaGet(
+		ctx, db, "intent.v2.needs_attention")
+	if err != nil || !ok || attention != "" {
+		t.Fatalf("resource wait attention=%q ok=%t err=%v",
+			attention, ok, err)
+	}
+
+	if err := updateIntentV2EvaluationMeta(ctx, db, bundle, ReplaySummary{
+		Skipped: true, SkippedReason: "intent_batch_wait",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	attention, _, err = state.MetaGet(
+		ctx, db, "intent.v2.needs_attention")
+	if err != nil || attention == "" {
+		t.Fatalf("ordinary unresolved attention=%q err=%v", attention, err)
+	}
+}
+
 func TestIntentV2CutoverUsesAuthoredIntentWithoutLegacyDBEvidence(t *testing.T) {
 	ctx := context.Background()
 	repo, dbPath := intentV2MigrationRepo(t)
