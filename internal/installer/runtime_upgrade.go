@@ -345,7 +345,11 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 		}
 		return false, rollback(err)
 	}
-	readyCtx, readyCancel := context.WithTimeout(ctx, time.Minute)
+	// Worker startup is admission-limited because each repository performs a
+	// protection scan. Match full setup's bounded readiness window so a user
+	// with dozens of repositories does not get a false rollback after one
+	// minute while healthy workers are still starting in turn.
+	readyCtx, readyCancel := context.WithTimeout(ctx, supervisor.CheckpointBarrierTimeout)
 	err = waitForCompatibleRuntimeWorkers(readyCtx, roots, registry)
 	readyCancel()
 	if err != nil {

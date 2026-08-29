@@ -110,12 +110,10 @@ type workerProcess struct {
 var restartDelays = []time.Duration{time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second}
 
 // Starting every registered repository at once creates a Git/process storm on
-// login and during setup cutover. Keep each reconcile batch small; the regular
-// two-second reconcile tick starts the remaining workers promptly.
-const (
-	maxWorkerStartsPerReconcile = 4
-	maxConcurrentWorkerStarts   = 8
-)
+// login and during setup cutover. Two protection scans retain useful
+// parallelism while the regular reconcile tick starts each remaining worker as
+// soon as capacity is available.
+const maxConcurrentWorkerStarts = 2
 
 func (s *Server) Run(ctx context.Context) error {
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -526,21 +524,18 @@ func (s *Server) reconcile(ctx context.Context) error {
 			worker.nextStart = time.Time{}
 		}
 	}
-	startLimit := maxWorkerStartsPerReconcile
-	if s.LaunchdWorkers && runtime.GOOS == "darwin" {
-		startLimit = min(startLimit, max(0,
-			maxConcurrentWorkerStarts-startingLaunchdWorkers(s.Roots, s.workers)))
-	}
+	startLimit := max(0,
+		maxConcurrentWorkerStarts-startingWorkers(s.Roots, s.workers))
 	for _, id := range startableWorkerIDs(s.workers, now, startLimit) {
 		s.startWorkerLocked(ctx, s.workers[id])
 	}
 	return nil
 }
 
-func startingLaunchdWorkers(roots paths.Roots, workers map[string]*workerProcess) int {
+func startingWorkers(roots paths.Roots, workers map[string]*workerProcess) int {
 	count := 0
 	for _, worker := range workers {
-		if worker == nil || !worker.launchd {
+		if worker == nil || !worker.launchd && worker.cmd == nil {
 			continue
 		}
 		status, err := ReadWorkerRuntimeStatus(roots, worker.id)

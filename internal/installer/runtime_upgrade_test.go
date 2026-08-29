@@ -77,6 +77,13 @@ func TestShouldUpgradeRuntimeUsesCompatibilityAndOrdering(t *testing.T) {
 	}
 }
 
+func TestCompatibleRuntimeReadinessAllowsAdmissionLimitedStartup(t *testing.T) {
+	if supervisor.CheckpointBarrierTimeout <= time.Minute {
+		t.Fatalf("compatible runtime readiness timeout=%s, want more than one minute",
+			supervisor.CheckpointBarrierTimeout)
+	}
+}
+
 func TestBuildPlanUsesBoundedCompatibleUpgrade(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS session supervisor plan")

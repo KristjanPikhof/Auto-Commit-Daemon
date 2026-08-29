@@ -251,32 +251,52 @@ func TestStartableWorkerIDsBoundsAndOrdersStartupBatch(t *testing.T) {
 			id: "backoff", nextStart: now.Add(time.Minute),
 		},
 	}
-	want := []string{"repo-a", "repo-b", "repo-c", "repo-d"}
-	if got := startableWorkerIDs(workers, now, maxWorkerStartsPerReconcile); !slices.Equal(got, want) {
+	want := []string{"repo-a", "repo-b"}
+	if got := startableWorkerIDs(workers, now, maxConcurrentWorkerStarts); !slices.Equal(got, want) {
 		t.Fatalf("startable workers=%v want %v", got, want)
 	}
 }
 
-func TestStartingLaunchdWorkersBoundsConcurrentProtection(t *testing.T) {
+func TestStartingWorkersBoundsProtectionAcrossReconciles(t *testing.T) {
 	home := t.TempDir()
 	roots := paths.Roots{State: filepath.Join(home, "state"), Share: filepath.Join(home, "share"), Config: filepath.Join(home, "config")}
-	workers := make(map[string]*workerProcess)
-	for index := 0; index < maxConcurrentWorkerStarts; index++ {
-		id := fmt.Sprintf("%016d", index)
-		workers[id] = &workerProcess{id: id, launchd: true}
-		if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{RepositoryID: id, State: "starting"}); err != nil {
-			t.Fatal(err)
-		}
+	workers := map[string]*workerProcess{
+		"0000000000000000": {id: "0000000000000000"},
+		"0000000000000001": {id: "0000000000000001"},
+		"0000000000000002": {id: "0000000000000002"},
+		"0000000000000003": {id: "0000000000000003"},
 	}
-	if got := startingLaunchdWorkers(roots, workers); got != maxConcurrentWorkerStarts {
-		t.Fatalf("starting launchd workers=%d want %d", got, maxConcurrentWorkerStarts)
+	now := time.Now()
+	if got := startableWorkerIDs(workers, now,
+		maxConcurrentWorkerStarts-startingWorkers(roots, workers)); !slices.Equal(got, []string{"0000000000000000", "0000000000000001"}) {
+		t.Fatalf("first reconcile startable workers=%v", got)
 	}
-	workers["9999999999999999"] = &workerProcess{id: "9999999999999999", launchd: true}
-	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{RepositoryID: "9999999999999999", State: "running"}); err != nil {
+	workers["0000000000000000"].cmd = &exec.Cmd{}
+	workers["0000000000000001"].cmd = &exec.Cmd{}
+	if got := startingWorkers(roots, workers); got != maxConcurrentWorkerStarts {
+		t.Fatalf("starting direct workers=%d want %d", got, maxConcurrentWorkerStarts)
+	}
+	if got := startableWorkerIDs(workers, now,
+		maxConcurrentWorkerStarts-startingWorkers(roots, workers)); len(got) != 0 {
+		t.Fatalf("second reconcile exceeded admission limit: %v", got)
+	}
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: "0000000000000000", State: "running",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := startingLaunchdWorkers(roots, workers); got != maxConcurrentWorkerStarts {
-		t.Fatalf("running worker consumed admission slot: got %d", got)
+	if got := startableWorkerIDs(workers, now,
+		maxConcurrentWorkerStarts-startingWorkers(roots, workers)); !slices.Equal(got, []string{"0000000000000002"}) {
+		t.Fatalf("third reconcile did not reuse one ready slot: %v", got)
+	}
+	workers["0000000000000002"].launchd = true
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: "0000000000000002", State: "starting",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := startingWorkers(roots, workers); got != maxConcurrentWorkerStarts {
+		t.Fatalf("mixed direct and launchd starts=%d want %d", got, maxConcurrentWorkerStarts)
 	}
 }
 
