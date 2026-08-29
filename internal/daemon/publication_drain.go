@@ -388,6 +388,7 @@ func configureIntentSalvage(
 	stage string,
 	targetSeqs []int64,
 ) {
+	cfg.targetEventSeqs = append([]int64(nil), targetSeqs...)
 	circuit := health.Snapshot()
 	useLocalUnlock := stage == publicationFallbackLocalUnlock
 	if circuit.State == IntentPlannerCircuitOpen {
@@ -398,7 +399,6 @@ func configureIntentSalvage(
 		return
 	}
 	cfg.semanticSalvage = true
-	cfg.salvageTargetSeqs = append([]int64(nil), targetSeqs...)
 }
 
 // publicationDrainAtomicFallbackWindow returns the smallest complete hard

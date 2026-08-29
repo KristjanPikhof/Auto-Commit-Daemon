@@ -183,7 +183,7 @@ func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
 	configureIntentSalvage(&cfg, health,
 		publicationFallbackLocalUnlock, []int64{1, 2})
 	if cfg.atomicFallback || !cfg.semanticSalvage ||
-		!reflect.DeepEqual(cfg.salvageTargetSeqs, []int64{1, 2}) {
+		!reflect.DeepEqual(cfg.targetEventSeqs, []int64{1, 2}) {
 		t.Fatalf("half-open config=%+v, want semantic replan", cfg)
 	}
 }
@@ -319,6 +319,84 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 	}
 }
 
+func TestPublicationDrainSemanticExcludesCandidateBeyondFrozenTarget(
+	t *testing.T,
+) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	captureOnePendingFile(t, ctx, f, "target.txt", "target\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("target pending=%+v err=%v", pending, err)
+	}
+	target := pending[0]
+	captureOnePendingFile(t, ctx, f, "later.txt", "later\n")
+	pending, err = state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("all pending=%+v err=%v", pending, err)
+	}
+	later := pending[1]
+
+	const mixedCandidateID = "candidate-spanning-frozen-target"
+	if err := state.SaveIntentCandidate(ctx, f.db, state.IntentCandidate{
+		ID: mixedCandidateID, BranchRef: f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		Status:           state.IntentCandidateReady,
+		Purpose:          "candidate includes a later edit",
+		Readiness:        state.IntentReadinessReady,
+		Events: []state.IntentCandidateEvent{
+			{EventSeq: target.Seq, EventRole: "code"},
+			{EventSeq: later.Seq, EventRole: "code"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	planner := &recoveringPublicationDrainPlanner{}
+	drain := state.PublicationDrain{
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		Phase: state.PublicationDrainSemantic, TargetEventCount: 1,
+		EventSeqs: []int64{target.Seq},
+	}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetFast,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+		IntentRepairEnabled: true, PublicationDrain: &drain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Published != 1 || planner.calls != 1 {
+		t.Fatalf("summary=%+v planner_calls=%d, want one target publication",
+			sum, planner.calls)
+	}
+	if len(planner.requests) != 1 {
+		t.Fatalf("planner requests=%d, want one", len(planner.requests))
+	}
+	for _, candidate := range planner.requests[0].Candidates {
+		if candidate.CandidateID == mixedCandidateID {
+			t.Fatalf("planner reused candidate beyond frozen target: %+v", candidate)
+		}
+	}
+	remaining, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(remaining) != 1 || remaining[0].Seq != later.Seq {
+		t.Fatalf("remaining=%+v err=%v, want only later event %d",
+			remaining, err, later.Seq)
+	}
+	if oid, err := gitpkg.LsTreeBlobOID(
+		ctx, f.dir, "HEAD", "target.txt"); err != nil || oid == "" {
+		t.Fatalf("target at HEAD=%q err=%v", oid, err)
+	}
+	if oid, err := gitpkg.LsTreeBlobOID(
+		ctx, f.dir, "HEAD", "later.txt"); err != nil || oid != "" {
+		t.Fatalf("later at HEAD=%q err=%v, want absent", oid, err)
+	}
+}
+
 func TestPublicationDrainLocalUnlockRetiresOnlyOverlappingCandidates(t *testing.T) {
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 2, 2)
@@ -355,7 +433,8 @@ type forbiddenPublicationDrainPlanner struct {
 }
 
 type recoveringPublicationDrainPlanner struct {
-	calls int
+	calls    int
+	requests []ai.IntentPlanRequestV2
 }
 
 func (*recoveringPublicationDrainPlanner) Name() string {
@@ -375,6 +454,7 @@ func (p *recoveringPublicationDrainPlanner) PlanIntentV2(
 	req ai.IntentPlanRequestV2,
 ) (ai.IntentPlanV2, error) {
 	p.calls++
+	p.requests = append(p.requests, req)
 	selected := make([]int64, 0, len(req.OfferedCaptures))
 	for _, capture := range req.OfferedCaptures {
 		selected = append(selected, capture.Seq)

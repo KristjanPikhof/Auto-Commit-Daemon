@@ -481,6 +481,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if err != nil {
 		return sum, err
 	}
+	if opts.PublicationDrain != nil && intentCfg.enabled {
+		intentCfg.targetEventSeqs = append(
+			[]int64(nil), opts.PublicationDrain.EventSeqs...)
+	}
 	if opts.PublicationDrain != nil && intentCfg.enabled &&
 		opts.PublicationDrain.Phase == state.PublicationDrainEventFallback {
 		configureIntentSalvage(&intentCfg, opts.IntentHealth,
@@ -1111,8 +1115,10 @@ type intentReplayConfig struct {
 	// semanticSalvage offers only the remaining forward target to the configured
 	// provider. A local evidence partition becomes a request for one explicit
 	// unlock pass instead of publishing under a misleading semantic label.
-	semanticSalvage   bool
-	salvageTargetSeqs []int64
+	semanticSalvage bool
+	// targetEventSeqs bounds durable candidate reuse to the exact capture set
+	// owned by an active publication drain or forward-recovery marker.
+	targetEventSeqs []int64
 	// pathQuiescence is the per-path silence window read from
 	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
 	// disables the gate; any positive value defers offering pending

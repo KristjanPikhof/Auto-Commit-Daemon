@@ -120,7 +120,7 @@ func replayIntentCandidateBatch(
 		VerificationMode:    opts.IntentVerificationMode,
 		Verify:              opts.IntentCandidateVerify,
 		Now:                 time.Now().UTC(),
-		TargetEventSeqs:     cfg.salvageTargetSeqs,
+		TargetEventSeqs:     cfg.targetEventSeqs,
 		RejectLocalFallback: cfg.semanticSalvage,
 	})
 	var semanticFallbackErr *IntentSemanticFallbackRequiredError

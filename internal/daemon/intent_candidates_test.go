@@ -2215,6 +2215,62 @@ func TestIntentCandidateEngineReplansRepairablePrivateSuffix(t *testing.T) {
 	}
 }
 
+func TestIntentCandidateTargetKeepsPublishedContextAndRejectsLaterPending(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	published := appendIntentCandidateCapture(
+		t, db, "internal/target.go", "create", "", "first")
+	target := appendIntentCandidateCapture(
+		t, db, "internal/target.go", "modify", "first", "second")
+	later := appendIntentCandidateCapture(
+		t, db, "internal/later.go", "create", "", "later")
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',published_ts=100,commit_oid='soft-commit'
+WHERE seq=?`, published.Event.Seq); err != nil {
+		t.Fatal(err)
+	}
+	saveSoftPublishedIntentCandidate(
+		t, db, "soft-target", published, "soft-commit", 100)
+	saveWaitingIntentCandidate(t, db, "later-pending", 110, later)
+
+	planner := &repairReplanIntentCandidatePlannerStub{}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{target}, Planner: planner,
+		RetryLimit: 1, RetryLimitSet: true, Preset: config.PresetBalanced,
+		VerificationMode: "structural", Now: time.Unix(120, 0),
+		TargetEventSeqs: []int64{target.Event.Seq},
+		Materialize: func(
+			_ context.Context,
+			captures []IntentCandidateCapture,
+		) error {
+			if got := intentCandidateCaptureSeqs(captures); !reflect.DeepEqual(
+				got, []int64{published.Event.Seq, target.Event.Seq}) {
+				return fmt.Errorf("materialized target repair=%v", got)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(result.VisibleCandidateIDs, []string{"soft-target"}) {
+		t.Fatalf("visible candidates=%v, want only published context",
+			result.VisibleCandidateIDs)
+	}
+	if planner.calls != 2 || len(result.Decisions) != 1 ||
+		!result.Decisions[0].Publishable ||
+		result.Decisions[0].Candidate.ID != "soft-target" ||
+		!reflect.DeepEqual(
+			intentCandidateEventSeqs(result.Decisions[0].Candidate.Events),
+			[]int64{published.Event.Seq, target.Event.Seq}) {
+		t.Fatalf("target repair calls=%d result=%+v", planner.calls, result)
+	}
+}
+
 func TestIntentCandidateEngineFallbackContinuesPersistedDependent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
