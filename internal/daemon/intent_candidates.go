@@ -482,28 +482,6 @@ func EvaluateIntentCandidates(
 		}
 		if decision.VerificationDeferred {
 			result.VerificationDeferred = true
-			candidateIDs := []string{assignment.CandidateID}
-			if continuation, ok := continuationByTarget[assignment.CandidateID]; ok {
-				candidateIDs = append(candidateIDs, continuation.SourceIDs...)
-			}
-			seenCandidateIDs := make(map[string]struct{}, len(candidateIDs))
-			for _, candidateID := range candidateIDs {
-				if _, seen := seenCandidateIDs[candidateID]; seen {
-					continue
-				}
-				seenCandidateIDs[candidateID] = struct{}{}
-				if _, exists := existingByID[candidateID]; !exists {
-					continue
-				}
-				if _, deferErr := state.MarkIntentCandidateVerificationPending(
-					ctx, db, candidateID, input.BranchRef,
-					input.BranchGeneration,
-					intentVerificationResourceWaitReason,
-					nowSeconds,
-				); deferErr != nil {
-					return result, deferErr
-				}
-			}
 			result.Decisions = append(result.Decisions, decision)
 			continue
 		}

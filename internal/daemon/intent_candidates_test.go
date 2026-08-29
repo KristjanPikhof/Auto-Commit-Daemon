@@ -3609,10 +3609,11 @@ func TestIntentCandidateEngineRetriesResourceLimitedVerificationWithoutReplan(
 	}
 	pending, ok, err := state.IntentCandidateByID(ctx, db, candidateID)
 	if err != nil || !ok || !pending.VerificationStatus.Valid ||
-		pending.VerificationStatus.String != "pending" ||
-		pending.AtomicityStatus.String != "pending" ||
-		pending.VerificationOutput != "" {
-		t.Fatalf("pending candidate=(%+v,%t,%v)", pending, ok, err)
+		pending.VerificationStatus.String != "needs_attention" ||
+		pending.AtomicityStatus.String != "failed" ||
+		pending.VerificationOutput != "No space left on device" {
+		t.Fatalf("resource wait rewrote semantic candidate=(%+v,%t,%v)",
+			pending, ok, err)
 	}
 
 	passed, err := EvaluateIntentCandidates(ctx, db, input)
