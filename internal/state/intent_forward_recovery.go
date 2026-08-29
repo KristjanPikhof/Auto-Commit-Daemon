@@ -519,10 +519,10 @@ UPDATE intent_candidate_events
 				BranchRef:        sql.NullString{String: branchRef, Valid: true},
 				BranchGeneration: sql.NullInt64{Int64: branchGeneration, Valid: true},
 				ActionTaken: sql.NullString{
-					String: "retired_failed_candidate_for_checkpoint_recovery", Valid: true,
+					String: "retired_checkpoint_candidate_for_recovery", Valid: true,
 				},
 				UserMessage: sql.NullString{
-					String: "ACD released the failed commit groups and will replan their complete protected checkpoints.",
+					String: "ACD released incomplete or failed commit groups and will replan their complete protected checkpoints.",
 					Valid:  true,
 				},
 				ConfigRevisionID: candidate.revision,

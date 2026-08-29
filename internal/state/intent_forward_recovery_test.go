@@ -246,7 +246,7 @@ UPDATE intent_candidates SET status=? WHERE id=?`,
 				if err != nil || len(decisions) != 1 ||
 					decisions[0].Kind != DecisionKindIntentForwardRecovery ||
 					decisions[0].ActionTaken.String !=
-						"retired_failed_candidate_for_checkpoint_recovery" {
+						"retired_checkpoint_candidate_for_recovery" {
 					t.Fatalf("event %d decisions=%+v err=%v", seq, decisions, err)
 				}
 			}
