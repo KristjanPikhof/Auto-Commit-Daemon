@@ -13,8 +13,10 @@ import (
 
 const intentForwardRecoveryMetaKey = "intent.v2.forward_recovery"
 
+const failedIntentCheckpointRecoveryReason = "verification_failed_checkpoint_replan"
+
 // IntentForwardRecovery is the durable forward-only salvage state for a
-// candidate whose published history can no longer be repaired safely.
+// candidate that must be replanned without changing captured work.
 type IntentForwardRecovery struct {
 	BranchRef        string  `json:"branch_ref"`
 	BranchGeneration int64   `json:"branch_generation"`
@@ -24,6 +26,338 @@ type IntentForwardRecovery struct {
 	TargetEventSeqs  []int64 `json:"target_event_seqs,omitempty"`
 	UnlockCount      int     `json:"unlock_count,omitempty"`
 	LastProgressTS   float64 `json:"last_progress_ts,omitempty"`
+}
+
+// StartFailedIntentCheckpointRecovery atomically releases the failed
+// candidate holding one pending capture and freezes its complete checkpoint
+// for a bounded semantic replan. It deliberately refuses to infer a target
+// across checkpoints or while another Git/state transition is active.
+func StartFailedIntentCheckpointRecovery(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	branchGeneration int64,
+	heldEventSeq int64,
+) (IntentForwardRecovery, bool, error) {
+	var recovery IntentForwardRecovery
+	if d == nil || strings.TrimSpace(branchRef) == "" ||
+		branchGeneration < 0 || heldEventSeq <= 0 {
+		return recovery, false, errors.New(
+			"state: StartFailedIntentCheckpointRecovery: invalid input")
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return recovery, false, fmt.Errorf(
+			"state: begin failed intent checkpoint recovery: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var markerRaw string
+	err = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta WHERE key=?`,
+		intentForwardRecoveryMetaKey).Scan(&markerRaw)
+	if err == nil {
+		if err := json.Unmarshal([]byte(markerRaw), &recovery); err != nil {
+			return IntentForwardRecovery{}, false, fmt.Errorf(
+				"state: parse existing intent forward recovery: %w", err)
+		}
+		if recovery.Stage == "" {
+			recovery.Stage = "semantic_replan"
+		}
+		if recovery.BranchRef == branchRef &&
+			recovery.BranchGeneration == branchGeneration &&
+			containsEventSeq(recovery.TargetEventSeqs, heldEventSeq) {
+			return recovery, false, nil
+		}
+		return IntentForwardRecovery{}, false, errors.New(
+			"state: conflicting intent forward recovery is active")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return recovery, false, fmt.Errorf(
+			"state: inspect existing intent forward recovery: %w", err)
+	}
+
+	type candidateRecord struct {
+		id           string
+		status       string
+		verification sql.NullString
+		published    sql.NullString
+		deadline     sql.NullFloat64
+		revision     sql.NullInt64
+		profile      sql.NullString
+	}
+	var candidate candidateRecord
+	err = tx.QueryRowContext(ctx, `
+SELECT candidate.id,candidate.status,candidate.verification_status,
+       candidate.published_commit_oid,candidate.soft_publication_deadline,
+       candidate.config_revision_id,candidate.config_profile
+FROM intent_candidate_events membership
+JOIN intent_candidates candidate ON candidate.id=membership.candidate_id
+WHERE membership.event_seq=? AND membership.membership_state='active'
+  AND candidate.branch_ref=? AND candidate.branch_generation=?`,
+		heldEventSeq, branchRef, branchGeneration).Scan(
+		&candidate.id, &candidate.status, &candidate.verification,
+		&candidate.published, &candidate.deadline, &candidate.revision,
+		&candidate.profile)
+	if errors.Is(err, sql.ErrNoRows) {
+		return recovery, false, nil
+	}
+	if err != nil {
+		return recovery, false, fmt.Errorf(
+			"state: load held intent candidate: %w", err)
+	}
+	if (candidate.status != IntentCandidateWaiting &&
+		candidate.status != IntentCandidateBlocked) ||
+		!candidate.verification.Valid ||
+		candidate.verification.String != "failed" ||
+		candidate.published.Valid || candidate.deadline.Valid {
+		return recovery, false, nil
+	}
+
+	type candidateMember struct {
+		seq  int64
+		path string
+	}
+	var members []candidateMember
+	checkpointID := ""
+	memberRows, err := tx.QueryContext(ctx, `
+SELECT membership.event_seq,event.path,event.state,event.branch_ref,
+       event.branch_generation,checkpoint_event.checkpoint_id
+FROM intent_candidate_events membership
+JOIN capture_events event ON event.seq=membership.event_seq
+LEFT JOIN checkpoint_events checkpoint_event
+  ON checkpoint_event.event_seq=membership.event_seq
+WHERE membership.candidate_id=? AND membership.membership_state='active'
+ORDER BY membership.ord,membership.event_seq`, candidate.id)
+	if err != nil {
+		return recovery, false, fmt.Errorf(
+			"state: load failed intent candidate members: %w", err)
+	}
+	for memberRows.Next() {
+		var member candidateMember
+		var eventState, eventBranchRef string
+		var eventGeneration int64
+		var memberCheckpoint sql.NullString
+		if err := memberRows.Scan(
+			&member.seq, &member.path, &eventState, &eventBranchRef,
+			&eventGeneration, &memberCheckpoint); err != nil {
+			_ = memberRows.Close()
+			return recovery, false, fmt.Errorf(
+				"state: scan failed intent candidate member: %w", err)
+		}
+		if eventState != EventStatePending || eventBranchRef != branchRef ||
+			eventGeneration != branchGeneration || !memberCheckpoint.Valid ||
+			strings.TrimSpace(memberCheckpoint.String) == "" {
+			_ = memberRows.Close()
+			return recovery, false, nil
+		}
+		if checkpointID == "" {
+			checkpointID = memberCheckpoint.String
+		} else if checkpointID != memberCheckpoint.String {
+			_ = memberRows.Close()
+			return recovery, false, nil
+		}
+		members = append(members, member)
+	}
+	if err := memberRows.Err(); err != nil {
+		_ = memberRows.Close()
+		return recovery, false, fmt.Errorf(
+			"state: iterate failed intent candidate members: %w", err)
+	}
+	if err := memberRows.Close(); err != nil {
+		return recovery, false, fmt.Errorf(
+			"state: close failed intent candidate members: %w", err)
+	}
+	if len(members) == 0 || checkpointID == "" {
+		return recovery, false, nil
+	}
+
+	targetRows, err := tx.QueryContext(ctx, `
+SELECT checkpoint_event.event_seq,event.state,event.branch_ref,
+       event.branch_generation,checkpoint.phase
+FROM checkpoint_events checkpoint_event
+JOIN checkpoints checkpoint ON checkpoint.id=checkpoint_event.checkpoint_id
+JOIN capture_events event ON event.seq=checkpoint_event.event_seq
+WHERE checkpoint_event.checkpoint_id=?
+ORDER BY checkpoint_event.ord`, checkpointID)
+	if err != nil {
+		return recovery, false, fmt.Errorf(
+			"state: load failed intent checkpoint target: %w", err)
+	}
+	for targetRows.Next() {
+		var seq, eventGeneration int64
+		var eventState, eventBranchRef, checkpointPhase string
+		if err := targetRows.Scan(
+			&seq, &eventState, &eventBranchRef, &eventGeneration,
+			&checkpointPhase); err != nil {
+			_ = targetRows.Close()
+			return recovery, false, fmt.Errorf(
+				"state: scan failed intent checkpoint target: %w", err)
+		}
+		if checkpointPhase != CheckpointCompleted ||
+			eventState != EventStatePending || eventBranchRef != branchRef ||
+			eventGeneration != branchGeneration {
+			_ = targetRows.Close()
+			return recovery, false, nil
+		}
+		recovery.TargetEventSeqs = append(recovery.TargetEventSeqs, seq)
+		if len(recovery.TargetEventSeqs) > IntentCandidateMaxCaptures {
+			_ = targetRows.Close()
+			return IntentForwardRecovery{}, false, nil
+		}
+	}
+	if err := targetRows.Err(); err != nil {
+		_ = targetRows.Close()
+		return IntentForwardRecovery{}, false, fmt.Errorf(
+			"state: iterate failed intent checkpoint target: %w", err)
+	}
+	if err := targetRows.Close(); err != nil {
+		return IntentForwardRecovery{}, false, fmt.Errorf(
+			"state: close failed intent checkpoint target: %w", err)
+	}
+	if len(recovery.TargetEventSeqs) == 0 ||
+		!containsEventSeq(recovery.TargetEventSeqs, heldEventSeq) {
+		return IntentForwardRecovery{}, false, nil
+	}
+
+	var activePublication, activeRepair, activeDrain int
+	if err := tx.QueryRowContext(ctx, `
+SELECT
+  EXISTS(
+    SELECT 1 FROM self_publications
+    WHERE branch_ref=? AND branch_generation=?
+      AND phase IN ('prepared','git_applied')
+  ),
+  EXISTS(
+    SELECT 1 FROM intent_repairs
+    WHERE branch_ref=? AND branch_generation=?
+      AND status IN ('prepared','git_applied')
+  ),
+  EXISTS(
+    SELECT 1 FROM publication_drains
+    WHERE branch_ref=? AND branch_generation=?
+      AND phase NOT IN ('completed','needs_action')
+  )`,
+		branchRef, branchGeneration,
+		branchRef, branchGeneration,
+		branchRef, branchGeneration).Scan(
+		&activePublication, &activeRepair, &activeDrain); err != nil {
+		return IntentForwardRecovery{}, false, fmt.Errorf(
+			"state: inspect failed intent recovery ownership: %w", err)
+	}
+	switch {
+	case activePublication != 0:
+		return IntentForwardRecovery{}, false, errors.New(
+			"state: failed intent checkpoint recovery requires self-publication recovery")
+	case activeRepair != 0:
+		return IntentForwardRecovery{}, false, errors.New(
+			"state: failed intent checkpoint recovery requires intent repair recovery")
+	case activeDrain != 0:
+		return IntentForwardRecovery{}, false, errors.New(
+			"state: failed intent checkpoint recovery requires publication drain recovery")
+	}
+
+	now := nowSeconds()
+	result, err := tx.ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='superseded',readiness='wait',soft_publication_deadline=NULL,
+    updated_ts=?
+WHERE id=? AND branch_ref=? AND branch_generation=?
+  AND status IN ('waiting','blocked')
+  AND verification_status='failed'
+  AND published_commit_oid IS NULL
+  AND soft_publication_deadline IS NULL`,
+		now, candidate.id, branchRef, branchGeneration)
+	if err != nil {
+		return IntentForwardRecovery{}, false, fmt.Errorf(
+			"state: retire failed intent checkpoint candidate: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return IntentForwardRecovery{}, false, err
+	}
+	if changed != 1 {
+		return IntentForwardRecovery{}, false, nil
+	}
+	result, err = tx.ExecContext(ctx, `
+UPDATE intent_candidate_events
+SET membership_state='superseded'
+WHERE candidate_id=? AND membership_state='active'`, candidate.id)
+	if err != nil {
+		return IntentForwardRecovery{}, false, fmt.Errorf(
+			"state: release failed intent checkpoint membership: %w", err)
+	}
+	released, err := result.RowsAffected()
+	if err != nil {
+		return IntentForwardRecovery{}, false, err
+	}
+	if released != int64(len(members)) {
+		return IntentForwardRecovery{}, false, errors.New(
+			"state: failed intent checkpoint membership changed")
+	}
+
+	recovery.BranchRef = branchRef
+	recovery.BranchGeneration = branchGeneration
+	recovery.CandidateID = candidate.id
+	recovery.Reason = failedIntentCheckpointRecoveryReason
+	recovery.Stage = "semantic_replan"
+	recovery.LastProgressTS = now
+	for _, member := range members {
+		if _, err := appendDecision(ctx, tx, DecisionRecord{
+			DecisionTS:       now,
+			Kind:             DecisionKindIntentForwardRecovery,
+			Path:             sql.NullString{String: member.path, Valid: member.path != ""},
+			Reason:           sql.NullString{String: recovery.Reason, Valid: true},
+			EventSeq:         sql.NullInt64{Int64: member.seq, Valid: true},
+			BranchRef:        sql.NullString{String: branchRef, Valid: true},
+			BranchGeneration: sql.NullInt64{Int64: branchGeneration, Valid: true},
+			ActionTaken: sql.NullString{
+				String: "retired_failed_candidate_for_checkpoint_recovery", Valid: true,
+			},
+			UserMessage: sql.NullString{
+				String: "ACD released the failed commit group and will replan the complete protected checkpoint.",
+				Valid:  true,
+			},
+			ConfigRevisionID: candidate.revision,
+			ConfigProfile:    candidate.profile,
+		}); err != nil {
+			return IntentForwardRecovery{}, false, err
+		}
+	}
+	markerRawBytes, err := json.Marshal(recovery)
+	if err != nil {
+		return IntentForwardRecovery{}, false, err
+	}
+	result, err = tx.ExecContext(ctx, `
+INSERT INTO daemon_meta(key,value,updated_ts)
+VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`,
+		intentForwardRecoveryMetaKey, string(markerRawBytes), now)
+	if err != nil {
+		return IntentForwardRecovery{}, false, fmt.Errorf(
+			"state: persist failed intent checkpoint recovery: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return IntentForwardRecovery{}, false, err
+	}
+	if inserted != 1 {
+		return IntentForwardRecovery{}, false, errors.New(
+			"state: intent forward recovery marker changed")
+	}
+	if err := tx.Commit(); err != nil {
+		return IntentForwardRecovery{}, false, fmt.Errorf(
+			"state: commit failed intent checkpoint recovery: %w", err)
+	}
+	return recovery, true, nil
+}
+
+func containsEventSeq(seqs []int64, target int64) bool {
+	for _, seq := range seqs {
+		if seq == target {
+			return true
+		}
+	}
+	return false
 }
 
 // ForwardRecoverIntentCandidate retires one blocking candidate without
@@ -266,6 +600,142 @@ func IntentForwardRecoveryForPair(
 		recovery.Stage = "semantic_replan"
 	}
 	return recovery, true, nil
+}
+
+// CompleteResolvedIntentForwardRecovery clears a loaded recovery marker only
+// after its frozen target is still exact and every member is durably resolved.
+// It makes a crash after the last publication but before ordinary marker
+// completion restart-safe without guessing from an empty pending queue.
+func CompleteResolvedIntentForwardRecovery(
+	ctx context.Context,
+	d *DB,
+	recovery IntentForwardRecovery,
+) (bool, error) {
+	if d == nil || strings.TrimSpace(recovery.BranchRef) == "" ||
+		recovery.BranchGeneration < 0 ||
+		strings.TrimSpace(recovery.CandidateID) == "" ||
+		strings.TrimSpace(recovery.Reason) == "" ||
+		len(recovery.TargetEventSeqs) == 0 ||
+		len(recovery.TargetEventSeqs) > IntentCandidateMaxCaptures {
+		return false, errors.New(
+			"state: CompleteResolvedIntentForwardRecovery: invalid input")
+	}
+	seen := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
+	for _, seq := range recovery.TargetEventSeqs {
+		if seq <= 0 {
+			return false, errors.New(
+				"state: CompleteResolvedIntentForwardRecovery: invalid target")
+		}
+		if _, duplicate := seen[seq]; duplicate {
+			return false, errors.New(
+				"state: CompleteResolvedIntentForwardRecovery: duplicate target")
+		}
+		seen[seq] = struct{}{}
+	}
+
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf(
+			"state: begin resolved intent forward recovery: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var markerRaw string
+	err = tx.QueryRowContext(ctx, `
+SELECT value FROM daemon_meta WHERE key=?`,
+		intentForwardRecoveryMetaKey).Scan(&markerRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"state: load resolved intent forward recovery: %w", err)
+	}
+	var current IntentForwardRecovery
+	if err := json.Unmarshal([]byte(markerRaw), &current); err != nil {
+		return false, fmt.Errorf(
+			"state: parse resolved intent forward recovery: %w", err)
+	}
+	if current.Stage == "" {
+		current.Stage = "semantic_replan"
+	}
+	if current.BranchRef != recovery.BranchRef ||
+		current.BranchGeneration != recovery.BranchGeneration ||
+		current.CandidateID != recovery.CandidateID ||
+		current.Reason != recovery.Reason ||
+		!sameEventSeqs(current.TargetEventSeqs, recovery.TargetEventSeqs) {
+		return false, errors.New(
+			"state: intent forward recovery marker changed")
+	}
+
+	placeholders := strings.TrimSuffix(
+		strings.Repeat("?,", len(current.TargetEventSeqs)), ",")
+	args := make([]any, 0, len(current.TargetEventSeqs)+2)
+	for _, seq := range current.TargetEventSeqs {
+		args = append(args, seq)
+	}
+	args = append(args, current.BranchRef, current.BranchGeneration)
+	var existing, resolved int
+	if err := tx.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN state IN ('published','recovered')
+                         THEN 1 ELSE 0 END),0)
+FROM capture_events
+WHERE seq IN (`+placeholders+`)
+  AND branch_ref=? AND branch_generation=?`, args...).Scan(
+		&existing, &resolved); err != nil {
+		return false, fmt.Errorf(
+			"state: prove resolved intent forward recovery target: %w", err)
+	}
+	if existing != len(current.TargetEventSeqs) || resolved != existing {
+		return false, nil
+	}
+
+	result, err := tx.ExecContext(ctx,
+		`DELETE FROM daemon_meta WHERE key=?`, intentForwardRecoveryMetaKey)
+	if err != nil {
+		return false, fmt.Errorf(
+			"state: clear resolved intent forward recovery: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if changed != 1 {
+		return false, errors.New(
+			"state: intent forward recovery marker changed")
+	}
+	now := nowSeconds()
+	for key, value := range map[string]string{
+		"intent.v2.last_fallback_mode":   current.Stage,
+		"intent.v2.last_fallback_size":   strconv.Itoa(len(current.TargetEventSeqs)),
+		"intent.v2.last_fallback_reason": current.Reason,
+	} {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_ts=excluded.updated_ts`,
+			key, value, now); err != nil {
+			return false, fmt.Errorf(
+				"state: record resolved intent forward recovery: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf(
+			"state: commit resolved intent forward recovery: %w", err)
+	}
+	return true, nil
+}
+
+func sameEventSeqs(left, right []int64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // AdvanceIntentForwardRecovery changes the restart-safe salvage subphase

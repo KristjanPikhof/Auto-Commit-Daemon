@@ -184,6 +184,9 @@ func CanRuntimeMigrate(from, to int) bool {
 			// additive planner-window observability columns.
 		case 22:
 			// v23 only adds bounded resolved-plan JSON to planner attempt state.
+		case 23:
+			// v24 adds immutable membership for new Intent repairs and marks
+			// historical repairs as legacy without inventing members.
 		default:
 			return false
 		}

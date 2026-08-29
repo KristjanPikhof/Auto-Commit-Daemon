@@ -76,7 +76,9 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // operation/checkpoint ledger and correlates new self-publication rows with
 // it. v21 adds publication_drains without backfilling historical checkpoints.
 // v22 adds durable adaptive planner attempts and additive window summaries.
-// v23 preserves the bounded resolved plan for restart-safe reuse.
+// v23 preserves the bounded resolved plan for restart-safe reuse. v24 adds
+// immutable Intent repair membership and zero-member seals for historical
+// repairs without inventing historical membership.
 // New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
@@ -88,8 +90,9 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // and adding idempotent statements to schemaDDL is sufficient for pure-DDL
 // migrations (such as v2→v3). v6 uses an explicit table rebuild for only
 // pre-v6 databases whose decision_records table still has the old event_seq
-// foreign key. v7, v8, v11, v12, and v13 are pure DDL migrations through schemaDDL.
-// v15, v16, v17, and v18 are additive and deliberately have no data backfill:
+// foreign key. v7, v8, v11, v12, and v13 are pure DDL migrations through
+// schemaDDL. v15, v16, v17, and v18 are additive and deliberately have no
+// data backfill:
 // existing intent repositories are cut over by runtime configuration
 // orchestration, not by mutating their capture ledger during schema bootstrap.
 // Migrate is wired now so future phases requiring separate data backfill have
@@ -241,6 +244,18 @@ END;`); err != nil {
 		if err := addColumnIfMissing(ctx, tx, "intent_plan_runs",
 			"resolved_plan_json", "TEXT"); err != nil {
 			return err
+		}
+	}
+	if cur < 24 {
+		if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO intent_repair_member_seals(
+    repair_id, membership_mode, member_count
+)
+SELECT repair.id, 'legacy', COUNT(member.event_seq)
+FROM intent_repairs repair
+LEFT JOIN intent_repair_members member ON member.repair_id=repair.id
+GROUP BY repair.id`); err != nil {
+			return fmt.Errorf("state: seal legacy intent repair membership: %w", err)
 		}
 	}
 	return nil

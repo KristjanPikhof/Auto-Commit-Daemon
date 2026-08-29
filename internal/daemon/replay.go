@@ -310,6 +310,10 @@ type ReplaySummary struct {
 	// succeeded in this pass. Multi-group Intent publication overwrites it
 	// group-by-group, so it always names the completed chain tip.
 	SelfPublicationTargetOID string
+	// InternalTransitionTargetOID is the final branch tip proved by any
+	// completed ACD mutation journal in this pass. It includes ordinary
+	// self-publications and non-ancestral Intent repair rewrites.
+	InternalTransitionTargetOID string
 	// PlannerFailure carries the sanitized provider or validation failure that
 	// led to a safe local plan. Durable drains retain it when they escalate.
 	PlannerFailure string
@@ -343,7 +347,9 @@ func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
 		return
 	}
 	switch {
-	case sum.Published > 0 || sum.RecaptureRequired || sum.SelfPublicationTargetOID != "":
+	case sum.Published > 0 || sum.RecaptureRequired ||
+		sum.InternalTransitionTargetOID != "" ||
+		sum.SelfPublicationTargetOID != "":
 		sum.Disposition = ReplayDispositionProgress
 	case sum.Conflicts > 0 || sum.Failed > 0:
 		sum.Disposition = ReplayDispositionNeedsAttention
@@ -475,6 +481,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	if err != nil {
 		return sum, err
 	}
+	if opts.PublicationDrain != nil && intentCfg.enabled {
+		intentCfg.targetEventSeqs = append(
+			[]int64(nil), opts.PublicationDrain.EventSeqs...)
+	}
 	if opts.PublicationDrain != nil && intentCfg.enabled &&
 		opts.PublicationDrain.Phase == state.PublicationDrainEventFallback {
 		configureIntentSalvage(&intentCfg, opts.IntentHealth,
@@ -548,7 +558,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		loadPending = state.PublishableEvents
 	}
 	loadLimit := queryLimit
-	if opts.PublicationDrain != nil {
+	if opts.PublicationDrain != nil ||
+		(forwardRecoveryActive && len(forwardRecovery.TargetEventSeqs) > 0) {
+		// Frozen recovery targets are already bounded by the durable candidate
+		// cap. Load the full pending ledger before selecting that exact set so
+		// unrelated earlier checkpoints cannot hide one of its members behind
+		// the ordinary look-ahead limit.
 		loadLimit = 0
 	}
 	pending, err := loadPending(ctx, db, loadLimit)
@@ -575,6 +590,20 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 	}
 	if len(pending) == 0 {
+		if forwardRecoveryActive && len(forwardRecovery.TargetEventSeqs) > 0 {
+			completed, completeErr := state.CompleteResolvedIntentForwardRecovery(
+				ctx, db, forwardRecovery)
+			if completeErr != nil {
+				return sum, completeErr
+			}
+			if completed {
+				slog.Default().Info("intent forward recovery completed after restart",
+					"candidate_id", forwardRecovery.CandidateID,
+					"mode", forwardRecovery.Stage,
+					"resolved_events", len(forwardRecovery.TargetEventSeqs),
+					"reason", forwardRecovery.Reason)
+			}
+		}
 		return sum, nil
 	}
 
@@ -635,7 +664,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// silently replay — the resulting commit would chain off a stale
 		// parent and diverge from the operator's intent. Block
 		// terminally so operators can spot the mismatch and reconcile.
-		if reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, activeCtx); err != nil {
+		if reason, err := checkEventGeneration(ctx, repoRoot, db, parent, ev, activeCtx); err != nil {
 			return sum, err
 		} else if reason != "" {
 			errorClass := replayErrorValidation
@@ -1000,6 +1029,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		activeCtx.BaseHead = commitOID
 		sum.BaseHead = commitOID
 		sum.SelfPublicationTargetOID = commitOID
+		sum.InternalTransitionTargetOID = commitOID
 		sum.Published++
 		traceReplay(opts.Trace, repoRoot, activeCtx, ev, "replay.commit", state.EventStatePublished, "event published", map[string]any{
 			"commit": commitOID,
@@ -1064,6 +1094,17 @@ func replayPendingBatchLimit(opts ReplayOpts, cfg intentReplayConfig) int {
 	if !cfg.enabled {
 		return opts.Limit
 	}
+	if cfg.candidateMode {
+		// Candidate planning still offers at most cfg.window fresh captures, but
+		// it must be able to see past a maximally sized held candidate. Keep one
+		// full fresh window beyond the durable candidate cap so a companion at
+		// position 257 cannot be starved by the stalled prefix.
+		limit := state.IntentCandidateMaxCaptures + cfg.window
+		if cfg.minPending > limit {
+			limit = cfg.minPending
+		}
+		return limit
+	}
 	limit := cfg.window
 	if cfg.minPending > limit {
 		limit = cfg.minPending
@@ -1104,8 +1145,10 @@ type intentReplayConfig struct {
 	// semanticSalvage offers only the remaining forward target to the configured
 	// provider. A local evidence partition becomes a request for one explicit
 	// unlock pass instead of publishing under a misleading semantic label.
-	semanticSalvage   bool
-	salvageTargetSeqs []int64
+	semanticSalvage bool
+	// targetEventSeqs bounds durable candidate reuse to the exact capture set
+	// owned by an active publication drain or forward-recovery marker.
+	targetEventSeqs []int64
 	// pathQuiescence is the per-path silence window read from
 	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
 	// disables the gate; any positive value defers offering pending
@@ -1573,7 +1616,7 @@ func rejectInvalidIntentWindowEvents(
 	sum ReplaySummary,
 ) (ReplaySummary, bool, error) {
 	for _, ev := range events {
-		reason, err := checkEventGeneration(ctx, repoRoot, parent, ev, activeCtx)
+		reason, err := checkEventGeneration(ctx, repoRoot, db, parent, ev, activeCtx)
 		if err != nil {
 			return sum, false, err
 		}
@@ -1603,10 +1646,22 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	if len(pending) == 0 {
 		return nil, false, "", nil
 	}
+	if cfg.semanticSalvage && len(cfg.targetEventSeqs) > 0 {
+		// Recovery owns an immutable, pre-proved target. Re-evaluate its bounded
+		// slice together instead of letting old per-event defer counters reduce
+		// the pass to the same forced singleton that previously stalled it.
+		n := cfg.window
+		if n > len(pending) {
+			n = len(pending)
+		}
+		return pending[:n], false, "", nil
+	}
 	var (
-		forcedEvent state.CaptureEvent
-		forcedState state.PlannerState
-		forcedOK    bool
+		forcedEvent  state.CaptureEvent
+		forcedState  state.PlannerState
+		forcedOK     bool
+		blockedPaths = make(map[string]struct{})
+		overdue      = make(map[int64]bool, len(pending))
 	)
 	for _, ev := range pending {
 		ps, ok, err := state.PlannerStateForEvent(ctx, db, ev.Seq)
@@ -1616,6 +1671,7 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		if !ok || ps.DeferCount < cfg.deferLimit {
 			continue
 		}
+		overdue[ev.Seq] = true
 		if !forcedOK ||
 			ps.LastPlannedTS < forcedState.LastPlannedTS ||
 			(ps.LastPlannedTS == forcedState.LastPlannedTS && ev.Seq < forcedEvent.Seq) {
@@ -1623,8 +1679,34 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 			forcedState = ps
 			forcedOK = true
 		}
+		addCaptureEventPaths(blockedPaths, ev)
 	}
 	if forcedOK {
+		freshWindow := make([]state.CaptureEvent, 0, cfg.window)
+		for _, ev := range pending {
+			if overdue[ev.Seq] || captureEventTouchesAnyPath(ev, blockedPaths) {
+				continue
+			}
+			freshWindow = append(freshWindow, ev)
+			if len(freshWindow) == cfg.window {
+				break
+			}
+		}
+		if len(freshWindow) > 0 {
+			held, err := forcedCaptureHeldByIntentCandidate(
+				ctx, db, forcedEvent)
+			if err != nil {
+				return nil, false, "", err
+			}
+			// A repeatedly deferred candidate must not monopolize the planner
+			// while later captures that may complete it have never been
+			// evaluated. Offer a bounded, non-contiguous window of fresh paths
+			// first. Same-path successors remain behind the overdue event because
+			// their before-state depends on applying that event first.
+			if held {
+				return freshWindow, false, "", nil
+			}
+		}
 		if hasEarlierPotentialPathDependency(pending, forcedEvent) {
 			n := cfg.window
 			if n > len(pending) {
@@ -1657,6 +1739,36 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		n = boundaryCaptureLimit
 	}
 	return pending[:n], false, "", nil
+}
+
+func captureEventTouchesAnyPath(
+	event state.CaptureEvent,
+	paths map[string]struct{},
+) bool {
+	for path := range captureEventPathSet(event) {
+		if _, ok := paths[path]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func addCaptureEventPaths(paths map[string]struct{}, event state.CaptureEvent) {
+	for path := range captureEventPathSet(event) {
+		paths[path] = struct{}{}
+	}
+}
+
+func forcedCaptureHeldByIntentCandidate(
+	ctx context.Context,
+	db *state.DB,
+	event state.CaptureEvent,
+) (bool, error) {
+	if event.BranchRef == "" || event.BranchGeneration < 0 {
+		return false, nil
+	}
+	return state.IntentEventHeldByCandidate(
+		ctx, db, event.BranchRef, event.BranchGeneration, event.Seq)
 }
 
 func intentActivityBoundaryCaptureLimit(
@@ -3098,7 +3210,7 @@ func publishIntentSelection(
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
-		if reason, err := checkEventGeneration(ctx, repoRoot, sourceHead, ev, activeCtx); err != nil {
+		if reason, err := checkEventGeneration(ctx, repoRoot, db, sourceHead, ev, activeCtx); err != nil {
 			return sum, err
 		} else if reason != "" {
 			errorClass := replayErrorValidation
@@ -3385,6 +3497,7 @@ func publishIntentSelection(
 	sum.Published += publishedCount
 	sum.BaseHead = commitOID
 	sum.SelfPublicationTargetOID = commitOID
+	sum.InternalTransitionTargetOID = commitOID
 	traceReplay(opts.Trace, repoRoot, activeCtx, firstEvent, "replay.commit", state.EventStatePublished, "intent group published", map[string]any{
 		"commit": commitOID,
 		"parent": oldOID,
@@ -4930,7 +5043,14 @@ func traceError(decision, reason string) string {
 // per published commit). When parent or ev.BaseHead is empty we skip the
 // ancestry probe — orphan repos and the very-first commit have no history
 // to compare against.
-func checkEventGeneration(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, cctx CaptureContext) (string, error) {
+func checkEventGeneration(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	parent string,
+	ev state.CaptureEvent,
+	cctx CaptureContext,
+) (string, error) {
 	if cctx.BranchRef != "" && ev.BranchRef != "" && ev.BranchRef != cctx.BranchRef {
 		return fmt.Sprintf(
 			"branch ref mismatch: event captured on %s but daemon is on %s",
@@ -4951,21 +5071,45 @@ func checkEventGeneration(ctx context.Context, repoRoot, parent string, ev state
 	if ev.BaseHead == parent {
 		return "", nil
 	}
-	ok, err := git.IsAncestor(ctx, repoRoot, ev.BaseHead, parent)
-	if err != nil {
+	ok, ancestryErr := git.IsAncestor(ctx, repoRoot, ev.BaseHead, parent)
+	if ancestryErr == nil && ok {
+		return "", nil
+	}
+	canonicalBase, mapped, mappingErr := state.CanonicalCompletedIntentRepairCommit(
+		ctx, db, ev.BranchRef, ev.BranchGeneration, ev.BaseHead)
+	if mappingErr != nil {
+		return "", fmt.Errorf(
+			"daemon: prove repaired event base %s: %w", ev.BaseHead, mappingErr)
+	}
+	if mapped {
+		if canonicalBase == parent {
+			return "", nil
+		}
+		canonicalOK, canonicalErr := git.IsAncestor(
+			ctx, repoRoot, canonicalBase, parent)
+		if canonicalErr == nil && canonicalOK {
+			return "", nil
+		}
+		if canonicalErr != nil {
+			return fmt.Sprintf(
+				"ancestry probe failed for repaired base %s (original %s): %v",
+				canonicalBase, ev.BaseHead, canonicalErr), nil
+		}
+		return fmt.Sprintf(
+			"repaired event base %s (original %s) is not an ancestor of replay head %s",
+			canonicalBase, ev.BaseHead, parent), nil
+	}
+	if ancestryErr != nil {
 		// merge-base failed — most often because ev.BaseHead is no
 		// longer in the object database (gc'd reset). Treat as a
 		// terminal block so the operator notices.
 		return fmt.Sprintf(
 			"ancestry probe failed for base %s: %v (branch likely rewritten since capture)",
-			ev.BaseHead, err), nil
+			ev.BaseHead, ancestryErr), nil
 	}
-	if !ok {
-		return fmt.Sprintf(
-			"event base %s is not an ancestor of replay head %s (branch was reset/rebased since capture)",
-			ev.BaseHead, parent), nil
-	}
-	return "", nil
+	return fmt.Sprintf(
+		"event base %s is not an ancestor of replay head %s (branch was reset/rebased since capture)",
+		ev.BaseHead, parent), nil
 }
 
 // errReplay is sentinel for fatal replay errors that should halt the pass.

@@ -618,6 +618,29 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 	if n, err := ConsumeIntentActivityBoundaries(ctx, d, 1, 10); err != nil || n != 1 {
 		t.Fatalf("consume boundaries=(%d,%v)", n, err)
 	}
+	for _, candidate := range []IntentCandidate{
+		{
+			ID: "candidate-a", BranchRef: "refs/heads/main",
+			BranchGeneration: 9, Status: IntentCandidateReady,
+			Readiness: IntentReadinessReady,
+			Events:    []IntentCandidateEvent{{EventSeq: first, EventRole: "code"}},
+		},
+		{
+			ID: "candidate-b", BranchRef: "refs/heads/main",
+			BranchGeneration: 9, Status: IntentCandidateReady,
+			Readiness: IntentReadinessReady,
+			Events:    []IntentCandidateEvent{{EventSeq: second, EventRole: "test"}},
+		},
+	} {
+		if err := SaveIntentCandidate(ctx, d, candidate); err != nil {
+			t.Fatalf("SaveIntentCandidate %s: %v", candidate.ID, err)
+		}
+	}
+	members, err := SnapshotIntentRepairMembers(ctx, d, "repair-1",
+		"refs/heads/main", 9, []string{"candidate-a", "candidate-b"})
+	if err != nil {
+		t.Fatalf("SnapshotIntentRepairMembers: %v", err)
+	}
 
 	repair := IntentRepair{
 		ID: "repair-1", BranchRef: "refs/heads/main", BranchGeneration: 9,
@@ -627,6 +650,7 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 			{OldOID: "head-1", CandidateID: sql.NullString{String: "candidate-a", Valid: true}},
 			{OldOID: "head-2", CandidateID: sql.NullString{String: "candidate-b", Valid: true}},
 		},
+		Members: members,
 	}
 	if err := SaveIntentRepair(ctx, d, repair); err != nil {
 		t.Fatalf("SaveIntentRepair: %v", err)
@@ -637,8 +661,8 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 		OldHead:   sql.NullString{String: "head-2", Valid: true},
 		NewHead:   sql.NullString{String: "new-2", Valid: true},
 		Commits: []IntentRepairCommit{
-			{OldOID: "head-1", NewOID: sql.NullString{String: "new-1", Valid: true}},
-			{OldOID: "head-2", NewOID: sql.NullString{String: "new-2", Valid: true}},
+			{OldOID: "head-1", CandidateID: sql.NullString{String: "candidate-a", Valid: true}, NewOID: sql.NullString{String: "new-1", Valid: true}},
+			{OldOID: "head-2", CandidateID: sql.NullString{String: "candidate-b", Valid: true}, NewOID: sql.NullString{String: "new-2", Valid: true}},
 		},
 	})
 	if err != nil || !applied {
@@ -654,6 +678,158 @@ func TestIntentV2DependenciesBoundariesAndRepairRoundTrip(t *testing.T) {
 	if err != nil || !ok || gotRepair.Status != IntentRepairCompleted ||
 		len(gotRepair.Commits) != 2 || gotRepair.Commits[1].NewOID.String != "new-2" {
 		t.Fatalf("repair=%+v ok=%v err=%v", gotRepair, ok, err)
+	}
+}
+
+func TestIntentRepairMembershipSnapshotRoundTripAndImmutability(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	published, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 12,
+		BaseHead: "base", Operation: "create", Path: "published.go",
+		Fidelity: "full", State: EventStatePublished,
+		CommitOID: sql.NullString{String: "old-commit", Valid: true},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := appendIntentV2Event(t, d, "refs/heads/main", 12, "pending.go")
+	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		ID: "repair-member-candidate", BranchRef: "refs/heads/main",
+		BranchGeneration: 12, Status: IntentCandidateReady,
+		Readiness: IntentReadinessReady,
+		Events: []IntentCandidateEvent{
+			{EventSeq: published, EventRole: "code"},
+			{EventSeq: pending, EventRole: "test"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	members, err := SnapshotIntentRepairMembers(
+		ctx, d, "repair-members", "refs/heads/main", 12,
+		[]string{"repair-member-candidate"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 2 || members[0].EventSeq != published ||
+		members[0].PriorState != EventStatePublished ||
+		members[1].EventSeq != pending ||
+		members[1].PriorState != EventStatePending {
+		t.Fatalf("members=%+v", members)
+	}
+	repair := IntentRepair{
+		ID: "repair-members", BranchRef: "refs/heads/main",
+		BranchGeneration: 12, ExpectedHead: "old-commit",
+		PlanDigest: testIntentRepairPlanDigest,
+		Commits: []IntentRepairCommit{{
+			CandidateID: sql.NullString{
+				String: "repair-member-candidate", Valid: true,
+			},
+			OldOID: "old-commit",
+		}},
+		Members: members,
+	}
+	if err := SaveIntentRepair(ctx, d, repair); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok, err := IntentRepairByID(ctx, d, repair.ID)
+	if err != nil || !ok || len(stored.Members) != 2 ||
+		stored.Members[1] != members[1] {
+		t.Fatalf("stored=%+v ok=%v err=%v", stored, ok, err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `
+UPDATE intent_repair_members SET prior_state='published'
+WHERE repair_id=? AND ord=1`, repair.ID); err == nil ||
+		!strings.Contains(err.Error(), "membership is immutable") {
+		t.Fatalf("mutable repair membership error=%v", err)
+	}
+	applied, err := TransitionIntentRepair(ctx, d, repair.ID,
+		IntentRepairTransition{
+			ExpectedStatus: IntentRepairPrepared,
+			Status:         IntentRepairGitApplied,
+			Commits: []IntentRepairCommit{{
+				CandidateID: sql.NullString{
+					String: "repair-member-candidate", Valid: true,
+				},
+				OldOID: "old-commit",
+				NewOID: sql.NullString{String: "new-commit", Valid: true},
+			}},
+		})
+	if err != nil || !applied {
+		t.Fatalf("git-applied transition=(%v,%v)", applied, err)
+	}
+	recoverable, err := RecoverableIntentRepairs(ctx, d, 10)
+	if err != nil || len(recoverable) != 1 ||
+		len(recoverable[0].Members) != len(members) {
+		t.Fatalf("recoverable=%+v err=%v", recoverable, err)
+	}
+	if _, err := d.SQL().ExecContext(ctx, `
+INSERT INTO intent_repair_members(
+    repair_id,ord,candidate_id,event_seq,prior_state
+	) VALUES (?,2,'repair-member-candidate',999,'pending')`, repair.ID); err == nil ||
+		!strings.Contains(err.Error(), "membership is not open") {
+		t.Fatalf("late repair membership error=%v", err)
+	}
+	if _, err := d.SQL().ExecContext(ctx,
+		`DELETE FROM intent_repair_members WHERE repair_id=? AND ord=0`,
+		repair.ID); err == nil ||
+		!strings.Contains(err.Error(), "membership is immutable") {
+		t.Fatalf("deleted repair membership error=%v", err)
+	}
+}
+
+func TestSaveIntentRepairRejectsMembershipDrift(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	published, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 13,
+		BaseHead: "base", Operation: "create", Path: "before.go",
+		Fidelity: "full", State: EventStatePublished,
+		CommitOID: sql.NullString{String: "old-commit", Valid: true},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := IntentCandidate{
+		ID: "drifting-repair-candidate", BranchRef: "refs/heads/main",
+		BranchGeneration: 13, Status: IntentCandidateReady,
+		Readiness: IntentReadinessReady,
+		Events:    []IntentCandidateEvent{{EventSeq: published, EventRole: "code"}},
+	}
+	if err := SaveIntentCandidate(ctx, d, candidate); err != nil {
+		t.Fatal(err)
+	}
+	members, err := SnapshotIntentRepairMembers(
+		ctx, d, "repair-drift", candidate.BranchRef,
+		candidate.BranchGeneration, []string{candidate.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	late := appendIntentV2Event(t, d, candidate.BranchRef,
+		candidate.BranchGeneration, "after.go")
+	candidate.Events = append(candidate.Events,
+		IntentCandidateEvent{EventSeq: late, EventRole: "test"})
+	if err := SaveIntentCandidate(ctx, d, candidate); err != nil {
+		t.Fatal(err)
+	}
+	err = SaveIntentRepair(ctx, d, IntentRepair{
+		ID: "repair-drift", BranchRef: candidate.BranchRef,
+		BranchGeneration: candidate.BranchGeneration,
+		ExpectedHead:     "old-commit",
+		PlanDigest:       testIntentRepairPlanDigest,
+		Commits: []IntentRepairCommit{{
+			CandidateID: sql.NullString{String: candidate.ID, Valid: true},
+			OldOID:      "old-commit",
+		}},
+		Members: members,
+	})
+	if err == nil || !strings.Contains(err.Error(), "incomplete membership") {
+		t.Fatalf("membership drift error=%v", err)
+	}
+	if _, ok, loadErr := IntentRepairByID(ctx, d, "repair-drift"); loadErr != nil || ok {
+		t.Fatalf("rolled-back repair ok=%v err=%v", ok, loadErr)
 	}
 }
 
@@ -746,6 +922,88 @@ PRAGMA user_version=14;`); err != nil {
 		if err := reopened.SQL().QueryRow(`
 SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table %s count=%d err=%v", table, count, err)
+		}
+	}
+}
+
+func TestIntentRepairMembershipV24RuntimeMigrationSealsLegacyRows(t *testing.T) {
+	t.Parallel()
+	d, dbPath := openTestDB(t)
+	ctx := context.Background()
+	legacyStatuses := map[string]string{
+		"legacy-prepared":    IntentRepairPrepared,
+		"legacy-git-applied": IntentRepairGitApplied,
+		"legacy-completed":   IntentRepairCompleted,
+	}
+	for id, status := range legacyStatuses {
+		if err := SaveIntentRepair(ctx, d, IntentRepair{
+			ID: id, BranchRef: "refs/heads/main", BranchGeneration: 3,
+			ExpectedHead: "old-" + id, PlanDigest: testIntentRepairPlanDigest,
+			MembershipMode: IntentRepairMembershipNone,
+			Commits: []IntentRepairCommit{{
+				CandidateID: sql.NullString{String: "candidate-" + id, Valid: true},
+				OldOID:      "old-" + id,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if status == IntentRepairPrepared {
+			continue
+		}
+		completedTS := any(nil)
+		if status == IntentRepairCompleted {
+			completedTS = 3.0
+		}
+		if _, err := d.SQL().ExecContext(ctx, `
+UPDATE intent_repairs
+SET status=?, backup_ref=?, old_head=expected_head, new_head=?,
+    git_applied_ts=2, completed_ts=?
+WHERE id=?;
+UPDATE intent_repair_commits SET new_oid=? WHERE repair_id=?`,
+			status, "refs/acd/intent-repair/legacy/"+id+"/backup",
+			"new-"+id, completedTS, id, "new-"+id, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open(driverName, buildDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+DROP TABLE intent_repair_members;
+DROP TABLE intent_repair_member_seals;
+PRAGMA user_version=23;`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := OpenRuntime(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	for id, status := range legacyStatuses {
+		stored, ok, err := IntentRepairByID(ctx, migrated, id)
+		if err != nil || !ok || stored.Status != status ||
+			stored.MembershipMode != IntentRepairMembershipLegacy ||
+			len(stored.Members) != 0 {
+			t.Fatalf("legacy repair %s=%+v ok=%v err=%v",
+				id, stored, ok, err)
+		}
+	}
+	for _, table := range []string{
+		"intent_repair_members", "intent_repair_member_seals",
+	} {
+		var found string
+		if err := migrated.SQL().QueryRowContext(ctx, `
+SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).
+			Scan(&found); err != nil || found != table {
+			t.Fatalf("migrated table %s=%q err=%v", table, found, err)
 		}
 	}
 }
@@ -984,6 +1242,8 @@ func TestIntentV2SchemaHasNoRawDiffColumns(t *testing.T) {
 		"idx_intent_activity_boundaries_consumed_epoch",
 		"idx_intent_repairs_pair_status_updated",
 		"idx_intent_repair_commits_old_oid",
+		"idx_intent_repair_members_candidate",
+		"idx_intent_repair_members_event",
 	} {
 		var found string
 		if err := d.SQL().QueryRow(`
@@ -1014,5 +1274,7 @@ func intentV2TableNames() []string {
 		"intent_activity_boundaries",
 		"intent_repairs",
 		"intent_repair_commits",
+		"intent_repair_members",
+		"intent_repair_member_seals",
 	}
 }

@@ -231,9 +231,10 @@ func ResumePublicationDrainCheckpointing(
 		return fail(err)
 	}
 	var observedHead string
+	var checkpointCreatedTS float64
 	if err := db.ReadSQL().QueryRowContext(ctx,
-		`SELECT observed_head FROM checkpoints WHERE id=?`, drain.CheckpointID).
-		Scan(&observedHead); err != nil {
+		`SELECT observed_head,created_ts FROM checkpoints WHERE id=?`,
+		drain.CheckpointID).Scan(&observedHead, &checkpointCreatedTS); err != nil {
 		return fail(err)
 	}
 	currentHead, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
@@ -242,7 +243,7 @@ func ResumePublicationDrainCheckpointing(
 	if err == nil && currentHeadText != observedHead {
 		var safe bool
 		safe, err = publicationDrainOwnsHeadAdvance(
-			ctx, repoRoot, db, drain, observedHead, currentHeadText)
+			ctx, db, drain, observedHead, currentHeadText, checkpointCreatedTS)
 		if err == nil && !safe {
 			err = fmt.Errorf(
 				publicationDrainHeadChangedPrefix+" observed=%s current=%s",
@@ -307,67 +308,18 @@ func ResumePublicationDrainCheckpointing(
 
 func publicationDrainOwnsHeadAdvance(
 	ctx context.Context,
-	repoRoot string,
 	db *state.DB,
 	drain state.PublicationDrain,
 	observedHead string,
 	currentHead string,
+	checkpointCreatedTS float64,
 ) (bool, error) {
 	if observedHead == "" || currentHead == "" {
 		return false, nil
 	}
-	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
-		"merge-base", "--is-ancestor", observedHead, currentHead); err != nil {
-		return false, nil
-	}
-	output, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
-		"rev-list", "--first-parent", "--reverse", "--max-count=4097",
-		observedHead+".."+currentHead)
-	if err != nil {
-		return false, err
-	}
-	commits := strings.Fields(string(output))
-	if len(commits) == 0 || len(commits) > 4096 {
-		return false, nil
-	}
-	sources := make(map[string]string, len(commits))
-	const batchSize = 400
-	for start := 0; start < len(commits); start += batchSize {
-		end := min(start+batchSize, len(commits))
-		placeholders := make([]string, 0, end-start)
-		args := make([]any, 0, end-start+2)
-		args = append(args, drain.BranchRef, drain.BranchGeneration)
-		for _, commit := range commits[start:end] {
-			placeholders = append(placeholders, "?")
-			args = append(args, commit)
-		}
-		rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT target_commit_oid,source_head FROM self_publications
-WHERE branch_ref=? AND branch_generation=? AND phase='completed'
-  AND target_commit_oid IN (`+strings.Join(placeholders, ",")+`)`, args...)
-		if err != nil {
-			return false, err
-		}
-		for rows.Next() {
-			var target, source string
-			if err := rows.Scan(&target, &source); err != nil {
-				rows.Close()
-				return false, err
-			}
-			sources[target] = source
-		}
-		if err := rows.Close(); err != nil {
-			return false, err
-		}
-	}
-	expectedSource := observedHead
-	for _, commit := range commits {
-		if sources[commit] != expectedSource {
-			return false, nil
-		}
-		expectedSource = commit
-	}
-	return true, nil
+	return state.CompletedBranchTransitionOwnsCheckpointTarget(
+		ctx, db, drain.BranchRef, drain.BranchGeneration,
+		observedHead, currentHead, checkpointCreatedTS, drain.EventSeqs)
 }
 
 // ResumePublicationDrainNormalization retires the stalled semantic pass at a
@@ -436,6 +388,19 @@ func configureIntentSalvage(
 	stage string,
 	targetSeqs []int64,
 ) {
+	cfg.targetEventSeqs = append([]int64(nil), targetSeqs...)
+	// A durable recovery marker already proves and bounds the target. Evaluate
+	// that frozen set as one semantic window when it fits the candidate cap;
+	// otherwise process bounded cap-sized slices. Old planner deferrals must not
+	// collapse recovery back to the same singleton that caused the stall.
+	if targetWindow := len(targetSeqs); targetWindow > cfg.window {
+		if targetWindow > state.IntentCandidateMaxCaptures {
+			targetWindow = state.IntentCandidateMaxCaptures
+		}
+		cfg.window = targetWindow
+	}
+	cfg.bypassBatchWait = true
+	cfg.pathQuiescence = 0
 	circuit := health.Snapshot()
 	useLocalUnlock := stage == publicationFallbackLocalUnlock
 	if circuit.State == IntentPlannerCircuitOpen {
@@ -446,7 +411,6 @@ func configureIntentSalvage(
 		return
 	}
 	cfg.semanticSalvage = true
-	cfg.salvageTargetSeqs = append([]int64(nil), targetSeqs...)
 }
 
 // publicationDrainAtomicFallbackWindow returns the smallest complete hard

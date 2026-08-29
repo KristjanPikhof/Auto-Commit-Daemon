@@ -162,6 +162,19 @@ and checkpoint publication links. Startup recovery proves the same immutable
 facts. Ambiguity remains `needs_attention` and never causes a guessed
 settlement.
 
+Intent history repair follows the same rule. It freezes the exact captures for
+each rebuilt candidate before Git can move, then records the rewrite as an
+ACD-owned branch transition. The running daemon and a restarted worker can
+adopt that transition without treating it as an external rebase. Captures made
+after a publication target was frozen stay pending for the next semantic plan.
+
+An unpublished candidate that repeatedly fails verification cannot hold the
+queue forever. ACD lets later paths reach the planner first. If that still
+makes no progress, it can supersede only the failed candidate and replan the
+single completed checkpoint that contains it. This recovery requires every
+checkpoint capture to remain pending on the same branch generation and refuses
+to run while a publication or repair transaction is active.
+
 Balanced/Quality repair is restricted to a private contiguous ACD-authored
 first-parent suffix at exact `HEAD`; it rejects merges, tags, other refs, Git
 operations, publication pause, staged overlap, and failed gates. Normal

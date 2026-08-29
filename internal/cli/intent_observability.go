@@ -458,6 +458,11 @@ func loadIntentV2Report(ctx context.Context, conn *sql.DB) (intentV2Report, erro
 	if value, ok, _ := metaLookup(ctx, conn, "intent.v2.needs_attention"); ok {
 		report.NeedsAttention = sanitizeObservabilityText(value)
 	}
+	if value, ok, _ := metaLookup(
+		ctx, conn, daemon.MetaKeyBranchTransitionNeedsAttention,
+	); ok && strings.TrimSpace(value) != "" {
+		report.NeedsAttention = sanitizeObservabilityText(value)
+	}
 	if value, ok, _ := metaLookup(ctx, conn,
 		"intent.v2.cutover_required"); ok && parseIntentV2MetaBool(value) {
 		report.NeedsAttention = "Intent v2 cutover is required; run acd config edit"

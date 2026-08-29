@@ -58,6 +58,13 @@ type partialReplanIntentCandidatePlannerStub struct {
 
 func (p *partialReplanIntentCandidatePlannerStub) Name() string { return "intent-v2-partial-test" }
 
+func (p *partialReplanIntentCandidatePlannerStub) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
 func (p *partialReplanIntentCandidatePlannerStub) PlanIntentV2(
 	_ context.Context,
 	req ai.IntentPlanRequestV2,
@@ -795,6 +802,65 @@ func TestIntentCandidateEnginePreservesValidGroupsDuringPartialReplan(t *testing
 		result.ResolutionMode != "partial_replan" || result.PreservedGroupCount != 1 ||
 		len(result.Decisions) != 2 {
 		t.Fatalf("partial replan requests=%+v result=%+v", planner.reqs, result)
+	}
+}
+
+func TestReplayIntentCandidatePartialReplanResetsPreflightScratch(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	seedTrackedFileCommit(t, ctx, f, "source.go", "package source\n\nconst Value = 1\n")
+	seedTrackedFileCommit(t, ctx, f, "source_test.go", "package source\n\nconst Want = 1\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		"source.go":      "package source\n\nconst Value = 2\n",
+		"source_test.go": "package source\n\nconst Want = 2\n",
+	} {
+		if err := os.WriteFile(filepath.Join(f.dir, path), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+
+	planner := &partialReplanIntentCandidatePlannerStub{}
+	retryLimit := 2
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetBalanced,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+		IntentRetryLimit:       &retryLimit,
+		IntentVerificationMode: "structural",
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || planner.calls != 2 {
+		candidates, _ := state.IntentCandidatesForPair(
+			ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, 0)
+		t.Fatalf("summary=%+v planner calls=%d candidates=%+v",
+			sum, planner.calls, candidates)
+	}
+	pending, err = state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending after replay=%+v err=%v", pending, err)
+	}
+	var blocked int
+	if err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_plan_runs
+WHERE progress_state='preflight_blocked'`).Scan(&blocked); err != nil {
+		t.Fatal(err)
+	}
+	if blocked != 0 {
+		t.Fatalf("preflight-blocked plan runs=%d want 0", blocked)
 	}
 }
 
@@ -2212,6 +2278,62 @@ func TestIntentCandidateEngineReplansRepairablePrivateSuffix(t *testing.T) {
 			intentCandidateEventSeqs(result.Decisions[0].Candidate.Events),
 			[]int64{oldCapture.Event.Seq, newCapture.Event.Seq}) {
 		t.Fatalf("repair replan calls=%d result=%+v", planner.calls, result)
+	}
+}
+
+func TestIntentCandidateTargetKeepsPublishedContextAndRejectsLaterPending(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	published := appendIntentCandidateCapture(
+		t, db, "internal/target.go", "create", "", "first")
+	target := appendIntentCandidateCapture(
+		t, db, "internal/target.go", "modify", "first", "second")
+	later := appendIntentCandidateCapture(
+		t, db, "internal/later.go", "create", "", "later")
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',published_ts=100,commit_oid='soft-commit'
+WHERE seq=?`, published.Event.Seq); err != nil {
+		t.Fatal(err)
+	}
+	saveSoftPublishedIntentCandidate(
+		t, db, "soft-target", published, "soft-commit", 100)
+	saveWaitingIntentCandidate(t, db, "later-pending", 110, later)
+
+	planner := &repairReplanIntentCandidatePlannerStub{}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{target}, Planner: planner,
+		RetryLimit: 1, RetryLimitSet: true, Preset: config.PresetBalanced,
+		VerificationMode: "structural", Now: time.Unix(120, 0),
+		TargetEventSeqs: []int64{target.Event.Seq},
+		Materialize: func(
+			_ context.Context,
+			captures []IntentCandidateCapture,
+		) error {
+			if got := intentCandidateCaptureSeqs(captures); !reflect.DeepEqual(
+				got, []int64{published.Event.Seq, target.Event.Seq}) {
+				return fmt.Errorf("materialized target repair=%v", got)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(result.VisibleCandidateIDs, []string{"soft-target"}) {
+		t.Fatalf("visible candidates=%v, want only published context",
+			result.VisibleCandidateIDs)
+	}
+	if planner.calls != 2 || len(result.Decisions) != 1 ||
+		!result.Decisions[0].Publishable ||
+		result.Decisions[0].Candidate.ID != "soft-target" ||
+		!reflect.DeepEqual(
+			intentCandidateEventSeqs(result.Decisions[0].Candidate.Events),
+			[]int64{published.Event.Seq, target.Event.Seq}) {
+		t.Fatalf("target repair calls=%d result=%+v", planner.calls, result)
 	}
 }
 

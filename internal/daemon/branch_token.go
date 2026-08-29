@@ -67,6 +67,10 @@ const (
 	// the token last changed. Operator breadcrumb only — the loop never
 	// reads it back.
 	MetaKeyBranchTokenChangedAt = "branch_token_changed_at"
+	// MetaKeyBranchTransitionNeedsAttention records contradictory durable
+	// evidence for an ACD-authored ref move. It keeps status honest when the
+	// daemon must fail closed instead of retrying an invalid journal forever.
+	MetaKeyBranchTransitionNeedsAttention = "branch.transition.needs_attention"
 	// MetaKeyDetachedHeadPaused is stamped when the daemon sees a detached
 	// HEAD and pauses capture/replay instead of inventing a branch ref.
 	MetaKeyDetachedHeadPaused = "detached_head_paused"
@@ -359,9 +363,10 @@ func SaveBranchPublicationToken(
 	token string,
 ) error {
 	return state.MetaSetMany(ctx, db, map[string]string{
-		MetaKeyBranchGeneration: strconv.FormatInt(generation, 10),
-		MetaKeyBranchHead:       head,
-		MetaKeyBranchToken:      token,
+		MetaKeyBranchGeneration:               strconv.FormatInt(generation, 10),
+		MetaKeyBranchHead:                     head,
+		MetaKeyBranchToken:                    token,
+		MetaKeyBranchTransitionNeedsAttention: "",
 	})
 }
 

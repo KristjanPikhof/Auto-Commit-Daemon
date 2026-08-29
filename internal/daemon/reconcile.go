@@ -119,6 +119,12 @@ func ProveUnpublishedChain(
 	}
 	first := chain[0].Event
 	last := chain[len(chain)-1].Event
+	proofChain, err := canonicalizeRecoveryProofEvents(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, chain)
+	if err != nil {
+		return result, err
+	}
+	baseHead := proofChain[0].Event.BaseHead
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
 		ctx, db, opts.BranchRef, opts.BranchGeneration, first.Seq, last.Seq,
 	)
@@ -129,13 +135,18 @@ func ProveUnpublishedChain(
 	if err != nil {
 		return result, err
 	}
+	recoveryContext, err = canonicalizeRecoveryProofEvents(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, recoveryContext)
+	if err != nil {
+		return result, err
+	}
 	recoveryContext, err = excludeSeedRepresentedPublishedContext(
-		ctx, repoRoot, first.BaseHead, recoveryContext,
+		ctx, repoRoot, baseHead, recoveryContext,
 	)
 	if err != nil {
 		return result, err
 	}
-	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, first.BaseHead, recoveryContext)
+	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, baseHead, recoveryContext)
 	if err != nil {
 		return result, err
 	}
@@ -153,17 +164,19 @@ func ProveUnpublishedChain(
 	}
 	materialization := make([]state.RecoveryChainEvent, 0, len(recoveryContext)+len(chain))
 	materialization = append(materialization, recoveryContext...)
-	materialization = append(materialization, chain...)
+	materialization = append(materialization, proofChain...)
 	if err := validateRecoveryObjects(ctx, repoRoot, materialization); err != nil {
 		return result, err
 	}
-	finalState, err := materializeRecoveryState(ctx, repoRoot, first.BaseHead, recoveryContext, chain)
+	finalState, err := materializeRecoveryState(
+		ctx, repoRoot, baseHead, recoveryContext, proofChain)
 	if err != nil {
 		return result, err
 	}
 	matched := false
 	if live.hasHead && !opts.ArchiveOnly {
-		matched, err = recoveryChainMatchesHEAD(ctx, repoRoot, live.head, chain, finalState)
+		matched, err = recoveryChainMatchesHEAD(
+			ctx, repoRoot, live.head, proofChain, finalState)
 		if err != nil {
 			return result, err
 		}
@@ -216,6 +229,12 @@ func ReconcileUnpublishedChain(
 	}
 	first := chain[0].Event
 	last := chain[len(chain)-1].Event
+	proofChain, err := canonicalizeRecoveryProofEvents(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, chain)
+	if err != nil {
+		return result, err
+	}
+	baseHead := proofChain[0].Event.BaseHead
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
 		ctx, db, opts.BranchRef, opts.BranchGeneration,
 		first.Seq, last.Seq,
@@ -227,13 +246,18 @@ func ReconcileUnpublishedChain(
 	if err != nil {
 		return result, err
 	}
+	recoveryContext, err = canonicalizeRecoveryProofEvents(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, recoveryContext)
+	if err != nil {
+		return result, err
+	}
 	recoveryContext, err = excludeSeedRepresentedPublishedContext(
-		ctx, repoRoot, first.BaseHead, recoveryContext,
+		ctx, repoRoot, baseHead, recoveryContext,
 	)
 	if err != nil {
 		return result, err
 	}
-	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, first.BaseHead, recoveryContext)
+	recoveryContext, err = descendantPublishedContext(ctx, repoRoot, baseHead, recoveryContext)
 	if err != nil {
 		return result, err
 	}
@@ -262,14 +286,14 @@ func ReconcileUnpublishedChain(
 		return result, err
 	}
 
-	baseHead := chain[0].Event.BaseHead
 	materialization := make([]state.RecoveryChainEvent, 0, len(recoveryContext)+len(chain))
 	materialization = append(materialization, recoveryContext...)
-	materialization = append(materialization, chain...)
+	materialization = append(materialization, proofChain...)
 	if err := validateRecoveryObjects(ctx, repoRoot, materialization); err != nil {
 		return result, err
 	}
-	treeOID, finalState, err := materializeRecoveryTree(ctx, repoRoot, gitDir, baseHead, recoveryContext, chain)
+	treeOID, finalState, err := materializeRecoveryTree(
+		ctx, repoRoot, gitDir, baseHead, recoveryContext, proofChain)
 	if err != nil {
 		return result, err
 	}
@@ -281,7 +305,8 @@ func ReconcileUnpublishedChain(
 
 	matched := false
 	if live.hasHead && !opts.ArchiveOnly {
-		matched, err = recoveryChainMatchesHEAD(ctx, repoRoot, live.head, chain, finalState)
+		matched, err = recoveryChainMatchesHEAD(
+			ctx, repoRoot, live.head, proofChain, finalState)
 		if err != nil {
 			return result, err
 		}
@@ -298,7 +323,8 @@ func ReconcileUnpublishedChain(
 
 	if matched {
 		ref := recoveryProofRefName(opts.BranchRef, opts.BranchGeneration, first.Seq, last.Seq, live.head)
-		commitOID, err := ensurePublishedProofRef(ctx, repoRoot, ref, live.head, chain, finalState)
+		commitOID, err := ensurePublishedProofRef(
+			ctx, repoRoot, ref, live.head, proofChain, finalState)
 		if err != nil {
 			return result, err
 		}
@@ -372,16 +398,83 @@ func ReconcileUnpublishedChain(
 		BranchGeneration: opts.BranchGeneration,
 		BaseHead:         live.head,
 	}, first, "replay.chain_reconcile", snapshot.Outcome, trigger, map[string]any{
-		"snapshot_id":  snapshot.ID,
-		"outcome":      snapshot.Outcome,
-		"commit":       snapshot.CommitOID,
-		"recovery_ref": snapshot.RecoveryRef.String,
-		"first_seq":    snapshot.FirstEventSeq,
-		"last_seq":     snapshot.LastEventSeq,
-		"event_count":  snapshot.EventCount,
-		"source_head":  baseHead,
+		"snapshot_id":   snapshot.ID,
+		"outcome":       snapshot.Outcome,
+		"commit":        snapshot.CommitOID,
+		"recovery_ref":  snapshot.RecoveryRef.String,
+		"first_seq":     snapshot.FirstEventSeq,
+		"last_seq":      snapshot.LastEventSeq,
+		"event_count":   snapshot.EventCount,
+		"source_head":   first.BaseHead,
+		"repaired_base": baseHead,
 	})
 	return result, nil
+}
+
+func canonicalRecoveryCommit(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	branchGeneration int64,
+	commitOID string,
+) (string, error) {
+	canonical, mapped, err := state.CanonicalCompletedIntentRepairCommit(
+		ctx, db, branchRef, branchGeneration, commitOID)
+	if err != nil {
+		return "", fmt.Errorf(
+			"daemon: reconcile recovery chain: resolve repaired commit %s: %w",
+			commitOID, err)
+	}
+	if mapped {
+		return canonical, nil
+	}
+	return commitOID, nil
+}
+
+// canonicalizeRecoveryProofEvents projects immutable ledger provenance onto
+// the commit identities produced by completed Intent repairs. Callers use the
+// projection only for Git proof and materialization; the original events stay
+// unchanged for the later SQLite compare-and-swap transition.
+func canonicalizeRecoveryProofEvents(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	branchGeneration int64,
+	events []state.RecoveryChainEvent,
+) ([]state.RecoveryChainEvent, error) {
+	canonicalByOID := make(map[string]string)
+	canonicalize := func(oid string) (string, error) {
+		if canonical, ok := canonicalByOID[oid]; ok {
+			return canonical, nil
+		}
+		canonical, err := canonicalRecoveryCommit(
+			ctx, db, branchRef, branchGeneration, oid)
+		if err != nil {
+			return "", err
+		}
+		canonicalByOID[oid] = canonical
+		return canonical, nil
+	}
+
+	proofEvents := make([]state.RecoveryChainEvent, len(events))
+	copy(proofEvents, events)
+	for i := range proofEvents {
+		baseHead, err := canonicalize(proofEvents[i].Event.BaseHead)
+		if err != nil {
+			return nil, err
+		}
+		proofEvents[i].Event.BaseHead = baseHead
+		if !proofEvents[i].Event.CommitOID.Valid ||
+			proofEvents[i].Event.CommitOID.String == "" {
+			continue
+		}
+		commitOID, err := canonicalize(proofEvents[i].Event.CommitOID.String)
+		if err != nil {
+			return nil, err
+		}
+		proofEvents[i].Event.CommitOID.String = commitOID
+	}
+	return proofEvents, nil
 }
 
 // reconcileActiveBarrierChain uses the existence of any terminal row as its

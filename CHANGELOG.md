@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed
+
+- Repository state schema v24 records the exact captures owned by each new
+  Intent history repair. Existing repair records migrate as legacy evidence
+  without inventing capture membership.
+
+### Fixed
+
+- The daemon now recognizes a completed Intent rewrite as its own branch move,
+  including after a crash or restart. A frozen `commit-all` target cannot pull
+  in later captures, and pending work continues without an `off` and `on`
+  cycle.
+- A repeatedly failed Intent candidate no longer hides later captures that may
+  complete it. ACD first looks ahead for new companion paths, then can retire
+  the unpublished candidate and replan its exact completed checkpoint. Partial
+  planner retries also start from a clean scratch baseline.
+
 ## v2026-08-27
 
 ### Fixed

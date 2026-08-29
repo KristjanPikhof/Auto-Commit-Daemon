@@ -730,6 +730,18 @@ func TestIntentRepairMergesTwoSoftPublishedCandidates(t *testing.T) {
 		result.CommitMap[oldA] != result.CommitMap[oldB] {
 		t.Fatalf("commit map=%+v", result.CommitMap)
 	}
+	repair, ok, err := state.IntentRepairByID(ctx, repo.db, result.ID)
+	if err != nil || !ok || len(repair.Members) != 3 {
+		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+	priorStates := make(map[string]int)
+	for _, member := range repair.Members {
+		priorStates[member.PriorState]++
+	}
+	if priorStates[state.EventStatePublished] != 2 ||
+		priorStates[state.EventStatePending] != 1 {
+		t.Fatalf("repair prior states=%v", priorStates)
+	}
 	lineage, err := state.IntentCandidateLineageForTarget(
 		ctx,
 		repo.db,
@@ -1238,6 +1250,19 @@ func (orderedIntentV2Planner) PlanIntentV2(
 func TestIntentRepairTransactionCompletesAndPreservesDirtyState(t *testing.T) {
 	f := newIntentRepairFixture(t, 2)
 	ctx := context.Background()
+	unrelatedSeq, err := state.AppendCaptureEvent(ctx, f.repo.db,
+		state.CaptureEvent{
+			BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+			BaseHead: f.plan.ExpectedHead, Operation: "create",
+			Path: "unrelated-ledger.txt", Fidelity: "full",
+			State: state.EventStatePublished,
+			CommitOID: sql.NullString{
+				String: f.oldCommits[0], Valid: true,
+			},
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(f.repo.dir, "unrelated.txt"),
 		[]byte("staged but unrelated\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -1268,6 +1293,16 @@ func TestIntentRepairTransactionCompletesAndPreservesDirtyState(t *testing.T) {
 		t.Fatalf("backup=%q err=%v want %s", backup, err, f.plan.ExpectedHead)
 	}
 	assertIntentRepairReconciled(t, f, result.NewHead)
+	var unrelatedOID string
+	if err := f.repo.db.SQL().QueryRowContext(ctx,
+		`SELECT commit_oid FROM capture_events WHERE seq=?`, unrelatedSeq).
+		Scan(&unrelatedOID); err != nil {
+		t.Fatal(err)
+	}
+	if unrelatedOID != f.oldCommits[0] {
+		t.Fatalf("unrelated event oid=%s want unchanged %s",
+			unrelatedOID, f.oldCommits[0])
+	}
 }
 
 func TestIntentRepairVerificationFailureLeavesPreparedRepairFailed(
@@ -1320,12 +1355,14 @@ func TestValidateIntentRepairPlanAllowsNonContiguousPartition(t *testing.T) {
 			{
 				CandidateID: "candidate-a",
 				Replaces:    []string{"old-a1", "old-a2"},
+				EventSeqs:   []int64{1, 3},
 				TreeOID:     "tree-a",
 				Message:     "Complete alpha",
 			},
 			{
 				CandidateID: "candidate-b",
 				Replaces:    []string{"old-b1"},
+				EventSeqs:   []int64{2},
 				TreeOID:     "tree-b",
 				Message:     "Add beta",
 			},
@@ -1359,6 +1396,7 @@ func TestValidateIntentRepairPlanRejectsIncompleteRepartition(t *testing.T) {
 		Candidates: []IntentRepairCandidatePlan{{
 			CandidateID: "candidate-a",
 			Replaces:    []string{"old-a1", "old-a2"},
+			EventSeqs:   []int64{1, 3},
 			TreeOID:     "tree-a",
 			Message:     "Complete alpha",
 		}},
@@ -1367,6 +1405,120 @@ func TestValidateIntentRepairPlanRejectsIncompleteRepartition(t *testing.T) {
 		BranchRef: plan.BranchRef, BranchGeneration: plan.BranchGeneration,
 	})
 	if err == nil || !strings.Contains(err.Error(), "partition the complete old chain") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestIntentRepairNoncontiguousCrashRecoversFrozenMembers(t *testing.T) {
+	f := newNoncontiguousIntentRepairFixture(t)
+	ctx := context.Background()
+	crash := errors.New("simulated crash after non-contiguous Git CAS")
+	intentRepairAfterGitApply = func(IntentRepairResult) error { return crash }
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+
+	applied, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if !errors.Is(err, crash) {
+		t.Fatalf("ApplyIntentRepairTransaction err=%v want crash", err)
+	}
+	if applied.NewHead == "" || applied.NewHead == f.plan.ExpectedHead {
+		t.Fatalf("Git CAS did not land before crash: %+v", applied)
+	}
+	if applied.CommitMap[f.oldA1] == "" ||
+		applied.CommitMap[f.oldA1] != applied.CommitMap[f.oldA2] ||
+		applied.CommitMap[f.oldB1] == "" ||
+		applied.CommitMap[f.oldB1] == applied.CommitMap[f.oldA1] {
+		t.Fatalf("non-contiguous commit map=%+v", applied.CommitMap)
+	}
+	repair, ok, err := state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
+	if err != nil || !ok || repair.Status != state.IntentRepairPrepared ||
+		repair.MembershipMode != state.IntentRepairMembershipFrozen {
+		t.Fatalf("prepared repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+	assertNoncontiguousIntentRepairMembers(t, repair.Members, f)
+
+	intentRepairAfterGitApply = nil
+	recovered, err := RecoverIntentRepairs(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx)
+	if err != nil {
+		t.Fatalf("RecoverIntentRepairs: %v", err)
+	}
+	if len(recovered) != 1 || !recovered[0].Recovered ||
+		recovered[0].Status != state.IntentRepairCompleted ||
+		recovered[0].NewHead != applied.NewHead {
+		t.Fatalf("recovered=%+v", recovered)
+	}
+
+	repair, ok, err = state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
+	if err != nil || !ok || repair.Status != state.IntentRepairCompleted ||
+		repair.MembershipMode != state.IntentRepairMembershipFrozen {
+		t.Fatalf("completed repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+	assertNoncontiguousIntentRepairMembers(t, repair.Members, f)
+
+	wantCommit := map[int64]string{
+		f.seqA1: applied.CommitMap[f.oldA1],
+		f.seqA2: applied.CommitMap[f.oldA2],
+		f.seqB1: applied.CommitMap[f.oldB1],
+	}
+	for seq, wantOID := range wantCommit {
+		var eventState string
+		var commitOID sql.NullString
+		if err := f.repo.db.SQL().QueryRowContext(ctx,
+			`SELECT state, commit_oid FROM capture_events WHERE seq=?`, seq).
+			Scan(&eventState, &commitOID); err != nil {
+			t.Fatal(err)
+		}
+		if eventState != state.EventStatePublished || !commitOID.Valid ||
+			commitOID.String != wantOID {
+			t.Fatalf("event %d state=%s oid=%+v want %s",
+				seq, eventState, commitOID, wantOID)
+		}
+	}
+	for candidateID, wantOID := range map[string]string{
+		"candidate-a": applied.CommitMap[f.oldA1],
+		"candidate-b": applied.CommitMap[f.oldB1],
+	} {
+		candidate, ok, loadErr := state.IntentCandidateByID(
+			ctx, f.repo.db, candidateID)
+		if loadErr != nil || !ok ||
+			candidate.Status != state.IntentCandidatePublished ||
+			!candidate.PublishedCommitOID.Valid ||
+			candidate.PublishedCommitOID.String != wantOID {
+			t.Fatalf("candidate %s=%+v ok=%v err=%v want %s",
+				candidateID, candidate, ok, loadErr, wantOID)
+		}
+	}
+}
+
+func TestValidateIntentRepairPlanRejectsDuplicateCandidateID(t *testing.T) {
+	plan := IntentRepairPlan{
+		BranchRef:        "refs/heads/main",
+		BranchGeneration: 1,
+		ExpectedHead:     "old-b",
+		OldChain:         []string{"old-a", "old-b"},
+		MaxCommits:       2,
+		Candidates: []IntentRepairCandidatePlan{
+			{
+				CandidateID: "candidate-shared",
+				Replaces:    []string{"old-a"},
+				EventSeqs:   []int64{1},
+				TreeOID:     "tree-a",
+				Message:     "Add alpha",
+			},
+			{
+				CandidateID: "candidate-shared",
+				Replaces:    []string{"old-b"},
+				EventSeqs:   []int64{2},
+				TreeOID:     "tree-b",
+				Message:     "Add beta",
+			},
+		},
+	}
+	err := validateIntentRepairPlan(plan, CaptureContext{
+		BranchRef: plan.BranchRef, BranchGeneration: plan.BranchGeneration,
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate candidate id") {
 		t.Fatalf("error=%v", err)
 	}
 }
@@ -1405,6 +1557,167 @@ func TestIntentRepairCrashAfterCASRecoversOnRestart(t *testing.T) {
 	assertIntentRepairReconciled(t, f, applied.NewHead)
 }
 
+func TestIntentRepairRejectsMembershipDriftAfterGitCAS(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	ctx := context.Background()
+	var lateSeq int64
+	intentRepairAfterGitApply = func(IntentRepairResult) error {
+		var err error
+		lateSeq, err = state.AppendCaptureEvent(ctx, f.repo.db,
+			state.CaptureEvent{
+				BranchRef:        f.cctx.BranchRef,
+				BranchGeneration: f.cctx.BranchGeneration,
+				BaseHead:         f.plan.ExpectedHead, Operation: "create",
+				Path: "late.go", Fidelity: "full",
+				State: state.EventStatePending,
+			}, nil)
+		if err != nil {
+			return err
+		}
+		_, err = f.repo.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_candidate_events(
+    candidate_id,ord,event_seq,event_role,membership_state
+) VALUES ('candidate-repair',99,?,'test','active')`, lateSeq)
+		return err
+	}
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+
+	applied, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if err == nil || !strings.Contains(err.Error(),
+		"intent candidate membership is locked by repair") {
+		t.Fatalf("ApplyIntentRepairTransaction result=%+v err=%v", applied, err)
+	}
+	repair, ok, loadErr := state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
+	if loadErr != nil || !ok || repair.Status != state.IntentRepairPrepared ||
+		len(repair.Members) != len(f.eventSeqs) {
+		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, loadErr)
+	}
+	var lateState string
+	if err := f.repo.db.SQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE seq=?`, lateSeq).
+		Scan(&lateState); err != nil {
+		t.Fatal(err)
+	}
+	if lateState != state.EventStatePending {
+		t.Fatalf("late event state=%s want pending", lateState)
+	}
+
+	intentRepairAfterGitApply = nil
+	recovered, recoverErr := RecoverIntentRepairs(ctx, f.repo.dir,
+		f.repo.gitDir, f.repo.db, f.cctx)
+	if recoverErr != nil {
+		t.Fatalf("RecoverIntentRepairs: %v", recoverErr)
+	}
+	if len(recovered) != 1 || !recovered[0].Recovered ||
+		recovered[0].Status != state.IntentRepairCompleted ||
+		recovered[0].NewHead != applied.NewHead {
+		t.Fatalf("recovered=%+v", recovered)
+	}
+	assertIntentRepairReconciled(t, f, applied.NewHead)
+	if err := f.repo.db.SQL().QueryRowContext(ctx,
+		`SELECT state FROM capture_events WHERE seq=?`, lateSeq).
+		Scan(&lateState); err != nil {
+		t.Fatal(err)
+	}
+	if lateState != state.EventStatePending {
+		t.Fatalf("late event state after recovery=%s want pending", lateState)
+	}
+}
+
+func TestIntentRepairRejectsMembershipDriftBeforeGitCAS(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	ctx := context.Background()
+	lateSeq, err := state.AppendCaptureEvent(ctx, f.repo.db,
+		state.CaptureEvent{
+			BranchRef:        f.cctx.BranchRef,
+			BranchGeneration: f.cctx.BranchGeneration,
+			BaseHead:         f.plan.ExpectedHead,
+			Operation:        "create",
+			Path:             "late.go",
+			Fidelity:         "full",
+			State:            state.EventStatePending,
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.repo.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_candidate_events(
+    candidate_id,ord,event_seq,event_role,membership_state
+) VALUES ('candidate-repair',99,?,'test','active')`, lateSeq); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if err == nil || !strings.Contains(err.Error(),
+		"membership changed since materialization") {
+		t.Fatalf("ApplyIntentRepairTransaction error=%v", err)
+	}
+	head, resolveErr := git.RevParse(ctx, f.repo.dir, "HEAD")
+	if resolveErr != nil || head != f.plan.ExpectedHead {
+		t.Fatalf("HEAD=%s err=%v want %s", head, resolveErr,
+			f.plan.ExpectedHead)
+	}
+	if _, ok, loadErr := state.IntentRepairByID(
+		ctx, f.repo.db, f.plan.ID); loadErr != nil || ok {
+		t.Fatalf("repair persisted before membership validation: ok=%v err=%v",
+			ok, loadErr)
+	}
+}
+
+func TestIntentRepairRecoveryIsIdempotentAfterLedgerSettlement(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	ctx := context.Background()
+	crash := errors.New("simulated crash after CAS")
+	intentRepairAfterGitApply = func(IntentRepairResult) error { return crash }
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+	applied, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if !errors.Is(err, crash) {
+		t.Fatalf("ApplyIntentRepairTransaction err=%v want crash", err)
+	}
+	intentRepairAfterGitApply = nil
+	mappings := intentRepairStateCommits(f.plan, applied.CommitMap)
+	ok, err := state.TransitionIntentRepair(ctx, f.repo.db, f.plan.ID,
+		state.IntentRepairTransition{
+			ExpectedStatus: state.IntentRepairPrepared,
+			Status:         state.IntentRepairGitApplied,
+			BackupRef: sql.NullString{
+				String: applied.BackupRef, Valid: true,
+			},
+			OldHead: sql.NullString{String: applied.OldHead, Valid: true},
+			NewHead: sql.NullString{String: applied.NewHead, Valid: true},
+			Commits: mappings,
+		})
+	if err != nil || !ok {
+		t.Fatalf("git-applied transition=(%v,%v)", ok, err)
+	}
+	repair, ok, err := state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
+	if err != nil || !ok {
+		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+	candidateMap := map[string]string{
+		"candidate-repair": mappings[0].NewOID.String,
+	}
+	if err := reconcileIntentRepairLedger(ctx, f.repo.db, f.plan.ID,
+		applied.CommitMap, candidateMap, repair.MembershipMode,
+		repair.Members, f.cctx,
+		applied.NewHead); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := RecoverIntentRepairs(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 1 ||
+		recovered[0].Status != state.IntentRepairCompleted {
+		t.Fatalf("recovered=%+v", recovered)
+	}
+	assertIntentRepairReconciled(t, f, applied.NewHead)
+}
+
 func TestRunRecoversIntentRepairBeforeStartupTransition(t *testing.T) {
 	f := newIntentRepairFixture(t, 1)
 	ctx := context.Background()
@@ -1432,6 +1745,260 @@ func TestRunRecoversIntentRepairBeforeStartupTransition(t *testing.T) {
 	if err != nil || generation != f.cctx.BranchGeneration {
 		t.Fatalf("generation=%d err=%v", generation, err)
 	}
+}
+
+func TestRunStartupSurfacesDurableIntentRepairRecoveryFailure(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	ctx := context.Background()
+	crash := errors.New("simulated crash before daemon restart")
+	intentRepairAfterGitApply = func(IntentRepairResult) error { return crash }
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+
+	applied, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,
+		f.repo.db, f.cctx, f.plan)
+	if !errors.Is(err, crash) {
+		t.Fatalf("ApplyIntentRepairTransaction err=%v want crash", err)
+	}
+	intentRepairAfterGitApply = nil
+	if err := git.UpdateRef(ctx, f.repo.dir, applied.BackupRef,
+		f.repo.head, f.plan.ExpectedHead); err != nil {
+		t.Fatal(err)
+	}
+	shutdown := make(chan struct{})
+	close(shutdown)
+	if err := Run(ctx, Options{
+		RepoPath: f.repo.dir, GitDir: f.repo.gitDir, DB: f.repo.db,
+		MessageFn: DeterministicMessage, ShutdownCh: shutdown,
+		SkipSignals: true, BootGrace: time.Hour,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	attention, ok, err := state.MetaGet(
+		ctx, f.repo.db, MetaKeyBranchTransitionNeedsAttention)
+	if err != nil || !ok ||
+		!strings.HasPrefix(attention, intentRepairRecoveryAttentionPrefix) ||
+		!strings.Contains(attention, "unexpected commit") {
+		t.Fatalf("startup repair attention=(%q,%t,%v)", attention, ok, err)
+	}
+	repair, ok, err := state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
+	if err != nil || !ok || repair.Status != state.IntentRepairPrepared {
+		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+}
+
+func TestRunRecoversIntentRepairAtActiveLoopBoundary(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	registerLiveClient(t, f.repo.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wake := make(chan struct{}, 2)
+	shutdown := make(chan struct{})
+	faulted := make(chan IntentRepairResult, 1)
+	adopted := make(chan CaptureContext, 1)
+	crash := errors.New("simulated active-loop crash after Git CAS")
+	intentRepairAfterGitApply = func(result IntentRepairResult) error {
+		faulted <- result
+		wake <- struct{}{}
+		return crash
+	}
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+
+	replayCalls := 0
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- Run(ctx, Options{
+			RepoPath: f.repo.dir, GitDir: f.repo.gitDir, DB: f.repo.db,
+			MessageFn: DeterministicMessage, Scheduler: fastScheduler(),
+			BootGrace: time.Hour, WakeCh: wake, ShutdownCh: shutdown,
+			SkipSignals: true,
+			replay: func(
+				replayCtx context.Context,
+				_ string,
+				_ *state.DB,
+				cctx CaptureContext,
+				_ ReplayOpts,
+			) (ReplaySummary, error) {
+				replayCalls++
+				if replayCalls != 1 {
+					return ReplaySummary{BaseHead: cctx.BaseHead}, nil
+				}
+				_, err := ApplyIntentRepairTransaction(
+					replayCtx, f.repo.dir, f.repo.gitDir,
+					f.repo.db, cctx, f.plan)
+				return ReplaySummary{BaseHead: cctx.BaseHead}, err
+			},
+			afterSelfPublicationAdoption: func(
+				cctx CaptureContext, _, _, _ string,
+			) {
+				select {
+				case adopted <- cctx:
+				default:
+				}
+			},
+		})
+	}()
+
+	var applied IntentRepairResult
+	select {
+	case applied = <-faulted:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("active replay did not reach the post-CAS fault")
+	}
+	if applied.NewHead == "" || applied.NewHead == f.plan.ExpectedHead {
+		cancel()
+		t.Fatalf("Git CAS did not land before fault: %+v", applied)
+	}
+	intentRepairAfterGitApply = nil
+
+	var adoptedContext CaptureContext
+	select {
+	case adoptedContext = <-adopted:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("active run loop did not recover and adopt the repair")
+	}
+	close(shutdown)
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("Run did not stop")
+	}
+
+	assertIntentRepairReconciled(t, f, applied.NewHead)
+	if adoptedContext.BaseHead != applied.NewHead ||
+		adoptedContext.BranchGeneration != f.cctx.BranchGeneration {
+		t.Fatalf("adopted context=%+v want head=%s generation=%d",
+			adoptedContext, applied.NewHead, f.cctx.BranchGeneration)
+	}
+	if generation, err := LoadBranchGeneration(
+		ctx, f.repo.db); err != nil || generation != f.cctx.BranchGeneration {
+		t.Fatalf("generation=%d err=%v want %d",
+			generation, err, f.cctx.BranchGeneration)
+	}
+}
+
+func TestRunSurfacesDurableActiveIntentRepairRecoveryFailure(t *testing.T) {
+	f := newIntentRepairFixture(t, 1)
+	registerLiveClient(t, f.repo.db)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wake := make(chan struct{}, 2)
+	shutdown := make(chan struct{})
+	faulted := make(chan IntentRepairResult, 1)
+	adopted := make(chan CaptureContext, 1)
+	crash := errors.New("simulated active repair recovery fault")
+	wrongBackup := f.repo.head
+	intentRepairAfterGitApply = func(result IntentRepairResult) error {
+		if err := git.UpdateRef(ctx, f.repo.dir, result.BackupRef,
+			wrongBackup, f.plan.ExpectedHead); err != nil {
+			return err
+		}
+		faulted <- result
+		wake <- struct{}{}
+		return crash
+	}
+	t.Cleanup(func() { intentRepairAfterGitApply = nil })
+
+	replayCalls := 0
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- Run(ctx, Options{
+			RepoPath: f.repo.dir, GitDir: f.repo.gitDir, DB: f.repo.db,
+			MessageFn: DeterministicMessage, Scheduler: fastScheduler(),
+			BootGrace: time.Hour, WakeCh: wake, ShutdownCh: shutdown,
+			SkipSignals: true,
+			replay: func(
+				replayCtx context.Context,
+				_ string,
+				_ *state.DB,
+				cctx CaptureContext,
+				_ ReplayOpts,
+			) (ReplaySummary, error) {
+				replayCalls++
+				if replayCalls != 1 {
+					return ReplaySummary{BaseHead: cctx.BaseHead}, nil
+				}
+				_, err := ApplyIntentRepairTransaction(
+					replayCtx, f.repo.dir, f.repo.gitDir,
+					f.repo.db, cctx, f.plan)
+				return ReplaySummary{BaseHead: cctx.BaseHead}, err
+			},
+			afterSelfPublicationAdoption: func(
+				cctx CaptureContext, _, _, _ string,
+			) {
+				select {
+				case adopted <- cctx:
+				default:
+				}
+			},
+		})
+	}()
+
+	var applied IntentRepairResult
+	select {
+	case applied = <-faulted:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("active replay did not create the contradictory repair")
+	}
+	intentRepairAfterGitApply = nil
+	waitFor(t, 5*time.Second, "durable repair recovery attention", func() bool {
+		value, ok, err := state.MetaGet(
+			ctx, f.repo.db, MetaKeyBranchTransitionNeedsAttention)
+		return err == nil && ok &&
+			strings.HasPrefix(value, intentRepairRecoveryAttentionPrefix) &&
+			strings.Contains(value, "unexpected commit")
+	})
+	attention, _, err := state.MetaGet(
+		ctx, f.repo.db, MetaKeyBranchTransitionNeedsAttention)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordIntentRepairRecoveryAttention(
+		ctx, f.repo.db, errors.New("transient database read")); err != nil {
+		t.Fatal(err)
+	}
+	if unchanged, _, _ := state.MetaGet(
+		ctx, f.repo.db, MetaKeyBranchTransitionNeedsAttention); unchanged != attention {
+		t.Fatalf("transient error replaced durable attention: %q", unchanged)
+	}
+
+	if err := git.UpdateRef(ctx, f.repo.dir, applied.BackupRef,
+		f.plan.ExpectedHead, wrongBackup); err != nil {
+		t.Fatal(err)
+	}
+	wake <- struct{}{}
+	select {
+	case recoveredContext := <-adopted:
+		if recoveredContext.BaseHead != applied.NewHead ||
+			recoveredContext.BranchGeneration != f.cctx.BranchGeneration {
+			t.Fatalf("recovered context=%+v", recoveredContext)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("repair did not recover after durable proof was restored")
+	}
+	waitFor(t, 5*time.Second, "settled repair attention clears", func() bool {
+		value, _, err := state.MetaGet(
+			ctx, f.repo.db, MetaKeyBranchTransitionNeedsAttention)
+		return err == nil && value == ""
+	})
+	close(shutdown)
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("Run did not stop")
+	}
+	assertIntentRepairReconciled(t, f, applied.NewHead)
 }
 
 func TestIntentRepairRecoveryRejectsDifferentReplacementChain(t *testing.T) {
@@ -1543,6 +2110,169 @@ type intentRepairFixture struct {
 	oldCommits []string
 }
 
+type noncontiguousIntentRepairFixture struct {
+	repo                *daemonTestRepo
+	cctx                CaptureContext
+	plan                IntentRepairPlan
+	oldA1, oldB1, oldA2 string
+	seqA1, seqB1, seqA2 int64
+}
+
+func newNoncontiguousIntentRepairFixture(
+	t *testing.T,
+) noncontiguousIntentRepairFixture {
+	t.Helper()
+	ctx := context.Background()
+	repo := cloneDaemonTestRepo(t, daemonRepoTemplate)
+	f := noncontiguousIntentRepairFixture{repo: repo}
+
+	f.oldA1 = mustCommitPath(t, repo.dir, "a.txt", "a1\n", "old alpha part")
+	f.seqA1 = appendPublishedIntentRepairCapture(t, repo, repo.head, f.oldA1,
+		"create", "a.txt", "")
+	f.oldB1 = mustCommitPath(t, repo.dir, "b.txt", "b1\n", "old beta part")
+	f.seqB1 = appendPublishedIntentRepairCapture(t, repo, f.oldA1, f.oldB1,
+		"create", "b.txt", "")
+	beforeA := mustBlobOID(t, repo.dir, f.oldA1, "a.txt")
+	f.oldA2 = mustCommitPath(t, repo.dir, "a.txt", "a2\n", "old alpha finish")
+	f.seqA2 = appendPublishedIntentRepairCapture(t, repo, f.oldB1, f.oldA2,
+		"modify", "a.txt", beforeA)
+
+	for _, candidate := range []state.IntentCandidate{
+		{
+			ID: "candidate-a", BranchRef: "refs/heads/main",
+			BranchGeneration: 1, Status: state.IntentCandidateSoftPublished,
+			Purpose: "complete alpha", Readiness: state.IntentReadinessReady,
+			PublishedCommitOID: sql.NullString{String: f.oldA2, Valid: true},
+			Events: []state.IntentCandidateEvent{
+				{EventSeq: f.seqA1, EventRole: "code"},
+				{EventSeq: f.seqA2, EventRole: "code"},
+			},
+		},
+		{
+			ID: "candidate-b", BranchRef: "refs/heads/main",
+			BranchGeneration: 1, Status: state.IntentCandidateSoftPublished,
+			Purpose: "add beta", Readiness: state.IntentReadinessReady,
+			PublishedCommitOID: sql.NullString{String: f.oldB1, Valid: true},
+			Events: []state.IntentCandidateEvent{
+				{EventSeq: f.seqB1, EventRole: "code"},
+			},
+		},
+	} {
+		if err := state.SaveIntentCandidate(ctx, repo.db, candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	baseEntries, err := git.LsTree(ctx, repo.dir, repo.head, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aTreeEntries := make([]git.MktreeEntry, 0, len(baseEntries)+1)
+	for _, entry := range baseEntries {
+		aTreeEntries = append(aTreeEntries, git.MktreeEntry{
+			Mode: entry.Mode, Type: entry.Type, OID: entry.OID, Path: entry.Path,
+		})
+	}
+	aTreeEntries = append(aTreeEntries, git.MktreeEntry{
+		Mode: git.RegularFileMode, Type: "blob",
+		OID: mustBlobOID(t, repo.dir, f.oldA2, "a.txt"), Path: "a.txt",
+	})
+	aTree, err := git.Mktree(ctx, repo.dir, aTreeEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalTree, err := git.RevParse(ctx, repo.dir, f.oldA2+"^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.cctx = CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: f.oldA2,
+	}
+	if _, err := BootstrapShadow(ctx, repo.dir, repo.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	f.plan = IntentRepairPlan{
+		ID: "repair-noncontiguous", BranchRef: f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		ExpectedHead:     f.oldA2,
+		OldChain:         []string{f.oldA1, f.oldB1, f.oldA2},
+		Paths:            []string{"a.txt", "b.txt"}, MaxCommits: 3,
+		Candidates: []IntentRepairCandidatePlan{
+			{
+				CandidateID: "candidate-a",
+				Replaces:    []string{f.oldA1, f.oldA2},
+				EventSeqs:   []int64{f.seqA1, f.seqA2},
+				TreeOID:     aTree, Message: "Complete alpha",
+			},
+			{
+				CandidateID: "candidate-b", Replaces: []string{f.oldB1},
+				EventSeqs: []int64{f.seqB1}, TreeOID: finalTree,
+				Message: "Add beta",
+			},
+		},
+	}
+	return f
+}
+
+func appendPublishedIntentRepairCapture(
+	t *testing.T,
+	repo *daemonTestRepo,
+	baseHead, commitOID, operation, path, beforeOID string,
+) int64 {
+	t.Helper()
+	afterOID := mustBlobOID(t, repo.dir, commitOID, path)
+	op := state.CaptureOp{
+		Op: operation, Path: path, Fidelity: "full",
+		AfterOID:  sql.NullString{String: afterOID, Valid: true},
+		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+	}
+	if beforeOID != "" {
+		op.BeforeOID = sql.NullString{String: beforeOID, Valid: true}
+		op.BeforeMode = sql.NullString{String: git.RegularFileMode, Valid: true}
+	}
+	seq, err := state.AppendCaptureEvent(context.Background(), repo.db,
+		state.CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			BaseHead: baseHead, Operation: operation, Path: path,
+			Fidelity: "full", State: state.EventStatePublished,
+			CommitOID:   sql.NullString{String: commitOID, Valid: true},
+			PublishedTS: sql.NullFloat64{Float64: float64(time.Now().UnixNano()) / 1e9, Valid: true},
+		}, []state.CaptureOp{op})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+func assertNoncontiguousIntentRepairMembers(
+	t *testing.T,
+	members []state.IntentRepairMember,
+	f noncontiguousIntentRepairFixture,
+) {
+	t.Helper()
+	want := []struct {
+		candidateID string
+		eventSeq    int64
+	}{
+		{candidateID: "candidate-a", eventSeq: f.seqA1},
+		{candidateID: "candidate-a", eventSeq: f.seqA2},
+		{candidateID: "candidate-b", eventSeq: f.seqB1},
+	}
+	if len(members) != len(want) {
+		t.Fatalf("repair members=%+v want %d", members, len(want))
+	}
+	for i, member := range members {
+		if member.Ord != i || member.CandidateID != want[i].candidateID ||
+			member.EventSeq != want[i].eventSeq ||
+			member.PriorState != state.EventStatePublished {
+			t.Fatalf("repair member %d=%+v want candidate=%s event=%d",
+				i, member, want[i].candidateID, want[i].eventSeq)
+		}
+	}
+}
+
 func newIntentRepairFixture(t *testing.T, commitCount int) intentRepairFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -1608,6 +2338,7 @@ func newIntentRepairFixture(t *testing.T, commitCount int) intentRepairFixture {
 		Candidates: []IntentRepairCandidatePlan{{
 			CandidateID: "candidate-repair",
 			Replaces:    append([]string(nil), f.oldCommits...),
+			EventSeqs:   append([]int64(nil), f.eventSeqs...),
 			TreeOID:     tree,
 			Message:     "Combine semantic change\n\n- Keep related files atomic",
 		}},
@@ -1659,6 +2390,15 @@ func assertIntentRepairReconciled(t *testing.T, f intentRepairFixture, newHead s
 	repair, ok, err := state.IntentRepairByID(ctx, f.repo.db, f.plan.ID)
 	if err != nil || !ok || repair.Status != state.IntentRepairCompleted {
 		t.Fatalf("repair=%+v ok=%v err=%v", repair, ok, err)
+	}
+	if len(repair.Members) != len(f.eventSeqs) {
+		t.Fatalf("repair members=%+v want %d", repair.Members, len(f.eventSeqs))
+	}
+	for i, member := range repair.Members {
+		if member.EventSeq != f.eventSeqs[i] ||
+			member.PriorState != state.EventStatePublished {
+			t.Fatalf("repair member %d=%+v", i, member)
+		}
 	}
 	candidate, ok, err := state.IntentCandidateByID(ctx, f.repo.db, "candidate-repair")
 	if err != nil || !ok || candidate.Status != state.IntentCandidatePublished ||

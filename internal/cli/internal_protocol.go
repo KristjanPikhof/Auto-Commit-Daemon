@@ -1334,11 +1334,12 @@ func freezePublicationDrainTarget(
 	defer func() { _ = tx.Rollback() }()
 	var observedHead, observedRef, checkpointWorktreeID, phase string
 	var coverageEpoch int64
+	var checkpointCreatedTS float64
 	if err := tx.QueryRowContext(ctx, `
-SELECT observed_head,observed_ref,worktree_id,coverage_epoch,phase
+SELECT observed_head,observed_ref,worktree_id,coverage_epoch,phase,created_ts
 FROM checkpoints WHERE id=?`, checkpointID).Scan(
 		&observedHead, &observedRef, &checkpointWorktreeID,
-		&coverageEpoch, &phase); err != nil {
+		&coverageEpoch, &phase, &checkpointCreatedTS); err != nil {
 		return publicationDrainTarget{}, fmt.Errorf("load publication checkpoint: %w", err)
 	}
 	if phase != state.CheckpointCompleted || observedRef == "" {
@@ -1429,14 +1430,14 @@ ORDER BY ce.ord`, checkpointID)
 	}
 	if headAfter != observedHead {
 		owned, proofErr := publicationHeadAdvanceOwnedByTarget(
-			ctx, db, observedHead, headAfter, target)
+			ctx, db, observedHead, headAfter, checkpointCreatedTS, target)
 		if proofErr != nil {
 			return publicationDrainTarget{}, fmt.Errorf(
 				"prove publication HEAD advance: %w", proofErr)
 		}
 		if !owned {
 			return publicationDrainTarget{}, fmt.Errorf(
-				"publication checkpoint HEAD changed without a completed ACD publication chain: checkpoint=%s current=%s",
+				"publication checkpoint HEAD changed without a completed ACD transition chain: checkpoint=%s current=%s",
 				observedHead, headAfter)
 		}
 	}
@@ -1455,81 +1456,12 @@ func publicationHeadAdvanceOwnedByTarget(
 	ctx context.Context,
 	db *state.DB,
 	sourceHead, targetHead string,
+	checkpointCreatedTS float64,
 	target publicationDrainTarget,
 ) (bool, error) {
-	unusedEvents := make(map[int64]struct{}, len(target.EventSeqs))
-	for _, seq := range target.EventSeqs {
-		unusedEvents[seq] = struct{}{}
-	}
-	seenHeads := map[string]struct{}{sourceHead: {}}
-	current := sourceHead
-	for step := 0; step < len(target.EventSeqs) && current != targetHead; step++ {
-		rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT id,target_commit_oid FROM self_publications
-WHERE branch_ref=? AND branch_generation=? AND source_head=?
-  AND phase='completed'
-ORDER BY created_ts,id LIMIT 2`, target.BranchRef, target.Generation, current)
-		if err != nil {
-			return false, err
-		}
-		var transitions [][2]string
-		for rows.Next() {
-			var id, nextHead string
-			if err := rows.Scan(&id, &nextHead); err != nil {
-				rows.Close()
-				return false, err
-			}
-			transitions = append(transitions, [2]string{id, nextHead})
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return false, err
-		}
-		if err := rows.Close(); err != nil {
-			return false, err
-		}
-		if len(transitions) != 1 {
-			return false, nil
-		}
-
-		publicationID, nextHead := transitions[0][0], transitions[0][1]
-		memberRows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT event_seq FROM self_publication_members
-WHERE publication_id=? ORDER BY ord`, publicationID)
-		if err != nil {
-			return false, err
-		}
-		memberCount := 0
-		for memberRows.Next() {
-			var seq int64
-			if err := memberRows.Scan(&seq); err != nil {
-				memberRows.Close()
-				return false, err
-			}
-			if _, ok := unusedEvents[seq]; !ok {
-				memberRows.Close()
-				return false, nil
-			}
-			delete(unusedEvents, seq)
-			memberCount++
-		}
-		if err := memberRows.Err(); err != nil {
-			memberRows.Close()
-			return false, err
-		}
-		if err := memberRows.Close(); err != nil {
-			return false, err
-		}
-		if memberCount == 0 {
-			return false, nil
-		}
-		if _, duplicate := seenHeads[nextHead]; duplicate {
-			return false, nil
-		}
-		seenHeads[nextHead] = struct{}{}
-		current = nextHead
-	}
-	return current == targetHead, nil
+	return state.CompletedBranchTransitionOwnsCheckpointTarget(
+		ctx, db, target.BranchRef, target.Generation, sourceHead, targetHead,
+		checkpointCreatedTS, target.EventSeqs)
 }
 
 func publicationDrainResult(

@@ -253,7 +253,11 @@ func EvaluateIntentCandidates(
 		return result, err
 	}
 	if len(input.TargetEventSeqs) > 0 {
-		existing = intentCandidatesWithinTarget(existing, input.TargetEventSeqs)
+		existing, err = intentCandidatesWithinTarget(
+			ctx, db, existing, input.TargetEventSeqs)
+		if err != nil {
+			return result, err
+		}
 	}
 	for _, candidate := range existing {
 		result.VisibleCandidateIDs = append(
@@ -478,27 +482,75 @@ func EvaluateIntentCandidates(
 }
 
 func intentCandidatesWithinTarget(
+	ctx context.Context,
+	db *state.DB,
 	candidates []state.IntentCandidate,
 	targetSeqs []int64,
-) []state.IntentCandidate {
+) ([]state.IntentCandidate, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
 	target := make(map[int64]struct{}, len(targetSeqs))
 	for _, seq := range targetSeqs {
 		target[seq] = struct{}{}
 	}
+	eligible := make(map[string]bool, len(candidates))
+	seen := make(map[string]int, len(candidates))
+	args := make([]any, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, duplicate := eligible[candidate.ID]; duplicate {
+			return nil, fmt.Errorf(
+				"daemon: intent candidates: duplicate target candidate %q",
+				candidate.ID)
+		}
+		eligible[candidate.ID] = len(candidate.Events) > 0
+		args = append(args, candidate.ID)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")
+	rows, err := db.ReadSQL().QueryContext(ctx, fmt.Sprintf(`
+SELECT membership.candidate_id,membership.event_seq,event.state
+FROM intent_candidate_events membership
+JOIN capture_events event ON event.seq=membership.event_seq
+WHERE membership.membership_state='active'
+  AND membership.candidate_id IN (%s)
+ORDER BY membership.candidate_id,membership.ord,membership.event_seq`,
+		placeholders), args...)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"daemon: intent candidates: load target member states: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var candidateID, eventState string
+		var eventSeq int64
+		if err := rows.Scan(&candidateID, &eventSeq, &eventState); err != nil {
+			return nil, fmt.Errorf(
+				"daemon: intent candidates: scan target member state: %w", err)
+		}
+		seen[candidateID]++
+		switch eventState {
+		case state.EventStatePublished:
+			// Published membership is repair context, not new drain work.
+		case state.EventStatePending:
+			if _, inside := target[eventSeq]; !inside {
+				eligible[candidateID] = false
+			}
+		default:
+			eligible[candidateID] = false
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"daemon: intent candidates: iterate target member states: %w", err)
+	}
+
 	filtered := make([]state.IntentCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		inside := len(candidate.Events) > 0
-		for _, event := range candidate.Events {
-			if _, ok := target[event.EventSeq]; !ok {
-				inside = false
-				break
-			}
-		}
-		if inside {
+		if eligible[candidate.ID] && seen[candidate.ID] == len(candidate.Events) {
 			filtered = append(filtered, candidate)
 		}
 	}
-	return filtered
+	return filtered, nil
 }
 
 // advanceTerminalIntentCandidateIDs keeps planner-stable IDs restart-safe

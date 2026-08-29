@@ -401,6 +401,135 @@ func TestSelectIntentWindowBoundaryExcludesLaterCaptures(t *testing.T) {
 	}
 }
 
+func TestSelectIntentWindowOffersFreshPathsBeforeRetryingForcedCapture(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	for _, path := range []string{"stuck.go", "definition.go", "definition_test.go"} {
+		captureOnePendingFile(t, ctx, f, path, "package sample\n")
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("pending=%d want 3", len(pending))
+	}
+	if err := state.RecordPlannerDefer(
+		ctx, f.db, pending[0].Seq, 1, "waiting for definition"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+	saveWaitingIntentCandidateForEvent(t, ctx, f, pending[0].Seq)
+
+	cfg := intentReplayConfig{
+		enabled: true, candidateMode: true, window: 2, deferLimit: 1,
+	}
+	batchLimit := replayPendingBatchLimit(ReplayOpts{}, cfg)
+	pending, err = state.PendingEvents(ctx, f.db, batchLimit+1)
+	if err != nil {
+		t.Fatalf("PendingEvents production window: %v", err)
+	}
+	if len(pending) > batchLimit {
+		pending = pending[:batchLimit]
+	}
+	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending, cfg)
+	if err != nil {
+		t.Fatalf("selectIntentWindow: %v", err)
+	}
+	if forced || reason != "" || len(window) != 2 ||
+		window[0].Seq != pending[1].Seq || window[1].Seq != pending[2].Seq {
+		t.Fatalf("window=%+v forced=%v reason=%q; want fresh companion paths",
+			window, forced, reason)
+	}
+}
+
+func TestReplayPendingBatchLimitLooksPastFullCandidate(t *testing.T) {
+	t.Parallel()
+	cfg := intentReplayConfig{
+		enabled: true, candidateMode: true, window: 20, minPending: 300,
+	}
+	if got, want := replayPendingBatchLimit(ReplayOpts{}, cfg), 300; got != want {
+		t.Fatalf("batch limit=%d want min-pending limit %d", got, want)
+	}
+	cfg.minPending = 2
+	if got, want := replayPendingBatchLimit(ReplayOpts{}, cfg),
+		state.IntentCandidateMaxCaptures+cfg.window; got != want {
+		t.Fatalf("batch limit=%d want candidate plus fresh window %d", got, want)
+	}
+}
+
+func TestSelectIntentWindowKeepsFrozenRecoveryTargetTogether(t *testing.T) {
+	t.Parallel()
+	pending := []state.CaptureEvent{{Seq: 1}, {Seq: 2}, {Seq: 3}}
+	window, forced, reason, err := selectIntentWindow(
+		context.Background(), nil, pending, intentReplayConfig{
+			window: 3, semanticSalvage: true,
+			targetEventSeqs: []int64{1, 2, 3},
+		})
+	if err != nil || forced || reason != "" || len(window) != len(pending) {
+		t.Fatalf("recovery window=%+v forced=%v reason=%q err=%v",
+			window, forced, reason, err)
+	}
+}
+
+func TestSelectIntentWindowKeepsFreshSamePathBehindForcedCapture(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	seedTrackedFileCommit(t, ctx, f, "chain.go", "package sample\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatalf("BootstrapShadow: %v", err)
+	}
+	first := captureSamePathEdit(t, ctx, f, "chain.go", "package sample\n\nvar first = true\n")
+	second := captureSamePathEdit(t, ctx, f, "chain.go", "package sample\n\nvar second = true\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatalf("PendingEvents: %v", err)
+	}
+	if err := state.RecordPlannerDefer(
+		ctx, f.db, first, 1, "waiting for companion"); err != nil {
+		t.Fatalf("RecordPlannerDefer: %v", err)
+	}
+	saveWaitingIntentCandidateForEvent(t, ctx, f, first)
+
+	window, forced, reason, err := selectIntentWindow(ctx, f.db, pending,
+		intentReplayConfig{window: 2, deferLimit: 1})
+	if err != nil {
+		t.Fatalf("selectIntentWindow: %v", err)
+	}
+	if !forced || reason != "" || len(window) != 1 ||
+		window[0].Seq != first || window[0].Seq == second {
+		t.Fatalf("window=%+v forced=%v reason=%q; want forced predecessor",
+			window, forced, reason)
+	}
+}
+
+func saveWaitingIntentCandidateForEvent(
+	t *testing.T,
+	ctx context.Context,
+	f *captureFixture,
+	eventSeq int64,
+) {
+	t.Helper()
+	if err := state.SaveIntentCandidate(ctx, f.db, state.IntentCandidate{
+		ID:               fmt.Sprintf("intent-waiting-%d", eventSeq),
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		Status:           state.IntentCandidateWaiting,
+		Purpose:          "wait for a captured companion",
+		CreatedTS:        1,
+		UpdatedTS:        1,
+		Readiness:        state.IntentReadinessWait,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq:  eventSeq,
+			EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatalf("SaveIntentCandidate: %v", err)
+	}
+}
+
 func TestPruneConsumedIntentActivityBoundariesKeepsBoundedTail(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
