@@ -14,6 +14,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 func TestIntentObservabilityNewestPlannerErrorWins(t *testing.T) {
@@ -353,6 +354,19 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	}
 	if !listReport.Protected || listReport.UnpublishedCheckpoints != 0 {
 		t.Fatalf("recovered list truth=%+v", listReport)
+	}
+	control := controlResult{OK: true, Health: controlHealthHealthy}
+	applyControlStatusWithDaemonAlive(&control, report, true)
+	if !control.Published || !control.CheckpointPublishedByACD {
+		t.Fatalf("recovered control truth=%+v", control)
+	}
+	listRecord := rec
+	listRecord.RepositoryID = "repository-id"
+	listRecord.WorktreeID = "0123456789abcdef"
+	entry := productListEntryFromOverview(listRecord, supervisor.WorkerStatus{},
+		productListRepoOverview{report: report}, nil)
+	if !entry.Published {
+		t.Fatalf("recovered product list truth=%+v", entry)
 	}
 	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o600); err != nil {
 		t.Fatal(err)
