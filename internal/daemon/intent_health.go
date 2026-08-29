@@ -181,6 +181,34 @@ func (e *IntentPlannerCircuitOpenError) Error() string {
 	return fmt.Sprintf("intent planner circuit open until %s", e.RetryAt.UTC().Format(time.RFC3339Nano))
 }
 
+// isIntentPlannerCircuitWait reports whether every leaf in err is the
+// planner's typed open/half-open signal. Keeping this structural avoids
+// mistaking an unrelated error joined to a circuit wait for a safe retry.
+func isIntentPlannerCircuitWait(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := err.(*IntentPlannerCircuitOpenError); ok {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !isIntentPlannerCircuitWait(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return isIntentPlannerCircuitWait(wrapped.Unwrap())
+	}
+	return false
+}
+
 // IntentPlannerTransportFailure opens the circuit immediately. Callers should
 // wrap timeouts, HTTP/subprocess failures, and other failures that occur before
 // a validated plan is available.
