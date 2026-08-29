@@ -48,6 +48,13 @@ func OldestOverdueFailedIntentEventSeq(
 	}
 	var seq int64
 	err := d.readSQL().QueryRowContext(ctx, `
+WITH barrier AS (
+    SELECT MIN(seq) AS first_seq
+    FROM capture_events
+    WHERE branch_ref=?
+      AND branch_generation=?
+      AND state IN (?,?)
+)
 SELECT event.seq
 FROM intent_candidate_events membership
 JOIN intent_candidates candidate ON candidate.id=membership.candidate_id
@@ -55,6 +62,7 @@ JOIN capture_events event ON event.seq=membership.event_seq
 JOIN planner_state planner ON planner.event_seq=event.seq
 JOIN checkpoint_events checkpoint_event ON checkpoint_event.event_seq=event.seq
 JOIN checkpoints checkpoint ON checkpoint.id=checkpoint_event.checkpoint_id
+CROSS JOIN barrier
 WHERE membership.membership_state='active'
   AND candidate.branch_ref=?
   AND candidate.branch_generation=?
@@ -67,9 +75,11 @@ WHERE membership.membership_state='active'
   AND event.state='pending'
   AND planner.defer_count>=?
   AND checkpoint.phase='completed'
+  AND (barrier.first_seq IS NULL OR event.seq<barrier.first_seq)
 ORDER BY event.seq
-LIMIT 1`, branchRef, branchGeneration, branchRef, branchGeneration,
-		deferLimit).Scan(&seq)
+LIMIT 1`, branchRef, branchGeneration, EventStateBlockedConflict,
+		EventStateFailed, branchRef, branchGeneration, branchRef,
+		branchGeneration, deferLimit).Scan(&seq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
