@@ -58,9 +58,11 @@ branch-token and Git safety gates prove a stable target.
 ## Publication behavior
 
 Only completed-checkpoint members enter publication. Existing Event and Intent
-semantics remain intact. Provider, plan, message, grouping, test, or
-verification failure sets product state to `waiting`; the completed checkpoint
-and `protected` boolean do not regress.
+semantics remain intact. Provider, planning, message, grouping, test, or
+verification problems never undo the completed checkpoint or its `protected`
+state. Status shows `waiting` while ACD pauses for a retry, `publishing` while
+it is actively retrying or rebuilding the plan, and `needs_action` only when
+bounded recovery is exhausted or ACD cannot prove a safe next step.
 
 Publication writes a specialized prepared record before branch mutation,
 uses a literal-ref compare-and-swap, observes the exact target, and atomically

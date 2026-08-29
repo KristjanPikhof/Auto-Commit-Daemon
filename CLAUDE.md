@@ -162,6 +162,7 @@ acd support recover --force --yes
 - Keep `processBranchTokenChange` before capture and after flush drain. Branch settle 100ms; flush drain 256; startup fails acknowledged flushes older than 5m.
 - fsnotify is opt-in; poll is the safety net. The first event wakes immediately; bursts use a 100ms trailing wake with a 500ms hard limit. The 750ms safety poll doubles while idle to 2m. Dispatch never blocks; rewalk/diagnostics use replaceable worker channels; budget exhaustion falls back to poll.
 - Bare `acd` is read-only health. Active-tail terminal events mean `needs_attention`; historical terminals do not. `acd on` is idempotent but returns nonzero if still unhealthy. `acd off` disables/stops and preserves state.
+- Status publication truth counts `published` and `recovered` checkpoint members as resolved. Active `failed` or `blocked_conflict` events keep publication false; retention still protects recovered snapshots from normal pruning.
 - `acd history activity`, `acd history explain`, `acd status`, `acd support diagnose`, and `acd doctor` read paths use read-only SQLite and never migrate/create tables.
 - Status/diagnose/doctor expose self-publication phase, canonical owners, remediation (`automatic_recovery`, `stop_old_owner`, `needs_attention`), intent windows/circuit/candidates/repair, and runtime revisions/experiments.
 - Start cache/registry may bypass control lock, migration, and registry rewrite. Manual session: `human:<repoHash>`; harness starts require `--session-id`.

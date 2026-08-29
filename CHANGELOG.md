@@ -36,8 +36,10 @@
   settings. Completed historical drains no longer appear as current work, and
   recoverable verification failures show automatic replanning instead of a
   false request for user action. Status and list now treat protected recovery
-  snapshots as resolved, while active failed captures cannot be reported as
-  published while ACD asks for recovery.
+  snapshots as resolved, while active failed or blocked captures cannot be
+  reported as published while ACD asks for recovery. Detailed diagnostics now
+  describe the aggregate as all protected checkpoints resolved in Git instead
+  of implying that only the latest checkpoint matters.
 - ACD can now prove and adopt a completed ACD-owned Intent repair after a crash
   or restart. Frozen publication targets do not absorb later captures, and the
   remaining queue continues without an `acd off` and `acd on` cycle.
