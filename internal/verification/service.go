@@ -30,19 +30,89 @@ const (
 	// OutputLimit is the maximum sanitized command output returned to callers.
 	OutputLimit = 64 * 1024
 
-	markerVersion       = 2
-	workspaceDirName    = "verification-worktrees"
-	workspacePrefix     = "candidate-"
-	workspaceMarkerName = "marker.json"
-	workspaceTreeName   = "tree"
-	environmentPrefix   = "acd-verification-env-"
-	environmentMarker   = "owner.json"
-	maxApprovalIDBytes  = 128
-	maxCommandBytes     = 16 * 1024
-	maxMarkerBytes      = 8 * 1024
-	commandWaitDelay    = 2 * time.Second
-	incompleteGrace     = 5 * time.Minute
+	markerVersion        = 2
+	workspaceDirName     = "verification-worktrees"
+	workspacePrefix      = "candidate-"
+	workspaceMarkerName  = "marker.json"
+	workspaceTreeName    = "tree"
+	environmentPrefix    = "acd-verification-env-"
+	environmentMarker    = "owner.json"
+	maxApprovalIDBytes   = 128
+	maxCommandBytes      = 16 * 1024
+	maxMarkerBytes       = 8 * 1024
+	commandWaitDelay     = 2 * time.Second
+	incompleteGrace      = 5 * time.Minute
+	resourceErrorScanCap = 8 * 1024
 )
+
+// ErrResourceUnavailable identifies a verification attempt that could not
+// start or clean up its isolated workspace because the host ran out of disk
+// space or quota. It is retryable infrastructure evidence, not evidence that
+// the approved verification command failed.
+var ErrResourceUnavailable = errors.New(
+	"verification: workspace resources unavailable",
+)
+
+type resourceUnavailableError struct {
+	cause error
+}
+
+func (e *resourceUnavailableError) Error() string {
+	return ErrResourceUnavailable.Error() + ": " + e.cause.Error()
+}
+
+func (e *resourceUnavailableError) Unwrap() error { return e.cause }
+
+func (e *resourceUnavailableError) Is(target error) bool {
+	return target == ErrResourceUnavailable
+}
+
+// ClassifyResourceUnavailable preserves err unless its wrapped filesystem
+// cause, or a bounded C-locale Git diagnostic, proves disk/quota exhaustion.
+// Callers should apply it only to verification infrastructure operations. A
+// command that starts and exits non-zero remains an ordinary failed Result.
+func ClassifyResourceUnavailable(err error) error {
+	if err == nil || errors.Is(err, ErrResourceUnavailable) {
+		return err
+	}
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) ||
+		hasGitResourceUnavailableDiagnostic(err) {
+		return &resourceUnavailableError{cause: err}
+	}
+	return err
+}
+
+func hasGitResourceUnavailableDiagnostic(err error) bool {
+	if err == nil {
+		return false
+	}
+	if gitErr, ok := err.(*gitpkg.Error); ok {
+		stderr := gitErr.Stderr
+		if len(stderr) > resourceErrorScanCap {
+			stderr = stderr[len(stderr)-resourceErrorScanCap:]
+		}
+		stderr = strings.ToLower(stderr)
+		if strings.Contains(stderr, "no space left on device") ||
+			strings.Contains(stderr, "disk quota exceeded") {
+			return true
+		}
+	}
+	type multiUnwrapper interface {
+		Unwrap() []error
+	}
+	if joined, ok := err.(multiUnwrapper); ok {
+		for _, child := range joined.Unwrap() {
+			if hasGitResourceUnavailableDiagnostic(child) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return hasGitResourceUnavailableDiagnostic(wrapped)
+	}
+	return false
+}
 
 type Mode string
 
@@ -202,6 +272,9 @@ const (
 // return a non-error Result with NeedsAttention=true; setup, cancellation, and
 // cleanup failures additionally return an error.
 func (r Runner) Run(ctx context.Context, request Request) (result Result, retErr error) {
+	defer func() {
+		retErr = ClassifyResourceUnavailable(retErr)
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -285,6 +358,9 @@ func (r Runner) CheckStructural(
 	ctx context.Context,
 	request StructuralRequest,
 ) (result Result, retErr error) {
+	defer func() {
+		retErr = ClassifyResourceUnavailable(retErr)
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
