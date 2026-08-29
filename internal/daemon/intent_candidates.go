@@ -176,9 +176,10 @@ func (e *IntentPlanPreflightError) Error() string {
 }
 
 const (
-	intentBalancedFallbackCaptureCap     = 32
-	intentBalancedFallbackPathCap        = 12
-	intentVerificationResourceWaitReason = "verification workspace resources unavailable; retrying automatically"
+	intentBalancedFallbackCaptureCap         = 32
+	intentBalancedFallbackPathCap            = 12
+	intentVerificationResourceWaitReason     = "verification workspace resources unavailable; retrying automatically"
+	intentVerificationResourceWaitSkipReason = "intent_v2_verification_resource_wait"
 )
 
 type intentCandidateContinuation struct {

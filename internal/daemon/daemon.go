@@ -2983,7 +2983,7 @@ func Run(ctx context.Context, opts Options) error {
 								updatedDrain.Phase != state.PublicationDrainNeedsAction {
 								repErr = nil
 								if repSum.SkippedReason !=
-									"intent_v2_verification_resource_wait" {
+									intentVerificationResourceWaitSkipReason {
 									repSum.HasMore = true
 								}
 							}

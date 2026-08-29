@@ -965,7 +965,7 @@ func TestPublicationDrainVerificationResourceWaitPreservesSemanticPhase(
 	waiting, err := UpdatePublicationDrainAfterReplay(
 		ctx, db, drain, ReplaySummary{
 			Skipped:           true,
-			SkippedReason:     "intent_v2_verification_resource_wait",
+			SkippedReason:     intentVerificationResourceWaitSkipReason,
 			Disposition:       ReplayDispositionTransientWait,
 			DispositionReason: intentVerificationResourceWaitReason,
 		}, nil, time.Unix(12, 0).UTC())

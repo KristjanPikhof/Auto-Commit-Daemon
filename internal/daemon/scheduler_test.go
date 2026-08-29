@@ -103,7 +103,7 @@ func TestReplayRecaptureSchedulesImmediateFollowup(t *testing.T) {
 	}
 	if replayNeedsImmediateFollowup(ReplaySummary{
 		Skipped:       true,
-		SkippedReason: "intent_v2_verification_resource_wait",
+		SkippedReason: intentVerificationResourceWaitSkipReason,
 		Disposition:   ReplayDispositionTransientWait,
 	}) {
 		t.Fatal("verification resource wait would spin instead of backing off")

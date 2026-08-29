@@ -464,7 +464,7 @@ func TestIntentV2EvaluationMetaClearsStaleAttentionDuringResourceWait(
 	}
 	if err := updateIntentV2EvaluationMeta(ctx, db, bundle, ReplaySummary{
 		Skipped:       true,
-		SkippedReason: "intent_v2_verification_resource_wait",
+		SkippedReason: intentVerificationResourceWaitSkipReason,
 		Disposition:   ReplayDispositionTransientWait,
 	}, nil); err != nil {
 		t.Fatal(err)

@@ -270,7 +270,7 @@ func TestReplayVerificationResourceWaitRetainsSemanticTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !result.Skipped ||
-		result.SkippedReason != "intent_v2_verification_resource_wait" ||
+		result.SkippedReason != intentVerificationResourceWaitSkipReason ||
 		result.Disposition != ReplayDispositionTransientWait ||
 		result.DispositionReason != intentVerificationResourceWaitReason ||
 		result.HasMore || result.Published != 0 || result.Failed != 0 ||

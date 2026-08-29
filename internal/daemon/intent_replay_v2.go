@@ -291,7 +291,7 @@ func replayIntentCandidateBatch(
 				selected, currentParent, visibleCandidateIDs)
 			if errors.Is(repairErr, verification.ErrResourceUnavailable) {
 				sum.Skipped = true
-				sum.SkippedReason = "intent_v2_verification_resource_wait"
+				sum.SkippedReason = intentVerificationResourceWaitSkipReason
 				sum.Disposition = ReplayDispositionTransientWait
 				sum.DispositionReason = intentVerificationResourceWaitReason
 				sum.HasMore = false
@@ -371,7 +371,7 @@ func replayIntentCandidateBatch(
 			sum.HasMore = publicationDrainMessageRewriteWait(
 				opts, cfg, evaluation)
 		} else if intentEvaluationWaitingForVerificationResources(evaluation) {
-			sum.SkippedReason = "intent_v2_verification_resource_wait"
+			sum.SkippedReason = intentVerificationResourceWaitSkipReason
 			sum.Disposition = ReplayDispositionTransientWait
 			sum.DispositionReason = intentVerificationResourceWaitReason
 			sum.HasMore = false

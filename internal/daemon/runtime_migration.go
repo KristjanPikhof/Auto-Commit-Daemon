@@ -376,7 +376,7 @@ func updateIntentV2EvaluationMeta(
 		"intent.v2.needs_attention": "",
 	}
 	verificationResourceWait := summary.SkippedReason ==
-		"intent_v2_verification_resource_wait"
+		intentVerificationResourceWaitSkipReason
 	if !verificationResourceWait &&
 		(summary.SkippedReason == "intent_v2_needs_attention" || unresolved) {
 		pairs["intent.v2.needs_attention"] = runtimeConfigureReason(
