@@ -7,7 +7,13 @@ acd history rewrite
 ~~~
 
 It is never part of normal protection or publication. Normal ACD behavior does
-not rewrite history.
+not invoke this explicit rewrite command automatically. Separately, enabled
+Intent repair may rewrite only a proved private, unshared, ACD-owned suffix. It
+never rewrites pushed or user-owned history.
+
+Creating a rewrite plan requires Intent mode and an explicitly configured
+non-deterministic AI provider that can produce Intent plans. Showing, editing,
+or applying an existing saved plan does not call the provider again.
 
 Rewrite planning and apply retain the existing exact-suffix, ownership,
 staging, Git-state, verification, backup-ref, preview, and confirmation gates.
