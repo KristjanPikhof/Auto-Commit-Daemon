@@ -3,7 +3,7 @@
 ## Project
 
 - Static Go CLI/daemon for macOS/Linux `arm64`/`amd64`; no Windows v1.
-- Module `github.com/KristjanPikhof/Auto-Commit-Daemon`; Go 1.26.5; `modernc.org/sqlite v1.54.0`; MIT.
+- Module `github.com/KristjanPikhof/Auto-Commit-Daemon`; Go 1.26.6; `modernc.org/sqlite v1.57.0`; MIT.
 - Tags use `vYYYY-MM-DD`; find the latest with `git tag --sort=-creatordate | head`. Never move a published tag unless requested.
 - `AGENTS.md -> CLAUDE.md`; edit `CLAUDE.md` and preserve the symlink.
 - README/docs are product contracts. Keep details in canonical docs, not duplicated here; nested Markdown fences use `~~~`.
@@ -60,7 +60,7 @@ ACD_VERSION=v2026-MM-DD sh scripts/install.sh
 | `cmd/acd/main.go` | CLI entrypoint |
 | `internal/cli` | Cobra commands, lifecycle/control, recovery, setup, start cache |
 | `internal/daemon` | Run loop, capture/replay, self-publication, recovery, intent, shadow, fsnotify |
-| `internal/state` | SQLite v19: events, settings, candidates, repairs, lineage, self-publication journal |
+| `internal/state` | SQLite v25: events, checkpoints, drains, settings, candidates, repairs, lineage, self-publication journal |
 | `internal/git` | Bounded ref/tree/diff/blob/index/history/ignore helpers |
 | `internal/ai` | Deterministic, OpenAI-compatible, subprocess providers; prompts/planner |
 | `internal/{central,config,identity,logger,paths,pause,prompttrace,trace}` | Registry, config, process identity, XDG/logging, pause, diagnostics |
@@ -95,7 +95,7 @@ Avoid filename-only subjects, `Update file`, `WIP`, and `changes`. Planner ratio
 
 ## State, ownership, branches and capture
 
-- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG paths. `SchemaVersion=19`: v17 candidate lineage; v18 immutable self-publication journal; v19 prepare-time completion semantics. See `internal/state/{schema.go,migrate.go,self_publication.go}`.
+- Repo DB: `<gitDir>/acd/state.db`; central registry/stats use XDG paths. `SchemaVersion=25`: v20 operation/checkpoint ledger; v21 publication drains; v22 adaptive plan runs; v23 resolved plans; v24 immutable repair membership; v25 frozen drain strategy/provider identity. See `internal/state/{schema.go,migrate.go,self_publication.go}`.
 - Read-only CLI paths must not migrate. Pre-v14 returns empty settings; pre-v15 reports Intent v2 unavailable; pre-v18 reports self-publication unavailable.
 - Canonical ownership is `<git-common-dir>/acd-daemon.lock`, shared by linked worktrees and outside movable `.git/acd`. A new daemon also locks every discovered legacy `<gitDir>/acd/daemon.lock` and probes old owners. Never delete a lock file or move `.git/acd` to bypass ownership.
 - PID/heartbeat are supporting evidence, not ownership proof. Concurrent `acd start` waits within the existing 3s/5s start budget for a new lock owner to stamp live state, then rechecks the lock; an unknown owner remains fail-closed.
@@ -160,7 +160,7 @@ acd fix --force --yes
 ## CLI, observability and run loop
 
 - Keep `processBranchTokenChange` before capture and after flush drain. Branch settle 100ms; flush drain 256; startup fails acknowledged flushes older than 5m.
-- fsnotify is opt-in; poll is the safety net. Dispatch never blocks; rewalk/diagnostics use replaceable worker channels; debounce tail 500ms; budget exhaustion falls back to poll.
+- fsnotify is opt-in; poll is the safety net. The first event wakes immediately; bursts use a 100ms trailing wake with a 500ms hard limit. The 750ms safety poll doubles while idle to 2m. Dispatch never blocks; rewalk/diagnostics use replaceable worker channels; budget exhaustion falls back to poll.
 - Bare `acd` is read-only health. Active-tail terminal events mean `needs_attention`; historical terminals do not. `acd on` is idempotent but returns nonzero if still unhealthy. `acd off` disables/stops and preserves state.
 - `events`, `explain`, `status`, `diagnose`, and `doctor` read paths use read-only SQLite and never migrate/create tables.
 - Status/diagnose/doctor expose self-publication phase, canonical owners, remediation (`automatic_recovery`, `stop_old_owner`, `needs_attention`), intent windows/circuit/candidates/repair, and runtime revisions/experiments.
