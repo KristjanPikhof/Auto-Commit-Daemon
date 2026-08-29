@@ -418,6 +418,102 @@ func TestReplayFailedCheckpointRecoveryWaitsForPathQuiescence(t *testing.T) {
 	}
 }
 
+func TestReplayFailedCheckpointRecoveryWaitsForEveryTargetPath(t *testing.T) {
+	ResetPathQuiescenceForTest(t)
+	t.Setenv(EnvPathQuiescenceSeconds, "30")
+	_ = resolvePathQuiescenceSeconds()
+	now := time.Date(2026, 8, 29, 2, 0, 0, 0, time.UTC)
+	SetPathQuiescenceClockForTest(t, func() time.Time { return now })
+	t.Cleanup(func() { SetPathQuiescenceClockForTest(t, nil) })
+
+	fixture := seedFailedCheckpointReplayFixture(t)
+	f := fixture.capture
+	ctx := context.Background()
+	now = now.Add(31 * time.Second)
+	RecordPathWrite("source_test.go", now)
+
+	planner := &failedCheckpointRecoveryPlanner{
+		stalledCandidateID: stalledCheckpointCandidateID,
+	}
+	var verifiedCounts []int
+	verify := func(
+		_ context.Context,
+		_ ai.IntentCandidateAssignment,
+		captures []IntentCandidateCapture,
+	) (IntentCandidateVerification, error) {
+		verifiedCounts = append(verifiedCounts, len(captures))
+		if len(captures) != len(fixture.seqs) {
+			return IntentCandidateVerification{},
+				errors.New("incomplete checkpoint recovery target")
+		}
+		return IntentCandidateVerification{Status: "passed", CheckedTS: 1}, nil
+	}
+	retryLimit := 0
+	pathCoalescing := false
+	opts := ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetBalanced,
+		IntentBypassBatchWait: true, IntentWindow: 2, IntentMinPending: 1,
+		IntentDeferLimit: 1, IntentRetryLimit: &retryLimit,
+		IntentPathCoalescing:   &pathCoalescing,
+		IntentVerificationMode: "fast", IntentCandidateVerify: verify,
+		RequireCompletedCheckpoint: true,
+	}
+
+	hot, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatalf("Replay hot target: %v", err)
+	}
+	if !hot.Skipped ||
+		hot.SkippedReason != "skipped_due_path_quiescence" ||
+		hot.Published != 0 || !hot.HasMore {
+		t.Fatalf("hot target result=%+v", hot)
+	}
+	if len(planner.offeredSeqs) != 0 || len(verifiedCounts) != 0 {
+		t.Fatalf("hot target planned=%v verified=%v",
+			planner.offeredSeqs, verifiedCounts)
+	}
+	recovery, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || !active ||
+		recovery.Stage != publicationFallbackSemanticReplan ||
+		recovery.UnlockCount != 0 ||
+		!reflect.DeepEqual(recovery.TargetEventSeqs, fixture.seqs) {
+		t.Fatalf("hot recovery=(%+v active=%t err=%v)", recovery, active, err)
+	}
+	for _, seq := range fixture.seqs {
+		var eventState string
+		if err := f.db.ReadSQL().QueryRowContext(ctx,
+			`SELECT state FROM capture_events WHERE seq=?`, seq).
+			Scan(&eventState); err != nil {
+			t.Fatal(err)
+		}
+		if eventState != state.EventStatePending {
+			t.Fatalf("hot event %d state=%q want pending", seq, eventState)
+		}
+	}
+
+	now = now.Add(31 * time.Second)
+	settled, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatalf("Replay settled target: %v", err)
+	}
+	if settled.Published != len(fixture.seqs) || settled.Failed != 0 ||
+		settled.Conflicts != 0 {
+		t.Fatalf("settled target result=%+v", settled)
+	}
+	if !reflect.DeepEqual(planner.offeredSeqs, [][]int64{fixture.seqs}) ||
+		!reflect.DeepEqual(verifiedCounts, []int{len(fixture.seqs)}) {
+		t.Fatalf("settled target planned=%v verified=%v",
+			planner.offeredSeqs, verifiedCounts)
+	}
+	if _, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
+	); err != nil || active {
+		t.Fatalf("settled recovery marker active=%t err=%v", active, err)
+	}
+}
+
 func TestUpdateIntentForwardRecoveryRetainsPartiallyResolvedTarget(t *testing.T) {
 	fixture := seedFailedCheckpointReplayFixture(t)
 	f := fixture.capture
@@ -478,6 +574,39 @@ WHERE seq=?`, fixture.seqs[2]); err != nil {
 		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
 	); err != nil || active {
 		t.Fatalf("completed marker active=%t err=%v", active, err)
+	}
+}
+
+func TestUpdateIntentForwardRecoveryPreservesTransientWaitStage(t *testing.T) {
+	fixture := seedFailedCheckpointReplayFixture(t)
+	f := fixture.capture
+	ctx := context.Background()
+	recovery, changed, err := state.StartFailedIntentCheckpointRecovery(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+
+	waiting, err := updateIntentForwardRecoveryAfterReplay(
+		ctx, f.db, recovery, ReplaySummary{
+			Skipped:           true,
+			SkippedReason:     "intent_v2_repair_skipped_head_changed",
+			Disposition:       ReplayDispositionTransientWait,
+			DispositionReason: "HEAD changed",
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waiting.HasMore || waiting.Published != 0 {
+		t.Fatalf("transient recovery summary=%+v", waiting)
+	}
+	marker, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	if err != nil || !active ||
+		marker.Stage != publicationFallbackSemanticReplan ||
+		marker.UnlockCount != 0 {
+		t.Fatalf("transient marker=(%+v active=%t err=%v)", marker, active, err)
 	}
 }
 
