@@ -136,11 +136,14 @@ Root help lists ten everyday commands:
 Repositories that need action or are processing work stay visible, and recent
 repositories fill the rest of the five-row view. `MODE` confirms whether ACD
 is using Intent or event commits. `QUEUE` is all pending work, while `TARGET`
-shows the bounded remainder of an earlier `commit-all` request. `LAST MOVE`
-measures real queue progress rather than worker heartbeats, and `PHASE` says
-whether ACD is waiting, planning, recovering, or publishing. Use `--all` for
-every enabled repository, `--verbose` for operational details, or `--once` for
-one snapshot. `acd repo list` remains the static registration inventory.
+shows the bounded remainder of `commit-all` or automatic Intent recovery.
+`LAST MOVE` measures real queue progress rather than worker heartbeats, and
+`PHASE` says whether ACD is waiting, calling the provider, verifying,
+recovering, or publishing. An open provider circuit shows its retry countdown;
+a half-open probe shows `provider-call`; an active repository check shows
+`verifying`. Use `--all` for every enabled repository, `--verbose` for
+operational details, or `--once` for one snapshot. `acd repo list` remains the
+static registration inventory.
 
 It also links directly to common tasks:
 

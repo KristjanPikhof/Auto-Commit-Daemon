@@ -101,4 +101,19 @@ func TestReplayRecaptureSchedulesImmediateFollowup(t *testing.T) {
 	if replayNeedsImmediateFollowup(ReplaySummary{}) {
 		t.Fatal("empty replay summary unexpectedly schedules an immediate follow-up")
 	}
+	if replayNeedsImmediateFollowup(ReplaySummary{
+		Skipped:       true,
+		SkippedReason: intentVerificationResourceWaitSkipReason,
+		Disposition:   ReplayDispositionTransientWait,
+	}) {
+		t.Fatal("verification resource wait would spin instead of backing off")
+	}
+	if !replayNeedsImmediateFollowup(ReplaySummary{
+		Skipped:       true,
+		SkippedReason: "intent_v2_waiting_message_rewrite",
+		Disposition:   ReplayDispositionTransientWait,
+		HasMore:       true,
+	}) {
+		t.Fatal("semantic message wait lost its explicit drain follow-up")
+	}
 }

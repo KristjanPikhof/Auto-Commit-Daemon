@@ -56,6 +56,25 @@ func (l *replayErrorLogLimiter) recover() (value string, suppressed int) {
 	return value, suppressed
 }
 
+// reconcileReplayErrorObservability records terminal/retryable replay errors,
+// but treats a planner circuit cooldown as healthy waiting. A wait also clears
+// stale metadata written by an older worker that misclassified the same typed
+// condition as a replay failure.
+func reconcileReplayErrorObservability(
+	ctx context.Context,
+	db *state.DB,
+	replayErr error,
+	now time.Time,
+) (value string, count int, providerWait bool, err error) {
+	if isIntentPlannerCircuitWait(replayErr) {
+		value, count, err = clearReplayErrorObservability(ctx, db)
+		return value, count, true, err
+	}
+	value, count, err = recordReplayErrorObservability(
+		ctx, db, replayErr, now)
+	return value, count, false, err
+}
+
 // recordReplayErrorObservability stores one bounded error and the number of
 // consecutive identical replay failures. It intentionally uses daemon_meta so
 // pre-existing schemas gain the projection without migration.

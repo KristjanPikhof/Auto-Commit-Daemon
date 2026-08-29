@@ -16,6 +16,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
 type intentCandidatePlannerStub struct {
@@ -1134,6 +1135,56 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 			forced.Decisions[0].Assignment.MissingCompanions,
 			"semantic commit message unavailable") {
 		t.Fatalf("forced message wait=%+v", forced)
+	}
+}
+
+func TestIntentCandidateSemanticReplanPreservesCircuitWaitCause(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(t, db,
+		"internal/a/a.go", "create", "", "a1")
+	planner := &failingIntentCandidatePlannerStub{}
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{
+		Provider: IntentPlannerProviderIdentity{Provider: planner.Name()},
+	})
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		Health: health, RetryLimit: 2, RetryLimitSet: true,
+		Preset: config.PresetFast, RejectLocalFallback: true,
+		Materialize: func(
+			context.Context,
+			[]IntentCandidateCapture,
+		) error {
+			return nil
+		},
+	}
+	if before := health.Snapshot(); before.State != IntentPlannerCircuitClosed {
+		t.Fatalf("new health state=%+v", before)
+	}
+	_, firstErr := EvaluateIntentCandidates(ctx, db, input)
+	var firstFallback *IntentSemanticFallbackRequiredError
+	firstIsFallback := errors.As(firstErr, &firstFallback)
+	firstIsWait := isIntentPlannerCircuitWait(firstErr)
+	if !firstIsFallback || firstIsWait {
+		t.Fatalf("initial transport failure classification=%v fallback=%t wait=%t cause=%T",
+			firstErr, firstIsFallback, firstIsWait, errors.Unwrap(firstErr))
+	}
+	if planner.calls != 1 ||
+		health.Snapshot().State != IntentPlannerCircuitOpen {
+		t.Fatalf("initial provider failure calls=%d health=%+v",
+			planner.calls, health.Snapshot())
+	}
+
+	_, err := EvaluateIntentCandidates(ctx, db, input)
+	var fallbackErr *IntentSemanticFallbackRequiredError
+	var waitErr *IntentPlannerCircuitOpenError
+	if !errors.As(err, &fallbackErr) || !errors.As(err, &waitErr) ||
+		!isIntentPlannerCircuitWait(err) {
+		t.Fatalf("semantic provider wait lost typed cause: %v", err)
+	}
+	if planner.calls != 1 {
+		t.Fatalf("open circuit invoked provider; calls=%d", planner.calls)
 	}
 }
 
@@ -3480,6 +3531,109 @@ func TestIntentCandidateEngineVerificationFailureStaysPending(t *testing.T) {
 		!candidate.VerificationTS.Valid ||
 		candidate.VerificationTS.Float64 != 123 {
 		t.Fatalf("verification evidence=%+v", candidate)
+	}
+}
+
+func TestIntentCandidateEngineRetriesResourceLimitedVerificationWithoutReplan(
+	t *testing.T,
+) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "internal/a/resource.go", "create", "", "a1")
+	const candidateID = "candidate-resource-retry"
+	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
+		ID: candidateID, BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Status: state.IntentCandidateWaiting, Readiness: state.IntentReadinessWait,
+		Purpose:          "preserve resource recovery grouping",
+		AtomicityStatus:  sql.NullString{String: "failed", Valid: true},
+		AtomicitySummary: "workspace setup failed",
+		VerificationStatus: sql.NullString{
+			String: "needs_attention", Valid: true,
+		},
+		VerificationOutput: "No space left on device",
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: capture.Event.Seq, EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID:  candidateID,
+			SelectedSeqs: []int64{capture.Event.Seq},
+			Purpose:      "preserve resource recovery grouping",
+			Readiness:    ai.IntentCandidateReady,
+			Subject:      "Preserve resource recovery grouping",
+			Body:         "- Retry the exact semantic group after disk recovery",
+			GroupingReason: "the capture is one independently verifiable " +
+				"semantic change",
+		}},
+	}}
+	verifyCalls := 0
+	input := IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		Preset: config.PresetBalanced, VerificationMode: "fast",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+		Verify: func(
+			context.Context,
+			ai.IntentCandidateAssignment,
+			[]IntentCandidateCapture,
+		) (IntentCandidateVerification, error) {
+			verifyCalls++
+			if verifyCalls == 1 {
+				return IntentCandidateVerification{Status: "needs_attention"},
+					fmt.Errorf("create detached worktree: %w",
+						verification.ErrResourceUnavailable)
+			}
+			return IntentCandidateVerification{
+				Status: "passed", Output: "ok", CheckedTS: 12,
+			}, nil
+		},
+	}
+	deferred, err := EvaluateIntentCandidates(ctx, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deferred.VerificationDeferred || deferred.NeedsAttention ||
+		len(deferred.Decisions) != 1 ||
+		!deferred.Decisions[0].VerificationDeferred ||
+		deferred.Decisions[0].Publishable || planner.calls != 1 {
+		t.Fatalf("resource-deferred evaluation=%+v planner_calls=%d",
+			deferred, planner.calls)
+	}
+	pending, ok, err := state.IntentCandidateByID(ctx, db, candidateID)
+	if err != nil || !ok || !pending.VerificationStatus.Valid ||
+		pending.VerificationStatus.String != "needs_attention" ||
+		pending.AtomicityStatus.String != "failed" ||
+		pending.VerificationOutput != "No space left on device" {
+		t.Fatalf("resource wait rewrote semantic candidate=(%+v,%t,%v)",
+			pending, ok, err)
+	}
+
+	passed, err := EvaluateIntentCandidates(ctx, db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed.VerificationDeferred || passed.NeedsAttention ||
+		len(passed.Decisions) != 1 ||
+		!passed.Decisions[0].Publishable || planner.calls != 1 ||
+		verifyCalls != 2 {
+		t.Fatalf("resource retry=%+v planner_calls=%d verify_calls=%d",
+			passed, planner.calls, verifyCalls)
+	}
+	assignment := passed.Decisions[0].Assignment
+	if assignment.Subject != "Preserve resource recovery grouping" ||
+		assignment.Body !=
+			"- Retry the exact semantic group after disk recovery" ||
+		!reflect.DeepEqual(
+			assignment.SelectedSeqs, []int64{capture.Event.Seq}) {
+		t.Fatalf("retried semantic assignment=%+v", assignment)
 	}
 }
 

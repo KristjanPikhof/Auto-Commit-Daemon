@@ -2982,7 +2982,10 @@ func Run(ctx context.Context, opts Options) error {
 							if updatedDrain.Phase != state.PublicationDrainCompleted &&
 								updatedDrain.Phase != state.PublicationDrainNeedsAction {
 								repErr = nil
-								repSum.HasMore = true
+								if repSum.SkippedReason !=
+									intentVerificationResourceWaitSkipReason {
+									repSum.HasMore = true
+								}
 							}
 						}
 					}
@@ -3049,16 +3052,31 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("capture error", "n", consecutiveErrors, "err", capErr.Error())
 			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", capErr.Error())
 		} else if repErr != nil {
-			consecutiveErrors++
-			clean, repeats, metaErr := recordReplayErrorObservability(
+			value, repeats, providerWait, metaErr := reconcileReplayErrorObservability(
 				ctx, opts.DB, repErr, now())
-			if metaErr != nil {
-				logger.Warn("persist replay error observability",
-					"err", metaErr.Error())
-			}
-			if emit, suppressed := replayErrorLogs.observe(clean, now()); emit {
-				logger.Warn("replay error", "n", repeats, "err", clean,
-					"suppressed", suppressed)
+			if providerWait {
+				consecutiveErrors = 0
+				_ = state.MetaSet(ctx, opts.DB, "last_capture_error", "")
+				if metaErr != nil {
+					logger.Warn("clear replay error observability for provider wait",
+						"err", metaErr.Error())
+				} else {
+					_, suppressed := replayErrorLogs.recover()
+					if value != "" {
+						logger.Info("replay recovered to provider wait",
+							"previous_err", value, "repeats", repeats,
+							"suppressed", suppressed)
+					}
+				}
+			} else {
+				consecutiveErrors++
+				if metaErr != nil {
+					logger.Warn("persist replay error observability",
+						"err", metaErr.Error())
+				} else if emit, suppressed := replayErrorLogs.observe(value, now()); emit {
+					logger.Warn("replay error", "n", repeats, "err", value,
+						"suppressed", suppressed)
+				}
 			}
 		} else {
 			consecutiveErrors = 0

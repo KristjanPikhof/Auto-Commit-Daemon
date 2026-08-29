@@ -144,11 +144,14 @@ screen until Ctrl-C; `--once` prints one snapshot.
 
 `SAFE` confirms that the latest checkpoint is complete. `MODE` shows the
 configured commit strategy. `QUEUE` counts all pending work. `TARGET` appears
-only for the bounded remainder of an earlier `commit-all` request; it does not
-mean the strategy changed. `LAST MOVE` is the age of durable queue progress,
-not the worker heartbeat. `PHASE` distinguishes an ordinary Intent countdown
-from planning, publication, retry, and automatic recovery. A dash means that
-field does not apply or could not be read during that frame.
+for the bounded remainder of `commit-all` or automatic Intent recovery; it does
+not mean the strategy changed. `LAST MOVE` is the age of durable queue
+progress, not the worker heartbeat. `PHASE` distinguishes an ordinary Intent
+countdown from planning, publication, retry, and automatic recovery.
+`provider-wait` includes the retry countdown, `provider-call` means the retry
+request is in flight, and `verifying` means the approved repository check is
+running. A dash means that field does not apply or could not be read during
+that frame.
 
 | Status | Meaning |
 |---|---|

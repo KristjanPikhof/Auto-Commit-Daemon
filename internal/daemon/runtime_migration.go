@@ -375,7 +375,10 @@ func updateIntentV2EvaluationMeta(
 		"intent.v2.preset_version":  strconv.Itoa(bundle.PresetVersion),
 		"intent.v2.needs_attention": "",
 	}
-	if summary.SkippedReason == "intent_v2_needs_attention" || unresolved {
+	verificationResourceWait := summary.SkippedReason ==
+		intentVerificationResourceWaitSkipReason
+	if !verificationResourceWait &&
+		(summary.SkippedReason == "intent_v2_needs_attention" || unresolved) {
 		pairs["intent.v2.needs_attention"] = runtimeConfigureReason(
 			"candidate planning or verification needs attention")
 	}

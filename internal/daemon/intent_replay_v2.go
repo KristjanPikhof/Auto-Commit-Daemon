@@ -23,6 +23,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
 const (
@@ -135,6 +136,7 @@ func replayIntentCandidateBatch(
 		Now:                 time.Now().UTC(),
 		TargetEventSeqs:     cfg.targetEventSeqs,
 		RejectLocalFallback: cfg.semanticSalvage,
+		RecoveryCandidateID: cfg.forwardRecoveryCandidateID,
 	})
 	sum.PlanFingerprint = evaluation.PlanFingerprint
 	if cfg.forwardRecoveryPlanFingerprint != "" {
@@ -287,6 +289,14 @@ func replayIntentCandidateBatch(
 			repaired, publishedCount, repairErr := repairIntentCandidateDecision(
 				ctx, repoRoot, opts.GitDir, db, activeCtx, opts, decision,
 				selected, currentParent, visibleCandidateIDs)
+			if errors.Is(repairErr, verification.ErrResourceUnavailable) {
+				sum.Skipped = true
+				sum.SkippedReason = intentVerificationResourceWaitSkipReason
+				sum.Disposition = ReplayDispositionTransientWait
+				sum.DispositionReason = intentVerificationResourceWaitReason
+				sum.HasMore = false
+				return sum, nil
+			}
 			if repairErr != nil {
 				return sum, repairErr
 			}
@@ -337,7 +347,8 @@ func replayIntentCandidateBatch(
 	}
 	if !publishedAny {
 		messageRewriteWait := evaluation.Fallback == "waiting_message_rewrite"
-		if !messageRewriteWait && forced && len(items) == 1 &&
+		if !messageRewriteWait && !evaluation.VerificationDeferred &&
+			forced && len(items) == 1 &&
 			opts.PublicationDrain == nil &&
 			intentRecoveryItemQuiescent(items[0], cfg) {
 			recovered, handled, recoveryErr :=
@@ -359,6 +370,11 @@ func replayIntentCandidateBatch(
 			// provider remains unavailable.
 			sum.HasMore = publicationDrainMessageRewriteWait(
 				opts, cfg, evaluation)
+		} else if intentEvaluationWaitingForVerificationResources(evaluation) {
+			sum.SkippedReason = intentVerificationResourceWaitSkipReason
+			sum.Disposition = ReplayDispositionTransientWait
+			sum.DispositionReason = intentVerificationResourceWaitReason
+			sum.HasMore = false
 		} else if intentEvaluationAwaitingCheckpointRecovery(evaluation) {
 			sum.SkippedReason = "intent_v2_verification_recovery"
 			sum.Disposition = ReplayDispositionRecoverableStall
@@ -373,6 +389,25 @@ func replayIntentCandidateBatch(
 		}
 	}
 	return sum, nil
+}
+
+func intentEvaluationWaitingForVerificationResources(
+	evaluation IntentCandidateEvaluationResult,
+) bool {
+	if !evaluation.VerificationDeferred || evaluation.PlannerFailure != "" ||
+		evaluation.NeedsAttention {
+		return false
+	}
+	for _, decision := range evaluation.Decisions {
+		if decision.Publishable ||
+			decision.Assignment.Readiness != ai.IntentCandidateReady {
+			continue
+		}
+		if !decision.VerificationDeferred {
+			return false
+		}
+	}
+	return true
 }
 
 // intentEvaluationAwaitingCheckpointRecovery distinguishes an exact
@@ -513,6 +548,14 @@ func updateIntentForwardRecoveryAfterReplay(
 		(recovery.Stage == publicationFallbackLocalUnlock &&
 			recovery.PlanFingerprint == "")
 	if replayErr != nil {
+		if isIntentPlannerCircuitWait(replayErr) {
+			sum.Skipped = true
+			sum.SkippedReason = "intent_v2_provider_wait"
+			sum.Disposition = ReplayDispositionTransientWait
+			sum.DispositionReason = replayErr.Error()
+			sum.HasMore = true
+			return sum, nil
+		}
 		var exhausted *IntentSemanticFallbackRequiredError
 		if semanticPass && errors.As(replayErr, &exhausted) {
 			advanced, ok, err := beginIntentForwardRecoveryPrefix(
@@ -1181,6 +1224,9 @@ func intentCandidateDeferredReason(
 	decision IntentCandidateDecision,
 	evaluation IntentCandidateEvaluationResult,
 ) string {
+	if decision.VerificationDeferred {
+		return intentVerificationResourceWaitReason
+	}
 	if len(decision.Assignment.MissingCompanions) > 0 {
 		return strings.Join(decision.Assignment.MissingCompanions, "; ")
 	}

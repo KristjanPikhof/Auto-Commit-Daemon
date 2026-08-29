@@ -7,11 +7,107 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 )
+
+func TestClassifyResourceUnavailable(t *testing.T) {
+	gitNoSpace := &gitpkg.Error{
+		Args: []string{"worktree", "add"}, ExitCode: 128,
+		Stderr: strings.Repeat("diagnostic context\n", 600) +
+			"fatal: cannot create directory: No space left on device\n",
+		Err: errors.New("exit status 128"),
+	}
+	gitQuota := &gitpkg.Error{
+		Args: []string{"worktree", "remove"}, ExitCode: 128,
+		Stderr: "fatal: could not remove worktree: Disk quota exceeded\n",
+		Err:    errors.New("exit status 128"),
+	}
+	tests := []struct {
+		name      string
+		err       error
+		want      bool
+		wantCause error
+		wantSame  bool
+	}{
+		{
+			name: "wrapped filesystem no space",
+			err: &os.PathError{
+				Op: "mkdir", Path: "verification-worktree", Err: syscall.ENOSPC,
+			},
+			want: true, wantCause: syscall.ENOSPC,
+		},
+		{
+			name: "wrapped filesystem quota",
+			err: &os.PathError{
+				Op: "write", Path: "marker.json", Err: syscall.EDQUOT,
+			},
+			want: true, wantCause: syscall.EDQUOT,
+		},
+		{name: "bounded git no space diagnostic", err: gitNoSpace, want: true},
+		{
+			name: "joined git quota diagnostic",
+			err:  errors.Join(errors.New("cleanup failed"), gitQuota), want: true,
+		},
+		{
+			name: "untyped matching text",
+			err:  errors.New("no space left on device"), wantSame: true,
+		},
+		{
+			name: "ordinary git failure",
+			err: &gitpkg.Error{
+				Args: []string{"worktree", "add"}, ExitCode: 128,
+				Stderr: "fatal: invalid reference\n", Err: errors.New("exit status 128"),
+			},
+			wantSame: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			classified := ClassifyResourceUnavailable(tc.err)
+			if got := errors.Is(classified, ErrResourceUnavailable); got != tc.want {
+				t.Fatalf("resource classification=%v want=%v err=%v", got, tc.want, classified)
+			}
+			if tc.wantCause != nil && !errors.Is(classified, tc.wantCause) {
+				t.Fatalf("classified error lost cause %v: %v", tc.wantCause, classified)
+			}
+			if tc.wantSame && classified != tc.err {
+				t.Fatalf("ordinary error was replaced: before=%p after=%p", tc.err, classified)
+			}
+			if tc.want {
+				again := ClassifyResourceUnavailable(classified)
+				if again != classified {
+					t.Fatal("resource classification is not idempotent")
+				}
+			}
+		})
+	}
+}
+
+func TestRunnerCommandNoSpaceDiagnosticRemainsVerificationFailure(t *testing.T) {
+	repo := initVerificationRepo(t)
+	commit := runGit(t, repo, "rev-parse", "HEAD")
+	approved := mustApprove(
+		t, repo, `printf 'No space left on device\n' >&2; exit 9`,
+		5*time.Second,
+	)
+	result, err := (Runner{
+		WorkspaceRoot: filepath.Join(t.TempDir(), "verification"),
+	}).Run(context.Background(), Request{
+		RepoPath: repo, CandidateID: "candidate-command-no-space",
+		CommitOID: commit, Command: approved,
+	})
+	if err != nil {
+		t.Fatalf("Run returned infrastructure error for command exit: %v", err)
+	}
+	if result.Status != StatusFailed || !result.NeedsAttention ||
+		result.ExitCode != 9 {
+		t.Fatalf("result=%+v", result)
+	}
+}
 
 func TestRunnerRunExactCandidateTreePreservesLiveState(t *testing.T) {
 	repo := initVerificationRepo(t)

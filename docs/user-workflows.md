@@ -44,7 +44,7 @@ The human status output keeps the main questions separate:
 | `Published to Git` | Whether all protected changes are now in local Git commits. |
 | `Commit mode` | The configured strategy. A temporary local recovery remains part of Intent mode. |
 | `Publication queue` | All protected changes still waiting for local Git publication. |
-| `Active target` | The bounded remainder of an earlier `commit-all` request, when one exists. |
+| `Active target` | The bounded remainder of `commit-all` or automatic Intent recovery, when one exists. |
 | `Publication phase` | The current wait, planning, recovery, or publication step. |
 | `Last queue movement` | Time since durable queue progress; worker heartbeats do not reset it. |
 | `Worker liveness` | Whether the background worker is responsive, reported separately from progress. |
@@ -54,6 +54,12 @@ The human status output keeps the main questions separate:
 
 These fields are independent. Current changes can remain protected while Git
 publication is waiting or needs recovery.
+
+For a quick check, run `acd list`. A changing `QUEUE` or `TARGET` proves
+durable progress. If neither moves, `PHASE` shows whether ACD is waiting for a
+provider retry, calling the provider, running verification, or recovering.
+`acd status` gives the same state in full sentences and says whether any action
+is actually required.
 
 ## Publication is delayed
 
