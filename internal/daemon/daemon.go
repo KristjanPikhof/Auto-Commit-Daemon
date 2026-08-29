@@ -47,6 +47,11 @@ const (
 	// DefaultPruneInterval matches the legacy PRUNE_INTERVAL_SECONDS —
 	// run the capture_events pruner roughly once per minute.
 	DefaultPruneInterval = 60 * time.Second
+	// DefaultCheckpointRetentionInterval keeps the object inventory out of
+	// the minute-level event maintenance path. Checkpoint age and budget
+	// policies operate on days, so hourly evaluation is prompt without making
+	// idle repositories repeatedly traverse Git history.
+	DefaultCheckpointRetentionInterval = time.Hour
 	// DefaultRollupInterval is the minimum gap between RunDailyRollup
 	// attempts. The aggregator is also forced once per UTC-day boundary
 	// crossing regardless of this floor.
@@ -1454,15 +1459,16 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Loop state.
 	var (
-		consecutiveErrors int
-		emptyCount        int
-		currentDelay      = opts.Scheduler.Reset()
-		lastSweep         = time.Time{}
-		lastPrune         = time.Time{}
-		lastRollup        = time.Time{}
-		lastRollupUTCDay  = ""
-		stopped           bool
-		replayErrorLogs   replayErrorLogLimiter
+		consecutiveErrors       int
+		emptyCount              int
+		currentDelay            = opts.Scheduler.Reset()
+		lastSweep               = time.Time{}
+		lastPrune               = time.Time{}
+		lastCheckpointRetention = bootTime
+		lastRollup              = time.Time{}
+		lastRollupUTCDay        = ""
+		stopped                 bool
+		replayErrorLogs         replayErrorLogLimiter
 
 		// operation_in_progress staleness tracking. opMarkerSetAt is the
 		// monotonic-ish wall-clock observation of when the current marker
@@ -3146,6 +3152,9 @@ func Run(ctx context.Context, opts Options) error {
 			} else if n > 0 {
 				logger.Info("pruned events", "rows", n)
 			}
+			lastPrune = nowTS
+		}
+		if nowTS.Sub(lastCheckpointRetention) >= DefaultCheckpointRetentionInterval {
 			retention, retentionErr := checkpointStore.ApplyRetention(ctx, opts.RepoPath,
 				checkpointpkg.WorktreeID(opts.RepoPath), nowTS)
 			if retentionErr != nil {
@@ -3163,7 +3172,7 @@ func Run(ctx context.Context, opts Options) error {
 					logger.Info("pruned published checkpoints", "checkpoints", retention.Pruned)
 				}
 			}
-			lastPrune = nowTS
+			lastCheckpointRetention = nowTS
 		}
 
 		// 4k. Phase 3 daily rollup hook (§8.10). Throttled to
