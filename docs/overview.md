@@ -92,6 +92,10 @@ staged consent, and restart-safe phase state. The specialized publication
 record remains the authoritative branch-ref CAS proof and links to the general
 operation.
 
+SQLite v24 also freezes the capture membership of each new Intent history
+repair. Completed repairs and normal publications use the same durable branch
+transition proof, so a worker can recover either ref move after a restart.
+
 ## Publication
 
 Event strategy retains one captured change per local commit. Intent strategy
