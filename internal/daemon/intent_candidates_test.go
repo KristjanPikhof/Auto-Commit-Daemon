@@ -58,6 +58,13 @@ type partialReplanIntentCandidatePlannerStub struct {
 
 func (p *partialReplanIntentCandidatePlannerStub) Name() string { return "intent-v2-partial-test" }
 
+func (p *partialReplanIntentCandidatePlannerStub) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
 func (p *partialReplanIntentCandidatePlannerStub) PlanIntentV2(
 	_ context.Context,
 	req ai.IntentPlanRequestV2,
@@ -795,6 +802,65 @@ func TestIntentCandidateEnginePreservesValidGroupsDuringPartialReplan(t *testing
 		result.ResolutionMode != "partial_replan" || result.PreservedGroupCount != 1 ||
 		len(result.Decisions) != 2 {
 		t.Fatalf("partial replan requests=%+v result=%+v", planner.reqs, result)
+	}
+}
+
+func TestReplayIntentCandidatePartialReplanResetsPreflightScratch(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	seedTrackedFileCommit(t, ctx, f, "source.go", "package source\n\nconst Value = 1\n")
+	seedTrackedFileCommit(t, ctx, f, "source_test.go", "package source\n\nconst Want = 1\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		"source.go":      "package source\n\nconst Value = 2\n",
+		"source_test.go": "package source\n\nconst Want = 2\n",
+	} {
+		if err := os.WriteFile(filepath.Join(f.dir, path), []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+
+	planner := &partialReplanIntentCandidatePlannerStub{}
+	retryLimit := 2
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetBalanced,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+		IntentRetryLimit:       &retryLimit,
+		IntentVerificationMode: "structural",
+	})
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if sum.Published != 2 || planner.calls != 2 {
+		candidates, _ := state.IntentCandidatesForPair(
+			ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, 0)
+		t.Fatalf("summary=%+v planner calls=%d candidates=%+v",
+			sum, planner.calls, candidates)
+	}
+	pending, err = state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending after replay=%+v err=%v", pending, err)
+	}
+	var blocked int
+	if err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_plan_runs
+WHERE progress_state='preflight_blocked'`).Scan(&blocked); err != nil {
+		t.Fatal(err)
+	}
+	if blocked != 0 {
+		t.Fatalf("preflight-blocked plan runs=%d want 0", blocked)
 	}
 }
 
