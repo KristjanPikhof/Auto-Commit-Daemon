@@ -13,7 +13,9 @@
 - `acd list` and `acd status` now separate worker liveness from durable queue
   progress. They show the configured mode, full queue, any earlier bounded
   `commit-all` target, the current phase, and time since the queue last moved.
-  A completed old drain is no longer displayed as current work.
+  A completed old drain is no longer displayed as current work. A failed
+  candidate check is shown as automatic checkpoint replanning instead of an
+  immediate request for user action.
 - Intent local recovery now keeps deterministic dependency-safe membership but
   requires the configured semantic provider to write the locked commit
   message. Provider outages wait and retry instead of creating a generic
