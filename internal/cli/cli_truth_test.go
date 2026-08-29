@@ -347,6 +347,13 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		!report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 0 {
 		t.Fatalf("clean truth=%+v", report)
 	}
+	listReport := statusReport{}
+	if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+		t.Fatal(err)
+	}
+	if !listReport.Protected || listReport.UnpublishedCheckpoints != 0 {
+		t.Fatalf("recovered list truth=%+v", listReport)
+	}
 	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +376,13 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	}
 	if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
 		t.Fatalf("failed checkpoint truth=%+v", report)
+	}
+	listReport = statusReport{}
+	if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+		t.Fatal(err)
+	}
+	if listReport.UnpublishedCheckpoints != 1 {
+		t.Fatalf("failed list truth=%+v", listReport)
 	}
 }
 
