@@ -76,6 +76,13 @@ type publicationProgressReport struct {
 	StallThresholdSeconds  int64   `json:"stall_threshold_seconds,omitempty"`
 }
 
+type intentForwardRecoveryProgress struct {
+	Stage           string
+	TargetTotal     int64
+	TargetRemaining int64
+	LastProgressTS  float64
+}
+
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
@@ -547,6 +554,7 @@ func buildPublicationProgressReport(
 	drain := report.PublicationDrain
 	activeDrain := drain.ID != "" &&
 		drain.Phase != state.PublicationDrainCompleted
+	activeIntentRecovery := false
 	if activeDrain {
 		progress.Origin = "commit_all"
 		progress.TargetRemaining = drain.RemainingEvents
@@ -572,7 +580,27 @@ func buildPublicationProgressReport(
 			progress.Phase = "working"
 		}
 	} else {
+		recovery, active, err := readIntentForwardRecoveryProgress(
+			ctx, conn, report.BranchRef, report.BranchGeneration)
+		if err != nil {
+			return progress, err
+		}
+		activeIntentRecovery = active
+		if active {
+			progress.Origin = "intent_recovery"
+			progress.TargetRemaining = recovery.TargetRemaining
+			progress.TargetTotal = recovery.TargetTotal
+			progress.LastProgressTS = recovery.LastProgressTS
+			switch recovery.Stage {
+			case "local_unlock":
+				progress.Phase = "local_fallback"
+				progress.TemporaryLocalFallback = progress.Strategy == "intent"
+			default:
+				progress.Phase = "intent_replanning"
+			}
+		}
 		switch {
+		case active:
 		case report.PendingEvents == 0:
 			progress.Phase = "idle"
 		case report.Replay.State == "needs_attention" ||
@@ -580,6 +608,8 @@ func buildPublicationProgressReport(
 			progress.Phase = "needs_action"
 		case report.Replay.State == "degraded":
 			progress.Phase = "retrying"
+		case report.IntentV2.VerificationRecovering > 0:
+			progress.Phase = "intent_verification_recovery"
 		case report.IntentStrategy.Active:
 			progress.Phase = "intent_processing"
 		default:
@@ -590,7 +620,9 @@ func buildPublicationProgressReport(
 		if err != nil {
 			return progress, err
 		}
-		progress.LastProgressTS = lastProgress
+		if lastProgress > progress.LastProgressTS {
+			progress.LastProgressTS = lastProgress
+		}
 	}
 	if progress.Phase != "needs_action" {
 		manualPause := report.Paused &&
@@ -604,12 +636,14 @@ func buildPublicationProgressReport(
 			progress.WaitRemainingSeconds = report.Pause.RemainingSeconds
 		case report.Configuration.Configuration == "validating":
 			progress.Phase = "config_wait"
+		case activeIntentRecovery:
 		case report.CheckpointProtectionAvailable && !report.Protected && report.Busy:
 			progress.Phase = "checkpointing"
 		case intentProviderWaitActive(report):
 			progress.Phase = "provider_wait"
 			progress.TemporaryLocalFallback = false
 		case !activeDrain && report.PendingEvents > 0 &&
+			progress.Phase != "intent_verification_recovery" &&
 			report.IntentStrategy.BatchWaitActive:
 			progress.Phase = "intent_wait"
 			progress.WaitRemainingSeconds = intentWaitRemainingSeconds(
@@ -670,11 +704,85 @@ func ageExceedsThreshold(ageSeconds int64, threshold time.Duration) bool {
 
 func publicationPhaseCanStall(phase string) bool {
 	switch phase {
-	case "working", "intent_planning", "intent_processing", "event_publishing":
+	case "working", "intent_planning", "intent_replanning", "intent_processing",
+		"local_fallback", "event_publishing":
 		return true
 	default:
 		return false
 	}
+}
+
+func readIntentForwardRecoveryProgress(
+	ctx context.Context,
+	conn *sql.DB,
+	branchRef string,
+	branchGeneration int64,
+) (intentForwardRecoveryProgress, bool, error) {
+	var progress intentForwardRecoveryProgress
+	if conn == nil || strings.TrimSpace(branchRef) == "" || branchGeneration < 0 {
+		return progress, false, nil
+	}
+	raw, ok, err := metaLookup(ctx, conn, "intent.v2.forward_recovery")
+	if err != nil || !ok {
+		return progress, false, err
+	}
+	var recovery state.IntentForwardRecovery
+	if err := json.Unmarshal([]byte(raw), &recovery); err != nil {
+		return progress, false, fmt.Errorf(
+			"parse intent forward recovery progress: %w", err)
+	}
+	if recovery.BranchRef != branchRef ||
+		recovery.BranchGeneration != branchGeneration ||
+		len(recovery.TargetEventSeqs) == 0 {
+		return progress, false, nil
+	}
+	if len(recovery.TargetEventSeqs) > state.IntentCandidateMaxCaptures {
+		return progress, false, errors.New(
+			"intent forward recovery target exceeds the capture limit")
+	}
+	seen := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
+	args := make([]any, 0, 2+len(recovery.TargetEventSeqs))
+	args = append(args, branchRef, branchGeneration)
+	placeholders := make([]string, 0, len(recovery.TargetEventSeqs))
+	for _, seq := range recovery.TargetEventSeqs {
+		if seq <= 0 {
+			return progress, false, errors.New(
+				"intent forward recovery target contains an invalid capture")
+		}
+		if _, duplicate := seen[seq]; duplicate {
+			return progress, false, errors.New(
+				"intent forward recovery target contains a duplicate capture")
+		}
+		seen[seq] = struct{}{}
+		args = append(args, seq)
+		placeholders = append(placeholders, "?")
+	}
+	query := `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN state IN ('published','recovered')
+                         THEN 1 ELSE 0 END),0)
+FROM capture_events
+WHERE branch_ref=? AND branch_generation=?
+  AND seq IN (` + strings.Join(placeholders, ",") + `)`
+	var existing, resolved int64
+	if err := conn.QueryRowContext(ctx, query, args...).Scan(
+		&existing, &resolved); err != nil {
+		return progress, false, fmt.Errorf(
+			"read intent forward recovery progress: %w", err)
+	}
+	if existing != int64(len(recovery.TargetEventSeqs)) || resolved > existing {
+		return progress, false, errors.New(
+			"intent forward recovery target cannot be proved")
+	}
+	stage := strings.TrimSpace(recovery.Stage)
+	if stage == "" {
+		stage = "semantic_replan"
+	}
+	return intentForwardRecoveryProgress{
+		Stage: stage, TargetTotal: existing,
+		TargetRemaining: existing - resolved,
+		LastProgressTS:  recovery.LastProgressTS,
+	}, true, nil
 }
 
 func regularPublicationProgressBaseline(

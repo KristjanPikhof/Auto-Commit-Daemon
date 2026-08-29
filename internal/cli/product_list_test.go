@@ -130,6 +130,9 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 		{Repo: "/pending", Enabled: true, Protected: true,
 			State: productStateWaiting, PendingEvents: 3,
 			PublicationProgress: publicationProgressReport{Strategy: "intent", Phase: "intent_wait", QueuePending: 3, WaitRemainingSeconds: 42, LastProgressTS: 1, LastProgressAgeSeconds: 8}},
+		{Repo: "/recovering", Enabled: true, Protected: true,
+			State: productStatePublishing, PendingEvents: 7,
+			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "intent_recovery", Phase: "intent_replanning", QueuePending: 7, TargetRemaining: 4, TargetTotal: 6, LastProgressTS: 1, LastProgressAgeSeconds: 12}},
 		{Repo: "/completed", Enabled: true, Protected: true,
 			State:               productStateProtected,
 			PublicationDrain:    publicationDrainReport{ID: "drain", Phase: "completed", PublishedEvents: 12, TargetEvents: 12},
@@ -145,6 +148,7 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 	}{
 		{"active", "intent", "22", "commit-all:5/12", "intent-plan"},
 		{"pending", "intent", "3", "-", "wait:42s"},
+		{"recovering", "intent", "7", "replan:4/6", "intent-replan"},
 		{"completed", "intent", "0", "-", "idle"},
 	} {
 		line := productListLineForRepo(t, out.String(), row.repo)
@@ -157,6 +161,30 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 	}
 	if line := productListLineForRepo(t, out.String(), "completed"); !strings.Contains(line, "healthy") {
 		t.Fatalf("completed drain did not return to healthy: %s", line)
+	}
+}
+
+func TestProductListDoesNotMaskActiveIntentRecoveryAsCheckpointing(t *testing.T) {
+	record := central.RepoRecord{
+		Path: "/repo", RepositoryID: "repo-id", WorktreeID: "worktree-id",
+	}
+	overview := productListRepoOverview{report: statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 7,
+		CheckpointProtectionAvailable: true, Protected: false, Busy: true,
+		OperationalState: "busy",
+		IntentStrategy:   intentStrategyReport{Strategy: "intent", Active: true},
+		PublicationProgress: publicationProgressReport{
+			Strategy: "intent", Origin: "intent_recovery",
+			Phase: "intent_replanning", QueuePending: 7,
+			TargetRemaining: 4, TargetTotal: 6,
+		},
+	}}
+	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
+		RepositoryID: record.RepositoryID, State: "running",
+	}, overview, nil)
+	if !strings.Contains(entry.Summary, "automatically rebuilding semantic") ||
+		strings.Contains(entry.Summary, "checkpointing") {
+		t.Fatalf("active recovery entry=%+v", entry)
 	}
 }
 

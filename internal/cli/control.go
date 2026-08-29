@@ -625,6 +625,10 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 			formatDurationCompact(time.Duration(
 				status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
 		res.NextAction = "No action needed yet. ACD will start bounded recovery automatically; run `acd doctor` if this persists."
+	case status.PublicationProgress.Origin == "intent_recovery":
+		res.Health = controlHealthPublishing
+		res.Summary = "ACD is automatically rebuilding semantic commit groups for the protected changes."
+		res.NextAction = "No action needed. ACD will keep the exact recovery target protected and continue automatically."
 	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
 		status.PublicationDrain.FallbackMode == "semantic_replan":
 		res.Health = controlHealthPublishing

@@ -319,11 +319,19 @@ func productListMode(entry productListEntry) string {
 
 func productListTarget(entry productListEntry) string {
 	progress := entry.PublicationProgress
-	if progress.Origin != "commit_all" || progress.TargetTotal <= 0 {
+	if progress.TargetTotal <= 0 {
 		return "-"
 	}
-	return fmt.Sprintf("commit-all:%d/%d", progress.TargetRemaining,
-		progress.TargetTotal)
+	switch progress.Origin {
+	case "commit_all":
+		return fmt.Sprintf("commit-all:%d/%d", progress.TargetRemaining,
+			progress.TargetTotal)
+	case "intent_recovery":
+		return fmt.Sprintf("replan:%d/%d", progress.TargetRemaining,
+			progress.TargetTotal)
+	default:
+		return "-"
+	}
 }
 
 func productListProgressAge(entry productListEntry) string {

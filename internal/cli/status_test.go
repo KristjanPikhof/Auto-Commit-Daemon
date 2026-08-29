@@ -268,6 +268,75 @@ func TestPublicationProgressSeparatesStallFromExpectedWait(t *testing.T) {
 	}
 }
 
+func TestPublicationProgressShowsAutomaticVerificationRecovery(t *testing.T) {
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 7,
+		IntentStrategy: intentStrategyReport{Strategy: "intent", Active: true},
+		IntentV2:       intentV2Report{VerificationRecovering: 2},
+	}
+	progress, err := buildPublicationProgressReport(
+		context.Background(), nil, report, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Phase != "intent_verification_recovery" {
+		t.Fatalf("verification recovery progress=%+v", progress)
+	}
+	if label := publicationProgressPhaseLabel(progress); !strings.Contains(
+		label, "automatic checkpoint replan",
+	) {
+		t.Fatalf("verification recovery label=%q", label)
+	}
+}
+
+func TestStatusProjectsFailedVerificationAsAutomaticRecovery(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, dbPath, d := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "codex")
+	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		BaseHead: "deadbeef", Operation: "modify", Path: "recover.go",
+		Fidelity: "exact", CapturedTS: nowFloat(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveIntentCandidate(ctx, d, state.IntentCandidate{
+		ID: "verification-recovery", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: state.IntentCandidateWaiting,
+		Readiness: state.IntentReadinessWait,
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: seq, EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"commit.strategy":           "intent",
+		"intent.v2.migration_state": "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	record := central.RepoRecord{
+		Path: repo, StateDB: dbPath, RepoHash: central.CanonicalID(repo),
+	}
+	report, err := buildStatusReport(ctx, record, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.IntentV2.VerificationRecovering != 1 ||
+		report.IntentV2.VerificationAttention != 0 ||
+		report.PublicationProgress.Phase != "intent_verification_recovery" {
+		t.Fatalf("verification recovery report=%+v progress=%+v",
+			report.IntentV2, report.PublicationProgress)
+	}
+}
+
 func TestPublicationProgressPrioritizesDeliberateWaits(t *testing.T) {
 	t.Setenv("ACD_AI_TIMEOUT", "1m")
 	now := time.Unix(1_000, 0)

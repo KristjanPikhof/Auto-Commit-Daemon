@@ -186,6 +186,9 @@ func renderProductPublicationProgress(
 	if progress.Origin == "commit_all" && progress.TargetTotal > 0 {
 		fmt.Fprintf(out, "Active target: earlier commit-all request, %d of %d left\n",
 			progress.TargetRemaining, progress.TargetTotal)
+	} else if progress.Origin == "intent_recovery" && progress.TargetTotal > 0 {
+		fmt.Fprintf(out, "Active target: automatic Intent replan, %d of %d left\n",
+			progress.TargetRemaining, progress.TargetTotal)
 	}
 	fmt.Fprintf(out, "Publication phase: %s\n",
 		publicationProgressPhaseLabel(progress))
@@ -232,6 +235,8 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 		return "recovering by replanning commit groups by Intent"
 	case "intent_processing":
 		return "grouping and publishing by Intent"
+	case "intent_verification_recovery":
+		return "verification failed; automatic checkpoint replan pending"
 	case "recovering":
 		return "recovering the publication plan"
 	case "local_fallback":

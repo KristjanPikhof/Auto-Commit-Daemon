@@ -232,6 +232,7 @@ type intentV2Report struct {
 	WaitingCandidates        int    `json:"waiting_candidates,omitempty"`
 	BlockedCandidates        int    `json:"blocked_candidates,omitempty"`
 	SoftPublishedCandidates  int    `json:"soft_published_candidates,omitempty"`
+	VerificationRecovering   int    `json:"verification_recovering,omitempty"`
 	VerificationAttention    int    `json:"verification_attention,omitempty"`
 	RecoverableRepairs       int    `json:"recoverable_repairs,omitempty"`
 	LastBoundaryEpoch        int64  `json:"last_boundary_epoch,omitempty"`
@@ -526,9 +527,23 @@ SELECT COUNT(*),
        COALESCE(SUM(status='blocked'),0),
        COALESCE(SUM(status='soft_published'),0),
        COALESCE(SUM(
+           status='waiting'
+           AND verification_status='failed'
+           AND EXISTS (
+               SELECT 1
+               FROM intent_candidate_events pending_membership
+               JOIN capture_events pending_event
+                 ON pending_event.seq=pending_membership.event_seq
+                AND pending_event.state='pending'
+               WHERE pending_membership.candidate_id=intent_candidates.id
+                 AND pending_membership.membership_state='active'
+           )
+       ),0),
+       COALESCE(SUM(
            (status='blocked'
             OR verification_status IN
-               ('failed','timed_out','needs_attention'))
+               ('timed_out','needs_attention')
+            OR (verification_status='failed' AND status<>'waiting'))
            AND EXISTS (
                SELECT 1
                FROM intent_candidate_events pending_membership
@@ -548,7 +563,8 @@ WHERE status IN ('open','waiting','ready','soft_published','blocked')
   )`).Scan(
 		&report.OpenCandidates, &report.ReadyCandidates,
 		&report.WaitingCandidates, &report.BlockedCandidates,
-		&report.SoftPublishedCandidates, &report.VerificationAttention,
+		&report.SoftPublishedCandidates, &report.VerificationRecovering,
+		&report.VerificationAttention,
 	); err != nil {
 		return report, errors.New("read Intent v2 candidate summary failed")
 	}
@@ -702,7 +718,7 @@ func renderIntentV2Human(out io.Writer, report intentV2Report) {
 		customized = " customized"
 	}
 	fmt.Fprintf(out,
-		"Intent v2: %s migration=%s preset=%s@%d%s verification=%s correction=%d/%d repair=%t/%s/%d candidates=%d ready=%d waiting=%d blocked=%d soft=%d verification_attention=%d recoverable_repairs=%d\n",
+		"Intent v2: %s migration=%s preset=%s@%d%s verification=%s correction=%d/%d repair=%t/%s/%d candidates=%d ready=%d waiting=%d blocked=%d soft=%d verification_recovering=%d verification_attention=%d recoverable_repairs=%d\n",
 		valueOrUnset(report.ReplayState), valueOrUnset(report.MigrationState),
 		valueOrUnset(report.PresetID), report.PresetVersion, customized,
 		valueOrUnset(report.VerificationMode),
@@ -712,6 +728,7 @@ func renderIntentV2Human(out io.Writer, report intentV2Report) {
 		report.OpenCandidates,
 		report.ReadyCandidates, report.WaitingCandidates,
 		report.BlockedCandidates, report.SoftPublishedCandidates,
+		report.VerificationRecovering,
 		report.VerificationAttention,
 		report.RecoverableRepairs)
 	if report.NeedsAttention != "" {
