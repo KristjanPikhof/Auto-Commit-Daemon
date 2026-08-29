@@ -320,6 +320,10 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 	repo, dbPath, d := makeRepoStateDB(t)
+	seqs := insertCompletedCheckpoint(t, d, "cp-recovered-status",
+		"0123456789abcdef", []checkpointMemberFixture{{
+			State: state.EventStateRecovered, CommitOID: "recovery-commit",
+		}})
 	registerRepo(t, roots, repo, dbPath, "codex")
 	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
 		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
@@ -340,7 +344,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !report.WorktreeClean || !report.AllChangesCommittedInGit ||
-		!report.CheckpointPublishedByACD {
+		!report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 0 {
 		t.Fatalf("clean truth=%+v", report)
 	}
 	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o600); err != nil {
@@ -353,6 +357,18 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if report.WorktreeClean || report.AllChangesCommittedInGit ||
 		!report.CheckpointPublishedByACD {
 		t.Fatalf("dirty truth=%+v", report)
+	}
+	if _, err := d.SQL().ExecContext(ctx,
+		`UPDATE capture_events SET state=? WHERE seq=?`,
+		state.EventStateFailed, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	report, err = buildStatusReport(ctx, rec, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
+		t.Fatalf("failed checkpoint truth=%+v", report)
 	}
 }
 
