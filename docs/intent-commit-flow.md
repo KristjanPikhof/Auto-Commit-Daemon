@@ -173,8 +173,10 @@ queue forever. ACD lets later paths reach the planner first. If that still
 makes no progress, it follows the bounded overlap between failed groups and
 their completed checkpoints, retires those unpublished groups together, and
 replans the exact protected set. Every capture must still be pending on the
-same branch generation. A healthy overlapping group or an active publication
-or repair transaction stops recovery rather than weakening its boundary.
+same branch generation, or already be durably resolved by an earlier recovery
+pass. The frozen target stays active until every member is resolved. A healthy
+overlapping group or an active publication or repair transaction stops
+recovery rather than weakening its boundary.
 
 Balanced/Quality repair is restricted to a private contiguous ACD-authored
 first-parent suffix at exact `HEAD`; it rejects merges, tags, other refs, Git
