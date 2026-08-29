@@ -235,9 +235,11 @@ SELECT MIN(seq) FROM (
     JOIN capture_events pending
       ON pending.seq=membership.event_seq
      AND pending.state='pending'
-    WHERE (candidate.status='blocked'
-       OR candidate.verification_status IN
-          ('failed','timed_out','needs_attention'))
+	    WHERE (candidate.status='blocked'
+	       OR candidate.verification_status IN
+	          ('timed_out','needs_attention')
+	       OR (candidate.verification_status='failed'
+	           AND candidate.status<>'waiting'))
       AND candidate.branch_ref=?
       AND candidate.branch_generation=?
 )`, branchRef, branchGeneration, branchRef, branchGeneration).Scan(&seq)

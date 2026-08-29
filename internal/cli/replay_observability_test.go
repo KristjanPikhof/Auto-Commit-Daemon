@@ -86,7 +86,7 @@ func TestReplayObservabilityDurableAttentionMatrix(t *testing.T) {
 			},
 		},
 		{
-			name: "candidate verification attention",
+			name: "candidate verification terminal attention",
 			seed: func(t *testing.T, d *state.DB) int64 {
 				t.Helper()
 				ctx := context.Background()
@@ -103,7 +103,7 @@ func TestReplayObservabilityDurableAttentionMatrix(t *testing.T) {
 					BranchGeneration: 1, Status: state.IntentCandidateWaiting,
 					Readiness: state.IntentReadinessWait,
 					VerificationStatus: sql.NullString{
-						String: "failed", Valid: true,
+						String: "needs_attention", Valid: true,
 					},
 					Events: []state.IntentCandidateEvent{{
 						EventSeq: seq, EventRole: "code",
@@ -150,6 +150,34 @@ func TestReplayObservabilityDurableAttentionMatrix(t *testing.T) {
 				t.Fatalf("durable projection=%+v want_seq=%d", report, wantSeq)
 			}
 		})
+	}
+}
+
+func TestReplayObservabilityTreatsFailedVerificationAsRecovering(t *testing.T) {
+	_, _, d := makeRepoStateDB(t)
+	ctx := context.Background()
+	seq := appendReplayHealthEvent(t, d, "recovering.go")
+	seedCurrentReplayPair(t, d, "refs/heads/main", 1)
+	if err := state.SaveIntentCandidate(ctx, d, state.IntentCandidate{
+		ID: "candidate-recovering", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: state.IntentCandidateWaiting,
+		Readiness: state.IntentReadinessWait,
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: seq, EventRole: "code",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := loadReplayObservabilityReport(ctx, d.SQL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.State != "active" || report.BlockedSeq != 0 {
+		t.Fatalf("recovering verification projection=%+v", report)
 	}
 }
 
