@@ -10,11 +10,12 @@ report `protected=true` only when:
 - no eligible path failed reading or stabilization; and
 - `covered_epoch == observation_epoch`.
 
-Watcher events wake the worker immediately. More events in the same burst use
-a 100 ms trailing debounce with a 500 ms hard limit, so continuous formatter
-activity cannot postpone observation indefinitely. The complete safety poll
-starts at 750 ms after activity and doubles while the repository stays idle,
-up to two minutes. It repairs watcher loss and remains the coverage authority.
+When filesystem watching is enabled, its first event wakes the worker
+immediately. More events in the same burst use a 100 ms trailing debounce with
+a 500 ms hard limit, so continuous formatter activity cannot postpone
+observation indefinitely. The complete safety poll starts at 750 ms after
+activity and doubles while the repository stays idle, up to two minutes. It
+repairs watcher loss and remains the coverage authority.
 
 ## Eligible scope
 
@@ -23,9 +24,12 @@ checks. Git-ignored and configured sensitive paths are outside the contract.
 Unreadable, unstable, or oversized eligible paths make the observation
 unprotected until a later complete rescan succeeds.
 
-The old pending-event limit no longer caps protection. It is accepted only as
-a deprecated publication-window limit. Completed checkpoint refs, not an
-in-memory queue size, bound durability.
+The 50,000-event default backpressure limit bounds low-level publication work
+for one branch generation. It does not cap checkpoint protection: a completed
+checkpoint still records the full eligible worktree when the event queue is
+full. Paths that do not fit in the event queue stay out of capture-event and
+shadow ownership, then are classified again after publication drains below the
+limit.
 
 ## Durable checkpoint completion
 
