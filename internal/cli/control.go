@@ -620,11 +620,19 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.NextAction = "No action needed. ACD will retry the provider automatically."
 	case status.PublicationProgress.Phase == "stalled":
 		res.Health = controlHealthDegraded
-		res.Summary = fmt.Sprintf(
-			"The worker is responsive, but the publication queue has not moved for %s. Your work remains protected.",
-			formatDurationCompact(time.Duration(
-				status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
-		res.NextAction = "No action needed yet. ACD will start bounded recovery automatically; run `acd doctor` if this persists."
+		if status.PublicationProgress.Origin == "intent_recovery" {
+			res.Summary = fmt.Sprintf(
+				"Automatic Intent recovery is active, but its target has not moved for %s. The worker is responsive and your work remains protected.",
+				formatDurationCompact(time.Duration(
+					status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
+			res.NextAction = "No action needed yet. ACD will keep replanning the exact recovery target; run `acd doctor` if this persists."
+		} else {
+			res.Summary = fmt.Sprintf(
+				"The worker is responsive, but the publication queue has not moved for %s. Your work remains protected.",
+				formatDurationCompact(time.Duration(
+					status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
+			res.NextAction = "No action needed yet. ACD will start bounded recovery automatically; run `acd doctor` if this persists."
+		}
 	case status.PublicationProgress.Origin == "intent_recovery":
 		res.Health = controlHealthPublishing
 		res.Summary = "ACD is automatically rebuilding semantic commit groups for the protected changes."
