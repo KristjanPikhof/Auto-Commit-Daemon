@@ -3486,7 +3486,14 @@ func runWithProgressHeartbeat(
 }
 
 func replayNeedsImmediateFollowup(sum ReplaySummary) bool {
-	return sum.Published > 0 || sum.HasMore || sum.RecaptureRequired
+	if sum.Published > 0 || sum.RecaptureRequired {
+		return true
+	}
+	// A transient wait can retain a frozen publication target and therefore
+	// report HasMore, but rerunning the full capture/replay loop immediately
+	// cannot advance it. Let the idle scheduler back off until the provider,
+	// verification resource, settle window, or another wake becomes ready.
+	return sum.HasMore && sum.Disposition != ReplayDispositionTransientWait
 }
 
 // resolveBranch returns (branchRef, headOID) for the current HEAD. A detached
