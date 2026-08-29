@@ -796,6 +796,52 @@ func IntentForwardRecoveryForPair(
 	return recovery, true, nil
 }
 
+// CompleteAnyResolvedIntentForwardRecovery retires the one durable forward
+// recovery marker when its exact frozen target has already been settled. The
+// marker is repository-wide, so a completed recovery from an older branch
+// generation must be cleared before a newer generation can start its own
+// bounded recovery.
+func CompleteAnyResolvedIntentForwardRecovery(
+	ctx context.Context,
+	d *DB,
+) (IntentForwardRecovery, bool, error) {
+	var recovery IntentForwardRecovery
+	if d == nil {
+		return recovery, false, errors.New(
+			"state: CompleteAnyResolvedIntentForwardRecovery: state db is required")
+	}
+	var raw string
+	err := d.readSQL().QueryRowContext(ctx,
+		`SELECT value FROM daemon_meta WHERE key=?`,
+		intentForwardRecoveryMetaKey).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return recovery, false, nil
+	}
+	if err != nil {
+		return recovery, false, fmt.Errorf(
+			"state: load any resolved intent forward recovery: %w", err)
+	}
+	if err := json.Unmarshal([]byte(raw), &recovery); err != nil {
+		return IntentForwardRecovery{}, false, fmt.Errorf(
+			"state: parse any resolved intent forward recovery: %w", err)
+	}
+	if recovery.Stage == "" {
+		recovery.Stage = "semantic_replan"
+	}
+	// Legacy forward-recovery markers predate the frozen target list. They
+	// remain usable by the pair-specific recovery path, but cannot be proved
+	// complete from durable event membership and therefore must not be guessed
+	// away here.
+	if len(recovery.TargetEventSeqs) == 0 {
+		return recovery, false, nil
+	}
+	completed, err := CompleteResolvedIntentForwardRecovery(ctx, d, recovery)
+	if err != nil {
+		return recovery, false, err
+	}
+	return recovery, completed, nil
+}
+
 // CompleteResolvedIntentForwardRecovery clears a loaded recovery marker only
 // after its frozen target is still exact and every member is durably resolved.
 // It makes a crash after the last publication but before ordinary marker

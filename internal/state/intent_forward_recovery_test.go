@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -535,6 +536,134 @@ WHERE seq IN (?,?,?)`, fixture.seqs[0], fixture.seqs[0],
 	completed, err = CompleteResolvedIntentForwardRecovery(ctx, fixture.db, loaded)
 	if err != nil || completed {
 		t.Fatalf("idempotent resolved completion=(%t,%v)", completed, err)
+	}
+}
+
+func TestCompleteAnyResolvedIntentForwardRecoveryClearsOlderGeneration(t *testing.T) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	execFailedIntentCheckpointTest(t, fixture.db, `
+UPDATE capture_events
+SET state='recovered',published_ts=2
+WHERE seq IN (?,?,?)`, fixture.seqs[0], fixture.seqs[1], fixture.seqs[2])
+
+	loaded, completed, err := CompleteAnyResolvedIntentForwardRecovery(
+		ctx, fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !completed || loaded.BranchRef != recovery.BranchRef ||
+		loaded.BranchGeneration != recovery.BranchGeneration ||
+		!sameEventSeqs(loaded.TargetEventSeqs, recovery.TargetEventSeqs) {
+		t.Fatalf("completed=%t loaded=%+v want=%+v",
+			completed, loaded, recovery)
+	}
+	if _, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, recovery.BranchRef, recovery.BranchGeneration,
+	); err != nil || active {
+		t.Fatalf("old generation marker active=%t err=%v", active, err)
+	}
+
+	newGeneration := recovery.BranchGeneration + 1
+	newSeqs := []int64{
+		appendIntentV2Event(t, fixture.db, recovery.BranchRef,
+			newGeneration, "new-source.go"),
+		appendIntentV2Event(t, fixture.db, recovery.BranchRef,
+			newGeneration, "new-source_test.go"),
+	}
+	seedFailedIntentCompletedCheckpoint(t, fixture.db, "split", newSeqs)
+	const newCandidateID = "new-generation-failed-candidate"
+	if err := SaveIntentCandidate(ctx, fixture.db, IntentCandidate{
+		ID: newCandidateID, BranchRef: recovery.BranchRef,
+		BranchGeneration: newGeneration,
+		Status:           IntentCandidateWaiting, Readiness: IntentReadinessWait,
+		Purpose: "complete the new generation change",
+		VerificationStatus: sql.NullString{
+			String: "failed", Valid: true,
+		},
+		Events: []IntentCandidateEvent{{
+			EventSeq: newSeqs[0], EventRole: "implementation",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, recovery.BranchRef, newGeneration, newSeqs[0])
+	if err != nil || !changed || started.CandidateID != newCandidateID ||
+		!sameEventSeqs(started.TargetEventSeqs, newSeqs) {
+		t.Fatalf("new generation recovery=(%+v changed=%t err=%v)",
+			started, changed, err)
+	}
+}
+
+func TestCompleteAnyResolvedIntentForwardRecoveryKeepsUnresolvedMarker(t *testing.T) {
+	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
+	ctx := context.Background()
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("start recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+
+	loaded, completed, err := CompleteAnyResolvedIntentForwardRecovery(
+		ctx, fixture.db)
+	if err != nil || completed || !reflect.DeepEqual(loaded, recovery) {
+		t.Fatalf("unresolved completion=(%+v completed=%t err=%v), want %+v",
+			loaded, completed, err, recovery)
+	}
+	if marker, active, err := IntentForwardRecoveryForPair(
+		ctx, fixture.db, recovery.BranchRef, recovery.BranchGeneration,
+	); err != nil || !active || !reflect.DeepEqual(marker, recovery) {
+		t.Fatalf("unresolved marker=(%+v active=%t err=%v), want %+v",
+			marker, active, err, recovery)
+	}
+	if _, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, recovery.BranchRef,
+		recovery.BranchGeneration+1, fixture.seqs[0],
+	); err == nil || changed || !strings.Contains(err.Error(), "conflicting") {
+		t.Fatalf("new generation with unresolved marker changed=%t err=%v",
+			changed, err)
+	}
+}
+
+func TestCompleteAnyResolvedIntentForwardRecoveryKeepsLegacyTargetlessMarker(
+	t *testing.T,
+) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	legacy := IntentForwardRecovery{
+		BranchRef: "refs/heads/main", BranchGeneration: 3,
+		CandidateID: "legacy", Reason: "repair_horizon_expired",
+	}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,1)`,
+		intentForwardRecoveryMetaKey, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, completed, err := CompleteAnyResolvedIntentForwardRecovery(ctx, db)
+	if err != nil || completed || loaded.Stage != "semantic_replan" ||
+		loaded.CandidateID != legacy.CandidateID {
+		t.Fatalf("legacy completion=(%+v completed=%t err=%v)",
+			loaded, completed, err)
+	}
+	if marker, active, err := IntentForwardRecoveryForPair(
+		ctx, db, legacy.BranchRef, legacy.BranchGeneration,
+	); err != nil || !active || marker.CandidateID != legacy.CandidateID {
+		t.Fatalf("legacy marker=(%+v active=%t err=%v)", marker, active, err)
 	}
 }
 
