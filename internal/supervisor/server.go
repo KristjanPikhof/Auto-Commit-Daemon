@@ -116,8 +116,9 @@ var restartDelays = []time.Duration{time.Second, 2 * time.Second, 5 * time.Secon
 // checkpoint must eventually release admission so two unhealthy repositories
 // cannot prevent every later repository from starting.
 const (
-	maxConcurrentWorkerStarts   = 2
-	workerStartupAdmissionLease = 2 * time.Minute
+	maxConcurrentWorkerStarts          = 2
+	workerStartupAdmissionLease        = 2 * time.Minute
+	workerStartupAdmissionExpiredError = "initial protection checkpoint is still retrying after 2 minutes"
 )
 
 func (s *Server) Run(ctx context.Context) error {
@@ -408,13 +409,15 @@ func (s *Server) expireMaintenanceLocked(now time.Time) {
 func (s *Server) status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	status := Status{PID: os.Getpid(), Version: s.Version, BinaryDigest: s.BinaryDigest,
 		Ownership: os.Getenv(supervisorOwnershipEnv), Compatibility: s.Compatibility,
 		Workers: make([]WorkerStatus, 0, len(s.workers))}
 	for _, worker := range s.workers {
 		item := WorkerStatus{RepositoryID: worker.id, Restarts: worker.restarts, LastError: worker.lastError, State: "backoff", Version: s.Version}
-		if runtimeStatus, err := ReadWorkerRuntimeStatus(s.Roots, worker.id); err == nil &&
-			(worker.launchd || worker.cmd != nil) {
+		runtimeStatus, runtimeStatusErr := ReadWorkerRuntimeStatus(s.Roots, worker.id)
+		active := worker.launchd || worker.cmd != nil
+		if runtimeStatusErr == nil && active {
 			item.PID = runtimeStatus.PID
 			item.State = runtimeStatus.State
 			item.Restarts = runtimeStatus.Restarts
@@ -424,6 +427,12 @@ func (s *Server) status() Status {
 		} else if worker.cmd != nil && worker.cmd.Process != nil {
 			item.PID = worker.cmd.Process.Pid
 			item.State = "starting"
+		}
+		if active && item.State == "starting" &&
+			!workerHoldsStartupAdmission(
+				worker, runtimeStatus, runtimeStatusErr, now) {
+			item.State = "needs_action"
+			item.LastError = workerStartupAdmissionExpiredError
 		}
 		if item.Restarts >= 5 && item.LastError != "" {
 			item.State = "needs_action"
@@ -510,6 +519,12 @@ func (s *Server) reconcile(ctx context.Context) error {
 			worker = &workerProcess{id: id, signature: signature, desired: signature}
 			if s.LaunchdWorkers && runtime.GOOS == "darwin" {
 				worker.launchd = s.launchdWorkerExists(ctx, id)
+				if worker.launchd {
+					// A discovered legacy launchd worker may not have written its
+					// status file yet. Give it one bounded admission lease instead
+					// of either ignoring an active scan or blocking forever.
+					worker.started = now
+				}
 			}
 			s.workers[id] = worker
 		}
@@ -561,13 +576,19 @@ func workerHoldsStartupAdmission(
 	statusErr error,
 	now time.Time,
 ) bool {
+	if worker == nil {
+		return false
+	}
 	started := worker.started
 	if statusErr == nil {
 		if status.State != "starting" {
 			return false
 		}
-		if status.UpdatedTS > 0 {
+		if started.IsZero() && status.UpdatedTS > 0 {
 			started = time.UnixMilli(status.UpdatedTS)
+			if started.After(now) {
+				started = now
+			}
 		}
 	}
 	if started.IsZero() {

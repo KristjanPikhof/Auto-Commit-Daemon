@@ -296,12 +296,90 @@ func TestStartingWorkersReleasesExpiredAdmission(t *testing.T) {
 	if workerHoldsStartupAdmission(worker, WorkerRuntimeStatus{}, os.ErrNotExist, now) {
 		t.Fatal("expired missing status still monopolized startup admission")
 	}
-	if !workerHoldsStartupAdmission(worker, WorkerRuntimeStatus{
+	if workerHoldsStartupAdmission(worker, WorkerRuntimeStatus{
 		RepositoryID: worker.id,
 		State:        "starting",
 		UpdatedTS:    now.UnixMilli(),
 	}, nil, now) {
-		t.Fatal("fresh starting status did not retain startup admission")
+		t.Fatal("fresh status extended an expired process admission")
+	}
+	fresh := &workerProcess{id: worker.id, cmd: &exec.Cmd{}, started: now}
+	if !workerHoldsStartupAdmission(fresh, WorkerRuntimeStatus{
+		RepositoryID: fresh.id,
+		State:        "starting",
+		UpdatedTS:    now.UnixMilli(),
+	}, nil, now) {
+		t.Fatal("fresh process did not retain startup admission")
+	}
+}
+
+func TestStatusReportsExpiredStartupAdmissionWithoutStoppingRetry(t *testing.T) {
+	roots := paths.Roots{
+		State: filepath.Join(t.TempDir(), "state"),
+		Share: filepath.Join(t.TempDir(), "share"),
+	}
+	const repositoryID = "0000000000000000"
+	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
+		RepositoryID: repositoryID,
+		State:        "starting",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	worker := &workerProcess{
+		id: repositoryID, cmd: &exec.Cmd{},
+		started: time.Now().Add(-workerStartupAdmissionLease - time.Second),
+	}
+	server := &Server{
+		Roots: roots,
+		workers: map[string]*workerProcess{
+			repositoryID: worker,
+		},
+	}
+	status := server.status()
+	if len(status.Workers) != 1 ||
+		status.Workers[0].State != "needs_action" ||
+		status.Workers[0].LastError != workerStartupAdmissionExpiredError {
+		t.Fatalf("expired worker status=%+v", status.Workers)
+	}
+	if worker.cmd == nil {
+		t.Fatal("status projection stopped the retrying worker")
+	}
+	runtimeStatus, err := ReadWorkerRuntimeStatus(roots, repositoryID)
+	if err != nil || runtimeStatus.State != "starting" {
+		t.Fatalf("runtime status=(%+v,%v), want untouched starting state",
+			runtimeStatus, err)
+	}
+}
+
+func TestStatusBoundsMissingLaunchdStartupState(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name      string
+		started   time.Time
+		wantState string
+	}{
+		{name: "fresh", started: now, wantState: "starting"},
+		{name: "expired", started: now.Add(-workerStartupAdmissionLease - time.Second), wantState: "needs_action"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const repositoryID = "0000000000000000"
+			server := &Server{
+				Roots: paths.Roots{
+					State: filepath.Join(t.TempDir(), "state"),
+				},
+				workers: map[string]*workerProcess{
+					repositoryID: {
+						id: repositoryID, launchd: true, started: tc.started,
+					},
+				},
+			}
+			status := server.status()
+			if len(status.Workers) != 1 ||
+				status.Workers[0].State != tc.wantState {
+				t.Fatalf("worker status=%+v, want %s",
+					status.Workers, tc.wantState)
+			}
+		})
 	}
 }
 
