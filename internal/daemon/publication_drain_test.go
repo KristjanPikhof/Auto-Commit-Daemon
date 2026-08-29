@@ -174,7 +174,8 @@ func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
 	cfg := intentReplayConfig{}
 	configureIntentSalvage(&cfg, health,
 		publicationFallbackSemanticReplan, []int64{1, 2})
-	if !cfg.atomicFallback || cfg.semanticSalvage {
+	if !cfg.atomicFallback || cfg.semanticSalvage || !cfg.bypassBatchWait ||
+		cfg.window != state.IntentCandidateMaxCaptures {
 		t.Fatalf("open circuit config=%+v, want local unlock", cfg)
 	}
 
@@ -182,7 +183,8 @@ func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
 	cfg = intentReplayConfig{}
 	configureIntentSalvage(&cfg, health,
 		publicationFallbackLocalUnlock, []int64{1, 2})
-	if cfg.atomicFallback || !cfg.semanticSalvage ||
+	if cfg.atomicFallback || !cfg.semanticSalvage || !cfg.bypassBatchWait ||
+		cfg.window != 2 ||
 		!reflect.DeepEqual(cfg.targetEventSeqs, []int64{1, 2}) {
 		t.Fatalf("half-open config=%+v, want semantic replan", cfg)
 	}

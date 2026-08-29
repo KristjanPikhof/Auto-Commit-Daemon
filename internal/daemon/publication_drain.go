@@ -389,6 +389,18 @@ func configureIntentSalvage(
 	targetSeqs []int64,
 ) {
 	cfg.targetEventSeqs = append([]int64(nil), targetSeqs...)
+	// A durable recovery marker already proves and bounds the target. Evaluate
+	// that frozen set as one semantic window when it fits the candidate cap;
+	// otherwise process bounded cap-sized slices. Old planner deferrals must not
+	// collapse recovery back to the same singleton that caused the stall.
+	if targetWindow := len(targetSeqs); targetWindow > cfg.window {
+		if targetWindow > state.IntentCandidateMaxCaptures {
+			targetWindow = state.IntentCandidateMaxCaptures
+		}
+		cfg.window = targetWindow
+	}
+	cfg.bypassBatchWait = true
+	cfg.pathQuiescence = 0
 	circuit := health.Snapshot()
 	useLocalUnlock := stage == publicationFallbackLocalUnlock
 	if circuit.State == IntentPlannerCircuitOpen {
