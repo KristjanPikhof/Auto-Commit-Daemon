@@ -54,7 +54,8 @@ func replayIntentCandidateBatch(
 	// invalid before candidate evaluation returns a decision. Give the strict
 	// checkpoint recovery proof a chance to release that terminal candidate
 	// before asking the planner to continue it.
-	if forced && len(items) == 1 && opts.PublicationDrain == nil {
+	if forced && len(items) == 1 && opts.PublicationDrain == nil &&
+		intentRecoveryItemQuiescent(items[0], cfg) {
 		recovered, handled, recoveryErr := startFailedIntentCheckpointRecovery(
 			ctx, repoRoot, db, activeCtx, opts,
 			items[0].event.Seq, parent, sum)
@@ -327,7 +328,8 @@ func replayIntentCandidateBatch(
 		}
 	}
 	if !publishedAny {
-		if forced && len(items) == 1 && opts.PublicationDrain == nil {
+		if forced && len(items) == 1 && opts.PublicationDrain == nil &&
+			intentRecoveryItemQuiescent(items[0], cfg) {
 			recovered, handled, recoveryErr :=
 				startFailedIntentCheckpointRecovery(
 					ctx, repoRoot, db, activeCtx, opts,
@@ -346,6 +348,14 @@ func replayIntentCandidateBatch(
 		}
 	}
 	return sum, nil
+}
+
+func intentRecoveryItemQuiescent(
+	item intentReplayItem,
+	cfg intentReplayConfig,
+) bool {
+	return cfg.pathQuiescence <= 0 || pathQuiescentForEvent(
+		item.event, item.ops, cfg.pathQuiescence, pathQuiescenceNow())
 }
 
 func startFailedIntentCheckpointRecovery(
