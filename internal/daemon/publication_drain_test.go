@@ -241,10 +241,10 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 }
 
 func TestConfigureIntentForwardRecoveryPreservesPathQuiescence(t *testing.T) {
-	health := &IntentPlannerHealth{}
 	cfg := intentReplayConfig{pathQuiescence: 30 * time.Second}
-	configureIntentForwardRecovery(
-		&cfg, health, publicationFallbackSemanticReplan, []int64{1, 2})
+	configureIntentForwardRecovery(&cfg, state.IntentForwardRecovery{
+		Stage: publicationFallbackSemanticReplan, TargetEventSeqs: []int64{1, 2},
+	}, nil)
 	if cfg.pathQuiescence != 30*time.Second || !cfg.semanticSalvage ||
 		cfg.atomicFallback {
 		t.Fatalf("forward recovery config=%+v", cfg)

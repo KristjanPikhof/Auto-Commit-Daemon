@@ -320,6 +320,10 @@ type ReplaySummary struct {
 	// PlannerFailure carries the sanitized provider or validation failure that
 	// led to a safe local plan. Durable drains retain it when they escalate.
 	PlannerFailure string
+	// PlanFingerprint names the durable resolved semantic plan evaluated in
+	// this pass. Forward recovery persists it before entering local unlock so
+	// restarts retain the provider's exact candidate ordering.
+	PlanFingerprint string
 	// Disposition classifies the completed pass independently from HasMore.
 	// HasMore is only a scheduler hint; it must never suppress durable
 	// recovery when the visible head of the queue made no progress.
@@ -330,6 +334,11 @@ type ReplaySummary struct {
 	// circuit redirected the pass to a local unlock.
 	RecoveryMode       string
 	PlannerCircuitOpen bool
+	// RecoveryPrefixCandidateCount and RecoveryPrefixTotalCandidates describe
+	// the anchored semantic prefix attempted by local unlock. They are used to
+	// widen verification without falling back to raw capture adjacency.
+	RecoveryPrefixCandidateCount  int
+	RecoveryPrefixTotalCandidates int
 }
 
 // ReplayDisposition describes the outcome of one completed replay pass.
@@ -508,8 +517,30 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			publicationDrainSalvageMode(*opts.PublicationDrain),
 			opts.PublicationDrain.EventSeqs)
 	} else if forwardRecoveryActive && intentCfg.enabled {
-		configureIntentForwardRecovery(&intentCfg, opts.IntentHealth,
-			forwardRecovery.Stage, forwardRecovery.TargetEventSeqs)
+		if forwardRecovery.NeedsAttention || forwardRecovery.PrefixExhausted {
+			sum.Skipped = true
+			sum.SkippedReason =
+				"intent_forward_recovery_verification_needs_attention"
+			sum.Disposition = ReplayDispositionNeedsAttention
+			sum.DispositionReason = forwardRecovery.AttentionReason
+			if sum.DispositionReason == "" {
+				sum.DispositionReason =
+					"the complete frozen recovery target failed verification"
+			}
+			return sum, nil
+		}
+		var resolvedPlan *ai.IntentPlanV2
+		if forwardRecovery.Stage == publicationFallbackLocalUnlock {
+			plan, valid, loadErr := resolvedIntentForwardRecoveryPlan(
+				ctx, db, forwardRecovery)
+			if loadErr != nil {
+				return sum, loadErr
+			}
+			if valid {
+				resolvedPlan = &plan
+			}
+		}
+		configureIntentForwardRecovery(&intentCfg, forwardRecovery, resolvedPlan)
 	}
 	if intentCfg.semanticSalvage {
 		if err := retireResolvedIntentCandidateMembership(ctx, db, cctx); err != nil {
@@ -1167,6 +1198,13 @@ type intentReplayConfig struct {
 	// targetEventSeqs bounds durable candidate reuse to the exact capture set
 	// owned by an active publication drain or forward-recovery marker.
 	targetEventSeqs []int64
+	// Forward recovery reuses the exact provider plan across bounded local
+	// verification attempts. PrefixCursor counts semantic candidates, not raw
+	// captures, and resets only after publication progress.
+	forwardRecoveryPlan            ai.IntentPlanV2
+	forwardRecoveryPlanFingerprint string
+	forwardRecoveryPrefixCursor    int
+	forwardRecoveryPrefixBaseHead  string
 	// pathQuiescence is the per-path silence window read from
 	// ACD_PATH_QUIESCENCE_SECONDS at planner-config resolve time. Zero
 	// disables the gate; any positive value defers offering pending
@@ -1566,8 +1604,31 @@ func replayIntentBatch(
 		err        error
 	)
 	if cfg.atomicFallback {
-		window, err = publicationDrainAtomicFallbackWindow(
-			ctx, db, activeCtx, pending)
+		if cfg.forwardRecoveryPlanFingerprint != "" {
+			if cfg.forwardRecoveryPrefixBaseHead != parent {
+				return sum, errors.New(
+					"daemon: intent forward recovery HEAD changed before progress")
+			}
+			prefix, prefixErr := selectIntentForwardRecoveryPrefix(
+				cfg.forwardRecoveryPlan, pending,
+				cfg.forwardRecoveryPrefixCursor)
+			if prefixErr != nil {
+				return sum, prefixErr
+			}
+			window = prefix.Events
+			sum.RecoveryPrefixCandidateCount = prefix.CandidateCount
+			sum.RecoveryPrefixTotalCandidates = prefix.RemainingGroups
+			fallback, ok := cfg.planner.(publicationDrainAtomicFallbackPlanner)
+			if !ok {
+				return sum, fmt.Errorf(
+					"daemon: atomic fallback planner has type %T", cfg.planner)
+			}
+			fallback.combineWindow = true
+			cfg.planner = fallback
+		} else {
+			window, err = publicationDrainAtomicFallbackWindow(
+				ctx, db, activeCtx, pending)
+		}
 	} else {
 		window, forced, waitReason, err = selectIntentWindow(ctx, db, pending, cfg)
 	}

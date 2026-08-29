@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -525,6 +526,7 @@ type publicationDrainAtomicFallbackPlanner struct {
 	commitFormat           ai.CommitFormat
 	messagePlanner         interface{ Name() string }
 	requireSemanticMessage bool
+	combineWindow          bool
 }
 
 func configureAtomicIntentFallback(cfg *intentReplayConfig) {
@@ -582,15 +584,175 @@ func configureIntentSalvage(
 
 func configureIntentForwardRecovery(
 	cfg *intentReplayConfig,
-	health *IntentPlannerHealth,
-	stage string,
-	targetSeqs []int64,
+	recovery state.IntentForwardRecovery,
+	resolvedPlan *ai.IntentPlanV2,
 ) {
 	quiescence := cfg.pathQuiescence
-	configureIntentSalvage(cfg, health, stage, targetSeqs)
+	cfg.targetEventSeqs = append(
+		[]int64(nil), recovery.TargetEventSeqs...)
+	if targetWindow := len(recovery.TargetEventSeqs); targetWindow > cfg.window {
+		if targetWindow > state.IntentCandidateMaxCaptures {
+			targetWindow = state.IntentCandidateMaxCaptures
+		}
+		cfg.window = targetWindow
+	}
+	cfg.bypassBatchWait = true
+	cfg.pathQuiescence = 0
+	if recovery.Stage == publicationFallbackLocalUnlock && resolvedPlan != nil {
+		configureAtomicIntentFallback(cfg)
+		cfg.forwardRecoveryPlan = *resolvedPlan
+		cfg.forwardRecoveryPlanFingerprint = recovery.PlanFingerprint
+		cfg.forwardRecoveryPrefixCursor = recovery.PrefixCursor
+		cfg.forwardRecoveryPrefixBaseHead = recovery.PrefixBaseHead
+	} else {
+		// A legacy local-unlock marker without a resolved semantic plan must
+		// re-enter exact-target semantic planning. Raw capture components can
+		// violate the provider's declared candidate ordering.
+		cfg.semanticSalvage = true
+	}
 	// A forward marker proves target membership, not that its paths are quiet.
 	// Keep the configured gate across recursive and restart recovery passes.
 	cfg.pathQuiescence = quiescence
+}
+
+// resolvedIntentForwardRecoveryPlan loads and revalidates the immutable plan
+// named by a recovery marker. Invalid or legacy fingerprints deliberately
+// return ok=false so recovery can create a fresh exact-target semantic plan.
+func resolvedIntentForwardRecoveryPlan(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+) (ai.IntentPlanV2, bool, error) {
+	fingerprint := strings.TrimSpace(recovery.PlanFingerprint)
+	if fingerprint == "" {
+		return ai.IntentPlanV2{}, false, nil
+	}
+	run, ok, err := state.IntentPlanRunByFingerprint(ctx, db, fingerprint)
+	if err != nil {
+		return ai.IntentPlanV2{}, false, err
+	}
+	if !ok || run.Fingerprint != fingerprint ||
+		run.BranchRef != recovery.BranchRef ||
+		run.BranchGeneration != recovery.BranchGeneration ||
+		!run.Completed || !run.ResolvedPlanJSON.Valid {
+		return ai.IntentPlanV2{}, false, nil
+	}
+	var resolved resolvedIntentPlanRun
+	if err := json.Unmarshal(
+		[]byte(run.ResolvedPlanJSON.String), &resolved,
+	); err != nil {
+		return ai.IntentPlanV2{}, false, nil
+	}
+	request := ai.IntentPlanRequestV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		OfferedCaptures: make(
+			[]ai.OfferedCapture, 0, len(recovery.TargetEventSeqs)),
+	}
+	for _, seq := range recovery.TargetEventSeqs {
+		request.OfferedCaptures = append(
+			request.OfferedCaptures, ai.OfferedCapture{Seq: seq})
+	}
+	if err := ai.ValidateIntentPlanV2(request, resolved.Plan); err != nil {
+		return ai.IntentPlanV2{}, false, nil
+	}
+	return resolved.Plan, true, nil
+}
+
+type intentForwardRecoveryPrefix struct {
+	Events          []state.CaptureEvent
+	CandidateCount  int
+	RemainingGroups int
+}
+
+// selectIntentForwardRecoveryPrefix anchors local verification to the first
+// unresolved candidates in the provider's topological order. Widening adds
+// later semantic candidates while retaining every unresolved prerequisite.
+func selectIntentForwardRecoveryPrefix(
+	plan ai.IntentPlanV2,
+	pending []state.CaptureEvent,
+	prefixCursor int,
+) (intentForwardRecoveryPrefix, error) {
+	if prefixCursor < 1 {
+		return intentForwardRecoveryPrefix{}, errors.New(
+			"daemon: intent forward recovery prefix cursor is invalid")
+	}
+	pendingBySeq := make(map[int64]state.CaptureEvent, len(pending))
+	for _, event := range pending {
+		pendingBySeq[event.Seq] = event
+	}
+	type unresolvedCandidate struct {
+		id   string
+		seqs []int64
+		deps []string
+	}
+	unresolved := make([]unresolvedCandidate, 0, len(plan.Candidates))
+	resolvedIDs := make(map[string]struct{}, len(plan.Candidates))
+	for _, candidate := range plan.Candidates {
+		group := unresolvedCandidate{
+			id: candidate.CandidateID,
+			deps: append(
+				[]string(nil), candidate.DependsOnCandidates...),
+		}
+		for _, seq := range candidate.SelectedSeqs {
+			if _, ok := pendingBySeq[seq]; ok {
+				group.seqs = append(group.seqs, seq)
+			}
+		}
+		if len(group.seqs) == 0 {
+			resolvedIDs[candidate.CandidateID] = struct{}{}
+			continue
+		}
+		unresolved = append(unresolved, group)
+	}
+	if len(unresolved) == 0 {
+		if len(pending) == 0 {
+			return intentForwardRecoveryPrefix{}, nil
+		}
+		return intentForwardRecoveryPrefix{}, errors.New(
+			"daemon: resolved intent plan does not cover pending recovery target")
+	}
+	width := prefixCursor
+	if width > len(unresolved) {
+		width = len(unresolved)
+	}
+	selectedIDs := make(map[string]struct{}, width)
+	selectedSeqs := make(map[int64]struct{})
+	for index := 0; index < width; index++ {
+		group := unresolved[index]
+		for _, dependencyID := range group.deps {
+			if _, ok := resolvedIDs[dependencyID]; ok {
+				continue
+			}
+			if _, ok := selectedIDs[dependencyID]; !ok {
+				return intentForwardRecoveryPrefix{}, fmt.Errorf(
+					"daemon: semantic recovery candidate %q is missing prerequisite %q",
+					group.id, dependencyID)
+			}
+		}
+		selectedIDs[group.id] = struct{}{}
+		for _, seq := range group.seqs {
+			selectedSeqs[seq] = struct{}{}
+		}
+	}
+	if len(selectedSeqs) > ai.IntentCandidateCaptureCap {
+		return intentForwardRecoveryPrefix{}, fmt.Errorf(
+			"daemon: semantic recovery prefix exceeds %d captures",
+			ai.IntentCandidateCaptureCap)
+	}
+	events := make([]state.CaptureEvent, 0, len(selectedSeqs))
+	for _, event := range pending {
+		if _, ok := selectedSeqs[event.Seq]; ok {
+			events = append(events, event)
+		}
+	}
+	if len(events) != len(selectedSeqs) {
+		return intentForwardRecoveryPrefix{}, errors.New(
+			"daemon: semantic recovery prefix membership changed")
+	}
+	return intentForwardRecoveryPrefix{
+		Events: events, CandidateCount: width,
+		RemainingGroups: len(unresolved),
+	}, nil
 }
 
 // publicationDrainAtomicFallbackWindow returns the smallest complete hard
@@ -621,17 +783,20 @@ func publicationDrainAtomicFallbackWindow(
 	derived, err := BuildIntentCandidateDependencies(
 		cctx.BranchRef, cctx.BranchGeneration, captures, nil, time.Now().UTC())
 	if err != nil {
-		return nil, fmt.Errorf("daemon: build atomic fallback dependencies: %w", err)
+		return nil, fmt.Errorf(
+			"daemon: build atomic fallback dependencies: %w", err)
 	}
 	persisted, err := state.IntentCaptureDependenciesForPair(
 		ctx, db, cctx.BranchRef, cctx.BranchGeneration)
 	if err != nil {
-		return nil, fmt.Errorf("daemon: load atomic fallback dependencies: %w", err)
+		return nil, fmt.Errorf(
+			"daemon: load atomic fallback dependencies: %w", err)
 	}
 	persisted = intentDependenciesWithinCaptures(persisted, captures)
 	dependencies, err := mergeIntentDependencies(persisted, derived)
 	if err != nil {
-		return nil, fmt.Errorf("daemon: merge atomic fallback dependencies: %w", err)
+		return nil, fmt.Errorf(
+			"daemon: merge atomic fallback dependencies: %w", err)
 	}
 	adjacent := make(map[int64][]int64)
 	for _, dependency := range dependencies {
@@ -692,7 +857,11 @@ func publicationDrainAtomicFallbackWindow(
 			window = append(window, event)
 		}
 	}
-	return topologicalPublicationDrainEvents(window, dependencies)
+	window, err = topologicalPublicationDrainEvents(window, dependencies)
+	if err != nil {
+		return nil, err
+	}
+	return window, nil
 }
 
 func (publicationDrainAtomicFallbackPlanner) Name() string {
@@ -714,6 +883,22 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 		return ai.IntentPlanV2{}, err
 	}
 	plan := deterministicIntentCandidatePlan(req, false, true)
+	if p.combineWindow && len(plan.Candidates) > 1 {
+		selected := make([]int64, 0, len(req.OfferedCaptures))
+		for _, capture := range req.OfferedCaptures {
+			selected = append(selected, capture.Seq)
+		}
+		subject, purpose := deterministicIntentCandidateMessage(req, selected)
+		plan.Candidates = []ai.IntentCandidateAssignment{{
+			CandidateID:  stableGeneratedCandidateID(req, selected),
+			SelectedSeqs: selected,
+			Purpose:      purpose,
+			Readiness:    ai.IntentCandidateReady,
+			Subject:      subject,
+			GroupingReason: "bounded verification recovery requires the " +
+				"complete widened window",
+		}}
+	}
 	provider := ai.DeterministicProvider{CommitFormat: p.commitFormat}
 	for index := range plan.Candidates {
 		if plan.Candidates[index].Readiness != ai.IntentCandidateReady {

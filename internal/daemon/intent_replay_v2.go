@@ -136,6 +136,13 @@ func replayIntentCandidateBatch(
 		TargetEventSeqs:     cfg.targetEventSeqs,
 		RejectLocalFallback: cfg.semanticSalvage,
 	})
+	sum.PlanFingerprint = evaluation.PlanFingerprint
+	if cfg.forwardRecoveryPlanFingerprint != "" {
+		// Local unlock evaluates a collapsed prefix, which has its own planner
+		// fingerprint. Recovery must continue naming the immutable semantic plan
+		// whose topological order selected that prefix.
+		sum.PlanFingerprint = cfg.forwardRecoveryPlanFingerprint
+	}
 	var semanticFallbackErr *IntentSemanticFallbackRequiredError
 	var preflightErr *IntentPlanPreflightError
 	if err != nil && !errors.As(err, &semanticFallbackErr) &&
@@ -502,16 +509,22 @@ func updateIntentForwardRecoveryAfterReplay(
 	sum ReplaySummary,
 	replayErr error,
 ) (ReplaySummary, error) {
+	semanticPass := recovery.Stage == publicationFallbackSemanticReplan ||
+		(recovery.Stage == publicationFallbackLocalUnlock &&
+			recovery.PlanFingerprint == "")
 	if replayErr != nil {
 		var exhausted *IntentSemanticFallbackRequiredError
-		if recovery.Stage == publicationFallbackSemanticReplan &&
-			errors.As(replayErr, &exhausted) {
-			if _, err := state.AdvanceIntentForwardRecovery(
-				ctx, db, recovery, publicationFallbackLocalUnlock, 0); err != nil {
+		if semanticPass && errors.As(replayErr, &exhausted) {
+			advanced, ok, err := beginIntentForwardRecoveryPrefix(
+				ctx, db, recovery, sum)
+			if err != nil {
 				return sum, errors.Join(replayErr, err)
 			}
+			if !ok {
+				return sum, replayErr
+			}
 			logIntentForwardRecoveryTransition(
-				recovery, publicationFallbackLocalUnlock)
+				advanced, publicationFallbackLocalUnlock)
 			sum.Skipped = true
 			sum.SkippedReason = "intent_forward_recovery_local_unlock"
 			sum.Disposition = ReplayDispositionRecoverableStall
@@ -554,19 +567,103 @@ func updateIntentForwardRecoveryAfterReplay(
 		sum.HasMore = true
 		return sum, nil
 	}
-	if recovery.Stage == publicationFallbackSemanticReplan {
-		if _, err := state.AdvanceIntentForwardRecovery(
-			ctx, db, recovery, publicationFallbackLocalUnlock, 0); err != nil {
+	if recovery.Stage == publicationFallbackLocalUnlock &&
+		recovery.PlanFingerprint != "" &&
+		sum.SkippedReason == "intent_v2_verification_recovery" {
+		return updateIntentForwardRecoveryPrefixFailure(
+			ctx, db, recovery, sum)
+	}
+	if semanticPass {
+		advanced, ok, err := beginIntentForwardRecoveryPrefix(
+			ctx, db, recovery, sum)
+		if err != nil {
 			return sum, err
 		}
+		if !ok {
+			return sum, nil
+		}
 		logIntentForwardRecoveryTransition(
-			recovery, publicationFallbackLocalUnlock)
+			advanced, publicationFallbackLocalUnlock)
 		sum.Skipped = true
 		sum.SkippedReason = "intent_forward_recovery_local_unlock"
 		sum.Disposition = ReplayDispositionRecoverableStall
 		sum.DispositionReason = recovery.Reason
 		sum.HasMore = true
 	}
+	return sum, nil
+}
+
+func beginIntentForwardRecoveryPrefix(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+	sum ReplaySummary,
+) (state.IntentForwardRecovery, bool, error) {
+	fingerprint := strings.TrimSpace(sum.PlanFingerprint)
+	if fingerprint == "" || strings.TrimSpace(sum.BaseHead) == "" {
+		return recovery, false, nil
+	}
+	candidate := recovery
+	candidate.PlanFingerprint = fingerprint
+	if _, valid, err := resolvedIntentForwardRecoveryPlan(
+		ctx, db, candidate); err != nil {
+		return recovery, false, err
+	} else if !valid {
+		return recovery, false, nil
+	}
+	advanced, err := state.AdvanceIntentForwardRecoveryPrefix(
+		ctx, db, recovery, fingerprint, sum.BaseHead, 1)
+	if err != nil {
+		return recovery, false, err
+	}
+	return advanced, true, nil
+}
+
+const intentForwardRecoveryVerificationExhausted = "complete semantic recovery prefix failed verification"
+
+func updateIntentForwardRecoveryPrefixFailure(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+	sum ReplaySummary,
+) (ReplaySummary, error) {
+	width := sum.RecoveryPrefixCandidateCount
+	total := sum.RecoveryPrefixTotalCandidates
+	if width < 1 || total < 1 || width > total {
+		return sum, errors.New(
+			"daemon: intent forward recovery prefix result is invalid")
+	}
+	if width == total {
+		marked, err := state.MarkIntentForwardRecoveryNeedsAttention(
+			ctx, db, recovery, intentForwardRecoveryVerificationExhausted)
+		if err != nil {
+			return sum, err
+		}
+		sum.Skipped = true
+		sum.SkippedReason =
+			"intent_forward_recovery_verification_needs_attention"
+		sum.Disposition = ReplayDispositionNeedsAttention
+		sum.DispositionReason = marked.AttentionReason
+		sum.HasMore = false
+		return sum, nil
+	}
+	next := width * 2
+	if next <= recovery.PrefixCursor {
+		next = recovery.PrefixCursor * 2
+	}
+	if next > state.IntentCandidateMaxOpenPerPair {
+		next = state.IntentCandidateMaxOpenPerPair
+	}
+	if next <= recovery.PrefixCursor {
+		return sum, errors.New(
+			"daemon: intent forward recovery prefix cannot widen")
+	}
+	if _, err := state.AdvanceIntentForwardRecoveryPrefix(
+		ctx, db, recovery, recovery.PlanFingerprint,
+		recovery.PrefixBaseHead, next); err != nil {
+		return sum, err
+	}
+	sum.HasMore = true
 	return sum, nil
 }
 
