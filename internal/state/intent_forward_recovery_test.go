@@ -97,6 +97,20 @@ WHERE seq=?`, published); err != nil {
 		marker.UnlockCount != 1 || marker.LastProgressTS <= 0 {
 		t.Fatalf("semantic marker=(%+v,%v)", marker, err)
 	}
+	if err := CompleteIntentForwardRecovery(ctx, db, marker, 1); err == nil {
+		t.Fatal("completion cleared an unresolved recovery target")
+	}
+	if _, active, err := IntentForwardRecoveryForPair(
+		ctx, db, recovery.BranchRef, recovery.BranchGeneration,
+	); err != nil || !active {
+		t.Fatalf("unresolved marker active=%t err=%v", active, err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',commit_oid='recovery-head',published_ts=2
+WHERE seq IN (?,?)`, pending, linked); err != nil {
+		t.Fatal(err)
+	}
 	if err := CompleteIntentForwardRecovery(ctx, db, marker, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +271,55 @@ SELECT COUNT(*) FROM decision_records WHERE kind=?`,
 				t.Fatalf("decision count=%d want 2", decisionCount)
 			}
 		})
+	}
+}
+
+func TestStartFailedIntentCheckpointRecoveryFreezesOnlyPendingCheckpointRows(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointFixture(t, 5, 2)
+	ctx := context.Background()
+	execFailedIntentCheckpointTest(t, fixture.db, `
+UPDATE capture_events
+SET state='published',commit_oid='published-before-recovery',published_ts=2
+WHERE seq=?`, fixture.seqs[2])
+	execFailedIntentCheckpointTest(t, fixture.db, `
+UPDATE capture_events SET state='recovered',published_ts=2 WHERE seq=?`,
+		fixture.seqs[3])
+
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed {
+		t.Fatalf("mixed checkpoint recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	wantTarget := []int64{fixture.seqs[0], fixture.seqs[1], fixture.seqs[4]}
+	if !reflect.DeepEqual(recovery.TargetEventSeqs, wantTarget) {
+		t.Fatalf("recovery target=%v want pending rows %v",
+			recovery.TargetEventSeqs, wantTarget)
+	}
+	wantStates := map[int64]string{
+		fixture.seqs[0]: EventStatePending,
+		fixture.seqs[1]: EventStatePending,
+		fixture.seqs[2]: EventStatePublished,
+		fixture.seqs[3]: EventStateRecovered,
+		fixture.seqs[4]: EventStatePending,
+	}
+	for seq, want := range wantStates {
+		var got string
+		if err := fixture.db.ReadSQL().QueryRowContext(ctx,
+			`SELECT state FROM capture_events WHERE seq=?`, seq).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("event %d state=%q want %q", seq, got, want)
+		}
+	}
+	candidate, ok, err := IntentCandidateByID(ctx, fixture.db, fixture.candidateID)
+	if err != nil || !ok || candidate.Status != IntentCandidateSuperseded ||
+		len(candidate.Events) != 0 {
+		t.Fatalf("candidate=(%+v ok=%t err=%v)", candidate, ok, err)
 	}
 }
 
@@ -579,10 +642,18 @@ UPDATE capture_events SET state='published',commit_oid='published' WHERE seq=?`,
 			},
 		},
 		{
-			name: "checkpoint member is not pending",
+			name: "checkpoint member failed",
 			mutate: func(t *testing.T, fixture failedIntentCheckpointFixture) {
-				execFailedIntentCheckpointTest(t, fixture.db, `
-UPDATE capture_events SET state='published',commit_oid='published' WHERE seq=?`,
+				execFailedIntentCheckpointTest(t, fixture.db,
+					`UPDATE capture_events SET state='failed' WHERE seq=?`,
+					fixture.seqs[2])
+			},
+		},
+		{
+			name: "checkpoint member blocked",
+			mutate: func(t *testing.T, fixture failedIntentCheckpointFixture) {
+				execFailedIntentCheckpointTest(t, fixture.db,
+					`UPDATE capture_events SET state='blocked_conflict' WHERE seq=?`,
 					fixture.seqs[2])
 			},
 		},
