@@ -488,6 +488,41 @@ SELECT COUNT(*) FROM decision_records WHERE kind=?`,
 	}
 }
 
+func TestStartFailedIntentCheckpointRecoveryIncludesIncompleteClosureCandidate(
+	t *testing.T,
+) {
+	fixture := seedFailedIntentCheckpointClosureFixture(t, true)
+	ctx := context.Background()
+	if _, err := fixture.db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates
+SET status='waiting',readiness='wait',
+    missing_companions='production companion is not in this planner window',
+    verification_status='pending'
+WHERE id=?`, fixture.overlapCandidateID); err != nil {
+		t.Fatal(err)
+	}
+
+	recovery, changed, err := StartFailedIntentCheckpointRecovery(
+		ctx, fixture.db, failedIntentCheckpointBranch,
+		failedIntentCheckpointGeneration, fixture.seqs[0])
+	if err != nil || !changed ||
+		!reflect.DeepEqual(recovery.TargetEventSeqs, fixture.seqs) {
+		t.Fatalf("incomplete closure recovery=(%+v changed=%t err=%v)",
+			recovery, changed, err)
+	}
+	for _, candidateID := range []string{
+		fixture.rootCandidateID,
+		fixture.overlapCandidateID,
+	} {
+		candidate, ok, err := IntentCandidateByID(ctx, fixture.db, candidateID)
+		if err != nil || !ok || candidate.Status != IntentCandidateSuperseded ||
+			len(candidate.Events) != 0 {
+			t.Fatalf("candidate %s=(%+v ok=%t err=%v)",
+				candidateID, candidate, ok, err)
+		}
+	}
+}
+
 func TestCompleteResolvedIntentForwardRecoveryProvesAndClearsMarker(t *testing.T) {
 	fixture := seedFailedIntentCheckpointFixture(t, 3, 2)
 	ctx := context.Background()

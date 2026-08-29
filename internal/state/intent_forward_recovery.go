@@ -92,9 +92,11 @@ LIMIT 1`, branchRef, branchGeneration, EventStateBlockedConflict,
 
 // StartFailedIntentCheckpointRecovery atomically releases the bounded closure
 // of failed candidates and completed checkpoints containing one held capture,
-// then freezes that exact pending target for a semantic replan. It refuses any
-// closure containing a healthy candidate, resolved capture, mixed branch pair,
-// or active Git/state transition.
+// then freezes that exact pending target for a semantic replan. It may release
+// an incomplete waiting sibling because that sibling has no publishable
+// boundary to preserve. It refuses any closure containing a ready or verified
+// candidate, resolved capture, mixed branch pair, or active Git/state
+// transition.
 func StartFailedIntentCheckpointRecovery(
 	ctx context.Context,
 	d *DB,
@@ -147,6 +149,7 @@ SELECT value FROM daemon_meta WHERE key=?`,
 	type candidateRecord struct {
 		id           string
 		status       string
+		readiness    string
 		verification sql.NullString
 		published    sql.NullString
 		deadline     sql.NullFloat64
@@ -206,12 +209,13 @@ ORDER BY candidate.id`, heldEventSeq)
 			var candidateBranch string
 			var candidateGeneration int64
 			err := tx.QueryRowContext(ctx, `
-SELECT id,branch_ref,branch_generation,status,verification_status,
+SELECT id,branch_ref,branch_generation,status,readiness,verification_status,
        published_commit_oid,soft_publication_deadline,
        config_revision_id,config_profile
 FROM intent_candidates WHERE id=?`, candidateID).Scan(
 				&candidate.id, &candidateBranch, &candidateGeneration,
-				&candidate.status, &candidate.verification,
+				&candidate.status, &candidate.readiness,
+				&candidate.verification,
 				&candidate.published, &candidate.deadline,
 				&candidate.revision, &candidate.profile)
 			if errors.Is(err, sql.ErrNoRows) {
@@ -221,13 +225,18 @@ FROM intent_candidates WHERE id=?`, candidateID).Scan(
 				return IntentForwardRecovery{}, false, fmt.Errorf(
 					"state: load failed intent closure candidate: %w", err)
 			}
+			failed := (candidate.status == IntentCandidateWaiting ||
+				candidate.status == IntentCandidateBlocked) &&
+				candidate.verification.Valid &&
+				candidate.verification.String == "failed"
+			incomplete := candidate.status == IntentCandidateWaiting &&
+				candidate.readiness == IntentReadinessWait &&
+				(!candidate.verification.Valid ||
+					candidate.verification.String == "pending")
 			if candidateBranch != branchRef ||
 				candidateGeneration != branchGeneration ||
-				(candidate.status != IntentCandidateWaiting &&
-					candidate.status != IntentCandidateBlocked) ||
-				!candidate.verification.Valid ||
-				candidate.verification.String != "failed" ||
-				candidate.published.Valid || candidate.deadline.Valid {
+				(!failed && !incomplete) || candidate.published.Valid ||
+				candidate.deadline.Valid {
 				return IntentForwardRecovery{}, false, nil
 			}
 
@@ -453,8 +462,12 @@ UPDATE intent_candidates
 SET status='superseded',readiness='wait',soft_publication_deadline=NULL,
     updated_ts=?
 WHERE id=? AND branch_ref=? AND branch_generation=?
-  AND status IN ('waiting','blocked')
-  AND verification_status='failed'
+  AND (
+    (status IN ('waiting','blocked') AND verification_status='failed')
+    OR
+    (status='waiting' AND readiness='wait'
+      AND (verification_status IS NULL OR verification_status='pending'))
+  )
   AND published_commit_oid IS NULL
   AND soft_publication_deadline IS NULL`,
 			now, candidate.id, branchRef, branchGeneration)
