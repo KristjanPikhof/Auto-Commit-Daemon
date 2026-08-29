@@ -260,10 +260,11 @@ func TestStartableWorkerIDsBoundsAndOrdersStartupBatch(t *testing.T) {
 func TestStartingWorkersCountsDirectAndLaunchdProtection(t *testing.T) {
 	home := t.TempDir()
 	roots := paths.Roots{State: filepath.Join(home, "state"), Share: filepath.Join(home, "share"), Config: filepath.Join(home, "config")}
+	now := time.Now()
 	workers := map[string]*workerProcess{
-		"0000000000000000": {id: "0000000000000000", cmd: &exec.Cmd{}},
+		"0000000000000000": {id: "0000000000000000", cmd: &exec.Cmd{}, started: now},
 		"0000000000000001": {id: "0000000000000001", launchd: true},
-		"0000000000000002": {id: "0000000000000002", cmd: &exec.Cmd{}},
+		"0000000000000002": {id: "0000000000000002", cmd: &exec.Cmd{}, started: now},
 	}
 	if err := WriteWorkerRuntimeStatus(roots, WorkerRuntimeStatus{
 		RepositoryID: "0000000000000001", State: "starting",
@@ -275,8 +276,32 @@ func TestStartingWorkersCountsDirectAndLaunchdProtection(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := startingWorkers(roots, workers); got != maxConcurrentWorkerStarts {
+	if got := startingWorkers(roots, workers, now); got != maxConcurrentWorkerStarts {
 		t.Fatalf("starting workers=%d want %d", got, maxConcurrentWorkerStarts)
+	}
+}
+
+func TestStartingWorkersReleasesExpiredAdmission(t *testing.T) {
+	now := time.Now()
+	started := now.Add(-workerStartupAdmissionLease - time.Second)
+	worker := &workerProcess{id: "0000000000000000", cmd: &exec.Cmd{}, started: started}
+	status := WorkerRuntimeStatus{
+		RepositoryID: worker.id,
+		State:        "starting",
+		UpdatedTS:    started.UnixMilli(),
+	}
+	if workerHoldsStartupAdmission(worker, status, nil, now) {
+		t.Fatal("expired starting status still monopolized startup admission")
+	}
+	if workerHoldsStartupAdmission(worker, WorkerRuntimeStatus{}, os.ErrNotExist, now) {
+		t.Fatal("expired missing status still monopolized startup admission")
+	}
+	if !workerHoldsStartupAdmission(worker, WorkerRuntimeStatus{
+		RepositoryID: worker.id,
+		State:        "starting",
+		UpdatedTS:    now.UnixMilli(),
+	}, nil, now) {
+		t.Fatal("fresh starting status did not retain startup admission")
 	}
 }
 
@@ -334,6 +359,16 @@ func TestReconcileBoundsDirectProtectionStartupAcrossCycles(t *testing.T) {
 	if server.workers["0000000000000002"].cmd == nil ||
 		server.workers["0000000000000003"].cmd != nil {
 		t.Fatal("third reconcile did not reuse exactly one ready slot")
+	}
+	server.workers["0000000000000001"].started = time.Now().Add(
+		-workerStartupAdmissionLease - time.Second)
+	server.workers["0000000000000002"].started = time.Now().Add(
+		-workerStartupAdmissionLease - time.Second)
+	if err := server.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if server.workers["0000000000000003"].cmd == nil {
+		t.Fatal("expired startup admission blocked the remaining repository")
 	}
 }
 

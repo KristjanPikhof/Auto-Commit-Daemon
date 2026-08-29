@@ -112,8 +112,13 @@ var restartDelays = []time.Duration{time.Second, 2 * time.Second, 5 * time.Secon
 // Starting every registered repository at once creates a Git/process storm on
 // login and during setup cutover. Two protection scans retain useful
 // parallelism while the regular reconcile tick starts each remaining worker as
-// soon as capacity is available.
-const maxConcurrentWorkerStarts = 2
+// soon as capacity is available. A worker that cannot finish its initial
+// checkpoint must eventually release admission so two unhealthy repositories
+// cannot prevent every later repository from starting.
+const (
+	maxConcurrentWorkerStarts   = 2
+	workerStartupAdmissionLease = 2 * time.Minute
+)
 
 func (s *Server) Run(ctx context.Context) error {
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -525,25 +530,50 @@ func (s *Server) reconcile(ctx context.Context) error {
 		}
 	}
 	startLimit := max(0,
-		maxConcurrentWorkerStarts-startingWorkers(s.Roots, s.workers))
+		maxConcurrentWorkerStarts-startingWorkers(s.Roots, s.workers, now))
 	for _, id := range startableWorkerIDs(s.workers, now, startLimit) {
 		s.startWorkerLocked(ctx, s.workers[id])
 	}
 	return nil
 }
 
-func startingWorkers(roots paths.Roots, workers map[string]*workerProcess) int {
+func startingWorkers(
+	roots paths.Roots,
+	workers map[string]*workerProcess,
+	now time.Time,
+) int {
 	count := 0
 	for _, worker := range workers {
 		if worker == nil || (worker.cmd == nil && !worker.launchd) {
 			continue
 		}
 		status, err := ReadWorkerRuntimeStatus(roots, worker.id)
-		if err != nil || status.State == "starting" {
+		if workerHoldsStartupAdmission(worker, status, err, now) {
 			count++
 		}
 	}
 	return count
+}
+
+func workerHoldsStartupAdmission(
+	worker *workerProcess,
+	status WorkerRuntimeStatus,
+	statusErr error,
+	now time.Time,
+) bool {
+	started := worker.started
+	if statusErr == nil {
+		if status.State != "starting" {
+			return false
+		}
+		if status.UpdatedTS > 0 {
+			started = time.UnixMilli(status.UpdatedTS)
+		}
+	}
+	if started.IsZero() {
+		return false
+	}
+	return now.Before(started.Add(workerStartupAdmissionLease))
 }
 
 func startableWorkerIDs(workers map[string]*workerProcess, now time.Time, limit int) []string {
