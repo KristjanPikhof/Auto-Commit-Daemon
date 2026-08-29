@@ -605,10 +605,10 @@ func beginIntentForwardRecoveryPrefix(
 	}
 	candidate := recovery
 	candidate.PlanFingerprint = fingerprint
-	if _, valid, err := resolvedIntentForwardRecoveryPlan(
+	if _, valid, partial, err := resolvedIntentForwardRecoveryPlan(
 		ctx, db, candidate); err != nil {
 		return recovery, false, err
-	} else if !valid {
+	} else if partial || !valid {
 		return recovery, false, nil
 	}
 	advanced, err := state.AdvanceIntentForwardRecoveryPrefix(

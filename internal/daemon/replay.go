@@ -531,12 +531,22 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 		var resolvedPlan *ai.IntentPlanV2
 		if forwardRecovery.Stage == publicationFallbackLocalUnlock {
-			plan, valid, loadErr := resolvedIntentForwardRecoveryPlan(
+			plan, valid, partial, loadErr := resolvedIntentForwardRecoveryPlan(
 				ctx, db, forwardRecovery)
 			if loadErr != nil {
 				return sum, loadErr
 			}
-			if valid {
+			if partial {
+				previousRecovery := forwardRecovery
+				forwardRecovery, loadErr = state.AdvanceIntentForwardRecovery(
+					ctx, db, forwardRecovery,
+					publicationFallbackSemanticReplan, 1)
+				if loadErr != nil {
+					return sum, loadErr
+				}
+				logIntentForwardRecoveryTransition(
+					previousRecovery, publicationFallbackSemanticReplan)
+			} else if valid {
 				resolvedPlan = &plan
 			}
 		}

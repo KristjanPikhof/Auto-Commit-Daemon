@@ -164,6 +164,51 @@ func TestPublicationDrainLocalUnlockSelectsSmallestHardComponent(t *testing.T) {
 	}
 }
 
+func TestIntentForwardRecoveryPrefixFollowsSemanticTopology(t *testing.T) {
+	events := []state.CaptureEvent{
+		{Seq: 10}, {Seq: 20}, {Seq: 30},
+	}
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			{CandidateID: "prerequisite", SelectedSeqs: []int64{30}},
+			{
+				CandidateID: "dependent", SelectedSeqs: []int64{10},
+				DependsOnCandidates: []string{"prerequisite"},
+			},
+			{
+				CandidateID: "final", SelectedSeqs: []int64{20},
+				DependsOnCandidates: []string{"dependent"},
+			},
+		},
+	}
+	for _, test := range []struct {
+		cursor int
+		want   []int64
+	}{
+		{cursor: 1, want: []int64{30}},
+		{cursor: 2, want: []int64{10, 30}},
+		{cursor: 4, want: []int64{10, 20, 30}},
+	} {
+		prefix, err := selectIntentForwardRecoveryPrefix(
+			plan, events, test.cursor)
+		if err != nil {
+			t.Fatalf("cursor %d: %v", test.cursor, err)
+		}
+		got := make([]int64, 0, len(prefix.Events))
+		for _, event := range prefix.Events {
+			got = append(got, event.Seq)
+		}
+		if !reflect.DeepEqual(got, test.want) ||
+			prefix.CandidateCount != min(test.cursor, 3) ||
+			prefix.RemainingGroups != 3 {
+			t.Fatalf("cursor %d prefix=(%v,%d/%d) want %v",
+				test.cursor, got, prefix.CandidateCount,
+				prefix.RemainingGroups, test.want)
+		}
+	}
+}
+
 func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	health := &IntentPlannerHealth{

@@ -622,40 +622,124 @@ func resolvedIntentForwardRecoveryPlan(
 	ctx context.Context,
 	db *state.DB,
 	recovery state.IntentForwardRecovery,
-) (ai.IntentPlanV2, bool, error) {
+) (ai.IntentPlanV2, bool, bool, error) {
 	fingerprint := strings.TrimSpace(recovery.PlanFingerprint)
 	if fingerprint == "" {
-		return ai.IntentPlanV2{}, false, nil
+		return ai.IntentPlanV2{}, false, false, nil
 	}
 	run, ok, err := state.IntentPlanRunByFingerprint(ctx, db, fingerprint)
 	if err != nil {
-		return ai.IntentPlanV2{}, false, err
+		return ai.IntentPlanV2{}, false, false, err
 	}
 	if !ok || run.Fingerprint != fingerprint ||
 		run.BranchRef != recovery.BranchRef ||
 		run.BranchGeneration != recovery.BranchGeneration ||
 		!run.Completed || !run.ResolvedPlanJSON.Valid {
-		return ai.IntentPlanV2{}, false, nil
+		return ai.IntentPlanV2{}, false, false, nil
 	}
-	var resolved resolvedIntentPlanRun
+	states, valid, err := intentForwardRecoveryTargetStates(
+		ctx, db, recovery)
+	if err != nil || !valid {
+		return ai.IntentPlanV2{}, false, false, err
+	}
+	// The durable plan JSON is the only record of the exact offered membership
+	// after a completed run clears its transient unresolved list. Peek only to
+	// reconstruct that request; loadResolvedIntentPlanRun below remains the
+	// authoritative decoder and continuation-aware validator.
+	var envelope resolvedIntentPlanRun
 	if err := json.Unmarshal(
-		[]byte(run.ResolvedPlanJSON.String), &resolved,
+		[]byte(run.ResolvedPlanJSON.String), &envelope,
 	); err != nil {
-		return ai.IntentPlanV2{}, false, nil
+		return ai.IntentPlanV2{}, false, false, nil
 	}
+	target := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
+	for _, seq := range recovery.TargetEventSeqs {
+		target[seq] = struct{}{}
+	}
+	planSeqs := make(map[int64]struct{}, len(recovery.TargetEventSeqs))
 	request := ai.IntentPlanRequestV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		OfferedCaptures: make(
 			[]ai.OfferedCapture, 0, len(recovery.TargetEventSeqs)),
 	}
+	for _, candidate := range envelope.Plan.Candidates {
+		for _, seq := range candidate.SelectedSeqs {
+			if _, ok := target[seq]; !ok {
+				return ai.IntentPlanV2{}, false, false, nil
+			}
+			if _, duplicate := planSeqs[seq]; duplicate {
+				continue
+			}
+			planSeqs[seq] = struct{}{}
+			request.OfferedCaptures = append(
+				request.OfferedCaptures, ai.OfferedCapture{Seq: seq})
+		}
+	}
+	for seq, eventState := range states {
+		if eventState == state.EventStatePublished ||
+			eventState == state.EventStateRecovered {
+			continue
+		}
+		if _, ok := planSeqs[seq]; !ok {
+			return ai.IntentPlanV2{}, false, false, nil
+		}
+	}
+	plan, _, err := loadResolvedIntentPlanRun(
+		request, run.ResolvedPlanJSON.String)
+	if err != nil {
+		return ai.IntentPlanV2{}, false, false, nil
+	}
+	for _, candidate := range plan.Candidates {
+		unresolved := 0
+		for _, seq := range candidate.SelectedSeqs {
+			if eventState := states[seq]; eventState != state.EventStatePublished &&
+				eventState != state.EventStateRecovered {
+				unresolved++
+			}
+		}
+		if unresolved > 0 && unresolved < len(candidate.SelectedSeqs) {
+			return ai.IntentPlanV2{}, false, true, nil
+		}
+	}
+	return plan, true, false, nil
+}
+
+func intentForwardRecoveryTargetStates(
+	ctx context.Context,
+	db *state.DB,
+	recovery state.IntentForwardRecovery,
+) (map[int64]string, bool, error) {
+	if len(recovery.TargetEventSeqs) == 0 {
+		return nil, false, nil
+	}
+	placeholders := strings.TrimSuffix(
+		strings.Repeat("?,", len(recovery.TargetEventSeqs)), ",")
+	args := make([]any, 0, len(recovery.TargetEventSeqs)+2)
 	for _, seq := range recovery.TargetEventSeqs {
-		request.OfferedCaptures = append(
-			request.OfferedCaptures, ai.OfferedCapture{Seq: seq})
+		args = append(args, seq)
 	}
-	if err := ai.ValidateIntentPlanV2(request, resolved.Plan); err != nil {
-		return ai.IntentPlanV2{}, false, nil
+	args = append(args, recovery.BranchRef, recovery.BranchGeneration)
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT seq,state FROM capture_events
+WHERE seq IN (`+placeholders+`) AND branch_ref=? AND branch_generation=?`,
+		args...)
+	if err != nil {
+		return nil, false, err
 	}
-	return resolved.Plan, true, nil
+	defer rows.Close()
+	states := make(map[int64]string, len(recovery.TargetEventSeqs))
+	for rows.Next() {
+		var seq int64
+		var eventState string
+		if err := rows.Scan(&seq, &eventState); err != nil {
+			return nil, false, err
+		}
+		states[seq] = eventState
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return states, len(states) == len(recovery.TargetEventSeqs), nil
 }
 
 type intentForwardRecoveryPrefix struct {
@@ -697,6 +781,11 @@ func selectIntentForwardRecoveryPrefix(
 			if _, ok := pendingBySeq[seq]; ok {
 				group.seqs = append(group.seqs, seq)
 			}
+		}
+		if len(group.seqs) > 0 &&
+			len(group.seqs) < len(candidate.SelectedSeqs) {
+			return intentForwardRecoveryPrefix{}, errors.New(
+				"daemon: semantic recovery candidate is partially resolved")
 		}
 		if len(group.seqs) == 0 {
 			resolvedIDs[candidate.CandidateID] = struct{}{}
