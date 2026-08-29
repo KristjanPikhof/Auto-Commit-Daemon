@@ -30,8 +30,9 @@ Candidate evaluation normally waits until the newest capture has been quiet for
 the configured settle window. Filling the planning window does not skip that
 wait. A durable soft or hard activity boundary, an explicit logical flush, a
 dependency-safe forced-aging window, or the maximum pending age can release
-work sooner. Window
-and high-water limits still bound each planning pass and the pending queue.
+work sooner. Window and high-water limits bound each planning pass, not the
+durable pending queue. A larger queue remains checkpoint-protected and is
+offered to the planner in bounded passes.
 Optional integrations may provide boundaries, but filesystem protection does
 not depend on them.
 
@@ -39,9 +40,9 @@ not depend on them.
 
 | Preset | Publication behavior |
 |---|---|
-| Fast | Evidence-based partition with structural checks. |
-| Balanced | Evidence-based partition with fast verification and bounded safe repair. |
-| Quality | Evidence-based partition with stronger verification and bounded safe repair. |
+| Fast | Evidence-based partition without a configured verification command. |
+| Balanced | Evidence-based partition with structural verification and bounded safe repair. |
+| Quality | Evidence-based partition with full verification and bounded safe repair. |
 
 ## Planner recovery
 
@@ -103,10 +104,12 @@ and retries after the provider recovers. Planner windows and diagnostics report
 `waiting_message_rewrite` until a meaningful message is available.
 
 ACD uses `needs_attention` only when it cannot prove a safe outcome.
-Examples include unresolved dependency ambiguity, failed materialization or
-verification, a revertibility failure, or uncertain branch ownership and
-exact-ref state. A provider or grouping failure does not require attention
-when the evidence partition passes those checks.
+Examples include unresolved dependency ambiguity, failed materialization, a
+revertibility failure, or uncertain branch ownership and exact-ref state. A
+verification failure first starts bounded automatic checkpoint replanning and
+target widening. It needs attention only when the complete frozen recovery
+target exhausts required verification. A provider or grouping failure does not
+require attention when the evidence partition passes the other checks.
 
 Status, diagnose, and doctor report the preflight state, finding codes,
 provider attempts, and why a provider call was skipped. Replay-error repeats
@@ -150,9 +153,9 @@ performs one local unlock before returning to semantic planning.
 
 Automatic recovery does not weaken publication safety. A branch or `HEAD`
 transition, detached `HEAD`, manual pause, or active Git operation waits for
-the repository to become stable. Failed required verification, ambiguous
-self-publication, missing objects, materialization conflicts, and dependency
-cycles that cannot be proved safe stop with `needs_attention`.
+the repository to become stable. Exhausted required-verification recovery,
+ambiguous self-publication, missing objects, materialization conflicts, and
+dependency cycles that cannot be proved safe stop with `needs_attention`.
 
 ## Publication safety
 
