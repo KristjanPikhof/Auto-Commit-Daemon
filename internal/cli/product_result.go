@@ -244,6 +244,9 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 	case "provider_wait":
 		return "waiting for the Intent provider to write a semantic commit message"
 	case "stalled":
+		if progress.Origin == "intent_recovery" {
+			return "automatic Intent recovery active; no target movement yet"
+		}
 		return "stalled; bounded automatic recovery is expected to start"
 	case "retrying":
 		return "retrying publication automatically"
