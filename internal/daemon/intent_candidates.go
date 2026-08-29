@@ -17,6 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
 // IntentCandidateCapture is the immutable capture material made visible to one
@@ -104,10 +105,11 @@ type IntentCandidateEvaluation struct {
 // IntentCandidateDecision is one persisted candidate revision plus its exact
 // planner message and atomicity result.
 type IntentCandidateDecision struct {
-	Candidate   state.IntentCandidate
-	Assignment  ai.IntentCandidateAssignment
-	Atomicity   ai.IntentAtomicityReport
-	Publishable bool
+	Candidate            state.IntentCandidate
+	Assignment           ai.IntentCandidateAssignment
+	Atomicity            ai.IntentAtomicityReport
+	Publishable          bool
+	VerificationDeferred bool
 }
 
 type IntentCandidateEvaluationResult struct {
@@ -125,6 +127,7 @@ type IntentCandidateEvaluationResult struct {
 	FindingCodes           []string
 	ProviderCallSkipped    string
 	NeedsAttention         bool
+	VerificationDeferred   bool
 	Boundaries             []state.IntentActivityBoundary
 	Dependencies           []state.IntentCaptureDependency
 	Decisions              []IntentCandidateDecision
@@ -173,8 +176,9 @@ func (e *IntentPlanPreflightError) Error() string {
 }
 
 const (
-	intentBalancedFallbackCaptureCap = 32
-	intentBalancedFallbackPathCap    = 12
+	intentBalancedFallbackCaptureCap     = 32
+	intentBalancedFallbackPathCap        = 12
+	intentVerificationResourceWaitReason = "verification workspace resources unavailable; retrying automatically"
 )
 
 type intentCandidateContinuation struct {
@@ -475,6 +479,33 @@ func EvaluateIntentCandidates(
 			assignment, evaluationDependencies, existingByID, captureBySeq)
 		if err != nil {
 			return result, err
+		}
+		if decision.VerificationDeferred {
+			result.VerificationDeferred = true
+			candidateIDs := []string{assignment.CandidateID}
+			if continuation, ok := continuationByTarget[assignment.CandidateID]; ok {
+				candidateIDs = append(candidateIDs, continuation.SourceIDs...)
+			}
+			seenCandidateIDs := make(map[string]struct{}, len(candidateIDs))
+			for _, candidateID := range candidateIDs {
+				if _, seen := seenCandidateIDs[candidateID]; seen {
+					continue
+				}
+				seenCandidateIDs[candidateID] = struct{}{}
+				if _, exists := existingByID[candidateID]; !exists {
+					continue
+				}
+				if _, deferErr := state.MarkIntentCandidateVerificationPending(
+					ctx, db, candidateID, input.BranchRef,
+					input.BranchGeneration,
+					intentVerificationResourceWaitReason,
+					nowSeconds,
+				); deferErr != nil {
+					return result, deferErr
+				}
+			}
+			result.Decisions = append(result.Decisions, decision)
+			continue
 		}
 		if continuation, ok := continuationByTarget[assignment.CandidateID]; ok && len(continuation.SourceIDs) > 0 {
 			merged, mergeErr := state.MergeIntentCandidates(ctx, db,
@@ -2356,6 +2387,7 @@ func evaluateIntentCandidateAssignment(
 	verificationRequired := input.VerificationMode == "fast" ||
 		input.VerificationMode == "full"
 	var verificationResult IntentCandidateVerification
+	verificationDeferred := false
 	if !verificationRequired {
 		results = append(results, ai.IntentAtomicityGateResult{
 			Gate:   ai.IntentAtomicityVerification,
@@ -2382,7 +2414,16 @@ func evaluateIntentCandidateAssignment(
 				PlanFingerprint:     input.planFingerprint,
 				RecoveryCandidateID: input.RecoveryCandidateID,
 			}, input.Verify, assignment, candidateCaptures)
-		if verifyErr != nil {
+		if errors.Is(verifyErr, verification.ErrResourceUnavailable) {
+			verificationResult = IntentCandidateVerification{}
+			verificationDeferred = true
+			results = append(results, pendingIntentGate(
+				assignment.CandidateID,
+				ai.IntentAtomicityVerification,
+				"verification_resource_unavailable",
+				intentVerificationResourceWaitReason,
+			))
+		} else if verifyErr != nil {
 			results = append(results, failedIntentGate(assignment.CandidateID,
 				ai.IntentAtomicityVerification, "verification_failed", verifyErr))
 		} else {
@@ -2475,6 +2516,7 @@ func evaluateIntentCandidateAssignment(
 	decision.Candidate = candidate
 	decision.Atomicity = report
 	decision.Publishable = report.Valid && assignment.Readiness == ai.IntentCandidateReady
+	decision.VerificationDeferred = verificationDeferred
 	return decision, nil
 }
 

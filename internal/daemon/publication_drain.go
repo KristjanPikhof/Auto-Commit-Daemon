@@ -1268,6 +1268,9 @@ func UpdatePublicationDrainAfterReplay(
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
 	if !progressed && summary.Disposition == ReplayDispositionTransientWait {
+		if summary.SkippedReason == "intent_v2_verification_resource_wait" {
+			update.LastError = intentVerificationResourceWaitReason
+		}
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
 	if !progressed && summary.Disposition == ReplayDispositionNeedsAttention {

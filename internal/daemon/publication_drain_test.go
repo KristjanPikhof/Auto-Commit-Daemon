@@ -950,6 +950,36 @@ func TestPublicationDrainProviderWaitPreservesSemanticPhase(t *testing.T) {
 	}
 }
 
+func TestPublicationDrainVerificationResourceWaitPreservesSemanticPhase(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 1, 1)
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainSemantic
+	drain, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waiting, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, ReplaySummary{
+			Skipped:           true,
+			SkippedReason:     "intent_v2_verification_resource_wait",
+			Disposition:       ReplayDispositionTransientWait,
+			DispositionReason: intentVerificationResourceWaitReason,
+		}, nil, time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting.Phase != state.PublicationDrainSemantic ||
+		waiting.SemanticRebuildAttempts != drain.SemanticRebuildAttempts ||
+		waiting.EventFallbackCount != drain.EventFallbackCount ||
+		waiting.LastError != intentVerificationResourceWaitReason {
+		t.Fatalf("verification resource wait changed semantic drain=%+v", waiting)
+	}
+}
+
 func TestPublicationDrainUnknownRuntimeContractNeedsAction(t *testing.T) {
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)

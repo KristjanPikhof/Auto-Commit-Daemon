@@ -21,6 +21,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
 type failedCheckpointRecoveryPlanner struct {
@@ -222,6 +223,56 @@ func TestIntentEvaluationAwaitingCheckpointRecovery(t *testing.T) {
 				t.Fatalf("%s was classified as automatic recovery", test.name)
 			}
 		})
+	}
+}
+
+func TestReplayVerificationResourceWaitRetainsSemanticTarget(t *testing.T) {
+	fixture := seedFailedCheckpointReplayFixture(t)
+	f := fixture.capture
+	ctx := context.Background()
+	planner := &exactTargetReplanPlanner{}
+	opts := semanticPrefixReplayOpts(planner, func(
+		context.Context,
+		ai.IntentCandidateAssignment,
+		[]IntentCandidateCapture,
+	) (IntentCandidateVerification, error) {
+		return IntentCandidateVerification{Status: "needs_attention"},
+			fmt.Errorf("prepare verification workspace: %w",
+				verification.ErrResourceUnavailable)
+	})
+	opts.GitDir = f.gitDir
+
+	result, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Skipped ||
+		result.SkippedReason != "intent_v2_verification_resource_wait" ||
+		result.Disposition != ReplayDispositionTransientWait ||
+		result.DispositionReason != intentVerificationResourceWaitReason ||
+		result.HasMore || result.Published != 0 || result.Failed != 0 ||
+		result.Conflicts != 0 {
+		t.Fatalf("resource wait replay=%+v", result)
+	}
+	if !reflect.DeepEqual(planner.offeredSeqs, [][]int64{fixture.seqs}) {
+		t.Fatalf("resource wait offers=%v want %v",
+			planner.offeredSeqs, fixture.seqs)
+	}
+	if _, active, err := state.IntentForwardRecoveryForPair(
+		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
+	); err != nil || active {
+		t.Fatalf("resource wait recovery active=%t err=%v", active, err)
+	}
+	for _, seq := range fixture.seqs {
+		var eventState string
+		if err := f.db.ReadSQL().QueryRowContext(ctx,
+			`SELECT state FROM capture_events WHERE seq=?`, seq).
+			Scan(&eventState); err != nil {
+			t.Fatal(err)
+		}
+		if eventState != state.EventStatePending {
+			t.Fatalf("resource wait event %d state=%q", seq, eventState)
+		}
 	}
 }
 
