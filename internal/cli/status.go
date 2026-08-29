@@ -311,8 +311,10 @@ WHERE cp.phase='completed'
       SELECT 1
       FROM checkpoint_events ce
       JOIN capture_events e ON e.seq=ce.event_seq
-      WHERE ce.checkpoint_id=cp.id AND e.state<>'published'
-  )`).Scan(&report.UnpublishedCheckpoints); err != nil {
+      WHERE ce.checkpoint_id=cp.id AND e.state NOT IN (?, ?)
+  )`, state.EventStatePublished, state.EventStateRecovered).Scan(
+			&report.UnpublishedCheckpoints,
+		); err != nil {
 			return report, fmt.Errorf("unpublished checkpoints: %w", err)
 		}
 		report.Protected = complete && report.LatestCheckpointID != "" &&
