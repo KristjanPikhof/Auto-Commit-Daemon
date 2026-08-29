@@ -621,6 +621,14 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
+	case status.PublicationProgress.Phase == "verifying":
+		res.Health = controlHealthPublishing
+		if status.PublicationProgress.Origin == "intent_recovery" {
+			res.Summary = "ACD is verifying the semantic group for automatic recovery. The recovery target and your work remain protected."
+		} else {
+			res.Summary = "ACD is verifying the semantic group. Your work remains protected."
+		}
+		res.NextAction = "No action needed. ACD will continue when verification finishes."
 	case status.PublicationProgress.Phase == "provider_call":
 		res.Health = controlHealthPublishing
 		if status.PublicationProgress.Origin == "intent_recovery" {
