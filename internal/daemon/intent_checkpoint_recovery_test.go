@@ -227,9 +227,32 @@ func TestIntentEvaluationAwaitingCheckpointRecovery(t *testing.T) {
 }
 
 func TestReplayVerificationResourceWaitRetainsSemanticTarget(t *testing.T) {
-	fixture := seedFailedCheckpointReplayFixture(t)
-	f := fixture.capture
 	ctx := context.Background()
+	f := newCaptureFixture(t)
+	seedTrackedFileCommit(t, ctx, f, "resource_wait.go",
+		"package source\n\nconst Value = 1\n")
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "resource_wait.go"),
+		[]byte("package source\n\nconst Value = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpointStore := checkpointpkg.Store{DB: f.db}
+	if captured, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+		CheckpointStore:  &checkpointStore,
+		WorktreeID:       checkpointpkg.WorktreeID(f.dir),
+		ObservationEpoch: 1, CheckpointReason: state.CheckpointReasonPoll,
+		DisablePendingCap: true,
+	}); err != nil || captured.EventsAppended != 1 ||
+		captured.CheckpointID == "" {
+		t.Fatalf("resource wait capture=%+v err=%v", captured, err)
+	}
+	pendingBefore, err := state.PublishableEvents(ctx, f.db, 0)
+	if err != nil || len(pendingBefore) != 1 {
+		t.Fatalf("resource wait pending=%+v err=%v", pendingBefore, err)
+	}
 	planner := &exactTargetReplanPlanner{}
 	opts := semanticPrefixReplayOpts(planner, func(
 		context.Context,
@@ -254,16 +277,17 @@ func TestReplayVerificationResourceWaitRetainsSemanticTarget(t *testing.T) {
 		result.Conflicts != 0 {
 		t.Fatalf("resource wait replay=%+v", result)
 	}
-	if !reflect.DeepEqual(planner.offeredSeqs, [][]int64{fixture.seqs}) {
+	wantSeqs := []int64{pendingBefore[0].Seq}
+	if !reflect.DeepEqual(planner.offeredSeqs, [][]int64{wantSeqs}) {
 		t.Fatalf("resource wait offers=%v want %v",
-			planner.offeredSeqs, fixture.seqs)
+			planner.offeredSeqs, wantSeqs)
 	}
 	if _, active, err := state.IntentForwardRecoveryForPair(
 		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
 	); err != nil || active {
 		t.Fatalf("resource wait recovery active=%t err=%v", active, err)
 	}
-	for _, seq := range fixture.seqs {
+	for _, seq := range wantSeqs {
 		var eventState string
 		if err := f.db.ReadSQL().QueryRowContext(ctx,
 			`SELECT state FROM capture_events WHERE seq=?`, seq).
