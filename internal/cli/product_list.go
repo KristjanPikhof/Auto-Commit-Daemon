@@ -372,7 +372,15 @@ func productListPhase(entry productListEntry) string {
 		}
 		return "local-recovery"
 	case "provider_wait":
+		if progress.WaitRemainingSeconds > 0 {
+			return "provider-wait:" + strings.ReplaceAll(formatDurationCompact(
+				time.Duration(progress.WaitRemainingSeconds)*time.Second), " ", "")
+		}
 		return "provider-wait"
+	case "provider_call":
+		return "provider-call"
+	case "verifying":
+		return "verifying"
 	case "event_publishing":
 		return "event"
 	case "needs_action":
@@ -437,6 +445,9 @@ func productListStatus(entry productListEntry) string {
 		return "needs action"
 	case entry.PublicationProgress.Phase == "stalled":
 		return "stalled"
+	case entry.PublicationProgress.Phase == "provider_call" ||
+		entry.PublicationProgress.Phase == "verifying":
+		return "working"
 	case entry.PublicationProgress.Phase == "provider_wait" ||
 		entry.PublicationProgress.Phase == "intent_wait" ||
 		entry.PublicationProgress.Phase == "rewind_wait" ||
