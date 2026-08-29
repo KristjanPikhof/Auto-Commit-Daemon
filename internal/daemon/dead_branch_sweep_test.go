@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -597,166 +596,50 @@ func TestDeadBranchSweep_LiveRefsErrorPreservesRows(t *testing.T) {
 	}
 }
 
-// TestDivergedHookRecoversDeadBranchTerminals drives a Diverged transition
-// through the run loop where the previous branch ref no longer resolves.
-// Mirrors TestRun_BranchSwitchDropsPending but adds:
-//   - a blocked_conflict row on refs/heads/old (which we delete before the
-//     transition)
-//   - assertion that after the bump, the terminal row is gone
-//   - assertion that an analogous row on a still-live ref is preserved
-func TestDivergedHookRecoversDeadBranchTerminals(t *testing.T) {
+// TestPruneDeadBranchTerminalsRecoversOnlyDeadRef verifies that the runtime
+// helper recovers a deleted ref without touching an otherwise identical live
+// ref. TestRun_RuntimeDivergedRecoversDeadBranchTerminals covers the run-loop
+// integration separately.
+func TestPruneDeadBranchTerminalsRecoversOnlyDeadRef(t *testing.T) {
 	t.Setenv(EnvKeepDeadBranchBarriers, "")
 	f := newDaemonFixture(t)
-	registerLiveClient(t, f.db)
 	ctx := context.Background()
 
-	seedHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	headOID, err := git.RevParse(ctx, f.dir, "HEAD")
 	if err != nil {
-		t.Fatalf("rev-parse seed: %v", err)
+		t.Fatalf("rev-parse HEAD: %v", err)
 	}
 
-	// Create refs/heads/old (will be deleted before the Diverged transition
-	// fires). This proves the runtime hook path discriminates "ref still
-	// alive" vs "ref deleted".
-	if err := git.UpdateRef(ctx, f.dir, "refs/heads/old", seedHead, ""); err != nil {
-		t.Fatalf("update-ref refs/heads/old: %v", err)
+	const deadRef = "refs/heads/old"
+	const liveRef = "refs/heads/keep"
+	if err := git.UpdateRef(ctx, f.dir, deadRef, headOID, ""); err != nil {
+		t.Fatalf("update-ref %s: %v", deadRef, err)
 	}
-	// Create refs/heads/keep — kept alive throughout the test.
-	if err := git.UpdateRef(ctx, f.dir, "refs/heads/keep", seedHead, ""); err != nil {
-		t.Fatalf("update-ref refs/heads/keep: %v", err)
+	if err := git.UpdateRef(ctx, f.dir, liveRef, headOID, ""); err != nil {
+		t.Fatalf("update-ref %s: %v", liveRef, err)
 	}
 
-	// Pre-seed terminal rows under generation 1 for both refs.
-	seedTerminalEvent(t, f.db, "refs/heads/old", 1, seedHead, "old-blocked.txt", state.EventStateBlockedConflict)
-	seedTerminalEvent(t, f.db, "refs/heads/keep", 1, seedHead, "keep-blocked.txt", state.EventStateBlockedConflict)
-
-	// Now delete refs/heads/old to simulate "branch merged + deleted".
-	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "update-ref", "-d", "refs/heads/old"); err != nil {
-		t.Fatalf("delete refs/heads/old: %v", err)
+	seedTerminalEvent(t, f.db, deadRef, 1, headOID, "old-blocked.txt", state.EventStateBlockedConflict)
+	seedTerminalEvent(t, f.db, liveRef, 1, headOID, "keep-blocked.txt", state.EventStateBlockedConflict)
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "update-ref", "-d", deadRef); err != nil {
+		t.Fatalf("delete %s: %v", deadRef, err)
 	}
 
-	// Manually persist branch token so the run-loop start sees us on
-	// refs/heads/old and detects the Diverged transition into a sibling.
-	// Easier route: fabricate a sibling ref on main that diverges. Use the
-	// well-trodden pattern from TestRun_BranchGenerationBumpsOnExternalReset.
-	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("sibling\n"))
-	if err != nil {
-		t.Fatalf("hash sibling blob: %v", err)
-	}
-	siblingTree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
-		{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "sibling.txt"},
-	})
-	if err != nil {
-		t.Fatalf("mktree sibling: %v", err)
-	}
-	sibling, err := git.CommitTree(ctx, f.dir, siblingTree, "sibling root")
-	if err != nil {
-		t.Fatalf("commit-tree sibling: %v", err)
-	}
-
-	wakeCh := make(chan struct{}, 4)
-	shutdownCh := make(chan struct{}, 1)
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_ = Run(runCtx, Options{
-			RepoPath:    f.dir,
-			GitDir:      f.gitDir,
-			DB:          f.db,
-			Scheduler:   fastScheduler(),
-			BootGrace:   30 * time.Second,
-			WakeCh:      wakeCh,
-			ShutdownCh:  shutdownCh,
-			SkipSignals: true,
-		})
-	}()
-
-	// Wait for the initial token + generation seed so we can drive a
-	// Diverged transition deterministically.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
-		head, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchHead)
-		if gen == "1" && head == seedHead {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	// Now reseat refs/heads/main onto the sibling: a Diverged transition
-	// from the daemon's perspective. The runtime Diverged hook bumps
-	// generation 1 -> 2 and (because the prior branch ref refs/heads/main
-	// IS the same as the new one — which is alive) the dead-branch prune
-	// short-circuits on the active ref.
-	//
-	// To exercise the dead-branch path we don't need to switch branches in
-	// the worktree; instead we directly invoke the helper on a *previous*
-	// generation pair whose ref is dead, which is what the Diverged path
-	// would do internally if branch switching deleted the prior ref.
-	//
-	// First, kick the run loop into a Diverged transition to validate the
-	// integration.
-	if err := git.UpdateRef(ctx, f.dir, "refs/heads/main", sibling, ""); err != nil {
-		t.Fatalf("update-ref to sibling: %v", err)
-	}
-	for i := 0; i < 4; i++ {
-		select {
-		case wakeCh <- struct{}{}:
-		default:
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	deadline = time.Now().Add(5 * time.Second)
-	var got string
-	for time.Now().Before(deadline) {
-		v, ok, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
-		if ok && v != "" && v != "1" {
-			got = v
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got == "" {
-		t.Fatalf("branch.generation did not bump after sibling reset; runtime Diverged path never fired")
-	}
-
-	// Stop the run loop before invoking the compatibility helper directly.
-	// Resetting main to the sibling leaves the fixture worktree dirty, so an
-	// active daemon may capture and publish that work while reconciliation is
-	// proving a stable live token. Production recovery must fail closed when
-	// HEAD moves; this direct-helper assertion needs a quiescent repository.
-	cancel()
-	wg.Wait()
-
-	// The Diverged hook reconciles its own prior exact pair. These separate
-	// fixtures exercise the compatibility sweep: refs/heads/old is dead and
-	// refs/heads/keep remains live.
-	//
-	// The runtime hook only prunes for tokenBranchRef(oldToken), i.e. the
-	// branch the daemon was on (refs/heads/main). To exercise the dead-ref
-	// path against refs/heads/old, also invoke the helper directly: this
-	// also covers the case where a prior daemon session moved off
-	// refs/heads/old before deletion and left terminals behind.
 	pruneDeadBranchTerminals(ctx, f.dir, f.db,
-		CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 2, BaseHead: sibling},
-		"refs/heads/old", 1,
+		CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 2, BaseHead: headOID},
+		deadRef, 1,
 		slog.Default(), nil,
 		"test-direct invocation")
 
-	if n := countEventsByRefState(t, f.db, "refs/heads/old", state.EventStateBlockedConflict); n != 0 {
-		t.Fatalf("dead-ref refs/heads/old blocked rows=%d want 0 after recovery", n)
+	if n := countEventsByRefState(t, f.db, deadRef, state.EventStateBlockedConflict); n != 0 {
+		t.Fatalf("dead-ref %s blocked rows=%d want 0 after recovery", deadRef, n)
 	}
-	if n := countEventsByRefState(t, f.db, "refs/heads/old", state.EventStateRecovered); n != 1 {
-		t.Fatalf("dead-ref refs/heads/old recovered rows=%d want 1", n)
+	if n := countEventsByRefState(t, f.db, deadRef, state.EventStateRecovered); n != 1 {
+		t.Fatalf("dead-ref %s recovered rows=%d want 1", deadRef, n)
 	}
-	if n := countEventsByRefState(t, f.db, "refs/heads/keep", state.EventStateBlockedConflict); n != 1 {
-		t.Fatalf("live-ref refs/heads/keep terminal rows=%d want 1 (must be preserved)", n)
+	if n := countEventsByRefState(t, f.db, liveRef, state.EventStateBlockedConflict); n != 1 {
+		t.Fatalf("live-ref %s terminal rows=%d want 1 (must be preserved)", liveRef, n)
 	}
-
 }
 
 // TestDeadBranchSweep_WritesMetaKeysWhenRowsRecovered asserts the startup sweep
