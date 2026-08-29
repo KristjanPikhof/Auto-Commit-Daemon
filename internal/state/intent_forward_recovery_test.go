@@ -195,6 +195,15 @@ func TestIntentForwardRecoverySemanticPrefixPersistsAndResetsAfterProgress(
 	); err == nil || !strings.Contains(err.Error(), "move backward") {
 		t.Fatalf("backward prefix err=%v", err)
 	}
+	changedTarget := wider
+	changedTarget.TargetEventSeqs = append(
+		[]int64(nil), changedTarget.TargetEventSeqs[:2]...)
+	if _, err := AdvanceIntentForwardRecoveryPrefix(
+		ctx, fixture.db, changedTarget, changedTarget.PlanFingerprint,
+		changedTarget.PrefixBaseHead, 4,
+	); err == nil || !strings.Contains(err.Error(), "marker changed") {
+		t.Fatalf("changed target err=%v", err)
+	}
 
 	progressed, err := AdvanceIntentForwardRecovery(
 		ctx, fixture.db, wider, "semantic_replan", 1)
@@ -230,6 +239,11 @@ func TestIntentForwardRecoverySemanticPrefixPersistsAndResetsAfterProgress(
 		attention.PrefixBaseHead, 2,
 	); err == nil || !strings.Contains(err.Error(), "exhausted") {
 		t.Fatalf("exhausted prefix err=%v", err)
+	}
+	if _, err := AdvanceIntentForwardRecovery(
+		ctx, fixture.db, attention, "semantic_replan", 0,
+	); err == nil || !strings.Contains(err.Error(), "requires attention") {
+		t.Fatalf("exhausted stage transition err=%v", err)
 	}
 }
 

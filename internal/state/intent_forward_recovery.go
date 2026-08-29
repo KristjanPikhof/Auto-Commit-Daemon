@@ -28,6 +28,7 @@ type IntentForwardRecovery struct {
 	LastProgressTS   float64 `json:"last_progress_ts,omitempty"`
 	PlanFingerprint  string  `json:"plan_fingerprint,omitempty"`
 	PrefixCursor     int     `json:"prefix_cursor,omitempty"`
+	PrefixUnresolvedCount int `json:"prefix_unresolved_count,omitempty"`
 	PrefixBaseHead   string  `json:"prefix_base_head,omitempty"`
 	PrefixExhausted  bool    `json:"prefix_exhausted,omitempty"`
 	NeedsAttention   bool    `json:"needs_attention,omitempty"`
@@ -1020,6 +1021,7 @@ func sameIntentForwardRecoveryMarker(
 		left.LastProgressTS == right.LastProgressTS &&
 		left.PlanFingerprint == right.PlanFingerprint &&
 		left.PrefixCursor == right.PrefixCursor &&
+		left.PrefixUnresolvedCount == right.PrefixUnresolvedCount &&
 		left.PrefixBaseHead == right.PrefixBaseHead &&
 		left.PrefixExhausted == right.PrefixExhausted &&
 		left.NeedsAttention == right.NeedsAttention &&
@@ -1094,6 +1096,11 @@ func AdvanceIntentForwardRecovery(
 	}
 	if !sameIntentForwardRecoveryMarker(current, recovery) {
 		return recovery, errors.New("state: intent forward recovery marker changed")
+	}
+	if published == 0 && (current.PrefixExhausted || current.NeedsAttention) &&
+		stage != current.Stage {
+		return recovery, errors.New(
+			"state: exhausted intent forward recovery requires attention")
 	}
 	current.Stage = stage
 	if published > 0 {
