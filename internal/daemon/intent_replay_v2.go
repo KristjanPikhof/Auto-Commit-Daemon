@@ -325,6 +325,14 @@ func replayIntentCandidateBatch(
 			if err != nil {
 				return sum, err
 			}
+			// Repair replaces the branch suffix without advancing the scratch
+			// index used by this replay pass. Start the next candidate from the
+			// repaired tree so it cannot reintroduce the replaced suffix.
+			if err := git.ReadTree(ctx, repoRoot, indexFile, currentParent); err != nil {
+				return sum, fmt.Errorf(
+					"daemon: replay reseed index after intent repair: %w", err)
+			}
+			activeCtx.BaseHead = currentParent
 			continue
 		}
 		before := sum
