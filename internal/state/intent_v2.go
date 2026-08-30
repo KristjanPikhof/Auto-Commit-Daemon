@@ -1621,6 +1621,68 @@ func IntentRepairByID(ctx context.Context, d *DB, id string) (IntentRepair, bool
 	return repair, true, nil
 }
 
+// IntentRepairByIDBounded loads immutable commit and member evidence for one
+// repair with a shared row budget. evidenceRows excludes the repair header and
+// membership seal; callers that traverse several repairs can subtract it from
+// one aggregate proof budget. A limit sentinel fails closed before returning a
+// partial repair.
+func IntentRepairByIDBounded(
+	ctx context.Context,
+	d *DB,
+	id string,
+	limit int,
+) (repair IntentRepair, ok bool, evidenceRows int, err error) {
+	if d == nil || strings.TrimSpace(id) == "" || limit < 0 ||
+		limit > CompletedBranchTransitionProofLimit {
+		return IntentRepair{}, false, 0, errors.New(
+			"state: IntentRepairByIDBounded: invalid input")
+	}
+	repair, err = scanIntentRepair(d.readSQL().QueryRowContext(ctx,
+		intentRepairSelect+` WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return IntentRepair{}, false, 0, nil
+	}
+	if err != nil {
+		return IntentRepair{}, false, 0, err
+	}
+	commits, overflow, err := loadIntentRepairCommitsBounded(
+		ctx, d.readSQL(), id, limit)
+	if err != nil {
+		return IntentRepair{}, false, 0, err
+	}
+	if overflow {
+		return IntentRepair{}, false, 0, completedBranchTransitionProofError(
+			"intent repair %s exceeds remaining evidence budget %d",
+			id, limit)
+	}
+	repair.Commits = commits
+	evidenceRows = len(commits)
+	members, overflow, err := loadIntentRepairMembersBounded(
+		ctx, d.readSQL(), id, limit-evidenceRows)
+	if err != nil {
+		return IntentRepair{}, false, 0, err
+	}
+	if overflow {
+		return IntentRepair{}, false, 0, completedBranchTransitionProofError(
+			"intent repair %s exceeds remaining evidence budget %d",
+			id, limit)
+	}
+	repair.Members = members
+	evidenceRows += len(members)
+	mode, sealedCount, err := loadIntentRepairMembershipSeal(
+		ctx, d.readSQL(), id)
+	if err != nil {
+		return IntentRepair{}, false, 0, err
+	}
+	if sealedCount != len(members) {
+		return IntentRepair{}, false, 0, fmt.Errorf(
+			"state: intent repair membership seal=%d members=%d",
+			sealedCount, len(members))
+	}
+	repair.MembershipMode = mode
+	return repair, true, evidenceRows, nil
+}
+
 func RecoverableIntentRepairs(ctx context.Context, d *DB, limit int) ([]IntentRepair, error) {
 	if d == nil {
 		return nil, errors.New("state: RecoverableIntentRepairs: nil db")
@@ -1934,6 +1996,39 @@ WHERE repair_id=? ORDER BY ord`, repairID)
 	return out, nil
 }
 
+func loadIntentRepairCommitsBounded(
+	ctx context.Context,
+	q intentV2Queryer,
+	repairID string,
+	limit int,
+) ([]IntentRepairCommit, bool, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT repair_id, ord, candidate_id, old_oid, new_oid
+FROM intent_repair_commits
+WHERE repair_id=? ORDER BY ord
+LIMIT ?`, repairID, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"state: query bounded intent repair commits: %w", err)
+	}
+	defer rows.Close()
+	var out []IntentRepairCommit
+	for rows.Next() {
+		var commit IntentRepairCommit
+		if err := rows.Scan(&commit.RepairID, &commit.Ord,
+			&commit.CandidateID, &commit.OldOID, &commit.NewOID); err != nil {
+			return nil, false, fmt.Errorf(
+				"state: scan bounded intent repair commit: %w", err)
+		}
+		out = append(out, commit)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf(
+			"state: iterate bounded intent repair commits: %w", err)
+	}
+	return out, len(out) > limit, nil
+}
+
 func loadIntentRepairMembers(
 	ctx context.Context,
 	q intentV2Queryer,
@@ -1960,6 +2055,39 @@ WHERE repair_id=? ORDER BY ord`, repairID)
 		return nil, fmt.Errorf("state: iterate intent repair members: %w", err)
 	}
 	return out, nil
+}
+
+func loadIntentRepairMembersBounded(
+	ctx context.Context,
+	q intentV2Queryer,
+	repairID string,
+	limit int,
+) ([]IntentRepairMember, bool, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT repair_id, ord, candidate_id, event_seq, prior_state
+FROM intent_repair_members
+WHERE repair_id=? ORDER BY ord
+LIMIT ?`, repairID, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"state: query bounded intent repair members: %w", err)
+	}
+	defer rows.Close()
+	var out []IntentRepairMember
+	for rows.Next() {
+		var member IntentRepairMember
+		if err := rows.Scan(&member.RepairID, &member.Ord,
+			&member.CandidateID, &member.EventSeq, &member.PriorState); err != nil {
+			return nil, false, fmt.Errorf(
+				"state: scan bounded intent repair member: %w", err)
+		}
+		out = append(out, member)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf(
+			"state: iterate bounded intent repair members: %w", err)
+	}
+	return out, len(out) > limit, nil
 }
 
 func loadIntentRepairMembershipSeal(
