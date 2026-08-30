@@ -280,7 +280,8 @@ func EnsureRecoveryRef(ctx context.Context, repoDir, ref, commitOID string) (Rec
 // process cannot move or delete it before fn returns and the transaction is
 // committed or aborted.
 func WithLockedRecoveryRef(ctx context.Context, repoDir, ref, expectedOID string, fn func() error) error {
-	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", "", true, fn)
+	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", "", true,
+		func(context.Context) error { return fn() })
 }
 
 // WithLockedRecoveryRefAndAbsentRef verifies and locks both a recovery ref
@@ -306,7 +307,8 @@ func WithLockedRecoveryRefAndAbsentRef(
 		return err
 	}
 	return withLockedExpectedRef(
-		ctx, repoDir, ref, expectedOID, expectedAbsentRef, zeroOID, true, fn)
+		ctx, repoDir, ref, expectedOID, expectedAbsentRef, zeroOID, true,
+		func(context.Context) error { return fn() })
 }
 
 // WithLockedRecoveryRefAndExpectedRef verifies and locks both a protected
@@ -320,7 +322,7 @@ func WithLockedRecoveryRefAndExpectedRef(
 	recoveryOID string,
 	expectedRef string,
 	expectedOID string,
-	fn func() error,
+	fn func(context.Context) error,
 ) error {
 	if !isValidFullRef(expectedRef) {
 		return fmt.Errorf("git: expected ref %q must be a valid full ref name", expectedRef)
@@ -328,9 +330,23 @@ func WithLockedRecoveryRefAndExpectedRef(
 	if expectedRef == recoveryRef {
 		return fmt.Errorf("git: expected ref must differ from recovery ref %q", recoveryRef)
 	}
-	return withLockedExpectedRef(
+	callbackSucceeded := false
+	err := withLockedExpectedRef(
 		ctx, repoDir, recoveryRef, recoveryOID,
-		expectedRef, expectedOID, true, fn)
+		expectedRef, expectedOID, true, func(lockCtx context.Context) error {
+			if err := fn(lockCtx); err != nil {
+				return err
+			}
+			callbackSucceeded = true
+			return nil
+		})
+	if callbackSucceeded {
+		// This transaction only verifies refs. Once the callback commits its
+		// cross-store mutation, a later update-ref protocol or cleanup error
+		// cannot invalidate the proof held for the duration of that mutation.
+		return nil
+	}
+	return err
 }
 
 // WithLockedExpectedRef verifies and locks one literal full ref at an exact
@@ -344,7 +360,8 @@ func WithLockedExpectedRef(
 	expectedOID string,
 	fn func() error,
 ) error {
-	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", "", false, fn)
+	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", "", false,
+		func(context.Context) error { return fn() })
 }
 
 // WithLockedAbsentRef verifies and locks one literal full ref while it is
@@ -360,7 +377,8 @@ func WithLockedAbsentRef(
 	if err != nil {
 		return err
 	}
-	return withLockedExpectedRef(ctx, repoDir, ref, zeroOID, "", "", false, fn)
+	return withLockedExpectedRef(ctx, repoDir, ref, zeroOID, "", "", false,
+		func(context.Context) error { return fn() })
 }
 
 func withLockedExpectedRef(
@@ -371,7 +389,7 @@ func withLockedExpectedRef(
 	secondaryRef string,
 	secondaryExpectedOID string,
 	requireRecoveryNamespace bool,
-	fn func() error,
+	fn func(context.Context) error,
 ) error {
 	if repoDir == "" {
 		return fmt.Errorf("git: locked ref verification called with empty repoDir")
@@ -481,7 +499,7 @@ func withLockedExpectedRef(
 		return fail("prepare", err)
 	}
 
-	if callbackErr := fn(); callbackErr != nil {
+	if callbackErr := fn(ctx); callbackErr != nil {
 		abortErr := write("abort")
 		if abortErr == nil {
 			abortErr = expectOK("abort")

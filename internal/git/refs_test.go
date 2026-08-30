@@ -231,6 +231,82 @@ func TestWithLockedExpectedRefBlocksConcurrentBranchMutation(t *testing.T) {
 	}
 }
 
+func TestWithLockedRecoveryAndBranchRefCancelsCallbackWork(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const (
+		recoveryRef = "refs/acd/recovery/test-timeout"
+		branchRef   = "refs/heads/main"
+	)
+	if err := UpdateRef(ctx, dir, recoveryRef, first, ""); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+	if err := UpdateRef(ctx, dir, branchRef, first, ""); err != nil {
+		t.Fatalf("seed branch ref: %v", err)
+	}
+
+	lockCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	var mutationErr error
+	err := WithLockedRecoveryRefAndExpectedRef(
+		lockCtx, dir, recoveryRef, first, branchRef, first,
+		func(callbackCtx context.Context) error {
+			<-callbackCtx.Done()
+			mutationErr = UpdateRef(
+				callbackCtx, dir, branchRef, second, first)
+			return callbackCtx.Err()
+		})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock timeout err=%v want deadline exceeded", err)
+	}
+	if mutationErr == nil {
+		t.Fatal("callback mutation succeeded after lock context expired")
+	}
+	got, err := RevParse(ctx, dir, branchRef)
+	if err != nil || got != first {
+		t.Fatalf("branch after timeout=%q err=%v want %s", got, err, first)
+	}
+}
+
+func TestWithLockedRecoveryAndBranchRefAcceptsCompletedCallbackAfterCancellation(t *testing.T) {
+	dir := initRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	first := commitFile(t, context.Background(), dir,
+		"first.txt", "first", "first")
+	const (
+		recoveryRef = "refs/acd/recovery/test-post-callback-cancel"
+		branchRef   = "refs/heads/main"
+	)
+	if err := UpdateRef(context.Background(), dir, recoveryRef, first, ""); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+	if err := UpdateRef(context.Background(), dir, branchRef, first, ""); err != nil {
+		t.Fatalf("seed branch ref: %v", err)
+	}
+
+	callbackCompleted := false
+	err := WithLockedRecoveryRefAndExpectedRef(
+		ctx, dir, recoveryRef, first, branchRef, first,
+		func(callbackCtx context.Context) error {
+			callbackCompleted = true
+			cancel()
+			<-callbackCtx.Done()
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("completed callback reported as failed: %v", err)
+	}
+	if !callbackCompleted {
+		t.Fatal("callback did not complete")
+	}
+	got, err := RevParse(context.Background(), dir, branchRef)
+	if err != nil || got != first {
+		t.Fatalf("branch after callback=%q err=%v want %s", got, err, first)
+	}
+}
+
 func TestWithLockedExpectedRefRejectsMismatchBeforeCallback(t *testing.T) {
 	dir := initRepo(t)
 	ctx := context.Background()
