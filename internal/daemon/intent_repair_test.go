@@ -409,6 +409,142 @@ LIMIT 1`).Scan(&candidateID); err != nil {
 	}
 }
 
+func TestReplayIntentV2RepairReseedsIndexBeforeNextCandidate(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		featureBody = "package feature\n\nfunc Value() int { return 1 }\n"
+		testBody    = "package feature\n\nfunc ExampleValue() { _ = Value() }\n"
+		notesBody   = "Feature notes\n"
+	)
+	if err := os.WriteFile(filepath.Join(f.dir, "feature.go"),
+		[]byte(featureBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	planner := &repairThenIndependentIntentV2Planner{}
+	opts := ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: planner, IntentPreset: config.PresetFast,
+		IntentBypassBatchWait: true, IntentWindow: 10,
+		IntentRepairEnabled: true, IntentRepairHorizon: 10 * time.Minute,
+		IntentRepairMaxCommits: 3,
+	}
+	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || first.Published != 1 {
+		t.Fatalf("first replay=%+v err=%v", first, err)
+	}
+	f.cctx.BaseHead = first.BaseHead
+	for path, contents := range map[string]string{
+		"feature_test.go": testBody,
+		"notes.md":        notesBody,
+	} {
+		if err := os.WriteFile(filepath.Join(f.dir, path),
+			[]byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
+		IgnoreChecker: f.ig, SensitiveMatcher: f.matcher,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil {
+		t.Fatalf("second Replay: %v", err)
+	}
+	if second.Published != 2 || second.Conflicts != 0 || second.Failed != 0 {
+		t.Fatalf("second replay=%+v", second)
+	}
+	for _, tc := range []struct {
+		rev, path, want string
+	}{
+		{"HEAD^", "feature_test.go", testBody},
+		{"HEAD", "feature_test.go", testBody},
+		{"HEAD", "notes.md", notesBody},
+	} {
+		if got := mustGitOutput(t, f.dir, "show", tc.rev+":"+tc.path); got != tc.want {
+			t.Fatalf("%s:%s=%q want %q", tc.rev, tc.path, got, tc.want)
+		}
+	}
+	if changed := strings.Fields(mustGitOutput(t, f.dir,
+		"diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD")); len(changed) != 1 || changed[0] != "notes.md" {
+		t.Fatalf("final candidate changed paths=%v want [notes.md]", changed)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending after repair and publish=%+v err=%v", pending, err)
+	}
+	if status := strings.TrimSpace(mustGitOutput(
+		t, f.dir, "status", "--short")); status != "" {
+		t.Fatalf("repair and follow-up publish left dirty state: %s", status)
+	}
+}
+
+func TestVerifyIntentTreePathOwnershipIncludesBothRenamePaths(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	const zeroObject = "0000000000000000000000000000000000000000"
+	parent := mustCommitPath(t, f.dir, "old.txt", "rename me\n", "seed rename")
+	parentTree, err := resolveTreeOID(ctx, f.dir, parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := mustBlobOID(t, f.dir, parent, "old.txt")
+	indexFile := filepath.Join(t.TempDir(), "intent.index")
+	if err := git.ReadTree(ctx, f.dir, indexFile, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := git.UpdateIndexInfo(ctx, f.dir, indexFile, []string{
+		fmt.Sprintf("0 %s\told.txt", zeroObject),
+		fmt.Sprintf("%s %s\tnew.txt", git.RegularFileMode, blob),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	renameTree, err := git.WriteTree(ctx, f.dir, indexFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := []state.CaptureOp{{
+		Op: "rename", Path: "new.txt",
+		OldPath:    sql.NullString{String: "old.txt", Valid: true},
+		BeforeOID:  sql.NullString{String: blob, Valid: true},
+		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+		AfterOID:   sql.NullString{String: blob, Valid: true},
+		AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: true},
+	}}
+	if err := verifyIntentTreePathOwnership(
+		ctx, f.dir, parentTree, renameTree, ops,
+	); err != nil {
+		t.Fatalf("rename ownership: %v", err)
+	}
+	leakedBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("not selected\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := git.UpdateIndexInfo(ctx, f.dir, indexFile, []string{
+		fmt.Sprintf("%s %s\tleaked.txt", git.RegularFileMode, leakedBlob),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	leakedTree, err := git.WriteTree(ctx, f.dir, indexFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = verifyIntentTreePathOwnership(ctx, f.dir, parentTree, leakedTree, ops)
+	if err == nil || !strings.Contains(err.Error(), `unowned path "leaked.txt"`) {
+		t.Fatalf("ownership error=%v want leaked path rejection", err)
+	}
+}
+
 func TestReplayIntentV2RepairVerificationFailureIsDurable(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -1392,6 +1528,8 @@ func (orderedIntentV2Planner) PlanIntent(
 
 type revisingIntentV2Planner struct{}
 
+type repairThenIndependentIntentV2Planner struct{}
+
 type waitingIntentV2Planner struct{}
 
 type suffixRepairIntentV2Planner struct{}
@@ -1572,6 +1710,62 @@ func (*revisingIntentV2Planner) PlanIntentV2(
 			Body:           "- Keep implementation and companion coverage atomic",
 			GroupingReason: "source and companion test form one purpose",
 		}},
+	}, nil
+}
+
+func (*repairThenIndependentIntentV2Planner) Name() string {
+	return "repair-then-independent-v2-test"
+}
+
+func (*repairThenIndependentIntentV2Planner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
+func (*repairThenIndependentIntentV2Planner) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	byPath := make(map[string]int64, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		byPath[capture.Path] = capture.Seq
+	}
+	featureID := "candidate-feature"
+	for _, candidate := range req.Candidates {
+		if strings.Contains(candidate.Purpose, "feature") {
+			featureID = candidate.CandidateID
+			break
+		}
+	}
+	assignments := make([]ai.IntentCandidateAssignment, 0, 2)
+	if seq := byPath["feature.go"]; seq != 0 {
+		assignments = append(assignments, ai.IntentCandidateAssignment{
+			CandidateID: featureID, SelectedSeqs: []int64{seq},
+			Purpose: "add feature with its test", Readiness: ai.IntentCandidateReady,
+			Subject: "Add feature", GroupingReason: "initial feature implementation",
+		})
+	}
+	if seq := byPath["feature_test.go"]; seq != 0 {
+		assignments = append(assignments, ai.IntentCandidateAssignment{
+			CandidateID: featureID, SelectedSeqs: []int64{seq},
+			Purpose: "add feature with its test", Readiness: ai.IntentCandidateReady,
+			Subject:        "Add tested feature",
+			GroupingReason: "late companion completes feature candidate",
+		})
+	}
+	if seq := byPath["notes.md"]; seq != 0 {
+		assignments = append(assignments, ai.IntentCandidateAssignment{
+			CandidateID: "candidate-notes", SelectedSeqs: []int64{seq},
+			Purpose: "record independent notes", Readiness: ai.IntentCandidateReady,
+			Subject:        "Add feature notes",
+			GroupingReason: "notes are independent of feature implementation",
+		})
+	}
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates:      assignments,
 	}, nil
 }
 
