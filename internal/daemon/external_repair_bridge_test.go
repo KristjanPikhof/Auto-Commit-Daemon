@@ -13,11 +13,11 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 	f := newExternalRepairBridgeFixture(t, false)
 	ctx := context.Background()
 	opts := RecoveryReconcileOptions{
-		GitDir:            f.capture.gitDir,
-		BranchRef:         f.capture.cctx.BranchRef,
-		BranchGeneration:  f.capture.cctx.BranchGeneration,
-		FirstSeq:          f.pendingSeqs[0],
-		Trigger:           "test_external_repair_bridge",
+		GitDir:             f.capture.gitDir,
+		BranchRef:          f.capture.cctx.BranchRef,
+		BranchGeneration:   f.capture.cctx.BranchGeneration,
+		FirstSeq:           f.pendingSeqs[0],
+		Trigger:            "test_external_repair_bridge",
 		ExternalParentHead: f.source,
 	}
 
@@ -31,8 +31,7 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 		t.Fatalf("proof=%+v want target %s", proved, f.target)
 	}
 	for _, seq := range f.pendingSeqs {
-		if eventState, commit := readEventState(t, ctx, f.capture.db, seq);
-			eventState != state.EventStatePending || commit.Valid {
+		if eventState, commit := readEventState(t, ctx, f.capture.db, seq); eventState != state.EventStatePending || commit.Valid {
 			t.Fatalf("read-only proof changed seq=%d state=%q commit=%v",
 				seq, eventState, commit)
 		}
@@ -51,25 +50,28 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 	if head, err := git.RevParse(ctx, f.capture.dir, "HEAD"); err != nil || head != f.live {
 		t.Fatalf("live HEAD=%s err=%v want untouched %s", head, err, f.live)
 	}
-	if statusAfter := gitRawOutput(t, ctx, f.capture.dir, "status", "--short");
-		statusAfter != statusBefore {
+	if statusAfter := gitRawOutput(t, ctx, f.capture.dir, "status", "--short"); statusAfter != statusBefore {
 		t.Fatalf("reconciliation changed worktree/index:\nbefore=%q\nafter=%q",
 			statusBefore, statusAfter)
 	}
 	for _, seq := range f.pendingSeqs {
-		if eventState, commit := readEventState(t, ctx, f.capture.db, seq);
-			eventState != state.EventStatePublished ||
+		if eventState, commit := readEventState(t, ctx, f.capture.db, seq); eventState != state.EventStatePublished ||
 			!commit.Valid || commit.String != f.target {
 			t.Fatalf("seq=%d state=%q commit=%v want published at %s",
 				seq, eventState, commit, f.target)
 		}
 	}
+	reconciled, err := state.ReconcileResolvedPublicationDrains(
+		ctx, f.capture.db, 3)
+	if err != nil || len(reconciled) != 1 ||
+		reconciled[0].ResolvedEvents != int64(len(f.pendingSeqs)) {
+		t.Fatalf("resolved drains=%+v err=%v", reconciled, err)
+	}
 	protected, err := git.RevParse(ctx, f.capture.dir, result.RecoveryRef)
 	if err != nil || protected != f.target {
 		t.Fatalf("proof ref=%s err=%v want target %s", protected, err, f.target)
 	}
-	if ancestor, err := git.IsAncestor(ctx, f.capture.dir, f.target, f.live);
-		err != nil || !ancestor {
+	if ancestor, err := git.IsAncestor(ctx, f.capture.dir, f.target, f.live); err != nil || !ancestor {
 		t.Fatalf("target ancestor of later live commit=%t err=%v", ancestor, err)
 	}
 }
@@ -101,18 +103,17 @@ func TestExternalRepairBridgeRejectsUnownedTargetPath(t *testing.T) {
 		t.Fatalf("unowned target path matched proof %+v", proof)
 	}
 	for _, seq := range f.pendingSeqs {
-		if eventState, _ := readEventState(t, ctx, f.capture.db, seq);
-			eventState != state.EventStatePending {
+		if eventState, _ := readEventState(t, ctx, f.capture.db, seq); eventState != state.EventStatePending {
 			t.Fatalf("rejected proof changed seq=%d state=%q", seq, eventState)
 		}
 	}
 }
 
 type externalRepairBridgeFixture struct {
-	capture    *captureFixture
-	source     string
-	target     string
-	live       string
+	capture     *captureFixture
+	source      string
+	target      string
+	live        string
 	pendingSeqs []int64
 }
 
@@ -140,25 +141,25 @@ func newExternalRepairBridgeFixture(
 	laterBlob := blob("later external work\n")
 	unownedBlob := blob("unowned target work\n")
 
-	source := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "source",
+	preRepair := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "pre-repair",
 		git.RegularFileMode+" "+pendingOld+"\tpending.txt",
 		git.RegularFileMode+" "+restoredOld+"\trestored.txt")
-	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, source, f.cctx.BaseHead); err != nil {
-		t.Fatalf("install source: %v", err)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, preRepair, f.cctx.BaseHead); err != nil {
+		t.Fatalf("install pre-repair head: %v", err)
 	}
-	f.cctx.BaseHead = source
+	f.cctx.BaseHead = preRepair
 
-	repairPending := appendRecoveryEvent(t, ctx, f, source, state.CaptureOp{
+	repairPending := appendRecoveryEvent(t, ctx, f, preRepair, state.CaptureOp{
 		Op: "modify", Path: "pending.txt",
 		BeforeOID: oidValue(pendingOld), BeforeMode: oidValue(git.RegularFileMode),
 		AfterOID: oidValue(pendingBridge), AfterMode: oidValue(git.RegularFileMode),
 	})
-	repairRestored := appendRecoveryEvent(t, ctx, f, source, state.CaptureOp{
+	repairRestored := appendRecoveryEvent(t, ctx, f, preRepair, state.CaptureOp{
 		Op: "modify", Path: "restored.txt",
 		BeforeOID: oidValue(restoredOld), BeforeMode: oidValue(git.RegularFileMode),
 		AfterOID: oidValue(restoredFinal), AfterMode: oidValue(git.RegularFileMode),
 	})
-	repairCommit := commitTreeWithIndexUpdates(t, ctx, f, source, "completed repair",
+	repairCommit := commitTreeWithIndexUpdates(t, ctx, f, preRepair, "completed repair",
 		git.RegularFileMode+" "+pendingBridge+"\tpending.txt",
 		git.RegularFileMode+" "+restoredFinal+"\trestored.txt")
 	for _, seq := range []int64{repairPending, repairRestored} {
@@ -169,8 +170,18 @@ func newExternalRepairBridgeFixture(
 		}
 	}
 	seedCompletedExternalBridgeRepair(
-		t, ctx, f, source, repairCommit,
+		t, ctx, f, preRepair, repairCommit,
 		[]int64{repairPending, repairRestored})
+
+	// Reproduce the stale-index publication: the commit descends from the
+	// repaired head but writes the pre-repair entries back into its tree.
+	source := commitTreeWithIndexUpdates(t, ctx, f, repairCommit, "stale source",
+		git.RegularFileMode+" "+pendingOld+"\tpending.txt",
+		git.RegularFileMode+" "+restoredOld+"\trestored.txt")
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, source, preRepair); err != nil {
+		t.Fatalf("install stale source: %v", err)
+	}
+	f.cctx.BaseHead = source
 
 	pendingOne := appendRecoveryEvent(t, ctx, f, source, state.CaptureOp{
 		Op: "modify", Path: "pending.txt",
@@ -186,6 +197,8 @@ func newExternalRepairBridgeFixture(
 		Op: "create", Path: "notes.txt",
 		AfterOID: oidValue(notesFinal), AfterMode: oidValue(git.RegularFileMode),
 	})
+	pendingSeqs := []int64{pendingOne, pendingTwo, pendingNotes}
+	seedExternalRepairBridgeDrain(t, ctx, f, source, pendingSeqs)
 
 	targetUpdates := []string{
 		git.RegularFileMode + " " + pendingFinal + "\tpending.txt",
@@ -208,7 +221,61 @@ func newExternalRepairBridgeFixture(
 	}
 	return externalRepairBridgeFixture{
 		capture: f, source: source, target: target, live: live,
-		pendingSeqs: []int64{pendingOne, pendingTwo, pendingNotes},
+		pendingSeqs: pendingSeqs,
+	}
+}
+
+func seedExternalRepairBridgeDrain(
+	t *testing.T,
+	ctx context.Context,
+	f *captureFixture,
+	head string,
+	eventSeqs []int64,
+) {
+	t.Helper()
+	tree, err := git.RevParse(ctx, f.dir, head+"^{tree}")
+	if err != nil {
+		t.Fatalf("resolve checkpoint tree: %v", err)
+	}
+	checkpoint := state.Checkpoint{
+		ID:               "cp-1786487000000-fedcba9876543210",
+		OperationID:      "op-external-repair-bridge",
+		WorktreeID:       "0123456789abcdef",
+		Reason:           state.CheckpointReasonManualBarrier,
+		ObservationEpoch: 1,
+		CoverageEpoch:    1,
+		ObservedHead:     head,
+		ObservedRef:      f.cctx.BranchRef,
+		TreeOID:          tree,
+		CommitOID:        head,
+		Ref:              "refs/acd/checkpoints/v1/0123456789abcdef/cp-1786487000000-fedcba9876543210",
+		CreatedTS:        1,
+		EventSeqs:        append([]int64(nil), eventSeqs...),
+	}
+	if created, err := state.PrepareCheckpoint(
+		ctx, f.db, checkpoint, publicationDrainTestDigest); err != nil || !created {
+		t.Fatalf("prepare bridge checkpoint=(%t,%v)", created, err)
+	}
+	if err := state.CompleteCheckpoint(
+		ctx, f.db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 2); err != nil {
+		t.Fatalf("complete bridge checkpoint: %v", err)
+	}
+	drain := state.PublicationDrain{
+		ID:                  "drain-external-repair-bridge",
+		CheckpointID:        checkpoint.ID,
+		WorktreeID:          checkpoint.WorktreeID,
+		BranchRef:           checkpoint.ObservedRef,
+		BranchGeneration:    f.cctx.BranchGeneration,
+		Phase:               state.PublicationDrainEventFallback,
+		TargetEventCount:    int64(len(eventSeqs)),
+		PublishedEventCount: 0,
+		CreatedTS:           2,
+		UpdatedTS:           2,
+		LastProgressTS:      2,
+	}
+	if created, err := state.PreparePublicationDrain(
+		ctx, f.db, drain); err != nil || !created {
+		t.Fatalf("prepare bridge drain=(%t,%v)", created, err)
 	}
 }
 
