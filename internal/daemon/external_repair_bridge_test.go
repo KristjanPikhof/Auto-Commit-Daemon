@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -84,8 +85,7 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 			livePending, err, targetPending)
 	}
 	for _, seq := range f.repairSeqs {
-		if eventState, commit := readEventState(t, ctx, f.capture.db, seq);
-			eventState != state.EventStatePublished || !commit.Valid ||
+		if eventState, commit := readEventState(t, ctx, f.capture.db, seq); eventState != state.EventStatePublished || !commit.Valid ||
 			commit.String != f.repairCommit {
 			t.Fatalf("repair seq=%d changed state=%q commit=%v",
 				seq, eventState, commit)
@@ -122,6 +122,44 @@ func TestExternalRepairBridgeRejectsUnownedTargetPath(t *testing.T) {
 	for _, seq := range f.pendingSeqs {
 		if eventState, _ := readEventState(t, ctx, f.capture.db, seq); eventState != state.EventStatePending {
 			t.Fatalf("rejected proof changed seq=%d state=%q", seq, eventState)
+		}
+	}
+}
+
+func TestExternalRepairBridgeRejectsEquivalentLaterProofRef(t *testing.T) {
+	f := newExternalRepairBridgeFixture(t, false)
+	ctx := context.Background()
+	laterBlob, err := git.HashObjectStdin(ctx, f.capture.dir, []byte("other later work\n"))
+	if err != nil {
+		t.Fatalf("HashObjectStdin: %v", err)
+	}
+	equivalentLater := commitTreeWithIndexUpdates(
+		t, ctx, f.capture, f.target, "equivalent later proof",
+		git.RegularFileMode+" "+laterBlob+"\tother-later.txt")
+	ref := recoveryProofRefName(
+		f.capture.cctx.BranchRef, f.capture.cctx.BranchGeneration,
+		f.pendingSeqs[0], f.pendingSeqs[len(f.pendingSeqs)-1], f.target)
+	if _, err := git.EnsureRecoveryRef(
+		ctx, f.capture.dir, ref, equivalentLater); err != nil {
+		t.Fatalf("seed equivalent later proof ref: %v", err)
+	}
+
+	result, err := ReconcileUnpublishedChain(
+		ctx, f.capture.dir, f.capture.db, RecoveryReconcileOptions{
+			GitDir:             f.capture.gitDir,
+			BranchRef:          f.capture.cctx.BranchRef,
+			BranchGeneration:   f.capture.cctx.BranchGeneration,
+			FirstSeq:           f.pendingSeqs[0],
+			ExternalParentHead: f.source,
+		})
+	if !errors.Is(err, git.ErrRecoveryRefCollision) {
+		t.Fatalf("ReconcileUnpublishedChain result=%+v err=%v want collision",
+			result, err)
+	}
+	for _, seq := range f.pendingSeqs {
+		if eventState, commit := readEventState(t, ctx, f.capture.db, seq); eventState != state.EventStatePending || commit.Valid {
+			t.Fatalf("rejected proof changed seq=%d state=%q commit=%v",
+				seq, eventState, commit)
 		}
 	}
 }
@@ -245,7 +283,7 @@ func newExternalRepairBridgeFixture(
 	return externalRepairBridgeFixture{
 		capture: f, source: source, target: target, live: live,
 		pendingSeqs: pendingSeqs, drainEventCount: len(drainSeqs),
-		repairSeqs: []int64{repairPending, repairRestored},
+		repairSeqs:   []int64{repairPending, repairRestored},
 		repairCommit: repairCommit,
 	}
 }

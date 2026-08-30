@@ -56,6 +56,11 @@ func reconcileExternalRepairBridge(
 	if err != nil {
 		return result, err
 	}
+	if commitOID != bridge.TargetCommit {
+		return result, fmt.Errorf(
+			"%w: external repair bridge ref %s points at %s, want exact target %s",
+			git.ErrRecoveryRefCollision, ref, commitOID, bridge.TargetCommit)
+	}
 	if opts.beforeFinalHeadCheck != nil {
 		opts.beforeFinalHeadCheck()
 	}
