@@ -268,6 +268,40 @@ func TestPublicationProgressSeparatesStallFromExpectedWait(t *testing.T) {
 	}
 }
 
+func TestPublicationProgressMarksStaleRetryAsStalled(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		BaseHead: "head", Operation: "modify", Path: "feature.go",
+		Fidelity: "exact", CapturedTS: 100,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	report := statusReport{
+		Daemon: "running", PID: os.Getpid(), PendingEvents: 1,
+		BranchRef: "refs/heads/main", BranchGeneration: 7,
+		Replay: replayObservabilityReport{State: "degraded"},
+	}
+
+	progress, err := buildPublicationProgressReport(
+		ctx, db.SQL(), report, time.Unix(1_000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Phase != "stalled" ||
+		progress.LastProgressTS != 100 ||
+		progress.LastProgressAgeSeconds != 900 {
+		t.Fatalf("stale retry progress=%+v", progress)
+	}
+	if got := productListStatus(productListEntry{
+		PublicationProgress: progress,
+	}); got != "stalled" {
+		t.Fatalf("stale retry list status=%q", got)
+	}
+}
+
 func TestPublicationProgressShowsAutomaticVerificationRecovery(t *testing.T) {
 	report := statusReport{
 		Daemon: "running", PID: os.Getpid(), PendingEvents: 7,
