@@ -12,6 +12,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -3722,6 +3723,11 @@ func publishIntentSelection(
 		})
 		return sum, nil
 	}
+	if err := verifyIntentTreePathOwnership(
+		ctx, repoRoot, parentTree, treeOID, allOps,
+	); err != nil {
+		return sum, err
+	}
 
 	eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
 	commitOID, err := commitTreeWithMessage(eventCtx, repoRoot, treeOID, parent, groupMessage)
@@ -3860,6 +3866,50 @@ func flattenIntentOps(items []intentReplayItem) []state.CaptureOp {
 		out = append(out, item.ops...)
 	}
 	return out
+}
+
+// verifyIntentTreePathOwnership proves that a candidate's generated tree only
+// changes paths named by its frozen capture operations. The diff is bounded
+// and disables rename detection so both sides of a rename remain explicit.
+func verifyIntentTreePathOwnership(
+	ctx context.Context,
+	repoRoot string,
+	parentTree string,
+	treeOID string,
+	ops []state.CaptureOp,
+) error {
+	if treeOID == "" {
+		return errors.New("daemon: intent publication path ownership: generated tree is empty")
+	}
+	if parentTree == "" {
+		parentTree = git.EmptyTreeOID
+	}
+	allowed := make(map[string]struct{})
+	for _, path := range touchedPaths(ops) {
+		allowed[path] = struct{}{}
+	}
+	out, err := git.RunWithLimit(
+		ctx,
+		git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
+		git.DefaultDiffCap,
+		"diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
+		"--no-renames", parentTree, treeOID, "--",
+	)
+	if err != nil {
+		return fmt.Errorf("daemon: intent publication path ownership diff: %w", err)
+	}
+	for _, record := range bytes.Split(out, []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		path := string(record)
+		if _, ok := allowed[path]; !ok {
+			return fmt.Errorf(
+				"daemon: intent publication path ownership: generated tree changed unowned path %q",
+				path)
+		}
+	}
+	return nil
 }
 
 func intentPlanMessage(plan ai.IntentPlan) string {
