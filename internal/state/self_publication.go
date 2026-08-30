@@ -474,6 +474,38 @@ func SelfPublicationByID(ctx context.Context, d *DB, id string) (SelfPublication
 	return publication, true, nil
 }
 
+// SelfPublicationByIDBounded loads one publication and its exact ordered
+// membership without reading beyond a caller-owned proof budget. evidenceRows
+// counts member rows; the single publication header is intrinsically bounded.
+func SelfPublicationByIDBounded(
+	ctx context.Context,
+	d *DB,
+	id string,
+	limit int,
+) (publication SelfPublication, ok bool, evidenceRows int, err error) {
+	if d == nil || strings.TrimSpace(id) == "" || limit < 0 ||
+		limit > CompletedBranchTransitionProofLimit {
+		return SelfPublication{}, false, 0, errors.New(
+			"state: SelfPublicationByIDBounded: invalid input")
+	}
+	publication, ok, err = selfPublicationByIDQuery(ctx, d.readSQL(), id)
+	if err != nil || !ok {
+		return publication, ok, 0, err
+	}
+	publication.Members, err = loadSelfPublicationMembersBounded(
+		ctx, d.readSQL(), id, limit)
+	if err != nil {
+		return SelfPublication{}, false, 0, err
+	}
+	if len(publication.Members) > limit {
+		return SelfPublication{}, false, 0,
+			completedBranchTransitionProofError(
+				"self-publication %s exceeds remaining member evidence budget %d",
+				id, limit)
+	}
+	return publication, true, len(publication.Members), nil
+}
+
 // RecoverableSelfPublications returns bounded prepared/git_applied rows in
 // creation order. Both phases require restart inspection; only git_applied may
 // be completed after exact Git parent/tree/ref proof.
@@ -1297,6 +1329,40 @@ WHERE publication_id=? ORDER BY ord`, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("state: iterate self-publication members: %w", err)
+	}
+	return members, nil
+}
+
+func loadSelfPublicationMembersBounded(
+	ctx context.Context,
+	q selfPublicationQueryer,
+	id string,
+	limit int,
+) ([]SelfPublicationMember, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT ord, event_seq, candidate_id
+FROM self_publication_members
+WHERE publication_id=? ORDER BY ord
+LIMIT ?`, id, limit+1)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"state: query bounded self-publication members: %w", err)
+	}
+	defer rows.Close()
+	var members []SelfPublicationMember
+	for rows.Next() {
+		var member SelfPublicationMember
+		if err := rows.Scan(
+			&member.Ord, &member.EventSeq,
+			&member.CandidateID); err != nil {
+			return nil, fmt.Errorf(
+				"state: scan bounded self-publication member: %w", err)
+		}
+		members = append(members, member)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"state: iterate bounded self-publication members: %w", err)
 	}
 	return members, nil
 }
