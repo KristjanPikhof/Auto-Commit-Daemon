@@ -36,6 +36,10 @@ type RecoveryReconcileOptions struct {
 	FirstSeq         int64
 	Trigger          string
 	Trace            acdtrace.Logger
+	// ExternalParentHead is the persisted branch-token commit observed before
+	// a same-branch transition. It enables the narrow repaired-publication
+	// bridge proof; ordinary replay and archive recovery leave it empty.
+	ExternalParentHead string
 	// ArchiveOnly is required when a branch/dead-ref transition is already
 	// known to have invalidated external-publish proof. It still snapshots and
 	// rechecks the exact live branch token, but never compares the chain to the
@@ -581,6 +585,7 @@ func reconcileTransitionPair(
 	db *state.DB,
 	branchRef string,
 	branchGeneration int64,
+	externalParentHead string,
 	archiveOnly bool,
 	expectedMissingRef string,
 	trigger string,
@@ -617,7 +622,8 @@ ORDER BY branch_ref`, branchGeneration,
 		}
 		for _, ref := range refs {
 			pair, err := reconcileTransitionPair(ctx, repoRoot, gitDir, db, ref,
-				branchGeneration, archiveOnly, expectedMissingRef, trigger, trace)
+				branchGeneration, externalParentHead, archiveOnly,
+				expectedMissingRef, trigger, trace)
 			if err != nil {
 				return result, err
 			}
@@ -648,6 +654,7 @@ ORDER BY branch_ref`, branchGeneration,
 		FirstSeq:           seq,
 		Trigger:            trigger,
 		Trace:              trace,
+		ExternalParentHead: externalParentHead,
 		ArchiveOnly:        archiveOnly,
 		ExpectedMissingRef: expectedMissingRef,
 	})

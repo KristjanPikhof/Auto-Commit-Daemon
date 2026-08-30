@@ -1149,6 +1149,7 @@ func Run(ctx context.Context, opts Options) error {
 				branchTransitionBlocked = true
 			} else if result, rErr := reconcileTransitionPair(ctx, opts.RepoPath, opts.GitDir,
 				opts.DB, tokenBranchRef(prevToken), persistedGen,
+				tokenSHA(prevToken),
 				tokenSHA(currentToken) == "", "", "startup_branch_transition", tracer); rErr != nil {
 				if attentionErr := recordCompletedTransitionProofAttention(
 					ctx, opts.DB, rErr); attentionErr != nil {
@@ -1939,6 +1940,7 @@ func Run(ctx context.Context, opts Options) error {
 		oldToken := currentToken
 		result, reconcileErr := reconcileTransitionPair(ctx, opts.RepoPath, opts.GitDir,
 			opts.DB, cctx.BranchRef, cctx.BranchGeneration,
+			tokenSHA(currentToken),
 			tokenSHA(newToken) == "", "", "runtime_branch_transition", tracer)
 		if reconcileErr != nil {
 			if attentionErr := recordCompletedTransitionProofAttention(
