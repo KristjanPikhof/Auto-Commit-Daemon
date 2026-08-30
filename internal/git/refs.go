@@ -599,7 +599,9 @@ func LiveBranchSet(ctx context.Context, repoDir string) (map[string]struct{}, er
 // Returns (true, nil) when ancestor, (false, nil) when not. A real git
 // failure (e.g. unresolved oid) returns a non-nil error.
 func IsAncestor(ctx context.Context, repoDir, ancestor, descendant string) (bool, error) {
-	_, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "merge-base", "--is-ancestor", ancestor, descendant)
+	_, _, err := RunWithStderr(ctx,
+		RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
+		"merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
 		return true, nil
 	}
