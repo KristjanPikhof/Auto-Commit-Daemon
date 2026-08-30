@@ -64,7 +64,7 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 	reconciled, err := state.ReconcileResolvedPublicationDrains(
 		ctx, f.capture.db, 3)
 	if err != nil || len(reconciled) != 1 ||
-		reconciled[0].ResolvedEvents != int64(len(f.pendingSeqs)) {
+		reconciled[0].ResolvedEvents != int64(f.drainEventCount) {
 		t.Fatalf("resolved drains=%+v err=%v", reconciled, err)
 	}
 	protected, err := git.RevParse(ctx, f.capture.dir, result.RecoveryRef)
@@ -73,6 +73,23 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 	}
 	if ancestor, err := git.IsAncestor(ctx, f.capture.dir, f.target, f.live); err != nil || !ancestor {
 		t.Fatalf("target ancestor of later live commit=%t err=%v", ancestor, err)
+	}
+	targetPending, err := git.LsTreeBlobOID(ctx, f.capture.dir, f.target, "pending.txt")
+	if err != nil {
+		t.Fatalf("read target pending blob: %v", err)
+	}
+	livePending, err := git.LsTreeBlobOID(ctx, f.capture.dir, f.live, "pending.txt")
+	if err != nil || livePending == targetPending {
+		t.Fatalf("later commit pending blob=%s err=%v want different from target %s",
+			livePending, err, targetPending)
+	}
+	for _, seq := range f.repairSeqs {
+		if eventState, commit := readEventState(t, ctx, f.capture.db, seq);
+			eventState != state.EventStatePublished || !commit.Valid ||
+			commit.String != f.repairCommit {
+			t.Fatalf("repair seq=%d changed state=%q commit=%v",
+				seq, eventState, commit)
+		}
 	}
 }
 
@@ -110,11 +127,14 @@ func TestExternalRepairBridgeRejectsUnownedTargetPath(t *testing.T) {
 }
 
 type externalRepairBridgeFixture struct {
-	capture     *captureFixture
-	source      string
-	target      string
-	live        string
-	pendingSeqs []int64
+	capture         *captureFixture
+	source          string
+	target          string
+	live            string
+	pendingSeqs     []int64
+	drainEventCount int
+	repairSeqs      []int64
+	repairCommit    string
 }
 
 func newExternalRepairBridgeFixture(
@@ -139,6 +159,7 @@ func newExternalRepairBridgeFixture(
 	restoredFinal := blob("restored final\n")
 	notesFinal := blob("notes final\n")
 	laterBlob := blob("later external work\n")
+	laterPending := blob("pending changed by later commit\n")
 	unownedBlob := blob("unowned target work\n")
 
 	preRepair := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "pre-repair",
@@ -198,7 +219,8 @@ func newExternalRepairBridgeFixture(
 		AfterOID: oidValue(notesFinal), AfterMode: oidValue(git.RegularFileMode),
 	})
 	pendingSeqs := []int64{pendingOne, pendingTwo, pendingNotes}
-	seedExternalRepairBridgeDrain(t, ctx, f, source, pendingSeqs)
+	drainSeqs := append([]int64{repairPending, repairRestored}, pendingSeqs...)
+	seedExternalRepairBridgeDrain(t, ctx, f, source, drainSeqs, 2)
 
 	targetUpdates := []string{
 		git.RegularFileMode + " " + pendingFinal + "\tpending.txt",
@@ -212,6 +234,7 @@ func newExternalRepairBridgeFixture(
 	target := commitTreeWithIndexUpdates(
 		t, ctx, f, source, "external target", targetUpdates...)
 	live := commitTreeWithIndexUpdates(t, ctx, f, target, "later external work",
+		git.RegularFileMode+" "+laterPending+"\tpending.txt",
 		git.RegularFileMode+" "+laterBlob+"\tlater.txt")
 	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, live, source); err != nil {
 		t.Fatalf("install live descendant: %v", err)
@@ -221,7 +244,9 @@ func newExternalRepairBridgeFixture(
 	}
 	return externalRepairBridgeFixture{
 		capture: f, source: source, target: target, live: live,
-		pendingSeqs: pendingSeqs,
+		pendingSeqs: pendingSeqs, drainEventCount: len(drainSeqs),
+		repairSeqs: []int64{repairPending, repairRestored},
+		repairCommit: repairCommit,
 	}
 }
 
@@ -231,6 +256,7 @@ func seedExternalRepairBridgeDrain(
 	f *captureFixture,
 	head string,
 	eventSeqs []int64,
+	publishedCount int64,
 ) {
 	t.Helper()
 	tree, err := git.RevParse(ctx, f.dir, head+"^{tree}")
@@ -268,7 +294,7 @@ func seedExternalRepairBridgeDrain(
 		BranchGeneration:    f.cctx.BranchGeneration,
 		Phase:               state.PublicationDrainEventFallback,
 		TargetEventCount:    int64(len(eventSeqs)),
-		PublishedEventCount: 0,
+		PublishedEventCount: publishedCount,
 		CreatedTS:           2,
 		UpdatedTS:           2,
 		LastProgressTS:      2,
@@ -293,10 +319,11 @@ func seedCompletedExternalBridgeRepair(
 	if _, err := f.db.SQL().ExecContext(ctx, `
 INSERT INTO intent_repairs(
     id,branch_ref,branch_generation,status,expected_head,plan_digest,
-    old_head,new_head,created_ts,updated_ts,error
-) VALUES (?, ?, ?, 'prepared', ?, 'bridge-digest', ?, ?, 1, 1, '')`,
+    backup_ref,old_head,new_head,created_ts,updated_ts,error
+) VALUES (?, ?, ?, 'prepared', ?, 'bridge-digest', ?, ?, ?, 1, 1, '')`,
 		repairID, f.cctx.BranchRef, f.cctx.BranchGeneration,
-		oldHead, oldHead, newHead); err != nil {
+		oldHead, "refs/acd/intent-repair/test/external-repair-bridge/backup",
+		oldHead, newHead); err != nil {
 		t.Fatalf("insert repair: %v", err)
 	}
 	if _, err := f.db.SQL().ExecContext(ctx, `
