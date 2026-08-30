@@ -1962,6 +1962,16 @@ func Run(ctx context.Context, opts Options) error {
 				"events", result.EventCount,
 				"recovery_ref", result.RecoveryRef)
 		}
+		preserveCapturedShadow := false
+		if result.Handled && result.Outcome == state.EventStatePublished {
+			_, preserveCapturedShadow, reconcileErr = firstUnpublishedRecoverySeq(
+				ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
+			if reconcileErr != nil {
+				logger.Warn(logPrefix+" inspect captures left after branch reconciliation; will retry",
+					"err", reconcileErr.Error())
+				return true
+			}
+		}
 		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
 			logger.Warn(logPrefix+" verify branch token after reconciliation; will retry",
@@ -1979,10 +1989,22 @@ func Run(ctx context.Context, opts Options) error {
 		oldBranchRef := branchRef
 		oldHeadOID := headOID
 		prospectiveShadowMutated := false
+		prospectiveShadowRebased := false
 		var pendingTransitionTraces []acdtrace.Event
 		rollbackTraced := false
 		rollbackTransition := func() {
-			if prospectiveShadowMutated && cctx.BranchRef != "" {
+			if prospectiveShadowRebased && oldCctx.BranchRef != "" {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, cleanupErr := state.RebaseShadowGeneration(
+					cleanupCtx, opts.DB, oldCctx.BranchRef,
+					oldCctx.BranchGeneration, oldCctx.BaseHead)
+				cleanupCancel()
+				if cleanupErr != nil {
+					logger.Warn(logPrefix+" roll back rebased shadow; will force refresh",
+						"err", cleanupErr.Error())
+					forceShadowRefresh = true
+				}
+			} else if prospectiveShadowMutated && cctx.BranchRef != "" {
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 				cleanupErr := state.InvalidateShadowGeneration(cleanupCtx, opts.DB,
 					cctx.BranchRef, cctx.BranchGeneration,
@@ -2170,6 +2192,13 @@ func Run(ctx context.Context, opts Options) error {
 					"err", gErr.Error())
 			}
 			if graceActive {
+				if preserveCapturedShadow {
+					logger.Info("branch fast-forward deferred during rewind grace to preserve later captures",
+						"old", oldToken, "new", newToken,
+						"grace_until", until)
+					rollbackTransition()
+					return true
+				}
 				prevGeneration := cctx.BranchGeneration
 				cctx.BranchGeneration++
 				pruneShadowAfterAccept = true
@@ -2253,15 +2282,31 @@ func Run(ctx context.Context, opts Options) error {
 				if cctx.BranchRef != "" {
 					var seedErr error
 					prospectiveShadowMutated = true
-					seeded, seedErr = ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx)
+					if preserveCapturedShadow {
+						seeded, seedErr = state.RebaseShadowGeneration(
+							ctx, opts.DB, cctx.BranchRef,
+							cctx.BranchGeneration, cctx.BaseHead)
+						prospectiveShadowRebased = seedErr == nil
+					} else {
+						seeded, seedErr = ReseedShadowFromHead(
+							ctx, opts.RepoPath, opts.DB, cctx)
+					}
 					if seedErr != nil {
 						logger.Warn("reseed shadow after branch fast-forward",
 							"err", seedErr.Error())
 						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
 						rollbackTransition()
 						return true
+					} else if preserveCapturedShadow {
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx,
+							traceSeedDecision(seeded),
+							"fast-forward shadow rebase preserved later captures", seeded)
+						logger.Info("shadow rebased after partial branch recovery",
+							"rows", seeded,
+							"generation", cctx.BranchGeneration)
 					} else {
-						traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "fast-forward shadow reseed", seeded)
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx,
+							traceSeedDecision(seeded), "fast-forward shadow reseed", seeded)
 						logger.Info("shadow reseeded after branch fast-forward",
 							"rows", seeded,
 							"generation", cctx.BranchGeneration)
