@@ -4,8 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -66,6 +71,137 @@ func TestExternalRepairBridgePublishesFrozenPrefixAndPreservesLaterCapture(
 	if err != nil || len(resolved) != 1 ||
 		resolved[0].ResolvedEvents != int64(f.drainEventCount) {
 		t.Fatalf("resolved drains=%+v err=%v", resolved, err)
+	}
+}
+
+func TestRunExternalRepairBridgePreservesLaterCapturedShadow(t *testing.T) {
+	t.Setenv(ai.EnvCommitStrategy, string(ai.CommitStrategyEvent))
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
+	ctx := context.Background()
+	registerLiveClient(t, f.capture.db)
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.capture.dir},
+		"reset", "--hard", f.source); err != nil {
+		t.Fatalf("reset fixture to persisted source: %v", err)
+	}
+
+	shadowCtx := f.capture.cctx
+	shadowCtx.BaseHead = f.source
+	if _, err := ReseedShadowFromHead(
+		ctx, f.capture.dir, f.capture.db, shadowCtx); err != nil {
+		t.Fatalf("seed live shadow: %v", err)
+	}
+	const laterPath = "captured-after-frozen-drain.txt"
+	laterBody := []byte("protected later edit\n")
+	laterBlob, err := git.HashObjectStdin(ctx, f.capture.dir, laterBody)
+	if err != nil {
+		t.Fatalf("hash later edit: %v", err)
+	}
+	laterSeq := appendRecoveryEvent(
+		t, ctx, f.capture, f.source, state.CaptureOp{
+			Op: "create", Path: laterPath,
+			AfterOID:  oidValue(laterBlob),
+			AfterMode: oidValue(git.RegularFileMode),
+		})
+	if err := os.WriteFile(
+		filepath.Join(f.capture.dir, laterPath), laterBody, 0o644); err != nil {
+		t.Fatalf("write later edit: %v", err)
+	}
+	if err := state.UpsertShadowPath(ctx, f.capture.db, state.ShadowPath{
+		BranchRef:        f.capture.cctx.BranchRef,
+		BranchGeneration: f.capture.cctx.BranchGeneration,
+		Path:             laterPath,
+		Operation:        "create",
+		Mode:             oidValue(git.RegularFileMode),
+		OID:              oidValue(laterBlob),
+		BaseHead:         f.source,
+		Fidelity:         "rescan",
+	}); err != nil {
+		t.Fatalf("record later shadow: %v", err)
+	}
+
+	wakeCh := make(chan struct{}, 8)
+	shutdownCh := make(chan struct{}, 1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
+	defer releaseCheck()
+	var wg sync.WaitGroup
+	var runErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runErr = Run(runCtx, Options{
+			RepoPath:        f.capture.dir,
+			GitDir:          f.capture.gitDir,
+			DB:              f.capture.db,
+			Scheduler:       fastScheduler(),
+			BootGrace:       30 * time.Second,
+			WakeCh:          wakeCh,
+			ShutdownCh:      shutdownCh,
+			SkipSignals:     true,
+			MessageFn:       DeterministicMessage,
+			beforeBranchTokenCheck: checkHook,
+			replay: func(_ context.Context, _ string, _ *state.DB,
+				cctx CaptureContext, _ ReplayOpts) (ReplaySummary, error) {
+				return ReplaySummary{BaseHead: cctx.BaseHead, Skipped: true}, nil
+			},
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		if runErr != nil {
+			t.Fatalf("Run: %v", runErr)
+		}
+	})
+
+	waitForDaemonMode(t, f.capture.db, "running", 2*time.Second)
+	waitForBranchTokenCheckGate(t, checkEntered)
+	if err := git.UpdateRef(ctx, f.capture.dir, f.capture.cctx.BranchRef,
+		f.live, f.source); err != nil {
+		t.Fatalf("advance branch to external descendant: %v", err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.capture.dir},
+		"reset", "--hard", f.live); err != nil {
+		t.Fatalf("materialize external descendant: %v", err)
+	}
+	releaseCheck()
+	waitForMetaValue(t, f.capture.db, MetaKeyBranchHead, f.live, 10*time.Second)
+	if eventState, commit := readEventState(
+		t, ctx, f.capture.db, laterSeq); eventState != state.EventStatePending || commit.Valid {
+		t.Fatalf("later seq=%d state=%q commit=%v want pending after transition",
+			laterSeq, eventState, commit)
+	}
+	for i := 0; i < 4; i++ {
+		wakeCh <- struct{}{}
+		time.Sleep(50 * time.Millisecond)
+	}
+	waitFor(t, 5*time.Second, "post-transition capture pass", func() bool {
+		var baseHead string
+		err := f.capture.db.ReadSQL().QueryRowContext(ctx, `
+SELECT base_head FROM shadow_paths
+WHERE branch_ref=? AND branch_generation=? AND path=?`,
+			f.capture.cctx.BranchRef, f.capture.cctx.BranchGeneration,
+			laterPath).Scan(&baseHead)
+		return err == nil && baseHead == f.live
+	})
+	var eventCount int
+	if err := f.capture.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM capture_events WHERE path=?`, laterPath).Scan(
+		&eventCount); err != nil {
+		t.Fatalf("count later capture: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("later capture rows=%d want exactly one", eventCount)
+	}
+	var externalCount int
+	if err := f.capture.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM capture_events WHERE path='later.txt'`).Scan(
+		&externalCount); err != nil {
+		t.Fatalf("count external descendant capture: %v", err)
+	}
+	if externalCount != 0 {
+		t.Fatalf("external descendant capture rows=%d want zero", externalCount)
 	}
 }
 
@@ -245,11 +381,15 @@ SELECT source_head FROM self_publications WHERE id=?`, publicationID).Scan(
 		&repairHead); err != nil {
 		t.Fatalf("load publication source: %v", err)
 	}
+	if _, err := f.capture.db.SQL().ExecContext(ctx,
+		`DROP TRIGGER self_publications_identity_immutable`); err != nil {
+		t.Fatalf("disable isolated fixture identity trigger: %v", err)
+	}
 	if _, err := f.capture.db.SQL().ExecContext(ctx, `
-UPDATE self_publication_members
-SET candidate_id='drifted-candidate'
-WHERE publication_id=? AND ord=0`, publicationID); err != nil {
-		t.Fatalf("drift publication membership: %v", err)
+UPDATE self_publications
+SET membership_digest='sha256:0000000000000000000000000000000000000000000000000000000000000000'
+WHERE id=?`, publicationID); err != nil {
+		t.Fatalf("drift publication membership digest: %v", err)
 	}
 
 	_, _, err := loadExternalRepairPublicationSuffix(

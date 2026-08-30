@@ -1077,7 +1077,10 @@ func Run(ctx context.Context, opts Options) error {
 	startupTransition := TokenTransitionUnchanged
 	startupChangedAt := ""
 	startupShadowMutated := false
+	startupShadowPreserved := false
+	var startupPreservedShadowChain []state.RecoveryChainEvent
 	startupShadowRefreshRequired := false
+	startupShadowPreserveRefreshRequired := false
 	if persistedHead != "" && currentToken != "" {
 		prevToken := "rev:" + persistedHead
 		if persistedToken, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyBranchToken); err != nil {
@@ -1168,6 +1171,25 @@ func Run(ctx context.Context, opts Options) error {
 					"outcome", result.Outcome,
 					"events", result.EventCount,
 					"recovery_ref", result.RecoveryRef)
+				if result.Outcome == state.EventStatePublished {
+					firstSeq, hasLater, findErr := firstUnpublishedRecoverySeq(
+						ctx, opts.DB, tokenBranchRef(prevToken), persistedGen)
+					if findErr != nil {
+						logger.Warn("inspect captures left after startup branch reconciliation; will retry",
+							"err", findErr.Error())
+						branchTransitionBlocked = true
+					} else if hasLater {
+						startupPreservedShadowChain, findErr =
+							state.LoadUnpublishedRecoveryChain(
+								ctx, opts.DB, tokenBranchRef(prevToken),
+								persistedGen, firstSeq)
+						if findErr != nil {
+							logger.Warn("load captures left after startup branch reconciliation; will retry",
+								"err", findErr.Error())
+							branchTransitionBlocked = true
+						}
+					}
+				}
 			}
 			if !branchTransitionBlocked {
 				verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
@@ -1219,13 +1241,26 @@ func Run(ctx context.Context, opts Options) error {
 		seedShadow := BootstrapShadow
 		seedReason := "startup shadow bootstrap"
 		if startupTokenChanged {
-			seedShadow = ReseedShadowFromHead
 			seedReason = "startup branch transition shadow reseed"
-			startupShadowMutated = true
 		}
-		if seeded, err := seedShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-			logger.Warn("bootstrap shadow", "err", err.Error())
-			traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+		var seeded int
+		var seedErr error
+		if startupTokenChanged && len(startupPreservedShadowChain) > 0 {
+			seeded, seedErr = ReseedShadowFromHeadPreservingUnpublished(
+				ctx, opts.RepoPath, opts.DB, cctx,
+				startupPreservedShadowChain)
+			seedReason = "startup branch transition preserved later captures"
+			startupShadowPreserved = seedErr == nil
+		} else {
+			if startupTokenChanged {
+				seedShadow = ReseedShadowFromHead
+			}
+			seeded, seedErr = seedShadow(ctx, opts.RepoPath, opts.DB, cctx)
+		}
+		startupShadowMutated = startupTokenChanged && seedErr == nil
+		if seedErr != nil {
+			logger.Warn("bootstrap shadow", "err", seedErr.Error())
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
 			branchTransitionBlocked = true
 		} else {
 			traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), seedReason, seeded)
@@ -1278,7 +1313,23 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	if branchTransitionBlocked && startupPreviousToken != "" {
-		if startupShadowMutated && cctx.BranchRef != "" {
+		if startupShadowPreserved && cctx.BranchRef != "" {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			oldCctx := CaptureContext{
+				BranchRef:        tokenBranchRef(startupPreviousToken),
+				BranchGeneration: startupPreviousGeneration,
+				BaseHead:         tokenSHA(startupPreviousToken),
+			}
+			_, cleanupErr := ReseedShadowFromHeadPreservingUnpublished(
+				cleanupCtx, opts.RepoPath, opts.DB, oldCctx,
+				startupPreservedShadowChain)
+			cleanupCancel()
+			if cleanupErr != nil {
+				logger.Warn("restore startup shadow with later captures; will retry",
+					"err", cleanupErr.Error())
+				startupShadowPreserveRefreshRequired = true
+			}
+		} else if startupShadowMutated && cctx.BranchRef != "" {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			cleanupErr := state.InvalidateShadowGeneration(cleanupCtx, opts.DB,
 				cctx.BranchRef, cctx.BranchGeneration,
@@ -1585,6 +1636,10 @@ func Run(ctx context.Context, opts Options) error {
 	lastStampedBranchHead := persistedHead
 	var branchTransitionSettleUntil time.Time
 	forceShadowRefresh := startupShadowRefreshRequired
+	var forceShadowPreserving []state.RecoveryChainEvent
+	if startupShadowPreserveRefreshRequired {
+		forceShadowPreserving = startupPreservedShadowChain
+	}
 	pendingInternalTransitionTarget := ""
 
 	adoptInternalTransitionTarget := func(targetOID, observedToken string) error {
@@ -1754,6 +1809,22 @@ func Run(ctx context.Context, opts Options) error {
 			pendingInternalTransitionTarget = ""
 		}
 		if SameGeneration(currentToken, newToken) {
+			if len(forceShadowPreserving) > 0 && cctx.BranchRef != "" {
+				if seeded, seedErr := ReseedShadowFromHeadPreservingUnpublished(
+					ctx, opts.RepoPath, opts.DB, cctx,
+					forceShadowPreserving); seedErr != nil {
+					logger.Warn(logPrefix+" refresh shadow while preserving later captures",
+						"err", seedErr.Error())
+					return true
+				} else {
+					forceShadowPreserving = nil
+					forceShadowRefresh = false
+					traceBootstrapShadow(tracer, opts.RepoPath, cctx,
+						traceSeedDecision(seeded),
+						"rolled-back transition preserved later captures", seeded)
+					return true
+				}
+			}
 			if forceShadowRefresh && cctx.BranchRef != "" {
 				if seeded, seedErr := ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx); seedErr != nil {
 					logger.Warn(logPrefix+" refresh shadow after rolled-back transition",
@@ -1962,14 +2033,23 @@ func Run(ctx context.Context, opts Options) error {
 				"events", result.EventCount,
 				"recovery_ref", result.RecoveryRef)
 		}
-		preserveCapturedShadow := false
+		var preservedShadowChain []state.RecoveryChainEvent
 		if result.Handled && result.Outcome == state.EventStatePublished {
-			_, preserveCapturedShadow, reconcileErr = firstUnpublishedRecoverySeq(
+			firstSeq, hasLater, findErr := firstUnpublishedRecoverySeq(
 				ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
-			if reconcileErr != nil {
+			if findErr != nil {
 				logger.Warn(logPrefix+" inspect captures left after branch reconciliation; will retry",
-					"err", reconcileErr.Error())
+					"err", findErr.Error())
 				return true
+			}
+			if hasLater {
+				preservedShadowChain, findErr = state.LoadUnpublishedRecoveryChain(
+					ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration, firstSeq)
+				if findErr != nil {
+					logger.Warn(logPrefix+" load captures left after branch reconciliation; will retry",
+						"err", findErr.Error())
+					return true
+				}
 			}
 		}
 		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
@@ -1989,20 +2069,21 @@ func Run(ctx context.Context, opts Options) error {
 		oldBranchRef := branchRef
 		oldHeadOID := headOID
 		prospectiveShadowMutated := false
-		prospectiveShadowRebased := false
+		prospectiveShadowPreserved := false
 		var pendingTransitionTraces []acdtrace.Event
 		rollbackTraced := false
 		rollbackTransition := func() {
-			if prospectiveShadowRebased && oldCctx.BranchRef != "" {
+			if prospectiveShadowPreserved && oldCctx.BranchRef != "" {
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_, cleanupErr := state.RebaseShadowGeneration(
-					cleanupCtx, opts.DB, oldCctx.BranchRef,
-					oldCctx.BranchGeneration, oldCctx.BaseHead)
+				_, cleanupErr := ReseedShadowFromHeadPreservingUnpublished(
+					cleanupCtx, opts.RepoPath, opts.DB, oldCctx,
+					preservedShadowChain)
 				cleanupCancel()
 				if cleanupErr != nil {
-					logger.Warn(logPrefix+" roll back rebased shadow; will force refresh",
+					logger.Warn(logPrefix+" restore shadow with later captures; will retry",
 						"err", cleanupErr.Error())
-					forceShadowRefresh = true
+					forceShadowPreserving = append(
+						[]state.RecoveryChainEvent(nil), preservedShadowChain...)
 				}
 			} else if prospectiveShadowMutated && cctx.BranchRef != "" {
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2192,7 +2273,7 @@ func Run(ctx context.Context, opts Options) error {
 					"err", gErr.Error())
 			}
 			if graceActive {
-				if preserveCapturedShadow {
+				if len(preservedShadowChain) > 0 {
 					logger.Info("branch fast-forward deferred during rewind grace to preserve later captures",
 						"old", oldToken, "new", newToken,
 						"grace_until", until)
@@ -2282,11 +2363,11 @@ func Run(ctx context.Context, opts Options) error {
 				if cctx.BranchRef != "" {
 					var seedErr error
 					prospectiveShadowMutated = true
-					if preserveCapturedShadow {
-						seeded, seedErr = state.RebaseShadowGeneration(
-							ctx, opts.DB, cctx.BranchRef,
-							cctx.BranchGeneration, cctx.BaseHead)
-						prospectiveShadowRebased = seedErr == nil
+					if len(preservedShadowChain) > 0 {
+						seeded, seedErr = ReseedShadowFromHeadPreservingUnpublished(
+							ctx, opts.RepoPath, opts.DB, cctx,
+							preservedShadowChain)
+						prospectiveShadowPreserved = seedErr == nil
 					} else {
 						seeded, seedErr = ReseedShadowFromHead(
 							ctx, opts.RepoPath, opts.DB, cctx)
@@ -2297,7 +2378,7 @@ func Run(ctx context.Context, opts Options) error {
 						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
 						rollbackTransition()
 						return true
-					} else if preserveCapturedShadow {
+					} else if len(preservedShadowChain) > 0 {
 						traceBootstrapShadow(tracer, opts.RepoPath, cctx,
 							traceSeedDecision(seeded),
 							"fast-forward shadow rebase preserved later captures", seeded)

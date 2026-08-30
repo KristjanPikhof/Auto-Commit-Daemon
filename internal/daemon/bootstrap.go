@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -60,6 +61,11 @@ const DefaultShadowRetentionGenerations int64 = 1
 // begin/commit fsync over thousands of rows. Tuning rationale: a 30k-file
 // repo seeds in 6 chunks instead of 30k independent commits.
 const shadowBootstrapChunkSize = 5000
+
+// A pending event normally owns one path and a rename owns two. Keep the
+// partial-recovery overlay bounded even when the normal capture cap is
+// disabled by configuration.
+const maxPreservedShadowPaths = DefaultMaxPendingEvents * 2
 
 // MetaKeyShadowBootstrappedPrefix is the daemon_meta key prefix used to mark
 // a (branch_ref, branch_generation) pair as fully seeded. The full key is
@@ -244,6 +250,145 @@ func ReseedShadowFromHead(ctx context.Context, repoDir string, db *state.DB, cct
 		return 0, err
 	}
 	return BootstrapShadow(ctx, repoDir, db, cctx)
+}
+
+// ReseedShadowFromHeadPreservingUnpublished builds a fresh shadow from HEAD,
+// then overlays only paths represented by the remaining unpublished capture
+// chain. This absorbs unrelated external commits without forgetting dirty work
+// that ACD already captured behind a frozen publication target.
+func ReseedShadowFromHeadPreservingUnpublished(
+	ctx context.Context,
+	repoDir string,
+	db *state.DB,
+	cctx CaptureContext,
+	chain []state.RecoveryChainEvent,
+) (int, error) {
+	if db == nil || cctx.BranchRef == "" || cctx.BranchGeneration < 1 ||
+		cctx.BaseHead == "" || len(chain) == 0 {
+		return 0, fmt.Errorf(
+			"daemon: preserve unpublished shadow: invalid recovery context")
+	}
+	touched := make(map[string]struct{})
+	addPath := func(path string) error {
+		if path == "" {
+			return nil
+		}
+		touched[path] = struct{}{}
+		if len(touched) > maxPreservedShadowPaths {
+			return fmt.Errorf(
+				"daemon: preserve unpublished shadow: path limit exceeds %d",
+				maxPreservedShadowPaths)
+		}
+		return nil
+	}
+	for _, item := range chain {
+		if item.Event.BranchRef != cctx.BranchRef ||
+			item.Event.BranchGeneration != cctx.BranchGeneration {
+			return 0, fmt.Errorf(
+				"daemon: preserve unpublished shadow: capture %d changed branch identity",
+				item.Event.Seq)
+		}
+		switch item.Event.State {
+		case state.EventStatePending, state.EventStateBlockedConflict,
+			state.EventStateFailed:
+		default:
+			return 0, fmt.Errorf(
+				"daemon: preserve unpublished shadow: capture %d is %s",
+				item.Event.Seq, item.Event.State)
+		}
+		if err := addPath(item.Event.Path); err != nil {
+			return 0, err
+		}
+		if item.Event.OldPath.Valid {
+			if err := addPath(item.Event.OldPath.String); err != nil {
+				return 0, err
+			}
+		}
+		for _, op := range item.Ops {
+			if err := addPath(op.Path); err != nil {
+				return 0, err
+			}
+			if op.OldPath.Valid {
+				if err := addPath(op.OldPath.String); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+
+	retained := make(map[string]state.ShadowPath, len(touched))
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT branch_ref, branch_generation, path, operation, mode, oid,
+       old_path, base_head, fidelity, updated_ts
+FROM shadow_paths
+WHERE branch_ref = ? AND branch_generation = ?`,
+		cctx.BranchRef, cctx.BranchGeneration)
+	if err != nil {
+		return 0, fmt.Errorf("daemon: preserve unpublished shadow: query current rows: %w", err)
+	}
+	for rows.Next() {
+		var row state.ShadowPath
+		if err := rows.Scan(
+			&row.BranchRef, &row.BranchGeneration, &row.Path, &row.Operation,
+			&row.Mode, &row.OID, &row.OldPath, &row.BaseHead, &row.Fidelity,
+			&row.UpdatedTS); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf(
+				"daemon: preserve unpublished shadow: scan current row: %w", err)
+		}
+		if _, keep := touched[row.Path]; keep {
+			row.BaseHead = cctx.BaseHead
+			retained[row.Path] = row
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf(
+			"daemon: preserve unpublished shadow: iterate current rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf(
+			"daemon: preserve unpublished shadow: close current rows: %w", err)
+	}
+
+	entries, err := git.LsTree(ctx, repoDir, cctx.BaseHead, true)
+	if err != nil {
+		return 0, fmt.Errorf("daemon: preserve unpublished shadow: ls-tree HEAD: %w", err)
+	}
+	merged := make(map[string]state.ShadowPath, len(entries)+len(retained))
+	for _, entry := range entries {
+		if entry.Mode == "160000" || entry.Type != "blob" {
+			continue
+		}
+		merged[entry.Path] = state.ShadowPath{
+			BranchRef:        cctx.BranchRef,
+			BranchGeneration: cctx.BranchGeneration,
+			Path:             entry.Path,
+			Operation:        "bootstrap",
+			Mode:             sql.NullString{String: entry.Mode, Valid: true},
+			OID:              sql.NullString{String: entry.OID, Valid: true},
+			BaseHead:         cctx.BaseHead,
+			Fidelity:         "full",
+		}
+	}
+	for path := range touched {
+		delete(merged, path)
+		if row, ok := retained[path]; ok {
+			merged[path] = row
+		}
+	}
+	paths := make([]string, 0, len(merged))
+	for path := range merged {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	mergedRows := make([]state.ShadowPath, 0, len(paths))
+	for _, path := range paths {
+		mergedRows = append(mergedRows, merged[path])
+	}
+	return state.ReplaceShadowGeneration(
+		ctx, db, cctx.BranchRef, cctx.BranchGeneration,
+		ShadowBootstrappedKey(cctx.BranchRef, cctx.BranchGeneration), mergedRows)
 }
 
 func setShadowBootstrappedMarker(ctx context.Context, db *state.DB, cctx CaptureContext) error {

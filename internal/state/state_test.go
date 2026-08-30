@@ -1668,6 +1668,56 @@ func TestShadowPathRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReplaceShadowGenerationIsAtomic(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	const (
+		branch = "refs/heads/main"
+		marker = "shadow.bootstrapped:test"
+	)
+	original := ShadowPath{
+		BranchRef: branch, BranchGeneration: 7, Path: "old.txt",
+		Operation: "modify", BaseHead: "old-head", Fidelity: "exact",
+		OID: sql.NullString{String: "old-blob", Valid: true},
+	}
+	if err := UpsertShadowPath(ctx, d, original); err != nil {
+		t.Fatalf("seed original shadow: %v", err)
+	}
+	duplicate := ShadowPath{
+		BranchRef: branch, BranchGeneration: 7, Path: "new.txt",
+		Operation: "bootstrap", BaseHead: "new-head", Fidelity: "full",
+		OID: sql.NullString{String: "new-blob", Valid: true},
+	}
+	if _, err := ReplaceShadowGeneration(
+		ctx, d, branch, 7, marker, []ShadowPath{duplicate, duplicate}); err == nil {
+		t.Fatal("duplicate replacement unexpectedly succeeded")
+	}
+	if got, ok, err := GetShadowPath(
+		ctx, d, branch, 7, original.Path); err != nil || !ok ||
+		got.OID.String != original.OID.String {
+		t.Fatalf("failed replacement changed original: got=%+v ok=%v err=%v",
+			got, ok, err)
+	}
+	if replaced, err := ReplaceShadowGeneration(
+		ctx, d, branch, 7, marker, []ShadowPath{duplicate}); err != nil ||
+		replaced != 1 {
+		t.Fatalf("replace shadow: rows=%d err=%v", replaced, err)
+	}
+	if _, ok, err := GetShadowPath(
+		ctx, d, branch, 7, original.Path); err != nil || ok {
+		t.Fatalf("old shadow survived replacement: ok=%v err=%v", ok, err)
+	}
+	if got, ok, err := GetShadowPath(
+		ctx, d, branch, 7, duplicate.Path); err != nil || !ok ||
+		got.BaseHead != duplicate.BaseHead {
+		t.Fatalf("replacement shadow: got=%+v ok=%v err=%v", got, ok, err)
+	}
+	if got, ok, err := MetaGet(ctx, d, marker); err != nil || !ok || got != "1" {
+		t.Fatalf("replacement marker=%q ok=%v err=%v", got, ok, err)
+	}
+}
+
 func TestPruneShadowGenerationsRetainsConfiguredPriorGenerations(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
