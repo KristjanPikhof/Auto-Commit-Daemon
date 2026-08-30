@@ -1672,12 +1672,18 @@ func IntentRepairByIDBounded(
 	mode, sealedCount, err := loadIntentRepairMembershipSeal(
 		ctx, d.readSQL(), id)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return IntentRepair{}, false, 0,
+				completedBranchTransitionProofError(
+					"intent repair %s lacks its membership seal", id)
+		}
 		return IntentRepair{}, false, 0, err
 	}
 	if sealedCount != len(members) {
-		return IntentRepair{}, false, 0, fmt.Errorf(
-			"state: intent repair membership seal=%d members=%d",
-			sealedCount, len(members))
+		return IntentRepair{}, false, 0,
+			completedBranchTransitionProofError(
+				"intent repair %s membership seal=%d members=%d",
+				id, sealedCount, len(members))
 	}
 	repair.MembershipMode = mode
 	return repair, true, evidenceRows, nil
