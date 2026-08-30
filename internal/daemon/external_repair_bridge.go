@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -21,6 +20,7 @@ const (
 type externalRepairBridgeProof struct {
 	TargetCommit string
 	RepairID     string
+	EventCount   int
 	FinalState   []recoveryPathState
 }
 
@@ -83,12 +83,13 @@ func reconcileExternalRepairBridge(
 		trigger = "automatic_chain_reconciliation"
 	}
 	transition := state.RecoveryChainTransition{
-		Expected:     chain,
-		TargetState:  state.EventStatePublished,
-		CommitOID:    commitOID,
-		RecoveryRef:  ref,
-		Reason:       trigger,
-		DecisionKind: opts.decisionKind,
+		Expected:              chain,
+		TargetState:           state.EventStatePublished,
+		CommitOID:             commitOID,
+		RecoveryRef:           ref,
+		Reason:                trigger,
+		DecisionKind:          opts.decisionKind,
+		AllowLaterUnpublished: true,
 	}
 	var snapshot state.RecoverySnapshot
 	err = git.WithLockedRecoveryRef(
@@ -151,8 +152,19 @@ func proveExternalRepairBridge(
 		tokenBranchRef(live.token) != opts.BranchRef {
 		return zero, false, nil
 	}
-	frozen, err := externalBridgeMatchesFrozenDrain(ctx, db, opts, chain)
+	frozenCount, frozen, err := externalBridgeMatchesFrozenDrain(
+		ctx, db, opts, chain)
 	if err != nil || !frozen {
+		return zero, false, err
+	}
+	chain = chain[:frozenCount]
+	if err := validateExternalRepairBridgeChain(chain); err != nil {
+		return zero, false, err
+	}
+	chain, err = canonicalizeRecoveryProofEvents(
+		ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
+		sameBranchRecoveryHead(live, opts.BranchRef), chain)
+	if err != nil {
 		return zero, false, err
 	}
 	if err := validateRecoveryObjects(ctx, repoRoot, chain); err != nil {
@@ -195,38 +207,46 @@ func proveExternalRepairBridge(
 	for _, path := range changedPaths {
 		changedSet[path] = struct{}{}
 	}
-	for path := range pendingPaths {
-		if _, changed := changedSet[path]; !changed {
-			return zero, false, nil
-		}
-	}
-
-	candidate, foundCandidate, err := nearestExternalRepairCandidate(
+	repairs, foundRepairs, err := externalRepairCandidates(
 		ctx, db, opts.BranchRef, opts.BranchGeneration,
 		opts.ExternalParentHead)
 	if err != nil {
 		return zero, false, err
 	}
-	if !foundCandidate {
+	if !foundRepairs {
 		return zero, false, nil
 	}
-
-	if err := validateRecoveryObjects(ctx, repoRoot,
-		[]state.RecoveryChainEvent{{
-			Event: state.CaptureEvent{Seq: 1, BaseHead: candidate.OldHead},
-			Ops:   candidate.Ops,
-		}}); err != nil {
-		return zero, false, err
-	}
-	validRepairTree, err := externalRepairCandidateTreeMatches(
-		ctx, repoRoot, candidate)
-	if err != nil {
-		return zero, false, err
-	}
-	if !validRepairTree {
-		return zero, false, fmt.Errorf(
-			"%w: external repair bridge: repair %s tree does not match its members",
-			state.ErrCompletedBranchTransitionProof, candidate.ID)
+	candidate := repairs[0]
+	repairOps := make([]state.CaptureOp, 0)
+	repairOwnedPaths := make(map[string]struct{})
+	for _, repair := range repairs {
+		if len(repairOps)+len(repair.Ops) > state.CompletedBranchTransitionProofLimit {
+			return zero, false, fmt.Errorf(
+				"%w: external repair bridge: repair chain exceeds %d operations",
+				state.ErrCompletedBranchTransitionProof,
+				state.CompletedBranchTransitionProofLimit)
+		}
+		if err := validateRecoveryObjects(ctx, repoRoot,
+			[]state.RecoveryChainEvent{{
+				Event: state.CaptureEvent{Seq: 1, BaseHead: repair.OldHead},
+				Ops:   repair.Ops,
+			}}); err != nil {
+			return zero, false, err
+		}
+		validRepairTree, err := externalRepairCandidateTreeMatches(
+			ctx, repoRoot, repair)
+		if err != nil {
+			return zero, false, err
+		}
+		if !validRepairTree {
+			return zero, false, fmt.Errorf(
+				"%w: external repair bridge: repair %s tree does not match its members",
+				state.ErrCompletedBranchTransitionProof, repair.ID)
+		}
+		repairOps = append(repairOps, repair.Ops...)
+		for _, path := range touchedPaths(repair.Ops) {
+			repairOwnedPaths[path] = struct{}{}
+		}
 	}
 	repairOnParent, err := git.IsAncestor(
 		ctx, repoRoot, candidate.NewHead, opts.ExternalParentHead)
@@ -239,7 +259,7 @@ func proveExternalRepairBridge(
 		return zero, false, nil
 	}
 	publicationSuffix, ownedSuffix, err := loadExternalRepairPublicationSuffix(
-		ctx, db, opts.BranchRef, opts.BranchGeneration,
+		ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
 		candidate.NewHead, opts.ExternalParentHead)
 	if err != nil {
 		return zero, false, err
@@ -261,7 +281,7 @@ func proveExternalRepairBridge(
 	}
 	proofInputs := [][]string{
 		baselineChanges,
-		touchedPaths(candidate.Ops),
+		touchedPaths(repairOps),
 		touchedPathsFromRecoveryChain(publicationSuffix),
 		touchedPathsFromRecoveryChain(chain),
 	}
@@ -303,11 +323,32 @@ func proveExternalRepairBridge(
 			break
 		}
 	}
-	if !valid || externalBridgeIndexesMatch(index, actualSource, proofPaths) {
+	if !valid {
 		return zero, false, nil
 	}
+	restoredRepairPath := false
+	for _, path := range proofPaths {
+		if sameExternalBridgeEntry(index, actualSource, path) {
+			continue
+		}
+		if _, owned := repairOwnedPaths[path]; !owned {
+			return zero, false, nil
+		}
+		restoredRepairPath = true
+	}
+	if !restoredRepairPath {
+		return zero, false, nil
+	}
+	lastUnpublishedBase := make(map[string]string)
 	for _, item := range chain {
-		if conflict := applyRecoveryOpsInMemory(index, item.Ops); conflict != "" {
+		conflict, err := applyRecoveryEventInMemory(
+			ctx, repoRoot, index, item, true, lastUnpublishedBase)
+		if err != nil {
+			return zero, false, fmt.Errorf(
+				"daemon: external repair bridge: prove event %d base state: %w",
+				item.Event.Seq, err)
+		}
+		if conflict != "" {
 			valid = false
 			break
 		}
@@ -327,12 +368,39 @@ func proveExternalRepairBridge(
 	return externalRepairBridgeProof{
 		TargetCommit: target,
 		RepairID:     candidate.ID,
+		EventCount:   len(chain),
 		FinalState:   finalState,
 	}, true, nil
 }
 
+func validateExternalRepairBridgeChain(chain []state.RecoveryChainEvent) error {
+	if len(chain) == 0 {
+		return fmt.Errorf(
+			"%w: external repair bridge: frozen drain has no unresolved events",
+			state.ErrCompletedBranchTransitionProof)
+	}
+	if len(chain) > state.CompletedBranchTransitionProofLimit {
+		return fmt.Errorf(
+			"%w: external repair bridge: frozen drain exceeds %d events",
+			state.ErrCompletedBranchTransitionProof,
+			state.CompletedBranchTransitionProofLimit)
+	}
+	opCount := 0
+	for _, item := range chain {
+		opCount += len(item.Ops)
+		if opCount > state.CompletedBranchTransitionProofLimit {
+			return fmt.Errorf(
+				"%w: external repair bridge: frozen drain exceeds %d operations",
+				state.ErrCompletedBranchTransitionProof,
+				state.CompletedBranchTransitionProofLimit)
+		}
+	}
+	return nil
+}
+
 func loadExternalRepairPublicationSuffix(
 	ctx context.Context,
+	repoRoot string,
 	db *state.DB,
 	branchRef string,
 	branchGeneration int64,
@@ -350,44 +418,160 @@ func loadExternalRepairPublicationSuffix(
 		if transition.Kind != state.CompletedBranchTransitionSelfPublication {
 			return nil, false, nil
 		}
-		for _, seq := range transition.EventSeqs {
-			event, err := loadIntentCaptureEvent(ctx, db, seq)
-			if err != nil {
-				return nil, false, fmt.Errorf(
-					"daemon: external repair bridge: load publication member %d: %w",
-					seq, err)
-			}
-			if event.State != state.EventStatePublished ||
-				!event.CommitOID.Valid ||
-				event.CommitOID.String != transition.TargetHead {
-				return nil, false, fmt.Errorf(
-					"%w: external repair bridge: publication %s member %d drifted",
-					state.ErrCompletedBranchTransitionProof,
-					transition.ID, seq)
-			}
-			ops, err := state.LoadCaptureOps(ctx, db, seq)
-			if err != nil {
-				return nil, false, fmt.Errorf(
-					"daemon: external repair bridge: load publication member ops %d: %w",
-					seq, err)
-			}
-			if len(ops) == 0 || validateOps(ops) != "" {
-				return nil, false, fmt.Errorf(
-					"%w: external repair bridge: publication %s member %d has invalid operations",
-					state.ErrCompletedBranchTransitionProof,
-					transition.ID, seq)
-			}
-			opCount += len(ops)
-			if opCount > maxExternalRepairBridgePaths {
-				return nil, false, fmt.Errorf(
-					"%w: external repair bridge: publication suffix exceeds %d operations",
-					state.ErrCompletedBranchTransitionProof,
-					maxExternalRepairBridgePaths)
-			}
-			events = append(events, state.RecoveryChainEvent{Event: event, Ops: ops})
+		publicationEvents, rawOps, err := loadExternalRepairPublication(
+			ctx, repoRoot, db, branchRef, branchGeneration, transition)
+		if err != nil {
+			return nil, false, err
 		}
+		opCount += rawOps
+		if opCount > state.CompletedBranchTransitionProofLimit ||
+			len(events)+len(publicationEvents) > state.CompletedBranchTransitionProofLimit {
+			return nil, false, fmt.Errorf(
+				"%w: external repair bridge: publication suffix exceeds %d events or operations",
+				state.ErrCompletedBranchTransitionProof,
+				state.CompletedBranchTransitionProofLimit)
+		}
+		events = append(events, publicationEvents...)
 	}
 	return events, true, nil
+}
+
+func loadExternalRepairPublication(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	branchRef string,
+	branchGeneration int64,
+	transition state.CompletedBranchTransition,
+) ([]state.RecoveryChainEvent, int, error) {
+	parents, err := selfPublicationParents(ctx, repoRoot, transition.TargetHead)
+	if err != nil {
+		return nil, 0, fmt.Errorf(
+			"%w: external repair bridge: read publication %s parents: %v",
+			state.ErrCompletedBranchTransitionProof, transition.ID, err)
+	}
+	if len(parents) != 1 || parents[0] != transition.SourceHead {
+		return nil, 0, fmt.Errorf(
+			"%w: external repair bridge: publication %s does not map the Git edge %s..%s",
+			state.ErrCompletedBranchTransitionProof, transition.ID,
+			transition.SourceHead, transition.TargetHead)
+	}
+
+	publication, ok, err := state.SelfPublicationByID(ctx, db, transition.ID)
+	if err != nil {
+		return nil, 0, fmt.Errorf(
+			"daemon: external repair bridge: load publication %s: %w",
+			transition.ID, err)
+	}
+	membershipDigest, digestErr := state.SelfPublicationMembershipDigest(
+		publication.Members)
+	if !ok || publication.Phase != state.SelfPublicationCompleted ||
+		publication.BranchRef != branchRef ||
+		publication.BranchGeneration != branchGeneration ||
+		publication.SourceHead != transition.SourceHead ||
+		publication.TargetCommitOID != transition.TargetHead ||
+		publication.MemberCount != len(publication.Members) ||
+		len(publication.Members) != len(transition.EventSeqs) ||
+		digestErr != nil || membershipDigest != publication.MembershipDigest {
+		return nil, 0, fmt.Errorf(
+			"%w: external repair bridge: publication %s identity changed",
+			state.ErrCompletedBranchTransitionProof, transition.ID)
+	}
+	treeOID, err := resolveTreeOID(ctx, repoRoot, transition.TargetHead)
+	if err != nil || treeOID != publication.TargetTreeOID {
+		return nil, 0, fmt.Errorf(
+			"%w: external repair bridge: publication %s tree proof changed",
+			state.ErrCompletedBranchTransitionProof, transition.ID)
+	}
+
+	window := make([]state.CaptureEvent, len(publication.Members))
+	opsBySeq := make(map[int64][]state.CaptureOp, len(publication.Members))
+	rawOpCount := 0
+	for i, member := range publication.Members {
+		if member.Ord != i || member.EventSeq != transition.EventSeqs[i] ||
+			(member.CandidateID.Valid && strings.TrimSpace(member.CandidateID.String) == "") {
+			return nil, 0, fmt.Errorf(
+				"%w: external repair bridge: publication %s membership changed",
+				state.ErrCompletedBranchTransitionProof, transition.ID)
+		}
+		event, err := loadIntentCaptureEvent(ctx, db, member.EventSeq)
+		if err != nil {
+			return nil, 0, fmt.Errorf(
+				"daemon: external repair bridge: load publication member %d: %w",
+				member.EventSeq, err)
+		}
+		if event.State != state.EventStatePublished ||
+			!event.CommitOID.Valid ||
+			event.CommitOID.String != transition.TargetHead {
+			return nil, 0, fmt.Errorf(
+				"%w: external repair bridge: publication %s member %d drifted",
+				state.ErrCompletedBranchTransitionProof,
+				transition.ID, member.EventSeq)
+		}
+		ops, err := state.LoadCaptureOps(ctx, db, member.EventSeq)
+		if err != nil {
+			return nil, 0, fmt.Errorf(
+				"daemon: external repair bridge: load publication member ops %d: %w",
+				member.EventSeq, err)
+		}
+		if len(ops) == 0 || validateOps(ops) != "" {
+			return nil, 0, fmt.Errorf(
+				"%w: external repair bridge: publication %s member %d has invalid operations",
+				state.ErrCompletedBranchTransitionProof,
+				transition.ID, member.EventSeq)
+		}
+		rawOpCount += len(ops)
+		if rawOpCount > state.CompletedBranchTransitionProofLimit {
+			return nil, 0, fmt.Errorf(
+				"%w: external repair bridge: publication %s exceeds %d operations",
+				state.ErrCompletedBranchTransitionProof, transition.ID,
+				state.CompletedBranchTransitionProofLimit)
+		}
+		window[i] = event
+		opsBySeq[event.Seq] = ops
+	}
+
+	loadOps := func(
+		_ context.Context, _ *state.DB, seq int64,
+	) ([]state.CaptureOp, error) {
+		ops, ok := opsBySeq[seq]
+		if !ok {
+			return nil, fmt.Errorf("publication member %d is not sealed", seq)
+		}
+		return ops, nil
+	}
+	applied := make([]state.RecoveryChainEvent, 0, len(window))
+	for start := 0; start < len(window); {
+		end := start + 1
+		candidateID := publication.Members[start].CandidateID
+		if candidateID.Valid {
+			for end < len(window) &&
+				publication.Members[end].CandidateID.Valid &&
+				publication.Members[end].CandidateID.String == candidateID.String {
+				end++
+			}
+		}
+		offers, err := coalesceIntentWindow(
+			ctx, db, window[start:end], true, loadOps)
+		if err != nil {
+			return nil, 0, fmt.Errorf(
+				"%w: external repair bridge: publication %s cannot reconstruct applied operations: %v",
+				state.ErrCompletedBranchTransitionProof, transition.ID, err)
+		}
+		for _, offer := range offers {
+			if len(offer.MergedOps) == 0 || validateOps(offer.MergedOps) != "" {
+				return nil, 0, fmt.Errorf(
+					"%w: external repair bridge: publication %s reconstructed invalid operations",
+					state.ErrCompletedBranchTransitionProof, transition.ID)
+			}
+			applied = append(applied, state.RecoveryChainEvent{
+				Event: offer.Primary,
+				Ops:   offer.MergedOps,
+			})
+		}
+		start = end
+	}
+	return applied, rawOpCount, nil
 }
 
 func touchedPathsFromRecoveryChain(chain []state.RecoveryChainEvent) []string {
@@ -403,10 +587,10 @@ func externalBridgeMatchesFrozenDrain(
 	db *state.DB,
 	opts RecoveryReconcileOptions,
 	chain []state.RecoveryChainEvent,
-) (bool, error) {
+) (int, bool, error) {
 	drains, err := state.ActivePublicationDrains(ctx, db)
 	if err != nil {
-		return false, fmt.Errorf(
+		return 0, false, fmt.Errorf(
 			"daemon: external repair bridge: load active publication drains: %w", err)
 	}
 	var matched []state.PublicationDrain
@@ -417,7 +601,7 @@ func externalBridgeMatchesFrozenDrain(
 		}
 	}
 	if len(matched) != 1 {
-		return false, nil
+		return 0, false, nil
 	}
 	rows, err := db.ReadSQL().QueryContext(ctx, `
 SELECT event.seq
@@ -425,12 +609,14 @@ FROM publication_drain_events member
 JOIN capture_events event ON event.seq=member.event_seq
 WHERE member.drain_id=?
   AND event.state IN (?, ?, ?)
-ORDER BY member.ord`, matched[0].ID,
+ORDER BY member.ord
+LIMIT ?`, matched[0].ID,
 		state.EventStatePending,
 		state.EventStateBlockedConflict,
-		state.EventStateFailed)
+		state.EventStateFailed,
+		state.CompletedBranchTransitionProofLimit+1)
 	if err != nil {
-		return false, fmt.Errorf(
+		return 0, false, fmt.Errorf(
 			"daemon: external repair bridge: load unresolved drain target: %w", err)
 	}
 	defer rows.Close()
@@ -438,24 +624,31 @@ ORDER BY member.ord`, matched[0].ID,
 	for rows.Next() {
 		var seq int64
 		if err := rows.Scan(&seq); err != nil {
-			return false, fmt.Errorf(
+			return 0, false, fmt.Errorf(
 				"daemon: external repair bridge: scan unresolved drain target: %w", err)
 		}
 		unresolved = append(unresolved, seq)
 	}
 	if err := rows.Err(); err != nil {
-		return false, fmt.Errorf(
+		return 0, false, fmt.Errorf(
 			"daemon: external repair bridge: iterate unresolved drain target: %w", err)
 	}
-	if len(unresolved) != len(chain) {
-		return false, nil
+	if len(unresolved) > state.CompletedBranchTransitionProofLimit {
+		return 0, false, fmt.Errorf(
+			"%w: external repair bridge: frozen drain exceeds %d events",
+			state.ErrCompletedBranchTransitionProof,
+			state.CompletedBranchTransitionProofLimit)
 	}
-	for i, item := range chain {
-		if unresolved[i] != item.Event.Seq {
-			return false, nil
+	if len(unresolved) == 0 || len(chain) < len(unresolved) {
+		return 0, false, nil
+	}
+	for i, seq := range unresolved {
+		item := chain[i]
+		if seq != item.Event.Seq {
+			return 0, false, nil
 		}
 	}
-	return true, nil
+	return len(unresolved), true, nil
 }
 
 func firstParentChildSince(
@@ -474,6 +667,11 @@ func firstParentChildSince(
 	}, maxOutput, "rev-list", "--first-parent",
 		fmt.Sprintf("--max-count=%d", maxCount), liveHead)
 	if err != nil {
+		if errors.Is(err, git.ErrStdoutOverflow) {
+			return "", false, fmt.Errorf(
+				"%w: external repair bridge: first-parent proof output exceeded its bound",
+				state.ErrCompletedBranchTransitionProof)
+		}
 		return "", false, fmt.Errorf(
 			"daemon: external repair bridge: list bounded first-parent chain: %w", err)
 	}
@@ -486,17 +684,10 @@ func firstParentChildSince(
 		}
 	}
 	if parentIndex < 0 && len(commits) == maxCount {
-		distance, direct, err := externalBridgeFirstParentDistance(
-			ctx, repoRoot, parent, liveHead)
-		if err != nil {
-			return "", false, err
-		}
-		if direct && distance > maxExternalRepairBridgeCommits {
-			return "", false, fmt.Errorf(
-				"%w: external repair bridge: first-parent proof exceeds %d commits",
-				state.ErrCompletedBranchTransitionProof,
-				maxExternalRepairBridgeCommits)
-		}
+		return "", false, fmt.Errorf(
+			"%w: external repair bridge: first-parent proof exceeds %d commits",
+			state.ErrCompletedBranchTransitionProof,
+			maxExternalRepairBridgeCommits)
 	}
 	if parentIndex <= 0 || parentIndex > maxExternalRepairBridgeCommits {
 		return "", false, nil
@@ -513,40 +704,6 @@ func firstParentChildSince(
 	return target, true, nil
 }
 
-func externalBridgeFirstParentDistance(
-	ctx context.Context,
-	repoRoot string,
-	parent string,
-	liveHead string,
-) (int, bool, error) {
-	out, err := git.RunWithLimit(ctx, git.RunOpts{
-		Dir: repoRoot, Timeout: git.DefaultReadTimeout,
-	}, 32, "rev-list", "--first-parent", "--count", parent+".."+liveHead)
-	if err != nil {
-		return 0, false, fmt.Errorf(
-			"daemon: external repair bridge: count first-parent distance: %w", err)
-	}
-	distance, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil || distance < 0 {
-		return 0, false, fmt.Errorf(
-			"daemon: external repair bridge: invalid first-parent distance %q",
-			strings.TrimSpace(string(out)))
-	}
-	if distance == 0 {
-		return 0, false, nil
-	}
-	ancestor, err := git.RevParse(
-		ctx, repoRoot, fmt.Sprintf("%s~%d", liveHead, distance))
-	if errors.Is(err, git.ErrRefNotFound) {
-		return distance, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf(
-			"daemon: external repair bridge: resolve first-parent distance: %w", err)
-	}
-	return distance, ancestor == parent, nil
-}
-
 func externalBridgeChangedPaths(
 	ctx context.Context,
 	repoRoot string,
@@ -558,6 +715,11 @@ func externalBridgeChangedPaths(
 	}, git.DefaultDiffCap, "diff-tree", "--no-commit-id", "--name-only",
 		"-r", "-z", "--no-renames", parent, target, "--")
 	if err != nil {
+		if errors.Is(err, git.ErrStdoutOverflow) {
+			return nil, fmt.Errorf(
+				"%w: external repair bridge: changed-path proof exceeds %d bytes",
+				state.ErrCompletedBranchTransitionProof, git.DefaultDiffCap)
+		}
 		return nil, fmt.Errorf(
 			"daemon: external repair bridge: diff parent and target: %w", err)
 	}
@@ -575,7 +737,8 @@ func externalBridgeChangedPaths(
 		paths = append(paths, path)
 		if len(paths) > maxExternalRepairBridgePaths {
 			return nil, fmt.Errorf(
-				"daemon: external repair bridge: target changes more than %d paths",
+				"%w: external repair bridge: target changes more than %d paths",
+				state.ErrCompletedBranchTransitionProof,
 				maxExternalRepairBridgePaths)
 		}
 	}
@@ -593,6 +756,11 @@ func externalBridgeIndexState(
 		ctx, repoRoot, rev, false, git.DefaultDiffCap,
 		git.LiteralPathspecs(paths)...)
 	if err != nil {
+		if errors.Is(err, git.ErrStdoutOverflow) {
+			return nil, fmt.Errorf(
+				"%w: external repair bridge: tree proof exceeds %d bytes",
+				state.ErrCompletedBranchTransitionProof, git.DefaultDiffCap)
+		}
 		return nil, fmt.Errorf(
 			"daemon: external repair bridge: read tree %s: %w", rev, err)
 	}
@@ -611,56 +779,68 @@ type externalRepairIncomingTransition struct {
 	SourceHead string
 }
 
-func nearestExternalRepairCandidate(
+// externalRepairCandidates walks backward from the stale publication parent.
+// It returns the nearest repair first, followed by any immediately adjacent
+// earlier repairs. The walk stops at the first ordinary publication before the
+// repair run so inherited history cannot authorize restored paths.
+func externalRepairCandidates(
 	ctx context.Context,
 	db *state.DB,
 	branchRef string,
 	branchGeneration int64,
 	externalParent string,
-) (externalRepairCandidate, bool, error) {
+) ([]externalRepairCandidate, bool, error) {
 	current := externalParent
 	sawPublication := false
+	var candidates []externalRepairCandidate
 	for step := 0; step < maxExternalRepairBridgeCommits; step++ {
 		incoming, err := externalRepairIncomingTransitions(
 			ctx, db, branchRef, branchGeneration, current)
 		if err != nil {
-			return externalRepairCandidate{}, false, err
+			return nil, false, err
 		}
 		switch len(incoming) {
 		case 0:
-			return externalRepairCandidate{}, false, nil
+			return candidates, len(candidates) > 0, nil
 		case 1:
 			// Continue below.
 		default:
-			return externalRepairCandidate{}, false, fmt.Errorf(
+			return nil, false, fmt.Errorf(
 				"%w: external repair bridge: transition into %s is ambiguous",
 				state.ErrCompletedBranchTransitionProof, current)
 		}
 		transition := incoming[0]
 		if transition.SourceHead == "" || transition.SourceHead == current {
-			return externalRepairCandidate{}, false, fmt.Errorf(
+			return nil, false, fmt.Errorf(
 				"%w: external repair bridge: transition %s has invalid source",
 				state.ErrCompletedBranchTransitionProof, transition.ID)
 		}
 		switch transition.Kind {
 		case state.CompletedBranchTransitionSelfPublication:
+			if len(candidates) > 0 {
+				return candidates, true, nil
+			}
 			sawPublication = true
 			current = transition.SourceHead
 		case state.CompletedBranchTransitionIntentRepair:
 			if !sawPublication {
-				return externalRepairCandidate{}, false, nil
+				return nil, false, nil
 			}
 			candidate, err := loadExternalRepairCandidate(
 				ctx, db, branchRef, branchGeneration, transition.ID)
-			return candidate, err == nil, err
+			if err != nil {
+				return nil, false, err
+			}
+			candidates = append(candidates, candidate)
+			current = transition.SourceHead
 		default:
-			return externalRepairCandidate{}, false, fmt.Errorf(
+			return nil, false, fmt.Errorf(
 				"%w: external repair bridge: transition %s has unknown kind %q",
 				state.ErrCompletedBranchTransitionProof,
 				transition.ID, transition.Kind)
 		}
 	}
-	return externalRepairCandidate{}, false, fmt.Errorf(
+	return nil, false, fmt.Errorf(
 		"%w: external repair bridge: incoming transition proof exceeds %d steps",
 		state.ErrCompletedBranchTransitionProof,
 		maxExternalRepairBridgeCommits)
@@ -754,6 +934,7 @@ func loadExternalRepairCandidate(
 			state.ErrCompletedBranchTransitionProof, repairID)
 	}
 	canonicalOIDByCandidate := make(map[string]string, len(repair.Commits))
+	originalOIDByCandidate := make(map[string]string, len(repair.Commits))
 	for _, commit := range repair.Commits {
 		if commit.CandidateID.Valid && commit.NewOID.Valid {
 			canonical, err := state.CompletedIntentRepairCommitChain(
@@ -762,14 +943,20 @@ func loadExternalRepairCandidate(
 				return externalRepairCandidate{}, err
 			}
 			canonicalOID := canonical[len(canonical)-1]
-			if existing := canonicalOIDByCandidate[commit.CandidateID.String];
-				existing != "" && existing != canonicalOID {
+			if existing := canonicalOIDByCandidate[commit.CandidateID.String]; existing != "" && existing != canonicalOID {
 				return externalRepairCandidate{}, fmt.Errorf(
 					"%w: external repair bridge: repair %s candidate %s has conflicting mappings",
 					state.ErrCompletedBranchTransitionProof,
 					repair.ID, commit.CandidateID.String)
 			}
+			if existing := originalOIDByCandidate[commit.CandidateID.String]; existing != "" && existing != commit.NewOID.String {
+				return externalRepairCandidate{}, fmt.Errorf(
+					"%w: external repair bridge: repair %s candidate %s has conflicting original mappings",
+					state.ErrCompletedBranchTransitionProof,
+					repair.ID, commit.CandidateID.String)
+			}
 			canonicalOIDByCandidate[commit.CandidateID.String] = canonicalOID
+			originalOIDByCandidate[commit.CandidateID.String] = commit.NewOID.String
 		}
 	}
 	candidate := externalRepairCandidate{
@@ -790,8 +977,11 @@ func loadExternalRepairCandidate(
 				state.ErrCompletedBranchTransitionProof,
 				repair.ID, member.EventSeq)
 		}
+		originalOID := originalOIDByCandidate[member.CandidateID]
 		if event.State != state.EventStatePublished ||
-			!event.CommitOID.Valid || event.CommitOID.String != canonicalOID {
+			!event.CommitOID.Valid ||
+			(event.CommitOID.String != canonicalOID &&
+				event.CommitOID.String != originalOID) {
 			return externalRepairCandidate{}, fmt.Errorf(
 				"%w: external repair bridge: repair %s member %d drifted",
 				state.ErrCompletedBranchTransitionProof,
@@ -865,16 +1055,6 @@ func externalRepairCandidateTreeMatches(
 		}
 	}
 	return true, nil
-}
-
-func cloneExternalBridgeIndex(
-	index map[string]git.IndexEntry,
-) map[string]git.IndexEntry {
-	clone := make(map[string]git.IndexEntry, len(index))
-	for path, entry := range index {
-		clone[path] = entry
-	}
-	return clone
 }
 
 func sameExternalBridgeEntry(

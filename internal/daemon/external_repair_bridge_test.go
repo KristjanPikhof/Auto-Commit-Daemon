@@ -217,13 +217,13 @@ func TestExternalRepairBridgeRejectsEquivalentLaterProofRef(t *testing.T) {
 	}
 }
 
-func TestExternalBridgeFirstParentDistanceRejectsBackwardReset(t *testing.T) {
+func TestExternalBridgeFirstParentProofRejectsBackwardReset(t *testing.T) {
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
-	distance, direct, err := externalBridgeFirstParentDistance(
+	target, matched, err := firstParentChildSince(
 		context.Background(), f.capture.dir, f.live, f.target)
-	if err != nil || direct || distance != 0 {
-		t.Fatalf("distance=%d direct=%t err=%v want ordinary no-match",
-			distance, direct, err)
+	if err != nil || matched || target != "" {
+		t.Fatalf("target=%q matched=%t err=%v want ordinary no-match",
+			target, matched, err)
 	}
 }
 
