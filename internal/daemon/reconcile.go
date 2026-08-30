@@ -137,6 +137,21 @@ func ProveUnpublishedChain(
 	if err != nil {
 		return result, err
 	}
+	bridge, bridged, err := proveExternalRepairBridge(
+		ctx, repoRoot, db, opts, live, proofChain)
+	if err != nil {
+		return result, err
+	}
+	if bridged {
+		if err := requireStableRecoveryLiveState(ctx, repoRoot, live); err != nil {
+			return result, err
+		}
+		return RecoveryChainResult{
+			Handled: true, Outcome: state.EventStatePublished,
+			CommitOID: bridge.TargetCommit,
+			FirstSeq:  first.Seq, LastSeq: last.Seq, EventCount: len(chain),
+		}, nil
+	}
 	baseHead := proofChain[0].Event.BaseHead
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
 		ctx, db, opts.BranchRef, opts.BranchGeneration, first.Seq, last.Seq,
@@ -253,6 +268,15 @@ func ReconcileUnpublishedChain(
 		proofLiveHead, chain)
 	if err != nil {
 		return result, err
+	}
+	bridge, bridged, err := proveExternalRepairBridge(
+		ctx, repoRoot, db, opts, live, proofChain)
+	if err != nil {
+		return result, err
+	}
+	if bridged {
+		return reconcileExternalRepairBridge(
+			ctx, repoRoot, db, opts, live, chain, proofChain, bridge)
 	}
 	baseHead := proofChain[0].Event.BaseHead
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
