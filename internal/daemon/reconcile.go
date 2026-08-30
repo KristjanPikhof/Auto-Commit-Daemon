@@ -130,27 +130,34 @@ func ProveUnpublishedChain(
 	if !live.hasHead && !opts.ArchiveOnly {
 		return result, fmt.Errorf("daemon: prove recovery chain: HEAD is missing; archive-only mode required")
 	}
+	bridge, bridged, err := proveExternalRepairBridge(
+		ctx, repoRoot, db, opts, live, chain)
+	if err != nil {
+		return result, err
+	}
+	if bridged {
+		if bridge.EventCount < 1 || bridge.EventCount > len(chain) {
+			return result, fmt.Errorf(
+				"%w: external repair bridge returned invalid event count %d",
+				state.ErrCompletedBranchTransitionProof, bridge.EventCount)
+		}
+		if err := requireStableRecoveryLiveState(ctx, repoRoot, live); err != nil {
+			return result, err
+		}
+		last := chain[bridge.EventCount-1].Event
+		return RecoveryChainResult{
+			Handled: true, Outcome: state.EventStatePublished,
+			CommitOID: bridge.TargetCommit,
+			FirstSeq:  first.Seq, LastSeq: last.Seq,
+			EventCount: bridge.EventCount,
+		}, nil
+	}
 	proofLiveHead := sameBranchRecoveryHead(live, opts.BranchRef)
 	proofChain, err := canonicalizeRecoveryProofEvents(
 		ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
 		proofLiveHead, chain)
 	if err != nil {
 		return result, err
-	}
-	bridge, bridged, err := proveExternalRepairBridge(
-		ctx, repoRoot, db, opts, live, proofChain)
-	if err != nil {
-		return result, err
-	}
-	if bridged {
-		if err := requireStableRecoveryLiveState(ctx, repoRoot, live); err != nil {
-			return result, err
-		}
-		return RecoveryChainResult{
-			Handled: true, Outcome: state.EventStatePublished,
-			CommitOID: bridge.TargetCommit,
-			FirstSeq:  first.Seq, LastSeq: last.Seq, EventCount: len(chain),
-		}, nil
 	}
 	baseHead := proofChain[0].Event.BaseHead
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
@@ -262,21 +269,34 @@ func ReconcileUnpublishedChain(
 	if !live.hasHead && !opts.ArchiveOnly {
 		return result, fmt.Errorf("daemon: reconcile recovery chain: HEAD is missing; archive-only mode required")
 	}
+	bridge, bridged, err := proveExternalRepairBridge(
+		ctx, repoRoot, db, opts, live, chain)
+	if err != nil {
+		return result, err
+	}
+	if bridged {
+		if bridge.EventCount < 1 || bridge.EventCount > len(chain) {
+			return result, fmt.Errorf(
+				"%w: external repair bridge returned invalid event count %d",
+				state.ErrCompletedBranchTransitionProof, bridge.EventCount)
+		}
+		proofChain, err := canonicalizeRecoveryProofEvents(
+			ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
+			sameBranchRecoveryHead(live, opts.BranchRef),
+			chain[:bridge.EventCount])
+		if err != nil {
+			return result, err
+		}
+		return reconcileExternalRepairBridge(
+			ctx, repoRoot, db, opts, live,
+			chain[:bridge.EventCount], proofChain[:bridge.EventCount], bridge)
+	}
 	proofLiveHead := sameBranchRecoveryHead(live, opts.BranchRef)
 	proofChain, err := canonicalizeRecoveryProofEvents(
 		ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
 		proofLiveHead, chain)
 	if err != nil {
 		return result, err
-	}
-	bridge, bridged, err := proveExternalRepairBridge(
-		ctx, repoRoot, db, opts, live, proofChain)
-	if err != nil {
-		return result, err
-	}
-	if bridged {
-		return reconcileExternalRepairBridge(
-			ctx, repoRoot, db, opts, live, chain, proofChain, bridge)
 	}
 	baseHead := proofChain[0].Event.BaseHead
 	recoveryContext, err := state.LoadPublishedRecoveryContext(
