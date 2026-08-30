@@ -24,8 +24,9 @@ type externalRepairBridgeProof struct {
 }
 
 type externalRepairCandidate struct {
-	ID  string
-	Ops []state.CaptureOp
+	ID      string
+	NewHead string
+	Ops     []state.CaptureOp
 }
 
 func reconcileExternalRepairBridge(
@@ -143,6 +144,10 @@ func proveExternalRepairBridge(
 		tokenBranchRef(live.token) != opts.BranchRef {
 		return zero, false, nil
 	}
+	frozen, err := externalBridgeMatchesFrozenDrain(ctx, db, opts, chain)
+	if err != nil || !frozen {
+		return zero, false, err
+	}
 	target, ok, err := firstParentChildSince(
 		ctx, repoRoot, opts.ExternalParentHead, live.head)
 	if err != nil || !ok {
@@ -203,6 +208,16 @@ func proveExternalRepairBridge(
 
 	var matches []externalRepairBridgeProof
 	for _, candidate := range candidates {
+		repairOnParent, err := git.IsAncestor(
+			ctx, repoRoot, candidate.NewHead, opts.ExternalParentHead)
+		if err != nil {
+			return zero, false, fmt.Errorf(
+				"daemon: external repair bridge: prove repair %s ancestry: %w",
+				candidate.ID, err)
+		}
+		if !repairOnParent {
+			continue
+		}
 		index := cloneExternalBridgeIndex(sourceIndex)
 		repairChanged := make(map[string]struct{})
 		valid := true
@@ -255,10 +270,19 @@ func proveExternalRepairBridge(
 		if !valid || !externalBridgeIndexesMatch(index, targetIndex, changedPaths) {
 			continue
 		}
+		finalState := externalBridgeFinalState(index, pendingPaths)
+		chainMatches, err := recoveryChainMatchesHEAD(
+			ctx, repoRoot, target, chain, finalState)
+		if err != nil {
+			return zero, false, err
+		}
+		if !chainMatches {
+			continue
+		}
 		matches = append(matches, externalRepairBridgeProof{
 			TargetCommit: target,
 			RepairID:     candidate.ID,
-			FinalState:   externalBridgeFinalState(index, pendingPaths),
+			FinalState:   finalState,
 		})
 	}
 	if len(matches) == 0 {
@@ -270,6 +294,66 @@ func proveExternalRepairBridge(
 			len(matches), target)
 	}
 	return matches[0], true, nil
+}
+
+func externalBridgeMatchesFrozenDrain(
+	ctx context.Context,
+	db *state.DB,
+	opts RecoveryReconcileOptions,
+	chain []state.RecoveryChainEvent,
+) (bool, error) {
+	drains, err := state.ActivePublicationDrains(ctx, db)
+	if err != nil {
+		return false, fmt.Errorf(
+			"daemon: external repair bridge: load active publication drains: %w", err)
+	}
+	var matched []state.PublicationDrain
+	for _, drain := range drains {
+		if drain.BranchRef == opts.BranchRef &&
+			drain.BranchGeneration == opts.BranchGeneration {
+			matched = append(matched, drain)
+		}
+	}
+	if len(matched) != 1 {
+		return false, nil
+	}
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT event.seq
+FROM publication_drain_events member
+JOIN capture_events event ON event.seq=member.event_seq
+WHERE member.drain_id=?
+  AND event.state IN (?, ?, ?)
+ORDER BY member.ord`, matched[0].ID,
+		state.EventStatePending,
+		state.EventStateBlockedConflict,
+		state.EventStateFailed)
+	if err != nil {
+		return false, fmt.Errorf(
+			"daemon: external repair bridge: load unresolved drain target: %w", err)
+	}
+	defer rows.Close()
+	var unresolved []int64
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			return false, fmt.Errorf(
+				"daemon: external repair bridge: scan unresolved drain target: %w", err)
+		}
+		unresolved = append(unresolved, seq)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf(
+			"daemon: external repair bridge: iterate unresolved drain target: %w", err)
+	}
+	if len(unresolved) != len(chain) {
+		return false, nil
+	}
+	for i, item := range chain {
+		if unresolved[i] != item.Event.Seq {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func firstParentChildSince(
@@ -446,7 +530,12 @@ LIMIT ?`, args...)
 				newOIDByCandidate[commit.CandidateID.String] = commit.NewOID.String
 			}
 		}
-		candidate := externalRepairCandidate{ID: repair.ID}
+		if !repair.NewHead.Valid || repair.NewHead.String == "" {
+			continue
+		}
+		candidate := externalRepairCandidate{
+			ID: repair.ID, NewHead: repair.NewHead.String,
+		}
 		valid := true
 		for _, member := range repair.Members {
 			event, err := loadIntentCaptureEvent(ctx, db, member.EventSeq)
