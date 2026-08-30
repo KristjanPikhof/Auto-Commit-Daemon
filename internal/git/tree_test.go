@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,6 +10,25 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestLsTreeLimitedCapsOutput(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	blob, err := HashObjectStdin(ctx, dir, []byte("hello\n"))
+	if err != nil {
+		t.Fatalf("HashObjectStdin: %v", err)
+	}
+	tree, err := Mktree(ctx, dir, []MktreeEntry{{
+		Mode: RegularFileMode, Type: "blob", OID: blob, Path: "hello.txt",
+	}})
+	if err != nil {
+		t.Fatalf("Mktree: %v", err)
+	}
+	if _, err := LsTreeLimited(
+		ctx, dir, tree, false, 1); !errors.Is(err, ErrStdoutOverflow) {
+		t.Fatalf("LsTreeLimited err=%v want ErrStdoutOverflow", err)
+	}
+}
 
 func TestHashObjectStdinWritesBlob(t *testing.T) {
 	dir := initRepo(t)
