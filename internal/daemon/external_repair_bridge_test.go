@@ -11,7 +11,7 @@ import (
 )
 
 func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(t *testing.T) {
-	f := newExternalRepairBridgeFixture(t, false)
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	opts := RecoveryReconcileOptions{
 		GitDir:             f.capture.gitDir,
@@ -84,9 +84,9 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 		t.Fatalf("later commit pending blob=%s err=%v want different from target %s",
 			livePending, err, targetPending)
 	}
-	for _, seq := range f.repairSeqs {
+	for seq, wantCommit := range f.repairCommits {
 		if eventState, commit := readEventState(t, ctx, f.capture.db, seq); eventState != state.EventStatePublished || !commit.Valid ||
-			commit.String != f.repairCommit {
+			commit.String != wantCommit {
 			t.Fatalf("repair seq=%d changed state=%q commit=%v",
 				seq, eventState, commit)
 		}
@@ -94,7 +94,9 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 }
 
 func TestExternalRepairBridgeRejectsUnownedTargetPath(t *testing.T) {
-	f := newExternalRepairBridgeFixture(t, true)
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{
+		includeUnownedPath: true,
+	})
 	ctx := context.Background()
 	live, err := currentRecoveryLiveState(ctx, f.capture.dir, nil, nil)
 	if err != nil {
@@ -126,8 +128,59 @@ func TestExternalRepairBridgeRejectsUnownedTargetPath(t *testing.T) {
 	}
 }
 
+func TestExternalRepairBridgeRejectsIncompleteRepairRestoration(t *testing.T) {
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{
+		omitRestoredPath: true,
+	})
+	ctx := context.Background()
+	live, err := currentRecoveryLiveState(ctx, f.capture.dir, nil, nil)
+	if err != nil {
+		t.Fatalf("currentRecoveryLiveState: %v", err)
+	}
+	chain, err := state.LoadUnpublishedRecoveryChain(
+		ctx, f.capture.db, f.capture.cctx.BranchRef,
+		f.capture.cctx.BranchGeneration, f.pendingSeqs[0])
+	if err != nil {
+		t.Fatalf("LoadUnpublishedRecoveryChain: %v", err)
+	}
+	proof, matched, err := proveExternalRepairBridge(
+		ctx, f.capture.dir, f.capture.db, RecoveryReconcileOptions{
+			BranchRef:          f.capture.cctx.BranchRef,
+			BranchGeneration:   f.capture.cctx.BranchGeneration,
+			FirstSeq:           f.pendingSeqs[0],
+			ExternalParentHead: f.source,
+		}, live, chain)
+	if err != nil {
+		t.Fatalf("proveExternalRepairBridge: %v", err)
+	}
+	if matched {
+		t.Fatalf("incomplete repair restoration matched proof %+v", proof)
+	}
+}
+
+func TestExternalRepairBridgeUsesCumulativeAdjacentRepairState(t *testing.T) {
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{
+		includePriorRepair: true,
+	})
+	result, err := ProveUnpublishedChain(
+		context.Background(), f.capture.dir, f.capture.db,
+		RecoveryReconcileOptions{
+			GitDir:             f.capture.gitDir,
+			BranchRef:          f.capture.cctx.BranchRef,
+			BranchGeneration:   f.capture.cctx.BranchGeneration,
+			FirstSeq:           f.pendingSeqs[0],
+			ExternalParentHead: f.source,
+		})
+	if err != nil || !result.Handled ||
+		result.Outcome != state.EventStatePublished ||
+		result.CommitOID != f.target {
+		t.Fatalf("cumulative repair proof=%+v err=%v want target %s",
+			result, err, f.target)
+	}
+}
+
 func TestExternalRepairBridgeRejectsEquivalentLaterProofRef(t *testing.T) {
-	f := newExternalRepairBridgeFixture(t, false)
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	laterBlob, err := git.HashObjectStdin(ctx, f.capture.dir, []byte("other later work\n"))
 	if err != nil {
@@ -164,6 +217,16 @@ func TestExternalRepairBridgeRejectsEquivalentLaterProofRef(t *testing.T) {
 	}
 }
 
+func TestExternalBridgeFirstParentDistanceRejectsBackwardReset(t *testing.T) {
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
+	distance, direct, err := externalBridgeFirstParentDistance(
+		context.Background(), f.capture.dir, f.live, f.target)
+	if err != nil || direct || distance != 0 {
+		t.Fatalf("distance=%d direct=%t err=%v want ordinary no-match",
+			distance, direct, err)
+	}
+}
+
 type externalRepairBridgeFixture struct {
 	capture         *captureFixture
 	source          string
@@ -171,13 +234,18 @@ type externalRepairBridgeFixture struct {
 	live            string
 	pendingSeqs     []int64
 	drainEventCount int
-	repairSeqs      []int64
-	repairCommit    string
+	repairCommits   map[int64]string
+}
+
+type externalRepairBridgeFixtureOptions struct {
+	includeUnownedPath bool
+	omitRestoredPath   bool
+	includePriorRepair bool
 }
 
 func newExternalRepairBridgeFixture(
 	t *testing.T,
-	includeUnownedPath bool,
+	opts externalRepairBridgeFixtureOptions,
 ) externalRepairBridgeFixture {
 	t.Helper()
 	f := newCaptureFixture(t)
@@ -196,17 +264,49 @@ func newExternalRepairBridgeFixture(
 	restoredOld := blob("restored old\n")
 	restoredFinal := blob("restored final\n")
 	notesFinal := blob("notes final\n")
+	publishedFinal := blob("published suffix\n")
 	laterBlob := blob("later external work\n")
 	laterPending := blob("pending changed by later commit\n")
 	unownedBlob := blob("unowned target work\n")
+	priorOld := blob("prior repair old\n")
+	priorFinal := blob("prior repair final\n")
 
 	preRepair := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "pre-repair",
 		git.RegularFileMode+" "+pendingOld+"\tpending.txt",
-		git.RegularFileMode+" "+restoredOld+"\trestored.txt")
+		git.RegularFileMode+" "+restoredOld+"\trestored.txt",
+		git.RegularFileMode+" "+priorOld+"\tprior.txt")
 	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, preRepair, f.cctx.BaseHead); err != nil {
 		t.Fatalf("install pre-repair head: %v", err)
 	}
 	f.cctx.BaseHead = preRepair
+	repairEvents := make([]int64, 0, 3)
+	repairCommits := make(map[int64]string)
+	if opts.includePriorRepair {
+		priorEvent := appendRecoveryEvent(t, ctx, f, preRepair, state.CaptureOp{
+			Op: "modify", Path: "prior.txt",
+			BeforeOID: oidValue(priorOld), BeforeMode: oidValue(git.RegularFileMode),
+			AfterOID: oidValue(priorFinal), AfterMode: oidValue(git.RegularFileMode),
+		})
+		priorCommit := commitTreeWithIndexUpdates(
+			t, ctx, f, preRepair, "prior completed repair",
+			git.RegularFileMode+" "+priorFinal+"\tprior.txt")
+		if err := state.MarkEventPublished(
+			ctx, f.db, priorEvent, state.EventStatePublished,
+			oidValue(priorCommit), sql.NullString{}, sql.NullString{}, 1); err != nil {
+			t.Fatalf("mark prior repair member published: %v", err)
+		}
+		seedCompletedExternalBridgeRepair(
+			t, ctx, f, "external-prior-repair", "external-prior-candidate",
+			preRepair, priorCommit, []int64{priorEvent})
+		if err := git.UpdateRef(
+			ctx, f.dir, f.cctx.BranchRef, priorCommit, preRepair); err != nil {
+			t.Fatalf("install prior repair head: %v", err)
+		}
+		preRepair = priorCommit
+		f.cctx.BaseHead = priorCommit
+		repairEvents = append(repairEvents, priorEvent)
+		repairCommits[priorEvent] = priorCommit
+	}
 
 	repairPending := appendRecoveryEvent(t, ctx, f, preRepair, state.CaptureOp{
 		Op: "modify", Path: "pending.txt",
@@ -229,17 +329,39 @@ func newExternalRepairBridgeFixture(
 		}
 	}
 	seedCompletedExternalBridgeRepair(
-		t, ctx, f, preRepair, repairCommit,
+		t, ctx, f, "external-repair-bridge", "external-repair-candidate",
+		preRepair, repairCommit,
 		[]int64{repairPending, repairRestored})
+	if err := git.UpdateRef(
+		ctx, f.dir, f.cctx.BranchRef, repairCommit, preRepair); err != nil {
+		t.Fatalf("install repair head: %v", err)
+	}
+	repairEvents = append(repairEvents, repairPending, repairRestored)
+	repairCommits[repairPending] = repairCommit
+	repairCommits[repairRestored] = repairCommit
+	publishedSuffix := appendRecoveryEvent(t, ctx, f, repairCommit, state.CaptureOp{
+		Op: "create", Path: "published.txt",
+		AfterOID: oidValue(publishedFinal), AfterMode: oidValue(git.RegularFileMode),
+	})
 
 	// Reproduce the stale-index publication: the commit descends from the
 	// repaired head but writes the pre-repair entries back into its tree.
-	source := commitTreeWithIndexUpdates(t, ctx, f, repairCommit, "stale source",
-		git.RegularFileMode+" "+pendingOld+"\tpending.txt",
-		git.RegularFileMode+" "+restoredOld+"\trestored.txt")
-	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, source, preRepair); err != nil {
+	sourceUpdates := []string{
+		git.RegularFileMode + " " + pendingOld + "\tpending.txt",
+		git.RegularFileMode + " " + restoredOld + "\trestored.txt",
+		git.RegularFileMode + " " + publishedFinal + "\tpublished.txt",
+	}
+	if opts.includePriorRepair {
+		sourceUpdates = append(sourceUpdates,
+			git.RegularFileMode+" "+priorOld+"\tprior.txt")
+	}
+	source := commitTreeWithIndexUpdates(
+		t, ctx, f, repairCommit, "stale source", sourceUpdates...)
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, source, repairCommit); err != nil {
 		t.Fatalf("install stale source: %v", err)
 	}
+	seedCompletedExternalBridgePublication(
+		t, ctx, f, repairCommit, source, publishedSuffix)
 	f.cctx.BaseHead = source
 
 	pendingOne := appendRecoveryEvent(t, ctx, f, source, state.CaptureOp{
@@ -257,15 +379,24 @@ func newExternalRepairBridgeFixture(
 		AfterOID: oidValue(notesFinal), AfterMode: oidValue(git.RegularFileMode),
 	})
 	pendingSeqs := []int64{pendingOne, pendingTwo, pendingNotes}
-	drainSeqs := append([]int64{repairPending, repairRestored}, pendingSeqs...)
-	seedExternalRepairBridgeDrain(t, ctx, f, source, drainSeqs, 2)
+	drainSeqs := append(append(
+		append([]int64(nil), repairEvents...), publishedSuffix), pendingSeqs...)
+	seedExternalRepairBridgeDrain(
+		t, ctx, f, source, drainSeqs, int64(len(repairEvents)+1))
 
 	targetUpdates := []string{
 		git.RegularFileMode + " " + pendingFinal + "\tpending.txt",
-		git.RegularFileMode + " " + restoredFinal + "\trestored.txt",
 		git.RegularFileMode + " " + notesFinal + "\tnotes.txt",
 	}
-	if includeUnownedPath {
+	if !opts.omitRestoredPath {
+		targetUpdates = append(targetUpdates,
+			git.RegularFileMode+" "+restoredFinal+"\trestored.txt")
+	}
+	if opts.includePriorRepair {
+		targetUpdates = append(targetUpdates,
+			git.RegularFileMode+" "+priorFinal+"\tprior.txt")
+	}
+	if opts.includeUnownedPath {
 		targetUpdates = append(targetUpdates,
 			git.RegularFileMode+" "+unownedBlob+"\tunowned.txt")
 	}
@@ -283,8 +414,59 @@ func newExternalRepairBridgeFixture(
 	return externalRepairBridgeFixture{
 		capture: f, source: source, target: target, live: live,
 		pendingSeqs: pendingSeqs, drainEventCount: len(drainSeqs),
-		repairSeqs:   []int64{repairPending, repairRestored},
-		repairCommit: repairCommit,
+		repairCommits: repairCommits,
+	}
+}
+
+func seedCompletedExternalBridgePublication(
+	t *testing.T,
+	ctx context.Context,
+	f *captureFixture,
+	sourceHead string,
+	targetHead string,
+	eventSeq int64,
+) {
+	t.Helper()
+	tree, err := git.RevParse(ctx, f.dir, targetHead+"^{tree}")
+	if err != nil {
+		t.Fatalf("resolve publication tree: %v", err)
+	}
+	members := []state.SelfPublicationMember{{EventSeq: eventSeq}}
+	digest, err := state.SelfPublicationMembershipDigest(members)
+	if err != nil {
+		t.Fatalf("publication membership digest: %v", err)
+	}
+	publication := state.SelfPublication{
+		ID: "external-repair-publication",
+		OperationID: sql.NullString{
+			String: "op-external-repair-publication", Valid: true,
+		},
+		BranchRef:        f.cctx.BranchRef,
+		BranchGeneration: f.cctx.BranchGeneration,
+		SourceHead:       sourceHead,
+		TargetCommitOID:  targetHead,
+		TargetTreeOID:    tree,
+		MembershipDigest: digest,
+		MemberCount:      len(members),
+		CreatedTS:        2,
+		Members:          members,
+		Completion: state.SelfPublicationCompletion{
+			PublishedTS: 3, CandidateStatus: state.IntentCandidatePublished,
+		},
+	}
+	if created, err := state.PrepareSelfPublication(
+		ctx, f.db, publication); err != nil || !created {
+		t.Fatalf("prepare publication=(%t,%v)", created, err)
+	}
+	if changed, err := state.MarkSelfPublicationGitApplied(
+		ctx, f.db, publication, 3); err != nil || !changed {
+		t.Fatalf("mark publication applied=(%t,%v)", changed, err)
+	}
+	if completed, err := state.CompleteSelfPublication(
+		ctx, f.db, publication, state.SelfPublicationCompletion{
+			PublishedTS: 3, CandidateStatus: state.IntentCandidatePublished,
+		}); err != nil || !completed {
+		t.Fatalf("complete publication=(%t,%v)", completed, err)
 	}
 }
 
@@ -347,20 +529,20 @@ func seedCompletedExternalBridgeRepair(
 	t *testing.T,
 	ctx context.Context,
 	f *captureFixture,
+	repairID string,
+	candidateID string,
 	oldHead string,
 	newHead string,
 	eventSeqs []int64,
 ) {
 	t.Helper()
-	const repairID = "external-repair-bridge"
-	const candidateID = "external-repair-candidate"
 	if _, err := f.db.SQL().ExecContext(ctx, `
 INSERT INTO intent_repairs(
     id,branch_ref,branch_generation,status,expected_head,plan_digest,
     backup_ref,old_head,new_head,created_ts,updated_ts,error
 ) VALUES (?, ?, ?, 'prepared', ?, 'bridge-digest', ?, ?, ?, 1, 1, '')`,
 		repairID, f.cctx.BranchRef, f.cctx.BranchGeneration,
-		oldHead, "refs/acd/intent-repair/test/external-repair-bridge/backup",
+		oldHead, "refs/acd/intent-repair/test/"+repairID+"/backup",
 		oldHead, newHead); err != nil {
 		t.Fatalf("insert repair: %v", err)
 	}
