@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // RecoverySnapshot is the durable record of one all-or-none unpublished-chain
@@ -48,13 +49,17 @@ type RecoveryChainEvent struct {
 // complete unpublished chain. Expected must be the exact same-anchor suffix
 // returned by LoadUnpublishedRecoveryChain.
 type RecoveryChainTransition struct {
-	Expected    []RecoveryChainEvent
-	TargetState string
-	CommitOID   string
-	RecoveryRef string
-	Reason      string
-	ActionTaken string
-	UserMessage string
+	Expected []RecoveryChainEvent
+	// ExpectedLater seals every unpublished row that remains after an exact
+	// frozen prefix. Branch adoption rechecks Expected || ExpectedLater in one
+	// writer transaction so a newly appended capture aborts the whole attempt.
+	ExpectedLater []RecoveryChainEvent
+	TargetState   string
+	CommitOID     string
+	RecoveryRef   string
+	Reason        string
+	ActionTaken   string
+	UserMessage   string
 	// DecisionKind preserves a narrower legacy classification when the
 	// caller has already proven it. Empty selects the outcome default.
 	DecisionKind string
@@ -68,6 +73,11 @@ type RecoveryChainTransition struct {
 	// the current unpublished suffix. Frozen publication recovery uses this to
 	// settle only its immutable target while preserving captures made later.
 	AllowLaterUnpublished bool
+	// AdoptedBranchHead makes prefix settlement, the complete replacement
+	// shadow, and branch-token metadata one SQLite commit. The caller must hold
+	// the literal branch ref at this exact OID for the duration of the call.
+	AdoptedBranchHead string
+	ShadowRows        []ShadowPath
 }
 
 // ErrRecoveryChainChanged means the unpublished suffix no longer exactly
@@ -432,7 +442,13 @@ func TransitionRecoveryChain(ctx context.Context, d *DB, req RecoveryChainTransi
 		return zero, err
 	}
 	matches := sameRecoveryChain(actual, req.Expected)
-	if req.AllowLaterUnpublished {
+	if req.AdoptedBranchHead != "" {
+		expectedAll := make([]RecoveryChainEvent, 0,
+			len(req.Expected)+len(req.ExpectedLater))
+		expectedAll = append(expectedAll, req.Expected...)
+		expectedAll = append(expectedAll, req.ExpectedLater...)
+		matches = sameRecoveryChain(actual, expectedAll)
+	} else if req.AllowLaterUnpublished {
 		matches = sameRecoveryChainPrefix(actual, req.Expected)
 	}
 	if !matches {
@@ -571,6 +587,37 @@ WHERE branch_ref = ? AND branch_generation = ?`,
 			return zero, fmt.Errorf("state: invalidate recovery shadow marker: %w", err)
 		}
 	}
+	if req.AdoptedBranchHead != "" {
+		marker := fmt.Sprintf("shadow.bootstrapped:%s:%d",
+			first.BranchRef, first.BranchGeneration)
+		if err := replaceShadowGenerationTx(
+			ctx, tx, first.BranchRef, first.BranchGeneration,
+			marker, req.ShadowRows); err != nil {
+			return zero, fmt.Errorf(
+				"state: adopt recovery shadow: %w", err)
+		}
+		const upsertMeta = `
+INSERT INTO daemon_meta(key, value, updated_ts) VALUES (?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                               updated_ts = excluded.updated_ts`
+		branchToken := "rev:" + req.AdoptedBranchHead + " " + first.BranchRef
+		meta := map[string]string{
+			selfPublicationMetaBranchGeneration: strconv.FormatInt(
+				first.BranchGeneration, 10),
+			selfPublicationMetaBranchHead:  req.AdoptedBranchHead,
+			selfPublicationMetaBranchToken: branchToken,
+			"branch_token_changed_at": strconv.FormatFloat(
+				req.TransitionTS, 'f', -1, 64),
+			"branch.transition.needs_attention": "",
+		}
+		for key, value := range meta {
+			if _, err := tx.ExecContext(
+				ctx, upsertMeta, key, value, req.TransitionTS); err != nil {
+				return zero, fmt.Errorf(
+					"state: adopt recovery branch meta %s: %w", key, err)
+			}
+		}
+	}
 
 	clearedBreadcrumb, err := clearMatchingRecoveryBreadcrumb(ctx, tx, members,
 		first.BranchRef, first.BranchGeneration, req.TargetState,
@@ -703,13 +750,31 @@ func validateRecoveryTransition(req RecoveryChainTransition) error {
 		return fmt.Errorf(
 			"state: TransitionRecoveryChain: later unpublished rows forbid shadow invalidation")
 	}
+	if len(req.ExpectedLater) > 0 && req.AdoptedBranchHead == "" {
+		return fmt.Errorf(
+			"state: TransitionRecoveryChain: sealed later rows require branch adoption")
+	}
+	if req.AdoptedBranchHead != "" {
+		if req.TargetState != EventStatePublished || req.InvalidateShadow {
+			return fmt.Errorf(
+				"state: TransitionRecoveryChain: branch adoption requires published outcome")
+		}
+		if req.AllowLaterUnpublished != (len(req.ExpectedLater) > 0) {
+			return fmt.Errorf(
+				"state: TransitionRecoveryChain: later-row adoption identity is inconsistent")
+		}
+	}
 
-	first := req.Expected[0].Event
+	expectedAll := make([]RecoveryChainEvent, 0,
+		len(req.Expected)+len(req.ExpectedLater))
+	expectedAll = append(expectedAll, req.Expected...)
+	expectedAll = append(expectedAll, req.ExpectedLater...)
+	first := expectedAll[0].Event
 	if first.BranchRef == "" || first.BranchGeneration < 1 || first.Seq < 1 {
 		return fmt.Errorf("state: TransitionRecoveryChain: invalid first event provenance")
 	}
 	prevSeq := int64(0)
-	for i, expected := range req.Expected {
+	for i, expected := range expectedAll {
 		ev := expected.Event
 		if ev.Seq <= prevSeq {
 			return fmt.Errorf("state: TransitionRecoveryChain: event seqs not strictly increasing at index %d", i)
@@ -731,6 +796,21 @@ func validateRecoveryTransition(req RecoveryChainTransition) error {
 			}
 		}
 		prevSeq = ev.Seq
+	}
+	if req.AdoptedBranchHead != "" {
+		marker := fmt.Sprintf("shadow.bootstrapped:%s:%d",
+			first.BranchRef, first.BranchGeneration)
+		if err := validateShadowReplacement(
+			first.BranchRef, first.BranchGeneration,
+			marker, req.ShadowRows); err != nil {
+			return err
+		}
+		for i, row := range req.ShadowRows {
+			if row.BaseHead != req.AdoptedBranchHead {
+				return fmt.Errorf(
+					"state: TransitionRecoveryChain: shadow row %d has stale base", i)
+			}
+		}
 	}
 	return nil
 }
