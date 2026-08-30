@@ -1252,8 +1252,20 @@ func UpdatePublicationDrainAfterReplay(
 		update.LastError = replayErr.Error()
 		var exhausted *IntentSemanticFallbackRequiredError
 		var preflight *IntentPlanPreflightError
-		if errors.As(replayErr, &exhausted) ||
-			errors.As(replayErr, &preflight) {
+		exhaustedSemanticFallback := errors.As(replayErr, &exhausted)
+		preflightFailed := errors.As(replayErr, &preflight)
+		if preflightFailed &&
+			drain.Phase == state.PublicationDrainEventFallback &&
+			drain.FallbackMode == publicationFallbackLocalUnlock &&
+			drain.LastError == update.LastError {
+			// Semantic normalization and the deterministic local unlock have
+			// both failed against the same frozen evidence. Retrying that exact
+			// preflight cannot make progress, so stop at the durable safety
+			// barrier instead of turning every worker wake into another pass.
+			update.Phase = state.PublicationDrainNeedsAction
+			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+		}
+		if exhaustedSemanticFallback || preflightFailed {
 			if drain.Phase == state.PublicationDrainSemantic {
 				update.Phase = state.PublicationDrainNormalizing
 				update.SemanticRebuildAttempts++

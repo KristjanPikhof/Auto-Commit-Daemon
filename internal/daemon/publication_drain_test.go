@@ -1210,6 +1210,36 @@ SELECT attempt_count FROM intent_plan_runs WHERE fingerprint=?`,
 	}
 }
 
+func TestPublicationDrainRepeatedLocalPreflightNeedsAction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 2, 2)
+	preflight := &IntentPlanPreflightError{
+		Failure: "modify before-state mismatch for feature.go",
+	}
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainEventFallback
+	update.EventFallbackCount = 1
+	update.FallbackMode = publicationFallbackLocalUnlock
+	update.LastError = preflight.Error()
+	drain, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocked, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, ReplaySummary{}, preflight,
+		time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Phase != state.PublicationDrainNeedsAction ||
+		blocked.EventFallbackCount != drain.EventFallbackCount ||
+		blocked.LastError != preflight.Error() {
+		t.Fatalf("blocked=%+v", blocked)
+	}
+}
+
 func TestPublicationDrainTerminalBarrierNeedsAction(t *testing.T) {
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 1, 1)
