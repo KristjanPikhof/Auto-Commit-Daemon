@@ -252,110 +252,98 @@ func ReseedShadowFromHead(ctx context.Context, repoDir string, db *state.DB, cct
 	return BootstrapShadow(ctx, repoDir, db, cctx)
 }
 
-// ReseedShadowFromHeadPreservingUnpublished builds a fresh shadow from HEAD,
-// then overlays only paths represented by the remaining unpublished capture
-// chain. This absorbs unrelated external commits without forgetting dirty work
-// that ACD already captured behind a frozen publication target.
-func ReseedShadowFromHeadPreservingUnpublished(
+// BuildShadowFromHeadPreservingUnpublished builds a fresh HEAD snapshot and
+// overlays the terminal state proved by an exact unpublished chain. It is
+// read-only: callers commit the returned rows with the lifecycle transition
+// that made the new HEAD authoritative.
+func BuildShadowFromHeadPreservingUnpublished(
 	ctx context.Context,
 	repoDir string,
-	db *state.DB,
 	cctx CaptureContext,
 	chain []state.RecoveryChainEvent,
-) (int, error) {
-	if db == nil || cctx.BranchRef == "" || cctx.BranchGeneration < 1 ||
-		cctx.BaseHead == "" || len(chain) == 0 {
-		return 0, fmt.Errorf(
+) ([]state.ShadowPath, error) {
+	if cctx.BranchRef == "" || cctx.BranchGeneration < 1 ||
+		cctx.BaseHead == "" {
+		return nil, fmt.Errorf(
 			"daemon: preserve unpublished shadow: invalid recovery context")
 	}
-	touched := make(map[string]struct{})
-	addPath := func(path string) error {
+	type terminalPath struct {
+		present bool
+		op      state.CaptureOp
+	}
+	terminal := make(map[string]terminalPath)
+	setTerminal := func(path string, value terminalPath) error {
 		if path == "" {
-			return nil
+			return fmt.Errorf("daemon: preserve unpublished shadow: empty operation path")
 		}
-		touched[path] = struct{}{}
-		if len(touched) > maxPreservedShadowPaths {
+		terminal[path] = value
+		if len(terminal) > maxPreservedShadowPaths {
 			return fmt.Errorf(
 				"daemon: preserve unpublished shadow: path limit exceeds %d",
 				maxPreservedShadowPaths)
 		}
 		return nil
 	}
+	prevSeq := int64(0)
 	for _, item := range chain {
 		if item.Event.BranchRef != cctx.BranchRef ||
-			item.Event.BranchGeneration != cctx.BranchGeneration {
-			return 0, fmt.Errorf(
+			item.Event.BranchGeneration != cctx.BranchGeneration ||
+			item.Event.Seq <= prevSeq {
+			return nil, fmt.Errorf(
 				"daemon: preserve unpublished shadow: capture %d changed branch identity",
 				item.Event.Seq)
 		}
+		prevSeq = item.Event.Seq
 		switch item.Event.State {
 		case state.EventStatePending, state.EventStateBlockedConflict,
 			state.EventStateFailed:
 		default:
-			return 0, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"daemon: preserve unpublished shadow: capture %d is %s",
 				item.Event.Seq, item.Event.State)
 		}
-		if err := addPath(item.Event.Path); err != nil {
-			return 0, err
-		}
-		if item.Event.OldPath.Valid {
-			if err := addPath(item.Event.OldPath.String); err != nil {
-				return 0, err
-			}
+		if len(item.Ops) == 0 || validateOps(item.Ops) != "" {
+			return nil, fmt.Errorf(
+				"daemon: preserve unpublished shadow: capture %d has invalid operations",
+				item.Event.Seq)
 		}
 		for _, op := range item.Ops {
-			if err := addPath(op.Path); err != nil {
-				return 0, err
-			}
-			if op.OldPath.Valid {
-				if err := addPath(op.OldPath.String); err != nil {
-					return 0, err
+			switch op.Op {
+			case "create", "modify", "mode":
+				if err := setTerminal(op.Path,
+					terminalPath{present: true, op: op}); err != nil {
+					return nil, err
 				}
+			case "delete":
+				if err := setTerminal(op.Path,
+					terminalPath{op: op}); err != nil {
+					return nil, err
+				}
+			case "rename":
+				if !op.OldPath.Valid || op.OldPath.String == "" {
+					return nil, fmt.Errorf(
+						"daemon: preserve unpublished shadow: rename lacks source")
+				}
+				if err := setTerminal(op.OldPath.String,
+					terminalPath{op: op}); err != nil {
+					return nil, err
+				}
+				if err := setTerminal(op.Path,
+					terminalPath{present: true, op: op}); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, fmt.Errorf(
+					"daemon: preserve unpublished shadow: unknown operation %q", op.Op)
 			}
 		}
-	}
-
-	retained := make(map[string]state.ShadowPath, len(touched))
-	rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT branch_ref, branch_generation, path, operation, mode, oid,
-       old_path, base_head, fidelity, updated_ts
-FROM shadow_paths
-WHERE branch_ref = ? AND branch_generation = ?`,
-		cctx.BranchRef, cctx.BranchGeneration)
-	if err != nil {
-		return 0, fmt.Errorf("daemon: preserve unpublished shadow: query current rows: %w", err)
-	}
-	for rows.Next() {
-		var row state.ShadowPath
-		if err := rows.Scan(
-			&row.BranchRef, &row.BranchGeneration, &row.Path, &row.Operation,
-			&row.Mode, &row.OID, &row.OldPath, &row.BaseHead, &row.Fidelity,
-			&row.UpdatedTS); err != nil {
-			_ = rows.Close()
-			return 0, fmt.Errorf(
-				"daemon: preserve unpublished shadow: scan current row: %w", err)
-		}
-		if _, keep := touched[row.Path]; keep {
-			row.BaseHead = cctx.BaseHead
-			retained[row.Path] = row
-		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return 0, fmt.Errorf(
-			"daemon: preserve unpublished shadow: iterate current rows: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return 0, fmt.Errorf(
-			"daemon: preserve unpublished shadow: close current rows: %w", err)
 	}
 
 	entries, err := git.LsTree(ctx, repoDir, cctx.BaseHead, true)
 	if err != nil {
-		return 0, fmt.Errorf("daemon: preserve unpublished shadow: ls-tree HEAD: %w", err)
+		return nil, fmt.Errorf("daemon: preserve unpublished shadow: ls-tree HEAD: %w", err)
 	}
-	merged := make(map[string]state.ShadowPath, len(entries)+len(retained))
+	merged := make(map[string]state.ShadowPath, len(entries)+len(terminal))
 	for _, entry := range entries {
 		if entry.Mode == "160000" || entry.Type != "blob" {
 			continue
@@ -371,10 +359,24 @@ WHERE branch_ref = ? AND branch_generation = ?`,
 			Fidelity:         "full",
 		}
 	}
-	for path := range touched {
+	for path, expected := range terminal {
 		delete(merged, path)
-		if row, ok := retained[path]; ok {
-			merged[path] = row
+		if expected.present {
+			oldPath := sql.NullString{}
+			if expected.op.Op == "rename" {
+				oldPath = expected.op.OldPath
+			}
+			merged[path] = state.ShadowPath{
+				BranchRef:        cctx.BranchRef,
+				BranchGeneration: cctx.BranchGeneration,
+				Path:             path,
+				Operation:        expected.op.Op,
+				Mode:             expected.op.AfterMode,
+				OID:              expected.op.AfterOID,
+				OldPath:          oldPath,
+				BaseHead:         cctx.BaseHead,
+				Fidelity:         expected.op.Fidelity,
+			}
 		}
 	}
 	paths := make([]string, 0, len(merged))
@@ -386,9 +388,24 @@ WHERE branch_ref = ? AND branch_generation = ?`,
 	for _, path := range paths {
 		mergedRows = append(mergedRows, merged[path])
 	}
+	return mergedRows, nil
+}
+
+func ReseedShadowFromHeadPreservingUnpublished(
+	ctx context.Context,
+	repoDir string,
+	db *state.DB,
+	cctx CaptureContext,
+	chain []state.RecoveryChainEvent,
+) (int, error) {
+	rows, err := BuildShadowFromHeadPreservingUnpublished(
+		ctx, repoDir, cctx, chain)
+	if err != nil {
+		return 0, err
+	}
 	return state.ReplaceShadowGeneration(
 		ctx, db, cctx.BranchRef, cctx.BranchGeneration,
-		ShadowBootstrappedKey(cctx.BranchRef, cctx.BranchGeneration), mergedRows)
+		ShadowBootstrappedKey(cctx.BranchRef, cctx.BranchGeneration), rows)
 }
 
 func setShadowBootstrappedMarker(ctx context.Context, db *state.DB, cctx CaptureContext) error {
