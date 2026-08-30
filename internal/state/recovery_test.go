@@ -253,6 +253,44 @@ func TestRecoveryChainTransitionPublishedAtomic(t *testing.T) {
 	assertRecoveryBookkeeping(t, d, snapshot, chain, DecisionKindRecoveryPublished)
 }
 
+func TestRecoveryChainTransitionPublishedPrefixPreservesLaterCapture(t *testing.T) {
+	t.Parallel()
+	d, chain := seedRecoveryTestChain(t)
+	ctx := context.Background()
+	later := appendRecoveryTestEvent(
+		t, ctx, d, chain[0].Event.BranchRef,
+		chain[0].Event.BranchGeneration,
+		"later-base", "later.txt", EventStatePending)
+
+	snapshot, err := TransitionRecoveryChain(ctx, d, RecoveryChainTransition{
+		Expected:              chain,
+		TargetState:           EventStatePublished,
+		CommitOID:             "frozen-external-target",
+		RecoveryRef:           "refs/acd/recovery/frozen-prefix",
+		Reason:                "settle frozen target only",
+		TransitionTS:          42,
+		AllowLaterUnpublished: true,
+	})
+	if err != nil {
+		t.Fatalf("TransitionRecoveryChain prefix: %v", err)
+	}
+	if snapshot.EventCount != len(chain) {
+		t.Fatalf("snapshot=%+v want %d frozen events", snapshot, len(chain))
+	}
+	assertRecoveryTransitionState(
+		t, d, chain, EventStatePublished, "frozen-external-target")
+	var laterState string
+	var laterCommit sql.NullString
+	if err := d.ReadSQL().QueryRowContext(ctx, `
+SELECT state,commit_oid FROM capture_events WHERE seq=?`, later).Scan(
+		&laterState, &laterCommit); err != nil {
+		t.Fatalf("load later capture: %v", err)
+	}
+	if laterState != EventStatePending || laterCommit.Valid {
+		t.Fatalf("later capture state=%q commit=%v want pending", laterState, laterCommit)
+	}
+}
+
 func TestRecoveryChainTransitionRecoveredIsNonBarrier(t *testing.T) {
 	t.Parallel()
 	d, chain := seedRecoveryTestChain(t)

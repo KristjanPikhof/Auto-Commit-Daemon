@@ -64,6 +64,10 @@ type RecoveryChainTransition struct {
 	// so the run loop reseeds HEAD and captures the still-dirty worktree again.
 	// Branch-transition callers leave it false and own their generation reseed.
 	InvalidateShadow bool
+	// AllowLaterUnpublished permits Expected to be an exact leading prefix of
+	// the current unpublished suffix. Frozen publication recovery uses this to
+	// settle only its immutable target while preserving captures made later.
+	AllowLaterUnpublished bool
 }
 
 // ErrRecoveryChainChanged means the unpublished suffix no longer exactly
@@ -427,7 +431,11 @@ func TransitionRecoveryChain(ctx context.Context, d *DB, req RecoveryChainTransi
 	if err != nil {
 		return zero, err
 	}
-	if !sameRecoveryChain(actual, req.Expected) {
+	matches := sameRecoveryChain(actual, req.Expected)
+	if req.AllowLaterUnpublished {
+		matches = sameRecoveryChainPrefix(actual, req.Expected)
+	}
+	if !matches {
 		return zero, ErrRecoveryChainChanged
 	}
 
@@ -687,6 +695,14 @@ func validateRecoveryTransition(req RecoveryChainTransition) error {
 	if req.InvalidateShadow && req.TargetState != EventStateRecovered {
 		return fmt.Errorf("state: TransitionRecoveryChain: shadow invalidation requires recovered outcome")
 	}
+	if req.AllowLaterUnpublished && req.TargetState != EventStatePublished {
+		return fmt.Errorf(
+			"state: TransitionRecoveryChain: later unpublished rows require published outcome")
+	}
+	if req.AllowLaterUnpublished && req.InvalidateShadow {
+		return fmt.Errorf(
+			"state: TransitionRecoveryChain: later unpublished rows forbid shadow invalidation")
+	}
 
 	first := req.Expected[0].Event
 	if first.BranchRef == "" || first.BranchGeneration < 1 || first.Seq < 1 {
@@ -734,6 +750,11 @@ func sameRecoveryChain(actual, expected []RecoveryChainEvent) bool {
 		}
 	}
 	return true
+}
+
+func sameRecoveryChainPrefix(actual, expected []RecoveryChainEvent) bool {
+	return len(actual) >= len(expected) &&
+		sameRecoveryChain(actual[:len(expected)], expected)
 }
 
 func clearMatchingRecoveryBreadcrumb(
