@@ -760,6 +760,50 @@ FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC`
 	return out, nil
 }
 
+// LoadCaptureOpsBounded returns ordered operations without reading beyond one
+// shared proof budget. The limit sentinel is classified as invalid completed
+// transition evidence so recovery callers fail closed.
+func LoadCaptureOpsBounded(
+	ctx context.Context,
+	d *DB,
+	seq int64,
+	limit int,
+) ([]CaptureOp, error) {
+	if d == nil || seq < 1 || limit < 0 ||
+		limit > CompletedBranchTransitionProofLimit {
+		return nil, fmt.Errorf("state: LoadCaptureOpsBounded: invalid input")
+	}
+	rows, err := d.readSQL().QueryContext(ctx, `
+SELECT event_seq, ord, op, path, old_path,
+       before_oid, before_mode, after_oid, after_mode, fidelity
+FROM capture_ops WHERE event_seq = ? ORDER BY ord ASC
+LIMIT ?`, seq, limit+1)
+	if err != nil {
+		return nil, fmt.Errorf("state: query bounded capture ops: %w", err)
+	}
+	defer rows.Close()
+	var out []CaptureOp
+	for rows.Next() {
+		var op CaptureOp
+		if err := rows.Scan(
+			&op.EventSeq, &op.Ord, &op.Op, &op.Path, &op.OldPath,
+			&op.BeforeOID, &op.BeforeMode, &op.AfterOID, &op.AfterMode,
+			&op.Fidelity); err != nil {
+			return nil, fmt.Errorf("state: scan bounded capture op: %w", err)
+		}
+		out = append(out, op)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate bounded capture ops: %w", err)
+	}
+	if len(out) > limit {
+		return nil, completedBranchTransitionProofError(
+			"capture %d exceeds remaining operation evidence budget %d",
+			seq, limit)
+	}
+	return out, nil
+}
+
 // PrunePublishedEventsBefore deletes old published rows that do not belong to
 // a recovery snapshot and are not materialization context for an unresolved
 // chain. Context includes same-base prefixes, earlier rows that touch a later
