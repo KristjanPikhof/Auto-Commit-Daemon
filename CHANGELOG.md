@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+
+- Intent replay now starts from the repaired tree after a history repair and
+  rejects any generated commit tree that changes paths outside its frozen
+  captures. A later candidate can no longer put replaced file states back into
+  the branch.
+- ACD can now settle a frozen publication target left by the older replay bug
+  when the immediate external child is fully explained by one completed Intent
+  repair and the remaining frozen captures. The proof is exact, preserves newer
+  descendant commits, and never changes the live index or worktree.
+- Repeated plan preflight failures stop at `needs_action` after semantic
+  recovery and local recovery fail against the same evidence. Status now marks
+  an overdue `retrying` phase as stalled instead of reporting endless work.
+
 ## v2026-08-30
 
 ### Changed

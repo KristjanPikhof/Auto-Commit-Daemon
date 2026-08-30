@@ -191,6 +191,19 @@ An internal repair preserves ACD's live capture baseline and advances only its
 recorded base `HEAD`. Dirty paths that are still pending therefore remain
 represented once instead of being captured again after the repair.
 
+Replay also reloads its private scratch index from the repaired tree before it
+publishes another candidate. Before creating each commit, ACD verifies that the
+new tree changes only paths owned by that candidate's frozen captures.
+
+An older runtime could publish the next candidate from the tree that existed
+before a repair. ACD can settle that frozen target automatically only when the
+immediate child of the persisted branch head is explained exactly by one
+completed, frozen repair and every remaining capture in the active publication
+drain. It protects that exact child with a private proof ref and updates the
+capture ledger without moving `HEAD` or changing the index or worktree. Newer
+descendant commits are preserved but are never credited to the frozen target.
+Missing, incomplete, or ambiguous evidence stops recovery safely.
+
 If an older runtime already left repeated captures in a queue, replay compares
 each file update with the state produced so far. An exact after-state match is
 a safe no-op, so the remaining real change can continue without user cleanup.
