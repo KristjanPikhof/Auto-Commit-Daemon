@@ -233,14 +233,9 @@ func ReplaceShadowGeneration(
 	if d == nil || branchRef == "" || gen < 1 || markerKey == "" {
 		return 0, fmt.Errorf("state: ReplaceShadowGeneration: invalid selector")
 	}
-	for i := range rows {
-		row := rows[i]
-		if row.BranchRef != branchRef || row.BranchGeneration != gen ||
-			row.Path == "" || row.BaseHead == "" || row.Operation == "" ||
-			row.Fidelity == "" {
-			return 0, fmt.Errorf(
-				"state: ReplaceShadowGeneration row %d: invalid identity", i)
-		}
+	if err := validateShadowReplacement(
+		branchRef, gen, markerKey, rows); err != nil {
+		return 0, err
 	}
 
 	tx, err := d.conn.BeginTx(ctx, nil)
@@ -248,10 +243,49 @@ func ReplaceShadowGeneration(
 		return 0, fmt.Errorf("state: replace shadow generation: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := replaceShadowGenerationTx(
+		ctx, tx, branchRef, gen, markerKey, rows); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("state: replace shadow generation: commit: %w", err)
+	}
+	return len(rows), nil
+}
+
+func validateShadowReplacement(
+	branchRef string,
+	gen int64,
+	markerKey string,
+	rows []ShadowPath,
+) error {
+	if branchRef == "" || gen < 1 || markerKey == "" {
+		return fmt.Errorf("state: ReplaceShadowGeneration: invalid selector")
+	}
+	for i := range rows {
+		row := rows[i]
+		if row.BranchRef != branchRef || row.BranchGeneration != gen ||
+			row.Path == "" || row.BaseHead == "" || row.Operation == "" ||
+			row.Fidelity == "" {
+			return fmt.Errorf(
+				"state: ReplaceShadowGeneration row %d: invalid identity", i)
+		}
+	}
+	return nil
+}
+
+func replaceShadowGenerationTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	branchRef string,
+	gen int64,
+	markerKey string,
+	rows []ShadowPath,
+) error {
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM shadow_paths WHERE branch_ref = ? AND branch_generation = ?`,
 		branchRef, gen); err != nil {
-		return 0, fmt.Errorf("state: replace shadow generation rows: %w", err)
+		return fmt.Errorf("state: replace shadow generation rows: %w", err)
 	}
 	const insert = `
 INSERT INTO shadow_paths(
@@ -260,7 +294,7 @@ INSERT INTO shadow_paths(
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	stmt, err := tx.PrepareContext(ctx, insert)
 	if err != nil {
-		return 0, fmt.Errorf("state: prepare replacement shadow rows: %w", err)
+		return fmt.Errorf("state: prepare replacement shadow rows: %w", err)
 	}
 	defer stmt.Close()
 	for i := range rows {
@@ -272,7 +306,7 @@ INSERT INTO shadow_paths(
 			row.BranchRef, row.BranchGeneration, row.Path, row.Operation,
 			row.Mode, row.OID, row.OldPath, row.BaseHead, row.Fidelity,
 			row.UpdatedTS); err != nil {
-			return 0, fmt.Errorf(
+			return fmt.Errorf(
 				"state: insert replacement shadow row %d: %w", i, err)
 		}
 	}
@@ -281,12 +315,9 @@ INSERT INTO daemon_meta(key, value, updated_ts) VALUES (?, '1', ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
                                updated_ts = excluded.updated_ts`,
 		markerKey, nowSeconds()); err != nil {
-		return 0, fmt.Errorf("state: replace shadow bootstrap marker: %w", err)
+		return fmt.Errorf("state: replace shadow bootstrap marker: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("state: replace shadow generation: commit: %w", err)
-	}
-	return len(rows), nil
+	return nil
 }
 
 // PruneShadowGenerations deletes shadow rows for branch generations older than
