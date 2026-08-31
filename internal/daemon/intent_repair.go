@@ -20,6 +20,8 @@ import (
 const (
 	intentRepairBackupRetention = 7 * 24 * time.Hour
 	intentRepairBackupCap       = 50
+	intentRepairMessageReadCap  = int64(64 << 10)
+	intentRepairAuthorReadCap   = int64(16 << 10)
 )
 
 // ErrIntentRepairRecoveryProof marks durable repair evidence that cannot be
@@ -1124,6 +1126,17 @@ type intentRepairDigestCandidate struct {
 	authorOID   string
 }
 
+type intentRepairAuthorReadError struct {
+	oid string
+	err error
+}
+
+func (err *intentRepairAuthorReadError) Error() string {
+	return fmt.Sprintf("daemon: intent repair: read author identity: %v", err.err)
+}
+
+func (err *intentRepairAuthorReadError) Unwrap() error { return err.err }
+
 func intentRepairPlanDigest(
 	ctx context.Context,
 	repoRoot string,
@@ -1178,22 +1191,85 @@ func recoveredIntentRepairPlanDigest(
 			candidate.replaces = append(candidate.replaces, mappings[i].OldOID)
 			i++
 		}
-		tree, err := resolveTreeOID(ctx, repoRoot, newOID)
+		resolvedCommit, err := git.RevParse(
+			ctx, repoRoot, newOID+"^{commit}")
 		if err != nil {
-			return "", err
-		}
-		message, err := git.Run(ctx, git.RunOpts{
-			Dir: repoRoot, Timeout: git.DefaultReadTimeout,
-		}, "show", "-s", "--format=%B", newOID)
-		if err != nil {
+			if errors.Is(err, git.ErrRefNotFound) {
+				return "", intentRepairRecoveryProofError(
+					"repair %s mapped commit %s is missing or invalid",
+					repair.ID, newOID)
+			}
 			return "", fmt.Errorf(
+				"daemon: recover intent repair: resolve rebuilt commit: %w", err)
+		}
+		if resolvedCommit != newOID {
+			return "", intentRepairRecoveryProofError(
+				"repair %s mapping %s does not name a commit directly",
+				repair.ID, newOID)
+		}
+		tree, err := git.RevParse(ctx, repoRoot, newOID+"^{tree}")
+		if err != nil {
+			if errors.Is(err, git.ErrRefNotFound) {
+				return "", intentRepairRecoveryProofError(
+					"repair %s mapped commit %s has no valid tree",
+					repair.ID, newOID)
+			}
+			return "", fmt.Errorf(
+				"daemon: recover intent repair: resolve rebuilt tree: %w", err)
+		}
+		message, err := git.RunWithLimit(ctx, git.RunOpts{
+			Dir: repoRoot, Timeout: git.DefaultReadTimeout,
+		}, intentRepairMessageReadCap,
+			"show", "-s", "--format=%B", newOID)
+		if err != nil {
+			if errors.Is(err, git.ErrStdoutOverflow) {
+				return "", intentRepairRecoveryProofError(
+					"repair %s rebuilt commit message exceeds %d bytes",
+					repair.ID, intentRepairMessageReadCap)
+			}
+			readErr := fmt.Errorf(
 				"daemon: recover intent repair: read rebuilt message: %w", err)
+			return "", classifyRecoveredIntentRepairMetadataError(
+				ctx, repoRoot, repair.ID, newOID, "message", readErr)
 		}
 		candidate.treeOID = tree
 		candidate.message = string(message)
 		candidates = append(candidates, candidate)
 	}
-	return hashIntentRepairCandidates(ctx, repoRoot, candidates)
+	digest, err := hashIntentRepairCandidates(ctx, repoRoot, candidates)
+	if errors.Is(err, git.ErrStdoutOverflow) {
+		return "", intentRepairRecoveryProofError(
+			"repair %s rebuilt author identity exceeds %d bytes",
+			repair.ID, intentRepairAuthorReadCap)
+	}
+	var authorErr *intentRepairAuthorReadError
+	if errors.As(err, &authorErr) {
+		err = classifyRecoveredIntentRepairMetadataError(
+			ctx, repoRoot, repair.ID, authorErr.oid,
+			"author", err)
+	}
+	return digest, err
+}
+
+func classifyRecoveredIntentRepairMetadataError(
+	ctx context.Context,
+	repoRoot string,
+	repairID string,
+	commitOID string,
+	evidence string,
+	readErr error,
+) error {
+	if errors.Is(readErr, context.Canceled) ||
+		errors.Is(readErr, context.DeadlineExceeded) {
+		return readErr
+	}
+	_, err := git.RevParse(ctx, repoRoot, commitOID+"^{commit}")
+	if errors.Is(err, git.ErrRefNotFound) {
+		return intentRepairRecoveryProofError(
+			"repair %s mapped commit %s has missing or invalid %s evidence",
+			repairID, commitOID, evidence)
+	}
+	return readErr
 }
 
 func hashIntentRepairCandidates(
@@ -1215,11 +1291,15 @@ func hashIntentRepairCandidates(
 	}
 	writeField(version)
 	for _, candidate := range candidates {
-		author, err := git.Run(ctx, git.RunOpts{
+		author, err := git.RunWithLimit(ctx, git.RunOpts{
 			Dir: repoRoot, Timeout: git.DefaultReadTimeout,
-		}, "show", "-s", "--format=%an%x00%ae%x00%aI", candidate.authorOID)
+		}, intentRepairAuthorReadCap,
+			"show", "-s", "--format=%an%x00%ae%x00%aI", candidate.authorOID)
 		if err != nil {
-			return "", fmt.Errorf("daemon: intent repair: read author identity: %w", err)
+			return "", &intentRepairAuthorReadError{
+				oid: candidate.authorOID,
+				err: err,
+			}
 		}
 		writeField(candidate.candidateID)
 		eventSeqs := append([]int64(nil), candidate.eventSeqs...)
