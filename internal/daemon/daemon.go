@@ -305,6 +305,9 @@ type Options struct {
 	// branchGenerationToken is a test-only resolver seam for publication
 	// adoption and transition retry coverage.
 	branchGenerationToken func(context.Context, string) (string, error)
+	// afterExternalRepairBridgeAdoption is a test-only synchronization point
+	// after atomic bridge state is adopted and before the pass reaches capture.
+	afterExternalRepairBridgeAdoption func(CaptureContext)
 	// beforeStartupDeadBranchPairSafetyCheck is a test-only synchronization
 	// point immediately before a startup dead-branch pair's final safety gate.
 	// The sweep-owned context lets blocking tests release on daemon shutdown.
@@ -1077,10 +1080,8 @@ func Run(ctx context.Context, opts Options) error {
 	startupTransition := TokenTransitionUnchanged
 	startupChangedAt := ""
 	startupShadowMutated := false
-	startupShadowPreserved := false
-	var startupPreservedShadowChain []state.RecoveryChainEvent
 	startupShadowRefreshRequired := false
-	startupShadowPreserveRefreshRequired := false
+	startupAtomicAdopted := false
 	if persistedHead != "" && currentToken != "" {
 		prevToken := "rev:" + persistedHead
 		if persistedToken, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyBranchToken); err != nil {
@@ -1171,27 +1172,29 @@ func Run(ctx context.Context, opts Options) error {
 					"outcome", result.Outcome,
 					"events", result.EventCount,
 					"recovery_ref", result.RecoveryRef)
-				if result.Outcome == state.EventStatePublished {
-					firstSeq, hasLater, findErr := firstUnpublishedRecoverySeq(
-						ctx, opts.DB, tokenBranchRef(prevToken), persistedGen)
-					if findErr != nil {
-						logger.Warn("inspect captures left after startup branch reconciliation; will retry",
-							"err", findErr.Error())
-						branchTransitionBlocked = true
-					} else if hasLater {
-						startupPreservedShadowChain, findErr =
-							state.LoadUnpublishedRecoveryChain(
-								ctx, opts.DB, tokenBranchRef(prevToken),
-								persistedGen, firstSeq)
-						if findErr != nil {
-							logger.Warn("load captures left after startup branch reconciliation; will retry",
-								"err", findErr.Error())
-							branchTransitionBlocked = true
-						}
+				if result.AcceptedHead != "" {
+					acceptedToken := branchTokenRev(
+						result.AcceptedHead, tokenBranchRef(prevToken))
+					persistedHead = result.AcceptedHead
+					currentToken = acceptedToken
+					branchRef = tokenBranchRef(acceptedToken)
+					headOID = result.AcceptedHead
+					prevToken = acceptedToken
+					transition = TokenTransitionUnchanged
+					startupTransition = TokenTransitionUnchanged
+					startupAtomicAdopted = true
+					if opts.afterExternalRepairBridgeAdoption != nil {
+						opts.afterExternalRepairBridgeAdoption(CaptureContext{
+							BranchRef:        branchRef,
+							BranchGeneration: persistedGen,
+							BaseHead:         result.AcceptedHead,
+						})
 					}
+					logger.Info("adopted repaired publication bridge at startup",
+						"head", result.AcceptedHead)
 				}
 			}
-			if !branchTransitionBlocked {
+			if !branchTransitionBlocked && !startupAtomicAdopted {
 				verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 				if verifyErr != nil {
 					logger.Warn("verify startup branch token after reconciliation; will retry",
@@ -1237,26 +1240,17 @@ func Run(ctx context.Context, opts Options) error {
 	logContext.SetBranch(cctx.BranchRef, cctx.BranchGeneration)
 	// Seed shadow_paths from HEAD before the first capture so files
 	// already at HEAD don't generate spurious creates.
-	if !branchTransitionBlocked && cctx.BranchRef != "" && cctx.BaseHead != "" {
+	if !branchTransitionBlocked && !startupAtomicAdopted &&
+		cctx.BranchRef != "" && cctx.BaseHead != "" {
 		seedShadow := BootstrapShadow
 		seedReason := "startup shadow bootstrap"
 		if startupTokenChanged {
 			seedReason = "startup branch transition shadow reseed"
 		}
-		var seeded int
-		var seedErr error
-		if startupTokenChanged && len(startupPreservedShadowChain) > 0 {
-			seeded, seedErr = ReseedShadowFromHeadPreservingUnpublished(
-				ctx, opts.RepoPath, opts.DB, cctx,
-				startupPreservedShadowChain)
-			seedReason = "startup branch transition preserved later captures"
-			startupShadowPreserved = seedErr == nil
-		} else {
-			if startupTokenChanged {
-				seedShadow = ReseedShadowFromHead
-			}
-			seeded, seedErr = seedShadow(ctx, opts.RepoPath, opts.DB, cctx)
+		if startupTokenChanged {
+			seedShadow = ReseedShadowFromHead
 		}
+		seeded, seedErr := seedShadow(ctx, opts.RepoPath, opts.DB, cctx)
 		startupShadowMutated = startupTokenChanged && seedErr == nil
 		if seedErr != nil {
 			logger.Warn("bootstrap shadow", "err", seedErr.Error())
@@ -1269,7 +1263,7 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 	}
-	if !branchTransitionBlocked {
+	if !branchTransitionBlocked && !startupAtomicAdopted {
 		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
 			logger.Warn("verify startup branch token before metadata accept; will retry",
@@ -1281,7 +1275,7 @@ func Run(ctx context.Context, opts Options) error {
 			branchTransitionBlocked = true
 		}
 	}
-	if !branchTransitionBlocked {
+	if !branchTransitionBlocked && !startupAtomicAdopted {
 		meta := map[string]string{
 			MetaKeyBranchGeneration:               strconv.FormatInt(cctx.BranchGeneration, 10),
 			MetaKeyBranchHead:                     cctx.BaseHead,
@@ -1313,23 +1307,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}
 	if branchTransitionBlocked && startupPreviousToken != "" {
-		if startupShadowPreserved && cctx.BranchRef != "" {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			oldCctx := CaptureContext{
-				BranchRef:        tokenBranchRef(startupPreviousToken),
-				BranchGeneration: startupPreviousGeneration,
-				BaseHead:         tokenSHA(startupPreviousToken),
-			}
-			_, cleanupErr := ReseedShadowFromHeadPreservingUnpublished(
-				cleanupCtx, opts.RepoPath, opts.DB, oldCctx,
-				startupPreservedShadowChain)
-			cleanupCancel()
-			if cleanupErr != nil {
-				logger.Warn("restore startup shadow with later captures; will retry",
-					"err", cleanupErr.Error())
-				startupShadowPreserveRefreshRequired = true
-			}
-		} else if startupShadowMutated && cctx.BranchRef != "" {
+		if startupShadowMutated && cctx.BranchRef != "" {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			cleanupErr := state.InvalidateShadowGeneration(cleanupCtx, opts.DB,
 				cctx.BranchRef, cctx.BranchGeneration,
@@ -1391,7 +1369,13 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 	}
-	if !branchTransitionBlocked && cctx.BranchRef != "" && cctx.BaseHead != "" {
+	// Atomic bridge adoption locks the literal branch ref, not symbolic HEAD.
+	// Carry the runtime resample gate across startup so a branch switch after
+	// lock release cannot make live-index repair or protection use the adopted
+	// context before HEAD is sampled again.
+	deferProtectionUntilBranchResample := startupAtomicAdopted
+	if !branchTransitionBlocked && !deferProtectionUntilBranchResample &&
+		cctx.BranchRef != "" && cctx.BaseHead != "" {
 		if repaired, err := RepairPublishedLiveIndex(ctx, opts.RepoPath, opts.DB, cctx.BaseHead, DefaultLiveIndexRepairLimit); err != nil {
 			logger.Warn("repair published live index", "err", err.Error())
 		} else if repaired.Applied > 0 || len(repaired.Skipped) > 0 {
@@ -1636,10 +1620,6 @@ func Run(ctx context.Context, opts Options) error {
 	lastStampedBranchHead := persistedHead
 	var branchTransitionSettleUntil time.Time
 	forceShadowRefresh := startupShadowRefreshRequired
-	var forceShadowPreserving []state.RecoveryChainEvent
-	if startupShadowPreserveRefreshRequired {
-		forceShadowPreserving = startupPreservedShadowChain
-	}
 	pendingInternalTransitionTarget := ""
 
 	adoptInternalTransitionTarget := func(targetOID, observedToken string) error {
@@ -1789,8 +1769,13 @@ func Run(ctx context.Context, opts Options) error {
 			// exact internal transition in progress. Fail closed until HEAD
 			// can be sampled again; otherwise capture/replay would run against
 			// the pre-publication cctx and strand new work on a stale base.
-			return pendingInternalTransitionTarget != ""
+			return pendingInternalTransitionTarget != "" ||
+				deferProtectionUntilBranchResample
 		}
+		// A successful token sample closes any identity gap left by atomic
+		// bridge adoption. Keep the gate set across passes that skip this
+		// function (for example, an active Git operation or manual pause).
+		deferProtectionUntilBranchResample = false
 		if pendingInternalTransitionTarget != "" {
 			if tokenSHA(newToken) == pendingInternalTransitionTarget &&
 				tokenBranchRef(newToken) == cctx.BranchRef {
@@ -1809,22 +1794,6 @@ func Run(ctx context.Context, opts Options) error {
 			pendingInternalTransitionTarget = ""
 		}
 		if SameGeneration(currentToken, newToken) {
-			if len(forceShadowPreserving) > 0 && cctx.BranchRef != "" {
-				if seeded, seedErr := ReseedShadowFromHeadPreservingUnpublished(
-					ctx, opts.RepoPath, opts.DB, cctx,
-					forceShadowPreserving); seedErr != nil {
-					logger.Warn(logPrefix+" refresh shadow while preserving later captures",
-						"err", seedErr.Error())
-					return true
-				} else {
-					forceShadowPreserving = nil
-					forceShadowRefresh = false
-					traceBootstrapShadow(tracer, opts.RepoPath, cctx,
-						traceSeedDecision(seeded),
-						"rolled-back transition preserved later captures", seeded)
-					return true
-				}
-			}
 			if forceShadowRefresh && cctx.BranchRef != "" {
 				if seeded, seedErr := ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx); seedErr != nil {
 					logger.Warn(logPrefix+" refresh shadow after rolled-back transition",
@@ -2033,24 +2002,29 @@ func Run(ctx context.Context, opts Options) error {
 				"events", result.EventCount,
 				"recovery_ref", result.RecoveryRef)
 		}
-		var preservedShadowChain []state.RecoveryChainEvent
-		if result.Handled && result.Outcome == state.EventStatePublished {
-			firstSeq, hasLater, findErr := firstUnpublishedRecoverySeq(
-				ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
-			if findErr != nil {
-				logger.Warn(logPrefix+" inspect captures left after branch reconciliation; will retry",
-					"err", findErr.Error())
-				return true
+		if result.AcceptedHead != "" {
+			acceptedToken := branchTokenRev(result.AcceptedHead, cctx.BranchRef)
+			cctx.BaseHead = result.AcceptedHead
+			currentToken = acceptedToken
+			headOID = result.AcceptedHead
+			lastStampedBranchHead = result.AcceptedHead
+			// The atomic replacement supersedes any refresh left over from a
+			// previously rolled-back prospective transition.
+			forceShadowRefresh = false
+			branchTransitionSettleUntil = now().Add(branchTransitionSettleDelay)
+			logContext.SetBranch(cctx.BranchRef, cctx.BranchGeneration)
+			// The bridge locks and verifies the literal branch ref, but HEAD is
+			// a separate symbolic ref that can switch as the cross-store adoption
+			// finishes. Do not stamp a protection checkpoint with this adopted
+			// context in the same pass. The next pass samples the branch token
+			// before any worktree scan or checkpoint can run.
+			deferProtectionUntilBranchResample = true
+			if opts.afterExternalRepairBridgeAdoption != nil {
+				opts.afterExternalRepairBridgeAdoption(cctx)
 			}
-			if hasLater {
-				preservedShadowChain, findErr = state.LoadUnpublishedRecoveryChain(
-					ctx, opts.DB, cctx.BranchRef, cctx.BranchGeneration, firstSeq)
-				if findErr != nil {
-					logger.Warn(logPrefix+" load captures left after branch reconciliation; will retry",
-						"err", findErr.Error())
-					return true
-				}
-			}
+			logger.Info("adopted repaired publication bridge",
+				"head", result.AcceptedHead)
+			return true
 		}
 		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
@@ -2069,23 +2043,10 @@ func Run(ctx context.Context, opts Options) error {
 		oldBranchRef := branchRef
 		oldHeadOID := headOID
 		prospectiveShadowMutated := false
-		prospectiveShadowPreserved := false
 		var pendingTransitionTraces []acdtrace.Event
 		rollbackTraced := false
 		rollbackTransition := func() {
-			if prospectiveShadowPreserved && oldCctx.BranchRef != "" {
-				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_, cleanupErr := ReseedShadowFromHeadPreservingUnpublished(
-					cleanupCtx, opts.RepoPath, opts.DB, oldCctx,
-					preservedShadowChain)
-				cleanupCancel()
-				if cleanupErr != nil {
-					logger.Warn(logPrefix+" restore shadow with later captures; will retry",
-						"err", cleanupErr.Error())
-					forceShadowPreserving = append(
-						[]state.RecoveryChainEvent(nil), preservedShadowChain...)
-				}
-			} else if prospectiveShadowMutated && cctx.BranchRef != "" {
+			if prospectiveShadowMutated && cctx.BranchRef != "" {
 				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 				cleanupErr := state.InvalidateShadowGeneration(cleanupCtx, opts.DB,
 					cctx.BranchRef, cctx.BranchGeneration,
@@ -2273,13 +2234,6 @@ func Run(ctx context.Context, opts Options) error {
 					"err", gErr.Error())
 			}
 			if graceActive {
-				if len(preservedShadowChain) > 0 {
-					logger.Info("branch fast-forward deferred during rewind grace to preserve later captures",
-						"old", oldToken, "new", newToken,
-						"grace_until", until)
-					rollbackTransition()
-					return true
-				}
 				prevGeneration := cctx.BranchGeneration
 				cctx.BranchGeneration++
 				pruneShadowAfterAccept = true
@@ -2363,28 +2317,14 @@ func Run(ctx context.Context, opts Options) error {
 				if cctx.BranchRef != "" {
 					var seedErr error
 					prospectiveShadowMutated = true
-					if len(preservedShadowChain) > 0 {
-						seeded, seedErr = ReseedShadowFromHeadPreservingUnpublished(
-							ctx, opts.RepoPath, opts.DB, cctx,
-							preservedShadowChain)
-						prospectiveShadowPreserved = seedErr == nil
-					} else {
-						seeded, seedErr = ReseedShadowFromHead(
-							ctx, opts.RepoPath, opts.DB, cctx)
-					}
+					seeded, seedErr = ReseedShadowFromHead(
+						ctx, opts.RepoPath, opts.DB, cctx)
 					if seedErr != nil {
 						logger.Warn("reseed shadow after branch fast-forward",
 							"err", seedErr.Error())
 						traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
 						rollbackTransition()
 						return true
-					} else if len(preservedShadowChain) > 0 {
-						traceBootstrapShadow(tracer, opts.RepoPath, cctx,
-							traceSeedDecision(seeded),
-							"fast-forward shadow rebase preserved later captures", seeded)
-						logger.Info("shadow rebased after partial branch recovery",
-							"rows", seeded,
-							"generation", cctx.BranchGeneration)
 					} else {
 						traceBootstrapShadow(tracer, opts.RepoPath, cctx,
 							traceSeedDecision(seeded), "fast-forward shadow reseed", seeded)
@@ -2507,10 +2447,24 @@ func Run(ctx context.Context, opts Options) error {
 					"err", ai.SanitizePlannerError(drainErr.Error()))
 			} else if runtimeDrain != nil {
 				frozenRuntimeDrainID = runtimeDrain.ID
-				if err := runtimeBundles.ActivatePublicationDrainRevision(
-					ctx, *runtimeDrain); err != nil {
-					logger.Warn("activate frozen publication drain runtime",
-						"err", ai.SanitizePlannerError(err.Error()))
+				if runtimeDrain.Phase == state.PublicationDrainNeedsAction &&
+					runtimeDrain.LastError ==
+						PublicationDrainSemanticMessageUnavailableReason {
+					// This exact terminal barrier cannot use its frozen provider
+					// again. Let a validated desired revision become applied so
+					// recovery can prove the replacement contract. The barrier
+					// below still prevents that runtime from replaying the frozen
+					// target before the whole suffix is preserved.
+					if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+						logger.Warn("activate desired runtime for semantic recovery; retaining last-known-good",
+							"err", ai.SanitizePlannerError(err.Error()))
+					}
+				} else {
+					if err := runtimeBundles.ActivatePublicationDrainRevision(
+						ctx, *runtimeDrain); err != nil {
+						logger.Warn("activate frozen publication drain runtime",
+							"err", ai.SanitizePlannerError(err.Error()))
+					}
 				}
 			} else {
 				if err := runtimeBundles.ActivateDesired(ctx); err != nil {
@@ -2881,11 +2835,18 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Info("publication held by transactional setup; protection remains active")
 		}
 		unsafePublication := branchTransitionBlocked || operationPaused || detachedHeadPaused || daemonPaused || publicationHeld
-		observationEpoch, observationErr := BeginProtectionObservation(passCtx, opts.DB)
-		if observationErr != nil {
+		observationEpoch := int64(0)
+		if deferProtectionUntilBranchResample {
+			logger.Info("protection deferred until repaired branch identity is resampled")
+		} else if epoch, observationErr := BeginProtectionObservation(
+			passCtx, opts.DB,
+		); observationErr != nil {
 			capErr = observationErr
+		} else {
+			observationEpoch = epoch
 		}
-		if capErr == nil && unsafePublication {
+		if capErr == nil && unsafePublication &&
+			!deferProtectionUntilBranchResample {
 			ignoreChecker.Invalidate()
 			capSum, capErr = ProtectWorktree(passCtx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:     ignoreChecker,
@@ -2899,7 +2860,8 @@ func Run(ctx context.Context, opts Options) error {
 				MaxFileBytes:      opts.MaxFileBytes,
 				ObservationEpoch:  observationEpoch,
 			})
-		} else if capErr == nil && cctx.BaseHead != "" {
+		} else if capErr == nil && cctx.BaseHead != "" &&
+			!deferProtectionUntilBranchResample {
 			// git check-ignore keeps ignore files loaded for the lifetime
 			// of its --stdin process. Refresh once per capture pass so
 			// newly-created or edited .gitignore files are honored even
@@ -2941,11 +2903,36 @@ func Run(ctx context.Context, opts Options) error {
 			// without waiting for the idle ceiling.
 			activeDrain, drainErr := PublicationDrainBarrierForPair(
 				passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
+			semanticMessageRecovered := false
 			if drainErr == nil && activeDrain != nil &&
 				activeDrain.Phase == state.PublicationDrainNeedsAction {
 				recoveredDrain, recoverErr := RecoverSupersededCandidatePublicationDrain(
 					passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
 					time.Now().UTC())
+				if recoverErr == nil && recoveredDrain == nil {
+					recoveredDrain, recoverErr = RecoverSoftDependencyCapPublicationDrain(
+						passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
+						time.Now().UTC())
+				}
+				var recoveredChain RecoveryChainResult
+				if recoverErr == nil && recoveredDrain == nil {
+					runWithProgressHeartbeat(
+						passCtx, progressHeartbeatInterval(opts), func() {
+							heartbeatNow("running", "")
+						}, func() {
+							recoveredDrain, recoveredChain, recoverErr =
+								RecoverUnavailableSemanticMessagePublicationDrain(
+									passCtx, opts.RepoPath, opts.GitDir, opts.DB,
+									*activeDrain, tracer, time.Now().UTC())
+						})
+					if recoveredDrain != nil {
+						semanticMessageRecovered = true
+						recoveryFollowup = true
+						logger.Info("preserved unavailable semantic publication for recapture",
+							"events", recoveredChain.EventCount,
+							"recovery_ref", recoveredChain.RecoveryRef)
+					}
+				}
 				if recoverErr != nil {
 					drainErr = recoverErr
 				} else if recoveredDrain != nil {
@@ -2965,6 +2952,14 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			if drainErr != nil {
 				repErr = drainErr
+			} else if semanticMessageRecovered {
+				repSum = ReplaySummary{
+					RecaptureRequired: true,
+					HasMore:           true,
+					BaseHead:          cctx.BaseHead,
+					Disposition:       ReplayDispositionProgress,
+					DispositionReason: PublicationDrainSemanticMessageUnavailableReason,
+				}
 			} else if validationErr != nil {
 				repErr = validationErr
 			} else if activeDrain != nil &&
