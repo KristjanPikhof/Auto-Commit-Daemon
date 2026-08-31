@@ -428,6 +428,7 @@ func TestFix_ForceRecoversUnreconstructibleDrainAndRecaptures(t *testing.T) {
 	for _, reason := range []string{
 		"publication_drain_runtime_contract_unavailable",
 		"publication_drain_environment_runtime_changed",
+		daemon.PublicationDrainSemanticMessageUnavailableReason,
 	} {
 		t.Run(reason, func(t *testing.T) {
 			ctx := context.Background()
@@ -529,6 +530,17 @@ UPDATE publication_drains
 SET commit_strategy='intent',commit_format='imperative',
     provider='openai-compat',provider_model='legacy-model'
 WHERE id=?`, drainID); err != nil {
+					t.Fatal(err)
+				}
+			} else if reason == daemon.PublicationDrainSemanticMessageUnavailableReason {
+				if _, err := migrated.SQL().ExecContext(ctx, `
+UPDATE publication_drains
+SET commit_strategy='intent',commit_format='imperative',
+    provider='openai-compat',provider_model='legacy-model',
+    provider_fingerprint=?,fallback_mode='local_unlock'
+WHERE id=?`,
+					"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+					drainID); err != nil {
 					t.Fatal(err)
 				}
 			}
