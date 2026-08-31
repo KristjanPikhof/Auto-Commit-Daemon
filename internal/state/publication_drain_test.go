@@ -84,6 +84,82 @@ func TestPublicationDrainPersistsFrozenMembershipAndTransitions(t *testing.T) {
 	}
 }
 
+func TestActivePublicationDrainsForPairIsExactAndBounded(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	type drainSpec struct {
+		id         string
+		branchRef  string
+		generation int64
+		phase      string
+		createdTS  float64
+	}
+	specs := []drainSpec{
+		{id: "drain-pair-1", branchRef: "refs/heads/main", generation: 7,
+			phase: PublicationDrainCheckpointing, createdTS: 1},
+		{id: "drain-pair-2", branchRef: "refs/heads/main", generation: 7,
+			phase: PublicationDrainSemantic, createdTS: 2},
+		{id: "drain-pair-3", branchRef: "refs/heads/main", generation: 7,
+			phase: PublicationDrainEventFallback, createdTS: 3},
+		{id: "drain-other-generation", branchRef: "refs/heads/main", generation: 8,
+			phase: PublicationDrainCheckpointing, createdTS: 4},
+		{id: "drain-needs-action", branchRef: "refs/heads/main", generation: 7,
+			phase: PublicationDrainNeedsAction, createdTS: 5},
+	}
+	for i, spec := range specs {
+		suffix := strings.Repeat("0", 15) + strconv.Itoa(i+1)
+		checkpoint := Checkpoint{
+			ID:               "cp-" + strconv.Itoa(1000+i) + "-" + suffix,
+			OperationID:      "op-drain-pair-" + strconv.Itoa(i+1),
+			WorktreeID:       "0123456789abcdef",
+			Reason:           CheckpointReasonManualBarrier,
+			ObservationEpoch: 1, CoverageEpoch: 1,
+			ObservedHead: "head", ObservedRef: spec.branchRef,
+			TreeOID: "tree", CommitOID: "commit", CreatedTS: spec.createdTS,
+		}
+		checkpoint.Ref = "refs/acd/checkpoints/v1/" +
+			checkpoint.WorktreeID + "/" + checkpoint.ID
+		if created, err := PrepareCheckpoint(
+			ctx, db, checkpoint, checkpointTestDigest); err != nil || !created {
+			t.Fatalf("prepare checkpoint %s=(%t,%v)", checkpoint.ID, created, err)
+		}
+		if err := CompleteCheckpoint(
+			ctx, db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID,
+			spec.createdTS); err != nil {
+			t.Fatalf("complete checkpoint %s: %v", checkpoint.ID, err)
+		}
+		drain := PublicationDrain{
+			ID: spec.id, CheckpointID: checkpoint.ID,
+			WorktreeID: checkpoint.WorktreeID, BranchRef: spec.branchRef,
+			BranchGeneration: spec.generation, Phase: PublicationDrainCompleted,
+			TargetEventCount: 0, PublishedEventCount: 0,
+			CreatedTS: spec.createdTS, UpdatedTS: spec.createdTS,
+			LastProgressTS: spec.createdTS,
+		}
+		if created, err := PreparePublicationDrain(
+			ctx, db, drain); err != nil || !created {
+			t.Fatalf("prepare drain %s=(%t,%v)", spec.id, created, err)
+		}
+	}
+	for _, spec := range specs {
+		if _, err := db.SQL().ExecContext(ctx,
+			"UPDATE publication_drains SET phase=? WHERE id=?",
+			spec.phase, spec.id); err != nil {
+			t.Fatalf("activate drain %s: %v", spec.id, err)
+		}
+	}
+
+	drains, err := ActivePublicationDrainsForPair(
+		ctx, db, "refs/heads/main", 7)
+	if err != nil {
+		t.Fatalf("ActivePublicationDrainsForPair: %v", err)
+	}
+	if len(drains) != 2 || drains[0].ID != "drain-pair-1" ||
+		drains[1].ID != "drain-pair-2" {
+		t.Fatalf("drains=%+v want first two exact active rows", drains)
+	}
+}
+
 func TestPublicationDrainFreezesEnvironmentIntentRuntime(t *testing.T) {
 	ctx := context.Background()
 	db, _ := openTestDB(t)
