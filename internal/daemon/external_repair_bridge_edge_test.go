@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +15,270 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+func TestExternalRepairBridgeRejectsRepairPlanDigestDrift(t *testing.T) {
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
+	ctx := context.Background()
+	if _, err := f.capture.db.SQL().ExecContext(ctx, `
+UPDATE intent_repairs SET plan_digest=? WHERE id='external-repair-bridge'`,
+		"sha256:"+strings.Repeat("f", 64)); err != nil {
+		t.Fatalf("drift repair plan digest: %v", err)
+	}
+
+	_, err := ProveUnpublishedChain(
+		ctx, f.capture.dir, f.capture.db,
+		externalBridgeTestRecoveryOptions(f))
+	if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+		t.Fatalf("plan digest drift err=%v want completed-transition proof error", err)
+	}
+}
+
+func TestExternalRepairBridgeRejectsFinalRepairMappingMismatch(t *testing.T) {
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
+	ctx := context.Background()
+	if _, err := f.capture.db.SQL().ExecContext(ctx, `
+UPDATE intent_repair_commits
+SET new_oid=old_oid
+WHERE repair_id='external-repair-bridge'
+  AND ord=(SELECT MAX(ord) FROM intent_repair_commits
+           WHERE repair_id='external-repair-bridge')`); err != nil {
+		t.Fatalf("drift final repair mapping: %v", err)
+	}
+
+	_, err := ProveUnpublishedChain(
+		ctx, f.capture.dir, f.capture.db,
+		externalBridgeTestRecoveryOptions(f))
+	if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+		t.Fatalf("final mapping drift err=%v want completed-transition proof error", err)
+	}
+}
+
+func TestRecoveredIntentRepairPlanDigestBoundsSealedMetadata(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	tree := externalBridgeTestTree(t, ctx, f, f.cctx.BaseHead)
+	tests := []struct {
+		name   string
+		commit func(t *testing.T) string
+	}{
+		{
+			name: "message",
+			commit: func(t *testing.T) string {
+				return commitTreeWithIndexUpdates(
+					t, ctx, f, f.cctx.BaseHead,
+					strings.Repeat("m", int(intentRepairMessageReadCap)+1))
+			},
+		},
+		{
+			name: "author",
+			commit: func(t *testing.T) string {
+				oid, err := git.CommitTreeWithIdentity(
+					ctx, f.dir, tree, "bounded author",
+					strings.Repeat("a", int(intentRepairAuthorReadCap)+1),
+					"bounded@example.com", f.cctx.BaseHead)
+				if err != nil {
+					t.Fatalf("CommitTreeWithIdentity: %v", err)
+				}
+				return oid
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			newOID := tt.commit(t)
+			_, err := recoveredIntentRepairPlanDigest(
+				ctx, f.dir, state.IntentRepair{ID: "bounded-" + tt.name},
+				[]state.IntentRepairCommit{{
+					CandidateID: oidValue("bounded-candidate"),
+					OldOID:      f.cctx.BaseHead,
+					NewOID:      oidValue(newOID),
+				}})
+			if !errors.Is(err, ErrIntentRepairRecoveryProof) {
+				t.Fatalf("recovered digest err=%v want recovery-proof error", err)
+			}
+		})
+	}
+}
+
+func TestRecoveredIntentRepairPlanDigestRejectsMissingMappedCommit(t *testing.T) {
+	f := newCaptureFixture(t)
+	missingOID := strings.Repeat("f", len(f.cctx.BaseHead))
+	_, err := recoveredIntentRepairPlanDigest(
+		context.Background(), f.dir,
+		state.IntentRepair{ID: "missing-mapped-commit"},
+		[]state.IntentRepairCommit{{
+			CandidateID: oidValue("missing-candidate"),
+			OldOID:      f.cctx.BaseHead,
+			NewOID:      oidValue(missingOID),
+		}})
+	if !errors.Is(err, ErrIntentRepairRecoveryProof) {
+		t.Fatalf("missing mapped commit err=%v want recovery-proof error", err)
+	}
+}
+
+func TestRecoveredIntentRepairPlanDigestKeepsCancellationRetryable(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := recoveredIntentRepairPlanDigest(
+		ctx, f.dir, state.IntentRepair{ID: "canceled-mapped-commit"},
+		[]state.IntentRepairCommit{{
+			CandidateID: oidValue("canceled-candidate"),
+			OldOID:      f.cctx.BaseHead,
+			NewOID:      oidValue(f.cctx.BaseHead),
+		}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled mapped commit err=%v want context cancellation", err)
+	}
+	if errors.Is(err, ErrIntentRepairRecoveryProof) {
+		t.Fatalf("canceled mapped commit err=%v was classified permanent", err)
+	}
+}
+
+func TestExternalRepairBridgeRejectsMissingMappedCommit(t *testing.T) {
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
+	ctx := context.Background()
+	missingOID := strings.Repeat("f", len(f.source))
+	if _, err := f.capture.db.SQL().ExecContext(ctx, `
+UPDATE intent_repair_commits SET new_oid=?
+WHERE repair_id='external-repair-bridge'`, missingOID); err != nil {
+		t.Fatalf("drift repair mapping: %v", err)
+	}
+	if _, err := f.capture.db.SQL().ExecContext(ctx, `
+UPDATE intent_repairs SET new_head=?
+WHERE id='external-repair-bridge'`, missingOID); err != nil {
+		t.Fatalf("drift repair head: %v", err)
+	}
+
+	evidence := newExternalRepairEvidence(
+		f.capture.db, f.capture.dir, f.capture.cctx.BranchRef,
+		f.capture.cctx.BranchGeneration)
+	_, err := evidence.loadRepair(ctx, "external-repair-bridge")
+	if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+		t.Fatalf("missing mapped commit err=%v want completed proof error", err)
+	}
+}
+
+func TestCanonicalRepairMappingValidatesSealedPlan(t *testing.T) {
+	tests := []struct {
+		name       string
+		driftPlan  bool
+		driftFinal bool
+	}{
+		{name: "plan digest", driftPlan: true},
+		{name: "final mapping", driftFinal: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newExternalRepairBridgeFixture(
+				t, externalRepairBridgeFixtureOptions{})
+			ctx := context.Background()
+			const repairID = "historical-canonical-mapping"
+			if _, err := f.capture.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repairs(
+    id,branch_ref,branch_generation,status,expected_head,plan_digest,
+    backup_ref,old_head,new_head,created_ts,updated_ts,error
+) VALUES (?, ?, ?, 'prepared', ?, ?, ?, ?, ?, 10, 10, '')`,
+				repairID, f.capture.cctx.BranchRef,
+				f.capture.cctx.BranchGeneration, f.live,
+				"sha256:"+strings.Repeat("0", 64),
+				"refs/acd/intent-repair/test/"+repairID+"/backup",
+				f.live, f.target); err != nil {
+				t.Fatalf("insert historical repair: %v", err)
+			}
+			if _, err := f.capture.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repair_commits(
+    repair_id,ord,candidate_id,old_oid,new_oid
+) VALUES (?, 0, 'historical-candidate', ?, ?)`,
+				repairID, f.source, f.target); err != nil {
+				t.Fatalf("insert historical mapping: %v", err)
+			}
+			if _, err := f.capture.db.SQL().ExecContext(ctx, `
+INSERT INTO intent_repair_member_seals(
+    repair_id,membership_mode,member_count
+) VALUES (?, 'legacy', 0)`, repairID); err != nil {
+				t.Fatalf("seal historical mapping: %v", err)
+			}
+			repair, ok, err := state.IntentRepairByID(
+				ctx, f.capture.db, repairID)
+			if err != nil || !ok {
+				t.Fatalf("load historical repair=(%t,%v)", ok, err)
+			}
+			digest, err := recoveredIntentRepairPlanDigest(
+				ctx, f.capture.dir, repair, repair.Commits)
+			if err != nil {
+				t.Fatalf("digest historical repair: %v", err)
+			}
+			if tt.driftPlan {
+				digest = "sha256:" + strings.Repeat("f", 64)
+			}
+			newHead := f.target
+			if tt.driftFinal {
+				newHead = f.live
+			}
+			if _, err := f.capture.db.SQL().ExecContext(ctx, `
+UPDATE intent_repairs
+SET status='completed',plan_digest=?,new_head=?,git_applied_ts=11,
+    completed_ts=11,updated_ts=11
+WHERE id=? AND status='prepared'`, digest, newHead, repairID); err != nil {
+				t.Fatalf("complete historical repair: %v", err)
+			}
+
+			evidence := newExternalRepairEvidence(
+				f.capture.db, f.capture.dir, f.capture.cctx.BranchRef,
+				f.capture.cctx.BranchGeneration)
+			_, err = evidence.canonicalCommitChain(ctx, f.source)
+			if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+				t.Fatalf("canonical mapping err=%v want completed proof error", err)
+			}
+		})
+	}
+}
+
+func TestExternalRepairBridgeClassifiesHistoricalObjectDrift(t *testing.T) {
+	tests := []struct {
+		name      string
+		memberSQL string
+		memberID  string
+	}{
+		{
+			name: "repair member",
+			memberSQL: `SELECT event_seq FROM intent_repair_members
+WHERE repair_id=? ORDER BY ord LIMIT 1`,
+			memberID: "external-repair-bridge",
+		},
+		{
+			name: "publication member",
+			memberSQL: `SELECT event_seq FROM self_publication_members
+WHERE publication_id=? ORDER BY ord LIMIT 1`,
+			memberID: "external-repair-publication",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newExternalRepairBridgeFixture(
+				t, externalRepairBridgeFixtureOptions{})
+			ctx := context.Background()
+			var seq int64
+			if err := f.capture.db.ReadSQL().QueryRowContext(
+				ctx, tt.memberSQL, tt.memberID).Scan(&seq); err != nil {
+				t.Fatalf("load historical member: %v", err)
+			}
+			if _, err := f.capture.db.SQL().ExecContext(ctx, `
+UPDATE capture_ops SET after_oid=? WHERE event_seq=? AND ord=0`,
+				strings.Repeat("f", 40), seq); err != nil {
+				t.Fatalf("drift captured object: %v", err)
+			}
+
+			_, err := ProveUnpublishedChain(
+				ctx, f.capture.dir, f.capture.db,
+				externalBridgeTestRecoveryOptions(f))
+			if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+				t.Fatalf("historical object drift err=%v want completed proof error", err)
+			}
+		})
+	}
+}
 
 func TestExternalRepairBridgePublishesFrozenPrefixAndPreservesLaterCapture(
 	t *testing.T,
@@ -131,15 +396,15 @@ func TestRunExternalRepairBridgePreservesLaterCapturedShadow(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		runErr = Run(runCtx, Options{
-			RepoPath:        f.capture.dir,
-			GitDir:          f.capture.gitDir,
-			DB:              f.capture.db,
-			Scheduler:       fastScheduler(),
-			BootGrace:       30 * time.Second,
-			WakeCh:          wakeCh,
-			ShutdownCh:      shutdownCh,
-			SkipSignals:     true,
-			MessageFn:       DeterministicMessage,
+			RepoPath:               f.capture.dir,
+			GitDir:                 f.capture.gitDir,
+			DB:                     f.capture.db,
+			Scheduler:              fastScheduler(),
+			BootGrace:              30 * time.Second,
+			WakeCh:                 wakeCh,
+			ShutdownCh:             shutdownCh,
+			SkipSignals:            true,
+			MessageFn:              DeterministicMessage,
 			beforeBranchTokenCheck: checkHook,
 			replay: func(_ context.Context, _ string, _ *state.DB,
 				cctx CaptureContext, _ ReplayOpts) (ReplaySummary, error) {
@@ -260,20 +525,6 @@ func TestExternalRepairPublicationSuffixReconstructsCoalescedOps(t *testing.T) {
 		Op: "create", Path: path,
 		AfterOID: oidValue(finalBlob), AfterMode: oidValue(git.RegularFileMode),
 	})
-	const candidateID = "external-bridge-coalesced-candidate"
-	if err := state.SaveIntentCandidate(ctx, f.db, state.IntentCandidate{
-		ID: candidateID, BranchRef: f.cctx.BranchRef,
-		BranchGeneration: f.cctx.BranchGeneration,
-		Status:           state.IntentCandidateReady,
-		Purpose:          "publish the final save",
-		Readiness:        state.IntentReadinessReady,
-		Events: []state.IntentCandidateEvent{
-			{EventSeq: firstSeq, EventRole: "code"},
-			{EventSeq: finalSeq, EventRole: "code"},
-		},
-	}); err != nil {
-		t.Fatalf("SaveIntentCandidate: %v", err)
-	}
 	target := commitTreeWithIndexUpdates(
 		t, ctx, f, f.cctx.BaseHead, "coalesced publication",
 		git.RegularFileMode+" "+finalBlob+"\t"+path)
@@ -286,17 +537,19 @@ func TestExternalRepairPublicationSuffixReconstructsCoalescedOps(t *testing.T) {
 		TargetTreeOID:    externalBridgeTestTree(t, ctx, f, target),
 		CreatedTS:        1,
 		Members: []state.SelfPublicationMember{
-			{EventSeq: firstSeq, CandidateID: oidValue(candidateID)},
-			{EventSeq: finalSeq, CandidateID: oidValue(candidateID)},
+			{EventSeq: firstSeq},
+			{EventSeq: finalSeq},
 		},
 		Completion: state.SelfPublicationCompletion{
 			PublishedTS: 3, CandidateStatus: state.IntentCandidatePublished,
 		},
 	}
 	completeExternalBridgeTestPublication(t, ctx, f, publication)
+	evidence := newExternalRepairEvidence(
+		f.db, f.dir, f.cctx.BranchRef, f.cctx.BranchGeneration)
 
 	suffix, owned, err := loadExternalRepairPublicationSuffix(
-		ctx, f.dir, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
+		ctx, f.dir, evidence,
 		f.cctx.BaseHead, target)
 	if err != nil {
 		t.Fatalf("loadExternalRepairPublicationSuffix: %v", err)
@@ -334,6 +587,57 @@ func TestExternalRepairPublicationSuffixReconstructsCoalescedOps(t *testing.T) {
 	t.Fatal("raw conflicting creates unexpectedly applied without coalescing")
 }
 
+func TestExternalRepairPublicationSuffixSharesEvidenceBudget(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	blob := externalBridgeTestBlob(t, ctx, f, "bounded publication\n")
+	seq := appendRecoveryEvent(t, ctx, f, f.cctx.BaseHead, state.CaptureOp{
+		Op: "create", Path: "bounded.txt",
+		AfterOID: oidValue(blob), AfterMode: oidValue(git.RegularFileMode),
+	})
+	target := commitTreeWithIndexUpdates(
+		t, ctx, f, f.cctx.BaseHead, "bounded publication",
+		git.RegularFileMode+" "+blob+"\tbounded.txt")
+	completeExternalBridgeTestPublication(t, ctx, f, state.SelfPublication{
+		ID:        "external-bridge-bounded-publication",
+		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
+		SourceHead: f.cctx.BaseHead, TargetCommitOID: target,
+		TargetTreeOID: externalBridgeTestTree(t, ctx, f, target),
+		CreatedTS:     1,
+		Members:       []state.SelfPublicationMember{{EventSeq: seq}},
+		Completion: state.SelfPublicationCompletion{
+			PublishedTS: 3, CandidateStatus: state.IntentCandidatePublished,
+		},
+	})
+	evidence := newExternalRepairEvidence(
+		f.db, f.dir, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	// One transition, one member, one capture event, and one operation require
+	// four shared evidence rows. A budget of three must fail before an
+	// unbounded per-member operation read can occur.
+	evidence.budget.remaining = 3
+	_, _, err := loadExternalRepairPublicationSuffix(
+		ctx, f.dir, evidence, f.cctx.BaseHead, target)
+	if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+		t.Fatalf("publication suffix err=%v want shared proof-budget error", err)
+	}
+}
+
+func TestExternalRepairPublicationSuffixKeepsCancellationRetryable(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	evidence := newExternalRepairEvidence(
+		f.db, f.dir, f.cctx.BranchRef, f.cctx.BranchGeneration)
+	_, _, err := loadExternalRepairPublicationSuffix(
+		ctx, f.dir, evidence, f.cctx.BaseHead, "unreached-target")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled suffix err=%v want context cancellation", err)
+	}
+	if errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+		t.Fatalf("canceled suffix err=%v was misclassified as permanent proof failure", err)
+	}
+}
+
 func TestExternalRepairPublicationSuffixRejectsGitParentMismatch(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -362,9 +666,11 @@ func TestExternalRepairPublicationSuffixRejectsGitParentMismatch(t *testing.T) {
 		},
 	}
 	completeExternalBridgeTestPublication(t, ctx, f, publication)
+	evidence := newExternalRepairEvidence(
+		f.db, f.dir, f.cctx.BranchRef, f.cctx.BranchGeneration)
 
 	_, _, err := loadExternalRepairPublicationSuffix(
-		ctx, f.dir, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration,
+		ctx, f.dir, evidence,
 		f.cctx.BaseHead, target)
 	if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
 		t.Fatalf("load suffix err=%v want completed transition proof failure", err)
@@ -391,10 +697,12 @@ SET membership_digest='sha256:00000000000000000000000000000000000000000000000000
 WHERE id=?`, publicationID); err != nil {
 		t.Fatalf("drift publication membership digest: %v", err)
 	}
+	evidence := newExternalRepairEvidence(
+		f.capture.db, f.capture.dir, f.capture.cctx.BranchRef,
+		f.capture.cctx.BranchGeneration)
 
 	_, _, err := loadExternalRepairPublicationSuffix(
-		ctx, f.capture.dir, f.capture.db,
-		f.capture.cctx.BranchRef, f.capture.cctx.BranchGeneration,
+		ctx, f.capture.dir, evidence,
 		repairHead, f.source)
 	if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
 		t.Fatalf("load suffix err=%v want completed transition proof failure", err)
@@ -417,6 +725,52 @@ func TestExternalBridgeChangedPathsClassifiesPathLimit(t *testing.T) {
 		ctx, f.dir, f.cctx.BaseHead, target)
 	if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
 		t.Fatalf("externalBridgeChangedPaths err=%v want completed transition proof failure", err)
+	}
+}
+
+func TestExternalBridgeIndexStateChunksPathspecArguments(t *testing.T) {
+	f := newCaptureFixture(t)
+	paths := make([]string, 0, maxExternalRepairBridgePaths)
+	for i := 0; i < maxExternalRepairBridgePaths-1; i++ {
+		paths = append(paths, fmt.Sprintf(
+			"missing-%04d-%s", i, strings.Repeat("x", 235)))
+	}
+	paths = append(paths, ".gitignore")
+	unchunkedBytes := argvBytes("git", "ls-tree", "-z", f.cctx.BaseHead, "--")
+	for _, path := range paths {
+		unchunkedBytes += len(git.LiteralPathspec(path)) + 1
+	}
+	if unchunkedBytes <= 1<<20 {
+		t.Fatalf("fixture argv=%d bytes does not exceed macOS ARG_MAX", unchunkedBytes)
+	}
+
+	index, err := externalBridgeIndexState(
+		context.Background(), f.dir, f.cctx.BaseHead, paths)
+	if err != nil {
+		t.Fatalf("externalBridgeIndexState: %v", err)
+	}
+	if len(index) != 1 || index[".gitignore"].OID == "" {
+		t.Fatalf("index=%+v want only the existing .gitignore", index)
+	}
+}
+
+func TestExternalBridgePathspecChunksRejectInvalidPathSets(t *testing.T) {
+	tests := []struct {
+		name  string
+		paths []string
+	}{
+		{name: "duplicate", paths: []string{"same.txt", "same.txt"}},
+		{name: "overlong", paths: []string{
+			strings.Repeat("x", externalBridgeGitArgvByteCap),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := externalBridgePathspecChunks("HEAD", tt.paths)
+			if !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+				t.Fatalf("pathspec chunks err=%v want completed proof error", err)
+			}
+		})
 	}
 }
 
