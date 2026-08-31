@@ -11,11 +11,71 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
+
+func RecoverUnavailableSemanticMessagePublicationDrain(
+	ctx context.Context,
+	repoRoot string,
+	gitDir string,
+	db *state.DB,
+	drain state.PublicationDrain,
+	trace acdtrace.Logger,
+	now time.Time,
+) (*state.PublicationDrain, RecoveryChainResult, error) {
+	var result RecoveryChainResult
+	if drain.Phase != state.PublicationDrainNeedsAction ||
+		drain.LastError != PublicationDrainSemanticMessageUnavailableReason {
+		return nil, result, nil
+	}
+	ready, err := publicationDrainHasAppliedAlternativeRuntime(ctx, db, drain)
+	if err != nil || !ready {
+		return nil, result, err
+	}
+	firstSeq, ok, err := firstUnpublishedRecoverySeq(
+		ctx, db, drain.BranchRef, drain.BranchGeneration)
+	if err != nil || !ok {
+		return nil, result, err
+	}
+	result, err = ReconcileUnpublishedChain(
+		ctx, repoRoot, db, RecoveryReconcileOptions{
+			GitDir:           gitDir,
+			BranchRef:        drain.BranchRef,
+			BranchGeneration: drain.BranchGeneration,
+			FirstSeq:         firstSeq,
+			Trigger:          PublicationDrainSemanticMessageUnavailableReason,
+			Trace:            trace,
+			EvidenceLimit:    state.CompletedBranchTransitionProofLimit,
+			ArchiveOnly:      true,
+			InvalidateShadow: true,
+		})
+	if errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+		// Automatic recovery must stay bounded. Leave the exact drain at its
+		// durable needs-action barrier so an explicit fix can preserve a larger
+		// suffix without turning every worker wake into another failed pass.
+		return nil, RecoveryChainResult{}, nil
+	}
+	if err != nil || !result.Handled {
+		return nil, result, err
+	}
+	if _, err := state.ReconcileResolvedPublicationDrains(
+		ctx, db, float64(now.UnixNano())/1e9); err != nil {
+		return nil, result, err
+	}
+	completed, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil {
+		return nil, result, err
+	}
+	if completed.Phase != state.PublicationDrainCompleted {
+		return nil, result, errors.New(
+			"daemon: semantic message recovery did not resolve publication drain")
+	}
+	return &completed, result, nil
+}
 
 const (
 	recoveryCommitIdentityName          = "Auto Commit Daemon"
@@ -23,6 +83,16 @@ const (
 	maxPublishedRecoveryContextCommits  = 64
 	maxPublishedRecoveryAncestryCommits = 4096
 )
+
+var errInvalidRecoveryObjectEvidence = errors.New(
+	"daemon: recovery object evidence is invalid")
+
+func invalidRecoveryObjectEvidence(format string, args ...any) error {
+	values := make([]any, 0, len(args)+1)
+	values = append(values, errInvalidRecoveryObjectEvidence)
+	values = append(values, args...)
+	return fmt.Errorf("%w: "+format, values...)
+}
 
 // RecoveryReconcileOptions identifies one immutable unpublished suffix. The
 // generic entrypoint deliberately accepts a pending first row: branch changes
@@ -36,6 +106,10 @@ type RecoveryReconcileOptions struct {
 	FirstSeq         int64
 	Trigger          string
 	Trace            acdtrace.Logger
+	// EvidenceLimit bounds suffix loading for automatic callers. Zero keeps
+	// explicit/manual reconciliation unbounded; positive values are validated
+	// by the state layer against its global proof ceiling.
+	EvidenceLimit int
 	// ExternalParentHead is the persisted branch-token commit observed before
 	// a same-branch transition. It enables the narrow repaired-publication
 	// bridge proof; ordinary replay and archive recovery leave it empty.
@@ -76,6 +150,9 @@ type RecoveryChainResult struct {
 	FirstSeq    int64
 	LastSeq     int64
 	EventCount  int
+	// AcceptedHead is set only when recovery atomically adopted the exact
+	// locked live branch head together with its replacement shadow.
+	AcceptedHead string
 }
 
 type recoveryPathState struct {
@@ -112,9 +189,7 @@ func ProveUnpublishedChain(
 		return result, err
 	}
 
-	chain, err := state.LoadUnpublishedRecoveryChain(
-		ctx, db, opts.BranchRef, opts.BranchGeneration, opts.FirstSeq,
-	)
+	chain, err := loadRecoveryChainForReconciliation(ctx, db, opts)
 	if err != nil {
 		return result, fmt.Errorf("daemon: prove recovery chain: load suffix: %w", err)
 	}
@@ -247,9 +322,7 @@ func ReconcileUnpublishedChain(
 		return result, err
 	}
 
-	chain, err := state.LoadUnpublishedRecoveryChain(
-		ctx, db, opts.BranchRef, opts.BranchGeneration, opts.FirstSeq,
-	)
+	chain, err := loadRecoveryChainForReconciliation(ctx, db, opts)
 	if err != nil {
 		return result, fmt.Errorf("daemon: reconcile recovery chain: load suffix: %w", err)
 	}
@@ -280,16 +353,8 @@ func ReconcileUnpublishedChain(
 				"%w: external repair bridge returned invalid event count %d",
 				state.ErrCompletedBranchTransitionProof, bridge.EventCount)
 		}
-		proofChain, err := canonicalizeRecoveryProofEvents(
-			ctx, repoRoot, db, opts.BranchRef, opts.BranchGeneration,
-			sameBranchRecoveryHead(live, opts.BranchRef),
-			chain[:bridge.EventCount])
-		if err != nil {
-			return result, err
-		}
 		return reconcileExternalRepairBridge(
-			ctx, repoRoot, db, opts, live,
-			chain[:bridge.EventCount], proofChain[:bridge.EventCount], bridge)
+			ctx, repoRoot, db, opts, live, chain, bridge)
 	}
 	proofLiveHead := sameBranchRecoveryHead(live, opts.BranchRef)
 	proofChain, err := canonicalizeRecoveryProofEvents(
@@ -466,6 +531,25 @@ func ReconcileUnpublishedChain(
 		"repaired_base": baseHead,
 	})
 	return result, nil
+}
+
+func loadRecoveryChainForReconciliation(
+	ctx context.Context,
+	db *state.DB,
+	opts RecoveryReconcileOptions,
+) ([]state.RecoveryChainEvent, error) {
+	if opts.EvidenceLimit > 0 {
+		return state.LoadUnpublishedRecoveryChainBounded(
+			ctx, db, opts.BranchRef, opts.BranchGeneration, opts.FirstSeq,
+			opts.EvidenceLimit)
+	}
+	if opts.ExternalParentHead != "" && !opts.ArchiveOnly {
+		return state.LoadUnpublishedRecoveryChainBounded(
+			ctx, db, opts.BranchRef, opts.BranchGeneration, opts.FirstSeq,
+			state.CompletedBranchTransitionProofLimit)
+	}
+	return state.LoadUnpublishedRecoveryChain(
+		ctx, db, opts.BranchRef, opts.BranchGeneration, opts.FirstSeq)
 }
 
 func canonicalRecoveryCommit(
@@ -1211,25 +1295,31 @@ func validateRecoveryObjects(ctx context.Context, repoRoot string, chain []state
 		}
 		ev := item.Event
 		if err := addRecoveryObjectRequirement(required, ev.BaseHead, "commit"); err != nil {
-			return fmt.Errorf("daemon: reconcile recovery chain: base commit seq=%d: %w", ev.Seq, err)
+			return invalidRecoveryObjectEvidence(
+				"base commit seq=%d: %v", ev.Seq, err)
 		}
 		if problem := validateOps(item.Ops); problem != "" {
-			return fmt.Errorf("daemon: reconcile recovery chain: invalid ops seq=%d: %s", ev.Seq, problem)
+			return invalidRecoveryObjectEvidence(
+				"invalid ops seq=%d: %s", ev.Seq, problem)
 		}
 		if len(item.Ops) == 0 {
-			return fmt.Errorf("daemon: reconcile recovery chain: event %d has no operations", ev.Seq)
+			return invalidRecoveryObjectEvidence(
+				"event %d has no operations", ev.Seq)
 		}
 		for _, op := range item.Ops {
 			if op.Op == "rename" && (!op.BeforeOID.Valid || !op.BeforeMode.Valid) {
-				return fmt.Errorf("daemon: reconcile recovery chain: rename %s lacks immutable before-state", op.Path)
+				return invalidRecoveryObjectEvidence(
+					"rename %s lacks immutable before-state", op.Path)
 			}
 			for _, object := range recoveryOpObjects(op) {
 				kind, err := recoveryObjectKind(object.mode)
 				if err != nil {
-					return fmt.Errorf("daemon: reconcile recovery chain: seq=%d path=%s: %w", ev.Seq, op.Path, err)
+					return invalidRecoveryObjectEvidence(
+						"seq=%d path=%s: %v", ev.Seq, op.Path, err)
 				}
 				if err := addRecoveryObjectRequirement(required, object.oid, kind); err != nil {
-					return fmt.Errorf("daemon: reconcile recovery chain: seq=%d path=%s: %w", ev.Seq, op.Path, err)
+					return invalidRecoveryObjectEvidence(
+						"seq=%d path=%s: %v", ev.Seq, op.Path, err)
 				}
 			}
 		}
@@ -1244,22 +1334,28 @@ func validateRecoveryObjects(ctx context.Context, repoRoot string, chain []state
 		input.WriteString(oid)
 		input.WriteByte('\n')
 	}
-	out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Stdin: strings.NewReader(input.String())},
-		"cat-file", "--batch-check=%(objectname) %(objecttype)")
+	maxOutput := int64(len(oids) * 96)
+	out, err := git.RunWithLimit(ctx, git.RunOpts{
+		Dir: repoRoot, Stdin: strings.NewReader(input.String()),
+		Timeout: git.DefaultReadTimeout,
+	}, maxOutput, "cat-file", "--batch-check=%(objectname) %(objecttype)")
 	if err != nil {
 		return fmt.Errorf("daemon: reconcile recovery chain: validate objects: %w", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) != len(oids) {
-		return fmt.Errorf("daemon: reconcile recovery chain: object validation returned %d rows, want %d", len(lines), len(oids))
+		return invalidRecoveryObjectEvidence(
+			"object validation returned %d rows, want %d", len(lines), len(oids))
 	}
 	for i, line := range lines {
 		fields := strings.Fields(line)
 		if len(fields) == 2 && fields[0] == oids[i] && fields[1] == "missing" {
-			return fmt.Errorf("daemon: reconcile recovery chain: missing %s object %s", required[oids[i]], oids[i])
+			return invalidRecoveryObjectEvidence(
+				"missing %s object %s", required[oids[i]], oids[i])
 		}
 		if len(fields) != 2 || fields[0] != oids[i] || fields[1] != required[oids[i]] {
-			return fmt.Errorf("daemon: reconcile recovery chain: object %s is %q, want %s", oids[i], line, required[oids[i]])
+			return invalidRecoveryObjectEvidence(
+				"object %s is %q, want %s", oids[i], line, required[oids[i]])
 		}
 	}
 	return nil
