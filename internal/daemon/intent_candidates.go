@@ -425,7 +425,8 @@ func EvaluateIntentCandidates(
 		result.Fallback = "deterministic_semantic_rebuild"
 	}
 	plan, continuations, err = advanceTerminalIntentCandidateIDs(
-		ctx, db, input.BranchRef, input.BranchGeneration, plan, continuations)
+		ctx, db, input.BranchRef, input.BranchGeneration, plan, continuations,
+		existing)
 	if err != nil {
 		return result, err
 	}
@@ -590,9 +591,9 @@ ORDER BY membership.candidate_id,membership.ord,membership.event_seq`,
 }
 
 // advanceTerminalIntentCandidateIDs keeps planner-stable IDs restart-safe
-// without allowing a historical terminal candidate to block new work. The
-// first available successor is deterministic, so a crash after saving it will
-// reuse that nonterminal candidate on the next pass.
+// without allowing terminal history to consume a finite successor namespace.
+// An existing exact membership remains stable across retries. Once it becomes
+// terminal, its ID seeds the next deterministic link in the successor chain.
 func advanceTerminalIntentCandidateIDs(
 	ctx context.Context,
 	db *state.DB,
@@ -600,6 +601,7 @@ func advanceTerminalIntentCandidateIDs(
 	generation int64,
 	plan ai.IntentPlanV2,
 	continuations []intentCandidateContinuation,
+	existing []state.IntentCandidate,
 ) (ai.IntentPlanV2, []intentCandidateContinuation, error) {
 	replacements := make(map[string]string)
 	for index := range plan.Candidates {
@@ -618,11 +620,21 @@ func advanceTerminalIntentCandidateIDs(
 			!terminalIntentCandidateStatus(candidate.Status)) {
 			continue
 		}
+		if activeID := exactActiveIntentCandidateID(
+			existing, branchRef, generation, assignment.SelectedSeqs); activeID != "" {
+			replacements[baseID] = activeID
+			assignment.CandidateID = activeID
+			continue
+		}
+		seedID, seedErr := terminalIntentCandidateSuccessorSeed(
+			ctx, db, branchRef, generation, assignment.SelectedSeqs, baseID)
+		if seedErr != nil {
+			return plan, continuations, seedErr
+		}
 		for attempt := 1; attempt <= state.IntentCandidateMaxOpenPerPair; attempt++ {
-			sum := sha256.Sum256([]byte(fmt.Sprintf(
-				"%s\x00%s\x00%d\x00%v\x00%d",
-				baseID, branchRef, generation, assignment.SelectedSeqs, attempt)))
-			successorID := fmt.Sprintf("intent-successor-%x", sum[:12])
+			successorID := intentCandidateSuccessorID(
+				baseID, branchRef, generation, assignment.SelectedSeqs, seedID,
+				attempt)
 			successor, found, loadErr := state.IntentCandidateByID(
 				ctx, db, successorID)
 			if loadErr != nil {
@@ -639,7 +651,8 @@ func advanceTerminalIntentCandidateIDs(
 		}
 		if assignment.CandidateID == baseID {
 			return plan, continuations, fmt.Errorf(
-				"daemon: intent candidates: exhausted successor IDs for %q", baseID)
+				"daemon: intent candidates: successor collision budget %d exhausted for %q",
+				state.IntentCandidateMaxOpenPerPair, baseID)
 		}
 	}
 	if len(replacements) == 0 {
@@ -663,6 +676,125 @@ func advanceTerminalIntentCandidateIDs(
 		}
 	}
 	return plan, continuations, nil
+}
+
+func intentCandidateSuccessorID(
+	baseID string,
+	branchRef string,
+	generation int64,
+	selectedSeqs []int64,
+	seedID string,
+	attempt int,
+) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf(
+		"%s\x00%s\x00%d\x00%v\x00%s\x00%d",
+		baseID, branchRef, generation, selectedSeqs, seedID, attempt)))
+	return fmt.Sprintf("intent-successor-%x", sum[:12])
+}
+
+func legacyIntentCandidateSuccessorID(
+	baseID string,
+	branchRef string,
+	generation int64,
+	selectedSeqs []int64,
+	attempt int,
+) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf(
+		"%s\x00%s\x00%d\x00%v\x00%d",
+		baseID, branchRef, generation, selectedSeqs, attempt)))
+	return fmt.Sprintf("intent-successor-%x", sum[:12])
+}
+
+func exactActiveIntentCandidateID(
+	candidates []state.IntentCandidate,
+	branchRef string,
+	generation int64,
+	selectedSeqs []int64,
+) string {
+	if len(selectedSeqs) == 0 {
+		return ""
+	}
+	selected := make(map[int64]struct{}, len(selectedSeqs))
+	for _, seq := range selectedSeqs {
+		selected[seq] = struct{}{}
+	}
+	if len(selected) != len(selectedSeqs) {
+		return ""
+	}
+	for _, candidate := range candidates {
+		if candidate.BranchRef != branchRef ||
+			candidate.BranchGeneration != generation ||
+			terminalIntentCandidateStatus(candidate.Status) ||
+			len(candidate.Events) != len(selected) {
+			continue
+		}
+		exact := true
+		for _, member := range candidate.Events {
+			if _, ok := selected[member.EventSeq]; !ok {
+				exact = false
+				break
+			}
+		}
+		if exact {
+			return candidate.ID
+		}
+	}
+	return ""
+}
+
+func terminalIntentCandidateSuccessorSeed(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	selectedSeqs []int64,
+	baseID string,
+) (string, error) {
+	if len(selectedSeqs) == 0 {
+		return baseID, nil
+	}
+	selected := append([]int64(nil), selectedSeqs...)
+	sort.Slice(selected, func(i, j int) bool { return selected[i] < selected[j] })
+	for index, seq := range selected {
+		if seq <= 0 || (index > 0 && seq == selected[index-1]) {
+			return "", errors.New(
+				"daemon: intent candidates: successor seed has invalid membership")
+		}
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(selected)), ",")
+	args := make([]any, 0, len(selected)+4)
+	args = append(args, selected[0], branchRef, generation, len(selected))
+	for _, seq := range selected {
+		args = append(args, seq)
+	}
+	var terminalCount int64
+	err := db.ReadSQL().QueryRowContext(ctx, fmt.Sprintf(`
+SELECT COUNT(*)
+FROM intent_candidates candidate
+WHERE EXISTS (
+      SELECT 1 FROM intent_candidate_events anchor
+      WHERE anchor.candidate_id=candidate.id AND anchor.event_seq=?
+  )
+	  AND candidate.branch_ref=? AND candidate.branch_generation=?
+		AND candidate.status IN ('superseded','failed')
+	AND candidate.published_commit_oid IS NULL
+	AND (SELECT COUNT(*) FROM intent_candidate_events membership
+	     WHERE membership.candidate_id=candidate.id)=?
+	AND NOT EXISTS (
+	    SELECT 1 FROM intent_candidate_events membership
+	    WHERE membership.candidate_id=candidate.id
+	      AND membership.membership_state<>'superseded'
+	)
+  AND NOT EXISTS (
+      SELECT 1 FROM intent_candidate_events membership
+      WHERE membership.candidate_id=candidate.id
+        AND membership.event_seq NOT IN (%s)
+	  )`, placeholders), args...).Scan(&terminalCount)
+	if err != nil {
+		return "", fmt.Errorf(
+			"daemon: intent candidates: load successor seed: %w", err)
+	}
+	return fmt.Sprintf("terminal-count:%d", terminalCount), nil
 }
 
 func terminalIntentCandidateStatus(status string) bool {
@@ -721,10 +853,6 @@ func BuildIntentCandidateDependencies(
 		key := fmt.Sprintf("%d\x00%d\x00%s\x00%s", from, to, strength, kind)
 		if _, ok := seen[key]; ok {
 			return nil
-		}
-		if len(out) >= state.IntentDependencyMaxPerPair {
-			return fmt.Errorf("daemon: intent dependency graph: edge cap %d exceeded",
-				state.IntentDependencyMaxPerPair)
 		}
 		seen[key] = struct{}{}
 		out = append(out, state.IntentCaptureDependency{
@@ -831,6 +959,7 @@ func BuildIntentCandidateDependencies(
 		}
 	}
 
+	derivedCount := len(out)
 	for _, hint := range hints {
 		if _, ok := known[hint.PrerequisiteSeq]; !ok {
 			return nil, fmt.Errorf("daemon: intent dependency hint references unknown seq %d",
@@ -855,19 +984,10 @@ func BuildIntentCandidateDependencies(
 			return nil, err
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].PrerequisiteSeq != out[j].PrerequisiteSeq {
-			return out[i].PrerequisiteSeq < out[j].PrerequisiteSeq
-		}
-		if out[i].DependentSeq != out[j].DependentSeq {
-			return out[i].DependentSeq < out[j].DependentSeq
-		}
-		if out[i].Strength != out[j].Strength {
-			return out[i].Strength < out[j].Strength
-		}
-		return out[i].Kind < out[j].Kind
-	})
-	return out, nil
+	// Intrinsic path, object, role, module, and temporal evidence is more
+	// durable than analyzer hints. Give its soft edges first claim on the
+	// remaining budget while still collecting every hard edge from both sets.
+	return boundedIntentDependencies(out[:derivedCount], out[derivedCount:])
 }
 
 func buildIntentCandidateRequest(
@@ -3729,37 +3849,120 @@ func mergeIntentDependencies(
 	prior []state.IntentCaptureDependency,
 	current []state.IntentCaptureDependency,
 ) ([]state.IntentCaptureDependency, error) {
-	out := make([]state.IntentCaptureDependency, 0, len(prior)+len(current))
-	seen := make(map[string]struct{}, len(prior)+len(current))
-	for _, group := range [][]state.IntentCaptureDependency{prior, current} {
+	// Current evidence is reconstructed from the active captures. Prefer it
+	// over retained soft evidence so analyzer changes and long-lived branch
+	// generations cannot permanently consume the bounded graph. Hard edges
+	// from both sets are always retained or the graph fails closed.
+	return boundedIntentDependencies(current, prior)
+}
+
+func boundedIntentDependencies(
+	preferred []state.IntentCaptureDependency,
+	retained []state.IntentCaptureDependency,
+) ([]state.IntentCaptureDependency, error) {
+	capacity := len(preferred) + len(retained)
+	hard := make([]state.IntentCaptureDependency, 0, min(capacity,
+		state.IntentDependencyMaxPerPair))
+	softGroups := make([][]state.IntentCaptureDependency, 0, 2)
+	seen := make(map[string]struct{}, capacity)
+	for _, group := range [][]state.IntentCaptureDependency{preferred, retained} {
+		soft := make([]state.IntentCaptureDependency, 0, len(group))
 		for _, edge := range group {
 			key := fmt.Sprintf("%d\x00%d\x00%s\x00%s", edge.PrerequisiteSeq,
 				edge.DependentSeq, edge.Strength, edge.Kind)
 			if _, ok := seen[key]; ok {
 				continue
 			}
-			if len(out) >= state.IntentDependencyMaxPerPair {
-				return nil, fmt.Errorf("daemon: intent dependency graph: persisted edge cap %d exceeded",
-					state.IntentDependencyMaxPerPair)
-			}
 			seen[key] = struct{}{}
 			edge.ID = 0
-			out = append(out, edge)
+			if edge.Strength == state.IntentDependencyHard {
+				hard = append(hard, edge)
+				continue
+			}
+			soft = append(soft, edge)
 		}
+		softGroups = append(softGroups, soft)
+	}
+	if len(hard) > state.IntentDependencyMaxPerPair {
+		return nil, fmt.Errorf(
+			"daemon: intent dependency graph: hard edge cap %d exceeded",
+			state.IntentDependencyMaxPerPair)
+	}
+	if err := validateIntentHardDependencyDAG(hard); err != nil {
+		return nil, err
+	}
+	less := func(left, right state.IntentCaptureDependency) bool {
+		if left.PrerequisiteSeq != right.PrerequisiteSeq {
+			return left.PrerequisiteSeq < right.PrerequisiteSeq
+		}
+		if left.DependentSeq != right.DependentSeq {
+			return left.DependentSeq < right.DependentSeq
+		}
+		if left.Strength != right.Strength {
+			return left.Strength < right.Strength
+		}
+		return left.Kind < right.Kind
+	}
+	sort.Slice(hard, func(i, j int) bool { return less(hard[i], hard[j]) })
+	out := append([]state.IntentCaptureDependency(nil), hard...)
+	for _, soft := range softGroups {
+		sort.Slice(soft, func(i, j int) bool { return less(soft[i], soft[j]) })
+		remaining := state.IntentDependencyMaxPerPair - len(out)
+		if remaining <= 0 {
+			break
+		}
+		if len(soft) > remaining {
+			soft = soft[:remaining]
+		}
+		out = append(out, soft...)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].PrerequisiteSeq != out[j].PrerequisiteSeq {
-			return out[i].PrerequisiteSeq < out[j].PrerequisiteSeq
-		}
-		if out[i].DependentSeq != out[j].DependentSeq {
-			return out[i].DependentSeq < out[j].DependentSeq
-		}
-		if out[i].Strength != out[j].Strength {
-			return out[i].Strength < out[j].Strength
-		}
-		return out[i].Kind < out[j].Kind
+		return less(out[i], out[j])
 	})
 	return out, nil
+}
+
+func validateIntentHardDependencyDAG(
+	dependencies []state.IntentCaptureDependency,
+) error {
+	indegree := make(map[int64]int, len(dependencies)*2)
+	dependents := make(map[int64][]int64, len(dependencies))
+	for _, dependency := range dependencies {
+		from, to := dependency.PrerequisiteSeq, dependency.DependentSeq
+		if from <= 0 || to <= 0 || from == to {
+			return fmt.Errorf(
+				"daemon: intent dependency graph: invalid hard edge %d -> %d",
+				from, to)
+		}
+		if _, ok := indegree[from]; !ok {
+			indegree[from] = 0
+		}
+		indegree[to]++
+		dependents[from] = append(dependents[from], to)
+	}
+	ready := make([]int64, 0, len(indegree))
+	for seq, degree := range indegree {
+		if degree == 0 {
+			ready = append(ready, seq)
+		}
+	}
+	visited := 0
+	for len(ready) > 0 {
+		seq := ready[len(ready)-1]
+		ready = ready[:len(ready)-1]
+		visited++
+		for _, dependent := range dependents[seq] {
+			indegree[dependent]--
+			if indegree[dependent] == 0 {
+				ready = append(ready, dependent)
+			}
+		}
+	}
+	if visited != len(indegree) {
+		return errors.New(
+			"daemon: intent dependency graph: hard dependency cycle")
+	}
+	return nil
 }
 
 // intentDependenciesWithinCaptures drops evidence whose endpoints have left
