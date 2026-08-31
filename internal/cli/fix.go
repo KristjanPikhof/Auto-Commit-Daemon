@@ -381,14 +381,15 @@ func resolvedPublicationDrainAction(
 }
 
 type unpublishedFixPair struct {
-	branchRef              string
-	generation             int64
-	firstSeq               int64
-	lastSeq                int64
-	eventCount             int
-	hasTerminal            bool
-	decisionLed            bool
-	runtimeContractBlocked bool
+	branchRef                  string
+	generation                 int64
+	firstSeq                   int64
+	lastSeq                    int64
+	eventCount                 int
+	hasTerminal                bool
+	decisionLed                bool
+	runtimeContractBlocked     bool
+	semanticMessageUnavailable bool
 }
 
 // planUnpublishedChainReconciliation emits one action per exact provenance
@@ -417,6 +418,8 @@ func planUnpublishedChainReconciliation(
 )`
 	}
 	runtimeContractBlockedExpr := "0"
+	semanticMessageUnavailableExpr := "0"
+	queryArgs := make([]any, 0, 4)
 	if hasPublicationDrains {
 		runtimeCondition := "1"
 		if publicationDrainRuntimeContractAvailable {
@@ -438,14 +441,40 @@ func planUnpublishedChainReconciliation(
       AND d.phase!='completed'
       AND ` + runtimeCondition + `
 )`
+		if publicationDrainRuntimeContractAvailable {
+			semanticMessageUnavailableExpr = `EXISTS (
+    SELECT 1
+    FROM publication_drain_events de
+    JOIN publication_drains d ON d.id=de.drain_id
+    WHERE de.event_seq=e.seq
+      AND d.branch_ref=e.branch_ref
+      AND d.branch_generation=e.branch_generation
+      AND d.phase='needs_action'
+      AND d.commit_strategy='intent'
+      AND d.provider<>'' AND d.provider<>'deterministic'
+      AND d.provider_fingerprint<>''
+      AND d.fallback_mode='local_unlock'
+      AND d.last_error=?
+      AND NOT EXISTS (
+          SELECT 1 FROM publication_drains sibling
+          WHERE sibling.branch_ref=d.branch_ref
+            AND sibling.branch_generation=d.branch_generation
+            AND sibling.phase!='completed' AND sibling.id<>d.id
+      )
+)`
+			queryArgs = append(queryArgs,
+				daemon.PublicationDrainSemanticMessageUnavailableReason)
+		}
 	}
+	queryArgs = append(queryArgs, state.EventStatePending,
+		state.EventStateBlockedConflict, state.EventStateFailed)
 	rows, err := conn.QueryContext(ctx, `
 SELECT e.seq, e.branch_ref, e.branch_generation, e.state, `+decisionExpr+`,
-       `+runtimeContractBlockedExpr+`
+       `+runtimeContractBlockedExpr+`, `+semanticMessageUnavailableExpr+`
 FROM capture_events e
 WHERE e.state IN (?, ?, ?)
 ORDER BY e.branch_ref, e.branch_generation, e.seq`,
-		state.EventStatePending, state.EventStateBlockedConflict, state.EventStateFailed)
+		queryArgs...)
 	if err != nil {
 		return fmt.Errorf("acd fix: scan unpublished recovery pairs: %w", err)
 	}
@@ -456,10 +485,11 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 	for rows.Next() {
 		var seq, generation int64
 		var branchRef, eventState string
-		var decisionLed, runtimeContractBlocked bool
+		var decisionLed, runtimeContractBlocked, semanticMessageUnavailable bool
 		if err := rows.Scan(
 			&seq, &branchRef, &generation, &eventState,
 			&decisionLed, &runtimeContractBlocked,
+			&semanticMessageUnavailable,
 		); err != nil {
 			return fmt.Errorf("acd fix: scan unpublished recovery row: %w", err)
 		}
@@ -478,6 +508,8 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		pair.hasTerminal = pair.hasTerminal || eventState == state.EventStateBlockedConflict || eventState == state.EventStateFailed
 		pair.decisionLed = pair.decisionLed || decisionLed
 		pair.runtimeContractBlocked = pair.runtimeContractBlocked || runtimeContractBlocked
+		pair.semanticMessageUnavailable = pair.semanticMessageUnavailable ||
+			semanticMessageUnavailable
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("acd fix: iterate unpublished recovery rows: %w", err)
@@ -498,7 +530,17 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 			continue
 		}
 		if !pair.hasTerminal && !stalePair && !pair.decisionLed &&
-			!pair.runtimeContractBlocked {
+			pair.semanticMessageUnavailable && !force {
+			plan.ForceRequired = true
+			plan.Unsafe = append(plan.Unsafe, fmt.Sprintf(
+				"the frozen semantic provider for %s generation %d exhausted its retry backoff",
+				pair.branchRef, pair.generation))
+			plan.Suggestions = append(plan.Suggestions,
+				"Run `acd fix --force --dry-run` to review whole-chain recovery, then `acd fix --force --yes` to preserve it and recapture under the active runtime.")
+			continue
+		}
+		if !pair.hasTerminal && !stalePair && !pair.decisionLed &&
+			!pair.runtimeContractBlocked && !pair.semanticMessageUnavailable {
 			continue
 		}
 		archiveOnly := force || currentHead == ""
@@ -514,6 +556,10 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		}
 		if pair.runtimeContractBlocked {
 			reasonParts = append(reasonParts, "publication runtime contract cannot be reconstructed")
+		}
+		if pair.semanticMessageUnavailable {
+			reasonParts = append(reasonParts,
+				"frozen semantic provider exhausted its retry backoff")
 		}
 		plan.Actions = append(plan.Actions, fixAction{
 			ID:               fmt.Sprintf("%s:%s:%d:%d", fixActionReconcileUnpublishedChain, pair.branchRef, pair.generation, pair.firstSeq),
