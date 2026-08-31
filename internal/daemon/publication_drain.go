@@ -21,6 +21,21 @@ const publicationDrainHeadChangedPrefix = "publication drain HEAD changed after 
 const publicationDrainRecoveredTargetError = "frozen publication target contains a terminal event"
 const supersededCandidateDrainErrorPrefix = "state: candidate "
 const supersededCandidateDrainErrorSuffix = " is terminal in status superseded"
+const exhaustedCandidateSuccessorDrainErrorPrefix = "daemon: intent candidates: exhausted successor IDs for \""
+const exhaustedCandidateSuccessorDrainErrorSuffix = "\""
+
+// PublicationDrainSemanticMessageUnavailableReason is persisted only after a
+// frozen semantic provider exhausts its circuit backoff while local grouping
+// still requires that provider to write the commit message.
+const PublicationDrainSemanticMessageUnavailableReason = "publication_drain_semantic_message_unavailable"
+
+func legacySoftDependencyCapDrainError(reason string) bool {
+	return reason == fmt.Sprintf(
+		"daemon: intent dependency graph: edge cap %d exceeded",
+		state.IntentDependencyMaxPerPair) || reason == fmt.Sprintf(
+		"daemon: intent dependency graph: persisted edge cap %d exceeded",
+		state.IntentDependencyMaxPerPair)
+}
 
 const (
 	publicationFallbackSemanticReplan = "semantic_replan"
@@ -98,6 +113,95 @@ func failPublicationDrainRuntimeContract(
 	update.Phase = state.PublicationDrainNeedsAction
 	update.LastError = reason
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+}
+
+func publicationDrainSemanticMessageExhausted(
+	drain state.PublicationDrain,
+	summary ReplaySummary,
+) bool {
+	waitReason := strings.TrimSpace(summary.DispositionReason)
+	currentWaitAlreadyObserved := waitReason != "" &&
+		strings.HasPrefix(waitReason, "intent planner circuit open until ") &&
+		strings.TrimSpace(drain.LastError) == waitReason &&
+		summary.PlannerCircuitLastFailureTS > drain.LastProgressTS
+	failureObservedByCurrentWait :=
+		summary.PlannerCircuitLastFailureTS > drain.UpdatedTS ||
+			currentWaitAlreadyObserved
+	return drain.Phase == state.PublicationDrainEventFallback &&
+		publicationDrainSalvageMode(drain) == publicationFallbackLocalUnlock &&
+		summary.Disposition == ReplayDispositionTransientWait &&
+		summary.SkippedReason == "intent_v2_waiting_message_rewrite" &&
+		summary.PlannerCircuitOpen &&
+		summary.PlannerProviderFingerprint != "" &&
+		summary.PlannerProviderFingerprint == drain.ProviderFingerprint &&
+		summary.PlannerCircuitBackoffLevel == len(intentPlannerCircuitBackoffs)-1 &&
+		summary.PlannerMaxBackoffProbeFailures > 0 &&
+		failureObservedByCurrentWait &&
+		summary.PlannerCircuitLastFailureTS > drain.LastProgressTS
+}
+
+func publicationDrainHasAppliedAlternativeRuntime(
+	ctx context.Context,
+	db *state.DB,
+	drain state.PublicationDrain,
+) (bool, error) {
+	if db == nil || drain.ConfigRevisionID <= 0 ||
+		drain.CommitStrategy != string(ai.CommitStrategyIntent) ||
+		drain.CommitFormat == "" || drain.ProviderFingerprint == "" {
+		return false, nil
+	}
+	runtime, err := state.RuntimeConfigActivationState(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	if !runtime.DesiredRevisionID.Valid || !runtime.AppliedRevisionID.Valid ||
+		!runtime.LastKnownGoodRevisionID.Valid ||
+		runtime.DesiredRevisionID.Int64 != runtime.AppliedRevisionID.Int64 ||
+		runtime.AppliedRevisionID.Int64 != runtime.LastKnownGoodRevisionID.Int64 ||
+		// Revision IDs are durable insertion order. Wall-clock timestamps can
+		// move backward and must not suppress a causally newer replacement.
+		runtime.AppliedRevisionID.Int64 <= drain.ConfigRevisionID ||
+		(runtime.LastError.Valid && strings.TrimSpace(runtime.LastError.String) != "") {
+		return false, nil
+	}
+	revision, err := state.ConfigRevisionByID(
+		ctx, db, runtime.AppliedRevisionID.Int64)
+	if err != nil {
+		return false, err
+	}
+	strategy, format, provider, fingerprint, err :=
+		publicationRuntimeRevisionContract(revision)
+	if err != nil {
+		return false, nil
+	}
+	if strategy != drain.CommitStrategy || format != drain.CommitFormat ||
+		provider != (ai.DeterministicProvider{}).Name() ||
+		fingerprint == "" || fingerprint == drain.ProviderFingerprint {
+		return false, nil
+	}
+
+	var unresolvedDrains, activeRepair, activeOperation, activePublication int
+	if err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT
+  (SELECT COUNT(*) FROM publication_drains
+   WHERE branch_ref=? AND branch_generation=? AND phase<>'completed'),
+  EXISTS(SELECT 1 FROM intent_repairs
+         WHERE branch_ref=? AND branch_generation=?
+           AND status IN ('prepared','git_applied')),
+  EXISTS(SELECT 1 FROM operations
+         WHERE worktree_id=? AND status IN ('prepared','active')),
+  EXISTS(SELECT 1 FROM self_publications
+         WHERE branch_ref=? AND branch_generation=?
+           AND phase IN ('prepared','git_applied'))`,
+		drain.BranchRef, drain.BranchGeneration,
+		drain.BranchRef, drain.BranchGeneration, drain.WorktreeID,
+		drain.BranchRef, drain.BranchGeneration,
+	).Scan(&unresolvedDrains, &activeRepair, &activeOperation,
+		&activePublication); err != nil {
+		return false, err
+	}
+	return unresolvedDrains == 1 && activeRepair == 0 &&
+		activeOperation == 0 && activePublication == 0, nil
 }
 
 func publicationDrainTerminalRuntimeReason(
@@ -221,9 +325,9 @@ func refreshPublicationDrainRuntimeAfterReconcile(
 }
 
 // RecoverSupersededCandidatePublicationDrain reopens only the latest drain
-// stopped by the old stable-ID collision. SaveIntentCandidate fails before Git
-// materialization, and the exact superseded candidate plus a clean frozen
-// target proves that replay may safely choose its deterministic successor.
+// stopped by a legacy terminal-ID collision or finite successor namespace.
+// Both failures happen before Git materialization. The exact terminal candidate
+// and a clean frozen target prove replay may choose a new deterministic link.
 func RecoverSupersededCandidatePublicationDrain(
 	ctx context.Context,
 	db *state.DB,
@@ -234,10 +338,7 @@ func RecoverSupersededCandidatePublicationDrain(
 	rows, err := db.ReadSQL().QueryContext(ctx, `
 SELECT id,last_error FROM publication_drains
 WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
-  AND last_error LIKE ?
-ORDER BY created_ts DESC,id DESC LIMIT 1`,
-		branchRef, generation,
-		supersededCandidateDrainErrorPrefix+"%"+supersededCandidateDrainErrorSuffix)
+ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if err != nil {
 		return nil, err
 	}
@@ -252,25 +353,242 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`,
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	candidateID, ok := strings.CutPrefix(
-		recordedError, supersededCandidateDrainErrorPrefix)
+	failure, ok := recoverableTerminalCandidateDrain(recordedError)
 	if !ok {
 		return nil, nil
 	}
-	candidateID, ok = strings.CutSuffix(
-		candidateID, supersededCandidateDrainErrorSuffix)
-	if !ok || strings.TrimSpace(candidateID) != candidateID || candidateID == "" {
-		return nil, nil
-	}
-	if strings.HasPrefix(candidateID, "intent-successor-") {
-		return nil, nil
-	}
-	candidate, exists, err := state.IntentCandidateByID(ctx, db, candidateID)
+	candidate, exists, err := state.IntentCandidateByID(
+		ctx, db, failure.candidateID)
 	if err != nil {
 		return nil, err
 	}
 	if !exists || candidate.Status != state.IntentCandidateSuperseded ||
 		candidate.BranchRef != branchRef || candidate.BranchGeneration != generation {
+		return nil, nil
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, id)
+	if err != nil {
+		return nil, err
+	}
+	if failure.exhaustedSuccessors {
+		proven, proofErr := proveLegacyExhaustedCandidateSuccessors(
+			ctx, db, drain, candidate)
+		if proofErr != nil {
+			return nil, proofErr
+		}
+		if !proven {
+			return nil, nil
+		}
+	}
+	counts, err := publicationDrainCountsForTarget(ctx, db, drain.EventSeqs)
+	if err != nil {
+		return nil, err
+	}
+	if counts.terminal != 0 {
+		return nil, nil
+	}
+	var recoverablePublication int
+	if err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT EXISTS(
+    SELECT 1 FROM self_publications
+    WHERE branch_ref=? AND branch_generation=?
+      AND phase IN ('prepared','git_applied')
+)`, branchRef, generation).Scan(&recoverablePublication); err != nil {
+		return nil, err
+	}
+	if recoverablePublication != 0 {
+		return nil, nil
+	}
+	nowTS := float64(now.UnixNano()) / 1e9
+	if nowTS < drain.UpdatedTS {
+		nowTS = drain.UpdatedTS
+	}
+	reopened, err := state.ReopenPublicationDrainCheckpointing(
+		ctx, db, drain.ID, recordedError, nowTS)
+	if err != nil {
+		return nil, err
+	}
+	return &reopened, nil
+}
+
+type terminalCandidateDrainFailure struct {
+	candidateID         string
+	exhaustedSuccessors bool
+}
+
+func recoverableTerminalCandidateDrain(
+	reason string,
+) (terminalCandidateDrainFailure, bool) {
+	candidateID, collision := strings.CutPrefix(
+		reason, supersededCandidateDrainErrorPrefix)
+	exhaustedSuccessors := false
+	if collision {
+		candidateID, collision = strings.CutSuffix(
+			candidateID, supersededCandidateDrainErrorSuffix)
+		if collision && strings.HasPrefix(candidateID, "intent-successor-") {
+			return terminalCandidateDrainFailure{}, false
+		}
+	} else {
+		candidateID, collision = strings.CutPrefix(
+			reason, exhaustedCandidateSuccessorDrainErrorPrefix)
+		if collision {
+			exhaustedSuccessors = true
+			candidateID, collision = strings.CutSuffix(
+				candidateID, exhaustedCandidateSuccessorDrainErrorSuffix)
+		}
+	}
+	if !collision || candidateID == "" || len(candidateID) > 128 ||
+		strings.TrimSpace(candidateID) != candidateID ||
+		strings.Contains(candidateID, "\"") {
+		return terminalCandidateDrainFailure{}, false
+	}
+	return terminalCandidateDrainFailure{
+		candidateID: candidateID, exhaustedSuccessors: exhaustedSuccessors,
+	}, true
+}
+
+func proveLegacyExhaustedCandidateSuccessors(
+	ctx context.Context,
+	db *state.DB,
+	drain state.PublicationDrain,
+	base state.IntentCandidate,
+) (bool, error) {
+	if base.PublishedCommitOID.Valid || base.Status != state.IntentCandidateSuperseded {
+		return false, nil
+	}
+	history, err := state.IntentCandidateEventHistory(ctx, db, base.ID)
+	if err != nil {
+		return false, err
+	}
+	if len(history) == 0 || len(history) > ai.IntentCandidateCaptureCap {
+		return false, nil
+	}
+	target := make(map[int64]struct{}, len(drain.EventSeqs))
+	for _, seq := range drain.EventSeqs {
+		target[seq] = struct{}{}
+	}
+	selectedSeqs := make([]int64, 0, len(history))
+	seen := make(map[int64]struct{}, len(history))
+	for _, member := range history {
+		if member.MembershipState != state.IntentMembershipSuperseded ||
+			member.EventSeq <= 0 {
+			return false, nil
+		}
+		if _, duplicate := seen[member.EventSeq]; duplicate {
+			return false, nil
+		}
+		if _, inside := target[member.EventSeq]; !inside {
+			return false, nil
+		}
+		seen[member.EventSeq] = struct{}{}
+		selectedSeqs = append(selectedSeqs, member.EventSeq)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(selectedSeqs)), ",")
+	args := make([]any, 0, len(selectedSeqs))
+	for _, seq := range selectedSeqs {
+		args = append(args, seq)
+	}
+	var pendingMembers int
+	if err := db.ReadSQL().QueryRowContext(ctx, fmt.Sprintf(`
+SELECT COUNT(*) FROM capture_events
+WHERE state='pending' AND seq IN (%s)`, placeholders), args...).Scan(
+		&pendingMembers); err != nil {
+		return false, err
+	}
+	if pendingMembers != len(selectedSeqs) {
+		return false, nil
+	}
+
+	for attempt := 1; attempt <= state.IntentCandidateMaxOpenPerPair; attempt++ {
+		candidateID := legacyIntentCandidateSuccessorID(
+			base.ID, drain.BranchRef, drain.BranchGeneration, selectedSeqs, attempt)
+		candidate, found, loadErr := state.IntentCandidateByID(
+			ctx, db, candidateID)
+		if loadErr != nil {
+			return false, loadErr
+		}
+		if !found || candidate.BranchRef != drain.BranchRef ||
+			candidate.BranchGeneration != drain.BranchGeneration ||
+			candidate.Status != state.IntentCandidateSuperseded ||
+			candidate.PublishedCommitOID.Valid {
+			return false, nil
+		}
+		candidateHistory, historyErr := state.IntentCandidateEventHistory(
+			ctx, db, candidateID)
+		if historyErr != nil {
+			return false, historyErr
+		}
+		if !sameSupersededIntentMembership(candidateHistory, selectedSeqs) {
+			return false, nil
+		}
+	}
+
+	var unresolvedDrains int
+	var activeRepair, activeOperation int
+	if err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT
+  (SELECT COUNT(*) FROM publication_drains
+   WHERE branch_ref=? AND branch_generation=? AND phase<>'completed'),
+  EXISTS(SELECT 1 FROM intent_repairs
+         WHERE branch_ref=? AND branch_generation=?
+           AND status IN ('prepared','git_applied')),
+  EXISTS(SELECT 1 FROM operations
+         WHERE worktree_id=? AND status IN ('prepared','active'))`,
+		drain.BranchRef, drain.BranchGeneration,
+		drain.BranchRef, drain.BranchGeneration, drain.WorktreeID,
+	).Scan(&unresolvedDrains, &activeRepair, &activeOperation); err != nil {
+		return false, err
+	}
+	return unresolvedDrains == 1 && activeRepair == 0 && activeOperation == 0, nil
+}
+
+func sameSupersededIntentMembership(
+	history []state.IntentCandidateEvent,
+	selectedSeqs []int64,
+) bool {
+	if len(history) != len(selectedSeqs) {
+		return false
+	}
+	for index, member := range history {
+		if member.MembershipState != state.IntentMembershipSuperseded ||
+			member.EventSeq != selectedSeqs[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// RecoverSoftDependencyCapPublicationDrain reopens a drain stopped by the
+// legacy graph builder after soft semantic evidence filled the shared edge
+// budget. The current builder reconstructs active evidence, keeps every hard
+// edge, and prunes only excess soft edges. New hard-cap and cycle failures use
+// distinct errors and remain needs_action.
+func RecoverSoftDependencyCapPublicationDrain(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	now time.Time,
+) (*state.PublicationDrain, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id,last_error FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	var id, recordedError string
+	if err := rows.Scan(&id, &recordedError); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if !legacySoftDependencyCapDrainError(recordedError) {
 		return nil, nil
 	}
 	drain, err := state.PublicationDrainByID(ctx, db, id)
@@ -297,6 +615,9 @@ SELECT EXISTS(
 		return nil, nil
 	}
 	nowTS := float64(now.UnixNano()) / 1e9
+	if nowTS < drain.UpdatedTS {
+		nowTS = drain.UpdatedTS
+	}
 	reopened, err := state.ReopenPublicationDrainCheckpointing(
 		ctx, db, drain.ID, recordedError, nowTS)
 	if err != nil {
@@ -318,10 +639,12 @@ func RestartablePublicationDrainForPair(
 	rows, err := db.ReadSQL().QueryContext(ctx, `
 SELECT id FROM publication_drains
 WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
-  AND (last_error LIKE ? OR last_error=? COLLATE BINARY)
+  AND (last_error LIKE ? OR last_error=? COLLATE BINARY
+       OR last_error=? COLLATE BINARY)
 ORDER BY created_ts DESC,id DESC LIMIT 2`,
 		branchRef, generation, publicationDrainHeadChangedPrefix+"%",
-		publicationDrainRecoveredTargetError)
+		publicationDrainRecoveredTargetError,
+		PublicationDrainSemanticMessageUnavailableReason)
 	if err != nil {
 		return nil, err
 	}
@@ -366,15 +689,22 @@ func ResumePublicationDrainCheckpointing(
 		strings.HasPrefix(drain.LastError, publicationDrainHeadChangedPrefix)
 	recheckingRecoveredTarget := drain.Phase == state.PublicationDrainNeedsAction &&
 		drain.LastError == publicationDrainRecoveredTargetError
+	recheckingSemanticMessage := drain.Phase == state.PublicationDrainNeedsAction &&
+		drain.LastError == PublicationDrainSemanticMessageUnavailableReason
 	if drain.Phase != state.PublicationDrainCheckpointing &&
-		!recheckingHeadAdvance && !recheckingRecoveredTarget {
+		!recheckingHeadAdvance && !recheckingRecoveredTarget &&
+		!recheckingSemanticMessage {
 		return drain, nil
 	}
 	fail := func(reason error) (state.PublicationDrain, error) {
-		if recheckingHeadAdvance || recheckingRecoveredTarget {
+		if recheckingHeadAdvance || recheckingRecoveredTarget ||
+			recheckingSemanticMessage {
 			return drain, nil
 		}
 		nowTS := float64(now.UnixNano()) / 1e9
+		if nowTS < drain.UpdatedTS {
+			nowTS = drain.UpdatedTS
+		}
 		update := PublicationDrainUpdateFrom(drain, nowTS, drain.LastProgressTS)
 		update.Phase = state.PublicationDrainNeedsAction
 		update.LastError = reason.Error()
@@ -444,8 +774,12 @@ func ResumePublicationDrainCheckpointing(
 		}
 		return fail(err)
 	}
-	if recheckingHeadAdvance || recheckingRecoveredTarget {
+	if recheckingHeadAdvance || recheckingRecoveredTarget ||
+		recheckingSemanticMessage {
 		nowTS := float64(now.UnixNano()) / 1e9
+		if nowTS < drain.UpdatedTS {
+			nowTS = drain.UpdatedTS
+		}
 		drain, err = state.ReopenPublicationDrainCheckpointing(
 			ctx, db, drain.ID, drain.LastError, nowTS)
 		if err != nil {
@@ -453,6 +787,7 @@ func ResumePublicationDrainCheckpointing(
 		}
 		recheckingHeadAdvance = false
 		recheckingRecoveredTarget = false
+		recheckingSemanticMessage = false
 	}
 	if drain.StagedConsent && !drain.StagedConsumed {
 		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
@@ -461,6 +796,9 @@ func ResumePublicationDrainCheckpointing(
 		}
 	}
 	nowTS := float64(now.UnixNano()) / 1e9
+	if nowTS < drain.UpdatedTS {
+		nowTS = drain.UpdatedTS
+	}
 	update := PublicationDrainUpdateFrom(drain, nowTS, nowTS)
 	update.Phase = state.PublicationDrainSemantic
 	update.StagedConsumed = drain.StagedConsent
@@ -1280,7 +1618,14 @@ func UpdatePublicationDrainAfterReplay(
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
 	if !progressed && summary.Disposition == ReplayDispositionTransientWait {
-		if summary.SkippedReason == intentVerificationResourceWaitSkipReason {
+		if publicationDrainSemanticMessageExhausted(drain, summary) {
+			update.Phase = state.PublicationDrainNeedsAction
+			update.LastError = PublicationDrainSemanticMessageUnavailableReason
+			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+		}
+		if summary.SkippedReason == "intent_v2_waiting_message_rewrite" {
+			update.LastError = strings.TrimSpace(summary.DispositionReason)
+		} else if summary.SkippedReason == intentVerificationResourceWaitSkipReason {
 			update.LastError = intentVerificationResourceWaitReason
 		}
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
