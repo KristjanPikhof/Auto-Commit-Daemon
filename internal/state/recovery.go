@@ -410,6 +410,44 @@ func loadUnpublishedRecoveryChainBounded(
 	firstSeq int64,
 	limit int,
 ) ([]RecoveryChainEvent, error) {
+	if limit < 1 || limit > CompletedBranchTransitionProofLimit {
+		return nil, fmt.Errorf(
+			"state: LoadUnpublishedRecoveryChainBounded: invalid limit %d", limit)
+	}
+	return loadUnpublishedRecoveryChainWithBounds(
+		ctx, q, branchRef, branchGeneration, firstSeq,
+		limit, limit, ErrCompletedBranchTransitionProof)
+}
+
+func loadUnpublishedRecoveryChainExact(
+	ctx context.Context,
+	q recoveryQueryer,
+	branchRef string,
+	branchGeneration int64,
+	firstSeq int64,
+	eventCount int,
+	opCount int,
+) ([]RecoveryChainEvent, error) {
+	if eventCount < 1 || eventCount > CompletedBranchTransitionProofLimit ||
+		opCount < 0 || opCount > CompletedBranchTransitionProofLimit {
+		return nil, fmt.Errorf(
+			"state: exact unpublished recovery bounds are invalid")
+	}
+	return loadUnpublishedRecoveryChainWithBounds(
+		ctx, q, branchRef, branchGeneration, firstSeq,
+		eventCount, opCount, ErrRecoveryChainChanged)
+}
+
+func loadUnpublishedRecoveryChainWithBounds(
+	ctx context.Context,
+	q recoveryQueryer,
+	branchRef string,
+	branchGeneration int64,
+	firstSeq int64,
+	eventLimit int,
+	opLimit int,
+	overflowErr error,
+) ([]RecoveryChainEvent, error) {
 	if branchRef == "" {
 		return nil, fmt.Errorf(
 			"state: LoadUnpublishedRecoveryChainBounded: empty branch_ref")
@@ -424,10 +462,6 @@ func loadUnpublishedRecoveryChainBounded(
 			"state: LoadUnpublishedRecoveryChainBounded: invalid first_seq %d",
 			firstSeq)
 	}
-	if limit < 1 || limit > CompletedBranchTransitionProofLimit {
-		return nil, fmt.Errorf(
-			"state: LoadUnpublishedRecoveryChainBounded: invalid limit %d", limit)
-	}
 
 	rows, err := q.QueryContext(ctx, `
 SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
@@ -441,7 +475,7 @@ ORDER BY seq ASC
 LIMIT ?`,
 		branchRef, branchGeneration, firstSeq,
 		EventStatePending, EventStateBlockedConflict, EventStateFailed,
-		limit+1)
+		eventLimit+1)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"state: load bounded unpublished recovery events: %w", err)
@@ -469,10 +503,10 @@ LIMIT ?`,
 		return nil, fmt.Errorf(
 			"state: close bounded unpublished recovery events: %w", err)
 	}
-	if len(chain) > limit {
+	if len(chain) > eventLimit {
 		return nil, fmt.Errorf(
 			"%w: unpublished recovery suffix exceeds %d events",
-			ErrCompletedBranchTransitionProof, limit)
+			overflowErr, eventLimit)
 	}
 	if len(chain) == 0 {
 		return nil, nil
@@ -497,7 +531,7 @@ ORDER BY op.event_seq ASC, op.ord ASC
 LIMIT ?`,
 		branchRef, branchGeneration, firstSeq, lastSeq,
 		EventStatePending, EventStateBlockedConflict, EventStateFailed,
-		limit+1)
+		opLimit+1)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"state: load bounded unpublished recovery operations: %w", err)
@@ -514,18 +548,18 @@ LIMIT ?`,
 				"state: scan bounded unpublished recovery operation: %w", err)
 		}
 		opCount++
-		if opCount > limit {
+		if opCount > opLimit {
 			_ = opRows.Close()
 			return nil, fmt.Errorf(
 				"%w: unpublished recovery suffix exceeds %d operations",
-				ErrCompletedBranchTransitionProof, limit)
+				overflowErr, opLimit)
 		}
 		i, ok := bySeq[op.EventSeq]
 		if !ok {
 			_ = opRows.Close()
 			return nil, fmt.Errorf(
 				"%w: bounded recovery operation references unselected event %d",
-				ErrCompletedBranchTransitionProof, op.EventSeq)
+				overflowErr, op.EventSeq)
 		}
 		chain[i].Ops = append(chain[i].Ops, op)
 	}
@@ -599,9 +633,17 @@ func TransitionRecoveryChain(ctx context.Context, d *DB, req RecoveryChainTransi
 	first := req.Expected[0].Event
 	var actual []RecoveryChainEvent
 	if req.AdoptedBranchHead != "" {
-		actual, err = loadUnpublishedRecoveryChainBounded(
+		expectedEventCount := len(req.Expected) + len(req.ExpectedLater)
+		expectedOpCount := 0
+		for _, item := range req.Expected {
+			expectedOpCount += len(item.Ops)
+		}
+		for _, item := range req.ExpectedLater {
+			expectedOpCount += len(item.Ops)
+		}
+		actual, err = loadUnpublishedRecoveryChainExact(
 			ctx, tx, first.BranchRef, first.BranchGeneration, first.Seq,
-			CompletedBranchTransitionProofLimit)
+			expectedEventCount, expectedOpCount)
 	} else {
 		actual, err = loadUnpublishedRecoveryChain(
 			ctx, tx, first.BranchRef, first.BranchGeneration, first.Seq)
@@ -942,11 +984,19 @@ func validateRecoveryTransition(req RecoveryChainTransition) error {
 		len(req.Expected)+len(req.ExpectedLater))
 	expectedAll = append(expectedAll, req.Expected...)
 	expectedAll = append(expectedAll, req.ExpectedLater...)
+	if req.AdoptedBranchHead != "" &&
+		len(expectedAll) > CompletedBranchTransitionProofLimit {
+		return fmt.Errorf(
+			"%w: branch adoption exceeds %d events",
+			ErrCompletedBranchTransitionProof,
+			CompletedBranchTransitionProofLimit)
+	}
 	first := expectedAll[0].Event
 	if first.BranchRef == "" || first.BranchGeneration < 1 || first.Seq < 1 {
 		return fmt.Errorf("state: TransitionRecoveryChain: invalid first event provenance")
 	}
 	prevSeq := int64(0)
+	opCount := 0
 	for i, expected := range expectedAll {
 		ev := expected.Event
 		if ev.Seq <= prevSeq {
@@ -967,6 +1017,14 @@ func validateRecoveryTransition(req RecoveryChainTransition) error {
 			if op.EventSeq != ev.Seq || op.Ord != ord || op.Op == "" || op.Path == "" || op.Fidelity == "" {
 				return fmt.Errorf("state: TransitionRecoveryChain: invalid op provenance seq=%d ord=%d", ev.Seq, ord)
 			}
+		}
+		opCount += len(expected.Ops)
+		if req.AdoptedBranchHead != "" &&
+			opCount > CompletedBranchTransitionProofLimit {
+			return fmt.Errorf(
+				"%w: branch adoption exceeds %d operations",
+				ErrCompletedBranchTransitionProof,
+				CompletedBranchTransitionProofLimit)
 		}
 		prevSeq = ev.Seq
 	}
