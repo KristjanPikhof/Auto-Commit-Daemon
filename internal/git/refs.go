@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrRefNotFound is returned by RevParse when the requested rev does not
@@ -391,6 +392,22 @@ func withLockedExpectedRef(
 	requireRecoveryNamespace bool,
 	fn func(context.Context) error,
 ) error {
+	return withLockedExpectedRefTimeout(
+		ctx, repoDir, ref, expectedOID, secondaryRef, secondaryExpectedOID,
+		requireRecoveryNamespace, DefaultWriteTimeout, fn)
+}
+
+func withLockedExpectedRefTimeout(
+	ctx context.Context,
+	repoDir string,
+	ref string,
+	expectedOID string,
+	secondaryRef string,
+	secondaryExpectedOID string,
+	requireRecoveryNamespace bool,
+	transactionTimeout time.Duration,
+	fn func(context.Context) error,
+) error {
 	if repoDir == "" {
 		return fmt.Errorf("git: locked ref verification called with empty repoDir")
 	}
@@ -409,8 +426,14 @@ func withLockedExpectedRef(
 	if fn == nil {
 		return fmt.Errorf("git: locked ref verification called with nil callback")
 	}
+	if transactionTimeout <= 0 {
+		return fmt.Errorf("git: locked ref verification called with invalid timeout")
+	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if secondaryRef != "" {
 		if !isValidFullRef(secondaryRef) || secondaryRef == ref {
@@ -421,10 +444,14 @@ func withLockedExpectedRef(
 			return fmt.Errorf("git: secondary locked ref has invalid expected OID")
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, DefaultWriteTimeout)
-	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", "update-ref", "--no-deref", "--stdin")
+	// Do not bind the process to a context. Once Git prepares the transaction,
+	// this process owns the exact-ref locks proving the callback's cross-store
+	// mutation. Caller cancellation and the callback deadline must remain
+	// visible to the callback without killing Git underneath a commit that is
+	// still finishing. Preparation is bounded before the callback, and cleanup
+	// gets a fresh bound after the callback returns.
+	cmd := exec.Command("git", "update-ref", "--no-deref", "--stdin")
 	cmd.Dir = repoDir
 	cmd.Env = scrubEnv(nil)
 	stdin, err := cmd.StdinPipe()
@@ -478,28 +505,80 @@ func withLockedExpectedRef(
 		return fmt.Errorf("git: recovery ref transaction %s: %w", action, err)
 	}
 
+	prepareCtx, prepareCancel := context.WithTimeout(ctx, transactionTimeout)
+	defer prepareCancel()
+	prepareWatchdogDone := make(chan struct{})
+	stopPrepareWatchdog := context.AfterFunc(prepareCtx, func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		close(prepareWatchdogDone)
+	})
+	prepareWatchdogStopped := false
+	defer func() {
+		if prepareWatchdogStopped {
+			return
+		}
+		if !stopPrepareWatchdog() {
+			<-prepareWatchdogDone
+		}
+	}()
+	failPrepare := func(action string, err error) error {
+		protocolErr := fail(action, err)
+		if ctxErr := prepareCtx.Err(); ctxErr != nil {
+			return errors.Join(ctxErr, protocolErr)
+		}
+		return protocolErr
+	}
+
 	if err := write("start"); err != nil {
-		return fail("start", err)
+		return failPrepare("start", err)
 	}
 	if err := expectOK("start"); err != nil {
-		return fail("start", err)
+		return failPrepare("start", err)
 	}
 	if err := write("verify " + ref + " " + expectedOID); err != nil {
-		return fail("verify", err)
+		return failPrepare("verify", err)
 	}
 	if secondaryRef != "" {
 		if err := write("verify " + secondaryRef + " " + secondaryExpectedOID); err != nil {
-			return fail("verify secondary", err)
+			return failPrepare("verify secondary", err)
 		}
 	}
 	if err := write("prepare"); err != nil {
-		return fail("prepare", err)
+		return failPrepare("prepare", err)
 	}
 	if err := expectOK("prepare"); err != nil {
-		return fail("prepare", err)
+		return failPrepare("prepare", err)
 	}
+	if !stopPrepareWatchdog() {
+		<-prepareWatchdogDone
+		prepareWatchdogStopped = true
+		if err := prepareCtx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("git: recovery ref transaction preparation watchdog fired")
+	}
+	prepareWatchdogStopped = true
+	prepareCancel()
 
-	if callbackErr := fn(ctx); callbackErr != nil {
+	callbackCtx, callbackCancel := context.WithTimeout(ctx, transactionTimeout)
+	callbackErr := fn(callbackCtx)
+	callbackCancel()
+
+	cleanupWatchdogDone := make(chan struct{})
+	cleanupTimer := time.AfterFunc(transactionTimeout, func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		close(cleanupWatchdogDone)
+	})
+	defer func() {
+		if !cleanupTimer.Stop() {
+			<-cleanupWatchdogDone
+		}
+	}()
+	if callbackErr != nil {
 		abortErr := write("abort")
 		if abortErr == nil {
 			abortErr = expectOK("abort")
