@@ -67,6 +67,11 @@ const shadowBootstrapChunkSize = 5000
 // disabled by configuration.
 const maxPreservedShadowPaths = DefaultMaxPendingEvents * 2
 
+const (
+	maxAdoptedShadowPaths = DefaultMaxPendingEvents * 4
+	maxAdoptedShadowBytes = 64 << 20
+)
+
 // MetaKeyShadowBootstrappedPrefix is the daemon_meta key prefix used to mark
 // a (branch_ref, branch_generation) pair as fully seeded. The full key is
 // formatted by ShadowBootstrappedKey.
@@ -339,9 +344,22 @@ func BuildShadowFromHeadPreservingUnpublished(
 		}
 	}
 
-	entries, err := git.LsTree(ctx, repoDir, cctx.BaseHead, true)
+	entries, err := git.LsTreeLimited(
+		ctx, repoDir, cctx.BaseHead, true, maxAdoptedShadowBytes)
 	if err != nil {
+		if errors.Is(err, git.ErrStdoutOverflow) {
+			return nil, fmt.Errorf(
+				"%w: adopted shadow tree exceeds %d bytes",
+				state.ErrCompletedBranchTransitionProof,
+				maxAdoptedShadowBytes)
+		}
 		return nil, fmt.Errorf("daemon: preserve unpublished shadow: ls-tree HEAD: %w", err)
+	}
+	if len(entries) > maxAdoptedShadowPaths {
+		return nil, fmt.Errorf(
+			"%w: adopted shadow tree exceeds %d paths",
+			state.ErrCompletedBranchTransitionProof,
+			maxAdoptedShadowPaths)
 	}
 	merged := make(map[string]state.ShadowPath, len(entries)+len(terminal))
 	for _, entry := range entries {
@@ -379,6 +397,12 @@ func BuildShadowFromHeadPreservingUnpublished(
 			}
 		}
 	}
+	if len(merged) > maxAdoptedShadowPaths {
+		return nil, fmt.Errorf(
+			"%w: adopted shadow exceeds %d paths after pending overlay",
+			state.ErrCompletedBranchTransitionProof,
+			maxAdoptedShadowPaths)
+	}
 	paths := make([]string, 0, len(merged))
 	for path := range merged {
 		paths = append(paths, path)
@@ -389,23 +413,6 @@ func BuildShadowFromHeadPreservingUnpublished(
 		mergedRows = append(mergedRows, merged[path])
 	}
 	return mergedRows, nil
-}
-
-func ReseedShadowFromHeadPreservingUnpublished(
-	ctx context.Context,
-	repoDir string,
-	db *state.DB,
-	cctx CaptureContext,
-	chain []state.RecoveryChainEvent,
-) (int, error) {
-	rows, err := BuildShadowFromHeadPreservingUnpublished(
-		ctx, repoDir, cctx, chain)
-	if err != nil {
-		return 0, err
-	}
-	return state.ReplaceShadowGeneration(
-		ctx, db, cctx.BranchRef, cctx.BranchGeneration,
-		ShadowBootstrappedKey(cctx.BranchRef, cctx.BranchGeneration), rows)
 }
 
 func setShadowBootstrappedMarker(ctx context.Context, db *state.DB, cctx CaptureContext) error {
