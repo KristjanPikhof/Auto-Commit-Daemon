@@ -335,6 +335,14 @@ type ReplaySummary struct {
 	// circuit redirected the pass to a local unlock.
 	RecoveryMode       string
 	PlannerCircuitOpen bool
+	// Planner health details let the durable publication drain distinguish a
+	// temporary circuit wait from a provider that exhausted its backoff ladder.
+	// The fingerprint binds that evidence to the drain's frozen runtime.
+	PlannerProviderFingerprint     string
+	PlannerCircuitBackoffLevel     int
+	PlannerCircuitFailureCount     int
+	PlannerMaxBackoffProbeFailures int
+	PlannerCircuitLastFailureTS    float64
 	// RecoveryPrefixCandidateCount and RecoveryPrefixTotalCandidates describe
 	// the anchored semantic prefix attempted by local unlock. They are used to
 	// widen verification without falling back to raw capture adjacency.
@@ -414,6 +422,17 @@ func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
 // branch_generation and lets the queue drain naturally).
 func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (sum ReplaySummary, replayErr error) {
 	defer func() {
+		if opts.IntentHealth != nil {
+			circuit := opts.IntentHealth.Snapshot()
+			sum.PlannerCircuitOpen = circuit.State == IntentPlannerCircuitOpen &&
+				!circuit.RecoveryReady
+			sum.PlannerProviderFingerprint = circuit.ProviderFingerprint
+			sum.PlannerCircuitBackoffLevel = circuit.BackoffLevel
+			sum.PlannerCircuitFailureCount = circuit.ConsecutiveFailures
+			sum.PlannerMaxBackoffProbeFailures =
+				circuit.MaxBackoffProbeFailures
+			sum.PlannerCircuitLastFailureTS = circuit.LastFailureTS
+		}
 		classifyReplayDisposition(&sum, replayErr)
 	}()
 	if repoRoot == "" || db == nil {
@@ -1568,9 +1587,6 @@ func replayIntentBatch(
 ) (ReplaySummary, error) {
 	if cfg.atomicFallback {
 		sum.RecoveryMode = publicationFallbackLocalUnlock
-		circuit := opts.IntentHealth.Snapshot()
-		sum.PlannerCircuitOpen = circuit.State == IntentPlannerCircuitOpen &&
-			!circuit.RecoveryReady
 	} else if cfg.semanticSalvage {
 		sum.RecoveryMode = publicationFallbackSemanticReplan
 	}
