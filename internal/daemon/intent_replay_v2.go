@@ -1279,11 +1279,11 @@ func runtimeIntentDependencyHints(
 		}
 		items = append(items, item)
 	}
-	var hints []IntentDependencyHint
+	var hardHints []IntentDependencyHint
+	var softHints []IntentDependencyHint
 	seen := map[string]struct{}{}
 	add := func(from, to int64, strength ai.IntentDependencyStrength, kind, evidence string) {
-		if from <= 0 || to <= 0 || from == to || evidence == "" ||
-			len(hints) >= state.IntentDependencyMaxPerPair {
+		if from <= 0 || to <= 0 || from == to || evidence == "" {
 			return
 		}
 		key := fmt.Sprintf("%d:%d:%s:%s", from, to, strength, kind)
@@ -1291,10 +1291,20 @@ func runtimeIntentDependencyHints(
 			return
 		}
 		seen[key] = struct{}{}
-		hints = append(hints, IntentDependencyHint{
+		hint := IntentDependencyHint{
 			PrerequisiteSeq: from, DependentSeq: to,
 			Strength: strength, Kind: kind, Evidence: evidence,
-		})
+		}
+		if strength == ai.IntentDependencyHard {
+			// One edge beyond the cap is enough for the builder to fail closed.
+			if len(hardHints) <= state.IntentDependencyMaxPerPair {
+				hardHints = append(hardHints, hint)
+			}
+			return
+		}
+		if len(softHints) < state.IntentDependencyMaxPerPair {
+			softHints = append(softHints, hint)
+		}
 	}
 	for i := range items {
 		for j := i + 1; j < len(items); j++ {
@@ -1341,7 +1351,7 @@ func runtimeIntentDependencyHints(
 			}
 		}
 	}
-	return hints
+	return append(hardHints, softHints...)
 }
 
 func runtimeIntentSymbols(diff string) map[string]struct{} {
