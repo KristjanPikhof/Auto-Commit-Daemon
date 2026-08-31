@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -224,6 +225,45 @@ func TestExternalBridgeFirstParentProofRejectsBackwardReset(t *testing.T) {
 	if err != nil || matched || target != "" {
 		t.Fatalf("target=%q matched=%t err=%v want ordinary no-match",
 			target, matched, err)
+	}
+}
+
+func TestExternalBridgeAncestryProofFailsClosedPastBound(t *testing.T) {
+	proof := externalRepairBridgeAncestry{
+		commits:   map[string]struct{}{"reachable": {}},
+		truncated: true,
+	}
+	if reachable, err := proof.contains("reachable"); err != nil || !reachable {
+		t.Fatalf("known reachability=(%t,%v), want (true,nil)", reachable, err)
+	}
+	if reachable, err := proof.contains("beyond-bound"); reachable ||
+		!errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+		t.Fatalf("unknown reachability=(%t,%v), want bounded proof error",
+			reachable, err)
+	}
+}
+
+func TestExternalRepairEvidenceBudgetAggregatesAdjacentRepairs(t *testing.T) {
+	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{
+		includePriorRepair: true,
+	})
+	evidence := newExternalRepairEvidence(
+		f.capture.db, f.capture.dir, f.capture.cctx.BranchRef,
+		f.capture.cctx.BranchGeneration)
+	// The nearest repair has one commit row and two member rows. Leave only
+	// one row afterward so the adjacent repair's two rows must fail against
+	// the same remaining budget instead of receiving a fresh per-repair cap.
+	evidence.budget.remaining = 4
+	if _, err := evidence.loadRepair(
+		context.Background(), "external-repair-bridge"); err != nil {
+		t.Fatalf("load nearest repair: %v", err)
+	}
+	if evidence.budget.remaining != 1 {
+		t.Fatalf("remaining budget=%d want 1", evidence.budget.remaining)
+	}
+	if _, err := evidence.loadRepair(
+		context.Background(), "external-prior-repair"); !errors.Is(err, state.ErrCompletedBranchTransitionProof) {
+		t.Fatalf("adjacent repair err=%v want shared proof-budget error", err)
 	}
 }
 
@@ -540,9 +580,10 @@ func seedCompletedExternalBridgeRepair(
 INSERT INTO intent_repairs(
     id,branch_ref,branch_generation,status,expected_head,plan_digest,
     backup_ref,old_head,new_head,created_ts,updated_ts,error
-) VALUES (?, ?, ?, 'prepared', ?, 'bridge-digest', ?, ?, ?, 1, 1, '')`,
+) VALUES (?, ?, ?, 'prepared', ?, ?, ?, ?, ?, 1, 1, '')`,
 		repairID, f.cctx.BranchRef, f.cctx.BranchGeneration,
-		oldHead, "refs/acd/intent-repair/test/"+repairID+"/backup",
+		oldHead, "sha256:"+strings.Repeat("0", 64),
+		"refs/acd/intent-repair/test/"+repairID+"/backup",
 		oldHead, newHead); err != nil {
 		t.Fatalf("insert repair: %v", err)
 	}
@@ -565,6 +606,20 @@ INSERT INTO intent_repair_member_seals(
     repair_id,membership_mode,member_count
 ) VALUES (?, 'frozen', ?)`, repairID, len(eventSeqs)); err != nil {
 		t.Fatalf("seal repair membership: %v", err)
+	}
+	repair, ok, err := state.IntentRepairByID(ctx, f.db, repairID)
+	if err != nil || !ok {
+		t.Fatalf("load prepared repair=(%t,%v)", ok, err)
+	}
+	digest, err := recoveredIntentRepairPlanDigest(
+		ctx, f.dir, repair, repair.Commits)
+	if err != nil {
+		t.Fatalf("digest prepared repair: %v", err)
+	}
+	if _, err := f.db.SQL().ExecContext(ctx, `
+UPDATE intent_repairs SET plan_digest=? WHERE id=? AND status='prepared'`,
+		digest, repairID); err != nil {
+		t.Fatalf("seal repair plan digest: %v", err)
 	}
 	if _, err := f.db.SQL().ExecContext(ctx, `
 UPDATE intent_repairs
