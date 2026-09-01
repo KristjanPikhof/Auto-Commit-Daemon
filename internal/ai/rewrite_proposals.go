@@ -17,6 +17,144 @@ type CommitRewriteProposer interface {
 	ProposeCommitRewrite(ctx context.Context, req CommitRewriteRequest) (Result, error)
 }
 
+const (
+	HistoryRewritePerCommitDiffCap = IntentStageDiffCap
+	HistoryRewriteTotalDiffCap     = 128 * 1024
+	HistoryRewriteRequestByteCap   = 512 * 1024
+)
+
+// HistoryRewritePlanner groups a selected linear history and proposes one
+// message for each resulting commit.
+type HistoryRewritePlanner interface {
+	Name() string
+	ProposeHistoryRewritePlan(context.Context, HistoryRewritePlanRequest) (HistoryRewritePlan, error)
+}
+
+// HistoryRewriteCommit is bounded evidence for one selected historical commit.
+type HistoryRewriteCommit struct {
+	OldOID          string                   `json:"old_oid"`
+	Position        int                      `json:"position"`
+	OriginalMessage string                   `json:"original_message"`
+	AuthorName      string                   `json:"author_name"`
+	AuthorEmail     string                   `json:"author_email"`
+	ChangedPaths    []string                 `json:"changed_paths"`
+	DiffStat        string                   `json:"diff_stat,omitempty"`
+	RedactedDiff    string                   `json:"redacted_diff,omitempty"`
+	DiffIncluded    bool                     `json:"diff_included"`
+	DecisionContext []RewriteDecisionContext `json:"acd_decision_context,omitempty"`
+}
+
+// HistoryRewritePlanRequest is the complete ordered selection presented to a
+// history rewrite planner.
+type HistoryRewritePlanRequest struct {
+	Commits      []HistoryRewriteCommit `json:"commits"`
+	CommitFormat CommitFormat           `json:"commit_format,omitempty"`
+	Now          time.Time              `json:"now,omitempty"`
+}
+
+// HistoryRewriteGroup is one proposed output commit.
+type HistoryRewriteGroup struct {
+	OldOIDs        []string `json:"old_oids"`
+	Subject        string   `json:"subject"`
+	Body           string   `json:"body,omitempty"`
+	GroupingReason string   `json:"grouping_reason"`
+}
+
+// HistoryRewritePlan is the structured result of historical grouping.
+type HistoryRewritePlan struct {
+	Groups []HistoryRewriteGroup `json:"groups"`
+	Source string                `json:"-"`
+}
+
+// BuildHistoryRewriteUserPrompt serializes the bounded historical grouping
+// request sent to providers.
+func BuildHistoryRewriteUserPrompt(req HistoryRewritePlanRequest) (string, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("history rewrite plan: marshal request: %w", err)
+	}
+	if len(body) > HistoryRewriteRequestByteCap {
+		return "", fmt.Errorf("history rewrite plan: request is %d bytes; maximum is %d bytes; select a smaller commit range", len(body), HistoryRewriteRequestByteCap)
+	}
+	return "Group these existing commits into a smaller semantic history.\n" +
+		"Return every old_oid exactly once, in the same chronological order, using contiguous groups only. Separate unrelated work even when it touches the same file. Never group commits with different author_name or author_email values.\n" +
+		"Return one evidence-grounded subject, body, and grouping_reason per group. Do not invent behavior not supported by the evidence.\n" +
+		CommitMessageFormatInstructions(req.CommitFormat) + "\n" + string(body), nil
+}
+
+// ValidateHistoryRewritePlan validates and sanitizes a provider partition.
+func ValidateHistoryRewritePlan(req HistoryRewritePlanRequest, plan HistoryRewritePlan) (HistoryRewritePlan, error) {
+	if len(req.Commits) == 0 {
+		return HistoryRewritePlan{}, errors.New("history rewrite plan: no commits were offered")
+	}
+	if len(plan.Groups) == 0 {
+		return HistoryRewritePlan{}, errors.New("history rewrite plan: groups must be non-empty")
+	}
+	byOID := make(map[string]HistoryRewriteCommit, len(req.Commits))
+	for _, commit := range req.Commits {
+		if commit.OldOID == "" {
+			return HistoryRewritePlan{}, errors.New("history rewrite plan: offered commit has an empty oid")
+		}
+		if _, ok := byOID[commit.OldOID]; ok {
+			return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: duplicate offered oid %s", commit.OldOID)
+		}
+		byOID[commit.OldOID] = commit
+	}
+	result := HistoryRewritePlan{Source: plan.Source}
+	flatIndex := 0
+	for groupIndex, group := range plan.Groups {
+		if len(group.OldOIDs) == 0 {
+			return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: groups[%d].old_oids must be non-empty", groupIndex)
+		}
+		if strings.TrimSpace(group.GroupingReason) == "" {
+			return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: groups[%d].grouping_reason must be non-empty", groupIndex)
+		}
+		first, ok := byOID[group.OldOIDs[0]]
+		if !ok {
+			return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: unknown oid %s", group.OldOIDs[0])
+		}
+		var paths []string
+		var diffs []string
+		for _, oid := range group.OldOIDs {
+			if flatIndex >= len(req.Commits) || req.Commits[flatIndex].OldOID != oid {
+				return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: groups must contain every offered oid exactly once in chronological order")
+			}
+			commit, ok := byOID[oid]
+			if !ok {
+				return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: unknown oid %s", oid)
+			}
+			if commit.AuthorName != first.AuthorName || commit.AuthorEmail != first.AuthorEmail {
+				return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: group %d crosses an author boundary at %s", groupIndex+1, oid)
+			}
+			paths = append(paths, commit.ChangedPaths...)
+			if commit.DiffIncluded {
+				diffs = append(diffs, commit.RedactedDiff)
+			}
+			flatIndex++
+		}
+		validated, err := ValidateCommitRewriteProposal(CommitRewriteRequest{
+			OldOID:       group.OldOIDs[len(group.OldOIDs)-1],
+			ChangedPaths: paths,
+			RedactedDiff: strings.Join(diffs, "\n"),
+			DiffIncluded: len(diffs) > 0,
+			CommitFormat: req.CommitFormat,
+		}, Result{Subject: group.Subject, Body: group.Body, Source: plan.Source})
+		if err != nil {
+			return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: group %d message: %w", groupIndex+1, err)
+		}
+		result.Groups = append(result.Groups, HistoryRewriteGroup{
+			OldOIDs:        append([]string(nil), group.OldOIDs...),
+			Subject:        validated.Subject,
+			Body:           validated.Body,
+			GroupingReason: strings.TrimSpace(group.GroupingReason),
+		})
+	}
+	if flatIndex != len(req.Commits) {
+		return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: groups included %d of %d offered commits", flatIndex, len(req.Commits))
+	}
+	return result, nil
+}
+
 // RewriteDecisionContext is ACD ledger context attached to the commit OID
 // being rewritten.
 type RewriteDecisionContext struct {
@@ -99,4 +237,14 @@ func (c *composed) ProposeCommitRewrite(ctx context.Context, req CommitRewriteRe
 		return Result{}, fmt.Errorf("ai: primary provider %s cannot propose commit rewrites", c.primary.Name())
 	}
 	return p.ProposeCommitRewrite(ctx, req)
+}
+
+// ProposeHistoryRewritePlan on composed providers uses only the primary
+// provider. Historical grouping never falls back to local rules.
+func (c *composed) ProposeHistoryRewritePlan(ctx context.Context, req HistoryRewritePlanRequest) (HistoryRewritePlan, error) {
+	p, ok := c.primary.(HistoryRewritePlanner)
+	if !ok {
+		return HistoryRewritePlan{}, fmt.Errorf("ai: primary provider %s cannot plan grouped history rewrites", c.primary.Name())
+	}
+	return p.ProposeHistoryRewritePlan(ctx, req)
 }
