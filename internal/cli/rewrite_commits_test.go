@@ -176,8 +176,8 @@ func TestRewriteCommitsPlanGenerationUsesPersistedSettings(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
-		selection: git.RewriteSelectionOptions{Last: 1},
-		planOnly:  true,
+		selection:    git.RewriteSelectionOptions{Last: 1},
+		planOnly:     true,
 		messagesOnly: true,
 	}, false)
 	if err != nil {
@@ -253,9 +253,9 @@ func TestRewriteCommitsPlanOnlyQuotesPlanOutPathWithSpaces(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
-		selection: git.RewriteSelectionOptions{Last: 1},
-		planOnly:  true,
-		planOut:   planPath,
+		selection:    git.RewriteSelectionOptions{Last: 1},
+		planOnly:     true,
+		planOut:      planPath,
 		messagesOnly: true,
 	}, false)
 	if err != nil {
@@ -317,11 +317,11 @@ func TestRewriteCommitsGenerationProgressEvents(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runRewriteCommits(context.Background(), &stdout, repo, rewriteCommitsOptions{
-		selection:  git.RewriteSelectionOptions{Last: 1},
-		planOnly:   true,
+		selection:    git.RewriteSelectionOptions{Last: 1},
+		planOnly:     true,
 		messagesOnly: true,
-		progress:   "json",
-		progressTo: &stderr,
+		progress:     "json",
+		progressTo:   &stderr,
 	}, false)
 	if err != nil {
 		t.Fatalf("plan-only generate: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
@@ -417,10 +417,10 @@ func TestRewriteCommitsDeclinedApplyOmitsNextFooter(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
-		selection: git.RewriteSelectionOptions{Last: 1},
-		noReview:  true,
+		selection:    git.RewriteSelectionOptions{Last: 1},
+		noReview:     true,
 		messagesOnly: true,
-		in:        strings.NewReader("n\n"),
+		in:           strings.NewReader("n\n"),
 	}, false)
 	if err != nil {
 		t.Fatalf("declined apply generate: %v\noutput:\n%s", err, out.String())
@@ -1167,7 +1167,7 @@ func TestRewriteProgressPlainIncludesBoundedCounts(t *testing.T) {
 
 	want := strings.Join([]string{
 		"History rewrite: Commit messages [42/169]: message ready",
-		"History rewrite: Applying messages [42/169]: applied the new message",
+		"History rewrite: Applying groups [42/169]: applied the new message",
 		"History rewrite: Keeping later commits [2/3]: kept a later commit unchanged",
 		"History rewrite: Plan check: plan is valid",
 		"",
