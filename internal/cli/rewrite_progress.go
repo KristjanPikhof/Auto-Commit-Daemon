@@ -124,6 +124,8 @@ func rewriteProgressPhaseLabel(phase string) string {
 		return "AI provider"
 	case "proposal":
 		return "Commit messages"
+	case "grouping":
+		return "Grouping commits"
 	case "save":
 		return "Saved plan"
 	case "validation", "apply_validate":
@@ -133,7 +135,7 @@ func rewriteProgressPhaseLabel(phase string) string {
 	case "apply_backup":
 		return "Recovery backup"
 	case "apply_recreate_selected":
-		return "Applying messages"
+		return "Applying groups"
 	case "apply_recreate_unchanged":
 		return "Keeping later commits"
 	case "apply_update_ref":
