@@ -238,7 +238,7 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	}
 
 	if plan.ValidationStatus == state.RewritePlanValidationInvalid {
-		fmt.Fprintf(out, "Plan stored as invalid: %s\n", plan.ValidationError.String)
+		fmt.Fprintf(out, "Plan stored as invalid (%s): %s\n", plan.ID, plan.ValidationError.String)
 	} else {
 		fmt.Fprintf(out, "Generated valid rewrite plan %s.\n", plan.ID)
 		printRewritePlanSummary(out, plan, selection.Selected)
@@ -251,6 +251,11 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	}
 	if plan.ValidationStatus == state.RewritePlanValidationInvalid {
 		fmt.Fprintln(out, "No commits were rewritten.")
+		planRef := plan.ID
+		if opts.planOut != "" {
+			planRef = opts.planOut
+		}
+		fmt.Fprintf(out, "Next: Repair the saved plan with `acd history rewrite --edit %s --plan-only`.\n", rewritePlanRefArg(planRef))
 		return errors.New("acd history rewrite: AI proposal validation failed; invalid plan saved and apply is blocked")
 	}
 	if opts.planOnly {
