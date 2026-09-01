@@ -106,7 +106,8 @@ func ValidateHistoryRewritePlan(req HistoryRewritePlanRequest, plan HistoryRewri
 		if len(group.OldOIDs) == 0 {
 			return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: groups[%d].old_oids must be non-empty", groupIndex)
 		}
-		if strings.TrimSpace(group.GroupingReason) == "" {
+		reason := NormalizeIntentReason(group.GroupingReason)
+		if reason == "" {
 			return HistoryRewritePlan{}, fmt.Errorf("history rewrite plan: groups[%d].grouping_reason must be non-empty", groupIndex)
 		}
 		first, ok := byOID[group.OldOIDs[0]]
@@ -146,7 +147,7 @@ func ValidateHistoryRewritePlan(req HistoryRewritePlanRequest, plan HistoryRewri
 			OldOIDs:        append([]string(nil), group.OldOIDs...),
 			Subject:        validated.Subject,
 			Body:           validated.Body,
-			GroupingReason: strings.TrimSpace(group.GroupingReason),
+			GroupingReason: reason,
 		})
 	}
 	if flatIndex != len(req.Commits) {

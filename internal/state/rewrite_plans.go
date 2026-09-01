@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 const (
@@ -517,11 +518,11 @@ func validateRewritePlanGroups(groups []RewritePlanGroup) error {
 	}
 	seen := make(map[string]struct{})
 	for i, group := range groups {
-		if len(group.Members) == 0 || group.ProposedMessage == "" || group.GroupingReason == "" {
+		if len(group.Members) == 0 || strings.TrimSpace(group.ProposedMessage) == "" || strings.TrimSpace(group.GroupingReason) == "" {
 			return fmt.Errorf("state: rewrite plan group %d: required field missing", i)
 		}
 		for j, member := range group.Members {
-			if member.OldOID == "" || member.OriginalMessage == "" {
+			if strings.TrimSpace(member.OldOID) == "" || strings.TrimSpace(member.OriginalMessage) == "" {
 				return fmt.Errorf("state: rewrite plan group %d member %d: required field missing", i, j)
 			}
 			if _, ok := seen[member.OldOID]; ok {
