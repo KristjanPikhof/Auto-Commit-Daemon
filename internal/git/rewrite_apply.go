@@ -15,11 +15,19 @@ type RewriteApplyCommit struct {
 	ProposedMessage string
 }
 
+// RewriteApplyGroup replaces one or more adjacent commits with one commit.
+type RewriteApplyGroup struct {
+	OldOIDs        []string
+	ProposedMessage string
+}
+
 // RewriteApplyOptions describes a saved rewrite plan application.
 type RewriteApplyOptions struct {
 	BranchRef    string
 	ExpectedHead string
 	PlanID       string
+	Groups       []RewriteApplyGroup
+	// Commits is retained for callers applying legacy message-only plans.
 	Commits      []RewriteApplyCommit
 	DryRun       bool
 	Now          time.Time
@@ -47,6 +55,9 @@ type RewriteApplyResult struct {
 	InternalBackupRef string
 	CommitMap         map[string]string
 	RecreatedCount    int
+	SelectedInputCount int
+	SelectedOutputCount int
+	UnchangedDescendantCount int
 }
 
 // ApplyRewritePlan safely applies a saved linear commit-message rewrite plan to
@@ -58,7 +69,13 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if opts.BranchRef == "" || opts.ExpectedHead == "" || len(opts.Commits) == 0 {
+	groups, err := rewriteApplyGroups(opts)
+	if err != nil {
+		return RewriteApplyResult{}, err
+	}
+	opts.Groups = groups
+	opts.Commits = nil
+	if opts.BranchRef == "" || opts.ExpectedHead == "" || len(opts.Groups) == 0 {
 		return RewriteApplyResult{}, fmt.Errorf("git rewrite apply: missing required plan fields")
 	}
 	if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{Phase: "validate", Message: "checking repository"}); err != nil {
@@ -108,32 +125,38 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 		res.InternalBackupRef = "refs/acd/rewrite-backups/" + sanitizeRewriteRefPart(opts.PlanID)
 	}
 
-	parent, err := firstParent(ctx, repoDir, opts.Commits[0].OldOID)
+	parent, err := firstParent(ctx, repoDir, opts.Groups[0].OldOIDs[0])
 	if err != nil {
 		return RewriteApplyResult{}, err
 	}
 	newParent := parent
-	for i, c := range opts.Commits {
-		newOID, err := recreateCommitWithMessage(ctx, repoDir, c.OldOID, c.ProposedMessage, newParent)
+	for i, group := range opts.Groups {
+		lastOID := group.OldOIDs[len(group.OldOIDs)-1]
+		newOID, err := recreateCommitWithMessage(ctx, repoDir, lastOID, group.ProposedMessage, newParent)
 		if err != nil {
 			return res, err
 		}
-		res.CommitMap[c.OldOID] = newOID
+		for _, oldOID := range group.OldOIDs {
+			res.CommitMap[oldOID] = newOID
+			res.SelectedInputCount++
+		}
 		newParent = newOID
 		res.RecreatedCount++
+		res.SelectedOutputCount++
 		if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{
 			Phase:   "recreate_selected",
-			Message: "recreated selected commit",
+			Message: fmt.Sprintf("grouped %d selected commit(s)", len(group.OldOIDs)),
 			Current: i + 1,
-			Total:   len(opts.Commits),
-			OldOID:  c.OldOID,
+			Total:   len(opts.Groups),
+			OldOID:  group.OldOIDs[0],
 			NewOID:  newOID,
 		}); err != nil {
 			return res, err
 		}
 	}
 
-	newer, err := firstParentDescendantsReverse(ctx, repoDir, opts.Commits[len(opts.Commits)-1].OldOID, head)
+	lastSelectedOID := opts.Groups[len(opts.Groups)-1].OldOIDs[len(opts.Groups[len(opts.Groups)-1].OldOIDs)-1]
+	newer, err := firstParentDescendantsReverse(ctx, repoDir, lastSelectedOID, head)
 	if err != nil {
 		return res, err
 	}
@@ -149,6 +172,7 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 		res.CommitMap[oldOID] = newOID
 		newParent = newOID
 		res.RecreatedCount++
+		res.UnchangedDescendantCount++
 		if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{
 			Phase:   "recreate_unchanged",
 			Message: "recreated unchanged descendant",
@@ -161,6 +185,17 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 		}
 	}
 	res.NewHead = newParent
+	originalTree, err := commitTreeOID(ctx, repoDir, head)
+	if err != nil {
+		return res, err
+	}
+	rewrittenTree, err := commitTreeOID(ctx, repoDir, res.NewHead)
+	if err != nil {
+		return res, err
+	}
+	if rewrittenTree != originalTree {
+		return res, errors.New("git rewrite apply: rewritten HEAD tree differs from the original; branch ref was not changed")
+	}
 	if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{Phase: "update_ref", Message: "updating branch ref", OldOID: head, NewOID: res.NewHead}); err != nil {
 		return res, err
 	}
@@ -178,36 +213,44 @@ func emitRewriteApplyProgress(opts RewriteApplyOptions, event RewriteApplyProgre
 }
 
 func validateRewriteApplyChain(ctx context.Context, repoDir string, opts RewriteApplyOptions) error {
+	if err := ValidateRewriteGroupSemantics(ctx, repoDir, opts.Groups); err != nil {
+		return err
+	}
 	seen := map[string]struct{}{}
-	for i, c := range opts.Commits {
-		if c.OldOID == "" || strings.TrimSpace(c.ProposedMessage) == "" {
-			return fmt.Errorf("git rewrite apply: commit %d missing oid or proposed message", i)
+	var flattened []string
+	for groupIndex, group := range opts.Groups {
+		if strings.TrimSpace(group.ProposedMessage) == "" {
+			return fmt.Errorf("git rewrite apply: group %d missing proposed message", groupIndex)
 		}
-		if _, ok := seen[c.OldOID]; ok {
-			return fmt.Errorf("git rewrite apply: duplicate commit %s in plan", shortApplyOID(c.OldOID))
-		}
-		seen[c.OldOID] = struct{}{}
-		if err := rejectMergeCommit(ctx, repoDir, c.OldOID); err != nil {
-			return err
-		}
-		if i > 0 {
-			p, err := firstParent(ctx, repoDir, c.OldOID)
-			if err != nil {
+		for _, oldOID := range group.OldOIDs {
+			if _, ok := seen[oldOID]; ok {
+				return fmt.Errorf("git rewrite apply: duplicate commit %s in plan", shortApplyOID(oldOID))
+			}
+			seen[oldOID] = struct{}{}
+			if err := rejectMergeCommit(ctx, repoDir, oldOID); err != nil {
 				return err
 			}
-			if p != opts.Commits[i-1].OldOID {
-				return fmt.Errorf("git rewrite apply: plan commits are not contiguous at %s", shortApplyOID(c.OldOID))
+			if len(flattened) > 0 {
+				p, err := firstParent(ctx, repoDir, oldOID)
+				if err != nil {
+					return err
+				}
+				if p != flattened[len(flattened)-1] {
+					return fmt.Errorf("git rewrite apply: plan commits are not contiguous at %s", shortApplyOID(oldOID))
+				}
 			}
+			flattened = append(flattened, oldOID)
 		}
 	}
-	isAnc, err := IsAncestor(ctx, repoDir, opts.Commits[len(opts.Commits)-1].OldOID, opts.ExpectedHead)
+	lastSelected := flattened[len(flattened)-1]
+	isAnc, err := IsAncestor(ctx, repoDir, lastSelected, opts.ExpectedHead)
 	if err != nil {
 		return fmt.Errorf("git rewrite apply: verify selected commit ancestry: %w", err)
 	}
 	if !isAnc {
 		return fmt.Errorf("git rewrite apply: selected commits are not ancestors of expected HEAD")
 	}
-	newer, err := firstParentDescendantsReverse(ctx, repoDir, opts.Commits[len(opts.Commits)-1].OldOID, opts.ExpectedHead)
+	newer, err := firstParentDescendantsReverse(ctx, repoDir, lastSelected, opts.ExpectedHead)
 	if err != nil {
 		return err
 	}
@@ -217,6 +260,92 @@ func validateRewriteApplyChain(ctx context.Context, repoDir string, opts Rewrite
 		}
 	}
 	return nil
+}
+
+// ValidateRewriteGroupSemantics checks group-local rules that require Git
+// metadata but do not mutate repository state.
+func ValidateRewriteGroupSemantics(ctx context.Context, repoDir string, groups []RewriteApplyGroup) error {
+	if len(groups) == 0 {
+		return errors.New("git rewrite apply: plan has no groups")
+	}
+	for groupIndex, group := range groups {
+		if len(group.OldOIDs) == 0 {
+			return fmt.Errorf("git rewrite apply: group %d has no commits", groupIndex+1)
+		}
+		firstIdentity, err := commitAuthorIdentity(ctx, repoDir, group.OldOIDs[0])
+		if err != nil {
+			return err
+		}
+		for _, oid := range group.OldOIDs[1:] {
+			identity, err := commitAuthorIdentity(ctx, repoDir, oid)
+			if err != nil {
+				return err
+			}
+			if identity != firstIdentity {
+				return fmt.Errorf("git rewrite apply: group %d crosses an author boundary at %s", groupIndex+1, shortApplyOID(oid))
+			}
+		}
+		if len(group.OldOIDs) > 1 {
+			beforeOID, err := firstParent(ctx, repoDir, group.OldOIDs[0])
+			if err != nil {
+				return err
+			}
+			beforeTree, err := treeBeforeCommit(ctx, repoDir, beforeOID)
+			if err != nil {
+				return err
+			}
+			afterTree, err := commitTreeOID(ctx, repoDir, group.OldOIDs[len(group.OldOIDs)-1])
+			if err != nil {
+				return err
+			}
+			if beforeTree == afterTree {
+				return fmt.Errorf("git rewrite apply: group %d has no net tree change; keep its change and revert as separate commits", groupIndex+1)
+			}
+		}
+	}
+	return nil
+}
+
+func rewriteApplyGroups(opts RewriteApplyOptions) ([]RewriteApplyGroup, error) {
+	if len(opts.Groups) > 0 && len(opts.Commits) > 0 {
+		return nil, errors.New("git rewrite apply: plan cannot include both groups and legacy commits")
+	}
+	if len(opts.Groups) > 0 {
+		groups := make([]RewriteApplyGroup, len(opts.Groups))
+		for i, group := range opts.Groups {
+			groups[i] = group
+			groups[i].OldOIDs = append([]string(nil), group.OldOIDs...)
+		}
+		return groups, nil
+	}
+	groups := make([]RewriteApplyGroup, 0, len(opts.Commits))
+	for _, commit := range opts.Commits {
+		groups = append(groups, RewriteApplyGroup{OldOIDs: []string{commit.OldOID}, ProposedMessage: commit.ProposedMessage})
+	}
+	return groups, nil
+}
+
+func commitAuthorIdentity(ctx context.Context, repoDir, oid string) (string, error) {
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, "show", "-s", "--format=%an%x00%ae", oid)
+	if err != nil {
+		return "", fmt.Errorf("git rewrite apply: read author identity for %s: %w", shortApplyOID(oid), err)
+	}
+	identity := strings.TrimRight(string(out), "\n")
+	if !strings.Contains(identity, "\x00") {
+		return "", fmt.Errorf("git rewrite apply: malformed author identity for %s", shortApplyOID(oid))
+	}
+	return identity, nil
+}
+
+func treeBeforeCommit(ctx context.Context, repoDir, parentOID string) (string, error) {
+	if parentOID != "" {
+		return commitTreeOID(ctx, repoDir, parentOID)
+	}
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, "hash-object", "-t", "tree", "--stdin")
+	if err != nil {
+		return "", fmt.Errorf("git rewrite apply: resolve empty tree: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func createRewriteBackupRefs(ctx context.Context, repoDir string, opts RewriteApplyOptions, head string) (string, error) {
