@@ -656,19 +656,11 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		}
 	}
 
-	applyGroups := make([]git.RewriteApplyGroup, 0, len(plan.Groups))
-	for _, group := range plan.Groups {
-		oldOIDs := make([]string, 0, len(group.Members))
-		for _, member := range group.Members {
-			oldOIDs = append(oldOIDs, member.OldOID)
-		}
-		applyGroups = append(applyGroups, git.RewriteApplyGroup{OldOIDs: oldOIDs, ProposedMessage: group.ProposedMessage})
-	}
 	res, err := git.ApplyRewritePlan(ctx, repo, git.RewriteApplyOptions{
 		BranchRef:    plan.BranchRef,
 		ExpectedHead: plan.ExpectedHead,
 		PlanID:       plan.ID,
-		Groups:       applyGroups,
+		Groups:       rewriteApplyGroups(plan.Groups),
 		DryRun:       opts.dryRun,
 		Progress: func(event git.RewriteApplyProgress) error {
 			return progress.Emit(rewriteProgressEvent{
@@ -1131,6 +1123,10 @@ func singletonRewritePlanGroups(commits []git.RewriteCommitRecord) []state.Rewri
 }
 
 func validateRewritePlanGroupsInRepo(ctx context.Context, repo string, groups []state.RewritePlanGroup) error {
+	return git.ValidateRewriteGroupSemantics(ctx, repo, rewriteApplyGroups(groups))
+}
+
+func rewriteApplyGroups(groups []state.RewritePlanGroup) []git.RewriteApplyGroup {
 	applyGroups := make([]git.RewriteApplyGroup, 0, len(groups))
 	for _, group := range groups {
 		oldOIDs := make([]string, 0, len(group.Members))
@@ -1139,7 +1135,7 @@ func validateRewritePlanGroupsInRepo(ctx context.Context, repo string, groups []
 		}
 		applyGroups = append(applyGroups, git.RewriteApplyGroup{OldOIDs: oldOIDs, ProposedMessage: group.ProposedMessage})
 	}
-	return git.ValidateRewriteGroupSemantics(ctx, repo, applyGroups)
+	return applyGroups
 }
 
 func rewriteStateDBPath(ctx context.Context, repo string) (string, error) {
