@@ -210,12 +210,15 @@ func TestRewriteCommitsGroupsHistoryByDefault(t *testing.T) {
 import json, sys
 for line in sys.stdin:
     req = json.loads(line)
-    commits = req['history_rewrite_plan_request']['commits']
-    groups = [
-        {'old_oids': [commits[0]['old_oid']], 'subject': 'Keep seed history', 'grouping_reason': 'repository seed'},
-        {'old_oids': [commits[1]['old_oid'], commits[2]['old_oid']], 'subject': 'Add feature behavior', 'grouping_reason': 'implementation and tests'},
-    ]
-    print(json.dumps({'version': 1, 'history_rewrite_plan': {'groups': groups}}), flush=True)
+    if req.get('request_type') == 'history_rewrite_plan':
+        commits = req['history_rewrite_plan_request']['commits']
+        groups = [
+            {'old_oids': [commits[0]['old_oid']], 'subject': 'Keep seed history', 'grouping_reason': 'repository seed'},
+            {'old_oids': [commits[1]['old_oid'], commits[2]['old_oid']], 'subject': 'Add feature behavior', 'grouping_reason': 'implementation and tests'},
+        ]
+        print(json.dumps({'version': 1, 'history_rewrite_plan': {'groups': groups}}), flush=True)
+    else:
+        print(json.dumps({'version': 1, 'subject': 'Rewrite historical commit', 'body': ''}), flush=True)
 `
 	if err := os.WriteFile(provider, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -240,6 +243,15 @@ for line in sys.stdin:
 	plan, ok, err := state.LoadRewritePlan(ctx, db, planID)
 	if err != nil || !ok || len(plan.Groups) != 2 || len(plan.Groups[1].Members) != 2 {
 		t.Fatalf("saved plan ok=%v err=%v plan=%+v", ok, err, plan)
+	}
+
+	out.Reset()
+	err = runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 3}, planOnly: true, messagesOnly: true}, false)
+	if err != nil {
+		t.Fatalf("messages-only plan: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Selected commits: 3") || !strings.Contains(out.String(), "Resulting commits: 3") || !strings.Contains(out.String(), "Commit reduction: 0") {
+		t.Fatalf("messages-only counts:\n%s", out.String())
 	}
 }
 
