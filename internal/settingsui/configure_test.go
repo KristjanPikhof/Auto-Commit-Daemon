@@ -266,7 +266,7 @@ func TestConfigureFinalApprovalBindsCommandAndRepair(t *testing.T) {
 		t.Fatalf("approval=%+v err=%v\n%s", approval, err, out.String())
 	}
 	view := out.String()
-	if !strings.Contains(view, "Approve every permission shown above") {
+	if !strings.Contains(view, "Approve these permissions") {
 		t.Errorf("single approval missing:\n%s", view)
 	}
 	if strings.Contains(view, "make test") || strings.Contains(view, "30m") {
@@ -290,7 +290,7 @@ func TestConfigureGlobalFinalApprovalDoesNotPromiseActivation(t *testing.T) {
 	if err != nil || !approval.Apply || !approval.Repair {
 		t.Fatalf("approval=%+v err=%v\n%s", approval, err, out.String())
 	}
-	if !strings.Contains(out.String(), "save these global defaults") ||
+	if !strings.Contains(out.String(), "save the global defaults") ||
 		strings.Contains(out.String(), "enable ACD") {
 		t.Fatalf("global approval prompt=%q", out.String())
 	}

@@ -301,7 +301,7 @@ func TestConfigureInheritRemovesOverrideAndCreatesRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !runtime.DesiredRevisionID.Valid ||
-		!strings.Contains(out, "inheriting global defaults") {
+		!strings.Contains(out, "using every global setting") {
 		t.Fatalf("runtime=%+v output=%s", runtime, out)
 	}
 }
@@ -429,8 +429,8 @@ func TestConfigureGlobalSavesOnlyReviewedDefaults(t *testing.T) {
 		t.Fatalf("order=%s want=%s", got, wantOrder)
 	}
 	for _, want := range []string{
-		"Scope: Global defaults",
-		"Verification: structural",
+		"Scope: global defaults; repository overrides stay unchanged",
+		"Verification: ACD safety checks",
 		"Project tests: not configured",
 		"Daemon: not started",
 	} {
@@ -684,7 +684,7 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 	if !strings.Contains(out, "Configuration saved.") ||
 		!strings.Contains(out, "Commit publishing: waiting for full validation") ||
 		!strings.Contains(out, "Safe to close this terminal.") ||
-		!strings.Contains(out, "no external hook file will be edited") ||
+		!strings.Contains(out, "External hook files: unchanged") ||
 		!strings.Contains(out, "repository command will run in an ephemeral worktree: make test") ||
 		!strings.Contains(out, "eligible recent ACD-owned commits may be repaired automatically") ||
 		!strings.Contains(out, "`acd setup codex`") {
@@ -921,8 +921,8 @@ func TestConfigureRepositoryEverydaySkipsProjectValidation(t *testing.T) {
 		strings.Contains(out+progress, "make test") {
 		t.Fatalf("Everyday queued project validation:\n%s\n%s", out, progress)
 	}
-	if !strings.Contains(out, "Verification: structural") ||
-		!strings.Contains(out, "Configuration ready:") {
+	if !strings.Contains(out, "Verification: ACD safety checks") ||
+		!strings.Contains(out, "Ready: Intent Balanced with OpenAI-compatible") {
 		t.Fatalf("output=%s", out)
 	}
 	if got := strings.Join(order, ","); got !=
@@ -1064,7 +1064,7 @@ func TestConfigureRiskPreviewNamesCustomEndpointAndExactCommand(t *testing.T) {
 	}, preset)
 	joined := strings.Join(risks, "\n")
 	for _, want := range []string{
-		"openai-compat", "https://provider.example/v1", "make test",
+		"OpenAI-compatible", "https://provider.example/v1", "make test",
 		"repaired automatically",
 	} {
 		if !strings.Contains(joined, want) {
