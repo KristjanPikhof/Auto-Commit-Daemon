@@ -377,8 +377,12 @@ func TestWithLockedRecoveryAndBranchRefKeepsLocksUntilCallbackReturnsAfterCancel
 			}
 			select {
 			case failedAttempt <- struct{}{}:
+			default:
+			}
+			select {
 			case <-stopWriter:
 				return
+			default:
 			}
 		}
 	}()
