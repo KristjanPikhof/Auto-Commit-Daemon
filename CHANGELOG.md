@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- History rewrite checks Intent mode and the commit message provider before it
+  prints the selected commits. If setup blocks planning, the error names the
+  effective provider and its scope, confirms that Git history is unchanged,
+  and shows how to configure the repository or use valid global defaults.
+  Interactive setup now uses the same provider names, explains that Local
+  rules do not support history rewrite, and keeps internal preset and runtime
+  details out of the normal preview.
+
 ### Fixed
 
 - Intent replay now starts from the repaired tree after a history repair and

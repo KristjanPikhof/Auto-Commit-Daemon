@@ -89,6 +89,9 @@ func (s rewriteProgressSink) Emit(event rewriteProgressEvent) error {
 		enc := json.NewEncoder(s.out)
 		return enc.Encode(event)
 	case rewriteProgressModePlain:
+		if event.Phase == "proposal" && event.Message == "requesting proposal" {
+			return nil
+		}
 		phase := rewriteProgressPhaseLabel(event.Phase)
 		message := rewriteProgressMessage(event.Message)
 		position := ""

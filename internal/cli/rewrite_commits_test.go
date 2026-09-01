@@ -81,6 +81,10 @@ func TestRewriteCommitsPlanGenerationRequiresIntentStrategy(t *testing.T) {
 	if !errors.Is(err, ai.ErrRewriteRequiresIntentStrategy) {
 		t.Fatalf("runRewriteCommits error = %v, want intent-strategy gate", err)
 	}
+	if out.Len() != 0 || !strings.Contains(err.Error(), "Current mode: Event (environment)") ||
+		!strings.Contains(err.Error(), "Git history is unchanged") {
+		t.Fatalf("intent guidance is incomplete: output=%q error=%v", out.String(), err)
+	}
 }
 
 func TestRewriteCommitsPlanGenerationRequiresUsableAIProvider(t *testing.T) {
@@ -94,6 +98,54 @@ func TestRewriteCommitsPlanGenerationRequiresUsableAIProvider(t *testing.T) {
 	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}}, false)
 	if !errors.Is(err, ai.ErrRewriteRequiresAIProvider) {
 		t.Fatalf("runRewriteCommits error = %v, want provider gate", err)
+	}
+	if out.Len() != 0 || !strings.Contains(err.Error(), "acd auth set") ||
+		!strings.Contains(err.Error(), "Git history is unchanged") {
+		t.Fatalf("missing credential guidance is incomplete: output=%q error=%v", out.String(), err)
+	}
+}
+
+func TestRewriteCommitsProviderRejectionExplainsRepositoryOverride(t *testing.T) {
+	roots := withIsolatedHome(t)
+	t.Setenv(ai.EnvAPIKey, "test-key")
+	repo := rewriteSelectionTestRepo(t)
+	repoHash := central.CanonicalID(repo)
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
+		doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"openai-compat"`)
+		doc.Settings.Global[config.FieldModel] = json.RawMessage(`"global-model"`)
+		doc.Settings.Repositories[repoHash] = config.RepositorySettings{
+			Fields: config.Overrides{
+				config.FieldCommitStrategy: json.RawMessage(`"intent"`),
+				config.FieldProvider:       json.RawMessage(`"deterministic"`),
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+
+	var out bytes.Buffer
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
+		selection: git.RewriteSelectionOptions{Last: 1},
+	}, false)
+	if !errors.Is(err, ai.ErrRewriteRequiresAIProvider) {
+		t.Fatalf("error = %v, want provider gate", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("rejection printed success output before provider gate:\n%s", out.String())
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"Current provider: Local rules (repository override)",
+		"Global default: OpenAI-compatible (global-model)",
+		"acd config edit --repo",
+		"--inherit",
+		"No plan was generated. Git history is unchanged.",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error missing %q:\n%s", want, message)
+		}
 	}
 }
 
@@ -1110,7 +1162,6 @@ func TestRewriteProgressPlainIncludesBoundedCounts(t *testing.T) {
 	}
 
 	want := strings.Join([]string{
-		"History rewrite: Commit messages [42/169]: generating a message",
 		"History rewrite: Commit messages [42/169]: message ready",
 		"History rewrite: Applying messages [42/169]: applied the new message",
 		"History rewrite: Keeping later commits [2/3]: kept a later commit unchanged",

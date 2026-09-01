@@ -362,17 +362,19 @@ func TestWithLockedRecoveryAndBranchRefKeepsLocksUntilCallbackReturnsAfterCancel
 	// finishing its commit. The old caller-bound process lifetime lets one of
 	// these attempts succeed as soon as cancellation kills update-ref.
 	failedAttempt := make(chan struct{}, 1)
-	writerDone := make(chan error, 1)
-	stopWriter := make(chan struct{})
-	defer close(stopWriter)
+	writerAcquired := make(chan struct{})
+	writerStopped := make(chan struct{})
+	writerCtx, stopWriter := context.WithCancel(context.Background())
+	defer stopWriter()
 	go func() {
+		defer close(writerStopped)
 		for {
 			attemptCtx, attemptCancel := context.WithTimeout(
-				context.Background(), 50*time.Millisecond)
+				writerCtx, 50*time.Millisecond)
 			err := UpdateRef(attemptCtx, dir, branchRef, second, first)
 			attemptCancel()
 			if err == nil {
-				writerDone <- nil
+				close(writerAcquired)
 				return
 			}
 			select {
@@ -380,7 +382,7 @@ func TestWithLockedRecoveryAndBranchRefKeepsLocksUntilCallbackReturnsAfterCancel
 			default:
 			}
 			select {
-			case <-stopWriter:
+			case <-writerCtx.Done():
 				return
 			default:
 			}
@@ -388,15 +390,18 @@ func TestWithLockedRecoveryAndBranchRefKeepsLocksUntilCallbackReturnsAfterCancel
 	}()
 	for range 20 {
 		select {
-		case err := <-writerDone:
-			if err == nil {
-				t.Fatal("concurrent writer acquired branch ref before callback returned")
-			}
-			t.Fatalf("concurrent writer stopped unexpectedly: %v", err)
+		case <-writerAcquired:
+			t.Fatal("concurrent writer acquired branch ref before callback returned")
 		case <-failedAttempt:
 		case <-time.After(5 * time.Second):
 			t.Fatal("concurrent writer did not finish a lock attempt")
 		}
+	}
+	stopWriter()
+	select {
+	case <-writerStopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent writer did not stop")
 	}
 
 	close(releaseCommit)
@@ -408,13 +413,10 @@ func TestWithLockedRecoveryAndBranchRefKeepsLocksUntilCallbackReturnsAfterCancel
 	case <-time.After(5 * time.Second):
 		t.Fatal("ref transaction did not finish after callback returned")
 	}
-	select {
-	case err := <-writerDone:
-		if err != nil {
-			t.Fatalf("concurrent writer after callback: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("concurrent writer did not acquire ref after callback returned")
+	updateCtx, cancelUpdate := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelUpdate()
+	if err := UpdateRef(updateCtx, dir, branchRef, second, first); err != nil {
+		t.Fatalf("update ref after callback returned: %v", err)
 	}
 }
 

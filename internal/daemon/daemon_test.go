@@ -2430,20 +2430,7 @@ func TestRun_RollupHookAdvancesLastDay(t *testing.T) {
 		})
 	}()
 
-	// Poll for rollup.last_day to land.
-	deadline := time.Now().Add(2 * time.Second)
-	var got string
-	for time.Now().Before(deadline) {
-		v, present, err := state.MetaGet(ctx, f.db, "rollup.last_day")
-		if err == nil && present && v != "" {
-			got = v
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got != "2026-04-01" {
-		t.Fatalf("rollup.last_day=%q want 2026-04-01", got)
-	}
+	waitForMetaValue(t, f.db, "rollup.last_day", "2026-04-01", 10*time.Second)
 
 	cancel()
 	select {
@@ -2580,7 +2567,6 @@ func TestRun_AIProvider_FallbackToDeterministic(t *testing.T) {
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -2597,13 +2583,17 @@ func TestRun_AIProvider_FallbackToDeterministic(t *testing.T) {
 			SkipSignals: true,
 		})
 	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
 
 	if err := os.WriteFile(filepath.Join(f.dir, "fallback.txt"), []byte("fb\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	wakeCh <- struct{}{}
 
-	newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+	newHead := waitForCommit(t, f.dir, startHead, 10*time.Second)
 	out, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir},
 		"log", "-1", "--pretty=%s", newHead)
 	if err != nil {

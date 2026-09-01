@@ -504,10 +504,8 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"[2/3] Protected credential stored.",
 		)
 	} else {
-		fmt.Fprintln(
-			cmd.ErrOrStderr(),
-			"[2/3] Existing credential retained.",
-		)
+		fmt.Fprintln(cmd.ErrOrStderr(), "[2/3] "+
+			configureUnchangedCredentialMessage(selection.Provider, source))
 	}
 
 	fmt.Fprintln(
@@ -953,7 +951,7 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		progress.success(3, "Protected credential stored.")
 	} else {
 		progress.complete("credential:unchanged")
-		progress.success(3, "Existing credential retained; no credential write required.")
+		progress.success(3, configureUnchangedCredentialMessage(selection.Provider, source))
 	}
 	changes := configureSaveValues(selection)
 	var repositoryProfile *string
@@ -1044,13 +1042,17 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 		}
 	} else {
 		fmt.Fprintf(cmd.OutOrStdout(),
-			"Configuration ready: %s@%d; runtime revision %d; daemon enabled.\n",
-			report.PresetID, report.PresetVersion, applied.RevisionID)
+			"Ready: %s %s with %s. ACD is enabled for this repository.\n",
+			displayConfigureWord(report.Strategy), displayConfigureWord(report.Preset),
+			displayProvider(report.Provider))
 		if opts.Inherit {
 			fmt.Fprintln(
 				cmd.OutOrStdout(),
-				"Repository settings: inheriting global defaults",
+				"Scope: using every global setting; repository override removed.",
 			)
+		} else {
+			fmt.Fprintln(cmd.OutOrStdout(),
+				"Scope: repository override saved; global defaults unchanged.")
 		}
 	}
 	for _, guidance := range report.HarnessGuidance {
@@ -1543,25 +1545,29 @@ func renderConfigureReport(out io.Writer, report configureReport, jsonOut bool) 
 	}
 	fmt.Fprintf(out, "ACD CONFIGURE PREVIEW%s\n", suffix)
 	if report.Scope == "global" {
-		fmt.Fprintln(out, "Scope: Global defaults")
+		fmt.Fprintln(out, "Scope: global defaults; repository overrides stay unchanged")
 	} else {
 		fmt.Fprintf(out, "Repository: %s\n", safeRepoPreview(report.Repo))
+		switch report.ConfigurationAction {
+		case "inherit_global":
+			fmt.Fprintln(out, "Scope: use every global setting and remove this repository override")
+		default:
+			fmt.Fprintln(out, "Scope: repository override; global defaults stay unchanged")
+		}
 	}
-	fmt.Fprintln(out, "Configuration action:",
-		displayConfigureAction(report.ConfigurationAction))
 	fmt.Fprintf(out, "Experience: %s\n", report.Experience)
-	fmt.Fprintf(out, "Mode: %s %s%s [%s@%d]\n", displayConfigureWord(report.Strategy),
-		displayConfigureWord(report.Preset), customized, report.PresetID, report.PresetVersion)
+	fmt.Fprintf(out, "Mode: %s %s%s\n", displayConfigureWord(report.Strategy),
+		displayConfigureWord(report.Preset), customized)
 	fmt.Fprintf(out, "Provider: %s; credential source: %s\n",
-		safePreviewText(report.Provider, 128), report.CredentialSource)
+		displayProvider(report.Provider), displayCredentialSource(report.CredentialSource))
 	if report.Provider == "openai-compat" {
 		fmt.Fprintf(out, "Model: %s\n", safePreviewText(report.Model, 128))
 		fmt.Fprintf(out, "Endpoint: %s\n", report.Endpoint)
 		fmt.Fprintf(out, "Provider timeout: %s\n",
 			safePreviewText(report.ProviderTimeout, 32))
 	}
-	fmt.Fprintf(out, "Diff context: %s\n", report.DiffContext)
-	fmt.Fprintf(out, "Verification: %s", report.Verification.Mode)
+	fmt.Fprintf(out, "Diff context: %s\n", displayConfigureDiffContext(report.DiffContext, report.Provider))
+	fmt.Fprintf(out, "Verification: %s", displayConfigureVerification(report.Verification.Mode))
 	if report.Verification.Command != "" {
 		fmt.Fprintf(out, ". Exact command: %s", safeCommandPreview(report.Verification.Command))
 	}
@@ -1575,39 +1581,69 @@ func renderConfigureReport(out io.Writer, report configureReport, jsonOut bool) 
 			report.Verification.ExpectedDuration)
 	}
 	for _, risk := range report.Risks {
-		fmt.Fprintln(out, "Approval:", risk)
+		fmt.Fprintln(out, "Permission:", risk)
 	}
-	fmt.Fprintf(out, "Automatic repair: %t; horizon %s; maximum commits %s\n",
-		report.RepairEnabled, report.RepairHorizon, report.RepairMaxCommits)
-	fmt.Fprintln(out, "Execution:", report.ExecutionMode)
-	fmt.Fprintln(out, "Readiness after save:", report.Readiness)
-	if report.Scope == "global" {
-		fmt.Fprintln(out,
-			"Apply order: provider test > credential > global defaults")
-	} else if report.Verification.Mode == "full" {
-		fmt.Fprintln(out,
-			"Apply order: provider test > credential > settings > one runtime revision + validation job > acd on")
+	if report.RepairEnabled {
+		fmt.Fprintf(out, "Automatic repair: up to %s recent ACD-owned commits within %s\n",
+			report.RepairMaxCommits, report.RepairHorizon)
 	} else {
-		fmt.Fprintln(out,
-			"Apply order: provider test > credential > settings > one runtime revision > acd on")
+		fmt.Fprintln(out, "Automatic repair: off")
 	}
 	if report.Verification.Mode == "full" {
 		fmt.Fprintln(out, "Validation runs after setup returns; capture stays active while commit publishing waits.")
 	}
-	fmt.Fprintln(out, "Harness hooks: report only; no external hook file will be edited")
+	fmt.Fprintln(out, "External hook files: unchanged")
 	return nil
 }
 
-func displayConfigureAction(action string) string {
-	switch action {
-	case "replace_global":
-		return "replace saved global overrides"
-	case "inherit_global":
-		return "remove repository override and inherit global defaults"
-	case "save_repository_override":
-		return "save repository-specific override"
+func displayConfigureDiffContext(value, provider string) string {
+	switch value {
+	case "approved_redacted":
+		if strings.HasPrefix(provider, "subprocess:") {
+			return "redacted repository changes may be sent to the local subprocess"
+		}
+		return "redacted repository changes may be sent to the provider"
+	case "approval_required":
+		return "permission required before repository changes are sent"
 	default:
-		return "update global defaults"
+		return "repository changes stay on this machine"
+	}
+}
+
+func displayConfigureVerification(value string) string {
+	switch value {
+	case "structural":
+		return "ACD safety checks"
+	case "fast":
+		return "quick project check"
+	case "full":
+		return "full project check"
+	default:
+		return value
+	}
+}
+
+func displayCredentialSource(source credentials.Source) string {
+	switch source {
+	case credentials.SourceEnvironment:
+		return "environment"
+	case credentials.SourceFile:
+		return "protected file"
+	default:
+		return "not required"
+	}
+}
+
+func configureUnchangedCredentialMessage(provider string, source credentials.Source) string {
+	switch {
+	case provider == "deterministic":
+		return "No provider credential is needed."
+	case source == credentials.SourceEnvironment:
+		return "Using ACD_AI_API_KEY from the environment; credential file unchanged."
+	case source == credentials.SourceFile:
+		return "Using the protected credential file; credential unchanged."
+	default:
+		return "Provider credential unchanged."
 	}
 }
 
@@ -1826,9 +1862,9 @@ func configureHarnessGuidance() []string {
 func configureRisks(selection settingsui.ConfigureSelection, preset config.PresetDefinition) []string {
 	risks := make([]string, 0, 4)
 	if preset.DiffContextRequired {
-		context := "redacted diff context remains local"
+		context := "redacted repository changes remain local"
 		if !strings.HasPrefix(selection.Provider, "subprocess:") {
-			context = "redacted diff context may leave the machine through " + selection.Provider
+			context = "redacted repository changes may leave the machine through " + displayProvider(selection.Provider)
 		}
 		risks = append(risks, context)
 	}

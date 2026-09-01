@@ -9,15 +9,15 @@ import (
 var (
 	// ErrRewriteRequiresIntentStrategy is returned when rewrite plan generation is
 	// requested while the effective commit strategy is not intent.
-	ErrRewriteRequiresIntentStrategy = errors.New("rewrite commits requires commit strategy intent")
+	ErrRewriteRequiresIntentStrategy = errors.New("history rewrite needs Intent mode")
 
 	// ErrRewriteRequiresAIProvider is returned when rewrite plan generation is
 	// requested without an explicitly configured non-deterministic AI provider.
-	ErrRewriteRequiresAIProvider = errors.New("rewrite commits requires an explicitly configured AI provider")
+	ErrRewriteRequiresAIProvider = errors.New("history rewrite needs an OpenAI-compatible or local subprocess provider")
 
 	// ErrRewriteProviderCannotPlan is returned when the configured provider cannot
 	// produce intent plans.
-	ErrRewriteProviderCannotPlan = errors.New("rewrite commits provider cannot produce intent plans")
+	ErrRewriteProviderCannotPlan = errors.New("the configured provider cannot plan a history rewrite")
 )
 
 // CheckRewritePlanGenerationGate verifies that the v1 rewrite-commits command
@@ -29,7 +29,7 @@ func CheckRewritePlanGenerationGate(cfg ProviderConfig, provider Provider) error
 	}
 	mode := strings.TrimSpace(strings.ToLower(cfg.Mode))
 	if mode == "" || mode == "deterministic" || PrimaryProviderName(provider) == "deterministic" {
-		return fmt.Errorf("%w: configure openai-compat with a credential, or subprocess:<name>", ErrRewriteRequiresAIProvider)
+		return ErrRewriteRequiresAIProvider
 	}
 	if _, ok := provider.(IntentPlanner); !ok {
 		return fmt.Errorf("%w: %s", ErrRewriteProviderCannotPlan, PrimaryProviderName(provider))

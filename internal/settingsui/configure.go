@@ -132,16 +132,17 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	providerSelected := false
 	if !providerReady {
 		options := []huh.Option[string]{
-			huh.NewOption("OpenAI-compatible network provider", "openai-compat"),
+			huh.NewOption("OpenAI-compatible provider (network)", "openai-compat"),
 			huh.NewOption("Local subprocess provider", "subprocess"),
 		}
 		if !(selection.Strategy == "intent" && selection.Preset == "quality") {
 			options = append([]huh.Option[string]{
-				huh.NewOption("Local rules (recommended)", "deterministic"),
+				huh.NewOption("Local rules (no AI or network)", "deterministic"),
 			}, options...)
 		}
 		providerForm := huh.NewForm(huh.NewGroup(
 			huh.NewSelect[string]().Key("provider").Title("Commit message provider").
+				Description("Local rules create commits without AI. History rewrite needs an OpenAI-compatible or local subprocess provider.").
 				Options(options...).Value(&providerKind),
 		))
 		if err := runConfigureForm(ctx, providerForm, opts); err != nil {
@@ -361,14 +362,14 @@ func ChooseConfigureRecovery(
 // exact final preview.
 func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Writer, accessible bool, opts ConfigurePreviewApprovalOptions) (ConfigurePreviewApproval, error) {
 	approval := ConfigurePreviewApproval{}
-	title := "Approve every permission shown above, save this configuration, and enable ACD?"
+	title := "Approve these permissions, save, and enable ACD?"
 	if opts.Global {
-		title = "Approve every permission shown above and save these global defaults?"
+		title = "Approve these permissions and save the global defaults?"
 		if opts.Action == "replace_global" {
-			title = "Approve every permission shown above and replace the saved global defaults?"
+			title = "Approve these permissions and replace the global defaults?"
 		}
 	} else if opts.Action == "inherit_global" {
-		title = "Approve every permission shown above, remove this repository override, and enable ACD?"
+		title = "Use every global setting for this repository and enable ACD?"
 	}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().Key("apply").Title(title).
