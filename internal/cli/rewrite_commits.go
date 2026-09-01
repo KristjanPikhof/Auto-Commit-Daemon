@@ -50,6 +50,7 @@ type rewriteCommitsOptions struct {
 	review     bool
 	noReview   bool
 	planOnly   bool
+	messagesOnly bool
 	editFormat string
 	progress   string
 	progressTo io.Writer
@@ -87,6 +88,9 @@ not supported. Working-tree files are not changed.
 
 Creating a new plan requires Intent mode and a configured AI provider. Showing,
 editing, or applying a saved plan does not create a new AI request.
+
+New plans group adjacent commits by intent. Use --messages-only to keep one
+output commit for each selected commit.
 
 Use --edit with a saved plan ID or file to review messages in $EDITOR. Editing a
 saved plan ID creates a new revision; editing a standalone plan file updates
@@ -130,6 +134,7 @@ Progress is written to stderr so stdout stays usable for command results and
 	cmd.Flags().BoolVar(&opts.review, "review", false, "Open EDITOR to review/edit proposed commit messages before apply")
 	cmd.Flags().BoolVar(&opts.noReview, "no-review", false, "Skip the review/edit prompt and leave proposed messages unchanged")
 	cmd.Flags().BoolVar(&opts.planOnly, "plan-only", false, "Generate or edit and save the rewrite plan without prompting to apply")
+	cmd.Flags().BoolVar(&opts.messagesOnly, "messages-only", false, "Keep one output commit per selected commit instead of grouping by intent")
 	cmd.Flags().StringVar(&opts.progress, "progress", string(rewriteProgressModeAuto), "Progress output mode: auto, plain, json, or off")
 	cmd.Flags().StringVar(&opts.editFormat, "format", rewriteEditFormatText, "Review edit format: text or json")
 	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD; prefer --from-sha or --from-nr")
@@ -202,7 +207,7 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	if closer != nil {
 		defer func() { _ = closer.Close() }()
 	}
-	if err := ai.CheckRewritePlanGenerationGate(providerResolution.Config, provider); err != nil {
+	if err := ai.CheckHistoryRewritePlanGenerationGate(providerResolution.Config, provider, opts.messagesOnly); err != nil {
 		return rewriteProviderGateError(err, providerResolution, repo)
 	}
 	if err := progress.Emit(rewriteProgressEvent{
@@ -219,7 +224,7 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		return err
 	}
 
-	plan, err := generateRewritePlan(ctx, repo, selection, provider, providerResolution.Config, progress)
+	plan, err := generateRewritePlan(ctx, repo, selection, provider, providerResolution.Config, progress, opts.messagesOnly)
 	if err != nil {
 		return err
 	}
@@ -235,7 +240,8 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	if plan.ValidationStatus == state.RewritePlanValidationInvalid {
 		fmt.Fprintf(out, "Plan stored as invalid: %s\n", plan.ValidationError.String)
 	} else {
-		fmt.Fprintf(out, "Generated valid rewrite plan %s with %d proposal(s).\n", plan.ID, len(plan.Commits))
+		fmt.Fprintf(out, "Generated valid rewrite plan %s.\n", plan.ID)
+		printRewritePlanSummary(out, plan, selection.Selected)
 	}
 	if err := progress.Emit(rewriteProgressEvent{Phase: "validation", Message: fmt.Sprintf("status %s", plan.ValidationStatus), PlanID: plan.ID}); err != nil {
 		return err
@@ -275,11 +281,11 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		}
 	}
 	if review {
-		commits, changed, err := editRewritePlanWithEditor(plan, opts.editFormat)
+		groups, changed, err := editRewritePlanWithEditor(plan, opts.editFormat)
 		if err != nil {
 			return err
 		}
-		updated, err := persistEditedRewritePlan(ctx, repo, plan, commits)
+		updated, err := persistEditedRewritePlan(ctx, repo, plan, groups)
 		if err != nil {
 			return err
 		}
@@ -294,7 +300,7 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	applyNow := opts.yes
 	if !opts.yes {
 		var err error
-		applyNow, err = promptRewriteYesNo(inputOrStdin(opts.in), out, "Apply this rewrite plan now?", false)
+		applyNow, err = promptRewriteYesNo(inputOrStdin(opts.in), out, rewriteApplyQuestion(plan), false)
 		if err != nil {
 			return err
 		}
@@ -460,14 +466,15 @@ func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, o
 	if err != nil {
 		return fmt.Errorf("acd history rewrite: read edit plan: %w", err)
 	}
-	commits, changed, err := editRewritePlanWithEditor(plan, opts.editFormat)
+	groups, changed, err := editRewritePlanWithEditor(plan, opts.editFormat)
 	if err != nil {
 		return err
 	}
 	applyRef := opts.editPlan
 	if changed {
 		if isRewritePlanFileRef(opts.editPlan) {
-			plan.Commits = commits
+			plan.Groups = groups
+			plan.Commits = nil
 			plan.ValidationStatus = state.RewritePlanValidationValid
 			plan.ValidationError = sql.NullString{}
 			plan.ApplyStatus = state.RewritePlanApplyPending
@@ -477,7 +484,7 @@ func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, o
 			}
 			fmt.Fprintf(out, "Edited rewrite plan file saved: %s.\n", opts.editPlan)
 		} else {
-			updated, err := persistEditedRewritePlan(ctx, repo, plan, commits)
+			updated, err := persistEditedRewritePlan(ctx, repo, plan, groups)
 			if err != nil {
 				return err
 			}
@@ -500,7 +507,7 @@ func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, o
 	}
 	applyNow := opts.yes
 	if !opts.yes {
-		applyNow, err = promptRewriteYesNo(inputOrStdin(opts.in), out, "Apply this edited rewrite plan now?", false)
+		applyNow, err = promptRewriteYesNo(inputOrStdin(opts.in), out, rewriteApplyQuestion(plan), false)
 		if err != nil {
 			return err
 		}
@@ -583,15 +590,19 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		}
 	}
 
-	applyCommits := make([]git.RewriteApplyCommit, 0, len(plan.Commits))
-	for _, c := range plan.Commits {
-		applyCommits = append(applyCommits, git.RewriteApplyCommit{OldOID: c.OldOID, ProposedMessage: c.ProposedMessage})
+	applyGroups := make([]git.RewriteApplyGroup, 0, len(plan.Groups))
+	for _, group := range plan.Groups {
+		oldOIDs := make([]string, 0, len(group.Members))
+		for _, member := range group.Members {
+			oldOIDs = append(oldOIDs, member.OldOID)
+		}
+		applyGroups = append(applyGroups, git.RewriteApplyGroup{OldOIDs: oldOIDs, ProposedMessage: group.ProposedMessage})
 	}
 	res, err := git.ApplyRewritePlan(ctx, repo, git.RewriteApplyOptions{
 		BranchRef:    plan.BranchRef,
 		ExpectedHead: plan.ExpectedHead,
 		PlanID:       plan.ID,
-		Commits:      applyCommits,
+		Groups:       applyGroups,
 		DryRun:       opts.dryRun,
 		Progress: func(event git.RewriteApplyProgress) error {
 			return progress.Emit(rewriteProgressEvent{
@@ -621,7 +632,8 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		return nil
 	}
 	fmt.Fprintln(out, "History rewrite complete.")
-	fmt.Fprintf(out, "Commits updated: %d\n", res.RecreatedCount)
+	fmt.Fprintf(out, "Selected commits: %d -> %d\n", res.SelectedInputCount, res.SelectedOutputCount)
+	fmt.Fprintf(out, "Later commits recreated unchanged: %d\n", res.UnchangedDescendantCount)
 	fmt.Fprintf(out, "Branch: %s (%s to %s)\n", plan.BranchRef, shortenSHA(res.OldHead), shortenSHA(res.NewHead))
 	fmt.Fprintf(out, "Recovery backup: %s\n", res.BackupBranchRef)
 	if res.InternalBackupRef != "" {
@@ -717,10 +729,7 @@ func showSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag, ref stri
 		fmt.Fprintf(out, "Validation error: %s\n", plan.ValidationError.String)
 	}
 	fmt.Fprintf(out, "Apply status: %s\n", plan.ApplyStatus)
-	fmt.Fprintf(out, "Commits (%d):\n", len(plan.Commits))
-	for _, c := range plan.Commits {
-		firstLine := strings.SplitN(strings.TrimSpace(c.ProposedMessage), "\n", 2)[0]
-		fmt.Fprintf(out, "- %s %s\n", shortenSHA(c.OldOID), firstLine)
+	printSavedRewritePlanGroups(out, plan)
 	}
 	return nil
 }
@@ -780,6 +789,12 @@ func readRewritePlanFile(path string) (state.RewritePlan, error) {
 	if err := json.NewDecoder(f).Decode(&plan); err != nil {
 		return state.RewritePlan{}, err
 	}
+	groups, err := state.RewritePlanGroups(plan)
+	if err != nil {
+		return state.RewritePlan{}, err
+	}
+	plan.Groups = groups
+	plan.Commits = nil
 	plan.CommitFormat = normalizeRewritePlanCommitFormat(plan.CommitFormat)
 	return plan, nil
 }
@@ -795,7 +810,7 @@ func writeRewritePlanFile(path string, plan state.RewritePlan) error {
 	return enc.Encode(plan)
 }
 
-func generateRewritePlan(ctx context.Context, repo string, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig, progress rewriteProgressSink) (state.RewritePlan, error) {
+func generateRewritePlan(ctx context.Context, repo string, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig, progress rewriteProgressSink, messagesOnly bool) (state.RewritePlan, error) {
 	dbPath, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
 		return state.RewritePlan{}, err
@@ -805,73 +820,11 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: open state db: %w", err)
 	}
 	defer db.Close()
-
-	proposer, ok := provider.(ai.CommitRewriteProposer)
-	if !ok {
-		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: provider %s cannot generate rewrite proposals", ai.PrimaryProviderName(provider))
-	}
-	plan := state.RewritePlan{
-		BranchRef:        selection.BranchRef,
-		ExpectedHead:     selection.Head,
-		Provider:         sql.NullString{String: ai.PrimaryProviderName(provider), Valid: ai.PrimaryProviderName(provider) != ""},
-		Model:            sql.NullString{String: cfg.Model, Valid: cfg.Model != ""},
-		CommitFormat:     string(cfg.CommitFormat),
-		ValidationStatus: state.RewritePlanValidationValid,
-		ApplyStatus:      state.RewritePlanApplyPending,
-	}
-	for i, c := range selection.Selected {
-		if err := progress.Emit(rewriteProgressEvent{
-			Phase:         "proposal",
-			Message:       "requesting proposal",
-			Current:       i + 1,
-			Total:         len(selection.Selected),
-			CommitOID:     c.OID,
-			CommitSubject: c.Subject,
-		}); err != nil {
-			return state.RewritePlan{}, err
-		}
-		req, err := buildCommitRewriteRequest(ctx, repo, db, selection.Selected, i, c, ai.ProviderNeedsDiff(provider), cfg.CommitFormat)
-		if err != nil {
-			return state.RewritePlan{}, err
-		}
-		result, err := proposer.ProposeCommitRewrite(ctx, req)
-		if err != nil {
-			plan.ValidationStatus = state.RewritePlanValidationInvalid
-			plan.ValidationError = sql.NullString{String: rewriteFailureJSON(c.OID, err), Valid: true}
-			plan.Commits = append(plan.Commits, state.RewritePlanCommit{OldOID: c.OID, OriginalMessage: c.Message, ProposedMessage: c.Message})
-			if emitErr := progress.Emit(rewriteProgressEvent{
-				Phase:         "proposal",
-				Message:       "proposal failed",
-				Current:       i + 1,
-				Total:         len(selection.Selected),
-				CommitOID:     c.OID,
-				CommitSubject: c.Subject,
-			}); emitErr != nil {
-				return state.RewritePlan{}, emitErr
-			}
-			break
-		}
-		message := result.Subject
-		if strings.TrimSpace(result.Body) != "" {
-			message += "\n\n" + result.Body
-		}
-		plan.Commits = append(plan.Commits, state.RewritePlanCommit{OldOID: c.OID, OriginalMessage: c.Message, ProposedMessage: message})
-		if err := progress.Emit(rewriteProgressEvent{
-			Phase:         "proposal",
-			Message:       "proposal accepted",
-			Current:       i + 1,
-			Total:         len(selection.Selected),
-			CommitOID:     c.OID,
-			CommitSubject: c.Subject,
-		}); err != nil {
-			return state.RewritePlan{}, err
-		}
-	}
-	if len(plan.Commits) == 0 && len(selection.Selected) > 0 {
-		c := selection.Selected[0]
-		plan.ValidationStatus = state.RewritePlanValidationInvalid
-		plan.ValidationError = sql.NullString{String: rewriteFailureJSON(c.OID, errors.New("no proposal generated")), Valid: true}
-		plan.Commits = []state.RewritePlanCommit{{OldOID: c.OID, OriginalMessage: c.Message, ProposedMessage: c.Message}}
+	plan := newRewritePlan(selection, provider, cfg)
+	if messagesOnly {
+		generateMessageOnlyRewritePlan(ctx, repo, db, selection, provider, cfg, progress, &plan)
+	} else {
+		generateGroupedRewritePlan(ctx, repo, db, selection, provider, cfg, progress, &plan)
 	}
 	id, err := state.SaveRewritePlan(ctx, db, plan)
 	if err != nil {
@@ -882,6 +835,240 @@ func generateRewritePlan(ctx context.Context, repo string, selection git.Rewrite
 		return state.RewritePlan{}, err
 	}
 	return plan, nil
+}
+
+func newRewritePlan(selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig) state.RewritePlan {
+	return state.RewritePlan{
+		BranchRef:        selection.BranchRef,
+		ExpectedHead:     selection.Head,
+		Provider:         sql.NullString{String: ai.PrimaryProviderName(provider), Valid: ai.PrimaryProviderName(provider) != ""},
+		Model:            sql.NullString{String: cfg.Model, Valid: cfg.Model != ""},
+		CommitFormat:     string(cfg.CommitFormat),
+		ValidationStatus: state.RewritePlanValidationValid,
+		ApplyStatus:      state.RewritePlanApplyPending,
+	}
+}
+
+func generateMessageOnlyRewritePlan(ctx context.Context, repo string, db *state.DB, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig, progress rewriteProgressSink, plan *state.RewritePlan) {
+	proposer, ok := provider.(ai.CommitRewriteProposer)
+	if !ok {
+		invalidateRewritePlan(plan, selection.Selected, errors.New("provider cannot generate rewrite proposals"))
+		return
+	}
+	for i, c := range selection.Selected {
+		if err := progress.Emit(rewriteProgressEvent{
+			Phase:         "proposal",
+			Message:       "requesting proposal",
+			Current:       i + 1,
+			Total:         len(selection.Selected),
+			CommitOID:     c.OID,
+			CommitSubject: c.Subject,
+		}); err != nil {
+			invalidateRewritePlan(plan, selection.Selected, err)
+			return
+		}
+		req, err := buildCommitRewriteRequest(ctx, repo, db, selection.Selected, i, c, ai.ProviderNeedsDiff(provider), cfg.CommitFormat)
+		if err != nil {
+			invalidateRewritePlan(plan, selection.Selected, err)
+			return
+		}
+		result, err := proposer.ProposeCommitRewrite(ctx, req)
+		if err != nil {
+			invalidateRewritePlan(plan, selection.Selected, err)
+			_ = progress.Emit(rewriteProgressEvent{
+				Phase:         "proposal",
+				Message:       "proposal failed",
+				Current:       i + 1,
+				Total:         len(selection.Selected),
+				CommitOID:     c.OID,
+				CommitSubject: c.Subject,
+			})
+			return
+		}
+		message := result.Subject
+		if strings.TrimSpace(result.Body) != "" {
+			message += "\n\n" + result.Body
+		}
+		plan.Groups = append(plan.Groups, state.RewritePlanGroup{
+			Members:         []state.RewritePlanMember{{OldOID: c.OID, OriginalMessage: c.Message}},
+			ProposedMessage: message,
+			GroupingReason:  "message-only rewrite",
+		})
+		if err := progress.Emit(rewriteProgressEvent{
+			Phase:         "proposal",
+			Message:       "proposal accepted",
+			Current:       i + 1,
+			Total:         len(selection.Selected),
+			CommitOID:     c.OID,
+			CommitSubject: c.Subject,
+		}); err != nil {
+			invalidateRewritePlan(plan, selection.Selected, err)
+			return
+		}
+	}
+	if len(plan.Groups) == 0 {
+		invalidateRewritePlan(plan, selection.Selected, errors.New("no proposal generated"))
+	}
+}
+
+func generateGroupedRewritePlan(ctx context.Context, repo string, db *state.DB, selection git.RewriteSelection, provider ai.Provider, cfg ai.ProviderConfig, progress rewriteProgressSink, plan *state.RewritePlan) {
+	planner, ok := provider.(ai.HistoryRewritePlanner)
+	if !ok {
+		invalidateRewritePlan(plan, selection.Selected, errors.New("provider cannot group historical commits"))
+		return
+	}
+	if err := progress.Emit(rewriteProgressEvent{Phase: "grouping", Message: fmt.Sprintf("grouping %d selected commit(s)", len(selection.Selected)), Current: len(selection.Selected), Total: len(selection.Selected)}); err != nil {
+		invalidateRewritePlan(plan, selection.Selected, err)
+		return
+	}
+	req, err := buildHistoryRewritePlanRequest(ctx, repo, db, selection.Selected, provider, cfg.CommitFormat)
+	if err != nil {
+		invalidateRewritePlan(plan, selection.Selected, err)
+		return
+	}
+	proposal, err := planner.ProposeHistoryRewritePlan(ctx, req)
+	if err != nil {
+		invalidateRewritePlan(plan, selection.Selected, err)
+		_ = progress.Emit(rewriteProgressEvent{Phase: "grouping", Message: "grouping failed"})
+		return
+	}
+	byOID := make(map[string]git.RewriteCommitRecord, len(selection.Selected))
+	for _, commit := range selection.Selected {
+		byOID[commit.OID] = commit
+	}
+	for _, proposed := range proposal.Groups {
+		group := state.RewritePlanGroup{GroupingReason: proposed.GroupingReason}
+		group.ProposedMessage = proposed.Subject
+		if strings.TrimSpace(proposed.Body) != "" {
+			group.ProposedMessage += "\n\n" + proposed.Body
+		}
+		for _, oid := range proposed.OldOIDs {
+			commit := byOID[oid]
+			group.Members = append(group.Members, state.RewritePlanMember{OldOID: oid, OriginalMessage: commit.Message})
+		}
+		plan.Groups = append(plan.Groups, group)
+	}
+	if err := validateRewritePlanGroupsInRepo(ctx, repo, plan.Groups); err != nil {
+		invalidateRewritePlan(plan, selection.Selected, err)
+		return
+	}
+	_ = progress.Emit(rewriteProgressEvent{Phase: "grouping", Message: fmt.Sprintf("%d group(s) ready", len(plan.Groups)), Current: len(plan.Groups), Total: len(plan.Groups)})
+}
+
+func buildHistoryRewritePlanRequest(ctx context.Context, repo string, db *state.DB, commits []git.RewriteCommitRecord, provider ai.Provider, format ai.CommitFormat) (ai.HistoryRewritePlanRequest, error) {
+	req := ai.HistoryRewritePlanRequest{CommitFormat: format}
+	diffCap := 0
+	if len(commits) > 0 {
+		diffCap = ai.HistoryRewriteTotalDiffCap / len(commits)
+		if diffCap > ai.HistoryRewritePerCommitDiffCap {
+			diffCap = ai.HistoryRewritePerCommitDiffCap
+		}
+	}
+	for i, commit := range commits {
+		paths, err := gitOutputLines(ctx, repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit.OID)
+		if err != nil {
+			return ai.HistoryRewritePlanRequest{}, err
+		}
+		if len(paths) > 100 {
+			paths = paths[:100]
+		}
+		stat, err := gitOutputString(ctx, repo, "show", "--stat", "--format=", commit.OID)
+		if err != nil {
+			return ai.HistoryRewritePlanRequest{}, err
+		}
+		author, err := gitOutputString(ctx, repo, "show", "-s", "--format=%an%x00%ae", commit.OID)
+		if err != nil {
+			return ai.HistoryRewritePlanRequest{}, err
+		}
+		parts := strings.Split(strings.TrimRight(author, "\n"), "\x00")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return ai.HistoryRewritePlanRequest{}, fmt.Errorf("acd history rewrite: malformed author metadata for %s", shortenSHA(commit.OID))
+		}
+		evidence := ai.HistoryRewriteCommit{
+			OldOID:          commit.OID,
+			Position:        i + 1,
+			OriginalMessage: truncateUTF8(commit.Message, 2*1024),
+			AuthorName:      parts[0],
+			AuthorEmail:     parts[1],
+			ChangedPaths:    paths,
+			DiffStat:        truncateUTF8(strings.TrimSpace(stat), 4*1024),
+		}
+		decisions, decisionErr := state.DecisionsForCommit(ctx, db, commit.OID, 20)
+		if decisionErr == nil {
+			for _, decision := range decisions {
+				evidence.DecisionContext = append(evidence.DecisionContext, truncateRewriteDecisionContext(decisionContextFromRecord(decision), 512))
+			}
+		}
+		if ai.ProviderNeedsDiff(provider) && rewriteDiffEgressOptIn() && diffCap > 0 {
+			diff, err := gitOutputString(ctx, repo, "show", "--format=", "--no-ext-diff", "--unified=80", commit.OID)
+			if err != nil {
+				return ai.HistoryRewritePlanRequest{}, err
+			}
+			evidence.RedactedDiff = ai.Truncate(ai.RedactDiffSecrets(diff), diffCap)
+			evidence.DiffIncluded = evidence.RedactedDiff != ""
+		}
+		req.Commits = append(req.Commits, evidence)
+	}
+	if _, err := ai.BuildHistoryRewriteUserPrompt(req); err != nil {
+		return ai.HistoryRewritePlanRequest{}, err
+	}
+	return req, nil
+}
+
+func truncateRewriteDecisionContext(in ai.RewriteDecisionContext, limit int) ai.RewriteDecisionContext {
+	in.Kind = truncateUTF8(in.Kind, limit)
+	in.Path = truncateUTF8(in.Path, limit)
+	in.Reason = truncateUTF8(in.Reason, limit)
+	in.ActionTaken = truncateUTF8(in.ActionTaken, limit)
+	in.UserMessage = truncateUTF8(in.UserMessage, limit)
+	return in
+}
+
+func truncateUTF8(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	end := 0
+	for index := range value {
+		if index > limit {
+			break
+		}
+		end = index
+	}
+	if end == 0 {
+		return ""
+	}
+	return value[:end]
+}
+
+func invalidateRewritePlan(plan *state.RewritePlan, commits []git.RewriteCommitRecord, cause error) {
+	plan.ValidationStatus = state.RewritePlanValidationInvalid
+	plan.ValidationError = sql.NullString{String: rewriteFailureJSON("selection", cause), Valid: true}
+	plan.Groups = singletonRewritePlanGroups(commits)
+}
+
+func singletonRewritePlanGroups(commits []git.RewriteCommitRecord) []state.RewritePlanGroup {
+	groups := make([]state.RewritePlanGroup, 0, len(commits))
+	for _, commit := range commits {
+		groups = append(groups, state.RewritePlanGroup{
+			Members:         []state.RewritePlanMember{{OldOID: commit.OID, OriginalMessage: commit.Message}},
+			ProposedMessage: commit.Message,
+			GroupingReason:  "original commit retained after planning failure",
+		})
+	}
+	return groups
+}
+
+func validateRewritePlanGroupsInRepo(ctx context.Context, repo string, groups []state.RewritePlanGroup) error {
+	applyGroups := make([]git.RewriteApplyGroup, 0, len(groups))
+	for _, group := range groups {
+		oldOIDs := make([]string, 0, len(group.Members))
+		for _, member := range group.Members {
+			oldOIDs = append(oldOIDs, member.OldOID)
+		}
+		applyGroups = append(applyGroups, git.RewriteApplyGroup{OldOIDs: oldOIDs, ProposedMessage: group.ProposedMessage})
+	}
+	return git.ValidateRewriteGroupSemantics(ctx, repo, applyGroups)
 }
 
 func rewriteStateDBPath(ctx context.Context, repo string) (string, error) {

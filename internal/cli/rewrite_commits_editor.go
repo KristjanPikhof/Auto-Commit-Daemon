@@ -27,19 +27,30 @@ func renderRewritePlanEdit(plan state.RewritePlan, format string) ([]byte, error
 	case rewriteEditFormatText:
 		var b strings.Builder
 		fmt.Fprintf(&b, "# ACD rewrite plan %s\n", plan.ID)
-		b.WriteString("# Edit only the commit message text between message markers.\n")
+		b.WriteString("# Move commit lines only to change adjacent group boundaries.\n")
+		b.WriteString("# Keep every commit exactly once and in the same order.\n")
 		b.WriteString("# Comment lines outside message blocks are ignored.\n\n")
-		for _, c := range plan.Commits {
-			fmt.Fprintf(&b, "commit %s\n", c.OldOID)
+		for i, group := range plan.Groups {
+			fmt.Fprintf(&b, "group %d\n", i+1)
+			for _, member := range group.Members {
+				fmt.Fprintf(&b, "commit %s\n", member.OldOID)
+			}
+			b.WriteString("reason <<ACD_GROUP_REASON\n")
+			b.WriteString(strings.TrimRight(group.GroupingReason, "\n"))
+			b.WriteString("\nACD_GROUP_REASON\n")
 			b.WriteString("message <<ACD_COMMIT_MESSAGE\n")
-			b.WriteString(strings.TrimRight(c.ProposedMessage, "\n"))
+			b.WriteString(strings.TrimRight(group.ProposedMessage, "\n"))
 			b.WriteString("\nACD_COMMIT_MESSAGE\n\n")
 		}
 		return []byte(b.String()), nil
 	case rewriteEditFormatJSON:
 		doc := rewritePlanEditJSON{PlanID: plan.ID}
-		for _, c := range plan.Commits {
-			doc.Commits = append(doc.Commits, rewritePlanEditJSONCommit{OldOID: c.OldOID, Message: c.ProposedMessage})
+		for _, group := range plan.Groups {
+			item := rewritePlanEditJSONGroup{GroupingReason: group.GroupingReason, Message: group.ProposedMessage}
+			for _, member := range group.Members {
+				item.OldOIDs = append(item.OldOIDs, member.OldOID)
+			}
+			doc.Groups = append(doc.Groups, item)
 		}
 		return json.MarshalIndent(doc, "", "  ")
 	default:
@@ -47,7 +58,7 @@ func renderRewritePlanEdit(plan state.RewritePlan, format string) ([]byte, error
 	}
 }
 
-func parseRewritePlanEdit(data []byte, format string, base state.RewritePlan) ([]state.RewritePlanCommit, error) {
+func parseRewritePlanEdit(data []byte, format string, base state.RewritePlan) ([]state.RewritePlanGroup, error) {
 	switch format {
 	case rewriteEditFormatText:
 		return parseRewritePlanEditText(data, base)
@@ -58,79 +69,88 @@ func parseRewritePlanEdit(data []byte, format string, base state.RewritePlan) ([
 	}
 }
 
-func parseRewritePlanEditText(data []byte, base state.RewritePlan) ([]state.RewritePlanCommit, error) {
-	type block struct{ oid, message string }
-	var blocks []block
+func parseRewritePlanEditText(data []byte, base state.RewritePlan) ([]state.RewritePlanGroup, error) {
 	s := bufio.NewScanner(bytes.NewReader(data))
 	s.Buffer(make([]byte, 1024), 1024*1024)
+	var groups []state.RewritePlanGroup
+	membersByOID := rewritePlanMembersByOID(base.Groups)
 	for s.Scan() {
 		line := s.Text()
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if !strings.HasPrefix(trimmed, "commit ") {
-			return nil, fmt.Errorf("acd history rewrite: invalid text plan: expected commit line, got %q", line)
+		expectedGroupLine := fmt.Sprintf("group %d", len(groups)+1)
+		if trimmed != expectedGroupLine {
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan: expected %q, got %q", expectedGroupLine, line)
 		}
-		oid := strings.TrimSpace(strings.TrimPrefix(trimmed, "commit "))
-		if oid == "" {
-			return nil, errors.New("acd history rewrite: invalid text plan: empty commit oid")
-		}
-		if !s.Scan() {
-			return nil, fmt.Errorf("acd history rewrite: invalid text plan for %s: missing message marker", oid)
-		}
-		if strings.TrimSpace(s.Text()) != "message <<ACD_COMMIT_MESSAGE" {
-			return nil, fmt.Errorf("acd history rewrite: invalid text plan for %s: expected message marker", oid)
-		}
-		var msg []string
-		closed := false
+		var group state.RewritePlanGroup
 		for s.Scan() {
-			line = s.Text()
-			if strings.TrimSpace(line) == "ACD_COMMIT_MESSAGE" {
-				closed = true
+			trimmed = strings.TrimSpace(s.Text())
+			if trimmed == "reason <<ACD_GROUP_REASON" {
 				break
 			}
-			msg = append(msg, line)
+			if !strings.HasPrefix(trimmed, "commit ") {
+				return nil, fmt.Errorf("acd history rewrite: invalid text plan: expected commit or reason line, got %q", s.Text())
+			}
+			oid := strings.TrimSpace(strings.TrimPrefix(trimmed, "commit "))
+			member, ok := membersByOID[oid]
+			if !ok {
+				return nil, fmt.Errorf("acd history rewrite: invalid text plan: unknown commit oid %q", oid)
+			}
+			group.Members = append(group.Members, member)
 		}
-		if !closed {
-			return nil, fmt.Errorf("acd history rewrite: invalid text plan for %s: missing end marker", oid)
+		if len(group.Members) == 0 {
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan: group %d has no commits", len(groups)+1)
 		}
-		blocks = append(blocks, block{oid: oid, message: strings.TrimRight(strings.Join(msg, "\n"), "\n")})
+		reason, err := scanRewriteEditBlock(s, "ACD_GROUP_REASON")
+		if err != nil {
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan group %d reason: %w", len(groups)+1, err)
+		}
+		if !s.Scan() || strings.TrimSpace(s.Text()) != "message <<ACD_COMMIT_MESSAGE" {
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan group %d: expected message marker", len(groups)+1)
+		}
+		message, err := scanRewriteEditBlock(s, "ACD_COMMIT_MESSAGE")
+		if err != nil {
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan group %d message: %w", len(groups)+1, err)
+		}
+		group.GroupingReason = reason
+		group.ProposedMessage = message
+		groups = append(groups, group)
 	}
 	if err := s.Err(); err != nil {
 		return nil, fmt.Errorf("acd history rewrite: read text plan: %w", err)
 	}
-	if len(blocks) != len(base.Commits) {
-		return nil, fmt.Errorf("acd history rewrite: invalid text plan: got %d commit block(s), want %d", len(blocks), len(base.Commits))
+	return validateEditedRewriteGroups(base, groups, "text")
+}
+
+func scanRewriteEditBlock(s *bufio.Scanner, marker string) (string, error) {
+	var lines []string
+	for s.Scan() {
+		if strings.TrimSpace(s.Text()) == marker {
+			value := strings.TrimRight(strings.Join(lines, "\n"), "\n")
+			if strings.TrimSpace(value) == "" {
+				return "", errors.New("block is empty")
+			}
+			return value, nil
+		}
+		lines = append(lines, s.Text())
 	}
-	out := make([]state.RewritePlanCommit, len(base.Commits))
-	for i, baseCommit := range base.Commits {
-		if blocks[i].oid != baseCommit.OldOID {
-			return nil, fmt.Errorf("acd history rewrite: invalid text plan: commit %d oid %q, want %q", i+1, blocks[i].oid, baseCommit.OldOID)
-		}
-		if strings.TrimSpace(blocks[i].message) == "" {
-			return nil, fmt.Errorf("acd history rewrite: invalid text plan: commit %s has empty message", blocks[i].oid)
-		}
-		if err := validateEditedRewriteMessage(base, baseCommit, blocks[i].message); err != nil {
-			return nil, err
-		}
-		out[i] = baseCommit
-		out[i].ProposedMessage = blocks[i].message
-	}
-	return out, nil
+	return "", fmt.Errorf("missing end marker %s", marker)
 }
 
 type rewritePlanEditJSON struct {
-	PlanID  string                      `json:"plan_id"`
-	Commits []rewritePlanEditJSONCommit `json:"commits"`
+	PlanID string                       `json:"plan_id"`
+	Groups []rewritePlanEditJSONGroup `json:"groups"`
 }
 
-type rewritePlanEditJSONCommit struct {
-	OldOID  string `json:"old_oid"`
-	Message string `json:"message"`
+type rewritePlanEditJSONGroup struct {
+	OldOIDs        []string `json:"old_oids"`
+	GroupingReason string   `json:"grouping_reason"`
+	Message        string   `json:"message"`
 }
 
-func parseRewritePlanEditJSON(data []byte, base state.RewritePlan) ([]state.RewritePlanCommit, error) {
+func parseRewritePlanEditJSON(data []byte, base state.RewritePlan) ([]state.RewritePlanGroup, error) {
 	var doc rewritePlanEditJSON
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -146,57 +166,102 @@ func parseRewritePlanEditJSON(data []byte, base state.RewritePlan) ([]state.Rewr
 	if strings.TrimSpace(doc.PlanID) != "" && doc.PlanID != base.ID {
 		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: plan_id %q, want %q", doc.PlanID, base.ID)
 	}
-	if len(doc.Commits) != len(base.Commits) {
-		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: got %d commit(s), want %d", len(doc.Commits), len(base.Commits))
+	membersByOID := rewritePlanMembersByOID(base.Groups)
+	groups := make([]state.RewritePlanGroup, 0, len(doc.Groups))
+	for i, item := range doc.Groups {
+		group := state.RewritePlanGroup{GroupingReason: item.GroupingReason, ProposedMessage: item.Message}
+		for _, oid := range item.OldOIDs {
+			member, ok := membersByOID[oid]
+			if !ok {
+				return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: group %d has unknown oid %q", i+1, oid)
+			}
+			group.Members = append(group.Members, member)
+		}
+		groups = append(groups, group)
 	}
-	out := make([]state.RewritePlanCommit, len(base.Commits))
-	for i, baseCommit := range base.Commits {
-		got := doc.Commits[i]
-		if got.OldOID != baseCommit.OldOID {
-			return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: commit %d oid %q, want %q", i+1, got.OldOID, baseCommit.OldOID)
-		}
-		if strings.TrimSpace(got.Message) == "" {
-			return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: commit %s has empty message", got.OldOID)
-		}
-		if err := validateEditedRewriteMessage(base, baseCommit, got.Message); err != nil {
-			return nil, err
-		}
-		out[i] = baseCommit
-		out[i].ProposedMessage = got.Message
-	}
-	return out, nil
+	return validateEditedRewriteGroups(base, groups, "JSON")
 }
 
-func validateEditedRewriteMessage(plan state.RewritePlan, commit state.RewritePlanCommit, message string) error {
+func validateEditedRewriteGroups(base state.RewritePlan, groups []state.RewritePlanGroup, format string) ([]state.RewritePlanGroup, error) {
+	if len(groups) == 0 {
+		return nil, fmt.Errorf("acd history rewrite: invalid %s plan: groups must be non-empty", format)
+	}
+	want := flattenRewritePlanMemberOIDs(base.Groups)
+	got := flattenRewritePlanMemberOIDs(groups)
+	if len(got) != len(want) {
+		return nil, fmt.Errorf("acd history rewrite: invalid %s plan: got %d commit(s), want %d", format, len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return nil, fmt.Errorf("acd history rewrite: invalid %s plan: commit %d oid %q, want %q", format, i+1, got[i], want[i])
+		}
+	}
+	for i, group := range groups {
+		if len(group.Members) == 0 || strings.TrimSpace(group.GroupingReason) == "" || strings.TrimSpace(group.ProposedMessage) == "" {
+			return nil, fmt.Errorf("acd history rewrite: invalid %s plan: group %d is missing commits, reason, or message", format, i+1)
+		}
+		if err := validateEditedRewriteMessage(base, group); err != nil {
+			return nil, err
+		}
+	}
+	return groups, nil
+}
+
+func validateEditedRewriteMessage(plan state.RewritePlan, group state.RewritePlanGroup) error {
 	if normalizeRewritePlanCommitFormat(plan.CommitFormat) != string(ai.CommitFormatConventional) {
 		return nil
 	}
-	parts := strings.SplitN(strings.TrimSpace(message), "\n\n", 2)
+	parts := strings.SplitN(strings.TrimSpace(group.ProposedMessage), "\n\n", 2)
 	result := ai.Result{Subject: parts[0]}
 	if len(parts) == 2 {
 		result.Body = parts[1]
 	}
-	_, err := ai.ValidateCommitRewriteProposal(ai.CommitRewriteRequest{
-		OldOID:          commit.OldOID,
-		OriginalMessage: commit.OriginalMessage,
-		CommitFormat:    ai.CommitFormatConventional,
-	}, result)
+	last := group.Members[len(group.Members)-1]
+	_, err := ai.ValidateCommitRewriteProposal(ai.CommitRewriteRequest{OldOID: last.OldOID, OriginalMessage: last.OriginalMessage, CommitFormat: ai.CommitFormatConventional}, result)
 	if err != nil {
-		return fmt.Errorf("acd history rewrite: invalid conventional message for %s: %w", commit.OldOID, err)
+		return fmt.Errorf("acd history rewrite: invalid conventional message for group ending at %s: %w", last.OldOID, err)
 	}
 	return nil
 }
 
-func rewritePlanMessagesEqual(a, b []state.RewritePlanCommit) bool {
+func rewritePlanGroupsEqual(a, b []state.RewritePlanGroup) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i].OldOID != b[i].OldOID || a[i].ProposedMessage != b[i].ProposedMessage {
+		if a[i].ProposedMessage != b[i].ProposedMessage || a[i].GroupingReason != b[i].GroupingReason {
 			return false
+		}
+		if len(a[i].Members) != len(b[i].Members) {
+			return false
+		}
+		for j := range a[i].Members {
+			if a[i].Members[j].OldOID != b[i].Members[j].OldOID {
+				return false
+			}
 		}
 	}
 	return true
+}
+
+func rewritePlanMembersByOID(groups []state.RewritePlanGroup) map[string]state.RewritePlanMember {
+	out := make(map[string]state.RewritePlanMember)
+	for _, group := range groups {
+		for _, member := range group.Members {
+			out[member.OldOID] = member
+		}
+	}
+	return out
+}
+
+func flattenRewritePlanMemberOIDs(groups []state.RewritePlanGroup) []string {
+	var out []string
+	for _, group := range groups {
+		for _, member := range group.Members {
+			out = append(out, member.OldOID)
+		}
+	}
+	return out
 }
 
 func promptRewriteYesNo(in io.Reader, out io.Writer, question string, defaultYes bool) (bool, error) {
@@ -235,7 +300,7 @@ func isInteractiveInput(in io.Reader) bool {
 	return err == nil && (st.Mode()&os.ModeCharDevice) != 0
 }
 
-func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.RewritePlanCommit, bool, error) {
+func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.RewritePlanGroup, bool, error) {
 	initial, err := renderRewritePlanEdit(plan, format)
 	if err != nil {
 		return nil, false, err
@@ -268,16 +333,19 @@ func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.R
 	if err != nil {
 		return nil, false, err
 	}
-	commits, err := parseRewritePlanEdit(edited, format, plan)
+	groups, err := parseRewritePlanEdit(edited, format, plan)
 	if err != nil {
 		return nil, false, err
 	}
-	return commits, !bytes.Equal(initial, edited), nil
+	return groups, !bytes.Equal(initial, edited), nil
 }
 
-func persistEditedRewritePlan(ctx context.Context, repo string, plan state.RewritePlan, commits []state.RewritePlanCommit) (state.RewritePlan, error) {
-	if rewritePlanMessagesEqual(plan.Commits, commits) {
+func persistEditedRewritePlan(ctx context.Context, repo string, plan state.RewritePlan, groups []state.RewritePlanGroup) (state.RewritePlan, error) {
+	if rewritePlanGroupsEqual(plan.Groups, groups) {
 		return plan, nil
+	}
+	if err := validateRewritePlanGroupsInRepo(ctx, repo, groups); err != nil {
+		return state.RewritePlan{}, err
 	}
 	if strings.TrimSpace(plan.ID) == "" {
 		return state.RewritePlan{}, errors.New("acd history rewrite: cannot save edited plan revision without a saved plan id")
@@ -291,7 +359,7 @@ func persistEditedRewritePlan(ctx context.Context, repo string, plan state.Rewri
 		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: open state db: %w", err)
 	}
 	defer db.Close()
-	id, err := state.CreateEditedRewritePlanRevision(ctx, db, plan.ID, commits, state.RewritePlanValidationValid)
+	id, err := state.CreateEditedRewritePlanRevision(ctx, db, plan.ID, groups, state.RewritePlanValidationValid)
 	if err != nil {
 		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: save edited plan: %w", err)
 	}
