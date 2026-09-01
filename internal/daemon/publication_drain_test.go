@@ -606,13 +606,7 @@ WHERE seq=?`, fmt.Sprintf("commit-%03d", i), events[i].Seq); err != nil {
 func TestResumePublicationDrainCheckpointingClampsClockRollback(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
-	if err := gitpkg.Init(ctx, repo); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
-		"symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
-		t.Fatal(err)
-	}
+	initPublicationDrainTestRepo(t, ctx, repo)
 	head := commitSingleFile(t, ctx, repo, "", "owned.txt", "base\n", "base")
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
 		"update-ref", "refs/heads/main", head); err != nil {
@@ -658,13 +652,7 @@ UPDATE capture_events SET state='recovered',commit_oid='archive-proof' WHERE seq
 func TestResumePublicationDrainRetriesUnavailableSemanticMessage(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
-	if err := gitpkg.Init(ctx, repo); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
-		"symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
-		t.Fatal(err)
-	}
+	initPublicationDrainTestRepo(t, ctx, repo)
 	head := commitSingleFile(t, ctx, repo, "", "owned.txt", "base\n", "base")
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
 		"update-ref", "refs/heads/main", head); err != nil {
@@ -695,6 +683,26 @@ func TestResumePublicationDrainRetriesUnavailableSemanticMessage(t *testing.T) {
 	if err != nil || resumed.Phase != state.PublicationDrainSemantic ||
 		resumed.LastError != "" {
 		t.Fatalf("resumed=(%+v,%v)", resumed, err)
+	}
+}
+
+func initPublicationDrainTestRepo(t *testing.T, ctx context.Context, repo string) {
+	t.Helper()
+	if err := gitpkg.Init(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+	for _, setting := range [][2]string{
+		{"user.name", "ACD Test"},
+		{"user.email", "acd@test.invalid"},
+	} {
+		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+			"config", setting[0], setting[1]); err != nil {
+			t.Fatalf("git config %s: %v", setting[0], err)
+		}
 	}
 }
 
