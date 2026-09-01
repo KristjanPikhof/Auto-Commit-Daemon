@@ -1081,6 +1081,10 @@ func TestRewriteCommitsParserFlags(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "--plan-only") {
 		t.Fatalf("plan-only/apply validation err = %v", err)
 	}
+	err = normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{showPlan: "plan-id", messagesOnly: true, editFormat: "text"})
+	if err == nil || !strings.Contains(err.Error(), "only valid when generating") {
+		t.Fatalf("messages-only saved-plan validation err = %v", err)
+	}
 }
 
 func TestRewriteCommitsSelectorAliasesNormalize(t *testing.T) {
