@@ -337,7 +337,7 @@ func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.R
 	if err != nil {
 		return nil, false, err
 	}
-	return groups, !bytes.Equal(initial, edited), nil
+	return groups, !rewritePlanGroupsEqual(plan.Groups, groups), nil
 }
 
 func persistEditedRewritePlan(ctx context.Context, repo string, plan state.RewritePlan, groups []state.RewritePlanGroup) (state.RewritePlan, error) {
