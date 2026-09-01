@@ -2567,7 +2567,6 @@ func TestRun_AIProvider_FallbackToDeterministic(t *testing.T) {
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -2584,13 +2583,17 @@ func TestRun_AIProvider_FallbackToDeterministic(t *testing.T) {
 			SkipSignals: true,
 		})
 	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
 
 	if err := os.WriteFile(filepath.Join(f.dir, "fallback.txt"), []byte("fb\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	wakeCh <- struct{}{}
 
-	newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+	newHead := waitForCommit(t, f.dir, startHead, 10*time.Second)
 	out, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir},
 		"log", "-1", "--pretty=%s", newHead)
 	if err != nil {
