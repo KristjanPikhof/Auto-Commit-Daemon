@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -54,6 +55,14 @@ type rewriteCommitsOptions struct {
 	progressTo io.Writer
 	quiet      bool
 	in         io.Reader
+}
+
+type rewriteProviderResolution struct {
+	Config         ai.ProviderConfig
+	ProviderSource config.Source
+	StrategySource config.Source
+	GlobalConfig   ai.ProviderConfig
+	GlobalSource   config.Source
 }
 
 func newRewriteCommitsCmd() *cobra.Command {
@@ -168,6 +177,34 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		RecreateUnchanged: selection.RecreateUnchanged,
 		SelectedPositions: fmt.Sprintf("%d-%d", selection.SelectedNewestIndex, selection.SelectedOldestIndex),
 	}
+	if jsonOut {
+		if err := progress.Emit(rewriteProgressEvent{
+			Phase:   "selection",
+			Message: fmt.Sprintf("selected %d commit(s)", len(report.Selected)),
+			Current: len(report.Selected),
+			Total:   len(report.Selected),
+		}); err != nil {
+			return err
+		}
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(report)
+	}
+	providerResolution, err := resolveRewriteProviderConfig(ctx, repo)
+	if err != nil {
+		return err
+	}
+	provider, closer, err := ai.BuildProvider(providerResolution.Config)
+	if err != nil {
+		cause := fmt.Errorf("%w: %v", ai.ErrRewriteRequiresAIProvider, err)
+		return rewriteProviderGateError(cause, providerResolution, repo)
+	}
+	if closer != nil {
+		defer func() { _ = closer.Close() }()
+	}
+	if err := ai.CheckRewritePlanGenerationGate(providerResolution.Config, provider); err != nil {
+		return rewriteProviderGateError(err, providerResolution, repo)
+	}
 	if err := progress.Emit(rewriteProgressEvent{
 		Phase:   "selection",
 		Message: fmt.Sprintf("selected %d commit(s)", len(report.Selected)),
@@ -176,34 +213,13 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	}); err != nil {
 		return err
 	}
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(report)
-	}
-	fmt.Fprintf(out, "rewrite-commits plan generation accepted for %s\n", rewriteSelectionLabel(opts))
+	fmt.Fprintf(out, "History rewrite plan for %s\n", rewriteSelectionLabel(opts))
 	printRewriteSelectionSummary(out, report)
-
-	cfg, err := resolveRewriteProviderConfig(ctx, repo)
-	if err != nil {
-		return err
-	}
-	provider, closer, err := ai.BuildProvider(cfg)
-	if err != nil {
-		return fmt.Errorf("acd history rewrite: %w: %w",
-			ai.ErrRewriteRequiresAIProvider, err)
-	}
-	if closer != nil {
-		defer func() { _ = closer.Close() }()
-	}
-	if err := ai.CheckRewritePlanGenerationGate(cfg, provider); err != nil {
-		return fmt.Errorf("acd history rewrite: %w", err)
-	}
-	if err := progress.Emit(rewriteProgressEvent{Phase: "provider", Message: fmt.Sprintf("using %s", ai.PrimaryProviderName(provider))}); err != nil {
+	if err := progress.Emit(rewriteProgressEvent{Phase: "provider", Message: fmt.Sprintf("using %s", displayProvider(ai.PrimaryProviderName(provider)))}); err != nil {
 		return err
 	}
 
-	plan, err := generateRewritePlan(ctx, repo, selection, provider, cfg, progress)
+	plan, err := generateRewritePlan(ctx, repo, selection, provider, providerResolution.Config, progress)
 	if err != nil {
 		return err
 	}
@@ -293,23 +309,107 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	return applySavedRewritePlan(ctx, out, repoFlag, applyOpts)
 }
 
-func resolveRewriteProviderConfig(ctx context.Context, repo string) (ai.ProviderConfig, error) {
+func resolveRewriteProviderConfig(ctx context.Context, repo string) (rewriteProviderResolution, error) {
 	roots, err := paths.Resolve()
 	if err != nil {
-		return ai.ProviderConfig{}, fmt.Errorf("acd history rewrite: resolve config paths: %w", err)
+		return rewriteProviderResolution{}, fmt.Errorf("acd history rewrite: resolve config paths: %w", err)
 	}
 	service, err := settings.NewValidationService(ctx, settings.Options{
 		Roots:    roots,
 		RepoPath: repo,
 	})
 	if err != nil {
-		return ai.ProviderConfig{}, fmt.Errorf("acd history rewrite: resolve settings: %w", err)
+		return rewriteProviderResolution{}, fmt.Errorf("acd history rewrite: resolve settings: %w", err)
+	}
+	defer func() { _ = service.Close() }()
+	preview, err := service.AuthoringPreview()
+	if err != nil {
+		return rewriteProviderResolution{}, fmt.Errorf("acd history rewrite: resolve settings: %w", err)
 	}
 	cfg, err := service.AuthoringProviderConfig()
 	if err != nil {
-		return ai.ProviderConfig{}, fmt.Errorf("acd history rewrite: resolve settings: %w", err)
+		return rewriteProviderResolution{}, fmt.Errorf("acd history rewrite: resolve settings: %w", err)
 	}
-	return cfg, nil
+	globalService, err := settings.NewGlobalService(ctx, settings.Options{Roots: roots})
+	if err != nil {
+		return rewriteProviderResolution{}, fmt.Errorf("acd history rewrite: resolve global settings: %w", err)
+	}
+	defer func() { _ = globalService.Close() }()
+	globalCfg, err := globalService.AuthoringProviderConfig()
+	if err != nil {
+		return rewriteProviderResolution{}, fmt.Errorf("acd history rewrite: resolve global settings: %w", err)
+	}
+	globalPreview, err := globalService.AuthoringPreview()
+	if err != nil {
+		return rewriteProviderResolution{}, fmt.Errorf("acd history rewrite: resolve global settings: %w", err)
+	}
+	return rewriteProviderResolution{
+		Config: cfg, ProviderSource: preview.Sources[config.FieldProvider],
+		StrategySource: preview.Sources[config.FieldCommitStrategy],
+		GlobalConfig:   globalCfg, GlobalSource: globalPreview.Sources[config.FieldProvider],
+	}, nil
+}
+
+func rewriteProviderGateError(cause error, resolved rewriteProviderResolution, repo string) error {
+	var guidance strings.Builder
+	repositoryOverride := resolved.ProviderSource == config.SourceRepository
+	if errors.Is(cause, ai.ErrRewriteRequiresIntentStrategy) {
+		repositoryOverride = resolved.StrategySource == config.SourceRepository
+		fmt.Fprintf(&guidance, "\n\nCurrent mode: %s (%s)\n",
+			displayConfigureWord(string(resolved.Config.CommitStrategy)),
+			displayRewriteSettingSource(resolved.StrategySource))
+	} else {
+		fmt.Fprintf(&guidance, "\n\nCurrent provider: %s (%s)\n",
+			displayProvider(resolved.Config.Mode),
+			displayRewriteSettingSource(resolved.ProviderSource))
+	}
+	if errors.Is(cause, ai.ErrRewriteRequiresAIProvider) &&
+		strings.TrimSpace(resolved.Config.Mode) == "openai-compat" &&
+		strings.TrimSpace(resolved.Config.APIKey) == "" {
+		guidance.WriteString("Credential: not configured\n\nConfigure the credential:\n  acd auth set\n")
+		guidance.WriteString("\nNo plan was generated. Git history is unchanged.")
+		return fmt.Errorf("%w%s", cause, guidance.String())
+	}
+	if repositoryOverride && rewriteProviderConfigCanPlan(resolved.GlobalConfig) {
+		label := "Inherited provider"
+		if resolved.GlobalSource == config.SourceGlobal {
+			label = "Global default"
+		}
+		fmt.Fprintf(&guidance, "%s: %s", label, displayProvider(resolved.GlobalConfig.Mode))
+		if model := strings.TrimSpace(resolved.GlobalConfig.Model); model != "" {
+			fmt.Fprintf(&guidance, " (%s)", model)
+		}
+		fmt.Fprintf(&guidance, "\n\nTo use every global setting:\n  acd config edit --repo %s --inherit\n", productListShellQuote(repo))
+		fmt.Fprintf(&guidance, "\nTo configure only this repository:\n  acd config edit --repo %s\n", productListShellQuote(repo))
+	} else {
+		fmt.Fprintf(&guidance, "\nConfigure this repository:\n  acd config edit --repo %s\n", productListShellQuote(repo))
+		guidance.WriteString("\nConfigure defaults for repositories without overrides:\n  acd config edit\n")
+	}
+	guidance.WriteString("\nNo plan was generated. Git history is unchanged.")
+	return fmt.Errorf("%w%s", cause, guidance.String())
+}
+
+func rewriteProviderConfigCanPlan(cfg ai.ProviderConfig) bool {
+	mode := strings.TrimSpace(strings.ToLower(cfg.Mode))
+	if cfg.CommitStrategy != ai.CommitStrategyIntent || mode == "" || mode == "deterministic" {
+		return false
+	}
+	if mode == "openai-compat" && strings.TrimSpace(cfg.APIKey) == "" {
+		return false
+	}
+	_, err := ai.ValidateProviderConfig(cfg)
+	return err == nil
+}
+
+func displayRewriteSettingSource(source config.Source) string {
+	switch source {
+	case config.SourceRepository:
+		return "repository override"
+	case config.SourceGlobal:
+		return "global default"
+	default:
+		return string(source)
+	}
 }
 
 func finishRewritePlanOnly(out io.Writer, planRef string) {
@@ -336,7 +436,8 @@ func printRewritePlanNextSteps(out io.Writer, planRef string) {
 }
 
 func printRewriteSelectionSummary(out io.Writer, report rewriteSelectionReport) {
-	fmt.Fprintf(out, "rewrite-commits selection for %s (%s @ %s)\n", report.Repo, report.BranchRef, shortenSHA(report.Head))
+	fmt.Fprintf(out, "Repository: %s\n", report.Repo)
+	fmt.Fprintf(out, "Branch: %s @ %s\n", report.BranchRef, shortenSHA(report.Head))
 	fmt.Fprintf(out, "Selected positions: %s\n", report.SelectedPositions)
 	fmt.Fprintf(out, "Selected commits (%d):\n", len(report.Selected))
 	for _, c := range report.Selected {

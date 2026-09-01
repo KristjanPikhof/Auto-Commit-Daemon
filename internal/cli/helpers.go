@@ -20,6 +20,20 @@ import (
 // overlay). Override via env ACD_CLIENT_TTL_SECONDS.
 const defaultClientTTLSeconds = 1800
 
+func displayProvider(provider string) string {
+	provider = strings.TrimSpace(provider)
+	switch {
+	case provider == "", provider == "deterministic":
+		return "Local rules"
+	case provider == "openai-compat":
+		return "OpenAI-compatible"
+	case strings.HasPrefix(provider, "subprocess:"):
+		return "Local subprocess " + strings.TrimPrefix(provider, "subprocess:")
+	default:
+		return provider
+	}
+}
+
 // clientTTL returns the configured heartbeat freshness window.
 func clientTTL() time.Duration {
 	if v := os.Getenv("ACD_CLIENT_TTL_SECONDS"); v != "" {
