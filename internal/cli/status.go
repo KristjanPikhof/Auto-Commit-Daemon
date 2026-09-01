@@ -798,7 +798,7 @@ func ageExceedsThreshold(ageSeconds int64, threshold time.Duration) bool {
 func publicationPhaseCanStall(phase string) bool {
 	switch phase {
 	case "working", "intent_planning", "intent_replanning", "intent_processing",
-		"local_fallback", "verifying", "event_publishing":
+		"local_fallback", "retrying", "verifying", "event_publishing":
 		return true
 	default:
 		return false

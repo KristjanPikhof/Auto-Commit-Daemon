@@ -3805,7 +3805,7 @@ func TestIntentCandidateBoundariesSkipStaleBranchEpochs(t *testing.T) {
 	}
 }
 
-func TestBuildIntentCandidateDependenciesHashesEvidenceAndEnforcesCap(t *testing.T) {
+func TestBuildIntentCandidateDependenciesHashesEvidenceAndPrunesSoftOverflow(t *testing.T) {
 	t.Parallel()
 	first := intentCandidateCaptureFixture(1, "a.go", "create", "", "a1")
 	second := intentCandidateCaptureFixture(2, "b.go", "create", "", "b1")
@@ -3847,8 +3847,132 @@ func TestBuildIntentCandidateDependenciesHashesEvidenceAndEnforcesCap(t *testing
 		"refs/heads/main", 1, []IntentCandidateCapture{first, second},
 		hints, time.Unix(100, 0),
 	)
-	if err == nil || !strings.Contains(err.Error(), "edge cap 4096") {
-		t.Fatalf("cap error=%v", err)
+	if err != nil {
+		t.Fatalf("soft overflow: %v", err)
+	}
+}
+
+func TestBuildIntentCandidateDependenciesPrunesRealisticSoftEvidenceChurn(
+	t *testing.T,
+) {
+	t.Parallel()
+	const captureCount = 199
+	captures := make([]IntentCandidateCapture, 0, captureCount)
+	for seq := int64(1); seq <= captureCount; seq++ {
+		capture := intentCandidateCaptureFixture(
+			seq, "shared.go", "modify", fmt.Sprintf("before-%d", seq),
+			fmt.Sprintf("after-%d", seq))
+		capture.Event.CapturedTS = float64(seq)
+		captures = append(captures, capture)
+	}
+	hints := make([]IntentDependencyHint, 0, state.IntentDependencyMaxPerPair)
+	for i := 0; i < state.IntentDependencyMaxPerPair; i++ {
+		hints = append(hints, IntentDependencyHint{
+			PrerequisiteSeq: 1, DependentSeq: captureCount,
+			Strength: ai.IntentDependencySoft,
+			Kind:     fmt.Sprintf("soft_%04d", i), Evidence: fmt.Sprint(i),
+		})
+	}
+
+	edges, err := BuildIntentCandidateDependencies(
+		"refs/heads/main", 1, captures, hints, time.Unix(1000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edges) != state.IntentDependencyMaxPerPair {
+		t.Fatalf("dependencies=%d want=%d", len(edges),
+			state.IntentDependencyMaxPerPair)
+	}
+	hard := make(map[[2]int64]struct{})
+	temporal := make(map[[2]int64]struct{})
+	for _, edge := range edges {
+		if edge.Strength == state.IntentDependencyHard {
+			hard[[2]int64{edge.PrerequisiteSeq, edge.DependentSeq}] = struct{}{}
+		}
+		if edge.Kind == "temporal_proximity" {
+			temporal[[2]int64{edge.PrerequisiteSeq, edge.DependentSeq}] = struct{}{}
+		}
+	}
+	for seq := int64(1); seq < captureCount; seq++ {
+		if _, ok := hard[[2]int64{seq, seq + 1}]; !ok {
+			t.Fatalf("hard same-path edge %d -> %d was pruned", seq, seq+1)
+		}
+		if _, ok := temporal[[2]int64{seq, seq + 1}]; !ok {
+			t.Fatalf("intrinsic temporal edge %d -> %d was pruned", seq, seq+1)
+		}
+	}
+}
+
+func TestMergeIntentDependenciesRebuildsSoftEvidenceBeforeRetainedChurn(
+	t *testing.T,
+) {
+	t.Parallel()
+	retained := make([]state.IntentCaptureDependency, 0,
+		state.IntentDependencyMaxPerPair)
+	for i := 0; i < state.IntentDependencyMaxPerPair; i++ {
+		retained = append(retained, state.IntentCaptureDependency{
+			PrerequisiteSeq: 1, DependentSeq: 3,
+			Strength: state.IntentDependencySoft,
+			Kind:     fmt.Sprintf("retained_%04d", i),
+		})
+	}
+	current := []state.IntentCaptureDependency{
+		{PrerequisiteSeq: 1, DependentSeq: 2,
+			Strength: state.IntentDependencyHard, Kind: "same_path"},
+		{PrerequisiteSeq: 2, DependentSeq: 3,
+			Strength: state.IntentDependencySoft, Kind: "fresh_symbol"},
+	}
+
+	merged, err := mergeIntentDependencies(retained, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged) != state.IntentDependencyMaxPerPair {
+		t.Fatalf("dependencies=%d want=%d", len(merged),
+			state.IntentDependencyMaxPerPair)
+	}
+	var hard, fresh bool
+	for _, edge := range merged {
+		hard = hard || edge.Strength == state.IntentDependencyHard &&
+			edge.Kind == "same_path"
+		fresh = fresh || edge.Kind == "fresh_symbol"
+	}
+	if !hard || !fresh {
+		t.Fatalf("hard=%t fresh=%t, rebuilt evidence was pruned", hard, fresh)
+	}
+}
+
+func TestMergeIntentDependenciesFailsClosedOnHardCycle(t *testing.T) {
+	t.Parallel()
+	_, err := mergeIntentDependencies(
+		[]state.IntentCaptureDependency{{
+			PrerequisiteSeq: 2, DependentSeq: 1,
+			Strength: state.IntentDependencyHard, Kind: "retained_order",
+		}},
+		[]state.IntentCaptureDependency{{
+			PrerequisiteSeq: 1, DependentSeq: 2,
+			Strength: state.IntentDependencyHard, Kind: "current_order",
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "hard dependency cycle") {
+		t.Fatalf("cycle error=%v", err)
+	}
+}
+
+func TestMergeIntentDependenciesFailsClosedOnHardCap(t *testing.T) {
+	t.Parallel()
+	hard := make([]state.IntentCaptureDependency, 0,
+		state.IntentDependencyMaxPerPair+1)
+	for i := int64(1); i <= state.IntentDependencyMaxPerPair+1; i++ {
+		hard = append(hard, state.IntentCaptureDependency{
+			PrerequisiteSeq: i, DependentSeq: i + 1,
+			Strength: state.IntentDependencyHard,
+			Kind:     fmt.Sprintf("hard_%04d", i),
+		})
+	}
+	_, err := mergeIntentDependencies(nil, hard)
+	if err == nil || !strings.Contains(err.Error(), "hard edge cap 4096") {
+		t.Fatalf("hard cap error=%v", err)
 	}
 }
 
@@ -3963,6 +4087,43 @@ func TestRuntimeIntentDependencyHintsFindOutputArchiveReferencesInEitherOrder(t 
 	}
 }
 
+func TestRuntimeIntentDependencyHintsKeepLateHardEvidenceAfterSoftCap(t *testing.T) {
+	t.Parallel()
+	captures := make([]IntentCandidateCapture, 0, 95)
+	for seq := int64(1); seq <= 93; seq++ {
+		capture := intentCandidateCaptureFixture(seq,
+			fmt.Sprintf("internal/file_%03d.go", seq), "modify", "", "")
+		capture.CapturedDiff = "+sharedIdentifierForDependencyChurn()\n"
+		captures = append(captures, capture)
+	}
+	source := intentCandidateCaptureFixture(
+		94, "internal/schema.go", "modify", "", "")
+	source.CapturedDiff = "+func BuildSchemaArtifact() {}\n"
+	generated := intentCandidateCaptureFixture(
+		95, "internal/schema.generated.go", "modify", "", "")
+	generated.CapturedDiff = "// Code generated from schema.go\n+BuildSchemaArtifact()\n"
+	captures = append(captures, source, generated)
+
+	hints := runtimeIntentDependencyHints(captures)
+	var hardFound bool
+	softCount := 0
+	for _, hint := range hints {
+		if hint.Strength == ai.IntentDependencyHard &&
+			hint.PrerequisiteSeq == source.Event.Seq &&
+			hint.DependentSeq == generated.Event.Seq &&
+			hint.Kind == "generated_source" {
+			hardFound = true
+		}
+		if hint.Strength == ai.IntentDependencySoft {
+			softCount++
+		}
+	}
+	if !hardFound || softCount != state.IntentDependencyMaxPerPair {
+		t.Fatalf("hard_found=%t soft_count=%d hints=%d", hardFound,
+			softCount, len(hints))
+	}
+}
+
 func openIntentCandidateTestDB(t *testing.T) *state.DB {
 	t.Helper()
 	db, err := state.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
@@ -4007,7 +4168,7 @@ WHERE candidate_id=?`, terminal.ID); err != nil {
 		}},
 	}
 	first, _, err := advanceTerminalIntentCandidateIDs(
-		ctx, db, "refs/heads/main", 1, plan, nil)
+		ctx, db, "refs/heads/main", 1, plan, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4019,11 +4180,157 @@ WHERE candidate_id=?`, terminal.ID); err != nil {
 		t.Fatalf("remapped dependency=%q want=%q", got, want)
 	}
 	second, _, err := advanceTerminalIntentCandidateIDs(
-		ctx, db, "refs/heads/main", 1, plan, nil)
+		ctx, db, "refs/heads/main", 1, plan, nil, nil)
 	if err != nil || second.Candidates[0].CandidateID != first.Candidates[0].CandidateID {
 		t.Fatalf("stable successor=%q first=%q err=%v",
 			second.Candidates[0].CandidateID, first.Candidates[0].CandidateID, err)
 	}
+}
+
+func TestAdvanceTerminalIntentCandidateIDsExtendsExhaustedLegacyChain(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "publication_drain.go", "modify", "before", "after")
+	const baseID = "reused-planner-id"
+	terminal, legacyIDs := seedExhaustedLegacyIntentCandidates(
+		t, db, "refs/heads/main", 1, baseID, capture.Event.Seq)
+
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: baseID, SelectedSeqs: []int64{capture.Event.Seq},
+		}},
+	}
+	extended, _, err := advanceTerminalIntentCandidateIDs(
+		ctx, db, "refs/heads/main", 1, plan, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extendedID := extended.Candidates[0].CandidateID
+	if extendedID == baseID {
+		t.Fatalf("successor id=%q", extendedID)
+	}
+	if _, legacy := legacyIDs[extendedID]; legacy {
+		t.Fatalf("successor reused exhausted legacy id %q", extendedID)
+	}
+	terminal.ID = extendedID
+	if err := state.SaveIntentCandidate(ctx, db, terminal); err != nil {
+		t.Fatal(err)
+	}
+	existing, err := state.IntentCandidatesForPair(
+		ctx, db, "refs/heads/main", 1, state.IntentCandidateMaxOpenPerPair)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reused, _, err := advanceTerminalIntentCandidateIDs(
+		ctx, db, "refs/heads/main", 1, plan, nil, existing)
+	if err != nil || reused.Candidates[0].CandidateID != extendedID {
+		t.Fatalf("reused successor=%q want=%q err=%v",
+			reused.Candidates[0].CandidateID, extendedID, err)
+	}
+}
+
+func TestAdvanceTerminalIntentCandidateIDsIgnoresClockRollback(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	capture := appendIntentCandidateCapture(
+		t, db, "publication_drain.go", "modify", "before", "after")
+	const baseID = "clock-rollback-planner-id"
+	terminal, seen := seedExhaustedLegacyIntentCandidates(
+		t, db, "refs/heads/main", 1, baseID, capture.Event.Seq)
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE intent_candidates SET updated_ts=1000000000`); err != nil {
+		t.Fatal(err)
+	}
+	seen[baseID] = struct{}{}
+	plan := ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: baseID, SelectedSeqs: []int64{capture.Event.Seq},
+		}},
+	}
+
+	for retry := 0; retry <= state.IntentCandidateMaxOpenPerPair; retry++ {
+		advanced, _, err := advanceTerminalIntentCandidateIDs(
+			ctx, db, "refs/heads/main", 1, plan, nil, nil)
+		if err != nil {
+			t.Fatalf("retry %d: %v", retry, err)
+		}
+		candidateID := advanced.Candidates[0].CandidateID
+		if _, duplicate := seen[candidateID]; duplicate {
+			t.Fatalf("retry %d reused candidate %q", retry, candidateID)
+		}
+		seen[candidateID] = struct{}{}
+		terminal.ID = candidateID
+		terminal.UpdatedTS = 1
+		if err := state.SaveIntentCandidate(ctx, db, terminal); err != nil {
+			t.Fatalf("retry %d save: %v", retry, err)
+		}
+		if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE candidate_id=?`, candidateID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates SET status='superseded',updated_ts=1
+WHERE id=?`, candidateID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func seedExhaustedLegacyIntentCandidates(
+	t *testing.T,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	baseID string,
+	eventSeq int64,
+) (state.IntentCandidate, map[string]struct{}) {
+	t.Helper()
+	ctx := context.Background()
+	candidate := state.IntentCandidate{
+		ID: baseID, BranchRef: branchRef, BranchGeneration: generation,
+		Status: state.IntentCandidateWaiting, Readiness: state.IntentReadinessWait,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: eventSeq, EventRole: "code",
+		}},
+	}
+	retire := func(id string) {
+		t.Helper()
+		if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE candidate_id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates SET status='superseded',updated_ts=updated_ts+1
+WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := state.SaveIntentCandidate(ctx, db, candidate); err != nil {
+		t.Fatal(err)
+	}
+	retire(baseID)
+	legacyIDs := make(map[string]struct{}, state.IntentCandidateMaxOpenPerPair)
+	for attempt := 1; attempt <= state.IntentCandidateMaxOpenPerPair; attempt++ {
+		id := legacyIntentCandidateSuccessorID(
+			baseID, branchRef, generation, []int64{eventSeq}, attempt)
+		legacyIDs[id] = struct{}{}
+		candidate.ID = id
+		if err := state.SaveIntentCandidate(ctx, db, candidate); err != nil {
+			t.Fatal(err)
+		}
+		retire(id)
+	}
+	candidate.ID = baseID
+	return candidate, legacyIDs
 }
 
 func appendIntentCandidateCapture(

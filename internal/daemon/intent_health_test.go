@@ -126,14 +126,15 @@ func TestIntentPlannerHealthTransportOpensImmediatelyAndBacksOff(t *testing.T) {
 	}
 
 	for step, tc := range []struct {
-		advance time.Duration
-		failure error
-		level   int
-		backoff time.Duration
+		advance          time.Duration
+		failure          error
+		level            int
+		backoff          time.Duration
+		maxProbeFailures int
 	}{
-		{30 * time.Second, &IntentPlannerTransportFailure{Err: errors.New("timeout")}, 1, 2 * time.Minute},
-		{2 * time.Minute, &IntentPlannerValidationFailure{Err: errors.New("invalid selection")}, 2, 10 * time.Minute},
-		{10 * time.Minute, &IntentPlannerTransportFailure{Err: errors.New("still unavailable")}, 2, 10 * time.Minute},
+		{30 * time.Second, &IntentPlannerTransportFailure{Err: errors.New("timeout")}, 1, 2 * time.Minute, 0},
+		{2 * time.Minute, &IntentPlannerValidationFailure{Err: errors.New("invalid selection")}, 2, 10 * time.Minute, 0},
+		{10 * time.Minute, &IntentPlannerTransportFailure{Err: errors.New("still unavailable")}, 2, 10 * time.Minute, 1},
 	} {
 		clock.Advance(tc.advance)
 		probe, err := health.Acquire(context.Background())
@@ -150,14 +151,59 @@ func TestIntentPlannerHealthTransportOpensImmediatelyAndBacksOff(t *testing.T) {
 		if snap.State != IntentPlannerCircuitOpen || snap.BackoffLevel != tc.level {
 			t.Fatalf("step %d snapshot=%+v want open level %d", step, snap, tc.level)
 		}
+		if snap.MaxBackoffProbeFailures != tc.maxProbeFailures {
+			t.Fatalf("step %d max probes=%d want %d", step,
+				snap.MaxBackoffProbeFailures, tc.maxProbeFailures)
+		}
 		if got, want := snap.NextProbeTS, intentPlannerHealthTimestamp(clock.Now().Add(tc.backoff)); got != want {
 			t.Fatalf("step %d next_probe_ts=%f want %f", step, got, want)
 		}
 	}
 
 	persisted := readIntentHealthRecord(t, db)
-	if persisted.State != IntentPlannerCircuitOpen || persisted.BackoffLevel != 2 || persisted.BypassCount != 1 {
+	if persisted.State != IntentPlannerCircuitOpen || persisted.BackoffLevel != 2 ||
+		persisted.MaxBackoffProbeFailures != 1 || persisted.BypassCount != 1 {
 		t.Fatalf("persisted=%+v", persisted)
+	}
+}
+
+func TestIntentPlannerHealthValidationCountsOnlyCompletedMaxProbe(t *testing.T) {
+	clock := newIntentHealthClock()
+	health := NewIntentPlannerHealth(context.Background(), nil,
+		IntentPlannerHealthOptions{
+			Provider: openAIIntentHealthIdentity("https://planner.example/v1"),
+			Now:      clock.Now,
+		})
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		permit, err := health.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("validation %d acquire: %v", attempt, err)
+		}
+		if err := health.Complete(context.Background(), permit,
+			&IntentPlannerValidationFailure{Err: errors.New("invalid plan")}); err != nil {
+			t.Fatalf("validation %d complete: %v", attempt, err)
+		}
+	}
+	for attempt, advance := range []time.Duration{
+		30 * time.Second, 2 * time.Minute, 10 * time.Minute,
+	} {
+		clock.Advance(advance)
+		permit, err := health.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("probe %d acquire: %v", attempt+1, err)
+		}
+		if err := health.Complete(context.Background(), permit,
+			&IntentPlannerValidationFailure{Err: errors.New("still invalid")}); err != nil {
+			t.Fatalf("probe %d complete: %v", attempt+1, err)
+		}
+		want := 0
+		if attempt == 2 {
+			want = 1
+		}
+		if got := health.Snapshot().MaxBackoffProbeFailures; got != want {
+			t.Fatalf("probe %d max failures=%d want %d", attempt+1, got, want)
+		}
 	}
 }
 
@@ -207,7 +253,8 @@ func TestIntentPlannerHealthSuccessResetsValidationAndClosesProbe(t *testing.T) 
 		t.Fatalf("Complete success: %v", err)
 	}
 	if snap := health.Snapshot(); snap.State != IntentPlannerCircuitClosed ||
-		snap.ConsecutiveFailures != 0 || snap.LastError != "" {
+		snap.ConsecutiveFailures != 0 || snap.MaxBackoffProbeFailures != 0 ||
+		snap.LastError != "" {
 		t.Fatalf("after success snapshot=%+v", snap)
 	}
 

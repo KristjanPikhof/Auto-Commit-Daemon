@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // RecoverySnapshot is the durable record of one all-or-none unpublished-chain
@@ -48,13 +49,17 @@ type RecoveryChainEvent struct {
 // complete unpublished chain. Expected must be the exact same-anchor suffix
 // returned by LoadUnpublishedRecoveryChain.
 type RecoveryChainTransition struct {
-	Expected    []RecoveryChainEvent
-	TargetState string
-	CommitOID   string
-	RecoveryRef string
-	Reason      string
-	ActionTaken string
-	UserMessage string
+	Expected []RecoveryChainEvent
+	// ExpectedLater seals every unpublished row that remains after an exact
+	// frozen prefix. Branch adoption rechecks Expected || ExpectedLater in one
+	// writer transaction so a newly appended capture aborts the whole attempt.
+	ExpectedLater []RecoveryChainEvent
+	TargetState   string
+	CommitOID     string
+	RecoveryRef   string
+	Reason        string
+	ActionTaken   string
+	UserMessage   string
 	// DecisionKind preserves a narrower legacy classification when the
 	// caller has already proven it. Empty selects the outcome default.
 	DecisionKind string
@@ -64,6 +69,15 @@ type RecoveryChainTransition struct {
 	// so the run loop reseeds HEAD and captures the still-dirty worktree again.
 	// Branch-transition callers leave it false and own their generation reseed.
 	InvalidateShadow bool
+	// AllowLaterUnpublished permits Expected to be an exact leading prefix of
+	// the current unpublished suffix. Frozen publication recovery uses this to
+	// settle only its immutable target while preserving captures made later.
+	AllowLaterUnpublished bool
+	// AdoptedBranchHead makes prefix settlement, the complete replacement
+	// shadow, and branch-token metadata one SQLite commit. The caller must hold
+	// the literal branch ref at this exact OID for the duration of the call.
+	AdoptedBranchHead string
+	ShadowRows        []ShadowPath
 }
 
 // ErrRecoveryChainChanged means the unpublished suffix no longer exactly
@@ -89,6 +103,27 @@ func LoadUnpublishedRecoveryChain(ctx context.Context, d *DB, branchRef string, 
 		return nil, fmt.Errorf("state: LoadUnpublishedRecoveryChain: nil db")
 	}
 	return loadUnpublishedRecoveryChain(ctx, d.readSQL(), branchRef, branchGeneration, firstSeq)
+}
+
+// LoadUnpublishedRecoveryChainBounded returns one complete unpublished suffix
+// while capping both event and operation evidence. It uses one event query and
+// one bulk operation query so proof work does not grow into one query per
+// capture. A suffix beyond either bound fails closed with
+// ErrCompletedBranchTransitionProof.
+func LoadUnpublishedRecoveryChainBounded(
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	branchGeneration int64,
+	firstSeq int64,
+	limit int,
+) ([]RecoveryChainEvent, error) {
+	if d == nil {
+		return nil, fmt.Errorf(
+			"state: LoadUnpublishedRecoveryChainBounded: nil db")
+	}
+	return loadUnpublishedRecoveryChainBounded(
+		ctx, d.readSQL(), branchRef, branchGeneration, firstSeq, limit)
 }
 
 // LoadPublishedRecoveryContext returns published candidates that may be needed
@@ -367,6 +402,179 @@ ORDER BY seq ASC`,
 	return chain, nil
 }
 
+func loadUnpublishedRecoveryChainBounded(
+	ctx context.Context,
+	q recoveryQueryer,
+	branchRef string,
+	branchGeneration int64,
+	firstSeq int64,
+	limit int,
+) ([]RecoveryChainEvent, error) {
+	if limit < 1 || limit > CompletedBranchTransitionProofLimit {
+		return nil, fmt.Errorf(
+			"state: LoadUnpublishedRecoveryChainBounded: invalid limit %d", limit)
+	}
+	return loadUnpublishedRecoveryChainWithBounds(
+		ctx, q, branchRef, branchGeneration, firstSeq,
+		limit, limit, ErrCompletedBranchTransitionProof)
+}
+
+func loadUnpublishedRecoveryChainExact(
+	ctx context.Context,
+	q recoveryQueryer,
+	branchRef string,
+	branchGeneration int64,
+	firstSeq int64,
+	eventCount int,
+	opCount int,
+) ([]RecoveryChainEvent, error) {
+	if eventCount < 1 || eventCount > CompletedBranchTransitionProofLimit ||
+		opCount < 0 || opCount > CompletedBranchTransitionProofLimit {
+		return nil, fmt.Errorf(
+			"state: exact unpublished recovery bounds are invalid")
+	}
+	return loadUnpublishedRecoveryChainWithBounds(
+		ctx, q, branchRef, branchGeneration, firstSeq,
+		eventCount, opCount, ErrRecoveryChainChanged)
+}
+
+func loadUnpublishedRecoveryChainWithBounds(
+	ctx context.Context,
+	q recoveryQueryer,
+	branchRef string,
+	branchGeneration int64,
+	firstSeq int64,
+	eventLimit int,
+	opLimit int,
+	overflowErr error,
+) ([]RecoveryChainEvent, error) {
+	if branchRef == "" {
+		return nil, fmt.Errorf(
+			"state: LoadUnpublishedRecoveryChainBounded: empty branch_ref")
+	}
+	if branchGeneration < 1 {
+		return nil, fmt.Errorf(
+			"state: LoadUnpublishedRecoveryChainBounded: invalid branch_generation %d",
+			branchGeneration)
+	}
+	if firstSeq < 1 {
+		return nil, fmt.Errorf(
+			"state: LoadUnpublishedRecoveryChainBounded: invalid first_seq %d",
+			firstSeq)
+	}
+
+	rows, err := q.QueryContext(ctx, `
+SELECT seq, branch_ref, branch_generation, base_head, operation, path, old_path,
+       fidelity, captured_ts, published_ts, state, commit_oid, error, message
+FROM capture_events
+WHERE branch_ref = ?
+  AND branch_generation = ?
+  AND seq >= ?
+  AND state IN (?, ?, ?)
+ORDER BY seq ASC
+LIMIT ?`,
+		branchRef, branchGeneration, firstSeq,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
+		eventLimit+1)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"state: load bounded unpublished recovery events: %w", err)
+	}
+	var chain []RecoveryChainEvent
+	for rows.Next() {
+		var ev CaptureEvent
+		if err := rows.Scan(
+			&ev.Seq, &ev.BranchRef, &ev.BranchGeneration, &ev.BaseHead,
+			&ev.Operation, &ev.Path, &ev.OldPath, &ev.Fidelity,
+			&ev.CapturedTS, &ev.PublishedTS, &ev.State, &ev.CommitOID,
+			&ev.Error, &ev.Message); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf(
+				"state: scan bounded unpublished recovery event: %w", err)
+		}
+		chain = append(chain, RecoveryChainEvent{Event: ev})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf(
+			"state: iterate bounded unpublished recovery events: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf(
+			"state: close bounded unpublished recovery events: %w", err)
+	}
+	if len(chain) > eventLimit {
+		return nil, fmt.Errorf(
+			"%w: unpublished recovery suffix exceeds %d events",
+			overflowErr, eventLimit)
+	}
+	if len(chain) == 0 {
+		return nil, nil
+	}
+
+	bySeq := make(map[int64]int, len(chain))
+	for i := range chain {
+		bySeq[chain[i].Event.Seq] = i
+	}
+	lastSeq := chain[len(chain)-1].Event.Seq
+	opRows, err := q.QueryContext(ctx, `
+SELECT op.event_seq, op.ord, op.op, op.path, op.old_path,
+       op.before_oid, op.before_mode, op.after_oid, op.after_mode, op.fidelity
+FROM capture_ops op
+JOIN capture_events event ON event.seq = op.event_seq
+WHERE event.branch_ref = ?
+  AND event.branch_generation = ?
+  AND event.seq >= ?
+  AND event.seq <= ?
+  AND event.state IN (?, ?, ?)
+ORDER BY op.event_seq ASC, op.ord ASC
+LIMIT ?`,
+		branchRef, branchGeneration, firstSeq, lastSeq,
+		EventStatePending, EventStateBlockedConflict, EventStateFailed,
+		opLimit+1)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"state: load bounded unpublished recovery operations: %w", err)
+	}
+	opCount := 0
+	for opRows.Next() {
+		var op CaptureOp
+		if err := opRows.Scan(
+			&op.EventSeq, &op.Ord, &op.Op, &op.Path, &op.OldPath,
+			&op.BeforeOID, &op.BeforeMode, &op.AfterOID, &op.AfterMode,
+			&op.Fidelity); err != nil {
+			_ = opRows.Close()
+			return nil, fmt.Errorf(
+				"state: scan bounded unpublished recovery operation: %w", err)
+		}
+		opCount++
+		if opCount > opLimit {
+			_ = opRows.Close()
+			return nil, fmt.Errorf(
+				"%w: unpublished recovery suffix exceeds %d operations",
+				overflowErr, opLimit)
+		}
+		i, ok := bySeq[op.EventSeq]
+		if !ok {
+			_ = opRows.Close()
+			return nil, fmt.Errorf(
+				"%w: bounded recovery operation references unselected event %d",
+				overflowErr, op.EventSeq)
+		}
+		chain[i].Ops = append(chain[i].Ops, op)
+	}
+	if err := opRows.Err(); err != nil {
+		_ = opRows.Close()
+		return nil, fmt.Errorf(
+			"state: iterate bounded unpublished recovery operations: %w", err)
+	}
+	if err := opRows.Close(); err != nil {
+		return nil, fmt.Errorf(
+			"state: close bounded unpublished recovery operations: %w", err)
+	}
+	return chain, nil
+}
+
 func loadCaptureOpsWith(ctx context.Context, q recoveryQueryer, seq int64) ([]CaptureOp, error) {
 	rows, err := q.QueryContext(ctx, `
 SELECT event_seq, ord, op, path, old_path,
@@ -423,11 +631,37 @@ func TransitionRecoveryChain(ctx context.Context, d *DB, req RecoveryChainTransi
 	}
 
 	first := req.Expected[0].Event
-	actual, err := loadUnpublishedRecoveryChain(ctx, tx, first.BranchRef, first.BranchGeneration, first.Seq)
+	var actual []RecoveryChainEvent
+	if req.AdoptedBranchHead != "" {
+		expectedEventCount := len(req.Expected) + len(req.ExpectedLater)
+		expectedOpCount := 0
+		for _, item := range req.Expected {
+			expectedOpCount += len(item.Ops)
+		}
+		for _, item := range req.ExpectedLater {
+			expectedOpCount += len(item.Ops)
+		}
+		actual, err = loadUnpublishedRecoveryChainExact(
+			ctx, tx, first.BranchRef, first.BranchGeneration, first.Seq,
+			expectedEventCount, expectedOpCount)
+	} else {
+		actual, err = loadUnpublishedRecoveryChain(
+			ctx, tx, first.BranchRef, first.BranchGeneration, first.Seq)
+	}
 	if err != nil {
 		return zero, err
 	}
-	if !sameRecoveryChain(actual, req.Expected) {
+	matches := sameRecoveryChain(actual, req.Expected)
+	if req.AdoptedBranchHead != "" {
+		expectedAll := make([]RecoveryChainEvent, 0,
+			len(req.Expected)+len(req.ExpectedLater))
+		expectedAll = append(expectedAll, req.Expected...)
+		expectedAll = append(expectedAll, req.ExpectedLater...)
+		matches = sameRecoveryChain(actual, expectedAll)
+	} else if req.AllowLaterUnpublished {
+		matches = sameRecoveryChainPrefix(actual, req.Expected)
+	}
+	if !matches {
 		return zero, ErrRecoveryChainChanged
 	}
 
@@ -563,6 +797,42 @@ WHERE branch_ref = ? AND branch_generation = ?`,
 			return zero, fmt.Errorf("state: invalidate recovery shadow marker: %w", err)
 		}
 	}
+	if req.AdoptedBranchHead != "" {
+		marker := fmt.Sprintf("shadow.bootstrapped:%s:%d",
+			first.BranchRef, first.BranchGeneration)
+		if err := replaceShadowGenerationTx(
+			ctx, tx, first.BranchRef, first.BranchGeneration,
+			marker, req.ShadowRows); err != nil {
+			return zero, fmt.Errorf(
+				"state: adopt recovery shadow: %w", err)
+		}
+		const upsertMeta = `
+INSERT INTO daemon_meta(key, value, updated_ts) VALUES (?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                               updated_ts = excluded.updated_ts`
+		branchToken := "rev:" + req.AdoptedBranchHead + " " + first.BranchRef
+		meta := map[string]string{
+			selfPublicationMetaBranchGeneration: strconv.FormatInt(
+				first.BranchGeneration, 10),
+			selfPublicationMetaBranchHead:  req.AdoptedBranchHead,
+			selfPublicationMetaBranchToken: branchToken,
+			"branch_token_changed_at": strconv.FormatFloat(
+				req.TransitionTS, 'f', -1, 64),
+			"branch.transition.needs_attention": "",
+		}
+		for key, value := range meta {
+			if _, err := tx.ExecContext(
+				ctx, upsertMeta, key, value, req.TransitionTS); err != nil {
+				return zero, fmt.Errorf(
+					"state: adopt recovery branch meta %s: %w", key, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM daemon_meta WHERE key = 'manual_pause.resumed_at'`); err != nil {
+			return zero, fmt.Errorf(
+				"state: clear manual resume after recovery adoption: %w", err)
+		}
+	}
 
 	clearedBreadcrumb, err := clearMatchingRecoveryBreadcrumb(ctx, tx, members,
 		first.BranchRef, first.BranchGeneration, req.TargetState,
@@ -687,13 +957,47 @@ func validateRecoveryTransition(req RecoveryChainTransition) error {
 	if req.InvalidateShadow && req.TargetState != EventStateRecovered {
 		return fmt.Errorf("state: TransitionRecoveryChain: shadow invalidation requires recovered outcome")
 	}
+	if req.AllowLaterUnpublished && req.TargetState != EventStatePublished {
+		return fmt.Errorf(
+			"state: TransitionRecoveryChain: later unpublished rows require published outcome")
+	}
+	if req.AllowLaterUnpublished && req.InvalidateShadow {
+		return fmt.Errorf(
+			"state: TransitionRecoveryChain: later unpublished rows forbid shadow invalidation")
+	}
+	if len(req.ExpectedLater) > 0 && req.AdoptedBranchHead == "" {
+		return fmt.Errorf(
+			"state: TransitionRecoveryChain: sealed later rows require branch adoption")
+	}
+	if req.AdoptedBranchHead != "" {
+		if req.TargetState != EventStatePublished || req.InvalidateShadow {
+			return fmt.Errorf(
+				"state: TransitionRecoveryChain: branch adoption requires published outcome")
+		}
+		if req.AllowLaterUnpublished != (len(req.ExpectedLater) > 0) {
+			return fmt.Errorf(
+				"state: TransitionRecoveryChain: later-row adoption identity is inconsistent")
+		}
+	}
 
-	first := req.Expected[0].Event
+	expectedAll := make([]RecoveryChainEvent, 0,
+		len(req.Expected)+len(req.ExpectedLater))
+	expectedAll = append(expectedAll, req.Expected...)
+	expectedAll = append(expectedAll, req.ExpectedLater...)
+	if req.AdoptedBranchHead != "" &&
+		len(expectedAll) > CompletedBranchTransitionProofLimit {
+		return fmt.Errorf(
+			"%w: branch adoption exceeds %d events",
+			ErrCompletedBranchTransitionProof,
+			CompletedBranchTransitionProofLimit)
+	}
+	first := expectedAll[0].Event
 	if first.BranchRef == "" || first.BranchGeneration < 1 || first.Seq < 1 {
 		return fmt.Errorf("state: TransitionRecoveryChain: invalid first event provenance")
 	}
 	prevSeq := int64(0)
-	for i, expected := range req.Expected {
+	opCount := 0
+	for i, expected := range expectedAll {
 		ev := expected.Event
 		if ev.Seq <= prevSeq {
 			return fmt.Errorf("state: TransitionRecoveryChain: event seqs not strictly increasing at index %d", i)
@@ -714,7 +1018,30 @@ func validateRecoveryTransition(req RecoveryChainTransition) error {
 				return fmt.Errorf("state: TransitionRecoveryChain: invalid op provenance seq=%d ord=%d", ev.Seq, ord)
 			}
 		}
+		opCount += len(expected.Ops)
+		if req.AdoptedBranchHead != "" &&
+			opCount > CompletedBranchTransitionProofLimit {
+			return fmt.Errorf(
+				"%w: branch adoption exceeds %d operations",
+				ErrCompletedBranchTransitionProof,
+				CompletedBranchTransitionProofLimit)
+		}
 		prevSeq = ev.Seq
+	}
+	if req.AdoptedBranchHead != "" {
+		marker := fmt.Sprintf("shadow.bootstrapped:%s:%d",
+			first.BranchRef, first.BranchGeneration)
+		if err := validateShadowReplacement(
+			first.BranchRef, first.BranchGeneration,
+			marker, req.ShadowRows); err != nil {
+			return err
+		}
+		for i, row := range req.ShadowRows {
+			if row.BaseHead != req.AdoptedBranchHead {
+				return fmt.Errorf(
+					"state: TransitionRecoveryChain: shadow row %d has stale base", i)
+			}
+		}
 	}
 	return nil
 }
@@ -734,6 +1061,11 @@ func sameRecoveryChain(actual, expected []RecoveryChainEvent) bool {
 		}
 	}
 	return true
+}
+
+func sameRecoveryChainPrefix(actual, expected []RecoveryChainEvent) bool {
+	return len(actual) >= len(expected) &&
+		sameRecoveryChain(actual[:len(expected)], expected)
 }
 
 func clearMatchingRecoveryBreadcrumb(

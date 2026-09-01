@@ -131,6 +131,11 @@ func TestReplay_IntentHealthSingletonOutageUsesCircuitFallback(t *testing.T) {
 	}
 	if snap := health.Snapshot(); snap.State != IntentPlannerCircuitOpen || snap.LastFailureClass != IntentPlannerFailureTransport {
 		t.Fatalf("health=%+v want transport-open", snap)
+	} else if !sum.PlannerCircuitOpen ||
+		sum.PlannerProviderFingerprint != snap.ProviderFingerprint ||
+		sum.PlannerCircuitFailureCount != snap.ConsecutiveFailures ||
+		sum.PlannerCircuitLastFailureTS != snap.LastFailureTS {
+		t.Fatalf("summary health=%+v want post-replay snapshot=%+v", sum, snap)
 	}
 }
 

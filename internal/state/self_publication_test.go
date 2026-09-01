@@ -105,6 +105,37 @@ SELECT kind,phase,status,plan_digest FROM operations WHERE id=?`,
 	}
 }
 
+func TestSelfPublicationByIDBoundedCapsMembershipEvidence(t *testing.T) {
+	ctx := context.Background()
+	d, _ := openTestDB(t)
+	first := appendSelfPublicationEvent(
+		t, d, "refs/heads/main", 1, "first.txt")
+	second := appendSelfPublicationEvent(
+		t, d, "refs/heads/main", 1, "second.txt")
+	publication := SelfPublication{
+		ID: "bounded-publication", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, SourceHead: "source",
+		TargetCommitOID: "target", TargetTreeOID: "tree",
+		Members: []SelfPublicationMember{
+			{EventSeq: first}, {EventSeq: second},
+		},
+	}
+	if created, err := PrepareSelfPublication(
+		ctx, d, publication); err != nil || !created {
+		t.Fatalf("PrepareSelfPublication=(%t,%v)", created, err)
+	}
+	got, ok, rows, err := SelfPublicationByIDBounded(
+		ctx, d, publication.ID, 2)
+	if err != nil || !ok || rows != 2 || len(got.Members) != 2 {
+		t.Fatalf("bounded publication=%+v ok=%t rows=%d err=%v",
+			got, ok, rows, err)
+	}
+	if _, _, _, err := SelfPublicationByIDBounded(
+		ctx, d, publication.ID, 1); !errors.Is(err, ErrCompletedBranchTransitionProof) {
+		t.Fatalf("member overflow err=%v want completed-transition proof", err)
+	}
+}
+
 func TestSelfPublicationOperationTransitionsRequireExactCorrelation(t *testing.T) {
 	newPublication := func(t *testing.T, id string) (*DB, SelfPublication, int64, string) {
 		t.Helper()

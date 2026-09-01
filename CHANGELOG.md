@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Fixed
+
+- Intent replay now starts from the repaired tree after a history repair and
+  rejects any generated commit tree that changes paths outside its frozen
+  captures. A later candidate can no longer put replaced file states back into
+  the branch.
+- ACD can now settle a frozen publication target left by the older replay bug
+  when the immediate external child is fully explained by one or more adjacent,
+  completed Intent repairs and the remaining frozen captures. It locks the
+  proof and live branch, then updates the capture ledger, shadow, and branch
+  token together. Newer captures stay pending, descendant commits are
+  preserved, and the live index and worktree are never changed.
+- Repeated plan preflight failures stop at `needs_action` after semantic
+  recovery and local recovery fail against the same evidence. Status now marks
+  an overdue `retrying` phase as stalled instead of reporting endless work.
+- Intent dependency graphs now keep every hard ordering edge and trim only
+  excess soft evidence. Drains stopped by the older shared edge limit resume
+  automatically; a real hard-edge overflow or cycle still needs attention.
+- Intent candidate retries now extend a deterministic successor chain instead
+  of exhausting 128 lifetime IDs. An older drain stopped at that limit resumes
+  only after ACD proves the complete terminal history and frozen target.
+- A frozen semantic-message outage no longer waits forever after a failed probe
+  at the longest provider backoff. If a newer deterministic Intent runtime is
+  already applied, ACD preserves the whole unpublished chain on a recovery ref
+  and recaptures the live work for that runtime. Remote replacements still
+  require an explicit retry or force recovery instead of being assumed healthy.
+
 ## v2026-08-30
 
 ### Changed

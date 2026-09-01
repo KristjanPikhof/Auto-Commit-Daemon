@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrRefNotFound is returned by RevParse when the requested rev does not
@@ -280,7 +281,8 @@ func EnsureRecoveryRef(ctx context.Context, repoDir, ref, commitOID string) (Rec
 // process cannot move or delete it before fn returns and the transaction is
 // committed or aborted.
 func WithLockedRecoveryRef(ctx context.Context, repoDir, ref, expectedOID string, fn func() error) error {
-	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", true, fn)
+	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", "", true,
+		func(context.Context) error { return fn() })
 }
 
 // WithLockedRecoveryRefAndAbsentRef verifies and locks both a recovery ref
@@ -301,8 +303,51 @@ func WithLockedRecoveryRefAndAbsentRef(
 	if expectedAbsentRef == ref {
 		return fmt.Errorf("git: expected-absent ref must differ from recovery ref %q", ref)
 	}
+	zeroOID, err := zeroOIDForRepo(ctx, repoDir)
+	if err != nil {
+		return err
+	}
 	return withLockedExpectedRef(
-		ctx, repoDir, ref, expectedOID, expectedAbsentRef, true, fn)
+		ctx, repoDir, ref, expectedOID, expectedAbsentRef, zeroOID, true,
+		func(context.Context) error { return fn() })
+}
+
+// WithLockedRecoveryRefAndExpectedRef verifies and locks both a protected
+// recovery ref and one exact live ref in a single Git transaction. The
+// callback can then adopt the live ref in another store without a ref-movement
+// gap.
+func WithLockedRecoveryRefAndExpectedRef(
+	ctx context.Context,
+	repoDir string,
+	recoveryRef string,
+	recoveryOID string,
+	expectedRef string,
+	expectedOID string,
+	fn func(context.Context) error,
+) error {
+	if !isValidFullRef(expectedRef) {
+		return fmt.Errorf("git: expected ref %q must be a valid full ref name", expectedRef)
+	}
+	if expectedRef == recoveryRef {
+		return fmt.Errorf("git: expected ref must differ from recovery ref %q", recoveryRef)
+	}
+	callbackSucceeded := false
+	err := withLockedExpectedRef(
+		ctx, repoDir, recoveryRef, recoveryOID,
+		expectedRef, expectedOID, true, func(lockCtx context.Context) error {
+			if err := fn(lockCtx); err != nil {
+				return err
+			}
+			callbackSucceeded = true
+			return nil
+		})
+	if callbackSucceeded {
+		// This transaction only verifies refs. Once the callback commits its
+		// cross-store mutation, a later update-ref protocol or cleanup error
+		// cannot invalidate the proof held for the duration of that mutation.
+		return nil
+	}
+	return err
 }
 
 // WithLockedExpectedRef verifies and locks one literal full ref at an exact
@@ -316,7 +361,8 @@ func WithLockedExpectedRef(
 	expectedOID string,
 	fn func() error,
 ) error {
-	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", false, fn)
+	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", "", false,
+		func(context.Context) error { return fn() })
 }
 
 // WithLockedAbsentRef verifies and locks one literal full ref while it is
@@ -332,7 +378,8 @@ func WithLockedAbsentRef(
 	if err != nil {
 		return err
 	}
-	return withLockedExpectedRef(ctx, repoDir, ref, zeroOID, "", false, fn)
+	return withLockedExpectedRef(ctx, repoDir, ref, zeroOID, "", "", false,
+		func(context.Context) error { return fn() })
 }
 
 func withLockedExpectedRef(
@@ -340,9 +387,26 @@ func withLockedExpectedRef(
 	repoDir string,
 	ref string,
 	expectedOID string,
-	expectedAbsentRef string,
+	secondaryRef string,
+	secondaryExpectedOID string,
 	requireRecoveryNamespace bool,
-	fn func() error,
+	fn func(context.Context) error,
+) error {
+	return withLockedExpectedRefTimeout(
+		ctx, repoDir, ref, expectedOID, secondaryRef, secondaryExpectedOID,
+		requireRecoveryNamespace, DefaultWriteTimeout, fn)
+}
+
+func withLockedExpectedRefTimeout(
+	ctx context.Context,
+	repoDir string,
+	ref string,
+	expectedOID string,
+	secondaryRef string,
+	secondaryExpectedOID string,
+	requireRecoveryNamespace bool,
+	transactionTimeout time.Duration,
+	fn func(context.Context) error,
 ) error {
 	if repoDir == "" {
 		return fmt.Errorf("git: locked ref verification called with empty repoDir")
@@ -362,21 +426,32 @@ func withLockedExpectedRef(
 	if fn == nil {
 		return fmt.Errorf("git: locked ref verification called with nil callback")
 	}
+	if transactionTimeout <= 0 {
+		return fmt.Errorf("git: locked ref verification called with invalid timeout")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	zeroOID := ""
-	if expectedAbsentRef != "" {
-		var err error
-		zeroOID, err = zeroOIDForRepo(ctx, repoDir)
-		if err != nil {
-			return err
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if secondaryRef != "" {
+		if !isValidFullRef(secondaryRef) || secondaryRef == ref {
+			return fmt.Errorf("git: secondary locked ref %q is invalid", secondaryRef)
+		}
+		if secondaryExpectedOID == "" ||
+			strings.ContainsAny(secondaryExpectedOID, " \t\r\n\x00") {
+			return fmt.Errorf("git: secondary locked ref has invalid expected OID")
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, DefaultWriteTimeout)
-	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", "update-ref", "--no-deref", "--stdin")
+	// Do not bind the process to a context. Once Git prepares the transaction,
+	// this process owns the exact-ref locks proving the callback's cross-store
+	// mutation. Caller cancellation and the callback deadline must remain
+	// visible to the callback without killing Git underneath a commit that is
+	// still finishing. Preparation is bounded before the callback, and cleanup
+	// gets a fresh bound after the callback returns.
+	cmd := exec.Command("git", "update-ref", "--no-deref", "--stdin")
 	cmd.Dir = repoDir
 	cmd.Env = scrubEnv(nil)
 	stdin, err := cmd.StdinPipe()
@@ -430,31 +505,80 @@ func withLockedExpectedRef(
 		return fmt.Errorf("git: recovery ref transaction %s: %w", action, err)
 	}
 
+	prepareCtx, prepareCancel := context.WithTimeout(ctx, transactionTimeout)
+	defer prepareCancel()
+	prepareWatchdogDone := make(chan struct{})
+	stopPrepareWatchdog := context.AfterFunc(prepareCtx, func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		close(prepareWatchdogDone)
+	})
+	prepareWatchdogStopped := false
+	defer func() {
+		if prepareWatchdogStopped {
+			return
+		}
+		if !stopPrepareWatchdog() {
+			<-prepareWatchdogDone
+		}
+	}()
+	failPrepare := func(action string, err error) error {
+		protocolErr := fail(action, err)
+		if ctxErr := prepareCtx.Err(); ctxErr != nil {
+			return errors.Join(ctxErr, protocolErr)
+		}
+		return protocolErr
+	}
+
 	if err := write("start"); err != nil {
-		return fail("start", err)
+		return failPrepare("start", err)
 	}
 	if err := expectOK("start"); err != nil {
-		return fail("start", err)
+		return failPrepare("start", err)
 	}
 	if err := write("verify " + ref + " " + expectedOID); err != nil {
-		return fail("verify", err)
+		return failPrepare("verify", err)
 	}
-	if expectedAbsentRef != "" {
-		// Git's all-zero expected value means the ref must not exist. Preparing
-		// the transaction acquires both locks before the callback can mutate
-		// cross-store state.
-		if err := write("verify " + expectedAbsentRef + " " + zeroOID); err != nil {
-			return fail("verify absent", err)
+	if secondaryRef != "" {
+		if err := write("verify " + secondaryRef + " " + secondaryExpectedOID); err != nil {
+			return failPrepare("verify secondary", err)
 		}
 	}
 	if err := write("prepare"); err != nil {
-		return fail("prepare", err)
+		return failPrepare("prepare", err)
 	}
 	if err := expectOK("prepare"); err != nil {
-		return fail("prepare", err)
+		return failPrepare("prepare", err)
 	}
+	if !stopPrepareWatchdog() {
+		<-prepareWatchdogDone
+		prepareWatchdogStopped = true
+		if err := prepareCtx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("git: recovery ref transaction preparation watchdog fired")
+	}
+	prepareWatchdogStopped = true
+	prepareCancel()
 
-	if callbackErr := fn(); callbackErr != nil {
+	callbackCtx, callbackCancel := context.WithTimeout(ctx, transactionTimeout)
+	callbackErr := fn(callbackCtx)
+	callbackCancel()
+
+	cleanupWatchdogDone := make(chan struct{})
+	cleanupTimer := time.AfterFunc(transactionTimeout, func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		close(cleanupWatchdogDone)
+	})
+	defer func() {
+		if !cleanupTimer.Stop() {
+			<-cleanupWatchdogDone
+		}
+	}()
+	if callbackErr != nil {
 		abortErr := write("abort")
 		if abortErr == nil {
 			abortErr = expectOK("abort")
@@ -599,7 +723,9 @@ func LiveBranchSet(ctx context.Context, repoDir string) (map[string]struct{}, er
 // Returns (true, nil) when ancestor, (false, nil) when not. A real git
 // failure (e.g. unresolved oid) returns a non-nil error.
 func IsAncestor(ctx context.Context, repoDir, ancestor, descendant string) (bool, error) {
-	_, _, err := RunWithStderr(ctx, RunOpts{Dir: repoDir}, "merge-base", "--is-ancestor", ancestor, descendant)
+	_, _, err := RunWithStderr(ctx,
+		RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
+		"merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
 		return true, nil
 	}

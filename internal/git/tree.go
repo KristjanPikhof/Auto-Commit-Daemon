@@ -19,6 +19,34 @@ type TreeEntry struct {
 // LsTree runs `git ls-tree -z [-r] <rev> [-- <paths...>]` and parses the
 // NUL-delimited output. Recursive=true expands tree entries.
 func LsTree(ctx context.Context, repoDir, rev string, recursive bool, paths ...string) ([]TreeEntry, error) {
+	args := lsTreeArgs(rev, recursive, paths)
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, args...)
+	if err != nil {
+		return nil, err
+	}
+	return parseLsTree(out)
+}
+
+// LsTreeLimited is LsTree with a fixed stdout cap. Use it when the caller
+// accepts repository-derived path lists and must keep read work bounded.
+func LsTreeLimited(
+	ctx context.Context,
+	repoDir string,
+	rev string,
+	recursive bool,
+	maxBytes int64,
+	paths ...string,
+) ([]TreeEntry, error) {
+	args := lsTreeArgs(rev, recursive, paths)
+	out, err := RunWithLimit(ctx,
+		RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, maxBytes, args...)
+	if err != nil {
+		return nil, err
+	}
+	return parseLsTree(out)
+}
+
+func lsTreeArgs(rev string, recursive bool, paths []string) []string {
 	args := []string{"ls-tree", "-z"}
 	if recursive {
 		args = append(args, "-r")
@@ -28,11 +56,7 @@ func LsTree(ctx context.Context, repoDir, rev string, recursive bool, paths ...s
 		args = append(args, "--")
 		args = append(args, paths...)
 	}
-	out, err := Run(ctx, RunOpts{Dir: repoDir}, args...)
-	if err != nil {
-		return nil, err
-	}
-	return parseLsTree(out)
+	return args
 }
 
 // LsTreeBlobOID returns the blob OID for path at ref, or an empty string

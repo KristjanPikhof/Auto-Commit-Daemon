@@ -81,18 +81,19 @@ type IntentPlannerHealthOptions struct {
 // IntentPlannerHealthSnapshot is safe to expose through status/diagnose. It
 // contains a hashed provider identity and a bounded, redacted error only.
 type IntentPlannerHealthSnapshot struct {
-	State               IntentPlannerCircuitState `json:"state"`
-	ProviderFingerprint string                    `json:"provider_fingerprint"`
-	ConsecutiveFailures int                       `json:"consecutive_failures"`
-	BackoffLevel        int                       `json:"backoff_level"`
-	NextProbeTS         float64                   `json:"next_probe_ts,omitempty"`
-	OpenedTS            float64                   `json:"opened_ts,omitempty"`
-	LastFailureTS       float64                   `json:"last_failure_ts,omitempty"`
-	LastFailureClass    IntentPlannerFailureKind  `json:"last_failure_class,omitempty"`
-	LastError           string                    `json:"last_error,omitempty"`
-	BypassCount         uint64                    `json:"bypass_count"`
-	UpdatedTS           float64                   `json:"updated_ts,omitempty"`
-	RecoveryReady       bool                      `json:"recovery_ready,omitempty"`
+	State                   IntentPlannerCircuitState `json:"state"`
+	ProviderFingerprint     string                    `json:"provider_fingerprint"`
+	ConsecutiveFailures     int                       `json:"consecutive_failures"`
+	BackoffLevel            int                       `json:"backoff_level"`
+	MaxBackoffProbeFailures int                       `json:"max_backoff_probe_failures,omitempty"`
+	NextProbeTS             float64                   `json:"next_probe_ts,omitempty"`
+	OpenedTS                float64                   `json:"opened_ts,omitempty"`
+	LastFailureTS           float64                   `json:"last_failure_ts,omitempty"`
+	LastFailureClass        IntentPlannerFailureKind  `json:"last_failure_class,omitempty"`
+	LastError               string                    `json:"last_error,omitempty"`
+	BypassCount             uint64                    `json:"bypass_count"`
+	UpdatedTS               float64                   `json:"updated_ts,omitempty"`
+	RecoveryReady           bool                      `json:"recovery_ready,omitempty"`
 }
 
 type intentPlannerHealthRecord struct {
@@ -115,6 +116,7 @@ func DecodeIntentPlannerHealthSnapshot(raw string) (IntentPlannerHealthSnapshot,
 	if !validIntentPlannerHealthState(snapshot.State) ||
 		!validIntentPlannerHealthFingerprint(snapshot.ProviderFingerprint) ||
 		snapshot.ConsecutiveFailures < 0 ||
+		snapshot.MaxBackoffProbeFailures < 0 ||
 		snapshot.BackoffLevel < 0 || snapshot.BackoffLevel >= len(intentPlannerCircuitBackoffs) ||
 		!validIntentPlannerHealthFailureClass(snapshot.LastFailureClass) ||
 		!validIntentPlannerHealthTimestamp(snapshot.NextProbeTS) ||
@@ -283,16 +285,17 @@ type IntentPlannerHealth struct {
 	deterministic bool
 	fingerprint   string
 
-	state               IntentPlannerCircuitState
-	consecutiveFailures int
-	backoffLevel        int
-	retryAt             time.Time
-	openedAt            time.Time
-	lastFailureAt       time.Time
-	lastFailureClass    IntentPlannerFailureKind
-	lastError           string
-	bypassCount         uint64
-	updatedAt           time.Time
+	state                   IntentPlannerCircuitState
+	consecutiveFailures     int
+	backoffLevel            int
+	maxBackoffProbeFailures int
+	retryAt                 time.Time
+	openedAt                time.Time
+	lastFailureAt           time.Time
+	lastFailureClass        IntentPlannerFailureKind
+	lastError               string
+	bypassCount             uint64
+	updatedAt               time.Time
 
 	epoch     uint64
 	nextLease uint64
@@ -507,6 +510,9 @@ func (h *IntentPlannerHealth) failLocked(now time.Time, kind IntentPlannerFailur
 	h.updatedAt = now
 
 	if halfOpen {
+		if h.backoffLevel == len(intentPlannerCircuitBackoffs)-1 {
+			h.maxBackoffProbeFailures++
+		}
 		if h.backoffLevel < len(intentPlannerCircuitBackoffs)-1 {
 			h.backoffLevel++
 		}
@@ -534,6 +540,7 @@ func (h *IntentPlannerHealth) closeLocked(now time.Time) {
 	h.state = IntentPlannerCircuitClosed
 	h.consecutiveFailures = 0
 	h.backoffLevel = 0
+	h.maxBackoffProbeFailures = 0
 	h.retryAt = time.Time{}
 	h.openedAt = time.Time{}
 	h.lastFailureAt = time.Time{}
@@ -552,6 +559,7 @@ func (h *IntentPlannerHealth) loadRecord(record intentPlannerHealthRecord, now t
 	h.state = record.State
 	h.consecutiveFailures = record.ConsecutiveFailures
 	h.backoffLevel = record.BackoffLevel
+	h.maxBackoffProbeFailures = record.MaxBackoffProbeFailures
 	h.retryAt = intentPlannerHealthTime(record.NextProbeTS)
 	h.openedAt = intentPlannerHealthTime(record.OpenedTS)
 	h.lastFailureAt = intentPlannerHealthTime(record.LastFailureTS)
@@ -573,6 +581,10 @@ func (h *IntentPlannerHealth) loadRecord(record intentPlannerHealthRecord, now t
 		h.consecutiveFailures = 0
 		normalized = true
 	}
+	if h.maxBackoffProbeFailures < 0 {
+		h.maxBackoffProbeFailures = 0
+		normalized = true
+	}
 	switch h.state {
 	case IntentPlannerCircuitClosed:
 		if h.consecutiveFailures > 2 {
@@ -583,6 +595,10 @@ func (h *IntentPlannerHealth) loadRecord(record intentPlannerHealthRecord, now t
 			h.retryAt = time.Time{}
 			h.openedAt = time.Time{}
 			h.backoffLevel = 0
+			normalized = true
+		}
+		if h.maxBackoffProbeFailures != 0 {
+			h.maxBackoffProbeFailures = 0
 			normalized = true
 		}
 	case IntentPlannerCircuitHalfOpen:
@@ -600,6 +616,7 @@ func (h *IntentPlannerHealth) loadRecord(record intentPlannerHealthRecord, now t
 		h.state = IntentPlannerCircuitClosed
 		h.consecutiveFailures = 0
 		h.backoffLevel = 0
+		h.maxBackoffProbeFailures = 0
 		h.retryAt = time.Time{}
 		h.openedAt = time.Time{}
 		h.lastFailureAt = time.Time{}
@@ -620,17 +637,18 @@ func (h *IntentPlannerHealth) snapshotLocked() IntentPlannerHealthSnapshot {
 		now = h.now()
 	}
 	return IntentPlannerHealthSnapshot{
-		State:               h.state,
-		ProviderFingerprint: h.fingerprint,
-		ConsecutiveFailures: h.consecutiveFailures,
-		BackoffLevel:        h.backoffLevel,
-		NextProbeTS:         intentPlannerHealthTimestamp(h.retryAt),
-		OpenedTS:            intentPlannerHealthTimestamp(h.openedAt),
-		LastFailureTS:       intentPlannerHealthTimestamp(h.lastFailureAt),
-		LastFailureClass:    h.lastFailureClass,
-		LastError:           h.lastError,
-		BypassCount:         h.bypassCount,
-		UpdatedTS:           intentPlannerHealthTimestamp(h.updatedAt),
+		State:                   h.state,
+		ProviderFingerprint:     h.fingerprint,
+		ConsecutiveFailures:     h.consecutiveFailures,
+		BackoffLevel:            h.backoffLevel,
+		MaxBackoffProbeFailures: h.maxBackoffProbeFailures,
+		NextProbeTS:             intentPlannerHealthTimestamp(h.retryAt),
+		OpenedTS:                intentPlannerHealthTimestamp(h.openedAt),
+		LastFailureTS:           intentPlannerHealthTimestamp(h.lastFailureAt),
+		LastFailureClass:        h.lastFailureClass,
+		LastError:               h.lastError,
+		BypassCount:             h.bypassCount,
+		UpdatedTS:               intentPlannerHealthTimestamp(h.updatedAt),
 		RecoveryReady: h.state == IntentPlannerCircuitOpen &&
 			!h.retryAt.IsZero() && !now.Before(h.retryAt),
 	}

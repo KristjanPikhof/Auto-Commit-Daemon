@@ -469,6 +469,276 @@ WHERE candidate_id=?`, candidate.ID); err != nil {
 	}
 }
 
+func TestPublicationDrainAutomaticallyRecoversExhaustedCandidateSuccessors(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db, events, drain := openPublicationDrainTestState(t, 1, 1)
+	candidate, _ := seedExhaustedLegacyIntentCandidates(
+		t, db, drain.BranchRef, drain.BranchGeneration, "exhausted-base",
+		events[0].Seq)
+	semantic := PublicationDrainUpdateFrom(drain, 11, 10)
+	semantic.Phase = state.PublicationDrainSemantic
+	loaded, err := state.AdvancePublicationDrain(ctx, db, drain.ID, semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := PublicationDrainUpdateFrom(loaded, 12, 10)
+	blocked.Phase = state.PublicationDrainNeedsAction
+	blocked.LastError = exhaustedCandidateSuccessorDrainErrorPrefix +
+		candidate.ID + exhaustedCandidateSuccessorDrainErrorSuffix
+	if _, err := state.AdvancePublicationDrain(ctx, db, drain.ID, blocked); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := RecoverSupersededCandidatePublicationDrain(
+		ctx, db, drain.BranchRef, drain.BranchGeneration,
+		time.Unix(13, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Phase != state.PublicationDrainCheckpointing ||
+		recovered.LastError != "" {
+		t.Fatalf("recovered drain=%+v", recovered)
+	}
+}
+
+func TestPublicationDrainRejectsIncompleteSuccessorExhaustionProof(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db, events, drain := openPublicationDrainTestState(t, 1, 1)
+	candidate := state.IntentCandidate{
+		ID: "incomplete-base", BranchRef: drain.BranchRef,
+		BranchGeneration: drain.BranchGeneration,
+		Status:           state.IntentCandidateWaiting,
+		Readiness:        state.IntentReadinessWait,
+		Events: []state.IntentCandidateEvent{{
+			EventSeq: events[0].Seq, EventRole: "change",
+		}},
+	}
+	if err := state.SaveIntentCandidate(ctx, db, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE candidate_id=?`, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE intent_candidates SET status='superseded' WHERE id=?`,
+		candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	semantic := PublicationDrainUpdateFrom(drain, 11, 10)
+	semantic.Phase = state.PublicationDrainSemantic
+	loaded, err := state.AdvancePublicationDrain(ctx, db, drain.ID, semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := PublicationDrainUpdateFrom(loaded, 12, 10)
+	blocked.Phase = state.PublicationDrainNeedsAction
+	blocked.LastError = exhaustedCandidateSuccessorDrainErrorPrefix +
+		candidate.ID + exhaustedCandidateSuccessorDrainErrorSuffix
+	if _, err := state.AdvancePublicationDrain(ctx, db, drain.ID, blocked); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := RecoverSupersededCandidatePublicationDrain(
+		ctx, db, drain.BranchRef, drain.BranchGeneration,
+		time.Unix(13, 0).UTC())
+	if err != nil || recovered != nil {
+		t.Fatalf("recovered=%+v err=%v", recovered, err)
+	}
+}
+
+func TestPublicationDrainAutomaticallyRecoversLegacySoftDependencyCap(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	const targetCount = 199
+	const publishedCount = 20
+	db, events, drain := openPublicationDrainTestState(
+		t, targetCount, targetCount)
+	for i := 0; i < publishedCount; i++ {
+		if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events
+SET state='published',published_ts=11,commit_oid=?
+WHERE seq=?`, fmt.Sprintf("commit-%03d", i), events[i].Seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	semantic := PublicationDrainUpdateFrom(drain, 11, 11)
+	semantic.Phase = state.PublicationDrainSemantic
+	semantic.PublishedEventCount = publishedCount
+	loaded, err := state.AdvancePublicationDrain(ctx, db, drain.ID, semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a durable timestamp written before the wall clock moved
+	// backwards. Recovery must remain monotonic instead of waiting for the
+	// clock to catch up.
+	blocked := PublicationDrainUpdateFrom(loaded, 100, 11)
+	blocked.Phase = state.PublicationDrainNeedsAction
+	blocked.LastError = fmt.Sprintf(
+		"daemon: intent dependency graph: edge cap %d exceeded",
+		state.IntentDependencyMaxPerPair)
+	if _, err := state.AdvancePublicationDrain(
+		ctx, db, drain.ID, blocked); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := RecoverSoftDependencyCapPublicationDrain(
+		ctx, db, drain.BranchRef, drain.BranchGeneration,
+		time.Unix(13, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Phase != state.PublicationDrainCheckpointing ||
+		recovered.LastError != "" ||
+		recovered.UpdatedTS != 100 ||
+		recovered.PublishedEventCount != publishedCount ||
+		recovered.TargetEventCount != targetCount {
+		t.Fatalf("recovered drain=%+v", recovered)
+	}
+}
+
+func TestResumePublicationDrainCheckpointingClampsClockRollback(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	initPublicationDrainTestRepo(t, ctx, repo)
+	head := commitSingleFile(t, ctx, repo, "", "owned.txt", "base\n", "base")
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"update-ref", "refs/heads/main", head); err != nil {
+		t.Fatal(err)
+	}
+
+	db, events, drain := openPublicationDrainTestState(t, 1, 1)
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE checkpoints SET observed_head=? WHERE id=?`,
+		head, drain.CheckpointID); err != nil {
+		t.Fatal(err)
+	}
+	semantic := PublicationDrainUpdateFrom(drain, 100, drain.LastProgressTS)
+	semantic.Phase = state.PublicationDrainSemantic
+	loaded, err := state.AdvancePublicationDrain(ctx, db, drain.ID, semantic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := PublicationDrainUpdateFrom(loaded, 101, loaded.LastProgressTS)
+	blocked.Phase = state.PublicationDrainNeedsAction
+	blocked.LastError = publicationDrainRecoveredTargetError
+	blockedDrain, err := state.AdvancePublicationDrain(ctx, db, drain.ID, blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE capture_events SET state='recovered',commit_oid='archive-proof' WHERE seq=?`,
+		events[0].Seq); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed, err := ResumePublicationDrainCheckpointing(
+		ctx, repo, db, blockedDrain, time.Unix(50, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Phase != state.PublicationDrainSemantic ||
+		resumed.UpdatedTS != blockedDrain.UpdatedTS || resumed.LastError != "" {
+		t.Fatalf("resumed drain=%+v", resumed)
+	}
+}
+
+func TestResumePublicationDrainRetriesUnavailableSemanticMessage(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	initPublicationDrainTestRepo(t, ctx, repo)
+	head := commitSingleFile(t, ctx, repo, "", "owned.txt", "base\n", "base")
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"update-ref", "refs/heads/main", head); err != nil {
+		t.Fatal(err)
+	}
+	db, _, drain := openPublicationDrainTestState(t, 1, 1)
+	if _, err := db.SQL().ExecContext(ctx,
+		`UPDATE checkpoints SET observed_head=? WHERE id=?`,
+		head, drain.CheckpointID); err != nil {
+		t.Fatal(err)
+	}
+	blocked := PublicationDrainUpdateFrom(drain, 11, drain.LastProgressTS)
+	blocked.Phase = state.PublicationDrainNeedsAction
+	blocked.FallbackMode = publicationFallbackLocalUnlock
+	blocked.LastError = PublicationDrainSemanticMessageUnavailableReason
+	blockedDrain, err := state.AdvancePublicationDrain(
+		ctx, db, drain.ID, blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartable, err := RestartablePublicationDrainForPair(
+		ctx, db, drain.BranchRef, drain.BranchGeneration)
+	if err != nil || restartable == nil || restartable.ID != drain.ID {
+		t.Fatalf("restartable=(%+v,%v)", restartable, err)
+	}
+	resumed, err := ResumePublicationDrainCheckpointing(
+		ctx, repo, db, blockedDrain, time.Unix(12, 0).UTC())
+	if err != nil || resumed.Phase != state.PublicationDrainSemantic ||
+		resumed.LastError != "" {
+		t.Fatalf("resumed=(%+v,%v)", resumed, err)
+	}
+}
+
+func initPublicationDrainTestRepo(t *testing.T, ctx context.Context, repo string) {
+	t.Helper()
+	if err := gitpkg.Init(ctx, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+		"symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		t.Fatal(err)
+	}
+	for _, setting := range [][2]string{
+		{"user.name", "ACD Test"},
+		{"user.email", "acd@test.invalid"},
+	} {
+		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+			"config", setting[0], setting[1]); err != nil {
+			t.Fatalf("git config %s: %v", setting[0], err)
+		}
+	}
+}
+
+func TestPublicationDrainKeepsHardDependencyFailuresBlocked(t *testing.T) {
+	for _, reason := range []string{
+		"daemon: intent dependency graph: hard edge cap 4096 exceeded",
+		"daemon: intent dependency graph: hard dependency cycle",
+	} {
+		reason := reason
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			db, _, drain := openPublicationDrainTestState(t, 1, 1)
+			semantic := PublicationDrainUpdateFrom(drain, 11, 10)
+			semantic.Phase = state.PublicationDrainSemantic
+			loaded, err := state.AdvancePublicationDrain(
+				ctx, db, drain.ID, semantic)
+			if err != nil {
+				t.Fatal(err)
+			}
+			blocked := PublicationDrainUpdateFrom(loaded, 12, 10)
+			blocked.Phase = state.PublicationDrainNeedsAction
+			blocked.LastError = reason
+			if _, err := state.AdvancePublicationDrain(
+				ctx, db, drain.ID, blocked); err != nil {
+				t.Fatal(err)
+			}
+			recovered, err := RecoverSoftDependencyCapPublicationDrain(
+				ctx, db, drain.BranchRef, drain.BranchGeneration,
+				time.Unix(13, 0).UTC())
+			if err != nil || recovered != nil {
+				t.Fatalf("recovered=%+v err=%v", recovered, err)
+			}
+		})
+	}
+}
+
 func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -586,7 +856,9 @@ func TestPublicationDrainLocalUnlockWaitsForSemanticMessage(t *testing.T) {
 	}
 	if sum.Published != 0 || !sum.Skipped ||
 		sum.SkippedReason != "intent_v2_waiting_message_rewrite" ||
-		sum.Disposition != ReplayDispositionTransientWait || !sum.HasMore {
+		sum.Disposition != ReplayDispositionTransientWait || !sum.HasMore ||
+		!strings.Contains(sum.PlannerFailure, "semantic provider unavailable") ||
+		sum.DispositionReason != sum.PlannerFailure {
 		t.Fatalf("summary=%+v, want retryable semantic-message wait", sum)
 	}
 	if planner.calls != 0 || planner.rewriteCalls == 0 {
@@ -950,6 +1222,166 @@ func TestPublicationDrainProviderWaitPreservesSemanticPhase(t *testing.T) {
 	}
 }
 
+func TestPublicationDrainSemanticMessageWaitStopsAfterCompletedMaxProbe(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 1, 1)
+	const fingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE publication_drains
+SET commit_strategy='intent',commit_format='imperative',config_revision_id=3,
+    provider='openai-compat',provider_model='model',provider_fingerprint=?,
+    phase='event_fallback',fallback_mode='local_unlock'
+WHERE id=?`, fingerprint, drain.ID); err != nil {
+		t.Fatal(err)
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := ReplaySummary{
+		Skipped:                        true,
+		SkippedReason:                  "intent_v2_waiting_message_rewrite",
+		Disposition:                    ReplayDispositionTransientWait,
+		PlannerCircuitOpen:             true,
+		PlannerProviderFingerprint:     fingerprint,
+		PlannerCircuitBackoffLevel:     len(intentPlannerCircuitBackoffs) - 1,
+		PlannerCircuitFailureCount:     4,
+		PlannerMaxBackoffProbeFailures: 1,
+		PlannerCircuitLastFailureTS:    drain.UpdatedTS + 1,
+	}
+	blocked, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, summary, nil, time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Phase != state.PublicationDrainNeedsAction ||
+		blocked.LastError != PublicationDrainSemanticMessageUnavailableReason ||
+		blocked.LastProgressTS != drain.LastProgressTS ||
+		blocked.TargetEventCount != drain.TargetEventCount ||
+		blocked.ConfigRevisionID != drain.ConfigRevisionID {
+		t.Fatalf("blocked drain=%+v", blocked)
+	}
+}
+
+func TestPublicationDrainSemanticMessageWaitRequiresExactCircuitProof(
+	t *testing.T,
+) {
+	const fingerprint = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ReplaySummary, state.PublicationDrain)
+	}{
+		{name: "no completed max probe", mutate: func(sum *ReplaySummary, _ state.PublicationDrain) {
+			sum.PlannerMaxBackoffProbeFailures = 0
+		}},
+		{name: "failure predates progress", mutate: func(sum *ReplaySummary, drain state.PublicationDrain) {
+			sum.PlannerCircuitLastFailureTS = drain.LastProgressTS
+		}},
+		{name: "failure predates current wait", mutate: func(sum *ReplaySummary, drain state.PublicationDrain) {
+			sum.PlannerCircuitLastFailureTS = drain.UpdatedTS
+		}},
+		{name: "fingerprint mismatch", mutate: func(sum *ReplaySummary, _ state.PublicationDrain) {
+			sum.PlannerProviderFingerprint = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		}},
+		{name: "probe ready", mutate: func(sum *ReplaySummary, _ state.PublicationDrain) {
+			sum.PlannerCircuitOpen = false
+		}},
+		{name: "wrong wait", mutate: func(sum *ReplaySummary, _ state.PublicationDrain) {
+			sum.SkippedReason = "skipped_due_intent_batch_wait"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, _, drain := openPublicationDrainTestState(t, 1, 1)
+			if _, err := db.SQL().ExecContext(ctx, `
+UPDATE publication_drains
+SET commit_strategy='intent',commit_format='imperative',config_revision_id=3,
+    provider='openai-compat',provider_fingerprint=?,phase='event_fallback',
+    fallback_mode='local_unlock',updated_ts=last_progress_ts+1
+WHERE id=?`, fingerprint, drain.ID); err != nil {
+				t.Fatal(err)
+			}
+			drain, err := state.PublicationDrainByID(ctx, db, drain.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			summary := ReplaySummary{
+				Skipped:                        true,
+				SkippedReason:                  "intent_v2_waiting_message_rewrite",
+				Disposition:                    ReplayDispositionTransientWait,
+				PlannerCircuitOpen:             true,
+				PlannerProviderFingerprint:     fingerprint,
+				PlannerCircuitBackoffLevel:     len(intentPlannerCircuitBackoffs) - 1,
+				PlannerMaxBackoffProbeFailures: 1,
+				PlannerCircuitLastFailureTS:    drain.UpdatedTS + 1,
+			}
+			tc.mutate(&summary, drain)
+			waiting, err := UpdatePublicationDrainAfterReplay(
+				ctx, db, drain, summary, nil, time.Unix(12, 0).UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if waiting.Phase != state.PublicationDrainEventFallback ||
+				waiting.LastProgressTS != drain.LastProgressTS {
+				t.Fatalf("waiting drain=%+v", waiting)
+			}
+		})
+	}
+}
+
+func TestPublicationDrainSemanticMessageWaitStopsAfterObservedLocalWait(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 1, 1)
+	const fingerprint = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	if _, err := db.SQL().ExecContext(ctx, `
+UPDATE publication_drains
+SET commit_strategy='intent',commit_format='imperative',config_revision_id=3,
+    provider='openai-compat',provider_fingerprint=?,phase='event_fallback',
+    fallback_mode='local_unlock',updated_ts=11,last_progress_ts=10,
+    last_error='intent planner circuit open until 2026-08-31T23:59:00Z'
+WHERE id=?`, fingerprint, drain.ID); err != nil {
+		t.Fatal(err)
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := ReplaySummary{
+		Skipped:                        true,
+		SkippedReason:                  "intent_v2_waiting_message_rewrite",
+		Disposition:                    ReplayDispositionTransientWait,
+		PlannerFailure:                 "intent planner circuit open until 2026-09-01T00:00:00Z",
+		DispositionReason:              "intent planner circuit open until 2026-09-01T00:00:00Z",
+		PlannerCircuitOpen:             true,
+		PlannerProviderFingerprint:     fingerprint,
+		PlannerCircuitBackoffLevel:     len(intentPlannerCircuitBackoffs) - 1,
+		PlannerMaxBackoffProbeFailures: 1,
+		PlannerCircuitLastFailureTS:    10.5,
+	}
+	waiting, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, summary, nil, time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting.Phase != state.PublicationDrainEventFallback ||
+		waiting.LastError != summary.DispositionReason {
+		t.Fatalf("first local wait=%+v", waiting)
+	}
+	blocked, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, waiting, summary, nil, time.Unix(13, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Phase != state.PublicationDrainNeedsAction ||
+		blocked.LastError != PublicationDrainSemanticMessageUnavailableReason {
+		t.Fatalf("observed local wait=%+v", blocked)
+	}
+}
+
 func TestPublicationDrainVerificationResourceWaitPreservesSemanticPhase(
 	t *testing.T,
 ) {
@@ -1207,6 +1639,36 @@ SELECT attempt_count FROM intent_plan_runs WHERE fingerprint=?`,
 	if err != nil || attemptCount != 0 {
 		t.Fatalf("replay recovery consumed provider attempt: attempts=%d err=%v",
 			attemptCount, err)
+	}
+}
+
+func TestPublicationDrainRepeatedLocalPreflightNeedsAction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 2, 2)
+	preflight := &IntentPlanPreflightError{
+		Failure: "modify before-state mismatch for feature.go",
+	}
+	update := PublicationDrainUpdateFrom(drain, 11, 10)
+	update.Phase = state.PublicationDrainEventFallback
+	update.EventFallbackCount = 1
+	update.FallbackMode = publicationFallbackLocalUnlock
+	update.LastError = preflight.Error()
+	drain, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocked, err := UpdatePublicationDrainAfterReplay(
+		ctx, db, drain, ReplaySummary{}, preflight,
+		time.Unix(12, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.Phase != state.PublicationDrainNeedsAction ||
+		blocked.EventFallbackCount != drain.EventFallbackCount ||
+		blocked.LastError != preflight.Error() {
+		t.Fatalf("blocked=%+v", blocked)
 	}
 }
 

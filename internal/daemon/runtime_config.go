@@ -1071,6 +1071,33 @@ func publicationDrainRevisionIdentityBlock(
 	}
 }
 
+func publicationRuntimeRevisionContract(
+	revision state.ConfigRevision,
+) (strategy, format, provider, fingerprint string, err error) {
+	values, _, _, err := decodeRuntimeSnapshot(revision.SnapshotJSON)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	cfg := ai.LoadProviderConfigFromEnv()
+	if err := applyRuntimeValues(&cfg, values); err != nil {
+		return "", "", "", "", err
+	}
+	provider = configuredIntentProviderName(cfg.Mode)
+	model := ""
+	if provider == "openai-compat" {
+		model = strings.TrimSpace(cfg.Model)
+	}
+	identity := IntentPlannerProviderIdentity{
+		Provider:         provider,
+		Model:            model,
+		Endpoint:         cfg.BaseURL,
+		TrustFingerprint: runtimeTrustFingerprint(cfg.CAFile),
+		Deterministic:    provider == (ai.DeterministicProvider{}).Name(),
+	}
+	return string(cfg.CommitStrategy), string(cfg.CommitFormat), provider,
+		IntentPlannerProviderFingerprint(identity), nil
+}
+
 // QueueExperimentRevert is called only between passes. State performs expiry
 // and baseline-derived revision/request creation atomically, making repeated
 // restart recovery calls idempotent.

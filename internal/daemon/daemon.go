@@ -305,6 +305,9 @@ type Options struct {
 	// branchGenerationToken is a test-only resolver seam for publication
 	// adoption and transition retry coverage.
 	branchGenerationToken func(context.Context, string) (string, error)
+	// afterExternalRepairBridgeAdoption is a test-only synchronization point
+	// after atomic bridge state is adopted and before the pass reaches capture.
+	afterExternalRepairBridgeAdoption func(CaptureContext)
 	// beforeStartupDeadBranchPairSafetyCheck is a test-only synchronization
 	// point immediately before a startup dead-branch pair's final safety gate.
 	// The sweep-owned context lets blocking tests release on daemon shutdown.
@@ -1078,6 +1081,7 @@ func Run(ctx context.Context, opts Options) error {
 	startupChangedAt := ""
 	startupShadowMutated := false
 	startupShadowRefreshRequired := false
+	startupAtomicAdopted := false
 	if persistedHead != "" && currentToken != "" {
 		prevToken := "rev:" + persistedHead
 		if persistedToken, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyBranchToken); err != nil {
@@ -1149,6 +1153,7 @@ func Run(ctx context.Context, opts Options) error {
 				branchTransitionBlocked = true
 			} else if result, rErr := reconcileTransitionPair(ctx, opts.RepoPath, opts.GitDir,
 				opts.DB, tokenBranchRef(prevToken), persistedGen,
+				tokenSHA(prevToken),
 				tokenSHA(currentToken) == "", "", "startup_branch_transition", tracer); rErr != nil {
 				if attentionErr := recordCompletedTransitionProofAttention(
 					ctx, opts.DB, rErr); attentionErr != nil {
@@ -1167,8 +1172,29 @@ func Run(ctx context.Context, opts Options) error {
 					"outcome", result.Outcome,
 					"events", result.EventCount,
 					"recovery_ref", result.RecoveryRef)
+				if result.AcceptedHead != "" {
+					acceptedToken := branchTokenRev(
+						result.AcceptedHead, tokenBranchRef(prevToken))
+					persistedHead = result.AcceptedHead
+					currentToken = acceptedToken
+					branchRef = tokenBranchRef(acceptedToken)
+					headOID = result.AcceptedHead
+					prevToken = acceptedToken
+					transition = TokenTransitionUnchanged
+					startupTransition = TokenTransitionUnchanged
+					startupAtomicAdopted = true
+					if opts.afterExternalRepairBridgeAdoption != nil {
+						opts.afterExternalRepairBridgeAdoption(CaptureContext{
+							BranchRef:        branchRef,
+							BranchGeneration: persistedGen,
+							BaseHead:         result.AcceptedHead,
+						})
+					}
+					logger.Info("adopted repaired publication bridge at startup",
+						"head", result.AcceptedHead)
+				}
 			}
-			if !branchTransitionBlocked {
+			if !branchTransitionBlocked && !startupAtomicAdopted {
 				verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 				if verifyErr != nil {
 					logger.Warn("verify startup branch token after reconciliation; will retry",
@@ -1214,17 +1240,21 @@ func Run(ctx context.Context, opts Options) error {
 	logContext.SetBranch(cctx.BranchRef, cctx.BranchGeneration)
 	// Seed shadow_paths from HEAD before the first capture so files
 	// already at HEAD don't generate spurious creates.
-	if !branchTransitionBlocked && cctx.BranchRef != "" && cctx.BaseHead != "" {
+	if !branchTransitionBlocked && !startupAtomicAdopted &&
+		cctx.BranchRef != "" && cctx.BaseHead != "" {
 		seedShadow := BootstrapShadow
 		seedReason := "startup shadow bootstrap"
 		if startupTokenChanged {
-			seedShadow = ReseedShadowFromHead
 			seedReason = "startup branch transition shadow reseed"
-			startupShadowMutated = true
 		}
-		if seeded, err := seedShadow(ctx, opts.RepoPath, opts.DB, cctx); err != nil {
-			logger.Warn("bootstrap shadow", "err", err.Error())
-			traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", err.Error(), 0)
+		if startupTokenChanged {
+			seedShadow = ReseedShadowFromHead
+		}
+		seeded, seedErr := seedShadow(ctx, opts.RepoPath, opts.DB, cctx)
+		startupShadowMutated = startupTokenChanged && seedErr == nil
+		if seedErr != nil {
+			logger.Warn("bootstrap shadow", "err", seedErr.Error())
+			traceBootstrapShadow(tracer, opts.RepoPath, cctx, "error", seedErr.Error(), 0)
 			branchTransitionBlocked = true
 		} else {
 			traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), seedReason, seeded)
@@ -1233,7 +1263,7 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 	}
-	if !branchTransitionBlocked {
+	if !branchTransitionBlocked && !startupAtomicAdopted {
 		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
 			logger.Warn("verify startup branch token before metadata accept; will retry",
@@ -1245,7 +1275,7 @@ func Run(ctx context.Context, opts Options) error {
 			branchTransitionBlocked = true
 		}
 	}
-	if !branchTransitionBlocked {
+	if !branchTransitionBlocked && !startupAtomicAdopted {
 		meta := map[string]string{
 			MetaKeyBranchGeneration:               strconv.FormatInt(cctx.BranchGeneration, 10),
 			MetaKeyBranchHead:                     cctx.BaseHead,
@@ -1339,7 +1369,13 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 	}
-	if !branchTransitionBlocked && cctx.BranchRef != "" && cctx.BaseHead != "" {
+	// Atomic bridge adoption locks the literal branch ref, not symbolic HEAD.
+	// Carry the runtime resample gate across startup so a branch switch after
+	// lock release cannot make live-index repair or protection use the adopted
+	// context before HEAD is sampled again.
+	deferProtectionUntilBranchResample := startupAtomicAdopted
+	if !branchTransitionBlocked && !deferProtectionUntilBranchResample &&
+		cctx.BranchRef != "" && cctx.BaseHead != "" {
 		if repaired, err := RepairPublishedLiveIndex(ctx, opts.RepoPath, opts.DB, cctx.BaseHead, DefaultLiveIndexRepairLimit); err != nil {
 			logger.Warn("repair published live index", "err", err.Error())
 		} else if repaired.Applied > 0 || len(repaired.Skipped) > 0 {
@@ -1733,8 +1769,13 @@ func Run(ctx context.Context, opts Options) error {
 			// exact internal transition in progress. Fail closed until HEAD
 			// can be sampled again; otherwise capture/replay would run against
 			// the pre-publication cctx and strand new work on a stale base.
-			return pendingInternalTransitionTarget != ""
+			return pendingInternalTransitionTarget != "" ||
+				deferProtectionUntilBranchResample
 		}
+		// A successful token sample closes any identity gap left by atomic
+		// bridge adoption. Keep the gate set across passes that skip this
+		// function (for example, an active Git operation or manual pause).
+		deferProtectionUntilBranchResample = false
 		if pendingInternalTransitionTarget != "" {
 			if tokenSHA(newToken) == pendingInternalTransitionTarget &&
 				tokenBranchRef(newToken) == cctx.BranchRef {
@@ -1939,6 +1980,7 @@ func Run(ctx context.Context, opts Options) error {
 		oldToken := currentToken
 		result, reconcileErr := reconcileTransitionPair(ctx, opts.RepoPath, opts.GitDir,
 			opts.DB, cctx.BranchRef, cctx.BranchGeneration,
+			tokenSHA(currentToken),
 			tokenSHA(newToken) == "", "", "runtime_branch_transition", tracer)
 		if reconcileErr != nil {
 			if attentionErr := recordCompletedTransitionProofAttention(
@@ -1959,6 +2001,30 @@ func Run(ctx context.Context, opts Options) error {
 				"outcome", result.Outcome,
 				"events", result.EventCount,
 				"recovery_ref", result.RecoveryRef)
+		}
+		if result.AcceptedHead != "" {
+			acceptedToken := branchTokenRev(result.AcceptedHead, cctx.BranchRef)
+			cctx.BaseHead = result.AcceptedHead
+			currentToken = acceptedToken
+			headOID = result.AcceptedHead
+			lastStampedBranchHead = result.AcceptedHead
+			// The atomic replacement supersedes any refresh left over from a
+			// previously rolled-back prospective transition.
+			forceShadowRefresh = false
+			branchTransitionSettleUntil = now().Add(branchTransitionSettleDelay)
+			logContext.SetBranch(cctx.BranchRef, cctx.BranchGeneration)
+			// The bridge locks and verifies the literal branch ref, but HEAD is
+			// a separate symbolic ref that can switch as the cross-store adoption
+			// finishes. Do not stamp a protection checkpoint with this adopted
+			// context in the same pass. The next pass samples the branch token
+			// before any worktree scan or checkpoint can run.
+			deferProtectionUntilBranchResample = true
+			if opts.afterExternalRepairBridgeAdoption != nil {
+				opts.afterExternalRepairBridgeAdoption(cctx)
+			}
+			logger.Info("adopted repaired publication bridge",
+				"head", result.AcceptedHead)
+			return true
 		}
 		verifiedToken, verifyErr := branchGenerationToken(ctx, opts.RepoPath)
 		if verifyErr != nil {
@@ -2251,7 +2317,8 @@ func Run(ctx context.Context, opts Options) error {
 				if cctx.BranchRef != "" {
 					var seedErr error
 					prospectiveShadowMutated = true
-					seeded, seedErr = ReseedShadowFromHead(ctx, opts.RepoPath, opts.DB, cctx)
+					seeded, seedErr = ReseedShadowFromHead(
+						ctx, opts.RepoPath, opts.DB, cctx)
 					if seedErr != nil {
 						logger.Warn("reseed shadow after branch fast-forward",
 							"err", seedErr.Error())
@@ -2259,7 +2326,8 @@ func Run(ctx context.Context, opts Options) error {
 						rollbackTransition()
 						return true
 					} else {
-						traceBootstrapShadow(tracer, opts.RepoPath, cctx, traceSeedDecision(seeded), "fast-forward shadow reseed", seeded)
+						traceBootstrapShadow(tracer, opts.RepoPath, cctx,
+							traceSeedDecision(seeded), "fast-forward shadow reseed", seeded)
 						logger.Info("shadow reseeded after branch fast-forward",
 							"rows", seeded,
 							"generation", cctx.BranchGeneration)
@@ -2379,10 +2447,24 @@ func Run(ctx context.Context, opts Options) error {
 					"err", ai.SanitizePlannerError(drainErr.Error()))
 			} else if runtimeDrain != nil {
 				frozenRuntimeDrainID = runtimeDrain.ID
-				if err := runtimeBundles.ActivatePublicationDrainRevision(
-					ctx, *runtimeDrain); err != nil {
-					logger.Warn("activate frozen publication drain runtime",
-						"err", ai.SanitizePlannerError(err.Error()))
+				if runtimeDrain.Phase == state.PublicationDrainNeedsAction &&
+					runtimeDrain.LastError ==
+						PublicationDrainSemanticMessageUnavailableReason {
+					// This exact terminal barrier cannot use its frozen provider
+					// again. Let a validated desired revision become applied so
+					// recovery can prove the replacement contract. The barrier
+					// below still prevents that runtime from replaying the frozen
+					// target before the whole suffix is preserved.
+					if err := runtimeBundles.ActivateDesired(ctx); err != nil {
+						logger.Warn("activate desired runtime for semantic recovery; retaining last-known-good",
+							"err", ai.SanitizePlannerError(err.Error()))
+					}
+				} else {
+					if err := runtimeBundles.ActivatePublicationDrainRevision(
+						ctx, *runtimeDrain); err != nil {
+						logger.Warn("activate frozen publication drain runtime",
+							"err", ai.SanitizePlannerError(err.Error()))
+					}
 				}
 			} else {
 				if err := runtimeBundles.ActivateDesired(ctx); err != nil {
@@ -2753,11 +2835,18 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Info("publication held by transactional setup; protection remains active")
 		}
 		unsafePublication := branchTransitionBlocked || operationPaused || detachedHeadPaused || daemonPaused || publicationHeld
-		observationEpoch, observationErr := BeginProtectionObservation(passCtx, opts.DB)
-		if observationErr != nil {
+		observationEpoch := int64(0)
+		if deferProtectionUntilBranchResample {
+			logger.Info("protection deferred until repaired branch identity is resampled")
+		} else if epoch, observationErr := BeginProtectionObservation(
+			passCtx, opts.DB,
+		); observationErr != nil {
 			capErr = observationErr
+		} else {
+			observationEpoch = epoch
 		}
-		if capErr == nil && unsafePublication {
+		if capErr == nil && unsafePublication &&
+			!deferProtectionUntilBranchResample {
 			ignoreChecker.Invalidate()
 			capSum, capErr = ProtectWorktree(passCtx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
 				IgnoreChecker:     ignoreChecker,
@@ -2771,7 +2860,8 @@ func Run(ctx context.Context, opts Options) error {
 				MaxFileBytes:      opts.MaxFileBytes,
 				ObservationEpoch:  observationEpoch,
 			})
-		} else if capErr == nil && cctx.BaseHead != "" {
+		} else if capErr == nil && cctx.BaseHead != "" &&
+			!deferProtectionUntilBranchResample {
 			// git check-ignore keeps ignore files loaded for the lifetime
 			// of its --stdin process. Refresh once per capture pass so
 			// newly-created or edited .gitignore files are honored even
@@ -2813,11 +2903,36 @@ func Run(ctx context.Context, opts Options) error {
 			// without waiting for the idle ceiling.
 			activeDrain, drainErr := PublicationDrainBarrierForPair(
 				passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
+			semanticMessageRecovered := false
 			if drainErr == nil && activeDrain != nil &&
 				activeDrain.Phase == state.PublicationDrainNeedsAction {
 				recoveredDrain, recoverErr := RecoverSupersededCandidatePublicationDrain(
 					passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
 					time.Now().UTC())
+				if recoverErr == nil && recoveredDrain == nil {
+					recoveredDrain, recoverErr = RecoverSoftDependencyCapPublicationDrain(
+						passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
+						time.Now().UTC())
+				}
+				var recoveredChain RecoveryChainResult
+				if recoverErr == nil && recoveredDrain == nil {
+					runWithProgressHeartbeat(
+						passCtx, progressHeartbeatInterval(opts), func() {
+							heartbeatNow("running", "")
+						}, func() {
+							recoveredDrain, recoveredChain, recoverErr =
+								RecoverUnavailableSemanticMessagePublicationDrain(
+									passCtx, opts.RepoPath, opts.GitDir, opts.DB,
+									*activeDrain, tracer, time.Now().UTC())
+						})
+					if recoveredDrain != nil {
+						semanticMessageRecovered = true
+						recoveryFollowup = true
+						logger.Info("preserved unavailable semantic publication for recapture",
+							"events", recoveredChain.EventCount,
+							"recovery_ref", recoveredChain.RecoveryRef)
+					}
+				}
 				if recoverErr != nil {
 					drainErr = recoverErr
 				} else if recoveredDrain != nil {
@@ -2837,6 +2952,14 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			if drainErr != nil {
 				repErr = drainErr
+			} else if semanticMessageRecovered {
+				repSum = ReplaySummary{
+					RecaptureRequired: true,
+					HasMore:           true,
+					BaseHead:          cctx.BaseHead,
+					Disposition:       ReplayDispositionProgress,
+					DispositionReason: PublicationDrainSemanticMessageUnavailableReason,
+				}
 			} else if validationErr != nil {
 				repErr = validationErr
 			} else if activeDrain != nil &&

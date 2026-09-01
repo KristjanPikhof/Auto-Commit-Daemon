@@ -689,6 +689,44 @@ func ActivePublicationDrains(
 	return publicationDrainsQuery(ctx, db.conn, true)
 }
 
+// ActivePublicationDrainsForPair returns at most two active drains for one
+// exact branch generation. The second row is a fail-closed sentinel for
+// callers that require unique ownership without scanning unrelated drains.
+func ActivePublicationDrainsForPair(
+	ctx context.Context,
+	db *DB,
+	branchRef string,
+	branchGeneration int64,
+) ([]PublicationDrain, error) {
+	if db == nil {
+		return nil, errors.New(
+			"state: ActivePublicationDrainsForPair: nil db")
+	}
+	rows, err := db.ReadSQL().QueryContext(ctx, publicationDrainSelect+`
+ WHERE branch_ref=? AND branch_generation=?
+   AND phase NOT IN ('completed','needs_action')
+ ORDER BY created_ts,id LIMIT 2`, branchRef, branchGeneration)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"state: query active publication drains for branch generation: %w", err)
+	}
+	defer rows.Close()
+	drains := make([]PublicationDrain, 0, 2)
+	for rows.Next() {
+		drain, err := scanPublicationDrain(rows)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"state: scan active publication drain for branch generation: %w", err)
+		}
+		drains = append(drains, drain)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"state: iterate active publication drains for branch generation: %w", err)
+	}
+	return drains, nil
+}
+
 // ReadPublicationDrainProjection opens an existing DB read-only. Pre-v21
 // repositories report Available=false and are never migrated as a side effect.
 func ReadPublicationDrainProjection(

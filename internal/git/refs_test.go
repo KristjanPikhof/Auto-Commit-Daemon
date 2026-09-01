@@ -231,6 +231,262 @@ func TestWithLockedExpectedRefBlocksConcurrentBranchMutation(t *testing.T) {
 	}
 }
 
+func TestWithLockedRecoveryAndBranchRefCancelsCallbackWork(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const (
+		recoveryRef = "refs/acd/recovery/test-timeout"
+		branchRef   = "refs/heads/main"
+	)
+	if err := UpdateRef(ctx, dir, recoveryRef, first, ""); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+	if err := UpdateRef(ctx, dir, branchRef, first, ""); err != nil {
+		t.Fatalf("seed branch ref: %v", err)
+	}
+
+	lockCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	var mutationErr error
+	err := WithLockedRecoveryRefAndExpectedRef(
+		lockCtx, dir, recoveryRef, first, branchRef, first,
+		func(callbackCtx context.Context) error {
+			<-callbackCtx.Done()
+			mutationErr = UpdateRef(
+				callbackCtx, dir, branchRef, second, first)
+			return callbackCtx.Err()
+		})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock timeout err=%v want deadline exceeded", err)
+	}
+	if mutationErr == nil {
+		t.Fatal("callback mutation succeeded after lock context expired")
+	}
+	got, err := RevParse(ctx, dir, branchRef)
+	if err != nil || got != first {
+		t.Fatalf("branch after timeout=%q err=%v want %s", got, err, first)
+	}
+}
+
+func TestWithLockedRecoveryAndBranchRefAcceptsCompletedCallbackAfterCancellation(t *testing.T) {
+	dir := initRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	first := commitFile(t, context.Background(), dir,
+		"first.txt", "first", "first")
+	const (
+		recoveryRef = "refs/acd/recovery/test-post-callback-cancel"
+		branchRef   = "refs/heads/main"
+	)
+	if err := UpdateRef(context.Background(), dir, recoveryRef, first, ""); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+	if err := UpdateRef(context.Background(), dir, branchRef, first, ""); err != nil {
+		t.Fatalf("seed branch ref: %v", err)
+	}
+
+	callbackCompleted := false
+	err := WithLockedRecoveryRefAndExpectedRef(
+		ctx, dir, recoveryRef, first, branchRef, first,
+		func(callbackCtx context.Context) error {
+			callbackCompleted = true
+			cancel()
+			<-callbackCtx.Done()
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("completed callback reported as failed: %v", err)
+	}
+	if !callbackCompleted {
+		t.Fatal("callback did not complete")
+	}
+	got, err := RevParse(context.Background(), dir, branchRef)
+	if err != nil || got != first {
+		t.Fatalf("branch after callback=%q err=%v want %s", got, err, first)
+	}
+}
+
+func TestWithLockedRecoveryAndBranchRefKeepsLocksUntilCallbackReturnsAfterCancellation(t *testing.T) {
+	dir := initRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := commitFile(t, context.Background(), dir,
+		"first.txt", "first", "first")
+	second := commitFile(t, context.Background(), dir,
+		"second.txt", "second", "second", first)
+	const (
+		recoveryRef = "refs/acd/recovery/test-cancelled-commit"
+		branchRef   = "refs/heads/main"
+	)
+	if err := UpdateRef(context.Background(), dir, recoveryRef, first, ""); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+	if err := UpdateRef(context.Background(), dir, branchRef, first, ""); err != nil {
+		t.Fatalf("seed branch ref: %v", err)
+	}
+
+	commitBoundary := make(chan struct{})
+	callbackCancelled := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- WithLockedRecoveryRefAndExpectedRef(
+			ctx, dir, recoveryRef, first, branchRef, first,
+			func(callbackCtx context.Context) error {
+				// Model a database commit that has crossed its commit boundary:
+				// cancellation is visible, but the call cannot return until the
+				// commit finishes.
+				close(commitBoundary)
+				<-callbackCtx.Done()
+				close(callbackCancelled)
+				<-releaseCommit
+				return nil
+			})
+	}()
+	select {
+	case <-commitBoundary:
+	case <-time.After(5 * time.Second):
+		t.Fatal("callback did not reach its commit boundary")
+	}
+	cancel()
+	select {
+	case <-callbackCancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("callback did not observe caller cancellation")
+	}
+
+	// Repeated real update-ref attempts provide a deterministic barrier: the
+	// caller has been cancelled and the competing writer has tried the exact
+	// ref many times, but none may acquire it while the callback is still
+	// finishing its commit. The old caller-bound process lifetime lets one of
+	// these attempts succeed as soon as cancellation kills update-ref.
+	failedAttempt := make(chan struct{}, 1)
+	writerDone := make(chan error, 1)
+	stopWriter := make(chan struct{})
+	defer close(stopWriter)
+	go func() {
+		for {
+			attemptCtx, attemptCancel := context.WithTimeout(
+				context.Background(), 50*time.Millisecond)
+			err := UpdateRef(attemptCtx, dir, branchRef, second, first)
+			attemptCancel()
+			if err == nil {
+				writerDone <- nil
+				return
+			}
+			select {
+			case failedAttempt <- struct{}{}:
+			default:
+			}
+			select {
+			case <-stopWriter:
+				return
+			default:
+			}
+		}
+	}()
+	for range 20 {
+		select {
+		case err := <-writerDone:
+			if err == nil {
+				t.Fatal("concurrent writer acquired branch ref before callback returned")
+			}
+			t.Fatalf("concurrent writer stopped unexpectedly: %v", err)
+		case <-failedAttempt:
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent writer did not finish a lock attempt")
+		}
+	}
+
+	close(releaseCommit)
+	select {
+	case err := <-lockDone:
+		if err != nil {
+			t.Fatalf("completed callback reported as failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ref transaction did not finish after callback returned")
+	}
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("concurrent writer after callback: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent writer did not acquire ref after callback returned")
+	}
+}
+
+func TestWithLockedRecoveryAndBranchRefKeepsLocksUntilCallbackReturnsAfterDeadline(t *testing.T) {
+	dir := initRepo(t)
+	ctx := context.Background()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	second := commitFile(t, ctx, dir, "second.txt", "second", "second", first)
+	const (
+		recoveryRef = "refs/acd/recovery/test-expired-callback-deadline"
+		branchRef   = "refs/heads/main"
+	)
+	if err := UpdateRef(ctx, dir, recoveryRef, first, ""); err != nil {
+		t.Fatalf("seed recovery ref: %v", err)
+	}
+	if err := UpdateRef(ctx, dir, branchRef, first, ""); err != nil {
+		t.Fatalf("seed branch ref: %v", err)
+	}
+
+	commitBoundary := make(chan struct{})
+	deadlineExpired := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	lockDone := make(chan error, 1)
+	go func() {
+		lockDone <- withLockedExpectedRefTimeout(
+			ctx, dir, recoveryRef, first, branchRef, first, true,
+			50*time.Millisecond, func(callbackCtx context.Context) error {
+				close(commitBoundary)
+				<-callbackCtx.Done()
+				close(deadlineExpired)
+				<-releaseCommit
+				return nil
+			})
+	}()
+	select {
+	case <-commitBoundary:
+	case <-time.After(5 * time.Second):
+		t.Fatal("callback did not reach its commit boundary")
+	}
+	select {
+	case <-deadlineExpired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("callback hard deadline did not expire")
+	}
+
+	acquiredEarly := false
+	for range 10 {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		err := UpdateRef(attemptCtx, dir, branchRef, second, first)
+		attemptCancel()
+		if err == nil {
+			acquiredEarly = true
+			break
+		}
+	}
+	close(releaseCommit)
+	select {
+	case err := <-lockDone:
+		if acquiredEarly {
+			t.Fatal("concurrent writer acquired branch ref after callback deadline but before callback return")
+		}
+		if err != nil {
+			t.Fatalf("completed callback reported as failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ref transaction did not finish after callback returned")
+	}
+	if err := UpdateRef(ctx, dir, branchRef, second, first); err != nil {
+		t.Fatalf("concurrent writer after callback: %v", err)
+	}
+}
+
 func TestWithLockedExpectedRefRejectsMismatchBeforeCallback(t *testing.T) {
 	dir := initRepo(t)
 	ctx := context.Background()

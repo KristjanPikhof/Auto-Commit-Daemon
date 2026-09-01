@@ -270,7 +270,8 @@ func runStartupDeadBranchSweepWithOptions(
 			return
 		}
 		result, dErr := reconcileTransitionPair(ctx, repoDir, gitDir, db,
-			p.Ref, p.Generation, archiveOnly, p.Ref, "startup_dead_branch_sweep", tracer)
+			p.Ref, p.Generation, "", archiveOnly, p.Ref,
+			"startup_dead_branch_sweep", tracer)
 		if dErr != nil {
 			logger.Warn("startup sweep: recover dead-branch unpublished failed",
 				"ref", p.Ref,
@@ -408,7 +409,8 @@ func pruneDeadBranchTerminals(
 		return
 	}
 	result, err := reconcileTransitionPair(ctx, repoDir, gitDir, db,
-		oldRef, prevGeneration, tokenSHA(liveToken) == "", oldRef, "runtime_dead_branch_sweep", tracer)
+		oldRef, prevGeneration, "", tokenSHA(liveToken) == "", oldRef,
+		"runtime_dead_branch_sweep", tracer)
 	if err != nil {
 		logger.Warn("recover dead-branch unpublished failed",
 			"ref", oldRef,

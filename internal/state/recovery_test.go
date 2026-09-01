@@ -143,6 +143,68 @@ func TestRecoveryChainLoadScopedOrdered(t *testing.T) {
 	}
 }
 
+func TestBoundedRecoveryChainMatchesCompleteBulkLoad(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	first := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"base-one", "one.txt", EventStatePending)
+	_ = appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"base-two", "two.txt", EventStateFailed)
+
+	want, err := LoadUnpublishedRecoveryChain(
+		ctx, d, "refs/heads/main", 4, first)
+	if err != nil {
+		t.Fatalf("LoadUnpublishedRecoveryChain: %v", err)
+	}
+	got, err := LoadUnpublishedRecoveryChainBounded(
+		ctx, d, "refs/heads/main", 4, first, 4)
+	if err != nil {
+		t.Fatalf("LoadUnpublishedRecoveryChainBounded: %v", err)
+	}
+	if !sameRecoveryChain(got, want) {
+		t.Fatalf("bounded chain=%+v want %+v", got, want)
+	}
+}
+
+func TestBoundedRecoveryChainRejectsEventOverflow(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	first := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"base-one", "one.txt", EventStatePending)
+	_ = appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"base-two", "two.txt", EventStatePending)
+
+	_, err := LoadUnpublishedRecoveryChainBounded(
+		ctx, d, "refs/heads/main", 4, first, 1)
+	if !errors.Is(err, ErrCompletedBranchTransitionProof) {
+		t.Fatalf("event overflow err=%v want completed-transition proof error", err)
+	}
+}
+
+func TestBoundedRecoveryChainRejectsOperationOverflow(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	first := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
+		"base-one", "one.txt", EventStatePending)
+	if _, err := d.SQL().ExecContext(ctx, `
+INSERT INTO capture_ops(
+    event_seq,ord,op,path,old_path,before_oid,before_mode,
+    after_oid,after_mode,fidelity
+) VALUES (?,1,'create','extra.txt',NULL,NULL,NULL,'extra-oid','100644','exact')`,
+		first); err != nil {
+		t.Fatalf("insert extra capture operation: %v", err)
+	}
+
+	_, err := LoadUnpublishedRecoveryChainBounded(
+		ctx, d, "refs/heads/main", 4, first, 1)
+	if !errors.Is(err, ErrCompletedBranchTransitionProof) {
+		t.Fatalf("operation overflow err=%v want completed-transition proof error", err)
+	}
+}
+
 func TestPublishedRecoveryContextLoadScopedOrdered(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
@@ -251,6 +313,237 @@ func TestRecoveryChainTransitionPublishedAtomic(t *testing.T) {
 	}
 	assertRecoveryTransitionState(t, d, chain, EventStatePublished, "external-head-oid")
 	assertRecoveryBookkeeping(t, d, snapshot, chain, DecisionKindRecoveryPublished)
+}
+
+func TestRecoveryChainTransitionPublishedPrefixPreservesLaterCapture(t *testing.T) {
+	t.Parallel()
+	d, chain := seedRecoveryTestChain(t)
+	ctx := context.Background()
+	later := appendRecoveryTestEvent(
+		t, ctx, d, chain[0].Event.BranchRef,
+		chain[0].Event.BranchGeneration,
+		"later-base", "later.txt", EventStatePending)
+
+	snapshot, err := TransitionRecoveryChain(ctx, d, RecoveryChainTransition{
+		Expected:              chain,
+		TargetState:           EventStatePublished,
+		CommitOID:             "frozen-external-target",
+		RecoveryRef:           "refs/acd/recovery/frozen-prefix",
+		Reason:                "settle frozen target only",
+		TransitionTS:          42,
+		AllowLaterUnpublished: true,
+	})
+	if err != nil {
+		t.Fatalf("TransitionRecoveryChain prefix: %v", err)
+	}
+	if snapshot.EventCount != len(chain) {
+		t.Fatalf("snapshot=%+v want %d frozen events", snapshot, len(chain))
+	}
+	assertRecoveryTransitionState(
+		t, d, chain, EventStatePublished, "frozen-external-target")
+	var laterState string
+	var laterCommit sql.NullString
+	if err := d.ReadSQL().QueryRowContext(ctx, `
+SELECT state,commit_oid FROM capture_events WHERE seq=?`, later).Scan(
+		&laterState, &laterCommit); err != nil {
+		t.Fatalf("load later capture: %v", err)
+	}
+	if laterState != EventStatePending || laterCommit.Valid {
+		t.Fatalf("later capture state=%q commit=%v want pending", laterState, laterCommit)
+	}
+}
+
+func TestRecoveryChainTransitionAdoptsBranchAtomically(t *testing.T) {
+	t.Parallel()
+	d, chain := seedRecoveryTestChain(t)
+	ctx := context.Background()
+	branchRef := chain[0].Event.BranchRef
+	generation := chain[0].Event.BranchGeneration
+	laterSeq := appendRecoveryTestEvent(t, ctx, d, branchRef, generation,
+		"frozen-target", "later.txt", EventStatePending)
+	later, err := LoadUnpublishedRecoveryChain(
+		ctx, d, branchRef, generation, laterSeq)
+	if err != nil {
+		t.Fatalf("LoadUnpublishedRecoveryChain later: %v", err)
+	}
+	if len(later) != 1 || later[0].Event.Seq != laterSeq {
+		t.Fatalf("later chain=%+v want exact seq %d", later, laterSeq)
+	}
+
+	marker, oldShadow, _ := seedRecoveryAdoptionBaseline(
+		t, ctx, d, branchRef, generation)
+	const adoptedHead = "accepted-live-head"
+	shadowRows := []ShadowPath{
+		{
+			BranchRef: branchRef, BranchGeneration: generation,
+			Path: "head-only.txt", Operation: "bootstrap",
+			Mode: sqlNullStr("100644"), OID: sqlNullStr("head-blob"),
+			BaseHead: adoptedHead, Fidelity: "full",
+		},
+		{
+			BranchRef: branchRef, BranchGeneration: generation,
+			Path: "later.txt", Operation: "modify",
+			Mode: sqlNullStr("100644"), OID: sqlNullStr("after-later.txt"),
+			BaseHead: adoptedHead, Fidelity: "exact",
+		},
+	}
+
+	snapshot, err := TransitionRecoveryChain(ctx, d, RecoveryChainTransition{
+		Expected:              chain,
+		ExpectedLater:         later,
+		TargetState:           EventStatePublished,
+		CommitOID:             "frozen-target",
+		RecoveryRef:           "refs/acd/recovery/atomic-adoption",
+		Reason:                "adopt exact externally repaired branch",
+		TransitionTS:          42,
+		AllowLaterUnpublished: true,
+		AdoptedBranchHead:     adoptedHead,
+		ShadowRows:            shadowRows,
+	})
+	if err != nil {
+		t.Fatalf("TransitionRecoveryChain adoption: %v", err)
+	}
+	if snapshot.EventCount != len(chain) ||
+		snapshot.LastEventSeq != chain[len(chain)-1].Event.Seq {
+		t.Fatalf("snapshot=%+v want frozen prefix only", snapshot)
+	}
+	assertRecoveryTransitionState(
+		t, d, chain, EventStatePublished, "frozen-target")
+	assertRecoveryEventPending(t, ctx, d, laterSeq)
+	assertRecoveryBookkeeping(
+		t, d, snapshot, chain, DecisionKindRecoveryPublished)
+
+	if _, ok, err := GetShadowPath(
+		ctx, d, branchRef, generation, oldShadow.Path); err != nil || ok {
+		t.Fatalf("old shadow survived adoption: ok=%v err=%v", ok, err)
+	}
+	var shadowCount int
+	if err := d.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM shadow_paths
+WHERE branch_ref = ? AND branch_generation = ?`,
+		branchRef, generation).Scan(&shadowCount); err != nil {
+		t.Fatalf("count adopted shadow: %v", err)
+	}
+	if shadowCount != len(shadowRows) {
+		t.Fatalf("adopted shadow rows=%d want %d", shadowCount, len(shadowRows))
+	}
+	for _, want := range shadowRows {
+		got, ok, err := GetShadowPath(
+			ctx, d, branchRef, generation, want.Path)
+		if err != nil || !ok || got.Operation != want.Operation ||
+			got.Mode != want.Mode || got.OID != want.OID ||
+			got.BaseHead != adoptedHead || got.Fidelity != want.Fidelity {
+			t.Fatalf("adopted shadow %q=(%+v,%v,%v) want %+v",
+				want.Path, got, ok, err, want)
+		}
+	}
+	assertRecoveryMetaValue(t, ctx, d, marker, "1")
+	assertRecoveryMetaValue(t, ctx, d,
+		selfPublicationMetaBranchGeneration, "3")
+	assertRecoveryMetaValue(t, ctx, d,
+		selfPublicationMetaBranchHead, adoptedHead)
+	assertRecoveryMetaValue(t, ctx, d, selfPublicationMetaBranchToken,
+		"rev:"+adoptedHead+" "+branchRef)
+	assertRecoveryMetaValue(t, ctx, d, "branch_token_changed_at", "42")
+	assertRecoveryMetaValue(t, ctx, d, "branch.transition.needs_attention", "")
+	if value, ok, err := MetaGet(
+		ctx, d, "manual_pause.resumed_at"); err != nil || ok {
+		t.Fatalf("manual resume meta=(%q,%v,%v) want absent", value, ok, err)
+	}
+}
+
+func TestRecoveryChainTransitionAdoptionRejectsAppendedCapture(t *testing.T) {
+	t.Parallel()
+	d, chain := seedRecoveryTestChain(t)
+	ctx := context.Background()
+	branchRef := chain[0].Event.BranchRef
+	generation := chain[0].Event.BranchGeneration
+	laterSeq := appendRecoveryTestEvent(t, ctx, d, branchRef, generation,
+		"frozen-target", "later.txt", EventStatePending)
+	later, err := LoadUnpublishedRecoveryChain(
+		ctx, d, branchRef, generation, laterSeq)
+	if err != nil {
+		t.Fatalf("LoadUnpublishedRecoveryChain later: %v", err)
+	}
+	if len(later) != 1 || later[0].Event.Seq != laterSeq {
+		t.Fatalf("later chain=%+v want exact seq %d", later, laterSeq)
+	}
+
+	marker, oldShadow, oldMeta := seedRecoveryAdoptionBaseline(
+		t, ctx, d, branchRef, generation)
+	var snapshotsBefore, membersBefore int
+	if err := d.ReadSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&snapshotsBefore); err != nil {
+		t.Fatalf("count snapshots before race: %v", err)
+	}
+	if err := d.ReadSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshot_events`).Scan(&membersBefore); err != nil {
+		t.Fatalf("count snapshot members before race: %v", err)
+	}
+	unexpectedSeq := appendRecoveryTestEvent(t, ctx, d, branchRef, generation,
+		"newer-base", "unexpected.txt", EventStatePending)
+
+	const adoptedHead = "must-not-be-adopted"
+	_, err = TransitionRecoveryChain(ctx, d, RecoveryChainTransition{
+		Expected:              chain,
+		ExpectedLater:         later,
+		TargetState:           EventStatePublished,
+		CommitOID:             "frozen-target",
+		RecoveryRef:           "refs/acd/recovery/stale-atomic-adoption",
+		Reason:                "stale branch adoption evidence",
+		TransitionTS:          52,
+		AllowLaterUnpublished: true,
+		AdoptedBranchHead:     adoptedHead,
+		ShadowRows: []ShadowPath{{
+			BranchRef: branchRef, BranchGeneration: generation,
+			Path: "new-shadow.txt", Operation: "bootstrap",
+			OID: sqlNullStr("new-blob"), BaseHead: adoptedHead,
+			Fidelity: "full",
+		}},
+	})
+	if !errors.Is(err, ErrRecoveryChainChanged) {
+		t.Fatalf("TransitionRecoveryChain race err=%v want ErrRecoveryChainChanged", err)
+	}
+
+	assertRecoveryNoPartialMutation(t, d, chain, unexpectedSeq)
+	assertRecoveryEventPending(t, ctx, d, laterSeq)
+	if got, ok, err := GetShadowPath(
+		ctx, d, branchRef, generation, oldShadow.Path); err != nil || !ok ||
+		got.Operation != oldShadow.Operation || got.OID != oldShadow.OID ||
+		got.BaseHead != oldShadow.BaseHead || got.Fidelity != oldShadow.Fidelity {
+		t.Fatalf("old shadow after rejected adoption=(%+v,%v,%v) want %+v",
+			got, ok, err, oldShadow)
+	}
+	if _, ok, err := GetShadowPath(
+		ctx, d, branchRef, generation, "new-shadow.txt"); err != nil || ok {
+		t.Fatalf("proposed shadow appeared after rejection: ok=%v err=%v", ok, err)
+	}
+	var shadowCount, snapshotsAfter, membersAfter int
+	if err := d.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM shadow_paths
+WHERE branch_ref = ? AND branch_generation = ?`,
+		branchRef, generation).Scan(&shadowCount); err != nil {
+		t.Fatalf("count shadow after rejected adoption: %v", err)
+	}
+	if shadowCount != 1 {
+		t.Fatalf("shadow rows after rejected adoption=%d want 1", shadowCount)
+	}
+	if err := d.ReadSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshots`).Scan(&snapshotsAfter); err != nil {
+		t.Fatalf("count snapshots after race: %v", err)
+	}
+	if err := d.ReadSQL().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM recovery_snapshot_events`).Scan(&membersAfter); err != nil {
+		t.Fatalf("count snapshot members after race: %v", err)
+	}
+	if snapshotsAfter != snapshotsBefore || membersAfter != membersBefore {
+		t.Fatalf("snapshot rows changed: snapshots=%d->%d members=%d->%d",
+			snapshotsBefore, snapshotsAfter, membersBefore, membersAfter)
+	}
+	assertRecoveryMetaValue(t, ctx, d, marker, "old-marker")
+	for key, want := range oldMeta {
+		assertRecoveryMetaValue(t, ctx, d, key, want)
+	}
 }
 
 func TestRecoveryChainTransitionRecoveredIsNonBarrier(t *testing.T) {
@@ -575,6 +868,76 @@ func appendRecoveryTestEvent(t *testing.T, ctx context.Context, d *DB, branchRef
 		t.Fatalf("AppendCaptureEvent %s: %v", path, err)
 	}
 	return seq
+}
+
+func seedRecoveryAdoptionBaseline(
+	t *testing.T,
+	ctx context.Context,
+	d *DB,
+	branchRef string,
+	generation int64,
+) (string, ShadowPath, map[string]string) {
+	t.Helper()
+	marker := fmt.Sprintf("shadow.bootstrapped:%s:%d", branchRef, generation)
+	oldShadow := ShadowPath{
+		BranchRef: branchRef, BranchGeneration: generation,
+		Path: "old-shadow.txt", Operation: "bootstrap",
+		Mode: sqlNullStr("100644"), OID: sqlNullStr("old-blob"),
+		BaseHead: "old-live-head", Fidelity: "full",
+	}
+	if err := UpsertShadowPath(ctx, d, oldShadow); err != nil {
+		t.Fatalf("seed adoption shadow: %v", err)
+	}
+	meta := map[string]string{
+		marker:                              "old-marker",
+		selfPublicationMetaBranchGeneration: "2",
+		selfPublicationMetaBranchHead:       "old-live-head",
+		selfPublicationMetaBranchToken:      "rev:old-live-head " + branchRef,
+		"branch_token_changed_at":           "7",
+		"branch.transition.needs_attention": "old transition warning",
+		"manual_pause.resumed_at":           "6",
+	}
+	for key, value := range meta {
+		if err := MetaSet(ctx, d, key, value); err != nil {
+			t.Fatalf("seed adoption meta %s: %v", key, err)
+		}
+	}
+	return marker, oldShadow, meta
+}
+
+func assertRecoveryEventPending(
+	t *testing.T,
+	ctx context.Context,
+	d *DB,
+	seq int64,
+) {
+	t.Helper()
+	var eventState string
+	var commitOID sql.NullString
+	if err := d.ReadSQL().QueryRowContext(ctx, `
+SELECT state, commit_oid FROM capture_events WHERE seq = ?`, seq).Scan(
+		&eventState, &commitOID); err != nil {
+		t.Fatalf("load pending recovery event seq=%d: %v", seq, err)
+	}
+	if eventState != EventStatePending || commitOID.Valid {
+		t.Fatalf("event seq=%d lifecycle=(%q,%+v) want pending,NULL",
+			seq, eventState, commitOID)
+	}
+}
+
+func assertRecoveryMetaValue(
+	t *testing.T,
+	ctx context.Context,
+	d *DB,
+	key string,
+	want string,
+) {
+	t.Helper()
+	got, ok, err := MetaGet(ctx, d, key)
+	if err != nil || !ok || got != want {
+		t.Fatalf("meta %s=(%q,%v,%v) want (%q,true,nil)",
+			key, got, ok, err, want)
+	}
 }
 
 func assertRecoveryTransitionState(t *testing.T, d *DB, original []RecoveryChainEvent, wantState, wantCommit string) {

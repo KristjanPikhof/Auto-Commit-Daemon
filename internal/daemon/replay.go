@@ -12,6 +12,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -334,6 +335,14 @@ type ReplaySummary struct {
 	// circuit redirected the pass to a local unlock.
 	RecoveryMode       string
 	PlannerCircuitOpen bool
+	// Planner health details let the durable publication drain distinguish a
+	// temporary circuit wait from a provider that exhausted its backoff ladder.
+	// The fingerprint binds that evidence to the drain's frozen runtime.
+	PlannerProviderFingerprint     string
+	PlannerCircuitBackoffLevel     int
+	PlannerCircuitFailureCount     int
+	PlannerMaxBackoffProbeFailures int
+	PlannerCircuitLastFailureTS    float64
 	// RecoveryPrefixCandidateCount and RecoveryPrefixTotalCandidates describe
 	// the anchored semantic prefix attempted by local unlock. They are used to
 	// widen verification without falling back to raw capture adjacency.
@@ -413,6 +422,17 @@ func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
 // branch_generation and lets the queue drain naturally).
 func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (sum ReplaySummary, replayErr error) {
 	defer func() {
+		if opts.IntentHealth != nil {
+			circuit := opts.IntentHealth.Snapshot()
+			sum.PlannerCircuitOpen = circuit.State == IntentPlannerCircuitOpen &&
+				!circuit.RecoveryReady
+			sum.PlannerProviderFingerprint = circuit.ProviderFingerprint
+			sum.PlannerCircuitBackoffLevel = circuit.BackoffLevel
+			sum.PlannerCircuitFailureCount = circuit.ConsecutiveFailures
+			sum.PlannerMaxBackoffProbeFailures =
+				circuit.MaxBackoffProbeFailures
+			sum.PlannerCircuitLastFailureTS = circuit.LastFailureTS
+		}
 		classifyReplayDisposition(&sum, replayErr)
 	}()
 	if repoRoot == "" || db == nil {
@@ -1567,9 +1587,6 @@ func replayIntentBatch(
 ) (ReplaySummary, error) {
 	if cfg.atomicFallback {
 		sum.RecoveryMode = publicationFallbackLocalUnlock
-		circuit := opts.IntentHealth.Snapshot()
-		sum.PlannerCircuitOpen = circuit.State == IntentPlannerCircuitOpen &&
-			!circuit.RecoveryReady
 	} else if cfg.semanticSalvage {
 		sum.RecoveryMode = publicationFallbackSemanticReplan
 	}
@@ -3722,6 +3739,11 @@ func publishIntentSelection(
 		})
 		return sum, nil
 	}
+	if err := verifyIntentTreePathOwnership(
+		ctx, repoRoot, parentTree, treeOID, allOps,
+	); err != nil {
+		return sum, err
+	}
 
 	eventCtx, cancelEvent := context.WithTimeout(ctx, perEventTimeout())
 	commitOID, err := commitTreeWithMessage(eventCtx, repoRoot, treeOID, parent, groupMessage)
@@ -3860,6 +3882,50 @@ func flattenIntentOps(items []intentReplayItem) []state.CaptureOp {
 		out = append(out, item.ops...)
 	}
 	return out
+}
+
+// verifyIntentTreePathOwnership proves that a candidate's generated tree only
+// changes paths named by its frozen capture operations. The diff is bounded
+// and disables rename detection so both sides of a rename remain explicit.
+func verifyIntentTreePathOwnership(
+	ctx context.Context,
+	repoRoot string,
+	parentTree string,
+	treeOID string,
+	ops []state.CaptureOp,
+) error {
+	if treeOID == "" {
+		return errors.New("daemon: intent publication path ownership: generated tree is empty")
+	}
+	if parentTree == "" {
+		parentTree = git.EmptyTreeOID
+	}
+	allowed := make(map[string]struct{})
+	for _, path := range touchedPaths(ops) {
+		allowed[path] = struct{}{}
+	}
+	out, err := git.RunWithLimit(
+		ctx,
+		git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
+		git.DefaultDiffCap,
+		"diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
+		"--no-renames", parentTree, treeOID, "--",
+	)
+	if err != nil {
+		return fmt.Errorf("daemon: intent publication path ownership diff: %w", err)
+	}
+	for _, record := range bytes.Split(out, []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		path := string(record)
+		if _, ok := allowed[path]; !ok {
+			return fmt.Errorf(
+				"daemon: intent publication path ownership: generated tree changed unowned path %q",
+				path)
+		}
+	}
+	return nil
 }
 
 func intentPlanMessage(plan ai.IntentPlan) string {

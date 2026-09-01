@@ -18,7 +18,9 @@ references, roles, and activity epochs. Time is weak evidence.
 
 Candidate metadata stores privacy-safe summaries, never raw diffs. Limits are
 256 captures, 128 open candidates, 4096 edges per exact pair, bounded purpose
-and atomicity fields, and 64 KiB verification output.
+and atomicity fields, and 64 KiB verification output. Every hard ordering edge
+gets capacity first. ACD rebuilds the remaining soft evidence from active
+captures and drops the least current soft evidence when the graph is full.
 
 ## Gates
 
@@ -101,7 +103,20 @@ Planner windows report this as `dependent_message_fallback`.
 If message generation is unavailable, ACD does not publish a generic message
 such as `Update <path>`. The candidate remains waiting across daemon restarts
 and retries after the provider recovers. Planner windows and diagnostics report
-`waiting_message_rewrite` until a meaningful message is available.
+`waiting_message_rewrite` until a meaningful message is available. Terminal
+retry history extends a deterministic successor chain, so a long provider
+outage cannot consume a fixed lifetime pool of candidate IDs.
+
+The provider circuit records a failed probe at its longest backoff separately
+from ordinary failures. Once that probe fails, ACD stops reporting an endless
+wait. When the user has already applied a newer deterministic Intent runtime with
+the same message format, ACD protects the complete unpublished suffix on a
+recovery ref, invalidates its old capture baseline, and recaptures the live
+work for the newer runtime. The frozen target and later captures move together,
+so later before-states cannot be stranded. A remote replacement is not treated
+as known-good without an explicit recovery. Without that exact proof, the
+drain needs attention and can be retried with `acd commit-all --yes` or
+preserved explicitly with `acd fix --force --yes`.
 
 ACD uses `needs_attention` only when it cannot prove a safe outcome.
 Examples include unresolved dependency ambiguity, failed materialization, a
@@ -110,6 +125,9 @@ verification failure first starts bounded automatic checkpoint replanning and
 target widening. It needs attention only when the complete frozen recovery
 target exhausts required verification. A provider or grouping failure does not
 require attention when the evidence partition passes the other checks.
+An older drain stopped only because soft dependency evidence filled the shared
+edge limit resumes automatically with the rebuilt graph. A hard-edge overflow
+or cycle remains stopped because ACD cannot safely discard ordering evidence.
 
 Status, diagnose, and doctor report the preflight state, finding codes,
 provider attempts, and why a provider call was skipped. Replay-error repeats
@@ -190,6 +208,22 @@ publication never rewrites history and never pushes.
 An internal repair preserves ACD's live capture baseline and advances only its
 recorded base `HEAD`. Dirty paths that are still pending therefore remain
 represented once instead of being captured again after the repair.
+
+Replay also reloads its private scratch index from the repaired tree before it
+publishes another candidate. Before creating each commit, ACD verifies that the
+new tree changes only paths owned by that candidate's frozen captures.
+
+An older runtime could publish the next candidate from the tree that existed
+before a repair. ACD can settle that frozen target automatically only when the
+immediate child of the persisted branch head is explained exactly by one or
+more adjacent, completed, frozen repairs and every remaining capture in the
+active publication drain. It protects that exact child with a private proof
+ref, locks the live branch at the observed descendant, and updates the frozen
+capture lifecycle, live shadow, and branch token in one state transaction.
+Captures made after the frozen target stay pending for the next plan. ACD does
+not move `HEAD` or change the index or worktree, and it never credits newer
+descendant commits to the frozen target. Missing, incomplete, or ambiguous
+evidence stops recovery safely.
 
 If an older runtime already left repeated captures in a queue, replay compares
 each file update with the state produced so far. An exact after-state match is
