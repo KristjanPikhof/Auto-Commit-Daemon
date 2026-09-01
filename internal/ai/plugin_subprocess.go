@@ -664,6 +664,42 @@ func (p *SubprocessProvider) ProposeCommitRewrite(ctx context.Context, rewriteRe
 	return ValidateCommitRewriteProposal(rewriteReq, Result{Subject: resp.Subject, Body: resp.Body, Source: p.Name()})
 }
 
+// ProposeHistoryRewritePlan asks the plugin for one ordered grouped rewrite
+// plan. Plugins that do not support this request should return a clear error;
+// callers can use --messages-only with the older proposal contract.
+func (p *SubprocessProvider) ProposeHistoryRewritePlan(ctx context.Context, planReq HistoryRewritePlanRequest) (HistoryRewritePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return HistoryRewritePlan{}, err
+	}
+	if p.resolveErr != nil {
+		return HistoryRewritePlan{}, p.resolveErr
+	}
+	planReq.CommitFormat = effectiveCommitFormat(planReq.CommitFormat)
+	req := subprocessRequest{
+		Version:                   pluginProtocolVersion,
+		RequestType:               "history_rewrite_plan",
+		CommitFormat:              planReq.CommitFormat,
+		HistoryRewritePlanRequest: &planReq,
+	}
+	body, err := marshalSubprocessRequest(req)
+	if err != nil {
+		return HistoryRewritePlan{}, err
+	}
+	resp, err := p.exchangeBytesWithRetry(ctx, body)
+	if err != nil {
+		return HistoryRewritePlan{}, err
+	}
+	if strings.TrimSpace(resp.Error) != "" {
+		return HistoryRewritePlan{}, fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
+	}
+	if resp.HistoryRewritePlan == nil {
+		return HistoryRewritePlan{}, fmt.Errorf("subprocess:%s: provider does not support grouped history rewrites; update it or use --messages-only", p.name)
+	}
+	plan := *resp.HistoryRewritePlan
+	plan.Source = p.Name()
+	return ValidateHistoryRewritePlan(planReq, plan)
+}
+
 // Close shuts down the plugin process if running. Idempotent and safe to
 // call from any goroutine. After Close, Generate returns an error.
 func (p *SubprocessProvider) Close() error {
@@ -834,6 +870,7 @@ type subprocessRequest struct {
 	PlannerRequestV2      *IntentPlanRequestV2         `json:"planner_request_v2,omitempty"`
 	MessageRewriteRequest *IntentMessageRewriteRequest `json:"message_rewrite_request,omitempty"`
 	CommitRewriteRequest  *CommitRewriteRequest        `json:"commit_rewrite_request,omitempty"`
+	HistoryRewritePlanRequest *HistoryRewritePlanRequest `json:"history_rewrite_plan_request,omitempty"`
 }
 
 // subprocessOp mirrors OpItem on the wire (field tags decouple the wire
@@ -858,6 +895,7 @@ type subprocessResponse struct {
 	GroupingReason  string              `json:"grouping_reason,omitempty"`
 	DeferredReasons []DeferredReason    `json:"deferred_reasons,omitempty"`
 	CommitGroups    []IntentCommitGroup `json:"commit_groups,omitempty"`
+	HistoryRewritePlan *HistoryRewritePlan `json:"history_rewrite_plan,omitempty"`
 }
 
 // pluginRequest packages a request with its reply channel. The owner
