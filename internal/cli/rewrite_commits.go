@@ -39,23 +39,23 @@ type rewriteCommitsOptions struct {
 	rangeNR   string
 	rangeSHA  string
 
-	base       string
-	head       string
-	planOut    string
-	showPlan   string
-	applyPlan  string
-	editPlan   string
-	dryRun     bool
-	yes        bool
-	review     bool
-	noReview   bool
-	planOnly   bool
+	base         string
+	head         string
+	planOut      string
+	showPlan     string
+	applyPlan    string
+	editPlan     string
+	dryRun       bool
+	yes          bool
+	review       bool
+	noReview     bool
+	planOnly     bool
 	messagesOnly bool
-	editFormat string
-	progress   string
-	progressTo io.Writer
-	quiet      bool
-	in         io.Reader
+	editFormat   string
+	progress     string
+	progressTo   io.Writer
+	quiet        bool
+	in           io.Reader
 }
 
 type rewriteProviderResolution struct {
@@ -457,6 +457,64 @@ func printRewriteSelectionSummary(out io.Writer, report rewriteSelectionReport) 
 	}
 }
 
+func printRewritePlanSummary(out io.Writer, plan state.RewritePlan, selected []git.RewriteCommitRecord) {
+	inputCount := rewritePlanInputCount(plan)
+	outputCount := len(plan.Groups)
+	fmt.Fprintf(out, "Selected commits: %d\n", inputCount)
+	fmt.Fprintf(out, "Resulting commits: %d\n", outputCount)
+	fmt.Fprintf(out, "Commit reduction: %d\n", inputCount-outputCount)
+	byOID := make(map[string]git.RewriteCommitRecord, len(selected))
+	for _, commit := range selected {
+		byOID[commit.OID] = commit
+	}
+	for i, group := range plan.Groups {
+		subject := strings.SplitN(strings.TrimSpace(group.ProposedMessage), "\n", 2)[0]
+		fmt.Fprintf(out, "Group %d: %s\n", i+1, subject)
+		fmt.Fprintf(out, "  Reason: %s\n", group.GroupingReason)
+		for _, member := range group.Members {
+			originalSubject := strings.SplitN(strings.TrimSpace(member.OriginalMessage), "\n", 2)[0]
+			if commit, ok := byOID[member.OldOID]; ok {
+				originalSubject = commit.Subject
+			}
+			fmt.Fprintf(out, "  - %s %s\n", shortenSHA(member.OldOID), originalSubject)
+		}
+	}
+	if inputCount > outputCount {
+		fmt.Fprintln(out, "Applying this plan reduces commit count. The final tree remains unchanged.")
+	}
+}
+
+func printSavedRewritePlanGroups(out io.Writer, plan state.RewritePlan) {
+	fmt.Fprintf(out, "Selected commits: %d\n", rewritePlanInputCount(plan))
+	fmt.Fprintf(out, "Resulting commits: %d\n", len(plan.Groups))
+	for i, group := range plan.Groups {
+		firstLine := strings.SplitN(strings.TrimSpace(group.ProposedMessage), "\n", 2)[0]
+		fmt.Fprintf(out, "Group %d: %s\n", i+1, firstLine)
+		fmt.Fprintf(out, "  Reason: %s\n", group.GroupingReason)
+		for _, member := range group.Members {
+			subject := strings.SplitN(strings.TrimSpace(member.OriginalMessage), "\n", 2)[0]
+			fmt.Fprintf(out, "  - %s %s\n", shortenSHA(member.OldOID), subject)
+		}
+	}
+}
+
+func rewritePlanInputCount(plan state.RewritePlan) int {
+	count := 0
+	for _, group := range plan.Groups {
+		count += len(group.Members)
+	}
+	return count
+}
+
+func rewriteApplyQuestion(plan state.RewritePlan) string {
+	inputCount := rewritePlanInputCount(plan)
+	outputCount := len(plan.Groups)
+	if inputCount == outputCount {
+		return fmt.Sprintf("Apply this plan to rewrite %d commit message(s)?", inputCount)
+	}
+	return fmt.Sprintf("Replace %d selected commits with %d grouped commits? The final tree will stay unchanged.", inputCount, outputCount)
+}
+
 func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, opts rewriteCommitsOptions) error {
 	repo, err := resolveRepo(repoFlag)
 	if err != nil {
@@ -473,6 +531,9 @@ func editSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, o
 	applyRef := opts.editPlan
 	if changed {
 		if isRewritePlanFileRef(opts.editPlan) {
+			if err := validateRewritePlanGroupsInRepo(ctx, repo, groups); err != nil {
+				return err
+			}
 			plan.Groups = groups
 			plan.Commits = nil
 			plan.ValidationStatus = state.RewritePlanValidationValid
@@ -730,7 +791,6 @@ func showSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag, ref stri
 	}
 	fmt.Fprintf(out, "Apply status: %s\n", plan.ApplyStatus)
 	printSavedRewritePlanGroups(out, plan)
-	}
 	return nil
 }
 
@@ -800,6 +860,12 @@ func readRewritePlanFile(path string) (state.RewritePlan, error) {
 }
 
 func writeRewritePlanFile(path string, plan state.RewritePlan) error {
+	groups, err := state.RewritePlanGroups(plan)
+	if err != nil {
+		return fmt.Errorf("acd history rewrite: validate plan file: %w", err)
+	}
+	plan.Groups = groups
+	plan.Commits = nil
 	f, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("acd history rewrite: create plan file: %w", err)
@@ -1297,6 +1363,9 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 	}
 	if modes > 1 {
 		return errors.New("acd history rewrite: choose only one mode: generate, --show-plan, --edit, or --apply/--apply-plan")
+	}
+	if opts.messagesOnly && !generate {
+		return errors.New("acd history rewrite: --messages-only is only valid when generating a new plan")
 	}
 	if opts.selection.Range != "" && strings.Contains(opts.selection.Range, "..") {
 		return errors.New("acd history rewrite: --range-nr/--range uses 1-based positions like 2-5; use --range-sha or --git-range for git revsets")
