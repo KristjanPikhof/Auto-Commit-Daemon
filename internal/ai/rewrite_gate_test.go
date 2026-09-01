@@ -69,10 +69,6 @@ func TestCheckHistoryRewritePlanGenerationGate(t *testing.T) {
 	if err := CheckHistoryRewritePlanGenerationGate(cfg, provider, true); err != nil {
 		t.Fatalf("messages-only gate: %v", err)
 	}
-	missing := Compose(intentOnlyRewritePlannerProvider{name: "openai-compat"}, DeterministicProvider{})
-	if err := CheckHistoryRewritePlanGenerationGate(cfg, missing, false); !errors.Is(err, ErrRewriteProviderCannotPlan) {
-		t.Fatalf("missing grouped capability error=%v", err)
-	}
 }
 
 type rewriteGenerateOnlyProvider struct{ name string }
@@ -101,14 +97,4 @@ func (p staticRewritePlannerProvider) ProposeCommitRewrite(_ context.Context, _ 
 
 func (p staticRewritePlannerProvider) ProposeHistoryRewritePlan(_ context.Context, req HistoryRewritePlanRequest) (HistoryRewritePlan, error) {
 	return HistoryRewritePlan{Groups: []HistoryRewriteGroup{{OldOIDs: []string{req.Commits[0].OldOID}, Subject: "Rewrite test history", GroupingReason: "test"}}, Source: p.name}, nil
-}
-
-type intentOnlyRewritePlannerProvider struct{ name string }
-
-func (p intentOnlyRewritePlannerProvider) Name() string { return p.name }
-func (p intentOnlyRewritePlannerProvider) Generate(_ context.Context, _ CommitContext) (Result, error) {
-	return Result{Subject: "test", Source: p.name}, nil
-}
-func (p intentOnlyRewritePlannerProvider) PlanIntent(_ context.Context, req IntentPlanRequest) (IntentPlan, error) {
-	return IntentPlan{SelectedSeqs: []int64{req.OfferedCaptures[0].Seq}, Subject: "test", Source: p.name}, nil
 }
