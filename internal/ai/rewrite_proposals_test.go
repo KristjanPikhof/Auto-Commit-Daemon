@@ -138,6 +138,7 @@ func TestValidateHistoryRewritePlanRejectsInvalidPartitions(t *testing.T) {
 		{"missing", []HistoryRewriteGroup{{OldOIDs: []string{"one"}, Subject: "Keep ordered commits", GroupingReason: "test"}}, "included 1 of 3"},
 		{"reordered", []HistoryRewriteGroup{{OldOIDs: []string{"two"}, Subject: "Keep ordered commits", GroupingReason: "test"}}, "exactly once in chronological order"},
 		{"duplicate", []HistoryRewriteGroup{{OldOIDs: []string{"one", "one"}, Subject: "Keep ordered commits", GroupingReason: "test"}}, "exactly once in chronological order"},
+		{"unknown", []HistoryRewriteGroup{{OldOIDs: []string{"unknown"}, Subject: "Keep ordered commits", GroupingReason: "test"}}, "unknown oid"},
 		{"mixed author", []HistoryRewriteGroup{{OldOIDs: []string{"one", "two"}, Subject: "Keep ordered commits", GroupingReason: "test"}, {OldOIDs: []string{"three"}, Subject: "Keep last commit", GroupingReason: "test"}}, "author boundary"},
 	}
 	for _, tt := range tests {
@@ -147,6 +148,18 @@ func TestValidateHistoryRewritePlanRejectsInvalidPartitions(t *testing.T) {
 				t.Fatalf("error=%v want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestBuildHistoryRewriteUserPromptStatesGroupingBoundaries(t *testing.T) {
+	prompt, err := BuildHistoryRewriteUserPrompt(HistoryRewritePlanRequest{Commits: []HistoryRewriteCommit{{OldOID: "one"}}})
+	if err != nil {
+		t.Fatalf("BuildHistoryRewriteUserPrompt: %v", err)
+	}
+	for _, want := range []string{"exactly once", "chronological order", "contiguous groups", "same file", "different author_name or author_email"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
 	}
 }
 
