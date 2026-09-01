@@ -255,6 +255,67 @@ for line in sys.stdin:
 	}
 }
 
+type rewriteNeedsDiffProvider struct{}
+
+func (rewriteNeedsDiffProvider) Name() string { return "rewrite-needs-diff" }
+
+func (rewriteNeedsDiffProvider) Generate(context.Context, ai.CommitContext) (ai.Result, error) {
+	return ai.Result{}, errors.New("not used")
+}
+
+func TestBuildHistoryRewritePlanRequestBudgetsDiffsFairly(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	const commitCount = 9
+	for i := 0; i < commitCount; i++ {
+		path := "large-" + strconv.Itoa(i) + ".txt"
+		writeRewriteTestFile(t, repo, path, strings.Repeat(string(rune('a'+i)), 24*1024))
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultWriteTimeout}, "add", path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultWriteTimeout}, "commit", "-q", "-m", "Add large evidence file"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selection, err := git.ResolveRewriteSelection(ctx, repo, git.RewriteSelectionOptions{Last: commitCount})
+	if err != nil {
+		t.Fatalf("resolve selection: %v", err)
+	}
+	db := openRewritePlanTestDB(t, ctx, repo)
+	defer db.Close()
+
+	t.Setenv("ACD_AI_DIFF_EGRESS", "0")
+	withoutDiffs, err := buildHistoryRewritePlanRequest(ctx, repo, db, selection.Selected, rewriteNeedsDiffProvider{}, ai.CommitFormatImperative)
+	if err != nil {
+		t.Fatalf("build request without diff egress: %v", err)
+	}
+	for _, commit := range withoutDiffs.Commits {
+		if commit.DiffIncluded || commit.RedactedDiff != "" {
+			t.Fatalf("diff included without egress approval for %s", commit.OldOID)
+		}
+	}
+
+	t.Setenv("ACD_AI_DIFF_EGRESS", "1")
+	withDiffs, err := buildHistoryRewritePlanRequest(ctx, repo, db, selection.Selected, rewriteNeedsDiffProvider{}, ai.CommitFormatImperative)
+	if err != nil {
+		t.Fatalf("build request with diff egress: %v", err)
+	}
+	perCommitCap := ai.HistoryRewriteTotalDiffCap / commitCount
+	total := 0
+	for _, commit := range withDiffs.Commits {
+		if !commit.DiffIncluded || len(commit.RedactedDiff) == 0 {
+			t.Fatalf("diff missing with egress approval for %s", commit.OldOID)
+		}
+		if len(commit.RedactedDiff) > perCommitCap || len(commit.RedactedDiff) > ai.HistoryRewritePerCommitDiffCap {
+			t.Fatalf("diff for %s is %d bytes; caps are %d and %d", commit.OldOID, len(commit.RedactedDiff), perCommitCap, ai.HistoryRewritePerCommitDiffCap)
+		}
+		total += len(commit.RedactedDiff)
+	}
+	if total > ai.HistoryRewriteTotalDiffCap {
+		t.Fatalf("total diff evidence is %d bytes; cap is %d", total, ai.HistoryRewriteTotalDiffCap)
+	}
+}
+
 func TestRewriteCommitsSavedPlanBypassesProviderGate(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, "event")
 	t.Setenv(ai.EnvProvider, "")
