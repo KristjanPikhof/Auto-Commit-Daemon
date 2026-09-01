@@ -59,6 +59,18 @@ history. The deterministic path needs no API key. Migration preserves every exis
 repository's effective provider, strategy, preset, verification, and repair
 values, including Event strategy inherited from old defaults.
 
+A repository override takes precedence over later changes to global defaults.
+Use the reviewed inheritance flow when a repository should follow every global
+setting again:
+
+~~~bash
+acd config edit --repo . --inherit
+~~~
+
+The preview states whether it will save a repository override, update global
+defaults, or remove an override. Local rules need no AI or network access, but
+they cannot generate a history rewrite plan.
+
 ## Credentials and privacy
 
 Credentials remain in
