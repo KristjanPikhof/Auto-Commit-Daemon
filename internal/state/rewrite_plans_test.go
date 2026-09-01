@@ -47,8 +47,8 @@ func TestRewritePlanSaveLoadAndApplyStatus(t *testing.T) {
 	if got.CommitFormat != "imperative" {
 		t.Fatalf("CommitFormat=%q want imperative", got.CommitFormat)
 	}
-	if len(got.Commits) != 2 || got.Commits[0].Ord != 0 || got.Commits[1].OldOID != "old2" || got.Commits[1].ProposedMessage != "new message 2" {
-		t.Fatalf("loaded commits mismatch: %+v", got.Commits)
+	if len(got.Groups) != 2 || got.Groups[0].Ord != 0 || got.Groups[1].Members[0].OldOID != "old2" || got.Groups[1].ProposedMessage != "new message 2" {
+		t.Fatalf("loaded groups mismatch: %+v", got.Groups)
 	}
 
 	if err := MarkRewritePlanApplyStatus(ctx, d, id, RewritePlanApplyApplied); err != nil {
@@ -85,9 +85,9 @@ func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 	updated := RewritePlan{
 		ID:               baseID,
 		ValidationStatus: RewritePlanValidationValid,
-		Commits: []RewritePlanCommit{
-			{OldOID: "old-a", ProposedMessage: "edited in place", OriginalMessage: "original"},
-			{OldOID: "old-b", ProposedMessage: "added row", OriginalMessage: "original b"},
+		Groups: []RewritePlanGroup{
+			{Members: []RewritePlanMember{{OldOID: "old-a", OriginalMessage: "original"}}, ProposedMessage: "edited in place", GroupingReason: "first"},
+			{Members: []RewritePlanMember{{OldOID: "old-b", OriginalMessage: "original b"}}, ProposedMessage: "added row", GroupingReason: "second"},
 		},
 	}
 	if err := UpdateRewritePlanDraft(ctx, d, updated); err != nil {
@@ -97,15 +97,15 @@ func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("LoadRewritePlan updated base: ok=%v err=%v", ok, err)
 	}
-	if !base.Edited || base.ValidationStatus != RewritePlanValidationValid || len(base.Commits) != 2 || base.Commits[0].ProposedMessage != "edited in place" {
-		t.Fatalf("draft update mismatch: %+v commits=%+v", base, base.Commits)
+	if !base.Edited || base.ValidationStatus != RewritePlanValidationValid || len(base.Groups) != 2 || base.Groups[0].ProposedMessage != "edited in place" {
+		t.Fatalf("draft update mismatch: %+v groups=%+v", base, base.Groups)
 	}
 	if base.CommitFormat != "conventional" {
 		t.Fatalf("draft CommitFormat=%q want conventional", base.CommitFormat)
 	}
 
-	revID, err := CreateEditedRewritePlanRevision(ctx, d, baseID, []RewritePlanCommit{
-		{OldOID: "old-a", ProposedMessage: "revision proposal", OriginalMessage: "original"},
+	revID, err := CreateEditedRewritePlanRevision(ctx, d, baseID, []RewritePlanGroup{
+		{Members: []RewritePlanMember{{OldOID: "old-a", OriginalMessage: "original"}}, ProposedMessage: "revision proposal", GroupingReason: "revision"},
 	}, RewritePlanValidationValid)
 	if err != nil {
 		t.Fatalf("CreateEditedRewritePlanRevision: %v", err)
@@ -130,7 +130,7 @@ func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 	if err := UpdateRewritePlanDraft(ctx, d, RewritePlan{
 		ID:               baseID,
 		ValidationStatus: RewritePlanValidationValid,
-		Commits:          []RewritePlanCommit{{OldOID: "", ProposedMessage: "bad", OriginalMessage: "bad"}},
+		Groups:           []RewritePlanGroup{{Members: []RewritePlanMember{{OldOID: "", OriginalMessage: "bad"}}, ProposedMessage: "bad", GroupingReason: "bad"}},
 	}); err == nil {
 		t.Fatalf("invalid draft update returned nil error")
 	}
@@ -138,8 +138,8 @@ func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("reload after failed draft update: ok=%v err=%v", ok, err)
 	}
-	if len(afterFailedUpdate.Commits) != 2 {
-		t.Fatalf("failed update was not atomic; commits=%+v", afterFailedUpdate.Commits)
+	if len(afterFailedUpdate.Groups) != 2 {
+		t.Fatalf("failed update was not atomic; groups=%+v", afterFailedUpdate.Groups)
 	}
 }
 

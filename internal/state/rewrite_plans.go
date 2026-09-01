@@ -298,30 +298,39 @@ func ReconcileRewriteCommitOIDs(ctx context.Context, d *DB, oidMap map[string]st
 		return out, fmt.Errorf("state: begin rewrite oid reconciliation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS acd_rewrite_oid_map(old_oid TEXT PRIMARY KEY, new_oid TEXT NOT NULL)`); err != nil {
+		return out, fmt.Errorf("state: create rewrite oid map: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acd_rewrite_oid_map`); err != nil {
+		return out, fmt.Errorf("state: clear rewrite oid map: %w", err)
+	}
 	for oldOID, newOID := range oidMap {
 		if oldOID == "" || newOID == "" || oldOID == newOID {
 			continue
 		}
-		n, err := execCount(ctx, tx, `UPDATE capture_events SET commit_oid = ? WHERE commit_oid = ?`, newOID, oldOID)
-		if err != nil {
-			return out, fmt.Errorf("state: reconcile capture_events commit_oid: %w", err)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO acd_rewrite_oid_map(old_oid, new_oid) VALUES (?, ?)`, oldOID, newOID); err != nil {
+			return out, fmt.Errorf("state: populate rewrite oid map: %w", err)
 		}
-		out.CaptureEvents += n
-		n, err = execCount(ctx, tx, `UPDATE decision_records SET commit_oid = ? WHERE commit_oid = ?`, newOID, oldOID)
+	}
+	updates := []struct {
+		name  string
+		query string
+		out   *int64
+	}{
+		{"capture_events commit_oid", `UPDATE capture_events SET commit_oid = (SELECT new_oid FROM acd_rewrite_oid_map WHERE old_oid = capture_events.commit_oid) WHERE commit_oid IN (SELECT old_oid FROM acd_rewrite_oid_map)`, &out.CaptureEvents},
+		{"decision_records commit_oid", `UPDATE decision_records SET commit_oid = (SELECT new_oid FROM acd_rewrite_oid_map WHERE old_oid = decision_records.commit_oid) WHERE commit_oid IN (SELECT old_oid FROM acd_rewrite_oid_map)`, &out.DecisionRecords},
+		{"publish_state target_commit_oid", `UPDATE publish_state SET target_commit_oid = (SELECT new_oid FROM acd_rewrite_oid_map WHERE old_oid = publish_state.target_commit_oid) WHERE target_commit_oid IN (SELECT old_oid FROM acd_rewrite_oid_map)`, &out.PublishTargetCommitOID},
+		{"publish_state source_head", `UPDATE publish_state SET source_head = (SELECT new_oid FROM acd_rewrite_oid_map WHERE old_oid = publish_state.source_head) WHERE source_head IN (SELECT old_oid FROM acd_rewrite_oid_map)`, &out.PublishSourceHead},
+	}
+	for _, update := range updates {
+		n, err := execCount(ctx, tx, update.query)
 		if err != nil {
-			return out, fmt.Errorf("state: reconcile decision_records commit_oid: %w", err)
+			return out, fmt.Errorf("state: reconcile %s: %w", update.name, err)
 		}
-		out.DecisionRecords += n
-		n, err = execCount(ctx, tx, `UPDATE publish_state SET target_commit_oid = ? WHERE target_commit_oid = ?`, newOID, oldOID)
-		if err != nil {
-			return out, fmt.Errorf("state: reconcile publish_state target_commit_oid: %w", err)
-		}
-		out.PublishTargetCommitOID += n
-		n, err = execCount(ctx, tx, `UPDATE publish_state SET source_head = ? WHERE source_head = ?`, newOID, oldOID)
-		if err != nil {
-			return out, fmt.Errorf("state: reconcile publish_state source_head: %w", err)
-		}
-		out.PublishSourceHead += n
+		*update.out = n
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE acd_rewrite_oid_map`); err != nil {
+		return out, fmt.Errorf("state: drop rewrite oid map: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return out, fmt.Errorf("state: commit rewrite oid reconciliation: %w", err)
