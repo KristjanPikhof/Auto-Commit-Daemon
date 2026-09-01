@@ -153,6 +153,87 @@ func TestApplyRewritePlanPreservesOriginalAuthorMetadata(t *testing.T) {
 	}
 }
 
+func TestApplyRewritePlanGroupsAdjacentCommitsAndPreservesTree(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	old1 := commitWorktreePathWithEnv(t, ctx, repo, "one.txt", "one\n", "one", map[string]string{
+		"GIT_AUTHOR_NAME": "Original Author", "GIT_AUTHOR_EMAIL": "author@example.com", "GIT_AUTHOR_DATE": "2020-01-01T00:00:00+00:00",
+	})
+	old2 := commitWorktreePathWithEnv(t, ctx, repo, "two.txt", "two\n", "two", map[string]string{
+		"GIT_AUTHOR_NAME": "Original Author", "GIT_AUTHOR_EMAIL": "author@example.com", "GIT_AUTHOR_DATE": "2020-01-02T00:00:00+00:00",
+	})
+	old3 := commitWorktreePath(t, ctx, repo, "three.txt", "three\n", "three")
+	originalTree, err := commitTreeOID(ctx, repo, old3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ApplyRewritePlan(ctx, repo, RewriteApplyOptions{
+		BranchRef:    "refs/heads/main",
+		ExpectedHead: old3,
+		Groups: []RewriteApplyGroup{{
+			OldOIDs:         []string{old1, old2},
+			ProposedMessage: "Group related history changes",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyRewritePlan grouped: %v", err)
+	}
+	if res.CommitMap[old1] == "" || res.CommitMap[old1] != res.CommitMap[old2] {
+		t.Fatalf("many-to-one map=%+v", res.CommitMap)
+	}
+	if res.SelectedInputCount != 2 || res.SelectedOutputCount != 1 || res.UnchangedDescendantCount != 1 {
+		t.Fatalf("counts=%+v", res)
+	}
+	if subjects := commitSubjectsNewestFirst(t, ctx, repo, "HEAD", 2); strings.Join(subjects, ",") != "three,Group related history changes" {
+		t.Fatalf("subjects=%v", subjects)
+	}
+	newTree, err := commitTreeOID(ctx, repo, "HEAD")
+	if err != nil || newTree != originalTree {
+		t.Fatalf("tree=%s err=%v want %s", newTree, err, originalTree)
+	}
+	author, err := Run(ctx, RunOpts{Dir: repo, Timeout: DefaultReadTimeout}, "show", "-s", "--format=%aI", res.CommitMap[old2])
+	if err != nil || strings.TrimSpace(string(author)) != "2020-01-02T00:00:00Z" {
+		t.Fatalf("group author date=%q err=%v", author, err)
+	}
+}
+
+func TestValidateRewriteGroupSemanticsRejectsMixedAuthorsAndEmptyNetChange(t *testing.T) {
+	t.Run("mixed authors", func(t *testing.T) {
+		repo := initRepo(t)
+		ctx := context.Background()
+		one := commitWorktreePathWithEnv(t, ctx, repo, "one.txt", "one\n", "one", map[string]string{"GIT_AUTHOR_NAME": "One", "GIT_AUTHOR_EMAIL": "one@example.com"})
+		two := commitWorktreePathWithEnv(t, ctx, repo, "two.txt", "two\n", "two", map[string]string{"GIT_AUTHOR_NAME": "Two", "GIT_AUTHOR_EMAIL": "two@example.com"})
+		err := ValidateRewriteGroupSemantics(ctx, repo, []RewriteApplyGroup{{OldOIDs: []string{one, two}, ProposedMessage: "Group commits"}})
+		if err == nil || !strings.Contains(err.Error(), "author boundary") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+
+	t.Run("empty net change", func(t *testing.T) {
+		repo := initRepo(t)
+		ctx := context.Background()
+		one := commitWorktreePath(t, ctx, repo, "temp.txt", "temporary\n", "add temporary file")
+		if err := os.Remove(filepath.Join(repo, "temp.txt")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Run(ctx, RunOpts{Dir: repo, Timeout: DefaultWriteTimeout}, "add", "temp.txt"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Run(ctx, RunOpts{Dir: repo, Timeout: DefaultWriteTimeout}, "commit", "-q", "-m", "remove temporary file"); err != nil {
+			t.Fatal(err)
+		}
+		two, err := RevParse(ctx, repo, "HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = ValidateRewriteGroupSemantics(ctx, repo, []RewriteApplyGroup{{OldOIDs: []string{one, two}, ProposedMessage: "Remove temporary experiment"}})
+		if err == nil || !strings.Contains(err.Error(), "no net tree change") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+}
+
 func TestApplyRewritePlanRefusesMovedHeadWithoutBackup(t *testing.T) {
 	repo := initRepo(t)
 	ctx := context.Background()
