@@ -853,24 +853,24 @@ func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strat
 // names so the JSON shape matches the contract regardless of struct
 // renames.
 type subprocessRequest struct {
-	Version               int                          `json:"version"`
-	RequestVersion        int                          `json:"request_version,omitempty"`
-	RequestType           string                       `json:"request_type,omitempty"`
-	PlannerProtocol       string                       `json:"planner_protocol,omitempty"`
-	CommitFormat          CommitFormat                 `json:"commit_format,omitempty"`
-	Path                  string                       `json:"path,omitempty"`
-	Op                    string                       `json:"op,omitempty"`
-	OldPath               string                       `json:"old_path,omitempty"`
-	Diff                  string                       `json:"diff,omitempty"`
-	RepoRoot              string                       `json:"repo_root,omitempty"`
-	Branch                string                       `json:"branch,omitempty"`
-	MultiOp               []subprocessOp               `json:"multi_op,omitempty"`
-	Now                   string                       `json:"now,omitempty"`
-	PlannerRequest        *IntentPlanRequest           `json:"planner_request,omitempty"`
-	PlannerRequestV2      *IntentPlanRequestV2         `json:"planner_request_v2,omitempty"`
-	MessageRewriteRequest *IntentMessageRewriteRequest `json:"message_rewrite_request,omitempty"`
-	CommitRewriteRequest  *CommitRewriteRequest        `json:"commit_rewrite_request,omitempty"`
-	HistoryRewritePlanRequest *HistoryRewritePlanRequest `json:"history_rewrite_plan_request,omitempty"`
+	Version                   int                          `json:"version"`
+	RequestVersion            int                          `json:"request_version,omitempty"`
+	RequestType               string                       `json:"request_type,omitempty"`
+	PlannerProtocol           string                       `json:"planner_protocol,omitempty"`
+	CommitFormat              CommitFormat                 `json:"commit_format,omitempty"`
+	Path                      string                       `json:"path,omitempty"`
+	Op                        string                       `json:"op,omitempty"`
+	OldPath                   string                       `json:"old_path,omitempty"`
+	Diff                      string                       `json:"diff,omitempty"`
+	RepoRoot                  string                       `json:"repo_root,omitempty"`
+	Branch                    string                       `json:"branch,omitempty"`
+	MultiOp                   []subprocessOp               `json:"multi_op,omitempty"`
+	Now                       string                       `json:"now,omitempty"`
+	PlannerRequest            *IntentPlanRequest           `json:"planner_request,omitempty"`
+	PlannerRequestV2          *IntentPlanRequestV2         `json:"planner_request_v2,omitempty"`
+	MessageRewriteRequest     *IntentMessageRewriteRequest `json:"message_rewrite_request,omitempty"`
+	CommitRewriteRequest      *CommitRewriteRequest        `json:"commit_rewrite_request,omitempty"`
+	HistoryRewritePlanRequest *HistoryRewritePlanRequest   `json:"history_rewrite_plan_request,omitempty"`
 }
 
 // subprocessOp mirrors OpItem on the wire (field tags decouple the wire
@@ -883,18 +883,18 @@ type subprocessOp struct {
 
 // subprocessResponse is the JSONL response envelope.
 type subprocessResponse struct {
-	Version         int                 `json:"version"`
-	Capabilities    []string            `json:"capabilities,omitempty"`
-	PlannerProtocol string              `json:"planner_protocol,omitempty"`
-	IntentPlanV2    json.RawMessage     `json:"intent_plan_v2,omitempty"`
-	Subject         string              `json:"subject"`
-	Body            string              `json:"body"`
-	Error           string              `json:"error"`
-	SelectedSeqs    []int64             `json:"selected_seqs,omitempty"`
-	DeferredSeqs    []int64             `json:"deferred_seqs,omitempty"`
-	GroupingReason  string              `json:"grouping_reason,omitempty"`
-	DeferredReasons []DeferredReason    `json:"deferred_reasons,omitempty"`
-	CommitGroups    []IntentCommitGroup `json:"commit_groups,omitempty"`
+	Version            int                 `json:"version"`
+	Capabilities       []string            `json:"capabilities,omitempty"`
+	PlannerProtocol    string              `json:"planner_protocol,omitempty"`
+	IntentPlanV2       json.RawMessage     `json:"intent_plan_v2,omitempty"`
+	Subject            string              `json:"subject"`
+	Body               string              `json:"body"`
+	Error              string              `json:"error"`
+	SelectedSeqs       []int64             `json:"selected_seqs,omitempty"`
+	DeferredSeqs       []int64             `json:"deferred_seqs,omitempty"`
+	GroupingReason     string              `json:"grouping_reason,omitempty"`
+	DeferredReasons    []DeferredReason    `json:"deferred_reasons,omitempty"`
+	CommitGroups       []IntentCommitGroup `json:"commit_groups,omitempty"`
 	HistoryRewritePlan *HistoryRewritePlan `json:"history_rewrite_plan,omitempty"`
 }
 
