@@ -17,7 +17,7 @@ type RewriteApplyCommit struct {
 
 // RewriteApplyGroup replaces one or more adjacent commits with one commit.
 type RewriteApplyGroup struct {
-	OldOIDs        []string
+	OldOIDs         []string
 	ProposedMessage string
 }
 
@@ -28,10 +28,10 @@ type RewriteApplyOptions struct {
 	PlanID       string
 	Groups       []RewriteApplyGroup
 	// Commits is retained for callers applying legacy message-only plans.
-	Commits      []RewriteApplyCommit
-	DryRun       bool
-	Now          time.Time
-	Progress     func(RewriteApplyProgress) error
+	Commits  []RewriteApplyCommit
+	DryRun   bool
+	Now      time.Time
+	Progress func(RewriteApplyProgress) error
 }
 
 // RewriteApplyProgress reports durable milestones during rewrite apply.
@@ -49,14 +49,14 @@ type RewriteApplyProgress struct {
 // apply. Mapping includes selected commits and newer unchanged commits that had
 // to be recreated with remapped parents.
 type RewriteApplyResult struct {
-	OldHead           string
-	NewHead           string
-	BackupBranchRef   string
-	InternalBackupRef string
-	CommitMap         map[string]string
-	RecreatedCount    int
-	SelectedInputCount int
-	SelectedOutputCount int
+	OldHead                  string
+	NewHead                  string
+	BackupBranchRef          string
+	InternalBackupRef        string
+	CommitMap                map[string]string
+	RecreatedCount           int
+	SelectedInputCount       int
+	SelectedOutputCount      int
 	UnchangedDescendantCount int
 }
 
