@@ -140,7 +140,7 @@ func scanRewriteEditBlock(s *bufio.Scanner, marker string) (string, error) {
 }
 
 type rewritePlanEditJSON struct {
-	PlanID string                       `json:"plan_id"`
+	PlanID string                     `json:"plan_id"`
 	Groups []rewritePlanEditJSONGroup `json:"groups"`
 }
 
