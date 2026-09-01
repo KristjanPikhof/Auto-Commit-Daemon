@@ -4,6 +4,16 @@
 
 ### Changed
 
+- `acd history rewrite` now groups adjacent, same-author commits by intent and
+  proposes one message per resulting commit. The preview shows the selected and
+  resulting counts, member commits, and grouping reasons. Use
+  `--messages-only` to preserve every existing commit boundary. Saved plan
+  editors can change adjacent group boundaries without allowing commit reorder,
+  omission, mixed authors, or empty net changes.
+- Grouped rewrite apply maps every old member OID to its new grouped commit,
+  verifies the final tree before moving the branch, and reconciles ACD records
+  with a set-based many-to-one update. Existing saved message-only plans remain
+  usable. Repository state schema is now v26.
 - History rewrite checks Intent mode and the commit message provider before it
   prints the selected commits. If setup blocks planning, the error names the
   effective provider and its scope, confirms that Git history is unchanged,

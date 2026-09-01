@@ -124,6 +124,10 @@ Creating a new rewrite plan requires Intent mode and an explicitly configured
 non-deterministic AI provider that can plan commits. Showing, editing, or
 applying an existing saved plan makes no new AI call.
 
+History rewrite groups adjacent commits by intent unless you pass
+`--messages-only`. Its preview shows the selected and resulting commit counts,
+group membership, messages, and grouping reasons before any history changes.
+
 Checkpoint prefixes are accepted only when unique. Restore is full-checkpoint
 only. Preview reports create, modify, delete, mode, symlink, untracked-overwrite
 and staged-overlap counts. Apply revalidates the plan digest, `HEAD` token,

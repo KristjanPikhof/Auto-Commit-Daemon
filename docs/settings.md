@@ -69,7 +69,9 @@ acd config edit --repo . --inherit
 
 The preview states whether it will save a repository override, update global
 defaults, or remove an override. Local rules need no AI or network access, but
-they cannot generate a history rewrite plan.
+they cannot generate a history rewrite plan. OpenAI-compatible providers can
+group selected history by default. Local subprocess providers must support the
+grouped history request, or you can use `acd history rewrite --messages-only`.
 
 ## Credentials and privacy
 
