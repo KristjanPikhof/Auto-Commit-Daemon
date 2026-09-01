@@ -60,6 +60,21 @@ func TestCheckRewritePlanGenerationGate(t *testing.T) {
 	}
 }
 
+func TestCheckHistoryRewritePlanGenerationGate(t *testing.T) {
+	cfg := ProviderConfig{CommitStrategy: CommitStrategyIntent, Mode: "openai-compat"}
+	provider := Compose(staticRewritePlannerProvider{name: "openai-compat"}, DeterministicProvider{})
+	if err := CheckHistoryRewritePlanGenerationGate(cfg, provider, false); err != nil {
+		t.Fatalf("grouped gate: %v", err)
+	}
+	if err := CheckHistoryRewritePlanGenerationGate(cfg, provider, true); err != nil {
+		t.Fatalf("messages-only gate: %v", err)
+	}
+	missing := Compose(intentOnlyRewritePlannerProvider{name: "openai-compat"}, DeterministicProvider{})
+	if err := CheckHistoryRewritePlanGenerationGate(cfg, missing, false); !errors.Is(err, ErrRewriteProviderCannotPlan) {
+		t.Fatalf("missing grouped capability error=%v", err)
+	}
+}
+
 type rewriteGenerateOnlyProvider struct{ name string }
 
 func (p rewriteGenerateOnlyProvider) Name() string { return p.name }
@@ -77,5 +92,23 @@ func (p staticRewritePlannerProvider) Generate(_ context.Context, _ CommitContex
 }
 
 func (p staticRewritePlannerProvider) PlanIntent(_ context.Context, req IntentPlanRequest) (IntentPlan, error) {
+	return IntentPlan{SelectedSeqs: []int64{req.OfferedCaptures[0].Seq}, Subject: "test", Source: p.name}, nil
+}
+
+func (p staticRewritePlannerProvider) ProposeCommitRewrite(_ context.Context, _ CommitRewriteRequest) (Result, error) {
+	return Result{Subject: "Rewrite test commit", Source: p.name}, nil
+}
+
+func (p staticRewritePlannerProvider) ProposeHistoryRewritePlan(_ context.Context, req HistoryRewritePlanRequest) (HistoryRewritePlan, error) {
+	return HistoryRewritePlan{Groups: []HistoryRewriteGroup{{OldOIDs: []string{req.Commits[0].OldOID}, Subject: "Rewrite test history", GroupingReason: "test"}}, Source: p.name}, nil
+}
+
+type intentOnlyRewritePlannerProvider struct{ name string }
+
+func (p intentOnlyRewritePlannerProvider) Name() string { return p.name }
+func (p intentOnlyRewritePlannerProvider) Generate(_ context.Context, _ CommitContext) (Result, error) {
+	return Result{Subject: "test", Source: p.name}, nil
+}
+func (p intentOnlyRewritePlannerProvider) PlanIntent(_ context.Context, req IntentPlanRequest) (IntentPlan, error) {
 	return IntentPlan{SelectedSeqs: []int64{req.OfferedCaptures[0].Seq}, Subject: "test", Source: p.name}, nil
 }

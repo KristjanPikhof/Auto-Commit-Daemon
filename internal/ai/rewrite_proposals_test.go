@@ -102,3 +102,80 @@ func TestValidateCommitRewriteProposalConventional(t *testing.T) {
 		t.Fatalf("subject=%q", got.Subject)
 	}
 }
+
+func TestValidateHistoryRewritePlanAcceptsOrderedSameAuthorGroups(t *testing.T) {
+	req := HistoryRewritePlanRequest{
+		CommitFormat: CommitFormatImperative,
+		Commits: []HistoryRewriteCommit{
+			{OldOID: "one", AuthorName: "Dev", AuthorEmail: "dev@example.com", ChangedPaths: []string{"a.go"}},
+			{OldOID: "two", AuthorName: "Dev", AuthorEmail: "dev@example.com", ChangedPaths: []string{"a_test.go"}},
+			{OldOID: "three", AuthorName: "Dev", AuthorEmail: "dev@example.com", ChangedPaths: []string{"notes.md"}},
+		},
+	}
+	got, err := ValidateHistoryRewritePlan(req, HistoryRewritePlan{Groups: []HistoryRewriteGroup{
+		{OldOIDs: []string{"one", "two"}, Subject: "Add grouped rewrite behavior", GroupingReason: "implementation and test"},
+		{OldOIDs: []string{"three"}, Subject: "Document grouped rewrites", GroupingReason: "separate documentation"},
+	}})
+	if err != nil {
+		t.Fatalf("ValidateHistoryRewritePlan: %v", err)
+	}
+	if len(got.Groups) != 2 || len(got.Groups[0].OldOIDs) != 2 || got.Groups[1].OldOIDs[0] != "three" {
+		t.Fatalf("groups=%+v", got.Groups)
+	}
+}
+
+func TestValidateHistoryRewritePlanRejectsInvalidPartitions(t *testing.T) {
+	req := HistoryRewritePlanRequest{Commits: []HistoryRewriteCommit{
+		{OldOID: "one", AuthorName: "Dev", AuthorEmail: "dev@example.com"},
+		{OldOID: "two", AuthorName: "Other", AuthorEmail: "other@example.com"},
+		{OldOID: "three", AuthorName: "Dev", AuthorEmail: "dev@example.com"},
+	}}
+	tests := []struct {
+		name   string
+		groups []HistoryRewriteGroup
+		want   string
+	}{
+		{"missing", []HistoryRewriteGroup{{OldOIDs: []string{"one"}, Subject: "Keep ordered commits", GroupingReason: "test"}}, "included 1 of 3"},
+		{"reordered", []HistoryRewriteGroup{{OldOIDs: []string{"two"}, Subject: "Keep ordered commits", GroupingReason: "test"}}, "exactly once in chronological order"},
+		{"duplicate", []HistoryRewriteGroup{{OldOIDs: []string{"one", "one"}, Subject: "Keep ordered commits", GroupingReason: "test"}}, "exactly once in chronological order"},
+		{"mixed author", []HistoryRewriteGroup{{OldOIDs: []string{"one", "two"}, Subject: "Keep ordered commits", GroupingReason: "test"}, {OldOIDs: []string{"three"}, Subject: "Keep last commit", GroupingReason: "test"}}, "author boundary"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ValidateHistoryRewritePlan(req, HistoryRewritePlan{Groups: tt.groups})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error=%v want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildHistoryRewriteUserPromptRejectsOversizedRequest(t *testing.T) {
+	req := HistoryRewritePlanRequest{Commits: []HistoryRewriteCommit{{
+		OldOID:          "one",
+		OriginalMessage: strings.Repeat("x", HistoryRewriteRequestByteCap),
+	}}}
+	if _, err := BuildHistoryRewriteUserPrompt(req); err == nil || !strings.Contains(err.Error(), "select a smaller commit range") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestOpenAIHistoryRewriteRequestUsesStructuredTool(t *testing.T) {
+	body, err := buildOpenAIHistoryRewritePlanRequest("test-model", HistoryRewritePlanRequest{Commits: []HistoryRewriteCommit{{OldOID: "one", AuthorName: "Dev", AuthorEmail: "dev@example.com"}}})
+	if err != nil {
+		t.Fatalf("buildOpenAIHistoryRewritePlanRequest: %v", err)
+	}
+	var request struct {
+		Tools []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	if len(request.Tools) != 1 || request.Tools[0].Function.Name != "history_rewrite_plan" {
+		t.Fatalf("tools=%+v", request.Tools)
+	}
+}
