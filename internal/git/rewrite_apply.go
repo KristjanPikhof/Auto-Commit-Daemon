@@ -143,9 +143,13 @@ func ApplyRewritePlan(ctx context.Context, repoDir string, opts RewriteApplyOpti
 		newParent = newOID
 		res.RecreatedCount++
 		res.SelectedOutputCount++
+		commitLabel := "commits"
+		if len(group.OldOIDs) == 1 {
+			commitLabel = "commit"
+		}
 		if err := emitRewriteApplyProgress(opts, RewriteApplyProgress{
 			Phase:   "recreate_selected",
-			Message: fmt.Sprintf("grouped %d selected commit(s)", len(group.OldOIDs)),
+			Message: fmt.Sprintf("grouped %d selected %s", len(group.OldOIDs), commitLabel),
 			Current: i + 1,
 			Total:   len(opts.Groups),
 			OldOID:  group.OldOIDs[0],
