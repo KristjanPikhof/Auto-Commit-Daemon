@@ -188,6 +188,61 @@ func TestRewriteCommitsPlanGenerationUsesPersistedSettings(t *testing.T) {
 	}
 }
 
+func TestRewriteCommitsGroupsHistoryByDefault(t *testing.T) {
+	withIsolatedHome(t)
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	for _, spec := range []struct{ path, body, message string }{
+		{"feature.go", "package feature\n", "update feature"},
+		{"feature_test.go", "package feature\n", "update feature tests"},
+	} {
+		writeRewriteTestFile(t, repo, spec.path, spec.body)
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultWriteTimeout}, "add", spec.path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultWriteTimeout}, "commit", "-q", "-m", spec.message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	script := `#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    commits = req['history_rewrite_plan_request']['commits']
+    groups = [
+        {'old_oids': [commits[0]['old_oid']], 'subject': 'Keep seed history', 'grouping_reason': 'repository seed'},
+        {'old_oids': [commits[1]['old_oid'], commits[2]['old_oid']], 'subject': 'Add feature behavior', 'grouping_reason': 'implementation and tests'},
+    ]
+    print(json.dumps({'version': 1, 'history_rewrite_plan': {'groups': groups}}), flush=True)
+`
+	if err := os.WriteFile(provider, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "intent")
+	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
+
+	var out bytes.Buffer
+	err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 3}, planOnly: true}, false)
+	if err != nil {
+		t.Fatalf("grouped plan: %v\n%s", err, out.String())
+	}
+	for _, want := range []string{"Selected commits: 3", "Resulting commits: 2", "Commit reduction: 1", "Group 2: Add feature behavior"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, out.String())
+		}
+	}
+	planID := parseRewritePlanIDAfter(t, out.String(), "Generated valid rewrite plan")
+	db := openRewritePlanTestDB(t, ctx, repo)
+	defer db.Close()
+	plan, ok, err := state.LoadRewritePlan(ctx, db, planID)
+	if err != nil || !ok || len(plan.Groups) != 2 || len(plan.Groups[1].Members) != 2 {
+		t.Fatalf("saved plan ok=%v err=%v plan=%+v", ok, err, plan)
+	}
+}
+
 func TestRewriteCommitsSavedPlanBypassesProviderGate(t *testing.T) {
 	t.Setenv(ai.EnvCommitStrategy, "event")
 	t.Setenv(ai.EnvProvider, "")
@@ -1241,6 +1296,35 @@ func TestRewritePlanJSONEditRoundTripAndValidation(t *testing.T) {
 	trailing := append(append([]byte{}, rendered...), []byte("\n{}")...)
 	if _, err := parseRewritePlanEdit(trailing, rewriteEditFormatJSON, plan); err == nil || !strings.Contains(err.Error(), "trailing") {
 		t.Fatalf("parse trailing json err = %v, want trailing-data validation", err)
+	}
+}
+
+func TestRewritePlanJSONEditCanMergeAdjacentGroups(t *testing.T) {
+	plan := rewritePlanEditTestPlan()
+	doc := rewritePlanEditJSON{
+		PlanID: plan.ID,
+		Groups: []rewritePlanEditJSONGroup{{
+			OldOIDs:        []string{"abc123", "def456"},
+			GroupingReason: "implementation and follow-up",
+			Message:        "Combine related history changes",
+		}},
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, err := parseRewritePlanEdit(raw, rewriteEditFormatJSON, plan)
+	if err != nil {
+		t.Fatalf("parse merged groups: %v", err)
+	}
+	if len(groups) != 1 || len(groups[0].Members) != 2 {
+		t.Fatalf("groups=%+v", groups)
+	}
+
+	doc.Groups[0].OldOIDs = []string{"def456", "abc123"}
+	raw, _ = json.Marshal(doc)
+	if _, err := parseRewritePlanEdit(raw, rewriteEditFormatJSON, plan); err == nil || !strings.Contains(err.Error(), "want") {
+		t.Fatalf("reordered membership error=%v", err)
 	}
 }
 
