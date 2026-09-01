@@ -1261,6 +1261,27 @@ func TestRewritePlanTextEditRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestRewritePlanTextEditCanMergeAdjacentGroups(t *testing.T) {
+	plan := rewritePlanEditTestPlan()
+	edited := `group 1
+commit abc123
+commit def456
+reason <<ACD_GROUP_REASON
+implementation and follow-up
+ACD_GROUP_REASON
+message <<ACD_COMMIT_MESSAGE
+Combine related history changes
+ACD_COMMIT_MESSAGE
+`
+	groups, err := parseRewritePlanEdit([]byte(edited), rewriteEditFormatText, plan)
+	if err != nil {
+		t.Fatalf("parse merged text groups: %v", err)
+	}
+	if len(groups) != 1 || len(groups[0].Members) != 2 {
+		t.Fatalf("groups=%+v", groups)
+	}
+}
+
 func TestRewritePlanJSONEditRoundTripAndValidation(t *testing.T) {
 	plan := rewritePlanEditTestPlan()
 	rendered, err := renderRewritePlanEdit(plan, rewriteEditFormatJSON)
