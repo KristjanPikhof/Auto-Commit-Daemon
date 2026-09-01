@@ -63,6 +63,48 @@ func TestRewritePlanSaveLoadAndApplyStatus(t *testing.T) {
 	}
 }
 
+func TestRewritePlanGroupedRoundTrip(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	id, err := SaveRewritePlan(ctx, d, RewritePlan{
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     "head-grouped",
+		ValidationStatus: RewritePlanValidationValid,
+		Groups: []RewritePlanGroup{{
+			Members: []RewritePlanMember{
+				{OldOID: "old-one", OriginalMessage: "one"},
+				{OldOID: "old-two", OriginalMessage: "two"},
+			},
+			ProposedMessage: "Group related changes",
+			GroupingReason:  "implementation and tests",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SaveRewritePlan: %v", err)
+	}
+	got, ok, err := LoadRewritePlan(ctx, d, id)
+	if err != nil || !ok {
+		t.Fatalf("LoadRewritePlan: ok=%v err=%v", ok, err)
+	}
+	if len(got.Groups) != 1 || len(got.Groups[0].Members) != 2 || got.Groups[0].Members[1].OldOID != "old-two" {
+		t.Fatalf("groups=%+v", got.Groups)
+	}
+	if len(got.Commits) != 0 {
+		t.Fatalf("legacy commits leaked into canonical plan: %+v", got.Commits)
+	}
+}
+
+func TestRewritePlanGroupsRejectsAmbiguousLegacyAndGroupedPlan(t *testing.T) {
+	_, err := RewritePlanGroups(RewritePlan{
+		Groups:  []RewritePlanGroup{{Members: []RewritePlanMember{{OldOID: "one", OriginalMessage: "one"}}, ProposedMessage: "one", GroupingReason: "one"}},
+		Commits: []RewritePlanCommit{{OldOID: "one", OriginalMessage: "one", ProposedMessage: "one"}},
+	})
+	if err == nil {
+		t.Fatal("ambiguous plan accepted")
+	}
+}
+
 func TestRewritePlanEditedRevisionAndDraftUpdateAreAtomic(t *testing.T) {
 	t.Parallel()
 	d, _ := openTestDB(t)
@@ -183,6 +225,29 @@ VALUES (1, 1, 'refs/heads/main', 1, 'old-a', 'old-b', 'published', 1);
 	var unrelated int
 	if err := d.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE commit_oid = 'unrelated'`).Scan(&unrelated); err != nil || unrelated != 1 {
 		t.Fatalf("unrelated capture event changed: n=%d err=%v", unrelated, err)
+	}
+}
+
+func TestReconcileRewriteCommitOIDsSupportsManyToOneWithoutCascading(t *testing.T) {
+	t.Parallel()
+	d, _ := openTestDB(t)
+	ctx := context.Background()
+	if _, err := d.SQL().ExecContext(ctx, `
+INSERT INTO decision_records(decision_ts, kind, commit_oid, branch_ref)
+VALUES (1, 'test', 'old-a', 'refs/heads/main'),
+       (2, 'test', 'old-b', 'refs/heads/main');`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ReconcileRewriteCommitOIDs(ctx, d, map[string]string{"old-a": "grouped", "old-b": "grouped"})
+	if err != nil {
+		t.Fatalf("ReconcileRewriteCommitOIDs: %v", err)
+	}
+	if res.DecisionRecords != 2 {
+		t.Fatalf("counts=%+v", res)
+	}
+	var grouped int
+	if err := d.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM decision_records WHERE commit_oid = 'grouped'`).Scan(&grouped); err != nil || grouped != 2 {
+		t.Fatalf("grouped rows=%d err=%v", grouped, err)
 	}
 }
 
