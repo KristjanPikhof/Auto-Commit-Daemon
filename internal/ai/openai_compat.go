@@ -103,6 +103,40 @@ func openAICommitMessageParameters(format CommitFormat) map[string]any {
 	}
 }
 
+func openAIHistoryRewritePlanParameters(format CommitFormat) map[string]any {
+	subject := openAICommitMessageParameters(format)["properties"].(map[string]any)["subject"]
+	body := openAICommitMessageParameters(format)["properties"].(map[string]any)["body"]
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"groups": map[string]any{
+				"type":     "array",
+				"minItems": 1,
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"old_oids": map[string]any{
+							"type":     "array",
+							"minItems": 1,
+							"items":    map[string]any{"type": "string"},
+						},
+						"subject": subject,
+						"body":    body,
+						"grouping_reason": map[string]any{
+							"type":        "string",
+							"description": "Why these adjacent commits form one coherent and independently revertible change.",
+						},
+					},
+					"required":             []string{"old_oids", "subject", "grouping_reason"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		"required":             []string{"groups"},
+		"additionalProperties": false,
+	}
+}
+
 func openAIIntentPlanParameters(format CommitFormat) map[string]any {
 	subjectDescription := "Final commit subject for selected captures: imperative verb plus semantic change, <= 50 chars, no trailing period, avoid filenames unless the file itself changed."
 	if effectiveCommitFormat(format) == CommitFormatConventional {
@@ -1070,6 +1104,79 @@ func (p *OpenAIProvider) ProposeCommitRewrite(ctx context.Context, rewriteReq Co
 	return result, nil
 }
 
+// ProposeHistoryRewritePlan groups and rewrites a selected linear history in
+// one structured provider request.
+func (p *OpenAIProvider) ProposeHistoryRewritePlan(ctx context.Context, planReq HistoryRewritePlanRequest) (HistoryRewritePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return HistoryRewritePlan{}, err
+	}
+	if strings.TrimSpace(p.APIKey) == "" {
+		return HistoryRewritePlan{}, errors.New("openai-compat: missing API key")
+	}
+	baseURL, err := normalizeOpenAIBaseURL(p.BaseURL, false)
+	if err != nil {
+		return HistoryRewritePlan{}, err
+	}
+	model := p.Model
+	if model == "" {
+		model = DefaultOpenAIModel
+	}
+	body, err := buildOpenAIHistoryRewritePlanRequest(model, planReq)
+	if err != nil {
+		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: build history rewrite plan request: %w", err)
+	}
+	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	if err != nil {
+		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: build endpoint: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+	httpClient := p.HTTP
+	if httpClient == nil {
+		httpClient = defaultOpenAIClient()
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: http: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: read body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+	}
+	plan, err := parseHistoryRewritePlanToolCall(raw)
+	if err != nil {
+		return HistoryRewritePlan{}, err
+	}
+	plan.Source = p.Name()
+	return ValidateHistoryRewritePlan(planReq, plan)
+}
+
+func buildOpenAIHistoryRewritePlanRequest(model string, planReq HistoryRewritePlanRequest) ([]byte, error) {
+	planReq.CommitFormat = effectiveCommitFormat(planReq.CommitFormat)
+	userPrompt, err := BuildHistoryRewriteUserPrompt(planReq)
+	if err != nil {
+		return nil, err
+	}
+	return marshalOpenAIToolRequest(openAIToolRequestOptions{
+		Model:           model,
+		SystemPrompt:    "You group and rewrite an existing linear git history. Always call the history_rewrite_plan function. " + CommitMessageFormatInstructions(planReq.CommitFormat),
+		UserPrompt:      userPrompt,
+		ToolName:        "history_rewrite_plan",
+		ToolDescription: "Partition the selected commits into ordered semantic groups and provide each resulting commit message.",
+		Parameters:      openAIHistoryRewritePlanParameters(planReq.CommitFormat),
+		Temperature:     0.2,
+	})
+}
+
 func buildOpenAICommitRewriteRequest(model string, rewriteReq CommitRewriteRequest) ([]byte, error) {
 	rewriteReq.CommitFormat = effectiveCommitFormat(rewriteReq.CommitFormat)
 	userPrompt, err := BuildCommitRewriteUserPrompt(rewriteReq)
@@ -1177,6 +1284,62 @@ func parseToolCall(raw []byte) (subject string, body string, err error) {
 		return "", "", errors.New("openai-compat: tool call returned empty subject")
 	}
 	return fa.Subject, fa.Body, nil
+}
+
+func parseHistoryRewritePlanToolCall(raw []byte) (HistoryRewritePlan, error) {
+	args, err := parseNamedToolArguments(raw, "history_rewrite_plan")
+	if err != nil {
+		return HistoryRewritePlan{}, err
+	}
+	var plan HistoryRewritePlan
+	dec := json.NewDecoder(strings.NewReader(args))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&plan); err != nil {
+		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: parse history rewrite plan arguments: %w", err)
+	}
+	return plan, nil
+}
+
+func parseNamedToolArguments(raw []byte, expectedName string) (string, error) {
+	type functionCall struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
+	type response struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					Function functionCall `json:"function"`
+				} `json:"tool_calls"`
+				FunctionCall *functionCall `json:"function_call"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	var parsed response
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", fmt.Errorf("openai-compat: parse response: %w", err)
+	}
+	if parsed.Error != nil && parsed.Error.Message != "" {
+		return "", fmt.Errorf("openai-compat: api error: %s", parsed.Error.Message)
+	}
+	if len(parsed.Choices) == 0 {
+		return "", errors.New("openai-compat: no choices in response")
+	}
+	message := parsed.Choices[0].Message
+	call := message.FunctionCall
+	if len(message.ToolCalls) > 0 {
+		call = &message.ToolCalls[0].Function
+	}
+	if call == nil || call.Arguments == "" {
+		return "", errors.New("openai-compat: response carried no tool_call arguments")
+	}
+	if call.Name != expectedName {
+		return "", fmt.Errorf("openai-compat: unexpected tool %q", call.Name)
+	}
+	return call.Arguments, nil
 }
 
 func parseIntentPlanToolCall(raw []byte) (IntentPlan, error) {
