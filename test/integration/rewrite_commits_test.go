@@ -90,6 +90,43 @@ func TestRewriteCommitsApplyPlanCLI(t *testing.T) {
 	}
 }
 
+func TestRewriteCommitsApplyGroupedPlanCLI(t *testing.T) {
+	repo := tempRepo(t)
+	one := rewriteIntegrationCommit(t, repo, "one.txt", "one\n", "one")
+	two := rewriteIntegrationCommit(t, repo, "two.txt", "two\n", "two")
+	three := rewriteIntegrationCommit(t, repo, "three.txt", "three\n", "three")
+	originalTree := strings.TrimSpace(runGitOK(t, repo, "show", "-s", "--format=%T", "HEAD"))
+	planPath := filepath.Join(t.TempDir(), "rewrite-grouped.json")
+	writeIntegrationRewritePlan(t, planPath, state.RewritePlan{
+		ID:               "rp_grouped_integration",
+		BranchRef:        "refs/heads/main",
+		ExpectedHead:     three,
+		ValidationStatus: state.RewritePlanValidationValid,
+		Groups: []state.RewritePlanGroup{{
+			Members: []state.RewritePlanMember{
+				{OldOID: one, OriginalMessage: "one"},
+				{OldOID: two, OriginalMessage: "two"},
+			},
+			ProposedMessage: "Group related integration changes",
+			GroupingReason:  "adjacent implementation changes",
+		}},
+	})
+
+	res := runAcd(t, context.Background(), withIsolatedHome(t), "--repo", repo, "history", "rewrite", "--apply", planPath, "--yes")
+	if res.ExitCode != 0 {
+		t.Fatalf("acd grouped apply failed exit=%d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	if !strings.Contains(res.Stdout, "Selected commits: 2 -> 1") || !strings.Contains(res.Stdout, "Later commits recreated unchanged: 1") {
+		t.Fatalf("grouped apply output missing counts:\n%s", res.Stdout)
+	}
+	if got := strings.TrimSpace(runGitOK(t, repo, "log", "--format=%s", "-n", "2")); got != "three\nGroup related integration changes" {
+		t.Fatalf("rewritten log subjects:\n%s", got)
+	}
+	if got := strings.TrimSpace(runGitOK(t, repo, "show", "-s", "--format=%T", "HEAD")); got != originalTree {
+		t.Fatalf("rewritten tree=%s want %s", got, originalTree)
+	}
+}
+
 func TestRewriteCommitsApplyPlanCLIRefusesMovedHead(t *testing.T) {
 	repo := tempRepo(t)
 	one := rewriteIntegrationCommit(t, repo, "one.txt", "one\n", "one")
