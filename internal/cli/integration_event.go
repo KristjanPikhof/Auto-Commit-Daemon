@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -312,6 +313,12 @@ func logIntegrationSessionOpenFailure(event integrationEvent, cause error) {
 		return
 	}
 	defer file.Close()
-	_, _ = fmt.Fprintf(file, "[%s] integration event failed harness=%s event=%s repo=%q cause=%q\n",
-		time.Now().Format(time.RFC3339), event.Harness, event.Kind, event.Repo, cause.Error())
+	line, err := json.Marshal(map[string]string{
+		"ts": time.Now().Format(time.RFC3339), "level": "error",
+		"msg": "integration event failed", "harness": event.Harness,
+		"event": event.Kind, "repo": event.Repo, "cause": cause.Error(),
+	})
+	if err == nil {
+		_, _ = file.Write(append(line, '\n'))
+	}
 }
