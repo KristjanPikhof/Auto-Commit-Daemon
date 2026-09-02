@@ -184,14 +184,62 @@ func TestEvaluateIntegrationRepoSupportsSubmoduleGitFile(t *testing.T) {
 }
 
 func TestEvaluateIntegrationRepoRegistryFailuresAreIndeterminate(t *testing.T) {
+	for name, body := range map[string]string{
+		"corrupt":     "{bad json",
+		"unsupported": `{"version":999,"repos":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			roots := withIsolatedHome(t)
+			repo := makeUnregisteredStartRepo(t)
+			if err := os.MkdirAll(filepath.Dir(roots.RegistryPath()), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(roots.RegistryPath(), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			decision := evaluateIntegrationRepo(context.Background(), repo)
+			if decision.State != integrationRepoIndeterminate || decision.Err == nil {
+				t.Fatalf("decision=%+v", decision)
+			}
+
+			activity := integrationEvent{Harness: "codex", Kind: "activity", Repo: repo, SessionID: "session"}
+			if err := runIntegrationEvent(context.Background(), bytes.NewReader(nil), activity); err != nil {
+				t.Fatal(err)
+			}
+			if pathExists(harnessHookLogPath("codex")) {
+				t.Fatal("routine indeterminate event wrote a log")
+			}
+			activity.Kind = "session_open"
+			if err := runIntegrationEvent(context.Background(), bytes.NewReader(nil), activity); err != nil {
+				t.Fatal(err)
+			}
+			if !pathExists(harnessHookLogPath("codex")) {
+				t.Fatal("session open did not log indeterminate repository state")
+			}
+		})
+	}
+}
+
+func TestEvaluateIntegrationRepoInvalidCanonicalIdentityIsIndeterminate(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo := makeUnregisteredStartRepo(t)
-	if err := os.MkdirAll(filepath.Dir(roots.RegistryPath()), 0o700); err != nil {
+	registerEnabledStartRepo(t, repo)
+	if err := central.WithLock(roots, func(registry *central.Registry) error {
+		record, ok := registry.FindRepo(repo)
+		if !ok {
+			return errors.New("registered repository missing")
+		}
+		for i := range registry.Repos {
+			if central.SameRepoPath(registry.Repos[i].Path, record.Path) {
+				registry.Repos[i].RepositoryID = "invalid"
+				return nil
+			}
+		}
+		return errors.New("registered repository row missing")
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(roots.RegistryPath(), []byte("{bad json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+
 	decision := evaluateIntegrationRepo(context.Background(), repo)
 	if decision.State != integrationRepoIndeterminate || decision.Err == nil {
 		t.Fatalf("decision=%+v", decision)
@@ -297,14 +345,18 @@ func TestRunIntegrationEventPayloadFailuresFailOpen(t *testing.T) {
 		senderCalls++
 		return nil
 	}
-	badPayloads := []string{
-		`{"cwd":"/repo"}`,
-		`{"session_id":"bad\nvalue","cwd":"/repo"}`,
-		strings.Repeat("x", hookStdinLimit+1),
+	badPayloads := []struct {
+		harness string
+		payload string
+	}{
+		{harness: "codex", payload: `{"cwd":"/repo"}`},
+		{harness: "codex", payload: `{"session_id":"bad\nvalue","cwd":"/repo"}`},
+		{harness: "cursor", payload: `{"conversation_id":"session","workspace_roots":["bad\npath"]}`},
+		{harness: "codex", payload: strings.Repeat("x", hookStdinLimit+1)},
 	}
-	for _, payload := range badPayloads {
-		event := integrationEvent{Harness: "codex", Kind: "activity"}
-		if err := runIntegrationEventWithSender(context.Background(), strings.NewReader(payload), event, sender); err != nil {
+	for _, tc := range badPayloads {
+		event := integrationEvent{Harness: tc.harness, Kind: "activity"}
+		if err := runIntegrationEventWithSender(context.Background(), strings.NewReader(tc.payload), event, sender); err != nil {
 			t.Fatalf("payload failure escaped to harness: %v", err)
 		}
 	}
