@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
@@ -83,6 +84,123 @@ func TestAdapterE2E(t *testing.T) {
 	t.Run("pause-resume", func(t *testing.T) {
 		runPauseResumeE2E(t, bin)
 	})
+}
+
+func TestAdapterE2E_InactiveRepositoriesAreSilent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("adapter e2e: Windows snippets not in scope for v1")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("adapter e2e: bash not on PATH")
+	}
+	bin := buildAcdBinary(t)
+	binDir := filepath.Dir(bin)
+
+	adapters := []struct {
+		name    string
+		command func(*testing.T) string
+		invoke  func(*testing.T, string, string, string) ([]string, string)
+	}{
+		{
+			name: "claude-code",
+			command: func(t *testing.T) string {
+				return pickHookByEvent(t, parseClaudeCodeSnippet(t,
+					readSnippet(t, "claude-code/settings.snippet.json")), "SessionStart").Command
+			},
+			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
+				return adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo),
+					fmt.Sprintf(`{"session_id":%q}`, session)
+			},
+		},
+		{
+			name: "codex",
+			command: func(t *testing.T) string {
+				return pickHookByEvent(t, parseCodexHooksJSON(t,
+					readSnippet(t, "codex/hooks.json")), "SessionStart").Command
+			},
+			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
+				return adapterEnv(t, binDir), fmt.Sprintf(`{"session_id":%q,"cwd":%q}`, session, repo)
+			},
+		},
+		{
+			name: "cursor",
+			command: func(t *testing.T) string {
+				return pickHookByEvent(t, parseCursorHooksJSON(t,
+					readSnippet(t, "cursor/hooks.json")), "sessionStart").Command
+			},
+			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
+				return adapterEnv(t, binDir),
+					fmt.Sprintf(`{"conversation_id":%q,"workspace_roots":[%q]}`, session, repo)
+			},
+		},
+		{
+			name: "opencode",
+			command: func(t *testing.T) string {
+				return pickHookByEvent(t, parseYAMLBashBlocks(t,
+					readSnippet(t, "opencode/hooks.snippet.yaml")), "acd-start").Command
+			},
+			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
+				return adapterEnv(t, binDir, "OPENCODE_PROJECT_DIR="+repo,
+					"OPENCODE_SESSION_ID="+session), ""
+			},
+		},
+		{
+			name: "pi",
+			command: func(t *testing.T) string {
+				return pickHookByEvent(t, parseYAMLBashBlocks(t,
+					readSnippet(t, "pi/hooks.snippet.yaml")), "acd-start").Command
+			},
+			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
+				return adapterEnv(t, binDir, "PI_PROJECT_DIR="+repo,
+					"PI_SESSION_ID="+session), ""
+			},
+		},
+	}
+
+	for _, adapter := range adapters {
+		adapter := adapter
+		for _, scenario := range []string{"non-git", "unregistered", "disabled"} {
+			t.Run(adapter.name+"/"+scenario, func(t *testing.T) {
+				repo := t.TempDir()
+				if scenario != "non-git" {
+					repo = tempRepo(t)
+				}
+				env, stdin := adapter.invoke(t, binDir, repo, "inactive-"+adapter.name)
+				if scenario == "disabled" {
+					roots, _ := prepareCheckpointRegistration(t, env, repo)
+					if err := central.WithLock(roots, func(registry *central.Registry) error {
+						result := registry.DisableRepo(central.RepoRemovalTarget{Path: repo}, time.Now().Unix())
+						if result.NotFound || !result.Record.LifecycleDisabled() {
+							return fmt.Errorf("disable repository: %+v", result)
+						}
+						return nil
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				res := runBash(t, ctx, env, stdin, adapter.command(t))
+				if res.ExitCode != 0 || res.Stdout != "" {
+					t.Fatalf("inactive %s hook exit=%d stdout=%q stderr=%q",
+						scenario, res.ExitCode, res.Stdout, res.Stderr)
+				}
+				stateRoot := envValue(env, "XDG_STATE_HOME")
+				if path := filepath.Join(stateRoot, "acd", adapter.name+"-hook.log"); integrationPathExists(path) {
+					t.Fatalf("inactive hook wrote %s", path)
+				}
+				if scenario == "unregistered" && integrationPathExists(filepath.Join(repo, ".git", "acd")) {
+					t.Fatal("unregistered hook created repository state")
+				}
+			})
+		}
+	}
+}
+
+func integrationPathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // runPauseResumeE2E covers P2 finding 15: drives `acd pause` / `acd resume`
