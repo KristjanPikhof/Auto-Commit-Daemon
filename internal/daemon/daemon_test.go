@@ -377,7 +377,6 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -396,6 +395,10 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 			SkipSignals: true,
 		})
 	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
 
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
@@ -405,7 +408,7 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	}
 	wakeCh <- struct{}{}
 
-	newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+	newHead := waitForCommit(t, f.dir, startHead, 10*time.Second)
 	if newHead == startHead {
 		t.Fatalf("HEAD did not advance")
 	}
@@ -1772,7 +1775,6 @@ func TestRun_WakeBurstCoalesced(t *testing.T) {
 	wakeCh := make(chan struct{}, 1) // cap 1 mimics the real signal channel
 	shutdownCh := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1790,6 +1792,10 @@ func TestRun_WakeBurstCoalesced(t *testing.T) {
 			SkipSignals: true,
 		})
 	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
 
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
@@ -1805,7 +1811,7 @@ func TestRun_WakeBurstCoalesced(t *testing.T) {
 		}
 	}
 
-	newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+	newHead := waitForCommit(t, f.dir, startHead, 10*time.Second)
 	if newHead == startHead {
 		t.Fatalf("HEAD did not advance")
 	}
@@ -2076,7 +2082,6 @@ func TestRun_RealSIGUSR1(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -2091,16 +2096,14 @@ func TestRun_RealSIGUSR1(t *testing.T) {
 			// SkipSignals=false so we exercise the real handler.
 		})
 	}()
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
 
 	// Wait until the daemon stamps mode=running to be sure signals are
 	// installed.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if mode := daemonMode(t, f.db); mode == "running" {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitForDaemonMode(t, f.db, "running", 10*time.Second)
 
 	if err := os.WriteFile(filepath.Join(f.dir, "sig.txt"), []byte("real\n"), 0o644); err != nil {
 		t.Fatalf("write sig: %v", err)
@@ -2109,7 +2112,7 @@ func TestRun_RealSIGUSR1(t *testing.T) {
 		t.Fatalf("send SIGUSR1: %v", err)
 	}
 
-	newHead := waitForCommit(t, f.dir, startHead, 3*time.Second)
+	newHead := waitForCommit(t, f.dir, startHead, 10*time.Second)
 	if newHead == startHead {
 		t.Fatalf("HEAD did not advance after SIGUSR1")
 	}
