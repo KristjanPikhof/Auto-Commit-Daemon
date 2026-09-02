@@ -21,6 +21,8 @@ usage: scripts/dev/test.sh
        scripts/dev/test.sh core <shard-count> <shard-index>
        scripts/dev/test.sh support
        scripts/dev/test.sh sensitive
+       scripts/dev/test.sh stress-daemon <shard-count> <shard-index>
+       scripts/dev/test.sh stress-support <shard-count> <shard-index>
 EOF
 }
 
@@ -50,15 +52,25 @@ validate_shard() {
   fi
 }
 
+run_package_shard() {
+  local package=$1
+  local count=$2
+  local index=$3
+  shift 3
+
+  ACD_TEST_SHARD_INDEX=$index scripts/dev/test-package-shards.sh \
+    "$package" "$count" "$@"
+}
+
 run_core() {
   local count=$1
   local index=$2
 
   validate_shard "$count" "$index"
-  ACD_TEST_SHARD_INDEX=$index scripts/dev/test-package-shards.sh \
-    ./internal/cli "$count" -race -count=1 -timeout "$test_timeout"
-  ACD_TEST_SHARD_INDEX=$index scripts/dev/test-package-shards.sh \
-    ./internal/daemon "$count" -race -count=1 -timeout "$test_timeout" \
+  run_package_shard ./internal/cli "$count" "$index" \
+    -race -count=1 -timeout "$test_timeout"
+  run_package_shard ./internal/daemon "$count" "$index" \
+    -race -count=1 -timeout "$test_timeout" \
     -skip "$timing_sensitive_daemon_tests"
 }
 
@@ -85,6 +97,27 @@ run_support() {
 run_sensitive() {
   go test ./internal/daemon -race -count=1 -timeout "$test_timeout" \
     -run "$timing_sensitive_daemon_tests"
+}
+
+run_stress_daemon() {
+  local count=$1
+  local index=$2
+
+  validate_shard "$count" "$index"
+  run_package_shard ./internal/daemon "$count" "$index" \
+    -race -count=3 -timeout "$test_timeout" -failfast \
+    -skip "$timing_sensitive_daemon_tests"
+}
+
+run_stress_support() {
+  local count=$1
+  local index=$2
+
+  validate_shard "$count" "$index"
+  run_package_shard ./internal/git "$count" "$index" \
+    -race -count=3 -timeout "$test_timeout" -failfast
+  run_package_shard ./internal/state "$count" "$index" \
+    -race -count=3 -timeout "$test_timeout" -failfast
 }
 
 run_all() {
@@ -146,6 +179,20 @@ case "${1:-}" in
       exit 2
     fi
     run_sensitive
+    ;;
+  stress-daemon)
+    if (($# != 3)); then
+      usage
+      exit 2
+    fi
+    run_stress_daemon "$2" "$3"
+    ;;
+  stress-support)
+    if (($# != 3)); then
+      usage
+      exit 2
+    fi
+    run_stress_support "$2" "$3"
     ;;
   *)
     usage
