@@ -24,6 +24,13 @@
 
 ### Fixed
 
+- Harness integrations now use one fail-open event command. It checks the
+  nearest Git root against the read-only registry before it opens repository
+  state or contacts the supervisor. Hooks silently ignore unregistered,
+  disabled, unactivated, and non-Git workspaces, including nested repositories
+  under a registered parent. Active tool events no longer send duplicate
+  session-open and wake requests, and session-start failures remain available
+  in the harness log without interrupting the coding tool.
 - Intent replay now starts from the repaired tree after a history repair and
   rejects any generated commit tree that changes paths outside its frozen
   captures. A later candidate can no longer put replaced file states back into
