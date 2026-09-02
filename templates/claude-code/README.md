@@ -15,5 +15,9 @@ The integration supplies session start/end, tool activity, and logical-boundary
 hints. Filesystem watching and complete polling remain the protection path;
 Claude hooks are optional and their absence never leaves edits uncaptured.
 
+Claude can run these hooks in repositories where ACD is not enabled. The hook
+checks the nearest Git root first and exits quietly when protection is off. An
+active hook sends one event to ACD instead of separate session and wake calls.
+
 Use `acd doctor` to inspect integration drift. Use `acd uninstall --dry-run`
 before removing verified owned entries.
