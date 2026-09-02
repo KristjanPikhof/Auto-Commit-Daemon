@@ -104,7 +104,8 @@ func newInternalCmd() *cobra.Command {
 	stdinExtract.Use = "stdin-extract"
 	cursorExtract := newHookCursorExtractCmd()
 	cursorExtract.Use = "cursor-extract"
-	integration.AddCommand(stdinExtract, cursorExtract)
+	event := withInvocationCapabilities(newInternalIntegrationEventCmd(), commandCapabilities{Repository: true, Quiet: true})
+	integration.AddCommand(stdinExtract, cursorExtract, event)
 	root.AddCommand(supervisorCmd, worker, hint, session, integration)
 	return root
 }
@@ -148,10 +149,24 @@ func newInternalSessionCmd(action string) *cobra.Command {
 }
 
 func sendInternalHint(ctx context.Context, repo, kind string, drain bool, sessionAction, sessionID, harness string, watchPID int) error {
-	record, roots, _, err := lookupRegisteredRepo("internal hint", repo)
-	if err != nil {
-		return err
+	decision := evaluateIntegrationRepo(ctx, repo)
+	switch decision.State {
+	case integrationRepoInactiveNoGit,
+		integrationRepoInactiveUnregistered,
+		integrationRepoInactiveDisabled,
+		integrationRepoInactiveUnactivated:
+		return nil
+	case integrationRepoIndeterminate:
+		return decision.Err
+	case integrationRepoActive:
+		return sendInternalHintToRepo(ctx, decision.Record, decision.Roots, kind,
+			drain, sessionAction, sessionID, harness, watchPID)
+	default:
+		return fmt.Errorf("acd internal hint: unknown integration repository state %q", decision.State)
 	}
+}
+
+func sendInternalHintToRepo(ctx context.Context, record central.RepoRecord, roots paths.Roots, kind string, drain bool, sessionAction, sessionID, harness string, watchPID int) error {
 	if strings.TrimSpace(record.RepositoryID) == "" || strings.TrimSpace(record.WorktreeID) == "" {
 		return fmt.Errorf("acd internal hint: repository setup is still in progress; retry after `acd setup` completes")
 	}

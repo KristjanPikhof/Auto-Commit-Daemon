@@ -7,7 +7,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
-func TestHookTemplatesPreserveFailureCodesAndFailOnlyCriticalHooks(t *testing.T) {
+func TestHookTemplatesUseFailOpenUnifiedEvents(t *testing.T) {
 	files := []string{
 		"pi/hooks.snippet.yaml",
 		"opencode/hooks.snippet.yaml",
@@ -22,20 +22,19 @@ func TestHookTemplatesPreserveFailureCodesAndFailOnlyCriticalHooks(t *testing.T)
 				t.Fatal(err)
 			}
 			text := string(body)
-			if strings.Contains(text, `"$(date +%FT%T%z)" "$?"`) {
-				t.Fatal("hook formats a command substitution before saving the failing exit code")
+			if !strings.Contains(text, "acd internal integration event") {
+				t.Fatal("template does not use the unified integration event command")
 			}
-			if !strings.Contains(text, "rc=$?") || !strings.Contains(text, "exit 1") {
-				t.Fatal("session-start and active hooks must save the real exit code and fail closed")
-			}
-			for _, marker := range []string{"logical_boundary", "soft_boundary", "session close"} {
-				index := strings.Index(text, marker)
-				if index < 0 {
-					continue
-				}
-				end := min(len(text), index+900)
-				if !strings.Contains(text[index:end], "exit 0") && !strings.Contains(text[index:end], "|| true") {
-					t.Fatalf("noncritical %s hook does not log and return success", marker)
+			for _, forbidden := range []string{
+				"acd internal integration stdin-extract",
+				"acd internal integration cursor-extract",
+				"acd internal session open",
+				"acd internal hint",
+				"exit 1",
+				"rc=$?",
+			} {
+				if strings.Contains(text, forbidden) {
+					t.Fatalf("template contains obsolete hook logic %q", forbidden)
 				}
 			}
 		})
