@@ -270,15 +270,7 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 	}
 }
 
-// TestSetup_ClaudeCode_ActiveHooksAndChainPlusLogFallback guards that
-// PreToolUse and PostToolUse:
-//   - chain `acd start` and `acd wake` with logical-and (`&&`) so a failed
-//     start cannot be silently masked by a successful wake;
-//   - end with an or-clause that writes the failure cause into the harness
-//     LOG file and exits nonzero so Claude Code can surface it.
-//
-// Regression target: P1-3 (wake masks start failure).
-func TestSetup_ClaudeCode_ActiveHooksAndChainPlusLogFallback(t *testing.T) {
+func TestSetup_ClaudeCode_ActivityHooksUseOneEvent(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "claude-code")
 	start := strings.Index(out, "{")
 	end := strings.LastIndex(out, "}")
@@ -298,7 +290,7 @@ func TestSetup_ClaudeCode_ActiveHooksAndChainPlusLogFallback(t *testing.T) {
 	for _, ev := range []string{"PreToolUse", "PostToolUse"} {
 		for i, entry := range settings.Hooks[ev] {
 			for j, h := range entry.Hooks {
-				assertActiveHookAndChainAndLogFallback(t, ev, i, j, h.Command, "claude-code-hook.log")
+				assertActivityEvent(t, fmt.Sprintf("%s entry %d hook %d", ev, i, j), h.Command, "claude-code")
 			}
 		}
 	}
@@ -616,7 +608,7 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	if stop := settings.Hooks["Stop"]; len(stop) > 0 && len(stop[0].Hooks) > 0 {
 		command := stop[0].Hooks[0].Command
 		if !integrationEventCommandOK("codex", "soft_boundary", command) {
-			t.Errorf("Stop hook must call acd touch --soft-boundary: %s", command)
+			t.Errorf("Stop hook must send a soft-boundary event: %s", command)
 		}
 		if strings.Contains(command, "acd flush --logical") {
 			t.Errorf("Codex Stop must remain a soft boundary, got hard flush: %s", command)
@@ -624,19 +616,7 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	}
 }
 
-// TestSetup_Codex_HelperFailureExplicitlyLogged guards that every codex hook
-// command captures `acd hook-stdin-extract` exit explicitly: when the helper
-// fails (binary missing, oversized stdin, bad JSON), the snippet must
-//   - log a `cmd=acd-hook-stdin-extract` line to LOG before any subsequent
-//     command runs (so the failure cause is visible);
-//   - capture rc=$? immediately after each guarded command so the printed
-//     `exit=%d` is the real failure code rather than an exit code clobbered
-//     by an intervening `$(date +...)` substitution; the regression target
-//     is rendered exit=0 hiding a real exit=7 from `acd start`.
-//
-// Regression target: P1-8 (codex SessionStart silently swallowed helper
-// failure when previously fed via process substitution + read).
-func TestSetup_Codex_HelperFailureExplicitlyLogged(t *testing.T) {
+func TestSetup_Codex_AllHooksUseUnifiedEvents(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
 	start := strings.Index(out, "{")
 	end := strings.LastIndex(out, "}")
@@ -669,18 +649,7 @@ func TestSetup_Codex_HelperFailureExplicitlyLogged(t *testing.T) {
 	}
 }
 
-// TestSetup_Codex_ActiveHooksSelfHeal guards that codex active hooks
-// (UserPromptSubmit, PreToolUse, PostToolUse) are resilient: they must
-//   - call `acd start` before `acd wake` so a fresh session can self-register;
-//   - chain start and wake with `&&` so a failed start cannot be masked by
-//     a successful wake;
-//   - tail with an or-clause that logs the failure cause into the harness
-//     LOG file and exits nonzero so codex can surface it;
-//   - gate `mkdir -p` behind a directory-exists check so the hot path does
-//     not fork+exec mkdir on every tool turn.
-//
-// Regression targets: P1-3 (wake masks start failure), P3-17 (mkdir hot-path).
-func TestSetup_Codex_ActiveHooksSelfHeal(t *testing.T) {
+func TestSetup_Codex_ActivityHooksUseOneEvent(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "codex")
 	start := strings.Index(out, "{")
 	end := strings.LastIndex(out, "}")
@@ -705,19 +674,7 @@ func TestSetup_Codex_ActiveHooksSelfHeal(t *testing.T) {
 		}
 		for i, entry := range entries {
 			for j, h := range entry.Hooks {
-				assertActiveHookAndChainAndLogFallback(t, ev, i, j, h.Command, "codex-hook.log")
-			}
-		}
-	}
-	// All codex hook bodies must gate mkdir behind a directory-exists check
-	// to avoid fork+exec on every PreToolUse / PostToolUse.
-	for ev, entries := range settings.Hooks {
-		for i, entry := range entries {
-			for j, h := range entry.Hooks {
-				if strings.Contains(h.Command, "mkdir -p") &&
-					!strings.Contains(h.Command, `[ -d "$LOG_DIR" ] || mkdir -p`) {
-					t.Errorf("%s entry %d hook %d: mkdir -p must be gated by [ -d \"$LOG_DIR\" ] || mkdir -p: %s", ev, i, j, h.Command)
-				}
+				assertActivityEvent(t, fmt.Sprintf("%s entry %d hook %d", ev, i, j), h.Command, "codex")
 			}
 		}
 	}
@@ -755,7 +712,7 @@ func TestSetup_OpenCode_FooterInstructions(t *testing.T) {
 	}
 }
 
-func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
+func TestSetup_OpenCode_ActivityHooksUseUnifiedEvent(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
 		block := yamlHookBlock(t, body, id)
@@ -763,14 +720,8 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 	}
 }
 
-// TestSetup_ClaudeCode_StopHookCallsFlushLogical guards the d1 rewire: the
-// Claude Code Stop hook must call `acd flush --logical` rather than the
-// legacy `acd touch`. The rewire is the whole point of the d1 task — Stop
-// fires when Claude finishes a turn, and we want pending captures to
-// commit immediately rather than wait the full IntentMaxPendingAge timer.
-// Regression target: a future template edit reverting to acd touch would
-// silently re-introduce the 5-minute commit lag.
-func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
+// Claude Stop records a logical boundary without closing the session.
+func TestSetup_ClaudeCode_StopUsesLogicalBoundary(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "claude-code")
 	start := strings.Index(out, "{")
 	end := strings.LastIndex(out, "}")
@@ -795,7 +746,7 @@ func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
 	}
 	cmd := stop[0].Hooks[0].Command
 	if !integrationEventCommandOK("claude-code", "logical_boundary", cmd) {
-		t.Errorf("Stop hook must call `acd flush --logical`, got: %s", cmd)
+		t.Errorf("Stop hook must send a logical-boundary event, got: %s", cmd)
 	}
 	if strings.Contains(cmd, "acd touch") {
 		t.Errorf("Stop hook still calls legacy `acd touch` — rewire incomplete: %s", cmd)
@@ -803,11 +754,7 @@ func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
 	assertUnifiedIntegrationEvent(t, "Stop", cmd, "claude-code", "logical_boundary")
 }
 
-// TestSetup_OpenCode_IdleHookCallsFlushLogical mirrors the claude-code rewire
-// guard for the OpenCode session.idle event: it must call `acd flush
-// --logical` (under the new acd-flush-idle id) instead of the legacy
-// acd-touch-idle / `acd touch` body.
-func TestSetup_OpenCode_IdleHookCallsFlushLogical(t *testing.T) {
+func TestSetup_OpenCode_IdleUsesLogicalBoundary(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	// YAML harnesses use a comment-prefixed marker `# acd-managed: true`
 	// at the top of the snippet. The `# ` prefix is load-bearing — a
@@ -823,15 +770,14 @@ func TestSetup_OpenCode_IdleHookCallsFlushLogical(t *testing.T) {
 	}
 	block := yamlHookBlock(t, body, "acd-flush-idle")
 	if !integrationEventCommandOK("opencode", "logical_boundary", block) {
-		t.Errorf("opencode acd-flush-idle must call `acd flush --logical`:\n%s", block)
+		t.Errorf("opencode idle hook must send a logical-boundary event:\n%s", block)
 	}
 	if !strings.Contains(block, "session.idle") {
 		t.Errorf("opencode acd-flush-idle must bind to session.idle event:\n%s", block)
 	}
 }
 
-// TestSetup_Pi_IdleHookCallsFlushLogical mirrors the OpenCode case for Pi.
-func TestSetup_Pi_IdleHookCallsFlushLogical(t *testing.T) {
+func TestSetup_Pi_IdleUsesLogicalBoundary(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
 	// Same YAML marker contract as opencode (P2 #18).
 	const yamlMarker = "# acd-managed: true"
@@ -843,16 +789,14 @@ func TestSetup_Pi_IdleHookCallsFlushLogical(t *testing.T) {
 	}
 	block := yamlHookBlock(t, body, "acd-flush-idle")
 	if !integrationEventCommandOK("pi", "logical_boundary", block) {
-		t.Errorf("pi acd-flush-idle must call `acd flush --logical`:\n%s", block)
+		t.Errorf("pi idle hook must send a logical-boundary event:\n%s", block)
 	}
 	if !strings.Contains(block, "session.idle") {
 		t.Errorf("pi acd-flush-idle must bind to session.idle event:\n%s", block)
 	}
 }
 
-// TestSetup_OpenCode_AllHooksGateMkdir now guards that hook-owned logging and
-// mkdir subprocesses stay out of every OpenCode event.
-func TestSetup_OpenCode_AllHooksGateMkdir(t *testing.T) {
+func TestSetup_OpenCode_HooksHaveNoShellLogging(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
@@ -862,8 +806,7 @@ func TestSetup_OpenCode_AllHooksGateMkdir(t *testing.T) {
 	}
 }
 
-// TestSetup_Pi_AllHooksGateMkdir mirrors the OpenCode no-wrapper check.
-func TestSetup_Pi_AllHooksGateMkdir(t *testing.T) {
+func TestSetup_Pi_HooksHaveNoShellLogging(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
 	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
@@ -873,15 +816,11 @@ func TestSetup_Pi_AllHooksGateMkdir(t *testing.T) {
 	}
 }
 
-// TestSetup_OpenCode_ActiveHooksAndChainPlusLogFallback guards that
-// tool.before.* and tool.after.* hooks chain start AND wake with `&&` and
-// route a failure through the harness LOG file, exiting nonzero so opencode
-// surfaces it. Regression target: P1-3 (wake masks start failure).
-func TestSetup_OpenCode_ActiveHooksAndChainPlusLogFallback(t *testing.T) {
+func TestSetup_OpenCode_ActivityHooksUseOneEvent(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
 		block := yamlHookBlock(t, body, id)
-		assertYAMLActiveHookAndChainAndLogFallback(t, id, block, "opencode-hook.log")
+		assertActivityEvent(t, id, block, "opencode")
 	}
 }
 
@@ -948,51 +887,25 @@ func TestSetup_Pi_AllHooksUsePerProcessSIDFallback(t *testing.T) {
 	}
 }
 
-// TestPiSIDFallbackProducesUniqueIDsAcrossProcesses runs the bash fallback
-// expression in two distinct shells and asserts they produce different IDs
-// when PI_SESSION_ID is unset. This catches a future regression where the
-// fallback drifts to a shared literal and concurrent sessions would
-// collapse onto the same client row.
-func TestPiSIDFallbackProducesUniqueIDsAcrossProcesses(t *testing.T) {
-	bash, err := exec.LookPath("bash")
-	if err != nil {
-		t.Skip("bash not on PATH; skipping process-uniqueness check")
-	}
-	// Use the exact fallback expression from the snippet so any drift in
-	// templates/pi/hooks.snippet.yaml surfaces here too.
-	expr := `unset PI_SESSION_ID; SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"; printf '%s' "$SID"`
-	out1, err := exec.Command(bash, "-c", expr).Output()
-	if err != nil {
-		t.Fatalf("first bash invocation: %v", err)
-	}
-	// Sleep just long enough that even if both shells happened to share a
-	// second boundary, we see distinct seconds in the second pid run too.
-	// $$ alone (different pid per process) is enough; the date guard is
-	// belt-and-suspenders against a degenerate scheduling case.
-	out2, err := exec.Command(bash, "-c", expr).Output()
-	if err != nil {
-		t.Fatalf("second bash invocation: %v", err)
-	}
-	id1, id2 := string(out1), string(out2)
-	if id1 == id2 {
-		t.Fatalf("two bash processes produced identical SIDs: %q == %q", id1, id2)
-	}
-	for _, id := range []string{id1, id2} {
-		if !strings.HasPrefix(id, "pi-") {
-			t.Errorf("SID %q missing pi- prefix", id)
+func TestPiSIDFallbackUsesWatchPID(t *testing.T) {
+	for _, watchPID := range []int{101, 202} {
+		event, err := normalizeIntegrationEvent(strings.NewReader(""), integrationEvent{
+			Harness: "pi", Kind: "activity", Repo: "/repo", WatchPID: watchPID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := fmt.Sprintf("pi-%d", watchPID); event.SessionID != want {
+			t.Fatalf("watch PID %d produced session %q want %q", watchPID, event.SessionID, want)
 		}
 	}
 }
 
-// TestSetup_Pi_ActiveHooksAndChainPlusLogFallback guards that tool.before.*
-// and tool.after.* hooks chain start AND wake with `&&` and route failure
-// through the harness LOG file, exiting nonzero so pi surfaces it.
-// Regression target: P1-3 (wake masks start failure).
-func TestSetup_Pi_ActiveHooksAndChainPlusLogFallback(t *testing.T) {
+func TestSetup_Pi_ActivityHooksUseOneEvent(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
 		block := yamlHookBlock(t, body, id)
-		assertYAMLActiveHookAndChainAndLogFallback(t, id, block, "pi-hook.log")
+		assertActivityEvent(t, id, block, "pi")
 	}
 }
 
@@ -1105,19 +1018,9 @@ func TestSetup_Shell_BashSyntaxCheck(t *testing.T) {
 	}
 }
 
-// assertActiveHookAndChainAndLogFallback preserves the historical helper name
-// while enforcing the current one-process, fail-open event contract.
-func assertActiveHookAndChainAndLogFallback(t *testing.T, ev string, i, j int, cmd, logFile string) {
+func assertActivityEvent(t *testing.T, label, command, harness string) {
 	t.Helper()
-	harness := strings.TrimSuffix(logFile, "-hook.log")
-	assertUnifiedIntegrationEvent(t, fmt.Sprintf("%s entry %d hook %d", ev, i, j), cmd, harness, "activity")
-}
-
-// assertYAMLActiveHookAndChainAndLogFallback is the YAML counterpart.
-func assertYAMLActiveHookAndChainAndLogFallback(t *testing.T, id, block, logFile string) {
-	t.Helper()
-	harness := strings.TrimSuffix(logFile, "-hook.log")
-	assertUnifiedIntegrationEvent(t, id, block, harness, "activity")
+	assertUnifiedIntegrationEvent(t, label, command, harness, "activity")
 }
 
 func assertUnifiedIntegrationEvent(t *testing.T, label, command, harness, event string) {
