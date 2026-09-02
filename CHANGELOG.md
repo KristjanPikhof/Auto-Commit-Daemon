@@ -4,6 +4,10 @@
 
 ### Changed
 
+- GitHub Actions now runs CLI and daemon test shards in dedicated Ubuntu and
+  macOS jobs. Support and timing-sensitive tests run separately, while repeated
+  daemon, Git, and state tests use smaller Ubuntu shards. Pull request jobs have
+  a five-minute limit and superseded runs stop automatically.
 - `acd history rewrite` now groups adjacent, same-author commits by intent and
   proposes one message per resulting commit. The preview shows the selected and
   resulting counts, member commits, and grouping reasons. Use
