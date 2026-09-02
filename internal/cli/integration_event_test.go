@@ -366,6 +366,13 @@ func TestRunIntegrationEventPayloadFailuresFailOpen(t *testing.T) {
 	if pathExists(harnessHookLogPath("codex")) {
 		t.Fatal("routine malformed payload wrote a hook log")
 	}
+	open := integrationEvent{Harness: "codex", Kind: "session_open"}
+	if err := runIntegrationEventWithSender(context.Background(), strings.NewReader(`{"cwd":"/repo"}`), open, sender); err != nil {
+		t.Fatal(err)
+	}
+	if !pathExists(harnessHookLogPath("codex")) {
+		t.Fatal("malformed session-open payload did not write a diagnostic")
+	}
 }
 
 func TestRunIntegrationEventRejectsInvalidConfiguration(t *testing.T) {
