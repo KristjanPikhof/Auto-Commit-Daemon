@@ -176,14 +176,143 @@ func TestRewriteCommitsPlanGenerationUsesPersistedSettings(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
-		selection: git.RewriteSelectionOptions{Last: 1},
-		planOnly:  true,
+		selection:    git.RewriteSelectionOptions{Last: 1},
+		planOnly:     true,
+		messagesOnly: true,
 	}, false)
 	if err != nil {
 		t.Fatalf("plan generation with persisted settings: %v\noutput:\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "Generated valid rewrite plan") {
 		t.Fatalf("persisted settings did not generate a plan:\n%s", out.String())
+	}
+}
+
+func TestRewriteCommitsGroupsHistoryByDefault(t *testing.T) {
+	withIsolatedHome(t)
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	for _, spec := range []struct{ path, body, message string }{
+		{"feature.go", "package feature\n", "update feature"},
+		{"feature_test.go", "package feature\n", "update feature tests"},
+	} {
+		writeRewriteTestFile(t, repo, spec.path, spec.body)
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultWriteTimeout}, "add", spec.path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultWriteTimeout}, "commit", "-q", "-m", spec.message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	providerDir := t.TempDir()
+	provider := filepath.Join(providerDir, "acd-provider-rewrite-test")
+	script := `#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    if req.get('request_type') == 'history_rewrite_plan':
+        commits = req['history_rewrite_plan_request']['commits']
+        groups = [
+            {'old_oids': [commits[0]['old_oid']], 'subject': 'Keep seed history', 'grouping_reason': 'repository seed'},
+            {'old_oids': [commits[1]['old_oid'], commits[2]['old_oid']], 'subject': 'Add feature behavior', 'grouping_reason': 'implementation and tests'},
+        ]
+        print(json.dumps({'version': 1, 'history_rewrite_plan': {'groups': groups}}), flush=True)
+    else:
+        print(json.dumps({'version': 1, 'subject': 'Rewrite historical commit', 'body': ''}), flush=True)
+`
+	if err := os.WriteFile(provider, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", providerDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(ai.EnvCommitStrategy, "intent")
+	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
+
+	var out bytes.Buffer
+	err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 3}, planOnly: true}, false)
+	if err != nil {
+		t.Fatalf("grouped plan: %v\n%s", err, out.String())
+	}
+	for _, want := range []string{"Selected commits: 3", "Resulting commits: 2", "Commit reduction: 1", "Group 2: Add feature behavior"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output missing %q:\n%s", want, out.String())
+		}
+	}
+	planID := parseRewritePlanIDAfter(t, out.String(), "Generated valid rewrite plan")
+	db := openRewritePlanTestDB(t, ctx, repo)
+	defer db.Close()
+	plan, ok, err := state.LoadRewritePlan(ctx, db, planID)
+	if err != nil || !ok || len(plan.Groups) != 2 || len(plan.Groups[1].Members) != 2 {
+		t.Fatalf("saved plan ok=%v err=%v plan=%+v", ok, err, plan)
+	}
+
+	out.Reset()
+	err = runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 3}, planOnly: true, messagesOnly: true}, false)
+	if err != nil {
+		t.Fatalf("messages-only plan: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Selected commits: 3") || !strings.Contains(out.String(), "Resulting commits: 3") || !strings.Contains(out.String(), "Commit reduction: 0") {
+		t.Fatalf("messages-only counts:\n%s", out.String())
+	}
+}
+
+type rewriteNeedsDiffProvider struct{}
+
+func (rewriteNeedsDiffProvider) Name() string { return "rewrite-needs-diff" }
+
+func (rewriteNeedsDiffProvider) Generate(context.Context, ai.CommitContext) (ai.Result, error) {
+	return ai.Result{}, errors.New("not used")
+}
+
+func TestBuildHistoryRewritePlanRequestBudgetsDiffsFairly(t *testing.T) {
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	const commitCount = 9
+	for i := 0; i < commitCount; i++ {
+		path := "large-" + strconv.Itoa(i) + ".txt"
+		writeRewriteTestFile(t, repo, path, strings.Repeat(string(rune('a'+i)), 24*1024))
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultWriteTimeout}, "add", path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultWriteTimeout}, "commit", "-q", "-m", "Add large evidence file"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selection, err := git.ResolveRewriteSelection(ctx, repo, git.RewriteSelectionOptions{Last: commitCount})
+	if err != nil {
+		t.Fatalf("resolve selection: %v", err)
+	}
+	db := openRewritePlanTestDB(t, ctx, repo)
+	defer db.Close()
+
+	t.Setenv("ACD_AI_DIFF_EGRESS", "0")
+	withoutDiffs, err := buildHistoryRewritePlanRequest(ctx, repo, db, selection.Selected, rewriteNeedsDiffProvider{}, ai.CommitFormatImperative)
+	if err != nil {
+		t.Fatalf("build request without diff egress: %v", err)
+	}
+	for _, commit := range withoutDiffs.Commits {
+		if commit.DiffIncluded || commit.RedactedDiff != "" {
+			t.Fatalf("diff included without egress approval for %s", commit.OldOID)
+		}
+	}
+
+	t.Setenv("ACD_AI_DIFF_EGRESS", "1")
+	withDiffs, err := buildHistoryRewritePlanRequest(ctx, repo, db, selection.Selected, rewriteNeedsDiffProvider{}, ai.CommitFormatImperative)
+	if err != nil {
+		t.Fatalf("build request with diff egress: %v", err)
+	}
+	perCommitCap := ai.HistoryRewriteTotalDiffCap / commitCount
+	total := 0
+	for _, commit := range withDiffs.Commits {
+		if !commit.DiffIncluded || len(commit.RedactedDiff) == 0 {
+			t.Fatalf("diff missing with egress approval for %s", commit.OldOID)
+		}
+		if len(commit.RedactedDiff) > perCommitCap || len(commit.RedactedDiff) > ai.HistoryRewritePerCommitDiffCap {
+			t.Fatalf("diff for %s is %d bytes; caps are %d and %d", commit.OldOID, len(commit.RedactedDiff), perCommitCap, ai.HistoryRewritePerCommitDiffCap)
+		}
+		total += len(commit.RedactedDiff)
+	}
+	if total > ai.HistoryRewriteTotalDiffCap {
+		t.Fatalf("total diff evidence is %d bytes; cap is %d", total, ai.HistoryRewriteTotalDiffCap)
 	}
 }
 
@@ -252,9 +381,10 @@ func TestRewriteCommitsPlanOnlyQuotesPlanOutPathWithSpaces(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
-		selection: git.RewriteSelectionOptions{Last: 1},
-		planOnly:  true,
-		planOut:   planPath,
+		selection:    git.RewriteSelectionOptions{Last: 1},
+		planOnly:     true,
+		planOut:      planPath,
+		messagesOnly: true,
 	}, false)
 	if err != nil {
 		t.Fatalf("plan-only with spaced plan-out: %v\noutput:\n%s", err, out.String())
@@ -294,7 +424,7 @@ func TestRewriteCommitsPlanOnlyGeneratePrintsNextFooter(t *testing.T) {
 	t.Setenv(ai.EnvProvider, "subprocess:rewrite-test")
 
 	var out bytes.Buffer
-	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, planOnly: true}, false)
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, planOnly: true, messagesOnly: true}, false)
 	if err != nil {
 		t.Fatalf("plan-only generate: %v\noutput:\n%s", err, out.String())
 	}
@@ -315,10 +445,11 @@ func TestRewriteCommitsGenerationProgressEvents(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runRewriteCommits(context.Background(), &stdout, repo, rewriteCommitsOptions{
-		selection:  git.RewriteSelectionOptions{Last: 1},
-		planOnly:   true,
-		progress:   "json",
-		progressTo: &stderr,
+		selection:    git.RewriteSelectionOptions{Last: 1},
+		planOnly:     true,
+		messagesOnly: true,
+		progress:     "json",
+		progressTo:   &stderr,
 	}, false)
 	if err != nil {
 		t.Fatalf("plan-only generate: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
@@ -414,9 +545,10 @@ func TestRewriteCommitsDeclinedApplyOmitsNextFooter(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{
-		selection: git.RewriteSelectionOptions{Last: 1},
-		noReview:  true,
-		in:        strings.NewReader("n\n"),
+		selection:    git.RewriteSelectionOptions{Last: 1},
+		noReview:     true,
+		messagesOnly: true,
+		in:           strings.NewReader("n\n"),
 	}, false)
 	if err != nil {
 		t.Fatalf("declined apply generate: %v\noutput:\n%s", err, out.String())
@@ -464,7 +596,7 @@ func TestRewriteCommitsEditStandaloneFilePersistsBackToFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read updated plan file: %v", err)
 	}
-	if updated.Commits[0].ProposedMessage != "file edited subject" || !updated.Edited || updated.ValidationStatus != state.RewritePlanValidationValid {
+	if updated.Groups[0].ProposedMessage != "file edited subject" || !updated.Edited || updated.ValidationStatus != state.RewritePlanValidationValid {
 		t.Fatalf("standalone file not persisted as edited valid plan: %#v", updated)
 	}
 }
@@ -487,7 +619,7 @@ func TestRewriteCommitsGenerationReviewPrintsEditedRevisionID(t *testing.T) {
 	t.Setenv("EDITOR", editor)
 
 	var out bytes.Buffer
-	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, review: true, editFormat: rewriteEditFormatText, in: strings.NewReader("n\n")}, false)
+	err := runRewriteCommits(context.Background(), &out, repo, rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, review: true, editFormat: rewriteEditFormatText, in: strings.NewReader("n\n"), messagesOnly: true}, false)
 	if err != nil {
 		t.Fatalf("generation review edit: %v\noutput:\n%s", err, out.String())
 	}
@@ -502,7 +634,7 @@ func TestRewriteCommitsGenerationReviewPrintsEditedRevisionID(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("load edited revision: ok=%v err=%v", ok, err)
 	}
-	if !edited.Edited || edited.Commits[0].ProposedMessage != "review edited subject" {
+	if !edited.Edited || edited.Groups[0].ProposedMessage != "review edited subject" {
 		t.Fatalf("edited review revision not saved: %#v", edited)
 	}
 }
@@ -540,15 +672,15 @@ func TestRewriteCommitsEditSavedPlanPersistsRevisionWithoutAICall(t *testing.T) 
 	if err != nil || !ok {
 		t.Fatalf("load base plan: ok=%v err=%v", ok, err)
 	}
-	if base.Commits[0].ProposedMessage != "seed rewritten" {
-		t.Fatalf("base plan mutated: %#v", base.Commits[0])
+	if base.Groups[0].ProposedMessage != "seed rewritten" {
+		t.Fatalf("base plan mutated: %#v", base.Groups[0])
 	}
 	editedID := parseEditedRewritePlanID(t, got)
 	edited, ok, err := state.LoadRewritePlan(ctx, db, editedID)
 	if err != nil || !ok {
 		t.Fatalf("load edited plan: ok=%v err=%v", ok, err)
 	}
-	if !edited.BasePlanID.Valid || edited.BasePlanID.String != planID || edited.Revision != base.Revision+1 || !edited.Edited || edited.Commits[0].ProposedMessage != "edited seed subject" {
+	if !edited.BasePlanID.Valid || edited.BasePlanID.String != planID || edited.Revision != base.Revision+1 || !edited.Edited || edited.Groups[0].ProposedMessage != "edited seed subject" {
 		t.Fatalf("edited revision not saved as expected: %#v", edited)
 	}
 }
@@ -571,7 +703,7 @@ func TestRewriteCommitsEditSavedPlanValidationFailure(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runRewriteCommits(ctx, &out, repo, rewriteCommitsOptions{editPlan: planID, planOnly: true, editFormat: rewriteEditFormatText}, false)
-	if err == nil || !strings.Contains(err.Error(), "empty message") {
+	if err == nil || !strings.Contains(err.Error(), "block is empty") {
 		t.Fatalf("edit validation err = %v, want empty message", err)
 	}
 }
@@ -598,7 +730,7 @@ func TestRewriteCommitsEditSavedPlanPromptsBeforeApply(t *testing.T) {
 		t.Fatalf("edit prompt flow: %v", err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "Apply this edited rewrite plan now?") || !strings.Contains(got, "No rewrite performed.") {
+	if !strings.Contains(got, "Apply this plan to rewrite 1 commit message(s)?") || !strings.Contains(got, "No rewrite performed.") {
 		t.Fatalf("edit output missing apply prompt/no-rewrite: %q", got)
 	}
 }
@@ -1022,6 +1154,10 @@ func TestRewriteCommitsParserFlags(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "--plan-only") {
 		t.Fatalf("plan-only/apply validation err = %v", err)
 	}
+	err = normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{showPlan: "plan-id", messagesOnly: true, editFormat: "text"})
+	if err == nil || !strings.Contains(err.Error(), "only valid when generating") {
+		t.Fatalf("messages-only saved-plan validation err = %v", err)
+	}
 }
 
 func TestRewriteCommitsSelectorAliasesNormalize(t *testing.T) {
@@ -1163,7 +1299,7 @@ func TestRewriteProgressPlainIncludesBoundedCounts(t *testing.T) {
 
 	want := strings.Join([]string{
 		"History rewrite: Commit messages [42/169]: message ready",
-		"History rewrite: Applying messages [42/169]: applied the new message",
+		"History rewrite: Applying groups [42/169]: applied the new message",
 		"History rewrite: Keeping later commits [2/3]: kept a later commit unchanged",
 		"History rewrite: Plan check: plan is valid",
 		"",
@@ -1183,7 +1319,7 @@ func TestRewritePlanTextEditRoundTripAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse rendered text: %v\n%s", err, rendered)
 	}
-	if !rewritePlanMessagesEqual(plan.Commits, parsed) {
+	if !rewritePlanGroupsEqual(plan.Groups, parsed) {
 		t.Fatalf("text round trip changed commits: %#v", parsed)
 	}
 
@@ -1202,6 +1338,27 @@ func TestRewritePlanTextEditRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestRewritePlanTextEditCanMergeAdjacentGroups(t *testing.T) {
+	plan := rewritePlanEditTestPlan()
+	edited := `group 1
+commit abc123
+commit def456
+reason <<ACD_GROUP_REASON
+implementation and follow-up
+ACD_GROUP_REASON
+message <<ACD_COMMIT_MESSAGE
+Combine related history changes
+ACD_COMMIT_MESSAGE
+`
+	groups, err := parseRewritePlanEdit([]byte(edited), rewriteEditFormatText, plan)
+	if err != nil {
+		t.Fatalf("parse merged text groups: %v", err)
+	}
+	if len(groups) != 1 || len(groups[0].Members) != 2 {
+		t.Fatalf("groups=%+v", groups)
+	}
+}
+
 func TestRewritePlanJSONEditRoundTripAndValidation(t *testing.T) {
 	plan := rewritePlanEditTestPlan()
 	rendered, err := renderRewritePlanEdit(plan, rewriteEditFormatJSON)
@@ -1212,11 +1369,11 @@ func TestRewritePlanJSONEditRoundTripAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse rendered json: %v\n%s", err, rendered)
 	}
-	if !rewritePlanMessagesEqual(plan.Commits, parsed) {
+	if !rewritePlanGroupsEqual(plan.Groups, parsed) {
 		t.Fatalf("json round trip changed commits: %#v", parsed)
 	}
 
-	unknown := strings.Replace(string(rendered), `"commits":`, `"unknown": true, "commits":`, 1)
+	unknown := strings.Replace(string(rendered), `"groups":`, `"unknown": true, "groups":`, 1)
 	if _, err := parseRewritePlanEdit([]byte(unknown), rewriteEditFormatJSON, plan); err == nil || !strings.Contains(err.Error(), "unknown field") {
 		t.Fatalf("parse unknown field err = %v, want unknown-field validation", err)
 	}
@@ -1225,7 +1382,7 @@ func TestRewritePlanJSONEditRoundTripAndValidation(t *testing.T) {
 	if err := json.Unmarshal(rendered, &doc); err != nil {
 		t.Fatalf("unmarshal rendered json: %v", err)
 	}
-	doc.Commits[0].Message = "   "
+	doc.Groups[0].Message = "   "
 	empty, err := json.Marshal(doc)
 	if err != nil {
 		t.Fatalf("marshal empty-message json: %v", err)
@@ -1240,12 +1397,41 @@ func TestRewritePlanJSONEditRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestRewritePlanJSONEditCanMergeAdjacentGroups(t *testing.T) {
+	plan := rewritePlanEditTestPlan()
+	doc := rewritePlanEditJSON{
+		PlanID: plan.ID,
+		Groups: []rewritePlanEditJSONGroup{{
+			OldOIDs:        []string{"abc123", "def456"},
+			GroupingReason: "implementation and follow-up",
+			Message:        "Combine related history changes",
+		}},
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, err := parseRewritePlanEdit(raw, rewriteEditFormatJSON, plan)
+	if err != nil {
+		t.Fatalf("parse merged groups: %v", err)
+	}
+	if len(groups) != 1 || len(groups[0].Members) != 2 {
+		t.Fatalf("groups=%+v", groups)
+	}
+
+	doc.Groups[0].OldOIDs = []string{"def456", "abc123"}
+	raw, _ = json.Marshal(doc)
+	if _, err := parseRewritePlanEdit(raw, rewriteEditFormatJSON, plan); err == nil || !strings.Contains(err.Error(), "want") {
+		t.Fatalf("reordered membership error=%v", err)
+	}
+}
+
 func TestRewritePlanEditRejectsWrongConventionalFormat(t *testing.T) {
 	plan := rewritePlanEditTestPlan()
 	plan.CommitFormat = string(ai.CommitFormatConventional)
-	plan.Commits = []state.RewritePlanCommit{{
-		OldOID:          "abc123",
-		OriginalMessage: "old subject",
+	plan.Groups = []state.RewritePlanGroup{{
+		Members:         []state.RewritePlanMember{{OldOID: "abc123", OriginalMessage: "old subject"}},
+		GroupingReason:  "test conventional message",
 		ProposedMessage: "fix: improve rewrite edit validation",
 	}}
 	rendered, err := renderRewritePlanEdit(plan, rewriteEditFormatText)
@@ -1279,7 +1465,7 @@ func TestRewritePlanFakeEditorAcceptsUnchangedContent(t *testing.T) {
 	if changed {
 		t.Fatalf("changed=true for unchanged editor content")
 	}
-	if !rewritePlanMessagesEqual(plan.Commits, commits) {
+	if !rewritePlanGroupsEqual(plan.Groups, commits) {
 		t.Fatalf("unchanged editor altered commits: %#v", commits)
 	}
 }
@@ -1327,9 +1513,9 @@ func rewritePlanEditTestPlan() state.RewritePlan {
 		ExpectedHead:     "feedface",
 		ValidationStatus: state.RewritePlanValidationValid,
 		ApplyStatus:      state.RewritePlanApplyPending,
-		Commits: []state.RewritePlanCommit{
-			{OldOID: "abc123", OriginalMessage: "old subject", ProposedMessage: "better subject\n\nbody"},
-			{OldOID: "def456", OriginalMessage: "second old", ProposedMessage: "second better"},
+		Groups: []state.RewritePlanGroup{
+			{Members: []state.RewritePlanMember{{OldOID: "abc123", OriginalMessage: "old subject"}}, GroupingReason: "first test group", ProposedMessage: "better subject\n\nbody"},
+			{Members: []state.RewritePlanMember{{OldOID: "def456", OriginalMessage: "second old"}}, GroupingReason: "second test group", ProposedMessage: "second better"},
 		},
 	}
 }

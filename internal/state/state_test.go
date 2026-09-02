@@ -84,7 +84,7 @@ func TestOpenCreatesSchemaAndPragmas(t *testing.T) {
 	tables := []string{
 		"daemon_state", "daemon_clients", "shadow_paths",
 		"capture_events", "capture_ops", "planner_state", "intent_planner_windows",
-		"intent_planner_window_events", "rewrite_plans", "rewrite_plan_commits",
+		"intent_planner_window_events", "rewrite_plans", "rewrite_plan_commits", "rewrite_plan_groups",
 		"flush_requests", "decision_records", "recovery_snapshots",
 		"recovery_snapshot_events", "publish_state", "daemon_meta", "daily_rollups",
 		"config_revisions", "runtime_config_state", "config_activation_requests",

@@ -242,6 +242,40 @@ done
 	}
 }
 
+func TestSubprocess_HistoryRewritePlan(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "test", `
+while IFS= read -r line; do
+  case "$line" in
+    *'"request_type":"history_rewrite_plan"'*'"history_rewrite_plan_request"'*)
+      printf '%s\n' '{"version":1,"history_rewrite_plan":{"groups":[{"old_oids":["one","two"],"subject":"Group related history changes","grouping_reason":"implementation and tests"}]}}'
+      ;;
+    *)
+      printf '%s\n' '{"version":1,"error":"missing history rewrite request"}'
+      ;;
+  esac
+done
+`)
+	p := NewSubprocessProvider("test", SubprocessOptions{
+		LookPath: fixedLookPath("acd-provider-test", bin),
+		Timeout:  5 * time.Second,
+		Stderr:   io.Discard,
+	})
+	t.Cleanup(func() { _ = p.Close() })
+
+	plan, err := p.ProposeHistoryRewritePlan(context.Background(), HistoryRewritePlanRequest{Commits: []HistoryRewriteCommit{
+		{OldOID: "one", AuthorName: "Dev", AuthorEmail: "dev@example.com"},
+		{OldOID: "two", AuthorName: "Dev", AuthorEmail: "dev@example.com"},
+	}})
+	if err != nil {
+		t.Fatalf("ProposeHistoryRewritePlan: %v", err)
+	}
+	if len(plan.Groups) != 1 || len(plan.Groups[0].OldOIDs) != 2 || plan.Source != "subprocess:test" {
+		t.Fatalf("plan=%+v", plan)
+	}
+}
+
 func TestSubprocess_RewriteIntentMessageValidationErrorsAreTyped(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

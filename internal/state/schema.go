@@ -40,7 +40,7 @@ package state
 // adds immutable event membership for newly prepared Intent repairs; v25
 // freezes the runtime strategy and provider identity used by publication
 // drains so restart recovery cannot reinterpret an Intent drain as Event.
-const SchemaVersion = 25
+const SchemaVersion = 26
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -266,6 +266,16 @@ CREATE TABLE IF NOT EXISTS rewrite_plan_commits(
     old_oid             TEXT NOT NULL,
     proposed_message    TEXT NOT NULL,
     original_message    TEXT NOT NULL,
+    PRIMARY KEY (plan_id, ord),
+    FOREIGN KEY (plan_id) REFERENCES rewrite_plans(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS rewrite_plan_groups(
+    plan_id             TEXT NOT NULL,
+    ord                 INTEGER NOT NULL,
+    members_json        TEXT NOT NULL,
+    proposed_message    TEXT NOT NULL,
+    grouping_reason     TEXT NOT NULL,
     PRIMARY KEY (plan_id, ord),
     FOREIGN KEY (plan_id) REFERENCES rewrite_plans(id) ON DELETE CASCADE
 );

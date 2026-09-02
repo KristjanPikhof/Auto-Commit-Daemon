@@ -36,3 +36,21 @@ func CheckRewritePlanGenerationGate(cfg ProviderConfig, provider Provider) error
 	}
 	return nil
 }
+
+// CheckHistoryRewritePlanGenerationGate verifies the provider capability for
+// the requested history rewrite mode after the common Intent/provider gate.
+func CheckHistoryRewritePlanGenerationGate(cfg ProviderConfig, provider Provider, messagesOnly bool) error {
+	if err := CheckRewritePlanGenerationGate(cfg, provider); err != nil {
+		return err
+	}
+	if messagesOnly {
+		if _, ok := provider.(CommitRewriteProposer); !ok {
+			return fmt.Errorf("%w: %s cannot rewrite commit messages", ErrRewriteProviderCannotPlan, PrimaryProviderName(provider))
+		}
+		return nil
+	}
+	if _, ok := provider.(HistoryRewritePlanner); !ok {
+		return fmt.Errorf("%w: %s cannot group historical commits", ErrRewriteProviderCannotPlan, PrimaryProviderName(provider))
+	}
+	return nil
+}
