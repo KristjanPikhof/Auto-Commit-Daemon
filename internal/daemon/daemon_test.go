@@ -377,6 +377,7 @@ func TestRun_LifecycleHappyPath(t *testing.T) {
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
