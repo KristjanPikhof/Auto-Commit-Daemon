@@ -65,7 +65,7 @@ func TestAdapterE2E(t *testing.T) {
 	})
 	t.Run("codex", func(t *testing.T) {
 		runCodexE2E(t, bin)
-		runCodexMissingAcdWritesHookLog(t)
+		runCodexMissingAcdIsConfigurationError(t)
 		runCodexLegacyTOMLAutoDetect(t, bin)
 	})
 	t.Run("cursor", func(t *testing.T) {
@@ -523,6 +523,28 @@ func pickHookByEvent(t *testing.T, hooks []hookSpec, want string) hookSpec {
 	return hookSpec{}
 }
 
+func assertIntegrationEventCommand(
+	t *testing.T,
+	command string,
+	harness string,
+	event string,
+) {
+	t.Helper()
+	if strings.Count(command, "acd internal integration event") != 1 {
+		t.Fatalf("%s %s hook must invoke one integration event, got: %s", harness, event, command)
+	}
+	for _, want := range []string{"--harness " + harness, "--event " + event} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("%s hook missing %q, got: %s", event, want, command)
+		}
+	}
+	for _, obsolete := range []string{"internal session open", "internal hint", "integration stdin-extract", "integration cursor-extract"} {
+		if strings.Contains(command, obsolete) {
+			t.Fatalf("%s hook still contains legacy command %q: %s", event, obsolete, command)
+		}
+	}
+}
+
 // clientRow models one daemon_clients row from the per-repo state.db.
 type clientRow struct {
 	SessionID string
@@ -638,80 +660,6 @@ func assertActiveHookSurvivesRejectedStopAll(t *testing.T, label string, ctx con
 	assertClientRow(t, repo, sessionID, harness, 5*time.Second)
 }
 
-// assertActiveHookFailsOnCorruptDB verifies the new chain semantics from the
-// templates lane: when `acd start` fails (here because state.db is garbage),
-// the active hook exits nonzero AND writes an "active hook failed exit=" line
-// to the harness log under XDG_STATE_HOME/acd/<harness>-hook.log. Caller
-// must have already torn the daemon down.
-func assertActiveHookFailsOnCorruptDB(t *testing.T, label string, ctx context.Context, env []string, repo, harness string, hook hookSpec, stdin string) {
-	t.Helper()
-	// The supervisor owns a live repository database for the lifetime of the
-	// enabled repository. Corrupting that database from a test process is no
-	// longer a valid lifecycle failure injection; worker crash/restart coverage
-	// lives in the supervisor integration tests.
-	return
-	/*
-		// Resolve the harness log file from the env we are about to invoke the
-		// hook under so the test reads the same file the hook writes.
-		home := ""
-		xdgState := ""
-		for _, kv := range env {
-			switch {
-			case strings.HasPrefix(kv, "HOME="):
-				home = strings.TrimPrefix(kv, "HOME=")
-			case strings.HasPrefix(kv, "XDG_STATE_HOME="):
-				xdgState = strings.TrimPrefix(kv, "XDG_STATE_HOME=")
-			}
-		}
-		if home == "" {
-			t.Fatalf("%s corrupt-db: HOME missing from env", label)
-		}
-		stateRoot := xdgState
-		if stateRoot == "" {
-			stateRoot = filepath.Join(home, ".local", "state")
-		}
-		logPath := filepath.Join(stateRoot, "acd", harness+"-hook.log")
-		// Truncate any pre-existing log content so we can assert the failure
-		// line was written by THIS hook invocation.
-		_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
-		_ = os.WriteFile(logPath, nil, 0o644)
-
-		// Corrupt state.db. The daemon's sqlite open should fail on garbage,
-		// which propagates as a nonzero exit from `acd start`. Per the new
-		// chain semantics, that nonzero must surface as a nonzero hook exit
-		// (the previous `;` chain swallowed it).
-		dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-		if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-			t.Fatalf("%s corrupt-db: mkdir: %v", label, err)
-		}
-		if err := os.WriteFile(dbPath, []byte("not a sqlite database -- garbage bytes\n"), 0o644); err != nil {
-			t.Fatalf("%s corrupt-db: write garbage: %v", label, err)
-		}
-
-		res := runBash(t, ctx, env, stdin, hook.Command)
-		if res.ExitCode == 0 {
-			t.Fatalf("%s active hook with corrupt state.db: want nonzero exit, got 0\nstdout=%s\nstderr=%s",
-				label, res.Stdout, res.Stderr)
-		}
-
-		// Tail the harness log; it must include the "active hook failed exit="
-		// line emitted by the snippet's failure branch.
-		waitFor(t, label+" harness log records active hook failure", 5*time.Second, func() bool {
-			body, err := os.ReadFile(logPath)
-			if err != nil {
-				return false
-			}
-			return strings.Contains(string(body), "active hook failed exit=")
-		})
-
-		// Clean up: remove the corrupt db so subsequent steps (or a fresh
-		// daemon spawn from the caller) can rebuild a clean schema.
-		if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
-			t.Fatalf("%s corrupt-db: remove garbage db: %v", label, err)
-		}
-	*/
-}
-
 // -----------------------------------------------------------------------------
 // per-harness flows
 // -----------------------------------------------------------------------------
@@ -758,45 +706,16 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 	// The removed registry-wide stop alias must not disrupt active hooks.
 	assertActiveHookSurvivesRejectedStopAll(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
 
-	// Negative-path: corrupt state.db so `acd start` fails. The new
-	// templates chain semantics must surface the failure as a nonzero hook
-	// exit AND write the "active hook failed" line to the harness log.
-	negStop := runBash(t, ctx, env, "",
-		"acd stop --session-id "+shellQuote(sessionID)+
-			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
-	if negStop.ExitCode != 0 {
-		t.Fatalf("claude-code negative-path pre-stop exit=%d\nstdout=%s\nstderr=%s",
-			negStop.ExitCode, negStop.Stdout, negStop.Stderr)
-	}
-	waitDaemonStoppedOrKill(t, "claude-code daemon stopped before negative-path", repo)
-	assertActiveHookFailsOnCorruptDB(t, "claude-code", ctx, env, repo, "claude-code", wakeHook, stdin)
-	// Re-arm the daemon so the SessionEnd path below operates on a clean,
-	// running daemon (avoids a flaky stop on a never-started daemon).
-	if rearm := runBash(t, ctx, env, stdin, startHook.Command); rearm.ExitCode != 0 {
-		t.Fatalf("claude-code re-arm after negative-path exit=%d\nstdout=%s\nstderr=%s",
-			rearm.ExitCode, rearm.Stdout, rearm.Stderr)
-	}
-	waitFor(t, "claude-code daemon mode==running after re-arm", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
-
-	// Stop hook (d1 rewire): now calls `acd flush --logical` rather than the
-	// legacy `acd touch`. Exit must be 0 and the daemon must remain alive
-	// (Stop fires when Claude finishes a turn — the agent is not exiting,
-	// only pausing). The flush request itself drives the bypass-min-pending
+	// Stop is a logical boundary. The daemon must remain alive because Stop
+	// fires when Claude finishes a turn, not when the session closes. The
+	// request itself drives the bypass-min-pending
 	// commit; we cover the commit-within-2s timing in the dedicated
 	// flush_logical integration test.
 	turnStopHook := pickHookByEvent(t, hooks, "Stop")
 	if turnStopHook.Command == "" {
 		t.Fatalf("claude-code snippet missing Stop hook entry")
 	}
-	if !strings.Contains(turnStopHook.Command, "acd internal hint --kind logical_boundary") {
-		t.Fatalf("claude-code Stop hook must call the logical-boundary hint, got: %s", turnStopHook.Command)
-	}
-	if strings.Contains(turnStopHook.Command, "acd touch") {
-		t.Fatalf("claude-code Stop hook still calls legacy `acd touch`; rewire incomplete: %s", turnStopHook.Command)
-	}
+	assertIntegrationEventCommand(t, turnStopHook.Command, "claude-code", "logical_boundary")
 	if turnRes := runBash(t, ctx, env, stdin, turnStopHook.Command); turnRes.ExitCode != 0 {
 		t.Fatalf("claude-code Stop (turn end) exit=%d\nstdout=%s\nstderr=%s",
 			turnRes.ExitCode, turnRes.Stdout, turnRes.Stderr)
@@ -881,28 +800,6 @@ func runCodexE2E(t *testing.T, bin string) {
 	// The removed registry-wide stop alias must not disrupt active hooks.
 	assertActiveHookSurvivesRejectedStopAll(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
 
-	// Negative-path: corrupt state.db so `acd start` fails. Active hook
-	// must exit nonzero AND log "active hook failed" to the codex hook log.
-	negStop := runBash(t, ctx, env, "",
-		"acd stop --session-id "+shellQuote(sessionID)+
-			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
-	if negStop.ExitCode != 0 {
-		t.Fatalf("codex negative-path pre-stop exit=%d\nstdout=%s\nstderr=%s",
-			negStop.ExitCode, negStop.Stdout, negStop.Stderr)
-	}
-	waitDaemonStoppedOrKill(t, "codex daemon stopped before negative-path", repo)
-	assertActiveHookFailsOnCorruptDB(t, "codex", ctx, env, repo, "codex", upHook, stdin)
-	// Re-arm the daemon so the Stop/teardown logic below works on a clean
-	// running daemon.
-	if rearm := runBash(t, ctx, env, stdin, startHook.Command); rearm.ExitCode != 0 {
-		t.Fatalf("codex re-arm after negative-path exit=%d\nstdout=%s\nstderr=%s",
-			rearm.ExitCode, rearm.Stdout, rearm.Stderr)
-	}
-	waitFor(t, "codex daemon mode==running after re-arm", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
-
 	// PreToolUse -> acd wake (matcher path).
 	preHook := pickHookByEvent(t, hooks, "PreToolUse")
 	if preRes := runBash(t, ctx, env, stdin, preHook.Command); preRes.ExitCode != 0 {
@@ -910,18 +807,11 @@ func runCodexE2E(t *testing.T, bin string) {
 			preRes.ExitCode, preRes.Stdout, preRes.Stderr)
 	}
 
-	// Stop -> acd touch --soft-boundary. Daemon must remain alive because
+	// Stop records a soft boundary. Daemon must remain alive because
 	// PostToolUse replay can still be draining when Stop fires. The soft epoch
 	// triggers candidate evaluation without the hard logical-flush bypass.
 	stopHook := pickHookByEvent(t, hooks, "Stop")
-	if !strings.Contains(stopHook.Command, "acd internal hint --kind soft_boundary") {
-		t.Fatalf("codex Stop hook must call the soft-boundary hint: %s",
-			stopHook.Command)
-	}
-	if strings.Contains(stopHook.Command, "acd flush --logical") {
-		t.Fatalf("codex Stop hook must not use hard logical flush: %s",
-			stopHook.Command)
-	}
+	assertIntegrationEventCommand(t, stopHook.Command, "codex", "soft_boundary")
 	if stopRes := runBash(t, ctx, env, stdin, stopHook.Command); stopRes.ExitCode != 0 {
 		t.Fatalf("codex Stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
@@ -982,18 +872,14 @@ func runCursorE2E(t *testing.T, bin string) {
 	assertActiveHookSelfHealsCursor(t, "cursor", ctx, env, home, repo, sessionID, wakeHook, stdin)
 
 	afterEditHook := pickHookByEvent(t, hooks, "afterFileEdit")
-	if !strings.Contains(afterEditHook.Command, "acd internal hint --kind wake") {
-		t.Fatalf("cursor afterFileEdit hook must call the wake hint, got: %s", afterEditHook.Command)
-	}
+	assertIntegrationEventCommand(t, afterEditHook.Command, "cursor", "activity")
 	if afterRes := runCursorHook(t, ctx, env, home, stdin, afterEditHook.Command); afterRes.ExitCode != 0 {
 		t.Fatalf("cursor afterFileEdit exit=%d\nstdout=%s\nstderr=%s",
 			afterRes.ExitCode, afterRes.Stdout, afterRes.Stderr)
 	}
 
 	flushHook := pickHookByEvent(t, hooks, "stop")
-	if !strings.Contains(flushHook.Command, "acd internal hint --kind logical_boundary") {
-		t.Fatalf("cursor stop hook must call the logical-boundary hint, got: %s", flushHook.Command)
-	}
+	assertIntegrationEventCommand(t, flushHook.Command, "cursor", "logical_boundary")
 	if flushRes := runCursorHook(t, ctx, env, home, stdin, flushHook.Command); flushRes.ExitCode != 0 {
 		t.Fatalf("cursor stop (flush) exit=%d\nstdout=%s\nstderr=%s",
 			flushRes.ExitCode, flushRes.Stdout, flushRes.Stderr)
@@ -1067,7 +953,7 @@ func runCodexLegacyTOMLAutoDetect(t *testing.T, bin string) {
 	}
 }
 
-func runCodexMissingAcdWritesHookLog(t *testing.T) {
+func runCodexMissingAcdIsConfigurationError(t *testing.T) {
 	body := readSnippet(t, "codex/hooks.json")
 	hooks := parseCodexHooksJSON(t, body)
 	startHook := pickHookByEvent(t, hooks, "SessionStart")
@@ -1075,64 +961,28 @@ func runCodexMissingAcdWritesHookLog(t *testing.T) {
 	fakeBin := t.TempDir()
 
 	base := withIsolatedHome(t)
-	home := ""
-	for _, kv := range base {
-		if strings.HasPrefix(kv, "HOME=") {
-			home = strings.TrimPrefix(kv, "HOME=")
-			break
-		}
-	}
-	if home == "" {
-		t.Fatal("isolated HOME missing from env")
-	}
-
 	env := envWith(base,
 		"PATH="+fakeBin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	stdin := fmt.Sprintf(`{"session_id":"e2e-codex-missing-acd","cwd":"%s"}`, t.TempDir())
-	// Codex hooks v2: hook bodies use `|| exit 0` after acd hook-stdin-extract
-	// fails so missing/broken acd never blocks the user. The hook log still
-	// captures the stderr from the failed extract attempt.
 	res := runBash(t, ctx, env, stdin, startHook.Command)
-	if res.ExitCode != 0 {
-		t.Fatalf("codex SessionStart without acd should still exit 0, got=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
+	if res.ExitCode == 0 {
+		t.Fatalf("codex SessionStart without acd should report invalid hook configuration\nstdout=%s\nstderr=%s",
+			res.Stdout, res.Stderr)
 	}
 
-	stateRoot := envValue(base, "XDG_STATE_HOME")
-	if stateRoot == "" {
-		stateRoot = filepath.Join(home, ".local", "state")
-	}
-	logPath := filepath.Join(stateRoot, "acd", "codex-hook.log")
-	logBody, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatalf("read codex hook log %s: %v", logPath, err)
-	}
-	// Per the new codex bash body (P1-8 regression), hook-stdin-extract
-	// failure must surface as a printf line tagged
-	// `active hook failed exit=<rc> cmd=acd-hook-stdin-extract`. The
-	// previous shape silently swallowed the helper exit code and only the
-	// "acd: command not found" stderr ended up in the log.
-	for _, want := range []string{"active hook failed exit=", "cmd=acd-hook-stdin-extract"} {
-		if !strings.Contains(string(logBody), want) {
-			t.Fatalf("codex hook log missing %q, got:\n%s", want, logBody)
-		}
+	logPath := filepath.Join(envValue(base, "XDG_STATE_HOME"), "acd", "codex-hook.log")
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("missing acd binary must not create %s: %v", logPath, err)
 	}
 }
 
-// TestAdapterE2E_Codex_HelperMissing covers the P1-8 regression target: when
-// `acd` is on PATH but exits non-zero (here `/usr/bin/false` masquerades as
-// the binary), the codex hook bodies must
-//   - return exit 0 to the harness so the user is not blocked,
-//   - log an explicit printf line tagged `cmd=acd-hook-stdin-extract` so the
-//     failure cause is visible in `acd doctor` output and the harness log.
-//
-// Distinct from `runCodexMissingAcdWritesHookLog` which removes acd from
-// PATH entirely (testing exit=127 / "command not found"). This case tests
-// the more subtle real-world failure where acd exists but is broken.
-func TestAdapterE2E_Codex_HelperMissing(t *testing.T) {
+// TestAdapterE2E_Codex_BrokenBinary proves command configuration errors stay
+// visible. ACD runtime failures fail open inside the command, but a binary
+// that cannot execute the integration protocol is not an ACD runtime result.
+func TestAdapterE2E_Codex_BrokenBinary(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("adapter e2e: Windows snippets not in scope for v1")
 	}
@@ -1147,72 +997,30 @@ func TestAdapterE2E_Codex_HelperMissing(t *testing.T) {
 	body := readSnippet(t, "codex/hooks.json")
 	hooks := parseCodexHooksJSON(t, body)
 
-	// Build a directory where `acd` is a symlink to /usr/bin/false. This
-	// shadows any installed acd on PATH so every invocation exits 1.
 	fakeBin := t.TempDir()
 	if err := os.Symlink(falseBin, filepath.Join(fakeBin, "acd")); err != nil {
 		t.Fatalf("symlink acd -> %s: %v", falseBin, err)
 	}
 
 	base := withIsolatedHome(t)
-	home := ""
-	for _, kv := range base {
-		if strings.HasPrefix(kv, "HOME=") {
-			home = strings.TrimPrefix(kv, "HOME=")
-			break
-		}
-	}
-	if home == "" {
-		t.Fatal("isolated HOME missing from env")
-	}
-
 	env := envWith(base,
 		"PATH="+fakeBin+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+"/usr/bin",
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	stateRoot := envValue(base, "XDG_STATE_HOME")
-	if stateRoot == "" {
-		stateRoot = filepath.Join(home, ".local", "state")
-	}
-	logPath := filepath.Join(stateRoot, "acd", "codex-hook.log")
-
-	// Run every event the codex template registers; each must exit 0
-	// (helper failure is soft-failed) and append a tagged printf line.
+	logPath := filepath.Join(envValue(base, "XDG_STATE_HOME"), "acd", "codex-hook.log")
 	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"} {
-		// Truncate the log between events so each assertion observes only
-		// the printf line written by this event.
-		_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
-		_ = os.WriteFile(logPath, nil, 0o644)
-
 		hook := pickHookByEvent(t, hooks, event)
-		stdin := fmt.Sprintf(`{"session_id":"e2e-codex-helper-missing-%s","cwd":"%s"}`, event, t.TempDir())
+		stdin := fmt.Sprintf(`{"session_id":"e2e-codex-broken-%s","cwd":"%s"}`, event, t.TempDir())
 		res := runBash(t, ctx, env, stdin, hook.Command)
-		if res.ExitCode != 0 {
-			t.Fatalf("codex %s with broken acd should exit 0, got=%d\nstdout=%s\nstderr=%s",
-				event, res.ExitCode, res.Stdout, res.Stderr)
+		if res.ExitCode == 0 {
+			t.Fatalf("codex %s with broken acd should report invalid hook configuration\nstdout=%s\nstderr=%s",
+				event, res.Stdout, res.Stderr)
 		}
-		logBody, err := os.ReadFile(logPath)
-		if err != nil {
-			t.Fatalf("%s: read codex hook log %s: %v", event, logPath, err)
-		}
-		// `/usr/bin/false` exits 1, so the hook-stdin-extract printf branch
-		// fires. The exit code printed must be the real exit (1), not 0.
-		for _, want := range []string{
-			"active hook failed exit=",
-			"cmd=acd-hook-stdin-extract",
-		} {
-			if !strings.Contains(string(logBody), want) {
-				t.Fatalf("%s: codex hook log missing %q, got:\n%s", event, want, logBody)
-			}
-		}
-		// Guard against the rc=$? regression: the printed exit must NOT be
-		// 0 because /usr/bin/false exits 1. If a future template edit drops
-		// the rc=$? capture, $(date +...) would clobber $? to 0.
-		if strings.Contains(string(logBody), "active hook failed exit=0 cmd=acd-hook-stdin-extract") {
-			t.Fatalf("%s: codex hook log printed exit=0 — rc=$? capture lost (P1-8 regression):\n%s", event, logBody)
-		}
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("broken acd binary must not create %s: %v", logPath, err)
 	}
 }
 
@@ -1250,16 +1058,12 @@ func runOpencodeE2E(t *testing.T, bin string) {
 	}
 	assertActiveHookSelfHeals(t, "opencode", ctx, env, repo, sessionID, "opencode", wakeHook, "")
 
-	// Idle hook (d1 rewire): now calls `acd flush --logical` rather than
-	// the legacy `acd touch`. Daemon must remain alive — session.idle does
-	// not end the session.
+	// Idle records a logical boundary and does not end the session.
 	idleHook := pickHookByEvent(t, hooks, "acd-flush-idle")
 	if idleHook.Command == "" {
 		t.Fatalf("opencode snippet missing acd-flush-idle entry (legacy acd-touch-idle id no longer recognised)")
 	}
-	if !strings.Contains(idleHook.Command, "acd internal hint --kind logical_boundary") {
-		t.Fatalf("opencode idle hook must call the logical-boundary hint, got: %s", idleHook.Command)
-	}
+	assertIntegrationEventCommand(t, idleHook.Command, "opencode", "logical_boundary")
 	if idleRes := runBash(t, ctx, env, "", idleHook.Command); idleRes.ExitCode != 0 {
 		t.Fatalf("opencode acd-flush-idle exit=%d\nstdout=%s\nstderr=%s",
 			idleRes.ExitCode, idleRes.Stdout, idleRes.Stderr)
@@ -1311,15 +1115,12 @@ func runPiE2E(t *testing.T, bin string) {
 	}
 	assertActiveHookSelfHeals(t, "pi", ctx, env, repo, sessionID, "pi", wakeHook, "")
 
-	// Idle hook (d1 rewire): now calls `acd flush --logical` rather than
-	// the legacy `acd touch`. Daemon must remain alive after idle.
+	// Idle records a logical boundary and leaves the daemon running.
 	idleHook := pickHookByEvent(t, hooks, "acd-flush-idle")
 	if idleHook.Command == "" {
 		t.Fatalf("pi snippet missing acd-flush-idle entry (legacy acd-touch-idle id no longer recognised)")
 	}
-	if !strings.Contains(idleHook.Command, "acd internal hint --kind logical_boundary") {
-		t.Fatalf("pi idle hook must call the logical-boundary hint, got: %s", idleHook.Command)
-	}
+	assertIntegrationEventCommand(t, idleHook.Command, "pi", "logical_boundary")
 	if idleRes := runBash(t, ctx, env, "", idleHook.Command); idleRes.ExitCode != 0 {
 		t.Fatalf("pi acd-flush-idle exit=%d\nstdout=%s\nstderr=%s",
 			idleRes.ExitCode, idleRes.Stdout, idleRes.Stderr)
