@@ -2118,7 +2118,7 @@ func stripFirstAcdStart(t *testing.T, body string) string {
 // the production wrapper printf line shape. Run with TZ=Asia/Tokyo to
 // catch zone bugs where the parser silently coerced into local time.
 func TestParseLogTimestamp_WrapperPrintfShape(t *testing.T) {
-	// Pin codexHookLogRecentWindow to 5 minutes (matches default; reset
+	// Pin hookLogRecentWindow to 5 minutes (matches default; reset
 	// is not strictly needed but documents the intent of the test).
 	now := time.Now()
 	wrap := func(off time.Duration) string {
@@ -2162,7 +2162,7 @@ func TestParseLogTimestamp_WrapperPrintfShape(t *testing.T) {
 			wantRecent: false,
 		},
 	}
-	cutoff := time.Now().Add(-codexHookLogRecentWindow)
+	cutoff := time.Now().Add(-hookLogRecentWindow)
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
