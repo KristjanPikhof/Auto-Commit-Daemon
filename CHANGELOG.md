@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-09-02
+
 ### Changed
 
 - Updated `charm.land/bubbles/v2` from `v2.2.0` to `v2.2.1`, which includes
