@@ -6,10 +6,11 @@
    `sessionStart`, `postToolUse`, `afterFileEdit`, `stop`, and `sessionEnd`,
    plus top-level `"version": 1`. If the file contains only the acd block you
    can delete it outright. If you merged custom (non-acd) hooks, remove only
-   hook objects whose command contains `acd internal integration cursor-extract`
-   and calls `acd internal session open`, `acd internal hint --kind wake`,
-   `acd internal hint --kind logical_boundary`, or
-   `acd internal session close`, then delete
+   hook objects whose command contains
+   `acd internal integration event --harness cursor`. Older entries can contain
+   `acd internal integration cursor-extract`, `acd internal session open`,
+   `acd internal hint`, or `acd internal session close`; remove those ACD-owned
+   entries too. Then delete
    an event key only if no hooks remain under it. Remove `version` only if
    nothing else needs it. Older installs may also have a top-level
    `_acd_managed` key; remove it if present.
