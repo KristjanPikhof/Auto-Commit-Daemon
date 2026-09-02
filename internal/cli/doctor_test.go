@@ -797,7 +797,7 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 		t.Fatalf("codex should be installed: %+v", codex)
 	}
 	got := strings.Join(codex.Notes, "\n")
-	if !strings.Contains(got, "Codex merges all hook sources and will fire each event twice") {
+	if !strings.Contains(got, "Codex merges all hook sources and will send each ACD integration event twice") {
 		t.Fatalf("codex duplicate-hook warning missing: %+v", codex)
 	}
 }
@@ -975,7 +975,7 @@ func TestDoctor_CodexShadowWarningWithConfigHomeLegacyTOML(t *testing.T) {
 		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
 	}
 	codex := findDoctorHarness(t, rep, "codex")
-	if got := strings.Join(codex.Notes, "\n"); !strings.Contains(got, "Codex merges all hook sources and will fire each event twice") {
+	if got := strings.Join(codex.Notes, "\n"); !strings.Contains(got, "Codex merges all hook sources and will send each ACD integration event twice") {
 		t.Fatalf("codex duplicate-hook warning missing for ~/.config/codex/config.toml: %+v", codex)
 	}
 }
