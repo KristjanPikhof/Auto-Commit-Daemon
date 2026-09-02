@@ -129,7 +129,7 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Run repeated Git shard
+      - name: Run repeated support shard
         run: scripts/dev/test.sh stress-support 2 ${{ matrix.shard.index }}
 
   quality:
