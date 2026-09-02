@@ -162,6 +162,13 @@ faster.
 The default local gate and the complete hosted GitHub Actions workflow each
 have a five-minute wall-clock target.
 
+Hosted pull requests run four core shards and one support lane on both Ubuntu
+and macOS. The support lane runs timing-sensitive tests only after the other
+package tests finish. Repeated daemon stress uses six Ubuntu runners, while
+Git and state stress use two. Each leaf job should finish within four minutes
+and 30 seconds and has a hard five-minute timeout. If a lane exceeds that
+target, split or rebalance it without dropping cases or repetitions.
+
 When tests exceed that budget:
 
 - shard independent packages

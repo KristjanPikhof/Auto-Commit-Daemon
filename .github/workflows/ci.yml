@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Default permissions for all jobs: read-only on contents. Individual jobs
 # may widen this; reading-only by default reduces blast radius if a third-
 # party action is ever compromised before SHA pins update.
@@ -13,16 +17,32 @@ permissions:
 
 env:
   GO_VERSION: '1.26.6'
+  ACD_TEST_TIMEOUT: 4m15s
 
 jobs:
-  test:
+  test-core:
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        os:
+          - runner: ubuntu-latest
+            label: ubuntu
+          - runner: macos-latest
+            label: macos
+        shard:
+          - index: 0
+            label: 1
+          - index: 1
+            label: 2
+          - index: 2
+            label: 3
+          - index: 3
+            label: 4
+    name: test-core (${{ matrix.os.label }}, ${{ matrix.shard.label }}/4)
+    runs-on: ${{ matrix.os.runner }}
+    timeout-minutes: 5
     steps:
       # All actions are pinned to a 40-char commit SHA. The `# vN.M.P`
       # comment is the human-readable tag the SHA was resolved from at
@@ -32,95 +52,137 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - run: make lint
-      - run: make test
-      - run: make build
+      - name: Run CLI and daemon shard
+        run: scripts/dev/test.sh core 4 ${{ matrix.shard.index }}
 
-  race-sensitive:
-    # Wall-clock-sensitive tests still run with the race detector, but once
-    # and without competing stress shards. Resource starvation otherwise
-    # tests runner load instead of the timeout behavior under test.
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-      - name: race + count=1 on timing-sensitive daemon tests
-        run: |
-          go test ./internal/daemon/... -race -count=1 -timeout 5m \
-            -run 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent'
-
-  race-stress-daemon:
-    # Runner-level shards preserve three complete repetitions without making
-    # Git and SQLite processes compete inside one small hosted runner.
+  test-support:
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
-    name: race-stress (daemon ${{ matrix.shard }})
-    runs-on: ubuntu-latest
+        os:
+          - runner: ubuntu-latest
+            label: ubuntu
+            package-parallelism: 2
+          - runner: macos-latest
+            label: macos
+            package-parallelism: 3
+    name: test-support (${{ matrix.os.label }})
+    runs-on: ${{ matrix.os.runner }}
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: race + count=3 daemon shard
+      - name: Run support packages
         env:
-          ACD_TEST_SHARD_INDEX: ${{ matrix.shard }}
-        run: |
-          scripts/dev/test-package-shards.sh ./internal/daemon 4 \
-            -race -count=3 -timeout 10m -failfast \
-            -skip 'TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent'
+          ACD_TEST_PACKAGE_PARALLELISM: ${{ matrix.os.package-parallelism }}
+        run: scripts/dev/test.sh support
+      - name: Run timing-sensitive daemon tests
+        run: scripts/dev/test.sh sensitive
+
+  race-stress-daemon:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - index: 0
+            label: 1
+          - index: 1
+            label: 2
+          - index: 2
+            label: 3
+          - index: 3
+            label: 4
+          - index: 4
+            label: 5
+          - index: 5
+            label: 6
+    name: race-stress (daemon ${{ matrix.shard.label }}/6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Run repeated daemon shard
+        run: scripts/dev/test.sh stress-daemon 6 ${{ matrix.shard.index }}
 
   race-stress-support:
     permissions:
       contents: read
-    name: race-stress (git and state)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - index: 0
+            label: 1
+          - index: 1
+            label: 2
+    name: race-stress (support ${{ matrix.shard.label }}/2)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: race + count=3 support packages
-        run: |
-          go test ./internal/git/... ./internal/state/... \
-            -race -count=3 -timeout 10m -failfast
+      - name: Run repeated support shard
+        run: scripts/dev/test.sh stress-support 2 ${{ matrix.shard.index }}
 
-  race-stress:
+  quality:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Run lint
+        run: make lint
+      - name: Build Linux binary
+        run: make build
+      - name: Cross-build Darwin binaries
+        run: |
+          GOOS=darwin GOARCH=amd64 make build
+          GOOS=darwin GOARCH=arm64 make build
+      - name: Run govulncheck
+        run: go tool govulncheck ./...
+
+  ci:
     permissions:
       contents: read
     if: ${{ always() }}
-    needs: [race-sensitive, race-stress-daemon, race-stress-support]
+    needs:
+      - test-core
+      - test-support
+      - race-stress-daemon
+      - race-stress-support
+      - quality
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Require every race lane
+      - name: Require every CI lane
         env:
-          SENSITIVE_RESULT: ${{ needs.race-sensitive.result }}
-          DAEMON_RESULT: ${{ needs.race-stress-daemon.result }}
-          SUPPORT_RESULT: ${{ needs.race-stress-support.result }}
+          CORE_RESULT: ${{ needs.test-core.result }}
+          SUPPORT_RESULT: ${{ needs.test-support.result }}
+          DAEMON_STRESS_RESULT: ${{ needs.race-stress-daemon.result }}
+          SUPPORT_STRESS_RESULT: ${{ needs.race-stress-support.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
         run: |
-          test "$SENSITIVE_RESULT" = success
-          test "$DAEMON_RESULT" = success
+          test "$CORE_RESULT" = success
           test "$SUPPORT_RESULT" = success
-
-  govulncheck:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-      - name: Run govulncheck
-        run: go tool govulncheck ./...
+          test "$DAEMON_STRESS_RESULT" = success
+          test "$SUPPORT_STRESS_RESULT" = success
+          test "$QUALITY_RESULT" = success
