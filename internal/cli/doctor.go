@@ -455,7 +455,7 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			}
 			jsonOK, legacyTOMLOK := adapter.CodexInstalls()
 			if jsonOK && legacyTOMLOK {
-				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml contain ACD hook installs; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")
+				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml contain ACD hook installs; Codex merges all hook sources and will send each ACD integration event twice. Remove the # acd-managed: true block from config.toml")
 			}
 		}
 		if hr.Installed {
@@ -952,13 +952,13 @@ func harnessHookLogPath(harness string) string {
 	return filepath.Join(home, ".local", "state", "acd", harness+"-hook.log")
 }
 
-// codexHookLogRecentWindow controls how far back tailCodexHookLog looks for
+// hookLogRecentWindow controls how far back hook diagnostics look for
 // "recent" errors; events outside the window are still reported when they
 // fall within the last 50 lines but do not count toward the recent total.
-var codexHookLogRecentWindow = 5 * time.Minute
+var hookLogRecentWindow = 5 * time.Minute
 
 // tailHarnessHookLog reads the trailing 8 KiB of path and inspects up to the
-// last 50 non-empty lines for hook-wrapper failures.
+// last 50 non-empty lines for integration failures.
 func tailHarnessHookLog(path, displayName string) string {
 	if path == "" {
 		return ""
@@ -1008,7 +1008,7 @@ func tailHarnessHookLog(path, displayName string) string {
 	if len(tail) == 0 {
 		return ""
 	}
-	cutoff := time.Now().Add(-codexHookLogRecentWindow)
+	cutoff := time.Now().Add(-hookLogRecentWindow)
 	var firstErr string
 	recentCount := 0
 	totalErr := 0
@@ -1039,7 +1039,7 @@ func tailHarnessHookLog(path, displayName string) string {
 	}
 	if recentCount > 0 {
 		return fmt.Sprintf("%s shows %d recent error(s) within the last %s (first: %s); see %s",
-			displayName, recentCount, formatDurationCompact(codexHookLogRecentWindow), first, homeShort(path))
+			displayName, recentCount, formatDurationCompact(hookLogRecentWindow), first, homeShort(path))
 	}
 	return fmt.Sprintf("%s shows %d error(s) in the last %d line(s) (first: %s); see %s",
 		displayName, totalErr, len(tail), first, homeShort(path))
