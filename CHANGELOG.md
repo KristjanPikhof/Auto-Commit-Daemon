@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Updated `charm.land/bubbles/v2` from `v2.2.0` to `v2.2.1`, which includes
+  an upstream fix for word-left navigation at a textarea boundary.
 - GitHub Actions now runs CLI and daemon test shards in dedicated Ubuntu and
   macOS jobs. Support and timing-sensitive tests run separately, while repeated
   daemon, Git, and state tests use smaller Ubuntu shards. Pull request jobs have
