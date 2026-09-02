@@ -97,7 +97,9 @@ jobs:
             label: 4
           - index: 4
             label: 5
-    name: race-stress (daemon ${{ matrix.shard.label }}/5)
+          - index: 5
+            label: 6
+    name: race-stress (daemon ${{ matrix.shard.label }}/6)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -107,7 +109,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Run repeated daemon shard
-        run: scripts/dev/test.sh stress-daemon 5 ${{ matrix.shard.index }}
+        run: scripts/dev/test.sh stress-daemon 6 ${{ matrix.shard.index }}
 
   race-stress-support:
     permissions:

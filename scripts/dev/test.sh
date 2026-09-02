@@ -65,13 +65,26 @@ run_package_shard() {
 run_core() {
   local count=$1
   local index=$2
+  local cli_pid
+  local daemon_pid
+  local status=0
 
   validate_shard "$count" "$index"
   run_package_shard ./internal/cli "$count" "$index" \
-    -race -count=1 -timeout "$test_timeout"
+    -race -count=1 -timeout "$test_timeout" &
+  cli_pid=$!
   run_package_shard ./internal/daemon "$count" "$index" \
     -race -count=1 -timeout "$test_timeout" \
-    -skip "$timing_sensitive_daemon_tests"
+    -skip "$timing_sensitive_daemon_tests" &
+  daemon_pid=$!
+
+  if ! wait "$cli_pid"; then
+    status=1
+  fi
+  if ! wait "$daemon_pid"; then
+    status=1
+  fi
+  return "$status"
 }
 
 run_support() {
