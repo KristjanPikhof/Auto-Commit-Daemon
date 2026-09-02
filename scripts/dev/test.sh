@@ -124,7 +124,7 @@ run_all() {
   local status=0
   local index
   local support_pid
-  local core_pids=()
+  local -a core_pids=()
 
   validate_shard "$shard_count" 0
   output_root=$(mktemp -d "${TMPDIR:-/tmp}/acd-tests.XXXXXX")
