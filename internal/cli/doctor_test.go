@@ -1822,14 +1822,8 @@ func readSnippet(t *testing.T, path string) []byte {
 	return body
 }
 
-// TestYAMLDrift_FromVerbatimSnippet feeds the verbatim
-// opencode/pi snippet bodies into extractYAMLHookBodies and asserts that
-// (a) the unmodified body has every active hook carrying both `acd start`
-// and `acd wake` (no drift), and (b) when one `acd start` invocation is
-// stripped from a tool.before/tool.after item, the drift scanner reports
-// at least one stale hook. This locks down the regression where the
-// scanner misread nested `actions: - bash:` items as new orphan hookItems
-// and silently dropped the parent event association.
+// TestYAMLDrift_FromVerbatimSnippet verifies unified activity events and
+// detects a changed event name in the shipped OpenCode and Pi snippets.
 func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 	cases := []struct {
 		harness     string
@@ -1842,9 +1836,6 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 		tc := tc
 		t.Run(tc.harness, func(t *testing.T) {
 			body := readSnippet(t, tc.snippetPath)
-			// Clean snippet: every active hook (tool.before.* / tool.after.*)
-			// carries `acd start` AND `acd wake`. scanHookBodyDrift returns
-			// "" when no drift is detected.
 			if note := scanHookBodyDrift(tc.harness, body); note != "" {
 				t.Fatalf("verbatim %s snippet should not report drift, got %q", tc.harness, note)
 			}
@@ -1855,19 +1846,11 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 				t.Fatalf("expected at least 2 active hook bodies for %s, got %d", tc.harness, len(bodies))
 			}
 			for i, b := range bodies {
-				if !strings.Contains(b, "acd internal session open") {
-					t.Fatalf("%s active hook[%d] missing session open in body=%q", tc.harness, i, b)
-				}
-				if !strings.Contains(b, "acd internal hint --kind wake") {
-					t.Fatalf("%s active hook[%d] missing wake hint in body=%q", tc.harness, i, b)
+				if !integrationEventCommandOK(tc.harness, "activity", b) {
+					t.Fatalf("%s active hook[%d] missing activity event in body=%q", tc.harness, i, b)
 				}
 			}
-			// Now strip the FIRST `acd start \` line under any
-			// tool.before/tool.after action to simulate user drift. We
-			// only remove a line that begins (after whitespace) with
-			// `acd start` — the regression we are guarding against: drift
-			// detection silently never fires for real OpenCode/Pi configs.
-			drifted := strings.ReplaceAll(string(body), "acd internal session open", "acd internal session broken")
+			drifted := strings.Replace(string(body), "--event activity", "--event inactive", 1)
 			note := scanHookBodyDrift(tc.harness, []byte(drifted))
 			if note == "" {
 				t.Fatalf("%s drift snippet should report drift, got empty note", tc.harness)
@@ -1895,9 +1878,7 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 			t.Fatalf("cursor active hook[%d] missing canonical start+wake behavior in %q", i, b)
 		}
 	}
-	drifted := strings.Replace(string(body),
-		`acd internal hint --kind wake`,
-		`acd internal hint --kind woke`, 1)
+	drifted := strings.Replace(string(body), `--event activity`, `--event inactive`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("cursor drift snippet should report drift, got empty note")
@@ -1909,9 +1890,7 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 
 func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
-	drifted := strings.Replace(string(body),
-		`acd internal session open`,
-		`acd internal hint --kind wake`, 1)
+	drifted := strings.Replace(string(body), `--event session_open`, `--event activity`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("sessionStart wired to wake should report drift")
@@ -1930,9 +1909,7 @@ func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
 
 func TestJSONDrift_CursorRejectsMissingWakeCommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
-	drifted := strings.Replace(string(body),
-		`acd internal hint --kind wake`,
-		`acd internal hint --kind woke`, 1)
+	drifted := strings.Replace(string(body), `--event activity`, `--event inactive`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("active hook without acd wake should report drift")

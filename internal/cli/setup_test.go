@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -239,6 +240,11 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 		t.Fatalf("parse JSON: %v\nblock:\n%s", err, block)
 	}
 	required := []string{"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"}
+	expectedEvent := map[string]string{
+		"SessionStart": "session_open", "PreToolUse": "activity",
+		"PostToolUse": "activity", "Stop": "logical_boundary",
+		"SessionEnd": "session_close",
+	}
 	for _, ev := range required {
 		entries, ok := settings.Hooks[ev]
 		if !ok || len(entries) == 0 {
@@ -257,10 +263,8 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 				if h.Command == "" {
 					t.Errorf("event %q entry %d hook %d: command is empty", ev, i, j)
 				}
-				if (ev == "PreToolUse" || ev == "PostToolUse") &&
-					(!strings.Contains(h.Command, "acd internal session open") || !strings.Contains(h.Command, "acd internal hint --kind wake")) {
-					t.Errorf("event %q entry %d hook %d: active hook must start before wake: %s", ev, i, j, h.Command)
-				}
+				assertUnifiedIntegrationEvent(t, fmt.Sprintf("%s entry %d hook %d", ev, i, j),
+					h.Command, "claude-code", expectedEvent[ev])
 			}
 		}
 	}
@@ -300,12 +304,8 @@ func TestSetup_ClaudeCode_ActiveHooksAndChainPlusLogFallback(t *testing.T) {
 	}
 }
 
-// TestSetup_ClaudeCode_SessionStartFailSoft guards that SessionStart adopts
-// the codex fail-soft pattern: defines LOG, makes its directory, redirects
-// stderr into LOG, and guards the extract pipeline so a missing acd binary
-// or schema drift never blocks SessionStart.
-//
-// Regression target: P2-15 (claude-code SessionStart no fail-soft).
+// TestSetup_ClaudeCode_SessionStartFailSoft guards the one-process fail-open
+// session-start path.
 func TestSetup_ClaudeCode_SessionStartFailSoft(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "claude-code")
 	start := strings.Index(out, "{")
@@ -328,17 +328,7 @@ func TestSetup_ClaudeCode_SessionStartFailSoft(t *testing.T) {
 		t.Fatalf("SessionStart hook missing")
 	}
 	cmd := ss[0].Hooks[0].Command
-	for _, want := range []string{
-		`LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/claude-code-hook.log"`,
-		`mkdir -p`,
-		`acd internal integration stdin-extract session_id`,
-		`|| exit 0`,
-		`2>>"$LOG"`,
-	} {
-		if !strings.Contains(cmd, want) {
-			t.Errorf("SessionStart missing fail-soft fragment %q in:\n%s", want, cmd)
-		}
-	}
+	assertUnifiedIntegrationEvent(t, "SessionStart", cmd, "claude-code", "session_open")
 }
 
 // --- cursor -----------------------------------------------------------------
@@ -440,6 +430,11 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 		t.Errorf("version=%d want 1", settings.Version)
 	}
 	required := []string{"sessionStart", "postToolUse", "afterFileEdit", "stop", "sessionEnd"}
+	expectedEvent := map[string]string{
+		"sessionStart": "session_open", "postToolUse": "activity",
+		"afterFileEdit": "activity", "stop": "logical_boundary",
+		"sessionEnd": "session_close",
+	}
 	for _, ev := range required {
 		entries, ok := settings.Hooks[ev]
 		if !ok || len(entries) == 0 {
@@ -453,33 +448,8 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 			if h.Timeout <= 0 {
 				t.Errorf("event %q entry %d: timeout must be positive, got %d", ev, i, h.Timeout)
 			}
-			if !strings.Contains(h.Command, "hook-cursor-extract") {
-				t.Errorf("event %q entry %d: command must extract Cursor stdin: %s", ev, i, h.Command)
-			}
-		}
-	}
-	if start := settings.Hooks["sessionStart"]; len(start) > 0 {
-		if !strings.Contains(start[0].Command, "acd internal session open") {
-			t.Errorf("sessionStart hook must call acd start: %s", start[0].Command)
-		}
-	}
-	for _, ev := range []string{"postToolUse", "afterFileEdit"} {
-		entries := settings.Hooks[ev]
-		if len(entries) == 0 {
-			continue
-		}
-		if !strings.Contains(entries[0].Command, "acd internal session open") || !strings.Contains(entries[0].Command, "acd internal hint --kind wake") {
-			t.Errorf("%s hook must call acd start+wake: %s", ev, entries[0].Command)
-		}
-	}
-	if stop := settings.Hooks["stop"]; len(stop) > 0 {
-		if !strings.Contains(stop[0].Command, "acd internal hint --kind logical_boundary") {
-			t.Errorf("stop hook must call acd flush --logical: %s", stop[0].Command)
-		}
-	}
-	if sessionEnd := settings.Hooks["sessionEnd"]; len(sessionEnd) > 0 {
-		if !strings.Contains(sessionEnd[0].Command, "acd internal session close") {
-			t.Errorf("sessionEnd hook must call acd stop: %s", sessionEnd[0].Command)
+			assertUnifiedIntegrationEvent(t, fmt.Sprintf("%s entry %d", ev, i),
+				h.Command, "cursor", expectedEvent[ev])
 		}
 	}
 }
@@ -607,6 +577,11 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 		t.Fatalf("parse codex JSON: %v\nblock:\n%s", err, block)
 	}
 	required := []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
+	expectedEvent := map[string]string{
+		"SessionStart": "session_open", "UserPromptSubmit": "activity",
+		"PreToolUse": "activity", "PostToolUse": "activity",
+		"Stop": "soft_boundary",
+	}
 	for _, ev := range required {
 		entries, ok := settings.Hooks[ev]
 		if !ok || len(entries) == 0 {
@@ -631,9 +606,8 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 				if h.Timeout <= 0 {
 					t.Errorf("event %q entry %d hook %d: timeout must be positive, got %d", ev, i, j, h.Timeout)
 				}
-				if !strings.Contains(h.Command, "acd internal integration stdin-extract session_id cwd") {
-					t.Errorf("event %q entry %d hook %d: command missing multi-arg hook-stdin-extract: %s", ev, i, j, h.Command)
-				}
+				assertUnifiedIntegrationEvent(t, fmt.Sprintf("%s entry %d hook %d", ev, i, j),
+					h.Command, "codex", expectedEvent[ev])
 			}
 		}
 	}
@@ -641,7 +615,7 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	// requests evaluation without bypassing Intent v2 safety gates.
 	if stop := settings.Hooks["Stop"]; len(stop) > 0 && len(stop[0].Hooks) > 0 {
 		command := stop[0].Hooks[0].Command
-		if !strings.Contains(command, "acd internal hint --kind soft_boundary") {
+		if !integrationEventCommandOK("codex", "soft_boundary", command) {
 			t.Errorf("Stop hook must call acd touch --soft-boundary: %s", command)
 		}
 		if strings.Contains(command, "acd flush --logical") {
@@ -682,37 +656,14 @@ func TestSetup_Codex_HelperFailureExplicitlyLogged(t *testing.T) {
 	for ev, entries := range settings.Hooks {
 		for i, entry := range entries {
 			for j, h := range entry.Hooks {
-				cmd := h.Command
-				// New shape: capture helper output via OUT=$(...) so we can
-				// distinguish helper failure from start failure. The old
-				// shape used `{ read -r SID; read -r CWD; } < <(...) || exit 0`
-				// which dropped helper exit on the floor.
-				if strings.Contains(cmd, "< <(acd internal integration stdin-extract") {
-					t.Errorf("%s entry %d hook %d: must not use process substitution + read for helper (drops helper exit): %s", ev, i, j, cmd)
+				expected := "activity"
+				if ev == "SessionStart" {
+					expected = "session_open"
+				} else if ev == "Stop" {
+					expected = "soft_boundary"
 				}
-				if !strings.Contains(cmd, "OUT=$(acd internal integration stdin-extract") {
-					t.Errorf("%s entry %d hook %d: must capture helper output via OUT=$(acd hook-stdin-extract ...): %s", ev, i, j, cmd)
-				}
-				// Helper failure path must log with cmd=acd-hook-stdin-extract
-				// (so corrupt-DB vs missing-binary cases are distinguishable
-				// in the harness log).
-				if !strings.Contains(cmd, "cmd=acd-hook-stdin-extract") {
-					t.Errorf("%s entry %d hook %d: helper failure branch must record cmd=acd-hook-stdin-extract: %s", ev, i, j, cmd)
-				}
-				// Every failure branch must capture rc immediately so an
-				// intervening $(date) substitution does not clobber $?
-				// before printf reads it. SessionStart, UserPromptSubmit,
-				// PreToolUse, PostToolUse have two failure branches (helper
-				// + start/wake); Stop has one (helper only) because the
-				// trailing `acd touch --soft-boundary` is best-effort with
-				// no log line.
-				wantRC := 2
-				if ev == "Stop" {
-					wantRC = 1
-				}
-				if got := strings.Count(cmd, "rc=$?"); got < wantRC {
-					t.Errorf("%s entry %d hook %d: failure branches must capture rc=$? before printing (got %d, want >= %d): %s", ev, i, j, got, wantRC, cmd)
-				}
+				assertUnifiedIntegrationEvent(t, fmt.Sprintf("%s entry %d hook %d", ev, i, j),
+					h.Command, "codex", expected)
 			}
 		}
 	}
@@ -754,14 +705,7 @@ func TestSetup_Codex_ActiveHooksSelfHeal(t *testing.T) {
 		}
 		for i, entry := range entries {
 			for j, h := range entry.Hooks {
-				cmd := h.Command
-				if !strings.Contains(cmd, "acd internal session open") || !strings.Contains(cmd, "acd internal hint --kind wake") {
-					t.Errorf("%s entry %d hook %d: must call both acd start and acd wake: %s", ev, i, j, cmd)
-				}
-				if strings.Index(cmd, "acd internal session open") > strings.Index(cmd, "acd internal hint --kind wake") {
-					t.Errorf("%s entry %d hook %d: acd start must precede acd wake: %s", ev, i, j, cmd)
-				}
-				assertActiveHookAndChainAndLogFallback(t, ev, i, j, cmd, "codex-hook.log")
+				assertActiveHookAndChainAndLogFallback(t, ev, i, j, h.Command, "codex-hook.log")
 			}
 		}
 	}
@@ -815,12 +759,7 @@ func TestSetup_OpenCode_ActiveHooksStartBeforeWake(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
 		block := yamlHookBlock(t, body, id)
-		if !strings.Contains(block, "acd internal session open") || !strings.Contains(block, "acd internal hint --kind wake") {
-			t.Fatalf("%s must run acd start before acd wake:\n%s", id, block)
-		}
-		if strings.Index(block, "acd internal session open") > strings.Index(block, "acd internal hint --kind wake") {
-			t.Fatalf("%s runs acd wake before acd start:\n%s", id, block)
-		}
+		assertUnifiedIntegrationEvent(t, id, block, "opencode", "activity")
 	}
 }
 
@@ -855,16 +794,13 @@ func TestSetup_ClaudeCode_StopHookCallsFlushLogical(t *testing.T) {
 		t.Fatalf("Stop hook missing")
 	}
 	cmd := stop[0].Hooks[0].Command
-	if !strings.Contains(cmd, "acd internal hint --kind logical_boundary") {
+	if !integrationEventCommandOK("claude-code", "logical_boundary", cmd) {
 		t.Errorf("Stop hook must call `acd flush --logical`, got: %s", cmd)
 	}
 	if strings.Contains(cmd, "acd touch") {
 		t.Errorf("Stop hook still calls legacy `acd touch` — rewire incomplete: %s", cmd)
 	}
-	// Same fail-soft pattern as the legacy touch body: stderr lands in $LOG.
-	if !strings.Contains(cmd, `2>>"$LOG"`) {
-		t.Errorf("Stop hook missing stderr->LOG redirect: %s", cmd)
-	}
+	assertUnifiedIntegrationEvent(t, "Stop", cmd, "claude-code", "logical_boundary")
 }
 
 // TestSetup_OpenCode_IdleHookCallsFlushLogical mirrors the claude-code rewire
@@ -886,7 +822,7 @@ func TestSetup_OpenCode_IdleHookCallsFlushLogical(t *testing.T) {
 		t.Errorf("opencode snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
 	}
 	block := yamlHookBlock(t, body, "acd-flush-idle")
-	if !strings.Contains(block, "acd internal hint --kind logical_boundary") {
+	if !integrationEventCommandOK("opencode", "logical_boundary", block) {
 		t.Errorf("opencode acd-flush-idle must call `acd flush --logical`:\n%s", block)
 	}
 	if !strings.Contains(block, "session.idle") {
@@ -906,7 +842,7 @@ func TestSetup_Pi_IdleHookCallsFlushLogical(t *testing.T) {
 		t.Errorf("pi snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
 	}
 	block := yamlHookBlock(t, body, "acd-flush-idle")
-	if !strings.Contains(block, "acd internal hint --kind logical_boundary") {
+	if !integrationEventCommandOK("pi", "logical_boundary", block) {
 		t.Errorf("pi acd-flush-idle must call `acd flush --logical`:\n%s", block)
 	}
 	if !strings.Contains(block, "session.idle") {
@@ -914,37 +850,25 @@ func TestSetup_Pi_IdleHookCallsFlushLogical(t *testing.T) {
 	}
 }
 
-// TestSetup_OpenCode_AllHooksGateMkdir guards that every opencode YAML hook
-// body gates `mkdir -p` behind a `[ -d "$LOG_DIR" ]` check, mirroring the
-// codex template invariant. Unconditional `mkdir -p` on every hook event
-// fork+execs an extra subprocess on the hot path; the gate elides that
-// when the log dir already exists. Regression target: P2-20 (parity gap
-// between codex and opencode/pi snippets).
+// TestSetup_OpenCode_AllHooksGateMkdir now guards that hook-owned logging and
+// mkdir subprocesses stay out of every OpenCode event.
 func TestSetup_OpenCode_AllHooksGateMkdir(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
-		if !strings.Contains(block, "mkdir -p") {
-			t.Errorf("%s: snippet must mkdir LOG_DIR before logging:\n%s", id, block)
-		}
-		if !strings.Contains(block, `[ -d "$LOG_DIR" ] || mkdir -p`) {
-			t.Errorf("%s: mkdir -p must be gated by [ -d \"$LOG_DIR\" ] || mkdir -p:\n%s", id, block)
+		if strings.Contains(block, "mkdir -p") || strings.Contains(block, "-hook.log") {
+			t.Errorf("%s: hook must leave diagnostics to the integration command:\n%s", id, block)
 		}
 	}
 }
 
-// TestSetup_Pi_AllHooksGateMkdir mirrors the opencode case for the Pi
-// template — every Pi YAML hook body must gate mkdir -p behind a
-// directory-exists check.
+// TestSetup_Pi_AllHooksGateMkdir mirrors the OpenCode no-wrapper check.
 func TestSetup_Pi_AllHooksGateMkdir(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
 	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
-		if !strings.Contains(block, "mkdir -p") {
-			t.Errorf("%s: snippet must mkdir LOG_DIR before logging:\n%s", id, block)
-		}
-		if !strings.Contains(block, `[ -d "$LOG_DIR" ] || mkdir -p`) {
-			t.Errorf("%s: mkdir -p must be gated by [ -d \"$LOG_DIR\" ] || mkdir -p:\n%s", id, block)
+		if strings.Contains(block, "mkdir -p") || strings.Contains(block, "-hook.log") {
+			t.Errorf("%s: hook must leave diagnostics to the integration command:\n%s", id, block)
 		}
 	}
 }
@@ -998,23 +922,11 @@ func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testin
 	if strings.Contains(body, "uuidgen") {
 		t.Fatalf("pi snippet must not create one-off session ids with uuidgen:\n%s", body)
 	}
-	// CLAUDE.md / P2-14 requires the SID fallback to be unique per process
-	// when PI_SESSION_ID is unset, so concurrent Pi sessions do not collapse
-	// onto a single shared "unknown" client (which would let the first
-	// session.deleted tear down the daemon while sibling sessions stay
-	// active). The fallback is `pi-$$-$(date +%s)`: $$ is the shell pid
-	// and date is in seconds, so every hook process gets a unique id
-	// without pulling in uuidgen.
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
 		block := yamlHookBlock(t, body, id)
-		if !strings.Contains(block, "acd internal session open") || !strings.Contains(block, "acd internal hint --kind wake") {
-			t.Fatalf("%s must run acd start before acd wake:\n%s", id, block)
-		}
-		if strings.Index(block, "acd internal session open") > strings.Index(block, "acd internal hint --kind wake") {
-			t.Fatalf("%s runs acd wake before acd start:\n%s", id, block)
-		}
-		if !strings.Contains(block, `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`) || !strings.Contains(block, `--session-id "$SID"`) {
-			t.Fatalf("%s must use the per-process unique SID fallback:\n%s", id, block)
+		assertUnifiedIntegrationEvent(t, id, block, "pi", "activity")
+		if !strings.Contains(block, `--session-id "${PI_SESSION_ID:-}"`) || !strings.Contains(block, `--watch-pid "$PPID"`) {
+			t.Fatalf("%s must let the integration command derive the Pi PID fallback:\n%s", id, block)
 		}
 		// Must not regress to the shared "unknown" placeholder.
 		if strings.Contains(block, `PI_SESSION_ID:-unknown`) {
@@ -1023,17 +935,15 @@ func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testin
 	}
 }
 
-// TestSetup_Pi_AllHooksUsePerProcessSIDFallback guards every Pi hook id
-// (start, wake-before, wake-after, idle-touch, stop) carries the same
-// per-process unique fallback. Regression target: P2-14 — if any single
-// hook keeps the legacy `unknown` literal, two concurrent Pi sessions with
-// neither setting PI_SESSION_ID would still collapse on that event.
+// TestSetup_Pi_AllHooksUsePerProcessSIDFallback guards that every Pi event
+// passes the same empty-value override and watch PID to the shared fallback.
 func TestSetup_Pi_AllHooksUsePerProcessSIDFallback(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
 	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
-		if !strings.Contains(block, `SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"`) {
-			t.Errorf("%s: must use per-process unique SID fallback (pi-$$-$(date +%%s)):\n%s", id, block)
+		if !strings.Contains(block, `--session-id "${PI_SESSION_ID:-}"`) ||
+			!strings.Contains(block, `--watch-pid "$PPID"`) {
+			t.Errorf("%s: must pass the Pi session value and watch PID:\n%s", id, block)
 		}
 	}
 }
@@ -1195,75 +1105,39 @@ func TestSetup_Shell_BashSyntaxCheck(t *testing.T) {
 	}
 }
 
-// assertActiveHookAndChainAndLogFallback verifies that an active hook
-// command chains `acd start` and `acd wake` with logical-and so a failed
-// start is not masked by a successful wake, and that the trailing
-// or-clause writes the failure cause into logFile and exits nonzero so the
-// harness can surface it. Used by JSON-bodied harnesses (claude-code,
-// codex) where the bash body lives inside a JSON string.
+// assertActiveHookAndChainAndLogFallback preserves the historical helper name
+// while enforcing the current one-process, fail-open event contract.
 func assertActiveHookAndChainAndLogFallback(t *testing.T, ev string, i, j int, cmd, logFile string) {
 	t.Helper()
-	// Order: acd start before acd wake.
-	startIdx := strings.Index(cmd, "acd internal session open")
-	wakeIdx := strings.Index(cmd, "acd internal hint --kind wake")
-	if startIdx < 0 || wakeIdx < 0 {
-		t.Errorf("%s entry %d hook %d: must call both acd start and acd wake: %s", ev, i, j, cmd)
-		return
-	}
-	if startIdx > wakeIdx {
-		t.Errorf("%s entry %d hook %d: acd start must precede acd wake: %s", ev, i, j, cmd)
-	}
-	// Logical-and chain between start and wake (no plain `;` masking exit).
-	chain := cmd[startIdx:wakeIdx]
-	if !strings.Contains(chain, "&&") {
-		t.Errorf("%s entry %d hook %d: acd start and acd wake must be chained with &&, got: %s", ev, i, j, chain)
-	}
-	// LOG file path appears.
-	if !strings.Contains(cmd, logFile) {
-		t.Errorf("%s entry %d hook %d: missing LOG path %q in: %s", ev, i, j, logFile, cmd)
-	}
-	// Trailing or-clause that writes failure cause and exits nonzero.
-	// Either pattern: `|| { printf ... ; exit 1; }` (JSON-escaped) or `|| {`.
-	if !strings.Contains(cmd, "|| {") {
-		t.Errorf("%s entry %d hook %d: missing tail or-clause `|| { ... ; exit 1; }`: %s", ev, i, j, cmd)
-	}
-	if !strings.Contains(cmd, "exit 1") {
-		t.Errorf("%s entry %d hook %d: failure branch must exit nonzero: %s", ev, i, j, cmd)
-	}
-	// Failure cause goes to LOG.
-	if !strings.Contains(cmd, ">>\\\"$LOG\\\"") && !strings.Contains(cmd, `>>"$LOG"`) {
-		t.Errorf("%s entry %d hook %d: failure must be appended to $LOG: %s", ev, i, j, cmd)
-	}
+	harness := strings.TrimSuffix(logFile, "-hook.log")
+	assertUnifiedIntegrationEvent(t, fmt.Sprintf("%s entry %d hook %d", ev, i, j), cmd, harness, "activity")
 }
 
-// assertYAMLActiveHookAndChainAndLogFallback is the YAML/block-scalar
-// counterpart for opencode and pi snippets.
+// assertYAMLActiveHookAndChainAndLogFallback is the YAML counterpart.
 func assertYAMLActiveHookAndChainAndLogFallback(t *testing.T, id, block, logFile string) {
 	t.Helper()
-	startIdx := strings.Index(block, "acd internal session open")
-	wakeIdx := strings.Index(block, "acd internal hint --kind wake")
-	if startIdx < 0 || wakeIdx < 0 {
-		t.Errorf("%s: must call both acd start and acd wake:\n%s", id, block)
-		return
+	harness := strings.TrimSuffix(logFile, "-hook.log")
+	assertUnifiedIntegrationEvent(t, id, block, harness, "activity")
+}
+
+func assertUnifiedIntegrationEvent(t *testing.T, label, command, harness, event string) {
+	t.Helper()
+	if strings.Count(command, "acd internal integration event") != 1 ||
+		!strings.Contains(command, "--harness "+harness) ||
+		!strings.Contains(command, "--event "+event) {
+		t.Errorf("%s: missing unified %s event for %s: %s", label, event, harness, command)
 	}
-	if startIdx > wakeIdx {
-		t.Errorf("%s: acd start must precede acd wake:\n%s", id, block)
-	}
-	chain := block[startIdx:wakeIdx]
-	if !strings.Contains(chain, "&&") {
-		t.Errorf("%s: acd start and acd wake must be chained with &&:\n%s", id, chain)
-	}
-	if !strings.Contains(block, logFile) {
-		t.Errorf("%s: missing LOG path %q:\n%s", id, logFile, block)
-	}
-	if !strings.Contains(block, "|| {") {
-		t.Errorf("%s: missing tail or-clause `|| { ... ; exit 1 }`:\n%s", id, block)
-	}
-	if !strings.Contains(block, "exit 1") {
-		t.Errorf("%s: failure branch must exit nonzero:\n%s", id, block)
-	}
-	if !strings.Contains(block, `>>"$LOG"`) {
-		t.Errorf("%s: failure must be appended to $LOG:\n%s", id, block)
+	for _, forbidden := range []string{
+		"acd internal integration stdin-extract",
+		"acd internal integration cursor-extract",
+		"acd internal session open",
+		"acd internal hint",
+		"exit 1",
+		"mkdir -p",
+	} {
+		if strings.Contains(command, forbidden) {
+			t.Errorf("%s: contains obsolete hook logic %q: %s", label, forbidden, command)
+		}
 	}
 }
 
