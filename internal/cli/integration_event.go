@@ -177,6 +177,10 @@ func resolveCursorIntegrationRepo(payload map[string]any) (string, error) {
 			if !ok || strings.TrimSpace(root) == "" {
 				continue
 			}
+			root, err := validateHookEmitScalar("workspace_roots", root, "acd internal integration event")
+			if err != nil {
+				return "", err
+			}
 			candidate, err := nearestGitMarkerRoot(root)
 			if err == nil && candidate != "" {
 				return candidate, nil
@@ -235,7 +239,14 @@ func evaluateIntegrationRepo(ctx context.Context, repo string) integrationRepoDe
 		return integrationRepoDecision{State: integrationRepoInactiveDisabled, Root: root, Record: record, Roots: roots}
 	}
 	if !registryRecordHasCanonicalIdentity(record) {
-		return integrationRepoDecision{State: integrationRepoInactiveUnactivated, Root: root, Record: record, Roots: roots}
+		decision := integrationRepoDecision{Root: root, Record: record, Roots: roots}
+		if record.CommonDir == "" && record.RepositoryID == "" && record.WorktreeID == "" {
+			decision.State = integrationRepoInactiveUnactivated
+			return decision
+		}
+		decision.State = integrationRepoIndeterminate
+		decision.Err = errors.New("acd internal integration event: registered repository has invalid canonical identity")
+		return decision
 	}
 
 	worktree, err := git.ResolveWorktree(ctx, root)
