@@ -4,90 +4,53 @@ hooks:
     event: session.created
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
-          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
-          LOG_DIR="$(dirname "$LOG")"
-          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          acd internal session open \
-            --session-id "$SID" \
+          acd internal integration event \
             --harness pi \
+            --event session_open \
+            --session-id "${PI_SESSION_ID:-}" \
             --watch-pid "$PPID" \
-            --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG" || {
-              rc=$?
-              printf '[%s] session-start failed exit=%d cmd=acd-start\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
-              exit 1
-            }
+            --repo "$PI_PROJECT_DIR"
 
   - id: acd-wake-tool-before
     event: tool.before.*
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
-          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
-          LOG_DIR="$(dirname "$LOG")"
-          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          { acd internal session open \
-              --session-id "$SID" \
-              --harness pi \
-              --watch-pid "$PPID" \
-              --repo "$PI_PROJECT_DIR" >/dev/null \
-            && acd internal hint --kind wake \
-              --session-id "$SID" \
-              --repo "$PI_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
-              rc=$?
-              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
-              exit 1
-            }
+          acd internal integration event \
+            --harness pi \
+            --event activity \
+            --session-id "${PI_SESSION_ID:-}" \
+            --watch-pid "$PPID" \
+            --repo "$PI_PROJECT_DIR"
 
   - id: acd-wake-tool-after
     event: tool.after.*
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
-          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
-          LOG_DIR="$(dirname "$LOG")"
-          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          { acd internal session open \
-              --session-id "$SID" \
-              --harness pi \
-              --watch-pid "$PPID" \
-              --repo "$PI_PROJECT_DIR" >/dev/null \
-            && acd internal hint --kind wake \
-              --session-id "$SID" \
-              --repo "$PI_PROJECT_DIR" >/dev/null ; } 2>>"$LOG" || {
-              rc=$?
-              printf '[%s] active hook failed exit=%d cmd=acd-start-wake\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
-              exit 1
-            }
+          acd internal integration event \
+            --harness pi \
+            --event activity \
+            --session-id "${PI_SESSION_ID:-}" \
+            --watch-pid "$PPID" \
+            --repo "$PI_PROJECT_DIR"
 
   - id: acd-flush-idle
     event: session.idle
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
-          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
-          LOG_DIR="$(dirname "$LOG")"
-          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          acd internal hint --kind logical_boundary \
-            --session-id "$SID" \
-            --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG" || {
-              rc=$?
-              printf '[%s] logical-boundary failed exit=%d cmd=acd-flush-logical\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
-              exit 0
-            }
+          acd internal integration event \
+            --harness pi \
+            --event logical_boundary \
+            --session-id "${PI_SESSION_ID:-}" \
+            --watch-pid "$PPID" \
+            --repo "$PI_PROJECT_DIR"
 
   - id: acd-stop
     event: session.deleted
     actions:
       - bash: |
-          SID="${PI_SESSION_ID:-pi-$$-$(date +%s)}"
-          LOG="${XDG_STATE_HOME:-$HOME/.local/state}/acd/pi-hook.log"
-          LOG_DIR="$(dirname "$LOG")"
-          [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null || true
-          acd internal session close \
-            --session-id "$SID" \
-            --repo "$PI_PROJECT_DIR" >/dev/null 2>>"$LOG" || {
-              rc=$?
-              printf '[%s] session-close failed exit=%d cmd=acd-stop\n' "$(date +%FT%T%z)" "$rc" >>"$LOG"
-              exit 0
-            }
+          acd internal integration event \
+            --harness pi \
+            --event session_close \
+            --session-id "${PI_SESSION_ID:-}" \
+            --watch-pid "$PPID" \
+            --repo "$PI_PROJECT_DIR"
