@@ -190,6 +190,9 @@ func TestAdapterE2E_InactiveRepositoriesAreSilent(t *testing.T) {
 				if path := filepath.Join(stateRoot, "acd", adapter.name+"-hook.log"); integrationPathExists(path) {
 					t.Fatalf("inactive hook wrote %s", path)
 				}
+				if socket := filepath.Join(stateRoot, "acd", "run", "supervisor.sock"); integrationPathExists(socket) {
+					t.Fatalf("inactive hook started the supervisor at %s", socket)
+				}
 				if scenario == "unregistered" && integrationPathExists(filepath.Join(repo, ".git", "acd")) {
 					t.Fatal("unregistered hook created repository state")
 				}
