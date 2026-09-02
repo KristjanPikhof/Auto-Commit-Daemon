@@ -83,6 +83,12 @@ func newInternalIntegrationEventCmd() *cobra.Command {
 }
 
 func runIntegrationEvent(ctx context.Context, in io.Reader, event integrationEvent) error {
+	return runIntegrationEventWithSender(ctx, in, event, sendInternalHint)
+}
+
+type integrationHintSender func(context.Context, string, string, bool, string, string, string, int) error
+
+func runIntegrationEventWithSender(ctx context.Context, in io.Reader, event integrationEvent, send integrationHintSender) error {
 	if _, ok := supportedIntegrationHarnesses[event.Harness]; !ok {
 		return fmt.Errorf("acd internal integration event: unsupported harness %q", event.Harness)
 	}
@@ -97,7 +103,7 @@ func runIntegrationEvent(ctx context.Context, in io.Reader, event integrationEve
 	}
 
 	kind, sessionAction := integrationEventProtocol(normalized.Kind)
-	err = sendInternalHint(ctx, normalized.Repo, kind, false, sessionAction,
+	err = send(ctx, normalized.Repo, kind, false, sessionAction,
 		normalized.SessionID, normalized.Harness, normalized.WatchPID)
 	if err != nil {
 		logIntegrationSessionOpenFailure(normalized, err)
