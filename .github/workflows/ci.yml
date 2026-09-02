@@ -64,8 +64,10 @@ jobs:
         os:
           - runner: ubuntu-latest
             label: ubuntu
+            package-parallelism: 2
           - runner: macos-latest
             label: macos
+            package-parallelism: 3
     name: test-support (${{ matrix.os.label }})
     runs-on: ${{ matrix.os.runner }}
     timeout-minutes: 5
@@ -76,6 +78,8 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Run support packages
+        env:
+          ACD_TEST_PACKAGE_PARALLELISM: ${{ matrix.os.package-parallelism }}
         run: scripts/dev/test.sh support
       - name: Run timing-sensitive daemon tests
         run: scripts/dev/test.sh sensitive
