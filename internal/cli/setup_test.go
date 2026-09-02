@@ -108,15 +108,15 @@ func TestSetup_JSONHarnessUninstallDocsCoverLifecycleCommands(t *testing.T) {
 	}{
 		{
 			path: "claude-code/uninstall.md",
-			want: []string{"acd internal integration stdin-extract", "acd internal session open", "acd internal hint --kind wake", "acd internal hint --kind logical_boundary", "acd internal session close"},
+			want: []string{"acd internal integration event --harness claude-code", "acd internal integration stdin-extract", "acd internal session open", "acd internal hint", "acd internal session close"},
 		},
 		{
 			path: "codex/uninstall.md",
-			want: []string{"acd internal integration stdin-extract", "acd internal session open", "acd internal hint --kind wake", "acd internal hint --kind soft_boundary"},
+			want: []string{"acd internal integration event --harness codex", "acd internal integration stdin-extract", "acd internal session open", "acd internal hint"},
 		},
 		{
 			path: "cursor/uninstall.md",
-			want: []string{"acd internal integration cursor-extract", "acd internal session open", "acd internal hint --kind wake", "acd internal hint --kind logical_boundary", "acd internal session close"},
+			want: []string{"acd internal integration event --harness cursor", "acd internal integration cursor-extract", "acd internal session open", "acd internal hint", "acd internal session close"},
 		},
 	}
 	for _, tc := range cases {
