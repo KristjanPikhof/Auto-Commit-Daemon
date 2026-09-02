@@ -1730,6 +1730,56 @@ func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
 	}
 }
 
+func TestDoctor_HookLogTailSurfacedForEveryInstalledAdapter(t *testing.T) {
+	roots := withIsolatedHome(t)
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+	home := os.Getenv("HOME")
+	installs := []struct {
+		name     string
+		path     string
+		template string
+	}{
+		{"claude-code", filepath.Join(home, ".claude", "settings.json"), "claude-code/settings.snippet.json"},
+		{"codex", filepath.Join(home, ".codex", "hooks.json"), "codex/hooks.json"},
+		{"cursor", filepath.Join(home, ".cursor", "hooks.json"), "cursor/hooks.json"},
+		{"opencode", filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml"), "opencode/hooks.snippet.yaml"},
+		{"pi", filepath.Join(home, ".pi", "agent", "hook", "hooks.yaml"), "pi/hooks.snippet.yaml"},
+	}
+	if err := os.MkdirAll(roots.State, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, install := range installs {
+		if err := os.MkdirAll(filepath.Dir(install.path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(install.path, readSnippet(t, install.template), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		line := fmt.Sprintf(`{"ts":%q,"level":"error","msg":"integration event failed","harness":%q,"event":"session_open","cause":"supervisor unavailable"}`+"\n",
+			time.Now().Format(time.RFC3339), install.name)
+		if err := os.WriteFile(filepath.Join(roots.State, install.name+"-hook.log"), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var output bytes.Buffer
+	if err := runDoctor(context.Background(), &output, false, "", true); err != nil {
+		t.Fatal(err)
+	}
+	var report doctorReport
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	for _, install := range installs {
+		harness := findDoctorHarness(t, report, install.name)
+		notes := strings.Join(harness.Notes, "\n")
+		if !harness.Installed || !strings.Contains(notes, install.name+"-hook.log") {
+			t.Fatalf("doctor did not surface %s hook log: %+v", install.name, harness)
+		}
+	}
+}
+
 // TestDoctor_CodexHookLogQuietWhenNoErrors verifies the log-tail check stays
 // silent for lines that are not wrapper-printf failures: plain info lines,
 // JSONL info lines that happen to mention "failed_blocking_pending=0", and
