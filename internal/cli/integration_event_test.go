@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 func TestEvaluateIntegrationRepoInactivePathsAreReadOnly(t *testing.T) {
@@ -160,6 +162,27 @@ func TestEvaluateIntegrationRepoSupportsLinkedWorktreeGitFile(t *testing.T) {
 	}
 }
 
+func TestEvaluateIntegrationRepoSupportsSubmoduleGitFile(t *testing.T) {
+	roots := withIsolatedHome(t)
+	parent := materializeTestRepo(t, true)
+	source := materializeTestRepo(t, true)
+	if _, err := gitpkg.Run(context.Background(), gitpkg.RunOpts{Dir: parent},
+		"-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "modules/child"); err != nil {
+		t.Fatal(err)
+	}
+	submodule := filepath.Join(parent, "modules", "child")
+	registerResolvedIntegrationRepo(t, roots, submodule)
+
+	decision := evaluateIntegrationRepo(context.Background(), submodule)
+	if decision.State != integrationRepoActive {
+		t.Fatalf("submodule decision=%+v", decision)
+	}
+	info, err := os.Stat(filepath.Join(submodule, ".git"))
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("submodule .git marker is not a file: info=%v err=%v", info, err)
+	}
+}
+
 func TestEvaluateIntegrationRepoRegistryFailuresAreIndeterminate(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo := makeUnregisteredStartRepo(t)
@@ -206,6 +229,36 @@ func TestRunIntegrationEventMapsEachEventToOneSend(t *testing.T) {
 				t.Fatalf("run=(%v), sends=%d want 1", err, calls)
 			}
 		})
+	}
+}
+
+func TestRepeatedActivityRefreshesOneClient(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := state.Open(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	raw, err := json.Marshal(map[string]any{
+		"session_action": "open",
+		"session_id":     "same-session",
+		"harness":        "codex",
+		"watch_pid":      42,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := applyWorkerSessionParams(context.Background(), db, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exists, count, err := state.ReadClientRegistration(context.Background(), dbPath, "same-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || count != 1 {
+		t.Fatalf("client exists=%t count=%d want one refreshed client", exists, count)
 	}
 }
 
