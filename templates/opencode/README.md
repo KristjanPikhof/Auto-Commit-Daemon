@@ -15,4 +15,7 @@ Session, tool, idle, and deletion events provide semantic and publication
 boundary hints. Filesystem watching and complete polling remain authoritative
 for protection.
 
+Each hook sends one normalized event. ACD first checks the nearest Git root and
+quietly ignores repositories where protection is not active.
+
 Use `acd doctor` for drift and `acd uninstall --dry-run` for safe removal.
