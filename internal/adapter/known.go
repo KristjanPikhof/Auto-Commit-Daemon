@@ -136,12 +136,15 @@ func textFileContains(path string, detector installDetector) bool {
 
 var (
 	claudeCodeJSONDetector = orInstallDetector(
+		jsonCommandSignatureDetector("acd internal integration event", "--harness claude-code"),
 		jsonSignatureOrLegacyDetector("acd hook-stdin-extract", "--harness claude-code"),
 		jsonCommandSignatureDetector("acd internal integration stdin-extract", "--harness claude-code"))
 	codexJSONDetector = orInstallDetector(
+		jsonCommandSignatureDetector("acd internal integration event", "--harness codex"),
 		jsonSignatureOrLegacyDetector("acd hook-stdin-extract", "--harness codex"),
 		jsonCommandSignatureDetector("acd internal integration stdin-extract", "--harness codex"))
 	cursorJSONDetector = orInstallDetector(
+		jsonCommandSignatureDetector("acd internal integration event", "--harness cursor"),
 		jsonSignatureOrLegacyDetector("acd hook-cursor-extract", "--harness cursor"),
 		jsonCommandSignatureDetector("acd internal integration cursor-extract", "--harness cursor"))
 	// tomlAcdManagedMarkers requires the leading `#` comment prefix because

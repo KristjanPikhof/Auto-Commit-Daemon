@@ -12,6 +12,35 @@ const (
 	schemaCleanCursorHooks     = `{"version":1,"hooks":{"postToolUse":[{"command":"acd hook-cursor-extract && acd start --harness cursor && acd wake"}]}}`
 )
 
+func TestDetectInstalled_UnifiedEventSignatures(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{"claude-code", ".claude/settings.json", `{"hooks":{"PreToolUse":[{"hooks":[{"command":"acd internal integration event --harness claude-code --event activity"}]}]}}`},
+		{"codex", ".codex/hooks.json", `{"hooks":{"PreToolUse":[{"hooks":[{"command":"acd internal integration event --harness codex --event activity"}]}]}}`},
+		{"cursor", ".cursor/hooks.json", `{"version":1,"hooks":{"postToolUse":[{"command":"acd internal integration event --harness cursor --event activity"}]}}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			path := filepath.Join(home, tc.path)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			installed := DetectInstalled()
+			if len(installed) != 1 || installed[0].Name() != tc.name {
+				t.Fatalf("DetectInstalled=%#v want %s", installed, tc.name)
+			}
+		})
+	}
+}
+
 func TestDetectInstalled_ClaudeCodeSignature(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

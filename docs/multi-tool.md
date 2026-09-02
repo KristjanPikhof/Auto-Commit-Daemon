@@ -7,6 +7,11 @@ polling observes the resulting filesystem state.
 Optional integrations add semantic or boundary hints. Duplicate hints are
 idempotent observations and do not create a second protection engine.
 
+Some tools install hooks for every workspace. Each ACD hook checks the nearest
+Git root against ACD's registry before it contacts the supervisor. Repositories
+where ACD is off, disabled, or not registered are ignored without creating
+state or showing a hook error.
+
 One worker owns each Git common directory, so linked worktrees share ownership
 while retaining distinct worktree identities and settings. Publication uses
 the current exact branch token and suspends during transitions or unsafe Git

@@ -797,7 +797,7 @@ func TestDoctor_CodexShadowWarningWhenLegacyTOMLAlongsideHooksJSON(t *testing.T)
 		t.Fatalf("codex should be installed: %+v", codex)
 	}
 	got := strings.Join(codex.Notes, "\n")
-	if !strings.Contains(got, "Codex merges all hook sources and will fire each event twice") {
+	if !strings.Contains(got, "Codex merges all hook sources and will send each ACD integration event twice") {
 		t.Fatalf("codex duplicate-hook warning missing: %+v", codex)
 	}
 }
@@ -975,7 +975,7 @@ func TestDoctor_CodexShadowWarningWithConfigHomeLegacyTOML(t *testing.T) {
 		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
 	}
 	codex := findDoctorHarness(t, rep, "codex")
-	if got := strings.Join(codex.Notes, "\n"); !strings.Contains(got, "Codex merges all hook sources and will fire each event twice") {
+	if got := strings.Join(codex.Notes, "\n"); !strings.Contains(got, "Codex merges all hook sources and will send each ACD integration event twice") {
 		t.Fatalf("codex duplicate-hook warning missing for ~/.config/codex/config.toml: %+v", codex)
 	}
 }
@@ -1730,6 +1730,56 @@ func TestDoctor_CodexHookLogTailSurfaced(t *testing.T) {
 	}
 }
 
+func TestDoctor_HookLogTailSurfacedForEveryInstalledAdapter(t *testing.T) {
+	roots := withIsolatedHome(t)
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv(ai.EnvAPIKey, "")
+	home := os.Getenv("HOME")
+	installs := []struct {
+		name     string
+		path     string
+		template string
+	}{
+		{"claude-code", filepath.Join(home, ".claude", "settings.json"), "claude-code/settings.snippet.json"},
+		{"codex", filepath.Join(home, ".codex", "hooks.json"), "codex/hooks.json"},
+		{"cursor", filepath.Join(home, ".cursor", "hooks.json"), "cursor/hooks.json"},
+		{"opencode", filepath.Join(home, ".config", "opencode", "hook", "hooks.yaml"), "opencode/hooks.snippet.yaml"},
+		{"pi", filepath.Join(home, ".pi", "agent", "hook", "hooks.yaml"), "pi/hooks.snippet.yaml"},
+	}
+	if err := os.MkdirAll(roots.State, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, install := range installs {
+		if err := os.MkdirAll(filepath.Dir(install.path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(install.path, readSnippet(t, install.template), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		line := fmt.Sprintf(`{"ts":%q,"level":"error","msg":"integration event failed","harness":%q,"event":"session_open","cause":"supervisor unavailable"}`+"\n",
+			time.Now().Format(time.RFC3339), install.name)
+		if err := os.WriteFile(filepath.Join(roots.State, install.name+"-hook.log"), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var output bytes.Buffer
+	if err := runDoctor(context.Background(), &output, false, "", true); err != nil {
+		t.Fatal(err)
+	}
+	var report doctorReport
+	if err := json.Unmarshal(output.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	for _, install := range installs {
+		harness := findDoctorHarness(t, report, install.name)
+		notes := strings.Join(harness.Notes, "\n")
+		if !harness.Installed || !strings.Contains(notes, install.name+"-hook.log") {
+			t.Fatalf("doctor did not surface %s hook log: %+v", install.name, harness)
+		}
+	}
+}
+
 // TestDoctor_CodexHookLogQuietWhenNoErrors verifies the log-tail check stays
 // silent for lines that are not wrapper-printf failures: plain info lines,
 // JSONL info lines that happen to mention "failed_blocking_pending=0", and
@@ -1822,14 +1872,8 @@ func readSnippet(t *testing.T, path string) []byte {
 	return body
 }
 
-// TestYAMLDrift_FromVerbatimSnippet feeds the verbatim
-// opencode/pi snippet bodies into extractYAMLHookBodies and asserts that
-// (a) the unmodified body has every active hook carrying both `acd start`
-// and `acd wake` (no drift), and (b) when one `acd start` invocation is
-// stripped from a tool.before/tool.after item, the drift scanner reports
-// at least one stale hook. This locks down the regression where the
-// scanner misread nested `actions: - bash:` items as new orphan hookItems
-// and silently dropped the parent event association.
+// TestYAMLDrift_FromVerbatimSnippet verifies unified activity events and
+// detects a changed event name in the shipped OpenCode and Pi snippets.
 func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 	cases := []struct {
 		harness     string
@@ -1842,9 +1886,6 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 		tc := tc
 		t.Run(tc.harness, func(t *testing.T) {
 			body := readSnippet(t, tc.snippetPath)
-			// Clean snippet: every active hook (tool.before.* / tool.after.*)
-			// carries `acd start` AND `acd wake`. scanHookBodyDrift returns
-			// "" when no drift is detected.
 			if note := scanHookBodyDrift(tc.harness, body); note != "" {
 				t.Fatalf("verbatim %s snippet should not report drift, got %q", tc.harness, note)
 			}
@@ -1855,19 +1896,11 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 				t.Fatalf("expected at least 2 active hook bodies for %s, got %d", tc.harness, len(bodies))
 			}
 			for i, b := range bodies {
-				if !strings.Contains(b, "acd internal session open") {
-					t.Fatalf("%s active hook[%d] missing session open in body=%q", tc.harness, i, b)
-				}
-				if !strings.Contains(b, "acd internal hint --kind wake") {
-					t.Fatalf("%s active hook[%d] missing wake hint in body=%q", tc.harness, i, b)
+				if !integrationEventCommandOK(tc.harness, "activity", b) {
+					t.Fatalf("%s active hook[%d] missing activity event in body=%q", tc.harness, i, b)
 				}
 			}
-			// Now strip the FIRST `acd start \` line under any
-			// tool.before/tool.after action to simulate user drift. We
-			// only remove a line that begins (after whitespace) with
-			// `acd start` — the regression we are guarding against: drift
-			// detection silently never fires for real OpenCode/Pi configs.
-			drifted := strings.ReplaceAll(string(body), "acd internal session open", "acd internal session broken")
+			drifted := strings.Replace(string(body), "--event activity", "--event inactive", 1)
 			note := scanHookBodyDrift(tc.harness, []byte(drifted))
 			if note == "" {
 				t.Fatalf("%s drift snippet should report drift, got empty note", tc.harness)
@@ -1895,9 +1928,7 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 			t.Fatalf("cursor active hook[%d] missing canonical start+wake behavior in %q", i, b)
 		}
 	}
-	drifted := strings.Replace(string(body),
-		`acd internal hint --kind wake`,
-		`acd internal hint --kind woke`, 1)
+	drifted := strings.Replace(string(body), `--event activity`, `--event inactive`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("cursor drift snippet should report drift, got empty note")
@@ -1909,9 +1940,7 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 
 func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
-	drifted := strings.Replace(string(body),
-		`acd internal session open`,
-		`acd internal hint --kind wake`, 1)
+	drifted := strings.Replace(string(body), `--event session_open`, `--event activity`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("sessionStart wired to wake should report drift")
@@ -1930,9 +1959,7 @@ func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
 
 func TestJSONDrift_CursorRejectsMissingWakeCommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
-	drifted := strings.Replace(string(body),
-		`acd internal hint --kind wake`,
-		`acd internal hint --kind woke`, 1)
+	drifted := strings.Replace(string(body), `--event activity`, `--event inactive`, 1)
 	note := scanHookBodyDrift("cursor", []byte(drifted))
 	if note == "" {
 		t.Fatalf("active hook without acd wake should report drift")
@@ -2091,7 +2118,7 @@ func stripFirstAcdStart(t *testing.T, body string) string {
 // the production wrapper printf line shape. Run with TZ=Asia/Tokyo to
 // catch zone bugs where the parser silently coerced into local time.
 func TestParseLogTimestamp_WrapperPrintfShape(t *testing.T) {
-	// Pin codexHookLogRecentWindow to 5 minutes (matches default; reset
+	// Pin hookLogRecentWindow to 5 minutes (matches default; reset
 	// is not strictly needed but documents the intent of the test).
 	now := time.Now()
 	wrap := func(off time.Duration) string {
@@ -2135,7 +2162,7 @@ func TestParseLogTimestamp_WrapperPrintfShape(t *testing.T) {
 			wantRecent: false,
 		},
 	}
-	cutoff := time.Now().Add(-codexHookLogRecentWindow)
+	cutoff := time.Now().Add(-hookLogRecentWindow)
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {

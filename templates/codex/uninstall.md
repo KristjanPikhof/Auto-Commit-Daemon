@@ -4,10 +4,9 @@
    `~/.codex/hooks.json`. For manual cleanup, if the file
    contains only the acd block you can delete it outright. If you have merged
    custom (non-acd) hooks, remove only hook objects whose command contains
-   `acd internal integration stdin-extract` and calls
-   `acd internal session open`, `acd internal hint --kind wake`, or
-   `acd internal hint --kind soft_boundary` (including legacy
-   heartbeat-only Stop hooks),
+   `acd internal integration event --harness codex`. Older entries can contain
+   `acd internal integration stdin-extract`, `acd internal session open`, or
+   `acd internal hint`; remove those ACD-owned entries too,
    then delete an event key (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
    `PostToolUse`, `Stop`) only if no hooks remain under it. Older installs may
    also have a top-level `_acd_managed` key; remove it if present.
@@ -25,4 +24,5 @@
 5. Remove protected data only through `acd uninstall --purge-data`, after
    reviewing the exact plan and supplying its second confirmation.
 
-The hook log lives at `~/.local/state/acd/codex-hook.log`; remove it if you want a fully clean slate.
+The hook log lives at `~/.local/state/acd/codex-hook.log`; remove it if you want
+a fully clean slate.

@@ -455,14 +455,11 @@ func collectDoctorHarnesses() []doctorHarnessReport {
 			}
 			jsonOK, legacyTOMLOK := adapter.CodexInstalls()
 			if jsonOK && legacyTOMLOK {
-				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml contain ACD hook installs; Codex merges all hook sources and will fire each event twice (doubled acd start/wake/touch). Remove the # acd-managed: true block from config.toml")
-			}
-			if note := tailCodexHookLog(); note != "" {
-				hr.Notes = append(hr.Notes, note)
+				hr.Notes = append(hr.Notes, "both ~/.codex/hooks.json and a legacy Codex config.toml contain ACD hook installs; Codex merges all hook sources and will send each ACD integration event twice. Remove the # acd-managed: true block from config.toml")
 			}
 		}
-		if name == "cursor" && hr.Installed {
-			if note := tailCursorHookLog(); note != "" {
+		if hr.Installed {
+			if note := tailHarnessHookLog(harnessHookLogPath(name), name+"-hook.log"); note != "" {
 				hr.Notes = append(hr.Notes, note)
 			}
 		}
@@ -483,8 +480,8 @@ func codexLegacyJSONManagedKeyNote(path string) string {
 }
 
 // driftRemediationCommands maps each supported harness to the recommended
-// remediation hint shown when an active hook is missing the canonical
-// `acd start` + `acd wake` body. The hint shows the merge-first (non-
+// remediation hint shown when a lifecycle hook is missing the canonical
+// integration event. The hint shows the merge-first (non-
 // destructive) form first, then the full-overwrite form as an alternative so
 // users with custom hooks are not surprised by silent config loss.
 var driftRemediationCommands = map[string]string{
@@ -553,19 +550,22 @@ func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	return fmt.Sprintf("installed snippet drift: %d lifecycle hook(s) missing the canonical command; reinstall via %s", stale, cmd)
 }
 
-// cursorLifecycleSubcommands maps wired Cursor hook events to the acd command
-// each inline hook string must invoke.
-var cursorLifecycleSubcommands = map[string]string{
-	"sessionStart":  "start",
-	"postToolUse":   "wake",
-	"afterFileEdit": "wake",
-	"stop":          "flush",
-	"sessionEnd":    "stop",
+// cursorLifecycleEvents maps Cursor hook events to the normalized integration
+// event each inline command must invoke.
+var cursorLifecycleEvents = map[string]string{
+	"sessionStart":  "session_open",
+	"postToolUse":   "activity",
+	"afterFileEdit": "activity",
+	"stop":          "logical_boundary",
+	"sessionEnd":    "session_close",
 }
 
 // activeHookBodyHasStartWake reports whether an installed active-hook command
 // body still carries the canonical acd start+wake behavior.
 func activeHookBodyHasStartWake(harness, body string) bool {
+	if integrationEventCommandOK(harness, "activity", body) {
+		return true
+	}
 	if strings.Contains(body, "acd start") && strings.Contains(body, "acd wake") {
 		return true
 	}
@@ -617,6 +617,9 @@ var codexTouchInvocation = regexp.MustCompile(
 )
 
 func codexStopHasSoftBoundary(command string) bool {
+	if integrationEventCommandOK("codex", "soft_boundary", command) {
+		return true
+	}
 	if strings.Contains(command, "acd internal hint --kind soft_boundary") {
 		return true
 	}
@@ -637,7 +640,7 @@ func countCursorStaleLifecycleCommands(body []byte) int {
 		return 0
 	}
 	stale := 0
-	for event, want := range cursorLifecycleSubcommands {
+	for event, want := range cursorLifecycleEvents {
 		cmds := byEvent[event]
 		if len(cmds) == 0 {
 			stale++
@@ -652,20 +655,29 @@ func countCursorStaleLifecycleCommands(body []byte) int {
 	return stale
 }
 
-func cursorLifecycleCommandOK(wantSubcmd, command string) bool {
-	switch wantSubcmd {
-	case "wake":
+func cursorLifecycleCommandOK(wantEvent, command string) bool {
+	if integrationEventCommandOK("cursor", wantEvent, command) {
+		return true
+	}
+	switch wantEvent {
+	case "activity":
 		return (strings.Contains(command, "acd start") && strings.Contains(command, "acd wake")) ||
 			(strings.Contains(command, "acd internal session open") &&
 				strings.Contains(command, "acd internal hint --kind wake"))
-	case "start":
+	case "session_open":
 		return strings.Contains(command, "acd start") || strings.Contains(command, "acd internal session open")
-	case "flush":
+	case "logical_boundary":
 		return strings.Contains(command, "acd flush --logical") || strings.Contains(command, "acd internal hint --kind logical_boundary")
-	case "stop":
+	case "session_close":
 		return strings.Contains(command, "acd stop") || strings.Contains(command, "acd internal session close")
 	}
 	return false
+}
+
+func integrationEventCommandOK(harness, event, command string) bool {
+	return strings.Contains(command, "acd internal integration event") &&
+		strings.Contains(command, "--harness "+harness) &&
+		strings.Contains(command, "--event "+event)
 }
 
 // extractCursorHookCommandsByEvent parses Cursor hooks.json and returns the
@@ -940,36 +952,13 @@ func harnessHookLogPath(harness string) string {
 	return filepath.Join(home, ".local", "state", "acd", harness+"-hook.log")
 }
 
-// codexHookLogPath returns the canonical location of codex-hook.log under
-// XDG_STATE_HOME (defaulting to $HOME/.local/state). Mirrors the path used
-// by templates/codex/hooks.json.
-func codexHookLogPath() string {
-	return harnessHookLogPath("codex")
-}
-
-func cursorHookLogPath() string {
-	return harnessHookLogPath("cursor")
-}
-
-// codexHookLogRecentWindow controls how far back tailCodexHookLog looks for
+// hookLogRecentWindow controls how far back hook diagnostics look for
 // "recent" errors; events outside the window are still reported when they
 // fall within the last 50 lines but do not count toward the recent total.
-var codexHookLogRecentWindow = 5 * time.Minute
-
-// tailCodexHookLog returns a Note describing recent codex-hook.log entries
-// that look like errors (stderr-style), or "" when the file does not exist
-// or contains no error-like lines.
-func tailCodexHookLog() string {
-	return tailHarnessHookLog(codexHookLogPath(), "codex-hook.log")
-}
-
-// tailCursorHookLog mirrors tailCodexHookLog for cursor-hook.log.
-func tailCursorHookLog() string {
-	return tailHarnessHookLog(cursorHookLogPath(), "cursor-hook.log")
-}
+var hookLogRecentWindow = 5 * time.Minute
 
 // tailHarnessHookLog reads the trailing 8 KiB of path and inspects up to the
-// last 50 non-empty lines for hook-wrapper failures.
+// last 50 non-empty lines for integration failures.
 func tailHarnessHookLog(path, displayName string) string {
 	if path == "" {
 		return ""
@@ -1019,7 +1008,7 @@ func tailHarnessHookLog(path, displayName string) string {
 	if len(tail) == 0 {
 		return ""
 	}
-	cutoff := time.Now().Add(-codexHookLogRecentWindow)
+	cutoff := time.Now().Add(-hookLogRecentWindow)
 	var firstErr string
 	recentCount := 0
 	totalErr := 0
@@ -1050,7 +1039,7 @@ func tailHarnessHookLog(path, displayName string) string {
 	}
 	if recentCount > 0 {
 		return fmt.Sprintf("%s shows %d recent error(s) within the last %s (first: %s); see %s",
-			displayName, recentCount, formatDurationCompact(codexHookLogRecentWindow), first, homeShort(path))
+			displayName, recentCount, formatDurationCompact(hookLogRecentWindow), first, homeShort(path))
 	}
 	return fmt.Sprintf("%s shows %d error(s) in the last %d line(s) (first: %s); see %s",
 		displayName, totalErr, len(tail), first, homeShort(path))
