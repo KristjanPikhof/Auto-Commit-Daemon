@@ -6835,7 +6835,6 @@ func TestRun_PauseStateReadFailClosed(t *testing.T) {
 	wakeCh := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -6857,6 +6856,7 @@ func TestRun_PauseStateReadFailClosed(t *testing.T) {
 		cancel()
 		wg.Wait()
 	})
+	waitForDaemonMode(t, f.db, "running", 10*time.Second)
 
 	// Edit a file that would normally produce a captured event; force
 	// several wakes so the run loop has clear opportunities to fall through
