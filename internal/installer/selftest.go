@@ -60,6 +60,14 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
 		return err
 	}
+	// The worker's isolated HOME hides the user's global Git identity. Keep
+	// the test identity in this repository so publication can use it too.
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "config", "--local", "user.name", "ACD Self Test"); err != nil {
+		return err
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "config", "--local", "user.email", "selftest@localhost"); err != nil {
+		return err
+	}
 	file := filepath.Join(repo, "file.txt")
 	if err := os.WriteFile(file, []byte("one\n"), 0o644); err != nil {
 		return err
@@ -67,7 +75,7 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "add", "file.txt"); err != nil {
 		return err
 	}
-	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "-c", "user.name=ACD Self Test", "-c", "user.email=selftest@localhost", "commit", "-m", "seed"); err != nil {
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "commit", "-m", "seed"); err != nil {
 		return err
 	}
 	wt, err := gitpkg.ResolveWorktree(ctx, repo)
