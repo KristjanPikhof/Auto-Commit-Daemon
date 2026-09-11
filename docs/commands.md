@@ -58,6 +58,9 @@ and migrates enabled repositories before committing the global transaction.
 Disabled repository records are preserved and their databases are left
 unchanged until their next `acd on`.
 
+The isolated setup self-test uses its own Git identity in a scratch repository.
+Your global Git identity and repository settings are unchanged.
+
 Existing installations skip first-run questions and keep their current
 settings.
 
