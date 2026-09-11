@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Setup now configures a Git identity in its scratch repository so the isolated
+  publication self-test can create commits without the user's global Git config.
+
 ## v2026-09-02
 
 ### Changed
