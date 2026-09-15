@@ -108,7 +108,7 @@ func renderCommitAllScope(out io.Writer, scope commitAllScope) {
 	for _, path := range scope.QueuedPaths {
 		fmt.Fprintf(out, "  %q\n", path)
 	}
-	fmt.Fprintln(out, "Staging: included staged content will be consumed after checkpoint protection. Later edits stay outside this target.")
+	fmt.Fprintln(out, "Staging: included staged content will be consumed after checkpoint protection. Edits after the target freezes stay outside it.")
 	fmt.Fprintln(out, "If a previous request stopped because staging changed, its protected work will be saved separately and regrouped with this request.")
 }
 
@@ -146,6 +146,15 @@ func commitAllTargetMatchesScope(ctx context.Context, db *state.DB, target publi
 		}
 		if !paths[path] || oldPath.Valid && oldPath.String != "" && !paths[oldPath.String] {
 			return false, nil
+		}
+		ops, err := state.LoadCaptureOps(ctx, db, seq)
+		if err != nil {
+			return false, err
+		}
+		for _, op := range ops {
+			if !paths[op.Path] || op.OldPath.Valid && op.OldPath.String != "" && !paths[op.OldPath.String] {
+				return false, nil
+			}
 		}
 	}
 	return true, nil
