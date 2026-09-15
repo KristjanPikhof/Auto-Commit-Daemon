@@ -286,6 +286,9 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"acd config edit: resolve global defaults: %w", err,
 		)
 	}
+	if !opts.JSON {
+		renderConfigureEffective(cmd.OutOrStdout(), authoring, opts.Repo != "")
+	}
 	defaults := authoring.Values
 	if opts.Replace {
 		defaults, err = builtInConfigureValues(strategy, preset)
@@ -721,6 +724,9 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	authoring, err := previewService.AuthoringPreview()
 	if err != nil {
 		return fmt.Errorf("acd config edit: resolve authoring defaults: %w", err)
+	}
+	if !opts.JSON {
+		renderConfigureEffective(cmd.OutOrStdout(), authoring, opts.Repo != "")
 	}
 	defaults := authoring.Values
 	if opts.Inherit {
@@ -2293,4 +2299,15 @@ func displayConfigureWord(value string) string {
 		return ""
 	}
 	return strings.ToUpper(value[:1]) + value[1:]
+}
+
+// Show inheritance before editing so a saved value is not mistaken for a default.
+func renderConfigureEffective(out io.Writer, preview settings.AuthoringPreview, repository bool) {
+	fmt.Fprintln(out, "Current effective settings:")
+	for _, key := range []string{config.FieldProvider, config.FieldCommitStrategy, config.FieldIntentVerification} {
+		fmt.Fprintf(out, "  %s: %s (from %s)\n", key, preview.Values[key], preview.Sources[key])
+	}
+	if repository {
+		fmt.Fprintln(out, "To use global defaults: acd config edit --repo . --inherit")
+	}
 }
