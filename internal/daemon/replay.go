@@ -1,14 +1,6 @@
-// replay.go drains pending capture_events into per-event commits per §8.3.
-//
-// Atomic-per-file: every event becomes ONE commit. Coalescing multi-file
-// events into a single commit is OFF by default in v1 — even when an event
-// happens to carry multiple ops, a single commit is produced via the legacy
-// update-index --index-info path.
-//
-// AI commit messages land in Phase 5 (internal/ai). Phase 1 ships a
-// deterministic message helper in this package; the run loop wires it via
-// the MessageFn hook so Phase 5 can swap the implementation without
-// touching the replay state machine.
+// Replay publishes protected captures using Intent groups or explicit Event mode.
+// Provider messages, materialization and verification share the worker
+// evaluation boundary; journaled state and live Git mutations stay on the worker.
 package daemon
 
 import (
@@ -138,9 +130,8 @@ func resetPauseWarnForTest(t interface{ Helper() }, intervalSeconds int64) {
 	pauseWarnMu.Unlock()
 }
 
-// MessageFn produces a commit message for one event + its ops. Phase 1
-// callers pass DeterministicMessage; Phase 5 swaps in an AI-backed
-// implementation.
+// MessageFn produces a commit message for one event and its operations using
+// the explicitly selected provider.
 type MessageFn func(ctx context.Context, ec EventContext) (string, error)
 
 // EventContext is the input handed to MessageFn. Mirrors the fields the

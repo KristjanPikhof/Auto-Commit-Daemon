@@ -1,8 +1,6 @@
 // Package daemon implements the long-running per-repo capture+replay loop.
 //
-// The exported entry point is Run, which composes all the Phase 1 building
-// blocks (capture, replay, refcount, prune, lock, signals, scheduler) into
-// the loop body §8.1 specifies.
+// Run coordinates capture, publication, object retention, locking and wakeups.
 //
 // Run is single-goroutine: every per-tick mutation happens on the run-loop
 // goroutine. Signals dispatch via os/signal in a small helper goroutine but
