@@ -46,7 +46,7 @@ type productEnvelope struct {
 }
 
 type productStatusData struct {
-	PublicationOutcome publicationOutcome `json:"publication_outcome"`
+	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
 	Repo                     string                       `json:"repo"`
 	Command                  string                       `json:"command"`
 	Registered               bool                         `json:"registered"`
@@ -108,7 +108,7 @@ func envelopeFromControl(result controlResult) productEnvelope {
 		Actions:    actions,
 		NextAction: next,
 		Data: productStatusData{
-			PublicationOutcome: result.PublicationOutcome,
+			PublicationOutcome:       result.PublicationOutcome,
 			Repo:                     result.Repo,
 			Command:                  result.Command,
 			Registered:               result.Registered,
@@ -150,13 +150,13 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	if !ok {
 		return fmt.Errorf("acd: unsupported human result %T", envelope.Data)
 	}
-	fmt.Fprintf(out, "State: %s\n", envelope.State)
-	fmt.Fprintf(out, "ACD protection: %s\n", onOff(data.Enabled))
-	fmt.Fprintf(out, "Current changes protected: %s\n", yesNo(data.Protected))
-	fmt.Fprintf(out, "Published to Git: %s\n", yesNo(data.Published))
-	renderProductPublicationProgress(out, data.PublicationProgress)
-	fmt.Fprintf(out, "Action needed: %s\n", yesNo(data.ActionRequired))
-	if data.Summary != "" {
+	fmt.Fprintf(out, "Protection: %s\n", onOff(data.Enabled))
+	fmt.Fprintf(out, "Current changes saved: %s\n", yesNo(data.Protected))
+	fmt.Fprintf(out, "Branch commits: %s\n", publicationOutcomeLabel(data.PublicationOutcome, data.PublicationProgress))
+	if data.PublicationOutcome.RecoveredChanges > 0 {
+		fmt.Fprintf(out, "Recovery: %d changes saved separately\n", data.PublicationOutcome.RecoveredChanges)
+	}
+	if data.ActionRequired && data.Summary != "" {
 		fmt.Fprintf(out, "Status: %s\n", data.Summary)
 	}
 	if envelope.NextAction == nil {
@@ -165,6 +165,29 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 		fmt.Fprintf(out, "Next: %s\n", *envelope.NextAction)
 	}
 	return nil
+}
+
+func publicationOutcomeLabel(outcome publicationOutcome, progress publicationProgressReport) string {
+	if outcome.BranchCommitted == nil {
+		return "unknown"
+	}
+	if outcome.WaitingChanges > 0 {
+		if outcome.ReasonCode == "provider_wait" {
+			label := fmt.Sprintf("%d changes waiting for AI", outcome.WaitingChanges)
+			if outcome.RetryAt > 0 {
+				label += "; retry at " + time.Unix(int64(outcome.RetryAt), 0).Format(time.RFC3339)
+			}
+			return label
+		}
+		return fmt.Sprintf("%d changes waiting (%s)", outcome.WaitingChanges, publicationProgressPhaseLabel(progress))
+	}
+	if *outcome.BranchCommitted {
+		return "up to date"
+	}
+	if outcome.RecoveredChanges > 0 {
+		return "some changes saved in recovery"
+	}
+	return "waiting for current changes to be saved"
 }
 
 func renderProductPublicationProgress(

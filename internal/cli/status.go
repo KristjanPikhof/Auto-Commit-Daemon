@@ -95,6 +95,7 @@ const (
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
+	PublicationOutcome            publicationOutcome           `json:"publication_outcome"`
 	Repo                          string                       `json:"repo"`
 	RepoHash                      string                       `json:"repo_hash"`
 	Daemon                        string                       `json:"daemon"`
@@ -297,6 +298,10 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		report.Protected = complete && report.LatestCheckpointID != "" &&
 			report.ObservationEpoch == report.CoveredEpoch &&
 			prepared == 0 && needsAction == 0
+		report.PublicationOutcome, err = readPublicationOutcome(ctx, conn, report.Protected)
+		if err != nil {
+			return report, err
+		}
 	}
 	// daemon_state singleton.
 	var pid int
@@ -512,6 +517,10 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		return report, fmt.Errorf("publication progress: %w", err)
 	}
 	report.PublicationProgress = progress
+	report.PublicationOutcome.ReasonCode = progress.Phase
+	if health := report.IntentStrategy.PlannerHealth; health != nil && health.NextProbeTS > 0 {
+		report.PublicationOutcome.RetryAt = health.NextProbeTS
+	}
 
 	return report, nil
 }

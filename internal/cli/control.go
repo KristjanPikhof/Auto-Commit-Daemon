@@ -39,7 +39,7 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
-	PublicationOutcome publicationOutcome `json:"publication_outcome"`
+	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
 	OK                       bool                         `json:"ok"`
 	Command                  string                       `json:"command"`
 	Repo                     string                       `json:"repo"`
