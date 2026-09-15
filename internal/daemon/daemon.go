@@ -528,6 +528,10 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		msgFn = providerMessageFnWithPromptTrace(provider, effectiveRepoRoot, promptTracer)
 	}
+	if opts.MessageFn == nil && providerBuildErr != nil && configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
+		cause := providerBuildErr
+		msgFn = func(context.Context, EventContext) (string, error) { return "", cause }
+	}
 
 	// Build or inject the intent planner once per Run. Replay receives this
 	// same instance on every pass, so subprocess sessions and HTTP transports
@@ -571,8 +575,11 @@ func Run(ctx context.Context, opts Options) error {
 		intentPlannerProvider string
 		intentPlannerModel    string
 	)
-	if runIntentPlanner != nil {
+	if runIntentPlanner != nil || configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
 		intentPlannerProvider = ai.PrimaryProviderName(runIntentPlanner)
+		if runIntentPlanner == nil {
+			intentPlannerProvider = configuredIntentProviderName(providerCfg.Mode)
+		}
 		if intentPlannerProvider == "openai-compat" {
 			intentPlannerModel = providerCfg.Model
 		}
@@ -2404,8 +2411,12 @@ func Run(ctx context.Context, opts Options) error {
 	// Start setup validation only after startup branch reconciliation has
 	// established the exact branch generation recorded by configure.
 	runtimeBundles.StartValidationWorker(ctx, validationWakeCh)
+	evaluationShutdown := false
 
 	for {
+		if evaluationShutdown {
+			return gracefulWithSweep("signal shutdown")
+		}
 		branchTransitionBlocked = false
 		recoveryFollowup := false
 		frozenRuntimeDrainID := ""
@@ -3073,7 +3084,8 @@ func Run(ctx context.Context, opts Options) error {
 						defer cancelEvaluation()
 						evaluation := &publicationEvaluation{
 							gate: opts.OperationGate, cancel: cancelEvaluation,
-							wake: wakeCh, files: fsWakeReader, shutdown: shutdownCh,
+							wake: wakeCh, files: fsWakeReader, changes: validationWakeCh, shutdown: shutdownCh,
+							onShutdown: func() { evaluationShutdown = true },
 							identity: func(checkCtx context.Context) (string, error) {
 								if opts.PublicationHeld != nil && opts.PublicationHeld() {
 									return "", errPublicationEvaluationStale
