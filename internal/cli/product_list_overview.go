@@ -262,7 +262,6 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		if err := readProductListProtection(ctx, conn, report); err != nil {
 			return overview, err
 		}
-
 	}
 	var heartbeat float64
 	var branchRef sql.NullString
@@ -445,6 +444,7 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	}
 	overview.unfinished = report.PendingEvents > 0 || report.BlockedConflicts > 0 ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0 ||
+		report.Replay.State == "needs_attention" ||
 		report.checkpointPrepared || report.checkpointNeedsAction || report.UnpublishedCheckpoints > 0 ||
 		report.ObservationEpoch > report.CoveredEpoch ||
 		(report.LatestCheckpointID != "" && !report.Protected) ||
