@@ -2311,6 +2311,6 @@ func renderConfigureEffective(out io.Writer, preview settings.AuthoringPreview, 
 		fmt.Fprintf(out, "  %s: %s (from %s)\n", key, preview.Values[key], preview.Sources[key])
 	}
 	if repo != "" {
-		fmt.Fprintf(out, "To use global defaults: acd config edit --repo %s --inherit\n", shellQuote(repo))
+		fmt.Fprintf(out, "To use global defaults: acd config edit --repo %s --inherit\n", productListShellQuote(repo))
 	}
 }
