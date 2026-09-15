@@ -26,7 +26,7 @@ type settingsPlannerHit struct {
 	Seqs  []int64
 }
 
-func TestSettingsLiveReloadInFlightAThenNextB(t *testing.T) {
+func TestSettingsLiveReloadInvalidatesInFlightAAndUsesB(t *testing.T) {
 	t.Parallel()
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
@@ -85,12 +85,22 @@ func TestSettingsLiveReloadInFlightAThenNextB(t *testing.T) {
 		models[i] = hits[i].Model
 	}
 	mu.Unlock()
-	if len(models) < 2 || models[0] != "model-a" || models[1] != "model-b" {
-		t.Fatalf("planner model sequence=%v want [model-a model-b]", models)
+	if len(models) < 3 || models[0] != "model-a" {
+		t.Fatalf("planner model sequence=%v want cancelled A, then B for each file", models)
+	}
+	for _, model := range models[1:] {
+		if model != "model-b" {
+			t.Fatalf("stale provider used after configuration changed: %v", models)
+		}
+	}
+	// The desired configuration changes while A is evaluating. Its response
+	// must never reach history; both completed windows use the approved B.
+	if messages := runGitOK(t, repo, "log", "-2", "--format=%s"); strings.Contains(messages, "model-a") || strings.Count(messages, "Apply model-b settings") != 2 {
+		t.Fatalf("stale or unhelpful commit messages: %q", messages)
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	if got := sqliteScalar(t, dbPath, "SELECT group_concat(config_revision_id, ',') FROM (SELECT config_revision_id FROM intent_planner_windows ORDER BY id LIMIT 2)"); got != fmt.Sprintf("%d,%d", a.ID, b.ID) {
-		t.Fatalf("planner revision sequence=%s want %d,%d", got, a.ID, b.ID)
+	if got := sqliteScalar(t, dbPath, "SELECT group_concat(config_revision_id, ',') FROM (SELECT config_revision_id FROM intent_planner_windows ORDER BY id LIMIT 2)"); got != fmt.Sprintf("%d,%d", b.ID, b.ID) {
+		t.Fatalf("planner revision sequence=%s want %d,%d (stale A must not be recorded)", got, b.ID, b.ID)
 	}
 	if got := sqliteScalar(t, dbPath, "SELECT desired_revision_id || '|' || applied_revision_id || '|' || last_known_good_revision_id FROM runtime_config_state WHERE id=1"); got != fmt.Sprintf("%d|%d|%d", b.ID, b.ID, b.ID) {
 		t.Fatalf("runtime projection=%s", got)
