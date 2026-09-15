@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -141,6 +142,7 @@ type statusReport struct {
 	CoveredEpoch                  int64                     `json:"covered_epoch,omitempty"`
 	LatestCheckpointID            string                    `json:"latest_checkpoint_id,omitempty"`
 	UnpublishedCheckpoints        int                       `json:"unpublished_checkpoints,omitempty"`
+	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
 	CheckpointRetentionOverBudget bool                      `json:"checkpoint_retention_over_budget,omitempty"`
 	FullPollTS                    float64                   `json:"full_poll_ts,omitempty"`
 	WatcherQueueDepth             int                       `json:"watcher_queue_depth,omitempty"`
@@ -151,6 +153,7 @@ type statusReport struct {
 	CheckpointPublishedByACD      bool                      `json:"checkpoint_published_by_acd"`
 	PublicationDrain              publicationDrainReport    `json:"publication_drain"`
 	PublicationProgress           publicationProgressReport `json:"publication_progress"`
+	checkpointPrepared bool
 	checkpointNeedsAction         bool
 }
 
@@ -306,9 +309,10 @@ func buildStatusReport(ctx context.Context, rec central.RepoRecord, now time.Tim
 		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionComplete); ok {
 			complete = strings.EqualFold(value, "true")
 		}
-		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionRetentionOverBudget); ok {
-			report.CheckpointRetentionOverBudget = value == "true" || value == "needs_action"
-		}
+		report.CheckpointMaintenance, err = readCheckpointMaintenance(ctx, conn)
+		if err != nil { return report, err }
+		report.CheckpointRetentionOverBudget = report.CheckpointMaintenance.State == "over_budget"
+
 		if value, ok, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionFullPollTS); ok {
 			report.FullPollTS, _ = strconv.ParseFloat(value, 64)
 		}
