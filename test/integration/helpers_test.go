@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -754,6 +755,10 @@ var (
 // TestMain removes package-scoped binary and repository fixtures after the
 // suite completes so /tmp stays clean.
 func TestMain(m *testing.M) {
+	flag.Parse()
+	if flag.Lookup("test.list").Value.String() != "" {
+		os.Exit(m.Run())
+	}
 	if runCheckpointRuntimeWatchdog() {
 		return
 	}
