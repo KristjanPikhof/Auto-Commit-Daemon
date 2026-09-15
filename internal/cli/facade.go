@@ -256,9 +256,11 @@ func runProductEvents(
 	if !jsonOut {
 		return runEvents(ctx, out, repo, path, since, limit, watch, interval, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runEvents(ctx, raw, repo, path, since, limit, false, interval, true)
-	})
+	report, err := collectEvents(ctx, repo, path, since, limit)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateProtected, report)
 }
 
 func runProductPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq int64, jsonOut bool) error {
