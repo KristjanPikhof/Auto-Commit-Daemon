@@ -47,12 +47,11 @@ func TestProductionMeasurements(t *testing.T) {
 	// Registered after the server so a failed assertion releases blocked calls
 	// before server cleanup attempts to join them.
 	t.Cleanup(unblock)
-	env = envWith(env, trust)
 	extra := activateIntentV2Runtime(t, repo,
 		"ACD_COMMIT_STRATEGY=intent", "ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL="+server.URL, "ACD_AI_MODEL=benchmark",
 		"ACD_AI_API_KEY=synthetic-benchmark-key", "ACD_INTENT_MIN_PENDING=1",
-		"ACD_INTENT_MAX_PENDING_AGE=1s")
+		"ACD_INTENT_MAX_PENDING_AGE=1s", trust)
 	env = envWith(env, extra...)
 	t.Cleanup(func() { unblock(); stopSessionForce(t, env, repo) })
 	startSessionJSON(t, ctx, env, repo, "production-measurements", "shell")
