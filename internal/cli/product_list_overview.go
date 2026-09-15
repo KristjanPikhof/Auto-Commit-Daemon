@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -36,6 +37,8 @@ type productListRepoOverview struct {
 	report       statusReport
 	clients      int
 	lastActivity time.Time
+	unfinished bool
+	rewriting bool
 }
 
 func collectProductListOverview(ctx context.Context) (productListData, productState, error) {
@@ -100,7 +103,7 @@ func productListEntryFromOverview(
 	readErr error,
 ) productListEntry {
 	if record.RepositoryID == "" || record.WorktreeID == "" {
-		activity := time.Unix(record.LastSeenTS, 0)
+		activity := overview.lastActivity
 		return productListEntry{
 			Repo: record.Path, RepoHash: record.RepoHash, ActionRequired: true, State: productStateNeedsAction,
 			OperationalState: "needs_attention", LastActivityAt: formatProductListActivity(activity),
@@ -111,7 +114,7 @@ func productListEntryFromOverview(
 	}
 	if readErr != nil {
 		if productListReadTransient(readErr) && worker.State != "needs_action" {
-			activity := time.Unix(record.LastSeenTS, 0)
+			activity := overview.lastActivity
 			stateName, operational := productStateProtected, "healthy_idle"
 			summary := "ACD is refreshing this repository's protection state."
 			if worker.State == "starting" || worker.State == "backoff" {
@@ -127,7 +130,7 @@ func productListEntryFromOverview(
 				lastActivity: activity,
 			}
 		}
-		activity := time.Unix(record.LastSeenTS, 0)
+		activity := overview.lastActivity
 		return productListEntry{
 			Repo: record.Path, RepoHash: record.RepoHash, Enabled: true, ActionRequired: true,
 			State: productStateNeedsAction, WorkerState: worker.State,
@@ -186,10 +189,13 @@ func productListEntryFromOverview(
 		CheckpointID: control.CheckpointID, WorkerState: worker.State,
 		OperationalState: operational, LastActivityAt: formatProductListActivity(overview.lastActivity),
 		PublicationDrain:    report.PublicationDrain,
+		CheckpointMaintenance: report.CheckpointMaintenance,
+		UnfinishedWork: overview.unfinished,
 		PublicationProgress: report.PublicationProgress, Summary: control.Summary,
 		Clients: overview.clients, LastCommitOID: report.LastCommitOID,
 		lastActivity: overview.lastActivity,
 	}
+	if overview.rewriting { entry.OperationalState = "rewriting"; entry.Summary = "ACD is applying a history rewrite." }
 	if envelope.NextAction != nil {
 		entry.NextAction = productListTargetAction(*envelope.NextAction, record.Path)
 	}
@@ -209,7 +215,7 @@ func productListReadTransient(err error) bool {
 
 func productListHasIndependentAttention(report statusReport) bool {
 	manualPause := report.Paused && (report.Pause == nil || report.Pause.Source != "rewind_grace")
-	return report.CheckpointRetentionOverBudget ||
+	return report.CheckpointRetentionOverBudget || report.CheckpointMaintenance.NeedsAction() ||
 		report.checkpointNeedsAction ||
 		(report.IntentV2.SchemaVersion > 0 && !report.CheckpointProtectionAvailable) ||
 		manualPause || report.BackpressurePaused ||
@@ -224,7 +230,7 @@ func productListHasIndependentAttention(report statusReport) bool {
 func readProductListRepo(ctx context.Context, record central.RepoRecord, now time.Time) (productListRepoOverview, error) {
 	overview := productListRepoOverview{
 		report:       statusReport{Repo: record.Path, RepoHash: record.RepoHash, Daemon: "stopped", Clients: []statusClient{}},
-		lastActivity: time.Unix(record.LastSeenTS, 0),
+		
 	}
 	if !fileExists(record.StateDB) {
 		return overview, errors.New("state.db missing")
@@ -254,11 +260,7 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		if err := readProductListProtection(ctx, conn, report); err != nil {
 			return overview, err
 		}
-		var checkpointActivity float64
-		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(COALESCE(completed_ts,created_ts)),0) FROM checkpoints`).Scan(&checkpointActivity); err != nil {
-			return overview, err
-		}
-		overview.lastActivity = laterProductListActivity(overview.lastActivity, checkpointActivity)
+
 	}
 	var heartbeat float64
 	var branchRef sql.NullString
@@ -422,6 +424,30 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	if err != nil {
 		return overview, err
 	}
+	for _, key := range []string{state.ActivityMetaKey, daemon.MetaKeyBranchTokenChangedAt} {
+		value, _, err := metaLookup(ctx, conn, key)
+		if err != nil { return overview, err }
+		ts, _ := strconv.ParseFloat(value, 64)
+		overview.lastActivity = laterProductListActivity(overview.lastActivity, ts)
+	}
+	if raw, _, err := metaLookup(ctx, conn, state.RewritePIDMetaKey); err != nil {
+		return overview, err
+	} else if raw != "" {
+		var owner state.RewriteActivity
+		if json.Unmarshal([]byte(raw), &owner) == nil && owner.PID > 0 {
+			fp, err := identity.CaptureContext(ctx, owner.PID)
+			overview.rewriting = err == nil && owner.Fingerprint != "" && daemon.FingerprintToken(fp) == owner.Fingerprint
+		}
+	}
+	overview.unfinished = report.PendingEvents > 0 || report.BlockedConflicts > 0 ||
+		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0 ||
+		report.checkpointPrepared || report.checkpointNeedsAction || report.UnpublishedCheckpoints > 0 ||
+		report.ObservationEpoch > report.CoveredEpoch ||
+		(report.LatestCheckpointID != "" && !report.Protected) ||
+		report.SelfPublication.PreparedCount > 0 || report.SelfPublication.GitAppliedCount > 0 ||
+		(report.PublicationDrain.ID != "" && report.PublicationDrain.Phase != state.PublicationDrainCompleted) ||
+		overview.rewriting
+
 	return overview, nil
 }
 
@@ -439,13 +465,17 @@ func readProductListProtection(ctx context.Context, conn *sql.DB, report *status
 	report.CoveredEpoch = lookupInt(daemon.MetaKeyProtectionCoveredEpoch)
 	report.LatestCheckpointID, _, _ = metaLookup(ctx, conn, daemon.MetaKeyProtectionCheckpointID)
 	completeValue, _, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionComplete)
-	retentionValue, _, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionRetentionOverBudget)
-	report.CheckpointRetentionOverBudget = retentionValue == "true" || retentionValue == "needs_action"
+	var err error
+	report.CheckpointMaintenance, err = readCheckpointMaintenance(ctx, conn)
+	if err != nil { return err }
+	report.CheckpointRetentionOverBudget = report.CheckpointMaintenance.State == "over_budget"
+
 	var prepared, needsAction int
 	if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(phase='prepared'),0),COALESCE(SUM(phase='needs_action'),0) FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		return err
 	}
 	report.checkpointNeedsAction = needsAction > 0
+	report.checkpointPrepared = prepared > 0
 	unresolved, err := countUnresolvedCompletedCheckpoints(ctx, conn)
 	if err != nil {
 		return err
@@ -500,10 +530,6 @@ func formatProductListActivity(value time.Time) string {
 
 func sortProductListEntries(entries []productListEntry) {
 	sort.SliceStable(entries, func(i, j int) bool {
-		left, right := productListPriority(entries[i]), productListPriority(entries[j])
-		if left != right {
-			return left < right
-		}
 		if !entries[i].lastActivity.Equal(entries[j].lastActivity) {
 			return entries[i].lastActivity.After(entries[j].lastActivity)
 		}
