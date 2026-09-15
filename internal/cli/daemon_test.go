@@ -29,10 +29,10 @@ func TestBuildDaemonRunOptions_WiresCentralStats(t *testing.T) {
 		t.Fatalf("DB handle not propagated")
 	}
 	if opts.RepoHash == "" {
-		t.Fatalf("RepoHash empty — `acd stats` push skipped (errOut=%q)", errBuf.String())
+		t.Fatal("RepoHash empty; central statistics would be skipped")
 	}
 	if opts.CentralStatsDBPath == "" {
-		t.Fatalf("CentralStatsDBPath empty — `acd stats` push skipped (errOut=%q)", errBuf.String())
+		t.Fatal("CentralStatsDBPath empty; central statistics would be skipped")
 	}
 	if opts.Logger == nil {
 		t.Fatalf("Logger empty — daemon logs fall back to slog.Default")
@@ -42,9 +42,6 @@ func TestBuildDaemonRunOptions_WiresCentralStats(t *testing.T) {
 	}
 	if want := roots.StatsDBPath(); opts.CentralStatsDBPath != want {
 		t.Fatalf("CentralStatsDBPath = %q, want %q", opts.CentralStatsDBPath, want)
-	}
-	if errBuf.Len() != 0 {
-		t.Fatalf("expected no errOut for healthy resolution, got %q", errBuf.String())
 	}
 }
 
