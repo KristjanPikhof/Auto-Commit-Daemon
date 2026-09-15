@@ -360,6 +360,15 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if !control.Published || !control.CheckpointPublishedByACD {
 		t.Fatalf("recovered control truth=%+v", control)
 	}
+	if control.PublicationOutcome.BranchCommitted == nil || *control.PublicationOutcome.BranchCommitted ||
+		control.PublicationOutcome.RecoveredChanges != 1 || control.PublicationOutcome.WaitingChanges != 0 {
+		t.Fatalf("recovery must be distinct from branch publication: %+v", control.PublicationOutcome)
+	}
+	entries, err := loadCheckpointHistory(ctx, repo)
+	if err != nil { t.Fatal(err) }
+	if len(entries) != 1 || entries[0].Outcome != "recovered" || entries[0].Published {
+		t.Fatalf("recovery history: %+v", entries)
+	}
 	listRecord := rec
 	listRecord.RepositoryID = "repository-id"
 	listRecord.WorktreeID = "0123456789abcdef"
@@ -429,7 +438,7 @@ func TestStatusDiagnoseDoctorControlReadsStayReadOnly(t *testing.T) {
 	}
 	rejectPath := plannerRejectLogPath(dbPath)
 	for name, read := range map[string]func() error{
-		"status":   func() error { return runStatus(ctx, &bytes.Buffer{}, repo, true) },
+		"status":   func() error { return writeStatusProjectionFixture(ctx, &bytes.Buffer{}, repo, true) },
 		"diagnose": func() error { return runDiagnose(ctx, &bytes.Buffer{}, repo, true) },
 		"doctor":   func() error { return runDoctor(ctx, &bytes.Buffer{}, false, repo, true) },
 		"control":  func() error { _, err := inspectControl(ctx, repo); return err },

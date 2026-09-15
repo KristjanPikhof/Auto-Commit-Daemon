@@ -68,6 +68,7 @@ type diagnoseGeneratedPendingGroup struct {
 }
 
 type diagnoseReport struct {
+	PublicationOutcome publicationOutcome `json:"publication_outcome"`
 	Repo                       string                          `json:"repo"`
 	RepoHash                   string                          `json:"repo_hash"`
 	StateDB                    string                          `json:"state_db"`
@@ -259,6 +260,7 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	report.WorktreeClean = status.WorktreeClean
 	report.AllChangesCommittedInGit = status.AllChangesCommittedInGit
 	report.CheckpointPublishedByACD = status.CheckpointPublishedByACD
+	report.PublicationOutcome = status.PublicationOutcome
 	report.PublicationDrain = status.PublicationDrain
 	report.CheckpointMaintenance = status.CheckpointMaintenance
 	report.Remediation = diagnoseRemediation(report)
