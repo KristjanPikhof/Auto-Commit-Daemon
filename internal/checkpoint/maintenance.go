@@ -50,7 +50,21 @@ func (s Store) LoadMaintenance(ctx context.Context) (MaintenanceStatus, error) {
 		return MaintenanceStatus{}, err
 	}
 	legacy, _, err := state.MetaGet(ctx, s.DB, "protection.retention_over_budget")
-	return DecodeMaintenance(raw, legacy), err
+	if err != nil {
+		return MaintenanceStatus{}, err
+	}
+	result := DecodeMaintenance(raw, legacy)
+	if result.State == "" {
+		prunes, err := state.PreparedCheckpointPrunes(ctx, s.DB)
+		if err != nil {
+			return result, err
+		}
+		if len(prunes) > 0 {
+			result.State = "retrying"
+			result.Error = "An interrupted checkpoint prune is awaiting recovery."
+		}
+	}
+	return result, nil
 }
 
 func (m MaintenanceStatus) NeedsAction() bool {
@@ -92,6 +106,12 @@ func (e retentionSafetyError) Unwrap() error { return e.error }
 func maintenanceFailure(err error) string {
 	if strings.Contains(err.Error(), "license agreements") || strings.Contains(err.Error(), "xcodebuild -license") {
 		return "prerequisite"
+	}
+	message := strings.ToLower(err.Error())
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		strings.Contains(message, "deadline exceeded") || strings.Contains(message, "database is locked") ||
+		strings.Contains(message, "sqlite_busy") || strings.Contains(message, "file exists") {
+		return "retrying"
 	}
 	var safety retentionSafetyError
 	if errors.As(err, &safety) {

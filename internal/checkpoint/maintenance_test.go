@@ -135,7 +135,7 @@ func TestMaintenanceRefMovementRemainsNeedsAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := state.PrepareCheckpointPrune(ctx, db, items[0], "proof"); err != nil {
+	if _, err := state.PrepareCheckpointPrune(ctx, db, items[0], "sha256:"+strings.Repeat("0", 64)); err != nil {
 		t.Fatal(err)
 	}
 	other, err := gitpkg.CommitTreeDurable(ctx, repo, cp.Checkpoint.TreeOID, "different checkpoint\n", IdentityName, IdentityEmail)
@@ -157,4 +157,17 @@ func TestMaintenanceRefMovementRemainsNeedsAction(t *testing.T) {
 	if oid, err := gitpkg.RevParse(ctx, repo, cp.Checkpoint.Ref); err != nil || oid != other {
 		t.Fatalf("moved ref was deleted: %s %v", oid, err)
 	}
+	// Restoring the exact recorded ref makes recovery provable again.
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "update-ref", cp.Checkpoint.Ref, cp.Checkpoint.CommitOID); err != nil {
+		t.Fatal(err)
+	}
+	result, err = store.Maintain(ctx, repo, WorktreeID(repo), time.Unix(result.NextAttemptTS, 0), result)
+	if err != nil || result.State != "healthy" {
+		t.Fatalf("proven recovery: %+v %v", result, err)
+	}
+	pending, err := state.PreparedCheckpointPrunes(ctx, db)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("recovered prune still pending: %+v %v", pending, err)
+	}
+
 }
