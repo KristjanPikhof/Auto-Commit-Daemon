@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -586,7 +587,7 @@ func RecoverSoftDependencyCapPublicationDrain(
 ) (*state.PublicationDrain, error) {
 	rows, err := db.ReadSQL().QueryContext(ctx, `
 SELECT id,last_error FROM publication_drains
-WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action' AND reason_code=''
 ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if err != nil {
 		return nil, err
@@ -1581,6 +1582,7 @@ func UpdatePublicationDrainAfterReplay(
 	if progressed {
 		update.LastError = ""
 		update.ReasonCode = ""
+		update.ReasonEvidence = ""
 	}
 	if summary.PlannerFailure != "" {
 		update.LastError = summary.PlannerFailure
@@ -1595,6 +1597,7 @@ func UpdatePublicationDrainAfterReplay(
 		update.Phase = state.PublicationDrainCompleted
 		update.LastError = ""
 		update.ReasonCode = ""
+		update.ReasonEvidence = ""
 		update.CompletedTS = sql.NullFloat64{Float64: nowTS, Valid: true}
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
@@ -1605,6 +1608,7 @@ func UpdatePublicationDrainAfterReplay(
 			// half-open probe resumes the same plan automatically.
 			update.LastError = ""
 			update.ReasonCode = ""
+			update.ReasonEvidence = ""
 			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 		}
 		update.LastError = replayErr.Error()
@@ -1618,10 +1622,18 @@ func UpdatePublicationDrainAfterReplay(
 		var preflight *IntentPlanPreflightError
 		exhaustedSemanticFallback := errors.As(replayErr, &exhausted)
 		preflightFailed := errors.As(replayErr, &preflight)
+		if preflightFailed {
+			evidence := preflight.EvidenceFingerprint
+			if evidence == "" {
+				evidence = preflight.Failure
+			}
+			update.ReasonEvidence = fmt.Sprintf("%x", sha256.Sum256([]byte(evidence)))
+		}
 		if preflightFailed &&
 			drain.Phase == state.PublicationDrainEventFallback &&
 			drain.FallbackMode == publicationFallbackLocalUnlock &&
-			publicationDrainReason(drain) == publicationReasonPreflight {
+			publicationDrainReason(drain) == publicationReasonPreflight &&
+			drain.ReasonEvidence == update.ReasonEvidence {
 			// Semantic normalization and the deterministic local unlock have
 			// both failed against the same frozen evidence. Retrying that exact
 			// preflight cannot make progress, so stop at the durable safety
@@ -1741,7 +1753,7 @@ func PublicationDrainUpdateFrom(
 		SemanticRebuildAttempts: drain.SemanticRebuildAttempts,
 		EventFallbackCount:      drain.EventFallbackCount,
 		CommitCount:             drain.CommitCount, FallbackMode: drain.FallbackMode,
-		LastError: drain.LastError, ReasonCode: drain.ReasonCode, StagedConsent: drain.StagedConsent,
+		LastError: drain.LastError, ReasonCode: drain.ReasonCode, ReasonEvidence: drain.ReasonEvidence, StagedConsent: drain.StagedConsent,
 		StagedConsumed: drain.StagedConsumed,
 		UpdatedTS:      updatedTS, LastProgressTS: progressTS,
 		CompletedTS: drain.CompletedTS,

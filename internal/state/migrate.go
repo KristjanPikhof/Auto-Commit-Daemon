@@ -118,6 +118,9 @@ func (d *DB) Migrate(ctx context.Context) error {
 
 func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
 	if cur < 28 {
+		if err := addColumnIfMissing(ctx, tx, "publication_drains", "reason_evidence", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
 		if err := addColumnIfMissing(ctx, tx, "publication_drains", "reason_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err
 		}

@@ -933,6 +933,7 @@ CREATE TABLE IF NOT EXISTS publication_drains(
     fallback_mode       TEXT NOT NULL DEFAULT '',
     last_error          TEXT NOT NULL DEFAULT '',
     reason_code         TEXT NOT NULL DEFAULT '',
+    reason_evidence     TEXT NOT NULL DEFAULT '',
     expected_index_digest TEXT NOT NULL DEFAULT '',
     staged_consent      INTEGER NOT NULL DEFAULT 0 CHECK (staged_consent IN (0,1)),
     staged_consumed     INTEGER NOT NULL DEFAULT 0 CHECK (staged_consumed IN (0,1)),

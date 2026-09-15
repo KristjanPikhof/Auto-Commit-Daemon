@@ -96,3 +96,51 @@ func (c *publicationMessageCache) persist(ctx context.Context) error {
 	}
 	return state.MetaSetJSON(ctx, evaluation.db, publicationMessageCacheMeta, c.entries)
 }
+
+// Old runtime revisions may still use v1 grouping. Their local safety fallback
+// follows the same selected-provider message contract as current Intent.
+func rewriteLegacyFallbackMessages(ctx context.Context, planner ai.IntentPlanner, health *IntentPlannerHealth, req ai.IntentPlanRequest, plan ai.IntentPlan) (ai.IntentPlan, error) {
+	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
+		return ai.IntentPlan{}, &IntentPlannerCircuitOpenError{RetryAt: time.Now().Add(30 * time.Second)}
+	}
+	cache, err := loadPublicationMessageCache(ctx, planner, health)
+	if err != nil {
+		return ai.IntentPlan{}, err
+	}
+	groups, err := ai.IntentPlanCommitGroups(plan)
+	if err != nil {
+		return ai.IntentPlan{}, err
+	}
+	for i, group := range groups {
+		locked := ai.IntentPlanForCommitGroup(plan, group)
+		request := ai.NewIntentMessageRewriteRequest(req, locked, ai.EvaluateIntentPlanMessageQuality(req, locked))
+		var result ai.Result
+		_, err := generatePublicationMessage(ctx, func(jobCtx context.Context, _ EventContext) (string, error) {
+			var err error
+			result, err = cache.RewriteIntentMessage(jobCtx, request)
+			if err != nil {
+				return "", err
+			}
+			locked.Subject, locked.Body = result.Subject, result.Body
+			quality := ai.EvaluateIntentPlanMessageQuality(req, locked)
+			if quality.Action != ai.MessageQualityClean && quality.Action != ai.MessageQualitySanitizeAccept {
+				return "", &ai.IntentMessageRewriteValidationError{Err: fmt.Errorf("legacy fallback message needs correction")}
+			}
+			return result.Subject, nil
+		}, EventContext{}, health)
+		if cacheErr := cache.persist(ctx); cacheErr != nil {
+			return ai.IntentPlan{}, cacheErr
+		}
+		if err != nil {
+			return ai.IntentPlan{}, err
+		}
+		groups[i].Subject, groups[i].Body = result.Subject, result.Body
+	}
+	if len(plan.CommitGroups) > 0 {
+		plan.CommitGroups = groups
+	} else if len(groups) > 0 {
+		plan.Subject, plan.Body = groups[0].Subject, groups[0].Body
+	}
+	plan.Source = planner.Name()
+	return plan, nil
+}

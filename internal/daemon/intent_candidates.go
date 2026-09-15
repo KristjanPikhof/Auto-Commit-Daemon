@@ -166,7 +166,8 @@ func (e *IntentSemanticFallbackRequiredError) Unwrap() error {
 // IntentPlanPreflightError means the durable planning snapshot could not
 // produce a locally valid baseline. No provider attempt has been consumed.
 type IntentPlanPreflightError struct {
-	Failure string
+	EvidenceFingerprint string
+	Failure             string
 }
 
 func (e *IntentPlanPreflightError) Error() string {
@@ -1270,7 +1271,8 @@ func chooseIntentCandidatePlan(
 		}
 		return ai.IntentPlanV2{}, "", "", retryCount, false,
 			baselineContinuations, run, &IntentPlanPreflightError{
-				Failure: ai.SanitizePlannerError(preflightErr.Error()),
+				Failure:             ai.SanitizePlannerError(preflightErr.Error()),
+				EvidenceFingerprint: fmt.Sprintf("%s/%v", run.Fingerprint, run.FindingCodes),
 			}
 	}
 	run, err = state.EnsureIntentPlanRun(ctx, db, run)

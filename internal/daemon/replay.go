@@ -2820,27 +2820,19 @@ func planIntentWithFallback(
 		var acquireErr error
 		permit, acquireErr = health.Acquire(ctx)
 		if acquireErr != nil {
-			var openErr *IntentPlannerCircuitOpenError
-			if !errors.As(acquireErr, &openErr) {
-				return ai.IntentPlan{}, "", acquireErr
-			}
-			// A circuit bypass is an expected deterministic degradation, not a
-			// fresh planner error. Keep validationFailure empty so no
-			// intent_planner_error rows or decisions are emitted on every tick.
-			bypassReason := "intent planner circuit bypass: open"
-			if openErr.HalfOpen {
-				bypassReason = "intent planner circuit bypass: half-open probe in progress"
-			}
-			recordIntentPromptFallback(ctx, planner, bypassReason)
-			plan, err := deterministicIntentFallback(ctx, repoRoot, req, items)
-			return plan, "", err
+			return ai.IntentPlan{}, "", acquireErr
 		}
+		defer func() { _ = health.Complete(ctx, permit, nil) }()
+
 	}
 
 	var validationFailure string
 	plan, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlan, error) {
 		return planner.PlanIntent(jobCtx, req)
 	})
+	if ai.ProviderNeedsConfiguration(err) {
+		return ai.IntentPlan{}, "", err
+	}
 	plannerCallFailed := err != nil
 	if err == nil {
 		// Defense in depth against third-party planners that skip the helper.
@@ -2868,6 +2860,18 @@ func planIntentWithFallback(
 			return ai.IntentPlan{}, "", healthErr
 		}
 	}
+	var transport *IntentPlannerTransportFailure
+	if ai.PrimaryProviderName(planner) != (ai.DeterministicProvider{}).Name() &&
+		errors.As(classifyIntentPlannerHealthFailure(err, plannerCallFailed), &transport) {
+		if ctx.Err() != nil {
+			return ai.IntentPlan{}, "", ctx.Err()
+		}
+		retryAt := time.Now().Add(30 * time.Second)
+		if health != nil {
+			retryAt = time.Unix(0, int64(health.Snapshot().NextProbeTS*1e9))
+		}
+		return ai.IntentPlan{}, "", &IntentPlannerCircuitOpenError{RetryAt: retryAt}
+	}
 	validationFailure = ai.SanitizePlannerError(err.Error())
 	recordIntentPromptFallback(ctx, planner, validationFailure)
 	for _, item := range items {
@@ -2891,6 +2895,9 @@ func planIntentWithFallback(
 		}
 	}
 	plan, err = deterministicIntentFallback(ctx, repoRoot, req, items)
+	if err == nil && ai.PrimaryProviderName(planner) != (ai.DeterministicProvider{}).Name() {
+		plan, err = rewriteLegacyFallbackMessages(ctx, planner, health, req, plan)
+	}
 	return plan, validationFailure, err
 }
 
