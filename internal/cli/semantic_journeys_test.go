@@ -8,8 +8,40 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+func TestSavedCheckpointAwaitsClassificationWithoutClaimingPublication(t *testing.T) {
+	withIsolatedHome(t)
+	_, _, db := makeRepoStateDB(t)
+	ctx := context.Background()
+	insertCompletedCheckpoint(t, db, "cp-unclassified", "0123456789abcdef", nil)
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyProtectionClassificationPending, "true"); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := readPublicationOutcome(ctx, db.SQL(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.BranchCommitted == nil || *outcome.BranchCommitted || !outcome.PendingClassification {
+		t.Fatalf("unclassified checkpoint reported published: %+v", outcome)
+	}
+	if got := publicationOutcomeLabel(outcome, publicationProgressReport{}); got != "saved changes waiting for grouping" {
+		t.Fatal(got)
+	}
+	if got := checkpointOutcome(state.CheckpointCompleted, 0, 0, 0); got != "saved" {
+		t.Fatalf("unclassified history: %s", got)
+	}
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyProtectionClassificationPending, "false"); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err = readPublicationOutcome(ctx, db.SQL(), true)
+	if err != nil || outcome.BranchCommitted == nil || !*outcome.BranchCommitted {
+		t.Fatalf("resolved checkpoint: %+v, %v", outcome, err)
+	}
+}
 
 func TestCommitAllPreviewShowsPartialStagingAndDetectsChangedIndex(t *testing.T) {
 	_, repo, dbPath := registeredProductMutationRepo(t)
