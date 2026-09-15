@@ -7,6 +7,8 @@ if [[ $# -lt 2 ]]; then
 fi
 started_seconds=$SECONDS
 package=$1
+package_slug=${package#./}
+package_slug=${package_slug//\//_}
 shard_count=$2
 shift 2
 requested_shard=${ACD_TEST_SHARD_INDEX:-}
@@ -42,7 +44,7 @@ for ((shard = first; shard < last; shard++)); do
   pattern=$(python3 scripts/dev/test-manifest.py pattern "$output_root/manifest.json" "$shard")
   result="$output_root/shard-$shard.jsonl"
   if [[ -n "${ACD_TEST_RESULTS_DIR:-}" ]]; then
-    name="${package//\//_}-$shard"
+    name="$package_slug-$shard"
     result="$ACD_TEST_RESULTS_DIR/$name.jsonl"
     cp "$output_root/manifest.json" "$ACD_TEST_RESULTS_DIR/$name.manifest.json"
   fi
@@ -71,7 +73,7 @@ for event in records:
 PY
 done
 if [[ -n "${ACD_TEST_RESULTS_DIR:-}" ]]; then
-  python3 - "$ACD_TEST_RESULTS_DIR/${package//\//_}-${requested_shard:-all}.summary.json" "$((SECONDS - started_seconds))" "$status" <<'PY_SUMMARY'
+  python3 - "$ACD_TEST_RESULTS_DIR/${package_slug}-${requested_shard:-all}.summary.json" "$((SECONDS - started_seconds))" "$status" <<'PY_SUMMARY'
 import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps({'wall_seconds': int(sys.argv[2]), 'exit_code': int(sys.argv[3])}) + '\n')
 PY_SUMMARY
