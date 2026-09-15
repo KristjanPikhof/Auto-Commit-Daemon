@@ -14,6 +14,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -169,5 +170,57 @@ func TestProductListReadOnlyMaintenanceAgreesWithStatus(t *testing.T) {
 	}
 	if before != after {
 		t.Fatal("read-only reports modified database")
+	}
+}
+
+func TestProductListDistinguishesRewriteExecutionFromProposal(t *testing.T) {
+	ctx := context.Background()
+	repo := materializeTestRepo(t, false)
+	db, err := state.Open(ctx, filepath.Join(repo, ".git", "acd", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = state.SaveRewritePlan(ctx, db, state.RewritePlan{BranchRef: "refs/heads/main", ExpectedHead: strings.Repeat("a", 40),
+		Commits: []state.RewritePlanCommit{{OldOID: strings.Repeat("a", 40), ProposedMessage: "Improve wording", OriginalMessage: "Old wording"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := central.RepoRecord{Path: repo, StateDB: db.Path(), RepositoryID: "repo", WorktreeID: "wt"}
+	overview, err := readProductListRepo(ctx, record, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.unfinished || !overview.lastActivity.IsZero() {
+		t.Fatalf("saved proposal counted as execution: %+v", overview)
+	}
+	fp, err := identity.CaptureContext(ctx, os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := state.RewriteActivity{PID: os.Getpid(), Fingerprint: daemon.FingerprintToken(fp)}
+	if err := state.MetaSetJSON(ctx, db, state.RewritePIDMetaKey, owner); err != nil {
+		t.Fatal(err)
+	}
+	overview, err = readProductListRepo(ctx, record, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !overview.unfinished || !overview.rewriting {
+		t.Fatalf("live rewrite not visible: %+v", overview)
+	}
+	if got := productListPhase(productListEntry{OperationalState: "rewriting"}); got != "history-rewrite" {
+		t.Fatalf("phase=%s", got)
+	}
+	owner.Fingerprint = "a different process"
+	if err := state.MetaSetJSON(ctx, db, state.RewritePIDMetaKey, owner); err != nil {
+		t.Fatal(err)
+	}
+	overview, err = readProductListRepo(ctx, record, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.unfinished || overview.rewriting {
+		t.Fatalf("stale rewrite owner pinned repository: %+v", overview)
 	}
 }
