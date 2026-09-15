@@ -29,6 +29,7 @@ retired implementations and migrates their useful scenarios as follows.
 | Direct `runDaemon`, old worktree resolver and option wrapper | The compatibility command delegates to `runRepositoryWorker`; option tests now call `buildDaemonRunOptionsWithID`. |
 | Old start/stop/repository command constructors and lifecycle wrappers | The root tree uses the current product and compatibility constructors. Repository-manager tests call the same lifecycle service used by its current UI. |
 | Old status constructor and status watch loop | Status is a snapshot; live repository monitoring belongs to `acd list`. |
+| Direct wake/touch/flush and autodiscovery controllers | Current aliases send supervisor hints; retained canonical identity and Intent boundary helpers are used by the current protocol. |
 
 Preserved: migration shutdown (`runStopRegistry`, `stopOneRepo`), repository
 removal and management, cached-file deletion for old runtimes, supported aliases,
@@ -175,18 +176,81 @@ table above for the retained production boundary or obsolete-contract reason.
 
 - `TestStatusWatchRejectsNonPositiveInterval`
 
-## Remaining cleanup
+## Projection fixtures
 
-Read-only `runStatus`/`runList` fixtures still cover schema compatibility,
-redaction, recovery and detailed projection invariants. Migrate those assertions
-to the shared projection before removing their old renderers. The old wake,
-touch and flush direct implementations and their autodiscovery helpers also
-remain for a separate scenario migration; their supported aliases already use
-supervisor IPC. The deadcode list is not an automatic deletion manifest.
+Historical status/list serialization now lives only in
+`internal/cli/projection_fixture_test.go`. Its explicitly named
+`writeStatusProjectionFixture` and `writeListProjectionFixture` adapters call the
+current `buildStatusReport` and `summarizeRepo` services. They preserve schema,
+redaction, durable recovery and detailed projection assertions without shipping
+a second command implementation. Product/control tests cover the current public
+presentation. The old watch loop and its two tests were removed; current
+`TestProductListWatch*` cases cover refresh and cancellation.
 
 ## Validation
 
+- Darwin/arm64 and Linux/amd64 matched at 134 unreachable CLI functions before
+  cleanup; the first removal pass reduced both to 60. A final pass follows the
+  fixture/controller migration.
 - Focused lifecycle, repository, commit-all and compatibility tests passed with
   the race detector: 23.115 seconds.
-- Full CLI race suite and new production preview tests: results pending.
+- Current-command preview and consent tests passed with the race detector:
+  3.297 seconds.
+- Residual shutdown/compatibility/signal tests passed: 9.525 seconds.
+- The full CLI race suite finished in 237.572 seconds. Failures identified
+  assertions against concurrently changed status text, metrics and setup help.
+  The new preview fixture's missing initial commit was fixed and verified with
+  its focused test. The combined branch gate must pass before completion.
 - `git diff --check` passed after the structural cleanup.
+
+## Additional removed controller tests
+
+Direct hint-controller tests covered retired SQLite and signal mutations. The
+current root compatibility opt-in test, worker hint tests, Intent boundary tests,
+and lifecycle/Intent flush integration tests cover the supported IPC path.
+`TestSignalProcess*` tests remain because migration shutdown still sends signals.
+
+### repo_autodiscovery_test.go
+
+- `TestFlushLogical_AutodiscoveryDisabledUnregisteredRefusesUnknownSessionWithoutState`
+- `TestStart_AutodiscoveryDisabledHookUnregisteredSkipsWithoutState`
+- `TestStart_AutodiscoveryDisabledRegisteredRepoWorks`
+- `TestStart_DisabledRepoHookSkipsEvenWhenAutodiscoveryEnabled`
+- `TestStart_DisabledRepoManualReportsEnableGuidance`
+- `TestStart_ManualUnregisteredRequiresRepoOn`
+- `TestStart_RechecksDisabledAfterControlLockWait`
+- `TestWakeTouchFlush_AutodiscoveryDisabledUnregisteredSkipsWithoutState`
+- `TestWakeTouchFlush_DisabledRepoSkipsWithoutState`
+### flush_test.go
+
+- `TestFlush_HeartbeatOnlyDoesNotEnqueueOrSignal`
+- `TestFlush_HeartbeatOnlyStillLazyRegisters`
+- `TestFlush_HelpListsLogicalFlag`
+- `TestFlush_LogicalEnqueuesAndSignals`
+- `TestFlush_LogicalRefusesOnDetachedHEAD`
+- `TestFlush_LogicalRefusesOnGitOperation`
+- `TestFlush_LogicalRefusesOnManualPause`
+- `TestFlush_LogicalRequiresRegisteredClient`
+- `TestFlush_PropagatesUnexpectedLockError`
+- `TestFlush_SessionIDRequired`
+- `TestFlush_SkippedJSONOmitsZeroLastSeenTS`
+- `TestFlush_SkipsWhenControlLockHeld`
+### touch_test.go
+
+- `TestTouchCommandExposesSoftBoundaryFlag`
+- `TestTouch_LazyRegistersUnknownSession`
+- `TestTouch_RefreshesLastSeenOnly`
+- `TestTouch_SkipsWhenControlLockHeld`
+- `TestTouch_SoftBoundaryPersistsRepoWideEpochAndSignals`
+### wake_test.go
+
+- `TestSignalDaemonSettingsActivationDoesNotEnqueueWake`
+- `TestSignalDaemonSettingsActivationStoppedAndFingerprintRequired`
+- `TestWake_LazyRegisterIdempotent`
+- `TestWake_PropagatesUnexpectedLockError`
+- `TestWake_RefreshesAndSignals`
+- `TestWake_SkipsWhenControlLockHeld`
+### list_test.go
+
+- `TestListWatch_AlreadyCanceledContextReturnsNil`
+- `TestListWatch_RendersMultipleSnapshotsAndStopsOnCancel`
