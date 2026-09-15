@@ -193,6 +193,8 @@ func CanRuntimeMigrate(from, to int) bool {
 		case 25:
 			// v26 adds grouped history rewrite plan storage. Workers do not use
 			// these rows during capture or publication.
+		case 27:
+			// v28 separates stable recovery reason codes from display errors.
 		case 26:
 			// v27 records approved index identity without inventing legacy consent.
 		default:

@@ -24,9 +24,8 @@ const supersededCandidateDrainErrorSuffix = " is terminal in status superseded"
 const exhaustedCandidateSuccessorDrainErrorPrefix = "daemon: intent candidates: exhausted successor IDs for \""
 const exhaustedCandidateSuccessorDrainErrorSuffix = "\""
 
-// PublicationDrainSemanticMessageUnavailableReason is persisted only after a
-// frozen semantic provider exhausts its circuit backoff while local grouping
-// still requires that provider to write the commit message.
+// PublicationDrainSemanticMessageUnavailableReason identifies historical
+// terminal outage rows so current recovery can reopen them safely.
 const PublicationDrainSemanticMessageUnavailableReason = "publication_drain_semantic_message_unavailable"
 
 func legacySoftDependencyCapDrainError(reason string) bool {
@@ -153,7 +152,7 @@ func publicationDrainHasAppliedAlternativeRuntime(
 	// configuration pause through the same journaled preservation path. Ordinary
 	// remote-provider changes remain fenced by the frozen target contract.
 	correctedConfiguration := drain.Phase == state.PublicationDrainNeedsAction &&
-		drain.LastError == "provider_configuration_required"
+		publicationDrainReason(drain) == publicationReasonProviderConfiguration
 	if strategy != drain.CommitStrategy || format != drain.CommitFormat || fingerprint == "" ||
 		(!correctedConfiguration && (provider != (ai.DeterministicProvider{}).Name() || fingerprint == drain.ProviderFingerprint)) {
 		return false, nil
@@ -665,11 +664,11 @@ func ResumePublicationDrainCheckpointing(
 	now time.Time,
 ) (state.PublicationDrain, error) {
 	recheckingHeadAdvance := drain.Phase == state.PublicationDrainNeedsAction &&
-		strings.HasPrefix(drain.LastError, publicationDrainHeadChangedPrefix)
+		publicationDrainReason(drain) == publicationReasonHeadChanged
 	recheckingRecoveredTarget := drain.Phase == state.PublicationDrainNeedsAction &&
-		drain.LastError == publicationDrainRecoveredTargetError
+		publicationDrainReason(drain) == publicationReasonRecoveredTarget
 	recheckingSemanticMessage := drain.Phase == state.PublicationDrainNeedsAction &&
-		drain.LastError == PublicationDrainSemanticMessageUnavailableReason
+		publicationDrainReason(drain) == publicationReasonSemanticUnavailable
 	if drain.Phase != state.PublicationDrainCheckpointing &&
 		!recheckingHeadAdvance && !recheckingRecoveredTarget &&
 		!recheckingSemanticMessage {
@@ -687,6 +686,7 @@ func ResumePublicationDrainCheckpointing(
 		update := PublicationDrainUpdateFrom(drain, nowTS, drain.LastProgressTS)
 		update.Phase = state.PublicationDrainNeedsAction
 		update.LastError = reason.Error()
+		update.ReasonCode = publicationErrorReason(reason)
 		blocked, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 		if err != nil {
 			return drain, errors.Join(reason, err)
@@ -715,9 +715,9 @@ func ResumePublicationDrainCheckpointing(
 		safe, err = publicationDrainOwnsHeadAdvance(
 			ctx, db, drain, observedHead, currentHeadText, checkpointCreatedTS)
 		if err == nil && !safe {
-			err = fmt.Errorf(
+			err = &publicationReasonError{code: publicationReasonHeadChanged, err: fmt.Errorf(
 				publicationDrainHeadChangedPrefix+" observed=%s current=%s",
-				observedHead, currentHeadText)
+				observedHead, currentHeadText)}
 		}
 	}
 	if err != nil {
@@ -1543,6 +1543,7 @@ func UpdatePublicationDrainAfterReplay(
 	update.CommitCount = counts.commits
 	if progressed {
 		update.LastError = ""
+		update.ReasonCode = ""
 	}
 	if summary.PlannerFailure != "" {
 		update.LastError = summary.PlannerFailure
@@ -1550,11 +1551,13 @@ func UpdatePublicationDrainAfterReplay(
 	if counts.terminal > 0 {
 		update.Phase = state.PublicationDrainNeedsAction
 		update.LastError = publicationDrainRecoveredTargetError
+		update.ReasonCode = publicationReasonRecoveredTarget
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
 	if resolved == drain.TargetEventCount {
 		update.Phase = state.PublicationDrainCompleted
 		update.LastError = ""
+		update.ReasonCode = ""
 		update.CompletedTS = sql.NullFloat64{Float64: nowTS, Valid: true}
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
@@ -1564,9 +1567,11 @@ func UpdatePublicationDrainAfterReplay(
 			// semantic target is invalid. Keep the exact phase so the next
 			// half-open probe resumes the same plan automatically.
 			update.LastError = ""
+			update.ReasonCode = ""
 			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 		}
 		update.LastError = replayErr.Error()
+		update.ReasonCode = publicationErrorReason(replayErr)
 		if ai.ProviderNeedsConfiguration(replayErr) {
 			update.Phase = state.PublicationDrainNeedsAction
 			update.LastError = "provider_configuration_required"
@@ -1579,7 +1584,7 @@ func UpdatePublicationDrainAfterReplay(
 		if preflightFailed &&
 			drain.Phase == state.PublicationDrainEventFallback &&
 			drain.FallbackMode == publicationFallbackLocalUnlock &&
-			drain.LastError == update.LastError {
+			publicationDrainReason(drain) == publicationReasonPreflight {
 			// Semantic normalization and the deterministic local unlock have
 			// both failed against the same frozen evidence. Retrying that exact
 			// preflight cannot make progress, so stop at the durable safety
@@ -1699,7 +1704,7 @@ func PublicationDrainUpdateFrom(
 		SemanticRebuildAttempts: drain.SemanticRebuildAttempts,
 		EventFallbackCount:      drain.EventFallbackCount,
 		CommitCount:             drain.CommitCount, FallbackMode: drain.FallbackMode,
-		LastError: drain.LastError, StagedConsent: drain.StagedConsent,
+		LastError: drain.LastError, ReasonCode: drain.ReasonCode, StagedConsent: drain.StagedConsent,
 		StagedConsumed: drain.StagedConsumed,
 		UpdatedTS:      updatedTS, LastProgressTS: progressTS,
 		CompletedTS: drain.CompletedTS,

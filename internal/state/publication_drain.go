@@ -55,6 +55,7 @@ type PublicationDrain struct {
 	CommitCount             int64
 	FallbackMode            string
 	LastError               string
+	ReasonCode              string
 	ExpectedIndexDigest     string
 	StagedConsent           bool
 	StagedConsumed          bool
@@ -74,6 +75,7 @@ type PublicationDrainUpdate struct {
 	CommitCount             int64
 	FallbackMode            string
 	LastError               string
+	ReasonCode              string
 	StagedConsent           bool
 	StagedConsumed          bool
 	UpdatedTS               float64
@@ -145,7 +147,7 @@ func ReconcileResolvedPublicationDrains(
 		result, err := tx.ExecContext(ctx, `
 UPDATE publication_drains
 SET phase='completed', published_event_count=?, commit_count=?,
-    last_error='', updated_ts=MAX(updated_ts,?),
+    last_error='', reason_code='', updated_ts=MAX(updated_ts,?),
     last_progress_ts=MAX(last_progress_ts,?), completed_ts=?
 WHERE id=? AND phase=? AND target_event_count=?`,
 			candidate.ResolvedEvents, candidate.CommitCount,
@@ -269,8 +271,8 @@ INSERT INTO publication_drains(
  provider_fingerprint,phase,
  target_event_count,published_event_count,semantic_rebuild_attempts,
  event_fallback_count,commit_count,fallback_mode,last_error,staged_consent,staged_consumed,
- expected_index_digest,created_ts,updated_ts,last_progress_ts,completed_ts
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+ reason_code,expected_index_digest,created_ts,updated_ts,last_progress_ts,completed_ts
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		drain.ID, drain.CheckpointID, drain.WorktreeID, drain.BranchRef,
 		drain.BranchGeneration, drain.CommitStrategy, drain.CommitFormat,
 		drain.ConfigRevisionID, drain.Provider, drain.ProviderModel,
@@ -279,7 +281,7 @@ INSERT INTO publication_drains(
 		drain.PublishedEventCount, drain.SemanticRebuildAttempts,
 		drain.EventFallbackCount, drain.CommitCount, drain.FallbackMode,
 		drain.LastError, drain.StagedConsent, drain.StagedConsumed,
-		drain.ExpectedIndexDigest, drain.CreatedTS, drain.UpdatedTS,
+		drain.ReasonCode, drain.ExpectedIndexDigest, drain.CreatedTS, drain.UpdatedTS,
 		drain.LastProgressTS, drain.CompletedTS); err != nil {
 		return false, fmt.Errorf("state: insert publication drain: %w", err)
 	}
@@ -595,11 +597,11 @@ func AdvancePublicationDrain(
 	result, err := tx.ExecContext(ctx, `
 UPDATE publication_drains SET
  phase=?,published_event_count=?,semantic_rebuild_attempts=?,
- event_fallback_count=?,commit_count=?,fallback_mode=?,last_error=?,
+ event_fallback_count=?,commit_count=?,fallback_mode=?,last_error=?,reason_code=?,
  staged_consent=?,staged_consumed=?,updated_ts=?,last_progress_ts=?,completed_ts=?
 WHERE id=? AND phase=?`, update.Phase, update.PublishedEventCount,
 		update.SemanticRebuildAttempts, update.EventFallbackCount,
-		update.CommitCount, update.FallbackMode, update.LastError,
+		update.CommitCount, update.FallbackMode, update.LastError, update.ReasonCode,
 		update.StagedConsent, update.StagedConsumed, update.UpdatedTS,
 		update.LastProgressTS,
 		update.CompletedTS, id, current.Phase)
@@ -632,7 +634,7 @@ func ReopenPublicationDrainCheckpointing(
 	}
 	result, err := db.conn.ExecContext(ctx, `
 UPDATE publication_drains
-SET phase='checkpointing',last_error='',updated_ts=?
+SET phase='checkpointing',last_error='',reason_code='',updated_ts=?
 WHERE id=? AND phase='needs_action' AND last_error=? AND updated_ts<=?`,
 		updatedTS, id, sanitizePublicationDrainError(expectedError), updatedTS)
 	if err != nil {
@@ -687,7 +689,7 @@ func ActivePublicationDrains(
 	if db == nil {
 		return nil, errors.New("state: ActivePublicationDrains: nil db")
 	}
-	return publicationDrainsQuery(ctx, db.conn, true, false)
+	return publicationDrainsQuery(ctx, db.conn, true, SchemaVersion)
 }
 
 // ActivePublicationDrainsForPair returns at most two active drains for one
@@ -766,12 +768,12 @@ func ReadPublicationDrainProjection(
 		}
 		return projection, nil
 	}
-	active, err := publicationDrainsQuery(ctx, conn, true, projection.SchemaVersion < 27)
+	active, err := publicationDrainsQuery(ctx, conn, true, projection.SchemaVersion)
 	if err != nil {
 		return projection, err
 	}
 	projection.Active = active
-	latest, ok, err := publicationDrainLatestQuery(ctx, conn, true, projection.SchemaVersion < 27)
+	latest, ok, err := publicationDrainLatestQuery(ctx, conn, true, projection.SchemaVersion)
 	if err != nil {
 		return projection, err
 	}
@@ -787,7 +789,7 @@ SELECT id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
  provider_fingerprint,
  target_event_count,published_event_count,semantic_rebuild_attempts,
  event_fallback_count,commit_count,fallback_mode,last_error,staged_consent,staged_consumed,
- expected_index_digest,created_ts,updated_ts,last_progress_ts,completed_ts
+ reason_code,expected_index_digest,created_ts,updated_ts,last_progress_ts,completed_ts
 FROM publication_drains`
 
 const legacyPublicationDrainSelect = `
@@ -845,10 +847,10 @@ func publicationDrainLatestQuery(
 	ctx context.Context,
 	query checkpointQuery,
 	loadEvents bool,
-	legacyIndex bool,
+	schemaVersion int,
 ) (PublicationDrain, bool, error) {
 	drain, err := scanPublicationDrain(query.QueryRowContext(
-		ctx, publicationDrainSelectIndex(legacyIndex)+" ORDER BY created_ts DESC,id DESC LIMIT 1"))
+		ctx, publicationDrainSelectForVersion(schemaVersion)+" ORDER BY created_ts DESC,id DESC LIMIT 1"))
 	if errors.Is(err, sql.ErrNoRows) {
 		return PublicationDrain{}, false, nil
 	}
@@ -863,11 +865,15 @@ func publicationDrainLatestQuery(
 	return drain, true, nil
 }
 
-func publicationDrainSelectIndex(legacy bool) string {
-	if legacy {
-		return strings.Replace(publicationDrainSelect, "expected_index_digest", "''", 1)
+func publicationDrainSelectForVersion(version int) string {
+	query := publicationDrainSelect
+	if version < 27 {
+		query = strings.Replace(query, "expected_index_digest", "''", 1)
 	}
-	return publicationDrainSelect
+	if version < 28 {
+		query = strings.Replace(query, "reason_code", "''", 1)
+	}
+	return query
 }
 
 func publicationDrainsQuery(
@@ -876,9 +882,9 @@ func publicationDrainsQuery(
 		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	},
 	activeOnly bool,
-	legacyIndex bool,
+	schemaVersion int,
 ) ([]PublicationDrain, error) {
-	statement := publicationDrainSelectIndex(legacyIndex)
+	statement := publicationDrainSelectForVersion(schemaVersion)
 	if activeOnly {
 		statement += " WHERE phase NOT IN ('completed','needs_action')"
 	}
@@ -1038,7 +1044,7 @@ func scanPublicationDrain(row checkpointRows) (PublicationDrain, error) {
 		&drain.TargetEventCount, &drain.PublishedEventCount,
 		&drain.SemanticRebuildAttempts, &drain.EventFallbackCount,
 		&drain.CommitCount, &drain.FallbackMode, &drain.LastError,
-		&drain.StagedConsent, &drain.StagedConsumed, &drain.ExpectedIndexDigest, &drain.CreatedTS, &drain.UpdatedTS,
+		&drain.StagedConsent, &drain.StagedConsumed, &drain.ReasonCode, &drain.ExpectedIndexDigest, &drain.CreatedTS, &drain.UpdatedTS,
 		&drain.LastProgressTS, &drain.CompletedTS); err != nil {
 		return PublicationDrain{}, err
 	}
@@ -1119,6 +1125,7 @@ func samePublicationDrainUpdate(
 		current.CommitCount == update.CommitCount &&
 		current.FallbackMode == update.FallbackMode &&
 		current.LastError == update.LastError &&
+		current.ReasonCode == update.ReasonCode &&
 		current.StagedConsent == update.StagedConsent &&
 		current.StagedConsumed == update.StagedConsumed &&
 		current.UpdatedTS == update.UpdatedTS &&

@@ -225,6 +225,14 @@ type IntentV2ReadOnlyProjection struct {
 // SaveIntentCandidate inserts or revises one candidate and its active
 // membership atomically. Captures assigned elsewhere are superseded, never
 // deleted, and all captures must belong to the candidate's exact branch pair.
+// IntentCandidateTerminalError identifies a terminal ownership conflict without
+// requiring recovery callers to parse user-facing error text.
+type IntentCandidateTerminalError struct{ ID, Status string }
+
+func (e *IntentCandidateTerminalError) Error() string {
+	return fmt.Sprintf("state: candidate %s is terminal in status %s", e.ID, e.Status)
+}
+
 func SaveIntentCandidate(ctx context.Context, d *DB, candidate IntentCandidate) error {
 	if d == nil {
 		return errors.New("state: SaveIntentCandidate: nil db")
@@ -247,7 +255,7 @@ func SaveIntentCandidate(ctx context.Context, d *DB, candidate IntentCandidate) 
 	).Scan(&existingStatus)
 	switch {
 	case err == nil && isTerminalIntentCandidateStatus(existingStatus):
-		return fmt.Errorf("state: candidate %s is terminal in status %s", candidate.ID, existingStatus)
+		return &IntentCandidateTerminalError{ID: candidate.ID, Status: existingStatus}
 	case err != nil && !errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("state: load existing candidate: %w", err)
 	case errors.Is(err, sql.ErrNoRows):
