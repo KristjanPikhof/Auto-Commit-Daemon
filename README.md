@@ -45,8 +45,9 @@ git config --global user.name "Your Name"
 git config --global user.email "you@example.com"
 ~~~
 
-The released binary does not require Go. The default setup does not require an
-API key, a Git remote, a GitHub account, or Full Disk Access on macOS.
+The released binary does not require Go, a Git remote, a GitHub account, or
+Full Disk Access on macOS. AI connections may need credentials; Local automatic
+commits work without them.
 
 ## Install
 
@@ -85,16 +86,19 @@ The installer needs Bash, `curl`, `tar`, `install`, and either `shasum` or
 acd setup
 ~~~
 
-Setup asks how you want ACD to group changes, format commit messages, and
-choose a provider. Choose Everyday for Intent commits. The local provider
-works offline; choose an OpenAI-compatible provider for AI-generated grouping
-and semantic commit messages.
+Setup recommends **AI semantic commits** with Everyday structural checks and
+bounded repair of recent private ACD commits. Related code, tests, and docs can
+become one meaningful commit. Choose an AI connection, or choose **Local
+automatic commits** for offline operation with more limited grouping and messages.
 
 ACD shows one exact plan before changing anything. Once you approve it, setup
 installs the managed runtime, starts the background supervisor, and adds any
 integrations you selected.
 
-Setup is user-wide. It does not enable the current repository.
+Setup is user-wide. In a terminal it offers a separate confirmation to protect
+the current repository. Declining leaves installation complete; run `acd on` later.
+Setup verifies running versions and protection for enabled repositories before
+reporting completion. Existing settings and repository opt-ins are preserved.
 
 To inspect the plan without making changes:
 
@@ -124,15 +128,18 @@ acd status
 Look for:
 
 ~~~text
-ACD protection: on
-Current changes protected: yes
-Action needed: no
+Protection: on
+Current changes saved: yes
+Branch commits: 3 changes waiting for AI
+Next: No action needed.
 ~~~
 
-`Commit mode` should be `Intent` when you selected Everyday. The publication
-queue may still contain protected changes. `Publication phase` explains
-whether ACD is grouping, calling the provider, verifying, publishing, waiting,
-or recovering.
+AI outages delay commits without delaying checkpoint protection. ACD retries
+with persisted backoff and resumes when AI returns. It never silently changes
+the selected provider to local messages. `Recovery: N changes saved separately`
+means that work is preserved outside ordinary branch history.
+
+Use `acd status --verbose` for provider, queue, target, phase, and worker details.
 
 ## Daily use
 
@@ -237,9 +244,10 @@ steps.
 
 ## Privacy and providers
 
-Fresh setup uses the local deterministic provider and needs no credential or
-network request. You can choose an OpenAI-compatible provider when you want AI
-Intent planning and semantic commit messages.
+Fresh interactive setup recommends AI semantic grouping and messages. You choose
+the connection and approve source sharing before activation. Local automatic
+commits remain an explicit offline option. Unattended first setup requires an
+explicit `--provider openai-compat` or `--provider deterministic`.
 
 Network diff egress is off until you approve it explicitly. Credentials never
 enter status, logs, diagnostics, traces, or plan fingerprints. Full provider
