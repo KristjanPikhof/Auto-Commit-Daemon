@@ -56,45 +56,7 @@ var stopWaitTimeout = 5 * time.Second
 // stopPollInterval is the busy-loop polling cadence inside stopWaitTimeout.
 var stopPollInterval = 100 * time.Millisecond
 
-func newStopCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "stop",
-		Short: "Stop the current repo daemon or deregister a harness session",
-		Long: `Stop the daemon for the current repository by default.
-
-Precedence:
-  acd stop
-    Stop the resolved repo daemon without inspecting session refcounts.
-  acd stop --session-id SESSION
-    Deregister one harness session; stop only when no peers remain.
-  acd stop --force [--session-id SESSION]
-    Best-effort deregister SESSION when provided, then terminate the daemon and escalate if needed.
-  acd stop --all [--force]
-    Apply the same stop mode to every registered repo and keep stopped/deferred/failed buckets.
-
-Use acd status before stopping when you need to see active sessions.`,
-		Example: `  acd stop
-  acd stop --repo /path/to/repo
-  acd stop --session-id "$ACD_SESSION_ID"
-  acd stop --force
-  acd stop --all --json`,
-		RunE: func(c *cobra.Command, args []string) error {
-			repoFlag, _ := c.Flags().GetString("repo")
-			jsonOut, _ := c.Flags().GetBool("json")
-			sessionID, _ := c.Flags().GetString("session-id")
-			force, _ := c.Flags().GetBool("force")
-			all, _ := c.Flags().GetBool("all")
-			return runStop(c.Context(), c.OutOrStdout(), repoFlag, sessionID, force, all, jsonOut)
-		},
-	}
-	cmd.Flags().String("session-id", "", "Harness session identifier to deregister instead of human stop")
-	cmd.Flags().Bool("flush", false, "Drain pending events before stopping (with --force)")
-	cmd.Flags().Bool("force", false, "Skip refcount and SIGTERM the daemon")
-	cmd.Flags().Bool("all", false, "Stop every daemon in the central registry")
-	return cmd
-}
-
-func runStop(ctx context.Context, out io.Writer, repoFlag, sessionID string, force, all, jsonOut bool) error {
+fufunc runStop(ctx context.Context, out io.Writer, repoFlag, sessionID string, force, all, jsonOut bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -410,21 +372,4 @@ func removeAllStartCaches(gitDir string) {
 	}
 }
 
-func writeStopResult(out io.Writer, res stopRepoResult, jsonOut bool) error {
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(res)
-	}
-	switch {
-	case res.Deferred:
-		fmt.Fprintf(out, "acd stop: deferred (%s)\n", res.Reason)
-	case res.Stopped && res.Force:
-		fmt.Fprintf(out, "acd stop: stopped (force, escalated=%v)\n", res.Escalated)
-	case res.Stopped:
-		fmt.Fprintln(out, "acd stop: stopped")
-	default:
-		fmt.Fprintf(out, "acd stop: result=%+v\n", res)
-	}
-	return nil
-}
+func write
