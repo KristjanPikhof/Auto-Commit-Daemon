@@ -49,7 +49,7 @@ func applyMaintenanceStatus(res *controlResult, report statusReport) {
 	}
 	if res.Health == controlHealthNeedsAttention {
 		// Preserve the more urgent protection/publication failure and its remedy.
-		res.Summary += " " + m.Summary()
+		res.Summary += " " + maintenanceDetails(m)
 		return
 	}
 	if res.Health == controlHealthHealthy && report.PendingEvents == 0 {
