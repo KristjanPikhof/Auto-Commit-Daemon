@@ -132,9 +132,9 @@ It should not leave the repository permanently blocked.
 A healthy wait is not a stall. A responsive worker is not proof of queue
 progress. Report worker liveness and queue movement separately.
 
-`Published to Git: yes` means every protected change is resolved in branch
-history or a protected recovery snapshot, with no active failed or blocked
-capture.
+Human status separates branch commits from recovery preservation. Deprecated
+JSON publication booleans retain their earlier resolved-work meaning; the shared
+publication outcome reports branch commitment, recovery, and pending classification.
 
 Prefer event-driven wakeups. Polling is a safety net and should back off while
 idle. Keep scans, provider calls, queues, logs, and database work bounded.
@@ -162,8 +162,8 @@ faster.
 The default local gate and the complete hosted GitHub Actions workflow each
 have a five-minute wall-clock target.
 
-Hosted pull requests run four core shards and one support lane on both Ubuntu
-and macOS. The support lane runs timing-sensitive tests only after the other
+Hosted pull requests run four core shards, four production integration shards,
+and one support lane on both Ubuntu and macOS. The support lane runs timing-sensitive tests only after the other
 package tests finish. Repeated daemon stress uses six Ubuntu runners, while
 Git and state stress use two. Each leaf job should finish within four minutes
 and 30 seconds and has a hard five-minute timeout. If a lane exceeds that
