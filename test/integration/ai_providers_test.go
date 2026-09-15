@@ -1,23 +1,8 @@
 //go:build integration
 // +build integration
 
-// ai_providers_test.go drives §10 (AI providers) end-to-end through the
-// real `acd` binary. The daemon picks up ACD_AI_* from the inherited
-// process environment (start.go does not strip env on spawn), so each
-// scenario simply passes the relevant env vars on `acd start`.
-//
-// Coverage:
-//
-//  1. Deterministic default (ACD_AI_PROVIDER unset)         — TestAI_DeterministicDefault
-//  2. openai-compat against a mock HTTP server (success)    — TestAI_OpenAICompatMockSuccess
-//  3. openai-compat 5xx -> protected AI wait           — TestAI_OpenAICompat5xxFallback
-//  4. conventional mode wrong-format response -> protected wait    — TestAI_OpenAICompatConventionalWrongFormatFallback
-//  5. Subprocess plugin happy path                          — TestAI_SubprocessPluginHappyPath
-//  6. Subprocess plugin timeout (ACD_AI_TIMEOUT=300ms)      — TestAI_SubprocessPluginTimeoutFallback
-//  7. Subprocess plugin crash + respawn between events      — TestAI_SubprocessPluginCrashRespawn
-//
-// Plugin tests are skipped on Windows (the bash shebang trick is not
-// portable; v1 ships no Windows support anyway per D1).
+// Exercise provider behavior through the real CLI, isolated runtime settings,
+// deterministic HTTP mocks, and subprocess plugins.
 package integration_test
 
 import (
@@ -27,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -668,7 +654,7 @@ func assertProviderWaitPreservesCheckpoint(t *testing.T, repo, path, body, head 
 		return json.Unmarshal([]byte(raw), &health) == nil && health.State == "open" && health.Failure == "transport" && health.Retry > health.Opened
 	})
 	waitForEventState(t, dbPath, path, "pending", 5*time.Second)
-	ref := sqliteScalar(t, dbPath, "SELECT ref FROM checkpoints WHERE phase='completed' AND retained=1 ORDER BY seq DESC LIMIT 1")
+	ref := sqliteScalar(t, dbPath, "SELECT checkpoint_ref FROM checkpoints WHERE phase='completed' AND retained=1 ORDER BY seq DESC LIMIT 1")
 	if ref == "" || runGitOK(t, repo, "show", ref+":"+path) != body {
 		t.Fatalf("provider wait did not retain exact checkpoint bytes for %s", path)
 	}
