@@ -22,16 +22,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-type repoInitResult struct {
-	Repo       string `json:"repo"`
-	RepoHash   string `json:"repo_hash"`
-	StateDB    string `json:"state_db"`
-	Inserted   bool   `json:"inserted"`
-	Refreshed  bool   `json:"refreshed"`
-	BranchRef  string `json:"branch_ref"`
-	ConfigPath string `json:"config_path,omitempty"`
-}
-
 type repoListEntry struct {
 	central.RepoRecord
 	Safety           central.RepoRemovalSafety `json:"safety"`
