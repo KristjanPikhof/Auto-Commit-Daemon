@@ -29,6 +29,9 @@
 
 ### Fixed
 
+- Internal setup and readiness checkpoints no longer make idle repositories
+  appear recently active in `acd list`. Slow optional Git checks retain known
+  activity and unfinished work instead of dropping those rows.
 - Slow AI and project verification no longer prevent new checkpoint protection.
   Evaluation results are checked against current ownership before publication.
   External Git movement can now resolve through `recovery_published` or

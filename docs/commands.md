@@ -178,7 +178,9 @@ acd commit-all --yes
 `list` shows enabled repositories with activity in the last hour, plus any
 repository with unfinished work. Activity includes agent hooks, captured edits,
 publication progress, commit-all requests, and applied history rewrites.
-Worker heartbeats and background maintenance do not count as activity.
+Worker heartbeats, setup/readiness checkpoints and background maintenance do
+not count as activity. Slow detail checks keep known activity and unfinished
+work visible.
 
 A repository with pending, blocked, stalled, or incompletely protected work
 stays visible until that work is resolved. An otherwise idle repository drops
