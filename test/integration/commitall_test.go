@@ -33,6 +33,7 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 		}
 		seqs := offeredIntentSeqsLenient(t, req)
 		if len(seqs) != 1 {
+			t.Logf("cached-wait planner expected one capture, offered seqs=%v", seqs)
 			http.Error(w, "expected one offered capture", http.StatusBadRequest)
 			return
 		}
@@ -69,10 +70,21 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	extra = activateIntentV2Runtime(t, repo, extra...)
 	fullEnv := envWith(env, extra...)
 	startSession(t, ctx, env, repo, "cached-wait-a", "shell", extra...)
-	writeFile(t, filepath.Join(repo, "forced.go"),
+	// This scenario needs one complete capture, without an intermediate
+	// empty file observed between create and write.
+	writeFileAtomically(t, repo, filepath.Join(repo, "forced.go"),
 		"package forced\n\nfunc Ready() bool { return true }\n")
 	wakeSession(t, ctx, fullEnv, repo, "cached-wait-a")
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("cached-wait state: planner_calls=%d captures=%s candidates=%s deferrals=%s",
+				plannerCalls.Load(),
+				sqliteScalar(t, dbPath, "SELECT group_concat(seq || ':' || state || ':' || operation || ':' || path) FROM capture_events"),
+				sqliteScalar(t, dbPath, "SELECT group_concat(id || ':' || status) FROM intent_candidates"),
+				sqliteScalar(t, dbPath, "SELECT group_concat(event_seq || ':' || defer_count) FROM planner_state"))
+		}
+	})
 	waitFor(t, "non-forced plan waits", 15*time.Second, func() bool {
 		return plannerCalls.Load() == 1 && sqliteScalar(t, dbPath,
 			"SELECT COUNT(*) FROM intent_candidates WHERE status='waiting'") == "1"

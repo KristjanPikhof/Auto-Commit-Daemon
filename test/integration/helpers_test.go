@@ -1215,6 +1215,28 @@ func writeFile(t *testing.T, path, body string) {
 	}
 }
 
+// writeFileAtomically presents one complete save to a running watcher. Use it
+// when a scenario requires one capture per edit rather than intermediate writes.
+func writeFileAtomically(t *testing.T, repo, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Keep preparation outside the watched worktree and on the same filesystem.
+	file, err := os.CreateTemp(filepath.Join(repo, ".git"), "integration-write-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Name())
+	_, writeErr := file.WriteString(body)
+	if err := errors.Join(writeErr, file.Chmod(0o644), file.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func gitCommitAll(t *testing.T, repo, message string, paths ...string) string {
 	t.Helper()
 	if len(paths) == 0 {
