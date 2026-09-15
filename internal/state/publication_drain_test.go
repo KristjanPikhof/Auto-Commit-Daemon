@@ -791,3 +791,41 @@ INSERT INTO capture_events(
 	}
 	return checkpoint
 }
+
+func TestPublicationDrainReasonCodeMigrationAndReadOnlyCompatibility(t *testing.T) {
+	ctx := context.Background()
+	db, path := openTestDB(t)
+	checkpoint := seedPublicationDrainCheckpoint(t, db, []string{"protected"})
+	drain := PublicationDrain{ID: "typed-reason", CheckpointID: checkpoint.ID, WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
+		BranchGeneration: 7, Phase: PublicationDrainCheckpointing, TargetEventCount: 1, CreatedTS: 10, UpdatedTS: 10, LastProgressTS: 10}
+	if _, err := PreparePublicationDrain(ctx, db, drain); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := AdvancePublicationDrain(ctx, db, drain.ID, PublicationDrainUpdate{ExpectedPhase: drain.Phase, Phase: PublicationDrainNeedsAction,
+		LastError: "human explanation can change", ReasonCode: "staging_changed", UpdatedTS: 11, LastProgressTS: 10})
+	if err != nil || updated.ReasonCode != "staging_changed" {
+		t.Fatalf("updated=%+v err=%v", updated, err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, "ALTER TABLE publication_drains DROP COLUMN reason_code"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, "PRAGMA user_version=27"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := ReadPublicationDrainProjection(ctx, path)
+	if err != nil || projection.Latest == nil || projection.Latest.LastError != "human explanation can change" || projection.Latest.ReasonCode != "" {
+		t.Fatalf("legacy readonly=%+v err=%v", projection, err)
+	}
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	reopened, err := PublicationDrainByID(ctx, db, drain.ID)
+	if err != nil || reopened.ReasonCode != "" || reopened.LastError != "human explanation can change" {
+		t.Fatalf("migrated=%+v err=%v", reopened, err)
+	}
+}

@@ -111,6 +111,7 @@ func failPublicationDrainRuntimeContract(
 		drain, nowTS, drain.LastProgressTS)
 	update.Phase = state.PublicationDrainNeedsAction
 	update.LastError = reason
+	update.ReasonCode = reason
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 }
 
@@ -314,7 +315,7 @@ func RecoverSupersededCandidatePublicationDrain(
 	now time.Time,
 ) (*state.PublicationDrain, error) {
 	rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT id,last_error FROM publication_drains
+SELECT id,last_error,reason_code FROM publication_drains
 WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
 ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if err != nil {
@@ -324,16 +325,51 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if !rows.Next() {
 		return nil, rows.Err()
 	}
-	var id, recordedError string
-	if err := rows.Scan(&id, &recordedError); err != nil {
+	var id, recordedError, reasonCode string
+	if err := rows.Scan(&id, &recordedError, &reasonCode); err != nil {
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	failure, ok := recoverableTerminalCandidateDrain(recordedError)
-	if !ok {
-		return nil, nil
+	var failure terminalCandidateDrainFailure
+	if reasonCode == "" {
+		var ok bool
+		failure, ok = recoverableTerminalCandidateDrain(recordedError)
+		if !ok {
+			return nil, nil
+		}
+	} else {
+		if reasonCode != publicationReasonSupersededCandidate {
+			return nil, nil
+		}
+		// New typed failures resolve candidate ownership from the frozen target.
+		// More than one terminal owner is ambiguous and cannot be guessed.
+		owners, err := db.ReadSQL().QueryContext(ctx, `SELECT DISTINCT c.id
+FROM intent_candidates c JOIN intent_candidate_events e ON e.candidate_id=c.id
+JOIN publication_drain_events d ON d.event_seq=e.event_seq
+WHERE d.drain_id=? AND c.status='superseded' AND c.branch_ref=? AND c.branch_generation=? LIMIT 2`, id, branchRef, generation)
+		if err != nil {
+			return nil, err
+		}
+		var ids []string
+		for owners.Next() {
+			var owner string
+			if err := owners.Scan(&owner); err != nil {
+				owners.Close()
+				return nil, err
+			}
+			ids = append(ids, owner)
+		}
+		err = owners.Err()
+		owners.Close()
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) != 1 {
+			return nil, nil
+		}
+		failure.candidateID = ids[0]
 	}
 	candidate, exists, err := state.IntentCandidateByID(
 		ctx, db, failure.candidateID)
@@ -617,8 +653,9 @@ func RestartablePublicationDrainForPair(
 	rows, err := db.ReadSQL().QueryContext(ctx, `
 SELECT id FROM publication_drains
 WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
-  AND (last_error LIKE ? OR last_error=? COLLATE BINARY
-       OR last_error=? COLLATE BINARY)
+  AND (reason_code IN ('head_changed','target_recovered','semantic_message_unavailable')
+       OR (reason_code='' AND (last_error LIKE ? OR last_error=? COLLATE BINARY
+       OR last_error=? COLLATE BINARY)))
 ORDER BY created_ts DESC,id DESC LIMIT 2`,
 		branchRef, generation, publicationDrainHeadChangedPrefix+"%",
 		publicationDrainRecoveredTargetError,

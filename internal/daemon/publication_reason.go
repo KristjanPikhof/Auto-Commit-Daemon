@@ -40,6 +40,8 @@ func publicationErrorReason(err error) string {
 		return publicationReasonProviderConfiguration
 	case isIntentPlannerCircuitWait(err):
 		return publicationReasonProviderWait
+	case errors.Is(err, gitpkg.ErrStagingApprovalMissing):
+		return "staging_approval_missing"
 	case errors.Is(err, gitpkg.ErrStagingChanged):
 		return "staging_changed"
 	case errors.As(err, &preflight):
