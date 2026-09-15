@@ -149,9 +149,13 @@ func publicationDrainHasAppliedAlternativeRuntime(
 	if err != nil {
 		return false, nil
 	}
-	if strategy != drain.CommitStrategy || format != drain.CommitFormat ||
-		provider != (ai.DeterministicProvider{}).Name() ||
-		fingerprint == "" || fingerprint == drain.ProviderFingerprint {
+	// A corrected, validated AI connection can recover an authentication or
+	// configuration pause through the same journaled preservation path. Ordinary
+	// remote-provider changes remain fenced by the frozen target contract.
+	correctedConfiguration := drain.Phase == state.PublicationDrainNeedsAction &&
+		drain.LastError == "provider_configuration_required"
+	if strategy != drain.CommitStrategy || format != drain.CommitFormat || fingerprint == "" ||
+		(!correctedConfiguration && (provider != (ai.DeterministicProvider{}).Name() || fingerprint == drain.ProviderFingerprint)) {
 		return false, nil
 	}
 
@@ -1362,6 +1366,7 @@ func (p publicationDrainAtomicFallbackPlanner) rewritePlanMessages(
 ) (ai.IntentPlanV2, error) {
 	legacyReq := ai.LegacyIntentPlanRequest(req)
 	out := plan
+	out.Candidates = append([]ai.IntentCandidateAssignment(nil), plan.Candidates...)
 	for index, candidate := range plan.Candidates {
 		if candidate.Readiness != ai.IntentCandidateReady {
 			continue
