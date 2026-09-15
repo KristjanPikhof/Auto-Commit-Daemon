@@ -1150,7 +1150,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 												runtime.gate.Unlock()
 												result, resultErr := publicationDrainOperationResult(ctx, runtime.db, activeDrain)
 												if resultErr != nil {
-													return nil, publicationFailure(resultErr)
+													return nil, publicationFailure(errors.New(resultErr.Message))
 												}
 												return result, nil
 											}
