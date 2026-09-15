@@ -2498,14 +2498,32 @@
     "core_source": "local gate 2026-09-15; race runner; two local shards; failed top-level cases retained",
     "date": "2026-09-15",
     "integration_current": "115 current targets; complete sharded execution plus focused fixture corrections; measurement scenario enabled in required integration runner",
+    "integration_latest_shards": [
+      {
+        "exit_code": 0,
+        "shard": 0,
+        "wall_seconds": 115
+      },
+      {
+        "corrected_by": "final-fixture-focus",
+        "exit_code": 1,
+        "shard": 1,
+        "wall_seconds": 131
+      },
+      {
+        "corrected_by": "final-fixture-focus",
+        "exit_code": 1,
+        "shard": 2,
+        "wall_seconds": 138
+      },
+      {
+        "exit_code": 0,
+        "shard": 3,
+        "wall_seconds": 113
+      }
+    ],
     "integration_measured_test_count": 114,
     "integration_serial_seconds": 613.402,
-    "integration_shard_wall_seconds": [
-      111,
-      137,
-      111,
-      129
-    ],
     "integration_shards": 4,
     "integration_test_budget_seconds": 180,
     "local_gate_result": "failed two known behavior assertions; durations retain failures; fixes require focused verification",
