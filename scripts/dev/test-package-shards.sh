@@ -5,6 +5,7 @@ if [[ $# -lt 2 ]]; then
   echo "usage: $0 <package> <shard-count> [go-test-args...]" >&2
   exit 2
 fi
+started_seconds=$SECONDS
 package=$1
 shard_count=$2
 shift 2
@@ -54,14 +55,25 @@ for ((shard = first; shard < last; shard++)); do
   if ! wait "${pids[$shard]}"; then status=1; fi
   python3 - "${outputs[$shard]}" <<'PY'
 import json, sys
+records = []
 for line in open(sys.argv[1]):
     try:
-        event = json.loads(line)
+        records.append(json.loads(line))
     except json.JSONDecodeError:
         print(line, end='')
-        continue
-    if event.get('Action') == 'output':
-        print(event.get('Output', ''), end='')
+failed = {r.get('Test', '').split('/')[0] for r in records if r.get('Action') == 'fail'}
+for event in records:
+    test = event.get('Test', '')
+    if event.get('Action') == 'output' and (not test or test.split('/')[0] in failed):
+        output = event.get('Output', '')
+        if not output.startswith(('=== RUN', '=== PAUSE', '=== CONT', '=== NAME')):
+            print(output, end='')
 PY
 done
+if [[ -n "${ACD_TEST_RESULTS_DIR:-}" ]]; then
+  python3 - "$ACD_TEST_RESULTS_DIR/${package//\//_}-${requested_shard:-all}.summary.json" "$((SECONDS - started_seconds))" "$status" <<'PY_SUMMARY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({'wall_seconds': int(sys.argv[2]), 'exit_code': int(sys.argv[3])}) + '\n')
+PY_SUMMARY
+fi
 exit "$status"
