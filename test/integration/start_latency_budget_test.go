@@ -56,7 +56,7 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 		t.Fatalf("decode cold json: %v\n%s", err, cold.Stdout)
 	}
 	if !coldJSON.Started || coldJSON.DaemonPID <= 0 {
-		t.Fatalf("cold start did not spawn daemon: %+v", coldJSON)
+		t.Fatalf("first session registration failed: %+v", coldJSON)
 	}
 
 	// Wait until daemon_state.mode == "running" so the daemon is fully
@@ -115,13 +115,13 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 			t.Fatalf("hook %d decode json: %v\n%s", i, err, res.Stdout)
 		}
 		if hot.Started {
-			t.Fatalf("hook %d unexpectedly reported started=true (daemon respawned?): %+v", i, hot)
+			t.Fatalf("hook %d unexpectedly registered the existing session again: %+v", i, hot)
 		}
 		if !hot.Duplicate {
 			t.Fatalf("hook %d not flagged duplicate (short-circuit may be misfiring): %+v", i, hot)
 		}
 		if hot.DaemonPID != coldJSON.DaemonPID {
-			t.Fatalf("hook %d daemon pid=%d want %d (cache should mirror cold-path pid)",
+			t.Fatalf("hook %d daemon pid=%d want %d (worker identity must remain stable)",
 				i, hot.DaemonPID, coldJSON.DaemonPID)
 		}
 
