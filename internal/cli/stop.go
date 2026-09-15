@@ -11,8 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spf13/cobra"
-
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
@@ -56,7 +54,7 @@ var stopWaitTimeout = 5 * time.Second
 // stopPollInterval is the busy-loop polling cadence inside stopWaitTimeout.
 var stopPollInterval = 100 * time.Millisecond
 
-fufunc runStop(ctx context.Context, out io.Writer, repoFlag, sessionID string, force, all, jsonOut bool) error {
+func runStop(ctx context.Context, out io.Writer, repoFlag, sessionID string, force, all, jsonOut bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -371,5 +369,3 @@ func removeAllStartCaches(gitDir string) {
 		_ = os.Remove(filepath.Join(dir, name))
 	}
 }
-
-func write

@@ -1,28 +1,17 @@
 package cli
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
-	"path/filepath"
 	"strings"
-	"syscall"
-
-	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	acdlogger "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/logger"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-
-f
-/
 func buildDaemonRunOptions(repo, gitDir string, db *state.DB, _ io.Writer) (daemon.Options, io.Closer, error) {
 	return buildDaemonRunOptionsWithID(repo, gitDir, db, "")
 }

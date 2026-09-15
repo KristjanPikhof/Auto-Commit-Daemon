@@ -107,7 +107,7 @@ func sessionCacheSuffix(sessionID string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// readSteCircuitDecision is the output of the registry-read decision matrix.
+// shortCircuitDecision is the output of the registry-read decision matrix.
 // `OK` means the caller may skip control.lock acquisition, SQLite open,
 // and central registry rewrite. `Reason` records why escalation was forced
 // (used in tests and JSON debug output).
@@ -123,5 +123,3 @@ type shortCircuitDecision struct {
 	// on a strictly-fresh value here.
 	ClientCount int
 }
-
-// evaluatemitcaroDi

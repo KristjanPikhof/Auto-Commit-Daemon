@@ -1,30 +1,18 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
-
-
-
-
 
 func makeStartRepo(t *testing.T) string {
 	t.Helper()
@@ -114,16 +102,6 @@ func openStartDB(t *testing.T, repoDir string) *state.DB {
 	return db
 }
 
-
-
-
-
-
-
-
-
-
-
 func commitStartRepoSeed(t *testing.T, repoDir string) string {
 	t.Helper()
 	ctx := context.Background()
@@ -151,31 +129,3 @@ func commitStartRepoSeed(t *testing.T, repoDir string) string {
 	}
 	return head
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

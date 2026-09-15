@@ -2,25 +2,12 @@ package cli
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 
-	"github.com/spf13/cobra"
-
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -38,18 +25,7 @@ type startResult struct {
 	ClientCount int    `json:"client_count"`
 }
 
-
-
-
-
-
-
-
-
-
-
-
-fufurLrtnSvetSarir resolves the .git directory for a repo. Falls back to
+// resolveGitDir resolves the .git directory for a repo. Falls back to
 // <repo>/.git when the git binary fails (common in synthetic test repos).
 func resolveGitDir(ctx context.Context, repo string) (string, error) {
 	resolved, err := git.AbsoluteGitDir(ctx, repo)
@@ -74,7 +50,7 @@ func ensureAttachedHEAD(ctx context.Context, repo string) error {
 	return nil
 }
 
-// fingerprintToHolientHotPath(ctx context.Context, gitDir, sessionID string) error {
+func defaultTouchClientHotPath(ctx context.Context, gitDir, sessionID string) error {
 	if sessionID == "" {
 		return errors.New("touchClientHotPath: empty session_id")
 	}

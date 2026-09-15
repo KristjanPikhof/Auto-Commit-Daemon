@@ -3,20 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -111,31 +105,7 @@ func TestCommitAllReconnectSelectsOnlyTheCurrentWorktreeDrain(t *testing.T) {
 	}
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-//// TestResolveEffectiveCommitStrategy_DaemonMetaWins covers the priority
+// TestResolveEffectiveCommitStrategy_DaemonMetaWins covers the priority
 // chain: daemon meta `commit.strategy` > env ACD_COMMIT_STRATEGY > default
 // (event). Three subtests, one per source.
 func TestResolveEffectiveCommitStrategy_PriorityChain(t *testing.T) {
@@ -216,7 +186,7 @@ func TestResolveEffectiveCommitStrategy_PriorityChain(t *testing.T) {
 	})
 }
 
-// T Tncncncncncncnc errOnReadReader is an io.Reader whose Read always returns an error, used
+// errOnReadReader is an io.Reader whose Read always returns an error, used
 // to detect any accidental stdin consumption in commit-all paths that are
 // supposed to skip the prompt.
 type errOnReadReader struct {
@@ -247,7 +217,7 @@ func (r *commitAllPromptHookReader) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
 }
 
-funcncncncnc T Tncncncncnc commitAllRecoveryRefs(t *testing.T, ctx context.Context, repo string) string {
+func commitAllRecoveryRefs(t *testing.T, ctx context.Context, repo string) string {
 	t.Helper()
 	out, err := git.Run(ctx, git.RunOpts{Dir: repo},
 		"for-each-ref", "--format=%(refname):%(objectname)", "refs/acd/recovery/")
@@ -287,7 +257,7 @@ func (p *fakePlannerProvider) PlanIntent(ctx context.Context, req ai.IntentPlanR
 	return ai.IntentPlan{SelectedSeqs: seqs, Subject: p.planSubject}, nil
 }
 
-func fakeProviderForReplay implements ai.Provider with NeedsDiff=false so
+// fakeProviderForReplay implements ai.Provider with NeedsDiff=false so
 // commitAllReplayLoopWith builds a real msgFn but no diff egress.
 // Generate counts how many times it is called from the per-event
 // MessageFn — proving the provider closure is wired up rather than
@@ -309,5 +279,3 @@ func (p *fakeProviderForReplay) Generate(ctx context.Context, cc ai.CommitContex
 	}
 	return ai.Result{Subject: subj}, nil
 }
-
-// Tes Tes
