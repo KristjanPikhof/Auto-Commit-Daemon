@@ -34,8 +34,14 @@ func TestProductionMeasurements(t *testing.T) {
 	defer unblock()
 	called := make(chan struct{}, 1)
 	server, trust := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select { case called <- struct{}{}: default: }
-		select { case <-release: case <-r.Context().Done(): }
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
 		http.Error(w, "temporary benchmark outage", http.StatusServiceUnavailable)
 	}))
 	// Registered after the server so a failed assertion releases blocked calls
@@ -75,11 +81,14 @@ WHERE c.phase='completed' AND o.path=%s`, sqliteLiteral(name))
 	metrics["checkpoint_seconds"] = checkpoint("first.txt").Seconds()
 	select {
 	case <-called:
-	case <-ctx.Done(): t.Fatal("provider was never called")
+	case <-ctx.Done():
+		t.Fatal("provider was never called")
 	}
 	metrics["provider_wait_checkpoint_seconds"] = checkpoint("during-provider.txt").Seconds()
 	unblock()
 	data, err := json.Marshal(metrics)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Logf("ACD_MEASUREMENT %s", data)
 }
