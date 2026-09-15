@@ -182,15 +182,21 @@ func loadRuntimeVerificationCache(ctx context.Context, input any) (string, runti
 	}
 	hash := sha256.Sum256(data)
 	key := hex.EncodeToString(hash[:])
-	_, err = state.MetaGetJSON(ctx, evaluation.db, runtimeVerificationCacheMeta, &cache)
+	raw, found, err := state.MetaGet(ctx, evaluation.db, runtimeVerificationCacheMeta)
 	if err != nil {
 		return "", nil, err
+	}
+	// This is derived evidence: malformed cache data requires a fresh check,
+	// never a permanent publication block. Database errors still propagate.
+	if found && json.Unmarshal([]byte(raw), &cache) != nil {
+		cache = nil
 	}
 	if cache == nil {
 		cache = runtimeVerificationCache{}
 	}
 	return key, cache, nil
 }
+
 func storeRuntimeVerificationCache(ctx context.Context, key string, cache runtimeVerificationCache, result IntentCandidateVerification) error {
 	evaluation, _ := ctx.Value(publicationEvaluationKey{}).(*publicationEvaluation)
 	if evaluation == nil || evaluation.db == nil || key == "" || result.Status != "passed" {
