@@ -570,8 +570,8 @@ func TestBuildStrictProviderDoesNotComposeFallback(t *testing.T) {
 		t.Fatalf("provider=%v closer=%v err=%v", missing, missingCloser, err)
 	}
 
-	// The normal path preserves its established deterministic fallback for
-	// the same unavailable subprocess configuration.
+	// Runtime construction preserves the selected provider even when its
+	// subprocess is temporarily unavailable. Generation must surface the wait.
 	normal, normalCloser, err := BuildProvider(ProviderConfig{
 		Mode: "subprocess:absent",
 		subprocessLookPath: func(string) (string, error) {
@@ -583,7 +583,7 @@ func TestBuildStrictProviderDoesNotComposeFallback(t *testing.T) {
 	}
 	defer normalCloser.Close()
 	result, err := normal.Generate(context.Background(), CommitContext{Path: "compat.txt", Op: "modify"})
-	if err != nil || result.Source != "deterministic" {
+	if err == nil || result.Source == "deterministic" || result.Subject != "" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
