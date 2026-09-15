@@ -160,7 +160,7 @@ func cliAlreadyPublishedAtHEAD(ctx context.Context, repo, sourceHead, headOID st
 		}
 		proofOps = append(proofOps, proof)
 	}
-	return git.ProvePublicationAtHEAD(ctx, repo, sourceHead, headOID, proofOps, git.PublicationProofPolicy{MissingPathIsMismatch: true})
+	return git.ProvePublicationAtHEAD(ctx, repo, sourceHead, headOID, proofOps, git.PublicationProofPolicy{MissingRefIsMismatch: true})
 }
 
 // recoveryBlockerCounts centralizes the read-only blocker predicates used by
