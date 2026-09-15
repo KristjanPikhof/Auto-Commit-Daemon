@@ -57,6 +57,14 @@ func TestProductionMeasurements(t *testing.T) {
 	startSessionJSON(t, ctx, env, repo, "production-measurements", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
 	metrics := map[string]any{"binary": "release-style", "scope": "isolated worker"}
+	defer func() {
+		data, err := json.Marshal(metrics)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		t.Logf("ACD_MEASUREMENT %s", data)
+	}()
 	pid := readDaemonStatePID(repo)
 	if out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "%cpu=", "-o", "rss=").Output(); err == nil {
 		fields := strings.Fields(string(out))
@@ -86,9 +94,4 @@ WHERE c.phase='completed' AND o.path=%s`, sqliteLiteral(name))
 	}
 	metrics["provider_wait_checkpoint_seconds"] = checkpoint("during-provider.txt").Seconds()
 	unblock()
-	data, err := json.Marshal(metrics)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("ACD_MEASUREMENT %s", data)
 }
