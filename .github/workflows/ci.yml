@@ -55,6 +55,34 @@ jobs:
       - name: Run CLI and daemon shard
         run: scripts/dev/test.sh core 4 ${{ matrix.shard.index }}
 
+  test-integration:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    name: test-integration (${{ matrix.os }}, ${{ matrix.shard }}/8)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Run production integration shard
+        env:
+          ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/integration-results
+        run: scripts/dev/test.sh integration 8 ${{ matrix.shard }}
+      - name: Preserve timing and selection evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: integration-${{ matrix.os }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/integration-results
+
   test-support:
     permissions:
       contents: read
@@ -149,6 +177,8 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      - name: Verify test manifest tooling
+        run: python3 -m unittest discover -s scripts/dev -p "*_test.py"
       - name: Run lint
         run: make lint
       - name: Build Linux binary
@@ -167,6 +197,7 @@ jobs:
     needs:
       - test-core
       - test-support
+      - test-integration
       - race-stress-daemon
       - race-stress-support
       - quality
@@ -176,11 +207,13 @@ jobs:
       - name: Require every CI lane
         env:
           CORE_RESULT: ${{ needs.test-core.result }}
+          INTEGRATION_RESULT: ${{ needs.test-integration.result }}
           SUPPORT_RESULT: ${{ needs.test-support.result }}
           DAEMON_STRESS_RESULT: ${{ needs.race-stress-daemon.result }}
           SUPPORT_STRESS_RESULT: ${{ needs.race-stress-support.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
         run: |
+          test "$INTEGRATION_RESULT" = success
           test "$CORE_RESULT" = success
           test "$SUPPORT_RESULT" = success
           test "$DAEMON_STRESS_RESULT" = success
