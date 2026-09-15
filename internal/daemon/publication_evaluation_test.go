@@ -514,3 +514,17 @@ func TestRunSemanticEvaluationProtectsAcrossRestartAndRejectsBranchChange(t *tes
 		})
 	}
 }
+
+func TestPublicationMessageRejectsBlankProviderOutput(t *testing.T) {
+	for _, message := range []string{"", " \n\t "} {
+		t.Run(fmt.Sprintf("length-%d", len(message)), func(t *testing.T) {
+			ctx := context.Background()
+			db := openIntentCandidateTestDB(t)
+			health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: IntentPlannerProviderIdentity{Provider: "selected-ai"}})
+			got, err := generatePublicationMessage(ctx, func(context.Context, EventContext) (string, error) { return message, nil }, EventContext{}, health)
+			if got != "" || !isIntentPlannerCircuitWait(err) {
+				t.Fatalf("blank provider output bypassed wait: %q %v", got, err)
+			}
+		})
+	}
+}
