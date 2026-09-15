@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // startResult is the JSON payload returned by `acd start --json`.
@@ -46,22 +44,6 @@ func ensureAttachedHEAD(ctx context.Context, repo string) error {
 	}
 	if branchRef == "" {
 		return errors.New("acd start: detached HEAD is not supported; checkout a branch before starting")
-	}
-	return nil
-}
-
-func defaultTouchClientHotPath(ctx context.Context, gitDir, sessionID string) error {
-	if sessionID == "" {
-		return errors.New("touchClientHotPath: empty session_id")
-	}
-	dbPath := state.DBPathFromGitDir(gitDir)
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		return fmt.Errorf("touchClientHotPath: open db: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-	if _, err := state.TouchClient(ctx, db, sessionID, float64(time.Now().Unix())); err != nil {
-		return fmt.Errorf("touchClientHotPath: touch: %w", err)
 	}
 	return nil
 }
