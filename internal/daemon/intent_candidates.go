@@ -2138,7 +2138,9 @@ func applyIntentFallbackMessageQuality(
 	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
 		return plan, plannerFailure, false, nil
 	}
-	rewritten, err := ai.ApplyIntentV2MessageQuality(ctx, planner, req, plan)
+	rewritten, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
+		return ai.ApplyIntentV2MessageQuality(jobCtx, planner, req, plan)
+	})
 	if err == nil {
 		return rewritten, plannerFailure, true, nil
 	}
