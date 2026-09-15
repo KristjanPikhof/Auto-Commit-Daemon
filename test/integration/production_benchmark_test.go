@@ -47,17 +47,17 @@ func TestProductionMeasurements(t *testing.T) {
 	// Registered after the server so a failed assertion releases blocked calls
 	// before server cleanup attempts to join them.
 	t.Cleanup(unblock)
-	env = envWith(env, trust...)
+	env = envWith(env, trust)
 	extra := activateIntentV2Runtime(t, repo,
 		"ACD_COMMIT_STRATEGY=intent", "ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL="+server.URL, "ACD_AI_MODEL=benchmark",
 		"ACD_AI_API_KEY=synthetic-benchmark-key", "ACD_INTENT_MIN_PENDING=1",
 		"ACD_INTENT_MAX_PENDING_AGE=1s")
 	env = envWith(env, extra...)
-	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+	t.Cleanup(func() { unblock(); stopSessionForce(t, env, repo) })
 	startSessionJSON(t, ctx, env, repo, "production-measurements", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
-	metrics := map[string]any{"binary": "release-style", "harness_race": true}
+	metrics := map[string]any{"binary": "release-style", "scope": "isolated worker"}
 	pid := readDaemonStatePID(repo)
 	if out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "%cpu=", "-o", "rss=").Output(); err == nil {
 		fields := strings.Fields(string(out))
@@ -74,7 +74,8 @@ func TestProductionMeasurements(t *testing.T) {
 JOIN checkpoints c ON c.id=ce.checkpoint_id
 JOIN capture_ops o ON o.event_seq=ce.event_seq
 WHERE c.phase='completed' AND o.path=%s`, sqliteLiteral(name))
-			return readDaemonStateScalar(repo, query) != "0" && readDaemonStateScalar(repo, query) != ""
+			count := readDaemonStateScalar(repo, query)
+			return count != "0" && count != ""
 		})
 		return time.Since(start)
 	}
