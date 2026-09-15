@@ -344,6 +344,9 @@ AND phase='completed' AND retained=1 AND tree_oid=`+sqliteQuote(finalTree)+`
 AND (SELECT value FROM daemon_meta WHERE key='protection.complete')='true'
 AND (SELECT value FROM daemon_meta WHERE key='protection.covered_epoch')=(SELECT value FROM daemon_meta WHERE key='protection.observation_epoch')`) == "1"
 	})
+	if got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); got != parent {
+		t.Fatalf("identical-tree rewrite created an extra commit: %s want %s", got, parent)
+	}
 	assertIntentCLITruthAgreement(t, ctx, env, repo, true, true)
 
 	responseMu.Lock()
