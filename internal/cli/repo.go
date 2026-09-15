@@ -330,51 +330,6 @@ func renderRepoManageVerbose(out io.Writer, entries []repoListEntry) error {
 	return tw.Flush()
 }
 
-func runRepoDisable(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
-	return runRepoLifecycleCommand(ctx, out, repoFlag, true, jsonOut)
-}
-
-func runRepoEnable(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
-	return runRepoLifecycleCommand(ctx, out, repoFlag, false, jsonOut)
-}
-
-func runRepoLifecycleCommand(ctx context.Context, out io.Writer, repoFlag string, disable bool, jsonOut bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	action := "enable"
-	if disable {
-		action = "disable"
-	}
-	roots, err := paths.Resolve()
-	if err != nil {
-		return fmt.Errorf("acd repo %s: resolve paths: %w", action, err)
-	}
-	target, err := repoRemovalTargetForCommand(ctx, repoFlag, "repo "+action)
-	if err != nil {
-		return err
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return fmt.Errorf("acd repo %s: load registry: %w", action, err)
-	}
-	rec, ok := reg.FindRepo(target.Path, target.StateDB)
-	if !ok {
-		return repoLifecycleUnknownTargetError(action, target)
-	}
-	_ = rec
-	var res repoLifecycleCommandResult
-	if disable {
-		res, err = applyRepoDisable(ctx, roots, target)
-	} else {
-		res, err = applyRepoEnable(ctx, roots, target)
-	}
-	if err != nil {
-		return err
-	}
-	return renderRepoLifecycleCommand(out, res, jsonOut)
-}
-
 func applyRepoDisable(ctx context.Context, roots paths.Roots, target central.RepoRemovalTarget) (repoLifecycleCommandResult, error) {
 	return applyRepoLifecycle(ctx, roots, target, true)
 }
@@ -449,10 +404,6 @@ func repoLifecycleUnknownTargetError(action string, target central.RepoRemovalTa
 		name = "."
 	}
 	return fmt.Errorf("acd repo %s: repo %s is not registered; run `acd on --repo %s` to register and enable it or `acd repo list` to inspect registered repos", action, name, name)
-}
-
-func runRepoRemove(ctx context.Context, out io.Writer, repoFlag string, dryRun, yes, purgeState, jsonOut bool) error {
-	return runRepoRemoveWithInput(ctx, out, os.Stdin, repoFlag, dryRun, yes, purgeState, jsonOut)
 }
 
 func runRepoRemoveWithInput(ctx context.Context, out io.Writer, in io.Reader, repoFlag string, dryRun, yes, purgeState, jsonOut bool) error {
@@ -743,10 +694,6 @@ func isCancelInput(input string) bool {
 	default:
 		return false
 	}
-}
-
-func repoRemovalTarget(ctx context.Context, repoFlag string) (central.RepoRemovalTarget, error) {
-	return repoRemovalTargetForCommand(ctx, repoFlag, "repo remove")
 }
 
 func repoRemovalTargetForCommand(ctx context.Context, repoFlag, command string) (central.RepoRemovalTarget, error) {
