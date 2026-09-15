@@ -7,36 +7,15 @@ import (
 	"context"
 	"encoding/json"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
-// TestStartLatencyBudget_RepeatedActiveHooks asserts that the registry-
-// read short-circuit is wired AND meaningfully faster than the cold
-// path. The test runs in two phases:
-//
-//  1. Cold path: stop any prior daemon, then time `acd start` against an
-//     empty registry. This call performs flock(control.lock) +
-//     state.Open(SQLite) + RegisterClient + LoadDaemonState +
-//     spawnDaemon (fork/exec) + spawn-poll + central registry rewrite.
-//     We measure this so the hot path can be compared apples-to-apples
-//     under the same hardware/IO conditions.
-//
-//  2. Hot path: 10 sequential `acd start` calls under the same
-//     session_id. Each must short-circuit (Started=false, Duplicate=true)
-//     and complete within `perCallBudget`. Aggregate must beat the
-//     `aggregateBudget`. Each individual hot call must also beat
-//     `cold / minSpeedupFactor`, pinning the documented 50ms-vs-1s
-//     budget claim.
-//
-// Budget rationale: cold path on a quiet macOS box is ~30-200ms (mostly
-// fork+exec). Hot path replaces all of that with one os.ReadFile, one
-// central.Load (no flock), one kill(0), one ps, and one TouchClient
-// UPDATE — comfortably under 50ms on the same hardware. We pick a
-// per-call budget of 200ms (4x measured) so the test is robust on noisy
-// CI runners but still flags genuine regressions, and require hot/cold
-// speedup of at least 1.5x so a regression that makes the hot path
-// equivalent to the cold path fails loudly.
+// TestStartLatencyBudget_RepeatedActiveHooks keeps compatibility session
+// responses correct while measuring the unified event command installed by
+// current integrations. Timing includes the production CLI and supervisor IPC;
+// diagnostic reads and legacy JSON reporting stay outside the hook budget.
 func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary not found in PATH; required for daemon_state probes")
@@ -55,9 +34,7 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 		aggregateBudget = 1500 * time.Millisecond
 	)
 
-	// Phase 1: time the cold path. We force a real cold start by
-	// stopping any pre-existing daemon (none should exist in a fresh
-	// $HOME, but the call is idempotent) and timing a fresh `acd start`.
+	// Establish the session and retain compatibility response coverage.
 	coldStart := time.Now()
 	cold := runAcd(t, ctx, env,
 		"start",
@@ -88,15 +65,36 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 		return readDaemonStateMode(repo) == "running"
 	})
 
-	// Phase 2: hot-path measurement. The first hot call exercises the
-	// full short-circuit path (cache read + central.Load + kill(0) + ps
-	// fingerprint + TouchClient UPDATE).
 	t.Logf("first session open took %v; repeated supervisor IPC calls must remain <= %v",
 		coldDuration, perCallBudget)
 
 	durations := make([]time.Duration, 0, hooks)
 	for i := 0; i < hooks; i++ {
+		dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+		const lastSeenQuery = "SELECT last_seen_ts FROM daemon_clients WHERE session_id='session-budget'"
+		before := sqliteScalar(t, dbPath, lastSeenQuery)
 		start := time.Now()
+		hook := runAcd(t, ctx, env, "internal", "integration", "event",
+			"--harness", "claude-code", "--event", "session_open",
+			"--repo", repo, "--session-id", "session-budget")
+		dur := time.Since(start)
+		if hook.ExitCode != 0 {
+			t.Fatalf("hook %d exit=%d: %s", i, hook.ExitCode, hook.Stderr)
+		}
+		// Integration hooks fail open; a zero exit alone cannot prove delivery.
+		if after := sqliteScalar(t, dbPath, lastSeenQuery); after == "" || after == before {
+			t.Fatalf("hook %d did not refresh its registered session: before=%q after=%q", i, before, after)
+		}
+		if dur > perCallBudget {
+			t.Fatalf("hook %d took %v; per-call budget is %v", i, dur, perCallBudget)
+		}
+		durations = append(durations, dur)
+	}
+
+	// Check legacy responses separately so diagnostic calls do not add wakes
+	// between the production hooks whose latency is being measured.
+
+	for i := 0; i < hooks; i++ {
 		res := runAcd(t, ctx, env,
 			"start",
 			"--session-id", "session-budget",
@@ -104,10 +102,9 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 			"--harness", "claude-code",
 			"--json",
 		)
-		dur := time.Since(start)
 		if res.ExitCode != 0 {
-			t.Fatalf("hook %d exit=%d after %v\nstdout=%s\nstderr=%s",
-				i, res.ExitCode, dur, res.Stdout, res.Stderr)
+			t.Fatalf("compatibility call %d exit=%d\nstdout=%s\nstderr=%s",
+				i, res.ExitCode, res.Stdout, res.Stderr)
 		}
 		var hot struct {
 			Started   bool `json:"started"`
@@ -127,10 +124,7 @@ func TestStartLatencyBudget_RepeatedActiveHooks(t *testing.T) {
 			t.Fatalf("hook %d daemon pid=%d want %d (cache should mirror cold-path pid)",
 				i, hot.DaemonPID, coldJSON.DaemonPID)
 		}
-		if dur > perCallBudget {
-			t.Fatalf("hook %d took %v; per-call budget is %v", i, dur, perCallBudget)
-		}
-		durations = append(durations, dur)
+
 	}
 
 	total := time.Duration(0)
