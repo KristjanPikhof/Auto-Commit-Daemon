@@ -55,22 +55,7 @@ for ((shard = first; shard < last; shard++)); do
 done
 for ((shard = first; shard < last; shard++)); do
   if ! wait "${pids[$shard]}"; then status=1; fi
-  python3 - "${outputs[$shard]}" <<'PY'
-import json, sys
-records = []
-for line in open(sys.argv[1]):
-    try:
-        records.append(json.loads(line))
-    except json.JSONDecodeError:
-        print(line, end='')
-failed = {r.get('Test', '').split('/')[0] for r in records if r.get('Action') == 'fail'}
-for event in records:
-    test = event.get('Test', '')
-    if event.get('Action') == 'output' and (not test or test.split('/')[0] in failed):
-        output = event.get('Output', '')
-        if not output.startswith(('=== RUN', '=== PAUSE', '=== CONT', '=== NAME')):
-            print(output, end='')
-PY
+  python3 scripts/dev/test-events.py "${outputs[$shard]}"
 done
 if [[ -n "${ACD_TEST_RESULTS_DIR:-}" ]]; then
   python3 - "$ACD_TEST_RESULTS_DIR/${package_slug}-${requested_shard:-all}.summary.json" "$((SECONDS - started_seconds))" "$status" <<'PY_SUMMARY'

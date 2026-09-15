@@ -53,7 +53,15 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Run CLI and daemon shard
+        env:
+          ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
         run: scripts/dev/test.sh core 4 ${{ matrix.shard.index }}
+      - name: Preserve timing and selection evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: core-${{ matrix.os.label }}-${{ matrix.shard.index }}
+          path: ${{ runner.temp }}/test-results
 
   test-integration:
     permissions:
@@ -110,9 +118,18 @@ jobs:
       - name: Run support packages
         env:
           ACD_TEST_PACKAGE_PARALLELISM: ${{ matrix.os.package-parallelism }}
+          ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
         run: scripts/dev/test.sh support
       - name: Run timing-sensitive daemon tests
+        env:
+          ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
         run: scripts/dev/test.sh sensitive
+      - name: Preserve timing evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: support-${{ matrix.os.label }}
+          path: ${{ runner.temp }}/test-results
 
   race-stress-daemon:
     permissions:
@@ -143,7 +160,15 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Run repeated daemon shard
+        env:
+          ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
         run: scripts/dev/test.sh stress-daemon 6 ${{ matrix.shard.index }}
+      - name: Preserve timing and selection evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stress-daemon-${{ matrix.shard.index }}
+          path: ${{ runner.temp }}/test-results
 
   race-stress-support:
     permissions:
@@ -166,7 +191,15 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Run repeated support shard
+        env:
+          ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
         run: scripts/dev/test.sh stress-support 2 ${{ matrix.shard.index }}
+      - name: Preserve timing and selection evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stress-support-${{ matrix.shard.index }}
+          path: ${{ runner.temp }}/test-results
 
   quality:
     permissions:

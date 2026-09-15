@@ -7,8 +7,19 @@ package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2}
 test_timeout=${ACD_TEST_TIMEOUT:-4m15s}
 timing_sensitive_daemon_tests='^(TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent)$'
 output_root=
+started_seconds=$SECONDS
+lane_name=${1:-local}
+lane_index=${3:-all}
 
 cleanup() {
+  local status=$?
+  if [[ -n "${ACD_TEST_RESULTS_DIR:-}" ]]; then
+    mkdir -p "$ACD_TEST_RESULTS_DIR"
+    python3 - "$ACD_TEST_RESULTS_DIR/$lane_name-$lane_index.summary.json" "$((SECONDS - started_seconds))" "$status" <<'PY_SUMMARY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({'wall_seconds': int(sys.argv[2]), 'exit_code': int(sys.argv[3])}) + '\n')
+PY_SUMMARY
+  fi
   if [[ -n "$output_root" ]]; then
     rm -rf "$output_root"
   fi
@@ -94,6 +105,23 @@ run_integration() {
     -tags=integration -race -count=1 -parallel=2 -timeout "$test_timeout"
 }
 
+run_measured_tests() {
+  local name=$1
+  shift
+  local result
+  local status=0
+  if [[ -n "${ACD_TEST_RESULTS_DIR:-}" ]]; then
+    mkdir -p "$ACD_TEST_RESULTS_DIR"
+    result="$ACD_TEST_RESULTS_DIR/$name.jsonl"
+  else
+    result=$(mktemp "${TMPDIR:-/tmp}/acd-test-events.XXXXXX")
+  fi
+  go test "$@" -json >"$result" 2>&1 || status=$?
+  python3 scripts/dev/test-events.py "$result"
+  if [[ -z "${ACD_TEST_RESULTS_DIR:-}" ]]; then rm -f "$result"; fi
+  return "$status"
+}
+
 run_support() {
   local package_list
   local package
@@ -110,12 +138,12 @@ run_support() {
     esac
   done <<<"$package_list"
 
-  go test -p "$package_parallelism" "${packages[@]}" \
+  run_measured_tests support -p "$package_parallelism" "${packages[@]}" \
     -race -count=1 -timeout "$test_timeout"
 }
 
 run_sensitive() {
-  go test ./internal/daemon -race -count=1 -timeout "$test_timeout" \
+  run_measured_tests sensitive ./internal/daemon -race -count=1 -timeout "$test_timeout" \
     -run "$timing_sensitive_daemon_tests"
 }
 
