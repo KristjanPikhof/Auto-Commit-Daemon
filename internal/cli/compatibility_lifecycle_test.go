@@ -45,3 +45,26 @@ func TestCompatibilityStartPreservesRepositoryOptIn(t *testing.T) {
 		t.Fatalf("session alias created repository state: %v", err)
 	}
 }
+
+func TestCompatibilityHintsPreserveRepositoryOptIn(t *testing.T) {
+	withIsolatedHome(t)
+	repo := initRepoForRepoLifecycle(t)
+	nested := filepath.Join(repo, "nested")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"wake", "touch", "flush"} {
+		t.Run(command, func(t *testing.T) {
+			root := newRootCmd()
+			root.SetOut(&bytes.Buffer{})
+			root.SetErr(&bytes.Buffer{})
+			root.SetArgs([]string{command, "--repo", nested, "--session-id", "editor", "--json"})
+			if err := root.ExecuteContext(t.Context()); err == nil {
+				t.Fatal("hint implicitly enabled repository")
+			}
+			if _, err := os.Stat(filepath.Join(repo, ".git", "acd")); !os.IsNotExist(err) {
+				t.Fatalf("hint created repository state: %v", err)
+			}
+		})
+	}
+}
