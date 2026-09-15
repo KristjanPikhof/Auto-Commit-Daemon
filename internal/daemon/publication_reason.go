@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
@@ -78,6 +80,19 @@ func publicationDrainReason(drain state.PublicationDrain) string {
 			return publicationReasonSuccessorExhausted
 		}
 		return publicationReasonSupersededCandidate
+	}
+	return ""
+}
+
+func publicationDrainPreflightEvidence(drain state.PublicationDrain) string {
+	if drain.ReasonEvidence != "" {
+		return drain.ReasonEvidence
+	}
+	// Legacy rows stored only the rendered preflight failure.
+	if drain.ReasonCode == "" {
+		if detail, ok := strings.CutPrefix(drain.LastError, "daemon: intent candidates: preflight blocked: "); ok {
+			return fmt.Sprintf("%x", sha256.Sum256([]byte(detail)))
+		}
 	}
 	return ""
 }

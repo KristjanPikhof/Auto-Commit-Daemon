@@ -1525,6 +1525,7 @@ func chooseIntentCandidatePlan(
 							false, nil, run, &IntentPlanPreflightError{
 								Failure: ai.SanitizePlannerError(
 									partialPreflightErr.Error()),
+								EvidenceFingerprint: fmt.Sprintf("%s/%v/%v", run.Fingerprint, run.UnresolvedSeqs, run.FindingCodes),
 							}
 					}
 					run.PreservedGroups = intentAssignmentMembership(preserved)

@@ -1658,7 +1658,7 @@ func UpdatePublicationDrainAfterReplay(
 			drain.Phase == state.PublicationDrainEventFallback &&
 			drain.FallbackMode == publicationFallbackLocalUnlock &&
 			publicationDrainReason(drain) == publicationReasonPreflight &&
-			drain.ReasonEvidence == update.ReasonEvidence {
+			publicationDrainPreflightEvidence(drain) == update.ReasonEvidence {
 			// Semantic normalization and the deterministic local unlock have
 			// both failed against the same frozen evidence. Retrying that exact
 			// preflight cannot make progress, so stop at the durable safety
