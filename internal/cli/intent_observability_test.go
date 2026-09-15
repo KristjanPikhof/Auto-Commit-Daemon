@@ -374,8 +374,8 @@ func TestStatus_SingletonCommitRateRecent_GroupedVsSingle(t *testing.T) {
 	}
 
 	report := runStatusJSON(ctx, t, repo)
-	if got := report.IntentStrategy.SingletonCommitRateRecent; got != 0.6 {
-		t.Fatalf("SingletonCommitRateRecent=%v want 0.6 (6 singletons over 10 observed commits)", got)
+	if got := report.IntentStrategy.SingletonCommitRateRecent; got != 0.75 {
+		t.Fatalf("SingletonCommitRateRecent=%v want 0.75 (6 singletons over 8 observed commits)", got)
 	}
 }
 
