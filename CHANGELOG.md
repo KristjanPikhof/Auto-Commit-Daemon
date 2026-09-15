@@ -29,6 +29,8 @@
 
 ### Fixed
 
+- Slow external-history checks now record their timeout even when Git reports
+  a killed process, so the affected capture does not remain pending indefinitely.
 - Internal setup and readiness checkpoints no longer make idle repositories
   appear recently active in `acd list`. Slow optional Git checks retain known
   activity and unfinished work instead of dropping those rows.
