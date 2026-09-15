@@ -1677,6 +1677,71 @@ func TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent(t *testing.T) 
 	}
 }
 
+func TestReplay_SupersededHistoryProbeGitFailure(t *testing.T) {
+	for _, strategy := range []ai.CommitStrategy{ai.CommitStrategyEvent, ai.CommitStrategyIntent} {
+		for _, deadline := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/deadline=%t", strategy, deadline), func(t *testing.T) {
+				ctx := context.Background()
+				f, cctx, seq := newSupersededHistoryProbeFixture(t, ctx)
+				probeErr := &git.Error{ExitCode: -1, Err: errors.New("signal: killed")}
+				budget := 5 * time.Second
+				if deadline {
+					budget = time.Second
+				}
+				replayPerEventTimeoutOverride.Store(int64(budget))
+				t.Cleanup(func() { replayPerEventTimeoutOverride.Store(0) })
+				original := pathsTouchedBetweenFn
+				probeReached := false
+				pathsTouchedBetweenFn = func(ctx context.Context, _, _, _ string, _ []string) (bool, error) {
+					probeReached = true
+					if deadline {
+						<-ctx.Done()
+					}
+					return false, probeErr
+				}
+				t.Cleanup(func() { pathsTouchedBetweenFn = original })
+
+				sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{
+					GitDir: f.gitDir, Limit: 1, MessageFn: DeterministicMessage,
+					CommitStrategy: strategy, IntentPlanner: &recordingIntentPlanner{},
+					IntentWindow: 1, IntentBypassBatchWait: true,
+				})
+				if !probeReached {
+					t.Fatal("replay did not reach the injected Git failure")
+				}
+				wantState := state.EventStatePending
+				wantFailed := 0
+				if deadline {
+					wantState = state.EventStateFailed
+					wantFailed = 1
+					if err != nil {
+						t.Fatalf("probe deadline escaped replay: %v", err)
+					}
+				} else if !errors.Is(err, probeErr) {
+					t.Fatalf("non-timeout Git error=%v, want original probe error", err)
+				}
+				if sum.Failed != wantFailed || sum.Published != 0 || sum.Conflicts != 0 {
+					t.Fatalf("summary=%+v, want failed=%d and no publication/conflict", sum, wantFailed)
+				}
+				var eventState string
+				var eventError sql.NullString
+				if err := f.db.SQL().QueryRowContext(ctx,
+					`SELECT state, error FROM capture_events WHERE seq=?`, seq,
+				).Scan(&eventState, &eventError); err != nil {
+					t.Fatal(err)
+				}
+				if eventState != wantState {
+					t.Fatalf("event state=%q, want %q", eventState, wantState)
+				}
+				if deadline && (!strings.Contains(eventError.String, context.DeadlineExceeded.Error()) ||
+					!strings.Contains(eventError.String, "signal: killed")) {
+					t.Fatalf("event error=%q, want deadline and Git failure evidence", eventError.String)
+				}
+			})
+		}
+	}
+}
+
 func newSupersededHistoryProbeFixture(
 	t *testing.T,
 	ctx context.Context,
