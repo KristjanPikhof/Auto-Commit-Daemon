@@ -114,5 +114,19 @@
     "TestStartLatencyBudget_RepeatedActiveHooks": 1.58,
     "TestStopAll_WipesAllPerSessionCaches": 3.53,
     "TestSupervisorAdmitsManyRepositoriesInBatches": 10.48
+  },
+  "_measurement": {
+    "aggregation": "maximum observed completed top-level duration in seconds; subtests excluded",
+    "date": "2026-09-15",
+    "integration_measured_test_count": 114,
+    "integration_serial_seconds": 613.402,
+    "integration_shards": 4,
+    "integration_test_budget_seconds": 180,
+    "platform": "darwin/arm64",
+    "sources": [
+      "tagged integration baseline (parallel=2, race harness)",
+      "remaining baseline scenarios",
+      "initial sharded run"
+    ]
   }
 }
