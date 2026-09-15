@@ -15,7 +15,8 @@
 - Commit-all preserves staging added while checkpoint protection is pending.
   Schema v27 saves the approved index identity for checks under Git's index
   lock, including after restart. Older requests require renewed staging review.
-- Schema v28 records recovery reason codes separately from display errors.
+- Schema v28 records recovery reason codes and evidence hashes separately from
+  display errors.
   Correcting credentials can resume the selected enabled AI repository through
   validated runtime activation, preserving its settings and privacy approvals.
 - Production integration tests run in four required shards on both Linux and
