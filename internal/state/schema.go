@@ -39,7 +39,9 @@ package state
 // bounded resolved plan so a completed run can be reused after restart; v24
 // adds immutable event membership for newly prepared Intent repairs; v25
 // freezes the runtime strategy and provider identity used by publication
-// drains so restart recovery cannot reinterpret an Intent drain as Event.
+// drains so restart recovery cannot reinterpret an Intent drain as Event; v26
+// adds grouped history rewrite plans; v27 preserves the approved index identity
+// so commit-all cannot consume staging added while its checkpoint was pending.
 const SchemaVersion = 27
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
