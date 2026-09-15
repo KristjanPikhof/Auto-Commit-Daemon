@@ -29,6 +29,8 @@
 
 ### Fixed
 
+- Repository discovery resolves worktree and Git paths in one Git call, reducing
+  startup work for hooks and commands.
 - Cancelled recovery transactions let Git release its ref locks before stopping,
   so a later recovery attempt can proceed.
 - Checkpoint waits keep their timeout reason and rejected-checkpoint details
