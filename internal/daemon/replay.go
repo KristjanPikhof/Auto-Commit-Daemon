@@ -2862,6 +2862,12 @@ func planIntentWithFallback(
 	}
 	if health != nil {
 		failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
+		// A rejected semantic response still proves the provider is reachable.
+		// Keep its grouping diagnostics below, without spending outage backoff.
+		var validation *IntentPlannerValidationFailure
+		if errors.As(failure, &validation) {
+			failure = nil
+		}
 		permitCompleted = true
 		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
 			return ai.IntentPlan{}, "", healthErr

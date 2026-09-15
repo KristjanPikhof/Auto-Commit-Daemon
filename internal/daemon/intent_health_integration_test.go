@@ -174,8 +174,8 @@ func TestReplay_IntentHealthProviderShapeFailureCountsAsValidation(t *testing.T)
 		t.Fatalf("summary=%+v planner_calls=%d", sum, planner.calls)
 	}
 	if snap := health.Snapshot(); snap.State != IntentPlannerCircuitClosed ||
-		snap.ConsecutiveFailures != 1 || snap.LastFailureClass != IntentPlannerFailureValidation {
-		t.Fatalf("health=%+v want one closed validation failure", snap)
+		snap.ConsecutiveFailures != 0 || snap.NextProbeTS != 0 {
+		t.Fatalf("health=%+v semantic rejection must not consume outage backoff", snap)
 	}
 }
 
@@ -366,8 +366,8 @@ func TestReplay_IntentHealthSelectionSafetyFailureIsValidation(t *testing.T) {
 		t.Fatalf("summary=%+v want protected work waiting for semantic message", sum)
 	}
 	if snap := health.Snapshot(); snap.State != IntentPlannerCircuitClosed ||
-		snap.ConsecutiveFailures != 1 || snap.LastFailureClass != IntentPlannerFailureValidation {
-		t.Fatalf("health=%+v want one closed validation failure", snap)
+		snap.ConsecutiveFailures != 0 || snap.NextProbeTS != 0 {
+		t.Fatalf("health=%+v semantic rejection must not consume outage backoff", snap)
 	}
 }
 
@@ -495,5 +495,42 @@ func TestRun_IntentV2HealthReusesRevisionedProvider(t *testing.T) {
 	if persisted.State != IntentPlannerCircuitClosed ||
 		persisted.ProviderFingerprint == "" {
 		t.Fatalf("persisted health=%+v", persisted)
+	}
+}
+
+func TestLegacySemanticRejectionsDoNotOpenTransportBackoff(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	captureOnePendingFile(t, ctx, f, "feature.txt", "feature behavior\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending=%v err=%v", pending, err)
+	}
+	planner := &recordingIntentPlanner{name: "openai-compat", err: &ai.IntentPlanValidationError{Code: ai.IntentPlanValidationShape, Message: "invalid plan shape"}}
+	health := NewIntentPlannerHealth(ctx, f.db, IntentPlannerHealthOptions{Provider: openAIIntentHealthIdentity("https://planner.example/v1")})
+	opts := ReplayOpts{GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent, IntentPlanner: planner, IntentHealth: health, IntentWindow: 10, IntentMinPending: 1, IntentBypassBatchWait: true}
+	for attempt := 0; attempt < 3; attempt++ {
+		sum, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+		if !isIntentPlannerCircuitWait(err) || sum.Published != 0 {
+			t.Fatalf("rejection must retain protected work: %+v %v", sum, err)
+		}
+		if snapshot := health.Snapshot(); snapshot.State != IntentPlannerCircuitClosed || snapshot.NextProbeTS != 0 || snapshot.ConsecutiveFailures != 0 {
+			t.Fatalf("semantic rejection spent transport backoff: %+v", snapshot)
+		}
+	}
+	if planner.calls != 3 {
+		t.Fatalf("semantic correction calls=%d want3", planner.calls)
+	}
+	if decisions := countIntentPlannerErrorDecisions(t, ctx, f.db, []int64{pending[0].Seq}); decisions < 1 {
+		t.Fatal("semantic rejection diagnostics lost")
+	}
+	planner.err = nil
+	planner.plan = ai.IntentPlan{SelectedSeqs: []int64{pending[0].Seq}, Subject: "Preserve feature behavior", Body: "- Keep the captured feature change coherent", GroupingReason: "one complete feature change"}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || sum.Published != 1 || planner.calls != 4 {
+		t.Fatalf("valid AI response did not resume immediately: %+v calls=%d err=%v", sum, planner.calls, err)
 	}
 }
