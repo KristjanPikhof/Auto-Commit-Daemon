@@ -145,10 +145,16 @@ func runProductCommitAll(
 		fmt.Fprintln(out, "The paths, staged content, or queued work changed. Review the refreshed preview.")
 	}
 
+	// --yes explicitly accepts current scope. Interactive approval is pinned
+	// to the reviewed paths and staging, including the worker-side recheck.
+	previewDigest := ""
+	if !yes {
+		previewDigest = scope.Digest
+	}
 	params, _ := json.Marshal(map[string]any{
 		"kind": "checkpoint", "drain_publication": true,
 		"consume_staged": true,
-		"preview_digest": scope.Digest,
+		"preview_digest": previewDigest,
 	})
 	type callResult struct {
 		result productCommitAllResult
