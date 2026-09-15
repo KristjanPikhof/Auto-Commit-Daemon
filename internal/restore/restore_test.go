@@ -104,8 +104,18 @@ func TestRestorePreviewDoesNotWriteGitObjects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Preview(ctx, repo, gitDir, db.Path(), target.ID); err != nil {
+	plan, err := Preview(ctx, repo, gitDir, db.Path(), target.ID)
+	if err != nil {
 		t.Fatal(err)
+	}
+	found := false
+	for _, path := range plan.Paths {
+		if path == "untracked.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("preview omitted affected file: %v", plan.Paths)
 	}
 	after, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "count-objects", "-v")
 	if err != nil {
