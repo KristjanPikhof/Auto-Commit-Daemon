@@ -272,3 +272,39 @@ func activatePublicationRuntimeRevision(
 		t.Fatalf("apply activation=(%t,%v)", ok, err)
 	}
 }
+
+func TestPublicationDrainActivatesOnlyReviewedReplacementKinds(t *testing.T) {
+	for _, test := range []struct {
+		name, provider, phase, reason string
+		want                          bool
+	}{
+		{"explicit-local", "deterministic", state.PublicationDrainSemantic, "", true},
+		{"corrected-ai", "openai-compat", state.PublicationDrainNeedsAction, publicationReasonProviderConfiguration, true},
+		{"unrelated-remote", "openai-compat", state.PublicationDrainSemantic, "", false},
+		{"unproven-safety", "openai-compat", state.PublicationDrainNeedsAction, "missing_objects", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openIntentCandidateTestDB(t)
+			frozen := insertPublicationRuntimeRevision(t, db, 1, "openai-compat", "https://frozen.example/v1", "model")
+			activatePublicationRuntimeRevision(t, db, frozen.ID, sql.NullInt64{})
+			replacement := insertPublicationRuntimeRevision(t, db, 2, test.provider, "https://frozen.example/v1", "model")
+			if _, ok, err := state.RequestConfigActivation(ctx, db, replacement.ID, sql.NullInt64{Int64: frozen.ID, Valid: true}); err != nil || !ok {
+				t.Fatalf("request=%v %v", ok, err)
+			}
+			strategy, format, _, _, err := publicationRuntimeRevisionContract(frozen)
+			if err != nil {
+				t.Fatal(err)
+			}
+			drain := state.PublicationDrain{ConfigRevisionID: frozen.ID, CommitStrategy: strategy, CommitFormat: format, Phase: test.phase, ReasonCode: test.reason}
+			ready, err := publicationDrainCanActivateReplacement(ctx, db, drain)
+			if err != nil || ready != test.want {
+				t.Fatalf("ready=%v err=%v want=%v", ready, err, test.want)
+			}
+			runtime, err := state.RuntimeConfigActivationState(ctx, db)
+			if err != nil || runtime.AppliedRevisionID.Int64 != frozen.ID {
+				t.Fatalf("readiness mutated runtime: %+v %v", runtime, err)
+			}
+		})
+	}
+}
