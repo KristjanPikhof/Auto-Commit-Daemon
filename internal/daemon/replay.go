@@ -2732,7 +2732,7 @@ func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item i
 	}
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
-		msg = "Update files"
+		return ai.IntentPlan{}, errors.New("selected provider returned an empty singleton message")
 	}
 	parts := strings.SplitN(msg, "\n\n", 2)
 	plan := ai.IntentPlan{
@@ -2745,7 +2745,7 @@ func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item i
 		plan.Body = strings.TrimSpace(parts[1])
 	}
 	if plan.Subject == "" {
-		plan.Subject = "Update files"
+		return ai.IntentPlan{}, errors.New("selected provider returned an empty singleton subject")
 	}
 	return plan, nil
 }
@@ -3957,7 +3957,7 @@ func intentPlanMessage(plan ai.IntentPlan) string {
 func commitTreeWithMessage(ctx context.Context, repoRoot, treeOID, parent, msg string) (string, error) {
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
-		msg = "Update files"
+		return "", errors.New("selected provider returned an empty commit message")
 	}
 	var parents []string
 	if parent != "" {
