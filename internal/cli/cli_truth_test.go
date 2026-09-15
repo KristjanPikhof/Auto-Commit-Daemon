@@ -332,6 +332,8 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"branch_token":                           "missing refs/heads/main",
+		"branch.generation":                      "7",
 		daemon.MetaKeyProtectionObservationEpoch: "7",
 		daemon.MetaKeyProtectionCoveredEpoch:     "7",
 		daemon.MetaKeyProtectionCheckpointID:     "checkpoint-7",
@@ -348,7 +350,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		!report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 0 {
 		t.Fatalf("clean truth=%+v", report)
 	}
-	listReport := statusReport{}
+	listReport := statusReport{Repo: repo}
 	if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +412,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 			if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
 				t.Fatalf("%s checkpoint truth=%+v", unresolvedState, report)
 			}
-			listReport := statusReport{}
+			listReport := statusReport{Repo: repo}
 			if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
 				t.Fatal(err)
 			}

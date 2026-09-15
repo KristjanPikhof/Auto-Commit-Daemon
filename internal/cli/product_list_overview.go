@@ -494,7 +494,7 @@ func readProductListProtection(ctx context.Context, conn *sql.DB, report *status
 	report.UnpublishedCheckpoints = unresolved
 	report.Protected = strings.EqualFold(completeValue, "true") && report.LatestCheckpointID != "" &&
 		report.ObservationEpoch == report.CoveredEpoch && prepared == 0 && needsAction == 0
-	report.PublicationOutcome, err = readPublicationOutcome(ctx, conn, report.Protected)
+	report.PublicationOutcome, err = readPublicationOutcome(ctx, conn, report.Protected, report.Repo)
 	return err
 }
 

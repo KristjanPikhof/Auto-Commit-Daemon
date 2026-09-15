@@ -15,13 +15,16 @@ import (
 
 func TestSavedCheckpointAwaitsClassificationWithoutClaimingPublication(t *testing.T) {
 	withIsolatedHome(t)
-	_, _, db := makeRepoStateDB(t)
+	repo, _, db := makeRepoStateDB(t)
 	ctx := context.Background()
+	if err := state.MetaSetMany(ctx, db, map[string]string{"branch_token": "missing refs/heads/main", "branch.generation": "7"}); err != nil {
+		t.Fatal(err)
+	}
 	insertCompletedCheckpoint(t, db, "cp-unclassified", "0123456789abcdef", nil)
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyProtectionClassificationPending, "true"); err != nil {
 		t.Fatal(err)
 	}
-	outcome, err := readPublicationOutcome(ctx, db.SQL(), true)
+	outcome, err := readPublicationOutcome(ctx, db.SQL(), true, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,9 +40,60 @@ func TestSavedCheckpointAwaitsClassificationWithoutClaimingPublication(t *testin
 	if err := state.MetaSet(ctx, db, daemon.MetaKeyProtectionClassificationPending, "false"); err != nil {
 		t.Fatal(err)
 	}
-	outcome, err = readPublicationOutcome(ctx, db.SQL(), true)
+	outcome, err = readPublicationOutcome(ctx, db.SQL(), true, repo)
 	if err != nil || outcome.BranchCommitted == nil || !*outcome.BranchCommitted {
 		t.Fatalf("resolved checkpoint: %+v, %v", outcome, err)
+	}
+}
+
+func TestPublicationOutcomeUsesCurrentBranchAndAcceptsRecapturedTree(t *testing.T) {
+	withIsolatedHome(t)
+	repo, _, db := makeRepoStateDB(t)
+	ctx := context.Background()
+	insertCompletedCheckpoint(t, db, "cp-current", "0123456789abcdef", []checkpointMemberFixture{
+		{State: state.EventStateRecovered, CommitOID: "recovery"},
+		{State: state.EventStatePublished, CommitOID: "published"},
+		{State: state.EventStatePending},
+	})
+	if _, err := db.SQL().ExecContext(ctx, "UPDATE capture_events SET branch_ref='refs/heads/other' WHERE state='pending'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, db, map[string]string{
+		"branch_token": "missing refs/heads/main", "branch.generation": "7",
+		daemon.MetaKeyProtectionCheckpointID: "cp-current",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An ordinary commit recreates the recovered content. The recovery row
+	// remains immutable, while the current checkpoint tree is now on HEAD.
+	if err := os.WriteFile(filepath.Join(repo, "restored.txt"), []byte("recovered work\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "restored.txt"}, {"-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "Restore recovered work"}} {
+		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tree, err := gitpkg.RevParse(ctx, repo, "HEAD^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, "UPDATE checkpoints SET tree_oid=? WHERE id='cp-current'", tree); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := readPublicationOutcome(ctx, db.SQL(), true, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.BranchCommitted == nil || !*outcome.BranchCommitted || outcome.WaitingChanges != 0 || outcome.BranchChanges != 1 || outcome.RecoveredChanges != 1 {
+		t.Fatalf("current branch outcome: %+v", outcome)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "checkout", "-b", "other"); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err = readPublicationOutcome(ctx, db.SQL(), true, repo)
+	if err != nil || outcome.BranchCommitted != nil {
+		t.Fatalf("branch moved without durable matching pair: %+v, %v", outcome, err)
 	}
 }
 

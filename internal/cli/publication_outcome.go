@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 )
 
 // publicationOutcome is a read-only projection of completed checkpoint
@@ -21,15 +22,19 @@ type publicationOutcome struct {
 	RetryAt               float64 `json:"retry_at,omitempty"`
 }
 
-func readPublicationOutcome(ctx context.Context, db *sql.DB, protected bool) (publicationOutcome, error) {
+func readPublicationOutcome(ctx context.Context, db *sql.DB, protected bool, repo string) (publicationOutcome, error) {
 	var result publicationOutcome
-	err := db.QueryRowContext(ctx, `
-SELECT COALESCE(SUM(CASE WHEN state='published' THEN 1 ELSE 0 END),0),
+	branch, generation, known, err := currentWorktreeReplayPair(ctx, db, repo)
+	if err != nil {
+		return result, err
+	}
+	err = db.QueryRowContext(ctx, `
+SELECT COALESCE(SUM(CASE WHEN state='published' AND branch_ref=? AND branch_generation=? THEN 1 ELSE 0 END),0),
        COALESCE(SUM(CASE WHEN state='recovered' THEN 1 ELSE 0 END),0),
-       COALESCE(SUM(CASE WHEN state NOT IN ('published','recovered') THEN 1 ELSE 0 END),0)
+       COALESCE(SUM(CASE WHEN state NOT IN ('published','recovered') AND branch_ref=? AND branch_generation=? THEN 1 ELSE 0 END),0)
 FROM capture_events e
 WHERE EXISTS (SELECT 1 FROM checkpoint_events ce JOIN checkpoints cp ON cp.id=ce.checkpoint_id
-              WHERE ce.event_seq=e.seq AND cp.phase='completed')`).Scan(
+              WHERE ce.event_seq=e.seq AND cp.phase='completed')`, branch, generation, branch, generation).Scan(
 		&result.BranchChanges, &result.RecoveredChanges, &result.WaitingChanges)
 	if err != nil {
 		return result, fmt.Errorf("publication outcome: %w", err)
@@ -39,7 +44,24 @@ WHERE EXISTS (SELECT 1 FROM checkpoint_events ce JOIN checkpoints cp ON cp.id=ce
 		return result, err
 	}
 	result.PendingClassification = pending == "true"
+	if !known {
+		return result, nil
+	}
 	committed := protected && !result.PendingClassification && result.WaitingChanges == 0 && result.RecoveredChanges == 0
+	if protected && !result.PendingClassification && result.WaitingChanges == 0 && result.RecoveredChanges > 0 {
+		// Recovery evidence survives recapture. Its historical presence does
+		// not make today's protected tree unpublished forever.
+		var tree string
+		if err := db.QueryRowContext(ctx, `SELECT tree_oid FROM checkpoints WHERE id=(SELECT value FROM daemon_meta WHERE key=?) AND phase='completed'`, daemon.MetaKeyProtectionCheckpointID).Scan(&tree); err != nil && err != sql.ErrNoRows {
+			return result, err
+		}
+		if tree != "" {
+			headTree, err := gitpkg.RevParse(ctx, repo, "HEAD^{tree}")
+			if err == nil && headTree == tree {
+				committed = true
+			}
+		}
+	}
 	result.BranchCommitted = &committed
 	return result, nil
 }
