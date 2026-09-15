@@ -1002,26 +1002,35 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		}
 		h.wake(request.WorktreeID)
 		runtime.gate.Unlock()
-		deadline := time.NewTimer(checkpointBarrierWait(ctx))
-		defer deadline.Stop()
+		ctx, cancelWait := context.WithTimeout(ctx, checkpointBarrierWait(ctx))
+		defer cancelWait()
 		ticker := time.NewTicker(25 * time.Millisecond)
 		defer ticker.Stop()
 		var lastCovered, lastComplete, lastCheckpoint, lastRejectedCheckpoint string
 		var lastReadErr error
 		var drainTarget publicationDrainTarget
 		var lastUnsafeCheck time.Time
+		checkpointTimeout := func() *supervisor.ProtocolError {
+			reason := "interrupted"
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				reason = "timed out"
+			}
+			return protocolFailure("checkpoint_timeout", fmt.Errorf(
+				"checkpoint barrier %s (accepted_epoch=%d covered_epoch=%q complete=%q checkpoint=%q rejected_checkpoint=%q read_error=%v): %w",
+				reason, acceptedEpoch, lastCovered, lastComplete, lastCheckpoint,
+				lastRejectedCheckpoint, lastReadErr, ctx.Err()), true)
+		}
+		publicationFailure := func(readErr error) *supervisor.ProtocolError {
+			if ctx.Err() != nil {
+				lastReadErr = errors.Join(lastReadErr, readErr)
+				return checkpointTimeout()
+			}
+			return protocolFailure("publication_status_failed", readErr, true)
+		}
 		for {
 			select {
 			case <-ctx.Done():
-				return nil, protocolFailure("checkpoint_timeout", fmt.Errorf(
-					"checkpoint barrier interrupted (accepted_epoch=%d covered_epoch=%q complete=%q checkpoint=%q rejected_checkpoint=%q read_error=%v): %w",
-					acceptedEpoch, lastCovered, lastComplete, lastCheckpoint,
-					lastRejectedCheckpoint, lastReadErr, ctx.Err()), true)
-			case <-deadline.C:
-				return nil, protocolFailure("checkpoint_timeout", fmt.Errorf(
-					"checkpoint barrier timed out (accepted_epoch=%d covered_epoch=%q complete=%q checkpoint=%q rejected_checkpoint=%q read_error=%v)",
-					acceptedEpoch, lastCovered, lastComplete, lastCheckpoint,
-					lastRejectedCheckpoint, lastReadErr), true)
+				return nil, checkpointTimeout()
 			case <-ticker.C:
 				var coveredErr, completeErr, checkpointErr error
 				lastCovered, _, coveredErr = state.MetaGet(ctx, runtime.db, daemon.MetaKeyProtectionCoveredEpoch)
@@ -1034,7 +1043,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 				if params.DrainPublication {
 					currentBranch, branchErr := git.RunBranchRef(ctx, runtime.worktree.Root)
 					if branchErr != nil {
-						return nil, protocolFailure("publication_status_failed", branchErr, true)
+						return nil, publicationFailure(branchErr)
 					}
 					expectedBranch := requestedPublicationBranch
 					if drainTarget.EventSeqs != nil {
@@ -1050,8 +1059,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 							ctx, runtime.db, publicationWorktreeID, acceptedEpoch,
 							minimumPublicationCheckpointSeq, expectedBranch)
 						if selectErr != nil {
-							return nil, protocolFailure(
-								"publication_status_failed", selectErr, true)
+							return nil, publicationFailure(selectErr)
 						}
 						if found {
 							lastCheckpoint = checkpoint.ID
@@ -1063,8 +1071,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 						}
 					} else if generation, generationErr := daemon.LoadBranchGeneration(
 						ctx, runtime.db); generationErr != nil {
-						return nil, protocolFailure(
-							"publication_status_failed", generationErr, true)
+						return nil, publicationFailure(generationErr)
 					} else if generation != drainTarget.Generation {
 						return nil, protocolFailure("publication_needs_action", fmt.Errorf(
 							"publication branch generation changed while saving work: before=%d current=%d",
@@ -1141,8 +1148,11 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 											if unsafeErr == nil && publicationDrainStart {
 												h.wake(request.WorktreeID)
 												runtime.gate.Unlock()
-												return publicationDrainOperationResult(
-													ctx, runtime.db, activeDrain)
+												result, resultErr := publicationDrainOperationResult(ctx, runtime.db, activeDrain)
+												if resultErr != nil {
+													return nil, publicationFailure(resultErr)
+												}
+												return result, nil
 											}
 										}
 									}
@@ -1153,7 +1163,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 							}
 							runtime.gate.Unlock()
 							if unsafeErr != nil {
-								return nil, protocolFailure("publication_status_failed", unsafeErr, true)
+								return nil, publicationFailure(unsafeErr)
 							}
 							if reason != "" {
 								return nil, protocolFailure("publication_needs_action", errors.New(reason), false)
@@ -1165,7 +1175,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 								ctx, runtime.worktree, params.ConsumeStaged)
 							runtime.gate.Unlock()
 							if unsafeErr != nil {
-								return nil, protocolFailure("publication_status_failed", unsafeErr, true)
+								return nil, publicationFailure(unsafeErr)
 							}
 							if reason != "" {
 								return nil, protocolFailure("publication_needs_action", errors.New(reason), false)
@@ -1173,7 +1183,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 						}
 						progress, statusErr := publicationDrainStatus(ctx, runtime.db, drainTarget)
 						if statusErr != nil {
-							return nil, protocolFailure("publication_status_failed", statusErr, true)
+							return nil, publicationFailure(statusErr)
 						}
 						if progress.Recovered > 0 || progress.Terminal > 0 {
 							return nil, protocolFailure("publication_needs_action", fmt.Errorf(
@@ -1191,8 +1201,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 						runtime.gate.Unlock()
 						if durableDrain, ok, loadErr := state.PublicationDrainByCheckpoint(
 							ctx, runtime.db, lastCheckpoint); loadErr != nil {
-							return nil, protocolFailure(
-								"publication_status_failed", loadErr, true)
+							return nil, publicationFailure(loadErr)
 						} else if ok && durableDrain.Phase != state.PublicationDrainCompleted {
 							nowTS := float64(time.Now().UnixNano()) / 1e9
 							update := daemon.PublicationDrainUpdateFrom(
@@ -1205,8 +1214,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 							}
 							if _, advanceErr := state.AdvancePublicationDrain(
 								ctx, runtime.db, durableDrain.ID, update); advanceErr != nil {
-								return nil, protocolFailure(
-									"publication_status_failed", advanceErr, true)
+								return nil, publicationFailure(advanceErr)
 							}
 						}
 						return publicationDrainResult(lastCheckpoint, drainTarget, progress, true, ""), nil

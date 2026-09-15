@@ -29,6 +29,8 @@
 
 ### Fixed
 
+- Checkpoint waits keep their timeout reason and rejected-checkpoint details
+  when the deadline interrupts a Git or database lookup.
 - Slow external-history checks now record their timeout even when Git reports
   a killed process, so the affected capture does not remain pending indefinitely.
 - Internal setup and readiness checkpoints no longer make idle repositories
