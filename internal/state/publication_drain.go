@@ -687,7 +687,7 @@ func ActivePublicationDrains(
 	if db == nil {
 		return nil, errors.New("state: ActivePublicationDrains: nil db")
 	}
-	return publicationDrainsQuery(ctx, db.conn, true)
+	return publicationDrainsQuery(ctx, db.conn, true, false)
 }
 
 // ActivePublicationDrainsForPair returns at most two active drains for one
@@ -845,7 +845,7 @@ func publicationDrainLatestQuery(
 	ctx context.Context,
 	query checkpointQuery,
 	loadEvents bool,
-	legacyIndex ...bool,
+	legacyIndex bool,
 ) (PublicationDrain, bool, error) {
 	drain, err := scanPublicationDrain(query.QueryRowContext(
 		ctx, publicationDrainSelectIndex(legacyIndex)+" ORDER BY created_ts DESC,id DESC LIMIT 1"))
@@ -863,8 +863,8 @@ func publicationDrainLatestQuery(
 	return drain, true, nil
 }
 
-func publicationDrainSelectIndex(legacy []bool) string {
-	if len(legacy) > 0 && legacy[0] {
+func publicationDrainSelectIndex(legacy bool) string {
+	if legacy {
 		return strings.Replace(publicationDrainSelect, "expected_index_digest", "''", 1)
 	}
 	return publicationDrainSelect
@@ -876,7 +876,7 @@ func publicationDrainsQuery(
 		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	},
 	activeOnly bool,
-	legacyIndex ...bool,
+	legacyIndex bool,
 ) ([]PublicationDrain, error) {
 	statement := publicationDrainSelectIndex(legacyIndex)
 	if activeOnly {
