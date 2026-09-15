@@ -234,7 +234,7 @@ done
 	}
 
 	waitForEventState(t, dbPath, "external-handled.txt", "published", 15*time.Second)
-	waitForDecision(t, dbPath, "external-handled.txt", "handled_external", "already_published_after_cas_exhaustion", 15*time.Second)
+	waitForDecision(t, dbPath, "external-handled.txt", "recovery_published", "runtime_branch_transition", 15*time.Second)
 
 	if got := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'external-handled.txt' ORDER BY seq DESC LIMIT 1"); got != externalHead {
 		t.Fatalf("published commit_oid=%q want external HEAD %s", got, externalHead)
@@ -248,8 +248,8 @@ done
 	if events.ExitCode != 0 {
 		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)
 	}
-	if !strings.Contains(events.Stdout, `"kind": "handled_external"`) {
-		t.Fatalf("events output missing daemon-recorded handled_external:\n%s", events.Stdout)
+	if !strings.Contains(events.Stdout, `"kind": "recovery_published"`) {
+		t.Fatalf("events output missing externally published recovery decision:\n%s", events.Stdout)
 	}
 }
 
@@ -329,27 +329,25 @@ WHERE e.path IN ('external-race-a.txt', 'external-race-b.txt')
 		t.Fatalf("external revert history did not advance as expected: base=%s after=%s revert=%s", baseHead, externalAfter, externalRevert)
 	}
 
-	if !eventStateBecomes(dbPath, handledPath, "published", 30*time.Second) {
-		rows := sqliteScalar(t, dbPath,
-			"SELECT group_concat(seq || ':' || path || ':' || state || ':' || COALESCE(error, ''), char(10)) FROM capture_events ORDER BY seq")
-		decisions := sqliteScalar(t, dbPath,
-			"SELECT group_concat(kind || ':' || COALESCE(path, '') || ':' || COALESCE(reason, ''), char(10)) FROM decision_records ORDER BY id")
-		journals := sqliteScalar(t, dbPath,
-			"SELECT group_concat(id || ':' || phase || ':' || source_head || ':' || target_commit_oid, char(10)) FROM self_publications ORDER BY id")
-		checkpoints := sqliteScalar(t, dbPath,
-			"SELECT group_concat(id || ':' || phase || ':' || reason, char(10)) FROM checkpoints ORDER BY seq")
-		t.Fatalf("%s did not publish\nrows:\n%s\ndecisions:\n%s\njournals:\n%s\ncheckpoints:\n%s",
-			handledPath, rows, decisions, journals, checkpoints)
+	// The in-flight response is invalidated by external HEAD movement. The
+	// whole protected chain is preserved separately because the external
+	// revert means its final contents no longer all match HEAD.
+	for _, path := range []string{handledPath, supersededPath} {
+		waitForEventState(t, dbPath, path, "recovered", 15*time.Second)
+		waitForDecision(t, dbPath, path, "recovery_archived", "runtime_branch_transition", 8*time.Second)
 	}
-	if !eventStateBecomes(dbPath, supersededPath, "published", 20*time.Second) {
-		dump := sqliteScalar(t, dbPath,
-			fmt.Sprintf("SELECT group_concat(seq || ':' || state || ':' || COALESCE(error, ''), char(10)) FROM capture_events WHERE path = %s ORDER BY seq", sqliteQuote(supersededPath)))
-		decisions := sqliteScalar(t, dbPath,
-			fmt.Sprintf("SELECT group_concat(kind || ':' || COALESCE(reason, ''), char(10)) FROM decision_records WHERE path = %s ORDER BY id", sqliteQuote(supersededPath)))
-		t.Fatalf("%s did not publish after restart\nrows:\n%s\ndecisions:\n%s", supersededPath, dump, decisions)
+	recoveryRef := sqliteScalar(t, dbPath, "SELECT recovery_ref FROM recovery_snapshots ORDER BY id DESC LIMIT 1")
+	if recoveryRef == "" {
+		t.Fatal("recovered captures lack a retained recovery ref")
 	}
-	waitForDecision(t, dbPath, handledPath, "handled_external", "already_published_after_cas_exhaustion", 8*time.Second)
-	waitForDecision(t, dbPath, supersededPath, "superseded_external", "superseded_external_current_head_matches_captured_before_state", 8*time.Second)
+	for _, path := range paths {
+		if got := runGitOK(t, repo, "show", recoveryRef+":"+path); got != "after\n" {
+			t.Fatalf("protected recovery content %s=%q want after", path, got)
+		}
+	}
+	if got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); got != externalRevert {
+		t.Fatalf("stale evaluation changed external HEAD: %s want %s", got, externalRevert)
+	}
 
 	if out, err := runGit(repo, "cat-file", "-e", "HEAD:"+supersededPath); err != nil {
 		t.Fatalf("target missing after superseded replay: %v\n%s", err, out)
@@ -366,8 +364,8 @@ WHERE e.path IN ('external-race-a.txt', 'external-race-b.txt')
 	if events.ExitCode != 0 {
 		t.Fatalf("acd events exit=%d\nstdout=%s\nstderr=%s", events.ExitCode, events.Stdout, events.Stderr)
 	}
-	if !strings.Contains(events.Stdout, `"kind": "superseded_external"`) {
-		t.Fatalf("events output missing daemon-recorded superseded_external:\n%s", events.Stdout)
+	if !strings.Contains(events.Stdout, `"kind": "recovery_archived"`) {
+		t.Fatalf("events output missing daemon-recorded recovery_archived:\n%s", events.Stdout)
 	}
 }
 
