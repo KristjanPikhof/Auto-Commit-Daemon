@@ -101,6 +101,12 @@ retain historical preservation evidence. Exact current-branch tree proof permits
 a recovered-and-recaptured snapshot to report commitment without erasing its
 recovery history. If that proof is unavailable, `branch_committed` is null.
 
+If Git changes while AI is evaluating a target, ACD rejects that stale result.
+An exact match with externally committed work can resolve through the recovery
+proof (`recovery_published`). A chain containing both applied and reverted work
+may instead be preserved separately (`recovery_archived`). Neither outcome
+creates a duplicate branch commit or restores files over your edits.
+
 Read-only status falls back to existing v20 SQLite projections when the
 supervisor is unavailable. Mutations never fall back to direct unsupervised
 writes. On macOS, mutating commands first start or reuse the shared per-user
