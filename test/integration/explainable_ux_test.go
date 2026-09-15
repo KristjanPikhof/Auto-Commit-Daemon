@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 )
 
 func TestExplainableUX_ProtectedTrackedSensitiveFileIsNotDeleted(t *testing.T) {
@@ -86,9 +89,21 @@ func TestExplainableUX_DecisionLedgerDrivesEventsExplainAndFix(t *testing.T) {
 	if off.ExitCode != 0 {
 		t.Fatalf("acd off exit=%d\nstdout=%s\nstderr=%s", off.ExitCode, off.Stdout, off.Stderr)
 	}
-	if !waitStopped(repo, 5*time.Second) {
-		t.Fatal("repository worker did not stop after acd off")
-	}
+	// Force-stop may leave old liveness metadata. The canonical ownership
+	// lock must be released before this fixture can seed repository state.
+	waitFor(t, "worker ownership released after off", 5*time.Second, func() bool {
+		lock, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lock.Release(); err != nil {
+			t.Fatal(err)
+		}
+		return true
+	})
 
 	writeFile(t, filepath.Join(repo, "manual.txt"), "landed outside acd\n")
 	manualHead := gitCommitAll(t, repo, "manual external commit", "manual.txt")
