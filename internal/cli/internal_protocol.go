@@ -874,9 +874,10 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		return projection, nil
 	case "checkpoint_barrier":
 		var params struct {
-			DrainPublication bool   `json:"drain_publication"`
-			ConsumeStaged    bool   `json:"consume_staged"`
-			PreviewDigest    string `json:"preview_digest"`
+			DrainPublication    bool   `json:"drain_publication"`
+			ConsumeStaged       bool   `json:"consume_staged"`
+			PreviewDigest       string `json:"preview_digest"`
+			ExpectedIndexDigest string `json:"expected_index_digest"`
 		}
 		_ = json.Unmarshal(request.Params, &params)
 		var drainAnchor publicationDrainTarget
@@ -890,6 +891,16 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 				if previewErr != nil || current.Digest != params.PreviewDigest {
 					runtime.gate.Unlock()
 					return nil, &supervisor.ProtocolError{Code: "plan_changed", Message: "commit-all scope or staging changed; run `acd commit-all` to review again"}
+				}
+				params.ExpectedIndexDigest = current.IndexDigest
+			}
+			if params.ConsumeStaged && params.PreviewDigest == "" {
+				// --yes accepts the index at worker admission, not an earlier CLI read.
+				var indexErr error
+				params.ExpectedIndexDigest, indexErr = git.IndexContentDigest(ctx, runtime.worktree.Root)
+				if indexErr != nil {
+					runtime.gate.Unlock()
+					return nil, protocolFailure("staging_read_failed", indexErr, true)
 				}
 			}
 			reason, unsafeErr := publicationUnsafeReason(
@@ -1079,9 +1090,10 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 										Phase:            state.PublicationDrainCheckpointing,
 										TargetEventCount: int64(len(drainTarget.EventSeqs)),
 										CreatedTS:        nowTS, UpdatedTS: nowTS,
-										LastProgressTS: nowTS,
-										StagedConsent:  params.ConsumeStaged,
-										EventSeqs:      append([]int64(nil), drainTarget.EventSeqs...),
+										LastProgressTS:      nowTS,
+										StagedConsent:       params.ConsumeStaged,
+										ExpectedIndexDigest: params.ExpectedIndexDigest,
+										EventSeqs:           append([]int64(nil), drainTarget.EventSeqs...),
 									}
 									if unsafeErr == nil {
 										_, unsafeErr = state.PreparePublicationDrain(

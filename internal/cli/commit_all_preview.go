@@ -21,6 +21,7 @@ type commitAllPath struct {
 type commitAllScope struct {
 	ChangedPaths []commitAllPath `json:"changed_paths"`
 	QueuedPaths  []string        `json:"queued_paths"`
+	IndexDigest  string          `json:"index_digest"`
 	Digest       string          `json:"preview_digest"`
 }
 
@@ -49,6 +50,10 @@ func inspectCommitAllScope(ctx context.Context, repo, dbPath string) (commitAllS
 	if err != nil {
 		return result, err
 	}
+	result.IndexDigest, err = gitpkg.IndexContentDigest(ctx, repo)
+	if err != nil {
+		return result, err
+	}
 	db, err := openStateDBReadOnly(ctx, dbPath)
 	if err != nil {
 		return result, err
@@ -62,6 +67,7 @@ func inspectCommitAllScope(ctx context.Context, repo, dbPath string) (commitAllS
 	hash := sha256.New()
 	_, _ = hash.Write(status)
 	_, _ = hash.Write(staged)
+	_, _ = hash.Write([]byte(result.IndexDigest))
 	seen := map[string]bool{}
 	for rows.Next() {
 		var seq int64

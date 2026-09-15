@@ -765,8 +765,7 @@ func ResumePublicationDrainCheckpointing(
 		recheckingSemanticMessage = false
 	}
 	if drain.StagedConsent && !drain.StagedConsumed {
-		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repoRoot},
-			"reset", "--mixed", "--quiet", "HEAD", "--"); err != nil {
+		if err := gitpkg.ConsumeApprovedIndex(ctx, repoRoot, drain.ExpectedIndexDigest, currentHeadText); err != nil {
 			return fail(err)
 		}
 	}

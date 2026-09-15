@@ -34,9 +34,6 @@ func indexContentDigest(ctx context.Context, repoDir, indexFile string) (string,
 // An already-clean index is the idempotent recovery state after a prior rename
 // succeeded but recording staged_consumed was interrupted.
 func ConsumeApprovedIndex(ctx context.Context, repoDir, expectedDigest, expectedHead string) error {
-	if expectedDigest == "" {
-		return errors.New("staging approval has no saved index identity; review commit-all again")
-	}
 	worktree, err := ResolveWorktree(ctx, repoDir)
 	if err != nil {
 		return err
@@ -73,6 +70,9 @@ func ConsumeApprovedIndex(ctx context.Context, repoDir, expectedDigest, expected
 	}
 	if current == clean {
 		return nil
+	}
+	if expectedDigest == "" {
+		return errors.New("staging approval has no saved index identity; review commit-all again")
 	}
 	if current != expectedDigest {
 		return ErrStagingChanged
