@@ -49,7 +49,7 @@ func TestConfigureWizardAccessibleStagesGlobalIntentBalancedWithoutTests(t *test
 		t.Fatalf("accessible output leaked secret or color: %q", out.String())
 	}
 	for _, want := range []string{
-		"How should ACD work?", "Everyday work", "Commit message provider",
+		"How should ACD work?", "Everyday work", "How should ACD create commits?",
 		"OpenAI-compatible endpoint", "Model", "API key",
 	} {
 		if !strings.Contains(out.String(), want) {
@@ -90,7 +90,7 @@ func TestConfigureWizardBalancedIgnoresSavedAndDetectedVerification(t *testing.T
 		t.Fatalf("selection=%+v", selection)
 	}
 	for _, forbidden := range []string{
-		"Commit message provider", "API key", "verification command",
+		"How should ACD create commits?", "API key", "verification command",
 		"Model", "base URL", "Provider timeout",
 	} {
 		if strings.Contains(out.String(), forbidden) {

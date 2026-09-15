@@ -298,10 +298,6 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	defaults[config.FieldCommitPreset] = preset
 	defaults[config.FieldIntentVerification] =
 		configureSelectionVerificationMode(strategy, preset)
-	if strategy == "intent" &&
-		defaults[config.FieldProvider] == "deterministic" {
-		defaults[config.FieldProvider] = "openai-compat"
-	}
 	providerConfigured := !opts.Replace && configureSourceIsExplicit(
 		authoring.Sources[config.FieldProvider],
 	) && originalProvider == defaults[config.FieldProvider]
@@ -740,10 +736,6 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if !opts.Inherit {
 		defaults[config.FieldCommitStrategy] = strategy
 		defaults[config.FieldCommitPreset] = preset
-		if strategy == "intent" &&
-			defaults[config.FieldProvider] == "deterministic" {
-			defaults[config.FieldProvider] = "openai-compat"
-		}
 	}
 	providerConfigured := configureSourceIsExplicit(
 		authoring.Sources[config.FieldProvider],
