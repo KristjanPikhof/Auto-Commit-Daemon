@@ -365,7 +365,9 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		t.Fatalf("recovery must be distinct from branch publication: %+v", control.PublicationOutcome)
 	}
 	entries, err := loadCheckpointHistory(ctx, repo)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(entries) != 1 || entries[0].Outcome != "recovered" || entries[0].Published {
 		t.Fatalf("recovery history: %+v", entries)
 	}
