@@ -2186,6 +2186,9 @@ func applyIntentFallbackMessageQuality(
 		return (publicationDrainAtomicFallbackPlanner{messagePlanner: planner, requireSemanticMessage: true}).rewritePlanMessages(jobCtx, req, plan)
 	})
 	if ai.ProviderNeedsConfiguration(err) {
+		if health != nil {
+			_ = health.Complete(ctx, permit, nil)
+		}
 		return ai.IntentPlanV2{}, plannerFailure, false, err
 	}
 	if health != nil {
