@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -113,6 +114,7 @@ type diagnoseReport struct {
 	WorktreeClean            bool                   `json:"worktree_clean"`
 	AllChangesCommittedInGit bool                   `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD bool                   `json:"checkpoint_published_by_acd"`
+	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
 	PublicationDrain         publicationDrainReport `json:"publication_drain"`
 }
 
@@ -258,7 +260,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	report.AllChangesCommittedInGit = status.AllChangesCommittedInGit
 	report.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 	report.PublicationDrain = status.PublicationDrain
+	report.CheckpointMaintenance = status.CheckpointMaintenance
 	report.Remediation = diagnoseRemediation(report)
+	if details := maintenanceDetails(report.CheckpointMaintenance); details != "" { report.Remediation = append(report.Remediation, details+" "+report.CheckpointMaintenance.NextAction()) }
 
 	after, err := fileSHA256(rec.StateDB)
 	if err != nil {
