@@ -153,7 +153,7 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 
 	var rows []state.DecisionRecord
 	cursor := since
-	if watch && since == 0 {
+	if since == 0 {
 		cursor, err = latestDecisionIDSQL(ctx, db)
 		if err != nil {
 			return fmt.Errorf("acd events: latest cursor: %w", err)
@@ -164,20 +164,11 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 			return err
 		}
 		cursor = maxDecisionCursor(rows, since)
-		if !watch && since == 0 && cursor == 0 {
-			cursor, err = latestDecisionIDSQL(ctx, db)
-			if err != nil {
-				return fmt.Errorf("acd events: latest cursor: %w", err)
-			}
-		}
 	}
-	if len(rows) > 0 || !watch {
-		if err := renderEvents(ctx, out, db, rec.Path, rows, cursor, jsonOut, !watch, ""); err != nil {
+	if len(rows) > 0 {
+		if err := renderEvents(ctx, out, db, rec.Path, rows, cursor, jsonOut, false, ""); err != nil {
 			return err
 		}
-	}
-	if !watch {
-		return nil
 	}
 	if eventsWatchReadyHook != nil {
 		eventsWatchReadyHook()
