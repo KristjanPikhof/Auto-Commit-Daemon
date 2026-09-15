@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,6 +63,7 @@ type controlResult struct {
 	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
 	CheckpointID             string                    `json:"checkpoint_id,omitempty"`
 	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
+	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
 	PublicationProgress      publicationProgressReport `json:"publication_progress"`
 	RecoveryRequired         bool                      `json:"-"`
 	CLIVersion               string                    `json:"cli_version,omitempty"`
@@ -544,6 +546,7 @@ func applyControlStatus(res *controlResult, status statusReport) {
 }
 
 func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, daemonAlive bool) {
+	defer func() { applyMaintenanceStatus(res, status) }()
 	manualPause := status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace")
 	res.Daemon = status.Daemon
 	res.DaemonPID = status.PID
@@ -565,10 +568,6 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 			status.PublicationProgress.Phase == "needs_action")
 
 	switch {
-	case status.CheckpointRetentionOverBudget:
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "Protected checkpoints use more storage than the configured limit. No protected data was deleted."
-		res.NextAction = "Run `acd repo gc` to review storage use and safe cleanup."
 	case status.IntentV2.SchemaVersion > 0 && !status.CheckpointProtectionAvailable:
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "This repository uses an older ACD protection format."
