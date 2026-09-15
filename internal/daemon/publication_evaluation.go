@@ -16,12 +16,13 @@ import (
 // the worker protects new bytes while that call is outstanding. The enclosing
 // replay retains its runtime lease and frozen inputs until this returns.
 type publicationEvaluation struct {
-	gate                  *sync.RWMutex
-	cancel                context.CancelFunc
-	identity              func(context.Context) (string, error)
-	protect               func(context.Context) error
-	wake, files, shutdown <-chan struct{}
-	interval              time.Duration
+	gate                           *sync.RWMutex
+	cancel                         context.CancelFunc
+	identity                       func(context.Context) (string, error)
+	protect                        func(context.Context) error
+	wake, files, changes, shutdown <-chan struct{}
+	onShutdown                     func()
+	interval                       time.Duration
 }
 
 type publicationEvaluationKey struct{}
@@ -102,10 +103,15 @@ func evaluatePublication[T any](ctx context.Context, run func(context.Context) (
 		case <-ctx.Done():
 			return abort(ctx.Err())
 		case <-evaluation.shutdown:
+			if evaluation.onShutdown != nil {
+				evaluation.onShutdown()
+			}
 			return abort(context.Canceled)
 		case <-evaluation.wake:
 			activity = true
 		case <-evaluation.files:
+			activity = true
+		case <-evaluation.changes:
 			activity = true
 		case <-timer.C:
 		}
