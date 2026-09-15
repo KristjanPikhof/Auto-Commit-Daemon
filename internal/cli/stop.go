@@ -119,29 +119,15 @@ func runStopRegistry(ctx context.Context, out io.Writer, force, jsonOut bool, re
 
 var stopOneRepoForAll = stopOneRepo
 
-// stopOneRepo handles the per-repo logic shared by single-repo and --all.
+// stopOneRepo shuts down an old worker during setup or repository removal.
 func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopRepoResult, error) {
 	res := stopRepoResult{Repo: repo, SessionID: sessionID, Force: force}
 	gitDir, err := resolveGitDir(ctx, repo)
 	if err != nil {
 		return res, fmt.Errorf("acd stop: resolve git dir: %w", err)
 	}
-	// perf-lane: remove start-cache files so subsequent active hooks no
-	// longer short-circuit onto a daemon that is being torn down. The
-	// cold path will re-spawn or refuse based on the live daemon_state
-	// row.
-	//
-	// Invalidation matrix (per-session caches under <gitDir>/acd/):
-	//   - res.Stopped              → wipe every start-cache-*.json
-	//                                (and matching .tmp leftovers).
-	//   - Deferred via sessionID   → wipe just that session's cache so
-	//                                a stale entry cannot mask the
-	//                                missing daemon_clients row.
-	//   - Failed (force survived)  → wipe every cache. The daemon is in
-	//                                an unknown state; we deliberately
-	//                                force every subsequent active hook
-	//                                onto the cold path so it can
-	//                                re-establish daemon_state truth.
+	// Old runtimes may still have cached session ownership. Remove all caches
+	// after a stop or failed forced stop; otherwise remove the closed session.
 	defer func() {
 		if res.Stopped {
 			removeAllStartCaches(gitDir)
