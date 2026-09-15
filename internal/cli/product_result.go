@@ -3,10 +3,11 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"io"
 	"strings"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 )
 
 type productState string
