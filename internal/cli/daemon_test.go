@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,8 +13,7 @@ func TestBuildDaemonRunOptions_WiresCentralStats(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repoDir, _, db := makeRepoStateDB(t)
 
-	var errBuf bytes.Buffer
-	opts, logCloser, err := buildDaemonRunOptions(repoDir, repoDir+"/.git", db, &errBuf)
+	opts, logCloser, err := buildDaemonRunOptionsWithID(repoDir, repoDir+"/.git", db, "")
 	if err != nil {
 		t.Fatalf("buildDaemonRunOptions: %v", err)
 	}
@@ -70,7 +68,7 @@ func TestBuildDaemonRunOptions_FsnotifyEnvToggle(t *testing.T) {
 		t.Run("env="+tc.env, func(t *testing.T) {
 			withIsolatedHome(t)
 			t.Setenv("ACD_FSNOTIFY_ENABLED", tc.env)
-			opts, logCloser, err := buildDaemonRunOptions(repoDir, repoDir+"/.git", db, os.Stderr)
+			opts, logCloser, err := buildDaemonRunOptionsWithID(repoDir, repoDir+"/.git", db, "")
 			if err != nil {
 				t.Fatalf("buildDaemonRunOptions: %v", err)
 			}
@@ -97,7 +95,7 @@ func TestBuildDaemonRunOptions_WiresAppendOnlyDaemonLog(t *testing.T) {
 		t.Fatalf("seed log: %v", err)
 	}
 
-	opts, logCloser, err := buildDaemonRunOptions(repoDir, repoDir+"/.git", db, os.Stderr)
+	opts, logCloser, err := buildDaemonRunOptionsWithID(repoDir, repoDir+"/.git", db, "")
 	if err != nil {
 		t.Fatalf("buildDaemonRunOptions: %v", err)
 	}

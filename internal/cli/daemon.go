@@ -12,10 +12,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-func buildDaemonRunOptions(repo, gitDir string, db *state.DB, _ io.Writer) (daemon.Options, io.Closer, error) {
-	return buildDaemonRunOptionsWithID(repo, gitDir, db, "")
-}
-
 func buildDaemonRunOptionsWithID(repo, gitDir string, db *state.DB, repositoryID string) (daemon.Options, io.Closer, error) {
 	fsEnabled := false
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ACD_FSNOTIFY_ENABLED"))); v != "" && v != "0" && v != "false" {
