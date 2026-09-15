@@ -34,6 +34,11 @@ func TestProductionMeasurements(t *testing.T) {
 	defer unblock()
 	called := make(chan struct{}, 1)
 	server, trust := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := decodeIntentChatRequest(t, r)
+		if req.ToolChoice.Function.Name == "commit_message" {
+			writeIntentMessageRewriteResponse(t, w, req)
+			return
+		}
 		select {
 		case called <- struct{}{}:
 		default:
@@ -42,7 +47,13 @@ func TestProductionMeasurements(t *testing.T) {
 		case <-release:
 		case <-r.Context().Done():
 		}
-		http.Error(w, "temporary benchmark outage", http.StatusServiceUnavailable)
+		candidates := []map[string]any{}
+		for _, capture := range offeredIntentCaptures(t, req) {
+			candidates = append(candidates, nativeReadyIntentCandidate(
+				fmt.Sprintf("measurement-%d", capture.Seq), []int64{capture.Seq},
+				"Add measured change", "Keep the measured changes independent.", "independent benchmark change"))
+		}
+		writeNativeIntentCandidatesResponse(t, w, "measurement", candidates)
 	}))
 	// Registered after the server so a failed assertion releases blocked calls
 	// before server cleanup attempts to join them.
@@ -74,15 +85,32 @@ func TestProductionMeasurements(t *testing.T) {
 		}
 	}
 	checkpoint := func(name string) time.Duration {
+		before, err := strconv.ParseInt(readDaemonStateScalar(repo,
+			"SELECT COALESCE(MAX(coverage_epoch),0) FROM checkpoints WHERE phase='completed'"), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
 		start := time.Now()
-		writeFile(t, filepath.Join(repo, name), "benchmark checkpoint\n")
-		waitFor(t, "completed checkpoint for "+name, 15*time.Second, func() bool {
-			query := fmt.Sprintf(`SELECT COUNT(*) FROM checkpoint_events ce
-JOIN checkpoints c ON c.id=ce.checkpoint_id
-JOIN capture_ops o ON o.event_seq=ce.event_seq
-WHERE c.phase='completed' AND o.path=%s`, sqliteLiteral(name))
-			count := readDaemonStateScalar(repo, query)
-			return count != "0" && count != ""
+		body := "benchmark checkpoint\n"
+		writeFile(t, filepath.Join(repo, name), body)
+		waitFor(t, "protected bytes for "+name, 15*time.Second, func() bool {
+			// Protection may precede classification. Prove the exact bytes are
+			// reachable through a newly completed, retained checkpoint ref.
+			row := strings.Fields(readDaemonStateScalar(repo, `SELECT tree_oid || ' ' || checkpoint_ref || ' ' || coverage_epoch || ' ' || observation_epoch
+FROM checkpoints WHERE phase='completed' AND retained=1 ORDER BY seq DESC LIMIT 1`))
+			if len(row) != 4 {
+				return false
+			}
+			coverage, err := strconv.ParseInt(row[2], 10, 64)
+			if err != nil || coverage <= before || row[2] != row[3] {
+				return false
+			}
+			tree, err := runGit(repo, "rev-parse", row[1]+"^{tree}")
+			if err != nil || strings.TrimSpace(tree) != row[0] {
+				return false
+			}
+			content, err := runGit(repo, "show", row[1]+":"+name)
+			return err == nil && content == body
 		})
 		return time.Since(start)
 	}
@@ -94,4 +122,14 @@ WHERE c.phase='completed' AND o.path=%s`, sqliteLiteral(name))
 	}
 	metrics["provider_wait_checkpoint_seconds"] = checkpoint("during-provider.txt").Seconds()
 	unblock()
+	waitFor(t, "separate publication after provider returns", 20*time.Second, func() bool {
+		return readDaemonStateScalar(repo, `SELECT COUNT(DISTINCT e.commit_oid)
+FROM capture_events e JOIN capture_ops o ON o.event_seq=e.seq
+WHERE e.state='published' AND o.path IN ('first.txt','during-provider.txt')`) == "2"
+	})
+	for _, name := range []string{"first.txt", "during-provider.txt"} {
+		if got := runGitOK(t, repo, "show", "HEAD:"+name); got != "benchmark checkpoint\n" {
+			t.Fatalf("published %s bytes=%q", name, got)
+		}
+	}
 }
