@@ -973,9 +973,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		treeOID, err := applyOpsAndWriteTree(eventCtx, repoRoot, indexFile, ops)
 		if err != nil {
 			cancelEvent()
-			if isIntentPlannerCircuitWait(err) || ai.ProviderNeedsConfiguration(err) || ctx.Err() != nil {
-				return sum, err
-			}
 			if markErr := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
 				Message:    err.Error(),
@@ -1028,6 +1025,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		commitOID, err := buildCommitFromTree(eventCtx, repoRoot, treeOID, parent, ev, ops, msgFn, opts.IntentHealth)
 		if err != nil {
 			cancelEvent()
+			if isIntentPlannerCircuitWait(err) || ai.ProviderNeedsConfiguration(err) || ctx.Err() != nil {
+				return sum, err
+			}
 			if markErr := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
 				Message:    err.Error(),
