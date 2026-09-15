@@ -90,7 +90,8 @@ detail. Branch publication and recovery preservation are distinct outcomes.
 
 JSON adds `publication_outcome` with nullable `branch_committed`, counts for
 `branch_changes`, `recovered_changes`, and `waiting_changes`, plus `reason_code`
-and `retry_at` when known. Null means unavailable. Existing `published` and
+and `retry_at` when known. `pending_classification` identifies saved bytes
+waiting to enter the capture ledger. Null means unavailable. Existing `published` and
 `checkpoint_published_by_acd` fields are deprecated compatibility fields: their
 existing meaning still includes safely recovered work. History retains its
 old `published` boolean and adds `outcome` and `recovered_events`.
