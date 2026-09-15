@@ -254,3 +254,17 @@ and lifecycle/Intent flush integration tests cover the supported IPC path.
 
 - `TestListWatch_AlreadyCanceledContextReturnsNil`
 - `TestListWatch_RendersMultipleSnapshotsAndStopsOnCancel`
+
+## Additional test reliability improvements
+
+`TestIsTransientUpdateRefLockError_PinsRealGitMessage` now holds its own ref lock
+inside an isolated repository and calls the production Git helper once. It
+still checks Git's real error text. The previous test raced two commands up to
+20 times and skipped when contention did not occur; that optional coverage and
+repeated process setup are gone.
+
+Interactive commit-all coverage now includes real checkpoint capture of a late
+unreviewed path, refusal before staging consumption, renewed approval, rename
+endpoints and every operation stored in a multi-operation capture. A separate
+restart case proves that a new approval can replace an old staging-blocked
+request without rewriting the old index consent.
