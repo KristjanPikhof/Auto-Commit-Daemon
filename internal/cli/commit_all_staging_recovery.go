@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
@@ -48,15 +47,5 @@ SELECT seq FROM capture_events WHERE branch_ref=? AND branch_generation=?
 			return errors.New("staging review could not prove preservation of the previous target")
 		}
 	}
-	if _, err := state.ReconcileResolvedPublicationDrains(ctx, runtime.db, float64(time.Now().UnixNano())/1e9); err != nil {
-		return err
-	}
-	drain, err := state.PublicationDrainByID(ctx, runtime.db, id)
-	if err != nil {
-		return err
-	}
-	if drain.Phase != state.PublicationDrainCompleted {
-		return fmt.Errorf("staging review left previous target %s unresolved", id)
-	}
-	return nil
+	return state.CompleteReplacedStagingDrain(ctx, runtime.db, id, float64(time.Now().UnixNano())/1e9)
 }

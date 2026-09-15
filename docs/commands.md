@@ -230,6 +230,9 @@ its saved approval identity. If you staged something else while it waited, ACD
 preserves that selection and asks you to review commit-all again. This check
 also survives a worker restart. Older requests without a saved staging identity
 require a new review before consuming staging.
+A fresh approval preserves the old request's captured work separately and
+recaptures the current files for a new target. The old staging approval stays
+unchanged; it is never reused to consume a newer selection.
 
 `commit-all` first completes a durable checkpoint, records the highest event
 sequence covered by the barrier, and drains only that bounded target through
