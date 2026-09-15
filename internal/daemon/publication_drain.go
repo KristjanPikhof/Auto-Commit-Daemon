@@ -115,31 +115,6 @@ func failPublicationDrainRuntimeContract(
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 }
 
-func publicationDrainSemanticMessageExhausted(
-	drain state.PublicationDrain,
-	summary ReplaySummary,
-) bool {
-	waitReason := strings.TrimSpace(summary.DispositionReason)
-	currentWaitAlreadyObserved := waitReason != "" &&
-		strings.HasPrefix(waitReason, "intent planner circuit open until ") &&
-		strings.TrimSpace(drain.LastError) == waitReason &&
-		summary.PlannerCircuitLastFailureTS > drain.LastProgressTS
-	failureObservedByCurrentWait :=
-		summary.PlannerCircuitLastFailureTS > drain.UpdatedTS ||
-			currentWaitAlreadyObserved
-	return drain.Phase == state.PublicationDrainEventFallback &&
-		publicationDrainSalvageMode(drain) == publicationFallbackLocalUnlock &&
-		summary.Disposition == ReplayDispositionTransientWait &&
-		summary.SkippedReason == "intent_v2_waiting_message_rewrite" &&
-		summary.PlannerCircuitOpen &&
-		summary.PlannerProviderFingerprint != "" &&
-		summary.PlannerProviderFingerprint == drain.ProviderFingerprint &&
-		summary.PlannerCircuitBackoffLevel == len(intentPlannerCircuitBackoffs)-1 &&
-		summary.PlannerMaxBackoffProbeFailures > 0 &&
-		failureObservedByCurrentWait &&
-		summary.PlannerCircuitLastFailureTS > drain.LastProgressTS
-}
-
 func publicationDrainHasAppliedAlternativeRuntime(
 	ctx context.Context,
 	db *state.DB,
@@ -1618,11 +1593,6 @@ func UpdatePublicationDrainAfterReplay(
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
 	if !progressed && summary.Disposition == ReplayDispositionTransientWait {
-		if publicationDrainSemanticMessageExhausted(drain, summary) {
-			update.Phase = state.PublicationDrainNeedsAction
-			update.LastError = PublicationDrainSemanticMessageUnavailableReason
-			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
-		}
 		if summary.SkippedReason == "intent_v2_waiting_message_rewrite" {
 			update.LastError = strings.TrimSpace(summary.DispositionReason)
 		} else if summary.SkippedReason == intentVerificationResourceWaitSkipReason {
