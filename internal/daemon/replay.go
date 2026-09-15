@@ -375,6 +375,11 @@ func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
 	case sum.Conflicts > 0 || sum.Failed > 0:
 		sum.Disposition = ReplayDispositionNeedsAttention
 	case replayErr != nil:
+		if ai.ProviderNeedsConfiguration(replayErr) {
+			sum.Disposition = ReplayDispositionNeedsAttention
+			sum.DispositionReason = "provider_configuration_required"
+			return
+		}
 		if errors.Is(replayErr, context.Canceled) ||
 			isIntentPlannerCircuitWait(replayErr) {
 			sum.Disposition = ReplayDispositionTransientWait
@@ -968,7 +973,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		treeOID, err := applyOpsAndWriteTree(eventCtx, repoRoot, indexFile, ops)
 		if err != nil {
 			cancelEvent()
-			if isIntentPlannerCircuitWait(err) || ctx.Err() != nil {
+			if isIntentPlannerCircuitWait(err) || ai.ProviderNeedsConfiguration(err) || ctx.Err() != nil {
 				return sum, err
 			}
 			if markErr := markFailed(ctx, db, ev, replayIssue{
