@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"io"
 	"os"
 	"os/signal"
@@ -13,6 +12,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 )
 
 const productListActiveWindow = time.Hour
@@ -56,9 +57,10 @@ func newProductListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "Show live protection and commit progress",
-		Long: `Show repositories active in the last hour, plus repositories with unfinished
-work. Idle repositories disappear even if they have a maintenance warning.
-Rows stay in place while the dashboard refreshes; newly active repos append.
+		Long: `Show repositories active in the last hour, including those that need action,
+and repositories with unfinished work. Idle repositories disappear even if
+they have a maintenance warning. Rows stay in place while the dashboard
+refreshes; newly active repositories append.
 
 In a terminal, the dashboard refreshes until you stop it with Ctrl-C. Use
 --once for one snapshot, --all for every enabled repository, or --verbose for
@@ -166,18 +168,19 @@ func runProductListOnceView(ctx context.Context, out io.Writer, jsonOut, verbose
 	if err != nil {
 		return fmt.Errorf("acd list: %w", err)
 	}
+	entries := data.Repos
 	if jsonOut {
 		if err := renderAnyProductEnvelope(out, productEnvelope{
 			OK: true, State: stateName, Actions: []productAction{}, Data: data,
 		}, true); err != nil {
 			return err
 		}
-	} else if err := renderProductListDashboard(out, data.Repos, verbose, showAll); err != nil {
-		return err
-	}
-	entries := data.Repos
-	if !jsonOut {
-		entries, _ = selectProductListEntries(data.Repos, showAll)
+	} else {
+		var hidden int
+		entries, hidden = selectProductListEntries(data.Repos, showAll)
+		if err := renderProductListSelection(out, entries, hidden, verbose, showAll); err != nil {
+			return err
+		}
 	}
 	if productListRequiresAction(entries) {
 		return &CommandError{
@@ -233,35 +236,15 @@ func runProductListWatchDisplay(
 			return nil
 		}
 		stabilizeProductListFrame(data.Repos, lastKnown)
-		visible, _ := selectProductListEntries(data.Repos, showAll)
+		visible, hidden := selectProductListEntries(data.Repos, showAll)
 		visible, rowOrder = orderProductListFrame(visible, rowOrder)
-		// Keep hidden rows behind the stable visible order for the hidden count.
-		seen := make(map[string]bool, len(visible))
-		for _, entry := range visible {
-			seen[entry.Repo] = true
-		}
-		for _, entry := range data.Repos {
-			if !seen[entry.Repo] {
-				visible = append(visible, entry)
-			}
-		}
-		data.Repos = visible
-		present := make(map[string]bool, len(data.Repos))
-		for _, entry := range data.Repos {
-			present[entry.Repo] = true
-		}
-		for repo := range lastKnown {
-			if !present[repo] {
-				delete(lastKnown, repo)
-			}
-		}
 		if terminalScreen && !terminalStarted {
 			fmt.Fprint(out, "\033[?1049h\033[?25l")
 			terminalStarted = true
 		}
 		fmt.Fprint(out, "\033[2J\033[H")
 		fmt.Fprintf(out, "Updated: %s\n\n", data.UpdatedAt)
-		if err := renderProductListDashboard(out, data.Repos, verbose, showAll); err != nil {
+		if err := renderProductListSelection(out, visible, hidden, verbose, showAll); err != nil {
 			return err
 		}
 
@@ -278,7 +261,9 @@ func runProductListWatchDisplay(
 }
 
 func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]productListEntry) {
+	present := make(map[string]bool, len(entries))
 	for index, entry := range entries {
+		present[entry.Repo] = true
 		if !entry.ProtectionUnknown {
 			lastKnown[entry.Repo] = entry
 			continue
@@ -289,6 +274,12 @@ func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]
 			entries[index] = previous
 		}
 	}
+	for repo := range lastKnown {
+		if !present[repo] {
+			delete(lastKnown, repo)
+		}
+	}
+
 }
 
 func renderProductListTable(out io.Writer, entries []productListEntry, verbose bool) error {
@@ -297,6 +288,10 @@ func renderProductListTable(out io.Writer, entries []productListEntry, verbose b
 
 func renderProductListDashboard(out io.Writer, entries []productListEntry, verbose, showAll bool) error {
 	visible, hidden := selectProductListEntries(entries, showAll)
+	return renderProductListSelection(out, visible, hidden, verbose, showAll)
+}
+
+func renderProductListSelection(out io.Writer, visible []productListEntry, hidden int, verbose, showAll bool) error {
 	labels := productListLabels(visible)
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	if verbose {
@@ -378,6 +373,9 @@ func productListProgressAge(entry productListEntry) string {
 }
 
 func productListPhase(entry productListEntry) string {
+	if entry.OperationalState == "rewriting" {
+		return "history-rewrite"
+	}
 	progress := entry.PublicationProgress
 	switch progress.Phase {
 	case "intent_wait":
