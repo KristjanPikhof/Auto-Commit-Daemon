@@ -350,10 +350,11 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		!report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 0 {
 		t.Fatalf("clean truth=%+v", report)
 	}
-	listReport := statusReport{Repo: repo}
-	if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+	listOverview, err := readProductListRepo(ctx, rec, time.Now())
+	if err != nil {
 		t.Fatal(err)
 	}
+	listReport := listOverview.report
 	if !listReport.Protected || listReport.UnpublishedCheckpoints != 0 {
 		t.Fatalf("recovered list truth=%+v", listReport)
 	}
@@ -380,7 +381,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	listRecord.RepositoryID = "repository-id"
 	listRecord.WorktreeID = "0123456789abcdef"
 	entry := productListEntryFromOverview(listRecord, supervisor.WorkerStatus{},
-		productListRepoOverview{report: report}, nil)
+		listOverview, nil)
 	if !entry.Published {
 		t.Fatalf("recovered product list truth=%+v", entry)
 	}
@@ -412,10 +413,11 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 			if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
 				t.Fatalf("%s checkpoint truth=%+v", unresolvedState, report)
 			}
-			listReport := statusReport{Repo: repo}
-			if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+			listOverview, err := readProductListRepo(ctx, rec, time.Now())
+			if err != nil {
 				t.Fatal(err)
 			}
+			listReport := listOverview.report
 			if listReport.UnpublishedCheckpoints != 1 {
 				t.Fatalf("%s list truth=%+v", unresolvedState, listReport)
 			}
