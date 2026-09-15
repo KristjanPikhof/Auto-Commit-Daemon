@@ -3,11 +3,13 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -95,6 +97,10 @@ func TestRunCheckpointDuringBlockedMessage(t *testing.T) {
 	})
 	if checkpointID == "" {
 		t.Fatal("later checkpoint missing")
+	}
+	pendingClassification, _, err := state.MetaGet(ctx, f.db, MetaKeyProtectionClassificationPending)
+	if err != nil || pendingClassification != "true" {
+		t.Fatalf("protected-only edit must wait for classification: %q %v", pendingClassification, err)
 	}
 	unchanged, err := git.RevParse(ctx, f.dir, "HEAD")
 	if err != nil || unchanged != head {
@@ -233,4 +239,76 @@ func TestRunCheckpointDuringProjectVerification(t *testing.T) {
 	// Cancel while the actual subprocess is blocked; its isolated worktree and
 	// runtime lease must remain owned until the process has exited.
 	cancel()
+}
+
+func TestEventPublicationWaitsForSelectedProviderAndRecovers(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "semantic.txt"), []byte("preserved\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{IgnoreChecker: f.ig, SensitiveMatcher: f.matcher}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	health := NewIntentPlannerHealth(ctx, f.db, IntentPlannerHealthOptions{Provider: IntentPlannerProviderIdentity{Provider: "test-ai"}, Now: func() time.Time { return now }})
+	calls := 0
+	unavailable := true
+	opts := ReplayOpts{GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyEvent, IntentHealth: health, MessageFn: func(context.Context, EventContext) (string, error) {
+		calls++
+		if unavailable {
+			return "", &ai.ProviderHTTPError{StatusCode: 503, Detail: "temporarily unavailable"}
+		}
+		return "Preserve semantic behavior\n\n- Keep the requested behavior consistent", nil
+	}}
+	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if !isIntentPlannerCircuitWait(err) || first.Failed != 0 || first.Published != 0 || first.Disposition != ReplayDispositionTransientWait {
+		t.Fatalf("outage=%+v err=%v", first, err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("outage lost pending capture: %v %v", pending, err)
+	}
+	_, _ = Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if calls != 1 {
+		t.Fatal("event retry bypassed provider cooldown")
+	}
+	unavailable = false
+	now = now.Add(31 * time.Second)
+	recovered, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || recovered.Published != 1 || recovered.Failed != 0 {
+		t.Fatalf("recovery=%+v err=%v", recovered, err)
+	}
+	out, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "log", "-1", "--format=%s")
+	if err != nil || strings.TrimSpace(string(out)) != "Preserve semantic behavior" {
+		t.Fatalf("message=%s err=%v", out, err)
+	}
+}
+
+func TestPublicationProviderConfigurationRequiresAction(t *testing.T) {
+	for _, status := range []int{401, 403, 404} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			ctx := context.Background()
+			db := openIntentCandidateTestDB(t)
+			failure := &ai.ProviderHTTPError{StatusCode: status, Detail: "check provider settings"}
+			health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: IntentPlannerProviderIdentity{Provider: "configured-ai"}})
+			_, err := generatePublicationMessage(ctx, func(context.Context, EventContext) (string, error) { return "", failure }, EventContext{}, health)
+			if !ai.ProviderNeedsConfiguration(err) || isIntentPlannerCircuitWait(err) {
+				t.Fatalf("configuration classified as temporary wait: %v", err)
+			}
+			summary := ReplaySummary{}
+			classifyReplayDisposition(&summary, err)
+			if summary.Disposition != ReplayDispositionNeedsAttention || summary.DispositionReason != "provider_configuration_required" {
+				t.Fatalf("configuration outcome=%+v", summary)
+			}
+			capture := appendIntentCandidateCapture(t, db, "feature.go", "create", "", "feature")
+			result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, Captures: []IntentCandidateCapture{capture}, Planner: &intentCandidatePlannerStub{err: failure}, Health: health, Preset: config.PresetBalanced})
+			if !ai.ProviderNeedsConfiguration(err) || len(result.Decisions) != 0 || result.PlanAttempt != 0 {
+				t.Fatalf("configuration planner=%+v err=%v", result, err)
+			}
+		})
+	}
 }
