@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -348,6 +349,20 @@ WHERE e.path IN ('external-race-a.txt', 'external-race-b.txt')
 	if got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); got != externalRevert {
 		t.Fatalf("stale evaluation changed external HEAD: %s want %s", got, externalRevert)
 	}
+
+	waitFor(t, "recovery reported separately from current work", 8*time.Second, func() bool {
+		status := runAcd(t, ctx, env, "status", "--repo", repo, "--json")
+		var payload struct {
+			Data struct {
+				Protected bool `json:"protected"`
+				Outcome   struct {
+					Recovered int `json:"recovered_changes"`
+					Waiting   int `json:"waiting_changes"`
+				} `json:"publication_outcome"`
+			} `json:"data"`
+		}
+		return json.Unmarshal([]byte(status.Stdout), &payload) == nil && payload.Data.Protected && payload.Data.Outcome.Recovered == 2 && payload.Data.Outcome.Waiting == 0
+	})
 
 	if out, err := runGit(repo, "cat-file", "-e", "HEAD:"+supersededPath); err != nil {
 		t.Fatalf("target missing after superseded replay: %v\n%s", err, out)
