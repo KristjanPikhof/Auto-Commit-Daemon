@@ -206,16 +206,24 @@ func newCompatStartCmd() *cobra.Command {
 			harness = "manual"
 		}
 		repo, _ := cmd.Flags().GetString("repo")
-		record, roots, worktreeRoot, err := lookupRegisteredRepo("start", repo)
-		if err != nil {
-			return err
+		// Resolve the canonical repository once. The compatibility result and
+		// the current integration route must use the same opt-in decision.
+		decision := evaluateIntegrationRepo(cmd.Context(), repo)
+		if decision.Err != nil {
+			return decision.Err
 		}
+		if decision.Record.Path == "" {
+			return fmt.Errorf("acd start: repository is not registered; use `acd on` to enable protection")
+		}
+		record, roots, worktreeRoot := decision.Record, decision.Roots, decision.Root
 		existed, _, err := state.ReadClientRegistration(cmd.Context(), record.StateDB, sessionID)
 		if err != nil {
 			return err
 		}
-		if err := sendInternalHint(cmd.Context(), worktreeRoot, "wake", false, "open", sessionID, harness, watchPID); err != nil {
-			return err
+		if decision.State == integrationRepoActive {
+			if err := sendInternalHintToRepo(cmd.Context(), record, roots, "wake", false, "open", sessionID, harness, watchPID); err != nil {
+				return err
+			}
 		}
 		_, count, err := state.ReadClientRegistration(cmd.Context(), record.StateDB, sessionID)
 		if err != nil {
