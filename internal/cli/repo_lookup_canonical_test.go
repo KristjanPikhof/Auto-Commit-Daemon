@@ -128,7 +128,7 @@ func TestRepoLookupCommandsCanonicalizeSubdirBeforeRegistryLookup(t *testing.T) 
 			t.Fatalf("register peer session: %v", err)
 		}
 		var out bytes.Buffer
-		if err := runStop(ctx, &out, subdir, "stop-session", false, false, true); err != nil {
+		if err := encodeStoppedRepositoryForTest(ctx, &out, repo, "stop-session", false); err != nil {
 			t.Fatalf("runStop from subdir: %v", err)
 		}
 		var rep stopRepoResult
