@@ -57,7 +57,7 @@ func TestConfigurationReadinessSurfacesAndFailureRecovery(t *testing.T) {
 	queued := queueCLIConfigValidation(t, d)
 
 	var statusOut bytes.Buffer
-	if err := runStatus(ctx, &statusOut, repo, true); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &statusOut, repo, true); err != nil {
 		t.Fatal(err)
 	}
 	var status statusReport
@@ -123,7 +123,7 @@ func TestConfigurationReadinessSurfacesAndFailureRecovery(t *testing.T) {
 		t.Fatalf("complete validation=(%v,%v)", completed, err)
 	}
 	statusOut.Reset()
-	if err := runStatus(ctx, &statusOut, repo, false); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &statusOut, repo, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
@@ -151,7 +151,7 @@ func TestReplayObservabilitySurfaces(t *testing.T) {
 	}
 
 	var statusOut bytes.Buffer
-	if err := runStatus(ctx, &statusOut, repo, true); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &statusOut, repo, true); err != nil {
 		t.Fatal(err)
 	}
 	var status statusReport

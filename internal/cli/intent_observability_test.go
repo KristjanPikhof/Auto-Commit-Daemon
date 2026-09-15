@@ -208,8 +208,8 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 	}
 
 	var human bytes.Buffer
-	if err := runStatus(ctx, &human, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &human, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	for _, want := range []string{"Last planner window", "offered=4,5", "Hidden/coalesced seqs: 6", "Validation fallback", "Plan preflight", "provider_call_skipped=invalid_local_baseline"} {
 		if !strings.Contains(human.String(), want) {
@@ -510,8 +510,8 @@ func TestIntentStageDiffCap_TunedTo16K(t *testing.T) {
 func runStatusJSON(ctx context.Context, t *testing.T, repo string) statusReport {
 	t.Helper()
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var report statusReport
 	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
