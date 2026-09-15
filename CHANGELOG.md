@@ -28,6 +28,8 @@
 
 - Slow AI and project verification no longer prevent new checkpoint protection.
   Evaluation results are checked against current ownership before publication.
+  External Git movement can now resolve through `recovery_published` or
+  `recovery_archived` decisions before the old publication race path runs.
 - Temporary AI failures keep work protected and retry with durable capped backoff.
   They no longer silently produce deterministic messages or exhaust semantic
   correction attempts. Explicit provider changes use verified recovery.
