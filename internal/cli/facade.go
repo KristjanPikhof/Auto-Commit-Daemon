@@ -507,7 +507,7 @@ func newConfigCredentialsCmd() *cobra.Command {
 	}
 	for _, child := range credentials.Commands() {
 		child.Example = strings.ReplaceAll(child.Example, "acd auth", "acd config credentials")
-		capabilities := commandCapabilities{Quiet: true, Interactive: true}
+		capabilities := commandCapabilities{Quiet: true, Interactive: true, Repository: child.Name() == "set"}
 		if child.Name() == "status" {
 			child.RunE = credentials.RunE
 			capabilities.JSON = true

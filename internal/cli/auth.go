@@ -43,7 +43,10 @@ func newAuthSetCmd() *cobra.Command {
 		Use:   "set",
 		Short: "Store a protected OpenAI-compatible API key",
 		Long: `Read an API key from a masked terminal prompt or, with --stdin, from
-standard input. No command-line flag accepts a literal secret.`,
+standard input. No command-line flag accepts a literal secret.
+
+For the current enabled repository (or --repo), ACD tests the stored credential
+and queues its existing runtime settings again. Other repositories are unchanged.`,
 		Example: "  acd auth set\n  printf '%s\\n' \"$ACD_AI_API_KEY\" | acd auth set --stdin",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -61,6 +64,10 @@ standard input. No command-line flag accepts a literal secret.`,
 				return fmt.Errorf("acd auth set: %w", err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Stored provider credential in %s\n", store.Path())
+			repo, _ := cmd.Flags().GetString("repo")
+			if err := refreshCredentialRuntime(cmd.Context(), cmd.OutOrStdout(), roots, repo); err != nil {
+				return fmt.Errorf("credential stored; runtime refresh failed: %w", err)
+			}
 			return nil
 		},
 	}
