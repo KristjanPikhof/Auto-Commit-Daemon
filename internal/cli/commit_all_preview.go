@@ -105,4 +105,5 @@ func renderCommitAllScope(out io.Writer, scope commitAllScope) {
 		fmt.Fprintf(out, "  %q\n", path)
 	}
 	fmt.Fprintln(out, "Staging: included staged content will be consumed after checkpoint protection. Later edits stay outside this target.")
+	fmt.Fprintln(out, "If a previous request stopped because staging changed, its protected work will be saved separately and regrouped with this request.")
 }

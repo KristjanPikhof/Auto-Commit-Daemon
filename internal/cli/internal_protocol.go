@@ -919,6 +919,9 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 				return nil, protocolFailure("publication_status_failed", branchErr, true)
 			}
 			generation, anchorErr := daemon.LoadBranchGeneration(ctx, runtime.db)
+			if anchorErr == nil && params.ConsumeStaged {
+				anchorErr = recoverCommitAllStagingReview(ctx, runtime, branchRef, generation)
+			}
 			if anchorErr == nil {
 				activeDrain, activeErr := daemon.ActivePublicationDrainForPair(
 					ctx, runtime.db, branchRef, generation)
