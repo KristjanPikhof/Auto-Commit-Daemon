@@ -116,6 +116,14 @@ With --watch and no --since, events prints only decisions appended after watch s
 }
 
 func runEvents(ctx context.Context, out io.Writer, repo, path string, since int64, limit int, watch bool, interval time.Duration, jsonOut bool) error {
+	if !watch {
+		report, err := collectEvents(ctx, repo, path, since, limit)
+		if err != nil {
+			return err
+		}
+		return renderEventsReport(out, report, jsonOut)
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -308,36 +316,93 @@ func followEvents(ctx context.Context, out io.Writer, db *sql.DB, repo, path str
 	}
 }
 
-func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, rows []state.DecisionRecord, cursor int64, jsonOut bool, includeEnvelope bool, message string) error {
+func collectEvents(ctx context.Context, repo, path string, since int64, limit int) (eventsReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if since < 0 {
+		return eventsReport{}, fmt.Errorf("acd events: --since must be non-negative")
+	}
+	if limit <= 0 {
+		return eventsReport{}, fmt.Errorf("acd events: --limit must be positive")
+	}
+	rec, err := eventsRepoRecord(repo)
+	if err != nil {
+		return eventsReport{}, err
+	}
+	db, err := openStateDBReadOnly(ctx, rec.StateDB)
+	if err != nil {
+		return eventsReport{}, fmt.Errorf("acd events: open state.db read-only for repo %s: %w", rec.Path, err)
+	}
+	defer db.Close()
+	hasLedger, err := sqliteTableExists(ctx, db, "decision_records")
+	if err != nil {
+		return eventsReport{}, fmt.Errorf("acd events: decision table check: %w", err)
+	}
+	if !hasLedger {
+		return buildEventsReport(ctx, db, rec.Path, nil, since, missingDecisionLedgerMessage)
+	}
+	rows, err := loadDecisionEvents(ctx, db, path, since, limit)
+	if err != nil {
+		return eventsReport{}, err
+	}
+	cursor := maxDecisionCursor(rows, since)
+	if since == 0 && cursor == 0 {
+		cursor, err = latestDecisionIDSQL(ctx, db)
+		if err != nil {
+			return eventsReport{}, fmt.Errorf("acd events: latest cursor: %w", err)
+		}
+	}
+	return buildEventsReport(ctx, db, rec.Path, rows, cursor, "")
+}
+
+func buildEventEntries(ctx context.Context, db *sql.DB, rows []state.DecisionRecord) ([]eventEntry, error) {
 	entries := make([]eventEntry, 0, len(rows))
 	for _, row := range rows {
 		entries = append(entries, decisionEntry(row))
 	}
 	if db != nil {
 		if err := enrichEventEntries(ctx, db, entries); err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
+}
+
+func buildEventsReport(ctx context.Context, db *sql.DB, repo string, rows []state.DecisionRecord, cursor int64, message string) (eventsReport, error) {
+	entries, err := buildEventEntries(ctx, db, rows)
+	if err != nil {
+		return eventsReport{}, err
+	}
+	intentV2, err := loadIntentV2Report(ctx, db)
+	if err != nil {
+		return eventsReport{}, fmt.Errorf("acd events: Intent v2 summary: %w", err)
+	}
+	readiness, err := loadConfigReadinessReport(ctx, db, time.Now())
+	if err != nil {
+		return eventsReport{}, fmt.Errorf("acd events: configuration readiness: %w", err)
+	}
+	replay, err := loadReplayObservabilityReport(ctx, db)
+	if err != nil {
+		return eventsReport{}, fmt.Errorf("acd events: replay observability: %w", err)
+	}
+	return eventsReport{Repo: repo, Cursor: cursor, Events: entries, Message: message, Configuration: readiness, Replay: replay, IntentV2: intentV2}, nil
+}
+
+func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, rows []state.DecisionRecord, cursor int64, jsonOut, includeEnvelope bool, message string) error {
+	if includeEnvelope {
+		report, err := buildEventsReport(ctx, db, repo, rows, cursor, message)
+		if err != nil {
 			return err
 		}
+		return renderEventsReport(out, report, jsonOut)
+	}
+	entries, err := buildEventEntries(ctx, db, rows)
+	if err != nil {
+		return err
 	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
-		if includeEnvelope {
-			intentV2, err := loadIntentV2Report(ctx, db)
-			if err != nil {
-				return fmt.Errorf("acd events: Intent v2 summary: %w", err)
-			}
-			readiness, err := loadConfigReadinessReport(ctx, db, time.Now())
-			if err != nil {
-				return fmt.Errorf("acd events: configuration readiness: %w", err)
-			}
-			replay, err := loadReplayObservabilityReport(ctx, db)
-			if err != nil {
-				return fmt.Errorf("acd events: replay observability: %w", err)
-			}
-			enc.SetIndent("", "  ")
-			return enc.Encode(eventsReport{Repo: repo, Cursor: cursor,
-				Events: entries, Message: message, Configuration: readiness,
-				Replay: replay, IntentV2: intentV2})
-		}
 		for _, entry := range entries {
 			if err := enc.Encode(entry); err != nil {
 				return fmt.Errorf("acd events: write json event: %w", err)
@@ -345,42 +410,34 @@ func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, r
 		}
 		return nil
 	}
-	if includeEnvelope {
-		fmt.Fprintf(out, "Repo: %s\n", repo)
-		fmt.Fprintf(out, "Cursor: %d\n\n", cursor)
-		if readiness, err := loadConfigReadinessReport(
-			ctx, db, time.Now(),
-		); err != nil {
-			return fmt.Errorf(
-				"acd events: configuration readiness: %w", err,
-			)
-		} else {
-			renderConfigReadinessHuman(out, readiness)
-			if readiness.Available {
-				fmt.Fprintln(out)
-			}
-		}
-		if replay, err := loadReplayObservabilityReport(ctx, db); err != nil {
-			return fmt.Errorf("acd events: replay observability: %w", err)
-		} else {
-			renderReplayObservabilityHuman(out, replay)
-			fmt.Fprintln(out)
-		}
-		if intentV2, err := loadIntentV2Report(ctx, db); err != nil {
-			return fmt.Errorf("acd events: Intent v2 summary: %w", err)
-		} else {
-			renderIntentV2Human(out, intentV2)
-			fmt.Fprintln(out)
-		}
-		if len(entries) == 0 {
-			if message == "" {
-				message = "No decisions recorded yet."
-			}
-			_, err := fmt.Fprintln(out, message)
-			return err
-		}
-	}
 	return renderEventsTable(out, entries)
+}
+
+func renderEventsReport(out io.Writer, report eventsReport, jsonOut bool) error {
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(report)
+	}
+	fmt.Fprintf(out, "Repo: %s\n", report.Repo)
+	fmt.Fprintf(out, "Cursor: %d\n\n", report.Cursor)
+	renderConfigReadinessHuman(out, report.Configuration)
+	if report.Configuration.Available {
+		fmt.Fprintln(out)
+	}
+	renderReplayObservabilityHuman(out, report.Replay)
+	fmt.Fprintln(out)
+	renderIntentV2Human(out, report.IntentV2)
+	fmt.Fprintln(out)
+	if len(report.Events) == 0 {
+		message := report.Message
+		if message == "" {
+			message = "No decisions recorded yet."
+		}
+		_, err := fmt.Fprintln(out, message)
+		return err
+	}
+	return renderEventsTable(out, report.Events)
 }
 
 func renderEventsTable(out io.Writer, entries []eventEntry) error {
