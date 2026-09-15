@@ -424,9 +424,10 @@ func TestBuildProvider_OpenAICompatNoKeyIgnoresInvalidCA(t *testing.T) {
 // non-nil closer, and Close drains cleanly even on a missing binary.
 func TestBuildProvider_Subprocess(t *testing.T) {
 	cfg := ProviderConfig{
-		Mode:    "subprocess:foo",
-		Timeout: 3 * time.Second,
-		Logger:  quietLogger(),
+		Mode:               "subprocess:foo",
+		Timeout:            3 * time.Second,
+		Logger:             quietLogger(),
+		subprocessLookPath: func(string) (string, error) { return "", errors.New("missing") },
 	}
 	p, closer, err := BuildProvider(cfg)
 	if err != nil {
@@ -441,25 +442,12 @@ func TestBuildProvider_Subprocess(t *testing.T) {
 		t.Fatalf("Name=%q want %q", p.Name(), want)
 	}
 
-	// Subprocess binary likely doesn't exist on the test host; the chain
-	// must still satisfy Generate via the deterministic fallback.
-	r, err := p.Generate(context.Background(), CommitContext{
-		Path: "hello.txt", Op: "create",
-	})
-	if err != nil {
-		t.Fatalf("Generate: %v", err)
-	}
-	if r.Subject == "" {
-		t.Fatalf("empty subject; chain did not fall through to deterministic")
-	}
-	if !strings.Contains(r.Subject, "hello.txt") {
-		t.Fatalf("subject=%q does not mention hello.txt", r.Subject)
+	r, err := p.Generate(context.Background(), CommitContext{Path: "hello.txt", Op: "create"})
+	if err == nil || r.Subject != "" || r.Source == "deterministic" {
+		t.Fatalf("missing configured subprocess must wait: %+v err=%v", r, err)
 	}
 }
 
-// TestBuildProvider_SubprocessEmptyName: a colon with no plugin name is
-// a misconfiguration; degrade to deterministic with a warning rather
-// than spawning anything.
 func TestBuildProvider_SubprocessEmptyName(t *testing.T) {
 	h := &captureHandler{}
 	cfg := ProviderConfig{
