@@ -62,7 +62,10 @@ func inspectCommitAllScope(ctx context.Context, repo, dbPath string) (commitAllS
 		return result, err
 	}
 	defer db.Close()
-	rows, err := db.QueryContext(ctx, "SELECT seq, path FROM capture_events WHERE state NOT IN ('published','recovered') ORDER BY seq")
+	rows, err := db.QueryContext(ctx, `
+SELECT e.seq,e.path,e.old_path,o.ord,o.path,o.old_path
+FROM capture_events e LEFT JOIN capture_ops o ON o.event_seq=e.seq
+WHERE e.state NOT IN ('published','recovered') ORDER BY e.seq,o.ord`)
 	if err != nil {
 		return result, err
 	}
@@ -72,17 +75,25 @@ func inspectCommitAllScope(ctx context.Context, repo, dbPath string) (commitAllS
 	_, _ = hash.Write(staged)
 	_, _ = hash.Write([]byte(result.IndexDigest))
 	seen := map[string]bool{}
+	seenSeqs := map[int64]bool{}
 	for rows.Next() {
 		var seq int64
 		var path string
-		if err := rows.Scan(&seq, &path); err != nil {
+		var oldPath, opPath, opOldPath sql.NullString
+		var ord sql.NullInt64
+		if err := rows.Scan(&seq, &path, &oldPath, &ord, &opPath, &opOldPath); err != nil {
 			return result, err
 		}
-		_ = json.NewEncoder(hash).Encode([]any{seq, path})
-		result.queuedSeqs = append(result.queuedSeqs, seq)
-		if !seen[path] {
-			result.QueuedPaths = append(result.QueuedPaths, path)
-			seen[path] = true
+		_ = json.NewEncoder(hash).Encode([]any{seq, path, oldPath, ord, opPath, opOldPath})
+		if !seenSeqs[seq] {
+			result.queuedSeqs = append(result.queuedSeqs, seq)
+			seenSeqs[seq] = true
+		}
+		for _, endpoint := range []string{path, oldPath.String, opPath.String, opOldPath.String} {
+			if endpoint != "" && !seen[endpoint] {
+				result.QueuedPaths = append(result.QueuedPaths, endpoint)
+				seen[endpoint] = true
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
