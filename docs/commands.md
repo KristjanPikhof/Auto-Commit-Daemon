@@ -149,14 +149,21 @@ acd commit-all --dry-run
 acd commit-all --yes
 ~~~
 
-`list` is the live overview for repository health and commit progress. It always
-shows repositories that need action or are working, waiting, or stalled. The
-default view fills the remaining five-row budget with repositories where ACD
-most recently handled changes. Paused repositories appear only when space
-remains after recent work.
-Use `--all` for every enabled repository and `--verbose` for worker, tool,
-blocker, last commit, and recovery details. A terminal refreshes the same
-screen until Ctrl-C; `--once` prints one snapshot.
+`list` shows enabled repositories with activity in the last hour, plus any
+repository with unfinished work. Activity includes agent hooks, captured edits,
+publication progress, commit-all requests, and applied history rewrites.
+Worker heartbeats and background maintenance do not count as activity.
+
+A repository with pending, blocked, stalled, or incompletely protected work
+stays visible until that work is resolved. An otherwise idle repository drops
+out after one hour, including repositories with maintenance warnings or a
+manual pause. There is no fixed row limit or filler from older repositories.
+
+The first snapshot sorts by recent activity. A terminal refreshes rows in place
+until Ctrl-C and appends newly active repositories. Use `--once` for one snapshot,
+`--all` for every enabled repository, and `--verbose` for worker, tool, blocker,
+last commit, maintenance error, and recovery details. `list` works globally
+from any directory. An empty compact view says `No active repositories`.
 
 `SAFE` confirms that the latest checkpoint is complete. `MODE` shows the
 configured commit strategy. `QUEUE` counts all pending work. `TARGET` appears
@@ -180,8 +187,13 @@ that frame.
 
 JSON remains exhaustive regardless of the compact view. It keeps the existing
 fields and adds `worker_state`, `operational_state`, `blocked_events`,
-`last_activity_at`, and `publication_drain`. A needs-action result is printed
-before `acd list` returns exit code 3.
+`last_activity_at`, `publication_drain`, `unfinished_work`, and
+`checkpoint_maintenance`. Maintenance details distinguish a failed check from
+measured storage use and include the next scheduled attempt.
+A needs-action result is printed
+before exit code 3 is returned. Human compact snapshots use only visible
+repositories to decide that exit status; `--all` and JSON use the exhaustive
+result. Hidden idle warnings do not fail a compact snapshot.
 
 Disabled, missing, and stale registration records remain available under hidden
 `acd repo list`. That command is the static maintenance inventory and does not

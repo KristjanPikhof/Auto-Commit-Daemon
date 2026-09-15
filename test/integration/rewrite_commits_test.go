@@ -125,6 +125,8 @@ func TestRewriteCommitsApplyGroupedPlanCLI(t *testing.T) {
 	if got := strings.TrimSpace(runGitOK(t, repo, "show", "-s", "--format=%T", "HEAD")); got != originalTree {
 		t.Fatalf("rewritten tree=%s want %s", got, originalTree)
 	}
+	assertRecentDashboardActivity(t, repo)
+
 }
 
 func TestRewriteCommitsApplyPlanCLIRefusesMovedHead(t *testing.T) {

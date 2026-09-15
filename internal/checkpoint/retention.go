@@ -54,7 +54,7 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 		now = time.Now()
 	}
 	if err := s.RecoverRetention(ctx, repoRoot); err != nil {
-		return summary, err
+		return summary, retentionSafetyError{err}
 	}
 	checkpoints, err := state.RetentionCheckpoints(ctx, s.DB, worktreeID)
 	if err != nil {
@@ -102,15 +102,15 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 		operationID, err := state.PrepareCheckpointPrune(ctx, s.DB, item,
 			"sha256:"+hex.EncodeToString(digest[:]))
 		if err != nil {
-			return summary, err
+			return summary, retentionSafetyError{err}
 		}
 		if err := gitpkg.DeletePrivateRefDurable(ctx, repoRoot, gitpkg.CheckpointRefPrefix, item.Ref, item.CommitOID); err != nil {
 			_ = state.AdvanceOperation(context.Background(), s.DB, operationID,
 				state.OperationNeedsAttention, state.OperationNeedsAttention, "checkpoint retention ref changed")
-			return summary, err
+			return summary, retentionSafetyError{err}
 		}
 		if err := state.CompleteCheckpointPrune(ctx, s.DB, operationID, item.ID, item.Ref, item.CommitOID); err != nil {
-			return summary, err
+			return summary, retentionSafetyError{err}
 		}
 		summary.Pruned++
 	}

@@ -805,15 +805,12 @@ func Run(ctx context.Context, opts Options) error {
 	if err := checkpointStore.RecoverPrepared(ctx, opts.RepoPath); err != nil {
 		return fmt.Errorf("daemon: recover protection checkpoints: %w", err)
 	}
-	if err := checkpointStore.RecoverRetention(ctx, opts.RepoPath); err != nil {
-		return fmt.Errorf("daemon: recover checkpoint retention: %w", err)
-	}
 	if _, err := reconcileResolvedPublicationDrains(
 		ctx, opts.DB, logger, "worker_startup", now(),
 	); err != nil {
 		return fmt.Errorf("daemon: reconcile resolved publication drains: %w", err)
 	}
-	// Do not advertise running until every crash journal has been recovered;
+	// Do not advertise running until protection/publication journals are recovered;
 	// setup and status use this stamp as the worker readiness barrier.
 	heartbeatNow("running", "daemon started")
 	var shutdownCh <-chan struct{}
@@ -1493,18 +1490,25 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 
+	maintenance, maintenanceErr := checkpointStore.LoadMaintenance(ctx)
+	if maintenanceErr != nil {
+		logger.Warn("load checkpoint maintenance", "err", maintenanceErr.Error())
+	}
+	if maintenance.State == "" {
+		maintenance.NextAttemptTS = bootTime.Add(DefaultCheckpointRetentionInterval).Unix()
+	}
+
 	// Loop state.
 	var (
-		consecutiveErrors       int
-		emptyCount              int
-		currentDelay            = opts.Scheduler.Reset()
-		lastSweep               = time.Time{}
-		lastPrune               = time.Time{}
-		lastCheckpointRetention = bootTime
-		lastRollup              = time.Time{}
-		lastRollupUTCDay        = ""
-		stopped                 bool
-		replayErrorLogs         replayErrorLogLimiter
+		consecutiveErrors int
+		emptyCount        int
+		currentDelay      = opts.Scheduler.Reset()
+		lastSweep         = time.Time{}
+		lastPrune         = time.Time{}
+		lastRollup        = time.Time{}
+		lastRollupUTCDay  = ""
+		stopped           bool
+		replayErrorLogs   replayErrorLogLimiter
 
 		// operation_in_progress staleness tracking. opMarkerSetAt is the
 		// monotonic-ish wall-clock observation of when the current marker
@@ -3277,25 +3281,26 @@ func Run(ctx context.Context, opts Options) error {
 			}
 			lastPrune = nowTS
 		}
-		if nowTS.Sub(lastCheckpointRetention) >= DefaultCheckpointRetentionInterval {
-			retention, retentionErr := checkpointStore.ApplyRetention(ctx, opts.RepoPath,
-				checkpointpkg.WorktreeID(opts.RepoPath), nowTS)
-			if retentionErr != nil {
-				logger.Warn("prune checkpoints", "err", retentionErr.Error())
-				_ = state.MetaSet(context.Background(), opts.DB, MetaKeyProtectionRetentionOverBudget, "needs_action")
+		if nowTS.Unix() >= maintenance.NextAttemptTS {
+			next, err := checkpointStore.Maintain(ctx, opts.RepoPath,
+				checkpointpkg.WorktreeID(opts.RepoPath), nowTS, maintenance)
+			if err != nil {
+				if next.Error != maintenance.Error {
+					logger.Warn("save checkpoint maintenance", "err", err.Error())
+				}
+				// Keep backoff in memory when the database cannot record it.
+				maintenance = next
 			} else {
-				value := "false"
-				if retention.OverBudget {
-					value = "true"
-					logger.Warn("checkpoint content exceeds soft budget",
-						"bytes", retention.ContentBytes, "protected_bytes", retention.ProtectedBytes)
+				if next.State != maintenance.State || next.Error != maintenance.Error {
+					if next.Summary() != "" {
+						logger.Warn("checkpoint maintenance", "state", next.State, "err", next.Error,
+							"bytes", next.ContentBytes, "protected_bytes", next.ProtectedBytes)
+					} else if maintenance.State != "" && maintenance.State != "healthy" {
+						logger.Info("checkpoint maintenance recovered")
+					}
 				}
-				_ = state.MetaSet(context.Background(), opts.DB, MetaKeyProtectionRetentionOverBudget, value)
-				if retention.Pruned > 0 {
-					logger.Info("pruned published checkpoints", "checkpoints", retention.Pruned)
-				}
+				maintenance = next
 			}
-			lastCheckpointRetention = nowTS
 		}
 
 		// 4k. Phase 3 daily rollup hook (§8.10). Throttled to
