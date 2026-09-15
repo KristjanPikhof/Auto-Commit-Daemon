@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -9,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"io"
 	"net/url"
 	"os"
@@ -102,20 +102,20 @@ type diagnoseReport struct {
 	// stamp last_run_ts to the wall-clock unix-second the recovery ran and
 	// last_count >= 1). The slice keeps `omitempty` so an empty list
 	// serializes as absent rather than `null`/`[]`.
-	DeadBranchPruneLastRunTS int64                  `json:"dead_branch_prune_last_run_ts"`
-	DeadBranchPruneLastCount int                    `json:"dead_branch_prune_last_count"`
-	DeadBranchPruneLastRefs  []string               `json:"dead_branch_prune_last_refs,omitempty"`
-	Remediation              []string               `json:"remediation"`
-	StateDBChecksumBefore    string                 `json:"state_db_checksum_before"`
-	StateDBChecksumAfter     string                 `json:"state_db_checksum_after"`
-	StateDBChecksumVerified  bool                   `json:"state_db_checksum_verified"`
-	Busy                     bool                   `json:"busy"`
-	OperationalState         string                 `json:"operational_state"`
-	WorktreeClean            bool                   `json:"worktree_clean"`
-	AllChangesCommittedInGit bool                   `json:"all_changes_committed_in_git"`
-	CheckpointPublishedByACD bool                   `json:"checkpoint_published_by_acd"`
-	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
-	PublicationDrain         publicationDrainReport `json:"publication_drain"`
+	DeadBranchPruneLastRunTS int64                        `json:"dead_branch_prune_last_run_ts"`
+	DeadBranchPruneLastCount int                          `json:"dead_branch_prune_last_count"`
+	DeadBranchPruneLastRefs  []string                     `json:"dead_branch_prune_last_refs,omitempty"`
+	Remediation              []string                     `json:"remediation"`
+	StateDBChecksumBefore    string                       `json:"state_db_checksum_before"`
+	StateDBChecksumAfter     string                       `json:"state_db_checksum_after"`
+	StateDBChecksumVerified  bool                         `json:"state_db_checksum_verified"`
+	Busy                     bool                         `json:"busy"`
+	OperationalState         string                       `json:"operational_state"`
+	WorktreeClean            bool                         `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                         `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
+	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
+	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
 }
 
 type replayConflictMeta struct {
@@ -262,7 +262,9 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	report.PublicationDrain = status.PublicationDrain
 	report.CheckpointMaintenance = status.CheckpointMaintenance
 	report.Remediation = diagnoseRemediation(report)
-	if details := maintenanceDetails(report.CheckpointMaintenance); details != "" { report.Remediation = append(report.Remediation, details+" "+report.CheckpointMaintenance.NextAction()) }
+	if details := maintenanceDetails(report.CheckpointMaintenance); details != "" {
+		report.Remediation = append(report.Remediation, details+" "+report.CheckpointMaintenance.NextAction())
+	}
 
 	after, err := fileSHA256(rec.StateDB)
 	if err != nil {

@@ -16,14 +16,14 @@ const MaintenanceMetaKey = "protection.maintenance"
 // MaintenanceStatus separates a failed measurement from measured storage use.
 // NextAttemptTS survives restarts; successful checks return to an hourly cadence.
 type MaintenanceStatus struct {
-	State         string `json:"state"`
-	Error         string `json:"error,omitempty"`
-	Failures      int    `json:"failures,omitempty"`
-	NextAttemptTS int64  `json:"next_attempt_ts,omitempty"`
-	LastSuccessTS int64  `json:"last_success_ts,omitempty"`
-	ContentBytes  int64  `json:"content_bytes"`
-	ProtectedBytes int64 `json:"protected_bytes"`
-	OverBudget    bool   `json:"over_budget"`
+	State          string `json:"state"`
+	Error          string `json:"error,omitempty"`
+	Failures       int    `json:"failures,omitempty"`
+	NextAttemptTS  int64  `json:"next_attempt_ts,omitempty"`
+	LastSuccessTS  int64  `json:"last_success_ts,omitempty"`
+	ContentBytes   int64  `json:"content_bytes"`
+	ProtectedBytes int64  `json:"protected_bytes"`
+	OverBudget     bool   `json:"over_budget"`
 }
 
 func DecodeMaintenance(raw, legacy string) MaintenanceStatus {

@@ -3,7 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
-"encoding/json"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -37,8 +37,8 @@ type productListRepoOverview struct {
 	report       statusReport
 	clients      int
 	lastActivity time.Time
-	unfinished bool
-	rewriting bool
+	unfinished   bool
+	rewriting    bool
 }
 
 func collectProductListOverview(ctx context.Context) (productListData, productState, error) {
@@ -188,14 +188,17 @@ func productListEntryFromOverview(
 		PendingEvents: control.PendingEvents, BlockedEvents: control.BlockedEvents,
 		CheckpointID: control.CheckpointID, WorkerState: worker.State,
 		OperationalState: operational, LastActivityAt: formatProductListActivity(overview.lastActivity),
-		PublicationDrain:    report.PublicationDrain,
+		PublicationDrain:      report.PublicationDrain,
 		CheckpointMaintenance: report.CheckpointMaintenance,
-		UnfinishedWork: overview.unfinished,
-		PublicationProgress: report.PublicationProgress, Summary: control.Summary,
+		UnfinishedWork:        overview.unfinished,
+		PublicationProgress:   report.PublicationProgress, Summary: control.Summary,
 		Clients: overview.clients, LastCommitOID: report.LastCommitOID,
 		lastActivity: overview.lastActivity,
 	}
-	if overview.rewriting { entry.OperationalState = "rewriting"; entry.Summary = "ACD is applying a history rewrite." }
+	if overview.rewriting {
+		entry.OperationalState = "rewriting"
+		entry.Summary = "ACD is applying a history rewrite."
+	}
 	if envelope.NextAction != nil {
 		entry.NextAction = productListTargetAction(*envelope.NextAction, record.Path)
 	}
@@ -229,8 +232,7 @@ func productListHasIndependentAttention(report statusReport) bool {
 
 func readProductListRepo(ctx context.Context, record central.RepoRecord, now time.Time) (productListRepoOverview, error) {
 	overview := productListRepoOverview{
-		report:       statusReport{Repo: record.Path, RepoHash: record.RepoHash, Daemon: "stopped", Clients: []statusClient{}},
-		
+		report: statusReport{Repo: record.Path, RepoHash: record.RepoHash, Daemon: "stopped", Clients: []statusClient{}},
 	}
 	if !fileExists(record.StateDB) {
 		return overview, errors.New("state.db missing")
@@ -426,7 +428,9 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	}
 	for _, key := range []string{state.ActivityMetaKey, daemon.MetaKeyBranchTokenChangedAt} {
 		value, _, err := metaLookup(ctx, conn, key)
-		if err != nil { return overview, err }
+		if err != nil {
+			return overview, err
+		}
 		ts, _ := strconv.ParseFloat(value, 64)
 		overview.lastActivity = laterProductListActivity(overview.lastActivity, ts)
 	}
@@ -467,7 +471,9 @@ func readProductListProtection(ctx context.Context, conn *sql.DB, report *status
 	completeValue, _, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionComplete)
 	var err error
 	report.CheckpointMaintenance, err = readCheckpointMaintenance(ctx, conn)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	report.CheckpointRetentionOverBudget = report.CheckpointMaintenance.State == "over_budget"
 
 	var prepared, needsAction int

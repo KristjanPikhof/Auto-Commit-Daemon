@@ -1,11 +1,11 @@
 package cli
 
 import (
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"io"
 	"os"
 	"path/filepath"
@@ -39,38 +39,38 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
-	OK                       bool                      `json:"ok"`
-	Command                  string                    `json:"command"`
-	Repo                     string                    `json:"repo"`
-	Health                   string                    `json:"health"`
-	Summary                  string                    `json:"summary"`
-	NextAction               string                    `json:"next_action"`
-	Registered               bool                      `json:"registered"`
-	Enabled                  bool                      `json:"enabled"`
-	Daemon                   string                    `json:"daemon"`
-	DaemonPID                int                       `json:"daemon_pid"`
-	PendingEvents            int                       `json:"pending_events"`
-	BlockedEvents            int                       `json:"blocked_events"`
-	Changed                  bool                      `json:"changed"`
-	Actions                  []string                  `json:"actions"`
-	StatePreserved           bool                      `json:"state_preserved"`
-	Protected                bool                      `json:"protected"`
-	Published                bool                      `json:"published"`
-	Busy                     bool                      `json:"busy"`
-	OperationalState         string                    `json:"operational_state"`
-	WorktreeClean            bool                      `json:"worktree_clean"`
-	AllChangesCommittedInGit bool                      `json:"all_changes_committed_in_git"`
-	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
-	CheckpointID             string                    `json:"checkpoint_id,omitempty"`
-	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
-	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
-	PublicationProgress      publicationProgressReport `json:"publication_progress"`
-	RecoveryRequired         bool                      `json:"-"`
-	CLIVersion               string                    `json:"cli_version,omitempty"`
-	SupervisorVersion        string                    `json:"supervisor_version,omitempty"`
-	SupervisorWorkerState    string                    `json:"supervisor_worker_state,omitempty"`
-	SupervisorWorkerRestarts int                       `json:"supervisor_worker_restarts,omitempty"`
-	SupervisorWorkerError    string                    `json:"supervisor_worker_error,omitempty"`
+	OK                       bool                         `json:"ok"`
+	Command                  string                       `json:"command"`
+	Repo                     string                       `json:"repo"`
+	Health                   string                       `json:"health"`
+	Summary                  string                       `json:"summary"`
+	NextAction               string                       `json:"next_action"`
+	Registered               bool                         `json:"registered"`
+	Enabled                  bool                         `json:"enabled"`
+	Daemon                   string                       `json:"daemon"`
+	DaemonPID                int                          `json:"daemon_pid"`
+	PendingEvents            int                          `json:"pending_events"`
+	BlockedEvents            int                          `json:"blocked_events"`
+	Changed                  bool                         `json:"changed"`
+	Actions                  []string                     `json:"actions"`
+	StatePreserved           bool                         `json:"state_preserved"`
+	Protected                bool                         `json:"protected"`
+	Published                bool                         `json:"published"`
+	Busy                     bool                         `json:"busy"`
+	OperationalState         string                       `json:"operational_state"`
+	WorktreeClean            bool                         `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                         `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
+	CheckpointID             string                       `json:"checkpoint_id,omitempty"`
+	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
+	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
+	PublicationProgress      publicationProgressReport    `json:"publication_progress"`
+	RecoveryRequired         bool                         `json:"-"`
+	CLIVersion               string                       `json:"cli_version,omitempty"`
+	SupervisorVersion        string                       `json:"supervisor_version,omitempty"`
+	SupervisorWorkerState    string                       `json:"supervisor_worker_state,omitempty"`
+	SupervisorWorkerRestarts int                          `json:"supervisor_worker_restarts,omitempty"`
+	SupervisorWorkerError    string                       `json:"supervisor_worker_error,omitempty"`
 }
 
 type controlRepoLookup struct {

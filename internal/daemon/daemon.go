@@ -1503,15 +1503,15 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Loop state.
 	var (
-		consecutiveErrors       int
-		emptyCount              int
-		currentDelay            = opts.Scheduler.Reset()
-		lastSweep               = time.Time{}
-		lastPrune               = time.Time{}
-		lastRollup              = time.Time{}
-		lastRollupUTCDay        = ""
-		stopped                 bool
-		replayErrorLogs         replayErrorLogLimiter
+		consecutiveErrors int
+		emptyCount        int
+		currentDelay      = opts.Scheduler.Reset()
+		lastSweep         = time.Time{}
+		lastPrune         = time.Time{}
+		lastRollup        = time.Time{}
+		lastRollupUTCDay  = ""
+		stopped           bool
+		replayErrorLogs   replayErrorLogLimiter
 
 		// operation_in_progress staleness tracking. opMarkerSetAt is the
 		// monotonic-ish wall-clock observation of when the current marker

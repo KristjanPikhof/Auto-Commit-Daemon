@@ -1,9 +1,9 @@
 package cli
 
 import (
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"encoding/json"
 	"fmt"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"io"
 	"strings"
 	"time"
@@ -45,32 +45,32 @@ type productEnvelope struct {
 }
 
 type productStatusData struct {
-	Repo                     string                    `json:"repo"`
-	Command                  string                    `json:"command"`
-	Registered               bool                      `json:"registered"`
-	Enabled                  bool                      `json:"enabled"`
-	Worker                   string                    `json:"worker"`
-	Protected                bool                      `json:"protected"`
-	Published                bool                      `json:"published"`
-	Busy                     bool                      `json:"busy"`
-	OperationalState         string                    `json:"operational_state"`
-	WorktreeClean            bool                      `json:"worktree_clean"`
-	AllChangesCommittedInGit bool                      `json:"all_changes_committed_in_git"`
-	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
-	ActionRequired           bool                      `json:"action_required"`
-	CheckpointID             string                    `json:"checkpoint_id,omitempty"`
-	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
-	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
-	PublicationProgress      publicationProgressReport `json:"publication_progress"`
-	PendingEvents            int                       `json:"pending_events"`
-	BlockedEvents            int                       `json:"blocked_events"`
-	Summary                  string                    `json:"summary"`
-	StatePreserved           bool                      `json:"state_preserved"`
-	CLIVersion               string                    `json:"cli_version,omitempty"`
-	SupervisorVersion        string                    `json:"supervisor_version,omitempty"`
-	SupervisorWorkerState    string                    `json:"supervisor_worker_state,omitempty"`
-	SupervisorWorkerRestarts int                       `json:"supervisor_worker_restarts,omitempty"`
-	SupervisorWorkerError    string                    `json:"supervisor_worker_error,omitempty"`
+	Repo                     string                       `json:"repo"`
+	Command                  string                       `json:"command"`
+	Registered               bool                         `json:"registered"`
+	Enabled                  bool                         `json:"enabled"`
+	Worker                   string                       `json:"worker"`
+	Protected                bool                         `json:"protected"`
+	Published                bool                         `json:"published"`
+	Busy                     bool                         `json:"busy"`
+	OperationalState         string                       `json:"operational_state"`
+	WorktreeClean            bool                         `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                         `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
+	ActionRequired           bool                         `json:"action_required"`
+	CheckpointID             string                       `json:"checkpoint_id,omitempty"`
+	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
+	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
+	PublicationProgress      publicationProgressReport    `json:"publication_progress"`
+	PendingEvents            int                          `json:"pending_events"`
+	BlockedEvents            int                          `json:"blocked_events"`
+	Summary                  string                       `json:"summary"`
+	StatePreserved           bool                         `json:"state_preserved"`
+	CLIVersion               string                       `json:"cli_version,omitempty"`
+	SupervisorVersion        string                       `json:"supervisor_version,omitempty"`
+	SupervisorWorkerState    string                       `json:"supervisor_worker_state,omitempty"`
+	SupervisorWorkerRestarts int                          `json:"supervisor_worker_restarts,omitempty"`
+	SupervisorWorkerError    string                       `json:"supervisor_worker_error,omitempty"`
 }
 
 func envelopeFromControl(result controlResult) productEnvelope {
@@ -122,7 +122,7 @@ func envelopeFromControl(result controlResult) productEnvelope {
 			CheckpointID:             result.CheckpointID,
 			PublicationDrain:         result.PublicationDrain,
 			PublicationProgress:      result.PublicationProgress,
-			CheckpointMaintenance: result.CheckpointMaintenance,
+			CheckpointMaintenance:    result.CheckpointMaintenance,
 			PendingEvents:            result.PendingEvents,
 			BlockedEvents:            result.BlockedEvents,
 			Summary:                  result.Summary,

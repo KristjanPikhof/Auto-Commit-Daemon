@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"archive/zip"
 	"bufio"
 	"bytes"
@@ -10,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"io"
 	"os"
 	"os/exec"
@@ -43,51 +43,51 @@ func withDoctorTarget(ctx context.Context, repo string) context.Context {
 
 // doctorRepoReport is the per-repo block inside the doctor report.
 type doctorRepoReport struct {
-	Path                     string                    `json:"path"`
-	RepoHash                 string                    `json:"repo_hash"`
-	StateDB                  string                    `json:"state_db"`
-	StateDBReadable          bool                      `json:"state_db_readable"`
-	DaemonPID                int                       `json:"daemon_pid"`
-	DaemonAlive              bool                      `json:"daemon_alive"`
-	DaemonProcessCount       int                       `json:"daemon_process_count,omitempty"`
-	DaemonProcessPIDs        []int                     `json:"daemon_process_pids,omitempty"`
-	DaemonMode               string                    `json:"daemon_mode"`
-	HeartbeatTS              int64                     `json:"heartbeat_ts,omitempty"`
-	HeartbeatAgeS            int64                     `json:"heartbeat_age_seconds,omitempty"`
-	HeartbeatStale           bool                      `json:"heartbeat_stale"`
-	Clients                  int                       `json:"client_count"`
-	Harnesses                []string                  `json:"harnesses,omitempty"`
-	LogPath                  string                    `json:"log_path"`
-	LogLines                 []string                  `json:"log_tail,omitempty"`
-	FsnotifyMode             string                    `json:"fsnotify_mode,omitempty"`
-	FsnotifyWatches          int                       `json:"fsnotify_watches,omitempty"`
-	FsnotifyDropped          int                       `json:"fsnotify_dropped,omitempty"`
-	FsnotifyFallbackReason   string                    `json:"fsnotify_fallback_reason,omitempty"`
-	LastCaptureError         string                    `json:"last_capture_error,omitempty"`
-	PendingEvents            int                       `json:"pending_events"`
-	BlockedConflicts         int                       `json:"blocked_conflicts"`
-	FailedEvents             int                       `json:"failed_events"`
-	FailedBlockingPending    int                       `json:"failed_blocking_pending"`
-	IntentStrategy           intentStrategyReport      `json:"intent_strategy"`
-	Configuration            configReadinessReport     `json:"configuration"`
-	Replay                   replayObservabilityReport `json:"replay"`
-	IntentV2                 intentV2Report            `json:"intent_v2"`
-	SelfPublication          selfPublicationReport     `json:"self_publication"`
-	LastReplayConflictTS     int64                     `json:"last_replay_conflict_ts,omitempty"`
-	LastReplayConflictPath   string                    `json:"last_replay_conflict_path,omitempty"`
-	LastReplayConflictErr    string                    `json:"last_replay_conflict_error,omitempty"`
-	LastReplayFailureTS      int64                     `json:"last_replay_failure_ts,omitempty"`
-	LastReplayFailurePath    string                    `json:"last_replay_failure_path,omitempty"`
-	LastReplayFailureErr     string                    `json:"last_replay_failure_error,omitempty"`
-	Notes                    []string                  `json:"notes,omitempty"`
-	FlushSessionID           string                    `json:"-"`
-	Busy                     bool                      `json:"busy"`
-	OperationalState         string                    `json:"operational_state"`
-	WorktreeClean            bool                      `json:"worktree_clean"`
-	AllChangesCommittedInGit bool                      `json:"all_changes_committed_in_git"`
-	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
-	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
-	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
+	Path                     string                       `json:"path"`
+	RepoHash                 string                       `json:"repo_hash"`
+	StateDB                  string                       `json:"state_db"`
+	StateDBReadable          bool                         `json:"state_db_readable"`
+	DaemonPID                int                          `json:"daemon_pid"`
+	DaemonAlive              bool                         `json:"daemon_alive"`
+	DaemonProcessCount       int                          `json:"daemon_process_count,omitempty"`
+	DaemonProcessPIDs        []int                        `json:"daemon_process_pids,omitempty"`
+	DaemonMode               string                       `json:"daemon_mode"`
+	HeartbeatTS              int64                        `json:"heartbeat_ts,omitempty"`
+	HeartbeatAgeS            int64                        `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale           bool                         `json:"heartbeat_stale"`
+	Clients                  int                          `json:"client_count"`
+	Harnesses                []string                     `json:"harnesses,omitempty"`
+	LogPath                  string                       `json:"log_path"`
+	LogLines                 []string                     `json:"log_tail,omitempty"`
+	FsnotifyMode             string                       `json:"fsnotify_mode,omitempty"`
+	FsnotifyWatches          int                          `json:"fsnotify_watches,omitempty"`
+	FsnotifyDropped          int                          `json:"fsnotify_dropped,omitempty"`
+	FsnotifyFallbackReason   string                       `json:"fsnotify_fallback_reason,omitempty"`
+	LastCaptureError         string                       `json:"last_capture_error,omitempty"`
+	PendingEvents            int                          `json:"pending_events"`
+	BlockedConflicts         int                          `json:"blocked_conflicts"`
+	FailedEvents             int                          `json:"failed_events"`
+	FailedBlockingPending    int                          `json:"failed_blocking_pending"`
+	IntentStrategy           intentStrategyReport         `json:"intent_strategy"`
+	Configuration            configReadinessReport        `json:"configuration"`
+	Replay                   replayObservabilityReport    `json:"replay"`
+	IntentV2                 intentV2Report               `json:"intent_v2"`
+	SelfPublication          selfPublicationReport        `json:"self_publication"`
+	LastReplayConflictTS     int64                        `json:"last_replay_conflict_ts,omitempty"`
+	LastReplayConflictPath   string                       `json:"last_replay_conflict_path,omitempty"`
+	LastReplayConflictErr    string                       `json:"last_replay_conflict_error,omitempty"`
+	LastReplayFailureTS      int64                        `json:"last_replay_failure_ts,omitempty"`
+	LastReplayFailurePath    string                       `json:"last_replay_failure_path,omitempty"`
+	LastReplayFailureErr     string                       `json:"last_replay_failure_error,omitempty"`
+	Notes                    []string                     `json:"notes,omitempty"`
+	FlushSessionID           string                       `json:"-"`
+	Busy                     bool                         `json:"busy"`
+	OperationalState         string                       `json:"operational_state"`
+	WorktreeClean            bool                         `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                         `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
+	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
+	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
 }
 
 type doctorHarnessReport struct {
@@ -298,7 +298,9 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 				rr.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 				rr.PublicationDrain = status.PublicationDrain
 				rr.CheckpointMaintenance = status.CheckpointMaintenance
-				if details := maintenanceDetails(status.CheckpointMaintenance); details != "" { rr.Notes = append(rr.Notes, details+" "+status.CheckpointMaintenance.NextAction()) }
+				if details := maintenanceDetails(status.CheckpointMaintenance); details != "" {
+					rr.Notes = append(rr.Notes, details+" "+status.CheckpointMaintenance.NextAction())
+				}
 			} else {
 				rr.Notes = append(rr.Notes, "status truth failed: "+statusErr.Error())
 			}

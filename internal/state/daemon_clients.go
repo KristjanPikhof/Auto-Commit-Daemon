@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
-"time"
+	"time"
 )
 
 // Client is one row of the daemon_clients refcount table (§6.1).
@@ -94,7 +94,9 @@ func TouchClient(ctx context.Context, d *DB, sessionID string, ts float64) (bool
 	if err != nil {
 		return false, fmt.Errorf("state: touch client rows: %w", err)
 	}
-	if n > 0 { RecordActivity(ctx, d, time.Unix(int64(ts), 0)) }
+	if n > 0 {
+		RecordActivity(ctx, d, time.Unix(int64(ts), 0))
+	}
 	return n > 0, nil
 }
 
