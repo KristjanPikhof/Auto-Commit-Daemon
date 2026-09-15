@@ -3,19 +3,17 @@ package cli
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // TestCommitAll_FlagsRegistered ensures the command surfaces all required
-// flags. Full behavior coverage lives in the t-unit task.
+// flags. Publication behavior is covered at the worker and integration boundaries.
 func TestCommitAll_FlagsRegistered(t *testing.T) {
 	cmd := newProductCommitAllCmd()
 	for _, name := range []string{"yes", "dry-run"} {
@@ -184,98 +182,4 @@ func TestResolveEffectiveCommitStrategy_PriorityChain(t *testing.T) {
 			t.Fatalf("nil conn should still honour env, got %q", got)
 		}
 	})
-}
-
-// errOnReadReader is an io.Reader whose Read always returns an error, used
-// to detect any accidental stdin consumption in commit-all paths that are
-// supposed to skip the prompt.
-type errOnReadReader struct {
-	reads int
-}
-
-func (e *errOnReadReader) Read(p []byte) (int, error) {
-	e.reads++
-	return 0, errStdinUnexpected
-}
-
-// errStdinUnexpected is a sentinel returned by errOnReadReader.
-var errStdinUnexpected = errors.New("stdin must not be read on this path")
-
-type commitAllPromptHookReader struct {
-	hook   func() error
-	reader *strings.Reader
-	ran    bool
-}
-
-func (r *commitAllPromptHookReader) Read(p []byte) (int, error) {
-	if !r.ran {
-		r.ran = true
-		if err := r.hook(); err != nil {
-			return 0, err
-		}
-	}
-	return r.reader.Read(p)
-}
-
-func commitAllRecoveryRefs(t *testing.T, ctx context.Context, repo string) string {
-	t.Helper()
-	out, err := git.Run(ctx, git.RunOpts{Dir: repo},
-		"for-each-ref", "--format=%(refname):%(objectname)", "refs/acd/recovery/")
-	if err != nil {
-		t.Fatalf("list recovery refs: %v", err)
-	}
-	return string(out)
-}
-
-// fakePlannerProvider is an ai.Provider + IntentPlanner whose calls are
-// recorded so the dry-run-airgap test can assert PlanIntent is NEVER
-// invoked when the provider is network-bound.
-type fakePlannerProvider struct {
-	name        string
-	needsDiff   bool
-	planCalls   int
-	genCalls    int
-	planSubject string
-	planErr     error
-}
-
-func (p *fakePlannerProvider) Name() string    { return p.name }
-func (p *fakePlannerProvider) NeedsDiff() bool { return p.needsDiff }
-func (p *fakePlannerProvider) Generate(ctx context.Context, cc ai.CommitContext) (ai.Result, error) {
-	p.genCalls++
-	return ai.Result{Subject: "fake: " + cc.Path}, nil
-}
-func (p *fakePlannerProvider) PlanIntent(ctx context.Context, req ai.IntentPlanRequest) (ai.IntentPlan, error) {
-	p.planCalls++
-	if p.planErr != nil {
-		return ai.IntentPlan{}, p.planErr
-	}
-	seqs := make([]int64, 0, len(req.OfferedCaptures))
-	for _, c := range req.OfferedCaptures {
-		seqs = append(seqs, c.Seq)
-	}
-	return ai.IntentPlan{SelectedSeqs: seqs, Subject: p.planSubject}, nil
-}
-
-// fakeProviderForReplay implements ai.Provider with NeedsDiff=false so
-// commitAllReplayLoopWith builds a real msgFn but no diff egress.
-// Generate counts how many times it is called from the per-event
-// MessageFn — proving the provider closure is wired up rather than
-// hard-coded to DeterministicMessage.
-type fakeProviderForReplay struct {
-	name      string
-	genCalls  int
-	subject   string
-	needsDiff bool
-}
-
-func (p *fakeProviderForReplay) Name() string    { return p.name }
-func (p *fakeProviderForReplay) NeedsDiff() bool { return p.needsDiff }
-func (p *fakeProviderForReplay) Generate(ctx context.Context, cc ai.CommitContext) (ai.Result, error) {
-	p.genCalls++
-	subj := p.subject
-	if subj == "" {
-		subj = "fake: " + cc.Path
-	}
-	return ai.Result{Subject: subj}, nil
 }
