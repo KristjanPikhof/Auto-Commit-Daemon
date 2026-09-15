@@ -11,6 +11,9 @@
 
 ### Fixed
 
+- Setup now configures a Git identity in its scratch repository so the isolated
+  publication self-test can create commits without the user's global Git config.
+
 - Checkpoint maintenance failures report the actual error instead of claiming
   storage is over budget. Retries back off to fifteen minutes, survive restarts,
   and clear the failure after recovery. Interrupted pruning retains its ref
