@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Changed
+
+- First setup recommends AI semantic commits with Everyday checks. Local automatic
+  commits remain explicit and offline. Unattended first setup requires a provider
+  choice; upgrades and configuration editing preserve existing choices.
+- Default status separates current checkpoint coverage, branch commits, and recovery.
+  `--verbose` keeps operational details available. JSON adds publication outcomes
+  while retaining the deprecated publication booleans for compatibility.
+- Commit-all previews paths, queued work and staging consumption, and rechecks
+  interactive approval. Bare restore offers a terminal checkpoint picker.
+- Production integration tests run in four required shards on both Linux and
+  macOS. Measured test manifests retain every test, example, and fuzz seed.
+  Obsolete command implementations and their redundant tests were removed;
+  supported compatibility commands use current operations.
+
+### Fixed
+
+- Slow AI and project verification no longer prevent new checkpoint protection.
+  Evaluation results are checked against current ownership before publication.
+- Temporary AI failures keep work protected and retry with durable capped backoff.
+  They no longer silently produce deterministic messages or exhaust semantic
+  correction attempts. Explicit provider changes use verified recovery.
+- Planner-error and singleton rates use actual sample counts. Small samples remain
+  visible without raising a full-window warning.
+
+
 ## v2026-09-15
 
 ### Changed
