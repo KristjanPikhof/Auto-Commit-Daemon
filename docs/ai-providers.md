@@ -19,7 +19,8 @@ acd config edit
 ~~~
 
 `acd config credentials set` stores the key securely and tests it with synthetic
-content for the current enabled AI repository. Use `--repo PATH` to select one.
+content for the current enabled OpenAI-compatible repository. Use `--repo PATH`
+to select one.
 After a successful test, ACD queues the repository's existing settings again so
 work waiting on corrected credentials can resume. Saved provider choices and
 source-sharing approvals stay intact. Other running repositories are unchanged.
