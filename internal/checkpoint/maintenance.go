@@ -125,6 +125,18 @@ func maintenanceRetry(failures int) time.Duration {
 	return delays[min(max(failures-1, 0), len(delays)-1)]
 }
 
+func (previous MaintenanceStatus) failed(now time.Time, err error) MaintenanceStatus {
+	result := previous
+	result.State = maintenanceFailure(err)
+	result.Error = strings.Join(strings.Fields(err.Error()), " ")
+	if len(result.Error) > 2048 {
+		result.Error = result.Error[:2048]
+	}
+	result.Failures = min(previous.Failures+1, 4)
+	result.NextAttemptTS = now.Add(maintenanceRetry(result.Failures)).Unix()
+	return result
+}
+
 // Maintain runs only when due. Errors from retention are durable outcomes;
 // the returned error means the outcome itself could not be persisted.
 func (s Store) Maintain(ctx context.Context, repo, worktree string, now time.Time, previous MaintenanceStatus) (MaintenanceStatus, error) {
@@ -134,13 +146,7 @@ func (s Store) Maintain(ctx context.Context, repo, worktree string, now time.Tim
 	result := previous
 	summary, retentionErr := s.ApplyRetention(ctx, repo, worktree, now)
 	if retentionErr != nil {
-		result.State = maintenanceFailure(retentionErr)
-		result.Error = strings.Join(strings.Fields(retentionErr.Error()), " ")
-		if len(result.Error) > 2048 {
-			result.Error = result.Error[:2048]
-		}
-		result.Failures = min(previous.Failures+1, 4)
-		result.NextAttemptTS = now.Add(maintenanceRetry(result.Failures)).Unix()
+		result = previous.failed(now, retentionErr)
 	} else {
 		result = MaintenanceStatus{
 			State: "healthy", NextAttemptTS: now.Add(time.Hour).Unix(), LastSuccessTS: now.Unix(),
@@ -158,7 +164,7 @@ func (s Store) Maintain(ctx context.Context, repo, worktree string, now time.Tim
 	if err := state.MetaSetMany(ctx, s.DB, map[string]string{
 		MaintenanceMetaKey: string(raw), "protection.retention_over_budget": fmt.Sprint(result.OverBudget),
 	}); err != nil {
-		return previous, err
+		return previous.failed(now, fmt.Errorf("save checkpoint maintenance: %w", err)), err
 	}
 	return result, nil
 }

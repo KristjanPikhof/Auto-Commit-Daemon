@@ -3285,9 +3285,11 @@ func Run(ctx context.Context, opts Options) error {
 			next, err := checkpointStore.Maintain(ctx, opts.RepoPath,
 				checkpointpkg.WorktreeID(opts.RepoPath), nowTS, maintenance)
 			if err != nil {
-				logger.Warn("save checkpoint maintenance", "err", err.Error())
-				// Avoid a busy loop if the database cannot record an outcome.
-				maintenance.NextAttemptTS = nowTS.Add(time.Minute).Unix()
+				if next.Error != maintenance.Error {
+					logger.Warn("save checkpoint maintenance", "err", err.Error())
+				}
+				// Keep backoff in memory when the database cannot record it.
+				maintenance = next
 			} else {
 				if next.State != maintenance.State || next.Error != maintenance.Error {
 					if next.Summary() != "" {

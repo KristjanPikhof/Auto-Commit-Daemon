@@ -171,3 +171,22 @@ func TestMaintenanceRefMovementRemainsNeedsAction(t *testing.T) {
 	}
 
 }
+
+func TestMaintenanceDatabaseFailureStillBacksOff(t *testing.T) {
+	ctx := context.Background()
+	repo, db := checkpointFixture(t, ctx)
+	store := Store{DB: db}
+	if _, err := db.SQL().ExecContext(ctx, "PRAGMA query_only=ON"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	var previous MaintenanceStatus
+	for _, delay := range []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 15 * time.Minute} {
+		next, err := store.Maintain(ctx, repo, WorktreeID(repo), now, previous)
+		if err == nil || next.State != "retrying" || next.NextAttemptTS != now.Add(delay).Unix() {
+			t.Fatalf("persistence failure: %+v %v", next, err)
+		}
+		previous = next
+		now = now.Add(delay)
+	}
+}
