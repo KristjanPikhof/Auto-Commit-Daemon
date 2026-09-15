@@ -11,7 +11,9 @@
   `--verbose` keeps operational details available. JSON adds publication outcomes
   while retaining the deprecated publication booleans for compatibility.
 - Commit-all previews paths, queued work and staging consumption, and rechecks
-  interactive approval. Bare restore offers a terminal checkpoint picker.
+  interactive approval against the frozen checkpoint membership. New paths
+  arriving during protection require a refreshed confirmation. Bare restore
+  offers a terminal checkpoint picker.
 - Commit-all preserves staging added while checkpoint protection is pending.
   Schema v27 saves the approved index identity for checks under Git's index
   lock, including after restart. Older requests require renewed staging review.
@@ -20,7 +22,8 @@
   Correcting credentials can resume the selected enabled AI repository through
   validated runtime activation, preserving its settings and privacy approvals.
 - Production integration tests run in four required shards on both Linux and
-  macOS. Measured test manifests retain every test, example, and fuzz seed.
+  macOS. Measured test manifests include tests, examples, and fuzz targets with
+  their seed corpora.
   Obsolete command implementations and their redundant tests were removed;
   supported compatibility commands use current operations.
 
