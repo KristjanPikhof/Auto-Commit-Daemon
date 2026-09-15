@@ -189,18 +189,26 @@ func runProductDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut
 	if !jsonOut {
 		return runDiagnose(ctx, out, repo, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runDiagnose(ctx, raw, repo, true)
-	})
+	report, err := collectDiagnose(ctx, repo)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateProtected, report)
 }
 
 func runProductDoctorBundle(ctx context.Context, out io.Writer, output string, jsonOut bool) error {
 	if !jsonOut {
 		return runDoctor(ctx, out, true, output, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runDoctor(ctx, raw, true, output, true)
-	})
+	report, err := collectDoctorReport(ctx)
+	if err != nil {
+		return fmt.Errorf("acd doctor: collect: %w", err)
+	}
+	bundle, err := writeDoctorBundle(ctx, report, output)
+	if err != nil {
+		return fmt.Errorf("acd doctor: bundle: %w", err)
+	}
+	return renderAdvancedResult(out, productStateProtected, bundle)
 }
 
 func runProductExplain(
@@ -215,18 +223,24 @@ func runProductExplain(
 	if !jsonOut {
 		return runExplain(ctx, out, repo, path, commit, last, since, limit, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runExplain(ctx, raw, repo, path, commit, last, since, limit, true)
-	})
+	report, err := collectExplain(ctx, repo, path, commit, last, since, limit)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateProtected, report)
 }
 
 func runProductRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
 	if !jsonOut {
 		return runRepoList(ctx, out, false)
 	}
-	return renderAdvancedJSON(out, productStateOff, func(raw io.Writer) error {
-		return runRepoList(ctx, raw, true)
-	})
+	entries, err := collectRepoList(ctx)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateOff, struct {
+		Repos []repoListEntry `json:"repos"`
+	}{Repos: entries})
 }
 
 func runProductEvents(
@@ -251,18 +265,22 @@ func runProductPrompt(ctx context.Context, out io.Writer, repo string, last bool
 	if !jsonOut {
 		return runPrompt(ctx, out, repo, last, seq, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runPrompt(ctx, raw, repo, last, seq, true)
-	})
+	report, err := collectPrompt(ctx, repo, last, seq)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateProtected, report)
 }
 
 func runProductStats(ctx context.Context, out io.Writer, since string, jsonOut bool) error {
 	if !jsonOut {
 		return runStats(ctx, out, since, false)
 	}
-	return renderAdvancedJSON(out, productStateOff, func(raw io.Writer) error {
-		return runStats(ctx, raw, since, true)
-	})
+	report, err := collectStats(ctx, since)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateOff, report)
 }
 
 func runProductFix(
@@ -297,6 +315,10 @@ func runProductLogs(ctx context.Context, out io.Writer, repo string, lines int, 
 		Actions: []productAction{}, Data: map[string]any{"lines": logLines}})
 }
 
+func renderAdvancedResult(out io.Writer, stateName productState, data any) error {
+	return renderJSONEnvelope(out, productEnvelope{OK: true, State: stateName, Actions: []productAction{}, Data: data})
+}
+
 func renderAdvancedJSON(out io.Writer, stateName productState, render func(io.Writer) error) error {
 	var raw bytes.Buffer
 	if err := render(&raw); err != nil {
@@ -312,6 +334,7 @@ func renderAdvancedJSON(out io.Writer, stateName productState, render func(io.Wr
 }
 
 type historyEntry struct {
+	Retained        bool    `json:"retained"`
 	Outcome         string  `json:"outcome"`
 	RecoveredEvents int     `json:"recovered_events"`
 	ID              string  `json:"id"`
@@ -392,7 +415,7 @@ func loadCheckpointHistory(ctx context.Context, repo string) ([]historyEntry, er
 	}
 	defer db.Close()
 	rows, err := db.QueryContext(ctx, `
-SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid,
+SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid, cp.retained,
        COUNT(ce.event_seq),
        COALESCE(SUM(CASE WHEN e.state='published' THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN e.state='recovered' THEN 1 ELSE 0 END), 0)
@@ -411,7 +434,7 @@ LIMIT 100`)
 		var entry historyEntry
 		var publishedEvents int
 		if err := rows.Scan(&entry.ID, &entry.Sequence, &entry.Reason,
-			&entry.Phase, &entry.CreatedTS, &entry.CommitOID,
+			&entry.Phase, &entry.CreatedTS, &entry.CommitOID, &entry.Retained,
 			&entry.EventCount, &publishedEvents, &entry.RecoveredEvents); err != nil {
 			return nil, fmt.Errorf("acd history: scan checkpoint: %w", err)
 		}
