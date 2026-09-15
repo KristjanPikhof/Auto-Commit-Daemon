@@ -225,6 +225,11 @@ after checkpoint protection; ordinary background publication preserves staging.
 Interactive approval is rechecked against paths, queued work, and staging. If
 they change, review the refreshed preview; a later worker-side mismatch refuses
 application. `--yes` accepts the current scope without an interactive preview.
+Immediately before consuming staging, the worker locks the Git index and checks
+its saved approval identity. If you staged something else while it waited, ACD
+preserves that selection and asks you to review commit-all again. This check
+also survives a worker restart. Older requests without a saved staging identity
+require a new review before consuming staging.
 
 `commit-all` first completes a durable checkpoint, records the highest event
 sequence covered by the barrier, and drains only that bounded target through
