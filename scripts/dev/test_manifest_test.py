@@ -60,6 +60,29 @@ esac
             self.assertEqual(success.returncode, 0, success.stderr)
             self.assertIn("-run ^$", pathlib.Path(env["FAKE_GO_ARGS"]).read_text())
 
+    def test_support_failure_keeps_events_output_exit_and_wall_time(self):
+        checkout = pathlib.Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as root:
+            go = pathlib.Path(root) / "go"
+            events = [
+                {"Action": "output", "Package": "example", "Test": "TestBroken", "Output": "useful failure details\n"},
+                {"Action": "fail", "Package": "example", "Test": "TestBroken", "Elapsed": 1.5},
+            ]
+            fixture = pathlib.Path(root) / "fixture.jsonl"
+            fixture.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            go.write_text('#!/bin/sh\nif [ "$1" = list ]; then echo example; exit 0; fi\ncat "$FAKE_EVENTS"\nexit 42\n')
+            go.chmod(0o755)
+            results = pathlib.Path(root) / "results"
+            env = dict(os.environ, PATH=root + os.pathsep + os.environ["PATH"],
+                       ACD_TEST_RESULTS_DIR=str(results), FAKE_EVENTS=str(fixture))
+            run = subprocess.run(["bash", "scripts/dev/test.sh", "support"], cwd=checkout, env=env, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 42, run.stderr)
+            self.assertIn("useful failure details", run.stdout)
+            self.assertEqual((results / "support.jsonl").read_bytes(), fixture.read_bytes())
+            summary = json.loads((results / "support-all.summary.json").read_text())
+            self.assertEqual(summary["exit_code"], 42)
+            self.assertGreaterEqual(summary["wall_seconds"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
