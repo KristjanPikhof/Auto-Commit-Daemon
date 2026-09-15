@@ -67,7 +67,7 @@ func runRestorePicker(cmd *cobra.Command, repo string) error {
 	}
 	var choices []historyEntry
 	for _, entry := range entries {
-		if entry.Phase != state.CheckpointCompleted {
+		if entry.Phase != state.CheckpointCompleted || !entry.Retained {
 			continue
 		}
 		choices = append(choices, entry)
