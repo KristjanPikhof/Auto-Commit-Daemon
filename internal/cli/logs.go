@@ -59,46 +59,44 @@ func runLogs(ctx context.Context, out io.Writer, repo string, lines int, follow 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if lines < 0 {
-		return fmt.Errorf("acd logs: --lines must be non-negative")
-	}
-
-	logPath, abs, err := resolveRepoLogPath(repo)
+	tail, logPath, offset, err := collectLogTail(repo, lines)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(logPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("acd logs: daemon log missing for repo %s at %s (try `acd start --repo %s` or run `acd doctor`)", abs, logPath, abs)
+	for _, line := range tail {
+		if _, err := fmt.Fprintln(out, line); err != nil {
+			return fmt.Errorf("acd logs: write output: %w", err)
 		}
-		return fmt.Errorf("acd logs: stat daemon log %s: %w", logPath, err)
 	}
-
-	if lines > 0 {
-		tail, offset, err := readLastLogLines(logPath, lines)
-		if err != nil {
-			return fmt.Errorf("acd logs: read daemon log %s: %w", logPath, err)
-		}
-		for _, line := range tail {
-			if _, err := fmt.Fprintln(out, line); err != nil {
-				return fmt.Errorf("acd logs: write output: %w", err)
-			}
-		}
-		if follow {
-			return followLog(ctx, out, logPath, offset, logFollowPollInterval)
-		}
-		return nil
+	if follow {
+		return followLog(ctx, out, logPath, offset, logFollowPollInterval)
 	}
+	return nil
+}
 
-	if !follow {
-		return nil
+func collectLogTail(repo string, lines int) ([]string, string, int64, error) {
+	if lines < 0 {
+		return nil, "", 0, fmt.Errorf("acd logs: --lines must be non-negative")
 	}
-
+	logPath, abs, err := resolveRepoLogPath(repo)
+	if err != nil {
+		return nil, "", 0, err
+	}
 	info, err := os.Stat(logPath)
 	if err != nil {
-		return fmt.Errorf("acd logs: stat daemon log %s: %w", logPath, err)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, "", 0, fmt.Errorf("acd logs: daemon log missing for repo %s at %s (try `acd start --repo %s` or run `acd doctor`)", abs, logPath, abs)
+		}
+		return nil, "", 0, fmt.Errorf("acd logs: stat daemon log %s: %w", logPath, err)
 	}
-	return followLog(ctx, out, logPath, info.Size(), logFollowPollInterval)
+	if lines == 0 {
+		return []string{}, logPath, info.Size(), nil
+	}
+	tail, offset, err := readLastLogLines(logPath, lines)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("acd logs: read daemon log %s: %w", logPath, err)
+	}
+	return tail, logPath, offset, nil
 }
 
 func resolveRepoLogPath(repo string) (logPath, absRepo string, err error) {

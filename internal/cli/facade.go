@@ -1,9 +1,9 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -294,21 +294,39 @@ func runProductFix(
 	if !jsonOut {
 		return runFix(ctx, out, repo, dryRun, yes, force, clearPause, false)
 	}
-	return renderAdvancedJSON(out, productStateNeedsAction, func(raw io.Writer) error {
-		return runFix(ctx, raw, repo, dryRun, yes, force, clearPause, true)
-	})
+	plan, err := executeFix(ctx, repo, dryRun, yes, force, clearPause)
+	if plan == nil {
+		return err
+	}
+	if err == nil {
+		return renderAdvancedResult(out, productStateNeedsAction, plan)
+	}
+	commandErr := &CommandError{Code: "recovery_failed", Message: err.Error(), Exit: ExitCode(err)}
+	var existing *CommandError
+	if errors.As(err, &existing) {
+		*commandErr = *existing
+	}
+	if renderErr := renderJSONEnvelope(out, productEnvelope{
+		OK: false, State: productStateNeedsAction, Actions: []productAction{}, Data: plan,
+		Error: &productError{Code: commandErr.Code, Message: commandErr.Message,
+			Retryable: commandErr.Retryable, Details: commandErr.Details},
+	}); renderErr != nil {
+		return renderErr
+	}
+	commandErr.rendered = true
+	return commandErr
 }
 
 func runProductLogs(ctx context.Context, out io.Writer, repo string, lines int, follow, jsonOut bool) error {
 	if !jsonOut {
 		return runLogs(ctx, out, repo, lines, follow)
 	}
-	var raw bytes.Buffer
-	if err := runLogs(ctx, &raw, repo, lines, false); err != nil {
+	tail, _, _, err := collectLogTail(repo, lines)
+	if err != nil {
 		return err
 	}
-	logLines := []string{}
-	for _, line := range strings.Split(strings.TrimSuffix(raw.String(), "\n"), "\n") {
+	logLines := make([]string, 0, len(tail))
+	for _, line := range tail {
 		if line != "" {
 			logLines = append(logLines, line)
 		}
@@ -319,20 +337,6 @@ func runProductLogs(ctx context.Context, out io.Writer, repo string, lines int, 
 
 func renderAdvancedResult(out io.Writer, stateName productState, data any) error {
 	return renderJSONEnvelope(out, productEnvelope{OK: true, State: stateName, Actions: []productAction{}, Data: data})
-}
-
-func renderAdvancedJSON(out io.Writer, stateName productState, render func(io.Writer) error) error {
-	var raw bytes.Buffer
-	if err := render(&raw); err != nil {
-		return err
-	}
-	var data any = map[string]any{}
-	if err := json.Unmarshal(raw.Bytes(), &data); err != nil {
-		return fmt.Errorf("acd: decode advanced JSON result: %w", err)
-	}
-	return renderJSONEnvelope(out, productEnvelope{
-		OK: true, State: stateName, Actions: []productAction{}, Data: data,
-	})
 }
 
 type historyEntry struct {
@@ -373,17 +377,11 @@ apply a reviewed rewrite plan.`,
 					return runEvents(cmd.Context(), cmd.OutOrStdout(), repo, "", 0,
 						defaultEventsLimit, false, defaultEventsWatchInterval, false)
 				}
-				var legacy bytes.Buffer
-				if err := runEvents(cmd.Context(), &legacy, repo, "", 0,
-					defaultEventsLimit, false, defaultEventsWatchInterval, true); err != nil {
+				report, err := collectEvents(cmd.Context(), repo, "", 0, defaultEventsLimit)
+				if err != nil {
 					return err
 				}
-				var activityData any = map[string]any{}
-				if err := json.Unmarshal(legacy.Bytes(), &activityData); err != nil {
-					return fmt.Errorf("acd history --activity: decode activity: %w", err)
-				}
-				return renderJSONEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true,
-					State: productStateProtected, Actions: []productAction{}, Data: activityData})
+				return renderAdvancedResult(cmd.OutOrStdout(), productStateProtected, report)
 			}
 			return runCheckpointHistory(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
 		},
