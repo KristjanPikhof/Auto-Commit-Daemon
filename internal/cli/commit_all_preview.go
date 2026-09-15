@@ -3,12 +3,14 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 type commitAllPath struct {
@@ -23,6 +25,7 @@ type commitAllScope struct {
 	QueuedPaths  []string        `json:"queued_paths"`
 	IndexDigest  string          `json:"index_digest"`
 	Digest       string          `json:"preview_digest"`
+	queuedSeqs   []int64
 }
 
 // inspectCommitAllScope never writes Git objects or stages paths. The digest
@@ -76,6 +79,7 @@ func inspectCommitAllScope(ctx context.Context, repo, dbPath string) (commitAllS
 			return result, err
 		}
 		_ = json.NewEncoder(hash).Encode([]any{seq, path})
+		result.queuedSeqs = append(result.queuedSeqs, seq)
 		if !seen[path] {
 			result.QueuedPaths = append(result.QueuedPaths, path)
 			seen[path] = true
@@ -106,4 +110,43 @@ func renderCommitAllScope(out io.Writer, scope commitAllScope) {
 	}
 	fmt.Fprintln(out, "Staging: included staged content will be consumed after checkpoint protection. Later edits stay outside this target.")
 	fmt.Fprintln(out, "If a previous request stopped because staging changed, its protected work will be saved separately and regrouped with this request.")
+}
+
+// The checkpoint may complete after more files arrive. Compare its immutable
+// members to the admitted preview; live status alone can miss a captured path
+// that was subsequently removed or reverted.
+func commitAllTargetMatchesScope(ctx context.Context, db *state.DB, target publicationDrainTarget, scope commitAllScope) (bool, error) {
+	paths := make(map[string]bool)
+	for _, path := range scope.ChangedPaths {
+		paths[path.Path] = true
+		if path.OldPath != "" {
+			paths[path.OldPath] = true
+		}
+	}
+	for _, path := range scope.QueuedPaths {
+		paths[path] = true
+	}
+	queued := make(map[int64]bool, len(scope.queuedSeqs))
+	for _, seq := range scope.queuedSeqs {
+		queued[seq] = true
+	}
+	query, err := db.ReadSQL().PrepareContext(ctx, "SELECT path,old_path FROM capture_events WHERE seq=?")
+	if err != nil {
+		return false, err
+	}
+	defer query.Close()
+	for _, seq := range target.EventSeqs {
+		if queued[seq] {
+			continue
+		}
+		var path string
+		var oldPath sql.NullString
+		if err := query.QueryRowContext(ctx, seq).Scan(&path, &oldPath); err != nil {
+			return false, err
+		}
+		if !paths[path] || oldPath.Valid && oldPath.String != "" && !paths[oldPath.String] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
