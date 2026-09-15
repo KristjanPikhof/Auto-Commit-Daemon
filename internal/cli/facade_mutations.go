@@ -197,6 +197,9 @@ func renderRestorePlan(out io.Writer, plan restorepkg.Plan, jsonOut bool) error 
 			Actions: []productAction{}, NextAction: next, Data: plan}, true)
 	}
 	fmt.Fprintf(out, "Restore preview: %s\n", plan.CheckpointID)
+	for _, path := range plan.Paths {
+		fmt.Fprintf(out, "  %q\n", path)
+	}
 	fmt.Fprintf(out, "Create: %d  Modify: %d  Delete: %d  Mode: %d  Symlink: %d\n",
 		plan.Counts.Created, plan.Counts.Modified, plan.Counts.Deleted,
 		plan.Counts.ModeChanged, plan.Counts.Symlinks)
