@@ -1055,7 +1055,9 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 	if runtime.GOOS == "darwin" {
 		scriptArgs = append([]string{"-q", "/dev/null"}, commandArgs...)
 	} else {
-		scriptArgs = []string{"-q", "-c", shellJoin(commandArgs), "/dev/null"}
+		// util-linux script otherwise reports its own success even when the
+		// child declines approval, fails, or exits on a signal.
+		scriptArgs = []string{"-q", "-e", "-c", shellJoin(commandArgs), "/dev/null"}
 	}
 	cmd := exec.CommandContext(ctx, "script", scriptArgs...)
 	cmd.Env = env
@@ -1430,7 +1432,9 @@ func SeedFlushRequests(t *testing.T, dbPath string, n int) {
 		sb.WriteString("; ")
 	}
 	sb.WriteString("COMMIT;")
-	if out, err := exec.Command("sqlite3", dbPath, sb.String()).CombinedOutput(); err != nil {
+	cmd := exec.Command("sqlite3", dbPath)
+	cmd.Stdin = strings.NewReader(sb.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("seed flush_requests: %v\n%s", err, out)
 	}
 }
