@@ -101,7 +101,7 @@ run_core() {
 
 run_integration() {
   validate_shard "$1" "$2"
-  run_package_shard ./test/integration "$1" "$2" \
+  ACD_BENCHMARK=1 run_package_shard ./test/integration "$1" "$2" \
     -tags=integration -race -count=1 -parallel=2 -timeout "$test_timeout"
 }
 
