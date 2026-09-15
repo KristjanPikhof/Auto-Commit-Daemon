@@ -15,7 +15,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settingsui"
 )
 
-func TestSetupDryRunDefaultsAreEverydayLocalAndSecretFree(t *testing.T) {
+func TestSetupDryRunRecommendsEverydayAIWithoutCredentials(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "")
 	cmd := newSetupCommand(false)
 	cmd.SetIn(strings.NewReader(""))
@@ -29,8 +29,8 @@ func TestSetupDryRunDefaultsAreEverydayLocalAndSecretFree(t *testing.T) {
 	if values[config.FieldCommitStrategy] != "intent" ||
 		values[config.FieldCommitPreset] != "balanced" ||
 		values[config.FieldCommitFormat] != "imperative" ||
-		values[config.FieldProvider] != "deterministic" ||
-		values[config.FieldDiffEgress] != "false" ||
+		values[config.FieldProvider] != "openai-compat" ||
+		values[config.FieldDiffEgress] != "true" ||
 		values[config.FieldIntentRepairEnabled] != "true" {
 		t.Fatalf("fresh values = %+v", values)
 	}
@@ -93,7 +93,12 @@ func TestSetupNonTTYUsesAccessibleWizard(t *testing.T) {
 		opts settingsui.ConfigureWizardOptions,
 	) (settingsui.ConfigureSelection, error) {
 		accessible = opts.Accessible
-		return configureSelectionFromValues(opts.Defaults), nil
+		if opts.Defaults[config.FieldProvider] != "openai-compat" {
+			t.Fatal("fresh setup did not recommend AI")
+		}
+		selection := configureSelectionFromValues(opts.Defaults)
+		selection.Provider = "deterministic"
+		return selection, nil
 	}
 
 	cmd := newSetupCommand(false)

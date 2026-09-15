@@ -132,17 +132,16 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	providerSelected := false
 	if !providerReady {
 		options := []huh.Option[string]{
-			huh.NewOption("OpenAI-compatible provider (network)", "openai-compat"),
-			huh.NewOption("Local subprocess provider", "subprocess"),
+			huh.NewOption("AI semantic commits: OpenAI-compatible connection (recommended)", "openai-compat"),
+			huh.NewOption("AI semantic commits: local subprocess", "subprocess"),
 		}
 		if !(selection.Strategy == "intent" && selection.Preset == "quality") {
-			options = append([]huh.Option[string]{
-				huh.NewOption("Local rules (no AI or network)", "deterministic"),
-			}, options...)
+			options = append(options,
+				huh.NewOption("Local automatic commits: limited rules and messages, no network", "deterministic"))
 		}
 		providerForm := huh.NewForm(huh.NewGroup(
-			huh.NewSelect[string]().Key("provider").Title("Commit message provider").
-				Description("Local rules create commits without AI. History rewrite needs an OpenAI-compatible or local subprocess provider.").
+			huh.NewSelect[string]().Key("provider").Title("How should ACD create commits?").
+				Description("AI can group related code, tests, and documentation into one meaningful commit. Local rules work offline with more limited grouping and messages.").
 				Options(options...).Value(&providerKind),
 		))
 		if err := runConfigureForm(ctx, providerForm, opts); err != nil {
