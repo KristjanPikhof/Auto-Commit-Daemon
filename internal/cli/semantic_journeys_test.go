@@ -46,6 +46,23 @@ func TestSavedCheckpointAwaitsClassificationWithoutClaimingPublication(t *testin
 	}
 }
 
+func TestRecoveryHistoryDoesNotHideCurrentPublicationActivity(t *testing.T) {
+	committed := true
+	entry := productListEntry{PublicationOutcome: publicationOutcome{RecoveredChanges: 1}}
+	if got := productListPhase(entry); got != "recovered" {
+		t.Fatalf("preserved work: %s", got)
+	}
+	entry.PublicationProgress.Phase = "verifying"
+	if got := productListPhase(entry); got != "verifying" {
+		t.Fatalf("recovery hid active verification: %s", got)
+	}
+	entry.PublicationProgress.Phase = "idle"
+	entry.PublicationOutcome.BranchCommitted = &committed
+	if got := productListPhase(entry); got != "idle" {
+		t.Fatalf("historical recovery hid completed recapture: %s", got)
+	}
+}
+
 func TestPublicationOutcomeUsesCurrentBranchAndAcceptsRecapturedTree(t *testing.T) {
 	withIsolatedHome(t)
 	repo, _, db := makeRepoStateDB(t)
