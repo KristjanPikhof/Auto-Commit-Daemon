@@ -65,6 +65,7 @@ esac
         with tempfile.TemporaryDirectory() as root:
             go = pathlib.Path(root) / "go"
             events = [
+                {"Action": "build-output", "Output": "compiler diagnostic\n"},
                 {"Action": "output", "Package": "example", "Test": "TestBroken", "Output": "useful failure details\n"},
                 {"Action": "fail", "Package": "example", "Test": "TestBroken", "Elapsed": 1.5},
             ]
@@ -78,6 +79,7 @@ esac
             run = subprocess.run(["bash", "scripts/dev/test.sh", "support"], cwd=checkout, env=env, capture_output=True, text=True)
             self.assertEqual(run.returncode, 42, run.stderr)
             self.assertIn("useful failure details", run.stdout)
+            self.assertIn("compiler diagnostic", run.stdout)
             self.assertEqual((results / "support.jsonl").read_bytes(), fixture.read_bytes())
             summary = json.loads((results / "support-all.summary.json").read_text())
             self.assertEqual(summary["exit_code"], 42)
