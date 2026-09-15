@@ -840,6 +840,9 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		params["drain_publication"] = true
 		request.Params, _ = json.Marshal(params)
 	}
+	if request.Method == "hint" || request.Method == "checkpoint_barrier" {
+		state.RecordActivity(ctx, runtime.db, time.Now())
+	}
 	if sessionErr := applyWorkerSessionParams(ctx, runtime.db, request.Params); sessionErr != nil {
 		return nil, protocolFailure("session_update_failed", sessionErr, true)
 	}

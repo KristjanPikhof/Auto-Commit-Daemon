@@ -19,7 +19,9 @@ fi
 test_names=()
 while IFS= read -r name; do
   test_names[${#test_names[@]}]=$name
-done < <(go test "$package" -list '^(Test|Example|Fuzz)' |
+# Use the execution flags so discovery reuses the race build and sees the same
+# build-tagged tests as the shard it is selecting.
+done < <(go test "$package" "$@" -list '^(Test|Example|Fuzz)' |
   awk '/^(Test|Example|Fuzz)/ { print }')
 
 test_count=${#test_names[@]}

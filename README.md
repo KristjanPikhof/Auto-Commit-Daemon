@@ -149,7 +149,14 @@ what ACD is doing:
 | `acd off` | Save a final checkpoint and stop protecting this repository |
 | `acd on` | Start protection again |
 
-`acd list` is the quickest fleet view:
+`acd list` works from any directory. It shows repositories active within the
+last hour and keeps unfinished work visible until it is resolved. Agent hooks,
+edits, commit-all requests, and applied history rewrites count as activity;
+worker heartbeats and maintenance checks do not. Rows stay in place as the
+terminal refreshes. Use `--all` to include idle repositories, including those
+with maintenance warnings.
+
+The dashboard columns show protection and publication separately:
 
 | Column | Meaning |
 |---|---|

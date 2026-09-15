@@ -101,7 +101,7 @@ WHERE id=? AND checkpoint_ref=? AND commit_oid=? AND retained=1`, now, checkpoin
 	if _, err := tx.ExecContext(ctx, `UPDATE operation_steps SET phase='completed',completed_ts=? WHERE operation_id=? AND ord=1`, now, operationID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE operations SET phase='completed',status='completed',updated_ts=?,completed_ts=? WHERE id=? AND status='prepared'`, now, now, operationID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE operations SET phase='completed',status='completed',error='',updated_ts=?,completed_ts=? WHERE id=? AND status IN ('prepared','needs_action')`, now, now, operationID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -115,7 +115,7 @@ func PreparedCheckpointPrunes(ctx context.Context, db *DB) ([]PreparedCheckpoint
 	rows, err := db.readSQL().QueryContext(ctx, `
 SELECT o.id,s.proof_id,s.target,s.before_digest
 FROM operations o JOIN operation_steps s ON s.operation_id=o.id
-WHERE o.kind='checkpoint_gc' AND o.status='prepared' AND s.ord=1
+WHERE o.kind='checkpoint_gc' AND o.status IN ('prepared','needs_action') AND s.ord=1
 ORDER BY o.created_ts,o.id`)
 	if err != nil {
 		return nil, err
