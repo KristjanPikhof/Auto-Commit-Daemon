@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
