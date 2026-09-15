@@ -993,6 +993,7 @@ func renderIntentStrategyHuman(out io.Writer, r intentStrategyReport) {
 			formatRate(r.SingletonCommitRateRecent),
 			warn,
 		)
+		fmt.Fprintf(out, "Rate samples: %d decisions, %d commits\n", r.PlannerErrorSampleCount, r.SingletonCommitSampleCount)
 	}
 }
 
