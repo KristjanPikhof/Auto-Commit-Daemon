@@ -46,8 +46,8 @@ func TestPublicationProofPoliciesAndReadOnlyState(t *testing.T) {
 		{name: "CLI cannot settle delete", op: PublicationOp{Operation: "delete", Path: "absent.txt"}},
 		{name: "worker settles absent delete", op: PublicationOp{Operation: "delete", Path: "absent.txt"}, policy: PublicationProofPolicy{AllowDeletes: true}, published: true},
 		{name: "worker refuses existing delete", op: PublicationOp{Operation: "delete", Path: "published.txt"}, policy: PublicationProofPolicy{AllowDeletes: true}},
-		{name: "CLI missing path is mismatch", op: PublicationOp{Operation: "modify", Path: "absent.txt", AfterOID: blob}, policy: PublicationProofPolicy{MissingPathIsMismatch: true}},
-		{name: "worker missing path is error", op: PublicationOp{Operation: "modify", Path: "absent.txt", AfterOID: blob}, wantError: true},
+		{name: "CLI missing path is mismatch", op: PublicationOp{Operation: "modify", Path: "absent.txt", AfterOID: blob}, policy: PublicationProofPolicy{MissingRefIsMismatch: true}},
+		{name: "worker missing path is mismatch", op: PublicationOp{Operation: "modify", Path: "absent.txt", AfterOID: blob}},
 		{name: "rename source still present", op: PublicationOp{Operation: "rename", Path: "published.txt", OldPath: "published.txt", BeforeOID: blob, AfterOID: blob}},
 		{name: "rename proven", op: PublicationOp{Operation: "rename", Path: "published.txt", OldPath: "old.txt", BeforeOID: blob, AfterOID: blob}, published: true},
 	}

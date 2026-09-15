@@ -19,8 +19,8 @@ type PublicationOp struct {
 
 // PublicationProofPolicy keeps caller-specific recovery limits explicit.
 type PublicationProofPolicy struct {
-	AllowDeletes          bool
-	MissingPathIsMismatch bool
+	AllowDeletes         bool
+	MissingRefIsMismatch bool
 }
 
 // ProvePublicationAtHEAD checks that the expected HEAD descends from sourceHead,
@@ -30,11 +30,7 @@ func ProvePublicationAtHEAD(ctx context.Context, repo, sourceHead, headOID strin
 	if len(ops) == 0 || headOID == "" {
 		return "", false, nil
 	}
-	// Ancestry guard: an external HEAD that doesn't descend from our
-	// replay parent means the matching tree state is coincidence, not a
-	// successful parallel publish. Return (headOID, false) so the caller
-	// can record a real conflict instead of silently chaining off a
-	// stranger.
+	// Matching content on unrelated history is not publication proof.
 	if sourceHead != "" && sourceHead != headOID {
 		descends, err := IsAncestor(ctx, repo, sourceHead, headOID)
 		if err != nil {
@@ -49,10 +45,7 @@ func ProvePublicationAtHEAD(ctx context.Context, repo, sourceHead, headOID strin
 			if !policy.AllowDeletes {
 				return headOID, false, nil
 			}
-			// Delete is idempotent only when HEAD has NO entry at all
-			// for this path. A path replaced by a directory (tree
-			// entry) or a submodule (commit entry) is NOT absent —
-			// settling as published would mask a real divergence.
+			// A directory or submodule at the old path is not a completed delete.
 			absent, err := PathAbsentInTree(ctx, repo, headOID, op.Path)
 			if err != nil {
 				return "", false, err
@@ -64,7 +57,7 @@ func ProvePublicationAtHEAD(ctx context.Context, repo, sourceHead, headOID strin
 		}
 		blobOID, err := LsTreeBlobOID(ctx, repo, headOID, op.Path)
 		if err != nil {
-			if policy.MissingPathIsMismatch && errors.Is(err, ErrRefNotFound) {
+			if policy.MissingRefIsMismatch && errors.Is(err, ErrRefNotFound) {
 				return headOID, false, nil
 			}
 			return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
@@ -92,12 +85,7 @@ func ProvePublicationAtHEAD(ctx context.Context, repo, sourceHead, headOID strin
 			if !absent {
 				return headOID, false, nil
 			}
-			// Rename source verify: before settling as already-published
-			// we require the captured BeforeOID for the rename source to
-			// still be present in the object database. If it's missing
-			// (gc'd, partial fetch), we cannot prove the rename actually
-			// matches the captured intent, so refuse to settle and let
-			// the caller block.
+			// Keep the captured source object available as rename evidence.
 			if op.BeforeOID != "" {
 				present, err := publicationObjectExists(ctx, repo, op.BeforeOID)
 				if err != nil {
@@ -109,12 +97,7 @@ func ProvePublicationAtHEAD(ctx context.Context, repo, sourceHead, headOID strin
 			}
 		}
 	}
-	// HEAD-movement guard: the per-op probes above all read against the
-	// `headOID` we resolved at the start. If HEAD has moved while we were
-	// probing (an external committer landed something between the first
-	// rev-parse and the last ls-tree), the matching tree state no longer
-	// describes the live ref. Refuse to settle and let the caller try
-	// again on the next pass with a fresh anchor.
+	// Reject a proof whose expected commit is no longer HEAD.
 	postHead, err := RevParse(ctx, repo, "HEAD")
 	if err != nil {
 		if errors.Is(err, ErrRefNotFound) {
@@ -128,10 +111,7 @@ func ProvePublicationAtHEAD(ctx context.Context, repo, sourceHead, headOID strin
 	return headOID, true, nil
 }
 
-// PathAbsentInTree reports whether path is absent at ref. A path resolved
-// to a non-blob entry (tree, submodule) is treated as NOT absent — the
-// caller's idempotent check must not confuse a directory-replacement with
-// a successful delete.
+// PathAbsentInTree treats files, directories and submodules as present.
 func PathAbsentInTree(ctx context.Context, repo, ref, path string) (bool, error) {
 	entries, err := LsTree(ctx, repo, ref, false, path)
 	if err != nil {
@@ -145,10 +125,7 @@ func PathAbsentInTree(ctx context.Context, repo, ref, path string) (bool, error)
 	return true, nil
 }
 
-// publicationObjectExists reports whether the given OID is present in the local
-// object database via `git cat-file -e`. Used by the rename-source verify
-// path so the daemon will not settle a rename as published when the
-// captured BeforeOID is no longer reachable (shallow clone, gc'd ref).
+// publicationObjectExists checks whether captured rename evidence still exists.
 func publicationObjectExists(ctx context.Context, repo, oid string) (bool, error) {
 	if oid == "" {
 		return false, nil
