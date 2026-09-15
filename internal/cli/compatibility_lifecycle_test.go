@@ -59,8 +59,8 @@ func TestCompatibilityHintsPreserveRepositoryOptIn(t *testing.T) {
 			root.SetOut(&bytes.Buffer{})
 			root.SetErr(&bytes.Buffer{})
 			root.SetArgs([]string{command, "--repo", nested, "--session-id", "editor", "--json"})
-			if err := root.ExecuteContext(t.Context()); err == nil {
-				t.Fatal("hint implicitly enabled repository")
+			if err := root.ExecuteContext(t.Context()); err != nil {
+				t.Fatalf("unregistered hook should be a harmless no-op: %v", err)
 			}
 			if _, err := os.Stat(filepath.Join(repo, ".git", "acd")); !os.IsNotExist(err) {
 				t.Fatalf("hint created repository state: %v", err)
