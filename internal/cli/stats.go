@@ -77,12 +77,26 @@ Stats are across all registered repos and default to the last 7 days. Use --sinc
 }
 
 func runStats(ctx context.Context, out io.Writer, sinceStr string, jsonOut bool) error {
+	report, err := collectStats(ctx, sinceStr)
+	if err != nil {
+		return err
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(report)
+	}
+	return renderStatsHuman(out, report, sinceStr)
+}
+
+func collectStats(ctx context.Context, sinceStr string) (statsReport, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	d, err := parseSince(sinceStr)
 	if err != nil {
-		return fmt.Errorf("acd stats: %w", err)
+		return statsReport{}, fmt.Errorf("acd stats: %w", err)
 	}
 	now := time.Now()
 	until := now
@@ -90,26 +104,21 @@ func runStats(ctx context.Context, out io.Writer, sinceStr string, jsonOut bool)
 
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd stats: resolve paths: %w", err)
+		return statsReport{}, fmt.Errorf("acd stats: resolve paths: %w", err)
 	}
 	db, err := central.Open(ctx, roots)
 	if err != nil {
-		return fmt.Errorf("acd stats: open stats.db: %w", err)
+		return statsReport{}, fmt.Errorf("acd stats: open stats.db: %w", err)
 	}
 	defer db.Close()
 
 	rows, err := db.ListRollupsSince(ctx, since.Unix())
 	if err != nil {
-		return fmt.Errorf("acd stats: list rollups: %w", err)
+		return statsReport{}, fmt.Errorf("acd stats: list rollups: %w", err)
 	}
 
 	report := buildStatsReport(rows, since, until)
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(report)
-	}
-	return renderStatsHuman(out, report, sinceStr)
+	return report, nil
 }
 
 // buildStatsReport rolls up DailyRollup rows into per-day, per-repo, and
