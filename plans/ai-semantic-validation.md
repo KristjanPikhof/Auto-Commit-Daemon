@@ -118,6 +118,24 @@ backoff. Both focused regressions and the final broad gate passed.
 Independent review found no remaining source or documentation blocker. Removed
 scenarios and their current replacements remain in the coverage mapping.
 
+## Dashboard follow-up after local upgrade
+
+The live upgrade exposed two list problems. Internal setup/readiness checkpoint
+barriers renewed the same activity timestamp as user hooks. Optional publication
+proofs also repeated a Git lookup and could time out before the dashboard read
+activity or unfinished work.
+
+The follow-up excludes internal barriers from activity, retains real hooks and
+explicit publication, reuses the branch lookup, and collects durable visibility
+facts before optional details. Targeted CLI race coverage, the production
+`TestActiveDashboardWorksOutsideRepositories` scenario and lint passed after
+these changes. The broad 263-second gate above precedes this focused follow-up.
+
+Existing unlabelled activity timestamps remain intact: they cannot reliably be
+separated from real hooks after the fact. Entries introduced by the earlier
+upgrade age out under the unchanged one-hour rule. No live activity database
+was edited to invent missing provenance.
+
 ## Delivery boundary
 
 The user subsequently authorized a local rebuild and runtime upgrade. Build
