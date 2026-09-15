@@ -228,9 +228,13 @@ refresh automatically.
 Before confirmation, `commit-all` lists changed paths, staged content, and
 already queued paths. The lists may overlap. Included staging is consumed only
 after checkpoint protection; ordinary background publication preserves staging.
-Interactive approval is rechecked against paths, queued work, and staging. If
-they change, review the refreshed preview; a later worker-side mismatch refuses
-application. `--yes` accepts the current scope without an interactive preview.
+Interactive approval is rechecked against paths, queued work, and staging. The
+worker also checks every path in the frozen checkpoint target, including rename
+endpoints. If an unreviewed path arrives while checkpointing, the command shows
+a refreshed preview and asks again before creating a publication request or
+consuming staging. Further edits to already reviewed paths can enter that
+checkpoint. `--yes` accepts the current checkpoint scope without an interactive
+path review.
 Immediately before consuming staging, the worker locks the Git index and checks
 its saved approval identity. If you staged something else while it waited, ACD
 preserves that selection and asks you to review commit-all again. This check
