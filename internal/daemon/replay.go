@@ -2816,13 +2816,18 @@ func planIntentWithFallback(
 	}
 
 	var permit IntentPlannerHealthPermit
+	permitCompleted := false
 	if health != nil {
 		var acquireErr error
 		permit, acquireErr = health.Acquire(ctx)
 		if acquireErr != nil {
 			return ai.IntentPlan{}, "", acquireErr
 		}
-		defer func() { _ = health.Complete(ctx, permit, nil) }()
+		defer func() {
+			if !permitCompleted {
+				_ = health.Complete(ctx, permit, nil)
+			}
+		}()
 
 	}
 
@@ -2848,6 +2853,7 @@ func planIntentWithFallback(
 	}
 	if err == nil {
 		if health != nil {
+			permitCompleted = true
 			if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
 				return ai.IntentPlan{}, "", healthErr
 			}
@@ -2856,6 +2862,7 @@ func planIntentWithFallback(
 	}
 	if health != nil {
 		failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
+		permitCompleted = true
 		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
 			return ai.IntentPlan{}, "", healthErr
 		}
