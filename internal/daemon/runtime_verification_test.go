@@ -143,3 +143,74 @@ func TestRuntimeIntentRepairVerifierKeepsCancellationRetryable(
 		t.Fatalf("cancellation became durable verification failure: %v", err)
 	}
 }
+
+func TestRuntimeVerificationCacheSurvivesRestartAndRequiresExactInputs(t *testing.T) {
+	f := newCaptureFixture(t)
+	base := context.Background()
+	if err := os.WriteFile(filepath.Join(f.dir, "feature.txt"), []byte("feature\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.firstCapture(t)
+	events, err := state.PendingEvents(base, f.db, 0)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("events=%v err=%v", events, err)
+	}
+	var event state.CaptureEvent
+	for _, candidate := range events {
+		if candidate.Path == "feature.txt" {
+			event = candidate
+		}
+	}
+	ops, err := state.LoadCaptureOps(base, f.db, event.Seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	captures := []IntentCandidateCapture{{Event: event, Ops: ops}}
+	assignment := ai.IntentCandidateAssignment{CandidateID: "feature", SelectedSeqs: []int64{event.Seq}}
+	countPath := filepath.Join(t.TempDir(), "runs")
+	command, err := verification.NewApprovedCommand(f.dir, "cache-proof", verification.ModeFast,
+		"printf 'run\\n' >> '"+countPath+"'; test -f feature.txt", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(t.TempDir(), "cache.db")
+	run := func(revision int64, corrupt bool) IntentCandidateVerification {
+		t.Helper()
+		db, err := state.Open(base, cachePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if corrupt {
+			if err := state.MetaSet(base, db, runtimeVerificationCacheMeta, "invalid json"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctx, cancel := context.WithCancel(base)
+		defer cancel()
+		ctx = context.WithValue(ctx, publicationEvaluationKey{}, &publicationEvaluation{db: db, cancel: cancel,
+			identity: func(context.Context) (string, error) { return "frozen", nil }, protect: func(context.Context) error { return nil }})
+		result, err := runtimeIntentCandidateVerifier(f.dir, f.gitDir, f.cctx.BaseHead, revision, command)(ctx, assignment, captures)
+		if err != nil || result.Status != string(verification.StatusPassed) {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		return result
+	}
+	first := run(7, false)
+	second := run(7, false)
+	if first.CheckedTS != second.CheckedTS {
+		t.Fatal("restart repeated an unchanged successful check")
+	}
+	assertRuns := func(want string) {
+		t.Helper()
+		got, err := os.ReadFile(countPath)
+		if err != nil || string(got) != want {
+			t.Fatalf("runs=%q err=%v want=%q", got, err, want)
+		}
+	}
+	assertRuns("run\n")
+	run(8, false)
+	assertRuns("run\nrun\n")
+	run(8, true)
+	assertRuns("run\nrun\nrun\n")
+}
