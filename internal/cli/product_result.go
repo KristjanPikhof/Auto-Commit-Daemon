@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,6 +60,7 @@ type productStatusData struct {
 	ActionRequired           bool                      `json:"action_required"`
 	CheckpointID             string                    `json:"checkpoint_id,omitempty"`
 	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
+	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
 	PublicationProgress      publicationProgressReport `json:"publication_progress"`
 	PendingEvents            int                       `json:"pending_events"`
 	BlockedEvents            int                       `json:"blocked_events"`
@@ -120,6 +122,7 @@ func envelopeFromControl(result controlResult) productEnvelope {
 			CheckpointID:             result.CheckpointID,
 			PublicationDrain:         result.PublicationDrain,
 			PublicationProgress:      result.PublicationProgress,
+			CheckpointMaintenance: result.CheckpointMaintenance,
 			PendingEvents:            result.PendingEvents,
 			BlockedEvents:            result.BlockedEvents,
 			Summary:                  result.Summary,
