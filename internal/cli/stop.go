@@ -14,7 +14,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -53,36 +52,6 @@ var stopWaitTimeout = 5 * time.Second
 
 // stopPollInterval is the busy-loop polling cadence inside stopWaitTimeout.
 var stopPollInterval = 100 * time.Millisecond
-
-func runStop(ctx context.Context, out io.Writer, repoFlag, sessionID string, force, all, jsonOut bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if all {
-		return runStopAll(ctx, out, force, jsonOut)
-	}
-	repo, err := resolveRepo(repoFlag)
-	if err != nil {
-		return err
-	}
-	res, err := stopOneRepo(ctx, repo, sessionID, force)
-	if err != nil {
-		return err
-	}
-	return writeStopResult(out, res, jsonOut)
-}
-
-func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
-	roots, err := paths.Resolve()
-	if err != nil {
-		return fmt.Errorf("acd stop: resolve paths: %w", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return fmt.Errorf("acd stop: load registry: %w", err)
-	}
-	return runStopRegistry(ctx, out, force, jsonOut, reg)
-}
 
 func runStopRegistry(ctx context.Context, out io.Writer, force, jsonOut bool, reg *central.Registry) error {
 	out_all := stopAllResult{

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -68,7 +70,7 @@ func TestStop_DefaultDeferredWhenPeerAlive(t *testing.T) {
 	defer restore()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, repoDir, "s1", false, false, true); err != nil {
+	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "s1", false); err != nil {
 		t.Fatalf("runStop: %v", err)
 	}
 	if count.Load() != 0 {
@@ -109,7 +111,7 @@ func TestStop_NoSessionStopsDaemonWithoutDeregisteringClients(t *testing.T) {
 	defer func() { stopWaitTimeout = prev }()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, repoDir, "", false, false, true); err != nil {
+	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "", false); err != nil {
 		t.Fatalf("runStop: %v", err)
 	}
 	if count.Load() != 1 {
@@ -186,7 +188,7 @@ func TestStop_NoSessionStopsDaemonWithNewerSchema(t *testing.T) {
 	defer func() { stopWaitTimeout = prevTimeout }()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, repoDir, "", false, false, true); err != nil {
+	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "", false); err != nil {
 		t.Fatalf("runStop with newer schema: %v", err)
 	}
 	if signals.Load() != 1 {
@@ -244,7 +246,7 @@ func TestStop_DefaultLastSession_SIGTERM(t *testing.T) {
 	defer func() { stopWaitTimeout = prev }()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, repoDir, "only", false, false, true); err != nil {
+	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "only", false); err != nil {
 		t.Fatalf("runStop: %v", err)
 	}
 	if count.Load() != 1 {
@@ -313,7 +315,7 @@ func TestStop_ForceEscalates(t *testing.T) {
 	}()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, repoDir, "", true, false, true); err != nil {
+	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "", true); err != nil {
 		t.Fatalf("runStop: %v", err)
 	}
 	if count.Load() < 2 {
@@ -363,7 +365,7 @@ func TestStopAll_PassesCallerForceToRepoStopper(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			calls = nil
 			var out bytes.Buffer
-			if err := runStopAll(ctx, &out, tc.force, true); err != nil {
+			if err := stopRegisteredRepositoriesForTest(ctx, &out, tc.force); err != nil {
 				t.Fatalf("runStopAll: %v", err)
 			}
 			if len(calls) != 1 {
@@ -462,7 +464,7 @@ func TestStop_All_IteratesRegistry(t *testing.T) {
 	// without invoking signalProcess. Result: both repos land in the
 	// Stopped bucket and runStopAll returns nil. The point of this
 	// test is registry iteration breadth, not the kill path.
-	if err := runStop(ctx, &out, "", "", true, true, true); err != nil {
+	if err := stopRegisteredRepositoriesForTest(ctx, &out, true); err != nil {
 		t.Fatalf("runStop --all: %v", err)
 	}
 	// signalProcess is legitimately not called for dead PIDs (the
@@ -517,7 +519,7 @@ func TestStopAll_RoutesFailuresToFailedBucket(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err := runStopAll(ctx, &out, true, true)
+	err := stopRegisteredRepositoriesForTest(ctx, &out, true)
 	if err == nil {
 		t.Fatalf("runStopAll: expected non-nil error when a repo failed, got nil; output=%s", out.String())
 	}
@@ -572,12 +574,7 @@ func TestStop_DeferredRemovesOnlyCallerCache(t *testing.T) {
 	pathA := startCachePath(gitDir, "sess-A")
 	pathB := startCachePath(gitDir, "sess-B")
 	for _, sid := range []string{"sess-A", "sess-B"} {
-		if err := writeStartCache(gitDir, startCache{
-			Version: startCacheVersion, RepoHash: "abc",
-			SessionID: sid, Harness: "claude-code",
-			DaemonPID: 99999, UpdatedAt: time.Now().Unix(),
-			DaemonStartTS: "Mon May  5 12:00:00 2026", DaemonArgvHash: "argv",
-		}); err != nil {
+		if err := os.WriteFile(startCachePath(gitDir, sid), []byte(`{"version":2}`), 0o600); err != nil {
 			t.Fatalf("seed cache %s: %v", sid, err)
 		}
 	}
@@ -586,7 +583,7 @@ func TestStop_DeferredRemovesOnlyCallerCache(t *testing.T) {
 	defer restore()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, repoDir, "sess-A", false, false, true); err != nil {
+	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "sess-A", false); err != nil {
 		t.Fatalf("runStop: %v", err)
 	}
 	if count.Load() != 0 {
@@ -624,12 +621,7 @@ func TestStop_ForceFailedEscalationWipesCaches(t *testing.T) {
 
 	gitDir := filepath.Join(repoDir, ".git")
 	for _, sid := range []string{"sess-A", "sess-B"} {
-		if err := writeStartCache(gitDir, startCache{
-			Version: startCacheVersion, RepoHash: "abc",
-			SessionID: sid, Harness: "claude-code",
-			DaemonPID: 1, UpdatedAt: time.Now().Unix(),
-			DaemonStartTS: "Mon May  5 12:00:00 2026", DaemonArgvHash: "argv",
-		}); err != nil {
+		if err := os.WriteFile(startCachePath(gitDir, sid), []byte(`{"version":2}`), 0o600); err != nil {
 			t.Fatalf("seed cache %s: %v", sid, err)
 		}
 	}
@@ -653,7 +645,7 @@ func TestStop_ForceFailedEscalationWipesCaches(t *testing.T) {
 	}()
 
 	var out bytes.Buffer
-	if err := runStop(ctx, &out, repoDir, "", true, false, true); err != nil {
+	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "", true); err != nil {
 		t.Fatalf("runStop: %v", err)
 	}
 	var got stopRepoResult
@@ -669,4 +661,25 @@ func TestStop_ForceFailedEscalationWipesCaches(t *testing.T) {
 			t.Fatalf("force-failed should have wiped %s cache, err=%v", sid, err)
 		}
 	}
+}
+
+// Exercise the stop helpers still used by runtime upgrades and repository removal.
+func encodeStoppedRepositoryForTest(ctx context.Context, out io.Writer, repo, session string, force bool) error {
+	result, err := stopOneRepo(ctx, repo, session, force)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(out).Encode(result)
+}
+
+func stopRegisteredRepositoriesForTest(ctx context.Context, out io.Writer, force bool) error {
+	roots, err := paths.Resolve()
+	if err != nil {
+		return err
+	}
+	registry, err := central.Load(roots)
+	if err != nil {
+		return err
+	}
+	return runStopRegistry(ctx, out, force, true, registry)
 }
