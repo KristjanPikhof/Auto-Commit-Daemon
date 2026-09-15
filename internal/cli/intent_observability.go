@@ -1327,11 +1327,7 @@ func normalizeCommitFormatForReport(raw, fallback string) string {
 // decision_records table (fresh repo, never committed) leaves both fields at
 // their zero value rather than aborting the report.
 //
-// Denominator policy: both rates use a fixed denominator
-// (IntentRecentDecisionWindow / IntentRecentCommitWindow). When the ledger
-// holds fewer rows than the window, the rate dilutes toward zero — this
-// keeps the metric stable and comparable across repos at the cost of
-// understating short-term spikes during the first 100 decisions.
+// Rates use actual bounded sample counts; warning eligibility is separate.
 func loadIntentRecentRates(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
 	ok, err := sqliteTableExists(ctx, conn, "decision_records")
 	if err != nil {
