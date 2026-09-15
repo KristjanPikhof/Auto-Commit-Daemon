@@ -40,7 +40,7 @@ package state
 // adds immutable event membership for newly prepared Intent repairs; v25
 // freezes the runtime strategy and provider identity used by publication
 // drains so restart recovery cannot reinterpret an Intent drain as Event.
-const SchemaVersion = 26
+const SchemaVersion = 27
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -930,6 +930,7 @@ CREATE TABLE IF NOT EXISTS publication_drains(
     commit_count        INTEGER NOT NULL DEFAULT 0 CHECK (commit_count >= 0),
     fallback_mode       TEXT NOT NULL DEFAULT '',
     last_error          TEXT NOT NULL DEFAULT '',
+    expected_index_digest TEXT NOT NULL DEFAULT '',
     staged_consent      INTEGER NOT NULL DEFAULT 0 CHECK (staged_consent IN (0,1)),
     staged_consumed     INTEGER NOT NULL DEFAULT 0 CHECK (staged_consumed IN (0,1)),
     created_ts          REAL NOT NULL,
