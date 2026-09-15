@@ -968,6 +968,9 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		treeOID, err := applyOpsAndWriteTree(eventCtx, repoRoot, indexFile, ops)
 		if err != nil {
 			cancelEvent()
+			if isIntentPlannerCircuitWait(err) || ctx.Err() != nil {
+				return sum, err
+			}
 			if markErr := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
 				Message:    err.Error(),
@@ -1017,7 +1020,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		// Build the commit on top of the new tree.
-		commitOID, err := buildCommitFromTree(eventCtx, repoRoot, treeOID, parent, ev, ops, msgFn)
+		commitOID, err := buildCommitFromTree(eventCtx, repoRoot, treeOID, parent, ev, ops, msgFn, opts.IntentHealth)
 		if err != nil {
 			cancelEvent()
 			if markErr := markFailed(ctx, db, ev, replayIssue{
@@ -4899,10 +4902,8 @@ func liveIndexOpsFromCaptureOps(ops []state.CaptureOp) []git.LiveIndexOp {
 // buildCommitFromTree composes the commit message and runs commit-tree on
 // the supplied tree OID. Returns the new commit OID; the caller is
 // responsible for update-ref.
-func buildCommitFromTree(ctx context.Context, repoRoot, treeOID, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn) (string, error) {
-	msg, err := evaluatePublication(ctx, func(jobCtx context.Context) (string, error) {
-		return msgFn(jobCtx, EventContext{Event: ev, Ops: ops})
-	})
+func buildCommitFromTree(ctx context.Context, repoRoot, treeOID, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn, health *IntentPlannerHealth) (string, error) {
+	msg, err := generatePublicationMessage(ctx, msgFn, EventContext{Event: ev, Ops: ops}, health)
 	if err != nil {
 		return "", fmt.Errorf("message: %w", err)
 	}
