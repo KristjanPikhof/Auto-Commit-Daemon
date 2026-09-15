@@ -46,6 +46,7 @@ type productEnvelope struct {
 }
 
 type productStatusData struct {
+	PublicationOutcome publicationOutcome `json:"publication_outcome"`
 	Repo                     string                       `json:"repo"`
 	Command                  string                       `json:"command"`
 	Registered               bool                         `json:"registered"`
@@ -107,6 +108,7 @@ func envelopeFromControl(result controlResult) productEnvelope {
 		Actions:    actions,
 		NextAction: next,
 		Data: productStatusData{
+			PublicationOutcome: result.PublicationOutcome,
 			Repo:                     result.Repo,
 			Command:                  result.Command,
 			Registered:               result.Registered,
