@@ -143,32 +143,10 @@ type intentStrategyReport struct {
 	PathQuiescenceGatedEvents int `json:"path_quiescence_gated_events,omitempty"`
 }
 
-// IntentRecentDecisionWindow is the fixed denominator for
-// PlannerErrorRateRecent — the number of most-recent decision_records rows
-// considered when computing the planner-error share. The value is fixed at
-// 100 so the metric is comparable across repos and over time; raising it
-// would smooth the rate further at the cost of taking longer to react to
-// new planner regressions.
+// Recent metrics use at most 100 observations; the denominator is the
+// actual sample count. Warnings require a full decision window.
 const IntentRecentDecisionWindow = 100
-
-// IntentRecentCommitWindow is the fixed denominator for
-// SingletonCommitRateRecent — the number of most-recent unique commit OIDs
-// considered when computing the singleton (one-event) commit share. Mirrors
-// IntentRecentDecisionWindow.
 const IntentRecentCommitWindow = 100
-
-// IntentPlannerErrorRateWarnThreshold is the planner-error rate above which
-// the diagnose remediation surfaces a warning. 0.05 (5%) reflects the
-// observed noise floor of healthy planner deployments under the Wave 2
-// retry+normalize stack; sustained rates above this are an operator signal
-// to inspect <gitDir>/acd/planner-rejects.jsonl.
-//
-// Warn gating: PlannerErrorRateRecentWarn is only set when the
-// decision_records table holds at least IntentRecentDecisionWindow
-// rows. Below the window a fresh ledger can trip the threshold simply
-// because the dilution denominator and the row count match (5 errors
-// out of 5 decisions = 0.05 = threshold), which is a noise signal, not
-// an operator-actionable regression.
 const IntentPlannerErrorRateWarnThreshold = 0.05
 
 type runtimeExperimentReport struct {
