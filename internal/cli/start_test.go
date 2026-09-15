@@ -91,17 +91,6 @@ func registerEnabledStartRepo(t *testing.T, repoDir string) {
 	}
 }
 
-func openStartDB(t *testing.T, repoDir string) *state.DB {
-	t.Helper()
-	ctx := context.Background()
-	db, err := state.Open(ctx, state.DBPathFromGitDir(filepath.Join(repoDir, ".git")))
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
-}
-
 func commitStartRepoSeed(t *testing.T, repoDir string) string {
 	t.Helper()
 	ctx := context.Background()
