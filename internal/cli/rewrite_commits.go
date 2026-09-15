@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+"time"
+"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 
 	"github.com/spf13/cobra"
 
@@ -654,6 +656,17 @@ func applySavedRewritePlan(ctx context.Context, out io.Writer, repoFlag string, 
 		if pending.Count > 0 {
 			return fmt.Errorf("acd history rewrite: %d protected change(s) are still waiting to be published; run `acd commit-all`, then try again", pending.Count)
 		}
+	}
+
+	if !opts.dryRun {
+		state.RecordActivity(ctx, db, time.Now())
+		fp, err := identity.CaptureContext(ctx, os.Getpid())
+		if err != nil { return err }
+		if err := state.MetaSetJSON(ctx, db, state.RewritePIDMetaKey, state.RewriteActivity{PID: os.Getpid(), Fingerprint: daemon.FingerprintToken(fp)}); err != nil { return err }
+		defer func() {
+			_ = state.MetaSet(context.Background(), db, state.RewritePIDMetaKey, "")
+			state.RecordActivity(context.Background(), db, time.Now())
+		}()
 	}
 
 	res, err := git.ApplyRewritePlan(ctx, repo, git.RewriteApplyOptions{
