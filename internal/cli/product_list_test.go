@@ -22,11 +22,11 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
-func TestProductListOnceNeedsActionHumanRendersThenExitsThree(t *testing.T) {
+func TestProductListAllNeedsActionHumanRendersThenExitsThree(t *testing.T) {
 	registerProductListNeedsActionRepo(t)
 
 	var out bytes.Buffer
-	err := runProductListOnce(context.Background(), &out, false, false)
+	err := runProductListOnceView(context.Background(), &out, false, false, true)
 	if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
 		t.Fatalf("exit=%d rendered=%v err=%v, want rendered exit %d", ExitCode(err), ErrorRendered(err), err, ExitActionRequired)
 	}
@@ -341,7 +341,7 @@ func TestProductListWatchNeedsActionContinuesRefreshing(t *testing.T) {
 	defer cancel()
 	out := &productListFrameWriter{cancel: cancel, want: 2}
 
-	if err := runProductListWatch(ctx, out, time.Millisecond, false); err != nil {
+	if err := runProductListWatchView(ctx, out, time.Millisecond, false, true); err != nil {
 		t.Fatalf("watch: %v", err)
 	}
 	if frames := out.frameCount(); frames < 2 {
@@ -410,103 +410,70 @@ func TestProductListPersistentFlagsAreHandled(t *testing.T) {
 	})
 }
 
-func TestProductListSelectionKeepsRelevantAndFillsFive(t *testing.T) {
-	base := time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
+func TestProductListSelectionShowsAllRecentActivity(t *testing.T) {
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
 	entries := []productListEntry{
-		{Repo: "/broken", ActionRequired: true, State: productStateNeedsAction, lastActivity: base.Add(1 * time.Minute)},
-		{Repo: "/working", State: productStatePublishing, PendingEvents: 2, lastActivity: base.Add(2 * time.Minute)},
-		{Repo: "/waiting", State: productStateWaiting, OperationalState: "waiting", lastActivity: base.Add(3 * time.Minute)},
+		{Repo: "/broken-recent", ActionRequired: true, lastActivity: now.Add(-time.Minute)},
+		{Repo: "/broken-idle", ActionRequired: true, lastActivity: now.Add(-2 * time.Hour)},
+		{Repo: "/working-old", PendingEvents: 2},
+		{Repo: "/waiting-old", UnfinishedWork: true},
 	}
-	for index := 0; index < 6; index++ {
-		entries = append(entries, productListEntry{
-			Repo: fmt.Sprintf("/healthy-%d", index), State: productStateProtected,
-			Protected: true, lastActivity: base.Add(time.Duration(index) * time.Minute),
-		})
+	for i := 0; i < 8; i++ {
+		entries = append(entries, productListEntry{Repo: fmt.Sprintf("/healthy-%d", i), lastActivity: now.Add(-time.Duration(i) * time.Minute)})
 	}
 	sortProductListEntries(entries)
-
-	visible, hidden := selectProductListEntries(entries, false)
-	if len(visible) != productListDefaultRows || hidden != 4 {
-		t.Fatalf("visible=%d hidden=%d, want 5 and 4", len(visible), hidden)
+	visible, hidden := selectProductListEntriesAt(entries, false, now)
+	if len(visible) != 11 || hidden != 1 {
+		t.Fatalf("visible=%d hidden=%d", len(visible), hidden)
 	}
-	for _, repo := range []string{"/broken", "/working", "/waiting"} {
-		if !productListContainsRepo(visible, repo) {
-			t.Fatalf("mandatory repository %s was hidden: %+v", repo, visible)
-		}
+	if productListContainsRepo(visible, "/broken-idle") {
+		t.Fatal("idle warning pinned a row")
 	}
-	for _, repo := range []string{"/healthy-5", "/healthy-4"} {
-		if !productListContainsRepo(visible, repo) {
-			t.Fatalf("recent repository %s did not fill the view: %+v", repo, visible)
-		}
-	}
-	all, hidden := selectProductListEntries(entries, true)
+	all, hidden := selectProductListEntriesAt(entries, true, now)
 	if len(all) != len(entries) || hidden != 0 {
-		t.Fatalf("--all selected %d hidden %d, want %d and 0", len(all), hidden, len(entries))
+		t.Fatal("all must remain exhaustive")
 	}
 }
 
-func TestProductListSelectionPrefersRecentWorkOverPaused(t *testing.T) {
-	base := time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
-	entries := []productListEntry{
-		{Repo: "/paused-new", State: productStateNeedsAction, OperationalState: "paused", lastActivity: base.Add(10 * time.Minute)},
-		{Repo: "/healthy-new", State: productStateProtected, Protected: true, lastActivity: base.Add(9 * time.Minute)},
-		{Repo: "/waiting", State: productStateWaiting, OperationalState: "waiting", lastActivity: base.Add(8 * time.Minute)},
-		{Repo: "/healthy-old", State: productStateProtected, Protected: true, lastActivity: base.Add(7 * time.Minute)},
-		{Repo: "/working", State: productStatePublishing, PendingEvents: 1, lastActivity: base},
-		{Repo: "/broken", State: productStateNeedsAction, ActionRequired: true, lastActivity: base},
-	}
-	sortProductListEntries(entries)
-
-	visible, hidden := selectProductListEntries(entries, false)
-	want := []string{"/broken", "/waiting", "/working", "/healthy-new", "/healthy-old"}
-	if len(visible) != len(want) || hidden != 1 {
-		t.Fatalf("visible=%d hidden=%d, want %d and 1: %+v", len(visible), hidden, len(want), visible)
-	}
-	for index, repo := range want {
-		if visible[index].Repo != repo {
-			t.Fatalf("visible[%d]=%s, want %s: %+v", index, visible[index].Repo, repo, visible)
-		}
-	}
-}
-
-func TestProductListSelectionKeepsPausedActionRequired(t *testing.T) {
-	base := time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
-	entries := []productListEntry{{
-		Repo: "/blocked-drain", State: productStateNeedsAction,
-		OperationalState: "paused", ActionRequired: true,
-		lastActivity: base,
-	}}
-	for index := 0; index < productListDefaultRows+2; index++ {
-		entries = append(entries, productListEntry{
-			Repo:  fmt.Sprintf("/healthy-%d", index),
-			State: productStateProtected, Protected: true,
-			lastActivity: base.Add(time.Duration(index+1) * time.Minute),
+func TestProductListSelectionUsesExactIdleCutoff(t *testing.T) {
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name                string
+		age                 time.Duration
+		unfinished, visible bool
+	}{
+		{"before", time.Hour - time.Second, false, true},
+		{"at", time.Hour, false, false},
+		{"after", time.Hour + time.Second, false, false},
+		{"unfinished", 2 * time.Hour, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []productListEntry{{Repo: "/repo", lastActivity: now.Add(-tc.age), UnfinishedWork: tc.unfinished}}
+			visible, _ := selectProductListEntriesAt(entries, false, now)
+			if (len(visible) == 1) != tc.visible {
+				t.Fatalf("visible=%v", visible)
+			}
 		})
 	}
-	sortProductListEntries(entries)
+}
 
-	visible, hidden := selectProductListEntries(entries, false)
-	if !productListContainsRepo(visible, "/blocked-drain") {
-		t.Fatalf("paused action-required drain was hidden: %+v", visible)
+func TestProductListSelectionKeepsPausedUnfinishedWork(t *testing.T) {
+	entries := []productListEntry{
+		{Repo: "/blocked-drain", OperationalState: "paused", ActionRequired: true, UnfinishedWork: true},
+		{Repo: "/paused-idle", OperationalState: "paused", ActionRequired: true},
+		{Repo: "/worker-restart", OperationalState: "retrying", WorkerState: "starting"},
 	}
-	if len(visible) != productListDefaultRows || hidden != 3 {
-		t.Fatalf("visible=%d hidden=%d, want %d and 3",
-			len(visible), hidden, productListDefaultRows)
+	visible, hidden := selectProductListEntries(entries, false)
+	if len(visible) != 1 || visible[0].Repo != "/blocked-drain" || hidden != 2 {
+		t.Fatalf("visible=%+v hidden=%d", visible, hidden)
 	}
 }
 
-func TestProductListSelectionUsesPausedAsFallback(t *testing.T) {
-	entries := []productListEntry{
-		{Repo: "/working", State: productStatePublishing, PendingEvents: 1},
-		{Repo: "/recent", State: productStateProtected, Protected: true},
-		{Repo: "/paused-a", State: productStateNeedsAction, OperationalState: "paused"},
-		{Repo: "/paused-b", State: productStateNeedsAction, OperationalState: "paused"},
-	}
-	sortProductListEntries(entries)
+func TestProductListSelectionHasNoIdleFallback(t *testing.T) {
+	entries := []productListEntry{{Repo: "/idle"}, {Repo: "/paused", OperationalState: "paused"}}
 	visible, hidden := selectProductListEntries(entries, false)
-	if len(visible) != len(entries) || hidden != 0 ||
-		visible[2].Repo != "/paused-a" || visible[3].Repo != "/paused-b" {
-		t.Fatalf("paused repositories were not used as the final fallback: %+v", visible)
+	if len(visible) != 0 || hidden != 2 {
+		t.Fatalf("visible=%+v hidden=%d", visible, hidden)
 	}
 }
 
@@ -542,7 +509,7 @@ func TestProductListAllControlsOnlyHumanFiltering(t *testing.T) {
 	if err := runProductListOnceView(context.Background(), &compact, false, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(compact.String(), "2 repositories hidden; use acd list --all") || strings.Contains(compact.String(), "repo-6") {
+	if !strings.Contains(compact.String(), "7 repositories hidden; use acd list --all") || strings.Contains(compact.String(), "repo-6") {
 		t.Fatalf("default view did not stay compact:\n%s", compact.String())
 	}
 
@@ -645,7 +612,7 @@ func TestProductListWatchKeepsKnownAttentionAcrossUnknownRead(t *testing.T) {
 		frames++
 		entry := productListEntry{
 			Repo: "/repo", State: productStateNeedsAction, ActionRequired: true,
-			Protected: false,
+			Protected: false, lastActivity: time.Now(),
 		}
 		if frames == 2 {
 			entry = productListEntry{
@@ -741,7 +708,7 @@ func assertProductListSchemaUnchanged(t *testing.T, dbPath string, want int) {
 	}
 }
 
-func TestProductListSortingUsesSeverityThenActivity(t *testing.T) {
+func TestProductListSortingUsesActivityThenPath(t *testing.T) {
 	base := time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
 	entries := []productListEntry{
 		{Repo: "/healthy", State: productStateProtected, lastActivity: base.Add(4 * time.Minute)},
@@ -752,7 +719,7 @@ func TestProductListSortingUsesSeverityThenActivity(t *testing.T) {
 		{Repo: "/paused", State: productStateNeedsAction, OperationalState: "paused", lastActivity: base.Add(5 * time.Minute)},
 	}
 	sortProductListEntries(entries)
-	want := []string{"/broken", "/waiting", "/working-new", "/working-old", "/healthy", "/paused"}
+	want := []string{"/paused", "/healthy", "/waiting", "/working-new", "/broken", "/working-old"}
 	for index := range want {
 		if entries[index].Repo != want[index] {
 			t.Fatalf("order[%d]=%s, want %s: %+v", index, entries[index].Repo, want[index], entries)
@@ -760,7 +727,7 @@ func TestProductListSortingUsesSeverityThenActivity(t *testing.T) {
 	}
 }
 
-func TestProductListHeartbeatsDoNotChangeRecentWork(t *testing.T) {
+func TestProductListHooksCountButWorkerHeartbeatsDoNot(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	db, err := state.Open(ctx, dbPath)
@@ -789,9 +756,9 @@ func TestProductListHeartbeatsDoNotChangeRecentWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := time.Unix(record.LastSeenTS, 0)
+	want := time.Unix(now.Unix(), 0)
 	if !overview.lastActivity.Equal(want) {
-		t.Fatalf("heartbeat changed recent work from %s to %s", want, overview.lastActivity)
+		t.Fatalf("hook activity got %s want %s", want, overview.lastActivity)
 	}
 }
 
@@ -889,7 +856,7 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 		t.Fatalf("transient read failure became an alert: %+v", entry)
 	}
 	var out bytes.Buffer
-	if err := renderProductListDashboard(&out, []productListEntry{entry}, false, false); err != nil {
+	if err := renderProductListDashboard(&out, []productListEntry{entry}, false, true); err != nil {
 		t.Fatal(err)
 	}
 	if line := productListLineForRepo(t, out.String(), "repo"); !strings.Contains(line, "-     -") {
