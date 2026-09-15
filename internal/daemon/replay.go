@@ -2724,7 +2724,9 @@ func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item i
 			Source:         "per-event",
 		}, nil
 	}
-	msg, err := msgFn(ctx, EventContext{Event: item.event, Ops: item.ops})
+	msg, err := evaluatePublication(ctx, func(jobCtx context.Context) (string, error) {
+		return msgFn(jobCtx, EventContext{Event: item.event, Ops: item.ops})
+	})
 	if err != nil {
 		return ai.IntentPlan{}, fmt.Errorf("singleton fast path message: %w", err)
 	}
@@ -2836,7 +2838,9 @@ func planIntentWithFallback(
 	}
 
 	var validationFailure string
-	plan, err := planner.PlanIntent(ctx, req)
+	plan, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlan, error) {
+		return planner.PlanIntent(jobCtx, req)
+	})
 	plannerCallFailed := err != nil
 	if err == nil {
 		// Defense in depth against third-party planners that skip the helper.
@@ -4896,7 +4900,9 @@ func liveIndexOpsFromCaptureOps(ops []state.CaptureOp) []git.LiveIndexOp {
 // the supplied tree OID. Returns the new commit OID; the caller is
 // responsible for update-ref.
 func buildCommitFromTree(ctx context.Context, repoRoot, treeOID, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn) (string, error) {
-	msg, err := msgFn(ctx, EventContext{Event: ev, Ops: ops})
+	msg, err := evaluatePublication(ctx, func(jobCtx context.Context) (string, error) {
+		return msgFn(jobCtx, EventContext{Event: ev, Ops: ops})
+	})
 	if err != nil {
 		return "", fmt.Errorf("message: %w", err)
 	}

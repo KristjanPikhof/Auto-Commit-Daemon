@@ -1209,7 +1209,9 @@ func preflightIntentCandidateMaterialization(
 			}
 			selected = append(selected, capture)
 		}
-		if err := materialize(ctx, selected); err != nil {
+		if _, err := evaluatePublication(ctx, func(jobCtx context.Context) (struct{}, error) {
+			return struct{}{}, materialize(jobCtx, selected)
+		}); err != nil {
 			return fmt.Errorf(
 				"daemon: intent candidates: preflight materialization: %w", err)
 		}
@@ -1360,8 +1362,9 @@ func chooseIntentCandidatePlan(
 			}
 			retryCount = run.AttemptCount - 1
 			attemptCtx := prompttrace.WithRetryCount(ctx, retryCount)
-			plan, err := ai.PlanIntentV2WithCompatibility(
-				attemptCtx, planner, plannerRequest)
+			plan, err := evaluatePublication(attemptCtx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
+				return ai.PlanIntentV2WithCompatibility(jobCtx, planner, plannerRequest)
+			})
 			if rejected, ok := ai.RejectedIntentPlanV2(err); ok {
 				plan = rejected
 			}
@@ -2474,7 +2477,9 @@ func evaluateIntentCandidateAssignment(
 		results = append(results, pendingIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityMaterialization, "materializer_unavailable",
 			"exact candidate materialization has not run"))
-	} else if err := input.Materialize(ctx, candidateCaptures); err != nil {
+	} else if _, err := evaluatePublication(ctx, func(jobCtx context.Context) (struct{}, error) {
+		return struct{}{}, input.Materialize(jobCtx, candidateCaptures)
+	}); err != nil {
 		results = append(results, failedIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityMaterialization, "materialization_failed", err))
 	} else {
