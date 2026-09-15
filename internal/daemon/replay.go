@@ -263,6 +263,7 @@ type ReplayOpts struct {
 	// the candidate engine's built-in atomicity and materialization gates.
 	IntentVerificationMode string
 	IntentCandidateVerify  IntentCandidateVerifier
+	ManagedVerification    bool
 	// IntentRepairCommitVerify validates exact commit-tree output before an
 	// automatic repair changes the branch ref.
 	IntentRepairCommitVerify git.IntentRepairCommitVerifier

@@ -133,6 +133,7 @@ func replayIntentCandidateBatch(
 			repoRoot, opts.GitDir, parent),
 		VerificationMode:    opts.IntentVerificationMode,
 		Verify:              opts.IntentCandidateVerify,
+		ManagedVerification: opts.ManagedVerification,
 		Now:                 time.Now().UTC(),
 		TargetEventSeqs:     cfg.targetEventSeqs,
 		RejectLocalFallback: cfg.semanticSalvage,

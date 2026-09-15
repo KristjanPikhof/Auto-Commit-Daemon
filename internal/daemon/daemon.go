@@ -3083,7 +3083,7 @@ func Run(ctx context.Context, opts Options) error {
 						evaluationCtx, cancelEvaluation := context.WithCancel(passCtx)
 						defer cancelEvaluation()
 						evaluation := &publicationEvaluation{
-							gate: opts.OperationGate, cancel: cancelEvaluation,
+							gate: opts.OperationGate, db: opts.DB, cancel: cancelEvaluation,
 							wake: wakeCh, files: fsWakeReader, changes: validationWakeCh, shutdown: shutdownCh,
 							onShutdown: func() { evaluationShutdown = true },
 							identity: func(checkCtx context.Context) (string, error) {
@@ -3134,6 +3134,7 @@ func Run(ctx context.Context, opts Options) error {
 							IntentPreset:               passBundle.IntentPreset,
 							IntentVerificationMode:     passBundle.IntentVerificationMode,
 							IntentCandidateVerify:      candidateVerify,
+							ManagedVerification:        true,
 							IntentRepairCommitVerify:   repairCommitVerify,
 							IntentRepairEnabled:        passBundle.IntentRepairEnabled,
 							IntentRepairHorizon:        passBundle.IntentRepairHorizon,

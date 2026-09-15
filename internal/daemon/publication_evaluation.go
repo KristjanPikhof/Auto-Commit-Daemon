@@ -19,6 +19,7 @@ import (
 // replay retains its runtime lease and frozen inputs until this returns.
 type publicationEvaluation struct {
 	gate                           *sync.RWMutex
+	db                             *state.DB
 	cancel                         context.CancelFunc
 	identity                       func(context.Context) (string, error)
 	protect                        func(context.Context) error

@@ -93,6 +93,7 @@ type IntentCandidateEvaluation struct {
 	PreflightMaterialize IntentCandidateMaterializer
 	VerificationMode     string
 	Verify               IntentCandidateVerifier
+	ManagedVerification  bool
 	Now                  time.Time
 	TargetEventSeqs      []int64
 	RejectLocalFallback  bool
@@ -2574,7 +2575,7 @@ func evaluateIntentCandidateAssignment(
 				CandidateID:         assignment.CandidateID,
 				PlanFingerprint:     input.planFingerprint,
 				RecoveryCandidateID: input.RecoveryCandidateID,
-			}, input.Verify, assignment, candidateCaptures)
+			}, input.Verify, assignment, candidateCaptures, input.ManagedVerification)
 		if errors.Is(verifyErr, verification.ErrResourceUnavailable) {
 			verificationResult = IntentCandidateVerification{}
 			verificationDeferred = true
