@@ -69,42 +69,51 @@ Use --path for one file, --commit for an ACD or externally-handled commit, or
 }
 
 func runExplain(ctx context.Context, out io.Writer, repo, path, commit string, last bool, since int64, limit int, jsonOut bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if since < 0 {
-		return fmt.Errorf("acd explain: --since must be non-negative")
-	}
-	if limit <= 0 {
-		return fmt.Errorf("acd explain: --limit must be positive")
-	}
-	if path != "" && (commit != "" || last) {
-		return fmt.Errorf("acd explain: choose only one of --path, --commit, or --last")
-	}
-	if commit != "" && last {
-		return fmt.Errorf("acd explain: choose only one of --commit or --last")
-	}
-
-	rec, err := eventsRepoRecord(repo)
+	report, err := collectExplain(ctx, repo, path, commit, last, since, limit)
 	if err != nil {
 		return err
 	}
-	db, err := openStateDBReadOnly(ctx, rec.StateDB)
-	if err != nil {
-		return fmt.Errorf("acd explain: open state.db read-only for repo %s: %w", rec.Path, err)
-	}
-	defer db.Close()
 
-	report, err := buildExplainReport(ctx, rec.Path, db, path, commit, last, since, limit)
-	if err != nil {
-		return err
-	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(report)
 	}
 	return renderExplainHuman(out, report)
+}
+
+func collectExplain(ctx context.Context, repo, path, commit string, last bool, since int64, limit int) (explainReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if since < 0 {
+		return explainReport{}, fmt.Errorf("acd explain: --since must be non-negative")
+	}
+	if limit <= 0 {
+		return explainReport{}, fmt.Errorf("acd explain: --limit must be positive")
+	}
+	if path != "" && (commit != "" || last) {
+		return explainReport{}, fmt.Errorf("acd explain: choose only one of --path, --commit, or --last")
+	}
+	if commit != "" && last {
+		return explainReport{}, fmt.Errorf("acd explain: choose only one of --commit or --last")
+	}
+
+	rec, err := eventsRepoRecord(repo)
+	if err != nil {
+		return explainReport{}, err
+	}
+	db, err := openStateDBReadOnly(ctx, rec.StateDB)
+	if err != nil {
+		return explainReport{}, fmt.Errorf("acd explain: open state.db read-only for repo %s: %w", rec.Path, err)
+	}
+	defer db.Close()
+
+	report, err := buildExplainReport(ctx, rec.Path, db, path, commit, last, since, limit)
+	if err != nil {
+		return explainReport{}, err
+	}
+	return report, nil
 }
 
 func buildExplainReport(ctx context.Context, repo string, db *sql.DB, path, commit string, last bool, since int64, limit int) (explainReport, error) {
