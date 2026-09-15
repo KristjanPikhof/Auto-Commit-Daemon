@@ -49,7 +49,8 @@ The production integration baseline contained 114 top-level scenarios and
 613.40 seconds of summed scenario time. An unsharded run exceeded five minutes;
 its remaining cases were measured separately. Four shards follow the planned
 three-minute execution budget (`ceil(613.40 / 180)`). Deterministic manifests
-include every discovered test, example and fuzz seed exactly once per run.
+include every discovered test, example and fuzz target exactly once per run.
+Go runs each selected fuzz target against its complete seed corpus.
 Repeated stress intentionally runs the same selected cases three times.
 
 The full integration suite now belongs to required CI on Ubuntu and macOS.
