@@ -172,3 +172,39 @@ func publicationEvaluationIdentity(ctx context.Context, repoRoot, gitDir string,
 	}
 	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
 }
+
+// Health bookkeeping runs on the worker, around the immutable message call.
+func generatePublicationMessage(ctx context.Context, fn MessageFn, event EventContext, health *IntentPlannerHealth) (string, error) {
+	var permit IntentPlannerHealthPermit
+	if health != nil {
+		var err error
+		permit, err = health.Acquire(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
+	message, err := evaluatePublication(ctx, func(jobCtx context.Context) (string, error) { return fn(jobCtx, event) })
+	if err == nil && message == "" {
+		err = errors.New("selected provider returned an empty message")
+	}
+	if health != nil {
+		var failure error
+		if err != nil {
+			failure = &IntentPlannerTransportFailure{Err: err}
+		}
+		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
+			return "", healthErr
+		}
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		wait := &IntentPlannerCircuitOpenError{}
+		if health != nil {
+			wait.RetryAt = time.Unix(0, int64(health.Snapshot().NextProbeTS*1e9))
+		}
+		return "", wait
+	}
+	return message, nil
+}
