@@ -158,3 +158,27 @@ func TestCommitAllTargetScopePreservesQueuedRenamesAndChecksNewEndpoints(t *test
 		})
 	}
 }
+
+// Stored capture events support multiple ordered operations even though current
+// filesystem classification normally emits one operation per event.
+func TestCommitAllTargetScopeChecksEveryStoredOperation(t *testing.T) {
+	ctx := context.Background()
+	_, _, db := makeRepoStateDB(t)
+	seq := appendFixEvent(t, ctx, db, state.CaptureEvent{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: "head", Operation: "modify", Path: "source.go", Fidelity: "exact", State: state.EventStatePending}, []state.CaptureOp{
+		{Op: "modify", Path: "source.go", Fidelity: "exact"},
+		{Op: "rename", Path: "generated.go", OldPath: sql.NullString{String: "old_generated.go", Valid: true}, Fidelity: "exact"},
+	})
+	target := publicationDrainTarget{EventSeqs: []int64{seq}}
+	scope := commitAllScope{ChangedPaths: []commitAllPath{{Path: "source.go"}}}
+	for _, path := range []string{"generated.go", "old_generated.go"} {
+		matches, err := commitAllTargetMatchesScope(ctx, db, target, scope)
+		if err != nil || matches {
+			t.Fatalf("unapproved operation endpoint accepted: %v %v", matches, err)
+		}
+		scope.ChangedPaths = append(scope.ChangedPaths, commitAllPath{Path: path})
+	}
+	matches, err := commitAllTargetMatchesScope(ctx, db, target, scope)
+	if err != nil || !matches {
+		t.Fatalf("reviewed operations refused: %v %v", matches, err)
+	}
+}
