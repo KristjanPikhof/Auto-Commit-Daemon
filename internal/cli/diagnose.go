@@ -68,7 +68,7 @@ type diagnoseGeneratedPendingGroup struct {
 }
 
 type diagnoseReport struct {
-	PublicationOutcome publicationOutcome `json:"publication_outcome"`
+	PublicationOutcome         publicationOutcome              `json:"publication_outcome"`
 	Repo                       string                          `json:"repo"`
 	RepoHash                   string                          `json:"repo_hash"`
 	StateDB                    string                          `json:"state_db"`
