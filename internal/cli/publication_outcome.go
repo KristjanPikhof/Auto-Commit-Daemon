@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 )
 
 // publicationOutcome is a read-only projection of completed checkpoint
 // membership. Recovery preserves work but does not put it on the branch.
 // BranchCommitted is unknown when checkpoint state is unavailable.
 type publicationOutcome struct {
+	PendingClassification bool `json:"pending_classification"`
 	BranchCommitted  *bool   `json:"branch_committed"`
 	BranchChanges    int     `json:"branch_changes"`
 	RecoveredChanges int     `json:"recovered_changes"`
@@ -31,7 +34,10 @@ WHERE EXISTS (SELECT 1 FROM checkpoint_events ce JOIN checkpoints cp ON cp.id=ce
 	if err != nil {
 		return result, fmt.Errorf("publication outcome: %w", err)
 	}
-	committed := protected && result.WaitingChanges == 0 && result.RecoveredChanges == 0
+	pending, _, err := metaLookup(ctx, db, daemon.MetaKeyProtectionClassificationPending)
+	if err != nil { return result, err }
+	result.PendingClassification = pending == "true"
+	committed := protected && !result.PendingClassification && result.WaitingChanges == 0 && result.RecoveredChanges == 0
 	result.BranchCommitted = &committed
 	return result, nil
 }
@@ -40,6 +46,7 @@ func checkpointOutcome(phase string, events, published, recovered int) string {
 	if phase != "completed" {
 		return phase
 	}
+	if events == 0 { return "saved" }
 	if published == events {
 		return "published"
 	}
