@@ -29,6 +29,8 @@
 
 ### Fixed
 
+- Cancelled recovery transactions let Git release its ref locks before stopping,
+  so a later recovery attempt can proceed.
 - Checkpoint waits keep their timeout reason and rejected-checkpoint details
   when the deadline interrupts a Git or database lookup.
 - Slow external-history checks now record their timeout even when Git reports
