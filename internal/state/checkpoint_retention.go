@@ -115,7 +115,7 @@ func PreparedCheckpointPrunes(ctx context.Context, db *DB) ([]PreparedCheckpoint
 	rows, err := db.readSQL().QueryContext(ctx, `
 SELECT o.id,s.proof_id,s.target,s.before_digest
 FROM operations o JOIN operation_steps s ON s.operation_id=o.id
-WHERE o.kind='checkpoint_gc' AND o.status='prepared' AND s.ord=1
+WHERE o.kind='checkpoint_gc' AND o.status IN ('prepared','needs_action') AND s.ord=1
 ORDER BY o.created_ts,o.id`)
 	if err != nil {
 		return nil, err

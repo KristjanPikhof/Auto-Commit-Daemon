@@ -805,15 +805,12 @@ func Run(ctx context.Context, opts Options) error {
 	if err := checkpointStore.RecoverPrepared(ctx, opts.RepoPath); err != nil {
 		return fmt.Errorf("daemon: recover protection checkpoints: %w", err)
 	}
-	if err := checkpointStore.RecoverRetention(ctx, opts.RepoPath); err != nil {
-		return fmt.Errorf("daemon: recover checkpoint retention: %w", err)
-	}
 	if _, err := reconcileResolvedPublicationDrains(
 		ctx, opts.DB, logger, "worker_startup", now(),
 	); err != nil {
 		return fmt.Errorf("daemon: reconcile resolved publication drains: %w", err)
 	}
-	// Do not advertise running until every crash journal has been recovered;
+	// Do not advertise running until protection/publication journals are recovered;
 	// setup and status use this stamp as the worker readiness barrier.
 	heartbeatNow("running", "daemon started")
 	var shutdownCh <-chan struct{}
