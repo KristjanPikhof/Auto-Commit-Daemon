@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"archive/zip"
 	"bufio"
 	"bytes"
@@ -85,6 +86,7 @@ type doctorRepoReport struct {
 	WorktreeClean            bool                      `json:"worktree_clean"`
 	AllChangesCommittedInGit bool                      `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD bool                      `json:"checkpoint_published_by_acd"`
+	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
 	PublicationDrain         publicationDrainReport    `json:"publication_drain"`
 }
 
@@ -295,6 +297,8 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 				rr.AllChangesCommittedInGit = status.AllChangesCommittedInGit
 				rr.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 				rr.PublicationDrain = status.PublicationDrain
+				rr.CheckpointMaintenance = status.CheckpointMaintenance
+				if details := maintenanceDetails(status.CheckpointMaintenance); details != "" { rr.Notes = append(rr.Notes, details+" "+status.CheckpointMaintenance.NextAction()) }
 			} else {
 				rr.Notes = append(rr.Notes, "status truth failed: "+statusErr.Error())
 			}
