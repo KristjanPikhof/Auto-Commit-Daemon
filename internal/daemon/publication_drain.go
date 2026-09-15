@@ -116,6 +116,31 @@ func failPublicationDrainRuntimeContract(
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 }
 
+// Validate and activate an explicitly selected replacement before deciding
+// whether the old target can be preserved and recaptured under that contract.
+func publicationDrainCanActivateReplacement(ctx context.Context, db *state.DB, drain state.PublicationDrain) (bool, error) {
+	runtime, err := state.RuntimeConfigActivationState(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	if !runtime.DesiredRevisionID.Valid || runtime.DesiredRevisionID.Int64 <= drain.ConfigRevisionID {
+		return false, nil
+	}
+	reason := publicationDrainReason(drain)
+	if drain.Phase == state.PublicationDrainNeedsAction && (reason == publicationReasonProviderConfiguration || reason == publicationReasonSemanticUnavailable) {
+		return true, nil
+	}
+	revision, err := state.ConfigRevisionByID(ctx, db, runtime.DesiredRevisionID.Int64)
+	if err != nil {
+		return false, err
+	}
+	strategy, format, provider, _, err := publicationRuntimeRevisionContract(revision)
+	if err != nil {
+		return false, err
+	}
+	return strategy == drain.CommitStrategy && format == drain.CommitFormat && provider == (ai.DeterministicProvider{}).Name(), nil
+}
+
 func publicationDrainHasAppliedAlternativeRuntime(
 	ctx context.Context,
 	db *state.DB,
