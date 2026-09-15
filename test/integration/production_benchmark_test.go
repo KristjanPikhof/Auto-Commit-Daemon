@@ -67,7 +67,7 @@ func TestProductionMeasurements(t *testing.T) {
 	t.Cleanup(func() { unblock(); stopSessionForce(t, env, repo) })
 	startSessionJSON(t, ctx, env, repo, "production-measurements", "shell")
 	waitMode(t, repo, "running", 5*time.Second)
-	metrics := map[string]any{"binary": "release-style", "scope": "isolated worker"}
+	metrics := map[string]any{"binary": "release-style", "runtime_scope": "isolated worker"}
 	defer func() {
 		data, err := json.Marshal(metrics)
 		if err != nil {
@@ -77,12 +77,21 @@ func TestProductionMeasurements(t *testing.T) {
 		t.Logf("ACD_MEASUREMENT %s", data)
 	}()
 	pid := readDaemonStatePID(repo)
-	if out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "%cpu=", "-o", "rss=").Output(); err == nil {
-		fields := strings.Fields(string(out))
-		if len(fields) == 2 {
-			metrics["idle_sample_lifetime_cpu_percent"], _ = strconv.ParseFloat(fields[0], 64)
-			metrics["idle_rss_kib"], _ = strconv.Atoi(fields[1])
-		}
+	idleStart := time.Now()
+	cpuBefore, _, beforeOK := productionProcessResources(pid)
+	// A bounded observation window measures idle CPU consumption rather than
+	// ps %cpu, whose lifetime average includes startup work.
+	select {
+	case <-time.After(time.Second):
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	cpuAfter, rss, afterOK := productionProcessResources(pid)
+	metrics["idle_resources_available"] = beforeOK && afterOK
+	if beforeOK && afterOK {
+		metrics["idle_cpu_seconds"] = cpuAfter - cpuBefore
+		metrics["idle_sample_seconds"] = time.Since(idleStart).Seconds()
+		metrics["idle_rss_kib"] = rss
 	}
 	checkpoint := func(name string) time.Duration {
 		before, err := strconv.ParseInt(readDaemonStateScalar(repo,
@@ -132,4 +141,33 @@ WHERE e.state='published' AND o.path IN ('first.txt','during-provider.txt')`) ==
 			t.Fatalf("published %s bytes=%q", name, got)
 		}
 	}
+}
+
+// ps reports cumulative CPU as [[days-]hours:]minutes:seconds and RSS in KiB.
+func productionProcessResources(pid int) (float64, int, bool) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "time=", "-o", "rss=").Output()
+	fields := strings.Fields(string(out))
+	if err != nil || len(fields) != 2 {
+		return 0, 0, false
+	}
+	clock := fields[0]
+	seconds := 0.0
+	if days, rest, ok := strings.Cut(clock, "-"); ok {
+		value, err := strconv.ParseFloat(days, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		seconds = value * 24 * 60 * 60
+		clock = rest
+	}
+	timeValue := 0.0
+	for _, part := range strings.Split(clock, ":") {
+		value, err := strconv.ParseFloat(part, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		timeValue = timeValue*60 + value
+	}
+	rss, err := strconv.Atoi(fields[1])
+	return seconds + timeValue, rss, err == nil
 }
