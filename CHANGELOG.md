@@ -2,10 +2,19 @@
 
 ## Unreleased
 
+### Changed
+
+- `acd list` shows repositories active in the last hour and keeps unfinished
+  work visible. Hook activity survives session closure, idle warnings no longer
+  fill the compact view, and rows keep their positions during terminal refreshes.
+  `--all` and JSON remain exhaustive; compact exit status follows visible rows.
+
 ### Fixed
 
-- Setup now configures a Git identity in its scratch repository so the isolated
-  publication self-test can create commits without the user's global Git config.
+- Checkpoint maintenance failures report the actual error instead of claiming
+  storage is over budget. Retries back off to fifteen minutes, survive restarts,
+  and clear the failure after recovery. Interrupted pruning retains its ref
+  proofs, and maintenance warnings no longer hide publication safety blocks.
 
 ## v2026-09-02
 
