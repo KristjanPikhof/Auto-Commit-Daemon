@@ -84,3 +84,21 @@ checkpoints older than seven days but never below 100. Protected-only content
 over budget is retained and reported, never discarded.
 
 Expected private refs make retained objects survive `git gc --prune=now`.
+
+Checkpoint maintenance normally runs hourly. Failed checks retry after one,
+two, five, then fifteen minutes, with later retries fifteen minutes apart.
+The retry schedule survives worker restarts. A successful check clears the
+failure and returns to hourly maintenance.
+
+A failed inventory is reported as a maintenance failure, not a storage-budget
+warning. Status, list, doctor, and diagnose share the saved outcome. Detailed
+reports include the error, next check, and last successful storage measurement.
+Temporary failures retry automatically. An external prerequisite, such as the
+Xcode license agreement, names the action needed and is rechecked automatically.
+ACD does not accept licenses on the user's behalf.
+
+Interrupted pruning retries through the recorded ref proof. A moved ref remains
+untouched and requires attention until safe recovery can be proven. Independent
+checkpoint protection and publication continue while maintenance is waiting.
+`acd repo gc` cleans registration records; it does not clear maintenance errors
+or prune protected checkpoints.
