@@ -874,8 +874,9 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		return projection, nil
 	case "checkpoint_barrier":
 		var params struct {
-			DrainPublication bool `json:"drain_publication"`
-			ConsumeStaged    bool `json:"consume_staged"`
+			DrainPublication bool   `json:"drain_publication"`
+			ConsumeStaged    bool   `json:"consume_staged"`
+			PreviewDigest    string `json:"preview_digest"`
 		}
 		_ = json.Unmarshal(request.Params, &params)
 		var drainAnchor publicationDrainTarget
@@ -884,6 +885,13 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		publicationWorktreeID := checkpointpkg.WorktreeID(runtime.worktree.Root)
 		runtime.gate.Lock()
 		if params.DrainPublication {
+			if params.PreviewDigest != "" {
+				current, previewErr := inspectCommitAllScope(ctx, runtime.worktree.Root, runtime.db.Path())
+				if previewErr != nil || current.Digest != params.PreviewDigest {
+					runtime.gate.Unlock()
+					return nil, &supervisor.ProtocolError{Code: "plan_changed", Message: "commit-all scope or staging changed; run `acd commit-all` to review again"}
+				}
+			}
 			reason, unsafeErr := publicationUnsafeReason(
 				ctx, runtime.worktree, params.ConsumeStaged)
 			if unsafeErr != nil {

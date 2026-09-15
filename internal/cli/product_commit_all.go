@@ -20,34 +20,35 @@ import (
 )
 
 type productCommitAllResult struct {
-	Repo               string  `json:"repo"`
-	CheckpointID       string  `json:"checkpoint_id,omitempty"`
-	DrainID            string  `json:"drain_id,omitempty"`
-	Phase              string  `json:"phase,omitempty"`
-	Protected          bool    `json:"protected"`
-	PublicationDrained bool    `json:"publication_drained"`
-	TargetEventSeq     int64   `json:"target_event_seq"`
-	TargetEvents       int64   `json:"target_events"`
-	PublishedEvents    int64   `json:"published_events"`
-	RemainingEvents    int64   `json:"remaining_events"`
-	RecoveredEvents    int64   `json:"recovered_events,omitempty"`
-	TerminalEvents     int64   `json:"terminal_events,omitempty"`
-	CommitsCreated     int64   `json:"commits_created"`
-	WaitingReason      string  `json:"waiting_reason,omitempty"`
-	FallbackMode       string  `json:"fallback_mode,omitempty"`
-	LastError          string  `json:"last_error,omitempty"`
-	SemanticAttempts   int64   `json:"semantic_rebuild_attempts,omitempty"`
-	EventFallbackCount int64   `json:"event_fallback_count,omitempty"`
-	LastProgressTS     float64 `json:"last_progress_ts,omitempty"`
-	StagedConsumed     bool    `json:"staged_consumed,omitempty"`
-	WorktreeChanges    int     `json:"worktree_changes,omitempty"`
-	PendingEvents      int     `json:"pending_events,omitempty"`
-	DryRun             bool    `json:"dry_run,omitempty"`
-	SemanticGroupCount int     `json:"semantic_group_count,omitempty"`
-	PlanAttempt        int     `json:"plan_attempt,omitempty"`
-	PlanAttemptLimit   int     `json:"plan_attempt_limit,omitempty"`
-	ResolutionMode     string  `json:"resolution_mode,omitempty"`
-	SingletonCount     int     `json:"singleton_count,omitempty"`
+	Preview            *commitAllScope `json:"preview,omitempty"`
+	Repo               string          `json:"repo"`
+	CheckpointID       string          `json:"checkpoint_id,omitempty"`
+	DrainID            string          `json:"drain_id,omitempty"`
+	Phase              string          `json:"phase,omitempty"`
+	Protected          bool            `json:"protected"`
+	PublicationDrained bool            `json:"publication_drained"`
+	TargetEventSeq     int64           `json:"target_event_seq"`
+	TargetEvents       int64           `json:"target_events"`
+	PublishedEvents    int64           `json:"published_events"`
+	RemainingEvents    int64           `json:"remaining_events"`
+	RecoveredEvents    int64           `json:"recovered_events,omitempty"`
+	TerminalEvents     int64           `json:"terminal_events,omitempty"`
+	CommitsCreated     int64           `json:"commits_created"`
+	WaitingReason      string          `json:"waiting_reason,omitempty"`
+	FallbackMode       string          `json:"fallback_mode,omitempty"`
+	LastError          string          `json:"last_error,omitempty"`
+	SemanticAttempts   int64           `json:"semantic_rebuild_attempts,omitempty"`
+	EventFallbackCount int64           `json:"event_fallback_count,omitempty"`
+	LastProgressTS     float64         `json:"last_progress_ts,omitempty"`
+	StagedConsumed     bool            `json:"staged_consumed,omitempty"`
+	WorktreeChanges    int             `json:"worktree_changes,omitempty"`
+	PendingEvents      int             `json:"pending_events,omitempty"`
+	DryRun             bool            `json:"dry_run,omitempty"`
+	SemanticGroupCount int             `json:"semantic_group_count,omitempty"`
+	PlanAttempt        int             `json:"plan_attempt,omitempty"`
+	PlanAttemptLimit   int             `json:"plan_attempt_limit,omitempty"`
+	ResolutionMode     string          `json:"resolution_mode,omitempty"`
+	SingletonCount     int             `json:"singleton_count,omitempty"`
 }
 
 func newProductCommitAllCmd() *cobra.Command {
@@ -114,24 +115,40 @@ func runProductCommitAll(
 		Repo: lookup.Worktree.Root, WorktreeChanges: changes,
 		PendingEvents: status.PendingEvents, DryRun: dryRun,
 	}
+	scope, err := inspectCommitAllScope(ctx, lookup.Worktree.Root, lookup.Record.StateDB)
+	if err != nil {
+		return fmt.Errorf("acd commit-all: inspect preview: %w", err)
+	}
+	preview.Preview = &scope
 	if dryRun {
 		return renderProductCommitAll(out, preview, productStateWaiting, jsonOut)
 	}
-	if !yes {
-		fmt.Fprintf(out, "Protect and publish %d changed path(s), plus %d already queued change(s)? [y/N] ",
-			changes, status.PendingEvents)
-		answer, readErr := bufio.NewReader(in).ReadString('\n')
+	input := bufio.NewReader(in)
+	for !yes {
+		renderCommitAllScope(out, scope)
+		fmt.Fprint(out, "Protect and publish this work? [y/N] ")
+		answer, readErr := input.ReadString('\n')
 		if readErr != nil && strings.TrimSpace(answer) == "" {
 			return readErr
 		}
 		if normalized := strings.ToLower(strings.TrimSpace(answer)); normalized != "y" && normalized != "yes" {
 			return invalidCommandError("acd commit-all: cancelled; no changes were made")
 		}
+		current, err := inspectCommitAllScope(ctx, lookup.Worktree.Root, lookup.Record.StateDB)
+		if err != nil {
+			return err
+		}
+		if current.Digest == scope.Digest {
+			break
+		}
+		scope = current
+		fmt.Fprintln(out, "The paths, staged content, or queued work changed. Review the refreshed preview.")
 	}
 
 	params, _ := json.Marshal(map[string]any{
 		"kind": "checkpoint", "drain_publication": true,
 		"consume_staged": true,
+		"preview_digest": scope.Digest,
 	})
 	type callResult struct {
 		result productCommitAllResult
@@ -514,6 +531,9 @@ func renderProductCommitAll(out io.Writer, result productCommitAllResult, stateN
 		fmt.Fprintln(out, "Commit-all preview")
 		fmt.Fprintf(out, "Changes found: %d path(s)\n", result.WorktreeChanges)
 		fmt.Fprintf(out, "Already protected and waiting: %d change(s)\n", result.PendingEvents)
+		if result.Preview != nil {
+			renderCommitAllScope(out, *result.Preview)
+		}
 		fmt.Fprintln(out, "Changed: no")
 		fmt.Fprintln(out, "Next: Run `acd commit-all --yes` to protect and publish this work.")
 		return nil
