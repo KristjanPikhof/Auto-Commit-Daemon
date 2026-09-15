@@ -917,6 +917,17 @@ func TestRewriteCommitsApplyProgressJSON(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Status: This plan can be applied") {
 		t.Fatalf("stdout missing dry-run result:\n%s", stdout.String())
 	}
+	db, err := state.Open(ctx, filepath.Join(repo, ".git", "acd", "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, key := range []string{state.ActivityMetaKey, state.RewritePIDMetaKey} {
+		if value, ok, err := state.MetaGet(ctx, db, key); err != nil || ok {
+			t.Fatalf("dry run recorded activity %s=%q: %v", key, value, err)
+		}
+	}
+
 }
 
 func assertRewritePlanNextFooter(t *testing.T, got string) {

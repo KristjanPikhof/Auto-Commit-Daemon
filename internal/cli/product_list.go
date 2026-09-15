@@ -12,34 +12,38 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 )
 
-const productListDefaultRows = 5
+const productListActiveWindow = time.Hour
 
 var productListCollect = collectProductListOverview
 
 type productListEntry struct {
-	Repo                string                    `json:"repo"`
-	Enabled             bool                      `json:"enabled"`
-	Protected           bool                      `json:"protected"`
-	Published           bool                      `json:"published"`
-	ActionRequired      bool                      `json:"action_required"`
-	State               productState              `json:"state"`
-	PendingEvents       int                       `json:"pending_events"`
-	BlockedEvents       int                       `json:"blocked_events"`
-	CheckpointID        string                    `json:"checkpoint_id,omitempty"`
-	WorkerState         string                    `json:"worker_state"`
-	OperationalState    string                    `json:"operational_state"`
-	LastActivityAt      string                    `json:"last_activity_at"`
-	PublicationDrain    publicationDrainReport    `json:"publication_drain"`
-	PublicationProgress publicationProgressReport `json:"publication_progress"`
-	Summary             string                    `json:"summary"`
-	NextAction          string                    `json:"next_action,omitempty"`
-	RepoHash            string                    `json:"-"`
-	Clients             int                       `json:"-"`
-	LastCommitOID       string                    `json:"-"`
-	ProtectionUnknown   bool                      `json:"-"`
-	lastActivity        time.Time
+	Repo                  string                       `json:"repo"`
+	Enabled               bool                         `json:"enabled"`
+	Protected             bool                         `json:"protected"`
+	Published             bool                         `json:"published"`
+	ActionRequired        bool                         `json:"action_required"`
+	State                 productState                 `json:"state"`
+	PendingEvents         int                          `json:"pending_events"`
+	BlockedEvents         int                          `json:"blocked_events"`
+	CheckpointID          string                       `json:"checkpoint_id,omitempty"`
+	WorkerState           string                       `json:"worker_state"`
+	OperationalState      string                       `json:"operational_state"`
+	LastActivityAt        string                       `json:"last_activity_at"`
+	PublicationDrain      publicationDrainReport       `json:"publication_drain"`
+	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
+	PublicationProgress   publicationProgressReport    `json:"publication_progress"`
+	Summary               string                       `json:"summary"`
+	NextAction            string                       `json:"next_action,omitempty"`
+	RepoHash              string                       `json:"-"`
+	Clients               int                          `json:"-"`
+	LastCommitOID         string                       `json:"-"`
+	ProtectionUnknown     bool                         `json:"-"`
+	UnfinishedWork        bool                         `json:"unfinished_work"`
+	lastActivity          time.Time
 }
 
 type productListData struct {
@@ -53,9 +57,10 @@ func newProductListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "Show live protection and commit progress",
-		Long: `Show repositories that need action or are processing commits, followed
-by the repositories where ACD most recently handled changes. Paused repositories
-appear only when the compact view still has room.
+		Long: `Show repositories active in the last hour, including those that need action,
+and repositories with unfinished work. Idle repositories disappear even if
+they have a maintenance warning. Rows stay in place while the dashboard
+refreshes; newly active repositories append.
 
 In a terminal, the dashboard refreshes until you stop it with Ctrl-C. Use
 --once for one snapshot, --all for every enabled repository, or --verbose for
@@ -163,16 +168,21 @@ func runProductListOnceView(ctx context.Context, out io.Writer, jsonOut, verbose
 	if err != nil {
 		return fmt.Errorf("acd list: %w", err)
 	}
+	entries := data.Repos
 	if jsonOut {
 		if err := renderAnyProductEnvelope(out, productEnvelope{
 			OK: true, State: stateName, Actions: []productAction{}, Data: data,
 		}, true); err != nil {
 			return err
 		}
-	} else if err := renderProductListDashboard(out, data.Repos, verbose, showAll); err != nil {
-		return err
+	} else {
+		var hidden int
+		entries, hidden = selectProductListEntries(data.Repos, showAll)
+		if err := renderProductListSelection(out, entries, hidden, verbose, showAll); err != nil {
+			return err
+		}
 	}
-	if productListRequiresAction(data.Repos) {
+	if productListRequiresAction(entries) {
 		return &CommandError{
 			Code:     "needs_action",
 			Message:  "acd list: one or more repositories require action",
@@ -208,6 +218,7 @@ func runProductListWatchDisplay(
 ) error {
 	terminalStarted := false
 	lastKnown := make(map[string]productListEntry)
+	var rowOrder []string
 	defer func() {
 		if terminalStarted {
 			fmt.Fprint(out, "\033[?25h\033[?1049l")
@@ -225,13 +236,15 @@ func runProductListWatchDisplay(
 			return nil
 		}
 		stabilizeProductListFrame(data.Repos, lastKnown)
+		visible, hidden := selectProductListEntries(data.Repos, showAll)
+		visible, rowOrder = orderProductListFrame(visible, rowOrder)
 		if terminalScreen && !terminalStarted {
 			fmt.Fprint(out, "\033[?1049h\033[?25l")
 			terminalStarted = true
 		}
 		fmt.Fprint(out, "\033[2J\033[H")
 		fmt.Fprintf(out, "Updated: %s\n\n", data.UpdatedAt)
-		if err := renderProductListDashboard(out, data.Repos, verbose, showAll); err != nil {
+		if err := renderProductListSelection(out, visible, hidden, verbose, showAll); err != nil {
 			return err
 		}
 
@@ -248,16 +261,25 @@ func runProductListWatchDisplay(
 }
 
 func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]productListEntry) {
+	present := make(map[string]bool, len(entries))
 	for index, entry := range entries {
+		present[entry.Repo] = true
 		if !entry.ProtectionUnknown {
 			lastKnown[entry.Repo] = entry
 			continue
 		}
 		previous, ok := lastKnown[entry.Repo]
 		if ok && productListPriority(previous) <= productListPriority(entry) {
+			previous.ProtectionUnknown = true
 			entries[index] = previous
 		}
 	}
+	for repo := range lastKnown {
+		if !present[repo] {
+			delete(lastKnown, repo)
+		}
+	}
+
 }
 
 func renderProductListTable(out io.Writer, entries []productListEntry, verbose bool) error {
@@ -266,6 +288,10 @@ func renderProductListTable(out io.Writer, entries []productListEntry, verbose b
 
 func renderProductListDashboard(out io.Writer, entries []productListEntry, verbose, showAll bool) error {
 	visible, hidden := selectProductListEntries(entries, showAll)
+	return renderProductListSelection(out, visible, hidden, verbose, showAll)
+}
+
+func renderProductListSelection(out io.Writer, visible []productListEntry, hidden int, verbose, showAll bool) error {
 	labels := productListLabels(visible)
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	if verbose {
@@ -276,6 +302,9 @@ func renderProductListDashboard(out io.Writer, entries []productListEntry, verbo
 	for index, entry := range visible {
 		if verbose {
 			details := entry.Summary
+			if entry.CheckpointMaintenance.Summary() != "" && !strings.Contains(details, entry.CheckpointMaintenance.Summary()) {
+				details += " " + maintenanceDetails(entry.CheckpointMaintenance)
+			}
 			if entry.NextAction != "" && entry.NextAction != "No action needed." {
 				details = strings.TrimSpace(details + " " + entry.NextAction)
 			}
@@ -284,19 +313,19 @@ func renderProductListDashboard(out io.Writer, entries []productListEntry, verbo
 				productListSafety(entry), productListMode(entry), entry.PendingEvents,
 				productListTarget(entry), productListProgressAge(entry), productListPhase(entry),
 				entry.BlockedEvents, productListLastCommit(entry.LastCommitOID),
-				productListStatus(entry), details)
+				productListDisplayStatus(entry), details)
 			continue
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", labels[index],
 			productListSafety(entry), productListMode(entry), entry.PendingEvents,
 			productListTarget(entry), productListProgressAge(entry), productListPhase(entry),
-			productListStatus(entry))
+			productListDisplayStatus(entry))
 	}
 	if len(visible) == 0 {
-		if verbose {
-			fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t\t\t\t\t\t\t\t\t")
+		if showAll {
+			fmt.Fprintln(tw, "No enabled repositories.")
 		} else {
-			fmt.Fprintln(tw, "No enabled repositories.\t\t\t\t\t\t\t")
+			fmt.Fprintln(tw, "No active repositories; use acd list --all to see every enabled repository.")
 		}
 	}
 	if err := tw.Flush(); err != nil {
@@ -344,6 +373,9 @@ func productListProgressAge(entry productListEntry) string {
 }
 
 func productListPhase(entry productListEntry) string {
+	if entry.OperationalState == "rewriting" {
+		return "history-rewrite"
+	}
 	progress := entry.PublicationProgress
 	switch progress.Phase {
 	case "intent_wait":
@@ -400,39 +432,62 @@ func productListSafety(entry productListEntry) string {
 }
 
 func selectProductListEntries(entries []productListEntry, showAll bool) ([]productListEntry, int) {
+	return selectProductListEntriesAt(entries, showAll, time.Now())
+}
+
+func selectProductListEntriesAt(entries []productListEntry, showAll bool, now time.Time) ([]productListEntry, int) {
 	if showAll {
 		return entries, 0
 	}
-	mandatory := make([]productListEntry, 0, len(entries))
-	recent := make([]productListEntry, 0, len(entries))
-	paused := make([]productListEntry, 0, len(entries))
+	visible := make([]productListEntry, 0, len(entries))
 	for _, entry := range entries {
-		if entry.ActionRequired {
-			mandatory = append(mandatory, entry)
-			continue
+		if entry.UnfinishedWork || entry.PendingEvents > 0 || entry.BlockedEvents > 0 ||
+			(!entry.lastActivity.IsZero() && entry.lastActivity.After(now.Add(-productListActiveWindow))) {
+			visible = append(visible, entry)
 		}
-		switch productListStatus(entry) {
-		case "needs action", "working", "waiting", "stalled":
-			mandatory = append(mandatory, entry)
-		case "paused":
-			paused = append(paused, entry)
-		default:
-			recent = append(recent, entry)
-		}
-	}
-	visible := append([]productListEntry(nil), mandatory...)
-	remaining := productListDefaultRows - len(visible)
-	if remaining < 0 {
-		remaining = 0
-	}
-	if count := min(remaining, len(recent)); count > 0 {
-		visible = append(visible, recent[:count]...)
-		remaining -= count
-	}
-	if count := min(remaining, len(paused)); count > 0 {
-		visible = append(visible, paused[:count]...)
 	}
 	return visible, len(entries) - len(visible)
+}
+
+func orderProductListFrame(entries []productListEntry, previous []string) ([]productListEntry, []string) {
+	remaining := make(map[string]productListEntry, len(entries))
+	for _, entry := range entries {
+		remaining[entry.Repo] = entry
+	}
+	ordered := make([]productListEntry, 0, len(entries))
+	for _, repo := range previous {
+		if entry, ok := remaining[repo]; ok {
+			ordered = append(ordered, entry)
+			delete(remaining, repo)
+		}
+	}
+	for _, entry := range entries {
+		if _, ok := remaining[entry.Repo]; ok {
+			ordered = append(ordered, entry)
+			delete(remaining, entry.Repo)
+		}
+	}
+	order := make([]string, len(ordered))
+	for i, entry := range ordered {
+		order[i] = entry.Repo
+	}
+	return ordered, order
+}
+
+func productListDisplayStatus(entry productListEntry) string {
+	status := productListStatus(entry)
+	switch entry.CheckpointMaintenance.State {
+	case "retrying":
+		return status + " (maintenance retry)"
+	case "prerequisite":
+		return status + " (Xcode license)"
+	case "needs_action":
+		return status + " (maintenance safety check)"
+	case "over_budget":
+		return status + " (checkpoint storage)"
+	default:
+		return status
+	}
 }
 
 func productListStatus(entry productListEntry) string {
@@ -468,7 +523,7 @@ func productListStatus(entry productListEntry) string {
 
 func productListWorkingState(operational string) bool {
 	switch operational {
-	case "busy", "planning", "event_fallback", "self_healing", "fallback", "retrying", "validating":
+	case "rewriting", "busy", "planning", "event_fallback", "self_healing", "fallback", "retrying", "validating":
 		return true
 	default:
 		return false

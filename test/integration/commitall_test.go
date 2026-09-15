@@ -241,6 +241,8 @@ func TestCommitAllEventStrategyOrdersByPath(t *testing.T) {
 			t.Fatalf("event-strategy commit ordering mismatch at idx=%d:\nwant=%v\ngot =%v", i, wantOrder, gotOrder)
 		}
 	}
+	assertRecentDashboardActivity(t, repo)
+
 }
 
 // TestCommitAllIntentStrategyDeterministic: with strategy=intent and the
