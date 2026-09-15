@@ -190,11 +190,11 @@ func CanRuntimeMigrate(from, to int) bool {
 		case 24:
 			// v25 adds immutable runtime identity columns to publication drains
 			// and adopts only revision-backed planner evidence for legacy drains.
-		case 26:
-			// v27 records approved index identity without inventing legacy consent.
 		case 25:
 			// v26 adds grouped history rewrite plan storage. Workers do not use
 			// these rows during capture or publication.
+		case 26:
+			// v27 records approved index identity without inventing legacy consent.
 		default:
 			return false
 		}
