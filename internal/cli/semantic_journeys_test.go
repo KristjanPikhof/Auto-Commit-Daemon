@@ -41,8 +41,8 @@ func TestSavedCheckpointAwaitsClassificationWithoutClaimingPublication(t *testin
 		t.Fatal(err)
 	}
 	outcome, err = readPublicationOutcome(ctx, db.SQL(), true, repo)
-	if err != nil || outcome.BranchCommitted == nil || !*outcome.BranchCommitted {
-		t.Fatalf("resolved checkpoint: %+v, %v", outcome, err)
+	if err != nil || outcome.BranchCommitted != nil {
+		t.Fatalf("unproven checkpoint must remain unknown: %+v, %v", outcome, err)
 	}
 }
 

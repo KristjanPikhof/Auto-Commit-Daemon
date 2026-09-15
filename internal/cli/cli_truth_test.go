@@ -362,7 +362,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if !control.Published || !control.CheckpointPublishedByACD {
 		t.Fatalf("recovered control truth=%+v", control)
 	}
-	if control.PublicationOutcome.BranchCommitted == nil || *control.PublicationOutcome.BranchCommitted ||
+	if (control.PublicationOutcome.BranchCommitted != nil && *control.PublicationOutcome.BranchCommitted) ||
 		control.PublicationOutcome.RecoveredChanges != 1 || control.PublicationOutcome.WaitingChanges != 0 {
 		t.Fatalf("recovery must be distinct from branch publication: %+v", control.PublicationOutcome)
 	}
@@ -373,7 +373,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if len(entries) != 1 || entries[0].Outcome != "recovered" || entries[0].Published {
 		t.Fatalf("recovery history: %+v", entries)
 	}
-	if listReport.PublicationOutcome.RecoveredChanges != 1 || listReport.PublicationOutcome.BranchCommitted == nil || *listReport.PublicationOutcome.BranchCommitted {
+	if listReport.PublicationOutcome.RecoveredChanges != 1 || (listReport.PublicationOutcome.BranchCommitted != nil && *listReport.PublicationOutcome.BranchCommitted) {
 		t.Fatalf("list recovery outcome: %+v", listReport.PublicationOutcome)
 	}
 	listRecord := rec

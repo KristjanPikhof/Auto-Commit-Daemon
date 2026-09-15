@@ -47,22 +47,27 @@ WHERE EXISTS (SELECT 1 FROM checkpoint_events ce JOIN checkpoints cp ON cp.id=ce
 	if !known {
 		return result, nil
 	}
-	committed := protected && !result.PendingClassification && result.WaitingChanges == 0 && result.RecoveredChanges == 0
-	if protected && !result.PendingClassification && result.WaitingChanges == 0 && result.RecoveredChanges > 0 {
-		// Recovery evidence survives recapture. Its historical presence does
-		// not make today's protected tree unpublished forever.
-		var tree string
-		if err := db.QueryRowContext(ctx, `SELECT tree_oid FROM checkpoints WHERE id=(SELECT value FROM daemon_meta WHERE key=?) AND phase='completed'`, daemon.MetaKeyProtectionCheckpointID).Scan(&tree); err != nil && err != sql.ErrNoRows {
-			return result, err
-		}
-		if tree != "" {
-			headTree, err := gitpkg.RevParse(ctx, repo, "HEAD^{tree}")
-			if err == nil && headTree == tree {
-				committed = true
-			}
+	committed := false
+	if !protected || result.PendingClassification || result.WaitingChanges > 0 {
+		result.BranchCommitted = &committed
+		return result, nil
+	}
+	// Captured publication mappings and historical recovery rows are not
+	// proof of today's branch after an external reset or recapture. Exact
+	// tree equality is sufficient; exclusions or unavailable objects leave
+	// the outcome unknown rather than inventing a publication result.
+	var tree string
+	if err := db.QueryRowContext(ctx, `SELECT tree_oid FROM checkpoints WHERE id=(SELECT value FROM daemon_meta WHERE key=?) AND phase='completed'`, daemon.MetaKeyProtectionCheckpointID).Scan(&tree); err != nil && err != sql.ErrNoRows {
+		return result, err
+	}
+	if tree != "" {
+		headTree, err := gitpkg.RevParse(ctx, repo, "HEAD^{tree}")
+		if err == nil && headTree == tree {
+			committed = true
+			result.BranchCommitted = &committed
 		}
 	}
-	result.BranchCommitted = &committed
+
 	return result, nil
 }
 
