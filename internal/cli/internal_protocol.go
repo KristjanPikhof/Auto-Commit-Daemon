@@ -889,6 +889,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		}
 		_ = json.Unmarshal(request.Params, &params)
 		var drainAnchor publicationDrainTarget
+		var admittedScope commitAllScope
 		var requestedPublicationBranch string
 		var minimumPublicationCheckpointSeq int64
 		publicationWorktreeID := checkpointpkg.WorktreeID(runtime.worktree.Root)
@@ -901,6 +902,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 					return nil, &supervisor.ProtocolError{Code: "plan_changed", Message: "commit-all scope or staging changed; run `acd commit-all` to review again"}
 				}
 				params.ExpectedIndexDigest = current.IndexDigest
+				admittedScope = current
 			}
 			if params.ConsumeStaged && params.PreviewDigest == "" {
 				// --yes accepts the index at worker admission, not an earlier CLI read.
@@ -1090,6 +1092,15 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 								drainTarget, unsafeErr = freezePublicationDrainTarget(
 									ctx, runtime.db, runtime.worktree.Root, lastCheckpoint,
 									publicationWorktreeID, acceptedEpoch, drainAnchor)
+								if unsafeErr == nil && params.PreviewDigest != "" {
+									matches, scopeErr := commitAllTargetMatchesScope(ctx, runtime.db, drainTarget, admittedScope)
+									if scopeErr != nil {
+										unsafeErr = scopeErr
+									} else if !matches {
+										runtime.gate.Unlock()
+										return nil, &supervisor.ProtocolError{Code: "plan_changed", Message: "new paths entered the checkpoint; review the refreshed commit-all preview"}
+									}
+								}
 								if unsafeErr == nil {
 									nowTS := float64(time.Now().UnixNano()) / 1e9
 									preparedDrain := state.PublicationDrain{
