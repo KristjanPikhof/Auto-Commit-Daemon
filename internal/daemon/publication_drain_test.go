@@ -855,9 +855,8 @@ func TestPublicationDrainLocalUnlockWaitsForSemanticMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if sum.Published != 0 || !sum.Skipped ||
-		sum.SkippedReason != "intent_v2_waiting_message_rewrite" ||
-		sum.Disposition != ReplayDispositionTransientWait || !sum.HasMore ||
-		!strings.Contains(sum.PlannerFailure, "semantic provider unavailable") ||
+		sum.SkippedReason != "intent_v2_waiting_for_ai" ||
+		sum.Disposition != ReplayDispositionTransientWait ||
 		sum.DispositionReason != sum.PlannerFailure {
 		t.Fatalf("summary=%+v, want retryable semantic-message wait", sum)
 	}
@@ -1222,7 +1221,7 @@ func TestPublicationDrainProviderWaitPreservesSemanticPhase(t *testing.T) {
 	}
 }
 
-func TestPublicationDrainSemanticMessageWaitStopsAfterCompletedMaxProbe(
+func TestPublicationDrainSemanticMessageWaitContinuesAfterCompletedMaxProbe(
 	t *testing.T,
 ) {
 	ctx := context.Background()
@@ -1256,8 +1255,8 @@ WHERE id=?`, fingerprint, drain.ID); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if blocked.Phase != state.PublicationDrainNeedsAction ||
-		blocked.LastError != PublicationDrainSemanticMessageUnavailableReason ||
+	if blocked.Phase != state.PublicationDrainEventFallback ||
+		blocked.LastError != "" ||
 		blocked.LastProgressTS != drain.LastProgressTS ||
 		blocked.TargetEventCount != drain.TargetEventCount ||
 		blocked.ConfigRevisionID != drain.ConfigRevisionID {
@@ -1331,7 +1330,7 @@ WHERE id=?`, fingerprint, drain.ID); err != nil {
 	}
 }
 
-func TestPublicationDrainSemanticMessageWaitStopsAfterObservedLocalWait(
+func TestPublicationDrainSemanticMessageWaitContinuesAfterObservedLocalWait(
 	t *testing.T,
 ) {
 	ctx := context.Background()
@@ -1376,8 +1375,8 @@ WHERE id=?`, fingerprint, drain.ID); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if blocked.Phase != state.PublicationDrainNeedsAction ||
-		blocked.LastError != PublicationDrainSemanticMessageUnavailableReason {
+	if blocked.Phase != state.PublicationDrainEventFallback ||
+		blocked.LastError != summary.DispositionReason {
 		t.Fatalf("observed local wait=%+v", blocked)
 	}
 }

@@ -139,6 +139,7 @@ func replayIntentCandidateBatch(
 		RecoveryCandidateID: cfg.forwardRecoveryCandidateID,
 	})
 	sum.PlanFingerprint = evaluation.PlanFingerprint
+	sum.PlannerFailure = evaluation.PlannerFailure
 	if cfg.forwardRecoveryPlanFingerprint != "" {
 		// Local unlock evaluates a collapsed prefix, which has its own planner
 		// fingerprint. Recovery must continue naming the immutable semantic plan

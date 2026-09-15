@@ -286,7 +286,7 @@ func (p *recoveringMessageIntentCandidatePlannerStub) PlanIntentV2(
 	context.Context,
 	ai.IntentPlanRequestV2,
 ) (ai.IntentPlanV2, error) {
-	return ai.IntentPlanV2{}, errors.New("semantic planning unavailable")
+	return ai.IntentPlanV2{}, &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"}
 }
 
 func (p *recoveringMessageIntentCandidatePlannerStub) RewriteIntentMessage(
@@ -489,7 +489,7 @@ WHERE seq IN (?, ?)`, staleFirst.Event.Seq, staleSecond.Event.Seq); err != nil {
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{currentFirst, currentSecond},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("semantic planning unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		RetryLimit: 0, RetryLimitSet: true,
 		Preset: config.PresetFast,
@@ -585,7 +585,7 @@ FROM pending`, totalPending)
 			BranchRef: "refs/heads/main", BranchGeneration: 1,
 			Captures: captures,
 			Planner: &intentCandidatePlannerStub{
-				err: errors.New("semantic planning unavailable"),
+				err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 			},
 			RetryLimit: 0, RetryLimitSet: true,
 			Preset: config.PresetFast,
@@ -1110,9 +1110,9 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 		t.Fatal(err)
 	}
 	if !strings.Contains(second.PlannerFailure, "circuit open") ||
-		second.Fallback != "waiting_message_rewrite" ||
-		second.ResolutionMode != "waiting_message_rewrite" ||
-		!second.NeedsAttention || second.Decisions[0].Publishable ||
+		second.Fallback != "waiting_for_ai" ||
+		second.ResolutionMode != "waiting_for_ai" ||
+		second.NeedsAttention || len(second.Decisions) != 0 ||
 		planner.calls != 1 {
 		t.Fatalf("circuit bypass=%+v calls=%d", second, planner.calls)
 	}
@@ -1127,14 +1127,9 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if forced.Fallback != "waiting_message_rewrite" ||
-		forced.ResolutionMode != "waiting_message_rewrite" ||
-		len(forced.Decisions) != 1 || forced.Decisions[0].Publishable ||
-		forced.Decisions[0].Assignment.Readiness != ai.IntentCandidateWait ||
-		!containsIntentString(
-			forced.Decisions[0].Assignment.MissingCompanions,
-			"semantic commit message unavailable") {
-		t.Fatalf("forced message wait=%+v", forced)
+	if forced.Fallback != "waiting_for_ai" || forced.PlanAttempt != 0 ||
+		len(forced.Decisions) != 0 || forced.NeedsAttention {
+		t.Fatalf("forced provider wait=%+v", forced)
 	}
 }
 
@@ -1162,29 +1157,15 @@ func TestIntentCandidateSemanticReplanPreservesCircuitWaitCause(t *testing.T) {
 	if before := health.Snapshot(); before.State != IntentPlannerCircuitClosed {
 		t.Fatalf("new health state=%+v", before)
 	}
-	_, firstErr := EvaluateIntentCandidates(ctx, db, input)
-	var firstFallback *IntentSemanticFallbackRequiredError
-	firstIsFallback := errors.As(firstErr, &firstFallback)
-	firstIsWait := isIntentPlannerCircuitWait(firstErr)
-	if !firstIsFallback || firstIsWait {
-		t.Fatalf("initial transport failure classification=%v fallback=%t wait=%t cause=%T",
-			firstErr, firstIsFallback, firstIsWait, errors.Unwrap(firstErr))
+	first, err := EvaluateIntentCandidates(ctx, db, input)
+	if err != nil || first.Fallback != "waiting_for_ai" || first.PlanAttempt != 0 {
+		t.Fatalf("initial transport wait=%+v err=%v", first, err)
 	}
-	if planner.calls != 1 ||
-		health.Snapshot().State != IntentPlannerCircuitOpen {
-		t.Fatalf("initial provider failure calls=%d health=%+v",
-			planner.calls, health.Snapshot())
-	}
-
-	_, err := EvaluateIntentCandidates(ctx, db, input)
-	var fallbackErr *IntentSemanticFallbackRequiredError
-	var waitErr *IntentPlannerCircuitOpenError
-	if !errors.As(err, &fallbackErr) || !errors.As(err, &waitErr) ||
-		!isIntentPlannerCircuitWait(err) {
-		t.Fatalf("semantic provider wait lost typed cause: %v", err)
-	}
-	if planner.calls != 1 {
-		t.Fatalf("open circuit invoked provider; calls=%d", planner.calls)
+	second, err := EvaluateIntentCandidates(ctx, db, input)
+	if err != nil || second.Fallback != "waiting_for_ai" ||
+		second.NeedsAttention || len(second.Decisions) != 0 ||
+		second.PlanAttempt != 0 || planner.calls != 1 {
+		t.Fatalf("frozen semantic retry=%+v calls=%d err=%v", second, planner.calls, err)
 	}
 }
 
@@ -2169,7 +2150,7 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 			result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 				BranchRef: "refs/heads/main", BranchGeneration: 1,
 				Captures:    []IntentCandidateCapture{a, b},
-				Planner:     &intentCandidatePlannerStub{err: errors.New("provider unavailable")},
+				Planner:     &intentCandidatePlannerStub{err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"}},
 				Preset:      tc.preset,
 				Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
 				Verify: func(
@@ -2228,27 +2209,10 @@ func TestIntentCandidateEngineModelWideFailureWaitsForMessage(t *testing.T) {
 			if err != nil {
 				t.Fatalf("EvaluateIntentCandidates: %v", err)
 			}
-			if planner.plannerCalls != 1 || planner.rewriteCalls != 1 ||
-				result.RetryCount != 0 ||
-				result.Fallback != "waiting_message_rewrite" ||
-				result.ResolutionMode != "waiting_message_rewrite" ||
-				!result.NeedsAttention || len(result.Decisions) == 0 {
-				t.Fatalf("bounded fallback planner=%d rewrite=%d result=%+v",
-					planner.plannerCalls, planner.rewriteCalls, result)
-			}
-			if !strings.Contains(result.PlannerFailure,
-				"provider planning unavailable") ||
-				!strings.Contains(result.PlannerFailure,
-					"message quality fallback") {
-				t.Fatalf("planner failure=%q", result.PlannerFailure)
-			}
-			for _, decision := range result.Decisions {
-				if decision.Publishable ||
-					decision.Assignment.Readiness != ai.IntentCandidateWait ||
-					!containsIntentString(decision.Assignment.MissingCompanions,
-						"semantic commit message unavailable") {
-					t.Fatalf("fallback decision=%+v", decision)
-				}
+			if planner.plannerCalls != 1 || planner.rewriteCalls != 0 ||
+				result.PlanAttempt != 0 || result.Fallback != "waiting_for_ai" ||
+				result.NeedsAttention || len(result.Decisions) != 0 {
+				t.Fatalf("provider outage must wait without consuming grouping attempts: %+v", result)
 			}
 		})
 	}
@@ -2434,7 +2398,7 @@ func TestIntentCandidateEngineFallbackContinuesPersistedDependent(t *testing.T) 
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{prerequisite},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(
@@ -2493,7 +2457,7 @@ func TestIntentCandidateEngineFallbackContinuesPersistedPrerequisite(t *testing.
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{dependent},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(
@@ -2574,7 +2538,7 @@ func TestIntentCandidateEngineFallbackPreservesHardBridgeCommits(
 		},
 		Now: time.Unix(120, 0),
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(
@@ -2729,7 +2693,7 @@ func TestIntentCandidateEngineBalancedFallbackKeepsA1B1A2Atomic(
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{firstA, firstB, secondA},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
@@ -2786,7 +2750,7 @@ func TestIntentCandidateEngineBalancedFallbackDoesNotMegaGroupWeakEvidence(
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: captures, Hints: hints,
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
@@ -2832,7 +2796,7 @@ func TestIntentCandidateEngineBalancedFallbackKeepsImportEvidenceSeparate(
 			Evidence:        "reference similarity alone",
 		}},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
@@ -2874,7 +2838,7 @@ func TestIntentCandidateEngineBalancedFallbackUsesUnambiguousTestCompanion(
 			Evidence:        "exact test companion",
 		}},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
@@ -2917,7 +2881,7 @@ func TestIntentCandidateEngineBalancedFallbackPreservesPublishedTestCompanion(
 		}},
 		Now: time.Unix(120, 0),
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(
@@ -2993,7 +2957,7 @@ func TestIntentCandidateEngineBalancedFallbackIgnoresPublishedCompanionAmbiguity
 			},
 		},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Now: time.Unix(120, 0),
@@ -3050,7 +3014,7 @@ func TestIntentCandidateEngineBalancedFallbackHoldsAmbiguousCompanions(
 			},
 		},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
@@ -3099,7 +3063,7 @@ func TestIntentCandidateEngineBalancedFallbackHoldsOversizedHardComponent(
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: captures,
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
@@ -3147,7 +3111,7 @@ func TestIntentCandidateEngineBalancedFallbackHoldsTooManyPaths(
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: captures, Hints: hints,
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(
@@ -3210,7 +3174,7 @@ func TestIntentCandidateEngineFallbackMergesCrossCandidateHardClosure(
 			},
 		},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: config.PresetBalanced, VerificationMode: "structural",
 		Materialize: func(
@@ -3269,7 +3233,7 @@ func TestIntentCandidateEngineHoldsOverCapHardContinuationWithoutErrors(
 				t, db, "cap-right", 110, right...)
 
 			planner := &intentCandidatePlannerStub{
-				err: errors.New("provider unavailable"),
+				err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 			}
 			if testCase.native {
 				planner.err = nil
@@ -3397,7 +3361,7 @@ func testIntentCandidateFallbackMergesThroughPersistedCandidate(
 			Evidence:        "persisted bridge",
 		}},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset: preset,
 		Materialize: func(
@@ -3478,7 +3442,7 @@ func TestIntentCandidateEngineRejectsUnknownVerificationMode(t *testing.T) {
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{capture},
 		Planner: &intentCandidatePlannerStub{
-			err: errors.New("provider unavailable"),
+			err: &ai.IntentPlanV2ValidationError{Message: "provider returned invalid grouping"},
 		},
 		Preset:           config.PresetBalanced,
 		VerificationMode: "unexpected",

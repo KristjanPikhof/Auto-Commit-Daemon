@@ -1601,7 +1601,7 @@ func chooseIntentCandidatePlan(
 	var messageErr error
 	var messageReady bool
 	plan, plannerFailure, messageReady, messageErr = applyIntentFallbackMessageQuality(
-		ctx, planner,
+		ctx, planner, health,
 		intentCandidateContinuationValidationRequest(fallbackReq, continuations),
 		plan, plannerFailure)
 	if messageErr != nil {
@@ -2139,6 +2139,7 @@ func intentFindingCodes(findings []ai.IntentAtomicityFinding) []string {
 func applyIntentFallbackMessageQuality(
 	ctx context.Context,
 	planner interface{ Name() string },
+	health *IntentPlannerHealth,
 	req ai.IntentPlanRequestV2,
 	plan ai.IntentPlanV2,
 	plannerFailure string,
@@ -2167,9 +2168,28 @@ func applyIntentFallbackMessageQuality(
 	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
 		return plan, plannerFailure, false, nil
 	}
+	var permit IntentPlannerHealthPermit
+	if health != nil {
+		var err error
+		permit, err = health.Acquire(ctx)
+		if err != nil {
+			return plan, ai.SanitizePlannerError(err.Error()), false, nil
+		}
+	}
 	rewritten, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
-		return ai.ApplyIntentV2MessageQuality(jobCtx, planner, req, plan)
+		// Every locally chosen group needs an AI-written message, even if a
+		// deterministic subject happens to pass the quality heuristic.
+		return (publicationDrainAtomicFallbackPlanner{messagePlanner: planner, requireSemanticMessage: true}).rewritePlanMessages(jobCtx, req, plan)
 	})
+	if health != nil {
+		var failure error
+		if err != nil {
+			failure = classifyIntentPlannerHealthFailure(err, true)
+		}
+		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
+			return ai.IntentPlanV2{}, plannerFailure, false, healthErr
+		}
+	}
 	if err == nil {
 		return rewritten, plannerFailure, true, nil
 	}
