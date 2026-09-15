@@ -80,7 +80,8 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // immutable Intent repair membership and zero-member seals for historical
 // repairs without inventing historical membership. v25 freezes the runtime
 // strategy, active revision, and provider used by publication drains. v26
-// adds grouped history rewrite plans while retaining legacy commit rows.
+// adds grouped history rewrite plans while retaining legacy commit rows. v27
+// adds the approved index digest without inventing consent for older drains.
 // New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
