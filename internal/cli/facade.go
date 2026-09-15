@@ -32,7 +32,8 @@ type productDoctorSettings struct {
 }
 
 func newProductStatusCmd() *cobra.Command {
-	return &cobra.Command{
+	var verbose bool
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show protection, Git publication, and the next step",
 		Long: `Show whether ACD is running, whether current changes are protected,
@@ -47,9 +48,26 @@ the exact next command to run.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runControlStatus(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
+			if !verbose || jsonOut {
+				return runControlStatus(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
+			}
+			result, err := inspectControl(cmd.Context(), repo)
+			if err != nil {
+				return err
+			}
+			if err := renderControl(cmd.OutOrStdout(), result, false); err != nil {
+				return err
+			}
+			renderProductPublicationProgress(cmd.OutOrStdout(), result.PublicationProgress)
+			renderProductDoctorWorker(cmd.OutOrStdout(), result)
+			if !result.OK {
+				return actionRequiredError("needs_action", result.Summary)
+			}
+			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include queue, provider, phase, and worker details")
+	return cmd
 }
 
 func newProductDoctorCmd() *cobra.Command {
@@ -294,14 +312,16 @@ func renderAdvancedJSON(out io.Writer, stateName productState, render func(io.Wr
 }
 
 type historyEntry struct {
-	ID         string  `json:"id"`
-	Sequence   int64   `json:"sequence"`
-	Reason     string  `json:"reason"`
-	Phase      string  `json:"phase"`
-	CreatedTS  float64 `json:"created_ts"`
-	CommitOID  string  `json:"checkpoint_commit_oid"`
-	Published  bool    `json:"published"`
-	EventCount int     `json:"event_count"`
+	Outcome         string  `json:"outcome"`
+	RecoveredEvents int     `json:"recovered_events"`
+	ID              string  `json:"id"`
+	Sequence        int64   `json:"sequence"`
+	Reason          string  `json:"reason"`
+	Phase           string  `json:"phase"`
+	CreatedTS       float64 `json:"created_ts"`
+	CommitOID       string  `json:"checkpoint_commit_oid"`
+	Published       bool    `json:"published"`
+	EventCount      int     `json:"event_count"`
 }
 
 func newHistoryCmd() *cobra.Command {
@@ -354,27 +374,28 @@ apply a reviewed rewrite plan.`,
 	return cmd
 }
 
-func runCheckpointHistory(ctx context.Context, out io.Writer, repo string, jsonOut bool) error {
+func loadCheckpointHistory(ctx context.Context, repo string) ([]historyEntry, error) {
 	record, _, _, err := lookupRegisteredRepo("history", repo)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	projection, err := state.ReadCheckpointProjection(ctx, record.StateDB, 100)
 	if err != nil {
-		return fmt.Errorf("acd history: %w", err)
+		return nil, fmt.Errorf("acd history: %w", err)
 	}
 	if !projection.Available {
-		return fmt.Errorf("acd history: checkpoint history is unavailable; run `acd setup` to cut over this repository")
+		return nil, fmt.Errorf("acd history: checkpoint history is unavailable; run `acd setup` to cut over this repository")
 	}
 	db, err := openStateDBReadOnly(ctx, record.StateDB)
 	if err != nil {
-		return fmt.Errorf("acd history: open state.db read-only: %w", err)
+		return nil, fmt.Errorf("acd history: open state.db read-only: %w", err)
 	}
 	defer db.Close()
 	rows, err := db.QueryContext(ctx, `
 SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid,
        COUNT(ce.event_seq),
-       COALESCE(SUM(CASE WHEN e.state='published' THEN 1 ELSE 0 END), 0)
+       COALESCE(SUM(CASE WHEN e.state='published' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN e.state='recovered' THEN 1 ELSE 0 END), 0)
 FROM checkpoints cp
 LEFT JOIN checkpoint_events ce ON ce.checkpoint_id=cp.id
 LEFT JOIN capture_events e ON e.seq=ce.event_seq
@@ -382,7 +403,7 @@ GROUP BY cp.id
 ORDER BY cp.seq DESC
 LIMIT 100`)
 	if err != nil {
-		return fmt.Errorf("acd history: query checkpoints: %w", err)
+		return nil, fmt.Errorf("acd history: query checkpoints: %w", err)
 	}
 	defer rows.Close()
 	entries := make([]historyEntry, 0)
@@ -391,14 +412,23 @@ LIMIT 100`)
 		var publishedEvents int
 		if err := rows.Scan(&entry.ID, &entry.Sequence, &entry.Reason,
 			&entry.Phase, &entry.CreatedTS, &entry.CommitOID,
-			&entry.EventCount, &publishedEvents); err != nil {
-			return fmt.Errorf("acd history: scan checkpoint: %w", err)
+			&entry.EventCount, &publishedEvents, &entry.RecoveredEvents); err != nil {
+			return nil, fmt.Errorf("acd history: scan checkpoint: %w", err)
 		}
 		entry.Published = entry.Phase == state.CheckpointCompleted && publishedEvents == entry.EventCount
+		entry.Outcome = checkpointOutcome(entry.Phase, entry.EventCount, publishedEvents, entry.RecoveredEvents)
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("acd history: iterate checkpoints: %w", err)
+		return nil, fmt.Errorf("acd history: iterate checkpoints: %w", err)
+	}
+	return entries, nil
+}
+
+func runCheckpointHistory(ctx context.Context, out io.Writer, repo string, jsonOut bool) error {
+	entries, err := loadCheckpointHistory(ctx, repo)
+	if err != nil {
+		return err
 	}
 	if jsonOut {
 		envelope := productEnvelope{
@@ -415,12 +445,8 @@ LIMIT 100`)
 	}
 	fmt.Fprintln(out, "CHECKPOINT\tWHEN\tREASON\tGIT")
 	for _, entry := range entries {
-		published := "waiting"
-		if entry.Published {
-			published = "published"
-		}
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", entry.ID,
-			time.Unix(int64(entry.CreatedTS), 0).Format(time.RFC3339), entry.Reason, published)
+			time.Unix(int64(entry.CreatedTS), 0).Format(time.RFC3339), entry.Reason, entry.Outcome)
 	}
 	return nil
 }
