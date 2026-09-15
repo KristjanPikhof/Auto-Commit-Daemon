@@ -60,8 +60,14 @@ time artifacts. Hosted queue time must be reported separately.
 
 ### Final gate
 
-Validation is still in progress. Replace this section with final outcomes before
-handoff. Local artifacts are under `/tmp/acd-testing-baseline/local-gate`.
+The first broad local gate finished in 250 seconds. All support packages and
+timing-sensitive tests passed. Two failures identified a stale restore-help
+expectation and a missing worker follow-up after evaluation. Both were fixed:
+the focused CLI/state retry and help checks passed (5.332/2.275 seconds), and
+the worker scenarios passed ten repetitions (120.943 seconds).
+
+A refreshed broad gate and complete production integration run are pending.
+Local baseline artifacts are under `/tmp/acd-testing-baseline/local-gate`.
 
 Focused evidence already recorded in Trekoon includes real blocked-provider and
 verifier protection, semantic branch-switch/restart, ten repeated concurrency
