@@ -3,12 +3,17 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -182,4 +187,78 @@ func TestResolveEffectiveCommitStrategy_PriorityChain(t *testing.T) {
 			t.Fatalf("nil conn should still honour env, got %q", got)
 		}
 	})
+}
+
+func TestProductCommitAllDryRunPreservesRepository(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, dbPath, db := makeProtectedControlRepoStateDB(t)
+	registerProtectedControlRepo(t, roots, repo)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "pending.txt"), []byte("keep this work\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A preview must remain available even if provider construction would fail.
+	t.Setenv(ai.EnvProvider, "unavailable-preview-provider")
+	beforeDB, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeGit := capturePreviewGitState(t, repo)
+	lock, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	var out bytes.Buffer
+	root := newRootCmd()
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"commit-all", "--repo", repo, "--dry-run", "--json"})
+	if err := root.ExecuteContext(t.Context()); err != nil {
+		t.Fatalf("preview: %v\n%s", err, out.String())
+	}
+	var result struct {
+		Data productCommitAllResult `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Data.DryRun || result.Data.WorktreeChanges != 1 {
+		t.Fatalf("preview=%+v", result.Data)
+	}
+	afterDB, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDB != beforeDB || capturePreviewGitState(t, repo) != beforeGit {
+		t.Fatal("preview changed Git or database state")
+	}
+}
+
+func capturePreviewGitState(t *testing.T, repo string) string {
+	t.Helper()
+	var result strings.Builder
+	for _, args := range [][]string{{"rev-parse", "HEAD"}, {"status", "--porcelain=v1"}, {"for-each-ref", "--format=%(refname):%(objectname)", "refs/acd/"}} {
+		out, err := git.Run(t.Context(), git.RunOpts{Dir: repo}, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result.Write(out)
+	}
+	return result.String()
+}
+
+func TestProductCommitAllNonInteractiveApplyRequiresYes(t *testing.T) {
+	for _, jsonOut := range []bool{false, true} {
+		var out bytes.Buffer
+		err := runProductCommitAll(t.Context(), &out, &out, strings.NewReader("y\n"), "", false, false, jsonOut, false)
+		if ExitCode(err) != ExitInvalidCommand || !strings.Contains(err.Error(), "--yes") {
+			t.Fatalf("json=%t err=%v", jsonOut, err)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("unexpected output before validation: %s", &out)
+		}
+	}
 }
