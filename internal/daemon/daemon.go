@@ -654,7 +654,7 @@ func Run(ctx context.Context, opts Options) error {
 			"intent.v2.needs_attention": cutoverBlock,
 		})
 	}
-	if runIntentPlanner != nil {
+	if runIntentPlanner != nil || configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
 		intentHealth = NewIntentPlannerHealth(ctx, opts.DB, intentHealthOptions)
 	}
 	initialIdentity := intentHealthOptions.Provider
@@ -2908,8 +2908,7 @@ func Run(ctx context.Context, opts Options) error {
 			activeDrain, drainErr := PublicationDrainBarrierForPair(
 				passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
 			semanticMessageRecovered := false
-			if drainErr == nil && activeDrain != nil &&
-				activeDrain.Phase == state.PublicationDrainNeedsAction {
+			if drainErr == nil && activeDrain != nil {
 				recoveredDrain, recoverErr := RecoverSupersededCandidatePublicationDrain(
 					passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
 					time.Now().UTC())
