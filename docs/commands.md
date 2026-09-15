@@ -184,7 +184,10 @@ that frame.
 
 JSON remains exhaustive regardless of the compact view. It keeps the existing
 fields and adds `worker_state`, `operational_state`, `blocked_events`,
-`last_activity_at`, and `publication_drain`. A needs-action result is printed
+`last_activity_at`, `publication_drain`, `unfinished_work`, and
+`checkpoint_maintenance`. Maintenance details distinguish a failed check from
+measured storage use and include the next scheduled attempt.
+A needs-action result is printed
 before exit code 3 is returned. Human compact snapshots use only visible
 repositories to decide that exit status; `--all` and JSON use the exhaustive
 result. Hidden idle warnings do not fail a compact snapshot.
