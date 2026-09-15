@@ -1,5 +1,7 @@
 # ACD
 
+Latest release: [v2026-09-15](https://github.com/KristjanPikhof/Auto-Commit-Daemon/releases/tag/v2026-09-15)
+
 ACD turns the changes you make in files into clean local Git history. You work
 normally. ACD captures the changes first, groups related work by intent, and
 creates semantic commits in the background.

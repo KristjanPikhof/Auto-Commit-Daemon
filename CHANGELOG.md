@@ -2,12 +2,16 @@
 
 ## Unreleased
 
+## v2026-09-15
+
 ### Changed
 
 - `acd list` shows repositories active in the last hour and keeps unfinished
   work visible. Hook activity survives session closure, idle warnings no longer
   fill the compact view, and rows keep their positions during terminal refreshes.
   `--all` and JSON remain exhaustive; compact exit status follows visible rows.
+- Updated `golang.org/x/sys` to `v0.48.0` and `modernc.org/sqlite` to `v1.58.0`,
+  with their supporting dependencies.
 
 ### Fixed
 
