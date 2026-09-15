@@ -192,6 +192,7 @@ func TestResolveEffectiveCommitStrategy_PriorityChain(t *testing.T) {
 func TestProductCommitAllDryRunPreservesRepository(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo, dbPath, db := makeProtectedControlRepoStateDB(t)
+	commitStartRepoSeed(t, repo)
 	registerProtectedControlRepo(t, roots, repo)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -254,7 +255,7 @@ func TestProductCommitAllNonInteractiveApplyRequiresYes(t *testing.T) {
 	for _, jsonOut := range []bool{false, true} {
 		var out bytes.Buffer
 		err := runProductCommitAll(t.Context(), &out, &out, strings.NewReader("y\n"), "", false, false, jsonOut, false)
-		if ExitCode(err) != ExitInvalidCommand || !strings.Contains(err.Error(), "--yes") {
+		if ExitCode(err) != ExitInvalid || !strings.Contains(err.Error(), "--yes") {
 			t.Fatalf("json=%t err=%v", jsonOut, err)
 		}
 		if out.Len() != 0 {
