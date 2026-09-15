@@ -4782,10 +4782,6 @@ func buildCommitFromTree(ctx context.Context, repoRoot, treeOID, parent string, 
 	if err != nil {
 		return "", fmt.Errorf("message: %w", err)
 	}
-	if strings.TrimSpace(msg) == "" {
-		// Defensive fallback so the commit never lands with an empty subject.
-		msg = "Update files"
-	}
 
 	var parents []string
 	if parent != "" {
