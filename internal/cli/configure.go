@@ -822,6 +822,9 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if opts.Inherit {
 		configureInheritedReport(&report)
 	}
+	if originalProvider != "deterministic" && selection.Provider == "deterministic" {
+		report.Risks = append(report.Risks, "If publication is active, ACD preserves the unpublished target in recovery, then recaptures it using Local automatic commits. The switch requires a verified applied configuration; an ambiguous target still needs attention.")
+	}
 	if err := renderConfigureReport(cmd.OutOrStdout(), report, false); err != nil {
 		return err
 	}
