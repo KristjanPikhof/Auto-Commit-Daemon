@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
@@ -141,132 +140,27 @@ func cliSelfHealEligibleByOps(ops []state.CaptureOp) bool {
 	return true
 }
 
-// cliAlreadyPublishedAtHEAD is the CLI-side mirror of daemon
-// alreadyPublishedAtHEAD. It enforces the same ancestry/per-op/post-probe
-// guards but does not re-resolve HEAD itself — callers pass the head OID they
-// observed at plan time. Returns (headOID, true, nil) only when every guard
-// passes.
-//
-// Returns (_, false, nil) on any guard failure (ancestry, blob mismatch,
-// mode mismatch, rename-source still present, missing rename source object).
-// Returns a non-nil error only for genuine git failures so the caller can
-// fail closed (treat the row as not-resolvable).
+// cliAlreadyPublishedAtHEAD proves the HEAD observed during the read-only plan.
+// The caller admits only modify/mode/rename captures; deletes stay in recovery.
 func cliAlreadyPublishedAtHEAD(ctx context.Context, repo, sourceHead, headOID string, ops []state.CaptureOp) (string, bool, error) {
-	if len(ops) == 0 {
-		return "", false, nil
-	}
-	if headOID == "" {
-		return "", false, nil
-	}
-	// Ancestry guard: sourceHead must be an ancestor of HEAD (or equal). An
-	// empty sourceHead skips the probe (orphan/initial commit).
-	if sourceHead != "" && sourceHead != headOID {
-		descends, err := git.IsAncestor(ctx, repo, sourceHead, headOID)
-		if err != nil {
-			return "", false, fmt.Errorf("ancestry probe %s..%s: %w", sourceHead, headOID, err)
-		}
-		if !descends {
-			return headOID, false, nil
-		}
-	}
+	proofOps := make([]git.PublicationOp, 0, len(ops))
 	for _, op := range ops {
-		// CLI predicate stays narrow: rename/modify/mode only (matches
-		// cliSelfHealEligibleByOps). create/delete branches are unreachable
-		// here because the caller pre-filters via cliSelfHealEligibleByOps.
-		blobOID, err := git.LsTreeBlobOID(ctx, repo, headOID, op.Path)
-		if err != nil {
-			if errors.Is(err, git.ErrRefNotFound) {
-				return headOID, false, nil
-			}
-			return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
+		proof := git.PublicationOp{Operation: op.Op, Path: op.Path}
+		if op.OldPath.Valid {
+			proof.OldPath = op.OldPath.String
 		}
-		if !op.AfterOID.Valid || op.AfterOID.String == "" {
-			return headOID, false, nil
+		if op.BeforeOID.Valid {
+			proof.BeforeOID = op.BeforeOID.String
 		}
-		if blobOID != op.AfterOID.String {
-			return headOID, false, nil
+		if op.AfterOID.Valid {
+			proof.AfterOID = op.AfterOID.String
 		}
-		if op.AfterMode.Valid && op.AfterMode.String != "" {
-			entries, err := git.LsTree(ctx, repo, headOID, false, op.Path)
-			if err != nil {
-				return "", false, fmt.Errorf("ls-tree HEAD entries %s: %w", op.Path, err)
-			}
-			matched := false
-			for _, entry := range entries {
-				if entry.Path == op.Path && entry.Type == "blob" {
-					if entry.Mode == op.AfterMode.String {
-						matched = true
-					}
-					break
-				}
-			}
-			if !matched {
-				return headOID, false, nil
-			}
+		if op.AfterMode.Valid {
+			proof.AfterMode = op.AfterMode.String
 		}
-		if op.Op == "rename" && op.OldPath.Valid && op.OldPath.String != "" {
-			absent, err := cliPathAbsentInTree(ctx, repo, headOID, op.OldPath.String)
-			if err != nil {
-				return "", false, err
-			}
-			if !absent {
-				return headOID, false, nil
-			}
-			// Rename source verify: require the captured BeforeOID for the
-			// rename source to still be present in the object database.
-			if op.BeforeOID.Valid && op.BeforeOID.String != "" {
-				present, err := cliObjectExists(ctx, repo, op.BeforeOID.String)
-				if err != nil {
-					return "", false, err
-				}
-				if !present {
-					return headOID, false, nil
-				}
-			}
-		}
+		proofOps = append(proofOps, proof)
 	}
-	// HEAD-drift guard: re-resolve HEAD; if it moved between the first read
-	// and the last probe, the matching state is no longer guaranteed to
-	// describe the live ref.
-	postHead, err := git.RevParse(ctx, repo, "HEAD")
-	if err != nil {
-		if errors.Is(err, git.ErrRefNotFound) {
-			return "", false, nil
-		}
-		return "", false, fmt.Errorf("rev-parse HEAD post-probe: %w", err)
-	}
-	if postHead != headOID {
-		return postHead, false, nil
-	}
-	return headOID, true, nil
-}
-
-func cliPathAbsentInTree(ctx context.Context, repo, ref, path string) (bool, error) {
-	entries, err := git.LsTree(ctx, repo, ref, false, path)
-	if err != nil {
-		return false, fmt.Errorf("ls-tree %s %s: %w", ref, path, err)
-	}
-	for _, entry := range entries {
-		if entry.Path == path {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-func cliObjectExists(ctx context.Context, repo, oid string) (bool, error) {
-	if oid == "" {
-		return false, nil
-	}
-	_, _, err := git.RunWithStderr(ctx, git.RunOpts{Dir: repo}, "cat-file", "-e", oid)
-	if err == nil {
-		return true, nil
-	}
-	var gerr *git.Error
-	if errors.As(err, &gerr) && gerr.ExitCode == 1 {
-		return false, nil
-	}
-	return false, fmt.Errorf("cat-file -e %s: %w", oid, err)
+	return git.ProvePublicationAtHEAD(ctx, repo, sourceHead, headOID, proofOps, git.PublicationProofPolicy{MissingPathIsMismatch: true})
 }
 
 // recoveryBlockerCounts centralizes the read-only blocker predicates used by
