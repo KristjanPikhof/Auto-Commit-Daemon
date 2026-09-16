@@ -93,6 +93,7 @@ type IntentCandidateEvaluation struct {
 	PreflightMaterialize IntentCandidateMaterializer
 	VerificationMode     string
 	Verify               IntentCandidateVerifier
+	ManagedVerification  bool
 	Now                  time.Time
 	TargetEventSeqs      []int64
 	RejectLocalFallback  bool
@@ -165,7 +166,8 @@ func (e *IntentSemanticFallbackRequiredError) Unwrap() error {
 // IntentPlanPreflightError means the durable planning snapshot could not
 // produce a locally valid baseline. No provider attempt has been consumed.
 type IntentPlanPreflightError struct {
-	Failure string
+	EvidenceFingerprint string
+	Failure             string
 }
 
 func (e *IntentPlanPreflightError) Error() string {
@@ -342,6 +344,13 @@ func EvaluateIntentCandidates(
 		result.FindingCodes = append([]string(nil), planRun.FindingCodes...)
 		if planRun.ProgressState.String == "preflight_blocked" {
 			result.ProviderCallSkipped = "invalid_local_baseline"
+		}
+		if isIntentPlannerCircuitWait(err) {
+			result.Fallback = "waiting_for_ai"
+			result.ResolutionMode = "waiting_for_ai"
+			result.PlannerFailure = ai.SanitizePlannerError(err.Error())
+			result.ProviderCallSkipped = "provider_backoff"
+			return result, nil
 		}
 		return result, err
 	}
@@ -1209,7 +1218,9 @@ func preflightIntentCandidateMaterialization(
 			}
 			selected = append(selected, capture)
 		}
-		if err := materialize(ctx, selected); err != nil {
+		if _, err := evaluatePublication(ctx, func(jobCtx context.Context) (struct{}, error) {
+			return struct{}{}, materialize(jobCtx, selected)
+		}); err != nil {
 			return fmt.Errorf(
 				"daemon: intent candidates: preflight materialization: %w", err)
 		}
@@ -1260,7 +1271,8 @@ func chooseIntentCandidatePlan(
 		}
 		return ai.IntentPlanV2{}, "", "", retryCount, false,
 			baselineContinuations, run, &IntentPlanPreflightError{
-				Failure: ai.SanitizePlannerError(preflightErr.Error()),
+				Failure:             ai.SanitizePlannerError(preflightErr.Error()),
+				EvidenceFingerprint: fmt.Sprintf("%s/%v", run.Fingerprint, run.FindingCodes),
 			}
 	}
 	run, err = state.EnsureIntentPlanRun(ctx, db, run)
@@ -1296,7 +1308,7 @@ func chooseIntentCandidatePlan(
 	permitHeld := false
 	defer func() {
 		if health != nil && permitHeld {
-			_ = health.Complete(context.Background(), permit, nil)
+			_ = health.Complete(ctx, permit, nil)
 		}
 	}()
 	if planner != nil && !skipSemanticPlanning {
@@ -1315,16 +1327,14 @@ func chooseIntentCandidatePlan(
 					if input.plannerWait != nil {
 						*input.plannerWait = openErr
 					}
-					planner = nil
-					break
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, openErr
 				}
 				permitHeld = true
 			}
-			reserved, allowed, reserveErr := state.ReserveIntentPlanAttempt(ctx, db, run)
-			if reserveErr != nil {
-				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, reserveErr
-			}
-			run = reserved
+			// Only a received semantic response consumes the correction budget.
+			// Transport waits and interrupted calls are retried under the durable
+			// provider circuit without exhausting this unchanged plan.
+			allowed := !run.Completed && run.AttemptCount < run.AttemptLimit
 			if !allowed {
 				if run.Completed && run.ResolvedPlanJSON.Valid {
 					plan, continuations, loadErr := loadResolvedIntentPlanRun(
@@ -1358,10 +1368,38 @@ func chooseIntentCandidatePlan(
 				previousSignature = run.NormalizedPartition.String + "\x00" +
 					strings.Join(run.FindingCodes, ",")
 			}
-			retryCount = run.AttemptCount - 1
+			retryCount = run.AttemptCount
 			attemptCtx := prompttrace.WithRetryCount(ctx, retryCount)
-			plan, err := ai.PlanIntentV2WithCompatibility(
-				attemptCtx, planner, plannerRequest)
+			plan, err := evaluatePublication(attemptCtx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
+				return ai.PlanIntentV2WithCompatibility(jobCtx, planner, plannerRequest)
+			})
+			if ctx.Err() != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, ctx.Err()
+			}
+			if ai.ProviderNeedsConfiguration(err) {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+			}
+			if failure := classifyIntentPlannerHealthFailure(err, err != nil); err != nil {
+				var transport *IntentPlannerTransportFailure
+				if errors.As(failure, &transport) {
+					if health != nil && permitHeld {
+						if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
+							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, healthErr
+						}
+						permitHeld = false
+					}
+					wait := &IntentPlannerCircuitOpenError{}
+					if health != nil {
+						wait.RetryAt = time.Unix(0, int64(health.Snapshot().NextProbeTS*1e9))
+					}
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, wait
+				}
+			}
+			reserved, _, reserveErr := state.ReserveIntentPlanAttempt(ctx, db, run)
+			if reserveErr != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, reserveErr
+			}
+			run = reserved
 			if rejected, ok := ai.RejectedIntentPlanV2(err); ok {
 				plan = rejected
 			}
@@ -1487,6 +1525,7 @@ func chooseIntentCandidatePlan(
 							false, nil, run, &IntentPlanPreflightError{
 								Failure: ai.SanitizePlannerError(
 									partialPreflightErr.Error()),
+								EvidenceFingerprint: fmt.Sprintf("%s/%v/%v", run.Fingerprint, run.UnresolvedSeqs, run.FindingCodes),
 							}
 					}
 					run.PreservedGroups = intentAssignmentMembership(preserved)
@@ -1569,7 +1608,7 @@ func chooseIntentCandidatePlan(
 	var messageErr error
 	var messageReady bool
 	plan, plannerFailure, messageReady, messageErr = applyIntentFallbackMessageQuality(
-		ctx, planner,
+		ctx, planner, health,
 		intentCandidateContinuationValidationRequest(fallbackReq, continuations),
 		plan, plannerFailure)
 	if messageErr != nil {
@@ -2107,6 +2146,7 @@ func intentFindingCodes(findings []ai.IntentAtomicityFinding) []string {
 func applyIntentFallbackMessageQuality(
 	ctx context.Context,
 	planner interface{ Name() string },
+	health *IntentPlannerHealth,
 	req ai.IntentPlanRequestV2,
 	plan ai.IntentPlanV2,
 	plannerFailure string,
@@ -2135,7 +2175,49 @@ func applyIntentFallbackMessageQuality(
 	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
 		return plan, plannerFailure, false, nil
 	}
-	rewritten, err := ai.ApplyIntentV2MessageQuality(ctx, planner, req, plan)
+	messageCache, cacheErr := loadPublicationMessageCache(ctx, planner, health)
+	if cacheErr != nil {
+		return ai.IntentPlanV2{}, plannerFailure, false, cacheErr
+	}
+	var permit IntentPlannerHealthPermit
+	permitCompleted := false
+	if health != nil {
+		var err error
+		permit, err = health.Acquire(ctx)
+		if err != nil {
+			return plan, ai.SanitizePlannerError(err.Error()), false, nil
+		}
+		defer func() {
+			if !permitCompleted {
+				_ = health.Complete(ctx, permit, nil)
+			}
+		}()
+	}
+	rewritten, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
+		// Every locally chosen group needs an AI-written message, even if a
+		// deterministic subject happens to pass the quality heuristic.
+		return (publicationDrainAtomicFallbackPlanner{messagePlanner: messageCache, requireSemanticMessage: true}).rewritePlanMessages(jobCtx, req, plan)
+	})
+	if cacheErr := messageCache.persist(ctx); cacheErr != nil {
+		return ai.IntentPlanV2{}, plannerFailure, false, cacheErr
+	}
+	if ai.ProviderNeedsConfiguration(err) {
+		if health != nil {
+			_ = health.Complete(ctx, permit, nil)
+			permitCompleted = true
+		}
+		return ai.IntentPlanV2{}, plannerFailure, false, err
+	}
+	if health != nil {
+		var failure error
+		if err != nil {
+			failure = classifyIntentPlannerHealthFailure(err, true)
+		}
+		permitCompleted = true
+		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
+			return ai.IntentPlanV2{}, plannerFailure, false, healthErr
+		}
+	}
 	if err == nil {
 		return rewritten, plannerFailure, true, nil
 	}
@@ -2474,7 +2556,9 @@ func evaluateIntentCandidateAssignment(
 		results = append(results, pendingIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityMaterialization, "materializer_unavailable",
 			"exact candidate materialization has not run"))
-	} else if err := input.Materialize(ctx, candidateCaptures); err != nil {
+	} else if _, err := evaluatePublication(ctx, func(jobCtx context.Context) (struct{}, error) {
+		return struct{}{}, input.Materialize(jobCtx, candidateCaptures)
+	}); err != nil {
 		results = append(results, failedIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityMaterialization, "materialization_failed", err))
 	} else {
@@ -2512,7 +2596,7 @@ func evaluateIntentCandidateAssignment(
 				CandidateID:         assignment.CandidateID,
 				PlanFingerprint:     input.planFingerprint,
 				RecoveryCandidateID: input.RecoveryCandidateID,
-			}, input.Verify, assignment, candidateCaptures)
+			}, input.Verify, assignment, candidateCaptures, input.ManagedVerification)
 		if errors.Is(verifyErr, verification.ErrResourceUnavailable) {
 			verificationResult = IntentCandidateVerification{}
 			verificationDeferred = true

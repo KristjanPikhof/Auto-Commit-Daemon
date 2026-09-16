@@ -1,0 +1,202 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+)
+
+func TestSavedCheckpointAwaitsClassificationWithoutClaimingPublication(t *testing.T) {
+	withIsolatedHome(t)
+	repo, _, db := makeRepoStateDB(t)
+	ctx := context.Background()
+	if err := state.MetaSetMany(ctx, db, map[string]string{"branch_token": "missing refs/heads/main", "branch.generation": "7"}); err != nil {
+		t.Fatal(err)
+	}
+	insertCompletedCheckpoint(t, db, "cp-unclassified", "0123456789abcdef", nil)
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyProtectionClassificationPending, "true"); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := readPublicationOutcome(ctx, db.SQL(), true, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.BranchCommitted == nil || *outcome.BranchCommitted || !outcome.PendingClassification {
+		t.Fatalf("unclassified checkpoint reported published: %+v", outcome)
+	}
+	if got := publicationOutcomeLabel(outcome, publicationProgressReport{}); got != "saved changes waiting for grouping" {
+		t.Fatal(got)
+	}
+	if got := checkpointOutcome(state.CheckpointCompleted, 0, 0, 0); got != "saved" {
+		t.Fatalf("unclassified history: %s", got)
+	}
+	if err := state.MetaSet(ctx, db, daemon.MetaKeyProtectionClassificationPending, "false"); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err = readPublicationOutcome(ctx, db.SQL(), true, repo)
+	if err != nil || outcome.BranchCommitted != nil {
+		t.Fatalf("unproven checkpoint must remain unknown: %+v, %v", outcome, err)
+	}
+}
+
+func TestRecoveryHistoryDoesNotHideCurrentPublicationActivity(t *testing.T) {
+	committed := true
+	entry := productListEntry{PublicationOutcome: publicationOutcome{RecoveredChanges: 1}}
+	if got := productListPhase(entry); got != "recovered" {
+		t.Fatalf("preserved work: %s", got)
+	}
+	entry.PublicationProgress.Phase = "verifying"
+	if got := productListPhase(entry); got != "verifying" {
+		t.Fatalf("recovery hid active verification: %s", got)
+	}
+	entry.PublicationProgress.Phase = "idle"
+	entry.PublicationOutcome.BranchCommitted = &committed
+	if got := productListPhase(entry); got != "idle" {
+		t.Fatalf("historical recovery hid completed recapture: %s", got)
+	}
+}
+
+func TestPublicationOutcomeUsesCurrentBranchAndAcceptsRecapturedTree(t *testing.T) {
+	withIsolatedHome(t)
+	repo, _, db := makeRepoStateDB(t)
+	ctx := context.Background()
+	insertCompletedCheckpoint(t, db, "cp-current", "0123456789abcdef", []checkpointMemberFixture{
+		{State: state.EventStateRecovered, CommitOID: "recovery"},
+		{State: state.EventStatePublished, CommitOID: "published"},
+		{State: state.EventStatePending},
+	})
+	if _, err := db.SQL().ExecContext(ctx, "UPDATE capture_events SET branch_ref='refs/heads/other' WHERE state='pending'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetMany(ctx, db, map[string]string{
+		"branch_token": "missing refs/heads/main", "branch.generation": "7",
+		daemon.MetaKeyProtectionCheckpointID: "cp-current",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An ordinary commit recreates the recovered content. The recovery row
+	// remains immutable, while the current checkpoint tree is now on HEAD.
+	if err := os.WriteFile(filepath.Join(repo, "restored.txt"), []byte("recovered work\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "restored.txt"}, {"-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "Restore recovered work"}} {
+		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tree, err := gitpkg.RevParse(ctx, repo, "HEAD^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, "UPDATE checkpoints SET tree_oid=? WHERE id='cp-current'", tree); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := readPublicationOutcome(ctx, db.SQL(), true, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.BranchCommitted == nil || !*outcome.BranchCommitted || outcome.WaitingChanges != 0 || outcome.BranchChanges != 1 || outcome.RecoveredChanges != 1 {
+		t.Fatalf("current branch outcome: %+v", outcome)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "checkout", "-b", "other"); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err = readPublicationOutcome(ctx, db.SQL(), true, repo)
+	if err != nil || outcome.BranchCommitted != nil {
+		t.Fatalf("branch moved without durable matching pair: %+v, %v", outcome, err)
+	}
+}
+
+func TestCommitAllPreviewShowsPartialStagingAndDetectsChangedIndex(t *testing.T) {
+	_, repo, dbPath := registeredProductMutationRepo(t)
+	ctx := context.Background()
+	path := filepath.Join(repo, "partial.txt")
+	if err := os.WriteFile(path, []byte("staged\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "add", "partial.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("later\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before := fileDigest(t, dbPath)
+	scope, err := inspectCommitAllScope(ctx, repo, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, path := range scope.ChangedPaths {
+		if path.Path == "partial.txt" {
+			found = path.Staged && path.Unstaged
+		}
+	}
+	if !found {
+		t.Fatalf("partial staging missing: %+v", scope)
+	}
+	var out bytes.Buffer
+	renderCommitAllScope(&out, scope)
+	for _, want := range []string{"partial.txt", "staged and unstaged", "may overlap", "consumed after checkpoint protection"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("preview missing %q: %s", want, &out)
+		}
+	}
+	if fileDigest(t, dbPath) != before {
+		t.Fatal("preview wrote state")
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "add", "partial.txt"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := inspectCommitAllScope(ctx, repo, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Digest == scope.Digest {
+		t.Fatal("staged content changed without invalidating approval")
+	}
+}
+
+func TestRestoreWithoutIDDoesNotApplyOutsideTerminal(t *testing.T) {
+	_, repo, dbPath := registeredProductMutationRepo(t)
+	before := fileDigest(t, dbPath)
+	cmd := newRootCmd()
+	cmd.SetIn(strings.NewReader("1\ny\n"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"restore", "--repo", repo})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "acd history") {
+		t.Fatalf("bare nonterminal restore: %v", err)
+	}
+	if fileDigest(t, dbPath) != before {
+		t.Fatal("nonterminal restore changed state")
+	}
+}
+
+func TestCompactStatusSeparatesAIWaitAndRecovery(t *testing.T) {
+	committed := false
+	var out bytes.Buffer
+	err := renderProductEnvelope(&out, productEnvelope{State: productStateWaiting, Data: productStatusData{
+		Enabled: true, Protected: true,
+		PublicationOutcome: publicationOutcome{BranchCommitted: &committed, WaitingChanges: 3, RecoveredChanges: 2, ReasonCode: "provider_wait"},
+	}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []string{"Protection: on", "Current changes saved: yes", "Branch commits: 3 changes waiting for AI", "Recovery: 2 changes saved separately", "Next: No action needed."} {
+		if !strings.Contains(out.String(), line) {
+			t.Fatalf("missing %q: %s", line, &out)
+		}
+	}
+	if strings.Contains(out.String(), "Worker liveness") || strings.Contains(out.String(), "Published to Git") {
+		t.Fatalf("default status contains obsolete/detail output: %s", &out)
+	}
+}

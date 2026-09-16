@@ -22,16 +22,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-type repoInitResult struct {
-	Repo       string `json:"repo"`
-	RepoHash   string `json:"repo_hash"`
-	StateDB    string `json:"state_db"`
-	Inserted   bool   `json:"inserted"`
-	Refreshed  bool   `json:"refreshed"`
-	BranchRef  string `json:"branch_ref"`
-	ConfigPath string `json:"config_path,omitempty"`
-}
-
 type repoListEntry struct {
 	central.RepoRecord
 	Safety           central.RepoRemovalSafety `json:"safety"`
@@ -79,107 +69,6 @@ const (
 
 var repoRemoveStopOneRepo = stopOneRepo
 var repoDisableStopOneRepo = stopOneRepo
-
-func newRepoCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "repo",
-		Short: "Manage explicit repo registration lifecycle",
-		Long: `Manage legacy repository registration records without starting normal capture and replay workflows.
-
-Use acd on to register or enable a repository and acd off to disable it without deleting state. Integration hooks never register unknown repositories or re-enable disabled ones. The old autodiscovery settings are deprecated and no longer grant repository consent. Use repo list to inspect registry rows and repo remove to preview or remove an old registration.`,
-		Example: `  acd repo init
-  acd repo init --json
-  acd repo disable --repo /path/to/repo
-  acd repo enable --repo /path/to/repo --json
-  acd repo manage
-  acd repo list --json
-  acd repo remove --dry-run
-  acd repo remove --yes
-  acd repo remove --yes --purge-state`,
-	}
-	cmd.AddCommand(
-		newRepoInitCmd(),
-		newRepoDisableCmd(),
-		newRepoEnableCmd(),
-		newRepoManageCmd(),
-		newRepoListCmd(),
-		newRepoRemoveCmd(),
-	)
-	return cmd
-}
-
-func newRepoInitCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "init",
-		Short: "Initialize acd state and registry for the current repo",
-		Long: `Initialize acd state and central registry metadata for the resolved Git worktree.
-
-This command refuses detached HEAD, opens or creates .git/acd/state.db, and records the repo in the central registry. It does not start the daemon.`,
-		Example: `  acd repo init
-  acd repo init --repo /path/to/repo
-  acd repo init --json`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			repoFlag, _ := cmd.Flags().GetString("repo")
-			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runRepoInit(cmd.Context(), cmd.OutOrStdout(), repoFlag, jsonOut)
-		},
-	}
-}
-
-func newRepoDisableCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "disable",
-		Short: "Disable a registered repo without deleting state",
-		Long: `Disable a registered repo in the central registry without deleting .git/acd/state.db.
-
-The command stops a live repo daemon, clears start caches, and preserves state so the repo can be enabled again later. It does not create a registry row for unknown repos.`,
-		Example: `  acd repo disable --repo /path/to/repo
-  acd repo disable --repo /path/to/repo --json`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			repoFlag, _ := cmd.Flags().GetString("repo")
-			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runRepoDisable(cmd.Context(), cmd.OutOrStdout(), repoFlag, jsonOut)
-		},
-	}
-}
-
-func newRepoEnableCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "enable",
-		Short: "Enable a registered repo without starting its daemon",
-		Long: `Enable a registered repo in the central registry without starting its daemon.
-
-The command clears the disabled lifecycle state and preserves .git/acd/state.db. It does not create a registry row for unknown repos.`,
-		Example: `  acd repo enable --repo /path/to/repo
-  acd repo enable --repo /path/to/repo --json`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			repoFlag, _ := cmd.Flags().GetString("repo")
-			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runRepoEnable(cmd.Context(), cmd.OutOrStdout(), repoFlag, jsonOut)
-		},
-	}
-}
-
-func newRepoManageCmd() *cobra.Command {
-	var verbose bool
-	cmd := &cobra.Command{
-		Use:   "manage",
-		Short: "Open the interactive repo lifecycle manager",
-		Long: `Open a line-oriented repo lifecycle manager for registered repos.
-
-The manager starts in compact mode by default. Use t N to toggle a repo,
-e N to enable, d N to disable, r to refresh, v to switch compact and
-verbose views, and q to exit.`,
-		Example: `  acd repo manage
-  acd repo manage --verbose
-  acd list --interactive`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRepoManageWithInput(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), verbose)
-		},
-	}
-	cmd.Flags().BoolVar(&verbose, "verbose", false, "Start in verbose audit mode")
-	return cmd
-}
 
 func newRepoListCmd() *cobra.Command {
 	return &cobra.Command{
@@ -347,75 +236,26 @@ interactive repository manager.`,
 	return cmd
 }
 
-func runRepoInit(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	wt, err := resolveRepoWorktree(ctx, repoFlag, "repo init")
-	if err != nil {
-		return err
-	}
-	branchRef, err := repoBranchRef(ctx, wt.Root, "repo init")
-	if err != nil {
-		return err
-	}
-	dbPath := state.DBPathFromGitDir(wt.GitDir)
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		return fmt.Errorf("acd repo init: open state.db: %w", err)
-	}
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("acd repo init: close state.db: %w", err)
-	}
-	roots, err := paths.Resolve()
-	if err != nil {
-		return fmt.Errorf("acd repo init: resolve paths: %w", err)
-	}
-	var regResult central.RepoRegistrationResult
-	if err := central.WithLock(roots, func(reg *central.Registry) error {
-		var err error
-		regResult, err = reg.RegisterResolvedRepo(wt, "", time.Now().Unix())
-		return err
-	}); err != nil {
-		return fmt.Errorf("acd repo init: update registry: %w", err)
-	}
-	res := repoInitResult{
-		Repo:       regResult.Record.Path,
-		RepoHash:   regResult.Record.RepoHash,
-		StateDB:    regResult.Record.StateDB,
-		Inserted:   regResult.Inserted,
-		Refreshed:  regResult.Refreshed,
-		BranchRef:  branchRef,
-		ConfigPath: roots.ConfigPath(),
-	}
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(res)
-	}
-	if res.Inserted {
-		fmt.Fprintf(out, "acd repo init: registered %s\n", res.Repo)
-	} else {
-		fmt.Fprintf(out, "acd repo init: already registered %s\n", res.Repo)
-	}
-	fmt.Fprintf(out, "state: %s\n", res.StateDB)
-	fmt.Fprintf(out, "config: %s\n", res.ConfigPath)
-	return nil
-}
-
-func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
+func collectRepoList(ctx context.Context) ([]repoListEntry, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd repo list: resolve paths: %w", err)
+		return nil, fmt.Errorf("acd repo list: resolve paths: %w", err)
 	}
 	reg, err := central.Load(roots)
 	if err != nil {
-		return fmt.Errorf("acd repo list: load registry: %w", err)
+		return nil, fmt.Errorf("acd repo list: load registry: %w", err)
 	}
-	entries := collectRepoManagementEntries(ctx, reg.Repos)
+	return collectRepoManagementEntries(ctx, reg.Repos), nil
+}
+
+func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
+	entries, err := collectRepoList(ctx)
+	if err != nil {
+		return err
+	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
@@ -485,51 +325,6 @@ func renderRepoManageVerbose(out io.Writer, entries []repoListEntry) error {
 			entry.Status)
 	}
 	return tw.Flush()
-}
-
-func runRepoDisable(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
-	return runRepoLifecycleCommand(ctx, out, repoFlag, true, jsonOut)
-}
-
-func runRepoEnable(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
-	return runRepoLifecycleCommand(ctx, out, repoFlag, false, jsonOut)
-}
-
-func runRepoLifecycleCommand(ctx context.Context, out io.Writer, repoFlag string, disable bool, jsonOut bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	action := "enable"
-	if disable {
-		action = "disable"
-	}
-	roots, err := paths.Resolve()
-	if err != nil {
-		return fmt.Errorf("acd repo %s: resolve paths: %w", action, err)
-	}
-	target, err := repoRemovalTargetForCommand(ctx, repoFlag, "repo "+action)
-	if err != nil {
-		return err
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return fmt.Errorf("acd repo %s: load registry: %w", action, err)
-	}
-	rec, ok := reg.FindRepo(target.Path, target.StateDB)
-	if !ok {
-		return repoLifecycleUnknownTargetError(action, target)
-	}
-	_ = rec
-	var res repoLifecycleCommandResult
-	if disable {
-		res, err = applyRepoDisable(ctx, roots, target)
-	} else {
-		res, err = applyRepoEnable(ctx, roots, target)
-	}
-	if err != nil {
-		return err
-	}
-	return renderRepoLifecycleCommand(out, res, jsonOut)
 }
 
 func applyRepoDisable(ctx context.Context, roots paths.Roots, target central.RepoRemovalTarget) (repoLifecycleCommandResult, error) {
@@ -606,10 +401,6 @@ func repoLifecycleUnknownTargetError(action string, target central.RepoRemovalTa
 		name = "."
 	}
 	return fmt.Errorf("acd repo %s: repo %s is not registered; run `acd on --repo %s` to register and enable it or `acd repo list` to inspect registered repos", action, name, name)
-}
-
-func runRepoRemove(ctx context.Context, out io.Writer, repoFlag string, dryRun, yes, purgeState, jsonOut bool) error {
-	return runRepoRemoveWithInput(ctx, out, os.Stdin, repoFlag, dryRun, yes, purgeState, jsonOut)
 }
 
 func runRepoRemoveWithInput(ctx context.Context, out io.Writer, in io.Reader, repoFlag string, dryRun, yes, purgeState, jsonOut bool) error {
@@ -900,32 +691,6 @@ func isCancelInput(input string) bool {
 	default:
 		return false
 	}
-}
-
-func resolveRepoWorktree(ctx context.Context, repoFlag, command string) (git.Worktree, error) {
-	wt, err := git.ResolveWorktree(ctx, repoFlag)
-	if err != nil {
-		if errors.Is(err, git.ErrNotWorktree) {
-			return git.Worktree{}, fmt.Errorf("acd %s: repo %q is not inside a Git worktree: %w", command, repoFlag, err)
-		}
-		return git.Worktree{}, err
-	}
-	return wt, nil
-}
-
-func repoBranchRef(ctx context.Context, repo, command string) (string, error) {
-	branchRef, err := git.RunBranchRef(ctx, repo)
-	if err != nil {
-		return "", fmt.Errorf("acd %s: resolve HEAD branch: %w", command, err)
-	}
-	if branchRef == "" {
-		return "", fmt.Errorf("acd %s: detached HEAD is not supported; checkout a branch before running repo lifecycle commands", command)
-	}
-	return branchRef, nil
-}
-
-func repoRemovalTarget(ctx context.Context, repoFlag string) (central.RepoRemovalTarget, error) {
-	return repoRemovalTargetForCommand(ctx, repoFlag, "repo remove")
 }
 
 func repoRemovalTargetForCommand(ctx context.Context, repoFlag, command string) (central.RepoRemovalTarget, error) {

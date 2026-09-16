@@ -364,25 +364,16 @@ func TestBuildProvider_OpenAICompatRejectsInvalidBaseURL(t *testing.T) {
 // TestBuildProvider_OpenAICompatNoKeyDegrades: an empty APIKey logs a
 // warning and falls back to DeterministicProvider so misconfiguration
 // can never silently disable commit messages.
-func TestBuildProvider_OpenAICompatNoKeyDegrades(t *testing.T) {
+func TestBuildProvider_OpenAICompatNoKeyRequiresConfiguration(t *testing.T) {
 	h := &captureHandler{}
 	cfg := ProviderConfig{
 		Mode:   "openai-compat",
 		APIKey: "",
 		Logger: slog.New(h),
 	}
-	p, closer, err := BuildProvider(cfg)
-	if err != nil {
-		t.Fatalf("BuildProvider: %v", err)
-	}
-	if closer != nil {
-		t.Fatalf("closer non-nil for degraded openai-compat")
-	}
-	if p.Name() != "deterministic" {
-		t.Fatalf("Name=%q want deterministic", p.Name())
-	}
-	if _, found := h.findWarn("ACD_AI_API_KEY empty"); !found {
-		t.Fatalf("warning about empty API key not fired; records=%v", h.records)
+	p, _, err := BuildProvider(cfg)
+	if err == nil || p != nil || !ProviderNeedsConfiguration(err) {
+		t.Fatalf("configuration must remain actionable without fallback: %v %v", p, err)
 	}
 }
 
@@ -403,30 +394,22 @@ func TestBuildProvider_IntentOpenAICompatNoKeyDoesNotDegrade(t *testing.T) {
 
 func TestBuildProvider_OpenAICompatNoKeyIgnoresInvalidCA(t *testing.T) {
 	h := &captureHandler{}
-	provider, closer, err := BuildProvider(ProviderConfig{
+	provider, _, err := BuildProvider(ProviderConfig{
 		Mode: "openai-compat", APIKey: " ",
 		CAFile: filepath.Join(t.TempDir(), "missing.pem"),
 		Logger: slog.New(h),
 	})
-	if err != nil {
-		t.Fatalf("BuildProvider: %v", err)
-	}
-	if closer != nil || provider.Name() != "deterministic" {
-		t.Fatalf("provider=%v closer=%v", provider, closer)
-	}
-	if _, found := h.findWarn("ACD_AI_API_KEY empty"); !found {
-		t.Fatalf("missing-key warning not emitted: %v", h.records)
+	if err == nil || provider != nil || !ProviderNeedsConfiguration(err) {
+		t.Fatalf("configuration must remain actionable without fallback: %v %v", provider, err)
 	}
 }
 
-// TestBuildProvider_Subprocess: a subprocess:<name> mode wraps the
-// SubprocessProvider in Compose with deterministic fallback, returns a
-// non-nil closer, and Close drains cleanly even on a missing binary.
 func TestBuildProvider_Subprocess(t *testing.T) {
 	cfg := ProviderConfig{
-		Mode:    "subprocess:foo",
-		Timeout: 3 * time.Second,
-		Logger:  quietLogger(),
+		Mode:               "subprocess:foo",
+		Timeout:            3 * time.Second,
+		Logger:             quietLogger(),
+		subprocessLookPath: func(string) (string, error) { return "", errors.New("missing") },
 	}
 	p, closer, err := BuildProvider(cfg)
 	if err != nil {
@@ -441,69 +424,36 @@ func TestBuildProvider_Subprocess(t *testing.T) {
 		t.Fatalf("Name=%q want %q", p.Name(), want)
 	}
 
-	// Subprocess binary likely doesn't exist on the test host; the chain
-	// must still satisfy Generate via the deterministic fallback.
-	r, err := p.Generate(context.Background(), CommitContext{
-		Path: "hello.txt", Op: "create",
-	})
-	if err != nil {
-		t.Fatalf("Generate: %v", err)
-	}
-	if r.Subject == "" {
-		t.Fatalf("empty subject; chain did not fall through to deterministic")
-	}
-	if !strings.Contains(r.Subject, "hello.txt") {
-		t.Fatalf("subject=%q does not mention hello.txt", r.Subject)
+	r, err := p.Generate(context.Background(), CommitContext{Path: "hello.txt", Op: "create"})
+	if err == nil || r.Subject != "" || r.Source == "deterministic" {
+		t.Fatalf("missing configured subprocess must wait: %+v err=%v", r, err)
 	}
 }
 
-// TestBuildProvider_SubprocessEmptyName: a colon with no plugin name is
-// a misconfiguration; degrade to deterministic with a warning rather
-// than spawning anything.
 func TestBuildProvider_SubprocessEmptyName(t *testing.T) {
 	h := &captureHandler{}
 	cfg := ProviderConfig{
 		Mode:   "subprocess:",
 		Logger: slog.New(h),
 	}
-	p, closer, err := BuildProvider(cfg)
-	if err != nil {
-		t.Fatalf("BuildProvider: %v", err)
-	}
-	if closer != nil {
-		t.Fatalf("closer non-nil")
-	}
-	if p.Name() != "deterministic" {
-		t.Fatalf("Name=%q want deterministic", p.Name())
-	}
-	if _, found := h.findWarn("missing plugin name"); !found {
-		t.Fatalf("warning about empty plugin name not fired")
+	p, _, err := BuildProvider(cfg)
+	if err == nil || p != nil || !ProviderNeedsConfiguration(err) {
+		t.Fatalf("configuration must remain actionable without fallback: %v %v", p, err)
 	}
 }
 
-// TestBuildProvider_UnknownModeDegrades: any unrecognized value warns
-// and falls back to deterministic.
-func TestBuildProvider_UnknownModeDegrades(t *testing.T) {
+func TestBuildProvider_UnknownModeRequiresConfiguration(t *testing.T) {
 	h := &captureHandler{}
 	cfg := ProviderConfig{
 		Mode:   "garbage",
 		Logger: slog.New(h),
 	}
 	p, _, err := BuildProvider(cfg)
-	if err != nil {
-		t.Fatalf("BuildProvider: %v", err)
-	}
-	if p.Name() != "deterministic" {
-		t.Fatalf("Name=%q want deterministic", p.Name())
-	}
-	if _, found := h.findWarn("unrecognized ACD_AI_PROVIDER"); !found {
-		t.Fatalf("warning about unknown mode not fired")
+	if err == nil || p != nil || !ProviderNeedsConfiguration(err) {
+		t.Fatalf("configuration must remain actionable without fallback: %v %v", p, err)
 	}
 }
 
-// TestBuildProvider_NilLoggerDoesNotPanic: a nil cfg.Logger falls back
-// to slog.Default() inside BuildProvider — tests must not panic when
-// callers forget to wire a logger.
 func TestBuildProvider_NilLoggerDoesNotPanic(t *testing.T) {
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -512,14 +462,8 @@ func TestBuildProvider_NilLoggerDoesNotPanic(t *testing.T) {
 
 	cfg := ProviderConfig{Mode: "garbage"}
 	p, _, err := BuildProvider(cfg)
-	if err != nil {
-		t.Fatalf("BuildProvider: %v", err)
-	}
-	if p.Name() != "deterministic" {
-		t.Fatalf("Name=%q", p.Name())
-	}
-	if !strings.Contains(buf.String(), "unrecognized") {
-		t.Fatalf("default logger did not receive warning; buf=%q", buf.String())
+	if err == nil || p != nil || !ProviderNeedsConfiguration(err) {
+		t.Fatalf("configuration must remain actionable without fallback: %v %v", p, err)
 	}
 }
 
@@ -570,8 +514,8 @@ func TestBuildStrictProviderDoesNotComposeFallback(t *testing.T) {
 		t.Fatalf("provider=%v closer=%v err=%v", missing, missingCloser, err)
 	}
 
-	// The normal path preserves its established deterministic fallback for
-	// the same unavailable subprocess configuration.
+	// Runtime construction preserves the selected provider even when its
+	// subprocess is temporarily unavailable. Generation must surface the wait.
 	normal, normalCloser, err := BuildProvider(ProviderConfig{
 		Mode: "subprocess:absent",
 		subprocessLookPath: func(string) (string, error) {
@@ -583,7 +527,7 @@ func TestBuildStrictProviderDoesNotComposeFallback(t *testing.T) {
 	}
 	defer normalCloser.Close()
 	result, err := normal.Generate(context.Background(), CommitContext{Path: "compat.txt", Op: "modify"})
-	if err != nil || result.Source != "deterministic" {
+	if err == nil || result.Source == "deterministic" || result.Subject != "" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }

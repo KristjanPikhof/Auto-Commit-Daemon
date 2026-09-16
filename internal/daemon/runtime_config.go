@@ -259,7 +259,7 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 	}
 	fingerprint := IntentPlannerProviderFingerprint(identity)
 	var health *IntentPlannerHealth
-	if planner != nil {
+	if planner != nil || providerName != (ai.DeterministicProvider{}).Name() {
 		if previous != nil && previous.IntentHealth != nil && previous.HealthFingerprint == fingerprint {
 			health = previous.IntentHealth
 		} else {
@@ -413,8 +413,7 @@ func stampDecisionRuntime(ctx context.Context, rec *state.DecisionRecord) {
 
 // buildValidatedRuntimeProvider performs strict construction first so missing
 // credentials and unavailable subprocesses reject activation, then constructs
-// the normal composed runtime provider to preserve deterministic fallback and
-// planner retry compatibility during ordinary daemon operation.
+// the normal composed runtime provider for bounded semantic planning retries.
 func buildValidatedRuntimeProvider(cfg ai.ProviderConfig) (ai.Provider, io.Closer, error) {
 	_, validationCloser, err := ai.BuildStrictProvider(cfg)
 	if err != nil {

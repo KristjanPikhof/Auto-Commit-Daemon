@@ -108,6 +108,7 @@ func runIntentCandidateVerificationWithActivity(
 	verify IntentCandidateVerifier,
 	assignment ai.IntentCandidateAssignment,
 	captures []IntentCandidateCapture,
+	managed ...bool,
 ) (result IntentCandidateVerification, err error) {
 	if db == nil || verify == nil {
 		return result, errors.New(
@@ -136,7 +137,12 @@ func runIntentCandidateVerificationWithActivity(
 					"daemon: clear intent verification activity: %w", cleanupErr))
 		}
 	}()
-	return verify(ctx, assignment, captures)
+	if len(managed) > 0 && managed[0] {
+		return verify(ctx, assignment, captures)
+	}
+	return evaluatePublication(ctx, func(jobCtx context.Context) (IntentCandidateVerification, error) {
+		return verify(jobCtx, assignment, captures)
+	})
 }
 
 func clearStaleIntentVerificationActivity(

@@ -340,75 +340,35 @@ func normalizeMode(raw string) string {
 	return strings.ToLower(raw)
 }
 
-// BuildProvider returns a Provider chain matching cfg. The io.Closer is
-// non-nil only when the chain owns a SubprocessProvider — the daemon must
-// call Close on shutdown so the child process is reaped cleanly. The
-// Event mode retains the historical deterministic degradation. Intent mode
-// fails construction when the operator explicitly selected a semantic
-// provider, preventing provider setup failures from changing commit semantics.
-//
-// Degraded paths log a single warning via cfg.Logger so an operator can
-// see why the OpenAI-compat or subprocess provider was skipped.
+// BuildProvider builds the selected runtime provider and preserves that choice
+// through failures. Only an unset or explicitly deterministic mode is local.
 func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
+	cfg.Mode = normalizeMode(cfg.Mode)
 	det := DeterministicProvider{CommitFormat: cfg.CommitFormat}
-
-	mode := cfg.Mode
 	switch {
-	case mode == "" || mode == "deterministic":
+	case cfg.Mode == "" || cfg.Mode == "deterministic":
 		return det, nil, nil
-
-	case mode == "openai-compat":
+	case cfg.Mode == "openai-compat":
 		if strings.TrimSpace(cfg.APIKey) == "" {
-			if cfg.CommitStrategy == CommitStrategyIntent {
-				return nil, nil, errors.New(
-					"openai-compat: missing API key for Intent commits")
-			}
-			logger.Warn("ai: ACD_AI_PROVIDER=openai-compat but ACD_AI_API_KEY empty; falling back to deterministic",
-				slog.String("provider", "openai-compat"))
-			return det, nil, nil
+			return nil, nil, &ProviderConfigurationError{Err: errors.New("openai-compat: missing API key")}
 		}
-		primary, closer, err := buildPrimaryProvider(cfg)
-		if err != nil {
-			return nil, nil, err
+	case strings.HasPrefix(cfg.Mode, "subprocess:"):
+		if strings.TrimSpace(strings.TrimPrefix(cfg.Mode, "subprocess:")) == "" {
+			return nil, nil, &ProviderConfigurationError{Err: errors.New("subprocess: missing plugin name")}
 		}
-		return Compose(primary, det), closer, nil
-
-	case strings.HasPrefix(mode, "subprocess:"):
-		name := strings.TrimPrefix(mode, "subprocess:")
-		if strings.TrimSpace(name) == "" {
-			if cfg.CommitStrategy == CommitStrategyIntent {
-				return nil, nil, errors.New(
-					"subprocess: missing plugin name for Intent commits")
-			}
-			logger.Warn("ai: ACD_AI_PROVIDER=subprocess: missing plugin name; falling back to deterministic",
-				slog.String("mode", mode))
-			return det, nil, nil
-		}
-		primary, closer, err := buildPrimaryProvider(cfg)
-		if err != nil {
-			return nil, nil, err
-		}
-		return Compose(primary, det), closer, nil
-
 	default:
-		if cfg.CommitStrategy == CommitStrategyIntent {
-			return nil, nil, fmt.Errorf(
-				"unrecognized Intent provider %q", mode)
-		}
-		logger.Warn("ai: unrecognized ACD_AI_PROVIDER; falling back to deterministic",
-			slog.String("mode", mode))
-		return det, nil, nil
+		return nil, nil, &ProviderConfigurationError{Err: fmt.Errorf("unrecognized provider %q", cfg.Mode)}
 	}
+	primary, closer, err := buildPrimaryProvider(cfg)
+	if err != nil {
+		return nil, nil, &ProviderConfigurationError{Err: err}
+	}
+	return Compose(primary, det), closer, nil
 }
 
-// BuildStrictProvider constructs the selected provider without a deterministic
-// fallback. Unlike BuildProvider it rejects degraded configuration and an
-// unavailable subprocess immediately, so a settings test cannot report a
-// synthetic fallback as provider success. Callers own and must close closer.
+// BuildStrictProvider validates the selected connection, including subprocess
+// availability, and returns the primary provider without planning retries.
+// Callers own and must close closer.
 func BuildStrictProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 	mode := normalizeMode(cfg.Mode)
 	if mode == "" {

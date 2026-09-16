@@ -1,8 +1,6 @@
 // Package daemon implements the long-running per-repo capture+replay loop.
 //
-// The exported entry point is Run, which composes all the Phase 1 building
-// blocks (capture, replay, refcount, prune, lock, signals, scheduler) into
-// the loop body §8.1 specifies.
+// Run coordinates capture, publication, object retention, locking and wakeups.
 //
 // Run is single-goroutine: every per-tick mutation happens on the run-loop
 // goroutine. Signals dispatch via os/signal in a small helper goroutine but
@@ -528,6 +526,10 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		msgFn = providerMessageFnWithPromptTrace(provider, effectiveRepoRoot, promptTracer)
 	}
+	if opts.MessageFn == nil && providerBuildErr != nil && configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
+		cause := providerBuildErr
+		msgFn = func(context.Context, EventContext) (string, error) { return "", cause }
+	}
 
 	// Build or inject the intent planner once per Run. Replay receives this
 	// same instance on every pass, so subprocess sessions and HTTP transports
@@ -571,8 +573,11 @@ func Run(ctx context.Context, opts Options) error {
 		intentPlannerProvider string
 		intentPlannerModel    string
 	)
-	if runIntentPlanner != nil {
+	if runIntentPlanner != nil || configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
 		intentPlannerProvider = ai.PrimaryProviderName(runIntentPlanner)
+		if runIntentPlanner == nil {
+			intentPlannerProvider = configuredIntentProviderName(providerCfg.Mode)
+		}
 		if intentPlannerProvider == "openai-compat" {
 			intentPlannerModel = providerCfg.Model
 		}
@@ -654,7 +659,7 @@ func Run(ctx context.Context, opts Options) error {
 			"intent.v2.needs_attention": cutoverBlock,
 		})
 	}
-	if runIntentPlanner != nil {
+	if runIntentPlanner != nil || configuredIntentProviderRequiresSemanticMessages(providerCfg.Mode) {
 		intentHealth = NewIntentPlannerHealth(ctx, opts.DB, intentHealthOptions)
 	}
 	initialIdentity := intentHealthOptions.Provider
@@ -2404,10 +2409,15 @@ func Run(ctx context.Context, opts Options) error {
 	// Start setup validation only after startup branch reconciliation has
 	// established the exact branch generation recorded by configure.
 	runtimeBundles.StartValidationWorker(ctx, validationWakeCh)
+	evaluationShutdown := false
 
 	for {
+		if evaluationShutdown {
+			return gracefulWithSweep("signal shutdown")
+		}
 		branchTransitionBlocked = false
 		recoveryFollowup := false
+		evaluationFollowup := false
 		frozenRuntimeDrainID := ""
 		runtimeSelectionBlocked := false
 
@@ -2451,9 +2461,12 @@ func Run(ctx context.Context, opts Options) error {
 					"err", ai.SanitizePlannerError(drainErr.Error()))
 			} else if runtimeDrain != nil {
 				frozenRuntimeDrainID = runtimeDrain.ID
-				if runtimeDrain.Phase == state.PublicationDrainNeedsAction &&
-					runtimeDrain.LastError ==
-						PublicationDrainSemanticMessageUnavailableReason {
+				activateReplacement, replacementErr := publicationDrainCanActivateReplacement(ctx, opts.DB, *runtimeDrain)
+				if replacementErr != nil {
+					runtimeSelectionBlocked = true
+					logger.Warn("read replacement runtime", "err", replacementErr)
+				}
+				if activateReplacement {
 					// This exact terminal barrier cannot use its frozen provider
 					// again. Let a validated desired revision become applied so
 					// recovery can prove the replacement contract. The barrier
@@ -2908,8 +2921,7 @@ func Run(ctx context.Context, opts Options) error {
 			activeDrain, drainErr := PublicationDrainBarrierForPair(
 				passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration)
 			semanticMessageRecovered := false
-			if drainErr == nil && activeDrain != nil &&
-				activeDrain.Phase == state.PublicationDrainNeedsAction {
+			if drainErr == nil && activeDrain != nil {
 				recoveredDrain, recoverErr := RecoverSupersededCandidatePublicationDrain(
 					passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
 					time.Now().UTC())
@@ -3070,7 +3082,37 @@ func Run(ctx context.Context, opts Options) error {
 					runWithProgressHeartbeat(passCtx, progressHeartbeatInterval(opts), func() {
 						heartbeatNow("running", "")
 					}, func() {
-						repSum, repErr = replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+						evaluationCtx, cancelEvaluation := context.WithCancel(passCtx)
+						defer cancelEvaluation()
+						evaluation := &publicationEvaluation{
+							gate: opts.OperationGate, db: opts.DB, cancel: cancelEvaluation,
+							wake: wakeCh, files: fsWakeReader, changes: validationWakeCh, shutdown: shutdownCh,
+							onShutdown: func() { evaluationShutdown = true },
+							identity: func(checkCtx context.Context) (string, error) {
+								if opts.PublicationHeld != nil && opts.PublicationHeld() {
+									return "", errPublicationEvaluationStale
+								}
+								return publicationEvaluationIdentity(checkCtx, opts.RepoPath, opts.GitDir, opts.DB, cctx)
+							},
+							protect: func(protectCtx context.Context) error {
+								evaluationFollowup = true
+								epoch, err := BeginProtectionObservation(protectCtx, opts.DB)
+								if err != nil {
+									return err
+								}
+								ignoreChecker.Invalidate()
+								_, err = ProtectWorktree(protectCtx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
+									IgnoreChecker: ignoreChecker, SensitiveMatcher: matcher,
+									SafeIgnoreMatcher: safeIgnore, Trace: tracer, GitDir: opts.GitDir,
+									CheckpointStore: &checkpointStore, WorktreeID: checkpointpkg.WorktreeID(opts.RepoPath),
+									CheckpointReason: state.CheckpointReasonPoll,
+									MaxFileBytes:     opts.MaxFileBytes, ObservationEpoch: epoch,
+								})
+								return err
+							},
+						}
+						evaluationCtx = context.WithValue(evaluationCtx, publicationEvaluationKey{}, evaluation)
+						repSum, repErr = replay(evaluationCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 							MessageFn:                  passBundle.MessageFn,
 							GitDir:                     opts.GitDir,
 							Trace:                      tracer,
@@ -3095,6 +3137,7 @@ func Run(ctx context.Context, opts Options) error {
 							IntentPreset:               passBundle.IntentPreset,
 							IntentVerificationMode:     passBundle.IntentVerificationMode,
 							IntentCandidateVerify:      candidateVerify,
+							ManagedVerification:        true,
 							IntentRepairCommitVerify:   repairCommitVerify,
 							IntentRepairEnabled:        passBundle.IntentRepairEnabled,
 							IntentRepairHorizon:        passBundle.IntentRepairHorizon,
@@ -3103,6 +3146,12 @@ func Run(ctx context.Context, opts Options) error {
 							RequireCompletedCheckpoint: true,
 							PublicationDrain:           activeDrain,
 						})
+						if evaluationCtx.Err() != nil && passCtx.Err() == nil {
+							evaluationFollowup = true
+							repSum.Disposition = ReplayDispositionTransientWait
+							repSum.DispositionReason = "publication_evaluation_invalidated"
+							repErr = nil
+						}
 					})
 					if activeDrain != nil {
 						updatedDrain, updateErr := UpdatePublicationDrainAfterReplay(
@@ -3354,6 +3403,11 @@ func Run(ctx context.Context, opts Options) error {
 		// 4m. Sleep until the next tick or wake/shutdown/ctx event.
 		if stopped {
 			return nil
+		}
+		if evaluationFollowup {
+			// A wake consumed by protection still requires full classification or
+			// branch/configuration handling once the frozen evaluation has ended.
+			continue
 		}
 		timer := time.NewTimer(currentDelay)
 		select {

@@ -417,6 +417,12 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("planner calls=%d; captures:\n%s", hits.Load(), sqliteScalar(t, dbPath,
+				"SELECT seq,path,state,error FROM capture_events ORDER BY seq"))
+		}
+	})
 
 	startCount := commitCount(t, repo)
 	steps := []struct {
@@ -431,7 +437,7 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 		{"unrelated-note.txt", "independent note\n", ""},
 	}
 	for _, step := range steps {
-		writeFile(t, filepath.Join(repo, step.path), step.body)
+		writeFileAtomically(t, repo, filepath.Join(repo, step.path), step.body)
 		wakeSession(t, ctx, fullEnv, repo, sessionID)
 		if step.want == "" {
 			continue

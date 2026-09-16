@@ -100,23 +100,19 @@ only the new captures and records the earlier candidates as dependencies. The
 new group still needs a locked message-only rewrite before it can publish.
 Planner windows report this as `dependent_message_fallback`.
 
-If message generation is unavailable, ACD does not publish a generic message
-such as `Update <path>`. The candidate remains waiting across daemon restarts
-and retries after the provider recovers. Planner windows and diagnostics report
-`waiting_message_rewrite` until a meaningful message is available. Terminal
-retry history extends a deterministic successor chain, so a long provider
-outage cannot consume a fixed lifetime pool of candidate IDs.
+If message generation is unavailable, ACD keeps the group protected and waits
+for AI. It never substitutes a generic message such as `Update <path>`. A
+transport outage uses durable 30-second, two-minute, then ten-minute backoff
+with one probe at a time. The capped interval continues through restarts and
+extended outages. Transport failures do not consume semantic correction attempts
+or create an endless sequence of replacement candidates.
 
-The provider circuit records a failed probe at its longest backoff separately
-from ordinary failures. Once that probe fails, ACD stops reporting an endless
-wait. When the user has already applied a newer deterministic Intent runtime with
-the same message format, ACD protects the complete unpublished suffix on a
-recovery ref, invalidates its old capture baseline, and recaptures the live
-work for the newer runtime. The frozen target and later captures move together,
-so later before-states cannot be stranded. A remote replacement is not treated
-as known-good without an explicit recovery. Without that exact proof, the
-drain needs attention and can be retried with `acd commit-all --yes` or
-preserved explicitly with `acd fix --force --yes`.
+If the user applies a newer verified deterministic Intent configuration with
+the same message format, the existing journaled recovery path preserves the
+unpublished target on a recovery ref, invalidates its old capture baseline, and
+recaptures work under the new contract. This also handles an active target;
+changing a saved provider string alone does not reinterpret frozen work.
+Overlapping operations or ambiguous provenance still require attention.
 
 ACD uses `needs_attention` only when it cannot prove a safe outcome.
 Examples include unresolved dependency ambiguity, failed materialization, a

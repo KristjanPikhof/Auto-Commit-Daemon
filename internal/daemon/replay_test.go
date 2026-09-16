@@ -1677,6 +1677,71 @@ func TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent(t *testing.T) 
 	}
 }
 
+func TestReplay_SupersededHistoryProbeGitFailure(t *testing.T) {
+	for _, strategy := range []ai.CommitStrategy{ai.CommitStrategyEvent, ai.CommitStrategyIntent} {
+		for _, deadline := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/deadline=%t", strategy, deadline), func(t *testing.T) {
+				ctx := context.Background()
+				f, cctx, seq := newSupersededHistoryProbeFixture(t, ctx)
+				probeErr := &git.Error{ExitCode: -1, Err: errors.New("signal: killed")}
+				budget := 5 * time.Second
+				if deadline {
+					budget = time.Second
+				}
+				replayPerEventTimeoutOverride.Store(int64(budget))
+				t.Cleanup(func() { replayPerEventTimeoutOverride.Store(0) })
+				original := pathsTouchedBetweenFn
+				probeReached := false
+				pathsTouchedBetweenFn = func(ctx context.Context, _, _, _ string, _ []string) (bool, error) {
+					probeReached = true
+					if deadline {
+						<-ctx.Done()
+					}
+					return false, probeErr
+				}
+				t.Cleanup(func() { pathsTouchedBetweenFn = original })
+
+				sum, err := Replay(ctx, f.dir, f.db, cctx, ReplayOpts{
+					GitDir: f.gitDir, Limit: 1, MessageFn: DeterministicMessage,
+					CommitStrategy: strategy, IntentPlanner: &recordingIntentPlanner{},
+					IntentWindow: 1, IntentBypassBatchWait: true,
+				})
+				if !probeReached {
+					t.Fatal("replay did not reach the injected Git failure")
+				}
+				wantState := state.EventStatePending
+				wantFailed := 0
+				if deadline {
+					wantState = state.EventStateFailed
+					wantFailed = 1
+					if err != nil {
+						t.Fatalf("probe deadline escaped replay: %v", err)
+					}
+				} else if !errors.Is(err, probeErr) {
+					t.Fatalf("non-timeout Git error=%v, want original probe error", err)
+				}
+				if sum.Failed != wantFailed || sum.Published != 0 || sum.Conflicts != 0 {
+					t.Fatalf("summary=%+v, want failed=%d and no publication/conflict", sum, wantFailed)
+				}
+				var eventState string
+				var eventError sql.NullString
+				if err := f.db.SQL().QueryRowContext(ctx,
+					`SELECT state, error FROM capture_events WHERE seq=?`, seq,
+				).Scan(&eventState, &eventError); err != nil {
+					t.Fatal(err)
+				}
+				if eventState != wantState {
+					t.Fatalf("event state=%q, want %q", eventState, wantState)
+				}
+				if deadline && (!strings.Contains(eventError.String, context.DeadlineExceeded.Error()) ||
+					!strings.Contains(eventError.String, "signal: killed")) {
+					t.Fatalf("event error=%q, want deadline and Git failure evidence", eventError.String)
+				}
+			})
+		}
+	}
+}
+
 func newSupersededHistoryProbeFixture(
 	t *testing.T,
 	ctx context.Context,
@@ -2519,60 +2584,32 @@ func TestIsTransientUpdateRefLockError_PinsRealGitMessage(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
-	// Build two distinct commits whose only difference is a single byte —
-	// either is a valid HEAD descendant of the seed commit. Both
-	// concurrent update-ref calls aim them at HEAD without a CAS, so at
-	// least one of them races with the other on the ref lock file.
-	mkCommit := func(payload string) string {
-		t.Helper()
-		blob, err := git.HashObjectStdin(ctx, f.dir, []byte(payload))
-		if err != nil {
-			t.Fatalf("hash-object: %v", err)
-		}
-		tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{
-			{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "lock-test.txt"},
-		})
-		if err != nil {
-			t.Fatalf("mktree: %v", err)
-		}
-		commit, err := git.CommitTree(ctx, f.dir, tree, "lock-test "+payload, f.cctx.BaseHead)
-		if err != nil {
-			t.Fatalf("commit-tree: %v", err)
-		}
-		return commit
+	// Hold a lock owned by this isolated fixture so the real Git error is
+	// guaranteed, rather than racing commands and sometimes skipping coverage.
+	blob, err := git.HashObjectStdin(ctx, f.dir, []byte("lock-test\n"))
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	commitA := mkCommit("a\n")
-	commitB := mkCommit("b\n")
-
-	const trials = 20
-	var observed error
-	for i := 0; i < trials && observed == nil; i++ {
-		var wg sync.WaitGroup
-		errs := make([]error, 2)
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			errs[0] = git.UpdateRef(ctx, f.dir, "refs/heads/main", commitA, "")
-		}()
-		go func() {
-			defer wg.Done()
-			errs[1] = git.UpdateRef(ctx, f.dir, "refs/heads/main", commitB, "")
-		}()
-		wg.Wait()
-		for _, err := range errs {
-			if err == nil {
-				continue
-			}
-			msg := strings.ToLower(err.Error())
-			if strings.Contains(msg, "cannot lock") || strings.Contains(msg, "unable to lock") {
-				observed = err
-				break
-			}
-		}
+	tree, err := git.Mktree(ctx, f.dir, []git.MktreeEntry{{Mode: git.RegularFileMode, Type: "blob", OID: blob, Path: "lock-test.txt"}})
+	if err != nil {
+		t.Fatal(err)
 	}
+	commit, err := git.CommitTree(ctx, f.dir, tree, "Test ref lock contention", f.cctx.BaseHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(f.dir, ".git", "refs", "heads", "main.lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = lock.Close()
+		_ = os.Remove(lockPath)
+	}()
+	observed := git.UpdateRef(ctx, f.dir, "refs/heads/main", commit, "")
 	if observed == nil {
-		t.Skipf("could not provoke real git ref-lock contention after %d trials", trials)
+		t.Fatal("update-ref succeeded while the test held its ref lock")
 	}
 	if !isTransientUpdateRefLockError(observed) {
 		t.Fatalf("isTransientUpdateRefLockError(%v) = false; real git lock message must classify as transient", observed)
@@ -3534,7 +3571,7 @@ func TestReplay_IntentStrategyForcedAgingRewritesWeakSubject(t *testing.T) {
 	}
 }
 
-func TestReplay_IntentStrategyForcedAgingRewriteFailureFallsBack(t *testing.T) {
+func TestReplay_IntentStrategyForcedAgingRewriteWaitsForAI(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -3570,57 +3607,24 @@ func TestReplay_IntentStrategyForcedAgingRewriteFailureFallsBack(t *testing.T) {
 		IntentMaxPendingAge: time.Hour,
 		IntentDeferLimit:    1,
 	})
-	if err != nil {
-		t.Fatalf("Replay: %v", err)
-	}
-	if sum.Published != 1 || sum.Skipped {
-		t.Fatalf("summary=%+v want deterministic fallback publish", sum)
+	if !isIntentPlannerCircuitWait(err) || sum.Published != 0 {
+		t.Fatalf("unavailable rewrite must wait: summary=%+v err=%v", sum, err)
 	}
 	if primary.planCalls != 1 || primary.rewriteCalls != 1 {
-		t.Fatalf("planCalls=%d rewriteCalls=%d want 1/1", primary.planCalls, primary.rewriteCalls)
+		t.Fatalf("unexpected calls %d/%d", primary.planCalls, primary.rewriteCalls)
 	}
-	validation := traceEventsByClass(trace.Events(), "intent.planner.validation_failed")
-	if len(validation) != 1 || !strings.Contains(validation[0].Error, "rewrite unavailable") {
-		t.Fatalf("validation trace=%+v want rewrite failure", validation)
+	if journals := loadSelfPublicationRows(t, ctx, f.db); len(journals) != 0 {
+		t.Fatalf("outage created publication journal: %+v", journals)
 	}
-	decisions, err := state.DecisionsForEvent(ctx, f.db, pending[0].Seq, 20)
-	if err != nil {
-		t.Fatalf("DecisionsForEvent: %v", err)
-	}
-	hasFallback := false
-	for _, decision := range decisions {
-		if decision.Kind == state.DecisionKindMessageQualityFallback {
-			hasFallback = true
-			break
-		}
-	}
-	if !hasFallback {
-		t.Fatalf("message_quality_fallback decision missing: %+v", decisions)
+	primary.rewriteErr = nil
+	primary.rewrite = ai.Result{Subject: "Parse totals consistently", Body: "- Keep total parsing behavior coherent"}
+	sum, err = Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent, IntentPlanner: planner, IntentWindow: 10, IntentMinPending: 3, IntentMaxPendingAge: time.Hour, IntentDeferLimit: 1})
+	if err != nil || sum.Published != 1 {
+		t.Fatalf("corrected rewrite=%+v err=%v", sum, err)
 	}
 	journals := loadSelfPublicationRows(t, ctx, f.db)
-	if len(journals) != 1 ||
-		journals[0].phase != state.SelfPublicationCompleted ||
-		journals[0].target != sum.SelfPublicationTargetOID {
-		t.Fatalf("message-quality journals=%+v summary=%+v", journals, sum)
-	}
-	commits := revListCount(t, ctx, f.dir, "HEAD")
-	f.cctx.BaseHead = sum.BaseHead
-	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
-		GitDir:              f.gitDir,
-		CommitStrategy:      ai.CommitStrategyIntent,
-		IntentPlanner:       planner,
-		IntentWindow:        10,
-		IntentMinPending:    3,
-		IntentMaxPendingAge: time.Hour,
-		IntentDeferLimit:    1,
-	}); err != nil {
-		t.Fatalf("second Replay: %v", err)
-	}
-	if got := revListCount(t, ctx, f.dir, "HEAD"); got != commits {
-		t.Fatalf("message-quality retry commits=%d want %d", got, commits)
-	}
-	if got := loadSelfPublicationRows(t, ctx, f.db); len(got) != 1 {
-		t.Fatalf("message-quality retry journals=%+v want one", got)
+	if len(journals) != 1 || journals[0].phase != state.SelfPublicationCompleted {
+		t.Fatalf("recovered publication=%+v", journals)
 	}
 }
 
@@ -4670,7 +4674,7 @@ func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) 
 	seq2 := captureSamePathEdit(t, ctx, f, "chain.txt", "v2\n")
 	seq3 := captureSamePathEdit(t, ctx, f, "chain.txt", "v3\n")
 
-	planner := &recordingIntentPlanner{
+	planner := &semanticRecordingIntentPlanner{recordingIntentPlanner: &recordingIntentPlanner{
 		plan: ai.IntentPlan{
 			SelectedSeqs: []int64{seq1, seq2, seq3},
 			CommitGroups: []ai.IntentCommitGroup{
@@ -4680,7 +4684,7 @@ func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) 
 			DeferredSeqs:    []int64{},
 			DeferredReasons: []ai.DeferredReason{},
 		},
-	}
+	}}
 
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:           f.gitDir,
@@ -5067,7 +5071,7 @@ func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
 		t.Fatalf("AppendCaptureEvent create: %v", err)
 	}
 
-	planner := &recordingIntentPlanner{
+	planner := &semanticRecordingIntentPlanner{recordingIntentPlanner: &recordingIntentPlanner{
 		plan: ai.IntentPlan{
 			SelectedSeqs:   []int64{createSeq},
 			DeferredSeqs:   []int64{deleteSeq},
@@ -5077,7 +5081,7 @@ func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
 				{Seq: deleteSeq, Reason: "later"},
 			},
 		},
-	}
+	}}
 
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:           f.gitDir,
@@ -8186,4 +8190,12 @@ func TestPathQuiescence_EvictionBoundsMapSize(t *testing.T) {
 	if got := PathQuiescenceTrackerSize(); got > pathQuiescenceMaxEntries/4 {
 		t.Fatalf("eviction did not prune stale entries; size=%d", got)
 	}
+}
+
+// This provider keeps legacy grouping-safety fixtures on the semantic-message
+// contract even when their deliberately invalid group needs local correction.
+type semanticRecordingIntentPlanner struct{ *recordingIntentPlanner }
+
+func (p *semanticRecordingIntentPlanner) RewriteIntentMessage(context.Context, ai.IntentMessageRewriteRequest) (ai.Result, error) {
+	return ai.Result{Subject: "Preserve ordered feature changes", Body: "- Keep dependent captures in their proven order"}, nil
 }

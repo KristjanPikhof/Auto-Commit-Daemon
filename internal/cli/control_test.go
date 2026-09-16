@@ -437,37 +437,14 @@ func TestControlOnReturnsErrorAfterRenderingUnhealthyResult(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close state DB: %v", err)
 	}
-	previousSpawn := spawnDaemon
-	spawnCount := 0
-	spawnDaemon = func(ctx context.Context, repoAbs string) (int, error) {
-		spawnCount++
-		spawnDB, err := state.Open(
-			ctx, state.DBPathFromGitDir(filepath.Join(repoAbs, ".git")))
-		if err != nil {
-			return 0, err
-		}
-		defer spawnDB.Close()
-		if err := state.SaveDaemonState(ctx, spawnDB, state.DaemonState{
-			PID:              os.Getpid(),
-			Mode:             "running",
-			HeartbeatTS:      nowFloat(),
-			BranchRef:        sqlNullStr("refs/heads/main"),
-			BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
-			UpdatedTS:        nowFloat(),
-		}); err != nil {
-			return 0, err
-		}
-		return os.Getpid(), nil
-	}
-	t.Cleanup(func() { spawnDaemon = previousSpawn })
 
 	var out bytes.Buffer
 	err = runControlOn(ctx, &out, repo, true)
 	if ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "setup") {
 		t.Fatalf("runControlOn exit=%d err=%v want setup-required result", ExitCode(err), err)
 	}
-	if out.Len() != 0 || spawnCount != 0 {
-		t.Fatalf("v19 on mutated before cutover: output=%q spawn_count=%d", out.String(), spawnCount)
+	if out.Len() != 0 {
+		t.Fatalf("v19 on mutated before cutover: output=%q", out.String())
 	}
 }
 
@@ -880,7 +857,7 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
 		t.Fatalf("runControlStatus: %v", err)
 	}
-	for _, line := range []string{"State:", "ACD protection:", "Current changes protected:", "Published to Git:", "Action needed:", "Status:", "Next:"} {
+	for _, line := range []string{"Protection:", "Current changes saved:", "Branch commits:", "Next:"} {
 		if got := strings.Count(out.String(), line); got != 1 {
 			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
 		}
@@ -908,6 +885,7 @@ func TestProductStatusShowsIntentQueueAndActiveTarget(t *testing.T) {
 	if err := renderProductEnvelope(&out, envelope, false); err != nil {
 		t.Fatal(err)
 	}
+	renderProductPublicationProgress(&out, progress)
 	for _, want := range []string{
 		"Commit mode: Intent",
 		"Publication queue: 22 protected change(s)",
@@ -966,6 +944,7 @@ func TestProductStatusSuppressesCompletedDrainAndWaitHasNoTarget(t *testing.T) {
 			if err := renderProductEnvelope(&out, envelope, false); err != nil {
 				t.Fatal(err)
 			}
+			renderProductPublicationProgress(&out, test.progress)
 			if !strings.Contains(out.String(), test.want) {
 				t.Fatalf("status missing %q:\n%s", test.want, out.String())
 			}

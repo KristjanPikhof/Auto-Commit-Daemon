@@ -191,6 +191,9 @@ func runConfigGet(ctx context.Context, out io.Writer, repo string, options confi
 	for _, value := range values {
 		fmt.Fprintf(out, "%s=%s\t%s\n", value.Name, value.Value, value.Source)
 	}
+	if target.Scope == "repo" {
+		fmt.Fprintf(out, "To inherit global defaults again: acd config edit --repo %s --inherit\n", productListShellQuote(target.Repo))
+	}
 	return nil
 }
 

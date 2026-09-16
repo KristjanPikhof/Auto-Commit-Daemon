@@ -68,6 +68,7 @@ type diagnoseGeneratedPendingGroup struct {
 }
 
 type diagnoseReport struct {
+	PublicationOutcome         publicationOutcome              `json:"publication_outcome"`
 	Repo                       string                          `json:"repo"`
 	RepoHash                   string                          `json:"repo_hash"`
 	StateDB                    string                          `json:"state_db"`
@@ -145,17 +146,9 @@ The default repo is the current working directory. Diagnose opens state read-onl
 }
 
 func runDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	rec, _, _, err := lookupRegisteredRepo("diagnose", repo)
+	report, err := collectDiagnose(ctx, repo)
 	if err != nil {
 		return err
-	}
-
-	report, err := buildDiagnoseReport(ctx, rec)
-	if err != nil {
-		return fmt.Errorf("acd diagnose: %w", err)
 	}
 
 	if jsonOut {
@@ -164,6 +157,23 @@ func runDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut bool) 
 		return enc.Encode(report)
 	}
 	return renderDiagnoseHuman(out, report)
+}
+
+func collectDiagnose(ctx context.Context, repo string) (diagnoseReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rec, _, _, err := lookupRegisteredRepo("diagnose", repo)
+	if err != nil {
+		return diagnoseReport{}, err
+	}
+
+	report, err := buildDiagnoseReport(ctx, rec)
+	if err != nil {
+		return diagnoseReport{}, fmt.Errorf("acd diagnose: %w", err)
+	}
+
+	return report, nil
 }
 
 func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseReport, error) {
@@ -259,6 +269,7 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	report.WorktreeClean = status.WorktreeClean
 	report.AllChangesCommittedInGit = status.AllChangesCommittedInGit
 	report.CheckpointPublishedByACD = status.CheckpointPublishedByACD
+	report.PublicationOutcome = status.PublicationOutcome
 	report.PublicationDrain = status.PublicationDrain
 	report.CheckpointMaintenance = status.CheckpointMaintenance
 	report.Remediation = diagnoseRemediation(report)

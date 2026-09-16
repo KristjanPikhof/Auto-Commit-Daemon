@@ -332,6 +332,8 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"branch_token":                           "missing refs/heads/main",
+		"branch.generation":                      "7",
 		daemon.MetaKeyProtectionObservationEpoch: "7",
 		daemon.MetaKeyProtectionCoveredEpoch:     "7",
 		daemon.MetaKeyProtectionCheckpointID:     "checkpoint-7",
@@ -348,10 +350,11 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		!report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 0 {
 		t.Fatalf("clean truth=%+v", report)
 	}
-	listReport := statusReport{}
-	if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+	listOverview, err := readProductListRepo(ctx, rec, time.Now())
+	if err != nil {
 		t.Fatal(err)
 	}
+	listReport := listOverview.report
 	if !listReport.Protected || listReport.UnpublishedCheckpoints != 0 {
 		t.Fatalf("recovered list truth=%+v", listReport)
 	}
@@ -360,11 +363,25 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if !control.Published || !control.CheckpointPublishedByACD {
 		t.Fatalf("recovered control truth=%+v", control)
 	}
+	if (control.PublicationOutcome.BranchCommitted != nil && *control.PublicationOutcome.BranchCommitted) ||
+		control.PublicationOutcome.RecoveredChanges != 1 || control.PublicationOutcome.WaitingChanges != 0 {
+		t.Fatalf("recovery must be distinct from branch publication: %+v", control.PublicationOutcome)
+	}
+	entries, err := loadCheckpointHistory(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Outcome != "recovered" || entries[0].Published {
+		t.Fatalf("recovery history: %+v", entries)
+	}
+	if listReport.PublicationOutcome.RecoveredChanges != 1 || (listReport.PublicationOutcome.BranchCommitted != nil && *listReport.PublicationOutcome.BranchCommitted) {
+		t.Fatalf("list recovery outcome: %+v", listReport.PublicationOutcome)
+	}
 	listRecord := rec
 	listRecord.RepositoryID = "repository-id"
 	listRecord.WorktreeID = "0123456789abcdef"
 	entry := productListEntryFromOverview(listRecord, supervisor.WorkerStatus{},
-		productListRepoOverview{report: report}, nil)
+		listOverview, nil)
 	if !entry.Published {
 		t.Fatalf("recovered product list truth=%+v", entry)
 	}
@@ -396,10 +413,11 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 			if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
 				t.Fatalf("%s checkpoint truth=%+v", unresolvedState, report)
 			}
-			listReport := statusReport{}
-			if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
+			listOverview, err := readProductListRepo(ctx, rec, time.Now())
+			if err != nil {
 				t.Fatal(err)
 			}
+			listReport := listOverview.report
 			if listReport.UnpublishedCheckpoints != 1 {
 				t.Fatalf("%s list truth=%+v", unresolvedState, listReport)
 			}
@@ -429,7 +447,7 @@ func TestStatusDiagnoseDoctorControlReadsStayReadOnly(t *testing.T) {
 	}
 	rejectPath := plannerRejectLogPath(dbPath)
 	for name, read := range map[string]func() error{
-		"status":   func() error { return runStatus(ctx, &bytes.Buffer{}, repo, true) },
+		"status":   func() error { return writeStatusProjectionFixture(ctx, &bytes.Buffer{}, repo, true) },
 		"diagnose": func() error { return runDiagnose(ctx, &bytes.Buffer{}, repo, true) },
 		"doctor":   func() error { return runDoctor(ctx, &bytes.Buffer{}, false, repo, true) },
 		"control":  func() error { _, err := inspectControl(ctx, repo); return err },

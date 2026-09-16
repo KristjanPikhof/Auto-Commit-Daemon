@@ -2550,10 +2550,8 @@ func TestRun_ShutdownCompletesWithin5sUnderHungProvider(t *testing.T) {
 	}
 }
 
-// TestRun_AIProvider_FallbackToDeterministic: when ACD_AI_PROVIDER=
-// openai-compat is set without an API key, the daemon must warn-and-degrade
-// to the deterministic generator so commits keep landing.
-func TestRun_AIProvider_FallbackToDeterministic(t *testing.T) {
+// Missing selected-provider credentials keep edits protected until corrected.
+func TestRun_AIProvider_MissingCredentialsKeepsProtection(t *testing.T) {
 	t.Setenv(ai.EnvProvider, "openai-compat")
 	t.Setenv(ai.EnvAPIKey, "")
 	t.Setenv(ai.EnvBaseURL, "")
@@ -2596,15 +2594,21 @@ func TestRun_AIProvider_FallbackToDeterministic(t *testing.T) {
 	}
 	wakeCh <- struct{}{}
 
-	newHead := waitForCommit(t, f.dir, startHead, 10*time.Second)
-	out, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir},
-		"log", "-1", "--pretty=%s", newHead)
-	if err != nil {
-		t.Fatalf("git log: %v", err)
-	}
-	subj := strings.TrimSpace(string(out))
-	if subj != "Add fallback.txt" {
-		t.Fatalf("subject=%q want %q (deterministic format)", subj, "Add fallback.txt")
+	waitFor(t, 5*time.Second, "checkpoint despite missing credentials", func() bool {
+		id, ok, err := state.MetaGet(ctx, f.db, MetaKeyProtectionCheckpointID)
+		if err != nil || !ok {
+			return false
+		}
+		checkpoint, err := state.ResolveCheckpoint(ctx, f.db.Path(), id)
+		if err != nil {
+			return false
+		}
+		_, err = git.Run(ctx, git.RunOpts{Dir: f.dir}, "cat-file", "-e", checkpoint.CommitOID+":fallback.txt")
+		return err == nil
+	})
+	newHead, err := git.RevParse(ctx, f.dir, "HEAD")
+	if err != nil || newHead != startHead {
+		t.Fatalf("missing credentials silently produced commit: %s %v", newHead, err)
 	}
 
 	cancel()

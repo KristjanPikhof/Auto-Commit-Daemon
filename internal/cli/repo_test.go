@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,7 +56,7 @@ func TestRepoDisable_StopsClearsCachesPreservesState(t *testing.T) {
 	t.Cleanup(func() { repoDisableStopOneRepo = prev })
 
 	var out bytes.Buffer
-	if err := runRepoDisable(ctx, &out, repo, true); err != nil {
+	if err := applyRepoLifecycleForTest(ctx, &out, repo, true, true); err != nil {
 		t.Fatalf("runRepoDisable: %v\n%s", err, out.String())
 	}
 	if stops != 1 {
@@ -104,7 +105,7 @@ func TestRepoDisable_IdempotentAlreadyDisabled(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRepoDisable(ctx, &out, repo, false); err != nil {
+	if err := applyRepoLifecycleForTest(ctx, &out, repo, true, false); err != nil {
 		t.Fatalf("runRepoDisable: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "already disabled "+repo) || !strings.Contains(out.String(), "state: preserved "+stateDB) {
@@ -126,7 +127,7 @@ func TestRepoEnable_ClearsDisabledWithoutStartingDaemon(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRepoEnable(ctx, &out, repo, true); err != nil {
+	if err := applyRepoLifecycleForTest(ctx, &out, repo, false, true); err != nil {
 		t.Fatalf("runRepoEnable: %v\n%s", err, out.String())
 	}
 	var got repoLifecycleCommandResult
@@ -157,7 +158,7 @@ func TestRepoEnable_IdempotentAlreadyEnabled(t *testing.T) {
 	registerRepo(t, roots, repo, stateDB, "")
 
 	var out bytes.Buffer
-	if err := runRepoEnable(ctx, &out, repo, false); err != nil {
+	if err := applyRepoLifecycleForTest(ctx, &out, repo, false, false); err != nil {
 		t.Fatalf("runRepoEnable: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "already enabled "+repo) || !strings.Contains(out.String(), "state: preserved "+stateDB) {
@@ -179,7 +180,7 @@ func TestRepoLifecycle_UnknownRepoDoesNotCreateState(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = runRepoDisable(ctx, &out, repo, true)
+	err = applyRepoLifecycleForTest(ctx, &out, repo, true, true)
 	if err == nil {
 		t.Fatalf("runRepoDisable unknown succeeded")
 	}
@@ -200,81 +201,6 @@ func TestRepoLifecycle_UnknownRepoDoesNotCreateState(t *testing.T) {
 	}
 }
 
-func TestRepoInit_JSONFromSubdir(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repo := initRepoForRepoLifecycle(t)
-	subdir := filepath.Join(repo, "nested", "deeper")
-	if err := os.MkdirAll(subdir, 0o755); err != nil {
-		t.Fatalf("mkdir subdir: %v", err)
-	}
-
-	var out bytes.Buffer
-	if err := runRepoInit(ctx, &out, subdir, true); err != nil {
-		t.Fatalf("runRepoInit: %v", err)
-	}
-	var got repoInitResult
-	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
-		t.Fatalf("decode init json: %v\n%s", err, out.String())
-	}
-	if got.Repo != repo {
-		t.Fatalf("repo=%q want %q", got.Repo, repo)
-	}
-	if !got.Inserted || got.Refreshed {
-		t.Fatalf("insert/refreshed mismatch: %+v", got)
-	}
-	if got.BranchRef != "refs/heads/main" {
-		t.Fatalf("branch_ref=%q", got.BranchRef)
-	}
-	if got.ConfigPath != roots.ConfigPath() {
-		t.Fatalf("config_path=%q want %q", got.ConfigPath, roots.ConfigPath())
-	}
-	if !fileExists(got.StateDB) {
-		t.Fatalf("state db was not created: %s", got.StateDB)
-	}
-
-	reg, err := central.Load(roots)
-	if err != nil {
-		t.Fatalf("load registry: %v", err)
-	}
-	if _, ok := reg.FindRepo(repo, got.StateDB); !ok {
-		t.Fatalf("registry missing initialized repo: %+v", reg.Repos)
-	}
-}
-
-func TestRepoInit_IdempotentAlreadyRegistered(t *testing.T) {
-	withIsolatedHome(t)
-	ctx := context.Background()
-	repo := initRepoForRepoLifecycle(t)
-
-	var first, second bytes.Buffer
-	if err := runRepoInit(ctx, &first, repo, true); err != nil {
-		t.Fatalf("first init: %v", err)
-	}
-	if err := runRepoInit(ctx, &second, repo, true); err != nil {
-		t.Fatalf("second init: %v", err)
-	}
-	var got repoInitResult
-	if err := json.Unmarshal(second.Bytes(), &got); err != nil {
-		t.Fatalf("decode second init: %v\n%s", err, second.String())
-	}
-	if got.Inserted || !got.Refreshed {
-		t.Fatalf("second init should refresh existing row: %+v", got)
-	}
-}
-
-func TestRepoInit_NonGitDirFails(t *testing.T) {
-	withIsolatedHome(t)
-	var out bytes.Buffer
-	err := runRepoInit(context.Background(), &out, t.TempDir(), true)
-	if err == nil {
-		t.Fatalf("runRepoInit in non-git dir succeeded")
-	}
-	if !strings.Contains(err.Error(), "not inside a Git worktree") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestRepoRemove_DryRunPreservesRegistryAndState(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
@@ -283,7 +209,7 @@ func TestRepoRemove_DryRunPreservesRegistryAndState(t *testing.T) {
 	registerRepo(t, roots, repo, stateDB, "")
 
 	var out bytes.Buffer
-	if err := runRepoRemove(ctx, &out, repo, false, false, false, true); err != nil {
+	if err := runRepoRemoveWithInput(ctx, &out, strings.NewReader(""), repo, false, false, false, true); err != nil {
 		t.Fatalf("runRepoRemove dry-run: %v", err)
 	}
 	var got repoRemoveResult
@@ -334,7 +260,7 @@ func TestRepoRemove_YesStopsClearsCachesAndRemovesRegistry(t *testing.T) {
 	t.Cleanup(func() { repoRemoveStopOneRepo = prev })
 
 	var out bytes.Buffer
-	if err := runRepoRemove(ctx, &out, repo, false, true, false, true); err != nil {
+	if err := runRepoRemoveWithInput(ctx, &out, strings.NewReader(""), repo, false, true, false, true); err != nil {
 		t.Fatalf("runRepoRemove --yes: %v\n%s", err, out.String())
 	}
 	if stops != 1 {
@@ -371,7 +297,7 @@ func TestRepoRemove_PurgeStateDeletesAcdStateDir(t *testing.T) {
 	stateDir := filepath.Dir(stateDB)
 
 	var out bytes.Buffer
-	if err := runRepoRemove(ctx, &out, repo, false, true, true, true); err != nil {
+	if err := runRepoRemoveWithInput(ctx, &out, strings.NewReader(""), repo, false, true, true, true); err != nil {
 		t.Fatalf("runRepoRemove --purge-state: %v\n%s", err, out.String())
 	}
 	var got repoRemoveResult
@@ -406,7 +332,7 @@ func TestRepoRemove_MissingPathRegistryRow(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRepoRemove(ctx, &out, missing, false, true, false, true); err != nil {
+	if err := runRepoRemoveWithInput(ctx, &out, strings.NewReader(""), missing, false, true, false, true); err != nil {
 		t.Fatalf("runRepoRemove missing --yes: %v\n%s", err, out.String())
 	}
 	var got repoRemoveResult
@@ -846,4 +772,20 @@ func initRepoForRepoLifecycle(t *testing.T) string {
 		t.Fatalf("repo hash: %q %v", hash, err)
 	}
 	return wt.Root
+}
+
+func applyRepoLifecycleForTest(ctx context.Context, out io.Writer, repo string, disable, jsonOut bool) error {
+	roots, err := paths.Resolve()
+	if err != nil {
+		return err
+	}
+	target, err := repoRemovalTargetForCommand(ctx, repo, "repo manage")
+	if err != nil {
+		return err
+	}
+	result, err := applyRepoLifecycle(ctx, roots, target, disable)
+	if err != nil {
+		return err
+	}
+	return renderRepoLifecycleCommand(out, result, jsonOut)
 }

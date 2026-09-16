@@ -1,14 +1,6 @@
-// replay.go drains pending capture_events into per-event commits per §8.3.
-//
-// Atomic-per-file: every event becomes ONE commit. Coalescing multi-file
-// events into a single commit is OFF by default in v1 — even when an event
-// happens to carry multiple ops, a single commit is produced via the legacy
-// update-index --index-info path.
-//
-// AI commit messages land in Phase 5 (internal/ai). Phase 1 ships a
-// deterministic message helper in this package; the run loop wires it via
-// the MessageFn hook so Phase 5 can swap the implementation without
-// touching the replay state machine.
+// Replay publishes protected captures using Intent groups or explicit Event mode.
+// Provider messages, materialization and verification share the worker
+// evaluation boundary; journaled state and live Git mutations stay on the worker.
 package daemon
 
 import (
@@ -138,9 +130,8 @@ func resetPauseWarnForTest(t interface{ Helper() }, intervalSeconds int64) {
 	pauseWarnMu.Unlock()
 }
 
-// MessageFn produces a commit message for one event + its ops. Phase 1
-// callers pass DeterministicMessage; Phase 5 swaps in an AI-backed
-// implementation.
+// MessageFn produces a commit message for one event and its operations using
+// the explicitly selected provider.
 type MessageFn func(ctx context.Context, ec EventContext) (string, error)
 
 // EventContext is the input handed to MessageFn. Mirrors the fields the
@@ -263,6 +254,7 @@ type ReplayOpts struct {
 	// the candidate engine's built-in atomicity and materialization gates.
 	IntentVerificationMode string
 	IntentCandidateVerify  IntentCandidateVerifier
+	ManagedVerification    bool
 	// IntentRepairCommitVerify validates exact commit-tree output before an
 	// automatic repair changes the branch ref.
 	IntentRepairCommitVerify git.IntentRepairCommitVerifier
@@ -375,6 +367,11 @@ func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
 	case sum.Conflicts > 0 || sum.Failed > 0:
 		sum.Disposition = ReplayDispositionNeedsAttention
 	case replayErr != nil:
+		if ai.ProviderNeedsConfiguration(replayErr) {
+			sum.Disposition = ReplayDispositionNeedsAttention
+			sum.DispositionReason = "provider_configuration_required"
+			return
+		}
 		if errors.Is(replayErr, context.Canceled) ||
 			isIntentPlannerCircuitWait(replayErr) {
 			sum.Disposition = ReplayDispositionTransientWait
@@ -1017,9 +1014,12 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		}
 
 		// Build the commit on top of the new tree.
-		commitOID, err := buildCommitFromTree(eventCtx, repoRoot, treeOID, parent, ev, ops, msgFn)
+		commitOID, err := buildCommitFromTree(eventCtx, repoRoot, treeOID, parent, ev, ops, msgFn, opts.IntentHealth)
 		if err != nil {
 			cancelEvent()
+			if isIntentPlannerCircuitWait(err) || ai.ProviderNeedsConfiguration(err) || ctx.Err() != nil {
+				return sum, err
+			}
 			if markErr := markFailed(ctx, db, ev, replayIssue{
 				ErrorClass: replayErrorCommitBuildFailure,
 				Message:    err.Error(),
@@ -2724,13 +2724,15 @@ func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item i
 			Source:         "per-event",
 		}, nil
 	}
-	msg, err := msgFn(ctx, EventContext{Event: item.event, Ops: item.ops})
+	msg, err := evaluatePublication(ctx, func(jobCtx context.Context) (string, error) {
+		return msgFn(jobCtx, EventContext{Event: item.event, Ops: item.ops})
+	})
 	if err != nil {
 		return ai.IntentPlan{}, fmt.Errorf("singleton fast path message: %w", err)
 	}
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
-		msg = "Update files"
+		return ai.IntentPlan{}, errors.New("selected provider returned an empty singleton message")
 	}
 	parts := strings.SplitN(msg, "\n\n", 2)
 	plan := ai.IntentPlan{
@@ -2743,7 +2745,7 @@ func planIntentSingletonMessagePath(ctx context.Context, msgFn MessageFn, item i
 		plan.Body = strings.TrimSpace(parts[1])
 	}
 	if plan.Subject == "" {
-		plan.Subject = "Update files"
+		return ai.IntentPlan{}, errors.New("selected provider returned an empty singleton subject")
 	}
 	return plan, nil
 }
@@ -2814,29 +2816,28 @@ func planIntentWithFallback(
 	}
 
 	var permit IntentPlannerHealthPermit
+	permitCompleted := false
 	if health != nil {
 		var acquireErr error
 		permit, acquireErr = health.Acquire(ctx)
 		if acquireErr != nil {
-			var openErr *IntentPlannerCircuitOpenError
-			if !errors.As(acquireErr, &openErr) {
-				return ai.IntentPlan{}, "", acquireErr
-			}
-			// A circuit bypass is an expected deterministic degradation, not a
-			// fresh planner error. Keep validationFailure empty so no
-			// intent_planner_error rows or decisions are emitted on every tick.
-			bypassReason := "intent planner circuit bypass: open"
-			if openErr.HalfOpen {
-				bypassReason = "intent planner circuit bypass: half-open probe in progress"
-			}
-			recordIntentPromptFallback(ctx, planner, bypassReason)
-			plan, err := deterministicIntentFallback(ctx, repoRoot, req, items)
-			return plan, "", err
+			return ai.IntentPlan{}, "", acquireErr
 		}
+		defer func() {
+			if !permitCompleted {
+				_ = health.Complete(ctx, permit, nil)
+			}
+		}()
+
 	}
 
 	var validationFailure string
-	plan, err := planner.PlanIntent(ctx, req)
+	plan, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlan, error) {
+		return planner.PlanIntent(jobCtx, req)
+	})
+	if ai.ProviderNeedsConfiguration(err) {
+		return ai.IntentPlan{}, "", err
+	}
 	plannerCallFailed := err != nil
 	if err == nil {
 		// Defense in depth against third-party planners that skip the helper.
@@ -2852,6 +2853,7 @@ func planIntentWithFallback(
 	}
 	if err == nil {
 		if health != nil {
+			permitCompleted = true
 			if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
 				return ai.IntentPlan{}, "", healthErr
 			}
@@ -2860,9 +2862,28 @@ func planIntentWithFallback(
 	}
 	if health != nil {
 		failure := classifyIntentPlannerHealthFailure(err, plannerCallFailed)
+		// A rejected semantic response still proves the provider is reachable.
+		// Keep its grouping diagnostics below, without spending outage backoff.
+		var validation *IntentPlannerValidationFailure
+		if errors.As(failure, &validation) {
+			failure = nil
+		}
+		permitCompleted = true
 		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
 			return ai.IntentPlan{}, "", healthErr
 		}
+	}
+	var transport *IntentPlannerTransportFailure
+	if ai.PrimaryProviderName(planner) != (ai.DeterministicProvider{}).Name() &&
+		errors.As(classifyIntentPlannerHealthFailure(err, plannerCallFailed), &transport) {
+		if ctx.Err() != nil {
+			return ai.IntentPlan{}, "", ctx.Err()
+		}
+		retryAt := time.Now().Add(30 * time.Second)
+		if health != nil {
+			retryAt = time.Unix(0, int64(health.Snapshot().NextProbeTS*1e9))
+		}
+		return ai.IntentPlan{}, "", &IntentPlannerCircuitOpenError{RetryAt: retryAt}
 	}
 	validationFailure = ai.SanitizePlannerError(err.Error())
 	recordIntentPromptFallback(ctx, planner, validationFailure)
@@ -2887,6 +2908,9 @@ func planIntentWithFallback(
 		}
 	}
 	plan, err = deterministicIntentFallback(ctx, repoRoot, req, items)
+	if err == nil && ai.PrimaryProviderName(planner) != (ai.DeterministicProvider{}).Name() {
+		plan, err = rewriteLegacyFallbackMessages(ctx, planner, health, req, plan)
+	}
 	return plan, validationFailure, err
 }
 
@@ -3939,7 +3963,7 @@ func intentPlanMessage(plan ai.IntentPlan) string {
 func commitTreeWithMessage(ctx context.Context, repoRoot, treeOID, parent, msg string) (string, error) {
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
-		msg = "Update files"
+		return "", errors.New("selected provider returned an empty commit message")
 	}
 	var parents []string
 	if parent != "" {
@@ -4449,31 +4473,8 @@ func selfHealEligibleByOps(ops []state.CaptureOp) bool {
 	return true
 }
 
-// alreadyPublishedAtHEAD reports whether HEAD's tree already reflects the
-// captured ops, signalling that an external committer landed our intent
-// before we got there. Returning (headOID, true, nil) tells the caller to
-// settle the event as published against `headOID` without minting a new
-// commit.
-//
-// Two guards keep idempotent settle from masking real divergence:
-//
-//  1. Ancestry guard: `sourceHead` (the replay parent the event was about
-//     to chain off) MUST be an ancestor of the current HEAD. If HEAD has
-//     diverged from our parent (operator hard-reset to an unrelated
-//     branch, force-push, etc.) the matching tree state is coincidence,
-//     not a successful parallel publish — return false and let the caller
-//     block terminally. An empty `sourceHead` skips the probe (initial
-//     commit / orphan repo).
-//  2. HEAD-movement guard: HEAD is re-resolved AFTER the per-op tree
-//     probes. If the resolved OID has shifted between the first read and
-//     the post-probe re-read, the captured tree state is no longer
-//     guaranteed to correspond to the live HEAD — return false so the
-//     caller retries on the next replay pass with a fresh anchor.
+// alreadyPublishedAtHEAD accepts deletes after replay has validated capture ops.
 func alreadyPublishedAtHEAD(ctx context.Context, repoRoot, sourceHead string, ops []state.CaptureOp) (string, bool, error) {
-	// Defensive empty-ops guard. The replay loop only reaches this helper
-	// after validateOps + LoadCaptureOps, but a future refactor could
-	// hand us a zero-length slice — settle to "not published" rather than
-	// silently confirming an empty event.
 	if len(ops) == 0 {
 		return "", false, nil
 	}
@@ -4484,141 +4485,28 @@ func alreadyPublishedAtHEAD(ctx context.Context, repoRoot, sourceHead string, op
 		}
 		return "", false, fmt.Errorf("rev-parse HEAD: %w", err)
 	}
-	// Ancestry guard: an external HEAD that doesn't descend from our
-	// replay parent means the matching tree state is coincidence, not a
-	// successful parallel publish. Return (headOID, false) so the caller
-	// can record a real conflict instead of silently chaining off a
-	// stranger.
-	if sourceHead != "" && sourceHead != headOID {
-		descends, err := git.IsAncestor(ctx, repoRoot, sourceHead, headOID)
-		if err != nil {
-			return "", false, fmt.Errorf("ancestry probe %s..%s: %w", sourceHead, headOID, err)
-		}
-		if !descends {
-			return headOID, false, nil
-		}
-	}
+	return git.ProvePublicationAtHEAD(ctx, repoRoot, sourceHead, headOID, publicationProofOps(ops), git.PublicationProofPolicy{AllowDeletes: true})
+}
+
+func publicationProofOps(ops []state.CaptureOp) []git.PublicationOp {
+	result := make([]git.PublicationOp, 0, len(ops))
 	for _, op := range ops {
-		if op.Op == "delete" {
-			// Delete is idempotent only when HEAD has NO entry at all
-			// for this path. A path replaced by a directory (tree
-			// entry) or a submodule (commit entry) is NOT absent —
-			// settling as published would mask a real divergence.
-			absent, err := isPathAbsentInTree(ctx, repoRoot, headOID, op.Path)
-			if err != nil {
-				return "", false, err
-			}
-			if !absent {
-				return headOID, false, nil
-			}
-			continue
+		proof := git.PublicationOp{Operation: op.Op, Path: op.Path}
+		if op.OldPath.Valid {
+			proof.OldPath = op.OldPath.String
 		}
-		blobOID, err := git.LsTreeBlobOID(ctx, repoRoot, headOID, op.Path)
-		if err != nil {
-			return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
+		if op.BeforeOID.Valid {
+			proof.BeforeOID = op.BeforeOID.String
 		}
-		if !op.AfterOID.Valid || op.AfterOID.String == "" {
-			return headOID, false, nil
+		if op.AfterOID.Valid {
+			proof.AfterOID = op.AfterOID.String
 		}
-		if blobOID != op.AfterOID.String {
-			return headOID, false, nil
+		if op.AfterMode.Valid {
+			proof.AfterMode = op.AfterMode.String
 		}
-		if op.AfterMode.Valid && op.AfterMode.String != "" {
-			entries, err := git.LsTree(ctx, repoRoot, headOID, false, op.Path)
-			if err != nil {
-				return "", false, fmt.Errorf("ls-tree HEAD %s: %w", op.Path, err)
-			}
-			if !treeEntryModeMatches(entries, op.Path, op.AfterMode.String) {
-				return headOID, false, nil
-			}
-		}
-		if op.Op == "rename" && op.OldPath.Valid && op.OldPath.String != "" {
-			absent, err := isPathAbsentInTree(ctx, repoRoot, headOID, op.OldPath.String)
-			if err != nil {
-				return "", false, err
-			}
-			if !absent {
-				return headOID, false, nil
-			}
-			// Rename source verify: before settling as already-published
-			// we require the captured BeforeOID for the rename source to
-			// still be present in the object database. If it's missing
-			// (gc'd, partial fetch), we cannot prove the rename actually
-			// matches the captured intent, so refuse to settle and let
-			// the caller block.
-			if op.BeforeOID.Valid && op.BeforeOID.String != "" {
-				present, err := objectExists(ctx, repoRoot, op.BeforeOID.String)
-				if err != nil {
-					return "", false, err
-				}
-				if !present {
-					return headOID, false, nil
-				}
-			}
-		}
+		result = append(result, proof)
 	}
-	// HEAD-movement guard: the per-op probes above all read against the
-	// `headOID` we resolved at the start. If HEAD has moved while we were
-	// probing (an external committer landed something between the first
-	// rev-parse and the last ls-tree), the matching tree state no longer
-	// describes the live ref. Refuse to settle and let the caller try
-	// again on the next pass with a fresh anchor.
-	postHead, err := git.RevParse(ctx, repoRoot, "HEAD")
-	if err != nil {
-		if errors.Is(err, git.ErrRefNotFound) {
-			return "", false, nil
-		}
-		return "", false, fmt.Errorf("rev-parse HEAD post-probe: %w", err)
-	}
-	if postHead != headOID {
-		return postHead, false, nil
-	}
-	return headOID, true, nil
-}
-
-// isPathAbsentInTree reports whether path is absent at ref. A path resolved
-// to a non-blob entry (tree, submodule) is treated as NOT absent — the
-// caller's idempotent check must not confuse a directory-replacement with
-// a successful delete.
-func isPathAbsentInTree(ctx context.Context, repoRoot, ref, path string) (bool, error) {
-	entries, err := git.LsTree(ctx, repoRoot, ref, false, path)
-	if err != nil {
-		return false, fmt.Errorf("ls-tree %s %s: %w", ref, path, err)
-	}
-	for _, entry := range entries {
-		if entry.Path == path {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-// objectExists reports whether the given OID is present in the local
-// object database via `git cat-file -e`. Used by the rename-source verify
-// path so the daemon will not settle a rename as published when the
-// captured BeforeOID is no longer reachable (shallow clone, gc'd ref).
-func objectExists(ctx context.Context, repoRoot, oid string) (bool, error) {
-	if oid == "" {
-		return false, nil
-	}
-	_, _, err := git.RunWithStderr(ctx, git.RunOpts{Dir: repoRoot}, "cat-file", "-e", oid)
-	if err == nil {
-		return true, nil
-	}
-	var gerr *git.Error
-	if errors.As(err, &gerr) && gerr.ExitCode == 1 {
-		return false, nil
-	}
-	return false, fmt.Errorf("cat-file -e %s: %w", oid, err)
-}
-
-func treeEntryModeMatches(entries []git.TreeEntry, path, mode string) bool {
-	for _, entry := range entries {
-		if entry.Path == path && entry.Type == "blob" {
-			return entry.Mode == mode
-		}
-	}
-	return false
+	return result
 }
 
 // validateOps mirrors snapshot-replay._validate_op: every op kind must
@@ -4895,14 +4783,10 @@ func liveIndexOpsFromCaptureOps(ops []state.CaptureOp) []git.LiveIndexOp {
 // buildCommitFromTree composes the commit message and runs commit-tree on
 // the supplied tree OID. Returns the new commit OID; the caller is
 // responsible for update-ref.
-func buildCommitFromTree(ctx context.Context, repoRoot, treeOID, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn) (string, error) {
-	msg, err := msgFn(ctx, EventContext{Event: ev, Ops: ops})
+func buildCommitFromTree(ctx context.Context, repoRoot, treeOID, parent string, ev state.CaptureEvent, ops []state.CaptureOp, msgFn MessageFn, health *IntentPlannerHealth) (string, error) {
+	msg, err := generatePublicationMessage(ctx, msgFn, EventContext{Event: ev, Ops: ops}, health)
 	if err != nil {
 		return "", fmt.Errorf("message: %w", err)
-	}
-	if strings.TrimSpace(msg) == "" {
-		// Defensive fallback so the commit never lands with an empty subject.
-		msg = "Update files"
 	}
 
 	var parents []string
@@ -4933,7 +4817,15 @@ func resolveTreeOID(ctx context.Context, repoRoot, commit string) (string, error
 	return tree, nil
 }
 
-func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, ops []state.CaptureOp) (bool, string, error) {
+func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, ops []state.CaptureOp) (superseded bool, reason string, err error) {
+	defer func() {
+		// CommandContext may report a killed Git process instead of the
+		// deadline that killed it. Preserve both before the caller cancels
+		// the event context, so replay can settle its timeout in the loop.
+		if err != nil && ctx.Err() != nil {
+			err = errors.Join(err, ctx.Err())
+		}
+	}()
 	if parent == "" || ev.BaseHead == "" || parent == ev.BaseHead || len(ops) == 0 {
 		return false, "", nil
 	}
@@ -5061,7 +4953,7 @@ func liveWorktreeMatchesCapturedBefore(ctx context.Context, repoRoot string, op 
 
 func treeMatchesCapturedBefore(ctx context.Context, repoRoot, commit string, op state.CaptureOp) (bool, error) {
 	if op.Op == "create" {
-		absent, err := isPathAbsentInTree(ctx, repoRoot, commit, op.Path)
+		absent, err := git.PathAbsentInTree(ctx, repoRoot, commit, op.Path)
 		if err != nil {
 			return false, err
 		}

@@ -46,119 +46,128 @@ func TestRecoveryReconciliationEvidenceLimitIsEnforced(t *testing.T) {
 }
 
 func TestRecoverUnavailableSemanticMessageArchivesWholeSuffix(t *testing.T) {
-	f := newCaptureFixture(t)
-	ctx := context.Background()
-	firstBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("first\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	laterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("later\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstSeq := appendRecoveryEvent(t, ctx, f, f.cctx.BaseHead, state.CaptureOp{
-		Op: "create", Path: "first.txt",
-		AfterOID:  sql.NullString{String: firstBlob, Valid: true},
-		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
-	})
-	laterSeq := appendRecoveryEvent(t, ctx, f, f.cctx.BaseHead, state.CaptureOp{
-		Op: "create", Path: "later.txt",
-		AfterOID:  sql.NullString{String: laterBlob, Valid: true},
-		AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
-	})
+	for _, test := range []struct{ name, phase, provider, reason string }{
+		{"local-needs-action", state.PublicationDrainNeedsAction, "deterministic", PublicationDrainSemanticMessageUnavailableReason},
+		{"local-semantic", state.PublicationDrainSemantic, "deterministic", ""},
+		{"local-fallback", state.PublicationDrainEventFallback, "deterministic", ""},
+		{"corrected-ai-credentials", state.PublicationDrainNeedsAction, "openai-compat", "provider_configuration_required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			ctx := context.Background()
+			firstBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("first\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			laterBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("later\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstSeq := appendRecoveryEvent(t, ctx, f, f.cctx.BaseHead, state.CaptureOp{
+				Op: "create", Path: "first.txt",
+				AfterOID:  sql.NullString{String: firstBlob, Valid: true},
+				AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			})
+			laterSeq := appendRecoveryEvent(t, ctx, f, f.cctx.BaseHead, state.CaptureOp{
+				Op: "create", Path: "later.txt",
+				AfterOID:  sql.NullString{String: laterBlob, Valid: true},
+				AfterMode: sql.NullString{String: git.RegularFileMode, Valid: true},
+			})
 
-	frozen := insertPublicationRuntimeRevision(t, f.db, 1,
-		"openai-compat", "https://frozen.example/v1", "frozen-model")
-	// A newer immutable revision remains causally newer even if the wall clock
-	// moved backward before its creation or activation.
-	alternative := insertPublicationRuntimeRevision(t, f.db, 1.25,
-		"deterministic", "", "")
-	activatePublicationRuntimeRevision(t, f.db, frozen.ID, sql.NullInt64{})
-	strategy, format, _, fingerprint, err :=
-		publicationRuntimeRevisionContract(frozen)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tree, err := git.RevParse(ctx, f.dir, f.cctx.BaseHead+"^{tree}")
-	if err != nil {
-		t.Fatal(err)
-	}
-	worktreeID := checkpointpkg.WorktreeID(f.dir)
-	checkpointID := "cp-1788210000000-0123456789abcdef"
-	checkpointRef := fmt.Sprintf(
-		"refs/acd/checkpoints/v1/%s/%s", worktreeID, checkpointID)
-	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
-		"update-ref", checkpointRef, f.cctx.BaseHead); err != nil {
-		t.Fatal(err)
-	}
-	checkpoint := state.Checkpoint{
-		ID: checkpointID, OperationID: "op-semantic-message-recovery",
-		WorktreeID: worktreeID, Reason: state.CheckpointReasonManualBarrier,
-		ObservationEpoch: 1, CoverageEpoch: 1,
-		ObservedHead: f.cctx.BaseHead, ObservedRef: f.cctx.BranchRef,
-		TreeOID: tree, CommitOID: f.cctx.BaseHead, Ref: checkpointRef,
-		CreatedTS: 1.5, EventSeqs: []int64{firstSeq},
-	}
-	if created, err := state.PrepareCheckpoint(
-		ctx, f.db, checkpoint, publicationDrainTestDigest); err != nil || !created {
-		t.Fatalf("prepare checkpoint=(%t,%v)", created, err)
-	}
-	if err := state.CompleteCheckpoint(
-		ctx, f.db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 1.75); err != nil {
-		t.Fatal(err)
-	}
-	drain := state.PublicationDrain{
-		ID: "drain-" + checkpointID, CheckpointID: checkpoint.ID,
-		WorktreeID: worktreeID, BranchRef: f.cctx.BranchRef,
-		BranchGeneration: f.cctx.BranchGeneration,
-		Phase:            state.PublicationDrainCheckpointing,
-		TargetEventCount: 1, CreatedTS: 2, UpdatedTS: 2,
-		LastProgressTS: 2, EventSeqs: []int64{firstSeq},
-		CommitStrategy: strategy, CommitFormat: format,
-		ConfigRevisionID: frozen.ID, Provider: "openai-compat",
-		ProviderModel: "frozen-model", ProviderFingerprint: fingerprint,
-	}
-	if created, err := state.PreparePublicationDrain(
-		ctx, f.db, drain); err != nil || !created {
-		t.Fatalf("prepare drain=(%t,%v)", created, err)
-	}
-	blockedUpdate := PublicationDrainUpdateFrom(drain, 2.5, 2)
-	blockedUpdate.Phase = state.PublicationDrainNeedsAction
-	blockedUpdate.FallbackMode = publicationFallbackLocalUnlock
-	blockedUpdate.LastError = PublicationDrainSemanticMessageUnavailableReason
-	blocked, err := state.AdvancePublicationDrain(
-		ctx, f.db, drain.ID, blockedUpdate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	activatePublicationRuntimeRevision(t, f.db, alternative.ID, sql.NullInt64{
-		Int64: frozen.ID, Valid: true,
-	})
-	if _, err := f.db.SQL().ExecContext(ctx,
-		`UPDATE runtime_config_state SET applied_ts=1 WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
+			frozen := insertPublicationRuntimeRevision(t, f.db, 1,
+				"openai-compat", "https://frozen.example/v1", "frozen-model")
+			// A newer immutable revision remains causally newer even if the wall clock
+			// moved backward before its creation or activation.
+			alternative := insertPublicationRuntimeRevision(t, f.db, 1.25,
+				test.provider, "https://frozen.example/v1", "frozen-model")
+			activatePublicationRuntimeRevision(t, f.db, frozen.ID, sql.NullInt64{})
+			strategy, format, _, fingerprint, err :=
+				publicationRuntimeRevisionContract(frozen)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tree, err := git.RevParse(ctx, f.dir, f.cctx.BaseHead+"^{tree}")
+			if err != nil {
+				t.Fatal(err)
+			}
+			worktreeID := checkpointpkg.WorktreeID(f.dir)
+			checkpointID := "cp-1788210000000-0123456789abcdef"
+			checkpointRef := fmt.Sprintf(
+				"refs/acd/checkpoints/v1/%s/%s", worktreeID, checkpointID)
+			if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
+				"update-ref", checkpointRef, f.cctx.BaseHead); err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := state.Checkpoint{
+				ID: checkpointID, OperationID: "op-semantic-message-recovery",
+				WorktreeID: worktreeID, Reason: state.CheckpointReasonManualBarrier,
+				ObservationEpoch: 1, CoverageEpoch: 1,
+				ObservedHead: f.cctx.BaseHead, ObservedRef: f.cctx.BranchRef,
+				TreeOID: tree, CommitOID: f.cctx.BaseHead, Ref: checkpointRef,
+				CreatedTS: 1.5, EventSeqs: []int64{firstSeq},
+			}
+			if created, err := state.PrepareCheckpoint(
+				ctx, f.db, checkpoint, publicationDrainTestDigest); err != nil || !created {
+				t.Fatalf("prepare checkpoint=(%t,%v)", created, err)
+			}
+			if err := state.CompleteCheckpoint(
+				ctx, f.db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 1.75); err != nil {
+				t.Fatal(err)
+			}
+			drain := state.PublicationDrain{
+				ID: "drain-" + checkpointID, CheckpointID: checkpoint.ID,
+				WorktreeID: worktreeID, BranchRef: f.cctx.BranchRef,
+				BranchGeneration: f.cctx.BranchGeneration,
+				Phase:            state.PublicationDrainCheckpointing,
+				TargetEventCount: 1, CreatedTS: 2, UpdatedTS: 2,
+				LastProgressTS: 2, EventSeqs: []int64{firstSeq},
+				CommitStrategy: strategy, CommitFormat: format,
+				ConfigRevisionID: frozen.ID, Provider: "openai-compat",
+				ProviderModel: "frozen-model", ProviderFingerprint: fingerprint,
+			}
+			if created, err := state.PreparePublicationDrain(
+				ctx, f.db, drain); err != nil || !created {
+				t.Fatalf("prepare drain=(%t,%v)", created, err)
+			}
+			blockedUpdate := PublicationDrainUpdateFrom(drain, 2.5, 2)
+			blockedUpdate.Phase = test.phase
+			blockedUpdate.FallbackMode = publicationFallbackLocalUnlock
+			blockedUpdate.LastError = test.reason
+			blocked, err := state.AdvancePublicationDrain(
+				ctx, f.db, drain.ID, blockedUpdate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			activatePublicationRuntimeRevision(t, f.db, alternative.ID, sql.NullInt64{
+				Int64: frozen.ID, Valid: true,
+			})
+			if _, err := f.db.SQL().ExecContext(ctx,
+				`UPDATE runtime_config_state SET applied_ts=1 WHERE id=1`); err != nil {
+				t.Fatal(err)
+			}
 
-	completed, result, err :=
-		RecoverUnavailableSemanticMessagePublicationDrain(
-			ctx, f.dir, f.gitDir, f.db, blocked, nil, time.Unix(5, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed == nil || completed.Phase != state.PublicationDrainCompleted ||
-		result.Outcome != state.EventStateRecovered || result.EventCount != 2 ||
-		result.FirstSeq != firstSeq || result.LastSeq != laterSeq ||
-		result.RecoveryRef == "" {
-		t.Fatalf("completed=%+v result=%+v", completed, result)
-	}
-	for _, seq := range []int64{firstSeq, laterSeq} {
-		got, _ := readEventState(t, ctx, f.db, seq)
-		if got != state.EventStateRecovered {
-			t.Fatalf("event %d state=%q want recovered", seq, got)
-		}
-	}
-	if _, err := git.RevParse(ctx, f.dir, result.RecoveryRef); err != nil {
-		t.Fatalf("recovery ref %s: %v", result.RecoveryRef, err)
+			completed, result, err :=
+				RecoverUnavailableSemanticMessagePublicationDrain(
+					ctx, f.dir, f.gitDir, f.db, blocked, nil, time.Unix(5, 0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if completed == nil || completed.Phase != state.PublicationDrainCompleted ||
+				result.Outcome != state.EventStateRecovered || result.EventCount != 2 ||
+				result.FirstSeq != firstSeq || result.LastSeq != laterSeq ||
+				result.RecoveryRef == "" {
+				t.Fatalf("completed=%+v result=%+v", completed, result)
+			}
+			for _, seq := range []int64{firstSeq, laterSeq} {
+				got, _ := readEventState(t, ctx, f.db, seq)
+				if got != state.EventStateRecovered {
+					t.Fatalf("event %d state=%q want recovered", seq, got)
+				}
+			}
+			if _, err := git.RevParse(ctx, f.dir, result.RecoveryRef); err != nil {
+				t.Fatalf("recovery ref %s: %v", result.RecoveryRef, err)
+			}
+		})
 	}
 }
 
@@ -261,5 +270,41 @@ func activatePublicationRuntimeRevision(
 	if ok, err := state.ApplyConfigActivation(
 		ctx, db, request.ID, revisionID); err != nil || !ok {
 		t.Fatalf("apply activation=(%t,%v)", ok, err)
+	}
+}
+
+func TestPublicationDrainActivatesOnlyReviewedReplacementKinds(t *testing.T) {
+	for _, test := range []struct {
+		name, provider, phase, reason string
+		want                          bool
+	}{
+		{"explicit-local", "deterministic", state.PublicationDrainSemantic, "", true},
+		{"corrected-ai", "openai-compat", state.PublicationDrainNeedsAction, publicationReasonProviderConfiguration, true},
+		{"unrelated-remote", "openai-compat", state.PublicationDrainSemantic, "", false},
+		{"unproven-safety", "openai-compat", state.PublicationDrainNeedsAction, "missing_objects", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openIntentCandidateTestDB(t)
+			frozen := insertPublicationRuntimeRevision(t, db, 1, "openai-compat", "https://frozen.example/v1", "model")
+			activatePublicationRuntimeRevision(t, db, frozen.ID, sql.NullInt64{})
+			replacement := insertPublicationRuntimeRevision(t, db, 2, test.provider, "https://frozen.example/v1", "model")
+			if _, ok, err := state.RequestConfigActivation(ctx, db, replacement.ID, sql.NullInt64{Int64: frozen.ID, Valid: true}); err != nil || !ok {
+				t.Fatalf("request=%v %v", ok, err)
+			}
+			strategy, format, _, _, err := publicationRuntimeRevisionContract(frozen)
+			if err != nil {
+				t.Fatal(err)
+			}
+			drain := state.PublicationDrain{ConfigRevisionID: frozen.ID, CommitStrategy: strategy, CommitFormat: format, Phase: test.phase, ReasonCode: test.reason}
+			ready, err := publicationDrainCanActivateReplacement(ctx, db, drain)
+			if err != nil || ready != test.want {
+				t.Fatalf("ready=%v err=%v want=%v", ready, err, test.want)
+			}
+			runtime, err := state.RuntimeConfigActivationState(ctx, db)
+			if err != nil || runtime.AppliedRevisionID.Int64 != frozen.ID {
+				t.Fatalf("readiness mutated runtime: %+v %v", runtime, err)
+			}
+		})
 	}
 }

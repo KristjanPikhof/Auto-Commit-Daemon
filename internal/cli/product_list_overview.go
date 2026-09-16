@@ -31,6 +31,8 @@ const (
 var (
 	productListReadSupervisor = readSupervisorStatus
 	productListReadRepo       = readProductListRepo
+	productListCurrentPair    = currentWorktreeReplayPair
+	productListReadOutcome    = readPublicationOutcomeForPair
 )
 
 type productListRepoOverview struct {
@@ -109,7 +111,7 @@ func productListEntryFromOverview(
 			OperationalState: "needs_attention", LastActivityAt: formatProductListActivity(activity),
 			Summary:      "This repository needs the current ACD protection format.",
 			NextAction:   productListTargetAction("Run `acd setup` to upgrade and enable protection.", record.Path),
-			lastActivity: activity,
+			lastActivity: activity, UnfinishedWork: overview.unfinished,
 		}
 	}
 	if readErr != nil {
@@ -127,7 +129,7 @@ func productListEntryFromOverview(
 				OperationalState: operational, ProtectionUnknown: true,
 				LastActivityAt: formatProductListActivity(activity),
 				Summary:        summary, NextAction: "No action needed.",
-				lastActivity: activity,
+				lastActivity: activity, UnfinishedWork: overview.unfinished,
 			}
 		}
 		activity := overview.lastActivity
@@ -137,7 +139,7 @@ func productListEntryFromOverview(
 			OperationalState: "needs_attention", LastActivityAt: formatProductListActivity(activity),
 			Summary:      "ACD could not read this repository's protection state.",
 			NextAction:   productListTargetAction("Run `acd doctor` for details.", record.Path),
-			lastActivity: activity,
+			lastActivity: activity, UnfinishedWork: overview.unfinished,
 		}
 	}
 	report := overview.report
@@ -184,7 +186,8 @@ func productListEntryFromOverview(
 	}
 	entry := productListEntry{
 		Repo: record.Path, RepoHash: record.RepoHash, Enabled: control.Enabled, Protected: control.Protected,
-		Published: control.Published, ActionRequired: actionRequired, State: entryState,
+		PublicationOutcome: control.PublicationOutcome,
+		Published:          control.Published, ActionRequired: actionRequired, State: entryState,
 		PendingEvents: control.PendingEvents, BlockedEvents: control.BlockedEvents,
 		CheckpointID: control.CheckpointID, WorkerState: worker.State,
 		OperationalState: operational, LastActivityAt: formatProductListActivity(overview.lastActivity),
@@ -230,8 +233,8 @@ func productListHasIndependentAttention(report statusReport) bool {
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0
 }
 
-func readProductListRepo(ctx context.Context, record central.RepoRecord, now time.Time) (productListRepoOverview, error) {
-	overview := productListRepoOverview{
+func readProductListRepo(ctx context.Context, record central.RepoRecord, now time.Time) (overview productListRepoOverview, err error) {
+	overview = productListRepoOverview{
 		report: statusReport{Repo: record.Path, RepoHash: record.RepoHash, Daemon: "stopped", Clients: []statusClient{}},
 	}
 	if !fileExists(record.StateDB) {
@@ -251,12 +254,53 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		return overview, err
 	}
 	report := &overview.report
+	defer func() {
+		overview.unfinished = overview.unfinished || report.PendingEvents > 0 || report.BlockedConflicts > 0 ||
+			report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0 ||
+			report.Replay.State == "needs_attention" ||
+			report.checkpointPrepared || report.checkpointNeedsAction || report.UnpublishedCheckpoints > 0 ||
+			report.ObservationEpoch > report.CoveredEpoch ||
+			(report.LatestCheckpointID != "" && !report.Protected) ||
+			report.SelfPublication.PreparedCount > 0 || report.SelfPublication.GitAppliedCount > 0 ||
+			(report.PublicationDrain.ID != "" && report.PublicationDrain.Phase != state.PublicationDrainCompleted) ||
+			overview.rewriting
+	}()
 	var schemaVersion int
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&schemaVersion); err != nil {
 		return overview, err
 	}
 	if schemaVersion > state.SchemaVersion {
 		return overview, fmt.Errorf("state schema v%d is newer than supported v%d", schemaVersion, state.SchemaVersion)
+	}
+	var lastCommitTS sql.NullFloat64
+	var lastCommitOID sql.NullString
+	if err := conn.QueryRowContext(ctx, `SELECT commit_oid,published_ts FROM capture_events WHERE commit_oid IS NOT NULL ORDER BY seq DESC LIMIT 1`).Scan(&lastCommitOID, &lastCommitTS); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return overview, err
+	}
+	if lastCommitOID.Valid {
+		report.LastCommitOID = lastCommitOID.String
+	}
+	if lastCommitTS.Valid {
+		report.LastCommitTS = int64(lastCommitTS.Float64)
+		overview.lastActivity = laterProductListActivity(overview.lastActivity, lastCommitTS.Float64)
+	}
+	var newestCapture sql.NullFloat64
+	if err := conn.QueryRowContext(ctx, `SELECT captured_ts FROM capture_events ORDER BY seq DESC LIMIT 1`).Scan(&newestCapture); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return overview, err
+	}
+	if newestCapture.Valid {
+		overview.lastActivity = laterProductListActivity(overview.lastActivity, newestCapture.Float64)
+	}
+	for _, key := range []string{state.ActivityMetaKey, daemon.MetaKeyBranchTokenChangedAt} {
+		value, _, err := metaLookup(ctx, conn, key)
+		if err != nil {
+			return overview, err
+		}
+		ts, _ := strconv.ParseFloat(value, 64)
+		overview.lastActivity = laterProductListActivity(overview.lastActivity, ts)
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE state=?`, state.EventStatePending).Scan(&report.PendingEvents); err != nil {
+		return overview, err
 	}
 	if schemaVersion >= 20 {
 		if err := readProductListProtection(ctx, conn, report); err != nil {
@@ -280,7 +324,7 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		}
 	}
 	currentBranchRef, currentBranchGeneration, hasCurrentPair, pairErr :=
-		currentWorktreeReplayPair(ctx, conn, record.Path)
+		productListCurrentPair(ctx, conn, record.Path)
 	if pairErr != nil {
 		return overview, pairErr
 	}
@@ -302,9 +346,6 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		return overview, err
 	}
 	overview.clients = clients
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE state=?`, state.EventStatePending).Scan(&report.PendingEvents); err != nil {
-		return overview, err
-	}
 	activeGeneration := report.BranchGeneration
 	blockers, err := loadRecoveryBlockerCounts(ctx, conn, report.BranchRef, activeGeneration)
 	if err != nil {
@@ -314,25 +355,6 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	report.ActiveBarriers = blockers.ActiveBlockedBarriersWithSuccessors
 	report.ActiveTerminalEvents = blockers.ActiveTerminalEvents
 
-	var lastCommitTS sql.NullFloat64
-	var lastCommitOID sql.NullString
-	if err := conn.QueryRowContext(ctx, `SELECT commit_oid,published_ts FROM capture_events WHERE commit_oid IS NOT NULL ORDER BY seq DESC LIMIT 1`).Scan(&lastCommitOID, &lastCommitTS); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return overview, err
-	}
-	if lastCommitOID.Valid {
-		report.LastCommitOID = lastCommitOID.String
-	}
-	if lastCommitTS.Valid {
-		report.LastCommitTS = int64(lastCommitTS.Float64)
-		overview.lastActivity = laterProductListActivity(overview.lastActivity, lastCommitTS.Float64)
-	}
-	var newestCapture sql.NullFloat64
-	if err := conn.QueryRowContext(ctx, `SELECT captured_ts FROM capture_events ORDER BY seq DESC LIMIT 1`).Scan(&newestCapture); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return overview, err
-	}
-	if newestCapture.Valid {
-		overview.lastActivity = laterProductListActivity(overview.lastActivity, newestCapture.Float64)
-	}
 	if info, err := pauseInfoForRepo(ctx, conn, record.StateDB, now); err != nil {
 		return overview, err
 	} else if info != nil {
@@ -425,14 +447,6 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	if err != nil {
 		return overview, err
 	}
-	for _, key := range []string{state.ActivityMetaKey, daemon.MetaKeyBranchTokenChangedAt} {
-		value, _, err := metaLookup(ctx, conn, key)
-		if err != nil {
-			return overview, err
-		}
-		ts, _ := strconv.ParseFloat(value, 64)
-		overview.lastActivity = laterProductListActivity(overview.lastActivity, ts)
-	}
 	if raw, _, err := metaLookup(ctx, conn, state.RewritePIDMetaKey); err != nil {
 		return overview, err
 	} else if raw != "" {
@@ -442,15 +456,19 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 			overview.rewriting = err == nil && owner.Fingerprint != "" && daemon.FingerprintToken(fp) == owner.Fingerprint
 		}
 	}
-	overview.unfinished = report.PendingEvents > 0 || report.BlockedConflicts > 0 ||
-		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0 ||
-		report.Replay.State == "needs_attention" ||
-		report.checkpointPrepared || report.checkpointNeedsAction || report.UnpublishedCheckpoints > 0 ||
-		report.ObservationEpoch > report.CoveredEpoch ||
-		(report.LatestCheckpointID != "" && !report.Protected) ||
-		report.SelfPublication.PreparedCount > 0 || report.SelfPublication.GitAppliedCount > 0 ||
-		(report.PublicationDrain.ID != "" && report.PublicationDrain.Phase != state.PublicationDrainCompleted) ||
-		overview.rewriting
+	// Outcome is optional enrichment. Activity and unfinished work must survive
+	// its timeout so a repository cannot disappear from the active dashboard.
+	if schemaVersion >= 20 {
+		outcome, outcomeErr := productListReadOutcome(ctx, conn, report.Protected, record.Path, currentBranchRef, currentBranchGeneration, hasCurrentPair)
+		report.PublicationOutcome = outcome
+		report.PublicationOutcome.ReasonCode = report.PublicationProgress.Phase
+		if health := report.IntentStrategy.PlannerHealth; health != nil {
+			report.PublicationOutcome.RetryAt = health.NextProbeTS
+		}
+		if outcomeErr != nil && !productListReadTransient(outcomeErr) {
+			return overview, outcomeErr
+		}
+	}
 
 	return overview, nil
 }

@@ -46,6 +46,9 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	if dryRun && opts.CredentialStdin {
 		return nil, invalidCommandError("acd setup: --credential-stdin cannot be used with --dry-run")
 	}
+	if nonInteractive && strings.TrimSpace(opts.Provider) == "" {
+		return nil, invalidCommandError("acd setup: first non-interactive setup requires --provider openai-compat or --provider deterministic, including the dry-run preview")
+	}
 	if nonInteractive && !dryRun && strings.TrimSpace(cmd.Flag("expect-plan").Value.String()) == "" {
 		return nil, invalidCommandError("acd setup: non-interactive first setup requires --expect-plan from a dry-run preview")
 	}
@@ -61,7 +64,7 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	if format != "imperative" && format != "conventional" {
 		return nil, invalidCommandError("acd setup: --commit-format must be imperative or conventional")
 	}
-	provider := fallbackConfigureValue(strings.ToLower(strings.TrimSpace(opts.Provider)), "deterministic")
+	provider := fallbackConfigureValue(strings.ToLower(strings.TrimSpace(opts.Provider)), "openai-compat")
 	if provider != "deterministic" && provider != "openai-compat" {
 		return nil, invalidCommandError("acd setup: --provider must be deterministic or openai-compat")
 	}

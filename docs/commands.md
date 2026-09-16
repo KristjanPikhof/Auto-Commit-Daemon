@@ -13,7 +13,7 @@
 | `acd list` | Nothing | None; live on a TTY and one-shot through a pipe or `--once`. |
 | `acd commit-all` | Checkpoint and normal local Git publication | Preview unless `--yes` is supplied. |
 | `acd history` | Nothing | None. |
-| `acd restore ID` | Nothing by default; working tree with `--yes` | Preview is mandatory. |
+| `acd restore [ID]` | Preview, or working tree after confirmation | Bare command opens a terminal picker; ID route supports scripts. |
 | `acd doctor` | Nothing unless bundle output is requested | Bundle path is explicit. |
 | `acd uninstall` | Supervisor process, Linux service, binary, owned integrations and desired state | Shows a plan; data purge needs a second confirmation. |
 
@@ -39,7 +39,8 @@ Git ref creation, or secret prompt. Fresh setup asks for an experience, commit
 format, and provider. An OpenAI-compatible provider also asks for the endpoint,
 model, and masked bearer token. The token is tested only after the final review.
 
-Automation must first run `acd setup --dry-run --json`, retain its digest, then
+Fresh automation must first run `acd setup --dry-run --non-interactive --provider
+deterministic --json` (or explicitly choose `openai-compat`), retain its digest, then
 apply with `--yes --non-interactive --expect-plan`. Use `--experience`,
 `--commit-format`, `--provider`, `--base-url`, `--model`, and `--ca-file` to set
 the reviewed non-secret values. A bearer token may come only from
@@ -52,8 +53,9 @@ token and later requests can be read or changed in transit. Redirects and URLs
 with embedded credentials, query strings, or fragments are refused.
 
 Setup validates the OS, architecture, platform lifecycle, disk space,
-configuration, and integration files. Fresh setup creates no repository state
-and registers no repository. During an incompatible upgrade, it checkpoints
+configuration, and integration files. The installation transaction does not grant repository consent. After it
+succeeds, terminal setup offers a separate repository enablement confirmation.
+Unattended setup never grants this consent. During an incompatible upgrade, it checkpoints
 and migrates enabled repositories before committing the global transaction.
 Disabled repository records are preserved and their databases are left
 unchanged until their next `acd on`.
@@ -82,9 +84,28 @@ State priority is `off`, `needs_action`, `publishing`, `waiting`, `protected`.
 The independent `protected` boolean may remain true in the middle three
 publication/repair states.
 
-`Published to Git: yes` means every protected change is resolved either in
-normal branch history or a protected recovery snapshot, with no unresolved
-failed or blocked capture.
+Default status shows `Protection`, `Current changes saved`, `Branch commits`,
+an optional `Recovery` count, and `Next`. `acd status --verbose` adds operational
+detail. Branch publication and recovery preservation are distinct outcomes.
+
+JSON adds `publication_outcome` with nullable `branch_committed`, counts for
+`branch_changes`, `recovered_changes`, and `waiting_changes`, plus `reason_code`
+and `retry_at` when known. `pending_classification` identifies saved bytes
+waiting to enter the capture ledger. Null means unavailable. Existing `published` and
+`checkpoint_published_by_acd` fields are deprecated compatibility fields: their
+existing meaning still includes safely recovered work. History retains its
+old `published` boolean and adds `outcome`, `retained`, and `recovered_events`.
+Snapshots without capture membership report `saved`. Outcome counts for branch
+publication and waiting use the current branch generation; recovery counts
+retain historical preservation evidence. Exact current-branch tree proof permits
+a recovered-and-recaptured snapshot to report commitment without erasing its
+recovery history. If that proof is unavailable, `branch_committed` is null.
+
+If Git changes while AI is evaluating a target, ACD rejects that stale result.
+An exact match with externally committed work can resolve through the recovery
+proof (`recovery_published`). A chain containing both applied and reverted work
+may instead be preserved separately (`recovery_archived`). Neither outcome
+creates a duplicate branch commit or restores files over your edits.
 
 Read-only status falls back to existing v20 SQLite projections when the
 supervisor is unavailable. Mutations never fall back to direct unsupervised
@@ -136,6 +157,11 @@ only. Preview reports create, modify, delete, mode, symlink, untracked-overwrite
 and staged-overlap counts. Apply revalidates the plan digest, `HEAD` token,
 worktree identity, index digest, and target ref.
 
+Bare `acd restore` in a terminal lists completed checkpoints. Select one to see
+changed files, confirm, and receive an undo checkpoint command. The picker and
+ID route share preview, overlap, staging-preservation, and stale-plan checks.
+Outside a terminal, supply an ID from `acd history`; no restore is applied.
+
 ## Repository dashboard and commit-all
 
 ~~~bash
@@ -152,7 +178,9 @@ acd commit-all --yes
 `list` shows enabled repositories with activity in the last hour, plus any
 repository with unfinished work. Activity includes agent hooks, captured edits,
 publication progress, commit-all requests, and applied history rewrites.
-Worker heartbeats and background maintenance do not count as activity.
+Worker heartbeats, setup/readiness checkpoints and background maintenance do
+not count as activity. Slow detail checks keep known activity and unfinished
+work visible.
 
 A repository with pending, blocked, stalled, or incompletely protected work
 stays visible until that work is resolved. An otherwise idle repository drops
@@ -198,6 +226,25 @@ result. Hidden idle warnings do not fail a compact snapshot.
 Disabled, missing, and stale registration records remain available under hidden
 `acd repo list`. That command is the static maintenance inventory and does not
 refresh automatically.
+
+Before confirmation, `commit-all` lists changed paths, staged content, and
+already queued paths. The lists may overlap. Included staging is consumed only
+after checkpoint protection; ordinary background publication preserves staging.
+Interactive approval is rechecked against paths, queued work, and staging. The
+worker also checks every path in the frozen checkpoint target, including rename
+endpoints. If an unreviewed path arrives while checkpointing, the command shows
+a refreshed preview and asks again before creating a publication request or
+consuming staging. Further edits to already reviewed paths can enter that
+checkpoint. `--yes` accepts the current checkpoint scope without an interactive
+path review.
+Immediately before consuming staging, the worker locks the Git index and checks
+its saved approval identity. If you staged something else while it waited, ACD
+preserves that selection and asks you to review commit-all again. This check
+also survives a worker restart. Older requests without a saved staging identity
+require a new review before consuming staging.
+A fresh approval preserves the old request's captured work separately and
+recaptures the current files for a new target. The old staging approval stays
+unchanged; it is never reused to consume a newer selection.
 
 `commit-all` first completes a durable checkpoint, records the highest event
 sequence covered by the barrier, and drains only that bounded target through
@@ -333,3 +380,6 @@ be removed no earlier than the third checkpoint-first release.
 
 Manual compatibility calls warn on stderr. Recognized integration calls
 suppress terminal warnings and emit only a rate-limited diagnostic.
+
+Failed JSON recovery commands preserve the reviewed or partial plan in `data`,
+with `ok: false` and a typed error, instead of discarding the plan on failure.

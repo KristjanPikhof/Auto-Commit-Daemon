@@ -367,7 +367,7 @@ func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result
 		return Result{}, fmt.Errorf("openai-compat: read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		err := &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: truncateForError(string(raw))}
 		p.recordPromptResponse(ctx, model, "event", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
 		return Result{}, err
 	}
@@ -465,7 +465,7 @@ func (p *OpenAIProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRe
 		return IntentPlan{}, fmt.Errorf("openai-compat: read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		err := &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: truncateForError(string(raw))}
 		p.recordPromptResponse(ctx, model, "intent", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
 		return IntentPlan{}, err
 	}
@@ -580,7 +580,7 @@ func (p *OpenAIProvider) PlanIntentV2(ctx context.Context, plannerReq IntentPlan
 		return IntentPlanV2{}, fmt.Errorf("openai-compat: read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		err := &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: truncateForError(string(raw))}
 		p.recordPromptResponse(ctx, model, "intent_v2", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
 		return IntentPlanV2{}, err
 	}
@@ -673,7 +673,7 @@ func (p *OpenAIProvider) RewriteIntentMessage(ctx context.Context, rewriteReq In
 		return Result{}, fmt.Errorf("openai-compat: read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		err := &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: truncateForError(string(raw))}
 		p.recordPromptResponse(ctx, model, "intent_message_rewrite", prompttrace.Response{StatusCode: resp.StatusCode, Error: err.Error()})
 		return Result{}, err
 	}
@@ -1091,7 +1091,7 @@ func (p *OpenAIProvider) ProposeCommitRewrite(ctx context.Context, rewriteReq Co
 		return Result{}, fmt.Errorf("openai-compat: read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Result{}, fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		return Result{}, &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: truncateForError(string(raw))}
 	}
 	subject, bodyOut, err := parseToolCall(raw)
 	if err != nil {
@@ -1150,7 +1150,7 @@ func (p *OpenAIProvider) ProposeHistoryRewritePlan(ctx context.Context, planReq 
 		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: read body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return HistoryRewritePlan{}, fmt.Errorf("openai-compat: http %d: %s", resp.StatusCode, truncateForError(string(raw)))
+		return HistoryRewritePlan{}, &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: truncateForError(string(raw))}
 	}
 	plan, err := parseHistoryRewritePlanToolCall(raw)
 	if err != nil {

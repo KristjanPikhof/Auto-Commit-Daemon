@@ -8,13 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
@@ -99,6 +95,7 @@ const (
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
+	PublicationOutcome            publicationOutcome           `json:"publication_outcome"`
 	Repo                          string                       `json:"repo"`
 	RepoHash                      string                       `json:"repo_hash"`
 	Daemon                        string                       `json:"daemon"`
@@ -155,64 +152,6 @@ type statusReport struct {
 	PublicationProgress           publicationProgressReport    `json:"publication_progress"`
 	checkpointPrepared            bool
 	checkpointNeedsAction         bool
-}
-
-func newStatusCmd() *cobra.Command {
-	var watch bool
-	var interval time.Duration
-	cmd := &cobra.Command{
-		Use:   "status",
-		Short: "Print current daemon + clients for one repo (default: cwd)",
-		Long: `Print daemon, client, queue, blocked-vs-waiting recovery state, pause, branch, and recent decision state for one registered repo.
-
-The default repo is the current working directory. Use --watch to refresh the
-same repo until interrupted. Use --json for automation. For all registered
-repos, use acd list; for why/how questions, use acd explain and acd events.`,
-		Example: `  acd status
-  acd status --watch
-  acd status --repo /path/to/repo
-  acd status --json
-  acd explain --path internal/state/schema.go
-  acd diagnose --repo . --json`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			repo, _ := cmd.Flags().GetString("repo")
-			jsonOut, _ := cmd.Flags().GetBool("json")
-			if watch {
-				if jsonOut {
-					return fmt.Errorf("acd status: --watch does not support --json")
-				}
-				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-				defer stop()
-				return runStatusWatch(ctx, cmd.OutOrStdout(), repo, interval)
-			}
-			return runStatus(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
-		},
-	}
-	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh status output until interrupted")
-	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for --watch (Go duration)")
-	return cmd
-}
-
-func runStatus(ctx context.Context, out io.Writer, repo string, jsonOut bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	rec, _, _, err := lookupRegisteredRepo("status", repo)
-	if err != nil {
-		return err
-	}
-
-	report, err := buildStatusReport(ctx, rec, time.Now())
-	if err != nil {
-		return fmt.Errorf("acd status: %w", err)
-	}
-
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(report)
-	}
-	return renderStatusHuman(out, report)
 }
 
 // findRepo returns the registry record whose Path matches abs. If expected
@@ -337,6 +276,10 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		report.Protected = complete && report.LatestCheckpointID != "" &&
 			report.ObservationEpoch == report.CoveredEpoch &&
 			prepared == 0 && needsAction == 0
+		report.PublicationOutcome, err = readPublicationOutcome(ctx, conn, report.Protected, rec.Path)
+		if err != nil {
+			return report, err
+		}
 	}
 	// daemon_state singleton.
 	var pid int
@@ -552,6 +495,10 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		return report, fmt.Errorf("publication progress: %w", err)
 	}
 	report.PublicationProgress = progress
+	report.PublicationOutcome.ReasonCode = progress.Phase
+	if health := report.IntentStrategy.PlannerHealth; health != nil && health.NextProbeTS > 0 {
+		report.PublicationOutcome.RetryAt = health.NextProbeTS
+	}
 
 	return report, nil
 }
@@ -1091,31 +1038,6 @@ func currentWorktreeReplayPair(
 	return branchRef, generation, true, nil
 }
 
-func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval time.Duration) error {
-	if interval <= 0 {
-		return fmt.Errorf("acd status: --interval must be positive")
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		fmt.Fprint(out, "\033[2J\033[H")
-		fmt.Fprintf(out, "Updated: %s\n\n", time.Now().Format(time.RFC3339))
-		if err := runStatus(ctx, out, repo, false); err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-		}
-	}
-}
-
 func statusDecisionSummary(ctx context.Context, conn *sql.DB, report *statusReport) error {
 	ok, err := sqliteTableExists(ctx, conn, "decision_records")
 	if err != nil {
@@ -1213,150 +1135,6 @@ func parseFloatStr(s string) (float64, error) {
 	return f, err
 }
 
-func renderStatusHuman(out io.Writer, r statusReport) error {
-	fmt.Fprintf(out, "Repo: %s\n", r.Repo)
-
-	daemon := r.Daemon
-	if r.Stale {
-		daemon = "stale"
-	}
-	parts := []string{daemon}
-	if r.PID > 0 {
-		parts = append(parts, fmt.Sprintf("pid %d", r.PID))
-	}
-	if r.HeartbeatTS > 0 {
-		parts = append(parts, fmt.Sprintf("heartbeat %s ago",
-			formatDurationCompact(time.Duration(r.HeartbeatAgeSeconds)*time.Second)))
-	}
-	if r.UptimeSeconds > 0 {
-		parts = append(parts, fmt.Sprintf("started %s ago",
-			formatDurationCompact(time.Duration(r.UptimeSeconds)*time.Second)))
-	}
-	fmt.Fprintf(out, "Daemon: %s\n", joinParens(parts))
-	renderRuntimeConfigHuman(out, r.RuntimeConfig)
-	renderConfigReadinessHuman(out, r.Configuration)
-	renderReplayObservabilityHuman(out, r.Replay)
-	renderIntentV2Human(out, r.IntentV2)
-	renderSelfPublicationHuman(out, r.SelfPublication, "")
-	renderPublicationDrainHuman(out, r.PublicationDrain)
-	renderProductPublicationProgress(out, r.PublicationProgress)
-	fmt.Fprintf(out, "Operational state: %s", valueOrUnset(r.OperationalState))
-	if r.Busy {
-		fmt.Fprint(out, " (worker responsive; progress shown separately)")
-	}
-	fmt.Fprintln(out)
-	fmt.Fprintf(out, "Worktree clean: %s\n", yesNo(r.WorktreeClean))
-	fmt.Fprintf(out, "All changes committed in Git: %s\n",
-		yesNo(r.AllChangesCommittedInGit))
-	fmt.Fprintf(out, "All protected checkpoints resolved in Git: %s\n",
-		yesNo(r.CheckpointPublishedByACD))
-
-	fmt.Fprintf(out, "Clients (%d):\n", len(r.Clients))
-	for _, c := range r.Clients {
-		ageStr := formatDurationCompact(time.Duration(c.LastSeenAgeS) * time.Second)
-		sid := c.SessionID
-		if len(sid) > 8 {
-			sid = sid[:4] + "..."
-		}
-		fmt.Fprintf(out, "  - %-12s session %s last_seen %s ago\n", c.Harness, sid, ageStr)
-	}
-
-	fmt.Fprintf(out, "Pending events: %d\n", r.PendingEvents)
-	if r.BlockedConflicts > 0 {
-		fmt.Fprintf(out, "Blocked conflicts: %d (inspect with `acd diagnose`; preview safe cleanup with `acd fix --dry-run`)\n", r.BlockedConflicts)
-		if r.ActiveBarriers > 0 {
-			fmt.Fprintf(out, "Blocked barriers with pending replay: %d (archive-only recovery preview: `acd fix --force --dry-run`)\n", r.ActiveBarriers)
-		}
-	}
-	if r.FailedEvents > 0 {
-		fmt.Fprintf(out, "Failed terminal events: %d\n", r.FailedEvents)
-		if r.FailedBlockingPending > 0 {
-			fmt.Fprintf(out, "Failed barriers blocking pending replay: %d (inspect with `acd diagnose`; preview cleanup with `acd fix --dry-run`)\n",
-				r.FailedBlockingPending)
-		}
-	}
-	if r.BackpressurePaused {
-		stamp := r.BackpressurePausedAt
-		if stamp == "" {
-			stamp = "unset"
-		}
-		fmt.Fprintf(out, "Backpressure: paused since %s (events dropped lifetime: %d)\n",
-			stamp, r.EventsDroppedTotal)
-	} else if r.EventsDroppedTotal > 0 {
-		fmt.Fprintf(out, "Capture dropped lifetime: %d\n", r.EventsDroppedTotal)
-	}
-
-	if r.LastCommitOID != "" {
-		oid := r.LastCommitOID
-		if len(oid) > 7 {
-			oid = oid[:7]
-		}
-		bits := []string{oid}
-		if r.LastCommitTS > 0 {
-			age := time.Since(time.Unix(r.LastCommitTS, 0))
-			bits = append(bits, formatDurationCompact(age)+" ago")
-		}
-		if r.LastCommitMessage != "" {
-			bits = append(bits, fmt.Sprintf("%q", r.LastCommitMessage))
-		}
-		fmt.Fprintf(out, "Last commit: %s\n", joinParens2(bits))
-	} else {
-		fmt.Fprintln(out, "Last commit: none")
-	}
-
-	if r.CaptureErrors == 0 {
-		fmt.Fprintln(out, "Capture errors: none")
-	} else {
-		fmt.Fprintf(out, "Capture errors: %d\n", r.CaptureErrors)
-	}
-
-	if r.Pause != nil {
-		fmt.Fprintln(out, "Pause:")
-		fmt.Fprintf(out, "  Source: %s\n", strings.ReplaceAll(r.Pause.Source, "_", " "))
-		if r.Pause.Reason != "" {
-			fmt.Fprintf(out, "  Reason: %s\n", r.Pause.Reason)
-		}
-		if r.Pause.SetAt != "" {
-			fmt.Fprintf(out, "  Set at: %s\n", r.Pause.SetAt)
-		}
-		if r.Pause.ExpiresAt != "" {
-			fmt.Fprintf(out, "  Expires at: %s (%s remaining)\n",
-				r.Pause.ExpiresAt,
-				formatDurationCompact(time.Duration(r.Pause.RemainingSeconds)*time.Second))
-		}
-	}
-
-	renderIntentStrategyHuman(out, r.IntentStrategy)
-
-	if len(r.DecisionCounts) > 0 {
-		fmt.Fprintf(out, "Decisions: %s\n", formatDecisionCounts(r.DecisionCounts))
-		if len(r.RecentDecisions) > 0 {
-			fmt.Fprintln(out, "Recent decisions:")
-			for _, ev := range r.RecentDecisions {
-				fmt.Fprintf(out, "  - #%d %s", ev.ID, ev.Kind)
-				if ev.Path != "" {
-					fmt.Fprintf(out, " %s", ev.Path)
-				}
-				if ev.ActionTaken != "" {
-					fmt.Fprintf(out, " (%s)", ev.ActionTaken)
-				} else if ev.Reason != "" {
-					fmt.Fprintf(out, " (%s)", ev.Reason)
-				}
-				if len(ev.GroupedSeqs) > 1 {
-					fmt.Fprintf(out, " seqs=%s", formatSeqs(ev.GroupedSeqs))
-				}
-				fmt.Fprintln(out)
-			}
-		}
-		fmt.Fprintln(out, "Explain: acd explain --path FILE; stream: acd events --watch")
-	}
-
-	if r.BranchGenToken != "" {
-		fmt.Fprintf(out, "Branch generation: %s\n", r.BranchGenToken)
-	}
-	return nil
-}
-
 func renderPublicationDrainHuman(out io.Writer, drain publicationDrainReport) {
 	if !drain.Available || drain.ID == "" ||
 		drain.Phase == state.PublicationDrainCompleted {
@@ -1382,52 +1160,3 @@ func renderPublicationDrainHuman(out io.Writer, drain publicationDrainReport) {
 			yesNo(drain.StagedConsumed))
 	}
 }
-
-func formatDecisionCounts(counts map[string]int) string {
-	order := []string{
-		state.DecisionKindProtected,
-		state.DecisionKindHandledExternal,
-		state.DecisionKindSupersededExternal,
-		state.DecisionKindBlocked,
-		state.DecisionKindCommitted,
-		state.DecisionKindCaptured,
-		state.DecisionKindSkipped,
-		state.DecisionKindPaused,
-		state.DecisionKindResumed,
-		state.DecisionKindIntentDeferred,
-		state.DecisionKindIntentForced,
-		state.DecisionKindIntentPlannerError,
-		state.DecisionKindMessageQualityRewrite,
-		state.DecisionKindMessageQualityFallback,
-	}
-	seen := make(map[string]bool, len(counts))
-	var parts []string
-	for _, kind := range order {
-		if n, ok := counts[kind]; ok {
-			parts = append(parts, fmt.Sprintf("%s=%d", kind, n))
-			seen[kind] = true
-		}
-	}
-	for kind, n := range counts {
-		if !seen[kind] {
-			parts = append(parts, fmt.Sprintf("%s=%d", kind, n))
-		}
-	}
-	return strings.Join(parts, " ")
-}
-
-// joinParens renders ["running", "pid 123", "heartbeat 2s ago"] as
-// "running (pid 123, heartbeat 2s ago)".
-func joinParens(parts []string) string {
-	if len(parts) == 0 {
-		return ""
-	}
-	if len(parts) == 1 {
-		return parts[0]
-	}
-	return parts[0] + " (" + strings.Join(parts[1:], ", ") + ")"
-}
-
-// joinParens2 renders ["a1b2c3d", "47s ago", "\"Update auth.py\""] as
-// `a1b2c3d (47s ago, "Update auth.py")`.
-func joinParens2(parts []string) string { return joinParens(parts) }

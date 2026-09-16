@@ -3,11 +3,77 @@ package git
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestWithLockedRecoveryAndBranchRefCancellationDuringPrepareReleasesLocks(t *testing.T) {
+	dir := initRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := commitFile(t, ctx, dir, "first.txt", "first", "first")
+	const recoveryRef = "refs/acd/recovery/cancelled-prepare"
+	const branchRef = "refs/heads/main"
+	for _, ref := range []string{recoveryRef, branchRef} {
+		if err := UpdateRef(ctx, dir, ref, first, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Git invokes this hook after acquiring the ref locks, before acknowledging
+	// prepare. Keep the hook's pipes open even after SIGTERM to exercise bounded
+	// cleanup of the transaction's descendants as well as Git's own ref locks.
+	hook := filepath.Join(dir, ".git", "hooks", "reference-transaction")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nif [ \"$1\" = prepared ]; then\n  trap '' TERM\n  : > .git/transaction-prepared\n  exec sleep 10\nfi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- WithLockedRecoveryRefAndExpectedRef(ctx, dir,
+			recoveryRef, first, branchRef, first, func(context.Context) error {
+				return errors.New("callback ran after cancelled preparation")
+			})
+	}()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	waitCtx, stopWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopWait()
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git", "transaction-prepared")); err == nil {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("transaction finished before prepared hook: %v", err)
+		case <-waitCtx.Done():
+			t.Fatal("transaction did not reach prepared hook")
+		case <-ticker.C:
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected preparation cancellation, got %v", err)
+		}
+	case <-waitCtx.Done():
+		t.Fatal("cancelled ref transaction did not stop")
+	}
+	for _, path := range []string{"HEAD.lock", branchRef + ".lock", recoveryRef + ".lock"} {
+		if _, err := os.Stat(filepath.Join(dir, ".git", path)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("cancelled transaction retained %s: %v", path, err)
+		}
+	}
+	if err := os.Remove(hook); err != nil {
+		t.Fatal(err)
+	}
+	if err := WithLockedRecoveryRefAndExpectedRef(context.Background(), dir,
+		recoveryRef, first, branchRef, first, func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("recovery cannot resume after cancellation: %v", err)
+	}
+}
 
 func TestRevParseReturnsErrRefNotFoundForMissingRef(t *testing.T) {
 	dir := initRepo(t)
@@ -443,7 +509,7 @@ func TestWithLockedRecoveryAndBranchRefKeepsLocksUntilCallbackReturnsAfterDeadli
 	go func() {
 		lockDone <- withLockedExpectedRefTimeout(
 			ctx, dir, recoveryRef, first, branchRef, first, true,
-			50*time.Millisecond, func(callbackCtx context.Context) error {
+			time.Second, func(callbackCtx context.Context) error {
 				close(commitBoundary)
 				<-callbackCtx.Done()
 				close(deadlineExpired)

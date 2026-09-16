@@ -336,6 +336,17 @@ func TestIntentWorktreeReliability(t *testing.T) {
 	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state IN ('pending','blocked_conflict','failed')"); got != "0" {
 		t.Fatalf("terminal/pending events after rewrite=%s want 0", got)
 	}
+	// Identical worktree bytes may reuse the retained checkpoint; its original
+	// observed HEAD stays immutable while current coverage advances.
+	waitFor(t, "new generation protection checkpoint", 12*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, `SELECT COUNT(*) FROM checkpoints WHERE id=(SELECT value FROM daemon_meta WHERE key='protection.checkpoint_id')
+AND phase='completed' AND retained=1 AND tree_oid=`+sqliteQuote(finalTree)+`
+AND (SELECT value FROM daemon_meta WHERE key='protection.complete')='true'
+AND (SELECT value FROM daemon_meta WHERE key='protection.covered_epoch')=(SELECT value FROM daemon_meta WHERE key='protection.observation_epoch')`) == "1"
+	})
+	if got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); got != parent {
+		t.Fatalf("identical-tree rewrite created an extra commit: %s want %s", got, parent)
+	}
 	assertIntentCLITruthAgreement(t, ctx, env, repo, true, true)
 
 	responseMu.Lock()
@@ -439,7 +450,21 @@ func assertIntentCLITruthAgreement(
 ) {
 	t.Helper()
 	for _, command := range []string{"status", "diagnose", "doctor"} {
-		res := runAcd(t, ctx, env, command, "--repo", repo, "--json")
+		var res ExecResult
+		waitFor(t, "stable "+command+" observation", 8*time.Second, func() bool {
+			res = runAcd(t, ctx, env, command, "--repo", repo, "--json")
+			var snapshot any
+			if json.Unmarshal([]byte(res.Stdout), &snapshot) != nil {
+				return true
+			}
+			matches := true
+			for key, want := range map[string]bool{"worktree_clean": true, "all_changes_committed_in_git": wantCommitted, "checkpoint_published_by_acd": wantACDPublished} {
+				got, found := findJSONBool(snapshot, key)
+				matches = matches && found && got == want
+			}
+			busy, _ := findJSONBool(snapshot, "busy")
+			return matches || !busy
+		})
 		if res.ExitCode != 0 {
 			t.Fatalf("acd %s exit=%d stdout=%s stderr=%s", command, res.ExitCode, res.Stdout, res.Stderr)
 		}

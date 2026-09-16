@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -15,7 +16,66 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settingsui"
 )
 
-func TestSetupDryRunDefaultsAreEverydayLocalAndSecretFree(t *testing.T) {
+func TestSetupNonInteractiveRequiresExplicitProvider(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "")
+	cmd := newSetupCommand(false)
+	roots := paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}
+	_, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{}, true, true)
+	if err == nil || !strings.Contains(err.Error(), "requires --provider") {
+		t.Fatalf("missing provider: %v", err)
+	}
+	state, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{Provider: "deterministic"}, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Selection.Provider != "deterministic" || state.Configuration.Values[config.FieldDiffEgress] != "false" || state.Credential != "" {
+		t.Fatalf("explicit offline setup changed: %+v", state.Selection)
+	}
+}
+
+func TestSetupRepositoryConsentIsSeparateAndReportsPartialSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name, answer string
+		failure      bool
+		wantCall     bool
+	}{
+		{name: "decline", answer: "n\n"},
+		{name: "default", answer: "\n"},
+		{name: "accept", answer: "yes\n", wantCall: true},
+		{name: "checkpoint failure", answer: "y\n", wantCall: true, failure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newSetupCommand(false)
+			cmd.SetIn(strings.NewReader(tc.answer))
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			called := false
+			err := offerSetupProtection(cmd, "/project", func(_ context.Context, _ io.Writer, repo string, jsonOut bool) error {
+				called = true
+				if repo != "/project" || jsonOut {
+					t.Fatalf("wrong enable scope: %q, %v", repo, jsonOut)
+				}
+				if tc.failure {
+					return errors.New("checkpoint unavailable")
+				}
+				return nil
+			})
+			if called != tc.wantCall {
+				t.Fatalf("enable called=%v", called)
+			}
+			if tc.failure {
+				if err == nil || !strings.Contains(err.Error(), "installation succeeded") {
+					t.Fatalf("partial result: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSetupDryRunRecommendsEverydayAIWithoutCredentials(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "")
 	cmd := newSetupCommand(false)
 	cmd.SetIn(strings.NewReader(""))
@@ -29,8 +89,8 @@ func TestSetupDryRunDefaultsAreEverydayLocalAndSecretFree(t *testing.T) {
 	if values[config.FieldCommitStrategy] != "intent" ||
 		values[config.FieldCommitPreset] != "balanced" ||
 		values[config.FieldCommitFormat] != "imperative" ||
-		values[config.FieldProvider] != "deterministic" ||
-		values[config.FieldDiffEgress] != "false" ||
+		values[config.FieldProvider] != "openai-compat" ||
+		values[config.FieldDiffEgress] != "true" ||
 		values[config.FieldIntentRepairEnabled] != "true" {
 		t.Fatalf("fresh values = %+v", values)
 	}
@@ -93,7 +153,12 @@ func TestSetupNonTTYUsesAccessibleWizard(t *testing.T) {
 		opts settingsui.ConfigureWizardOptions,
 	) (settingsui.ConfigureSelection, error) {
 		accessible = opts.Accessible
-		return configureSelectionFromValues(opts.Defaults), nil
+		if opts.Defaults[config.FieldProvider] != "openai-compat" {
+			t.Fatal("fresh setup did not recommend AI")
+		}
+		selection := configureSelectionFromValues(opts.Defaults)
+		selection.Provider = "deterministic"
+		return selection, nil
 	}
 
 	cmd := newSetupCommand(false)

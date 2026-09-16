@@ -286,6 +286,9 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 			"acd config edit: resolve global defaults: %w", err,
 		)
 	}
+	if !opts.JSON {
+		renderConfigureEffective(cmd.OutOrStdout(), authoring, opts.Repo)
+	}
 	defaults := authoring.Values
 	if opts.Replace {
 		defaults, err = builtInConfigureValues(strategy, preset)
@@ -298,10 +301,6 @@ func runGlobalConfigure(cmd *cobra.Command, opts configureOptions) error {
 	defaults[config.FieldCommitPreset] = preset
 	defaults[config.FieldIntentVerification] =
 		configureSelectionVerificationMode(strategy, preset)
-	if strategy == "intent" &&
-		defaults[config.FieldProvider] == "deterministic" {
-		defaults[config.FieldProvider] = "openai-compat"
-	}
 	providerConfigured := !opts.Replace && configureSourceIsExplicit(
 		authoring.Sources[config.FieldProvider],
 	) && originalProvider == defaults[config.FieldProvider]
@@ -726,6 +725,9 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if err != nil {
 		return fmt.Errorf("acd config edit: resolve authoring defaults: %w", err)
 	}
+	if !opts.JSON {
+		renderConfigureEffective(cmd.OutOrStdout(), authoring, opts.Repo)
+	}
 	defaults := authoring.Values
 	if opts.Inherit {
 		global, previewErr := loadGlobalConfigurePreview(
@@ -740,10 +742,6 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	if !opts.Inherit {
 		defaults[config.FieldCommitStrategy] = strategy
 		defaults[config.FieldCommitPreset] = preset
-		if strategy == "intent" &&
-			defaults[config.FieldProvider] == "deterministic" {
-			defaults[config.FieldProvider] = "openai-compat"
-		}
 	}
 	providerConfigured := configureSourceIsExplicit(
 		authoring.Sources[config.FieldProvider],
@@ -823,6 +821,9 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 	}
 	if opts.Inherit {
 		configureInheritedReport(&report)
+	}
+	if originalProvider != "deterministic" && selection.Provider == "deterministic" {
+		report.Risks = append(report.Risks, "If publication is active, ACD preserves the unpublished target in recovery, then recaptures it using Local automatic commits. The switch requires a verified applied configuration; an ambiguous target still needs attention.")
 	}
 	if err := renderConfigureReport(cmd.OutOrStdout(), report, false); err != nil {
 		return err
@@ -2301,4 +2302,15 @@ func displayConfigureWord(value string) string {
 		return ""
 	}
 	return strings.ToUpper(value[:1]) + value[1:]
+}
+
+// Show inheritance before editing so a saved value is not mistaken for a default.
+func renderConfigureEffective(out io.Writer, preview settings.AuthoringPreview, repo string) {
+	fmt.Fprintln(out, "Current effective settings:")
+	for _, key := range []string{config.FieldProvider, config.FieldCommitStrategy, config.FieldIntentVerification} {
+		fmt.Fprintf(out, "  %s: %s (from %s)\n", key, preview.Values[key], preview.Sources[key])
+	}
+	if repo != "" {
+		fmt.Fprintf(out, "To use global defaults: acd config edit --repo %s --inherit\n", productListShellQuote(repo))
+	}
 }

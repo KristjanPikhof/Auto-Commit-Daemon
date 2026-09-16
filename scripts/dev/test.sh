@@ -2,13 +2,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-shard_count=${ACD_TEST_SHARDS:-2}
+shard_count=${ACD_TEST_SHARDS:-3}
 package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2}
 test_timeout=${ACD_TEST_TIMEOUT:-4m15s}
 timing_sensitive_daemon_tests='^(TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent)$'
 output_root=
+started_seconds=$SECONDS
+lane_name=${1:-local}
+lane_index=${3:-all}
 
 cleanup() {
+  local status=$?
+  if [[ -n "${ACD_TEST_RESULTS_DIR:-}" ]]; then
+    mkdir -p "$ACD_TEST_RESULTS_DIR"
+    python3 - "$ACD_TEST_RESULTS_DIR/$lane_name-$lane_index.summary.json" "$((SECONDS - started_seconds))" "$status" <<'PY_SUMMARY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({'wall_seconds': int(sys.argv[2]), 'exit_code': int(sys.argv[3])}) + '\n')
+PY_SUMMARY
+  fi
   if [[ -n "$output_root" ]]; then
     rm -rf "$output_root"
   fi
@@ -19,6 +30,7 @@ usage() {
   cat >&2 <<'EOF'
 usage: scripts/dev/test.sh
        scripts/dev/test.sh core <shard-count> <shard-index>
+       scripts/dev/test.sh integration <shard-count> <shard-index>
        scripts/dev/test.sh support
        scripts/dev/test.sh sensitive
        scripts/dev/test.sh stress-daemon <shard-count> <shard-index>
@@ -71,10 +83,10 @@ run_core() {
 
   validate_shard "$count" "$index"
   run_package_shard ./internal/cli "$count" "$index" \
-    -race -count=1 -timeout "$test_timeout" &
+    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-4}" -timeout "$test_timeout" &
   cli_pid=$!
   run_package_shard ./internal/daemon "$count" "$index" \
-    -race -count=1 -timeout "$test_timeout" \
+    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-4}" -timeout "$test_timeout" \
     -skip "$timing_sensitive_daemon_tests" &
   daemon_pid=$!
 
@@ -84,6 +96,29 @@ run_core() {
   if ! wait "$daemon_pid"; then
     status=1
   fi
+  return "$status"
+}
+
+run_integration() {
+  validate_shard "$1" "$2"
+  ACD_BENCHMARK=1 run_package_shard ./test/integration "$1" "$2" \
+    -tags=integration -race -count=1 -parallel=2 -timeout "$test_timeout"
+}
+
+run_measured_tests() {
+  local name=$1
+  shift
+  local result
+  local status=0
+  if [[ -n "${ACD_TEST_RESULTS_DIR:-}" ]]; then
+    mkdir -p "$ACD_TEST_RESULTS_DIR"
+    result="$ACD_TEST_RESULTS_DIR/$name.jsonl"
+  else
+    result=$(mktemp "${TMPDIR:-/tmp}/acd-test-events.XXXXXX")
+  fi
+  go test "$@" -json >"$result" 2>&1 || status=$?
+  python3 scripts/dev/test-events.py "$result"
+  if [[ -z "${ACD_TEST_RESULTS_DIR:-}" ]]; then rm -f "$result"; fi
   return "$status"
 }
 
@@ -103,12 +138,12 @@ run_support() {
     esac
   done <<<"$package_list"
 
-  go test -p "$package_parallelism" "${packages[@]}" \
+  run_measured_tests support -p "$package_parallelism" "${packages[@]}" \
     -race -count=1 -timeout "$test_timeout"
 }
 
 run_sensitive() {
-  go test ./internal/daemon -race -count=1 -timeout "$test_timeout" \
+  run_measured_tests sensitive ./internal/daemon -race -count=1 -timeout "$test_timeout" \
     -run "$timing_sensitive_daemon_tests"
 }
 
@@ -143,7 +178,7 @@ run_all() {
   output_root=$(mktemp -d "${TMPDIR:-/tmp}/acd-tests.XXXXXX")
 
   for ((index = 0; index < shard_count; index++)); do
-    run_core "$shard_count" "$index" \
+    ACD_TEST_CASE_PARALLELISM=${ACD_TEST_CASE_PARALLELISM:-2} run_core "$shard_count" "$index" \
       >"$output_root/core-$index.log" 2>&1 &
     core_pids[$index]=$!
   done
@@ -178,6 +213,10 @@ case "${1:-}" in
       exit 2
     fi
     run_core "$2" "$3"
+    ;;
+  integration)
+    if (($# != 3)); then usage; exit 2; fi
+    run_integration "$2" "$3"
     ;;
   support)
     if (($# != 1)); then

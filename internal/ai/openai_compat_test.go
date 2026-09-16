@@ -173,21 +173,15 @@ func TestOpenAI_ConventionalPromptAndSchema(t *testing.T) {
 	}
 }
 
-func TestOpenAI_ConventionalWrongFormatFallsBack(t *testing.T) {
+func TestOpenAI_ConventionalWrongFormatWaits(t *testing.T) {
 	p, _, _ := newOpenAIMock(t, func(req capturedReq) (int, string) {
 		return 200, cannedToolCall("Update openai_compat.go", "")
 	})
 	p.Format = CommitFormatConventional
 	prov := Compose(p, DeterministicProvider{CommitFormat: CommitFormatConventional})
 	got, err := prov.Generate(context.Background(), CommitContext{Op: "modify", Path: "internal/ai/openai_compat.go"})
-	if err != nil {
-		t.Fatalf("Generate: %v", err)
-	}
-	if got.Source != "deterministic" {
-		t.Fatalf("Source=%q want deterministic", got.Source)
-	}
-	if got.Subject != "chore: update openai_compat.go" {
-		t.Fatalf("Subject=%q", got.Subject)
+	if err == nil || got.Subject != "" || got.Source == "deterministic" {
+		t.Fatalf("invalid AI message must wait: %+v err=%v", got, err)
 	}
 }
 
@@ -312,26 +306,18 @@ func TestOpenAI_RejectsWrongCommitMessageToolName(t *testing.T) {
 	}
 }
 
-// Compose(openai, deterministic): on openai 5xx the deterministic
-// fallback fires and Source reflects "deterministic".
-func TestOpenAI_ComposeFallback(t *testing.T) {
+// A provider outage cannot silently change the selected commit-message mode.
+func TestOpenAI_ComposeOutageWaits(t *testing.T) {
 	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
 		return 503, `{"error":{"message":"unavailable"}}`
 	})
 	prov := Compose(p, DeterministicProvider{})
 	r, err := prov.Generate(context.Background(), CommitContext{Op: "modify", Path: "src/foo.go"})
-	if err != nil {
-		t.Fatalf("Compose: %v", err)
-	}
-	if r.Subject != "Update foo.go" {
-		t.Fatalf("subject=%q (expected deterministic fallback)", r.Subject)
-	}
-	if r.Source != "deterministic" {
-		t.Fatalf("source=%q want deterministic", r.Source)
+	if err == nil || r.Subject != "" || r.Source == "deterministic" {
+		t.Fatalf("AI outage must wait: %+v err=%v", r, err)
 	}
 }
 
-// Compose(openai, deterministic): on openai success Source reflects "openai-compat".
 func TestOpenAI_ComposePrimaryWins(t *testing.T) {
 	p, _, _ := newOpenAIMock(t, func(capturedReq) (int, string) {
 		return 200, cannedToolCall("Refactor pipeline", "")

@@ -27,16 +27,17 @@ acd setup
 ~~~
 
 Setup configures the shared runtime, integrations, grouping, commit format,
-repair limit, and provider. Choose Everyday work for Intent commits. The local
-provider works offline. Choose an OpenAI-compatible provider when you want AI
-grouping and semantic commit messages.
+repair limit, and provider. AI semantic commits with Everyday checks are
+recommended. Local automatic commits are an explicit offline alternative with
+more limited grouping and messages.
 
 An OpenAI-compatible setup asks for its endpoint, model, and bearer token. It
 sends one fixed synthetic request after you approve the plan, without sending
 repository content during that test.
 
-`acd setup` finishes with `ACD installation is ready`. It does not protect the
-current directory.
+`acd setup` verifies the running installation before reporting readiness.
+In a terminal it then offers to protect the current repository, with separate
+consent. It confirms protection only after a completed checkpoint.
 
 ## Enable a repository
 
@@ -58,7 +59,7 @@ acd
 acd history
 ~~~
 
-`waiting` with `Current changes protected: yes` means work is safe and Git
+`Branch commits` waiting with `Current changes saved: yes` means work is safe and Git
 publication is delayed. The final `Next:` line gives the exact command only
 when action is necessary.
 
@@ -66,19 +67,15 @@ The human status output keeps the main questions separate:
 
 | Output | Meaning |
 |---|---|
-| `State` | Overall state: `off`, `protected`, `waiting`, `publishing`, or `needs_action`. |
-| `ACD protection` | Whether background protection is on. |
-| `Current changes protected` | Whether the latest eligible changes have a completed durable checkpoint. |
-| `Published to Git` | Whether every protected change is resolved in Git: in local branch history or a protected recovery snapshot, with no unresolved failed or blocked capture. |
-| `Commit mode` | The configured strategy. A temporary local recovery remains part of Intent mode. |
-| `Publication queue` | All protected changes still waiting for local Git publication. |
-| `Active target` | The bounded remainder of `commit-all` or automatic Intent recovery, when one exists. |
-| `Publication phase` | The current wait, planning, recovery, or publication step. |
-| `Last queue movement` | Time since durable queue progress; worker heartbeats do not reset it. |
-| `Worker liveness` | Whether the background worker is responsive, reported separately from progress. |
-| `Action needed` | Whether you need to do anything now. |
-| `Status` | What ACD is doing or why it stopped. |
-| `Next` | The next command, or `No action needed.` |
+| `Protection` | Whether background protection is on. |
+| `Current changes saved` | Whether the latest observation has a completed durable checkpoint. |
+| `Branch commits` | Committed work or the reason protected changes are waiting. |
+| `Recovery` | Changes preserved separately from normal branch history. |
+| `Next` | An actionable command, or `No action needed.` |
+
+`acd status --verbose` also shows the provider, queue, active target, phase,
+last queue movement, and worker heartbeat. A heartbeat shows liveness; it does
+not prove publication progress.
 
 These fields are independent. Current changes can remain protected while Git
 publication is waiting or needs recovery.
@@ -142,12 +139,15 @@ without discarding protected work.
 ## Restore a checkpoint
 
 ~~~bash
-acd history
+acd restore                 # terminal picker
+acd history                 # IDs for scripting
 acd restore cp-...
 acd restore cp-... --yes
 ~~~
 
-Preview first. Resolve staged overlap before applying. Restore leaves `HEAD`
+The terminal picker shows retained completed checkpoints, then the selected
+file preview and a separate apply confirmation. Outside a terminal, an ID is
+required. Preview first. Resolve staged overlap before applying. Restore leaves `HEAD`
 and the index unchanged and prints an undo command using the pre-restore
 checkpoint.
 

@@ -3,7 +3,6 @@ package cli
 // Checkpoint-first transactional setup plus the hidden legacy snippet route.
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +19,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
@@ -88,12 +88,13 @@ func newSetupCommand(initCompat bool) *cobra.Command {
 		Long: `Inspect the current installation and show the exact setup plan before
 changing anything. The plan installs or upgrades ACD, starts its background
 service, and updates user-level integrations as one rollback-safe operation.
-It does not enable the current repository. Run acd on once in each repository
-that ACD should protect.
+After installation, interactive setup offers to protect the current repository
+with a separate confirmation. You can also run acd on in each repository.
 
-Start with --dry-run when you want a preview. The default setup works without
-an API key. Fresh setup asks how to group and format commits, then lets you use
-the local provider or test an OpenAI-compatible endpoint. On macOS, run setup
+Start with --dry-run when you want a preview. Fresh setup recommends AI semantic
+commits and tests the selected connection using synthetic content. Local automatic
+commits remain available without credentials or network access. Fresh unattended
+setup requires --provider openai-compat or --provider deterministic. On macOS, run setup
 from the terminal or coding tool that should own the ACD service.
 Full Disk Access is not required.`,
 		Example: `  acd setup
@@ -157,7 +158,6 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	repo, _ := cmd.Flags().GetString("repo")
 	jsonOut, _ := cmd.Flags().GetBool("json")
 	quiet, _ := cmd.Flags().GetBool("quiet")
-	input := bufio.NewReader(cmd.InOrStdin())
 	if dryRun && yes {
 		return invalidCommandError("acd setup: --dry-run cannot be combined with --yes")
 	}
@@ -197,18 +197,6 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	if dryRun {
 		return renderSetupPlan(cmd, plan, jsonOut)
 	}
-	if len(plan.Actions) == 1 && plan.Actions[0].Kind == "verify_compatible_runtime" {
-		if jsonOut {
-			return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateReady,
-				Changed: false, Actions: []productAction{}, Data: plan}, true)
-		}
-		if err := renderSetupPlan(cmd, plan, false); err != nil {
-			return err
-		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Status: ACD installation is ready.")
-		renderSetupNextAction(cmd.OutOrStdout(), plan)
-		return nil
-	}
 	if !jsonOut {
 		if err := renderSetupPlan(cmd, plan, false); err != nil {
 			return err
@@ -220,7 +208,8 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 		}
 	} else if !yes {
 		fmt.Fprint(cmd.ErrOrStderr(), "Apply this setup plan? [y/N] ")
-		answer, _ := input.ReadString('\n')
+		var answer string
+		_, _ = fmt.Fscanln(cmd.InOrStdin(), &answer)
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		if answer != "y" && answer != "yes" {
 			return nil
@@ -251,7 +240,8 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 			return err
 		}
 		fmt.Fprint(cmd.ErrOrStderr(), "Apply this changed setup plan? [y/N] ")
-		answer, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+		var answer string
+		_, _ = fmt.Fscanln(cmd.InOrStdin(), &answer)
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		if answer != "y" && answer != "yes" {
 			return errors.New("acd setup: setup stopped; nothing was written")
@@ -285,6 +275,7 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Setup complete.")
 	fmt.Fprintln(cmd.OutOrStdout(), "Status: ACD installation is ready.")
+	fmt.Fprintf(cmd.OutOrStdout(), "Runtime: %s; running versions and enabled repository protection verified.\n", version.String())
 	fmt.Fprintln(cmd.OutOrStdout(), "Repositories: Existing enablement was preserved; no repository was added.")
 	if onboardingState != nil {
 		fmt.Fprintf(cmd.OutOrStdout(), "Preferences: %s, %s commits, %s provider.\n",
@@ -293,7 +284,29 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 			onboardingState.Selection.Provider)
 		fmt.Fprintln(cmd.OutOrStdout(), "Provider test: passed with synthetic content.")
 	}
+	if !nonInteractive && !yes && !quiet && settingsInputTTY(cmd.InOrStdin()) && settingsOutputTTY(cmd.OutOrStdout()) {
+		lookup, lookupErr := loadControlRepo(cmd.Context(), repo)
+		if lookupErr == nil && (!lookup.Registered || lookup.Record.LifecycleDisabled()) {
+			return offerSetupProtection(cmd, lookup.Worktree.Root, runControlOn)
+		}
+	}
 	renderSetupNextAction(cmd.OutOrStdout(), plan)
+	return nil
+}
+
+// Installation consent never includes repository enablement. Use the same
+// operation as `acd on`, which confirms the initial checkpoint before success.
+func offerSetupProtection(cmd *cobra.Command, repo string, enable func(context.Context, io.Writer, string, bool) error) error {
+	fmt.Fprintf(cmd.ErrOrStderr(), "Protect %s now? [y/N] ", repo)
+	var answer string
+	_, _ = fmt.Fscanln(cmd.InOrStdin(), &answer)
+	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+		fmt.Fprintln(cmd.OutOrStdout(), "Next: Run `acd on` in this repository when you want protection.")
+		return nil
+	}
+	if err := enable(cmd.Context(), cmd.OutOrStdout(), repo, false); err != nil {
+		return fmt.Errorf("acd setup: installation succeeded, but repository protection could not be confirmed; run `acd status` and follow its next step: %w", err)
+	}
 	return nil
 }
 

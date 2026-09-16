@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -96,7 +97,7 @@ func countIntentPlannerErrorDecisions(t *testing.T, ctx context.Context, db *sta
 	return total
 }
 
-func TestReplay_IntentHealthSingletonOutageUsesCircuitFallback(t *testing.T) {
+func TestReplay_IntentHealthSingletonOutageWaitsForAI(t *testing.T) {
 	runBoundedParallel(t)
 
 	f := newCaptureFixture(t)
@@ -123,10 +124,10 @@ func TestReplay_IntentHealthSingletonOutageUsesCircuitFallback(t *testing.T) {
 		IntentMinPending:      1,
 		IntentBypassBatchWait: true,
 	})
-	if err != nil {
-		t.Fatalf("Replay: %v", err)
+	if !isIntentPlannerCircuitWait(err) {
+		t.Fatalf("Replay should preserve selected provider: %v", err)
 	}
-	if sum.Published != 1 || planner.calls != 1 || messageCalls != 0 {
+	if sum.Published != 0 || planner.calls != 1 || messageCalls != 0 {
 		t.Fatalf("summary=%+v planner_calls=%d message_calls=%d", sum, planner.calls, messageCalls)
 	}
 	if snap := health.Snapshot(); snap.State != IntentPlannerCircuitOpen || snap.LastFailureClass != IntentPlannerFailureTransport {
@@ -166,15 +167,15 @@ func TestReplay_IntentHealthProviderShapeFailureCountsAsValidation(t *testing.T)
 		IntentMinPending:      1,
 		IntentBypassBatchWait: true,
 	})
-	if err != nil {
-		t.Fatalf("Replay: %v", err)
+	if !isIntentPlannerCircuitWait(err) {
+		t.Fatalf("Replay should preserve selected provider: %v", err)
 	}
-	if sum.Published != 1 || planner.calls != 1 {
+	if sum.Published != 0 || planner.calls != 1 {
 		t.Fatalf("summary=%+v planner_calls=%d", sum, planner.calls)
 	}
 	if snap := health.Snapshot(); snap.State != IntentPlannerCircuitClosed ||
-		snap.ConsecutiveFailures != 1 || snap.LastFailureClass != IntentPlannerFailureValidation {
-		t.Fatalf("health=%+v want one closed validation failure", snap)
+		snap.ConsecutiveFailures != 0 || snap.NextProbeTS != 0 {
+		t.Fatalf("health=%+v semantic rejection must not consume outage backoff", snap)
 	}
 }
 
@@ -212,8 +213,8 @@ func TestReplay_IntentFailureSanitizesDurableObservability(t *testing.T) {
 		IntentWindow:          10,
 		IntentMinPending:      1,
 		IntentBypassBatchWait: true,
-	}); err != nil {
-		t.Fatalf("Replay: %v", err)
+	}); !isIntentPlannerCircuitWait(err) {
+		t.Fatalf("Replay should wait: %v", err)
 	}
 	assertNoSecret := func(label, value string) {
 		t.Helper()
@@ -226,40 +227,21 @@ func TestReplay_IntentFailureSanitizesDurableObservability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecisionsForEvent: %v", err)
 	}
-	foundDecision := false
-	for _, decision := range decisions {
-		if decision.Kind == state.DecisionKindIntentPlannerError {
-			foundDecision = true
-			assertNoSecret("decision reason", decision.Reason.String)
-		}
-	}
-	if !foundDecision {
-		t.Fatal("planner error decision missing")
-	}
 	windows, err := state.RecentIntentPlannerWindows(ctx, f.db, 1)
-	if err != nil || len(windows) != 1 {
-		t.Fatalf("windows=%d err=%v", len(windows), err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	assertNoSecret("window validation failure", windows[0].ValidationFailure.String)
-	foundPrompt := false
-	for _, record := range prompts.Records() {
-		if record.Stage == "fallback" && record.Response != nil {
-			foundPrompt = true
-			assertNoSecret("prompt fallback", record.Response.FallbackReason)
+	for _, value := range []any{decisions, windows, prompts.Records(), traces.Events()} {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("secret escaped durable observability: %s", encoded)
 		}
 	}
-	if !foundPrompt {
-		t.Fatal("prompt fallback record missing")
-	}
-	foundTrace := false
-	for _, event := range traces.Events() {
-		if event.EventClass == "intent.planner.validation_failed" {
-			foundTrace = true
-			assertNoSecret("trace error", event.Error)
-		}
-	}
-	if !foundTrace {
-		t.Fatal("planner validation trace missing")
+	if len(windows) != 0 {
+		t.Fatal("transport wait was recorded as semantic validation result")
 	}
 }
 
@@ -298,23 +280,23 @@ func TestReplay_IntentHealthOpenBypassDoesNotRepeatPlannerErrors(t *testing.T) {
 		IntentBypassBatchWait: true,
 	}
 	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
-	if err != nil {
-		t.Fatalf("first Replay: %v", err)
+	if !isIntentPlannerCircuitWait(err) {
+		t.Fatalf("first Replay should wait: %v", err)
 	}
-	if first.Published != 1 || planner.calls != 1 {
+	if first.Published != 0 || planner.calls != 1 {
 		t.Fatalf("first summary=%+v planner_calls=%d", first, planner.calls)
 	}
 	firstErrorCount := countIntentPlannerErrorDecisions(t, ctx, f.db, seqs)
-	if firstErrorCount != 2 {
-		t.Fatalf("first planner-error decisions=%d want 2", firstErrorCount)
+	if firstErrorCount != 0 {
+		t.Fatalf("first planner-error decisions=%d want 0", firstErrorCount)
 	}
 
 	f.cctx.BaseHead = first.BaseHead
 	second, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
-	if err != nil {
-		t.Fatalf("second Replay: %v", err)
+	if !isIntentPlannerCircuitWait(err) {
+		t.Fatalf("second Replay should wait: %v", err)
 	}
-	if second.Published != 1 || planner.calls != 1 {
+	if second.Published != 0 || planner.calls != 1 {
 		t.Fatalf("second summary=%+v planner_calls=%d want circuit bypass", second, planner.calls)
 	}
 	if got := countIntentPlannerErrorDecisions(t, ctx, f.db, seqs); got != firstErrorCount {
@@ -324,34 +306,14 @@ func TestReplay_IntentHealthOpenBypassDoesNotRepeatPlannerErrors(t *testing.T) {
 		t.Fatalf("health=%+v want open with one bypass", snap)
 	}
 
-	windows, err := state.RecentIntentPlannerWindows(ctx, f.db, 2)
-	if err != nil {
-		t.Fatalf("RecentIntentPlannerWindows: %v", err)
+	remaining, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(remaining) != 2 {
+		t.Fatalf("outage changed protected membership: %v %v", remaining, err)
 	}
-	if len(windows) != 2 {
-		t.Fatalf("windows=%d want 2", len(windows))
-	}
-	if windows[0].Provider.String != "openai-compat" || windows[0].Model.String != "planner-model" || windows[0].ValidationFailure.Valid {
-		t.Fatalf("bypass window metadata=%+v", windows[0])
-	}
-	if !windows[1].ValidationFailure.Valid || windows[1].ValidationFailure.String == "" {
-		t.Fatalf("first failure window missing validation failure: %+v", windows[1])
-	}
-
-	records := prompts.Records()
-	foundCircuitFallback := false
-	for _, record := range records {
-		if record.Stage != "fallback" || record.Response == nil ||
-			!strings.Contains(record.Response.FallbackReason, "circuit bypass") {
-			continue
+	for _, record := range prompts.Records() {
+		if record.Stage == "fallback" {
+			t.Fatalf("transport wait advertised deterministic fallback: %+v", record)
 		}
-		foundCircuitFallback = true
-		if record.Provider != "openai-compat" || record.Model != "planner-model" || !record.DiffIncluded {
-			t.Fatalf("circuit fallback metadata=%+v", record)
-		}
-	}
-	if !foundCircuitFallback {
-		t.Fatalf("prompt records missing circuit fallback: %+v", records)
 	}
 }
 
@@ -397,15 +359,15 @@ func TestReplay_IntentHealthSelectionSafetyFailureIsValidation(t *testing.T) {
 		IntentMinPending:      1,
 		IntentBypassBatchWait: true,
 	})
-	if err != nil {
-		t.Fatalf("Replay: %v", err)
+	if !isIntentPlannerCircuitWait(err) {
+		t.Fatalf("Replay should preserve selected provider: %v", err)
 	}
-	if sum.Published != 1 {
-		t.Fatalf("summary=%+v want deterministic fallback publish", sum)
+	if sum.Published != 0 {
+		t.Fatalf("summary=%+v want protected work waiting for semantic message", sum)
 	}
 	if snap := health.Snapshot(); snap.State != IntentPlannerCircuitClosed ||
-		snap.ConsecutiveFailures != 1 || snap.LastFailureClass != IntentPlannerFailureValidation {
-		t.Fatalf("health=%+v want one closed validation failure", snap)
+		snap.ConsecutiveFailures != 0 || snap.NextProbeTS != 0 {
+		t.Fatalf("health=%+v semantic rejection must not consume outage backoff", snap)
 	}
 }
 
@@ -533,5 +495,42 @@ func TestRun_IntentV2HealthReusesRevisionedProvider(t *testing.T) {
 	if persisted.State != IntentPlannerCircuitClosed ||
 		persisted.ProviderFingerprint == "" {
 		t.Fatalf("persisted health=%+v", persisted)
+	}
+}
+
+func TestLegacySemanticRejectionsDoNotOpenTransportBackoff(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	captureOnePendingFile(t, ctx, f, "feature.txt", "feature behavior\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending=%v err=%v", pending, err)
+	}
+	planner := &recordingIntentPlanner{name: "openai-compat", err: &ai.IntentPlanValidationError{Code: ai.IntentPlanValidationShape, Message: "invalid plan shape"}}
+	health := NewIntentPlannerHealth(ctx, f.db, IntentPlannerHealthOptions{Provider: openAIIntentHealthIdentity("https://planner.example/v1")})
+	opts := ReplayOpts{GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent, IntentPlanner: planner, IntentHealth: health, IntentWindow: 10, IntentMinPending: 1, IntentBypassBatchWait: true}
+	for attempt := 0; attempt < 3; attempt++ {
+		sum, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+		if !isIntentPlannerCircuitWait(err) || sum.Published != 0 {
+			t.Fatalf("rejection must retain protected work: %+v %v", sum, err)
+		}
+		if snapshot := health.Snapshot(); snapshot.State != IntentPlannerCircuitClosed || snapshot.NextProbeTS != 0 || snapshot.ConsecutiveFailures != 0 {
+			t.Fatalf("semantic rejection spent transport backoff: %+v", snapshot)
+		}
+	}
+	if planner.calls != 3 {
+		t.Fatalf("semantic correction calls=%d want3", planner.calls)
+	}
+	if decisions := countIntentPlannerErrorDecisions(t, ctx, f.db, []int64{pending[0].Seq}); decisions < 1 {
+		t.Fatal("semantic rejection diagnostics lost")
+	}
+	planner.err = nil
+	planner.plan = ai.IntentPlan{SelectedSeqs: []int64{pending[0].Seq}, Subject: "Preserve feature behavior", Body: "- Keep the captured feature change coherent", GroupingReason: "one complete feature change"}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || sum.Published != 1 || planner.calls != 4 {
+		t.Fatalf("valid AI response did not resume immediately: %+v calls=%d err=%v", sum, planner.calls, err)
 	}
 }

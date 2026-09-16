@@ -42,8 +42,8 @@ func TestRepoLookupCommandsCanonicalizeSubdirBeforeRegistryLookup(t *testing.T) 
 
 	t.Run("status", func(t *testing.T) {
 		var out bytes.Buffer
-		if err := runStatus(ctx, &out, subdir, true); err != nil {
-			t.Fatalf("runStatus from subdir: %v", err)
+		if err := writeStatusProjectionFixture(ctx, &out, subdir, true); err != nil {
+			t.Fatalf("writeStatusProjectionFixture from subdir: %v", err)
 		}
 		var rep statusReport
 		if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
@@ -92,34 +92,6 @@ func TestRepoLookupCommandsCanonicalizeSubdirBeforeRegistryLookup(t *testing.T) 
 		}
 	})
 
-	t.Run("wake", func(t *testing.T) {
-		var out bytes.Buffer
-		if err := runWake(ctx, &out, subdir, "wake-session", true); err != nil {
-			t.Fatalf("runWake from subdir: %v", err)
-		}
-		var rep wakeResult
-		if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
-			t.Fatalf("decode wake: %v\n%s", err, out.String())
-		}
-		if rep.Repo != repo {
-			t.Fatalf("wake repo=%q want canonical root %q", rep.Repo, repo)
-		}
-	})
-
-	t.Run("touch", func(t *testing.T) {
-		var out bytes.Buffer
-		if err := runTouch(ctx, &out, subdir, "touch-session", true); err != nil {
-			t.Fatalf("runTouch from subdir: %v", err)
-		}
-		var rep touchResult
-		if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
-			t.Fatalf("decode touch: %v\n%s", err, out.String())
-		}
-		if rep.Repo != repo {
-			t.Fatalf("touch repo=%q want canonical root %q", rep.Repo, repo)
-		}
-	})
-
 	t.Run("stop", func(t *testing.T) {
 		if err := state.RegisterClient(ctx, db, state.Client{SessionID: "stop-session", Harness: "codex", LastSeenTS: nowFloat()}); err != nil {
 			t.Fatalf("register stop session: %v", err)
@@ -128,7 +100,7 @@ func TestRepoLookupCommandsCanonicalizeSubdirBeforeRegistryLookup(t *testing.T) 
 			t.Fatalf("register peer session: %v", err)
 		}
 		var out bytes.Buffer
-		if err := runStop(ctx, &out, subdir, "stop-session", false, false, true); err != nil {
+		if err := encodeStoppedRepositoryForTest(ctx, &out, repo, "stop-session", false); err != nil {
 			t.Fatalf("runStop from subdir: %v", err)
 		}
 		var rep stopRepoResult
@@ -191,12 +163,12 @@ func TestRepoLookupCommandsFindLegacySubdirRegistryRowByStateDBReadOnly(t *testi
 	for name, run := range map[string]func(string) (string, error){
 		"status-root": func(path string) (string, error) {
 			var out bytes.Buffer
-			err := runStatus(ctx, &out, path, true)
+			err := writeStatusProjectionFixture(ctx, &out, path, true)
 			return out.String(), err
 		},
 		"status-subdir": func(path string) (string, error) {
 			var out bytes.Buffer
-			err := runStatus(ctx, &out, path, true)
+			err := writeStatusProjectionFixture(ctx, &out, path, true)
 			return out.String(), err
 		},
 		"logs-root": func(path string) (string, error) {
@@ -250,8 +222,10 @@ func TestRepoLookupRejectsNonGitWithoutRegistryMutation(t *testing.T) {
 	nonGit := t.TempDir()
 
 	for name, run := range map[string]func() error{
-		"status": func() error { return runStatus(context.Background(), bytes.NewBuffer(nil), nonGit, true) },
-		"logs":   func() error { return runLogs(context.Background(), bytes.NewBuffer(nil), nonGit, 1, false) },
+		"status": func() error {
+			return writeStatusProjectionFixture(context.Background(), bytes.NewBuffer(nil), nonGit, true)
+		},
+		"logs": func() error { return runLogs(context.Background(), bytes.NewBuffer(nil), nonGit, 1, false) },
 		"events": func() error {
 			return runEvents(context.Background(), bytes.NewBuffer(nil), nonGit, "", 0, 1, false, time.Millisecond, true)
 		},

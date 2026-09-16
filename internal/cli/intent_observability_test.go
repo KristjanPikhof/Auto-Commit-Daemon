@@ -208,8 +208,8 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 	}
 
 	var human bytes.Buffer
-	if err := runStatus(ctx, &human, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &human, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	for _, want := range []string{"Last planner window", "offered=4,5", "Hidden/coalesced seqs: 6", "Validation fallback", "Plan preflight", "provider_call_skipped=invalid_local_baseline"} {
 		if !strings.Contains(human.String(), want) {
@@ -218,13 +218,8 @@ func TestStatus_LastPlannerWindowSummary(t *testing.T) {
 	}
 }
 
-// TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator asserts
-// that with 50 decisions of which all 50 are planner errors, the rate is
-// 50/100 = 0.5 (NOT 50/50 = 1.0). Documents the fixed-denominator policy
-// chosen for sub-window ledgers. The warn flag MUST stay false at this
-// row count: see TestStatus_PlannerErrorRateWarnRequiresFullWindow for
-// the gating rationale.
-func TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator(t *testing.T) {
+// Small samples report their actual rate without raising a full-window warning.
+func TestStatus_PlannerErrorRateRecent_HalfWindow_ActualDenominator(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 	repo, dbPath, d := makeRepoStateDB(t)
@@ -244,9 +239,12 @@ func TestStatus_PlannerErrorRateRecent_HalfWindow_FixedDenominator(t *testing.T)
 	}
 
 	report := runStatusJSON(ctx, t, repo)
-	want := 0.5
+	if report.IntentStrategy.PlannerErrorSampleCount != 50 {
+		t.Fatalf("sample count = %d", report.IntentStrategy.PlannerErrorSampleCount)
+	}
+	want := 1.0
 	if got := report.IntentStrategy.PlannerErrorRateRecent; got != want {
-		t.Fatalf("PlannerErrorRateRecent=%v want %v (fixed denominator: 50/%d)",
+		t.Fatalf("PlannerErrorRateRecent=%v want %v (actual denominator: 50/%d)",
 			got, want, IntentRecentDecisionWindow)
 	}
 	if report.IntentStrategy.PlannerErrorRateRecentWarn {
@@ -376,8 +374,8 @@ func TestStatus_SingletonCommitRateRecent_GroupedVsSingle(t *testing.T) {
 	}
 
 	report := runStatusJSON(ctx, t, repo)
-	if got := report.IntentStrategy.SingletonCommitRateRecent; got != 0.06 {
-		t.Fatalf("SingletonCommitRateRecent=%v want 0.06 (6 singletons over fixed window 100)", got)
+	if got := report.IntentStrategy.SingletonCommitRateRecent; got != 0.75 {
+		t.Fatalf("SingletonCommitRateRecent=%v want 0.75 (6 singletons over 8 observed commits)", got)
 	}
 }
 
@@ -512,8 +510,8 @@ func TestIntentStageDiffCap_TunedTo16K(t *testing.T) {
 func runStatusJSON(ctx context.Context, t *testing.T, repo string) statusReport {
 	t.Helper()
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var report statusReport
 	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
@@ -684,8 +682,8 @@ func TestStatus_PlannerErrorRateWarnRequiresFullWindow(t *testing.T) {
 	}
 
 	report := runStatusJSON(ctx, t, repo)
-	if got := report.IntentStrategy.PlannerErrorRateRecent; got != 0.5 {
-		t.Fatalf("PlannerErrorRateRecent=%v want 0.5", got)
+	if got := report.IntentStrategy.PlannerErrorRateRecent; got != 1.0 {
+		t.Fatalf("PlannerErrorRateRecent=%v want 1.0", got)
 	}
 	if report.IntentStrategy.PlannerErrorRateRecentWarn {
 		t.Fatalf("PlannerErrorRateRecentWarn must stay false until ledger reaches %d rows; got true with 50",

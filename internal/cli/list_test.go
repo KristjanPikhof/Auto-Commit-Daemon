@@ -23,8 +23,8 @@ func TestList_HumanOneShotOutputStaysTableOnly(t *testing.T) {
 	withIsolatedHome(t)
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(context.Background(), &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(context.Background(), &stdout, &stderr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr=%q, want empty", stderr.String())
@@ -162,8 +162,8 @@ func TestList_VerboseOnceShowsWideColumns(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, true); err != nil {
-		t.Fatalf("runList verbose: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, true); err != nil {
+		t.Fatalf("writeListProjectionFixture verbose: %v", err)
 	}
 	got := stdout.String()
 	for _, col := range []string{"CLIENTS", "PENDING", "BLOCKED", "LAST_COMMIT"} {
@@ -209,8 +209,8 @@ func TestList_Human_TwoRepos(t *testing.T) {
 	registerRepo(t, roots, repoB, dbB, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	out := stdout.String()
 	if !strings.Contains(out, "REPO") || !strings.Contains(out, "DAEMON") {
@@ -250,8 +250,8 @@ func TestList_JSON_TwoRepos(t *testing.T) {
 	registerRepo(t, roots, repoB, dbB, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -286,8 +286,8 @@ func TestList_StatusColumnShowsManualPause(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, true); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, true); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "paused (manual)") {
 		t.Fatalf("missing manual pause status:\n%s", stdout.String())
@@ -309,8 +309,8 @@ func TestList_StatusColumnShowsRewindGrace(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, true); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, true); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	got := stdout.String()
 	if !strings.Contains(got, "paused (rewind grace, expires in") {
@@ -330,8 +330,8 @@ func TestList_NoPauseShowsOK(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -366,8 +366,8 @@ func TestList_StaleHeartbeatMarked(t *testing.T) {
 	registerRepo(t, roots, repo, db, "claude-code")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "stale") {
 		t.Fatalf("expected stale marker, got:\n%s", stdout.String())
@@ -396,8 +396,8 @@ func TestList_HidesStaleDaemonWithoutLiveClients(t *testing.T) {
 	registerRepo(t, roots, repo, db, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -440,8 +440,8 @@ func TestList_CountsOnlyLiveClients(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -503,8 +503,8 @@ func TestList_PendingAndBlockedFromState(t *testing.T) {
 
 	// Compact human output exposes queue depth and blocked status token.
 	var humanOut, humanErr bytes.Buffer
-	if err := runList(ctx, &humanOut, &humanErr, false, false); err != nil {
-		t.Fatalf("runList human: %v", err)
+	if err := writeListProjectionFixture(ctx, &humanOut, &humanErr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture human: %v", err)
 	}
 	human := humanOut.String()
 	if !strings.Contains(human, "PEND") || !strings.Contains(human, "BLK") || !strings.Contains(human, "blk") {
@@ -513,8 +513,8 @@ func TestList_PendingAndBlockedFromState(t *testing.T) {
 
 	// JSON shape exposes counts as integers and matches the state we wrote.
 	var jsonOut, jsonErr bytes.Buffer
-	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -559,8 +559,8 @@ func TestList_PendingOnlyShowsWaitingNotBlocked(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "claude-code")
 
 	var jsonOut, jsonErr bytes.Buffer
-	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -604,24 +604,24 @@ func TestList_IntentBatchWaitShowsCountdown(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var compactOut, compactErr bytes.Buffer
-	if err := runList(ctx, &compactOut, &compactErr, false, false); err != nil {
-		t.Fatalf("runList compact: %v", err)
+	if err := writeListProjectionFixture(ctx, &compactOut, &compactErr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture compact: %v", err)
 	}
 	if !strings.Contains(compactOut.String(), "wait 1m") {
 		t.Fatalf("compact output missing wait countdown:\n%s", compactOut.String())
 	}
 
 	var verboseOut, verboseErr bytes.Buffer
-	if err := runList(ctx, &verboseOut, &verboseErr, false, true); err != nil {
-		t.Fatalf("runList verbose: %v", err)
+	if err := writeListProjectionFixture(ctx, &verboseOut, &verboseErr, false, true); err != nil {
+		t.Fatalf("writeListProjectionFixture verbose: %v", err)
 	}
 	if !strings.Contains(verboseOut.String(), "intent batch wait: pending=2/3, trigger in 1m") {
 		t.Fatalf("verbose output missing intent wait note:\n%s", verboseOut.String())
 	}
 
 	var jsonOut, jsonErr bytes.Buffer
-	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -668,24 +668,24 @@ func TestList_IntentSettleWaitShowsCountdown(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var compactOut, compactErr bytes.Buffer
-	if err := runList(ctx, &compactOut, &compactErr, false, false); err != nil {
-		t.Fatalf("runList compact: %v", err)
+	if err := writeListProjectionFixture(ctx, &compactOut, &compactErr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture compact: %v", err)
 	}
 	if !strings.Contains(compactOut.String(), "wait") {
 		t.Fatalf("compact output missing wait status:\n%s", compactOut.String())
 	}
 
 	var verboseOut, verboseErr bytes.Buffer
-	if err := runList(ctx, &verboseOut, &verboseErr, false, true); err != nil {
-		t.Fatalf("runList verbose: %v", err)
+	if err := writeListProjectionFixture(ctx, &verboseOut, &verboseErr, false, true); err != nil {
+		t.Fatalf("writeListProjectionFixture verbose: %v", err)
 	}
 	if !strings.Contains(verboseOut.String(), "intent settle wait: pending=2, trigger in") {
 		t.Fatalf("verbose output missing intent settle note:\n%s", verboseOut.String())
 	}
 
 	var jsonOut, jsonErr bytes.Buffer
-	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -745,8 +745,8 @@ func TestList_UnreadableStateShowsBad(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "claude-code")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "bad") {
 		t.Fatalf("expected compact unreadable status bad, got:\n%s", stdout.String())
@@ -766,8 +766,8 @@ func TestList_MissingStateDB_Reported(t *testing.T) {
 	registerRepo(t, roots, repo, db+".doesnotexist", "claude-code")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "miss") {
 		t.Fatalf("expected compact missing status, got:\n%s", stdout.String())
@@ -798,24 +798,24 @@ func TestList_DisabledLifecycleHiddenFromList(t *testing.T) {
 	disableRepoLifecycleForListTest(t, roots, repo)
 
 	var compactOut, compactErr bytes.Buffer
-	if err := runList(ctx, &compactOut, &compactErr, false, false); err != nil {
-		t.Fatalf("runList compact: %v", err)
+	if err := writeListProjectionFixture(ctx, &compactOut, &compactErr, false, false); err != nil {
+		t.Fatalf("writeListProjectionFixture compact: %v", err)
 	}
 	if strings.Contains(compactOut.String(), repo) || strings.Contains(compactOut.String(), "disabled") {
 		t.Fatalf("compact output should hide disabled rows:\n%s", compactOut.String())
 	}
 
 	var verboseOut, verboseErr bytes.Buffer
-	if err := runList(ctx, &verboseOut, &verboseErr, false, true); err != nil {
-		t.Fatalf("runList verbose: %v", err)
+	if err := writeListProjectionFixture(ctx, &verboseOut, &verboseErr, false, true); err != nil {
+		t.Fatalf("writeListProjectionFixture verbose: %v", err)
 	}
 	if strings.Contains(verboseOut.String(), repo) || strings.Contains(verboseOut.String(), "disabled") {
 		t.Fatalf("verbose output should hide disabled rows:\n%s", verboseOut.String())
 	}
 
 	var jsonOut, jsonErr bytes.Buffer
-	if err := runList(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -846,8 +846,8 @@ func TestList_DisabledLifecycleDoesNotOpenMissingStateDB(t *testing.T) {
 	disableRepoLifecycleForListTest(t, roots, repo)
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	if fileExists(dbPath) {
 		t.Fatalf("disabled lifecycle list recreated missing state.db at %s", dbPath)
@@ -909,8 +909,8 @@ func TestList_PausedAndStale_RendersBoth(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, false, true); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, true); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	got := stdout.String()
 	if !strings.Contains(got, "paused") || !strings.Contains(got, "manual") {
@@ -939,8 +939,8 @@ func TestList_JSON_PausedAndStale(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -985,8 +985,8 @@ func TestList_PausedStaleNoClients_StillRendered(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 
 	var stdout, stderr bytes.Buffer
-	if err := runList(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("runList json: %v", err)
+	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture json: %v", err)
 	}
 	var got struct {
 		Repos []listEntry `json:"repos"`
@@ -996,68 +996,6 @@ func TestList_PausedStaleNoClients_StillRendered(t *testing.T) {
 	}
 	if len(got.Repos) != 1 {
 		t.Fatalf("paused-stale repo with no clients was hidden: %+v", got.Repos)
-	}
-}
-
-func TestListWatch_RendersMultipleSnapshotsAndStopsOnCancel(t *testing.T) {
-	withIsolatedHome(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	stdout := newCancelAfterFramesWriter(cancel, 2)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- runListWatch(ctx, stdout, io.Discard, time.Millisecond, false)
-	}()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("runListWatch: %v", err)
-		}
-		if stdout.frameCount() < 2 {
-			t.Fatalf("watch exited before two frames:\n%s", stdout.String())
-		}
-	case <-stdout.done:
-	}
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("runListWatch after cancel: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("runListWatch did not stop after context cancellation")
-	}
-
-	got := stdout.String()
-	if strings.Count(got, "Updated:") < 2 {
-		t.Fatalf("watch output missing repeated timestamps:\n%s", got)
-	}
-	if strings.Count(got, "\033[2J\033[H") < 2 {
-		t.Fatalf("watch output missing repeated redraw escapes:\n%q", got)
-	}
-	if strings.Count(got, "REPO") < 2 {
-		t.Fatalf("watch output missing repeated table renders:\n%s", got)
-	}
-	if !strings.Contains(got, "PEND") || strings.Contains(got, "PENDING\t") {
-		t.Fatalf("watch frames should use compact headers:\n%s", got)
-	}
-}
-
-func TestListWatch_AlreadyCanceledContextReturnsNil(t *testing.T) {
-	withIsolatedHome(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	var stdout bytes.Buffer
-	if err := runListWatch(ctx, &stdout, io.Discard, time.Millisecond, false); err != nil {
-		t.Fatalf("runListWatch: %v", err)
-	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout=%q, want empty for pre-canceled context", stdout.String())
 	}
 }
 

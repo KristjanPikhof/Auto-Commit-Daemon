@@ -106,24 +106,6 @@ func pauseInfoFromMarker(marker pausepkg.Marker, now time.Time) (*pauseInfo, err
 	return info, nil
 }
 
-func pauseStatusNote(info *pauseInfo) string {
-	if info == nil {
-		return ""
-	}
-	switch info.Source {
-	case "manual":
-		return "manual"
-	case "manual_expired":
-		return "manual pause expired (marker still on disk; run acd resume --yes to remove)"
-	case "rewind_grace":
-		if info.ExpiresAt != "" {
-			return "rewind grace, expires in " + formatDurationCompact(time.Duration(info.RemainingSeconds)*time.Second)
-		}
-		return "rewind grace"
-	}
-	return strings.ReplaceAll(info.Source, "_", " ")
-}
-
 // gitDirFromStateDB returns the gitDir that owns a per-repo state.db. It
 // pins the on-disk layout `<gitDir>/acd/state.db`. Any change to that layout
 // must update this helper and the table-driven test that asserts it.

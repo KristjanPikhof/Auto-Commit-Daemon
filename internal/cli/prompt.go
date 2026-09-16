@@ -92,14 +92,28 @@ opening or migrating state.db. With no selector, --last is implied.`,
 }
 
 func runPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq int64, jsonOut bool) error {
+	report, err := collectPrompt(ctx, repo, last, seq)
+	if err != nil {
+		return err
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(report)
+	}
+	return renderPromptHuman(out, report)
+}
+
+func collectPrompt(ctx context.Context, repo string, last bool, seq int64) (promptReport, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if seq < 0 {
-		return fmt.Errorf("acd prompt: --seq must be non-negative")
+		return promptReport{}, fmt.Errorf("acd prompt: --seq must be non-negative")
 	}
 	if last && seq > 0 {
-		return fmt.Errorf("acd prompt: choose only one of --last or --seq")
+		return promptReport{}, fmt.Errorf("acd prompt: choose only one of --last or --seq")
 	}
 	if !last && seq == 0 {
 		last = true
@@ -107,21 +121,16 @@ func runPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq i
 
 	rec, err := promptRepoRecord(repo)
 	if err != nil {
-		return err
+		return promptReport{}, err
 	}
 	gitDir := gitDirFromStateDB(rec.StateDB)
 	traceDir := prompttrace.Dir(gitDir)
 	group, hasTraces, err := selectPromptGroup(ctx, traceDir, last, seq)
 	if err != nil {
-		return fmt.Errorf("acd prompt: read prompt trace: %w", err)
+		return promptReport{}, fmt.Errorf("acd prompt: read prompt trace: %w", err)
 	}
 	report := buildPromptReport(rec.Path, traceDir, group, hasTraces, last, seq)
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(report)
-	}
-	return renderPromptHuman(out, report)
+	return report, nil
 }
 
 func promptRepoRecord(repo string) (repoRecord, error) {

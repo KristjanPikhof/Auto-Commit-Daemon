@@ -3,6 +3,7 @@ package version
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"os"
 	"regexp"
 	"strconv"
@@ -24,12 +25,16 @@ func String() string {
 // FileDigest identifies the exact executable bytes independently of build
 // metadata. This lets local dirty builds replace an older compatible runtime.
 func FileDigest(path string) (string, error) {
-	body, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256(body)
-	return hex.EncodeToString(digest[:]), nil
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 // Compare reports whether left is older (-1), equal (0), or newer (1) than

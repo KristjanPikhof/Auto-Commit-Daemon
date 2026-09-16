@@ -109,6 +109,22 @@ configuration revision, and provider identity. A restart therefore continues
 the same publication contract instead of reinterpreting Intent work as Event
 work.
 
+## Publication evaluation and capture
+
+The repository worker remains the sole authority for Git and durable lifecycle
+changes. It prepares immutable provider, materialization, and verification
+inputs; a bounded background evaluation performs that slow call in isolation.
+While it waits, the worker releases the operation gate and services watcher,
+checkpoint, and polling work through protection-only checkpoints. These snapshots
+save the exact file bytes without changing the active capture membership or
+shadow baseline. Normal capture classifies those edits after evaluation returns.
+
+Only one evaluation runs per worktree. The runtime lease remains alive until it
+finishes or cancellation joins it. Before applying a result, the worker reacquires
+the gate and verifies branch, candidate, configuration, and restore evidence.
+Stale results are discarded. Later protected edits do not invalidate the frozen
+target. Referenced checkpoints and recovery records remain retained.
+
 ## Publication
 
 Event strategy retains one captured change per local commit. Intent strategy

@@ -75,11 +75,15 @@ INSERT INTO capture_events(
 		ctx, db, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, 2); err != nil {
 		t.Fatal(err)
 	}
+	approvedIndex, err := git.IndexContentDigest(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 	drain := state.PublicationDrain{
 		ID: "drain-publication-self-healing", CheckpointID: checkpoint.ID,
 		WorktreeID: checkpoint.WorktreeID, BranchRef: checkpoint.ObservedRef,
 		BranchGeneration: 7, Phase: state.PublicationDrainCheckpointing,
-		TargetEventCount: 2, StagedConsent: true,
+		TargetEventCount: 2, StagedConsent: true, ExpectedIndexDigest: approvedIndex,
 		CreatedTS: 3, UpdatedTS: 3, LastProgressTS: 3,
 		EventSeqs: targetSeqs,
 	}

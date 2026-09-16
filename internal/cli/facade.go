@@ -1,9 +1,9 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,7 +32,8 @@ type productDoctorSettings struct {
 }
 
 func newProductStatusCmd() *cobra.Command {
-	return &cobra.Command{
+	var verbose bool
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show protection, Git publication, and the next step",
 		Long: `Show whether ACD is running, whether current changes are protected,
@@ -47,9 +48,26 @@ the exact next command to run.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runControlStatus(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
+			if !verbose || jsonOut {
+				return runControlStatus(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
+			}
+			result, err := inspectControl(cmd.Context(), repo)
+			if err != nil {
+				return err
+			}
+			if err := renderControl(cmd.OutOrStdout(), result, false); err != nil {
+				return err
+			}
+			renderProductPublicationProgress(cmd.OutOrStdout(), result.PublicationProgress)
+			renderProductDoctorWorker(cmd.OutOrStdout(), result)
+			if !result.OK {
+				return actionRequiredError("needs_action", result.Summary)
+			}
+			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include queue, provider, phase, and worker details")
+	return cmd
 }
 
 func newProductDoctorCmd() *cobra.Command {
@@ -171,18 +189,26 @@ func runProductDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut
 	if !jsonOut {
 		return runDiagnose(ctx, out, repo, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runDiagnose(ctx, raw, repo, true)
-	})
+	report, err := collectDiagnose(ctx, repo)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateProtected, report)
 }
 
 func runProductDoctorBundle(ctx context.Context, out io.Writer, output string, jsonOut bool) error {
 	if !jsonOut {
 		return runDoctor(ctx, out, true, output, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runDoctor(ctx, raw, true, output, true)
-	})
+	report, err := collectDoctorReport(ctx)
+	if err != nil {
+		return fmt.Errorf("acd doctor: collect: %w", err)
+	}
+	bundle, err := writeDoctorBundle(ctx, report, output)
+	if err != nil {
+		return fmt.Errorf("acd doctor: bundle: %w", err)
+	}
+	return renderAdvancedResult(out, productStateProtected, bundle)
 }
 
 func runProductExplain(
@@ -197,18 +223,24 @@ func runProductExplain(
 	if !jsonOut {
 		return runExplain(ctx, out, repo, path, commit, last, since, limit, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runExplain(ctx, raw, repo, path, commit, last, since, limit, true)
-	})
+	report, err := collectExplain(ctx, repo, path, commit, last, since, limit)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateProtected, report)
 }
 
 func runProductRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
 	if !jsonOut {
 		return runRepoList(ctx, out, false)
 	}
-	return renderAdvancedJSON(out, productStateOff, func(raw io.Writer) error {
-		return runRepoList(ctx, raw, true)
-	})
+	entries, err := collectRepoList(ctx)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateOff, struct {
+		Repos []repoListEntry `json:"repos"`
+	}{Repos: entries})
 }
 
 func runProductEvents(
@@ -224,27 +256,33 @@ func runProductEvents(
 	if !jsonOut {
 		return runEvents(ctx, out, repo, path, since, limit, watch, interval, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runEvents(ctx, raw, repo, path, since, limit, false, interval, true)
-	})
+	report, err := collectEvents(ctx, repo, path, since, limit)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateProtected, report)
 }
 
 func runProductPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq int64, jsonOut bool) error {
 	if !jsonOut {
 		return runPrompt(ctx, out, repo, last, seq, false)
 	}
-	return renderAdvancedJSON(out, productStateProtected, func(raw io.Writer) error {
-		return runPrompt(ctx, raw, repo, last, seq, true)
-	})
+	report, err := collectPrompt(ctx, repo, last, seq)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateProtected, report)
 }
 
 func runProductStats(ctx context.Context, out io.Writer, since string, jsonOut bool) error {
 	if !jsonOut {
 		return runStats(ctx, out, since, false)
 	}
-	return renderAdvancedJSON(out, productStateOff, func(raw io.Writer) error {
-		return runStats(ctx, raw, since, true)
-	})
+	report, err := collectStats(ctx, since)
+	if err != nil {
+		return err
+	}
+	return renderAdvancedResult(out, productStateOff, report)
 }
 
 func runProductFix(
@@ -256,21 +294,39 @@ func runProductFix(
 	if !jsonOut {
 		return runFix(ctx, out, repo, dryRun, yes, force, clearPause, false)
 	}
-	return renderAdvancedJSON(out, productStateNeedsAction, func(raw io.Writer) error {
-		return runFix(ctx, raw, repo, dryRun, yes, force, clearPause, true)
-	})
+	plan, err := executeFix(ctx, repo, dryRun, yes, force, clearPause)
+	if plan == nil {
+		return err
+	}
+	if err == nil {
+		return renderAdvancedResult(out, productStateNeedsAction, plan)
+	}
+	commandErr := &CommandError{Code: "recovery_failed", Message: err.Error(), Exit: ExitCode(err)}
+	var existing *CommandError
+	if errors.As(err, &existing) {
+		*commandErr = *existing
+	}
+	if renderErr := renderJSONEnvelope(out, productEnvelope{
+		OK: false, State: productStateNeedsAction, Actions: []productAction{}, Data: plan,
+		Error: &productError{Code: commandErr.Code, Message: commandErr.Message,
+			Retryable: commandErr.Retryable, Details: commandErr.Details},
+	}); renderErr != nil {
+		return renderErr
+	}
+	commandErr.rendered = true
+	return commandErr
 }
 
 func runProductLogs(ctx context.Context, out io.Writer, repo string, lines int, follow, jsonOut bool) error {
 	if !jsonOut {
 		return runLogs(ctx, out, repo, lines, follow)
 	}
-	var raw bytes.Buffer
-	if err := runLogs(ctx, &raw, repo, lines, false); err != nil {
+	tail, _, _, err := collectLogTail(repo, lines)
+	if err != nil {
 		return err
 	}
-	logLines := []string{}
-	for _, line := range strings.Split(strings.TrimSuffix(raw.String(), "\n"), "\n") {
+	logLines := make([]string, 0, len(tail))
+	for _, line := range tail {
 		if line != "" {
 			logLines = append(logLines, line)
 		}
@@ -279,29 +335,22 @@ func runProductLogs(ctx context.Context, out io.Writer, repo string, lines int, 
 		Actions: []productAction{}, Data: map[string]any{"lines": logLines}})
 }
 
-func renderAdvancedJSON(out io.Writer, stateName productState, render func(io.Writer) error) error {
-	var raw bytes.Buffer
-	if err := render(&raw); err != nil {
-		return err
-	}
-	var data any = map[string]any{}
-	if err := json.Unmarshal(raw.Bytes(), &data); err != nil {
-		return fmt.Errorf("acd: decode advanced JSON result: %w", err)
-	}
-	return renderJSONEnvelope(out, productEnvelope{
-		OK: true, State: stateName, Actions: []productAction{}, Data: data,
-	})
+func renderAdvancedResult(out io.Writer, stateName productState, data any) error {
+	return renderJSONEnvelope(out, productEnvelope{OK: true, State: stateName, Actions: []productAction{}, Data: data})
 }
 
 type historyEntry struct {
-	ID         string  `json:"id"`
-	Sequence   int64   `json:"sequence"`
-	Reason     string  `json:"reason"`
-	Phase      string  `json:"phase"`
-	CreatedTS  float64 `json:"created_ts"`
-	CommitOID  string  `json:"checkpoint_commit_oid"`
-	Published  bool    `json:"published"`
-	EventCount int     `json:"event_count"`
+	Retained        bool    `json:"retained"`
+	Outcome         string  `json:"outcome"`
+	RecoveredEvents int     `json:"recovered_events"`
+	ID              string  `json:"id"`
+	Sequence        int64   `json:"sequence"`
+	Reason          string  `json:"reason"`
+	Phase           string  `json:"phase"`
+	CreatedTS       float64 `json:"created_ts"`
+	CommitOID       string  `json:"checkpoint_commit_oid"`
+	Published       bool    `json:"published"`
+	EventCount      int     `json:"event_count"`
 }
 
 func newHistoryCmd() *cobra.Command {
@@ -328,17 +377,11 @@ apply a reviewed rewrite plan.`,
 					return runEvents(cmd.Context(), cmd.OutOrStdout(), repo, "", 0,
 						defaultEventsLimit, false, defaultEventsWatchInterval, false)
 				}
-				var legacy bytes.Buffer
-				if err := runEvents(cmd.Context(), &legacy, repo, "", 0,
-					defaultEventsLimit, false, defaultEventsWatchInterval, true); err != nil {
+				report, err := collectEvents(cmd.Context(), repo, "", 0, defaultEventsLimit)
+				if err != nil {
 					return err
 				}
-				var activityData any = map[string]any{}
-				if err := json.Unmarshal(legacy.Bytes(), &activityData); err != nil {
-					return fmt.Errorf("acd history --activity: decode activity: %w", err)
-				}
-				return renderJSONEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true,
-					State: productStateProtected, Actions: []productAction{}, Data: activityData})
+				return renderAdvancedResult(cmd.OutOrStdout(), productStateProtected, report)
 			}
 			return runCheckpointHistory(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
 		},
@@ -354,27 +397,28 @@ apply a reviewed rewrite plan.`,
 	return cmd
 }
 
-func runCheckpointHistory(ctx context.Context, out io.Writer, repo string, jsonOut bool) error {
+func loadCheckpointHistory(ctx context.Context, repo string) ([]historyEntry, error) {
 	record, _, _, err := lookupRegisteredRepo("history", repo)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	projection, err := state.ReadCheckpointProjection(ctx, record.StateDB, 100)
 	if err != nil {
-		return fmt.Errorf("acd history: %w", err)
+		return nil, fmt.Errorf("acd history: %w", err)
 	}
 	if !projection.Available {
-		return fmt.Errorf("acd history: checkpoint history is unavailable; run `acd setup` to cut over this repository")
+		return nil, fmt.Errorf("acd history: checkpoint history is unavailable; run `acd setup` to cut over this repository")
 	}
 	db, err := openStateDBReadOnly(ctx, record.StateDB)
 	if err != nil {
-		return fmt.Errorf("acd history: open state.db read-only: %w", err)
+		return nil, fmt.Errorf("acd history: open state.db read-only: %w", err)
 	}
 	defer db.Close()
 	rows, err := db.QueryContext(ctx, `
-SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid,
+SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid, cp.retained,
        COUNT(ce.event_seq),
-       COALESCE(SUM(CASE WHEN e.state='published' THEN 1 ELSE 0 END), 0)
+       COALESCE(SUM(CASE WHEN e.state='published' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN e.state='recovered' THEN 1 ELSE 0 END), 0)
 FROM checkpoints cp
 LEFT JOIN checkpoint_events ce ON ce.checkpoint_id=cp.id
 LEFT JOIN capture_events e ON e.seq=ce.event_seq
@@ -382,7 +426,7 @@ GROUP BY cp.id
 ORDER BY cp.seq DESC
 LIMIT 100`)
 	if err != nil {
-		return fmt.Errorf("acd history: query checkpoints: %w", err)
+		return nil, fmt.Errorf("acd history: query checkpoints: %w", err)
 	}
 	defer rows.Close()
 	entries := make([]historyEntry, 0)
@@ -390,15 +434,24 @@ LIMIT 100`)
 		var entry historyEntry
 		var publishedEvents int
 		if err := rows.Scan(&entry.ID, &entry.Sequence, &entry.Reason,
-			&entry.Phase, &entry.CreatedTS, &entry.CommitOID,
-			&entry.EventCount, &publishedEvents); err != nil {
-			return fmt.Errorf("acd history: scan checkpoint: %w", err)
+			&entry.Phase, &entry.CreatedTS, &entry.CommitOID, &entry.Retained,
+			&entry.EventCount, &publishedEvents, &entry.RecoveredEvents); err != nil {
+			return nil, fmt.Errorf("acd history: scan checkpoint: %w", err)
 		}
 		entry.Published = entry.Phase == state.CheckpointCompleted && publishedEvents == entry.EventCount
+		entry.Outcome = checkpointOutcome(entry.Phase, entry.EventCount, publishedEvents, entry.RecoveredEvents)
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("acd history: iterate checkpoints: %w", err)
+		return nil, fmt.Errorf("acd history: iterate checkpoints: %w", err)
+	}
+	return entries, nil
+}
+
+func runCheckpointHistory(ctx context.Context, out io.Writer, repo string, jsonOut bool) error {
+	entries, err := loadCheckpointHistory(ctx, repo)
+	if err != nil {
+		return err
 	}
 	if jsonOut {
 		envelope := productEnvelope{
@@ -415,12 +468,8 @@ LIMIT 100`)
 	}
 	fmt.Fprintln(out, "CHECKPOINT\tWHEN\tREASON\tGIT")
 	for _, entry := range entries {
-		published := "waiting"
-		if entry.Published {
-			published = "published"
-		}
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", entry.ID,
-			time.Unix(int64(entry.CreatedTS), 0).Format(time.RFC3339), entry.Reason, published)
+			time.Unix(int64(entry.CreatedTS), 0).Format(time.RFC3339), entry.Reason, entry.Outcome)
 	}
 	return nil
 }
@@ -458,7 +507,7 @@ func newConfigCredentialsCmd() *cobra.Command {
 	}
 	for _, child := range credentials.Commands() {
 		child.Example = strings.ReplaceAll(child.Example, "acd auth", "acd config credentials")
-		capabilities := commandCapabilities{Quiet: true, Interactive: true}
+		capabilities := commandCapabilities{Quiet: true, Interactive: true, Repository: child.Name() == "set"}
 		if child.Name() == "status" {
 			child.RunE = credentials.RunE
 			capabilities.JSON = true

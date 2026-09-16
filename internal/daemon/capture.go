@@ -100,14 +100,18 @@ const MetaKeyCaptureBackpressurePausedAt = "capture.backpressure_paused_at"
 const MetaKeyCaptureEventsDroppedTotal = "capture.events_dropped_total"
 
 const (
-	MetaKeyProtectionObservationEpoch    = "protection.observation_epoch"
-	MetaKeyProtectionCoveredEpoch        = "protection.covered_epoch"
-	MetaKeyProtectionCheckpointID        = "protection.checkpoint_id"
-	MetaKeyProtectionComplete            = "protection.complete"
-	MetaKeyProtectionRetentionOverBudget = "protection.retention_over_budget"
-	MetaKeyProtectionFullPollTS          = "protection.full_poll_ts"
-	MetaKeyProtectionWatcherQueueDepth   = "protection.watcher_queue_depth"
-	MetaKeyProtectionTreeDigest          = "protection.tree_digest"
+	MetaKeyProtectionObservationEpoch         = "protection.observation_epoch"
+	MetaKeyProtectionCoveredEpoch             = "protection.covered_epoch"
+	MetaKeyProtectionCheckpointID             = "protection.checkpoint_id"
+	MetaKeyProtectionComplete                 = "protection.complete"
+	MetaKeyProtectionRetentionOverBudget      = "protection.retention_over_budget"
+	MetaKeyProtectionFullPollTS               = "protection.full_poll_ts"
+	MetaKeyProtectionWatcherQueueDepth        = "protection.watcher_queue_depth"
+	MetaKeyProtectionTreeDigest               = "protection.tree_digest"
+	MetaKeyProtectionClassificationPending    = "protection.classification_pending"
+	MetaKeyProtectionClassificationCheckpoint = "protection.classification_checkpoint_id"
+	MetaKeyProtectionClassificationEpoch      = "protection.classification_epoch"
+	metaProtectionClassifiedDigest            = "protection.classified_tree_digest"
 )
 
 func requiredProtectionCheckpointEpochKey(worktreeID string) string {
@@ -176,10 +180,7 @@ type CaptureSummary struct {
 	Protected bool
 }
 
-// CaptureContext carries the per-pass repository identity that the legacy
-// daemon calls "ctx" (branch_ref, branch_generation, base_head). Phase 1
-// keeps this struct small and lets the run loop populate it; the
-// branch-generation token implementation lives elsewhere (§8.9).
+// CaptureContext carries the repository identity frozen at the start of a pass.
 type CaptureContext struct {
 	BranchRef        string
 	BranchGeneration int64
@@ -809,6 +810,21 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			summary.PendingDepth = pending
 			updatePendingHighWater(ctx, db, pending)
 		}
+		if len(ownedOps) == len(ops) {
+			_, digest := checkpointEntries(live)
+			covered, _, err := state.MetaGet(ctx, db, MetaKeyProtectionCoveredEpoch)
+			if err != nil {
+				return summary, err
+			}
+			if err := state.MetaSetMany(ctx, db, map[string]string{
+				metaProtectionClassifiedDigest:            digest,
+				MetaKeyProtectionClassificationPending:    "false",
+				MetaKeyProtectionClassificationCheckpoint: summary.CheckpointID,
+				MetaKeyProtectionClassificationEpoch:      covered,
+			}); err != nil {
+				return summary, err
+			}
+		}
 		ops = nil
 	}
 
@@ -1199,6 +1215,21 @@ func requiredProtectionCheckpointEpoch(
 }
 
 func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID, liveDigest string) error {
+	classified, _, err := state.MetaGet(ctx, db, metaProtectionClassifiedDigest)
+	if err != nil {
+		return err
+	}
+	// A protected tree is not evidence that its newest edits have entered the
+	// publication queue. Persist that distinction before reporting coverage.
+	if classified != liveDigest {
+		if err := state.MetaSetMany(ctx, db, map[string]string{
+			MetaKeyProtectionClassificationPending:    "true",
+			MetaKeyProtectionClassificationCheckpoint: checkpointID,
+			MetaKeyProtectionClassificationEpoch:      strconv.FormatInt(epoch, 10),
+		}); err != nil {
+			return err
+		}
+	}
 	values := []struct {
 		key   string
 		value string

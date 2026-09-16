@@ -133,12 +133,14 @@ func replayIntentCandidateBatch(
 			repoRoot, opts.GitDir, parent),
 		VerificationMode:    opts.IntentVerificationMode,
 		Verify:              opts.IntentCandidateVerify,
+		ManagedVerification: opts.ManagedVerification,
 		Now:                 time.Now().UTC(),
 		TargetEventSeqs:     cfg.targetEventSeqs,
 		RejectLocalFallback: cfg.semanticSalvage,
 		RecoveryCandidateID: cfg.forwardRecoveryCandidateID,
 	})
 	sum.PlanFingerprint = evaluation.PlanFingerprint
+	sum.PlannerFailure = evaluation.PlannerFailure
 	if cfg.forwardRecoveryPlanFingerprint != "" {
 		// Local unlock evaluates a collapsed prefix, which has its own planner
 		// fingerprint. Recovery must continue naming the immutable semantic plan
@@ -354,7 +356,7 @@ func replayIntentCandidateBatch(
 		}
 	}
 	if !publishedAny {
-		messageRewriteWait := evaluation.Fallback == "waiting_message_rewrite"
+		messageRewriteWait := evaluation.Fallback == "waiting_message_rewrite" || evaluation.Fallback == "waiting_for_ai"
 		if !messageRewriteWait && !evaluation.VerificationDeferred &&
 			forced && len(items) == 1 &&
 			opts.PublicationDrain == nil &&
@@ -370,6 +372,9 @@ func replayIntentCandidateBatch(
 		sum.Skipped = true
 		if messageRewriteWait {
 			sum.SkippedReason = "intent_v2_waiting_message_rewrite"
+			if evaluation.Fallback == "waiting_for_ai" {
+				sum.SkippedReason = "intent_v2_waiting_for_ai"
+			}
 			sum.Disposition = ReplayDispositionTransientWait
 			sum.DispositionReason = evaluation.PlannerFailure
 			// Active drains and forward recovery own a frozen target and need an

@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -754,6 +755,10 @@ var (
 // TestMain removes package-scoped binary and repository fixtures after the
 // suite completes so /tmp stays clean.
 func TestMain(m *testing.M) {
+	flag.Parse()
+	if flag.Lookup("test.list").Value.String() != "" {
+		os.Exit(m.Run())
+	}
 	if runCheckpointRuntimeWatchdog() {
 		return
 	}
@@ -1050,7 +1055,9 @@ func runPTYCommand(t *testing.T, ctx context.Context, env []string, cols, rows i
 	if runtime.GOOS == "darwin" {
 		scriptArgs = append([]string{"-q", "/dev/null"}, commandArgs...)
 	} else {
-		scriptArgs = []string{"-q", "-c", shellJoin(commandArgs), "/dev/null"}
+		// util-linux script otherwise reports its own success even when the
+		// child declines approval, fails, or exits on a signal.
+		scriptArgs = []string{"-q", "-e", "-c", shellJoin(commandArgs), "/dev/null"}
 	}
 	cmd := exec.CommandContext(ctx, "script", scriptArgs...)
 	cmd.Env = env
@@ -1205,6 +1212,28 @@ func writeFile(t *testing.T, path, body string) {
 	}
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// writeFileAtomically presents one complete save to a running watcher. Use it
+// when a scenario requires one capture per edit rather than intermediate writes.
+func writeFileAtomically(t *testing.T, repo, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Keep preparation outside the watched worktree and on the same filesystem.
+	file, err := os.CreateTemp(filepath.Join(repo, ".git"), "integration-write-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Name())
+	_, writeErr := file.WriteString(body)
+	if err := errors.Join(writeErr, file.Chmod(0o644), file.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1425,7 +1454,9 @@ func SeedFlushRequests(t *testing.T, dbPath string, n int) {
 		sb.WriteString("; ")
 	}
 	sb.WriteString("COMMIT;")
-	if out, err := exec.Command("sqlite3", dbPath, sb.String()).CombinedOutput(); err != nil {
+	cmd := exec.Command("sqlite3", dbPath)
+	cmd.Stdin = strings.NewReader(sb.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("seed flush_requests: %v\n%s", err, out)
 	}
 }

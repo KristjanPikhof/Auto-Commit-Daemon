@@ -1,23 +1,8 @@
 //go:build integration
 // +build integration
 
-// ai_providers_test.go drives §10 (AI providers) end-to-end through the
-// real `acd` binary. The daemon picks up ACD_AI_* from the inherited
-// process environment (start.go does not strip env on spawn), so each
-// scenario simply passes the relevant env vars on `acd start`.
-//
-// Coverage:
-//
-//  1. Deterministic default (ACD_AI_PROVIDER unset)         — TestAI_DeterministicDefault
-//  2. openai-compat against a mock HTTP server (success)    — TestAI_OpenAICompatMockSuccess
-//  3. openai-compat 5xx -> deterministic fallback           — TestAI_OpenAICompat5xxFallback
-//  4. conventional mode wrong-format response -> fallback    — TestAI_OpenAICompatConventionalWrongFormatFallback
-//  5. Subprocess plugin happy path                          — TestAI_SubprocessPluginHappyPath
-//  6. Subprocess plugin timeout (ACD_AI_TIMEOUT=300ms)      — TestAI_SubprocessPluginTimeoutFallback
-//  7. Subprocess plugin crash + respawn between events      — TestAI_SubprocessPluginCrashRespawn
-//
-// Plugin tests are skipped on Windows (the bash shebang trick is not
-// portable; v1 ships no Windows support anyway per D1).
+// Exercise provider behavior through the real CLI, isolated runtime settings,
+// deterministic HTTP mocks, and subprocess plugins.
 package integration_test
 
 import (
@@ -27,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -246,10 +232,8 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 	}
 }
 
-// TestAI_OpenAICompat5xxFallback: the mock returns HTTP 500. The daemon
-// must fall back to the deterministic "Add <basename>" subject and log
-// a warning containing the upstream status.
-func TestAI_OpenAICompat5xxFallback(t *testing.T) {
+// A temporary provider failure preserves a checkpoint and schedules AI retry.
+func TestAI_OpenAICompat5xxWaitsForAI(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -281,12 +265,8 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	writeFile(t, filepath.Join(repo, "boom.txt"), "5xx fallback\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "ai-5xx")
-	waitHeadAdvances(t, repo, startHead, 8*time.Second)
+	assertProviderWaitPreservesCheckpoint(t, repo, "boom.txt", "5xx fallback\n", startHead)
 
-	subj := headSubject(t, repo)
-	if subj != "Add boom.txt" {
-		t.Fatalf("subject=%q want deterministic 'Add boom.txt' (server hits=%d)", subj, hits.Load())
-	}
 	if hits.Load() == 0 {
 		t.Fatalf("mock never received a request; daemon never tried openai-compat")
 	}
@@ -297,11 +277,8 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 	}
 }
 
-// TestAI_OpenAICompatConventionalWrongFormatFallback proves that conventional
-// mode validates provider output end-to-end. A 200 OK response with the old
-// imperative subject format must not publish as-is; replay falls back to the
-// deterministic conventional message instead.
-func TestAI_OpenAICompatConventionalWrongFormatFallback(t *testing.T) {
+// Invalid message format must wait for a valid AI message without downgrading.
+func TestAI_OpenAICompatConventionalWrongFormatWaitsForAI(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -357,14 +334,12 @@ func TestAI_OpenAICompatConventionalWrongFormatFallback(t *testing.T) {
 	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	writeFile(t, filepath.Join(repo, "format-bad.txt"), "wrong format fallback\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "ai-conventional-format")
-	waitHeadAdvances(t, repo, startHead, 8*time.Second)
+	assertProviderWaitPreservesCheckpoint(t, repo, "format-bad.txt", "wrong format fallback\n", startHead)
 
 	if hits.Load() == 0 {
 		t.Fatalf("mock never received a request; daemon never tried openai-compat")
 	}
-	if subj := headSubject(t, repo); subj != "chore: add format-bad.txt" {
-		t.Fatalf("subject=%q want conventional deterministic fallback", subj)
-	}
+
 }
 
 // TestAI_OpenAICompatReceivesCapturedDiff: end-to-end coverage that the
@@ -552,11 +527,8 @@ done
 	}
 }
 
-// TestAI_SubprocessPluginTimeoutFallback: a plugin that sleeps longer
-// than ACD_AI_TIMEOUT must not wedge the daemon. The 300ms cap ensures
-// the test completes in well under 2s; the commit subject must be the
-// deterministic fallback.
-func TestAI_SubprocessPluginTimeoutFallback(t *testing.T) {
+// A timed-out plugin must keep its capture protected and retry the provider.
+func TestAI_SubprocessPluginTimeoutWaitsForAI(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available; subprocess plugin tests skipped")
@@ -589,12 +561,8 @@ done
 	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	writeFile(t, filepath.Join(repo, "slowplug.txt"), "timeout-test\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "ai-timeout")
-	waitHeadAdvances(t, repo, startHead, 10*time.Second)
+	assertProviderWaitPreservesCheckpoint(t, repo, "slowplug.txt", "timeout-test\n", startHead)
 
-	subj := headSubject(t, repo)
-	if subj != "Add slowplug.txt" {
-		t.Fatalf("subject=%q want deterministic fallback 'Add slowplug.txt'", subj)
-	}
 }
 
 // TestAI_SubprocessPluginCrashRespawn: a plugin that exits cleanly after
@@ -667,5 +635,30 @@ exit 0
 	}
 	if !hasPluginSubject {
 		t.Fatalf("no commit carried the plugin subject 'first ok'; subjects=%v", subjects)
+	}
+}
+
+// Verify failure after a real provider call, then prove exact retained bytes
+// and no branch mutation rather than accepting a generic fallback commit.
+func assertProviderWaitPreservesCheckpoint(t *testing.T, repo, path, body, head string) {
+	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitFor(t, "durable provider retry", 8*time.Second, func() bool {
+		raw := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
+		var health struct {
+			State   string  `json:"state"`
+			Failure string  `json:"last_failure_class"`
+			Opened  float64 `json:"opened_ts"`
+			Retry   float64 `json:"next_probe_ts"`
+		}
+		return json.Unmarshal([]byte(raw), &health) == nil && health.State == "open" && health.Failure == "transport" && health.Retry > health.Opened
+	})
+	waitForEventState(t, dbPath, path, "pending", 5*time.Second)
+	ref := sqliteScalar(t, dbPath, "SELECT checkpoint_ref FROM checkpoints WHERE phase='completed' AND retained=1 ORDER BY seq DESC LIMIT 1")
+	if ref == "" || runGitOK(t, repo, "show", ref+":"+path) != body {
+		t.Fatalf("provider wait did not retain exact checkpoint bytes for %s", path)
+	}
+	if got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); got != head {
+		t.Fatalf("provider failure changed HEAD: %s want %s", got, head)
 	}
 }

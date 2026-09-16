@@ -80,7 +80,8 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // immutable Intent repair membership and zero-member seals for historical
 // repairs without inventing historical membership. v25 freezes the runtime
 // strategy, active revision, and provider used by publication drains. v26
-// adds grouped history rewrite plans while retaining legacy commit rows.
+// adds grouped history rewrite plans while retaining legacy commit rows. v27
+// adds the approved index digest without inventing consent for older drains.
 // New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
@@ -116,6 +117,19 @@ func (d *DB) Migrate(ctx context.Context) error {
 }
 
 func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
+	if cur < 28 {
+		if err := addColumnIfMissing(ctx, tx, "publication_drains", "reason_evidence", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+		if err := addColumnIfMissing(ctx, tx, "publication_drains", "reason_code", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	if cur < 27 {
+		if err := addColumnIfMissing(ctx, tx, "publication_drains", "expected_index_digest", "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
 	if cur < 6 {
 		rebuilt, err := migrateDecisionRecordsV6(ctx, tx)
 		if err != nil {
