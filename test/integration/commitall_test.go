@@ -5,6 +5,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 )
 
 func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
@@ -22,6 +25,7 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	}
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	var plannerCalls atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(
 		w http.ResponseWriter, r *http.Request,
@@ -46,6 +50,11 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 			}})
 			return
 		}
+		if active := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM publication_drains WHERE phase='semantic' AND target_event_count=1"); active != "1" {
+			t.Errorf("second planner call preceded the explicit commit-all target: active drains=%s", active)
+			http.Error(w, "explicit publication target required", http.StatusBadRequest)
+			return
+		}
 		writeNativeIntentCandidatesResponse(t, w, "call_forced", []map[string]any{
 			nativeReadyIntentCandidate("forced-ready", seqs,
 				"Commit forced capture", "", "commit-all forces the complete capture"),
@@ -58,7 +67,10 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
 		"ACD_INTENT_WINDOW=10",
-		"ACD_INTENT_MIN_PENDING=1",
+		// One soft boundary starts the initial plan. Ordinary wakes then wait
+		// for another capture; only commit-all bypasses that batch threshold.
+		"ACD_INTENT_MIN_PENDING=2",
+		"ACD_INTENT_DEFER_LIMIT=2",
 		"ACD_INTENT_SETTLE_WINDOW=0",
 		"ACD_INTENT_MAX_PENDING_AGE=5m",
 		"ACD_AI_PROVIDER=openai-compat",
@@ -69,13 +81,12 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	}
 	extra = activateIntentV2Runtime(t, repo, extra...)
 	fullEnv := envWith(env, extra...)
-	startSession(t, ctx, env, repo, "cached-wait-a", "shell", extra...)
+	firstSession := startSession(t, ctx, env, repo, "cached-wait-a", "shell", extra...)
 	// This scenario needs one complete capture, without an intermediate
 	// empty file observed between create and write.
 	writeFileAtomically(t, repo, filepath.Join(repo, "forced.go"),
 		"package forced\n\nfunc Ready() bool { return true }\n")
 	wakeSession(t, ctx, fullEnv, repo, "cached-wait-a")
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	t.Cleanup(func() {
 		if t.Failed() {
 			t.Logf("cached-wait state: planner_calls=%d captures=%s candidates=%s deferrals=%s",
@@ -85,14 +96,73 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 				sqliteScalar(t, dbPath, "SELECT group_concat(event_seq || ':' || defer_count) FROM planner_state"))
 		}
 	})
+	waitFor(t, "one capture before the initial boundary", 15*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state='pending'") == "1"
+	})
+	hint := func(kind string) {
+		t.Helper()
+		res := runAcd(t, ctx, fullEnv, "internal", "hint", "--repo", repo, "--kind", kind)
+		if res.ExitCode != 0 {
+			t.Fatalf("%s hint exit=%d: %s", kind, res.ExitCode, res.Stderr)
+		}
+	}
+	hint("soft_boundary")
 	waitFor(t, "non-forced plan waits", 15*time.Second, func() bool {
 		return plannerCalls.Load() == 1 && sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM intent_candidates WHERE status='waiting'") == "1"
+			"SELECT COUNT(*) FROM intent_candidates WHERE status='waiting'") == "1" &&
+			sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM intent_activity_boundaries WHERE consumed_ts IS NOT NULL") == "1"
 	})
-	shutdownDaemon(t, fullEnv, repo, "cached-wait-a")
+	const completedPlans = "SELECT group_concat(fingerprint) FROM intent_plan_runs WHERE completed=1"
+	waitFingerprint := sqliteScalar(t, dbPath, completedPlans)
+	if waitFingerprint == "" {
+		t.Fatal("waiting plan was not cached durably")
+	}
+	assertWaiting := func() {
+		t.Helper()
+		if plannerCalls.Load() != 1 || sqliteScalar(t, dbPath, completedPlans) != waitFingerprint ||
+			sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM intent_candidates WHERE status='waiting'") != "1" ||
+			sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state='pending'") != "1" {
+			t.Fatal("ordinary wake or restart changed the cached waiting target")
+		}
+	}
+	wakeSession(t, ctx, fullEnv, repo, "cached-wait-a")
+	hint("checkpoint")
+	assertWaiting()
+	// The compatibility stop command only closes a session. Disable this
+	// isolated repository and prove worker ownership ended before restarting.
+	off := runAcd(t, ctx, fullEnv, "off", "--force", "--repo", repo, "--json")
+	if off.ExitCode != 0 {
+		t.Fatalf("off exit=%d: %s", off.ExitCode, off.Stderr)
+	}
+	var stoppedLock *daemon.DaemonLock
+	waitFor(t, "cached-wait worker ownership released", 10*time.Second, func() bool {
+		lock, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		stoppedLock = lock
+		return true
+	})
+	t.Cleanup(func() { _ = stoppedLock.Release() })
+	assertWaiting()
+	if err := stoppedLock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	on := runAcd(t, ctx, fullEnv, "on", "--repo", repo, "--json")
+	if on.ExitCode != 0 {
+		t.Fatalf("on exit=%d: %s", on.ExitCode, on.Stderr)
+	}
 
-	startSession(t, ctx, env, repo, "cached-wait-b", "shell", extra...)
+	secondSession := startSession(t, ctx, env, repo, "cached-wait-b", "shell", extra...)
+	if firstSession.DaemonPID <= 0 || secondSession.DaemonPID <= 0 || firstSession.DaemonPID == secondSession.DaemonPID {
+		t.Fatalf("worker did not restart: before=%d after=%d", firstSession.DaemonPID, secondSession.DaemonPID)
+	}
 	t.Cleanup(func() { shutdownDaemon(t, fullEnv, repo, "cached-wait-b") })
+	hint("checkpoint")
+	assertWaiting()
 	result := runAcd(t, ctx, fullEnv, "commit-all", "--repo", repo, "--yes")
 	if result.ExitCode != 0 {
 		t.Fatalf("commit-all exit=%d\nstdout=%s\nstderr=%s",
