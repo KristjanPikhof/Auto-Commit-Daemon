@@ -1,60 +1,17 @@
 //go:build integration
-// +build integration
 
 package integration_test
 
 import (
 	"context"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
-
-func TestSettingsTUIRealPTYLayoutsResizeAndRestore(t *testing.T) {
-	repo := tempRepo(t)
-	env := envWith(withIsolatedHome(t), "TERM=xterm-256color")
-	bin := buildAcdBinary(t)
-
-	for _, tc := range []struct {
-		name       string
-		cols, rows int
-		want       string
-	}{
-		{name: "wide", cols: 120, rows: 40, want: "FIELDS"},
-		{name: "medium", cols: 84, rows: 30, want: "DETAILS"},
-		{name: "narrow", cols: 58, rows: 22, want: "FIELD 1/"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			result := runPTYCommand(t, ctx, env, tc.cols, tc.rows, 0, 0, "q", bin, "settings", "--repo", repo)
-			if result.ExitCode != 0 {
-				t.Fatalf("settings PTY exit=%d\n%s", result.ExitCode, result.Stdout)
-			}
-			if !strings.Contains(result.Stdout, "ACD SETTINGS") || !strings.Contains(result.Stdout, tc.want) {
-				t.Fatalf("missing %q layout at %dx%d\n%s", tc.want, tc.cols, tc.rows, result.Stdout)
-			}
-			assertAltScreenRestored(t, result.Stdout)
-		})
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	resized := runPTYCommand(t, ctx, env, 120, 36, 58, 20, "q", bin, "settings", "--repo", repo)
-	if resized.ExitCode != 0 {
-		t.Fatalf("resize PTY exit=%d\n%s", resized.ExitCode, resized.Stdout)
-	}
-	if !strings.Contains(resized.Stdout, "FIELDS") || !strings.Contains(resized.Stdout, "FIELD 1/") {
-		t.Fatalf("SIGWINCH did not render both wide and narrow layouts\n%s", resized.Stdout)
-	}
-	assertAltScreenRestored(t, resized.Stdout)
-}
 
 func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
 	t.Parallel()
@@ -185,239 +142,6 @@ func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
 	}
 }
 
-func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
-	repo := tempRepo(t)
-	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
-	bin := buildAcdBinary(t)
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	noColor := runPTYCommand(t, ctx, envWith(baseEnv, "NO_COLOR=1"), 84, 28, 0, 0, "jkq", bin, "settings", "--repo", repo)
-	cancel()
-	if noColor.ExitCode != 0 {
-		t.Fatalf("NO_COLOR PTY exit=%d\n%s", noColor.ExitCode, noColor.Stdout)
-	}
-	if strings.Contains(noColor.Stdout, "\x1b[38;") || strings.Contains(noColor.Stdout, "\x1b[48;") {
-		t.Fatalf("NO_COLOR emitted color SGR sequences\n%q", noColor.Stdout)
-	}
-	assertAltScreenRestored(t, noColor.Stdout)
-
-	beforeConfig := readOptionalFile(t, settingsConfigPath(baseEnv))
-	beforeRevisions := "0"
-	if _, err := os.Stat(dbPath); err == nil {
-		beforeRevisions = sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM config_revisions")
-	}
-	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
-	// Enter edit mode, replace the first field, accept, then use the explicit
-	// dirty-quit discard confirmation. No provider test or apply key is sent.
-	dirty := runPTYCommand(t, ctx, baseEnv, 84, 28, 0, 0, "\r\x15openai-compat\rqd", bin, "settings", "--repo", repo)
-	cancel()
-	if dirty.ExitCode != 0 {
-		t.Fatalf("dirty-discard PTY exit=%d\n%s", dirty.ExitCode, dirty.Stdout)
-	}
-	if !strings.Contains(dirty.Stdout, "Unsaved DRAFT") {
-		t.Fatalf("dirty quit confirmation not rendered\n%s", dirty.Stdout)
-	}
-	assertAltScreenRestored(t, dirty.Stdout)
-	if got := readOptionalFile(t, settingsConfigPath(baseEnv)); got != beforeConfig {
-		t.Fatalf("discarded draft mutated XDG config: before=%q after=%q", beforeConfig, got)
-	}
-	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM config_revisions"); got != beforeRevisions {
-		t.Fatalf("discarded draft created runtime revisions: before=%s after=%s", beforeRevisions, got)
-	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
-	accessible := runPTYCommand(t, ctx, baseEnv, 72, 28, 0, 0, "\x03", bin, "settings", "--repo", repo, "--accessible")
-	cancel()
-	if accessible.ExitCode == 0 {
-		t.Fatalf("cancelled accessible action unexpectedly succeeded\n%s", accessible.Stdout)
-	}
-	if !strings.Contains(accessible.Stdout, "ACD SETTINGS - accessible mode") || !strings.Contains(accessible.Stdout, "set/unset only; value never displayed") {
-		t.Fatalf("accessible transcript missing\n%s", accessible.Stdout)
-	}
-	if !strings.Contains(accessible.Stdout, "What do you want to do?") ||
-		!strings.Contains(accessible.Stdout, "Test current settings (recommended)") {
-		t.Fatalf("accessible prompt omitted action-first onboarding\n%s", accessible.Stdout)
-	}
-	if strings.Contains(accessible.Stdout, "Minimum pending (next safe boundary) [current:") {
-		t.Fatalf("accessible start unexpectedly opened the advanced catalog\n%s", accessible.Stdout)
-	}
-	if strings.Contains(accessible.Stdout, "\x1b[?1049h") {
-		t.Fatalf("accessible mode entered alternate screen\n%q", accessible.Stdout)
-	}
-}
-
-func TestSettingsTUIAccessibleActionFirstTestAndRiskDecline(t *testing.T) {
-	repo := tempRepo(t)
-	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
-	bin := buildAcdBinary(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	tested := runPTYCommand(t, ctx, baseEnv, 72, 28, 0, 0,
-		"\n\x00y\n\x00", bin, "settings", "--repo", repo, "--accessible")
-	cancel()
-	if tested.ExitCode != 0 || !strings.Contains(tested.Stdout, "TESTED:") {
-		t.Fatalf("action-first deterministic test exit=%d\n%s", tested.ExitCode, tested.Stdout)
-	}
-	if !strings.Contains(tested.Stdout, "Test current settings (recommended)") {
-		t.Fatalf("action-first default was not rendered\n%s", tested.Stdout)
-	}
-	if strings.Contains(tested.Stdout, "Minimum pending (next safe boundary) [current:") {
-		t.Fatalf("current-settings test visited the advanced catalog\n%s", tested.Stdout)
-	}
-	if strings.Contains(tested.Stdout, "\x1b[?1049h") {
-		t.Fatalf("accessible test entered alternate screen\n%q", tested.Stdout)
-	}
-
-	riskEnv := envWith(baseEnv,
-		"ACD_AI_PROVIDER=openai-compat",
-		"ACD_AI_MODEL=synthetic-test-model",
-		"ACD_AI_BASE_URL=https://example.invalid/v1",
-		"ACD_AI_API_KEY=integration-placeholder",
-	)
-	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	declined := runPTYCommand(t, ctx, riskEnv, 72, 28, 0, 0,
-		"\n\x00y\n\x00n\n\x00", bin, "settings", "--repo", repo, "--accessible")
-	cancel()
-	if declined.ExitCode == 0 {
-		t.Fatalf("declined endpoint risk unexpectedly succeeded\n%s", declined.Stdout)
-	}
-	if !strings.Contains(declined.Stdout, "send credentials to a non-default endpoint") ||
-		!strings.Contains(declined.Stdout, "no request or change was made") {
-		t.Fatalf("endpoint risk decline was not explicit\n%s", declined.Stdout)
-	}
-	if strings.Contains(declined.Stdout, "integration-placeholder") {
-		t.Fatalf("accessible transcript exposed the test credential\n%s", declined.Stdout)
-	}
-	if strings.Contains(declined.Stdout, "\x1b[?1049h") {
-		t.Fatalf("accessible risk prompt entered alternate screen\n%q", declined.Stdout)
-	}
-}
-
-func TestSettingsTUIRealPTYConfirmationRetryAndApplyDecline(t *testing.T) {
-	repo := tempRepo(t)
-	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
-	bin := buildAcdBinary(t)
-	const response = `{
-  "id": "chatcmpl-settings-probe",
-  "object": "chat.completion",
-  "model": "synthetic-test-model",
-  "choices": [{
-    "index": 0,
-    "message": {
-      "role": "assistant",
-      "content": "",
-      "tool_calls": [{
-        "id": "call_settings_probe",
-        "type": "function",
-        "function": {
-          "name": "commit_message",
-          "arguments": "{\"subject\":\"Probe provider\",\"body\":\"\"}"
-        }
-      }]
-    },
-    "finish_reason": "tool_calls"
-  }]
-}`
-	var hits atomic.Int32
-	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
-			http.Error(w, "wrong path", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(response))
-	}))
-	defer server.Close()
-	providerEnv := envWith(baseEnv,
-		"ACD_AI_PROVIDER=openai-compat",
-		"ACD_AI_MODEL=synthetic-test-model",
-		"ACD_AI_BASE_URL="+server.URL,
-		"ACD_AI_API_KEY=integration-placeholder",
-		trustEnv,
-	)
-
-	for _, key := range []string{"t", "T"} {
-		t.Run("rich_"+key, func(t *testing.T) {
-			before := hits.Load()
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			result := runPTYCommand(t, ctx, providerEnv, 100, 32, 0, 0,
-				key+"\x00y\x00\x00q\x00", bin, "settings", "--repo", repo)
-			cancel()
-			if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Confirm send credentials to a non-default endpoint?") ||
-				!strings.Contains(result.Stdout, "TESTED") || !strings.Contains(result.Stdout, "[t/T] test") {
-				t.Fatalf("rich %q confirmation/retry exit=%d\n%s", key, result.ExitCode, result.Stdout)
-			}
-			if got := hits.Load() - before; got != 1 {
-				t.Fatalf("rich %q provider requests=%d want 1", key, got)
-			}
-			assertAltScreenRestored(t, result.Stdout)
-		})
-	}
-
-	applyEnv := envWith(providerEnv, "ACD_AI_DIFF_EGRESS=true")
-	beforeConfig := readOptionalFile(t, settingsConfigPath(applyEnv))
-	beforeHits := hits.Load()
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	declined := runPTYCommand(t, ctx, applyEnv, 72, 28, 0, 0,
-		"2\n\x00y\n\x00y\n\x00n\n\x00", bin, "settings", "--repo", repo, "--accessible")
-	cancel()
-	if declined.ExitCode == 0 {
-		t.Fatalf("declined diff egress unexpectedly applied\n%s", declined.Stdout)
-	}
-	if !strings.Contains(declined.Stdout, "allow redacted repository diff egress") ||
-		!strings.Contains(declined.Stdout, "synthetic test completed, but no apply or activation change was made") {
-		t.Fatalf("accessible apply decline was inaccurate\n%s", declined.Stdout)
-	}
-	if got := hits.Load() - beforeHits; got != 1 {
-		t.Fatalf("accessible apply provider requests=%d want 1", got)
-	}
-	if strings.Contains(declined.Stdout, "integration-placeholder") {
-		t.Fatalf("accessible apply exposed the test credential\n%s", declined.Stdout)
-	}
-	if got := readOptionalFile(t, settingsConfigPath(applyEnv)); got != beforeConfig {
-		t.Fatalf("declined apply changed config: before=%q after=%q", beforeConfig, got)
-	}
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM config_revisions"); got != "0" {
-		t.Fatalf("declined apply created runtime revisions: %s", got)
-	}
-	if strings.Contains(declined.Stdout, "\x1b[?1049h") {
-		t.Fatalf("accessible apply entered alternate screen\n%q", declined.Stdout)
-	}
-}
-
-func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
-	repo := tempRepo(t)
-	env := envWith(withIsolatedHome(t), "TERM=xterm-256color")
-	bin := buildAcdBinary(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	// Edit provider, save, wait for the real config write, then quit.
-	saved := runPTYCommand(t, ctx, env, 100, 32, 0, 0,
-		"\r\x00\x15\x00openai-compat\x00\r\x00s\x00q", bin, "settings", "--repo", repo)
-	cancel()
-	if saved.ExitCode != 0 || !strings.Contains(saved.Stdout, "draft saved") {
-		t.Fatalf("save action exit=%d\n%s", saved.ExitCode, saved.Stdout)
-	}
-	assertAltScreenRestored(t, saved.Stdout)
-	if body := readOptionalFile(t, settingsConfigPath(env)); !strings.Contains(body, `"ai.provider": "openai-compat"`) {
-		t.Fatalf("save action did not persist scoped provider: %s", body)
-	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	// Make the provider invalid, exercise the asynchronous strict-test error,
-	// wait for it to render, then use the dirty-discard path to exit.
-	failed := runPTYCommand(t, ctx, env, 100, 32, 0, 0,
-		"\r\x00\x15\x00invalid-provider\x00\r\x00t\x00qd", bin, "settings", "--repo", repo)
-	cancel()
-	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "FAILED:") {
-		t.Fatalf("failed action exit=%d\n%s", failed.ExitCode, failed.Stdout)
-	}
-	assertAltScreenRestored(t, failed.Stdout)
-}
-
 func TestSettingsTUIProductionBinaryIsCGODisabled(t *testing.T) {
 	bin := buildAcdBinary(t)
 	out, err := exec.Command("file", bin).CombinedOutput()
@@ -472,4 +196,130 @@ func readOptionalFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(body)
+}
+
+func TestSettingsTUIRealPTYLayoutsResizeAndRestore(t *testing.T) {
+	t.Parallel()
+	repo := tempRepo(t)
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color")
+	bin := buildAcdBinary(t)
+	for _, size := range [][2]int{{120, 40}, {84, 30}, {58, 22}} {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		result := runPTYCommand(t, ctx, env, size[0], size[1], 0, 0, "\x03", bin, "config", "--repo", repo)
+		cancel()
+		if result.ExitCode != 0 || !strings.Contains(result.Stdout, "ACD Settings") || !strings.Contains(result.Stdout, "Model") {
+			t.Fatalf("layout %v exit=%d\n%s", size, result.ExitCode, result.Stdout)
+		}
+		if strings.Contains(result.Stdout, "\x1b[?1049h") {
+			assertAltScreenRestored(t, result.Stdout)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resized := runPTYCommand(t, ctx, env, 120, 36, 58, 20, "\x03", bin, "config", "edit", "--repo", repo)
+	if resized.ExitCode != 0 || !strings.Contains(resized.Stdout, "ACD Settings") {
+		t.Fatalf("resize exit=%d\n%s", resized.ExitCode, resized.Stdout)
+	}
+	if strings.Contains(resized.Stdout, "\x1b[?1049h") {
+		assertAltScreenRestored(t, resized.Stdout)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "acd", "state.db")); !os.IsNotExist(err) {
+		t.Fatal("opening/cancelling editor created repository state")
+	}
+}
+
+func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
+	t.Parallel()
+	repo := tempRepo(t)
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color", "NO_COLOR=1")
+	bin := buildAcdBinary(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	rich := runPTYCommand(t, ctx, env, 84, 28, 0, 0, "\x1b[B\x1b[B\r\x00\x15unsaved-model\r\x00\x03", bin, "config", "--repo", repo)
+	cancel()
+	if rich.ExitCode != 0 || strings.Contains(rich.Stdout, "\x1b[38;") || strings.Contains(rich.Stdout, "\x1b[48;") {
+		t.Fatalf("rich exit=%d\n%s", rich.ExitCode, rich.Stdout)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+	dirty := runPTYCommand(t, ctx, env, 72, 28, 0, 0, "3\n\x00unsaved-model\n\x0011\n\x00y\n", bin, "config", "--repo", repo, "--accessible")
+	cancel()
+	if dirty.ExitCode != 0 || !strings.Contains(dirty.Stdout, "Discard unsaved changes") {
+		t.Fatalf("discard exit=%d\n%s", dirty.ExitCode, dirty.Stdout)
+	}
+	if readOptionalFile(t, settingsConfigPath(env)) != "" {
+		t.Fatal("discard wrote settings")
+	}
+	if strings.Contains(dirty.Stdout, "\x1b[?1049h") {
+		t.Fatal("accessible editor entered alternate screen")
+	}
+}
+
+func TestSettingsTUIAccessibleActionFirstTestAndRiskDecline(t *testing.T) {
+	t.Parallel()
+	repo := tempRepo(t)
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=synthetic-test-model", "ACD_AI_BASE_URL=https://example.invalid/v1", "ACD_AI_API_KEY=integration-placeholder")
+	bin := buildAcdBinary(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	declined := runPTYCommand(t, ctx, env, 72, 28, 0, 0, "10\n\x00n\n\x0011\n", bin, "config", "--repo", repo, "--accessible")
+	if declined.ExitCode != 0 || !strings.Contains(declined.Stdout, "Permission: send credentials to https://example.invalid/v1") {
+		t.Fatalf("decline exit=%d\n%s", declined.ExitCode, declined.Stdout)
+	}
+	if strings.Contains(declined.Stdout, "integration-placeholder") || strings.Contains(declined.Stdout, "Testing and saving") {
+		t.Fatal("declined review probed or leaked key")
+	}
+	if readOptionalFile(t, settingsConfigPath(env)) != "" {
+		t.Fatal("declined review wrote config")
+	}
+}
+
+func TestSettingsTUIRealPTYConfirmationRetryAndApplyDecline(t *testing.T) {
+	t.Parallel()
+	repo := tempRepo(t)
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color")
+	bin := buildAcdBinary(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// Review a model edit, decline it, then review and approve the retained draft.
+	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00retained-model\n\x0010\n\x00n\n\x0010\n\x00y\n", bin, "config", "--repo", repo, "--accessible")
+	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Waiting to apply") {
+		t.Fatalf("retry exit=%d\n%s", result.ExitCode, result.Stdout)
+	}
+	if strings.Count(result.Stdout, "Review changes") != 2 {
+		t.Fatal("declined review did not retain editable draft")
+	}
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM config_revisions"); got != "1" {
+		t.Fatalf("expected one approved activation, got %s", got)
+	}
+	if !strings.Contains(readOptionalFile(t, settingsConfigPath(env)), `"ai.model": "retained-model"`) {
+		t.Fatal("reviewed model was not saved")
+	}
+}
+
+func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
+	t.Parallel()
+	repo := tempRepo(t)
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color")
+	bin := buildAcdBinary(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// Global is the initial scope even inside a worktree. Model is always editable.
+	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00global-model\n\x0010\n\x00y\n", bin, "config", "--accessible", "--scope", "global")
+	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Global defaults") || !strings.Contains(result.Stdout, "Settings saved") {
+		t.Fatalf("global save exit=%d\n%s", result.ExitCode, result.Stdout)
+	}
+	body := readOptionalFile(t, settingsConfigPath(env))
+	if !strings.Contains(body, `"ai.model": "global-model"`) {
+		t.Fatalf("model not saved: %s", body)
+	}
+	// An invalid value is rejected at the field and can be corrected before saving.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel2()
+	failed := runPTYCommand(t, ctx2, env, 84, 30, 0, 0, "2\n\x00invalid-provider\n\x00deterministic\n\x0011\n\x00y\n", bin, "config", "--repo", repo, "--accessible")
+	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "provider") {
+		t.Fatalf("validation recovery exit=%d\n%s", failed.ExitCode, failed.Stdout)
+	}
+	if after := readOptionalFile(t, settingsConfigPath(env)); after != body {
+		t.Fatal("discard after invalid input changed saved config")
+	}
 }

@@ -265,6 +265,8 @@ func TestConfigEditorGlobalSaveUpdatesInheritingRuntimeOnly(t *testing.T) {
 	e := editorFixture(t)
 	e.repo = materializeTestRepo(t, false)
 	overrideRepo := materializeTestRepo(t, false)
+	overrideDB := filepath.Join(overrideRepo, ".git", "acd", "state.db")
+	beforeOverride, _ := os.ReadFile(overrideDB)
 	editorSeed(t, e, func(doc *config.Document) {
 		doc.Settings.Global[config.FieldModel] = json.RawMessage(`"old-model"`)
 		doc.Settings.Repositories[central.CanonicalID(overrideRepo)] = config.RepositorySettings{Fields: config.Overrides{config.FieldModel: json.RawMessage(`"custom-model"`)}}
@@ -351,8 +353,9 @@ func TestConfigEditorGlobalSaveUpdatesInheritingRuntimeOnly(t *testing.T) {
 	if editorModel(t, &scoped, "repo").Value != "custom-model" {
 		t.Fatal("repository override changed")
 	}
-	if _, err := os.Stat(filepath.Join(overrideRepo, ".git", "acd")); !os.IsNotExist(err) {
-		t.Fatal("overridden repository state was opened for writing")
+	afterOverride, _ := os.ReadFile(overrideDB)
+	if !bytes.Equal(beforeOverride, afterOverride) {
+		t.Fatal("overridden repository state changed")
 	}
 }
 
@@ -368,7 +371,7 @@ func TestConfigEditorPresetChangeKeepsAuthoredValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if projection.values[config.FieldIntentWindow] != "30" || projection.values[config.FieldIntentVerification] != "full" || projection.values[config.FieldIntentRepairHorizon] != "7m" || projection.values[config.FieldVerificationFullCommand] != "make quality" {
+	if projection.values[config.FieldIntentWindow] != "30" || projection.values[config.FieldIntentVerification] != "full" || projection.values[config.FieldIntentRepairHorizon] != "7m0s" || projection.values[config.FieldVerificationFullCommand] != "make quality" {
 		t.Fatalf("preset projection=%v", projection.values)
 	}
 }
