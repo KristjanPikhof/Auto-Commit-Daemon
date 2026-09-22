@@ -326,7 +326,13 @@ func editEditorField(ctx context.Context, field EditorField, scope string, opts 
 	if len(desc.Choices) > 0 {
 		choices := []huh.Option[string]{}
 		for _, choice := range desc.Choices {
-			choices = append(choices, huh.NewOption(choice, choice))
+			label := choice
+			if choice == "true" {
+				label = "On"
+			} else if choice == "false" {
+				label = "Off"
+			}
+			choices = append(choices, huh.NewOption(label, choice))
 		}
 		input = huh.NewSelect[string]().Title(desc.Label).Description(desc.Description).Options(choices...).Value(&value).Validate(validate)
 	} else {
