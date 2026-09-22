@@ -256,8 +256,11 @@ func runConfigReset(ctx context.Context, out io.Writer, repo string, options con
 	if targetName == "" {
 		targetName = target.Scope
 	}
-	return renderConfigMutation(out, target, jsonOut, "config_reset", targetName,
-		"Run `acd config edit` to review and activate the resolved settings.")
+	next := "Run `acd config --scope global` to review and apply the inherited settings."
+	if target.Scope == "repo" {
+		next = fmt.Sprintf("Run `acd config --repo %s` to review and apply the inherited settings.", productListShellQuote(target.Repo))
+	}
+	return renderConfigMutation(out, target, jsonOut, "config_reset", targetName, next)
 }
 
 func configInput(target resolvedConfigTarget) (config.ResolveInput, config.Overrides) {
