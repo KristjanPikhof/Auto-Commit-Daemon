@@ -163,7 +163,16 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 			if field.Key == "" {
 				continue
 			}
-			value, inherit, err := editEditorField(ctx, field, draft.Scope, opts)
+			validate := func(value string) error {
+				changes := make(map[string]*string, len(draft.Changes)+1)
+				for key, change := range draft.Changes {
+					changes[key] = change
+				}
+				changes[field.Key] = &value
+				_, err := backend.Load(ctx, draft.Scope, changes)
+				return err
+			}
+			value, inherit, err := editEditorField(ctx, field, draft.Scope, opts, validate)
 			if errors.Is(err, huh.ErrUserAborted) {
 				continue
 			}
@@ -238,7 +247,7 @@ func editorMenu(snapshot EditorSnapshot, draft EditorDraft, advanced bool, repo 
 	return append(rows, huh.NewOption("Save changes", "save"), huh.NewOption("Cancel", "cancel"))
 }
 
-func editEditorField(ctx context.Context, field EditorField, scope string, opts EditorOptions) (string, bool, error) {
+func editEditorField(ctx context.Context, field EditorField, scope string, opts EditorOptions, validate func(string) error) (string, bool, error) {
 	desc := descriptor(field.Key)
 	value := field.Value
 	if field.Overridden {
@@ -258,9 +267,9 @@ func editEditorField(ctx context.Context, field EditorField, scope string, opts 
 		for _, choice := range desc.Choices {
 			choices = append(choices, huh.NewOption(choice, choice))
 		}
-		input = huh.NewSelect[string]().Title(desc.Label).Description(desc.Description).Options(choices...).Value(&value)
+		input = huh.NewSelect[string]().Title(desc.Label).Description(desc.Description).Options(choices...).Value(&value).Validate(validate)
 	} else {
-		input = huh.NewInput().Title(desc.Label).Description(desc.Description).Value(&value)
+		input = huh.NewInput().Title(desc.Label).Description(desc.Description).Value(&value).Validate(validate)
 	}
 	err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(input)), opts)
 	return strings.TrimSpace(value), false, err
