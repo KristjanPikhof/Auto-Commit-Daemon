@@ -52,7 +52,7 @@ func TestRootHelpLinksPublicationAndRewriteWorkflows(t *testing.T) {
 	for _, want := range []string{
 		"acd commit-all --dry-run",
 		"acd history rewrite --help",
-		"acd config edit",
+		"acd config",
 		"acd repo --help",
 		"acd support --help",
 	} {
