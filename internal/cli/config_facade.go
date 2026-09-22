@@ -218,7 +218,10 @@ func runConfigSet(ctx context.Context, out io.Writer, repo string, options confi
 	if err != nil {
 		return fmt.Errorf("acd config set: %w", err)
 	}
-	next := "Run `acd config edit` to test and activate this saved draft."
+	next := "Run `acd config --scope global` to review and apply this saved setting."
+	if target.Scope == "repo" {
+		next = fmt.Sprintf("Run `acd config --repo %s` to review and apply this saved setting.", productListShellQuote(target.Repo))
+	}
 	if definition.Boundary == config.ApplyRestart {
 		next = "Run `acd off`, then `acd on`, to activate this restart-required setting."
 	}

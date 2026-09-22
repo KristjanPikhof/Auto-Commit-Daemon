@@ -8,6 +8,7 @@ const rootHelpTemplate = `{{if eq .CommandPath "acd"}}{{with (or .Long .Short)}}
 
 Commands:
   setup       Safely install or upgrade ACD
+  config      Edit global or repository settings
   status      Show protection, Git publication, and the next step
   on          Start protecting this repository
   off         Save a final checkpoint and stop protection
@@ -21,7 +22,7 @@ Commands:
 Common tasks:
   Preview publishing all:    acd commit-all --dry-run
   Rewrite commit messages:   acd history rewrite --help
-  Change settings:           acd config edit
+  Change settings:           acd config
   Manage repositories:       acd repo --help
   Diagnose a problem:        acd doctor
   Advanced recovery tools:   acd support --help

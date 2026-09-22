@@ -300,7 +300,7 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 // a fresh validation of this exact draft.
 type SaveGlobalSetupRequest struct {
 	// Changes, when set, saves only edited overrides. Nil values restore inheritance.
-	Changes map[string]*string
+	Changes            map[string]*string
 	Values             map[string]string
 	TestedFingerprint  string
 	Confirmations      []ai.ConfirmationRequirement
@@ -388,6 +388,17 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 				return err
 			}
 			doc.Settings.Global[name] = raw
+		}
+		if req.Changes != nil {
+			fields, _, err := config.ResolveAll(config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}, doc.Settings.Global)
+			if err != nil {
+				return err
+			}
+			for name, expected := range validation.ResolvedHot {
+				if fields[name].EffectiveValue() != expected {
+					return fmt.Errorf("acd settings: saved field %s does not match the reviewed settings", name)
+				}
+			}
 		}
 		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{
 			Generation:    req.ExpectedGeneration + 1,
