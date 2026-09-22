@@ -72,6 +72,9 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 			draft.Generation = snapshot.Generation
 			initialized = true
 		}
+		if opts.Accessible {
+			fmt.Fprintln(opts.Output, message)
+		}
 		action := ""
 		fields := editorMenu(snapshot, draft, advanced, opts.Repo)
 		form := huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("ACD Settings · " + editorScopeLabel(draft.Scope, opts.Repo)).Description(message).Options(fields...).Value(&action).Height(12)))
@@ -111,7 +114,16 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 			initialized = false
 			message = "Choose a setting to edit. Changes are saved together."
 		case "commit.mode":
-			mode := "everyday"
+			strategy, preset := "", ""
+			for _, field := range snapshot.Fields {
+				if field.Key == "commit.strategy" {
+					strategy = field.Value
+				}
+				if field.Key == "commit.preset" {
+					preset = field.Value
+				}
+			}
+			mode := configureExperience(strategy, preset)
 			options := []huh.Option[string]{huh.NewOption("Everyday: semantic commits with safety checks", "everyday"), huh.NewOption("Maximum speed: immediate commits", "speed")}
 			if draft.Scope == "repo" {
 				options = append(options, huh.NewOption("Strict review: require project verification", "strict"))
@@ -119,7 +131,7 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 			if err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("Commit mode").Description("Advanced customizations are kept. Review the effective verification settings before saving.").Options(options...).Value(&mode))), opts); err != nil {
 				return editorExitError(err)
 			}
-			strategy, preset := configureExperienceMode(mode)
+			strategy, preset = configureExperienceMode(mode)
 			draft.Changes["commit.strategy"], draft.Changes["commit.preset"] = &strategy, &preset
 			message = "Commit mode changed. Choose Save changes when ready."
 		case "advanced":

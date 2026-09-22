@@ -21,9 +21,10 @@ func (r *bytewiseReader) Read(p []byte) (int, error) {
 }
 
 type editorFake struct {
-	drafts   []EditorDraft
-	saved    int
-	failOnce bool
+	drafts      []EditorDraft
+	saved       int
+	failOnce    bool
+	reviewError error
 }
 
 func (b *editorFake) Load(_ context.Context, scope string, changes map[string]*string) (EditorSnapshot, error) {
@@ -51,6 +52,9 @@ func (b *editorFake) Load(_ context.Context, scope string, changes map[string]*s
 	return snapshot, nil
 }
 func (b *editorFake) Review(_ context.Context, draft EditorDraft) (EditorReview, error) {
+	if b.reviewError != nil {
+		return EditorReview{}, b.reviewError
+	}
 	b.drafts = append(b.drafts, draft)
 	return EditorReview{Text: "Scope: " + draft.Scope + "\nAPI key: masked", Save: func(context.Context) (string, error) {
 		b.saved++
@@ -136,5 +140,13 @@ func TestEditorSafeTextRemovesTerminalControls(t *testing.T) {
 	clean := safeText("ok\x1b[31m\n\r\tbad\x1b[0m")
 	if strings.ContainsAny(clean, "\x1b\n\r\t") || !strings.Contains(clean, "ok") {
 		t.Fatal(clean)
+	}
+}
+
+func TestEditorAccessibleReviewErrorIsVisible(t *testing.T) {
+	b := &editorFake{reviewError: errors.New("API key is missing; select API key to enter it")}
+	out, err := runEditorInput(t, b, "8\n9\n", "")
+	if err != nil || b.saved != 0 || !strings.Contains(out, "API key is missing") {
+		t.Fatalf("err=%v saved=%d\n%s", err, b.saved, out)
 	}
 }
