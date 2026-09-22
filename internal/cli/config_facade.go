@@ -221,6 +221,8 @@ func runConfigSet(ctx context.Context, out io.Writer, repo string, options confi
 	next := "Run `acd config --scope global` to review and apply this saved setting."
 	if target.Scope == "repo" {
 		next = fmt.Sprintf("Run `acd config --repo %s` to review and apply this saved setting.", productListShellQuote(target.Repo))
+	} else if target.Scope == "profile" {
+		next = "Run `acd config --repo PATH` for each repository using this profile to review and apply it."
 	}
 	if definition.Boundary == config.ApplyRestart {
 		next = "Run `acd off`, then `acd on`, to activate this restart-required setting."
@@ -259,6 +261,8 @@ func runConfigReset(ctx context.Context, out io.Writer, repo string, options con
 	next := "Run `acd config --scope global` to review and apply the inherited settings."
 	if target.Scope == "repo" {
 		next = fmt.Sprintf("Run `acd config --repo %s` to review and apply the inherited settings.", productListShellQuote(target.Repo))
+	} else if target.Scope == "profile" {
+		next = "Run `acd config --repo PATH` for each repository using this profile to review and apply it."
 	}
 	return renderConfigMutation(out, target, jsonOut, "config_reset", targetName, next)
 }
