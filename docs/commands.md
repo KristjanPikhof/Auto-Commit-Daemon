@@ -6,6 +6,7 @@
 
 | Command | Mutates | Confirmation |
 |---|---|---|
+| `acd config` | Reviewed settings, credentials, and runtime activation requests | Reviews changes and permissions before saving. |
 | `acd setup` | Shared binary, service, configuration, integrations, and enabled repository migrations during an incompatible upgrade | Shows one exact global plan and asks once. |
 | `acd status` | Nothing | None. |
 | `acd on` | Repository desired state through the supervisor | None; idempotent. |
@@ -313,11 +314,16 @@ acd repo list|remove|gc
 acd history activity|explain|rewrite
 ~~~
 
-They are callable but hidden from root help.
+`config` is listed in root help and opens the settings editor without a subcommand.
+The other advanced namespaces are callable but hidden from root help.
 
-Configuration defaults to repository scope inside a worktree and global scope
-outside one. `--scope repo|profile|global` is explicit. Interactive editors
-reject `--json` rather than ignoring it.
+`config` and `config edit` open the same editor, initially at global scope.
+Use the scope menu or `--repo PATH` for repository settings. The editor accepts
+`--scope global|repo` and `--accessible` and rejects `--json`.
+
+`config get|set|reset` default to repository scope inside a worktree and global
+scope outside one. Their `--scope repo|profile|global` flag is explicit. Saved
+command-line changes still need review and activation through the editor.
 
 ## Persistent flags
 
