@@ -34,6 +34,9 @@ func (b *editorFake) Load(_ context.Context, scope string, changes map[string]*s
 			continue
 		}
 		field := EditorField{Key: definition.Name, Value: definition.Default, Source: "global", Inherited: "inherited-value"}
+		if scope == "global" {
+			field.Inherited = definition.Default
+		}
 		if field.Key == config.FieldModel {
 			field.Value = "old-model"
 			field.Overridden = true
@@ -148,5 +151,23 @@ func TestEditorAccessibleReviewErrorIsVisible(t *testing.T) {
 	out, err := runEditorInput(t, b, "8\n9\n", "")
 	if err != nil || b.saved != 0 || !strings.Contains(out, "API key is missing") {
 		t.Fatalf("err=%v saved=%d\n%s", err, b.saved, out)
+	}
+}
+
+func TestEditorGlobalModelResetShowsCurrentDefault(t *testing.T) {
+	b := &editorFake{}
+	out, err := runEditorInput(t, b, "2\n2\n8\ny\n", "")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Reset to default: gpt-6-luna") {
+		t.Fatal(out)
+	}
+	if b.saved != 1 || len(b.drafts) != 1 {
+		t.Fatalf("saved=%d drafts=%+v", b.saved, b.drafts)
+	}
+	value, found := b.drafts[0].Changes[config.FieldModel]
+	if !found || value != nil {
+		t.Fatal("reset did not remove the model override")
 	}
 }

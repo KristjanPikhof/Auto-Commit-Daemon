@@ -404,3 +404,26 @@ func TestConfigEditorGlobalVerificationNeedsRepositoryScopeBeforeProbe(t *testin
 		t.Fatal("invalid scope reached provider")
 	}
 }
+
+func TestConfigEditorGlobalModelResetUsesCurrentDefault(t *testing.T) {
+	e := editorFixture(t)
+	editorSeed(t, e, func(doc *config.Document) { doc.Settings.Global[config.FieldModel] = json.RawMessage(`"custom-model"`) })
+	before := editorModel(t, e, "global")
+	if before.Value != "custom-model" || before.Inherited != "gpt-6-luna" {
+		t.Fatalf("model reset choice = %+v", before)
+	}
+	review, err := e.Review(context.Background(), editorDraft(t, e, "global", map[string]*string{config.FieldModel: nil}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(review.Text, "gpt-6-luna") {
+		t.Fatal(review.Text)
+	}
+	if _, err := review.Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after := editorModel(t, e, "global")
+	if after.Value != "gpt-6-luna" || after.Overridden {
+		t.Fatalf("reset model = %+v", after)
+	}
+}
