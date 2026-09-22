@@ -197,7 +197,7 @@ func TestIntentWorktreeReliability(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=integration-test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		"ACD_AI_TIMEOUT=10s",
 		trustEnv,
 	}
