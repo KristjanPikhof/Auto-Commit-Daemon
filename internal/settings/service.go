@@ -299,6 +299,8 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 // persistable non-secret fields; the fingerprint and confirmations must match
 // a fresh validation of this exact draft.
 type SaveGlobalSetupRequest struct {
+	// Changes, when set, saves only edited overrides. Nil values restore inheritance.
+	Changes map[string]*string
 	Values             map[string]string
 	TestedFingerprint  string
 	Confirmations      []ai.ConfirmationRequirement
@@ -365,12 +367,23 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 		if req.Replace {
 			doc.Settings.Global = config.Overrides{}
 		}
-		for name, value := range req.Values {
+		changes := req.Changes
+		if changes == nil {
+			changes = make(map[string]*string, len(req.Values))
+			for name, value := range req.Values {
+				changes[name] = &value
+			}
+		}
+		for name, value := range changes {
 			field, err := persistedField(name)
 			if err != nil {
 				return err
 			}
-			raw, err := encodePersistedField(field, value)
+			if value == nil {
+				delete(doc.Settings.Global, name)
+				continue
+			}
+			raw, err := encodePersistedField(field, *value)
 			if err != nil {
 				return err
 			}
