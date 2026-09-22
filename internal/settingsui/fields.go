@@ -2,7 +2,6 @@ package settingsui
 
 import (
 	"regexp"
-	"sort"
 	"strings"
 	"unicode"
 )
@@ -63,17 +62,6 @@ func Fields() []FieldDescriptor {
 	return out
 }
 
-func visibleFields(query string) []FieldDescriptor {
-	query = strings.ToLower(strings.TrimSpace(query))
-	var out []FieldDescriptor
-	for _, f := range fieldDescriptors {
-		if query == "" || strings.Contains(strings.ToLower(f.Key+" "+f.Label+" "+f.Description), query) {
-			out = append(out, f)
-		}
-	}
-	return out
-}
-
 func safeText(s string) string {
 	s = ansiRE.ReplaceAllString(s, "")
 	s = strings.Map(func(r rune) rune {
@@ -94,22 +82,6 @@ func safePreviewValue(value string, limit int) string {
 }
 
 var ansiRE = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))`)
-
-func sanitizedDraft(draft map[string]string) map[string]string {
-	out := make(map[string]string, len(draft))
-	keys := make([]string, 0, len(draft))
-	for key := range draft {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		if descriptor(key).Sensitive {
-			continue
-		}
-		out[safeText(key)] = safeText(draft[key])
-	}
-	return out
-}
 
 func descriptor(key string) FieldDescriptor {
 	for _, f := range fieldDescriptors {

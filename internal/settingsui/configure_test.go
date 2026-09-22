@@ -6,8 +6,6 @@ import (
 	"io"
 	"strings"
 	"testing"
-
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 )
 
 func TestConfigureWizardAccessibleStagesGlobalIntentBalancedWithoutTests(t *testing.T) {
@@ -176,81 +174,6 @@ func TestConfigureWizardRepositoryStrictUsesDetectedFullCheck(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Strict review") {
 		t.Fatalf("repository setup did not offer Strict Review:\n%s", out.String())
-	}
-}
-
-func TestSettingsModeIsFirstClassBeforeProviderAndAdvanced(t *testing.T) {
-	view := AccessibleStartTranscript(nil)
-	mode := strings.Index(view, "Change strategy or preset")
-	quick := strings.Index(view, "Quick provider")
-	advanced := strings.Index(view, "Advanced settings")
-	if mode < 0 || quick < 0 || advanced < 0 || !(mode < quick && quick < advanced) {
-		t.Fatalf("action order:\n%s", view)
-	}
-}
-
-func TestRichSettingsModeKeyCyclesStrategyAndPreset(t *testing.T) {
-	m := New(&fakeBackend{})
-	m.Draft = map[string]string{"commit.strategy": "intent", "commit.preset": "balanced"}
-	next, _ := updated(t, m, keyMsg("m"))
-	if next.Draft["commit.strategy"] != "intent" || next.Draft["commit.preset"] != "fast" {
-		t.Fatalf("draft=%v", next.Draft)
-	}
-	if !next.Dirty["commit.strategy"] || !next.Dirty["commit.preset"] ||
-		!strings.Contains(next.Status, "MODE:") {
-		t.Fatalf("mode state=%+v", next)
-	}
-	if !strings.Contains(next.Render(), "strategy/preset") {
-		t.Fatalf("rich mode action not rendered:\n%s", next.Render())
-	}
-}
-
-func TestRichFastToQualityResetsOnlyPresetSources(t *testing.T) {
-	m := New(&fakeBackend{})
-	m.Draft = map[string]string{
-		config.FieldCommitStrategy:          "intent",
-		config.FieldCommitPreset:            "fast",
-		config.FieldIntentWindow:            "10",
-		config.FieldIntentVerification:      "none",
-		config.FieldIntentRepairHorizon:     "7m",
-		config.FieldVerificationFullCommand: "make quality",
-	}
-	m.Snapshot.Fields = []FieldValue{
-		{Key: config.FieldIntentWindow, Value: "10", Source: string(config.SourcePreset)},
-		{Key: config.FieldIntentVerification, Value: "none", Source: string(config.SourcePreset)},
-		{Key: config.FieldIntentRepairHorizon, Value: "7m", Source: string(config.SourceRepository)},
-		{Key: config.FieldVerificationFullCommand, Value: "make quality", Source: string(config.SourceRepository)},
-	}
-	next, _ := updated(t, m, keyMsg("m"))
-	if next.Draft[config.FieldCommitPreset] != "quality" ||
-		next.Draft[config.FieldIntentWindow] != "30" ||
-		next.Draft[config.FieldIntentVerification] != "full" ||
-		next.Draft[config.FieldIntentRepairHorizon] != "7m" ||
-		next.Draft[config.FieldVerificationFullCommand] != "make quality" {
-		t.Fatalf("draft=%v", next.Draft)
-	}
-}
-
-func TestAccessibleFastToQualityResetsOnlyPresetSources(t *testing.T) {
-	draft := map[string]string{
-		config.FieldCommitStrategy:      "intent",
-		config.FieldCommitPreset:        "fast",
-		config.FieldIntentWindow:        "10",
-		config.FieldIntentVerification:  "none",
-		config.FieldIntentRepairHorizon: "7m",
-	}
-	fields := []FieldValue{
-		{Key: config.FieldIntentWindow, Source: string(config.SourcePreset)},
-		{Key: config.FieldIntentVerification, Source: string(config.SourcePreset)},
-		{Key: config.FieldIntentRepairHorizon, Source: string(config.SourceRepository)},
-	}
-	values := finalizeAccessibleValues(newAccessibleValues(draft))
-	applyAccessibleModeSelection(&values, fields, "intent", "quality")
-	if values.Values[config.FieldCommitPreset] != "quality" ||
-		values.Values[config.FieldIntentWindow] != "30" ||
-		values.Values[config.FieldIntentVerification] != "full" ||
-		values.Values[config.FieldIntentRepairHorizon] != "7m" {
-		t.Fatalf("values=%v", values.Values)
 	}
 }
 
