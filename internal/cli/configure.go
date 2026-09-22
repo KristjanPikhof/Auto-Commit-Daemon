@@ -687,8 +687,8 @@ func runRepositoryConfigure(cmd *cobra.Command, opts configureOptions) error {
 						"Capture remains active; commit publishing is waiting.")
 					return nil
 				case settingsui.ConfigureRecoveryAdvanced:
-					fmt.Fprintln(cmd.OutOrStdout(),
-						"Run `acd settings` to edit advanced verification settings.")
+					fmt.Fprintf(cmd.OutOrStdout(),
+						"Run `acd config --repo %s` to edit advanced verification settings.\n", productListShellQuote(repo))
 					return nil
 				case settingsui.ConfigureRecoveryLeave:
 					fmt.Fprintln(cmd.OutOrStdout(),

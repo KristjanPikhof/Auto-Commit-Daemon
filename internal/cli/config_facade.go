@@ -32,7 +32,7 @@ type configValue struct {
 func newConfigGetCmd() *cobra.Command {
 	var options configScopeOptions
 	cmd := &cobra.Command{
-		Use: "get [KEY]", Short: "Show the settings ACD is using", Args: cobra.MaximumNArgs(1),
+		Use: "get [KEY]", Short: "Show saved settings and their sources", Args: cobra.MaximumNArgs(1),
 		Long: `Show one setting or all resolved settings for the selected scope.
 
 The output includes where each value came from. This command does not change
@@ -61,8 +61,8 @@ func newConfigSetCmd() *cobra.Command {
 		Use: "set KEY VALUE", Short: "Save one setting", Args: cobra.ExactArgs(2),
 		Long: `Save one setting for a repository, profile, or global defaults.
 
-ACD validates the name and value before saving. The output says whether the
-change is active now or requires the background worker to restart.`,
+ACD validates the name and value before saving a draft. The next-step command
+opens the matching scope for review and activation.`,
 		Example: `  acd config set commit.strategy intent
   acd config set commit.preset balanced
   acd config set commit.strategy event --scope global`,
