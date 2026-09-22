@@ -77,7 +77,7 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	values[config.FieldCommitPreset] = preset
 	values[config.FieldCommitFormat] = format
 	values[config.FieldProvider] = provider
-	values[config.FieldModel] = fallbackConfigureValue(strings.TrimSpace(opts.Model), "gpt-5.4-mini")
+	values[config.FieldModel] = fallbackConfigureValue(strings.TrimSpace(opts.Model), config.DefaultOpenAIModel)
 	values[config.FieldBaseURL] = fallbackConfigureValue(strings.TrimSpace(opts.BaseURL), ai.DefaultOpenAIBaseURL)
 	values[config.FieldCAFile] = strings.TrimSpace(opts.CAFile)
 	values[config.FieldTimeout] = ai.DefaultProviderTimeout.String()

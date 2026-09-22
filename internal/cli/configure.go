@@ -1144,7 +1144,7 @@ func dryRunConfigureSelection(
 	return settingsui.ConfigureSelection{
 		Experience: configureExperienceName(strategy, preset),
 		Strategy:   strategy, Preset: preset, CommitFormat: "imperative",
-		Provider: provider, Model: "gpt-5.4-mini", BaseURL: ai.DefaultOpenAIBaseURL,
+		Provider: provider, Model: config.DefaultOpenAIModel, BaseURL: ai.DefaultOpenAIBaseURL,
 		ProviderTimeout: ai.DefaultProviderTimeout.String(), VerificationMode: mode,
 		VerificationCommand: command, VerificationSource: source,
 		ExecutionMode: configureExecutionMode(strategy, preset),
@@ -1223,7 +1223,7 @@ func configureSelectionFromValues(values map[string]string) settingsui.Configure
 		Preset:              preset,
 		CommitFormat:        fallbackConfigureValue(values[config.FieldCommitFormat], "imperative"),
 		Provider:            provider,
-		Model:               fallbackConfigureValue(values[config.FieldModel], "gpt-5.4-mini"),
+		Model:               fallbackConfigureValue(values[config.FieldModel], config.DefaultOpenAIModel),
 		BaseURL:             baseURL,
 		ProviderTimeout:     fallbackConfigureValue(values[config.FieldTimeout], ai.DefaultProviderTimeout.String()),
 		CAFile:              strings.TrimSpace(values[config.FieldCAFile]),

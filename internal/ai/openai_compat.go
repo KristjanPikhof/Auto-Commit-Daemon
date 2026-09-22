@@ -58,14 +58,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
 // DefaultOpenAIBaseURL is the canonical OpenAI v1 endpoint root.
 const DefaultOpenAIBaseURL = "https://api.openai.com/v1"
 
-// DefaultOpenAIModel matches the spec §10.4 default.
-const DefaultOpenAIModel = "gpt-5.4-mini"
+// DefaultOpenAIModel is the default model for OpenAI-compatible requests.
+const DefaultOpenAIModel = config.DefaultOpenAIModel
 
 // DefaultOpenAITimeout is the per-request HTTP timeout. The caller's ctx
 // can shorten this; the field exists so a client without a deadline still

@@ -10,6 +10,8 @@ import (
 
 	"charm.land/huh/v2"
 	"github.com/charmbracelet/x/term"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 )
 
 // ConfigureWizardOptions contains presentation-safe setup defaults. Credential
@@ -74,7 +76,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		Preset:          fallback(defaults["commit.preset"], "balanced"),
 		CommitFormat:    fallback(defaults["commit.format"], "imperative"),
 		Provider:        fallback(defaults["ai.provider"], "openai-compat"),
-		Model:           fallback(defaults["ai.model"], "gpt-5.4-mini"),
+		Model:           fallback(defaults["ai.model"], config.DefaultOpenAIModel),
 		BaseURL:         fallback(defaults["ai.base_url"], "https://api.openai.com/v1"),
 		ProviderTimeout: fallback(defaults["ai.timeout"], "30s"),
 		CAFile:          defaults["ai.ca_file"],
