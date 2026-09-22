@@ -16,12 +16,12 @@ type FieldDescriptor struct {
 }
 
 var fieldDescriptors = []FieldDescriptor{
-	{Key: "ai.provider", Label: "Provider", Description: "Provider used for synthetic tests and future work", Apply: "next safe boundary"},
+	{Key: "ai.provider", Label: "AI provider", Description: "Provider used for synthetic tests and future work", Apply: "next safe boundary"},
 	{Key: "ai.model", Label: "Model", Description: "Provider model identifier", Apply: "next safe boundary"},
-	{Key: "ai.base_url", Label: "Base URL", Description: "OpenAI-compatible endpoint", Apply: "next safe boundary"},
+	{Key: "ai.base_url", Label: "Endpoint", Description: "OpenAI-compatible endpoint", Apply: "next safe boundary"},
 	{Key: "ai.timeout", Label: "Timeout", Description: "Bound for provider operations", Apply: "next safe boundary"},
 	{Key: "ai.ca_file", Label: "CA file", Description: "Custom TLS certificate authority path", Apply: "next safe boundary"},
-	{Key: "ai.api_key", Label: "API key", Description: "Environment or protected credential file", Apply: "managed by acd auth", Sensitive: true},
+	{Key: "ai.api_key", Label: "API key", Description: "Environment or protected credential file", Apply: "saved securely after testing", Sensitive: true},
 	{Key: "ai.diff_egress", Label: "Diff egress", Description: "Allow redacted repository diffs to eligible providers", Apply: "next safe boundary", Choices: []string{"off", "on"}},
 	{Key: "commit.strategy", Label: "Commit strategy", Description: "Event or intent grouping", Apply: "next safe boundary", Choices: []string{"event", "intent"}},
 	{Key: "commit.preset", Label: "Commit preset", Description: "Fast, Balanced, or Quality preset identity", Apply: "next safe boundary", Choices: []string{"fast", "balanced", "quality"}},
@@ -54,12 +54,6 @@ var fieldDescriptors = []FieldDescriptor{
 	{Key: "recovery.rewind_grace", Label: "Rewind grace seconds", Description: "Same-branch rewind safety period", Apply: "restart required"},
 	{Key: "recovery.shadow_generations", Label: "Shadow generations", Description: "Old shadow generation retention", Apply: "restart required"},
 	{Key: "client.ttl", Label: "Client TTL", Description: "Inactive client expiry seconds", Apply: "restart required"},
-}
-
-func Fields() []FieldDescriptor {
-	out := make([]FieldDescriptor, len(fieldDescriptors))
-	copy(out, fieldDescriptors)
-	return out
 }
 
 func safeText(s string) string {

@@ -323,7 +323,7 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel2()
 	failed := runPTYCommand(t, ctx2, env, 84, 30, 0, 0, "4\n\x00not-a-url\n\x00https://api.openai.com/v1\n\x0010\n\x00y\n\x00", bin, "config", "--repo", repo, "--accessible")
-	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "URL") {
+	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "Endpoint") {
 		t.Fatalf("validation recovery exit=%d\n%s", failed.ExitCode, failed.Stdout)
 	}
 	if after := readOptionalFile(t, settingsConfigPath(env)); after != body {
