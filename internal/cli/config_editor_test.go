@@ -257,15 +257,12 @@ func TestConfigEditorPublicRoutesAndOutsideRepository(t *testing.T) {
 	}
 }
 
-// Keep this compile-time assertion beside tests that exercise the real service.
-var _ settings.ProbeFunc = (&configEditor{}).probe
-
 func TestConfigEditorGlobalSaveUpdatesInheritingRuntimeOnly(t *testing.T) {
-	for _, saved := range []bool{false, true} {
-		t.Run(map[bool]string{false: "editor_change", true: "saved_cli_draft"}[saved], func(t *testing.T) { checkEditorGlobalActivation(t, saved) })
+	for _, scenario := range []string{"editor_change", "saved_cli_set", "saved_cli_reset"} {
+		t.Run(scenario, func(t *testing.T) { checkEditorGlobalActivation(t, scenario) })
 	}
 }
-func checkEditorGlobalActivation(t *testing.T, saved bool) {
+func checkEditorGlobalActivation(t *testing.T, scenario string) {
 	ctx := context.Background()
 	e := editorFixture(t)
 	e.repo = materializeTestRepo(t, false)
@@ -318,9 +315,15 @@ func checkEditorGlobalActivation(t *testing.T, saved bool) {
 		t.Fatal(err)
 	}
 	changes := map[string]*string{config.FieldModel: editorString("new-model")}
-	if saved {
+	expectedModel := "new-model"
+	if scenario == "saved_cli_set" {
 		editorSeed(t, e, func(doc *config.Document) { doc.Settings.Global[config.FieldModel] = json.RawMessage(`"new-model"`) })
 		changes = nil
+	} else if scenario == "saved_cli_reset" {
+		editorSeed(t, e, func(doc *config.Document) { delete(doc.Settings.Global, config.FieldModel) })
+		changes = nil
+		definition, _ := config.LookupField(config.FieldModel)
+		expectedModel = definition.Default
 	}
 	draft := editorDraft(t, e, "global", changes)
 	review, err := e.Review(ctx, draft)
@@ -352,7 +355,7 @@ func checkEditorGlobalActivation(t *testing.T, saved bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if values[config.FieldModel] != "new-model" || values[config.FieldCommitFormat] != "imperative" {
+	if values[config.FieldModel] != expectedModel || values[config.FieldCommitFormat] != "imperative" {
 		t.Fatalf("global change activated unrelated draft: %v", values)
 	}
 	if editorModel(t, e, "repo").Overridden {
@@ -383,5 +386,21 @@ func TestConfigEditorPresetChangeKeepsAuthoredValues(t *testing.T) {
 	}
 	if projection.values[config.FieldIntentWindow] != "30" || projection.values[config.FieldIntentVerification] != "full" || projection.values[config.FieldIntentRepairHorizon] != "7m0s" || projection.values[config.FieldVerificationFullCommand] != "make quality" {
 		t.Fatalf("preset projection=%v", projection.values)
+	}
+}
+
+func TestConfigEditorGlobalVerificationNeedsRepositoryScopeBeforeProbe(t *testing.T) {
+	e := editorFixture(t)
+	calls := 0
+	e.probe = func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		calls++
+		return ai.ProviderProbeResult{Success: true}, nil
+	}
+	draft := editorDraft(t, e, "global", map[string]*string{config.FieldIntentVerification: editorString("full"), config.FieldVerificationFullCommand: editorString("make test")})
+	if _, err := e.Review(context.Background(), draft); err == nil || !strings.Contains(err.Error(), "repository") {
+		t.Fatalf("err=%v", err)
+	}
+	if calls != 0 {
+		t.Fatal("invalid scope reached provider")
 	}
 }
