@@ -4,6 +4,12 @@
 
 ### Changed
 
+- `acd config` and `acd config edit` open an editable settings menu with visible
+  global/repository scope, masked API-key entry, and one reviewed Save action.
+  Global saves queue inherited changes for enabled repositories. Editing one
+  field preserves other overrides; individual fields can return to inheritance.
+  The old settings lab UI was removed; `acd settings` opens the same editor.
+
 - First setup recommends AI semantic commits with Everyday checks. Local automatic
   commits remain explicit and offline. Unattended first setup requires a provider
   choice; upgrades and configuration editing preserve existing choices.
