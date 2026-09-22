@@ -4,11 +4,14 @@ package integration_test
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -205,7 +208,11 @@ func TestSettingsTUIRealPTYLayoutsResizeAndRestore(t *testing.T) {
 	bin := buildAcdBinary(t)
 	for _, size := range [][2]int{{120, 40}, {84, 30}, {58, 22}} {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		result := runPTYCommand(t, ctx, env, size[0], size[1], 0, 0, "\x03", bin, "config", "--repo", repo)
+		input := "\x03\x00"
+		if size[1] < 24 {
+			input = "10\n\x00"
+		}
+		result := runPTYCommand(t, ctx, env, size[0], size[1], 0, 0, input, bin, "config", "--repo", repo)
 		cancel()
 		if result.ExitCode != 0 || !strings.Contains(result.Stdout, "ACD Settings") || !strings.Contains(result.Stdout, "Model") {
 			t.Fatalf("layout %v exit=%d\n%s", size, result.ExitCode, result.Stdout)
@@ -240,7 +247,7 @@ func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
 		t.Fatalf("rich exit=%d\n%s", rich.ExitCode, rich.Stdout)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	dirty := runPTYCommand(t, ctx, env, 72, 28, 0, 0, "3\n\x00unsaved-model\n\x0011\n\x00y\n", bin, "config", "--repo", repo, "--accessible")
+	dirty := runPTYCommand(t, ctx, env, 72, 28, 0, 0, "3\n\x00unsaved-model\n\x0010\n\x00y\n\x00", bin, "config", "--repo", repo, "--accessible")
 	cancel()
 	if dirty.ExitCode != 0 || !strings.Contains(dirty.Stdout, "Discard unsaved changes") {
 		t.Fatalf("discard exit=%d\n%s", dirty.ExitCode, dirty.Stdout)
@@ -260,7 +267,7 @@ func TestSettingsTUIAccessibleActionFirstTestAndRiskDecline(t *testing.T) {
 	bin := buildAcdBinary(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	declined := runPTYCommand(t, ctx, env, 72, 28, 0, 0, "10\n\x00n\n\x0011\n", bin, "config", "--repo", repo, "--accessible")
+	declined := runPTYCommand(t, ctx, env, 72, 28, 0, 0, "9\n\x00n\n\x0010\n\x00", bin, "config", "--repo", repo, "--accessible")
 	if declined.ExitCode != 0 || !strings.Contains(declined.Stdout, "Permission: send credentials to https://example.invalid/v1") {
 		t.Fatalf("decline exit=%d\n%s", declined.ExitCode, declined.Stdout)
 	}
@@ -280,7 +287,7 @@ func TestSettingsTUIRealPTYConfirmationRetryAndApplyDecline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	// Review a model edit, decline it, then review and approve the retained draft.
-	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00retained-model\n\x0010\n\x00n\n\x0010\n\x00y\n", bin, "config", "--repo", repo, "--accessible")
+	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00retained-model\n\x009\n\x00n\n\x009\n\x00y\n\x00", bin, "config", "--repo", repo, "--accessible")
 	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Waiting to apply") {
 		t.Fatalf("retry exit=%d\n%s", result.ExitCode, result.Stdout)
 	}
@@ -304,7 +311,7 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	// Global is the initial scope even inside a worktree. Model is always editable.
-	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00global-model\n\x0010\n\x00y\n", bin, "config", "--accessible", "--scope", "global")
+	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00global-model\n\x009\n\x00y\n\x00", bin, "config", "--accessible", "--scope", "global")
 	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Global defaults") || !strings.Contains(result.Stdout, "Settings saved") {
 		t.Fatalf("global save exit=%d\n%s", result.ExitCode, result.Stdout)
 	}
@@ -315,11 +322,59 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	// An invalid value is rejected at the field and can be corrected before saving.
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel2()
-	failed := runPTYCommand(t, ctx2, env, 84, 30, 0, 0, "2\n\x00invalid-provider\n\x00deterministic\n\x0011\n\x00y\n", bin, "config", "--repo", repo, "--accessible")
-	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "provider") {
+	failed := runPTYCommand(t, ctx2, env, 84, 30, 0, 0, "4\n\x00not-a-url\n\x00https://api.openai.com/v1\n\x0010\n\x00y\n\x00", bin, "config", "--repo", repo, "--accessible")
+	if failed.ExitCode != 0 || !strings.Contains(failed.Stdout, "URL") {
 		t.Fatalf("validation recovery exit=%d\n%s", failed.ExitCode, failed.Stdout)
 	}
 	if after := readOptionalFile(t, settingsConfigPath(env)); after != body {
 		t.Fatal("discard after invalid input changed saved config")
+	}
+}
+
+func TestConfigEditorAPIKeyMaskedAndTestedInRealPTY(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	var wrongKey atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") != "Bearer editor-secret-test-token" {
+			wrongKey.Store(true)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"test","type":"function","function":{"name":"commit_message","arguments":"{\"subject\":\"Test connection\",\"body\":\"\"}"}}]},"finish_reason":"tool_calls"}]}`))
+	}))
+	defer server.Close()
+	repo := tempRepo(t)
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=synthetic-test-model", "ACD_AI_BASE_URL="+server.URL+"/v1", "ACD_AI_API_KEY=")
+	bin := buildAcdBinary(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "5\n\x00editor-secret-test-token\n\x009\n\x00y\n\x00", bin, "config", "--repo", repo, "--accessible")
+	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Waiting to apply") {
+		t.Fatalf("API key editor exit=%d\n%s", result.ExitCode, result.Stdout)
+	}
+	if strings.Contains(result.Stdout, "editor-secret-test-token") {
+		t.Fatal("terminal exposed API key")
+	}
+	if calls.Load() != 1 || wrongKey.Load() {
+		t.Fatalf("probe count=%d wrongKey=%t", calls.Load(), wrongKey.Load())
+	}
+	configPath := settingsConfigPath(env)
+	if strings.Contains(readOptionalFile(t, configPath), "editor-secret-test-token") {
+		t.Fatal("key entered ordinary config")
+	}
+	credentialPath := filepath.Join(filepath.Dir(configPath), "credentials.json")
+	info, err := os.Stat(credentialPath)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("credential storage permissions: %v", err)
+	}
+	body := readOptionalFile(t, credentialPath)
+	if !strings.Contains(body, "editor-secret-test-token") {
+		t.Fatal("tested key was not stored")
+	}
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	snapshot := sqliteScalar(t, dbPath, "SELECT snapshot_json FROM config_revisions ORDER BY id DESC LIMIT 1")
+	if strings.Contains(snapshot, "editor-secret-test-token") {
+		t.Fatal("key entered runtime revision")
 	}
 }
