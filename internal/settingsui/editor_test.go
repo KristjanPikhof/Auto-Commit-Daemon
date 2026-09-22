@@ -70,7 +70,7 @@ func runEditorInput(t *testing.T, backend *editorFake, input, repo string) (stri
 
 func TestEditorModelIsEditableAndSaveIsOneReviewedAction(t *testing.T) {
 	b := &editorFake{}
-	out, err := runEditorInput(t, b, "2\n1\nnew-model\n9\ny\n", "")
+	out, err := runEditorInput(t, b, "2\n1\nnew-model\n8\ny\n", "")
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -88,7 +88,7 @@ func TestEditorModelIsEditableAndSaveIsOneReviewedAction(t *testing.T) {
 }
 func TestEditorDeclinedReviewAndDirtyCancelNeverSave(t *testing.T) {
 	b := &editorFake{}
-	out, err := runEditorInput(t, b, "2\n1\nnew-model\n9\nn\n10\ny\n", "")
+	out, err := runEditorInput(t, b, "2\n1\nnew-model\n8\nn\n9\ny\n", "")
 	if err != nil || b.saved != 0 {
 		t.Fatalf("err=%v saved=%d\n%s", err, b.saved, out)
 	}
@@ -98,7 +98,7 @@ func TestEditorDeclinedReviewAndDirtyCancelNeverSave(t *testing.T) {
 }
 func TestEditorFailedSaveKeepsCredentialAndEditsForRetry(t *testing.T) {
 	b := &editorFake{failOnce: true}
-	out, err := runEditorInput(t, b, "4\nsecret-test-token\n2\n1\nnew-model\n9\ny\n9\ny\n", "")
+	out, err := runEditorInput(t, b, "4\nsecret-test-token\n2\n1\nnew-model\n8\ny\n8\ny\n", "")
 	if err != nil || b.saved != 2 || len(b.drafts) != 2 {
 		t.Fatalf("err=%v saved=%d\n%s", err, b.saved, out)
 	}
@@ -112,7 +112,7 @@ func TestEditorFailedSaveKeepsCredentialAndEditsForRetry(t *testing.T) {
 func TestEditorSwitchScopeAndResetOneOverride(t *testing.T) {
 	b := &editorFake{}
 	// Select repository scope, choose Model, use inheritance, then save.
-	out, err := runEditorInput(t, b, "1\n2\n3\n2\n10\ny\n", "/test/repo")
+	out, err := runEditorInput(t, b, "1\n2\n3\n2\n9\ny\n", "/test/repo")
 	if err != nil || b.saved != 1 {
 		t.Fatalf("err=%v\n%s", err, out)
 	}
@@ -124,7 +124,7 @@ func TestEditorSwitchScopeAndResetOneOverride(t *testing.T) {
 }
 func TestEditorScopeChangeCanKeepUnsavedDraft(t *testing.T) {
 	b := &editorFake{}
-	out, err := runEditorInput(t, b, "3\n1\nnew-model\n1\n2\nn\n10\ny\n", "/test/repo")
+	out, err := runEditorInput(t, b, "3\n1\nnew-model\n1\n2\nn\n9\ny\n", "/test/repo")
 	if err != nil || b.saved != 1 {
 		t.Fatalf("err=%v\n%s", err, out)
 	}

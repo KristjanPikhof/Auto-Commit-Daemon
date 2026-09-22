@@ -110,6 +110,18 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 			draft = EditorDraft{Scope: scope, Changes: map[string]*string{}}
 			initialized = false
 			message = "Choose a setting to edit. Changes are saved together."
+		case "commit.mode":
+			mode := "everyday"
+			options := []huh.Option[string]{huh.NewOption("Everyday: semantic commits with safety checks", "everyday"), huh.NewOption("Maximum speed: immediate commits", "speed")}
+			if draft.Scope == "repo" {
+				options = append(options, huh.NewOption("Strict review: require project verification", "strict"))
+			}
+			if err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("Commit mode").Description("Advanced customizations are kept. Review the effective verification settings before saving.").Options(options...).Value(&mode))), opts); err != nil {
+				return editorExitError(err)
+			}
+			strategy, preset := configureExperienceMode(mode)
+			draft.Changes["commit.strategy"], draft.Changes["commit.preset"] = &strategy, &preset
+			message = "Commit mode changed. Choose Save changes when ready."
 		case "advanced":
 			advanced = !advanced
 		case "save":
@@ -194,12 +206,26 @@ func editorMenu(snapshot EditorSnapshot, draft EditorDraft, advanced bool, repo 
 	if repo != "" {
 		rows = append(rows, huh.NewOption("Editing: "+editorScopeLabel(draft.Scope, repo)+" (change)", "scope"))
 	}
-	primary := []string{"ai.provider", "ai.model", "ai.base_url", "ai.api_key", "commit.format", "commit.strategy", "commit.preset"}
+	primary := []string{"ai.provider", "ai.model", "ai.base_url", "ai.api_key", "commit.format", "commit.mode"}
 	byKey := map[string]EditorField{}
 	for _, field := range snapshot.Fields {
 		byKey[field.Key] = field
 	}
 	add := func(key string) {
+		if key == "commit.mode" {
+			strategy, preset := byKey["commit.strategy"].Value, byKey["commit.preset"].Value
+			label := strategy + " / " + preset
+			switch {
+			case strategy == "intent" && preset == "balanced":
+				label = "Everyday"
+			case strategy == "event" && preset == "fast":
+				label = "Maximum speed"
+			case strategy == "intent" && preset == "quality":
+				label = "Strict review"
+			}
+			rows = append(rows, huh.NewOption("Commit mode: "+label, key))
+			return
+		}
 		if key == "ai.api_key" {
 			status := snapshot.Credential
 			if draft.Credential != "" {
@@ -260,6 +286,29 @@ func editEditorField(ctx context.Context, field EditorField, scope string, opts 
 		if err != nil || action == "inherit" {
 			return "", action == "inherit", err
 		}
+	}
+	if field.Key == "ai.provider" {
+		provider := value
+		if strings.HasPrefix(provider, "subprocess:") {
+			provider = "subprocess"
+		}
+		err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("AI provider").Options(
+			huh.NewOption("OpenAI-compatible connection", "openai-compat"),
+			huh.NewOption("Local automatic commits (no API key)", "deterministic"),
+			huh.NewOption("Local subprocess provider", "subprocess"),
+		).Value(&provider))), opts)
+		if err != nil {
+			return "", false, err
+		}
+		if provider == "subprocess" {
+			name := strings.TrimPrefix(value, "subprocess:")
+			if !strings.HasPrefix(value, "subprocess:") {
+				name = ""
+			}
+			err = runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewInput().Title("Local provider name").Value(&name).Validate(func(value string) error { return validate("subprocess:" + strings.TrimSpace(value)) }))), opts)
+			provider = "subprocess:" + strings.TrimSpace(name)
+		}
+		return provider, false, err
 	}
 	var input huh.Field
 	if len(desc.Choices) > 0 {
