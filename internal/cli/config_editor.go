@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -268,6 +269,12 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 		return editorPlan{}, err
 	}
 	defer service.Close()
+	if draft.Scope == "global" {
+		mode := projection.values[config.FieldIntentVerification]
+		if mode != "none" && mode != "structural" || projection.values[config.FieldVerificationFastCommand] != "" || projection.values[config.FieldVerificationFullCommand] != "" {
+			return editorPlan{}, errors.New("project verification commands belong to a repository; switch Editing to This repository")
+		}
+	}
 	validation, err := service.Validate(ctx, projection.values, nil)
 	if err != nil {
 		return editorPlan{}, err
@@ -302,7 +309,8 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 	if len(keys) == 0 && draft.Credential == "" {
 		fmt.Fprintln(&review, "  Test and apply the saved settings.")
 	}
-	fmt.Fprintf(&review, "Connection: %s / %s / %s\n", safePreviewText(plan.values[config.FieldProvider], 100), safePreviewText(plan.values[config.FieldModel], 100), safeEndpointPreview(plan.values[config.FieldBaseURL]))
+	fmt.Fprintf(&review, "Connection: %s / %s / %s\n", safePreviewText(plan.values[config.FieldProvider], 100), safePreviewText(plan.values[config.FieldModel], 0), safeEndpointPreview(plan.values[config.FieldBaseURL]))
+	fmt.Fprintf(&review, "Commit mode: %s / %s; verification: %s\n", projection.values[config.FieldCommitStrategy], projection.values[config.FieldCommitPreset], projection.values[config.FieldIntentVerification])
 	writeEditorPermissions(&review, validation)
 	if len(validation.RestartChanged) > 0 {
 		fmt.Fprintln(&review, "Restart required for:", strings.Join(validation.RestartChanged, ", "))
@@ -342,12 +350,12 @@ func writeEditorPermissions(out io.Writer, validation settings.Validation) {
 		case ai.ConfirmationDiffEgress:
 			fmt.Fprintln(out, "Permission: send redacted repository changes to the selected provider")
 		case ai.ConfirmationSubprocessExecution:
-			fmt.Fprintln(out, "Permission: run the selected local provider")
+			fmt.Fprintln(out, "Permission: run the selected local provider: "+strconv.Quote(validation.ProviderConfig.Mode))
 		case ai.ConfirmationVerificationCommand:
 			mode := validation.ResolvedHot[config.FieldIntentVerification]
-			fmt.Fprintln(out, "Permission: run project verification:", safePreviewText(validation.ResolvedHot["verification."+mode+".command"], 4096))
+			fmt.Fprintln(out, "Permission: run project verification:", strconv.Quote(validation.ResolvedHot["verification."+mode+".command"]))
 		case ai.ConfirmationIntentRepair:
-			fmt.Fprintln(out, "Permission: repair eligible recent ACD-owned commits within the configured limits")
+			fmt.Fprintf(out, "Permission: repair up to %s eligible recent ACD-owned commits within %s\n", validation.ResolvedHot[config.FieldIntentRepairMaxCommits], validation.ResolvedHot[config.FieldIntentRepairHorizon])
 		}
 	}
 }
@@ -432,6 +440,26 @@ func (e *configEditor) globalActivations(ctx context.Context, doc *config.Docume
 				changes[key] = value
 			}
 		}
+		// CLI set/reset may already have saved a global draft before opening the
+		// editor. In that case compare inherited global choices with the applied
+		// runtime, without activating unrelated repository/profile drafts.
+		if len(draft.Changes) == 0 {
+			hasOverrides := false
+			for _, field := range after.fields {
+				definition, _ := config.LookupField(field.Key)
+				if definition.Boundary != config.ApplyHot {
+					continue
+				}
+				if field.Source == string(config.SourceRepository) || field.Source == string(config.SourceProfile) {
+					hasOverrides = true
+					continue
+				}
+				changes[field.Key] = field.Value
+			}
+			if hasOverrides {
+				fmt.Fprintf(out, "Keeps repository/profile overrides: %s\n", safeRepoPreview(record.Path))
+			}
+		}
 		keyChanged := draft.Credential != "" && after.values[config.FieldProvider] == "openai-compat"
 		if len(changes) == 0 && !keyChanged {
 			fmt.Fprintf(out, "Keeps repository/profile overrides: %s\n", safeRepoPreview(record.Path))
@@ -459,16 +487,32 @@ func (e *configEditor) globalActivations(ctx context.Context, doc *config.Docume
 			return nil, err
 		}
 		restart := false
-		for key, value := range changes {
+		changedHot := false
+		var differences strings.Builder
+		keys := make([]string, 0, len(changes))
+		for key := range changes {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			value := changes[key]
 			definition, _ := config.LookupField(key)
 			if definition.Boundary == config.ApplyRestart {
 				restart = true
 				continue
 			}
-			values[key] = value
+			if values[key] != value {
+				fmt.Fprintf(&differences, "  %s: %s → %s\n", key, editorDisplayValue(key, values[key]), editorDisplayValue(key, value))
+				changedHot = true
+				values[key] = value
+			}
 		}
 		if restart {
 			fmt.Fprintf(out, "Restart-required fields take effect on next start: %s\n", safeRepoPreview(record.Path))
+		}
+		if !changedHot && !keyChanged {
+			fmt.Fprintf(out, "Already using reviewed runtime settings: %s\n", safeRepoPreview(record.Path))
+			continue
 		}
 		target.values = values
 		service, err := settings.NewValidationService(ctx, e.options(record.Path, draft.Credential))
@@ -482,6 +526,7 @@ func (e *configEditor) globalActivations(ctx context.Context, doc *config.Docume
 		}
 		target.confirmations = validation.Confirmations
 		fmt.Fprintf(out, "Apply inherited changes: %s (%s / %s)\n", safeRepoPreview(record.Path), safeEndpointPreview(validation.ProviderConfig.BaseURL), safePreviewText(validation.ProviderConfig.Model, 100))
+		fmt.Fprint(out, differences.String())
 		writeEditorPermissions(out, validation)
 		targets = append(targets, target)
 	}

@@ -261,6 +261,11 @@ func TestConfigEditorPublicRoutesAndOutsideRepository(t *testing.T) {
 var _ settings.ProbeFunc = (&configEditor{}).probe
 
 func TestConfigEditorGlobalSaveUpdatesInheritingRuntimeOnly(t *testing.T) {
+	for _, saved := range []bool{false, true} {
+		t.Run(map[bool]string{false: "editor_change", true: "saved_cli_draft"}[saved], func(t *testing.T) { checkEditorGlobalActivation(t, saved) })
+	}
+}
+func checkEditorGlobalActivation(t *testing.T, saved bool) {
 	ctx := context.Background()
 	e := editorFixture(t)
 	e.repo = materializeTestRepo(t, false)
@@ -312,7 +317,12 @@ func TestConfigEditorGlobalSaveUpdatesInheritingRuntimeOnly(t *testing.T) {
 	if err := central.Save(e.roots, registry); err != nil {
 		t.Fatal(err)
 	}
-	draft := editorDraft(t, e, "global", map[string]*string{config.FieldModel: editorString("new-model")})
+	changes := map[string]*string{config.FieldModel: editorString("new-model")}
+	if saved {
+		editorSeed(t, e, func(doc *config.Document) { doc.Settings.Global[config.FieldModel] = json.RawMessage(`"new-model"`) })
+		changes = nil
+	}
+	draft := editorDraft(t, e, "global", changes)
 	review, err := e.Review(ctx, draft)
 	if err != nil {
 		t.Fatal(err)
