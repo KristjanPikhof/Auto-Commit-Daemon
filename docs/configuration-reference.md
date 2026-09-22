@@ -12,7 +12,7 @@ Run `acd config get` to inspect effective repository settings and environment ov
 | `ai.base_url` | `ACD_AI_BASE_URL` | `https://api.openai.com/v1` | next work boundary | yes | no |
 | `ai.ca_file` | `ACD_AI_CA_FILE` | none | next work boundary | yes | no |
 | `ai.diff_egress` | `ACD_AI_DIFF_EGRESS` | `false` | next work boundary | yes | no |
-| `ai.model` | `ACD_AI_MODEL` | `gpt-5.4-mini` | next work boundary | yes | no |
+| `ai.model` | `ACD_AI_MODEL` | `gpt-6-luna` | next work boundary | yes | no |
 | `ai.provider` | `ACD_AI_PROVIDER` | `deterministic` | next work boundary | yes | no |
 | `ai.timeout` | `ACD_AI_TIMEOUT` | `5m` | next work boundary | yes | no |
 | `capture.max_file_bytes` | `ACD_MAX_FILE_BYTES` | `5242880` | restart required | yes | no |
