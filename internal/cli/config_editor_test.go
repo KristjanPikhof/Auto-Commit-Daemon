@@ -259,3 +259,116 @@ func TestConfigEditorPublicRoutesAndOutsideRepository(t *testing.T) {
 
 // Keep this compile-time assertion beside tests that exercise the real service.
 var _ settings.ProbeFunc = (&configEditor{}).probe
+
+func TestConfigEditorGlobalSaveUpdatesInheritingRuntimeOnly(t *testing.T) {
+	ctx := context.Background()
+	e := editorFixture(t)
+	e.repo = materializeTestRepo(t, false)
+	overrideRepo := materializeTestRepo(t, false)
+	editorSeed(t, e, func(doc *config.Document) {
+		doc.Settings.Global[config.FieldModel] = json.RawMessage(`"old-model"`)
+		doc.Settings.Repositories[central.CanonicalID(overrideRepo)] = config.RepositorySettings{Fields: config.Overrides{config.FieldModel: json.RawMessage(`"custom-model"`)}}
+	})
+	// Establish the inheriting repository's applied runtime, then add an unrelated
+	// saved draft to prove a global model edit does not activate that draft.
+	service, err := settings.NewService(ctx, e.options(e.repo, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validation, err := service.Validate(ctx, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tested, err := service.TestProvider(ctx, nil, validation.Confirmations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := service.Apply(ctx, settings.ApplyRequest{TestedFingerprint: tested.Fingerprint, Confirmations: validation.Confirmations, ExpectedGeneration: validation.SourceGeneration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Close()
+	dbPath := filepath.Join(e.repo, ".git", "acd", "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if ok, err := state.AcknowledgeConfigActivation(ctx, db, baseline.RequestID, baseline.RevisionID); err != nil || !ok {
+		t.Fatalf("ack: %t %v", ok, err)
+	}
+	if ok, err := state.ApplyConfigActivation(ctx, db, baseline.RequestID, baseline.RevisionID); err != nil || !ok {
+		t.Fatalf("apply: %t %v", ok, err)
+	}
+	editorSeed(t, e, func(doc *config.Document) {
+		doc.Settings.Repositories[central.CanonicalID(e.repo)] = config.RepositorySettings{Fields: config.Overrides{config.FieldCommitFormat: json.RawMessage(`"conventional"`)}}
+	})
+	registry := &central.Registry{Version: central.RegistryVersion, Repos: []central.RepoRecord{
+		{Path: e.repo, RepoHash: central.CanonicalID(e.repo), StateDB: dbPath, LifecycleState: central.RepoLifecycleEnabled},
+		{Path: overrideRepo, RepoHash: central.CanonicalID(overrideRepo), StateDB: filepath.Join(overrideRepo, ".git", "acd", "state.db"), LifecycleState: central.RepoLifecycleEnabled},
+	}}
+	if err := central.Save(e.roots, registry); err != nil {
+		t.Fatal(err)
+	}
+	draft := editorDraft(t, e, "global", map[string]*string{config.FieldModel: editorString("new-model")})
+	review, err := e.Review(ctx, draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(review.Text, "Keeps repository/profile overrides") || !strings.Contains(review.Text, "Apply inherited changes") {
+		t.Fatal(review.Text)
+	}
+	result, err := review.Save(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result, "could not apply") {
+		t.Fatal(result)
+	}
+	runtime, err := state.RuntimeConfigActivationState(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.DesiredRevisionID.Int64 == baseline.RevisionID || runtime.AppliedRevisionID.Int64 != baseline.RevisionID {
+		t.Fatalf("runtime=%+v", runtime)
+	}
+	revision, err := state.ConfigRevisionByID(ctx, db, runtime.DesiredRevisionID.Int64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, _, err := credentialRuntimeContract(revision.SnapshotJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values[config.FieldModel] != "new-model" || values[config.FieldCommitFormat] != "imperative" {
+		t.Fatalf("global change activated unrelated draft: %v", values)
+	}
+	if editorModel(t, e, "repo").Overridden {
+		t.Fatal("global activation created repository model override")
+	}
+	scoped := *e
+	scoped.repo = overrideRepo
+	if editorModel(t, &scoped, "repo").Value != "custom-model" {
+		t.Fatal("repository override changed")
+	}
+	if _, err := os.Stat(filepath.Join(overrideRepo, ".git", "acd")); !os.IsNotExist(err) {
+		t.Fatal("overridden repository state was opened for writing")
+	}
+}
+
+func TestConfigEditorPresetChangeKeepsAuthoredValues(t *testing.T) {
+	e := editorFixture(t)
+	e.repo = materializeTestRepo(t, false)
+	editorSeed(t, e, func(doc *config.Document) {
+		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
+		doc.Settings.Global[config.FieldCommitPreset] = json.RawMessage(`"fast"`)
+		doc.Settings.Repositories[central.CanonicalID(e.repo)] = config.RepositorySettings{Fields: config.Overrides{config.FieldIntentRepairHorizon: json.RawMessage(`"7m"`), config.FieldVerificationFullCommand: json.RawMessage(`"make quality"`)}}
+	})
+	projection, err := e.project("repo", map[string]*string{config.FieldCommitPreset: editorString("quality")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.values[config.FieldIntentWindow] != "30" || projection.values[config.FieldIntentVerification] != "full" || projection.values[config.FieldIntentRepairHorizon] != "7m" || projection.values[config.FieldVerificationFullCommand] != "make quality" {
+		t.Fatalf("preset projection=%v", projection.values)
+	}
+}

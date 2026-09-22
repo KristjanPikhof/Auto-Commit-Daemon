@@ -91,3 +91,10 @@ func descriptor(key string) FieldDescriptor {
 	}
 	return FieldDescriptor{Key: safeText(key), Label: safeText(key), Apply: "next safe boundary"}
 }
+
+func fallback(value, defaultValue string) string {
+	if strings.TrimSpace(value) == "" {
+		return defaultValue
+	}
+	return value
+}
