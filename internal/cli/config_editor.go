@@ -143,6 +143,9 @@ func (e *configEditor) projectDocument(doc *config.Document, scope string, chang
 			delete(selected, key)
 			continue
 		}
+		if err := validateEditorField(key, *value); err != nil {
+			return editorProjection{}, err
+		}
 		raw, err := normalizedConfigRaw(definition, *value)
 		if err != nil {
 			return editorProjection{}, err
@@ -305,7 +308,7 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 		fmt.Fprintln(&review, "Restart required for:", strings.Join(validation.RestartChanged, ", "))
 	}
 	if draft.Scope == "repo" {
-		target, err := e.repositoryActivation(ctx, e.repo, plan.values, draft.Credential)
+		target, err := e.repositoryActivation(ctx, e.repo, plan.values)
 		if err != nil {
 			return editorPlan{}, err
 		}
@@ -362,7 +365,7 @@ func cloneEditorChanges(changes map[string]*string) map[string]*string {
 	return out
 }
 
-func (e *configEditor) repositoryActivation(ctx context.Context, repo string, values map[string]string, secret string) (editorActivation, error) {
+func (e *configEditor) repositoryActivation(ctx context.Context, repo string, values map[string]string) (editorActivation, error) {
 	wt, err := gitpkg.ResolveWorktree(ctx, repo)
 	if err != nil {
 		return editorActivation{}, err
@@ -434,7 +437,7 @@ func (e *configEditor) globalActivations(ctx context.Context, doc *config.Docume
 			fmt.Fprintf(out, "Keeps repository/profile overrides: %s\n", safeRepoPreview(record.Path))
 			continue
 		}
-		target, err := e.repositoryActivation(ctx, record.Path, nil, draft.Credential)
+		target, err := e.repositoryActivation(ctx, record.Path, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -490,9 +493,29 @@ func (e *configEditor) save(ctx context.Context, plan editorPlan) (string, error
 	if err != nil {
 		return "", err
 	}
-	if fresh.text != plan.text || !maps.Equal(fresh.values, plan.values) || !editorTargetsEqual(fresh.targets, plan.targets) {
+	if fresh.validation.ProviderConfig.APIKey != plan.validation.ProviderConfig.APIKey || fresh.text != plan.text || !maps.Equal(fresh.values, plan.values) || !editorTargetsEqual(fresh.targets, plan.targets) {
 		return "", errors.New("settings or affected repositories changed; review again before saving")
 	}
+	// Share successful synthetic probes across repositories using the same
+	// connection. This cache exists only for this save and is never serialized.
+	cached := *e
+	probes := map[editorProbeConnection]ai.ProviderProbeResult{}
+	probe := e.probe
+	if probe == nil {
+		probe = ai.ProbeProviderConfig
+	}
+	cached.probe = func(ctx context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		key := editorProbeConnection{mode: cfg.Mode, endpoint: cfg.BaseURL, model: cfg.Model, credential: cfg.APIKey, ca: cfg.CAFile, timeout: cfg.Timeout.String(), format: string(cfg.CommitFormat)}
+		if result, found := probes[key]; found {
+			return result, nil
+		}
+		result, err := probe(ctx, cfg)
+		if err == nil && result.Success {
+			probes[key] = result
+		}
+		return result, err
+	}
+	e = &cached
 	// All probes happen before authoring, credentials, or runtime state are written.
 	service, err := e.validationService(ctx, plan.draft.Scope, plan.draft.Credential)
 	if err != nil {
@@ -531,7 +554,7 @@ func (e *configEditor) save(ctx context.Context, plan editorPlan) (string, error
 	if err != nil {
 		return "", err
 	}
-	if fresh.text != plan.text || !editorTargetsEqual(fresh.targets, plan.targets) {
+	if fresh.validation.ProviderConfig.APIKey != plan.validation.ProviderConfig.APIKey || fresh.text != plan.text || !editorTargetsEqual(fresh.targets, plan.targets) {
 		return "", errors.New("settings or affected repositories changed during testing; review again")
 	}
 	oldCredential, hadCredential := "", false
@@ -610,4 +633,25 @@ func editorSetupValidation(validationTarget configureValidationTarget, target ed
 	command := target.values[config.FieldVerificationFullCommand]
 	digest := sha256.Sum256([]byte(command))
 	return &settings.SetupValidation{BranchRef: validationTarget.BranchRef, BranchGeneration: validationTarget.BranchGeneration, ExpectedHead: validationTarget.ExpectedHead, Mode: "full", CommandSource: "settings editor", CommandDigest: fmt.Sprintf("%x", digest), ApprovalID: target.fingerprint}
+}
+
+// Validate individual connection inputs without requiring a key or making requests.
+func validateEditorField(key, value string) error {
+	cfg := ai.ProviderConfig{Mode: "openai-compat", BaseURL: ai.DefaultOpenAIBaseURL, Model: "validation", APIKey: "validation-only"}
+	switch key {
+	case config.FieldProvider:
+		cfg.Mode = value
+	case config.FieldModel:
+		cfg.Model = value
+	case config.FieldBaseURL:
+		cfg.BaseURL = value
+	default:
+		return nil
+	}
+	_, err := ai.ValidateProviderConfig(cfg)
+	return err
+}
+
+type editorProbeConnection struct {
+	mode, endpoint, model, credential, ca, timeout, format string
 }
