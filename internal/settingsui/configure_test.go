@@ -26,7 +26,7 @@ func TestConfigureWizardAccessibleStagesGlobalIntentBalancedWithoutTests(t *test
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
-			"ai.model": "gpt-5.4-mini", "ai.base_url": "https://api.openai.com/v1",
+			"ai.model": "gpt-6-luna", "ai.base_url": "https://api.openai.com/v1",
 			"ai.timeout": "30s",
 		},
 	})
@@ -76,7 +76,7 @@ func TestConfigureWizardBalancedIgnoresSavedAndDetectedVerification(t *testing.T
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
-			"ai.model": "gpt-5.4-mini", "ai.base_url": "https://api.openai.com/v1",
+			"ai.model": "gpt-6-luna", "ai.base_url": "https://api.openai.com/v1",
 			"ai.timeout": "30s", "verification.fast.command": "go test ./...",
 		},
 	})
@@ -109,7 +109,7 @@ func TestConfigureWizardStrictUnavailableWithoutFullCheck(t *testing.T) {
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
-			"ai.model":    "gpt-5.4-mini",
+			"ai.model":    "gpt-6-luna",
 			"ai.base_url": "https://api.openai.com/v1",
 			"ai.timeout":  "30s",
 		},
@@ -132,7 +132,7 @@ func TestConfigureWizardGlobalExplicitStrictIsUnavailable(t *testing.T) {
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "quality",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
-			"ai.model": "gpt-5.4-mini", "ai.base_url": "https://api.openai.com/v1",
+			"ai.model": "gpt-6-luna", "ai.base_url": "https://api.openai.com/v1",
 			"ai.timeout": "30s",
 		},
 	})
@@ -157,7 +157,7 @@ func TestConfigureWizardRepositoryStrictUsesDetectedFullCheck(t *testing.T) {
 		Defaults: map[string]string{
 			"commit.strategy": "intent", "commit.preset": "balanced",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
-			"ai.model": "gpt-5.4-mini", "ai.base_url": "https://api.openai.com/v1",
+			"ai.model": "gpt-6-luna", "ai.base_url": "https://api.openai.com/v1",
 			"ai.timeout": "30s",
 		},
 	})
