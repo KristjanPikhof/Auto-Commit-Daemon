@@ -209,7 +209,7 @@ reviewScope:
 			}
 			projection, _, statusErr := readProductPublicationDrain(ctx, lookup)
 			if statusErr == nil {
-				if drain := selectReconnectPublicationDrain(projection,
+				if drain := productPublicationDrainForProgress(projection,
 					lookup.Record.WorktreeID, startedAt); drain != nil {
 					remaining := drain.TargetEventCount - drain.PublishedEventCount
 					writeProductCommitAllProgress(progressOut, *drain, remaining)
@@ -413,6 +413,22 @@ func selectReconnectPublicationDrain(
 	return drain
 }
 
+func productPublicationDrainForProgress(
+	projection state.PublicationDrainReadOnlyProjection,
+	worktreeID string,
+	startedAt time.Time,
+) *state.PublicationDrain {
+	if drain := selectReconnectPublicationDrain(projection, worktreeID, startedAt); drain != nil {
+		return drain
+	}
+	// A repeated command may be waiting for a drain created hours ago. This
+	// older target is useful for display, but not proof that this request began.
+	if projection.Latest != nil && projection.Latest.WorktreeID == worktreeID {
+		return projection.Latest
+	}
+	return nil
+}
+
 func productCommitAllResultFromDrain(drain state.PublicationDrain) productCommitAllResult {
 	var maxSeq int64
 	for _, seq := range drain.EventSeqs {
@@ -444,6 +460,8 @@ func waitForProductPublicationDrain(
 	report := time.NewTicker(5 * time.Second)
 	defer report.Stop()
 	var latest *state.PublicationDrain
+	var workerAvailable bool
+	var lastRestart time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -451,6 +469,10 @@ func waitForProductPublicationDrain(
 		case <-report.C:
 			if quiet {
 				continue
+			}
+			if !workerAvailable {
+				fmt.Fprintln(progressOut,
+					"Commit all: worker unavailable; reconnecting to the protected publication run")
 			}
 			if latest == nil {
 				fmt.Fprintln(progressOut,
@@ -460,13 +482,20 @@ func waitForProductPublicationDrain(
 			remaining := latest.TargetEventCount - latest.PublishedEventCount
 			writeProductCommitAllProgress(progressOut, *latest, remaining)
 		case <-poll.C:
-			projection, _, err := readProductPublicationDrain(ctx, lookup)
+			projection, live, err := readProductPublicationDrain(ctx, lookup)
 			if err != nil {
 				continue
 			}
+			workerAvailable = live
 			latest = productPublicationDrainByID(projection, result.DrainID)
 			if latest == nil {
 				continue
+			}
+			if !live && latest.Phase != state.PublicationDrainCompleted &&
+				latest.Phase != state.PublicationDrainNeedsAction &&
+				time.Since(lastRestart) >= 15*time.Second {
+				lastRestart = time.Now()
+				_, _ = callSupervisor(ctx, lookup, "restart_repository", nil, 30*time.Second)
 			}
 			result.Phase = latest.Phase
 			result.TargetEvents = latest.TargetEventCount

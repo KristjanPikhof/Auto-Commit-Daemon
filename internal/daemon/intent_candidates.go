@@ -460,7 +460,9 @@ func EvaluateIntentCandidates(
 	// The size limit guards the locally reconstructed evidence partition.
 	// A repaired provider plan still carries a nonempty fallback label, but
 	// has already passed the semantic and dependency gates.
-	if input.Preset == config.PresetBalanced && fallback == "evidence_partition" {
+	if input.Preset == config.PresetBalanced &&
+		(fallback == "evidence_partition" ||
+			result.Fallback == "deterministic_semantic_rebuild") {
 		if applyBalancedFallbackBounds(&plan, existingByID, captureBySeq) {
 			result.NeedsAttention = true
 		}
