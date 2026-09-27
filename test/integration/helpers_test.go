@@ -630,6 +630,10 @@ func signalCheckpointProcess(expected checkpointProcessIdentity, signal syscall.
 // variables to customize provider and timing fields, but never rely on the
 // unsupported env-only v1 startup path.
 func activateIntentV2Runtime(t *testing.T, repo string, extra ...string) []string {
+	return activateIntentV2RuntimeWithPreset(t, repo, "fast", extra...)
+}
+
+func activateIntentV2RuntimeWithPreset(t *testing.T, repo, presetName string, extra ...string) []string {
 	t.Helper()
 	values := make(map[string]string, len(extra))
 	cleaned := make([]string, 0, len(extra))
@@ -654,7 +658,7 @@ func activateIntentV2Runtime(t *testing.T, repo string, extra ...string) []strin
 	}
 	overrides := config.Overrides{}
 	overrides[config.FieldCommitStrategy], _ = json.Marshal("intent")
-	overrides[config.FieldCommitPreset], _ = json.Marshal("fast")
+	overrides[config.FieldCommitPreset], _ = json.Marshal(presetName)
 	resolved, preset, err := config.ResolveAll(config.ResolveInput{
 		Repository: overrides, LookupEnv: lookup,
 	}, overrides)
