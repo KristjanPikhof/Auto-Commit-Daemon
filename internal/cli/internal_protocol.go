@@ -848,7 +848,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		params["drain_publication"] = true
 		request.Params, _ = json.Marshal(params)
 	}
-	if request.Method == "hint" || request.Method == "checkpoint_barrier" {
+	if workerRequestRecordsActivity(request) {
 		state.RecordActivity(ctx, runtime.db, time.Now())
 	}
 	if sessionErr := applyWorkerSessionParams(ctx, runtime.db, request.Params); sessionErr != nil {
@@ -1734,6 +1734,28 @@ func checkpointBarrierWait(ctx context.Context) time.Duration {
 		return max(remaining, time.Millisecond)
 	}
 	return supervisor.CheckpointBarrierTimeout
+}
+
+// Plain checkpoint barriers also serve setup, upgrades and readiness probes.
+// Only user/harness requests should renew the compact dashboard activity window.
+func workerRequestRecordsActivity(request supervisor.Request) bool {
+	if request.Method == "hint" || request.Method == "publication_drain_start" {
+		return true
+	}
+	if request.Method != "checkpoint_barrier" {
+		return false
+	}
+	var params struct {
+		Kind             string `json:"kind"`
+		SessionID        string `json:"session_id"`
+		Harness          string `json:"harness"`
+		DrainPublication bool   `json:"drain_publication"`
+	}
+	if json.Unmarshal(request.Params, &params) != nil {
+		return false
+	}
+	return params.DrainPublication || params.Kind == "logical_boundary" ||
+		params.SessionID != "" || params.Harness != ""
 }
 
 func applyWorkerActivityHint(ctx context.Context, db *state.DB, raw json.RawMessage) error {

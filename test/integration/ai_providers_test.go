@@ -233,7 +233,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 }
 
 // A temporary provider failure preserves a checkpoint and schedules AI retry.
-func TestAI_OpenAICompat5xxFallback(t *testing.T) {
+func TestAI_OpenAICompat5xxWaitsForAI(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -278,7 +278,7 @@ func TestAI_OpenAICompat5xxFallback(t *testing.T) {
 }
 
 // Invalid message format must wait for a valid AI message without downgrading.
-func TestAI_OpenAICompatConventionalWrongFormatFallback(t *testing.T) {
+func TestAI_OpenAICompatConventionalWrongFormatWaitsForAI(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -528,7 +528,7 @@ done
 }
 
 // A timed-out plugin must keep its capture protected and retry the provider.
-func TestAI_SubprocessPluginTimeoutFallback(t *testing.T) {
+func TestAI_SubprocessPluginTimeoutWaitsForAI(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available; subprocess plugin tests skipped")

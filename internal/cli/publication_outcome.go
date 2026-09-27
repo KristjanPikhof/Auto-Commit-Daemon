@@ -23,12 +23,18 @@ type publicationOutcome struct {
 }
 
 func readPublicationOutcome(ctx context.Context, db *sql.DB, protected bool, repo string) (publicationOutcome, error) {
-	var result publicationOutcome
 	branch, generation, known, err := currentWorktreeReplayPair(ctx, db, repo)
 	if err != nil {
-		return result, err
+		return publicationOutcome{}, err
 	}
-	err = db.QueryRowContext(ctx, `
+	return readPublicationOutcomeForPair(ctx, db, protected, repo, branch, generation, known)
+}
+
+// Dashboard callers already resolved the live pair. Reuse that proof instead
+// of starting the same Git processes again for every repository row.
+func readPublicationOutcomeForPair(ctx context.Context, db *sql.DB, protected bool, repo, branch string, generation int64, known bool) (publicationOutcome, error) {
+	var result publicationOutcome
+	err := db.QueryRowContext(ctx, `
 SELECT COALESCE(SUM(CASE WHEN state='published' AND branch_ref=? AND branch_generation=? THEN 1 ELSE 0 END),0),
        COALESCE(SUM(CASE WHEN state='recovered' THEN 1 ELSE 0 END),0),
        COALESCE(SUM(CASE WHEN state NOT IN ('published','recovered') AND branch_ref=? AND branch_generation=? THEN 1 ELSE 0 END),0)

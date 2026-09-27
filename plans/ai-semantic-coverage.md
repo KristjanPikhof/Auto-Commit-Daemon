@@ -200,7 +200,8 @@ presentation. The old watch loop and its two tests were removed; current
 - The full CLI race suite finished in 237.572 seconds. Failures identified
   assertions against concurrently changed status text, metrics and setup help.
   The new preview fixture's missing initial commit was fixed and verified with
-  its focused test. The combined branch gate must pass before completion.
+  its focused test. See the [final validation record](ai-semantic-validation.md)
+  for the combined branch results.
 - `git diff --check` passed after the structural cleanup.
 
 ## Additional removed controller tests
@@ -254,3 +255,22 @@ and lifecycle/Intent flush integration tests cover the supported IPC path.
 
 - `TestListWatch_AlreadyCanceledContextReturnsNil`
 - `TestListWatch_RendersMultipleSnapshotsAndStopsOnCancel`
+
+## Additional test reliability improvements
+
+`TestIsTransientUpdateRefLockError_PinsRealGitMessage` now holds its own ref lock
+inside an isolated repository and calls the production Git helper once. It
+still checks Git's real error text. The previous test raced two commands up to
+20 times and skipped when contention did not occur; that optional coverage and
+repeated process setup are gone.
+
+Interactive commit-all coverage now includes real checkpoint capture of a late
+unreviewed path, refusal before staging consumption, renewed approval, rename
+endpoints and every operation stored in a multi-operation capture. A separate
+restart case proves that a new approval can replace an old staging-blocked
+request without rewriting the old index consent.
+
+Queued commit-all previews also include both rename endpoints and every stored
+operation path when the current worktree no longer shows those edits. The
+read-only preview test checks this display, stable scope digests and unchanged
+stored state.

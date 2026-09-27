@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-shard_count=${ACD_TEST_SHARDS:-2}
+shard_count=${ACD_TEST_SHARDS:-3}
 package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2}
 test_timeout=${ACD_TEST_TIMEOUT:-4m15s}
 timing_sensitive_daemon_tests='^(TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent)$'
@@ -83,10 +83,10 @@ run_core() {
 
   validate_shard "$count" "$index"
   run_package_shard ./internal/cli "$count" "$index" \
-    -race -count=1 -timeout "$test_timeout" &
+    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-4}" -timeout "$test_timeout" &
   cli_pid=$!
   run_package_shard ./internal/daemon "$count" "$index" \
-    -race -count=1 -timeout "$test_timeout" \
+    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-4}" -timeout "$test_timeout" \
     -skip "$timing_sensitive_daemon_tests" &
   daemon_pid=$!
 
@@ -178,7 +178,7 @@ run_all() {
   output_root=$(mktemp -d "${TMPDIR:-/tmp}/acd-tests.XXXXXX")
 
   for ((index = 0; index < shard_count; index++)); do
-    run_core "$shard_count" "$index" \
+    ACD_TEST_CASE_PARALLELISM=${ACD_TEST_CASE_PARALLELISM:-2} run_core "$shard_count" "$index" \
       >"$output_root/core-$index.log" 2>&1 &
     core_pids[$index]=$!
   done

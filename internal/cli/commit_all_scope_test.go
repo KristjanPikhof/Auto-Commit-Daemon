@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -180,5 +181,71 @@ func TestCommitAllTargetScopeChecksEveryStoredOperation(t *testing.T) {
 	matches, err := commitAllTargetMatchesScope(ctx, db, target, scope)
 	if err != nil || !matches {
 		t.Fatalf("reviewed operations refused: %v %v", matches, err)
+	}
+}
+
+func TestCommitAllPreviewIncludesQueuedRenameAndOperationPaths(t *testing.T) {
+	ctx := context.Background()
+	repo, dbPath, db := makeSeededRepoStateDB(t)
+	head, err := gitpkg.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx := daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head}
+	if _, err := daemon.BootstrapShadow(ctx, repo, db, cctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "mv", "seed.txt", "renamed.txt"); err != nil {
+		t.Fatal(err)
+	}
+	checker := gitpkg.NewIgnoreChecker(repo)
+	defer checker.Close()
+	if _, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{IgnoreChecker: checker, SensitiveMatcher: state.NewSensitiveMatcher()}); err != nil {
+		t.Fatal(err)
+	}
+	var renamed int64
+	if err := db.ReadSQL().QueryRowContext(ctx, "SELECT seq FROM capture_events WHERE operation='rename' AND path='renamed.txt' AND old_path='seed.txt'").Scan(&renamed); err != nil {
+		t.Fatal(err)
+	}
+	// The editor returns to HEAD before publication. Current status no longer
+	// supplies the rename endpoints, but the queued change is still reviewed.
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "reset", "--hard", "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+	before := fileDigest(t, dbPath)
+	scope, err := inspectCommitAllScope(ctx, repo, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scope.ChangedPaths) != 0 || !reflect.DeepEqual(scope.QueuedPaths, []string{"renamed.txt", "seed.txt"}) || !reflect.DeepEqual(scope.queuedSeqs, []int64{renamed}) {
+		t.Fatalf("queued rename preview=%+v ids=%v", scope, scope.queuedSeqs)
+	}
+	if fileDigest(t, dbPath) != before {
+		t.Fatal("preview changed stored state")
+	}
+	// Supported older capture records can contain more than one ordered op.
+	multi := appendFixEvent(t, ctx, db, state.CaptureEvent{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head, Operation: "modify", Path: "source.go", Fidelity: "exact", State: state.EventStatePending}, []state.CaptureOp{
+		{Op: "modify", Path: "source.go", Fidelity: "exact"},
+		{Op: "rename", Path: "generated.go", OldPath: sql.NullString{String: "old_generated.go", Valid: true}, Fidelity: "exact"},
+	})
+	scope, err = inspectCommitAllScope(ctx, repo, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(scope.QueuedPaths, []string{"renamed.txt", "seed.txt", "source.go", "generated.go", "old_generated.go"}) || !reflect.DeepEqual(scope.queuedSeqs, []int64{renamed, multi}) {
+		t.Fatalf("queued operation preview=%+v ids=%v", scope, scope.queuedSeqs)
+	}
+	repeated, err := inspectCommitAllScope(ctx, repo, dbPath)
+	if err != nil || repeated.Digest != scope.Digest {
+		t.Fatalf("unstable digest: %s %v", repeated.Digest, err)
+	}
+	// Alter only a secondary fixture endpoint: the digest must bind that
+	// displayed endpoint even when the event identity and summary are unchanged.
+	if _, err := db.SQL().ExecContext(ctx, "UPDATE capture_ops SET old_path='prior_generated.go' WHERE event_seq=? AND path='generated.go'", multi); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := inspectCommitAllScope(ctx, repo, dbPath)
+	if err != nil || changed.Digest == scope.Digest {
+		t.Fatalf("secondary endpoint absent from digest: %s %v", changed.Digest, err)
 	}
 }

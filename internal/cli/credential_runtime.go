@@ -52,7 +52,7 @@ func refreshCredentialRuntime(ctx context.Context, out io.Writer, roots paths.Ro
 		return err
 	}
 	if snapshot.AppliedRevisionID == 0 {
-		fmt.Fprintf(out, "Credential saved. Run `acd config edit --repo %s` to review runtime settings.\n", worktree.Root)
+		fmt.Fprintf(out, "Credential saved. Run `acd config edit --repo %s` to review runtime settings.\n", productListShellQuote(worktree.Root))
 		return nil
 	}
 	if snapshot.DesiredRevisionID != snapshot.AppliedRevisionID {
