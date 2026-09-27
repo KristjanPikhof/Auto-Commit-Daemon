@@ -146,6 +146,24 @@ func TestCommitAllProgressShowsOlderProtectedTarget(t *testing.T) {
 		drain.ID != "older-run" || drain.TargetEventCount-drain.PublishedEventCount != 31 {
 		t.Fatalf("older target was hidden from progress: %+v", drain)
 	}
+	projection.Latest.Phase = state.PublicationDrainCompleted
+	if drain := productPublicationDrainForProgress(projection, "current", startedAt); drain != nil {
+		t.Fatalf("old completed target shown as current progress: %+v", drain)
+	}
+}
+
+func TestCommitAllReadOnlyFallbackPreservesCompatibilityError(t *testing.T) {
+	for _, message := range []string{
+		"installed runtime does not match; run `acd setup`",
+		"running ACD does not advertise the current compatibility contract",
+	} {
+		if productDrainReadOnlyFallbackAllowed(fmt.Errorf("%s", message)) {
+			t.Fatalf("read-only fallback hid compatibility error: %s", message)
+		}
+	}
+	if !productDrainReadOnlyFallbackAllowed(fmt.Errorf("worker unavailable: missing socket")) {
+		t.Fatal("worker disconnect did not allow durable read-only projection")
+	}
 }
 
 // TestResolveEffectiveCommitStrategy_DaemonMetaWins covers the priority
