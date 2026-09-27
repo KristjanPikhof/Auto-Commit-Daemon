@@ -207,12 +207,10 @@ reviewScope:
 			if quiet || jsonOut {
 				continue
 			}
-			statusResponse, statusErr := callSupervisor(
-				ctx, lookup, "publication_drain_status", nil, 2*time.Second)
+			projection, _, statusErr := readProductPublicationDrain(ctx, lookup)
 			if statusErr == nil {
-				projection, decodeErr := decodeProductData[state.PublicationDrainReadOnlyProjection](statusResponse.Data)
-				if decodeErr == nil && projection.Latest != nil {
-					drain := projection.Latest
+				if drain := selectReconnectPublicationDrain(projection,
+					lookup.Record.WorktreeID, startedAt); drain != nil {
 					remaining := drain.TargetEventCount - drain.PublishedEventCount
 					writeProductCommitAllProgress(progressOut, *drain, remaining)
 					continue
@@ -346,13 +344,7 @@ func reconnectProductPublicationDrain(
 	lookup controlRepoLookup,
 	startedAt time.Time,
 ) (productCommitAllResult, bool) {
-	response, err := callSupervisor(
-		ctx, lookup, "publication_drain_status", nil, 2*time.Second)
-	if err != nil {
-		return productCommitAllResult{}, false
-	}
-	projection, err := decodeProductData[state.PublicationDrainReadOnlyProjection](
-		response.Data)
+	projection, workerAvailable, err := readProductPublicationDrain(ctx, lookup)
 	if err != nil {
 		return productCommitAllResult{}, false
 	}
@@ -361,7 +353,38 @@ func reconnectProductPublicationDrain(
 	if drain == nil {
 		return productCommitAllResult{}, false
 	}
+	// A persisted active drain proves protection, not that a missing worker
+	// resumed publication. Let the caller restart the worker first.
+	if !publicationDrainCanReconnect(*drain, workerAvailable) {
+		return productCommitAllResult{}, false
+	}
 	return productCommitAllResultFromDrain(*drain), true
+}
+
+func publicationDrainCanReconnect(drain state.PublicationDrain, workerAvailable bool) bool {
+	return workerAvailable || drain.Phase == state.PublicationDrainCompleted ||
+		drain.Phase == state.PublicationDrainNeedsAction
+}
+
+// The durable drain remains readable when a worker socket disappears. Keep the
+// request-time filter at the call site so an unrelated earlier run cannot be
+// mistaken for the current commit-all request.
+func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup) (
+	state.PublicationDrainReadOnlyProjection, bool, error,
+) {
+	response, err := callSupervisor(ctx, lookup, "publication_drain_status", nil, 2*time.Second)
+	if err == nil {
+		projection, decodeErr := decodeProductData[state.PublicationDrainReadOnlyProjection](response.Data)
+		return projection, decodeErr == nil, decodeErr
+	}
+	if !fileExists(lookup.Record.StateDB) {
+		return state.PublicationDrainReadOnlyProjection{}, false, err
+	}
+	projection, readErr := state.ReadPublicationDrainProjection(ctx, lookup.Record.StateDB)
+	if readErr != nil {
+		return state.PublicationDrainReadOnlyProjection{}, false, errors.Join(err, readErr)
+	}
+	return projection, false, nil
 }
 
 func selectReconnectPublicationDrain(
@@ -416,7 +439,7 @@ func waitForProductPublicationDrain(
 	progressOut io.Writer,
 	quiet bool,
 ) (productCommitAllResult, error) {
-	poll := time.NewTicker(100 * time.Millisecond)
+	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
 	report := time.NewTicker(5 * time.Second)
 	defer report.Stop()
@@ -437,13 +460,7 @@ func waitForProductPublicationDrain(
 			remaining := latest.TargetEventCount - latest.PublishedEventCount
 			writeProductCommitAllProgress(progressOut, *latest, remaining)
 		case <-poll.C:
-			response, err := callSupervisor(
-				ctx, lookup, "publication_drain_status", nil, 2*time.Second)
-			if err != nil {
-				continue
-			}
-			projection, err := decodeProductData[state.PublicationDrainReadOnlyProjection](
-				response.Data)
+			projection, _, err := readProductPublicationDrain(ctx, lookup)
 			if err != nil {
 				continue
 			}

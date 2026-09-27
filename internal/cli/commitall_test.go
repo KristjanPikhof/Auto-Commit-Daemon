@@ -108,6 +108,28 @@ func TestCommitAllReconnectSelectsOnlyTheCurrentWorktreeDrain(t *testing.T) {
 	}
 }
 
+func TestCommitAllMissingWorkerCannotReconnectToActiveDrain(t *testing.T) {
+	for _, phase := range []string{
+		state.PublicationDrainCheckpointing,
+		state.PublicationDrainSemantic,
+		state.PublicationDrainEventFallback,
+	} {
+		if publicationDrainCanReconnect(state.PublicationDrain{Phase: phase}, false) {
+			t.Fatalf("reconnected to active %s drain without a worker", phase)
+		}
+		if !publicationDrainCanReconnect(state.PublicationDrain{Phase: phase}, true) {
+			t.Fatalf("did not reconnect to active %s drain with a worker", phase)
+		}
+	}
+	for _, phase := range []string{
+		state.PublicationDrainCompleted, state.PublicationDrainNeedsAction,
+	} {
+		if !publicationDrainCanReconnect(state.PublicationDrain{Phase: phase}, false) {
+			t.Fatalf("did not report terminal %s drain without a worker", phase)
+		}
+	}
+}
+
 // TestResolveEffectiveCommitStrategy_DaemonMetaWins covers the priority
 // chain: daemon meta `commit.strategy` > env ACD_COMMIT_STRATEGY > default
 // (event). Three subtests, one per source.
