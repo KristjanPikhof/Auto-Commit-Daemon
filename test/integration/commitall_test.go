@@ -5,6 +5,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os/exec"
@@ -173,6 +174,168 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	}
 	if dirty := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")); dirty != "" {
 		t.Fatalf("commit-all left worktree dirty: %s", dirty)
+	}
+}
+
+func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 binary required")
+	}
+	repo := tempRepo(t)
+	env := withIsolatedHome(t)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	forcedRequest := make(chan struct{})
+	releaseForced := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseForced:
+		default:
+			close(releaseForced)
+		}
+	}()
+	var plannerCalls atomic.Int32
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := decodeIntentChatRequest(t, r)
+		if req.ToolChoice.Function.Name == "commit_message" {
+			writeIntentMessageRewriteResponse(t, w, req)
+			return
+		}
+		seqs := offeredIntentSeqsLenient(t, req)
+		switch plannerCalls.Add(1) {
+		case 1:
+			if len(seqs) != 13 {
+				http.Error(w, "expected complete wide candidate", http.StatusBadRequest)
+				return
+			}
+			writeNativeIntentCandidatesResponse(t, w, "wide_wait", []map[string]any{{
+				"candidate_id": "wide-shortcuts", "selected_seqs": seqs,
+				"purpose": "finish one shortcut change", "readiness": "wait",
+				"missing_companions": []string{"balanced fallback exceeds 12 paths"},
+				"grouping_reason": "the wide candidate is still waiting",
+			}})
+		case 2:
+			if len(seqs) != 1 {
+				http.Error(w, "expected forced singleton", http.StatusBadRequest)
+				return
+			}
+			close(forcedRequest)
+			<-releaseForced
+			writeNativeIntentCandidatesResponse(t, w, "forced_wait", []map[string]any{{
+				"candidate_id": "wide-shortcuts", "selected_seqs": seqs,
+				"purpose": "finish one shortcut change", "readiness": "wait",
+				"missing_companions": []string{"model-only companion"},
+				"grouping_reason": "the model incorrectly deferred forced work",
+			}})
+		default:
+			http.Error(w, "unexpected planner call", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	extra := []string{
+		"ACD_COMMIT_STRATEGY=intent", "ACD_INTENT_WINDOW=20",
+		"ACD_INTENT_MIN_PENDING=14", "ACD_INTENT_SETTLE_WINDOW=0",
+		"ACD_INTENT_MAX_PENDING_AGE=5m", "ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_BASE_URL=" + server.URL, "ACD_AI_API_KEY=test-key",
+		"ACD_AI_MODEL=gpt-6-luna", trustEnv,
+	}
+	extra = activateIntentV2Runtime(t, repo, extra...)
+	fullEnv := envWith(env, extra...)
+	firstSession := startSession(t, ctx, env, repo, "wide-forced-a", "shell", extra...)
+	for i := 0; i < 13; i++ {
+		name := "shortcut-" + strconv.Itoa(i) + ".go"
+		writeFileAtomically(t, repo, filepath.Join(repo, name),
+			"package shortcuts\n\nfunc Shortcut"+strconv.Itoa(i)+"() {}\n")
+	}
+	wakeSession(t, ctx, fullEnv, repo, "wide-forced-a")
+	waitFor(t, "wide candidate captured", 15*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state='pending'") == "13"
+	})
+	hint := runAcd(t, ctx, fullEnv, "internal", "hint", "--repo", repo, "--kind", "soft_boundary")
+	if hint.ExitCode != 0 {
+		t.Fatalf("soft boundary exit=%d: %s", hint.ExitCode, hint.Stderr)
+	}
+	waitFor(t, "wide waiting candidate", 15*time.Second, func() bool {
+		return plannerCalls.Load() == 1 && sqliteScalar(t, dbPath,
+			"SELECT COUNT(*) FROM intent_candidates WHERE status='waiting' AND missing_companions='balanced fallback exceeds 12 paths'") == "1"
+	})
+
+	off := runAcd(t, ctx, fullEnv, "off", "--force", "--repo", repo, "--json")
+	if off.ExitCode != 0 {
+		t.Fatalf("off exit=%d: %s", off.ExitCode, off.Stderr)
+	}
+	var stoppedLock *daemon.DaemonLock
+	waitFor(t, "wide candidate worker released", 10*time.Second, func() bool {
+		lock, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		stoppedLock = lock
+		return true
+	})
+	if err := stoppedLock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	on := runAcd(t, ctx, fullEnv, "on", "--repo", repo, "--json")
+	if on.ExitCode != 0 {
+		t.Fatalf("on exit=%d: %s", on.ExitCode, on.Stderr)
+	}
+	secondSession := startSession(t, ctx, env, repo, "wide-forced-b", "shell", extra...)
+	if firstSession.DaemonPID == secondSession.DaemonPID {
+		t.Fatal("worker did not restart")
+	}
+	t.Cleanup(func() { shutdownDaemon(t, fullEnv, repo, "wide-forced-b") })
+
+	done := make(chan ExecResult, 1)
+	go func() { done <- runAcd(t, ctx, fullEnv, "commit-all", "--repo", repo, "--yes") }()
+	select {
+	case <-forcedRequest:
+	case <-ctx.Done():
+		t.Fatal("commit-all never reached forced planner request")
+	}
+	if got := sqliteScalar(t, dbPath, "SELECT target_event_count FROM publication_drains ORDER BY id DESC LIMIT 1"); got != "13" {
+		t.Fatalf("frozen target=%s want 13", got)
+	}
+	writeFileAtomically(t, repo, filepath.Join(repo, "later.go"), "package shortcuts\n\nfunc Later() {}\n")
+	wakeSession(t, ctx, fullEnv, repo, "wide-forced-b")
+	close(releaseForced)
+	result := <-done
+	if result.ExitCode != 0 {
+		t.Fatalf("commit-all exit=%d\nstdout=%s\nstderr=%s", result.ExitCode, result.Stdout, result.Stderr)
+	}
+	if _, err := runGit(repo, "cat-file", "-e", "HEAD:later.go"); err == nil {
+		t.Fatal("later capture entered frozen publication target")
+	}
+	for i := 0; i < 13; i++ {
+		name := "shortcut-" + strconv.Itoa(i) + ".go"
+		if _, err := runGit(repo, "cat-file", "-e", "HEAD:"+name); err != nil {
+			t.Fatalf("wide candidate path %s missing from branch: %v", name, err)
+		}
+	}
+	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
+	var payload struct {
+		Data struct {
+			Protected      bool `json:"protected"`
+			PendingEvents  int  `json:"pending_events"`
+			Outcome struct {
+				BranchChanges int `json:"branch_changes"`
+				WaitingChanges int `json:"waiting_changes"`
+			} `json:"publication_outcome"`
+		} `json:"data"`
+	}
+	if status.ExitCode != 0 || json.Unmarshal([]byte(status.Stdout), &payload) != nil ||
+		!payload.Data.Protected || payload.Data.Outcome.BranchChanges != 13 || payload.Data.Outcome.WaitingChanges != 1 {
+		t.Fatalf("status after forced repair: %+v\n%s", status, status.Stdout)
+	}
+	list := runAcd(t, ctx, fullEnv, "list", "--once", "--all")
+	if list.ExitCode != 0 || !strings.Contains(list.Stdout, filepath.Base(repo)) ||
+		strings.Contains(list.Stdout, "needs action") {
+		t.Fatalf("list after forced repair: %+v", list)
 	}
 }
 
