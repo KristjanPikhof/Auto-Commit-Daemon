@@ -28,20 +28,27 @@ import (
 func newRestoreCmd() *cobra.Command {
 	var yes bool
 	cmd := &cobra.Command{
-		Use:   "restore ID",
+		Use:   "restore [ID]",
 		Short: "Preview or bring back a protected checkpoint",
 		Long: `Preview the files that a checkpoint would restore into the working
 tree. Add --yes to apply the exact preview after ACD checks it again.
 
 Restore does not move Git HEAD or change the staging area. ACD creates an undo
-checkpoint before it applies the restore.`,
+checkpoint before it applies the restore. With no ID, a terminal shows a
+checkpoint picker and asks before applying the selected preview.`,
 		Example: `  acd history
   acd restore cp-1234
   acd restore cp-1234 --yes`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
+			if len(args) == 0 {
+				if jsonOut || !settingsInputTTY(cmd.InOrStdin()) || !settingsOutputTTY(cmd.OutOrStdout()) {
+					return invalidCommandError("acd restore: choose an ID with `acd history`, then run `acd restore ID` to preview it")
+				}
+				return runRestorePicker(cmd, repo)
+			}
 			return runRestore(cmd.Context(), cmd.OutOrStdout(), repo, args[0], yes, jsonOut)
 		},
 	}
@@ -50,6 +57,45 @@ checkpoint before it applies the restore.`,
 }
 
 func runRestore(ctx context.Context, out io.Writer, repo, id string, apply, jsonOut bool) error {
+	return runRestoreWithConfirmation(ctx, out, repo, id, apply, jsonOut, nil)
+}
+
+func runRestorePicker(cmd *cobra.Command, repo string) error {
+	entries, err := loadCheckpointHistory(cmd.Context(), repo)
+	if err != nil {
+		return err
+	}
+	var choices []historyEntry
+	for _, entry := range entries {
+		if entry.Phase != state.CheckpointCompleted {
+			continue
+		}
+		choices = append(choices, entry)
+		fmt.Fprintf(cmd.OutOrStdout(), "%d. %s  %s  %s\n", len(choices), entry.ID,
+			time.Unix(int64(entry.CreatedTS), 0).Format(time.RFC3339), entry.Reason)
+	}
+	if len(choices) == 0 {
+		return actionRequiredError("no_checkpoints", "acd restore: no completed checkpoints; run `acd history` after protection completes")
+	}
+	fmt.Fprint(cmd.OutOrStdout(), "Choose a checkpoint number (Enter to cancel): ")
+	var answer string
+	_, _ = fmt.Fscanln(cmd.InOrStdin(), &answer)
+	if answer == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(answer)
+	if err != nil || n < 1 || n > len(choices) {
+		return invalidCommandError("acd restore: invalid selection; run `acd restore` to choose again")
+	}
+	return runRestoreWithConfirmation(cmd.Context(), cmd.OutOrStdout(), repo, choices[n-1].ID, true, false, func() bool {
+		fmt.Fprint(cmd.OutOrStdout(), "Apply this restore? [y/N] ")
+		var answer string
+		_, _ = fmt.Fscanln(cmd.InOrStdin(), &answer)
+		return strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes")
+	})
+}
+
+func runRestoreWithConfirmation(ctx context.Context, out io.Writer, repo, id string, apply, jsonOut bool, confirm func() bool) error {
 	record, roots, repoRoot, err := lookupRegisteredRepo("restore", repo)
 	if err != nil {
 		return err
@@ -75,6 +121,14 @@ func runRestore(ctx context.Context, out io.Writer, repo, id string, apply, json
 	}
 	if !plan.CanApply || plan.Refusal != "" {
 		return fmt.Errorf("acd restore: %s", plan.Refusal)
+	}
+	if confirm != nil {
+		if err := renderRestorePlan(out, plan, false); err != nil {
+			return err
+		}
+		if !confirm() {
+			return nil
+		}
 	}
 	if err := ensureMutationSupervisor(ctx, roots); err != nil {
 		return unavailableError(fmt.Sprintf("acd restore: supervisor unavailable: %v", err))

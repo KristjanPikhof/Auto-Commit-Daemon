@@ -2,6 +2,10 @@ import importlib.util
 import pathlib
 import unittest
 import sys
+import json
+import os
+import subprocess
+import tempfile
 
 sys.dont_write_bytecode = True
 
@@ -24,6 +28,37 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.manifest(["TestA", "TestA"], 2, {})
         self.assertEqual(len(module.manifest(["TestA"], 4, {})["shards"]), 4)
+
+    def test_timings_keep_slowest_repetition_without_counting_subtests(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = pathlib.Path(root) / "events.jsonl"
+            source.write_text("\n".join(json.dumps(event) for event in [
+                {"Action": "pass", "Package": "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git", "Test": "FuzzParse", "Elapsed": 3},
+                {"Action": "pass", "Package": "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git", "Test": "FuzzParse", "Elapsed": 1},
+                {"Action": "pass", "Package": "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git", "Test": "FuzzParse/seed", "Elapsed": 8},
+            ]))
+            self.assertEqual(module.timings([source]), {"./internal/git": {"FuzzParse": 3}})
+
+    def test_discovery_failure_propagates_and_empty_shard_selects_nothing(self):
+        checkout = pathlib.Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as root:
+            go = pathlib.Path(root) / "go"
+            go.write_text('#!/bin/sh\nexit 42\n')
+            go.chmod(0o755)
+            env = dict(os.environ, PATH=root + os.pathsep + os.environ["PATH"])
+            command = ["bash", "scripts/dev/test-package-shards.sh", "./example", "4"]
+            failure = subprocess.run(command, cwd=checkout, env=env, capture_output=True)
+            self.assertEqual(failure.returncode, 42)
+            go.write_text('''#!/bin/sh
+case "$*" in
+  *-list*) printf 'TestOnly\\nExample\\nFuzzParse\\n';;
+  *) printf '%s\\n' "$*" > "$FAKE_GO_ARGS";;
+esac
+''')
+            env.update(ACD_TEST_SHARD_INDEX="3", FAKE_GO_ARGS=root + "/args")
+            success = subprocess.run(command, cwd=checkout, env=env, capture_output=True)
+            self.assertEqual(success.returncode, 0, success.stderr)
+            self.assertIn("-run ^$", pathlib.Path(env["FAKE_GO_ARGS"]).read_text())
 
 
 if __name__ == "__main__":

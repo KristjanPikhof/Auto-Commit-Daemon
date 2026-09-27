@@ -69,8 +69,8 @@ func TestStatus_RegisteredRepoWithClientsAndCommit(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, false); err != nil {
-		t.Fatalf("runStatus: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &out, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture: %v", err)
 	}
 	got := out.String()
 	for _, want := range []string{
@@ -489,7 +489,7 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 	report.PublicationProgress = blocked
 	report.Repo = "/repo"
 	var verbose bytes.Buffer
-	if err := renderStatusHuman(&verbose, report); err != nil {
+	if err := renderStatusProjectionFixture(&verbose, report); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(verbose.String(), intentRecoveryVerificationAttentionSummary) ||
@@ -995,7 +995,7 @@ func TestStatus_RepeatedReplayErrorIsRetrying(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, true); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
 		t.Fatal(err)
 	}
 	var report statusReport
@@ -1019,7 +1019,7 @@ func TestStatus_RepeatedReplayErrorIsRetrying(t *testing.T) {
 	}
 
 	out.Reset()
-	if err := runStatus(ctx, &out, repo, false); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &out, repo, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
@@ -1075,7 +1075,7 @@ func TestStatusSelfPublicationHumanJSONParity(t *testing.T) {
 		state.SelfPublicationPrepared, now)
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
 		t.Fatal(err)
 	}
 	var report statusReport
@@ -1095,7 +1095,7 @@ func TestStatusSelfPublicationHumanJSONParity(t *testing.T) {
 	}
 
 	var human bytes.Buffer
-	if err := runStatus(ctx, &human, repo, false); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &human, repo, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
@@ -1141,7 +1141,7 @@ func TestDiagnoseWriterSelfPublicationRemediationParity(t *testing.T) {
 	}
 
 	var statusOut, diagnoseOut, doctorOut bytes.Buffer
-	if err := renderStatusHuman(&statusOut,
+	if err := renderStatusProjectionFixture(&statusOut,
 		statusReport{SelfPublication: report}); err != nil {
 		t.Fatal(err)
 	}
@@ -1200,7 +1200,7 @@ func TestSelfPublicationDurableAttentionStatusDiagnoseDoctorParity(
 	}
 
 	var statusOut, diagnoseOut, doctorOut bytes.Buffer
-	if err := renderStatusHuman(&statusOut,
+	if err := renderStatusProjectionFixture(&statusOut,
 		statusReport{SelfPublication: report}); err != nil {
 		t.Fatal(err)
 	}
@@ -1261,7 +1261,7 @@ func TestSelfPublicationWriterWinsOverRecoveryAttentionParity(t *testing.T) {
 	}
 
 	var statusOut, diagnoseOut, doctorOut bytes.Buffer
-	if err := renderStatusHuman(&statusOut,
+	if err := renderStatusProjectionFixture(&statusOut,
 		statusReport{SelfPublication: report}); err != nil {
 		t.Fatal(err)
 	}
@@ -1325,7 +1325,7 @@ func TestSelfPublicationUnknownPreMarkerStatusDiagnoseDoctorParity(
 	}
 
 	var statusOut, diagnoseOut, doctorOut bytes.Buffer
-	if err := renderStatusHuman(&statusOut,
+	if err := renderStatusProjectionFixture(&statusOut,
 		statusReport{SelfPublication: report}); err != nil {
 		t.Fatal(err)
 	}
@@ -1582,7 +1582,7 @@ func TestStatusRuntimeConfigHumanJSONAndRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
 		t.Fatal(err)
 	}
 	var report statusReport
@@ -1598,7 +1598,7 @@ func TestStatusRuntimeConfigHumanJSONAndRedaction(t *testing.T) {
 		t.Fatalf("runtime JSON projection = %+v", runtime)
 	}
 	var human bytes.Buffer
-	if err := runStatus(ctx, &human, repo, false); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &human, repo, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"Runtime settings: rejected", "desired=", "known_good=", "boundary=next_work_boundary", "saved_generation=1", "Experiment #"} {
@@ -1696,7 +1696,7 @@ func TestStatusIntentV2ProjectionAndRedaction(t *testing.T) {
 	}
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
 		t.Fatal(err)
 	}
 	var report statusReport
@@ -1720,7 +1720,7 @@ func TestStatusIntentV2ProjectionAndRedaction(t *testing.T) {
 		t.Fatalf("Intent v2 projection=%+v", got)
 	}
 	var human bytes.Buffer
-	if err := runStatus(ctx, &human, repo, false); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &human, repo, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
@@ -1748,7 +1748,7 @@ func TestStatusIntentV2ProjectionAndRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	jsonOut.Reset()
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := json.Unmarshal(jsonOut.Bytes(), &report); err != nil {
@@ -1785,7 +1785,7 @@ PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, true); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
 		t.Fatal(err)
 	}
 	var report statusReport
@@ -1861,8 +1861,8 @@ func TestStatus_StaleHeartbeatOverlay(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, false); err != nil {
-		t.Fatalf("runStatus: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &out, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture: %v", err)
 	}
 	if !strings.Contains(out.String(), "stale") {
 		t.Fatalf("expected stale daemon line, got:\n%s", out.String())
@@ -1875,7 +1875,7 @@ func TestStatus_UnregisteredRepoErrors(t *testing.T) {
 
 	stranger := initCLIResolverRepo(t)
 	var out bytes.Buffer
-	err := runStatus(ctx, &out, stranger, false)
+	err := writeStatusProjectionFixture(ctx, &out, stranger, false)
 	if err == nil {
 		t.Fatal("expected error for unregistered repo")
 	}
@@ -1923,8 +1923,8 @@ func TestStatus_BlockedConflictCount(t *testing.T) {
 
 	// Human output mentions the blocker.
 	var humanOut bytes.Buffer
-	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	if !strings.Contains(humanOut.String(), "Blocked conflicts: 1") {
 		t.Fatalf("missing 'Blocked conflicts: 1' in:\n%s", humanOut.String())
@@ -1932,8 +1932,8 @@ func TestStatus_BlockedConflictCount(t *testing.T) {
 
 	// JSON shape exposes the field as an integer count.
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -1985,8 +1985,8 @@ func TestStatus_BlockedBarrierGuidance(t *testing.T) {
 	}
 
 	var humanOut bytes.Buffer
-	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	human := humanOut.String()
 	for _, want := range []string{"Blocked conflicts: 1", "acd fix --dry-run", "Blocked barriers with pending replay: 1", "acd fix --force --dry-run"} {
@@ -1996,8 +1996,8 @@ func TestStatus_BlockedBarrierGuidance(t *testing.T) {
 	}
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2041,8 +2041,8 @@ func TestStatus_FailedBarrierGuidance(t *testing.T) {
 	}
 
 	var humanOut bytes.Buffer
-	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	human := humanOut.String()
 	for _, want := range []string{"Failed terminal events: 1", "Failed barriers blocking pending replay: 1", "acd fix --dry-run"} {
@@ -2052,8 +2052,8 @@ func TestStatus_FailedBarrierGuidance(t *testing.T) {
 	}
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2084,8 +2084,8 @@ func TestStatus_BodyRendersPauseSection(t *testing.T) {
 	})
 
 	var humanOut bytes.Buffer
-	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	human := humanOut.String()
 	for _, want := range []string{"Pause:", "Source: manual", "Reason: deploy window", "Expires at:"} {
@@ -2095,8 +2095,8 @@ func TestStatus_BodyRendersPauseSection(t *testing.T) {
 	}
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2140,8 +2140,8 @@ func TestStatus_DecisionSummary(t *testing.T) {
 	}
 
 	var humanOut bytes.Buffer
-	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	human := humanOut.String()
 	for _, want := range []string{
@@ -2158,8 +2158,8 @@ func TestStatus_DecisionSummary(t *testing.T) {
 	}
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2202,8 +2202,8 @@ func TestStatus_IntentStrategyUsesDaemonMetadata(t *testing.T) {
 
 	t.Setenv("ACD_COMMIT_STRATEGY", "event")
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2245,8 +2245,8 @@ func TestStatus_IntentStrategyReportsPlannerHealth(t *testing.T) {
 	}
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2265,8 +2265,8 @@ func TestStatus_IntentStrategyReportsPlannerHealth(t *testing.T) {
 	}
 
 	var human bytes.Buffer
-	if err := runStatus(ctx, &human, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &human, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	for _, want := range []string{
 		"Intent planner health: open failures=3 bypasses=7",
@@ -2307,8 +2307,8 @@ func TestStatus_IntentPlannerHealthWarningIsReadOnly(t *testing.T) {
 			}
 
 			var jsonOut bytes.Buffer
-			if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-				t.Fatalf("runStatus json: %v", err)
+			if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+				t.Fatalf("writeStatusProjectionFixture json: %v", err)
 			}
 			var rep statusReport
 			if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2322,8 +2322,8 @@ func TestStatus_IntentPlannerHealthWarningIsReadOnly(t *testing.T) {
 			}
 
 			var human bytes.Buffer
-			if err := runStatus(ctx, &human, repo, false); err != nil {
-				t.Fatalf("runStatus human: %v", err)
+			if err := writeStatusProjectionFixture(ctx, &human, repo, false); err != nil {
+				t.Fatalf("writeStatusProjectionFixture human: %v", err)
 			}
 			if !strings.Contains(human.String(), "Intent planner health warning: "+tc.warning) {
 				t.Fatalf("status human missing safe warning:\n%s", human.String())
@@ -2371,8 +2371,8 @@ func TestStatus_IntentStrategyReportsBatchWaitState(t *testing.T) {
 	appendIntentPendingEvent(t, ctx, d, "wait-b.go", nowFloat()-20)
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2393,8 +2393,8 @@ func TestStatus_IntentStrategyReportsBatchWaitState(t *testing.T) {
 	}
 
 	var humanOut bytes.Buffer
-	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	if !strings.Contains(humanOut.String(), "Intent batch wait: pending=2 min_pending=3") {
 		t.Fatalf("status human missing batch wait line:\n%s", humanOut.String())
@@ -2429,8 +2429,8 @@ func TestStatus_IntentStrategyReportsSettleWaitState(t *testing.T) {
 	newest := appendIntentPendingEvent(t, ctx, d, "settle-b.go", nowFloat()-5)
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2450,8 +2450,8 @@ func TestStatus_IntentStrategyReportsSettleWaitState(t *testing.T) {
 	}
 
 	var humanOut bytes.Buffer
-	if err := runStatus(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("runStatus human: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture human: %v", err)
 	}
 	if !strings.Contains(humanOut.String(), "Intent settle wait: pending=2") {
 		t.Fatalf("status human missing settle wait line:\n%s", humanOut.String())
@@ -2498,8 +2498,8 @@ func TestStatus_IntentStrategyUsesDurablePlannerErrorLedger(t *testing.T) {
 	}
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2570,8 +2570,8 @@ func TestStatus_IntentStrategyPlannerSummaryIsBarrierAware(t *testing.T) {
 	}
 
 	var jsonOut bytes.Buffer
-	if err := runStatus(ctx, &jsonOut, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
@@ -2602,8 +2602,8 @@ func TestStatus_SkipsDecisionSummaryForPreV5DB(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, false); err != nil {
-		t.Fatalf("runStatus should tolerate missing decision_records: %v\n%s", err, out.String())
+	if err := writeStatusProjectionFixture(ctx, &out, repo, false); err != nil {
+		t.Fatalf("writeStatusProjectionFixture should tolerate missing decision_records: %v\n%s", err, out.String())
 	}
 	if strings.Contains(out.String(), "Decisions:") {
 		t.Fatalf("pre-v5 status rendered decisions unexpectedly:\n%s", out.String())
@@ -2655,8 +2655,8 @@ func TestList_Status_Doctor_AgreeOnCounts(t *testing.T) {
 
 	// list (json)
 	var lOut, lErr bytes.Buffer
-	if err := runList(ctx, &lOut, &lErr, true, false); err != nil {
-		t.Fatalf("runList: %v", err)
+	if err := writeListProjectionFixture(ctx, &lOut, &lErr, true, false); err != nil {
+		t.Fatalf("writeListProjectionFixture: %v", err)
 	}
 	var listGot struct {
 		Repos []listEntry `json:"repos"`
@@ -2670,8 +2670,8 @@ func TestList_Status_Doctor_AgreeOnCounts(t *testing.T) {
 
 	// status (json)
 	var sOut bytes.Buffer
-	if err := runStatus(ctx, &sOut, repo, true); err != nil {
-		t.Fatalf("runStatus: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &sOut, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture: %v", err)
 	}
 	var statusGot statusReport
 	if err := json.Unmarshal(sOut.Bytes(), &statusGot); err != nil {
@@ -2725,8 +2725,8 @@ func TestStatus_JSONShape(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {

@@ -185,7 +185,7 @@ func productListEntryFromOverview(
 	entry := productListEntry{
 		Repo: record.Path, RepoHash: record.RepoHash, Enabled: control.Enabled, Protected: control.Protected,
 		PublicationOutcome: control.PublicationOutcome,
-		Published: control.Published, ActionRequired: actionRequired, State: entryState,
+		Published:          control.Published, ActionRequired: actionRequired, State: entryState,
 		PendingEvents: control.PendingEvents, BlockedEvents: control.BlockedEvents,
 		CheckpointID: control.CheckpointID, WorkerState: worker.State,
 		OperationalState: operational, LastActivityAt: formatProductListActivity(overview.lastActivity),
@@ -426,6 +426,10 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	if err != nil {
 		return overview, err
 	}
+	report.PublicationOutcome.ReasonCode = report.PublicationProgress.Phase
+	if health := report.IntentStrategy.PlannerHealth; health != nil {
+		report.PublicationOutcome.RetryAt = health.NextProbeTS
+	}
 	for _, key := range []string{state.ActivityMetaKey, daemon.MetaKeyBranchTokenChangedAt} {
 		value, _, err := metaLookup(ctx, conn, key)
 		if err != nil {
@@ -490,7 +494,8 @@ func readProductListProtection(ctx context.Context, conn *sql.DB, report *status
 	report.UnpublishedCheckpoints = unresolved
 	report.Protected = strings.EqualFold(completeValue, "true") && report.LatestCheckpointID != "" &&
 		report.ObservationEpoch == report.CoveredEpoch && prepared == 0 && needsAction == 0
-	return nil
+	report.PublicationOutcome, err = readPublicationOutcome(ctx, conn, report.Protected)
+	return err
 }
 
 func readProductListClients(ctx context.Context, conn *sql.DB, now time.Time, ttl time.Duration) (int, float64, error) {

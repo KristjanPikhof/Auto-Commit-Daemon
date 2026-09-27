@@ -857,7 +857,7 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
 		t.Fatalf("runControlStatus: %v", err)
 	}
-	for _, line := range []string{"State:", "ACD protection:", "Current changes protected:", "Published to Git:", "Action needed:", "Status:", "Next:"} {
+	for _, line := range []string{"Protection:", "Current changes saved:", "Branch commits:", "Next:"} {
 		if got := strings.Count(out.String(), line); got != 1 {
 			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
 		}
@@ -885,6 +885,7 @@ func TestProductStatusShowsIntentQueueAndActiveTarget(t *testing.T) {
 	if err := renderProductEnvelope(&out, envelope, false); err != nil {
 		t.Fatal(err)
 	}
+	renderProductPublicationProgress(&out, progress)
 	for _, want := range []string{
 		"Commit mode: Intent",
 		"Publication queue: 22 protected change(s)",
@@ -943,6 +944,7 @@ func TestProductStatusSuppressesCompletedDrainAndWaitHasNoTarget(t *testing.T) {
 			if err := renderProductEnvelope(&out, envelope, false); err != nil {
 				t.Fatal(err)
 			}
+			renderProductPublicationProgress(&out, test.progress)
 			if !strings.Contains(out.String(), test.want) {
 				t.Fatalf("status missing %q:\n%s", test.want, out.String())
 			}

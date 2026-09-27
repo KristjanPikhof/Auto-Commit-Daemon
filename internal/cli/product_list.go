@@ -21,7 +21,7 @@ const productListActiveWindow = time.Hour
 var productListCollect = collectProductListOverview
 
 type productListEntry struct {
-	PublicationOutcome publicationOutcome `json:"publication_outcome"`
+	PublicationOutcome    publicationOutcome           `json:"publication_outcome"`
 	Repo                  string                       `json:"repo"`
 	Enabled               bool                         `json:"enabled"`
 	Protected             bool                         `json:"protected"`
@@ -374,6 +374,9 @@ func productListProgressAge(entry productListEntry) string {
 }
 
 func productListPhase(entry productListEntry) string {
+	if entry.PublicationOutcome.RecoveredChanges > 0 && entry.PublicationOutcome.WaitingChanges == 0 {
+		return "recovered"
+	}
 	if entry.OperationalState == "rewriting" {
 		return "history-rewrite"
 	}

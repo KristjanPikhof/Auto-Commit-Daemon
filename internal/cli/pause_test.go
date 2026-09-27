@@ -413,8 +413,8 @@ func TestPauseStatus_ExpiredManualMarker_Visible(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runStatus(ctx, &out, repo, true); err != nil {
-		t.Fatalf("runStatus json: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
+		t.Fatalf("writeStatusProjectionFixture json: %v", err)
 	}
 	var rep statusReport
 	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {

@@ -117,34 +117,22 @@ func (c *composed) NeedsDiff() bool {
 	return ProviderNeedsDiff(c.primary) || ProviderNeedsDiff(c.fallback)
 }
 
-// Generate tries the primary provider; on error or empty subject we fall
-// through to the fallback. Source is rewritten to reflect whichever
-// provider produced the final Result so downstream telemetry sees the
-// actual source rather than the composed alias.
+// Generate preserves the selected provider contract. An unavailable provider
+// or empty response is retryable by the worker; it cannot silently publish a
+// locally generated message for an AI-configured repository.
 func (c *composed) Generate(ctx context.Context, cc CommitContext) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
 	r, err := c.primary.Generate(ctx, cc)
-	if err == nil && r.Subject != "" {
-		if r.Source == "" {
-			r.Source = c.primary.Name()
-		}
-		return r, nil
-	}
-	reason := "empty subject"
 	if err != nil {
-		reason = err.Error()
+		return Result{}, err
 	}
-	recordPromptFallback(ctx, "event", c.primary.Name(), c.fallback.Name(), reason)
-	r, ferr := c.fallback.Generate(ctx, cc)
-	if ferr != nil {
-		// Surface the fallback error; the primary error becomes
-		// secondary context (the run loop logs both).
-		return Result{}, ferr
+	if strings.TrimSpace(r.Subject) == "" {
+		return Result{}, errors.New("ai: selected provider returned an empty commit subject")
 	}
 	if r.Source == "" {
-		r.Source = c.fallback.Name()
+		r.Source = c.primary.Name()
 	}
 	return r, nil
 }
