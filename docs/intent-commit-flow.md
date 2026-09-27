@@ -38,6 +38,26 @@ offered to the planner in bounded passes.
 Optional integrations may provide boundaries, but filesystem protection does
 not depend on them.
 
+## Commit purpose
+
+Intent planning follows the approach described in
+[Purposeful Commits](https://chrisarcand.com/purposeful-commits/): each commit
+should explain one useful step and leave a working state under the configured
+checks. A preparatory refactor can precede the feature it enables when the
+captured changes support two complete steps. Tests, imports, generated files,
+and documentation stay with the step they support.
+
+A change with a broader effect, such as changing a shared default, can be a
+separate step when it is independently meaningful and safe. Its message should
+explain the reason supported by the available evidence. ACD must not invent
+motivation or claim tests ran when it has no such evidence.
+
+These rules guide grouping and messages; they do not impose a commit count.
+ACD cannot split a captured file change into invented intermediate versions.
+When a safe intermediate step is unavailable, it keeps the required changes
+together. Existing materialization, verification, and history-repair limits
+still apply.
+
 ## Presets
 
 | Preset | Publication behavior |
