@@ -1792,11 +1792,11 @@ func TestIntentCandidateForcedRepairKeepsWidePersistedGroupReady(t *testing.T) {
 		target = append(target, capture.Event.Seq)
 		if i > 0 {
 			hints = append(hints, IntentDependencyHint{
-			PrerequisiteSeq: captures[i-1].Event.Seq,
-			DependentSeq:    capture.Event.Seq,
-			Strength: ai.IntentDependencyHard, Kind: "object_reference",
-			Evidence: "one complete shortcut change",
-		})
+				PrerequisiteSeq: captures[i-1].Event.Seq,
+				DependentSeq:    capture.Event.Seq,
+				Strength:        ai.IntentDependencyHard, Kind: "object_reference",
+				Evidence: "one complete shortcut change",
+			})
 		}
 	}
 	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
@@ -1804,7 +1804,7 @@ func TestIntentCandidateForcedRepairKeepsWidePersistedGroupReady(t *testing.T) {
 		BranchGeneration: 1, Status: state.IntentCandidateWaiting,
 		Purpose: "finish overlay shortcuts", Readiness: state.IntentReadinessWait,
 		MissingCompanions: "balanced fallback exceeds 12 paths",
-		Events: members,
+		Events:            members,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1816,13 +1816,13 @@ func TestIntentCandidateForcedRepairKeepsWidePersistedGroupReady(t *testing.T) {
 			CandidateID: "wide-shortcuts", SelectedSeqs: []int64{target[0]},
 			Purpose: "finish overlay shortcuts", Readiness: ai.IntentCandidateWait,
 			MissingCompanions: []string{"model-only missing companion"},
-			GroupingReason: "wait for a companion",
+			GroupingReason:    "wait for a companion",
 		}},
 	}}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{captures[0]},
-		Hints: hints, TargetEventSeqs: target, ForcedAging: true,
+		Hints:    hints, TargetEventSeqs: target, ForcedAging: true,
 		Planner: planner, Preset: config.PresetBalanced,
 		VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
