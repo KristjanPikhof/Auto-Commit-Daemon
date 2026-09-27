@@ -630,10 +630,6 @@ func signalCheckpointProcess(expected checkpointProcessIdentity, signal syscall.
 // variables to customize provider and timing fields, but never rely on the
 // unsupported env-only v1 startup path.
 func activateIntentV2Runtime(t *testing.T, repo string, extra ...string) []string {
-	return activateIntentV2RuntimeWithPreset(t, repo, "fast", extra...)
-}
-
-func activateIntentV2RuntimeWithPreset(t *testing.T, repo, presetName string, extra ...string) []string {
 	t.Helper()
 	values := make(map[string]string, len(extra))
 	cleaned := make([]string, 0, len(extra))
@@ -658,7 +654,7 @@ func activateIntentV2RuntimeWithPreset(t *testing.T, repo, presetName string, ex
 	}
 	overrides := config.Overrides{}
 	overrides[config.FieldCommitStrategy], _ = json.Marshal("intent")
-	overrides[config.FieldCommitPreset], _ = json.Marshal(presetName)
+	overrides[config.FieldCommitPreset], _ = json.Marshal("fast")
 	resolved, preset, err := config.ResolveAll(config.ResolveInput{
 		Repository: overrides, LookupEnv: lookup,
 	}, overrides)
@@ -677,9 +673,6 @@ func activateIntentV2RuntimeWithPreset(t *testing.T, repo, presetName string, ex
 	}
 	provider := resolved[config.FieldProvider].EffectiveValue()
 	confirmations := []string{string(ai.ConfirmationDiffEgress)}
-	if presetName != "fast" {
-		confirmations = append(confirmations, string(ai.ConfirmationIntentRepair))
-	}
 	if strings.HasPrefix(provider, "subprocess:") {
 		confirmations = append(confirmations,
 			string(ai.ConfirmationSubprocessExecution))
