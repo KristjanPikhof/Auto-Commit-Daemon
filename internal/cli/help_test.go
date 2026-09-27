@@ -19,7 +19,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 		{"list", []string{"last hour", "unfinished work", "need action", "Ctrl-C", "--watch", "--once", "--all"}},
 		{"commit-all", []string{"does not squash", "--dry-run", "--yes"}},
 		{"history", []string{"recent protected checkpoints", "--activity", "activity", "rewrite"}},
-		{"restore", []string{"restore ID", "--yes"}},
+		{"restore", []string{"restore [ID]", "checkpoint picker", "--yes"}},
 		{"doctor", []string{"safe next step", "--bundle", "--output"}},
 		{"uninstall", []string{"kept by default", "--dry-run", "--purge-data"}},
 		{"config", []string{"get", "set", "credentials"}},

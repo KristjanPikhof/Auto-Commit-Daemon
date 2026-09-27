@@ -124,6 +124,13 @@ func runProductCommitAll(
 		return renderProductCommitAll(out, preview, productStateWaiting, jsonOut)
 	}
 	input := bufio.NewReader(in)
+	var ticker *time.Ticker
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+reviewScope:
 	for !yes {
 		renderCommitAllScope(out, scope)
 		fmt.Fprint(out, "Protect and publish this work? [y/N] ")
@@ -172,8 +179,7 @@ func runProductCommitAll(
 	if !quiet && !jsonOut {
 		fmt.Fprintln(progressOut, "Commit all: saving a checkpoint for current changes")
 	}
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	ticker = time.NewTicker(5 * time.Second)
 	var call callResult
 	for {
 		select {
@@ -182,6 +188,15 @@ func runProductCommitAll(
 		case call = <-resultCh:
 			if call.err != nil {
 				var commandErr *CommandError
+				if !yes && errors.As(call.err, &commandErr) && commandErr.Code == "plan_changed" {
+					ticker.Stop()
+					scope, err = inspectCommitAllScope(ctx, lookup.Worktree.Root, lookup.Record.StateDB)
+					if err != nil {
+						return err
+					}
+					fmt.Fprintln(out, "The paths, staged content, or queued work changed. Review the refreshed preview.")
+					goto reviewScope
+				}
 				if errors.As(call.err, &commandErr) && commandErr.Code == "publication_needs_action" {
 					return actionRequiredError(commandErr.Code, commandErr.Message)
 				}

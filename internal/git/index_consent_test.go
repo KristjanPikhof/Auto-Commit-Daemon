@@ -123,6 +123,13 @@ func TestConsumeApprovedIndexPreservesFlagsAndDetectsIntentToAdd(t *testing.T) {
 	if intent == staged {
 		t.Fatal("intent-to-add equals staged empty file")
 	}
+	newHead := run("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "independent publication")
+	run("update-ref", "HEAD", newHead, head)
+	afterMove, err := IndexContentDigest(ctx, repo)
+	if err != nil || afterMove != staged {
+		t.Fatalf("unchanged staging changed identity after HEAD advance: %s %v", afterMove, err)
+	}
+	head = newHead
 	if err := ConsumeApprovedIndex(ctx, repo, intent, head); !errors.Is(err, ErrStagingChanged) {
 		t.Fatalf("err=%v", err)
 	}

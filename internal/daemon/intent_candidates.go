@@ -166,7 +166,8 @@ func (e *IntentSemanticFallbackRequiredError) Unwrap() error {
 // IntentPlanPreflightError means the durable planning snapshot could not
 // produce a locally valid baseline. No provider attempt has been consumed.
 type IntentPlanPreflightError struct {
-	Failure string
+	EvidenceFingerprint string
+	Failure             string
 }
 
 func (e *IntentPlanPreflightError) Error() string {
@@ -1270,7 +1271,8 @@ func chooseIntentCandidatePlan(
 		}
 		return ai.IntentPlanV2{}, "", "", retryCount, false,
 			baselineContinuations, run, &IntentPlanPreflightError{
-				Failure: ai.SanitizePlannerError(preflightErr.Error()),
+				Failure:             ai.SanitizePlannerError(preflightErr.Error()),
+				EvidenceFingerprint: fmt.Sprintf("%s/%v", run.Fingerprint, run.FindingCodes),
 			}
 	}
 	run, err = state.EnsureIntentPlanRun(ctx, db, run)
@@ -1523,6 +1525,7 @@ func chooseIntentCandidatePlan(
 							false, nil, run, &IntentPlanPreflightError{
 								Failure: ai.SanitizePlannerError(
 									partialPreflightErr.Error()),
+								EvidenceFingerprint: fmt.Sprintf("%s/%v/%v", run.Fingerprint, run.UnresolvedSeqs, run.FindingCodes),
 							}
 					}
 					run.PreservedGroups = intentAssignmentMembership(preserved)
@@ -2177,12 +2180,18 @@ func applyIntentFallbackMessageQuality(
 		return ai.IntentPlanV2{}, plannerFailure, false, cacheErr
 	}
 	var permit IntentPlannerHealthPermit
+	permitCompleted := false
 	if health != nil {
 		var err error
 		permit, err = health.Acquire(ctx)
 		if err != nil {
 			return plan, ai.SanitizePlannerError(err.Error()), false, nil
 		}
+		defer func() {
+			if !permitCompleted {
+				_ = health.Complete(ctx, permit, nil)
+			}
+		}()
 	}
 	rewritten, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
 		// Every locally chosen group needs an AI-written message, even if a
@@ -2195,6 +2204,7 @@ func applyIntentFallbackMessageQuality(
 	if ai.ProviderNeedsConfiguration(err) {
 		if health != nil {
 			_ = health.Complete(ctx, permit, nil)
+			permitCompleted = true
 		}
 		return ai.IntentPlanV2{}, plannerFailure, false, err
 	}
@@ -2203,6 +2213,7 @@ func applyIntentFallbackMessageQuality(
 		if err != nil {
 			failure = classifyIntentPlannerHealthFailure(err, true)
 		}
+		permitCompleted = true
 		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
 			return ai.IntentPlanV2{}, plannerFailure, false, healthErr
 		}

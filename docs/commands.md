@@ -101,6 +101,12 @@ retain historical preservation evidence. Exact current-branch tree proof permits
 a recovered-and-recaptured snapshot to report commitment without erasing its
 recovery history. If that proof is unavailable, `branch_committed` is null.
 
+If Git changes while AI is evaluating a target, ACD rejects that stale result.
+An exact match with externally committed work can resolve through the recovery
+proof (`recovery_published`). A chain containing both applied and reverted work
+may instead be preserved separately (`recovery_archived`). Neither outcome
+creates a duplicate branch commit or restores files over your edits.
+
 Read-only status falls back to existing v20 SQLite projections when the
 supervisor is unavailable. Mutations never fall back to direct unsupervised
 writes. On macOS, mutating commands first start or reuse the shared per-user
@@ -222,14 +228,21 @@ refresh automatically.
 Before confirmation, `commit-all` lists changed paths, staged content, and
 already queued paths. The lists may overlap. Included staging is consumed only
 after checkpoint protection; ordinary background publication preserves staging.
-Interactive approval is rechecked against paths, queued work, and staging. If
-they change, review the refreshed preview; a later worker-side mismatch refuses
-application. `--yes` accepts the current scope without an interactive preview.
+Interactive approval is rechecked against paths, queued work, and staging. The
+worker also checks every path in the frozen checkpoint target, including rename
+endpoints. If an unreviewed path arrives while checkpointing, the command shows
+a refreshed preview and asks again before creating a publication request or
+consuming staging. Further edits to already reviewed paths can enter that
+checkpoint. `--yes` accepts the current checkpoint scope without an interactive
+path review.
 Immediately before consuming staging, the worker locks the Git index and checks
 its saved approval identity. If you staged something else while it waited, ACD
 preserves that selection and asks you to review commit-all again. This check
 also survives a worker restart. Older requests without a saved staging identity
 require a new review before consuming staging.
+A fresh approval preserves the old request's captured work separately and
+recaptures the current files for a new target. The old staging approval stays
+unchanged; it is never reused to consume a newer selection.
 
 `commit-all` first completes a durable checkpoint, records the highest event
 sequence covered by the barrier, and drains only that bounded target through

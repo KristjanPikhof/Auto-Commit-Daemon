@@ -19,7 +19,7 @@ def render(path):
     }
     for event in records:
         test = event.get("Test", "")
-        if event.get("Action") != "output":
+        if event.get("Action") not in ("output", "build-output"):
             continue
         if test and (event.get("Package"), test.split("/")[0]) not in failed:
             continue

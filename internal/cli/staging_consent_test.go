@@ -98,4 +98,25 @@ func TestAdmittedCommitAllPreservesStagingChangedDuringCheckpoint(t *testing.T) 
 	if err != nil || after != changed {
 		t.Fatalf("restart consumed new staging: digest=%s err=%v", after, err)
 	}
+	// A fresh explicit approval replaces the refused request, without
+	// rewriting its original consent or requiring manual queue recovery.
+	handler.runtimes["worktree"].db = reopened
+	var reviewed sync.Once
+	handler.wake = func(string) {
+		reviewed.Do(func() {
+			wakeErr = insertFreshBarrierCheckpoint(ctx, reopened, repo, "cp-reviewed", worktreeID, 3)
+		})
+	}
+	_, protocolErr = handler.HandleWorkerRequest(ctx, supervisor.Request{Method: "publication_drain_start", WorktreeID: "worktree", Params: params})
+	if wakeErr != nil || protocolErr != nil {
+		t.Fatalf("reviewed retry failed: wake=%v protocol=%v", wakeErr, protocolErr)
+	}
+	old, err := state.PublicationDrainByID(ctx, reopened, drain.ID)
+	if err != nil || old.Phase != state.PublicationDrainCompleted || old.StagedConsumed || old.ExpectedIndexDigest != approved {
+		t.Fatalf("retry rewrote old consent: %+v %v", old, err)
+	}
+	current, ok, err := state.PublicationDrainByCheckpoint(ctx, reopened, "cp-reviewed")
+	if err != nil || !ok || !current.StagedConsumed || current.ExpectedIndexDigest != changed {
+		t.Fatalf("new approval was not applied: %+v exists=%v error=%v", current, ok, err)
+	}
 }

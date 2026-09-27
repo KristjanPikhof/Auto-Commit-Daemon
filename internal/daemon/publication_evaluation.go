@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -193,7 +194,7 @@ func generatePublicationMessage(ctx context.Context, fn MessageFn, event EventCo
 		}
 	}
 	message, err := evaluatePublication(ctx, func(jobCtx context.Context) (string, error) { return fn(jobCtx, event) })
-	if err == nil && message == "" {
+	if err == nil && strings.TrimSpace(message) == "" {
 		err = errors.New("selected provider returned an empty message")
 	}
 	if ai.ProviderNeedsConfiguration(err) {

@@ -2417,6 +2417,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 		branchTransitionBlocked = false
 		recoveryFollowup := false
+		evaluationFollowup := false
 		frozenRuntimeDrainID := ""
 		runtimeSelectionBlocked := false
 
@@ -2460,9 +2461,12 @@ func Run(ctx context.Context, opts Options) error {
 					"err", ai.SanitizePlannerError(drainErr.Error()))
 			} else if runtimeDrain != nil {
 				frozenRuntimeDrainID = runtimeDrain.ID
-				if runtimeDrain.Phase == state.PublicationDrainNeedsAction &&
-					runtimeDrain.LastError ==
-						PublicationDrainSemanticMessageUnavailableReason {
+				activateReplacement, replacementErr := publicationDrainCanActivateReplacement(ctx, opts.DB, *runtimeDrain)
+				if replacementErr != nil {
+					runtimeSelectionBlocked = true
+					logger.Warn("read replacement runtime", "err", replacementErr)
+				}
+				if activateReplacement {
 					// This exact terminal barrier cannot use its frozen provider
 					// again. Let a validated desired revision become applied so
 					// recovery can prove the replacement contract. The barrier
@@ -3091,6 +3095,7 @@ func Run(ctx context.Context, opts Options) error {
 								return publicationEvaluationIdentity(checkCtx, opts.RepoPath, opts.GitDir, opts.DB, cctx)
 							},
 							protect: func(protectCtx context.Context) error {
+								evaluationFollowup = true
 								epoch, err := BeginProtectionObservation(protectCtx, opts.DB)
 								if err != nil {
 									return err
@@ -3142,6 +3147,7 @@ func Run(ctx context.Context, opts Options) error {
 							PublicationDrain:           activeDrain,
 						})
 						if evaluationCtx.Err() != nil && passCtx.Err() == nil {
+							evaluationFollowup = true
 							repSum.Disposition = ReplayDispositionTransientWait
 							repSum.DispositionReason = "publication_evaluation_invalidated"
 							repErr = nil
@@ -3397,6 +3403,11 @@ func Run(ctx context.Context, opts Options) error {
 		// 4m. Sleep until the next tick or wake/shutdown/ctx event.
 		if stopped {
 			return nil
+		}
+		if evaluationFollowup {
+			// A wake consumed by protection still requires full classification or
+			// branch/configuration handling once the frozen evaluation has ended.
+			continue
 		}
 		timer := time.NewTimer(currentDelay)
 		select {

@@ -1881,3 +1881,28 @@ INSERT INTO capture_events(
 	drain.EventSeqs = append([]int64(nil), checkpoint.EventSeqs...)
 	return db, events, drain
 }
+
+func TestPublicationDrainPreflightRequiresRepeatedExactEvidence(t *testing.T) {
+	ctx := context.Background()
+	db, _, drain := openPublicationDrainTestState(t, 1, 1)
+	update := PublicationDrainUpdateFrom(drain, drain.UpdatedTS+1, drain.LastProgressTS)
+	update.Phase = state.PublicationDrainEventFallback
+	update.FallbackMode = publicationFallbackLocalUnlock
+	update.ReasonCode = publicationReasonPreflight
+	update.ReasonEvidence = "older-evidence"
+	update.LastError = "an older display message"
+	current, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := &IntentPlanPreflightError{Failure: "updated wording", EvidenceFingerprint: "new-exact-plan-and-findings"}
+	changed, err := UpdatePublicationDrainAfterReplay(ctx, db, current, ReplaySummary{}, failure, time.Unix(20, 0))
+	if err != nil || changed.Phase != state.PublicationDrainEventFallback || changed.ReasonEvidence == "older-evidence" {
+		t.Fatalf("new evidence prematurely stopped: %+v %v", changed, err)
+	}
+	failure.Failure = "another display wording for the same evidence"
+	repeated, err := UpdatePublicationDrainAfterReplay(ctx, db, changed, ReplaySummary{}, failure, time.Unix(21, 0))
+	if err != nil || repeated.Phase != state.PublicationDrainNeedsAction {
+		t.Fatalf("same typed evidence did not stop: %+v %v", repeated, err)
+	}
+}

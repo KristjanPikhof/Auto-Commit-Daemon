@@ -206,16 +206,24 @@ func newCompatStartCmd() *cobra.Command {
 			harness = "manual"
 		}
 		repo, _ := cmd.Flags().GetString("repo")
-		record, roots, worktreeRoot, err := lookupRegisteredRepo("start", repo)
-		if err != nil {
-			return err
+		// Resolve the canonical repository once. The compatibility result and
+		// the current integration route must use the same opt-in decision.
+		decision := evaluateIntegrationRepo(cmd.Context(), repo)
+		if decision.Err != nil {
+			return decision.Err
 		}
+		if decision.Record.Path == "" {
+			return fmt.Errorf("acd start: repository is not registered; use `acd on` to enable protection")
+		}
+		record, roots, worktreeRoot := decision.Record, decision.Roots, decision.Root
 		existed, _, err := state.ReadClientRegistration(cmd.Context(), record.StateDB, sessionID)
 		if err != nil {
 			return err
 		}
-		if err := sendInternalHint(cmd.Context(), worktreeRoot, "wake", false, "open", sessionID, harness, watchPID); err != nil {
-			return err
+		if decision.State == integrationRepoActive {
+			if err := sendInternalHintToRepo(cmd.Context(), record, roots, "wake", false, "open", sessionID, harness, watchPID); err != nil {
+				return err
+			}
 		}
 		_, count, err := state.ReadClientRegistration(cmd.Context(), record.StateDB, sessionID)
 		if err != nil {
@@ -881,6 +889,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		}
 		_ = json.Unmarshal(request.Params, &params)
 		var drainAnchor publicationDrainTarget
+		var admittedScope commitAllScope
 		var requestedPublicationBranch string
 		var minimumPublicationCheckpointSeq int64
 		publicationWorktreeID := checkpointpkg.WorktreeID(runtime.worktree.Root)
@@ -893,6 +902,7 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 					return nil, &supervisor.ProtocolError{Code: "plan_changed", Message: "commit-all scope or staging changed; run `acd commit-all` to review again"}
 				}
 				params.ExpectedIndexDigest = current.IndexDigest
+				admittedScope = current
 			}
 			if params.ConsumeStaged && params.PreviewDigest == "" {
 				// --yes accepts the index at worker admission, not an earlier CLI read.
@@ -1082,6 +1092,15 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 								drainTarget, unsafeErr = freezePublicationDrainTarget(
 									ctx, runtime.db, runtime.worktree.Root, lastCheckpoint,
 									publicationWorktreeID, acceptedEpoch, drainAnchor)
+								if unsafeErr == nil && params.PreviewDigest != "" {
+									matches, scopeErr := commitAllTargetMatchesScope(ctx, runtime.db, drainTarget, admittedScope)
+									if scopeErr != nil {
+										unsafeErr = scopeErr
+									} else if !matches {
+										runtime.gate.Unlock()
+										return nil, &supervisor.ProtocolError{Code: "plan_changed", Message: "new paths entered the checkpoint; review the refreshed commit-all preview"}
+									}
+								}
 								if unsafeErr == nil {
 									nowTS := float64(time.Now().UnixNano()) / 1e9
 									preparedDrain := state.PublicationDrain{

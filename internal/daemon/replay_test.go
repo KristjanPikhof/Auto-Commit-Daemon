@@ -3534,7 +3534,7 @@ func TestReplay_IntentStrategyForcedAgingRewritesWeakSubject(t *testing.T) {
 	}
 }
 
-func TestReplay_IntentStrategyForcedAgingRewriteFailureFallsBack(t *testing.T) {
+func TestReplay_IntentStrategyForcedAgingRewriteWaitsForAI(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 
@@ -3570,57 +3570,24 @@ func TestReplay_IntentStrategyForcedAgingRewriteFailureFallsBack(t *testing.T) {
 		IntentMaxPendingAge: time.Hour,
 		IntentDeferLimit:    1,
 	})
-	if err != nil {
-		t.Fatalf("Replay: %v", err)
-	}
-	if sum.Published != 1 || sum.Skipped {
-		t.Fatalf("summary=%+v want deterministic fallback publish", sum)
+	if !isIntentPlannerCircuitWait(err) || sum.Published != 0 {
+		t.Fatalf("unavailable rewrite must wait: summary=%+v err=%v", sum, err)
 	}
 	if primary.planCalls != 1 || primary.rewriteCalls != 1 {
-		t.Fatalf("planCalls=%d rewriteCalls=%d want 1/1", primary.planCalls, primary.rewriteCalls)
+		t.Fatalf("unexpected calls %d/%d", primary.planCalls, primary.rewriteCalls)
 	}
-	validation := traceEventsByClass(trace.Events(), "intent.planner.validation_failed")
-	if len(validation) != 1 || !strings.Contains(validation[0].Error, "rewrite unavailable") {
-		t.Fatalf("validation trace=%+v want rewrite failure", validation)
+	if journals := loadSelfPublicationRows(t, ctx, f.db); len(journals) != 0 {
+		t.Fatalf("outage created publication journal: %+v", journals)
 	}
-	decisions, err := state.DecisionsForEvent(ctx, f.db, pending[0].Seq, 20)
-	if err != nil {
-		t.Fatalf("DecisionsForEvent: %v", err)
-	}
-	hasFallback := false
-	for _, decision := range decisions {
-		if decision.Kind == state.DecisionKindMessageQualityFallback {
-			hasFallback = true
-			break
-		}
-	}
-	if !hasFallback {
-		t.Fatalf("message_quality_fallback decision missing: %+v", decisions)
+	primary.rewriteErr = nil
+	primary.rewrite = ai.Result{Subject: "Parse totals consistently", Body: "- Keep total parsing behavior coherent"}
+	sum, err = Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent, IntentPlanner: planner, IntentWindow: 10, IntentMinPending: 3, IntentMaxPendingAge: time.Hour, IntentDeferLimit: 1})
+	if err != nil || sum.Published != 1 {
+		t.Fatalf("corrected rewrite=%+v err=%v", sum, err)
 	}
 	journals := loadSelfPublicationRows(t, ctx, f.db)
-	if len(journals) != 1 ||
-		journals[0].phase != state.SelfPublicationCompleted ||
-		journals[0].target != sum.SelfPublicationTargetOID {
-		t.Fatalf("message-quality journals=%+v summary=%+v", journals, sum)
-	}
-	commits := revListCount(t, ctx, f.dir, "HEAD")
-	f.cctx.BaseHead = sum.BaseHead
-	if _, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
-		GitDir:              f.gitDir,
-		CommitStrategy:      ai.CommitStrategyIntent,
-		IntentPlanner:       planner,
-		IntentWindow:        10,
-		IntentMinPending:    3,
-		IntentMaxPendingAge: time.Hour,
-		IntentDeferLimit:    1,
-	}); err != nil {
-		t.Fatalf("second Replay: %v", err)
-	}
-	if got := revListCount(t, ctx, f.dir, "HEAD"); got != commits {
-		t.Fatalf("message-quality retry commits=%d want %d", got, commits)
-	}
-	if got := loadSelfPublicationRows(t, ctx, f.db); len(got) != 1 {
-		t.Fatalf("message-quality retry journals=%+v want one", got)
+	if len(journals) != 1 || journals[0].phase != state.SelfPublicationCompleted {
+		t.Fatalf("recovered publication=%+v", journals)
 	}
 }
 
@@ -4670,7 +4637,7 @@ func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) 
 	seq2 := captureSamePathEdit(t, ctx, f, "chain.txt", "v2\n")
 	seq3 := captureSamePathEdit(t, ctx, f, "chain.txt", "v3\n")
 
-	planner := &recordingIntentPlanner{
+	planner := &semanticRecordingIntentPlanner{recordingIntentPlanner: &recordingIntentPlanner{
 		plan: ai.IntentPlan{
 			SelectedSeqs: []int64{seq1, seq2, seq3},
 			CommitGroups: []ai.IntentCommitGroup{
@@ -4680,7 +4647,7 @@ func TestReplay_IntentStrategyRejectsInterleavedSamePathPartition(t *testing.T) 
 			DeferredSeqs:    []int64{},
 			DeferredReasons: []ai.DeferredReason{},
 		},
-	}
+	}}
 
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:           f.gitDir,
@@ -5067,7 +5034,7 @@ func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
 		t.Fatalf("AppendCaptureEvent create: %v", err)
 	}
 
-	planner := &recordingIntentPlanner{
+	planner := &semanticRecordingIntentPlanner{recordingIntentPlanner: &recordingIntentPlanner{
 		plan: ai.IntentPlan{
 			SelectedSeqs:   []int64{createSeq},
 			DeferredSeqs:   []int64{deleteSeq},
@@ -5077,7 +5044,7 @@ func TestReplay_IntentStrategyRejectsDeferredPrefixDependency(t *testing.T) {
 				{Seq: deleteSeq, Reason: "later"},
 			},
 		},
-	}
+	}}
 
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir:           f.gitDir,
@@ -8186,4 +8153,12 @@ func TestPathQuiescence_EvictionBoundsMapSize(t *testing.T) {
 	if got := PathQuiescenceTrackerSize(); got > pathQuiescenceMaxEntries/4 {
 		t.Fatalf("eviction did not prune stale entries; size=%d", got)
 	}
+}
+
+// This provider keeps legacy grouping-safety fixtures on the semantic-message
+// contract even when their deliberately invalid group needs local correction.
+type semanticRecordingIntentPlanner struct{ *recordingIntentPlanner }
+
+func (p *semanticRecordingIntentPlanner) RewriteIntentMessage(context.Context, ai.IntentMessageRewriteRequest) (ai.Result, error) {
+	return ai.Result{Subject: "Preserve ordered feature changes", Body: "- Keep dependent captures in their proven order"}, nil
 }
