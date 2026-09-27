@@ -177,7 +177,7 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	}
 }
 
-func TestIntentForcedRepairPublishesWideCandidateAfterRestart(t *testing.T) {
+func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
@@ -216,7 +216,10 @@ func TestIntentForcedRepairPublishesWideCandidateAfterRestart(t *testing.T) {
 				"grouping_reason":    "the model incorrectly deferred forced work",
 			}})
 		default:
-			http.Error(w, "unexpected planner call", http.StatusBadRequest)
+			writeNativeIntentCandidatesResponse(t, w, "wide_retry", []map[string]any{
+				nativeReadyIntentCandidate("wide-shortcuts", seqs,
+					"Finish shortcut change", "", "complete captured shortcut work"),
+			})
 		}
 	}))
 	defer server.Close()
@@ -279,7 +282,11 @@ func TestIntentForcedRepairPublishesWideCandidateAfterRestart(t *testing.T) {
 		t.Fatalf("worker did not restart: before=%d after=%d", firstSession.DaemonPID, secondSession.DaemonPID)
 	}
 	t.Cleanup(func() { shutdownDaemon(t, fullEnv, repo, "wide-forced-b") })
-	waitFor(t, "wide forced candidate published after restart", 30*time.Second, func() bool {
+	result := runAcd(t, ctx, fullEnv, "commit-all", "--repo", repo, "--yes")
+	if result.ExitCode != 0 {
+		t.Fatalf("commit-all exit=%d\nstdout=%s\nstderr=%s", result.ExitCode, result.Stdout, result.Stderr)
+	}
+	waitFor(t, "wide forced candidate published after commit-all", 10*time.Second, func() bool {
 		return plannerCalls.Load() >= 2 && sqliteScalar(t, dbPath,
 			"SELECT COUNT(*) FROM capture_events WHERE state='published'") == "13"
 	})
