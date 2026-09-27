@@ -630,15 +630,48 @@ func ReopenPublicationDrainCheckpointing(
 	expectedError string,
 	updatedTS float64,
 ) (PublicationDrain, error) {
+	return reopenPublicationDrainCheckpointing(
+		ctx, db, id, expectedError, updatedTS, "")
+}
+
+// ReopenPublicationDrainCheckpointingOnce preserves a retry marker through
+// checkpointing and replay. A repeated identical failure retains the marker,
+// so automatic recovery cannot restart the same drain indefinitely.
+func ReopenPublicationDrainCheckpointingOnce(
+	ctx context.Context,
+	db *DB,
+	id string,
+	expectedError string,
+	updatedTS float64,
+	marker string,
+) (PublicationDrain, error) {
+	if marker == "" {
+		return PublicationDrain{}, errors.New(
+			"state: reopen publication drain: empty retry marker")
+	}
+	return reopenPublicationDrainCheckpointing(
+		ctx, db, id, expectedError, updatedTS, marker)
+}
+
+func reopenPublicationDrainCheckpointing(
+	ctx context.Context,
+	db *DB,
+	id string,
+	expectedError string,
+	updatedTS float64,
+	marker string,
+) (PublicationDrain, error) {
 	if db == nil {
 		return PublicationDrain{}, errors.New(
 			"state: ReopenPublicationDrainCheckpointing: nil db")
 	}
 	result, err := db.conn.ExecContext(ctx, `
 UPDATE publication_drains
-SET phase='checkpointing',last_error='',reason_code='',reason_evidence='',updated_ts=?
-WHERE id=? AND phase='needs_action' AND last_error=? AND updated_ts<=?`,
-		updatedTS, id, sanitizePublicationDrainError(expectedError), updatedTS)
+SET phase='checkpointing',last_error='',reason_code='',reason_evidence=?,updated_ts=?
+WHERE id=? AND phase='needs_action' AND last_error=? AND updated_ts<=?
+  AND (?='' OR reason_evidence='')`,
+		marker, updatedTS, id, sanitizePublicationDrainError(expectedError),
+		updatedTS, marker)
 	if err != nil {
 		return PublicationDrain{}, fmt.Errorf(
 			"state: reopen publication drain checkpointing: %w", err)

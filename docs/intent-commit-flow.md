@@ -38,6 +38,41 @@ offered to the planner in bounded passes.
 Optional integrations may provide boundaries, but filesystem protection does
 not depend on them.
 
+## Commit purpose
+
+The planner identifies completed goals before assigning captures. Each commit
+should explain one useful step and leave a working state under the configured
+checks. Implementation, callers, imports, tests, generated files, and relevant
+documentation stay with the step they support. Different files, screens, or
+capture times do not justify separate commits.
+
+Each split needs a useful review or revert boundary. A preparatory refactor can
+precede the feature it enables when both are complete steps. Helpers must
+precede their callers or ship together. Documentation links belong with their
+targets, and available test updates belong with the changed behavior.
+Unpublished assertion corrections and other supporting edits stay with the
+change they finish.
+
+For example, a shortcut menu implementation, its tests, and a corrected
+assertion form one change. A settings-placement document and its index link
+form another. The same model-row presentation improvement across several
+screens can form one commit when the diffs show a shared purpose.
+
+A change with a broader effect, such as changing a shared default, can be a
+separate step when it is independently meaningful and safe. Its message should
+explain the reason supported by the available evidence. ACD must not invent
+motivation or claim tests ran when it has no such evidence.
+
+These rules guide grouping and messages; they do not impose a commit count.
+ACD cannot split a captured file change into invented intermediate versions.
+When a safe intermediate step is unavailable, it keeps the required changes
+together. Missing dependencies must follow from evidence. Age and queue
+pressure never prove completeness. Checks apply to the proposed commit tree,
+not the final combined worktree. Structural checks do not prove that a project
+builds or its tests pass; that requires a configured verification command.
+Existing planning-window bounds, frozen targets, and history-repair limits
+still apply. Planner guidance does not authorize rewriting published history.
+
 ## Presets
 
 | Preset | Publication behavior |
@@ -75,6 +110,16 @@ For forced aging, ACD may discard a missing companion invented by the model
 only when an exact baseline group proves that all available hard dependencies
 are complete. A real waiting dependency, missing object, materialization
 failure, verification failure, or branch-safety problem still blocks the work.
+Balanced fallback size limits apply to the local evidence partition. They do
+not turn a repaired semantic plan back into a waiting group merely because
+its existing membership spans more paths.
+
+An older run stopped by that mistaken size limit gets one automatic retry.
+ACD requires the recorded forced-aging failure, the matching size-limit hold,
+and a completed ready repair plan for the affected capture. Pending candidate
+members must remain inside the frozen target, with no conflicting publication
+or repair in progress. Recovery reopens checkpointing and repeats the normal
+safety checks; it does not publish directly from the old plan.
 
 When a completed plan still matches the same fingerprint, ACD reloads and
 revalidates that plan instead of asking the provider again or rebuilding an

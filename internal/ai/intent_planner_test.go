@@ -206,6 +206,9 @@ func TestIntentPlannerPromptContainsPlannerRules(t *testing.T) {
 		"return every offered seq as either selected or deferred",
 		"Do not group unrelated captures",
 		"Do not invent intent beyond the supplied evidence",
+		"Separate a preparatory refactor from a later feature",
+		"Keep tests, imports, generated output, and other support changes with the behavior they complete",
+		"Give a broad behavior or default-setting change its own purpose",
 		"Forced-aging windows contain only the overdue capture",
 		"leave deferred_seqs and deferred_reasons empty",
 		"Same-path causality",
@@ -222,6 +225,42 @@ func TestIntentPlannerPromptContainsPlannerRules(t *testing.T) {
 	for _, want := range required {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestIntentPlannerPromptsRequireCompleteChanges(t *testing.T) {
+	for _, planner := range []struct {
+		name   string
+		prompt func(...CommitFormat) string
+	}{
+		{"v1", IntentPlannerSystemPrompt},
+		{"v2", IntentPlannerV2SystemPrompt},
+	} {
+		for _, format := range []CommitFormat{CommitFormatImperative, CommitFormatConventional} {
+			t.Run(planner.name+"/"+string(format), func(t *testing.T) {
+				prompt := planner.prompt(format)
+				for _, rule := range []string{
+					"Identify the distinct goals in the supplied changes before assigning captures",
+					"Different files, screens, directories, capture times, or programming languages are not reasons to split",
+					"Fold available unpublished corrections into the change they correct",
+					"published history remains subject to the supplied repair boundaries",
+					"helpers before callers, documentation targets before links",
+					"changed behavior together with its available test updates",
+					"state in grouping_reason why the steps are useful to review or revert separately",
+					"never claim tests passed without recorded results",
+					"never invent intermediate file versions or pull in later captures",
+					"age and queue pressure do not prove completeness or waive safety checks",
+					"Assess each intermediate commit using its proposed contents and prerequisites",
+					"do not target a fixed commit count",
+					"group a menu-state implementation, its tests, and an assertion correction as one change",
+					"group a placement document with its index link",
+				} {
+					if !strings.Contains(prompt, rule) {
+						t.Errorf("planner missing complete-change rule %q", rule)
+					}
+				}
+			})
 		}
 	}
 }

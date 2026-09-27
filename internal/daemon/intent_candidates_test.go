@@ -1774,6 +1774,76 @@ func TestIntentCandidatePlanRepairsForcedDeferralFromBaseline(t *testing.T) {
 	}
 }
 
+func TestIntentCandidateForcedRepairKeepsWidePersistedGroupReady(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	captures := make([]IntentCandidateCapture, 0, 13)
+	members := make([]state.IntentCandidateEvent, 0, 13)
+	target := make([]int64, 0, 13)
+	hints := make([]IntentDependencyHint, 0, 12)
+	for i := 0; i < 13; i++ {
+		capture := appendIntentCandidateCapture(t, db,
+			fmt.Sprintf("shortcut-%02d.go", i), "create", "",
+			fmt.Sprintf("shortcut-%d", i))
+		captures = append(captures, capture)
+		members = append(members, state.IntentCandidateEvent{
+			EventSeq: capture.Event.Seq, EventRole: "code",
+		})
+		target = append(target, capture.Event.Seq)
+		if i > 0 {
+			hints = append(hints, IntentDependencyHint{
+				PrerequisiteSeq: captures[i-1].Event.Seq,
+				DependentSeq:    capture.Event.Seq,
+				Strength:        ai.IntentDependencyHard, Kind: "object_reference",
+				Evidence: "one complete shortcut change",
+			})
+		}
+	}
+	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
+		ID: "wide-shortcuts", BranchRef: "refs/heads/main",
+		BranchGeneration: 1, Status: state.IntentCandidateWaiting,
+		Purpose: "finish overlay shortcuts", Readiness: state.IntentReadinessWait,
+		MissingCompanions: "balanced fallback exceeds 12 paths",
+		Events:            members,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	later := appendIntentCandidateCapture(t, db,
+		"unrelated.go", "create", "", "later")
+	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "wide-shortcuts", SelectedSeqs: []int64{target[0]},
+			Purpose: "finish overlay shortcuts", Readiness: ai.IntentCandidateWait,
+			MissingCompanions: []string{"model-only missing companion"},
+			GroupingReason:    "wait for a companion",
+		}},
+	}}
+	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
+		BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Captures: []IntentCandidateCapture{captures[0]},
+		Hints:    hints, TargetEventSeqs: target, ForcedAging: true,
+		Planner: planner, Preset: config.PresetBalanced,
+		VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("forced repair: %v", err)
+	}
+	if planner.calls != 1 || result.Fallback != "repaired_forced_aging" ||
+		len(result.Decisions) != 1 || !result.Decisions[0].Publishable {
+		t.Fatalf("forced plan did not recover: calls=%d result=%+v",
+			planner.calls, result)
+	}
+	decision := result.Decisions[0]
+	if len(decision.Candidate.Events) != len(target) ||
+		containsIntentSeq(intentCandidateEventSeqs(decision.Candidate.Events), later.Event.Seq) {
+		t.Fatalf("frozen target membership changed: %+v", decision.Candidate.Events)
+	}
+}
+
 func TestIntentCandidateLocalRepairKeepsWaitingHardDependency(t *testing.T) {
 	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
 		OfferedCaptures: []ai.OfferedCapture{{

@@ -530,6 +530,33 @@ func TestApplyControlStatusUnreconstructibleDrainOffersForceRecovery(t *testing.
 	}
 }
 
+func TestApplyControlStatusBlockedDrainExplainsCause(t *testing.T) {
+	const cause = "forced_capture_deferred: forced-aging seq 92343 must be ready with no missing companions"
+	status := statusReport{
+		Daemon: "running", PID: os.Getpid(),
+		PublicationDrain: publicationDrainReport{
+			Available: true, Phase: state.PublicationDrainNeedsAction,
+			LastError: cause,
+		},
+	}
+	result := controlResult{OK: true}
+	applyControlStatus(&result, status)
+	if result.OK || result.Health != controlHealthNeedsAttention ||
+		!strings.Contains(result.Summary, cause) ||
+		strings.Contains(result.NextAction, "acd doctor") ||
+		!strings.Contains(result.NextAction, "acd support diagnose") {
+		t.Fatalf("blocked drain control result=%+v", result)
+	}
+	var doctor bytes.Buffer
+	if err := renderProductEnvelope(&doctor, envelopeFromControl(result), false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(doctor.String(), cause) ||
+		!strings.Contains(doctor.String(), "acd support diagnose") {
+		t.Fatalf("doctor output lacks blocker and next step: %s", doctor.String())
+	}
+}
+
 func TestApplyControlStatusRewindGraceIsWaiting(t *testing.T) {
 	status := statusReport{
 		Daemon: "running",

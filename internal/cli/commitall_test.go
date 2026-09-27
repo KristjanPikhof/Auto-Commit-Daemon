@@ -108,6 +108,95 @@ func TestCommitAllReconnectSelectsOnlyTheCurrentWorktreeDrain(t *testing.T) {
 	}
 }
 
+func TestCommitAllMissingWorkerCannotReconnectToActiveDrain(t *testing.T) {
+	for _, phase := range []string{
+		state.PublicationDrainCheckpointing,
+		state.PublicationDrainSemantic,
+		state.PublicationDrainEventFallback,
+	} {
+		if publicationDrainCanReconnect(state.PublicationDrain{Phase: phase}, false) {
+			t.Fatalf("reconnected to active %s drain without a worker", phase)
+		}
+		if !publicationDrainCanReconnect(state.PublicationDrain{Phase: phase}, true) {
+			t.Fatalf("did not reconnect to active %s drain with a worker", phase)
+		}
+	}
+	for _, phase := range []string{
+		state.PublicationDrainCompleted, state.PublicationDrainNeedsAction,
+	} {
+		if !publicationDrainCanReconnect(state.PublicationDrain{Phase: phase}, false) {
+			t.Fatalf("did not report terminal %s drain without a worker", phase)
+		}
+	}
+}
+
+func TestCommitAllProgressShowsOlderProtectedTarget(t *testing.T) {
+	startedAt := time.Unix(10_000, 0)
+	projection := state.PublicationDrainReadOnlyProjection{
+		Latest: &state.PublicationDrain{
+			ID: "older-run", WorktreeID: "current",
+			CreatedTS: 1, Phase: state.PublicationDrainNeedsAction,
+			TargetEventCount: 37, PublishedEventCount: 6,
+		},
+	}
+	if selectReconnectPublicationDrain(projection, "current", startedAt) != nil {
+		t.Fatal("older target must not prove a new request started")
+	}
+	if drain := productPublicationDrainForProgress(projection, "current", startedAt); drain == nil ||
+		drain.ID != "older-run" || drain.TargetEventCount-drain.PublishedEventCount != 31 {
+		t.Fatalf("older target was hidden from progress: %+v", drain)
+	}
+	projection.Latest.Phase = state.PublicationDrainCompleted
+	if drain := productPublicationDrainForProgress(projection, "current", startedAt); drain != nil {
+		t.Fatalf("old completed target shown as current progress: %+v", drain)
+	}
+}
+
+func TestCommitAllReadOnlyFallbackPreservesCompatibilityError(t *testing.T) {
+	for _, message := range []string{
+		"installed runtime does not match; run `acd setup`",
+		"running ACD does not advertise the current compatibility contract",
+	} {
+		if productDrainReadOnlyFallbackAllowed(unavailableError(message)) {
+			t.Fatalf("read-only fallback hid compatibility error: %s", message)
+		}
+	}
+	if productDrainReadOnlyFallbackAllowed(actionRequiredError("blocked", "worker refused status")) {
+		t.Fatal("read-only fallback hid a non-retryable worker error")
+	}
+	if !productDrainReadOnlyFallbackAllowed(unavailableError("worker unavailable: missing socket")) {
+		t.Fatal("worker disconnect did not allow durable read-only projection")
+	}
+}
+
+func TestCommitAllMissingWorkerReadsDurableBlockedDrain(t *testing.T) {
+	repo, dbPath, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	drainID, _ := seedResolvedFixPublicationDrain(t, ctx, repo, db)
+	before, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, live, err := readProductPublicationDrainAfterWorkerFailure(
+		ctx, dbPath, unavailableError("worker unavailable: missing socket"))
+	if err != nil || live {
+		t.Fatalf("read-only projection live=%t err=%v", live, err)
+	}
+	drain := selectReconnectPublicationDrain(projection,
+		"0123456789abcdef", time.Unix(3, 0))
+	if drain == nil || drain.ID != drainID ||
+		drain.Phase != state.PublicationDrainNeedsAction ||
+		drain.LastError != "forced_capture_deferred" ||
+		!publicationDrainCanReconnect(*drain, live) {
+		t.Fatalf("blocked durable drain lost after worker failure: %+v", drain)
+	}
+	after, err := fileSHA256(dbPath)
+	if err != nil || before != after {
+		t.Fatalf("read-only projection changed DB: before=%s after=%s err=%v",
+			before, after, err)
+	}
+}
+
 // TestResolveEffectiveCommitStrategy_DaemonMetaWins covers the priority
 // chain: daemon meta `commit.strategy` > env ACD_COMMIT_STRATEGY > default
 // (event). Three subtests, one per source.

@@ -923,6 +923,7 @@ func IntentPlannerV2SystemPrompt(format ...CommitFormat) string {
 		"Return only a v2 candidate plan. Assign every offered seq to exactly one candidate. " +
 		"Candidate order must be topological. Non-contiguous capture groups are allowed when dependency evidence proves independence and ordering. " +
 		"A group may add semantic cohesion not present in the dependency graph when the exact diffs prove one intent. Never group by time or directory alone. " +
+		purposefulCommitGroupingInstructions +
 		"Activity epochs and temporal proximity may trigger evaluation but cannot alone prove cohesion. " +
 		"Mark readiness=wait when any required companion is missing. A ready candidate must not depend on a waiting candidate. " +
 		"Keep raw-source reasoning out of purpose, grouping_reason, and missing_companions. " +

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ const supersededCandidateDrainErrorPrefix = "state: candidate "
 const supersededCandidateDrainErrorSuffix = " is terminal in status superseded"
 const exhaustedCandidateSuccessorDrainErrorPrefix = "daemon: intent candidates: exhausted successor IDs for \""
 const exhaustedCandidateSuccessorDrainErrorSuffix = "\""
+const publicationForcedIntentBoundRetry = "forced_intent_bound_retry"
 
 // PublicationDrainSemanticMessageUnavailableReason identifies historical
 // terminal outage rows so current recovery can reopen them safely.
@@ -660,6 +662,166 @@ SELECT EXISTS(
 	}
 	reopened, err := state.ReopenPublicationDrainCheckpointing(
 		ctx, db, drain.ID, recordedError, nowTS)
+	if err != nil {
+		return nil, err
+	}
+	return &reopened, nil
+}
+
+// RecoverForcedIntentBoundPublicationDrain retries a drain stopped by the old
+// Balanced size cap after a valid forced-aging plan had already been repaired.
+// The frozen membership, persisted candidate, and completed local repair must
+// all describe the same capture before checkpointing can be retried.
+func RecoverForcedIntentBoundPublicationDrain(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	now time.Time,
+) (*state.PublicationDrain, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id,last_error,reason_code FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	var id, recordedError, reasonCode string
+	if err := rows.Scan(&id, &recordedError, &reasonCode); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if reasonCode != "publication_failed" {
+		return nil, nil
+	}
+	const prefix = "intent planner v2: forced_capture_deferred: forced-aging seq "
+	const suffix = " must be ready with no missing companions"
+	seqText, ok := strings.CutPrefix(recordedError, prefix)
+	if !ok {
+		return nil, nil
+	}
+	seqText, ok = strings.CutSuffix(seqText, suffix)
+	if !ok {
+		return nil, nil
+	}
+	seq, err := strconv.ParseInt(seqText, 10, 64)
+	if err != nil || seq <= 0 {
+		return nil, nil
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, id)
+	if err != nil {
+		return nil, err
+	}
+	if !containsIntentSeq(drain.EventSeqs, seq) {
+		return nil, nil
+	}
+	if drain.ReasonEvidence != "" {
+		return nil, nil
+	}
+	var pendingSeq int
+	err = db.ReadSQL().QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM capture_events WHERE seq=? AND state='pending'
+  AND branch_ref=? AND branch_generation=?)`, seq, branchRef, generation).
+		Scan(&pendingSeq)
+	if err != nil || pendingSeq == 0 {
+		return nil, err
+	}
+	counts, err := publicationDrainCountsForTarget(ctx, db, drain.EventSeqs)
+	if err != nil || counts.terminal != 0 {
+		return nil, err
+	}
+	var candidateID string
+	err = db.ReadSQL().QueryRowContext(ctx, `
+SELECT c.id FROM intent_candidates c
+JOIN intent_candidate_events e ON e.candidate_id=c.id
+WHERE e.event_seq=? AND e.membership_state='active'
+  AND c.branch_ref=? AND c.branch_generation=?
+  AND c.status='waiting' AND c.readiness='wait'
+  AND c.missing_companions='balanced fallback exceeds 12 paths'`,
+		seq, branchRef, generation).Scan(&candidateID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	candidate, exists, err := state.IntentCandidateByID(ctx, db, candidateID)
+	if err != nil || !exists {
+		return nil, err
+	}
+	within, err := intentCandidatesWithinTarget(ctx, db,
+		[]state.IntentCandidate{candidate}, drain.EventSeqs)
+	if err != nil || len(within) != 1 {
+		return nil, err
+	}
+	var activeRepair, activePublication, activeOperation int
+	err = db.ReadSQL().QueryRowContext(ctx, `
+SELECT
+  EXISTS(SELECT 1 FROM intent_repairs WHERE branch_ref=?
+    AND branch_generation=? AND status IN ('prepared','git_applied')),
+  EXISTS(SELECT 1 FROM self_publications WHERE branch_ref=?
+    AND branch_generation=? AND phase IN ('prepared','git_applied')),
+  EXISTS(SELECT 1 FROM operations WHERE worktree_id=?
+    AND status IN ('prepared','active'))`,
+		branchRef, generation, branchRef, generation, drain.WorktreeID).
+		Scan(&activeRepair, &activePublication, &activeOperation)
+	if err != nil || activeRepair != 0 || activePublication != 0 ||
+		activeOperation != 0 {
+		return nil, err
+	}
+	planRows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT finding_codes,resolved_plan_json FROM intent_plan_runs
+WHERE branch_ref=? AND branch_generation=? AND completed=1
+  AND resolution_mode='local_repair' AND updated_ts>=?
+  AND updated_ts<=?
+ORDER BY updated_ts DESC LIMIT 16`, branchRef, generation,
+		drain.LastProgressTS, drain.UpdatedTS)
+	if err != nil {
+		return nil, err
+	}
+	provedPlan := false
+	for planRows.Next() {
+		var findings string
+		var raw sql.NullString
+		if err := planRows.Scan(&findings, &raw); err != nil {
+			planRows.Close()
+			return nil, err
+		}
+		var codes []string
+		var resolved resolvedIntentPlanRun
+		if json.Unmarshal([]byte(findings), &codes) != nil ||
+			!containsIntentString(codes, "forced_capture_deferred") ||
+			!raw.Valid || json.Unmarshal([]byte(raw.String), &resolved) != nil {
+			continue
+		}
+		for _, assignment := range resolved.Plan.Candidates {
+			if assignment.CandidateID == candidateID &&
+				containsIntentSeq(assignment.SelectedSeqs, seq) &&
+				assignment.Readiness == ai.IntentCandidateReady &&
+				len(assignment.MissingCompanions) == 0 &&
+				strings.TrimSpace(assignment.Subject) != "" {
+				provedPlan = true
+			}
+		}
+	}
+	err = planRows.Err()
+	planRows.Close()
+	if err != nil || !provedPlan {
+		return nil, err
+	}
+	nowTS := float64(now.UnixNano()) / 1e9
+	if nowTS < drain.UpdatedTS {
+		nowTS = drain.UpdatedTS
+	}
+	reopened, err := state.ReopenPublicationDrainCheckpointingOnce(
+		ctx, db, drain.ID, recordedError, nowTS,
+		publicationForcedIntentBoundRetry)
 	if err != nil {
 		return nil, err
 	}
@@ -1633,7 +1795,9 @@ func UpdatePublicationDrainAfterReplay(
 			// half-open probe resumes the same plan automatically.
 			update.LastError = ""
 			update.ReasonCode = ""
-			update.ReasonEvidence = ""
+			if update.ReasonEvidence != publicationForcedIntentBoundRetry {
+				update.ReasonEvidence = ""
+			}
 			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 		}
 		update.LastError = replayErr.Error()

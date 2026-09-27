@@ -93,6 +93,23 @@ const IntentStageDiffCap = 16000
 
 const commitMessageFormatInstructions = imperativeCommitMessageFormatInstructions
 
+const purposefulCommitGroupingInstructions = "Identify the distinct goals in the supplied changes before assigning captures; describe each goal in one sentence. " +
+	"Make each commit a complete working step that can be reviewed, verified, and reverted on its own. " +
+	"Include the implementation, callers, imports, tests, generated output, and relevant documentation needed to complete that step. " +
+	"Different files, screens, directories, capture times, or programming languages are not reasons to split one goal into separate commits. " +
+	"Separate a preparatory refactor from a later feature when the refactor is independently valid and its dependencies permit that order. " +
+	"Keep tests, imports, generated output, and other support changes with the behavior they complete; do not create commits for incidental edits. " +
+	"Fold available unpublished corrections into the change they correct, including assertion adjustments, missing imports, and formatting; published history remains subject to the supplied repair boundaries. " +
+	"Order prerequisites before consumers, or keep them together: helpers before callers, documentation targets before links, and changed behavior together with its available test updates. " +
+	"For every proposed split, state in grouping_reason why the steps are useful to review or revert separately; combine them when the evidence gives no meaningful reason, subject to hard dependencies. " +
+	"Give a broad behavior or default-setting change its own purpose when independently valid, and explain its reason and impact in the commit body. " +
+	"Use only supplied evidence for motivation and verification claims; never claim tests passed without recorded results. " +
+	"Preserve supplied capture units, offered-sequence limits, and frozen targets; never invent intermediate file versions or pull in later captures to finish a group. " +
+	"Do not invent hypothetical companions. Identify actual missing dependencies from the supplied evidence; age and queue pressure do not prove completeness or waive safety checks. " +
+	"Assess each intermediate commit using its proposed contents and prerequisites, not the final combined worktree. " +
+	"Prefer a few meaningful steps over save-by-save commits or one group containing unrelated purposes; do not target a fixed commit count. " +
+	"Examples: group a menu-state implementation, its tests, and an assertion correction as one change; group a placement document with its index link; group the same model-row presentation improvement across screens when those edits serve one goal. "
+
 const intentPlannerSystemPrompt = "You are an intent planner for git commits. " +
 	"Return only the structured capture_intent_plan tool output. " +
 	"You may select exactly one capture or any larger non-empty subset. " +
@@ -100,6 +117,7 @@ const intentPlannerSystemPrompt = "You are an intent planner for git commits. " 
 	"You must return every offered seq as either selected or deferred. " +
 	"Do not group unrelated captures. " +
 	"Do not invent intent beyond the supplied evidence. " +
+	purposefulCommitGroupingInstructions +
 	"Forced-aging windows contain only the overdue capture; when forced_aging is true, select that single offered capture and leave deferred_seqs and deferred_reasons empty. " +
 	"When one visible window contains multiple independent commit intents, return commit_groups in chronological order; each group has its own selected_seqs, subject, body, and grouping_reason. " +
 	"When commit_groups is present, top-level selected_seqs must be the union of all group selected_seqs and top-level subject/body/grouping_reason may describe the first group for legacy compatibility. " +
@@ -113,7 +131,7 @@ const intentPlannerSystemPrompt = "You are an intent planner for git commits. " 
 	commitMessageFormatInstructions + " " +
 	"Keep grouping rationale in grouping_reason, not in body. " +
 	"Body must be empty or contain only commit-message bullets for why/context; never write prose explaining why the selected captures fit together. " +
-	"Worked example: offered=[10,11,12] where 10 and 11 touch internal/checkout/service.go and 12 touches docs/checkout.md; valid plan selected=[10,11], deferred=[12], deferred_reasons=[{seq:12,reason:\"docs change is independent\"}]; invalid plan selected=[11], deferred=[10,12] would split the same-path chain on internal/checkout/service.go and is forbidden."
+	"Worked example: offered=[10,11,12,13] where 10 and 11 touch internal/checkout/service.go, 12 documents that same checkout change, and the diff for 13 proves an unrelated logging fix; valid plan selected=[10,11,12], deferred=[13], deferred_reasons=[{seq:13,reason:\"logging fix is independent\"}]; invalid plan selected=[11], deferred=[10,12,13] would split the same-path chain on internal/checkout/service.go and separate supporting documentation."
 
 var (
 	// reBulletPrefix strips a leading `-` / `*` plus whitespace from a

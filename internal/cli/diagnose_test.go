@@ -19,6 +19,29 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+func TestDiagnoseJSONBlockedDrainAgreesWithStatus(t *testing.T) {
+	var out bytes.Buffer
+	report := diagnoseReport{
+		OperationalState: "needs_attention",
+		PublicationDrain: publicationDrainReport{
+			Available: true, Phase: state.PublicationDrainNeedsAction,
+			LastError: "forced_capture_deferred: missing companions",
+		},
+	}
+	if err := renderProductDiagnoseReport(&out, report); err != nil {
+		t.Fatal(err)
+	}
+	var envelope productEnvelope
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.State != productStateNeedsAction || envelope.NextAction == nil ||
+		!strings.Contains(*envelope.NextAction, "acd support logs") ||
+		!strings.Contains(out.String(), report.PublicationDrain.LastError) {
+		t.Fatalf("diagnose envelope did not expose blocker: %s", out.String())
+	}
+}
+
 func TestDiagnose_AnchorMismatchDetected(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()

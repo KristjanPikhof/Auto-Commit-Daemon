@@ -461,6 +461,66 @@ func TestDecodeIntentPlanV2PreservesRejectedPlanForLocalRepair(t *testing.T) {
 	}
 }
 
+func TestIntentPlanV2SupportsPurposefulSteps(t *testing.T) {
+	req := mustIntentPlanRequestV2(t,
+		[]OfferedCapture{
+			{Seq: 1, Path: "auth/authentication.go", Op: "modify"},
+			{Seq: 2, Path: "auth/authentication_test.go", Op: "modify"},
+			{Seq: 3, Path: "auth/google.go", Op: "create"},
+			{Seq: 4, Path: "auth/google_test.go", Op: "create"},
+			{Seq: 5, Path: "config/session.go", Op: "modify"},
+		},
+		[]IntentCaptureDependency{
+			{FromSeq: 1, ToSeq: 3, Strength: IntentDependencyHard, Kind: "object_reference"},
+			{FromSeq: 1, ToSeq: 2, Strength: IntentDependencySoft, Kind: "source_test"},
+			{FromSeq: 3, ToSeq: 4, Strength: IntentDependencySoft, Kind: "source_test"},
+		},
+	)
+	plan := IntentPlanV2{
+		ProtocolVersion: IntentPlannerProtocolV2,
+		Candidates: []IntentCandidateAssignment{
+			{
+				CandidateID: "prepare-auth", SelectedSeqs: []int64{1, 2},
+				Purpose: "prepare authentication strategies", Readiness: IntentCandidateReady,
+				Subject:        "Refactor authentication strategies",
+				GroupingReason: "refactor and its tests are one working step",
+			},
+			{
+				CandidateID: "add-google", SelectedSeqs: []int64{3, 4},
+				Purpose: "add Google authentication", Readiness: IntentCandidateReady,
+				DependsOnCandidates: []string{"prepare-auth"},
+				Subject:             "Add Google authentication",
+				GroupingReason:      "provider and its tests complete the feature",
+			},
+			{
+				CandidateID: "extend-session", SelectedSeqs: []int64{5},
+				Purpose: "extend session lifetime", Readiness: IntentCandidateReady,
+				Subject:        "Extend session lifetime",
+				Body:           "- OAuth refresh needs longer sessions to avoid early logout",
+				GroupingReason: "default setting has broader impact than the provider",
+			},
+		},
+	}
+	if err := ValidateIntentPlanV2(req, plan); err != nil {
+		t.Fatalf("purposeful ordered plan rejected: %v", err)
+	}
+	plan.Candidates[1].DependsOnCandidates = nil
+	if err := ValidateIntentPlanV2(req, plan); err == nil || !strings.Contains(err.Error(), "hard_dependency_undeclared") {
+		t.Fatalf("feature missing preparatory dependency: %v", err)
+	}
+
+	prompt := IntentPlannerV2SystemPrompt()
+	for _, phrase := range []string{
+		"Separate a preparatory refactor from a later feature",
+		"Keep tests, imports, generated output, and other support changes with the behavior they complete",
+		"Give a broad behavior or default-setting change its own purpose",
+	} {
+		if !strings.Contains(prompt, phrase) {
+			t.Fatalf("v2 planner missing purposeful grouping guidance %q", phrase)
+		}
+	}
+}
+
 func TestNewIntentAtomicityReportRequiresAllSevenGates(t *testing.T) {
 	report := NewIntentAtomicityReport("candidate",
 		IntentAtomicityGateResult{Gate: IntentAtomicityCohesion, Status: IntentAtomicityPassed},

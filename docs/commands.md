@@ -254,6 +254,9 @@ one commit per capture; Intent mode may create several semantically atomic
 commits. The command never combines everything into one commit merely because
 of its name. If the terminal disconnects or the worker restarts, publication
 continues and the next `acd commit-all --yes` reconnects to the same drain.
+If the worker socket is unavailable, the command can still read the saved
+target and its last error. A saved active run does not prove that a worker is
+publishing it; worker recovery remains necessary before it can continue.
 Invalid Intent grouping can use the configured retry budget, capped at two
 corrections after the first plan. Repeated no-progress state then enters
 bounded replanning or a safe local unlock. A local group still requires a
@@ -277,6 +280,8 @@ acd support bundle
 `doctor` shows the worker's current state, its latest safe error, and a command
 that addresses that error. Start with `acd on` for a stopped or stale managed
 worker. Use the support commands only when doctor asks for them.
+A stopped commit-all run includes its recorded cause. `support diagnose --json`
+reports `needs_action` for that block even when checkpoint protection is healthy.
 
 Support repair previews a safely provable interrupted restore and, with
 `--yes`, completes its post-restore checkpoint. It refuses if the working tree

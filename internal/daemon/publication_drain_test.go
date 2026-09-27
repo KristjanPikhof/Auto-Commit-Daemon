@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1598,6 +1599,175 @@ func TestPublicationDrainFallbackNoProgressNeedsAttention(t *testing.T) {
 	if blocked.Phase != state.PublicationDrainNeedsAction ||
 		blocked.LastError != "atomic dependency component made no progress" {
 		t.Fatalf("blocked=%+v", blocked)
+	}
+}
+
+func TestRecoverForcedIntentBoundPublicationDrain(t *testing.T) {
+	makeBlocked := func(t *testing.T) (*state.DB, []state.CaptureEvent, state.PublicationDrain) {
+		t.Helper()
+		ctx := context.Background()
+		db, events, drain := openPublicationDrainTestState(t, 14, 13)
+		members := make([]state.IntentCandidateEvent, 0, 13)
+		for _, event := range events[:13] {
+			members = append(members, state.IntentCandidateEvent{
+				EventSeq: event.Seq, EventRole: "code",
+			})
+		}
+		if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
+			ID: "wide-candidate", BranchRef: drain.BranchRef,
+			BranchGeneration:  drain.BranchGeneration,
+			Status:            state.IntentCandidateWaiting,
+			Readiness:         state.IntentReadinessWait,
+			MissingCompanions: "balanced fallback exceeds 12 paths",
+			Events:            members,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := json.Marshal(resolvedIntentPlanRun{Plan: ai.IntentPlanV2{
+			ProtocolVersion: ai.IntentPlannerProtocolV2,
+			Candidates: []ai.IntentCandidateAssignment{{
+				CandidateID: "wide-candidate", SelectedSeqs: []int64{events[0].Seq},
+				Purpose: "finish shortcuts", Readiness: ai.IntentCandidateReady,
+				Subject: "Gate overlay shortcuts", GroupingReason: "one change",
+			}},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO intent_plan_runs(fingerprint,branch_ref,branch_generation,
+ attempt_limit,finding_codes,resolution_mode,completed,resolved_plan_json,
+ created_ts,updated_ts)
+VALUES('forced-proof',?,?,3,'["forced_capture_deferred"]','local_repair',1,?,11,12)`,
+			drain.BranchRef, drain.BranchGeneration, string(resolved)); err != nil {
+			t.Fatal(err)
+		}
+		update := PublicationDrainUpdateFrom(drain, 13, drain.LastProgressTS)
+		update.Phase = state.PublicationDrainNeedsAction
+		update.ReasonCode = "publication_failed"
+		update.LastError = fmt.Sprintf(
+			"intent planner v2: forced_capture_deferred: forced-aging seq %d must be ready with no missing companions",
+			events[0].Seq)
+		blocked, err := state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db, events, blocked
+	}
+	t.Run("reopens exact frozen target", func(t *testing.T) {
+		ctx := context.Background()
+		db, events, drain := makeBlocked(t)
+		repo := t.TempDir()
+		initPublicationDrainTestRepo(t, ctx, repo)
+		head := commitSingleFile(t, ctx, repo, "", "owned.txt", "base\n", "base")
+		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo},
+			"update-ref", "refs/heads/main", head); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SQL().ExecContext(ctx,
+			`UPDATE checkpoints SET observed_head=? WHERE id=?`,
+			head, drain.CheckpointID); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := RecoverForcedIntentBoundPublicationDrain(
+			ctx, db, drain.BranchRef,
+			drain.BranchGeneration, time.Unix(14, 0))
+		if err != nil || reopened == nil ||
+			reopened.Phase != state.PublicationDrainCheckpointing ||
+			reopened.LastError != "" ||
+			reopened.ReasonEvidence != "forced_intent_bound_retry" ||
+			reopened.TargetEventCount != 13 {
+			t.Fatalf("reopened=%+v err=%v", reopened, err)
+		}
+		var laterState string
+		if err := db.ReadSQL().QueryRowContext(context.Background(),
+			`SELECT state FROM capture_events WHERE seq=?`, events[13].Seq).
+			Scan(&laterState); err != nil || laterState != state.EventStatePending {
+			t.Fatalf("later capture state=%q err=%v", laterState, err)
+		}
+		resumed, err := ResumePublicationDrainCheckpointing(
+			ctx, repo, db, *reopened, time.Unix(15, 0))
+		if err != nil || resumed.Phase != state.PublicationDrainSemantic ||
+			resumed.ReasonEvidence != publicationForcedIntentBoundRetry {
+			t.Fatalf("resumed=%+v err=%v", resumed, err)
+		}
+		waiting, err := UpdatePublicationDrainAfterReplay(ctx, db, resumed,
+			ReplaySummary{}, &IntentPlannerCircuitOpenError{}, time.Unix(16, 0))
+		if err != nil || waiting.ReasonEvidence != publicationForcedIntentBoundRetry {
+			t.Fatalf("transport wait=%+v err=%v", waiting, err)
+		}
+		failure := fmt.Errorf(
+			"intent planner v2: forced_capture_deferred: forced-aging seq %d must be ready with no missing companions",
+			events[0].Seq)
+		blocked, err := UpdatePublicationDrainAfterReplay(ctx, db, waiting,
+			ReplaySummary{}, failure, time.Unix(17, 0))
+		if err != nil || blocked.Phase != state.PublicationDrainNeedsAction {
+			t.Fatalf("repeated failure=%+v err=%v", blocked, err)
+		}
+		again, err := RecoverForcedIntentBoundPublicationDrain(
+			ctx, db, drain.BranchRef,
+			drain.BranchGeneration, time.Unix(18, 0))
+		if err != nil || again != nil {
+			t.Fatalf("repeated reopen=%+v err=%v", again, err)
+		}
+	})
+	for _, tc := range []struct {
+		name   string
+		change func(*testing.T, *state.DB, []state.CaptureEvent)
+	}{
+		{"missing plan proof", func(t *testing.T, db *state.DB, _ []state.CaptureEvent) {
+			_, err := db.SQL().Exec(`DELETE FROM intent_plan_runs`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"stale plan proof", func(t *testing.T, db *state.DB, _ []state.CaptureEvent) {
+			_, err := db.SQL().Exec(`UPDATE intent_plan_runs SET updated_ts=9`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"genuine missing companion", func(t *testing.T, db *state.DB, _ []state.CaptureEvent) {
+			_, err := db.SQL().Exec(`UPDATE intent_candidates SET missing_companions='required test is missing' WHERE id='wide-candidate'`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"active operation", func(t *testing.T, db *state.DB, _ []state.CaptureEvent) {
+			_, err := db.SQL().Exec(`INSERT INTO operations(id,kind,worktree_id,phase,status,created_ts,updated_ts) VALUES('active-test','checkpoint','0123456789abcdef','prepared','prepared',12,12)`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"candidate reaches later capture", func(t *testing.T, db *state.DB, events []state.CaptureEvent) {
+			_, err := db.SQL().Exec(`INSERT INTO intent_candidate_events(candidate_id,ord,event_seq,event_role) VALUES('wide-candidate',13,?,'code')`, events[13].Seq)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"terminal target", func(t *testing.T, db *state.DB, events []state.CaptureEvent) {
+			_, err := db.SQL().Exec(`UPDATE capture_events SET state='failed' WHERE seq=?`, events[1].Seq)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"different safety failure", func(t *testing.T, db *state.DB, _ []state.CaptureEvent) {
+			_, err := db.SQL().Exec(`UPDATE publication_drains SET last_error='hard dependency missing'`)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, events, drain := makeBlocked(t)
+			tc.change(t, db, events)
+			reopened, err := RecoverForcedIntentBoundPublicationDrain(
+				context.Background(), db, drain.BranchRef,
+				drain.BranchGeneration, time.Unix(14, 0))
+			if err != nil || reopened != nil {
+				t.Fatalf("unsafe reopen=%+v err=%v", reopened, err)
+			}
+		})
 	}
 }
 
