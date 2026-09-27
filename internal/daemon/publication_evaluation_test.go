@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,8 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
 func TestRunCheckpointDuringBlockedMessage(t *testing.T) {
@@ -309,6 +309,208 @@ func TestPublicationProviderConfigurationRequiresAction(t *testing.T) {
 			if !ai.ProviderNeedsConfiguration(err) || len(result.Decisions) != 0 || result.PlanAttempt != 0 {
 				t.Fatalf("configuration planner=%+v err=%v", result, err)
 			}
+		})
+	}
+}
+
+type configurationMessageRewriter struct{ err error }
+
+func (p *configurationMessageRewriter) Name() string { return "configured-ai" }
+func (p *configurationMessageRewriter) RewriteIntentMessage(context.Context, ai.IntentMessageRewriteRequest) (ai.Result, error) {
+	if p.err != nil {
+		return ai.Result{}, p.err
+	}
+	return ai.Result{Subject: "Preserve semantic behavior", Body: "- Keep related feature changes together"}, nil
+}
+func TestFallbackMessageConfigurationReleasesRecoveryProbe(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	now := time.Now()
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: IntentPlannerProviderIdentity{Provider: "configured-ai"}, Now: func() time.Time { return now }})
+	permit, err := health.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := health.Complete(ctx, permit, &IntentPlannerTransportFailure{Err: errors.New("outage")}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * time.Second)
+	planner := &configurationMessageRewriter{err: &ai.ProviderHTTPError{StatusCode: 401, Detail: "credentials rejected"}}
+	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{{CandidateID: "feature", SelectedSeqs: []int64{1}, Readiness: ai.IntentCandidateReady}}}
+	_, _, _, err = applyIntentFallbackMessageQuality(ctx, planner, health, ai.IntentPlanRequestV2{}, plan, "")
+	if !ai.ProviderNeedsConfiguration(err) {
+		t.Fatalf("error=%v", err)
+	}
+	if health.Snapshot().State == IntentPlannerCircuitHalfOpen {
+		t.Fatal("configuration failure leaked half-open probe")
+	}
+	permit, err = health.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("corrected credentials cannot acquire released probe: %v", err)
+	}
+	if err := health.Complete(ctx, permit, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockingSemanticPlanner struct {
+	entered chan ai.IntentPlanRequestV2
+	release chan struct{}
+}
+
+func (p *blockingSemanticPlanner) Name() string { return "blocking-semantic" }
+func (p *blockingSemanticPlanner) PlanIntent(context.Context, ai.IntentPlanRequest) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("v2 required")
+}
+func (p *blockingSemanticPlanner) PlanIntentV2(ctx context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
+	select {
+	case p.entered <- req:
+	case <-ctx.Done():
+		return ai.IntentPlanV2{}, ctx.Err()
+	}
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+		return ai.IntentPlanV2{}, ctx.Err()
+	}
+	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}
+	for _, capture := range req.OfferedCaptures {
+		plan.Candidates = append(plan.Candidates, ai.IntentCandidateAssignment{
+			CandidateID: fmt.Sprintf("semantic-%d", capture.Seq), SelectedSeqs: []int64{capture.Seq}, Readiness: ai.IntentCandidateReady,
+			Purpose: "preserve independent feature behavior", Subject: "Preserve feature behavior", Body: "- Keep the captured behavior consistent", GroupingReason: "independent feature implementation",
+		})
+	}
+	return plan, nil
+}
+func (p *blockingSemanticPlanner) RewriteIntentMessage(context.Context, ai.IntentMessageRewriteRequest) (ai.Result, error) {
+	return ai.Result{Subject: "Preserve feature behavior", Body: "- Keep the captured behavior consistent"}, nil
+}
+
+func TestRunSemanticEvaluationProtectsAcrossRestartAndRejectsBranchChange(t *testing.T) {
+	for _, scenario := range []string{"restart", "branch-switch"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newDaemonFixture(t)
+			registerLiveClient(t, f.db)
+			base := context.Background()
+			originalHead, err := git.RevParse(base, f.dir, "HEAD")
+			if err != nil {
+				t.Fatal(err)
+			}
+			planner := &blockingSemanticPlanner{entered: make(chan ai.IntentPlanRequestV2, 8), release: make(chan struct{})}
+			wake := make(chan struct{}, 1)
+			start := func(db *state.DB) (context.CancelFunc, chan error) {
+				ctx, cancel := context.WithCancel(base)
+				done := make(chan error, 1)
+				go func() {
+					done <- Run(ctx, Options{RepoPath: f.dir, GitDir: f.gitDir, DB: db, Scheduler: fastScheduler(), BootGrace: 30 * time.Second,
+						WakeCh: wake, ShutdownCh: make(chan struct{}), SkipSignals: true,
+						replay: func(pass context.Context, repo string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (ReplaySummary, error) {
+							opts.CommitStrategy = ai.CommitStrategyIntent
+							opts.IntentPreset = config.PresetBalanced
+							opts.IntentPlanner = planner
+							opts.IntentHealth = nil
+							opts.IntentSettleWindow = -1
+							opts.IntentBypassBatchWait = true
+							opts.IntentVerificationMode = "structural"
+							return Replay(pass, repo, db, cctx, opts)
+						},
+					})
+				}()
+				return cancel, done
+			}
+			cancel, done := start(f.db)
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Error("semantic worker did not join")
+				}
+			})
+			waitForDaemonMode(t, f.db, "running", 3*time.Second)
+			if err := os.WriteFile(filepath.Join(f.dir, "first.txt"), []byte("first semantic change\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			wake <- struct{}{}
+			select {
+			case <-planner.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("semantic planner did not start")
+			}
+			if err := os.WriteFile(filepath.Join(f.dir, "later.txt"), []byte("later protected change\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			wake <- struct{}{}
+			var checkpointID string
+			waitFor(t, 3*time.Second, "semantic wait checkpoint", func() bool {
+				id, ok, err := state.MetaGet(base, f.db, MetaKeyProtectionCheckpointID)
+				if err != nil || !ok {
+					return false
+				}
+				checkpoint, err := state.ResolveCheckpoint(base, f.db.Path(), id)
+				if err != nil {
+					return false
+				}
+				bytes, err := git.Run(base, git.RunOpts{Dir: f.dir}, "show", checkpoint.CommitOID+":later.txt")
+				if err == nil && string(bytes) == "later protected change\n" {
+					checkpointID = id
+					return true
+				}
+				return false
+			})
+			if scenario == "branch-switch" {
+				if _, err := git.Run(base, git.RunOpts{Dir: f.dir}, "switch", "-c", "new-branch"); err != nil {
+					t.Fatal(err)
+				}
+				// Returning the old semantic response must not apply it on the new branch.
+				planner.release <- struct{}{}
+				select {
+				case <-planner.entered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("worker did not rebuild after branch movement")
+				}
+				head, err := git.RevParse(base, f.dir, "HEAD")
+				if err != nil || head != originalHead {
+					t.Fatalf("stale plan changed branch HEAD: %s %v", head, err)
+				}
+				return
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("cancel did not join semantic job")
+			}
+			path := f.db.Path()
+			if err := f.db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err := state.Open(base, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			pending, _, err := state.MetaGet(base, db, MetaKeyProtectionClassificationPending)
+			if err != nil || pending != "true" {
+				t.Fatalf("restart lost unclassified protection marker: %q %v", pending, err)
+			}
+			checkpoint, err := state.ResolveCheckpoint(base, path, checkpointID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := git.Run(base, git.RunOpts{Dir: f.dir}, "cat-file", "-e", checkpoint.CommitOID+":later.txt"); err != nil {
+				t.Fatal(err)
+			}
+			close(planner.release)
+			cancel, done = start(db)
+			waitFor(t, 8*time.Second, "restarted semantic publication", func() bool {
+				out, err := git.Run(base, git.RunOpts{Dir: f.dir}, "show", "HEAD:later.txt")
+				if err != nil || string(out) != "later protected change\n" {
+					return false
+				}
+				pending, _, err := state.MetaGet(base, db, MetaKeyProtectionClassificationPending)
+				return err == nil && pending == "false"
+			})
 		})
 	}
 }

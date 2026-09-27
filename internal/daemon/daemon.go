@@ -1,8 +1,6 @@
 // Package daemon implements the long-running per-repo capture+replay loop.
 //
-// The exported entry point is Run, which composes all the Phase 1 building
-// blocks (capture, replay, refcount, prune, lock, signals, scheduler) into
-// the loop body §8.1 specifies.
+// Run coordinates capture, publication, object retention, locking and wakeups.
 //
 // Run is single-goroutine: every per-tick mutation happens on the run-loop
 // goroutine. Signals dispatch via os/signal in a small helper goroutine but
@@ -3083,7 +3081,7 @@ func Run(ctx context.Context, opts Options) error {
 						evaluationCtx, cancelEvaluation := context.WithCancel(passCtx)
 						defer cancelEvaluation()
 						evaluation := &publicationEvaluation{
-							gate: opts.OperationGate, cancel: cancelEvaluation,
+							gate: opts.OperationGate, db: opts.DB, cancel: cancelEvaluation,
 							wake: wakeCh, files: fsWakeReader, changes: validationWakeCh, shutdown: shutdownCh,
 							onShutdown: func() { evaluationShutdown = true },
 							identity: func(checkCtx context.Context) (string, error) {
@@ -3134,6 +3132,7 @@ func Run(ctx context.Context, opts Options) error {
 							IntentPreset:               passBundle.IntentPreset,
 							IntentVerificationMode:     passBundle.IntentVerificationMode,
 							IntentCandidateVerify:      candidateVerify,
+							ManagedVerification:        true,
 							IntentRepairCommitVerify:   repairCommitVerify,
 							IntentRepairEnabled:        passBundle.IntentRepairEnabled,
 							IntentRepairHorizon:        passBundle.IntentRepairHorizon,

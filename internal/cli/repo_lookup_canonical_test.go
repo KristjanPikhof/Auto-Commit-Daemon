@@ -222,8 +222,10 @@ func TestRepoLookupRejectsNonGitWithoutRegistryMutation(t *testing.T) {
 	nonGit := t.TempDir()
 
 	for name, run := range map[string]func() error{
-		"status": func() error { return writeStatusProjectionFixture(context.Background(), bytes.NewBuffer(nil), nonGit, true) },
-		"logs":   func() error { return runLogs(context.Background(), bytes.NewBuffer(nil), nonGit, 1, false) },
+		"status": func() error {
+			return writeStatusProjectionFixture(context.Background(), bytes.NewBuffer(nil), nonGit, true)
+		},
+		"logs": func() error { return runLogs(context.Background(), bytes.NewBuffer(nil), nonGit, 1, false) },
 		"events": func() error {
 			return runEvents(context.Background(), bytes.NewBuffer(nil), nonGit, "", 0, 1, false, time.Millisecond, true)
 		},

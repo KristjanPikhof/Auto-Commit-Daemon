@@ -374,9 +374,6 @@ func productListProgressAge(entry productListEntry) string {
 }
 
 func productListPhase(entry productListEntry) string {
-	if entry.PublicationOutcome.RecoveredChanges > 0 && entry.PublicationOutcome.WaitingChanges == 0 {
-		return "recovered"
-	}
 	if entry.OperationalState == "rewriting" {
 		return "history-rewrite"
 	}
@@ -424,6 +421,11 @@ func productListPhase(entry productListEntry) string {
 	case "stalled":
 		return "stalled"
 	default:
+		outcome := entry.PublicationOutcome
+		if outcome.RecoveredChanges > 0 && outcome.WaitingChanges == 0 && !outcome.PendingClassification &&
+			(outcome.BranchCommitted == nil || !*outcome.BranchCommitted) {
+			return "recovered"
+		}
 		return strings.ReplaceAll(valueOrDash(progress.Phase), "_", "-")
 	}
 }

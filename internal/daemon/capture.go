@@ -180,10 +180,7 @@ type CaptureSummary struct {
 	Protected bool
 }
 
-// CaptureContext carries the per-pass repository identity that the legacy
-// daemon calls "ctx" (branch_ref, branch_generation, base_head). Phase 1
-// keeps this struct small and lets the run loop populate it; the
-// branch-generation token implementation lives elsewhere (§8.9).
+// CaptureContext carries the repository identity frozen at the start of a pass.
 type CaptureContext struct {
 	BranchRef        string
 	BranchGeneration int64

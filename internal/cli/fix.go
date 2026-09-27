@@ -151,6 +151,16 @@ before any mutation.`,
 }
 
 func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force, clearPause, jsonOut bool) error {
+	plan, err := executeFix(ctx, repo, dryRun, yes, force, clearPause)
+	if plan != nil {
+		if renderErr := renderFix(out, *plan, jsonOut); renderErr != nil {
+			return renderErr
+		}
+	}
+	return err
+}
+
+func executeFix(ctx context.Context, repo string, dryRun, yes, force, clearPause bool) (*fixPlan, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -164,20 +174,17 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 
 	rec, err := recoverRepoRecord(repo)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	plan, err := buildFixPlan(ctx, rec.Path, rec.StateDB, dryRun, force, clearPause)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if dryRun {
-		return renderFix(out, plan, jsonOut)
+		return &plan, nil
 	}
 	if len(plan.Unsafe) > 0 {
-		if err := renderFix(out, plan, jsonOut); err != nil {
-			return err
-		}
-		return fmt.Errorf("acd fix: refusing to mutate state while unsafe conditions remain")
+		return &plan, fmt.Errorf("acd fix: refusing to mutate state while unsafe conditions remain")
 	}
 	if len(plan.Actions) > 0 {
 		var applyErr error
@@ -191,25 +198,19 @@ func runFix(ctx context.Context, out io.Writer, repo string, dryRun, yes, force,
 		}
 		if applyErr != nil {
 			markFixIncomplete(&plan, applyErr)
-			if rerr := renderFix(out, plan, jsonOut); rerr != nil {
-				return rerr
-			}
-			return applyErr
+			return &plan, applyErr
 		}
 	} else if force {
 		conn, err := openStateDBReadOnly(ctx, rec.StateDB)
 		if err != nil {
-			return fmt.Errorf("acd fix: open state.db read-only for post-apply verification: %w", err)
+			return nil, fmt.Errorf("acd fix: open state.db read-only for post-apply verification: %w", err)
 		}
 		defer conn.Close()
 		if err := verifyFixPostApply(ctx, conn, &plan); err != nil {
-			if rerr := renderFix(out, plan, jsonOut); rerr != nil {
-				return rerr
-			}
-			return err
+			return &plan, err
 		}
 	}
-	return renderFix(out, plan, jsonOut)
+	return &plan, nil
 }
 
 func applyFixPlanWithRuntimeQuiesced(

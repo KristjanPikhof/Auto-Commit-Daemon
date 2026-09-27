@@ -1,19 +1,5 @@
-// message.go is the daemon-side adapter onto the Phase 5 ai package.
-//
-// Phase 1 owned a local rule-based generator; Phase 5 (this lane) moved
-// the canonical implementation into internal/ai/deterministic.go so the
-// replay path can swap providers without code churn here. This file is
-// now a thin wrapper that:
-//
-//  1. translates the daemon's EventContext into ai.CommitContext;
-//  2. invokes the ai.Provider's Generate;
-//  3. composes the resulting Result.Subject + Result.Body into the
-//     single-string message MessageFn returns.
-//
-// Output is **byte-identical** to the previous Phase 1 implementation:
-// single-op events produce just the subject, multi-op events produce
-// `subject + "\n\n" + bullets`. Existing replay tests pin the subject
-// shape and continue to pass unchanged.
+// This adapter turns a captured event into the selected provider's commit
+// context and joins its subject and body into a Git message.
 //
 // Diff text reconstruction
 // ------------------------
@@ -173,7 +159,7 @@ func providerMessageFnWithPromptTrace(p ai.Provider, repoRoot string, promptLogg
 // providers whose ai.ProviderNeedsDiff is false (e.g. the deterministic
 // provider), so reconstruction is implicitly gated on provider need.
 // Diff failures are swallowed: an empty DiffText still produces a
-// working commit message (the deterministic fallback is unaffected).
+// working commit message from the selected provider.
 func commitContextFromEvent(ctx context.Context, ec EventContext, repoRoot string) ai.CommitContext {
 	cc := ai.CommitContext{
 		Branch:   ec.Event.BranchRef,

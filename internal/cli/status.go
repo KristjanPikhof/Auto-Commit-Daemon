@@ -276,7 +276,7 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		report.Protected = complete && report.LatestCheckpointID != "" &&
 			report.ObservationEpoch == report.CoveredEpoch &&
 			prepared == 0 && needsAction == 0
-		report.PublicationOutcome, err = readPublicationOutcome(ctx, conn, report.Protected)
+		report.PublicationOutcome, err = readPublicationOutcome(ctx, conn, report.Protected, rec.Path)
 		if err != nil {
 			return report, err
 		}

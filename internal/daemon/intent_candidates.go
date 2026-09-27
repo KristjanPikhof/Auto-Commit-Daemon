@@ -93,6 +93,7 @@ type IntentCandidateEvaluation struct {
 	PreflightMaterialize IntentCandidateMaterializer
 	VerificationMode     string
 	Verify               IntentCandidateVerifier
+	ManagedVerification  bool
 	Now                  time.Time
 	TargetEventSeqs      []int64
 	RejectLocalFallback  bool
@@ -2171,6 +2172,10 @@ func applyIntentFallbackMessageQuality(
 	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
 		return plan, plannerFailure, false, nil
 	}
+	messageCache, cacheErr := loadPublicationMessageCache(ctx, planner, health)
+	if cacheErr != nil {
+		return ai.IntentPlanV2{}, plannerFailure, false, cacheErr
+	}
 	var permit IntentPlannerHealthPermit
 	if health != nil {
 		var err error
@@ -2182,9 +2187,15 @@ func applyIntentFallbackMessageQuality(
 	rewritten, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
 		// Every locally chosen group needs an AI-written message, even if a
 		// deterministic subject happens to pass the quality heuristic.
-		return (publicationDrainAtomicFallbackPlanner{messagePlanner: planner, requireSemanticMessage: true}).rewritePlanMessages(jobCtx, req, plan)
+		return (publicationDrainAtomicFallbackPlanner{messagePlanner: messageCache, requireSemanticMessage: true}).rewritePlanMessages(jobCtx, req, plan)
 	})
+	if cacheErr := messageCache.persist(ctx); cacheErr != nil {
+		return ai.IntentPlanV2{}, plannerFailure, false, cacheErr
+	}
 	if ai.ProviderNeedsConfiguration(err) {
+		if health != nil {
+			_ = health.Complete(ctx, permit, nil)
+		}
 		return ai.IntentPlanV2{}, plannerFailure, false, err
 	}
 	if health != nil {
@@ -2574,7 +2585,7 @@ func evaluateIntentCandidateAssignment(
 				CandidateID:         assignment.CandidateID,
 				PlanFingerprint:     input.planFingerprint,
 				RecoveryCandidateID: input.RecoveryCandidateID,
-			}, input.Verify, assignment, candidateCaptures)
+			}, input.Verify, assignment, candidateCaptures, input.ManagedVerification)
 		if errors.Is(verifyErr, verification.ErrResourceUnavailable) {
 			verificationResult = IntentCandidateVerification{}
 			verificationDeferred = true

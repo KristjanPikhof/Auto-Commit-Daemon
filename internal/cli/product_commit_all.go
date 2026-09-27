@@ -153,8 +153,9 @@ func runProductCommitAll(
 	}
 	params, _ := json.Marshal(map[string]any{
 		"kind": "checkpoint", "drain_publication": true,
-		"consume_staged": true,
-		"preview_digest": previewDigest,
+		"consume_staged":        true,
+		"preview_digest":        previewDigest,
+		"expected_index_digest": scope.IndexDigest,
 	})
 	type callResult struct {
 		result productCommitAllResult

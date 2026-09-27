@@ -190,8 +190,8 @@ presentation. The old watch loop and its two tests were removed; current
 ## Validation
 
 - Darwin/arm64 and Linux/amd64 matched at 134 unreachable CLI functions before
-  cleanup; the first removal pass reduced both to 60. A final pass follows the
-  fixture/controller migration.
+  cleanup; the first removal pass reduced both to 60 and the final pass to 19.
+  The remaining candidates are outside the retired controller scope.
 - Focused lifecycle, repository, commit-all and compatibility tests passed with
   the race detector: 23.115 seconds.
 - Current-command preview and consent tests passed with the race detector:

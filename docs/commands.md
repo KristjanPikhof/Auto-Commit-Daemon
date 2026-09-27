@@ -94,7 +94,12 @@ and `retry_at` when known. `pending_classification` identifies saved bytes
 waiting to enter the capture ledger. Null means unavailable. Existing `published` and
 `checkpoint_published_by_acd` fields are deprecated compatibility fields: their
 existing meaning still includes safely recovered work. History retains its
-old `published` boolean and adds `outcome` and `recovered_events`.
+old `published` boolean and adds `outcome`, `retained`, and `recovered_events`.
+Snapshots without capture membership report `saved`. Outcome counts for branch
+publication and waiting use the current branch generation; recovery counts
+retain historical preservation evidence. Exact current-branch tree proof permits
+a recovered-and-recaptured snapshot to report commitment without erasing its
+recovery history. If that proof is unavailable, `branch_committed` is null.
 
 Read-only status falls back to existing v20 SQLite projections when the
 supervisor is unavailable. Mutations never fall back to direct unsupervised
@@ -220,6 +225,11 @@ after checkpoint protection; ordinary background publication preserves staging.
 Interactive approval is rechecked against paths, queued work, and staging. If
 they change, review the refreshed preview; a later worker-side mismatch refuses
 application. `--yes` accepts the current scope without an interactive preview.
+Immediately before consuming staging, the worker locks the Git index and checks
+its saved approval identity. If you staged something else while it waited, ACD
+preserves that selection and asks you to review commit-all again. This check
+also survives a worker restart. Older requests without a saved staging identity
+require a new review before consuming staging.
 
 `commit-all` first completes a durable checkpoint, records the highest event
 sequence covered by the barrier, and drains only that bounded target through
@@ -355,3 +365,6 @@ be removed no earlier than the third checkpoint-first release.
 
 Manual compatibility calls warn on stderr. Recognized integration calls
 suppress terminal warnings and emit only a rate-limited diagnostic.
+
+Failed JSON recovery commands preserve the reviewed or partial plan in `data`,
+with `ok: false` and a typed error, instead of discarding the plan on failure.

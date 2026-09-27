@@ -12,6 +12,9 @@
   while retaining the deprecated publication booleans for compatibility.
 - Commit-all previews paths, queued work and staging consumption, and rechecks
   interactive approval. Bare restore offers a terminal checkpoint picker.
+- Commit-all preserves staging added while checkpoint protection is pending.
+  Schema v27 saves the approved index identity for checks under Git's index
+  lock, including after restart. Older requests require renewed staging review.
 - Production integration tests run in four required shards on both Linux and
   macOS. Measured test manifests retain every test, example, and fuzz seed.
   Obsolete command implementations and their redundant tests were removed;

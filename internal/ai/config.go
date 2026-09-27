@@ -366,10 +366,9 @@ func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 	return Compose(primary, det), closer, nil
 }
 
-// BuildStrictProvider constructs the selected provider without a deterministic
-// fallback. Unlike BuildProvider it rejects degraded configuration and an
-// unavailable subprocess immediately, so a settings test cannot report a
-// synthetic fallback as provider success. Callers own and must close closer.
+// BuildStrictProvider validates the selected connection, including subprocess
+// availability, and returns the primary provider without planning retries.
+// Callers own and must close closer.
 func BuildStrictProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 	mode := normalizeMode(cfg.Mode)
 	if mode == "" {

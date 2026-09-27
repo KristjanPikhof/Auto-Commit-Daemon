@@ -30,7 +30,7 @@ func RecoverUnavailableSemanticMessagePublicationDrain(
 	var result RecoveryChainResult
 	if drain.Phase == state.PublicationDrainCompleted ||
 		(drain.Phase == state.PublicationDrainNeedsAction &&
-			drain.LastError != PublicationDrainSemanticMessageUnavailableReason && drain.LastError != "provider_configuration_required") {
+			publicationDrainReason(drain) != publicationReasonSemanticUnavailable && publicationDrainReason(drain) != publicationReasonProviderConfiguration) {
 		return nil, result, nil
 	}
 	ready, err := publicationDrainHasAppliedAlternativeRuntime(ctx, db, drain)

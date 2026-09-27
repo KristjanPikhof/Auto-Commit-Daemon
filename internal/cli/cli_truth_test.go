@@ -332,6 +332,8 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := state.MetaSetMany(ctx, d, map[string]string{
+		"branch_token":                           "missing refs/heads/main",
+		"branch.generation":                      "7",
 		daemon.MetaKeyProtectionObservationEpoch: "7",
 		daemon.MetaKeyProtectionCoveredEpoch:     "7",
 		daemon.MetaKeyProtectionCheckpointID:     "checkpoint-7",
@@ -348,7 +350,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		!report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 0 {
 		t.Fatalf("clean truth=%+v", report)
 	}
-	listReport := statusReport{}
+	listReport := statusReport{Repo: repo}
 	if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +362,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if !control.Published || !control.CheckpointPublishedByACD {
 		t.Fatalf("recovered control truth=%+v", control)
 	}
-	if control.PublicationOutcome.BranchCommitted == nil || *control.PublicationOutcome.BranchCommitted ||
+	if (control.PublicationOutcome.BranchCommitted != nil && *control.PublicationOutcome.BranchCommitted) ||
 		control.PublicationOutcome.RecoveredChanges != 1 || control.PublicationOutcome.WaitingChanges != 0 {
 		t.Fatalf("recovery must be distinct from branch publication: %+v", control.PublicationOutcome)
 	}
@@ -371,7 +373,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if len(entries) != 1 || entries[0].Outcome != "recovered" || entries[0].Published {
 		t.Fatalf("recovery history: %+v", entries)
 	}
-	if listReport.PublicationOutcome.RecoveredChanges != 1 || listReport.PublicationOutcome.BranchCommitted == nil || *listReport.PublicationOutcome.BranchCommitted {
+	if listReport.PublicationOutcome.RecoveredChanges != 1 || (listReport.PublicationOutcome.BranchCommitted != nil && *listReport.PublicationOutcome.BranchCommitted) {
 		t.Fatalf("list recovery outcome: %+v", listReport.PublicationOutcome)
 	}
 	listRecord := rec
@@ -410,7 +412,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 			if report.CheckpointPublishedByACD || report.UnpublishedCheckpoints != 1 {
 				t.Fatalf("%s checkpoint truth=%+v", unresolvedState, report)
 			}
-			listReport := statusReport{}
+			listReport := statusReport{Repo: repo}
 			if err := readProductListProtection(ctx, d.SQL(), &listReport); err != nil {
 				t.Fatal(err)
 			}

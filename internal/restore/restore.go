@@ -36,17 +36,18 @@ type Counts struct {
 }
 
 type Plan struct {
-	CheckpointID     string `json:"checkpoint_id"`
-	PlanDigest       string `json:"plan_digest"`
-	RepoRoot         string `json:"repo_root"`
-	WorktreeID       string `json:"worktree_id"`
-	HeadToken        string `json:"head_token"`
-	BranchGeneration int64  `json:"branch_generation"`
-	Detached         bool   `json:"detached"`
-	IndexDigest      string `json:"index_digest"`
-	Counts           Counts `json:"counts"`
-	CanApply         bool   `json:"can_apply"`
-	Refusal          string `json:"refusal,omitempty"`
+	CheckpointID     string   `json:"checkpoint_id"`
+	PlanDigest       string   `json:"plan_digest"`
+	RepoRoot         string   `json:"repo_root"`
+	WorktreeID       string   `json:"worktree_id"`
+	HeadToken        string   `json:"head_token"`
+	BranchGeneration int64    `json:"branch_generation"`
+	Detached         bool     `json:"detached"`
+	IndexDigest      string   `json:"index_digest"`
+	Counts           Counts   `json:"counts"`
+	Paths            []string `json:"paths"`
+	CanApply         bool     `json:"can_apply"`
+	Refusal          string   `json:"refusal,omitempty"`
 
 	target  state.Checkpoint
 	changes []change
@@ -184,6 +185,10 @@ func PreviewWithPolicy(
 		return Plan{}, err
 	}
 	counts := countChanges(changes, staged, tracked)
+	changedPaths := make([]string, 0, len(changes))
+	for _, change := range changes {
+		changedPaths = append(changedPaths, change.Path)
+	}
 	indexDigest, err := digestIndex(ctx, repoRoot)
 	if err != nil {
 		return Plan{}, err
@@ -192,7 +197,7 @@ func PreviewWithPolicy(
 		CheckpointID: target.ID, RepoRoot: repoRoot,
 		WorktreeID: target.WorktreeID, HeadToken: headToken,
 		BranchGeneration: generation, Detached: observedRef(headToken) == "",
-		IndexDigest: indexDigest, Counts: counts, CanApply: counts.StagedOverlap == 0,
+		IndexDigest: indexDigest, Counts: counts, Paths: changedPaths, CanApply: counts.StagedOverlap == 0,
 		target: target, changes: changes, current: current, policy: policy,
 	}
 	if counts.StagedOverlap > 0 {

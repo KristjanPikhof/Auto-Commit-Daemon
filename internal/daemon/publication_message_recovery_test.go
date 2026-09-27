@@ -46,8 +46,13 @@ func TestRecoveryReconciliationEvidenceLimitIsEnforced(t *testing.T) {
 }
 
 func TestRecoverUnavailableSemanticMessageArchivesWholeSuffix(t *testing.T) {
-	for _, phase := range []string{state.PublicationDrainNeedsAction, state.PublicationDrainSemantic, state.PublicationDrainEventFallback} {
-		t.Run(phase, func(t *testing.T) {
+	for _, test := range []struct{ name, phase, provider, reason string }{
+		{"local-needs-action", state.PublicationDrainNeedsAction, "deterministic", PublicationDrainSemanticMessageUnavailableReason},
+		{"local-semantic", state.PublicationDrainSemantic, "deterministic", ""},
+		{"local-fallback", state.PublicationDrainEventFallback, "deterministic", ""},
+		{"corrected-ai-credentials", state.PublicationDrainNeedsAction, "openai-compat", "provider_configuration_required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			f := newCaptureFixture(t)
 			ctx := context.Background()
 			firstBlob, err := git.HashObjectStdin(ctx, f.dir, []byte("first\n"))
@@ -74,7 +79,7 @@ func TestRecoverUnavailableSemanticMessageArchivesWholeSuffix(t *testing.T) {
 			// A newer immutable revision remains causally newer even if the wall clock
 			// moved backward before its creation or activation.
 			alternative := insertPublicationRuntimeRevision(t, f.db, 1.25,
-				"deterministic", "", "")
+				test.provider, "https://frozen.example/v1", "frozen-model")
 			activatePublicationRuntimeRevision(t, f.db, frozen.ID, sql.NullInt64{})
 			strategy, format, _, fingerprint, err :=
 				publicationRuntimeRevisionContract(frozen)
@@ -125,9 +130,9 @@ func TestRecoverUnavailableSemanticMessageArchivesWholeSuffix(t *testing.T) {
 				t.Fatalf("prepare drain=(%t,%v)", created, err)
 			}
 			blockedUpdate := PublicationDrainUpdateFrom(drain, 2.5, 2)
-			blockedUpdate.Phase = phase
+			blockedUpdate.Phase = test.phase
 			blockedUpdate.FallbackMode = publicationFallbackLocalUnlock
-			blockedUpdate.LastError = PublicationDrainSemanticMessageUnavailableReason
+			blockedUpdate.LastError = test.reason
 			blocked, err := state.AdvancePublicationDrain(
 				ctx, f.db, drain.ID, blockedUpdate)
 			if err != nil {
