@@ -379,8 +379,7 @@ func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup) 
 	}
 	// A runtime compatibility failure is not a worker disconnect. Do not let
 	// an older local projection make an incompatible command look successful.
-	if strings.Contains(err.Error(), "acd setup") ||
-		strings.Contains(err.Error(), "compatibility contract") {
+	if !productDrainReadOnlyFallbackAllowed(err) {
 		return state.PublicationDrainReadOnlyProjection{}, false, err
 	}
 	if !fileExists(lookup.Record.StateDB) {
@@ -391,6 +390,11 @@ func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup) 
 		return state.PublicationDrainReadOnlyProjection{}, false, errors.Join(err, readErr)
 	}
 	return projection, false, nil
+}
+
+func productDrainReadOnlyFallbackAllowed(err error) bool {
+	return !strings.Contains(err.Error(), "acd setup") &&
+		!strings.Contains(err.Error(), "compatibility contract")
 }
 
 func selectReconnectPublicationDrain(
