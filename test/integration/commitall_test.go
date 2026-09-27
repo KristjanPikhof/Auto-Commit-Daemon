@@ -341,12 +341,16 @@ WHERE e.state='pending' AND c.phase='completed'`) == "13"
 		t.Fatalf("worker did not restart: before=%d after=%d", firstSession.DaemonPID, secondSession.DaemonPID)
 	}
 	t.Cleanup(func() { shutdownDaemon(t, fullEnv, repo, "wide-forced-b") })
+	t.Logf("seeded candidate restart: planner state=%s",
+		sqliteScalar(t, dbPath, "SELECT group_concat(event_seq || ':' || defer_count) FROM planner_state"))
 	done := make(chan ExecResult, 1)
 	go func() { done <- runAcd(t, ctx, fullEnv, "commit-all", "--repo", repo, "--yes") }()
 	select {
 	case <-forcedRequest:
-	case <-ctx.Done():
-		t.Fatal("forced planner request did not start")
+		t.Log("forced planner request held")
+	case <-time.After(15 * time.Second):
+		t.Fatalf("forced planner request did not start: calls=%d drains=%s", plannerCalls.Load(),
+			sqliteScalar(t, dbPath, "SELECT group_concat(id || ':' || phase || ':' || last_error) FROM publication_drains"))
 	}
 	waitFor(t, "frozen wide commit-all target", 20*time.Second, func() bool {
 		return sqliteScalar(t, dbPath,
