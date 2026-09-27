@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -653,6 +654,145 @@ SELECT EXISTS(
 	}
 	if recoverablePublication != 0 {
 		return nil, nil
+	}
+	nowTS := float64(now.UnixNano()) / 1e9
+	if nowTS < drain.UpdatedTS {
+		nowTS = drain.UpdatedTS
+	}
+	reopened, err := state.ReopenPublicationDrainCheckpointing(
+		ctx, db, drain.ID, recordedError, nowTS)
+	if err != nil {
+		return nil, err
+	}
+	return &reopened, nil
+}
+
+// RecoverForcedIntentBoundPublicationDrain retries a drain stopped by the old
+// Balanced size cap after a valid forced-aging plan had already been repaired.
+// The frozen membership, persisted candidate, and completed local repair must
+// all describe the same capture before checkpointing can be retried.
+func RecoverForcedIntentBoundPublicationDrain(
+	ctx context.Context,
+	db *state.DB,
+	branchRef string,
+	generation int64,
+	now time.Time,
+) (*state.PublicationDrain, error) {
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id,last_error FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+  AND reason_code='publication_failed'
+ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	var id, recordedError string
+	if err := rows.Scan(&id, &recordedError); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	const prefix = "intent planner v2: forced_capture_deferred: forced-aging seq "
+	const suffix = " must be ready with no missing companions"
+	seqText, ok := strings.CutPrefix(recordedError, prefix)
+	if !ok {
+		return nil, nil
+	}
+	seqText, ok = strings.CutSuffix(seqText, suffix)
+	if !ok {
+		return nil, nil
+	}
+	seq, err := strconv.ParseInt(seqText, 10, 64)
+	if err != nil || seq <= 0 {
+		return nil, nil
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, id)
+	if err != nil {
+		return nil, err
+	}
+	if !containsIntentSeq(drain.EventSeqs, seq) {
+		return nil, nil
+	}
+	counts, err := publicationDrainCountsForTarget(ctx, db, drain.EventSeqs)
+	if err != nil || counts.terminal != 0 {
+		return nil, err
+	}
+	var candidateID string
+	err = db.ReadSQL().QueryRowContext(ctx, `
+SELECT c.id FROM intent_candidates c
+JOIN intent_candidate_events e ON e.candidate_id=c.id
+WHERE e.event_seq=? AND e.membership_state='active'
+  AND c.branch_ref=? AND c.branch_generation=?
+  AND c.status='waiting' AND c.readiness='wait'
+  AND c.missing_companions='balanced fallback exceeds 12 paths'`,
+		seq, branchRef, generation).Scan(&candidateID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	candidate, exists, err := state.IntentCandidateByID(ctx, db, candidateID)
+	if err != nil || !exists {
+		return nil, err
+	}
+	within, err := intentCandidatesWithinTarget(ctx, db,
+		[]state.IntentCandidate{candidate}, drain.EventSeqs)
+	if err != nil || len(within) != 1 {
+		return nil, err
+	}
+	var activeRepair, activePublication int
+	err = db.ReadSQL().QueryRowContext(ctx, `
+SELECT
+  EXISTS(SELECT 1 FROM intent_repairs WHERE branch_ref=?
+    AND branch_generation=? AND status IN ('prepared','git_applied')),
+  EXISTS(SELECT 1 FROM self_publications WHERE branch_ref=?
+    AND branch_generation=? AND phase IN ('prepared','git_applied'))`,
+		branchRef, generation, branchRef, generation).
+		Scan(&activeRepair, &activePublication)
+	if err != nil || activeRepair != 0 || activePublication != 0 {
+		return nil, err
+	}
+	planRows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT resolved_plan_json FROM intent_plan_runs
+WHERE branch_ref=? AND branch_generation=? AND completed=1
+  AND resolution_mode='local_repair' AND updated_ts>=?
+  AND updated_ts<=?
+ORDER BY updated_ts DESC LIMIT 16`, branchRef, generation,
+		drain.LastProgressTS, drain.UpdatedTS)
+	if err != nil {
+		return nil, err
+	}
+	provedPlan := false
+	for planRows.Next() {
+		var raw sql.NullString
+		if err := planRows.Scan(&raw); err != nil {
+			planRows.Close()
+			return nil, err
+		}
+		var resolved resolvedIntentPlanRun
+		if !raw.Valid || json.Unmarshal([]byte(raw.String), &resolved) != nil {
+			continue
+		}
+		for _, assignment := range resolved.Plan.Candidates {
+			if assignment.CandidateID == candidateID &&
+				containsIntentSeq(assignment.SelectedSeqs, seq) &&
+				assignment.Readiness == ai.IntentCandidateReady &&
+				len(assignment.MissingCompanions) == 0 &&
+				strings.TrimSpace(assignment.Subject) != "" {
+				provedPlan = true
+			}
+		}
+	}
+	err = planRows.Err()
+	planRows.Close()
+	if err != nil || !provedPlan {
+		return nil, err
 	}
 	nowTS := float64(now.UnixNano()) / 1e9
 	if nowTS < drain.UpdatedTS {
