@@ -40,7 +40,7 @@ not depend on them.
 
 ## Commit purpose
 
-Intent planning follows the purposeful commit approach wehere each commit
+Intent planning follows the purposeful commit approach where each commit
 should explain one useful step and leave a working state under the configured
 checks. A preparatory refactor can precede the feature it enables when the
 captured changes support two complete steps. Tests, imports, generated files,
@@ -98,8 +98,7 @@ Balanced fallback size limits apply to the local evidence partition. They do
 not turn a repaired semantic plan back into a waiting group merely because
 its existing membership spans more paths.
 
-An older run stopped by that mistaken size limit can retry automatically once
-without progress.
+An older run stopped by that mistaken size limit gets one automatic retry.
 ACD requires the recorded forced-aging failure, the matching size-limit hold,
 and a completed ready repair plan for the affected capture. Pending candidate
 members must remain inside the frozen target, with no conflicting publication
