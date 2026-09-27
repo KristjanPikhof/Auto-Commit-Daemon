@@ -616,7 +616,10 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "The current commit-all run stopped at a safety check. Your work remains protected."
-		res.NextAction = "Run `acd doctor` to see what blocked publication."
+		if status.PublicationDrain.LastError != "" {
+			res.Summary += " Cause: " + status.PublicationDrain.LastError
+		}
+		res.NextAction = "Run `acd support diagnose` to inspect the blocked drain and its recovery options."
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
