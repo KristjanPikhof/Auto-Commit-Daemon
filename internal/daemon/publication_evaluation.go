@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"sync"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // publicationEvaluation keeps the canonical worker as the sole state writer.
@@ -192,6 +194,12 @@ func generatePublicationMessage(ctx context.Context, fn MessageFn, event EventCo
 	message, err := evaluatePublication(ctx, func(jobCtx context.Context) (string, error) { return fn(jobCtx, event) })
 	if err == nil && message == "" {
 		err = errors.New("selected provider returned an empty message")
+	}
+	if ai.ProviderNeedsConfiguration(err) {
+		if health != nil {
+			_ = health.Complete(ctx, permit, nil)
+		}
+		return "", err
 	}
 	if health != nil {
 		var failure error

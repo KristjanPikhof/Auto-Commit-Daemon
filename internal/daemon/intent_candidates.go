@@ -1373,6 +1373,9 @@ func chooseIntentCandidatePlan(
 			if ctx.Err() != nil {
 				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, ctx.Err()
 			}
+			if ai.ProviderNeedsConfiguration(err) {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+			}
 			if failure := classifyIntentPlannerHealthFailure(err, err != nil); err != nil {
 				var transport *IntentPlannerTransportFailure
 				if errors.As(failure, &transport) {
@@ -2181,6 +2184,9 @@ func applyIntentFallbackMessageQuality(
 		// deterministic subject happens to pass the quality heuristic.
 		return (publicationDrainAtomicFallbackPlanner{messagePlanner: planner, requireSemanticMessage: true}).rewritePlanMessages(jobCtx, req, plan)
 	})
+	if ai.ProviderNeedsConfiguration(err) {
+		return ai.IntentPlanV2{}, plannerFailure, false, err
+	}
 	if health != nil {
 		var failure error
 		if err != nil {

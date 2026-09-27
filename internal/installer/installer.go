@@ -323,7 +323,14 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			AllowUnadvertised:            true,
 			AllowSameDistanceReplacement: true,
 		})
-		return Result{OperationID: plan.OperationID, PlanDigest: plan.Digest, Changed: changed}, err
+		result := Result{OperationID: plan.OperationID, PlanDigest: plan.Digest, Changed: changed}
+		if err != nil {
+			return result, err
+		}
+		if err := verifySetupReadiness(ctx, roots, plan.Registry, options, "workers"); err != nil {
+			return result, fmt.Errorf("setup: runtime is installed, but version and checkpoint readiness could not be confirmed: %w", err)
+		}
+		return result, nil
 	}
 	lifecycleLock, err := globalops.AcquireUserLock(ctx, roots.OperationsDBPath())
 	if err != nil {
@@ -600,21 +607,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if err := journal.Advance(ctx, plan.OperationID, "self_tested", "", false); err != nil {
 		return Result{}, rollback(err)
 	}
-	ready := options.Ready
-	readyPhase := "workers"
-	if ready == nil {
-		ready = func(ctx context.Context, roots paths.Roots, registry *central.Registry) error {
-			return waitSetupWorkersWithProgress(ctx, roots, registry, func(ready, total int) {
-				emitProgress(options, readyPhase, fmt.Sprintf(
-					"Repository workers ready: %d of %d", ready, total))
-			}, func(completed, total int, path string) {
-				emitProgress(options, readyPhase, fmt.Sprintf(
-					"Confirming checkpoint coverage %d of %d: %s", completed, total, path))
-			})
-		}
-	}
-	emitProgress(options, "workers", "Waiting for repository workers to report complete protection")
-	if err := ready(ctx, roots, plan.Registry); err != nil {
+	if err := verifySetupReadiness(ctx, roots, plan.Registry, options, "workers"); err != nil {
 		return Result{}, rollback(err)
 	}
 	emitProgress(options, "integrations", "Updating coding-tool integrations without changing unrelated settings")
@@ -661,9 +654,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	}
 	// A barrier after the bridge's final observation proves every edit that
 	// could have arrived during cutover is represented by held v20 workers.
-	readyPhase = "final_workers"
-	emitProgress(options, readyPhase, "Running final checkpoint coverage verification")
-	if err := ready(ctx, roots, plan.Registry); err != nil {
+	if err := verifySetupReadiness(ctx, roots, plan.Registry, options, "final_workers"); err != nil {
 		return Result{}, rollback(err)
 	}
 	if err := journal.Advance(ctx, plan.OperationID, "workers_ready", "", false); err != nil {
@@ -1342,6 +1333,20 @@ func waitSupervisorReady(ctx context.Context, roots paths.Roots, repositoryID st
 			}
 		}
 	}
+}
+
+// Both full setup and compatible/no-op setup must prove the same readiness
+// before claiming that enabled worktrees are protected by the current runtime.
+func verifySetupReadiness(ctx context.Context, roots paths.Roots, registry *central.Registry, options ApplyOptions, phase string) error {
+	emitProgress(options, phase, "Verifying running versions and repository checkpoint protection")
+	if options.Ready != nil {
+		return options.Ready(ctx, roots, registry)
+	}
+	return waitSetupWorkersWithProgress(ctx, roots, registry, func(ready, total int) {
+		emitProgress(options, phase, fmt.Sprintf("Repository workers ready: %d of %d", ready, total))
+	}, func(completed, total int, path string) {
+		emitProgress(options, phase, fmt.Sprintf("Confirming checkpoint coverage %d of %d: %s", completed, total, path))
+	})
 }
 
 func waitSetupWorkers(ctx context.Context, roots paths.Roots, registry *central.Registry) error {

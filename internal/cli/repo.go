@@ -236,19 +236,26 @@ interactive repository manager.`,
 	return cmd
 }
 
-func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
+func collectRepoList(ctx context.Context) ([]repoListEntry, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd repo list: resolve paths: %w", err)
+		return nil, fmt.Errorf("acd repo list: resolve paths: %w", err)
 	}
 	reg, err := central.Load(roots)
 	if err != nil {
-		return fmt.Errorf("acd repo list: load registry: %w", err)
+		return nil, fmt.Errorf("acd repo list: load registry: %w", err)
 	}
-	entries := collectRepoManagementEntries(ctx, reg.Repos)
+	return collectRepoManagementEntries(ctx, reg.Repos), nil
+}
+
+func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
+	entries, err := collectRepoList(ctx)
+	if err != nil {
+		return err
+	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")

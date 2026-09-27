@@ -12,13 +12,13 @@ import (
 // membership. Recovery preserves work but does not put it on the branch.
 // BranchCommitted is unknown when checkpoint state is unavailable.
 type publicationOutcome struct {
-	PendingClassification bool `json:"pending_classification"`
-	BranchCommitted  *bool   `json:"branch_committed"`
-	BranchChanges    int     `json:"branch_changes"`
-	RecoveredChanges int     `json:"recovered_changes"`
-	WaitingChanges   int     `json:"waiting_changes"`
-	ReasonCode       string  `json:"reason_code,omitempty"`
-	RetryAt          float64 `json:"retry_at,omitempty"`
+	PendingClassification bool    `json:"pending_classification"`
+	BranchCommitted       *bool   `json:"branch_committed"`
+	BranchChanges         int     `json:"branch_changes"`
+	RecoveredChanges      int     `json:"recovered_changes"`
+	WaitingChanges        int     `json:"waiting_changes"`
+	ReasonCode            string  `json:"reason_code,omitempty"`
+	RetryAt               float64 `json:"retry_at,omitempty"`
 }
 
 func readPublicationOutcome(ctx context.Context, db *sql.DB, protected bool) (publicationOutcome, error) {
@@ -35,7 +35,9 @@ WHERE EXISTS (SELECT 1 FROM checkpoint_events ce JOIN checkpoints cp ON cp.id=ce
 		return result, fmt.Errorf("publication outcome: %w", err)
 	}
 	pending, _, err := metaLookup(ctx, db, daemon.MetaKeyProtectionClassificationPending)
-	if err != nil { return result, err }
+	if err != nil {
+		return result, err
+	}
 	result.PendingClassification = pending == "true"
 	committed := protected && !result.PendingClassification && result.WaitingChanges == 0 && result.RecoveredChanges == 0
 	result.BranchCommitted = &committed
@@ -46,7 +48,9 @@ func checkpointOutcome(phase string, events, published, recovered int) string {
 	if phase != "completed" {
 		return phase
 	}
-	if events == 0 { return "saved" }
+	if events == 0 {
+		return "saved"
+	}
 	if published == events {
 		return "published"
 	}

@@ -313,5 +313,24 @@ make lint
 make test
 ~~~
 
+The local gate and each hosted workflow have a five-minute execution target.
+CI runs package race tests, repeated stability cases, and the tagged production
+integration suite in four measured shards on both Linux and macOS. The release-style
+integration child binary is not race-instrumented; package tests cover internal
+concurrency.
+
+For one production shard or real checkpoint measurements:
+
+~~~bash
+scripts/dev/test.sh integration 4 0
+scripts/dev/benchmark.sh
+~~~
+
+Set `ACD_TEST_RESULTS_DIR` to an output directory outside the checkout to retain
+JSON timings and complete shard manifests. Update measured weights with
+`python3 scripts/dev/test-manifest.py timings <jsonl-files...>` and review the
+result before replacing `scripts/dev/test-timings.json`. Tooling tests use
+`python3 -B -m unittest discover -s scripts/dev -p '*_test.py'`.
+
 Repository contribution and verification requirements are in
 [`CLAUDE.md`](CLAUDE.md). ACD is MIT licensed.

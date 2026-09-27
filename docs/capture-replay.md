@@ -34,7 +34,8 @@ limit.
 ## Durable checkpoint completion
 
 1. Scan and hash the complete eligible scope.
-2. Append low-level capture records and build a tree through a scratch index.
+2. Build a tree through a scratch index. Normal capture also appends low-level
+   capture records; protection-only scans defer classification.
 3. Write Git objects with supported fsync settings and reread them exactly.
 4. Insert the operation, checkpoint, membership, exclusions, object IDs, and
    expected private ref as `prepared` in one full-synchronous SQLite
@@ -47,6 +48,14 @@ limit.
 On recovery, absent prepared refs are retryable, exact expected refs complete
 forward, and a different target becomes durable `needs_action`. Recovery never
 guesses or deletes an ambiguous ref.
+
+During a slow provider or verifier call, the worker continues making durable
+protection-only checkpoints. Their bytes are protected immediately; capture
+classification waits until the active evaluation finishes. The durable
+`protection.classification_pending` marker prevents status from claiming those
+bytes are already committed. It clears only after a complete capture has
+classified the observed work, including work held by the event-queue cap.
+History labels snapshots without capture membership `saved`.
 
 ## Unsafe Git states
 

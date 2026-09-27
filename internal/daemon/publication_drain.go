@@ -1563,6 +1563,11 @@ func UpdatePublicationDrainAfterReplay(
 			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 		}
 		update.LastError = replayErr.Error()
+		if ai.ProviderNeedsConfiguration(replayErr) {
+			update.Phase = state.PublicationDrainNeedsAction
+			update.LastError = "provider_configuration_required"
+			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+		}
 		var exhausted *IntentSemanticFallbackRequiredError
 		var preflight *IntentPlanPreflightError
 		exhaustedSemanticFallback := errors.As(replayErr, &exhausted)

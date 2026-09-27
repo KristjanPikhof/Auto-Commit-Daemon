@@ -371,6 +371,9 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 	if len(entries) != 1 || entries[0].Outcome != "recovered" || entries[0].Published {
 		t.Fatalf("recovery history: %+v", entries)
 	}
+	if listReport.PublicationOutcome.RecoveredChanges != 1 || listReport.PublicationOutcome.BranchCommitted == nil || *listReport.PublicationOutcome.BranchCommitted {
+		t.Fatalf("list recovery outcome: %+v", listReport.PublicationOutcome)
+	}
 	listRecord := rec
 	listRecord.RepositoryID = "repository-id"
 	listRecord.WorktreeID = "0123456789abcdef"

@@ -27,16 +27,17 @@ acd setup
 ~~~
 
 Setup configures the shared runtime, integrations, grouping, commit format,
-repair limit, and provider. Choose Everyday work for Intent commits. The local
-provider works offline. Choose an OpenAI-compatible provider when you want AI
-grouping and semantic commit messages.
+repair limit, and provider. AI semantic commits with Everyday checks are
+recommended. Local automatic commits are an explicit offline alternative with
+more limited grouping and messages.
 
 An OpenAI-compatible setup asks for its endpoint, model, and bearer token. It
 sends one fixed synthetic request after you approve the plan, without sending
 repository content during that test.
 
-`acd setup` finishes with `ACD installation is ready`. It does not protect the
-current directory.
+`acd setup` verifies the running installation before reporting readiness.
+In a terminal it then offers to protect the current repository, with separate
+consent. It confirms protection only after a completed checkpoint.
 
 ## Enable a repository
 
@@ -138,12 +139,15 @@ without discarding protected work.
 ## Restore a checkpoint
 
 ~~~bash
-acd history
+acd restore                 # terminal picker
+acd history                 # IDs for scripting
 acd restore cp-...
 acd restore cp-... --yes
 ~~~
 
-Preview first. Resolve staged overlap before applying. Restore leaves `HEAD`
+The terminal picker shows retained completed checkpoints, then the selected
+file preview and a separate apply confirmation. Outside a terminal, an ID is
+required. Preview first. Resolve staged overlap before applying. Restore leaves `HEAD`
 and the index unchanged and prints an undo command using the pre-restore
 checkpoint.
 

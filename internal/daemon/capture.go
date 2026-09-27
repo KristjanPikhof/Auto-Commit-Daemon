@@ -815,11 +815,15 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		}
 		if len(ownedOps) == len(ops) {
 			_, digest := checkpointEntries(live)
+			covered, _, err := state.MetaGet(ctx, db, MetaKeyProtectionCoveredEpoch)
+			if err != nil {
+				return summary, err
+			}
 			if err := state.MetaSetMany(ctx, db, map[string]string{
 				metaProtectionClassifiedDigest:            digest,
 				MetaKeyProtectionClassificationPending:    "false",
 				MetaKeyProtectionClassificationCheckpoint: summary.CheckpointID,
-				MetaKeyProtectionClassificationEpoch:      strconv.FormatInt(opts.ObservationEpoch, 10),
+				MetaKeyProtectionClassificationEpoch:      covered,
 			}); err != nil {
 				return summary, err
 			}

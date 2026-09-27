@@ -14,11 +14,7 @@ import (
 // returned alongside ErrStdoutOverflow so callers can surface a truncated
 // payload or fall back to metadata-only flows.
 //
-// Either OID may be the empty tree's all-zero SHA to represent
-// creation/deletion, but most callers will use git's special "/dev/null"
-// path semantics by passing the empty string for the missing side; this
-// helper sticks to two real OIDs for now and the higher-level diff helpers
-// are introduced when the replay path lands (phase 5).
+// Both inputs must be existing blob object IDs.
 func DiffBlobs(ctx context.Context, repoDir, oidA, oidB string) (string, error) {
 	return DiffBlobsLimited(ctx, repoDir, oidA, oidB, DefaultDiffCap)
 }
