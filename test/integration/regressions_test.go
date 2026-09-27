@@ -6,6 +6,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +18,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 )
 
 // TestRegressions exercises the §14.2 list one subtest at a time. Every
@@ -759,7 +762,21 @@ func regOfflineResetRestartNoPhantomEvents(t *testing.T) {
 	if off.ExitCode != 0 {
 		t.Fatalf("acd off exit=%d\nstdout=%s\nstderr=%s", off.ExitCode, off.Stdout, off.Stderr)
 	}
-	waitMode(t, repo, "stopped", 10*time.Second)
+	// A stopped process can leave stale liveness metadata. Hold canonical
+	// ownership so the reset is proven offline until we explicitly restart.
+	var offlineLock *daemon.DaemonLock
+	waitFor(t, "worker ownership released after off", 10*time.Second, func() bool {
+		lock, err := daemon.AcquireDaemonLock(filepath.Join(repo, ".git"))
+		if errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		offlineLock = lock
+		return true
+	})
+	t.Cleanup(func() { _ = offlineLock.Release() })
 
 	preEvents := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events")
 	runGitOK(t, repo, "reset", "--hard", seedHead)
@@ -770,6 +787,9 @@ func regOfflineResetRestartNoPhantomEvents(t *testing.T) {
 		t.Fatalf("reset did not move HEAD away from %s", headBeforeReset)
 	}
 
+	if err := offlineLock.Release(); err != nil {
+		t.Fatal(err)
+	}
 	on := runAcd(t, ctx, env, "on", "--repo", repo, "--json")
 	if on.ExitCode != 0 {
 		t.Fatalf("acd on exit=%d\nstdout=%s\nstderr=%s", on.ExitCode, on.Stdout, on.Stderr)

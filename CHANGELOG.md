@@ -29,6 +29,14 @@
 
 ### Fixed
 
+- Repository discovery resolves worktree and Git paths in one Git call, reducing
+  startup work for hooks and commands.
+- Cancelled recovery transactions let Git release its ref locks before stopping,
+  so a later recovery attempt can proceed.
+- Checkpoint waits keep their timeout reason and rejected-checkpoint details
+  when the deadline interrupts a Git or database lookup.
+- Slow external-history checks now record their timeout even when Git reports
+  a killed process, so the affected capture does not remain pending indefinitely.
 - Internal setup and readiness checkpoints no longer make idle repositories
   appear recently active in `acd list`. Slow optional Git checks retain known
   activity and unfinished work instead of dropping those rows.

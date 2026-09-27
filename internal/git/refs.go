@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -454,6 +455,9 @@ func withLockedExpectedRefTimeout(
 	cmd := exec.Command("git", "update-ref", "--no-deref", "--stdin")
 	cmd.Dir = repoDir
 	cmd.Env = scrubEnv(nil)
+	// Include transaction hooks in cancellation so inherited pipes cannot keep
+	// preparation or cleanup blocked after Git exits.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("git: open recovery ref transaction stdin: %w", err)
@@ -470,16 +474,35 @@ func withLockedExpectedRefTimeout(
 		return fmt.Errorf("git: start recovery ref transaction: %w", err)
 	}
 	reader := bufio.NewReader(stdout)
+	signalTransaction := func(signal syscall.Signal) {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			_ = syscall.Kill(-cmd.Process.Pid, signal)
+		}
+	}
+	var terminationOnce sync.Once
+	var killTimer *time.Timer
+	killDone := make(chan struct{})
+	terminate := func() {
+		terminationOnce.Do(func() {
+			// Git removes its prepared ref locks on EOF or SIGTERM. SIGKILL
+			// skips that cleanup and can prevent every later recovery attempt.
+			_ = stdin.Close()
+			signalTransaction(syscall.SIGTERM)
+			killTimer = time.AfterFunc(time.Second, func() {
+				signalTransaction(syscall.SIGKILL)
+				close(killDone)
+			})
+		})
+	}
 	finished := false
 	defer func() {
-		if finished {
-			return
+		if !finished {
+			terminate()
+			_ = cmd.Wait()
 		}
-		_ = stdin.Close()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+		if killTimer != nil && !killTimer.Stop() {
+			<-killDone
 		}
-		_ = cmd.Wait()
 	}()
 
 	write := func(line string) error {
@@ -509,9 +532,7 @@ func withLockedExpectedRefTimeout(
 	defer prepareCancel()
 	prepareWatchdogDone := make(chan struct{})
 	stopPrepareWatchdog := context.AfterFunc(prepareCtx, func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		terminate()
 		close(prepareWatchdogDone)
 	})
 	prepareWatchdogStopped := false
@@ -568,9 +589,7 @@ func withLockedExpectedRefTimeout(
 
 	cleanupWatchdogDone := make(chan struct{})
 	cleanupTimer := time.AfterFunc(transactionTimeout, func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		terminate()
 		close(cleanupWatchdogDone)
 	})
 	defer func() {

@@ -4817,7 +4817,15 @@ func resolveTreeOID(ctx context.Context, repoRoot, commit string) (string, error
 	return tree, nil
 }
 
-func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, ops []state.CaptureOp) (bool, string, error) {
+func supersededByExternalHistory(ctx context.Context, repoRoot, parent string, ev state.CaptureEvent, ops []state.CaptureOp) (superseded bool, reason string, err error) {
+	defer func() {
+		// CommandContext may report a killed Git process instead of the
+		// deadline that killed it. Preserve both before the caller cancels
+		// the event context, so replay can settle its timeout in the loop.
+		if err != nil && ctx.Err() != nil {
+			err = errors.Join(err, ctx.Err())
+		}
+	}()
 	if parent == "" || ev.BaseHead == "" || parent == ev.BaseHead || len(ops) == 0 {
 		return false, "", nil
 	}

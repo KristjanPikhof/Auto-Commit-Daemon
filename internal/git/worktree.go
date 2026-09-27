@@ -48,17 +48,32 @@ func ResolveWorktree(ctx context.Context, repoPath string) (Worktree, error) {
 		return Worktree{}, fmt.Errorf("git: %s is not a directory", abs)
 	}
 
-	root, err := ShowToplevel(ctx, abs)
-	if err != nil {
-		return Worktree{}, fmt.Errorf("%w: %s: %v", ErrNotWorktree, abs, err)
-	}
-	gitDir, err := AbsoluteGitDir(ctx, abs)
-	if err != nil {
-		return Worktree{}, fmt.Errorf("git: resolve absolute git dir for %s: %w", abs, err)
-	}
-	commonDir, err := GitCommonDir(ctx, abs)
-	if err != nil {
-		return Worktree{}, fmt.Errorf("git: resolve common dir for %s: %w", abs, err)
+	out, queryErr := Run(ctx, RunOpts{Dir: abs, Timeout: DefaultReadTimeout},
+		"rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir")
+	paths := bytes.Split(bytes.TrimSuffix(out, []byte("\n")), []byte("\n"))
+	var root, gitDir, commonDir string
+	if queryErr == nil && len(paths) == 3 && len(paths[0]) > 0 && len(paths[1]) > 0 && len(paths[2]) > 0 {
+		root = string(bytes.TrimSpace(paths[0]))
+		gitDir = string(bytes.TrimSpace(paths[1]))
+		commonDir = filepath.Clean(string(bytes.TrimSpace(paths[2])))
+		if !filepath.IsAbs(commonDir) {
+			commonDir = filepath.Join(abs, commonDir)
+		}
+	} else {
+		// rev-parse does not delimit path output safely when paths contain
+		// newlines. Separate reads also retain the existing error boundaries.
+		root, err = ShowToplevel(ctx, abs)
+		if err != nil {
+			return Worktree{}, fmt.Errorf("%w: %s: %v", ErrNotWorktree, abs, err)
+		}
+		gitDir, err = AbsoluteGitDir(ctx, abs)
+		if err != nil {
+			return Worktree{}, fmt.Errorf("git: resolve absolute git dir for %s: %w", abs, err)
+		}
+		commonDir, err = GitCommonDir(ctx, abs)
+		if err != nil {
+			return Worktree{}, fmt.Errorf("git: resolve common dir for %s: %w", abs, err)
+		}
 	}
 	root = filepath.Clean(root)
 	if realRoot, err := filepath.EvalSymlinks(root); err == nil {

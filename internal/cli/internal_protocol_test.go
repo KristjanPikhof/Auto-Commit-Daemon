@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -491,6 +492,24 @@ WHERE id='cp-stale-feature'`); err != nil {
 }
 
 func TestCheckpointBarrierTimeoutReportsRejectedCheckpoint(t *testing.T) {
+	handler := rejectedCheckpointBarrierFixture(t, nil)
+	params, err := json.Marshal(map[string]bool{"drain_publication": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
+		Method: "publication_drain_start", WorktreeID: "worktree", Params: params,
+	})
+	if protocolErr == nil || protocolErr.Code != "checkpoint_timeout" ||
+		!strings.Contains(protocolErr.Message, `rejected_checkpoint="cp-stale-feature"`) {
+		t.Fatalf("checkpoint timeout=%+v", protocolErr)
+	}
+}
+
+func rejectedCheckpointBarrierFixture(t *testing.T, rejected func()) repositoryWorkerHandler {
+	t.Helper()
 	repo := materializeTestRepo(t, true)
 	worktree, err := gitpkg.ResolveWorktree(context.Background(), repo)
 	if err != nil {
@@ -500,7 +519,7 @@ func TestCheckpointBarrierTimeoutReportsRejectedCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
 	worktreeID := checkpointpkg.WorktreeID(repo)
 	insertCompletedCheckpoint(t, db, "cp-stale-feature", worktreeID, nil)
 	if _, err := db.SQL().ExecContext(context.Background(), `
@@ -513,6 +532,7 @@ WHERE id='cp-stale-feature'`); err != nil {
 		t.Fatal(err)
 	}
 
+	wakes := 0
 	handler := repositoryWorkerHandler{
 		runtimes: map[string]*workerRuntime{"worktree": {
 			worktree: worktree, db: db, gate: &sync.RWMutex{},
@@ -532,20 +552,66 @@ WHERE id='cp-stale-feature'`); err != nil {
 			); err != nil {
 				t.Fatal(err)
 			}
+			wakes++
+			if wakes > 1 && rejected != nil {
+				rejected()
+			}
 		},
 	}
-	params, err := json.Marshal(map[string]bool{"drain_publication": true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	_, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
-		Method: "publication_drain_start", WorktreeID: "worktree", Params: params,
-	})
-	if protocolErr == nil || protocolErr.Code != "checkpoint_timeout" ||
-		!strings.Contains(protocolErr.Message, `rejected_checkpoint="cp-stale-feature"`) {
-		t.Fatalf("checkpoint timeout=%+v", protocolErr)
+	return handler
+}
+
+func TestCheckpointBarrierGitFailurePreservesTimeoutEvidence(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%t", deadline), func(t *testing.T) {
+			gate := filepath.Join(t.TempDir(), "rejected")
+			handler := rejectedCheckpointBarrierFixture(t, func() {
+				if err := os.WriteFile(gate, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			})
+			realGit, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatal(err)
+			}
+			binDir := t.TempDir()
+			quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
+			body := fmt.Sprintf(`#!/bin/sh
+branch_gate=%s
+real_git=%s
+if [ "$1" = symbolic-ref ] && [ -e "$branch_gate" ]; then
+  echo entered > "$branch_gate.observed"
+  if [ %t = true ]; then
+    exec sleep 10
+  fi
+  echo branch-probe-failed >&2
+  exit 42
+fi
+exec "$real_git" "$@"
+`, quote(gate), quote(realGit), deadline)
+			if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
+				Method: "publication_drain_start", WorktreeID: "worktree",
+			})
+			if _, err := os.Stat(gate + ".observed"); err != nil {
+				t.Fatalf("Git failure probe did not run after rejected checkpoint: %v; result=%+v", err, protocolErr)
+			}
+			if deadline {
+				if protocolErr == nil || protocolErr.Code != "checkpoint_timeout" || !protocolErr.Retryable ||
+					!strings.Contains(protocolErr.Message, `rejected_checkpoint="cp-stale-feature"`) ||
+					!strings.Contains(protocolErr.Message, "git symbolic-ref") {
+					t.Fatalf("deadline lost checkpoint/Git evidence: %+v", protocolErr)
+				}
+			} else if protocolErr == nil || protocolErr.Code != "publication_status_failed" ||
+				!strings.Contains(protocolErr.Message, "branch-probe-failed") {
+				t.Fatalf("live-context Git failure hidden: %+v", protocolErr)
+			}
+		})
 	}
 }
 
