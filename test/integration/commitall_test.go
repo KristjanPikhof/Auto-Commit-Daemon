@@ -324,7 +324,8 @@ WHERE e.state='pending' AND c.phase='completed'`) == "13"
 	}
 	on := runAcd(t, ctx, fullEnv, "on", "--repo", repo, "--json")
 	if on.ExitCode != 0 {
-		t.Fatalf("on exit=%d: %s", on.ExitCode, on.Stderr)
+		status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
+		t.Fatalf("on exit=%d: %s\nstatus=%s", on.ExitCode, on.Stderr, status.Stdout)
 	}
 	secondSession := startSession(t, ctx, env, repo, "wide-forced-b", "shell", extra...)
 	if firstSession.DaemonPID <= 0 || secondSession.DaemonPID <= 0 || firstSession.DaemonPID == secondSession.DaemonPID {
