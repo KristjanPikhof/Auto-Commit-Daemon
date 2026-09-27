@@ -3070,7 +3070,35 @@ func Run(ctx context.Context, opts Options) error {
 					runWithProgressHeartbeat(passCtx, progressHeartbeatInterval(opts), func() {
 						heartbeatNow("running", "")
 					}, func() {
-						repSum, repErr = replay(passCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+						evaluationCtx, cancelEvaluation := context.WithCancel(passCtx)
+						defer cancelEvaluation()
+						evaluation := &publicationEvaluation{
+							gate: opts.OperationGate, cancel: cancelEvaluation,
+							wake: wakeCh, files: fsWakeReader, shutdown: shutdownCh,
+							identity: func(checkCtx context.Context) (string, error) {
+								if opts.PublicationHeld != nil && opts.PublicationHeld() {
+									return "", errPublicationEvaluationStale
+								}
+								return publicationEvaluationIdentity(checkCtx, opts.RepoPath, opts.GitDir, opts.DB, cctx)
+							},
+							protect: func(protectCtx context.Context) error {
+								epoch, err := BeginProtectionObservation(protectCtx, opts.DB)
+								if err != nil {
+									return err
+								}
+								ignoreChecker.Invalidate()
+								_, err = ProtectWorktree(protectCtx, opts.RepoPath, opts.DB, cctx, CaptureOpts{
+									IgnoreChecker: ignoreChecker, SensitiveMatcher: matcher,
+									SafeIgnoreMatcher: safeIgnore, Trace: tracer, GitDir: opts.GitDir,
+									CheckpointStore: &checkpointStore, WorktreeID: checkpointpkg.WorktreeID(opts.RepoPath),
+									CheckpointReason: state.CheckpointReasonPoll,
+									MaxFileBytes:     opts.MaxFileBytes, ObservationEpoch: epoch,
+								})
+								return err
+							},
+						}
+						evaluationCtx = context.WithValue(evaluationCtx, publicationEvaluationKey{}, evaluation)
+						repSum, repErr = replay(evaluationCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
 							MessageFn:                  passBundle.MessageFn,
 							GitDir:                     opts.GitDir,
 							Trace:                      tracer,
@@ -3103,6 +3131,11 @@ func Run(ctx context.Context, opts Options) error {
 							RequireCompletedCheckpoint: true,
 							PublicationDrain:           activeDrain,
 						})
+						if evaluationCtx.Err() != nil && passCtx.Err() == nil {
+							repSum.Disposition = ReplayDispositionTransientWait
+							repSum.DispositionReason = "publication_evaluation_invalidated"
+							repErr = nil
+						}
 					})
 					if activeDrain != nil {
 						updatedDrain, updateErr := UpdatePublicationDrainAfterReplay(

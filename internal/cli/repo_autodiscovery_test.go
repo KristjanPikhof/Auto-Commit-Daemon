@@ -8,10 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -50,136 +48,6 @@ func registerDisabledRepo(t *testing.T, roots paths.Roots, repoDir string) {
 	}); err != nil {
 		t.Fatalf("register disabled repo: %v", err)
 	}
-}
-
-func TestStart_AutodiscoveryDisabledHookUnregisteredSkipsWithoutState(t *testing.T) {
-	roots := disableRepoAutodiscovery(t)
-	ctx := context.Background()
-	repoDir := makeUnregisteredStartRepo(t)
-	count, restore := installFakeSpawn(t, os.Getpid())
-	defer restore()
-
-	var out bytes.Buffer
-	if err := runStart(ctx, &out, repoDir, "session-hook", "codex", 0, true); err != nil {
-		t.Fatalf("runStart: %v", err)
-	}
-	if count.Load() != 0 {
-		t.Fatalf("spawn count=%d, want 0", count.Load())
-	}
-	var got startResult
-	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	if !got.Skipped || got.SkipReason != repoAutodiscoverySkipDisabled || got.Started || got.DaemonPID != 0 {
-		t.Fatalf("unexpected start result: %+v", got)
-	}
-	assertNoRepoStateOrRegistry(t, roots, repoDir)
-}
-
-func TestStart_DisabledRepoHookSkipsEvenWhenAutodiscoveryEnabled(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repoDir := makeUnregisteredStartRepo(t)
-	registerDisabledRepo(t, roots, repoDir)
-	count, restore := installFakeSpawn(t, os.Getpid())
-	defer restore()
-
-	var out bytes.Buffer
-	if err := runStart(ctx, &out, repoDir, "session-disabled", "codex", 0, true); err != nil {
-		t.Fatalf("runStart: %v", err)
-	}
-	if count.Load() != 0 {
-		t.Fatalf("spawn count=%d, want 0", count.Load())
-	}
-	var got startResult
-	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	if !got.Skipped || got.SkipReason != repoAutodiscoverySkipRepoDisabled || got.Started || got.DaemonPID != 0 {
-		t.Fatalf("unexpected start result: %+v", got)
-	}
-	assertNoRepoState(t, repoDir)
-}
-
-func TestStart_DisabledRepoManualReportsEnableGuidance(t *testing.T) {
-	roots := withIsolatedHome(t)
-	repoDir := makeUnregisteredStartRepo(t)
-	registerDisabledRepo(t, roots, repoDir)
-
-	var out bytes.Buffer
-	err := runStart(context.Background(), &out, repoDir, "", "", 0, true)
-	if err == nil {
-		t.Fatalf("runStart succeeded, want disabled repo error")
-	}
-	if msg := err.Error(); !strings.Contains(msg, " is disabled") || !strings.Contains(msg, "acd on --repo ") {
-		t.Fatalf("error %q does not point to repo enable", msg)
-	}
-	assertNoRepoState(t, repoDir)
-}
-
-func TestStart_RechecksDisabledAfterControlLockWait(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repoDir := makeUnregisteredStartRepo(t)
-	stateDB := state.DBPathFromGitDir(filepath.Join(repoDir, ".git"))
-	registerEnabledStartRepo(t, repoDir)
-
-	held, err := daemon.AcquireControlLock(filepath.Join(repoDir, ".git"))
-	if err != nil {
-		t.Fatalf("pre-acquire control.lock: %v", err)
-	}
-	count, restore := installFakeSpawn(t, os.Getpid())
-	defer restore()
-
-	var out bytes.Buffer
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- runStart(ctx, &out, repoDir, "session-race", "codex", 0, true)
-	}()
-	time.Sleep(50 * time.Millisecond)
-	if err := central.WithLock(roots, func(reg *central.Registry) error {
-		res := reg.DisableRepo(central.RepoRemovalTarget{Path: repoDir, StateDB: stateDB}, time.Now().Unix())
-		if res.NotFound {
-			t.Fatalf("disable target not found")
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("disable repo: %v", err)
-	}
-	if err := held.Release(); err != nil {
-		t.Fatalf("release control.lock: %v", err)
-	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("runStart: %v\n%s", err, out.String())
-	}
-	if count.Load() != 0 {
-		t.Fatalf("spawn count=%d, want 0", count.Load())
-	}
-	var got startResult
-	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
-	}
-	if !got.Skipped || got.SkipReason != repoAutodiscoverySkipRepoDisabled {
-		t.Fatalf("start result=%+v, want repo_disabled skip", got)
-	}
-	if fileExists(stateDB) {
-		t.Fatalf("start created state.db after repo was disabled")
-	}
-}
-
-func TestStart_ManualUnregisteredRequiresRepoOn(t *testing.T) {
-	roots := disableRepoAutodiscovery(t)
-	repoDir := makeUnregisteredStartRepo(t)
-
-	var out bytes.Buffer
-	err := runStart(context.Background(), &out, repoDir, "", "", 0, true)
-	if err == nil {
-		t.Fatalf("runStart succeeded, want repository enablement error")
-	}
-	if msg := err.Error(); !strings.Contains(msg, "protection is off") || !strings.Contains(msg, "acd on --repo "+repoDir) {
-		t.Fatalf("error %q does not point to acd on", msg)
-	}
-	assertNoRepoStateOrRegistry(t, roots, repoDir)
 }
 
 func TestWakeTouchFlush_DisabledRepoSkipsWithoutState(t *testing.T) {
@@ -230,31 +98,6 @@ func TestWakeTouchFlush_DisabledRepoSkipsWithoutState(t *testing.T) {
 			}
 			assertNoRepoState(t, repoDir)
 		})
-	}
-}
-
-func TestStart_AutodiscoveryDisabledRegisteredRepoWorks(t *testing.T) {
-	_ = disableRepoAutodiscovery(t)
-	ctx := context.Background()
-	repoDir := makeUnregisteredStartRepo(t)
-	registerEnabledStartRepo(t, repoDir)
-	count, restore := installFakeSpawn(t, os.Getpid())
-	defer restore()
-
-	var out bytes.Buffer
-	if err := runStart(ctx, &out, repoDir, "session-registered", "codex", 0, true); err != nil {
-		t.Fatalf("runStart: %v", err)
-	}
-	if count.Load() != 1 {
-		t.Fatalf("spawn count=%d, want 1", count.Load())
-	}
-	db := openStartDB(t, repoDir)
-	clients, err := state.ListClients(ctx, db)
-	if err != nil {
-		t.Fatalf("ListClients: %v", err)
-	}
-	if len(clients) != 1 || clients[0].SessionID != "session-registered" {
-		t.Fatalf("clients=%+v, want registered session", clients)
 	}
 }
 

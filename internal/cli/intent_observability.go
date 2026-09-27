@@ -122,28 +122,11 @@ type intentStrategyReport struct {
 	ProviderCallSkippedReason         string                              `json:"provider_call_skipped_reason,omitempty"`
 	RecoveryReady                     bool                                `json:"recovery_ready,omitempty"`
 	LastPlannerWindow                 *intentPlannerWindowSummary         `json:"last_planner_window,omitempty"`
-	// PlannerErrorRateRecent is the share of intent_planner_error rows in
-	// the most recent IntentRecentDecisionWindow decisions. The denominator
-	// is always IntentRecentDecisionWindow (default 100) regardless of how
-	// many decisions have actually been recorded — the rate moves smoothly
-	// as the ledger fills rather than oscillating wildly during the first
-	// few decisions.
-	//
-	// JSON encoding: the field uses `,omitempty` so a zero rate is
-	// absent from the payload. Operators consuming this metric should
-	// treat absent and 0.0 identically — both mean "no planner errors
-	// observed in the most recent window". The decision_records table
-	// existence check upstream (see loadIntentRecentRates) already gates
-	// the field off when no decisions have ever been recorded, so the
-	// "never observed" vs "observed, exactly zero" distinction is not
-	// meaningful from the JSON shape and operators should not try to
-	// infer it.
-	PlannerErrorRateRecent float64 `json:"planner_error_rate_recent,omitempty"`
-	// SingletonCommitRateRecent is the share of one-event commits in the
-	// most recent IntentRecentCommitWindow distinct commit OIDs. The
-	// denominator follows the same "fixed 100 even when not yet filled"
-	// policy as PlannerErrorRateRecent.
-	SingletonCommitRateRecent float64 `json:"singleton_commit_rate_recent,omitempty"`
+	// Rates use the actual bounded sample. A zero sample means unavailable.
+	PlannerErrorRateRecent     float64 `json:"planner_error_rate_recent,omitempty"`
+	PlannerErrorSampleCount    int     `json:"planner_error_sample_count"`
+	SingletonCommitRateRecent  float64 `json:"singleton_commit_rate_recent,omitempty"`
+	SingletonCommitSampleCount int     `json:"singleton_commit_sample_count"`
 	// PlannerErrorRateRecentWarn surfaces the intent_strategy threshold
 	// breach to operators in the human renderer. Set to true whenever
 	// PlannerErrorRateRecent exceeds IntentPlannerErrorRateWarnThreshold
@@ -1384,22 +1367,9 @@ func loadIntentRecentRates(ctx context.Context, conn *sql.DB, report *intentStra
 	if err := loadIntentSingletonCommitRate(ctx, conn, report); err != nil {
 		return err
 	}
-	if report.PlannerErrorRateRecent > IntentPlannerErrorRateWarnThreshold {
-		// Suppress the warn flag while the ledger is still filling toward
-		// IntentRecentDecisionWindow. With a fixed denominator a small
-		// number of early errors dilutes against the full window — but a
-		// burst of 5 errors in the first 5 decisions also reaches the
-		// 0.05 threshold and is indistinguishable from sustained noise.
-		// Wait for a representative sample before surfacing the
-		// remediation hint to operators.
-		var total int
-		if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM decision_records`).Scan(&total); err != nil {
-			return fmt.Errorf("planner error rate full-window check: %w", err)
-		}
-		if total >= IntentRecentDecisionWindow {
-			report.PlannerErrorRateRecentWarn = true
-		}
-	}
+	report.PlannerErrorRateRecentWarn = report.PlannerErrorSampleCount >= IntentRecentDecisionWindow &&
+		report.PlannerErrorRateRecent > IntentPlannerErrorRateWarnThreshold
+
 	return nil
 }
 
@@ -1408,64 +1378,34 @@ func loadIntentRecentRates(ctx context.Context, conn *sql.DB, report *intentStra
 // subquery so the planner-error count never re-scans the full ledger.
 func loadIntentPlannerErrorRate(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
 	const q = `
-SELECT COUNT(*)
-FROM (
-    SELECT id, kind
-    FROM decision_records
-    ORDER BY id DESC
-    LIMIT ?
-) recent
-WHERE recent.kind = ?`
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN kind = ? THEN 1 ELSE 0 END), 0)
+FROM (SELECT kind FROM decision_records ORDER BY id DESC LIMIT ?)`
 	var errs int
-	if err := conn.QueryRowContext(ctx, q, IntentRecentDecisionWindow, state.DecisionKindIntentPlannerError).Scan(&errs); err != nil {
+	if err := conn.QueryRowContext(ctx, q, state.DecisionKindIntentPlannerError, IntentRecentDecisionWindow).Scan(&report.PlannerErrorSampleCount, &errs); err != nil {
 		return fmt.Errorf("planner error rate: %w", err)
 	}
-	report.PlannerErrorRateRecent = float64(errs) / float64(IntentRecentDecisionWindow)
+	if report.PlannerErrorSampleCount > 0 {
+		report.PlannerErrorRateRecent = float64(errs) / float64(report.PlannerErrorSampleCount)
+	}
 	return nil
 }
 
-// loadIntentSingletonCommitRate counts singleton commits among the most
-// recent IntentRecentCommitWindow distinct commit OIDs. A singleton commit
-// is defined as a committed-decision commit_oid that maps to exactly one
-// committed decision row — i.e. exactly one capture event landed in that
-// commit.
-//
-// The query first windows the commit OID list to the recent IntentRecentCommitWindow,
-// then GROUP BYs to count rows per OID and counts how many groups have
-// exactly one row. The denominator is the fixed IntentRecentCommitWindow
-// (not the actual count of recent commits) so the rate dilutes toward zero
-// while the ledger fills, mirroring the planner-error rate policy.
+// loadIntentSingletonCommitRate counts distinct commits, not capture rows.
 func loadIntentSingletonCommitRate(ctx context.Context, conn *sql.DB, report *intentStrategyReport) error {
 	const q = `
-SELECT COUNT(*)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN events = 1 THEN 1 ELSE 0 END), 0)
 FROM (
-    SELECT commit_oid
-    FROM decision_records
-    WHERE commit_oid IS NOT NULL
-      AND commit_oid != ''
-      AND kind = ?
-      AND commit_oid IN (
-          SELECT commit_oid
-          FROM decision_records
-          WHERE commit_oid IS NOT NULL
-            AND commit_oid != ''
-            AND kind = ?
-          GROUP BY commit_oid
-          ORDER BY MAX(id) DESC
-          LIMIT ?
-      )
-    GROUP BY commit_oid
-    HAVING COUNT(*) = 1
+ SELECT COUNT(*) AS events FROM decision_records
+ WHERE commit_oid IS NOT NULL AND commit_oid != '' AND kind = ?
+ GROUP BY commit_oid ORDER BY MAX(id) DESC LIMIT ?
 )`
 	var singletons int
-	if err := conn.QueryRowContext(ctx, q,
-		state.DecisionKindCommitted,
-		state.DecisionKindCommitted,
-		IntentRecentCommitWindow,
-	).Scan(&singletons); err != nil {
+	if err := conn.QueryRowContext(ctx, q, state.DecisionKindCommitted, IntentRecentCommitWindow).Scan(&report.SingletonCommitSampleCount, &singletons); err != nil {
 		return fmt.Errorf("singleton commit rate: %w", err)
 	}
-	report.SingletonCommitRateRecent = float64(singletons) / float64(IntentRecentCommitWindow)
+	if report.SingletonCommitSampleCount > 0 {
+		report.SingletonCommitRateRecent = float64(singletons) / float64(report.SingletonCommitSampleCount)
+	}
 	return nil
 }
 

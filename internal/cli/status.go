@@ -8,13 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
@@ -99,6 +95,7 @@ const (
 // statusReport is the JSON shape for `acd status --json`. Mirrors the
 // human-readable layout 1:1 so users can flip flags without losing fields.
 type statusReport struct {
+	PublicationOutcome            publicationOutcome           `json:"publication_outcome"`
 	Repo                          string                       `json:"repo"`
 	RepoHash                      string                       `json:"repo_hash"`
 	Daemon                        string                       `json:"daemon"`
@@ -155,42 +152,6 @@ type statusReport struct {
 	PublicationProgress           publicationProgressReport    `json:"publication_progress"`
 	checkpointPrepared            bool
 	checkpointNeedsAction         bool
-}
-
-func newStatusCmd() *cobra.Command {
-	var watch bool
-	var interval time.Duration
-	cmd := &cobra.Command{
-		Use:   "status",
-		Short: "Print current daemon + clients for one repo (default: cwd)",
-		Long: `Print daemon, client, queue, blocked-vs-waiting recovery state, pause, branch, and recent decision state for one registered repo.
-
-The default repo is the current working directory. Use --watch to refresh the
-same repo until interrupted. Use --json for automation. For all registered
-repos, use acd list; for why/how questions, use acd explain and acd events.`,
-		Example: `  acd status
-  acd status --watch
-  acd status --repo /path/to/repo
-  acd status --json
-  acd explain --path internal/state/schema.go
-  acd diagnose --repo . --json`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			repo, _ := cmd.Flags().GetString("repo")
-			jsonOut, _ := cmd.Flags().GetBool("json")
-			if watch {
-				if jsonOut {
-					return fmt.Errorf("acd status: --watch does not support --json")
-				}
-				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-				defer stop()
-				return runStatusWatch(ctx, cmd.OutOrStdout(), repo, interval)
-			}
-			return runStatus(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
-		},
-	}
-	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh status output until interrupted")
-	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval for --watch (Go duration)")
-	return cmd
 }
 
 func runStatus(ctx context.Context, out io.Writer, repo string, jsonOut bool) error {
@@ -337,6 +298,10 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		report.Protected = complete && report.LatestCheckpointID != "" &&
 			report.ObservationEpoch == report.CoveredEpoch &&
 			prepared == 0 && needsAction == 0
+		report.PublicationOutcome, err = readPublicationOutcome(ctx, conn, report.Protected)
+		if err != nil {
+			return report, err
+		}
 	}
 	// daemon_state singleton.
 	var pid int
@@ -552,6 +517,10 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		return report, fmt.Errorf("publication progress: %w", err)
 	}
 	report.PublicationProgress = progress
+	report.PublicationOutcome.ReasonCode = progress.Phase
+	if health := report.IntentStrategy.PlannerHealth; health != nil && health.NextProbeTS > 0 {
+		report.PublicationOutcome.RetryAt = health.NextProbeTS
+	}
 
 	return report, nil
 }
@@ -1089,31 +1058,6 @@ func currentWorktreeReplayPair(
 		return "", 0, false, nil
 	}
 	return branchRef, generation, true, nil
-}
-
-func runStatusWatch(ctx context.Context, out io.Writer, repo string, interval time.Duration) error {
-	if interval <= 0 {
-		return fmt.Errorf("acd status: --interval must be positive")
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		fmt.Fprint(out, "\033[2J\033[H")
-		fmt.Fprintf(out, "Updated: %s\n\n", time.Now().Format(time.RFC3339))
-		if err := runStatus(ctx, out, repo, false); err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-		}
-	}
 }
 
 func statusDecisionSummary(ctx context.Context, conn *sql.DB, report *statusReport) error {

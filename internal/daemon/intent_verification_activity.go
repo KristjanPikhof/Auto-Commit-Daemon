@@ -136,7 +136,9 @@ func runIntentCandidateVerificationWithActivity(
 					"daemon: clear intent verification activity: %w", cleanupErr))
 		}
 	}()
-	return verify(ctx, assignment, captures)
+	return evaluatePublication(ctx, func(jobCtx context.Context) (IntentCandidateVerification, error) {
+		return verify(jobCtx, assignment, captures)
+	})
 }
 
 func clearStaleIntentVerificationActivity(

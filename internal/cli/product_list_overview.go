@@ -184,6 +184,7 @@ func productListEntryFromOverview(
 	}
 	entry := productListEntry{
 		Repo: record.Path, RepoHash: record.RepoHash, Enabled: control.Enabled, Protected: control.Protected,
+		PublicationOutcome: control.PublicationOutcome,
 		Published: control.Published, ActionRequired: actionRequired, State: entryState,
 		PendingEvents: control.PendingEvents, BlockedEvents: control.BlockedEvents,
 		CheckpointID: control.CheckpointID, WorkerState: worker.State,

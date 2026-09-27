@@ -104,9 +104,11 @@ func runtimeIntentRepairCommitVerifier(
 			index,
 			shortRuntimeVerificationOID(commitOID),
 		)
-		result, err := (verification.Runner{}).Run(ctx, verification.Request{
-			RepoPath: repoRoot, CandidateID: candidateID,
-			CommitOID: commitOID, Command: command,
+		result, err := evaluatePublication(ctx, func(jobCtx context.Context) (verification.Result, error) {
+			return (verification.Runner{}).Run(jobCtx, verification.Request{
+				RepoPath: repoRoot, CandidateID: candidateID,
+				CommitOID: commitOID, Command: command,
+			})
 		})
 		if err != nil {
 			return fmt.Errorf("runtime repair verification: %w", err)

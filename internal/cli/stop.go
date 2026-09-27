@@ -11,12 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spf13/cobra"
-
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -55,74 +52,6 @@ var stopWaitTimeout = 5 * time.Second
 
 // stopPollInterval is the busy-loop polling cadence inside stopWaitTimeout.
 var stopPollInterval = 100 * time.Millisecond
-
-func newStopCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "stop",
-		Short: "Stop the current repo daemon or deregister a harness session",
-		Long: `Stop the daemon for the current repository by default.
-
-Precedence:
-  acd stop
-    Stop the resolved repo daemon without inspecting session refcounts.
-  acd stop --session-id SESSION
-    Deregister one harness session; stop only when no peers remain.
-  acd stop --force [--session-id SESSION]
-    Best-effort deregister SESSION when provided, then terminate the daemon and escalate if needed.
-  acd stop --all [--force]
-    Apply the same stop mode to every registered repo and keep stopped/deferred/failed buckets.
-
-Use acd status before stopping when you need to see active sessions.`,
-		Example: `  acd stop
-  acd stop --repo /path/to/repo
-  acd stop --session-id "$ACD_SESSION_ID"
-  acd stop --force
-  acd stop --all --json`,
-		RunE: func(c *cobra.Command, args []string) error {
-			repoFlag, _ := c.Flags().GetString("repo")
-			jsonOut, _ := c.Flags().GetBool("json")
-			sessionID, _ := c.Flags().GetString("session-id")
-			force, _ := c.Flags().GetBool("force")
-			all, _ := c.Flags().GetBool("all")
-			return runStop(c.Context(), c.OutOrStdout(), repoFlag, sessionID, force, all, jsonOut)
-		},
-	}
-	cmd.Flags().String("session-id", "", "Harness session identifier to deregister instead of human stop")
-	cmd.Flags().Bool("flush", false, "Drain pending events before stopping (with --force)")
-	cmd.Flags().Bool("force", false, "Skip refcount and SIGTERM the daemon")
-	cmd.Flags().Bool("all", false, "Stop every daemon in the central registry")
-	return cmd
-}
-
-func runStop(ctx context.Context, out io.Writer, repoFlag, sessionID string, force, all, jsonOut bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if all {
-		return runStopAll(ctx, out, force, jsonOut)
-	}
-	repo, err := resolveRepo(repoFlag)
-	if err != nil {
-		return err
-	}
-	res, err := stopOneRepo(ctx, repo, sessionID, force)
-	if err != nil {
-		return err
-	}
-	return writeStopResult(out, res, jsonOut)
-}
-
-func runStopAll(ctx context.Context, out io.Writer, force, jsonOut bool) error {
-	roots, err := paths.Resolve()
-	if err != nil {
-		return fmt.Errorf("acd stop: resolve paths: %w", err)
-	}
-	reg, err := central.Load(roots)
-	if err != nil {
-		return fmt.Errorf("acd stop: load registry: %w", err)
-	}
-	return runStopRegistry(ctx, out, force, jsonOut, reg)
-}
 
 func runStopRegistry(ctx context.Context, out io.Writer, force, jsonOut bool, reg *central.Registry) error {
 	out_all := stopAllResult{
@@ -408,23 +337,4 @@ func removeAllStartCaches(gitDir string) {
 		}
 		_ = os.Remove(filepath.Join(dir, name))
 	}
-}
-
-func writeStopResult(out io.Writer, res stopRepoResult, jsonOut bool) error {
-	if jsonOut {
-		enc := json.NewEncoder(out)
-		enc.SetIndent("", "  ")
-		return enc.Encode(res)
-	}
-	switch {
-	case res.Deferred:
-		fmt.Fprintf(out, "acd stop: deferred (%s)\n", res.Reason)
-	case res.Stopped && res.Force:
-		fmt.Fprintf(out, "acd stop: stopped (force, escalated=%v)\n", res.Escalated)
-	case res.Stopped:
-		fmt.Fprintln(out, "acd stop: stopped")
-	default:
-		fmt.Fprintf(out, "acd stop: result=%+v\n", res)
-	}
-	return nil
 }

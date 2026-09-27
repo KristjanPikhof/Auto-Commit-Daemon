@@ -21,6 +21,7 @@ const productListActiveWindow = time.Hour
 var productListCollect = collectProductListOverview
 
 type productListEntry struct {
+	PublicationOutcome publicationOutcome `json:"publication_outcome"`
 	Repo                  string                       `json:"repo"`
 	Enabled               bool                         `json:"enabled"`
 	Protected             bool                         `json:"protected"`

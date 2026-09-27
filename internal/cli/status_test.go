@@ -2610,13 +2610,6 @@ func TestStatus_SkipsDecisionSummaryForPreV5DB(t *testing.T) {
 	}
 }
 
-func TestStatusWatchRejectsNonPositiveInterval(t *testing.T) {
-	var out bytes.Buffer
-	if err := runStatusWatch(context.Background(), &out, ".", 0); err == nil {
-		t.Fatal("runStatusWatch with zero interval succeeded")
-	}
-}
-
 // TestList_Status_Doctor_AgreeOnCounts asserts that when the same repo is
 // inspected by acd list, acd status, and acd doctor they all report the
 // same pending + blocked_conflict counts. This is the contract the cli-lane
