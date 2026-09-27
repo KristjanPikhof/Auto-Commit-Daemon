@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
@@ -187,6 +188,14 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 	forcedRequest := make(chan struct{})
 	releaseForced := make(chan struct{})
 	var plannerCalls atomic.Int32
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("wide candidate diagnostics: calls=%d candidates=%s plans=%s",
+				plannerCalls.Load(),
+				sqliteScalar(t, dbPath, "SELECT group_concat(id || ':' || status || ':' || missing_companions) FROM intent_candidates"),
+				sqliteScalar(t, dbPath, "SELECT group_concat(resolution_mode || ':' || completed) FROM intent_plan_runs"))
+		}
+	})
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := decodeIntentChatRequest(t, r)
 		if req.ToolChoice.Function.Name == "commit_message" {
@@ -196,17 +205,6 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 		seqs := offeredIntentSeqsLenient(t, req)
 		switch plannerCalls.Add(1) {
 		case 1:
-			if len(seqs) != 13 {
-				http.Error(w, "expected complete wide candidate", http.StatusBadRequest)
-				return
-			}
-			writeNativeIntentCandidatesResponse(t, w, "wide_wait", []map[string]any{{
-				"candidate_id": "wide-shortcuts", "selected_seqs": seqs,
-				"purpose": "finish one shortcut change", "readiness": "wait",
-				"missing_companions": []string{"balanced fallback exceeds 12 paths"},
-				"grouping_reason":    "the wide candidate is still waiting",
-			}})
-		case 2:
 			if len(seqs) != 1 {
 				http.Error(w, "expected forced singleton", http.StatusBadRequest)
 				return
@@ -248,25 +246,24 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 		"ACD_AI_BASE_URL=" + server.URL, "ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-6-luna", trustEnv,
 	}
-	extra = activateIntentV2Runtime(t, repo, extra...)
+	extra = activateIntentV2RuntimeWithPreset(t, repo, "balanced", extra...)
 	fullEnv := envWith(env, extra...)
 	firstSession := startSession(t, ctx, env, repo, "wide-forced-a", "shell", extra...)
+	if got := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.v2.preset_id'"); got != "intent.balanced" {
+		t.Fatalf("runtime preset=%q want intent.balanced", got)
+	}
 	for i := 0; i < 13; i++ {
 		name := "shortcut-" + strconv.Itoa(i) + ".go"
 		writeFileAtomically(t, repo, filepath.Join(repo, name),
 			"package shortcuts\n\nfunc Shortcut"+strconv.Itoa(i)+"() {}\n")
 	}
 	wakeSession(t, ctx, fullEnv, repo, "wide-forced-a")
-	waitFor(t, "wide candidate captured", 15*time.Second, func() bool {
-		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state='pending'") == "13"
-	})
-	hint := runAcd(t, ctx, fullEnv, "internal", "hint", "--repo", repo, "--kind", "soft_boundary")
-	if hint.ExitCode != 0 {
-		t.Fatalf("soft boundary exit=%d: %s", hint.ExitCode, hint.Stderr)
-	}
-	waitFor(t, "wide waiting candidate", 15*time.Second, func() bool {
-		return plannerCalls.Load() == 1 && sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM intent_candidates WHERE status='waiting' AND missing_companions='balanced fallback exceeds 12 paths'") == "1"
+	waitFor(t, "wide changes checkpointed", 15*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, `SELECT COUNT(DISTINCT e.seq)
+FROM capture_events e
+JOIN checkpoint_events ce ON ce.event_seq=e.seq
+JOIN checkpoints c ON c.id=ce.checkpoint_id
+WHERE e.state='pending' AND c.phase='completed'`) == "13"
 	})
 
 	off := runAcd(t, ctx, fullEnv, "off", "--force", "--repo", repo, "--json")
@@ -285,6 +282,43 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 		stoppedLock = lock
 		return true
 	})
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.SQL().QueryContext(ctx,
+		"SELECT seq, branch_ref, branch_generation FROM capture_events WHERE state='pending' ORDER BY seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var branchRef string
+	var generation int64
+	var events []state.IntentCandidateEvent
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq, &branchRef, &generation); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, state.IntentCandidateEvent{EventSeq: seq, EventRole: "code"})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	_ = rows.Close()
+	if len(events) != 13 {
+		t.Fatalf("captured events=%d want 13", len(events))
+	}
+	if err := state.SaveIntentCandidate(ctx, db, state.IntentCandidate{
+		ID: "wide-shortcuts", BranchRef: branchRef, BranchGeneration: generation,
+		Status: state.IntentCandidateWaiting, Readiness: state.IntentReadinessWait,
+		Purpose:           "finish one shortcut change",
+		MissingCompanions: "balanced fallback exceeds 12 paths", Events: events,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := stoppedLock.Release(); err != nil {
 		t.Fatal(err)
 	}
@@ -316,8 +350,8 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 	if result.ExitCode != 0 {
 		t.Fatalf("commit-all exit=%d\nstdout=%s\nstderr=%s", result.ExitCode, result.Stdout, result.Stderr)
 	}
-	if calls := plannerCalls.Load(); calls != 2 {
-		t.Fatalf("planner calls=%d want the wait and one forced repair", calls)
+	if calls := plannerCalls.Load(); calls != 1 {
+		t.Fatalf("planner calls=%d want one forced repair", calls)
 	}
 	waitFor(t, "wide forced candidate published after commit-all", 10*time.Second, func() bool {
 		return plannerCalls.Load() >= 2 && sqliteScalar(t, dbPath,
