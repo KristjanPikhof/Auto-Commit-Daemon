@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Intent planner guidance favors complete, purposeful steps: separate useful
+  preparatory refactors from features when safe, keep supporting tests and
+  edits together, and explain broader behavior changes from available evidence.
+
 - The default OpenAI-compatible model is `gpt-6-luna` across setup, settings,
   and provider requests. Explicitly configured models keep their saved values.
 
@@ -37,6 +41,10 @@
   supported compatibility commands use current operations.
 
 ### Fixed
+
+- Balanced Intent no longer applies evidence-fallback size limits to a valid
+  repaired semantic plan. Forced aging can continue a wider existing group
+  without turning the repaired plan back into an invalid wait.
 
 - Repository discovery resolves worktree and Git paths in one Git call, reducing
   startup work for hooks and commands.
