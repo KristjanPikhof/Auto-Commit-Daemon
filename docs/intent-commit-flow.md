@@ -40,8 +40,7 @@ not depend on them.
 
 ## Commit purpose
 
-Intent planning follows the approach described in
-[Purposeful Commits](https://chrisarcand.com/purposeful-commits/): each commit
+Intent planning follows the purposeful commit approach wehere each commit
 should explain one useful step and leave a working state under the configured
 checks. A preparatory refactor can precede the feature it enables when the
 captured changes support two complete steps. Tests, imports, generated files,
