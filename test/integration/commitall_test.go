@@ -190,10 +190,12 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 	var plannerCalls atomic.Int32
 	t.Cleanup(func() {
 		if t.Failed() {
-			t.Logf("wide candidate diagnostics: calls=%d candidates=%s plans=%s",
+			t.Logf("wide candidate diagnostics: calls=%d candidates=%s plans=%s drains=%s replay=%s",
 				plannerCalls.Load(),
 				sqliteScalar(t, dbPath, "SELECT group_concat(id || ':' || status || ':' || missing_companions) FROM intent_candidates"),
-				sqliteScalar(t, dbPath, "SELECT group_concat(resolution_mode || ':' || completed) FROM intent_plan_runs"))
+				sqliteScalar(t, dbPath, "SELECT group_concat(resolution_mode || ':' || completed) FROM intent_plan_runs"),
+				sqliteScalar(t, dbPath, "SELECT group_concat(id || ':' || phase || ':' || reason_code || ':' || last_error) FROM publication_drains"),
+				sqliteScalar(t, dbPath, "SELECT group_concat(key || ':' || value) FROM daemon_meta WHERE key LIKE '%attention%' OR key LIKE '%replay%'"))
 		}
 	})
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -241,7 +243,8 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 	defer cancel()
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent", "ACD_INTENT_WINDOW=20",
-		"ACD_INTENT_MIN_PENDING=14", "ACD_INTENT_SETTLE_WINDOW=0",
+		"ACD_INTENT_MIN_PENDING=14", "ACD_INTENT_DEFER_LIMIT=2",
+		"ACD_INTENT_SETTLE_WINDOW=0",
 		"ACD_INTENT_MAX_PENDING_AGE=5m", "ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL, "ACD_AI_API_KEY=test-key",
 		"ACD_AI_MODEL=gpt-6-luna", trustEnv,
@@ -315,6 +318,12 @@ WHERE e.state='pending' AND c.phase='completed'`) == "13"
 		MissingCompanions: "balanced fallback exceeds 12 paths", Events: events,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := state.RecordPlannerDefer(ctx, db, events[0].EventSeq,
+			float64(time.Now().Unix()), "wide candidate waiting"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
