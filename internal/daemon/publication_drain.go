@@ -679,9 +679,8 @@ func RecoverForcedIntentBoundPublicationDrain(
 	now time.Time,
 ) (*state.PublicationDrain, error) {
 	rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT id,last_error FROM publication_drains
+SELECT id,last_error,reason_code FROM publication_drains
 WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
-  AND reason_code='publication_failed'
 ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if err != nil {
 		return nil, err
@@ -690,12 +689,15 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if !rows.Next() {
 		return nil, rows.Err()
 	}
-	var id, recordedError string
-	if err := rows.Scan(&id, &recordedError); err != nil {
+	var id, recordedError, reasonCode string
+	if err := rows.Scan(&id, &recordedError, &reasonCode); err != nil {
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
+	}
+	if reasonCode != "publication_failed" {
+		return nil, nil
 	}
 	const prefix = "intent planner v2: forced_capture_deferred: forced-aging seq "
 	const suffix = " must be ready with no missing companions"
@@ -717,6 +719,14 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	}
 	if !containsIntentSeq(drain.EventSeqs, seq) {
 		return nil, nil
+	}
+	var pendingSeq int
+	err = db.ReadSQL().QueryRowContext(ctx, `
+SELECT EXISTS(SELECT 1 FROM capture_events WHERE seq=? AND state='pending'
+  AND branch_ref=? AND branch_generation=?)`, seq, branchRef, generation).
+		Scan(&pendingSeq)
+	if err != nil || pendingSeq == 0 {
+		return nil, err
 	}
 	counts, err := publicationDrainCountsForTarget(ctx, db, drain.EventSeqs)
 	if err != nil || counts.terminal != 0 {
@@ -746,16 +756,19 @@ WHERE e.event_seq=? AND e.membership_state='active'
 	if err != nil || len(within) != 1 {
 		return nil, err
 	}
-	var activeRepair, activePublication int
+	var activeRepair, activePublication, activeOperation int
 	err = db.ReadSQL().QueryRowContext(ctx, `
 SELECT
   EXISTS(SELECT 1 FROM intent_repairs WHERE branch_ref=?
     AND branch_generation=? AND status IN ('prepared','git_applied')),
   EXISTS(SELECT 1 FROM self_publications WHERE branch_ref=?
-    AND branch_generation=? AND phase IN ('prepared','git_applied'))`,
-		branchRef, generation, branchRef, generation).
-		Scan(&activeRepair, &activePublication)
-	if err != nil || activeRepair != 0 || activePublication != 0 {
+    AND branch_generation=? AND phase IN ('prepared','git_applied')),
+  EXISTS(SELECT 1 FROM operations WHERE worktree_id=?
+    AND status IN ('prepared','active'))`,
+		branchRef, generation, branchRef, generation, drain.WorktreeID).
+		Scan(&activeRepair, &activePublication, &activeOperation)
+	if err != nil || activeRepair != 0 || activePublication != 0 ||
+		activeOperation != 0 {
 		return nil, err
 	}
 	planRows, err := db.ReadSQL().QueryContext(ctx, `
