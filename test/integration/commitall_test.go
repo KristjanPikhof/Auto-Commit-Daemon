@@ -184,6 +184,8 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	forcedRequest := make(chan struct{})
+	releaseForced := make(chan struct{})
 	var plannerCalls atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := decodeIntentChatRequest(t, r)
@@ -209,6 +211,12 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 				http.Error(w, "expected forced singleton", http.StatusBadRequest)
 				return
 			}
+			close(forcedRequest)
+			select {
+			case <-releaseForced:
+			case <-r.Context().Done():
+				return
+			}
 			writeNativeIntentCandidatesResponse(t, w, "forced_wait", []map[string]any{{
 				"candidate_id": "wide-shortcuts", "selected_seqs": seqs,
 				"purpose": "finish one shortcut change", "readiness": "wait",
@@ -223,6 +231,13 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 		}
 	}))
 	defer server.Close()
+	defer func() {
+		select {
+		case <-releaseForced:
+		default:
+			close(releaseForced)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -282,9 +297,27 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 		t.Fatalf("worker did not restart: before=%d after=%d", firstSession.DaemonPID, secondSession.DaemonPID)
 	}
 	t.Cleanup(func() { shutdownDaemon(t, fullEnv, repo, "wide-forced-b") })
-	result := runAcd(t, ctx, fullEnv, "commit-all", "--repo", repo, "--yes")
+	done := make(chan ExecResult, 1)
+	go func() { done <- runAcd(t, ctx, fullEnv, "commit-all", "--repo", repo, "--yes") }()
+	select {
+	case <-forcedRequest:
+	case <-ctx.Done():
+		t.Fatal("forced planner request did not start")
+	}
+	waitFor(t, "frozen wide commit-all target", 20*time.Second, func() bool {
+		return sqliteScalar(t, dbPath,
+			"SELECT COUNT(*) FROM publication_drains WHERE phase='semantic' AND target_event_count=13") == "1"
+	})
+	writeFileAtomically(t, repo, filepath.Join(repo, "later.go"),
+		"package shortcuts\n\nfunc Later() {}\n")
+	wakeSession(t, ctx, fullEnv, repo, "wide-forced-b")
+	close(releaseForced)
+	result := <-done
 	if result.ExitCode != 0 {
 		t.Fatalf("commit-all exit=%d\nstdout=%s\nstderr=%s", result.ExitCode, result.Stdout, result.Stderr)
+	}
+	if calls := plannerCalls.Load(); calls != 2 {
+		t.Fatalf("planner calls=%d want the wait and one forced repair", calls)
 	}
 	waitFor(t, "wide forced candidate published after commit-all", 10*time.Second, func() bool {
 		return plannerCalls.Load() >= 2 && sqliteScalar(t, dbPath,
@@ -296,6 +329,16 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 			t.Fatalf("wide candidate path %s missing from branch: %v", name, err)
 		}
 	}
+	if _, err := runGit(repo, "cat-file", "-e", "HEAD:later.go"); err == nil {
+		t.Fatal("later capture entered the frozen target")
+	}
+	waitFor(t, "later edit remains protected", 15*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, `SELECT COUNT(*)
+FROM capture_events e
+JOIN checkpoint_events ce ON ce.event_seq=e.seq
+JOIN checkpoints c ON c.id=ce.checkpoint_id
+WHERE e.path='later.go' AND e.state='pending' AND c.phase='completed'`) == "1"
+	})
 	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
 	var payload struct {
 		Data struct {
@@ -307,7 +350,7 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 		} `json:"data"`
 	}
 	if status.ExitCode != 0 || json.Unmarshal([]byte(status.Stdout), &payload) != nil ||
-		!payload.Data.Protected || payload.Data.Outcome.BranchChanges != 13 || payload.Data.Outcome.WaitingChanges != 0 {
+		!payload.Data.Protected || payload.Data.Outcome.BranchChanges != 13 || payload.Data.Outcome.WaitingChanges != 1 {
 		t.Fatalf("status after forced repair: %+v\n%s", status, status.Stdout)
 	}
 	list := runAcd(t, ctx, fullEnv, "list", "--once", "--all")
