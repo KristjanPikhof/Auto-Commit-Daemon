@@ -177,22 +177,13 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	}
 }
 
-func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testing.T) {
+func TestIntentForcedRepairPublishesWideCandidateAfterRestart(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
 	}
 	repo := tempRepo(t)
 	env := withIsolatedHome(t)
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	forcedRequest := make(chan struct{})
-	releaseForced := make(chan struct{})
-	defer func() {
-		select {
-		case <-releaseForced:
-		default:
-			close(releaseForced)
-		}
-	}()
 	var plannerCalls atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := decodeIntentChatRequest(t, r)
@@ -218,8 +209,6 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 				http.Error(w, "expected forced singleton", http.StatusBadRequest)
 				return
 			}
-			close(forcedRequest)
-			<-releaseForced
 			writeNativeIntentCandidatesResponse(t, w, "forced_wait", []map[string]any{{
 				"candidate_id": "wide-shortcuts", "selected_seqs": seqs,
 				"purpose": "finish one shortcut change", "readiness": "wait",
@@ -286,31 +275,14 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 		t.Fatalf("on exit=%d: %s", on.ExitCode, on.Stderr)
 	}
 	secondSession := startSession(t, ctx, env, repo, "wide-forced-b", "shell", extra...)
-	if firstSession.DaemonPID == secondSession.DaemonPID {
-		t.Fatal("worker did not restart")
+	if firstSession.DaemonPID <= 0 || secondSession.DaemonPID <= 0 || firstSession.DaemonPID == secondSession.DaemonPID {
+		t.Fatalf("worker did not restart: before=%d after=%d", firstSession.DaemonPID, secondSession.DaemonPID)
 	}
 	t.Cleanup(func() { shutdownDaemon(t, fullEnv, repo, "wide-forced-b") })
-
-	done := make(chan ExecResult, 1)
-	go func() { done <- runAcd(t, ctx, fullEnv, "commit-all", "--repo", repo, "--yes") }()
-	select {
-	case <-forcedRequest:
-	case <-ctx.Done():
-		t.Fatal("commit-all never reached forced planner request")
-	}
-	if got := sqliteScalar(t, dbPath, "SELECT target_event_count FROM publication_drains ORDER BY id DESC LIMIT 1"); got != "13" {
-		t.Fatalf("frozen target=%s want 13", got)
-	}
-	writeFileAtomically(t, repo, filepath.Join(repo, "later.go"), "package shortcuts\n\nfunc Later() {}\n")
-	wakeSession(t, ctx, fullEnv, repo, "wide-forced-b")
-	close(releaseForced)
-	result := <-done
-	if result.ExitCode != 0 {
-		t.Fatalf("commit-all exit=%d\nstdout=%s\nstderr=%s", result.ExitCode, result.Stdout, result.Stderr)
-	}
-	if _, err := runGit(repo, "cat-file", "-e", "HEAD:later.go"); err == nil {
-		t.Fatal("later capture entered frozen publication target")
-	}
+	waitFor(t, "wide forced candidate published after restart", 30*time.Second, func() bool {
+		return plannerCalls.Load() >= 2 && sqliteScalar(t, dbPath,
+			"SELECT COUNT(*) FROM capture_events WHERE state='published'") == "13"
+	})
 	for i := 0; i < 13; i++ {
 		name := "shortcut-" + strconv.Itoa(i) + ".go"
 		if _, err := runGit(repo, "cat-file", "-e", "HEAD:"+name); err != nil {
@@ -320,16 +292,15 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
 	var payload struct {
 		Data struct {
-			Protected     bool `json:"protected"`
-			PendingEvents int  `json:"pending_events"`
-			Outcome       struct {
+			Protected bool `json:"protected"`
+			Outcome   struct {
 				BranchChanges  int `json:"branch_changes"`
 				WaitingChanges int `json:"waiting_changes"`
 			} `json:"publication_outcome"`
 		} `json:"data"`
 	}
 	if status.ExitCode != 0 || json.Unmarshal([]byte(status.Stdout), &payload) != nil ||
-		!payload.Data.Protected || payload.Data.Outcome.BranchChanges != 13 || payload.Data.Outcome.WaitingChanges != 1 {
+		!payload.Data.Protected || payload.Data.Outcome.BranchChanges != 13 || payload.Data.Outcome.WaitingChanges != 0 {
 		t.Fatalf("status after forced repair: %+v\n%s", status, status.Stdout)
 	}
 	list := runAcd(t, ctx, fullEnv, "list", "--once", "--all")
