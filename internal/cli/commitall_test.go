@@ -130,6 +130,24 @@ func TestCommitAllMissingWorkerCannotReconnectToActiveDrain(t *testing.T) {
 	}
 }
 
+func TestCommitAllProgressShowsOlderProtectedTarget(t *testing.T) {
+	startedAt := time.Unix(10_000, 0)
+	projection := state.PublicationDrainReadOnlyProjection{
+		Latest: &state.PublicationDrain{
+			ID: "older-run", WorktreeID: "current",
+			CreatedTS: 1, Phase: state.PublicationDrainNeedsAction,
+			TargetEventCount: 37, PublishedEventCount: 6,
+		},
+	}
+	if selectReconnectPublicationDrain(projection, "current", startedAt) != nil {
+		t.Fatal("older target must not prove a new request started")
+	}
+	if drain := productPublicationDrainForProgress(projection, "current", startedAt); drain == nil ||
+		drain.ID != "older-run" || drain.TargetEventCount-drain.PublishedEventCount != 31 {
+		t.Fatalf("older target was hidden from progress: %+v", drain)
+	}
+}
+
 // TestResolveEffectiveCommitStrategy_DaemonMetaWins covers the priority
 // chain: daemon meta `commit.strategy` > env ACD_COMMIT_STRATEGY > default
 // (event). Three subtests, one per source.
