@@ -25,6 +25,7 @@ const supersededCandidateDrainErrorPrefix = "state: candidate "
 const supersededCandidateDrainErrorSuffix = " is terminal in status superseded"
 const exhaustedCandidateSuccessorDrainErrorPrefix = "daemon: intent candidates: exhausted successor IDs for \""
 const exhaustedCandidateSuccessorDrainErrorSuffix = "\""
+const publicationForcedIntentBoundRetry = "forced_intent_bound_retry"
 
 // PublicationDrainSemanticMessageUnavailableReason identifies historical
 // terminal outage rows so current recovery can reopen them safely.
@@ -720,6 +721,9 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if !containsIntentSeq(drain.EventSeqs, seq) {
 		return nil, nil
 	}
+	if drain.ReasonEvidence != "" {
+		return nil, nil
+	}
 	var pendingSeq int
 	err = db.ReadSQL().QueryRowContext(ctx, `
 SELECT EXISTS(SELECT 1 FROM capture_events WHERE seq=? AND state='pending'
@@ -772,7 +776,7 @@ SELECT
 		return nil, err
 	}
 	planRows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT resolved_plan_json FROM intent_plan_runs
+SELECT finding_codes,resolved_plan_json FROM intent_plan_runs
 WHERE branch_ref=? AND branch_generation=? AND completed=1
   AND resolution_mode='local_repair' AND updated_ts>=?
   AND updated_ts<=?
@@ -783,13 +787,17 @@ ORDER BY updated_ts DESC LIMIT 16`, branchRef, generation,
 	}
 	provedPlan := false
 	for planRows.Next() {
+		var findings string
 		var raw sql.NullString
-		if err := planRows.Scan(&raw); err != nil {
+		if err := planRows.Scan(&findings, &raw); err != nil {
 			planRows.Close()
 			return nil, err
 		}
+		var codes []string
 		var resolved resolvedIntentPlanRun
-		if !raw.Valid || json.Unmarshal([]byte(raw.String), &resolved) != nil {
+		if json.Unmarshal([]byte(findings), &codes) != nil ||
+			!containsIntentString(codes, "forced_capture_deferred") ||
+			!raw.Valid || json.Unmarshal([]byte(raw.String), &resolved) != nil {
 			continue
 		}
 		for _, assignment := range resolved.Plan.Candidates {
@@ -811,8 +819,9 @@ ORDER BY updated_ts DESC LIMIT 16`, branchRef, generation,
 	if nowTS < drain.UpdatedTS {
 		nowTS = drain.UpdatedTS
 	}
-	reopened, err := state.ReopenPublicationDrainCheckpointing(
-		ctx, db, drain.ID, recordedError, nowTS)
+	reopened, err := state.ReopenPublicationDrainCheckpointingOnce(
+		ctx, db, drain.ID, recordedError, nowTS,
+		publicationForcedIntentBoundRetry)
 	if err != nil {
 		return nil, err
 	}
@@ -1786,7 +1795,9 @@ func UpdatePublicationDrainAfterReplay(
 			// half-open probe resumes the same plan automatically.
 			update.LastError = ""
 			update.ReasonCode = ""
-			update.ReasonEvidence = ""
+			if update.ReasonEvidence != publicationForcedIntentBoundRetry {
+				update.ReasonEvidence = ""
+			}
 			return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 		}
 		update.LastError = replayErr.Error()
