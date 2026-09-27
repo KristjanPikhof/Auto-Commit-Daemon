@@ -95,6 +95,9 @@ For forced aging, ACD may discard a missing companion invented by the model
 only when an exact baseline group proves that all available hard dependencies
 are complete. A real waiting dependency, missing object, materialization
 failure, verification failure, or branch-safety problem still blocks the work.
+Balanced fallback size limits apply to the local evidence partition. They do
+not turn a repaired semantic plan back into a waiting group merely because
+its existing membership spans more paths.
 
 When a completed plan still matches the same fingerprint, ACD reloads and
 revalidates that plan instead of asking the provider again or rebuilding an
