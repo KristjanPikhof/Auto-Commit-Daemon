@@ -377,6 +377,9 @@ func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup) 
 		projection, decodeErr := decodeProductData[state.PublicationDrainReadOnlyProjection](response.Data)
 		return projection, decodeErr == nil, decodeErr
 	}
+	if ctx.Err() != nil {
+		return state.PublicationDrainReadOnlyProjection{}, false, ctx.Err()
+	}
 	return readProductPublicationDrainAfterWorkerFailure(ctx, lookup.Record.StateDB, err)
 }
 
@@ -399,7 +402,9 @@ func readProductPublicationDrainAfterWorkerFailure(
 }
 
 func productDrainReadOnlyFallbackAllowed(err error) bool {
-	return !strings.Contains(err.Error(), "acd setup") &&
+	var commandErr *CommandError
+	return errors.As(err, &commandErr) && commandErr.Retryable &&
+		!strings.Contains(err.Error(), "acd setup") &&
 		!strings.Contains(err.Error(), "compatibility contract")
 }
 
@@ -472,6 +477,8 @@ func waitForProductPublicationDrain(
 	progressOut io.Writer,
 	quiet bool,
 ) (productCommitAllResult, error) {
+	// Supervisor restart backoff reaches 30 seconds; allow startup time too.
+	const workerReconnectGrace = 45 * time.Second
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
 	report := time.NewTicker(5 * time.Second)
@@ -501,28 +508,28 @@ func waitForProductPublicationDrain(
 		case <-poll.C:
 			projection, live, err := readProductPublicationDrain(ctx, lookup)
 			if err != nil {
-			if workerUnavailableSince.IsZero() {
-				workerUnavailableSince = time.Now()
-			}
-			if time.Since(workerUnavailableSince) >= 30*time.Second &&
-				!productWorkerRunning(ctx, lookup) {
-				return result, unavailableError(fmt.Sprintf(
-					"acd commit-all: protected publication drain %s could not reconnect to its worker; run `acd doctor`",
-					result.DrainID))
-			}
+				if workerUnavailableSince.IsZero() {
+					workerUnavailableSince = time.Now()
+				}
+				if time.Since(workerUnavailableSince) >= workerReconnectGrace &&
+					!productWorkerRunning(ctx, lookup) {
+					return result, unavailableError(fmt.Sprintf(
+						"acd commit-all: protected publication drain %s could not reconnect to its worker; run `acd doctor`",
+						result.DrainID))
+				}
 				continue
 			}
 			workerAvailable = live
 			if live {
 				workerUnavailableSince = time.Time{}
 			} else if workerUnavailableSince.IsZero() {
-			workerUnavailableSince = time.Now()
+				workerUnavailableSince = time.Now()
 			}
 			latest = productPublicationDrainByID(projection, result.DrainID)
 			if latest == nil {
 				continue
 			}
-			if !live && time.Since(workerUnavailableSince) >= 30*time.Second &&
+			if !live && time.Since(workerUnavailableSince) >= workerReconnectGrace &&
 				!productWorkerRunning(ctx, lookup) &&
 				latest.Phase != state.PublicationDrainCompleted &&
 				latest.Phase != state.PublicationDrainNeedsAction {

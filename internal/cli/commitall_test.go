@@ -157,12 +157,43 @@ func TestCommitAllReadOnlyFallbackPreservesCompatibilityError(t *testing.T) {
 		"installed runtime does not match; run `acd setup`",
 		"running ACD does not advertise the current compatibility contract",
 	} {
-		if productDrainReadOnlyFallbackAllowed(fmt.Errorf("%s", message)) {
+		if productDrainReadOnlyFallbackAllowed(unavailableError(message)) {
 			t.Fatalf("read-only fallback hid compatibility error: %s", message)
 		}
 	}
-	if !productDrainReadOnlyFallbackAllowed(fmt.Errorf("worker unavailable: missing socket")) {
+	if productDrainReadOnlyFallbackAllowed(actionRequiredError("blocked", "worker refused status")) {
+		t.Fatal("read-only fallback hid a non-retryable worker error")
+	}
+	if !productDrainReadOnlyFallbackAllowed(unavailableError("worker unavailable: missing socket")) {
 		t.Fatal("worker disconnect did not allow durable read-only projection")
+	}
+}
+
+func TestCommitAllMissingWorkerReadsDurableBlockedDrain(t *testing.T) {
+	repo, dbPath, db := makeRegisteredGitRepoStateDB(t)
+	ctx := context.Background()
+	drainID, _ := seedResolvedFixPublicationDrain(t, ctx, repo, db)
+	before, err := fileSHA256(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, live, err := readProductPublicationDrainAfterWorkerFailure(
+		ctx, dbPath, unavailableError("worker unavailable: missing socket"))
+	if err != nil || live {
+		t.Fatalf("read-only projection live=%t err=%v", live, err)
+	}
+	drain := selectReconnectPublicationDrain(projection,
+		"0123456789abcdef", time.Unix(3, 0))
+	if drain == nil || drain.ID != drainID ||
+		drain.Phase != state.PublicationDrainNeedsAction ||
+		drain.LastError != "forced_capture_deferred" ||
+		!publicationDrainCanReconnect(*drain, live) {
+		t.Fatalf("blocked durable drain lost after worker failure: %+v", drain)
+	}
+	after, err := fileSHA256(dbPath)
+	if err != nil || before != after {
+		t.Fatalf("read-only projection changed DB: before=%s after=%s err=%v",
+			before, after, err)
 	}
 }
 
