@@ -45,6 +45,13 @@
 - Balanced Intent no longer applies evidence-fallback size limits to a valid
   repaired semantic plan. Forced aging can continue a wider existing group
   without turning the repaired plan back into an invalid wait.
+- Existing runs stopped by that error can retry automatically once when saved
+  plan and membership evidence proves the cause. Recovery retains the frozen
+  target and repeats checkpoint and publication checks.
+- Commit-all reads saved progress when a worker socket disappears without
+  mistaking a saved run for a working process. Doctor shows the recorded cause
+  instead of pointing back to itself, and diagnose JSON reports blocked
+  publication as `needs_action` even when the files are protected.
 
 - Repository discovery resolves worktree and Git paths in one Git call, reducing
   startup work for hooks and commands.
