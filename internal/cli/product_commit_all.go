@@ -377,6 +377,12 @@ func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup) 
 		projection, decodeErr := decodeProductData[state.PublicationDrainReadOnlyProjection](response.Data)
 		return projection, decodeErr == nil, decodeErr
 	}
+	// A runtime compatibility failure is not a worker disconnect. Do not let
+	// an older local projection make an incompatible command look successful.
+	if strings.Contains(err.Error(), "acd setup") ||
+		strings.Contains(err.Error(), "compatibility contract") {
+		return state.PublicationDrainReadOnlyProjection{}, false, err
+	}
 	if !fileExists(lookup.Record.StateDB) {
 		return state.PublicationDrainReadOnlyProjection{}, false, err
 	}
@@ -423,7 +429,8 @@ func productPublicationDrainForProgress(
 	}
 	// A repeated command may be waiting for a drain created hours ago. This
 	// older target is useful for display, but not proof that this request began.
-	if projection.Latest != nil && projection.Latest.WorktreeID == worktreeID {
+	if projection.Latest != nil && projection.Latest.WorktreeID == worktreeID &&
+		projection.Latest.Phase != state.PublicationDrainCompleted {
 		return projection.Latest
 	}
 	return nil
@@ -461,7 +468,7 @@ func waitForProductPublicationDrain(
 	defer report.Stop()
 	var latest *state.PublicationDrain
 	var workerAvailable bool
-	var lastRestart time.Time
+	var workerUnavailableSince time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -484,18 +491,34 @@ func waitForProductPublicationDrain(
 		case <-poll.C:
 			projection, live, err := readProductPublicationDrain(ctx, lookup)
 			if err != nil {
+			if workerUnavailableSince.IsZero() {
+				workerUnavailableSince = time.Now()
+			}
+			if time.Since(workerUnavailableSince) >= 30*time.Second &&
+				!productWorkerRunning(ctx, lookup) {
+				return result, unavailableError(fmt.Sprintf(
+					"acd commit-all: protected publication drain %s could not reconnect to its worker; run `acd doctor`",
+					result.DrainID))
+			}
 				continue
 			}
 			workerAvailable = live
+			if live {
+				workerUnavailableSince = time.Time{}
+			} else if workerUnavailableSince.IsZero() {
+			workerUnavailableSince = time.Now()
+			}
 			latest = productPublicationDrainByID(projection, result.DrainID)
 			if latest == nil {
 				continue
 			}
-			if !live && latest.Phase != state.PublicationDrainCompleted &&
-				latest.Phase != state.PublicationDrainNeedsAction &&
-				time.Since(lastRestart) >= 15*time.Second {
-				lastRestart = time.Now()
-				_, _ = callSupervisor(ctx, lookup, "restart_repository", nil, 30*time.Second)
+			if !live && time.Since(workerUnavailableSince) >= 30*time.Second &&
+				!productWorkerRunning(ctx, lookup) &&
+				latest.Phase != state.PublicationDrainCompleted &&
+				latest.Phase != state.PublicationDrainNeedsAction {
+				return result, unavailableError(fmt.Sprintf(
+					"acd commit-all: protected publication drain %s could not reconnect to its worker; run `acd doctor`",
+					result.DrainID))
 			}
 			result.Phase = latest.Phase
 			result.TargetEvents = latest.TargetEventCount
@@ -519,6 +542,11 @@ func waitForProductPublicationDrain(
 			}
 		}
 	}
+}
+
+func productWorkerRunning(ctx context.Context, lookup controlRepoLookup) bool {
+	worker, ok := readSupervisorWorkerStatus(ctx, lookup.Roots, lookup.Record.RepositoryID)
+	return ok && (worker.State == "running" || worker.State == "starting")
 }
 
 func productPublicationDrainByID(
