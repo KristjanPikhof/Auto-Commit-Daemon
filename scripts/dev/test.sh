@@ -19,6 +19,7 @@ usage() {
   cat >&2 <<'EOF'
 usage: scripts/dev/test.sh
        scripts/dev/test.sh core <shard-count> <shard-index>
+       scripts/dev/test.sh integration <shard-count> <shard-index>
        scripts/dev/test.sh support
        scripts/dev/test.sh sensitive
        scripts/dev/test.sh stress-daemon <shard-count> <shard-index>
@@ -85,6 +86,12 @@ run_core() {
     status=1
   fi
   return "$status"
+}
+
+run_integration() {
+  validate_shard "$1" "$2"
+  run_package_shard ./test/integration "$1" "$2" \
+    -tags=integration -race -count=1 -parallel=2 -timeout "$test_timeout"
 }
 
 run_support() {
@@ -178,6 +185,10 @@ case "${1:-}" in
       exit 2
     fi
     run_core "$2" "$3"
+    ;;
+  integration)
+    if (($# != 3)); then usage; exit 2; fi
+    run_integration "$2" "$3"
     ;;
   support)
     if (($# != 1)); then
