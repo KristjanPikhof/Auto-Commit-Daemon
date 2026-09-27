@@ -99,6 +99,13 @@ Balanced fallback size limits apply to the local evidence partition. They do
 not turn a repaired semantic plan back into a waiting group merely because
 its existing membership spans more paths.
 
+An older run stopped by that mistaken size limit can resume automatically.
+ACD requires the recorded forced-aging failure, the matching size-limit hold,
+and a completed ready repair plan for the affected capture. Pending candidate
+members must remain inside the frozen target, with no conflicting publication
+or repair in progress. Recovery reopens checkpointing and repeats the normal
+safety checks; it does not publish directly from the old plan.
+
 When a completed plan still matches the same fingerprint, ACD reloads and
 revalidates that plan instead of asking the provider again or rebuilding an
 evidence partition. Planner windows report this as `completed_plan_reuse`.
