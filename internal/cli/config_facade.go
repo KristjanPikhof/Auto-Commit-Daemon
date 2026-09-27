@@ -32,7 +32,7 @@ type configValue struct {
 func newConfigGetCmd() *cobra.Command {
 	var options configScopeOptions
 	cmd := &cobra.Command{
-		Use: "get [KEY]", Short: "Show the settings ACD is using", Args: cobra.MaximumNArgs(1),
+		Use: "get [KEY]", Short: "Show saved settings and their sources", Args: cobra.MaximumNArgs(1),
 		Long: `Show one setting or all resolved settings for the selected scope.
 
 The output includes where each value came from. This command does not change
@@ -61,8 +61,8 @@ func newConfigSetCmd() *cobra.Command {
 		Use: "set KEY VALUE", Short: "Save one setting", Args: cobra.ExactArgs(2),
 		Long: `Save one setting for a repository, profile, or global defaults.
 
-ACD validates the name and value before saving. The output says whether the
-change is active now or requires the background worker to restart.`,
+ACD validates the name and value before saving a draft. The next-step command
+opens the matching scope for review and activation.`,
 		Example: `  acd config set commit.strategy intent
   acd config set commit.preset balanced
   acd config set commit.strategy event --scope global`,
@@ -218,7 +218,12 @@ func runConfigSet(ctx context.Context, out io.Writer, repo string, options confi
 	if err != nil {
 		return fmt.Errorf("acd config set: %w", err)
 	}
-	next := "Run `acd config edit` to test and activate this saved draft."
+	next := "Run `acd config --scope global` to review and apply this saved setting."
+	if target.Scope == "repo" {
+		next = fmt.Sprintf("Run `acd config --repo %s` to review and apply this saved setting.", productListShellQuote(target.Repo))
+	} else if target.Scope == "profile" {
+		next = "Run `acd config --repo PATH` for each repository using this profile to review and apply it."
+	}
 	if definition.Boundary == config.ApplyRestart {
 		next = "Run `acd off`, then `acd on`, to activate this restart-required setting."
 	}
@@ -253,8 +258,13 @@ func runConfigReset(ctx context.Context, out io.Writer, repo string, options con
 	if targetName == "" {
 		targetName = target.Scope
 	}
-	return renderConfigMutation(out, target, jsonOut, "config_reset", targetName,
-		"Run `acd config edit` to review and activate the resolved settings.")
+	next := "Run `acd config --scope global` to review and apply the inherited settings."
+	if target.Scope == "repo" {
+		next = fmt.Sprintf("Run `acd config --repo %s` to review and apply the inherited settings.", productListShellQuote(target.Repo))
+	} else if target.Scope == "profile" {
+		next = "Run `acd config --repo PATH` for each repository using this profile to review and apply it."
+	}
+	return renderConfigMutation(out, target, jsonOut, "config_reset", targetName, next)
 }
 
 func configInput(target resolvedConfigTarget) (config.ResolveInput, config.Overrides) {

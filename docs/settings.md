@@ -1,10 +1,49 @@
 # Settings
 
+## Edit settings
+
+Run `acd config` to open the settings editor. It starts at **Global defaults**.
+Inside a Git worktree, choose **Editing** to switch to **This repository**.
+The selected scope stays visible while you edit.
+
+~~~bash
+acd config
+acd config --scope global
+acd config --repo .
+acd config edit
+acd config --accessible
+~~~
+
+Select a field to change it. Model and endpoint remain editable after setup.
+The API key field accepts masked input and keeps the key in memory until Save
+passes its connection test. Keys use the protected store shared by repositories.
+If `ACD_AI_API_KEY` supplies the key, unset that variable before replacing the
+stored key through the editor.
+
+**Save changes** shows the changed values, affected repositories, and required
+permissions. After approval, ACD tests the connection, saves only edited fields,
+and queues runtime changes for the next safe boundary. A failed test keeps the
+editor open with your edits and leaves saved settings and credentials unchanged.
+If settings change in another terminal during review, reopen the editor to
+review those values before saving.
+
+Repository fields show where their value comes from. Select **Use inherited
+value** to remove one override. Other repository settings stay as they were.
+Advanced settings include verification commands, capture limits, and retention.
+Changing the commit mode preserves explicit advanced customizations.
+
+Global saves update enabled repositories that inherit the changed values.
+The review lists repositories that keep their own overrides. Stopped workers
+stay stopped. Completion distinguishes queued activation, restart-required
+fields, and settings that were saved but could not yet be applied. A repository
+with another activation pending must finish it before a new save.
+
 ## Scope and precedence
 
-Inside a Git worktree, configuration defaults to repository scope. Outside a
-worktree it defaults to global scope. Use `--scope repo|profile|global` to be
-explicit.
+For `config get`, `set`, and `reset`, the default is repository scope inside a
+Git worktree and global scope outside one. Use `--scope repo|profile|global` to
+choose explicitly. The interactive editor always starts at global scope unless
+`--repo` or `--scope repo` is supplied.
 
 Resolution order is:
 
@@ -29,7 +68,6 @@ acd config get
 acd config get commit.preset
 acd config set commit.preset fast
 acd config set --scope global ai.provider deterministic
-acd config edit
 acd config reset
 acd config credentials
 ~~~
@@ -71,9 +109,10 @@ setting again:
 acd config edit --repo . --inherit
 ~~~
 
-Ordinary configuration shows the effective provider, strategy, verification,
-and their sources before editing. `acd config get` shows every field and source.
-Opening configuration preserves a saved local provider choice.
+`acd config get` shows saved values and their sources. `config set` and
+`config reset` save authoring changes; their next-step message names the editor
+and matching scope for review and activation. `acd status --verbose` shows the
+provider and model the worker is currently using.
 
 An explicit change from AI to local mode may preserve the active unpublished
 target in recovery and recapture it under the new verified configuration. The
@@ -105,9 +144,12 @@ files never contain the token.
 
 ## Runtime application
 
-Hot fields apply between safe worker passes. Restart-required fields apply
-when the supervisor next starts that repository worker. Changing a global
-value does not start stopped repositories or fan out an implicit restart.
+Hot fields apply between safe worker passes after the editor queues them.
+Restart-required fields apply when the supervisor next starts that worker.
+Saving global settings does not start stopped repositories or restart workers.
+For an activation failure after saving, reopen `acd config --repo PATH` and save
+the reviewed settings again. Existing active settings remain in use until the
+new revision is applied.
 
 ## Repository consent
 

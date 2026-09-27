@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestRootHelpExposesExactlyTenProductCommands(t *testing.T) {
+func TestRootHelpExposesSettingsAndProductCommands(t *testing.T) {
 	root := newRootCmd()
 	var out, errOut bytes.Buffer
 	root.SetOut(&out)
@@ -20,7 +20,7 @@ func TestRootHelpExposesExactlyTenProductCommands(t *testing.T) {
 		t.Fatalf("stderr=%q", errOut.String())
 	}
 	got := out.String()
-	for _, command := range []string{"setup", "status", "on", "off", "list", "commit-all", "history", "restore", "doctor", "uninstall"} {
+	for _, command := range []string{"setup", "config", "status", "on", "off", "list", "commit-all", "history", "restore", "doctor", "uninstall"} {
 		if !strings.Contains(got, "  "+command) {
 			t.Fatalf("help missing %s:\n%s", command, got)
 		}
@@ -36,8 +36,8 @@ func TestRootHelpExposesExactlyTenProductCommands(t *testing.T) {
 			visible++
 		}
 	}
-	if visible != 10 {
-		t.Fatalf("visible root commands=%d want=10", visible)
+	if visible != 11 {
+		t.Fatalf("visible root commands=%d want=11", visible)
 	}
 }
 

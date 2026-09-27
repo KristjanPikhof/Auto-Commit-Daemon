@@ -475,15 +475,11 @@ func runCheckpointHistory(ctx context.Context, out io.Writer, repo string, jsonO
 }
 
 func newConfigNamespaceCmd() *cobra.Command {
-	cmd := &cobra.Command{Use: "config", Short: "View or change ACD settings", Hidden: true,
-		Long: `View resolved settings, change one value, open guided setup, reset
-saved values, or manage the optional AI provider credential.`,
-		Example: `  acd config get
-  acd config edit
-  acd config credentials status`}
-	edit := newConfigureCmd()
-	edit.Use = "edit"
-	edit.Example = strings.ReplaceAll(edit.Example, "acd configure", "acd config edit")
+	cmd := newConfigEditorCmd()
+	cmd.Use = "config"
+	cmd.Short = "Edit global or repository settings"
+	withInvocationCapabilities(cmd, commandCapabilities{Repository: true, Quiet: true, Interactive: true})
+	edit := newConfigEditorCmd()
 	cmd.AddCommand(
 		withInvocationCapabilities(newConfigGetCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newConfigSetCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),

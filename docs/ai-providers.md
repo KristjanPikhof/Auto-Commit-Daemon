@@ -10,12 +10,14 @@ credentials, network requests, or source sharing. Upgrades preserve saved choice
 | `openai-compat` | Protected credential store or environment | Only with explicit diff-egress approval and provider declaration |
 | `subprocess:<name>` | Provider-specific | Local process receives only its approved input contract |
 
-Configure through the advanced namespace:
+Open `acd config`, choose global or repository scope, and edit the provider,
+model, endpoint, or API key. Save reviews the permissions and tests the connection
+before storing a replacement key. A global save also queues inherited changes
+for enabled repositories. The standalone credential command remains available:
 
 ~~~bash
-acd config set ai.provider deterministic
-acd config credentials
-acd config edit
+acd config
+acd config credentials set
 ~~~
 
 `acd config credentials set` stores the key securely and tests it with synthetic

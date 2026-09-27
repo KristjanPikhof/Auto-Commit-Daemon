@@ -261,14 +261,16 @@ See [AI providers](docs/ai-providers.md) for the provider and privacy contract.
 ## Configuration
 
 ~~~bash
-acd config get
-acd config edit
-acd config credentials
+acd config                 # Edit global defaults; switch scope in the menu
+acd config --repo .        # Edit this repository
+acd config get             # Inspect saved values and their sources
 ~~~
 
-Repository settings override profile and global defaults. Use the interactive
-editor for advanced Intent, provider, verification, repair, and retention
-settings.
+Select the model, endpoint, or API key to change it, then choose **Save changes**.
+ACD reviews, tests, saves, and queues the settings in one flow. Repository fields
+can inherit global defaults or override individual values. API keys are masked
+and stored securely after testing. Advanced settings cover verification,
+capture, repair, and retention.
 
 See [settings](docs/settings.md) and the generated [configuration
 reference](docs/configuration-reference.md).
