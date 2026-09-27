@@ -259,7 +259,7 @@ func (b RuntimeBundleBuilder) BuildRevision(ctx context.Context, revision state.
 	}
 	fingerprint := IntentPlannerProviderFingerprint(identity)
 	var health *IntentPlannerHealth
-	if planner != nil {
+	if planner != nil || providerName != (ai.DeterministicProvider{}).Name() {
 		if previous != nil && previous.IntentHealth != nil && previous.HealthFingerprint == fingerprint {
 			health = previous.IntentHealth
 		} else {

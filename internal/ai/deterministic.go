@@ -1,10 +1,6 @@
 // deterministic.go — rule-based commit message generator.
 //
-// Output contract is **byte-identical** to the daemon's Phase-1
-// DeterministicMessage helper (internal/daemon/message.go) so the replay
-// path can swap providers without changing commit content. The
-// daemon-package implementation will become a thin wrapper over this
-// provider once Phase 5 wires through.
+// The daemon adapter delegates to this provider for explicit local mode.
 //
 // Subject formats:
 //

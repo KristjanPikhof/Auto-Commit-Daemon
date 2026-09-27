@@ -207,6 +207,7 @@ func TestStatusAndListKeepPausedDrainTargetFromDurablePair(t *testing.T) {
 	if err := runControlStatus(ctx, &out, repo, false); ExitCode(err) != ExitActionRequired {
 		t.Fatalf("paused status exit=%d err=%v\n%s", ExitCode(err), err, out.String())
 	}
+	renderProductPublicationProgress(&out, report.PublicationProgress)
 	for _, want := range []string{
 		"Active target: earlier commit-all request, 1 of 1 left",
 		"Publication phase: paused by the user",
@@ -511,8 +512,6 @@ UPDATE capture_events SET published_ts=? WHERE seq=?`,
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"State: needs_action",
-		"Action needed: yes",
 		"Status: " + intentRecoveryVerificationAttentionSummary,
 		"Next: " + intentRecoveryVerificationAttentionNext,
 	} {

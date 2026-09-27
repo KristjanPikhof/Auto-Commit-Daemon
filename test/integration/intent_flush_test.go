@@ -28,6 +28,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -202,32 +203,17 @@ func TestFlush_LogicalWaitsForUnavailableSemanticProvider(t *testing.T) {
 			flushRes.ExitCode, flushRes.Stdout, flushRes.Stderr)
 	}
 
-	messageDeadline := time.Now().Add(5 * time.Second)
-	progressState := ""
-	for time.Now().Before(messageDeadline) {
-		progressState = readDaemonStateScalar(repo, `
-SELECT COALESCE(progress_state, '')
-FROM intent_plan_runs
-ORDER BY updated_ts DESC
-LIMIT 1`)
-		if progressState == "waiting_message_rewrite" {
-			break
+	waitFor(t, "persisted provider wait", 10*time.Second, func() bool {
+		raw := readDaemonStateScalar(repo, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
+		var health struct {
+			State   string  `json:"state"`
+			Failure string  `json:"last_failure_class"`
+			Opened  float64 `json:"opened_ts"`
+			Retry   float64 `json:"next_probe_ts"`
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if progressState != "waiting_message_rewrite" {
-		t.Fatalf("Intent progress_state=%q want waiting_message_rewrite; HEAD=%s; events=%s; runtime=%s",
-			progressState,
-			strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")),
-			readDaemonStateScalar(repo, `
-SELECT group_concat(seq || ':' || state || ':' || COALESCE(commit_oid, ''), ',')
-FROM capture_events`),
-			readDaemonStateScalar(repo, `
-SELECT group_concat(key || '=' || value, ',')
-FROM daemon_meta
-WHERE key IN ('runtime.active_revision_id', 'ai.provider', 'commit.strategy',
-	              'intent.v2.migration_state', 'intent.v2.needs_attention')`))
-	}
+		return json.Unmarshal([]byte(raw), &health) == nil && health.State == "open" &&
+			health.Failure == "transport" && health.Retry > health.Opened
+	})
 	if headAfter := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
 		t.Fatalf("unavailable semantic provider advanced HEAD: %s -> %s",
 			headBefore, headAfter)

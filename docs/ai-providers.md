@@ -1,7 +1,8 @@
 # AI providers
 
-AI is optional. Fresh setup uses the deterministic provider and requires no
-credential, network request, or source egress.
+Fresh interactive setup recommends AI semantic commits. You choose the provider
+and approve its access. The explicit deterministic option works without
+credentials, network requests, or source sharing. Upgrades preserve saved choices.
 
 | Provider | Credential | Source diff |
 |---|---|---|
@@ -69,7 +70,9 @@ Only connection, timeout, protocol transport, and unavailable-service failures
 open the provider circuit. It uses 30-second, 2-minute, then 10-minute
 cooldowns and permits one half-open probe. A rejected semantic plan does not
 change transport health. Cancellation releases a probe without changing
-provider health.
+provider health. The ten-minute interval continues through extended outages
+and worker restarts; transport failures do not spend semantic correction
+attempts or become terminal merely because the outage lasts longer.
 
 Rejected plans are written to the exact worktree Git directory at
 `<gitDir>/acd/planner-rejects.jsonl`. Linked worktrees therefore keep separate

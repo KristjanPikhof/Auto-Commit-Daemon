@@ -28,8 +28,9 @@ func RecoverUnavailableSemanticMessagePublicationDrain(
 	now time.Time,
 ) (*state.PublicationDrain, RecoveryChainResult, error) {
 	var result RecoveryChainResult
-	if drain.Phase != state.PublicationDrainNeedsAction ||
-		drain.LastError != PublicationDrainSemanticMessageUnavailableReason {
+	if drain.Phase == state.PublicationDrainCompleted ||
+		(drain.Phase == state.PublicationDrainNeedsAction &&
+			drain.LastError != PublicationDrainSemanticMessageUnavailableReason) {
 		return nil, result, nil
 	}
 	ready, err := publicationDrainHasAppliedAlternativeRuntime(ctx, db, drain)
@@ -47,7 +48,7 @@ func RecoverUnavailableSemanticMessagePublicationDrain(
 			BranchRef:        drain.BranchRef,
 			BranchGeneration: drain.BranchGeneration,
 			FirstSeq:         firstSeq,
-			Trigger:          PublicationDrainSemanticMessageUnavailableReason,
+			Trigger:          "publication_drain_provider_changed",
 			Trace:            trace,
 			EvidenceLimit:    state.CompletedBranchTransitionProofLimit,
 			ArchiveOnly:      true,

@@ -301,27 +301,23 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	writeFile(t, filepath.Join(repo, "singleton-one.txt"), "one\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
 	waitForEventState(t, dbPath, "singleton-one.txt", "pending", 10*time.Second)
-	waitFor(t, "semantic message wait after transport failure", 10*time.Second, func() bool {
-		return sqliteScalar(t, dbPath, `
-SELECT COALESCE(progress_state, '')
-FROM intent_plan_runs
-ORDER BY updated_ts DESC
-LIMIT 1`) == "waiting_message_rewrite"
-	})
 	waitFor(t, "planner circuit opens", 10*time.Second, func() bool {
 		raw := sqliteScalar(t, dbPath,
 			"SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
 		var health struct {
-			State string `json:"state"`
+			State   string  `json:"state"`
+			Failure string  `json:"last_failure_class"`
+			Opened  float64 `json:"opened_ts"`
+			Retry   float64 `json:"next_probe_ts"`
 		}
 		return json.Unmarshal([]byte(raw), &health) == nil &&
-			health.State == "open"
+			health.State == "open" && health.Failure == "transport" && health.Retry > health.Opened
 	})
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after first capture=%d want 1", got)
 	}
-	if got := rewriteHits.Load(); got < 1 {
-		t.Fatalf("message rewrite hits=%d want at least 1", got)
+	if got := rewriteHits.Load(); got != 0 {
+		t.Fatalf("message rewrite hits=%d want none during planner outage", got)
 	}
 	if headAfter := strings.TrimSpace(runGitOK(
 		t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
@@ -335,9 +331,6 @@ LIMIT 1`) == "waiting_message_rewrite"
 
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after cooldown bypass=%d want 1", got)
-	}
-	if got := sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM decision_records WHERE kind='intent_planner_error'"); got != "1" {
-		t.Fatalf("planner error evidence=%s want durable outage record", got)
 	}
 	waitFor(t, "persisted planner circuit bypass", 10*time.Second, func() bool {
 		raw := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")

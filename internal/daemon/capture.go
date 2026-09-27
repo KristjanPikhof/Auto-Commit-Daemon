@@ -100,14 +100,18 @@ const MetaKeyCaptureBackpressurePausedAt = "capture.backpressure_paused_at"
 const MetaKeyCaptureEventsDroppedTotal = "capture.events_dropped_total"
 
 const (
-	MetaKeyProtectionObservationEpoch    = "protection.observation_epoch"
-	MetaKeyProtectionCoveredEpoch        = "protection.covered_epoch"
-	MetaKeyProtectionCheckpointID        = "protection.checkpoint_id"
-	MetaKeyProtectionComplete            = "protection.complete"
-	MetaKeyProtectionRetentionOverBudget = "protection.retention_over_budget"
-	MetaKeyProtectionFullPollTS          = "protection.full_poll_ts"
-	MetaKeyProtectionWatcherQueueDepth   = "protection.watcher_queue_depth"
-	MetaKeyProtectionTreeDigest          = "protection.tree_digest"
+	MetaKeyProtectionObservationEpoch         = "protection.observation_epoch"
+	MetaKeyProtectionCoveredEpoch             = "protection.covered_epoch"
+	MetaKeyProtectionCheckpointID             = "protection.checkpoint_id"
+	MetaKeyProtectionComplete                 = "protection.complete"
+	MetaKeyProtectionRetentionOverBudget      = "protection.retention_over_budget"
+	MetaKeyProtectionFullPollTS               = "protection.full_poll_ts"
+	MetaKeyProtectionWatcherQueueDepth        = "protection.watcher_queue_depth"
+	MetaKeyProtectionTreeDigest               = "protection.tree_digest"
+	MetaKeyProtectionClassificationPending    = "protection.classification_pending"
+	MetaKeyProtectionClassificationCheckpoint = "protection.classification_checkpoint_id"
+	MetaKeyProtectionClassificationEpoch      = "protection.classification_epoch"
+	metaProtectionClassifiedDigest            = "protection.classified_tree_digest"
 )
 
 func requiredProtectionCheckpointEpochKey(worktreeID string) string {
@@ -809,6 +813,17 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			summary.PendingDepth = pending
 			updatePendingHighWater(ctx, db, pending)
 		}
+		if len(ownedOps) == len(ops) {
+			_, digest := checkpointEntries(live)
+			if err := state.MetaSetMany(ctx, db, map[string]string{
+				metaProtectionClassifiedDigest:            digest,
+				MetaKeyProtectionClassificationPending:    "false",
+				MetaKeyProtectionClassificationCheckpoint: summary.CheckpointID,
+				MetaKeyProtectionClassificationEpoch:      strconv.FormatInt(opts.ObservationEpoch, 10),
+			}); err != nil {
+				return summary, err
+			}
+		}
 		ops = nil
 	}
 
@@ -1199,6 +1214,21 @@ func requiredProtectionCheckpointEpoch(
 }
 
 func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID, liveDigest string) error {
+	classified, _, err := state.MetaGet(ctx, db, metaProtectionClassifiedDigest)
+	if err != nil {
+		return err
+	}
+	// A protected tree is not evidence that its newest edits have entered the
+	// publication queue. Persist that distinction before reporting coverage.
+	if classified != liveDigest {
+		if err := state.MetaSetMany(ctx, db, map[string]string{
+			MetaKeyProtectionClassificationPending:    "true",
+			MetaKeyProtectionClassificationCheckpoint: checkpointID,
+			MetaKeyProtectionClassificationEpoch:      strconv.FormatInt(epoch, 10),
+		}); err != nil {
+			return err
+		}
+	}
 	values := []struct {
 		key   string
 		value string

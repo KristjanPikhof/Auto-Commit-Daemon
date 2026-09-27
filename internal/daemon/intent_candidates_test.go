@@ -4447,3 +4447,59 @@ func intentCandidateCaptureFixture(
 	}
 	return IntentCandidateCapture{Event: event, Ops: []state.CaptureOp{captureOp}}
 }
+
+func TestIntentProviderOutageSurvivesRestartsWithoutConsumingAttempts(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := appendIntentCandidateCapture(t, db, "feature.go", "create", "", "feature")
+	planner := &intentCandidatePlannerStub{err: errors.New("temporary provider outage")}
+	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+	identity := IntentPlannerProviderIdentity{Provider: planner.Name()}
+	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced, VerificationMode: "structural",
+		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil }}
+	for attempt := 0; attempt < 8; attempt++ {
+		input.Health = NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: identity, Now: func() time.Time { return now }})
+		result, err := EvaluateIntentCandidates(ctx, db, input)
+		if err != nil || result.Fallback != "waiting_for_ai" || result.PlanAttempt != 0 || len(result.Decisions) != 0 || result.NeedsAttention {
+			t.Fatalf("outage attempt %d result=%+v err=%v", attempt, result, err)
+		}
+		opened := input.Health.Snapshot()
+		delay := time.Unix(0, int64(opened.NextProbeTS*1e9)).Sub(now)
+		want := intentPlannerCircuitBackoffs[min(attempt, len(intentPlannerCircuitBackoffs)-1)]
+		if delay != want {
+			t.Fatalf("attempt %d backoff=%v want=%v", attempt, delay, want)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, err = state.Open(ctx, dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input.Health = NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: identity, Now: func() time.Time { return now }})
+		before := planner.calls
+		if _, err := EvaluateIntentCandidates(ctx, db, input); err != nil {
+			t.Fatal(err)
+		}
+		if planner.calls != before {
+			t.Fatal("restart bypassed durable cooldown")
+		}
+		now = now.Add(delay)
+	}
+	defer db.Close()
+	planner.err = nil
+	planner.plan = ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{{CandidateID: "feature", SelectedSeqs: []int64{capture.Event.Seq}, Readiness: ai.IntentCandidateReady, Purpose: "implement feature", Subject: "Implement feature behavior", Body: "- Keep the feature behavior consistent", GroupingReason: "implements one feature behavior"}}}
+	input.Health = NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: identity, Now: func() time.Time { return now }})
+	recovered, err := EvaluateIntentCandidates(ctx, db, input)
+	if err != nil || len(recovered.Decisions) != 1 || !recovered.Decisions[0].Publishable || recovered.PlanAttempt != 1 || recovered.Decisions[0].Assignment.Subject != "Implement feature behavior" {
+		t.Fatalf("recovered=%+v err=%v", recovered, err)
+	}
+	if input.Health.Snapshot().State != IntentPlannerCircuitClosed {
+		t.Fatal("successful AI response did not close circuit")
+	}
+}

@@ -1347,7 +1347,7 @@ func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	for _, required := range []string{"macOS", "Full Disk Access is not required", "without credentials or network access", "API key"} {
+	for _, required := range []string{"macOS", "Full Disk Access is not required", "without credentials or network access", "AI semantic"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("setup help missing %q:\n%s", required, got)
 		}

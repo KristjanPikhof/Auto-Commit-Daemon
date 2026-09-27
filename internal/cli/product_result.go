@@ -171,6 +171,9 @@ func publicationOutcomeLabel(outcome publicationOutcome, progress publicationPro
 	if outcome.BranchCommitted == nil {
 		return "unknown"
 	}
+	if outcome.PendingClassification && outcome.WaitingChanges == 0 {
+		return "saved changes waiting for grouping"
+	}
 	if outcome.WaitingChanges > 0 {
 		if outcome.ReasonCode == "provider_wait" {
 			label := fmt.Sprintf("%d changes waiting for AI", outcome.WaitingChanges)

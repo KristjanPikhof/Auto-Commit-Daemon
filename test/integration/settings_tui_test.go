@@ -167,7 +167,7 @@ func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
 		"Verification: full",
 		"repository command will run in an ephemeral worktree: make test",
 		"eligible recent ACD-owned commits may be repaired automatically",
-		"Approve every permission shown above",
+		"Approve these permissions, save, and enable ACD?",
 	} {
 		if !strings.Contains(final, want) {
 			t.Errorf("final approval missing %q\n%s", want, final)

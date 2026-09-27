@@ -40,17 +40,21 @@ silently ignoring it.
 
 ## Defaults
 
-Fresh setup persists:
+Fresh setup recommends these settings after provider and privacy approval:
 
 ~~~text
-ai.provider = deterministic
+ai.provider = openai-compat
 commit.strategy = intent
 commit.preset = balanced
 commit.format = imperative
 intent.verification = structural
 intent.repair.enabled = true
-ai.diff_egress = false
+ai.diff_egress = true
 ~~~
+
+Choosing Local automatic commits instead saves `ai.provider = deterministic`
+and `ai.diff_egress = false`, without credentials or network access. A fresh
+noninteractive setup must specify the provider even in its dry-run preview.
 
 These are global user defaults. The current repository and future repositories
 inherit them without repository-specific overrides. Repair is limited to
@@ -66,6 +70,15 @@ setting again:
 ~~~bash
 acd config edit --repo . --inherit
 ~~~
+
+Ordinary configuration shows the effective provider, strategy, verification,
+and their sources before editing. `acd config get` shows every field and source.
+Opening configuration preserves a saved local provider choice.
+
+An explicit change from AI to local mode may preserve the active unpublished
+target in recovery and recapture it under the new verified configuration. The
+preview explains this effect; an ambiguous target remains protected and needs
+attention. ACD returns to AI only when you select it again.
 
 The preview states whether it will save a repository override, update global
 defaults, or remove an override. Local rules need no AI or network access, but

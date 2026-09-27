@@ -124,7 +124,7 @@ done
 	}
 }
 
-func TestSubprocess_WrongConventionalFormatFallsBack(t *testing.T) {
+func TestSubprocess_WrongConventionalFormatWaits(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
 	bin := writePluginScript(t, dir, "test", `
@@ -142,14 +142,8 @@ done
 
 	prov := Compose(p, DeterministicProvider{CommitFormat: CommitFormatConventional})
 	got, err := prov.Generate(context.Background(), CommitContext{Path: "internal/ai/plugin_subprocess.go", Op: "modify"})
-	if err != nil {
-		t.Fatalf("Generate: %v", err)
-	}
-	if got.Source != "deterministic" {
-		t.Fatalf("Source=%q want deterministic", got.Source)
-	}
-	if got.Subject != "chore: update plugin_subprocess.go" {
-		t.Fatalf("Subject=%q", got.Subject)
+	if err == nil || got.Subject != "" || got.Source == "deterministic" {
+		t.Fatalf("invalid AI message must wait: %+v err=%v", got, err)
 	}
 }
 
@@ -588,8 +582,7 @@ done
 		t.Errorf("subject: got %q want OK", r.Subject)
 	}
 
-	// Compose-with-deterministic should fall back cleanly on the soft
-	// error rather than surfacing it.
+	// The selected subprocess error remains visible to the worker retry policy.
 	det := DeterministicProvider{}
 	composed := Compose(NewSubprocessProvider("test", SubprocessOptions{
 		LookPath: fixedLookPath("acd-provider-test", bin),
@@ -597,24 +590,11 @@ done
 		Stderr:   io.Discard,
 	}), det)
 	r, err = composed.Generate(context.Background(), CommitContext{Path: "z.go", Op: "modify"})
-	if err != nil {
-		t.Fatalf("composed Generate: %v", err)
-	}
-	// First call to the new provider hits the soft error; Compose then
-	// calls deterministic which yields "Update z.go".
-	if r.Subject != "Update z.go" {
-		t.Errorf("composed fallback subject: got %q want %q", r.Subject, "Update z.go")
-	}
-	if r.Source != "deterministic" {
-		t.Errorf("composed fallback source: got %q want deterministic", r.Source)
+	if err == nil || r.Subject != "" || r.Source == "deterministic" {
+		t.Fatalf("unavailable subprocess must wait: %+v err=%v", r, err)
 	}
 }
 
-// TestSubprocess_Timeout makes the plugin sleep longer than the timeout.
-// The runner must kill the plugin on timeout and respawn on the next
-// Generate. We point the same provider at a different script before the
-// second invocation so the killed shell cannot race an in-place rewrite of
-// its executable.
 func TestSubprocess_Timeout(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
@@ -776,19 +756,11 @@ func TestSubprocess_MissingBinary(t *testing.T) {
 
 	composed := Compose(p, DeterministicProvider{})
 	r, err := composed.Generate(context.Background(), CommitContext{Path: "x.go", Op: "modify"})
-	if err != nil {
-		t.Fatalf("composed Generate: %v", err)
-	}
-	if r.Subject != "Update x.go" {
-		t.Errorf("fallback subject: got %q", r.Subject)
-	}
-	if r.Source != "deterministic" {
-		t.Errorf("fallback source: got %q", r.Source)
+	if err == nil || r.Subject != "" || r.Source == "deterministic" {
+		t.Fatalf("unavailable subprocess must wait: %+v err=%v", r, err)
 	}
 }
 
-// TestSubprocess_CloseCleanup verifies Close terminates the plugin
-// promptly and subsequent Generate calls error.
 func TestSubprocess_CloseCleanup(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
