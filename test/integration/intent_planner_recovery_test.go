@@ -125,7 +125,7 @@ func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T)
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	extra = activateIntentV2Runtime(t, repo, extra...)
@@ -289,7 +289,7 @@ func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	extra = activateIntentV2Runtime(t, repo, extra...)
@@ -395,7 +395,7 @@ func writeNativeIntentCandidatesResponse(
 	resp := map[string]any{
 		"id":     "chatcmpl-singleton",
 		"object": "chat.completion",
-		"model":  "gpt-5.4-mini",
+		"model":  "gpt-6-luna",
 		"choices": []map[string]any{{
 			"index": 0,
 			"message": map[string]any{

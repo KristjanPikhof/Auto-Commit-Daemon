@@ -64,7 +64,7 @@ func TestIntentStrategy_RejectsDisconnectedNativeGroup(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	extra = activateIntentV2Runtime(t, repo, extra...)
@@ -167,7 +167,7 @@ func TestIntentStrategy_RapidFiveCapturesOfferedThenSeparated(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	extra = activateIntentV2Runtime(t, repo, extra...)
@@ -337,7 +337,7 @@ func writeIntentMessageRewriteResponse(t *testing.T, w http.ResponseWriter, req 
 	body, err := json.Marshal(map[string]any{
 		"id":     "chatcmpl-intent-message-rewrite",
 		"object": "chat.completion",
-		"model":  "gpt-5.4-mini",
+		"model":  "gpt-6-luna",
 		"choices": []map[string]any{{
 			"index": 0,
 			"message": map[string]any{

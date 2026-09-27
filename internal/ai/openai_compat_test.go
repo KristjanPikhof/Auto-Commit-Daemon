@@ -1159,3 +1159,22 @@ func int64sToStrings(in []int64) []string {
 	}
 	return out
 }
+
+func TestOpenAI_DefaultModelRequest(t *testing.T) {
+	p, last, _ := newOpenAIMock(t, func(req capturedReq) (int, string) {
+		return 200, cannedToolCall("Update token expiry", "- Extend session duration")
+	})
+	p.Model = ""
+	if _, err := p.Generate(context.Background(), CommitContext{Op: "modify", Path: "auth.go"}); err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(last.rawBody, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Model != "gpt-6-luna" {
+		t.Fatalf("request model = %q", request.Model)
+	}
+}

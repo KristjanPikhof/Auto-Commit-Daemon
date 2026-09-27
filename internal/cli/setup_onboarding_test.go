@@ -90,6 +90,7 @@ func TestSetupDryRunRecommendsEverydayAIWithoutCredentials(t *testing.T) {
 		values[config.FieldCommitPreset] != "balanced" ||
 		values[config.FieldCommitFormat] != "imperative" ||
 		values[config.FieldProvider] != "openai-compat" ||
+		values[config.FieldModel] != "gpt-6-luna" ||
 		values[config.FieldDiffEgress] != "true" ||
 		values[config.FieldIntentRepairEnabled] != "true" {
 		t.Fatalf("fresh values = %+v", values)

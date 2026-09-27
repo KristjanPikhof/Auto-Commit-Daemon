@@ -616,7 +616,7 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 		SavedGeneration: 7,
 		Fields: []settings.FieldSnapshot{
 			{Name: config.FieldProvider, DraftValue: "deterministic"},
-			{Name: config.FieldModel, DraftValue: "gpt-5.4-mini"},
+			{Name: config.FieldModel, DraftValue: "gpt-6-luna"},
 			{Name: config.FieldBaseURL, DraftValue: ai.DefaultOpenAIBaseURL},
 			{Name: config.FieldTimeout, DraftValue: "30s"},
 			{Name: config.FieldCommitFormat, DraftValue: "imperative"},
@@ -637,7 +637,7 @@ func TestConfigureApplyOrderCreatesOneRevisionAndOnlyReportsHarness(t *testing.T
 		order = append(order, "wizard")
 		return settingsui.ConfigureSelection{
 			Strategy: "intent", Preset: "quality", CommitFormat: "imperative",
-			Provider: "openai-compat", Model: "gpt-5.4-mini",
+			Provider: "openai-compat", Model: "gpt-6-luna",
 			BaseURL: ai.DefaultOpenAIBaseURL, ProviderTimeout: "30s",
 			Credential: "staged-secret", DiffContextApproved: true,
 			VerificationMode: "full", VerificationCommand: "make test",

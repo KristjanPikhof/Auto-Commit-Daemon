@@ -312,7 +312,7 @@ func TestResolvePrecedenceAndShadowedEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.Value != "gpt-5.4-mini" || resolved.Source != SourceDefault {
+	if resolved.Value != "gpt-6-luna" || resolved.Source != SourceDefault {
 		t.Fatalf("resolved default = %#v", resolved)
 	}
 }

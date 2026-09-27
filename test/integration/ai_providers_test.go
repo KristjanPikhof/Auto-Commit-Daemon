@@ -174,7 +174,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 	const cannedResp = `{
   "id": "chatcmpl-test",
   "object": "chat.completion",
-  "model": "gpt-5.4-mini",
+  "model": "gpt-6-luna",
   "choices": [{
     "index": 0,
     "message": {
@@ -212,7 +212,7 @@ func TestAI_OpenAICompatMockSuccess(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	startSession(t, ctx, env, repo, "ai-mock", "shell", extra...)
@@ -256,7 +256,7 @@ func TestAI_OpenAICompat5xxWaitsForAI(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	p := startSessionJSON(t, ctx, env, repo, "ai-5xx", "shell", extra...)
@@ -290,7 +290,7 @@ func TestAI_OpenAICompatConventionalWrongFormatWaitsForAI(t *testing.T) {
 	const cannedResp = `{
   "id": "chatcmpl-format",
   "object": "chat.completion",
-  "model": "gpt-5.4-mini",
+  "model": "gpt-6-luna",
   "choices": [{
     "index": 0,
     "message": {
@@ -324,7 +324,7 @@ func TestAI_OpenAICompatConventionalWrongFormatWaitsForAI(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		"ACD_COMMIT_FORMAT=conventional",
 		trustEnv,
 	}
@@ -372,7 +372,7 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 	const cannedResp = `{
   "id": "chatcmpl-diff",
   "object": "chat.completion",
-  "model": "gpt-5.4-mini",
+  "model": "gpt-6-luna",
   "choices": [{
     "index": 0,
     "message": {
@@ -415,7 +415,7 @@ func TestAI_OpenAICompatReceivesCapturedDiff(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		"ACD_AI_DIFF_EGRESS=1",
 		trustEnv,
 	}

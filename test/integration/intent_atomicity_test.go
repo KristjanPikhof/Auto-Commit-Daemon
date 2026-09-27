@@ -95,7 +95,7 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	extra = activateIntentV2Runtime(t, repo, extra...)
@@ -246,7 +246,7 @@ func TestIntentAtomicity_HonorsDeferredMiddleBoundary(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	extra = activateIntentV2Runtime(t, repo, extra...)
@@ -408,7 +408,7 @@ func TestIntentAtomicity_PartitionWindowSplitsIndependentIntents(t *testing.T) {
 		"ACD_AI_PROVIDER=openai-compat",
 		"ACD_AI_BASE_URL=" + server.URL,
 		"ACD_AI_API_KEY=test-key",
-		"ACD_AI_MODEL=gpt-5.4-mini",
+		"ACD_AI_MODEL=gpt-6-luna",
 		trustEnv,
 	}
 	extra = activateIntentV2Runtime(t, repo, extra...)

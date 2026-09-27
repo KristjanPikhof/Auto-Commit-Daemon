@@ -4,6 +4,9 @@
 
 ### Changed
 
+- The default OpenAI-compatible model is `gpt-6-luna` across setup, settings,
+  and provider requests. Explicitly configured models keep their saved values.
+
 - `acd config` and `acd config edit` open an editable settings menu with visible
   global/repository scope, masked API-key entry, and one reviewed Save action.
   Global saves queue inherited changes for enabled repositories. Editing one
