@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-09-27
+
 ### Changed
 
 - Intent planner guidance favors complete, purposeful steps: separate useful
