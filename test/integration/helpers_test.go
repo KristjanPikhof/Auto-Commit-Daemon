@@ -677,6 +677,9 @@ func activateIntentV2RuntimeWithPreset(t *testing.T, repo, presetName string, ex
 	}
 	provider := resolved[config.FieldProvider].EffectiveValue()
 	confirmations := []string{string(ai.ConfirmationDiffEgress)}
+	if presetName != "fast" {
+		confirmations = append(confirmations, string(ai.ConfirmationIntentRepair))
+	}
 	if strings.HasPrefix(provider, "subprocess:") {
 		confirmations = append(confirmations,
 			string(ai.ConfirmationSubprocessExecution))
