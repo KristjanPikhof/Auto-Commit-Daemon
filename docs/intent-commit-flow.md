@@ -40,11 +40,23 @@ not depend on them.
 
 ## Commit purpose
 
-Intent planning follows the purposeful commit approach where each commit
+The planner identifies completed goals before assigning captures. Each commit
 should explain one useful step and leave a working state under the configured
-checks. A preparatory refactor can precede the feature it enables when the
-captured changes support two complete steps. Tests, imports, generated files,
-and documentation stay with the step they support.
+checks. Implementation, callers, imports, tests, generated files, and relevant
+documentation stay with the step they support. Different files, screens, or
+capture times do not justify separate commits.
+
+Each split needs a useful review or revert boundary. A preparatory refactor can
+precede the feature it enables when both are complete steps. Helpers must
+precede their callers or ship together. Documentation links belong with their
+targets, and available test updates belong with the changed behavior.
+Unpublished assertion corrections and other supporting edits stay with the
+change they finish.
+
+For example, a shortcut menu implementation, its tests, and a corrected
+assertion form one change. A settings-placement document and its index link
+form another. The same model-row presentation improvement across several
+screens can form one commit when the diffs show a shared purpose.
 
 A change with a broader effect, such as changing a shared default, can be a
 separate step when it is independently meaningful and safe. Its message should
@@ -54,8 +66,12 @@ motivation or claim tests ran when it has no such evidence.
 These rules guide grouping and messages; they do not impose a commit count.
 ACD cannot split a captured file change into invented intermediate versions.
 When a safe intermediate step is unavailable, it keeps the required changes
-together. Existing materialization, verification, and history-repair limits
-still apply.
+together. Missing dependencies must follow from evidence. Age and queue
+pressure never prove completeness. Checks apply to the proposed commit tree,
+not the final combined worktree. Structural checks do not prove that a project
+builds or its tests pass; that requires a configured verification command.
+Existing planning-window bounds, frozen targets, and history-repair limits
+still apply. Planner guidance does not authorize rewriting published history.
 
 ## Presets
 

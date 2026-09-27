@@ -7,6 +7,9 @@
 - Intent planner guidance favors complete, purposeful steps: separate useful
   preparatory refactors from features when safe, keep supporting tests and
   edits together, and explain broader behavior changes from available evidence.
+  Both planner versions identify goals before grouping files, require a reason
+  for each split, and keep available corrections with their unpublished change.
+  Examples cover caller/helper order, document links, and shared screen updates.
 
 - The default OpenAI-compatible model is `gpt-6-luna` across setup, settings,
   and provider requests. Explicitly configured models keep their saved values.

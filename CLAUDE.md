@@ -108,6 +108,17 @@ Hard dependencies, rename chains, create and delete order, and generated
 relationships must remain safe. Time and directory proximity cannot be the only
 reason for grouping unrelated work.
 
+Plan completed goals before assigning files to commits. Keep implementation,
+callers, tests, imports, generated output, and relevant documentation together
+when they complete one goal. Available unpublished corrections belong with the
+change they correct. Different files or screens do not justify a split.
+
+Each split needs a useful review or revert boundary and a valid intermediate
+state. Put prerequisites before consumers or in the same commit. Explain
+broader defaults and behavior changes from evidence. Age and queue pressure
+never waive completeness checks. Judge the proposed commit tree, not the final
+worktree. Existing publication targets and history-repair limits still apply.
+
 When a plan fails:
 
 1. Keep valid groups when possible.
