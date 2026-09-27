@@ -211,7 +211,7 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 				"candidate_id": "wide-shortcuts", "selected_seqs": seqs,
 				"purpose": "finish one shortcut change", "readiness": "wait",
 				"missing_companions": []string{"balanced fallback exceeds 12 paths"},
-				"grouping_reason": "the wide candidate is still waiting",
+				"grouping_reason":    "the wide candidate is still waiting",
 			}})
 		case 2:
 			if len(seqs) != 1 {
@@ -224,7 +224,7 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 				"candidate_id": "wide-shortcuts", "selected_seqs": seqs,
 				"purpose": "finish one shortcut change", "readiness": "wait",
 				"missing_companions": []string{"model-only companion"},
-				"grouping_reason": "the model incorrectly deferred forced work",
+				"grouping_reason":    "the model incorrectly deferred forced work",
 			}})
 		default:
 			http.Error(w, "unexpected planner call", http.StatusBadRequest)
@@ -320,10 +320,10 @@ func TestCommitAllIntentForcedRepairPublishesWideCandidateAfterRestart(t *testin
 	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
 	var payload struct {
 		Data struct {
-			Protected      bool `json:"protected"`
-			PendingEvents  int  `json:"pending_events"`
-			Outcome struct {
-				BranchChanges int `json:"branch_changes"`
+			Protected     bool `json:"protected"`
+			PendingEvents int  `json:"pending_events"`
+			Outcome       struct {
+				BranchChanges  int `json:"branch_changes"`
 				WaitingChanges int `json:"waiting_changes"`
 			} `json:"publication_outcome"`
 		} `json:"data"`
