@@ -377,17 +377,23 @@ func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup) 
 		projection, decodeErr := decodeProductData[state.PublicationDrainReadOnlyProjection](response.Data)
 		return projection, decodeErr == nil, decodeErr
 	}
+	return readProductPublicationDrainAfterWorkerFailure(ctx, lookup.Record.StateDB, err)
+}
+
+func readProductPublicationDrainAfterWorkerFailure(
+	ctx context.Context, dbPath string, workerErr error,
+) (state.PublicationDrainReadOnlyProjection, bool, error) {
 	// A runtime compatibility failure is not a worker disconnect. Do not let
 	// an older local projection make an incompatible command look successful.
-	if !productDrainReadOnlyFallbackAllowed(err) {
-		return state.PublicationDrainReadOnlyProjection{}, false, err
+	if !productDrainReadOnlyFallbackAllowed(workerErr) {
+		return state.PublicationDrainReadOnlyProjection{}, false, workerErr
 	}
-	if !fileExists(lookup.Record.StateDB) {
-		return state.PublicationDrainReadOnlyProjection{}, false, err
+	if !fileExists(dbPath) {
+		return state.PublicationDrainReadOnlyProjection{}, false, workerErr
 	}
-	projection, readErr := state.ReadPublicationDrainProjection(ctx, lookup.Record.StateDB)
+	projection, readErr := state.ReadPublicationDrainProjection(ctx, dbPath)
 	if readErr != nil {
-		return state.PublicationDrainReadOnlyProjection{}, false, errors.Join(err, readErr)
+		return state.PublicationDrainReadOnlyProjection{}, false, errors.Join(workerErr, readErr)
 	}
 	return projection, false, nil
 }
