@@ -12,6 +12,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
@@ -199,6 +200,67 @@ func TestCaptureHealthDiagnosePreservesIndependentAttention(t *testing.T) {
 		if envelope.State != productStateNeedsAction || envelope.Data.CaptureHealth.Error != report.CaptureHealth.Error {
 			t.Fatalf("diagnose lost required action or capture health: %s", output.String())
 		}
+	}
+}
+
+func TestCaptureHealthPausedProtectionThroughProductionReaders(t *testing.T) {
+	for _, manual := range []bool{false, true} {
+		t.Run(strconv.FormatBool(manual), func(t *testing.T) {
+			withIsolatedHome(t)
+			ctx := context.Background()
+			repo, dbPath, db := makeSeededRepoStateDB(t)
+			now := time.Now()
+			if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(now.Unix()), UpdatedTS: float64(now.Unix())}); err != nil {
+				t.Fatal(err)
+			}
+			health := state.CaptureHealth{State: "retrying", Error: "unstable file"}
+			if err := state.MetaSetJSON(ctx, db, "capture.health", health); err != nil {
+				t.Fatal(err)
+			}
+			if err := state.MetaSet(ctx, db, "last_capture_error", health.Error); err != nil {
+				t.Fatal(err)
+			}
+			wantPhase, wantOperational := "needs_action", "needs_attention"
+			if manual {
+				writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{Reason: "inspect changes", SetAt: now.UTC().Format(time.RFC3339), SetBy: "test"})
+				wantPhase, wantOperational = "paused", "paused"
+			} else if err := state.MetaSet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt, now.UTC().Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+			rec := central.RepoRecord{Path: repo, StateDB: dbPath, RepositoryID: "repository", WorktreeID: "worktree"}
+			status, err := buildStatusReport(ctx, rec, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			overview, err := readProductListRepo(ctx, rec, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, report := range []statusReport{status, overview.report} {
+				if report.PublicationProgress.Phase != wantPhase || report.OperationalState != wantOperational || report.CaptureHealth.State != "retrying" {
+					t.Fatalf("pause hidden: %+v", report)
+				}
+			}
+			entry := productListEntryFromOverview(rec, supervisor.WorkerStatus{}, overview, nil)
+			wantLabel := "blocked"
+			if manual {
+				wantLabel = "paused"
+			}
+			if entry.State != productStateNeedsAction || productListPhase(entry) != wantLabel {
+				t.Fatalf("list hides pause: %+v", entry)
+			}
+			diagnose, err := buildDiagnoseReport(ctx, rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			if err := renderProductDiagnoseReport(&output, diagnose); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output.String(), `"state": "needs_action"`) || !strings.Contains(output.String(), `"error": "unstable file"`) {
+				t.Fatalf("diagnose hides pause or capture health: %s", output.String())
+			}
+		})
 	}
 }
 

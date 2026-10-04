@@ -64,17 +64,18 @@ type PathRecentCommit struct {
 
 // OfferedCapture is one capture the planner may either select or defer.
 type OfferedCapture struct {
+	FileMetadata *IntentFileMetadata `json:"file_metadata,omitempty"`
+	Seq          int64               `json:"seq"`
+	Path         string              `json:"path"`
+	Op           string              `json:"op"`
+	Timestamp    time.Time           `json:"timestamp"`
+	Fidelity     string              `json:"fidelity"`
+	DeferCount   int                 `json:"defer_count"`
+	CapturedDiff string              `json:"captured_diff,omitempty"`
+
 	// Preserve truncation across normalization before native metadata is attached.
 	// Keep this transient field out of provider JSON.
-	CapturedDiffTruncated bool                `json:"-"`
-	FileMetadata          *IntentFileMetadata `json:"file_metadata,omitempty"`
-	Seq                   int64               `json:"seq"`
-	Path                  string              `json:"path"`
-	Op                    string              `json:"op"`
-	Timestamp             time.Time           `json:"timestamp"`
-	Fidelity              string              `json:"fidelity"`
-	DeferCount            int                 `json:"defer_count"`
-	CapturedDiff          string              `json:"captured_diff,omitempty"`
+	CapturedDiffTruncated bool `json:"-"`
 }
 
 // IntentFileMetadata describes captured blobs without sending their contents.

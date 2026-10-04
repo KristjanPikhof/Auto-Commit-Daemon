@@ -197,6 +197,13 @@ func runProductDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut
 }
 
 func renderProductDiagnoseReport(out io.Writer, report diagnoseReport) error {
+	if report.OperationalState == "paused" {
+		next := "Run `acd status` to review the pause reason."
+		return renderJSONEnvelope(out, productEnvelope{
+			OK: true, State: productStateNeedsAction,
+			Actions: []productAction{}, NextAction: &next, Data: report,
+		})
+	}
 	if report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.OperationalState == "needs_attention" {
 		next := "Review the blocked drain and run `acd support logs --lines 100` for the failure context."

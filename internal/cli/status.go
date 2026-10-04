@@ -641,6 +641,8 @@ func buildPublicationProgressReport(
 		switch {
 		case manualPause:
 			progress.Phase = "paused"
+		case report.BackpressurePaused:
+			progress.Phase = "needs_action"
 		case report.Paused && report.Pause != nil &&
 			report.Pause.Source == "rewind_grace":
 			progress.Phase = "rewind_wait"
@@ -978,10 +980,13 @@ func statusOperationalState(report statusReport) string {
 }
 
 func statusOperationalStateWithDaemonAlive(report statusReport, daemonAlive bool) string {
+	manualPause := report.Paused && (report.Pause == nil || report.Pause.Source != "rewind_grace")
 	switch {
 	case report.Stale || report.Daemon != "running" || !daemonAlive:
 		return "stopped"
-	case report.Configuration.Configuration == "needs_attention" ||
+	case manualPause:
+		return "paused"
+	case report.BackpressurePaused || report.Configuration.Configuration == "needs_attention" ||
 		report.Replay.State == "needs_attention" ||
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:

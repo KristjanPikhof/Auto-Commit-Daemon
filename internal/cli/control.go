@@ -548,9 +548,10 @@ func applyControlStatus(res *controlResult, status statusReport) {
 }
 
 func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, daemonAlive bool) {
+	captureExplained := false
 	defer func() {
 		applyMaintenanceStatus(res, status)
-		if status.CaptureHealth.Error != "" && !strings.Contains(res.Summary, "incomplete") {
+		if status.CaptureHealth.Error != "" && !captureExplained {
 			res.Summary += " Checkpoint protection is also incomplete: " + status.CaptureHealth.Error
 		}
 	}()
@@ -638,10 +639,12 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Summary = "A blocked publication needs recovery on the active branch."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
 	case status.CaptureHealth.State == "retrying":
+		captureExplained = true
 		res.Health = controlHealthWaiting
 		res.Summary = "Checkpoint coverage is incomplete while changed files stabilize. Readable files are saved."
 		res.NextAction = "ACD will retry automatically; see `acd doctor` for affected paths."
 	case status.CaptureHealth.State == "blocked":
+		captureExplained = true
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "Checkpoint protection is incomplete: " + status.CaptureHealth.Error
