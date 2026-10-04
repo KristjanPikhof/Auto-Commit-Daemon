@@ -67,6 +67,7 @@ type IntentCandidateVerifier func(
 // IntentCandidateEvaluation describes one durable planner evaluation. It does
 // not publish commits or mutate Git refs; P8 consumes the publishable decisions.
 type IntentCandidateEvaluation struct {
+	ProviderBudget       time.Duration
 	BranchRef            string
 	BranchGeneration     int64
 	Captures             []IntentCandidateCapture
@@ -1309,6 +1310,27 @@ func chooseIntentCandidatePlan(
 	if run.AttemptCount >= run.AttemptLimit {
 		skipSemanticPlanning = true
 	}
+	budget := input.ProviderBudget
+	if budget <= 0 {
+		budget = 5 * time.Minute
+	}
+	if planner != nil && run.ProviderDeadlineTS == 0 && !skipSemanticPlanning {
+		deadline := time.Now().Add(budget)
+		if run.AttemptCount > 0 {
+			deadline = time.Unix(0, int64(run.CreatedTS*1e9)).Add(budget)
+		}
+		run, err = state.StartIntentProviderBudget(ctx, db, run, float64(deadline.UnixNano())/1e9)
+		if err != nil {
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+		}
+	}
+	providerCtx := ctx
+	cancelProvider := func() {}
+	if run.ProviderDeadlineTS > 0 {
+		providerCtx, cancelProvider = context.WithDeadline(ctx, time.Unix(0, int64(run.ProviderDeadlineTS*1e9)))
+	}
+	defer cancelProvider()
+	var lockedCandidates []ai.IntentCandidateAssignment
 	var permit IntentPlannerHealthPermit
 	permitHeld := false
 	defer func() {
@@ -1318,8 +1340,11 @@ func chooseIntentCandidatePlan(
 	}()
 	if planner != nil && !skipSemanticPlanning {
 		var previousSignature string
-		var lockedCandidates []ai.IntentCandidateAssignment
 		for {
+			if providerCtx.Err() != nil {
+				plannerFailure = "Intent provider budget exhausted"
+				break
+			}
 			if health != nil && !permitHeld {
 				permit, err = health.Acquire(ctx)
 				if err != nil {
@@ -1332,7 +1357,7 @@ func chooseIntentCandidatePlan(
 					if input.plannerWait != nil {
 						*input.plannerWait = openErr
 					}
-					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, openErr
+					break
 				}
 				permitHeld = true
 			}
@@ -1374,7 +1399,7 @@ func chooseIntentCandidatePlan(
 					strings.Join(run.FindingCodes, ",")
 			}
 			retryCount = run.AttemptCount
-			attemptCtx := prompttrace.WithRetryCount(ctx, retryCount)
+			attemptCtx := prompttrace.WithRetryCount(providerCtx, retryCount)
 			plan, err := evaluatePublication(attemptCtx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
 				return ai.PlanIntentV2WithCompatibility(jobCtx, planner, plannerRequest)
 			})
@@ -1397,7 +1422,8 @@ func chooseIntentCandidatePlan(
 					if health != nil {
 						wait.RetryAt = time.Unix(0, int64(health.Snapshot().NextProbeTS*1e9))
 					}
-					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, wait
+					plannerFailure = ai.SanitizePlannerError(err.Error())
+					break
 				}
 			}
 			reserved, _, reserveErr := state.ReserveIntentPlanAttempt(ctx, db, run)
@@ -1592,6 +1618,9 @@ func chooseIntentCandidatePlan(
 	fallbackNeedsAttention := false
 	if preset == config.PresetBalanced {
 		plan, fallbackNeedsAttention = balancedIntentCandidatePlan(req)
+	}
+	if len(lockedCandidates) > 0 {
+		plan = mergeLockedIntentCandidates(req, lockedCandidates, plan)
 	}
 	fallbackReq := normalizeIntentFallbackBoundaries(req)
 	continuations, companionNeedsAttention, err := continuePersistedIntentCandidates(
@@ -2156,84 +2185,36 @@ func applyIntentFallbackMessageQuality(
 	plan ai.IntentPlanV2,
 	plannerFailure string,
 ) (ai.IntentPlanV2, string, bool, error) {
-	// Deterministic is an explicit supported provider mode, not a silent
-	// downgrade from a configured semantic provider. Its locally generated
-	// fallback messages are therefore complete without a semantic rewrite.
-	if ai.PrimaryProviderName(planner) ==
-		(ai.DeterministicProvider{}).Name() {
-		return plan, plannerFailure, true, nil
-	}
-	// Publication-drain recovery wraps the configured planner so it can lock
-	// membership locally. Preserve the same explicit deterministic policy when
-	// that wrapper is active; semantic wrappers continue through the rewrite
-	// gate below and fail closed when their provider is unavailable.
-	switch fallback := planner.(type) {
-	case publicationDrainAtomicFallbackPlanner:
-		if !fallback.requireSemanticMessage {
-			return plan, plannerFailure, true, nil
+	provider := ai.DeterministicProvider{CommitFormat: req.CommitFormat}
+	for i, candidate := range plan.Candidates {
+		if candidate.Readiness != ai.IntentCandidateReady {
+			continue
 		}
-	case *publicationDrainAtomicFallbackPlanner:
-		if fallback != nil && !fallback.requireSemanticMessage {
-			return plan, plannerFailure, true, nil
+		locked := ai.IntentPlan{SelectedSeqs: candidate.SelectedSeqs, Subject: candidate.Subject, Body: candidate.Body}
+		report := ai.EvaluateIntentPlanMessageQuality(ai.LegacyIntentPlanRequest(req), locked)
+		if report.Action == ai.MessageQualityClean || report.Action == ai.MessageQualitySanitizeAccept {
+			continue
 		}
+		subject, _ := deterministicIntentCandidateMessage(req, candidate.SelectedSeqs)
+		plan.Candidates[i].Subject = provider.FormatSubjectForOps(subject, nil)
+		plan.Candidates[i].Body = localIntentMessageBody(req, candidate.SelectedSeqs)
 	}
-	if _, ok := planner.(ai.IntentMessageRewriter); !ok {
-		return plan, plannerFailure, false, nil
+	return plan, plannerFailure, true, ai.ValidateIntentPlanV2(req, plan)
+}
+
+func localIntentMessageBody(req ai.IntentPlanRequestV2, seqs []int64) string {
+	selected := make(map[int64]bool, len(seqs))
+	for _, seq := range seqs {
+		selected[seq] = true
 	}
-	messageCache, cacheErr := loadPublicationMessageCache(ctx, planner, health)
-	if cacheErr != nil {
-		return ai.IntentPlanV2{}, plannerFailure, false, cacheErr
-	}
-	var permit IntentPlannerHealthPermit
-	permitCompleted := false
-	if health != nil {
-		var err error
-		permit, err = health.Acquire(ctx)
-		if err != nil {
-			return plan, ai.SanitizePlannerError(err.Error()), false, nil
+	var bullets []string
+	for _, capture := range req.OfferedCaptures {
+		if !selected[capture.Seq] {
+			continue
 		}
-		defer func() {
-			if !permitCompleted {
-				_ = health.Complete(ctx, permit, nil)
-			}
-		}()
+		bullets = append(bullets, fmt.Sprintf("- Preserve the captured %s to %s", capture.Op, capture.Path))
 	}
-	rewritten, err := evaluatePublication(ctx, func(jobCtx context.Context) (ai.IntentPlanV2, error) {
-		// Every locally chosen group needs an AI-written message, even if a
-		// deterministic subject happens to pass the quality heuristic.
-		return (publicationDrainAtomicFallbackPlanner{messagePlanner: messageCache, requireSemanticMessage: true}).rewritePlanMessages(jobCtx, req, plan)
-	})
-	if cacheErr := messageCache.persist(ctx); cacheErr != nil {
-		return ai.IntentPlanV2{}, plannerFailure, false, cacheErr
-	}
-	if ai.ProviderNeedsConfiguration(err) {
-		if health != nil {
-			_ = health.Complete(ctx, permit, nil)
-			permitCompleted = true
-		}
-		return ai.IntentPlanV2{}, plannerFailure, false, err
-	}
-	if health != nil {
-		var failure error
-		if err != nil {
-			failure = classifyIntentPlannerHealthFailure(err, true)
-		}
-		permitCompleted = true
-		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
-			return ai.IntentPlanV2{}, plannerFailure, false, healthErr
-		}
-	}
-	if err == nil {
-		return rewritten, plannerFailure, true, nil
-	}
-	if ctx.Err() != nil {
-		return ai.IntentPlanV2{}, plannerFailure, false, ctx.Err()
-	}
-	messageFailure := "message quality fallback: " + err.Error()
-	if plannerFailure != "" {
-		messageFailure = plannerFailure + "; " + messageFailure
-	}
-	return plan, ai.SanitizePlannerError(messageFailure), false, nil
+	return strings.Join(bullets, "\n")
 }
 
 func holdIntentFallbackForMessage(plan *ai.IntentPlanV2) {
@@ -2539,10 +2520,23 @@ func evaluateIntentCandidateAssignment(
 	}
 	waiting := assignment.Readiness == ai.IntentCandidateWait ||
 		len(assignment.MissingCompanions) > 0
+	var capturePaths []string
+	var captureEvidence strings.Builder
+	for _, capture := range candidateCaptures {
+		capturePaths = append(capturePaths, intentCapturePaths(capture)...)
+		captureEvidence.WriteString(capture.CapturedDiff)
+	}
+	captureHold, holdErr := capturePublicationHold(ctx, db, capturePaths, captureEvidence.String())
+	if holdErr != nil {
+		return decision, holdErr
+	}
+	if captureHold != "" {
+		waiting = true
+	}
 	if waiting {
 		results[1] = pendingIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityCompleteness, "candidate_waiting",
-			"candidate is waiting for required companions")
+			"candidate is waiting for required companions or complete capture: "+captureHold)
 	}
 	if err := validateIntentCandidateComponent(selected, dependencies); err != nil &&
 		!input.allowSemanticPlan {
@@ -4301,18 +4295,40 @@ func deterministicIntentCandidateMessage(
 	if len(paths) == 0 {
 		return "Update captured changes", "apply one dependency component"
 	}
-	label := path.Base(paths[0])
-	if len(paths) > 1 {
-		label = path.Dir(paths[0])
-		if label == "." {
-			label = "related changes"
+	primary := ai.OfferedCapture{}
+	for _, capture := range req.OfferedCaptures {
+		if _, ok := selected[capture.Seq]; ok {
+			primary = capture
+			if intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: capture.Path}}) == "code" {
+				break
+			}
 		}
 	}
-	subject := "Update " + label
+	subject := ai.DiffAwareSubject(ai.OpItem{Op: primary.Op, Path: primary.Path}, primary.CapturedDiff)
+	if subject == "" || strings.Contains(subject, path.Base(primary.Path)) {
+		label := intentSemanticStem(IntentCandidateCapture{Event: state.CaptureEvent{Path: primary.Path}})
+		label = strings.ReplaceAll(strings.ReplaceAll(label, "_", " "), "-", " ")
+		if label == "" {
+			label = "protected"
+		}
+		role := intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: primary.Path}})
+		verb := "Update"
+		if primary.Op == "create" {
+			verb = "Add"
+		}
+		if primary.Op == "delete" {
+			verb = "Remove"
+		}
+		if primary.Op == "rename" {
+			verb = "Rename"
+		}
+		subject = verb + " " + label + " " + role + " changes"
+	}
+
 	if len([]rune(subject)) > ai.SubjectCap {
 		subject = string([]rune(subject)[:ai.SubjectCap])
 	}
-	return subject, "update " + label
+	return subject, strings.ToLower(subject)
 }
 
 func intentCapturePaths(capture IntentCandidateCapture) []string {
