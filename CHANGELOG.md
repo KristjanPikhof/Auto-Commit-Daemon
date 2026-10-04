@@ -32,6 +32,8 @@
 - Repository schema v29 stores checkpoint coverage, eligible capture failures,
   and provider deadlines. Existing checkpoints retain complete coverage.
 - `capture.max_file_bytes` now controls buffering rather than file eligibility.
+- Update Bubble Tea to 2.0.10, which skips terminal queries when input is disabled.
+- Update CI artifact uploads to `actions/upload-artifact` 7.0.1.
 
 ## v2026-09-27
 
