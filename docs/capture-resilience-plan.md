@@ -52,12 +52,14 @@ dictionary sizes during an AI outage, preserves exact file bytes and deliberate
 user staging, and sends binary metadata without contents. AI-Assistant remains
 protected, idle, clean, and without pending captures under its temporary setting.
 
-The whole branch received a structured manual code review because the requested
-code-review skill was unavailable. Review fixes cover schema upgrades, retention,
-unknown capture scope, partial-snapshot retry reuse, preserved-group fallback,
-FIFO swaps, and status overrides. The simplify pass removed the remote rewrite
-path from local recovery and reused loaded capture operations. Documentation
-received a humanizer pass.
+Earlier review fixes cover schema upgrades, retention, unknown capture scope,
+partial-snapshot retry reuse, preserved-group fallback, FIFO swaps, and status
+overrides. A Trekoon code review with three subagents added fixes for offline
+message subjects, truncated-diff metadata, held Event queue prefixes, and
+status/list/diagnose parity. The simplify pass removed remote message rewriting
+from local recovery and the obsolete message-wait branch, reused capture
+operations, and avoided duplicate coverage reads within publication checks.
+Documentation received a humanizer pass.
 
 Validation passed: `make lint`, the sharded `make test` gate, focused race tests,
 and real-process outage, flush, planner rejection, and recovery integration tests.
