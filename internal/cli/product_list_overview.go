@@ -149,7 +149,7 @@ func productListEntryFromOverview(
 	}
 	daemonAlive := report.Daemon == "running" && report.PID > 0 && !report.Stale
 	applyControlStatusWithDaemonAlive(&control, report, daemonAlive)
-	checkpointing := daemonAlive && report.CheckpointProtectionAvailable && !report.Protected &&
+	checkpointing := report.CaptureHealth.State != "blocked" && daemonAlive && report.CheckpointProtectionAvailable && !report.Protected &&
 		report.PublicationProgress.Origin != "intent_recovery" &&
 		!productListHasIndependentAttention(report)
 	if checkpointing {
@@ -160,7 +160,7 @@ func productListEntryFromOverview(
 	}
 	if worker.RepositoryID != "" {
 		applySupervisorWorkerFailure(&control, worker)
-		if (worker.State == "starting" || worker.State == "backoff") &&
+		if report.CaptureHealth.State != "blocked" && (worker.State == "starting" || worker.State == "backoff") &&
 			!productListHasIndependentAttention(report) {
 			control.OK = true
 			control.Health = controlHealthPublishing

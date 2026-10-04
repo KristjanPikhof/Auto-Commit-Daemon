@@ -63,6 +63,7 @@ type doctorRepoReport struct {
 	FsnotifyWatches          int                          `json:"fsnotify_watches,omitempty"`
 	FsnotifyDropped          int                          `json:"fsnotify_dropped,omitempty"`
 	FsnotifyFallbackReason   string                       `json:"fsnotify_fallback_reason,omitempty"`
+	CaptureHealth state.CaptureHealth `json:"capture_health"`
 	LastCaptureError         string                       `json:"last_capture_error,omitempty"`
 	PendingEvents            int                          `json:"pending_events"`
 	BlockedConflicts         int                          `json:"blocked_conflicts"`
@@ -298,6 +299,7 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 				rr.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 				rr.PublicationDrain = status.PublicationDrain
 				rr.CheckpointMaintenance = status.CheckpointMaintenance
+				rr.CaptureHealth=status.CaptureHealth
 				if details := maintenanceDetails(status.CheckpointMaintenance); details != "" {
 					rr.Notes = append(rr.Notes, details+" "+status.CheckpointMaintenance.NextAction())
 				}

@@ -584,6 +584,11 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthNeedsAttention
 		res.Summary = "ACD is enabled, but background protection is not running."
 		res.NextAction = "Run `acd on` to start it."
+	case status.CaptureHealth.State == "blocked":
+		res.OK=false
+		res.Health=controlHealthNeedsAttention
+		res.Summary="Checkpoint protection is incomplete: " + status.CaptureHealth.Error
+		res.NextAction="Run `acd doctor` to inspect the affected files. Readable files remain saved; ACD retries automatically."
 	case status.PublicationProgress.Origin == "intent_recovery" &&
 		status.PublicationProgress.Phase == "needs_action":
 		res.OK = false
