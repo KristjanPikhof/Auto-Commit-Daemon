@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
@@ -141,6 +142,14 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 	}
 	for _, offered := range opts.OfferedCaptures {
 		cp := offered
+		if strings.ContainsRune(cp.CapturedDiff, 0) || !utf8.ValidString(cp.CapturedDiff) {
+			cp.CapturedDiff = ""
+			if cp.FileMetadata != nil {
+				metadata := *cp.FileMetadata
+				metadata.Kind, metadata.DiffOmittedReason = "binary", "binary"
+				cp.FileMetadata = &metadata
+			}
+		}
 		if cp.FileMetadata != nil {
 			metadata := *cp.FileMetadata
 			if metadata.BeforeBytes < 0 || metadata.AfterBytes < 0 {

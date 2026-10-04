@@ -6,6 +6,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -52,7 +53,7 @@ func attachIntentFileMetadata(ctx context.Context, repo string, captures []Inten
 			metadata.BeforeBytes += sizes[op.BeforeOID.String]
 			metadata.AfterBytes += sizes[op.AfterOID.String]
 		}
-		binary := strings.Contains(capture.CapturedDiff, "Binary files ")
+		binary := strings.Contains(capture.CapturedDiff, "Binary files ") || strings.ContainsRune(capture.CapturedDiff, 0) || !utf8.ValidString(capture.CapturedDiff)
 		switch strings.ToLower(path.Ext(capture.Event.Path)) {
 		case ".bin", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".zip", ".gz", ".mp3", ".mp4", ".sqlite":
 			binary = true
