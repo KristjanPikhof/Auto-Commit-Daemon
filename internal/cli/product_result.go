@@ -255,6 +255,10 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 		return "idle"
 	case "checkpointing":
 		return "saving the protected checkpoint"
+	case "capture_retry":
+		return "retrying incomplete capture while files stabilize"
+	case "capture_blocked":
+		return "incomplete capture; inspect affected paths with acd doctor"
 	case "paused":
 		return "paused by the user"
 	case "rewind_wait":
