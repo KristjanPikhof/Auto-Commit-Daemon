@@ -83,8 +83,14 @@ func ResolveCheckpoint(ctx context.Context, dbPath, idOrPrefix string) (Checkpoi
 	}
 	for _, checkpoint := range matches {
 		if checkpoint.ID == idOrPrefix {
-			if version >= 29 { if err := loadCheckpointCoverage(ctx, conn, &checkpoint); err != nil { return Checkpoint{}, err } }
-			if checkpoint.Partial { return Checkpoint{}, ErrCheckpointPartial }
+			if version >= 29 {
+				if err := loadCheckpointCoverage(ctx, conn, &checkpoint); err != nil {
+					return Checkpoint{}, err
+				}
+			}
+			if checkpoint.Partial {
+				return Checkpoint{}, ErrCheckpointPartial
+			}
 			return checkpoint, nil
 		}
 	}
@@ -92,8 +98,14 @@ func ResolveCheckpoint(ctx context.Context, dbPath, idOrPrefix string) (Checkpoi
 		return Checkpoint{}, ErrCheckpointAmbiguous
 	}
 	checkpoint := matches[0]
-	if version >= 29 { if err := loadCheckpointCoverage(ctx, conn, &checkpoint); err != nil { return Checkpoint{}, err } }
-	if checkpoint.Partial { return Checkpoint{}, ErrCheckpointPartial }
+	if version >= 29 {
+		if err := loadCheckpointCoverage(ctx, conn, &checkpoint); err != nil {
+			return Checkpoint{}, err
+		}
+	}
+	if checkpoint.Partial {
+		return Checkpoint{}, ErrCheckpointPartial
+	}
 	return checkpoint, nil
 }
 
@@ -107,8 +119,8 @@ func escapeLike(value string) string {
 // snapshot. Git objects and the private ref are written by the checkpoint
 // service; state owns the before-ref and after-ref phases.
 type Checkpoint struct {
-	Partial bool
-	CaptureIssues []CheckpointCaptureIssue
+	Partial          bool
+	CaptureIssues    []CheckpointCaptureIssue
 	ID               string
 	Seq              int64
 	OperationID      string
@@ -294,8 +306,12 @@ INSERT INTO checkpoint_exclusions(checkpoint_id, category, count) VALUES (?, ?, 
 		}
 	}
 	for _, issue := range checkpoint.CaptureIssues {
-		if issue.Reason == "" || len(issue.Reason) > 64 || strings.ContainsAny(issue.Path, "\x00\r\n\t") { return false, errors.New("state: invalid checkpoint capture issue") }
-		if _, err := tx.ExecContext(ctx, `INSERT INTO checkpoint_capture_issues(checkpoint_id,path,subtree,reason) VALUES(?,?,?,?)`, checkpoint.ID, issue.Path, issue.Subtree, issue.Reason); err != nil { return false, err }
+		if issue.Reason == "" || len(issue.Reason) > 64 || strings.ContainsAny(issue.Path, "\x00\r\n\t") {
+			return false, errors.New("state: invalid checkpoint capture issue")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO checkpoint_capture_issues(checkpoint_id,path,subtree,reason) VALUES(?,?,?,?)`, checkpoint.ID, issue.Path, issue.Subtree, issue.Reason); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("state: commit checkpoint prepare: %w", err)
@@ -437,7 +453,11 @@ FROM checkpoints`).Scan(&projection.Prepared, &projection.Completed, &projection
 		return projection, err
 	}
 	if ok {
-		if projection.SchemaVersion >= 29 { if err := loadCheckpointCoverage(ctx, conn, &latest); err != nil { return projection, err } }
+		if projection.SchemaVersion >= 29 {
+			if err := loadCheckpointCoverage(ctx, conn, &latest); err != nil {
+				return projection, err
+			}
+		}
 		projection.Latest = &latest
 	}
 	if recoverableLimit <= 0 {
@@ -580,9 +600,15 @@ SELECT category, count FROM checkpoint_exclusions WHERE checkpoint_id=? ORDER BY
 		}
 		checkpoint.Exclusions = append(checkpoint.Exclusions, exclusion)
 	}
-	if err := exclusionRows.Err(); err != nil { return checkpoint, false, err }
-	if err := exclusionRows.Close(); err != nil { return checkpoint, false, err }
-	if err := loadCheckpointCoverage(ctx, childQuery, &checkpoint); err != nil { return checkpoint, false, err }
+	if err := exclusionRows.Err(); err != nil {
+		return checkpoint, false, err
+	}
+	if err := exclusionRows.Close(); err != nil {
+		return checkpoint, false, err
+	}
+	if err := loadCheckpointCoverage(ctx, childQuery, &checkpoint); err != nil {
+		return checkpoint, false, err
+	}
 	return checkpoint, true, nil
 }
 
@@ -629,7 +655,11 @@ func sameCheckpointIdentity(left, right Checkpoint) bool {
 		len(left.EventSeqs) != len(right.EventSeqs) {
 		return false
 	}
-	for i := range left.CaptureIssues { if left.CaptureIssues[i] != right.CaptureIssues[i] { return false } }
+	for i := range left.CaptureIssues {
+		if left.CaptureIssues[i] != right.CaptureIssues[i] {
+			return false
+		}
+	}
 	for i := range left.EventSeqs {
 		if left.EventSeqs[i] != right.EventSeqs[i] {
 			return false
