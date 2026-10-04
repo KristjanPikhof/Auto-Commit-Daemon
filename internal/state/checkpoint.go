@@ -480,6 +480,9 @@ FROM checkpoints`).Scan(&projection.Prepared, &projection.Completed, &projection
 }
 
 func validateCheckpoint(checkpoint Checkpoint, planDigest string) error {
+	if checkpoint.Partial != (len(checkpoint.CaptureIssues) > 0) {
+		return errors.New("state: incomplete checkpoint requires capture issues")
+	}
 	if !validCheckpointID(checkpoint.ID) {
 		return errors.New("state: invalid checkpoint id")
 	}
