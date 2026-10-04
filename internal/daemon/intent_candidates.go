@@ -1362,6 +1362,9 @@ func chooseIntentCandidatePlan(
 							false, nil, run, err
 					}
 					plannerFailure = ai.SanitizePlannerError(err.Error())
+					if input.RejectLocalFallback {
+						return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, openErr
+					}
 					if input.plannerWait != nil {
 						*input.plannerWait = openErr
 					}
@@ -1431,6 +1434,12 @@ func chooseIntentCandidatePlan(
 						wait.RetryAt = time.Unix(0, int64(health.Snapshot().NextProbeTS*1e9))
 					}
 					plannerFailure = ai.SanitizePlannerError(err.Error())
+					if input.plannerWait != nil {
+						*input.plannerWait = wait
+					}
+					if input.RejectLocalFallback && providerCtx.Err() == nil {
+						return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, wait
+					}
 					break
 				}
 			}
