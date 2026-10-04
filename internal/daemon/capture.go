@@ -1460,7 +1460,7 @@ func newProtectedSkipIndex(protected map[string]skippedPresent) protectedSkipInd
 		exact: make(map[string]string, len(protected)),
 	}
 	for path, skip := range protected {
-		if path == "" || skip.Reason == "" {
+		if skip.Reason == "" {
 			continue
 		}
 		if skip.Dir {
@@ -1480,6 +1480,9 @@ func (index protectedSkipIndex) reasonForPath(path string) (reason string, ok bo
 		return reason, true, false
 	}
 	for _, prefix := range index.dirs {
+		if prefix.path == "" {
+			return prefix.reason, true, false
+		}
 		if path == prefix.path || strings.HasPrefix(path, prefix.path+"/") {
 			return prefix.reason, true, true
 		}
@@ -1675,7 +1678,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 	protected := map[string]skippedPresent{}
 	var summary CaptureSummary
 	markProtected := func(rel, reason string, dir bool) {
-		if rel == "" || reason == "" {
+		if reason == "" {
 			return
 		}
 		protected[rel] = skippedPresent{Reason: reason, Dir: dir}
@@ -1768,6 +1771,20 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				childFull := filepath.Join(parent.full, name)
 				fi, lstatErr := os.Lstat(childFull)
 				if lstatErr != nil {
+					if reason := protectedFileReason(childRel, opts); reason != "" {
+						markProtected(childRel, reason, true)
+						continue
+					}
+					if opts.ignoreChecker != nil {
+						ignored, err := opts.ignoreChecker.Check(ctx, []string{childRel})
+						if err != nil {
+							return nil, protected, summary, err
+						}
+						if len(ignored) == 1 && ignored[0] {
+							markProtected(childRel, "gitignore", true)
+							continue
+						}
+					}
 					markProtected(childRel, "lstat_error", false)
 					bumpLayerError()
 					continue
