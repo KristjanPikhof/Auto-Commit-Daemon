@@ -381,6 +381,8 @@ func productListPhase(entry productListEntry) string {
 	}
 	progress := entry.PublicationProgress
 	switch progress.Phase {
+	case "capture_retry", "capture_blocked":
+		return strings.ReplaceAll(progress.Phase, "_", "-")
 	case "intent_wait":
 		if progress.WaitRemainingSeconds > 0 {
 			return "wait:" + strings.ReplaceAll(formatDurationCompact(
