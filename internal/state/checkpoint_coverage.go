@@ -29,6 +29,9 @@ func CurrentCaptureIssues(ctx context.Context, db *DB) ([]CheckpointCaptureIssue
 	if err != nil || !ok {
 		return nil, err
 	}
+	if checkpoint.Partial && len(checkpoint.CaptureIssues) == 0 {
+		return nil, errors.New("partial checkpoint capture scope is unavailable")
+	}
 	return checkpoint.CaptureIssues, nil
 }
 
