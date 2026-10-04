@@ -565,9 +565,7 @@ func checkpointByIDQuery(ctx context.Context, query checkpointQuery, id string, 
 	if err != nil || !ok || !loadChildren {
 		return checkpoint, ok, err
 	}
-	childQuery, ok := query.(interface {
-		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-	})
+	childQuery, ok := query.(coverageQuery)
 	if !ok {
 		return Checkpoint{}, false, errors.New("state: checkpoint query cannot load membership")
 	}
