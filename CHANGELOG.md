@@ -15,11 +15,15 @@
   for safe fallback groups without a second call to an unavailable provider.
   Local messages recover from rejected symbol-only subjects, and native planner
   metadata preserves text-diff truncation.
+- Preserve validated Intent groups and their dependency order during offline
+  recovery. Message repair keeps candidate membership and purpose intact.
 - Report capture health consistently across status, list, doctor, diagnose, and
   recovery. Recovery no longer reports healthy publication state as complete
   protection or claims a repair was applied when nothing changed.
   Capture retries keep manual pauses and other required actions visible; status
   and list agree on checkpoint stalls, including scans with empty queues.
+- Keep verification recovery visible when checkpoint coverage is incomplete.
+  Stopped workers no longer appear to be actively scanning for checkpoints.
 - Preserve published captures referenced by completed publication drains during
   retention, preventing foreign-key failures.
 
