@@ -204,6 +204,13 @@ func renderProductDiagnoseReport(out io.Writer, report diagnoseReport) error {
 			Actions: []productAction{}, NextAction: &next, Data: report,
 		})
 	}
+	if report.BackpressurePaused {
+		next := "Run `acd doctor` before clearing backpressure."
+		return renderJSONEnvelope(out, productEnvelope{
+			OK: true, State: productStateNeedsAction,
+			Actions: []productAction{}, NextAction: &next, Data: report,
+		})
+	}
 	if report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.OperationalState == "needs_attention" {
 		next := "Review the blocked drain and run `acd support logs --lines 100` for the failure context."
