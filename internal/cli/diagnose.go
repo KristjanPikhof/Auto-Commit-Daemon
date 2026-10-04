@@ -274,9 +274,6 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	report.PublicationDrain = status.PublicationDrain
 	report.CheckpointMaintenance = status.CheckpointMaintenance
 	report.CaptureHealth = status.CaptureHealth
-	if status.CaptureHealth.State == "blocked" {
-		report.Remediation = append(report.Remediation, "Checkpoint protection is incomplete: "+status.CaptureHealth.Error)
-	}
 	report.Remediation = diagnoseRemediation(report)
 	if status.CaptureHealth.State == "blocked" {
 		report.Remediation = append(report.Remediation, "Checkpoint protection is incomplete: "+status.CaptureHealth.Error)

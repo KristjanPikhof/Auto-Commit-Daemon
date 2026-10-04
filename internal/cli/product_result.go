@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 type productState string
@@ -46,6 +47,7 @@ type productEnvelope struct {
 }
 
 type productStatusData struct {
+	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
 	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
 	Repo                     string                       `json:"repo"`
 	Command                  string                       `json:"command"`
@@ -124,7 +126,7 @@ func envelopeFromControl(result controlResult) productEnvelope {
 			ActionRequired:           actionRequired,
 			CheckpointID:             result.CheckpointID,
 			PublicationDrain:         result.PublicationDrain,
-			PublicationProgress:      result.PublicationProgress,
+			CaptureHealth:            result.CaptureHealth, PublicationProgress: result.PublicationProgress,
 			CheckpointMaintenance:    result.CheckpointMaintenance,
 			PendingEvents:            result.PendingEvents,
 			BlockedEvents:            result.BlockedEvents,

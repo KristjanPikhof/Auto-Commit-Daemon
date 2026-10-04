@@ -39,6 +39,7 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
+	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
 	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
 	OK                       bool                         `json:"ok"`
 	Command                  string                       `json:"command"`
@@ -563,6 +564,7 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	res.CheckpointPublishedByACD = res.Published
 	res.CheckpointID = status.LatestCheckpointID
 	res.PublicationDrain = status.PublicationDrain
+	res.CaptureHealth = status.CaptureHealth
 	res.PublicationProgress = status.PublicationProgress
 	res.RecoveryRequired = status.Replay.State == "needs_attention" ||
 		status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0 ||

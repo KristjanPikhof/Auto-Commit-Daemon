@@ -36,6 +36,7 @@ type productListEntry struct {
 	LastActivityAt        string                       `json:"last_activity_at"`
 	PublicationDrain      publicationDrainReport       `json:"publication_drain"`
 	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
+	CaptureHealth         state.CaptureHealth          `json:"capture_health"`
 	PublicationProgress   publicationProgressReport    `json:"publication_progress"`
 	Summary               string                       `json:"summary"`
 	NextAction            string                       `json:"next_action,omitempty"`

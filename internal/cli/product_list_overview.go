@@ -194,7 +194,7 @@ func productListEntryFromOverview(
 		PublicationDrain:      report.PublicationDrain,
 		CheckpointMaintenance: report.CheckpointMaintenance,
 		UnfinishedWork:        overview.unfinished,
-		PublicationProgress:   report.PublicationProgress, Summary: control.Summary,
+		CaptureHealth:         report.CaptureHealth, PublicationProgress: report.PublicationProgress, Summary: control.Summary,
 		Clients: overview.clients, LastCommitOID: report.LastCommitOID,
 		lastActivity: overview.lastActivity,
 	}
@@ -366,6 +366,12 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	} else if ok {
 		report.BackpressurePaused = true
 		report.BackpressurePausedAt = value
+	}
+	if report.CaptureHealth, err = state.ReadCaptureHealth(ctx, conn); err != nil {
+		return overview, err
+	}
+	if report.CaptureHealth.State == "blocked" {
+		report.CaptureErrors = max(1, report.CaptureHealth.IssueCount)
 	}
 	if report.Configuration, err = loadConfigReadinessReport(ctx, conn, now); err != nil {
 		return overview, err
