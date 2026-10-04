@@ -47,6 +47,7 @@ type Request struct {
 	Entries          []Entry
 	EventSeqs        []int64
 	Exclusions       []state.CheckpointExclusion
+	CaptureIssues []state.CheckpointCaptureIssue
 	Now              time.Time
 }
 
@@ -130,6 +131,8 @@ func (s Store) Create(ctx context.Context, request Request) (Result, error) {
 		CreatedTS:        float64(now.UnixNano()) / float64(time.Second),
 		EventSeqs:        append([]int64(nil), request.EventSeqs...),
 		Exclusions:       append([]state.CheckpointExclusion(nil), request.Exclusions...),
+		Partial: len(request.CaptureIssues) > 0,
+		CaptureIssues: append([]state.CheckpointCaptureIssue(nil), request.CaptureIssues...),
 	}
 	if _, err := state.PrepareCheckpoint(ctx, s.DB, checkpoint, planDigest); err != nil {
 		return Result{}, fmt.Errorf("checkpoint: prepare state: %w", err)
@@ -266,6 +269,7 @@ func requestDigest(request Request, entries []Entry, treeOID, commitOID, checkpo
 		hash.Write([]byte(strconv.FormatInt(exclusion.Count, 10)))
 		hash.Write([]byte{0})
 	}
+	for _, issue := range request.CaptureIssues { fmt.Fprintf(hash, "%s\x00%t\x00%s\x00", issue.Path, issue.Subtree, issue.Reason) }
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
 }
 

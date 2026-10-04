@@ -43,7 +43,8 @@ package state
 // adds grouped history rewrite plans; v27 preserves the approved index identity
 // so commit-all cannot consume staging added while its checkpoint was pending;
 // v28 separates typed recovery reasons and immutable evidence from display text.
-const SchemaVersion = 28
+// v29 records partial checkpoint coverage and bounded provider deadlines.
+const SchemaVersion = 29
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -840,6 +841,7 @@ CREATE TABLE IF NOT EXISTS checkpoints(
                             'pre_restore','restore','manual_barrier')),
     observation_epoch   INTEGER NOT NULL CHECK (observation_epoch >= 0),
     coverage_epoch      INTEGER NOT NULL CHECK (coverage_epoch >= 0),
+    coverage_complete   INTEGER NOT NULL DEFAULT 1 CHECK (coverage_complete IN (0,1)),
     observed_head       TEXT NOT NULL DEFAULT '',
     observed_ref        TEXT NOT NULL DEFAULT '',
     tree_oid            TEXT NOT NULL,
@@ -1225,3 +1227,13 @@ CREATE TABLE IF NOT EXISTS daily_rollups(
     PRIMARY KEY (day, repo_root)
 );
 `
+
+const checkpointCaptureIssuesDDL = `
+CREATE TABLE IF NOT EXISTS checkpoint_capture_issues(
+    checkpoint_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    subtree INTEGER NOT NULL CHECK (subtree IN (0,1)),
+    reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 64),
+    PRIMARY KEY (checkpoint_id, path),
+    FOREIGN KEY (checkpoint_id) REFERENCES checkpoints(id) ON DELETE CASCADE
+);`
