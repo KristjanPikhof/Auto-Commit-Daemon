@@ -46,7 +46,7 @@ func TestResiliencePrunePublishedPreservesCompletedDrain(t *testing.T) {
 func TestResiliencePartialCheckpointRejectsFullBarrierAndRestore(t *testing.T) {
 	ctx := context.Background()
 	db, _ := openTestDB(t)
-	cp := Checkpoint{ID: "cp-123-0123456789abcdef", OperationID: "partial-op", WorktreeID: "0123456789abcdef", Reason: CheckpointReasonPoll, ObservationEpoch: 9, CoverageEpoch: 9, ObservedRef: "refs/heads/main", TreeOID: "tree", CommitOID: "commit", Ref: "refs/acd/checkpoints/v1/partial", Partial: true, CaptureIssues: []CheckpointCaptureIssue{{Path: "missing.go", Reason: "unreadable"}}}
+	cp := Checkpoint{ID: "cp-123-0123456789abcdef", OperationID: "partial-op", WorktreeID: "0123456789abcdef", Reason: CheckpointReasonPoll, ObservationEpoch: 9, CoverageEpoch: 9, ObservedRef: "refs/heads/main", TreeOID: "tree", CommitOID: "commit", Ref: "refs/acd/checkpoints/v1/0123456789abcdef/cp-123-0123456789abcdef", Partial: true, CaptureIssues: []CheckpointCaptureIssue{{Path: "missing.go", Reason: "unreadable"}}}
 	if _, err := PrepareCheckpoint(ctx, db, cp, checkpointTestDigest); err != nil {
 		t.Fatal(err)
 	}

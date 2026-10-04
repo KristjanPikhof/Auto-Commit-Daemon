@@ -25,8 +25,9 @@ func CurrentCaptureIssues(ctx context.Context, db *DB) ([]CheckpointCaptureIssue
 	if err != nil || !ok || id == "" {
 		return nil, err
 	}
-	checkpoint, ok, err := checkpointByIDQuery(ctx, db.ReadSQL(), id, true)
-	if err != nil || !ok {
+	checkpoint := Checkpoint{ID: id}
+	err = loadCheckpointCoverage(ctx, db.ReadSQL(), &checkpoint)
+	if err != nil {
 		return nil, err
 	}
 	if checkpoint.Partial && len(checkpoint.CaptureIssues) == 0 {

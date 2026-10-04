@@ -26,7 +26,7 @@ const (
 	IdentityEmail = "checkpoint@localhost"
 )
 
-// Entry is one eligible worktree path in a complete checkpoint tree. Blob
+// Entry is one eligible worktree path in a checkpoint tree. Blob
 // objects must already have been written through Git's durable object helper.
 type Entry struct {
 	Path string
@@ -34,8 +34,8 @@ type Entry struct {
 	OID  string
 }
 
-// Request is a complete, already-scanned protection snapshot. Exclusions are
-// category counts only; paths are deliberately absent from this boundary.
+// Request is an already-scanned protection snapshot. CaptureIssues mark incomplete
+// eligible coverage; privacy exclusions remain category counts without paths.
 type Request struct {
 	RepoRoot         string
 	WorktreeID       string
