@@ -313,15 +313,6 @@ func TestPublicationProviderConfigurationRequiresAction(t *testing.T) {
 	}
 }
 
-type configurationMessageRewriter struct{ err error }
-
-func (p *configurationMessageRewriter) Name() string { return "configured-ai" }
-func (p *configurationMessageRewriter) RewriteIntentMessage(context.Context, ai.IntentMessageRewriteRequest) (ai.Result, error) {
-	if p.err != nil {
-		return ai.Result{}, p.err
-	}
-	return ai.Result{Subject: "Preserve semantic behavior", Body: "- Keep related feature changes together"}, nil
-}
 func TestLocalFallbackMessagesLeaveRecoveryProbeAvailable(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
