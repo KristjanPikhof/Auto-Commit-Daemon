@@ -3237,7 +3237,9 @@ func Run(ctx context.Context, opts Options) error {
 		if capErr != nil {
 			consecutiveErrors++
 			previous, _, _ := state.MetaGet(ctx, opts.DB, "last_capture_error")
-			if previous != capErr.Error() { logger.Warn("capture error", "n", consecutiveErrors, "err", capErr.Error()) }
+			if previous != capErr.Error() {
+				logger.Warn("capture error", "n", consecutiveErrors, "err", capErr.Error())
+			}
 			_ = state.RecordCaptureHealth(ctx, opts.DB, capErr.Error(), capSum.CheckpointID, now())
 		} else if repErr != nil {
 			value, repeats, providerWait, metaErr := reconcileReplayErrorObservability(
