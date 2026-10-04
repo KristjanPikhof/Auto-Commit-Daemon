@@ -618,7 +618,7 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 			status.PublicationDrain.LastError == "publication_drain_environment_runtime_changed"):
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD can no longer reconstruct the exact runtime needed to resume this commit-all run. Captured work remains saved."
+		res.Summary = "ACD can no longer reconstruct the exact runtime needed to resume this commit-all run. Your captured work remains saved."
 		res.NextAction = "Run `acd fix --force --dry-run`, review the archive-only recovery plan, then run `acd fix --force --yes`."
 	case status.PublicationDrain.Phase == state.PublicationDrainNeedsAction:
 		res.OK = false

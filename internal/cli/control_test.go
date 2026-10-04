@@ -521,7 +521,7 @@ func TestApplyControlStatusUnreconstructibleDrainOffersForceRecovery(t *testing.
 			applyControlStatus(&res, status)
 
 			if res.OK || res.Health != controlHealthNeedsAttention ||
-				!strings.Contains(res.Summary, "captured work remains protected") ||
+				!strings.Contains(res.Summary, "captured work remains saved") ||
 				!strings.Contains(res.NextAction, "acd fix --force --dry-run") ||
 				!strings.Contains(res.NextAction, "acd fix --force --yes") {
 				t.Fatalf("control result=%+v", res)
