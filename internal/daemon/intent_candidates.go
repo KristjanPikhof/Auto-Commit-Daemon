@@ -1550,6 +1550,7 @@ func chooseIntentCandidatePlan(
 					req, plan, validation.Findings); ok &&
 					len(preserved) > len(lockedCandidates) {
 					lockedCandidates = preserved
+					partialRequest = partial
 					var partialPreflightErr error
 					plannerRequest, _, partialPreflightErr =
 						preflightIntentCandidatePlan(
@@ -1634,10 +1635,10 @@ func chooseIntentCandidatePlan(
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run,
 			fmt.Errorf("daemon: intent candidates: unsupported preset %q", preset)
 	}
-	plan := deterministicIntentCandidatePlan(req, true, false)
+	plan := deterministicIntentCandidatePlan(partialRequest, true, false)
 	fallbackNeedsAttention := false
 	if preset == config.PresetBalanced {
-		plan, fallbackNeedsAttention = balancedIntentCandidatePlan(req)
+		plan, fallbackNeedsAttention = balancedIntentCandidatePlan(partialRequest)
 	}
 	if len(lockedCandidates) > 0 {
 		plan = mergeLockedIntentCandidates(req, lockedCandidates, plan)

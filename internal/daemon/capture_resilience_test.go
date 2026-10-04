@@ -277,6 +277,36 @@ func (p *interruptedPartialPlanner) PlanIntentV2(ctx context.Context, req ai.Int
 	return p.partialReplanIntentCandidatePlannerStub.PlanIntentV2(ctx, req)
 }
 
+type unavailablePartialPlanner struct {
+	partialReplanIntentCandidatePlannerStub
+}
+
+func (p *unavailablePartialPlanner) PlanIntentV2(ctx context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
+	if p.calls > 0 {
+		p.calls++
+		p.reqs = append(p.reqs, req)
+		return ai.IntentPlanV2{}, &IntentPlannerTransportFailure{Err: errors.New("provider unavailable")}
+	}
+	return p.partialReplanIntentCandidatePlannerStub.PlanIntentV2(ctx, req)
+}
+
+func TestCaptureResilienceFallbackPreservesValidatedGroups(t *testing.T) {
+	db := openIntentCandidateTestDB(t)
+	planner := &unavailablePartialPlanner{}
+	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "a.go", Op: "create"}, {Seq: 2, Path: "b.go", Op: "create"}}}
+	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, Provider: planner.Name()}
+	plan, fallback, _, _, _, _, run, err := chooseIntentCandidatePlan(context.Background(), req, planner, nil, 2, config.PresetFast, nil, db, input)
+	if err != nil || fallback != "evidence_partition" || !run.Completed || len(plan.Candidates) != 2 || planner.calls != 2 || len(planner.reqs[1].OfferedCaptures) != 1 {
+		t.Fatalf("fallback=%s plan=%+v run=%+v calls=%d err=%v", fallback, plan, run, planner.calls, err)
+	}
+	if plan.Candidates[0].CandidateID != "locked-a" || plan.Candidates[0].Subject != "Update source change" {
+		t.Fatalf("validated group changed: %+v", plan.Candidates)
+	}
+	if err := ai.ValidateIntentPlanV2(req, plan); err != nil {
+		t.Fatalf("fallback duplicated or lost capture membership: %v", err)
+	}
+}
+
 func TestCaptureResiliencePreservesValidatedMessagesAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	db, err := state.Open(context.Background(), path)
