@@ -44,3 +44,25 @@ Privacy exclusions stay outside the capture-failure ledger.
   race tests, process integration, lint, and the sharded local gate.
 - Let ACD commit the changes. Installation, restart of the installed runtime,
   push, and release remain separate delivery actions.
+
+## Result
+
+The implementation is complete. The real-worker regression publishes all four
+dictionary sizes during an AI outage, preserves exact file bytes and deliberate
+user staging, and sends binary metadata without contents. AI-Assistant remains
+protected, idle, clean, and without pending captures under its temporary setting.
+
+The whole branch received a structured manual code review because the requested
+code-review skill was unavailable. Review fixes cover schema upgrades, retention,
+unknown capture scope, partial-snapshot retry reuse, preserved-group fallback,
+FIFO swaps, and status overrides. The simplify pass removed the remote rewrite
+path from local recovery and reused loaded capture operations. Documentation
+received a humanizer pass.
+
+Validation passed: `make lint`, the sharded `make test` gate, focused race tests,
+and real-process outage, flush, planner rejection, and recovery integration tests.
+Deadline, restart, partial capture, and fallback scenarios also passed ten
+repetitions. `git diff --check` and the `AGENTS.md` symlink checks passed.
+
+The installed runtime is still `v2026-09-27`. Installing or releasing these
+source changes is a separate delivery step.
