@@ -63,6 +63,7 @@ func TestCaptureResilienceLargeAssetsDuringProviderOutage(t *testing.T) {
 	writeFile(t, filepath.Join(repo, "autocomplete.go"), "package autocomplete\n\nfunc Complete() string { return \"eng_autocomplete.bin\" }\n")
 	writeFile(t, filepath.Join(repo, "autocomplete_test.go"), "package autocomplete\n\n// Complete uses the bundled dictionary.\n")
 	writeFile(t, filepath.Join(repo, "autocomplete.md"), "Autocomplete uses the bundled dictionaries.\n")
+	writeFile(t, filepath.Join(repo, "settings.py"), "def save_settings(value):\n    return value\n")
 	// Keep a deliberate staging choice separate from the captured worktree bytes.
 	writeFile(t, filepath.Join(repo, ".gitignore"), "# user staging choice\n")
 	runGitOK(t, repo, "add", ".gitignore")
@@ -75,7 +76,7 @@ func TestCaptureResilienceLargeAssetsDuringProviderOutage(t *testing.T) {
 		t.Fatalf("flush: %s %s", result.Stdout, result.Stderr)
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	for _, name := range append(names, "../autocomplete.go", "../autocomplete_test.go", "../autocomplete.md") {
+	for _, name := range append(names, "../autocomplete.go", "../autocomplete_test.go", "../autocomplete.md", "../settings.py") {
 		path := filepath.ToSlash(filepath.Clean(filepath.Join("assets", name)))
 		waitForEventState(t, dbPath, path, "published", 30*time.Second)
 		want := strings.TrimSpace(runGitOK(t, repo, "hash-object", path))

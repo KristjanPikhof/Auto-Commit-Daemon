@@ -42,11 +42,11 @@ import (
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
-// EnvMaxFileBytes is the per-file size cap. Mirrors the legacy
+// EnvMaxFileBytes is the regular-file buffering threshold. Mirrors the legacy
 // SNAPSHOTD_MAX_FILE_BYTES knob with the new ACD_ prefix.
 const EnvMaxFileBytes = "ACD_MAX_FILE_BYTES"
 
-// DefaultMaxFileBytes is the default per-file size cap (5 MiB).
+// DefaultMaxFileBytes is the default buffering threshold (5 MiB).
 const DefaultMaxFileBytes int64 = 5 << 20
 
 // EnvPathQuiescenceSeconds names the operator knob that defers planner offers
@@ -1932,7 +1932,7 @@ func protectedFileReason(path string, opts walkOpts) string {
 //
 // Returns:
 //   - (entry, true,  "",     nil) — captured ok.
-//   - (zero,  false, reason, nil) — skipped (oversize, vanished, type changed).
+//   - (zero,  false, reason, nil) — skipped (unstable or type changed).
 //   - (zero,  _,     "",     err) — hard error worth recording in summary.
 func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts walkOpts) (LiveEntry, bool, string, error) {
 	mode := c.fi.Mode()
