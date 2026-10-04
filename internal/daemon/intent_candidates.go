@@ -4318,6 +4318,7 @@ func deterministicIntentCandidateMessage(
 		return "Update captured changes", "apply one dependency component"
 	}
 	subject := ai.DiffAwareSubject(ai.OpItem{Op: primary.Op, Path: primary.Path}, primary.CapturedDiff)
+	// A valid body lets the shared quality gate judge only the proposed subject.
 	quality := ai.EvaluateIntentPlanMessageQuality(ai.IntentPlanRequest{
 		OfferedCaptures: req.OfferedCaptures, CommitFormat: ai.CommitFormatImperative,
 	}, ai.IntentPlan{SelectedSeqs: seqs, Subject: subject, Body: "- Preserve the captured changes"})

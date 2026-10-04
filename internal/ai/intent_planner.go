@@ -64,6 +64,8 @@ type PathRecentCommit struct {
 
 // OfferedCapture is one capture the planner may either select or defer.
 type OfferedCapture struct {
+	// Preserve truncation across normalization before native metadata is attached.
+	// Keep this transient field out of provider JSON.
 	CapturedDiffTruncated bool                `json:"-"`
 	FileMetadata          *IntentFileMetadata `json:"file_metadata,omitempty"`
 	Seq                   int64               `json:"seq"`
