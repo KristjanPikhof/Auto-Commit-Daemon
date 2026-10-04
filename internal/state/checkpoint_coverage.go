@@ -10,9 +10,9 @@ var ErrCheckpointPartial = errors.New("checkpoint has incomplete coverage; choos
 
 // CheckpointCaptureIssue names only eligible paths, never privacy exclusions.
 type CheckpointCaptureIssue struct {
-	Path string `json:"path"`
-	Subtree bool `json:"subtree,omitempty"`
-	Reason string `json:"reason"`
+	Path    string `json:"path"`
+	Subtree bool   `json:"subtree,omitempty"`
+	Reason  string `json:"reason"`
 }
 
 type coverageQuery interface {
@@ -20,15 +20,35 @@ type coverageQuery interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
+func CurrentCaptureIssues(ctx context.Context, db *DB) ([]CheckpointCaptureIssue, error) {
+	id, ok, err := MetaGet(ctx, db, "protection.checkpoint_id")
+	if err != nil || !ok || id == "" {
+		return nil, err
+	}
+	checkpoint, ok, err := checkpointByIDQuery(ctx, db.ReadSQL(), id, true)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return checkpoint.CaptureIssues, nil
+}
+
 func loadCheckpointCoverage(ctx context.Context, query coverageQuery, checkpoint *Checkpoint) error {
-	if err := query.QueryRowContext(ctx, `SELECT coverage_complete=0 FROM checkpoints WHERE id=?`, checkpoint.ID).Scan(&checkpoint.Partial); err != nil { return err }
-	if !checkpoint.Partial { return nil }
+	if err := query.QueryRowContext(ctx, `SELECT coverage_complete=0 FROM checkpoints WHERE id=?`, checkpoint.ID).Scan(&checkpoint.Partial); err != nil {
+		return err
+	}
+	if !checkpoint.Partial {
+		return nil
+	}
 	rows, err := query.QueryContext(ctx, `SELECT path,subtree,reason FROM checkpoint_capture_issues WHERE checkpoint_id=? ORDER BY path`, checkpoint.ID)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer rows.Close()
 	for rows.Next() {
 		var issue CheckpointCaptureIssue
-		if err := rows.Scan(&issue.Path, &issue.Subtree, &issue.Reason); err != nil { return err }
+		if err := rows.Scan(&issue.Path, &issue.Subtree, &issue.Reason); err != nil {
+			return err
+		}
 		checkpoint.CaptureIssues = append(checkpoint.CaptureIssues, issue)
 	}
 	return rows.Err()
