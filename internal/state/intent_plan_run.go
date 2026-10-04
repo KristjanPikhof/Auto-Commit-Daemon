@@ -208,6 +208,9 @@ func StartIntentProviderBudget(ctx context.Context, db *DB, run IntentPlanRun, d
 	if _, err := db.SQL().ExecContext(ctx, `UPDATE intent_plan_runs SET provider_deadline_ts=? WHERE fingerprint=? AND provider_deadline_ts=0`, deadline, run.Fingerprint); err != nil {
 		return run, err
 	}
-	current, _, err := IntentPlanRunByFingerprint(ctx, db, run.Fingerprint)
+	current, ok, err := IntentPlanRunByFingerprint(ctx, db, run.Fingerprint)
+	if err == nil && !ok {
+		return run, fmt.Errorf("state: provider budget run not found")
+	}
 	return current, err
 }
