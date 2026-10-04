@@ -3240,7 +3240,7 @@ func Run(ctx context.Context, opts Options) error {
 			if previous != capErr.Error() {
 				logger.Warn("capture error", "n", consecutiveErrors, "err", capErr.Error())
 			}
-			_ = state.RecordCaptureHealth(ctx, opts.DB, capErr.Error(), capSum.CheckpointID, now())
+			_ = state.RecordCaptureHealth(ctx, opts.DB, capErr.Error(), capSum.CheckpointID, now(), now().Add(opts.Scheduler.NextError(currentDelay)))
 		} else if repErr != nil {
 			value, repeats, providerWait, metaErr := reconcileReplayErrorObservability(
 				ctx, opts.DB, repErr, now())

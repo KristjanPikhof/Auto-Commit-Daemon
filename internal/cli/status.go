@@ -423,7 +423,8 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 	if err != nil {
 		return report, err
 	}
-	if report.CaptureHealth.State == "blocked" {
+	if report.CaptureHealth.Error != "" {
+		report.Protected = false
 		report.CaptureErrors = max(report.CaptureErrors, max(1, report.CaptureHealth.IssueCount))
 	}
 
@@ -692,6 +693,20 @@ func buildPublicationProgressReport(
 		progress.LastProgressAgeSeconds, stallThreshold) &&
 		publicationPhaseCanStall(progress.Phase) {
 		progress.Phase = "stalled"
+	}
+	if report.CaptureHealth.Error != "" {
+		progress.Phase = "capture_blocked"
+		if report.CaptureHealth.State == "retrying" {
+			progress.Phase = "capture_retry"
+		}
+		progress.LastProgressTS = report.CaptureHealth.LastProgressTS
+		if progress.LastProgressTS == 0 {
+			progress.LastProgressTS = report.CaptureHealth.SinceTS
+		}
+		progress.LastProgressAgeSeconds = max(0, now.Unix()-int64(progress.LastProgressTS))
+		if progress.LastProgressTS == 0 {
+			progress.LastProgressAgeSeconds = 0
+		}
 	}
 	return progress, nil
 }
