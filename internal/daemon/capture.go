@@ -13,8 +13,6 @@
 //   - Generated dependency/cache tree pruning via state.SafeIgnoreMatcher.
 //   - Gitignored paths via batch git.IgnoreChecker.
 //   - Regular files above ACD_MAX_FILE_BYTES stream into Git objects.
-//     only when their exact bytes already match a normal indexed Git blob;
-//     other oversized content remains incomplete/meta-only.
 //   - Regular files opened with O_NOFOLLOW + post-open lstat/fstat
 //     ino+dev+mode verification (TOCTOU defense against symlink swap).
 package daemon
@@ -1279,6 +1277,16 @@ func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, c
 // supplied observation. Recovery paths use it only after independently
 // proving the complete protected entry set.
 func CompleteProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID string, entries []checkpoint.Entry) error {
+	cp, ok, err := state.CheckpointByID(ctx, db, checkpointID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return state.ErrCheckpointNotFound
+	}
+	if cp.Partial {
+		return state.ErrCheckpointPartial
+	}
 	return persistProtectionCoverage(ctx, db, epoch, checkpointID, ProtectionEntriesDigest(entries))
 }
 
