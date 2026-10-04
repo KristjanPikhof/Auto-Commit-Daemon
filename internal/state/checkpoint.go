@@ -81,23 +81,16 @@ func ResolveCheckpoint(ctx context.Context, dbPath, idOrPrefix string) (Checkpoi
 	if len(matches) == 0 {
 		return Checkpoint{}, ErrCheckpointNotFound
 	}
-	for _, checkpoint := range matches {
-		if checkpoint.ID == idOrPrefix {
-			if version >= 29 {
-				if err := loadCheckpointCoverage(ctx, conn, &checkpoint); err != nil {
-					return Checkpoint{}, err
-				}
-			}
-			if checkpoint.Partial {
-				return Checkpoint{}, ErrCheckpointPartial
-			}
-			return checkpoint, nil
+	checkpoint := matches[0]
+	for _, match := range matches {
+		if match.ID == idOrPrefix {
+			checkpoint = match
+			break
 		}
 	}
-	if len(matches) != 1 {
+	if checkpoint.ID != idOrPrefix && len(matches) != 1 {
 		return Checkpoint{}, ErrCheckpointAmbiguous
 	}
-	checkpoint := matches[0]
 	if version >= 29 {
 		if err := loadCheckpointCoverage(ctx, conn, &checkpoint); err != nil {
 			return Checkpoint{}, err
@@ -476,7 +469,20 @@ FROM checkpoints`).Scan(&projection.Prepared, &projection.Completed, &projection
 		}
 		projection.Recoverable = append(projection.Recoverable, checkpoint)
 	}
-	return projection, rows.Err()
+	if err := rows.Err(); err != nil {
+		return projection, err
+	}
+	if err := rows.Close(); err != nil {
+		return projection, err
+	}
+	if projection.SchemaVersion >= 29 {
+		for i := range projection.Recoverable {
+			if err := loadCheckpointCoverage(ctx, conn, &projection.Recoverable[i]); err != nil {
+				return projection, err
+			}
+		}
+	}
+	return projection, nil
 }
 
 func validateCheckpoint(checkpoint Checkpoint, planDigest string) error {

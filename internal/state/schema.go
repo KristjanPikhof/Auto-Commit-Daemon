@@ -1,7 +1,7 @@
 // Package state owns the per-repo SQLite layer (open, migrate, CRUD).
 //
-// Schema reference: .plan/acd.md §6.1. The DDL below mirrors that section
-// verbatim. The daily_rollups table is the long-term backward-compat anchor
+// The DDL below is the canonical state contract. The daily_rollups table
+// is the long-term backward-compat anchor
 // (D9): future migrations may only ALTER TABLE ADD COLUMN — never rename,
 // remove, or reorder.
 package state
@@ -1227,7 +1227,7 @@ CREATE TABLE IF NOT EXISTS daily_rollups(
     daemon_uptime_seconds INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, repo_root)
 );
-`
+` + checkpointCaptureIssuesDDL
 
 const checkpointCaptureIssuesDDL = `
 CREATE TABLE IF NOT EXISTS checkpoint_capture_issues(

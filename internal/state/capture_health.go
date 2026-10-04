@@ -68,11 +68,12 @@ func RecordCaptureHealth(ctx context.Context, db *DB, failure, checkpointID stri
 			health.NextRetryTS = float64(nextRetry[0].UnixNano()) / 1e9
 		}
 		if checkpointID != "" {
-			checkpoint, ok, err := checkpointByIDQuery(ctx, db.ReadSQL(), checkpointID, true)
+			checkpoint := Checkpoint{ID: checkpointID}
+			err := loadCheckpointCoverage(ctx, db.ReadSQL(), &checkpoint)
 			if err != nil {
 				return err
 			}
-			if ok {
+			{
 				if checkpoint.ID != health.CheckpointID {
 					health.LastProgressTS = ts
 					health.CheckpointID = checkpoint.ID
