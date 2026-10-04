@@ -40,6 +40,11 @@ func capturePublicationHoldOps(ctx context.Context, repo string, db *state.DB, o
 	if err != nil || len(issues) == 0 {
 		return "", err
 	}
+	for _, op := range ops {
+		if op.Op == "delete" || op.Op == "rename" {
+			return "capture may be missing a rename or deletion companion", nil
+		}
+	}
 	evidence, err := BuildOpsDiff(ctx, repo, ops)
 	if err != nil {
 		return "", err
