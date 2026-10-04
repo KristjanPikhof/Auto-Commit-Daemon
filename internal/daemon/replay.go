@@ -797,7 +797,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if ev.OldPath.Valid {
 			pathsForHold = append(pathsForHold, ev.OldPath.String)
 		}
-		hold, err := capturePublicationHold(ctx, db, pathsForHold, BuildOpsDiff(ctx, repoRoot, opsForHold))
+		hold, err := capturePublicationHoldOps(ctx, repoRoot, db, opsForHold, pathsForHold)
 		if err != nil {
 			return sum, err
 		}
@@ -3601,15 +3601,13 @@ func publishIntentSelection(
 		return sum, nil
 	}
 	var holdPaths []string
-	var holdEvidence strings.Builder
 	for _, item := range selected {
 		holdPaths = append(holdPaths, item.event.Path)
 		if item.event.OldPath.Valid {
 			holdPaths = append(holdPaths, item.event.OldPath.String)
 		}
-		holdEvidence.WriteString(BuildOpsDiff(ctx, repoRoot, item.ops))
 	}
-	hold, err := capturePublicationHold(ctx, db, holdPaths, holdEvidence.String())
+	hold, err := capturePublicationHoldOps(ctx, repoRoot, db, flattenIntentOps(selected), holdPaths)
 	if err != nil {
 		return sum, err
 	}
