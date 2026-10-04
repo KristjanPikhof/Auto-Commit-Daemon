@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
@@ -132,17 +135,16 @@ func TestCaptureResiliencePartialProtectionPreservesShadow(t *testing.T) {
 	if err == nil || repeat.CheckpointID != partial.CheckpointID || repeat.EventsAppended != 0 {
 		t.Fatalf("repeat=%+v err=%v", repeat, err)
 	}
-	indexPath := filepath.Join(f.gitDir, "index")
-	indexBefore, err := os.ReadFile(indexPath)
+	indexBefore, err := git.LsFilesStaged(ctx, f.dir, "README.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{})
+	replayed, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir})
 	if err != nil || replayed.Published != 1 {
 		t.Fatalf("partial replay=%+v err=%v", replayed, err)
 	}
-	indexAfter, err := os.ReadFile(indexPath)
-	if err != nil || !bytes.Equal(indexBefore, indexAfter) {
+	indexAfter, err := git.LsFilesStaged(ctx, f.dir, "README.md")
+	if err != nil || !reflect.DeepEqual(indexBefore, indexAfter) {
 		t.Fatalf("live index changed: %v", err)
 	}
 	if got, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "show", "HEAD:independent.md"); err != nil || string(got) != "Independent documentation.\n" {
@@ -163,5 +165,28 @@ func TestCaptureResilienceLocalMessagesNeverCallAI(t *testing.T) {
 	out, _, ready, err := applyIntentFallbackMessageQuality(context.Background(), nil, nil, req, plan, "offline")
 	if err != nil || !ready || len(out.Candidates) != 1 || out.Candidates[0].Body == "" {
 		t.Fatalf("local fallback=%+v ready=%t err=%v", out, ready, err)
+	}
+}
+
+func TestCaptureResilienceProviderBudgetStopsUnchangedCalls(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	planner := &blockingSemanticPlanner{entered: make(chan ai.IntentPlanRequestV2, 1)}
+	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "independent.md", Op: "create"}}}
+	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, ProviderBudget: 200 * time.Millisecond}
+	started := time.Now()
+	plan, fallback, _, _, _, _, first, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
+	if err != nil || fallback != "evidence_partition" || len(plan.Candidates) != 1 || !first.Completed {
+		t.Fatalf("budget result=%+v fallback=%s err=%v", first, fallback, err)
+	}
+	if time.Since(started) > 5*time.Second {
+		t.Fatal("provider budget did not bound wait")
+	}
+	if len(planner.entered) != 1 {
+		t.Fatal("provider call was not observed")
+	}
+	_, _, _, _, _, _, second, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
+	if err != nil || second.ResolutionMode.String != "completed_plan_reuse" || len(planner.entered) != 1 || second.ProviderDeadlineTS != first.ProviderDeadlineTS {
+		t.Fatalf("budget reuse=%+v err=%v", second, err)
 	}
 }
