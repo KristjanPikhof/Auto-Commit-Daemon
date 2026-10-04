@@ -88,7 +88,7 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 		if !item.Retained || candidateIDs[item.ID] {
 			continue
 		}
-		if !item.Published || item.Unresolved || item.Reason == state.CheckpointReasonPreRestore {
+		if !item.Published || item.Unresolved || item.LatestComplete || item.Reason == state.CheckpointReasonPreRestore {
 			protectedRefs = append(protectedRefs, item.Ref)
 		}
 	}
@@ -139,7 +139,7 @@ func (s Store) retentionCandidates(
 	eligible := make([]retentionCandidate, 0)
 	for index := len(checkpoints) - 1; index >= 0; index-- {
 		item := checkpoints[index]
-		if !item.Retained || !item.Published || item.Unresolved ||
+		if !item.Retained || !item.Published || item.Unresolved || item.LatestComplete ||
 			index < DefaultMinimumRetained ||
 			item.Reason == state.CheckpointReasonPreRestore {
 			continue

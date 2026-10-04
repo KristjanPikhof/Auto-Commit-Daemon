@@ -178,6 +178,7 @@ type CaptureSummary struct {
 	// Protected means this complete scan covers ObservationEpoch. An unchanged
 	// tree may reuse the prior checkpoint while still advancing covered_epoch.
 	Protected bool
+	Partial bool
 }
 
 // CaptureContext carries the repository identity frozen at the start of a pass.
@@ -810,7 +811,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			summary.PendingDepth = pending
 			updatePendingHighWater(ctx, db, pending)
 		}
-		if len(ownedOps) == len(ops) {
+		if len(ownedOps) == len(ops) && summary.Protected {
 			_, digest := checkpointEntries(live)
 			covered, _, err := state.MetaGet(ctx, db, MetaKeyProtectionCoveredEpoch)
 			if err != nil {
@@ -979,6 +980,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		summary.EventsDroppedTotal = total
 	}
 
+	if summary.Partial { return summary, partialCaptureError(summary) }
 	return summary, nil
 }
 
@@ -1017,6 +1019,7 @@ func ProtectWorktree(ctx context.Context, repoRoot string, db *state.DB, cctx Ca
 		_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
 		return summary, err
 	}
+	if summary.Partial { return summary, partialCaptureError(summary) }
 	return summary, nil
 }
 
@@ -1077,10 +1080,8 @@ func completeProtectionCheckpoint(
 		strconv.FormatInt(epoch, 10)); err != nil {
 		return fmt.Errorf("daemon: persist protection observation epoch: %w", err)
 	}
-	if summary.Errors > 0 || summary.Oversize > 0 {
-		return fmt.Errorf("daemon: protection scan incomplete (unreadable_or_unstable=%d oversized_or_unstable=%d)",
-			summary.Errors, summary.Oversize)
-	}
+	issues := captureIssues(protectedSkips)
+	summary.Partial = len(issues) > 0
 
 	entries, liveDigest := checkpointEntries(live)
 	projection, err := state.ReadCheckpointProjection(ctx, db.Path(), 1)
@@ -1097,7 +1098,7 @@ func completeProtectionCheckpoint(
 	}
 	forceNew = forceNew || requiredEpoch > 0 && epoch >= requiredEpoch
 	if !forceNew && projection.Latest != nil &&
-		projection.Latest.Phase == state.CheckpointCompleted &&
+		!summary.Partial && !projection.Latest.Partial && projection.Latest.Phase == state.CheckpointCompleted &&
 		digestOK && priorDigest == liveDigest {
 		if err := persistProtectionCoverage(ctx, db, epoch, projection.Latest.ID, liveDigest); err != nil {
 			return err
@@ -1107,6 +1108,15 @@ func completeProtectionCheckpoint(
 		return nil
 	}
 
+	partialFingerprint := fmt.Sprintf("%s/%v", liveDigest, issues)
+	if summary.Partial && !forceNew && projection.Latest != nil && projection.Latest.Phase == state.CheckpointCompleted && projection.Latest.Partial {
+		previous, _, err := state.MetaGet(ctx, db, "protection.partial_fingerprint")
+		if err != nil { return err }
+		if previous == partialFingerprint {
+			summary.CheckpointID=projection.Latest.ID
+			return nil
+		}
+	}
 	exclusions := checkpointExclusions(protectedSkips)
 	reason := opts.CheckpointReason
 	if reason == "" {
@@ -1126,9 +1136,19 @@ func completeProtectionCheckpoint(
 		ObservedRef:      cctx.BranchRef,
 		Entries:          entries,
 		Exclusions:       exclusions,
+		CaptureIssues: issues,
 	})
 	if err != nil {
 		return fmt.Errorf("daemon: complete protection checkpoint: %w", err)
+	}
+	if summary.Partial {
+		summary.CheckpointID = result.Checkpoint.ID
+		return state.MetaSetMany(ctx, db, map[string]string{
+			MetaKeyProtectionCheckpointID: summary.CheckpointID,
+			MetaKeyProtectionComplete: "false",
+			"protection.partial_fingerprint": partialFingerprint,
+			MetaKeyProtectionClassificationPending: "true",
+		})
 	}
 	if err := persistProtectionCoverage(ctx, db, epoch, result.Checkpoint.ID, liveDigest); err != nil {
 		return err
@@ -2265,4 +2285,24 @@ func metaPathKey(rel string) string {
 		"\r", "\\r",
 	)
 	return replacer.Replace(rel)
+}
+
+func captureIssues(skips map[string]skippedPresent) []state.CheckpointCaptureIssue {
+	var issues []state.CheckpointCaptureIssue
+	for path, skip := range skips {
+		switch skip.Reason {
+		case "sensitive", "safe_ignore", "gitignore": continue
+		case "invalid_path": path = "" // no control characters in the ledger
+		}
+		issues = append(issues, state.CheckpointCaptureIssue{Path:path, Subtree:skip.Dir || path=="", Reason:skip.Reason})
+	}
+	sort.Slice(issues, func(i,j int) bool { return issues[i].Path < issues[j].Path })
+	// Several invalid names all represent the same unknown scope.
+	unique := issues[:0]
+	for _, issue := range issues { if len(unique)==0 || unique[len(unique)-1].Path!=issue.Path { unique=append(unique,issue) } }
+	return unique
+}
+
+func partialCaptureError(summary CaptureSummary) error {
+	return fmt.Errorf("daemon: protection scan incomplete (unreadable=%d unstable=%d); readable files saved in a partial checkpoint", summary.Errors, summary.Oversize)
 }

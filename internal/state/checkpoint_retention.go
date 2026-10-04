@@ -12,6 +12,7 @@ type RetentionCheckpoint struct {
 	Sequence                               int64
 	CreatedTS                              float64
 	Retained, Published, Unresolved        bool
+	LatestComplete bool
 }
 
 func RetentionCheckpoints(ctx context.Context, db *DB, worktreeID string) ([]RetentionCheckpoint, error) {
@@ -21,6 +22,7 @@ func RetentionCheckpoints(ctx context.Context, db *DB, worktreeID string) ([]Ret
 	rows, err := db.readSQL().QueryContext(ctx, `
 SELECT cp.id,cp.worktree_id,cp.reason,cp.checkpoint_ref,cp.commit_oid,
        cp.seq,cp.created_ts,cp.retained,
+       cp.coverage_complete=1 AND cp.seq=(SELECT MAX(full.seq) FROM checkpoints full WHERE full.worktree_id=cp.worktree_id AND full.phase='completed' AND full.retained=1 AND full.coverage_complete=1),
        EXISTS (
          SELECT 1 FROM checkpoint_events ce
          WHERE ce.checkpoint_id=cp.id
@@ -50,7 +52,7 @@ ORDER BY cp.seq DESC`, worktreeID)
 		var item RetentionCheckpoint
 		if err := rows.Scan(&item.ID, &item.WorktreeID, &item.Reason, &item.Ref,
 			&item.CommitOID, &item.Sequence, &item.CreatedTS, &item.Retained,
-			&item.Published, &item.Unresolved); err != nil {
+			&item.LatestComplete, &item.Published, &item.Unresolved); err != nil {
 			return nil, err
 		}
 		checkpoints = append(checkpoints, item)
