@@ -3233,6 +3233,10 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("queue settled experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
 		}
 
+		// Capture health must clear after successful capture even when replay fails.
+		if capErr == nil && !capSum.Partial {
+			_ = state.RecordCaptureHealth(ctx, opts.DB, "", capSum.CheckpointID, now())
+		}
 		// Tick error counters.
 		if capErr != nil {
 			consecutiveErrors++
@@ -3246,7 +3250,6 @@ func Run(ctx context.Context, opts Options) error {
 				ctx, opts.DB, repErr, now())
 			if providerWait {
 				consecutiveErrors = 0
-				_ = state.RecordCaptureHealth(ctx, opts.DB, "", capSum.CheckpointID, now())
 				if metaErr != nil {
 					logger.Warn("clear replay error observability for provider wait",
 						"err", metaErr.Error())
@@ -3270,7 +3273,6 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		} else {
 			consecutiveErrors = 0
-			_ = state.RecordCaptureHealth(ctx, opts.DB, "", capSum.CheckpointID, now())
 			if replayChecked {
 				previous, repeats, metaErr := clearReplayErrorObservability(
 					ctx, opts.DB)
