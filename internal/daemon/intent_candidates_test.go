@@ -4527,7 +4527,7 @@ func TestIntentProviderOutageSurvivesRestartsWithoutConsumingAttempts(t *testing
 	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
 	identity := IntentPlannerProviderIdentity{Provider: planner.Name()}
 	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, Captures: []IntentCandidateCapture{capture}, Planner: planner,
-		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced, VerificationMode: "structural",
+		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced, VerificationMode: "structural", RejectLocalFallback: true,
 		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil }}
 	for attempt := 0; attempt < 8; attempt++ {
 		input.Health = NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: identity, Now: func() time.Time { return now }})
