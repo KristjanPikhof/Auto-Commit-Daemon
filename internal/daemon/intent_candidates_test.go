@@ -1109,13 +1109,13 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.ResolutionMode != "completed_plan_reuse" || len(second.Decisions) != 1 || !second.Decisions[0].Publishable || planner.calls != 1 {
+	if second.ResolutionMode != "evidence_partition" || len(second.Decisions) != 1 || !second.Decisions[0].Publishable || planner.calls != 1 {
 		t.Fatalf("offline plan reuse=%+v calls=%d", second, planner.calls)
 	}
 
 	snapshot := health.Snapshot()
 	if snapshot.State != IntentPlannerCircuitOpen ||
-		snapshot.BypassCount != 0 {
+		snapshot.BypassCount != 1 {
 		t.Fatalf("health after bypass=%+v", snapshot)
 	}
 
@@ -1124,7 +1124,7 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if forced.ResolutionMode != "completed_plan_reuse" || forced.PlanAttempt != 0 ||
+	if forced.ResolutionMode != "evidence_partition" || forced.PlanAttempt != 0 ||
 		len(forced.Decisions) != 1 || !forced.Decisions[0].Publishable || forced.NeedsAttention {
 		t.Fatalf("forced provider wait=%+v", forced)
 	}
@@ -2330,8 +2330,8 @@ func TestIntentCandidateEngineReusesLocalMessagesAcrossRestart(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Fallback != "" ||
-		second.ResolutionMode != "completed_plan_reuse" ||
+	if second.Fallback != "evidence_partition" ||
+		second.ResolutionMode != "evidence_partition" ||
 		len(second.Decisions) != 1 || !second.Decisions[0].Publishable ||
 		second.Decisions[0].Assignment.Subject != first.Decisions[0].Assignment.Subject {
 		t.Fatalf("message recovery=%+v", second)

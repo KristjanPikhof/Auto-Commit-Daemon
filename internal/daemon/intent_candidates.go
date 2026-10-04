@@ -2194,6 +2194,11 @@ func applyIntentFallbackMessageQuality(
 		locked := ai.IntentPlan{SelectedSeqs: candidate.SelectedSeqs, Subject: candidate.Subject, Body: candidate.Body}
 		report := ai.EvaluateIntentPlanMessageQuality(ai.LegacyIntentPlanRequest(req), locked)
 		if report.Action == ai.MessageQualityClean || report.Action == ai.MessageQualitySanitizeAccept {
+			plan.Candidates[i].Subject = report.SanitizedSubject
+			plan.Candidates[i].Body = report.SanitizedBody
+			if plan.Candidates[i].Body == "" {
+				plan.Candidates[i].Body = localIntentMessageBody(req, candidate.SelectedSeqs)
+			}
 			continue
 		}
 		subject, _ := deterministicIntentCandidateMessage(req, candidate.SelectedSeqs)
@@ -2213,7 +2218,11 @@ func localIntentMessageBody(req ai.IntentPlanRequestV2, seqs []int64) string {
 		if !selected[capture.Seq] {
 			continue
 		}
-		bullets = append(bullets, fmt.Sprintf("- Preserve the captured %s to %s", capture.Op, capture.Path))
+		detail := fmt.Sprintf("- Preserve the captured %s of %s", capture.Op, capture.Path)
+		if capture.FileMetadata != nil && capture.FileMetadata.Kind == "binary" {
+			detail += fmt.Sprintf(" (%d bytes; binary contents omitted from AI)", capture.FileMetadata.AfterBytes)
+		}
+		bullets = append(bullets, detail)
 	}
 	return strings.Join(bullets, "\n")
 }
@@ -4307,12 +4316,15 @@ func deterministicIntentCandidateMessage(
 	}
 	subject := ai.DiffAwareSubject(ai.OpItem{Op: primary.Op, Path: primary.Path}, primary.CapturedDiff)
 	if subject == "" || strings.Contains(subject, path.Base(primary.Path)) {
-		label := intentSemanticStem(IntentCandidateCapture{Event: state.CaptureEvent{Path: primary.Path}})
+		label := path.Base(intentSemanticStem(IntentCandidateCapture{Event: state.CaptureEvent{Path: primary.Path}}))
 		label = strings.ReplaceAll(strings.ReplaceAll(label, "_", " "), "-", " ")
 		if label == "" {
 			label = "protected"
 		}
 		role := intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: primary.Path}})
+		if primary.FileMetadata != nil && primary.FileMetadata.Kind == "binary" {
+			role = "asset"
+		}
 		verb := "Update"
 		if primary.Op == "create" {
 			verb = "Add"
