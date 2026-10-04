@@ -12,7 +12,7 @@ type RetentionCheckpoint struct {
 	Sequence                               int64
 	CreatedTS                              float64
 	Retained, Published, Unresolved        bool
-	LatestComplete bool
+	LatestComplete                         bool
 }
 
 func RetentionCheckpoints(ctx context.Context, db *DB, worktreeID string) ([]RetentionCheckpoint, error) {
