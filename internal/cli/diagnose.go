@@ -115,7 +115,7 @@ type diagnoseReport struct {
 	WorktreeClean            bool                         `json:"worktree_clean"`
 	AllChangesCommittedInGit bool                         `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
-	CaptureHealth state.CaptureHealth `json:"capture_health"`
+	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
 	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
 	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
 }
@@ -273,10 +273,14 @@ func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseR
 	report.PublicationOutcome = status.PublicationOutcome
 	report.PublicationDrain = status.PublicationDrain
 	report.CheckpointMaintenance = status.CheckpointMaintenance
-	report.CaptureHealth=status.CaptureHealth
-	if status.CaptureHealth.State == "blocked" { report.Remediation=append(report.Remediation,"Checkpoint protection is incomplete: " + status.CaptureHealth.Error) }
+	report.CaptureHealth = status.CaptureHealth
+	if status.CaptureHealth.State == "blocked" {
+		report.Remediation = append(report.Remediation, "Checkpoint protection is incomplete: "+status.CaptureHealth.Error)
+	}
 	report.Remediation = diagnoseRemediation(report)
-	if status.CaptureHealth.State == "blocked" { report.Remediation=append(report.Remediation,"Checkpoint protection is incomplete: " + status.CaptureHealth.Error) }
+	if status.CaptureHealth.State == "blocked" {
+		report.Remediation = append(report.Remediation, "Checkpoint protection is incomplete: "+status.CaptureHealth.Error)
+	}
 	if details := maintenanceDetails(report.CheckpointMaintenance); details != "" {
 		report.Remediation = append(report.Remediation, details+" "+report.CheckpointMaintenance.NextAction())
 	}
