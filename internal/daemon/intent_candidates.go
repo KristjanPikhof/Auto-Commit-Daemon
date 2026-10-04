@@ -24,6 +24,7 @@ import (
 // candidate evaluation. CapturedDiff is transient planner context and is never
 // copied into candidate or dependency state.
 type IntentCandidateCapture struct {
+	FileMetadata *ai.IntentFileMetadata
 	Event        state.CaptureEvent
 	Ops          []state.CaptureOp
 	CapturedDiff string
@@ -1021,7 +1022,7 @@ func buildIntentCandidateRequest(
 		offered = append(offered, ai.OfferedCapture{
 			Seq: capture.Event.Seq, Path: capture.Event.Path, Op: op,
 			Timestamp: time.Unix(0, int64(capture.Event.CapturedTS*1e9)).UTC(),
-			Fidelity:  capture.Event.Fidelity, CapturedDiff: capture.CapturedDiff,
+			Fidelity:  capture.Event.Fidelity, CapturedDiff: capture.CapturedDiff, FileMetadata: capture.FileMetadata,
 		})
 		visibleSeqs[capture.Event.Seq] = struct{}{}
 	}

@@ -63,13 +63,22 @@ type PathRecentCommit struct {
 
 // OfferedCapture is one capture the planner may either select or defer.
 type OfferedCapture struct {
-	Seq          int64     `json:"seq"`
-	Path         string    `json:"path"`
-	Op           string    `json:"op"`
-	Timestamp    time.Time `json:"timestamp"`
-	Fidelity     string    `json:"fidelity"`
-	DeferCount   int       `json:"defer_count"`
-	CapturedDiff string    `json:"captured_diff,omitempty"`
+	FileMetadata *IntentFileMetadata `json:"file_metadata,omitempty"`
+	Seq          int64               `json:"seq"`
+	Path         string              `json:"path"`
+	Op           string              `json:"op"`
+	Timestamp    time.Time           `json:"timestamp"`
+	Fidelity     string              `json:"fidelity"`
+	DeferCount   int                 `json:"defer_count"`
+	CapturedDiff string              `json:"captured_diff,omitempty"`
+}
+
+// IntentFileMetadata describes captured blobs without sending their contents.
+type IntentFileMetadata struct {
+	Kind              string `json:"kind"`
+	BeforeBytes       int64  `json:"before_bytes"`
+	AfterBytes        int64  `json:"after_bytes"`
+	DiffOmittedReason string `json:"diff_omitted_reason,omitempty"`
 }
 
 // IntentPlanRequest is the structured planner input shared by OpenAI-compatible

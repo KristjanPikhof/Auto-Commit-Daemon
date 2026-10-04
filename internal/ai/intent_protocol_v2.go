@@ -403,10 +403,14 @@ func validateNativeIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) erro
 
 // LegacyIntentPlanRequest projects common fields for v1 provider compatibility.
 func LegacyIntentPlanRequest(req IntentPlanRequestV2) IntentPlanRequest {
+	offered := append([]OfferedCapture(nil), req.OfferedCaptures...)
+	for i := range offered {
+		offered[i].FileMetadata = nil
+	}
 	return IntentPlanRequest{
 		LatestCommit:          cloneCommitSummary(req.LatestCommit),
 		PathCommitContext:     clonePathCommitContext(req.PathCommitContext),
-		OfferedCaptures:       append([]OfferedCapture(nil), req.OfferedCaptures...),
+		OfferedCaptures:       offered,
 		ForcedAging:           req.ForcedAging,
 		CommitFormat:          req.CommitFormat,
 		CapturedDiffTransform: req.CapturedDiffTransform,

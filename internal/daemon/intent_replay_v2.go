@@ -79,6 +79,9 @@ func replayIntentCandidateBatch(
 			CoveredEvents: covered,
 		})
 	}
+	if err := attachIntentFileMetadata(ctx, repoRoot, captures); err != nil {
+		return sum, err
+	}
 	retryLimit := resolvedIntentRetryLimit()
 	if cfg.retryLimit != nil {
 		retryLimit = *cfg.retryLimit
