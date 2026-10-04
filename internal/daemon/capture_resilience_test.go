@@ -180,6 +180,13 @@ func TestCaptureResiliencePartialProtectionPreservesShadow(t *testing.T) {
 	if err == nil || repeat.CheckpointID != partial.CheckpointID || repeat.EventsAppended != 0 {
 		t.Fatalf("repeat=%+v err=%v", repeat, err)
 	}
+	if err := RequireProtectionCheckpoint(ctx, f.db, checkpointpkg.WorktreeID(f.dir), 1); err != nil {
+		t.Fatal(err)
+	}
+	barrierRetry, err := Capture(ctx, f.dir, f.db, f.cctx, opts)
+	if err == nil || barrierRetry.CheckpointID != partial.CheckpointID || barrierRetry.Protected {
+		t.Fatalf("barrier retry created duplicate coverage: %+v err=%v", barrierRetry, err)
+	}
 	indexBefore, err := git.LsFilesStaged(ctx, f.dir, "README.md")
 	if err != nil {
 		t.Fatal(err)
