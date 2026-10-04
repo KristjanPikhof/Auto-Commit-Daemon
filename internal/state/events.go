@@ -983,6 +983,10 @@ SELECT seq FROM capture_events
 WHERE state = 'published'
   AND captured_ts < ?
   AND NOT EXISTS (
+      SELECT 1 FROM publication_drain_events member
+      WHERE member.event_seq = capture_events.seq
+  )
+  AND NOT EXISTS (
       SELECT 1
       FROM recovery_snapshot_events member
       WHERE member.event_seq = capture_events.seq
