@@ -118,7 +118,7 @@ type statusReport struct {
 	LastCommitOID                 string                       `json:"last_commit_oid,omitempty"`
 	LastCommitTS                  int64                        `json:"last_commit_ts,omitempty"`
 	LastCommitMessage             string                       `json:"last_commit_message,omitempty"`
-	CaptureHealth state.CaptureHealth `json:"capture_health"`
+	CaptureHealth                 state.CaptureHealth          `json:"capture_health"`
 	CaptureErrors                 int                          `json:"capture_errors"`
 	Paused                        bool                         `json:"paused,omitempty"`
 	Pause                         *pauseInfo                   `json:"pause,omitempty"`
@@ -420,8 +420,12 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 	}
 
 	report.CaptureHealth, err = state.ReadCaptureHealth(ctx, conn)
-	if err != nil { return report, err }
-	if report.CaptureHealth.State == "blocked" { report.CaptureErrors=max(report.CaptureErrors, max(1,report.CaptureHealth.IssueCount)) }
+	if err != nil {
+		return report, err
+	}
+	if report.CaptureHealth.State == "blocked" {
+		report.CaptureErrors = max(report.CaptureErrors, max(1, report.CaptureHealth.IssueCount))
+	}
 
 	// Durable capture-backpressure state. Presence of the meta key signals
 	// "saturated"; readers should not block on the timestamp shape.
