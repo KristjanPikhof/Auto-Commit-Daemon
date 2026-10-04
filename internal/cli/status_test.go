@@ -890,6 +890,15 @@ func TestPublicationProgressPrioritizesDeliberateWaits(t *testing.T) {
 			report.Paused = true
 			report.Pause = &pauseInfo{Source: "manual"}
 		}, want: "paused"},
+		{name: "manual pause during capture retry", mutate: func(report *statusReport) {
+			report.Paused = true
+			report.Pause = &pauseInfo{Source: "manual"}
+			report.CaptureHealth = state.CaptureHealth{State: "retrying", Error: "unstable file"}
+		}, want: "paused"},
+		{name: "blocked drain during capture retry", mutate: func(report *statusReport) {
+			report.PublicationDrain.Phase = state.PublicationDrainNeedsAction
+			report.CaptureHealth = state.CaptureHealth{State: "retrying", Error: "unstable file"}
+		}, want: "needs_action"},
 		{name: "rewind grace", mutate: func(report *statusReport) {
 			report.Paused = true
 			report.Pause = &pauseInfo{Source: "rewind_grace", RemainingSeconds: 23}

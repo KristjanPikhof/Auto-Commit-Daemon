@@ -661,7 +661,7 @@ func buildPublicationProgressReport(
 				report.IntentStrategy.PlannerHealth, now)
 			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery:
-		case report.CheckpointProtectionAvailable && !report.Protected && report.Busy:
+		case report.CheckpointProtectionAvailable && !report.Protected:
 			progress.Phase = "checkpointing"
 		case intentProviderCallActive(report):
 			progress.Phase = "provider_call"
@@ -699,7 +699,7 @@ func buildPublicationProgressReport(
 		publicationPhaseCanStall(progress.Phase) {
 		progress.Phase = "stalled"
 	}
-	if report.CaptureHealth.Error != "" {
+	if report.CaptureHealth.Error != "" && progress.Phase != "needs_action" && progress.Phase != "paused" {
 		progress.Phase = "capture_blocked"
 		if report.CaptureHealth.State == "retrying" {
 			progress.Phase = "capture_retry"

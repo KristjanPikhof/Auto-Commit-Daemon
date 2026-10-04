@@ -3,12 +3,15 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
@@ -73,20 +76,129 @@ func TestCaptureHealthTruthWithResponsiveWorkerAndEmptyQueue(t *testing.T) {
 
 func TestCaptureHealthCheckpointStallWithoutPendingEvents(t *testing.T) {
 	t.Setenv("ACD_AI_TIMEOUT", "1m")
-	report := statusReport{Daemon: "running", PID: os.Getpid(), Busy: true, CheckpointProtectionAvailable: true, FullPollTS: 100}
-	progress, err := buildPublicationProgressReport(context.Background(), nil, report, time.Unix(1000, 0))
-	if err != nil || progress.Phase != "stalled" || progress.QueuePending != 0 {
-		t.Fatalf("empty queue stall=%+v err=%v", progress, err)
+	for _, pending := range []bool{false, true} {
+		for _, age := range []time.Duration{time.Minute, time.Hour} {
+			t.Run(strconv.FormatBool(pending)+"/"+age.String(), func(t *testing.T) {
+				ctx := context.Background()
+				repo, dbPath, db := makeSeededRepoStateDB(t)
+				now := time.Now().Truncate(time.Second)
+				lastPoll := now.Add(-age)
+				if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(now.Unix()), UpdatedTS: float64(now.Unix())}); err != nil {
+					t.Fatal(err)
+				}
+				if err := state.MetaSetMany(ctx, db, map[string]string{
+					daemon.MetaKeyProtectionFullPollTS:       strconv.FormatInt(lastPoll.Unix(), 10),
+					daemon.MetaKeyProtectionObservationEpoch: "2",
+					daemon.MetaKeyProtectionCoveredEpoch:     "1",
+					daemon.MetaKeyProtectionComplete:         "false",
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if pending {
+					if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+						BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: "head",
+						Operation: "modify", Path: "main.go", Fidelity: "exact", CapturedTS: float64(lastPoll.Unix()),
+					}, nil); err != nil {
+						t.Fatal(err)
+					}
+				}
+				rec := central.RepoRecord{Path: repo, StateDB: dbPath, RepositoryID: "repository", WorktreeID: "worktree"}
+				report, err := buildStatusReport(ctx, rec, now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				overview, err := readProductListRepo(ctx, rec, now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantPhase := "checkpointing"
+				if age == time.Hour {
+					wantPhase = "stalled"
+				}
+				for _, got := range []publicationProgressReport{report.PublicationProgress, overview.report.PublicationProgress} {
+					if got.Phase != wantPhase || got.LastProgressTS != float64(lastPoll.Unix()) {
+						t.Fatalf("checkpoint phase=%+v want=%s baseline=%d", got, wantPhase, lastPoll.Unix())
+					}
+					if !pending && got.QueuePending != 0 {
+						t.Fatalf("empty queue progress=%+v", got)
+					}
+				}
+				if wantPhase == "stalled" {
+					control := controlResult{OK: true, Enabled: true}
+					applyControlStatusWithDaemonAlive(&control, report, true)
+					if control.Health != controlHealthNeedsAttention || control.Protected || strings.Contains(control.Summary, "remains protected") {
+						t.Fatalf("capture stall=%+v", control)
+					}
+					entry := productListEntryFromOverview(rec, supervisor.WorkerStatus{}, overview, nil)
+					if entry.State != productStateNeedsAction || entry.PublicationProgress.Phase != "stalled" {
+						t.Fatalf("list masked stalled checkpoint: %+v", entry)
+					}
+				}
+			})
+		}
 	}
-	report.PublicationProgress = progress
-	control := controlResult{OK: true, Enabled: true}
-	applyControlStatusWithDaemonAlive(&control, report, true)
-	if control.Health != controlHealthNeedsAttention || control.Protected || strings.Contains(control.Summary, "remains protected") {
-		t.Fatalf("capture stall=%+v", control)
+}
+
+func TestCaptureHealthPreservesIndependentAttention(t *testing.T) {
+	for _, captureState := range []string{"retrying", "blocked"} {
+		for _, tc := range []struct {
+			name, remedy string
+			mutate       func(*statusReport)
+		}{
+			{"manual pause", "pause reason", func(s *statusReport) { s.Paused = true; s.Pause = &pauseInfo{Source: "manual"} }},
+			{"backpressure", "clearing backpressure", func(s *statusReport) { s.BackpressurePaused = true }},
+			{"configuration", "config edit", func(s *statusReport) { s.Configuration.Configuration = "needs_attention" }},
+			{"blocked drain", "support diagnose", func(s *statusReport) { s.PublicationDrain.Phase = state.PublicationDrainNeedsAction }},
+			{"replay", "support recover", func(s *statusReport) { s.Replay.State = "needs_attention" }},
+			{"terminal captures", "support recover", func(s *statusReport) { s.ActiveTerminalEvents = 1 }},
+			{"barrier", "support recover", func(s *statusReport) { s.ActiveBarriers = 1 }},
+			{"Intent recovery", intentRecoveryVerificationAttentionNext, func(s *statusReport) {
+				s.PublicationProgress = publicationProgressReport{Origin: "intent_recovery", Phase: "needs_action"}
+			}},
+		} {
+			t.Run(captureState+"/"+tc.name, func(t *testing.T) {
+				report := statusReport{Daemon: "running", PID: os.Getpid(), CaptureHealth: state.CaptureHealth{State: captureState, Error: "unstable file"}}
+				tc.mutate(&report)
+				control := controlResult{OK: true, Enabled: true}
+				applyControlStatusWithDaemonAlive(&control, report, true)
+				if control.OK || control.Health != controlHealthNeedsAttention || !strings.Contains(control.NextAction, tc.remedy) || !strings.Contains(control.Summary, "incomplete") {
+					t.Fatalf("capture hides attention: %+v", control)
+				}
+				envelope := envelopeFromControl(control)
+				if envelope.State != productStateNeedsAction || envelope.Data.(productStatusData).CaptureHealth.Error != report.CaptureHealth.Error {
+					t.Fatalf("status lost required action or capture health: %+v", envelope)
+				}
+				entry := productListEntryFromOverview(central.RepoRecord{RepositoryID: "repository", WorktreeID: "worktree"}, supervisor.WorkerStatus{}, productListRepoOverview{report: report}, nil)
+				if entry.State != productStateNeedsAction || entry.CaptureHealth.Error != report.CaptureHealth.Error {
+					t.Fatalf("list lost required action or capture health: %+v", entry)
+				}
+			})
+		}
 	}
-	entry := productListEntryFromOverview(central.RepoRecord{RepositoryID: "repository", WorktreeID: "worktree"}, supervisor.WorkerStatus{}, productListRepoOverview{report: report}, nil)
-	if entry.State != productStateNeedsAction || entry.PublicationProgress.Phase != "stalled" {
-		t.Fatalf("list masked stalled checkpoint: %+v", entry)
+}
+
+func TestCaptureHealthDiagnosePreservesIndependentAttention(t *testing.T) {
+	for _, operational := range []bool{false, true} {
+		report := diagnoseReport{CaptureHealth: state.CaptureHealth{State: "retrying", Error: "unstable file"}}
+		if operational {
+			report.OperationalState = "needs_attention"
+		} else {
+			report.PublicationDrain.Phase = state.PublicationDrainNeedsAction
+		}
+		var output bytes.Buffer
+		if err := renderProductDiagnoseReport(&output, report); err != nil {
+			t.Fatal(err)
+		}
+		var envelope struct {
+			State productState   `json:"state"`
+			Data  diagnoseReport `json:"data"`
+		}
+		if err := json.Unmarshal(output.Bytes(), &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.State != productStateNeedsAction || envelope.Data.CaptureHealth.Error != report.CaptureHealth.Error {
+			t.Fatalf("diagnose lost required action or capture health: %s", output.String())
+		}
 	}
 }
 

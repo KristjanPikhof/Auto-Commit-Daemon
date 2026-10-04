@@ -9,12 +9,17 @@
   contains metadata only.
 - Save readable work in explicit partial checkpoints when eligible files cannot
   be read. Retain the last complete checkpoint and prevent incomplete restore
-  or barrier proofs. Independent documentation can continue publishing.
+  or barrier proofs. Independent documentation can continue publishing past
+  held queue prefixes in Event mode.
 - Bound Intent provider work with a restart-safe deadline and use local messages
   for safe fallback groups without a second call to an unavailable provider.
+  Local messages recover from rejected symbol-only subjects, and native planner
+  metadata preserves text-diff truncation.
 - Report capture health consistently across status, list, doctor, diagnose, and
   recovery. Recovery no longer reports healthy publication state as complete
   protection or claims a repair was applied when nothing changed.
+  Capture retries keep manual pauses and other required actions visible; status
+  and list agree on checkpoint stalls, including scans with empty queues.
 - Preserve published captures referenced by completed publication drains during
   retention, preventing foreign-key failures.
 

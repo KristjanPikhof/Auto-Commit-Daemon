@@ -85,6 +85,10 @@ State priority is `off`, `needs_action`, `publishing`, `waiting`, `protected`.
 The independent `protected` boolean may remain true in the middle three
 publication/repair states.
 
+A manual pause or independent safety block stays visible while capture retries.
+Status and list use the same checkpoint progress timestamp to detect stalled
+scans, including scans with no queued captures.
+
 Default status shows `Protection`, `Current changes saved`, `Branch commits`,
 an optional `Recovery` count, and `Next`. `acd status --verbose` adds operational
 detail. Branch publication and recovery preservation are distinct outcomes.

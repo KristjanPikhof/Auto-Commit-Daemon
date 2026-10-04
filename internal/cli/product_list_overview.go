@@ -494,6 +494,8 @@ func readProductListProtection(ctx context.Context, conn *sql.DB, report *status
 	report.ObservationEpoch = lookupInt(daemon.MetaKeyProtectionObservationEpoch)
 	report.CoveredEpoch = lookupInt(daemon.MetaKeyProtectionCoveredEpoch)
 	report.LatestCheckpointID, _, _ = metaLookup(ctx, conn, daemon.MetaKeyProtectionCheckpointID)
+	fullPoll, _, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionFullPollTS)
+	report.FullPollTS, _ = strconv.ParseFloat(fullPoll, 64)
 	completeValue, _, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionComplete)
 	var err error
 	report.CheckpointMaintenance, err = readCheckpointMaintenance(ctx, conn)
