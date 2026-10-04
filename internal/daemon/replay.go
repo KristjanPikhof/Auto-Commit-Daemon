@@ -839,6 +839,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	for _, ev := range pending {
+		publicationIssues, err = state.CurrentCaptureIssues(ctx, db)
+		if err != nil {
+			return sum, err
+		}
 		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
 		if err != nil {
 			return sum, err
@@ -856,7 +860,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			sum.SkippedReason = "capture_wait: " + hold
 			continue
 		}
-		if len(publicationIssues) > 0 {
+		if scanKey != "" || len(publicationIssues) > 0 {
 			predecessorPending, err := captureEventHasPendingPredecessor(ctx, db, ev)
 			if err != nil {
 				return sum, err
@@ -1252,6 +1256,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		})
 	}
 
+	if sum.Published > 0 {
+		sum.Skipped = false
+		sum.SkippedReason = ""
+	}
 	return sum, nil
 }
 
