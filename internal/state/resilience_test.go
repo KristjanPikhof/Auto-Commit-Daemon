@@ -93,3 +93,59 @@ func TestResilienceProviderDeadlineSurvivesRestart(t *testing.T) {
 		t.Fatalf("budget reset across restart: %+v err=%v", run, err)
 	}
 }
+
+func TestResilienceV28ReaderDoesNotMigrateCoverage(t *testing.T) {
+	ctx := context.Background()
+	db, path := openTestDB(t)
+	cp := seedPublicationDrainCheckpoint(t, db, []string{"legacy"})
+	for _, query := range []string{`DROP TABLE checkpoint_capture_issues`, `ALTER TABLE checkpoints DROP COLUMN coverage_complete`, `ALTER TABLE intent_plan_runs DROP COLUMN provider_deadline_ts`, `PRAGMA user_version=28`} {
+		if _, err := db.SQL().ExecContext(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := ReadCheckpointProjection(ctx, path, 1)
+	if err != nil || projection.SchemaVersion != 28 || projection.Latest == nil || projection.Latest.Partial {
+		t.Fatalf("legacy reader=%+v err=%v", projection, err)
+	}
+	if _, err := ResolveCheckpoint(ctx, path, cp.ID); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	projection, err = ReadCheckpointProjection(ctx, path, 1)
+	if err != nil || projection.SchemaVersion != SchemaVersion || projection.Latest.Partial {
+		t.Fatalf("migrated reader=%+v err=%v", projection, err)
+	}
+}
+
+func TestResilienceRetainsLastCompleteBehindPartial(t *testing.T) {
+	ctx := context.Background()
+	db, _ := openTestDB(t)
+	complete := seedPublicationDrainCheckpoint(t, db, []string{"complete"})
+	partial := complete
+	partial.ID = "cp-124-0123456789abcdef"
+	partial.OperationID = "partial-retention"
+	partial.Ref = "refs/acd/checkpoints/v1/" + partial.WorktreeID + "/" + partial.ID
+	partial.Partial = true
+	partial.CaptureIssues = []CheckpointCaptureIssue{{Path: "unreadable.go", Reason: "unreadable"}}
+	partial.EventSeqs = nil
+	if _, err := PrepareCheckpoint(ctx, db, partial, checkpointTestDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := CompleteCheckpoint(ctx, db, partial.ID, partial.Ref, partial.CommitOID, 2); err != nil {
+		t.Fatal(err)
+	}
+	checkpoints, err := RetentionCheckpoints(ctx, db, complete.WorktreeID)
+	if err != nil || len(checkpoints) != 2 || checkpoints[0].LatestComplete || !checkpoints[1].LatestComplete {
+		t.Fatalf("complete retention=%+v err=%v", checkpoints, err)
+	}
+	if _, err := PreparePublicationDrain(ctx, db, PublicationDrain{ID: "partial-drain", CheckpointID: partial.ID, WorktreeID: partial.WorktreeID, BranchRef: partial.ObservedRef, BranchGeneration: 7, Phase: PublicationDrainCheckpointing, CreatedTS: 2, UpdatedTS: 2}); !errors.Is(err, ErrCheckpointPartial) {
+		t.Fatalf("partial full barrier err=%v", err)
+	}
+}

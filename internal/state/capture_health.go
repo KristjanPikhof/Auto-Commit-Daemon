@@ -73,23 +73,21 @@ func RecordCaptureHealth(ctx context.Context, db *DB, failure, checkpointID stri
 			if err != nil {
 				return err
 			}
-			{
-				if checkpoint.ID != health.CheckpointID {
-					health.LastProgressTS = ts
-					health.CheckpointID = checkpoint.ID
-				}
-				retryable := len(checkpoint.CaptureIssues) > 0
-				for _, issue := range checkpoint.CaptureIssues {
-					if issue.Reason != "unstable" && issue.Reason != "lstat_error" {
-						retryable = false
-					}
-				}
-				if retryable && ts-health.SinceTS < 120 {
-					health.State = "retrying"
-				}
-				health.IssueCount = len(checkpoint.CaptureIssues)
-				health.Issues = checkpoint.CaptureIssues[:min(10, len(checkpoint.CaptureIssues))]
+			if checkpoint.ID != health.CheckpointID {
+				health.LastProgressTS = ts
+				health.CheckpointID = checkpoint.ID
 			}
+			retryable := len(checkpoint.CaptureIssues) > 0
+			for _, issue := range checkpoint.CaptureIssues {
+				if issue.Reason != "unstable" && issue.Reason != "lstat_error" {
+					retryable = false
+				}
+			}
+			if retryable && ts-health.SinceTS < 120 {
+				health.State = "retrying"
+			}
+			health.IssueCount = len(checkpoint.CaptureIssues)
+			health.Issues = checkpoint.CaptureIssues[:min(10, len(checkpoint.CaptureIssues))]
 		}
 	} else {
 		progress := health.LastProgressTS

@@ -190,3 +190,76 @@ func TestCaptureResilienceProviderBudgetStopsUnchangedCalls(t *testing.T) {
 		t.Fatalf("budget reuse=%+v err=%v", second, err)
 	}
 }
+
+func TestCaptureResilienceUnreadableRootIsUnknownScope(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires enforced file permissions")
+	}
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	store := checkpointpkg.Store{DB: f.db}
+	opts := CaptureOpts{CheckpointStore: &store, IgnoreChecker: f.ig}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, opts); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(f.dir, 0111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(f.dir, 0755) })
+	partial, err := Capture(ctx, f.dir, f.db, f.cctx, opts)
+	if err == nil || !partial.Partial || partial.Protected || partial.EventsAppended != 0 {
+		t.Fatalf("unknown root=%+v err=%v", partial, err)
+	}
+	issues, err := state.CurrentCaptureIssues(ctx, f.db)
+	if err != nil || len(issues) != 1 || issues[0].Path != "" || !issues[0].Subtree {
+		t.Fatalf("unknown scope=%+v err=%v", issues, err)
+	}
+	if hold, err := capturePublicationHold(ctx, f.db, []string{"independent.md"}, ""); err != nil || hold == "" {
+		t.Fatalf("unknown scope permits publication: %q %v", hold, err)
+	}
+}
+
+type interruptedPartialPlanner struct {
+	partialReplanIntentCandidatePlannerStub
+	cancel context.CancelFunc
+}
+
+func (p *interruptedPartialPlanner) PlanIntentV2(ctx context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
+	if p.calls == 1 {
+		p.cancel()
+		return ai.IntentPlanV2{}, ctx.Err()
+	}
+	return p.partialReplanIntentCandidatePlannerStub.PlanIntentV2(ctx, req)
+}
+
+func TestCaptureResiliencePreservesValidatedMessagesAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := state.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	planner := &interruptedPartialPlanner{cancel: cancel}
+	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "a.go", Op: "create"}, {Seq: 2, Path: "b.go", Op: "create"}}}
+	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, Provider: planner.Name()}
+	if _, _, _, _, _, _, _, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 2, config.PresetFast, nil, db, input); !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted correction err=%v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = state.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	restarted := &partialReplanIntentCandidatePlannerStub{calls: 1}
+	plan, _, _, _, _, _, run, err := chooseIntentCandidatePlan(context.Background(), req, restarted, nil, 2, config.PresetFast, nil, db, input)
+	if err != nil || run.ResolutionMode.String != "partial_replan" || len(plan.Candidates) != 2 || len(restarted.reqs) != 1 || len(restarted.reqs[0].OfferedCaptures) != 1 {
+		t.Fatalf("restart groups=%+v run=%+v req=%+v err=%v", plan, run, restarted.reqs, err)
+	}
+	if plan.Candidates[0].CandidateID != "locked-a" || plan.Candidates[0].Subject != "Update source change" {
+		t.Fatalf("validated message changed: %+v", plan.Candidates)
+	}
+}

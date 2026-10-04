@@ -3234,7 +3234,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		// Capture health must clear after successful capture even when replay fails.
-		if capErr == nil && !capSum.Partial {
+		if capErr == nil && capSum.Protected {
 			_ = state.RecordCaptureHealth(ctx, opts.DB, "", capSum.CheckpointID, now())
 		}
 		// Tick error counters.
