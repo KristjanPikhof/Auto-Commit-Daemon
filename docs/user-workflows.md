@@ -116,8 +116,8 @@ new `HEAD`. Existing commits are not rewritten.
 
 If the configured provider is unavailable, ACD can publish a dependency-safe
 local group with an evidence-based message. It does not ask the same unavailable
-provider to rewrite that message. Ambiguous groups remain protected. Recovery also runs during normal
-background publication. It does not require another `commit-all`, a database
+provider to rewrite that message. Ambiguous groups remain protected. Recovery
+also runs during normal background publication. It does not require another `commit-all`, a database
 purge, or a manual Git commit.
 
 This command is also the normal way to let ACD include staged changes. ACD
