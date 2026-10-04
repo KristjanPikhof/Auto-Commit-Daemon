@@ -146,7 +146,7 @@ const stateSubdir = "acd"
 type CaptureSummary struct {
 	EventsAppended   int   // number of capture_events rows inserted
 	EventsDropped    int   // ops refused due to ACD_MAX_PENDING_EVENTS cap
-	Oversize         int   // files skipped due to size cap
+	Oversize         int   // files skipped due to instability (legacy field name)
 	Errors           int   // soft errors (per-file lstat/open failures)
 	WalkedFiles      int64 // for diagnostics
 	PendingDepth     int   // pending depth observed for the active generation at end of pass (0 if cap disabled)
@@ -1882,7 +1882,7 @@ func protectedFileReason(path string, opts walkOpts) string {
 // hashCandidate hashes one candidate path into the git object store. For
 // symlinks: read target bytes, hash with mode 120000. For regulars: open
 // O_NOFOLLOW, verify ino+dev+mode unchanged across the open, enforce the
-// size cap (recording oversize via daemon_meta), then hash via stdin.
+// buffer threshold, then stream large files through stdin.
 //
 // Returns:
 //   - (entry, true,  "",     nil) — captured ok.
@@ -1931,75 +1931,45 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 	if !post.Mode().IsRegular() {
 		return LiveEntry{}, false, "non_regular", nil
 	}
+	var oid string
 	if post.Size() > opts.maxBytes {
-		entry, reusable, reuseErr := reuseIndexedBlob(ctx, repoRoot, c.rel, f, post)
-		if reuseErr != nil {
-			return LiveEntry{}, false, "", reuseErr
+		// The buffer threshold is not a protection limit. Git consumes the
+		// stream under its operation deadline without copying the asset here.
+		reader := io.LimitReader(f, post.Size()+1)
+		if opts.hashOnly {
+			oid, err = git.HashObjectReaderReadOnly(ctx, repoRoot, reader)
+		} else {
+			oid, err = git.HashObjectReaderDurable(ctx, repoRoot, reader)
 		}
-		if reusable {
-			return entry, true, "", nil
+	} else {
+		var buf []byte
+		buf, err = io.ReadAll(io.LimitReader(f, opts.maxBytes+1))
+		if err == nil && int64(len(buf)) != post.Size() {
+			return LiveEntry{}, false, "unstable", nil
 		}
-		recordOversize(ctx, opts.db, c.rel, post.Size(), opts.maxBytes)
-		return LiveEntry{}, false, "oversize", nil
+		if err == nil {
+			if opts.blobHasher != nil {
+				oid, err = opts.blobHasher.BlobOID(buf)
+				if err == nil && opts.blobBatch != nil {
+					err = opts.blobBatch.add(ctx, repoRoot, oid, buf)
+				}
+			} else {
+				oid, err = git.HashObjectStdin(ctx, repoRoot, buf)
+			}
+		}
 	}
-	// Read up to maxBytes+1 to detect truncation/grow during read; if we
-	// exceed, record oversize and discard.
-	buf, err := io.ReadAll(f)
 	if err != nil {
 		return LiveEntry{}, false, "", err
 	}
-	if int64(len(buf)) > opts.maxBytes {
-		recordOversize(ctx, opts.db, c.rel, int64(len(buf)), opts.maxBytes)
-		return LiveEntry{}, false, "oversize", nil
-	}
-	var oid string
-	var herr error
-	if opts.blobHasher != nil {
-		oid, herr = opts.blobHasher.BlobOID(buf)
-		if herr == nil && opts.blobBatch != nil {
-			herr = opts.blobBatch.add(ctx, repoRoot, oid, buf)
-		}
-	} else {
-		oid, herr = git.HashObjectStdin(ctx, repoRoot, buf)
-	}
-	if herr != nil {
-		return LiveEntry{}, false, "", herr
-	}
-	return LiveEntry{
-		Path: c.rel,
-		Mode: gitModeFor(post.Mode()),
-		OID:  oid,
-	}, true, "", nil
-}
-
-// reuseIndexedBlob accepts an oversized regular file only when hashing its
-// exact worktree bytes proves they already exist as the path's ordinary
-// stage-0 index blob. This keeps dirty and untracked oversized content
-// fail-closed while avoiding a duplicate object write for large tracked
-// assets that Git already protects.
-func reuseIndexedBlob(ctx context.Context, repoRoot, path string, file *os.File, before os.FileInfo) (LiveEntry, bool, error) {
-	entries, err := git.LsFilesStaged(ctx, repoRoot, path)
+	after, err := f.Stat()
 	if err != nil {
-		return LiveEntry{}, false, err
+		return LiveEntry{}, false, "", err
 	}
-	if len(entries) != 1 || entries[0].Stage != 0 || entries[0].Path != path || entries[0].Mode != gitModeFor(before.Mode()) {
-		return LiveEntry{}, false, nil
+	pathAfter, err := os.Lstat(c.full)
+	if err != nil || !sameFileSnapshot(post, after) || !sameFileSnapshot(after, pathAfter) {
+		return LiveEntry{}, false, "unstable", nil
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return LiveEntry{}, false, err
-	}
-	oid, err := git.HashObjectReaderReadOnly(ctx, repoRoot, file)
-	if err != nil {
-		return LiveEntry{}, false, err
-	}
-	after, err := file.Stat()
-	if err != nil {
-		return LiveEntry{}, false, err
-	}
-	if !sameFileSnapshot(before, after) || oid != entries[0].OID {
-		return LiveEntry{}, false, nil
-	}
-	return LiveEntry{Path: path, Mode: entries[0].Mode, OID: entries[0].OID}, true, nil
+	return LiveEntry{Path: c.rel, Mode: gitModeFor(post.Mode()), OID: oid}, true, "", nil
 }
 
 // candidateLike is the minimal shape hashCandidate needs. Aliasing the
