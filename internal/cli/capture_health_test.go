@@ -86,8 +86,9 @@ func TestCaptureHealthCheckpointStallWithoutPendingEvents(t *testing.T) {
 }
 
 func TestCaptureHealthRecoveryFailsWhenWorkerUnavailable(t *testing.T) {
-	withIsolatedHome(t)
-	repo, _, db := makeSeededRepoStateDB(t)
+	roots := withIsolatedHome(t)
+	repo, dbPath, db := makeSeededRepoStateDB(t)
+	registerRepo(t, roots, repo, dbPath, "shell")
 	if err := state.MetaSet(context.Background(), db, "last_capture_error", "eligible file unreadable"); err != nil {
 		t.Fatal(err)
 	}

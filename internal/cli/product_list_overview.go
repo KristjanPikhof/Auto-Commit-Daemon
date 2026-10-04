@@ -194,7 +194,8 @@ func productListEntryFromOverview(
 		PublicationDrain:      report.PublicationDrain,
 		CheckpointMaintenance: report.CheckpointMaintenance,
 		UnfinishedWork:        overview.unfinished,
-		CaptureHealth:         report.CaptureHealth, PublicationProgress: report.PublicationProgress, Summary: control.Summary,
+		CaptureHealth:         report.CaptureHealth,
+		PublicationProgress:   report.PublicationProgress, Summary: control.Summary,
 		Clients: overview.clients, LastCommitOID: report.LastCommitOID,
 		lastActivity: overview.lastActivity,
 	}
