@@ -24,6 +24,7 @@ type CaptureHealth struct {
 func ReadCaptureHealth(ctx context.Context, query checkpointQuery) (CaptureHealth, error) {
 	health := CaptureHealth{State: "healthy"}
 	var raw string
+	var errorUpdatedTS float64
 	err := query.QueryRowContext(ctx, `SELECT value FROM daemon_meta WHERE key='capture.health'`).Scan(&raw)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return health, err
@@ -33,7 +34,7 @@ func ReadCaptureHealth(ctx context.Context, query checkpointQuery) (CaptureHealt
 			return health, err
 		}
 	}
-	err = query.QueryRowContext(ctx, `SELECT value FROM daemon_meta WHERE key='last_capture_error'`).Scan(&raw)
+	err = query.QueryRowContext(ctx, `SELECT value,updated_ts FROM daemon_meta WHERE key='last_capture_error'`).Scan(&raw, &errorUpdatedTS)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return health, err
 	}
@@ -42,6 +43,11 @@ func ReadCaptureHealth(ctx context.Context, query checkpointQuery) (CaptureHealt
 			health.State = "blocked"
 		}
 		health.Error = raw
+		if health.SinceTS == 0 {
+			health.SinceTS = errorUpdatedTS
+		}
+	} else if err == nil && raw == "" {
+		health = CaptureHealth{State: "healthy", LastSuccessTS: health.LastSuccessTS, LastProgressTS: health.LastProgressTS, CheckpointID: health.CheckpointID}
 	}
 	return health, nil
 }

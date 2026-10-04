@@ -1738,6 +1738,12 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		}
 		if rr.LastCaptureError != "" {
 			fmt.Fprintf(out, "      last error : %s\n", rr.LastCaptureError)
+			for _, issue := range rr.CaptureHealth.Issues {
+				fmt.Fprintf(out, "      capture    : %s (%s)\n", valueOrUnset(issue.Path), issue.Reason)
+			}
+			if rr.CaptureHealth.NextRetryTS > 0 {
+				fmt.Fprintf(out, "      next retry : %s\n", time.Unix(0, int64(rr.CaptureHealth.NextRetryTS*1e9)).Format(time.RFC3339))
+			}
 		}
 		if len(rr.Notes) > 0 {
 			fmt.Fprintf(out, "      notes      : %s\n", strings.Join(rr.Notes, "; "))

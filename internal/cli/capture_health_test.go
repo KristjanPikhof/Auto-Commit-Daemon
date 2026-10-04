@@ -22,7 +22,7 @@ func TestCaptureHealthTruthWithResponsiveWorkerAndEmptyQueue(t *testing.T) {
 	if err := state.MetaSetMany(ctx, db, map[string]string{"last_capture_error": "eligible file unreadable", "protection.complete": "false"}); err != nil {
 		t.Fatal(err)
 	}
-	rec := central.RepoRecord{Path: repo, StateDB: dbPath, Enabled: true}
+	rec := central.RepoRecord{Path: repo, StateDB: dbPath}
 	status, err := buildStatusReport(ctx, rec, now)
 	if err != nil {
 		t.Fatal(err)

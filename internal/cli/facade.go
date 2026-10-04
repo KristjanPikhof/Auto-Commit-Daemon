@@ -197,7 +197,15 @@ func runProductDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut
 }
 
 func renderProductDiagnoseReport(out io.Writer, report diagnoseReport) error {
-	if report.CaptureHealth.Error != "" || report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
+	if report.CaptureHealth.Error != "" {
+		state := productStateNeedsAction
+		if report.CaptureHealth.State == "retrying" {
+			state = productStateWaiting
+		}
+		next := "Inspect the affected paths with `acd doctor`; ACD retries capture automatically."
+		return renderJSONEnvelope(out, productEnvelope{OK: true, State: state, Actions: []productAction{}, NextAction: &next, Data: report})
+	}
+	if report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.OperationalState == "needs_attention" {
 		next := "Review the blocked drain and run `acd support logs --lines 100` for the failure context."
 		return renderJSONEnvelope(out, productEnvelope{

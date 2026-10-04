@@ -212,16 +212,25 @@ func executeFix(ctx context.Context, repo string, dryRun, yes, force, clearPause
 			return &plan, err
 		}
 	}
-	if plan.CaptureHealth.State == "blocked" {
+	if plan.CaptureHealth.Error != "" {
 		lookup, lookupErr := loadControlRepo(ctx, repo)
 		if lookupErr == nil && lookup.Registered {
-			_, _ = callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout)
-			if report, statusErr := buildStatusReport(ctx, lookup.Record, time.Now()); statusErr == nil {
-				plan.CaptureHealth = report.CaptureHealth
+			_, retryErr := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout)
+			report, statusErr := buildStatusReport(ctx, lookup.Record, time.Now())
+			if statusErr != nil {
+				markFixIncomplete(&plan, statusErr)
+				return &plan, statusErr
+			}
+			plan.CaptureHealth = report.CaptureHealth
+			if retryErr != nil {
+				markFixIncomplete(&plan, retryErr)
+				return &plan, fmt.Errorf("acd support recover: checkpoint retry failed: %w", retryErr)
 			}
 		}
-		if plan.CaptureHealth.State == "blocked" {
-			return &plan, fmt.Errorf("acd support recover: capture remains incomplete: %s", plan.CaptureHealth.Error)
+		if plan.CaptureHealth.Error != "" {
+			err := fmt.Errorf("acd support recover: capture remains incomplete: %s", plan.CaptureHealth.Error)
+			markFixIncomplete(&plan, err)
+			return &plan, err
 		}
 	}
 	return &plan, nil
@@ -308,11 +317,10 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		}
 	}
 
-	if alive, desc, err := daemonAliveSQL(ctx, conn); err != nil {
+	if alive, _, err := daemonAliveSQL(ctx, conn); err != nil {
 		return fixPlan{}, err
 	} else if alive {
 		plan.RuntimeQuiescence = true
-		_ = desc
 	}
 	if branchRef == "" {
 		plan.Unsafe = append(plan.Unsafe, "detached HEAD is not safe for guided state mutation")
@@ -361,10 +369,11 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 	); err != nil {
 		return fixPlan{}, err
 	}
-	if plan.RuntimeQuiescence && len(plan.Actions) > 0 {
+	plan.RuntimeQuiescence = plan.RuntimeQuiescence && len(plan.Actions) > 0
+	if plan.RuntimeQuiescence {
 		plan.Suggestions = append(plan.Suggestions, "Apply mode will checkpoint enabled worktrees, stop the shared runtime, recover, and restart protection automatically.")
 	}
-	if plan.CaptureHealth.State == "blocked" {
+	if plan.CaptureHealth.Error != "" {
 		plan.Suggestions = append(plan.Suggestions, "Capture is incomplete: "+plan.CaptureHealth.Error+". Inspect the affected paths with `acd doctor`; ACD retries automatically.")
 	}
 	return plan, nil
@@ -1365,7 +1374,7 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintf(out, "Backup: %s\n", plan.BackupPath)
 	}
 	if len(plan.Actions) == 0 {
-		if plan.CaptureHealth.State == "blocked" {
+		if plan.CaptureHealth.Error != "" {
 			fmt.Fprintf(out, "No publication repair applies. Checkpoint protection is incomplete: %s\n", plan.CaptureHealth.Error)
 		} else if len(plan.Unsafe) == 0 && !plan.Incomplete {
 			fmt.Fprintln(out, "Repository recovery state is healthy; no changes are needed.")

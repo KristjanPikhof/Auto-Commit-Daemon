@@ -12,7 +12,7 @@
 //   - Sensitive default-deny via state.SensitiveMatcher.
 //   - Generated dependency/cache tree pruning via state.SafeIgnoreMatcher.
 //   - Gitignored paths via batch git.IgnoreChecker.
-//   - Oversize regulars (> ACD_MAX_FILE_BYTES, default 5 MiB) are accepted
+//   - Regular files above ACD_MAX_FILE_BYTES stream into Git objects.
 //     only when their exact bytes already match a normal indexed Git blob;
 //     other oversized content remains incomplete/meta-only.
 //   - Regular files opened with O_NOFOLLOW + post-open lstat/fstat
@@ -1054,7 +1054,7 @@ func ScanProtectedEntries(ctx context.Context, repoRoot string, opts CaptureOpts
 	}
 	if summary.Errors > 0 || summary.Oversize > 0 {
 		return nil, checkpointExclusions(protected), summary,
-			fmt.Errorf("daemon: protection scan incomplete (unreadable_or_unstable=%d oversized_or_unstable=%d)", summary.Errors, summary.Oversize)
+			fmt.Errorf("daemon: protection scan incomplete (unreadable=%d unstable=%d)", summary.Errors, summary.Oversize)
 	}
 	entries, _ := checkpointEntries(live)
 	return entries, checkpointExclusions(protected), summary, nil
@@ -2265,18 +2265,6 @@ func resolvePathQuiescenceSeconds() time.Duration {
 func applyPathQuiescenceWindow(d time.Duration) {
 	pathQuiescenceWindowSec.Store(int64(d / time.Second))
 	SetPathQuiescenceEnabled(d > 0)
-}
-
-// recordOversize stores a daemon_meta breadcrumb so operators can see why a
-// path was skipped without having to grep the daemon log. Best-effort:
-// errors are dropped because the capture pipeline must keep running.
-func recordOversize(ctx context.Context, db *state.DB, rel string, size, cap int64) {
-	if db == nil {
-		return
-	}
-	key := "capture-skip-large:" + rel
-	val := fmt.Sprintf("size=%d>cap=%d", size, cap)
-	_ = state.MetaSet(ctx, db, key, val)
 }
 
 func hasControlPathChar(rel string) bool {

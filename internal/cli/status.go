@@ -426,6 +426,8 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 	if report.CaptureHealth.Error != "" {
 		report.Protected = false
 		report.CaptureErrors = max(report.CaptureErrors, max(1, report.CaptureHealth.IssueCount))
+		committed := false
+		report.PublicationOutcome.BranchCommitted = &committed
 	}
 
 	// Durable capture-backpressure state. Presence of the meta key signals
@@ -678,6 +680,9 @@ func buildPublicationProgressReport(
 				report.IntentStrategy)
 		}
 	}
+	if progress.Phase == "checkpointing" && report.FullPollTS > 0 {
+		progress.LastProgressTS = report.FullPollTS
+	}
 	if progress.LastProgressTS > 0 {
 		age := now.Sub(time.Unix(0,
 			int64(progress.LastProgressTS*float64(time.Second))))
@@ -688,7 +693,7 @@ func buildPublicationProgressReport(
 	}
 	stallThreshold := publicationStallThreshold(ctx, conn)
 	progress.StallThresholdSeconds = int64(stallThreshold / time.Second)
-	if progress.WorkerResponsive && progress.QueuePending > 0 &&
+	if progress.WorkerResponsive && (progress.QueuePending > 0 || progress.Phase == "checkpointing") &&
 		progress.LastProgressTS > 0 && ageExceedsThreshold(
 		progress.LastProgressAgeSeconds, stallThreshold) &&
 		publicationPhaseCanStall(progress.Phase) {
@@ -775,7 +780,7 @@ func ageExceedsThreshold(ageSeconds int64, threshold time.Duration) bool {
 func publicationPhaseCanStall(phase string) bool {
 	switch phase {
 	case "working", "intent_planning", "intent_replanning", "intent_processing",
-		"local_fallback", "retrying", "verifying", "event_publishing":
+		"local_fallback", "retrying", "verifying", "event_publishing", "checkpointing":
 		return true
 	default:
 		return false
