@@ -13,6 +13,7 @@ const IntentResolvedPlanJSONCap = 512 * 1024
 // IntentPlanRun is the privacy-safe durable identity and progress record for
 // one unchanged adaptive planning window. It never stores diffs or responses.
 type IntentPlanRun struct {
+	ProviderDeadlineTS  float64
 	Fingerprint         string
 	BranchRef           string
 	BranchGeneration    int64
@@ -173,7 +174,7 @@ const intentPlanRunSelect = `SELECT fingerprint, branch_ref, branch_generation,
        provider, model, config_revision_id, attempt_count, attempt_limit,
        preserved_groups, unresolved_seqs, finding_codes, normalized_partition,
        progress_state, resolution_mode, resolved_plan_json, completed,
-       created_ts, updated_ts
+       created_ts, updated_ts, provider_deadline_ts
 FROM intent_plan_runs`
 
 func scanIntentPlanRun(row *sql.Row) (IntentPlanRun, error) {
@@ -184,7 +185,7 @@ func scanIntentPlanRun(row *sql.Row) (IntentPlanRun, error) {
 		&run.Provider, &run.Model, &run.ConfigRevisionID, &run.AttemptCount,
 		&run.AttemptLimit, &preserved, &unresolved, &findings,
 		&run.NormalizedPartition, &run.ProgressState, &run.ResolutionMode,
-		&run.ResolvedPlanJSON, &completed, &run.CreatedTS, &run.UpdatedTS)
+		&run.ResolvedPlanJSON, &completed, &run.CreatedTS, &run.UpdatedTS, &run.ProviderDeadlineTS)
 	if err != nil {
 		return IntentPlanRun{}, fmt.Errorf("state: scan intent plan run: %w", err)
 	}
@@ -199,4 +200,14 @@ func scanIntentPlanRun(row *sql.Row) (IntentPlanRun, error) {
 		return IntentPlanRun{}, err
 	}
 	return run, nil
+}
+
+// StartIntentProviderBudget freezes a wall-clock deadline before a provider call.
+// Narrowed correction requests and worker restarts share this same budget.
+func StartIntentProviderBudget(ctx context.Context, db *DB, run IntentPlanRun, deadline float64) (IntentPlanRun, error) {
+	if _, err := db.SQL().ExecContext(ctx, `UPDATE intent_plan_runs SET provider_deadline_ts=? WHERE fingerprint=? AND provider_deadline_ts=0`, deadline, run.Fingerprint); err != nil {
+		return run, err
+	}
+	current, _, err := IntentPlanRunByFingerprint(ctx, db, run.Fingerprint)
+	return current, err
 }
