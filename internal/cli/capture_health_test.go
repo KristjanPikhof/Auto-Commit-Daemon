@@ -46,6 +46,11 @@ func TestCaptureHealthTruthWithResponsiveWorkerAndEmptyQueue(t *testing.T) {
 	if overview.report.CaptureHealth.State != "blocked" {
 		t.Fatalf("list lost capture health: %+v", overview.report.CaptureHealth)
 	}
+	entry := productListEntry{State: productStateNeedsAction, CaptureHealth: status.CaptureHealth, PublicationProgress: status.PublicationProgress,
+		PublicationOutcome: publicationOutcome{RecoveredChanges: 1, BranchCommitted: &control.Published}}
+	if productListPhase(entry) != "capture-blocked" || productListStatus(entry) != "needs action" || !strings.Contains(publicationProgressPhaseLabel(status.PublicationProgress), "incomplete capture") {
+		t.Fatalf("human views mask capture failure: phase=%q status=%q", productListPhase(entry), productListStatus(entry))
+	}
 	plan, err := buildFixPlan(ctx, repo, dbPath, true, false, false)
 	if err != nil {
 		t.Fatal(err)
