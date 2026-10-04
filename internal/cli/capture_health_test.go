@@ -260,6 +260,19 @@ func TestCaptureHealthPausedProtectionThroughProductionReaders(t *testing.T) {
 			if !strings.Contains(output.String(), `"state": "needs_action"`) || !strings.Contains(output.String(), `"error": "unstable file"`) {
 				t.Fatalf("diagnose hides pause or capture health: %s", output.String())
 			}
+			var envelope struct {
+				NextAction string `json:"next_action"`
+			}
+			if err := json.Unmarshal(output.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			wantRemedy := "acd doctor"
+			if manual {
+				wantRemedy = "pause reason"
+			}
+			if !strings.Contains(envelope.NextAction, wantRemedy) {
+				t.Fatalf("diagnose gives the wrong remedy: %s", output.String())
+			}
 		})
 	}
 }
