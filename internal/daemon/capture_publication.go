@@ -24,7 +24,7 @@ func capturePublicationHold(ctx context.Context, db *state.DB, paths []string, e
 			if candidatePath == issue.Path || issue.Subtree && strings.HasPrefix(candidatePath, issue.Path+"/") {
 				return "candidate includes an unreadable or unstable path", nil
 			}
-			if !strings.EqualFold(path.Ext(candidatePath), ".md") && !strings.EqualFold(path.Ext(candidatePath), ".rst") && !strings.EqualFold(path.Ext(candidatePath), ".txt") {
+			if intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: candidatePath}}) != "documentation" {
 				return "candidate independence from incomplete capture is unproven", nil
 			}
 		}
