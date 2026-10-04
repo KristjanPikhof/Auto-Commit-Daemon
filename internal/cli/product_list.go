@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 const productListActiveWindow = time.Hour
