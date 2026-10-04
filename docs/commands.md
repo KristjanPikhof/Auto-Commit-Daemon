@@ -200,6 +200,8 @@ for the bounded remainder of `commit-all` or automatic Intent recovery; it does
 not mean the strategy changed. `LAST MOVE` is the age of durable queue
 progress, not the worker heartbeat. `PHASE` distinguishes an ordinary Intent
 countdown from planning, publication, retry, and automatic recovery.
+`capture_retry` means readable work is saved while files stabilize;
+`capture_blocked` means current eligible coverage remains incomplete.
 `provider-wait` includes the retry countdown, `provider-call` means the retry
 request is in flight, and `verifying` means the approved repository check is
 running. A dash means that field does not apply or could not be read during
@@ -210,14 +212,16 @@ that frame.
 | `healthy` | Protection is complete and no work is pending. |
 | `working` | ACD is checkpointing, planning, publishing, validating, starting, or retrying; `PHASE` gives the exact activity. |
 | `waiting` | Protected work is waiting for the countdown or safe condition shown in `PHASE`. |
-| `stalled` | The worker is responsive, but the queue has not made durable progress within the bounded threshold. ACD keeps retrying or recovering automatically; no action is needed unless the status changes to `needs action`. |
+| `stalled` | The worker is responsive, but the queue or checkpoint scan has not made durable progress within the bounded threshold. ACD keeps retrying or recovering automatically; no action is needed unless the status changes to `needs action`. |
 | `paused` | Protection and publication are manually paused. |
 | `needs action` | A failure or safety block requires attention. |
 
 JSON remains exhaustive regardless of the compact view. It keeps the existing
 fields and adds `worker_state`, `operational_state`, `blocked_events`,
 `last_activity_at`, `publication_drain`, `unfinished_work`, and
-`checkpoint_maintenance`. Maintenance details distinguish a failed check from
+`checkpoint_maintenance`, and `capture_health`. Capture health includes failure
+onset, progress, affected-path samples, and the next retry, even with an empty
+queue. Maintenance details distinguish a failed check from
 measured storage use and include the next scheduled attempt.
 A needs-action result is printed
 before exit code 3 is returned. Human compact snapshots use only visible
@@ -291,6 +295,12 @@ no longer matches the interrupted restore target.
 a stale publication run when every frozen member is already published or
 recovered. Workers perform that completion automatically during startup and
 normal branch recovery; the command is a fallback for a worker that cannot run.
+
+Recovery also reports incomplete capture coverage. With `--yes`, it asks the
+owning worker to retry a checkpoint and returns failure if coverage remains
+incomplete. A no-op check says `checked`, not `applied`. Healthy publication
+state cannot hide a capture failure, and a no-op repair does not claim to restart
+the shared runtime. Use `acd doctor` to see affected eligible paths and retries.
 
 ## Uninstall
 

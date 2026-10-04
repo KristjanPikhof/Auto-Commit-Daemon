@@ -32,6 +32,10 @@ An environment key still takes precedence over the stored key.
 
 Network content is redacted and bounded. A network provider receives diffs
 only when it declares `NeedsDiff` and diff egress is explicitly enabled.
+Binary contents never enter planner requests. Native Intent input includes
+filenames, operations, blob sizes, file kind, and the reason a diff was omitted.
+Text diffs keep the existing redaction, size bounds, and egress permission.
+Older provider protocols keep their existing filename and operation fields.
 Credentials never enter state, logs, status, diagnostics, traces, plan
 fingerprints, or test output. Full provider payloads stay out of ordinary
 diagnostics. `ACD_AI_PROMPT_TRACE` is an explicit local opt-in that records
@@ -71,10 +75,13 @@ Provider failures do not affect completed checkpoints or `protected=true`.
 Malformed plans are repaired locally, partially replanned, or replaced with a
 verified evidence partition. This applies to Fast, Balanced, and Quality.
 
-When Intent recovery selects a dependency-safe local group under a configured
-non-deterministic provider, that provider must still write the semantic commit
-message. An outage keeps the locked group protected and waiting for retry. ACD
-does not silently publish a deterministic or filename-based message.
+Planning and corrections share a persisted `ai.timeout` deadline per unchanged
+window, five minutes by default. During an outage, safe evidence-based groups
+can publish with local messages without another provider request. Binary
+messages name the captured assets and sizes; source changes still require
+complete grouping, materialization, and verification. The saved provider and
+privacy permissions do not change. Incorrect credentials or missing required
+provider configuration still require a settings correction.
 
 Only connection, timeout, protocol transport, and unavailable-service failures
 open the provider circuit. It uses 30-second, 2-minute, then 10-minute

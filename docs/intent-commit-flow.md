@@ -142,15 +142,23 @@ exact-ref CAS checks. Planner windows report this as `repair_replan`.
 
 If that replan fails, ACD leaves the earlier commit OIDs unchanged. It groups
 only the new captures and records the earlier candidates as dependencies. The
-new group still needs a locked message-only rewrite before it can publish.
-Planner windows report this as `dependent_message_fallback`.
+new group receives a local message from its captured evidence and still passes
+materialization and verification. Planner windows report this as
+`dependent_message_fallback`.
 
-If message generation is unavailable, ACD keeps the group protected and waits
-for AI. It never substitutes a generic message such as `Update <path>`. A
-transport outage uses durable 30-second, two-minute, then ten-minute backoff
-with one probe at a time. The capped interval continues through restarts and
-extended outages. Transport failures do not consume semantic correction attempts
-or create an endless sequence of replacement candidates.
+AI planning, corrections, and message repair share one `ai.timeout` budget per
+unchanged planning fingerprint (five minutes by default), with at most three
+semantic attempts. The deadline survives worker restart. A timeout, unavailable
+provider, or rejected plan can use the dependency-safe evidence partition
+without another AI call for commit messages. Valid groups and messages survive
+partial correction and restart. Local messages describe the captured operation;
+binary groups include filenames and sizes in the body.
+
+This fallback preserves hard dependencies, complete goals, frozen targets,
+materialization, verification, and repair limits. Unknown companions stay
+protected until a safe group can be proved. Provider circuit backoff remains
+30 seconds, two minutes, then ten minutes, with one probe at a time. Transport
+failures do not consume semantic correction attempts.
 
 If the user applies a newer verified deterministic Intent configuration with
 the same message format, the existing journaled recovery path preserves the

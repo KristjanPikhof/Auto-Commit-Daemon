@@ -18,6 +18,7 @@ func RenderReference() []byte {
 	output.WriteString("# Configuration reference\n\n")
 	output.WriteString("This table is generated from `config.Catalog()`. It describes supported settings, not the values active on your machine. It never resolves persisted settings, credentials, or environment values.\n\n")
 	output.WriteString("Run `acd config get` to inspect effective repository settings and environment overrides. See [Settings](settings.md) for precedence and persistence details.\n\n")
+	output.WriteString("`capture.max_file_bytes` is a buffering threshold, not an eligibility limit; larger files stream into Git. `ai.timeout` also bounds the combined Intent planning and correction window. See [Settings](settings.md#large-files-and-provider-waits).\n\n")
 	output.WriteString("| Setting | Environment variable | Default | Apply boundary | Can be persisted | Sensitive |\n")
 	output.WriteString("|---|---|---|---|---|---|\n")
 	for _, field := range fields {

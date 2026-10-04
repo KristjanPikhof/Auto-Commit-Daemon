@@ -134,9 +134,10 @@ Branch commits: 3 changes waiting for AI
 Next: No action needed.
 ~~~
 
-AI outages delay commits without delaying checkpoint protection. ACD retries
-with persisted backoff and resumes when AI returns. It never silently changes
-the selected provider to local messages. `Recovery: N changes saved separately`
+ACD bounds AI planning time and can publish safe groups with local messages
+during an outage. Large files stream into Git; binary contents stay out of AI
+requests. If a file cannot be read, ACD saves readable work in a partial
+checkpoint and reports incomplete protection while retrying. `Recovery: N changes saved separately`
 means that work is preserved outside ordinary branch history.
 
 Use `acd status --verbose` for provider, queue, target, phase, and worker details.

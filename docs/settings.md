@@ -163,3 +163,16 @@ fields, but they no longer grant repository consent or override `acd on`.
 See the generated [configuration reference](configuration-reference.md) for
 every supported setting, environment variable, default, apply boundary,
 persistence rule, and sensitivity classification.
+
+## Large files and provider waits
+
+`capture.max_file_bytes` (`ACD_MAX_FILE_BYTES`) defaults to 5 MiB. It is a
+buffering threshold: larger regular files stream into durable Git objects.
+ACD caps buffering at 32 MiB even if this setting is higher. It does not silently
+exclude large or binary files. Git-ignored and sensitive paths remain excluded.
+
+`ai.timeout` (`ACD_AI_TIMEOUT`) defaults to five minutes. Intent uses one
+persisted deadline for planning and corrections of unchanged evidence. Restart
+cannot renew that deadline. When AI cannot finish, safe local grouping and
+messages let publication continue; verification and dependency checks still
+apply. Invalid provider credentials remain a configuration error.

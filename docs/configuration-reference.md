@@ -6,6 +6,8 @@ This table is generated from `config.Catalog()`. It describes supported settings
 
 Run `acd config get` to inspect effective repository settings and environment overrides. See [Settings](settings.md) for precedence and persistence details.
 
+`capture.max_file_bytes` is a buffering threshold, not an eligibility limit; larger files stream into Git. `ai.timeout` also bounds the combined Intent planning and correction window. See [Settings](settings.md#large-files-and-provider-waits).
+
 | Setting | Environment variable | Default | Apply boundary | Can be persisted | Sensitive |
 |---|---|---|---|---|---|
 | `ai.api_key` | `ACD_AI_API_KEY` | not shown | next work boundary | no | yes |
