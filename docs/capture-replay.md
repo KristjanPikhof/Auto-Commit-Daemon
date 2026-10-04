@@ -100,8 +100,9 @@ the index, the worktree, or another branch.
 ## Retention
 
 ACD never prunes unpublished checkpoints, restore preimages, unresolved
-operations, or the newest complete checkpoint, even when a newer partial snapshot exists. Published checkpoints default
-to 30 days and at least 100 retained. A soft 5 GiB budget may prune published
+operations, or the newest complete checkpoint, even when a newer partial
+snapshot exists. Published checkpoints default to 30 days and at least 100
+retained. A soft 5 GiB budget may prune published
 checkpoints older than seven days but never below 100. Protected-only content
 over budget is retained and reported, never discarded.
 
