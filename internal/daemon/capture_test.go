@@ -585,48 +585,22 @@ func TestCapture_SafeIgnoreDirectoryPatternKeepsSameNamedFile(t *testing.T) {
 	t.Fatalf("expected same-named target file to be captured, got %+v", pendingOps(t, f.db))
 }
 
-// TestCapture_OversizeMetaOnly: a file > MaxFileBytes records a daemon_meta
-// row and produces NO commit-event.
-func TestCapture_OversizeMetaOnly(t *testing.T) {
+func TestCaptureStreamsFilesAboveBufferThreshold(t *testing.T) {
 	f := newCaptureFixture(t)
-
-	// 4kB file with a 2kB cap.
-	big := make([]byte, 4096)
-	for i := range big {
-		big[i] = 'a'
+	body := bytes.Repeat([]byte("a"), 4096)
+	if err := os.WriteFile(filepath.Join(f.dir, "big.bin"), body, 0644); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(f.dir, "big.bin"), big, 0o644); err != nil {
-		t.Fatalf("write big: %v", err)
+	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{IgnoreChecker: f.ig, MaxFileBytes: 2048})
+	if err != nil || sum.Oversize != 0 {
+		t.Fatalf("capture=%+v err=%v", sum, err)
 	}
-
-	sum, err := Capture(context.Background(), f.dir, f.db, f.cctx, CaptureOpts{
-		IgnoreChecker:    f.ig,
-		SensitiveMatcher: f.matcher,
-		MaxFileBytes:     2048,
-	})
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-	if sum.Oversize != 1 {
-		t.Fatalf("oversize=%d want 1", sum.Oversize)
-	}
-
 	for _, op := range pendingOps(t, f.db) {
 		if op.Path == "big.bin" {
-			t.Fatalf("big.bin should not have produced a capture event: %+v", op)
+			return
 		}
 	}
-
-	val, ok, err := state.MetaGet(context.Background(), f.db, "capture-skip-large:big.bin")
-	if err != nil {
-		t.Fatalf("MetaGet: %v", err)
-	}
-	if !ok {
-		t.Fatalf("expected capture-skip-large daemon_meta row")
-	}
-	if !strings.Contains(val, "size=4096") || !strings.Contains(val, "cap=2048") {
-		t.Fatalf("oversize meta value=%q, want size=4096>cap=2048", val)
-	}
+	t.Fatal("large untracked asset was not captured")
 }
 
 func TestScanProtectedEntries_ReusesExactIndexedOversizeBlob(t *testing.T) {
@@ -665,7 +639,7 @@ func TestScanProtectedEntries_ReusesExactIndexedOversizeBlob(t *testing.T) {
 	t.Fatalf("missing %s in entries: %+v", path, entries)
 }
 
-func TestScanProtectedEntries_RejectsDirtyIndexedOversizeBlob(t *testing.T) {
+func TestScanProtectedEntriesStreamsDirtyIndexedLargeBlob(t *testing.T) {
 	f := newCaptureFixture(t)
 	path := "tracked-large.bin"
 	if err := os.WriteFile(filepath.Join(f.dir, path), bytes.Repeat([]byte("a"), 4096), 0o644); err != nil {
@@ -678,13 +652,32 @@ func TestScanProtectedEntries_RejectsDirtyIndexedOversizeBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, summary, err := ScanProtectedEntries(context.Background(), f.dir, CaptureOpts{
-		IgnoreChecker: f.ig,
-		MaxFileBytes:  2048,
-	})
-	if err == nil || summary.Oversize != 1 {
-		t.Fatalf("err=%v oversize=%d, want incomplete scan with one oversize", err, summary.Oversize)
+	indexBefore, err := os.ReadFile(filepath.Join(f.gitDir, "index"))
+	if err != nil {
+		t.Fatal(err)
 	}
+	entries, _, summary, err := ScanProtectedEntries(context.Background(), f.dir, CaptureOpts{IgnoreChecker: f.ig, MaxFileBytes: 2048})
+	if err != nil || summary.Oversize != 0 {
+		t.Fatalf("scan=%+v err=%v", summary, err)
+	}
+	want, err := git.HashObjectStdinReadOnly(context.Background(), f.dir, bytes.Repeat([]byte("b"), 4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range entries {
+		if entry.Path == path {
+			found = entry.OID == want
+		}
+	}
+	if !found {
+		t.Fatalf("dirty blob missing: %+v", entries)
+	}
+	indexAfter, err := os.ReadFile(filepath.Join(f.gitDir, "index"))
+	if err != nil || !bytes.Equal(indexBefore, indexAfter) {
+		t.Fatalf("read-only scan changed index: %v", err)
+	}
+
 }
 
 func TestCapture_SkipsPathWithControlCharacters(t *testing.T) {

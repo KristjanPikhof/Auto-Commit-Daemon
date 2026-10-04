@@ -1921,6 +1921,10 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		if rerr != nil {
 			return LiveEntry{}, false, "", rerr
 		}
+		after, err := os.Lstat(c.full)
+		if err != nil || !sameFileSnapshot(c.fi, after) {
+			return LiveEntry{}, false, "unstable", nil
+		}
 		var oid string
 		var herr error
 		content := []byte(target)
@@ -1958,18 +1962,22 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		return LiveEntry{}, false, "non_regular", nil
 	}
 	var oid string
-	if post.Size() > opts.maxBytes {
+	bufferLimit := min(opts.maxBytes, int64(32<<20))
+	if post.Size() > bufferLimit {
 		// The buffer threshold is not a protection limit. Git consumes the
 		// stream under its operation deadline without copying the asset here.
-		reader := io.LimitReader(f, post.Size()+1)
+		reader := &io.LimitedReader{R: f, N: post.Size() + 1}
 		if opts.hashOnly {
 			oid, err = git.HashObjectReaderReadOnly(ctx, repoRoot, reader)
 		} else {
 			oid, err = git.HashObjectReaderDurable(ctx, repoRoot, reader)
 		}
+		if err == nil && reader.N != 1 {
+			return LiveEntry{}, false, "unstable", nil
+		}
 	} else {
 		var buf []byte
-		buf, err = io.ReadAll(io.LimitReader(f, opts.maxBytes+1))
+		buf, err = io.ReadAll(io.LimitReader(f, bufferLimit+1))
 		if err == nil && int64(len(buf)) != post.Size() {
 			return LiveEntry{}, false, "unstable", nil
 		}
