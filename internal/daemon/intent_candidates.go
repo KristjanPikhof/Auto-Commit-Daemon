@@ -1659,18 +1659,9 @@ func chooseIntentCandidatePlan(
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false,
 			nil, run, validationErr
 	}
-	var messageErr error
-	var messageReady bool
-	plan, plannerFailure, messageReady, messageErr = applyIntentFallbackMessageQuality(
-		ctx, planner, health,
-		intentCandidateContinuationValidationRequest(fallbackReq, continuations),
-		plan, plannerFailure)
-	if messageErr != nil {
-		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, messageErr
-	}
-	validationErr := ai.ValidateIntentPlanV2(validationReq, plan)
-	if validationErr != nil {
-		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, validationErr
+	plan, err = applyIntentFallbackMessageQuality(validationReq, plan)
+	if err != nil {
+		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
 	}
 	if run.AttemptCount == 0 {
 		var ensureErr error
@@ -1678,24 +1669,6 @@ func chooseIntentCandidatePlan(
 		if ensureErr != nil {
 			return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, ensureErr
 		}
-	}
-	if !messageReady {
-		holdIntentFallbackForMessage(&plan)
-		run.Completed = false
-		run.ResolutionMode = sql.NullString{
-			String: "waiting_message_rewrite", Valid: true,
-		}
-		run.ProgressState = sql.NullString{
-			String: "waiting_message_rewrite", Valid: true,
-		}
-		run.UnresolvedSeqs = offeredIntentSeqs(req)
-		run.ResolvedPlanJSON = sql.NullString{}
-		if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
-			return ai.IntentPlanV2{}, "", plannerFailure, retryCount,
-				false, nil, run, err
-		}
-		return plan, "waiting_message_rewrite", plannerFailure, retryCount,
-			true, continuations, run, nil
 	}
 	if err := storeResolvedIntentPlanRun(&run, plan, continuations); err != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false,
@@ -2237,34 +2210,34 @@ func intentFindingCodes(findings []ai.IntentAtomicityFinding) []string {
 	return codes
 }
 
-func applyIntentFallbackMessageQuality(
-	ctx context.Context,
-	planner interface{ Name() string },
-	health *IntentPlannerHealth,
-	req ai.IntentPlanRequestV2,
-	plan ai.IntentPlanV2,
-	plannerFailure string,
-) (ai.IntentPlanV2, string, bool, error) {
+// Local fallback never asks a failed provider to rewrite its locked messages.
+func applyIntentFallbackMessageQuality(req ai.IntentPlanRequestV2, plan ai.IntentPlanV2) (ai.IntentPlanV2, error) {
+	plan = cloneIntentPlanV2(plan)
 	provider := ai.DeterministicProvider{CommitFormat: req.CommitFormat}
+	legacy := ai.LegacyIntentPlanRequest(req)
 	for i, candidate := range plan.Candidates {
 		if candidate.Readiness != ai.IntentCandidateReady {
 			continue
 		}
 		locked := ai.IntentPlan{SelectedSeqs: candidate.SelectedSeqs, Subject: candidate.Subject, Body: candidate.Body}
-		report := ai.EvaluateIntentPlanMessageQuality(ai.LegacyIntentPlanRequest(req), locked)
+		report := ai.EvaluateIntentPlanMessageQuality(legacy, locked)
 		if report.Action == ai.MessageQualityClean || report.Action == ai.MessageQualitySanitizeAccept {
-			plan.Candidates[i].Subject = report.SanitizedSubject
-			plan.Candidates[i].Body = report.SanitizedBody
-			if plan.Candidates[i].Body == "" {
-				plan.Candidates[i].Body = localIntentMessageBody(req, candidate.SelectedSeqs)
-			}
-			continue
+			locked.Subject, locked.Body = report.SanitizedSubject, report.SanitizedBody
+		} else {
+			subject, _ := deterministicIntentCandidateMessage(req, candidate.SelectedSeqs)
+			locked.Subject = provider.FormatSubjectForOps(subject, nil)
+			locked.Body = localIntentMessageBody(req, candidate.SelectedSeqs)
 		}
-		subject, _ := deterministicIntentCandidateMessage(req, candidate.SelectedSeqs)
-		plan.Candidates[i].Subject = provider.FormatSubjectForOps(subject, nil)
-		plan.Candidates[i].Body = localIntentMessageBody(req, candidate.SelectedSeqs)
+		if locked.Body == "" {
+			locked.Body = localIntentMessageBody(req, candidate.SelectedSeqs)
+		}
+		report = ai.EvaluateIntentPlanMessageQuality(legacy, locked)
+		if report.Action != ai.MessageQualityClean && report.Action != ai.MessageQualitySanitizeAccept {
+			return plan, fmt.Errorf("daemon: captured evidence cannot produce a valid local message for %s", candidate.CandidateID)
+		}
+		plan.Candidates[i].Subject, plan.Candidates[i].Body = report.SanitizedSubject, report.SanitizedBody
 	}
-	return plan, plannerFailure, true, ai.ValidateIntentPlanV2(req, plan)
+	return plan, ai.ValidateIntentPlanV2(req, plan)
 }
 
 func localIntentMessageBody(req ai.IntentPlanRequestV2, seqs []int64) string {
@@ -2284,23 +2257,6 @@ func localIntentMessageBody(req ai.IntentPlanRequestV2, seqs []int64) string {
 		bullets = append(bullets, detail)
 	}
 	return strings.Join(bullets, "\n")
-}
-
-func holdIntentFallbackForMessage(plan *ai.IntentPlanV2) {
-	for i := range plan.Candidates {
-		candidate := &plan.Candidates[i]
-		if candidate.Readiness != ai.IntentCandidateReady {
-			continue
-		}
-		candidate.Readiness = ai.IntentCandidateWait
-		candidate.Subject = ""
-		candidate.Body = ""
-		if !containsIntentString(candidate.MissingCompanions,
-			"semantic commit message unavailable") {
-			candidate.MissingCompanions = append(candidate.MissingCompanions,
-				"semantic commit message unavailable")
-		}
-	}
 }
 
 func intentPlanDependsOnPersistedCandidate(

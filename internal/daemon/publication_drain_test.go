@@ -359,8 +359,8 @@ func TestConfigureAtomicIntentFallbackPreservesSemanticProvider(t *testing.T) {
 	if !ok {
 		t.Fatalf("planner=%T, want atomic fallback wrapper", cfg.planner)
 	}
-	if wrapped.messagePlanner != planner || !wrapped.requireSemanticMessage {
-		t.Fatalf("wrapper=%+v, want configured semantic planner", wrapped)
+	if wrapped.commitFormat != ai.CommitFormatImperative {
+		t.Fatalf("wrapper lost commit format: %+v", wrapped)
 	}
 	if cfg.plannerProvider != planner.Name() ||
 		cfg.plannerModel != "semantic-model" || cfg.health != health {
@@ -376,9 +376,7 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 	}
 	configureAtomicIntentFallback(&cfg)
 	planner := cfg.planner.(publicationDrainAtomicFallbackPlanner)
-	if planner.requireSemanticMessage {
-		t.Fatal("explicit deterministic provider unexpectedly requires rewrite")
-	}
+
 	plan, err := planner.PlanIntentV2(context.Background(), ai.IntentPlanRequestV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		OfferedCaptures: []ai.OfferedCapture{{
@@ -389,7 +387,7 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 		t.Fatal(err)
 	}
 	if len(plan.Candidates) != 1 ||
-		plan.Candidates[0].Subject != "Update replay.go" {
+		plan.Candidates[0].Subject != "Update replay code changes" || !strings.Contains(plan.Candidates[0].Body, "replay.go") {
 		t.Fatalf("plan=%+v", plan)
 	}
 }

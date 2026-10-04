@@ -162,9 +162,9 @@ func TestCaptureResiliencePartialProtectionPreservesShadow(t *testing.T) {
 func TestCaptureResilienceLocalMessagesNeverCallAI(t *testing.T) {
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "assets/eng_autocomplete.bin", Op: "modify"}}}
 	plan := deterministicIntentCandidatePlan(req, true, false)
-	out, _, ready, err := applyIntentFallbackMessageQuality(context.Background(), nil, nil, req, plan, "offline")
-	if err != nil || !ready || len(out.Candidates) != 1 || out.Candidates[0].Body == "" {
-		t.Fatalf("local fallback=%+v ready=%t err=%v", out, ready, err)
+	out, err := applyIntentFallbackMessageQuality(req, plan)
+	if err != nil || len(out.Candidates) != 1 || out.Candidates[0].Body == "" {
+		t.Fatalf("local fallback=%+v err=%v", out, err)
 	}
 }
 
