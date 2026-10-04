@@ -789,6 +789,21 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	for _, ev := range pending {
+		opsForHold, err := state.LoadCaptureOps(ctx, db, ev.Seq)
+		if err != nil {
+			return sum, err
+		}
+		pathsForHold := []string{ev.Path}
+		if ev.OldPath.Valid {
+			pathsForHold = append(pathsForHold, ev.OldPath.String)
+		}
+		hold, err := capturePublicationHold(ctx, db, pathsForHold, BuildOpsDiff(ctx, repoRoot, opsForHold))
+		if err != nil {
+			return sum, err
+		}
+		if hold != "" {
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
@@ -3583,6 +3598,23 @@ func publishIntentSelection(
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
 	if len(selected) == 0 {
+		return sum, nil
+	}
+	var holdPaths []string
+	var holdEvidence strings.Builder
+	for _, item := range selected {
+		holdPaths = append(holdPaths, item.event.Path)
+		if item.event.OldPath.Valid {
+			holdPaths = append(holdPaths, item.event.OldPath.String)
+		}
+		holdEvidence.WriteString(BuildOpsDiff(ctx, repoRoot, item.ops))
+	}
+	hold, err := capturePublicationHold(ctx, db, holdPaths, holdEvidence.String())
+	if err != nil {
+		return sum, err
+	}
+	if hold != "" {
+		sum.SkippedReason = hold
 		return sum, nil
 	}
 	sourceHead := parent
