@@ -319,7 +319,13 @@ func runProductFix(
 		return err
 	}
 	if err == nil {
-		return renderAdvancedResult(out, productStateNeedsAction, plan)
+		stateName := productStateProtected
+		if plan.CaptureHealth.State == "retrying" {
+			stateName = productStateWaiting
+		} else if plan.CaptureHealth.Error != "" || len(plan.Unsafe) > 0 || plan.DryRun && len(plan.Actions) > 0 {
+			stateName = productStateNeedsAction
+		}
+		return renderAdvancedResult(out, stateName, plan)
 	}
 	commandErr := &CommandError{Code: "recovery_failed", Message: err.Error(), Exit: ExitCode(err)}
 	var existing *CommandError
