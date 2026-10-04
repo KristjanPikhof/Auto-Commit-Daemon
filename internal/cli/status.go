@@ -680,7 +680,7 @@ func buildPublicationProgressReport(
 				report.IntentStrategy)
 		}
 	}
-	if progress.Phase == "checkpointing" && report.FullPollTS > 0 {
+	if progress.Phase == "checkpointing" {
 		progress.LastProgressTS = report.FullPollTS
 	}
 	if progress.LastProgressTS > 0 {

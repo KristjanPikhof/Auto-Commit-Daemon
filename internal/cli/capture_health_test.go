@@ -10,6 +10,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 func TestCaptureHealthTruthWithResponsiveWorkerAndEmptyQueue(t *testing.T) {
@@ -62,5 +63,36 @@ func TestCaptureHealthTruthWithResponsiveWorkerAndEmptyQueue(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), `"state": "needs_action"`) {
 		t.Fatalf("diagnose masks failure: %s", output.String())
+	}
+}
+
+func TestCaptureHealthCheckpointStallWithoutPendingEvents(t *testing.T) {
+	t.Setenv("ACD_AI_TIMEOUT", "1m")
+	report := statusReport{Daemon: "running", PID: os.Getpid(), Busy: true, CheckpointProtectionAvailable: true, FullPollTS: 100}
+	progress, err := buildPublicationProgressReport(context.Background(), nil, report, time.Unix(1000, 0))
+	if err != nil || progress.Phase != "stalled" || progress.QueuePending != 0 {
+		t.Fatalf("empty queue stall=%+v err=%v", progress, err)
+	}
+	report.PublicationProgress = progress
+	control := controlResult{OK: true, Enabled: true}
+	applyControlStatusWithDaemonAlive(&control, report, true)
+	if control.Health != controlHealthNeedsAttention || control.Protected || strings.Contains(control.Summary, "remains protected") {
+		t.Fatalf("capture stall=%+v", control)
+	}
+	entry := productListEntryFromOverview(central.RepoRecord{RepositoryID: "repository", WorktreeID: "worktree"}, supervisor.WorkerStatus{}, productListRepoOverview{report: report}, nil)
+	if entry.State != productStateNeedsAction || entry.PublicationProgress.Phase != "stalled" {
+		t.Fatalf("list masked stalled checkpoint: %+v", entry)
+	}
+}
+
+func TestCaptureHealthRecoveryFailsWhenWorkerUnavailable(t *testing.T) {
+	withIsolatedHome(t)
+	repo, _, db := makeSeededRepoStateDB(t)
+	if err := state.MetaSet(context.Background(), db, "last_capture_error", "eligible file unreadable"); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := executeFix(context.Background(), repo, false, true, false, false)
+	if err == nil || plan == nil || !plan.Incomplete || plan.CaptureHealth.Error == "" || plan.RuntimeQuiescence {
+		t.Fatalf("recovery=%+v err=%v", plan, err)
 	}
 }

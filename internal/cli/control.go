@@ -669,6 +669,11 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		} else {
 			res.NextAction = "No action needed. ACD will retry the provider automatically."
 		}
+	case status.PublicationProgress.Phase == "stalled" && !status.Protected && status.CheckpointProtectionAvailable:
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = fmt.Sprintf("The worker is responsive, but checkpointing has not completed for %s. Current protection is incomplete.", formatDurationCompact(time.Duration(status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
+		res.NextAction = "Run `acd doctor` to inspect capture and checkpoint failures."
 	case status.PublicationProgress.Phase == "stalled":
 		res.Health = controlHealthDegraded
 		if status.PublicationProgress.Origin == "intent_recovery" {

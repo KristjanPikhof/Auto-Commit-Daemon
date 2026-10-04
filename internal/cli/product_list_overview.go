@@ -150,7 +150,7 @@ func productListEntryFromOverview(
 	daemonAlive := report.Daemon == "running" && report.PID > 0 && !report.Stale
 	applyControlStatusWithDaemonAlive(&control, report, daemonAlive)
 	checkpointing := report.CaptureHealth.Error == "" && daemonAlive && report.CheckpointProtectionAvailable && !report.Protected &&
-		report.PublicationProgress.Origin != "intent_recovery" &&
+		report.PublicationProgress.Origin != "intent_recovery" && report.PublicationProgress.Phase != "stalled" &&
 		!productListHasIndependentAttention(report)
 	if checkpointing {
 		control.OK = true
