@@ -201,6 +201,7 @@ CREATE INDEX IF NOT EXISTS idx_intent_planner_windows_branch_id
 
 CREATE TABLE IF NOT EXISTS intent_plan_runs(
     fingerprint              TEXT PRIMARY KEY,
+    provider_deadline_ts     REAL NOT NULL DEFAULT 0,
     branch_ref               TEXT NOT NULL,
     branch_generation        INTEGER NOT NULL,
     provider                 TEXT,
