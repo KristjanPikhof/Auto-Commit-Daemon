@@ -141,6 +141,26 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 	}
 	for _, offered := range opts.OfferedCaptures {
 		cp := offered
+		if cp.FileMetadata != nil {
+			metadata := *cp.FileMetadata
+			if metadata.BeforeBytes < 0 || metadata.AfterBytes < 0 {
+				return IntentPlanRequest{}, fmt.Errorf("intent planner: negative file size")
+			}
+			switch metadata.Kind {
+			case "text", "binary", "unknown":
+			default:
+				return IntentPlanRequest{}, fmt.Errorf("intent planner: invalid file kind")
+			}
+			switch metadata.DiffOmittedReason {
+			case "", "binary", "truncated", "not_requested_or_unavailable":
+			default:
+				return IntentPlanRequest{}, fmt.Errorf("intent planner: invalid omitted diff reason")
+			}
+			cp.FileMetadata = &metadata
+			if metadata.Kind == "binary" {
+				cp.CapturedDiff = ""
+			}
+		}
 		if opts.IncludeCapturedDiffs {
 			input := cp.CapturedDiff
 			redacted := RedactDiffSecrets(input)
@@ -148,6 +168,9 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 			// than the per-event DiffCap (4 KiB) so the planner sees enough
 			// of each captured diff to reason about multi-file grouping.
 			cp.CapturedDiff = Truncate(redacted, IntentStageDiffCap)
+			if len(redacted) > IntentStageDiffCap && cp.FileMetadata != nil {
+				cp.FileMetadata.DiffOmittedReason = "truncated"
+			}
 			req.CapturedDiffTransform = mergePromptTransformMetadata(req.CapturedDiffTransform, promptTransformMetadata(input, redacted, cp.CapturedDiff))
 		} else {
 			cp.CapturedDiff = ""
