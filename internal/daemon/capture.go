@@ -178,7 +178,7 @@ type CaptureSummary struct {
 	// Protected means this complete scan covers ObservationEpoch. An unchanged
 	// tree may reuse the prior checkpoint while still advancing covered_epoch.
 	Protected bool
-	Partial bool
+	Partial   bool
 }
 
 // CaptureContext carries the repository identity frozen at the start of a pass.
@@ -980,7 +980,9 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		summary.EventsDroppedTotal = total
 	}
 
-	if summary.Partial { return summary, partialCaptureError(summary) }
+	if summary.Partial {
+		return summary, partialCaptureError(summary)
+	}
 	return summary, nil
 }
 
@@ -1019,7 +1021,9 @@ func ProtectWorktree(ctx context.Context, repoRoot string, db *state.DB, cctx Ca
 		_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
 		return summary, err
 	}
-	if summary.Partial { return summary, partialCaptureError(summary) }
+	if summary.Partial {
+		return summary, partialCaptureError(summary)
+	}
 	return summary, nil
 }
 
@@ -1111,9 +1115,11 @@ func completeProtectionCheckpoint(
 	partialFingerprint := fmt.Sprintf("%s/%v", liveDigest, issues)
 	if summary.Partial && !forceNew && projection.Latest != nil && projection.Latest.Phase == state.CheckpointCompleted && projection.Latest.Partial {
 		previous, _, err := state.MetaGet(ctx, db, "protection.partial_fingerprint")
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		if previous == partialFingerprint {
-			summary.CheckpointID=projection.Latest.ID
+			summary.CheckpointID = projection.Latest.ID
 			return nil
 		}
 	}
@@ -1136,7 +1142,7 @@ func completeProtectionCheckpoint(
 		ObservedRef:      cctx.BranchRef,
 		Entries:          entries,
 		Exclusions:       exclusions,
-		CaptureIssues: issues,
+		CaptureIssues:    issues,
 	})
 	if err != nil {
 		return fmt.Errorf("daemon: complete protection checkpoint: %w", err)
@@ -1144,9 +1150,9 @@ func completeProtectionCheckpoint(
 	if summary.Partial {
 		summary.CheckpointID = result.Checkpoint.ID
 		return state.MetaSetMany(ctx, db, map[string]string{
-			MetaKeyProtectionCheckpointID: summary.CheckpointID,
-			MetaKeyProtectionComplete: "false",
-			"protection.partial_fingerprint": partialFingerprint,
+			MetaKeyProtectionCheckpointID:          summary.CheckpointID,
+			MetaKeyProtectionComplete:              "false",
+			"protection.partial_fingerprint":       partialFingerprint,
 			MetaKeyProtectionClassificationPending: "true",
 		})
 	}
@@ -2291,15 +2297,21 @@ func captureIssues(skips map[string]skippedPresent) []state.CheckpointCaptureIss
 	var issues []state.CheckpointCaptureIssue
 	for path, skip := range skips {
 		switch skip.Reason {
-		case "sensitive", "safe_ignore", "gitignore": continue
-		case "invalid_path": path = "" // no control characters in the ledger
+		case "sensitive", "safe_ignore", "gitignore":
+			continue
+		case "invalid_path":
+			path = "" // no control characters in the ledger
 		}
-		issues = append(issues, state.CheckpointCaptureIssue{Path:path, Subtree:skip.Dir || path=="", Reason:skip.Reason})
+		issues = append(issues, state.CheckpointCaptureIssue{Path: path, Subtree: skip.Dir || path == "", Reason: skip.Reason})
 	}
-	sort.Slice(issues, func(i,j int) bool { return issues[i].Path < issues[j].Path })
+	sort.Slice(issues, func(i, j int) bool { return issues[i].Path < issues[j].Path })
 	// Several invalid names all represent the same unknown scope.
 	unique := issues[:0]
-	for _, issue := range issues { if len(unique)==0 || unique[len(unique)-1].Path!=issue.Path { unique=append(unique,issue) } }
+	for _, issue := range issues {
+		if len(unique) == 0 || unique[len(unique)-1].Path != issue.Path {
+			unique = append(unique, issue)
+		}
+	}
 	return unique
 }
 
