@@ -1109,16 +1109,13 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(second.PlannerFailure, "circuit open") ||
-		second.Fallback != "waiting_for_ai" ||
-		second.ResolutionMode != "waiting_for_ai" ||
-		second.NeedsAttention || len(second.Decisions) != 0 ||
-		planner.calls != 1 {
-		t.Fatalf("circuit bypass=%+v calls=%d", second, planner.calls)
+	if second.ResolutionMode != "completed_plan_reuse" || len(second.Decisions) != 1 || !second.Decisions[0].Publishable || planner.calls != 1 {
+		t.Fatalf("offline plan reuse=%+v calls=%d", second, planner.calls)
 	}
+
 	snapshot := health.Snapshot()
 	if snapshot.State != IntentPlannerCircuitOpen ||
-		snapshot.BypassCount != 1 {
+		snapshot.BypassCount != 0 {
 		t.Fatalf("health after bypass=%+v", snapshot)
 	}
 
@@ -1127,8 +1124,8 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if forced.Fallback != "waiting_for_ai" || forced.PlanAttempt != 0 ||
-		len(forced.Decisions) != 0 || forced.NeedsAttention {
+	if forced.ResolutionMode != "completed_plan_reuse" || forced.PlanAttempt != 0 ||
+		len(forced.Decisions) != 1 || !forced.Decisions[0].Publishable || forced.NeedsAttention {
 		t.Fatalf("forced provider wait=%+v", forced)
 	}
 }
@@ -2250,7 +2247,7 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	}
 }
 
-func TestIntentCandidateEngineModelWideFailureWaitsForMessage(t *testing.T) {
+func TestIntentCandidateEngineModelWideFailureUsesLocalMessages(t *testing.T) {
 	for _, preset := range []config.PresetName{
 		config.PresetFast,
 		config.PresetBalanced,
@@ -2280,15 +2277,15 @@ func TestIntentCandidateEngineModelWideFailureWaitsForMessage(t *testing.T) {
 				t.Fatalf("EvaluateIntentCandidates: %v", err)
 			}
 			if planner.plannerCalls != 1 || planner.rewriteCalls != 0 ||
-				result.PlanAttempt != 0 || result.Fallback != "waiting_for_ai" ||
-				result.NeedsAttention || len(result.Decisions) != 0 {
-				t.Fatalf("provider outage must wait without consuming grouping attempts: %+v", result)
+				result.PlanAttempt != 0 || result.Fallback != "evidence_partition" ||
+				result.NeedsAttention || len(result.Decisions) != 2 || !result.Decisions[0].Publishable || !result.Decisions[1].Publishable {
+				t.Fatalf("provider outage must publish verified local groups without rewriting messages: %+v", result)
 			}
 		})
 	}
 }
 
-func TestIntentCandidateEnginePublishesAfterMessageRecoveryAcrossRestart(
+func TestIntentCandidateEngineReusesLocalMessagesAcrossRestart(
 	t *testing.T,
 ) {
 	ctx := context.Background()
@@ -2315,8 +2312,8 @@ func TestIntentCandidateEnginePublishesAfterMessageRecoveryAcrossRestart(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Fallback != "waiting_message_rewrite" ||
-		len(first.Decisions) != 1 || first.Decisions[0].Publishable {
+	if first.Fallback != "evidence_partition" ||
+		len(first.Decisions) != 1 || !first.Decisions[0].Publishable {
 		t.Fatalf("message outage=%+v", first)
 	}
 	if err := db.Close(); err != nil {
@@ -2333,10 +2330,10 @@ func TestIntentCandidateEnginePublishesAfterMessageRecoveryAcrossRestart(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Fallback != "evidence_partition" ||
-		second.ResolutionMode != "evidence_partition" ||
+	if second.Fallback != "" ||
+		second.ResolutionMode != "completed_plan_reuse" ||
 		len(second.Decisions) != 1 || !second.Decisions[0].Publishable ||
-		second.Decisions[0].Assignment.Subject != "Finish dependent behavior" {
+		second.Decisions[0].Assignment.Subject != first.Decisions[0].Assignment.Subject {
 		t.Fatalf("message recovery=%+v", second)
 	}
 }
