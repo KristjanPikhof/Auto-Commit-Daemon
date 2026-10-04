@@ -200,8 +200,8 @@ for the bounded remainder of `commit-all` or automatic Intent recovery; it does
 not mean the strategy changed. `LAST MOVE` is the age of durable queue
 progress, not the worker heartbeat. `PHASE` distinguishes an ordinary Intent
 countdown from planning, publication, retry, and automatic recovery.
-`capture_retry` means readable work is saved while files stabilize;
-`capture_blocked` means current eligible coverage remains incomplete.
+`capture-retry` means readable work is saved while files stabilize;
+`capture-blocked` means current eligible coverage remains incomplete.
 `provider-wait` includes the retry countdown, `provider-call` means the retry
 request is in flight, and `verifying` means the approved repository check is
 running. A dash means that field does not apply or could not be read during
