@@ -35,6 +35,7 @@ only when it declares `NeedsDiff` and diff egress is explicitly enabled.
 Binary contents never enter planner requests. Native Intent input includes
 filenames, operations, blob sizes, file kind, and the reason a diff was omitted.
 Text diffs keep the existing redaction, size bounds, and egress permission.
+Native metadata marks text diffs shortened by the size limit.
 Older provider protocols keep their existing filename and operation fields.
 Credentials never enter state, logs, status, diagnostics, traces, plan
 fingerprints, or test output. Full provider payloads stay out of ordinary

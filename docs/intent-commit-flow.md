@@ -199,14 +199,15 @@ Recovery then alternates between two bounded modes:
    provider. Published events satisfy dependencies and appear only as recent
    history.
 2. If that plan stalls, `local_unlock` selects the smallest safe hard
-   dependency component. A singleton is allowed. It publishes only after a
-   locked semantic message is available. The next pass returns to
-   `semantic_replan` with a new `HEAD`, remaining target, and fingerprint.
+   dependency component. A singleton is allowed. Its local message describes
+   the captured evidence and passes message-quality checks. The next pass
+   returns to `semantic_replan` with a new `HEAD`, remaining target, and
+   fingerprint.
 
-A local unlock uses deterministic membership and still passes materialization,
-verification, the publication journal, exact-ref CAS, and index reconciliation.
-It waits if the provider circuit cannot supply a semantic message. Later
-captures remain outside the frozen recovery target.
+A local unlock generates membership and messages without a provider request.
+It still passes materialization, verification, the publication journal,
+exact-ref CAS, and index reconciliation. Later captures remain outside the
+frozen recovery target.
 
 History repair remains a bounded optimization. If its time horizon has expired
 or the published suffix is no longer safe to rewrite, ACD retires the blocking

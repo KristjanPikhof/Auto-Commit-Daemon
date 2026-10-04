@@ -64,14 +64,15 @@ type PathRecentCommit struct {
 
 // OfferedCapture is one capture the planner may either select or defer.
 type OfferedCapture struct {
-	FileMetadata *IntentFileMetadata `json:"file_metadata,omitempty"`
-	Seq          int64               `json:"seq"`
-	Path         string              `json:"path"`
-	Op           string              `json:"op"`
-	Timestamp    time.Time           `json:"timestamp"`
-	Fidelity     string              `json:"fidelity"`
-	DeferCount   int                 `json:"defer_count"`
-	CapturedDiff string              `json:"captured_diff,omitempty"`
+	CapturedDiffTruncated bool                `json:"-"`
+	FileMetadata          *IntentFileMetadata `json:"file_metadata,omitempty"`
+	Seq                   int64               `json:"seq"`
+	Path                  string              `json:"path"`
+	Op                    string              `json:"op"`
+	Timestamp             time.Time           `json:"timestamp"`
+	Fidelity              string              `json:"fidelity"`
+	DeferCount            int                 `json:"defer_count"`
+	CapturedDiff          string              `json:"captured_diff,omitempty"`
 }
 
 // IntentFileMetadata describes captured blobs without sending their contents.
@@ -177,7 +178,8 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 			// than the per-event DiffCap (4 KiB) so the planner sees enough
 			// of each captured diff to reason about multi-file grouping.
 			cp.CapturedDiff = Truncate(redacted, IntentStageDiffCap)
-			if len(redacted) > IntentStageDiffCap && cp.FileMetadata != nil {
+			cp.CapturedDiffTruncated = cp.CapturedDiffTruncated || len(redacted) > IntentStageDiffCap
+			if cp.CapturedDiffTruncated && cp.FileMetadata != nil && cp.FileMetadata.Kind != "binary" {
 				cp.FileMetadata.DiffOmittedReason = "truncated"
 			}
 			req.CapturedDiffTransform = mergePromptTransformMetadata(req.CapturedDiffTransform, promptTransformMetadata(input, redacted, cp.CapturedDiff))

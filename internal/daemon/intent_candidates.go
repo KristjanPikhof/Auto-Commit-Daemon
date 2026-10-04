@@ -389,14 +389,6 @@ func EvaluateIntentCandidates(
 	if result.Fallback != "" {
 		validationBaseRequest = normalizeIntentFallbackBoundaries(req)
 	}
-	if result.Fallback == "waiting_message_rewrite" {
-		// Forced aging requires publication only when a safe commit message is
-		// available. The locally constructed wait plan deliberately keeps every
-		// candidate unpublishable until the configured semantic provider can
-		// rewrite its locked message, so do not reinterpret that hold as an
-		// invalid planner deferral and rebuild it with a deterministic message.
-		validationBaseRequest.ForcedAging = false
-	}
 	validationRequest := intentCandidateContinuationValidationRequest(
 		validationBaseRequest, continuations)
 	if validationErr := ai.ValidateIntentPlanV2(validationRequest, plan); validationErr != nil {
@@ -4311,29 +4303,27 @@ func deterministicIntentCandidateMessage(
 	for _, seq := range seqs {
 		selected[seq] = struct{}{}
 	}
-	var paths []string
-	for _, capture := range req.OfferedCaptures {
-		if _, ok := selected[capture.Seq]; ok {
-			paths = append(paths, capture.Path)
-		}
-	}
-	sort.Strings(paths)
-	if len(paths) == 0 {
-		return "Update captured changes", "apply one dependency component"
-	}
 	primary := ai.OfferedCapture{}
+	found := false
 	for _, capture := range req.OfferedCaptures {
 		if _, ok := selected[capture.Seq]; ok {
 			primary = capture
+			found = true
 			if intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: capture.Path}}) == "code" {
 				break
 			}
 		}
 	}
+	if !found {
+		return "Update captured changes", "apply one dependency component"
+	}
 	subject := ai.DiffAwareSubject(ai.OpItem{Op: primary.Op, Path: primary.Path}, primary.CapturedDiff)
-	if subject == "" || strings.Contains(subject, path.Base(primary.Path)) {
+	quality := ai.EvaluateIntentPlanMessageQuality(ai.IntentPlanRequest{
+		OfferedCaptures: req.OfferedCaptures, CommitFormat: ai.CommitFormatImperative,
+	}, ai.IntentPlan{SelectedSeqs: seqs, Subject: subject, Body: "- Preserve the captured changes"})
+	if quality.Action != ai.MessageQualityClean && quality.Action != ai.MessageQualitySanitizeAccept {
 		label := path.Base(intentSemanticStem(IntentCandidateCapture{Event: state.CaptureEvent{Path: primary.Path}}))
-		label = strings.ReplaceAll(strings.ReplaceAll(label, "_", " "), "-", " ")
+		label = strings.Join(strings.Fields(strings.NewReplacer("_", " ", "-", " ").Replace(label)), " ")
 		if label == "" {
 			label = "protected"
 		}
@@ -4342,16 +4332,21 @@ func deterministicIntentCandidateMessage(
 			role = "asset"
 		}
 		verb := "Update"
-		if primary.Op == "create" {
+		switch primary.Op {
+		case "create":
 			verb = "Add"
-		}
-		if primary.Op == "delete" {
+		case "delete":
 			verb = "Remove"
-		}
-		if primary.Op == "rename" {
+		case "rename":
 			verb = "Rename"
 		}
+		labelCap := ai.SubjectCap - len([]rune(verb+"  "+role+" changes"))
+		if len([]rune(label)) > labelCap {
+			label = strings.TrimSpace(string([]rune(label)[:labelCap]))
+		}
 		subject = verb + " " + label + " " + role + " changes"
+	} else {
+		subject = quality.SanitizedSubject
 	}
 
 	if len([]rune(subject)) > ai.SubjectCap {
