@@ -909,6 +909,15 @@ func TestPublicationProgressPrioritizesDeliberateWaits(t *testing.T) {
 		{name: "checkpoint protection", mutate: func(report *statusReport) {
 			report.Protected = false
 		}, want: "checkpointing"},
+		{name: "failed verification recovery", mutate: func(report *statusReport) {
+			report.Protected = false
+			report.PublicationDrain = publicationDrainReport{}
+			report.IntentV2.VerificationRecovering = 1
+		}, want: "intent_verification_recovery"},
+		{name: "stopped worker", mutate: func(report *statusReport) {
+			report.Daemon = "stopped"
+			report.Protected = false
+		}, want: "intent_planning"},
 		{name: "provider circuit", mutate: func(report *statusReport) {
 			report.IntentStrategy.PlannerHealth = &daemon.IntentPlannerHealthSnapshot{
 				State: daemon.IntentPlannerCircuitOpen,

@@ -663,7 +663,8 @@ func buildPublicationProgressReport(
 				report.IntentStrategy.PlannerHealth, now)
 			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery:
-		case report.CheckpointProtectionAvailable && !report.Protected:
+		case report.CheckpointProtectionAvailable && !report.Protected && progress.WorkerResponsive &&
+			progress.Phase != "intent_verification_recovery":
 			progress.Phase = "checkpointing"
 		case intentProviderCallActive(report):
 			progress.Phase = "provider_call"
