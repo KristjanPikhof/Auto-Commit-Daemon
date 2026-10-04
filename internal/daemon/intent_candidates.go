@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -1331,7 +1332,13 @@ func chooseIntentCandidatePlan(
 		providerCtx, cancelProvider = context.WithDeadline(ctx, time.Unix(0, int64(run.ProviderDeadlineTS*1e9)))
 	}
 	defer cancelProvider()
-	var lockedCandidates []ai.IntentCandidateAssignment
+	lockedCandidates, partialRequest := loadPreservedIntentGroups(req, run)
+	if len(lockedCandidates) > 0 {
+		plannerRequest, _, err = preflightIntentCandidatePlan(ctx, partialRequest, preset, input.Captures, input.PreflightMaterialize)
+		if err != nil {
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+		}
+	}
 	var permit IntentPlannerHealthPermit
 	permitHeld := false
 	defer func() {
@@ -1561,6 +1568,9 @@ func chooseIntentCandidatePlan(
 							}
 					}
 					run.PreservedGroups = intentAssignmentMembership(preserved)
+					if err := storeResolvedIntentPlanRun(&run, ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: preserved}, nil); err != nil {
+						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+					}
 					run.UnresolvedSeqs = offeredIntentSeqs(partial)
 				}
 				run.NormalizedPartition = sql.NullString{String: partition, Valid: partition != ""}
@@ -1696,6 +1706,46 @@ func chooseIntentCandidatePlan(
 	}
 	return plan, "evidence_partition", plannerFailure, retryCount,
 		fallbackNeedsAttention || companionNeedsAttention, continuations, run, nil
+}
+
+// Reload only normalized, validated groups from this exact planning fingerprint.
+// The incomplete run uses the existing bounded plan column; no raw response is saved.
+func loadPreservedIntentGroups(req ai.IntentPlanRequestV2, run state.IntentPlanRun) ([]ai.IntentCandidateAssignment, ai.IntentPlanRequestV2) {
+	if run.Completed || !run.ResolvedPlanJSON.Valid || len(run.PreservedGroups) == 0 {
+		return nil, req
+	}
+	var stored resolvedIntentPlanRun
+	if json.Unmarshal([]byte(run.ResolvedPlanJSON.String), &stored) != nil ||
+		!reflect.DeepEqual(intentAssignmentMembership(stored.Plan.Candidates), run.PreservedGroups) {
+		return nil, req
+	}
+	preserved, partial, ok := preserveIntentPlanGroups(req, stored.Plan, nil)
+	if !ok || len(preserved) != len(stored.Plan.Candidates) {
+		return nil, req
+	}
+	selected := make(map[int64]bool)
+	for _, candidate := range preserved {
+		for _, seq := range candidate.SelectedSeqs {
+			selected[seq] = true
+		}
+	}
+	validation := req
+	validation.OfferedCaptures = nil
+	validation.Dependencies = nil
+	for _, capture := range req.OfferedCaptures {
+		if selected[capture.Seq] {
+			validation.OfferedCaptures = append(validation.OfferedCaptures, capture)
+		}
+	}
+	for _, edge := range req.Dependencies {
+		if selected[edge.FromSeq] && selected[edge.ToSeq] {
+			validation.Dependencies = append(validation.Dependencies, edge)
+		}
+	}
+	if ai.ValidateIntentPlanV2(validation, stored.Plan) != nil {
+		return nil, req
+	}
+	return preserved, partial
 }
 
 func storeResolvedIntentPlanRun(
@@ -2102,7 +2152,7 @@ func preserveIntentPlanGroups(
 		}
 		fromID, fromOK := owner[edge.FromSeq]
 		toID, toOK := owner[edge.ToSeq]
-		if fromOK && toOK && fromID != toID {
+		if fromOK != toOK || fromOK && toOK && fromID != toID {
 			badIDs[fromID] = struct{}{}
 			badIDs[toID] = struct{}{}
 		}
