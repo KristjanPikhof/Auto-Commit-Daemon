@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2026-10-04
+
 ### Fixed
 
 - Stream large regular files into durable Git objects instead of stopping
