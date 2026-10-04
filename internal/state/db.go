@@ -195,6 +195,9 @@ func CanRuntimeMigrate(from, to int) bool {
 			// these rows during capture or publication.
 		case 27:
 			// v28 separates stable recovery reason codes from display errors.
+		case 28:
+			// v29 adds explicit partial coverage and provider deadlines. Existing
+			// checkpoints remain complete; no provenance or membership changes.
 		case 26:
 			// v27 records approved index identity without inventing legacy consent.
 		default:

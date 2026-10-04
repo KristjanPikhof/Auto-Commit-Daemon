@@ -88,7 +88,7 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 		if !item.Retained || candidateIDs[item.ID] {
 			continue
 		}
-		if !item.Published || item.Unresolved || item.LatestComplete || item.Reason == state.CheckpointReasonPreRestore {
+		if !item.Published || item.Unresolved || item.Reason == state.CheckpointReasonPreRestore {
 			protectedRefs = append(protectedRefs, item.Ref)
 		}
 	}
