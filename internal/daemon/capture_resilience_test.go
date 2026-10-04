@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"os"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -81,6 +82,50 @@ func TestCaptureResilienceFourLargeAssets(t *testing.T) {
 		if capture.FileMetadata.Kind != "binary" || capture.FileMetadata.AfterBytes != map[string]int64{names[0]: int64(sizes[0]), names[1]: int64(sizes[1]), names[2]: int64(sizes[2]), names[3]: int64(sizes[3])}[capture.Event.Path] || capture.CapturedDiff != "" {
 			t.Fatalf("metadata=%+v", capture)
 		}
+	}
+}
+
+func TestCaptureResilienceNonRegularDoesNotBlockProtection(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	store := checkpointpkg.Store{DB: f.db}
+	opts := CaptureOpts{CheckpointStore: &store, IgnoreChecker: f.ig}
+	changed := filepath.Join(f.dir, "replaced.txt")
+	if err := os.WriteFile(changed, []byte("protected regular file\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, opts); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(changed); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(changed, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// A stale regular-file candidate must reject the FIFO without waiting
+	// for another process to open it.
+	if _, ok, reason, err := hashCandidate(ctx, f.dir, candidateLike{rel: "replaced.txt", full: changed, fi: before}, walkOpts{}); err != nil || ok || reason != "unstable" {
+		t.Fatalf("replaced candidate ok=%t reason=%q err=%v", ok, reason, err)
+	}
+	if err := os.WriteFile(filepath.Join(f.dir, "independent.go"), []byte("package fixture\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := Capture(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || !summary.Protected || summary.Partial || summary.EventsAppended != 1 {
+		t.Fatalf("non-regular exclusion=%+v err=%v", summary, err)
+	}
+	for _, op := range pendingOps(t, f.db) {
+		if op.Path == "replaced.txt" && op.Op == "delete" {
+			t.Fatal("non-regular replacement became deletion")
+		}
+	}
+	if hold, err := capturePublicationHold(ctx, f.db, []string{"independent.go"}, ""); err != nil || hold != "" {
+		t.Fatalf("non-regular exclusion blocks publication: %q %v", hold, err)
 	}
 }
 

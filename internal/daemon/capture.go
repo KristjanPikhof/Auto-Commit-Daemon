@@ -1962,7 +1962,8 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 	}
 
 	// Regular file: O_NOFOLLOW + verify ino/dev/mode (TOCTOU defense).
-	flags := os.O_RDONLY | syscall.O_NOFOLLOW
+	// O_NONBLOCK prevents a regular-file-to-FIFO swap from blocking the open.
+	flags := os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
 	f, err := os.OpenFile(c.full, flags, 0)
 	if err != nil {
 		return LiveEntry{}, false, "", err
@@ -2312,7 +2313,7 @@ func captureIssues(skips map[string]skippedPresent) []state.CheckpointCaptureIss
 	var issues []state.CheckpointCaptureIssue
 	for path, skip := range skips {
 		switch skip.Reason {
-		case "sensitive", "safe_ignore", "gitignore":
+		case "sensitive", "safe_ignore", "gitignore", "non_regular":
 			continue
 		case "invalid_path":
 			path = "" // no control characters in the ledger
