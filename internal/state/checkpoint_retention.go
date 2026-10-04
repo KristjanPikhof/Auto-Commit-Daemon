@@ -22,7 +22,7 @@ func RetentionCheckpoints(ctx context.Context, db *DB, worktreeID string) ([]Ret
 	rows, err := db.readSQL().QueryContext(ctx, `
 SELECT cp.id,cp.worktree_id,cp.reason,cp.checkpoint_ref,cp.commit_oid,
        cp.seq,cp.created_ts,cp.retained,
-       cp.coverage_complete=1 AND cp.seq=(SELECT MAX(full.seq) FROM checkpoints full WHERE full.worktree_id=cp.worktree_id AND full.phase='completed' AND full.retained=1 AND full.coverage_complete=1),
+       cp.coverage_complete=1 AND cp.seq=(SELECT MAX(complete_cp.seq) FROM checkpoints complete_cp WHERE complete_cp.worktree_id=cp.worktree_id AND complete_cp.phase='completed' AND complete_cp.retained=1 AND complete_cp.coverage_complete=1),
        EXISTS (
          SELECT 1 FROM checkpoint_events ce
          WHERE ce.checkpoint_id=cp.id
