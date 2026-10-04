@@ -79,8 +79,9 @@ func TestReplayIntentMetadataPreservesPerCaptureTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 	contents := map[string]string{
-		"large.md": strings.Repeat("Changed documentation text.\n", ai.IntentStageDiffCap),
-		"small.md": "Small documentation update.\n",
+		"large.md":    strings.Repeat("Changed documentation text.\n", ai.IntentStageDiffCap),
+		"redacted.md": "token = \"" + strings.Repeat("a", ai.IntentStageDiffCap*2) + "\"\nRemaining documentation.\n",
+		"small.md":    "Small documentation update.\n",
 	}
 	for path, content := range contents {
 		if err := os.WriteFile(filepath.Join(f.dir, path), []byte(content), 0o644); err != nil {
@@ -96,15 +97,21 @@ func TestReplayIntentMetadataPreservesPerCaptureTruncation(t *testing.T) {
 		IntentPlanner: planner, IntentPreset: config.PresetFast,
 		IntentIncludeDiffs: true, IntentBypassBatchWait: true, IntentWindow: 10,
 	})
-	if err != nil || sum.Published != 2 || len(planner.requests) != 1 {
+	if err != nil || sum.Published != len(contents) || len(planner.requests) != 1 {
 		t.Fatalf("offline publication=%+v calls=%d err=%v", sum, len(planner.requests), err)
 	}
 	for _, capture := range planner.requests[0].OfferedCaptures {
 		wantReason := ""
-		if capture.Path == "large.md" {
+		switch capture.Path {
+		case "large.md":
 			wantReason = "truncated"
 			if !strings.Contains(capture.CapturedDiff, "<truncated>") || len(capture.CapturedDiff) > ai.IntentStageDiffCap {
 				t.Fatalf("large diff was not bounded: %d bytes", len(capture.CapturedDiff))
+			}
+		case "redacted.md":
+			wantReason = "truncated"
+			if len(capture.CapturedDiff) >= ai.IntentStageDiffCap || !strings.Contains(capture.CapturedDiff, "[REDACTED_SECRET]") || strings.Contains(capture.CapturedDiff, strings.Repeat("a", 32)) {
+				t.Fatal("redaction must remove the generated secret and shorten the clipped source")
 			}
 		}
 		if capture.FileMetadata == nil || capture.FileMetadata.Kind != "text" || capture.FileMetadata.DiffOmittedReason != wantReason {
