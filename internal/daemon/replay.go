@@ -789,7 +789,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	for _, ev := range pending {
-		opsForHold, err := state.LoadCaptureOps(ctx, db, ev.Seq)
+		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
 		if err != nil {
 			return sum, err
 		}
@@ -797,7 +797,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		if ev.OldPath.Valid {
 			pathsForHold = append(pathsForHold, ev.OldPath.String)
 		}
-		hold, err := capturePublicationHoldOps(ctx, repoRoot, db, opsForHold, pathsForHold)
+		hold, err := capturePublicationHoldOps(ctx, repoRoot, db, ops, pathsForHold)
 		if err != nil {
 			return sum, err
 		}
@@ -837,10 +837,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
-		if err != nil {
-			return sum, fmt.Errorf("daemon: load ops seq=%d: %w", ev.Seq, err)
-		}
 		if len(ops) == 0 {
 			// No ops to apply — mark failed, do not block the queue.
 			if err := markFailed(ctx, db, ev, replayIssue{
