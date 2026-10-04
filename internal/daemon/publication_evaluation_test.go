@@ -336,8 +336,9 @@ func TestLocalFallbackMessagesLeaveRecoveryProbeAvailable(t *testing.T) {
 	}
 	now = now.Add(31 * time.Second)
 	planner := &configurationMessageRewriter{err: &ai.ProviderHTTPError{StatusCode: 401, Detail: "credentials rejected"}}
-	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{{CandidateID: "feature", SelectedSeqs: []int64{1}, Readiness: ai.IntentCandidateReady}}}
-	_, _, _, err = applyIntentFallbackMessageQuality(ctx, planner, health, ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "feature.go", Op: "create"}}}, plan, "")
+	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "feature.go", Op: "create"}}}
+	plan := deterministicIntentCandidatePlan(req, true, false)
+	_, _, _, err = applyIntentFallbackMessageQuality(ctx, planner, health, req, plan, "")
 	if err != nil {
 		t.Fatalf("error=%v", err)
 	}
