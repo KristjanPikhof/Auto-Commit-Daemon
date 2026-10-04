@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path"
+	"strings"
 )
 
 var ErrCheckpointPartial = errors.New("checkpoint has incomplete coverage; choose a complete checkpoint for full-tree restore")
@@ -56,4 +58,16 @@ func loadCheckpointCoverage(ctx context.Context, query coverageQuery, checkpoint
 		checkpoint.CaptureIssues = append(checkpoint.CaptureIssues, issue)
 	}
 	return rows.Err()
+}
+
+func validCheckpointCaptureIssue(issue CheckpointCaptureIssue) bool {
+	switch issue.Reason {
+	case "unreadable", "unstable", "lstat_error", "non_regular", "invalid_path":
+	default:
+		return false
+	}
+	if issue.Path == "" {
+		return issue.Subtree
+	}
+	return !strings.ContainsAny(issue.Path, "\x00\r\n\t") && !path.IsAbs(issue.Path) && path.Clean(issue.Path) == issue.Path && issue.Path != ".." && !strings.HasPrefix(issue.Path, "../")
 }
