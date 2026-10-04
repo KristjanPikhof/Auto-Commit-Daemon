@@ -271,6 +271,44 @@ func TestCaptureResilienceUnreadableRootIsUnknownScope(t *testing.T) {
 	}
 }
 
+func TestCaptureResilienceUnstatableSubtreePreservesShadow(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires enforced directory permissions")
+	}
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	store := checkpointpkg.Store{DB: f.db}
+	opts := CaptureOpts{CheckpointStore: &store, IgnoreChecker: f.ig}
+	parent := filepath.Join(f.dir, "parent")
+	if err := os.MkdirAll(filepath.Join(parent, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "nested", "kept.go"), []byte("package fixture\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Capture(ctx, f.dir, f.db, f.cctx, opts); err != nil {
+		t.Fatal(err)
+	}
+	// Names remain readable, but their types and contents cannot be inspected.
+	if err := os.Chmod(parent, 0400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(parent, 0755) })
+	partial, err := Capture(ctx, f.dir, f.db, f.cctx, opts)
+	if err == nil || !partial.Partial || partial.EventsAppended != 0 {
+		t.Fatalf("unstatable subtree=%+v err=%v", partial, err)
+	}
+	for _, op := range pendingOps(t, f.db) {
+		if op.Op == "delete" {
+			t.Fatalf("failed subtree inspection became deletion: %+v", op)
+		}
+	}
+	issues, err := state.CurrentCaptureIssues(ctx, f.db)
+	if err != nil || len(issues) != 1 || issues[0].Path != "parent/nested" || !issues[0].Subtree {
+		t.Fatalf("unstatable scope=%+v err=%v", issues, err)
+	}
+}
+
 type interruptedPartialPlanner struct {
 	partialReplanIntentCandidatePlannerStub
 	cancel context.CancelFunc
