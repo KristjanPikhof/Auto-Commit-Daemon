@@ -197,7 +197,7 @@ func runProductDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut
 }
 
 func renderProductDiagnoseReport(out io.Writer, report diagnoseReport) error {
-	if report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
+	if report.CaptureHealth.Error != "" || report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.OperationalState == "needs_attention" {
 		next := "Review the blocked drain and run `acd support logs --lines 100` for the failure context."
 		return renderJSONEnvelope(out, productEnvelope{
