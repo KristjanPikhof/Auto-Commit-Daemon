@@ -23,6 +23,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 const (
@@ -39,6 +40,7 @@ var (
 )
 
 type fixPlan struct {
+	CaptureHealth      state.CaptureHealth     `json:"capture_health"`
 	Repo               string                  `json:"repo"`
 	StateDB            string                  `json:"state_db"`
 	GitDir             string                  `json:"git_dir,omitempty"`
@@ -210,6 +212,18 @@ func executeFix(ctx context.Context, repo string, dryRun, yes, force, clearPause
 			return &plan, err
 		}
 	}
+	if plan.CaptureHealth.State == "blocked" {
+		lookup, lookupErr := loadControlRepo(ctx, repo)
+		if lookupErr == nil && lookup.Registered {
+			_, _ = callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout)
+			if report, statusErr := buildStatusReport(ctx, lookup.Record, time.Now()); statusErr == nil {
+				plan.CaptureHealth = report.CaptureHealth
+			}
+		}
+		if plan.CaptureHealth.State == "blocked" {
+			return &plan, fmt.Errorf("acd support recover: capture remains incomplete: %s", plan.CaptureHealth.Error)
+		}
+	}
 	return &plan, nil
 }
 
@@ -282,6 +296,10 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		Force:            force,
 		ClearPause:       clearPause,
 	}
+	plan.CaptureHealth, err = state.ReadCaptureHealth(ctx, conn)
+	if err != nil {
+		return fixPlan{}, err
+	}
 	if raw, ok, err := metaLookup(ctx, conn, "branch.generation"); err != nil {
 		return fixPlan{}, fmt.Errorf("acd fix: load branch generation: %w", err)
 	} else if ok {
@@ -294,8 +312,7 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		return fixPlan{}, err
 	} else if alive {
 		plan.RuntimeQuiescence = true
-		plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
-			"%s; apply mode will checkpoint enabled worktrees, stop the shared runtime, recover, and restart protection automatically.", desc))
+		_ = desc
 	}
 	if branchRef == "" {
 		plan.Unsafe = append(plan.Unsafe, "detached HEAD is not safe for guided state mutation")
@@ -343,6 +360,12 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 		publicationDrainRuntimeContractAvailable, &plan,
 	); err != nil {
 		return fixPlan{}, err
+	}
+	if plan.RuntimeQuiescence && len(plan.Actions) > 0 {
+		plan.Suggestions = append(plan.Suggestions, "Apply mode will checkpoint enabled worktrees, stop the shared runtime, recover, and restart protection automatically.")
+	}
+	if plan.CaptureHealth.State == "blocked" {
+		plan.Suggestions = append(plan.Suggestions, "Capture is incomplete: "+plan.CaptureHealth.Error+". Inspect the affected paths with `acd doctor`; ACD retries automatically.")
 	}
 	return plan, nil
 }
@@ -1328,8 +1351,10 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 	mode := "planned"
 	if plan.Incomplete {
 		mode = "incomplete"
-	} else if !plan.DryRun {
+	} else if !plan.DryRun && len(plan.Actions) > 0 {
 		mode = "applied"
+	} else if !plan.DryRun {
+		mode = "checked"
 	}
 	fmt.Fprintf(out, "Fix %s for %s\n", mode, plan.Repo)
 	if plan.CurrentBranchRef != "" || plan.CurrentHead != "" {
@@ -1340,7 +1365,9 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintf(out, "Backup: %s\n", plan.BackupPath)
 	}
 	if len(plan.Actions) == 0 {
-		if len(plan.Unsafe) == 0 && !plan.Incomplete {
+		if plan.CaptureHealth.State == "blocked" {
+			fmt.Fprintf(out, "No publication repair applies. Checkpoint protection is incomplete: %s\n", plan.CaptureHealth.Error)
+		} else if len(plan.Unsafe) == 0 && !plan.Incomplete {
 			fmt.Fprintln(out, "Repository recovery state is healthy; no changes are needed.")
 		} else {
 			fmt.Fprintln(out, "ACD found no recovery change it can safely apply.")
