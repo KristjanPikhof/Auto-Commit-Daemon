@@ -76,15 +76,15 @@ func TestCapturePublicationPagesPastHeldPrefixAfterRestart(t *testing.T) {
 	if sum := capturePublicationFiles(t, f); !sum.Partial || sum.EventsAppended != 3 {
 		t.Fatalf("capture=%+v", sum)
 	}
-	originalREADME, err := os.ReadFile(filepath.Join(f.dir, "README.md"))
+	originalIgnore, err := os.ReadFile(filepath.Join(f.dir, ".gitignore"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	writePublicationFile(t, f, "README.md", "deliberately staged\n")
-	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", "README.md"); err != nil {
+	writePublicationFile(t, f, ".gitignore", "deliberately staged\n")
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "add", ".gitignore"); err != nil {
 		t.Fatal(err)
 	}
-	staged, err := git.LsFilesStaged(ctx, f.dir, "README.md")
+	staged, err := git.LsFilesStaged(ctx, f.dir, ".gitignore")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,11 +114,11 @@ func TestCapturePublicationPagesPastHeldPrefixAfterRestart(t *testing.T) {
 	if got, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "show", "HEAD:z.md"); err != nil || string(got) != "Independent documentation.\n" {
 		t.Fatalf("published document=%q err=%v", got, err)
 	}
-	after, err := git.LsFilesStaged(ctx, f.dir, "README.md")
+	after, err := git.LsFilesStaged(ctx, f.dir, ".gitignore")
 	if err != nil || !reflect.DeepEqual(staged, after) {
 		t.Fatalf("user staging changed: before=%+v after=%+v err=%v", staged, after, err)
 	}
-	if err := os.WriteFile(filepath.Join(f.dir, "README.md"), originalREADME, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(f.dir, ".gitignore"), originalIgnore, 0644); err != nil {
 		t.Fatal(err)
 	}
 	// The completed rotation wraps instead of overlooking newly captured work.
@@ -163,6 +163,50 @@ func TestCapturePublicationPagingPreservesHeldPathOrder(t *testing.T) {
 	}
 }
 
+func TestCapturePublicationPagingKeepsPathOrderWhenCoverageRecovers(t *testing.T) {
+	f := newPartialPublicationFixture(t)
+	ctx := context.Background()
+	unchanged := "References blocked.go.\n" + strings.Repeat("Unchanged paragraph.\n", 50)
+	writePublicationFile(t, f, "a.md", unchanged+"Old trailing section.\n")
+	capturePublicationFiles(t, f)
+	writePublicationFile(t, f, "b.md", "Independent document.\n")
+	capturePublicationFiles(t, f)
+	writePublicationFile(t, f, "a.md", unchanged+"New trailing section.\n")
+	capturePublicationFiles(t, f)
+	if sum := replayPublicationPage(t, f, nil); sum.Published != 0 || !sum.HasMore {
+		t.Fatalf("held create=%+v", sum)
+	}
+	store := checkpoint.Store{DB: f.db}
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyEvent, Limit: 2, RequireCompletedCheckpoint: true,
+		MessageFn: func(ctx context.Context, event EventContext) (string, error) {
+			if event.Event.Path != "b.md" {
+				t.Fatalf("successor overtook held create: %s", event.Event.Path)
+			}
+			if err := os.Chmod(filepath.Join(f.dir, "blocked.go"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			coverage, err := ProtectWorktree(ctx, f.dir, f.db, f.cctx, CaptureOpts{CheckpointStore: &store, IgnoreChecker: f.ig})
+			if err != nil || !coverage.Protected {
+				t.Fatalf("restored coverage=%+v err=%v", coverage, err)
+			}
+			return DeterministicMessage(ctx, event)
+		},
+	})
+	if err != nil || sum.Published != 1 || sum.Conflicts != 0 || sum.Skipped {
+		t.Fatalf("recovered page=%+v err=%v", sum, err)
+	}
+	f.cctx.BaseHead = sum.BaseHead
+	for i := 0; i < 2; i++ {
+		if sum := replayPublicationPage(t, f, nil); sum.Published != 1 || sum.Conflicts != 0 {
+			t.Fatalf("complete-coverage FIFO step %d=%+v", i, sum)
+		}
+	}
+	if got, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "show", "HEAD:a.md"); err != nil || string(got) != unchanged+"New trailing section.\n" {
+		t.Fatalf("final ordered revision=%q err=%v", got, err)
+	}
+}
+
 func TestCapturePublicationPageRetainsCheckpointAndTerminalBarriers(t *testing.T) {
 	f := newPartialPublicationFixture(t)
 	ctx := context.Background()
@@ -191,6 +235,56 @@ func TestCapturePublicationPageRetainsCheckpointAndTerminalBarriers(t *testing.T
 	page, err = state.PendingEventsAfter(ctx, f.db, pending[0].Seq, 10, true)
 	if err != nil || len(page) != 0 {
 		t.Fatalf("paging crossed terminal predecessor=%+v err=%v", page, err)
+	}
+}
+
+func TestCapturePublicationRechecksCoverageBetweenEvents(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires enforced file permissions")
+	}
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	capturePublicationFiles(t, f)
+	baseline, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyEvent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.cctx.BaseHead = baseline.BaseHead
+	writePublicationFile(t, f, "a.md", "Independent document.\n")
+	writePublicationFile(t, f, "b.go", "package fixture\n")
+	writePublicationFile(t, f, "blocked.go", "package fixture\n")
+	if sum := capturePublicationFiles(t, f); !sum.Protected {
+		t.Fatalf("initial complete capture=%+v", sum)
+	}
+	blocked := filepath.Join(f.dir, "blocked.go")
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0644) })
+	store := checkpoint.Store{DB: f.db}
+	calls := 0
+	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyEvent, RequireCompletedCheckpoint: true,
+		MessageFn: func(ctx context.Context, event EventContext) (string, error) {
+			calls++
+			if event.Event.Path != "a.md" {
+				t.Fatalf("source passed stale coverage proof: %s", event.Event.Path)
+			}
+			// Protection can run while message generation waits. The next
+			// queued event must observe its newly incomplete checkpoint.
+			if err := os.Chmod(blocked, 0); err != nil {
+				t.Fatal(err)
+			}
+			partial, err := ProtectWorktree(ctx, f.dir, f.db, f.cctx, CaptureOpts{CheckpointStore: &store, IgnoreChecker: f.ig})
+			if err == nil || !partial.Partial {
+				t.Fatalf("changed coverage=%+v err=%v", partial, err)
+			}
+			return DeterministicMessage(ctx, event)
+		},
+	})
+	if err != nil || sum.Published != 1 || sum.Conflicts != 0 || sum.Skipped || calls != 1 {
+		t.Fatalf("coverage change replay=%+v calls=%d err=%v", sum, calls, err)
+	}
+	remaining, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(remaining) != 2 || remaining[0].Path != "b.go" || remaining[1].Path != "blocked.go" {
+		t.Fatalf("source protection=%+v err=%v", remaining, err)
 	}
 }
 
