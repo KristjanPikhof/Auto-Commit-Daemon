@@ -306,7 +306,7 @@ INSERT INTO checkpoint_exclusions(checkpoint_id, category, count) VALUES (?, ?, 
 		}
 	}
 	for _, issue := range checkpoint.CaptureIssues {
-		if issue.Reason == "" || len(issue.Reason) > 64 || strings.ContainsAny(issue.Path, "\x00\r\n\t") {
+		if !validCheckpointCaptureIssue(issue) {
 			return false, errors.New("state: invalid checkpoint capture issue")
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO checkpoint_capture_issues(checkpoint_id,path,subtree,reason) VALUES(?,?,?,?)`, checkpoint.ID, issue.Path, issue.Subtree, issue.Reason); err != nil {
