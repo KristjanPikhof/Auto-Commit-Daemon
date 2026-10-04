@@ -1532,7 +1532,7 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 
 func skippedDecisionKind(reason string) string {
 	switch reason {
-	case "sensitive", "safe_ignore", "gitignore":
+	case "sensitive", "safe_ignore", "gitignore", "non_regular":
 		return state.DecisionKindProtected
 	default:
 		return state.DecisionKindSkipped
@@ -1824,6 +1824,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 
 				// Regular files only — sockets/FIFOs/devices skipped quietly.
 				if !mode.IsRegular() {
+					markProtected(childRel, "non_regular", false)
 					continue
 				}
 				if reason := protectedFileReason(childRel, opts); reason != "" {
