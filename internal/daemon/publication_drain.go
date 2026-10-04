@@ -1589,31 +1589,8 @@ func (p publicationDrainAtomicFallbackPlanner) rewritePlanMessages(
 	req ai.IntentPlanRequestV2,
 	plan ai.IntentPlanV2,
 ) (ai.IntentPlanV2, error) {
-	legacyReq := ai.LegacyIntentPlanRequest(req)
-	out := plan
-	out.Candidates = append([]ai.IntentCandidateAssignment(nil), plan.Candidates...)
-	for index, candidate := range plan.Candidates {
-		if candidate.Readiness != ai.IntentCandidateReady {
-			continue
-		}
-		locked := ai.IntentPlan{
-			SelectedSeqs:   append([]int64(nil), candidate.SelectedSeqs...),
-			Subject:        candidate.Subject,
-			Body:           candidate.Body,
-			GroupingReason: candidate.GroupingReason,
-		}
-		report := ai.EvaluateIntentPlanMessageQuality(legacyReq, locked)
-		result, err := p.RewriteIntentMessage(
-			ctx, ai.NewIntentMessageRewriteRequest(legacyReq, locked, report))
-		if err != nil {
-			return ai.IntentPlanV2{}, err
-		}
-		out.Candidates[index].Subject = result.Subject
-		out.Candidates[index].Body = result.Body
-	}
-	// The provider may only replace subject/body. Re-run the shared quality and
-	// shape gates so malformed output cannot escape through local unlock.
-	return ai.ApplyIntentV2MessageQuality(ctx, p, req, out)
+	out, _, _, err := applyIntentFallbackMessageQuality(ctx, nil, nil, req, plan, "")
+	return out, err
 }
 
 func publicationDrainPendingEvents(
