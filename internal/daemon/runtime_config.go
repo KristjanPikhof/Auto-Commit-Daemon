@@ -350,11 +350,12 @@ ORDER BY id DESC LIMIT 1`, revisionID).Scan(
 }
 
 type runtimeTelemetry struct {
-	revisionID    int64
-	profile       string
-	experimentID  int64
-	presetID      string
-	presetVersion int
+	providerTimeout time.Duration
+	revisionID      int64
+	profile         string
+	experimentID    int64
+	presetID        string
+	presetVersion   int
 }
 type runtimeTelemetryContextKey struct{}
 
@@ -363,7 +364,7 @@ func withRuntimeTelemetry(ctx context.Context, bundle *RuntimeBundle) context.Co
 		return ctx
 	}
 	return context.WithValue(ctx, runtimeTelemetryContextKey{}, runtimeTelemetry{
-		revisionID: bundle.RevisionID, profile: bundle.Profile,
+		revisionID: bundle.RevisionID, profile: bundle.Profile, providerTimeout: bundle.ProviderTimeout,
 		experimentID: bundle.ExperimentID,
 		presetID:     bundle.PresetID, presetVersion: bundle.PresetVersion,
 	})
