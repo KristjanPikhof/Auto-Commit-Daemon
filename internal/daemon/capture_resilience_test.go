@@ -132,6 +132,22 @@ func TestCaptureResiliencePartialProtectionPreservesShadow(t *testing.T) {
 	if err == nil || repeat.CheckpointID != partial.CheckpointID || repeat.EventsAppended != 0 {
 		t.Fatalf("repeat=%+v err=%v", repeat, err)
 	}
+	indexPath := filepath.Join(f.gitDir, "index")
+	indexBefore, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{})
+	if err != nil || replayed.Published != 1 {
+		t.Fatalf("partial replay=%+v err=%v", replayed, err)
+	}
+	indexAfter, err := os.ReadFile(indexPath)
+	if err != nil || !bytes.Equal(indexBefore, indexAfter) {
+		t.Fatalf("live index changed: %v", err)
+	}
+	if got, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "show", "HEAD:independent.md"); err != nil || string(got) != "Independent documentation.\n" {
+		t.Fatalf("independent publication=%q err=%v", got, err)
+	}
 	if err := os.Chmod(blocked, 0644); err != nil {
 		t.Fatal(err)
 	}
