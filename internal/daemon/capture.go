@@ -1086,6 +1086,10 @@ func completeProtectionCheckpoint(
 	summary.Partial = len(issues) > 0
 
 	entries, liveDigest := checkpointEntries(live)
+	worktreeID := opts.WorktreeID
+	if worktreeID == "" {
+		worktreeID = checkpoint.WorktreeID(repoRoot)
+	}
 	projection, err := state.ReadCheckpointProjection(ctx, db.Path(), 1)
 	if err != nil {
 		return fmt.Errorf("daemon: read checkpoint projection: %w", err)
@@ -1094,12 +1098,12 @@ func completeProtectionCheckpoint(
 	if digestErr != nil {
 		return fmt.Errorf("daemon: read protection tree digest: %w", digestErr)
 	}
-	requiredEpoch, err := requiredProtectionCheckpointEpoch(ctx, db, opts.WorktreeID)
+	requiredEpoch, err := requiredProtectionCheckpointEpoch(ctx, db, worktreeID)
 	if err != nil {
 		return err
 	}
-	forceNew = forceNew || requiredEpoch > 0 && epoch >= requiredEpoch
-	if !forceNew && projection.Latest != nil &&
+	barrierNeedsCheckpoint := requiredEpoch > 0 && epoch >= requiredEpoch
+	if !forceNew && !barrierNeedsCheckpoint && projection.Latest != nil && projection.Latest.WorktreeID == worktreeID &&
 		!summary.Partial && !projection.Latest.Partial && projection.Latest.Phase == state.CheckpointCompleted &&
 		digestOK && priorDigest == liveDigest {
 		if err := persistProtectionCoverage(ctx, db, epoch, projection.Latest.ID, liveDigest); err != nil {
@@ -1111,7 +1115,7 @@ func completeProtectionCheckpoint(
 	}
 
 	partialFingerprint := fmt.Sprintf("%s/%v", liveDigest, issues)
-	if summary.Partial && !forceNew && projection.Latest != nil && projection.Latest.Phase == state.CheckpointCompleted && projection.Latest.Partial {
+	if summary.Partial && !forceNew && projection.Latest != nil && projection.Latest.WorktreeID == worktreeID && projection.Latest.Phase == state.CheckpointCompleted && projection.Latest.Partial {
 		previous, _, err := state.MetaGet(ctx, db, "protection.partial_fingerprint")
 		if err != nil {
 			return err
@@ -1125,10 +1129,6 @@ func completeProtectionCheckpoint(
 	reason := opts.CheckpointReason
 	if reason == "" {
 		reason = state.CheckpointReasonPoll
-	}
-	worktreeID := opts.WorktreeID
-	if worktreeID == "" {
-		worktreeID = checkpoint.WorktreeID(repoRoot)
 	}
 	result, err := opts.CheckpointStore.Create(ctx, checkpoint.Request{
 		RepoRoot:         repoRoot,
@@ -1160,7 +1160,7 @@ func completeProtectionCheckpoint(
 	if requiredEpoch > 0 && epoch >= requiredEpoch {
 		if _, err := db.SQL().ExecContext(ctx, `
 DELETE FROM daemon_meta WHERE key=? AND CAST(value AS INTEGER)<=?`,
-			requiredProtectionCheckpointEpochKey(opts.WorktreeID), epoch); err != nil {
+			requiredProtectionCheckpointEpochKey(worktreeID), epoch); err != nil {
 			return fmt.Errorf("daemon: clear required protection checkpoint: %w", err)
 		}
 	}
