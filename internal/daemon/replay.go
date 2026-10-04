@@ -2493,13 +2493,14 @@ func buildIntentPlanRequest(
 			coalesce:   token,
 		})
 		offered = append(offered, ai.OfferedCapture{
-			Seq:          ev.Seq,
-			Path:         ev.Path,
-			Op:           opName,
-			Timestamp:    time.Unix(0, int64(ev.CapturedTS*1e9)).UTC(),
-			Fidelity:     ev.Fidelity,
-			DeferCount:   deferCount,
-			CapturedDiff: diff,
+			Seq:                   ev.Seq,
+			Path:                  ev.Path,
+			Op:                    opName,
+			Timestamp:             time.Unix(0, int64(ev.CapturedTS*1e9)).UTC(),
+			Fidelity:              ev.Fidelity,
+			DeferCount:            deferCount,
+			CapturedDiff:          diff,
+			CapturedDiffTruncated: len(diff) > ai.IntentStageDiffCap,
 		})
 		for _, path := range touchedPaths(ops) {
 			paths[path] = struct{}{}
