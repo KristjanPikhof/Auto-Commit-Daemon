@@ -137,8 +137,9 @@ Next: No action needed.
 ACD bounds AI planning time and can publish safe groups with local messages
 during an outage. Large files stream into Git; binary contents stay out of AI
 requests. If a file cannot be read, ACD saves readable work in a partial
-checkpoint and reports incomplete protection while retrying. `Recovery: N changes saved separately`
-means that work is preserved outside ordinary branch history.
+checkpoint and reports incomplete protection while retrying.
+`Recovery: N changes saved separately` means that work is preserved outside
+ordinary branch history.
 
 Use `acd status --verbose` for provider, queue, target, phase, and worker details.
 
