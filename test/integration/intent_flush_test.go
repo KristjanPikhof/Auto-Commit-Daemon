@@ -136,11 +136,9 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 	}
 }
 
-// TestFlush_LogicalWaitsForUnavailableSemanticProvider proves that a logical
-// flush bypasses the batching delay but not the semantic-message contract. If
-// a configured semantic provider is unavailable, the capture remains durable
-// and pending until that provider can supply the locked commit message.
-func TestFlush_LogicalWaitsForUnavailableSemanticProvider(t *testing.T) {
+// A logical flush can publish a safe local group during a provider outage.
+// The provider circuit remains open instead of retrying for a commit message.
+func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -149,7 +147,7 @@ func TestFlush_LogicalWaitsForUnavailableSemanticProvider(t *testing.T) {
 	binDir := filepath.Dir(bin)
 
 	repo := tempRepo(t)
-	sessionID := "intent-flush-provider-wait"
+	sessionID := "intent-flush-provider-outage"
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
@@ -181,9 +179,9 @@ func TestFlush_LogicalWaitsForUnavailableSemanticProvider(t *testing.T) {
 	})
 	assertIntentV2RuntimeActive(t, repo)
 
-	headBefore := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
-	target := filepath.Join(repo, "semantic-provider-wait.txt")
-	writeFile(t, target, "wait for semantic message\n")
+	startCount := commitCount(t, repo)
+	target := filepath.Join(repo, "semantic-provider-outage.txt")
+	writeFile(t, target, "publish from captured evidence\n")
 
 	wakeRes := runAcd(t, ctx, env, "wake",
 		"--repo", repo, "--session-id", sessionID,
@@ -193,7 +191,7 @@ func TestFlush_LogicalWaitsForUnavailableSemanticProvider(t *testing.T) {
 			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitForEventState(t, dbPath, "semantic-provider-wait.txt", "pending", 5*time.Second)
+	waitForEventState(t, dbPath, "semantic-provider-outage.txt", "pending", 5*time.Second)
 
 	flushRes := runAcd(t, ctx, env, "flush",
 		"--repo", repo, "--session-id", sessionID, "--logical",
@@ -203,7 +201,7 @@ func TestFlush_LogicalWaitsForUnavailableSemanticProvider(t *testing.T) {
 			flushRes.ExitCode, flushRes.Stdout, flushRes.Stderr)
 	}
 
-	waitFor(t, "persisted provider wait", 10*time.Second, func() bool {
+	waitFor(t, "persisted provider circuit", 10*time.Second, func() bool {
 		raw := readDaemonStateScalar(repo, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
 		var health struct {
 			State   string  `json:"state"`
@@ -214,11 +212,16 @@ func TestFlush_LogicalWaitsForUnavailableSemanticProvider(t *testing.T) {
 		return json.Unmarshal([]byte(raw), &health) == nil && health.State == "open" &&
 			health.Failure == "transport" && health.Retry > health.Opened
 	})
-	if headAfter := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
-		t.Fatalf("unavailable semantic provider advanced HEAD: %s -> %s",
-			headBefore, headAfter)
+	waitForEventState(t, dbPath, "semantic-provider-outage.txt", "published", 10*time.Second)
+	if got := commitCount(t, repo); got != startCount+1 {
+		t.Fatalf("commit count=%d want %d", got, startCount+1)
 	}
-	waitForEventState(t, dbPath, "semantic-provider-wait.txt", "pending", time.Second)
+	if got := runGitOK(t, repo, "show", "HEAD:semantic-provider-outage.txt"); got != "publish from captured evidence\n" {
+		t.Fatalf("published bytes=%q", got)
+	}
+	if body := runGitOK(t, repo, "log", "-1", "--format=%b"); !strings.Contains(body, "semantic-provider-outage.txt") {
+		t.Fatalf("local message lost captured evidence: %q", body)
+	}
 }
 
 // TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture asserts the b2

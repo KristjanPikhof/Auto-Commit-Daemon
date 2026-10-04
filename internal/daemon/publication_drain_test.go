@@ -359,8 +359,8 @@ func TestConfigureAtomicIntentFallbackPreservesSemanticProvider(t *testing.T) {
 	if !ok {
 		t.Fatalf("planner=%T, want atomic fallback wrapper", cfg.planner)
 	}
-	if wrapped.messagePlanner != planner || !wrapped.requireSemanticMessage {
-		t.Fatalf("wrapper=%+v, want configured semantic planner", wrapped)
+	if wrapped.commitFormat != ai.CommitFormatImperative {
+		t.Fatalf("wrapper lost commit format: %+v", wrapped)
 	}
 	if cfg.plannerProvider != planner.Name() ||
 		cfg.plannerModel != "semantic-model" || cfg.health != health {
@@ -376,9 +376,7 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 	}
 	configureAtomicIntentFallback(&cfg)
 	planner := cfg.planner.(publicationDrainAtomicFallbackPlanner)
-	if planner.requireSemanticMessage {
-		t.Fatal("explicit deterministic provider unexpectedly requires rewrite")
-	}
+
 	plan, err := planner.PlanIntentV2(context.Background(), ai.IntentPlanRequestV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		OfferedCaptures: []ai.OfferedCapture{{
@@ -389,7 +387,7 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 		t.Fatal(err)
 	}
 	if len(plan.Candidates) != 1 ||
-		plan.Candidates[0].Subject != "Update replay.go" {
+		plan.Candidates[0].Subject != "Update replay code changes" || !strings.Contains(plan.Candidates[0].Body, "replay.go") {
 		t.Fatalf("plan=%+v", plan)
 	}
 }
@@ -782,18 +780,12 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 	}
 	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil || first.Published != 1 || planner.calls != 0 ||
-		planner.rewriteCalls != 1 {
+		planner.rewriteCalls != 0 {
 		t.Fatalf("first fallback=%+v planner_calls=%d rewrite_calls=%d err=%v",
 			first, planner.calls, planner.rewriteCalls, err)
 	}
-	if len(planner.rewriteRequests) != 1 ||
-		len(planner.rewriteRequests[0].LockedPlan.SelectedSeqs) != 1 {
-		t.Fatalf("locked rewrite requests=%+v", planner.rewriteRequests)
-	}
-	if subject := strings.TrimSpace(mustGitOutput(
-		t, f.dir, "show", "-s", "--format=%s", "HEAD",
-	)); subject != "Publish safe dependency group" {
-		t.Fatalf("local unlock subject=%q", subject)
+	if body := mustGitOutput(t, f.dir, "show", "-s", "--format=%b", "HEAD"); !strings.Contains(body, "first.txt") && !strings.Contains(body, "second.txt") {
+		t.Fatalf("local message lacks capture evidence: %q", body)
 	}
 	f.cctx.BaseHead = first.BaseHead
 	drain.FallbackMode = publicationFallbackSemanticReplan
@@ -816,7 +808,7 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 	}
 }
 
-func TestPublicationDrainLocalUnlockWaitsForSemanticMessage(t *testing.T) {
+func TestPublicationDrainLocalUnlockPublishesDuringMessageOutage(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -855,28 +847,21 @@ func TestPublicationDrainLocalUnlockWaitsForSemanticMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sum.Published != 0 || !sum.Skipped ||
-		sum.SkippedReason != "intent_v2_waiting_for_ai" ||
-		sum.Disposition != ReplayDispositionTransientWait ||
-		sum.DispositionReason != sum.PlannerFailure {
-		t.Fatalf("summary=%+v, want retryable semantic-message wait", sum)
+	if sum.Published != 1 || sum.Skipped || sum.Disposition != ReplayDispositionProgress {
+		t.Fatalf("local publication=%+v", sum)
 	}
-	if planner.calls != 0 || planner.rewriteCalls == 0 {
-		t.Fatalf("planner_calls=%d rewrite_calls=%d",
-			planner.calls, planner.rewriteCalls)
+	if planner.calls != 0 || planner.rewriteCalls != 0 {
+		t.Fatalf("unexpected AI calls: plan=%d message=%d", planner.calls, planner.rewriteCalls)
 	}
 	after, err := gitpkg.RevParse(ctx, f.dir, "HEAD")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after != before {
-		t.Fatalf("HEAD=%s want unchanged %s", after, before)
+	if err != nil || after == before {
+		t.Fatalf("HEAD=%s err=%v", after, err)
 	}
 	remaining, err := state.PendingEvents(ctx, f.db, 0)
-	if err != nil || len(remaining) != 1 ||
-		remaining[0].Seq != pending[0].Seq {
+	if err != nil || len(remaining) != 0 {
 		t.Fatalf("remaining=%+v err=%v", remaining, err)
 	}
+
 }
 
 func TestPublicationDrainSemanticMessageWaitIsTransient(t *testing.T) {

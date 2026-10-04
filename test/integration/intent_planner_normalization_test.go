@@ -297,10 +297,9 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	startCount := commitCount(t, repo)
-	headBefore := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	writeFile(t, filepath.Join(repo, "singleton-one.txt"), "one\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
-	waitForEventState(t, dbPath, "singleton-one.txt", "pending", 10*time.Second)
+	waitForEventState(t, dbPath, "singleton-one.txt", "published", 10*time.Second)
 	waitFor(t, "planner circuit opens", 10*time.Second, func() bool {
 		raw := sqliteScalar(t, dbPath,
 			"SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
@@ -319,15 +318,13 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	if got := rewriteHits.Load(); got != 0 {
 		t.Fatalf("message rewrite hits=%d want none during planner outage", got)
 	}
-	if headAfter := strings.TrimSpace(runGitOK(
-		t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
-		t.Fatalf("semantic provider outage advanced HEAD: before=%s after=%s",
-			headBefore, headAfter)
+	if got := runGitOK(t, repo, "show", "HEAD:singleton-one.txt"); got != "one\n" {
+		t.Fatalf("first published capture=%q", got)
 	}
 
 	writeFile(t, filepath.Join(repo, "singleton-two.txt"), "two\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
-	waitForEventState(t, dbPath, "singleton-two.txt", "pending", 10*time.Second)
+	waitForEventState(t, dbPath, "singleton-two.txt", "published", 10*time.Second)
 
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after cooldown bypass=%d want 1", got)
@@ -342,16 +339,17 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	})
 	if got := sqliteScalar(t, dbPath, `
 SELECT COUNT(*) FROM capture_events
-WHERE path IN ('singleton-one.txt','singleton-two.txt') AND state='pending'`); got != "2" {
-		t.Fatalf("pending captures=%s want 2", got)
+WHERE path IN ('singleton-one.txt','singleton-two.txt') AND state='pending'`); got != "0" {
+		t.Fatalf("pending captures=%s want 0", got)
 	}
-	if headAfter := strings.TrimSpace(runGitOK(
-		t, repo, "rev-parse", "HEAD")); headAfter != headBefore {
-		t.Fatalf("circuit bypass advanced HEAD: before=%s after=%s",
-			headBefore, headAfter)
+	if got := runGitOK(t, repo, "show", "HEAD:singleton-one.txt"); got != "one\n" {
+		t.Fatalf("first capture changed during circuit bypass: %q", got)
 	}
-	if got := commitCount(t, repo); got != startCount {
-		t.Fatalf("commit count=%d want unchanged %d during provider outage",
-			got, startCount)
+	if got := runGitOK(t, repo, "show", "HEAD:singleton-two.txt"); got != "two\n" {
+		t.Fatalf("second published capture=%q", got)
+	}
+	if got := commitCount(t, repo); got != startCount+2 {
+		t.Fatalf("commit count=%d want %d during provider outage",
+			got, startCount+2)
 	}
 }

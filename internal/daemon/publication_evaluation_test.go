@@ -313,16 +313,7 @@ func TestPublicationProviderConfigurationRequiresAction(t *testing.T) {
 	}
 }
 
-type configurationMessageRewriter struct{ err error }
-
-func (p *configurationMessageRewriter) Name() string { return "configured-ai" }
-func (p *configurationMessageRewriter) RewriteIntentMessage(context.Context, ai.IntentMessageRewriteRequest) (ai.Result, error) {
-	if p.err != nil {
-		return ai.Result{}, p.err
-	}
-	return ai.Result{Subject: "Preserve semantic behavior", Body: "- Keep related feature changes together"}, nil
-}
-func TestFallbackMessageConfigurationReleasesRecoveryProbe(t *testing.T) {
+func TestLocalFallbackMessagesLeaveRecoveryProbeAvailable(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	now := time.Now()
@@ -335,10 +326,10 @@ func TestFallbackMessageConfigurationReleasesRecoveryProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	now = now.Add(31 * time.Second)
-	planner := &configurationMessageRewriter{err: &ai.ProviderHTTPError{StatusCode: 401, Detail: "credentials rejected"}}
-	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{{CandidateID: "feature", SelectedSeqs: []int64{1}, Readiness: ai.IntentCandidateReady}}}
-	_, _, _, err = applyIntentFallbackMessageQuality(ctx, planner, health, ai.IntentPlanRequestV2{}, plan, "")
-	if !ai.ProviderNeedsConfiguration(err) {
+	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "feature.go", Op: "create"}}}
+	plan := deterministicIntentCandidatePlan(req, true, false)
+	_, err = applyIntentFallbackMessageQuality(req, plan)
+	if err != nil {
 		t.Fatalf("error=%v", err)
 	}
 	if health.Snapshot().State == IntentPlannerCircuitHalfOpen {

@@ -2909,7 +2909,7 @@ func Run(ctx context.Context, opts Options) error {
 			repErr        error
 			replayChecked bool
 		)
-		if capErr == nil && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused &&
+		if (capErr == nil || capSum.Partial && capSum.CheckpointID != "") && !branchTransitionBlocked && !operationPaused && !detachedHeadPaused &&
 			!daemonPaused && !publicationHeld && !runtimeSelectionBlocked && cctx.BaseHead != "" {
 			replayChecked = true
 			// 4g. Replay pass. Bounded by DefaultReplayLimit so a large
@@ -3233,17 +3233,23 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("queue settled experiment baseline revert", "err", ai.SanitizePlannerError(err.Error()))
 		}
 
+		// Capture health must clear after successful capture even when replay fails.
+		if capErr == nil && capSum.Protected {
+			_ = state.RecordCaptureHealth(ctx, opts.DB, "", capSum.CheckpointID, now())
+		}
 		// Tick error counters.
 		if capErr != nil {
 			consecutiveErrors++
-			logger.Warn("capture error", "n", consecutiveErrors, "err", capErr.Error())
-			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", capErr.Error())
+			previous, _, _ := state.MetaGet(ctx, opts.DB, "last_capture_error")
+			if previous != capErr.Error() {
+				logger.Warn("capture error", "n", consecutiveErrors, "err", capErr.Error())
+			}
+			_ = state.RecordCaptureHealth(ctx, opts.DB, capErr.Error(), capSum.CheckpointID, now(), now().Add(opts.Scheduler.NextError(currentDelay)))
 		} else if repErr != nil {
 			value, repeats, providerWait, metaErr := reconcileReplayErrorObservability(
 				ctx, opts.DB, repErr, now())
 			if providerWait {
 				consecutiveErrors = 0
-				_ = state.MetaSet(ctx, opts.DB, "last_capture_error", "")
 				if metaErr != nil {
 					logger.Warn("clear replay error observability for provider wait",
 						"err", metaErr.Error())
@@ -3267,7 +3273,6 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		} else {
 			consecutiveErrors = 0
-			_ = state.MetaSet(ctx, opts.DB, "last_capture_error", "")
 			if replayChecked {
 				previous, repeats, metaErr := clearReplayErrorObservability(
 					ctx, opts.DB)

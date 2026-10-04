@@ -1061,13 +1061,10 @@ func publicationDrainSalvageMode(drain state.PublicationDrain) string {
 }
 
 // publicationDrainAtomicFallbackPlanner keeps every hard dependency component
-// in one commit. Membership is local and deterministic; a configured semantic
-// provider remains responsible for the locked commit message.
+// in one commit and writes messages from the captured evidence.
 type publicationDrainAtomicFallbackPlanner struct {
-	commitFormat           ai.CommitFormat
-	messagePlanner         interface{ Name() string }
-	requireSemanticMessage bool
-	combineWindow          bool
+	commitFormat  ai.CommitFormat
+	combineWindow bool
 }
 
 func configureAtomicIntentFallback(cfg *intentReplayConfig) {
@@ -1081,9 +1078,7 @@ func configureAtomicIntentFallback(cfg *intentReplayConfig) {
 		cfg.plannerProvider = provider
 	}
 	cfg.planner = publicationDrainAtomicFallbackPlanner{
-		commitFormat:           cfg.commitFormat,
-		messagePlanner:         configuredPlanner,
-		requireSemanticMessage: provider != "" && provider != "deterministic",
+		commitFormat: cfg.commitFormat,
 	}
 	cfg.candidateMode = true
 	cfg.bypassBatchWait = true
@@ -1562,58 +1557,7 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 		plan.Candidates[index].Subject = provider.FormatSubjectForOps(
 			plan.Candidates[index].Subject, nil)
 	}
-	if p.requireSemanticMessage {
-		return p.rewritePlanMessages(ctx, req, plan)
-	}
-	return plan, nil
-}
-
-func (p publicationDrainAtomicFallbackPlanner) RewriteIntentMessage(
-	ctx context.Context,
-	req ai.IntentMessageRewriteRequest,
-) (ai.Result, error) {
-	rewriter, ok := p.messagePlanner.(ai.IntentMessageRewriter)
-	if !ok {
-		provider := "configured provider"
-		if p.messagePlanner != nil && strings.TrimSpace(p.messagePlanner.Name()) != "" {
-			provider = p.messagePlanner.Name()
-		}
-		return ai.Result{}, fmt.Errorf(
-			"daemon: %s cannot rewrite a locked Intent message", provider)
-	}
-	return rewriter.RewriteIntentMessage(ctx, req)
-}
-
-func (p publicationDrainAtomicFallbackPlanner) rewritePlanMessages(
-	ctx context.Context,
-	req ai.IntentPlanRequestV2,
-	plan ai.IntentPlanV2,
-) (ai.IntentPlanV2, error) {
-	legacyReq := ai.LegacyIntentPlanRequest(req)
-	out := plan
-	out.Candidates = append([]ai.IntentCandidateAssignment(nil), plan.Candidates...)
-	for index, candidate := range plan.Candidates {
-		if candidate.Readiness != ai.IntentCandidateReady {
-			continue
-		}
-		locked := ai.IntentPlan{
-			SelectedSeqs:   append([]int64(nil), candidate.SelectedSeqs...),
-			Subject:        candidate.Subject,
-			Body:           candidate.Body,
-			GroupingReason: candidate.GroupingReason,
-		}
-		report := ai.EvaluateIntentPlanMessageQuality(legacyReq, locked)
-		result, err := p.RewriteIntentMessage(
-			ctx, ai.NewIntentMessageRewriteRequest(legacyReq, locked, report))
-		if err != nil {
-			return ai.IntentPlanV2{}, err
-		}
-		out.Candidates[index].Subject = result.Subject
-		out.Candidates[index].Body = result.Body
-	}
-	// The provider may only replace subject/body. Re-run the shared quality and
-	// shape gates so malformed output cannot escape through local unlock.
-	return ai.ApplyIntentV2MessageQuality(ctx, p, req, out)
+	return applyIntentFallbackMessageQuality(req, plan)
 }
 
 func publicationDrainPendingEvents(

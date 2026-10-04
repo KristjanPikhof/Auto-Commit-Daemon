@@ -388,6 +388,7 @@ func classifyReplayDisposition(sum *ReplaySummary, replayErr error) {
 			strings.Contains(sum.SkippedReason, "batch_wait") ||
 			strings.Contains(sum.SkippedReason, "settle_window") ||
 			strings.Contains(sum.SkippedReason, "candidate_wait") ||
+			strings.Contains(sum.SkippedReason, "capture_wait") ||
 			strings.Contains(sum.SkippedReason, "branch_transition") {
 			sum.Disposition = ReplayDispositionTransientWait
 		}
@@ -696,6 +697,7 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		loadPending = state.PublishableEvents
 	}
 	loadLimit := queryLimit
+	frozenTarget := ""
 	if opts.PublicationDrain != nil ||
 		(forwardRecoveryActive && len(forwardRecovery.TargetEventSeqs) > 0) {
 		// Frozen recovery targets are already bounded by the durable candidate
@@ -703,8 +705,36 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		// unrelated earlier checkpoints cannot hide one of its members behind
 		// the ordinary look-ahead limit.
 		loadLimit = 0
+		if opts.PublicationDrain != nil {
+			frozenTarget = "drain:" + opts.PublicationDrain.ID
+		} else {
+			frozenTarget = "recovery:" + forwardRecovery.CandidateID
+		}
 	}
-	pending, err := loadPending(ctx, db, loadLimit)
+	var publicationIssues []state.CheckpointCaptureIssue
+	var scanKey string
+	var scanCursor captureEventScanCursor
+	if !intentCfg.enabled {
+		publicationIssues, err = state.CurrentCaptureIssues(ctx, db)
+		if err != nil {
+			return sum, err
+		}
+		if len(publicationIssues) > 0 && batchLimit > 0 {
+			scanKey, scanCursor, err = loadCaptureEventScanCursor(ctx, db, repoRoot, cctx, frozenTarget)
+			if err != nil {
+				return sum, err
+			}
+		}
+	}
+	var pending []state.CaptureEvent
+	if scanKey != "" && frozenTarget == "" {
+		pending, err = state.PendingEventsAfter(ctx, db, scanCursor.Seq, loadLimit, opts.RequireCompletedCheckpoint)
+		if err == nil && len(pending) == 0 && scanCursor.Seq > 0 {
+			pending, err = loadPending(ctx, db, loadLimit)
+		}
+	} else {
+		pending, err = loadPending(ctx, db, loadLimit)
+	}
 	if err != nil {
 		return sum, fmt.Errorf("daemon: load pending: %w", err)
 	}
@@ -718,9 +748,29 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		pending = intentForwardRecoveryPendingEvents(
 			pending, forwardRecovery.TargetEventSeqs)
 	}
+	if scanKey != "" && frozenTarget != "" {
+		start := sort.Search(len(pending), func(index int) bool { return pending[index].Seq > scanCursor.Seq })
+		if start < len(pending) {
+			pending = pending[start:]
+		}
+	}
 	if batchLimit > 0 && len(pending) > batchLimit {
 		pending = pending[:batchLimit]
 		sum.HasMore = true
+	}
+	if scanKey != "" {
+		nextSeq := int64(0)
+		if sum.HasMore {
+			nextSeq = pending[len(pending)-1].Seq
+		}
+		if scanCursor.Seq != nextSeq {
+			defer func() {
+				if replayErr == nil && sum.Conflicts == 0 && sum.Failed == 0 {
+					scanCursor.Seq = nextSeq
+					replayErr = state.MetaSetJSON(ctx, db, scanKey, scanCursor)
+				}
+			}()
+		}
 	}
 	if !intentCfg.candidateMode || len(pending) == 0 {
 		if err := consumeInactiveIntentActivityBoundaries(ctx, db); err != nil {
@@ -789,6 +839,38 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 	}
 
 	for _, ev := range pending {
+		publicationIssues, err = state.CurrentCaptureIssues(ctx, db)
+		if err != nil {
+			return sum, err
+		}
+		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
+		if err != nil {
+			return sum, err
+		}
+		pathsForHold := []string{ev.Path}
+		if ev.OldPath.Valid {
+			pathsForHold = append(pathsForHold, ev.OldPath.String)
+		}
+		hold, err := capturePublicationHoldOpsForIssues(ctx, repoRoot, ops, pathsForHold, publicationIssues)
+		if err != nil {
+			return sum, err
+		}
+		if hold != "" {
+			sum.Skipped = true
+			sum.SkippedReason = "capture_wait: " + hold
+			continue
+		}
+		if scanKey != "" || len(publicationIssues) > 0 {
+			predecessorPending, err := captureEventHasPendingPredecessor(ctx, db, ev)
+			if err != nil {
+				return sum, err
+			}
+			if predecessorPending {
+				sum.Skipped = true
+				sum.SkippedReason = "capture_wait: earlier capture on the same path is pending"
+				continue
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return sum, err
 		}
@@ -822,10 +904,6 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 			return sum, nil
 		}
 
-		ops, err := state.LoadCaptureOps(ctx, db, ev.Seq)
-		if err != nil {
-			return sum, fmt.Errorf("daemon: load ops seq=%d: %w", ev.Seq, err)
-		}
 		if len(ops) == 0 {
 			// No ops to apply — mark failed, do not block the queue.
 			if err := markFailed(ctx, db, ev, replayIssue{
@@ -1178,6 +1256,10 @@ func Replay(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCont
 		})
 	}
 
+	if sum.Published > 0 {
+		sum.Skipped = false
+		sum.SkippedReason = ""
+	}
 	return sum, nil
 }
 
@@ -1281,8 +1363,7 @@ type intentReplayConfig struct {
 	// gates.
 	candidateMode bool
 	// atomicFallback bypasses semantic windows and selects one complete hard
-	// dependency component locally. Non-deterministic configurations still
-	// require their provider to supply the locked semantic commit message.
+	// dependency component locally, including an evidence-based commit message.
 	atomicFallback bool
 	// semanticSalvage offers only the remaining forward target to the configured
 	// provider. A local evidence partition becomes a request for one explicit
@@ -2401,7 +2482,7 @@ func buildIntentPlanRequest(
 		}
 		diff := ""
 		if cfg.includeDiffs {
-			if rendered, err := BuildOpsDiff(ctx, repoRoot, ops); err == nil {
+			if rendered, err := BuildOpsDiffWithCap(ctx, repoRoot, ops, ai.IntentStageDiffCap+1); err == nil {
 				diff = rendered
 			}
 		}
@@ -2420,13 +2501,14 @@ func buildIntentPlanRequest(
 			coalesce:   token,
 		})
 		offered = append(offered, ai.OfferedCapture{
-			Seq:          ev.Seq,
-			Path:         ev.Path,
-			Op:           opName,
-			Timestamp:    time.Unix(0, int64(ev.CapturedTS*1e9)).UTC(),
-			Fidelity:     ev.Fidelity,
-			DeferCount:   deferCount,
-			CapturedDiff: diff,
+			Seq:                   ev.Seq,
+			Path:                  ev.Path,
+			Op:                    opName,
+			Timestamp:             time.Unix(0, int64(ev.CapturedTS*1e9)).UTC(),
+			Fidelity:              ev.Fidelity,
+			DeferCount:            deferCount,
+			CapturedDiff:          diff,
+			CapturedDiffTruncated: len(diff) > ai.IntentStageDiffCap,
 		})
 		for _, path := range touchedPaths(ops) {
 			paths[path] = struct{}{}
@@ -3583,6 +3665,21 @@ func publishIntentSelection(
 	sum ReplaySummary,
 ) (ReplaySummary, error) {
 	if len(selected) == 0 {
+		return sum, nil
+	}
+	var holdPaths []string
+	for _, item := range selected {
+		holdPaths = append(holdPaths, item.event.Path)
+		if item.event.OldPath.Valid {
+			holdPaths = append(holdPaths, item.event.OldPath.String)
+		}
+	}
+	hold, err := capturePublicationHoldOps(ctx, repoRoot, db, flattenIntentOps(selected), holdPaths)
+	if err != nil {
+		return sum, err
+	}
+	if hold != "" {
+		sum.SkippedReason = hold
 		return sum, nil
 	}
 	sourceHead := parent

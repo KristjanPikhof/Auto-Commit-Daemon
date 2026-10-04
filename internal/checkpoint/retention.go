@@ -139,7 +139,7 @@ func (s Store) retentionCandidates(
 	eligible := make([]retentionCandidate, 0)
 	for index := len(checkpoints) - 1; index >= 0; index-- {
 		item := checkpoints[index]
-		if !item.Retained || !item.Published || item.Unresolved ||
+		if !item.Retained || !item.Published || item.Unresolved || item.LatestComplete ||
 			index < DefaultMinimumRetained ||
 			item.Reason == state.CheckpointReasonPreRestore {
 			continue

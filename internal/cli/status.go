@@ -118,6 +118,7 @@ type statusReport struct {
 	LastCommitOID                 string                       `json:"last_commit_oid,omitempty"`
 	LastCommitTS                  int64                        `json:"last_commit_ts,omitempty"`
 	LastCommitMessage             string                       `json:"last_commit_message,omitempty"`
+	CaptureHealth                 state.CaptureHealth          `json:"capture_health"`
 	CaptureErrors                 int                          `json:"capture_errors"`
 	Paused                        bool                         `json:"paused,omitempty"`
 	Pause                         *pauseInfo                   `json:"pause,omitempty"`
@@ -418,6 +419,17 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		return report, fmt.Errorf("capture errors: %w", err)
 	}
 
+	report.CaptureHealth, err = state.ReadCaptureHealth(ctx, conn)
+	if err != nil {
+		return report, err
+	}
+	if report.CaptureHealth.Error != "" {
+		report.Protected = false
+		report.CaptureErrors = max(report.CaptureErrors, max(1, report.CaptureHealth.IssueCount))
+		committed := false
+		report.PublicationOutcome.BranchCommitted = &committed
+	}
+
 	// Durable capture-backpressure state. Presence of the meta key signals
 	// "saturated"; readers should not block on the timestamp shape.
 	if v, ok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at"); err != nil {
@@ -629,6 +641,8 @@ func buildPublicationProgressReport(
 		switch {
 		case manualPause:
 			progress.Phase = "paused"
+		case report.BackpressurePaused:
+			progress.Phase = "needs_action"
 		case report.Paused && report.Pause != nil &&
 			report.Pause.Source == "rewind_grace":
 			progress.Phase = "rewind_wait"
@@ -649,7 +663,8 @@ func buildPublicationProgressReport(
 				report.IntentStrategy.PlannerHealth, now)
 			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery:
-		case report.CheckpointProtectionAvailable && !report.Protected && report.Busy:
+		case report.CheckpointProtectionAvailable && !report.Protected && progress.WorkerResponsive &&
+			progress.Phase != "intent_verification_recovery":
 			progress.Phase = "checkpointing"
 		case intentProviderCallActive(report):
 			progress.Phase = "provider_call"
@@ -668,6 +683,9 @@ func buildPublicationProgressReport(
 				report.IntentStrategy)
 		}
 	}
+	if progress.Phase == "checkpointing" {
+		progress.LastProgressTS = report.FullPollTS
+	}
 	if progress.LastProgressTS > 0 {
 		age := now.Sub(time.Unix(0,
 			int64(progress.LastProgressTS*float64(time.Second))))
@@ -678,11 +696,25 @@ func buildPublicationProgressReport(
 	}
 	stallThreshold := publicationStallThreshold(ctx, conn)
 	progress.StallThresholdSeconds = int64(stallThreshold / time.Second)
-	if progress.WorkerResponsive && progress.QueuePending > 0 &&
+	if progress.WorkerResponsive && (progress.QueuePending > 0 || progress.Phase == "checkpointing") &&
 		progress.LastProgressTS > 0 && ageExceedsThreshold(
 		progress.LastProgressAgeSeconds, stallThreshold) &&
 		publicationPhaseCanStall(progress.Phase) {
 		progress.Phase = "stalled"
+	}
+	if report.CaptureHealth.Error != "" && progress.Phase != "needs_action" && progress.Phase != "paused" {
+		progress.Phase = "capture_blocked"
+		if report.CaptureHealth.State == "retrying" {
+			progress.Phase = "capture_retry"
+		}
+		progress.LastProgressTS = report.CaptureHealth.LastProgressTS
+		if progress.LastProgressTS == 0 {
+			progress.LastProgressTS = report.CaptureHealth.SinceTS
+		}
+		progress.LastProgressAgeSeconds = max(0, now.Unix()-int64(progress.LastProgressTS))
+		if progress.LastProgressTS == 0 {
+			progress.LastProgressAgeSeconds = 0
+		}
 	}
 	return progress, nil
 }
@@ -751,7 +783,7 @@ func ageExceedsThreshold(ageSeconds int64, threshold time.Duration) bool {
 func publicationPhaseCanStall(phase string) bool {
 	switch phase {
 	case "working", "intent_planning", "intent_replanning", "intent_processing",
-		"local_fallback", "retrying", "verifying", "event_publishing":
+		"local_fallback", "retrying", "verifying", "event_publishing", "checkpointing":
 		return true
 	default:
 		return false
@@ -949,10 +981,13 @@ func statusOperationalState(report statusReport) string {
 }
 
 func statusOperationalStateWithDaemonAlive(report statusReport, daemonAlive bool) string {
+	manualPause := report.Paused && (report.Pause == nil || report.Pause.Source != "rewind_grace")
 	switch {
 	case report.Stale || report.Daemon != "running" || !daemonAlive:
 		return "stopped"
-	case report.Configuration.Configuration == "needs_attention" ||
+	case manualPause:
+		return "paused"
+	case report.BackpressurePaused || report.Configuration.Configuration == "needs_attention" ||
 		report.Replay.State == "needs_attention" ||
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:

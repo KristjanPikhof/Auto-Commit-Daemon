@@ -64,9 +64,9 @@ func replayIntentCandidateBatch(
 			return recovered, recoveryErr
 		}
 	}
-	diffBySeq := make(map[int64]string, len(legacyRequest.OfferedCaptures))
+	offeredBySeq := make(map[int64]ai.OfferedCapture, len(legacyRequest.OfferedCaptures))
 	for _, offered := range legacyRequest.OfferedCaptures {
-		diffBySeq[offered.Seq] = offered.CapturedDiff
+		offeredBySeq[offered.Seq] = offered
 	}
 	captures := make([]IntentCandidateCapture, 0, len(items))
 	for _, item := range items {
@@ -75,9 +75,17 @@ func replayIntentCandidateBatch(
 			covered = append(covered, item.coalesce.Covered...)
 		}
 		captures = append(captures, IntentCandidateCapture{
-			Event: item.event, Ops: item.ops, CapturedDiff: diffBySeq[item.event.Seq],
+			Event: item.event, Ops: item.ops, CapturedDiff: offeredBySeq[item.event.Seq].CapturedDiff,
 			CoveredEvents: covered,
 		})
+	}
+	if err := attachIntentFileMetadata(ctx, repoRoot, captures); err != nil {
+		return sum, err
+	}
+	for _, capture := range captures {
+		if offeredBySeq[capture.Event.Seq].CapturedDiffTruncated && capture.FileMetadata != nil && capture.FileMetadata.Kind == "text" {
+			capture.FileMetadata.DiffOmittedReason = "truncated"
+		}
 	}
 	retryLimit := resolvedIntentRetryLimit()
 	if cfg.retryLimit != nil {
@@ -114,7 +122,7 @@ func replayIntentCandidateBatch(
 	evaluation, err := EvaluateIntentCandidates(plannerCtx, db, IntentCandidateEvaluation{
 		BranchRef: activeCtx.BranchRef, BranchGeneration: activeCtx.BranchGeneration,
 		Captures: captures, Planner: cfg.planner, Health: opts.IntentHealth,
-		RetryLimit: retryLimit, RetryLimitSet: true,
+		RetryLimit: retryLimit, RetryLimitSet: true, ProviderBudget: telemetry.providerTimeout,
 		Preset:       opts.IntentPreset,
 		CommitFormat: cfg.commitFormat, IncludeDiffs: cfg.includeDiffs,
 		ForcedAging: forced, Provider: cfg.plannerProvider, Model: cfg.plannerModel,

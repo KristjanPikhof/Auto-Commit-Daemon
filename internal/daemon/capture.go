@@ -12,9 +12,7 @@
 //   - Sensitive default-deny via state.SensitiveMatcher.
 //   - Generated dependency/cache tree pruning via state.SafeIgnoreMatcher.
 //   - Gitignored paths via batch git.IgnoreChecker.
-//   - Oversize regulars (> ACD_MAX_FILE_BYTES, default 5 MiB) are accepted
-//     only when their exact bytes already match a normal indexed Git blob;
-//     other oversized content remains incomplete/meta-only.
+//   - Regular files above ACD_MAX_FILE_BYTES stream into Git objects.
 //   - Regular files opened with O_NOFOLLOW + post-open lstat/fstat
 //     ino+dev+mode verification (TOCTOU defense against symlink swap).
 package daemon
@@ -44,11 +42,11 @@ import (
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
 
-// EnvMaxFileBytes is the per-file size cap. Mirrors the legacy
+// EnvMaxFileBytes is the regular-file buffering threshold. Mirrors the legacy
 // SNAPSHOTD_MAX_FILE_BYTES knob with the new ACD_ prefix.
 const EnvMaxFileBytes = "ACD_MAX_FILE_BYTES"
 
-// DefaultMaxFileBytes is the default per-file size cap (5 MiB).
+// DefaultMaxFileBytes is the default buffering threshold (5 MiB).
 const DefaultMaxFileBytes int64 = 5 << 20
 
 // EnvPathQuiescenceSeconds names the operator knob that defers planner offers
@@ -146,7 +144,7 @@ const stateSubdir = "acd"
 type CaptureSummary struct {
 	EventsAppended   int   // number of capture_events rows inserted
 	EventsDropped    int   // ops refused due to ACD_MAX_PENDING_EVENTS cap
-	Oversize         int   // files skipped due to size cap
+	Oversize         int   // files skipped due to instability (legacy field name)
 	Errors           int   // soft errors (per-file lstat/open failures)
 	WalkedFiles      int64 // for diagnostics
 	PendingDepth     int   // pending depth observed for the active generation at end of pass (0 if cap disabled)
@@ -178,6 +176,7 @@ type CaptureSummary struct {
 	// Protected means this complete scan covers ObservationEpoch. An unchanged
 	// tree may reuse the prior checkpoint while still advancing covered_epoch.
 	Protected bool
+	Partial   bool
 }
 
 // CaptureContext carries the repository identity frozen at the start of a pass.
@@ -810,7 +809,7 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 			summary.PendingDepth = pending
 			updatePendingHighWater(ctx, db, pending)
 		}
-		if len(ownedOps) == len(ops) {
+		if len(ownedOps) == len(ops) && summary.Protected {
 			_, digest := checkpointEntries(live)
 			covered, _, err := state.MetaGet(ctx, db, MetaKeyProtectionCoveredEpoch)
 			if err != nil {
@@ -979,6 +978,9 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 		summary.EventsDroppedTotal = total
 	}
 
+	if summary.Partial {
+		return summary, partialCaptureError(summary)
+	}
 	return summary, nil
 }
 
@@ -1017,6 +1019,9 @@ func ProtectWorktree(ctx context.Context, repoRoot string, db *state.DB, cctx Ca
 		_ = state.MetaSet(context.Background(), db, MetaKeyProtectionComplete, "false")
 		return summary, err
 	}
+	if summary.Partial {
+		return summary, partialCaptureError(summary)
+	}
 	return summary, nil
 }
 
@@ -1047,7 +1052,7 @@ func ScanProtectedEntries(ctx context.Context, repoRoot string, opts CaptureOpts
 	}
 	if summary.Errors > 0 || summary.Oversize > 0 {
 		return nil, checkpointExclusions(protected), summary,
-			fmt.Errorf("daemon: protection scan incomplete (unreadable_or_unstable=%d oversized_or_unstable=%d)", summary.Errors, summary.Oversize)
+			fmt.Errorf("daemon: protection scan incomplete (unreadable=%d unstable=%d)", summary.Errors, summary.Oversize)
 	}
 	entries, _ := checkpointEntries(live)
 	return entries, checkpointExclusions(protected), summary, nil
@@ -1077,12 +1082,14 @@ func completeProtectionCheckpoint(
 		strconv.FormatInt(epoch, 10)); err != nil {
 		return fmt.Errorf("daemon: persist protection observation epoch: %w", err)
 	}
-	if summary.Errors > 0 || summary.Oversize > 0 {
-		return fmt.Errorf("daemon: protection scan incomplete (unreadable_or_unstable=%d oversized_or_unstable=%d)",
-			summary.Errors, summary.Oversize)
-	}
+	issues := captureIssues(protectedSkips)
+	summary.Partial = len(issues) > 0
 
 	entries, liveDigest := checkpointEntries(live)
+	worktreeID := opts.WorktreeID
+	if worktreeID == "" {
+		worktreeID = checkpoint.WorktreeID(repoRoot)
+	}
 	projection, err := state.ReadCheckpointProjection(ctx, db.Path(), 1)
 	if err != nil {
 		return fmt.Errorf("daemon: read checkpoint projection: %w", err)
@@ -1091,13 +1098,13 @@ func completeProtectionCheckpoint(
 	if digestErr != nil {
 		return fmt.Errorf("daemon: read protection tree digest: %w", digestErr)
 	}
-	requiredEpoch, err := requiredProtectionCheckpointEpoch(ctx, db, opts.WorktreeID)
+	requiredEpoch, err := requiredProtectionCheckpointEpoch(ctx, db, worktreeID)
 	if err != nil {
 		return err
 	}
-	forceNew = forceNew || requiredEpoch > 0 && epoch >= requiredEpoch
-	if !forceNew && projection.Latest != nil &&
-		projection.Latest.Phase == state.CheckpointCompleted &&
+	barrierNeedsCheckpoint := requiredEpoch > 0 && epoch >= requiredEpoch
+	if !forceNew && !barrierNeedsCheckpoint && projection.Latest != nil && projection.Latest.WorktreeID == worktreeID &&
+		!summary.Partial && !projection.Latest.Partial && projection.Latest.Phase == state.CheckpointCompleted &&
 		digestOK && priorDigest == liveDigest {
 		if err := persistProtectionCoverage(ctx, db, epoch, projection.Latest.ID, liveDigest); err != nil {
 			return err
@@ -1107,14 +1114,21 @@ func completeProtectionCheckpoint(
 		return nil
 	}
 
+	partialFingerprint := fmt.Sprintf("%s/%v", liveDigest, issues)
+	if summary.Partial && !forceNew && projection.Latest != nil && projection.Latest.WorktreeID == worktreeID && projection.Latest.Phase == state.CheckpointCompleted && projection.Latest.Partial {
+		previous, _, err := state.MetaGet(ctx, db, "protection.partial_fingerprint")
+		if err != nil {
+			return err
+		}
+		if previous == partialFingerprint {
+			summary.CheckpointID = projection.Latest.ID
+			return nil
+		}
+	}
 	exclusions := checkpointExclusions(protectedSkips)
 	reason := opts.CheckpointReason
 	if reason == "" {
 		reason = state.CheckpointReasonPoll
-	}
-	worktreeID := opts.WorktreeID
-	if worktreeID == "" {
-		worktreeID = checkpoint.WorktreeID(repoRoot)
 	}
 	result, err := opts.CheckpointStore.Create(ctx, checkpoint.Request{
 		RepoRoot:         repoRoot,
@@ -1126,9 +1140,19 @@ func completeProtectionCheckpoint(
 		ObservedRef:      cctx.BranchRef,
 		Entries:          entries,
 		Exclusions:       exclusions,
+		CaptureIssues:    issues,
 	})
 	if err != nil {
 		return fmt.Errorf("daemon: complete protection checkpoint: %w", err)
+	}
+	if summary.Partial {
+		summary.CheckpointID = result.Checkpoint.ID
+		return state.MetaSetMany(ctx, db, map[string]string{
+			MetaKeyProtectionCheckpointID:          summary.CheckpointID,
+			MetaKeyProtectionComplete:              "false",
+			"protection.partial_fingerprint":       partialFingerprint,
+			MetaKeyProtectionClassificationPending: "true",
+		})
 	}
 	if err := persistProtectionCoverage(ctx, db, epoch, result.Checkpoint.ID, liveDigest); err != nil {
 		return err
@@ -1136,7 +1160,7 @@ func completeProtectionCheckpoint(
 	if requiredEpoch > 0 && epoch >= requiredEpoch {
 		if _, err := db.SQL().ExecContext(ctx, `
 DELETE FROM daemon_meta WHERE key=? AND CAST(value AS INTEGER)<=?`,
-			requiredProtectionCheckpointEpochKey(opts.WorktreeID), epoch); err != nil {
+			requiredProtectionCheckpointEpochKey(worktreeID), epoch); err != nil {
 			return fmt.Errorf("daemon: clear required protection checkpoint: %w", err)
 		}
 	}
@@ -1253,6 +1277,9 @@ func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, c
 // supplied observation. Recovery paths use it only after independently
 // proving the complete protected entry set.
 func CompleteProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID string, entries []checkpoint.Entry) error {
+	if _, err := state.ResolveCheckpoint(ctx, db.Path(), checkpointID); err != nil {
+		return err
+	}
 	return persistProtectionCoverage(ctx, db, epoch, checkpointID, ProtectionEntriesDigest(entries))
 }
 
@@ -1433,7 +1460,7 @@ func newProtectedSkipIndex(protected map[string]skippedPresent) protectedSkipInd
 		exact: make(map[string]string, len(protected)),
 	}
 	for path, skip := range protected {
-		if path == "" || skip.Reason == "" {
+		if skip.Reason == "" {
 			continue
 		}
 		if skip.Dir {
@@ -1453,6 +1480,9 @@ func (index protectedSkipIndex) reasonForPath(path string) (reason string, ok bo
 		return reason, true, false
 	}
 	for _, prefix := range index.dirs {
+		if prefix.path == "" {
+			return prefix.reason, true, false
+		}
 		if path == prefix.path || strings.HasPrefix(path, prefix.path+"/") {
 			return prefix.reason, true, true
 		}
@@ -1502,7 +1532,7 @@ func recordProtectedSkipDecision(ctx context.Context, db *state.DB, cctx Capture
 
 func skippedDecisionKind(reason string) string {
 	switch reason {
-	case "sensitive", "safe_ignore", "gitignore":
+	case "sensitive", "safe_ignore", "gitignore", "non_regular":
 		return state.DecisionKindProtected
 	default:
 		return state.DecisionKindSkipped
@@ -1648,7 +1678,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 	protected := map[string]skippedPresent{}
 	var summary CaptureSummary
 	markProtected := func(rel, reason string, dir bool) {
-		if rel == "" || reason == "" {
+		if reason == "" {
 			return
 		}
 		protected[rel] = skippedPresent{Reason: reason, Dir: dir}
@@ -1741,7 +1771,22 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 				childFull := filepath.Join(parent.full, name)
 				fi, lstatErr := os.Lstat(childFull)
 				if lstatErr != nil {
-					markProtected(childRel, "lstat_error", false)
+					if reason := protectedFileReason(childRel, opts); reason != "" {
+						markProtected(childRel, reason, true)
+						continue
+					}
+					if opts.ignoreChecker != nil {
+						ignored, err := opts.ignoreChecker.Check(ctx, []string{childRel})
+						if err != nil {
+							return nil, protected, summary, err
+						}
+						if len(ignored) == 1 && ignored[0] {
+							markProtected(childRel, "gitignore", true)
+							continue
+						}
+					}
+					// Its type is unknown, so retain possible descendants too.
+					markProtected(childRel, "lstat_error", true)
 					bumpLayerError()
 					continue
 				}
@@ -1780,6 +1825,7 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 
 				// Regular files only — sockets/FIFOs/devices skipped quietly.
 				if !mode.IsRegular() {
+					markProtected(childRel, "non_regular", false)
 					continue
 				}
 				if reason := protectedFileReason(childRel, opts); reason != "" {
@@ -1882,11 +1928,11 @@ func protectedFileReason(path string, opts walkOpts) string {
 // hashCandidate hashes one candidate path into the git object store. For
 // symlinks: read target bytes, hash with mode 120000. For regulars: open
 // O_NOFOLLOW, verify ino+dev+mode unchanged across the open, enforce the
-// size cap (recording oversize via daemon_meta), then hash via stdin.
+// buffer threshold, then stream large files through stdin.
 //
 // Returns:
 //   - (entry, true,  "",     nil) — captured ok.
-//   - (zero,  false, reason, nil) — skipped (oversize, vanished, type changed).
+//   - (zero,  false, reason, nil) — skipped (unstable or type changed).
 //   - (zero,  _,     "",     err) — hard error worth recording in summary.
 func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts walkOpts) (LiveEntry, bool, string, error) {
 	mode := c.fi.Mode()
@@ -1894,6 +1940,10 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 		target, rerr := os.Readlink(c.full)
 		if rerr != nil {
 			return LiveEntry{}, false, "", rerr
+		}
+		after, err := os.Lstat(c.full)
+		if err != nil || !sameFileSnapshot(c.fi, after) {
+			return LiveEntry{}, false, "unstable", nil
 		}
 		var oid string
 		var herr error
@@ -1913,7 +1963,8 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 	}
 
 	// Regular file: O_NOFOLLOW + verify ino/dev/mode (TOCTOU defense).
-	flags := os.O_RDONLY | syscall.O_NOFOLLOW
+	// O_NONBLOCK prevents a regular-file-to-FIFO swap from blocking the open.
+	flags := os.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
 	f, err := os.OpenFile(c.full, flags, 0)
 	if err != nil {
 		return LiveEntry{}, false, "", err
@@ -1931,75 +1982,49 @@ func hashCandidate(ctx context.Context, repoRoot string, c candidateLike, opts w
 	if !post.Mode().IsRegular() {
 		return LiveEntry{}, false, "non_regular", nil
 	}
-	if post.Size() > opts.maxBytes {
-		entry, reusable, reuseErr := reuseIndexedBlob(ctx, repoRoot, c.rel, f, post)
-		if reuseErr != nil {
-			return LiveEntry{}, false, "", reuseErr
+	var oid string
+	bufferLimit := min(opts.maxBytes, int64(32<<20))
+	if post.Size() > bufferLimit {
+		// The buffer threshold is not a protection limit. Git consumes the
+		// stream under its operation deadline without copying the asset here.
+		reader := &io.LimitedReader{R: f, N: post.Size() + 1}
+		if opts.hashOnly {
+			oid, err = git.HashObjectReaderReadOnly(ctx, repoRoot, reader)
+		} else {
+			oid, err = git.HashObjectReaderDurable(ctx, repoRoot, reader)
 		}
-		if reusable {
-			return entry, true, "", nil
+		if err == nil && reader.N != 1 {
+			return LiveEntry{}, false, "unstable", nil
 		}
-		recordOversize(ctx, opts.db, c.rel, post.Size(), opts.maxBytes)
-		return LiveEntry{}, false, "oversize", nil
+	} else {
+		var buf []byte
+		buf, err = io.ReadAll(io.LimitReader(f, bufferLimit+1))
+		if err == nil && int64(len(buf)) != post.Size() {
+			return LiveEntry{}, false, "unstable", nil
+		}
+		if err == nil {
+			if opts.blobHasher != nil {
+				oid, err = opts.blobHasher.BlobOID(buf)
+				if err == nil && opts.blobBatch != nil {
+					err = opts.blobBatch.add(ctx, repoRoot, oid, buf)
+				}
+			} else {
+				oid, err = git.HashObjectStdin(ctx, repoRoot, buf)
+			}
+		}
 	}
-	// Read up to maxBytes+1 to detect truncation/grow during read; if we
-	// exceed, record oversize and discard.
-	buf, err := io.ReadAll(f)
 	if err != nil {
 		return LiveEntry{}, false, "", err
 	}
-	if int64(len(buf)) > opts.maxBytes {
-		recordOversize(ctx, opts.db, c.rel, int64(len(buf)), opts.maxBytes)
-		return LiveEntry{}, false, "oversize", nil
-	}
-	var oid string
-	var herr error
-	if opts.blobHasher != nil {
-		oid, herr = opts.blobHasher.BlobOID(buf)
-		if herr == nil && opts.blobBatch != nil {
-			herr = opts.blobBatch.add(ctx, repoRoot, oid, buf)
-		}
-	} else {
-		oid, herr = git.HashObjectStdin(ctx, repoRoot, buf)
-	}
-	if herr != nil {
-		return LiveEntry{}, false, "", herr
-	}
-	return LiveEntry{
-		Path: c.rel,
-		Mode: gitModeFor(post.Mode()),
-		OID:  oid,
-	}, true, "", nil
-}
-
-// reuseIndexedBlob accepts an oversized regular file only when hashing its
-// exact worktree bytes proves they already exist as the path's ordinary
-// stage-0 index blob. This keeps dirty and untracked oversized content
-// fail-closed while avoiding a duplicate object write for large tracked
-// assets that Git already protects.
-func reuseIndexedBlob(ctx context.Context, repoRoot, path string, file *os.File, before os.FileInfo) (LiveEntry, bool, error) {
-	entries, err := git.LsFilesStaged(ctx, repoRoot, path)
+	after, err := f.Stat()
 	if err != nil {
-		return LiveEntry{}, false, err
+		return LiveEntry{}, false, "", err
 	}
-	if len(entries) != 1 || entries[0].Stage != 0 || entries[0].Path != path || entries[0].Mode != gitModeFor(before.Mode()) {
-		return LiveEntry{}, false, nil
+	pathAfter, err := os.Lstat(c.full)
+	if err != nil || !sameFileSnapshot(post, after) || !sameFileSnapshot(after, pathAfter) {
+		return LiveEntry{}, false, "unstable", nil
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return LiveEntry{}, false, err
-	}
-	oid, err := git.HashObjectReaderReadOnly(ctx, repoRoot, file)
-	if err != nil {
-		return LiveEntry{}, false, err
-	}
-	after, err := file.Stat()
-	if err != nil {
-		return LiveEntry{}, false, err
-	}
-	if !sameFileSnapshot(before, after) || oid != entries[0].OID {
-		return LiveEntry{}, false, nil
-	}
-	return LiveEntry{Path: path, Mode: entries[0].Mode, OID: entries[0].OID}, true, nil
+	return LiveEntry{Path: c.rel, Mode: gitModeFor(post.Mode()), OID: oid}, true, "", nil
 }
 
 // candidateLike is the minimal shape hashCandidate needs. Aliasing the
@@ -2263,18 +2288,6 @@ func applyPathQuiescenceWindow(d time.Duration) {
 	SetPathQuiescenceEnabled(d > 0)
 }
 
-// recordOversize stores a daemon_meta breadcrumb so operators can see why a
-// path was skipped without having to grep the daemon log. Best-effort:
-// errors are dropped because the capture pipeline must keep running.
-func recordOversize(ctx context.Context, db *state.DB, rel string, size, cap int64) {
-	if db == nil {
-		return
-	}
-	key := "capture-skip-large:" + rel
-	val := fmt.Sprintf("size=%d>cap=%d", size, cap)
-	_ = state.MetaSet(ctx, db, key, val)
-}
-
 func hasControlPathChar(rel string) bool {
 	return strings.ContainsAny(rel, "\x00\t\n\r")
 }
@@ -2295,4 +2308,30 @@ func metaPathKey(rel string) string {
 		"\r", "\\r",
 	)
 	return replacer.Replace(rel)
+}
+
+func captureIssues(skips map[string]skippedPresent) []state.CheckpointCaptureIssue {
+	var issues []state.CheckpointCaptureIssue
+	for path, skip := range skips {
+		switch skip.Reason {
+		case "sensitive", "safe_ignore", "gitignore", "non_regular":
+			continue
+		case "invalid_path":
+			path = "" // no control characters in the ledger
+		}
+		issues = append(issues, state.CheckpointCaptureIssue{Path: path, Subtree: skip.Dir || path == "", Reason: skip.Reason})
+	}
+	sort.Slice(issues, func(i, j int) bool { return issues[i].Path < issues[j].Path })
+	// Several invalid names all represent the same unknown scope.
+	unique := issues[:0]
+	for _, issue := range issues {
+		if len(unique) == 0 || unique[len(unique)-1].Path != issue.Path {
+			unique = append(unique, issue)
+		}
+	}
+	return unique
+}
+
+func partialCaptureError(summary CaptureSummary) error {
+	return fmt.Errorf("daemon: protection scan incomplete (unreadable=%d unstable=%d); readable files saved in a partial checkpoint", summary.Errors, summary.Oversize)
 }

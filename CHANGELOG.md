@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Fixed
+
+- Stream large regular files into durable Git objects instead of stopping
+  checkpoint protection at the capture buffer threshold. Binary planner input
+  contains metadata only.
+- Save readable work in explicit partial checkpoints when eligible files cannot
+  be read. Retain the last complete checkpoint and prevent incomplete restore
+  or barrier proofs. Independent documentation can continue publishing past
+  held queue prefixes in Event mode.
+- Bound Intent provider work with a restart-safe deadline and use local messages
+  for safe fallback groups without a second call to an unavailable provider.
+  Local messages recover from rejected symbol-only subjects, and native planner
+  metadata preserves text-diff truncation.
+- Preserve validated Intent groups and their dependency order during offline
+  recovery. Message repair keeps candidate membership and purpose intact.
+- Report capture health consistently across status, list, doctor, diagnose, and
+  recovery. Recovery no longer reports healthy publication state as complete
+  protection or claims a repair was applied when nothing changed.
+  Capture retries keep manual pauses and other required actions visible; status
+  and list agree on checkpoint stalls, including scans with empty queues.
+- Keep verification recovery visible when checkpoint coverage is incomplete.
+  Stopped workers no longer appear to be actively scanning for checkpoints.
+- Preserve published captures referenced by completed publication drains during
+  retention, preventing foreign-key failures.
+
+### Changed
+
+- Repository schema v29 stores checkpoint coverage, eligible capture failures,
+  and provider deadlines. Existing checkpoints retain complete coverage.
+- `capture.max_file_bytes` now controls buffering rather than file eligibility.
+
 ## v2026-09-27
 
 ### Changed

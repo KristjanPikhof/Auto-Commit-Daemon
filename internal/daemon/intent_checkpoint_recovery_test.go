@@ -635,9 +635,8 @@ func TestReplayLocalUnlockWidensResolvedSemanticPrefix(t *testing.T) {
 		t.Fatalf("verified semantic prefixes=%v want %v",
 			verifiedSeqs, wantAttempts)
 	}
-	if !reflect.DeepEqual(planner.rewriteSeqs, wantAttempts) {
-		t.Fatalf("provider message prefixes=%v want %v",
-			planner.rewriteSeqs, wantAttempts)
+	if len(planner.rewriteSeqs) != 0 {
+		t.Fatalf("local recovery called the message provider: %v", planner.rewriteSeqs)
 	}
 	if third.Published != len(fixture.seqs) || third.Failed != 0 ||
 		third.Conflicts != 0 {
@@ -649,8 +648,8 @@ func TestReplayLocalUnlockWidensResolvedSemanticPrefix(t *testing.T) {
 		t.Fatalf("completed marker active=%t err=%v", active, err)
 	}
 	if subject := strings.TrimSpace(mustGitOutput(
-		t, f.dir, "log", "-1", "--format=%s")); subject != "Restore checkpoint compilation" {
-		t.Fatalf("commit subject=%q want provider rewrite", subject)
+		t, f.dir, "log", "-1", "--format=%s")); subject != "Update source code changes" {
+		t.Fatalf("local recovery subject=%q", subject)
 	}
 }
 

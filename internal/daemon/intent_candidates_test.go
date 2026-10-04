@@ -1109,13 +1109,10 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(second.PlannerFailure, "circuit open") ||
-		second.Fallback != "waiting_for_ai" ||
-		second.ResolutionMode != "waiting_for_ai" ||
-		second.NeedsAttention || len(second.Decisions) != 0 ||
-		planner.calls != 1 {
-		t.Fatalf("circuit bypass=%+v calls=%d", second, planner.calls)
+	if second.ResolutionMode != "evidence_partition" || len(second.Decisions) != 1 || !second.Decisions[0].Publishable || planner.calls != 1 {
+		t.Fatalf("offline plan reuse=%+v calls=%d", second, planner.calls)
 	}
+
 	snapshot := health.Snapshot()
 	if snapshot.State != IntentPlannerCircuitOpen ||
 		snapshot.BypassCount != 1 {
@@ -1127,8 +1124,8 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if forced.Fallback != "waiting_for_ai" || forced.PlanAttempt != 0 ||
-		len(forced.Decisions) != 0 || forced.NeedsAttention {
+	if forced.ResolutionMode != "evidence_partition" || forced.PlanAttempt != 0 ||
+		len(forced.Decisions) != 1 || !forced.Decisions[0].Publishable || forced.NeedsAttention {
 		t.Fatalf("forced provider wait=%+v", forced)
 	}
 }
@@ -2250,7 +2247,7 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	}
 }
 
-func TestIntentCandidateEngineModelWideFailureWaitsForMessage(t *testing.T) {
+func TestIntentCandidateEngineModelWideFailureUsesLocalMessages(t *testing.T) {
 	for _, preset := range []config.PresetName{
 		config.PresetFast,
 		config.PresetBalanced,
@@ -2280,15 +2277,15 @@ func TestIntentCandidateEngineModelWideFailureWaitsForMessage(t *testing.T) {
 				t.Fatalf("EvaluateIntentCandidates: %v", err)
 			}
 			if planner.plannerCalls != 1 || planner.rewriteCalls != 0 ||
-				result.PlanAttempt != 0 || result.Fallback != "waiting_for_ai" ||
-				result.NeedsAttention || len(result.Decisions) != 0 {
-				t.Fatalf("provider outage must wait without consuming grouping attempts: %+v", result)
+				result.PlanAttempt != 0 || result.Fallback != "evidence_partition" ||
+				result.NeedsAttention || len(result.Decisions) != 2 || !result.Decisions[0].Publishable || !result.Decisions[1].Publishable {
+				t.Fatalf("provider outage must publish verified local groups without rewriting messages: %+v", result)
 			}
 		})
 	}
 }
 
-func TestIntentCandidateEnginePublishesAfterMessageRecoveryAcrossRestart(
+func TestIntentCandidateEngineReusesLocalMessagesAcrossRestart(
 	t *testing.T,
 ) {
 	ctx := context.Background()
@@ -2315,8 +2312,8 @@ func TestIntentCandidateEnginePublishesAfterMessageRecoveryAcrossRestart(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Fallback != "waiting_message_rewrite" ||
-		len(first.Decisions) != 1 || first.Decisions[0].Publishable {
+	if first.Fallback != "evidence_partition" ||
+		len(first.Decisions) != 1 || !first.Decisions[0].Publishable {
 		t.Fatalf("message outage=%+v", first)
 	}
 	if err := db.Close(); err != nil {
@@ -2336,7 +2333,7 @@ func TestIntentCandidateEnginePublishesAfterMessageRecoveryAcrossRestart(
 	if second.Fallback != "evidence_partition" ||
 		second.ResolutionMode != "evidence_partition" ||
 		len(second.Decisions) != 1 || !second.Decisions[0].Publishable ||
-		second.Decisions[0].Assignment.Subject != "Finish dependent behavior" {
+		second.Decisions[0].Assignment.Subject != first.Decisions[0].Assignment.Subject {
 		t.Fatalf("message recovery=%+v", second)
 	}
 }
@@ -4530,7 +4527,7 @@ func TestIntentProviderOutageSurvivesRestartsWithoutConsumingAttempts(t *testing
 	now := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
 	identity := IntentPlannerProviderIdentity{Provider: planner.Name()}
 	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, Captures: []IntentCandidateCapture{capture}, Planner: planner,
-		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced, VerificationMode: "structural",
+		RetryLimit: 0, RetryLimitSet: true, Preset: config.PresetBalanced, VerificationMode: "structural", RejectLocalFallback: true,
 		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil }}
 	for attempt := 0; attempt < 8; attempt++ {
 		input.Health = NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: identity, Now: func() time.Time { return now }})

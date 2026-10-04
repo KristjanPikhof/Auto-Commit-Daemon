@@ -152,7 +152,12 @@ func DurabilitySupport(ctx context.Context, repoDir string) error {
 // HashObjectStdinDurable writes one blob with Git's loose-object fsync mode
 // enabled and rereads its exact type before returning.
 func HashObjectStdinDurable(ctx context.Context, repoDir string, content []byte) (string, error) {
-	out, err := runDurable(ctx, repoDir, bytes.NewReader(content), "loose-object",
+	return HashObjectReaderDurable(ctx, repoDir, bytes.NewReader(content))
+}
+
+// HashObjectReaderDurable protects a blob without buffering its contents.
+func HashObjectReaderDurable(ctx context.Context, repoDir string, content io.Reader) (string, error) {
+	out, err := runDurable(ctx, repoDir, content, "loose-object",
 		"hash-object", "-w", "--stdin")
 	if err != nil {
 		return "", err

@@ -969,7 +969,7 @@ SELECT COUNT(*) FROM intent_repairs WHERE status='completed'`).
 		t.Fatalf("failed replan rewrote prior commits: %v", err)
 	}
 	if subject := strings.TrimSpace(mustGitOutput(
-		t, f.dir, "show", "-s", "--format=%s", "HEAD")); subject != "Complete dependent feature update" {
+		t, f.dir, "show", "-s", "--format=%s", "HEAD")); subject != "Update feature code changes" {
 		t.Fatalf("fallback subject=%q", subject)
 	}
 	if resolution != "dependent_message_fallback" {

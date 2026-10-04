@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 const productListActiveWindow = time.Hour
@@ -36,6 +37,7 @@ type productListEntry struct {
 	LastActivityAt        string                       `json:"last_activity_at"`
 	PublicationDrain      publicationDrainReport       `json:"publication_drain"`
 	CheckpointMaintenance checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
+	CaptureHealth         state.CaptureHealth          `json:"capture_health"`
 	PublicationProgress   publicationProgressReport    `json:"publication_progress"`
 	Summary               string                       `json:"summary"`
 	NextAction            string                       `json:"next_action,omitempty"`
@@ -379,6 +381,8 @@ func productListPhase(entry productListEntry) string {
 	}
 	progress := entry.PublicationProgress
 	switch progress.Phase {
+	case "capture_retry", "capture_blocked":
+		return strings.ReplaceAll(progress.Phase, "_", "-")
 	case "intent_wait":
 		if progress.WaitRemainingSeconds > 0 {
 			return "wait:" + strings.ReplaceAll(formatDurationCompact(

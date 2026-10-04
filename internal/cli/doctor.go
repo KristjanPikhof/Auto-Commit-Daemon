@@ -63,6 +63,7 @@ type doctorRepoReport struct {
 	FsnotifyWatches          int                          `json:"fsnotify_watches,omitempty"`
 	FsnotifyDropped          int                          `json:"fsnotify_dropped,omitempty"`
 	FsnotifyFallbackReason   string                       `json:"fsnotify_fallback_reason,omitempty"`
+	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
 	LastCaptureError         string                       `json:"last_capture_error,omitempty"`
 	PendingEvents            int                          `json:"pending_events"`
 	BlockedConflicts         int                          `json:"blocked_conflicts"`
@@ -298,6 +299,7 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 				rr.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 				rr.PublicationDrain = status.PublicationDrain
 				rr.CheckpointMaintenance = status.CheckpointMaintenance
+				rr.CaptureHealth = status.CaptureHealth
 				if details := maintenanceDetails(status.CheckpointMaintenance); details != "" {
 					rr.Notes = append(rr.Notes, details+" "+status.CheckpointMaintenance.NextAction())
 				}
@@ -1736,6 +1738,12 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		}
 		if rr.LastCaptureError != "" {
 			fmt.Fprintf(out, "      last error : %s\n", rr.LastCaptureError)
+			for _, issue := range rr.CaptureHealth.Issues {
+				fmt.Fprintf(out, "      capture    : %s (%s)\n", valueOrUnset(issue.Path), issue.Reason)
+			}
+			if rr.CaptureHealth.NextRetryTS > 0 {
+				fmt.Fprintf(out, "      next retry : %s\n", time.Unix(0, int64(rr.CaptureHealth.NextRetryTS*1e9)).Format(time.RFC3339))
+			}
 		}
 		if len(rr.Notes) > 0 {
 			fmt.Fprintf(out, "      notes      : %s\n", strings.Join(rr.Notes, "; "))

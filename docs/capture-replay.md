@@ -19,10 +19,23 @@ repairs watcher loss and remains the coverage authority.
 
 ## Eligible scope
 
-ACD reuses its bounded ignore, sensitive-path, symlink, file-size, and TOCTOU
-checks. Git-ignored and configured sensitive paths are outside the contract.
-Unreadable, unstable, or oversized eligible paths make the observation
-unprotected until a later complete rescan succeeds.
+Git-ignored, sensitive, and generated cache paths remain outside the protected
+scope. Regular files above `capture.max_file_bytes` stream into durable Git
+objects with bounded memory. File size alone no longer stops capture. The
+setting keeps its name for compatibility and now controls buffering.
+
+An unreadable or changing eligible path makes coverage incomplete. ACD still
+saves readable files in a durable **partial checkpoint**, records the failed
+eligible paths and reasons, and retries with backoff. It keeps the last complete
+checkpoint. Partial checkpoints cannot satisfy a complete-checkpoint barrier
+or be used for full-tree restore.
+
+Independent documentation may publish when it neither touches nor references
+a failed path. Missing content can hide dependencies, so source, configuration,
+assets, and uncertain rename or delete companions wait for complete observation.
+ACD keeps these captures protected; it never treats a failed read as a deletion.
+Status reports incomplete coverage even when the pending queue is empty.
+Sockets, FIFOs, and devices are outside Git's file model and are not captured.
 
 The 50,000-event default backpressure limit bounds low-level publication work
 for one branch generation. It does not cap checkpoint protection: a completed
@@ -33,7 +46,7 @@ limit.
 
 ## Durable checkpoint completion
 
-1. Scan and hash the complete eligible scope.
+1. Scan and hash eligible files; record failed coverage explicitly.
 2. Build a tree through a scratch index. Normal capture also appends low-level
    capture records; protection-only scans defer classification.
 3. Write Git objects with supported fsync settings and reread them exactly.
@@ -87,8 +100,9 @@ the index, the worktree, or another branch.
 ## Retention
 
 ACD never prunes unpublished checkpoints, restore preimages, unresolved
-operations, or the newest completed checkpoint. Published checkpoints default
-to 30 days and at least 100 retained. A soft 5 GiB budget may prune published
+operations, or the newest complete checkpoint, even when a newer partial
+snapshot exists. Published checkpoints default to 30 days and at least 100
+retained. A soft 5 GiB budget may prune published
 checkpoints older than seven days but never below 100. Protected-only content
 over budget is retained and reported, never discarded.
 
@@ -111,3 +125,14 @@ untouched and requires attention until safe recovery can be proven. Independent
 checkpoint protection and publication continue while maintenance is waiting.
 `acd repo gc` cleans registration records; it does not clear maintenance errors
 or prune protected checkpoints.
+
+Capture health is shared by status, list, doctor, diagnose, and recovery.
+Reports separate worker responsiveness, capture progress, failure onset, affected
+paths, and the next retry. Brief stabilization failures show waiting; persistent
+or unreadable-path failures need attention while retries continue. Repeated
+unchanged failures reuse the partial checkpoint and do not repeat the same log
+line on every scan. A responsive worker does not prove queue progress.
+
+Published capture retention keeps records referenced by a publication drain,
+including a completed drain. Pruning an unrelated old capture cannot break the
+frozen membership ledger or its foreign keys.

@@ -39,6 +39,7 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
+	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
 	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
 	OK                       bool                         `json:"ok"`
 	Command                  string                       `json:"command"`
@@ -547,7 +548,13 @@ func applyControlStatus(res *controlResult, status statusReport) {
 }
 
 func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, daemonAlive bool) {
-	defer func() { applyMaintenanceStatus(res, status) }()
+	captureExplained := false
+	defer func() {
+		applyMaintenanceStatus(res, status)
+		if status.CaptureHealth.Error != "" && !captureExplained {
+			res.Summary += " Checkpoint protection is also incomplete: " + status.CaptureHealth.Error
+		}
+	}()
 	manualPause := status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace")
 	res.Daemon = status.Daemon
 	res.DaemonPID = status.PID
@@ -563,6 +570,7 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	res.CheckpointPublishedByACD = res.Published
 	res.CheckpointID = status.LatestCheckpointID
 	res.PublicationDrain = status.PublicationDrain
+	res.CaptureHealth = status.CaptureHealth
 	res.PublicationProgress = status.PublicationProgress
 	res.RecoveryRequired = status.Replay.State == "needs_attention" ||
 		status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0 ||
@@ -610,12 +618,12 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 			status.PublicationDrain.LastError == "publication_drain_environment_runtime_changed"):
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD can no longer reconstruct the exact runtime needed to resume this commit-all run. Your captured work remains protected."
+		res.Summary = "ACD can no longer reconstruct the exact runtime needed to resume this commit-all run. Your captured work remains saved."
 		res.NextAction = "Run `acd fix --force --dry-run`, review the archive-only recovery plan, then run `acd fix --force --yes`."
 	case status.PublicationDrain.Phase == state.PublicationDrainNeedsAction:
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "The current commit-all run stopped at a safety check. Your work remains protected."
+		res.Summary = "The current commit-all run stopped at a safety check. Captured work remains saved."
 		if status.PublicationDrain.LastError != "" {
 			res.Summary += " Cause: " + status.PublicationDrain.LastError
 		}
@@ -623,8 +631,24 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 	case status.Replay.State == "needs_attention":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "A safety block stopped Git publication, but checkpoint protection is still active."
+		res.Summary = "A safety block stopped Git publication. Captured work remains saved."
 		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
+	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "A blocked publication needs recovery on the active branch."
+		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
+	case status.CaptureHealth.State == "retrying":
+		captureExplained = true
+		res.Health = controlHealthWaiting
+		res.Summary = "Checkpoint coverage is incomplete while changed files stabilize. Readable files are saved."
+		res.NextAction = "ACD will retry automatically; see `acd doctor` for affected paths."
+	case status.CaptureHealth.State == "blocked":
+		captureExplained = true
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = "Checkpoint protection is incomplete: " + status.CaptureHealth.Error
+		res.NextAction = "Run `acd doctor` to inspect the affected files. Readable files remain saved; ACD retries automatically."
 	case status.PublicationProgress.Phase == "verifying":
 		res.Health = controlHealthPublishing
 		if status.PublicationProgress.Origin == "intent_recovery" {
@@ -658,6 +682,12 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		} else {
 			res.NextAction = "No action needed. ACD will retry the provider automatically."
 		}
+	case status.PublicationProgress.Phase == "stalled" && !status.Protected && status.CheckpointProtectionAvailable &&
+		status.PublicationProgress.Origin != "intent_recovery":
+		res.OK = false
+		res.Health = controlHealthNeedsAttention
+		res.Summary = fmt.Sprintf("The worker is responsive, but checkpointing has not completed for %s. Current protection is incomplete.", formatDurationCompact(time.Duration(status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
+		res.NextAction = "Run `acd doctor` to inspect capture and checkpoint failures."
 	case status.PublicationProgress.Phase == "stalled":
 		res.Health = controlHealthDegraded
 		if status.PublicationProgress.Origin == "intent_recovery" {
@@ -703,11 +733,6 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 		res.Health = controlHealthPublishing
 		res.Summary = "ACD is planning commits for the protected checkpoint."
 		res.NextAction = "No action needed. If planning stalls, ACD switches to safe local groups automatically."
-	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "A blocked publication needs recovery on the active branch."
-		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
 	case status.CheckpointProtectionAvailable && !status.Protected && status.Busy:
 		res.Health = controlHealthWaiting
 		res.Summary = "ACD is scanning recent changes and completing their protection checkpoint."

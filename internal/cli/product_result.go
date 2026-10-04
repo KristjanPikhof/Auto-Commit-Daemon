@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 type productState string
@@ -46,6 +47,7 @@ type productEnvelope struct {
 }
 
 type productStatusData struct {
+	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
 	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
 	Repo                     string                       `json:"repo"`
 	Command                  string                       `json:"command"`
@@ -124,6 +126,7 @@ func envelopeFromControl(result controlResult) productEnvelope {
 			ActionRequired:           actionRequired,
 			CheckpointID:             result.CheckpointID,
 			PublicationDrain:         result.PublicationDrain,
+			CaptureHealth:            result.CaptureHealth,
 			PublicationProgress:      result.PublicationProgress,
 			CheckpointMaintenance:    result.CheckpointMaintenance,
 			PendingEvents:            result.PendingEvents,
@@ -252,6 +255,10 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 		return "idle"
 	case "checkpointing":
 		return "saving the protected checkpoint"
+	case "capture_retry":
+		return "retrying incomplete capture while files stabilize"
+	case "capture_blocked":
+		return "incomplete capture; inspect affected paths with acd doctor"
 	case "paused":
 		return "paused by the user"
 	case "rewind_wait":

@@ -207,6 +207,9 @@ func PreparePublicationDrain(
 	if !ok {
 		return false, ErrCheckpointNotFound
 	}
+	if checkpoint.Partial {
+		return false, ErrCheckpointPartial
+	}
 	if checkpoint.Phase != CheckpointCompleted {
 		return false, ErrPublicationDrainIdentity
 	}

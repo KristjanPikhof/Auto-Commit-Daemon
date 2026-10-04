@@ -117,6 +117,17 @@ func (d *DB) Migrate(ctx context.Context) error {
 }
 
 func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
+	if cur < 29 {
+		if err := addColumnIfMissing(ctx, tx, "checkpoints", "coverage_complete", "INTEGER NOT NULL DEFAULT 1 CHECK (coverage_complete IN (0,1))"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, checkpointCaptureIssuesDDL); err != nil {
+			return err
+		}
+		if err := addColumnIfMissing(ctx, tx, "intent_plan_runs", "provider_deadline_ts", "REAL NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
 	if cur < 28 {
 		if err := addColumnIfMissing(ctx, tx, "publication_drains", "reason_evidence", "TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err

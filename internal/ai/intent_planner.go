@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
@@ -63,13 +64,26 @@ type PathRecentCommit struct {
 
 // OfferedCapture is one capture the planner may either select or defer.
 type OfferedCapture struct {
-	Seq          int64     `json:"seq"`
-	Path         string    `json:"path"`
-	Op           string    `json:"op"`
-	Timestamp    time.Time `json:"timestamp"`
-	Fidelity     string    `json:"fidelity"`
-	DeferCount   int       `json:"defer_count"`
-	CapturedDiff string    `json:"captured_diff,omitempty"`
+	FileMetadata *IntentFileMetadata `json:"file_metadata,omitempty"`
+	Seq          int64               `json:"seq"`
+	Path         string              `json:"path"`
+	Op           string              `json:"op"`
+	Timestamp    time.Time           `json:"timestamp"`
+	Fidelity     string              `json:"fidelity"`
+	DeferCount   int                 `json:"defer_count"`
+	CapturedDiff string              `json:"captured_diff,omitempty"`
+
+	// Preserve truncation across normalization before native metadata is attached.
+	// Keep this transient field out of provider JSON.
+	CapturedDiffTruncated bool `json:"-"`
+}
+
+// IntentFileMetadata describes captured blobs without sending their contents.
+type IntentFileMetadata struct {
+	Kind              string `json:"kind"`
+	BeforeBytes       int64  `json:"before_bytes"`
+	AfterBytes        int64  `json:"after_bytes"`
+	DiffOmittedReason string `json:"diff_omitted_reason,omitempty"`
 }
 
 // IntentPlanRequest is the structured planner input shared by OpenAI-compatible
@@ -132,6 +146,34 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 	}
 	for _, offered := range opts.OfferedCaptures {
 		cp := offered
+		if strings.ContainsRune(cp.CapturedDiff, 0) || !utf8.ValidString(cp.CapturedDiff) {
+			cp.CapturedDiff = ""
+			if cp.FileMetadata != nil {
+				metadata := *cp.FileMetadata
+				metadata.Kind, metadata.DiffOmittedReason = "binary", "binary"
+				cp.FileMetadata = &metadata
+			}
+		}
+		if cp.FileMetadata != nil {
+			metadata := *cp.FileMetadata
+			if metadata.BeforeBytes < 0 || metadata.AfterBytes < 0 {
+				return IntentPlanRequest{}, fmt.Errorf("intent planner: negative file size")
+			}
+			switch metadata.Kind {
+			case "text", "binary", "unknown":
+			default:
+				return IntentPlanRequest{}, fmt.Errorf("intent planner: invalid file kind")
+			}
+			switch metadata.DiffOmittedReason {
+			case "", "binary", "truncated", "not_requested_or_unavailable":
+			default:
+				return IntentPlanRequest{}, fmt.Errorf("intent planner: invalid omitted diff reason")
+			}
+			cp.FileMetadata = &metadata
+			if metadata.Kind == "binary" {
+				cp.CapturedDiff = ""
+			}
+		}
 		if opts.IncludeCapturedDiffs {
 			input := cp.CapturedDiff
 			redacted := RedactDiffSecrets(input)
@@ -139,6 +181,10 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 			// than the per-event DiffCap (4 KiB) so the planner sees enough
 			// of each captured diff to reason about multi-file grouping.
 			cp.CapturedDiff = Truncate(redacted, IntentStageDiffCap)
+			cp.CapturedDiffTruncated = cp.CapturedDiffTruncated || len(redacted) > IntentStageDiffCap
+			if cp.CapturedDiffTruncated && cp.FileMetadata != nil && cp.FileMetadata.Kind != "binary" {
+				cp.FileMetadata.DiffOmittedReason = "truncated"
+			}
 			req.CapturedDiffTransform = mergePromptTransformMetadata(req.CapturedDiffTransform, promptTransformMetadata(input, redacted, cp.CapturedDiff))
 		} else {
 			cp.CapturedDiff = ""

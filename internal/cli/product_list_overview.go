@@ -149,8 +149,8 @@ func productListEntryFromOverview(
 	}
 	daemonAlive := report.Daemon == "running" && report.PID > 0 && !report.Stale
 	applyControlStatusWithDaemonAlive(&control, report, daemonAlive)
-	checkpointing := daemonAlive && report.CheckpointProtectionAvailable && !report.Protected &&
-		report.PublicationProgress.Origin != "intent_recovery" &&
+	checkpointing := report.CaptureHealth.Error == "" && daemonAlive && report.CheckpointProtectionAvailable && !report.Protected &&
+		report.PublicationProgress.Origin != "intent_recovery" && report.PublicationProgress.Phase != "stalled" &&
 		!productListHasIndependentAttention(report)
 	if checkpointing {
 		control.OK = true
@@ -160,7 +160,7 @@ func productListEntryFromOverview(
 	}
 	if worker.RepositoryID != "" {
 		applySupervisorWorkerFailure(&control, worker)
-		if (worker.State == "starting" || worker.State == "backoff") &&
+		if report.CaptureHealth.Error == "" && (worker.State == "starting" || worker.State == "backoff") &&
 			!productListHasIndependentAttention(report) {
 			control.OK = true
 			control.Health = controlHealthPublishing
@@ -194,6 +194,7 @@ func productListEntryFromOverview(
 		PublicationDrain:      report.PublicationDrain,
 		CheckpointMaintenance: report.CheckpointMaintenance,
 		UnfinishedWork:        overview.unfinished,
+		CaptureHealth:         report.CaptureHealth,
 		PublicationProgress:   report.PublicationProgress, Summary: control.Summary,
 		Clients: overview.clients, LastCommitOID: report.LastCommitOID,
 		lastActivity: overview.lastActivity,
@@ -367,6 +368,13 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		report.BackpressurePaused = true
 		report.BackpressurePausedAt = value
 	}
+	if report.CaptureHealth, err = state.ReadCaptureHealth(ctx, conn); err != nil {
+		return overview, err
+	}
+	if report.CaptureHealth.Error != "" {
+		report.Protected = false
+		report.CaptureErrors = max(1, report.CaptureHealth.IssueCount)
+	}
 	if report.Configuration, err = loadConfigReadinessReport(ctx, conn, now); err != nil {
 		return overview, err
 	}
@@ -486,6 +494,8 @@ func readProductListProtection(ctx context.Context, conn *sql.DB, report *status
 	report.ObservationEpoch = lookupInt(daemon.MetaKeyProtectionObservationEpoch)
 	report.CoveredEpoch = lookupInt(daemon.MetaKeyProtectionCoveredEpoch)
 	report.LatestCheckpointID, _, _ = metaLookup(ctx, conn, daemon.MetaKeyProtectionCheckpointID)
+	fullPoll, _, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionFullPollTS)
+	report.FullPollTS, _ = strconv.ParseFloat(fullPoll, 64)
 	completeValue, _, _ := metaLookup(ctx, conn, daemon.MetaKeyProtectionComplete)
 	var err error
 	report.CheckpointMaintenance, err = readCheckpointMaintenance(ctx, conn)

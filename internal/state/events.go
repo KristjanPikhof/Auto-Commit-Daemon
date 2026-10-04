@@ -276,17 +276,23 @@ ORDER BY branch_ref, branch_generation`)
 }
 
 func PendingEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
-	return pendingEvents(ctx, d, limit, false)
+	return pendingEvents(ctx, d, limit, false, 0)
 }
 
 // PublishableEvents returns only pending capture rows owned by a completed
 // checkpoint. Protection may append rows before private-ref completion, but
 // publication must never observe that cross-store prepared window.
 func PublishableEvents(ctx context.Context, d *DB, limit int) ([]CaptureEvent, error) {
-	return pendingEvents(ctx, d, limit, true)
+	return pendingEvents(ctx, d, limit, true, 0)
 }
 
-func pendingEvents(ctx context.Context, d *DB, limit int, checkpointOnly bool) ([]CaptureEvent, error) {
+// PendingEventsAfter pages through the same replay-safe queue without consuming
+// earlier captures. checkpointOnly retains the completed-checkpoint requirement.
+func PendingEventsAfter(ctx context.Context, d *DB, afterSeq int64, limit int, checkpointOnly bool) ([]CaptureEvent, error) {
+	return pendingEvents(ctx, d, limit, checkpointOnly, afterSeq)
+}
+
+func pendingEvents(ctx context.Context, d *DB, limit int, checkpointOnly bool, afterSeq int64) ([]CaptureEvent, error) {
 	checkpointJoin := ""
 	checkpointWhere := ""
 	if checkpointOnly {
@@ -310,9 +316,10 @@ LEFT JOIN barriers b
        ON b.branch_ref = e.branch_ref
       AND b.branch_generation = e.branch_generation
 WHERE e.state = 'pending'` + checkpointWhere + `
+  AND e.seq > ?
   AND (b.first_seq IS NULL OR e.seq < b.first_seq)
 ORDER BY e.seq ASC`
-	args := []any{}
+	args := []any{afterSeq}
 	if limit > 0 {
 		q += " LIMIT ?"
 		args = append(args, limit)
@@ -982,6 +989,10 @@ INSERT OR IGNORE INTO acd_prune_intent_events(event_seq)
 SELECT seq FROM capture_events
 WHERE state = 'published'
   AND captured_ts < ?
+  AND NOT EXISTS (
+      SELECT 1 FROM publication_drain_events member
+      WHERE member.event_seq = capture_events.seq
+  )
   AND NOT EXISTS (
       SELECT 1
       FROM recovery_snapshot_events member
