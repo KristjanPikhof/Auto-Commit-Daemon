@@ -1785,7 +1785,8 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 							continue
 						}
 					}
-					markProtected(childRel, "lstat_error", false)
+					// Its type is unknown, so retain possible descendants too.
+					markProtected(childRel, "lstat_error", true)
 					bumpLayerError()
 					continue
 				}
