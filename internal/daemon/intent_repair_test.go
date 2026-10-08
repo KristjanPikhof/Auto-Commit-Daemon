@@ -195,6 +195,7 @@ func (duplicateRecaptureIntentPlanner) PlanIntentV2(_ context.Context, req ai.In
 }
 
 func TestReplayIntentV2DrainsDuplicateDeleteAndRenameRecaptures(t *testing.T) {
+	t.Parallel()
 	t.Run("delete", func(t *testing.T) {
 		f := newCaptureFixture(t)
 		ctx := context.Background()
@@ -390,6 +391,7 @@ func TestReplayIntentV2AdvancesFastFallbackComponents(t *testing.T) {
 }
 
 func TestReplayIntentV2LateCompanionRepairsSoftCommit(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -464,6 +466,7 @@ LIMIT 1`).Scan(&candidateID); err != nil {
 }
 
 func TestReplayIntentV2RepairReseedsIndexBeforeNextCandidate(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -600,6 +603,7 @@ func TestVerifyIntentTreePathOwnershipIncludesBothRenamePaths(t *testing.T) {
 }
 
 func TestReplayIntentV2RepairVerificationFailureIsDurable(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -701,6 +705,7 @@ ORDER BY updated_ts DESC LIMIT 1`,
 }
 
 func TestIntentRepairRequiredVerificationUnavailableFailsClosed(t *testing.T) {
+	t.Parallel()
 	result, _, err := repairIntentCandidateDecision(
 		context.Background(),
 		"",
@@ -754,6 +759,7 @@ func TestIntentRepairForwardRecoveryClassification(t *testing.T) {
 }
 
 func TestIntentRepairRejectsFinalTreeThatDropsHeadContent(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	repo := cloneDaemonTestRepo(t, daemonRepoTemplate)
 	beforeHead := mustCommitPath(
@@ -874,6 +880,7 @@ func TestIntentRepairRejectsFinalTreeThatDropsHeadContent(t *testing.T) {
 }
 
 func TestReplayIntentV2RepairsOwnedCommitSuffix(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -928,6 +935,7 @@ WHERE status='completed'`).Scan(&completed); err != nil || completed != 1 {
 }
 
 func TestReplayIntentV2SemanticRepairReplan(t *testing.T) {
+	t.Parallel()
 	t.Run("repairs private suffix", func(t *testing.T) {
 		testReplayIntentV2SemanticRepairReplan(t, true)
 	})
@@ -1060,6 +1068,7 @@ SELECT COUNT(*) FROM intent_repairs WHERE status='completed'`).
 }
 
 func TestReplayIntentV2RecoversForwardWhenRepartitionIsUnproven(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -1150,6 +1159,7 @@ WHERE kind=? AND reason='repair_repartition_not_proven'`,
 }
 
 func TestIntentRepairMergesTwoSoftPublishedCandidates(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	repo := cloneDaemonTestRepo(t, daemonRepoTemplate)
 	base := repo.head
@@ -1328,6 +1338,7 @@ func TestIntentRepairMergesTwoSoftPublishedCandidates(t *testing.T) {
 }
 
 func TestIntentRepairSourceCommitsTraverseMergedLineage(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	repo := cloneDaemonTestRepo(t, daemonRepoTemplate)
 	const (
@@ -1905,6 +1916,7 @@ func (orderedIntentV2Planner) PlanIntentV2(
 }
 
 func TestIntentRepairTransactionCompletesAndPreservesDirtyState(t *testing.T) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 2)
 	ctx := context.Background()
 	unrelatedSeq, err := state.AppendCaptureEvent(ctx, f.repo.db,
@@ -1963,6 +1975,7 @@ func TestIntentRepairTransactionCompletesAndPreservesDirtyState(t *testing.T) {
 }
 
 func TestIntentRepairPreservesCapturedDirtyShadow(t *testing.T) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 2)
 	ctx := context.Background()
 	ignore := git.NewIgnoreChecker(f.repo.dir)
@@ -2026,6 +2039,7 @@ func TestIntentRepairPreservesCapturedDirtyShadow(t *testing.T) {
 func TestIntentRepairVerificationFailureLeavesPreparedRepairFailed(
 	t *testing.T,
 ) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 1)
 	ctx := context.Background()
 	f.plan.VerifyCommit = func(
@@ -2063,6 +2077,7 @@ func TestIntentRepairVerificationFailureLeavesPreparedRepairFailed(
 }
 
 func TestValidateIntentRepairPlanAllowsNonContiguousPartition(t *testing.T) {
+	t.Parallel()
 	plan := IntentRepairPlan{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
@@ -2105,6 +2120,7 @@ func TestValidateIntentRepairPlanAllowsNonContiguousPartition(t *testing.T) {
 }
 
 func TestValidateIntentRepairPlanRejectsIncompleteRepartition(t *testing.T) {
+	t.Parallel()
 	plan := IntentRepairPlan{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
@@ -2210,6 +2226,7 @@ func TestIntentRepairNoncontiguousCrashRecoversFrozenMembers(t *testing.T) {
 }
 
 func TestValidateIntentRepairPlanRejectsDuplicateCandidateID(t *testing.T) {
+	t.Parallel()
 	plan := IntentRepairPlan{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
@@ -2344,6 +2361,7 @@ INSERT INTO intent_candidate_events(
 }
 
 func TestIntentRepairRejectsMembershipDriftBeforeGitCAS(t *testing.T) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 1)
 	ctx := context.Background()
 	lateSeq, err := state.AppendCaptureEvent(ctx, f.repo.db,
@@ -2757,6 +2775,7 @@ func TestIntentRepairRecoveryRejectsDifferentReplacementChain(t *testing.T) {
 }
 
 func TestIntentRepairDirtyOverlapSkipsWithoutMutation(t *testing.T) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 1)
 	ctx := context.Background()
 	if err := os.WriteFile(filepath.Join(f.repo.dir, "file-1.txt"),
@@ -2786,6 +2805,7 @@ func TestIntentRepairDirtyOverlapSkipsWithoutMutation(t *testing.T) {
 }
 
 func TestIntentRepairBackupRetentionPrunesOnlyAdvancedBranch(t *testing.T) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 1)
 	ctx := context.Background()
 	result, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir,

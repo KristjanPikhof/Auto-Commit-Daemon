@@ -25,6 +25,7 @@ const publicationDrainTestDigest = "sha256:0123456789abcdef0123456789abcdef01234
 func TestPublicationDrainFrozenTargetOrdersHardDependenciesAndExcludesLaterEdits(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 3, 2)
 	drain.Phase = state.PublicationDrainEventFallback
@@ -60,6 +61,7 @@ func TestPublicationDrainFrozenTargetOrdersHardDependenciesAndExcludesLaterEdits
 }
 
 func TestPublicationDrainFinalFallbackKeepsHardComponentAtomic(t *testing.T) {
+	t.Parallel()
 	planner := publicationDrainAtomicFallbackPlanner{}
 	plan, err := planner.PlanIntentV2(context.Background(), ai.IntentPlanRequestV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
@@ -92,6 +94,7 @@ func TestPublicationDrainFinalFallbackKeepsHardComponentAtomic(t *testing.T) {
 }
 
 func TestPublicationDrainFinalFallbackExpandsAcrossIntentWindow(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, _ := openPublicationDrainTestState(t, 11, 11)
 	for index := range events {
@@ -109,6 +112,7 @@ func TestPublicationDrainFinalFallbackExpandsAcrossIntentWindow(t *testing.T) {
 }
 
 func TestPublicationDrainFinalFallbackIgnoresPublishedDependencyCapacity(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, _ := openPublicationDrainTestState(t, 4, 4)
 	if _, err := db.SQL().ExecContext(ctx, `
@@ -145,6 +149,7 @@ WHERE seq IN (?, ?)`, events[0].Seq, events[1].Seq); err != nil {
 }
 
 func TestPublicationDrainLocalUnlockSelectsSmallestHardComponent(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, _ := openPublicationDrainTestState(t, 3, 3)
 	if err := state.ReplaceIntentCaptureDependencies(ctx, db,
@@ -167,6 +172,7 @@ func TestPublicationDrainLocalUnlockSelectsSmallestHardComponent(t *testing.T) {
 }
 
 func TestIntentForwardRecoveryPrefixFollowsSemanticTopology(t *testing.T) {
+	t.Parallel()
 	events := []state.CaptureEvent{
 		{Seq: 10}, {Seq: 20}, {Seq: 30},
 	}
@@ -212,6 +218,7 @@ func TestIntentForwardRecoveryPrefixFollowsSemanticTopology(t *testing.T) {
 }
 
 func TestResolvedIntentForwardRecoveryPlanUsesStoredMembership(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name           string
 		resolutionMode string
@@ -319,6 +326,7 @@ func semanticPlanTestCandidate(
 }
 
 func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
+	t.Parallel()
 	now := time.Unix(100, 0).UTC()
 	health := &IntentPlannerHealth{
 		state:   IntentPlannerCircuitOpen,
@@ -345,6 +353,7 @@ func TestConfigureIntentSalvageHonorsProviderProbeWindow(t *testing.T) {
 }
 
 func TestConfigureAtomicIntentFallbackPreservesSemanticProvider(t *testing.T) {
+	t.Parallel()
 	planner := &recoveringPublicationDrainPlanner{}
 	health := &IntentPlannerHealth{}
 	cfg := intentReplayConfig{
@@ -371,6 +380,7 @@ func TestConfigureAtomicIntentFallbackPreservesSemanticProvider(t *testing.T) {
 func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 	t *testing.T,
 ) {
+	t.Parallel()
 	cfg := intentReplayConfig{
 		planner: ai.DeterministicProvider{}, plannerProvider: "deterministic",
 	}
@@ -395,6 +405,7 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 }
 
 func TestConfigureIntentForwardRecoveryPreservesPathQuiescence(t *testing.T) {
+	t.Parallel()
 	cfg := intentReplayConfig{pathQuiescence: 30 * time.Second}
 	configureIntentForwardRecovery(&cfg, state.IntentForwardRecovery{
 		Stage: publicationFallbackSemanticReplan, TargetEventSeqs: []int64{1, 2},
@@ -406,6 +417,7 @@ func TestConfigureIntentForwardRecoveryPreservesPathQuiescence(t *testing.T) {
 }
 
 func TestPublicationDrainFinalFallbackRefusesOversizedHardComponent(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, _ := openPublicationDrainTestState(
 		t, ai.IntentCandidateCaptureCap+1, ai.IntentCandidateCaptureCap+1)
@@ -423,6 +435,7 @@ func TestPublicationDrainFinalFallbackRefusesOversizedHardComponent(t *testing.T
 func TestPublicationDrainAutomaticallyRecoversSupersededCandidateIDCollision(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 1, 1)
 	candidate := state.IntentCandidate{
@@ -473,6 +486,7 @@ WHERE candidate_id=?`, candidate.ID); err != nil {
 func TestPublicationDrainAutomaticallyRecoversExhaustedCandidateSuccessors(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 1, 1)
 	candidate, _ := seedExhaustedLegacyIntentCandidates(
@@ -507,6 +521,7 @@ func TestPublicationDrainAutomaticallyRecoversExhaustedCandidateSuccessors(
 func TestPublicationDrainRejectsIncompleteSuccessorExhaustionProof(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 1, 1)
 	candidate := state.IntentCandidate{
@@ -556,6 +571,7 @@ UPDATE intent_candidates SET status='superseded' WHERE id=?`,
 func TestPublicationDrainAutomaticallyRecoversLegacySoftDependencyCap(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	const targetCount = 199
 	const publishedCount = 20
@@ -605,6 +621,7 @@ WHERE seq=?`, fmt.Sprintf("commit-%03d", i), events[i].Seq); err != nil {
 }
 
 func TestResumePublicationDrainCheckpointingClampsClockRollback(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	repo := t.TempDir()
 	initPublicationDrainTestRepo(t, ctx, repo)
@@ -651,6 +668,7 @@ UPDATE capture_events SET state='recovered',commit_oid='archive-proof' WHERE seq
 }
 
 func TestResumePublicationDrainRetriesUnavailableSemanticMessage(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	repo := t.TempDir()
 	initPublicationDrainTestRepo(t, ctx, repo)
@@ -708,6 +726,7 @@ func initPublicationDrainTestRepo(t *testing.T, ctx context.Context, repo string
 }
 
 func TestPublicationDrainKeepsHardDependencyFailuresBlocked(t *testing.T) {
+	t.Parallel()
 	for _, reason := range []string{
 		"daemon: intent dependency graph: hard edge cap 4096 exceeded",
 		"daemon: intent dependency graph: hard dependency cycle",
@@ -741,6 +760,7 @@ func TestPublicationDrainKeepsHardDependencyFailuresBlocked(t *testing.T) {
 }
 
 func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -814,6 +834,7 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 }
 
 func TestPublicationDrainLocalUnlockPublishesDuringMessageOutage(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -877,6 +898,7 @@ func TestPublicationDrainLocalUnlockPublishesDuringMessageOutage(t *testing.T) {
 }
 
 func TestPublicationDrainSemanticMessageWaitIsTransient(t *testing.T) {
+	t.Parallel()
 	drain := state.PublicationDrain{Phase: state.PublicationDrainSemantic}
 	evaluation := IntentCandidateEvaluationResult{
 		Fallback: "waiting_message_rewrite",
@@ -894,6 +916,7 @@ func TestPublicationDrainSemanticMessageWaitIsTransient(t *testing.T) {
 func TestPublicationDrainSemanticExcludesCandidateBeyondFrozenTarget(
 	t *testing.T,
 ) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -970,6 +993,7 @@ func TestPublicationDrainSemanticExcludesCandidateBeyondFrozenTarget(
 }
 
 func TestPublicationDrainLocalUnlockRetiresOnlyOverlappingCandidates(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 2, 2)
 	for index, id := range []string{"overlap", "unrelated"} {
@@ -1083,6 +1107,7 @@ func (p *forbiddenPublicationDrainPlanner) PlanIntentV2(
 func TestPublicationDrainRestartEscalatesOnceAndCompletesIdempotently(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 2, 2)
 	update := PublicationDrainUpdateFrom(drain, 11, 10)
@@ -1165,6 +1190,7 @@ WHERE seq=?`, events[1].Seq); err != nil {
 }
 
 func TestPublicationDrainOpenCircuitKeepsLocalUnlockMode(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 2, 2)
 	update := PublicationDrainUpdateFrom(drain, 11, 10)
@@ -1191,6 +1217,7 @@ WHERE seq=?`, events[0].Seq); err != nil {
 }
 
 func TestPublicationDrainProviderWaitPreservesSemanticPhase(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)
 	update := PublicationDrainUpdateFrom(drain, 11, 10)
@@ -1222,6 +1249,7 @@ func TestPublicationDrainProviderWaitPreservesSemanticPhase(t *testing.T) {
 func TestPublicationDrainSemanticMessageWaitContinuesAfterCompletedMaxProbe(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)
 	const fingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1265,6 +1293,7 @@ WHERE id=?`, fingerprint, drain.ID); err != nil {
 func TestPublicationDrainSemanticMessageWaitRequiresExactCircuitProof(
 	t *testing.T,
 ) {
+	t.Parallel()
 	const fingerprint = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	for _, tc := range []struct {
 		name   string
@@ -1331,6 +1360,7 @@ WHERE id=?`, fingerprint, drain.ID); err != nil {
 func TestPublicationDrainSemanticMessageWaitContinuesAfterObservedLocalWait(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)
 	const fingerprint = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
@@ -1382,6 +1412,7 @@ WHERE id=?`, fingerprint, drain.ID); err != nil {
 func TestPublicationDrainVerificationResourceWaitPreservesSemanticPhase(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)
 	update := PublicationDrainUpdateFrom(drain, 11, 10)
@@ -1410,6 +1441,7 @@ func TestPublicationDrainVerificationResourceWaitPreservesSemanticPhase(
 }
 
 func TestPublicationDrainUnknownRuntimeContractNeedsAction(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)
 	if _, err := db.SQL().ExecContext(ctx, `
@@ -1459,6 +1491,7 @@ WHERE id=?`, drain.ID); err != nil {
 }
 
 func TestPublicationDrainConvergingRuntimeMismatchStaysActive(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)
 	drain, err := state.PublicationDrainByID(ctx, db, drain.ID)
@@ -1485,6 +1518,7 @@ func TestPublicationDrainConvergingRuntimeMismatchStaysActive(t *testing.T) {
 }
 
 func TestPublicationDrainEnvironmentRuntimeChangeNeedsAction(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)
 	drain, err := state.PublicationDrainByID(ctx, db, drain.ID)
@@ -1542,6 +1576,7 @@ func TestPublicationDrainNoProgressEscalatesWithMorePending(t *testing.T) {
 }
 
 func TestReplayDispositionSeparatesTransientWaitsFromStalls(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		sum  ReplaySummary
@@ -1600,6 +1635,7 @@ func TestPublicationDrainFallbackNoProgressNeedsAttention(t *testing.T) {
 }
 
 func TestRecoverForcedIntentBoundPublicationDrain(t *testing.T) {
+	t.Parallel()
 	makeBlocked := func(t *testing.T) (*state.DB, []state.CaptureEvent, state.PublicationDrain) {
 		t.Helper()
 		ctx := context.Background()
@@ -1839,6 +1875,7 @@ func TestPublicationDrainRepeatedLocalPreflightNeedsAction(t *testing.T) {
 }
 
 func TestPublicationDrainTerminalBarrierNeedsAction(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 1, 1)
 	update := PublicationDrainUpdateFrom(drain, 11, 10)
@@ -1862,6 +1899,7 @@ UPDATE capture_events SET state='failed',error='missing object' WHERE seq=?`,
 }
 
 func TestPublicationDrainRecoveredTargetIsResolved(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, events, drain := openPublicationDrainTestState(t, 1, 1)
 	update := PublicationDrainUpdateFrom(drain, 11, 10)
@@ -1884,6 +1922,7 @@ UPDATE capture_events SET state='recovered',commit_oid='archive-proof' WHERE seq
 }
 
 func TestPublicationDrainAcceptsLongJournalProvenHeadAdvance(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	repo := t.TempDir()
 	if err := gitpkg.Init(ctx, repo); err != nil {
@@ -2050,6 +2089,7 @@ INSERT INTO capture_events(
 }
 
 func TestPublicationDrainPreflightRequiresRepeatedExactEvidence(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, _, drain := openPublicationDrainTestState(t, 1, 1)
 	update := PublicationDrainUpdateFrom(drain, drain.UpdatedTS+1, drain.LastProgressTS)

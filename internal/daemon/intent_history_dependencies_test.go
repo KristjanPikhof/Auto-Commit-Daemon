@@ -24,6 +24,7 @@ func (successiveHistoryGoalsPlanner) PlanIntentV2(_ context.Context, req ai.Inte
 }
 
 func TestIntentHistorySavedPrerequisitesPreserveSuccessiveGoalTrees(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	firstBody := "package policy\n\nfunc ClampPendingWindow(pending int) int {\n if pending > 64 { return 64 }\n return pending\n}\n"
