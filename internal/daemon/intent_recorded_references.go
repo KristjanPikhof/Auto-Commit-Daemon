@@ -18,7 +18,7 @@ func loadIntentRecordedReferenceContext(ctx context.Context, repo, sourcePath, o
 		return "", nil
 	}
 	switch path.Ext(sourcePath) {
-	case ".sh", ".py":
+	case ".sh", ".py", ".go", ".pbxproj":
 	default:
 		return "", nil
 	}
@@ -37,10 +37,17 @@ func loadIntentRecordedReferenceContext(ctx context.Context, repo, sourcePath, o
 	if strings.ContainsRune(string(contents), 0) || !utf8.Valid(contents) {
 		return "", nil
 	}
-	return intentSourceReferenceContext(sourcePath, string(contents), offeredPaths), nil
+	switch path.Ext(sourcePath) {
+	case ".go":
+		return intentGoImportReferenceContext(sourcePath, string(contents), offeredPaths), nil
+	case ".pbxproj":
+		return intentProjectReferenceContext(sourcePath, string(contents), offeredPaths), nil
+	default:
+		return intentSourceReferenceContext(sourcePath, string(contents), offeredPaths), nil
+	}
 }
 
-func includeIntentRecordedReferenceContext(diff, references string) string {
+func prependIntentRecordedReferenceContext(diff, references string) string {
 	const prefix = "Recorded post-image references:\n"
 	const separator = "\nRecorded diff:\n"
 	if strings.HasPrefix(diff, prefix) {
@@ -49,8 +56,12 @@ func includeIntentRecordedReferenceContext(diff, references string) string {
 		}
 	}
 	if references == "" {
-		return truncateIntentEvidenceDiff(ai.RedactDiffSecrets(diff), ai.IntentStageDiffCap)
+		return diff
 	}
 	header := ai.RedactDiffSecrets(prefix + references + separator)
-	return header + truncateIntentEvidenceDiff(ai.RedactDiffSecrets(diff), max(0, ai.IntentStageDiffCap-len(header)))
+	return header + diff
+}
+
+func includeIntentRecordedReferenceContext(diff, references string) string {
+	return truncateIntentEvidenceDiff(ai.RedactDiffSecrets(prependIntentRecordedReferenceContext(diff, references)), ai.IntentStageDiffCap)
 }
