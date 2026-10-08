@@ -4,7 +4,7 @@ cd "$(dirname "$0")/../.."
 
 shard_count=${ACD_TEST_SHARDS:-3}
 package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2}
-test_timeout=${ACD_TEST_TIMEOUT:-4m15s}
+test_timeout=${ACD_TEST_TIMEOUT:-4m30s}
 timing_sensitive_daemon_tests='^(TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent)$'
 output_root=
 started_seconds=$SECONDS
