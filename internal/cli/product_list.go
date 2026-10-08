@@ -417,6 +417,12 @@ func productListPhase(entry productListEntry) string {
 				time.Duration(progress.WaitRemainingSeconds)*time.Second), " ", "")
 		}
 		return "provider-retry-due"
+	case "goal_review_wait":
+		if progress.WaitRemainingSeconds > 0 {
+			return "goal-review:" + strings.ReplaceAll(formatDurationCompact(
+				time.Duration(progress.WaitRemainingSeconds)*time.Second), " ", "")
+		}
+		return "goal-review-due"
 	case "provider_call":
 		return "provider-call"
 	case "verifying":
@@ -518,6 +524,7 @@ func productListStatus(entry productListEntry) string {
 		entry.PublicationProgress.Phase == "verifying":
 		return "working"
 	case entry.PublicationProgress.Phase == "provider_wait" ||
+		entry.PublicationProgress.Phase == "goal_review_wait" ||
 		entry.PublicationProgress.Phase == "intent_wait" ||
 		entry.PublicationProgress.Phase == "rewind_wait" ||
 		entry.PublicationProgress.Phase == "config_wait":
