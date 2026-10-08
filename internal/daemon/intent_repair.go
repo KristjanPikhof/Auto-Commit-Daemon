@@ -162,17 +162,17 @@ func ApplyIntentRepairTransaction(
 	if err := validateIntentRepairMemberSnapshot(plan, members); err != nil {
 		return result, err
 	}
-	if plan.ExpectedFinalTree == "" {
-		qualityOnly := true
-		for _, member := range members {
-			qualityOnly = qualityOnly && member.PriorState == state.EventStatePublished
+	qualityOnly := true
+	for _, member := range members {
+		qualityOnly = qualityOnly && member.PriorState == state.EventStatePublished
+	}
+	if qualityOnly {
+		originalTree, err := git.RevParse(ctx, repoRoot, plan.ExpectedHead+"^{tree}")
+		if err != nil { return result, err }
+		if plan.ExpectedFinalTree != "" && plan.ExpectedFinalTree != originalTree {
+			return result, errors.New("daemon: intent repair: quality-only final tree differs from original HEAD")
 		}
-		if qualityOnly {
-			plan.ExpectedFinalTree, err = git.RevParse(ctx, repoRoot, plan.ExpectedHead+"^{tree}")
-			if err != nil {
-				return result, err
-			}
-		}
+		plan.ExpectedFinalTree = originalTree
 	}
 
 	prepared := state.IntentRepair{
