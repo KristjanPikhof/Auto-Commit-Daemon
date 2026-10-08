@@ -167,13 +167,17 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	}
 	if opts.showPlan != "" {
 		if plan, ok, err := readIntentHistoryPlanRef(ctx, repoFlag, opts.showPlan); err == nil && ok {
-			if jsonOut { return json.NewEncoder(out).Encode(plan) }
+			if jsonOut {
+				return json.NewEncoder(out).Encode(plan)
+			}
 			printIntentHistoryPlan(out, plan)
 			if repo, err := resolveRepo(repoFlag); err == nil {
 				if dbPath, err := rewriteStateDBPath(ctx, repo); err == nil {
 					if db, err := state.OpenReadOnly(ctx, dbPath); err == nil {
 						defer db.Close()
-						if request, ok, _ := state.LoadIntentHistoryRequest(ctx, db); ok && request.PlanID == plan.ID { fmt.Fprintf(out, "Worker status: %s\n%s\n", request.Status, request.Error) }
+						if request, ok, _ := state.LoadIntentHistoryRequest(ctx, db); ok && request.PlanID == plan.ID {
+							fmt.Fprintf(out, "Worker status: %s\n%s\n", request.Status, request.Error)
+						}
 					}
 				}
 			}
@@ -184,13 +188,20 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	if opts.applyPlan != "" {
 		if repo, err := resolveRepo(repoFlag); err == nil {
 			if plan, ok, err := readIntentHistoryPlanRef(ctx, repo, opts.applyPlan); err == nil && ok {
-				if !opts.yes && !opts.dryRun { return errors.New("acd history rewrite: --apply requires --yes or --dry-run") }
+				if !opts.yes && !opts.dryRun {
+					return errors.New("acd history rewrite: --apply requires --yes or --dry-run")
+				}
 				return applyIntentHistoryPlan(ctx, out, repo, plan, opts.dryRun)
 			}
 		}
 		return applySavedRewritePlan(ctx, out, repoFlag, opts)
 	}
 	if opts.editPlan != "" {
+		if repo, err := resolveRepo(repoFlag); err == nil {
+			if _, ok, err := readIntentHistoryPlanRef(ctx, repo, opts.editPlan); err == nil && ok {
+				return errors.New("acd history rewrite: goal reconstruction plans are immutable; generate a new plan to change goals or messages")
+			}
+		}
 		return editSavedRewritePlan(ctx, out, repoFlag, opts)
 	}
 	repo, err := resolveRepo(repoFlag)
@@ -239,8 +250,10 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		return rewriteProviderGateError(err, providerResolution, repo)
 	}
 	if opts.newBranch != "" {
-		if opts.messagesOnly { return errors.New("acd history rewrite: --new-branch and --messages-only cannot be combined") }
-		return generateIntentHistoryPlan(ctx, out, repo, selection, opts, provider, providerResolution.Config)
+		if opts.messagesOnly {
+			return errors.New("acd history rewrite: --new-branch and --messages-only cannot be combined")
+		}
+		return generateIntentHistoryPlan(ctx, out, repo, selection, opts, provider, providerResolution.Config, jsonOut)
 	}
 	if err := progress.Emit(rewriteProgressEvent{
 		Phase:   "selection",
@@ -1312,6 +1325,10 @@ func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
 	opts.showPlan = strings.TrimSpace(opts.showPlan)
 	opts.applyPlan = strings.TrimSpace(opts.applyPlan)
 	opts.editPlan = strings.TrimSpace(opts.editPlan)
+	opts.newBranch = strings.TrimSpace(opts.newBranch)
+	if opts.newBranch != "" && (opts.messagesOnly || opts.review || opts.editPlan != "" || opts.applyPlan != "" || opts.showPlan != "") {
+		return errors.New("acd history rewrite: --new-branch generates a goal plan; use its saved ID for show or apply")
+	}
 
 	opts.editFormat = strings.ToLower(strings.TrimSpace(opts.editFormat))
 	if opts.editFormat == "" {
