@@ -93,6 +93,14 @@ func TestIntentRepairMixedCommitSplitCrashPreservesCaptureLineage(t *testing.T) 
 	if err != nil || !mapped || canonical != applied.NewHead {
 		t.Fatalf("old complete HEAD must resolve to the complete repaired HEAD: canonical=%s mapped=%v err=%v", canonical, mapped, err)
 	}
+	evidence := newExternalRepairEvidence(repo.db, repo.dir, cctx.BranchRef, cctx.BranchGeneration)
+	mappedCommits, err := evidence.commitMappingsFrom(ctx, mixed)
+	if err != nil || len(mappedCommits) != 1 || mappedCommits[0].newOID != applied.NewHead {
+		t.Fatalf("external recovery reader lost split source transition: mappings=%+v err=%v", mappedCommits, err)
+	}
+	if _, err := evidence.loadRepair(ctx, plan.ID); err != nil {
+		t.Fatalf("external reader rejected valid frozen split lineage: %v", err)
+	}
 }
 
 func TestIntentRepairQualityOnlyRejectsFinalTreeChange(t *testing.T) {

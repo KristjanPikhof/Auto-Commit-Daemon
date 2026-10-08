@@ -52,14 +52,15 @@ func (budget *externalRepairProofBudget) consume(rows int, evidence string) erro
 }
 
 type externalRepairEvidence struct {
-	db               *state.DB
-	repoRoot         string
-	branchRef        string
-	branchGeneration int64
-	budget           externalRepairProofBudget
-	repairs          map[string]state.IntentRepair
-	publications     map[string]state.SelfPublication
-	canonicalCommits map[string][]string
+	db                 *state.DB
+	repoRoot           string
+	branchRef          string
+	branchGeneration   int64
+	budget             externalRepairProofBudget
+	repairs            map[string]state.IntentRepair
+	publications       map[string]state.SelfPublication
+	canonicalCommits   map[string][]string
+	commitMappingTable string
 }
 
 func newExternalRepairEvidence(
@@ -879,12 +880,13 @@ func (evidence *externalRepairEvidence) loadRepair(
 		!repair.BackupRef.Valid || repair.BackupRef.String == "" ||
 		!repair.CompletedTS.Valid ||
 		len(repair.Commits) == 0 ||
-		len(repair.Commits) > state.IntentRepairMaxCommits {
+		len(repair.Commits) > state.IntentRepairMaxMappings {
 		return state.IntentRepair{}, fmt.Errorf(
 			"%w: external repair bridge: repair %s identity changed",
 			state.ErrCompletedBranchTransitionProof, repairID)
 	}
 	commitCandidates := make(map[string]struct{}, len(repair.Commits))
+	oldCommits := make(map[string]struct{}, len(repair.Commits))
 	for ord, commit := range repair.Commits {
 		if commit.RepairID != repair.ID || commit.Ord != ord ||
 			!commit.CandidateID.Valid || commit.CandidateID.String == "" ||
@@ -895,6 +897,10 @@ func (evidence *externalRepairEvidence) loadRepair(
 				state.ErrCompletedBranchTransitionProof, repairID, ord)
 		}
 		commitCandidates[commit.CandidateID.String] = struct{}{}
+		oldCommits[commit.OldOID] = struct{}{}
+	}
+	if len(commitCandidates) > state.IntentRepairMaxCommits || len(oldCommits) > state.IntentRepairMaxCommits {
+		return state.IntentRepair{}, fmt.Errorf("%w: external repair bridge: repair %s exceeds its source or goal limit", state.ErrCompletedBranchTransitionProof, repairID)
 	}
 	switch repair.MembershipMode {
 	case state.IntentRepairMembershipLegacy:
@@ -969,9 +975,19 @@ func (evidence *externalRepairEvidence) commitMappingsFrom(
 	ctx context.Context,
 	oldOID string,
 ) ([]externalRepairCommitMapping, error) {
+	if evidence.commitMappingTable == "" {
+		var hasView int
+		if err := evidence.db.ReadSQL().QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='view' AND name='intent_repair_commit_mappings')`).Scan(&hasView); err != nil {
+			return nil, err
+		}
+		evidence.commitMappingTable = "intent_repair_commits"
+		if hasView != 0 {
+			evidence.commitMappingTable = "intent_repair_commit_mappings"
+		}
+	}
 	rows, err := evidence.db.ReadSQL().QueryContext(ctx, `
-SELECT r.id,c.new_oid
-FROM intent_repair_commits c
+SELECT DISTINCT r.id,CASE WHEN r.old_head=c.old_oid THEN r.new_head ELSE c.new_oid END
+FROM `+evidence.commitMappingTable+` c
 JOIN intent_repairs r ON r.id=c.repair_id
 WHERE r.branch_ref=? AND r.branch_generation=?
   AND r.status='completed' AND c.old_oid=?
