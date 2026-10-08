@@ -26,15 +26,11 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 	if len(units) == 0 {
 		return result, errors.New("intent history: selection has no captured path changes")
 	}
-	parent, err := git.RevParse(ctx, repo, chain[0]+"^")
+	baseTree, err := git.IntentHistoryBaseTree(ctx, repo, chain[0])
 	if err != nil {
 		return result, err
 	}
-	baseTree, err := git.RevParse(ctx, repo, parent+"^{tree}")
-	if err != nil {
-		return result, err
-	}
-	batches, req, err := intentHistoryEvidence(ctx, repo, branch, parent, units, format, includeDiffs)
+	batches, req, err := intentHistoryEvidence(ctx, repo, branch, baseTree, units, format, includeDiffs)
 	if err != nil {
 		return result, err
 	}
@@ -43,6 +39,7 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 	var selected [][]git.IntentHistoryUnit
 	for attempt := 0; attempt < 3; attempt++ {
 		plan, err = ai.PlanIntentV2WithCompatibility(ctx, planner, req)
+		plannerCallFailed := err != nil
 		if err == nil {
 			err = ValidateIntentGoalPlan(req, plan)
 		}
@@ -74,9 +71,10 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
-		if kind, _ := classifyIntentPlannerFailure(classifyIntentPlannerHealthFailure(err, true)); kind == IntentPlannerFailureTransport {
-			return result, err
+		if kind, _ := classifyIntentPlannerFailure(classifyIntentPlannerHealthFailure(err, plannerCallFailed)); kind == IntentPlannerFailureTransport {
+			return result, classifyIntentPlannerHealthFailure(err, plannerCallFailed)
 		}
+		err = classifyIntentPlannerHealthFailure(err, plannerCallFailed)
 		req.RetryCorrection = ai.SanitizePlannerError(err.Error())
 	}
 	if err != nil {
@@ -108,7 +106,7 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 	return result, nil
 }
 
-func intentHistoryEvidence(ctx context.Context, repo, branch, parent string, units []git.IntentHistoryUnit, format ai.CommitFormat, includeDiffs bool) ([][]int, ai.IntentPlanRequestV2, error) {
+func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree string, units []git.IntentHistoryUnit, format ai.CommitFormat, includeDiffs bool) ([][]int, ai.IntentPlanRequestV2, error) {
 	// A large history is represented by complete path chains, not by equally
 	// clipped commit messages. Every underlying transition retains ownership.
 	batches := make([][]int, 0, len(units))
@@ -133,15 +131,19 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, parent string, uni
 	}
 	var captures []IntentCandidateCapture
 	var offered []ai.OfferedCapture
+	var err error
 	diffs := make([]string, len(batches))
 	for i, batch := range batches {
 		if !includeDiffs {
 			break
 		}
 		first, last := units[batch[0]], units[batch[len(batch)-1]]
-		before := parent
+		before := baseTree
 		if len(batch) == 1 {
-			before = first.OldOID + "^"
+			before, err = git.IntentHistoryBaseTree(ctx, repo, first.OldOID)
+			if err != nil {
+				return nil, ai.IntentPlanRequestV2{}, err
+			}
 		}
 		raw, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, 256<<10, "diff", "--no-ext-diff", "--unified=3", before, last.OldOID, "--", first.Path)
 		if err != nil {
@@ -149,7 +151,7 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, parent string, uni
 		}
 		diffs[i] = ai.Truncate(ai.RedactDiffSecrets(string(raw)), ai.IntentStageDiffCap)
 	}
-	diffs = allocateIntentHistoryDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
+	diffs = allocateIntentEvidenceDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
 	for i, batch := range batches {
 		first, last := units[batch[0]], units[batch[len(batch)-1]]
 		op := "modify"
@@ -169,6 +171,34 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, parent string, uni
 	if err != nil {
 		return nil, ai.IntentPlanRequestV2{}, err
 	}
+	var chain []string
+	seenCommits := map[string]bool{}
+	unitSeq := map[string]int64{}
+	for i, batch := range batches {
+		for _, index := range batch {
+			unitSeq[units[index].OldOID+"\x00"+units[index].Path] = int64(i + 1)
+		}
+	}
+	for _, unit := range units {
+		if !seenCommits[unit.OldOID] {
+			chain = append(chain, unit.OldOID)
+			seenCommits[unit.OldOID] = true
+		}
+	}
+	renames, err := git.ReadIntentHistoryRenamePairs(ctx, repo, chain)
+	if err != nil {
+		return nil, ai.IntentPlanRequestV2{}, err
+	}
+	for _, rename := range renames {
+		left, right := unitSeq[rename.OldOID+"\x00"+rename.BeforePath], unitSeq[rename.OldOID+"\x00"+rename.AfterPath]
+		if left == right {
+			continue
+		}
+		if left > right {
+			left, right = right, left
+		}
+		edges = append(edges, state.IntentCaptureDependency{PrerequisiteSeq: left, DependentSeq: right, Strength: state.IntentDependencyHard, Kind: "recorded_rename", Evidence: intentEvidenceHash(rename.OldOID + rename.BeforePath + rename.AfterPath)})
+	}
 	var dependencies []ai.IntentCaptureDependency
 	for _, edge := range edges {
 		dependencies = append(dependencies, ai.IntentCaptureDependency{FromSeq: edge.PrerequisiteSeq, ToSeq: edge.DependentSeq, Strength: ai.IntentDependencyStrength(edge.Strength), Kind: edge.Kind, EvidenceHash: edge.Evidence})
@@ -182,7 +212,7 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, parent string, uni
 
 // Keep small companion changes complete before spending the remaining budget
 // on larger changes. Equal clipping can hide an import or a late correction.
-func allocateIntentHistoryDiffs(raw []string, budget int) []string {
+func allocateIntentEvidenceDiffs(raw []string, budget int) []string {
 	result := make([]string, len(raw))
 	limits := make([]int, len(raw))
 	order := make([]int, len(raw))
@@ -227,18 +257,14 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 	if len(plan.SourceChain) == 0 || plan.ExpectedHead != plan.SourceChain[len(plan.SourceChain)-1] {
 		return nil, errors.New("intent history: invalid frozen source head")
 	}
-	parent, err := git.RevParse(ctx, repo, plan.SourceChain[0]+"^")
-	if err != nil {
-		return nil, err
-	}
-	baseTree, err := git.RevParse(ctx, repo, parent+"^{tree}")
+	baseTree, err := git.IntentHistoryBaseTree(ctx, repo, plan.SourceChain[0])
 	if err != nil {
 		return nil, err
 	}
 	if baseTree != plan.BaseTree {
 		return nil, errors.New("intent history: saved base differs from source parent")
 	}
-	batches, req, err := intentHistoryEvidence(ctx, repo, plan.SourceBranchRef, parent, original, ai.CommitFormat(plan.CommitFormat), true)
+	batches, req, err := intentHistoryEvidence(ctx, repo, plan.SourceBranchRef, baseTree, original, ai.CommitFormat(plan.CommitFormat), true)
 	if err != nil {
 		return nil, err
 	}

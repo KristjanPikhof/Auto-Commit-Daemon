@@ -61,7 +61,7 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		}
 		diffs[i] = ai.RedactDiffSecrets(diffs[i])
 	}
-	diffs = allocateIntentHistoryDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
+	diffs = allocateIntentEvidenceDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
 	for i := range captures {
 		if related[captures[i].Event.Seq] {
 			captures[i].CapturedDiff = diffs[i]
