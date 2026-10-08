@@ -110,7 +110,7 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 		if candidate.Body != "" {
 			message += "\n\n" + candidate.Body
 		}
-		result.Goals = append(result.Goals, state.IntentHistoryGoal{ID: candidate.CandidateID, Purpose: candidate.Purpose, Message: message, Reason: candidate.GroupingReason, Units: indexes, TreeOID: trees[i]})
+		result.Goals = append(result.Goals, state.IntentHistoryGoal{ID: candidate.CandidateID, Purpose: candidate.Purpose, Message: message, Reason: candidate.GroupingReason, Units: indexes, TreeOID: trees[i], DependsOnCandidates: append([]string(nil), candidate.DependsOnCandidates...)})
 	}
 	return result, nil
 }
@@ -321,7 +321,7 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 		if len(parts) == 2 {
 			body = parts[1]
 		}
-		semantic.Candidates = append(semantic.Candidates, ai.IntentCandidateAssignment{CandidateID: goal.ID, SelectedSeqs: seqs, Purpose: goal.Purpose, Readiness: ai.IntentCandidateReady, Subject: parts[0], Body: body, GroupingReason: goal.Reason})
+		semantic.Candidates = append(semantic.Candidates, ai.IntentCandidateAssignment{CandidateID: goal.ID, SelectedSeqs: seqs, Purpose: goal.Purpose, Readiness: ai.IntentCandidateReady, Subject: parts[0], Body: body, GroupingReason: goal.Reason, DependsOnCandidates: append([]string(nil), goal.DependsOnCandidates...)})
 		groups = append(groups, group)
 		replacements = append(replacements, git.IntentRepairReplacement{Replaces: replaces, TreeOID: goal.TreeOID, Message: goal.Message})
 	}
