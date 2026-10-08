@@ -108,15 +108,6 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	t.Cleanup(func() {
-		if t.Failed() {
-			t.Logf("outage diagnostic: mode=%s pending=%s health=%s windows=%s candidates=%s", readDaemonStateMode(repo),
-				sqliteScalar(t, dbPath, "SELECT path||':'||state FROM capture_events"),
-				sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'"),
-				sqliteScalar(t, dbPath, "SELECT resolution_mode||':'||COALESCE(validation_failure,'') FROM intent_planner_windows ORDER BY id DESC LIMIT 2"),
-				sqliteScalar(t, dbPath, "SELECT status||':'||COALESCE(verification_status,'')||':'||COALESCE(verification_output,'') FROM intent_candidates"))
-		}
-	})
 	waitForEventState(t, dbPath, "norm-one.md", "published", 10*time.Second)
 	waitFor(t, "evidence partition recovery", 10*time.Second, func() bool {
 		return sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM intent_planner_windows WHERE resolution_mode='evidence_partition' AND validation_failure IS NOT NULL") == "1"
@@ -319,6 +310,11 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	startCount := commitCount(t, repo)
+	t.Cleanup(func() {
+		if t.Failed() {
+			logOutageTestState(t, repo)
+		}
+	})
 	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	writeFile(t, filepath.Join(repo, "singleton-one.txt"), "one\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
@@ -399,8 +395,22 @@ func makeOutageProbeDue(t *testing.T, repo string) {
 	sqliteExec(t, dbPath, fmt.Sprintf(`UPDATE daemon_meta SET value=json_set(value,'$.next_probe_ts',%d) WHERE key='intent.planner.health'`, time.Now().Unix()-1))
 }
 
+func logOutageTestState(t *testing.T, repo string) {
+	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	t.Logf("outage diagnostic: mode=%s pending=%s health=%s windows=%s candidates=%s", readDaemonStateMode(repo),
+		sqliteScalar(t, dbPath, "SELECT path||':'||state FROM capture_events"),
+		sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'"),
+		sqliteScalar(t, dbPath, "SELECT resolution_mode||':'||COALESCE(validation_failure,'') FROM intent_planner_windows ORDER BY id DESC LIMIT 2"),
+		sqliteScalar(t, dbPath, "SELECT status||':'||COALESCE(verification_status,'')||':'||COALESCE(verification_output,'') FROM intent_candidates"))
+}
+
 func restartOutageTestSession(t *testing.T, ctx context.Context, env []string, repo, session, harness string) {
 	t.Helper()
+	enabled := runAcd(t, ctx, env, "on", "--repo", repo, "--yes", "--json")
+	if enabled.ExitCode != 0 {
+		t.Fatalf("enable restarted outage worker: %s %s", enabled.Stdout, enabled.Stderr)
+	}
 	result := runAcd(t, ctx, env, "start", "--repo", repo, "--session-id", session, "--harness", harness, "--json")
 	if result.ExitCode != 0 {
 		t.Fatalf("restart outage worker: %s %s", result.Stdout, result.Stderr)

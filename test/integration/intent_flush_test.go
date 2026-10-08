@@ -124,10 +124,11 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !advanced {
-		t.Fatalf("flush --logical did not advance HEAD within 2s\nbefore=%s\nstill=%s\nflush stdout=%s\nflush stderr=%s",
+		diagnostic := sqliteExec(t, dbPath, `SELECT id,status,purpose,atomicity_summary FROM intent_candidates; SELECT fingerprint,resolution_mode,progress_state FROM intent_plan_runs;`)
+		t.Fatalf("flush --logical did not advance HEAD within 2s\nbefore=%s\nstill=%s\nflush stdout=%s\nflush stderr=%s\nstate=%s",
 			headBefore,
 			strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")),
-			flushRes.Stdout, flushRes.Stderr)
+			flushRes.Stdout, flushRes.Stderr, diagnostic)
 	}
 
 	// Captured evidence supplies a meaningful deterministic goal message.
@@ -213,6 +214,11 @@ func TestFlush_LogicalWaitsDuringProviderOutageAndRecovers(t *testing.T) {
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "semantic-provider-outage.txt", "pending", 5*time.Second)
+	t.Cleanup(func() {
+		if t.Failed() {
+			logOutageTestState(t, repo)
+		}
+	})
 
 	flushRes := runAcd(t, ctx, env, "flush",
 		"--repo", repo, "--session-id", sessionID, "--logical",
