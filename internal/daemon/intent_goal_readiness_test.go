@@ -100,6 +100,21 @@ func TestIntentGoalReadinessRecognizesSwiftTestsAcrossDirectories(t *testing.T) 
 	}
 }
 
+func TestIntentGoalReadinessContinuesPersistedSourceWithLaterTest(t *testing.T) {
+	t.Parallel()
+	req := ai.IntentPlanRequestV2{
+		OfferedCaptures: []ai.OfferedCapture{{Seq: 2, Path: "exporter_test.go"}},
+		Candidates:      []ai.IntentCandidateSummary{{CandidateID: "export", SelectedSeqs: []int64{1}}},
+		Dependencies:    []ai.IntentCaptureDependency{{FromSeq: 1, ToSeq: 2, Kind: "test_source", Strength: ai.IntentDependencySoft}},
+	}
+	plan := ai.IntentPlanV2{Candidates: []ai.IntentCandidateAssignment{{
+		CandidateID: "export", SelectedSeqs: []int64{2}, Readiness: ai.IntentCandidateReady,
+	}}}
+	if err := validatePlannerSemanticRationale(req, plan); err != nil {
+		t.Fatalf("later test could not complete durable goal: %v", err)
+	}
+}
+
 func TestIntentGoalReadinessSemanticPlanCannotBypassEvidenceGate(t *testing.T) {
 	t.Parallel()
 	db := openIntentCandidateTestDB(t)
