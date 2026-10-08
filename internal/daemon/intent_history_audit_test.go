@@ -72,6 +72,42 @@ func TestIntentHistoryAuditPreservesTypedSemanticFailure(t *testing.T) {
 	}
 }
 
+func TestIntentHistoryAuditDistinguishesPlanRejectionFromProviderConfiguration(t *testing.T) {
+	for _, configuration := range []bool{false, true} {
+		t.Run(fmt.Sprint(configuration), func(t *testing.T) {
+			f, planner, opts := newHistoryAuditFixture(t)
+			opts.IntentHealth = NewIntentPlannerHealth(context.Background(), f.repo.db, IntentPlannerHealthOptions{Provider: IntentPlannerProviderIdentity{Provider: "audit-provider"}})
+			planner.failure = &ai.IntentPlanV2ValidationError{Message: "response has incomplete goals"}
+			if configuration {
+				planner.failure = &ai.ProviderHTTPError{StatusCode: 401, Detail: "credentials rejected"}
+			}
+			result, err := MaybeRepairIntentHistory(context.Background(), f.repo.dir, f.repo.gitDir, f.repo.db, f.cctx, opts)
+			if result.Status != state.IntentRepairSkipped {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if configuration && !ai.ProviderNeedsConfiguration(err) {
+				t.Fatalf("configuration was hidden as retry wait: %v", err)
+			}
+			if !configuration && err != nil {
+				t.Fatal(err)
+			}
+			if snapshot := opts.IntentHealth.Snapshot(); snapshot.State != IntentPlannerCircuitClosed {
+				t.Fatalf("reachable provider consumed outage backoff: %+v", snapshot)
+			}
+			var record intentHistoryAuditRecord
+			if _, err := state.MetaGetJSON(context.Background(), f.repo.db, metaIntentHistoryAudit, &record); err != nil {
+				t.Fatal(err)
+			}
+			if configuration && (record.Outcome != "needs_attention" || record.NextAttemptTS != 0) {
+				t.Fatalf("configuration outcome=%+v", record)
+			}
+			if !configuration && (record.Outcome != "planning_wait" || record.NextAttemptTS == 0) {
+				t.Fatalf("semantic plan outcome=%+v", record)
+			}
+		})
+	}
+}
+
 func newHistoryAuditFixture(t *testing.T) (noncontiguousIntentRepairFixture, *historyAuditPlanner, ReplayOpts) {
 	t.Helper()
 	f := newNoncontiguousIntentRepairFixture(t)
@@ -88,7 +124,13 @@ func newHistoryAuditFixture(t *testing.T) (noncontiguousIntentRepairFixture, *hi
 	if err := git.UpdateRef(ctx, f.repo.dir, f.cctx.BranchRef, newHead, f.oldA2); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.repo.db.SQL().ExecContext(ctx, `UPDATE capture_events SET commit_oid=? WHERE commit_oid=?; UPDATE intent_candidates SET published_commit_oid=? WHERE published_commit_oid=?; UPDATE intent_candidates SET soft_publication_deadline=? WHERE status='soft_published'`, newHead, f.oldA2, newHead, f.oldA2, float64(time.Now().Add(30*time.Minute).UnixNano())/1e9); err != nil {
+	if _, err := f.repo.db.SQL().ExecContext(ctx, `UPDATE capture_events SET commit_oid=? WHERE commit_oid=?`, newHead, f.oldA2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.repo.db.SQL().ExecContext(ctx, `UPDATE intent_candidates SET published_commit_oid=? WHERE published_commit_oid=?`, newHead, f.oldA2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.repo.db.SQL().ExecContext(ctx, `UPDATE intent_candidates SET soft_publication_deadline=? WHERE status='soft_published'`, float64(time.Now().Add(30*time.Minute).UnixNano())/1e9); err != nil {
 		t.Fatal(err)
 	}
 	f.oldA2 = newHead
