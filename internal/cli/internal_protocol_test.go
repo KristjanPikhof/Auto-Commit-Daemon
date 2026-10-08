@@ -593,7 +593,9 @@ exec "$real_git" "$@"
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			// Leave startup room for Git and SQLite under the parallel gate. The
+			// observed marker still proves the deadline interrupts the Git probe.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, protocolErr := handler.HandleWorkerRequest(ctx, supervisor.Request{
 				Method: "publication_drain_start", WorktreeID: "worktree",
@@ -603,6 +605,7 @@ exec "$real_git" "$@"
 			}
 			if deadline {
 				if protocolErr == nil || protocolErr.Code != "checkpoint_timeout" || !protocolErr.Retryable ||
+					!strings.Contains(protocolErr.Message, "timed out") ||
 					!strings.Contains(protocolErr.Message, `rejected_checkpoint="cp-stale-feature"`) ||
 					!strings.Contains(protocolErr.Message, "git symbolic-ref") {
 					t.Fatalf("deadline lost checkpoint/Git evidence: %+v", protocolErr)
