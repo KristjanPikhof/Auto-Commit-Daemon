@@ -77,9 +77,9 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 		plan := map[string]any{
 			"selected_seqs":    seqs,
 			"deferred_seqs":    []int64{},
-			"subject":          "Atomic four-file group",
-			"body":             "Group every offered capture in one commit.",
-			"grouping_reason":  "atomicity test: select all four offered seqs",
+			"subject":          "Add recording archive construction",
+			"body":             "- Keep archive values consistent through registration",
+			"grouping_reason":  "construct recording archives and register the same archive value",
 			"deferred_reasons": []map[string]any{},
 		}
 		writeIntentPlanResponse(t, w, "call_atomic", plan)
@@ -117,8 +117,14 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 		"internal/atomic/c.go",
 		"internal/atomic/d.go",
 	}
-	for _, name := range files {
-		writeFile(t, filepath.Join(repo, name), "atomic content for "+name+"\n")
+	contents := []string{
+		"package atomic\n\ntype RecordingArchive struct { Data string }\n",
+		"package atomic\n\nfunc BuildRecordingArchive(text string) RecordingArchive { return RecordingArchive{Data: text} }\n",
+		"package atomic\n\nfunc RecordingArchiveSummary(archive RecordingArchive) string { return archive.Data }\n",
+		"package atomic\n\nfunc RegisterRecordingArchive() string { return RecordingArchiveSummary(BuildRecordingArchive(\"example\")) }\n",
+	}
+	for i, name := range files {
+		writeFile(t, filepath.Join(repo, name), contents[i])
 	}
 
 	startCount := commitCount(t, repo)
@@ -165,8 +171,8 @@ func TestIntentAtomicity_FourFileBatchLandsAsOneGroupedCommit(t *testing.T) {
 			oid, committed)
 	}
 
-	if subj := headSubject(t, repo); subj != "Atomic four-file group" {
-		t.Fatalf("HEAD subject=%q want %q (planner subject must land for grouped commit)", subj, "Atomic four-file group")
+	if subj := headSubject(t, repo); subj != "Add recording archive construction" {
+		t.Fatalf("HEAD subject=%q want %q (planner subject must land for grouped commit)", subj, "Add recording archive construction")
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("planner hits=%d want 1 (single offered window for the four creates)", hits.Load())
