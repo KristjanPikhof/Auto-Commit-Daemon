@@ -162,6 +162,7 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	if data.ActionRequired && data.Summary != "" {
 		fmt.Fprintf(out, "Status: %s\n", data.Summary)
 	} else if data.PublicationProgress.Phase == "provider_wait" ||
+		data.PublicationProgress.Phase == "goal_review_wait" ||
 		data.PublicationProgress.Phase == "provider_call" ||
 		data.PublicationProgress.Phase == "history_reconstruction" {
 		fmt.Fprintf(out, "Status: %s\n", publicationProgressPhaseLabel(data.PublicationProgress))
@@ -312,6 +313,16 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 		return "AI provider retry is due" + capture
 	case "provider_call":
 		return "waiting for the current Intent provider response"
+	case "goal_review_wait":
+		label := "Intent goal review retry is due"
+		if progress.WaitRemainingSeconds > 0 {
+			label = fmt.Sprintf("waiting to review unresolved Intent goals (%s remaining)",
+				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
+		}
+		if progress.WorkerResponsive {
+			label += "; file capture continues"
+		}
+		return label
 	case "verifying":
 		return "verifying the semantic group"
 	case "stalled":
