@@ -101,8 +101,4 @@ func TestCaptureResilienceLargeAssetsDuringProviderOutage(t *testing.T) {
 		t.Fatalf("provider outage published unverified local history: %s want=%s", got, startHead)
 	}
 	assertOutageStatusAndList(t, ctx, fullEnv, repo, 8)
-	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
-	if status.ExitCode != 0 || !strings.Contains(status.Stdout, `"protected": true`) || !strings.Contains(status.Stdout, `"state": "waiting"`) {
-		t.Fatalf("final status: %s %s", status.Stdout, status.Stderr)
-	}
 }

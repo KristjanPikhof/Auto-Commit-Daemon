@@ -420,6 +420,13 @@ func restartOutageTestSession(t *testing.T, ctx context.Context, env []string, r
 
 func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, repo string, pending int) {
 	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitFor(t, "completed outage protection observation", 10*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, `SELECT
+ (SELECT value FROM daemon_meta WHERE key='protection.complete')='true'
+ AND (SELECT value FROM daemon_meta WHERE key='protection.observation_epoch')=
+     (SELECT value FROM daemon_meta WHERE key='protection.covered_epoch')`) == "1"
+	})
 	canonicalRepo, err := filepath.EvalSymlinks(repo)
 	if err != nil {
 		t.Fatal(err)
@@ -431,8 +438,9 @@ func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, 
 		Pending           int    `json:"pending_events"`
 		ActionRequired    bool   `json:"action_required"`
 		Progress          struct {
-			Phase     string `json:"phase"`
-			Remaining int64  `json:"wait_remaining_seconds"`
+			Phase      string `json:"phase"`
+			Remaining  int64  `json:"wait_remaining_seconds"`
+			Responsive bool   `json:"worker_responsive"`
 		} `json:"publication_progress"`
 		Outcome struct {
 			RetryAt float64 `json:"retry_at"`
@@ -475,7 +483,7 @@ func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, 
 					}
 				}
 			}
-			return !got.ProtectionUnknown
+			return !got.ProtectionUnknown && !(got.Progress.Phase == "checkpointing" && got.Progress.Responsive)
 		})
 		if got.Repo != canonicalRepo || !got.Protected || got.Pending != pending || got.ActionRequired || got.Progress.Phase != "provider_wait" || got.Progress.Remaining <= 0 || got.Outcome.RetryAt <= float64(time.Now().Unix()) {
 			t.Fatalf("%s hid protected provider retry: %+v\n%s", command, got, result.Stdout)
