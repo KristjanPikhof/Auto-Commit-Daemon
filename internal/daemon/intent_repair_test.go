@@ -20,6 +20,7 @@ import (
 )
 
 func TestReplayIntentV2PublishesCandidatesInPlannerOrder(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -69,6 +70,7 @@ func TestReplayIntentV2PublishesCandidatesInPlannerOrder(t *testing.T) {
 }
 
 func TestReplayIntentV2DrainsDuplicateRecaptureChain(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	path := "duplicate.txt"
@@ -346,6 +348,7 @@ func replayAllIntentPendingForTest(t *testing.T, f *captureFixture) {
 }
 
 func TestReplayIntentV2AdvancesFastFallbackComponents(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -1461,6 +1464,7 @@ func TestReplayIntentV2AdvancesDeferredCaptureState(t *testing.T) {
 }
 
 func TestReplayIntentV2WiresPromptAndOperationalTrace(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := withRuntimeTelemetry(context.Background(), &RuntimeBundle{
 		RevisionID: 42, Profile: "quality-check",
