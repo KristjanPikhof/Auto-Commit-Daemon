@@ -36,24 +36,35 @@ func expandIntentGoalWindow(
 	}
 	captures := make([]IntentCandidateCapture, 0, state.IntentCandidateMaxCaptures)
 	bySeq := make(map[int64]IntentCandidateCapture)
+	load := func(event state.CaptureEvent) error {
+		ops, err := state.LoadCaptureOps(ctx, db, event.Seq)
+		if err != nil {
+			return err
+		}
+		diff, err := BuildOpsDiffWithCap(ctx, repoRoot, ops, intentGoalLookaheadDiffCap)
+		if err != nil {
+			return err
+		}
+		capture := IntentCandidateCapture{Event: event, Ops: ops, CapturedDiff: diff}
+		captures = append(captures, capture)
+		bySeq[event.Seq] = capture
+		return nil
+	}
+	for _, event := range window {
+		if err := load(event); err != nil {
+			return nil, nil, "", err
+		}
+	}
 	for _, event := range pending {
-		if len(target) > 0 && !target[event.Seq] {
+		if selected[event.Seq] || (len(target) > 0 && !target[event.Seq]) {
 			continue
 		}
 		if len(captures) >= state.IntentCandidateMaxCaptures {
 			break
 		}
-		ops, err := state.LoadCaptureOps(ctx, db, event.Seq)
-		if err != nil {
+		if err := load(event); err != nil {
 			return nil, nil, "", err
 		}
-		diff, err := BuildOpsDiffWithCap(ctx, repoRoot, ops, intentGoalLookaheadDiffCap)
-		if err != nil {
-			return nil, nil, "", err
-		}
-		capture := IntentCandidateCapture{Event: event, Ops: ops, CapturedDiff: diff}
-		captures = append(captures, capture)
-		bySeq[event.Seq] = capture
 	}
 	dependencies, err := BuildIntentCandidateDependencies(active.BranchRef,
 		active.BranchGeneration, captures, runtimeIntentDependencyHints(captures), now)
@@ -69,7 +80,7 @@ func expandIntentGoalWindow(
 	for _, edge := range dependencies {
 		request.Dependencies = append(request.Dependencies, ai.IntentCaptureDependency{
 			FromSeq: edge.PrerequisiteSeq, ToSeq: edge.DependentSeq,
-			Strength: ai.IntentDependencyStrength(edge.Strength), Kind: edge.Kind,
+			Strength: ai.IntentDependencyStrength(edge.Strength), Kind: edge.Kind, EvidenceHash: edge.Evidence,
 		})
 	}
 	var companions []ai.IntentCaptureDependency
@@ -123,7 +134,7 @@ func expandIntentGoalWindow(
 			hints = append(hints, IntentDependencyHint{
 				PrerequisiteSeq: edge.FromSeq, DependentSeq: edge.ToSeq,
 				Strength: edge.Strength, Kind: edge.Kind,
-				Evidence: "recorded companion relationship in bounded pending context",
+				Evidence: "recorded companion relationship: " + edge.EvidenceHash,
 			})
 		}
 	}
