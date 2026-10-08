@@ -13,7 +13,7 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 	if input.RepoPath == "" || !input.IncludeDiffs {
 		return captures, nil
 	}
-	edges, err := BuildIntentCandidateDependencies(input.BranchRef, input.BranchGeneration, captures, append(input.Hints, runtimeIntentDependencyHints(captures)...), input.Now)
+	edges, err := BuildIntentCandidateDependencies(input.BranchRef, input.BranchGeneration, captures, append(append([]IntentDependencyHint(nil), input.Hints...), runtimeIntentDependencyHints(captures)...), input.Now)
 	if err != nil {
 		return nil, err
 	}
