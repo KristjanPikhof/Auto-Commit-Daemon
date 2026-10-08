@@ -323,9 +323,9 @@ func seedCheckpointReplayFixture(t *testing.T, semanticPrefix bool) failedCheckp
 		"companion_test.go": "package source\n\nconst Companion = 1\n",
 		"fresh.go":          "package source\n\nconst Fresh = 1\n",
 		"source.go": "package source\n\n" +
-			"func Value() int { return 1 }\n",
+			"func LabeledValue() int { return 1 }\n",
 		"source_fixture.go": "package source\n\nfunc FixtureValue() int { return 1 }\n",
-		"source_test.go":    "package source\n\nvar Want = Value()\n",
+		"source_test.go":    "package source\n\nvar Want = LabeledValue()\n",
 	}
 	if semanticPrefix {
 		targetPath = "zsource_api.go"
@@ -340,16 +340,16 @@ func seedCheckpointReplayFixture(t *testing.T, semanticPrefix bool) failedCheckp
 	}
 	edits := map[string]string{
 		"source.go": "package source\n\n" +
-			"func Value(label string) int { return len(label) }\n",
-		"source_fixture.go": "package source\n\nfunc FixtureValue() int { return Value(\"fixture\") }\n",
+			"func LabeledValue(label string) int { return len(label) }\n",
+		"source_fixture.go": "package source\n\nfunc FixtureValue() int { return LabeledValue(\"fixture\") }\n",
 		// This checkpoint is an intentionally incomplete API transition:
-		// Value now requires a label, while the test still calls Value().
-		"source_test.go": "package source\n\nvar Want = Value() + FixtureValue()\n",
+		// Value now requires a label, while the test still calls LabeledValue().
+		"source_test.go": "package source\n\nvar Want = LabeledValue() + FixtureValue()\n",
 	}
 	if semanticPrefix {
 		delete(edits, "source_test.go")
 		edits[targetPath] = "package source\n\nconst ValueLabel = \"complete\"\n"
-		edits["source.go"] += "\nfunc DefaultValue() int { return Value(ValueLabel) }\n"
+		edits["source.go"] += "\nfunc DefaultValue() int { return LabeledValue(ValueLabel) }\n"
 		edits["source_fixture.go"] = "package source\n\nfunc FixtureValue() int { return DefaultValue() }\n"
 	}
 	for path, contents := range edits {
@@ -539,7 +539,7 @@ func appendLaterRecoverySnapshots(
 	bridgeEdits := map[string]string{
 		"companion_test.go": "package source\n\nvar Companion = FixtureValue() + 2\n",
 		fixture.targetPath: "package source\n\n" +
-			"var Want = Value(\"complete\") + FixtureValue()\n",
+			"var Want = LabeledValue(\"complete\") + FixtureValue()\n",
 	}
 	if fixture.targetPath == "zsource_api.go" {
 		bridgeEdits[fixture.targetPath] = "package source\n\nconst ValueLabel = \"latest\"\n"
