@@ -167,6 +167,37 @@ func TestIntentPlannerHealthTransportOpensImmediatelyAndBacksOff(t *testing.T) {
 	}
 }
 
+func TestIntentPlannerHealthCooldownBypassesDoNotRewriteDurableState(t *testing.T) {
+	ctx := context.Background()
+	db := newIntentHealthTestDB(t)
+	clock := newIntentHealthClock()
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{
+		Provider: openAIIntentHealthIdentity("https://planner.example/v1"),
+		Now:      clock.Now,
+	})
+	permit, err := health.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := health.Complete(ctx, permit, &IntentPlannerTransportFailure{Err: errors.New("offline")}); err != nil {
+		t.Fatal(err)
+	}
+	before, found, err := state.MetaGet(ctx, db, MetaKeyIntentPlannerHealth)
+	if err != nil || !found {
+		t.Fatalf("durable circuit found=%t err=%v", found, err)
+	}
+	clock.Advance(time.Minute)
+	for range 10 {
+		if _, err := health.Acquire(ctx); !isIntentPlannerCircuitWait(err) {
+			t.Fatalf("cooldown permit: %v", err)
+		}
+	}
+	after, _, err := state.MetaGet(ctx, db, MetaKeyIntentPlannerHealth)
+	if err != nil || before != after || health.Snapshot().BypassCount != 10 {
+		t.Fatalf("cooldown rewrote state: before=%s after=%s bypasses=%d err=%v", before, after, health.Snapshot().BypassCount, err)
+	}
+}
+
 func TestIntentPlannerHealthValidationCountsOnlyCompletedMaxProbe(t *testing.T) {
 	clock := newIntentHealthClock()
 	health := NewIntentPlannerHealth(context.Background(), nil,
