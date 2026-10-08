@@ -26,8 +26,12 @@
   incomplete work publishable.
 - Keep local Intent evidence available without network sharing, and reject
   grouping based only on shared prose or code comments.
-- Retain bounded recorded script references when changed lines omit the call
-  connecting a runner, helper, or generated timing file.
+- Retain actual recorded ownership, caller, project, and named API references
+  before clipping large Intent evidence. Handle Swift test macros and paths
+  containing spaces without treating comments or quoted labels as symbols.
+- Review rejected semantic relationships automatically after an hourly wait,
+  including protected older blocks. Corrected plans can split rejected groups
+  while preserving valid goals and immutable capture provenance.
 - Mark transient list reads as refreshing and expose unknown protection in
   JSON. Provider waits and active probes use the same status across views.
 
