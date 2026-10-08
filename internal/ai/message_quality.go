@@ -277,7 +277,7 @@ func isFilenameOnlySubject(subject string, paths map[string]struct{}) bool {
 	if subject == "" {
 		return false
 	}
-	tail := subjectTail(subject)
+	tail := subjectTail(subjectTailForQuality(subject))
 	if looksLikePathToken(tail) {
 		return true
 	}
@@ -315,14 +315,14 @@ func looksLikePathToken(s string) bool {
 }
 
 func isTokenOnlySubject(subject string) bool {
-	tail := strings.Trim(subjectTail(subject), "`'\" ")
+	tail := strings.Trim(subjectTail(subjectTailForQuality(subject)), "`'\" ")
 	if tail == "" || strings.Contains(tail, " ") || looksLikePathToken(tail) {
 		return false
 	}
 	if strings.Contains(tail, "_") || strings.Contains(tail, "-") {
 		return true
 	}
-	if hasInternalUpper(tail) && tail[0] >= 'a' && tail[0] <= 'z' {
+	if hasInternalUpper(tail) {
 		return true
 	}
 	switch strings.ToLower(tail) {

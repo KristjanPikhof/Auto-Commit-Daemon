@@ -226,6 +226,18 @@ func TestIntentMessageQualityRejectsFilenameCodeChangeFallback(t *testing.T) {
 	}
 }
 
+func TestIntentMessageQualityRejectsPascalCaseSymbolSubject(t *testing.T) {
+	t.Parallel()
+	for _, subject := range []string{"Add PublishRecordingArchive", "feat: PublishRecordingArchive"} {
+		report := EvaluateIntentPlanMessageQuality(IntentPlanRequest{
+			OfferedCaptures: []OfferedCapture{{Seq: 1, Path: "export.go", CapturedDiff: "+func PublishRecordingArchive() {}\n"}},
+		}, IntentPlan{SelectedSeqs: []int64{1}, Subject: subject})
+		if report.Action != MessageQualityRewrite || !report.HasReason(MessageQualityReasonTokenOnly) {
+			t.Fatalf("raw symbol escaped goal message policy: %+v", report)
+		}
+	}
+}
+
 func TestEvaluateIntentPlanMessageQuality_ConventionalFormat(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
 	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{
