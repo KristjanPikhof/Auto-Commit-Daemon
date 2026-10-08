@@ -747,8 +747,8 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{
-		"first.txt":  "first\n",
-		"second.txt": "second\n",
+		"first.md":  "# Offline capture recovery\nProtect edits while the semantic provider is unavailable.\n",
+		"second.md": "# Provider reconnect recovery\nResume preserved work after the provider reconnects.\n",
 	}
 	for path, contents := range want {
 		if err := os.WriteFile(filepath.Join(f.dir, path),
@@ -777,7 +777,7 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 	opts := ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
 		IntentPlanner: planner, IntentPreset: config.PresetFast,
-		IntentBypassBatchWait: true, IntentWindow: 10,
+		IntentBypassBatchWait: true, IntentWindow: 10, IntentIncludeDiffs: true,
 		PublicationDrain: &drain,
 	}
 	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
@@ -786,17 +786,20 @@ func TestPublicationDrainLocalUnlockReturnsToIntentPlanner(t *testing.T) {
 		t.Fatalf("first fallback=%+v planner_calls=%d rewrite_calls=%d err=%v",
 			first, planner.calls, planner.rewriteCalls, err)
 	}
-	if body := mustGitOutput(t, f.dir, "show", "-s", "--format=%b", "HEAD"); !strings.Contains(body, "first.txt") && !strings.Contains(body, "second.txt") {
+	if body := mustGitOutput(t, f.dir, "show", "-s", "--format=%b", "HEAD"); !strings.Contains(body, "first.md") && !strings.Contains(body, "second.md") {
 		t.Fatalf("local message lacks capture evidence: %q", body)
 	}
 	f.cctx.BaseHead = first.BaseHead
 	drain.FallbackMode = publicationFallbackSemanticReplan
-	semanticPlanner := &recoveringPublicationDrainPlanner{}
+	semanticPlanner := &reconnectingIntentPlanner{}
 	opts.IntentPlanner = semanticPlanner
 	second, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil || second.Published != 1 || semanticPlanner.calls != 1 {
 		t.Fatalf("semantic replan=%+v provider_calls=%d err=%v",
 			second, semanticPlanner.calls, err)
+	}
+	if subject := strings.TrimSpace(mustGitOutput(t, f.dir, "show", "-s", "--format=%s", "HEAD")); subject != "Document continued offline capture" {
+		t.Fatalf("semantic replan lost its meaningful provider message: %q", subject)
 	}
 	for path, contents := range want {
 		got, err := os.ReadFile(filepath.Join(f.dir, path))
