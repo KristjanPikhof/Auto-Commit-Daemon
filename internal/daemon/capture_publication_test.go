@@ -68,6 +68,7 @@ func replayPublicationPage(t *testing.T, f *captureFixture, drain *state.Publica
 }
 
 func TestCapturePublicationPagesPastHeldPrefixAfterRestart(t *testing.T) {
+	t.Parallel()
 	f := newPartialPublicationFixture(t)
 	ctx := context.Background()
 	writePublicationFile(t, f, "a.go", "package fixture\n")
@@ -138,6 +139,7 @@ func TestCapturePublicationPagesPastHeldPrefixAfterRestart(t *testing.T) {
 }
 
 func TestCapturePublicationPagingPreservesHeldPathOrder(t *testing.T) {
+	t.Parallel()
 	f := newPartialPublicationFixture(t)
 	unchanged := "References blocked.go.\n" + strings.Repeat("Unchanged paragraph.\n", 50)
 	writePublicationFile(t, f, "a.md", unchanged+"Old trailing section.\n")
@@ -164,6 +166,7 @@ func TestCapturePublicationPagingPreservesHeldPathOrder(t *testing.T) {
 }
 
 func TestCapturePublicationPagingKeepsPathOrderWhenCoverageRecovers(t *testing.T) {
+	t.Parallel()
 	f := newPartialPublicationFixture(t)
 	ctx := context.Background()
 	unchanged := "References blocked.go.\n" + strings.Repeat("Unchanged paragraph.\n", 50)
@@ -208,6 +211,7 @@ func TestCapturePublicationPagingKeepsPathOrderWhenCoverageRecovers(t *testing.T
 }
 
 func TestCapturePublicationPageRetainsCheckpointAndTerminalBarriers(t *testing.T) {
+	t.Parallel()
 	f := newPartialPublicationFixture(t)
 	ctx := context.Background()
 	writePublicationFile(t, f, "a.go", "package fixture\n")
@@ -239,6 +243,7 @@ func TestCapturePublicationPageRetainsCheckpointAndTerminalBarriers(t *testing.T
 }
 
 func TestCapturePublicationRechecksCoverageBetweenEvents(t *testing.T) {
+	t.Parallel()
 	if os.Geteuid() == 0 {
 		t.Skip("requires enforced file permissions")
 	}
@@ -289,6 +294,7 @@ func TestCapturePublicationRechecksCoverageBetweenEvents(t *testing.T) {
 }
 
 func TestCapturePublicationPagingKeepsFrozenTarget(t *testing.T) {
+	t.Parallel()
 	f := newPartialPublicationFixture(t)
 	writePublicationFile(t, f, "a.go", "package fixture\n")
 	writePublicationFile(t, f, "target.md", "Independent target.\n")
@@ -314,6 +320,7 @@ func TestCapturePublicationPagingKeepsFrozenTarget(t *testing.T) {
 }
 
 func TestCapturePublicationScanCursorScopesIdentity(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	key, cursor, err := loadCaptureEventScanCursor(ctx, f.db, f.dir, f.cctx, "drain:first")
