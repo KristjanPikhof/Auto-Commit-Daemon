@@ -3423,20 +3423,21 @@ func TestIntentCandidateEngineHoldsOverCapHardContinuationWithoutErrors(
 		t.Run(testCase.name, func(t *testing.T) {
 			ctx := context.Background()
 			db := openIntentCandidateTestDB(t)
-			left := make([]IntentCandidateCapture, 0, 128)
+			captures := make([]IntentCandidateCapture, 0, 257)
 			for i := 0; i < 128; i++ {
-				left = append(left, appendIntentCandidateCapture(
-					t, db, fmt.Sprintf("left/%03d.go", i),
+				captures = append(captures, intentCandidateCaptureFixture(
+					0, fmt.Sprintf("left/%03d.go", i),
 					"create", "", fmt.Sprintf("left-%d", i)))
 			}
-			bridge := appendIntentCandidateCapture(
-				t, db, "bridge.go", "create", "", "bridge")
-			right := make([]IntentCandidateCapture, 0, 128)
+			captures = append(captures, intentCandidateCaptureFixture(
+				0, "bridge.go", "create", "", "bridge"))
 			for i := 0; i < 128; i++ {
-				right = append(right, appendIntentCandidateCapture(
-					t, db, fmt.Sprintf("right/%03d.go", i),
+				captures = append(captures, intentCandidateCaptureFixture(
+					0, fmt.Sprintf("right/%03d.go", i),
 					"create", "", fmt.Sprintf("right-%d", i)))
 			}
+			seedIntentCandidateCaptureBatch(t, db, captures)
+			left, bridge, right := captures[:128], captures[128], captures[129:]
 			saveWaitingIntentCandidate(
 				t, db, "cap-left", 100, left...)
 			saveWaitingIntentCandidate(
@@ -3527,6 +3528,30 @@ func TestIntentCandidateEngineHoldsOverCapHardContinuationWithoutErrors(
 				ctx, db, "refs/heads/main", 1, "cap-left", 10)
 			if err != nil || len(lineage) != 0 {
 				t.Fatalf("over-cap lineage=%+v err=%v", lineage, err)
+			}
+			rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT e.seq,e.path,e.state,o.after_oid,o.after_mode,o.fidelity
+FROM capture_events e JOIN capture_ops o ON o.event_seq=e.seq
+ORDER BY e.seq,o.ord`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			stored := 0
+			for rows.Next() {
+				var seq int64
+				var path, eventState, after, mode, fidelity string
+				if err := rows.Scan(&seq, &path, &eventState, &after, &mode, &fidelity); err != nil {
+					t.Fatal(err)
+				}
+				if stored >= len(captures) || seq != captures[stored].Event.Seq || path != captures[stored].Event.Path ||
+					eventState != state.EventStatePending || after != captures[stored].Ops[0].AfterOID.String || mode != "100644" || fidelity != "full" {
+					t.Fatalf("capture version %d changed: seq=%d path=%s state=%s after=%s mode=%s fidelity=%s", stored, seq, path, eventState, after, mode, fidelity)
+				}
+				stored++
+			}
+			if err := rows.Err(); err != nil || stored != len(captures) {
+				t.Fatalf("stored capture versions=%d want=%d err=%v", stored, len(captures), err)
 			}
 		})
 	}
@@ -4613,36 +4638,116 @@ func seedExhaustedLegacyIntentCandidates(
 			EventSeq: eventSeq, EventRole: "code",
 		}},
 	}
-	retire := func(id string) {
-		t.Helper()
-		if _, err := db.SQL().ExecContext(ctx, `
-UPDATE intent_candidate_events SET membership_state='superseded'
-WHERE candidate_id=?`, id); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.SQL().ExecContext(ctx, `
-UPDATE intent_candidates SET status='superseded',updated_ts=updated_ts+1
-WHERE id=?`, id); err != nil {
-			t.Fatal(err)
-		}
-	}
 	if err := state.SaveIntentCandidate(ctx, db, candidate); err != nil {
 		t.Fatal(err)
 	}
-	retire(baseID)
+	// These are historical rows, not transitions under test. Seed their exact
+	// superseded state together; the caller still exercises every real retry.
+	tx, err := db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidate_events SET membership_state='superseded'
+WHERE candidate_id=?`, baseID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE intent_candidates SET status='superseded',updated_ts=updated_ts+1
+WHERE id=?`, baseID); err != nil {
+		t.Fatal(err)
+	}
+	row, err := tx.PrepareContext(ctx, `
+INSERT INTO intent_candidates(id,branch_ref,branch_generation,status,created_ts,updated_ts,readiness)
+SELECT ?,branch_ref,branch_generation,status,created_ts,updated_ts,readiness
+FROM intent_candidates WHERE id=?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer row.Close()
+	member, err := tx.PrepareContext(ctx, `
+INSERT INTO intent_candidate_events(candidate_id,ord,event_seq,event_role,membership_state)
+VALUES(?,0,?,'code','superseded')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer member.Close()
 	legacyIDs := make(map[string]struct{}, state.IntentCandidateMaxOpenPerPair)
 	for attempt := 1; attempt <= state.IntentCandidateMaxOpenPerPair; attempt++ {
 		id := legacyIntentCandidateSuccessorID(
 			baseID, branchRef, generation, []int64{eventSeq}, attempt)
 		legacyIDs[id] = struct{}{}
-		candidate.ID = id
-		if err := state.SaveIntentCandidate(ctx, db, candidate); err != nil {
+		if _, err := row.ExecContext(ctx, id, baseID); err != nil {
 			t.Fatal(err)
 		}
-		retire(id)
+		if _, err := member.ExecContext(ctx, id, eventSeq); err != nil {
+			t.Fatal(err)
+		}
 	}
-	candidate.ID = baseID
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var historical int
+	if err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM intent_candidates c JOIN intent_candidate_events e ON e.candidate_id=c.id
+WHERE c.branch_ref=? AND c.branch_generation=? AND c.status='superseded'
+  AND e.event_seq=? AND e.membership_state='superseded'`, branchRef, generation, eventSeq).Scan(&historical); err != nil || historical != len(legacyIDs)+1 {
+		t.Fatalf("historical candidate memberships=%d want=%d err=%v", historical, len(legacyIDs)+1, err)
+	}
 	return candidate, legacyIDs
+}
+
+// Bulk setup retains every event and operation version without measuring a
+// separate durable transaction for each capture before the scenario starts.
+func seedIntentCandidateCaptureBatch(t *testing.T, db *state.DB, captures []IntentCandidateCapture) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	event, err := tx.PrepareContext(ctx, `
+INSERT INTO capture_events(branch_ref,branch_generation,base_head,operation,path,old_path,
+    fidelity,captured_ts,published_ts,state,commit_oid,error,message)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer event.Close()
+	op, err := tx.PrepareContext(ctx, `
+INSERT INTO capture_ops(event_seq,ord,op,path,old_path,before_oid,before_mode,after_oid,after_mode,fidelity)
+VALUES(?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer op.Close()
+	for i := range captures {
+		capture := &captures[i]
+		ev := capture.Event
+		result, err := event.ExecContext(ctx, ev.BranchRef, ev.BranchGeneration, ev.BaseHead, ev.Operation,
+			ev.Path, ev.OldPath, ev.Fidelity, ev.CapturedTS, ev.PublishedTS, ev.State, ev.CommitOID, ev.Error, ev.Message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seq, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		capture.Event.Seq = seq
+		for ord := range capture.Ops {
+			version := &capture.Ops[ord]
+			version.EventSeq = seq
+			if _, err := op.ExecContext(ctx, seq, ord, version.Op, version.Path, version.OldPath,
+				version.BeforeOID, version.BeforeMode, version.AfterOID, version.AfterMode, version.Fidelity); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func appendIntentCandidateCapture(
