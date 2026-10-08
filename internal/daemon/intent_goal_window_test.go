@@ -107,3 +107,35 @@ func TestIntentGoalWindowPreservesFrozenPublicationTarget(t *testing.T) {
 		t.Fatalf("later capture entered frozen publication target: window=%+v reason=%q err=%v", window, reason, err)
 	}
 }
+
+func TestIntentGoalWindowWaitsForHotCompanion(t *testing.T) {
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	callerPath, helperPath := "goal_quiet_caller.go", "goal_quiet_helper.go"
+	_ = captureSamePathEdit(t, ctx, f, callerPath, "package archive\n\nfunc ExportRecording() string { return BuildRecordingArchive() }\n")
+	_ = captureSamePathEdit(t, ctx, f, helperPath, "package archive\n\nfunc BuildRecordingArchive() string { return \"archive\" }\n")
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wasEnabled := pathQuiescenceEnabled.Load()
+	SetPathQuiescenceEnabled(true)
+	t.Cleanup(func() {
+		SetPathQuiescenceEnabled(wasEnabled)
+		pathQuiescenceMu.Lock()
+		delete(pathQuiescenceWrites, callerPath)
+		delete(pathQuiescenceWrites, helperPath)
+		pathQuiescenceMu.Unlock()
+	})
+	now := time.Now()
+	RecordPathWrite(callerPath, now.Add(-time.Minute))
+	RecordPathWrite(helperPath, now)
+	window, _, reason, err := expandIntentGoalWindow(ctx, f.dir, f.db, f.cctx,
+		pending, pending[:1], intentReplayConfig{pathQuiescence: 5 * time.Second}, now)
+	if err != nil || len(window) != 0 || reason != "skipped_due_path_quiescence" {
+		t.Fatalf("hot companion was bypassed: window=%+v reason=%q err=%v", window, reason, err)
+	}
+}

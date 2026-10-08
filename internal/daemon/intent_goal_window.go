@@ -12,7 +12,12 @@ import (
 
 const intentGoalLookaheadDiffCap = 4096
 
-var intentGoalDeclaration = regexp.MustCompile(`\b(?:func|function|def|class|struct|type|enum|interface|protocol)\s+([a-zA-Z_][a-zA-Z0-9_]*)`)
+var intentGoalDeclaration = regexp.MustCompile(`\b(?:func(?:\s+\([^)]*\))?|function|def|class|struct|type|enum|interface|protocol)\s+([a-zA-Z_][a-zA-Z0-9_]*)`)
+
+type intentGoalReferences struct {
+	declarations []string
+	symbols      map[string]struct{}
+}
 
 // Expand from a processing window into its recorded dependency closure. This
 // reads captured objects only, and never includes captures outside a frozen
@@ -84,8 +89,18 @@ func expandIntentGoalWindow(
 		})
 	}
 	var companions []ai.IntentCaptureDependency
+	references := make(map[int64]intentGoalReferences, len(captures))
+	for _, capture := range captures {
+		item := intentGoalReferences{symbols: runtimeIntentSymbols(capture.CapturedDiff)}
+		for _, match := range intentGoalDeclaration.FindAllStringSubmatch(capture.CapturedDiff, 128) {
+			if len(match[1]) >= 8 {
+				item.declarations = append(item.declarations, strings.ToLower(match[1]))
+			}
+		}
+		references[capture.Event.Seq] = item
+	}
 	for _, edge := range groundedIntentRequestDependencies(request) {
-		if edge.Strength != ai.IntentDependencyHard && !intentGoalCompanionEdge(edge, bySeq) {
+		if edge.Strength != ai.IntentDependencyHard && !intentGoalCompanionEdge(edge, references) {
 			continue
 		}
 		companions = append(companions, edge)
@@ -141,19 +156,18 @@ func expandIntentGoalWindow(
 	return expanded, hints, "", nil
 }
 
-func intentGoalCompanionEdge(edge ai.IntentCaptureDependency, captures map[int64]IntentCandidateCapture) bool {
+func intentGoalCompanionEdge(edge ai.IntentCaptureDependency, references map[int64]intentGoalReferences) bool {
 	switch edge.Kind {
 	case "test_source", "migration_test", "import_reference", "generated_artifact_reference":
 		return true
 	case "symbol_hash":
 		for _, seq := range []int64{edge.FromSeq, edge.ToSeq} {
-			for _, match := range intentGoalDeclaration.FindAllStringSubmatch(captures[seq].CapturedDiff, 128) {
-				name := strings.ToLower(match[1])
+			for _, name := range references[seq].declarations {
 				other := edge.ToSeq
 				if seq == other {
 					other = edge.FromSeq
 				}
-				if len(name) >= 8 && strings.Contains(strings.ToLower(captures[other].CapturedDiff), name) {
+				if _, used := references[other].symbols[name]; used {
 					return true
 				}
 			}
