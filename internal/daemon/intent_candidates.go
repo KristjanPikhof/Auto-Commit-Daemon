@@ -2674,33 +2674,16 @@ func evaluateIntentCandidateAssignment(
 		})
 	}
 	grounded := groundedIntentRequestDependencies(request)
-	results := make([]ai.IntentAtomicityGateResult, 0, 7)
-	for _, gate := range []ai.IntentAtomicityGate{
-		ai.IntentAtomicityCohesion, ai.IntentAtomicityCompleteness,
-		ai.IntentAtomicitySeparation, ai.IntentAtomicityDependency,
-		ai.IntentAtomicityRevertibility,
-	} {
-		results = append(results, pendingIntentGate(assignment.CandidateID,
-			gate, "evidence_not_checked", "candidate evidence has not been checked"))
-	}
 	connected := intentRequestSeqsConnected(selected, grounded)
-	if connected {
-		for _, index := range []int{0, 2, 4} {
-			results[index] = ai.IntentAtomicityGateResult{
-				Gate: results[index].Gate, Status: ai.IntentAtomicityPassed,
-			}
-		}
-	} else {
-		for _, index := range []int{0, 2, 4} {
-			results[index] = failedIntentGate(assignment.CandidateID,
-				results[index].Gate, "candidate_lacks_semantic_evidence",
-				errors.New("candidate merges captures without a grounded relationship"))
-		}
-	}
 	// Complete-plan validation has already proven unique ownership and the
 	// declared prerequisite order; it cannot prove semantic completeness.
-	results[3] = ai.IntentAtomicityGateResult{
-		Gate: ai.IntentAtomicityDependency, Status: ai.IntentAtomicityPassed,
+	results := []ai.IntentAtomicityGateResult{
+		intentRelationshipGate(assignment.CandidateID, ai.IntentAtomicityCohesion, connected),
+		pendingIntentGate(assignment.CandidateID, ai.IntentAtomicityCompleteness,
+			"evidence_not_checked", "companion completeness has not been checked"),
+		intentRelationshipGate(assignment.CandidateID, ai.IntentAtomicitySeparation, connected),
+		{Gate: ai.IntentAtomicityDependency, Status: ai.IntentAtomicityPassed},
+		intentRelationshipGate(assignment.CandidateID, ai.IntentAtomicityRevertibility, connected),
 	}
 	waiting := assignment.Readiness == ai.IntentCandidateWait ||
 		len(assignment.MissingCompanions) > 0
@@ -2885,6 +2868,14 @@ func evaluateIntentCandidateAssignment(
 	decision.Publishable = report.Valid && assignment.Readiness == ai.IntentCandidateReady
 	decision.VerificationDeferred = verificationDeferred
 	return decision, nil
+}
+
+func intentRelationshipGate(candidateID string, gate ai.IntentAtomicityGate, connected bool) ai.IntentAtomicityGateResult {
+	if connected {
+		return ai.IntentAtomicityGateResult{Gate: gate, Status: ai.IntentAtomicityPassed}
+	}
+	return failedIntentGate(candidateID, gate, "candidate_lacks_semantic_evidence",
+		errors.New("candidate merges captures without a grounded relationship"))
 }
 
 func intentPreVerificationGatesPassed(
