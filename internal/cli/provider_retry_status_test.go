@@ -124,6 +124,13 @@ func TestSemanticRetryStatusAndListAgreeOnDurableGoalWait(t *testing.T) {
 	}
 	record := central.RepoRecord{Path: repo, StateDB: dbPath, RepositoryID: "repository-id", WorktreeID: "worktree-id"}
 	for _, checkAt := range []time.Time{now, now.Add(time.Hour)} {
+		if err := state.SaveDaemonState(ctx, db, state.DaemonState{
+			PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(checkAt.Unix()),
+			BranchRef:        sql.NullString{String: branch, Valid: true},
+			BranchGeneration: sql.NullInt64{Int64: 1, Valid: true},
+		}); err != nil {
+			t.Fatal(err)
+		}
 		report, err := buildStatusReport(ctx, record, checkAt)
 		if err != nil {
 			t.Fatal(err)
