@@ -380,14 +380,16 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 	plan, err := planner.PlanIntentV2(context.Background(), ai.IntentPlanRequestV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		OfferedCaptures: []ai.OfferedCapture{{
-			Seq: 1, Path: "replay.go", Op: "modify",
+			Seq: 1, Path: "replay.md", Op: "modify",
+			CapturedDiff: "+# Protected publication retries\n+Keep captures protected until their provider reconnects.\n",
 		}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(plan.Candidates) != 1 ||
-		plan.Candidates[0].Subject != "Update replay code changes" || !strings.Contains(plan.Candidates[0].Body, "replay.go") {
+		plan.Candidates[0].Readiness != ai.IntentCandidateReady ||
+		plan.Candidates[0].Subject != "Update Protected publication retries" || !strings.Contains(plan.Candidates[0].Body, "replay.md") {
 		t.Fatalf("plan=%+v", plan)
 	}
 }
@@ -814,8 +816,9 @@ func TestPublicationDrainLocalUnlockPublishesDuringMessageOutage(t *testing.T) {
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(f.dir, "replay.go"),
-		[]byte("package replay\n"), 0o644); err != nil {
+	const contents = "# Protected publication retries\nKeep captures protected until their provider reconnects.\n"
+	if err := os.WriteFile(filepath.Join(f.dir, "replay.md"),
+		[]byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
@@ -842,7 +845,7 @@ func TestPublicationDrainLocalUnlockPublishesDuringMessageOutage(t *testing.T) {
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
 		IntentPlanner: planner, IntentPreset: config.PresetFast,
 		IntentRetryLimit: &retryLimit, IntentBypassBatchWait: true,
-		IntentWindow: 10, PublicationDrain: &drain,
+		IntentWindow: 10, IntentIncludeDiffs: true, PublicationDrain: &drain,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -856,6 +859,12 @@ func TestPublicationDrainLocalUnlockPublishesDuringMessageOutage(t *testing.T) {
 	after, err := gitpkg.RevParse(ctx, f.dir, "HEAD")
 	if err != nil || after == before {
 		t.Fatalf("HEAD=%s err=%v", after, err)
+	}
+	if subject := strings.TrimSpace(mustGitOutput(t, f.dir, "show", "-s", "--format=%s", "HEAD")); subject != "Add Protected publication retries" {
+		t.Fatalf("local message did not explain captured evidence: %q", subject)
+	}
+	if got := mustGitOutput(t, f.dir, "show", "HEAD:replay.md"); got != contents {
+		t.Fatalf("local publication changed captured bytes: %q", got)
 	}
 	remaining, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil || len(remaining) != 0 {
