@@ -376,13 +376,14 @@ func productListProgressAge(entry productListEntry) string {
 }
 
 func productListPhase(entry productListEntry) string {
+	if entry.PublicationProgress.Phase == "history_reconstruction" {
+		return "history-reconstruct"
+	}
 	if entry.OperationalState == "rewriting" {
 		return "history-rewrite"
 	}
 	progress := entry.PublicationProgress
 	switch progress.Phase {
-	case "history_reconstruction":
-		return "history-reconstruct"
 	case "capture_retry", "capture_blocked":
 		return strings.ReplaceAll(progress.Phase, "_", "-")
 	case "intent_wait":
