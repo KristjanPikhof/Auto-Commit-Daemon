@@ -360,7 +360,7 @@ func completedIntentRepairCommitChain(
 			return nil, err
 		}
 		rows, err := d.readSQL().QueryContext(ctx, `
-SELECT r.id,c.new_oid
+SELECT DISTINCT r.id,CASE WHEN r.old_head=c.old_oid THEN r.new_head ELSE c.new_oid END
 FROM `+table+` c
 JOIN intent_repairs r ON r.id=c.repair_id
 WHERE r.branch_ref=? AND r.branch_generation=?
