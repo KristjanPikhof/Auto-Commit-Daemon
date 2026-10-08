@@ -612,10 +612,13 @@ FROM pending`, totalPending)
 		if decision.Publishable {
 			ready++
 		}
+		if decision.Assignment.Readiness != ai.IntentCandidateWait ||
+			decision.Assignment.Subject != "" || len(decision.Candidate.Events) != 1 {
+			t.Fatalf("bounded unknown evidence was not retained: %+v", decision)
+		}
 	}
-	if ready != configuredWindow {
-		t.Fatalf("Fast evidence fallback publishable candidates=%d want=%d",
-			ready, configuredWindow)
+	if ready != 0 {
+		t.Fatalf("Fast evidence fallback invented %d goal messages", ready)
 	}
 	after, err := state.CountAllPendingCaptureEvents(ctx, db)
 	if err != nil {
@@ -648,7 +651,8 @@ func TestIntentCandidateEngineAcceptsGroundedSemanticGroupingWithoutExplicitGrap
 				IntentCandidateEvaluation{
 					BranchRef: "refs/heads/main", BranchGeneration: 1,
 					Captures: []IntentCandidateCapture{a, b}, Planner: planner,
-					RetryLimit: retryLimit, RetryLimitSet: true,
+					IncludeDiffs: true,
+					RetryLimit:   retryLimit, RetryLimitSet: true,
 					Preset: config.PresetFast,
 					Materialize: func(
 						context.Context,
@@ -680,10 +684,12 @@ func TestIntentCandidateEngineBoundedFallbackAfterOneCorrection(t *testing.T) {
 	db := openIntentCandidateTestDB(t)
 	capture := appendIntentCandidateCapture(
 		t, db, "internal/a.go", "create", "", "a")
+	capture.CapturedDiff = "+func PublishExportArchive() {}\n"
 	planner := &selfDependentIntentCandidatePlannerStub{}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		IncludeDiffs: true,
 		RetryLimit: 99, RetryLimitSet: true, Preset: config.PresetBalanced,
 		VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
@@ -788,7 +794,7 @@ func TestIntentCandidateEnginePreservesValidGroupsDuringPartialReplan(t *testing
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	first := appendIntentCandidateCapture(t, db, "source.go", "create", "", "a")
-	second := appendIntentCandidateCapture(t, db, "source_test.go", "create", "", "b")
+	second := appendIntentCandidateCapture(t, db, "other_test.go", "create", "", "b")
 	planner := &partialReplanIntentCandidatePlannerStub{}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
@@ -1229,12 +1235,15 @@ func TestIntentCandidateEngineRetriesEligibleMetadataWithCorrection(t *testing.T
 	db := openIntentCandidateTestDB(t)
 	a := appendIntentCandidateCapture(t, db, "internal/a/a.go", "create", "", "a1")
 	b := appendIntentCandidateCapture(t, db, "internal/b/b.go", "create", "", "b1")
+	a.CapturedDiff = "+func ProtectExportArchive() {}\n"
+	b.CapturedDiff = "+func ProtectReminderAlert() {}\n"
 	planner := &correctingIntentCandidatePlannerStub{}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{a, b}, Planner: planner,
-		Preset:      config.PresetBalanced,
-		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
+		IncludeDiffs: true,
+		Preset:       config.PresetBalanced,
+		Materialize:  func(context.Context, []IntentCandidateCapture) error { return nil },
 		Verify: func(
 			context.Context,
 			ai.IntentCandidateAssignment,
@@ -2094,6 +2103,8 @@ func TestIntentCandidateEngineRejectsSameDirectoryMegaGroup(t *testing.T) {
 	db := openIntentCandidateTestDB(t)
 	first := appendIntentCandidateCapture(t, db, "internal/api/alpha.go", "create", "", "a1")
 	second := appendIntentCandidateCapture(t, db, "internal/api/beta.go", "create", "", "b1")
+	first.CapturedDiff = "+func LoadEventCatalog() {}\n"
+	second.CapturedDiff = "+func SendReminderAlerts() {}\n"
 	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
@@ -2106,8 +2117,9 @@ func TestIntentCandidateEngineRejectsSameDirectoryMegaGroup(t *testing.T) {
 	}}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		Captures: []IntentCandidateCapture{first, second},
-		Planner:  planner, Preset: config.PresetFast,
+		Captures:     []IntentCandidateCapture{first, second},
+		IncludeDiffs: true,
+		Planner:      planner, Preset: config.PresetFast,
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
 			return nil
 		},

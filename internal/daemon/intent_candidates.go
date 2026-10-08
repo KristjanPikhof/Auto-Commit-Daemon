@@ -1779,7 +1779,7 @@ func loadResolvedIntentPlanRun(
 	}
 	validationReq := intentCandidateContinuationValidationRequest(
 		req, resolved.Continuations)
-	if err := ai.ValidateIntentPlanV2(validationReq, resolved.Plan); err != nil {
+	if err := ValidateIntentGoalPlan(validationReq, resolved.Plan); err != nil {
 		return ai.IntentPlanV2{}, nil,
 			fmt.Errorf("daemon: validate resolved intent plan: %w", err)
 	}
@@ -1801,14 +1801,24 @@ func validatePlannerSemanticRationale(
 ) error {
 	edges := groundedIntentRequestDependencies(req)
 	for _, candidate := range plan.Candidates {
+		seqs := append([]int64(nil), candidate.SelectedSeqs...)
+		for _, prior := range req.Candidates {
+			if prior.CandidateID != candidate.CandidateID {
+				continue
+			}
+			for _, seq := range prior.SelectedSeqs {
+				if !containsIntentSeq(seqs, seq) {
+					seqs = append(seqs, seq)
+				}
+			}
+		}
 		if candidate.Readiness == ai.IntentCandidateReady {
-			if err := validateIntentCandidateCompanions(candidate.SelectedSeqs, edges); err != nil {
+			if err := validateIntentCandidateCompanions(seqs, edges); err != nil {
 				return intentSemanticValidationError(candidate.CandidateID,
 					ai.IntentAtomicityCompleteness, "available_companion_split", err.Error())
 			}
 		}
-		if len(candidate.SelectedSeqs) <= 1 ||
-			intentRequestSeqsConnected(candidate.SelectedSeqs, edges) {
+		if len(seqs) <= 1 || intentRequestSeqsConnected(seqs, edges) {
 			continue
 		}
 		return intentSemanticValidationError(candidate.CandidateID,
@@ -1867,6 +1877,26 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 				EvidenceHash: intentEvidenceHash(capture.Event.Path),
 			})
 		}
+	}
+	published := make(map[int64]bool)
+	for _, candidate := range req.Candidates {
+		if candidate.Status != state.IntentCandidateSoftPublished && candidate.Status != state.IntentCandidatePublished {
+			continue
+		}
+		for _, seq := range candidate.SelectedSeqs {
+			published[seq] = true
+		}
+	}
+	if len(published) > 0 {
+		kept := edges[:0]
+		for _, edge := range edges {
+			if (edge.Kind == "test_source" || edge.Kind == "migration_test") &&
+				(published[edge.FromSeq] || published[edge.ToSeq]) {
+				continue
+			}
+			kept = append(kept, edge)
+		}
+		edges = kept
 	}
 	return edges
 }
@@ -2625,6 +2655,12 @@ func evaluateIntentCandidateAssignment(
 	}
 
 	request := ai.IntentPlanRequestV2{}
+	for _, prior := range existing {
+		request.Candidates = append(request.Candidates, ai.IntentCandidateSummary{
+			CandidateID: prior.ID, Status: prior.Status,
+			SelectedSeqs: intentCandidateEventSeqs(prior.Events),
+		})
+	}
 	for _, capture := range candidateCaptures {
 		request.OfferedCaptures = append(request.OfferedCaptures, ai.OfferedCapture{
 			Seq: capture.Event.Seq, Path: capture.Event.Path,
@@ -2990,11 +3026,7 @@ func balancedIntentCandidatePlan(
 		var missing []string
 		groupingReason := "bounded deterministic dependency component"
 		root := find(componentBySeq[seqs[0]])
-		if subject == "" {
-			readiness = ai.IntentCandidateWait
-			missing = []string{"captured evidence cannot yet explain a meaningful commit goal"}
-			groupingReason = "protected dependency component needs a meaningful goal message"
-		} else if ambiguousByRoot[root] {
+		if ambiguousByRoot[root] {
 			readiness = ai.IntentCandidateWait
 			subject = ""
 			missing = []string{
@@ -3002,6 +3034,10 @@ func balancedIntentCandidatePlan(
 			}
 			groupingReason = "ambiguous companion evidence is retained for planner review"
 			needsAttention = true
+		} else if subject == "" {
+			readiness = ai.IntentCandidateWait
+			missing = []string{"captured evidence cannot yet explain a meaningful commit goal"}
+			groupingReason = "protected dependency component needs a meaningful goal message"
 		}
 		plan.Candidates = append(plan.Candidates, ai.IntentCandidateAssignment{
 			CandidateID:  stableGeneratedCandidateID(req, seqs),
