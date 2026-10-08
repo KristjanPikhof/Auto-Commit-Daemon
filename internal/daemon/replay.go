@@ -2082,6 +2082,15 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		}
 		return pending[:n], false, "", nil
 	}
+	if cfg.candidateMode && len(cfg.targetEventSeqs) == 0 {
+		due, err := dueIntentSemanticReviewWindow(ctx, db, pending, cfg.window, time.Now().UTC())
+		if err != nil {
+			return nil, false, "", err
+		}
+		if len(due) > 0 {
+			return due, false, "", nil
+		}
+	}
 	var (
 		forcedEvent  state.CaptureEvent
 		forcedState  state.PlannerState
@@ -2155,6 +2164,15 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	if !cfg.bypassBatchWait && !boundaryTriggered {
 		if waitReason := intentBatchWaitReason(pending, cfg, time.Now()); waitReason != "" {
 			return nil, false, waitReason, nil
+		}
+	}
+	if cfg.candidateMode && len(cfg.targetEventSeqs) == 0 && pending[0].BranchRef != "" {
+		fresh, err := freshIntentWindowAfterHeldGoal(ctx, db, pending, cfg.window)
+		if err != nil {
+			return nil, false, "", err
+		}
+		if len(fresh) > 0 {
+			return fresh, false, "", nil
 		}
 	}
 	n := cfg.window
