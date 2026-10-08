@@ -76,8 +76,10 @@ func BuildHistoryRewriteUserPrompt(req HistoryRewritePlanRequest) (string, error
 	if len(body) > HistoryRewriteRequestByteCap {
 		return "", fmt.Errorf("history rewrite plan: request is %d bytes; maximum is %d bytes; select a smaller commit range", len(body), HistoryRewriteRequestByteCap)
 	}
-	return "Group these existing commits into a smaller semantic history.\n" +
+	return "Reconstruct purposeful commits from this existing history. Do not target a smaller commit count.\n" +
 		"Return every old_oid exactly once, in the same chronological order, using contiguous groups only. Separate unrelated work even when it touches the same file. Never group commits with different author_name or author_email values.\n" +
+		purposefulCommitGroupingInstructions + "\n" +
+		"The supplied historical commits are the capture units for this request. Contiguous grouping cannot split a mixed existing commit or move interleaved goals; preserve those boundaries rather than hide unrelated goals in a broad squash. Judge the net change of each group, including corrections that cancel earlier edits, and describe that completed change in its message.\n" +
 		"Return one evidence-grounded subject, body, and grouping_reason per group. Do not invent behavior not supported by the evidence.\n" +
 		CommitMessageFormatInstructions(req.CommitFormat) + "\n" + string(body), nil
 }

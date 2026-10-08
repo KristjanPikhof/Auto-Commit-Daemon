@@ -107,6 +107,8 @@ const purposefulCommitGroupingInstructions = "Identify the distinct goals in the
 	"Preserve supplied capture units, offered-sequence limits, and frozen targets; never invent intermediate file versions or pull in later captures to finish a group. " +
 	"Do not invent hypothetical companions. Identify actual missing dependencies from the supplied evidence; age and queue pressure do not prove completeness or waive safety checks. " +
 	"Assess each intermediate commit using its proposed contents and prerequisites, not the final combined worktree. " +
+	"Write the subject and body after fixing membership, from the net change between that commit's parent and proposed tree; omit reverted edits and incidental save history. " +
+	"A filename, symbol, or '<filename> code changes' does not establish a completed goal. If the supplied evidence cannot explain the goal, keep its captures waiting with a concrete reason instead of publishing a generic message. " +
 	"Prefer a few meaningful steps over save-by-save commits or one group containing unrelated purposes; do not target a fixed commit count. " +
 	"Examples: group a menu-state implementation, its tests, and an assertion correction as one change; group a placement document with its index link; group the same model-row presentation improvement across screens when those edits serve one goal. "
 

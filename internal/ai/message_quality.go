@@ -250,16 +250,26 @@ var genericSubjectPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^(update|change|modify|fix|adjust|improve|refactor)\s+(file|files|stuff|things|changes|code|content|logic|data)$`),
 	regexp.MustCompile(`(?i)^(wip|changes|misc|miscellaneous|updates?)$`),
 	regexp.MustCompile(`(?i)^update\s+\d+\s+files?(?:\s+in\s+.+)?$`),
+	regexp.MustCompile(`(?i)^(add|remove|rename|update|fix|refactor|modify|change)\s+.+\s+(code|test|documentation|configuration|asset)\s+changes$`),
 }
 
 func isGenericSubject(subject string) bool {
-	subject = strings.TrimSpace(subject)
+	subject = strings.TrimSpace(subjectTailForQuality(subject))
 	for _, re := range genericSubjectPatterns {
 		if re.MatchString(subject) {
 			return true
 		}
 	}
 	return false
+}
+
+// Conventional subjects use the same semantic quality bar as imperative ones.
+func subjectTailForQuality(subject string) string {
+	if prefix, rest, ok := strings.Cut(subject, ":"); ok &&
+		!strings.ContainsAny(prefix, " /\\") {
+		return strings.TrimSpace(rest)
+	}
+	return subject
 }
 
 func isFilenameOnlySubject(subject string, paths map[string]struct{}) bool {
