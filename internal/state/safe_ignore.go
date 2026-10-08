@@ -29,6 +29,7 @@ var DefaultSafeIgnorePatterns = []string{
 	"target/",
 	"DerivedData/",
 	".derivedData*/",
+	"-Xcc/",
 	".venv/",
 	"venv/",
 	"__pycache__/",

@@ -888,6 +888,10 @@ func ResumePublicationDrainCheckpointing(
 	drain state.PublicationDrain,
 	now time.Time,
 ) (state.PublicationDrain, error) {
+	recheckingProviderWait, err := publicationDrainTransportWait(ctx, db, drain, now)
+	if err != nil {
+		return drain, err
+	}
 	recheckingHeadAdvance := drain.Phase == state.PublicationDrainNeedsAction &&
 		publicationDrainReason(drain) == publicationReasonHeadChanged
 	recheckingRecoveredTarget := drain.Phase == state.PublicationDrainNeedsAction &&
@@ -896,12 +900,12 @@ func ResumePublicationDrainCheckpointing(
 		publicationDrainReason(drain) == publicationReasonSemanticUnavailable
 	if drain.Phase != state.PublicationDrainCheckpointing &&
 		!recheckingHeadAdvance && !recheckingRecoveredTarget &&
-		!recheckingSemanticMessage {
+		!recheckingSemanticMessage && !recheckingProviderWait {
 		return drain, nil
 	}
 	fail := func(reason error) (state.PublicationDrain, error) {
 		if recheckingHeadAdvance || recheckingRecoveredTarget ||
-			recheckingSemanticMessage {
+			recheckingSemanticMessage || recheckingProviderWait {
 			return drain, nil
 		}
 		nowTS := float64(now.UnixNano()) / 1e9
@@ -979,7 +983,7 @@ func ResumePublicationDrainCheckpointing(
 		return fail(err)
 	}
 	if recheckingHeadAdvance || recheckingRecoveredTarget ||
-		recheckingSemanticMessage {
+		recheckingSemanticMessage || recheckingProviderWait {
 		nowTS := float64(now.UnixNano()) / 1e9
 		if nowTS < drain.UpdatedTS {
 			nowTS = drain.UpdatedTS
@@ -992,6 +996,7 @@ func ResumePublicationDrainCheckpointing(
 		recheckingHeadAdvance = false
 		recheckingRecoveredTarget = false
 		recheckingSemanticMessage = false
+		recheckingProviderWait = false
 	}
 	if drain.StagedConsent && !drain.StagedConsumed {
 		if err := gitpkg.ConsumeApprovedIndex(ctx, repoRoot, drain.ExpectedIndexDigest, currentHeadText); err != nil {
@@ -1006,6 +1011,58 @@ func ResumePublicationDrainCheckpointing(
 	update.Phase = state.PublicationDrainSemantic
 	update.StagedConsumed = drain.StagedConsent
 	return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
+}
+
+// Legacy drains lost the typed circuit wait when a bounded fallback deferred
+// its whole group. Match the persisted transport failure, not its display text,
+// before allowing the normal checkpoint and branch proofs to run again.
+func publicationDrainTransportWait(ctx context.Context, db *state.DB, drain state.PublicationDrain, now time.Time) (bool, error) {
+	if drain.Phase != state.PublicationDrainNeedsAction || drain.ReasonCode != "" ||
+		drain.CommitStrategy != string(ai.CommitStrategyIntent) || drain.LastError == "" ||
+		!validIntentPlannerHealthFingerprint(drain.ProviderFingerprint) {
+		return false, nil
+	}
+	raw, found, err := state.MetaGet(ctx, db, MetaKeyIntentPlannerHealth)
+	if err != nil || !found {
+		return false, err
+	}
+	health, err := DecodeIntentPlannerHealthSnapshot(raw)
+	if err != nil {
+		return false, nil
+	}
+	return health.State == IntentPlannerCircuitOpen &&
+		health.LastFailureClass == IntentPlannerFailureTransport &&
+		health.ProviderFingerprint == drain.ProviderFingerprint &&
+		health.LastError == ai.SanitizePlannerError(drain.LastError) &&
+		health.LastFailureTS >= drain.LastProgressTS &&
+		health.NextProbeTS > 0 &&
+		health.NextProbeTS <= float64(now.UnixNano())/1e9, nil
+}
+
+func RecoverTransportWaitPublicationDrain(ctx context.Context, repo string, db *state.DB, drain state.PublicationDrain, now time.Time) (*state.PublicationDrain, error) {
+	wait, err := publicationDrainTransportWait(ctx, db, drain, now)
+	if err != nil || !wait {
+		return nil, err
+	}
+	counts, err := publicationDrainCountsForTarget(ctx, db, drain.EventSeqs)
+	if err != nil || counts.terminal != 0 {
+		return nil, err
+	}
+	var active int
+	if err := db.ReadSQL().QueryRowContext(ctx, `SELECT
+ EXISTS(SELECT 1 FROM self_publications WHERE branch_ref=? AND branch_generation=? AND phase IN ('prepared','git_applied'))
+ OR EXISTS(SELECT 1 FROM intent_repairs WHERE branch_ref=? AND branch_generation=? AND status IN ('prepared','git_applied'))`,
+		drain.BranchRef, drain.BranchGeneration, drain.BranchRef, drain.BranchGeneration).Scan(&active); err != nil {
+		return nil, err
+	}
+	if active != 0 {
+		return nil, nil
+	}
+	resumed, err := ResumePublicationDrainCheckpointing(ctx, repo, db, drain, now)
+	if err != nil || resumed.Phase == state.PublicationDrainNeedsAction {
+		return nil, err
+	}
+	return &resumed, nil
 }
 
 func publicationDrainOwnsHeadAdvance(
