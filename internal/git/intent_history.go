@@ -25,6 +25,69 @@ type IntentHistoryUnit struct {
 	After  TreeEntry
 }
 
+type IntentHistoryRenamePair struct {
+	OldOID     string
+	BeforePath string
+	AfterPath  string
+}
+
+// ReadIntentHistoryRenamePairs retains Git's recorded similarity evidence for
+// delete/create units, including renames with edits. Both sides must remain in
+// one goal; treating them as independent changes can create invalid history.
+func ReadIntentHistoryRenamePairs(ctx context.Context, repoDir string, chain []string) ([]IntentHistoryRenamePair, error) {
+	if len(chain) == 0 || len(chain) > MaxIntentHistoryCommits {
+		return nil, errors.New("git intent history: invalid rename evidence range")
+	}
+	var pairs []IntentHistoryRenamePair
+	for _, oid := range chain {
+		out, err := RunWithLimit(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, DefaultDiffCap, "diff-tree", "--root", "--no-commit-id", "--raw", "--no-abbrev", "--find-renames=50%", "-r", "-z", oid, "--")
+		if err != nil {
+			return nil, err
+		}
+		records := bytes.Split(out, []byte{0})
+		for i := 0; i < len(records) && len(records[i]) != 0; {
+			fields := strings.Fields(strings.TrimPrefix(string(records[i]), ":"))
+			if len(fields) != 5 || i+1 >= len(records) {
+				return nil, errors.New("git intent history: malformed rename evidence")
+			}
+			if strings.HasPrefix(fields[4], "R") {
+				if i+2 >= len(records) {
+					return nil, errors.New("git intent history: missing rename target")
+				}
+				pairs = append(pairs, IntentHistoryRenamePair{OldOID: oid, BeforePath: string(records[i+1]), AfterPath: string(records[i+2])})
+				i += 3
+			} else {
+				i += 2
+			}
+			if len(pairs) > MaxIntentHistoryUnits {
+				return nil, errors.New("git intent history: rename evidence limit exceeded")
+			}
+		}
+	}
+	return pairs, nil
+}
+
+// IntentHistoryBaseTree supports an initial commit without assuming SHA-1.
+// Materialization already creates inert Git objects; this writes only the
+// canonical empty tree when the selected range begins at the root commit.
+func IntentHistoryBaseTree(ctx context.Context, repoDir, oldestOID string) (string, error) {
+	parents, err := parentsOf(ctx, repoDir, oldestOID)
+	if err != nil {
+		return "", err
+	}
+	if len(parents) > 1 {
+		return "", errors.New("git intent history: merge has no single reconstruction base")
+	}
+	if len(parents) == 1 {
+		return RevParse(ctx, repoDir, parents[0]+"^{tree}")
+	}
+	out, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultWriteTimeout}, "hash-object", "-w", "-t", "tree", "--stdin")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // ReadIntentHistoryUnits extracts exact before/after versions from a linear
 // oldest-to-newest chain. Renames are represented by deletion and creation;
 // planners must keep their dependencies together. Reads and output are bounded.
@@ -101,6 +164,8 @@ func MaterializeIntentHistoryUnits(ctx context.Context, repoDir, baseTree string
 		return nil, errors.New("git intent history: invalid materialization input")
 	}
 	available := make(map[IntentHistoryUnit]bool, len(original))
+	var oldChain []string
+	oldSeen := make(map[string]struct{})
 	for _, unit := range original {
 		if _, exists := available[unit]; exists {
 			return nil, errors.New("git intent history: duplicate original transition")
@@ -109,8 +174,13 @@ func MaterializeIntentHistoryUnits(ctx context.Context, repoDir, baseTree string
 			return nil, err
 		}
 		available[unit] = false
+		if _, seen := oldSeen[unit.OldOID]; !seen {
+			oldSeen[unit.OldOID] = struct{}{}
+			oldChain = append(oldChain, unit.OldOID)
+		}
 	}
-	for _, group := range groups {
+	owners := make(map[string]int, len(original))
+	for groupIndex, group := range groups {
 		if len(group) == 0 {
 			return nil, errors.New("git intent history: empty goal")
 		}
@@ -120,11 +190,23 @@ func MaterializeIntentHistoryUnits(ctx context.Context, repoDir, baseTree string
 				return nil, errors.New("git intent history: fabricated or multiply owned transition")
 			}
 			available[unit] = true
+			owners[unit.OldOID+"\x00"+unit.Path] = groupIndex
 		}
 	}
 	for _, used := range available {
 		if !used {
 			return nil, errors.New("git intent history: unowned original transition")
+		}
+	}
+	pairs, err := ReadIntentHistoryRenamePairs(ctx, repoDir, oldChain)
+	if err != nil {
+		return nil, err
+	}
+	for _, pair := range pairs {
+		before, hasBefore := owners[pair.OldOID+"\x00"+pair.BeforePath]
+		after, hasAfter := owners[pair.OldOID+"\x00"+pair.AfterPath]
+		if hasBefore != hasAfter || hasBefore && before != after {
+			return nil, fmt.Errorf("git intent history: rename %q to %q must remain in one goal", pair.BeforePath, pair.AfterPath)
 		}
 	}
 	dir, err := os.MkdirTemp("", "acd-intent-history-index-")

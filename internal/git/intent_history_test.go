@@ -200,3 +200,76 @@ func TestIntentHistoryReconstructionRejectsCrossAuthorGoal(t *testing.T) {
 		t.Fatal("cross-author goal created a branch")
 	}
 }
+
+func TestIntentHistoryUnitsKeepEditedRenameTogether(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	before := commitWorktreePath(t, ctx, repo, "before.txt", "first stable line\nsecond stable line\nthird stable line\nfourth old line\n", "Add source")
+	if err := os.Rename(filepath.Join(repo, "before.txt"), filepath.Join(repo, "after.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "after.txt"), []byte("first stable line\nsecond stable line\nthird stable line\nfourth corrected line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, RunOpts{Dir: repo}, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, RunOpts{Dir: repo}, "commit", "-q", "-m", "Move and correct source"); err != nil {
+		t.Fatal(err)
+	}
+	head, err := RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	units, err := ReadIntentHistoryUnits(ctx, repo, []string{head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairs, err := ReadIntentHistoryRenamePairs(ctx, repo, []string{head})
+	if err != nil || len(pairs) != 1 || pairs[0].BeforePath != "before.txt" || pairs[0].AfterPath != "after.txt" {
+		t.Fatalf("rename evidence=%+v err=%v", pairs, err)
+	}
+	base, err := IntentHistoryBaseTree(ctx, repo, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, _ := RevParse(ctx, repo, before+"^{tree}"); base != want {
+		t.Fatalf("base=%s want=%s", base, want)
+	}
+	if _, err := MaterializeIntentHistoryUnits(ctx, repo, base, units, [][]IntentHistoryUnit{{units[0]}, {units[1]}}); err == nil || !strings.Contains(err.Error(), "must remain in one goal") {
+		t.Fatalf("split edited rename err=%v", err)
+	}
+	if _, err := MaterializeIntentHistoryUnits(ctx, repo, base, units, [][]IntentHistoryUnit{units}); err != nil {
+		t.Fatalf("complete edited rename refused: %v", err)
+	}
+}
+
+func TestIntentHistoryReconstructionIncludesRootCommit(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	head := commitWorktreePath(t, ctx, repo, "root.txt", "root content\n", "Initialize behavior")
+	base, err := IntentHistoryBaseTree(ctx, repo, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	units, err := ReadIntentHistoryUnits(ctx, repo, []string{head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trees, err := MaterializeIntentHistoryUnits(ctx, repo, base, units, [][]IntentHistoryUnit{units})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := IntentHistoryReconstructionOptions{SourceBranchRef: "refs/heads/main", TargetBranchRef: "refs/heads/reconstructed-root", ExpectedHead: head, OldChain: []string{head}, PlanID: "root-plan", Replacements: []IntentRepairReplacement{{Replaces: []string{head}, TreeOID: trees[0], Message: "Initialize complete behavior\n\n- Preserve the original initial source"}}}
+	result, err := ApplyIntentHistoryReconstruction(ctx, repo, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parents, err := parentsOf(ctx, repo, result.NewHead)
+	if err != nil || len(parents) != 0 {
+		t.Fatalf("root parents=%v err=%v", parents, err)
+	}
+	if recovered, err := ApplyIntentHistoryReconstruction(ctx, repo, options); err != nil || recovered.NewHead != result.NewHead {
+		t.Fatalf("root recovery=%+v err=%v", recovered, err)
+	}
+}
