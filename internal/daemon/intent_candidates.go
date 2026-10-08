@@ -297,6 +297,15 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	if input.IncludeDiffs && input.RepoPath != "" {
+		bySeq := map[int64]IntentCandidateCapture{}
+		for _, capture := range allCaptures {
+			bySeq[capture.Event.Seq] = capture
+		}
+		for i := range input.Captures {
+			input.Captures[i].CapturedDiff = bySeq[input.Captures[i].Event.Seq].CapturedDiff
+		}
+	}
 	input.Hints = append(input.Hints, runtimeIntentDependencyHints(allCaptures)...)
 	if len(input.RecentSoftCommits) == 0 {
 		input.RecentSoftCommits = recentIntentSoftCommitSummaries(
