@@ -127,8 +127,9 @@ func TestReplayIntentMetadataPreservesPerCaptureTruncation(t *testing.T) {
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatal(err)
 	}
+	const largeLine = "Changed documentation text.\n"
 	contents := map[string]string{
-		"large.md":    strings.Repeat("Changed documentation text.\n", ai.IntentStageDiffCap),
+		"large.md":    strings.Repeat(largeLine, ai.IntentStageDiffCap/len(largeLine)+1),
 		"redacted.md": "token = \"" + strings.Repeat("a", ai.IntentStageDiffCap*2) + "\"\nRemaining documentation.\n",
 		"small.md":    "Small documentation update.\n",
 	}
