@@ -354,8 +354,7 @@ WHERE path IN ('singleton-one.txt','singleton-two.txt') AND state='pending'`); g
 	if err := stopIntentTestWorker(t, fullEnv, repo, "intent-singleton-circuit"); err != nil {
 		t.Fatal(err)
 	}
-	startSession(t, ctx, env, repo, "intent-singleton-circuit", "shell", extra...)
-	waitMode(t, repo, "running", 5*time.Second)
+	restartOutageTestSession(t, ctx, fullEnv, repo, "intent-singleton-circuit", "shell")
 	wakeSession(t, ctx, fullEnv, repo, "intent-singleton-circuit")
 	assertOutageStatusAndList(t, ctx, fullEnv, repo, 2)
 	after := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
@@ -367,8 +366,7 @@ WHERE path IN ('singleton-one.txt','singleton-two.txt') AND state='pending'`); g
 	}
 	makeOutageProbeDue(t, repo)
 	available.Store(true)
-	startSession(t, ctx, env, repo, "intent-singleton-circuit", "shell", extra...)
-	waitMode(t, repo, "running", 5*time.Second)
+	restartOutageTestSession(t, ctx, fullEnv, repo, "intent-singleton-circuit", "shell")
 	wakeSession(t, ctx, fullEnv, repo, "intent-singleton-circuit")
 	for path, body := range map[string]string{"singleton-one.txt": "one\n", "singleton-two.txt": "two\n"} {
 		waitForEventState(t, dbPath, path, "published", 15*time.Second)
@@ -390,6 +388,15 @@ func makeOutageProbeDue(t *testing.T, repo string) {
 	t.Helper()
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	sqliteExec(t, dbPath, fmt.Sprintf(`UPDATE daemon_meta SET value=json_set(value,'$.next_probe_ts',%d) WHERE key='intent.planner.health'`, time.Now().Unix()-1))
+}
+
+func restartOutageTestSession(t *testing.T, ctx context.Context, env []string, repo, session, harness string) {
+	t.Helper()
+	result := runAcd(t, ctx, env, "start", "--repo", repo, "--session-id", session, "--harness", harness, "--json")
+	if result.ExitCode != 0 {
+		t.Fatalf("restart outage worker: %s %s", result.Stdout, result.Stderr)
+	}
+	waitMode(t, repo, "running", 5*time.Second)
 }
 
 func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, repo string, pending int) {
@@ -416,35 +423,40 @@ func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, 
 		if command == "status" {
 			args = append(args, "--repo", repo)
 		}
-		result := runAcd(t, ctx, env, args...)
-		if result.ExitCode != 0 {
-			t.Fatalf("%s: %s %s", command, result.Stdout, result.Stderr)
-		}
-		var payload struct {
-			Data json.RawMessage `json:"data"`
-		}
-		if err := json.Unmarshal([]byte(result.Stdout), &payload); err != nil {
-			t.Fatal(err)
-		}
 		var got snapshot
-		if command == "status" {
-			if err := json.Unmarshal(payload.Data, &got); err != nil {
-				t.Fatal(err)
+		var result ExecResult
+		waitFor(t, "stable "+command+" provider retry observation", 10*time.Second, func() bool {
+			result = runAcd(t, ctx, env, args...)
+			if result.ExitCode != 0 {
+				return false
 			}
-		} else {
-			var list struct {
-				Repos []snapshot `json:"repos"`
+			var payload struct {
+				Data json.RawMessage `json:"data"`
 			}
-			if err := json.Unmarshal(payload.Data, &list); err != nil {
-				t.Fatal(err)
+			if json.Unmarshal([]byte(result.Stdout), &payload) != nil {
+				return false
 			}
-			for _, row := range list.Repos {
-				if row.Repo == canonicalRepo {
-					got = row
-					break
+			got = snapshot{}
+			if command == "status" {
+				if json.Unmarshal(payload.Data, &got) != nil {
+					return false
+				}
+			} else {
+				var list struct {
+					Repos []snapshot `json:"repos"`
+				}
+				if json.Unmarshal(payload.Data, &list) != nil {
+					return false
+				}
+				for _, row := range list.Repos {
+					if row.Repo == canonicalRepo {
+						got = row
+						break
+					}
 				}
 			}
-		}
+			return got.Repo == canonicalRepo && got.Protected && got.Pending == pending && !got.ActionRequired && got.Progress.Phase == "provider_wait" && got.Progress.Remaining > 0 && got.Outcome.RetryAt > float64(time.Now().Unix())
+		})
 		if got.Repo != canonicalRepo || !got.Protected || got.Pending != pending || got.ActionRequired || got.Progress.Phase != "provider_wait" || got.Progress.Remaining <= 0 || got.Outcome.RetryAt <= float64(time.Now().Unix()) {
 			t.Fatalf("%s hid protected provider retry: %+v\n%s", command, got, result.Stdout)
 		}

@@ -243,7 +243,7 @@ func TestFlush_LogicalWaitsDuringProviderOutageAndRecovers(t *testing.T) {
 	}
 	makeOutageProbeDue(t, repo)
 	available.Store(true)
-	startSession(t, ctx, env, repo, sessionID, "claude-code")
+	restartOutageTestSession(t, ctx, env, repo, sessionID, "claude-code")
 	flushed := runAcd(t, ctx, env, "flush", "--repo", repo, "--session-id", sessionID, "--logical", "--json")
 	if flushed.ExitCode != 0 {
 		t.Fatalf("retry flush: %s %s", flushed.Stdout, flushed.Stderr)
