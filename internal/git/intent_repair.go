@@ -396,6 +396,7 @@ func validateIntentRepairReplacements(
 	allowCaptureRepartition bool,
 ) error {
 	var flattened []string
+	authors := make(map[string]map[string]string)
 	for i, replacement := range replacements {
 		if len(replacement.Replaces) == 0 || replacement.TreeOID == "" || strings.TrimSpace(replacement.Message) == "" {
 			return fmt.Errorf("git intent repair apply: replacement %d is incomplete", i)
@@ -410,6 +411,23 @@ func validateIntentRepairReplacements(
 		if replacement.AuthorOID != "" {
 			if _, err := RevParse(ctx, repoDir, replacement.AuthorOID+"^{commit}"); err != nil {
 				return fmt.Errorf("git intent repair apply: resolve replacement %d author: %w", i, err)
+			}
+		}
+		authorOID := replacement.AuthorOID
+		if authorOID == "" {
+			authorOID = replacement.Replaces[0]
+		}
+		for _, oid := range append(append([]string(nil), replacement.Replaces...), authorOID) {
+			if _, ok := authors[oid]; !ok {
+				identity, err := commitAuthorEnv(ctx, repoDir, oid)
+				if err != nil {
+					return err
+				}
+				authors[oid] = identity
+			}
+			identity, first := authors[oid], authors[replacement.Replaces[0]]
+			if identity["GIT_AUTHOR_NAME"] != first["GIT_AUTHOR_NAME"] || identity["GIT_AUTHOR_EMAIL"] != first["GIT_AUTHOR_EMAIL"] {
+				return fmt.Errorf("git intent repair apply: replacement %d crosses an author boundary", i)
 			}
 		}
 		flattened = append(flattened, replacement.Replaces...)
