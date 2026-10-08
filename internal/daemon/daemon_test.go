@@ -3182,7 +3182,9 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	hookDone := make(chan error, 1)
+	rollbackDone := make(chan struct{}, 1)
 	var hookOnce sync.Once
+	var rollbackOnce sync.Once
 	var wg sync.WaitGroup
 	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
 	defer releaseCheck()
@@ -3199,6 +3201,9 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 					_, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/main")
 					hookDone <- err
 				})
+			},
+			afterBranchTransitionRollback: func() {
+				rollbackOnce.Do(func() { rollbackDone <- struct{}{} })
 			},
 		})
 	}()
@@ -3219,8 +3224,11 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("branch transition hook did not run")
 	}
-	wakeCh <- struct{}{}
-	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-rollbackDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("branch transition rollback did not finish")
+	}
 	gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
 	if gen != "1" {
 		t.Fatalf("branch generation=%q want 1 after rollback", gen)
