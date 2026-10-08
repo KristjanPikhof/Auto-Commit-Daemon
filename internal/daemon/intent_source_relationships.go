@@ -101,7 +101,7 @@ func intentSourceReferenceContext(sourcePath, recordedContents string, offeredPa
 				opaqueEnd = ")"
 				continue
 			}
-			words := intentReferenceWords.FindAllStringIndex(line, -1)
+			words := intentReferenceWords.FindAllStringIndex(line, 128)
 			first := 0
 			for first < len(words) && intentReferenceAssign.MatchString(line[words[first][0]:words[first][1]]) {
 				first++
@@ -119,8 +119,8 @@ func intentSourceReferenceContext(sourcePath, recordedContents string, offeredPa
 			}
 			continue
 		}
-		quoted := intentSourceQuoted.FindAllStringIndex(line, -1)
-		for _, match := range intentReferencePython.FindAllStringSubmatchIndex(line, -1) {
+		quoted := intentSourceQuoted.FindAllStringIndex(line, 128)
+		for _, match := range intentReferencePython.FindAllStringSubmatchIndex(line, 128) {
 			inside := false
 			for _, span := range quoted {
 				inside = inside || (span[0] < match[0] && match[0] < span[1])
