@@ -76,6 +76,7 @@ func TestIntentProviderOutageRetriesAcrossRestartAndPreservesLaterCaptures(t *te
 		IntentPlanner: planner, IntentHealth: health, IntentPreset: config.PresetBalanced,
 		IntentPlannerProvider: planner.Name(), IntentWindow: 20, IntentMinPending: 1,
 		IntentBypassBatchWait: true, PublicationDrain: &drain,
+		IntentVerificationMode: "structural",
 	}
 	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	assertIntentProviderWait(t, first, err)
@@ -139,7 +140,9 @@ func TestIntentProviderOutageRetriesAcrossRestartAndPreservesLaterCaptures(t *te
 			}
 		} else {
 			if err != nil || summary.Published != 1 || summary.Failed != 0 {
-				t.Fatalf("reconnection failed to publish: %+v err=%v", summary, err)
+				candidates, _ := state.IntentCandidatesForPair(ctx, f.db,
+					f.cctx.BranchRef, f.cctx.BranchGeneration, 20)
+				t.Fatalf("reconnection failed to publish: %+v candidates=%+v err=%v", summary, candidates, err)
 			}
 			f.cctx.BaseHead = summary.BaseHead
 		}

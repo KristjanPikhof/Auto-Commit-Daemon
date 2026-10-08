@@ -10,6 +10,7 @@ func TestIntentBaselineMessageWaitDoesNotPreventUrgentProviderRequest(t *testing
 		CandidateID: "protected-offline-work", SelectedSeqs: []int64{1},
 		Purpose:           "retain dependency component until its goal is known",
 		Readiness:         IntentCandidateWait,
+		GroupingReason:    "retain the protected capture until its purpose is established",
 		MissingCompanions: []string{"captured evidence needs a meaningful goal message"},
 	}
 	req := IntentPlanRequestV2{

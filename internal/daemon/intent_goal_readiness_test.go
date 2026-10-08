@@ -10,6 +10,15 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+func assertIntentCandidateProtectedGoalWait(t *testing.T, decision IntentCandidateDecision) {
+	t.Helper()
+	if decision.Publishable || decision.Candidate.Status != state.IntentCandidateWaiting ||
+		decision.Assignment.Readiness != ai.IntentCandidateWait || decision.Assignment.Subject != "" ||
+		!strings.Contains(strings.Join(decision.Assignment.MissingCompanions, " "), "goal") {
+		t.Fatalf("capture without semantic evidence was not retained for goal planning: %+v", decision)
+	}
+}
+
 func TestIntentGoalReadinessRequiresGroundedRelationships(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

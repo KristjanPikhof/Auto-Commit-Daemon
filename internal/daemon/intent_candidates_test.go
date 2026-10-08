@@ -690,7 +690,7 @@ func TestIntentCandidateEngineBoundedFallbackAfterOneCorrection(t *testing.T) {
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{capture}, Planner: planner,
 		IncludeDiffs: true,
-		RetryLimit: 99, RetryLimitSet: true, Preset: config.PresetBalanced,
+		RetryLimit:   99, RetryLimitSet: true, Preset: config.PresetBalanced,
 		VerificationMode: "structural",
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
 			return nil
@@ -1120,8 +1120,8 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.ResolutionMode != "evidence_partition" || len(second.Decisions) != 1 || !second.Decisions[0].Publishable || planner.calls != 1 {
-		t.Fatalf("offline plan reuse=%+v calls=%d", second, planner.calls)
+	if second.ResolutionMode != "waiting_for_ai" || len(second.Decisions) != 0 || second.PlanAttempt != 0 || second.NeedsAttention || planner.calls != 1 {
+		t.Fatalf("offline retry wait=%+v calls=%d", second, planner.calls)
 	}
 
 	snapshot := health.Snapshot()
@@ -1135,8 +1135,8 @@ func TestIntentCandidateEngineReportsCircuitBypassWithoutReopening(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if forced.ResolutionMode != "evidence_partition" || forced.PlanAttempt != 0 ||
-		len(forced.Decisions) != 1 || !forced.Decisions[0].Publishable || forced.NeedsAttention {
+	if forced.ResolutionMode != "waiting_for_ai" || forced.PlanAttempt != 0 ||
+		len(forced.Decisions) != 0 || forced.NeedsAttention || planner.calls != 1 {
 		t.Fatalf("forced provider wait=%+v", forced)
 	}
 }
@@ -1956,7 +1956,7 @@ WHERE fingerprint=?`, string(raw), run.Fingerprint); err != nil {
 	}
 	if fallback == "" || failure == "" || !rebuilt.Completed ||
 		len(result.Candidates) != 1 ||
-		result.Candidates[0].Readiness != ai.IntentCandidateReady {
+		result.Candidates[0].Readiness != ai.IntentCandidateWait || len(result.Candidates[0].MissingCompanions) == 0 {
 		t.Fatalf("rebuilt fallback=%q failure=%q run=%+v plan=%+v",
 			fallback, failure, rebuilt, result)
 	}
@@ -2058,6 +2058,8 @@ func TestIntentCandidateEngineCorrectsDisconnectedMegaGroupWithBalancedFallback(
 	db := openIntentCandidateTestDB(t)
 	a := appendIntentCandidateCapture(t, db, "internal/a/a.go", "create", "", "a1")
 	b := appendIntentCandidateCapture(t, db, "internal/b/b.go", "create", "", "b1")
+	a.CapturedDiff = "+func ProtectExportArchive() {}\n"
+	b.CapturedDiff = "+func ProtectReminderAlert() {}\n"
 	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
@@ -2070,8 +2072,9 @@ func TestIntentCandidateEngineCorrectsDisconnectedMegaGroupWithBalancedFallback(
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{a, b}, Planner: planner,
-		Preset:      config.PresetBalanced,
-		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
+		IncludeDiffs: true,
+		Preset:       config.PresetBalanced,
+		Materialize:  func(context.Context, []IntentCandidateCapture) error { return nil },
 		Verify: func(
 			context.Context,
 			ai.IntentCandidateAssignment,
@@ -2144,8 +2147,10 @@ func TestIntentCandidateEngineAdvancesFastFallbackComponents(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
-	first := appendIntentCandidateCapture(t, db, "first.txt", "create", "", "a1")
-	second := appendIntentCandidateCapture(t, db, "second.txt", "create", "", "b1")
+	first := appendIntentCandidateCapture(t, db, "first.md", "create", "", "a1")
+	second := appendIntentCandidateCapture(t, db, "second.md", "create", "", "b1")
+	first.CapturedDiff = "+# Release checklist\n"
+	second.CapturedDiff = "+# Recovery walkthrough\n"
 	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
@@ -2158,7 +2163,7 @@ func TestIntentCandidateEngineAdvancesFastFallbackComponents(t *testing.T) {
 	evaluate := func(captures []IntentCandidateCapture) IntentCandidateEvaluationResult {
 		result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 			BranchRef: "refs/heads/main", BranchGeneration: 1,
-			Captures: captures, Planner: planner, Preset: config.PresetFast,
+			Captures: captures, Planner: planner, Preset: config.PresetFast, IncludeDiffs: true,
 			Materialize: func(context.Context, []IntentCandidateCapture) error {
 				return nil
 			},
@@ -2210,17 +2215,17 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	}{
 		{
 			name: "fast", preset: config.PresetFast,
-			wantFallback: "evidence_partition", wantReady: 2,
+			wantFallback: "evidence_partition", wantReady: 0,
 		},
 		{
 			name: "balanced", preset: config.PresetBalanced,
-			wantFallback: "evidence_partition", wantReady: 2,
-			wantVerifyCall: 2,
+			wantFallback: "evidence_partition", wantReady: 0,
+			wantVerifyCall: 0,
 		},
 		{
 			name: "quality", preset: config.PresetQuality,
-			wantFallback: "evidence_partition", wantReady: 2,
-			wantVerifyCall: 2,
+			wantFallback: "evidence_partition", wantReady: 0,
+			wantVerifyCall: 0,
 		},
 	} {
 		tc := tc
@@ -2251,6 +2256,7 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 			}
 			ready := 0
 			for _, decision := range result.Decisions {
+				assertIntentCandidateProtectedGoalWait(t, decision)
 				if decision.Publishable {
 					ready++
 				}
@@ -2264,7 +2270,7 @@ func TestIntentCandidateEnginePresetProviderFailurePolicies(t *testing.T) {
 	}
 }
 
-func TestIntentCandidateEngineModelWideFailureUsesLocalMessages(t *testing.T) {
+func TestIntentCandidateEngineModelWideFailureWaitsForProvider(t *testing.T) {
 	for _, preset := range []config.PresetName{
 		config.PresetFast,
 		config.PresetBalanced,
@@ -2294,9 +2300,9 @@ func TestIntentCandidateEngineModelWideFailureUsesLocalMessages(t *testing.T) {
 				t.Fatalf("EvaluateIntentCandidates: %v", err)
 			}
 			if planner.plannerCalls != 1 || planner.rewriteCalls != 0 ||
-				result.PlanAttempt != 0 || result.Fallback != "evidence_partition" ||
-				result.NeedsAttention || len(result.Decisions) != 2 || !result.Decisions[0].Publishable || !result.Decisions[1].Publishable {
-				t.Fatalf("provider outage must publish verified local groups without rewriting messages: %+v", result)
+				result.PlanAttempt != 0 || result.Fallback != "waiting_for_ai" ||
+				result.NeedsAttention || len(result.Decisions) != 0 {
+				t.Fatalf("provider outage must retain protected captures without fallback commits: %+v", result)
 			}
 		})
 	}
@@ -2500,7 +2506,8 @@ func TestIntentCandidateEngineFallbackContinuesPersistedDependent(t *testing.T) 
 		t.Fatalf("fallback result=%+v", result)
 	}
 	decision := result.Decisions[0]
-	if !decision.Publishable || decision.Candidate.ID != candidateID ||
+	assertIntentCandidateProtectedGoalWait(t, decision)
+	if decision.Publishable || decision.Candidate.ID != candidateID ||
 		len(decision.Candidate.Events) != 2 {
 		t.Fatalf("continued candidate=%+v", decision.Candidate)
 	}
@@ -2559,7 +2566,8 @@ func TestIntentCandidateEngineFallbackContinuesPersistedPrerequisite(t *testing.
 		t.Fatalf("fallback result=%+v", result)
 	}
 	decision := result.Decisions[0]
-	if !decision.Publishable || decision.Candidate.ID != candidateID ||
+	assertIntentCandidateProtectedGoalWait(t, decision)
+	if decision.Publishable || decision.Candidate.ID != candidateID ||
 		len(decision.Candidate.Events) != 2 {
 		t.Fatalf("continued fallback=%+v", decision)
 	}
@@ -2640,10 +2648,13 @@ func TestIntentCandidateEngineFallbackPreservesHardBridgeCommits(
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates hard bridge: %v", err)
 	}
+	if len(result.Decisions) > 0 {
+		assertIntentCandidateProtectedGoalWait(t, result.Decisions[0])
+	}
 	if result.Fallback != "evidence_partition" ||
 		result.ResolutionMode != "dependent_message_fallback" ||
 		result.NeedsAttention || len(result.Decisions) != 1 ||
-		!result.Decisions[0].Publishable {
+		result.Decisions[0].Publishable {
 		t.Fatalf("hard bridge result=%+v", result)
 	}
 	decision := result.Decisions[0]
@@ -2792,7 +2803,8 @@ func TestIntentCandidateEngineBalancedFallbackKeepsA1B1A2Atomic(
 	}
 	got := make([][]int64, 0, 2)
 	for _, decision := range result.Decisions {
-		if !decision.Publishable {
+		assertIntentCandidateProtectedGoalWait(t, decision)
+		if decision.Publishable {
 			t.Fatalf("fallback decision not publishable=%+v", decision)
 		}
 		got = append(got, decision.Assignment.SelectedSeqs)
@@ -2846,14 +2858,15 @@ func TestIntentCandidateEngineBalancedFallbackDoesNotMegaGroupWeakEvidence(
 		t.Fatal(err)
 	}
 	if len(result.Decisions) != len(captures) ||
-		materializeCalls != len(captures) ||
+		materializeCalls != 0 ||
 		result.NeedsAttention {
 		t.Fatalf("weak evidence fallback=%+v materialize=%d",
 			result, materializeCalls)
 	}
 	for _, decision := range result.Decisions {
+		assertIntentCandidateProtectedGoalWait(t, decision)
 		if len(decision.Assignment.SelectedSeqs) != 1 ||
-			!decision.Publishable {
+			decision.Publishable {
 			t.Fatalf("weak evidence created mega-group=%+v", decision)
 		}
 	}
@@ -2894,7 +2907,8 @@ func TestIntentCandidateEngineBalancedFallbackKeepsImportEvidenceSeparate(
 		t.Fatalf("import-only fallback=%+v", result)
 	}
 	for _, decision := range result.Decisions {
-		if !decision.Publishable ||
+		assertIntentCandidateProtectedGoalWait(t, decision)
+		if decision.Publishable ||
 			len(decision.Assignment.SelectedSeqs) != 1 {
 			t.Fatalf("import evidence merged fallback=%+v", decision)
 		}
@@ -2932,8 +2946,11 @@ func TestIntentCandidateEngineBalancedFallbackUsesUnambiguousTestCompanion(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(result.Decisions) > 0 {
+		assertIntentCandidateProtectedGoalWait(t, result.Decisions[0])
+	}
 	if result.NeedsAttention || len(result.Decisions) != 1 ||
-		!result.Decisions[0].Publishable ||
+		result.Decisions[0].Publishable ||
 		!reflect.DeepEqual(result.Decisions[0].Assignment.SelectedSeqs,
 			[]int64{source.Event.Seq, test.Event.Seq}) {
 		t.Fatalf("unambiguous test companion=%+v", result)
@@ -2988,7 +3005,8 @@ func TestIntentCandidateEngineBalancedFallbackPreservesPublishedTestCompanion(
 		t.Fatalf("fallback result=%+v", result)
 	}
 	decision := result.Decisions[0]
-	if !decision.Publishable ||
+	assertIntentCandidateProtectedGoalWait(t, decision)
+	if decision.Publishable ||
 		decision.Candidate.ID == "persisted-source" ||
 		!reflect.DeepEqual(
 			intentCandidateEventSeqs(decision.Candidate.Events),
@@ -3059,8 +3077,11 @@ func TestIntentCandidateEngineBalancedFallbackIgnoresPublishedCompanionAmbiguity
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates: %v", err)
 	}
+	if len(result.Decisions) > 0 {
+		assertIntentCandidateProtectedGoalWait(t, result.Decisions[0])
+	}
 	if result.NeedsAttention || len(result.Decisions) != 1 ||
-		!result.Decisions[0].Publishable {
+		result.Decisions[0].Publishable {
 		t.Fatalf("ambiguous persisted companion=%+v", result)
 	}
 }
@@ -3276,9 +3297,12 @@ func TestIntentCandidateEngineFallbackMergesCrossCandidateHardClosure(
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates hard closure: %v", err)
 	}
+	if len(result.Decisions) > 0 {
+		assertIntentCandidateProtectedGoalWait(t, result.Decisions[0])
+	}
 	if len(result.Decisions) != 1 ||
 		result.Decisions[0].Candidate.ID != "closure-left" ||
-		!result.Decisions[0].Publishable ||
+		result.Decisions[0].Publishable ||
 		len(result.Decisions[0].Candidate.Events) != 5 {
 		t.Fatalf("cross-candidate hard closure=%+v", result)
 	}
@@ -3465,10 +3489,13 @@ func testIntentCandidateFallbackMergesThroughPersistedCandidate(
 	if err != nil {
 		t.Fatalf("EvaluateIntentCandidates: %v", err)
 	}
+	if len(result.Decisions) > 0 {
+		assertIntentCandidateProtectedGoalWait(t, result.Decisions[0])
+	}
 	if len(result.Decisions) != 1 ||
 		result.Decisions[0].Candidate.ID != candidateID ||
 		len(result.Decisions[0].Candidate.Events) != 4 ||
-		!result.Decisions[0].Publishable {
+		result.Decisions[0].Publishable {
 		t.Fatalf("merged fallback=%+v", result)
 	}
 }

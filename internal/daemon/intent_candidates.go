@@ -1329,9 +1329,6 @@ func chooseIntentCandidatePlan(
 			_ = health.Complete(ctx, permit, nil)
 		}
 	}()
-	providerCtx := ctx
-	cancelProvider := func() {}
-	defer func() { cancelProvider() }()
 	if planner != nil && !skipSemanticPlanning {
 		// Cooldown is not provider work. Claim the due probe before starting
 		// its bounded correction cycle, so even an hour-long outage can resume.
@@ -1340,8 +1337,8 @@ func chooseIntentCandidatePlan(
 			if circuit.State != IntentPlannerCircuitClosed &&
 				circuit.LastFailureClass == IntentPlannerFailureTransport &&
 				run.ProviderDeadlineTS > 0 {
-				run.ProviderDeadlineTS = 0
-				if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+				run, err = persistIntentProviderWait(ctx, db, run, req)
+				if err != nil {
 					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 				}
 			}
@@ -1367,7 +1364,8 @@ func chooseIntentCandidatePlan(
 				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 			}
 		}
-		providerCtx, cancelProvider = context.WithDeadline(ctx, time.Unix(0, int64(run.ProviderDeadlineTS*1e9)))
+		providerCtx, cancelProvider := context.WithDeadline(ctx, time.Unix(0, int64(run.ProviderDeadlineTS*1e9)))
+		defer cancelProvider()
 		var previousSignature string
 		for {
 			if providerCtx.Err() != nil {
@@ -2908,6 +2906,7 @@ func deterministicIntentCandidatePlan(
 	includeSemantic bool,
 	onlySmallestReady bool,
 ) ai.IntentPlanV2 {
+	req.Dependencies = groundedIntentRequestDependencies(req)
 	components := intentDependencyComponents(req, includeSemantic)
 	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}
 	for i, seqs := range components {
@@ -2939,6 +2938,7 @@ func deterministicIntentCandidatePlan(
 func balancedIntentCandidatePlan(
 	req ai.IntentPlanRequestV2,
 ) (ai.IntentPlanV2, bool) {
+	req.Dependencies = groundedIntentRequestDependencies(req)
 	hardComponents := intentDependencyComponents(req, false)
 	componentBySeq := make(map[int64]int, len(req.OfferedCaptures))
 	for component, seqs := range hardComponents {

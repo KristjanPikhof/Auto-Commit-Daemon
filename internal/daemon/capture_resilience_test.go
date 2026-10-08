@@ -225,7 +225,7 @@ func TestCaptureResilienceProviderTimeoutWaitsAndRetries(t *testing.T) {
 	db := openIntentCandidateTestDB(t)
 	planner := &blockingSemanticPlanner{entered: make(chan ai.IntentPlanRequestV2, 2), release: make(chan struct{})}
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "independent.md", Op: "create"}}}
-	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, ProviderBudget: 200 * time.Millisecond}
+	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, ProviderBudget: time.Second}
 	clock := newIntentHealthClock()
 	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: IntentPlannerProviderIdentity{Provider: planner.Name()}, Now: clock.Now})
 	started := time.Now()
