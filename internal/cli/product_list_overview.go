@@ -450,20 +450,16 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		(report.PendingEvents > 0 || report.SelfPublication.Phase == "active" ||
 			(report.PublicationDrain.ID != "" && report.PublicationDrain.Phase != state.PublicationDrainCompleted && report.PublicationDrain.Phase != state.PublicationDrainNeedsAction) ||
 			report.Configuration.Configuration == "validating")
-	report.OperationalState = statusOperationalStateWithDaemonAlive(*report,
-		report.Daemon == "running" && report.PID > 0 && !report.Stale)
 	report.PublicationProgress, err = buildPublicationProgressReport(
 		ctx, conn, *report, now)
 	if err != nil {
 		return overview, err
 	}
-	if report.PublicationProgress.Phase == "goal_review_wait" {
-		report.OperationalState = "waiting"
-	}
 	if report.PublicationProgress.Phase == "history_reconstruction" {
 		report.Busy = true
-		report.OperationalState = statusOperationalStateWithDaemonAlive(*report, report.Daemon == "running" && report.PID > 0 && !report.Stale)
 	}
+	report.OperationalState = statusOperationalStateWithDaemonAlive(*report,
+		report.Daemon == "running" && report.PID > 0 && !report.Stale)
 	if raw, _, err := metaLookup(ctx, conn, state.RewritePIDMetaKey); err != nil {
 		return overview, err
 	} else if raw != "" {

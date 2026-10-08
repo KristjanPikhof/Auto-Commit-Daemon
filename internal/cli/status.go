@@ -505,7 +505,6 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 				report.PublicationDrain.Phase != state.PublicationDrainCompleted &&
 				report.PublicationDrain.Phase != state.PublicationDrainNeedsAction) ||
 			report.Configuration.Configuration == "validating")
-	report.OperationalState = statusOperationalState(report)
 	progress, err := buildPublicationProgressReport(ctx, conn, report, now)
 	if err != nil {
 		return report, fmt.Errorf("publication progress: %w", err)
@@ -513,8 +512,8 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 	report.PublicationProgress = progress
 	if progress.Phase == "history_reconstruction" {
 		report.Busy = true
-		report.OperationalState = statusOperationalState(report)
 	}
+	report.OperationalState = statusOperationalState(report)
 	report.PublicationOutcome.ReasonCode = progress.Phase
 	if health := report.IntentStrategy.PlannerHealth; health != nil &&
 		health.State == daemon.IntentPlannerCircuitOpen && health.NextProbeTS > 0 {
@@ -523,7 +522,6 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 
 	if progress.Phase == "goal_review_wait" {
 		report.PublicationOutcome.RetryAt = progress.RetryAtTS
-		report.OperationalState = statusOperationalState(report)
 	}
 
 	return report, nil
@@ -765,6 +763,10 @@ func buildPublicationProgressReport(
 		if progress.LastProgressTS == 0 {
 			progress.LastProgressAgeSeconds = 0
 		}
+	}
+	if health := report.IntentStrategy.PlannerHealth; health != nil &&
+		progress.Phase == "provider_wait" && health.State == daemon.IntentPlannerCircuitOpen {
+		progress.RetryAtTS = health.NextProbeTS
 	}
 	return progress, nil
 }
