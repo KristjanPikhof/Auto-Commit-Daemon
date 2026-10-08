@@ -152,11 +152,11 @@ func UpdateIntentPlanRun(ctx context.Context, d *DB, run IntentPlanRun) error {
 UPDATE intent_plan_runs
 SET preserved_groups=?, unresolved_seqs=?, finding_codes=?,
     normalized_partition=?, progress_state=?, resolution_mode=?,
-    resolved_plan_json=?, completed=?, provider_deadline_ts=?,
+    resolved_plan_json=?, completed=?, provider_deadline_ts=?, attempt_count=?,
     updated_ts=?
 WHERE fingerprint=?`, string(preserved), string(unresolved), string(findings),
 		run.NormalizedPartition, run.ProgressState, run.ResolutionMode,
-		run.ResolvedPlanJSON, boolInt(run.Completed), run.ProviderDeadlineTS,
+		run.ResolvedPlanJSON, boolInt(run.Completed), run.ProviderDeadlineTS, run.AttemptCount,
 		nowSeconds(), run.Fingerprint)
 	if err != nil {
 		return fmt.Errorf("state: update intent plan run: %w", err)
