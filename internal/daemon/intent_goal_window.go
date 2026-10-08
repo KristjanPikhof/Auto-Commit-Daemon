@@ -67,7 +67,7 @@ func expandIntentGoalWindow(
 		}
 	}
 	dependencies, err := BuildIntentCandidateDependencies(active.BranchRef,
-		active.BranchGeneration, captures, runtimeIntentDependencyHints(captures), now)
+		active.BranchGeneration, captures, nil, now)
 	if err != nil {
 		return nil, nil, "", err
 	}
