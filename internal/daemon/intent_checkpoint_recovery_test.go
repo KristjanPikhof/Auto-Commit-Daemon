@@ -799,6 +799,7 @@ func TestLockedRecoveryPrefixRetainsGroundedGoals(t *testing.T) {
 func TestSupersedingIntentForwardRecoveryTargetIncludesCompletePathChain(
 	t *testing.T,
 ) {
+	t.Parallel()
 	fixture := seedSemanticPrefixReplayFixture(t)
 	recovery, _ := seedSemanticPrefixRecovery(t, fixture)
 	matching, siblings, unrelated := appendLaterRecoverySnapshots(t, fixture)
