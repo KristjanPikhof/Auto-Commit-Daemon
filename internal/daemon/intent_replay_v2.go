@@ -121,7 +121,7 @@ func replayIntentCandidateBatch(
 	}
 	evaluation, err := EvaluateIntentCandidates(plannerCtx, db, IntentCandidateEvaluation{
 		BranchRef: activeCtx.BranchRef, BranchGeneration: activeCtx.BranchGeneration,
-		Captures: captures, Planner: cfg.planner, Health: opts.IntentHealth,
+		RepoPath: repoRoot, Captures: captures, Planner: cfg.planner, Health: opts.IntentHealth,
 		RetryLimit: retryLimit, RetryLimitSet: true, ProviderBudget: telemetry.providerTimeout,
 		Preset:       opts.IntentPreset,
 		CommitFormat: cfg.commitFormat, IncludeDiffs: cfg.includeDiffs,

@@ -72,6 +72,7 @@ type IntentCandidateEvaluation struct {
 	ProviderBudget       time.Duration
 	BranchRef            string
 	BranchGeneration     int64
+	RepoPath             string
 	Captures             []IntentCandidateCapture
 	Hints                []IntentDependencyHint
 	Planner              interface{ Name() string }
@@ -292,6 +293,11 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	allCaptures, err = loadFocusedIntentGoalEvidence(ctx, input, existing, allCaptures)
+	if err != nil {
+		return result, err
+	}
+	input.Hints = append(input.Hints, runtimeIntentDependencyHints(allCaptures)...)
 	if len(input.RecentSoftCommits) == 0 {
 		input.RecentSoftCommits = recentIntentSoftCommitSummaries(
 			existing, allCaptures, input.Now)
@@ -327,7 +333,7 @@ func EvaluateIntentCandidates(
 		input.BranchRef, input.BranchGeneration)
 	result.Boundaries = boundaries
 
-	req, err := buildIntentCandidateRequest(input, existing, dependencies, boundaries)
+	req, err := buildIntentCandidateRequest(input, existing, dependencies, boundaries, allCaptures)
 	if err != nil {
 		return result, err
 	}
@@ -1006,6 +1012,7 @@ func buildIntentCandidateRequest(
 	existing []state.IntentCandidate,
 	dependencies []state.IntentCaptureDependency,
 	boundaries []state.IntentActivityBoundary,
+	allCaptures []IntentCandidateCapture,
 ) (ai.IntentPlanRequestV2, error) {
 	offered := make([]ai.OfferedCapture, 0, len(input.Captures))
 	visibleSeqs := make(map[int64]struct{}, len(input.Captures))
@@ -1031,9 +1038,32 @@ func buildIntentCandidateRequest(
 			seqs = append(seqs, event.EventSeq)
 			visibleSeqs[event.EventSeq] = struct{}{}
 		}
+		var evidence []ai.OfferedCapture
+		paths := map[string]bool{}
+		memberSeqs := map[int64]bool{}
+		for _, seq := range seqs {
+			memberSeqs[seq] = true
+		}
+		for _, capture := range allCaptures {
+			if !memberSeqs[capture.Event.Seq] {
+				continue
+			}
+			for _, path := range intentCapturePaths(capture) {
+				paths[path] = true
+			}
+			if capture.CapturedDiff != "" {
+				evidence = append(evidence, ai.OfferedCapture{Seq: capture.Event.Seq, Path: capture.Event.Path, Op: capture.Event.Operation, Fidelity: capture.Event.Fidelity, CapturedDiff: capture.CapturedDiff})
+			}
+		}
+		var goalPaths []string
+		for path := range paths {
+			goalPaths = append(goalPaths, path)
+		}
+		sort.Strings(goalPaths)
 		candidates = append(candidates, ai.IntentCandidateSummary{
 			CandidateID: candidate.ID, Status: candidate.Status,
 			Purpose: candidate.Purpose, SelectedSeqs: seqs,
+			Paths: goalPaths, CapturedEvidence: evidence,
 			MissingCompanions: splitIntentSummary(candidate.MissingCompanions),
 			Ready:             candidate.Readiness == state.IntentReadinessReady,
 			CreatedAt:         secondsTime(candidate.CreatedTS),

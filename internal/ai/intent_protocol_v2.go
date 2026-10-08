@@ -69,15 +69,16 @@ type IntentCaptureDependency struct {
 
 // IntentCandidateSummary carries durable candidate context without raw source.
 type IntentCandidateSummary struct {
-	CandidateID       string    `json:"candidate_id"`
-	Status            string    `json:"status"`
-	Purpose           string    `json:"purpose,omitempty"`
-	SelectedSeqs      []int64   `json:"selected_seqs,omitempty"`
-	Paths             []string  `json:"paths,omitempty"`
-	MissingCompanions []string  `json:"missing_companions,omitempty"`
-	Ready             bool      `json:"ready"`
-	CreatedAt         time.Time `json:"created_at,omitempty"`
-	UpdatedAt         time.Time `json:"updated_at,omitempty"`
+	CandidateID       string           `json:"candidate_id"`
+	Status            string           `json:"status"`
+	Purpose           string           `json:"purpose,omitempty"`
+	SelectedSeqs      []int64          `json:"selected_seqs,omitempty"`
+	Paths             []string         `json:"paths,omitempty"`
+	CapturedEvidence  []OfferedCapture `json:"captured_evidence,omitempty"`
+	MissingCompanions []string         `json:"missing_companions,omitempty"`
+	Ready             bool             `json:"ready"`
+	CreatedAt         time.Time        `json:"created_at,omitempty"`
+	UpdatedAt         time.Time        `json:"updated_at,omitempty"`
 }
 
 // IntentActivityBoundary contains no prompt text. Epoch is an opaque,
@@ -332,6 +333,16 @@ func NewIntentPlanRequestV2(opts IntentPlanRequestV2Options) (IntentPlanRequestV
 		CommitFormat:           legacy.CommitFormat,
 		CapturedDiffTransform:  legacy.CapturedDiffTransform,
 	}
+	for i := range req.Candidates {
+		if len(req.Candidates[i].CapturedEvidence) == 0 {
+			continue
+		}
+		context, err := NewIntentPlanRequest(IntentPlanRequestOptions{OfferedCaptures: req.Candidates[i].CapturedEvidence, IncludeCapturedDiffs: opts.IncludeCapturedDiffs, CommitFormat: opts.CommitFormat})
+		if err != nil {
+			return IntentPlanRequestV2{}, fmt.Errorf("intent goal evidence: %w", err)
+		}
+		req.Candidates[i].CapturedEvidence = context.OfferedCaptures
+	}
 	if err := ValidateIntentPlanRequestV2(req); err != nil {
 		return IntentPlanRequestV2{}, err
 	}
@@ -458,6 +469,7 @@ func ValidateIntentPlanRequestV2(req IntentPlanRequestV2) error {
 	}
 	candidateIDs := make(map[string]struct{}, len(req.Candidates))
 	candidateSeqOwners := make(map[int64]string)
+	evidenceCount := 0
 	for i, candidate := range req.Candidates {
 		if err := validateBoundedText("candidate_id", candidate.CandidateID, IntentCandidateIDCap, true); err != nil {
 			return fmt.Errorf("intent planner v2: candidates[%d]: %w", i, err)
@@ -487,6 +499,23 @@ func ValidateIntentPlanRequestV2(req IntentPlanRequestV2) error {
 			}
 			candidateSeqOwners[seq] = candidate.CandidateID
 			knownSeqs[seq] = struct{}{}
+		}
+		evidenceCount += len(candidate.CapturedEvidence)
+		if evidenceCount > IntentCandidateCaptureCap {
+			return fmt.Errorf("intent planner v2: goal evidence exceeds cap %d", IntentCandidateCaptureCap)
+		}
+		seenEvidence := make(map[int64]bool)
+		for _, capture := range candidate.CapturedEvidence {
+			if candidateSeqOwners[capture.Seq] != candidate.CandidateID || seenEvidence[capture.Seq] {
+				return fmt.Errorf("intent planner v2: goal evidence must belong exactly once to its recorded candidate")
+			}
+			seenEvidence[capture.Seq] = true
+			if err := validateBoundedText("evidence path", capture.Path, IntentContextPathCap, true); err != nil {
+				return err
+			}
+			if len(capture.CapturedDiff) > IntentStageDiffCap {
+				return fmt.Errorf("intent planner v2: goal evidence diff exceeds cap")
+			}
 		}
 		if err := validateContextPaths(candidate.Paths); err != nil {
 			return fmt.Errorf("intent planner v2: candidates[%d]: %w", i, err)
