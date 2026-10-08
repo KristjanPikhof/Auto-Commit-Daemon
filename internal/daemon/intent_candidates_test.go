@@ -411,19 +411,26 @@ func TestIntentCandidateEnginePersistsNonContiguousCandidateAcrossWindows(t *tes
 	firstA := appendIntentCandidateCapture(t, db, "internal/a/a.go", "create", "", "a1")
 	b := appendIntentCandidateCapture(t, db, "internal/b/b.go", "create", "", "b1")
 	secondA := appendIntentCandidateCapture(t, db, "internal/a/a.go", "modify", "a1", "a2")
+	firstA.CapturedDiff = "+func ExportRecording(text string) string { return text }\n"
+	b.CapturedDiff = "+const DefaultLocale = \"en\"\n"
+	secondA.CapturedDiff = "-func ExportRecording(text string) string { return text }\n+func ExportRecording(text string) string { return \"archive:\" + text }\n"
 
 	planner := &intentCandidatePlannerStub{plan: ai.IntentPlanV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{
 			{
 				CandidateID: "candidate-a", SelectedSeqs: []int64{firstA.Event.Seq, secondA.Event.Seq},
-				Purpose: "implement a", Readiness: ai.IntentCandidateReady,
-				Subject: "Implement a", GroupingReason: "same-path object chain",
+				Purpose: "export recordings with their archive prefix", Readiness: ai.IntentCandidateReady,
+				Subject:        "Add recording archive exports",
+				Body:           "- Keep the completed archive prefix with the original exporter",
+				GroupingReason: "same-path object chain completes recording archive exports",
 			},
 			{
 				CandidateID: "candidate-b", SelectedSeqs: []int64{b.Event.Seq},
-				Purpose: "implement b", Readiness: ai.IntentCandidateReady,
-				Subject: "Implement b", GroupingReason: "independent component",
+				Purpose: "use English as the default language", Readiness: ai.IntentCandidateReady,
+				Subject:        "Use English as the default language",
+				Body:           "- Keep the default locale set to English",
+				GroupingReason: "the default language is independently reviewable",
 			},
 		},
 	}}
@@ -469,13 +476,16 @@ func TestIntentCandidateEnginePersistsNonContiguousCandidateAcrossWindows(t *tes
 	}
 
 	testA := appendIntentCandidateCapture(t, db, "internal/a/a_test.go", "create", "", "at1")
+	testA.CapturedDiff = "+func TestRecordingArchive(t *testing.T) { if ExportRecording(\"note\") != \"archive:note\" { t.Fatal(\"missing prefix\") } }\n"
 	candidateAID := first.Decisions[0].Candidate.ID
 	planner.plan = ai.IntentPlanV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
 			CandidateID: candidateAID, SelectedSeqs: []int64{testA.Event.Seq},
-			Purpose: "implement and test a", Readiness: ai.IntentCandidateReady,
-			Subject: "Implement and test a", GroupingReason: "matching source and test",
+			Purpose: "verify recording archive exports", Readiness: ai.IntentCandidateReady,
+			Subject:        "Verify recording archive exports",
+			Body:           "- Keep archive prefix coverage with the exporter it validates",
+			GroupingReason: "matching source and test complete recording archive exports",
 		}},
 	}
 	second, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
@@ -491,7 +501,7 @@ func TestIntentCandidateEnginePersistsNonContiguousCandidateAcrossWindows(t *tes
 		t.Fatalf("persisted candidate summaries=%d want=2", len(planner.req.Candidates))
 	}
 	if len(second.Decisions) != 1 ||
-		second.Decisions[0].Candidate.ID != candidateAID {
+		second.Decisions[0].Candidate.ID != candidateAID || !second.Decisions[0].Publishable {
 		t.Fatalf("second decisions=%+v", second.Decisions)
 	}
 	got, ok, err := state.IntentCandidateByID(ctx, db, candidateAID)
@@ -2754,7 +2764,7 @@ func TestIntentCandidateEngineFallbackPreservesHardBridgeCommits(
 		assertIntentCandidateProtectedGoalWait(t, result.Decisions[0])
 	}
 	if result.Fallback != "evidence_partition" ||
-		result.ResolutionMode != "dependent_message_fallback" ||
+		result.ResolutionMode != "waiting_semantic_retry" ||
 		result.NeedsAttention || len(result.Decisions) != 1 ||
 		result.Decisions[0].Publishable {
 		t.Fatalf("hard bridge result=%+v", result)
@@ -2804,6 +2814,9 @@ func TestIntentCandidateEngineNativePlannerMergesHardBridgeBetweenCandidates(
 		t, db, "bridge.go", "create", "", "bridge")
 	right := appendIntentCandidateCapture(
 		t, db, "right.go", "create", "", "right")
+	left.CapturedDiff = "+func ReadRecording() string { return \"recorded text\" }\n"
+	bridge.CapturedDiff = "+func TransferRecording() string { return ArchiveRecording(ReadRecording()) }\n"
+	right.CapturedDiff = "+func ArchiveRecording(text string) string { return \"archive:\" + text }\n"
 	saveSoftPublishedIntentCandidate(
 		t, db, "native-left", left, "left-commit", 100)
 	saveSoftPublishedIntentCandidate(
@@ -2812,9 +2825,10 @@ func TestIntentCandidateEngineNativePlannerMergesHardBridgeBetweenCandidates(
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
 			CandidateID: "native-left", SelectedSeqs: []int64{bridge.Event.Seq},
-			Purpose: "complete the hard-linked change", Readiness: ai.IntentCandidateReady,
-			Subject:        "Complete hard-linked change",
-			GroupingReason: "hard bridge completes the persisted candidate",
+			Purpose: "archive contents read from the recording source", Readiness: ai.IntentCandidateReady,
+			Subject:        "Archive captured recording contents",
+			Body:           "- Connect recording reads to the archive builder",
+			GroupingReason: "the transfer calls the recording reader and archive builder",
 		}},
 	}}
 
