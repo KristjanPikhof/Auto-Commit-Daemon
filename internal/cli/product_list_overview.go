@@ -478,6 +478,9 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 			health.State == daemon.IntentPlannerCircuitOpen {
 			report.PublicationOutcome.RetryAt = health.NextProbeTS
 		}
+		if report.PublicationProgress.Phase == "goal_review_wait" {
+			report.PublicationOutcome.RetryAt = report.PublicationProgress.RetryAtTS
+		}
 		if outcomeErr != nil && !productListReadTransient(outcomeErr) {
 			return overview, outcomeErr
 		}

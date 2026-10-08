@@ -75,6 +75,7 @@ type publicationProgressReport struct {
 	LastProgressTS         float64 `json:"last_progress_ts,omitempty"`
 	LastProgressAgeSeconds int64   `json:"last_progress_age_seconds,omitempty"`
 	WaitRemainingSeconds   int64   `json:"wait_remaining_seconds,omitempty"`
+	RetryAtTS              float64 `json:"retry_at,omitempty"`
 	TemporaryLocalFallback bool    `json:"temporary_local_fallback,omitempty"`
 	WorkerResponsive       bool    `json:"worker_responsive"`
 	HeartbeatAgeSeconds    int64   `json:"heartbeat_age_seconds,omitempty"`
@@ -520,6 +521,10 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		report.PublicationOutcome.RetryAt = health.NextProbeTS
 	}
 
+	if progress.Phase == "goal_review_wait" {
+		report.PublicationOutcome.RetryAt = progress.RetryAtTS
+	}
+
 	return report, nil
 }
 
@@ -551,6 +556,17 @@ func buildPublicationProgressReport(
 	}
 	progress.HistoryPlanID, progress.HistoryStatus, progress.HistoryError = history.PlanID, history.Status, history.Error
 	historyActive := history.Status == "pending" || history.Status == "running"
+	var semanticRetry daemon.IntentSemanticRetrySnapshot
+	if conn != nil {
+		raw, _, err := metaLookup(ctx, conn, daemon.MetaKeyIntentSemanticRetry)
+		if err != nil {
+			return progress, err
+		}
+		if raw != "" {
+			semanticRetry, _ = daemon.DecodeIntentSemanticRetrySnapshot(raw)
+		}
+	}
+	semanticReviewWait := report.PendingEvents > 0 && report.IntentStrategy.ResolutionMode == "waiting_semantic_retry" && semanticRetry.BranchRef == report.BranchRef && semanticRetry.BranchGeneration == report.BranchGeneration && semanticRetry.RetryAtTS > 0
 	if progress.Strategy == "" {
 		progress.Strategy = "event"
 	}
@@ -702,6 +718,11 @@ func buildPublicationProgressReport(
 			progress.Phase = "provider_wait"
 			progress.WaitRemainingSeconds = intentProviderRetryRemainingSeconds(
 				report.IntentStrategy.PlannerHealth, now)
+			progress.TemporaryLocalFallback = false
+		case semanticReviewWait:
+			progress.Phase = "goal_review_wait"
+			progress.RetryAtTS = semanticRetry.RetryAtTS
+			progress.WaitRemainingSeconds = max(0, int64(semanticRetry.RetryAtTS-float64(now.UnixNano())/1e9+0.999))
 			progress.TemporaryLocalFallback = false
 		case !activeDrain && report.PendingEvents > 0 &&
 			progress.Phase != "intent_verification_recovery" &&

@@ -3446,6 +3446,15 @@ func Run(ctx context.Context, opts Options) error {
 			currentDelay = intentProviderRetryDelay(currentDelay, passBundle.IntentHealth.Snapshot(), now())
 		}
 
+		if raw, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyIntentSemanticRetry); err == nil && ok {
+			if retry, err := DecodeIntentSemanticRetrySnapshot(raw); err == nil && retry.BranchRef == cctx.BranchRef && retry.BranchGeneration == cctx.BranchGeneration {
+				remaining := time.Unix(0, int64(retry.RetryAtTS*float64(time.Second))).Sub(now())
+				if remaining > 0 && remaining < currentDelay {
+					currentDelay = remaining
+				}
+			}
+		}
+
 		// 4m. Sleep until the next tick or wake/shutdown/ctx event.
 		if stopped {
 			return nil
