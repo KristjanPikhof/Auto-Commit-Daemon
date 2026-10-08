@@ -1445,12 +1445,15 @@ func runtimeIntentChangeIDs(diff string) map[string]struct{} {
 func firstRuntimeIntentFeature(
 	left, right map[string]struct{},
 ) string {
+	shared := ""
 	for feature := range left {
 		if _, ok := right[feature]; ok {
-			return feature
+			if shared == "" || feature < shared {
+				shared = feature
+			}
 		}
 	}
-	return ""
+	return shared
 }
 
 func runtimeIntentStemBase(stem string) string {

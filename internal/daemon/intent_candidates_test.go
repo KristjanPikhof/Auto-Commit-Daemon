@@ -4238,6 +4238,56 @@ func TestRuntimeIntentDependencyHintsUseSourceEvidence(t *testing.T) {
 	}
 }
 
+func TestRuntimeIntentDependencyEvidenceKeepsRetryFingerprintStable(t *testing.T) {
+	t.Parallel()
+	source := intentCandidateCaptureFixture(1, "archive.go", "create", "", "archive")
+	source.CapturedDiff = "+func BuildRecordingArchive(text string) string { return ValidateRecordingContents(text) }\n" +
+		"+// PreserveRecordingMetadata\n+// RecordArchiveVersion\n"
+	caller := intentCandidateCaptureFixture(2, "export.go", "create", "", "export")
+	caller.CapturedDiff = "+return BuildRecordingArchive(ValidateRecordingContents(text))\n" +
+		"+// PreserveRecordingMetadata\n+// RecordArchiveVersion\n"
+	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1,
+		Provider: "goal-planner", Preset: config.PresetBalanced, IncludeDiffs: true}
+	var expectedHints []IntentDependencyHint
+	var expectedPlan, expectedEvidence string
+	for attempt := 0; attempt < 200; attempt++ {
+		captures := []IntentCandidateCapture{source, caller}
+		if attempt%2 == 1 {
+			captures[0], captures[1] = captures[1], captures[0]
+		}
+		hints := runtimeIntentDependencyHints(captures)
+		req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+			OfferedCaptures: []ai.OfferedCapture{
+				{Seq: 1, Path: source.Event.Path, CapturedDiff: source.CapturedDiff},
+				{Seq: 2, Path: caller.Event.Path, CapturedDiff: caller.CapturedDiff},
+			}}
+		for _, hint := range hints {
+			req.Dependencies = append(req.Dependencies, ai.IntentCaptureDependency{
+				FromSeq: hint.PrerequisiteSeq, ToSeq: hint.DependentSeq,
+				Strength: hint.Strength, Kind: hint.Kind, EvidenceHash: intentEvidenceHash(hint.Evidence),
+			})
+		}
+		run, err := newIntentPlanRun(req, input, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidence, err := intentSemanticRetryEvidence(req, input, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempt == 0 {
+			expectedHints, expectedPlan, expectedEvidence = hints, run.Fingerprint, evidence
+		} else if !reflect.DeepEqual(hints, expectedHints) || run.Fingerprint != expectedPlan || evidence != expectedEvidence {
+			t.Fatalf("unchanged captures lost retry identity on attempt %d: hints=%+v plan=%s evidence=%s", attempt, hints, run.Fingerprint, evidence)
+		}
+	}
+	if len(expectedHints) != 3 || expectedHints[0].Kind != "symbol_hash" ||
+		expectedHints[0].Evidence != "buildrecordingarchive" || expectedHints[1].Kind != "hunk_hash" ||
+		expectedHints[2].Kind != "import_reference" {
+		t.Fatalf("regression did not exercise multiple shared symbols and lines: %+v", expectedHints)
+	}
+}
+
 func TestRuntimeIntentDependencyHintsFindOutputArchiveReferencesInEitherOrder(t *testing.T) {
 	t.Parallel()
 	archive := intentCandidateCaptureFixture(
