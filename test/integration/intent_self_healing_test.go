@@ -296,7 +296,11 @@ func TestIntentWorktreeReliability(t *testing.T) {
 		if result.ExitCode != 0 || json.Unmarshal([]byte(result.Stdout), &payload) != nil {
 			t.Fatalf("read incomplete-goal %s: %s %s", command, result.Stdout, result.Stderr)
 		}
-		for _, key := range []string{"all_changes_committed_in_git", "checkpoint_published_by_acd"} {
+		keys := []string{"all_changes_committed_in_git", "checkpoint_published_by_acd"}
+		if command == "list" {
+			keys = []string{"branch_committed"}
+		}
+		for _, key := range keys {
 			if committed, found := findJSONBool(payload, key); !found || committed {
 				t.Fatalf("%s claimed the incomplete goal was published: %s", command, result.Stdout)
 			}
