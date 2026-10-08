@@ -42,6 +42,11 @@ func TestIntentDocumentCompanionsRequireExactPublicReferences(t *testing.T) {
 				t.Fatalf("connected=%t error=%v", testCase.connected, err)
 			}
 			if !testCase.connected {
+				req.Dependencies = []ai.IntentCaptureDependency{{FromSeq: 1, ToSeq: 2,
+					Strength: ai.IntentDependencySoft, Kind: "documented_public_reference", EvidenceHash: "unproved-public-token"}}
+				if err := ValidateIntentGoalPlan(req, plan); err == nil {
+					t.Fatal("retained hint bypassed exact public reference checks")
+				}
 				return
 			}
 			source, doc := goal, goal
