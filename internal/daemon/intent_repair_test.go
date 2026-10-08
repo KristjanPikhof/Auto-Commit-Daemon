@@ -1026,7 +1026,7 @@ SELECT COUNT(*) FROM intent_repairs WHERE status='completed'`).
 		t, f.dir, "show", "-s", "--format=%s", "HEAD")); subject != "Increase the returned feature value" {
 		t.Fatalf("fallback subject=%q", subject)
 	}
-	if resolution != "provider" {
+	if resolution != "local_repair" {
 		t.Fatalf("failed repair resolution=%q", resolution)
 	}
 }

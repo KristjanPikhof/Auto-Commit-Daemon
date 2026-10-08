@@ -1287,11 +1287,14 @@ func resolvedIntentForwardRecoveryPlan(
 			return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 		}
 	}
-	plan, _, err := loadResolvedIntentPlanRun(
-		request, run.ResolvedPlanJSON.String)
-	if err != nil {
+	// This reader proves frozen membership and prerequisite ordering. Its
+	// sequence-only request has no Git evidence for semantic classification;
+	// replay rebuilds that evidence and runs the goal gates before publication.
+	validationRequest := intentCandidateContinuationValidationRequest(request, envelope.Continuations)
+	if err := ai.ValidateIntentPlanV2(validationRequest, envelope.Plan); err != nil {
 		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 	}
+	plan := envelope.Plan
 	for _, candidate := range plan.Candidates {
 		unresolved := 0
 		for _, seq := range candidate.SelectedSeqs {

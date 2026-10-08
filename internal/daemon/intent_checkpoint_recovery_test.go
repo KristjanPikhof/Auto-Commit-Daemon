@@ -752,6 +752,45 @@ func TestReplayLocalUnlockStopsAfterFullSemanticPrefixFailure(t *testing.T) {
 	}
 }
 
+func TestLockedRecoveryPrefixRetainsGroundedGoals(t *testing.T) {
+	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+		OfferedCaptures: []ai.OfferedCapture{
+			{Seq: 1, Path: "label.go", Op: "create", Fidelity: "full", CapturedDiff: "+const DefaultLabel = \"complete\"\n"},
+			{Seq: 2, Path: "value.go", Op: "create", Fidelity: "full", CapturedDiff: "+func DefaultValue() string { return DefaultLabel }\n"},
+		},
+	}
+	cached := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{
+			{CandidateID: "label", SelectedSeqs: []int64{1}, Purpose: "define the default value label", Readiness: ai.IntentCandidateReady,
+				Subject: "Set the default value label", Body: "- Supply the label used by default value consumers"},
+			{CandidateID: "value", SelectedSeqs: []int64{2}, Purpose: "return the default value label", Readiness: ai.IntentCandidateReady,
+				Subject: "Add labeled default values", Body: "- Resolve the default label through the value API", DependsOnCandidates: []string{"label"}},
+		},
+	}
+	planner := publicationDrainAtomicFallbackPlanner{semanticPrefix: &cached}
+	plan, err := planner.PlanIntentV2(context.Background(), req)
+	if err != nil || len(plan.Candidates) != 1 || plan.Candidates[0].Subject != cached.Candidates[1].Subject {
+		t.Fatalf("cached prefix message was replaced: plan=%+v err=%v", plan, err)
+	}
+	if err := ValidateIntentGoalPlan(req, plan); err != nil {
+		t.Fatalf("grounded prerequisite and consumer were refused: %v", err)
+	}
+	// Reusing a semantic message cannot prove an unrelated replacement unit.
+	req.OfferedCaptures[1].CapturedDiff = "+func IndependentFeature() int { return 1 }\n"
+	if err := ValidateIntentGoalPlan(req, plan); err == nil || !strings.Contains(err.Error(), "candidate_disconnected") {
+		t.Fatalf("cached message bypassed grounded goal validation: %v", err)
+	}
+	fragment := req
+	fragment.OfferedCaptures = req.OfferedCaptures[:1]
+	cached.Candidates = []ai.IntentCandidateAssignment{{
+		CandidateID: "complete-goal", SelectedSeqs: []int64{1, 2}, Purpose: "return labeled default values", Readiness: ai.IntentCandidateReady,
+		Subject: "Add labeled default values", Body: "- Keep the default label with its consumer",
+	}}
+	if _, err := planner.PlanIntentV2(context.Background(), fragment); err == nil {
+		t.Fatal("recovery silently split a cached semantic goal")
+	}
+}
+
 func TestSupersedingIntentForwardRecoveryTargetIncludesCompletePathChain(
 	t *testing.T,
 ) {
