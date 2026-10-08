@@ -596,6 +596,7 @@ WHERE seq IN (?, ?)`, staleFirst.Event.Seq, staleSecond.Event.Seq); err != nil {
 }
 
 func TestIntentCandidateEngineBoundsFiftyThousandPendingEvents(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	const totalPending = 50_000
