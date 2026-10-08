@@ -162,7 +162,9 @@ func replayIntentCandidateBatch(
 		return sum, err
 	}
 	if cfg.atomicFallback &&
-		evaluation.ResolutionMode != "waiting_message_rewrite" {
+		evaluation.ResolutionMode != "waiting_message_rewrite" &&
+		evaluation.ResolutionMode != "waiting_semantic_retry" &&
+		evaluation.ResolutionMode != "waiting_for_ai" {
 		evaluation.ResolutionMode = publicationFallbackLocalUnlock
 	}
 	if counted := attemptCounter.RetryCount(); counted > evaluation.RetryCount {
@@ -193,7 +195,8 @@ func replayIntentCandidateBatch(
 		return sum, err
 	}
 	if evaluation.Fallback != "waiting_for_ai" &&
-		evaluation.Fallback != "waiting_message_rewrite" {
+		evaluation.Fallback != "waiting_message_rewrite" &&
+		evaluation.ResolutionMode != "waiting_semantic_retry" {
 		// Provider cooldown is not a semantic decision to defer work. Counting
 		// it would age unchanged captures into forced publication requests.
 		if err := recordIntentDeferrals(
@@ -375,7 +378,9 @@ func replayIntentCandidateBatch(
 		}
 	}
 	if !publishedAny {
-		messageRewriteWait := evaluation.Fallback == "waiting_message_rewrite" || evaluation.Fallback == "waiting_for_ai"
+		messageRewriteWait := evaluation.Fallback == "waiting_message_rewrite" ||
+			evaluation.Fallback == "waiting_for_ai" ||
+			evaluation.ResolutionMode == "waiting_semantic_retry"
 		if !messageRewriteWait && !evaluation.VerificationDeferred &&
 			forced && len(items) == 1 &&
 			opts.PublicationDrain == nil &&
@@ -393,6 +398,9 @@ func replayIntentCandidateBatch(
 			sum.SkippedReason = "intent_v2_waiting_message_rewrite"
 			if evaluation.Fallback == "waiting_for_ai" {
 				sum.SkippedReason = "intent_v2_waiting_for_ai"
+			}
+			if evaluation.ResolutionMode == "waiting_semantic_retry" {
+				sum.SkippedReason = "intent_v2_waiting_semantic_retry"
 			}
 			sum.Disposition = ReplayDispositionTransientWait
 			sum.DispositionReason = evaluation.PlannerFailure

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
@@ -26,7 +27,7 @@ type IntentSemanticRetrySnapshot struct {
 
 func DecodeIntentSemanticRetrySnapshot(raw string) (IntentSemanticRetrySnapshot, error) {
 	var record IntentSemanticRetrySnapshot
-	if json.Unmarshal([]byte(raw), &record) != nil || record.Version != 1 ||
+	if len(raw) > 4096 || json.Unmarshal([]byte(raw), &record) != nil || record.Version != 1 ||
 		record.BranchRef == "" || len(record.BranchRef) > 1024 || record.BranchGeneration < 0 ||
 		!validIntentPlannerHealthFingerprint(record.EvidenceFingerprint) ||
 		!validIntentPlannerHealthFingerprint(record.PlanFingerprint) ||
@@ -43,12 +44,61 @@ func (e *IntentSemanticRetryWaitError) Error() string {
 }
 
 func loadIntentSemanticRetry(ctx context.Context, db *state.DB) (IntentSemanticRetrySnapshot, bool, error) {
-	raw, found, err := state.MetaGet(ctx, db, MetaKeyIntentSemanticRetry)
+	return loadIntentSemanticRetryKey(ctx, db, MetaKeyIntentSemanticRetry)
+}
+
+func loadIntentSemanticRetryKey(ctx context.Context, db *state.DB, key string) (IntentSemanticRetrySnapshot, bool, error) {
+	raw, found, err := state.MetaGet(ctx, db, key)
 	if err != nil || !found || raw == "" {
 		return IntentSemanticRetrySnapshot{}, false, err
 	}
 	record, err := DecodeIntentSemanticRetrySnapshot(raw)
 	return record, err == nil, err
+}
+
+func intentSemanticRetryKey(evidence string) string {
+	return MetaKeyIntentSemanticRetry + "." + strings.TrimPrefix(evidence, "sha256:")
+}
+
+func loadIntentSemanticRetryForEvidence(ctx context.Context, db *state.DB, evidence string) (IntentSemanticRetrySnapshot, bool, error) {
+	record, found, err := loadIntentSemanticRetryKey(ctx, db, intentSemanticRetryKey(evidence))
+	if err != nil || found {
+		return record, found, err
+	}
+	// Accept the earlier single-record format without losing its deadline.
+	record, found, err = loadIntentSemanticRetry(ctx, db)
+	return record, found && record.EvidenceFingerprint == evidence, err
+}
+
+func saveIntentSemanticRetry(ctx context.Context, db *state.DB, record IntentSemanticRetrySnapshot) error {
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	return state.MetaSetMany(ctx, db, map[string]string{
+		intentSemanticRetryKey(record.EvidenceFingerprint): string(raw),
+		MetaKeyIntentSemanticRetry:                         string(raw),
+	})
+}
+
+func projectIntentSemanticRetry(ctx context.Context, db *state.DB, record IntentSemanticRetrySnapshot) error {
+	current, found, err := loadIntentSemanticRetry(ctx, db)
+	if err != nil || found && current == record {
+		return err
+	}
+	return state.MetaSetJSON(ctx, db, MetaKeyIntentSemanticRetry, record)
+}
+
+func clearIntentSemanticRetry(ctx context.Context, db *state.DB, evidence string) error {
+	values := map[string]string{intentSemanticRetryKey(evidence): ""}
+	current, found, err := loadIntentSemanticRetry(ctx, db)
+	if err != nil {
+		return err
+	}
+	if found && current.EvidenceFingerprint == evidence {
+		values[MetaKeyIntentSemanticRetry] = ""
+	}
+	return state.MetaSetMany(ctx, db, values)
 }
 
 func intentSemanticRetryEvidence(req ai.IntentPlanRequestV2, input IntentCandidateEvaluation, limit int) (string, error) {
@@ -91,7 +141,7 @@ func holdUnclearIntentMessages(req ai.IntentPlanRequestV2, plan ai.IntentPlanV2,
 }
 
 func scheduleIntentSemanticRetry(ctx context.Context, db *state.DB, input IntentCandidateEvaluation, run state.IntentPlanRun, evidence string, retryAt time.Time) error {
-	return state.MetaSetJSON(ctx, db, MetaKeyIntentSemanticRetry, IntentSemanticRetrySnapshot{
+	return saveIntentSemanticRetry(ctx, db, IntentSemanticRetrySnapshot{
 		Version: 1, BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
 		EvidenceFingerprint: evidence, PlanFingerprint: run.Fingerprint,
 		RetryAtTS: float64(retryAt.UnixNano()) / 1e9,

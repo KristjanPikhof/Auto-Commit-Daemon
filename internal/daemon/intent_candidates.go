@@ -371,6 +371,13 @@ func EvaluateIntentCandidates(
 			result.ProviderCallSkipped = "provider_backoff"
 			return result, nil
 		}
+		var semanticWait *IntentSemanticRetryWaitError
+		if errors.As(err, &semanticWait) {
+			result.Fallback = "waiting_semantic_retry"
+			result.ResolutionMode = "waiting_semantic_retry"
+			result.ProviderCallSkipped = "semantic_retry_cooldown"
+			return result, nil
+		}
 		return result, err
 	}
 	result.ProtocolVersion = plan.ProtocolVersion
@@ -388,6 +395,11 @@ func EvaluateIntentCandidates(
 	result.NeedsAttention = needsAttention
 	if input.RejectLocalFallback &&
 		(result.Fallback != "" || result.PlannerFailure != "") {
+		if result.ResolutionMode == "waiting_semantic_retry" {
+			result.Fallback = "waiting_semantic_retry"
+			result.ProviderCallSkipped = "semantic_retry_cooldown"
+			return result, nil
+		}
 		return result, &IntentSemanticFallbackRequiredError{
 			Failure:     result.PlannerFailure,
 			plannerWait: plannerWait,
@@ -1324,7 +1336,7 @@ func chooseIntentCandidatePlan(
 	if err != nil {
 		return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 	}
-	semanticRetry, hasSemanticRetry, err := loadIntentSemanticRetry(ctx, db)
+	semanticRetry, hasSemanticRetry, err := loadIntentSemanticRetryForEvidence(ctx, db, retryEvidence)
 	if err != nil {
 		return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 	}
@@ -1345,9 +1357,12 @@ func chooseIntentCandidatePlan(
 		}
 		if semanticRetry.PlanFingerprint != run.Fingerprint {
 			semanticRetry.PlanFingerprint = run.Fingerprint
-			if err := state.MetaSetJSON(ctx, db, MetaKeyIntentSemanticRetry, semanticRetry); err != nil {
+			if err := saveIntentSemanticRetry(ctx, db, semanticRetry); err != nil {
 				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 			}
+		}
+		if err := projectIntentSemanticRetry(ctx, db, semanticRetry); err != nil {
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 		}
 		wait := &IntentSemanticRetryWaitError{RetryAt: time.Unix(0, int64(semanticRetry.RetryAtTS*1e9))}
 		return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, wait
@@ -1587,7 +1602,7 @@ func chooseIntentCandidatePlan(
 					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, updateErr
 				}
 				if retryMatches {
-					if err := state.MetaSet(ctx, db, MetaKeyIntentSemanticRetry, ""); err != nil {
+					if err := clearIntentSemanticRetry(ctx, db, retryEvidence); err != nil {
 						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 					}
 				}
@@ -1781,9 +1796,11 @@ func chooseIntentCandidatePlan(
 	run.ProgressState = sql.NullString{String: "completed", Valid: true}
 	run.UnresolvedSeqs = nil
 	run.PreservedGroups = nil
+	semanticReviewNeeded := false
 	if planner != nil {
 		_, needsReview := holdUnclearIntentMessages(req, plan, true)
 		if needsReview {
+			semanticReviewNeeded = true
 			run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
 			run.ResolutionMode = run.ProgressState
 			run.UnresolvedSeqs = offeredIntentSeqs(req)
@@ -1796,7 +1813,7 @@ func chooseIntentCandidatePlan(
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
 	}
 	return plan, "evidence_partition", plannerFailure, retryCount,
-		fallbackNeedsAttention || companionNeedsAttention, continuations, run, nil
+		!semanticReviewNeeded && (fallbackNeedsAttention || companionNeedsAttention), continuations, run, nil
 }
 
 // An outage leaves the same semantic evidence resumable. Only active provider
@@ -2023,15 +2040,14 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 		}
 	}
 	if len(published) > 0 {
-		kept := edges[:0]
-		for _, edge := range edges {
+		for i, edge := range edges {
 			if (edge.Kind == "test_source" || edge.Kind == "migration_test") &&
 				(published[edge.FromSeq] || published[edge.ToSeq]) {
-				continue
+				// Published companions can explain a private history repair,
+				// but are not missing unpublished support for a new commit.
+				edges[i].Kind = "published_" + edge.Kind
 			}
-			kept = append(kept, edge)
 		}
-		edges = kept
 	}
 	return edges
 }
@@ -2506,7 +2522,10 @@ func applyIntentFallbackMessageQuality(req ai.IntentPlanRequestV2, plan ai.Inten
 		}
 		report = ai.EvaluateIntentPlanMessageQuality(legacy, locked)
 		if report.Action != ai.MessageQualityClean && report.Action != ai.MessageQualitySanitizeAccept {
-			return plan, fmt.Errorf("daemon: captured evidence cannot produce a valid local message for %s", candidate.CandidateID)
+			plan.Candidates[i].Readiness = ai.IntentCandidateWait
+			plan.Candidates[i].MissingCompanions = []string{"captured evidence needs a meaningful goal message"}
+			plan.Candidates[i].Subject, plan.Candidates[i].Body = "", ""
+			continue
 		}
 		plan.Candidates[i].Subject, plan.Candidates[i].Body = report.SanitizedSubject, report.SanitizedBody
 	}

@@ -126,6 +126,10 @@ func TestIntentGoalReadinessContinuesPersistedSourceWithLaterTest(t *testing.T) 
 	if err := validatePlannerSemanticRationale(req, plan); err != nil {
 		t.Fatalf("later test could not complete durable goal: %v", err)
 	}
+	req.Candidates[0].Status = state.IntentCandidateSoftPublished
+	if err := validatePlannerSemanticRationale(req, plan); err != nil {
+		t.Fatalf("published source relationship was lost during private goal repair: %v", err)
+	}
 }
 
 func TestIntentGoalReadinessSemanticPlanCannotBypassEvidenceGate(t *testing.T) {
