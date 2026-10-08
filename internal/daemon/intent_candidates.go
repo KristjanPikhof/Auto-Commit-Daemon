@@ -285,6 +285,9 @@ func EvaluateIntentCandidates(
 			return result, err
 		}
 	}
+	if err := reopenProtectedSemanticIntentCandidates(ctx, db, input, existing); err != nil {
+		return result, err
+	}
 	for _, candidate := range existing {
 		result.VisibleCandidateIDs = append(
 			result.VisibleCandidateIDs, candidate.ID)
@@ -297,6 +300,16 @@ func EvaluateIntentCandidates(
 	if err != nil {
 		return result, err
 	}
+	// A rejected semantic grouping has no valid boundary to preserve. Keep
+	// its captures and history, but let the next plan repartition them. Saving
+	// corrected candidates atomically supersedes their old memberships.
+	planningCandidates := make([]state.IntentCandidate, 0, len(existing))
+	for _, candidate := range existing {
+		if candidate.Status != state.IntentCandidateWaiting || !intentCandidateNeedsSemanticReview(candidate) {
+			planningCandidates = append(planningCandidates, candidate)
+		}
+	}
+	existing = planningCandidates
 	if input.IncludeDiffs && input.RepoPath != "" {
 		bySeq := map[int64]IntentCandidateCapture{}
 		for _, capture := range allCaptures {
@@ -542,9 +555,12 @@ func EvaluateIntentCandidates(
 			return result, err
 		}
 		result.Decisions = append(result.Decisions, decision)
-		if !decision.Publishable && assignment.Readiness == ai.IntentCandidateReady {
+		if !decision.Publishable && assignment.Readiness == ai.IntentCandidateReady && !intentAtomicityNeedsSemanticReview(decision.Atomicity) {
 			result.NeedsAttention = true
 		}
+	}
+	if err := scheduleRejectedIntentGoalReview(ctx, db, input, req, plan, continuations, planRun, &result); err != nil {
+		return result, err
 	}
 
 	if throughBoundary > 0 {
@@ -554,6 +570,156 @@ func EvaluateIntentCandidates(
 		}
 	}
 	return result, nil
+}
+
+// An unproved relationship asks for another semantic plan, not a settings
+// change. Other failed or pending gates retain their existing safety handling.
+func intentAtomicityNeedsSemanticReview(report ai.IntentAtomicityReport) bool {
+	failed := false
+	for _, gate := range report.Gates {
+		if gate.Status == ai.IntentAtomicityPassed || gate.Status == ai.IntentAtomicityNotRequired {
+			continue
+		}
+		if gate.Status == ai.IntentAtomicityPending && gate.Gate == ai.IntentAtomicityVerification &&
+			gate.Finding != nil && gate.Finding.Code == "candidate_not_atomic" {
+			continue
+		}
+		if gate.Status != ai.IntentAtomicityFailed || gate.Finding == nil ||
+			gate.Finding.Code != "candidate_lacks_semantic_evidence" ||
+			(gate.Gate != ai.IntentAtomicityCohesion && gate.Gate != ai.IntentAtomicitySeparation && gate.Gate != ai.IntentAtomicityRevertibility) {
+			return false
+		}
+		failed = true
+	}
+	return failed
+}
+
+func scheduleRejectedIntentGoalReview(ctx context.Context, db *state.DB, input IntentCandidateEvaluation, req ai.IntentPlanRequestV2, plan ai.IntentPlanV2, continuations []intentCandidateContinuation, run state.IntentPlanRun, result *IntentCandidateEvaluationResult) error {
+	unresolved := map[int64]bool{}
+	for _, decision := range result.Decisions {
+		if decision.Publishable || !intentAtomicityNeedsSemanticReview(decision.Atomicity) {
+			continue
+		}
+		for _, member := range decision.Candidate.Events {
+			if member.EventRole != "coalesced" {
+				unresolved[member.EventSeq] = true
+			}
+		}
+		for i := range plan.Candidates {
+			if plan.Candidates[i].CandidateID == decision.Assignment.CandidateID {
+				plan.Candidates[i].Readiness = ai.IntentCandidateWait
+				plan.Candidates[i].MissingCompanions = []string{"captured relationships need a grounded goal review"}
+			}
+		}
+	}
+	if len(unresolved) == 0 {
+		return nil
+	}
+	run.UnresolvedSeqs = nil
+	run.PreservedGroups = nil
+	for _, decision := range result.Decisions {
+		if decision.Publishable {
+			run.PreservedGroups = append(run.PreservedGroups, append([]int64(nil), decision.Assignment.SelectedSeqs...))
+		}
+	}
+	for seq := range unresolved {
+		run.UnresolvedSeqs = append(run.UnresolvedSeqs, seq)
+	}
+	sort.Slice(run.UnresolvedSeqs, func(i, j int) bool { return run.UnresolvedSeqs[i] < run.UnresolvedSeqs[j] })
+	run.Completed = true
+	run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
+	run.ResolutionMode = run.ProgressState
+	run.ProviderDeadlineTS = 0
+	run.FindingCodes = []string{"candidate_lacks_semantic_evidence"}
+	if err := storeResolvedIntentPlanRun(&run, plan, continuations); err != nil {
+		return err
+	}
+	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+		return err
+	}
+	evidence, err := intentSemanticRetryEvidence(req, input, run.AttemptLimit)
+	if err != nil {
+		return err
+	}
+	if err := scheduleIntentSemanticRetry(ctx, db, input, run, evidence, input.Now.Add(time.Hour)); err != nil {
+		return err
+	}
+	result.UnresolvedCaptureCount = len(run.UnresolvedSeqs)
+	result.PreservedGroupCount = len(run.PreservedGroups)
+	if !result.NeedsAttention {
+		result.Fallback = "waiting_semantic_retry"
+		result.ResolutionMode = "waiting_semantic_retry"
+	}
+	return nil
+}
+
+// Older workers persisted these semantic misses as blocked. Reopen only an
+// exact unpublished pending membership already protected by completed capture.
+// The writer keeps its membership and all immutable capture evidence intact.
+func reopenProtectedSemanticIntentCandidates(ctx context.Context, db *state.DB, input IntentCandidateEvaluation, candidates []state.IntentCandidate) error {
+	attention, _, err := state.MetaGet(ctx, db, MetaKeyBranchTransitionNeedsAttention)
+	if err != nil || attention != "" {
+		return err
+	}
+	for i := range candidates {
+		candidate := &candidates[i]
+		if candidate.Status != state.IntentCandidateBlocked || candidate.BranchRef != input.BranchRef || candidate.BranchGeneration != input.BranchGeneration ||
+			!intentCandidateNeedsSemanticReview(*candidate) || len(candidate.Events) == 0 || len(candidate.Events) > state.IntentCandidateMaxCaptures {
+			continue
+		}
+		var members int
+		var safe bool
+		if err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*),
+ NOT EXISTS (SELECT 1 FROM self_publications WHERE branch_ref=? AND branch_generation=? AND phase IN ('prepared','git_applied'))
+ AND NOT EXISTS (SELECT 1 FROM intent_repairs WHERE branch_ref=? AND branch_generation=? AND status IN ('prepared','git_applied'))
+ AND NOT EXISTS (SELECT 1 FROM publication_drains WHERE branch_ref=? AND branch_generation=? AND phase NOT IN ('completed','needs_action'))
+FROM intent_candidate_events membership JOIN capture_events event ON event.seq=membership.event_seq
+WHERE membership.candidate_id=? AND membership.membership_state='active'
+ AND event.state='pending' AND event.branch_ref=? AND event.branch_generation=?
+ AND EXISTS (SELECT 1 FROM checkpoint_events member JOIN checkpoints checkpoint ON checkpoint.id=member.checkpoint_id
+  WHERE member.event_seq=event.seq AND checkpoint.phase='completed' AND checkpoint.retained=1
+   AND checkpoint.coverage_complete=1 AND checkpoint.observed_ref=event.branch_ref)`, input.BranchRef, input.BranchGeneration,
+			input.BranchRef, input.BranchGeneration, input.BranchRef, input.BranchGeneration,
+			candidate.ID, input.BranchRef, input.BranchGeneration).Scan(&members, &safe); err != nil {
+			return err
+		}
+		if !safe || members != len(candidate.Events) {
+			continue
+		}
+		candidate.Status = state.IntentCandidateWaiting
+		candidate.Readiness = state.IntentReadinessWait
+		candidate.UpdatedTS = intentPlannerHealthTimestamp(input.Now)
+		if err := state.SaveIntentCandidate(ctx, db, *candidate); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func intentCandidateNeedsSemanticReview(candidate state.IntentCandidate) bool {
+	if candidate.PublishedCommitOID.Valid || candidate.SoftPublicationDeadline.Valid ||
+		candidate.AtomicityStatus.String != string(ai.IntentAtomicityFailed) ||
+		len(candidate.AtomicitySummary) >= ai.IntentAtomicityCorrectionCap ||
+		(candidate.VerificationStatus.Valid && candidate.VerificationStatus.String != "not_required" && candidate.VerificationStatus.String != "pending") {
+		return false
+	}
+	failed := false
+	for _, line := range strings.Split(candidate.AtomicitySummary, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[0] != "candidate="+candidate.ID {
+			return false
+		}
+		if fields[1] == "gate=verification" && fields[2] == "code=candidate_not_atomic:" && candidate.VerificationStatus.String == "pending" {
+			continue
+		}
+		if fields[2] != "code=candidate_lacks_semantic_evidence:" ||
+			(fields[1] != "gate=cohesion" && fields[1] != "gate=separation" && fields[1] != "gate=revertibility") {
+			return false
+		}
+		failed = true
+	}
+	return failed
 }
 
 func intentCandidatesWithinTarget(
@@ -1406,6 +1572,10 @@ func chooseIntentCandidatePlan(
 				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 			}
 		} else {
+			var previous resolvedIntentPlanRun
+			if len(run.ResolvedPlanJSON.String) <= state.IntentResolvedPlanJSONCap {
+				_ = json.Unmarshal([]byte(run.ResolvedPlanJSON.String), &previous)
+			}
 			run.Completed = false
 			run.ResolvedPlanJSON = sql.NullString{}
 			run.ProgressState = sql.NullString{String: "local_cache_rebuild", Valid: true}
@@ -1416,6 +1586,15 @@ func chooseIntentCandidatePlan(
 			}
 			plannerFailure = ai.SanitizePlannerError(loadErr.Error())
 			skipSemanticPlanning = true
+			if retryMatches {
+				// A due review must reserve a fresh bounded semantic session even
+				// when the rejected waiting group cannot pass cached-plan checks.
+				run, err = reopenIntentSemanticPlanRun(ctx, db, req, run, previous.Plan)
+				if err != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+				}
+				skipSemanticPlanning = false
+			}
 		}
 	}
 	if run.AttemptCount >= run.AttemptLimit {
@@ -1907,7 +2086,7 @@ func loadPreservedIntentGroups(req ai.IntentPlanRequestV2, run state.IntentPlanR
 			validation.Dependencies = append(validation.Dependencies, edge)
 		}
 	}
-	if ai.ValidateIntentPlanV2(validation, stored.Plan) != nil {
+	if ValidateIntentGoalPlan(validation, stored.Plan) != nil {
 		return nil, req
 	}
 	return preserved, partial
@@ -2062,10 +2241,10 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 	for _, edge := range req.Dependencies {
 		if edge.Strength == ai.IntentDependencySoft {
 			switch edge.Kind {
-			case "symbol_hash", "hunk_hash", "import_reference", "generated_artifact_reference", "documented_public_reference":
+			case "symbol_hash", "hunk_hash", "import_reference", "generated_artifact_reference", "documented_public_reference", "documented_api_reference", "published_documented_api_reference":
 				// Retained hints may predate the grounded analyzer. Reprove their
 				// relationship from recorded evidence before using them as cohesion.
-				if !proven[key(edge.FromSeq, edge.ToSeq, edge.Kind)] {
+				if !proven[key(edge.FromSeq, edge.ToSeq, strings.TrimPrefix(edge.Kind, "published_"))] {
 					continue
 				}
 			}
@@ -2106,7 +2285,7 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 	}
 	if len(published) > 0 {
 		for i, edge := range edges {
-			if (edge.Kind == "test_source" || edge.Kind == "migration_test" || edge.Kind == "documented_public_reference") &&
+			if (edge.Kind == "test_source" || edge.Kind == "migration_test" || edge.Kind == "documented_public_reference" || edge.Kind == "documented_api_reference") &&
 				(published[edge.FromSeq] || published[edge.ToSeq]) {
 				// Published companions can explain a private history repair,
 				// but are not missing unpublished support for a new commit.
@@ -2141,7 +2320,7 @@ func validateIntentCandidateCompanions(seqs []int64, edges []ai.IntentCaptureDep
 		selected[seq] = true
 	}
 	for _, edge := range edges {
-		if edge.Kind != "test_source" && edge.Kind != "migration_test" && edge.Kind != "documented_public_reference" {
+		if edge.Kind != "test_source" && edge.Kind != "migration_test" && edge.Kind != "documented_public_reference" && edge.Kind != "documented_api_reference" {
 			continue
 		}
 		if selected[edge.FromSeq] != selected[edge.ToSeq] {
@@ -3053,6 +3232,9 @@ func evaluateIntentCandidateAssignment(
 				break
 			}
 		}
+		if intentAtomicityNeedsSemanticReview(report) {
+			status = state.IntentCandidateWaiting
+		}
 	}
 	nowSeconds := float64(input.Now.UnixNano()) / 1e9
 	created := nowSeconds
@@ -3222,7 +3404,7 @@ func balancedIntentCandidatePlan(
 		if !leftOK || !rightOK || left == right {
 			continue
 		}
-		if edge.Kind == "documented_public_reference" {
+		if edge.Kind == "documented_public_reference" || edge.Kind == "documented_api_reference" {
 			// Several documentation captures can describe one exact public API.
 			// They are available support, not competing test implementations.
 			union(left, right)
@@ -3303,7 +3485,7 @@ func balancedIntentCandidatePlan(
 
 func balancedIntentCompanionDependency(kind string) bool {
 	switch kind {
-	case "test_source", "migration_test", "documented_public_reference":
+	case "test_source", "migration_test", "documented_public_reference", "documented_api_reference":
 		return true
 	default:
 		return false
