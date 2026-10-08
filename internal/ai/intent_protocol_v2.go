@@ -548,6 +548,9 @@ func ValidateIntentPlanRequestV2(req IntentPlanRequestV2) error {
 	if len(req.BaselineCandidates) > 0 {
 		baselineReq := req
 		baselineReq.BaselineCandidates = nil
+		// The baseline establishes membership before semantic planning. An
+		// urgent request does not make its local message evidence complete.
+		baselineReq.ForcedAging = false
 		if err := ValidateIntentPlanV2(baselineReq, IntentPlanV2{
 			ProtocolVersion: IntentPlannerProtocolV2,
 			Candidates:      req.BaselineCandidates,
