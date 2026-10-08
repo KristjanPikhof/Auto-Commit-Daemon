@@ -548,9 +548,6 @@ func ValidateIntentPlanRequestV2(req IntentPlanRequestV2) error {
 	if len(req.BaselineCandidates) > 0 {
 		baselineReq := req
 		baselineReq.BaselineCandidates = nil
-		// The baseline establishes membership before semantic planning. An
-		// urgent request does not make its local message evidence complete.
-		baselineReq.ForcedAging = false
 		if err := ValidateIntentPlanV2(baselineReq, IntentPlanV2{
 			ProtocolVersion: IntentPlannerProtocolV2,
 			Candidates:      req.BaselineCandidates,
@@ -627,20 +624,6 @@ func ValidateIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) error {
 				fmt.Sprintf("offered seq %d is not assigned to a candidate", capture.Seq))
 		}
 	}
-	if req.ForcedAging {
-		for _, capture := range req.OfferedCaptures {
-			candidate := plan.Candidates[assignments[capture.Seq]]
-			if candidate.Readiness != IntentCandidateReady ||
-				len(candidate.MissingCompanions) > 0 {
-				return v2ValidationError(candidate.CandidateID,
-					IntentAtomicityCompleteness, "forced_capture_deferred",
-					fmt.Sprintf(
-						"forced-aging seq %d must be ready with no missing companions",
-						capture.Seq))
-			}
-		}
-	}
-
 	dependencies := make([]map[int]struct{}, len(plan.Candidates))
 	declaredDependencyIDs := make([]map[string]struct{}, len(plan.Candidates))
 	for i, candidate := range plan.Candidates {

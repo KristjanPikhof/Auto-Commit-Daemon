@@ -154,7 +154,7 @@ func TestValidateIntentPlanV2RejectsReadyCandidateWithMissingCompanion(t *testin
 	}
 }
 
-func TestValidateIntentPlanV2RejectsDeferredForcedCapture(t *testing.T) {
+func TestValidateIntentPlanV2RetainsIncompleteForcedCapture(t *testing.T) {
 	req, err := NewIntentPlanRequestV2(IntentPlanRequestV2Options{
 		OfferedCaptures: []OfferedCapture{{
 			Seq: 1, Path: "a.go", Op: "modify",
@@ -166,16 +166,14 @@ func TestValidateIntentPlanV2RejectsDeferredForcedCapture(t *testing.T) {
 	}
 	candidate := readyCandidate("forced", []int64{1})
 	candidate.Readiness = IntentCandidateWait
-	candidate.MissingCompanions = []string{"a companion outside the forced window"}
+	candidate.MissingCompanions = []string{"the captured caller refers to an unavailable migration"}
 
 	err = ValidateIntentPlanV2(req, IntentPlanV2{
 		ProtocolVersion: IntentPlannerProtocolV2,
 		Candidates:      []IntentCandidateAssignment{candidate},
 	})
-	var validationErr *IntentPlanV2ValidationError
-	if !errors.As(err, &validationErr) ||
-		validationErr.Findings[0].Code != "forced_capture_deferred" {
-		t.Fatalf("error = %T %v", err, err)
+	if err != nil {
+		t.Fatalf("age waived a valid completeness wait: %v", err)
 	}
 }
 
