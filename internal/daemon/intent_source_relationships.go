@@ -12,6 +12,10 @@ var (
 	intentSourceQuoted      = regexp.MustCompile("\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|`[^`]*`")
 	intentSourceMultiline   = regexp.MustCompile(`(?s)""".*?(?:"""|$)|'''.*?(?:'''|$)` + "|`[^`]*(?:`|$)")
 	intentSourceFilePath    = regexp.MustCompile(`[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*\.[a-zA-Z0-9_-]+`)
+	intentPublicFlagCall    = regexp.MustCompile(`\.(?:PersistentFlags|Flags)\(\)\.(?:String|Bool|Int(?:32|64)?|Uint(?:32|64)?|Duration|Float(?:32|64)|StringSlice|StringArray|Count)(?:Var)?P?\(`)
+	intentPublicFlagName    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{1,63}$`)
+	intentPublicStatusName  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{7,63}$`)
+	intentDocumentInline    = regexp.MustCompile("`([^`\n]+)`")
 )
 
 // These are bounded lexical relationships, not a language parser. Declarations
@@ -145,4 +149,61 @@ func intentSourceImports(imports map[string]struct{}, importer, target string) b
 		}
 	}
 	return false
+}
+
+func intentSourcePublicReferences(diff string) map[string]struct{} {
+	public := make(map[string]struct{})
+	for _, line := range intentSourceCodeLines(diff) {
+		quoted := intentSourceQuoted.FindString(line)
+		if quoted == "" {
+			continue
+		}
+		value := strings.Trim(quoted, "\"'")
+		if intentPublicFlagCall.MatchString(line) && intentPublicFlagName.MatchString(value) {
+			public["--"+value] = struct{}{}
+		} else if strings.HasPrefix(line, "return "+quoted) &&
+			intentPublicStatusName.MatchString(value) && strings.ContainsAny(value, "-_") {
+			public[value] = struct{}{}
+		}
+		if len(public) >= 128 {
+			break
+		}
+	}
+	return public
+}
+
+func intentDocumentPublicReferences(diff string) map[string]struct{} {
+	used := make(map[string]struct{})
+	inFence := false
+	for _, raw := range strings.Split(diff, "\n") {
+		if len(raw) == 0 || (raw[0] != '+' && raw[0] != '-' && raw[0] != ' ') ||
+			strings.HasPrefix(raw, "+++") || strings.HasPrefix(raw, "---") {
+			continue
+		}
+		line := strings.TrimSpace(raw[1:])
+		if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if raw[0] != '+' && raw[0] != '-' {
+			continue
+		}
+		var fragments []string
+		if inFence {
+			fragments = append(fragments, line)
+		}
+		for _, match := range intentDocumentInline.FindAllStringSubmatch(line, 128) {
+			fragments = append(fragments, match[1])
+		}
+		for _, fragment := range fragments {
+			for _, token := range strings.FieldsFunc(fragment, func(r rune) bool {
+				return unicode.IsSpace(r) || strings.ContainsRune("`'\",;()[]{}=.:", r)
+			}) {
+				if len(used) < 128 && len(token) <= 66 {
+					used[token] = struct{}{}
+				}
+			}
+		}
+	}
+	return used
 }

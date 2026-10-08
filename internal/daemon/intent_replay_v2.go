@@ -1290,6 +1290,8 @@ func runtimeIntentDependencyHints(
 		files     map[string]struct{}
 		imports   map[string]struct{}
 		changeIDs map[string]struct{}
+		public    map[string]struct{}
+		docUses   map[string]struct{}
 		generated bool
 	}
 	ordered := append([]IntentCandidateCapture(nil), captures...)
@@ -1310,8 +1312,14 @@ func runtimeIntentDependencyHints(
 		if role := intentCaptureRole(capture); role == "code" || role == "test" || role == "migration" {
 			item.declared, item.symbols = intentSourceSymbols(capture.CapturedDiff)
 			item.changeIDs = runtimeIntentChangeIDs(capture.CapturedDiff)
+			if role == "code" {
+				item.public = intentSourcePublicReferences(capture.CapturedDiff)
+			}
 		} else {
 			item.imports = nil
+			if role == "documentation" {
+				item.docUses = intentDocumentPublicReferences(capture.CapturedDiff)
+			}
 		}
 		items = append(items, item)
 	}
@@ -1353,6 +1361,11 @@ func runtimeIntentDependencyHints(
 	for i := range items {
 		for j := i + 1; j < len(items); j++ {
 			earlier, later := items[i], items[j]
+			if reference := firstRuntimeIntentFeature(earlier.public, later.docUses); reference != "" {
+				add(earlier.seq, later.seq, ai.IntentDependencySoft, "documented_public_reference", reference)
+			} else if reference := firstRuntimeIntentFeature(later.public, earlier.docUses); reference != "" {
+				add(later.seq, earlier.seq, ai.IntentDependencySoft, "documented_public_reference", reference)
+			}
 			shared := firstRuntimeIntentFeature(earlier.declared, later.symbols)
 			if reverse := firstRuntimeIntentFeature(later.declared, earlier.symbols); reverse != "" && (shared == "" || reverse < shared) {
 				shared = reverse

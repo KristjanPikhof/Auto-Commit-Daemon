@@ -2062,7 +2062,7 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 	for _, edge := range req.Dependencies {
 		if edge.Strength == ai.IntentDependencySoft {
 			switch edge.Kind {
-			case "symbol_hash", "hunk_hash", "import_reference", "generated_artifact_reference":
+			case "symbol_hash", "hunk_hash", "import_reference", "generated_artifact_reference", "documented_public_reference":
 				// Retained hints may predate the grounded analyzer. Reprove their
 				// relationship from recorded evidence before using them as cohesion.
 				if !proven[key(edge.FromSeq, edge.ToSeq, edge.Kind)] {
@@ -2106,7 +2106,7 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 	}
 	if len(published) > 0 {
 		for i, edge := range edges {
-			if (edge.Kind == "test_source" || edge.Kind == "migration_test") &&
+			if (edge.Kind == "test_source" || edge.Kind == "migration_test" || edge.Kind == "documented_public_reference") &&
 				(published[edge.FromSeq] || published[edge.ToSeq]) {
 				// Published companions can explain a private history repair,
 				// but are not missing unpublished support for a new commit.
@@ -2141,11 +2141,11 @@ func validateIntentCandidateCompanions(seqs []int64, edges []ai.IntentCaptureDep
 		selected[seq] = true
 	}
 	for _, edge := range edges {
-		if edge.Kind != "test_source" && edge.Kind != "migration_test" {
+		if edge.Kind != "test_source" && edge.Kind != "migration_test" && edge.Kind != "documented_public_reference" {
 			continue
 		}
 		if selected[edge.FromSeq] != selected[edge.ToSeq] {
-			return fmt.Errorf("available implementation and supporting test captures %d and %d must complete one goal", edge.FromSeq, edge.ToSeq)
+			return fmt.Errorf("available implementation and supporting capture %d and %d must complete one goal", edge.FromSeq, edge.ToSeq)
 		}
 	}
 	return nil
@@ -3222,6 +3222,12 @@ func balancedIntentCandidatePlan(
 		if !leftOK || !rightOK || left == right {
 			continue
 		}
+		if edge.Kind == "documented_public_reference" {
+			// Several documentation captures can describe one exact public API.
+			// They are available support, not competing test implementations.
+			union(left, right)
+			continue
+		}
 		if neighbors[left] == nil {
 			neighbors[left] = make(map[int]struct{})
 		}
@@ -3297,7 +3303,7 @@ func balancedIntentCandidatePlan(
 
 func balancedIntentCompanionDependency(kind string) bool {
 	switch kind {
-	case "test_source", "migration_test":
+	case "test_source", "migration_test", "documented_public_reference":
 		return true
 	default:
 		return false

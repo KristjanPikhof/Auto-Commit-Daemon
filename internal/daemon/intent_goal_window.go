@@ -184,7 +184,7 @@ func expandIntentGoalWindow(
 
 func intentGoalCompanionEdge(edge ai.IntentCaptureDependency, references map[int64]intentGoalReferences) bool {
 	switch edge.Kind {
-	case "test_source", "migration_test", "import_reference", "generated_artifact_reference":
+	case "test_source", "migration_test", "import_reference", "generated_artifact_reference", "documented_public_reference":
 		return true
 	case "symbol_hash":
 		for _, seq := range []int64{edge.FromSeq, edge.ToSeq} {
