@@ -1152,11 +1152,15 @@ func reconstructIntentRepairMappings(
 		return nil, err
 	}
 	base, err := git.RevParse(ctx, repoRoot, oldest+"^")
-	if err != nil {
+	if err != nil && !errors.Is(err, git.ErrRefNotFound) {
 		return nil, fmt.Errorf("daemon: recover intent repair: resolve repair base: %w", err)
 	}
+	rangeSpec := head
+	if base != "" {
+		rangeSpec = base + ".." + head
+	}
 	out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
-		"rev-list", "--first-parent", "--reverse", base+".."+head)
+		"rev-list", "--first-parent", "--reverse", fmt.Sprintf("--max-count=%d", git.MaxIntentRepairCommits+1), rangeSpec)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: recover intent repair: inspect rebuilt chain: %w", err)
 	}
@@ -1201,9 +1205,17 @@ func intentRepairOldestMappedCommit(ctx context.Context, repoRoot string, mappin
 	}
 	var oldest string
 	for oid := range old {
-		parent, err := git.RevParse(ctx, repoRoot, oid+"^")
+		out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, "rev-list", "--parents", "-n", "1", oid)
 		if err != nil {
 			return "", err
+		}
+		fields := strings.Fields(string(out))
+		if len(fields) < 1 || fields[0] != oid || len(fields) > 2 {
+			return "", intentRepairRecoveryProofError("mapped old commit has invalid linear ancestry")
+		}
+		parent := ""
+		if len(fields) == 2 {
+			parent = fields[1]
 		}
 		if _, included := old[parent]; !included {
 			if oldest != "" {
