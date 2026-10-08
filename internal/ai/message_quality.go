@@ -118,7 +118,7 @@ func EvaluateIntentPlanMessageQuality(req IntentPlanRequest, plan IntentPlan) Me
 	if isFilenameOnlySubject(subject, ctx.paths) {
 		report.add(MessageQualityReasonFilenameOnly, "subject only names a file or path")
 	}
-	if isTokenOnlySubject(subject) {
+	if isTokenOnlySubject(subject) || isCapturedSymbolOnlySubject(subject, ctx.captures) {
 		report.add(MessageQualityReasonTokenOnly, "subject only names a parsed token or symbol")
 	}
 
@@ -333,6 +333,19 @@ func isTokenOnlySubject(subject string) bool {
 	switch strings.ToLower(tail) {
 	case "parsed", "total", "value", "data", "state", "result", "item", "items", "helper", "logic", "flow":
 		return true
+	}
+	return false
+}
+
+func isCapturedSymbolOnlySubject(subject string, captures []OfferedCapture) bool {
+	tail := strings.Trim(subjectTail(subjectTailForQuality(subject)), "`'\" ")
+	if tail == "" || strings.Contains(tail, " ") {
+		return false
+	}
+	for _, capture := range captures {
+		if changeClass(capture.Path) == "code" && extractSymbol(capture.Path, capture.CapturedDiff) == tail {
+			return true
+		}
 	}
 	return false
 }

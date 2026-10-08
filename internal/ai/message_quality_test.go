@@ -253,6 +253,16 @@ func TestIntentMessageQualityRewritesClippedOutcomes(t *testing.T) {
 	}
 }
 
+func TestIntentMessageQualityRejectsCapturedSingleWordSymbol(t *testing.T) {
+	t.Parallel()
+	report := EvaluateIntentPlanMessageQuality(IntentPlanRequest{
+		OfferedCaptures: []OfferedCapture{{Seq: 1, Path: "math.go", CapturedDiff: "+func One() int { return 1 }\n"}},
+	}, IntentPlan{SelectedSeqs: []int64{1}, Subject: "Add One"})
+	if report.Action != MessageQualityRewrite || !report.HasReason(MessageQualityReasonTokenOnly) {
+		t.Fatalf("captured symbol escaped semantic message policy: %+v", report)
+	}
+}
+
 func TestEvaluateIntentPlanMessageQuality_ConventionalFormat(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
 	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{
