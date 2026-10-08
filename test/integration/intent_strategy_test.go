@@ -76,8 +76,8 @@ func TestIntentStrategy_RejectsDisconnectedNativeGroup(t *testing.T) {
 	if paused.ExitCode != 0 {
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
-	writeFile(t, filepath.Join(repo, "intent-one.txt"), "one\n")
-	writeFile(t, filepath.Join(repo, "intent-two.txt"), "two\n")
+	writeFile(t, filepath.Join(repo, "intent-one.md"), "# Release checklist\n")
+	writeFile(t, filepath.Join(repo, "intent-two.md"), "# Recovery workflow\n")
 
 	startCount := commitCount(t, repo)
 	resumed := runAcd(t, ctx, envWith(env, extra...), "resume", "--repo", repo, "--yes", "--json")
@@ -90,17 +90,17 @@ func TestIntentStrategy_RejectsDisconnectedNativeGroup(t *testing.T) {
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitForEventState(t, dbPath, "intent-one.txt", "published", 10*time.Second)
+	waitForEventState(t, dbPath, "intent-one.md", "published", 10*time.Second)
 	flushed = runAcd(t, ctx, envWith(env, extra...), "flush", "--repo", repo,
 		"--session-id", "intent-group", "--logical", "--json")
 	if flushed.ExitCode != 0 {
 		t.Fatalf("second acd flush exit=%d\nstdout=%s\nstderr=%s",
 			flushed.ExitCode, flushed.Stdout, flushed.Stderr)
 	}
-	waitForEventState(t, dbPath, "intent-two.txt", "published", 10*time.Second)
+	waitForEventState(t, dbPath, "intent-two.md", "published", 10*time.Second)
 
-	oidOne := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'intent-one.txt' ORDER BY seq DESC LIMIT 1")
-	oidTwo := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'intent-two.txt' ORDER BY seq DESC LIMIT 1")
+	oidOne := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'intent-one.md' ORDER BY seq DESC LIMIT 1")
+	oidTwo := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'intent-two.md' ORDER BY seq DESC LIMIT 1")
 	if oidOne == "" || oidTwo == "" || oidOne == oidTwo {
 		t.Fatalf("disconnected commit oids one=%q two=%q", oidOne, oidTwo)
 	}
