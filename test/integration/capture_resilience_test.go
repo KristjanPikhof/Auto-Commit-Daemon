@@ -91,6 +91,9 @@ func TestCaptureResilienceLargeAssetsDuringProviderOutage(t *testing.T) {
 	if indexAfter != indexBefore {
 		t.Fatalf("user staging changed: before=%s after=%s", indexBefore, indexAfter)
 	}
+	waitFor(t, "provider outage after large assets are protected", 15*time.Second, func() bool {
+		return plannerHits.Load() >= 1 && sawMetadata.Load()
+	})
 	if plannerHits.Load() < 1 || plannerHits.Load() > 3 || messageHits.Load() != 0 || !sawMetadata.Load() {
 		t.Fatalf("provider calls=%d message calls=%d binary metadata=%t", plannerHits.Load(), messageHits.Load(), sawMetadata.Load())
 	}
