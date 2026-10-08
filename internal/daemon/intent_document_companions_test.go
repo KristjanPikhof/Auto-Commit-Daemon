@@ -15,6 +15,7 @@ import (
 )
 
 func TestIntentDocumentCompanionsRequireExactPublicReferences(t *testing.T) {
+	t.Parallel()
 	for _, testCase := range []struct {
 		name, source, documentation string
 		connected                   bool
@@ -74,6 +75,7 @@ func TestIntentDocumentCompanionsRequireExactPublicReferences(t *testing.T) {
 }
 
 func TestIntentDocumentReferenceKeepsQuotedCodeIndependent(t *testing.T) {
+	t.Parallel()
 	first := intentCandidateCaptureFixture(1, "phase.go", "create", "", "phase")
 	first.CapturedDiff = "+return \"provider-retry-due\"\n"
 	second := intentCandidateCaptureFixture(2, "label.go", "create", "", "label")
@@ -84,6 +86,7 @@ func TestIntentDocumentReferenceKeepsQuotedCodeIndependent(t *testing.T) {
 }
 
 func TestIntentDocumentCompanionWindowFindsLateUsageGuide(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {

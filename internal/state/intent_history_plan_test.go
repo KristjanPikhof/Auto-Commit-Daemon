@@ -7,6 +7,7 @@ import (
 )
 
 func TestIntentHistoryPlanRemainsImmutableAcrossQueueRestart(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db, path := openTestDB(t)
 	plan, err := SaveIntentHistoryPlan(ctx, db, IntentHistoryPlan{SourceBranchRef: "refs/heads/main", TargetBranchRef: "refs/heads/goals", ExpectedHead: "frozen", Goals: []IntentHistoryGoal{{ID: "goal", Purpose: "complete outcome"}}})

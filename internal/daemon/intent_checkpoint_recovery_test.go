@@ -186,6 +186,7 @@ func (p *expandedTargetRecoveryPlanner) PlanIntentV2(
 }
 
 func TestIntentEvaluationAwaitingCheckpointRecovery(t *testing.T) {
+	t.Parallel()
 	recoverable := IntentCandidateEvaluationResult{
 		NeedsAttention: true,
 		Decisions: []IntentCandidateDecision{{
@@ -231,6 +232,7 @@ func TestIntentEvaluationAwaitingCheckpointRecovery(t *testing.T) {
 }
 
 func TestReplayVerificationResourceWaitRetainsSemanticTarget(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	f := newCaptureFixture(t)
 	seedTrackedFileCommit(t, ctx, f, "resource_wait.go",
@@ -604,6 +606,7 @@ UPDATE daemon_meta SET value=? WHERE key='intent.v2.forward_recovery'`,
 }
 
 func TestReplayLocalUnlockWidensResolvedSemanticPrefix(t *testing.T) {
+	t.Parallel()
 	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -691,6 +694,7 @@ func TestReplayLocalUnlockWidensResolvedSemanticPrefix(t *testing.T) {
 }
 
 func TestReplayLocalUnlockStopsAfterFullSemanticPrefixFailure(t *testing.T) {
+	t.Parallel()
 	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -753,6 +757,7 @@ func TestReplayLocalUnlockStopsAfterFullSemanticPrefixFailure(t *testing.T) {
 }
 
 func TestLockedRecoveryPrefixRetainsGroundedGoals(t *testing.T) {
+	t.Parallel()
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
 		OfferedCaptures: []ai.OfferedCapture{
 			{Seq: 1, Path: "label.go", Op: "create", Fidelity: "full", CapturedDiff: "+const DefaultLabel = \"complete\"\n"},
@@ -817,6 +822,7 @@ func TestSupersedingIntentForwardRecoveryTargetIncludesCompletePathChain(
 }
 
 func TestReplayFullSemanticPrefixExpandsToLaterCheckpointChain(t *testing.T) {
+	t.Parallel()
 	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -904,6 +910,7 @@ func TestReplayFullSemanticPrefixExpandsToLaterCheckpointChain(t *testing.T) {
 }
 
 func TestReplayReopensExhaustedRecoveryForLaterCheckpointChain(t *testing.T) {
+	t.Parallel()
 	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -968,6 +975,7 @@ func TestReplayReopensExhaustedRecoveryForLaterCheckpointChain(t *testing.T) {
 }
 
 func TestReplayResetsStalePrefixAfterCrashPublication(t *testing.T) {
+	t.Parallel()
 	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -1021,6 +1029,7 @@ WHERE seq=?`, newHead, fixture.seqs[2]); err != nil {
 }
 
 func TestReplayReplansPartiallyResolvedStoredCandidate(t *testing.T) {
+	t.Parallel()
 	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -1097,6 +1106,7 @@ WHERE seq=?`, f.cctx.BaseHead, fixture.seqs[2]); err != nil {
 }
 
 func TestReplayReplansInvalidCachedPrefixMarker(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name   string
 		mutate func(*testing.T, *captureFixture, state.IntentForwardRecovery)
@@ -1184,6 +1194,7 @@ func TestReplayReplansInvalidCachedPrefixMarker(t *testing.T) {
 }
 
 func TestReplayLegacyLocalUnlockReplansBeforeSelectingPrefix(t *testing.T) {
+	t.Parallel()
 	fixture := seedFailedCheckpointReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -1233,6 +1244,7 @@ func TestReplayLegacyLocalUnlockReplansBeforeSelectingPrefix(t *testing.T) {
 }
 
 func TestReplayIntentCandidateRecoversBeforeForcedPreflightFailure(t *testing.T) {
+	t.Parallel()
 	fixture := seedFailedCheckpointReplayFixture(t)
 	f := fixture.capture
 	seqs := fixture.seqs
@@ -1371,6 +1383,7 @@ SELECT state,commit_oid FROM capture_events WHERE seq=?`, seq).
 }
 
 func TestReplayFailedCheckpointRecoveryPrecedesFreshCapture(t *testing.T) {
+	t.Parallel()
 	fixture := seedFailedCheckpointReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -1632,6 +1645,7 @@ func TestReplayFailedCheckpointRecoveryWaitsForEveryTargetPath(t *testing.T) {
 }
 
 func TestUpdateIntentForwardRecoveryRetainsPartiallyResolvedTarget(t *testing.T) {
+	t.Parallel()
 	fixture := seedFailedCheckpointReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -1695,6 +1709,7 @@ WHERE seq=?`, fixture.seqs[2]); err != nil {
 }
 
 func TestUpdateIntentForwardRecoveryPreservesTransientWaitStage(t *testing.T) {
+	t.Parallel()
 	fixture := seedFailedCheckpointReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -1728,6 +1743,7 @@ func TestUpdateIntentForwardRecoveryPreservesTransientWaitStage(t *testing.T) {
 }
 
 func TestUpdateIntentForwardRecoveryPreservesProviderWaitStage(t *testing.T) {
+	t.Parallel()
 	fixture := seedFailedCheckpointReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
@@ -1765,6 +1781,7 @@ func TestUpdateIntentForwardRecoveryPreservesProviderWaitStage(t *testing.T) {
 }
 
 func TestReplayClearsResolvedOlderIntentCheckpointRecoveryAfterRestart(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	for path, contents := range map[string]string{

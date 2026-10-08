@@ -11,6 +11,7 @@ import (
 )
 
 func TestIntentHistorySavedPlanRevalidatesGoalEvidenceAndVersions(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	a := mustCommitPath(t, f.dir, "a.txt", "alpha\n", "Add alpha")
@@ -51,6 +52,7 @@ func TestIntentHistorySavedPlanRevalidatesGoalEvidenceAndVersions(t *testing.T) 
 }
 
 func TestIntentHistoryProviderOutageStopsAtOneCall(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	a := mustCommitPath(t, f.dir, "a.txt", "alpha\n", "Add alpha")
 	provider := &historyAuditPlanner{failure: &ai.ProviderHTTPError{StatusCode: 502, Detail: "temporary outage"}}
@@ -63,6 +65,7 @@ func TestIntentHistoryProviderOutageStopsAtOneCall(t *testing.T) {
 }
 
 func TestIntentHistoryDiffBudgetKeepsCompanionsComplete(t *testing.T) {
+	t.Parallel()
 	raw := []string{strings.Repeat("large source evidence\n", 1000), strings.Repeat("caller correction\n", 20), strings.Repeat("required import\n", 15)}
 	got := allocateIntentEvidenceDiffs(raw, 2048)
 	if got[1] != raw[1] || got[2] != raw[2] {

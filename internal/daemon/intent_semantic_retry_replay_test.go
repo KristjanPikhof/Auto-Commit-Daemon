@@ -28,6 +28,7 @@ func (p *semanticRetryReplayPlanner) PlanIntentV2(ctx context.Context, req ai.In
 }
 
 func TestIntentSemanticRetryProtectsWithoutEscalationAndPublishesAfterRestart(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -95,6 +96,7 @@ func TestIntentSemanticRetryProtectsWithoutEscalationAndPublishesAfterRestart(t 
 }
 
 func TestIntentSemanticRetryDueReviewGetsTurnDuringSustainedFreshWork(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {

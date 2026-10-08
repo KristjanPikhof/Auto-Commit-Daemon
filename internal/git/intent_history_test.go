@@ -61,6 +61,7 @@ func intentHistoryMixedFixture(t *testing.T) (string, IntentHistoryReconstructio
 }
 
 func TestIntentHistoryReconstructionSplitsMixedCommitAndPreservesLiveState(t *testing.T) {
+	t.Parallel()
 	repo, opts, _, _ := intentHistoryMixedFixture(t)
 	ctx := context.Background()
 	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("user's later edit\n"), 0o644); err != nil {
@@ -103,6 +104,7 @@ func TestIntentHistoryReconstructionSplitsMixedCommitAndPreservesLiveState(t *te
 }
 
 func TestIntentHistoryUnitsRejectFabricationAndMissingPrerequisites(t *testing.T) {
+	t.Parallel()
 	repo, _, units, base := intentHistoryMixedFixture(t)
 	var alpha, beta []IntentHistoryUnit
 	for _, unit := range units {
@@ -136,6 +138,7 @@ func TestIntentHistoryUnitsRejectFabricationAndMissingPrerequisites(t *testing.T
 }
 
 func TestIntentHistoryReconstructionRejectsFinalTreeLossAndSourceMovement(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"final tree loss", "source movement", "verification failure"} {
 		t.Run(name, func(t *testing.T) {
 			repo, opts, _, _ := intentHistoryMixedFixture(t)
@@ -169,6 +172,7 @@ func TestIntentHistoryReconstructionRejectsFinalTreeLossAndSourceMovement(t *tes
 }
 
 func TestIntentHistoryReconstructionRecoveryRejectsTargetDrift(t *testing.T) {
+	t.Parallel()
 	repo, opts, _, _ := intentHistoryMixedFixture(t)
 	result, err := ApplyIntentHistoryReconstruction(context.Background(), repo, opts)
 	if err != nil {
@@ -181,6 +185,7 @@ func TestIntentHistoryReconstructionRecoveryRejectsTargetDrift(t *testing.T) {
 }
 
 func TestIntentHistoryReconstructionRecoveryRunsCurrentVerification(t *testing.T) {
+	t.Parallel()
 	repo, opts, _, _ := intentHistoryMixedFixture(t)
 	ctx := context.Background()
 	result, err := ApplyIntentHistoryReconstruction(ctx, repo, opts)
@@ -205,6 +210,7 @@ func TestIntentHistoryReconstructionRecoveryRunsCurrentVerification(t *testing.T
 }
 
 func TestIntentHistoryReconstructionRejectsCrossAuthorGoal(t *testing.T) {
+	t.Parallel()
 	repo, opts, _, _ := intentHistoryMixedFixture(t)
 	ctx := context.Background()
 	other, err := CommitTreeWithIdentity(ctx, repo, opts.Replacements[1].TreeOID, "Another author's correction", "Other Author", "other@example.com", opts.OldChain[0])
@@ -226,6 +232,7 @@ func TestIntentHistoryReconstructionRejectsCrossAuthorGoal(t *testing.T) {
 }
 
 func TestIntentHistoryUnitsKeepEditedRenameTogether(t *testing.T) {
+	t.Parallel()
 	repo := initRepo(t)
 	ctx := context.Background()
 	before := commitWorktreePath(t, ctx, repo, "before.txt", "first stable line\nsecond stable line\nthird stable line\nfourth old line\n", "Add source")
@@ -269,6 +276,7 @@ func TestIntentHistoryUnitsKeepEditedRenameTogether(t *testing.T) {
 }
 
 func TestIntentHistoryReconstructionIncludesRootCommit(t *testing.T) {
+	t.Parallel()
 	repo := initRepo(t)
 	ctx := context.Background()
 	head := commitWorktreePath(t, ctx, repo, "root.txt", "root content\n", "Initialize behavior")
@@ -299,6 +307,7 @@ func TestIntentHistoryReconstructionIncludesRootCommit(t *testing.T) {
 }
 
 func TestIntentHistoryMaterializationRejectsCancelledGoal(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	repo := initRepo(t)
 	base := commitWorktreePath(t, ctx, repo, "base.txt", "base\n", "Base")

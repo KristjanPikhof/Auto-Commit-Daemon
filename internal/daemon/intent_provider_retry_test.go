@@ -43,6 +43,7 @@ func (p *reconnectingIntentPlanner) PlanIntentV2(_ context.Context, req ai.Inten
 }
 
 func TestIntentProviderOutageRetriesAcrossRestartAndPreservesLaterCaptures(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {

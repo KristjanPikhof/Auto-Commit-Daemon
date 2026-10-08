@@ -21,6 +21,7 @@ func (*intentGoalWindowPlanner) PlanIntent(context.Context, ai.IntentPlanRequest
 }
 
 func TestIntentGoalWindowFindsLateHelperAndTestBeforePublication(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	seedTrackedFileCommit(t, ctx, f, "exporter.go", "package archive\n\nfunc ExportRecording(text string) string { return text }\n")
@@ -90,6 +91,7 @@ func TestIntentGoalWindowFindsLateHelperAndTestBeforePublication(t *testing.T) {
 }
 
 func TestIntentGoalWindowPreservesFrozenPublicationTarget(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -141,6 +143,7 @@ func TestIntentGoalWindowWaitsForHotCompanion(t *testing.T) {
 }
 
 func TestIntentGoalWindowKeepsFreshGoalMovingPastIncompleteGoal(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {

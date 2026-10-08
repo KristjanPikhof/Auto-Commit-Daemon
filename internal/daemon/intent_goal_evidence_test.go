@@ -11,6 +11,7 @@ import (
 )
 
 func TestIntentGoalOverviewRetrievesOnlyRelatedRecordedEvidence(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	blob := func(content string) string {

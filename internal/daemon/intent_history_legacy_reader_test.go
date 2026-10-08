@@ -8,6 +8,7 @@ import (
 )
 
 func TestExternalRepairMappingReaderSupportsLegacyWithoutMigration(t *testing.T) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 1)
 	ctx := context.Background()
 	result, err := ApplyIntentRepairTransaction(ctx, f.repo.dir, f.repo.gitDir, f.repo.db, f.cctx, f.plan)

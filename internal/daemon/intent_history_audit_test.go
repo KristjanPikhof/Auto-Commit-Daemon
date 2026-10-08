@@ -45,6 +45,7 @@ func (p *historyAuditPlanner) PlanIntentV2(_ context.Context, req ai.IntentPlanR
 }
 
 func TestIntentHistoryAuditDoesNotExtendExpiredRepairHorizon(t *testing.T) {
+	t.Parallel()
 	f, planner, opts := newHistoryAuditFixture(t)
 	planner.onPlan = func() {
 		if _, err := f.repo.db.SQL().ExecContext(context.Background(), `UPDATE intent_candidates SET soft_publication_deadline=1 WHERE status='soft_published'`); err != nil {
@@ -65,6 +66,7 @@ func TestIntentHistoryAuditDoesNotExtendExpiredRepairHorizon(t *testing.T) {
 }
 
 func TestIntentHistoryAuditPreservesTypedSemanticFailure(t *testing.T) {
+	t.Parallel()
 	failure := &IntentPlannerValidationFailure{Err: errors.New("recorded goals are incomplete")}
 	classified := classifyIntentHistoryAuditFailure(failure)
 	if kind, ok := classifyIntentPlannerFailure(classified); !ok || kind != IntentPlannerFailureValidation {
@@ -73,6 +75,7 @@ func TestIntentHistoryAuditPreservesTypedSemanticFailure(t *testing.T) {
 }
 
 func TestIntentHistoryAuditDistinguishesPlanRejectionFromProviderConfiguration(t *testing.T) {
+	t.Parallel()
 	for _, configuration := range []bool{false, true} {
 		t.Run(fmt.Sprint(configuration), func(t *testing.T) {
 			f, planner, opts := newHistoryAuditFixture(t)
@@ -159,6 +162,7 @@ func newHistoryAuditFixture(t *testing.T) (noncontiguousIntentRepairFixture, *hi
 }
 
 func TestIntentHistoryAuditRepairsPrivateQualityDebtOnce(t *testing.T) {
+	t.Parallel()
 	f, planner, opts := newHistoryAuditFixture(t)
 	ctx := context.Background()
 	result, err := MaybeRepairIntentHistory(ctx, f.repo.dir, f.repo.gitDir, f.repo.db, f.cctx, opts)
@@ -183,6 +187,7 @@ func TestIntentHistoryAuditRepairsPrivateQualityDebtOnce(t *testing.T) {
 }
 
 func TestIntentHistoryAuditKeepsSharedHistoryAndRetriesProviderOutage(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{"shared history", "provider outage"} {
 		t.Run(name, func(t *testing.T) {
 			f, planner, opts := newHistoryAuditFixture(t)

@@ -32,6 +32,7 @@ func semanticRetryRequest(t *testing.T) (ai.IntentPlanRequestV2, IntentCandidate
 }
 
 func TestIntentSemanticRetryPrunesOnlyExpiredSupersededCooldowns(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
@@ -102,6 +103,7 @@ func TestIntentSemanticRetryPrunesOnlyExpiredSupersededCooldowns(t *testing.T) {
 }
 
 func TestIntentSemanticRetryDueSelectionSkipsTerminalRecordsBeforeLimit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	now := time.Now().UTC().Truncate(time.Second)
@@ -179,6 +181,7 @@ func restoredSemanticPlan() ai.IntentPlanV2 {
 }
 
 func TestIntentSemanticRetryResumesUnchangedEvidenceAfterRestart(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	req, input, planner := semanticRetryRequest(t)
@@ -222,6 +225,7 @@ func TestIntentSemanticRetryResumesUnchangedEvidenceAfterRestart(t *testing.T) {
 }
 
 func TestIntentSemanticRetryRebuildsLegacyGenericResolution(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	req, input, planner := semanticRetryRequest(t)
@@ -260,6 +264,7 @@ func TestIntentSemanticRetryRebuildsLegacyGenericResolution(t *testing.T) {
 }
 
 func TestIntentSemanticRetryKeepsIndependentWindowCooldowns(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	reqA, input, planner := semanticRetryRequest(t)
@@ -313,6 +318,7 @@ func TestIntentSemanticRetryKeepsIndependentWindowCooldowns(t *testing.T) {
 }
 
 func TestIntentSemanticRetryRetainsValidGroups(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	req, input, planner := semanticRetryRequest(t)
@@ -350,6 +356,7 @@ func TestIntentSemanticRetryRetainsValidGroups(t *testing.T) {
 }
 
 func TestIntentSemanticRetryEvidenceIgnoresCandidateObservationClocks(t *testing.T) {
+	t.Parallel()
 	req, input, _ := semanticRetryRequest(t)
 	req.Candidates = []ai.IntentCandidateSummary{{CandidateID: "previous", SelectedSeqs: []int64{1}, CreatedAt: input.Now, UpdatedAt: input.Now}}
 	before, err := newIntentPlanRun(req, input, 1)

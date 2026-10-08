@@ -15,6 +15,7 @@ import (
 )
 
 func TestIntentHistoryRequestProtectsLaterWorkDuringFrozenVerification(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
