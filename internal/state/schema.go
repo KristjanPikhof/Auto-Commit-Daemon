@@ -44,7 +44,8 @@ package state
 // so commit-all cannot consume staging added while its checkpoint was pending;
 // v28 separates typed recovery reasons and immutable evidence from display text.
 // v29 records partial checkpoint coverage and bounded provider deadlines.
-const SchemaVersion = 29
+// v30 preserves capture lineage when one old commit contributes to several goals.
+const SchemaVersion = 30
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -634,7 +635,7 @@ CREATE TABLE IF NOT EXISTS intent_repair_commits(
     old_oid             TEXT NOT NULL,
     new_oid             TEXT,
     PRIMARY KEY (repair_id, ord),
-    UNIQUE (repair_id, old_oid),
+    UNIQUE (repair_id, old_oid, candidate_id),
     FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
 );
 

@@ -275,7 +275,7 @@ func completedIntentRepairProof(
 		!repair.OldHead.Valid || repair.OldHead.String != transition.SourceHead ||
 		!repair.NewHead.Valid || repair.NewHead.String != transition.TargetHead ||
 		!repair.BackupRef.Valid || repair.BackupRef.String == "" ||
-		len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxCommits {
+		len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxMappings {
 		return IntentRepair{}, completedBranchTransitionProofError(
 			"intent repair %s has incomplete transition proof",
 			transition.ID)

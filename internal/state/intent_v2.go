@@ -25,6 +25,7 @@ const (
 	IntentCandidateLineageMaxPerPair     = 4096
 	IntentVerificationOutputMaxBytes     = 64 * 1024
 	IntentRepairMaxCommits               = 5
+	IntentRepairMaxMappings              = IntentRepairMaxCommits * IntentRepairMaxCommits
 	IntentRepairMaxMembers               = IntentCandidateMaxCaptures * IntentRepairMaxCommits
 
 	IntentCandidateOpen          = "open"
@@ -1530,9 +1531,9 @@ func TransitionIntentRepair(ctx context.Context, d *DB, id string, transition In
 		IntentCandidateSummaryMaxChars); err != nil {
 		return false, err
 	}
-	if len(transition.Commits) > IntentRepairMaxCommits {
+	if len(transition.Commits) > IntentRepairMaxMappings {
 		return false, fmt.Errorf("state: intent repair commit cap %d exceeded",
-			IntentRepairMaxCommits)
+			IntentRepairMaxMappings)
 	}
 	if transition.Status == IntentRepairGitApplied && transition.Commits == nil {
 		return false, errors.New(
@@ -1767,8 +1768,8 @@ func scanIntentRepair(row intentCandidateScanner) (IntentRepair, error) {
 }
 
 func replaceIntentRepairCommits(ctx context.Context, tx *sql.Tx, repairID string, commits []IntentRepairCommit) error {
-	if len(commits) == 0 || len(commits) > IntentRepairMaxCommits {
-		return fmt.Errorf("state: intent repair requires 1..%d commits", IntentRepairMaxCommits)
+	if len(commits) == 0 || len(commits) > IntentRepairMaxMappings {
+		return fmt.Errorf("state: intent repair requires 1..%d mappings", IntentRepairMaxMappings)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM intent_repair_commits WHERE repair_id=?`, repairID); err != nil {
@@ -1779,10 +1780,11 @@ func replaceIntentRepairCommits(ctx context.Context, tx *sql.Tx, repairID string
 		if strings.TrimSpace(commit.OldOID) == "" {
 			return errors.New("state: intent repair commit has empty old oid")
 		}
-		if _, exists := seen[commit.OldOID]; exists {
-			return fmt.Errorf("state: duplicate intent repair old oid %s", commit.OldOID)
+		key := commit.OldOID + "\x00" + commit.CandidateID.String
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("state: duplicate intent repair old oid %s for candidate %s", commit.OldOID, commit.CandidateID.String)
 		}
-		seen[commit.OldOID] = struct{}{}
+		seen[key] = struct{}{}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO intent_repair_commits(
     repair_id, ord, candidate_id, old_oid, new_oid
@@ -2348,9 +2350,18 @@ func validateIntentRepair(repair IntentRepair) error {
 		IntentCandidateSummaryMaxChars); err != nil {
 		return err
 	}
-	if len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxCommits {
-		return fmt.Errorf("state: intent repair requires 1..%d commits",
-			IntentRepairMaxCommits)
+	if len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxMappings {
+		return fmt.Errorf("state: intent repair requires 1..%d mappings",
+			IntentRepairMaxMappings)
+	}
+	oldOIDs := make(map[string]struct{})
+	candidates := make(map[string]struct{})
+	for _, commit := range repair.Commits {
+		oldOIDs[commit.OldOID] = struct{}{}
+		if commit.CandidateID.Valid { candidates[commit.CandidateID.String] = struct{}{} }
+	}
+	if len(oldOIDs) > IntentRepairMaxCommits || len(candidates) > IntentRepairMaxCommits {
+		return fmt.Errorf("state: intent repair source or goal count exceeds %d", IntentRepairMaxCommits)
 	}
 	if err := validateIntentRepairMembers(repair); err != nil {
 		return err

@@ -198,6 +198,9 @@ func CanRuntimeMigrate(from, to int) bool {
 		case 28:
 			// v29 adds explicit partial coverage and provider deadlines. Existing
 			// checkpoints remain complete; no provenance or membership changes.
+		case 29:
+			// v30 expands old-commit lineage without changing stored rows,
+			// checkpoints, captures, membership or transaction identities.
 		case 26:
 			// v27 records approved index identity without inventing legacy consent.
 		default:

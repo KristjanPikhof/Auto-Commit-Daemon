@@ -182,8 +182,8 @@ func CheckIntentRepairEligibility(
 // IntentRepairReplacement describes one rebuilt commit. Replaces must be a
 // non-empty, ordered subset of the eligible old chain. The default requires
 // adjacent ownership; approved semantic repartitioning may use non-contiguous
-// subsets while still accounting for every old commit exactly once. Splitting
-// one old commit into synthetic commits remains unsupported.
+// subsets while still accounting for every old commit. Capture repartitioning
+// may associate one old commit with several independently materialized goals.
 type IntentRepairReplacement struct {
 	Replaces  []string
 	TreeOID   string
@@ -203,6 +203,14 @@ type IntentRepairApplyOptions struct {
 	// authoritative oldest-to-newest chain; Replacements controls the new
 	// candidate order.
 	AllowRepartition bool
+	// AllowCaptureRepartition permits one old commit to contribute captures to
+	// several replacements. The caller must prove exact capture ownership and
+	// supply ExpectedFinalTree; commit-level ownership alone cannot prove a split.
+	AllowCaptureRepartition bool
+	// ExpectedFinalTree is the exact approved resulting tree. Quality-only
+	// reconstruction supplies the original HEAD tree; publication repair may
+	// include frozen, still-pending captures in this tree.
+	ExpectedFinalTree string
 	// VerifyCommit checks each exact rebuilt commit after commit-tree and
 	// before the second eligibility check and branch CAS. A failure leaves
 	// only unreachable loose objects and never creates the backup ref.
@@ -277,7 +285,14 @@ func ApplyIntentRepair(
 		opts.Eligibility.Commits,
 		opts.Replacements,
 		opts.AllowRepartition,
+		opts.AllowCaptureRepartition,
 	); err != nil {
+		return result, err
+	}
+	if opts.AllowCaptureRepartition && opts.ExpectedFinalTree == "" {
+		return result, errors.New("git intent repair apply: capture repartition requires an exact final tree")
+	}
+	if err := validateIntentRepairFinalTree(ctx, repoDir, opts.Replacements, opts.ExpectedFinalTree); err != nil {
 		return result, err
 	}
 	if opts.DryRun {
@@ -378,6 +393,7 @@ func validateIntentRepairReplacements(
 	commits []IntentRepairOwnedCommit,
 	replacements []IntentRepairReplacement,
 	allowRepartition bool,
+	allowCaptureRepartition bool,
 ) error {
 	var flattened []string
 	for i, replacement := range replacements {
@@ -398,10 +414,10 @@ func validateIntentRepairReplacements(
 		}
 		flattened = append(flattened, replacement.Replaces...)
 	}
-	if len(flattened) != len(commits) {
+	if !allowCaptureRepartition && len(flattened) != len(commits) {
 		return errors.New("git intent repair apply: replacements must partition the complete old chain")
 	}
-	if allowRepartition {
+	if allowRepartition || allowCaptureRepartition {
 		oldPositions := make(map[string]int, len(commits))
 		for i, commit := range commits {
 			if _, duplicate := oldPositions[commit.OID]; duplicate {
@@ -413,20 +429,35 @@ func validateIntentRepairReplacements(
 			oldPositions[commit.OID] = i
 		}
 		seen := make(map[string]struct{}, len(flattened))
-		for _, oldOID := range flattened {
-			if _, ok := oldPositions[oldOID]; !ok {
-				return fmt.Errorf(
-					"git intent repair apply: replacement contains commit outside old chain %s",
-					shortApplyOID(oldOID),
-				)
+		for _, replacement := range replacements {
+			withinReplacement := make(map[string]struct{}, len(replacement.Replaces))
+			previousPosition := -1
+			for _, oldOID := range replacement.Replaces {
+				if _, ok := oldPositions[oldOID]; !ok {
+					return fmt.Errorf(
+						"git intent repair apply: replacement contains commit outside old chain %s",
+						shortApplyOID(oldOID),
+					)
+				}
+				if _, duplicate := withinReplacement[oldOID]; duplicate {
+					return fmt.Errorf("git intent repair apply: replacement repeats old commit %s", shortApplyOID(oldOID))
+				}
+				withinReplacement[oldOID] = struct{}{}
+				if allowCaptureRepartition && oldPositions[oldOID] <= previousPosition {
+					return errors.New("git intent repair apply: replacement lineage does not preserve old-chain order")
+				}
+				previousPosition = oldPositions[oldOID]
+				if _, duplicate := seen[oldOID]; duplicate && !allowCaptureRepartition {
+					return fmt.Errorf(
+						"git intent repair apply: replacement repeats old commit %s",
+						shortApplyOID(oldOID),
+					)
+				}
+				seen[oldOID] = struct{}{}
 			}
-			if _, duplicate := seen[oldOID]; duplicate {
-				return fmt.Errorf(
-					"git intent repair apply: replacement repeats old commit %s",
-					shortApplyOID(oldOID),
-				)
-			}
-			seen[oldOID] = struct{}{}
+		}
+		if len(seen) != len(commits) {
+			return errors.New("git intent repair apply: replacements must cover the complete old chain")
 		}
 		return nil
 	}
@@ -434,6 +465,20 @@ func validateIntentRepairReplacements(
 		if flattened[i] != commit.OID {
 			return fmt.Errorf("git intent repair apply: replacements do not preserve old-chain order at position %d", i)
 		}
+	}
+	return nil
+}
+
+func validateIntentRepairFinalTree(ctx context.Context, repoDir string, replacements []IntentRepairReplacement, expected string) error {
+	if expected == "" {
+		return nil
+	}
+	tree, err := RevParse(ctx, repoDir, expected+"^{tree}")
+	if err != nil || tree != expected {
+		return fmt.Errorf("git intent repair apply: expected final tree is not an exact tree oid: %s", expected)
+	}
+	if replacements[len(replacements)-1].TreeOID != expected {
+		return errors.New("git intent repair apply: rebuilt final tree differs from the approved target; refs were not changed")
 	}
 	return nil
 }

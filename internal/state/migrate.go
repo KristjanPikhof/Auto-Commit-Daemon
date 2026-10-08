@@ -117,6 +117,30 @@ func (d *DB) Migrate(ctx context.Context) error {
 }
 
 func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
+	if cur < 30 {
+		// Only the mapping relation changes: existing provenance, ordering,
+		// frozen membership and transaction rows are copied without alteration.
+		if _, err := tx.ExecContext(ctx, `
+CREATE TABLE intent_repair_commits_v30(
+    repair_id TEXT NOT NULL,
+    ord INTEGER NOT NULL CHECK (ord >= 0),
+    candidate_id TEXT,
+    old_oid TEXT NOT NULL,
+    new_oid TEXT,
+    PRIMARY KEY (repair_id, ord),
+    UNIQUE (repair_id, old_oid, candidate_id),
+    FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
+);
+INSERT INTO intent_repair_commits_v30
+SELECT repair_id,ord,candidate_id,old_oid,new_oid FROM intent_repair_commits;
+DROP TABLE intent_repair_commits;
+ALTER TABLE intent_repair_commits_v30 RENAME TO intent_repair_commits;
+CREATE INDEX idx_intent_repair_commits_old_oid ON intent_repair_commits(old_oid,repair_id);
+CREATE INDEX idx_intent_repair_commits_candidate ON intent_repair_commits(candidate_id,repair_id);
+`); err != nil {
+			return fmt.Errorf("state: migrate capture repair lineage: %w", err)
+		}
+	}
 	if cur < 29 {
 		if err := addColumnIfMissing(ctx, tx, "checkpoints", "coverage_complete", "INTEGER NOT NULL DEFAULT 1 CHECK (coverage_complete IN (0,1))"); err != nil {
 			return err
