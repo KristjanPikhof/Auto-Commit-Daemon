@@ -192,10 +192,15 @@ func replayIntentCandidateBatch(
 		evaluation.PlannerFailure); err != nil {
 		return sum, err
 	}
-	if err := recordIntentDeferrals(
-		ctx, db, windowPlan, items, activeCtx, evaluationStartedTS,
-	); err != nil {
-		return sum, err
+	if evaluation.Fallback != "waiting_for_ai" &&
+		evaluation.Fallback != "waiting_message_rewrite" {
+		// Provider cooldown is not a semantic decision to defer work. Counting
+		// it would age unchanged captures into forced publication requests.
+		if err := recordIntentDeferrals(
+			ctx, db, windowPlan, items, activeCtx, evaluationStartedTS,
+		); err != nil {
+			return sum, err
+		}
 	}
 	if semanticFallbackErr != nil {
 		return sum, semanticFallbackErr
