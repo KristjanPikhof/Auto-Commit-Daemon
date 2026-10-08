@@ -220,26 +220,34 @@ func TestCaptureResilienceLocalMessagesNeverCallAI(t *testing.T) {
 	}
 }
 
-func TestCaptureResilienceProviderBudgetStopsUnchangedCalls(t *testing.T) {
+func TestCaptureResilienceProviderTimeoutWaitsAndRetries(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
-	planner := &blockingSemanticPlanner{entered: make(chan ai.IntentPlanRequestV2, 1)}
+	planner := &blockingSemanticPlanner{entered: make(chan ai.IntentPlanRequestV2, 2), release: make(chan struct{})}
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "independent.md", Op: "create"}}}
 	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, ProviderBudget: 200 * time.Millisecond}
+	clock := newIntentHealthClock()
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: IntentPlannerProviderIdentity{Provider: planner.Name()}, Now: clock.Now})
 	started := time.Now()
-	plan, fallback, _, _, _, _, first, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
-	if err != nil || fallback != "evidence_partition" || len(plan.Candidates) != 1 || !first.Completed {
-		t.Fatalf("budget result=%+v fallback=%s err=%v", first, fallback, err)
+	_, _, _, _, _, _, first, err := chooseIntentCandidatePlan(ctx, req, planner, health, 2, config.PresetFast, nil, db, input)
+	if !isIntentPlannerCircuitWait(err) || first.Completed || first.AttemptCount != 0 || first.ProviderDeadlineTS != 0 {
+		t.Fatalf("timeout result=%+v err=%v", first, err)
 	}
 	if time.Since(started) > 5*time.Second {
-		t.Fatal("provider budget did not bound wait")
+		t.Fatal("provider timeout did not bound wait")
 	}
 	if len(planner.entered) != 1 {
 		t.Fatal("provider call was not observed")
 	}
-	_, _, _, _, _, _, second, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
-	if err != nil || second.ResolutionMode.String != "completed_plan_reuse" || len(planner.entered) != 1 || second.ProviderDeadlineTS != first.ProviderDeadlineTS {
-		t.Fatalf("budget reuse=%+v err=%v", second, err)
+	_, _, _, _, _, _, second, err := chooseIntentCandidatePlan(ctx, req, planner, health, 2, config.PresetFast, nil, db, input)
+	if !isIntentPlannerCircuitWait(err) || second.Completed || len(planner.entered) != 1 || second.Fingerprint != first.Fingerprint {
+		t.Fatalf("cooldown retry=%+v err=%v", second, err)
+	}
+	close(planner.release)
+	clock.Advance(5 * time.Minute)
+	plan, fallback, _, _, _, _, resumed, err := chooseIntentCandidatePlan(ctx, req, planner, health, 2, config.PresetFast, nil, db, input)
+	if err != nil || fallback != "" || !resumed.Completed || resumed.AttemptCount != 1 || len(plan.Candidates) != 1 || len(planner.entered) != 2 || resumed.Fingerprint != first.Fingerprint {
+		t.Fatalf("reconnected planning=%+v fallback=%s err=%v", resumed, fallback, err)
 	}
 }
 
