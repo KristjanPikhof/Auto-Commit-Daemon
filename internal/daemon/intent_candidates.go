@@ -1320,27 +1320,84 @@ func chooseIntentCandidatePlan(
 	if err != nil {
 		return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 	}
+	retryEvidence, err := intentSemanticRetryEvidence(req, input, run.AttemptLimit)
+	if err != nil {
+		return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+	}
+	semanticRetry, hasSemanticRetry, err := loadIntentSemanticRetry(ctx, db)
+	if err != nil {
+		return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+	}
+	retryMatches := hasSemanticRetry && semanticRetry.EvidenceFingerprint == retryEvidence
+	reviewNow := input.Now
+	if reviewNow.IsZero() {
+		reviewNow = time.Now().UTC()
+	}
+	if retryMatches && reviewNow.Before(time.Unix(0, int64(semanticRetry.RetryAtTS*1e9))) {
+		if run.ProgressState.String != "waiting_semantic_retry" {
+			run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
+			run.ResolutionMode = run.ProgressState
+			run.ProviderDeadlineTS = 0
+			run.UnresolvedSeqs = offeredIntentSeqs(req)
+			if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+			}
+		}
+		if semanticRetry.PlanFingerprint != run.Fingerprint {
+			semanticRetry.PlanFingerprint = run.Fingerprint
+			if err := state.MetaSetJSON(ctx, db, MetaKeyIntentSemanticRetry, semanticRetry); err != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+			}
+		}
+		wait := &IntentSemanticRetryWaitError{RetryAt: time.Unix(0, int64(semanticRetry.RetryAtTS*1e9))}
+		return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, wait
+	}
 	if run.Completed && run.ResolvedPlanJSON.Valid {
 		plan, continuations, loadErr := loadResolvedIntentPlanRun(
 			req, run.ResolvedPlanJSON.String)
 		if loadErr == nil {
-			run.ResolutionMode = sql.NullString{
-				String: "completed_plan_reuse", Valid: true,
+			localFallback := run.ResolutionMode.String == "evidence_partition" ||
+				run.ResolutionMode.String == "dependent_message_fallback" ||
+				run.ProgressState.String == "waiting_semantic_retry"
+			plan, needsReview := holdUnclearIntentMessages(req, plan, localFallback)
+			if !needsReview {
+				run.ResolutionMode = sql.NullString{String: "completed_plan_reuse", Valid: true}
+				return plan, "", "", retryCount, false, continuations, run, nil
 			}
-			return plan, "", "", retryCount, false, continuations, run, nil
+			retryAt := secondsTime(run.UpdatedTS).Add(time.Hour)
+			if retryMatches {
+				retryAt = time.Unix(0, int64(semanticRetry.RetryAtTS*1e9))
+			}
+			if reviewNow.Before(retryAt) {
+				if err := storeResolvedIntentPlanRun(&run, plan, continuations); err != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+				}
+				run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
+				run.ResolutionMode = run.ProgressState
+				if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+				}
+				if err := scheduleIntentSemanticRetry(ctx, db, input, run, retryEvidence, retryAt); err != nil {
+					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+				}
+				return plan, "evidence_partition", "", retryCount, false, continuations, run, nil
+			}
+			run, err = reopenIntentSemanticPlanRun(ctx, db, req, run, plan)
+			if err != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+			}
+		} else {
+			run.Completed = false
+			run.ResolvedPlanJSON = sql.NullString{}
+			run.ProgressState = sql.NullString{String: "local_cache_rebuild", Valid: true}
+			run.ResolutionMode = sql.NullString{}
+			run.FindingCodes = []string{"cached_plan_invalid"}
+			if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+			}
+			plannerFailure = ai.SanitizePlannerError(loadErr.Error())
+			skipSemanticPlanning = true
 		}
-		run.Completed = false
-		run.ResolvedPlanJSON = sql.NullString{}
-		run.ProgressState = sql.NullString{
-			String: "local_cache_rebuild", Valid: true,
-		}
-		run.ResolutionMode = sql.NullString{}
-		run.FindingCodes = []string{"cached_plan_invalid"}
-		if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
-			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
-		}
-		plannerFailure = ai.SanitizePlannerError(loadErr.Error())
-		skipSemanticPlanning = true
 	}
 	if run.AttemptCount >= run.AttemptLimit {
 		skipSemanticPlanning = true
@@ -1528,6 +1585,11 @@ func chooseIntentCandidatePlan(
 				}
 				if updateErr := state.UpdateIntentPlanRun(ctx, db, run); updateErr != nil {
 					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, updateErr
+				}
+				if retryMatches {
+					if err := state.MetaSet(ctx, db, MetaKeyIntentSemanticRetry, ""); err != nil {
+						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+					}
 				}
 				if health != nil && permitHeld {
 					if healthErr := health.Complete(ctx, permit, nil); healthErr != nil {
@@ -1719,6 +1781,17 @@ func chooseIntentCandidatePlan(
 	run.ProgressState = sql.NullString{String: "completed", Valid: true}
 	run.UnresolvedSeqs = nil
 	run.PreservedGroups = nil
+	if planner != nil {
+		_, needsReview := holdUnclearIntentMessages(req, plan, true)
+		if needsReview {
+			run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
+			run.ResolutionMode = run.ProgressState
+			run.UnresolvedSeqs = offeredIntentSeqs(req)
+			if err := scheduleIntentSemanticRetry(ctx, db, input, run, retryEvidence, reviewNow.Add(time.Hour)); err != nil {
+				return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
+			}
+		}
+	}
 	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
 	}
@@ -2148,6 +2221,8 @@ func canonicalIntentPlanFingerprintRequest(
 	canonical.Candidates = append([]ai.IntentCandidateSummary(nil),
 		req.Candidates...)
 	for i := range canonical.Candidates {
+		canonical.Candidates[i].CreatedAt = time.Time{}
+		canonical.Candidates[i].UpdatedAt = time.Time{}
 		canonical.Candidates[i].SelectedSeqs = append([]int64(nil),
 			req.Candidates[i].SelectedSeqs...)
 		sort.Slice(canonical.Candidates[i].SelectedSeqs, func(a, b int) bool {

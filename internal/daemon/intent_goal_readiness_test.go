@@ -198,7 +198,7 @@ func TestIntentGoalFallbackUsesFinalCapturedEvidence(t *testing.T) {
 
 func TestIntentGoalSavedPlanIndependentlyRejectsGenericMessages(t *testing.T) {
 	t.Parallel()
-	req := ai.IntentPlanRequestV2{OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "alpha.go", Op: "modify"}}}
+	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "alpha.go", Op: "modify"}}}
 	for _, subject := range []string{"Update alpha code changes", "Add PublishRecordingArchive", "Fix publication readiness after..."} {
 		plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{{
 			CandidateID: "saved", SelectedSeqs: []int64{1}, Readiness: ai.IntentCandidateReady,

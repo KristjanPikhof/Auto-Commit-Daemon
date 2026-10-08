@@ -63,19 +63,23 @@ func intentSemanticRetryEvidence(req ai.IntentPlanRequestV2, input IntentCandida
 	return run.Fingerprint, err
 }
 
-func holdUnclearIntentMessages(req ai.IntentPlanRequestV2, plan ai.IntentPlanV2) (ai.IntentPlanV2, bool) {
+func holdUnclearIntentMessages(req ai.IntentPlanRequestV2, plan ai.IntentPlanV2, localFallback bool) (ai.IntentPlanV2, bool) {
 	plan = cloneIntentPlanV2(plan)
 	needsReview := false
 	legacy := ai.LegacyIntentPlanRequest(req)
 	for i, candidate := range plan.Candidates {
 		if candidate.Readiness != ai.IntentCandidateReady {
-			needsReview = true
+			needsReview = needsReview || localFallback
 			continue
 		}
 		quality := ai.EvaluateIntentPlanMessageQuality(legacy, ai.IntentPlan{
 			SelectedSeqs: candidate.SelectedSeqs, Subject: candidate.Subject, Body: candidate.Body,
 		})
-		if quality.Action == ai.MessageQualityClean || quality.Action == ai.MessageQualitySanitizeAccept {
+		if !quality.HasReason(ai.MessageQualityReasonGenericSubject) &&
+			!quality.HasReason(ai.MessageQualityReasonFilenameOnly) &&
+			!quality.HasReason(ai.MessageQualityReasonTokenOnly) &&
+			!quality.HasReason(ai.MessageQualityReasonMalformedSubject) &&
+			!quality.HasReason(ai.MessageQualityReasonTruncatedSubject) {
 			continue
 		}
 		needsReview = true
