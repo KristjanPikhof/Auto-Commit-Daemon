@@ -117,7 +117,7 @@ func productListEntryFromOverview(
 	if readErr != nil {
 		if productListReadTransient(readErr) && worker.State != "needs_action" {
 			activity := overview.lastActivity
-			stateName, operational := productStateProtected, "healthy_idle"
+			stateName, operational := productStateWaiting, "refreshing"
 			summary := "ACD is refreshing this repository's protection state."
 			if worker.State == "starting" || worker.State == "backoff" {
 				stateName, operational = productStatePublishing, "retrying"
@@ -127,8 +127,10 @@ func productListEntryFromOverview(
 				Repo: record.Path, RepoHash: record.RepoHash, Enabled: true,
 				State: stateName, WorkerState: worker.State,
 				OperationalState: operational, ProtectionUnknown: true,
-				LastActivityAt: formatProductListActivity(activity),
-				Summary:        summary, NextAction: "No action needed.",
+				PublicationProgress: publicationProgressReport{Phase: "protection_refresh"},
+				PublicationOutcome:  publicationOutcome{PendingClassification: true, ReasonCode: "protection_read_pending"},
+				LastActivityAt:      formatProductListActivity(activity),
+				Summary:             summary, NextAction: "No action needed.",
 				lastActivity: activity, UnfinishedWork: overview.unfinished,
 			}
 		}

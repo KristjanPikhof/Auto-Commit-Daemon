@@ -108,6 +108,15 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("outage diagnostic: mode=%s pending=%s health=%s windows=%s candidates=%s", readDaemonStateMode(repo),
+				sqliteScalar(t, dbPath, "SELECT path||':'||state FROM capture_events"),
+				sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'"),
+				sqliteScalar(t, dbPath, "SELECT resolution_mode||':'||COALESCE(validation_failure,'') FROM intent_planner_windows ORDER BY id DESC LIMIT 2"),
+				sqliteScalar(t, dbPath, "SELECT status||':'||COALESCE(verification_status,'')||':'||COALESCE(verification_output,'') FROM intent_candidates"))
+		}
+	})
 	waitForEventState(t, dbPath, "norm-one.md", "published", 10*time.Second)
 	waitFor(t, "evidence partition recovery", 10*time.Second, func() bool {
 		return sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM intent_planner_windows WHERE resolution_mode='evidence_partition' AND validation_failure IS NOT NULL") == "1"
@@ -406,11 +415,12 @@ func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, 
 		t.Fatal(err)
 	}
 	type snapshot struct {
-		Repo           string `json:"repo"`
-		Protected      bool   `json:"protected"`
-		Pending        int    `json:"pending_events"`
-		ActionRequired bool   `json:"action_required"`
-		Progress       struct {
+		Repo              string `json:"repo"`
+		Protected         bool   `json:"protected"`
+		ProtectionUnknown bool   `json:"protection_unknown"`
+		Pending           int    `json:"pending_events"`
+		ActionRequired    bool   `json:"action_required"`
+		Progress          struct {
 			Phase     string `json:"phase"`
 			Remaining int64  `json:"wait_remaining_seconds"`
 		} `json:"publication_progress"`
@@ -455,7 +465,7 @@ func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, 
 					}
 				}
 			}
-			return got.Repo == canonicalRepo && got.Protected && got.Pending == pending && !got.ActionRequired && got.Progress.Phase == "provider_wait" && got.Progress.Remaining > 0 && got.Outcome.RetryAt > float64(time.Now().Unix())
+			return !got.ProtectionUnknown
 		})
 		if got.Repo != canonicalRepo || !got.Protected || got.Pending != pending || got.ActionRequired || got.Progress.Phase != "provider_wait" || got.Progress.Remaining <= 0 || got.Outcome.RetryAt <= float64(time.Now().Unix()) {
 			t.Fatalf("%s hid protected provider retry: %+v\n%s", command, got, result.Stdout)

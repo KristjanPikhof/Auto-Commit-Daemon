@@ -882,9 +882,14 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
 		RepositoryID: record.RepositoryID, State: "running",
 	}, productListRepoOverview{}, context.DeadlineExceeded)
-	if entry.ActionRequired || entry.State != productStateProtected ||
-		productListStatus(entry) != "healthy" || !entry.ProtectionUnknown {
+	if entry.ActionRequired || entry.State != productStateWaiting ||
+		productListStatus(entry) != "refreshing" || !entry.ProtectionUnknown ||
+		productListPhase(entry) != "refreshing" || !entry.PublicationOutcome.PendingClassification {
 		t.Fatalf("transient read failure became an alert: %+v", entry)
+	}
+	encoded, err := json.Marshal(entry)
+	if err != nil || !bytes.Contains(encoded, []byte(`"protection_unknown":true`)) {
+		t.Fatalf("JSON hid the unavailable protection read: %s err=%v", encoded, err)
 	}
 	var out bytes.Buffer
 	if err := renderProductListDashboard(&out, []productListEntry{entry}, false, true); err != nil {
@@ -1020,7 +1025,7 @@ func TestProductListSlowRepositoryDoesNotBlockOtherRows(t *testing.T) {
 	if elapsed := time.Since(started); elapsed < productListReadTimeout || elapsed > time.Second {
 		t.Fatalf("elapsed=%s, want one bounded repository timeout", elapsed)
 	}
-	if len(data.Repos) != 10 || stateName != productStateProtected {
+	if len(data.Repos) != 10 || stateName != productStateWaiting {
 		t.Fatalf("unexpected bounded result: state=%s repos=%+v", stateName, data.Repos)
 	}
 	var slow productListEntry
