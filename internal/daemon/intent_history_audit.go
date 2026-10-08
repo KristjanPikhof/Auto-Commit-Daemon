@@ -51,7 +51,7 @@ func MaybeRepairIntentHistory(ctx context.Context, repoRoot, gitDir string, db *
 	if err != nil {
 		return IntentRepairResult{}, err
 	}
-	fingerprint := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%t\x00%d\x00%s", cctx.BranchRef, cctx.BranchGeneration, head, opts.IntentPlannerProvider, opts.IntentPlannerModel, opts.CommitFormat, opts.IntentIncludeDiffs, opts.IntentRepairMaxCommits, opts.IntentVerificationMode))))
+	fingerprint := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%t\x00%d\x00%s\x00%s", cctx.BranchRef, cctx.BranchGeneration, head, opts.IntentPlannerProvider, opts.IntentPlannerModel, opts.CommitFormat, opts.IntentIncludeDiffs, opts.IntentRepairMaxCommits, opts.IntentVerificationMode, opts.IntentHealth.Snapshot().ProviderFingerprint))))
 	var record intentHistoryAuditRecord
 	ok, err := state.MetaGetJSON(ctx, db, metaIntentHistoryAudit, &record)
 	if err != nil {
@@ -68,6 +68,11 @@ func MaybeRepairIntentHistory(ctx context.Context, repoRoot, gitDir string, db *
 		record.Outcome = "skipped"
 		record.Reason = reason
 		record.NextAttemptTS = 0
+		if reason == git.IntentRepairReasonStagedOverlap || reason == git.IntentRepairReasonAlternateRef || reason == "repair_verification_unavailable" {
+			// These fences may change without a new commit. Recheck slowly,
+			// while unchanged successful plans still make no provider calls.
+			record.NextAttemptTS = now + 300
+		}
 		return skipped(reason), state.MetaSetJSON(ctx, db, metaIntentHistoryAudit, record)
 	}
 	limit := opts.IntentRepairMaxCommits
@@ -183,9 +188,14 @@ ORDER BY candidate.id LIMIT 1`, oid, cctx.BranchRef, cctx.BranchGeneration, now)
 	if err := state.MetaSetJSON(ctx, db, metaIntentHistoryAudit, record); err != nil {
 		return IntentRepairResult{}, err
 	}
-	history, planErr := PlanIntentHistory(ctx, repoRoot, cctx.BranchRef, chain, cfg.planner, opts.CommitFormat, cfg.includeDiffs)
+	history, planErr := evaluatePublication(ctx, func(jobCtx context.Context) (state.IntentHistoryPlan, error) {
+		return PlanIntentHistory(jobCtx, repoRoot, cctx.BranchRef, chain, cfg.planner, opts.CommitFormat, cfg.includeDiffs)
+	})
 	if err := cfg.health.Complete(ctx, permit, classifyIntentHistoryAuditFailure(planErr)); err != nil {
 		return IntentRepairResult{}, err
+	}
+	if ctx.Err() != nil {
+		return IntentRepairResult{}, ctx.Err()
 	}
 	if planErr != nil {
 		record.Outcome = "provider_wait"
@@ -267,7 +277,7 @@ func intentHistoryAuditRepairPlan(ctx context.Context, db *state.DB, cctx Captur
 			return nil, plan, fmt.Errorf("capture evidence missing")
 		}
 		for _, seq := range seqs {
-			ops, err := state.LoadCaptureOps(ctx, db, seq)
+			ops, err := state.LoadCaptureOpsBounded(ctx, db, seq, state.IntentCandidateMaxCaptures)
 			if err != nil {
 				return nil, plan, err
 			}
