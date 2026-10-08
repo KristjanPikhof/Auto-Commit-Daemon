@@ -67,7 +67,8 @@ type IntentCaptureDependency struct {
 	EvidenceHash string                   `json:"evidence_hash,omitempty"`
 }
 
-// IntentCandidateSummary carries durable candidate context without raw source.
+// IntentCandidateSummary carries goal metadata and optional transient recorded
+// evidence. CapturedEvidence uses the same opt-in diff policy as fresh captures.
 type IntentCandidateSummary struct {
 	CandidateID       string           `json:"candidate_id"`
 	Status            string           `json:"status"`
