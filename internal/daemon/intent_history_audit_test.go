@@ -16,6 +16,7 @@ import (
 type historyAuditPlanner struct {
 	calls   int
 	failure error
+	onPlan  func()
 }
 
 func (*historyAuditPlanner) Name() string { return "history-audit-provider" }
@@ -24,6 +25,9 @@ func (*historyAuditPlanner) PlanIntent(context.Context, ai.IntentPlanRequest) (a
 }
 func (p *historyAuditPlanner) PlanIntentV2(_ context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
 	p.calls++
+	if p.onPlan != nil {
+		p.onPlan()
+	}
 	if p.failure != nil {
 		return ai.IntentPlanV2{}, p.failure
 	}
@@ -38,6 +42,34 @@ func (p *historyAuditPlanner) PlanIntentV2(_ context.Context, req ai.IntentPlanR
 		plan.Candidates = append(plan.Candidates, ai.IntentCandidateAssignment{CandidateID: strings.TrimSuffix(path, ".txt"), SelectedSeqs: seqs, Purpose: "complete the " + path + " outcome", GroupingReason: "Keep the independent outcome and its available corrections together", Readiness: ai.IntentCandidateReady, Subject: "Complete " + path + " behavior", Body: "- Include the available corrections in one reviewable goal"})
 	}
 	return plan, nil
+}
+
+func TestIntentHistoryAuditDoesNotExtendExpiredRepairHorizon(t *testing.T) {
+	f, planner, opts := newHistoryAuditFixture(t)
+	planner.onPlan = func() {
+		if _, err := f.repo.db.SQL().ExecContext(context.Background(), `UPDATE intent_candidates SET soft_publication_deadline=1 WHERE status='soft_published'`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := MaybeRepairIntentHistory(context.Background(), f.repo.dir, f.repo.gitDir, f.repo.db, f.cctx, opts)
+	if err != nil || result.Status != state.IntentRepairSkipped || result.Reason != "repair_horizon_expired" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if head, _ := git.RevParse(context.Background(), f.repo.dir, "HEAD"); head != f.oldA2 {
+		t.Fatal("provider answer extended private rewrite horizon")
+	}
+	var reassigned int
+	if err := f.repo.db.SQL().QueryRow(`SELECT COUNT(*) FROM intent_candidates WHERE id LIKE 'audit-%'`).Scan(&reassigned); err != nil || reassigned != 0 {
+		t.Fatalf("expired reply reassigned capture ownership: count=%d err=%v", reassigned, err)
+	}
+}
+
+func TestIntentHistoryAuditPreservesTypedSemanticFailure(t *testing.T) {
+	failure := &IntentPlannerValidationFailure{Err: errors.New("recorded goals are incomplete")}
+	classified := classifyIntentHistoryAuditFailure(failure)
+	if kind, ok := classifyIntentPlannerFailure(classified); !ok || kind != IntentPlannerFailureValidation {
+		t.Fatalf("semantic failure became provider transport outage: %v", classified)
+	}
 }
 
 func newHistoryAuditFixture(t *testing.T) (noncontiguousIntentRepairFixture, *historyAuditPlanner, ReplayOpts) {

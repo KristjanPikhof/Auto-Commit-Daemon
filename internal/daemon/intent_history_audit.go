@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -192,7 +193,25 @@ ORDER BY candidate.id LIMIT 1`, oid, cctx.BranchRef, cctx.BranchGeneration, now)
 	history, planErr := evaluatePublication(ctx, func(jobCtx context.Context) (state.IntentHistoryPlan, error) {
 		return PlanIntentHistory(jobCtx, repoRoot, cctx.BranchRef, chain, cfg.planner, opts.CommitFormat, cfg.includeDiffs)
 	})
-	if err := cfg.health.Complete(ctx, permit, classifyIntentHistoryAuditFailure(planErr)); err != nil {
+	if ai.ProviderNeedsConfiguration(planErr) {
+		if cfg.health != nil {
+			cfg.health.releaseCanceledHalfOpenProbe(context.WithoutCancel(ctx), permit)
+		}
+		record.Outcome = "needs_attention"
+		record.Reason = "provider_configuration_required"
+		record.NextAttemptTS = 0
+		if err := state.MetaSetJSON(ctx, db, metaIntentHistoryAudit, record); err != nil {
+			return IntentRepairResult{}, err
+		}
+		return skipped(record.Reason), planErr
+	}
+	failure := classifyIntentHistoryAuditFailure(planErr)
+	var validation *IntentPlannerValidationFailure
+	semanticRejected := errors.As(failure, &validation)
+	if semanticRejected {
+		failure = nil
+	} // a rejected plan still proves provider reachability
+	if err := cfg.health.Complete(ctx, permit, failure); err != nil {
 		return IntentRepairResult{}, err
 	}
 	if ctx.Err() != nil {
@@ -201,6 +220,10 @@ ORDER BY candidate.id LIMIT 1`, oid, cctx.BranchRef, cctx.BranchGeneration, now)
 	if planErr != nil {
 		record.Outcome = "provider_wait"
 		record.Reason = "quality_audit_replan_wait"
+		if semanticRejected {
+			record.Outcome = "planning_wait"
+			record.Reason = "quality_audit_plan_rejected"
+		}
 		if snapshot := cfg.health.Snapshot(); snapshot.NextProbeTS > 0 {
 			record.NextAttemptTS = snapshot.NextProbeTS
 		}
@@ -261,6 +284,11 @@ ORDER BY candidate.id LIMIT 1`, oid, cctx.BranchRef, cctx.BranchGeneration, now)
 func classifyIntentHistoryAuditFailure(err error) error {
 	if err == nil {
 		return nil
+	}
+	var transport *IntentPlannerTransportFailure
+	var validation *IntentPlannerValidationFailure
+	if errors.As(err, &transport) || errors.As(err, &validation) {
+		return err
 	}
 	return classifyIntentPlannerHealthFailure(err, true)
 }
