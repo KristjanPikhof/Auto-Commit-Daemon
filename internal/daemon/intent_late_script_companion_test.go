@@ -75,3 +75,65 @@ func TestIntentLateScriptCompanionRetainsRecordedWaitingCaller(t *testing.T) {
 		})
 	}
 }
+
+func TestIntentLateConsumerRetainsRecordedWaitingDefinition(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ source, before, after, target, contents string }{
+		{"helpers.go", "package app\nfunc WritePlan() {}\n// old rationale\n", "package app\nfunc WritePlan() {}\n// corrected rationale\n", "consumer_test.go", "package app\nimport \"testing\"\nfunc TestWritePlan(t *testing.T) { WritePlan() }\n"},
+		{"SourceDiagnostics.swift", "class SourceDiagnostics {}\n// old rationale\n", "class SourceDiagnostics {}\n// corrected rationale\n", "router.swift", "let diagnostics = SourceDiagnostics()\n"},
+	} {
+		t.Run(tc.source, func(t *testing.T) {
+			ctx := context.Background()
+			f := newCaptureFixture(t)
+			beforeOID, err := git.HashObjectStdin(ctx, f.dir, []byte(tc.before))
+			if err != nil {
+				t.Fatal(err)
+			}
+			afterOID, err := git.HashObjectStdin(ctx, f.dir, []byte(tc.after))
+			if err != nil {
+				t.Fatal(err)
+			}
+			definition := appendIntentCandidateCapture(t, f.db, tc.source, "modify", beforeOID, afterOID)
+			candidate := state.IntentCandidate{ID: "recorded-api", BranchRef: definition.Event.BranchRef,
+				BranchGeneration: definition.Event.BranchGeneration, Status: state.IntentCandidateWaiting,
+				Readiness: state.IntentReadinessWait, Purpose: "complete recorded API behavior",
+				Events: []state.IntentCandidateEvent{{EventSeq: definition.Event.Seq, EventRole: "code"}}}
+			if err := state.SaveIntentCandidate(ctx, f.db, candidate); err != nil {
+				t.Fatal(err)
+			}
+			targetOID, err := git.HashObjectStdin(ctx, f.dir, []byte(tc.contents))
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := appendIntentCandidateCapture(t, f.db, tc.target, "create", "", targetOID)
+			input := IntentCandidateEvaluation{RepoPath: f.dir, BranchRef: definition.Event.BranchRef,
+				BranchGeneration: definition.Event.BranchGeneration, Captures: []IntentCandidateCapture{target}, IncludeDiffs: true, Now: time.Now()}
+			evidence, err := loadFocusedIntentGoalEvidence(ctx, input, []state.IntentCandidate{candidate}, []IntentCandidateCapture{definition, target})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(evidence[0].CapturedDiff, "Recorded post-image references:\n") {
+				t.Fatalf("waiting recorded definition was not retained: %q", evidence[0].CapturedDiff)
+			}
+			connected := false
+			for _, hint := range runtimeIntentDependencyHints(evidence) {
+				connected = connected || hint.Kind == "symbol_hash"
+			}
+			if !connected {
+				t.Fatalf("late consumer lost actual recorded definition: %+v", evidence)
+			}
+			unrelatedOID, err := git.HashObjectStdin(ctx, f.dir, []byte("class UnrelatedDiagnostics {}\n// corrected rationale\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			unrelated := appendIntentCandidateCapture(t, f.db, "UnrelatedDiagnostics.swift", "create", "", unrelatedOID)
+			isolated, err := loadFocusedIntentGoalEvidence(ctx, input, nil, []IntentCandidateCapture{unrelated, target})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if isolated[0].CapturedDiff != "" {
+				t.Fatal("unrelated own type caused a full old diff fetch")
+			}
+		})
+	}
+}

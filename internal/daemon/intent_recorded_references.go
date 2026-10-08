@@ -13,12 +13,12 @@ import (
 
 // Reference context comes from a captured blob, never the live worktree. Only
 // script calls and file reads naming another offered path can add evidence.
-func loadIntentRecordedReferenceContext(ctx context.Context, repo, sourcePath, oid, mode string, offeredPaths []string) (string, error) {
+func loadIntentRecordedReferenceContext(ctx context.Context, repo, sourcePath, oid, mode string, offeredPaths []string, names ...intentReferenceNames) (string, error) {
 	if oid == "" || mode == "120000" || mode == "160000" {
 		return "", nil
 	}
 	switch path.Ext(sourcePath) {
-	case ".sh", ".py", ".go", ".pbxproj":
+	case ".sh", ".py", ".go", ".swift", ".pbxproj":
 	default:
 		return "", nil
 	}
@@ -39,7 +39,17 @@ func loadIntentRecordedReferenceContext(ctx context.Context, repo, sourcePath, o
 	}
 	switch path.Ext(sourcePath) {
 	case ".go":
-		return intentGoImportReferenceContext(sourcePath, string(contents), offeredPaths), nil
+		references := intentGoImportReferenceContext(sourcePath, string(contents), offeredPaths)
+		if len(names) > 0 {
+			references += intentRecordedDeclarationContext(sourcePath, string(contents), names[0], intentSourceReferenceContextCap-len(references))
+		}
+		return references, nil
+	case ".swift":
+		owner := strings.Split(strings.TrimSuffix(path.Base(sourcePath), ".swift"), "+")[0]
+		if len(names) > 0 && !names[0].outside(owner, sourcePath) {
+			return "", nil
+		}
+		return intentRecordedDeclarationContext(sourcePath, string(contents), nil), nil
 	case ".pbxproj":
 		return intentProjectReferenceContext(sourcePath, string(contents), offeredPaths), nil
 	default:

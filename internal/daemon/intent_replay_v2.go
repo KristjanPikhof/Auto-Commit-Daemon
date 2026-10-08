@@ -1291,6 +1291,7 @@ func runtimeIntentDependencyHints(
 		imports   map[string]struct{}
 		changeIDs map[string]struct{}
 		public    map[string]struct{}
+		api       map[string]struct{}
 		docUses   map[string]struct{}
 		generated bool
 	}
@@ -1310,10 +1311,11 @@ func runtimeIntentDependencyHints(
 		}
 		item.files, item.imports = intentSourcePathReferences(diff)
 		if role := intentCaptureRole(capture); role == "code" || role == "test" || role == "migration" {
-			item.declared, item.symbols = intentSourceSymbols(capture.CapturedDiff)
-			item.changeIDs = runtimeIntentChangeIDs(capture.CapturedDiff)
+			item.declared, item.symbols = intentSourceSymbolsForPath(capture.Event.Path, capture.CapturedDiff)
+			item.changeIDs = runtimeIntentChangeIDsForPath(capture.Event.Path, capture.CapturedDiff)
 			if role == "code" {
 				item.public = intentSourcePublicReferences(capture.CapturedDiff)
+				item.api = intentSourceAPIReferences(capture.Event.Path, capture.CapturedDiff)
 			}
 		} else {
 			item.imports = nil
@@ -1366,6 +1368,11 @@ func runtimeIntentDependencyHints(
 			} else if reference := firstRuntimeIntentFeature(later.public, earlier.docUses); reference != "" {
 				add(later.seq, earlier.seq, ai.IntentDependencySoft, "documented_public_reference", reference)
 			}
+			if reference := firstRuntimeIntentFeature(earlier.api, later.docUses); reference != "" {
+				add(earlier.seq, later.seq, ai.IntentDependencySoft, "documented_api_reference", reference)
+			} else if reference := firstRuntimeIntentFeature(later.api, earlier.docUses); reference != "" {
+				add(later.seq, earlier.seq, ai.IntentDependencySoft, "documented_api_reference", reference)
+			}
 			shared := firstRuntimeIntentFeature(earlier.declared, later.symbols)
 			if reverse := firstRuntimeIntentFeature(later.declared, earlier.symbols); reverse != "" && (shared == "" || reverse < shared) {
 				shared = reverse
@@ -1409,9 +1416,13 @@ func runtimeIntentDependencyHints(
 }
 
 func runtimeIntentChangeIDs(diff string) map[string]struct{} {
+	return runtimeIntentChangeIDsForPath("", diff)
+}
+
+func runtimeIntentChangeIDsForPath(sourcePath, diff string) map[string]struct{} {
 	const maxChanges = 64
 	out := make(map[string]struct{})
-	for _, line := range intentSourceCodeLines(diff) {
+	for _, line := range intentSourceCodeLinesForPath(sourcePath, diff) {
 		if intentSourceDeclaration.MatchString(line) {
 			continue
 		}

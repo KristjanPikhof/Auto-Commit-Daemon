@@ -166,8 +166,29 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree string, u
 		if err != nil {
 			return nil, ai.IntentPlanRequestV2{}, err
 		}
-		diffs[i] = includeIntentRecordedReferenceContext(string(raw), references)
+		diffs[i] = prependIntentRecordedReferenceContext(string(raw), references)
 	}
+	var relationshipCaptures []IntentCandidateCapture
+	for i, batch := range batches {
+		relationshipCaptures = append(relationshipCaptures, IntentCandidateCapture{
+			Event: state.CaptureEvent{Seq: int64(i + 1), Path: units[batch[0]].Path}, CapturedDiff: diffs[i],
+		})
+	}
+	if includeDiffs {
+		names := intentOtherCaptureReferenceNames(relationshipCaptures)
+		for i, batch := range batches {
+			last := units[batch[len(batch)-1]]
+			if !strings.HasSuffix(last.Path, ".go") {
+				continue
+			}
+			references, err := loadIntentRecordedReferenceContext(ctx, repo, last.Path, last.After.OID, last.After.Mode, offeredPaths, names)
+			if err != nil {
+				return nil, ai.IntentPlanRequestV2{}, err
+			}
+			relationshipCaptures[i].CapturedDiff = prependIntentRecordedReferenceContext(relationshipCaptures[i].CapturedDiff, references)
+		}
+	}
+	diffs = prioritizeIntentRelationshipEvidence(relationshipCaptures)
 	diffs = allocateIntentEvidenceDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
 	for i, batch := range batches {
 		first, last := units[batch[0]], units[batch[len(batch)-1]]
@@ -231,23 +252,49 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree string, u
 // on larger changes. Equal clipping can hide an import or a late correction.
 func allocateIntentEvidenceDiffs(raw []string, budget int) []string {
 	result := make([]string, len(raw))
+	priorities := make([]string, len(raw))
+	bodies := make([]string, len(raw))
 	limits := make([]int, len(raw))
 	order := make([]int, len(raw))
 	for i, diff := range raw {
 		order[i] = i
-		limits[i] = min(len(diff), 512, max(0, budget))
+		priorities[i], bodies[i] = splitIntentEvidencePriority(diff)
+		if len(priorities[i]) <= max(0, budget) {
+			budget -= len(priorities[i])
+		} else {
+			// Never emit a partial ownership/import signature. Missing evidence
+			// remains an honest planning wait, not permission to exceed the cap.
+			priorities[i] = ""
+		}
+	}
+	for i, body := range bodies {
+		limits[i] = min(len(body), 512, max(0, budget))
 		budget -= limits[i]
 	}
-	sort.SliceStable(order, func(i, j int) bool { return len(raw[order[i]]) < len(raw[order[j]]) })
+	sort.SliceStable(order, func(i, j int) bool { return len(bodies[order[i]]) < len(bodies[order[j]]) })
 	for _, i := range order {
-		extra := min(len(raw[i])-limits[i], max(0, budget))
+		extra := min(len(bodies[i])-limits[i], max(0, budget))
 		limits[i] += extra
 		budget -= extra
 	}
 	for i, limit := range limits {
-		result[i] = truncateIntentEvidenceDiff(raw[i], limit)
+		result[i] = priorities[i] + truncateIntentEvidenceDiff(bodies[i], limit)
 	}
 	return result
+}
+
+func splitIntentEvidencePriority(diff string) (string, string) {
+	if !strings.HasPrefix(diff, "Recorded post-image references:\n") &&
+		!strings.HasPrefix(diff, "Recorded relationship witnesses:\n") &&
+		!strings.HasPrefix(diff, "Recorded changed relationship witnesses:\n") {
+		return "", diff
+	}
+	const separator = "\nRecorded diff:\n"
+	if end := strings.LastIndex(diff, separator); end >= 0 {
+		end += len(separator)
+		return diff[:end], diff[end:]
+	}
+	return "", diff
 }
 
 // Keep witnessed references and early declarations as well as late corrections.

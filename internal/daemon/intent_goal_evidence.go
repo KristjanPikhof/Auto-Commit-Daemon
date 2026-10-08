@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"path"
+	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -25,31 +26,61 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		freshPaths = append(freshPaths, capture.Event.Path)
 	}
 	withReferences := make(map[int64]bool)
+	withRawDiff := make(map[int64]bool)
+	var referenceNames intentReferenceNames
+	loadRawDiff := func(capture *IntentCandidateCapture) error {
+		if withRawDiff[capture.Event.Seq] {
+			return nil
+		}
+		withRawDiff[capture.Event.Seq] = true
+		raw, err := BuildOpsDiffWithCap(ctx, input.RepoPath, capture.Ops, intentSourceReferenceScanCap)
+		if err != nil {
+			return err
+		}
+		if raw != "" {
+			capture.CapturedDiff = intentCompleteRawDiff(raw)
+		}
+		return nil
+	}
 	attachReferences := func(capture *IntentCandidateCapture) error {
 		if withReferences[capture.Event.Seq] {
 			return nil
 		}
 		withReferences[capture.Event.Seq] = true
+		if newCaptures[capture.Event.Seq] {
+			if err := loadRawDiff(capture); err != nil {
+				return err
+			}
+		}
 		for i := len(capture.Ops) - 1; i >= 0; i-- {
 			op := capture.Ops[i]
 			if op.Path != capture.Event.Path {
 				continue
 			}
-			references, err := loadIntentRecordedReferenceContext(ctx, input.RepoPath, op.Path, op.AfterOID.String, op.AfterMode.String, offeredPaths)
+			references, err := loadIntentRecordedReferenceContext(ctx, input.RepoPath, op.Path, op.AfterOID.String, op.AfterMode.String, offeredPaths, referenceNames)
 			if err != nil {
 				return err
 			}
-			if references != "" && capture.CapturedDiff == "" {
-				capture.CapturedDiff, err = BuildOpsDiffWithCap(ctx, input.RepoPath, capture.Ops, ai.IntentStageDiffCap)
-				if err != nil {
+			if references != "" {
+				if err := loadRawDiff(capture); err != nil {
 					return err
 				}
 			}
-			capture.CapturedDiff = includeIntentRecordedReferenceContext(capture.CapturedDiff, references)
+			capture.CapturedDiff = prependIntentRecordedReferenceContext(capture.CapturedDiff, references)
 			break
 		}
 		return nil
 	}
+	var freshCaptures []IntentCandidateCapture
+	for i := range captures {
+		if newCaptures[captures[i].Event.Seq] && len(freshCaptures) < ai.IntentCandidateCaptureCap {
+			if err := loadRawDiff(&captures[i]); err != nil {
+				return nil, err
+			}
+			freshCaptures = append(freshCaptures, captures[i])
+		}
+	}
+	referenceNames = intentOtherCaptureReferenceNames(freshCaptures)
 	for i := range captures {
 		if newCaptures[captures[i].Event.Seq] && len(withReferences) < ai.IntentCandidateCaptureCap {
 			if err := attachReferences(&captures[i]); err != nil {
@@ -57,14 +88,14 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 			}
 		}
 	}
-	// A late configuration/helper capture may name no symbols itself. Prove
-	// that an existing script goal calls or reads it before deciding which
-	// detailed old diffs are relevant. The scan stays on bounded captured blobs.
+	// A late consumer may refer to an existing goal's unchanged helper or type.
+	// A late configuration may instead be read by an unchanged script caller.
+	// Fetch old diffs only after the recorded blob proves a fresh relationship.
 	scanned := len(withReferences)
 	for i := range captures {
 		capture := &captures[i]
 		ext := path.Ext(capture.Event.Path)
-		if newCaptures[capture.Event.Seq] || (ext != ".sh" && ext != ".py") || scanned >= ai.IntentCandidateCaptureCap {
+		if newCaptures[capture.Event.Seq] || (ext != ".sh" && ext != ".py" && ext != ".go" && ext != ".swift") || scanned >= ai.IntentCandidateCaptureCap {
 			continue
 		}
 		scanned++
@@ -73,18 +104,15 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 			if op.Path != capture.Event.Path {
 				continue
 			}
-			references, err := loadIntentRecordedReferenceContext(ctx, input.RepoPath, op.Path, op.AfterOID.String, op.AfterMode.String, freshPaths)
+			references, err := loadIntentRecordedReferenceContext(ctx, input.RepoPath, op.Path, op.AfterOID.String, op.AfterMode.String, freshPaths, referenceNames)
 			if err != nil {
 				return nil, err
 			}
 			if references != "" {
-				if capture.CapturedDiff == "" {
-					capture.CapturedDiff, err = BuildOpsDiffWithCap(ctx, input.RepoPath, capture.Ops, ai.IntentStageDiffCap)
-					if err != nil {
-						return nil, err
-					}
+				if err := loadRawDiff(capture); err != nil {
+					return nil, err
 				}
-				capture.CapturedDiff = includeIntentRecordedReferenceContext(capture.CapturedDiff, references)
+				capture.CapturedDiff = prependIntentRecordedReferenceContext(capture.CapturedDiff, references)
 			}
 			break
 		}
@@ -122,23 +150,36 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		}
 	}
 	diffs := make([]string, len(captures))
+	var relatedCaptures []IntentCandidateCapture
+	detailed := make(map[int64]bool)
 	count := 0
 	for i, capture := range captures {
 		if !related[capture.Event.Seq] || count >= ai.IntentCandidateCaptureCap {
 			continue
 		}
 		count++
-		if capture.CapturedDiff == "" {
-			captures[i].CapturedDiff, err = BuildOpsDiffWithCap(ctx, input.RepoPath, capture.Ops, ai.IntentStageDiffCap)
-			if err != nil {
-				return nil, err
-			}
+		detailed[capture.Event.Seq] = true
+		if err := loadRawDiff(&captures[i]); err != nil {
+			return nil, err
 		}
+		relatedCaptures = append(relatedCaptures, captures[i])
+	}
+	referenceNames = intentOtherCaptureReferenceNames(relatedCaptures)
+	for i := range captures {
+		if !detailed[captures[i].Event.Seq] {
+			continue
+		}
+		delete(withReferences, captures[i].Event.Seq)
 		if err := attachReferences(&captures[i]); err != nil {
 			return nil, err
 		}
-		diffs[i] = ai.RedactDiffSecrets(captures[i].CapturedDiff)
+		diffs[i] = captures[i].CapturedDiff
 	}
+	priorityCaptures := append([]IntentCandidateCapture(nil), captures...)
+	for i := range priorityCaptures {
+		priorityCaptures[i].CapturedDiff = diffs[i]
+	}
+	diffs = prioritizeIntentRelationshipEvidence(priorityCaptures)
 	diffs = allocateIntentEvidenceDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
 	for i := range captures {
 		if related[captures[i].Event.Seq] {
@@ -146,4 +187,15 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		}
 	}
 	return captures, nil
+}
+
+func intentCompleteRawDiff(diff string) string {
+	if len(diff) < intentSourceReferenceScanCap {
+		return diff
+	}
+	diff = diff[:intentSourceReferenceScanCap]
+	if end := strings.LastIndexByte(diff, '\n'); end >= 0 {
+		return diff[:end+1]
+	}
+	return ""
 }
