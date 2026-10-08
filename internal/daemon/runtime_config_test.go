@@ -513,6 +513,34 @@ func TestRuntimeBundleAllowsApprovedLocalSubprocessDiffContext(t *testing.T) {
 	}
 }
 
+func TestRuntimeIntentLocalEvidenceUsesActualDeterministicProvider(t *testing.T) {
+	local := ai.ProviderConfig{Mode: "deterministic", CommitStrategy: ai.CommitStrategyIntent}
+	for _, provider := range []ai.Provider{ai.DeterministicProvider{}, &ai.DeterministicProvider{}} {
+		if !runtimeIntentIncludeDiffs(local, nil, provider) {
+			t.Fatal("local Intent planner lost the captured evidence needed for goal messages")
+		}
+		if ai.ProviderNeedsDiff(provider) {
+			t.Fatal("event-mode deterministic provider changed its metadata-only contract")
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		cfg      ai.ProviderConfig
+		provider ai.Provider
+	}{
+		{"event mode", ai.ProviderConfig{Mode: "deterministic", CommitStrategy: ai.CommitStrategyEvent}, ai.DeterministicProvider{}},
+		{"provider name claim", local, &runtimeTestProvider{name: "deterministic"}},
+		{"network fallback", ai.ProviderConfig{Mode: "openai-compat", CommitStrategy: ai.CommitStrategyIntent}, ai.DeterministicProvider{}},
+		{"unapproved subprocess", ai.ProviderConfig{Mode: "subprocess:local-planner", CommitStrategy: ai.CommitStrategyIntent}, &runtimeTestProvider{name: "local-planner"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if runtimeIntentIncludeDiffs(tc.cfg, nil, tc.provider) {
+				t.Fatal("local evidence exception bypassed another provider's policy")
+			}
+		})
+	}
+}
+
 func TestRuntimeBundleProviderFailureUsesPresetPolicy(t *testing.T) {
 	db := openTestDB(t)
 	for _, tc := range []struct {

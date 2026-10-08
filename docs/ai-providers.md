@@ -6,9 +6,12 @@ credentials, network requests, or source sharing. Upgrades preserve saved choice
 
 | Provider | Credential | Source diff |
 |---|---|---|
-| `deterministic` | None | Never |
+| `deterministic` | None | Inside the worker only |
 | `openai-compat` | Protected credential store or environment | Only with explicit diff-egress approval and provider declaration |
 | `subprocess:<name>` | Provider-specific | Local process receives only its approved input contract |
+
+The built-in local Intent planner uses bounded, redacted captured evidence
+inside the worker. Network and subprocess permissions stay separate.
 
 Open `acd config`, choose global or repository scope, and edit the provider,
 model, endpoint, or API key. Save reviews the permissions and tests the connection

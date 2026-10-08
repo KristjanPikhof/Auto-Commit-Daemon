@@ -24,6 +24,8 @@
 - Recheck cached and saved plan quality; generic filename, raw-symbol, and
   clipped messages remain protected for scheduled goal review. Age never makes
   incomplete work publishable.
+- Keep local Intent evidence available without network sharing, and reject
+  grouping based only on shared prose or code comments.
 
 - Keep a stopped Intent run retryable when an AI outage leaves an oversized
   fallback group waiting. Older stopped runs resume only after matching the
