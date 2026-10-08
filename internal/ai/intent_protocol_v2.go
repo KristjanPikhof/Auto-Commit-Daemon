@@ -1223,6 +1223,7 @@ func cloneCandidateSummaries(in []IntentCandidateSummary) []IntentCandidateSumma
 		out[i] = in[i]
 		out[i].SelectedSeqs = append([]int64(nil), in[i].SelectedSeqs...)
 		out[i].Paths = append([]string(nil), in[i].Paths...)
+		out[i].CapturedEvidence = append([]OfferedCapture(nil), in[i].CapturedEvidence...)
 		out[i].MissingCompanions = append([]string(nil), in[i].MissingCompanions...)
 	}
 	return out
