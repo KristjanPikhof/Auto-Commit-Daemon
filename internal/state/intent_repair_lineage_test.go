@@ -57,6 +57,10 @@ PRAGMA user_version=29;
 	if _, err := migrated.SQL().ExecContext(ctx, `INSERT INTO intent_repair_commit_lineage(repair_id,ord,candidate_id,old_oid,new_oid) VALUES('legacy-mapping',2,'goal-b','mixed',NULL)`); err == nil {
 		t.Fatal("same old/candidate relation can be duplicated")
 	}
+	var originalCount int
+	if err := migrated.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM intent_repair_commits WHERE repair_id='legacy-mapping' AND ord=0 AND candidate_id='goal-a' AND old_oid='mixed' AND new_oid IS NULL`).Scan(&originalCount); err != nil || originalCount != 1 {
+		t.Fatalf("original immutable mapping was removed: count=%d err=%v", originalCount, err)
+	}
 	var foreignKeyRows int
 	rows, err := migrated.SQL().QueryContext(ctx, "PRAGMA foreign_key_check")
 	if err != nil {
