@@ -86,6 +86,7 @@ func TestCaptureResilienceFourLargeAssets(t *testing.T) {
 }
 
 func TestCaptureResilienceNonRegularDoesNotBlockProtection(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	store := checkpointpkg.Store{DB: f.db}
@@ -130,6 +131,7 @@ func TestCaptureResilienceNonRegularDoesNotBlockProtection(t *testing.T) {
 }
 
 func TestCaptureResiliencePartialProtectionPreservesShadow(t *testing.T) {
+	t.Parallel()
 	if os.Geteuid() == 0 {
 		t.Skip("requires file permissions enforced for a non-root user")
 	}
