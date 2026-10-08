@@ -277,7 +277,7 @@ func TestEventPublicationWaitsForSelectedProviderAndRecovers(t *testing.T) {
 		t.Fatal("event retry bypassed provider cooldown")
 	}
 	unavailable = false
-	now = now.Add(31 * time.Second)
+	now = now.Add(5*time.Minute + time.Second)
 	recovered, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil || recovered.Published != 1 || recovered.Failed != 0 {
 		t.Fatalf("recovery=%+v err=%v", recovered, err)
@@ -325,7 +325,7 @@ func TestLocalFallbackMessagesLeaveRecoveryProbeAvailable(t *testing.T) {
 	if err := health.Complete(ctx, permit, &IntentPlannerTransportFailure{Err: errors.New("outage")}); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(31 * time.Second)
+	now = now.Add(5*time.Minute + time.Second)
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "feature.go", Op: "create"}}}
 	plan := deterministicIntentCandidatePlan(req, true, false)
 	_, err = applyIntentFallbackMessageQuality(req, plan)
