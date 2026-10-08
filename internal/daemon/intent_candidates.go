@@ -1825,6 +1825,7 @@ func ValidateIntentGoalPlan(req ai.IntentPlanRequestV2, plan ai.IntentPlanV2) er
 		return err
 	}
 	legacy := ai.LegacyIntentPlanRequest(req)
+	legacy.OfferedCaptures = intentGoalCaptureEvidence(req)
 	known := make(map[int64]bool, len(legacy.OfferedCaptures))
 	for _, capture := range legacy.OfferedCaptures {
 		known[capture.Seq] = true
@@ -1902,8 +1903,9 @@ func intentSemanticValidationError(candidateID string, gate ai.IntentAtomicityGa
 // provide captured diffs. Semantic claims and weak proximity cannot add edges.
 func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCaptureDependency {
 	edges := append([]ai.IntentCaptureDependency(nil), req.Dependencies...)
-	captures := make([]IntentCandidateCapture, 0, len(req.OfferedCaptures))
-	for _, capture := range req.OfferedCaptures {
+	evidence := intentGoalCaptureEvidence(req)
+	captures := make([]IntentCandidateCapture, 0, len(evidence))
+	for _, capture := range evidence {
 		captures = append(captures, IntentCandidateCapture{
 			Event:        state.CaptureEvent{Seq: capture.Seq, Path: capture.Path},
 			CapturedDiff: capture.CapturedDiff,
@@ -1959,6 +1961,24 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 		edges = kept
 	}
 	return edges
+}
+
+func intentGoalCaptureEvidence(req ai.IntentPlanRequestV2) []ai.OfferedCapture {
+	known := make(map[int64]bool)
+	out := append([]ai.OfferedCapture(nil), req.OfferedCaptures...)
+	for _, capture := range out {
+		known[capture.Seq] = true
+	}
+	for _, prior := range req.Candidates {
+		for _, capture := range prior.CapturedEvidence {
+			if known[capture.Seq] || !containsIntentSeq(prior.SelectedSeqs, capture.Seq) {
+				continue
+			}
+			known[capture.Seq] = true
+			out = append(out, capture)
+		}
+	}
+	return out
 }
 
 func validateIntentCandidateCompanions(seqs []int64, edges []ai.IntentCaptureDependency) error {

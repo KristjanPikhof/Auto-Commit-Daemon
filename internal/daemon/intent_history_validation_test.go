@@ -64,7 +64,7 @@ func TestIntentHistoryProviderOutageStopsAtOneCall(t *testing.T) {
 
 func TestIntentHistoryDiffBudgetKeepsCompanionsComplete(t *testing.T) {
 	raw := []string{strings.Repeat("large source evidence\n", 1000), strings.Repeat("caller correction\n", 20), strings.Repeat("required import\n", 15)}
-	got := allocateIntentHistoryDiffs(raw, 2048)
+	got := allocateIntentEvidenceDiffs(raw, 2048)
 	if got[1] != raw[1] || got[2] != raw[2] {
 		t.Fatal("small companion evidence was clipped equally with a large change")
 	}
