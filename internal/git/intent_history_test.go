@@ -180,6 +180,30 @@ func TestIntentHistoryReconstructionRecoveryRejectsTargetDrift(t *testing.T) {
 	}
 }
 
+func TestIntentHistoryReconstructionRecoveryRunsCurrentVerification(t *testing.T) {
+	repo, opts, _, _ := intentHistoryMixedFixture(t)
+	ctx := context.Background()
+	result, err := ApplyIntentHistoryReconstruction(ctx, repo, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("new approved project check rejected the reconstructed goal")
+	calls := 0
+	opts.VerifyCommit = func(context.Context, string, int) error { calls++; return failure }
+	if _, err := ApplyIntentHistoryReconstruction(ctx, repo, opts); !errors.Is(err, failure) || calls != 1 {
+		t.Fatalf("resumed verification calls=%d err=%v", calls, err)
+	}
+	if source, _ := RevParse(ctx, repo, opts.SourceBranchRef); source != opts.ExpectedHead {
+		t.Fatal("failed resumed check moved source")
+	}
+	if target, _ := RevParse(ctx, repo, opts.TargetBranchRef); target != result.NewHead {
+		t.Fatal("failed resumed check removed the protected target")
+	}
+	if backup, _ := RevParse(ctx, repo, result.BackupRef); backup != opts.ExpectedHead {
+		t.Fatal("failed resumed check removed original history backup")
+	}
+}
+
 func TestIntentHistoryReconstructionRejectsCrossAuthorGoal(t *testing.T) {
 	repo, opts, _, _ := intentHistoryMixedFixture(t)
 	ctx := context.Background()

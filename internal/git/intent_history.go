@@ -434,6 +434,24 @@ func RecoverIntentHistoryReconstruction(ctx context.Context, repoDir string, opt
 	if err := validateIntentRepairFinalTree(ctx, repoDir, opts.Replacements, finalTree); err != nil {
 		return result, err
 	}
+	for i, oid := range chain {
+		if opts.VerifyCommit != nil {
+			if err := opts.VerifyCommit(ctx, oid, i); err != nil {
+				return result, fmt.Errorf("git intent history: verify recovered goal: %w", err)
+			}
+		}
+	}
+	currentTarget, err := RevParse(ctx, repoDir, opts.TargetBranchRef)
+	if err != nil {
+		return result, err
+	}
+	currentBackup, err := RevParse(ctx, repoDir, backup)
+	if err != nil {
+		return result, err
+	}
+	if currentTarget != head || currentBackup != opts.ExpectedHead {
+		return result, errors.New("git intent history: reconstruction refs changed during recovery verification")
+	}
 	return result, nil
 }
 
