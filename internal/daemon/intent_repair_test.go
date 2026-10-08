@@ -951,9 +951,37 @@ func testReplayIntentV2SemanticRepairReplan(t *testing.T, repairSucceeds bool) {
 	headBefore := second.BaseHead
 	third := publish(
 		"feature.go", "package feature\n\nfunc Value() int { return 2 }\n")
-	if first.Published != 1 || second.Published != 1 || third.Published != 1 {
+	if first.Published != 1 || second.Published != 1 {
 		t.Fatalf("replays first=%+v second=%+v third=%+v",
 			first, second, third)
+	}
+	if !repairSucceeds {
+		if third.Published != 0 || third.Disposition != ReplayDispositionTransientWait ||
+			third.SkippedReason != "intent_v2_waiting_semantic_retry" || third.BaseHead != headBefore {
+			t.Fatalf("failed replan did not protect the unresolved goal: %+v", third)
+		}
+		pending, err := state.PendingEvents(ctx, f.db, 0)
+		if err != nil || len(pending) != 1 || pending[0].Path != "feature.go" {
+			t.Fatalf("failed replan lost pending correction=%+v err=%v", pending, err)
+		}
+		// Make the durable review deadline due, then let the provider return a
+		// complete dependent goal without rewriting either prior commit.
+		retry, found, err := loadIntentSemanticRetry(ctx, f.db)
+		if err != nil || !found {
+			t.Fatalf("semantic retry=%+v found=%t err=%v", retry, found, err)
+		}
+		retry.RetryAtTS = intentPlannerHealthTimestamp(time.Now().Add(-time.Second))
+		if err := saveIntentSemanticRetry(ctx, f.db, retry); err != nil {
+			t.Fatal(err)
+		}
+		planner.publishDependent = true
+		third, err = Replay(ctx, f.dir, f.db, f.cctx, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if third.Published != 1 {
+		t.Fatalf("complete goal did not publish: %+v", third)
 	}
 	if got := strings.TrimSpace(mustGitOutput(
 		t, f.dir, "show", "HEAD:feature.go")); !strings.Contains(got, "return 2") {
@@ -995,10 +1023,10 @@ SELECT COUNT(*) FROM intent_repairs WHERE status='completed'`).
 		t.Fatalf("failed replan rewrote prior commits: %v", err)
 	}
 	if subject := strings.TrimSpace(mustGitOutput(
-		t, f.dir, "show", "-s", "--format=%s", "HEAD")); subject != "Update feature code changes" {
+		t, f.dir, "show", "-s", "--format=%s", "HEAD")); subject != "Increase the returned feature value" {
 		t.Fatalf("fallback subject=%q", subject)
 	}
-	if resolution != "dependent_message_fallback" {
+	if resolution != "provider" {
 		t.Fatalf("failed repair resolution=%q", resolution)
 	}
 }
@@ -1561,7 +1589,8 @@ type waitingIntentV2Planner struct{}
 type suffixRepairIntentV2Planner struct{}
 
 type fallbackRepairReplanIntentV2Planner struct {
-	repairSucceeds bool
+	repairSucceeds   bool
+	publishDependent bool
 }
 
 func (*suffixRepairIntentV2Planner) Name() string { return "suffix-repair-v2-test" }
@@ -1584,6 +1613,24 @@ func (p *fallbackRepairReplanIntentV2Planner) PlanIntentV2(
 	byPath := make(map[string]int64)
 	for _, capture := range req.OfferedCaptures {
 		byPath[capture.Path] = capture.Seq
+	}
+	if p.publishDependent {
+		var prerequisite string
+		for _, candidate := range req.Candidates {
+			if candidate.Status == state.IntentCandidateSoftPublished && strings.Contains(candidate.Purpose, "feature") {
+				prerequisite = candidate.CandidateID
+			}
+		}
+		return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+			Candidates: []ai.IntentCandidateAssignment{{
+				CandidateID: "dependent-value-increase", SelectedSeqs: []int64{byPath["feature.go"]},
+				Purpose: "increase the returned feature value", Readiness: ai.IntentCandidateReady,
+				Subject:             "Increase the returned feature value",
+				Body:                "- Return the updated value while keeping prior history intact",
+				GroupingReason:      "the correction changes the existing value implementation",
+				DependsOnCandidates: []string{prerequisite},
+			}},
+		}, nil
 	}
 	if byPath["feature.go"] == 0 || len(req.RecentSoftCommits) < 2 {
 		return (&suffixRepairIntentV2Planner{}).PlanIntentV2(ctx, req)

@@ -1798,6 +1798,7 @@ func replayIntentBatch(
 					"daemon: atomic fallback planner has type %T", cfg.planner)
 			}
 			fallback.combineWindow = true
+			fallback.semanticPrefix = &cfg.forwardRecoveryPlan
 			cfg.planner = fallback
 		} else {
 			window, err = publicationDrainAtomicFallbackWindow(

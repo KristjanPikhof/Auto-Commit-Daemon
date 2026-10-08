@@ -685,7 +685,7 @@ func TestReplayLocalUnlockWidensResolvedSemanticPrefix(t *testing.T) {
 		t.Fatalf("completed marker active=%t err=%v", active, err)
 	}
 	if subject := strings.TrimSpace(mustGitOutput(
-		t, f.dir, "log", "-1", "--format=%s")); subject != "Update source code changes" {
+		t, f.dir, "log", "-1", "--format=%s")); subject != "Use default values in fixtures" {
 		t.Fatalf("local recovery subject=%q", subject)
 	}
 }
@@ -970,7 +970,8 @@ WHERE seq=?`, newHead, fixture.seqs[2]); err != nil {
 	if err != nil || !active || marker.Stage != publicationFallbackLocalUnlock ||
 		marker.PrefixBaseHead != newHead || marker.PrefixUnresolvedCount != 2 ||
 		marker.PrefixCursor != 1 || marker.PlanFingerprint == recovery.PlanFingerprint {
-		t.Fatalf("restarted marker=(%+v active=%t err=%v)", marker, active, err)
+		candidates, _ := state.IntentCandidatesForPair(ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, 10)
+		t.Fatalf("restarted marker=(%+v active=%t err=%v) result=%+v candidates=%+v", marker, active, err, result, candidates)
 	}
 	wantOffered := [][]int64{{fixture.seqs[0], fixture.seqs[1]}}
 	if !reflect.DeepEqual(planner.offeredSeqs, wantOffered) ||
@@ -1181,7 +1182,8 @@ func TestReplayLegacyLocalUnlockReplansBeforeSelectingPrefix(t *testing.T) {
 	if err != nil || !active || marker.Stage != publicationFallbackLocalUnlock ||
 		marker.PlanFingerprint == "" || marker.PrefixCursor != 1 ||
 		marker.PrefixBaseHead != f.cctx.BaseHead {
-		t.Fatalf("replanned marker=(%+v active=%t err=%v)", marker, active, err)
+		candidates, _ := state.IntentCandidatesForPair(ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, 10)
+		t.Fatalf("replanned marker=(%+v active=%t err=%v) result=%+v candidates=%+v", marker, active, err, result, candidates)
 	}
 	if len(planner.offeredSeqs) != 1 ||
 		!reflect.DeepEqual(planner.offeredSeqs[0], fixture.seqs) ||

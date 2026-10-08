@@ -1120,8 +1120,9 @@ func publicationDrainSalvageMode(drain state.PublicationDrain) string {
 // publicationDrainAtomicFallbackPlanner keeps every hard dependency component
 // in one commit and writes messages from the captured evidence.
 type publicationDrainAtomicFallbackPlanner struct {
-	commitFormat  ai.CommitFormat
-	combineWindow bool
+	commitFormat   ai.CommitFormat
+	combineWindow  bool
+	semanticPrefix *ai.IntentPlanV2
 }
 
 func configureAtomicIntentFallback(cfg *intentReplayConfig) {
@@ -1590,7 +1591,13 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 		return ai.IntentPlanV2{}, err
 	}
 	plan := deterministicIntentCandidatePlan(req, false, true)
-	if p.combineWindow && len(plan.Candidates) > 1 {
+	if p.semanticPrefix != nil {
+		assignment, err := lockedIntentRecoveryPrefixMessage(req, *p.semanticPrefix)
+		if err != nil {
+			return ai.IntentPlanV2{}, err
+		}
+		plan.Candidates = []ai.IntentCandidateAssignment{assignment}
+	} else if p.combineWindow && len(plan.Candidates) > 1 {
 		selected := make([]int64, 0, len(req.OfferedCaptures))
 		for _, capture := range req.OfferedCaptures {
 			selected = append(selected, capture.Seq)
@@ -1615,6 +1622,50 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 			plan.Candidates[index].Subject, nil)
 	}
 	return applyIntentFallbackMessageQuality(req, plan)
+}
+
+// Reuse completed semantic goals for a recovery prefix. The selected tree still
+// passes the normal relationship, materialization, and configured verification
+// gates; a filename fallback must not replace an already proven goal message.
+func lockedIntentRecoveryPrefixMessage(req ai.IntentPlanRequestV2, cached ai.IntentPlanV2) (ai.IntentCandidateAssignment, error) {
+	selected := make(map[int64]bool, len(req.OfferedCaptures))
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		selected[capture.Seq] = true
+		seqs = append(seqs, capture.Seq)
+	}
+	covered := make(map[int64]bool, len(selected))
+	var subject string
+	var purposes []string
+	for _, candidate := range cached.Candidates {
+		included := false
+		for _, seq := range candidate.SelectedSeqs {
+			included = included || selected[seq]
+		}
+		if !included {
+			continue
+		}
+		if candidate.Readiness != ai.IntentCandidateReady {
+			return ai.IntentCandidateAssignment{}, errors.New("recovery prefix contains an incomplete semantic goal")
+		}
+		for _, seq := range candidate.SelectedSeqs {
+			if !selected[seq] || covered[seq] {
+				return ai.IntentCandidateAssignment{}, errors.New("recovery prefix changed semantic goal membership")
+			}
+			covered[seq] = true
+		}
+		subject = candidate.Subject
+		purposes = append(purposes, "- "+strings.TrimSpace(candidate.Purpose))
+	}
+	if len(covered) != len(selected) || len(selected) == 0 {
+		return ai.IntentCandidateAssignment{}, errors.New("recovery prefix does not match cached semantic goals")
+	}
+	return ai.IntentCandidateAssignment{
+		CandidateID: stableGeneratedCandidateID(req, seqs), SelectedSeqs: seqs,
+		Purpose: "complete the resolved semantic dependency prefix", Readiness: ai.IntentCandidateReady,
+		Subject: subject, Body: strings.Join(purposes, "\n"),
+		GroupingReason: "verification recovery keeps the resolved prerequisites with their consumer goal",
+	}, nil
 }
 
 func publicationDrainPendingEvents(
