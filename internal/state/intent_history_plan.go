@@ -34,12 +34,13 @@ type IntentHistoryUnit struct {
 }
 
 type IntentHistoryGoal struct {
-	ID      string `json:"id"`
-	Purpose string `json:"purpose"`
-	Message string `json:"message"`
-	Reason  string `json:"reason"`
-	Units   []int  `json:"units"`
-	TreeOID string `json:"tree_oid"`
+	ID                  string   `json:"id"`
+	Purpose             string   `json:"purpose"`
+	Message             string   `json:"message"`
+	Reason              string   `json:"reason"`
+	Units               []int    `json:"units"`
+	TreeOID             string   `json:"tree_oid"`
+	DependsOnCandidates []string `json:"depends_on_candidates,omitempty"`
 }
 
 // IntentHistoryPlan freezes both original provenance and proposed goal trees.
