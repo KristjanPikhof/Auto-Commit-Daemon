@@ -157,6 +157,30 @@ History rewrite groups adjacent commits by intent unless you pass
 `--messages-only`. Its preview shows the selected and resulting commit counts,
 group membership, messages, and grouping reasons before any history changes.
 
+Use `--new-branch` when original commits mixed goals or interleaved related
+work. This reconstruction uses exact recorded path versions and preserves the
+original branch:
+
+~~~bash
+acd history rewrite --last 30 --new-branch feature-goals --plan-out goals.json
+acd history rewrite --show-plan goals.json
+acd history rewrite --apply goals.json --dry-run
+acd history rewrite --apply goals.json --yes
+acd history rewrite --show-plan goals.json
+~~~
+
+Apply queues the reviewed plan for the active worker. Capture continues while
+it checks each proposed tree using the repository's approved verification.
+`status` and `list` show `history-reconstruct`; `--show-plan` reports completion
+or the failure reason. The source branch is unchanged, so select the new branch
+when ready. Reconstruction plans are immutable; generate a new plan to change
+them. Legacy adjacent-commit plans still support `--edit`.
+
+Showing or previewing a plan does not migrate state. `--plan-out` can create a
+standalone preview before runtime setup. Apply requires a worker with the new
+reconstruction protocol and matching schema; an older worker is rejected
+without changing its database.
+
 Checkpoint prefixes are accepted only when unique. Restore is full-checkpoint
 only. Preview reports create, modify, delete, mode, symlink, untracked-overwrite
 and staged-overlap counts. Apply revalidates the plan digest, `HEAD` token,

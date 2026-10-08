@@ -2,7 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- Reconstruct selected history onto a new branch from exact recorded path
+  versions. The active worker checks each proposed goal while later edits keep
+  entering checkpoints. Saved plans preserve the source branch and staging.
+- Audit bounded private ACD history for generic messages while publication is
+  idle, with unchanged-evidence caching and full capture lineage for split goals.
+
+### Changed
+
+- Keep open goal paths and focused recorded evidence visible across planning
+  windows. Include available source/test/reference companions before publishing.
+- Schema v30 adds commit lineage for repartitioned repairs without replacing
+  the existing immutable repair mappings.
+
 ### Fixed
+
+- Persist provider retries at five minutes, ten minutes, then hourly across
+  restarts. Outages keep capture active and do not exhaust semantic attempts.
+- Recheck cached and saved plan quality; generic filename, raw-symbol, and
+  clipped messages remain protected for scheduled goal review. Age never makes
+  incomplete work publishable.
 
 - Keep a stopped Intent run retryable when an AI outage leaves an oversized
   fallback group waiting. Older stopped runs resume only after matching the

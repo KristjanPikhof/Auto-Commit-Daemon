@@ -76,21 +76,29 @@ Provider failures do not affect completed checkpoints or `protected=true`.
 Malformed plans are repaired locally, partially replanned, or replaced with a
 verified evidence partition. This applies to Fast, Balanced, and Quality.
 
-Planning and corrections share a persisted `ai.timeout` deadline per unchanged
-window, five minutes by default. During an outage, safe evidence-based groups
-can publish with local messages without another provider request. Binary
-messages name the captured assets and sizes; source changes still require
-complete grouping, materialization, and verification. The saved provider and
-privacy permissions do not change. Incorrect credentials or missing required
-provider configuration still require a settings correction.
+Each provider probe gets an `ai.timeout` budget, five minutes by default.
+Connection failures and timeouts leave the planning run retryable. Capture and
+checkpoint protection continue while publication waits. A failed connection
+does not consume a semantic correction attempt or permanently cache a local
+message as the completed plan.
 
-Only connection, timeout, protocol transport, and unavailable-service failures
-open the provider circuit. It uses 30-second, 2-minute, then 10-minute
-cooldowns and permits one half-open probe. A rejected semantic plan does not
-change transport health. Cancellation releases a probe without changing
-provider health. The ten-minute interval continues through extended outages
-and worker restarts; transport failures do not spend semantic correction
-attempts or become terminal merely because the outage lasts longer.
+The retry schedule is five minutes after the first failure, ten minutes after
+the next, then one hour after subsequent failures. The next probe time survives
+a worker restart. Only one probe runs at a time; file events still wake capture
+immediately. Status and list show the retry countdown, then `provider-retry-due`
+when the scheduled time has arrived.
+
+A rejected semantic plan is a separate failure. ACD keeps valid groups and
+corrects the unresolved part within the bounded planning session. An unchanged
+unresolved goal gets a scheduled review instead of repeated calls every poll.
+Incorrect credentials or missing required configuration still require a
+settings correction.
+
+Local recovery messages must describe an outcome supported by the captured
+changes. Filename messages, raw code symbols, clipped subjects, and generic
+phrases such as `Update export code changes` do not pass Intent quality checks.
+When ACD cannot write a useful message, it keeps the work protected for later
+planning. An outage never grants permission to publish an incomplete goal.
 
 Rejected plans are written to the exact worktree Git directory at
 `<gitDir>/acd/planner-rejects.jsonl`. Linked worktrees therefore keep separate
