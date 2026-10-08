@@ -123,7 +123,7 @@ func TestReplayIntentV2DrainsDuplicateRecaptureChain(t *testing.T) {
 
 	opts := ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
-		IntentPlanner: ai.DeterministicProvider{}, IntentPreset: config.PresetFast,
+		IntentPlanner: duplicateRecaptureIntentPlanner{}, IntentPreset: config.PresetFast,
 		IntentBypassBatchWait: true, IntentWindow: 10,
 	}
 	for attempt := 0; attempt < 6; attempt++ {
@@ -142,8 +142,9 @@ func TestReplayIntentV2DrainsDuplicateRecaptureChain(t *testing.T) {
 			break
 		}
 		if result.Published == 0 {
-			t.Fatalf("replay attempt %d made no progress: %+v pending=%+v",
-				attempt, result, pending)
+			candidates, _ := state.IntentCandidatesForPair(ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, 10)
+			t.Fatalf("replay attempt %d made no progress: %+v pending=%+v candidates=%+v",
+				attempt, result, pending, candidates)
 		}
 	}
 	pending, err := state.PendingEvents(ctx, f.db, 0)
@@ -156,6 +157,31 @@ func TestReplayIntentV2DrainsDuplicateRecaptureChain(t *testing.T) {
 	if got := mustGitOutput(t, f.dir, "show", "HEAD:"+path); got != "C\n" {
 		t.Fatalf("published contents=%q want C", got)
 	}
+}
+
+type duplicateRecaptureIntentPlanner struct{}
+
+func (duplicateRecaptureIntentPlanner) Name() string { return "duplicate-recapture-test" }
+
+func (duplicateRecaptureIntentPlanner) PlanIntent(context.Context, ai.IntentPlanRequest) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("Intent v2 planning is required")
+}
+
+func (duplicateRecaptureIntentPlanner) PlanIntentV2(_ context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		seqs = append(seqs, capture.Seq)
+	}
+	return ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "capture-letter-sequence", SelectedSeqs: seqs,
+			Purpose: "advance the captured letter sequence", Readiness: ai.IntentCandidateReady,
+			Subject:        "Advance the captured letter sequence",
+			Body:           "- Apply the recorded letter transitions once despite recaptures",
+			GroupingReason: "the recorded same-path transitions complete one letter sequence",
+		}},
+	}, nil
 }
 
 func TestReplayIntentV2DrainsDuplicateDeleteAndRenameRecaptures(t *testing.T) {
@@ -1625,6 +1651,7 @@ func (*suffixRepairIntentV2Planner) PlanIntentV2(
 			Purpose:        "add feature with its test",
 			Readiness:      ai.IntentCandidateReady,
 			Subject:        "Add tested feature",
+			Body:           "- Keep value implementation and companion coverage atomic",
 			GroupingReason: "feature candidate",
 		})
 	case byPath["feature_test.go"] != 0:
@@ -1634,6 +1661,7 @@ func (*suffixRepairIntentV2Planner) PlanIntentV2(
 			Purpose:        "add feature with its test",
 			Readiness:      ai.IntentCandidateReady,
 			Subject:        "Add tested feature",
+			Body:           "- Keep value implementation and companion coverage atomic",
 			GroupingReason: "late companion completes feature candidate",
 		})
 	case byPath["guide.md"] != 0:
@@ -1643,6 +1671,7 @@ func (*suffixRepairIntentV2Planner) PlanIntentV2(
 			Purpose:        "feature documentation",
 			Readiness:      ai.IntentCandidateReady,
 			Subject:        "Document feature",
+			Body:           "- Explain the value feature in its independent guide",
 			GroupingReason: "independent documentation candidate",
 		})
 	}
@@ -1744,7 +1773,8 @@ func (*repairThenIndependentIntentV2Planner) PlanIntentV2(
 		assignments = append(assignments, ai.IntentCandidateAssignment{
 			CandidateID: featureID, SelectedSeqs: []int64{seq},
 			Purpose: "add feature with its test", Readiness: ai.IntentCandidateReady,
-			Subject: "Add feature", GroupingReason: "initial feature implementation",
+			Subject: "Add feature", Body: "- Provide the value implementation",
+			GroupingReason: "initial feature implementation",
 		})
 	}
 	if seq := byPath["feature_test.go"]; seq != 0 {
@@ -1752,6 +1782,7 @@ func (*repairThenIndependentIntentV2Planner) PlanIntentV2(
 			CandidateID: featureID, SelectedSeqs: []int64{seq},
 			Purpose: "add feature with its test", Readiness: ai.IntentCandidateReady,
 			Subject:        "Add tested feature",
+			Body:           "- Keep value implementation and companion coverage atomic",
 			GroupingReason: "late companion completes feature candidate",
 		})
 	}
@@ -1760,6 +1791,7 @@ func (*repairThenIndependentIntentV2Planner) PlanIntentV2(
 			CandidateID: "candidate-notes", SelectedSeqs: []int64{seq},
 			Purpose: "record independent notes", Readiness: ai.IntentCandidateReady,
 			Subject:        "Add feature notes",
+			Body:           "- Record feature notes independently of its implementation",
 			GroupingReason: "notes are independent of feature implementation",
 		})
 	}
