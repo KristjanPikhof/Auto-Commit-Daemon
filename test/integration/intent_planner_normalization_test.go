@@ -94,8 +94,8 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 	if paused.ExitCode != 0 {
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
-	writeFile(t, filepath.Join(repo, "norm-one.txt"), "one\n")
-	writeFile(t, filepath.Join(repo, "norm-two.txt"), "two\n")
+	writeFile(t, filepath.Join(repo, "norm-one.md"), "# Capture protection reference\n")
+	writeFile(t, filepath.Join(repo, "norm-two.md"), "# Provider reconnection reference\n")
 
 	startCount := commitCount(t, repo)
 	resumed := runAcd(t, ctx, envWith(env, extra...), "resume", "--repo", repo, "--yes", "--json")
@@ -108,13 +108,13 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitForEventState(t, dbPath, "norm-one.txt", "published", 10*time.Second)
+	waitForEventState(t, dbPath, "norm-one.md", "published", 10*time.Second)
 	waitFor(t, "evidence partition recovery", 10*time.Second, func() bool {
 		return sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM intent_planner_windows WHERE resolution_mode='evidence_partition' AND validation_failure IS NOT NULL") == "1"
 	})
 
-	oidOne := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-one.txt' ORDER BY seq DESC LIMIT 1")
-	oidTwo := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-two.txt' ORDER BY seq DESC LIMIT 1")
+	oidOne := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-one.md' ORDER BY seq DESC LIMIT 1")
+	oidTwo := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-two.md' ORDER BY seq DESC LIMIT 1")
 	if oidOne == "" {
 		t.Fatalf("norm-one fallback commit oid is empty")
 	}
@@ -394,6 +394,10 @@ func makeOutageProbeDue(t *testing.T, repo string) {
 
 func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, repo string, pending int) {
 	t.Helper()
+	canonicalRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 	type snapshot struct {
 		Repo           string `json:"repo"`
 		Protected      bool   `json:"protected"`
@@ -435,13 +439,13 @@ func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, 
 				t.Fatal(err)
 			}
 			for _, row := range list.Repos {
-				if row.Repo == repo {
+				if row.Repo == canonicalRepo {
 					got = row
 					break
 				}
 			}
 		}
-		if got.Repo != repo || !got.Protected || got.Pending != pending || got.ActionRequired || got.Progress.Phase != "provider_wait" || got.Progress.Remaining <= 0 || got.Outcome.RetryAt <= float64(time.Now().Unix()) {
+		if got.Repo != canonicalRepo || !got.Protected || got.Pending != pending || got.ActionRequired || got.Progress.Phase != "provider_wait" || got.Progress.Remaining <= 0 || got.Outcome.RetryAt <= float64(time.Now().Unix()) {
 			t.Fatalf("%s hid protected provider retry: %+v\n%s", command, got, result.Stdout)
 		}
 	}
