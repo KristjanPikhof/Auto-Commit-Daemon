@@ -20,6 +20,7 @@ import (
 )
 
 func TestRunCheckpointDuringBlockedMessage(t *testing.T) {
+	t.Parallel()
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -174,6 +175,7 @@ func TestPublicationEvaluationRejectsStaleResultAndJoins(t *testing.T) {
 }
 
 func TestRunCheckpointDuringProjectVerification(t *testing.T) {
+	t.Parallel()
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 	control := t.TempDir()
@@ -388,6 +390,7 @@ func (p *blockingSemanticPlanner) RewriteIntentMessage(context.Context, ai.Inten
 }
 
 func TestRunSemanticEvaluationProtectsAcrossRestartAndRejectsBranchChange(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"restart", "branch-switch"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newDaemonFixture(t)
