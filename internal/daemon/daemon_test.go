@@ -5372,6 +5372,18 @@ func TestRun_WakeOnlyFlushCannotBypassIntentV2Cutover(t *testing.T) {
 	})
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
+	// Running proves ownership, while the first completed checkpoint proves
+	// startup has reached protection. Keep the wake-only scenario separate
+	// from the initial branch and shadow preparation.
+	waitFor(t, 10*time.Second, "startup protection checkpoint completed", func() bool {
+		var ready int
+		err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM checkpoints
+WHERE phase='completed' AND coverage_complete=1
+  AND observed_ref='refs/heads/main' AND observed_head=?`, startHead).Scan(&ready)
+		return err == nil && ready > 0
+	})
+
 	if err := os.WriteFile(filepath.Join(f.dir, "wake-only.txt"), []byte("v1\n"), 0o644); err != nil {
 		t.Fatalf("write wake-only: %v", err)
 	}
@@ -5383,9 +5395,19 @@ func TestRun_WakeOnlyFlushCannotBypassIntentV2Cutover(t *testing.T) {
 	waitFor(t, 2*time.Second, "wake flush request completed", func() bool {
 		return countFlushByStatus(t, f.db, "completed") >= 1
 	})
-	waitFor(t, 2*time.Second, "capture event remains pending", func() bool {
+	waitFor(t, 10*time.Second, "wake-only capture remains protected and pending", func() bool {
 		pending, err := state.PendingEvents(context.Background(), f.db, 0)
-		return err == nil && len(pending) == 1
+		if err != nil || len(pending) != 1 || pending[0].Path != "wake-only.txt" || pending[0].Operation != "create" {
+			return false
+		}
+		var protected int
+		err = f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM checkpoint_events membership
+JOIN checkpoints checkpoint ON checkpoint.id=membership.checkpoint_id
+WHERE membership.event_seq=? AND checkpoint.phase='completed'
+  AND checkpoint.coverage_complete=1 AND checkpoint.observed_head=?`,
+			pending[0].Seq, startHead).Scan(&protected)
+		return err == nil && protected == 1
 	})
 	if planner.calls != 0 {
 		t.Fatalf("planner calls=%d want 0 before immutable v2 activation",
