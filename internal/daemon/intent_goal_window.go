@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"context"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
@@ -11,8 +9,6 @@ import (
 )
 
 const intentGoalLookaheadDiffCap = 4096
-
-var intentGoalDeclaration = regexp.MustCompile(`\b(?:func(?:\s+\([^)]*\))?|function|def|class|struct|type|enum|interface|protocol)\s+([a-zA-Z_][a-zA-Z0-9_]*)`)
 
 type intentGoalReferences struct {
 	declarations []string
@@ -122,11 +118,10 @@ func expandIntentGoalWindow(
 	var companions []ai.IntentCaptureDependency
 	references := make(map[int64]intentGoalReferences, len(captures))
 	for _, capture := range captures {
-		item := intentGoalReferences{symbols: runtimeIntentSymbols(capture.CapturedDiff)}
-		for _, match := range intentGoalDeclaration.FindAllStringSubmatch(capture.CapturedDiff, 128) {
-			if len(match[1]) >= 8 {
-				item.declarations = append(item.declarations, strings.ToLower(match[1]))
-			}
+		declared, used := intentSourceSymbols(capture.CapturedDiff)
+		item := intentGoalReferences{symbols: used}
+		for name := range declared {
+			item.declarations = append(item.declarations, name)
 		}
 		references[capture.Event.Seq] = item
 	}

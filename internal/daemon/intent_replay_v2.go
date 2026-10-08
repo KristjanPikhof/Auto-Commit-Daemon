@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
@@ -1285,10 +1284,11 @@ func runtimeIntentDependencyHints(
 	type features struct {
 		seq       int64
 		path      string
-		stem      string
 		module    string
-		diff      string
 		symbols   map[string]struct{}
+		declared  map[string]struct{}
+		files     map[string]struct{}
+		imports   map[string]struct{}
 		changeIDs map[string]struct{}
 		generated bool
 	}
@@ -1301,15 +1301,27 @@ func runtimeIntentDependencyHints(
 		diff := strings.ToLower(capture.CapturedDiff)
 		item := features{
 			seq: capture.Event.Seq, path: strings.ToLower(capture.Event.Path),
-			stem:   intentSemanticStem(capture),
-			module: intentCaptureModule(capture), diff: diff,
-			symbols:   runtimeIntentSymbols(diff),
-			changeIDs: runtimeIntentChangeIDs(diff),
+			module: intentCaptureModule(capture),
 			generated: strings.Contains(diff, "code generated") ||
 				strings.Contains(diff, "generated from") ||
 				runtimeIntentGeneratedPath(capture.Event.Path),
 		}
+		item.files, item.imports = intentSourcePathReferences(diff)
+		if role := intentCaptureRole(capture); role == "code" || role == "test" || role == "migration" {
+			item.declared, item.symbols = intentSourceSymbols(diff)
+			item.changeIDs = runtimeIntentChangeIDs(diff)
+		} else {
+			item.imports = nil
+		}
 		items = append(items, item)
+	}
+	basePaths := make(map[string]map[string]struct{})
+	for _, item := range items {
+		base := path.Base(item.path)
+		if basePaths[base] == nil {
+			basePaths[base] = make(map[string]struct{})
+		}
+		basePaths[base][item.path] = struct{}{}
 	}
 	var hardHints []IntentDependencyHint
 	var softHints []IntentDependencyHint
@@ -1341,8 +1353,11 @@ func runtimeIntentDependencyHints(
 	for i := range items {
 		for j := i + 1; j < len(items); j++ {
 			earlier, later := items[i], items[j]
-			if shared := firstRuntimeIntentFeature(
-				earlier.symbols, later.symbols); shared != "" {
+			shared := firstRuntimeIntentFeature(earlier.declared, later.symbols)
+			if reverse := firstRuntimeIntentFeature(later.declared, earlier.symbols); reverse != "" && (shared == "" || reverse < shared) {
+				shared = reverse
+			}
+			if shared != "" {
 				add(earlier.seq, later.seq, ai.IntentDependencySoft,
 					"symbol_hash", shared)
 			}
@@ -1351,29 +1366,23 @@ func runtimeIntentDependencyHints(
 				add(earlier.seq, later.seq, ai.IntentDependencySoft,
 					"hunk_hash", shared)
 			}
-			earlierBase := runtimeIntentStemBase(earlier.stem)
-			laterBase := runtimeIntentStemBase(later.stem)
+			earlierReferenced := intentSourceReferencesFile(later.files, later.path, earlier.path, len(basePaths[path.Base(earlier.path)]) == 1)
+			laterReferenced := intentSourceReferencesFile(earlier.files, earlier.path, later.path, len(basePaths[path.Base(later.path)]) == 1)
 			switch {
-			case earlierBase != "" && strings.Contains(later.diff, earlierBase):
-				add(earlier.seq, later.seq, ai.IntentDependencySoft,
-					"import_reference", earlierBase)
-			case laterBase != "" && strings.Contains(earlier.diff, laterBase):
-				add(earlier.seq, later.seq, ai.IntentDependencySoft,
-					"import_reference", laterBase)
+			case earlierReferenced || intentSourceImports(later.imports, later.path, earlier.path):
+				add(earlier.seq, later.seq, ai.IntentDependencySoft, "import_reference", earlier.path)
+			case laterReferenced || intentSourceImports(earlier.imports, earlier.path, later.path):
+				add(earlier.seq, later.seq, ai.IntentDependencySoft, "import_reference", later.path)
 			}
-			if later.generated && earlier.module == later.module &&
-				(earlierBase != "" && strings.Contains(later.diff, earlierBase)) {
-				add(earlier.seq, later.seq, ai.IntentDependencyHard,
-					"generated_source", earlierBase)
+			if later.generated && earlier.module == later.module && earlierReferenced {
+				add(earlier.seq, later.seq, ai.IntentDependencyHard, "generated_source", earlier.path)
 			}
 			generated, source := later, earlier
 			if earlier.generated && !later.generated {
 				generated, source = earlier, later
 			}
 			if generated.generated && !source.generated {
-				artifactBase := strings.ToLower(path.Base(generated.path))
-				if strings.Contains(source.diff, generated.path) ||
-					(len(artifactBase) >= 4 && strings.Contains(source.diff, artifactBase)) {
+				if intentSourceReferencesFile(source.files, source.path, generated.path, len(basePaths[path.Base(generated.path)]) == 1) {
 					// The reference proves the semantic relationship without
 					// assuming capture order. Publication order remains governed by
 					// hard object/path dependencies.
@@ -1386,51 +1395,11 @@ func runtimeIntentDependencyHints(
 	return append(hardHints, softHints...)
 }
 
-func runtimeIntentSymbols(diff string) map[string]struct{} {
-	const maxSymbols = 128
-	common := map[string]struct{}{
-		"about": {}, "after": {}, "before": {}, "branch": {}, "candidate": {},
-		"commit": {}, "config": {}, "context": {}, "error": {}, "false": {},
-		"function": {}, "import": {}, "intent": {}, "package": {}, "return": {},
-		"string": {}, "struct": {}, "testing": {}, "true": {}, "value": {},
-	}
-	out := make(map[string]struct{})
-	for _, line := range strings.Split(diff, "\n") {
-		if len(line) == 0 || (line[0] != '+' && line[0] != '-') ||
-			strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
-			continue
-		}
-		for _, token := range strings.FieldsFunc(line[1:], func(r rune) bool {
-			return r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
-		}) {
-			token = strings.ToLower(token)
-			// Short words such as "split", "content", or a directory name
-			// are common across unrelated captures and are not reliable
-			// symbol evidence. Keep this signal for identifier-like tokens.
-			if len(token) < 8 {
-				continue
-			}
-			if _, skip := common[token]; skip {
-				continue
-			}
-			out[token] = struct{}{}
-			if len(out) >= maxSymbols {
-				return out
-			}
-		}
-	}
-	return out
-}
-
 func runtimeIntentChangeIDs(diff string) map[string]struct{} {
 	const maxChanges = 64
 	out := make(map[string]struct{})
-	for _, line := range strings.Split(diff, "\n") {
-		if len(line) < 8 || (line[0] != '+' && line[0] != '-') ||
-			strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") {
-			continue
-		}
-		normalized := strings.Join(strings.Fields(line[1:]), " ")
+	for _, line := range intentSourceCodeLines(diff) {
+		normalized := strings.Join(strings.Fields(line), " ")
 		if len(normalized) < 7 {
 			continue
 		}
@@ -1454,14 +1423,6 @@ func firstRuntimeIntentFeature(
 		}
 	}
 	return shared
-}
-
-func runtimeIntentStemBase(stem string) string {
-	base := strings.ToLower(path.Base(stem))
-	if len(base) < 4 {
-		return ""
-	}
-	return base
 }
 
 func runtimeIntentGeneratedPath(value string) bool {

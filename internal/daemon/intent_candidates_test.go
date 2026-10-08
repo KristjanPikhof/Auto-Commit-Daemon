@@ -4238,14 +4238,76 @@ func TestRuntimeIntentDependencyHintsUseSourceEvidence(t *testing.T) {
 	}
 }
 
+func TestRuntimeIntentDependencyHintsRejectProseAndStemSimilarity(t *testing.T) {
+	for _, testCase := range []struct {
+		name, firstPath, firstDiff, secondPath, secondDiff string
+	}{
+		{"shared_document_word", "onboarding.md", "+# Notification onboarding\n", "exports.md", "+# Notification exports\n"},
+		{"shared_comments", "onboarding.go", "+// Notification workflow\n", "exports.go", "+// Notification workflow\n"},
+		{"commented_declaration", "builder.go", "+// func BuildRecordingArchive() {}\n", "consumer.go", "+BuildRecordingArchive()\n"},
+		{"quoted_symbol", "builder.go", "+func BuildRecordingArchive() {}\n", "consumer.go", "+fmt.Println(\"BuildRecordingArchive\")\n"},
+		{"stem_substring", "help.go", "+func ShowHelp() {}\n", "consumer.go", "+const title = \"helpful notification\"\n"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			first := intentCandidateCaptureFixture(1, testCase.firstPath, "create", "", "first")
+			first.CapturedDiff = testCase.firstDiff
+			second := intentCandidateCaptureFixture(2, testCase.secondPath, "create", "", "second")
+			second.CapturedDiff = testCase.secondDiff
+			if hints := runtimeIntentDependencyHints([]IntentCandidateCapture{first, second}); len(hints) != 0 {
+				t.Fatalf("unrelated captures gained source evidence: %+v", hints)
+			}
+			req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+				OfferedCaptures: []ai.OfferedCapture{
+					{Seq: 1, Path: first.Event.Path, CapturedDiff: first.CapturedDiff},
+					{Seq: 2, Path: second.Event.Path, CapturedDiff: second.CapturedDiff},
+				}}
+			plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+				Candidates: []ai.IntentCandidateAssignment{{CandidateID: "broad-goal",
+					SelectedSeqs: []int64{1, 2}, Purpose: "complete related workflows",
+					Readiness: ai.IntentCandidateReady, Subject: "Complete related workflows",
+					Body: "- Keep the related behavior together", GroupingReason: "shared terminology"}}}
+			if err := ValidateIntentGoalPlan(req, plan); err == nil {
+				t.Fatal("shared prose allowed an unrelated broad goal")
+			}
+		})
+	}
+}
+
+func TestRuntimeIntentDependencyHintsAcceptDeclarationsImportsAndPaths(t *testing.T) {
+	for _, testCase := range []struct {
+		name, sourcePath, sourceDiff, consumerPath, consumerDiff, kind string
+	}{
+		{"short_declared_helper", "helper.go", "+func One() int { return 1 }\n", "consumer.go", "+func Use() int { return One() }\n", "symbol_hash"},
+		{"go_import_block", "internal/archive/archive.go", "+func ExportArchive() {}\n", "cmd/main.go", " import (\n+\"example/internal/archive\"\n )\n", "import_reference"},
+		{"relative_js_import", "src/archive.ts", "+export function archive() {}\n", "src/client.ts", "+import { archive } from './archive'\n", "import_reference"},
+		{"literal_source_file", "support/schema.go", "+func BuildSchema() {}\n", "docs/schema.md", "+The schema comes from support/schema.go\n", "import_reference"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			source := intentCandidateCaptureFixture(2, testCase.sourcePath, "create", "", "source")
+			source.CapturedDiff = testCase.sourceDiff
+			consumer := intentCandidateCaptureFixture(1, testCase.consumerPath, "create", "", "consumer")
+			consumer.CapturedDiff = testCase.consumerDiff
+			for _, captures := range [][]IntentCandidateCapture{{source, consumer}, {consumer, source}} {
+				found := false
+				for _, hint := range runtimeIntentDependencyHints(captures) {
+					found = found || hint.Kind == testCase.kind
+				}
+				if !found {
+					t.Fatalf("actual source relationship %s was lost", testCase.kind)
+				}
+			}
+		})
+	}
+}
+
 func TestRuntimeIntentDependencyEvidenceKeepsRetryFingerprintStable(t *testing.T) {
 	t.Parallel()
 	source := intentCandidateCaptureFixture(1, "archive.go", "create", "", "archive")
 	source.CapturedDiff = "+func BuildRecordingArchive(text string) string { return ValidateRecordingContents(text) }\n" +
-		"+// PreserveRecordingMetadata\n+// RecordArchiveVersion\n"
+		"+PreserveRecordingMetadata(text)\n+RecordArchiveVersion(text)\n"
 	caller := intentCandidateCaptureFixture(2, "export.go", "create", "", "export")
 	caller.CapturedDiff = "+return BuildRecordingArchive(ValidateRecordingContents(text))\n" +
-		"+// PreserveRecordingMetadata\n+// RecordArchiveVersion\n"
+		"+PreserveRecordingMetadata(text)\n+RecordArchiveVersion(text)\n"
 	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Provider: "goal-planner", Preset: config.PresetBalanced, IncludeDiffs: true}
 	var expectedHints []IntentDependencyHint
@@ -4281,9 +4343,8 @@ func TestRuntimeIntentDependencyEvidenceKeepsRetryFingerprintStable(t *testing.T
 			t.Fatalf("unchanged captures lost retry identity on attempt %d: hints=%+v plan=%s evidence=%s", attempt, hints, run.Fingerprint, evidence)
 		}
 	}
-	if len(expectedHints) != 3 || expectedHints[0].Kind != "symbol_hash" ||
-		expectedHints[0].Evidence != "buildrecordingarchive" || expectedHints[1].Kind != "hunk_hash" ||
-		expectedHints[2].Kind != "import_reference" {
+	if len(expectedHints) != 2 || expectedHints[0].Kind != "symbol_hash" ||
+		expectedHints[0].Evidence != "buildrecordingarchive" || expectedHints[1].Kind != "hunk_hash" {
 		t.Fatalf("regression did not exercise multiple shared symbols and lines: %+v", expectedHints)
 	}
 }
