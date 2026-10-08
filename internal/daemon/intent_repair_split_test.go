@@ -89,6 +89,10 @@ func TestIntentRepairMixedCommitSplitCrashPreservesCaptureLineage(t *testing.T) 
 	if err != nil || !ok || len(stored.Commits) != 2 || stored.Commits[0].OldOID != mixed || stored.Commits[1].OldOID != mixed {
 		t.Fatalf("durable split lineage=%+v err=%v", stored, err)
 	}
+	canonical, mapped, err := state.CanonicalCompletedIntentRepairCommit(ctx, repo.db, cctx.BranchRef, cctx.BranchGeneration, mixed)
+	if err != nil || !mapped || canonical != applied.NewHead {
+		t.Fatalf("old complete HEAD must resolve to the complete repaired HEAD: canonical=%s mapped=%v err=%v", canonical, mapped, err)
+	}
 }
 
 func TestIntentRepairQualityOnlyRejectsFinalTreeChange(t *testing.T) {
