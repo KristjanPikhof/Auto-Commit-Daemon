@@ -27,9 +27,10 @@ func TestIntentBinaryMetadataOmitsContentsAndClones(t *testing.T) {
 }
 
 func TestIntentTruncationProvenanceStaysOffTheLegacyWire(t *testing.T) {
+	const changedLine = "+changed text\n"
 	request, err := NewIntentPlanRequest(IntentPlanRequestOptions{
 		IncludeCapturedDiffs: true,
-		OfferedCaptures:      []OfferedCapture{{Seq: 1, Path: "notes.md", Op: "modify", CapturedDiff: strings.Repeat("+changed text\n", IntentStageDiffCap)}},
+		OfferedCaptures:      []OfferedCapture{{Seq: 1, Path: "notes.md", Op: "modify", CapturedDiff: strings.Repeat(changedLine, IntentStageDiffCap/len(changedLine)+1)}},
 	})
 	if err != nil || !request.OfferedCaptures[0].CapturedDiffTruncated {
 		t.Fatalf("truncation provenance missing: %+v err=%v", request, err)

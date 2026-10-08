@@ -349,7 +349,8 @@ func TestAdaptIntentPlanV1UsesStableDistinctCandidateIDsAcrossWindows(t *testing
 
 func TestNewIntentPlanRequestV2RedactsAndCapsDiff(t *testing.T) {
 	secret := "Authorization: Bearer sk-" + strings.Repeat("x", 80)
-	longDiff := secret + "\n" + strings.Repeat("+sensitive-looking-source\n", IntentStageDiffCap)
+	const changedLine = "+sensitive-looking-source\n"
+	longDiff := secret + "\n" + strings.Repeat(changedLine, IntentStageDiffCap/len(changedLine)+1)
 	req, err := NewIntentPlanRequestV2(IntentPlanRequestV2Options{
 		OfferedCaptures: []OfferedCapture{{
 			Seq: 1, Path: "a.go", Op: "modify", CapturedDiff: longDiff,
