@@ -455,6 +455,9 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	if err != nil {
 		return overview, err
 	}
+	if report.PublicationProgress.Phase == "goal_review_wait" {
+		report.OperationalState = "waiting"
+	}
 	if report.PublicationProgress.Phase == "history_reconstruction" {
 		report.Busy = true
 		report.OperationalState = statusOperationalStateWithDaemonAlive(*report, report.Daemon == "running" && report.PID > 0 && !report.Stale)
