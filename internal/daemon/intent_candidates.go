@@ -306,7 +306,7 @@ func EvaluateIntentCandidates(
 			input.Captures[i].CapturedDiff = bySeq[input.Captures[i].Event.Seq].CapturedDiff
 		}
 	}
-	input.Hints = append(input.Hints, runtimeIntentDependencyHints(allCaptures)...)
+	input.Hints = append(append([]IntentDependencyHint(nil), input.Hints...), runtimeIntentDependencyHints(allCaptures)...)
 	if len(input.RecentSoftCommits) == 0 {
 		input.RecentSoftCommits = recentIntentSoftCommitSummaries(
 			existing, allCaptures, input.Now)
@@ -1373,6 +1373,7 @@ func chooseIntentCandidatePlan(
 		if loadErr == nil {
 			localFallback := run.ResolutionMode.String == "evidence_partition" ||
 				run.ResolutionMode.String == "dependent_message_fallback" ||
+				run.ResolutionMode.String == "local_repair" ||
 				run.ProgressState.String == "waiting_semantic_retry"
 			plan, needsReview := holdUnclearIntentMessages(req, plan, localFallback)
 			if !needsReview {
@@ -1640,6 +1641,19 @@ func chooseIntentCandidatePlan(
 					run.UnresolvedSeqs = nil
 					run.PreservedGroups = nil
 					run.FindingCodes = intentFindingCodes(validation.Findings)
+					_, needsReview := holdUnclearIntentMessages(req, repaired, true)
+					if needsReview {
+						run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
+						run.ResolutionMode = run.ProgressState
+						run.UnresolvedSeqs = offeredIntentSeqs(req)
+						if err := scheduleIntentSemanticRetry(ctx, db, input, run, retryEvidence, reviewNow.Add(time.Hour)); err != nil {
+							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+						}
+					} else if retryMatches {
+						if err := clearIntentSemanticRetry(ctx, db, retryEvidence); err != nil {
+							return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+						}
+					}
 					if updateErr := state.UpdateIntentPlanRun(ctx, db, run); updateErr != nil {
 						return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, updateErr
 					}
