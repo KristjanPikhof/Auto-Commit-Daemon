@@ -313,19 +313,21 @@ func TestWithLockedRecoveryAndBranchRefCancelsCallbackWork(t *testing.T) {
 		t.Fatalf("seed branch ref: %v", err)
 	}
 
-	lockCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	lockCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var mutationErr error
 	err := WithLockedRecoveryRefAndExpectedRef(
 		lockCtx, dir, recoveryRef, first, branchRef, first,
 		func(callbackCtx context.Context) error {
+			// Cancel only after preparation proves the callback owns the locks.
+			cancel()
 			<-callbackCtx.Done()
 			mutationErr = UpdateRef(
 				callbackCtx, dir, branchRef, second, first)
 			return callbackCtx.Err()
 		})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("lock timeout err=%v want deadline exceeded", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("lock cancellation err=%v want context canceled", err)
 	}
 	if mutationErr == nil {
 		t.Fatal("callback mutation succeeded after lock context expired")
