@@ -126,11 +126,15 @@ run_support() {
   local package_list
   local package
   local packages=()
+  local long_packages=()
 
   package_list=$(go list ./...)
   while IFS= read -r package; do
     case "$package" in
       */internal/cli | */internal/daemon)
+        ;;
+      */internal/git | */internal/restore | */internal/state)
+        long_packages[${#long_packages[@]}]=$package
         ;;
       *)
         packages[${#packages[@]}]=$package
@@ -138,7 +142,10 @@ run_support() {
     esac
   done <<<"$package_list"
 
-  run_measured_tests support -p "$package_parallelism" "${packages[@]}" \
+  # Start the long suites together so a late state package cannot extend
+  # the entire lane after the shorter packages have already finished.
+  run_measured_tests support -p "$package_parallelism" \
+    ${long_packages[@]+"${long_packages[@]}"} ${packages[@]+"${packages[@]}"} \
     -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout"
 }
 
@@ -178,11 +185,11 @@ run_all() {
   output_root=$(mktemp -d "${TMPDIR:-/tmp}/acd-tests.XXXXXX")
 
   for ((index = 0; index < shard_count; index++)); do
-    ACD_TEST_CASE_PARALLELISM=${ACD_TEST_CASE_PARALLELISM:-2} run_core "$shard_count" "$index" \
+    GOMAXPROCS=${GOMAXPROCS:-2} ACD_TEST_CASE_PARALLELISM=${ACD_TEST_CASE_PARALLELISM:-2} run_core "$shard_count" "$index" \
       >"$output_root/core-$index.log" 2>&1 &
     core_pids[$index]=$!
   done
-  run_support >"$output_root/support.log" 2>&1 &
+  GOMAXPROCS=${GOMAXPROCS:-2} package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-3} run_support >"$output_root/support.log" 2>&1 &
   support_pid=$!
 
   for ((index = 0; index < shard_count; index++)); do
@@ -196,7 +203,7 @@ run_all() {
   fi
   cat "$output_root/support.log"
 
-  if ! run_sensitive >"$output_root/sensitive.log" 2>&1; then
+  if ! GOMAXPROCS=${GOMAXPROCS:-2} run_sensitive >"$output_root/sensitive.log" 2>&1; then
     status=1
   fi
   cat "$output_root/sensitive.log"
