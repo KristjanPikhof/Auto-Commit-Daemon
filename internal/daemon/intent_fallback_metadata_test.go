@@ -16,6 +16,7 @@ import (
 )
 
 func TestIntentLocalFallbackRecoversRejectedSymbolSubjects(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, path, diff string
 	}{
@@ -70,6 +71,7 @@ func TestIntentLocalFallbackRecoversRejectedSymbolSubjects(t *testing.T) {
 }
 
 func TestIntentLocalFallbackPreservesValidLockedAssignments(t *testing.T) {
+	t.Parallel()
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
 		OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "settings.py", Op: "modify", CapturedDiff: "+def save_settings(value):\n"}}}
 	plan := deterministicIntentCandidatePlan(req, true, false)
@@ -119,6 +121,7 @@ func (p *recordingUnavailableMetadataPlanner) PlanIntentV2(_ context.Context, re
 }
 
 func TestReplayIntentMetadataPreservesPerCaptureTruncation(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
