@@ -42,6 +42,7 @@ func TestIntentSourceReferenceContextRejectsProseAndLiteralExamples(t *testing.T
 		{"multiline_string", "scripts/run.sh", "example='example\npython3 scripts/tool.py\n'\n"},
 		{"python_comment", "scripts/run.py", "# open(\"scripts/tool.py\")\n"},
 		{"python_string", "scripts/run.py", `example = 'open("scripts/tool.py")'`},
+		{"quoted_span_cap", "scripts/run.py", "labels = [" + strings.Repeat("'label', ", 129) + `'open("scripts/tool.py")']`},
 		{"python_docstring", "scripts/run.py", "\"\"\"Example\nopen('scripts/tool.py')\n\"\"\"\n"},
 		{"arbitrary_sibling_object", "scripts/run.py", "output.with_name('tool.py')\n"},
 		{"arbitrary_quote", "scripts/run.py", "example = 'scripts/tool.py'\n"},
