@@ -26,6 +26,8 @@
   incomplete work publishable.
 - Keep local Intent evidence available without network sharing, and reject
   grouping based only on shared prose or code comments.
+- Mark transient list reads as refreshing and expose unknown protection in
+  JSON. Provider waits and active probes use the same status across views.
 
 - Keep a stopped Intent run retryable when an AI outage leaves an oversized
   fallback group waiting. Older stopped runs resume only after matching the

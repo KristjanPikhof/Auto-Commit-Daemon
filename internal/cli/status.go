@@ -1042,9 +1042,11 @@ func statusOperationalStateWithDaemonAlive(report statusReport, daemonAlive bool
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
 		return "needs_attention"
-	case report.PublicationProgress.Phase == "history_reconstruction":
+	case report.PublicationProgress.Phase == "history_reconstruction" ||
+		report.PublicationProgress.Phase == "provider_call":
 		return "busy"
-	case report.PublicationProgress.Phase == "goal_review_wait":
+	case report.PublicationProgress.Phase == "goal_review_wait" ||
+		report.PublicationProgress.Phase == "provider_wait":
 		return "waiting"
 	case report.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
 		report.PublicationDrain.FallbackMode == "semantic_replan":

@@ -44,7 +44,7 @@ type productListEntry struct {
 	RepoHash              string                       `json:"-"`
 	Clients               int                          `json:"-"`
 	LastCommitOID         string                       `json:"-"`
-	ProtectionUnknown     bool                         `json:"-"`
+	ProtectionUnknown     bool                         `json:"protection_unknown,omitempty"`
 	UnfinishedWork        bool                         `json:"unfinished_work"`
 	lastActivity          time.Time
 }
@@ -376,6 +376,9 @@ func productListProgressAge(entry productListEntry) string {
 }
 
 func productListPhase(entry productListEntry) string {
+	if entry.PublicationProgress.Phase == "protection_refresh" {
+		return "refreshing"
+	}
 	if entry.PublicationProgress.Phase == "history_reconstruction" {
 		return "history-reconstruct"
 	}
@@ -517,6 +520,8 @@ func productListStatus(entry productListEntry) string {
 		return "paused"
 	case entry.ActionRequired || entry.State == productStateNeedsAction || entry.OperationalState == "needs_attention":
 		return "needs action"
+	case entry.OperationalState == "refreshing":
+		return "refreshing"
 	case entry.PublicationProgress.Phase == "stalled":
 		return "stalled"
 	case entry.PublicationProgress.Phase == "history_reconstruction" ||

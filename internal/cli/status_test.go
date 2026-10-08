@@ -588,6 +588,9 @@ func TestActiveIntentRecoveryShowsOpenProviderWait(t *testing.T) {
 	report.PublicationProgress = progress
 	result := controlResult{OK: true}
 	applyControlStatusWithDaemonAlive(&result, report, true)
+	if got := statusOperationalStateWithDaemonAlive(report, true); got != "waiting" {
+		t.Fatalf("durable provider cooldown operational state=%q want waiting", got)
+	}
 	if result.Health != controlHealthWaiting ||
 		!strings.Contains(result.Summary, "recovery target and your work remain protected") ||
 		!strings.Contains(result.NextAction, "retry in 45s") {
@@ -611,6 +614,10 @@ UPDATE daemon_meta SET updated_ts=600 WHERE key=?`,
 		t.Fatal(err)
 	}
 	halfOpenEntry := productListEntry{PublicationProgress: halfOpen}
+	report.PublicationProgress = halfOpen
+	if got := statusOperationalStateWithDaemonAlive(report, true); got != "busy" {
+		t.Fatalf("leased provider probe operational state=%q want busy", got)
+	}
 	if halfOpen.Phase != "provider_call" ||
 		halfOpen.WaitRemainingSeconds != 0 ||
 		halfOpen.LastProgressAgeSeconds < halfOpen.StallThresholdSeconds ||

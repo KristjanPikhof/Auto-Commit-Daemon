@@ -211,6 +211,10 @@ Worker heartbeats, setup/readiness checkpoints and background maintenance do
 not count as activity. Slow detail checks keep known activity and unfinished
 work visible.
 
+A read that exceeds its time budget shows `refreshing`, with unknown protection
+marked as `protection_unknown` in JSON. A later successful read shows the current
+queue and publication phase.
+
 A repository with pending, blocked, stalled, or incompletely protected work
 stays visible until that work is resolved. An otherwise idle repository drops
 out after one hour, including repositories with maintenance warnings or a
