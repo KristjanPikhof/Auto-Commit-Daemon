@@ -1181,12 +1181,7 @@ func preflightIntentCandidatePlan(
 	plannerRequest := intentCandidateContinuationValidationRequest(
 		req, continuations)
 	baseline = declareIntentFallbackDependencies(plannerRequest, baseline)
-	// Baseline preflight proves capture membership and materialization. A local
-	// message cannot establish semantic readiness before the provider evaluates
-	// the goal, even when age or a flush makes the final request urgent.
-	baselineRequest := plannerRequest
-	baselineRequest.ForcedAging = false
-	if err := ai.ValidateIntentPlanV2(baselineRequest, baseline); err != nil {
+	if err := ai.ValidateIntentPlanV2(plannerRequest, baseline); err != nil {
 		return plannerRequest, continuations, err
 	}
 	if err := preflightIntentCandidateMaterialization(
@@ -2654,9 +2649,15 @@ func evaluateIntentCandidateAssignment(
 
 	request := ai.IntentPlanRequestV2{}
 	for _, prior := range existing {
+		seqs := make([]int64, 0, len(prior.Events))
+		for _, event := range prior.Events {
+			if event.EventRole != "coalesced" {
+				seqs = append(seqs, event.EventSeq)
+			}
+		}
 		request.Candidates = append(request.Candidates, ai.IntentCandidateSummary{
 			CandidateID: prior.ID, Status: prior.Status,
-			SelectedSeqs: intentCandidateEventSeqs(prior.Events),
+			SelectedSeqs: seqs,
 		})
 	}
 	for _, capture := range candidateCaptures {

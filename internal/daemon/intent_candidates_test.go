@@ -702,9 +702,10 @@ func TestIntentCandidateEngineBoundedFallbackAfterOneCorrection(t *testing.T) {
 	if planner.calls != 2 || result.RetryCount != 1 ||
 		result.Fallback != "evidence_partition" ||
 		result.PlannerFailure == "" || len(result.Decisions) != 1 ||
-		!result.Decisions[0].Publishable {
+		result.Decisions[0].Publishable {
 		t.Fatalf("bounded fallback calls=%d result=%+v", planner.calls, result)
 	}
+	assertIntentCandidateProtectedGoalWait(t, result.Decisions[0])
 	candidates, err := state.IntentCandidatesForPair(
 		ctx, db, "refs/heads/main", 1, state.IntentCandidateMaxOpenPerPair)
 	if err != nil {
@@ -1744,7 +1745,7 @@ func TestIntentCandidatePlanPreflightSuppliesValidBaseline(t *testing.T) {
 	}
 }
 
-func TestIntentCandidatePlanRepairsForcedDeferralFromBaseline(t *testing.T) {
+func TestIntentCandidatePlanAgeDoesNotMakeUnknownGoalReady(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
@@ -1775,17 +1776,17 @@ func TestIntentCandidatePlanRepairsForcedDeferralFromBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if planner.calls != 1 || fallback != "repaired_forced_aging" ||
-		run.ResolutionMode.String != "local_repair" ||
+	if planner.calls != 1 || fallback != "" ||
+		run.ResolutionMode.String != "provider" ||
 		len(plan.Candidates) != 1 ||
-		plan.Candidates[0].Readiness != ai.IntentCandidateReady ||
-		len(plan.Candidates[0].MissingCompanions) != 0 {
+		plan.Candidates[0].Readiness != ai.IntentCandidateWait ||
+		len(plan.Candidates[0].MissingCompanions) != 1 {
 		t.Fatalf("calls=%d fallback=%q run=%+v plan=%+v",
 			planner.calls, fallback, run, plan)
 	}
 }
 
-func TestIntentCandidateForcedRepairKeepsWidePersistedGroupReady(t *testing.T) {
+func TestIntentCandidateAgeKeepsWidePersistedGoalProtected(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	captures := make([]IntentCandidateCapture, 0, 13)
@@ -1843,12 +1844,15 @@ func TestIntentCandidateForcedRepairKeepsWidePersistedGroupReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("forced repair: %v", err)
 	}
-	if planner.calls != 1 || result.Fallback != "repaired_forced_aging" ||
-		len(result.Decisions) != 1 || !result.Decisions[0].Publishable {
+	if planner.calls != 1 || result.Fallback != "" ||
+		len(result.Decisions) != 1 || result.Decisions[0].Publishable {
 		t.Fatalf("forced plan did not recover: calls=%d result=%+v",
 			planner.calls, result)
 	}
 	decision := result.Decisions[0]
+	if decision.Assignment.Readiness != ai.IntentCandidateWait || len(decision.Assignment.MissingCompanions) == 0 {
+		t.Fatalf("age waived completeness: %+v", decision)
+	}
 	if len(decision.Candidate.Events) != len(target) ||
 		containsIntentSeq(intentCandidateEventSeqs(decision.Candidate.Events), later.Event.Seq) {
 		t.Fatalf("frozen target membership changed: %+v", decision.Candidate.Events)
@@ -2090,11 +2094,12 @@ func TestIntentCandidateEngineCorrectsDisconnectedMegaGroupWithBalancedFallback(
 	if result.Fallback != "evidence_partition" {
 		t.Fatalf("fallback=%q", result.Fallback)
 	}
-	if len(result.Decisions) != 2 || verifyCalls != 2 {
+	if len(result.Decisions) != 2 || verifyCalls != 0 {
 		t.Fatalf("decisions=%d verifyCalls=%d", len(result.Decisions), verifyCalls)
 	}
 	for _, decision := range result.Decisions {
-		if len(decision.Assignment.SelectedSeqs) != 1 || !decision.Publishable {
+		assertIntentCandidateProtectedGoalWait(t, decision)
+		if len(decision.Assignment.SelectedSeqs) != 1 || decision.Publishable {
 			t.Fatalf("fallback decision=%+v", decision)
 		}
 	}
@@ -2132,11 +2137,12 @@ func TestIntentCandidateEngineRejectsSameDirectoryMegaGroup(t *testing.T) {
 	}
 	if result.Fallback != "evidence_partition" ||
 		len(result.Decisions) != 2 ||
-		!result.Decisions[0].Publishable ||
-		!result.Decisions[1].Publishable {
+		result.Decisions[0].Publishable ||
+		result.Decisions[1].Publishable {
 		t.Fatalf("same-directory mega-group was not split safely: %+v", result)
 	}
 	for _, decision := range result.Decisions {
+		assertIntentCandidateProtectedGoalWait(t, decision)
 		if len(decision.Assignment.SelectedSeqs) != 1 {
 			t.Fatalf("fallback component=%+v", decision)
 		}
@@ -2318,10 +2324,11 @@ func TestIntentCandidateEngineReusesLocalMessagesAcrossRestart(
 		t.Fatal(err)
 	}
 	capture := appendIntentCandidateCapture(
-		t, db, "internal/recovery.go", "create", "", "recovery")
+		t, db, "internal/recovery.md", "create", "", "recovery")
+	capture.CapturedDiff = "+# Recovered publication protection\n"
 	input := IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		Captures: []IntentCandidateCapture{capture},
+		Captures: []IntentCandidateCapture{capture}, IncludeDiffs: true,
 		Planner: &recoveringMessageIntentCandidatePlannerStub{
 			messageUnavailable: true,
 		},
