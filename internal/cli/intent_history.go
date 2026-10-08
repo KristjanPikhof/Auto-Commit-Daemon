@@ -137,6 +137,36 @@ func printIntentHistoryPlan(out io.Writer, plan state.IntentHistoryPlan) {
 	}
 }
 
+func showIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, jsonOut, previewPassed bool) error {
+	view := struct {
+		state.IntentHistoryPlan
+		WorkerRequest *state.IntentHistoryRequest `json:"worker_request,omitempty"`
+		PreviewPassed bool                        `json:"preview_passed,omitempty"`
+	}{IntentHistoryPlan: plan, PreviewPassed: previewPassed}
+	if path, err := rewriteStateDBPath(ctx, repo); err == nil {
+		if db, err := state.OpenReadOnly(ctx, path); err == nil {
+			defer db.Close()
+			if request, ok, err := state.LoadIntentHistoryRequest(ctx, db); err == nil && ok && request.PlanID == plan.ID {
+				view.WorkerRequest = &request
+			}
+		}
+	}
+	if jsonOut {
+		return json.NewEncoder(out).Encode(view)
+	}
+	printIntentHistoryPlan(out, plan)
+	if request := view.WorkerRequest; request != nil {
+		fmt.Fprintf(out, "Worker status: %s\n", request.Status)
+		if request.Error != "" {
+			fmt.Fprintln(out, request.Error)
+		}
+		if request.NewHead != "" {
+			fmt.Fprintf(out, "New HEAD: %s\nBackup: %s\n", request.NewHead, request.BackupRef)
+		}
+	}
+	return nil
+}
+
 func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, dryRun bool) error {
 	replacements, err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan)
 	if err != nil {

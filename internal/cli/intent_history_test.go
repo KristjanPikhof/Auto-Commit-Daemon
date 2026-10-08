@@ -143,3 +143,59 @@ func TestIntentHistorySharedProgressKeepsCaptureAndRequestSeparate(t *testing.T)
 		t.Fatalf("manual pause hidden: %+v %v", progress, err)
 	}
 }
+
+func TestIntentHistoryPreviewAndUnsupportedWorkerDoNotMigrateState(t *testing.T) {
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo := rewriteSelectionTestRepo(t)
+	writeRewriteTestFile(t, repo, "recovery.md", "# Checkpoint recovery\nResume protected work after interruption.\n")
+	for _, args := range [][]string{{"add", "recovery.md"}, {"commit", "-q", "-m", "Update recovery.md"}} {
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbPath, _ := rewriteStateDBPath(ctx, repo)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerRepo(t, roots, repo, dbPath, "codex")
+	if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: 12345, Mode: "running", HeartbeatTS: nowFloat()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, "PRAGMA user_version=29"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	selection, err := git.ResolveRewriteSelection(ctx, repo, git.RewriteSelectionOptions{Last: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "goals.json")
+	var out bytes.Buffer
+	if err := generateIntentHistoryPlan(ctx, &out, repo, selection, rewriteCommitsOptions{newBranch: "goal-preview", planOut: file, planOnly: true}, historyGoalCLIPlanner{}, ai.ProviderConfig{CommitFormat: ai.CommitFormatImperative, DiffEgress: true}, false); err != nil {
+		t.Fatal(err)
+	}
+	plan, ok, err := readIntentHistoryPlanRef(ctx, repo, file)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := applyIntentHistoryPlan(ctx, &out, repo, plan, false); err == nil || !strings.Contains(err.Error(), "does not support") {
+		t.Fatalf("old worker accepted request: %v", err)
+	}
+	if version, err := state.ReadUserVersion(ctx, dbPath); err != nil || version != 29 {
+		t.Fatalf("authoring migrated old worker database: %d %v", version, err)
+	}
+	readOnly, err := state.OpenReadOnly(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if _, ok, _ := state.LoadIntentHistoryRequest(ctx, readOnly); ok {
+		t.Fatal("unsupported worker received a request")
+	}
+	if _, err := git.RevParse(ctx, repo, plan.TargetBranchRef); err == nil {
+		t.Fatal("unsupported worker created a branch")
+	}
+}

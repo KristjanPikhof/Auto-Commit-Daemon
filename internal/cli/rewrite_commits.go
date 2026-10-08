@@ -166,22 +166,10 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		return err
 	}
 	if opts.showPlan != "" {
-		if plan, ok, err := readIntentHistoryPlanRef(ctx, repoFlag, opts.showPlan); err == nil && ok {
-			if jsonOut {
-				return json.NewEncoder(out).Encode(plan)
+		if repo, repoErr := resolveRepo(repoFlag); repoErr == nil {
+			if plan, ok, err := readIntentHistoryPlanRef(ctx, repo, opts.showPlan); err == nil && ok {
+				return showIntentHistoryPlan(ctx, out, repo, plan, jsonOut, false)
 			}
-			printIntentHistoryPlan(out, plan)
-			if repo, err := resolveRepo(repoFlag); err == nil {
-				if dbPath, err := rewriteStateDBPath(ctx, repo); err == nil {
-					if db, err := state.OpenReadOnly(ctx, dbPath); err == nil {
-						defer db.Close()
-						if request, ok, _ := state.LoadIntentHistoryRequest(ctx, db); ok && request.PlanID == plan.ID {
-							fmt.Fprintf(out, "Worker status: %s\n%s\n", request.Status, request.Error)
-						}
-					}
-				}
-			}
-			return nil
 		}
 		return showSavedRewritePlan(ctx, out, repoFlag, opts.showPlan, jsonOut)
 	}
@@ -190,6 +178,12 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 			if plan, ok, err := readIntentHistoryPlanRef(ctx, repo, opts.applyPlan); err == nil && ok {
 				if !opts.yes && !opts.dryRun {
 					return errors.New("acd history rewrite: --apply requires --yes or --dry-run")
+				}
+				if jsonOut {
+					if err := applyIntentHistoryPlan(ctx, io.Discard, repo, plan, opts.dryRun); err != nil {
+						return err
+					}
+					return showIntentHistoryPlan(ctx, out, repo, plan, true, opts.dryRun)
 				}
 				return applyIntentHistoryPlan(ctx, out, repo, plan, opts.dryRun)
 			}
