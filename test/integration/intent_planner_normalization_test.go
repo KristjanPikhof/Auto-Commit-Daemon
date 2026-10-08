@@ -407,7 +407,7 @@ func logOutageTestState(t *testing.T, repo string) {
 
 func restartOutageTestSession(t *testing.T, ctx context.Context, env []string, repo, session, harness string) {
 	t.Helper()
-	enabled := runAcd(t, ctx, env, "on", "--repo", repo, "--yes", "--json")
+	enabled := runAcd(t, ctx, env, "on", "--repo", repo, "--json")
 	if enabled.ExitCode != 0 {
 		t.Fatalf("enable restarted outage worker: %s %s", enabled.Stdout, enabled.Stderr)
 	}
