@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -11,9 +12,12 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 type historyGoalCLIPlanner struct{}
@@ -197,5 +201,245 @@ func TestIntentHistoryPreviewAndUnsupportedWorkerDoNotMigrateState(t *testing.T)
 	}
 	if _, err := git.RevParse(ctx, repo, plan.TargetBranchRef); err == nil {
 		t.Fatal("unsupported worker created a branch")
+	}
+}
+
+func TestIntentHistoryApplyUsesCanonicalWorkerSocketAndWake(t *testing.T) {
+	repo, db, plan, lookup := intentHistoryApplyFixture(t)
+	lock, err := daemon.AcquireDaemonLock(lookup.Worktree.GitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	woke := make(chan string, 1)
+	handler := &repositoryWorkerHandler{
+		repositoryID: lookup.Record.RepositoryID,
+		runtimes: map[string]*workerRuntime{lookup.Record.WorktreeID: {
+			record: lookup.Record, worktree: lookup.Worktree, db: db,
+		}},
+		wake: func(id string) { woke <- id },
+	}
+	serveIntentHistoryWorker(t, lookup, handler)
+	var out bytes.Buffer
+	if err := applyIntentHistoryPlan(context.Background(), &out, repo, plan, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-woke:
+		if id != lookup.Record.WorktreeID {
+			t.Fatalf("woke another worktree: %s", id)
+		}
+	default:
+		t.Fatal("saved request did not wake the canonical worker")
+	}
+	request, ok, err := state.LoadIntentHistoryRequest(context.Background(), db)
+	if err != nil || !ok || request.Status != "pending" || request.PlanID != plan.ID {
+		t.Fatalf("request=%+v ok=%v err=%v", request, ok, err)
+	}
+	if !strings.Contains(out.String(), "Queued for the active worker") {
+		t.Fatal(out.String())
+	}
+	if head, _ := git.RevParse(context.Background(), repo, "HEAD"); head != plan.ExpectedHead {
+		t.Fatal("queueing changed the source branch")
+	}
+	if _, err := git.RevParse(context.Background(), repo, plan.TargetBranchRef); err == nil {
+		t.Fatal("queueing bypassed worker verification")
+	}
+}
+
+func TestIntentHistoryApplyRejectsUnprovedWorkerWithoutWrites(t *testing.T) {
+	for _, scenario := range []string{"absent_socket", "different_pid", "different_repository", "not_ready", "older_schema"} {
+		t.Run(scenario, func(t *testing.T) {
+			repo, db, plan, lookup := intentHistoryApplyFixture(t)
+			wantVersion := state.SchemaVersion
+			if scenario == "older_schema" {
+				wantVersion = 29
+				if _, err := db.SQL().ExecContext(context.Background(), "PRAGMA user_version=29"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario != "absent_socket" && scenario != "older_schema" {
+				ready := supervisor.WorkerReadiness{RepositoryID: lookup.Record.RepositoryID, PID: os.Getpid(), Ready: true}
+				switch scenario {
+				case "different_pid":
+					ready.PID++
+				case "different_repository":
+					ready.RepositoryID = "ffffffffffffffff"
+				case "not_ready":
+					ready.Ready = false
+				}
+				serveIntentHistoryWorker(t, lookup, historyReadinessFixture{ready: ready})
+			}
+			var out bytes.Buffer
+			if err := applyIntentHistoryPlan(context.Background(), &out, repo, plan, false); err == nil || !strings.Contains(err.Error(), "worker") {
+				t.Fatalf("unproved owner accepted: %v", err)
+			}
+			if _, ok, err := state.LoadIntentHistoryRequest(context.Background(), db); err != nil || ok {
+				t.Fatalf("unproved owner received request: ok=%v err=%v", ok, err)
+			}
+			if _, ok, err := state.LoadIntentHistoryPlan(context.Background(), db, plan.ID); err != nil || ok {
+				t.Fatalf("unproved owner saved plan: ok=%v err=%v", ok, err)
+			}
+			if version, err := db.UserVersion(context.Background()); err != nil || version != wantVersion {
+				t.Fatalf("schema changed: %d %v", version, err)
+			}
+		})
+	}
+}
+
+func TestIntentHistoryCompletedApplyProvesExistingTarget(t *testing.T) {
+	for _, scenario := range []string{"intact", "deleted", "drifted", "backup_deleted"} {
+		t.Run(scenario, func(t *testing.T) {
+			repo, db, plan, _ := intentHistoryApplyFixture(t)
+			ctx := context.Background()
+			replacements, err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := git.ApplyIntentHistoryReconstruction(ctx, repo, git.IntentHistoryReconstructionOptions{
+				SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead,
+				OldChain: plan.SourceChain, Replacements: replacements, PlanID: plan.ID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := state.IntentHistoryRequest{PlanID: plan.ID, Status: "completed", NewHead: result.NewHead, BackupRef: result.BackupRef}
+			if err := state.SaveIntentHistoryRequest(ctx, db, request); err != nil {
+				t.Fatal(err)
+			}
+			request, _, err = state.LoadIntentHistoryRequest(ctx, db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch scenario {
+			case "deleted":
+				_, err = git.Run(ctx, git.RunOpts{Dir: repo}, "update-ref", "-d", plan.TargetBranchRef)
+			case "drifted":
+				_, err = git.Run(ctx, git.RunOpts{Dir: repo}, "update-ref", plan.TargetBranchRef, plan.ExpectedHead)
+			case "backup_deleted":
+				_, err = git.Run(ctx, git.RunOpts{Dir: repo}, "update-ref", "-d", result.BackupRef)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, dryRun := range []bool{true, false} {
+				var out bytes.Buffer
+				err := applyIntentHistoryPlan(ctx, &out, repo, plan, dryRun)
+				if scenario == "intact" {
+					if err != nil || !strings.Contains(out.String(), "Already completed") || strings.Contains(out.String(), "Queued") {
+						t.Fatalf("completed result=%q err=%v", out.String(), err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), "generate a new plan") {
+					t.Fatalf("changed completed target accepted: %v", err)
+				}
+			}
+			after, _, err := state.LoadIntentHistoryRequest(ctx, db)
+			if err != nil || after != request {
+				t.Fatalf("completion evidence changed: %+v %v", after, err)
+			}
+			if scenario == "deleted" {
+				if _, err := git.RevParse(ctx, repo, plan.TargetBranchRef); err == nil {
+					t.Fatal("replay silently recreated the deleted branch")
+				}
+			}
+		})
+	}
+}
+
+func intentHistoryApplyFixture(t *testing.T) (string, *state.DB, state.IntentHistoryPlan, controlRepoLookup) {
+	t.Helper()
+	withIsolatedHome(t)
+	shortState, err := os.MkdirTemp("/tmp", "acd-history-cli-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortState) })
+	t.Setenv("XDG_STATE_HOME", shortState)
+	roots, err := paths.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := rewriteSelectionTestRepo(t)
+	ctx := context.Background()
+	writeRewriteTestFile(t, repo, "recovery.md", "# Checkpoint recovery\nResume protected work after interruption.\n")
+	for _, args := range [][]string{{"add", "recovery.md"}, {"commit", "-q", "-m", "Update recovery.md"}} {
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wt, err := git.ResolveWorktree(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := state.DBPathFromGitDir(wt.GitDir)
+	db, err := state.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		upsertActivatedRepoFixture(reg, wt.Root, wt.CommonDir, dbPath, "codex", time.Now().Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	worker := state.DaemonState{PID: os.Getpid(), Mode: "running", DaemonFingerprint: sql.NullString{String: "history-owner-fixture", Valid: true}}
+	if err := state.SaveDaemonState(ctx, db, worker); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSetJSON(ctx, db, state.MetaKeyIntentHistoryWorker, state.IntentHistoryWorker{PID: worker.PID, Fingerprint: worker.DaemonFingerprint.String, Protocol: state.IntentHistoryPlanVersion}); err != nil {
+		t.Fatal(err)
+	}
+	head, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := daemon.PlanIntentHistory(ctx, repo, "refs/heads/main", []string{head}, historyGoalCLIPlanner{}, ai.CommitFormatImperative, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.TargetBranchRef = "refs/heads/verified-recovery"
+	plan, err = state.PrepareIntentHistoryPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := loadControlRepo(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo, db, plan, lookup
+}
+
+type historyReadinessFixture struct{ ready supervisor.WorkerReadiness }
+
+func (h historyReadinessFixture) HandleWorkerRequest(_ context.Context, request supervisor.Request) (any, *supervisor.ProtocolError) {
+	if request.Method != "status" {
+		return nil, &supervisor.ProtocolError{Code: "unexpected_mutation", Message: "owner proof must precede mutation"}
+	}
+	return h.ready, nil
+}
+
+func serveIntentHistoryWorker(t *testing.T, lookup controlRepoLookup, handler supervisor.WorkerHandler) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- supervisor.ServeWorker(ctx, supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), handler)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("worker socket: %v", err)
+		}
+	})
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID)); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker socket did not start")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

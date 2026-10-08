@@ -8,12 +8,13 @@ import (
 	"io"
 	"os"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 func readIntentHistoryPlanRef(ctx context.Context, repo, ref string) (state.IntentHistoryPlan, bool, error) {
@@ -177,6 +178,23 @@ func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, pla
 	if err != nil {
 		return err
 	}
+	dbPath, err := rewriteStateDBPath(ctx, repo)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dbPath); err == nil {
+		readDB, err := state.OpenReadOnly(ctx, dbPath)
+		if err != nil {
+			return err
+		}
+		completed, checkErr := acknowledgeCompletedIntentHistory(ctx, out, repo, readDB, plan, replacements)
+		readDB.Close()
+		if checkErr != nil || completed {
+			return checkErr
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if _, err := git.ApplyIntentHistoryReconstruction(ctx, repo, git.IntentHistoryReconstructionOptions{SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead, OldChain: plan.SourceChain, Replacements: replacements, PlanID: plan.ID, DryRun: true}); err != nil {
 		return err
 	}
@@ -186,10 +204,6 @@ func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, pla
 		return nil
 	}
 	lookup, err := loadControlRepo(ctx, repo)
-	if err != nil {
-		return err
-	}
-	dbPath, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
 		return err
 	}
@@ -220,11 +234,17 @@ func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, pla
 	if version != state.SchemaVersion {
 		return errors.New("acd history rewrite: active worker schema does not match the reconstruction protocol; run setup and restart first")
 	}
+	if err := proveIntentHistoryWorker(ctx, lookup, worker.PID); err != nil {
+		return err
+	}
 	db, err := state.OpenRuntime(ctx, dbPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	if completed, err := acknowledgeCompletedIntentHistory(ctx, out, repo, db, plan, replacements); err != nil || completed {
+		return err
+	}
 	plan, err = state.SaveIntentHistoryPlan(ctx, db, plan)
 	if err != nil {
 		return err
@@ -232,9 +252,56 @@ func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, pla
 	if err := state.EnqueueIntentHistoryRequest(ctx, db, plan.ID); err != nil {
 		return err
 	}
-	if err := signalProcess(worker.PID, syscall.SIGUSR1, daemonFingerprintToken(worker)); err != nil {
-		return err
+	response, err := supervisor.DoWorker(ctx, supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), supervisor.Request{
+		Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("history-wake-%d", time.Now().UnixNano()),
+		Method: "hint", RepositoryID: lookup.Record.RepositoryID, WorktreeID: lookup.Record.WorktreeID,
+	}, 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("acd history rewrite: request was saved, but worker wake failed: %w", err)
+	}
+	if !response.OK || response.Error != nil {
+		return errors.New("acd history rewrite: request was saved, but worker rejected the wake")
 	}
 	fmt.Fprintf(out, "Queued for the active worker: %s\nCapture protection continues. Run acd history rewrite --show-plan %s to inspect progress.\n", plan.ID, plan.ID)
 	return nil
+}
+
+// The worker socket is served only while its process holds the canonical
+// repository lock. Persisted PID and capability metadata alone cannot prove it.
+func proveIntentHistoryWorker(ctx context.Context, lookup controlRepoLookup, pid int) error {
+	response, err := supervisor.DoWorker(ctx, supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), supervisor.Request{
+		Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("history-owner-%d", time.Now().UnixNano()),
+		Method: "status", RepositoryID: lookup.Record.RepositoryID,
+	}, 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("acd history rewrite: cannot prove the active worker owns this repository: %w", err)
+	}
+	ready, err := decodeProductData[supervisor.WorkerReadiness](response.Data)
+	if err != nil || !response.OK || response.Error != nil || !ready.Ready || ready.RepositoryID != lookup.Record.RepositoryID || ready.PID != pid {
+		return errors.New("acd history rewrite: active worker ownership does not match the saved capability; restart ACD before applying")
+	}
+	return nil
+}
+
+func acknowledgeCompletedIntentHistory(ctx context.Context, out io.Writer, repo string, db *state.DB, plan state.IntentHistoryPlan, replacements []git.IntentRepairReplacement) (bool, error) {
+	request, ok, err := state.LoadIntentHistoryRequest(ctx, db)
+	if err != nil || !ok || request.PlanID != plan.ID || request.Status != "completed" {
+		return false, err
+	}
+	head, err := git.RevParse(ctx, repo, plan.TargetBranchRef)
+	if err != nil || request.NewHead == "" || head != request.NewHead {
+		return true, errors.New("acd history rewrite: completed target is missing or changed; generate a new plan")
+	}
+	result, err := git.RecoverIntentHistoryReconstruction(ctx, repo, git.IntentHistoryReconstructionOptions{
+		SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead,
+		OldChain: plan.SourceChain, Replacements: replacements, PlanID: plan.ID,
+	})
+	if err != nil {
+		return true, fmt.Errorf("acd history rewrite: completed reconstruction no longer matches; generate a new plan: %w", err)
+	}
+	if request.BackupRef != result.BackupRef {
+		return true, errors.New("acd history rewrite: completed reconstruction backup changed; generate a new plan")
+	}
+	fmt.Fprintf(out, "Already completed: %s\nNew branch: %s\n", plan.ID, plan.TargetBranchRef)
+	return true, nil
 }
