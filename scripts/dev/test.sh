@@ -139,11 +139,11 @@ run_support() {
   done <<<"$package_list"
 
   run_measured_tests support -p "$package_parallelism" "${packages[@]}" \
-    -race -count=1 -timeout "$test_timeout"
+    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout"
 }
 
 run_sensitive() {
-  run_measured_tests sensitive ./internal/daemon -race -count=1 -timeout "$test_timeout" \
+  run_measured_tests sensitive ./internal/daemon -race -count=1 -parallel=2 -timeout "$test_timeout" \
     -run "$timing_sensitive_daemon_tests"
 }
 
