@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"path"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -14,12 +15,14 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		return captures, nil
 	}
 	var offeredPaths []string
+	var freshPaths []string
 	for _, capture := range captures {
 		offeredPaths = append(offeredPaths, capture.Event.Path)
 	}
 	newCaptures := make(map[int64]bool)
 	for _, capture := range input.Captures {
 		newCaptures[capture.Event.Seq] = true
+		freshPaths = append(freshPaths, capture.Event.Path)
 	}
 	withReferences := make(map[int64]bool)
 	attachReferences := func(capture *IntentCandidateCapture) error {
@@ -52,6 +55,38 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 			if err := attachReferences(&captures[i]); err != nil {
 				return nil, err
 			}
+		}
+	}
+	// A late configuration/helper capture may name no symbols itself. Prove
+	// that an existing script goal calls or reads it before deciding which
+	// detailed old diffs are relevant. The scan stays on bounded captured blobs.
+	scanned := len(withReferences)
+	for i := range captures {
+		capture := &captures[i]
+		ext := path.Ext(capture.Event.Path)
+		if newCaptures[capture.Event.Seq] || (ext != ".sh" && ext != ".py") || scanned >= ai.IntentCandidateCaptureCap {
+			continue
+		}
+		scanned++
+		for j := len(capture.Ops) - 1; j >= 0; j-- {
+			op := capture.Ops[j]
+			if op.Path != capture.Event.Path {
+				continue
+			}
+			references, err := loadIntentRecordedReferenceContext(ctx, input.RepoPath, op.Path, op.AfterOID.String, op.AfterMode.String, freshPaths)
+			if err != nil {
+				return nil, err
+			}
+			if references != "" {
+				if capture.CapturedDiff == "" {
+					capture.CapturedDiff, err = BuildOpsDiffWithCap(ctx, input.RepoPath, capture.Ops, ai.IntentStageDiffCap)
+					if err != nil {
+						return nil, err
+					}
+				}
+				capture.CapturedDiff = includeIntentRecordedReferenceContext(capture.CapturedDiff, references)
+			}
+			break
 		}
 	}
 	edges, err := BuildIntentCandidateDependencies(input.BranchRef, input.BranchGeneration, captures, append(append([]IntentDependencyHint(nil), input.Hints...), runtimeIntentDependencyHints(captures)...), input.Now)
