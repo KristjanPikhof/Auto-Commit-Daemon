@@ -3413,6 +3413,7 @@ func TestIntentCandidateEngineFallbackMergesCrossCandidateHardClosure(
 func TestIntentCandidateEngineHoldsOverCapHardContinuationWithoutErrors(
 	t *testing.T,
 ) {
+	t.Parallel()
 	for _, testCase := range []struct {
 		name   string
 		native bool
@@ -4573,6 +4574,7 @@ func TestAdvanceTerminalIntentCandidateIDsExtendsExhaustedLegacyChain(
 func TestAdvanceTerminalIntentCandidateIDsIgnoresClockRollback(
 	t *testing.T,
 ) {
+	t.Parallel()
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	capture := appendIntentCandidateCapture(
