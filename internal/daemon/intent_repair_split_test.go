@@ -77,12 +77,12 @@ func TestIntentRepairMixedCommitSplitCrashPreservesCaptureLineage(t *testing.T) 
 		t.Fatalf("recovery=%+v err=%v", recovered, err)
 	}
 	for _, candidate := range plan.Candidates {
-		event, err := state.CaptureEventBySeq(ctx, repo.db, candidate.EventSeqs[0])
-		if err != nil {
+		var commitOID string
+		if err := repo.db.SQL().QueryRowContext(ctx, `SELECT commit_oid FROM capture_events WHERE seq=?`, candidate.EventSeqs[0]).Scan(&commitOID); err != nil {
 			t.Fatal(err)
 		}
-		if event.CommitOID.String != applied.CandidateMap[candidate.CandidateID] {
-			t.Fatalf("capture lineage=%+v", event)
+		if commitOID != applied.CandidateMap[candidate.CandidateID] {
+			t.Fatalf("capture lineage=%s", commitOID)
 		}
 	}
 	stored, ok, err := state.IntentRepairByID(ctx, repo.db, plan.ID)
