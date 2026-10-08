@@ -31,11 +31,36 @@ func TestIntentLocalFallbackRecoversRejectedSymbolSubjects(t *testing.T) {
 			if err != nil {
 				t.Fatalf("local fallback cannot recover an ordinary edit: %v", err)
 			}
-			if len(out.Candidates) != 1 || !reflect.DeepEqual(out.Candidates[0].SelectedSeqs, []int64{1}) || out.Candidates[0].Body == "" {
-				t.Fatalf("local fallback changed membership or omitted evidence: %+v", out)
+			if len(out.Candidates) != 1 || !reflect.DeepEqual(out.Candidates[0].SelectedSeqs, []int64{1}) ||
+				out.Candidates[0].Readiness != ai.IntentCandidateWait || out.Candidates[0].Subject != "" ||
+				len(out.Candidates[0].MissingCompanions) == 0 {
+				t.Fatalf("unknown meaning was not retained as a protected goal: %+v", out)
+			}
+			if err := ai.ValidateIntentPlanV2(req, out); err != nil {
+				t.Fatalf("waiting plan lost capture ownership: %v", err)
+			}
+			// Later captured implementation provides the outcome that the bare
+			// declaration could not explain. The original capture stays owned.
+			followup := "+def save_settings(value):\n+    with open(\"settings.json\", \"w\") as output:\n+        json.dump(value, output)\n"
+			if strings.HasSuffix(tc.path, ".go") {
+				followup = "+func saveSettings(value any) error {\n+    data, err := json.Marshal(value)\n+    if err != nil { return err }\n+    return os.WriteFile(\"settings.json\", data, 0600)\n+}\n"
+			}
+			req.OfferedCaptures = append(req.OfferedCaptures, ai.OfferedCapture{Seq: 2, Path: tc.path, Op: "modify", CapturedDiff: followup})
+			req.Dependencies = []ai.IntentCaptureDependency{{FromSeq: 1, ToSeq: 2, Strength: ai.IntentDependencyHard,
+				Kind: "same_path_order", EvidenceHash: "recorded follow-up on the same settings path"}}
+			recovered := cloneIntentPlanV2(out)
+			goal := &recovered.Candidates[0]
+			goal.SelectedSeqs = []int64{1, 2}
+			goal.Purpose = "persist settings for the next application run"
+			goal.Readiness, goal.MissingCompanions = ai.IntentCandidateReady, nil
+			goal.Subject = "Preserve settings across restarts"
+			goal.Body = "- Store the supplied settings in a JSON file for the next run"
+			goal.GroupingReason = "the follow-up completes the original settings persistence edit"
+			if err := ValidateIntentGoalPlan(req, recovered); err != nil {
+				t.Fatalf("meaningful later evidence could not recover the owned goal: %v", err)
 			}
 			report := ai.EvaluateIntentPlanMessageQuality(ai.LegacyIntentPlanRequest(req), ai.IntentPlan{
-				SelectedSeqs: out.Candidates[0].SelectedSeqs, Subject: out.Candidates[0].Subject, Body: out.Candidates[0].Body,
+				SelectedSeqs: goal.SelectedSeqs, Subject: goal.Subject, Body: goal.Body,
 			})
 			if report.Action != ai.MessageQualityClean {
 				t.Fatalf("local message failed quality: %+v", report)
