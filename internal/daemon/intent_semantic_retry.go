@@ -90,15 +90,102 @@ func projectIntentSemanticRetry(ctx context.Context, db *state.DB, record Intent
 }
 
 func clearIntentSemanticRetry(ctx context.Context, db *state.DB, evidence string) error {
-	values := map[string]string{intentSemanticRetryKey(evidence): ""}
+	if _, err := state.MetaDelete(ctx, db, intentSemanticRetryKey(evidence)); err != nil {
+		return err
+	}
 	current, found, err := loadIntentSemanticRetry(ctx, db)
 	if err != nil {
 		return err
 	}
 	if found && current.EvidenceFingerprint == evidence {
-		values[MetaKeyIntentSemanticRetry] = ""
+		_, err = state.MetaDelete(ctx, db, MetaKeyIntentSemanticRetry)
 	}
-	return state.MetaSetMany(ctx, db, values)
+	return err
+}
+
+// Prune only derived cooldowns at a real planning transition. Active deadlines
+// survive; expired records lose authority once their captures are terminal or
+// a newer waiting plan already covers all of their still-pending captures.
+func pruneIntentSemanticRetries(ctx context.Context, db *state.DB, evidence string, now time.Time) error {
+	_, err := db.SQL().ExecContext(ctx, `
+DELETE FROM daemon_meta
+WHERE key LIKE ? AND key<>? AND (
+ value='' OR (json_valid(value) AND json_extract(value,'$.retry_at_ts')<=? AND (
+  NOT EXISTS (
+   SELECT 1 FROM intent_plan_runs old, json_each(old.unresolved_seqs) seq
+   JOIN capture_events ev ON ev.seq=seq.value AND ev.state='pending'
+   WHERE old.fingerprint=json_extract(daemon_meta.value,'$.plan_fingerprint')
+  ) OR EXISTS (
+   SELECT 1 FROM intent_plan_runs old JOIN intent_plan_runs newer
+    ON newer.branch_ref=old.branch_ref AND newer.branch_generation=old.branch_generation
+    AND newer.updated_ts>old.updated_ts AND newer.progress_state='waiting_semantic_retry'
+   WHERE old.fingerprint=json_extract(daemon_meta.value,'$.plan_fingerprint')
+   AND NOT EXISTS (
+    SELECT 1 FROM json_each(old.unresolved_seqs) seq
+    JOIN capture_events ev ON ev.seq=seq.value AND ev.state='pending'
+    WHERE NOT EXISTS (SELECT 1 FROM json_each(newer.unresolved_seqs) covered WHERE covered.value=seq.value)
+   )
+  )
+ )))`, MetaKeyIntentSemanticRetry+".%", intentSemanticRetryKey(evidence), intentPlannerHealthTimestamp(now))
+	return err
+}
+
+// A due review gets one bounded session even when independent new work keeps
+// arriving. Renewing its cooldown returns priority to the normal fresh window.
+// Selection proves membership against the replay-safe pending queue and does
+// not reserve attempts or change state.
+func dueIntentSemanticReviewWindow(ctx context.Context, db *state.DB, pending []state.CaptureEvent, size int, now time.Time) ([]state.CaptureEvent, error) {
+	if len(pending) == 0 || size <= 0 || pending[0].BranchRef == "" {
+		return nil, nil
+	}
+	head := pending[0]
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT retry.value, run.unresolved_seqs
+FROM daemon_meta retry JOIN intent_plan_runs run
+ ON run.fingerprint=json_extract(retry.value,'$.plan_fingerprint')
+WHERE retry.key LIKE ? AND json_valid(retry.value)
+ AND json_extract(retry.value,'$.branch_ref')=?
+ AND json_extract(retry.value,'$.branch_generation')=?
+ AND json_extract(retry.value,'$.retry_at_ts')<=?
+ AND run.branch_ref=? AND run.branch_generation=?
+ AND run.progress_state IN ('waiting_semantic_retry','semantic_retry_running')
+ORDER BY json_extract(retry.value,'$.retry_at_ts'), retry.key
+LIMIT ?`, MetaKeyIntentSemanticRetry+".%", head.BranchRef, head.BranchGeneration,
+		intentPlannerHealthTimestamp(now), head.BranchRef, head.BranchGeneration, state.IntentCandidateMaxOpenPerPair)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw, members string
+		if err := rows.Scan(&raw, &members); err != nil {
+			return nil, err
+		}
+		if _, err := DecodeIntentSemanticRetrySnapshot(raw); err != nil || len(members) > state.IntentCandidateMaxCaptures*24+2 {
+			continue
+		}
+		var seqs []int64
+		if json.Unmarshal([]byte(members), &seqs) != nil || len(seqs) > state.IntentCandidateMaxCaptures {
+			continue
+		}
+		wanted := make(map[int64]bool, len(seqs))
+		for _, seq := range seqs {
+			wanted[seq] = true
+		}
+		var window []state.CaptureEvent
+		for _, event := range pending {
+			if wanted[event.Seq] && event.BranchRef == head.BranchRef && event.BranchGeneration == head.BranchGeneration {
+				window = append(window, event)
+				if len(window) == size {
+					break
+				}
+			}
+		}
+		if len(window) > 0 {
+			return window, nil
+		}
+	}
+	return nil, rows.Err()
 }
 
 func intentSemanticRetryEvidence(req ai.IntentPlanRequestV2, input IntentCandidateEvaluation, limit int) (string, error) {
@@ -141,6 +228,13 @@ func holdUnclearIntentMessages(req ai.IntentPlanRequestV2, plan ai.IntentPlanV2,
 }
 
 func scheduleIntentSemanticRetry(ctx context.Context, db *state.DB, input IntentCandidateEvaluation, run state.IntentPlanRun, evidence string, retryAt time.Time) error {
+	now := input.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if err := pruneIntentSemanticRetries(ctx, db, evidence, now); err != nil {
+		return err
+	}
 	return saveIntentSemanticRetry(ctx, db, IntentSemanticRetrySnapshot{
 		Version: 1, BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
 		EvidenceFingerprint: evidence, PlanFingerprint: run.Fingerprint,

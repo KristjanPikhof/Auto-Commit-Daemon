@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -27,6 +29,76 @@ func semanticRetryRequest(t *testing.T) (ai.IntentPlanRequestV2, IntentCandidate
 		Preset: config.PresetBalanced, Now: time.Now().UTC().Truncate(time.Second),
 	}
 	return req, input, planner
+}
+
+func TestIntentSemanticRetryPrunesOnlyExpiredSupersededCooldowns(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	a := appendIntentCandidateCapture(t, db, "SpeechEngine.swift", "modify", "before", "after")
+	b := appendIntentCandidateCapture(t, db, "CameraController.swift", "modify", "before", "after")
+	var runs []state.IntentPlanRun
+	for i, seq := range []int64{a.Event.Seq, a.Event.Seq, b.Event.Seq} {
+		run, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
+			Fingerprint: fmt.Sprintf("sha256:%064x", i+1), BranchRef: "refs/heads/main", BranchGeneration: 1,
+			AttemptLimit: 1, UnresolvedSeqs: []int64{seq},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run.Completed = true
+		run.UnresolvedSeqs = []int64{seq}
+		run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
+		run.ResolutionMode = run.ProgressState
+		if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+			t.Fatal(err)
+		}
+		runs = append(runs, run)
+	}
+	if _, err := db.SQL().ExecContext(ctx, "UPDATE intent_plan_runs SET updated_ts=? WHERE fingerprint=?", float64(now.Unix())+1, runs[1].Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]string{}
+	for i := 1; i <= 143; i++ {
+		fingerprint := fmt.Sprintf("sha256:%064x", i)
+		retryAt := now.Add(-time.Minute)
+		if i == 2 {
+			retryAt = now.Add(time.Hour)
+		}
+		raw, err := json.Marshal(IntentSemanticRetrySnapshot{
+			Version: 1, BranchRef: "refs/heads/main", BranchGeneration: 1,
+			EvidenceFingerprint: fingerprint, PlanFingerprint: fingerprint,
+			RetryAtTS: intentPlannerHealthTimestamp(retryAt),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		values[intentSemanticRetryKey(fingerprint)] = string(raw)
+	}
+	if err := state.MetaSetMany(ctx, db, values); err != nil {
+		t.Fatal(err)
+	}
+	if err := pruneIntentSemanticRetries(ctx, db, runs[1].Fingerprint, now); err != nil {
+		t.Fatal(err)
+	}
+	var cooldowns, plans, captures int
+	if err := db.SQL().QueryRowContext(ctx, "SELECT count(*) FROM daemon_meta WHERE key LIKE ?", MetaKeyIntentSemanticRetry+".%").Scan(&cooldowns); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SQL().QueryRowContext(ctx, "SELECT count(*) FROM intent_plan_runs").Scan(&plans); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SQL().QueryRowContext(ctx, "SELECT count(*) FROM capture_events WHERE state='pending'").Scan(&captures); err != nil {
+		t.Fatal(err)
+	}
+	if cooldowns != 2 || plans != 3 || captures != 2 {
+		t.Fatalf("prune lost active retry or provenance: cooldowns=%d plans=%d captures=%d", cooldowns, plans, captures)
+	}
+	for _, index := range []int{1, 2} {
+		if _, found, err := loadIntentSemanticRetryForEvidence(ctx, db, runs[index].Fingerprint); err != nil || !found {
+			t.Fatalf("active record %d pruned: found=%t err=%v", index, found, err)
+		}
+	}
 }
 
 func restoredSemanticPlan() ai.IntentPlanV2 {
