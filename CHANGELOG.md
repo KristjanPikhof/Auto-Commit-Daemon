@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Keep a stopped Intent run retryable when an AI outage leaves an oversized
+  fallback group waiting. Older stopped runs resume only after matching the
+  saved transport failure and proving the frozen target and branch are safe.
+- Report stopped publication in recovery previews. Explicit force recovery can
+  preserve the whole unpublished chain before recapturing current work.
+- Exclude compiler index caches under `-Xcc/` from capture and watching.
+
 ## v2026-10-04
 
 ### Fixed

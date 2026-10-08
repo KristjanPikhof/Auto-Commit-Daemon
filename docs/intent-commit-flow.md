@@ -168,6 +168,14 @@ changing a saved provider string alone does not reinterpret frozen work.
 Overlapping operations or ambiguous provenance still require attention.
 
 ACD uses `needs_attention` only when it cannot prove a safe outcome.
+
+When an AI outage leaves a local fallback group too large to publish, the
+frozen run waits for the provider retry instead of stopping permanently.
+Older runs stopped by this path resume after ACD matches the saved transport
+failure and rechecks the branch, target, and active operations. Later captures
+stay outside that target. Recovery previews show stopped runs; explicit
+`acd support recover --force --yes` preserves the whole unpublished chain on
+a recovery ref before recapturing current work.
 Examples include unresolved dependency ambiguity, failed materialization, a
 revertibility failure, or uncertain branch ownership and exact-ref state. A
 verification failure first starts bounded automatic checkpoint replanning and

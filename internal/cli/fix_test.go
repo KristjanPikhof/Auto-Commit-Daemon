@@ -111,6 +111,65 @@ func TestFix_ReconcilesResolvedPublicationDrain(t *testing.T) {
 	}
 }
 
+func TestFix_StoppedProviderDrainOffersWholeChainRecovery(t *testing.T) {
+	ctx := context.Background()
+	repo, _, db := makeRegisteredGitRepoStateDB(t)
+	drainID, _ := seedResolvedFixPublicationDrain(t, ctx, repo, db)
+	const contents = "protected work after the provider outage\n"
+	if err := os.WriteFile(filepath.Join(repo, "outage.txt"), []byte(contents), 0644); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := git.HashObjectStdin(ctx, repo, []byte(contents))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seq int64
+	if err := db.SQL().QueryRowContext(ctx, `SELECT event_seq FROM publication_drain_events WHERE drain_id=?`, drainID).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `UPDATE capture_events SET state='pending',operation='create',path='outage.txt',commit_oid=NULL,published_ts=NULL WHERE seq=?`, seq); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `INSERT INTO capture_ops(event_seq,ord,op,path,after_oid,after_mode,fidelity) VALUES(?,0,'create','outage.txt',?,'100644','exact')`, seq, blob); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `UPDATE publication_drains SET last_error='openai-compat: http 502: Bad Gateway' WHERE id=?`, drainID); err != nil {
+		t.Fatal(err)
+	}
+	headBefore, err := git.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := runFixJSON(t, repo, true, false, false, false)
+	if !checked.ForceRequired || len(checked.Unsafe) == 0 {
+		t.Fatalf("stopped publication reported healthy: %+v", checked)
+	}
+	preview := runFixJSON(t, repo, true, false, true, false)
+	action := findFixAction(preview, fixActionReconcileUnpublishedChain)
+	if action == nil || !action.ArchiveOnly || action.PendingCount != 1 || action.Applied {
+		t.Fatalf("archive preview=%+v", preview)
+	}
+	applied := runFixJSON(t, repo, false, true, true, false)
+	action = findFixAction(applied, fixActionReconcileUnpublishedChain)
+	if action == nil || !action.Applied || action.RecoveryRef == "" {
+		t.Fatalf("applied recovery=%+v", applied)
+	}
+	drain, err := state.PublicationDrainByID(ctx, db, drainID)
+	if err != nil || drain.Phase != state.PublicationDrainCompleted {
+		t.Fatalf("drain=%+v err=%v", drain, err)
+	}
+	var eventState string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT state FROM capture_events WHERE seq=?`, seq).Scan(&eventState); err != nil || eventState != state.EventStateRecovered {
+		t.Fatalf("preserved capture=%q err=%v", eventState, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(repo, "outage.txt")); err != nil || string(got) != contents {
+		t.Fatalf("worktree changed=%q err=%v", got, err)
+	}
+	if headAfter, err := git.RevParse(ctx, repo, "HEAD"); err != nil || headAfter != headBefore {
+		t.Fatalf("HEAD changed=%s err=%v", headAfter, err)
+	}
+}
+
 func TestFix_DryRunToleratesPreV5DB(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	seedPurgeFixtureRows(t, db)
