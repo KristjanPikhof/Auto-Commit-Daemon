@@ -29,9 +29,11 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -136,9 +138,9 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 	}
 }
 
-// A logical flush can publish a safe local group during a provider outage.
-// The provider circuit remains open instead of retrying for a commit message.
-func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
+// A logical flush protects its target while the provider is unavailable, then
+// publishes it with a meaningful provider message after a restart and retry.
+func TestFlush_LogicalWaitsDuringProviderOutageAndRecovers(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -149,9 +151,28 @@ func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
 	repo := tempRepo(t)
 	sessionID := "intent-flush-provider-outage"
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
+	var available atomic.Bool
+	var providerHits atomic.Int32
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerHits.Add(1)
+		if !available.Load() {
+			http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		req := decodeIntentChatRequest(t, r)
+		var candidates []map[string]any
+		for _, capture := range offeredIntentCaptures(t, req) {
+			candidates = append(candidates, nativeReadyIntentCandidate("flush-capture", []int64{capture.Seq},
+				"Document protected capture recovery", "- Explain retained work and automatic provider recovery",
+				"the independent documentation change explains protected capture recovery"))
+		}
+		writeNativeIntentCandidatesResponse(t, w, "flush-recovered", candidates)
+	}))
+	defer server.Close()
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
-		"ACD_AI_PROVIDER=subprocess:missing-integration",
+		"ACD_AI_PROVIDER=openai-compat", "ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key", "ACD_AI_MODEL=gpt-6-luna", trustEnv,
 		"ACD_INTENT_MIN_PENDING=10",
 		"ACD_INTENT_MAX_PENDING_AGE=5m",
 		"ACD_INTENT_WINDOW=10",
@@ -180,6 +201,7 @@ func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
 	assertIntentV2RuntimeActive(t, repo)
 
 	startCount := commitCount(t, repo)
+	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	target := filepath.Join(repo, "semantic-provider-outage.txt")
 	writeFile(t, target, "publish from captured evidence\n")
 
@@ -212,15 +234,30 @@ func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
 		return json.Unmarshal([]byte(raw), &health) == nil && health.State == "open" &&
 			health.Failure == "transport" && health.Retry > health.Opened
 	})
-	waitForEventState(t, dbPath, "semantic-provider-outage.txt", "published", 10*time.Second)
-	if got := commitCount(t, repo); got != startCount+1 {
-		t.Fatalf("commit count=%d want %d", got, startCount+1)
+	assertProviderWaitPreservesCheckpoint(t, repo, "semantic-provider-outage.txt", "publish from captured evidence\n", startHead)
+	assertOutageStatusAndList(t, ctx, env, repo, 1)
+	if got := commitCount(t, repo); got != startCount || providerHits.Load() != 1 {
+		t.Fatalf("flush bypassed provider wait: commits=%d want=%d calls=%d", got, startCount, providerHits.Load())
+	}
+	if err := stopIntentTestWorker(t, env, repo, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	makeOutageProbeDue(t, repo)
+	available.Store(true)
+	startSession(t, ctx, env, repo, sessionID, "claude-code")
+	flushed := runAcd(t, ctx, env, "flush", "--repo", repo, "--session-id", sessionID, "--logical", "--json")
+	if flushed.ExitCode != 0 {
+		t.Fatalf("retry flush: %s %s", flushed.Stdout, flushed.Stderr)
+	}
+	waitForEventState(t, dbPath, "semantic-provider-outage.txt", "published", 15*time.Second)
+	if got := commitCount(t, repo); got != startCount+1 || providerHits.Load() != 2 {
+		t.Fatalf("reconnect commits=%d want=%d calls=%d", got, startCount+1, providerHits.Load())
 	}
 	if got := runGitOK(t, repo, "show", "HEAD:semantic-provider-outage.txt"); got != "publish from captured evidence\n" {
 		t.Fatalf("published bytes=%q", got)
 	}
-	if body := runGitOK(t, repo, "log", "-1", "--format=%b"); !strings.Contains(body, "semantic-provider-outage.txt") {
-		t.Fatalf("local message lost captured evidence: %q", body)
+	if subject := headSubject(t, repo); subject != "Document protected capture recovery" {
+		t.Fatalf("recovery lost purposeful provider message: %q", subject)
 	}
 }
 

@@ -395,30 +395,51 @@ func makeOutageProbeDue(t *testing.T, repo string) {
 func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, repo string, pending int) {
 	t.Helper()
 	type snapshot struct {
-		Repo string `json:"repo"`
-		Protected bool `json:"protected"`
-		Pending int `json:"pending_events"`
-		ActionRequired bool `json:"action_required"`
-		Progress struct {
-			Phase string `json:"phase"`
-			Remaining int64 `json:"wait_remaining_seconds"`
+		Repo           string `json:"repo"`
+		Protected      bool   `json:"protected"`
+		Pending        int    `json:"pending_events"`
+		ActionRequired bool   `json:"action_required"`
+		Progress       struct {
+			Phase     string `json:"phase"`
+			Remaining int64  `json:"wait_remaining_seconds"`
 		} `json:"publication_progress"`
-		Outcome struct { RetryAt float64 `json:"retry_at"` } `json:"publication_outcome"`
+		Outcome struct {
+			RetryAt float64 `json:"retry_at"`
+		} `json:"publication_outcome"`
 	}
 	for _, command := range []string{"status", "list"} {
 		args := []string{command, "--json"}
-		if command == "status" { args = append(args, "--repo", repo) }
+		if command == "status" {
+			args = append(args, "--repo", repo)
+		}
 		result := runAcd(t, ctx, env, args...)
-		if result.ExitCode != 0 { t.Fatalf("%s: %s %s", command, result.Stdout, result.Stderr) }
-		var payload struct { Data json.RawMessage `json:"data"` }
-		if err := json.Unmarshal([]byte(result.Stdout), &payload); err != nil { t.Fatal(err) }
+		if result.ExitCode != 0 {
+			t.Fatalf("%s: %s %s", command, result.Stdout, result.Stderr)
+		}
+		var payload struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(result.Stdout), &payload); err != nil {
+			t.Fatal(err)
+		}
 		var got snapshot
 		if command == "status" {
-			if err := json.Unmarshal(payload.Data, &got); err != nil { t.Fatal(err) }
+			if err := json.Unmarshal(payload.Data, &got); err != nil {
+				t.Fatal(err)
+			}
 		} else {
-			var list struct { Repos []snapshot `json:"repos"` }
-			if err := json.Unmarshal(payload.Data, &list); err != nil { t.Fatal(err) }
-			for _, row := range list.Repos { if row.Repo == repo { got = row; break } }
+			var list struct {
+				Repos []snapshot `json:"repos"`
+			}
+			if err := json.Unmarshal(payload.Data, &list); err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range list.Repos {
+				if row.Repo == repo {
+					got = row
+					break
+				}
+			}
 		}
 		if got.Repo != repo || !got.Protected || got.Pending != pending || got.ActionRequired || got.Progress.Phase != "provider_wait" || got.Progress.Remaining <= 0 || got.Outcome.RetryAt <= float64(time.Now().Unix()) {
 			t.Fatalf("%s hid protected provider retry: %+v\n%s", command, got, result.Stdout)

@@ -47,6 +47,7 @@ func TestCaptureResilienceLargeAssetsDuringProviderOutage(t *testing.T) {
 	startSession(t, ctx, env, repo, "large-assets", "shell", extra...)
 	waitMode(t, repo, "running", 5*time.Second)
 	fullEnv := envWith(env, extra...)
+	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	if result := runAcd(t, ctx, fullEnv, "pause", "--repo", repo, "--yes", "--json"); result.ExitCode != 0 {
 		t.Fatalf("pause: %s %s", result.Stdout, result.Stderr)
 	}
@@ -78,11 +79,12 @@ func TestCaptureResilienceLargeAssetsDuringProviderOutage(t *testing.T) {
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	for _, name := range append(names, "../autocomplete.go", "../autocomplete_test.go", "../autocomplete.md", "../settings.py") {
 		path := filepath.ToSlash(filepath.Clean(filepath.Join("assets", name)))
-		waitForEventState(t, dbPath, path, "published", 30*time.Second)
+		waitForEventState(t, dbPath, path, "pending", 30*time.Second)
 		want := strings.TrimSpace(runGitOK(t, repo, "hash-object", path))
-		got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:"+path))
+		ref := sqliteScalar(t, dbPath, "SELECT checkpoint_ref FROM checkpoints WHERE phase='completed' AND retained=1 ORDER BY seq DESC LIMIT 1")
+		got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", ref+":"+path))
 		if got != want {
-			t.Fatalf("%s differs from published blob", path)
+			t.Fatalf("%s differs from protected checkpoint blob", path)
 		}
 	}
 	indexAfter := runGitOK(t, repo, "ls-files", "--stage", ".gitignore")
@@ -92,8 +94,12 @@ func TestCaptureResilienceLargeAssetsDuringProviderOutage(t *testing.T) {
 	if plannerHits.Load() < 1 || plannerHits.Load() > 3 || messageHits.Load() != 0 || !sawMetadata.Load() {
 		t.Fatalf("provider calls=%d message calls=%d binary metadata=%t", plannerHits.Load(), messageHits.Load(), sawMetadata.Load())
 	}
+	if got := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); got != startHead {
+		t.Fatalf("provider outage published unverified local history: %s want=%s", got, startHead)
+	}
+	assertOutageStatusAndList(t, ctx, fullEnv, repo, 8)
 	status := runAcd(t, ctx, fullEnv, "status", "--repo", repo, "--json")
-	if status.ExitCode != 0 || !strings.Contains(status.Stdout, `"protected": true`) || !strings.Contains(status.Stdout, `"state": "healthy"`) {
+	if status.ExitCode != 0 || !strings.Contains(status.Stdout, `"protected": true`) || !strings.Contains(status.Stdout, `"state": "waiting"`) {
 		t.Fatalf("final status: %s %s", status.Stdout, status.Stderr)
 	}
 }
