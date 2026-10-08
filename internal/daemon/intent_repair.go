@@ -168,7 +168,9 @@ func ApplyIntentRepairTransaction(
 	}
 	if qualityOnly {
 		originalTree, err := git.RevParse(ctx, repoRoot, plan.ExpectedHead+"^{tree}")
-		if err != nil { return result, err }
+		if err != nil {
+			return result, err
+		}
 		if plan.ExpectedFinalTree != "" && plan.ExpectedFinalTree != originalTree {
 			return result, errors.New("daemon: intent repair: quality-only final tree differs from original HEAD")
 		}
