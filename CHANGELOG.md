@@ -26,6 +26,8 @@
   incomplete work publishable.
 - Keep local Intent evidence available without network sharing, and reject
   grouping based only on shared prose or code comments.
+- Retain bounded recorded script references when changed lines omit the call
+  connecting a runner, helper, or generated timing file.
 - Mark transient list reads as refreshing and expose unknown protection in
   JSON. Provider waits and active probes use the same status across views.
 

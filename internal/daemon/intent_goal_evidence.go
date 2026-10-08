@@ -13,6 +13,47 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 	if input.RepoPath == "" || !input.IncludeDiffs {
 		return captures, nil
 	}
+	var offeredPaths []string
+	for _, capture := range captures {
+		offeredPaths = append(offeredPaths, capture.Event.Path)
+	}
+	newCaptures := make(map[int64]bool)
+	for _, capture := range input.Captures {
+		newCaptures[capture.Event.Seq] = true
+	}
+	withReferences := make(map[int64]bool)
+	attachReferences := func(capture *IntentCandidateCapture) error {
+		if withReferences[capture.Event.Seq] {
+			return nil
+		}
+		withReferences[capture.Event.Seq] = true
+		for i := len(capture.Ops) - 1; i >= 0; i-- {
+			op := capture.Ops[i]
+			if op.Path != capture.Event.Path {
+				continue
+			}
+			references, err := loadIntentRecordedReferenceContext(ctx, input.RepoPath, op.Path, op.AfterOID.String, op.AfterMode.String, offeredPaths)
+			if err != nil {
+				return err
+			}
+			if references != "" && capture.CapturedDiff == "" {
+				capture.CapturedDiff, err = BuildOpsDiffWithCap(ctx, input.RepoPath, capture.Ops, ai.IntentStageDiffCap)
+				if err != nil {
+					return err
+				}
+			}
+			capture.CapturedDiff = includeIntentRecordedReferenceContext(capture.CapturedDiff, references)
+			break
+		}
+		return nil
+	}
+	for i := range captures {
+		if newCaptures[captures[i].Event.Seq] && len(withReferences) < ai.IntentCandidateCaptureCap {
+			if err := attachReferences(&captures[i]); err != nil {
+				return nil, err
+			}
+		}
+	}
 	edges, err := BuildIntentCandidateDependencies(input.BranchRef, input.BranchGeneration, captures, append(append([]IntentDependencyHint(nil), input.Hints...), runtimeIntentDependencyHints(captures)...), input.Now)
 	if err != nil {
 		return nil, err
@@ -52,14 +93,16 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 			continue
 		}
 		count++
-		diffs[i] = capture.CapturedDiff
-		if diffs[i] == "" {
-			diffs[i], err = BuildOpsDiffWithCap(ctx, input.RepoPath, capture.Ops, ai.IntentStageDiffCap)
+		if capture.CapturedDiff == "" {
+			captures[i].CapturedDiff, err = BuildOpsDiffWithCap(ctx, input.RepoPath, capture.Ops, ai.IntentStageDiffCap)
 			if err != nil {
 				return nil, err
 			}
 		}
-		diffs[i] = ai.RedactDiffSecrets(diffs[i])
+		if err := attachReferences(&captures[i]); err != nil {
+			return nil, err
+		}
+		diffs[i] = ai.RedactDiffSecrets(captures[i].CapturedDiff)
 	}
 	diffs = allocateIntentEvidenceDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
 	for i := range captures {

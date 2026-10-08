@@ -141,6 +141,10 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree string, u
 	var captures []IntentCandidateCapture
 	var offered []ai.OfferedCapture
 	var err error
+	var offeredPaths []string
+	for _, batch := range batches {
+		offeredPaths = append(offeredPaths, units[batch[0]].Path)
+	}
 	diffs := make([]string, len(batches))
 	for i, batch := range batches {
 		if !includeDiffs {
@@ -158,7 +162,11 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree string, u
 		if err != nil {
 			return nil, ai.IntentPlanRequestV2{}, err
 		}
-		diffs[i] = ai.Truncate(ai.RedactDiffSecrets(string(raw)), ai.IntentStageDiffCap)
+		references, err := loadIntentRecordedReferenceContext(ctx, repo, last.Path, last.After.OID, last.After.Mode, offeredPaths)
+		if err != nil {
+			return nil, ai.IntentPlanRequestV2{}, err
+		}
+		diffs[i] = includeIntentRecordedReferenceContext(string(raw), references)
 	}
 	diffs = allocateIntentEvidenceDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
 	for i, batch := range batches {

@@ -39,6 +39,11 @@ version-chain evidence. A confident planner explanation cannot join unrelated
 changes. Available implementation and test corrections stay together. ACD
 checks message quality again when it reloads a cached or saved plan.
 
+An unchanged script call can still connect a changed runner to its changed
+helper. ACD keeps matching shell calls and Python file reads from the captured
+file version, within the same privacy and evidence limits. It never reads the
+live worktree to supply that context.
+
 Relationship checks and structural verification cannot prove that the planner
 understood the human purpose or that a project builds. Configure a verification
 command when those checks are needed.

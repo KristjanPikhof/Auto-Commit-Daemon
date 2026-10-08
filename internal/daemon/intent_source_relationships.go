@@ -16,7 +16,132 @@ var (
 	intentPublicFlagName    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{1,63}$`)
 	intentPublicStatusName  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{7,63}$`)
 	intentDocumentInline    = regexp.MustCompile("`([^`\n]+)`")
+	intentReferenceWords    = regexp.MustCompile(`"(?:\\.|[^"\\])*"|'[^']*'|[^\s]+`)
+	intentReferenceAssign   = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*=`)
+	intentReferenceHereDoc  = regexp.MustCompile(`<<-?\s*['"]?([a-zA-Z_][a-zA-Z0-9_]*)['"]?`)
+	intentReferencePython   = regexp.MustCompile(`\b(?:(?:pathlib\.)?Path\(__file__\)\.with_name|(?:pathlib\.)?Path|open)\(\s*['"]([^'"\n]+)['"]\s*\)`)
 )
+
+const intentSourceReferenceScanCap = 256 << 10
+const intentSourceReferenceContextCap = 4096
+
+// The caller supplies an immutable recorded post-image, never the live file.
+// Return bounded context fragments that actually execute or open another
+// offered path. Comments, arbitrary quoted labels, and proximity prove nothing.
+func intentSourceReferenceContext(sourcePath, recordedContents string, offeredPaths []string) string {
+	ext := path.Ext(sourcePath)
+	if ext != ".sh" && ext != ".py" {
+		return ""
+	}
+	if len(recordedContents) > intentSourceReferenceScanCap {
+		recordedContents = recordedContents[:intentSourceReferenceScanCap]
+		if end := strings.LastIndexByte(recordedContents, '\n'); end >= 0 {
+			recordedContents = recordedContents[:end+1]
+		} else {
+			return ""
+		}
+	}
+	targets := make(map[string]bool)
+	for _, target := range offeredPaths[:min(len(offeredPaths), 256)] {
+		if target != sourcePath {
+			targets[path.Clean(target)] = true
+		}
+	}
+	references := func(name string) bool {
+		return targets[path.Clean(name)] || targets[path.Clean(path.Join(path.Dir(sourcePath), name))]
+	}
+	var result strings.Builder
+	seen := make(map[string]bool)
+	appendWitness := func(fragment string) {
+		if !seen[fragment] && result.Len()+len(fragment)+2 <= intentSourceReferenceContextCap {
+			result.WriteString(" " + fragment + "\n")
+			seen[fragment] = true
+		}
+	}
+	// Reuse the comment/docstring lexer on the recorded source. The artificial
+	// '+' prefix is internal to lexing; returned evidence is unchanged context.
+	lines := intentSourceCodeLines("+" + strings.ReplaceAll(recordedContents, "\n", "\n+"))
+	var quote byte
+	opaqueEnd := ""
+	for _, line := range lines {
+		if opaqueEnd != "" {
+			if line == opaqueEnd {
+				opaqueEnd = ""
+			}
+			continue
+		}
+		insideString := quote != 0
+		for i := 0; i < len(line); i++ {
+			if line[i] == '\\' && quote != '\'' {
+				i++
+				continue
+			}
+			if quote != 0 {
+				if line[i] == quote {
+					quote = 0
+				}
+			} else if line[i] == '\'' || line[i] == '"' {
+				quote = line[i]
+			}
+		}
+		if insideString || quote != 0 {
+			continue
+		}
+		if ext == ".sh" {
+			if strings.Contains(line, "<<") {
+				match := intentReferenceHereDoc.FindStringSubmatch(line)
+				if match == nil {
+					// Unknown delimiters cannot prove where literal input ends.
+					break
+				}
+				opaqueEnd = match[1]
+				continue
+			}
+			if intentReferenceAssign.MatchString(line) && strings.HasSuffix(line, "=(") {
+				opaqueEnd = ")"
+				continue
+			}
+			words := intentReferenceWords.FindAllStringIndex(line, -1)
+			first := 0
+			for first < len(words) && intentReferenceAssign.MatchString(line[words[first][0]:words[first][1]]) {
+				first++
+			}
+			if first == len(words) {
+				continue
+			}
+			operand := first
+			switch intentReferenceLiteral(line[words[first][0]:words[first][1]]) {
+			case "bash", "sh", "python", "python2", "python3", "node", "source", ".", "exec":
+				operand++
+			}
+			if operand < len(words) && references(intentReferenceLiteral(line[words[operand][0]:words[operand][1]])) {
+				appendWitness(line[words[first][0]:words[operand][1]])
+			}
+			continue
+		}
+		quoted := intentSourceQuoted.FindAllStringIndex(line, -1)
+		for _, match := range intentReferencePython.FindAllStringSubmatchIndex(line, -1) {
+			inside := false
+			for _, span := range quoted {
+				inside = inside || (span[0] < match[0] && match[0] < span[1])
+			}
+			if !inside && references(line[match[2]:match[3]]) {
+				appendWitness(line[match[0]:match[1]])
+			}
+		}
+	}
+	return result.String()
+}
+
+func intentReferenceLiteral(token string) string {
+	if len(token) >= 2 && (token[0] == '"' || token[0] == '\'') && token[len(token)-1] == token[0] {
+		token = token[1 : len(token)-1]
+	}
+	if strings.ContainsAny(token, "$\\`\"'") {
+		return ""
+	}
+	return token
+}
 
 // These are bounded lexical relationships, not a language parser. Declarations
 // and uses must occur in changed code, so prose and quoted labels cannot provide
