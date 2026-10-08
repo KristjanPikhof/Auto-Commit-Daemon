@@ -104,6 +104,24 @@ func TestIntentHistoryAuditDistinguishesPlanRejectionFromProviderConfiguration(t
 			if !configuration && (record.Outcome != "planning_wait" || record.NextAttemptTS == 0) {
 				t.Fatalf("semantic plan outcome=%+v", record)
 			}
+			if !configuration {
+				planner.failure = nil
+				before := planner.calls
+				if _, err := MaybeRepairIntentHistory(context.Background(), f.repo.dir, f.repo.gitDir, f.repo.db, f.cctx, opts); err != nil {
+					t.Fatal(err)
+				}
+				if planner.calls != before {
+					t.Fatal("unchanged semantic evidence bypassed its review cooldown")
+				}
+				record.NextAttemptTS = intentPlannerHealthTimestamp(time.Now().Add(-time.Second))
+				if err := state.MetaSetJSON(context.Background(), f.repo.db, metaIntentHistoryAudit, record); err != nil {
+					t.Fatal(err)
+				}
+				result, err = MaybeRepairIntentHistory(context.Background(), f.repo.dir, f.repo.gitDir, f.repo.db, f.cctx, opts)
+				if err != nil || result.Status != state.IntentRepairCompleted || planner.calls != before+1 {
+					t.Fatalf("due semantic review did not repair unchanged history: result=%+v calls=%d err=%v", result, planner.calls, err)
+				}
+			}
 		})
 	}
 }
