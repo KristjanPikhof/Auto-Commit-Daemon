@@ -72,8 +72,9 @@ func TestPublicationDrainOversizedFallbackAfter502RemainsRetryable(t *testing.T)
 		IntentPlannerProvider: "openai-compat", IntentWindow: 20,
 		IntentMinPending: 1, IntentBypassBatchWait: true, PublicationDrain: &drain,
 	})
-	if !isIntentPlannerCircuitWait(replayErr) || summary.Disposition != ReplayDispositionTransientWait || summary.Published != 0 {
-		t.Fatalf("outage became terminal: summary=%+v err=%v", summary, replayErr)
+	assertIntentProviderWait(t, summary, replayErr)
+	if !summary.PlannerCircuitOpen || summary.HasMore || planner.calls != 1 {
+		t.Fatalf("oversized component did not enter one durable provider wait: summary=%+v calls=%d", summary, planner.calls)
 	}
 	waiting, err := UpdatePublicationDrainAfterReplay(ctx, f.db, drain, summary, replayErr, time.Now().UTC())
 	if err != nil || waiting.Phase != state.PublicationDrainSemantic || waiting.LastError != "" || !reflect.DeepEqual(waiting.EventSeqs, seqs) {
