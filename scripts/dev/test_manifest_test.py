@@ -160,6 +160,23 @@ esac
             self.assertEqual(summary["exit_code"], 42)
             self.assertGreaterEqual(summary["wall_seconds"], 0)
 
+    def test_package_timeout_reports_stack_without_individual_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = pathlib.Path(root) / "events.jsonl"
+            events = [
+                {"Action": "output", "Package": "example", "Test": "TestFinished", "Output": "irrelevant successful output\n"},
+                {"Action": "pass", "Package": "example", "Test": "TestFinished"},
+                {"Action": "output", "Package": "example", "Test": "TestRunning", "Output": "panic: test timed out after 4m15s\n"},
+                {"Action": "output", "Package": "example", "Test": "TestRunning", "Output": "blocked operation stack\n"},
+                {"Action": "fail", "Package": "example"},
+            ]
+            source.write_text("\n".join(map(json.dumps, events)) + "\n")
+            run = subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-events.py")), str(source)],
+                                 capture_output=True, text=True, check=True)
+            self.assertIn("panic: test timed out", run.stdout)
+            self.assertIn("blocked operation stack", run.stdout)
+            self.assertNotIn("irrelevant successful output", run.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
