@@ -523,6 +523,8 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 
 	if progress.Phase == "goal_review_wait" {
 		report.PublicationOutcome.RetryAt = progress.RetryAtTS
+
+		report.OperationalState = statusOperationalState(report)
 	}
 
 	return report, nil
@@ -1041,6 +1043,10 @@ func statusOperationalStateWithDaemonAlive(report statusReport, daemonAlive bool
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
 		return "needs_attention"
+	case report.PublicationProgress.Phase == "history_reconstruction":
+		return "busy"
+	case report.PublicationProgress.Phase == "goal_review_wait":
+		return "waiting"
 	case report.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
 		report.PublicationDrain.FallbackMode == "semantic_replan":
 		return "planning"
