@@ -382,10 +382,10 @@ func (h *IntentPlannerHealth) Acquire(ctx context.Context) (IntentPlannerHealthP
 	case IntentPlannerCircuitOpen:
 		if now.Before(h.retryAt) {
 			h.bypassCount++
-			h.updatedAt = now
 			retryAt := h.retryAt
 			h.mu.Unlock()
-			h.persistLatest(ctx)
+			// A skipped call makes no durable progress. Keep bypass statistics
+			// in memory until the next actual circuit transition is persisted.
 			return IntentPlannerHealthPermit{}, &IntentPlannerCircuitOpenError{RetryAt: retryAt}
 		}
 		h.state = IntentPlannerCircuitHalfOpen
@@ -401,9 +401,7 @@ func (h *IntentPlannerHealth) Acquire(ctx context.Context) (IntentPlannerHealthP
 		return permit, nil
 	case IntentPlannerCircuitHalfOpen:
 		h.bypassCount++
-		h.updatedAt = now
 		h.mu.Unlock()
-		h.persistLatest(ctx)
 		return IntentPlannerHealthPermit{}, &IntentPlannerCircuitOpenError{HalfOpen: true}
 	default:
 		permit := IntentPlannerHealthPermit{epoch: h.epoch}
