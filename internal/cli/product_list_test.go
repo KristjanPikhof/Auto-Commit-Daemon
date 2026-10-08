@@ -665,34 +665,42 @@ func TestProductListWatchKeepsKnownAttentionAcrossUnknownRead(t *testing.T) {
 }
 
 func TestProductListWatchShowsRefreshingAfterKnownWork(t *testing.T) {
-	original := productListCollect
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	frames := 0
-	productListCollect = func(context.Context) (productListData, productState, error) {
-		frames++
-		entry := productListEntry{
-			Repo: "/repo", State: productStatePublishing, OperationalState: "busy",
-			Protected: true, PendingEvents: 2, UnfinishedWork: true,
-			lastActivity: time.Now().Add(-2 * time.Hour),
-		}
-		if frames == 2 {
-			entry = productListEntry{
-				Repo: "/repo", State: productStateWaiting, OperationalState: "refreshing",
-				ProtectionUnknown:   true,
-				PublicationProgress: publicationProgressReport{Phase: "protection_refresh"},
-				PublicationOutcome:  publicationOutcome{PendingClassification: true},
+	for _, working := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unfinished=%t", working), func(t *testing.T) {
+			original := productListCollect
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			frames := 0
+			productListCollect = func(context.Context) (productListData, productState, error) {
+				frames++
+				entry := productListEntry{
+					Repo: "/repo", State: productStateProtected, OperationalState: "healthy_idle",
+					Protected: true, lastActivity: time.Now(),
+				}
+				if working {
+					entry.State, entry.OperationalState = productStatePublishing, "busy"
+					entry.PendingEvents, entry.UnfinishedWork = 2, true
+					entry.lastActivity = time.Now().Add(-2 * time.Hour)
+				}
+				if frames == 2 {
+					entry = productListEntry{
+						Repo: "/repo", State: productStateWaiting, OperationalState: "refreshing",
+						ProtectionUnknown:   true,
+						PublicationProgress: publicationProgressReport{Phase: "protection_refresh"},
+						PublicationOutcome:  publicationOutcome{PendingClassification: true},
+					}
+				}
+				return productListData{UpdatedAt: time.Now().UTC().Format(time.RFC3339), Repos: []productListEntry{entry}}, entry.State, nil
 			}
-		}
-		return productListData{UpdatedAt: time.Now().UTC().Format(time.RFC3339), Repos: []productListEntry{entry}}, entry.State, nil
-	}
-	t.Cleanup(func() { productListCollect = original })
-	out := &productListFrameWriter{cancel: cancel, want: 2}
-	if err := runProductListWatchView(ctx, out, time.Millisecond, false, false); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Count(out.String(), "refreshing") < 1 || strings.Contains(out.String(), "healthy") {
-		t.Fatalf("unavailable read hid unfinished work or claimed health:\n%s", out.String())
+			t.Cleanup(func() { productListCollect = original })
+			out := &productListFrameWriter{cancel: cancel, want: 2}
+			if err := runProductListWatchView(ctx, out, time.Millisecond, false, false); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(out.String(), "refreshing") < 1 || strings.Count(out.String(), "healthy") > 1 {
+				t.Fatalf("unavailable read hid unfinished work or claimed health:\n%s", out.String())
+			}
+		})
 	}
 }
 

@@ -274,7 +274,8 @@ func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]
 		previous, ok := lastKnown[entry.Repo]
 		if ok && productListPriority(previous) <= productListPriority(entry) {
 			if entry.OperationalState == "refreshing" && !previous.ActionRequired &&
-				previous.State != productStateNeedsAction && previous.OperationalState != "paused" {
+				previous.State != productStateNeedsAction && previous.OperationalState != "paused" &&
+				previous.OperationalState != "needs_attention" && previous.PublicationProgress.Phase != "needs_action" {
 				entry.UnfinishedWork = entry.UnfinishedWork || previous.UnfinishedWork
 				if previous.lastActivity.After(entry.lastActivity) {
 					entry.lastActivity, entry.LastActivityAt = previous.lastActivity, previous.LastActivityAt
