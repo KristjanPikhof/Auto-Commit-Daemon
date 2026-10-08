@@ -30,6 +30,7 @@ const (
 	MessageQualityReasonBodyRequired       MessageQualityReasonCode = "body_required"
 	MessageQualityReasonMalformedBody      MessageQualityReasonCode = "malformed_body"
 	MessageQualityReasonMalformedSubject   MessageQualityReasonCode = "malformed_subject"
+	MessageQualityReasonTruncatedSubject   MessageQualityReasonCode = "truncated_subject"
 	MessageQualityReasonUnknownCommitType  MessageQualityReasonCode = "unknown_commit_type"
 	MessageQualityReasonSanitizedSubject   MessageQualityReasonCode = "sanitized_subject"
 	MessageQualityReasonSanitizedBody      MessageQualityReasonCode = "sanitized_body"
@@ -90,6 +91,9 @@ func EvaluateIntentPlanMessageQuality(req IntentPlanRequest, plan IntentPlan) Me
 	if subject != strings.TrimSpace(plan.Subject) {
 		report.add(MessageQualityReasonSanitizedSubject, "subject changes after sanitation")
 	}
+	if strings.HasSuffix(subject, "…") || strings.HasSuffix(strings.TrimSpace(plan.Subject), "...") {
+		report.add(MessageQualityReasonTruncatedSubject, "subject is clipped; rewrite the complete outcome within the subject limit")
+	}
 	if body != strings.TrimSpace(plan.Body) {
 		report.add(MessageQualityReasonSanitizedBody, "body changes after sanitation")
 	}
@@ -142,6 +146,7 @@ func (r MessageQualityReport) decide(plan IntentPlan) MessageQualityAction {
 		return MessageQualityFallback
 	}
 	if r.HasReason(MessageQualityReasonGenericSubject) ||
+		r.HasReason(MessageQualityReasonTruncatedSubject) ||
 		r.HasReason(MessageQualityReasonFilenameOnly) ||
 		r.HasReason(MessageQualityReasonTokenOnly) ||
 		r.HasReason(MessageQualityReasonBodyRequired) ||

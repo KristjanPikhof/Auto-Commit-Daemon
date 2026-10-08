@@ -238,6 +238,21 @@ func TestIntentMessageQualityRejectsPascalCaseSymbolSubject(t *testing.T) {
 	}
 }
 
+func TestIntentMessageQualityRewritesClippedOutcomes(t *testing.T) {
+	t.Parallel()
+	for _, subject := range []string{
+		"Fix publication readiness after missing companion recovery",
+		"Fix publication readiness after...",
+	} {
+		report := EvaluateIntentPlanMessageQuality(IntentPlanRequest{
+			OfferedCaptures: []OfferedCapture{{Seq: 1, Path: "publication.go"}},
+		}, IntentPlan{SelectedSeqs: []int64{1}, Subject: subject})
+		if report.Action != MessageQualityRewrite || !report.HasReason(MessageQualityReasonTruncatedSubject) {
+			t.Fatalf("clipped semantic outcome accepted: subject=%q report=%+v", subject, report)
+		}
+	}
+}
+
 func TestEvaluateIntentPlanMessageQuality_ConventionalFormat(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
 	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{
