@@ -1633,6 +1633,7 @@ func chooseIntentCandidatePlan(
 					localRepairReq, plannerRequest.BaselineCandidates,
 					plan, validation.Findings,
 				); ok {
+					applyIntentPlanContinuationLimits(&repaired, continuations, existing, input.Captures)
 					if err := storeResolvedIntentPlanRun(
 						&run, repaired, continuations); err != nil {
 						return ai.IntentPlanV2{}, "", "", retryCount,
@@ -1788,6 +1789,9 @@ func chooseIntentCandidatePlan(
 	if err != nil {
 		return ai.IntentPlanV2{}, "", plannerFailure, retryCount, false, nil, run, err
 	}
+	if applyIntentPlanContinuationLimits(&plan, continuations, existing, input.Captures) {
+		companionNeedsAttention = true
+	}
 	plan = declareIntentFallbackDependencies(
 		intentCandidateContinuationValidationRequest(fallbackReq, continuations), plan)
 	validationReq := intentCandidateContinuationValidationRequest(
@@ -1840,6 +1844,18 @@ func chooseIntentCandidatePlan(
 	}
 	return plan, "evidence_partition", plannerFailure, retryCount,
 		!semanticReviewNeeded && (fallbackNeedsAttention || companionNeedsAttention), continuations, run, nil
+}
+
+func applyIntentPlanContinuationLimits(plan *ai.IntentPlanV2, continuations []intentCandidateContinuation, existing []state.IntentCandidate, captures []IntentCandidateCapture) bool {
+	prior := make(map[string]state.IntentCandidate, len(existing))
+	for _, candidate := range existing {
+		prior[candidate.ID] = candidate
+	}
+	bySeq := make(map[int64]IntentCandidateCapture, len(captures))
+	for _, capture := range captures {
+		bySeq[capture.Event.Seq] = capture
+	}
+	return applyIntentCandidateContinuationLimits(plan, continuations, prior, bySeq)
 }
 
 // An outage leaves the same semantic evidence resumable. Only active provider

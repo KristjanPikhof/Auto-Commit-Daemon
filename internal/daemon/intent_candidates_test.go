@@ -15,6 +15,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
@@ -55,6 +56,55 @@ type correctingIntentCandidatePlannerStub struct {
 type partialReplanIntentCandidatePlannerStub struct {
 	calls int
 	reqs  []ai.IntentPlanRequestV2
+}
+
+type completeGoalPartialReplanPlanner struct {
+	calls int
+	reqs  []ai.IntentPlanRequestV2
+}
+
+func (p *completeGoalPartialReplanPlanner) Name() string { return "complete-goal-partial-test" }
+
+func (p *completeGoalPartialReplanPlanner) PlanIntent(
+	context.Context,
+	ai.IntentPlanRequest,
+) (ai.IntentPlan, error) {
+	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
+}
+
+func (p *completeGoalPartialReplanPlanner) PlanIntentV2(
+	_ context.Context,
+	req ai.IntentPlanRequestV2,
+) (ai.IntentPlanV2, error) {
+	p.calls++
+	p.reqs = append(p.reqs, req)
+	var sourceSeqs []int64
+	var documentSeq int64
+	for _, capture := range req.OfferedCaptures {
+		if capture.Path == "source.go" || capture.Path == "source_test.go" {
+			sourceSeqs = append(sourceSeqs, capture.Seq)
+		} else if capture.Path == "usage.md" {
+			documentSeq = capture.Seq
+		}
+	}
+	document := ai.IntentCandidateAssignment{
+		CandidateID: "usage-guide", SelectedSeqs: []int64{documentSeq},
+		Purpose: "document keyboard shortcuts", Readiness: ai.IntentCandidateReady,
+		Subject: "Document keyboard shortcuts", GroupingReason: "independent usage guide",
+	}
+	if p.calls == 1 {
+		document.DependsOnCandidates = []string{document.CandidateID}
+		return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+			Candidates: []ai.IntentCandidateAssignment{{
+				CandidateID: "source-value", SelectedSeqs: sourceSeqs,
+				Purpose: "return the new source value", Readiness: ai.IntentCandidateReady,
+				Subject:        "Return the new source value",
+				Body:           "- Keep the value implementation and its assertion in one goal",
+				GroupingReason: "source value behavior and its matching test",
+			}, document}}, nil
+	}
+	return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+		Candidates: []ai.IntentCandidateAssignment{document}}, nil
 }
 
 func (p *partialReplanIntentCandidatePlannerStub) Name() string { return "intent-v2-partial-test" }
@@ -214,6 +264,7 @@ func (p *semanticIntentCandidatePlannerStub) PlanIntentV2(
 			},
 			Purpose: "implement shared request validation", Readiness: ai.IntentCandidateReady,
 			Subject:        "Implement shared request validation",
+			Body:           "- Apply request syntax validation before processing callers",
 			GroupingReason: "both captures implement the same validation behavior",
 		}},
 	}, nil
@@ -269,9 +320,10 @@ func (p *repairReplanIntentCandidatePlannerStub) PlanIntentV2(
 		Candidates: []ai.IntentCandidateAssignment{{
 			CandidateID:  req.Candidates[0].CandidateID,
 			SelectedSeqs: []int64{req.OfferedCaptures[0].Seq},
-			Purpose:      "complete the private semantic change",
+			Purpose:      "complete request validation behavior",
 			Readiness:    ai.IntentCandidateReady,
-			Subject:      "Complete private semantic change",
+			Subject:      "Complete request validation behavior",
+			Body:         "- Fold the follow-up validation fix into its unpublished goal",
 			GroupingReason: "the same-file capture completes the " +
 				"repairable private candidate",
 		}},
@@ -720,12 +772,14 @@ func TestIntentCandidateSemanticReplanDoesNotPersistLocalFallback(t *testing.T) 
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	capture := appendIntentCandidateCapture(
-		t, db, "internal/a.go", "create", "", "a")
+		t, db, "docs/shortcuts.md", "create", "", "a")
+	capture.CapturedDiff = "+# Keyboard shortcut reference\n"
 	planner := &selfDependentIntentCandidatePlannerStub{}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{capture}, Planner: planner,
-		RetryLimit: 2, RetryLimitSet: true, Preset: config.PresetBalanced,
+		IncludeDiffs: true,
+		RetryLimit:   2, RetryLimitSet: true, Preset: config.PresetBalanced,
 		VerificationMode: "structural", RejectLocalFallback: true,
 		Materialize: func(context.Context, []IntentCandidateCapture) error {
 			return nil
@@ -747,19 +801,23 @@ func TestIntentCandidateSemanticReplanDoesNotPersistLocalFallback(t *testing.T) 
 func TestIntentCandidateEngineStopsRepeatedInvalidPlanEarly(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
-	capture := appendIntentCandidateCapture(t, db, "a.go", "create", "", "a")
+	capture := appendIntentCandidateCapture(t, db, "docs/shortcuts.md", "create", "", "a")
+	capture.CapturedDiff = "+# Keyboard shortcut reference\n"
 	planner := &selfDependentIntentCandidatePlannerStub{}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{capture}, Planner: planner,
-		RetryLimit: 2, RetryLimitSet: true, Preset: config.PresetFast,
+		IncludeDiffs: true,
+		RetryLimit:   2, RetryLimitSet: true, Preset: config.PresetFast,
 		Materialize: func(context.Context, []IntentCandidateCapture) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if planner.calls != 2 || result.PlanAttempt != 2 ||
-		result.PlanAttemptLimit != 3 || result.ResolutionMode != "evidence_partition" {
+		result.PlanAttemptLimit != 3 || result.ResolutionMode != "evidence_partition" ||
+		len(result.Decisions) != 1 || !result.Decisions[0].Publishable ||
+		result.Decisions[0].Assignment.Subject != "Add Keyboard shortcut reference" {
 		t.Fatalf("no-progress fallback calls=%d result=%+v", planner.calls, result)
 	}
 }
@@ -767,14 +825,16 @@ func TestIntentCandidateEngineStopsRepeatedInvalidPlanEarly(t *testing.T) {
 func TestIntentCandidateValidationFallbackKeepsTransportCircuitClosed(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
-	capture := appendIntentCandidateCapture(t, db, "a.go", "create", "", "a")
+	capture := appendIntentCandidateCapture(t, db, "docs/shortcuts.md", "create", "", "a")
+	capture.CapturedDiff = "+# Keyboard shortcut reference\n"
 	planner := &selfDependentIntentCandidatePlannerStub{}
 	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{
 		Provider: IntentPlannerProviderIdentity{Provider: planner.Name()},
 	})
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		Captures: []IntentCandidateCapture{capture}, Planner: planner, Health: health,
+		Captures: []IntentCandidateCapture{capture}, Planner: planner,
+		IncludeDiffs: true, Health: health,
 		RetryLimit: 2, RetryLimitSet: true, Preset: config.PresetQuality,
 		VerificationMode: "structural",
 		Materialize:      func(context.Context, []IntentCandidateCapture) error { return nil },
@@ -782,7 +842,8 @@ func TestIntentCandidateValidationFallbackKeepsTransportCircuitClosed(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ResolutionMode != "evidence_partition" || planner.calls != 2 {
+	if result.ResolutionMode != "evidence_partition" || planner.calls != 2 ||
+		len(result.Decisions) != 1 || !result.Decisions[0].Publishable {
 		t.Fatalf("validation recovery calls=%d result=%+v", planner.calls, result)
 	}
 	if snapshot := health.Snapshot(); snapshot.State != IntentPlannerCircuitClosed ||
@@ -821,15 +882,17 @@ func TestIntentCandidateEnginePreservesValidGroupsDuringPartialReplan(t *testing
 func TestReplayIntentCandidatePartialReplanResetsPreflightScratch(t *testing.T) {
 	f := newCaptureFixture(t)
 	ctx := context.Background()
-	seedTrackedFileCommit(t, ctx, f, "source.go", "package source\n\nconst Value = 1\n")
-	seedTrackedFileCommit(t, ctx, f, "source_test.go", "package source\n\nconst Want = 1\n")
+	seedTrackedFileCommit(t, ctx, f, "source.go", "package source\n\nfunc Value() int { return 1 }\n")
+	seedTrackedFileCommit(t, ctx, f, "source_test.go", "package source\n\nimport \"testing\"\n\nfunc TestValue(t *testing.T) { if Value() != 1 { t.Fatal(Value()) } }\n")
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatal(err)
 	}
-	for path, contents := range map[string]string{
-		"source.go":      "package source\n\nconst Value = 2\n",
-		"source_test.go": "package source\n\nconst Want = 2\n",
-	} {
+	bodies := map[string]string{
+		"source.go":      "package source\n\nfunc Value() int { return 2 }\n",
+		"source_test.go": "package source\n\nimport \"testing\"\n\nfunc TestValue(t *testing.T) { if Value() != 2 { t.Fatal(Value()) } }\n",
+		"usage.md":       "# Keyboard shortcut reference\n",
+	}
+	for path, contents := range bodies {
 		if err := os.WriteFile(filepath.Join(f.dir, path), []byte(contents), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -840,27 +903,55 @@ func TestReplayIntentCandidatePartialReplanResetsPreflightScratch(t *testing.T) 
 		t.Fatal(err)
 	}
 	pending, err := state.PendingEvents(ctx, f.db, 0)
-	if err != nil || len(pending) != 2 {
+	if err != nil || len(pending) != 3 {
 		t.Fatalf("pending=%+v err=%v", pending, err)
 	}
 
-	planner := &partialReplanIntentCandidatePlannerStub{}
+	planner := &completeGoalPartialReplanPlanner{}
 	retryLimit := 2
+	before := revListCount(t, ctx, f.dir, "HEAD")
 	sum, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
 		IntentPlanner: planner, IntentPreset: config.PresetBalanced,
 		IntentBypassBatchWait: true, IntentWindow: 10,
 		IntentRetryLimit:       &retryLimit,
 		IntentVerificationMode: "structural",
+		IntentIncludeDiffs:     true,
 	})
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
-	if sum.Published != 2 || planner.calls != 2 {
+	if sum.Published != 3 || planner.calls != 2 || revListCount(t, ctx, f.dir, "HEAD") != before+2 {
 		candidates, _ := state.IntentCandidatesForPair(
 			ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, 0)
 		t.Fatalf("summary=%+v planner calls=%d candidates=%+v",
 			sum, planner.calls, candidates)
+	}
+	if len(planner.reqs[1].OfferedCaptures) != 1 ||
+		planner.reqs[1].OfferedCaptures[0].Path != "usage.md" {
+		t.Fatalf("complete source goal was replanned: %+v", planner.reqs)
+	}
+	var sourceCommit, testCommit string
+	for path, target := range map[string]*string{
+		"source.go": &sourceCommit, "source_test.go": &testCommit,
+	} {
+		if err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT commit_oid FROM capture_events WHERE path=? AND state='published'`, path).Scan(target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sourceCommit == "" || sourceCommit != testCommit {
+		t.Fatalf("source and test published separately: source=%s test=%s", sourceCommit, testCommit)
+	}
+	for path, body := range bodies {
+		actual, err := git.LsTreeBlobOID(ctx, f.dir, "HEAD", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := git.HashObjectStdin(ctx, f.dir, []byte(body))
+		if err != nil || actual != want {
+			t.Fatalf("published %s blob=%s want=%s err=%v", path, actual, want, err)
+		}
 	}
 	pending, err = state.PendingEvents(ctx, f.db, 0)
 	if err != nil || len(pending) != 0 {
@@ -2377,11 +2468,13 @@ func TestIntentCandidateEngineReplansRepairablePrivateSuffix(t *testing.T) {
 		t, db, "internal/feature.go", "modify", "first", "second")
 	saveSoftPublishedIntentCandidate(
 		t, db, "soft-feature", oldCapture, "soft-commit", 100)
+	newCapture.CapturedDiff = "+if err := ValidateRequestSyntax(); err != nil { return err }\n"
 	planner := &repairReplanIntentCandidatePlannerStub{}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{newCapture}, Planner: planner,
-		RetryLimit: 1, RetryLimitSet: true, Preset: config.PresetBalanced,
+		IncludeDiffs: true,
+		RetryLimit:   1, RetryLimitSet: true, Preset: config.PresetBalanced,
 		VerificationMode: "structural", Now: time.Unix(120, 0),
 		Materialize: func(
 			_ context.Context,
@@ -2429,11 +2522,13 @@ WHERE seq=?`, published.Event.Seq); err != nil {
 		t, db, "soft-target", published, "soft-commit", 100)
 	saveWaitingIntentCandidate(t, db, "later-pending", 110, later)
 
+	target.CapturedDiff = "+if err := ValidateRequestSyntax(); err != nil { return err }\n"
 	planner := &repairReplanIntentCandidatePlannerStub{}
 	result, err := EvaluateIntentCandidates(ctx, db, IntentCandidateEvaluation{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Captures: []IntentCandidateCapture{target}, Planner: planner,
-		RetryLimit: 1, RetryLimitSet: true, Preset: config.PresetBalanced,
+		IncludeDiffs: true,
+		RetryLimit:   1, RetryLimitSet: true, Preset: config.PresetBalanced,
 		VerificationMode: "structural", Now: time.Unix(120, 0),
 		TargetEventSeqs: []int64{target.Event.Seq},
 		Materialize: func(
