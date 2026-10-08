@@ -1371,6 +1371,9 @@ func chooseIntentCandidatePlan(
 		plan, continuations, loadErr := loadResolvedIntentPlanRun(
 			req, run.ResolvedPlanJSON.String)
 		if loadErr == nil {
+			if run.ProgressState.String == "structural_hold" {
+				return plan, "evidence_partition", "", retryCount, true, continuations, run, nil
+			}
 			localFallback := run.ResolutionMode.String == "evidence_partition" ||
 				run.ResolutionMode.String == "dependent_message_fallback" ||
 				run.ResolutionMode.String == "local_repair" ||
@@ -1642,6 +1645,13 @@ func chooseIntentCandidatePlan(
 					run.PreservedGroups = nil
 					run.FindingCodes = intentFindingCodes(validation.Findings)
 					_, needsReview := holdUnclearIntentMessages(req, repaired, true)
+					for _, continuation := range continuations {
+						if continuation.HoldReason != "" {
+							needsReview = false
+							run.ProgressState = sql.NullString{String: "structural_hold", Valid: true}
+							break
+						}
+					}
 					if needsReview {
 						run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
 						run.ResolutionMode = run.ProgressState
@@ -1811,7 +1821,9 @@ func chooseIntentCandidatePlan(
 	run.UnresolvedSeqs = nil
 	run.PreservedGroups = nil
 	semanticReviewNeeded := false
-	if planner != nil {
+	if fallbackNeedsAttention || companionNeedsAttention {
+		run.ProgressState = sql.NullString{String: "structural_hold", Valid: true}
+	} else if planner != nil {
 		_, needsReview := holdUnclearIntentMessages(req, plan, true)
 		if needsReview {
 			semanticReviewNeeded = true

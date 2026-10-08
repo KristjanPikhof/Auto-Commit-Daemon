@@ -148,7 +148,7 @@ WHERE retry.key LIKE ? AND json_valid(retry.value)
  AND json_extract(retry.value,'$.branch_generation')=?
  AND json_extract(retry.value,'$.retry_at_ts')<=?
  AND run.branch_ref=? AND run.branch_generation=?
- AND run.progress_state IN ('waiting_semantic_retry','semantic_retry_running')
+ AND run.progress_state IN ('waiting_semantic_retry','semantic_retry_running','waiting_for_ai')
 ORDER BY json_extract(retry.value,'$.retry_at_ts'), retry.key
 LIMIT ?`, MetaKeyIntentSemanticRetry+".%", head.BranchRef, head.BranchGeneration,
 		intentPlannerHealthTimestamp(now), head.BranchRef, head.BranchGeneration, state.IntentCandidateMaxOpenPerPair)
