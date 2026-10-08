@@ -523,7 +523,6 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 
 	if progress.Phase == "goal_review_wait" {
 		report.PublicationOutcome.RetryAt = progress.RetryAtTS
-
 		report.OperationalState = statusOperationalState(report)
 	}
 
