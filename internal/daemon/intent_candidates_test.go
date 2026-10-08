@@ -4252,6 +4252,7 @@ func TestRuntimeIntentDependencyHintsRejectProseAndStemSimilarity(t *testing.T) 
 		{"docstring_declaration", "builder.py", "+\"\"\"\n+def BuildRecordingArchive():\n+    pass\n+\"\"\"\n", "consumer.py", "+BuildRecordingArchive()\n"},
 		{"quoted_symbol", "builder.go", "+func BuildRecordingArchive() {}\n", "consumer.go", "+fmt.Println(\"BuildRecordingArchive\")\n"},
 		{"different_symbol_case", "builder.go", "+func BuildRecordingArchive() {}\n", "consumer.go", "+buildRecordingArchive()\n"},
+		{"different_error_literals", "users.go", "+return errors.New(\"user missing\")\n", "payments.go", "+return errors.New(\"payment declined\")\n"},
 		{"stem_substring", "help.go", "+func ShowHelp() {}\n", "consumer.go", "+const title = \"helpful notification\"\n"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
