@@ -21,6 +21,7 @@ func (p *publicationOutagePlanner) PlanIntent(context.Context, ai.IntentPlanRequ
 }
 
 func TestPublicationDrainOversizedFallbackAfter502RemainsRetryable(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
@@ -51,11 +52,14 @@ func TestPublicationDrainOversizedFallbackAfter502RemainsRetryable(t *testing.T)
 	}
 	now := time.Now().UTC()
 	ts := float64(now.UnixNano()) / 1e9
+	identity := openAIIntentHealthIdentity("https://planner.example/v1")
 	drain := state.PublicationDrain{
 		ID: "drain-502", CheckpointID: capture.CheckpointID, WorktreeID: checkpoint.WorktreeID(f.dir),
 		BranchRef: f.cctx.BranchRef, BranchGeneration: f.cctx.BranchGeneration,
 		Phase: state.PublicationDrainSemantic, TargetEventCount: 13, EventSeqs: seqs,
-		CreatedTS: ts, UpdatedTS: ts, LastProgressTS: ts,
+		CommitStrategy: string(ai.CommitStrategyIntent), Provider: "openai-compat",
+		ProviderFingerprint: IntentPlannerProviderFingerprint(identity),
+		CreatedTS:           ts, UpdatedTS: ts, LastProgressTS: ts,
 	}
 	if created, err := state.PreparePublicationDrain(ctx, f.db, drain); err != nil || !created {
 		t.Fatalf("prepare=%t err=%v", created, err)
@@ -64,7 +68,7 @@ func TestPublicationDrainOversizedFallbackAfter502RemainsRetryable(t *testing.T)
 	capturePublicationFiles(t, f)
 	planner := &publicationOutagePlanner{intentCandidatePlannerStub: intentCandidatePlannerStub{err: &ai.ProviderHTTPError{StatusCode: 502, Detail: "Bad Gateway"}}}
 	health := NewIntentPlannerHealth(ctx, f.db, IntentPlannerHealthOptions{
-		Provider: openAIIntentHealthIdentity("https://planner.example/v1"),
+		Provider: identity,
 	})
 	summary, replayErr := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
@@ -77,7 +81,7 @@ func TestPublicationDrainOversizedFallbackAfter502RemainsRetryable(t *testing.T)
 		t.Fatalf("oversized component did not enter one durable provider wait: summary=%+v calls=%d", summary, planner.calls)
 	}
 	waiting, err := UpdatePublicationDrainAfterReplay(ctx, f.db, drain, summary, replayErr, time.Now().UTC())
-	if err != nil || waiting.Phase != state.PublicationDrainSemantic || waiting.LastError != "" || !reflect.DeepEqual(waiting.EventSeqs, seqs) {
+	if err != nil || waiting.Phase != state.PublicationDrainSemantic || waiting.LastError != summary.PlannerFailure || waiting.ReasonCode != "" || !reflect.DeepEqual(waiting.EventSeqs, seqs) {
 		t.Fatalf("waiting=%+v err=%v", waiting, err)
 	}
 	remaining, err := state.PendingEvents(ctx, f.db, 0)
@@ -90,6 +94,7 @@ func TestPublicationDrainOversizedFallbackAfter502RemainsRetryable(t *testing.T)
 }
 
 func TestRecoverTransportWaitPublicationDrainRequiresMatchingProof(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"recover", "different-provider", "different-error", "validation", "cooldown", "external-head", "terminal-event", "typed-safety-error"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
