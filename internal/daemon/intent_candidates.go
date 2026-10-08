@@ -1181,7 +1181,12 @@ func preflightIntentCandidatePlan(
 	plannerRequest := intentCandidateContinuationValidationRequest(
 		req, continuations)
 	baseline = declareIntentFallbackDependencies(plannerRequest, baseline)
-	if err := ai.ValidateIntentPlanV2(plannerRequest, baseline); err != nil {
+	// Baseline preflight proves capture membership and materialization. A local
+	// message cannot establish semantic readiness before the provider evaluates
+	// the goal, even when age or a flush makes the final request urgent.
+	baselineRequest := plannerRequest
+	baselineRequest.ForcedAging = false
+	if err := ai.ValidateIntentPlanV2(baselineRequest, baseline); err != nil {
 		return plannerRequest, continuations, err
 	}
 	if err := preflightIntentCandidateMaterialization(
@@ -1781,6 +1786,15 @@ func loadResolvedIntentPlanRun(
 	return resolved.Plan, resolved.Continuations, nil
 }
 
+// ValidateIntentGoalPlan applies the same ownership, prerequisite, and grounded
+// goal checks to live planning and reconstruction without changing durable state.
+func ValidateIntentGoalPlan(req ai.IntentPlanRequestV2, plan ai.IntentPlanV2) error {
+	if err := ai.ValidateIntentPlanV2(req, plan); err != nil {
+		return err
+	}
+	return validatePlannerSemanticRationale(req, plan)
+}
+
 func validatePlannerSemanticRationale(
 	req ai.IntentPlanRequestV2,
 	plan ai.IntentPlanV2,
@@ -1831,6 +1845,28 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 			Strength: hint.Strength, Kind: hint.Kind,
 			EvidenceHash: intentEvidenceHash(hint.Evidence),
 		})
+	}
+	sourcesByStem := make(map[string][]int64)
+	for _, capture := range captures {
+		if role := intentCaptureRole(capture); role == "code" || role == "migration" {
+			stem := path.Base(intentSemanticStem(capture))
+			sourcesByStem[stem] = append(sourcesByStem[stem], capture.Event.Seq)
+		}
+	}
+	for _, capture := range captures {
+		if intentCaptureRole(capture) != "test" {
+			continue
+		}
+		// Match a source and its conventional test name across directories only
+		// when there is one source. Repeated basenames need more evidence.
+		sources := sourcesByStem[path.Base(intentSemanticStem(capture))]
+		if len(sources) == 1 {
+			edges = append(edges, ai.IntentCaptureDependency{
+				FromSeq: sources[0], ToSeq: capture.Event.Seq,
+				Strength: ai.IntentDependencySoft, Kind: "test_source",
+				EvidenceHash: intentEvidenceHash(capture.Event.Path),
+			})
+		}
 	}
 	return edges
 }
@@ -4408,19 +4444,41 @@ func deterministicIntentCandidateMessage(
 	}
 	primary := ai.OfferedCapture{}
 	found := false
+	latestByPath := make(map[string]ai.OfferedCapture)
+	firstOpByPath := make(map[string]string)
 	for _, capture := range req.OfferedCaptures {
 		if _, ok := selected[capture.Seq]; ok {
-			primary = capture
-			found = true
-			if intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: capture.Path}}) == "code" {
-				break
+			if _, exists := firstOpByPath[capture.Path]; !exists {
+				firstOpByPath[capture.Path] = capture.Op
+			}
+			latestByPath[capture.Path] = capture
+			if !found || intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: primary.Path}}) != "code" {
+				primary = capture
+				found = true
 			}
 		}
 	}
 	if !found {
 		return "", "retain dependency component until its goal is known"
 	}
+	primary = latestByPath[primary.Path]
+	if firstOpByPath[primary.Path] == "create" && primary.Op != "delete" {
+		primary.Op = "create"
+	}
 	subject := ai.DiffAwareSubject(ai.OpItem{Op: primary.Op, Path: primary.Path}, primary.CapturedDiff)
+	primaryRole := intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: primary.Path}})
+	for capturePath, capture := range latestByPath {
+		role := intentCaptureRole(IntentCandidateCapture{Event: state.CaptureEvent{Path: capturePath}})
+		if role != primaryRole || capturePath == primary.Path {
+			continue
+		}
+		if firstOpByPath[capturePath] == "create" && capture.Op != "delete" {
+			capture.Op = "create"
+		}
+		if ai.DiffAwareSubject(ai.OpItem{Op: capture.Op, Path: capture.Path}, capture.CapturedDiff) != subject {
+			return "", "retain dependency component until its goal is known"
+		}
+	}
 	// A valid body lets the shared quality gate judge only the proposed subject.
 	quality := ai.EvaluateIntentPlanMessageQuality(ai.IntentPlanRequest{
 		OfferedCaptures: req.OfferedCaptures, CommitFormat: ai.CommitFormatImperative,
@@ -4475,7 +4533,8 @@ func intentCaptureRole(capture IntentCandidateCapture) string {
 		return "documentation"
 	case strings.Contains(base, "_test.") || strings.Contains(base, ".test.") ||
 		strings.Contains(base, ".spec.") || strings.Contains(lower, "/test/") ||
-		strings.Contains(lower, "/tests/"):
+		strings.Contains(lower, "/tests/") || strings.HasSuffix(base, "tests.swift") ||
+		strings.HasPrefix(base, "test_"):
 		return "test"
 	case strings.HasSuffix(base, ".json") || strings.HasSuffix(base, ".yaml") ||
 		strings.HasSuffix(base, ".yml") || strings.HasSuffix(base, ".toml") ||
@@ -4502,7 +4561,14 @@ func intentSemanticStem(capture IntentCandidateCapture) string {
 		}
 	}
 	ext := path.Ext(base)
-	return path.Join(path.Dir(capture.Event.Path), strings.TrimSuffix(base, ext))
+	stem := strings.TrimSuffix(base, ext)
+	if intentCaptureRole(capture) == "test" {
+		stem = strings.TrimPrefix(stem, "test_")
+		if ext == ".swift" {
+			stem = strings.TrimSuffix(stem, "tests")
+		}
+	}
+	return path.Join(path.Dir(capture.Event.Path), stem)
 }
 
 func intentEvidenceHash(value string) string {

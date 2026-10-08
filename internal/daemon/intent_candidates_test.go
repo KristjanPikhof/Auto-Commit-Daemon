@@ -632,7 +632,7 @@ FROM pending`, totalPending)
 	}
 }
 
-func TestIntentCandidateEngineAcceptsSemanticGroupingWithoutGraphPath(t *testing.T) {
+func TestIntentCandidateEngineAcceptsGroundedSemanticGroupingWithoutExplicitGraphPath(t *testing.T) {
 	for _, retryLimit := range []int{0, 2} {
 		t.Run(fmt.Sprintf("retry_limit_%d", retryLimit), func(t *testing.T) {
 			ctx := context.Background()
@@ -641,6 +641,8 @@ func TestIntentCandidateEngineAcceptsSemanticGroupingWithoutGraphPath(t *testing
 				"internal/a/a.go", "create", "", "a1")
 			b := appendIntentCandidateCapture(t, db,
 				"internal/b/b.go", "create", "", "b1")
+			a.CapturedDiff = "+func ValidateRequestSyntax() error { return nil }\n"
+			b.CapturedDiff = "+if err := ValidateRequestSyntax(); err != nil { return err }\n"
 			planner := &semanticIntentCandidatePlannerStub{}
 			result, err := EvaluateIntentCandidates(ctx, db,
 				IntentCandidateEvaluation{
@@ -665,6 +667,9 @@ func TestIntentCandidateEngineAcceptsSemanticGroupingWithoutGraphPath(t *testing
 			if result.Fallback != "" || result.PlannerFailure != "" ||
 				result.ResolutionMode != "provider" {
 				t.Fatalf("semantic result=%+v", result)
+			}
+			if len(result.Decisions) != 1 || !result.Decisions[0].Publishable {
+				t.Fatalf("grounded cross-module goal was not ready: %+v", result.Decisions)
 			}
 		})
 	}
