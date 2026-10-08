@@ -4245,7 +4245,13 @@ func TestRuntimeIntentDependencyHintsRejectProseAndStemSimilarity(t *testing.T) 
 		{"shared_document_word", "onboarding.md", "+# Notification onboarding\n", "exports.md", "+# Notification exports\n"},
 		{"shared_comments", "onboarding.go", "+// Notification workflow\n", "exports.go", "+// Notification workflow\n"},
 		{"commented_declaration", "builder.go", "+// func BuildRecordingArchive() {}\n", "consumer.go", "+BuildRecordingArchive()\n"},
+		{"existing_block_comment", "builder.go", " /* Existing example\n+func BuildRecordingArchive() {}\n */\n", "consumer.go", "+BuildRecordingArchive()\n"},
+		{"independent_same_declaration", "one/value.go", "+func Value() int { return 1 }\n", "two/value.go", "+func Value() int { return 2 }\n"},
+		{"independent_same_constant", "one/value.go", "+const ValueLabel = \"One\"\n", "two/value.go", "+const ValueLabel = \"Two\"\n"},
+		{"identical_independent_declarations", "one/value.go", "+const ValueLabel = \"Default\"\n", "two/value.go", "+const ValueLabel = \"Default\"\n"},
+		{"docstring_declaration", "builder.py", "+\"\"\"\n+def BuildRecordingArchive():\n+    pass\n+\"\"\"\n", "consumer.py", "+BuildRecordingArchive()\n"},
 		{"quoted_symbol", "builder.go", "+func BuildRecordingArchive() {}\n", "consumer.go", "+fmt.Println(\"BuildRecordingArchive\")\n"},
+		{"different_symbol_case", "builder.go", "+func BuildRecordingArchive() {}\n", "consumer.go", "+buildRecordingArchive()\n"},
 		{"stem_substring", "help.go", "+func ShowHelp() {}\n", "consumer.go", "+const title = \"helpful notification\"\n"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -4269,6 +4275,20 @@ func TestRuntimeIntentDependencyHintsRejectProseAndStemSimilarity(t *testing.T) 
 			if err := ValidateIntentGoalPlan(req, plan); err == nil {
 				t.Fatal("shared prose allowed an unrelated broad goal")
 			}
+			for _, kind := range []string{"symbol_hash", "hunk_hash", "import_reference"} {
+				req.Dependencies = []ai.IntentCaptureDependency{{FromSeq: 1, ToSeq: 2,
+					Strength: ai.IntentDependencySoft, Kind: kind, EvidenceHash: "legacy-weak-hint"}}
+				if err := ValidateIntentGoalPlan(req, plan); err == nil {
+					t.Fatalf("retained %s hint authorized an unrelated broad goal", kind)
+				}
+				var cached state.IntentPlanRun
+				if err := storeResolvedIntentPlanRun(&cached, plan, nil); err != nil {
+					t.Fatal(err)
+				}
+				if _, _, err := loadResolvedIntentPlanRun(req, cached.ResolvedPlanJSON.String); err == nil {
+					t.Fatalf("cached plan bypassed %s grounding", kind)
+				}
+			}
 		})
 	}
 }
@@ -4278,6 +4298,9 @@ func TestRuntimeIntentDependencyHintsAcceptDeclarationsImportsAndPaths(t *testin
 		name, sourcePath, sourceDiff, consumerPath, consumerDiff, kind string
 	}{
 		{"short_declared_helper", "helper.go", "+func One() int { return 1 }\n", "consumer.go", "+func Use() int { return One() }\n", "symbol_hash"},
+		{"constant_use", "labels.go", "+const ValueLabel = \"Recording\"\n", "consumer.go", "+return ValueLabel\n", "symbol_hash"},
+		{"arrow_helper_use", "builder.ts", "+export const BuildRecordingArchive = (value) => value\n", "consumer.ts", "+BuildRecordingArchive(text)\n", "symbol_hash"},
+		{"swift_value_use", "Defaults.swift", "+let RecordingDefaults = 2\n", "Consumer.swift", "+return RecordingDefaults\n", "symbol_hash"},
 		{"go_import_block", "internal/archive/archive.go", "+func ExportArchive() {}\n", "cmd/main.go", " import (\n+\"example/internal/archive\"\n )\n", "import_reference"},
 		{"relative_js_import", "src/archive.ts", "+export function archive() {}\n", "src/client.ts", "+import { archive } from './archive'\n", "import_reference"},
 		{"literal_source_file", "support/schema.go", "+func BuildSchema() {}\n", "docs/schema.md", "+The schema comes from support/schema.go\n", "import_reference"},
@@ -4344,7 +4367,7 @@ func TestRuntimeIntentDependencyEvidenceKeepsRetryFingerprintStable(t *testing.T
 		}
 	}
 	if len(expectedHints) != 2 || expectedHints[0].Kind != "symbol_hash" ||
-		expectedHints[0].Evidence != "buildrecordingarchive" || expectedHints[1].Kind != "hunk_hash" {
+		expectedHints[0].Evidence != "BuildRecordingArchive" || expectedHints[1].Kind != "hunk_hash" {
 		t.Fatalf("regression did not exercise multiple shared symbols and lines: %+v", expectedHints)
 	}
 }

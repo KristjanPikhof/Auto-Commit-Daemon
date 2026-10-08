@@ -1308,8 +1308,8 @@ func runtimeIntentDependencyHints(
 		}
 		item.files, item.imports = intentSourcePathReferences(diff)
 		if role := intentCaptureRole(capture); role == "code" || role == "test" || role == "migration" {
-			item.declared, item.symbols = intentSourceSymbols(diff)
-			item.changeIDs = runtimeIntentChangeIDs(diff)
+			item.declared, item.symbols = intentSourceSymbols(capture.CapturedDiff)
+			item.changeIDs = runtimeIntentChangeIDs(capture.CapturedDiff)
 		} else {
 			item.imports = nil
 		}
@@ -1399,6 +1399,9 @@ func runtimeIntentChangeIDs(diff string) map[string]struct{} {
 	const maxChanges = 64
 	out := make(map[string]struct{})
 	for _, line := range intentSourceCodeLines(diff) {
+		if intentSourceDeclaration.MatchString(line) {
+			continue
+		}
 		normalized := strings.Join(strings.Fields(line), " ")
 		if len(normalized) < 7 {
 			continue

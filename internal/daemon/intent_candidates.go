@@ -2034,7 +2034,6 @@ func intentSemanticValidationError(candidateID string, gate ai.IntentAtomicityGa
 // Reuse the runtime's bounded source-reference analyzer for callers that only
 // provide captured diffs. Semantic claims and weak proximity cannot add edges.
 func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCaptureDependency {
-	edges := append([]ai.IntentCaptureDependency(nil), req.Dependencies...)
 	evidence := intentGoalCaptureEvidence(req)
 	captures := make([]IntentCandidateCapture, 0, len(evidence))
 	for _, capture := range evidence {
@@ -2043,13 +2042,37 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 			CapturedDiff: capture.CapturedDiff,
 		})
 	}
+	var derived []ai.IntentCaptureDependency
+	proven := make(map[string]bool)
+	key := func(from, to int64, kind string) string {
+		if from > to {
+			from, to = to, from
+		}
+		return fmt.Sprintf("%d:%d:%s", from, to, kind)
+	}
 	for _, hint := range runtimeIntentDependencyHints(captures) {
-		edges = append(edges, ai.IntentCaptureDependency{
+		derived = append(derived, ai.IntentCaptureDependency{
 			FromSeq: hint.PrerequisiteSeq, ToSeq: hint.DependentSeq,
 			Strength: hint.Strength, Kind: hint.Kind,
 			EvidenceHash: intentEvidenceHash(hint.Evidence),
 		})
+		proven[key(hint.PrerequisiteSeq, hint.DependentSeq, hint.Kind)] = true
 	}
+	var edges []ai.IntentCaptureDependency
+	for _, edge := range req.Dependencies {
+		if edge.Strength == ai.IntentDependencySoft {
+			switch edge.Kind {
+			case "symbol_hash", "hunk_hash", "import_reference", "generated_artifact_reference":
+				// Retained hints may predate the grounded analyzer. Reprove their
+				// relationship from recorded evidence before using them as cohesion.
+				if !proven[key(edge.FromSeq, edge.ToSeq, edge.Kind)] {
+					continue
+				}
+			}
+		}
+		edges = append(edges, edge)
+	}
+	edges = append(edges, derived...)
 	sourcesByStem := make(map[string][]int64)
 	for _, capture := range captures {
 		if role := intentCaptureRole(capture); role == "code" || role == "migration" {

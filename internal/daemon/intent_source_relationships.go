@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	intentSourceDeclaration = regexp.MustCompile(`^(?:(?:public|private|protected|internal|open|fileprivate|static|async|export|default|final|abstract)\s+)*(?:func(?:\s+\([^)]*\))?|function|def|class|struct|type|enum|interface|protocol)\s+([a-zA-Z_][a-zA-Z0-9_]*)`)
+	intentSourceDeclaration = regexp.MustCompile(`^(?:(?:public|private|protected|internal|open|fileprivate|static|async|export|default|final|abstract)\s+)*(?:func(?:\s+\([^)]*\))?|function|def|class|struct|type|enum|interface|protocol|const|let|var)\s+([a-zA-Z_][a-zA-Z0-9_]*)`)
 	intentSourceQuoted      = regexp.MustCompile("\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|`[^`]*`")
+	intentSourceMultiline   = regexp.MustCompile(`(?s)""".*?(?:"""|$)|'''.*?(?:'''|$)` + "|`[^`]*(?:`|$)")
 	intentSourceFilePath    = regexp.MustCompile(`[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*\.[a-zA-Z0-9_-]+`)
 )
 
@@ -19,12 +20,13 @@ var (
 func intentSourceCodeLines(diff string) []string {
 	var lines []string
 	inBlockComment := false
-	for _, raw := range strings.Split(diff, "\n") {
-		if len(raw) == 0 || (raw[0] != '+' && raw[0] != '-') ||
+	for _, raw := range strings.Split(intentSourceMultiline.ReplaceAllString(diff, ""), "\n") {
+		if len(raw) == 0 || (raw[0] != '+' && raw[0] != '-' && raw[0] != ' ') ||
 			strings.HasPrefix(raw, "+++") || strings.HasPrefix(raw, "---") {
 			continue
 		}
-		line := intentSourceQuoted.ReplaceAllString(raw[1:], "")
+		changed := raw[0] == '+' || raw[0] == '-'
+		line := raw[1:]
 		var code strings.Builder
 		for len(line) > 0 {
 			if inBlockComment {
@@ -42,10 +44,17 @@ func intentSourceCodeLines(diff string) []string {
 				line, inBlockComment = line[2:], true
 				continue
 			}
+			if line[0] == '"' || line[0] == '\'' || line[0] == '`' {
+				if quoted := intentSourceQuoted.FindStringIndex(line); quoted != nil && quoted[0] == 0 {
+					code.WriteString(line[:quoted[1]])
+					line = line[quoted[1]:]
+					continue
+				}
+			}
 			code.WriteByte(line[0])
 			line = line[1:]
 		}
-		if cleaned := strings.TrimSpace(code.String()); cleaned != "" {
+		if cleaned := strings.TrimSpace(code.String()); cleaned != "" && changed {
 			lines = append(lines, cleaned)
 		}
 	}
@@ -55,14 +64,21 @@ func intentSourceCodeLines(diff string) []string {
 func intentSourceSymbols(diff string) (map[string]struct{}, map[string]struct{}) {
 	declared, used := make(map[string]struct{}), make(map[string]struct{})
 	for _, line := range intentSourceCodeLines(diff) {
-		if match := intentSourceDeclaration.FindStringSubmatch(line); len(match) > 1 && len(match[1]) >= 3 {
-			declared[strings.ToLower(match[1])] = struct{}{}
+		line = intentSourceQuoted.ReplaceAllString(line, "")
+		if match := intentSourceDeclaration.FindStringSubmatchIndex(line); len(match) > 3 {
+			name := line[match[2]:match[3]]
+			if len(name) >= 3 {
+				declared[name] = struct{}{}
+			}
+			// A declaration is not a reference to another capture's symbol.
+			// Keep genuine references in its same-line initializer or body.
+			line = line[:match[2]] + " " + line[match[3]:]
 		}
 		for _, token := range strings.FieldsFunc(line, func(r rune) bool {
 			return r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r)
 		}) {
 			if len(token) >= 3 && len(used) < 128 {
-				used[strings.ToLower(token)] = struct{}{}
+				used[token] = struct{}{}
 			}
 		}
 		if len(declared) >= 128 {
