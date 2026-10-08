@@ -2358,7 +2358,9 @@ func validateIntentRepair(repair IntentRepair) error {
 	candidates := make(map[string]struct{})
 	for _, commit := range repair.Commits {
 		oldOIDs[commit.OldOID] = struct{}{}
-		if commit.CandidateID.Valid { candidates[commit.CandidateID.String] = struct{}{} }
+		if commit.CandidateID.Valid {
+			candidates[commit.CandidateID.String] = struct{}{}
+		}
 	}
 	if len(oldOIDs) > IntentRepairMaxCommits || len(candidates) > IntentRepairMaxCommits {
 		return fmt.Errorf("state: intent repair source or goal count exceeds %d", IntentRepairMaxCommits)

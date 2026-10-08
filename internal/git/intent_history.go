@@ -139,7 +139,7 @@ func MaterializeIntentHistoryUnits(ctx context.Context, repoDir, baseTree string
 	var trees []string
 	for _, group := range groups {
 		for _, unit := range group {
-			entries, err := LsFilesIndex(ctx, repoDir, index, unit.Path)
+			entries, err := LsFilesIndex(ctx, repoDir, index, ":(literal)"+unit.Path)
 			if err != nil {
 				return nil, err
 			}
@@ -193,6 +193,11 @@ func ApplyIntentHistoryReconstruction(ctx context.Context, repoDir string, opts 
 		if _, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, "check-ref-format", ref); err != nil {
 			return result, err
 		}
+	}
+	if _, err := RevParse(ctx, repoDir, opts.TargetBranchRef); err == nil {
+		return RecoverIntentHistoryReconstruction(ctx, repoDir, opts)
+	} else if !errors.Is(err, ErrRefNotFound) {
+		return result, err
 	}
 	if err := checkIntentHistorySource(ctx, repoDir, opts); err != nil {
 		return result, err
@@ -258,6 +263,95 @@ func ApplyIntentHistoryReconstruction(ctx context.Context, repoDir string, opts 
 		return result, fmt.Errorf("git intent history: atomic reconstruction refs: %w", err)
 	}
 	result.NewHead = parent
+	return result, nil
+}
+
+// RecoverIntentHistoryReconstruction proves a target created before the worker
+// could record completion. Matching messages alone are insufficient: every
+// saved tree, parent boundary, author identity and backup must still agree.
+func RecoverIntentHistoryReconstruction(ctx context.Context, repoDir string, opts IntentHistoryReconstructionOptions) (IntentRepairApplyResult, error) {
+	var result IntentRepairApplyResult
+	backup, err := IntentRepairBackupRef(opts.SourceBranchRef, opts.PlanID)
+	if err != nil {
+		return result, err
+	}
+	backupOID, err := RevParse(ctx, repoDir, backup)
+	if err != nil || backupOID != opts.ExpectedHead {
+		return result, errors.New("git intent history: existing target has no matching reconstruction backup")
+	}
+	head, err := RevParse(ctx, repoDir, opts.TargetBranchRef)
+	if err != nil {
+		return result, err
+	}
+	base, err := firstParent(ctx, repoDir, opts.OldChain[0])
+	if err != nil {
+		return result, err
+	}
+	var args = []string{"rev-list", "--first-parent", "--reverse", "--max-count=" + fmt.Sprint(MaxIntentHistoryCommits+1)}
+	if base != "" {
+		args = append(args, base+".."+head)
+	} else {
+		args = append(args, head)
+	}
+	out, err := RunWithLimit(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, DefaultDiffCap, args...)
+	if err != nil {
+		return result, err
+	}
+	chain := strings.Fields(string(out))
+	if len(chain) != len(opts.Replacements) {
+		return result, errors.New("git intent history: existing target does not match the saved goal count")
+	}
+	result = IntentRepairApplyResult{Eligible: true, OldHead: opts.ExpectedHead, NewHead: head, BackupRef: backup, PlannedCommits: len(chain)}
+	parent := base
+	for i, oid := range chain {
+		parents, err := parentsOf(ctx, repoDir, oid)
+		if err != nil {
+			return result, err
+		}
+		if (parent == "" && len(parents) != 0) || (parent != "" && (len(parents) != 1 || parents[0] != parent)) {
+			return result, errors.New("git intent history: existing target parent chain changed")
+		}
+		tree, err := RevParse(ctx, repoDir, oid+"^{tree}")
+		if err != nil {
+			return result, err
+		}
+		message, err := commitMessage(ctx, repoDir, oid)
+		if err != nil {
+			return result, err
+		}
+		replacement := opts.Replacements[i]
+		if tree != replacement.TreeOID || strings.TrimRight(message, "\n") != strings.TrimRight(replacement.Message, "\n") {
+			return result, errors.New("git intent history: existing target goal changed")
+		}
+		authorOID := replacement.AuthorOID
+		if authorOID == "" {
+			authorOID = replacement.Replaces[0]
+		}
+		expectedAuthor, err := commitAuthorEnv(ctx, repoDir, authorOID)
+		if err != nil {
+			return result, err
+		}
+		actualAuthor, err := commitAuthorEnv(ctx, repoDir, oid)
+		if err != nil {
+			return result, err
+		}
+		for key, value := range expectedAuthor {
+			if actualAuthor[key] != value {
+				return result, errors.New("git intent history: existing target author changed")
+			}
+		}
+		for _, old := range replacement.Replaces {
+			result.CommitMappings = append(result.CommitMappings, IntentRepairCommitMapping{OldOID: old, NewOID: oid})
+		}
+		parent = oid
+	}
+	finalTree, err := RevParse(ctx, repoDir, opts.ExpectedHead+"^{tree}")
+	if err != nil {
+		return result, err
+	}
+	if err := validateIntentRepairFinalTree(ctx, repoDir, opts.Replacements, finalTree); err != nil {
+		return result, err
+	}
 	return result, nil
 }
 

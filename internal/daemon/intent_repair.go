@@ -902,8 +902,7 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 			return errors.New("daemon: intent repair: old chain does not end at expected HEAD")
 		}
 		if _, ok := seen[plan.OldChain[0]]; !ok ||
-			len(plan.Candidates[0].Replaces) == 0 ||
-			plan.Candidates[0].Replaces[0] != plan.OldChain[0] {
+			(!plan.AllowCaptureRepartition && plan.Candidates[0].Replaces[0] != plan.OldChain[0]) {
 			return errors.New(
 				"daemon: intent repair: first candidate must own the oldest commit",
 			)
@@ -1146,12 +1145,14 @@ func reconstructIntentRepairMappings(
 		return nil, intentRepairRecoveryProofError(
 			"repair %s has no old commit mapping", repair.ID)
 	}
-	baseOut, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
-		"rev-parse", repair.Commits[0].OldOID+"^")
+	oldest, err := intentRepairOldestMappedCommit(ctx, repoRoot, repair.Commits)
+	if err != nil {
+		return nil, err
+	}
+	base, err := git.RevParse(ctx, repoRoot, oldest+"^")
 	if err != nil {
 		return nil, fmt.Errorf("daemon: recover intent repair: resolve repair base: %w", err)
 	}
-	base := strings.TrimSpace(string(baseOut))
 	out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
 		"rev-list", "--first-parent", "--reverse", base+".."+head)
 	if err != nil {
@@ -1189,6 +1190,30 @@ func reconstructIntentRepairMappings(
 		}
 	}
 	return mappings, nil
+}
+
+func intentRepairOldestMappedCommit(ctx context.Context, repoRoot string, mappings []state.IntentRepairCommit) (string, error) {
+	old := make(map[string]struct{})
+	for _, mapping := range mappings {
+		old[mapping.OldOID] = struct{}{}
+	}
+	var oldest string
+	for oid := range old {
+		parent, err := git.RevParse(ctx, repoRoot, oid+"^")
+		if err != nil {
+			return "", err
+		}
+		if _, included := old[parent]; !included {
+			if oldest != "" {
+				return "", intentRepairRecoveryProofError("mapped old commits have multiple bases")
+			}
+			oldest = oid
+		}
+	}
+	if oldest == "" {
+		return "", intentRepairRecoveryProofError("mapped old commits have no base")
+	}
+	return oldest, nil
 }
 
 type intentRepairDigestCandidate struct {
