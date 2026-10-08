@@ -172,14 +172,24 @@ func (duplicateRecaptureIntentPlanner) PlanIntentV2(_ context.Context, req ai.In
 	for _, capture := range req.OfferedCaptures {
 		seqs = append(seqs, capture.Seq)
 	}
+	purpose, subject := "advance the captured letter sequence", "Advance the captured letter sequence"
+	body, reason := "- Apply the recorded letter transitions once despite recaptures", "the recorded same-path transitions complete one letter sequence"
+	if len(req.OfferedCaptures) > 0 {
+		switch req.OfferedCaptures[0].Op {
+		case "delete":
+			purpose, subject = "remove retired setup instructions", "Remove retired setup instructions"
+			body, reason = "- Remove the superseded guide once despite duplicate captures", "duplicate deletion captures describe the same retired guide"
+		case "rename":
+			purpose, subject = "move setup instructions to the current guide", "Rename the current setup guide"
+			body, reason = "- Preserve setup instructions at their current documentation path", "duplicate rename captures describe the same setup guide movement"
+		}
+	}
 	return ai.IntentPlanV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
 			CandidateID: "capture-letter-sequence", SelectedSeqs: seqs,
-			Purpose: "advance the captured letter sequence", Readiness: ai.IntentCandidateReady,
-			Subject:        "Advance the captured letter sequence",
-			Body:           "- Apply the recorded letter transitions once despite recaptures",
-			GroupingReason: "the recorded same-path transitions complete one letter sequence",
+			Purpose: purpose, Readiness: ai.IntentCandidateReady,
+			Subject: subject, Body: body, GroupingReason: reason,
 		}},
 	}, nil
 }
@@ -188,8 +198,8 @@ func TestReplayIntentV2DrainsDuplicateDeleteAndRenameRecaptures(t *testing.T) {
 	t.Run("delete", func(t *testing.T) {
 		f := newCaptureFixture(t)
 		ctx := context.Background()
-		path := "removed.txt"
-		contents := []byte("remove once\n")
+		path := "retired-setup.md"
+		contents := []byte("# Retired setup instructions\nUse the current setup guide instead.\n")
 		if err := os.WriteFile(filepath.Join(f.dir, path), contents, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -228,7 +238,11 @@ func TestReplayIntentV2DrainsDuplicateDeleteAndRenameRecaptures(t *testing.T) {
 		if err := os.Remove(filepath.Join(f.dir, path)); err != nil {
 			t.Fatal(err)
 		}
+		beforeCommits := revListCount(t, ctx, f.dir, "HEAD")
 		replayAllIntentPendingForTest(t, f)
+		if after := revListCount(t, ctx, f.dir, "HEAD"); after != beforeCommits+1 {
+			t.Fatalf("duplicate deletion created %d commits, want one", after-beforeCommits)
+		}
 		if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir},
 			"cat-file", "-e", "HEAD:"+path); err == nil {
 			t.Fatalf("%s still exists at HEAD", path)
@@ -238,8 +252,8 @@ func TestReplayIntentV2DrainsDuplicateDeleteAndRenameRecaptures(t *testing.T) {
 	t.Run("rename", func(t *testing.T) {
 		f := newCaptureFixture(t)
 		ctx := context.Background()
-		oldPath, newPath := "before.txt", "after.txt"
-		contents := []byte("rename once\n")
+		oldPath, newPath := "old-setup.md", "setup.md"
+		contents := []byte("# Setup instructions\nStart the application and connect its provider.\n")
 		if err := os.WriteFile(filepath.Join(f.dir, oldPath), contents, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -284,7 +298,11 @@ func TestReplayIntentV2DrainsDuplicateDeleteAndRenameRecaptures(t *testing.T) {
 			filepath.Join(f.dir, newPath)); err != nil {
 			t.Fatal(err)
 		}
+		beforeCommits := revListCount(t, ctx, f.dir, "HEAD")
 		replayAllIntentPendingForTest(t, f)
+		if after := revListCount(t, ctx, f.dir, "HEAD"); after != beforeCommits+1 {
+			t.Fatalf("duplicate rename created %d commits, want one", after-beforeCommits)
+		}
 		if got := mustGitOutput(t, f.dir, "show", "HEAD:"+newPath); got != string(contents) {
 			t.Fatalf("renamed contents=%q want %q", got, contents)
 		}
@@ -300,7 +318,7 @@ func replayAllIntentPendingForTest(t *testing.T, f *captureFixture) {
 	ctx := context.Background()
 	opts := ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
-		IntentPlanner: ai.DeterministicProvider{}, IntentPreset: config.PresetFast,
+		IntentPlanner: duplicateRecaptureIntentPlanner{}, IntentPreset: config.PresetFast,
 		IntentBypassBatchWait: true, IntentWindow: 10,
 	}
 	for attempt := 0; attempt < 6; attempt++ {
@@ -333,7 +351,8 @@ func TestReplayIntentV2AdvancesFastFallbackComponents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, contents := range map[string]string{
-		"first.txt": "one\n", "second.txt": "two\n",
+		"archive-recovery.md":  "# Archive recovery\nResume interrupted recording exports.\n",
+		"release-checklist.md": "# Release readiness\nCheck the approved build before publishing.\n",
 	} {
 		if err := os.WriteFile(filepath.Join(f.dir, path),
 			[]byte(contents), 0o644); err != nil {
@@ -349,11 +368,20 @@ func TestReplayIntentV2AdvancesFastFallbackComponents(t *testing.T) {
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
 		IntentPlanner: &disconnectedIntentV2Planner{},
 		IntentPreset:  config.PresetFast, IntentBypassBatchWait: true,
-		IntentWindow: 10, IntentDeferLimit: 5,
+		IntentWindow: 10, IntentDeferLimit: 5, IntentIncludeDiffs: true,
 	}
+	beforeCommits := revListCount(t, ctx, f.dir, "HEAD")
 	first, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil || first.Published != 2 {
 		t.Fatalf("first replay=%+v err=%v", first, err)
+	}
+	if after := revListCount(t, ctx, f.dir, "HEAD"); after != beforeCommits+2 {
+		t.Fatalf("independent goals created %d commits, want two", after-beforeCommits)
+	}
+	subjects := strings.Split(strings.TrimSpace(mustGitOutput(t, f.dir, "log", "-2", "--format=%s")), "\n")
+	sort.Strings(subjects)
+	if strings.Join(subjects, "|") != "Add Archive recovery|Add Release readiness" {
+		t.Fatalf("fallback subjects lost their separate goals: %v", subjects)
 	}
 	pending, err := state.PendingEvents(ctx, f.db, 0)
 	if err != nil || len(pending) != 0 {
@@ -1429,8 +1457,8 @@ func TestReplayIntentV2WiresPromptAndOperationalTrace(t *testing.T) {
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(f.dir, "trace.go"),
-		[]byte("package trace\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(f.dir, "provider-tracing.md"),
+		[]byte("# Provider tracing\nInspect planner requests and validation failures.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Capture(ctx, f.dir, f.db, f.cctx, CaptureOpts{
@@ -1455,6 +1483,9 @@ func TestReplayIntentV2WiresPromptAndOperationalTrace(t *testing.T) {
 	}
 	if result.Published != 1 {
 		t.Fatalf("result=%+v", result)
+	}
+	if subject := strings.TrimSpace(mustGitOutput(t, f.dir, "log", "-1", "--format=%s")); subject != "Add Provider tracing" {
+		t.Fatalf("trace fallback published an unexplained goal: %q", subject)
 	}
 	records := prompts.Records()
 	if len(records) != 2 {
