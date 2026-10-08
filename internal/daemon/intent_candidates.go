@@ -1785,6 +1785,34 @@ func ValidateIntentGoalPlan(req ai.IntentPlanRequestV2, plan ai.IntentPlanV2) er
 	if err := ai.ValidateIntentPlanV2(req, plan); err != nil {
 		return err
 	}
+	legacy := ai.LegacyIntentPlanRequest(req)
+	known := make(map[int64]bool, len(legacy.OfferedCaptures))
+	for _, capture := range legacy.OfferedCaptures {
+		known[capture.Seq] = true
+	}
+	for _, prior := range req.Candidates {
+		for _, seq := range prior.SelectedSeqs {
+			if !known[seq] {
+				// A persisted capture remains known even when its detailed diff is
+				// outside this request. Do not invent paths or content for it.
+				legacy.OfferedCaptures = append(legacy.OfferedCaptures, ai.OfferedCapture{Seq: seq})
+				known[seq] = true
+			}
+		}
+	}
+	for _, candidate := range plan.Candidates {
+		if candidate.Readiness != ai.IntentCandidateReady {
+			continue
+		}
+		report := ai.EvaluateIntentPlanMessageQuality(legacy, ai.IntentPlan{
+			SelectedSeqs: candidate.SelectedSeqs, Subject: candidate.Subject, Body: candidate.Body,
+		})
+		if report.Action != ai.MessageQualityClean && report.Action != ai.MessageQualitySanitizeAccept {
+			return intentSemanticValidationError(candidate.CandidateID,
+				ai.IntentAtomicityCompleteness, "goal_message_unproven",
+				"candidate message does not describe a complete meaningful goal")
+		}
+	}
 	return validatePlannerSemanticRationale(req, plan)
 }
 
@@ -2648,6 +2676,7 @@ func evaluateIntentCandidateAssignment(
 	}
 
 	request := ai.IntentPlanRequestV2{}
+	request.CommitFormat = input.CommitFormat
 	for _, prior := range existing {
 		seqs := make([]int64, 0, len(prior.Events))
 		for _, event := range prior.Events {
@@ -2663,7 +2692,7 @@ func evaluateIntentCandidateAssignment(
 	for _, capture := range candidateCaptures {
 		request.OfferedCaptures = append(request.OfferedCaptures, ai.OfferedCapture{
 			Seq: capture.Event.Seq, Path: capture.Event.Path,
-			CapturedDiff: capture.CapturedDiff,
+			CapturedDiff: capture.CapturedDiff, FileMetadata: capture.FileMetadata,
 		})
 	}
 	for _, edge := range dependencies {
@@ -2707,6 +2736,12 @@ func evaluateIntentCandidateAssignment(
 	} else if err := validateIntentCandidateCompanions(selected, grounded); err != nil {
 		results[1] = failedIntentGate(assignment.CandidateID,
 			ai.IntentAtomicityCompleteness, "available_companion_split", err)
+	} else if report := ai.EvaluateIntentPlanMessageQuality(ai.LegacyIntentPlanRequest(request), ai.IntentPlan{
+		SelectedSeqs: selected, Subject: assignment.Subject, Body: assignment.Body,
+	}); report.Action != ai.MessageQualityClean && report.Action != ai.MessageQualitySanitizeAccept {
+		results[1] = failedIntentGate(assignment.CandidateID,
+			ai.IntentAtomicityCompleteness, "goal_message_unproven",
+			errors.New("candidate message does not describe a complete meaningful goal"))
 	} else {
 		results[1] = ai.IntentAtomicityGateResult{
 			Gate: ai.IntentAtomicityCompleteness, Status: ai.IntentAtomicityPassed,

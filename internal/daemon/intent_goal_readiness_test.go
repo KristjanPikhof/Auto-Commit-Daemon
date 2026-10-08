@@ -195,3 +195,18 @@ func TestIntentGoalFallbackUsesFinalCapturedEvidence(t *testing.T) {
 		t.Fatalf("different outcomes described by one source symbol: %q", subject)
 	}
 }
+
+func TestIntentGoalSavedPlanIndependentlyRejectsGenericMessages(t *testing.T) {
+	t.Parallel()
+	req := ai.IntentPlanRequestV2{OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "alpha.go", Op: "modify"}}}
+	for _, subject := range []string{"Update alpha code changes", "Add PublishRecordingArchive", "Fix publication readiness after..."} {
+		plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "saved", SelectedSeqs: []int64{1}, Readiness: ai.IntentCandidateReady,
+			Purpose: "improve recorded archive handling", GroupingReason: "one complete archive goal",
+			Subject: subject,
+		}}}
+		if err := ValidateIntentGoalPlan(req, plan); err == nil || !strings.Contains(err.Error(), "goal_message_unproven") {
+			t.Fatalf("saved generic plan accepted: subject=%q err=%v", subject, err)
+		}
+	}
+}
