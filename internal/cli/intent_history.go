@@ -55,6 +55,22 @@ func generateIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "check-ref-format", target); err != nil {
 		return err
 	}
+	if target == selection.BranchRef {
+		return errors.New("acd history rewrite: --new-branch must preserve the source branch")
+	}
+	if _, err := git.RevParse(ctx, repo, target); err == nil {
+		return errors.New("acd history rewrite: target branch already exists; choose a new branch")
+	}
+	dbPath, err := rewriteStateDBPath(ctx, repo)
+	if err != nil {
+		return err
+	}
+	if opts.planOut == "" {
+		version, err := state.ReadUserVersion(ctx, dbPath)
+		if err != nil || version != state.SchemaVersion {
+			return errors.New("acd history rewrite: use --plan-out FILE for a standalone preview until ACD is set up at the current schema; planning does not migrate an active worker")
+		}
+	}
 	var chain []string
 	for _, commit := range selection.Selected {
 		chain = append(chain, commit.OID)
@@ -64,16 +80,16 @@ func generateIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 		return err
 	}
 	plan.TargetBranchRef = target
-	dbPath, err := rewriteStateDBPath(ctx, repo)
-	if err != nil {
-		return err
+	if opts.planOut != "" {
+		plan, err = state.PrepareIntentHistoryPlan(plan)
+	} else {
+		db, openErr := state.OpenRuntime(ctx, dbPath)
+		if openErr != nil {
+			return openErr
+		}
+		plan, err = state.SaveIntentHistoryPlan(ctx, db, plan)
+		db.Close()
 	}
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	plan, err = state.SaveIntentHistoryPlan(ctx, db, plan)
 	if err != nil {
 		return err
 	}
@@ -142,26 +158,38 @@ func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, pla
 	if err != nil {
 		return err
 	}
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
 	if !lookup.Registered || lookup.Record.LifecycleDisabled() {
 		return errors.New("acd history rewrite: goal reconstruction requires an active worker to run the repository's approved verification; run acd on first")
 	}
-	worker, _, err := state.LoadDaemonState(ctx, db)
+	readDB, err := state.OpenReadOnly(ctx, dbPath)
+	if err != nil {
+		return err
+	}
+	defer readDB.Close()
+	worker, _, err := state.LoadDaemonState(ctx, readDB)
 	if err != nil {
 		return err
 	}
 	var capability state.IntentHistoryWorker
-	ok, err := state.MetaGetJSON(ctx, db, state.MetaKeyIntentHistoryWorker, &capability)
+	ok, err := state.MetaGetJSON(ctx, readDB, state.MetaKeyIntentHistoryWorker, &capability)
 	if err != nil {
 		return err
 	}
 	if !ok || capability.Protocol != state.IntentHistoryPlanVersion || capability.PID != worker.PID || capability.Fingerprint != daemonFingerprintToken(worker) || worker.PID <= 0 {
 		return errors.New("acd history rewrite: the active worker does not support goal reconstruction; rebuild and restart ACD before applying")
 	}
+	version, err := state.ReadUserVersion(ctx, dbPath)
+	if err != nil {
+		return err
+	}
+	if version != state.SchemaVersion {
+		return errors.New("acd history rewrite: active worker schema does not match the reconstruction protocol; run setup and restart first")
+	}
+	db, err := state.OpenRuntime(ctx, dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
 	plan, err = state.SaveIntentHistoryPlan(ctx, db, plan)
 	if err != nil {
 		return err

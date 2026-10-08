@@ -48,6 +48,12 @@ func TestIntentHistoryCLIPlanPreviewPreservesSourceAndReadsWithoutMutation(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
+	statePath, _ := rewriteStateDBPath(ctx, repo)
+	initialized, err := state.Open(ctx, statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialized.Close()
 	var out bytes.Buffer
 	err = generateIntentHistoryPlan(ctx, &out, repo, selection, rewriteCommitsOptions{newBranch: "semantic-recovery", planOnly: true}, historyGoalCLIPlanner{}, ai.ProviderConfig{CommitFormat: ai.CommitFormatImperative, DiffEgress: true}, true)
 	if err != nil {

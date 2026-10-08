@@ -66,7 +66,9 @@ type IntentHistoryRequest struct {
 	UpdatedTS float64 `json:"updated_ts"`
 }
 
-func SaveIntentHistoryPlan(ctx context.Context, db *DB, plan IntentHistoryPlan) (IntentHistoryPlan, error) {
+// PrepareIntentHistoryPlan gives a standalone preview the same identity as a
+// database plan without opening or migrating a repository's state.
+func PrepareIntentHistoryPlan(plan IntentHistoryPlan) (IntentHistoryPlan, error) {
 	if plan.ID == "" {
 		id, err := newRewritePlanID()
 		if err != nil {
@@ -75,6 +77,14 @@ func SaveIntentHistoryPlan(ctx context.Context, db *DB, plan IntentHistoryPlan) 
 		plan.ID = id
 	}
 	plan.Version = IntentHistoryPlanVersion
+	return plan, nil
+}
+
+func SaveIntentHistoryPlan(ctx context.Context, db *DB, plan IntentHistoryPlan) (IntentHistoryPlan, error) {
+	plan, err := PrepareIntentHistoryPlan(plan)
+	if err != nil {
+		return plan, err
+	}
 	raw, err := json.Marshal(plan)
 	if err != nil {
 		return plan, err
