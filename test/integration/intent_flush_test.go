@@ -83,8 +83,8 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 	assertIntentV2RuntimeActive(t, repo)
 
 	headBefore := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
-	target := filepath.Join(repo, "deterministic-flush.txt")
-	writeFile(t, target, "flush me\n")
+	target := filepath.Join(repo, "capture-protection.md")
+	writeFile(t, target, "# Capture protection reference\n\nKeep changes protected before publication.\n")
 
 	// Wake first so capture observes the file before the flush. flush
 	// --logical only forces the planner past the count gate; it does not
@@ -97,7 +97,7 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitForEventState(t, dbPath, "deterministic-flush.txt", "pending", 5*time.Second)
+	waitForEventState(t, dbPath, "capture-protection.md", "pending", 5*time.Second)
 	if headAfterWake := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfterWake != headBefore {
 		t.Fatalf("wake-only drain bypassed intent batch gate: HEAD=%s want %s", headAfterWake, headBefore)
 	}
@@ -130,11 +130,10 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 			flushRes.Stdout, flushRes.Stderr)
 	}
 
-	// One commit, deterministic subject.
+	// Captured evidence supplies a meaningful deterministic goal message.
 	subj := headSubject(t, repo)
-	if subj != "Add deterministic-flush.txt" {
-		t.Fatalf("HEAD subject=%q want %q (deterministic provider must produce Add <basename>)",
-			subj, "Add deterministic-flush.txt")
+	if subj != "Add Capture protection reference" {
+		t.Fatalf("HEAD subject=%q want a grounded documentation goal", subj)
 	}
 }
 
