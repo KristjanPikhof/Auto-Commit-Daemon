@@ -355,9 +355,13 @@ func completedIntentRepairCommitChain(
 	seen := map[string]struct{}{current: {}}
 	chain := []string{current}
 	for step := 0; step < CompletedBranchTransitionProofLimit; step++ {
+		table, err := intentRepairMappingsTable(ctx, d.readSQL())
+		if err != nil {
+			return nil, err
+		}
 		rows, err := d.readSQL().QueryContext(ctx, `
 SELECT r.id,c.new_oid
-FROM intent_repair_commits c
+FROM `+table+` c
 JOIN intent_repairs r ON r.id=c.repair_id
 WHERE r.branch_ref=? AND r.branch_generation=?
   AND r.status='completed' AND c.old_oid=?

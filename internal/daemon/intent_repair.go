@@ -647,7 +647,7 @@ func validateIntentRepairSettlement(
 SELECT COUNT(*)
 FROM (
     SELECT mapped.candidate_id
-    FROM intent_repair_commits mapped
+    FROM intent_repair_commit_mappings mapped
     WHERE mapped.repair_id=?
     GROUP BY mapped.candidate_id
     HAVING mapped.candidate_id IS NULL
@@ -730,7 +730,7 @@ WITH classified AS (
             WHEN owned.prior_state='published'
              AND event.state='published'
              AND EXISTS (
-                 SELECT 1 FROM intent_repair_commits mapped
+                 SELECT 1 FROM intent_repair_commit_mappings mapped
                  WHERE mapped.repair_id=owned.repair_id
                    AND mapped.candidate_id=owned.candidate_id
                    AND mapped.old_oid=event.commit_oid
@@ -740,7 +740,7 @@ WITH classified AS (
         CASE
             WHEN event.state='published'
              AND EXISTS (
-                 SELECT 1 FROM intent_repair_commits mapped
+                 SELECT 1 FROM intent_repair_commit_mappings mapped
                  WHERE mapped.repair_id=owned.repair_id
                    AND mapped.candidate_id=owned.candidate_id
                    AND mapped.new_oid=event.commit_oid

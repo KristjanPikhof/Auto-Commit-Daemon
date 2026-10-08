@@ -118,25 +118,11 @@ func (d *DB) Migrate(ctx context.Context) error {
 
 func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
 	if cur < 30 {
-		// Only the mapping relation changes: existing provenance, ordering,
-		// frozen membership and transaction rows are copied without alteration.
+		// Preserve the original mapping rows and copy their provenance into the
+		// additive lineage relation. Only split transactions use the new relation.
 		if _, err := tx.ExecContext(ctx, `
-CREATE TABLE intent_repair_commits_v30(
-    repair_id TEXT NOT NULL,
-    ord INTEGER NOT NULL CHECK (ord >= 0),
-    candidate_id TEXT,
-    old_oid TEXT NOT NULL,
-    new_oid TEXT,
-    PRIMARY KEY (repair_id, ord),
-    UNIQUE (repair_id, old_oid, candidate_id),
-    FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
-);
-INSERT INTO intent_repair_commits_v30
+INSERT OR IGNORE INTO intent_repair_commit_lineage
 SELECT repair_id,ord,candidate_id,old_oid,new_oid FROM intent_repair_commits;
-DROP TABLE intent_repair_commits;
-ALTER TABLE intent_repair_commits_v30 RENAME TO intent_repair_commits;
-CREATE INDEX idx_intent_repair_commits_old_oid ON intent_repair_commits(old_oid,repair_id);
-CREATE INDEX idx_intent_repair_commits_candidate ON intent_repair_commits(candidate_id,repair_id);
 `); err != nil {
 			return fmt.Errorf("state: migrate capture repair lineage: %w", err)
 		}

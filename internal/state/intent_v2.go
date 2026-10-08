@@ -1815,8 +1815,16 @@ func replaceIntentRepairCommits(ctx context.Context, tx *sql.Tx, repairID string
 	if len(commits) == 0 || len(commits) > IntentRepairMaxMappings {
 		return fmt.Errorf("state: intent repair requires 1..%d mappings", IntentRepairMaxMappings)
 	}
+	oldOIDs := make(map[string]struct{})
+	for _, commit := range commits {
+		oldOIDs[commit.OldOID] = struct{}{}
+	}
+	table := "intent_repair_commits"
+	if len(oldOIDs) < len(commits) {
+		table = "intent_repair_commit_lineage"
+	}
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM intent_repair_commits WHERE repair_id=?`, repairID); err != nil {
+		`DELETE FROM `+table+` WHERE repair_id=?`, repairID); err != nil {
 		return fmt.Errorf("state: clear intent repair commits: %w", err)
 	}
 	seen := make(map[string]struct{}, len(commits))
@@ -1830,7 +1838,7 @@ func replaceIntentRepairCommits(ctx context.Context, tx *sql.Tx, repairID string
 		}
 		seen[key] = struct{}{}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO intent_repair_commits(
+INSERT INTO `+table+`(
     repair_id, ord, candidate_id, old_oid, new_oid
 ) VALUES (?, ?, ?, ?, ?)`,
 			repairID, ord, commit.CandidateID, commit.OldOID,
@@ -1901,7 +1909,7 @@ WHERE owned.repair_id=?
       OR
       (owned.prior_state='published' AND event.commit_oid IS NOT NULL
        AND EXISTS (
-           SELECT 1 FROM intent_repair_commits mapped
+           SELECT 1 FROM intent_repair_commit_mappings mapped
            WHERE mapped.repair_id=owned.repair_id
              AND mapped.candidate_id=owned.candidate_id
              AND mapped.old_oid=event.commit_oid
@@ -2012,7 +2020,7 @@ GROUP BY repair.id`, repairID).Scan(
 	var unmapped int
 	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*)
-FROM intent_repair_commits mapped
+FROM intent_repair_commit_mappings mapped
 WHERE mapped.repair_id=?
   AND (
       mapped.candidate_id IS NULL
@@ -2033,9 +2041,13 @@ WHERE mapped.repair_id=?
 }
 
 func loadIntentRepairCommits(ctx context.Context, q intentV2Queryer, repairID string) ([]IntentRepairCommit, error) {
+	table, err := intentRepairMappingsTable(ctx, q)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := q.QueryContext(ctx, `
 SELECT repair_id, ord, candidate_id, old_oid, new_oid
-FROM intent_repair_commits
+FROM `+table+`
 WHERE repair_id=? ORDER BY ord`, repairID)
 	if err != nil {
 		return nil, fmt.Errorf("state: query intent repair commits: %w", err)
@@ -2062,9 +2074,13 @@ func loadIntentRepairCommitsBounded(
 	repairID string,
 	limit int,
 ) ([]IntentRepairCommit, bool, error) {
+	table, err := intentRepairMappingsTable(ctx, q)
+	if err != nil {
+		return nil, false, err
+	}
 	rows, err := q.QueryContext(ctx, `
 SELECT repair_id, ord, candidate_id, old_oid, new_oid
-FROM intent_repair_commits
+FROM `+table+`
 WHERE repair_id=? ORDER BY ord
 LIMIT ?`, repairID, limit+1)
 	if err != nil {
@@ -2558,4 +2574,15 @@ func sanitizedOutputTail(value string) string {
 		value = value[1:]
 	}
 	return value
+}
+
+func intentRepairMappingsTable(ctx context.Context, q intentV2Queryer) (string, error) {
+	var exists int
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='view' AND name='intent_repair_commit_mappings')`).Scan(&exists); err != nil {
+		return "", err
+	}
+	if exists != 0 {
+		return "intent_repair_commit_mappings", nil
+	}
+	return "intent_repair_commits", nil
 }

@@ -21,15 +21,8 @@ func TestIntentRepairV30MigrationPreservesProvenanceAndAllowsSplitMapping(t *tes
 		t.Fatal(err)
 	}
 	if _, err := raw.ExecContext(ctx, `
-CREATE TABLE intent_repair_commits_v29(
-    repair_id TEXT NOT NULL, ord INTEGER NOT NULL CHECK(ord>=0),
-    candidate_id TEXT, old_oid TEXT NOT NULL, new_oid TEXT,
-    PRIMARY KEY(repair_id,ord), UNIQUE(repair_id,old_oid),
-    FOREIGN KEY(repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
-);
-INSERT INTO intent_repair_commits_v29 SELECT * FROM intent_repair_commits;
-DROP TABLE intent_repair_commits;
-ALTER TABLE intent_repair_commits_v29 RENAME TO intent_repair_commits;
+DROP VIEW intent_repair_commit_mappings;
+DROP TABLE intent_repair_commit_lineage;
 PRAGMA user_version=29;
 `); err != nil {
 		t.Fatal(err)
@@ -58,10 +51,10 @@ PRAGMA user_version=29;
 	if err != nil || !ok || repair.ExpectedHead != "mixed" || repair.BranchGeneration != 2 || repair.Status != IntentRepairPrepared || repair.Commits[0].CandidateID.String != "goal-a" || repair.Commits[0].NewOID.Valid {
 		t.Fatalf("migration changed provenance: %+v err=%v", repair, err)
 	}
-	if _, err := migrated.SQL().ExecContext(ctx, `INSERT INTO intent_repair_commits(repair_id,ord,candidate_id,old_oid,new_oid) VALUES('legacy-mapping',1,'goal-b','mixed',NULL)`); err != nil {
+	if _, err := migrated.SQL().ExecContext(ctx, `INSERT INTO intent_repair_commit_lineage(repair_id,ord,candidate_id,old_oid,new_oid) VALUES('legacy-mapping',1,'goal-b','mixed',NULL)`); err != nil {
 		t.Fatalf("split lineage refused: %v", err)
 	}
-	if _, err := migrated.SQL().ExecContext(ctx, `INSERT INTO intent_repair_commits(repair_id,ord,candidate_id,old_oid,new_oid) VALUES('legacy-mapping',2,'goal-b','mixed',NULL)`); err == nil {
+	if _, err := migrated.SQL().ExecContext(ctx, `INSERT INTO intent_repair_commit_lineage(repair_id,ord,candidate_id,old_oid,new_oid) VALUES('legacy-mapping',2,'goal-b','mixed',NULL)`); err == nil {
 		t.Fatal("same old/candidate relation can be duplicated")
 	}
 	var foreignKeyRows int
