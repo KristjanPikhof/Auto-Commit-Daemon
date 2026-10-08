@@ -250,8 +250,55 @@ func SaveIntentCandidate(ctx context.Context, d *DB, candidate IntentCandidate) 
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := saveIntentCandidateTx(ctx, tx, candidate); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SaveIntentRepairCandidates atomically reassigns published captures to the
+// approved repair goals. Superseded membership stays available as provenance.
+func SaveIntentRepairCandidates(ctx context.Context, d *DB, candidates []IntentCandidate) error {
+	if d == nil || len(candidates) == 0 || len(candidates) > IntentRepairMaxCommits {
+		return errors.New("state: invalid repair candidate batch")
+	}
+	seenIDs := make(map[string]struct{})
+	seenEvents := make(map[int64]struct{})
+	for i := range candidates {
+		candidate := &candidates[i]
+		if candidate.Readiness == "" {
+			candidate.Readiness = IntentReadinessWait
+		}
+		if err := validateIntentCandidate(*candidate); err != nil {
+			return err
+		}
+		if _, duplicate := seenIDs[candidate.ID]; duplicate {
+			return errors.New("state: duplicate repair candidate")
+		}
+		seenIDs[candidate.ID] = struct{}{}
+		for _, event := range candidate.Events {
+			if _, duplicate := seenEvents[event.EventSeq]; duplicate {
+				return errors.New("state: repair capture has multiple goals")
+			}
+			seenEvents[event.EventSeq] = struct{}{}
+		}
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, candidate := range candidates {
+		if err := saveIntentCandidateTx(ctx, tx, candidate); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func saveIntentCandidateTx(ctx context.Context, tx *sql.Tx, candidate IntentCandidate) error {
 	var existingStatus string
-	err = tx.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`SELECT status FROM intent_candidates WHERE id=?`, candidate.ID,
 	).Scan(&existingStatus)
 	switch {
@@ -338,9 +385,6 @@ WHERE branch_ref=? AND branch_generation=? AND id<>?
         AND active_membership.membership_state='active'
   )`, now, candidate.BranchRef, candidate.BranchGeneration, candidate.ID); err != nil {
 		return fmt.Errorf("state: retire empty reassigned candidates: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("state: commit intent candidate save: %w", err)
 	}
 	return nil
 }
