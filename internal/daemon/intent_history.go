@@ -19,6 +19,15 @@ import (
 // It does not alter the worktree, index, branch, or capture ledger.
 func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string, planner interface{ Name() string }, format ai.CommitFormat, includeDiffs bool) (state.IntentHistoryPlan, error) {
 	var result state.IntentHistoryPlan
+	budget := runtimeTelemetryFromContext(ctx).providerTimeout
+	if budget <= 0 {
+		budget = ai.LoadProviderConfigFromEnv().Timeout
+	}
+	if budget <= 0 {
+		budget = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 	units, err := git.ReadIntentHistoryUnits(ctx, repo, chain)
 	if err != nil {
 		return result, err

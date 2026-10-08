@@ -75,6 +75,11 @@ func generateIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 	for _, commit := range selection.Selected {
 		chain = append(chain, commit.OID)
 	}
+	if cfg.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
+		defer cancel()
+	}
 	plan, err := daemon.PlanIntentHistory(ctx, repo, selection.BranchRef, chain, provider, cfg.CommitFormat, cfg.DiffEgress)
 	if err != nil {
 		return err
