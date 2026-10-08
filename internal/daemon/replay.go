@@ -1395,6 +1395,7 @@ type intentReplayConfig struct {
 	commitFormat         ai.CommitFormat
 	plannerProvider      string
 	plannerModel         string
+	goalDependencies     []IntentDependencyHint
 }
 
 type unavailableIntentPlanner struct {
@@ -1672,6 +1673,7 @@ func replayIntentBatch(
 		sum.RecoveryMode = publicationFallbackSemanticReplan
 	}
 	quiescenceNow := pathQuiescenceNow()
+	goalPending := pending
 	if cfg.pathQuiescence > 0 && len(cfg.targetEventSeqs) > 0 &&
 		(cfg.semanticSalvage || cfg.atomicFallback) {
 		quiet, err := intentRecoveryTargetQuiescent(
@@ -1806,6 +1808,20 @@ func replayIntentBatch(
 	}
 	if err != nil {
 		return sum, err
+	}
+	if cfg.candidateMode && !cfg.atomicFallback && len(window) > 0 && len(goalPending) > len(window) {
+		var goalWait string
+		window, cfg.goalDependencies, goalWait, err = expandIntentGoalWindow(
+			ctx, repoRoot, db, activeCtx, goalPending, window, cfg, quiescenceNow)
+		if err != nil {
+			return sum, err
+		}
+		if goalWait != "" {
+			waitReason = goalWait
+		}
+		if len(window) > 1 {
+			forced = false
+		}
 	}
 	if len(window) == 0 {
 		if waitReason != "" {

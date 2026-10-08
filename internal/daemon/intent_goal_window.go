@@ -1,0 +1,152 @@
+package daemon
+
+import (
+	"context"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+)
+
+const intentGoalLookaheadDiffCap = 4096
+
+var intentGoalDeclaration = regexp.MustCompile(`\b(?:func|function|def|class|struct|type|enum|interface|protocol)\s+([a-zA-Z_][a-zA-Z0-9_]*)`)
+
+// Expand from a processing window into its recorded dependency closure. This
+// reads captured objects only, and never includes captures outside a frozen
+// publication target or treats directory/time similarity as a companion.
+func expandIntentGoalWindow(
+	ctx context.Context,
+	repoRoot string,
+	db *state.DB,
+	active CaptureContext,
+	pending, window []state.CaptureEvent,
+	cfg intentReplayConfig,
+	now time.Time,
+) ([]state.CaptureEvent, []IntentDependencyHint, string, error) {
+	target := make(map[int64]bool, len(cfg.targetEventSeqs))
+	for _, seq := range cfg.targetEventSeqs {
+		target[seq] = true
+	}
+	selected := make(map[int64]bool, len(window))
+	for _, event := range window {
+		selected[event.Seq] = true
+	}
+	captures := make([]IntentCandidateCapture, 0, state.IntentCandidateMaxCaptures)
+	bySeq := make(map[int64]IntentCandidateCapture)
+	for _, event := range pending {
+		if len(target) > 0 && !target[event.Seq] {
+			continue
+		}
+		if len(captures) >= state.IntentCandidateMaxCaptures {
+			break
+		}
+		ops, err := state.LoadCaptureOps(ctx, db, event.Seq)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		diff, err := BuildOpsDiffWithCap(ctx, repoRoot, ops, intentGoalLookaheadDiffCap)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		capture := IntentCandidateCapture{Event: event, Ops: ops, CapturedDiff: diff}
+		captures = append(captures, capture)
+		bySeq[event.Seq] = capture
+	}
+	dependencies, err := BuildIntentCandidateDependencies(active.BranchRef,
+		active.BranchGeneration, captures, runtimeIntentDependencyHints(captures), now)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	request := ai.IntentPlanRequestV2{}
+	for _, capture := range captures {
+		request.OfferedCaptures = append(request.OfferedCaptures, ai.OfferedCapture{
+			Seq: capture.Event.Seq, Path: capture.Event.Path, CapturedDiff: capture.CapturedDiff,
+		})
+	}
+	for _, edge := range dependencies {
+		request.Dependencies = append(request.Dependencies, ai.IntentCaptureDependency{
+			FromSeq: edge.PrerequisiteSeq, ToSeq: edge.DependentSeq,
+			Strength: ai.IntentDependencyStrength(edge.Strength), Kind: edge.Kind,
+		})
+	}
+	var companions []ai.IntentCaptureDependency
+	for _, edge := range groundedIntentRequestDependencies(request) {
+		if edge.Strength != ai.IntentDependencyHard && !intentGoalCompanionEdge(edge, bySeq) {
+			continue
+		}
+		companions = append(companions, edge)
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, edge := range companions {
+			if selected[edge.FromSeq] == selected[edge.ToSeq] {
+				continue
+			}
+			selected[edge.FromSeq], selected[edge.ToSeq] = true, true
+			changed = true
+		}
+	}
+	var expanded []state.CaptureEvent
+	paths := make(map[string]struct{})
+	for _, event := range pending {
+		if !selected[event.Seq] {
+			continue
+		}
+		capture, known := bySeq[event.Seq]
+		if !known {
+			return nil, nil, "skipped_due_intent_goal_context_limit", nil
+		}
+		if !pathQuiescentForEvent(event, capture.Ops, cfg.pathQuiescence, now) {
+			return nil, nil, "skipped_due_path_quiescence", nil
+		}
+		expanded = append(expanded, event)
+		for _, name := range intentCapturePaths(capture) {
+			paths[name] = struct{}{}
+		}
+	}
+	// A known same-path successor beyond the bounded detailed context must
+	// remain protected rather than be silently cut off by the context limit.
+	for _, event := range pending {
+		if len(target) > 0 && !target[event.Seq] {
+			continue
+		}
+		if !selected[event.Seq] && captureEventTouchesAnyPath(event, paths) {
+			return nil, nil, "skipped_due_intent_goal_context_limit", nil
+		}
+	}
+	var hints []IntentDependencyHint
+	for _, edge := range companions {
+		if selected[edge.FromSeq] && selected[edge.ToSeq] {
+			hints = append(hints, IntentDependencyHint{
+				PrerequisiteSeq: edge.FromSeq, DependentSeq: edge.ToSeq,
+				Strength: edge.Strength, Kind: edge.Kind,
+				Evidence: "recorded companion relationship in bounded pending context",
+			})
+		}
+	}
+	return expanded, hints, "", nil
+}
+
+func intentGoalCompanionEdge(edge ai.IntentCaptureDependency, captures map[int64]IntentCandidateCapture) bool {
+	switch edge.Kind {
+	case "test_source", "migration_test", "import_reference", "generated_artifact_reference":
+		return true
+	case "symbol_hash":
+		for _, seq := range []int64{edge.FromSeq, edge.ToSeq} {
+			for _, match := range intentGoalDeclaration.FindAllStringSubmatch(captures[seq].CapturedDiff, 128) {
+				name := strings.ToLower(match[1])
+				other := edge.ToSeq
+				if seq == other {
+					other = edge.FromSeq
+				}
+				if len(name) >= 8 && strings.Contains(strings.ToLower(captures[other].CapturedDiff), name) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}

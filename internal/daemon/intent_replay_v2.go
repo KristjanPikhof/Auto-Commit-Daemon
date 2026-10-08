@@ -134,7 +134,7 @@ func replayIntentCandidateBatch(
 		PresetVersion: presetVersion,
 		LatestCommit:  legacyRequest.LatestCommit,
 		PathContext:   legacyRequest.PathCommitContext,
-		Hints:         runtimeIntentDependencyHints(captures),
+		Hints:         append(runtimeIntentDependencyHints(captures), cfg.goalDependencies...),
 		Materialize: intentCandidateScratchMaterializer(
 			repoRoot, opts.GitDir, parent),
 		PreflightMaterialize: intentCandidatePreflightMaterializer(
