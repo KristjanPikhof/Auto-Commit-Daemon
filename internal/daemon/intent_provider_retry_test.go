@@ -54,7 +54,7 @@ func TestIntentProviderOutageRetriesAcrossRestartAndPreservesLaterCaptures(t *te
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("target captures=%v err=%v", pending, err)
 	}
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Second)
 	ts := float64(now.UnixNano()) / 1e9
 	drain := state.PublicationDrain{
 		ID: "outage-retry", CheckpointID: protected.CheckpointID,
