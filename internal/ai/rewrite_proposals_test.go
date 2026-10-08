@@ -156,7 +156,7 @@ func TestBuildHistoryRewriteUserPromptStatesGroupingBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildHistoryRewriteUserPrompt: %v", err)
 	}
-	for _, want := range []string{"exactly once", "chronological order", "contiguous groups", "same file", "different author_name or author_email"} {
+	for _, want := range []string{"exactly once", "chronological order", "contiguous groups", "same file", "different author_name or author_email", "distinct goals", "prerequisites before consumers", "tests", "corrections", "net change", "cannot split a mixed existing commit", "Do not target a smaller commit count"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}

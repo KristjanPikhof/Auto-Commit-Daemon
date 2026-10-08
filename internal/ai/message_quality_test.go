@@ -209,6 +209,23 @@ func TestEvaluateIntentPlanMessageQuality(t *testing.T) {
 	}
 }
 
+func TestIntentMessageQualityRejectsFilenameCodeChangeFallback(t *testing.T) {
+	t.Parallel()
+	for _, subject := range []string{
+		"Update transcriptionservice code changes",
+		"Add dependencycontainer code changes",
+		"Update client test changes",
+		"fix: Update transcriptionservice code changes",
+	} {
+		report := EvaluateIntentPlanMessageQuality(IntentPlanRequest{
+			OfferedCaptures: []OfferedCapture{{Seq: 1, Path: "Assistant/TranscriptionService.swift"}},
+		}, IntentPlan{SelectedSeqs: []int64{1}, Subject: subject})
+		if !report.HasReason(MessageQualityReasonGenericSubject) || report.Action != MessageQualityRewrite {
+			t.Fatalf("generic fallback accepted: subject=%q report=%+v", subject, report)
+		}
+	}
+}
+
 func TestEvaluateIntentPlanMessageQuality_ConventionalFormat(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
 	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{
