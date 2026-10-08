@@ -24,6 +24,11 @@ scope. Regular files above `capture.max_file_bytes` stream into durable Git
 objects with bounded memory. File size alone no longer stops capture. The
 setting keeps its name for compatibility and now controls buffering.
 
+The generated-cache guard also excludes `-Xcc/` compiler index directories,
+including output accidentally written inside an Xcode project. Existing
+captured work remains protected until publication or explicit recovery resolves
+it; adding an exclusion does not discard queued captures or remove tracked files.
+
 An unreadable or changing eligible path makes coverage incomplete. ACD still
 saves readable files in a durable **partial checkpoint**, records the failed
 eligible paths and reasons, and retries with backoff. It keeps the last complete
