@@ -19,6 +19,34 @@ type intentGoalReferences struct {
 	symbols      map[string]struct{}
 }
 
+func freshIntentWindowAfterHeldGoal(ctx context.Context, db *state.DB, pending []state.CaptureEvent, size int) ([]state.CaptureEvent, error) {
+	if len(pending) == 0 || size <= 0 {
+		return nil, nil
+	}
+	head := pending[0]
+	held, err := state.HeldIntentCapturesForPair(ctx, db, head.BranchRef, head.BranchGeneration)
+	if err != nil || !held[head.Seq] {
+		return nil, err
+	}
+	blockedPaths := make(map[string]struct{})
+	for _, event := range pending {
+		if held[event.Seq] {
+			addCaptureEventPaths(blockedPaths, event)
+		}
+	}
+	var fresh []state.CaptureEvent
+	for _, event := range pending {
+		if held[event.Seq] || captureEventTouchesAnyPath(event, blockedPaths) {
+			continue
+		}
+		fresh = append(fresh, event)
+		if len(fresh) == size {
+			break
+		}
+	}
+	return fresh, nil
+}
+
 // Expand from a processing window into its recorded dependency closure. This
 // reads captured objects only, and never includes captures outside a frozen
 // publication target or treats directory/time similarity as a companion.
@@ -31,6 +59,9 @@ func expandIntentGoalWindow(
 	cfg intentReplayConfig,
 	now time.Time,
 ) ([]state.CaptureEvent, []IntentDependencyHint, string, error) {
+	if len(window) > state.IntentCandidateMaxCaptures {
+		return nil, nil, "skipped_due_intent_goal_context_limit", nil
+	}
 	target := make(map[int64]bool, len(cfg.targetEventSeqs))
 	for _, seq := range cfg.targetEventSeqs {
 		target[seq] = true
