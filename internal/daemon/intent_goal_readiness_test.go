@@ -107,6 +107,10 @@ func TestIntentGoalReadinessRecognizesSwiftTestsAcrossDirectories(t *testing.T) 
 	if err := validatePlannerSemanticRationale(req, plan); err != nil {
 		t.Fatal(err)
 	}
+	fallback, _ := balancedIntentCandidatePlan(req)
+	if len(fallback.Candidates) != 1 || len(fallback.Candidates[0].SelectedSeqs) != 2 {
+		t.Fatalf("rejected semantic split returned in fallback: %+v", fallback)
+	}
 }
 
 func TestIntentGoalReadinessContinuesPersistedSourceWithLaterTest(t *testing.T) {
@@ -177,15 +181,15 @@ func TestIntentGoalFallbackRetainsUnknownMeaning(t *testing.T) {
 func TestIntentGoalFallbackUsesFinalCapturedEvidence(t *testing.T) {
 	t.Parallel()
 	req := ai.IntentPlanRequestV2{OfferedCaptures: []ai.OfferedCapture{
-		{Seq: 1, Path: "service.go", Op: "create", CapturedDiff: "+func OriginalExportDraft() {}\n"},
-		{Seq: 2, Path: "service.go", Op: "modify", CapturedDiff: "+func PublishRecordingArchive() {}\n"},
+		{Seq: 1, Path: "export.md", Op: "create", CapturedDiff: "+# Initial recording export draft\n"},
+		{Seq: 2, Path: "export.md", Op: "modify", CapturedDiff: "+# Recording archive publication\n"},
 	}}
 	subject, _ := deterministicIntentCandidateMessage(req, []int64{1, 2})
-	if subject != "Add PublishRecordingArchive" {
+	if subject != "Add Recording archive publication" {
 		t.Fatalf("final captured subject=%q", subject)
 	}
 	req.OfferedCaptures = append(req.OfferedCaptures, ai.OfferedCapture{
-		Seq: 3, Path: "onboarding.go", Op: "modify", CapturedDiff: "+func ShowWelcomeScreen() {}\n",
+		Seq: 3, Path: "onboarding.md", Op: "modify", CapturedDiff: "+# Onboarding instructions\n",
 	})
 	if subject, _ := deterministicIntentCandidateMessage(req, []int64{1, 2, 3}); subject != "" {
 		t.Fatalf("different outcomes described by one source symbol: %q", subject)
