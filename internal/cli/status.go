@@ -56,6 +56,9 @@ type publicationDrainReport struct {
 // LastProgressTS: a fresh heartbeat proves that the worker is alive, not that
 // the publication frontier is moving.
 type publicationProgressReport struct {
+	HistoryPlanID          string  `json:"history_plan_id,omitempty"`
+	HistoryStatus          string  `json:"history_status,omitempty"`
+	HistoryError           string  `json:"history_error,omitempty"`
 	Strategy               string  `json:"strategy"`
 	PlannerProvider        string  `json:"planner_provider,omitempty"`
 	PlannerModel           string  `json:"planner_model,omitempty"`
@@ -507,8 +510,13 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 		return report, fmt.Errorf("publication progress: %w", err)
 	}
 	report.PublicationProgress = progress
+	if progress.Phase == "history_reconstruction" {
+		report.Busy = true
+		report.OperationalState = statusOperationalState(report)
+	}
 	report.PublicationOutcome.ReasonCode = progress.Phase
-	if health := report.IntentStrategy.PlannerHealth; health != nil && health.NextProbeTS > 0 {
+	if health := report.IntentStrategy.PlannerHealth; health != nil &&
+		health.State == daemon.IntentPlannerCircuitOpen && health.NextProbeTS > 0 {
 		report.PublicationOutcome.RetryAt = health.NextProbeTS
 	}
 
@@ -529,6 +537,20 @@ func buildPublicationProgressReport(
 			report.PID > 0 && identity.Alive(report.PID),
 		HeartbeatAgeSeconds: report.HeartbeatAgeSeconds,
 	}
+	var history state.IntentHistoryRequest
+	if conn != nil {
+		raw, _, err := metaLookup(ctx, conn, state.MetaKeyIntentHistoryRequest)
+		if err != nil {
+			return progress, err
+		}
+		if raw != "" {
+			if err := json.Unmarshal([]byte(raw), &history); err != nil {
+				return progress, fmt.Errorf("history request: %w", err)
+			}
+		}
+	}
+	progress.HistoryPlanID, progress.HistoryStatus, progress.HistoryError = history.PlanID, history.Status, history.Error
+	historyActive := history.Status == "pending" || history.Status == "running"
 	if progress.Strategy == "" {
 		progress.Strategy = "event"
 	}
@@ -651,6 +673,12 @@ func buildPublicationProgressReport(
 			progress.Phase = "config_wait"
 		case activeIntentVerification:
 			progress.Phase = "verifying"
+			progress.WaitRemainingSeconds = 0
+			progress.TemporaryLocalFallback = false
+		case historyActive && progress.WorkerResponsive && report.Protected:
+			progress.Phase = "history_reconstruction"
+			progress.Origin = "history_reconstruction"
+			progress.LastProgressTS = history.UpdatedTS
 			progress.WaitRemainingSeconds = 0
 			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery && intentProviderCallActive(report):

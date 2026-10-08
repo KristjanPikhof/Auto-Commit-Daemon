@@ -381,6 +381,8 @@ func productListPhase(entry productListEntry) string {
 	}
 	progress := entry.PublicationProgress
 	switch progress.Phase {
+	case "history_reconstruction":
+		return "history-reconstruct"
 	case "capture_retry", "capture_blocked":
 		return strings.ReplaceAll(progress.Phase, "_", "-")
 	case "intent_wait":
@@ -413,7 +415,7 @@ func productListPhase(entry productListEntry) string {
 			return "provider-wait:" + strings.ReplaceAll(formatDurationCompact(
 				time.Duration(progress.WaitRemainingSeconds)*time.Second), " ", "")
 		}
-		return "provider-wait"
+		return "provider-retry-due"
 	case "provider_call":
 		return "provider-call"
 	case "verifying":
@@ -510,7 +512,8 @@ func productListStatus(entry productListEntry) string {
 		return "needs action"
 	case entry.PublicationProgress.Phase == "stalled":
 		return "stalled"
-	case entry.PublicationProgress.Phase == "provider_call" ||
+	case entry.PublicationProgress.Phase == "history_reconstruction" ||
+		entry.PublicationProgress.Phase == "provider_call" ||
 		entry.PublicationProgress.Phase == "verifying":
 		return "working"
 	case entry.PublicationProgress.Phase == "provider_wait" ||

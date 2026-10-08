@@ -455,6 +455,10 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 	if err != nil {
 		return overview, err
 	}
+	if report.PublicationProgress.Phase == "history_reconstruction" {
+		report.Busy = true
+		report.OperationalState = statusOperationalStateWithDaemonAlive(*report, report.Daemon == "running" && report.PID > 0 && !report.Stale)
+	}
 	if raw, _, err := metaLookup(ctx, conn, state.RewritePIDMetaKey); err != nil {
 		return overview, err
 	} else if raw != "" {
@@ -470,7 +474,8 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		outcome, outcomeErr := productListReadOutcome(ctx, conn, report.Protected, record.Path, currentBranchRef, currentBranchGeneration, hasCurrentPair)
 		report.PublicationOutcome = outcome
 		report.PublicationOutcome.ReasonCode = report.PublicationProgress.Phase
-		if health := report.IntentStrategy.PlannerHealth; health != nil {
+		if health := report.IntentStrategy.PlannerHealth; health != nil &&
+			health.State == daemon.IntentPlannerCircuitOpen {
 			report.PublicationOutcome.RetryAt = health.NextProbeTS
 		}
 		if outcomeErr != nil && !productListReadTransient(outcomeErr) {
