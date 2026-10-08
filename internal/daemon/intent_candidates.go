@@ -120,6 +120,7 @@ type IntentCandidateEvaluationResult struct {
 	ProtocolVersion        string
 	Fallback               string
 	PlannerFailure         string
+	PlannerWait            *IntentPlannerCircuitOpenError
 	RetryCount             int
 	PlanAttempt            int
 	PlanAttemptLimit       int
@@ -360,6 +361,7 @@ func EvaluateIntentCandidates(
 	result.ProtocolVersion = plan.ProtocolVersion
 	result.Fallback = fallback
 	result.PlannerFailure = plannerFailure
+	result.PlannerWait = plannerWait
 	result.RetryCount = retryCount
 	result.PlanAttempt = planRun.AttemptCount
 	result.PlanAttemptLimit = planRun.AttemptLimit

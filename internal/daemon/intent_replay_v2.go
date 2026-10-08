@@ -203,6 +203,12 @@ func replayIntentCandidateBatch(
 	if preflightErr != nil {
 		return sum, preflightErr
 	}
+	if evaluation.PlannerFailure != "" && evaluation.NeedsAttention &&
+		evaluation.Fallback != "" {
+		return sum, &IntentSemanticFallbackRequiredError{
+			Failure: evaluation.PlannerFailure, plannerWait: evaluation.PlannerWait,
+		}
+	}
 	if evaluation.PlannerFailure != "" && evaluation.NeedsAttention {
 		sum.PlannerFailure = evaluation.PlannerFailure
 		nowSec := float64(time.Now().UnixNano()) / 1e9
