@@ -62,7 +62,8 @@ func (p *failedCheckpointRecoveryPlanner) PlanIntentV2(
 			SelectedSeqs: seqs,
 			Purpose:      "complete the source change and its test companion",
 			Readiness:    ai.IntentCandidateReady,
-			Subject:      "Complete source change",
+			Subject:      "Complete labeled value API",
+			Body:         "- Keep labeled values, their fixture, and coverage consistent",
 			GroupingReason: "the implementation, fixture, and test form one " +
 				"verified source change",
 		}},
@@ -72,8 +73,9 @@ func (p *failedCheckpointRecoveryPlanner) PlanIntentV2(
 const stalledCheckpointCandidateID = "checkpoint-stalled-candidate"
 
 type failedCheckpointReplayFixture struct {
-	capture *captureFixture
-	seqs    []int64
+	capture    *captureFixture
+	seqs       []int64
+	targetPath string
 }
 
 type semanticPrefixMessagePlanner struct {
@@ -107,8 +109,8 @@ func (p *semanticPrefixMessagePlanner) RewriteIntentMessage(
 	p.rewriteSeqs = append(p.rewriteSeqs,
 		append([]int64(nil), req.LockedPlan.SelectedSeqs...))
 	return ai.Result{
-		Subject: "Restore checkpoint compilation",
-		Body:    "- Keep the semantic dependency prefix together",
+		Subject: "Complete labeled value API",
+		Body:    "- Keep label defaults and their consumers consistent",
 		Source:  p.Name(),
 	}, nil
 }
@@ -140,7 +142,8 @@ func (p *exactTargetReplanPlanner) PlanIntentV2(
 			SelectedSeqs: seqs,
 			Purpose:      "replan the remaining frozen recovery target",
 			Readiness:    ai.IntentCandidateReady,
-			Subject:      "Replan remaining recovery",
+			Subject:      "Complete labeled value API",
+			Body:         "- Keep label defaults and their consumers consistent",
 			GroupingReason: "the remaining captures form the exact unresolved " +
 				"semantic target",
 		}},
@@ -175,6 +178,7 @@ func (p *expandedTargetRecoveryPlanner) PlanIntentV2(
 			Purpose:      "complete the API transition at its latest snapshot",
 			Readiness:    ai.IntentCandidateReady,
 			Subject:      "Complete API transition",
+			Body:         "- Keep labeled values, their fixture, and coverage consistent",
 			GroupingReason: "the newer same-path snapshots complete the frozen " +
 				"intermediate implementation",
 		}},
@@ -301,30 +305,54 @@ func TestReplayVerificationResourceWaitRetainsSemanticTarget(t *testing.T) {
 }
 
 func seedFailedCheckpointReplayFixture(t *testing.T) failedCheckpointReplayFixture {
+	return seedCheckpointReplayFixture(t, false)
+}
+
+// Prefix recovery exercises independently reviewable prerequisites and consumers.
+// The companion recovery fixture separately keeps implementation and tests atomic.
+func seedSemanticPrefixReplayFixture(t *testing.T) failedCheckpointReplayFixture {
+	return seedCheckpointReplayFixture(t, true)
+}
+
+func seedCheckpointReplayFixture(t *testing.T, semanticPrefix bool) failedCheckpointReplayFixture {
 	t.Helper()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
-	for path, contents := range map[string]string{
+	targetPath := "source_test.go"
+	base := map[string]string{
 		"companion_test.go": "package source\n\nconst Companion = 1\n",
 		"fresh.go":          "package source\n\nconst Fresh = 1\n",
 		"source.go": "package source\n\n" +
 			"func Value() int { return 1 }\n",
-		"source_fixture.go": "package source\n\nconst Fixture = 1\n",
+		"source_fixture.go": "package source\n\nfunc FixtureValue() int { return 1 }\n",
 		"source_test.go":    "package source\n\nvar Want = Value()\n",
-	} {
+	}
+	if semanticPrefix {
+		targetPath = "zsource_api.go"
+		delete(base, "source_test.go")
+		base[targetPath] = "package source\n\nconst ValueLabel = \"seed\"\n"
+	}
+	for path, contents := range base {
 		seedTrackedFileCommit(t, ctx, f, path, contents)
 	}
 	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
 		t.Fatal(err)
 	}
-	for path, contents := range map[string]string{
+	edits := map[string]string{
 		"source.go": "package source\n\n" +
 			"func Value(label string) int { return len(label) }\n",
-		"source_fixture.go": "package source\n\nconst Fixture = 2\n",
+		"source_fixture.go": "package source\n\nfunc FixtureValue() int { return Value(\"fixture\") }\n",
 		// This checkpoint is an intentionally incomplete API transition:
 		// Value now requires a label, while the test still calls Value().
-		"source_test.go": "package source\n\nvar Want = Value() + 1\n",
-	} {
+		"source_test.go": "package source\n\nvar Want = Value() + FixtureValue()\n",
+	}
+	if semanticPrefix {
+		delete(edits, "source_test.go")
+		edits[targetPath] = "package source\n\nconst ValueLabel = \"complete\"\n"
+		edits["source.go"] += "\nfunc DefaultValue() int { return Value(ValueLabel) }\n"
+		edits["source_fixture.go"] = "package source\n\nfunc FixtureValue() int { return DefaultValue() }\n"
+	}
+	for path, contents := range edits {
 		if err := os.WriteFile(filepath.Join(f.dir, path), []byte(contents), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -359,7 +387,7 @@ func seedFailedCheckpointReplayFixture(t *testing.T) failedCheckpointReplayFixtu
 		Status:            state.IntentCandidateWaiting,
 		Readiness:         state.IntentReadinessWait,
 		Purpose:           "complete the source implementation",
-		MissingCompanions: "source_test.go",
+		MissingCompanions: targetPath,
 		AtomicityStatus: sql.NullString{
 			String: string(ai.IntentAtomicityFailed), Valid: true,
 		},
@@ -380,7 +408,7 @@ func seedFailedCheckpointReplayFixture(t *testing.T) failedCheckpointReplayFixtu
 			t.Fatal(err)
 		}
 	}
-	return failedCheckpointReplayFixture{capture: f, seqs: seqs}
+	return failedCheckpointReplayFixture{capture: f, seqs: seqs, targetPath: targetPath}
 }
 
 func seedSemanticPrefixRecovery(
@@ -403,29 +431,32 @@ func seedSemanticPrefixRecovery(
 			{
 				CandidateID:  "semantic-prerequisite",
 				SelectedSeqs: []int64{fixture.seqs[2]},
-				Purpose:      "establish the semantic prerequisite",
+				Purpose:      "define the default value label",
 				Readiness:    ai.IntentCandidateReady,
-				Subject:      "Add semantic prerequisite",
+				Subject:      "Set the default value label",
+				Body:         "- Supply the label used by default value consumers",
 				GroupingReason: "the provider identified this capture as the " +
 					"first independently reviewable intent",
 			},
 			{
 				CandidateID:         "semantic-dependent",
 				SelectedSeqs:        []int64{fixture.seqs[0]},
-				Purpose:             "apply the first dependent change",
+				Purpose:             "add labeled values and the default value helper",
 				Readiness:           ai.IntentCandidateReady,
 				DependsOnCandidates: []string{"semantic-prerequisite"},
-				Subject:             "Apply semantic dependent",
+				Subject:             "Add labeled default values",
+				Body:                "- Resolve the configured label through the value API",
 				GroupingReason: "the provider declared an explicit dependency " +
 					"on the prerequisite intent",
 			},
 			{
 				CandidateID:         "semantic-final",
 				SelectedSeqs:        []int64{fixture.seqs[1]},
-				Purpose:             "complete the semantic change",
+				Purpose:             "use default values in the fixture",
 				Readiness:           ai.IntentCandidateReady,
 				DependsOnCandidates: []string{"semantic-dependent"},
-				Subject:             "Complete semantic change",
+				Subject:             "Use default values in fixtures",
+				Body:                "- Keep the fixture aligned with the labeled value API",
 				GroupingReason: "the provider declared an explicit dependency " +
 					"on the preceding intent",
 			},
@@ -505,20 +536,24 @@ func appendLaterRecoverySnapshots(
 		t.Fatalf("unrelated checkpoint events=%+v", unrelatedEvents)
 	}
 	unrelated = unrelatedEvents[0].Seq
-	bridge := capture(3, map[string]string{
-		"companion_test.go": "package source\n\nconst Companion = 2\n",
-		"source_test.go": "package source\n\n" +
-			"var Want = Value(\"complete\") + 1\n",
-	})
+	bridgeEdits := map[string]string{
+		"companion_test.go": "package source\n\nvar Companion = FixtureValue() + 2\n",
+		fixture.targetPath: "package source\n\n" +
+			"var Want = Value(\"complete\") + FixtureValue()\n",
+	}
+	if fixture.targetPath == "zsource_api.go" {
+		bridgeEdits[fixture.targetPath] = "package source\n\nconst ValueLabel = \"latest\"\n"
+	}
+	bridge := capture(3, bridgeEdits)
 	for _, event := range bridge {
-		if event.Path == "source_test.go" {
+		if event.Path == fixture.targetPath {
 			matching = append(matching, event.Seq)
 		} else {
 			checkpointSibling = append(checkpointSibling, event.Seq)
 		}
 	}
 	continued := capture(4, map[string]string{
-		"companion_test.go": "package source\n\nconst Companion = 3\n",
+		"companion_test.go": "package source\n\nvar Companion = FixtureValue() + 3\n",
 	})
 	checkpointSibling = append(checkpointSibling, continued[0].Seq)
 	if len(matching) != 1 || len(checkpointSibling) != 2 || unrelated == 0 {
@@ -537,6 +572,7 @@ func semanticPrefixReplayOpts(
 	return ReplayOpts{
 		CommitStrategy:             ai.CommitStrategyIntent,
 		IntentPlanner:              planner,
+		IntentIncludeDiffs:         true,
 		IntentPreset:               config.PresetBalanced,
 		IntentBypassBatchWait:      true,
 		IntentWindow:               3,
@@ -568,7 +604,7 @@ UPDATE daemon_meta SET value=? WHERE key='intent.v2.forward_recovery'`,
 }
 
 func TestReplayLocalUnlockWidensResolvedSemanticPrefix(t *testing.T) {
-	fixture := seedFailedCheckpointReplayFixture(t)
+	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
 	_, _ = seedSemanticPrefixRecovery(t, fixture)
@@ -601,7 +637,8 @@ func TestReplayLocalUnlockWidensResolvedSemanticPrefix(t *testing.T) {
 		ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration)
 	if err != nil || !active || marker.PrefixCursor != 2 ||
 		marker.PlanFingerprint != "semantic-prefix-plan-test" {
-		t.Fatalf("first marker=(%+v active=%t err=%v)", marker, active, err)
+		candidates, _ := state.IntentCandidatesForPair(ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, 10)
+		t.Fatalf("first marker=(%+v active=%t err=%v) result=%+v candidates=%+v", marker, active, err, first, candidates)
 	}
 	if first.RecoveryPrefixCandidateCount != 1 ||
 		first.RecoveryPrefixTotalCandidates != 3 {
@@ -654,7 +691,7 @@ func TestReplayLocalUnlockWidensResolvedSemanticPrefix(t *testing.T) {
 }
 
 func TestReplayLocalUnlockStopsAfterFullSemanticPrefixFailure(t *testing.T) {
-	fixture := seedFailedCheckpointReplayFixture(t)
+	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
 	_, _ = seedSemanticPrefixRecovery(t, fixture)
@@ -718,7 +755,7 @@ func TestReplayLocalUnlockStopsAfterFullSemanticPrefixFailure(t *testing.T) {
 func TestSupersedingIntentForwardRecoveryTargetIncludesCompletePathChain(
 	t *testing.T,
 ) {
-	fixture := seedFailedCheckpointReplayFixture(t)
+	fixture := seedSemanticPrefixReplayFixture(t)
 	recovery, _ := seedSemanticPrefixRecovery(t, fixture)
 	matching, siblings, unrelated := appendLaterRecoverySnapshots(t, fixture)
 
@@ -741,7 +778,7 @@ func TestSupersedingIntentForwardRecoveryTargetIncludesCompletePathChain(
 }
 
 func TestReplayFullSemanticPrefixExpandsToLaterCheckpointChain(t *testing.T) {
-	fixture := seedFailedCheckpointReplayFixture(t)
+	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
 	_, _ = seedSemanticPrefixRecovery(t, fixture)
@@ -828,7 +865,7 @@ func TestReplayFullSemanticPrefixExpandsToLaterCheckpointChain(t *testing.T) {
 }
 
 func TestReplayReopensExhaustedRecoveryForLaterCheckpointChain(t *testing.T) {
-	fixture := seedFailedCheckpointReplayFixture(t)
+	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
 	_, _ = seedSemanticPrefixRecovery(t, fixture)
@@ -892,7 +929,7 @@ func TestReplayReopensExhaustedRecoveryForLaterCheckpointChain(t *testing.T) {
 }
 
 func TestReplayResetsStalePrefixAfterCrashPublication(t *testing.T) {
-	fixture := seedFailedCheckpointReplayFixture(t)
+	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
 	recovery, _ := seedSemanticPrefixRecovery(t, fixture)
@@ -901,7 +938,7 @@ func TestReplayResetsStalePrefixAfterCrashPublication(t *testing.T) {
 			recovery.PrefixUnresolvedCount, len(fixture.seqs))
 	}
 
-	mustGitOutput(t, f.dir, "add", "source_test.go")
+	mustGitOutput(t, f.dir, "add", fixture.targetPath)
 	mustGitOutput(t, f.dir, "commit", "-m", "Publish semantic prerequisite")
 	newHead := strings.TrimSpace(mustGitOutput(t, f.dir, "rev-parse", "HEAD"))
 	if _, err := f.db.SQL().ExecContext(ctx, `
@@ -944,7 +981,7 @@ WHERE seq=?`, newHead, fixture.seqs[2]); err != nil {
 }
 
 func TestReplayReplansPartiallyResolvedStoredCandidate(t *testing.T) {
-	fixture := seedFailedCheckpointReplayFixture(t)
+	fixture := seedSemanticPrefixReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
 	recovery, changed, err := state.StartFailedIntentCheckpointRecovery(
@@ -1066,7 +1103,7 @@ func TestReplayReplansInvalidCachedPrefixMarker(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := seedFailedCheckpointReplayFixture(t)
+			fixture := seedSemanticPrefixReplayFixture(t)
 			f := fixture.capture
 			ctx := context.Background()
 			recovery, _ := seedSemanticPrefixRecovery(t, fixture)
@@ -1212,7 +1249,7 @@ INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,1)`,
 	headBefore := f.cctx.BaseHead
 	result, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
-		IntentPlanner: planner, IntentPreset: config.PresetBalanced,
+		IntentPlanner: planner, IntentIncludeDiffs: true, IntentPreset: config.PresetBalanced,
 		IntentBypassBatchWait: true, IntentWindow: 2, IntentMinPending: 1,
 		IntentDeferLimit: 1, IntentRetryLimit: &retryLimit,
 		IntentPathCoalescing:   &pathCoalescing,
@@ -1346,7 +1383,7 @@ func TestReplayFailedCheckpointRecoveryPrecedesFreshCapture(t *testing.T) {
 	pathCoalescing := false
 	result, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
-		IntentPlanner: planner, IntentPreset: config.PresetBalanced,
+		IntentPlanner: planner, IntentIncludeDiffs: true, IntentPreset: config.PresetBalanced,
 		IntentBypassBatchWait: true, IntentWindow: 2, IntentMinPending: 1,
 		IntentDeferLimit: 1, IntentRetryLimit: &retryLimit,
 		IntentPathCoalescing:   &pathCoalescing,
@@ -1415,7 +1452,7 @@ func TestReplayFailedCheckpointRecoveryWaitsForPathQuiescence(t *testing.T) {
 	pathCoalescing := false
 	result, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
-		IntentPlanner: planner, IntentPreset: config.PresetBalanced,
+		IntentPlanner: planner, IntentIncludeDiffs: true, IntentPreset: config.PresetBalanced,
 		IntentBypassBatchWait: true, IntentWindow: 2, IntentMinPending: 1,
 		IntentDeferLimit: 1, IntentRetryLimit: &retryLimit,
 		IntentPathCoalescing:       &pathCoalescing,
@@ -1468,7 +1505,7 @@ func TestReplayFailedCheckpointRecoveryWaitsForEveryTargetPath(t *testing.T) {
 	fixture := seedFailedCheckpointReplayFixture(t)
 	f := fixture.capture
 	ctx := context.Background()
-	now = now.Add(31 * time.Second)
+	now = now.Add(5*time.Minute + time.Second)
 	RecordPathWrite("source_test.go", now)
 
 	planner := &failedCheckpointRecoveryPlanner{
@@ -1491,7 +1528,7 @@ func TestReplayFailedCheckpointRecoveryWaitsForEveryTargetPath(t *testing.T) {
 	pathCoalescing := false
 	opts := ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
-		IntentPlanner: planner, IntentPreset: config.PresetBalanced,
+		IntentPlanner: planner, IntentIncludeDiffs: true, IntentPreset: config.PresetBalanced,
 		IntentBypassBatchWait: true, IntentWindow: 2, IntentMinPending: 1,
 		IntentDeferLimit: 1, IntentRetryLimit: &retryLimit,
 		IntentPathCoalescing:   &pathCoalescing,
@@ -1532,7 +1569,7 @@ func TestReplayFailedCheckpointRecoveryWaitsForEveryTargetPath(t *testing.T) {
 		}
 	}
 
-	now = now.Add(31 * time.Second)
+	now = now.Add(5*time.Minute + time.Second)
 	settled, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil {
 		t.Fatalf("Replay settled target: %v", err)
