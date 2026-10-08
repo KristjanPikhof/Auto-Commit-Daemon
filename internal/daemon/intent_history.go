@@ -235,7 +235,7 @@ func allocateIntentEvidenceDiffs(raw []string, budget int) []string {
 	order := make([]int, len(raw))
 	for i, diff := range raw {
 		order[i] = i
-		limits[i] = min(len(diff), 256, max(0, budget))
+		limits[i] = min(len(diff), 512, max(0, budget))
 		budget -= limits[i]
 	}
 	sort.SliceStable(order, func(i, j int) bool { return len(raw[order[i]]) < len(raw[order[j]]) })
@@ -245,9 +245,39 @@ func allocateIntentEvidenceDiffs(raw []string, budget int) []string {
 		budget -= extra
 	}
 	for i, limit := range limits {
-		result[i] = ai.Truncate(raw[i], limit)
+		result[i] = truncateIntentEvidenceDiff(raw[i], limit)
 	}
 	return result
+}
+
+// Keep witnessed references and early declarations as well as late corrections.
+// Generic message clipping retains metadata and the tail, which can erase every
+// relationship in a large captured change. Never create a partial code witness.
+func truncateIntentEvidenceDiff(diff string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(diff) <= limit {
+		return diff
+	}
+	const marker = "\n... <truncated> ...\n"
+	if limit <= len(marker) {
+		return ""
+	}
+	headLimit := (limit - len(marker)) / 2
+	head := diff[:headLimit]
+	if end := strings.LastIndexByte(head, '\n'); end >= 0 {
+		head = head[:end+1]
+	} else {
+		head = ""
+	}
+	tail := diff[len(diff)-(limit-len(head)-len(marker)):]
+	if start := strings.IndexByte(tail, '\n'); start >= 0 {
+		tail = tail[start+1:]
+	} else {
+		tail = ""
+	}
+	return head + marker + tail
 }
 
 func stateHistoryUnit(unit git.IntentHistoryUnit) state.IntentHistoryUnit {

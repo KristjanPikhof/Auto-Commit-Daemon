@@ -49,8 +49,8 @@ func includeIntentRecordedReferenceContext(diff, references string) string {
 		}
 	}
 	if references == "" {
-		return ai.Truncate(ai.RedactDiffSecrets(diff), ai.IntentStageDiffCap)
+		return truncateIntentEvidenceDiff(ai.RedactDiffSecrets(diff), ai.IntentStageDiffCap)
 	}
 	header := ai.RedactDiffSecrets(prefix + references + separator)
-	return header + ai.Truncate(ai.RedactDiffSecrets(diff), max(0, ai.IntentStageDiffCap-len(header)))
+	return header + truncateIntentEvidenceDiff(ai.RedactDiffSecrets(diff), max(0, ai.IntentStageDiffCap-len(header)))
 }

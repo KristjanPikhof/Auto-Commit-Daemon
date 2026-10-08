@@ -79,3 +79,28 @@ func TestIntentHistoryDiffBudgetKeepsCompanionsComplete(t *testing.T) {
 		t.Fatalf("diff budget exceeded: %d", total)
 	}
 }
+
+func TestIntentHistoryDiffBudgetRetainsReferencesAndCorrections(t *testing.T) {
+	t.Parallel()
+	const reference = " python3 scripts/helper.py\n"
+	const correction = "+workers = 2\n"
+	evidence := "Recorded post-image references:\n" + reference + "\nRecorded diff:\n+func ChangedProducer() {}\n" +
+		strings.Repeat("+long changed implementation\n", 1000) + correction
+	raw := make([]string, 148)
+	for i := range raw {
+		raw[i] = evidence
+	}
+	total := 0
+	for _, diff := range allocateIntentEvidenceDiffs(raw, ai.HistoryRewriteTotalDiffCap) {
+		total += len(diff)
+		if !strings.Contains(diff, reference) || !strings.Contains(diff, correction) {
+			t.Fatal("large history discarded its source relationship or late correction")
+		}
+	}
+	if total > ai.HistoryRewriteTotalDiffCap {
+		t.Fatalf("history evidence budget exceeded: %d", total)
+	}
+	if diff := truncateIntentEvidenceDiff(evidence, 0); diff != "" {
+		t.Fatal("zero remaining budget emitted unbounded evidence")
+	}
+}
