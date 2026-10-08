@@ -22,6 +22,19 @@ type publicationOutcome struct {
 	RetryAt               float64 `json:"retry_at,omitempty"`
 }
 
+// Build completed membership once. A correlated EXISTS can make SQLite scan
+// every completed checkpoint again for each capture in a large history.
+const publicationOutcomeSelectSQL = `
+SELECT COALESCE(SUM(CASE WHEN state='published' AND branch_ref=? AND branch_generation=? THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN state='recovered' THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN state NOT IN ('published','recovered') AND branch_ref=? AND branch_generation=? THEN 1 ELSE 0 END),0)
+FROM capture_events e
+WHERE e.seq IN (
+    SELECT ce.event_seq
+    FROM checkpoint_events ce JOIN checkpoints cp ON cp.id=ce.checkpoint_id
+    WHERE cp.phase='completed'
+)`
+
 func readPublicationOutcome(ctx context.Context, db *sql.DB, protected bool, repo string) (publicationOutcome, error) {
 	branch, generation, known, err := currentWorktreeReplayPair(ctx, db, repo)
 	if err != nil {
@@ -34,13 +47,7 @@ func readPublicationOutcome(ctx context.Context, db *sql.DB, protected bool, rep
 // of starting the same Git processes again for every repository row.
 func readPublicationOutcomeForPair(ctx context.Context, db *sql.DB, protected bool, repo, branch string, generation int64, known bool) (publicationOutcome, error) {
 	var result publicationOutcome
-	err := db.QueryRowContext(ctx, `
-SELECT COALESCE(SUM(CASE WHEN state='published' AND branch_ref=? AND branch_generation=? THEN 1 ELSE 0 END),0),
-       COALESCE(SUM(CASE WHEN state='recovered' THEN 1 ELSE 0 END),0),
-       COALESCE(SUM(CASE WHEN state NOT IN ('published','recovered') AND branch_ref=? AND branch_generation=? THEN 1 ELSE 0 END),0)
-FROM capture_events e
-WHERE EXISTS (SELECT 1 FROM checkpoint_events ce JOIN checkpoints cp ON cp.id=ce.checkpoint_id
-              WHERE ce.event_seq=e.seq AND cp.phase='completed')`, branch, generation, branch, generation).Scan(
+	err := db.QueryRowContext(ctx, publicationOutcomeSelectSQL, branch, generation, branch, generation).Scan(
 		&result.BranchChanges, &result.RecoveredChanges, &result.WaitingChanges)
 	if err != nil {
 		return result, fmt.Errorf("publication outcome: %w", err)
