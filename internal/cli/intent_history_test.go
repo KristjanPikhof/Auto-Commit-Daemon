@@ -248,17 +248,26 @@ func TestIntentHistoryApplyUsesCanonicalWorkerSocketAndWake(t *testing.T) {
 }
 
 func TestIntentHistoryApplyRejectsUnprovedWorkerWithoutWrites(t *testing.T) {
-	for _, scenario := range []string{"absent_socket", "different_pid", "different_repository", "not_ready", "older_schema"} {
+	repo, db, plan, lookup := intentHistoryApplyFixture(t)
+	assertRejected := func(t *testing.T, repo string, db *state.DB, plan state.IntentHistoryPlan, wantVersion int) {
+		t.Helper()
+		var out bytes.Buffer
+		if err := applyIntentHistoryPlan(context.Background(), &out, repo, plan, false); err == nil || !strings.Contains(err.Error(), "worker") {
+			t.Fatalf("unproved owner accepted: %v", err)
+		}
+		if _, ok, err := state.LoadIntentHistoryRequest(context.Background(), db); err != nil || ok {
+			t.Fatalf("unproved owner received request: ok=%v err=%v", ok, err)
+		}
+		if _, ok, err := state.LoadIntentHistoryPlan(context.Background(), db, plan.ID); err != nil || ok {
+			t.Fatalf("unproved owner saved plan: ok=%v err=%v", ok, err)
+		}
+		if version, err := db.UserVersion(context.Background()); err != nil || version != wantVersion {
+			t.Fatalf("schema changed: %d %v", version, err)
+		}
+	}
+	for _, scenario := range []string{"absent_socket", "different_pid", "different_repository", "not_ready"} {
 		t.Run(scenario, func(t *testing.T) {
-			repo, db, plan, lookup := intentHistoryApplyFixture(t)
-			wantVersion := state.SchemaVersion
-			if scenario == "older_schema" {
-				wantVersion = 29
-				if _, err := db.SQL().ExecContext(context.Background(), "PRAGMA user_version=29"); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if scenario != "absent_socket" && scenario != "older_schema" {
+			if scenario != "absent_socket" {
 				ready := supervisor.WorkerReadiness{RepositoryID: lookup.Record.RepositoryID, PID: os.Getpid(), Ready: true}
 				switch scenario {
 				case "different_pid":
@@ -270,47 +279,49 @@ func TestIntentHistoryApplyRejectsUnprovedWorkerWithoutWrites(t *testing.T) {
 				}
 				serveIntentHistoryWorker(t, lookup, historyReadinessFixture{ready: ready})
 			}
-			var out bytes.Buffer
-			if err := applyIntentHistoryPlan(context.Background(), &out, repo, plan, false); err == nil || !strings.Contains(err.Error(), "worker") {
-				t.Fatalf("unproved owner accepted: %v", err)
-			}
-			if _, ok, err := state.LoadIntentHistoryRequest(context.Background(), db); err != nil || ok {
-				t.Fatalf("unproved owner received request: ok=%v err=%v", ok, err)
-			}
-			if _, ok, err := state.LoadIntentHistoryPlan(context.Background(), db, plan.ID); err != nil || ok {
-				t.Fatalf("unproved owner saved plan: ok=%v err=%v", ok, err)
-			}
-			if version, err := db.UserVersion(context.Background()); err != nil || version != wantVersion {
-				t.Fatalf("schema changed: %d %v", version, err)
-			}
+			assertRejected(t, repo, db, plan, state.SchemaVersion)
 		})
 	}
+	t.Run("older_schema", func(t *testing.T) {
+		repo, db, plan, _ := intentHistoryApplyFixture(t)
+		if _, err := db.SQL().ExecContext(context.Background(), "PRAGMA user_version=29"); err != nil {
+			t.Fatal(err)
+		}
+		assertRejected(t, repo, db, plan, 29)
+	})
 }
 
 func TestIntentHistoryCompletedApplyProvesExistingTarget(t *testing.T) {
+	repo, db, plan, _ := intentHistoryApplyFixture(t)
+	ctx := context.Background()
+	replacements, err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := git.ApplyIntentHistoryReconstruction(ctx, repo, git.IntentHistoryReconstructionOptions{
+		SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead,
+		OldChain: plan.SourceChain, Replacements: replacements, PlanID: plan.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := state.IntentHistoryRequest{PlanID: plan.ID, Status: "completed", NewHead: result.NewHead, BackupRef: result.BackupRef}
+	if err := state.SaveIntentHistoryRequest(ctx, db, request); err != nil {
+		t.Fatal(err)
+	}
+	request, _, err = state.LoadIntentHistoryRequest(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, scenario := range []string{"intact", "deleted", "drifted", "backup_deleted"} {
 		t.Run(scenario, func(t *testing.T) {
-			repo, db, plan, _ := intentHistoryApplyFixture(t)
-			ctx := context.Background()
-			replacements, err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan)
-			if err != nil {
-				t.Fatal(err)
-			}
-			result, err := git.ApplyIntentHistoryReconstruction(ctx, repo, git.IntentHistoryReconstructionOptions{
-				SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead,
-				OldChain: plan.SourceChain, Replacements: replacements, PlanID: plan.ID,
+			t.Cleanup(func() {
+				refs := "update " + plan.TargetBranchRef + " " + result.NewHead + "\nupdate " + result.BackupRef + " " + plan.ExpectedHead + "\n"
+				if _, err := git.Run(ctx, git.RunOpts{Dir: repo, Stdin: strings.NewReader(refs)}, "update-ref", "--stdin"); err != nil {
+					t.Errorf("restore completed fixture refs: %v", err)
+				}
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			request := state.IntentHistoryRequest{PlanID: plan.ID, Status: "completed", NewHead: result.NewHead, BackupRef: result.BackupRef}
-			if err := state.SaveIntentHistoryRequest(ctx, db, request); err != nil {
-				t.Fatal(err)
-			}
-			request, _, err = state.LoadIntentHistoryRequest(ctx, db)
-			if err != nil {
-				t.Fatal(err)
-			}
+			var err error
 			switch scenario {
 			case "deleted":
 				_, err = git.Run(ctx, git.RunOpts{Dir: repo}, "update-ref", "-d", plan.TargetBranchRef)
