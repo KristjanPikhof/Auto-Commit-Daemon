@@ -101,6 +101,71 @@ func TestIntentSemanticRetryPrunesOnlyExpiredSupersededCooldowns(t *testing.T) {
 	}
 }
 
+func TestIntentSemanticRetryDueSelectionSkipsTerminalRecordsBeforeLimit(t *testing.T) {
+	ctx := context.Background()
+	db := openIntentCandidateTestDB(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	terminal := appendIntentCandidateCapture(t, db, "completed.md", "create", "", "completed")
+	held := appendIntentCandidateCapture(t, db, "SpeechEngine.swift", "modify", "before", "after")
+	fresh := appendIntentCandidateCapture(t, db, "release.md", "create", "", "release checks")
+	if _, err := db.SQL().ExecContext(ctx, "UPDATE capture_events SET state='published' WHERE seq=?", terminal.Event.Seq); err != nil {
+		t.Fatal(err)
+	}
+	saveWaitingIntentCandidate(t, db, "held-recognition", float64(now.Unix()), held)
+	values := make(map[string]string)
+	for i := 1; i <= state.IntentCandidateMaxOpenPerPair+2; i++ {
+		member, retryAt := terminal.Event.Seq, now.Add(-2*time.Hour)
+		if i == state.IntentCandidateMaxOpenPerPair+2 {
+			member, retryAt = held.Event.Seq, now.Add(-time.Minute)
+		}
+		fingerprint := fmt.Sprintf("sha256:%064x", i)
+		run, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
+			Fingerprint: fingerprint, BranchRef: "refs/heads/main", BranchGeneration: 1, AttemptLimit: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run.UnresolvedSeqs = []int64{member}
+		run.Completed = true
+		run.ProgressState = sql.NullString{String: "waiting_semantic_retry", Valid: true}
+		run.ResolutionMode = run.ProgressState
+		if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(IntentSemanticRetrySnapshot{
+			Version: 1, BranchRef: run.BranchRef, BranchGeneration: run.BranchGeneration,
+			EvidenceFingerprint: fingerprint, PlanFingerprint: fingerprint, RetryAtTS: intentPlannerHealthTimestamp(retryAt),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		values[intentSemanticRetryKey(fingerprint)] = string(raw)
+	}
+	if err := state.MetaSetMany(ctx, db, values); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := state.PendingEvents(ctx, db, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, forced, reason, err := selectIntentWindow(ctx, db, pending, intentReplayConfig{
+		candidateMode: true, window: 1, bypassBatchWait: true, deferLimit: 10,
+	})
+	if err != nil || forced || reason != "" || len(window) != 1 || window[0].Seq != held.Event.Seq {
+		t.Fatalf("terminal cooldowns hid due goal behind fresh capture %d: window=%+v forced=%t reason=%s err=%v", fresh.Event.Seq, window, forced, reason, err)
+	}
+	var plans, cooldowns int
+	if err := db.SQL().QueryRowContext(ctx, "SELECT count(*) FROM intent_plan_runs").Scan(&plans); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SQL().QueryRowContext(ctx, "SELECT count(*) FROM daemon_meta WHERE key LIKE ?", MetaKeyIntentSemanticRetry+".%").Scan(&cooldowns); err != nil {
+		t.Fatal(err)
+	}
+	if plans != 130 || cooldowns != 130 {
+		t.Fatalf("read-only selection deleted durable provenance: plans=%d cooldowns=%d", plans, cooldowns)
+	}
+}
+
 func restoredSemanticPlan() ai.IntentPlanV2 {
 	return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
