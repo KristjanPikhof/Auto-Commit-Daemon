@@ -184,11 +184,19 @@ func TestIntentHistoryReconstructionRejectsCrossAuthorGoal(t *testing.T) {
 	repo, opts, _, _ := intentHistoryMixedFixture(t)
 	ctx := context.Background()
 	other, err := CommitTreeWithIdentity(ctx, repo, opts.Replacements[1].TreeOID, "Another author's correction", "Other Author", "other@example.com", opts.OldChain[0])
-	if err != nil { t.Fatal(err) }
-	if err := UpdateRef(ctx, repo, opts.SourceBranchRef, other, opts.ExpectedHead); err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateRef(ctx, repo, opts.SourceBranchRef, other, opts.ExpectedHead); err != nil {
+		t.Fatal(err)
+	}
 	opts.ExpectedHead = other
 	opts.OldChain[1] = other
 	opts.Replacements[0].Replaces[1] = other
-	if _, err := ApplyIntentHistoryReconstruction(ctx, repo, opts); err == nil || !strings.Contains(err.Error(), "author boundary") { t.Fatalf("cross-author goal err=%v", err) }
-	if _, err := RevParse(ctx, repo, opts.TargetBranchRef); !errors.Is(err, ErrRefNotFound) { t.Fatal("cross-author goal created a branch") }
+	if _, err := ApplyIntentHistoryReconstruction(ctx, repo, opts); err == nil || !strings.Contains(err.Error(), "author boundary") {
+		t.Fatalf("cross-author goal err=%v", err)
+	}
+	if _, err := RevParse(ctx, repo, opts.TargetBranchRef); !errors.Is(err, ErrRefNotFound) {
+		t.Fatal("cross-author goal created a branch")
+	}
 }
