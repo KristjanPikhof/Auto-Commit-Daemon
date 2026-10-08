@@ -31,11 +31,11 @@ func (p *reconnectingIntentPlanner) PlanIntentV2(_ context.Context, req ai.Inten
 	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}
 	for _, capture := range req.OfferedCaptures {
 		plan.Candidates = append(plan.Candidates, ai.IntentCandidateAssignment{
-			CandidateID: fmt.Sprintf("document-offline-capture-%d", capture.Seq),
+			CandidateID:  fmt.Sprintf("document-offline-capture-%d", capture.Seq),
 			SelectedSeqs: []int64{capture.Seq}, Readiness: ai.IntentCandidateReady,
-			Purpose: "document continued capture during a provider outage",
-			Subject: "Document continued offline capture",
-			Body: "- Explain how saved work survives a temporary provider outage",
+			Purpose:        "document continued capture during a provider outage",
+			Subject:        "Document continued offline capture",
+			Body:           "- Explain how saved work survives a temporary provider outage",
 			GroupingReason: "this document independently explains offline capture",
 		})
 	}
