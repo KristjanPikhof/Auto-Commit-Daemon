@@ -2621,7 +2621,7 @@
   },
   "_measurement": {
     "aggregation": "maximum observed completed top-level duration in seconds; subtests excluded",
-    "core_source": "October 8 completed top-level race cases and focused remainder runs; GOMAXPROCS=2; local case parallelism=2; parallel tests observed from Go pause events",
+    "core_source": "Completed October 8 top-level race cases and focused remainder runs; parallel-aware local gate passed with GOMAXPROCS=2, three core shards, and case parallelism=2",
     "date": "2026-10-08",
     "integration_current": "September 15 baseline: 115 current targets; all pass in complete nonoverlapping full shards; verified function-only WrongFormat rename mapped; zero skips; benchmark enabled",
     "integration_current_serial_seconds": 681.352,
@@ -2656,8 +2656,8 @@
     "integration_serial_seconds": 613.402,
     "integration_shards": 4,
     "integration_test_budget_seconds": 180,
-    "local_gate_result": "No assertion failures; one daemon shard exceeded its timeout with four remaining cases",
-    "local_gate_wall_seconds": 286,
+    "local_gate_result": "passed; all core, support, and timing-sensitive cases retained; lint and runner regressions passed",
+    "local_gate_wall_seconds": 258,
     "platform": "darwin/arm64",
     "sources": [
       "tagged integration baseline (parallel=2, race harness)",
