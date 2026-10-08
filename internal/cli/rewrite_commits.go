@@ -53,6 +53,7 @@ type rewriteCommitsOptions struct {
 	noReview     bool
 	planOnly     bool
 	messagesOnly bool
+	newBranch    string
 	editFormat   string
 	progress     string
 	progressTo   io.Writer
@@ -93,6 +94,11 @@ editing, or applying a saved plan does not create a new AI request.
 
 New plans group adjacent commits by intent. Use --messages-only to keep one
 output commit for each selected commit.
+
+Use --new-branch NAME to reconstruct complete goals from recorded path versions.
+This can split mixed commits and regroup interleaved work. The original branch
+is preserved. An active ACD worker verifies and applies the saved plan while
+capture protection continues.
 
 Use --edit with a saved plan ID or file to review messages in $EDITOR. Editing a
 saved plan ID creates a new revision; editing a standalone plan file updates
@@ -137,6 +143,7 @@ Progress is written to stderr so stdout stays usable for command results and
 	cmd.Flags().BoolVar(&opts.noReview, "no-review", false, "Skip the review/edit prompt and leave proposed messages unchanged")
 	cmd.Flags().BoolVar(&opts.planOnly, "plan-only", false, "Generate or edit and save the rewrite plan without prompting to apply")
 	cmd.Flags().BoolVar(&opts.messagesOnly, "messages-only", false, "Keep one output commit per selected commit instead of grouping by intent")
+	cmd.Flags().StringVar(&opts.newBranch, "new-branch", "", "Reconstruct complete goals onto a new branch while preserving the original")
 	cmd.Flags().StringVar(&opts.progress, "progress", string(rewriteProgressModeAuto), "Progress output mode: auto, plain, json, or off")
 	cmd.Flags().StringVar(&opts.editFormat, "format", rewriteEditFormatText, "Review edit format: text or json")
 	cmd.Flags().StringVar(&opts.selection.From, "from", "", "Compatibility selector: select from commit-ish or 1-based position through HEAD; prefer --from-sha or --from-nr")
@@ -159,9 +166,28 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		return err
 	}
 	if opts.showPlan != "" {
+		if plan, ok, err := readIntentHistoryPlanRef(ctx, repoFlag, opts.showPlan); err == nil && ok {
+			if jsonOut { return json.NewEncoder(out).Encode(plan) }
+			printIntentHistoryPlan(out, plan)
+			if repo, err := resolveRepo(repoFlag); err == nil {
+				if dbPath, err := rewriteStateDBPath(ctx, repo); err == nil {
+					if db, err := state.OpenReadOnly(ctx, dbPath); err == nil {
+						defer db.Close()
+						if request, ok, _ := state.LoadIntentHistoryRequest(ctx, db); ok && request.PlanID == plan.ID { fmt.Fprintf(out, "Worker status: %s\n%s\n", request.Status, request.Error) }
+					}
+				}
+			}
+			return nil
+		}
 		return showSavedRewritePlan(ctx, out, repoFlag, opts.showPlan, jsonOut)
 	}
 	if opts.applyPlan != "" {
+		if repo, err := resolveRepo(repoFlag); err == nil {
+			if plan, ok, err := readIntentHistoryPlanRef(ctx, repo, opts.applyPlan); err == nil && ok {
+				if !opts.yes && !opts.dryRun { return errors.New("acd history rewrite: --apply requires --yes or --dry-run") }
+				return applyIntentHistoryPlan(ctx, out, repo, plan, opts.dryRun)
+			}
+		}
 		return applySavedRewritePlan(ctx, out, repoFlag, opts)
 	}
 	if opts.editPlan != "" {
@@ -184,7 +210,7 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 		RecreateUnchanged: selection.RecreateUnchanged,
 		SelectedPositions: fmt.Sprintf("%d-%d", selection.SelectedNewestIndex, selection.SelectedOldestIndex),
 	}
-	if jsonOut {
+	if jsonOut && opts.newBranch == "" {
 		if err := progress.Emit(rewriteProgressEvent{
 			Phase:   "selection",
 			Message: fmt.Sprintf("selected %d commit(s)", len(report.Selected)),
@@ -211,6 +237,10 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 	}
 	if err := ai.CheckHistoryRewritePlanGenerationGate(providerResolution.Config, provider, opts.messagesOnly); err != nil {
 		return rewriteProviderGateError(err, providerResolution, repo)
+	}
+	if opts.newBranch != "" {
+		if opts.messagesOnly { return errors.New("acd history rewrite: --new-branch and --messages-only cannot be combined") }
+		return generateIntentHistoryPlan(ctx, out, repo, selection, opts, provider, providerResolution.Config)
 	}
 	if err := progress.Emit(rewriteProgressEvent{
 		Phase:   "selection",

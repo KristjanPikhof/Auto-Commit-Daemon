@@ -3122,7 +3122,7 @@ func Run(ctx context.Context, opts Options) error {
 							},
 						}
 						evaluationCtx = context.WithValue(evaluationCtx, publicationEvaluationKey{}, evaluation)
-						repSum, repErr = replay(evaluationCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+						replayOptions := ReplayOpts{
 							MessageFn:                  passBundle.MessageFn,
 							GitDir:                     opts.GitDir,
 							Trace:                      tracer,
@@ -3155,7 +3155,17 @@ func Run(ctx context.Context, opts Options) error {
 							SelfPublicationCheckpoint:  opts.selfPublicationCheckpoint,
 							RequireCompletedCheckpoint: true,
 							PublicationDrain:           activeDrain,
-						})
+						}
+						historyHandled, historyErr := ProcessIntentHistoryRequest(evaluationCtx, opts.RepoPath, opts.DB, passBundle)
+						if historyHandled {
+							repSum = ReplaySummary{BaseHead: cctx.BaseHead, Skipped: true, SkippedReason: "history_reconstruction", Disposition: ReplayDispositionProgress}
+							repErr = historyErr
+						} else if historyErr != nil {
+							repErr = historyErr
+						} else {
+							repSum, repErr = replay(evaluationCtx, opts.RepoPath, opts.DB, cctx, replayOptions)
+						}
+
 						if evaluationCtx.Err() != nil && passCtx.Err() == nil {
 							evaluationFollowup = true
 							repSum.Disposition = ReplayDispositionTransientWait
