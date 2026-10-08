@@ -29,6 +29,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -98,6 +99,7 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "capture-protection.md", "pending", 5*time.Second)
+	frozenSeq := sqliteScalar(t, dbPath, "SELECT seq FROM capture_events WHERE path='capture-protection.md' AND state='pending' ORDER BY seq DESC LIMIT 1")
 	if headAfterWake := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfterWake != headBefore {
 		t.Fatalf("wake-only drain bypassed intent batch gate: HEAD=%s want %s", headAfterWake, headBefore)
 	}
@@ -122,6 +124,30 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+	if !advanced {
+		// A slow final Git observation can miss a commit that already met the
+		// deadline. git_applied_ts is generated after the literal branch CAS;
+		// the capture and completion timestamps are not valid deadline proof.
+		head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+		if head != headBefore {
+			query := fmt.Sprintf(`SELECT EXISTS(
+SELECT 1 FROM self_publications publication
+JOIN self_publication_members member ON member.publication_id=publication.id
+JOIN capture_events capture ON capture.seq=member.event_seq
+WHERE publication.source_head=%s AND publication.target_commit_oid=%s
+ AND publication.branch_ref='refs/heads/main' AND publication.member_count=1
+ AND member.event_seq=%s AND capture.path='capture-protection.md'
+ AND capture.branch_ref=publication.branch_ref
+ AND capture.branch_generation=publication.branch_generation
+ AND publication.phase IN ('git_applied','completed')
+ AND publication.git_applied_ts>=%.9f AND publication.git_applied_ts<=%.9f
+)`, sqliteQuote(headBefore), sqliteQuote(head), frozenSeq, float64(flushStart.UnixNano())/1e9, float64(deadline.UnixNano())/1e9)
+			if sqliteScalar(t, dbPath, query) == "1" {
+				advanced = true
+				t.Logf("post-CAS journal proves HEAD advanced within 2s; observation took %s", time.Since(flushStart))
+			}
+		}
 	}
 	if !advanced {
 		diagnostic := sqliteExec(t, dbPath, `SELECT id,status,purpose,atomicity_summary FROM intent_candidates; SELECT fingerprint,resolution_mode,progress_state FROM intent_plan_runs;`)
