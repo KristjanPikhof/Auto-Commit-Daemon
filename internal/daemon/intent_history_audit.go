@@ -128,7 +128,8 @@ ORDER BY candidate.id LIMIT 1`, oid, cctx.BranchRef, cctx.BranchGeneration, now)
 		pathList = append(pathList, path)
 	}
 	sort.Strings(pathList)
-	eligible, err := git.CheckIntentRepairEligibility(ctx, repoRoot, git.IntentRepairEligibilityOptions{BranchRef: cctx.BranchRef, ExpectedHead: head, Commits: owned, Paths: pathList, MaxCommits: limit})
+	eligibility := git.IntentRepairEligibilityOptions{BranchRef: cctx.BranchRef, ExpectedHead: head, Commits: owned, Paths: pathList, MaxCommits: limit}
+	eligible, err := git.CheckIntentRepairEligibility(ctx, repoRoot, eligibility)
 	if err != nil {
 		return IntentRepairResult{}, err
 	}
@@ -208,7 +209,31 @@ ORDER BY candidate.id LIMIT 1`, oid, cctx.BranchRef, cctx.BranchGeneration, now)
 	if len(history.Goals) == 0 || len(history.Goals) > limit {
 		return finish("quality_audit_goal_limit")
 	}
-	candidates, repairPlan, err := intentHistoryAuditRepairPlan(ctx, db, cctx, history, fingerprint, opts, pathList)
+	// A provider may take longer than the remaining private repair horizon.
+	// Its eventual answer cannot extend consent to rewrite that old suffix.
+	var minimumDeadline float64
+	for _, commit := range owned {
+		var deadline float64
+		if err := db.ReadSQL().QueryRowContext(ctx, `SELECT soft_publication_deadline FROM intent_candidates WHERE id=? AND branch_ref=? AND branch_generation=? AND status='soft_published'`, commit.CandidateID, cctx.BranchRef, cctx.BranchGeneration).Scan(&deadline); err == sql.ErrNoRows {
+			return finish("repair_horizon_expired")
+		} else if err != nil {
+			return IntentRepairResult{}, err
+		}
+		if deadline <= float64(time.Now().UnixNano())/1e9 {
+			return finish("repair_horizon_expired")
+		}
+		if minimumDeadline == 0 || deadline < minimumDeadline {
+			minimumDeadline = deadline
+		}
+	}
+	eligible, err = git.CheckIntentRepairEligibility(ctx, repoRoot, eligibility)
+	if err != nil {
+		return IntentRepairResult{}, err
+	}
+	if !eligible.Eligible {
+		return finish(eligible.Reason)
+	}
+	candidates, repairPlan, err := intentHistoryAuditRepairPlan(ctx, db, cctx, history, fingerprint, record.Attempts, minimumDeadline, opts, pathList)
 	if err != nil {
 		return finish("quality_audit_capture_evidence_incomplete")
 	}
@@ -224,6 +249,9 @@ ORDER BY candidate.id LIMIT 1`, oid, cctx.BranchRef, cctx.BranchGeneration, now)
 		record.Reason = result.Reason
 	}
 	record.NextAttemptTS = 0
+	if result.Status == state.IntentRepairSkipped && (result.Reason == git.IntentRepairReasonStagedOverlap || result.Reason == git.IntentRepairReasonAlternateRef) {
+		record.NextAttemptTS = now + 300
+	}
 	if saveErr := state.MetaSetJSON(ctx, db, metaIntentHistoryAudit, record); saveErr != nil && err == nil {
 		err = saveErr
 	}
@@ -237,8 +265,8 @@ func classifyIntentHistoryAuditFailure(err error) error {
 	return classifyIntentPlannerHealthFailure(err, true)
 }
 
-func intentHistoryAuditRepairPlan(ctx context.Context, db *state.DB, cctx CaptureContext, history state.IntentHistoryPlan, fingerprint string, opts ReplayOpts, paths []string) ([]state.IntentCandidate, IntentRepairPlan, error) {
-	plan := IntentRepairPlan{ID: "audit-" + strings.TrimPrefix(fingerprint, "sha256:")[:24], BranchRef: cctx.BranchRef, BranchGeneration: cctx.BranchGeneration, ExpectedHead: history.ExpectedHead, OldChain: history.SourceChain, Paths: paths, AllowCaptureRepartition: true, ExpectedFinalTree: history.Goals[len(history.Goals)-1].TreeOID, MaxCommits: opts.IntentRepairMaxCommits, VerifyCommit: opts.IntentRepairCommitVerify}
+func intentHistoryAuditRepairPlan(ctx context.Context, db *state.DB, cctx CaptureContext, history state.IntentHistoryPlan, fingerprint string, attempt int, deadline float64, opts ReplayOpts, paths []string) ([]state.IntentCandidate, IntentRepairPlan, error) {
+	plan := IntentRepairPlan{ID: "audit-" + strings.TrimPrefix(fingerprint, "sha256:")[:24] + fmt.Sprintf("-%d", attempt), BranchRef: cctx.BranchRef, BranchGeneration: cctx.BranchGeneration, ExpectedHead: history.ExpectedHead, OldChain: history.SourceChain, Paths: paths, AllowCaptureRepartition: true, ExpectedFinalTree: history.Goals[len(history.Goals)-1].TreeOID, MaxCommits: opts.IntentRepairMaxCommits, VerifyCommit: opts.IntentRepairCommitVerify}
 	unitGoal := map[string]int{}
 	for goalIndex, goal := range history.Goals {
 		for _, i := range goal.Units {
@@ -306,7 +334,6 @@ func intentHistoryAuditRepairPlan(ctx context.Context, db *state.DB, cctx Captur
 			return nil, plan, fmt.Errorf("invalid goal membership")
 		}
 		id := plan.ID + fmt.Sprintf("-%d", index+1)
-		candidates = append(candidates, state.IntentCandidate{ID: id, BranchRef: cctx.BranchRef, BranchGeneration: cctx.BranchGeneration, Status: state.IntentCandidateReady, Purpose: goal.Purpose, Readiness: state.IntentReadinessReady, Events: goalEvents[index], PlannerProtocol: sql.NullString{String: ai.IntentPlannerProtocolV2, Valid: true}})
 		replacement := IntentRepairCandidatePlan{CandidateID: id, TreeOID: goal.TreeOID, Message: goal.Message}
 		old := map[string]struct{}{}
 		for _, i := range goal.Units {
@@ -320,6 +347,7 @@ func intentHistoryAuditRepairPlan(ctx context.Context, db *state.DB, cctx Captur
 		for _, event := range goalEvents[index] {
 			replacement.EventSeqs = append(replacement.EventSeqs, event.EventSeq)
 		}
+		candidates = append(candidates, state.IntentCandidate{ID: id, BranchRef: cctx.BranchRef, BranchGeneration: cctx.BranchGeneration, Status: state.IntentCandidateSoftPublished, Purpose: goal.Purpose, Readiness: state.IntentReadinessReady, Events: goalEvents[index], PlannerProtocol: sql.NullString{String: ai.IntentPlannerProtocolV2, Valid: true}, PublishedCommitOID: sql.NullString{String: replacement.Replaces[len(replacement.Replaces)-1], Valid: true}, SoftPublicationDeadline: sql.NullFloat64{Float64: deadline, Valid: true}})
 		plan.Candidates = append(plan.Candidates, replacement)
 	}
 	return candidates, plan, nil
