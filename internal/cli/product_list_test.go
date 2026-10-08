@@ -215,7 +215,7 @@ func TestProductListLoadsCurrentProviderWait(t *testing.T) {
 	t.Setenv("ACD_AI_TIMEOUT", "1m")
 	ctx := context.Background()
 	repo, dbPath, db := makeRepoStateDB(t)
-	now := time.Now()
+	now := time.Now().Truncate(time.Second)
 	branchRef := "refs/heads/main"
 	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
 		PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(now.Unix()),
@@ -282,6 +282,7 @@ func TestProductListLoadsCurrentProviderWait(t *testing.T) {
 		State:               daemon.IntentPlannerCircuitOpen,
 		ProviderFingerprint: testPlannerHealthFingerprint(),
 		ConsecutiveFailures: 1,
+		NextProbeTS:         float64(now.Add(5 * time.Minute).Unix()),
 	}
 	if err := state.MetaSetJSON(ctx, db, daemon.MetaKeyIntentPlannerHealth, struct {
 		Version int `json:"version"`
@@ -311,6 +312,36 @@ func TestProductListLoadsCurrentProviderWait(t *testing.T) {
 	}, overview, nil)
 	if got := productListStatus(entry); got != "waiting" {
 		t.Fatalf("provider wait status=%q entry=%+v", got, entry)
+	}
+	if progress.WaitRemainingSeconds != 300 || overview.report.PublicationOutcome.RetryAt != health.NextProbeTS || productListPhase(entry) != "provider-wait:5m" {
+		t.Fatalf("list lost persisted retry deadline: progress=%+v outcome=%+v phase=%s", progress, overview.report.PublicationOutcome, productListPhase(entry))
+	}
+	for _, circuit := range []daemon.IntentPlannerCircuitState{
+		daemon.IntentPlannerCircuitOpen, daemon.IntentPlannerCircuitHalfOpen, daemon.IntentPlannerCircuitClosed,
+	} {
+		health.State = circuit
+		if err := state.MetaSetJSON(ctx, db, daemon.MetaKeyIntentPlannerHealth, struct {
+			Version int `json:"version"`
+			daemon.IntentPlannerHealthSnapshot
+		}{Version: 1, IntentPlannerHealthSnapshot: health}); err != nil {
+			t.Fatal(err)
+		}
+		overview, err := readProductListRepo(ctx, record, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		report, err := buildStatusReport(ctx, record, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantRetry := float64(0)
+		if circuit == daemon.IntentPlannerCircuitOpen {
+			wantRetry = health.NextProbeTS
+		}
+		if overview.report.PublicationOutcome.RetryAt != wantRetry || report.PublicationOutcome.RetryAt != wantRetry {
+			t.Fatalf("%s circuit exposed stale retry: list=%f status=%f want=%f", circuit,
+				overview.report.PublicationOutcome.RetryAt, report.PublicationOutcome.RetryAt, wantRetry)
+		}
 	}
 }
 
