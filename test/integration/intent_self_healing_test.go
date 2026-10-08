@@ -154,24 +154,32 @@ func TestIntentWorktreeReliability(t *testing.T) {
 				candidates = append(candidates, nativeReadyIntentCandidate(
 					fmt.Sprintf("flow-%d", i+1), []int64{seq},
 					fmt.Sprintf("Apply flow step %d", i+1),
-					"Preserve the ordered flow update.",
+					"- Preserve the ordered flow update",
 					"ordered same-path capture"))
 			}
 			// Same-path order is a hard edge. Omitting depends_on_candidates
 			// deliberately produces hard_dependency_undeclared; local repair
 			// must add the provable edge without another remote call.
 			writeNativeIntentCandidatesResponse(t, w, "call_hard_edge", candidates)
-		case containsIntentPath(paths, "outside.txt"):
+		case containsIntentPath(paths, "outside.md"):
 			writeNativeIntentCandidatesResponse(t, w, "call_outside", []map[string]any{
-				nativeReadyIntentCandidate("outside", []int64{999999}, "Outside window", "Invalid selection.", "structural reject"),
+				nativeReadyIntentCandidate("outside", []int64{999999}, "Explain recovery boundaries", "- Keep the recovery boundary reference complete", "structural reject"),
 			})
-		case containsIntentPath(paths, "forced.txt"):
+		case containsIntentPath(paths, "forced.go"):
+			if containsIntentPath(paths, "forced_test.go") {
+				writeNativeIntentCandidatesResponse(t, w, "call_completed_capture", []map[string]any{
+					nativeReadyIntentCandidate("completed-capture", seqs,
+						"Add completed capture behavior", "- Keep the capture implementation and its test atomic",
+						"the test exercises CompleteCapture from the implementation"),
+				})
+				return
+			}
 			candidates := make([]map[string]any, 0, len(seqs))
 			for _, seq := range seqs {
 				candidates = append(candidates, map[string]any{
 					"candidate_id": fmt.Sprintf("forced-%d", seq), "selected_seqs": []int64{seq},
 					"purpose": "wait for an unavailable companion", "readiness": "wait",
-					"missing_companions":    []string{"companion outside the offered window"},
+					"missing_companions":    []string{"forced_test.go"},
 					"depends_on_candidates": []string{}, "subject": "", "body": "",
 					"grouping_reason": "forced-aging deferral fixture",
 				})
@@ -257,17 +265,16 @@ func TestIntentWorktreeReliability(t *testing.T) {
 	}
 	assertIntentCLITruthAgreement(t, ctx, env, repo, true, true)
 
-	// Structural outside-window output must skip correction and fall back in
-	// the same pass. A logical boundary releases the single pending capture.
-	writeFile(t, filepath.Join(repo, "outside.txt"), "outside\n")
+	// Structural outside-window output must skip correction. Captured document
+	// evidence can explain a safe local goal at the logical boundary.
+	writeFile(t, filepath.Join(repo, "outside.md"), "# Recovery boundary reference\n\nKeep protected captures available for a later goal.\n")
 	wakeSession(t, ctx, env, repo, "intent-self-healing")
 	flushIntentBoundary(t, ctx, env, repo)
-	waitForEventState(t, dbPath, "outside.txt", "published", 20*time.Second)
+	waitForEventState(t, dbPath, "outside.md", "published", 20*time.Second)
 
-	// First waiting response persists a candidate. Once age forces the same
-	// capture ready, the second waiting response is forced_capture_deferred
-	// and deterministic fallback must drain it without needs_attention.
-	writeFile(t, filepath.Join(repo, "forced.txt"), "forced\n")
+	// A waiting response persists an incomplete goal. Age cannot publish it
+	// without coverage; the real companion later completes the same goal.
+	writeFile(t, filepath.Join(repo, "forced.go"), "package capture\n\nfunc CompleteCapture() string { return \"protected\" }\n")
 	wakeSession(t, ctx, env, repo, "intent-self-healing")
 	flushIntentBoundary(t, ctx, env, repo)
 	waitFor(t, "forced candidate waiting", 10*time.Second, func() bool {
@@ -275,7 +282,35 @@ func TestIntentWorktreeReliability(t *testing.T) {
 	})
 	time.Sleep(2300 * time.Millisecond)
 	wakeSession(t, ctx, env, repo, "intent-self-healing")
-	waitForEventState(t, dbPath, "forced.txt", "published", 20*time.Second)
+	waitFor(t, "aged incomplete goal remains protected", 10*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE path='forced.go' AND state='pending'") == "1" &&
+			sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE path='forced.go' AND state='published'") == "0"
+	})
+	for _, command := range []string{"status", "list"} {
+		args := []string{command, "--json"}
+		if command == "status" {
+			args = append(args, "--repo", repo)
+		}
+		result := runAcd(t, ctx, env, args...)
+		var payload any
+		if result.ExitCode != 0 || json.Unmarshal([]byte(result.Stdout), &payload) != nil {
+			t.Fatalf("read incomplete-goal %s: %s %s", command, result.Stdout, result.Stderr)
+		}
+		for _, key := range []string{"all_changes_committed_in_git", "checkpoint_published_by_acd"} {
+			if committed, found := findJSONBool(payload, key); !found || committed {
+				t.Fatalf("%s claimed the incomplete goal was published: %s", command, result.Stdout)
+			}
+		}
+	}
+	writeFile(t, filepath.Join(repo, "forced_test.go"), "package capture\n\nimport \"testing\"\n\nfunc TestCompleteCapture(t *testing.T) { if CompleteCapture() != \"protected\" { t.Fatal(CompleteCapture()) } }\n")
+	wakeSession(t, ctx, env, repo, "intent-self-healing")
+	flushIntentBoundary(t, ctx, env, repo)
+	waitForEventState(t, dbPath, "forced.go", "published", 20*time.Second)
+	waitForEventState(t, dbPath, "forced_test.go", "published", 20*time.Second)
+	if implementation, companion := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path='forced.go' ORDER BY seq DESC LIMIT 1"),
+		sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path='forced_test.go' ORDER BY seq DESC LIMIT 1"); implementation == "" || implementation != companion {
+		t.Fatalf("completed capture goal split implementation=%q companion=%q", implementation, companion)
+	}
 
 	if got := plannerCalls.Load(); got > 6 {
 		t.Fatalf("planner calls=%d want <=6 across three bounded phases", got)
@@ -288,7 +323,7 @@ func TestIntentWorktreeReliability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read active planner rejects: %v", err)
 	}
-	for _, code := range []string{"hard_dependency_undeclared", "capture_outside_window", "forced_capture_deferred"} {
+	for _, code := range []string{"hard_dependency_undeclared", "capture_outside_window"} {
 		if !strings.Contains(string(rejectRaw), code) {
 			t.Fatalf("active planner rejects missing %s\n%s", code, rejectRaw)
 		}
