@@ -29,9 +29,9 @@ const (
 )
 
 var intentPlannerCircuitBackoffs = [...]time.Duration{
-	30 * time.Second,
-	2 * time.Minute,
+	5 * time.Minute,
 	10 * time.Minute,
+	time.Hour,
 }
 
 var (

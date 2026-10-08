@@ -110,7 +110,7 @@ func TestIntentPlannerHealthTransportOpensImmediatelyAndBacksOff(t *testing.T) {
 	if snap.State != IntentPlannerCircuitOpen || snap.BackoffLevel != 0 {
 		t.Fatalf("snapshot=%+v want open level 0", snap)
 	}
-	if got, want := snap.NextProbeTS, intentPlannerHealthTimestamp(clock.Now().Add(30*time.Second)); got != want {
+	if got, want := snap.NextProbeTS, intentPlannerHealthTimestamp(clock.Now().Add(5*time.Minute)); got != want {
 		t.Fatalf("next_probe_ts=%f want %f", got, want)
 	}
 	if _, err := health.Acquire(context.Background()); err == nil {
@@ -132,9 +132,9 @@ func TestIntentPlannerHealthTransportOpensImmediatelyAndBacksOff(t *testing.T) {
 		backoff          time.Duration
 		maxProbeFailures int
 	}{
-		{30 * time.Second, &IntentPlannerTransportFailure{Err: errors.New("timeout")}, 1, 2 * time.Minute, 0},
-		{2 * time.Minute, &IntentPlannerValidationFailure{Err: errors.New("invalid selection")}, 2, 10 * time.Minute, 0},
-		{10 * time.Minute, &IntentPlannerTransportFailure{Err: errors.New("still unavailable")}, 2, 10 * time.Minute, 1},
+		{5 * time.Minute, &IntentPlannerTransportFailure{Err: errors.New("timeout")}, 1, 10 * time.Minute, 0},
+		{10 * time.Minute, &IntentPlannerValidationFailure{Err: errors.New("invalid selection")}, 2, time.Hour, 0},
+		{time.Hour, &IntentPlannerTransportFailure{Err: errors.New("still unavailable")}, 2, time.Hour, 1},
 	} {
 		clock.Advance(tc.advance)
 		probe, err := health.Acquire(context.Background())
@@ -186,7 +186,7 @@ func TestIntentPlannerHealthValidationCountsOnlyCompletedMaxProbe(t *testing.T) 
 		}
 	}
 	for attempt, advance := range []time.Duration{
-		30 * time.Second, 2 * time.Minute, 10 * time.Minute,
+		5 * time.Minute, 10 * time.Minute, time.Hour,
 	} {
 		clock.Advance(advance)
 		permit, err := health.Acquire(context.Background())
@@ -260,7 +260,7 @@ func TestIntentPlannerHealthSuccessResetsValidationAndClosesProbe(t *testing.T) 
 
 	permit, _ = health.Acquire(context.Background())
 	_ = health.Complete(context.Background(), permit, &IntentPlannerTransportFailure{Err: errors.New("down")})
-	clock.Advance(30 * time.Second)
+	clock.Advance(5 * time.Minute)
 	probe, err := health.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire half-open: %v", err)
@@ -281,7 +281,7 @@ func TestIntentPlannerHealthExactlyOneHalfOpenLease(t *testing.T) {
 	})
 	permit, _ := health.Acquire(context.Background())
 	_ = health.Complete(context.Background(), permit, &IntentPlannerTransportFailure{Err: errors.New("down")})
-	clock.Advance(30 * time.Second)
+	clock.Advance(5 * time.Minute)
 
 	const callers = 32
 	start := make(chan struct{})
@@ -431,7 +431,7 @@ func TestIntentPlannerHealthCancellationDoesNotMutate(t *testing.T) {
 		t.Fatalf("provider-internal cancellation snapshot=%+v want transport-open", after)
 	}
 
-	clock.Advance(30 * time.Second)
+	clock.Advance(5 * time.Minute)
 	openBefore := health.Snapshot()
 	if _, err := health.Acquire(canceled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled Acquire error=%v", err)
@@ -579,7 +579,7 @@ func TestIntentPlannerHealthCanceledHalfOpenProbeReturnsToOpen(t *testing.T) {
 		t.Fatalf("open circuit: %v", err)
 	}
 	before := health.Snapshot()
-	clock.Advance(30 * time.Second)
+	clock.Advance(5 * time.Minute)
 	probe, err := health.Acquire(context.Background())
 	if err != nil || !probe.halfOpenProbe {
 		t.Fatalf("half-open Acquire permit=%+v err=%v", probe, err)

@@ -1198,7 +1198,7 @@ func TestIntentCandidateEngineCancellationReleasesHalfOpenProbe(t *testing.T) {
 	if opened.State != IntentPlannerCircuitOpen {
 		t.Fatalf("health after transport failure=%+v", opened)
 	}
-	now = now.Add(31 * time.Second)
+	now = now.Add(5 * time.Minute)
 	probeCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -1438,7 +1438,7 @@ func TestIntentCandidateCachedPlanDoesNotAcquireHalfOpenProbe(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	clock.Advance(30 * time.Second)
+	clock.Advance(5 * time.Minute)
 	if _, _, _, _, _, _, run, err := chooseIntentCandidatePlan(
 		ctx, req, planner, health, 0, config.PresetFast, nil, db, input); err != nil {
 		t.Fatal(err)
