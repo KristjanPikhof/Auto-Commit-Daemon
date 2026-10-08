@@ -100,9 +100,9 @@ func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T)
 			plan = map[string]any{
 				"selected_seqs":    seqs,
 				"deferred_seqs":    []int64{},
-				"subject":          "Recovered after retry",
-				"body":             "Composed retry absorbed the first failure.",
-				"grouping_reason":  "second-attempt success",
+				"subject":          "Add composed recovery values",
+				"body":             "- Keep the recovery value producer with its composed consumer",
+				"grouping_reason":  "the recovery consumer uses the new producer",
 				"deferred_reasons": []map[string]any{},
 			}
 		}
@@ -140,9 +140,9 @@ func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T)
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
 	writeFile(t, filepath.Join(repo, "internal/recovery/one.go"),
-		"package recovery\n\nfunc One() {}\n")
+		"package recovery\n\nfunc RecoveryValue() int { return 1 }\n")
 	writeFile(t, filepath.Join(repo, "internal/recovery/two.go"),
-		"package recovery\n\nfunc Two() {}\n")
+		"package recovery\n\nfunc ComposedRecoveryValue() int { return RecoveryValue() + 1 }\n")
 
 	startCount := commitCount(t, repo)
 	resumed := runAcd(t, ctx, fullEnv, "resume", "--repo", repo, "--yes", "--json")
@@ -171,7 +171,7 @@ func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T)
 	if got, want := commitCount(t, repo), startCount+1; got != want {
 		t.Fatalf("commit count=%d want %d (retry must publish single grouped commit)", got, want)
 	}
-	if subj := headSubject(t, repo); subj != "Recovered after retry" {
+	if subj := headSubject(t, repo); subj != "Add composed recovery values" {
 		t.Fatalf("HEAD subject=%q want corrected plan subject", subj)
 	}
 	if plannerHits.Load() != 2 {
