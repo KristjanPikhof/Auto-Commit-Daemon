@@ -196,8 +196,18 @@ func TestRunCheckpointDuringProjectVerification(t *testing.T) {
 			replay: func(passCtx context.Context, repo string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (ReplaySummary, error) {
 				opts.CommitStrategy = ai.CommitStrategyIntent
 				opts.IntentPreset = config.PresetBalanced
-				opts.IntentPlanner = ai.DeterministicProvider{}
+				opts.IntentPlanner = &intentGoalWindowPlanner{intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+					ProtocolVersion: ai.IntentPlannerProtocolV2,
+					Candidates: []ai.IntentCandidateAssignment{{
+						CandidateID: "project-verification", SelectedSeqs: []int64{1},
+						Purpose: "explain approved project verification", Readiness: ai.IntentCandidateReady,
+						Subject:        "Document project verification",
+						Body:           "- Explain how approved checks validate a proposed commit",
+						GroupingReason: "the project verification guide is complete",
+					}},
+				}}}
 				opts.IntentHealth = nil
+				opts.IntentIncludeDiffs = true
 				opts.IntentSettleWindow = -1
 				opts.IntentBypassBatchWait = true
 				opts.IntentVerificationMode = "fast"
@@ -215,7 +225,7 @@ func TestRunCheckpointDuringProjectVerification(t *testing.T) {
 		}
 	})
 	waitForDaemonMode(t, f.db, "running", 3*time.Second)
-	if err := os.WriteFile(filepath.Join(f.dir, "verified.txt"), []byte("verify\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(f.dir, "project-verification.md"), []byte("# Project verification\nRun approved checks against the proposed commit before publication.\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	wake <- struct{}{}
