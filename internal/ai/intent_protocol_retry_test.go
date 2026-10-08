@@ -24,8 +24,16 @@ func TestIntentBaselineMessageWaitDoesNotPreventUrgentProviderRequest(t *testing
 	if err := ValidateIntentPlanV2(req, IntentPlanV2{
 		ProtocolVersion: IntentPlannerProtocolV2,
 		Candidates:      []IntentCandidateAssignment{baseline},
-	}); err == nil || !strings.Contains(err.Error(), "forced_capture_deferred") {
-		t.Fatalf("baseline exemption leaked into final provider validation: %v", err)
+	}); err != nil {
+		t.Fatalf("urgency must retain a valid semantic wait: %v", err)
+	}
+	unfinished := baseline
+	unfinished.Readiness = IntentCandidateReady
+	if err := ValidateIntentPlanV2(req, IntentPlanV2{
+		ProtocolVersion: IntentPlannerProtocolV2,
+		Candidates:      []IntentCandidateAssignment{unfinished},
+	}); err == nil || !strings.Contains(err.Error(), "ready_with_missing_companions") {
+		t.Fatalf("urgency bypassed semantic completeness: %v", err)
 	}
 	resolved := baseline
 	resolved.Purpose = "document continued capture while the provider is offline"
