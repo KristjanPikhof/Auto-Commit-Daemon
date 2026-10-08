@@ -4,8 +4,8 @@
 
 ### Added
 
-- Reconstruct selected history onto a new branch from exact recorded path
-  versions. The active worker checks each proposed goal while later edits keep
+- Add `acd history rewrite --new-branch` to reconstruct selected history from
+  exact recorded path versions. The worker checks each goal while later edits keep
   entering checkpoints. Saved plans preserve the source branch and staging.
 - Audit bounded private ACD history for generic messages while publication is
   idle, with unchanged-evidence caching and full capture lineage for split goals.
