@@ -657,6 +657,14 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 			res.Summary = "ACD is verifying the semantic group. Your work remains protected."
 		}
 		res.NextAction = "No action needed. ACD will continue when verification finishes."
+	case status.PublicationProgress.Phase == "goal_review_wait":
+		res.Health = controlHealthWaiting
+		res.Summary = publicationProgressPhaseLabel(status.PublicationProgress)
+		res.NextAction = "No action needed. ACD keeps capturing and reviews the unresolved goals automatically."
+	case status.PublicationProgress.Phase == "history_reconstruction":
+		res.Health = controlHealthPublishing
+		res.Summary = publicationProgressPhaseLabel(status.PublicationProgress)
+		res.NextAction = "No action needed. Inspect the saved history plan for its result."
 	case status.PublicationProgress.Phase == "provider_call":
 		res.Health = controlHealthPublishing
 		if status.PublicationProgress.Origin == "intent_recovery" {
