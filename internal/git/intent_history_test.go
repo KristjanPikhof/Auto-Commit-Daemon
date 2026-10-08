@@ -297,3 +297,31 @@ func TestIntentHistoryReconstructionIncludesRootCommit(t *testing.T) {
 		t.Fatalf("root recovery=%+v err=%v", recovered, err)
 	}
 }
+
+func TestIntentHistoryMaterializationRejectsCancelledGoal(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	base := commitWorktreePath(t, ctx, repo, "base.txt", "base\n", "Base")
+	added := commitWorktreePath(t, ctx, repo, "temporary.txt", "temporary\n", "Add temporary work")
+	if _, err := Run(ctx, RunOpts{Dir: repo}, "rm", "temporary.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, RunOpts{Dir: repo}, "commit", "-q", "-m", "Cancel temporary work"); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	units, err := ReadIntentHistoryUnits(ctx, repo, []string{added, removed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := RevParse(ctx, repo, base+"^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MaterializeIntentHistoryUnits(ctx, repo, tree, units, [][]IntentHistoryUnit{units}); err == nil || !strings.Contains(err.Error(), "no net change") {
+		t.Fatalf("empty goal created semantic history: %v", err)
+	}
+}

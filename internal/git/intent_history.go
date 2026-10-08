@@ -219,6 +219,7 @@ func MaterializeIntentHistoryUnits(ctx context.Context, repoDir, baseTree string
 		return nil, err
 	}
 	var trees []string
+	previousTree := baseTree
 	for _, group := range groups {
 		for _, unit := range group {
 			entries, err := LsFilesIndex(ctx, repoDir, index, ":(literal)"+unit.Path)
@@ -244,6 +245,10 @@ func MaterializeIntentHistoryUnits(ctx context.Context, repoDir, baseTree string
 		if err != nil {
 			return nil, err
 		}
+		if tree == previousTree {
+			return nil, errors.New("git intent history: proposed goal has no net change")
+		}
+		previousTree = tree
 		trees = append(trees, tree)
 	}
 	return trees, nil
