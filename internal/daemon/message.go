@@ -222,7 +222,7 @@ func BuildOpsDiff(ctx context.Context, repoRoot string, ops []state.CaptureOp) (
 
 // BuildOpsDiffWithCap is the cap-aware variant of BuildOpsDiff. It accepts
 // a per-call byte cap so the intent-planner stage can request its larger
-// IntentStageDiffCap (16 KiB) budget without resurrecting the dead-code
+// IntentStageDiffCap budget without resurrecting the dead-code
 // truncation that the original BuildOpsDiff performed at the legacy 4 KiB
 // per-event DiffCap.
 //
@@ -267,7 +267,7 @@ func BuildOpsDiffWithCap(ctx context.Context, repoRoot string, ops []state.Captu
 
 // cappedDiffBuffer caps appends at the per-call budget supplied to
 // newCappedDiffBuffer. Use BuildOpsDiff for the per-event default and
-// BuildOpsDiffWithCap for the intent-stage 16 KiB budget.
+// BuildOpsDiffWithCap for the larger bounded Intent-stage budget.
 type cappedDiffBuffer struct {
 	buf bytes.Buffer
 	cap int
