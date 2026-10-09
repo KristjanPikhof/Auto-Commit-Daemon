@@ -604,7 +604,8 @@ func sameSupersededIntentMembership(
 // legacy graph builder after soft semantic evidence filled the shared edge
 // budget. The current builder reconstructs active evidence, keeps every hard
 // edge, and prunes only excess soft edges. New hard-cap and cycle failures use
-// distinct errors and remain needs_action.
+// distinct errors and remain needs_action. It also retries a protected target
+// stopped when member reoffering expanded an overdue singleton.
 func RecoverSoftDependencyCapPublicationDrain(
 	ctx context.Context,
 	db *state.DB,
@@ -613,8 +614,9 @@ func RecoverSoftDependencyCapPublicationDrain(
 	now time.Time,
 ) (*state.PublicationDrain, error) {
 	rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT id,last_error FROM publication_drains
-WHERE branch_ref=? AND branch_generation=? AND phase='needs_action' AND reason_code=''
+SELECT id,last_error,reason_code FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+  AND reason_code IN ('','publication_failed')
 ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if err != nil {
 		return nil, err
@@ -623,14 +625,16 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if !rows.Next() {
 		return nil, rows.Err()
 	}
-	var id, recordedError string
-	if err := rows.Scan(&id, &recordedError); err != nil {
+	var id, recordedError, reasonCode string
+	if err := rows.Scan(&id, &recordedError, &reasonCode); err != nil {
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	if !legacySoftDependencyCapDrainError(recordedError) {
+	expandedCount := expandedForcedIntentWindowError(recordedError)
+	if !(reasonCode == "" && legacySoftDependencyCapDrainError(recordedError)) &&
+		!(reasonCode == "publication_failed" && expandedCount > 1) {
 		return nil, nil
 	}
 	drain, err := state.PublicationDrainByID(ctx, db, id)
@@ -644,6 +648,26 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if counts.terminal != 0 {
 		return nil, nil
 	}
+	if expandedCount > 1 {
+		pending := int64(len(drain.EventSeqs)) - counts.published - counts.recovered - counts.terminal
+		if drain.ReasonEvidence != "" || drain.CommitStrategy != string(ai.CommitStrategyIntent) || pending < int64(expandedCount) {
+			return nil, nil
+		}
+		var safe bool
+		if err := db.ReadSQL().QueryRowContext(ctx, `SELECT
+ NOT EXISTS(SELECT 1 FROM intent_repairs WHERE branch_ref=? AND branch_generation=? AND status IN ('prepared','git_applied'))
+ AND NOT EXISTS(SELECT 1 FROM operations WHERE worktree_id=? AND status IN ('prepared','active'))
+ AND (SELECT COUNT(*) FROM publication_drain_events target JOIN capture_events event ON event.seq=target.event_seq
+  WHERE target.drain_id=? AND event.state='pending' AND event.branch_ref=? AND event.branch_generation=?
+   AND EXISTS(SELECT 1 FROM checkpoint_events member JOIN checkpoints checkpoint ON checkpoint.id=member.checkpoint_id
+    WHERE member.event_seq=event.seq AND checkpoint.phase='completed' AND checkpoint.retained=1
+     AND checkpoint.coverage_complete=1 AND checkpoint.observed_ref=event.branch_ref))=?`,
+			drain.BranchRef, drain.BranchGeneration, drain.WorktreeID, drain.ID, drain.BranchRef, drain.BranchGeneration,
+			pending).Scan(&safe); err != nil || !safe {
+			return nil, err
+		}
+	}
+
 	var recoverablePublication int
 	if err := db.ReadSQL().QueryRowContext(ctx, `
 SELECT EXISTS(
@@ -666,6 +690,23 @@ SELECT EXISTS(
 		return nil, err
 	}
 	return &reopened, nil
+}
+
+// This constructor error precedes candidate evaluation and any Git write.
+func expandedForcedIntentWindowError(reason string) int {
+	text, ok := strings.CutPrefix(reason, "intent planner: forced-aging request offered ")
+	if !ok {
+		return 0
+	}
+	text, ok = strings.CutSuffix(text, " captures, want 1")
+	if !ok {
+		return 0
+	}
+	count, err := strconv.Atoi(text)
+	if err != nil || count < 2 || count > ai.IntentCandidateCaptureCap || strconv.Itoa(count) != text {
+		return 0
+	}
+	return count
 }
 
 // RecoverForcedIntentBoundPublicationDrain retries a drain stopped by the old

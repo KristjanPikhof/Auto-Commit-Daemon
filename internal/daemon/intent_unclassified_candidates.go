@@ -202,5 +202,10 @@ func reofferIntentCandidateMembers(input *IntentCandidateEvaluation, candidate s
 	}
 	input.Captures = append(input.Captures, added...)
 	sort.Slice(input.Captures, func(i, j int) bool { return input.Captures[i].Event.Seq < input.Captures[j].Event.Seq })
+	if len(added) > 0 && len(input.Captures) > 1 {
+		// Forced aging selects an overdue singleton. Once its protected
+		// membership is reoffered, use normal whole-goal planning instead.
+		input.ForcedAging = false
+	}
 	return true
 }
