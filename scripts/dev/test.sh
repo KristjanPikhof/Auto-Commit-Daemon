@@ -5,7 +5,8 @@ cd "$(dirname "$0")/../.."
 shard_count=${ACD_TEST_SHARDS:-3}
 package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2}
 test_timeout=${ACD_TEST_TIMEOUT:-4m30s}
-timing_sensitive_daemon_tests='^(TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients|LongReplayHeartbeatStaysFreshAndJoinsOnCancellation)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent)$'
+timing_sensitive_daemon_tests='^(TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients|LongReplayHeartbeatStaysFreshAndJoinsOnCancellation)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent|TestRunRecoveryHasMoreRequestsImmediateFollowup|TestRunCheckpointDuringProjectVerification)$'
+timing_sensitive_verification_tests='^(TestRunnerKillsBackgroundDescendantsAfterSuccessfulShell)$'
 output_root=
 started_seconds=$SECONDS
 lane_name=${1:-local}
@@ -146,12 +147,14 @@ run_support() {
   # the entire lane after the shorter packages have already finished.
   run_measured_tests support -p "$package_parallelism" \
     ${long_packages[@]+"${long_packages[@]}"} ${packages[@]+"${packages[@]}"} \
-    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout"
+    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout" \
+    -skip "$timing_sensitive_verification_tests"
 }
 
 run_sensitive() {
-  run_measured_tests sensitive ./internal/daemon -race -count=1 -parallel=2 -timeout "$test_timeout" \
-    -run "$timing_sensitive_daemon_tests"
+  run_measured_tests sensitive ./internal/daemon ./internal/verification -p 1 \
+    -race -count=1 -parallel=2 -timeout "$test_timeout" \
+    -run "$timing_sensitive_daemon_tests|$timing_sensitive_verification_tests"
 }
 
 run_stress_daemon() {
@@ -189,7 +192,7 @@ run_all() {
       >"$output_root/core-$index.log" 2>&1 &
     core_pids[$index]=$!
   done
-  GOMAXPROCS=${GOMAXPROCS:-2} package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-3} run_support >"$output_root/support.log" 2>&1 &
+  GOMAXPROCS=${GOMAXPROCS:-2} package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2} run_support >"$output_root/support.log" 2>&1 &
   support_pid=$!
 
   for ((index = 0; index < shard_count; index++)); do
