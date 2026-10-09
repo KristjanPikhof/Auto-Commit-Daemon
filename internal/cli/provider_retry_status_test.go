@@ -30,6 +30,8 @@ func TestProviderRetryStatusExplainsCaptureAndDueRetry(t *testing.T) {
 		{"worker unavailable", "provider_wait", 0, false, "AI provider retry is due", "provider-retry-due", "waiting"},
 		{"provider active", "provider_call", 0, true, "waiting for the current Intent provider response", "provider-call", "working"},
 		{"history reconstruction", "history_reconstruction", 0, true, "reconstructing verified goals on a new branch; file capture continues", "history-reconstruct", "working"},
+		{"semantic first cooldown", "goal_review_wait", 300, true, "waiting to review unresolved Intent goals (5m remaining); file capture continues", "goal-review:5m", "waiting"},
+		{"semantic second cooldown", "goal_review_wait", 600, true, "waiting to review unresolved Intent goals (10m remaining); file capture continues", "goal-review:10m", "waiting"},
 		{"semantic cooldown", "goal_review_wait", 3600, true, "waiting to review unresolved Intent goals (1h remaining); file capture continues", "goal-review:1h", "waiting"},
 		{"semantic review due", "goal_review_wait", 0, true, "Intent goal review retry is due; file capture continues", "goal-review-due", "waiting"},
 	} {
