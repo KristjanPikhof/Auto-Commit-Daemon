@@ -29,11 +29,30 @@
 - Retain actual recorded ownership, caller, project, and named API references
   before clipping large Intent evidence. Handle Swift test macros and paths
   containing spaces without treating comments or quoted labels as symbols.
-- Review rejected semantic relationships automatically after an hourly wait,
-  including protected older blocks. Corrected plans can split rejected groups
-  while preserving valid goals and immutable capture provenance.
+- Resolve late test-table corrections using captured Go calls and published
+  companions proven to match the current commit.
+- Review rejected goals after five minutes, ten minutes, then hourly for
+  unchanged evidence. Restarts preserve deadlines, and older one-hour waits
+  shorten automatically. Corrected plans keep valid goals and capture provenance.
+- Review valid provider plans that leave goals waiting instead of caching those
+  plans forever. Ready goals can continue while the unresolved part is reviewed.
+- Honor explicit archive recovery for pending-only queues. Preserve the whole
+  captured chain before recapturing current files, without changing user staging.
+- Hold fallback messages that only name a captured symbol or heading for goal
+  review. Resume provider planning when the wait ends instead of repeating the
+  same local grouping.
+- Regroup protected implementation/test splits automatically. Keep finalized
+  Intents as prerequisites and rebuild cached plans that try to merge into them.
+- Correct redundant planner selections when they repeat the same Intent's
+  retained work, without accepting unknown captures or changing ownership.
+- Replan complete protected fallback partitions whose goal is still unknown,
+  instead of preserving unrelated changes as a fixed commit boundary.
+- Replan dependent goals when their rejected prerequisite invalidates a
+  retained plan, while keeping independent valid goals.
 - Mark transient list reads as refreshing and expose unknown protection in
   JSON. Provider waits and active probes use the same status across views.
+- Keep status and list responsive when repositories have thousands of
+  captures and completed checkpoints.
 
 - Keep a stopped Intent run retryable when an AI outage leaves an oversized
   fallback group waiting. Older stopped runs resume only after matching the
