@@ -22,7 +22,7 @@ func buildFixPlan(force bool) {
 `
 	captures := []IntentCandidateCapture{
 		{Event: state.CaptureEvent{Seq: 1, Path: source}, CapturedDiff: "+if !pending && !force { continue }\n"},
-		{Event: state.CaptureEvent{Seq: 2, Path: "internal/cli/fix_pending_capture_recovery_test.go"}, CapturedDiff: "+if action.Kind != fixActionReconcileUnpublishedChain { t.Fatal(action) }\n"},
+		{Event: state.CaptureEvent{Seq: 2, Path: "internal/cli/fix_pending_capture_recovery_test.go"}, CapturedDiff: "+package cli\n+if action.Kind != fixActionReconcileUnpublishedChain { t.Fatal(action) }\n"},
 	}
 	references := intentRecordedDeclarationContext(source, contents, intentOtherCaptureReferenceNames(captures))
 	if !strings.Contains(references, " const (\n") || !strings.Contains(references, " fixActionReconcileUnpublishedChain =") {
@@ -55,7 +55,7 @@ func TestIntentRecordedConstantsRejectLocalAndUnrelatedOwners(t *testing.T) {
 		"quoted":  "package cli\nvar label = `const action = 1`\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			captures := []IntentCandidateCapture{{Event: state.CaptureEvent{Path: "internal/cli/check_test.go"}, CapturedDiff: "+check(action)\n"}}
+			captures := []IntentCandidateCapture{{Event: state.CaptureEvent{Path: "internal/cli/check_test.go"}, CapturedDiff: "+package cli\n+check(action)\n"}}
 			if got := intentRecordedDeclarationContext("internal/cli/fix.go", contents, intentOtherCaptureReferenceNames(captures)); got != "" {
 				t.Fatalf("non-global ownership supplied evidence: %q", got)
 			}
@@ -63,20 +63,23 @@ func TestIntentRecordedConstantsRejectLocalAndUnrelatedOwners(t *testing.T) {
 	}
 	const contents = "package cli\nconst (\n action = 1\n)\n"
 	for _, consumer := range []string{"internal/other/check_test.go", "docs/actions.md"} {
-		captures := []IntentCandidateCapture{{Event: state.CaptureEvent{Path: consumer}, CapturedDiff: "+check(action)\n"}}
+		captures := []IntentCandidateCapture{{Event: state.CaptureEvent{Path: consumer}, CapturedDiff: "+package cli\n+check(action)\n"}}
 		if got := intentRecordedDeclarationContext("internal/cli/fix.go", contents, intentOtherCaptureReferenceNames(captures)); got != "" {
 			t.Fatalf("unrelated package or prose supplied ownership: %s: %q", consumer, got)
 		}
+	}
+	external := []IntentCandidateCapture{{Event: state.CaptureEvent{Path: "internal/cli/external_test.go"}, CapturedDiff: "+package cli_test\n+check(action)\n"}}
+	if got := intentRecordedDeclarationContext("internal/cli/fix.go", contents, intentOtherCaptureReferenceNames(external)); got != "" {
+		t.Fatalf("external test package acquired private constant ownership: %q", got)
 	}
 }
 
 func TestIntentRecordedOwnerSurvivesRelationshipWrapper(t *testing.T) {
 	t.Parallel()
 	captures := []IntentCandidateCapture{
-		{Event: state.CaptureEvent{Seq: 1, Path: "internal/worker.go"}, CapturedDiff: "+// Clarify existing worker ownership.\n"},
+		{Event: state.CaptureEvent{Seq: 1, Path: "internal/worker.go"}, CapturedDiff: strings.Repeat("+// bounded unrelated padding\n", 1000) + "@@ -10,2 +10,2 @@ func KeepWorkerState() {\n-oldState()\n+newState()\n" + strings.Repeat("+// bounded unrelated padding\n", 1000)},
 		{Event: state.CaptureEvent{Seq: 2, Path: "internal/caller.go"}, CapturedDiff: "+KeepWorkerState()\n"},
 	}
-	captures[0].CapturedDiff = prependIntentRecordedReferenceContext(captures[0].CapturedDiff, " func KeepWorkerState() {\n")
 	prioritized := prioritizeIntentRelationshipEvidence(captures)
 	if !strings.HasPrefix(prioritized[0], intentRelationshipEvidencePrefix) {
 		t.Fatal("scenario did not retain ownership in the relationship wrapper")
