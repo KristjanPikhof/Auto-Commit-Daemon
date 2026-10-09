@@ -75,15 +75,19 @@ func TestIntentSemanticRetryProtectsWithoutEscalationAndPublishesAfterRestart(t 
 	if err != nil || waiting.Disposition != ReplayDispositionTransientWait || planner.calls != calls || waiting.Published != 0 || waiting.HasMore {
 		t.Fatalf("restart spent cooldown: %+v calls=%d err=%v", waiting, planner.calls, err)
 	}
-	// Advance the persisted deadline instead of sleeping for an hour. The
+	// Advance the persisted deadline instead of sleeping for five minutes. The
 	// provider now returns a useful goal for the same protected capture.
 	retry.RetryAtTS = intentPlannerHealthTimestamp(time.Now().Add(-time.Second))
+	retry.ScheduledAtTS = retry.RetryAtTS - intentSemanticReviewDelay(retry.ReviewCount).Seconds()
 	if err := saveIntentSemanticRetry(ctx, f.db, retry); err != nil {
 		t.Fatal(err)
 	}
 	recovered, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil || recovered.Published != 1 || recovered.Failed != 0 || planner.calls != calls+1 {
 		t.Fatalf("due review did not publish: %+v calls=%d err=%v", recovered, planner.calls, err)
+	}
+	if _, found, err := loadIntentSemanticRetry(ctx, f.db); err != nil || found {
+		t.Fatalf("published goal retained review cooldown: found=%t err=%v", found, err)
 	}
 	pending, err = state.PendingEvents(ctx, f.db, 0)
 	if err != nil || len(pending) != 0 {
@@ -122,12 +126,13 @@ func TestIntentSemanticRetryDueReviewGetsTurnDuringSustainedFreshWork(t *testing
 		t.Fatalf("review deadline missing: found=%t err=%v", found, err)
 	}
 	retry.RetryAtTS = intentPlannerHealthTimestamp(time.Now().Add(-time.Second))
+	retry.ScheduledAtTS = retry.RetryAtTS - intentSemanticReviewDelay(retry.ReviewCount).Seconds()
 	if err := saveIntentSemanticRetry(ctx, f.db, retry); err != nil {
 		t.Fatal(err)
 	}
 	calls := planner.calls
 	// More than one fresh window is available. The due old goal still gets
-	// its bounded provider session, then returns to an hourly cooldown.
+	// its bounded provider session, then returns to the next cooldown.
 	reviewed, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil || reviewed.Published != 0 || reviewed.Disposition != ReplayDispositionTransientWait || planner.calls != calls+1 || len(planner.req.OfferedCaptures) != 1 || planner.req.OfferedCaptures[0].Seq != held {
 		t.Fatalf("continuous fresh work starved due review: %+v request=%+v calls=%d err=%v", reviewed, planner.req.OfferedCaptures, planner.calls, err)

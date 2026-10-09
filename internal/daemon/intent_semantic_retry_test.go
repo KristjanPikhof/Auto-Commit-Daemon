@@ -190,7 +190,7 @@ func TestIntentSemanticRetryResumesUnchangedEvidenceAfterRestart(t *testing.T) {
 		t.Fatalf("unresolved goals were not held safely: plan=%+v run=%+v attention=%t err=%v", plan, first, attention, err)
 	}
 	retry, found, err := loadIntentSemanticRetry(ctx, db)
-	if err != nil || !found || retry.RetryAtTS != intentPlannerHealthTimestamp(input.Now.Add(time.Hour)) {
+	if err != nil || !found || retry.ReviewCount != 1 || retry.RetryAtTS != intentPlannerHealthTimestamp(input.Now.Add(5*time.Minute)) {
 		t.Fatalf("retry=%+v found=%t err=%v", retry, found, err)
 	}
 	planner.err, planner.plan = nil, restoredSemanticPlan()
@@ -206,7 +206,7 @@ func TestIntentSemanticRetryResumesUnchangedEvidenceAfterRestart(t *testing.T) {
 		t.Cleanup(func() { _ = db.Close() })
 		_, _, _, _, _, _, waiting, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 0, input.Preset, nil, db, input)
 		var wait *IntentSemanticRetryWaitError
-		if !errors.As(err, &wait) || !wait.RetryAt.Equal(input.Now.Add(time.Hour)) || waiting.AttemptCount != 1 || waiting.Fingerprint != first.Fingerprint || planner.calls != 1 {
+		if !errors.As(err, &wait) || !wait.RetryAt.Equal(input.Now.Add(5*time.Minute)) || waiting.AttemptCount != 1 || waiting.Fingerprint != first.Fingerprint || planner.calls != 1 {
 			t.Fatalf("restart reset semantic cooldown: run=%+v calls=%d err=%v", waiting, planner.calls, err)
 		}
 		after, _, err := loadIntentSemanticRetry(ctx, db)
@@ -214,13 +214,18 @@ func TestIntentSemanticRetryResumesUnchangedEvidenceAfterRestart(t *testing.T) {
 			t.Fatalf("retry drifted across restart: before=%+v after=%+v err=%v", retry, after, err)
 		}
 	}
-	input.Now = input.Now.Add(time.Hour)
+	input.Now = secondsTime(retry.RetryAtTS)
 	plan, fallback, _, _, _, _, resumed, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 0, input.Preset, nil, db, input)
 	if err != nil || fallback != "" || resumed.ResolutionMode.String != "provider" || resumed.AttemptCount != 1 || resumed.Fingerprint != first.Fingerprint || planner.calls != 2 || !reflect.DeepEqual(plan, planner.plan) {
 		t.Fatalf("due review did not resume same evidence: plan=%+v run=%+v calls=%d err=%v", plan, resumed, planner.calls, err)
 	}
-	if _, found, err := loadIntentSemanticRetry(ctx, db); err != nil || found {
-		t.Fatalf("completed goal retained retry: found=%t err=%v", found, err)
+	// Plan selection retains its review count until the candidate gates pass;
+	// otherwise a later semantic rejection would reset the cadence.
+	if after, found, err := loadIntentSemanticRetry(ctx, db); err != nil || !found || after != retry {
+		t.Fatalf("plan selection lost review history: record=%+v found=%t err=%v", after, found, err)
+	}
+	if _, _, _, _, _, _, _, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 0, input.Preset, nil, db, input); err != nil || planner.calls != 2 {
+		t.Fatalf("accepted goal spent another review: calls=%d err=%v", planner.calls, err)
 	}
 }
 
@@ -256,7 +261,7 @@ func TestIntentSemanticRetryRebuildsLegacyGenericResolution(t *testing.T) {
 	if err != nil || len(plan.Candidates) != 1 || plan.Candidates[0].Readiness != ai.IntentCandidateWait || rebuilt.ResolutionMode.String != "waiting_semantic_retry" || planner.calls != 1 {
 		t.Fatalf("generic cached resolution bypassed safe review: plan=%+v run=%+v calls=%d err=%v", plan, rebuilt, planner.calls, err)
 	}
-	input.Now = input.Now.Add(time.Hour)
+	input.Now = input.Now.Add(5 * time.Minute)
 	plan, _, _, _, _, _, repaired, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 0, input.Preset, nil, db, input)
 	if err != nil || repaired.Fingerprint != run.Fingerprint || planner.calls != 2 || plan.Candidates[0].Subject != planner.plan.Candidates[0].Subject {
 		t.Fatalf("legacy generic goal stayed blocked: plan=%+v run=%+v calls=%d err=%v", plan, repaired, planner.calls, err)
@@ -297,11 +302,11 @@ func TestIntentSemanticRetryKeepsIndependentWindowCooldowns(t *testing.T) {
 	for _, req := range []ai.IntentPlanRequestV2{reqA, reqB, reqA, reqB} {
 		_, _, _, _, _, _, _, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 0, input.Preset, nil, db, input)
 		var wait *IntentSemanticRetryWaitError
-		if !errors.As(err, &wait) || !wait.RetryAt.Equal(input.Now.Add(time.Hour)) || planner.calls != 2 {
+		if !errors.As(err, &wait) || !wait.RetryAt.Equal(input.Now.Add(5*time.Minute)) || planner.calls != 2 {
 			t.Fatalf("another window or pressure escaped cooldown: calls=%d err=%v", planner.calls, err)
 		}
 	}
-	input.Now = input.Now.Add(time.Hour)
+	input.Now = secondsTime(beforeA.RetryAtTS)
 	planner.err, planner.plan = nil, restoredSemanticPlan()
 	planner.plan.Candidates[0].SelectedSeqs = []int64{2}
 	if _, _, _, _, _, _, run, err := chooseIntentCandidatePlan(ctx, reqB, planner, nil, 0, input.Preset, nil, db, input); err != nil || run.AttemptCount != 1 || planner.calls != 3 {
@@ -339,7 +344,7 @@ func TestIntentSemanticRetryRetainsValidGroups(t *testing.T) {
 	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
 		t.Fatal(err)
 	}
-	input.Now = input.Now.Add(time.Hour)
+	input.Now = input.Now.Add(5 * time.Minute)
 	planner.err, planner.plan = nil, restoredSemanticPlan()
 	planner.plan.Candidates[0].CandidateID = "document-recognition"
 	planner.plan.Candidates[0].SelectedSeqs = []int64{2}
