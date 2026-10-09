@@ -31,6 +31,8 @@
   containing spaces without treating comments or quoted labels as symbols.
 - Resolve late test-table corrections using captured Go calls and published
   companions proven to match the current commit.
+- Retain grouped Go constant ownership and named declarations through evidence
+  clipping, so related implementation and regression tests stay together.
 - Review rejected goals after five minutes, ten minutes, then hourly for
   unchanged evidence. Restarts preserve deadlines, and older one-hour waits
   shorten automatically. Corrected plans keep valid goals and capture provenance.
@@ -44,6 +46,7 @@
   coverage diagnostic before the client connection closes.
 - Honor explicit archive recovery for pending-only queues. Preserve the whole
   captured chain before recapturing current files, without changing user staging.
+- Report actual recovery changes in JSON while keeping previews and no-ops clear.
 - Hold fallback messages that only name a captured symbol or heading for goal
   review. Resume provider planning when the wait ends instead of repeating the
   same local grouping.
