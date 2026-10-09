@@ -300,7 +300,8 @@ func DecodeIntentPlanV2(raw []byte, req IntentPlanRequestV2) (IntentPlanV2, erro
 	} else if !errors.Is(err, io.EOF) {
 		return IntentPlanV2{}, v2ValidationError("", IntentAtomicityCohesion, "response_trailing_data", err.Error())
 	}
-	if err := ValidateIntentPlanV2(req, plan); err != nil {
+	plan, err := retainUnassignedIntentCaptures(req, plan, ValidateIntentPlanV2(req, plan))
+	if err != nil {
 		return plan, rejectedIntentPlanV2(err, plan)
 	}
 	return plan, nil
@@ -369,7 +370,8 @@ func PlanIntentV2WithCompatibility(ctx context.Context, planner interface{ Name(
 			}
 			return AdaptIntentPlanV1(req, unsupported.LegacyPlan)
 		}
-		if err := validateNativeIntentPlanV2(req, plan); err != nil {
+		plan, err = retainUnassignedIntentCaptures(req, plan, validateNativeIntentPlanV2(req, plan))
+		if err != nil {
 			return plan, rejectedIntentPlanV2(err, plan)
 		}
 		return plan, nil
