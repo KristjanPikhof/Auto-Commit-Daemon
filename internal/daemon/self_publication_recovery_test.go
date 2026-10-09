@@ -452,6 +452,7 @@ func TestRecoverSelfPublicationPreservesCandidateCompletionIdentity(
 }
 
 func TestSelfPublicationCrashRecoveryMatrix(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name              string
 		checkpoint        SelfPublicationCheckpoint
