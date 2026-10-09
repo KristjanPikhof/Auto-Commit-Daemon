@@ -1811,6 +1811,15 @@ func replayIntentBatch(
 		return sum, err
 	}
 	if cfg.candidateMode && !cfg.atomicFallback && len(window) > 0 && len(goalPending) > len(window) {
+		window, err = expandIntentSwiftMaintenanceWindow(ctx, repoRoot, db, goalPending, window, cfg, quiescenceNow)
+		if err != nil {
+			return sum, err
+		}
+		if len(window) > 1 {
+			forced = false
+		}
+	}
+	if cfg.candidateMode && !cfg.atomicFallback && len(window) > 0 && len(goalPending) > len(window) {
 		var goalWait string
 		window, cfg.goalDependencies, goalWait, err = expandIntentGoalWindow(
 			ctx, repoRoot, db, activeCtx, goalPending, window, cfg, quiescenceNow)
