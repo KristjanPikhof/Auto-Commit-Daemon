@@ -72,6 +72,17 @@ func prependIntentRecordedReferenceContext(diff, references string) string {
 	return header + diff
 }
 
+func intentRecordedReferenceLines(diff string) string {
+	const prefix = "Recorded post-image references:\n"
+	const separator = "\nRecorded diff:\n"
+	if strings.HasPrefix(diff, prefix) {
+		if end := strings.Index(diff, separator); end >= 0 {
+			return diff[len(prefix):end]
+		}
+	}
+	return ""
+}
+
 func includeIntentRecordedReferenceContext(diff, references string) string {
 	return truncateIntentEvidenceDiff(ai.RedactDiffSecrets(prependIntentRecordedReferenceContext(diff, references)), ai.IntentStageDiffCap)
 }

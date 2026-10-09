@@ -40,7 +40,8 @@ func intentRecordedDeclarationContext(sourcePath, contents string, referenced in
 					for _, name := range values.Names {
 						owner := referenced[name.Name]
 						needed = needed || referenced.outside(name.Name, sourcePath) &&
-							!owner.crossDirectory && path.Dir(owner.path) == path.Dir(sourcePath)
+							!owner.crossDirectory && !owner.crossPackage && owner.goPackage == file.Name.Name &&
+							path.Dir(owner.path) == path.Dir(sourcePath)
 					}
 				}
 				if needed {
@@ -98,6 +99,7 @@ type intentReferenceName struct {
 	path           string
 	shared         bool
 	crossDirectory bool
+	crossPackage   bool
 	goPackage      string
 }
 
@@ -119,13 +121,38 @@ func intentOtherCaptureReferenceNames(captures []IntentCandidateCapture) intentR
 		default:
 			continue
 		}
+		goPackage := ""
+		if path.Ext(capture.Event.Path) == ".go" {
+			packageDiff := capture.CapturedDiff
+			if len(packageDiff) > intentSourceReferenceContextCap {
+				packageDiff = packageDiff[:intentSourceReferenceContextCap]
+				if end := strings.LastIndexByte(packageDiff, '\n'); end >= 0 {
+					packageDiff = packageDiff[:end+1]
+				} else {
+					packageDiff = ""
+				}
+			}
+			for _, line := range intentSourceCodeWitnessesWithContext(capture.Event.Path, packageDiff, true) {
+				if strings.HasPrefix(line.Code, "package ") {
+					file, err := parser.ParseFile(token.NewFileSet(), capture.Event.Path, line.Code+"\n", parser.PackageClauseOnly)
+					if err == nil {
+						goPackage = file.Name.Name
+					}
+					break
+				}
+			}
+		}
 		for name := range intentSourceUsedNames(capture.Event.Path, capture.CapturedDiff) {
 			owner, found := owners[name]
 			if !found {
-				owners[name] = intentReferenceName{path: capture.Event.Path}
+				owners[name] = intentReferenceName{path: capture.Event.Path, goPackage: goPackage}
 			} else if owner.path != capture.Event.Path {
 				owner.shared = true
 				owner.crossDirectory = owner.crossDirectory || path.Dir(owner.path) != path.Dir(capture.Event.Path)
+				owner.crossPackage = owner.crossPackage || owner.goPackage != "" && goPackage != "" && owner.goPackage != goPackage
+				if owner.goPackage == "" {
+					owner.goPackage = goPackage
+				}
 				owners[name] = owner
 			}
 		}

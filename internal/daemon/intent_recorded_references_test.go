@@ -16,7 +16,8 @@ type recordedScriptGoalPlanner struct{}
 
 func TestIntentRecordedReferenceContextStaysBoundedAndFresh(t *testing.T) {
 	t.Parallel()
-	diff := "+api_key = abcdef1234567890\n" + strings.Repeat("+changed_code = 2\n", ai.IntentStageDiffCap)
+	const changedLine = "+changed_code = 2\n"
+	diff := "+api_key = abcdef1234567890\n" + strings.Repeat(changedLine, ai.IntentStageDiffCap/len(changedLine)+1)
 	references := " python3 scripts/manifest.py\n"
 	first := includeIntentRecordedReferenceContext(diff, references)
 	if len(first) > ai.IntentStageDiffCap || strings.Contains(first, "abcdef1234567890") {

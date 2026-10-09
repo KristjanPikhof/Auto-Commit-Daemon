@@ -18,6 +18,9 @@ import (
 type intentRecordedGoCalls struct {
 	context, packageName string
 	names                []string
+	ownedFunctions       []string
+	ownedTypes           []string
+	calledFunctions      []string
 }
 
 var intentGoDiffNewLine = regexp.MustCompile(`^@@ -[0-9]+(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@`)
@@ -46,7 +49,9 @@ func intentGoChangedLinePositions(sourcePath, diff string) (map[int]bool, bool) 
 			line++
 		case '-':
 			if code[index] {
-				changed[line] = true
+				if _, added := changed[line]; !added {
+					changed[line] = false
+				}
 			}
 		case ' ':
 			line++
@@ -94,6 +99,8 @@ func intentGoRecordedCallContext(sourcePath, contents, diff string, budget int) 
 	lines := strings.Split(contents, "\n")
 	seen := make(map[string]bool)
 	var context strings.Builder
+	changedFunctions := make(map[*ast.FuncDecl]bool)
+	referencedFunctions := make(map[string]bool)
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok || function.Recv != nil || function.Body == nil {
@@ -103,12 +110,16 @@ func intentGoRecordedCallContext(sourcePath, contents, diff string, budget int) 
 		if hasHunk {
 			ownsChange = false
 			first, last := fset.Position(function.Pos()).Line, fset.Position(function.End()).Line
-			for line := range positions {
-				ownsChange = ownsChange || (line >= first && line <= last)
+			for line, added := range positions {
+				ownsChange = ownsChange || (line >= first && line <= last && (added || line > first))
 			}
 		}
 		if !ownsChange {
 			continue
+		}
+		changedFunctions[function] = true
+		if len(result.ownedFunctions) < 128 {
+			result.ownedFunctions = append(result.ownedFunctions, function.Name.Name)
 		}
 		type call struct {
 			name        string
@@ -135,6 +146,10 @@ func intentGoRecordedCallContext(sourcePath, contents, diff string, budget int) 
 			case "append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len", "make", "max", "min", "new", "panic", "print", "println", "real", "recover":
 				return true
 			}
+			if identifier.Obj == nil && !referencedFunctions[identifier.Name] && len(result.calledFunctions) < 128 {
+				result.calledFunctions = append(result.calledFunctions, identifier.Name)
+				referencedFunctions[identifier.Name] = true
+			}
 			if _, already := present[identifier.Name]; !already {
 				calls = append(calls, call{identifier.Name, first, last})
 			}
@@ -160,7 +175,19 @@ func intentGoRecordedCallContext(sourcePath, contents, diff string, budget int) 
 			}
 		}
 	}
-	result.context, result.packageName = context.String(), file.Name.Name
+	callers, names := intentGoRecordedCallerContext(file, fset, contents, changedFunctions, budget)
+	result.ownedFunctions = append(result.ownedFunctions, names...)
+	types, typeNames := intentGoRecordedTypeContext(file, fset, contents, positions, budget)
+	result.ownedTypes = typeNames
+	result.context, result.packageName = mergeIntentRecordedGoCallContext(types, mergeIntentRecordedGoCallContext(callers, context.String())), file.Name.Name
+	if len(result.context) > budget {
+		result.context = result.context[:budget]
+		if end := strings.LastIndexByte(result.context, '\n'); end >= 0 {
+			result.context = result.context[:end+1]
+		} else {
+			result.context = ""
+		}
+	}
 	return result
 }
 

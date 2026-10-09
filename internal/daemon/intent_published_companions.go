@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"path"
 	"sort"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -34,6 +35,27 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 	if err != nil {
 		return nil, err
 	}
+	regressions, matchedTests, err := discoverIntentPublishedGoRegressions(ctx, db, *input)
+	if err != nil {
+		return nil, err
+	}
+	companions = append(companions, regressions...)
+	tsRegressions, tsTests, err := discoverIntentPublishedTypeScriptRegressions(ctx, db, *input)
+	if err != nil {
+		return nil, err
+	}
+	companions = append(companions, tsRegressions...)
+	if matchedTests == nil {
+		matchedTests = make(map[string]map[string]string)
+	}
+	for id, paths := range tsTests {
+		if matchedTests[id] == nil {
+			matchedTests[id] = make(map[string]string)
+		}
+		for name := range paths {
+			matchedTests[id][name] = ""
+		}
+	}
 	if len(companions) == 0 {
 		return existing, nil
 	}
@@ -49,6 +71,9 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 	members := 0
 	var verified []state.IntentCandidate
 	for _, candidate := range companions {
+		if len(active)+len(verified) >= state.IntentCandidateMaxOpenPerPair {
+			break
+		}
 		if known[candidate.ID] || candidate.Status != state.IntentCandidatePublished || !candidate.PublishedCommitOID.Valid || len(candidate.Events) == 0 || len(candidate.Events) > state.IntentCandidateMaxCaptures {
 			continue
 		}
@@ -75,6 +100,20 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 			return nil, err
 		}
 		if proven {
+			for i := range captures {
+				if path.Ext(captures[i].Event.Path) == ".ts" {
+					// Available published imports resolve in this pinned baseline.
+					// The original capture ledger and post-images stay unchanged.
+					captures[i].Event.BaseHead = head
+				}
+				if references, matched := matchedTests[candidate.ID][captures[i].Event.Path]; matched {
+					raw, err := BuildOpsDiffWithCap(ctx, input.RepoPath, captures[i].Ops, intentSourceReferenceScanCap)
+					if err != nil {
+						return nil, err
+					}
+					captures[i].CapturedDiff = prependIntentRecordedReferenceContext(intentCompleteRawDiff(raw), references)
+				}
+			}
 			if input.publishedContext == nil {
 				input.publishedContext = make(map[string][]IntentCandidateCapture)
 			}
