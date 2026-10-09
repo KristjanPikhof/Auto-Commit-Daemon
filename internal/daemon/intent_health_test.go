@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -51,12 +50,7 @@ func openAIIntentHealthIdentity(endpoint string) IntentPlannerProviderIdentity {
 
 func newIntentHealthTestDB(t *testing.T) *state.DB {
 	t.Helper()
-	db, err := state.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return cloneDaemonTestState(t, context.Background())
 }
 
 func readIntentHealthRecord(t *testing.T, db *state.DB) intentPlannerHealthRecord {

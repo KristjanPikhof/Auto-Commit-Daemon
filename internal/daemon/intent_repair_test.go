@@ -1009,7 +1009,13 @@ func testReplayIntentV2SemanticRepairReplan(t *testing.T, repairSucceeds bool) {
 		if err != nil || !found {
 			t.Fatalf("semantic retry=%+v found=%t err=%v", retry, found, err)
 		}
+		if retry.ReviewCount != 1 || retry.RetryAtTS-retry.ScheduledAtTS != (5*time.Minute).Seconds() {
+			t.Fatalf("first review did not use five-minute cadence: %+v", retry)
+		}
+		// Advance this fixture's complete review interval into the past. The
+		// persisted schedule must still precede its deadline after the move.
 		retry.RetryAtTS = intentPlannerHealthTimestamp(time.Now().Add(-time.Second))
+		retry.ScheduledAtTS = retry.RetryAtTS - (5 * time.Minute).Seconds()
 		if err := saveIntentSemanticRetry(ctx, f.db, retry); err != nil {
 			t.Fatal(err)
 		}
@@ -1444,12 +1450,15 @@ func TestReplayIntentV2AdvancesDeferredCaptureState(t *testing.T) {
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending=%+v err=%v", pending, err)
 	}
-	result, err := Replay(ctx, f.dir, f.db, f.cctx, ReplayOpts{
+	planner := &waitingIntentV2Planner{}
+	opts := ReplayOpts{
 		GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
-		IntentPlanner: &waitingIntentV2Planner{},
+		IntentPlanner: planner,
 		IntentPreset:  config.PresetFast, IntentBypassBatchWait: true,
 		IntentWindow: 10, IntentDeferLimit: 1,
-	})
+	}
+	head := mustGitOutput(t, f.dir, "rev-parse", "HEAD")
+	result, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1458,8 +1467,52 @@ func TestReplayIntentV2AdvancesDeferredCaptureState(t *testing.T) {
 	}
 	plannerState, ok, err := state.PlannerStateForEvent(
 		ctx, f.db, pending[0].Seq)
-	if err != nil || !ok || plannerState.DeferCount != 1 {
+	if err != nil || !ok || plannerState.DeferCount != 1 ||
+		plannerState.LastDeferReason.String != "companion test" || planner.calls != 1 {
 		t.Fatalf("planner state=%+v ok=%v err=%v", plannerState, ok, err)
+	}
+	candidates, err := state.IntentCandidatesForPair(ctx, f.db, f.cctx.BranchRef, f.cctx.BranchGeneration, 10)
+	if err != nil || len(candidates) != 1 || candidates[0].Status != state.IntentCandidateWaiting ||
+		len(candidates[0].Events) != 1 || candidates[0].Events[0].EventSeq != pending[0].Seq {
+		t.Fatalf("accepted WAIT membership=%+v err=%v", candidates, err)
+	}
+	retry, ok, err := loadIntentSemanticRetry(ctx, f.db)
+	if err != nil || !ok || retry.ReviewCount != 1 ||
+		retry.RetryAtTS-retry.ScheduledAtTS != (5*time.Minute).Seconds() {
+		t.Fatalf("accepted WAIT retry=%+v ok=%v err=%v", retry, ok, err)
+	}
+	for restart := 0; restart < 2; restart++ {
+		if restart == 1 {
+			dbPath := f.db.Path()
+			if err := f.db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			f.db, err = state.Open(ctx, dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = f.db.Close() })
+		}
+		for poll := 0; poll < 3; poll++ {
+			waiting, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+			if err != nil || waiting.Published != 0 || planner.calls != 1 ||
+				waiting.SkippedReason != "intent_v2_waiting_semantic_retry" {
+				t.Fatalf("cooldown poll=%+v calls=%d err=%v", waiting, planner.calls, err)
+			}
+			current, ok, err := state.PlannerStateForEvent(ctx, f.db, pending[0].Seq)
+			if err != nil || !ok || current.DeferCount != 1 ||
+				current.LastDeferReason != plannerState.LastDeferReason {
+				t.Fatalf("cooldown aged accepted WAIT: %+v ok=%v err=%v", current, ok, err)
+			}
+			saved, ok, err := loadIntentSemanticRetry(ctx, f.db)
+			if err != nil || !ok || saved.RetryAtTS != retry.RetryAtTS ||
+				saved.ScheduledAtTS != retry.ScheduledAtTS || saved.ReviewCount != 1 {
+				t.Fatalf("cooldown changed accepted review: %+v ok=%v err=%v", saved, ok, err)
+			}
+		}
+	}
+	if got := mustGitOutput(t, f.dir, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("accepted WAIT changed HEAD: before=%q after=%q", head, got)
 	}
 }
 
@@ -1630,7 +1683,7 @@ type revisingIntentV2Planner struct{}
 
 type repairThenIndependentIntentV2Planner struct{}
 
-type waitingIntentV2Planner struct{}
+type waitingIntentV2Planner struct{ calls int }
 
 type suffixRepairIntentV2Planner struct{}
 
@@ -1783,10 +1836,11 @@ func (*waitingIntentV2Planner) PlanIntent(
 	return ai.IntentPlan{}, errors.New("legacy planner path must not run")
 }
 
-func (*waitingIntentV2Planner) PlanIntentV2(
+func (p *waitingIntentV2Planner) PlanIntentV2(
 	_ context.Context,
 	req ai.IntentPlanRequestV2,
 ) (ai.IntentPlanV2, error) {
+	p.calls++
 	seqs := make([]int64, 0, len(req.OfferedCaptures))
 	for _, capture := range req.OfferedCaptures {
 		seqs = append(seqs, capture.Seq)
