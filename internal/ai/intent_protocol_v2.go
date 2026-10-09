@@ -941,11 +941,15 @@ func IntentPlannerV2SystemPrompt(format ...CommitFormat) string {
 	}
 	return "You are a semantic intent planner for atomic git commits. " +
 		"Return only a v2 candidate plan. Assign every offered seq to exactly one candidate. " +
+		"Output selected_seqs may contain only offered_captures seqs. Existing candidates' selected_seqs and captured_evidence are retained context, not additional assignments. " +
+		"To extend an existing mutable candidate, reuse its candidate_id and select only its offered additions; its retained members still belong to the goal and must satisfy completeness. " +
 		"Candidate order must be topological. Non-contiguous capture groups are allowed when dependency evidence proves independence and ordering. " +
 		"A group may add semantic cohesion not present in the dependency graph when the exact diffs prove one intent. Never group by time or directory alone. " +
 		purposefulCommitGroupingInstructions +
 		"Activity epochs and temporal proximity may trigger evaluation but cannot alone prove cohesion. " +
 		"Mark readiness=wait when any required companion is missing. A ready candidate must not depend on a waiting candidate. " +
+		"Candidates with status=published supply existing baseline behavior through their recorded evidence. Do not call that behavior missing merely because its captures are not offered, and do not select those captures again. " +
+		"A later correction or regression test may complete its own useful goal against that baseline; keep any available unpublished support together and explain the new goal from its net change. " +
 		"Keep raw-source reasoning out of purpose, grouping_reason, and missing_companions. " +
 		CommitMessageFormatInstructions(selected) + " " +
 		"Keep grouping rationale in grouping_reason, not in the commit body."

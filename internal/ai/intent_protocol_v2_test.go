@@ -513,6 +513,12 @@ func TestIntentPlanV2SupportsPurposefulSteps(t *testing.T) {
 		"Separate a preparatory refactor from a later feature",
 		"Keep tests, imports, generated output, and other support changes with the behavior they complete",
 		"Give a broad behavior or default-setting change its own purpose",
+		"Candidates with status=published supply existing baseline behavior",
+		"Output selected_seqs may contain only offered_captures seqs",
+		"retained context, not additional assignments",
+		"reuse its candidate_id and select only its offered additions",
+		"Do not call that behavior missing merely because its captures are not offered",
+		"A later correction or regression test may complete its own useful goal against that baseline",
 	} {
 		if !strings.Contains(prompt, phrase) {
 			t.Fatalf("v2 planner missing purposeful grouping guidance %q", phrase)
