@@ -193,11 +193,14 @@ func replayIntentCandidateBatch(
 		evaluation.PlannerFailure); err != nil {
 		return sum, err
 	}
+	acceptedProviderWait := evaluation.Fallback == "" && evaluation.PlannerFailure == "" &&
+		evaluation.ResolutionMode == "waiting_semantic_retry" && len(evaluation.Decisions) > 0
 	if evaluation.Fallback != "waiting_for_ai" &&
 		evaluation.Fallback != "waiting_message_rewrite" &&
-		evaluation.ResolutionMode != "waiting_semantic_retry" {
-		// Provider cooldown is not a semantic decision to defer work. Counting
-		// it would age unchanged captures into forced publication requests.
+		(evaluation.ResolutionMode != "waiting_semantic_retry" || acceptedProviderWait) {
+		// An accepted provider WAIT is one semantic decision to defer work.
+		// Cached cooldowns have no evaluated decisions and must not age the
+		// unchanged captures again on polls or after a restart.
 		if err := recordIntentDeferrals(
 			ctx, db, windowPlan, items, activeCtx, evaluationStartedTS,
 		); err != nil {
@@ -1293,6 +1296,8 @@ func runtimeIntentDependencyHints(
 		public    map[string]struct{}
 		api       map[string]struct{}
 		docUses   map[string]struct{}
+		cli       map[string]string
+		docCLI    map[string]struct{}
 		generated bool
 	}
 	ordered := append([]IntentCandidateCapture(nil), captures...)
@@ -1316,11 +1321,16 @@ func runtimeIntentDependencyHints(
 			if role == "code" {
 				item.public = intentSourcePublicReferences(capture.CapturedDiff)
 				item.api = intentSourceAPIReferences(capture.Event.Path, capture.CapturedDiff)
+				item.cli = capture.FileMetadata.IntentCLIReferences(capture.Event.Seq, capture.Event.Path)
 			}
 		} else {
 			item.imports = nil
 			if role == "documentation" {
 				item.docUses = intentDocumentPublicReferences(capture.CapturedDiff)
+				item.docCLI = make(map[string]struct{})
+				for _, invocation := range intentDocumentCLIInvocations(capture.CapturedDiff) {
+					item.docCLI[invocation.key()] = struct{}{}
+				}
 			}
 		}
 		items = append(items, item)
@@ -1363,6 +1373,19 @@ func runtimeIntentDependencyHints(
 	for i := range items {
 		for j := i + 1; j < len(items); j++ {
 			earlier, later := items[i], items[j]
+			for _, pair := range [][2]features{{earlier, later}, {later, earlier}} {
+				var qualified []string
+				for command := range pair[0].cli {
+					if _, used := pair[1].docCLI[command]; used {
+						qualified = append(qualified, command)
+					}
+				}
+				sort.Strings(qualified)
+				if len(qualified) > 0 {
+					command := qualified[0]
+					add(pair[0].seq, pair[1].seq, ai.IntentDependencySoft, "documented_public_reference", command+"\x00"+pair[0].cli[command])
+				}
+			}
 			if reference := firstRuntimeIntentFeature(earlier.public, later.docUses); reference != "" {
 				add(earlier.seq, later.seq, ai.IntentDependencySoft, "documented_public_reference", reference)
 			} else if reference := firstRuntimeIntentFeature(later.public, earlier.docUses); reference != "" {
