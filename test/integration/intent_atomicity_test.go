@@ -33,6 +33,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -203,6 +204,7 @@ func TestIntentAtomicity_HonorsDeferredMiddleBoundary(t *testing.T) {
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	var hits atomic.Int32
+	var waitingSeq atomic.Int64
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
@@ -212,12 +214,66 @@ func TestIntentAtomicity_HonorsDeferredMiddleBoundary(t *testing.T) {
 		if writeIntentMessageRewriteResponse(t, w, req) {
 			return
 		}
-		hits.Add(1)
+		call := hits.Add(1)
 		seqs := offeredIntentSeqs(t, req)
-		if len(seqs) < 3 {
+		if call == 2 {
+			if len(seqs) != 1 || seqs[0] != waitingSeq.Load() {
+				t.Errorf("factual review offered seqs=%v, want only deferred middle %d", seqs, waitingSeq.Load())
+				http.Error(w, "only the unresolved middle may be reoffered", http.StatusBadRequest)
+				return
+			}
+			for _, message := range req.Messages {
+				const prefix = "Plan durable semantic commit candidates for these offered captures:\n"
+				if !strings.HasPrefix(message.Content, prefix) {
+					continue
+				}
+				var payload struct {
+					OfferedCaptures []struct {
+						Path         string `json:"path"`
+						CapturedDiff string `json:"captured_diff"`
+					} `json:"offered_captures"`
+					Candidates []struct {
+						CandidateID  string  `json:"candidate_id"`
+						Status       string  `json:"status"`
+						Ready        bool    `json:"ready"`
+						SelectedSeqs []int64 `json:"selected_seqs"`
+					} `json:"candidates"`
+				}
+				if err := json.NewDecoder(strings.NewReader(strings.TrimPrefix(message.Content, prefix))).Decode(&payload); err != nil {
+					t.Errorf("decode factual middle review: %v", err)
+					return
+				}
+				if len(payload.OfferedCaptures) != 1 || payload.OfferedCaptures[0].Path != "split-b.txt" ||
+					!strings.Contains(payload.OfferedCaptures[0].CapturedDiff, "split-b.txt content") ||
+					!strings.Contains(message.Content, "Review the waiting goals against these facts") ||
+					!strings.Contains(message.Content, "no renderer clipping or omission") ||
+					!strings.Contains(message.Content, "Keep WAIT") {
+					t.Error("factual review did not retain the supplied middle evidence and WAIT guidance")
+				}
+				locked := map[string]bool{}
+				for _, candidate := range payload.Candidates {
+					if candidate.Status == "locked_ready" && candidate.Ready && len(candidate.SelectedSeqs) == 0 {
+						locked[candidate.CandidateID] = true
+					}
+				}
+				if !locked["split-a"] || !locked["split-c"] || len(locked) != 2 {
+					t.Errorf("factual review changed validated bookends: locked=%v", locked)
+				}
+			}
+			writeNativeIntentCandidatesResponse(t, w, "call_split_review", []map[string]any{{
+				"candidate_id": "split-b", "selected_seqs": seqs,
+				"purpose": "wait at the middle boundary", "readiness": "wait",
+				"missing_companions": []string{"middle capture remains deferred"},
+				"grouping_reason":    "planner-defined middle boundary",
+			}})
+			return
+		}
+		if call != 1 || len(seqs) != 3 {
+			t.Errorf("planner call=%d offered seqs=%v, want one initial three-capture plan and one factual review", call, seqs)
 			http.Error(w, "expected three offered captures", http.StatusBadRequest)
 			return
 		}
+		waitingSeq.Store(seqs[1])
 		candidates := []map[string]any{
 			nativeReadyIntentCandidate("split-a", []int64{seqs[0]},
 				"Publish first bookend", "Keep the first change independent.",
@@ -314,8 +370,8 @@ WHERE capture.path='split-b.txt'
 			waiting)
 	}
 
-	if hits.Load() != 1 {
-		t.Fatalf("planner hits=%d want 1 (structural failure skips remote correction)", hits.Load())
+	if hits.Load() != 2 {
+		t.Fatalf("planner hits=%d want 2 (one initial plan and one bounded factual review)", hits.Load())
 	}
 }
 
