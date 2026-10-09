@@ -45,14 +45,64 @@ within the same privacy and evidence limits. Named APIs in inline or fenced
 documentation must point to an actual supplied declaration. Generic prose and
 comments cannot prove a relationship.
 
+A documented command such as `acd support recover --force --yes` can connect
+its documentation to the changed command constructors. ACD checks the exact
+registered command and flags in complete recorded Go files. An option name by
+itself is not enough. Available constructors and regression tests stay in the
+same goal, including when ACD reconstructs history from a saved plan.
+
+A test-table edit can call its implementation outside the changed lines. ACD
+checks the enclosing function in the captured Go file and keeps missing direct
+calls. Previously published companions can supply context when their captured
+path, content and mode still match the current commit. They are never offered
+as new work or committed again. For a companion saved several times, ACD proves
+the final recorded version of each path. Earlier versions remain provenance,
+not missing work. A later correction or regression test can complete a useful
+goal against that published behavior.
+
 ACD retains those relationship lines before clipping large diffs, then keeps
 complete lines from both ends of the remaining evidence. It never reads the
 live worktree to supply that context.
 
-A rejected relationship remains protected for another goal review. The hourly
-review survives restarts and can replace the rejected grouping while keeping
-valid groups. Dependency, verification, and branch safety blocks still require
-their own proven recovery path.
+A rejected relationship remains protected for another goal review after five
+minutes, ten minutes, then hourly if the evidence is unchanged. Restarts preserve
+the deadline; older one-hour waits shorten automatically from their original
+start time. Review can replace the rejected grouping while keeping valid groups.
+The same schedule applies when a valid provider plan leaves a goal waiting;
+caching that plan does not stop later reviews.
+If a valid response omits a capture, ACD keeps that work waiting and checks the
+other proposed goals normally. It cannot publish a goal that needs the omitted
+work. An updated planning contract rechecks older cached waits once; ordinary
+restarts preserve their retry deadlines.
+This also covers a plan that separates an available implementation
+from its supporting test. During publication, ACD can regroup those captures
+only within the frozen target. Later captures remain protected for the next
+plan. Dependency, verification, and branch safety blocks still require their
+own proven recovery path.
+
+For Swift blank-line cleanup, ACD can prove one maintenance goal locally from
+complete recorded before/after files. It joins blank-line space removal and
+extra trailing blank-line removal in one commit, including files left in older
+review windows. Other code changes, multiline literals, and ambiguous line
+endings stay on the normal planning path. This proof also supports explicit
+history reconstruction without sending source to a provider.
+
+A temporary fallback partition keeps captures together until their purpose is
+known. It does not establish a commit boundary. ACD can reoffer the complete,
+protected partition for a new plan instead of preserving an unrelated group.
+If a rejected goal invalidates another goal's prerequisite, both return to
+planning. Independent valid goals stay intact.
+
+A rejected partial plan cannot assign a capture to two retained groups. ACD
+reconsiders that grouping while preserving the capture and valid assignments.
+
+A local fallback message that only names a captured symbol or heading still
+needs goal review. When its wait ends, ACD retries provider planning with the
+protected evidence.
+
+Finalized Intents can supply prerequisites for new work, but cannot absorb new
+captures. If an older cached plan mixes those roles, ACD rebuilds the affected
+part using the remaining planning attempts and keeps valid groups.
 
 Relationship checks and structural verification cannot prove that the planner
 understood the human purpose or that a project builds. Configure a verification
@@ -147,6 +197,35 @@ captures, candidates, dependencies, boundaries, and forced-aging state. The
 baseline must assign every visible capture, preserve hard-dependency closure,
 and pass the structural safety checks. Native v2 providers receive this
 baseline and may refine its grouping and messages.
+
+Retained work outside the offered window remains visible as read-only evidence.
+Only offered captures carry assignment IDs. Dependencies on retained work name
+the owning Intent, so the provider can understand prerequisites without trying
+to assign captures that are still waiting for a later review.
+
+Older local waiting groups labeled `Update files` can be regrouped when their
+recorded provenance proves they are provisional, unpublished, and protected.
+Purposeful waiting goals keep their boundaries and review deadlines.
+
+A stale label does not override a newer exact saved plan that identifies a
+protected group as an unknown goal. The newest native assignment decides this
+check; a later purposeful plan closes older fallback evidence.
+
+Rejecting a ready group does not remove other waiting groups from its retry
+schedule. Older schedules missing those members use the saved plan to recover
+still-pending work on the same branch, keeping the original retry deadline.
+
+Available TypeScript helpers can join their callers through exact static named
+imports and exports from complete recorded files. This check reads at most
+256 KiB per file and 2 MiB per window. Ambiguous modules, dynamic imports, and
+unsupported syntax provide no inferred relationship.
+
+History review uses the same recorded relationships from the selected source
+commits. Later worktree changes cannot alter the saved plan or its validation.
+
+Ordinary WAIT findings do not prevent a protected semantic rejection from being
+reviewed again. Materialization, verification, ownership, and branch safety are
+checked again before publication.
 
 If the baseline is invalid, ACD records `preflight_blocked` and does not call
 the provider. A changed planning snapshot gets a new fingerprint and a fresh
