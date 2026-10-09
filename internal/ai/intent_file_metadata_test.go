@@ -40,3 +40,23 @@ func TestIntentTruncationProvenanceStaysOffTheLegacyWire(t *testing.T) {
 		t.Fatalf("internal truncation flag reached legacy JSON: %s err=%v", encoded, err)
 	}
 }
+
+func TestIntentAggregateClippingRemainsExplicitBelowFileCap(t *testing.T) {
+	t.Parallel()
+	metadata := &IntentFileMetadata{Kind: "text", BeforeBytes: 10, AfterBytes: 100000}
+	diff := "+api_key = abcdef1234567890\n+recorded head\n... <truncated> ...\n+recorded tail\n"
+	request, err := NewIntentPlanRequestV2(IntentPlanRequestV2Options{
+		IncludeCapturedDiffs: true,
+		OfferedCaptures:      []OfferedCapture{{Seq: 1, Path: "settings.go", Op: "modify", CapturedDiff: diff, FileMetadata: metadata}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := request.OfferedCaptures[0]
+	if !capture.CapturedDiffTruncated || capture.FileMetadata.DiffOmittedReason != "truncated" || !request.CapturedDiffTransform.Truncated {
+		t.Fatal("aggregate clipping was mistaken for complete evidence")
+	}
+	if strings.Contains(capture.CapturedDiff, "abcdef1234567890") || metadata.DiffOmittedReason != "" {
+		t.Fatal("normalization leaked a secret or changed caller metadata")
+	}
+}
