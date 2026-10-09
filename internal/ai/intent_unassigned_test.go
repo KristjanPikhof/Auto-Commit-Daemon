@@ -51,6 +51,25 @@ func TestIntentUnassignedCompletionPreservesReadyGoal(t *testing.T) {
 	if err := ValidateIntentPlanV2(req, decoded); err != nil {
 		t.Fatalf("completed ownership is not exact: %v", err)
 	}
+	if !wait.IsHostRetainedWait() || decoded.Candidates[0].IsHostRetainedWait() ||
+		!cloneIntentPlanV2Value(decoded).Candidates[1].IsHostRetainedWait() {
+		t.Fatal("host omission provenance was lost or applied to provider work")
+	}
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var providerPlan IntentPlanV2
+	if err := json.Unmarshal(encoded, &providerPlan); err != nil {
+		t.Fatal(err)
+	}
+	if providerPlan.Candidates[1].IsHostRetainedWait() {
+		t.Fatal("private host provenance crossed the provider JSON boundary")
+	}
+	explicit, err := DecodeIntentPlanV2(encoded, req)
+	if err != nil || explicit.Candidates[1].IsHostRetainedWait() {
+		t.Fatalf("explicit provider WAIT was inferred from purpose or ID: %+v err=%v", explicit, err)
+	}
 }
 
 func TestIntentUnassignedCompletionKeepsUnsafePlansRejected(t *testing.T) {

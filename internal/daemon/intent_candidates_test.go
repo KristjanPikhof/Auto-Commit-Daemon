@@ -891,6 +891,7 @@ func TestIntentCandidateEnginePreservesValidGroupsDuringPartialReplan(t *testing
 }
 
 func TestReplayIntentCandidatePartialReplanResetsPreflightScratch(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	seedTrackedFileCommit(t, ctx, f, "source.go", "package source\n\nfunc Value() int { return 1 }\n")
@@ -1872,6 +1873,7 @@ func TestIntentCandidatePlanAgeDoesNotMakeUnknownGoalReady(t *testing.T) {
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Preset: config.PresetBalanced, Provider: planner.Name(),
 		ForcedAging: true,
+		Now:         time.Now().UTC().Truncate(time.Second),
 	}
 	plan, fallback, _, _, _, _, run, err := chooseIntentCandidatePlan(
 		ctx, req, planner, nil, 2, config.PresetBalanced, nil, db, input)
@@ -1879,12 +1881,17 @@ func TestIntentCandidatePlanAgeDoesNotMakeUnknownGoalReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	if planner.calls != 1 || fallback != "" ||
-		run.ResolutionMode.String != "provider" ||
+		run.ResolutionMode.String != "waiting_semantic_retry" ||
 		len(plan.Candidates) != 1 ||
 		plan.Candidates[0].Readiness != ai.IntentCandidateWait ||
 		len(plan.Candidates[0].MissingCompanions) != 1 {
 		t.Fatalf("calls=%d fallback=%q run=%+v plan=%+v",
 			planner.calls, fallback, run, plan)
+	}
+	retry, found, err := loadIntentSemanticRetry(ctx, db)
+	if err != nil || !found || retry.ReviewCount != 1 ||
+		retry.RetryAtTS != intentPlannerHealthTimestamp(input.Now.Add(5*time.Minute)) {
+		t.Fatalf("aged unknown goal lost its scheduled review: retry=%+v found=%t err=%v", retry, found, err)
 	}
 }
 
@@ -2071,7 +2078,10 @@ WHERE fingerprint=?`, string(raw), run.Fingerprint); err != nil {
 func TestIntentCandidatePlanDoesNotReuseWaitAfterForcedAging(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
-	capture := ai.OfferedCapture{Seq: 1, Path: "service.go", Op: "modify"}
+	capture := ai.OfferedCapture{
+		Seq: 1, Path: "service.go", Op: "modify",
+		CapturedDiff: "--- a/service.go\n+++ b/service.go\n@@ -1,4 +1,5 @@\n package service\n+import \"strings\"\n func ValidEmail(address string) bool {\n- return len(address) > 0\n+ return strings.Contains(address, \"@\")\n }\n",
+	}
 	normalReq, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
 		OfferedCaptures: []ai.OfferedCapture{capture},
 	})
@@ -2091,11 +2101,17 @@ func TestIntentCandidatePlanDoesNotReuseWaitAfterForcedAging(t *testing.T) {
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		Preset: config.PresetBalanced, Provider: planner.Name(),
 		CommitFormat: ai.CommitFormatImperative,
+		Now:          time.Now().UTC().Truncate(time.Second),
 	}
 	_, _, _, _, _, _, normalRun, err := chooseIntentCandidatePlan(
 		ctx, normalReq, planner, nil, 0, config.PresetBalanced, nil, db, input)
 	if err != nil {
 		t.Fatal(err)
+	}
+	retry, found, err := loadIntentSemanticRetry(ctx, db)
+	if err != nil || !found || retry.ReviewCount != 1 ||
+		retry.RetryAtTS != intentPlannerHealthTimestamp(input.Now.Add(5*time.Minute)) {
+		t.Fatalf("initial wait review=%+v found=%t err=%v", retry, found, err)
 	}
 
 	forcedReq, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
@@ -2108,12 +2124,24 @@ func TestIntentCandidatePlanDoesNotReuseWaitAfterForcedAging(t *testing.T) {
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		Candidates: []ai.IntentCandidateAssignment{{
 			CandidateID: "service-change", SelectedSeqs: []int64{1},
-			Purpose:   "finish the available service change",
-			Readiness: ai.IntentCandidateReady, Subject: "Finish service change",
-			GroupingReason: "forced aging releases the complete available capture",
+			Purpose:   "reject email addresses without an at sign",
+			Readiness: ai.IntentCandidateReady, Subject: "Require an at sign in email addresses",
+			Body:           "- Replace nonempty input checks with an address separator check",
+			GroupingReason: "the captured validation and import complete the available behavior",
 		}},
 	}
 	input.ForcedAging = true
+	_, _, _, _, _, _, _, err = chooseIntentCandidatePlan(
+		ctx, forcedReq, planner, nil, 0, config.PresetBalanced, nil, db, input)
+	var wait *IntentSemanticRetryWaitError
+	if !errors.As(err, &wait) || planner.calls != 1 ||
+		intentPlannerHealthTimestamp(wait.RetryAt) != retry.RetryAtTS {
+		t.Fatalf("age bypassed unchanged-evidence cooldown: calls=%d err=%v", planner.calls, err)
+	}
+	if unchanged, found, err := loadIntentSemanticRetry(ctx, db); err != nil || !found || unchanged.RetryAtTS != retry.RetryAtTS || unchanged.ReviewCount != retry.ReviewCount {
+		t.Fatalf("aging reset the review deadline: retry=%+v err=%v", unchanged, err)
+	}
+	input.Now = secondsTime(retry.RetryAtTS)
 	result, _, _, _, _, _, forcedRun, err := chooseIntentCandidatePlan(
 		ctx, forcedReq, planner, nil, 0, config.PresetBalanced, nil, db, input)
 	if err != nil {
@@ -2131,6 +2159,9 @@ func TestIntentCandidatePlanDoesNotReuseWaitAfterForcedAging(t *testing.T) {
 	if len(result.Candidates) != 1 ||
 		result.Candidates[0].Readiness != ai.IntentCandidateReady {
 		t.Fatalf("forced plan=%+v", result)
+	}
+	if err := ValidateIntentGoalPlan(forcedReq, result); err != nil {
+		t.Fatalf("due review did not produce a complete meaningful goal: %v", err)
 	}
 }
 
@@ -4479,12 +4510,7 @@ func TestRuntimeIntentDependencyHintsKeepLateHardEvidenceAfterSoftCap(t *testing
 
 func openIntentCandidateTestDB(t *testing.T) *state.DB {
 	t.Helper()
-	db, err := state.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return cloneDaemonTestState(t, context.Background())
 }
 
 func TestAdvanceTerminalIntentCandidateIDsUsesStableSuccessor(t *testing.T) {

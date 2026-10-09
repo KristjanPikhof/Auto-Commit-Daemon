@@ -128,7 +128,7 @@ func TestOpenAIPlanIntentV2UsesNativeBoundedTool(t *testing.T) {
 	if got := body.Tools[0].Function.Name; got != "capture_intent_plan_v2" {
 		t.Fatalf("tool=%q", got)
 	}
-	if !strings.Contains(body.Messages[1].Content, "previous candidate plan failed") {
+	if !strings.Contains(body.Messages[1].Content, "previous candidate plan against these recorded corrections") {
 		t.Fatalf("correction prompt missing: %s", body.Messages[1].Content)
 	}
 	if strings.Count(body.Messages[1].Content, "x") > IntentAtomicityCorrectionCap+50 {

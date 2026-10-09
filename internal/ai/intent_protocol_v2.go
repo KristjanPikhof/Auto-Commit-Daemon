@@ -218,6 +218,13 @@ type IntentCandidateAssignment struct {
 	Subject             string                   `json:"subject,omitempty"`
 	Body                string                   `json:"body,omitempty"`
 	GroupingReason      string                   `json:"grouping_reason"`
+	hostRetainedWait    bool
+}
+
+// IsHostRetainedWait distinguishes an omitted capture protected by the host
+// from an explicit provider WAIT. The provider cannot set this private marker.
+func (candidate IntentCandidateAssignment) IsHostRetainedWait() bool {
+	return candidate.hostRetainedWait && candidate.Readiness == IntentCandidateWait
 }
 
 // IntentPlanV2 is the native candidate protocol response. Candidate order is
@@ -927,7 +934,7 @@ func BuildIntentPlanV2UserPrompt(req IntentPlanRequestV2) (string, error) {
 	}
 	out := "Plan durable semantic commit candidates for these offered captures:\n" + string(body)
 	if correction := NormalizeIntentAtomicityCorrection(req.RetryCorrection); correction != "" {
-		out += "\n\nThe previous candidate plan failed atomicity validation:\n" + correction +
+		out += "\n\nReview the previous candidate plan against these recorded corrections:\n" + correction +
 			"\n\nReturn a corrected v2 candidate plan. Assign every offered seq exactly once, split disconnected components, preserve every hard dependency, and do not mark a candidate ready while it has missing companions."
 	}
 	return out, nil

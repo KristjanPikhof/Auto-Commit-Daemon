@@ -52,6 +52,7 @@ func retainUnassignedIntentCaptures(req IntentPlanRequestV2, plan IntentPlanV2, 
 			Readiness:         IntentCandidateWait,
 			MissingCompanions: []string{"captured evidence cannot yet explain a meaningful commit goal"},
 			GroupingReason:    "bounded fallback requires planner review",
+			hostRetainedWait:  true,
 		})
 	}
 	if err := ValidateIntentPlanV2(req, completed); err != nil {
