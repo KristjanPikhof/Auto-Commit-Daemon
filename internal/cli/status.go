@@ -706,7 +706,9 @@ func buildPublicationProgressReport(
 				report.IntentStrategy.PlannerHealth, now)
 			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery:
-		case report.CheckpointProtectionAvailable && !report.Protected && progress.WorkerResponsive &&
+		// New observations have their own protection state. They do not
+		// replace the activity of an earlier frozen publication target.
+		case !activeDrain && report.CheckpointProtectionAvailable && !report.Protected && progress.WorkerResponsive &&
 			progress.Phase != "intent_verification_recovery":
 			progress.Phase = "checkpointing"
 		case intentProviderCallActive(report):
@@ -731,7 +733,8 @@ func buildPublicationProgressReport(
 				report.IntentStrategy)
 		}
 	}
-	if progress.Phase == "checkpointing" {
+	// A fresh scan proves capture health, not frozen publication progress.
+	if progress.Phase == "checkpointing" && !activeDrain {
 		progress.LastProgressTS = report.FullPollTS
 	}
 	if progress.LastProgressTS > 0 {

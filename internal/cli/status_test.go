@@ -913,8 +913,12 @@ func TestPublicationProgressPrioritizesDeliberateWaits(t *testing.T) {
 		{name: "configuration validation", mutate: func(report *statusReport) {
 			report.Configuration.Configuration = "validating"
 		}, want: "config_wait"},
-		{name: "checkpoint protection", mutate: func(report *statusReport) {
+		{name: "later checkpoint protection preserves stalled target", mutate: func(report *statusReport) {
 			report.Protected = false
+		}, want: "stalled"},
+		{name: "checkpoint protection without frozen publication", mutate: func(report *statusReport) {
+			report.Protected = false
+			report.PublicationDrain = publicationDrainReport{}
 		}, want: "checkpointing"},
 		{name: "failed verification recovery", mutate: func(report *statusReport) {
 			report.Protected = false
