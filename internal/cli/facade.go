@@ -332,6 +332,7 @@ func runProductFix(
 	if plan == nil {
 		return err
 	}
+	changed := !plan.DryRun && (plan.RowsChanged > 0 || plan.ManualPauseRemoved)
 	if err == nil {
 		stateName := productStateProtected
 		if plan.CaptureHealth.State == "retrying" {
@@ -339,7 +340,9 @@ func runProductFix(
 		} else if plan.CaptureHealth.Error != "" || len(plan.Unsafe) > 0 || plan.DryRun && len(plan.Actions) > 0 {
 			stateName = productStateNeedsAction
 		}
-		return renderAdvancedResult(out, stateName, plan)
+		return renderJSONEnvelope(out, productEnvelope{
+			OK: true, State: stateName, Changed: changed, Actions: []productAction{}, Data: plan,
+		})
 	}
 	commandErr := &CommandError{Code: "recovery_failed", Message: err.Error(), Exit: ExitCode(err)}
 	var existing *CommandError
@@ -347,7 +350,7 @@ func runProductFix(
 		*commandErr = *existing
 	}
 	if renderErr := renderJSONEnvelope(out, productEnvelope{
-		OK: false, State: productStateNeedsAction, Actions: []productAction{}, Data: plan,
+		OK: false, State: productStateNeedsAction, Changed: changed, Actions: []productAction{}, Data: plan,
 		Error: &productError{Code: commandErr.Code, Message: commandErr.Message,
 			Retryable: commandErr.Retryable, Details: commandErr.Details},
 	}); renderErr != nil {
