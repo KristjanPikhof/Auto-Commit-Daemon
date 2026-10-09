@@ -921,7 +921,7 @@ func BuildIntentPlanV2UserPrompt(req IntentPlanRequestV2) (string, error) {
 	if err := ValidateIntentPlanRequestV2(req); err != nil {
 		return "", err
 	}
-	body, err := json.Marshal(req)
+	body, err := json.Marshal(intentPlanV2WireRequest(req))
 	if err != nil {
 		return "", fmt.Errorf("intent planner v2: marshal request: %w", err)
 	}
@@ -944,6 +944,7 @@ func IntentPlannerV2SystemPrompt(format ...CommitFormat) string {
 	return "You are a semantic intent planner for atomic git commits. " +
 		"Return only a v2 candidate plan. Assign every offered seq to exactly one candidate. " +
 		"Output selected_seqs may contain only offered_captures seqs. Existing candidates' selected_seqs and captured_evidence are retained context, not additional assignments. " +
+		"readonly_evidence describes retained or published behavior without selectable capture IDs. readonly_dependencies name known candidate endpoints; honor hard prerequisites between different candidates through depends_on_candidates. " +
 		"To extend an existing mutable candidate, reuse its candidate_id and select only its offered additions; its retained members still belong to the goal and must satisfy completeness. " +
 		"Candidate order must be topological. Non-contiguous capture groups are allowed when dependency evidence proves independence and ordering. " +
 		"A group may add semantic cohesion not present in the dependency graph when the exact diffs prove one intent. Never group by time or directory alone. " +
