@@ -16,13 +16,44 @@ import (
 
 func makeStartRepo(t *testing.T) string {
 	t.Helper()
+	roots := withIsolatedHome(t)
 	repoDir := makeUnregisteredStartRepo(t)
-	roots, err := paths.Resolve()
-	if err != nil {
-		t.Fatalf("resolve paths: %v", err)
-	}
 	registerStartRepoFixture(t, roots, repoDir)
 	return repoDir
+}
+
+func TestStartRepoFixturePreservesInheritedRegistry(t *testing.T) {
+	inherited := withIsolatedHome(t)
+	before, err := json.Marshal(central.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(inherited.RegistryPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inherited.RegistryPath(), before, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	makeStartRepo(t)
+	after, err := os.ReadFile(inherited.RegistryPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("repository fixture changed the inherited registry")
+	}
+	roots, err := paths.Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roots.Share == inherited.Share {
+		t.Fatal("repository fixture reused the inherited registry root")
+	}
+	registry, err := central.Load(roots)
+	if err != nil || len(registry.Repos) != 1 {
+		t.Fatalf("isolated repository registration missing: registry=%+v err=%v", registry, err)
+	}
 }
 
 // registerStartRepoFixture gives start and pause tests explicit repository
