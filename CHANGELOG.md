@@ -36,6 +36,12 @@
   shorten automatically. Corrected plans keep valid goals and capture provenance.
 - Review valid provider plans that leave goals waiting instead of caching those
   plans forever. Ready goals can continue while the unresolved part is reviewed.
+- Group proved Swift blank-line cleanup as one maintenance goal across older
+  review windows. Use complete recorded files and retain the normal safety checks.
+- Rebuild that maintenance proof when reconstructing history locally, so saved
+  plans cannot substitute an unverified formatting claim.
+- Respect the caller's explicit checkpoint deadline so maintenance returns its
+  coverage diagnostic before the client connection closes.
 - Honor explicit archive recovery for pending-only queues. Preserve the whole
   captured chain before recapturing current files, without changing user staging.
 - Hold fallback messages that only name a captured symbol or heading for goal
