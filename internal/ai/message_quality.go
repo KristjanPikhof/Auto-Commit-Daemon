@@ -338,13 +338,30 @@ func isTokenOnlySubject(subject string) bool {
 }
 
 func isCapturedSymbolOnlySubject(subject string, captures []OfferedCapture) bool {
-	tail := strings.Trim(subjectTail(subjectTailForQuality(subject)), "`'\" ")
-	if tail == "" || strings.Contains(tail, " ") {
+	qualitySubject := subjectTailForQuality(subject)
+	tail := strings.Trim(subjectTail(qualitySubject), "`'\" ")
+	if tail == "" {
 		return false
 	}
 	for _, capture := range captures {
-		if changeClass(capture.Path) == "code" && extractSymbol(capture.Path, capture.CapturedDiff) == tail {
+		label := extractSymbol(capture.Path, capture.CapturedDiff)
+		if label == "" || !strings.EqualFold(label, tail) {
+			continue
+		}
+		switch changeClass(capture.Path) {
+		case "code", "tests":
 			return true
+		case "docs":
+			// A new named guide can be a complete goal. Updating an existing
+			// heading only identifies its location, not the changed behavior.
+			if capture.Op == "create" {
+				continue
+			}
+			fields := strings.Fields(qualitySubject)
+			if strings.EqualFold(qualitySubject, tail) || len(fields) > 0 &&
+				(strings.EqualFold(fields[0], "update") || strings.EqualFold(fields[0], "change") || strings.EqualFold(fields[0], "modify")) {
+				return true
+			}
 		}
 	}
 	return false
