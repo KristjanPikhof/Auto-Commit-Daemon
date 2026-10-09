@@ -134,7 +134,7 @@ func TestIntentSemanticCandidateRejectionReviewsAfterRestartAndProtectsLaterCapt
 		t.Fatalf("healthy review still asked for configuration: %q err=%v", raw, err)
 	}
 	retry, found, err := loadIntentSemanticRetry(ctx, f.db)
-	if err != nil || !found || retry.RetryAtTS != intentPlannerHealthTimestamp(input.Now.Add(time.Hour)) {
+	if err != nil || !found || retry.RetryAtTS != intentPlannerHealthTimestamp(input.Now.Add(5*time.Minute)) {
 		t.Fatalf("durable review deadline=%+v found=%t err=%v", retry, found, err)
 	}
 	planner := &semanticRetryReplayPlanner{intentCandidatePlannerStub: intentCandidatePlannerStub{plan: correctedSemanticRejectedPlan(input)}}
@@ -157,7 +157,7 @@ func TestIntentSemanticCandidateRejectionReviewsAfterRestartAndProtectsLaterCapt
 	if err != nil || waiting.NeedsAttention || waiting.ResolutionMode != "waiting_semantic_retry" || planner.calls != 0 {
 		t.Fatalf("restart skipped semantic cooldown: %+v calls=%d err=%v", waiting, planner.calls, err)
 	}
-	input.Now = input.Now.Add(time.Hour + time.Second)
+	input.Now = secondsTime(retry.RetryAtTS).Add(time.Second)
 	reviewed, err := EvaluateIntentCandidates(ctx, f.db, input)
 	if err != nil || reviewed.NeedsAttention || planner.calls != 1 || len(reviewed.Decisions) != 2 {
 		t.Fatalf("due review could not safely split rejected grouping: %+v calls=%d err=%v", reviewed, planner.calls, err)
