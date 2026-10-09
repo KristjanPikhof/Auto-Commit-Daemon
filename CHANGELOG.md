@@ -19,6 +19,39 @@
 
 ### Fixed
 
+- Allow history reconstruction to read larger generated diffs while keeping
+  provider evidence bounded and preserving every recorded file version.
+- Give history planners bounded feedback on conflicting capture assignments
+  so correction retries can resolve overlaps together.
+- Keep verification cleanup diagnostics out of the approved command's output,
+  preserving its exact exit status and descendant cleanup.
+- Review valid provider waits once against supplied recorded evidence, without
+  forcing readiness or spending beyond the existing planning budget.
+- Keep large recorded implementations complete within bounded goal reviews,
+  allowing 64 KiB per capture and 256 KiB of focused live evidence.
+- Keep unresolved WAIT groups available for plan correction instead of treating
+  them as locked ready goals and rejecting their captures on the next attempt.
+- Keep current test and implementation detail ahead of older published context
+  within Intent's evidence limits. Retain the exact published reference used to
+  explain a pending goal when larger support diffs are clipped.
+- Find already-published Go and TypeScript support through recorded references,
+  so later corrections do not wait for code or tests already in the branch.
+- Report provider waits and frozen publication progress separately from
+  checkpoint scans, so ongoing capture cannot hide a stalled commit target.
+- Reoffer protected companions as a normal goal review when an overdue
+  singleton expands. Retry existing targets stopped by that request error.
+- Prefer the newest exact saved plan over stale candidate labels when reopening
+  unknown goals. Later purposeful plans still keep their boundaries.
+- Use bounded recorded TypeScript imports and exports to keep available mock
+  helpers and their callers with the regression they complete.
+- Reopen protected semantic rejections that also carry ordinary WAIT findings,
+  keeping real verification and publication safety failures blocked.
+- Keep waiting groups in the retry schedule when another group fails goal
+  review. Recover missing membership from saved plans without resetting waits.
+- Keep retained planner context read-only so providers cannot select captures
+  outside the offered window. Preserve its source evidence and prerequisites.
+- Release protected provisional groups saved with the legacy `Update files`
+  label, allowing normal goal planning to resume without changing provenance.
 - Persist provider retries at five minutes, ten minutes, then hourly across
   restarts. Outages keep capture active and do not exhaust semantic attempts.
 - Recheck cached and saved plan quality; generic filename, raw-symbol, and
@@ -33,6 +66,14 @@
   companions proven to match the current commit.
 - Retain grouped Go constant ownership and named declarations through evidence
   clipping, so related implementation and regression tests stay together.
+- Connect changed CLI documentation to its exact recorded command registration
+  and flags, keeping available constructors and regression tests together.
+- Rebuild CLI reference proof when applying saved history plans without reading
+  later worktree edits or trusting planner claims.
+- Reconsider rejected partial groups that overlap an existing capture owner,
+  instead of leaving the queue blocked by a derived duplicate assignment.
+- Preserve omitted captures as waiting work while complete verified goals
+  proceed. Recheck waits saved under the earlier planning contract after upgrade.
 - Review rejected goals after five minutes, ten minutes, then hourly for
   unchanged evidence. Restarts preserve deadlines, and older one-hour waits
   shorten automatically. Corrected plans keep valid goals and capture provenance.
