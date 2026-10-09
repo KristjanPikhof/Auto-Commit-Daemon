@@ -32,8 +32,15 @@ func (c Client) Do(ctx context.Context, request Request) (Response, error) {
 	}
 	defer conn.Close()
 	deadline := time.Now().Add(timeout)
-	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
+	if contextDeadline, ok := ctx.Deadline(); ok {
+		if contextDeadline.Before(deadline) {
+			deadline = contextDeadline
+		}
+		// The server must see the caller's limit too, so a timed operation
+		// can return its diagnostic before the client closes the connection.
+		if request.DeadlineMS > contextDeadline.UnixMilli() {
+			request.DeadlineMS = contextDeadline.UnixMilli()
+		}
 	}
 	if request.DeadlineMS > 0 {
 		requested := time.UnixMilli(request.DeadlineMS)
