@@ -85,7 +85,7 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 			return result, classifyIntentPlannerHealthFailure(err, plannerCallFailed)
 		}
 		err = classifyIntentPlannerHealthFailure(err, plannerCallFailed)
-		req.RetryCorrection = ai.SanitizePlannerError(err.Error())
+		req.RetryCorrection = intentHistoryPlanCorrection(req, plan, err)
 	}
 	if err != nil {
 		return result, err
@@ -115,6 +115,9 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 	}
 	return result, nil
 }
+
+// Read generated-data changes before the separate provider evidence clipping.
+const intentHistoryRawDiffCap = 512 << 10
 
 func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHead string, units []git.IntentHistoryUnit, format ai.CommitFormat, includeDiffs bool) ([][]int, ai.IntentPlanRequestV2, error) {
 	// A large history is represented by complete path chains, not by equally
@@ -159,7 +162,7 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHe
 				return nil, ai.IntentPlanRequestV2{}, err
 			}
 		}
-		raw, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, 256<<10, "diff", "--no-ext-diff", "--unified=3", before, last.OldOID, "--", first.Path)
+		raw, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, intentHistoryRawDiffCap, "diff", "--no-ext-diff", "--unified=3", before, last.OldOID, "--", first.Path)
 		if err != nil {
 			return nil, ai.IntentPlanRequestV2{}, err
 		}
@@ -171,8 +174,24 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHe
 	}
 	var relationshipCaptures []IntentCandidateCapture
 	for i, batch := range batches {
+		first, last := units[batch[0]], units[batch[len(batch)-1]]
+		op := "modify"
+		if first.Before.OID == "" {
+			op = "create"
+		}
+		if last.After.OID == "" {
+			op = "delete"
+		}
+		// Reference evidence may read a continuous path chain's postimage.
+		// Pin its resolution to the original commit containing that version.
+		// Maintenance proof still uses individual transitions below.
 		relationshipCaptures = append(relationshipCaptures, IntentCandidateCapture{
-			Event: state.CaptureEvent{Seq: int64(i + 1), Path: units[batch[0]].Path}, CapturedDiff: diffs[i],
+			Event: state.CaptureEvent{Seq: int64(i + 1), Path: first.Path, BaseHead: last.OldOID, Operation: op}, CapturedDiff: diffs[i],
+			Ops: []state.CaptureOp{{EventSeq: int64(i + 1), Op: op, Path: first.Path,
+				BeforeOID:  sql.NullString{String: first.Before.OID, Valid: first.Before.OID != ""},
+				AfterOID:   sql.NullString{String: last.After.OID, Valid: last.After.OID != ""},
+				BeforeMode: sql.NullString{String: first.Before.Mode, Valid: first.Before.Mode != ""},
+				AfterMode:  sql.NullString{String: last.After.Mode, Valid: last.After.Mode != ""}}},
 		})
 	}
 	if includeDiffs {
@@ -188,6 +207,11 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHe
 			}
 			relationshipCaptures[i].CapturedDiff = prependIntentRecordedReferenceContext(relationshipCaptures[i].CapturedDiff, references)
 		}
+		references, err := loadIntentRecordedTypeScriptReferences(ctx, repo, relationshipCaptures)
+		if err != nil {
+			return nil, ai.IntentPlanRequestV2{}, err
+		}
+		attachIntentTypeScriptReferences(relationshipCaptures, references)
 	}
 	diffs = prioritizeIntentRelationshipEvidence(relationshipCaptures)
 	diffs = allocateIntentEvidenceDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
@@ -286,6 +310,12 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHe
 // Keep small companion changes complete before spending the remaining budget
 // on larger changes. Equal clipping can hide an import or a late correction.
 func allocateIntentEvidenceDiffs(raw []string, budget int) []string {
+	return allocateIntentEvidenceDiffsPrioritized(raw, budget, nil)
+}
+
+// Current work gets ordinary body detail before already-published context.
+// Both classes retain their bounded ownership/reference prefixes first.
+func allocateIntentEvidenceDiffsPrioritized(raw []string, budget int, preferred map[int]bool) []string {
 	result := make([]string, len(raw))
 	priorities := make([]string, len(raw))
 	bodies := make([]string, len(raw))
@@ -303,10 +333,18 @@ func allocateIntentEvidenceDiffs(raw []string, budget int) []string {
 		}
 	}
 	for i, body := range bodies {
+		if preferred != nil && !preferred[i] {
+			continue
+		}
 		limits[i] = min(len(body), 512, max(0, budget))
 		budget -= limits[i]
 	}
-	sort.SliceStable(order, func(i, j int) bool { return len(bodies[order[i]]) < len(bodies[order[j]]) })
+	sort.SliceStable(order, func(i, j int) bool {
+		if preferred[order[i]] != preferred[order[j]] {
+			return preferred[order[i]]
+		}
+		return len(bodies[order[i]]) < len(bodies[order[j]])
+	})
 	for _, i := range order {
 		extra := min(len(bodies[i])-limits[i], max(0, budget))
 		limits[i] += extra
