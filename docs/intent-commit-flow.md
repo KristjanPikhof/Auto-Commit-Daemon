@@ -60,9 +60,17 @@ the final recorded version of each path. Earlier versions remain provenance,
 not missing work. A later correction or regression test can complete a useful
 goal against that published behavior.
 
+ACD can find published support through recorded Go calls and type references,
+or exact TypeScript imports. It checks the captured version against the current
+commit before using it. Lookup stays bounded; matching filenames help search
+order but do not prove that changes belong together.
+
 ACD retains those relationship lines before clipping large diffs, then keeps
-complete lines from both ends of the remaining evidence. It never reads the
-live worktree to supply that context.
+complete lines from both ends of the remaining evidence. Live goal reviews allow
+64 KiB per capture and 256 KiB in total, so ordinary implementation changes can
+remain complete. Current captures get detail before already-published context.
+The exact published call or type reference stays available even when its other
+lines are clipped. ACD never reads the live worktree to supply that context.
 
 A rejected relationship remains protected for another goal review after five
 minutes, ten minutes, then hourly if the evidence is unchanged. Restarts preserve
@@ -70,6 +78,10 @@ the deadline; older one-hour waits shorten automatically from their original
 start time. Review can replace the rejected grouping while keeping valid groups.
 The same schedule applies when a valid provider plan leaves a goal waiting;
 caching that plan does not stop later reviews.
+Before accepting that wait, ACD can make one review against explicit supplied
+diff and published-reference facts, within the existing planning budget.
+Validated ready goals stay intact. A goal that still lacks what it needs keeps
+its wait and retry deadline.
 If a valid response omits a capture, ACD keeps that work waiting and checks the
 other proposed goals normally. It cannot publish a goal that needs the omitted
 work. An updated planning contract rechecks older cached waits once; ordinary
@@ -94,7 +106,7 @@ If a rejected goal invalidates another goal's prerequisite, both return to
 planning. Independent valid goals stay intact.
 
 A rejected partial plan cannot assign a capture to two retained groups. ACD
-reconsiders that grouping while preserving the capture and valid assignments.
+reconsiders waiting groups together while preserving validated ready goals.
 
 A local fallback message that only names a captured symbol or heading still
 needs goal review. When its wait ends, ACD retries provider planning with the
@@ -177,6 +189,11 @@ ACD never invents an intermediate file version. Reconstruction is bounded to
 selections must be narrowed. Structural verification alone does not claim that
 builds or tests passed.
 
+ACD reconstructs generated files from their exact recorded versions. Shortened
+provider evidence does not omit those changes from the resulting files.
+If a planner assigns the same path chain to several goals, ACD rejects the plan
+and identifies the conflicting assignments in its bounded correction retries.
+
 ## Presets
 
 | Preset | Publication behavior |
@@ -226,6 +243,14 @@ commits. Later worktree changes cannot alter the saved plan or its validation.
 Ordinary WAIT findings do not prevent a protected semantic rejection from being
 reviewed again. Materialization, verification, ownership, and branch safety are
 checked again before publication.
+
+An overdue singleton becomes a normal goal review when protected companions
+join it. Existing targets stopped by the old singleton request error reopen
+only when their remaining members are protected and no transaction is active.
+
+Fresh capture scans do not count as progress on a frozen publication target.
+Status and list keep its progress, provider waits, and goal-review deadlines
+visible while ACD protects newer edits.
 
 If the baseline is invalid, ACD records `preflight_blocked` and does not call
 the provider. A changed planning snapshot gets a new fingerprint and a fresh
