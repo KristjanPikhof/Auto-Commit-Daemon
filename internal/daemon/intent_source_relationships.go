@@ -248,6 +248,11 @@ func intentSourceSymbolsForPath(sourcePath, diff string) (map[string]struct{}, m
 			declared[name] = struct{}{}
 		}
 	}
+	for _, declaration := range intentRecordedGoConstantWitnesses(sourcePath, diff) {
+		if len(declared) < 128 {
+			declared[intentSourceCrossFileDeclaration(declaration)] = struct{}{}
+		}
+	}
 	for _, line := range intentSourceCodeWitnessesForPath(sourcePath, diff) {
 		name := intentSourceCrossFileDeclaration(line)
 		if name != "" {
@@ -296,12 +301,26 @@ func intentSourceUsedNamesWithCap(sourcePath, diff string, cap int) map[string]s
 func intentProvidedDeclarationContext(diff string) string {
 	const prefix = "Recorded post-image references:\n"
 	const separator = "\nRecorded diff:\n"
-	if strings.HasPrefix(diff, prefix) {
-		if end := strings.Index(diff, separator); end >= 0 {
-			return diff[len(prefix):end]
+	var context strings.Builder
+	// Prioritization retains original declaration lines in its own outer
+	// header. They still describe the recorded owner after diff clipping.
+	for range 2 {
+		header := prefix
+		if strings.HasPrefix(diff, intentRelationshipEvidencePrefix) {
+			header = intentRelationshipEvidencePrefix
 		}
+		if !strings.HasPrefix(diff, header) {
+			break
+		}
+		end := strings.Index(diff, separator)
+		if end < 0 {
+			break
+		}
+		context.WriteString(diff[len(header):end])
+		context.WriteByte('\n')
+		diff = diff[end+len(separator):]
 	}
-	return ""
+	return context.String()
 }
 
 func intentSourceAPIDeclarationWitnesses(sourcePath, diff string) []intentSourceCodeWitness {

@@ -27,6 +27,8 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 	}
 	withReferences := make(map[int64]bool)
 	withRawDiff := make(map[int64]bool)
+	rawDiffs := make(map[int64]string)
+	goCalls := make(map[int64]intentRecordedGoCalls)
 	var referenceNames intentReferenceNames
 	loadRawDiff := func(capture *IntentCandidateCapture) error {
 		if withRawDiff[capture.Event.Seq] {
@@ -39,6 +41,19 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		}
 		if raw != "" {
 			capture.CapturedDiff = intentCompleteRawDiff(raw)
+		}
+		rawDiffs[capture.Event.Seq] = capture.CapturedDiff
+		for i := len(capture.Ops) - 1; i >= 0; i-- {
+			op := capture.Ops[i]
+			if op.Path != capture.Event.Path {
+				continue
+			}
+			calls, err := loadIntentRecordedGoCalls(ctx, input.RepoPath, op.Path, op.AfterOID.String, op.AfterMode.String, capture.CapturedDiff, intentSourceReferenceContextCap)
+			if err != nil {
+				return err
+			}
+			goCalls[capture.Event.Seq] = calls
+			break
 		}
 		return nil
 	}
@@ -66,6 +81,7 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 					return err
 				}
 			}
+			references = mergeIntentRecordedGoCallContext(goCalls[capture.Event.Seq].context, references)
 			capture.CapturedDiff = prependIntentRecordedReferenceContext(capture.CapturedDiff, references)
 			break
 		}
@@ -81,6 +97,9 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		}
 	}
 	referenceNames = intentOtherCaptureReferenceNames(freshCaptures)
+	for _, capture := range freshCaptures {
+		addIntentRecordedGoCallNames(referenceNames, capture.Event.Path, goCalls[capture.Event.Seq])
+	}
 	for i := range captures {
 		if newCaptures[captures[i].Event.Seq] && len(withReferences) < ai.IntentCandidateCaptureCap {
 			if err := attachReferences(&captures[i]); err != nil {
@@ -162,9 +181,14 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		if err := loadRawDiff(&captures[i]); err != nil {
 			return nil, err
 		}
-		relatedCaptures = append(relatedCaptures, captures[i])
+		rawCapture := captures[i]
+		rawCapture.CapturedDiff = rawDiffs[capture.Event.Seq]
+		relatedCaptures = append(relatedCaptures, rawCapture)
 	}
 	referenceNames = intentOtherCaptureReferenceNames(relatedCaptures)
+	for _, capture := range relatedCaptures {
+		addIntentRecordedGoCallNames(referenceNames, capture.Event.Path, goCalls[capture.Event.Seq])
+	}
 	for i := range captures {
 		if !detailed[captures[i].Event.Seq] {
 			continue

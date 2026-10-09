@@ -43,6 +43,7 @@ func prioritizeIntentRelationshipEvidence(captures []IntentCandidateCapture) []s
 		}
 		declarationLines = append(declarationLines, intentSourceEnclosingDeclarationsForPath(capture.Event.Path, capture.CapturedDiff)...)
 		declarationLines = append(declarationLines, intentSourceCodeWitnessesWithContext(capture.Event.Path, intentProvidedDeclarationContext(capture.CapturedDiff), true)...)
+		declarationLines = append(declarationLines, intentRecordedGoConstantWitnesses(capture.Event.Path, capture.CapturedDiff)...)
 		apiNames := make(map[string]bool)
 		for _, line := range declarationLines {
 			if role == "code" && len(apiNames) < 128 &&

@@ -30,11 +30,35 @@ func intentRecordedDeclarationContext(sourcePath, contents string, referenced in
 			return ""
 		}
 		for _, declaration := range file.Decls {
+			if constants, ok := declaration.(*ast.GenDecl); ok && constants.Tok == token.CONST {
+				needed := false
+				for _, specification := range constants.Specs {
+					values, ok := specification.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for _, name := range values.Names {
+						owner := referenced[name.Name]
+						needed = needed || referenced.outside(name.Name, sourcePath) &&
+							!owner.crossDirectory && path.Dir(owner.path) == path.Dir(sourcePath)
+					}
+				}
+				if needed {
+					first := positions.Position(constants.Pos()).Offset
+					last := positions.Position(constants.End()).Offset
+					declarations = append(declarations, contents[first:last])
+				}
+				continue
+			}
 			function, ok := declaration.(*ast.FuncDecl)
 			if !ok || function.Recv != nil || function.Body == nil {
 				continue
 			}
 			if !referenced.outside(function.Name.Name, sourcePath) {
+				continue
+			}
+			owner := referenced[function.Name.Name]
+			if owner.goPackage != "" && (owner.goPackage != file.Name.Name || path.Dir(owner.path) != path.Dir(sourcePath)) {
 				continue
 			}
 			start := positions.Position(function.Pos()).Offset
@@ -71,8 +95,10 @@ func intentRecordedDeclarationContext(sourcePath, contents string, referenced in
 }
 
 type intentReferenceName struct {
-	path   string
-	shared bool
+	path           string
+	shared         bool
+	crossDirectory bool
+	goPackage      string
 }
 
 type intentReferenceNames map[string]intentReferenceName
@@ -97,8 +123,9 @@ func intentOtherCaptureReferenceNames(captures []IntentCandidateCapture) intentR
 			owner, found := owners[name]
 			if !found {
 				owners[name] = intentReferenceName{path: capture.Event.Path}
-			} else if !owner.shared && owner.path != capture.Event.Path {
+			} else if owner.path != capture.Event.Path {
 				owner.shared = true
+				owner.crossDirectory = owner.crossDirectory || path.Dir(owner.path) != path.Dir(capture.Event.Path)
 				owners[name] = owner
 			}
 		}
