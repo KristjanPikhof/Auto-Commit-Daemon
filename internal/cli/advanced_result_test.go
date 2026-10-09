@@ -25,16 +25,17 @@ func TestProductFixJSONPreservesRefusedPlan(t *testing.T) {
 		t.Fatalf("fix error=%v rendered=%v", err, ErrorRendered(err))
 	}
 	var result struct {
-		OK    bool          `json:"ok"`
-		State productState  `json:"state"`
-		Data  fixPlan       `json:"data"`
-		Error *productError `json:"error"`
+		OK      bool          `json:"ok"`
+		Changed bool          `json:"changed"`
+		State   productState  `json:"state"`
+		Data    fixPlan       `json:"data"`
+		Error   *productError `json:"error"`
 	}
 	decoder := json.NewDecoder(&out)
 	if err := decoder.Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if result.OK || result.State != productStateNeedsAction || result.Error == nil || len(result.Data.Unsafe) == 0 {
+	if result.OK || result.Changed || result.State != productStateNeedsAction || result.Error == nil || len(result.Data.Unsafe) == 0 {
 		t.Fatalf("refusal lost actionable plan: %+v", result)
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
