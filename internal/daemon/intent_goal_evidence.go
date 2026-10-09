@@ -136,6 +136,11 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 			break
 		}
 	}
+	typeScriptReferences, err := loadIntentRecordedTypeScriptReferences(ctx, input.RepoPath, captures)
+	if err != nil {
+		return nil, err
+	}
+	attachIntentTypeScriptReferences(captures, typeScriptReferences)
 	edges, err := BuildIntentCandidateDependencies(input.BranchRef, input.BranchGeneration, captures, append(append([]IntentDependencyHint(nil), input.Hints...), runtimeIntentDependencyHints(captures)...), input.Now)
 	if err != nil {
 		return nil, err
@@ -197,6 +202,7 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		if err := attachReferences(&captures[i]); err != nil {
 			return nil, err
 		}
+		attachIntentTypeScriptReferences(captures[i:i+1], typeScriptReferences)
 		diffs[i] = captures[i].CapturedDiff
 	}
 	priorityCaptures := append([]IntentCandidateCapture(nil), captures...)

@@ -98,6 +98,15 @@ func expandIntentGoalWindow(
 			return nil, nil, "", err
 		}
 	}
+	typeScriptReferences, err := loadIntentRecordedTypeScriptReferences(ctx, repoRoot, captures)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	attachIntentTypeScriptReferences(captures, typeScriptReferences)
+	captures, err = proveIntentCobraCLIReferences(ctx, repoRoot, active.BaseHead, captures)
+	if err != nil {
+		return nil, nil, "", err
+	}
 	dependencies, err := BuildIntentCandidateDependencies(active.BranchRef,
 		active.BranchGeneration, captures, nil, now)
 	if err != nil {
@@ -106,7 +115,7 @@ func expandIntentGoalWindow(
 	request := ai.IntentPlanRequestV2{}
 	for _, capture := range captures {
 		request.OfferedCaptures = append(request.OfferedCaptures, ai.OfferedCapture{
-			Seq: capture.Event.Seq, Path: capture.Event.Path, CapturedDiff: capture.CapturedDiff,
+			Seq: capture.Event.Seq, Path: capture.Event.Path, CapturedDiff: capture.CapturedDiff, FileMetadata: capture.FileMetadata,
 		})
 	}
 	for _, edge := range dependencies {
