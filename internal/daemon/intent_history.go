@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"reflect"
@@ -39,7 +40,7 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 	if err != nil {
 		return result, err
 	}
-	batches, req, err := intentHistoryEvidence(ctx, repo, branch, baseTree, units, format, includeDiffs)
+	batches, req, err := intentHistoryEvidence(ctx, repo, branch, baseTree, chain[len(chain)-1], units, format, includeDiffs)
 	if err != nil {
 		return result, err
 	}
@@ -115,7 +116,7 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 	return result, nil
 }
 
-func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree string, units []git.IntentHistoryUnit, format ai.CommitFormat, includeDiffs bool) ([][]int, ai.IntentPlanRequestV2, error) {
+func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHead string, units []git.IntentHistoryUnit, format ai.CommitFormat, includeDiffs bool) ([][]int, ai.IntentPlanRequestV2, error) {
 	// A large history is represented by complete path chains, not by equally
 	// clipped commit messages. Every underlying transition retains ownership.
 	batches := make([][]int, 0, len(units))
@@ -202,8 +203,42 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree string, u
 		diff := diffs[i]
 		seq := int64(i + 1)
 		capture := IntentCandidateCapture{Event: state.CaptureEvent{Seq: seq, BranchRef: branch, BranchGeneration: 0, Path: first.Path, Operation: op}, CapturedDiff: diff}
+		// Only individual recorded transitions can prove a normalization.
+		// A net path change must not hide substantive intermediate versions.
+		if len(batch) == 1 {
+			capture.Event.State = state.EventStatePending
+			capture.Ops = []state.CaptureOp{{EventSeq: seq, Op: op, Path: first.Path,
+				BeforeOID:  sql.NullString{String: first.Before.OID, Valid: first.Before.OID != ""},
+				AfterOID:   sql.NullString{String: last.After.OID, Valid: last.After.OID != ""},
+				BeforeMode: sql.NullString{String: first.Before.Mode, Valid: first.Before.Mode != ""},
+				AfterMode:  sql.NullString{String: last.After.Mode, Valid: last.After.Mode != ""}}}
+		}
 		captures = append(captures, capture)
 		offered = append(offered, ai.OfferedCapture{Seq: seq, Path: first.Path, Op: op, Fidelity: "recorded_history", CapturedDiff: diff})
+	}
+	captures, err = proveIntentSwiftBlankLineMaintenance(ctx, repo, captures)
+	if err != nil {
+		return nil, ai.IntentPlanRequestV2{}, err
+	}
+	// CLI references describe the final registered command. Unlike a
+	// maintenance proof, they can use a complete, continuous path chain.
+	cliCaptures := append([]IntentCandidateCapture(nil), captures...)
+	for i, batch := range batches {
+		first, last := units[batch[0]], units[batch[len(batch)-1]]
+		cliCaptures[i].Event.State = state.EventStatePending
+		cliCaptures[i].Ops = []state.CaptureOp{{EventSeq: cliCaptures[i].Event.Seq, Op: cliCaptures[i].Event.Operation, Path: first.Path,
+			BeforeOID:  sql.NullString{String: first.Before.OID, Valid: first.Before.OID != ""},
+			AfterOID:   sql.NullString{String: last.After.OID, Valid: last.After.OID != ""},
+			BeforeMode: sql.NullString{String: first.Before.Mode, Valid: first.Before.Mode != ""},
+			AfterMode:  sql.NullString{String: last.After.Mode, Valid: last.After.Mode != ""}}}
+	}
+	cliCaptures, err = proveIntentCobraCLIReferences(ctx, repo, sourceHead, cliCaptures)
+	if err != nil {
+		return nil, ai.IntentPlanRequestV2{}, err
+	}
+	for i := range captures {
+		captures[i].FileMetadata = cliCaptures[i].FileMetadata
+		offered[i].FileMetadata = captures[i].FileMetadata
 	}
 	edges, err := BuildIntentCandidateDependencies(branch, 0, captures, runtimeIntentDependencyHints(captures), time.Now())
 	if err != nil {
@@ -358,7 +393,7 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 	if baseTree != plan.BaseTree {
 		return nil, errors.New("intent history: saved base differs from source parent")
 	}
-	batches, req, err := intentHistoryEvidence(ctx, repo, plan.SourceBranchRef, baseTree, original, ai.CommitFormat(plan.CommitFormat), true)
+	batches, req, err := intentHistoryEvidence(ctx, repo, plan.SourceBranchRef, baseTree, plan.ExpectedHead, original, ai.CommitFormat(plan.CommitFormat), true)
 	if err != nil {
 		return nil, err
 	}
