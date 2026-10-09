@@ -2938,6 +2938,11 @@ func Run(ctx context.Context, opts Options) error {
 					recoveredDrain, recoverErr = RecoverTransportWaitPublicationDrain(
 						passCtx, opts.RepoPath, opts.DB, *activeDrain, time.Now().UTC())
 				}
+				if recoverErr == nil && recoveredDrain == nil &&
+					publicationDrainRuntimeBlock(*activeDrain, passBundle) == "" {
+					recoveredDrain, recoverErr = RecoverUnknownIntentDependencyPublicationDrain(
+						passCtx, opts.RepoPath, opts.DB, *activeDrain, time.Now().UTC())
+				}
 				if recoverErr == nil && recoveredDrain == nil {
 					recoveredDrain, recoverErr = RecoverForcedIntentBoundPublicationDrain(
 						passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,

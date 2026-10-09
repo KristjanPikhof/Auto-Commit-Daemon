@@ -892,6 +892,10 @@ func ResumePublicationDrainCheckpointing(
 	if err != nil {
 		return drain, err
 	}
+	recheckingPlanDependency, err := publicationDrainUnknownPlanDependency(ctx, db, drain)
+	if err != nil {
+		return drain, err
+	}
 	recheckingHeadAdvance := drain.Phase == state.PublicationDrainNeedsAction &&
 		publicationDrainReason(drain) == publicationReasonHeadChanged
 	recheckingRecoveredTarget := drain.Phase == state.PublicationDrainNeedsAction &&
@@ -900,12 +904,12 @@ func ResumePublicationDrainCheckpointing(
 		publicationDrainReason(drain) == publicationReasonSemanticUnavailable
 	if drain.Phase != state.PublicationDrainCheckpointing &&
 		!recheckingHeadAdvance && !recheckingRecoveredTarget &&
-		!recheckingSemanticMessage && !recheckingProviderWait {
+		!recheckingSemanticMessage && !recheckingProviderWait && !recheckingPlanDependency {
 		return drain, nil
 	}
 	fail := func(reason error) (state.PublicationDrain, error) {
 		if recheckingHeadAdvance || recheckingRecoveredTarget ||
-			recheckingSemanticMessage || recheckingProviderWait {
+			recheckingSemanticMessage || recheckingProviderWait || recheckingPlanDependency {
 			return drain, nil
 		}
 		nowTS := float64(now.UnixNano()) / 1e9
@@ -983,7 +987,7 @@ func ResumePublicationDrainCheckpointing(
 		return fail(err)
 	}
 	if recheckingHeadAdvance || recheckingRecoveredTarget ||
-		recheckingSemanticMessage || recheckingProviderWait {
+		recheckingSemanticMessage || recheckingProviderWait || recheckingPlanDependency {
 		nowTS := float64(now.UnixNano()) / 1e9
 		if nowTS < drain.UpdatedTS {
 			nowTS = drain.UpdatedTS
@@ -1900,6 +1904,13 @@ func UpdatePublicationDrainAfterReplay(
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
 	if !progressed && summary.Disposition == ReplayDispositionTransientWait {
+		if summary.SkippedReason == "intent_v2_waiting_semantic_retry" && !summary.PlannerCircuitOpen &&
+			drain.Phase == state.PublicationDrainEventFallback &&
+			drain.FallbackMode == publicationFallbackLocalUnlock {
+			// The local evidence did not establish a complete goal. Let the
+			// next durable review use the configured semantic planner.
+			update.FallbackMode = publicationFallbackSemanticReplan
+		}
 		if summary.SkippedReason == "intent_v2_waiting_message_rewrite" {
 			update.LastError = strings.TrimSpace(summary.DispositionReason)
 		} else if summary.SkippedReason == intentVerificationResourceWaitSkipReason {

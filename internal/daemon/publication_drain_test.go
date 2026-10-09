@@ -390,7 +390,7 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 	plan, err := planner.PlanIntentV2(context.Background(), ai.IntentPlanRequestV2{
 		ProtocolVersion: ai.IntentPlannerProtocolV2,
 		OfferedCaptures: []ai.OfferedCapture{{
-			Seq: 1, Path: "replay.md", Op: "modify",
+			Seq: 1, Path: "replay.md", Op: "create",
 			CapturedDiff: "+# Protected publication retries\n+Keep captures protected until their provider reconnects.\n",
 		}},
 	})
@@ -399,7 +399,7 @@ func TestConfigureAtomicIntentFallbackAllowsExplicitDeterministicMessages(
 	}
 	if len(plan.Candidates) != 1 ||
 		plan.Candidates[0].Readiness != ai.IntentCandidateReady ||
-		plan.Candidates[0].Subject != "Update Protected publication retries" || !strings.Contains(plan.Candidates[0].Body, "replay.md") {
+		plan.Candidates[0].Subject != "Add Protected publication retries" || !strings.Contains(plan.Candidates[0].Body, "replay.md") {
 		t.Fatalf("plan=%+v", plan)
 	}
 }

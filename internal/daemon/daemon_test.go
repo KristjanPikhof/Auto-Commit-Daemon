@@ -3755,6 +3755,7 @@ func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
 }
 
 func TestRun_SameSHABranchSwitchCommitsToActiveBranch(t *testing.T) {
+	t.Parallel()
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 	ctx := context.Background()
@@ -4541,6 +4542,7 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 	}
 
 	wakeCh := make(chan struct{}, 4)
+	passDone := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
 	manual := Scheduler{
 		Base:         1 * time.Hour,
@@ -4562,6 +4564,12 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 			WakeCh:      wakeCh,
 			ShutdownCh:  shutdownCh,
 			SkipSignals: true,
+			afterRunLoopWorkDecision: func(_, _ bool) {
+				select {
+				case passDone <- struct{}{}:
+				case <-ctx.Done():
+				}
+			},
 		})
 	}()
 	t.Cleanup(func() {
@@ -4571,6 +4579,17 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+	// Startup publishes the mode and branch head before its first work pass
+	// finishes. Wait for that pass so the phase-one wake cannot be consumed
+	// while capture/replay is still processing the startup token.
+	waitFor(t, 2*time.Second, "startup work pass completes", func() bool {
+		select {
+		case <-passDone:
+			return true
+		default:
+			return false
+		}
+	})
 
 	// Force a divergence on disk in two deterministic phases:
 	//
@@ -4609,6 +4628,16 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 	// fixed sleep so this is robust to slow runners.
 	wakeCh <- struct{}{}
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, aheadHead, 3*time.Second)
+	// The persisted head changes within the pass. Finish that pass before
+	// resetting HEAD, so phase two exercises a settled ahead token.
+	waitFor(t, 3*time.Second, "ahead-token work pass completes", func() bool {
+		select {
+		case <-passDone:
+			return true
+		default:
+			return false
+		}
+	})
 
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "reset", "--hard", seedHead); err != nil {
 		t.Fatalf("git reset: %v", err)

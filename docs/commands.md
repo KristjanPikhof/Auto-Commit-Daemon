@@ -328,6 +328,12 @@ a stale publication run when every frozen member is already published or
 recovered. Workers perform that completion automatically during startup and
 normal branch recovery; the command is a fallback for a worker that cannot run.
 
+`acd support recover --force --dry-run` also previews preservation of a queue
+containing only pending work. Apply it with `--force --yes` to save the whole
+captured chain at a private recovery ref and restart capture from current files.
+Recovery keeps the working tree and staging intact. Preserved captures count as
+recovered work; branch commitment is reported separately.
+
 Recovery also reports incomplete capture coverage. With `--yes`, it asks the
 owning worker to retry a checkpoint and returns failure if coverage remains
 incomplete. A no-op check says `checked`, not `applied`. Healthy publication
