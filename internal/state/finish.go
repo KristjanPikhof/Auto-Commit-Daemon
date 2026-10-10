@@ -2,13 +2,13 @@ package state
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strings"
-	"time"
 )
 
 const (
@@ -62,6 +62,8 @@ type FinishRequest struct {
 	Stage         string          `json:"stage"`
 	DeadlineTS    float64         `json:"deadline_ts"`
 	PlanningCalls int             `json:"planning_calls"`
+	PlanID        string          `json:"plan_id,omitempty"`
+	ResultID      string          `json:"result_id,omitempty"`
 	Plan          json.RawMessage `json:"plan,omitempty"`
 	Result        json.RawMessage `json:"result,omitempty"`
 	Publication   json.RawMessage `json:"publication,omitempty"`
@@ -126,8 +128,6 @@ const finishSelect = `SELECT request_id,attempt,target_json,state,stage,dry_run,
  planning_calls,plan_json,result_json,publication_json,reason_code,reason,
  created_ts,updated_ts,superseded_by FROM finish_requests`
 
-func finishTimestamp() float64 { return float64(time.Now().UnixNano()) / float64(time.Second) }
-
 // Every finish boundary is FULL-synchronous before external provider/Git work.
 func beginFinishWrite(ctx context.Context, db *DB) (*sql.Tx, func(), error) {
 	if db == nil {
@@ -156,7 +156,7 @@ func beginFinishWrite(ctx context.Context, db *DB) (*sql.Tx, func(), error) {
 }
 
 func validFinishDeadline(deadline float64) bool {
-	return !math.IsNaN(deadline) && !math.IsInf(deadline, 0) && deadline > finishTimestamp()
+	return !math.IsNaN(deadline) && !math.IsInf(deadline, 0) && deadline > nowSeconds()
 }
 
 func finishTargetJSON(target *FinishTarget) (string, error) {
@@ -205,6 +205,12 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 	r.Plan = json.RawMessage(plan)
 	r.Result = json.RawMessage(result)
 	r.Publication = json.RawMessage(publication)
+	if len(r.Plan) > 0 {
+		r.PlanID = fmt.Sprintf("sha256:%x", sha256.Sum256(r.Plan))
+	}
+	if len(r.Result) > 0 {
+		r.ResultID = fmt.Sprintf("sha256:%x", sha256.Sum256(r.Result))
+	}
 	return r, nil
 }
 
@@ -307,7 +313,7 @@ func StartFinishRequest(ctx context.Context, db *DB, r FinishRequest) (FinishReq
 	r.Attempt = 1
 	r.State = FinishRunning
 	r.Stage = "preparing"
-	r.CreatedTS = finishTimestamp()
+	r.CreatedTS = nowSeconds()
 	r.UpdatedTS = r.CreatedTS
 	if err := insertFinish(ctx, tx, r, targetJSON); err != nil {
 		return FinishRequest{}, false, err
@@ -357,7 +363,7 @@ func RetryFinishRequest(ctx context.Context, db *DB, id string, deadline float64
 	r.Attempt++
 	r.DryRun = dryRun
 	r.DeadlineTS = deadline
-	r.CreatedTS = finishTimestamp()
+	r.CreatedTS = nowSeconds()
 	r.UpdatedTS = r.CreatedTS
 	if err := insertFinish(ctx, tx, r, targetJSON); err != nil {
 		return r, err
@@ -447,7 +453,7 @@ func UpdateFinishRequest(ctx context.Context, db *DB, id string, attempt int, ex
 		return r, ErrFinishState
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE finish_requests SET state=?,stage=?,plan_json=?,result_json=?,publication_json=?,reason_code=?,reason=?,updated_ts=? WHERE request_id=? AND attempt=?`,
-		u.State, u.Stage, string(r.Plan), string(r.Result), string(r.Publication), u.ReasonCode, u.Reason, finishTimestamp(), id, attempt)
+		u.State, u.Stage, string(r.Plan), string(r.Result), string(r.Publication), u.ReasonCode, u.Reason, nowSeconds(), id, attempt)
 	if err != nil {
 		return r, err
 	}
@@ -465,7 +471,7 @@ func ConsumeFinishPlanningCall(ctx context.Context, db *DB, id string, attempt i
 		return 0, err
 	}
 	defer cleanup()
-	result, err := tx.ExecContext(ctx, `UPDATE finish_requests SET planning_calls=planning_calls+1,updated_ts=? WHERE request_id=? AND attempt=? AND state='running' AND planning_calls<2 AND deadline_ts>?`, finishTimestamp(), id, attempt, finishTimestamp())
+	result, err := tx.ExecContext(ctx, `UPDATE finish_requests SET planning_calls=planning_calls+1,updated_ts=? WHERE request_id=? AND attempt=? AND state='running' AND planning_calls<2 AND deadline_ts>?`, nowSeconds(), id, attempt, nowSeconds())
 	if err != nil {
 		return 0, err
 	}
@@ -491,7 +497,7 @@ func InterruptFinishRequests(ctx context.Context, db *DB, worktree string) (int6
 		return 0, err
 	}
 	defer cleanup()
-	result, err := tx.ExecContext(ctx, `UPDATE finish_requests SET state='failed',stage='',reason_code='finish_interrupted',reason='Worker restarted before publication; retry explicitly',updated_ts=? WHERE worktree_id=? AND state='running' AND publication_json=''`, finishTimestamp(), worktree)
+	result, err := tx.ExecContext(ctx, `UPDATE finish_requests SET state='failed',stage='',reason_code='finish_interrupted',reason='Worker restarted before publication; retry explicitly',updated_ts=? WHERE worktree_id=? AND state='running' AND publication_json=''`, nowSeconds(), worktree)
 	if err != nil {
 		return 0, err
 	}

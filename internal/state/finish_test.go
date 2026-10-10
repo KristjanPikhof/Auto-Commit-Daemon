@@ -20,7 +20,7 @@ func finishFixture(t *testing.T, db *DB, n int) FinishRequest {
 	if err := CompleteCheckpoint(ctx, db, cp.ID, cp.Ref, cp.CommitOID, float64(n)); err != nil {
 		t.Fatal(err)
 	}
-	return FinishRequest{ID: fmt.Sprintf("finish-%d", n), DeadlineTS: finishTimestamp() + 300, Target: FinishTarget{Version: 1, RepositoryID: "repository", WorktreeID: cp.WorktreeID, BranchRef: cp.ObservedRef, ExpectedHead: cp.ObservedHead, CheckpointID: cp.ID, CheckpointTree: cp.TreeOID, TargetTree: cp.TreeOID, IndexDigest: "index", Mode: "local", Style: "imperative", ConfigDigest: "config"}}
+	return FinishRequest{ID: fmt.Sprintf("finish-%d", n), DeadlineTS: nowSeconds() + 300, Target: FinishTarget{Version: 1, RepositoryID: "repository", WorktreeID: cp.WorktreeID, BranchRef: cp.ObservedRef, ExpectedHead: cp.ObservedHead, CheckpointID: cp.ID, CheckpointTree: cp.TreeOID, TargetTree: cp.TreeOID, IndexDigest: "index", Mode: "local", Style: "imperative", ConfigDigest: "config"}}
 }
 
 func startFinishFixture(t *testing.T, db *DB, r FinishRequest) FinishRequest {
@@ -138,7 +138,7 @@ func TestFinishStatePreparedJournalAndAttention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RetryFinishRequest(ctx, db, r.ID, finishTimestamp()+300, false); !errors.Is(err, ErrFinishState) {
+	if _, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, false); !errors.Is(err, ErrFinishState) {
 		t.Fatalf("ambiguous retry: %v", err)
 	}
 	next := finishFixture(t, db, 2)
@@ -185,7 +185,7 @@ func TestFinishRetryRestartAndDurableBudget(t *testing.T) {
 	if err != nil || failed.State != FinishFailed {
 		t.Fatalf("failure %+v %v", failed, err)
 	}
-	retried, err := RetryFinishRequest(ctx, reopened, r.ID, finishTimestamp()+600, true)
+	retried, err := RetryFinishRequest(ctx, reopened, r.ID, nowSeconds()+600, true)
 	if err != nil || retried.Attempt != 2 || retried.PlanningCalls != 0 || !retried.DryRun || retried.Target != r.Target {
 		t.Fatalf("retry %+v %v", retried, err)
 	}
@@ -195,7 +195,7 @@ func TestFinishRetryRestartAndDurableBudget(t *testing.T) {
 	if _, err := UpdateFinishRequest(ctx, reopened, r.ID, 2, FinishRunning, FinishUpdate{State: FinishCompleted, Result: json.RawMessage(`{"published":false}`)}); err != nil {
 		t.Fatal(err)
 	}
-	applied, err := RetryFinishRequest(ctx, reopened, r.ID, finishTimestamp()+600, false)
+	applied, err := RetryFinishRequest(ctx, reopened, r.ID, nowSeconds()+600, false)
 	if err != nil || applied.Attempt != 3 || applied.DryRun || applied.Target != r.Target {
 		t.Fatalf("after preview %+v %v", applied, err)
 	}
@@ -210,7 +210,7 @@ func TestFinishRetrySupersedeAndDeadline(t *testing.T) {
 	db, _ := openTestDB(t)
 	first := startFinishFixture(t, db, finishFixture(t, db, 1))
 	failFinishFixture(t, db, first)
-	if _, err := RetryFinishRequest(ctx, db, first.ID, finishTimestamp()-1, false); !errors.Is(err, ErrFinishBudget) {
+	if _, err := RetryFinishRequest(ctx, db, first.ID, nowSeconds()-1, false); !errors.Is(err, ErrFinishBudget) {
 		t.Fatalf("expired retry: %v", err)
 	}
 	next := startFinishFixture(t, db, finishFixture(t, db, 2))
@@ -218,12 +218,12 @@ func TestFinishRetrySupersedeAndDeadline(t *testing.T) {
 	if err != nil || old.SupersededBy != next.ID || old.Target != first.Target {
 		t.Fatalf("supersede %+v %v", old, err)
 	}
-	if _, err := RetryFinishRequest(ctx, db, first.ID, finishTimestamp()+300, false); !errors.Is(err, ErrFinishState) {
+	if _, err := RetryFinishRequest(ctx, db, first.ID, nowSeconds()+300, false); !errors.Is(err, ErrFinishState) {
 		t.Fatalf("superseded retry: %v", err)
 	}
 	expired := finishFixture(t, db, 3)
 	expired.Target.WorktreeID = "other"
-	expired.DeadlineTS = finishTimestamp() - 1
+	expired.DeadlineTS = nowSeconds() - 1
 	if _, _, err := StartFinishRequest(ctx, db, expired); !errors.Is(err, ErrFinishBudget) {
 		t.Fatalf("expired start: %v", err)
 	}
