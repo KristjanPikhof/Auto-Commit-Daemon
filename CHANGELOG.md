@@ -23,6 +23,8 @@
   provider evidence bounded and preserving every recorded file version.
 - Give history planners bounded feedback on conflicting capture assignments
   so correction retries can resolve overlaps together.
+- Review a small frozen publication target together when aged captures would
+  otherwise wait separately for companions already inside that target.
 - Keep verification cleanup diagnostics out of the approved command's output,
   preserving its exact exit status and descendant cleanup.
 - Review valid provider waits once against supplied recorded evidence, without
