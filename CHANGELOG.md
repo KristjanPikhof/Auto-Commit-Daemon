@@ -23,6 +23,8 @@
 
 - Restore known prerequisites after replacing a published candidate's ID.
   Automatically resume protected runs stopped by that missing declaration.
+- Supply proven recent published behavior to later documentation reviews,
+  including correction feedback for stale missing-companion claims.
 - Allow history reconstruction to read larger generated diffs while keeping
   provider evidence bounded and preserving every recorded file version.
 - Give history planners bounded feedback on conflicting capture assignments
