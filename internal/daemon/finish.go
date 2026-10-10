@@ -358,6 +358,10 @@ func (w *FinishWorker) protect(ctx context.Context, wt git.Worktree, cfg FinishW
 			opts.SubmodulePaths[path] = true
 		}
 	}
+	opts.SubmodulePaths, err = protectionSubmodulePaths(ctx, wt.Root, opts.SubmodulePaths, nil)
+	if err != nil {
+		return state.Checkpoint{}, fmt.Errorf("finish: inspect index Gitlinks: %w", err)
+	}
 	opts.WorktreeID = checkpoint.WorktreeID(wt.Root)
 	opts.GitDir = wt.GitDir
 	opts.CheckpointStore = &checkpoint.Store{DB: w.DB}
