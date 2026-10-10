@@ -91,10 +91,8 @@ service, and updates user-level integrations as one rollback-safe operation.
 After installation, interactive setup offers to protect the current repository
 with a separate confirmation. You can also run acd on in each repository.
 
-Start with --dry-run when you want a preview. Fresh setup recommends AI semantic
-commits and tests the selected connection using synthetic content. Local automatic
-commits remain available without credentials or network access. Fresh unattended
-setup requires --provider openai-compat or --provider deterministic. On macOS, run setup
+Start with --dry-run when you want a preview. Fresh setup uses local commits, created only by acd finish, without
+credentials or network access. Intent and provider setup are optional. On macOS, run setup
 from the terminal or coding tool that should own the ACD service.
 Full Disk Access is not required.`,
 		Example: `  acd setup
@@ -111,7 +109,7 @@ Full Disk Access is not required.`,
 			if len(args) == 1 {
 				for _, name := range []string{
 					"dry-run", "yes", "non-interactive", "expect-plan", "integrations", "repo",
-					"experience", "commit-format", "provider", "base-url", "model", "ca-file",
+					"strategy", "experience", "commit-format", "provider", "base-url", "model", "ca-file",
 					"credential-stdin", "accessible", "confirm-endpoint-credentials",
 					"confirm-insecure-http", "confirm-diff-egress", "confirm-intent-repair",
 				} {
@@ -138,7 +136,9 @@ Full Disk Access is not required.`,
 	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Apply only this exact plan ID")
 	cmd.Flags().StringVar(&integrations, "integrations", "auto", "Coding-tool integrations: auto, none, or a comma-separated list")
 	cmd.Flags().BoolVar(&rawFlag, "raw", false, "Compatibility: print a harness snippet without instructions")
-	cmd.Flags().StringVar(&onboarding.Experience, "experience", "", "First setup: everyday or speed")
+	cmd.Flags().StringVar(&onboarding.Strategy, "strategy", "", "First setup: local (default) or intent")
+	cmd.Flags().StringVar(&onboarding.Experience, "experience", "", "Compatibility: everyday or speed")
+	_ = cmd.Flags().MarkHidden("experience")
 	cmd.Flags().StringVar(&onboarding.CommitFormat, "commit-format", "", "First setup: imperative or conventional")
 	cmd.Flags().StringVar(&onboarding.Provider, "provider", "", "First setup: deterministic or openai-compat")
 	cmd.Flags().StringVar(&onboarding.BaseURL, "base-url", "", "OpenAI-compatible base URL")
@@ -282,7 +282,9 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 			setupExperience(onboardingState.Draft),
 			onboardingState.Selection.CommitFormat,
 			onboardingState.Selection.Provider)
-		fmt.Fprintln(cmd.OutOrStdout(), "Provider test: passed with synthetic content.")
+		if onboardingState.Selection.Strategy == "intent" {
+			fmt.Fprintln(cmd.OutOrStdout(), "Provider test: passed with synthetic content.")
+		}
 	}
 	if !nonInteractive && !yes && !quiet && settingsInputTTY(cmd.InOrStdin()) && settingsOutputTTY(cmd.OutOrStdout()) {
 		lookup, lookupErr := loadControlRepo(cmd.Context(), repo)
