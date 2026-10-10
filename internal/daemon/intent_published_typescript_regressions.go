@@ -34,7 +34,7 @@ func discoverIntentPublishedTypeScriptRegressions(ctx context.Context, db *state
 			return intentTypeScriptRecordedFile{}, false, err
 		}
 		remaining -= len(contents)
-		return intentTypeScriptRecordedFile{seq: capture.Event.Seq, path: capture.Event.Path, contents: string(contents), baseHead: capture.Event.BaseHead}, true, nil
+		return newIntentTypeScriptRecordedFile(capture.Event.Seq, capture.Event.Path, string(contents), capture.Event.BaseHead), true, nil
 	}
 	for _, capture := range input.Captures {
 		if strings.HasSuffix(capture.Event.Path, ".test.ts") || strings.HasSuffix(capture.Event.Path, ".spec.ts") || len(sources) >= state.IntentCandidateMaxCaptures-1 {
