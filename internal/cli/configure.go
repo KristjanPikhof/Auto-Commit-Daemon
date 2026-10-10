@@ -1191,7 +1191,6 @@ func snapshotDraft(snapshot settings.Snapshot) map[string]string {
 func selectionDraft(selection settingsui.ConfigureSelection) map[string]string {
 	out := make(map[string]string, 12)
 	out[config.FieldCommitStrategy] = selection.Strategy
-	out[config.FieldCommitPreset] = selection.Preset
 	out[config.FieldCommitFormat] = selection.CommitFormat
 	out[config.FieldProvider] = selection.Provider
 	out[config.FieldModel] = selection.Model
@@ -1209,9 +1208,9 @@ func selectionDraft(selection settingsui.ConfigureSelection) map[string]string {
 }
 
 func configureSelectionFromValues(values map[string]string) settingsui.ConfigureSelection {
-	strategy := fallbackConfigureValue(values[config.FieldCommitStrategy], "intent")
+	strategy := fallbackConfigureValue(values[config.FieldCommitStrategy], "local")
 	preset := fallbackConfigureValue(values[config.FieldCommitPreset], "balanced")
-	provider := fallbackConfigureValue(values[config.FieldProvider], "openai-compat")
+	provider := fallbackConfigureValue(values[config.FieldProvider], "deterministic")
 	baseURL := fallbackConfigureValue(values[config.FieldBaseURL], ai.DefaultOpenAIBaseURL)
 	verification := fallbackConfigureValue(
 		values[config.FieldIntentVerification],
