@@ -1890,7 +1890,7 @@ func TestStatus_StaleHeartbeatOverlay(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if !report.Stale || report.HeartbeatAgeSeconds < 2*time.Hour.Seconds() {
+	if !report.Stale || report.HeartbeatAgeSeconds < 2*60*60 {
 		t.Fatalf("status report=%+v", report)
 	}
 }
