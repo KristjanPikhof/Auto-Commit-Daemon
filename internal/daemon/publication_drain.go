@@ -937,6 +937,12 @@ func ResumePublicationDrainCheckpointing(
 	if err != nil {
 		return drain, err
 	}
+	if !recheckingPlanDependency {
+		recheckingPlanDependency, err = publicationDrainPublishedPlanDependency(ctx, repoRoot, db, drain)
+		if err != nil {
+			return drain, err
+		}
+	}
 	recheckingHeadAdvance := drain.Phase == state.PublicationDrainNeedsAction &&
 		publicationDrainReason(drain) == publicationReasonHeadChanged
 	recheckingRecoveredTarget := drain.Phase == state.PublicationDrainNeedsAction &&

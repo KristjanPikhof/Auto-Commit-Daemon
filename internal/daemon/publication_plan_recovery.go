@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -141,8 +143,56 @@ ORDER BY updated_ts DESC,fingerprint LIMIT 16`, drain.BranchRef, drain.BranchGen
 	return false, rows.Err()
 }
 
+// A saved local baseline could use continuation IDs with the old ownership
+// context. Reopen only a protected target whose named prerequisite is already
+// published and whose exact recorded result still exists in HEAD.
+func publicationDrainPublishedPlanDependency(ctx context.Context, repo string, db *state.DB, drain state.PublicationDrain) (bool, error) {
+	if drain.Phase != state.PublicationDrainNeedsAction || drain.ReasonCode != "publication_failed" ||
+		drain.CommitStrategy != string(ai.CommitStrategyIntent) || len(drain.EventSeqs) == 0 || len(drain.EventSeqs) > state.IntentCandidateMaxCaptures {
+		return false, nil
+	}
+	const format = "intent planner v2: hard_dependency_undeclared: hard dependency %d -> %d crosses candidates without depends_on_candidates"
+	var from, to int64
+	if n, err := fmt.Sscanf(drain.LastError, format, &from, &to); err != nil || n != 2 || from <= 0 || to <= 0 || fmt.Sprintf(format, from, to) != drain.LastError {
+		return false, nil
+	}
+	var safe bool
+	if err := db.ReadSQL().QueryRowContext(ctx, `SELECT
+ EXISTS(SELECT 1 FROM intent_capture_dependencies edge JOIN capture_events prerequisite ON prerequisite.seq=edge.prerequisite_seq
+  JOIN publication_drain_events target ON target.event_seq=edge.dependent_seq
+  WHERE edge.branch_ref=? AND edge.branch_generation=? AND edge.prerequisite_seq=? AND edge.dependent_seq=?
+   AND edge.strength='hard' AND prerequisite.state='published' AND prerequisite.branch_ref=edge.branch_ref
+   AND prerequisite.branch_generation=edge.branch_generation AND target.drain_id=?)
+ AND NOT EXISTS(SELECT 1 FROM self_publications WHERE branch_ref=? AND branch_generation=? AND phase IN ('prepared','git_applied'))
+ AND NOT EXISTS(SELECT 1 FROM intent_repairs WHERE branch_ref=? AND branch_generation=? AND status IN ('prepared','git_applied'))
+ AND NOT EXISTS(SELECT 1 FROM operations WHERE worktree_id=? AND status IN ('prepared','active'))
+ AND (SELECT COUNT(*) FROM publication_drain_events target JOIN capture_events event ON event.seq=target.event_seq
+  WHERE target.drain_id=? AND event.state='pending' AND event.branch_ref=? AND event.branch_generation=?
+   AND EXISTS(SELECT 1 FROM checkpoint_events member JOIN checkpoints checkpoint ON checkpoint.id=member.checkpoint_id
+    WHERE member.event_seq=event.seq AND checkpoint.phase='completed' AND checkpoint.retained=1
+     AND checkpoint.coverage_complete=1 AND checkpoint.observed_ref=event.branch_ref))=?`,
+		drain.BranchRef, drain.BranchGeneration, from, to, drain.ID,
+		drain.BranchRef, drain.BranchGeneration, drain.BranchRef, drain.BranchGeneration, drain.WorktreeID,
+		drain.ID, drain.BranchRef, drain.BranchGeneration, len(drain.EventSeqs)).Scan(&safe); err != nil || !safe {
+		return false, err
+	}
+	ops, err := state.LoadCaptureOpsBounded(ctx, db, from, state.IntentCandidateMaxCaptures)
+	if err != nil || len(ops) == 0 {
+		return false, err
+	}
+	head, err := gitpkg.RevParse(ctx, repo, "HEAD")
+	if err != nil {
+		return false, err
+	}
+	_, proven, err := gitpkg.ProvePublicationAtHEAD(ctx, repo, "", head, publicationProofOps(ops), gitpkg.PublicationProofPolicy{MissingRefIsMismatch: true})
+	return proven, err
+}
+
 func RecoverUnknownIntentDependencyPublicationDrain(ctx context.Context, repo string, db *state.DB, drain state.PublicationDrain, now time.Time) (*state.PublicationDrain, error) {
 	proved, err := publicationDrainUnknownPlanDependency(ctx, db, drain)
+	if err == nil && !proved {
+		proved, err = publicationDrainPublishedPlanDependency(ctx, repo, db, drain)
+	}
 	if err != nil || !proved {
 		return nil, err
 	}
