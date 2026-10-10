@@ -1501,12 +1501,3 @@ func newIntentRepairID() (string, error) {
 	}
 	return hex.EncodeToString(raw[:]), nil
 }
-
-func sortedIntentRepairCandidateIDs(values map[string]string) []string {
-	out := make([]string, 0, len(values))
-	for value := range values {
-		out = append(out, value)
-	}
-	sort.Strings(out)
-	return out
-}
