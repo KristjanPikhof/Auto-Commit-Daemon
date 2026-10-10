@@ -408,10 +408,22 @@ func withLockedExpectedRefTimeout(
 	requireRecoveryNamespace bool,
 	transactionTimeout time.Duration,
 	fn func(context.Context) error,
+	replacementOID ...string,
 ) error {
 	if repoDir == "" {
 		return fmt.Errorf("git: locked ref verification called with empty repoDir")
 	}
+	if len(replacementOID) > 1 {
+		return fmt.Errorf("git: locked ref transaction accepts one replacement")
+	}
+	newOID := ""
+	if len(replacementOID) == 1 {
+		newOID = replacementOID[0]
+		if newOID == "" || strings.ContainsAny(newOID, " \t\r\n\x00") {
+			return fmt.Errorf("git: invalid locked ref replacement")
+		}
+	}
+
 	if !isValidFullRef(ref) {
 		return fmt.Errorf("git: locked ref %q must be a valid full ref name", ref)
 	}
@@ -452,7 +464,11 @@ func withLockedExpectedRefTimeout(
 	// visible to the callback without killing Git underneath a commit that is
 	// still finishing. Preparation is bounded before the callback, and cleanup
 	// gets a fresh bound after the callback returns.
-	cmd := exec.Command("git", "update-ref", "--no-deref", "--stdin")
+	args := []string{"update-ref", "--no-deref", "--stdin"}
+	if newOID != "" {
+		args = append([]string{"-c", "core.fsync=reference", "-c", "core.fsyncMethod=fsync"}, args...)
+	}
+	cmd := exec.Command("git", args...)
 	cmd.Dir = repoDir
 	cmd.Env = scrubEnv(nil)
 	// Include transaction hooks in cancellation so inherited pipes cannot keep
@@ -558,8 +574,12 @@ func withLockedExpectedRefTimeout(
 	if err := expectOK("start"); err != nil {
 		return failPrepare("start", err)
 	}
-	if err := write("verify " + ref + " " + expectedOID); err != nil {
-		return failPrepare("verify", err)
+	primary := "verify " + ref + " " + expectedOID
+	if newOID != "" {
+		primary = "update " + ref + " " + newOID + " " + expectedOID
+	}
+	if err := write(primary); err != nil {
+		return failPrepare("primary", err)
 	}
 	if secondaryRef != "" {
 		if err := write("verify " + secondaryRef + " " + secondaryExpectedOID); err != nil {
