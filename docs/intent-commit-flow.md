@@ -43,91 +43,60 @@ A group publishes only after cohesion, completeness, separation, dependency,
 materialization, verification, and revertibility checks. No preset bypasses
 hard dependencies, materialization, or required verification.
 
-Ready groups need supplied source, test, registration, generated-file, or
-version-chain evidence. A confident planner explanation cannot join unrelated
-changes. Available implementation and test corrections stay together. ACD
-checks message quality again when it reloads a cached or saved plan.
+Ready groups need recorded source, test, registration, generated-file, or
+version-chain evidence. A planner explanation alone cannot join unrelated
+changes. Missing companions must follow from concrete evidence; a useful
+correction or documentation goal does not always need new implementation or tests.
+ACD rechecks message quality when it reloads a cached or saved plan.
 
-An unchanged call can still connect a changed caller to its changed owner.
-ACD keeps matching references and declarations from captured file versions,
-within the same privacy and evidence limits. Named APIs in inline or fenced
-documentation must point to an actual supplied declaration. Generic prose and
-comments cannot prove a relationship.
+ACD uses captured file versions to connect changed owners and callers, even
+when the relevant call falls outside the edited lines. Go calls and types,
+static TypeScript imports and exports, script file references, and named APIs
+can supply that proof. Documented commands must match recorded registration
+and flags, such as `acd support recover --force --yes`; an option name alone
+is insufficient. Documentation can also connect through matching descriptions
+of the same behavior. Generic prose and comments do not establish code ownership.
 
-A documented command such as `acd support recover --force --yes` can connect
-its documentation to the changed command constructors. ACD checks the exact
-registered command and flags in complete recorded Go files. An option name by
-itself is not enough. Available constructors and regression tests stay in the
-same goal, including when ACD reconstructs history from a saved plan.
+Published companions provide read-only context when their final recorded path,
+content, and mode match the current branch. Intermediate saves remain provenance.
+Lookup stays bounded, and filenames affect search order without proving a
+relationship. Published goals cannot absorb new captures. Stale plans that
+try to do so return to planning.
 
-A test-table edit can call its implementation outside the changed lines. ACD
-checks the enclosing function in the captured Go file and keeps missing direct
-calls. Previously published companions can supply context when their captured
-path, content and mode still match the current commit. They are never offered
-as new work or committed again. For a companion saved several times, ACD proves
-the final recorded version of each path. Earlier versions remain provenance,
-not missing work. A later correction or regression test can complete a useful
-goal against that published behavior.
+Relationship lines survive evidence clipping. Live reviews allow 64 KiB per
+capture and 256 KiB in total, with current work ahead of older published context.
+ACD keeps complete lines from both ends of a clipped diff and retains the exact
+published call or type that admitted support. It reads recorded blobs rather
+than the live worktree. TypeScript declarations are parsed once per recorded
+file and reused across comparisons with published tests.
 
-ACD can find published support through recorded Go calls and type references,
-or exact TypeScript imports. It checks the captured version against the current
-commit before using it. Lookup stays bounded; matching filenames help search
-order but do not prove that changes belong together.
+For a frozen target, later protected explanatory Go edits can clarify intent
+only when their code tokens are identical and they contain no compiler
+directives. These comments supply context; they do not add later work to the
+publication target.
 
-ACD retains those relationship lines before clipping large diffs, then keeps
-complete lines from both ends of the remaining evidence. Live goal reviews allow
-64 KiB per capture and 256 KiB in total, so ordinary implementation changes can
-remain complete. Current captures get detail before already-published context.
-The exact published call or type reference stays available even when its other
-lines are clipped. ACD never reads the live worktree to supply that context.
+Rejected goals and valid provider waits receive another review after five
+minutes, ten minutes, then hourly for unchanged evidence. Restarts preserve
+deadlines. Older one-hour waits shorten from their original start time, and
+an upgraded planning contract rechecks older cached waits once. ACD may review
+a wait once against supplied diff and published-reference facts within the
+existing planning budget. Readiness still requires every normal gate.
 
-A rejected relationship remains protected for another goal review after five
-minutes, ten minutes, then hourly if the evidence is unchanged. Restarts preserve
-the deadline; older one-hour waits shorten automatically from their original
-start time. Review can replace the rejected grouping while keeping valid groups.
-The same schedule applies when a valid provider plan leaves a goal waiting;
-caching that plan does not stop later reviews.
-Before accepting that wait, ACD can make one review against explicit supplied
-diff and published-reference facts, within the existing planning budget.
-Validated ready goals stay intact. A goal that still lacks what it needs keeps
-its wait and retry deadline.
-If a valid response omits a capture, ACD keeps that work waiting and checks the
-other proposed goals normally. It cannot publish a goal that needs the omitted
-work. An updated planning contract rechecks older cached waits once; ordinary
-restarts preserve their retry deadlines.
-This also covers a plan that separates an available implementation
-from its supporting test. During publication, ACD can regroup those captures
-only within the frozen target. Later captures remain protected for the next
-plan. Dependency, verification, and branch safety blocks still require their
-own proven recovery path.
+Valid ready groups survive correction. Omitted captures remain waiting, and
+incomplete or overlapping groups return to planning together with goals whose
+prerequisites they invalidate. A provisional fallback partition is not a fixed
+commit boundary. Filename, raw-symbol, heading-only, and clipped messages still
+need goal review. Within a frozen target, ACD can regroup an implementation and
+its available tests; later captures stay protected for the next plan.
 
-For Swift blank-line cleanup, ACD can prove one maintenance goal locally from
-complete recorded before/after files. It joins blank-line space removal and
-extra trailing blank-line removal in one commit, including files left in older
-review windows. Other code changes, multiline literals, and ambiguous line
-endings stay on the normal planning path. This proof also supports explicit
-history reconstruction without sending source to a provider.
+For Swift blank-line cleanup, ACD can prove one maintenance goal from complete
+recorded before/after files. It groups whitespace removal from blank lines and
+extra trailing blank lines, including files left in older review windows.
+Multiline literals, ambiguous line endings, and other code edits use ordinary
+planning. Saved history plans rebuild this proof locally without provider access.
 
-A temporary fallback partition keeps captures together until their purpose is
-known. It does not establish a commit boundary. ACD can reoffer the complete,
-protected partition for a new plan instead of preserving an unrelated group.
-If a rejected goal invalidates another goal's prerequisite, both return to
-planning. Independent valid goals stay intact.
-
-A rejected partial plan cannot assign a capture to two retained groups. ACD
-reconsiders waiting groups together while preserving validated ready goals.
-
-A local fallback message that only names a captured symbol or heading still
-needs goal review. When its wait ends, ACD retries provider planning with the
-protected evidence.
-
-Finalized Intents can supply prerequisites for new work, but cannot absorb new
-captures. If an older cached plan mixes those roles, ACD rebuilds the affected
-part using the remaining planning attempts and keeps valid groups.
-
-Relationship checks and structural verification cannot prove that the planner
-understood the human purpose or that a project builds. Configure a verification
-command when those checks are needed.
+Relationship checks cannot prove the human purpose or that a project builds.
+Configure a verification command when build or test results are required.
 
 Candidate evaluation normally waits until the newest capture has been quiet for
 the configured settle window. Filling the planning window does not skip that
@@ -241,10 +210,9 @@ Rejecting a ready group does not remove other waiting groups from its retry
 schedule. Older schedules missing those members use the saved plan to recover
 still-pending work on the same branch, keeping the original retry deadline.
 
-Available TypeScript helpers can join their callers through exact static named
-imports and exports from complete recorded files. This check reads at most
-256 KiB per file and 2 MiB per window. Ambiguous modules, dynamic imports, and
-unsupported syntax provide no inferred relationship.
+TypeScript reference checks read at most 256 KiB per file and 2 MiB per window.
+Ambiguous modules, dynamic imports, and unsupported syntax provide no inferred
+relationship.
 
 History review uses the same recorded relationships from the selected source
 commits. Later worktree changes cannot alter the saved plan or its validation.
@@ -367,8 +335,8 @@ target from the current `HEAD`.
 Recovery then alternates between two bounded modes:
 
 1. `semantic_replan` offers only unresolved target events to the configured
-   provider. Published events satisfy dependencies and appear only as recent
-   history.
+   provider. Verified published events satisfy dependencies and supply read-only
+   recorded context; they cannot be selected for publication again.
 2. If that plan stalls, `local_unlock` selects the smallest safe hard
    dependency component. A singleton is allowed. Its local message describes
    the captured evidence and passes message-quality checks. The next pass
