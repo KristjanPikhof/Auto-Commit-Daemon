@@ -954,6 +954,7 @@ func IntentPlannerV2SystemPrompt(format ...CommitFormat) string {
 		"readonly_evidence describes retained or published behavior without selectable capture IDs. readonly_dependencies name known candidate endpoints; honor hard prerequisites between different candidates through depends_on_candidates. " +
 		"To extend an existing mutable candidate, reuse its candidate_id and select only its offered additions; its retained members still belong to the goal and must satisfy completeness. " +
 		"Candidate order must be topological. Non-contiguous capture groups are allowed when dependency evidence proves independence and ordering. " +
+		"Historical captures with different history_author values must remain in separate goals; preserve prerequisite order across author boundaries. " +
 		"A group may add semantic cohesion not present in the dependency graph when the exact diffs prove one intent. Never group by time or directory alone. " +
 		purposefulCommitGroupingInstructions +
 		"Activity epochs and temporal proximity may trigger evaluation but cannot alone prove cohesion. " +
