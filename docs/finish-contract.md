@@ -72,7 +72,11 @@ There is one unfinished batch per worktree and no begin command. A request
 records repository and worktree identity, attached branch ref, expected HEAD
 (or an absent ref for an unborn branch), source checkpoint/tree identity, retained finish target tree,
 index identity and consent, options, and immutable input evidence before
-planning. Private snapshots retain their normal recovery provenance.
+planning. Build the complete finish target by applying frozen eligible
+checkpoint changes to the base tree while preserving unchanged excluded or
+sensitive tracked entries and gitlinks. Eligibility exclusions never imply
+deleting those branch entries. Pin any target tree different from the source
+checkpoint through its own retained private ref before planning. Private snapshots retain their normal recovery provenance.
 
 An empty newly initialized repository can be protected. An empty finish is a
 successful no-op. A nonempty finish on an attached unborn branch creates its
