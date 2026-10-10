@@ -335,11 +335,16 @@ func StartFinishRequest(ctx context.Context, db *DB, r FinishRequest) (FinishReq
  (state='failed' OR (state='completed' AND dry_run=1 AND attempt>1))`, r.ID, r.UpdatedTS, r.Target.WorktreeID); err != nil {
 		return FinishRequest{}, false, err
 	}
+	// Load before committing: a client deadline after durable acceptance must
+	// not turn an accepted request into an error and strand its worker job.
+	saved, err := loadFinish(ctx, tx, r.ID)
+	if err != nil {
+		return FinishRequest{}, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return FinishRequest{}, false, err
 	}
-	saved, err := LoadFinishRequest(ctx, db, r.ID)
-	return saved, true, err
+	return saved, true, nil
 }
 
 func RetryFinishRequest(ctx context.Context, db *DB, id string, deadline float64, dryRun bool) (FinishRequest, error) {
@@ -384,10 +389,14 @@ func RetryFinishRequest(ctx context.Context, db *DB, id string, deadline float64
 	if err := insertFinish(ctx, tx, r, targetJSON); err != nil {
 		return r, err
 	}
+	saved, err := loadFinish(ctx, tx, id)
+	if err != nil {
+		return r, err
+	}
 	if err := tx.Commit(); err != nil {
 		return r, err
 	}
-	return LoadFinishRequest(ctx, db, id)
+	return saved, nil
 }
 
 func validFinishTransition(from, to string) bool {
