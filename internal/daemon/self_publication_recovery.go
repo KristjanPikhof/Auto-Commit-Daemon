@@ -589,6 +589,16 @@ func resolveSelfPublicationRef(
 	ctx context.Context,
 	repoRoot, branchRef string,
 ) (string, bool, error) {
+	// update-ref's no-deref proof cannot treat a branch alias as the branch.
+	_, symbolicErr := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
+		"symbolic-ref", "--no-recurse", "-q", branchRef)
+	if symbolicErr == nil {
+		return "", false, fmt.Errorf("self-publication branch %s is symbolic", branchRef)
+	}
+	var commandErr *git.Error
+	if !errors.As(symbolicErr, &commandErr) || commandErr.ExitCode != 1 {
+		return "", false, symbolicErr
+	}
 	oid, err := git.RevParse(ctx, repoRoot, branchRef)
 	if errors.Is(err, git.ErrRefNotFound) {
 		return "", false, nil
