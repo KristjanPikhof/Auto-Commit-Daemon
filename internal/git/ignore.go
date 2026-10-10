@@ -103,7 +103,7 @@ func (c *IgnoreChecker) ensureLocked() error {
 	// index lock and refreshing index metadata while ACD is only classifying
 	// paths; restore relies on read-only scans leaving the live index
 	// byte-for-byte unchanged.
-	cmd.Env = scrubEnv(map[string]string{"GIT_OPTIONAL_LOCKS": "0", "GIT_LITERAL_PATHSPECS": "1"})
+	cmd.Env = scrubEnv(map[string]string{"GIT_OPTIONAL_LOCKS": "0"})
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -183,6 +183,12 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 	// Build the NUL-delimited stdin payload.
 	var buf bytes.Buffer
 	for _, p := range paths {
+		// check-ignore rejects pathspec magic, including Git's global literal
+		// mode. A relative prefix makes filenames beginning with :( ordinary
+		// paths without changing their ignore matching.
+		if strings.HasPrefix(p, ":(") {
+			buf.WriteString("./")
+		}
 		buf.WriteString(p)
 		buf.WriteByte(0)
 	}
