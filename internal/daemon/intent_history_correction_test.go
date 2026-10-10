@@ -107,3 +107,60 @@ func TestIntentHistoryOwnershipCorrectionIsBoundedMetadataOnly(t *testing.T) {
 		}
 	}
 }
+
+type mergingHistoryOwnershipPlanner struct {
+	t     *testing.T
+	calls int
+}
+
+func (*mergingHistoryOwnershipPlanner) Name() string { return "history-merged-goal-correction" }
+
+func (p *mergingHistoryOwnershipPlanner) PlanIntentV2(_ context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
+	p.calls++
+	if p.calls == 1 {
+		return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{
+			{CandidateID: "provider-retry-health", SelectedSeqs: []int64{1, 2}, Purpose: "restore provider readiness after a wait", Readiness: ai.IntentCandidateReady,
+				Subject: "Restore provider readiness", Body: "- Resume readiness through the provider wait helper", GroupingReason: "the readiness consumer requires its provider wait implementation"},
+			{CandidateID: "intent-history-observability", SelectedSeqs: []int64{2, 3}, Purpose: "verify provider readiness after a wait", Readiness: ai.IntentCandidateReady,
+				Subject: "Verify provider readiness", Body: "- Cover the public readiness consumer and its recovery result", GroupingReason: "the focused regression calls the public readiness consumer"},
+		}}, nil
+	}
+	for _, expected := range []string{"merge those inseparable goals", "all their required implementation, callers, tests, and documentation", "combined net behavior", "connected overlap set", "correct the assignment instead", `seq=2 owners=["intent-history-observability","provider-retry-health"]`} {
+		if !strings.Contains(req.RetryCorrection, expected) {
+			p.t.Fatalf("correction omitted complete-goal guidance %q: %s", expected, req.RetryCorrection)
+		}
+	}
+	return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{{
+		CandidateID: "restore-provider-readiness", SelectedSeqs: []int64{1, 2, 3}, Purpose: "restore and verify provider readiness after a wait", Readiness: ai.IntentCandidateReady,
+		Subject: "Restore provider readiness after waits", Body: "- Keep the wait helper, readiness consumer, and regression complete",
+		GroupingReason: "the wait helper, its public consumer, and the direct regression form one complete readiness behavior",
+	}}}, nil
+}
+
+func TestIntentHistoryCorrectionMergesInseparableGoals(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newCaptureFixture(t)
+	first := mustCommitPath(t, f.dir, "provider_wait.go", "package provider\nfunc RetryProviderWait() bool { return true }\n", "Add provider wait readiness")
+	second := mustCommitPath(t, f.dir, "provider.go", "package provider\nfunc ProviderReady() bool { return RetryProviderWait() }\n", "Expose provider readiness")
+	head := mustCommitPath(t, f.dir, "provider_test.go", "package provider\nimport \"testing\"\nfunc TestProviderReady(t *testing.T) { if !ProviderReady() { t.Fatal(\"provider did not resume\") } }\n", "Verify provider readiness")
+	planner := &mergingHistoryOwnershipPlanner{t: t}
+	plan, err := PlanIntentHistory(ctx, f.dir, f.cctx.BranchRef, []string{first, second, head}, planner, ai.CommitFormatImperative, true)
+	if err != nil || planner.calls != 2 || len(plan.Goals) != 1 || len(plan.Goals[0].Units) != 3 {
+		t.Fatalf("inseparable goals did not merge through bounded correction: goals=%+v calls=%d err=%v", plan.Goals, planner.calls, err)
+	}
+	if plan.Goals[0].Message != "Restore provider readiness after waits\n\n- Keep the wait helper, readiness consumer, and regression complete" {
+		t.Fatalf("merged goal lost its semantic message: %q", plan.Goals[0].Message)
+	}
+	replacements, err := ValidateIntentHistoryPlan(ctx, f.dir, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := git.RevParse(ctx, f.dir, head+"^{tree}")
+	if err != nil || len(replacements) != 1 || replacements[0].TreeOID != tree {
+		t.Fatalf("merged goal changed the recorded final tree: replacements=%+v tree=%s err=%v", replacements, tree, err)
+	}
+	if current, err := git.RevParse(ctx, f.dir, "HEAD"); err != nil || current != head {
+		t.Fatalf("correction changed source HEAD: %s want=%s err=%v", current, head, err)
+	}
+}

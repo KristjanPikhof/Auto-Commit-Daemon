@@ -56,7 +56,7 @@ func intentHistoryPlanCorrection(req ai.IntentPlanRequestV2, plan ai.IntentPlanV
 		}
 	}
 	sort.Slice(conflicts, func(i, j int) bool { return conflicts[i] < conflicts[j] })
-	correction += "\nEach offered history capture is indivisible. A coalesced recorded path chain cannot be split between goals. Return every offered seq exactly once; revised goals must still satisfy cohesion and dependencies.\nRejected ownership overlaps:"
+	correction += "\nEach offered history capture is indivisible. A coalesced recorded path chain cannot be split between goals. If multiple goals genuinely require the same capture, merge those inseparable goals with all their required implementation, callers, tests, and documentation; rewrite their purpose and commit message around the combined net behavior. Resolve the entire connected overlap set together. If goals are independently complete and ownership was merely mistaken, correct the assignment instead. Do not drop captures or invent hunk splits. Return every offered seq exactly once; revised goals must still satisfy cohesion, dependencies, completeness, and materialization.\nRejected ownership overlaps:"
 	shown := 0
 	// Reserve room for an explicit omission count, and append complete rows only.
 	limit := ai.IntentAtomicityCorrectionCap - 128
