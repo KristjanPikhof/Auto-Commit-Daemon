@@ -152,16 +152,17 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 			err, root, processErr, detail)
 	}
 	client := supervisor.Client{SocketPath: scratchRoots.SupervisorSocketPath(), Timeout: 45 * time.Second}
-	file := filepath.Join(repo, "capture-protection.md")
-	guide := "# Capture protection guide\n\nSave captured file versions in durable checkpoints before publication.\n"
-	if err := os.WriteFile(file, []byte(guide), 0o644); err != nil {
+	captureGuidePath := filepath.Join(repo, "capture-protection.md")
+	captureGuide := "# Capture protection guide\n\nSave captured file versions in durable checkpoints before publication.\n"
+	if err := os.WriteFile(captureGuidePath, []byte(captureGuide), 0o644); err != nil {
 		return err
 	}
 	if _, err := selfTestRequest(ctx, client, registration.Record, "checkpoint_barrier", nil); err != nil {
 		return err
 	}
-	guide += "Keep later edits protected while the current publication target stays frozen.\n"
-	if err := os.WriteFile(file, []byte(guide), 0o644); err != nil {
+	publicationGuidePath := filepath.Join(repo, "publication-target.md")
+	publicationGuide := "# Publication target guide\n\nKeep later edits protected while the current publication target stays frozen.\n"
+	if err := os.WriteFile(publicationGuidePath, []byte(publicationGuide), 0o644); err != nil {
 		return err
 	}
 	drainParams, _ := json.Marshal(map[string]bool{"drain_publication": true})
@@ -217,8 +218,10 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	if indexAfter, readErr := os.ReadFile(filepath.Join(wt.GitDir, "index")); readErr != nil || string(indexAfter) != string(indexBefore) {
 		return errors.New("setup self-test: restore changed index")
 	}
-	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("setup self-test: restore did not remove the new guide: %v", err)
+	for _, file := range []string{captureGuidePath, publicationGuidePath} {
+		if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("setup self-test: restore did not remove %s: %v", filepath.Base(file), err)
+		}
 	}
 	params, _ = json.Marshal(map[string]string{"id": restoreResult.UndoCheckpoint})
 	undoPreview, err := selfTestRequest(ctx, client, registration.Record, "restore_plan", params)
@@ -232,8 +235,10 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	if _, err := selfTestRequest(ctx, client, registration.Record, "restore_apply", params); err != nil {
 		return err
 	}
-	if content, err := os.ReadFile(file); err != nil || string(content) != guide {
-		return fmt.Errorf("setup self-test: undo did not restore the guide: %v", err)
+	for file, expected := range map[string]string{captureGuidePath: captureGuide, publicationGuidePath: publicationGuide} {
+		if content, err := os.ReadFile(file); err != nil || string(content) != expected {
+			return fmt.Errorf("setup self-test: undo did not restore %s: %v", filepath.Base(file), err)
+		}
 	}
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "fsck", "--no-dangling"); err != nil {
 		return err

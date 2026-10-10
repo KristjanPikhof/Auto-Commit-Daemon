@@ -24,7 +24,7 @@
 
 ### Fixed
 
-- Give setup's isolated self-test a meaningful documentation goal so Intent can
+- Give setup's isolated self-test meaningful documentation goals so Intent can
   publish it, then verify that restore and undo preserve the expected file contents.
 - Build and test with Go 1.26.9 to include the standard-library security fixes.
 - Recover background queues that exceed the goal window after repeated edits to
