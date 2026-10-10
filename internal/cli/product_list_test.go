@@ -41,7 +41,7 @@ func TestProductListOnceNeedsActionJSONRendersThenExitsThree(t *testing.T) {
 	repo := registerProductListNeedsActionRepo(t)
 
 	var out bytes.Buffer
-	err := runProductListOnce(context.Background(), &out, true, false)
+	err := runProductListOnceView(context.Background(), &out, true, false, false)
 	if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
 		t.Fatalf("exit=%d rendered=%v err=%v, want rendered exit %d", ExitCode(err), ErrorRendered(err), err, ExitActionRequired)
 	}
@@ -77,7 +77,7 @@ func TestProductListOnceOffRepositoryRequiresAction(t *testing.T) {
 	repo := registerProductListOffRepo(t, roots, materializeTestRepo(t, false))
 
 	var out bytes.Buffer
-	err := runProductListOnce(context.Background(), &out, true, false)
+	err := runProductListOnceView(context.Background(), &out, true, false, false)
 	if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
 		t.Fatalf("exit=%d rendered=%v err=%v, want rendered exit %d", ExitCode(err), ErrorRendered(err), err, ExitActionRequired)
 	}
@@ -143,7 +143,7 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := renderProductListTable(&out, entries, false); err != nil {
+	if err := renderProductListDashboard(&out, entries, false, true); err != nil {
 		t.Fatalf("render table: %v", err)
 	}
 	for _, row := range []struct {

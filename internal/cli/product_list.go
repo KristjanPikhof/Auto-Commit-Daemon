@@ -162,10 +162,6 @@ func productListShellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-func runProductListOnce(ctx context.Context, out io.Writer, jsonOut, verbose bool) error {
-	return runProductListOnceView(ctx, out, jsonOut, verbose, false)
-}
-
 func runProductListOnceView(ctx context.Context, out io.Writer, jsonOut, verbose, showAll bool) error {
 	data, stateName, err := collectProductList(ctx)
 	if err != nil {
@@ -203,10 +199,6 @@ func productListRequiresAction(entries []productListEntry) bool {
 		}
 	}
 	return false
-}
-
-func runProductListWatch(ctx context.Context, out io.Writer, interval time.Duration, verbose bool) error {
-	return runProductListWatchView(ctx, out, interval, verbose, false)
 }
 
 func runProductListWatchView(ctx context.Context, out io.Writer, interval time.Duration, verbose, showAll bool) error {
@@ -293,10 +285,6 @@ func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]
 		}
 	}
 
-}
-
-func renderProductListTable(out io.Writer, entries []productListEntry, verbose bool) error {
-	return renderProductListDashboard(out, entries, verbose, true)
 }
 
 func renderProductListDashboard(out io.Writer, entries []productListEntry, verbose, showAll bool) error {
