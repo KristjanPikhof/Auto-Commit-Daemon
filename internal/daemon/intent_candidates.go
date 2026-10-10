@@ -3384,7 +3384,7 @@ func localIntentPlanRepairSignature(plan ai.IntentPlanV2) string {
 // repairIntentCandidateDependencies adds only dependency declarations already
 // proven by hard capture edges. It works on a deep clone and returns success
 // only when the complete v2 validator accepts the result, so cycles, unknown
-// owners, non-topological plans, and unrelated structural defects leave the
+// owners, dependency cycles, and unrelated structural defects leave the
 // original plan untouched.
 func repairIntentCandidateDependencies(
 	req ai.IntentPlanRequestV2,
@@ -3431,6 +3431,11 @@ func repairIntentCandidateDependencies(
 			changed = true
 		}
 	}
+	ordered := stableTopologicalIntentCandidates(repaired.Candidates)
+	for i := range ordered {
+		changed = changed || ordered[i].CandidateID != repaired.Candidates[i].CandidateID
+	}
+	repaired.Candidates = ordered
 	if !changed || ai.ValidateIntentPlanV2(req, repaired) != nil {
 		return plan, false
 	}
@@ -3472,6 +3477,7 @@ func declareIntentFallbackDependencies(
 		repaired.Candidates[toIndex].DependsOnCandidates = append(
 			repaired.Candidates[toIndex].DependsOnCandidates, fromID)
 	}
+	repaired.Candidates = stableTopologicalIntentCandidates(repaired.Candidates)
 	return repaired
 }
 
