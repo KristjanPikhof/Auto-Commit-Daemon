@@ -292,8 +292,9 @@ of its name. If the terminal disconnects or the worker restarts, publication
 continues and the next `acd commit-all --yes` reconnects to the same drain.
 This is a priority request: ACD interrupts background planning and reviews the
 protected target immediately. It brings an existing goal-review deadline
-forward once, without relaxing commit quality or repeatedly calling a failed
-provider. Provider outages retain their retry schedule.
+forward once, without relaxing commit quality. For the first five minutes,
+planning corrections retry after 30, 60, then 90 seconds. Longer waits return
+to the background schedule. Provider outages retain their retry schedule.
 If the worker socket is unavailable, the command can still read the saved
 target and its last error. A saved active run does not prove that a worker is
 publishing it; worker recovery remains necessary before it can continue.
@@ -304,6 +305,9 @@ semantic commit message before publication.
 ACD restores missing declarations for known published prerequisites. A saved
 run stopped by this mismatch resumes automatically after ACD proves that the
 target is protected and the prerequisite's recorded version is still in Git.
+Later documentation reviews can use a bounded set of recent published goals
+whose recorded versions still match Git. Those goals supply evidence without
+being selected for another commit.
 
 The barrier accepts only a completed checkpoint for the requested worktree,
 branch, generation, and observation. A checkpoint from another branch or
