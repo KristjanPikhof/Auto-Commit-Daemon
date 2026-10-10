@@ -157,6 +157,12 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 	for _, capture := range input.Captures {
 		related[capture.Event.Seq] = true
 	}
+	// Same-target publication is baseline provenance, not a causal edge. A late
+	// documentation capture can review the already-proven implementation/test
+	// bodies without making them selectable or claiming prose proves cohesion.
+	for seq := range input.frozenPublishedContext {
+		related[seq] = true
+	}
 	for changed := true; changed; {
 		changed = false
 		for _, edge := range edges {
