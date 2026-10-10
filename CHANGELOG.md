@@ -25,6 +25,8 @@
   so correction retries can resolve overlaps together.
 - Review a small frozen publication target together when aged captures would
   otherwise wait separately for companions already inside that target.
+- Show documentation follow-ups proven published companions from the same
+  frozen target, so reviews do not wait for work already in the branch.
 - Keep verification cleanup diagnostics out of the approved command's output,
   preserving its exact exit status and descendant cleanup.
 - Review valid provider waits once against supplied recorded evidence, without
