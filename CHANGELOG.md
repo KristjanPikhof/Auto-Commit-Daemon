@@ -21,6 +21,10 @@
 
 ### Fixed
 
+- Put declared prerequisites before their consumers during Intent plan repair,
+  and resume protected runs whose saved plan can be safely reordered.
+- Bound recovery lookups by the dependencies in the saved plan, so accumulated
+  historical goals cannot prevent recovery.
 - Keep `commit-all` attached to its exact publication run when a newer run
   becomes the latest, so completed commands stop waiting.
 - Restore known prerequisites after replacing a published candidate's ID.
