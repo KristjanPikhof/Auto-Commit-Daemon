@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"reflect"
 	"testing"
@@ -15,6 +16,76 @@ import (
 )
 
 type intentGoalWindowPlanner struct{ intentCandidatePlannerStub }
+
+func TestIntentGoalWindowRecoversOversizedPathQueue(t *testing.T) {
+	t.Parallel()
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	var body string
+	for i := 0; i <= state.IntentCandidateMaxCaptures; i++ {
+		body = fmt.Sprintf("# Recording archive reference\nRevision %d\n", i)
+		captureSamePathEdit(t, ctx, f, "archive.md", body)
+	}
+	head, _ := git.RevParse(ctx, f.dir, "HEAD")
+	index, _ := git.Run(ctx, git.RunOpts{Dir: f.dir}, "write-tree")
+	opts := ReplayOpts{GitDir: f.gitDir, CommitStrategy: ai.CommitStrategyIntent,
+		IntentPlanner: &intentGoalWindowPlanner{}, IntentPreset: config.PresetBalanced,
+		IntentWindow: 10, IntentBypassBatchWait: true, IntentIncludeDiffs: true,
+		IntentVerificationMode: "structural"}
+	summary, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || !summary.RecaptureRequired || !summary.HasMore || summary.Published != 0 {
+		t.Fatalf("oversized queue did not recover: summary=%+v err=%v", summary, err)
+	}
+	pending, err := state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("recovered queue remains pending: %d err=%v", len(pending), err)
+	}
+	var snapshotID int64
+	if err := f.db.SQL().QueryRowContext(ctx, `SELECT id FROM recovery_snapshots`).Scan(&snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok, err := state.RecoverySnapshotByID(ctx, f.db, snapshotID)
+	if err != nil || !ok || snapshot.EventCount != state.IntentCandidateMaxCaptures+1 || snapshot.Outcome != state.EventStateRecovered {
+		t.Fatalf("incomplete recovery: snapshot=%+v ok=%v err=%v", snapshot, ok, err)
+	}
+	saved, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "show", snapshot.CommitOID+":archive.md")
+	if err != nil || string(saved) != body {
+		t.Fatalf("recovery lost captured version: %q err=%v", saved, err)
+	}
+	if actual, _ := git.RevParse(ctx, f.dir, "HEAD"); actual != head {
+		t.Fatal("recovery moved the branch")
+	}
+	if actual, _ := git.Run(ctx, git.RunOpts{Dir: f.dir}, "write-tree"); string(actual) != string(index) {
+		t.Fatal("recovery changed staging")
+	}
+	if _, err := BootstrapShadow(ctx, f.dir, f.db, f.cctx); err != nil {
+		t.Fatal(err)
+	}
+	f.firstCapture(t)
+	pending, err = state.PendingEvents(ctx, f.db, 0)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("current version not recaptured: %d err=%v", len(pending), err)
+	}
+	opts.IntentPlanner = &intentGoalWindowPlanner{intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+		ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{{
+			CandidateID: "archive-guide", SelectedSeqs: []int64{pending[0].Seq},
+			Purpose: "document recording archive revisions", Readiness: ai.IntentCandidateReady,
+			Subject: "Document recording archive revisions", Body: "- Explain the latest recorded archive revision",
+			GroupingReason: "the recaptured guide completes one documentation goal",
+		}},
+	}}}
+	summary, err = Replay(ctx, f.dir, f.db, f.cctx, opts)
+	if err != nil || summary.Published != 1 {
+		t.Fatalf("publication did not resume: summary=%+v err=%v", summary, err)
+	}
+	published, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "show", "HEAD:archive.md")
+	if err != nil || string(published) != body {
+		t.Fatalf("publication lost current version: %q err=%v", published, err)
+	}
+}
 
 func (*intentGoalWindowPlanner) PlanIntent(context.Context, ai.IntentPlanRequest) (ai.IntentPlan, error) {
 	return ai.IntentPlan{}, errors.New("legacy planner must not bypass native goal readiness")
