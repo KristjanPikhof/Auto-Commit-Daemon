@@ -40,7 +40,7 @@ func TestIntentPlanV2WireKeepsReadonlyProofWithoutAssignmentIDs(t *testing.T) {
 		t.Run(transport, func(t *testing.T) {
 			var payload []byte
 			if transport == "openai" {
-				body, err := buildOpenAIIntentPlanV2Request("test-model", req)
+				body, _, err := buildOpenAIIntentPlanV2RequestWithTrace("test-model", req)
 				if err != nil {
 					t.Fatal(err)
 				}
