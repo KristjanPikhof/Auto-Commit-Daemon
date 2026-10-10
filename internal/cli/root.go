@@ -215,6 +215,7 @@ func newRootCmd() *cobra.Command {
 		withInvocationCapabilities(newOnCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newOffCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newProductListCmd(), commandCapabilities{JSON: true, Quiet: true, Interactive: true, Streaming: true}),
+		withInvocationCapabilities(newFinishCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newProductCommitAllCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newHistoryCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newRestoreCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
