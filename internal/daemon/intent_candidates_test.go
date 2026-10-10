@@ -2165,7 +2165,7 @@ func TestIntentCandidatePlanDoesNotReuseWaitAfterForcedAging(t *testing.T) {
 	}
 }
 
-func TestIntentCandidatePlanRefusesNonTopologicalDependencyRepair(t *testing.T) {
+func TestIntentCandidatePlanOrdersProvenPrerequisitesWithoutChangingGoals(t *testing.T) {
 	req, err := ai.NewIntentPlanRequestV2(ai.IntentPlanRequestV2Options{
 		OfferedCaptures: []ai.OfferedCapture{
 			{Seq: 1, Path: "a.go", Op: "modify"},
@@ -2184,8 +2184,20 @@ func TestIntentCandidatePlanRefusesNonTopologicalDependencyRepair(t *testing.T) 
 			{CandidateID: "dependent", SelectedSeqs: []int64{1}, Purpose: "dependent", Readiness: ai.IntentCandidateReady, Subject: "Update dependent", GroupingReason: "independent candidate"},
 			{CandidateID: "later-prerequisite", SelectedSeqs: []int64{2}, Purpose: "prerequisite", Readiness: ai.IntentCandidateReady, Subject: "Update prerequisite", GroupingReason: "independent candidate"},
 		}}
-	if repaired, ok := repairIntentCandidateDependencies(req, plan); ok || !reflect.DeepEqual(repaired, plan) {
-		t.Fatalf("unsafe repair accepted: ok=%v plan=%+v", ok, repaired)
+	original := cloneIntentPlanV2(plan)
+	want := cloneIntentPlanV2(plan)
+	want.Candidates[0].DependsOnCandidates = []string{"later-prerequisite"}
+	want.Candidates[0], want.Candidates[1] = want.Candidates[1], want.Candidates[0]
+	if repaired, ok := repairIntentCandidateDependencies(req, plan); !ok || !reflect.DeepEqual(repaired, want) || !reflect.DeepEqual(plan, original) {
+		t.Fatalf("repair changed a goal or lost prerequisite order: ok=%v plan=%+v", ok, repaired)
+	}
+	for _, dependency := range []string{"dependent", "unknown-candidate"} {
+		unsafe := cloneIntentPlanV2(plan)
+		unsafe.Candidates[1].DependsOnCandidates = []string{dependency}
+		original := cloneIntentPlanV2(unsafe)
+		if repaired, ok := repairIntentCandidateDependencies(req, unsafe); ok || !reflect.DeepEqual(repaired, original) || !reflect.DeepEqual(unsafe, original) {
+			t.Fatalf("unsafe dependency %q was repaired or mutated: ok=%v plan=%+v", dependency, ok, repaired)
+		}
 	}
 }
 
