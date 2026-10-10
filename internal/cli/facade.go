@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
@@ -383,17 +384,18 @@ func renderAdvancedResult(out io.Writer, stateName productState, data any) error
 }
 
 type historyEntry struct {
-	Retained        bool    `json:"retained"`
-	Outcome         string  `json:"outcome"`
-	RecoveredEvents int     `json:"recovered_events"`
-	ID              string  `json:"id"`
-	Sequence        int64   `json:"sequence"`
-	Reason          string  `json:"reason"`
-	Phase           string  `json:"phase"`
-	CreatedTS       float64 `json:"created_ts"`
-	CommitOID       string  `json:"checkpoint_commit_oid"`
-	Published       bool    `json:"published"`
-	EventCount      int     `json:"event_count"`
+	PublicationOutcome publicationOutcome `json:"publication_outcome"`
+	Retained           bool               `json:"retained"`
+	Outcome            string             `json:"outcome"`
+	RecoveredEvents    int                `json:"recovered_events"`
+	ID                 string             `json:"id"`
+	Sequence           int64              `json:"sequence"`
+	Reason             string             `json:"reason"`
+	Phase              string             `json:"phase"`
+	CreatedTS          float64            `json:"created_ts"`
+	CommitOID          string             `json:"checkpoint_commit_oid"`
+	Published          bool               `json:"published"`
+	EventCount         int                `json:"event_count"`
 }
 
 func newHistoryCmd() *cobra.Command {
@@ -458,7 +460,7 @@ func loadCheckpointHistory(ctx context.Context, repo string) ([]historyEntry, er
 	}
 	defer db.Close()
 	rows, err := db.QueryContext(ctx, `
-SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid, cp.retained,
+SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid, cp.retained, cp.coverage_complete,
        COUNT(ce.event_seq),
        COALESCE(SUM(CASE WHEN e.state='published' THEN 1 ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN e.state='recovered' THEN 1 ELSE 0 END), 0)
@@ -476,17 +478,47 @@ LIMIT 100`)
 	for rows.Next() {
 		var entry historyEntry
 		var publishedEvents int
+		var complete bool
 		if err := rows.Scan(&entry.ID, &entry.Sequence, &entry.Reason,
-			&entry.Phase, &entry.CreatedTS, &entry.CommitOID, &entry.Retained,
+			&entry.Phase, &entry.CreatedTS, &entry.CommitOID, &entry.Retained, &complete,
 			&entry.EventCount, &publishedEvents, &entry.RecoveredEvents); err != nil {
 			return nil, fmt.Errorf("acd history: scan checkpoint: %w", err)
 		}
-		entry.Published = entry.Phase == state.CheckpointCompleted && publishedEvents == entry.EventCount
+		entry.Published = entry.Phase == state.CheckpointCompleted && entry.EventCount > 0 && publishedEvents+entry.RecoveredEvents == entry.EventCount
 		entry.Outcome = checkpointOutcome(entry.Phase, entry.EventCount, publishedEvents, entry.RecoveredEvents)
+		entry.PublicationOutcome = publicationOutcome{CheckpointAvailable: true, Protected: complete && entry.Phase == state.CheckpointCompleted, Resolved: entry.Published, RecoveredChanges: entry.RecoveredEvents}
+		if !complete {
+			entry.Published = false
+			entry.Outcome = "partial"
+			entry.PublicationOutcome.Resolved = false
+		}
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("acd history: iterate checkpoints: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range entries {
+		entry := &entries[i]
+		finish, err := readFinishStatusForCheckpoint(ctx, db, checkpoint.WorktreeID(record.Path), entry.ID)
+		if err != nil {
+			return nil, err
+		}
+		committed := entry.Outcome == "published"
+		if finish != nil && finish.Published {
+			committed = true
+			entry.Published = true
+			entry.Outcome = "published"
+		}
+		if finish != nil && finish.NoChanges && !finish.DryRun {
+			entry.Published = true
+			entry.Outcome = "up_to_date"
+		}
+		entry.PublicationOutcome.Resolved = entry.Published
+		entry.PublicationOutcome.Finish = finish
+		entry.PublicationOutcome.BranchCommitted = &committed
 	}
 	return entries, nil
 }
