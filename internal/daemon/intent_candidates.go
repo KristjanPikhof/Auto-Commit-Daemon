@@ -69,43 +69,44 @@ type IntentCandidateVerifier func(
 // IntentCandidateEvaluation describes one durable planner evaluation. It does
 // not publish commits or mutate Git refs; P8 consumes the publishable decisions.
 type IntentCandidateEvaluation struct {
-	ProviderBudget       time.Duration
-	BranchRef            string
-	BranchGeneration     int64
-	RepoPath             string
-	Captures             []IntentCandidateCapture
-	Hints                []IntentDependencyHint
-	Planner              interface{ Name() string }
-	Health               *IntentPlannerHealth
-	RetryLimit           int
-	RetryLimitSet        bool
-	Preset               config.PresetName
-	CommitFormat         ai.CommitFormat
-	IncludeDiffs         bool
-	ForcedAging          bool
-	Provider             string
-	Model                string
-	ConfigRevisionID     sql.NullInt64
-	ConfigProfile        string
-	PresetID             string
-	PresetVersion        int
-	LatestCommit         *ai.CommitSummary
-	PathContext          []ai.PathCommitContext
-	RecentSoftCommits    []ai.IntentSoftCommitSummary
-	PriorFindings        []ai.IntentAtomicityFinding
-	Materialize          IntentCandidateMaterializer
-	PreflightMaterialize IntentCandidateMaterializer
-	VerificationMode     string
-	Verify               IntentCandidateVerifier
-	ManagedVerification  bool
-	Now                  time.Time
-	TargetEventSeqs      []int64
-	RejectLocalFallback  bool
-	RecoveryCandidateID  string
-	planFingerprint      string
-	plannerWait          **IntentPlannerCircuitOpenError
-	allowSemanticPlan    bool
-	publishedContext     map[string][]IntentCandidateCapture
+	ProviderBudget         time.Duration
+	BranchRef              string
+	BranchGeneration       int64
+	RepoPath               string
+	Captures               []IntentCandidateCapture
+	Hints                  []IntentDependencyHint
+	Planner                interface{ Name() string }
+	Health                 *IntentPlannerHealth
+	RetryLimit             int
+	RetryLimitSet          bool
+	Preset                 config.PresetName
+	CommitFormat           ai.CommitFormat
+	IncludeDiffs           bool
+	ForcedAging            bool
+	Provider               string
+	Model                  string
+	ConfigRevisionID       sql.NullInt64
+	ConfigProfile          string
+	PresetID               string
+	PresetVersion          int
+	LatestCommit           *ai.CommitSummary
+	PathContext            []ai.PathCommitContext
+	RecentSoftCommits      []ai.IntentSoftCommitSummary
+	PriorFindings          []ai.IntentAtomicityFinding
+	Materialize            IntentCandidateMaterializer
+	PreflightMaterialize   IntentCandidateMaterializer
+	VerificationMode       string
+	Verify                 IntentCandidateVerifier
+	ManagedVerification    bool
+	Now                    time.Time
+	TargetEventSeqs        []int64
+	RejectLocalFallback    bool
+	RecoveryCandidateID    string
+	planFingerprint        string
+	plannerWait            **IntentPlannerCircuitOpenError
+	allowSemanticPlan      bool
+	publishedContext       map[string][]IntentCandidateCapture
+	frozenPublishedContext map[int64]bool
 }
 
 // IntentCandidateDecision is one persisted candidate revision plus its exact
@@ -2716,9 +2717,9 @@ func newIntentPlanRun(
 		RejectLocalFallback  bool                   `json:"reject_local_fallback"`
 		AttemptLimit         int                    `json:"attempt_limit"`
 	}{
-		// Valid native waits receive one bounded review of recorded facts.
-		// Reevaluate older waiting plans once under this correction contract.
-		Domain:    "acd.intent-plan-run/v7",
+		// Documentation can now review proven publications in its frozen target.
+		// Reevaluate older waiting plans once with this baseline context.
+		Domain:    "acd.intent-plan-run/v8",
 		Request:   fingerprintRequest,
 		BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
 		Provider: input.Provider, Model: input.Model, Preset: input.Preset,
