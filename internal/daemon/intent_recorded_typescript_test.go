@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,36 +17,66 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+func BenchmarkIntentTypeScriptPublishedSupport(b *testing.B) {
+	const count = 16
+	owner := "export function Helper() {\n" + strings.Repeat(" const value = 1;\n", 64) + " return 1;\n}\n"
+	paths := make([]string, count)
+	tests := make([]string, count)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("owner%d.ts", i)
+		tests[i] = fmt.Sprintf("import { Helper } from \"./owner%d.ts\";\nHelper();\n", i)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		sources := make([]intentTypeScriptRecordedFile, count)
+		for i := range sources {
+			sources[i] = newIntentTypeScriptRecordedFile(int64(i+1), paths[i], owner, "")
+		}
+		for i, contents := range tests {
+			test := newIntentTypeScriptRecordedFile(int64(count+i+1), "support.test.ts", contents, "")
+			pair := append(append([]intentTypeScriptRecordedFile(nil), sources...), test)
+			if intentTypeScriptReferenceContexts(pair)[test.seq] == "" {
+				b.Fatal("published support lost its recorded import")
+			}
+		}
+	}
+}
+
 func TestIntentTypeScriptRecordedReferencesRequireExactImportsAndOwners(t *testing.T) {
 	t.Parallel()
-	owner := intentTypeScriptRecordedFile{seq: 1, path: "tests/runtime/test-helpers.ts", contents: "export class MockWorkerTransport {\n prompt(input: string) { return input.split(/\\r?\\n/); }\n}\nexport class MockWorkerHandle {}\nexport function waitForMicrotasks() {}\n"}
-	consumer := intentTypeScriptRecordedFile{seq: 2, path: "tests/runtime/worker-manager.test.ts", contents: "import { MockWorkerHandle, MockWorkerTransport, waitForMicrotasks } from \"./test-helpers\";\nnew MockWorkerTransport();\n"}
+	const ownerPath = "tests/runtime/test-helpers.ts"
+	const consumerPath = "tests/runtime/worker-manager.test.ts"
+	const ownerContents = "export class MockWorkerTransport {\n prompt(input: string) { return input.split(/\\r?\\n/); }\n}\nexport class MockWorkerHandle {}\nexport function waitForMicrotasks() {}\n"
+	const consumerContents = "import { MockWorkerHandle, MockWorkerTransport, waitForMicrotasks } from \"./test-helpers\";\nnew MockWorkerTransport();\n"
+	owner := newIntentTypeScriptRecordedFile(1, ownerPath, ownerContents, "")
+	consumer := newIntentTypeScriptRecordedFile(2, consumerPath, consumerContents, "")
 	proof := intentTypeScriptReferenceContexts([]intentTypeScriptRecordedFile{owner, consumer})
 	if proof[1] != " export class MockWorkerTransport\n" || proof[2] != " import { MockWorkerHandle, MockWorkerTransport, waitForMicrotasks } from \"./test-helpers\";\n" {
 		t.Fatalf("recorded import and owner were not retained: %+v", proof)
 	}
 	for _, tc := range []struct {
 		name, source, target string
-		extra                *intentTypeScriptRecordedFile
+		ambiguous            bool
 	}{
-		{"comment", "// import { MockWorkerTransport } from \"./test-helpers\";\n", owner.contents, nil},
-		{"block comment", "/*\nimport { MockWorkerTransport } from \"./test-helpers\";\n*/\n", owner.contents, nil},
-		{"quoted prose", "const label = `\nimport { MockWorkerTransport } from \"./test-helpers\";\n`;\n", owner.contents, nil},
-		{"dynamic", "const module = await import(\"./test-helpers\");\n", owner.contents, nil},
-		{"namespace", "import * as helpers from \"./test-helpers\";\n", owner.contents, nil},
-		{"pathspec syntax", "import { MockWorkerTransport } from \"./test-helpers?.ts\";\n", owner.contents, nil},
-		{"wrong owner", consumer.contents, "export class OtherTransport {}\n", nil},
-		{"private owner", consumer.contents, "class MockWorkerTransport {}\n", nil},
-		{"nested owner", consumer.contents, "namespace Private {\nexport class MockWorkerTransport {}\n}\n", nil},
-		{"other directory", "import { MockWorkerTransport } from \"../unrelated/test-helpers\";\n", owner.contents, nil},
-		{"ambiguous resolution", consumer.contents, owner.contents, &intentTypeScriptRecordedFile{seq: 3, path: "tests/runtime/test-helpers/index.ts", contents: owner.contents}},
-		{"oversized owner", consumer.contents, strings.Repeat(" ", intentSourceReferenceScanCap+1) + owner.contents, nil},
-		{"binary owner", consumer.contents, owner.contents + "\x00", nil},
+		{"comment", "// import { MockWorkerTransport } from \"./test-helpers\";\n", ownerContents, false},
+		{"block comment", "/*\nimport { MockWorkerTransport } from \"./test-helpers\";\n*/\n", ownerContents, false},
+		{"quoted prose", "const label = `\nimport { MockWorkerTransport } from \"./test-helpers\";\n`;\n", ownerContents, false},
+		{"dynamic", "const module = await import(\"./test-helpers\");\n", ownerContents, false},
+		{"namespace", "import * as helpers from \"./test-helpers\";\n", ownerContents, false},
+		{"pathspec syntax", "import { MockWorkerTransport } from \"./test-helpers?.ts\";\n", ownerContents, false},
+		{"wrong owner", consumerContents, "export class OtherTransport {}\n", false},
+		{"private owner", consumerContents, "class MockWorkerTransport {}\n", false},
+		{"nested owner", consumerContents, "namespace Private {\nexport class MockWorkerTransport {}\n}\n", false},
+		{"other directory", "import { MockWorkerTransport } from \"../unrelated/test-helpers\";\n", ownerContents, false},
+		{"ambiguous resolution", consumerContents, ownerContents, true},
+		{"oversized owner", consumerContents, strings.Repeat(" ", intentSourceReferenceScanCap+1) + ownerContents, false},
+		{"binary owner", consumerContents, ownerContents + "\x00", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			files := []intentTypeScriptRecordedFile{{seq: 1, path: owner.path, contents: tc.target}, {seq: 2, path: consumer.path, contents: tc.source}}
-			if tc.extra != nil {
-				files = append(files, *tc.extra)
+			files := []intentTypeScriptRecordedFile{newIntentTypeScriptRecordedFile(1, ownerPath, tc.target, ""), newIntentTypeScriptRecordedFile(2, consumerPath, tc.source, "")}
+			if tc.ambiguous {
+				files = append(files, newIntentTypeScriptRecordedFile(3, "tests/runtime/test-helpers/index.ts", ownerContents, ""))
 			}
 			if got := intentTypeScriptReferenceContexts(files); len(got) != 0 {
 				t.Fatalf("unproved relationship: %+v", got)

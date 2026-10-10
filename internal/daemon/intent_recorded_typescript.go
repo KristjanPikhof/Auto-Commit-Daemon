@@ -23,14 +23,24 @@ var (
 
 type intentTypeScriptRecordedFile struct {
 	seq               int64
-	path, contents    string
+	path              string
 	baseHead          string
+	imports           []intentTypeScriptRecordedImport
+	exports           map[string]string
 	javaScriptTargets map[string]bool
 }
 
 type intentTypeScriptRecordedImport struct {
 	witness, target string
 	names           []string
+}
+
+func newIntentTypeScriptRecordedFile(seq int64, sourcePath, contents, baseHead string) intentTypeScriptRecordedFile {
+	file := intentTypeScriptRecordedFile{seq: seq, path: sourcePath, baseHead: baseHead}
+	if path.Ext(sourcePath) == ".ts" {
+		file.imports, file.exports = intentTypeScriptRecordedDeclarations(contents)
+	}
+	return file
 }
 
 // Only exact static named imports and actual top-level exports can connect
@@ -82,14 +92,11 @@ func intentTypeScriptRecordedDeclarations(source string) ([]intentTypeScriptReco
 func intentTypeScriptReferenceContexts(files []intentTypeScriptRecordedFile) map[int64]string {
 	result := make(map[int64]string)
 	byPath := make(map[string][]int)
-	imports := make([][]intentTypeScriptRecordedImport, len(files))
-	exports := make([]map[string]string, len(files))
 	for i, file := range files {
 		if path.Ext(file.path) != ".ts" {
 			continue
 		}
 		byPath[file.path] = append(byPath[file.path], i)
-		imports[i], exports[i] = intentTypeScriptRecordedDeclarations(file.contents)
 	}
 	seen := make(map[int64]map[string]bool)
 	appendWitness := func(seq int64, witness string) {
@@ -102,8 +109,8 @@ func intentTypeScriptReferenceContexts(files []intentTypeScriptRecordedFile) map
 			seen[seq][witness] = true
 		}
 	}
-	for i, file := range files {
-		for _, imported := range imports[i] {
+	for _, file := range files {
+		for _, imported := range file.imports {
 			resolved := path.Clean(path.Join(path.Dir(file.path), imported.target))
 			var choices []string
 			switch path.Ext(resolved) {
@@ -139,7 +146,7 @@ func intentTypeScriptReferenceContexts(files []intentTypeScriptRecordedFile) map
 			for _, name := range imported.names {
 				valid := true
 				for _, target := range targets {
-					valid = valid && exports[target][name] != ""
+					valid = valid && files[target].exports[name] != ""
 				}
 				if valid {
 					witnessed = append(witnessed, name)
@@ -151,7 +158,7 @@ func intentTypeScriptReferenceContexts(files []intentTypeScriptRecordedFile) map
 			appendWitness(file.seq, imported.witness)
 			for _, target := range targets {
 				for _, name := range witnessed {
-					appendWitness(files[target].seq, exports[target][name])
+					appendWitness(files[target].seq, files[target].exports[name])
 				}
 			}
 		}
@@ -181,7 +188,7 @@ func loadIntentRecordedTypeScriptReferences(ctx context.Context, repo string, ca
 			break
 		}
 		bytes += len(contents)
-		files = append(files, intentTypeScriptRecordedFile{seq: capture.Event.Seq, path: op.Path, contents: string(contents), baseHead: capture.Event.BaseHead})
+		files = append(files, newIntentTypeScriptRecordedFile(capture.Event.Seq, op.Path, string(contents), capture.Event.BaseHead))
 	}
 	if err := proveIntentTypeScriptJavaScriptTargets(ctx, repo, files, captures); err != nil {
 		return nil, err
@@ -209,8 +216,7 @@ func proveIntentTypeScriptJavaScriptTargets(ctx context.Context, repo string, fi
 		if !intentTypeScriptBaseOID.MatchString(file.baseHead) {
 			continue
 		}
-		imports, _ := intentTypeScriptRecordedDeclarations(file.contents)
-		for _, imported := range imports {
+		for _, imported := range file.imports {
 			resolved := path.Clean(path.Join(path.Dir(file.path), imported.target))
 			if path.Ext(resolved) != ".js" || pending[resolved] {
 				continue
