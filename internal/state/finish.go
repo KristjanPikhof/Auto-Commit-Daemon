@@ -115,6 +115,11 @@ WHEN NEW.kind='delete_checkpoint_ref' AND EXISTS(
  SELECT 1 FROM finish_requests f WHERE f.checkpoint_id=NEW.proof_id AND f.state<>'completed'
 )
 BEGIN SELECT RAISE(ABORT,'checkpoint pinned by finish'); END;
+CREATE TRIGGER IF NOT EXISTS finish_checkpoint_pin_retained BEFORE UPDATE OF retained ON checkpoints
+WHEN NEW.retained=0 AND EXISTS(
+ SELECT 1 FROM finish_requests f WHERE f.checkpoint_id=NEW.id AND f.state<>'completed'
+)
+BEGIN SELECT RAISE(ABORT,'checkpoint pinned by finish'); END;
 `
 
 const finishSelect = `SELECT request_id,attempt,target_json,state,stage,dry_run,deadline_ts,
@@ -125,6 +130,9 @@ func finishTimestamp() float64 { return float64(time.Now().UnixNano()) / float64
 
 // Every finish boundary is FULL-synchronous before external provider/Git work.
 func beginFinishWrite(ctx context.Context, db *DB) (*sql.Tx, func(), error) {
+	if db == nil {
+		return nil, nil, errors.New("state: finish requires a database")
+	}
 	conn, err := db.conn.Conn(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -163,7 +171,7 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 		return "", ErrFinishIdentity
 	}
 	if target.TargetTree != target.CheckpointTree &&
-		(target.TargetRef == "" || target.TargetCommitOID == "" || !target.IncludeStaged) {
+		(target.TargetRef == "" || target.TargetCommitOID == "") {
 		return "", ErrFinishIdentity
 	}
 	if target.TargetRef != "" && (!strings.HasPrefix(target.TargetRef, "refs/acd/") || target.TargetCommitOID == "") {
@@ -200,9 +208,11 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 	return r, nil
 }
 
-func loadFinish(ctx context.Context, q interface {
+type finishReader interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, id string) (FinishRequest, error) {
+}
+
+func loadFinish(ctx context.Context, q finishReader, id string) (FinishRequest, error) {
 	return scanFinish(q.QueryRowContext(ctx, finishSelect+` WHERE request_id=? ORDER BY attempt DESC LIMIT 1`, id))
 }
 
@@ -221,9 +231,7 @@ func LoadFinishRequest(ctx context.Context, db *DB, id string) (FinishRequest, e
 	return loadFinish(ctx, db.readSQL(), id)
 }
 
-func activeFinish(ctx context.Context, q interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, worktree string) (FinishRequest, error) {
+func activeFinish(ctx context.Context, q finishReader, worktree string) (FinishRequest, error) {
 	return scanFinish(q.QueryRowContext(ctx, finishSelect+` WHERE worktree_id=? AND state IN ('running','prepared','needs_attention')`, worktree))
 }
 
@@ -304,7 +312,8 @@ func StartFinishRequest(ctx context.Context, db *DB, r FinishRequest) (FinishReq
 	if err := insertFinish(ctx, tx, r, targetJSON); err != nil {
 		return FinishRequest{}, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE finish_requests SET superseded_by=?,updated_ts=? WHERE worktree_id=? AND state='failed' AND superseded_by='' AND publication_json=''`, r.ID, r.UpdatedTS, r.Target.WorktreeID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE finish_requests SET superseded_by=?,updated_ts=? WHERE worktree_id=? AND superseded_by='' AND publication_json='' AND
+ (state='failed' OR (state='completed' AND dry_run=1 AND attempt>1))`, r.ID, r.UpdatedTS, r.Target.WorktreeID); err != nil {
 		return FinishRequest{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -422,6 +431,14 @@ func UpdateFinishRequest(ctx context.Context, db *DB, id string, attempt int, ex
 	}
 	if u.State == FinishPrepared && (len(r.Plan) == 0 || len(r.Publication) == 0 || r.DryRun) {
 		return r, ErrFinishIdentity
+	}
+	if u.State == FinishCompleted && r.State == FinishRunning && !r.DryRun {
+		var result struct {
+			NoChanges bool `json:"no_changes"`
+		}
+		if len(r.Result) == 0 || json.Unmarshal(r.Result, &result) != nil || !result.NoChanges {
+			return r, ErrFinishState
+		}
 	}
 	if u.State == FinishFailed && len(r.Publication) > 0 {
 		return r, ErrFinishState

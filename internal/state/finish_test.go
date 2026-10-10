@@ -53,6 +53,9 @@ func TestFinishStateOwnershipAndImmutableTarget(t *testing.T) {
 	if err != nil || created || got.ID != saved.ID || got.DeadlineTS != saved.DeadlineTS {
 		t.Fatalf("reconnect %+v created=%t err=%v", got, created, err)
 	}
+	if _, err := UpdateFinishRequest(ctx, db, r.ID, 1, FinishRunning, FinishUpdate{State: FinishCompleted, Result: json.RawMessage(`{"published":true}`)}); !errors.Is(err, ErrFinishState) {
+		t.Fatalf("published without prepared proof: %v", err)
+	}
 	changed := r
 	changed.ID = "different"
 	changed.Target.Message = "Different goal"
@@ -240,6 +243,9 @@ func TestFinishRetentionPinsFailedOverlayAndPruneRace(t *testing.T) {
 	if err != nil || len(cps) != 1 || !cps[0].Unresolved {
 		t.Fatalf("retention %+v %v", cps, err)
 	}
+	if _, err := db.SQL().ExecContext(ctx, `UPDATE checkpoints SET retained=0 WHERE id=?`, r.Target.CheckpointID); err == nil {
+		t.Fatal("pinned checkpoint marked pruned")
+	}
 	if _, err := PrepareCheckpointPrune(ctx, db, cps[0], checkpointTestDigest); err == nil {
 		t.Fatal("pinned checkpoint pruning prepared")
 	}
@@ -264,7 +270,7 @@ func TestFinishSchemaUpgradeAndReadOnly(t *testing.T) {
 	ctx := context.Background()
 	db, path := openTestDB(t)
 	original := finishFixture(t, db, 1)
-	if _, err := db.SQL().ExecContext(ctx, `DROP TRIGGER finish_checkpoint_pin_prune; DROP TABLE finish_requests; PRAGMA user_version=30`); err != nil {
+	if _, err := db.SQL().ExecContext(ctx, `DROP TRIGGER finish_checkpoint_pin_prune; DROP TRIGGER finish_checkpoint_pin_retained; DROP TABLE finish_requests; PRAGMA user_version=30`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
