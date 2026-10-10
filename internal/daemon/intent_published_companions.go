@@ -13,6 +13,7 @@ import (
 // A finalized former companion can explain a late correction without becoming
 // newly offered work. Its complete recorded post-image must still be in HEAD.
 func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, input *IntentCandidateEvaluation, existing []state.IntentCandidate) ([]state.IntentCandidate, error) {
+	input.frozenPublishedContext = nil
 	if input.RepoPath == "" || !input.IncludeDiffs || input.LatestCommit == nil || input.LatestCommit.OID == "" {
 		return existing, nil
 	}
@@ -35,6 +36,15 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 	if err != nil {
 		return nil, err
 	}
+	frozen, err := discoverIntentPublishedFrozenContext(ctx, db, *input)
+	if err != nil {
+		return nil, err
+	}
+	frozenIDs := make(map[string]bool, len(frozen))
+	for _, candidate := range frozen {
+		frozenIDs[candidate.ID] = true
+	}
+	companions = append(frozen, companions...)
 	regressions, matchedTests, err := discoverIntentPublishedGoRegressions(ctx, db, *input)
 	if err != nil {
 		return nil, err
@@ -70,11 +80,12 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 	}
 	members := 0
 	var verified []state.IntentCandidate
+	verifiedIDs := make(map[string]bool)
 	for _, candidate := range companions {
 		if len(active)+len(verified) >= state.IntentCandidateMaxOpenPerPair {
 			break
 		}
-		if known[candidate.ID] || candidate.Status != state.IntentCandidatePublished || !candidate.PublishedCommitOID.Valid || len(candidate.Events) == 0 || len(candidate.Events) > state.IntentCandidateMaxCaptures {
+		if verifiedIDs[candidate.ID] || (known[candidate.ID] && !frozenIDs[candidate.ID]) || candidate.Status != state.IntentCandidatePublished || !candidate.PublishedCommitOID.Valid || len(candidate.Events) == 0 || len(candidate.Events) > state.IntentCandidateMaxCaptures {
 			continue
 		}
 		if members+len(candidate.Events) > state.IntentCandidateMaxCaptures {
@@ -118,7 +129,16 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 				input.publishedContext = make(map[string][]IntentCandidateCapture)
 			}
 			input.publishedContext[candidate.ID] = captures
+			if frozenIDs[candidate.ID] {
+				if input.frozenPublishedContext == nil {
+					input.frozenPublishedContext = make(map[int64]bool)
+				}
+				for _, capture := range captures {
+					input.frozenPublishedContext[capture.Event.Seq] = true
+				}
+			}
 			verified = append(verified, candidate)
+			verifiedIDs[candidate.ID] = true
 			known[candidate.ID] = true
 		}
 	}
@@ -128,7 +148,11 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 	// Preserve pending groups first. Proven former companions precede optional
 	// old soft-publication context so the bounded request cannot clip them away.
 	result := append(active, verified...)
-	result = append(result, published[:min(len(published), state.IntentCandidateMaxOpenPerPair-len(result))]...)
+	for _, candidate := range published {
+		if !verifiedIDs[candidate.ID] && len(result) < state.IntentCandidateMaxOpenPerPair {
+			result = append(result, candidate)
+		}
+	}
 	return result, nil
 }
 
