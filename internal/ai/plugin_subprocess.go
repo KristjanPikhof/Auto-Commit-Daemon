@@ -178,6 +178,46 @@ func NewSubprocessProvider(name string, opts SubprocessOptions) *SubprocessProvi
 // `subprocess:<name>` selector used in ACD_AI_PROVIDER.
 func (p *SubprocessProvider) Name() string { return "subprocess:" + p.name }
 
+func (p *SubprocessProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte, error) {
+	return json.Marshal(struct {
+		Version       int               `json:"version"`
+		RequestType   string            `json:"request_type"`
+		SystemPrompt  string            `json:"system_prompt"`
+		FinishRequest FinishPlanRequest `json:"finish_request"`
+	}{Version: 1, RequestType: "finish_plan", SystemPrompt: finishSystemPrompt, FinishRequest: request})
+}
+
+// ExchangeFinish deliberately bypasses capability negotiation and the legacy
+// crash retry. A failed exchange consumes one caller-owned planning call.
+func (p *SubprocessProvider) ExchangeFinish(ctx context.Context, body []byte) ([]byte, error) {
+	if p.resolveErr != nil {
+		return nil, p.resolveErr
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	session, err := p.acquire()
+	if err != nil {
+		return nil, err
+	}
+	response, err := session.exchangeBytes(reqCtx, body)
+	if err != nil {
+		p.markCrashed(session)
+		var decodeError *subprocessResponseDecodeError
+		var tooLarge *subprocessResponseTooLargeError
+		if errors.As(err, &decodeError) && !errors.As(err, &tooLarge) {
+			return nil, &finishOutputError{Err: err, Raw: decodeError.raw}
+		}
+		return nil, err
+	}
+	if response.Error != "" {
+		return nil, errors.New("subprocess finish: " + SanitizePlannerError(response.Error))
+	}
+	if response.Version != 1 || len(response.FinishPlan) == 0 {
+		return nil, &finishOutputError{Err: errors.New("subprocess finish requires version 1 and finish_plan"), Raw: response.FinishPlan}
+	}
+	return response.FinishPlan, nil
+}
+
 // Generate marshals cc into a JSONL line, writes it to the plugin, reads
 // one JSONL line back, sanitises subject + body, and returns the Result.
 //
@@ -896,6 +936,7 @@ type subprocessResponse struct {
 	DeferredReasons    []DeferredReason    `json:"deferred_reasons,omitempty"`
 	CommitGroups       []IntentCommitGroup `json:"commit_groups,omitempty"`
 	HistoryRewritePlan *HistoryRewritePlan `json:"history_rewrite_plan,omitempty"`
+	FinishPlan         json.RawMessage     `json:"finish_plan,omitempty"`
 }
 
 // pluginRequest packages a request with its reply channel. The owner
