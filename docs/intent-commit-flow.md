@@ -28,6 +28,11 @@ connected to the current work. That context follows the same diff permission
 and redaction rules as fresh captures. Later captures outside a frozen
 publication target remain input for the next plan.
 
+When a small frozen target's remaining captures fit the planning window, ACD
+reviews them together. An implementation and its available test can then finish
+the same goal instead of waiting in separate requests. Later captures stay
+protected for the next publication target.
+
 ## Gates
 
 A group publishes only after cohesion, completeness, separation, dependency,
