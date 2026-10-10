@@ -149,9 +149,6 @@ func (w *FinishWorker) resolved(ctx context.Context) (git.Worktree, FinishWorker
 	if cfg.Provider.Timeout <= 0 {
 		cfg.Provider.Timeout = ai.DefaultProviderTimeout
 	}
-	if cfg.AuthorName == "" || cfg.AuthorEmail == "" {
-		return wt, cfg, "", errors.New("finish: frozen author name and email are required")
-	}
 	if cfg.Capture.SensitiveMatcher == nil {
 		cfg.Capture.SensitiveMatcher = state.NewSensitiveMatcher()
 	}
@@ -230,7 +227,7 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 		if err := git.CheckFinishPublicationSafety(ctx, wt.Root, old.Target.BranchRef, old.Target.ExpectedHead, old.Target.IndexDigest, old.Target.IncludeStaged); err != nil {
 			return old, false, err
 		}
-		if _, _, err := w.evidence(ctx, wt, old.Target, cfg); err != nil {
+		if _, _, err := w.evidence(ctx, wt, old.Target); err != nil {
 			return old, false, err
 		}
 		retried, err := state.RetryFinishRequest(ctx, w.DB, old.ID, finishTimestamp(time.Now().Add(cfg.Provider.Timeout)), options.DryRun)
@@ -290,6 +287,11 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 			return active, false, err
 		}
 	}
+	if !maps.Equal(base, target) {
+		if err := finishRequireAuthor(cfg); err != nil {
+			return active, false, err
+		}
+	}
 	tree, err := materializeFinishTree(ctx, wt, w.DB, target)
 	if err != nil {
 		return active, false, err
@@ -320,6 +322,14 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 }
 
 func finishTimestamp(t time.Time) float64 { return float64(t.UnixNano()) / float64(time.Second) }
+
+func finishRequireAuthor(cfg FinishWorkerConfig) error {
+	if cfg.AuthorName == "" || cfg.AuthorEmail == "" {
+		return errors.New("finish: configure Git user.name and user.email before finishing nonempty work")
+	}
+	return nil
+}
+
 func finishDeadline(r state.FinishRequest) time.Time {
 	return time.Unix(0, int64(r.DeadlineTS*float64(time.Second)))
 }
@@ -495,7 +505,7 @@ func materializeFinishTree(ctx context.Context, wt git.Worktree, db *state.DB, t
 	return git.WriteTreeDurable(ctx, wt.Root, filepath.Join(filepath.Dir(db.Path()), id+".index"), entries)
 }
 
-func (w *FinishWorker) evidence(ctx context.Context, wt git.Worktree, target state.FinishTarget, cfg FinishWorkerConfig) (finish.Evidence, string, error) {
+func (w *FinishWorker) evidence(ctx context.Context, wt git.Worktree, target state.FinishTarget) (finish.Evidence, string, error) {
 	cp, err := state.ResolveCheckpoint(ctx, w.DB.Path(), target.CheckpointID)
 	if err != nil {
 		return finish.Evidence{}, "", err
@@ -643,7 +653,7 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 	if err := git.CheckFinishPublicationSafety(planningCtx, wt.Root, r.Target.BranchRef, r.Target.ExpectedHead, r.Target.IndexDigest, r.Target.IncludeStaged); err != nil {
 		return w.fail(r, err)
 	}
-	evidence, baseTree, err := w.evidence(planningCtx, wt, r.Target, cfg)
+	evidence, baseTree, err := w.evidence(planningCtx, wt, r.Target)
 	if err != nil {
 		return w.fail(r, err)
 	}
@@ -655,44 +665,20 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 		}
 		return completed, nil
 	}
+	if err := finishRequireAuthor(cfg); err != nil {
+		return w.fail(r, err)
+	}
 	evalCtx, cancel := w.evaluationContext(ctx, wt, cfg, digest, r)
 	defer cancel()
-	var plan finish.Plan
-	var disclosure ai.FinishDisclosure
-	if cfg.Mode == "local" {
-		plan, err = finish.Local(evidence, finish.LocalOptions{Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message})
-	} else {
-		transport := w.Transport
-		if transport == nil {
-			var closer interface{ Close() error }
-			transport, closer, err = ai.BuildFinishTransport(cfg.Provider, cfg.Approved)
-			if closer != nil {
-				defer closer.Close()
-			}
-		}
-		if err == nil {
-			var diffs []ai.FinishDiff
-			diffCtx, diffCancel := context.WithDeadline(evalCtx, finishDeadline(r))
-			diffs, err = finishProviderDiffs(diffCtx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress)
-			diffCancel()
-			if err == nil {
-				var planned ai.FinishPlanResult
-				planned, err = ai.PlanFinish(evalCtx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, BeforeCall: func(callCtx context.Context) error {
-					_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
-					return err
-				}})
-				plan, disclosure = planned.Plan, planned.Disclosure
-			}
-		}
-	}
+	plan, disclosure, err := w.plan(evalCtx, wt, cfg, r, evidence, baseTree)
 	if err != nil {
 		return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: disclosure}, err)
 	}
 	if err := finish.Validate(evidence, plan); err != nil {
-		return w.fail(r, err)
+		return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: disclosure}, err)
 	}
 	if _, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishRunning, Stage: "verifying"}); err != nil {
-		return w.fail(r, err)
+		return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: disclosure}, err)
 	}
 	saved := FinishSavedPlan{Version: 1, Disclosure: disclosure}
 	commits := make([]git.FinishCommit, 0, len(plan.Steps))
@@ -701,24 +687,25 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 	for _, step := range plan.Steps {
 		tree, err := materializeFinishTree(verifyCtx, wt, w.DB, step.Tree)
 		if err != nil {
-			return w.fail(r, err)
+			return w.failPlan(r, saved, err)
 		}
 		saved.Steps = append(saved.Steps, FinishPlanStep{Goal: step.Goal, TreeOID: tree, Author: step.Author})
 		commits = append(commits, git.FinishCommit{TreeOID: tree, Message: step.Message, AuthorName: cfg.AuthorName, AuthorEmail: cfg.AuthorEmail})
 	}
 	proof, err := git.BuildFinishChain(verifyCtx, wt.Root, git.FinishBuildOptions{RequestID: r.ID, Attempt: r.Attempt, WorktreeID: r.Target.WorktreeID, BranchRef: r.Target.BranchRef, ExpectedHead: r.Target.ExpectedHead, TargetTree: r.Target.TargetTree, IndexDigest: r.Target.IndexDigest, IncludeStaged: r.Target.IncludeStaged, ObjectRef: git.FinishRefPrefix + r.Target.WorktreeID + "/" + r.ID + "/" + strconv.Itoa(r.Attempt) + "/chain", Commits: commits, Verify: func(checkCtx context.Context, index int, oid, tree string) error {
 		check := FinishCheck{TreeOID: tree, Policy: cfg.VerificationMode}
-		check.Result, err = evaluatePublication(checkCtx, func(jobCtx context.Context) (verification.Result, error) {
+		result, checkErr := evaluatePublication(checkCtx, func(jobCtx context.Context) (verification.Result, error) {
 			candidateID := r.ID + "-" + strconv.Itoa(r.Attempt) + "-" + strconv.Itoa(index)
 			if cfg.VerificationMode == "none" || cfg.VerificationMode == "structural" {
 				return w.Runner.CheckStructural(jobCtx, verification.StructuralRequest{RepoPath: wt.Root, CandidateID: candidateID, CommitOID: oid})
 			}
 			return w.Runner.Run(jobCtx, verification.Request{RepoPath: wt.Root, CandidateID: candidateID, CommitOID: oid, Command: cfg.Command})
 		})
+		check.Result = result
 		check.Executed = check.Result.Executed
 		saved.Steps[index].Check = check
-		if err != nil {
-			return err
+		if checkErr != nil {
+			return checkErr
 		}
 		if check.Result.Status != verification.StatusPassed || check.Result.NeedsAttention {
 			return fmt.Errorf("finish: candidate verification %s", check.Result.Status)
@@ -745,6 +732,40 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 		return w.failPlan(r, saved, err)
 	}
 	return w.publish(ctx, wt, prepared, false)
+}
+
+// plan keeps request preparation and durable call accounting on the worker
+// stack. Only the immutable provider exchange releases the operation gate.
+func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, r state.FinishRequest, evidence finish.Evidence, baseTree string) (finish.Plan, ai.FinishDisclosure, error) {
+	if cfg.Mode == "local" {
+		plan, err := finish.Local(evidence, finish.LocalOptions{Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message})
+		return plan, ai.FinishDisclosure{}, err
+	}
+	ctx, cancel := context.WithDeadline(ctx, finishDeadline(r))
+	defer cancel()
+	transport := w.Transport
+	if transport == nil {
+		configured, closer, err := ai.BuildFinishTransport(cfg.Provider, cfg.Approved)
+		if err != nil {
+			return finish.Plan{}, ai.FinishDisclosure{}, err
+		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		transport = configured
+	}
+	diffs, err := finishProviderDiffs(ctx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress)
+	if ctx.Err() != nil {
+		return finish.Plan{}, ai.FinishDisclosure{}, &ai.FinishPlanningError{Code: "provider_deadline", Err: ctx.Err()}
+	}
+	if err != nil {
+		return finish.Plan{}, ai.FinishDisclosure{}, err
+	}
+	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, BeforeCall: func(callCtx context.Context) error {
+		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
+		return err
+	}})
+	return planned.Plan, planned.Disclosure, err
 }
 
 func (w *FinishWorker) fail(r state.FinishRequest, cause error) (state.FinishRequest, error) {
@@ -821,6 +842,7 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 		return nil, nil
 	}
 	var diffs []ai.FinishDiff
+	totalBytes := 0
 	for _, change := range changes {
 		diff := ai.FinishDiff{ChangeID: change.ID}
 		for index, entry := range []finish.Entry{change.Before, change.After} {
@@ -840,11 +862,11 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 			} else {
 				diff.AfterSize = size
 			}
-			body, err := git.CatFileBlobLimited(ctx, repo, entry.OID, 8000)
-			if err != nil && !errors.Is(err, git.ErrStdoutOverflow) {
+			text, err := git.FinishBlobIsText(ctx, repo, entry.OID)
+			if err != nil {
 				return nil, err
 			}
-			if strings.ContainsRune(string(body), 0) || (err == nil && !utf8.Valid(body)) {
+			if !text {
 				diff.Binary = true
 			}
 		}
@@ -859,6 +881,10 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 			if strings.ContainsRune(string(out), 0) || !utf8.Valid(out) {
 				diff.Binary = true
 			} else {
+				totalBytes += len(out)
+				if totalBytes > ai.IntentGoalEvidenceTotalDiffCap {
+					return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diffs total %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", totalBytes, ai.IntentGoalEvidenceTotalDiffCap)}
+				}
 				diff.Text = string(out)
 			}
 		}

@@ -136,6 +136,35 @@ func TestFinishWorkerLocalFreezePreviewAndPublication(t *testing.T) {
 	}
 }
 
+func TestFinishWorkerEmptyNeedsNoAuthor(t *testing.T) {
+	for _, unborn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "clean", true: "unborn"}[unborn], func(t *testing.T) {
+			f, w := finishWorkerFixture(t)
+			w.Config.AuthorName, w.Config.AuthorEmail = "", ""
+			if unborn {
+				finishWorkerGit(t, f.dir, "symbolic-ref", "HEAD", "refs/heads/unborn")
+				if err := os.Remove(filepath.Join(f.dir, ".gitignore")); err != nil {
+					t.Fatal(err)
+				}
+				finishWorkerGit(t, f.dir, "read-tree", "--empty")
+			}
+			r := startFinishWorker(t, w, FinishOptions{})
+			completed, err := w.Execute(context.Background(), r.ID)
+			if err != nil || completed.State != state.FinishCompleted {
+				t.Fatalf("empty finish %+v: %v", completed, err)
+			}
+			var result FinishResult
+			if err := json.Unmarshal(completed.Result, &result); err != nil || !result.NoChanges || result.Published {
+				t.Fatalf("empty result %+v: %v", result, err)
+			}
+			finishWrite(t, f.dir, "goal.txt", "nonempty needs identity\n")
+			if _, _, err := w.Start(context.Background(), FinishOptions{}); err == nil || !strings.Contains(err.Error(), "user.name") {
+				t.Fatalf("missing author froze nonempty target: %v", err)
+			}
+		})
+	}
+}
+
 func TestFinishWorkerStagedOverlayAndExcludedBase(t *testing.T) {
 	f, w := finishWorkerFixture(t)
 	finishWrite(t, f.dir, ".env", "protected branch secret\n")
@@ -175,6 +204,30 @@ func TestFinishWorkerStagedOverlayAndExcludedBase(t *testing.T) {
 	finishWorkerGit(t, f.dir, "add", "-f", ".env")
 	if _, _, err := w.Start(context.Background(), FinishOptions{IncludeStaged: true}); err == nil || !strings.Contains(err.Error(), "staged_scope_excluded") {
 		t.Fatalf("excluded staged consent bypass: %v", err)
+	}
+}
+
+func TestFinishWorkerPreservesGitlinks(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	linked := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
+	finishWorkerGit(t, f.dir, "update-index", "--add", "--cacheinfo", "160000,"+linked+",vendor/sdk")
+	finishWorkerGit(t, f.dir, "commit", "-m", "Seed tracked Gitlink")
+	finishWrite(t, f.dir, "vendor/sdk/later.txt", "nested work stays local\n")
+	finishWrite(t, f.dir, "goal.txt", "eligible change\n")
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	if out := finishWorkerGit(t, f.dir, "ls-tree", r.Target.TargetTree, "--", "vendor/sdk"); !strings.Contains(out, "160000 commit "+linked) {
+		t.Fatalf("tracked Gitlink changed: %q", out)
+	}
+	if out := finishWorkerGit(t, f.dir, "ls-tree", "-r", r.Target.CheckpointTree); strings.Contains(out, "vendor/sdk") {
+		t.Fatal("checkpoint scanned excluded Gitlink contents")
+	}
+	completed, err := w.Execute(context.Background(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted {
+		t.Fatalf("Gitlink preview %+v: %v", completed, err)
+	}
+	finishWorkerGit(t, f.dir, "update-index", "--cacheinfo", "160000,"+finishWorkerGit(t, f.dir, "rev-parse", "HEAD")+",vendor/sdk")
+	if _, _, err := w.Start(context.Background(), FinishOptions{IncludeStaged: true}); err == nil || !strings.Contains(err.Error(), "staged_scope_excluded") {
+		t.Fatalf("staged Gitlink accepted: %v", err)
 	}
 }
 
@@ -377,15 +430,31 @@ func TestFinishWorkerCommandChecksAndRestart(t *testing.T) {
 
 func TestFinishWorkerExactProviderEvidence(t *testing.T) {
 	f, w := finishWorkerFixture(t)
+	for _, path := range []string{"unchanged-binary.dat", "unchanged-invalid.dat"} {
+		tail := "\x00tail\n"
+		if path == "unchanged-invalid.dat" {
+			tail = "\xfftail\n"
+		}
+		finishWrite(t, f.dir, path, "before\n"+strings.Repeat("unchanged\n", 1200)+tail)
+	}
+	finishWorkerGit(t, f.dir, "add", "--", "unchanged-binary.dat", "unchanged-invalid.dat")
+	finishWorkerGit(t, f.dir, "commit", "-m", "Seed unchanged late binary bytes")
+	for _, path := range []string{"unchanged-binary.dat", "unchanged-invalid.dat"} {
+		body, err := os.ReadFile(filepath.Join(f.dir, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		finishWrite(t, f.dir, path, "after\n"+string(body[len("before\n"):]))
+	}
 	for path, body := range map[string]string{"*.txt": "wildcard file\n", "other.txt": "other file\n", ":(exclude)config.go": "exclude named file\n", "binary.dat": strings.Repeat("x", 9000) + "\x00tail", "unicode.txt": strings.Repeat("界", 4000)} {
 		finishWrite(t, f.dir, path, body)
 	}
 	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
-	wt, cfg, _, err := w.resolved(context.Background())
+	wt, _, _, err := w.resolved(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence, base, err := w.evidence(context.Background(), wt, r.Target, cfg)
+	evidence, base, err := w.evidence(context.Background(), wt, r.Target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,6 +463,12 @@ func TestFinishWorkerExactProviderEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, diff := range diffs {
+		if strings.HasPrefix(diff.ChangeID, "unchanged-") {
+			if !diff.Binary || diff.Text != "" {
+				t.Fatalf("unchanged binary bytes hidden outside diff hunks %+v", diff)
+			}
+			continue
+		}
 		if diff.ChangeID == "binary.dat" {
 			if !diff.Binary || diff.Text != "" || diff.AfterSize != 9005 {
 				t.Fatalf("binary bytes sent %+v", diff)
@@ -410,7 +485,7 @@ func TestFinishWorkerExactProviderEvidence(t *testing.T) {
 			t.Fatal("exclude filename interpreted as pathspec")
 		}
 	}
-	if len(diffs) != 5 {
+	if len(diffs) != 7 {
 		t.Fatalf("evidence missing %d", len(diffs))
 	}
 }
@@ -424,8 +499,8 @@ func TestFinishWorkerRetainsRenameAtomicBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
-	wt, cfg, _, _ := w.resolved(context.Background())
-	evidence, _, err := w.evidence(context.Background(), wt, r.Target, cfg)
+	wt, _, _, _ := w.resolved(context.Background())
+	evidence, _, err := w.evidence(context.Background(), wt, r.Target)
 	if err != nil {
 		t.Fatal(err)
 	}
