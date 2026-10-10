@@ -124,6 +124,9 @@ An explicit retry creates a new attempt and deadline for the same frozen target,
 with separate evidence. It checks current ownership before work and publication.
 It never changes options or silently rebases a stale target. If the branch
 moved, finish must report that a new request is needed rather than guessing.
+Credentials may be refreshed between explicit attempts. The saved provider,
+endpoint, trust settings, credential source policy, and egress consent stay fixed.
+An active attempt keeps the credentials it started with.
 
 ## Planning, provider bounds, and verification
 
