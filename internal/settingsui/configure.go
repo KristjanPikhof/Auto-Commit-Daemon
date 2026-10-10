@@ -29,6 +29,7 @@ type ConfigureWizardOptions struct {
 	ExplicitMode         bool
 	RepositoryScoped     bool
 	HasCredential        bool
+	CredentialStatus     func() (bool, error)
 	CredentialFromStdin  bool
 	ProviderConfigured   bool
 	OpenAIConfigured     bool
@@ -72,46 +73,27 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	}
 	defaults := opts.Defaults
 	selection := ConfigureSelection{
-		Strategy:        fallback(defaults["commit.strategy"], "intent"),
-		Preset:          fallback(defaults["commit.preset"], "balanced"),
+		Strategy:        fallback(defaults["commit.strategy"], "local"),
+		Preset:          defaults["commit.preset"],
 		CommitFormat:    fallback(defaults["commit.format"], "imperative"),
-		Provider:        fallback(defaults["ai.provider"], "openai-compat"),
+		Provider:        fallback(defaults["ai.provider"], "deterministic"),
 		Model:           fallback(defaults["ai.model"], config.DefaultOpenAIModel),
 		BaseURL:         fallback(defaults["ai.base_url"], "https://api.openai.com/v1"),
 		ProviderTimeout: fallback(defaults["ai.timeout"], "30s"),
 		CAFile:          defaults["ai.ca_file"],
 	}
-	selection.Experience = configureExperience(selection.Strategy, selection.Preset)
-	if opts.ExplicitMode && !opts.RepositoryScoped &&
-		selection.Strategy == "intent" && selection.Preset == "quality" {
-		return ConfigureSelection{}, errors.New(
-			"configure wizard: Strict Review is available only for repository-scoped setup",
-		)
+	if selection.Strategy == "event" {
+		selection.Strategy = "local"
 	}
 	if !opts.ExplicitMode {
-		options := []huh.Option[string]{
-			huh.NewOption("Everyday work: semantic commits with ACD safety checks (recommended)", "everyday"),
-			huh.NewOption("Maximum speed: immediate one-change commits, no project checks", "speed"),
-		}
-		description := "Everyday is the recommended balance. Project tests are not run."
-		if opts.RepositoryScoped {
-			options = append(options,
-				huh.NewOption("Strict review: semantic commits gated by the full test suite (multi-minute)", "strict"),
-			)
-			description = "Everyday runs no project tests. Strict Review can take several minutes."
-		} else if selection.Experience == "strict" {
-			selection.Experience = "everyday"
-		}
-		experienceForm := huh.NewForm(huh.NewGroup(
-			huh.NewSelect[string]().Key("experience").Title("How should ACD work?").
-				Description(description).
-				Options(options...).Value(&selection.Experience),
-		))
-		if err := runConfigureForm(ctx, experienceForm, opts); err != nil {
+		form := huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Key("strategy").Title("How should finish create commits?").
+			Description("Files are saved continuously. Branch commits are created only when you run acd finish.").
+			Options(huh.NewOption("Local: one complete batch, offline (recommended)", "local"), huh.NewOption("Intent: AI groups completed goals", "intent")).Value(&selection.Strategy)))
+		if err := runConfigureForm(ctx, form, opts); err != nil {
 			return ConfigureSelection{}, err
 		}
-		selection.Strategy, selection.Preset = configureExperienceMode(selection.Experience)
 	}
+	selection.Experience = selection.Strategy
 	if opts.IncludeCommitFormat {
 		formatForm := huh.NewForm(huh.NewGroup(
 			huh.NewSelect[string]().Key("commit-format").Title("How should commit messages look?").
@@ -126,23 +108,31 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		}
 	}
 
+	if selection.Strategy == "local" {
+		selection.Provider = "deterministic"
+	} else if opts.CredentialStatus != nil {
+		var err error
+		opts.HasCredential, err = opts.CredentialStatus()
+		if err != nil {
+			return ConfigureSelection{}, err
+		}
+	}
 	providerKind, subprocessName := configureProviderParts(selection.Provider)
 	providerReady := opts.ProviderConfigured && (providerKind == "subprocess" ||
 		(providerKind == "openai-compat" && opts.HasCredential) ||
 		(providerKind == "deterministic" &&
 			!(selection.Strategy == "intent" && selection.Preset == "quality")))
 	providerSelected := false
-	if !providerReady {
+	if selection.Strategy == "intent" && !providerReady {
 		options := []huh.Option[string]{
-			huh.NewOption("AI semantic commits: OpenAI-compatible connection (recommended)", "openai-compat"),
-			huh.NewOption("AI semantic commits: local subprocess", "subprocess"),
+			huh.NewOption("OpenAI-compatible connection", "openai-compat"),
+			huh.NewOption("Local AI subprocess", "subprocess"),
 		}
-		if !(selection.Strategy == "intent" && selection.Preset == "quality") {
-			options = append(options,
-				huh.NewOption("Local automatic commits: limited rules and messages, no network", "deterministic"))
+		if providerKind == "deterministic" {
+			providerKind = "openai-compat"
 		}
 		providerForm := huh.NewForm(huh.NewGroup(
-			huh.NewSelect[string]().Key("provider").Title("How should ACD create commits?").
+			huh.NewSelect[string]().Key("provider").Title("Which provider should Intent use?").
 				Description("AI can group related code, tests, and documentation into one meaningful commit. Local rules work offline with more limited grouping and messages.").
 				Options(options...).Value(&providerKind),
 		))
@@ -216,42 +206,14 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		return ConfigureSelection{}, fmt.Errorf("configure wizard: unsupported provider %q", safeText(providerKind))
 	}
 
-	selection.VerificationMode = configureVerificationMode(selection.Strategy, selection.Preset)
-	if selection.VerificationMode == "full" {
-		field := "verification." + selection.VerificationMode + ".command"
-		selection.VerificationCommand = strings.TrimSpace(defaults[field])
-		if selection.VerificationCommand != "" {
-			selection.VerificationSource = "saved setting"
-		}
-		if selection.VerificationCommand == "" {
-			selection.VerificationCommand = strings.TrimSpace(opts.DetectedFullCommand)
-			selection.VerificationSource = strings.TrimSpace(opts.DetectedFullSource)
-			if selection.VerificationCommand == "" {
-				selection.VerificationCommand = strings.TrimSpace(opts.DetectedCommand)
-				if selection.VerificationCommand != "" {
-					selection.VerificationSource = "detected project command"
-				}
-			}
-		}
-		if selection.VerificationCommand == "" {
-			return ConfigureSelection{}, errors.New(
-				"configure wizard: Strict Review is unavailable because no full verification command was detected; " +
-					"set one in acd settings",
-			)
-		}
+	selection.VerificationMode = fallback(defaults["intent.verification"], "none")
+	if selection.VerificationMode == "fast" || selection.VerificationMode == "full" {
+		selection.VerificationCommand = strings.TrimSpace(defaults["verification."+selection.VerificationMode+".command"])
+		selection.VerificationSource = "saved setting"
 	}
-	selection.ExecutionMode = "background activation gate"
-	if selection.VerificationMode != "full" {
-		selection.ExecutionMode = "immediate"
-	}
-
-	needsDiff := selection.Strategy == "intent" ||
-		(selection.Strategy == "event" && selection.Preset != "fast")
-	diffContext := needsDiff && selection.Provider != "deterministic"
-	customEndpoint := selection.Provider == "openai-compat" &&
-		strings.TrimRight(strings.TrimSpace(selection.BaseURL), "/") != "https://api.openai.com/v1"
-	selection.DiffContextApproved = diffContext
-	selection.EndpointCredentialsApproved = customEndpoint
+	selection.ExecutionMode = "explicit finish"
+	selection.DiffContextApproved = selection.Strategy == "intent" && defaults["ai.diff_egress"] == "true"
+	selection.EndpointCredentialsApproved = selection.Provider == "openai-compat" && strings.TrimRight(strings.TrimSpace(selection.BaseURL), "/") != "https://api.openai.com/v1"
 	selection.SubprocessApproved = strings.HasPrefix(selection.Provider, "subprocess:")
 	return selection, nil
 }
