@@ -773,6 +773,7 @@ func ActivePublicationDrainsForPair(
 func ReadPublicationDrainProjection(
 	ctx context.Context,
 	dbPath string,
+	drainIDs ...string,
 ) (PublicationDrainReadOnlyProjection, error) {
 	projection := PublicationDrainReadOnlyProjection{}
 	q := url.Values{}
@@ -791,6 +792,27 @@ func ReadPublicationDrainProjection(
 		return projection, nil
 	}
 	projection.Available = true
+	if len(drainIDs) > 0 && drainIDs[0] != "" {
+		statement := publicationDrainSelectForVersion(projection.SchemaVersion)
+		if projection.SchemaVersion < 25 {
+			statement = legacyPublicationDrainSelect
+		}
+		row := conn.QueryRowContext(ctx, statement+" WHERE id=?", drainIDs[0])
+		var drain PublicationDrain
+		if projection.SchemaVersion < 25 {
+			drain, err = scanLegacyPublicationDrain(row)
+		} else {
+			drain, err = scanPublicationDrain(row)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return projection, nil
+		}
+		if err != nil {
+			return projection, err
+		}
+		projection.Latest = &drain
+		return projection, nil
+	}
 	if projection.SchemaVersion < 25 {
 		active, err := legacyPublicationDrainsQuery(ctx, conn, true)
 		if err != nil {
