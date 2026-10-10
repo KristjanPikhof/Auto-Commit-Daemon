@@ -2557,7 +2557,7 @@ func groundedIntentRequestDependencies(req ai.IntentPlanRequestV2) []ai.IntentCa
 	for _, edge := range req.Dependencies {
 		if edge.Strength == ai.IntentDependencySoft {
 			switch edge.Kind {
-			case "symbol_hash", "hunk_hash", "import_reference", "generated_artifact_reference", "documented_public_reference", "published_documented_public_reference", "documented_api_reference", "published_documented_api_reference":
+			case "symbol_hash", "hunk_hash", "import_reference", "generated_artifact_reference", "documented_change_reference", "documented_public_reference", "published_documented_public_reference", "documented_api_reference", "published_documented_api_reference":
 				// Retained hints may predate the grounded analyzer. Reprove their
 				// relationship from recorded evidence before using them as cohesion.
 				if !proven[key(edge.FromSeq, edge.ToSeq, strings.TrimPrefix(edge.Kind, "published_"))] {

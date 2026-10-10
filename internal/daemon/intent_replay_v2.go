@@ -1296,6 +1296,7 @@ func runtimeIntentDependencyHints(
 		public    map[string]struct{}
 		api       map[string]struct{}
 		docUses   map[string]struct{}
+		docChange map[string]struct{}
 		cli       map[string]string
 		docCLI    map[string]struct{}
 		generated bool
@@ -1326,6 +1327,7 @@ func runtimeIntentDependencyHints(
 		} else {
 			item.imports = nil
 			if role == "documentation" {
+				item.docChange = intentDocumentChangeReferences(capture.CapturedDiff)
 				item.docUses = intentDocumentPublicReferences(capture.CapturedDiff)
 				item.docCLI = make(map[string]struct{})
 				for _, invocation := range intentDocumentCLIInvocations(capture.CapturedDiff) {
@@ -1373,6 +1375,9 @@ func runtimeIntentDependencyHints(
 	for i := range items {
 		for j := i + 1; j < len(items); j++ {
 			earlier, later := items[i], items[j]
+			if reference := firstRuntimeIntentFeature(earlier.docChange, later.docChange); reference != "" {
+				add(earlier.seq, later.seq, ai.IntentDependencySoft, "documented_change_reference", reference)
+			}
 			for _, pair := range [][2]features{{earlier, later}, {later, earlier}} {
 				var qualified []string
 				for command := range pair[0].cli {

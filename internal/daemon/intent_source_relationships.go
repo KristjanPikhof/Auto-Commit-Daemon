@@ -534,6 +534,33 @@ func intentDocumentPublicReferences(diff string) map[string]struct{} {
 	return used
 }
 
+// Shared substantive phrases in added prose can ground a documentation goal.
+// Headers, unchanged text, filenames and short boilerplate are not witnesses.
+func intentDocumentChangeReferences(diff string) map[string]struct{} {
+	refs := make(map[string]struct{})
+	if len(diff) > 8<<10 {
+		diff = diff[:8<<10]
+	}
+	for _, line := range strings.Split(diff, "\n") {
+		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
+			continue
+		}
+		words := strings.FieldsFunc(strings.ToLower(line[1:]), func(r rune) bool { return !unicode.IsLetter(r) })
+		for i := 0; i+5 <= len(words) && len(refs) < 128; i++ {
+			substantive := 0
+			for _, word := range words[i : i+5] {
+				if len(word) >= 8 {
+					substantive++
+				}
+			}
+			if substantive >= 2 {
+				refs[strings.Join(words[i:i+5], " ")] = struct{}{}
+			}
+		}
+	}
+	return refs
+}
+
 func intentDocumentPublicWitnesses(diff string) map[string][]string {
 	used := make(map[string][]string)
 	inFence := false
