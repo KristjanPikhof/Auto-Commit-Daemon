@@ -93,6 +93,8 @@ type processExposer interface {
 // Options configures one Run invocation.
 //
 // Required: RepoPath, GitDir, DB. Everything else has a usable default.
+// Legacy publication, planner and provider fields remain compile bridges;
+// Run ignores them. Their callers are removed in the surface-removal task.
 type Options struct {
 	// RepoPath is the absolute path to the worktree root.
 	RepoPath string
@@ -351,7 +353,7 @@ func Run(ctx context.Context, opts Options) error {
 	boot := now()
 	store := checkpointpkg.Store{DB: opts.DB}
 	if err := store.RecoverPrepared(ctx, opts.RepoPath); err != nil {
-		return fmt.Errorf("daemon: recover protection checkpoints: %w", err)
+		logger.Warn("checkpoint recovery requires attention; new protection remains active", "err", err)
 	}
 	if !opts.FinishRecoveryDone {
 		worker := FinishWorker{RepoPath: opts.RepoPath, DB: opts.DB, OperationGate: opts.OperationGate, ProtectionGate: opts.ProtectionGate}
@@ -440,6 +442,9 @@ func Run(ctx context.Context, opts Options) error {
 	if maintenance.State == "" {
 		maintenance.NextAttemptTS = boot.Add(DefaultCheckpointRetentionInterval).Unix()
 	}
+	var indexGitlinks protectionIndexCache
+	var submoduleHead string
+	var submodules map[string]bool
 	protect := func(passCtx context.Context, reason string, maintain bool) (CaptureSummary, error) {
 		if opts.OperationGate != nil {
 			opts.OperationGate.RLock()
@@ -452,13 +457,34 @@ func Run(ctx context.Context, opts Options) error {
 		checker.Invalidate()
 		branch, head := observeProtectionHead(passCtx, opts.RepoPath, logger)
 		logContext.SetBranch(branch, 0)
+		if submodules == nil || head != submoduleHead {
+			submodules = map[string]bool{}
+			if head != "" {
+				entries, err := git.LsTree(passCtx, opts.RepoPath, head, true)
+				if err != nil {
+					return CaptureSummary{}, fmt.Errorf("daemon: inspect protection Gitlinks: %w", err)
+				}
+				for _, entry := range entries {
+					if entry.Mode == "160000" {
+						submodules[entry.Path] = true
+					}
+				}
+			}
+			submoduleHead = head
+		}
+
+		paths, err := protectionSubmodulePaths(passCtx, opts.RepoPath, submodules, &indexGitlinks)
+		if err != nil {
+			return CaptureSummary{}, fmt.Errorf("daemon: inspect index Gitlinks: %w", err)
+		}
+
 		epoch, err := BeginProtectionObservation(passCtx, opts.DB)
 		if err != nil {
 			return CaptureSummary{}, err
 		}
 		sum, captureErr := ProtectWorktree(passCtx, opts.RepoPath, opts.DB, CaptureContext{BranchRef: branch, BaseHead: head}, CaptureOpts{
 			IgnoreChecker: checker, SensitiveMatcher: opts.SensitiveMatcher, SafeIgnoreMatcher: opts.SafeIgnoreMatcher,
-			Trace: tracer, MaxFileBytes: opts.MaxFileBytes, CheckpointStore: &store, WorktreeID: checkpointpkg.WorktreeID(opts.RepoPath),
+			SubmodulePaths: paths, Trace: tracer, MaxFileBytes: opts.MaxFileBytes, CheckpointStore: &store, WorktreeID: checkpointpkg.WorktreeID(opts.RepoPath),
 			ObservationEpoch: epoch, CheckpointReason: reason,
 		})
 		if maintain && now().Unix() >= maintenance.NextAttemptTS {
@@ -469,6 +495,26 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 		return sum, captureErr
+	}
+	var healthRecorded bool
+	var healthCheckpoint, healthFailure string
+	recordHealth := func(passCtx context.Context, sum CaptureSummary, captureErr error, nextRetry time.Time) {
+		failure := ""
+		if captureErr != nil {
+			failure = captureErr.Error()
+		}
+		if healthRecorded && failure == "" && healthFailure == "" && sum.CheckpointID == healthCheckpoint {
+			return
+		}
+		var retry []time.Time
+		if !nextRetry.IsZero() {
+			retry = []time.Time{nextRetry}
+		}
+		if err := state.RecordCaptureHealth(passCtx, opts.DB, failure, sum.CheckpointID, now(), retry...); err != nil {
+			logger.Warn("record checkpoint health", "err", err)
+			return
+		}
+		healthRecorded, healthCheckpoint, healthFailure = true, sum.CheckpointID, failure
 	}
 	pid := os.Getpid()
 	fingerprint := ""
@@ -517,6 +563,7 @@ func Run(ctx context.Context, opts Options) error {
 			default:
 				delay = opts.Scheduler.NextIdle(delay)
 			}
+			recordHealth(ctx, sum, err, now().Add(delay))
 			previousCheckpoint = sum.CheckpointID
 			current := now()
 			if current.Sub(lastSweep) >= sweepEvery {
@@ -572,14 +619,18 @@ func Run(ctx context.Context, opts Options) error {
 	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var stopErr error
+	var stopSum CaptureSummary
 	runWithProgressHeartbeat(stopCtx, progressHeartbeatInterval(opts), func() { heartbeat(stopCtx, "running", "final checkpoint") }, func() {
-		_, stopErr = protect(stopCtx, state.CheckpointReasonHint, false)
+		stopSum, stopErr = protect(stopCtx, state.CheckpointReasonHint, false)
 	})
 	note := "checkpoint protection stopped"
 	if stopErr != nil {
 		note = "stopped with incomplete checkpoint"
 	}
-	heartbeat(stopCtx, "stopped", note)
+	stampCtx, cancelStamp := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelStamp()
+	recordHealth(stampCtx, stopSum, stopErr, time.Time{})
+	heartbeat(stampCtx, "stopped", note)
 	return stopErr
 }
 
