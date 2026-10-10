@@ -45,6 +45,15 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 		frozenIDs[candidate.ID] = true
 	}
 	companions = append(frozen, companions...)
+	baseline, err := discoverIntentPublishedDocumentationBaseline(ctx, db, *input)
+	if err != nil {
+		return nil, err
+	}
+	baselineIDs := make(map[string]bool, len(baseline))
+	for _, candidate := range baseline {
+		baselineIDs[candidate.ID] = true
+	}
+	companions = append(companions, baseline...)
 	regressions, matchedTests, err := discoverIntentPublishedGoRegressions(ctx, db, *input)
 	if err != nil {
 		return nil, err
@@ -129,7 +138,7 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 				input.publishedContext = make(map[string][]IntentCandidateCapture)
 			}
 			input.publishedContext[candidate.ID] = captures
-			if frozenIDs[candidate.ID] {
+			if frozenIDs[candidate.ID] || baselineIDs[candidate.ID] {
 				if input.frozenPublishedContext == nil {
 					input.frozenPublishedContext = make(map[int64]bool)
 				}
@@ -154,6 +163,53 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 		}
 	}
 	return result, nil
+}
+
+// Later documentation can describe an earlier publication target. Recent
+// history bounds this lookup; the post-image proof below establishes what is
+// available, and ordinary goal validation still decides its relevance.
+func discoverIntentPublishedDocumentationBaseline(ctx context.Context, db *state.DB, input IntentCandidateEvaluation) ([]state.IntentCandidate, error) {
+	if len(input.Captures) == 0 {
+		return nil, nil
+	}
+	for _, capture := range input.Captures {
+		if intentCaptureRole(capture) != "documentation" {
+			return nil, nil
+		}
+	}
+	rows, err := db.ReadSQL().QueryContext(ctx, `
+SELECT id FROM intent_candidates
+WHERE branch_ref=? AND branch_generation=? AND status='published'
+ AND published_commit_oid IS NOT NULL
+ORDER BY updated_ts DESC,id LIMIT 8`, input.BranchRef, input.BranchGeneration)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	var candidates []state.IntentCandidate
+	for _, id := range ids {
+		candidate, found, err := state.IntentCandidateByID(ctx, db, id)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates, nil
 }
 
 // Published context is a complete net change. Intermediate post-images are
