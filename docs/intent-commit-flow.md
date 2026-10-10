@@ -33,6 +33,10 @@ reviews them together. An implementation and its available test can then finish
 the same goal instead of waiting in separate requests. Later captures stay
 protected for the next publication target.
 
+A documentation follow-up can also see proven published companions from its
+frozen target. ACD checks their recorded versions against the current branch and
+supplies them as context, without publishing them again.
+
 ## Gates
 
 A group publishes only after cohesion, completeness, separation, dependency,
