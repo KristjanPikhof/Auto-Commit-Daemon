@@ -307,6 +307,8 @@ semantic commit message before publication.
 ACD restores missing declarations for known published prerequisites. A saved
 run stopped by this mismatch resumes automatically after ACD proves that the
 target is protected and the prerequisite's recorded version is still in Git.
+It also orders declared prerequisites before their consumers and resumes a
+protected run when that ordering repair passes validation.
 Later documentation reviews can use a bounded set of recent published goals
 whose recorded versions still match Git. Those goals supply evidence without
 being selected for another commit.
