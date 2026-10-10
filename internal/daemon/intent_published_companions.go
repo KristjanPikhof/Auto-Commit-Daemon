@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path"
 	"sort"
@@ -49,6 +50,11 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 	if err != nil {
 		return nil, err
 	}
+	predecessors, err := discoverIntentPublishedPredecessors(ctx, db, *input)
+	if err != nil {
+		return nil, err
+	}
+	baseline = append(baseline, predecessors...)
 	baselineIDs := make(map[string]bool, len(baseline))
 	for _, candidate := range baseline {
 		baselineIDs[candidate.ID] = true
@@ -94,7 +100,7 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 		if len(active)+len(verified) >= state.IntentCandidateMaxOpenPerPair {
 			break
 		}
-		if verifiedIDs[candidate.ID] || (known[candidate.ID] && !frozenIDs[candidate.ID]) || candidate.Status != state.IntentCandidatePublished || !candidate.PublishedCommitOID.Valid || len(candidate.Events) == 0 || len(candidate.Events) > state.IntentCandidateMaxCaptures {
+		if verifiedIDs[candidate.ID] || (known[candidate.ID] && !frozenIDs[candidate.ID] && !baselineIDs[candidate.ID]) || candidate.Status != state.IntentCandidatePublished || !candidate.PublishedCommitOID.Valid || len(candidate.Events) == 0 || len(candidate.Events) > state.IntentCandidateMaxCaptures {
 			continue
 		}
 		if members+len(candidate.Events) > state.IntentCandidateMaxCaptures {
@@ -120,6 +126,10 @@ func loadPublishedIntentFormerCompanions(ctx context.Context, db *state.DB, inpu
 			return nil, err
 		}
 		if proven {
+			// Availability is proven by immutable publication, not the current
+			// readiness label of a superseded logical goal.
+			candidate.Readiness = state.IntentReadinessReady
+			candidate.MissingCompanions = ""
 			for i := range captures {
 				if path.Ext(captures[i].Event.Path) == ".ts" {
 					// Available published imports resolve in this pinned baseline.
@@ -207,6 +217,58 @@ ORDER BY updated_ts DESC,id LIMIT 8`, input.BranchRef, input.BranchGeneration)
 		}
 		if found {
 			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates, nil
+}
+
+// Exact before-images identify the already-published component being amended.
+// The shared post-image proof still checks availability at the pinned HEAD.
+func discoverIntentPublishedPredecessors(ctx context.Context, db *state.DB, input IntentCandidateEvaluation) ([]state.IntentCandidate, error) {
+	var candidates []state.IntentCandidate
+	seen := make(map[string]bool)
+	for _, capture := range input.Captures {
+		for _, op := range capture.Ops {
+			if !op.BeforeOID.Valid || !op.BeforeMode.Valid || len(candidates) >= 8 {
+				continue
+			}
+			var id string
+			err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT candidate.id FROM (
+ SELECT seq FROM capture_events WHERE branch_ref=? AND branch_generation=? AND state='published'
+ ORDER BY seq DESC LIMIT 256
+) recent
+JOIN capture_ops prior ON prior.event_seq=recent.seq
+JOIN capture_events event ON event.seq=prior.event_seq
+JOIN intent_candidates candidate ON candidate.published_commit_oid=event.commit_oid
+ AND candidate.branch_ref=event.branch_ref AND candidate.branch_generation=event.branch_generation
+WHERE candidate.status IN ('published','superseded') AND prior.path=? AND prior.after_oid=? AND prior.after_mode=?
+ORDER BY event.seq DESC LIMIT 1`, input.BranchRef, input.BranchGeneration, op.Path, op.BeforeOID.String, op.BeforeMode.String).Scan(&id)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			candidate, found, err := state.IntentCandidateByID(ctx, db, id)
+			if err != nil {
+				return nil, err
+			}
+			if found {
+				if candidate.Status == state.IntentCandidateSuperseded {
+					candidate.Events, err = state.IntentCandidateEventHistory(ctx, db, id)
+					if err != nil {
+						return nil, err
+					}
+					// Only this verified read-only view becomes published context.
+					candidate.Status = state.IntentCandidatePublished
+				}
+				candidates = append(candidates, candidate)
+			}
 		}
 	}
 	return candidates, nil
