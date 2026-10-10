@@ -2428,10 +2428,6 @@ func persistPathQuiescenceSnapshot(ctx context.Context, db *state.DB, gated int,
 	_ = state.MetaSet(ctx, db, MetaKeyPathQuiescenceUpdatedAt, time.Now().UTC().Format(time.RFC3339))
 }
 
-func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) bool {
-	return intentBatchWaitReason(pending, cfg, now) != ""
-}
-
 func intentBatchWaitReason(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) string {
 	if len(pending) == 0 || len(pending) >= cfg.minPending {
 		if len(pending) == 0 || cfg.settleWindow <= 0 {
