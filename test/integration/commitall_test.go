@@ -401,7 +401,28 @@ func TestCommitAllIntentStrategyDeterministic(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary required")
 	}
-	repo, files := commitAllFixture(t)
+	repo := tempRepo(t)
+	// The deterministic planner can explain these complete guide additions.
+	// Keep the shared comment-only fixture for Event's path-order contract.
+	guides := map[string]string{
+		"guides/branch-safety.md":      "# Reject stale branch plans\n\nRecheck the expected branch head before applying a planned ref update.\n",
+		"guides/checkpoint.md":         "# Protected checkpoint capture\n\nA completed checkpoint preserves captured file versions before branch publication.\n",
+		"guides/later-work.md":         "# Protect later edits\n\nLeave new captures outside an active frozen target for the next publication plan.\n",
+		"guides/ownership.md":          "# Check canonical worker ownership\n\nUse the canonical daemon lock as the proof of repository worker ownership.\n",
+		"guides/provider-retry.md":     "# Provider reconnection intervals\n\nRetry temporary provider failures after five minutes, ten minutes, then hourly.\n",
+		"guides/snapshot-retention.md": "# Preserve recovery snapshots\n\nRetain recovery snapshots when normal publication cannot safely continue.\n",
+		"guides/rename-order.md":       "# Preserve rename dependencies\n\nKeep recorded rename chains ordered with their required file changes.\n",
+		"guides/staging.md":            "# Preserve staged user changes\n\nPublish captures with a temporary index so user staging remains intact.\n",
+		"guides/verification.md":       "# Verify proposed commit trees\n\nRun required checks against each proposed commit tree before updating branch refs.\n",
+	}
+	files := make([]string, 0, len(guides))
+	for path := range guides {
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	for _, path := range files {
+		writeFile(t, filepath.Join(repo, path), guides[path])
+	}
 	env := commitAllEnv(t, "intent", "deterministic")
 	env = activateIntentV2Runtime(t, repo, env...)
 	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
