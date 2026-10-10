@@ -43,6 +43,15 @@ func intentRecordedEvidenceCorrection(req ai.IntentPlanRequestV2, selected []int
 	if len(eligible) == 0 {
 		return ""
 	}
+	documentationOnly := true
+	for _, capture := range req.OfferedCaptures {
+		if !eligible[capture.Seq] {
+			continue
+		}
+		documentationOnly = documentationOnly && intentCaptureRole(IntentCandidateCapture{
+			Event: state.CaptureEvent{Path: capture.Path},
+		}) == "documentation"
+	}
 	// Published members have no assignment authority. List only evidence related
 	// to unresolved offered members by the same grounded relationship inventory
 	// used by the goal gates, rather than every prior commit in the request.
@@ -60,10 +69,13 @@ func intentRecordedEvidenceCorrection(req ai.IntentPlanRequestV2, selected []int
 			continue
 		}
 		for _, capture := range candidate.CapturedEvidence {
-			if related[capture.Seq] && capture.CapturedDiff != "" && containsIntentSeq(candidate.SelectedSeqs, capture.Seq) {
+			if (related[capture.Seq] || documentationOnly) && capture.CapturedDiff != "" && containsIntentSeq(candidate.SelectedSeqs, capture.Seq) {
 				fmt.Fprintf(&facts, "- Published baseline %q supplies recorded evidence for related path %q. It is read-only context, not unoffered pending work.\n", candidate.CandidateID, capture.Path)
 			}
 		}
+	}
+	if documentationOnly {
+		facts.WriteString("- Review this documentation goal against the supplied published baseline. Documentation can complete a useful goal without new implementation or tests when it describes behavior already present there; do not require those captures to be offered again. Keep WAIT if the described behavior is actually absent or unproven.\n")
 	}
 	if facts.Len() == 0 {
 		return ""
