@@ -1844,7 +1844,7 @@ func replayIntentBatch(
 				BranchGeneration: activeCtx.BranchGeneration, FirstSeq: goalPending[0].Seq,
 				Trigger: "intent_goal_context_limit", Trace: opts.Trace,
 				EvidenceLimit: state.CompletedBranchTransitionProofLimit,
-				ArchiveOnly: true, InvalidateShadow: true,
+				ArchiveOnly:   true, InvalidateShadow: true,
 			})
 			if err != nil {
 				return sum, err
