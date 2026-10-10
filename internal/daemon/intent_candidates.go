@@ -2728,9 +2728,8 @@ func newIntentPlanRun(
 		RejectLocalFallback  bool                   `json:"reject_local_fallback"`
 		AttemptLimit         int                    `json:"attempt_limit"`
 	}{
-		// Documentation can now review proven publications in its frozen target.
-		// Reevaluate older waiting plans once with this baseline context.
-		Domain:    "acd.intent-plan-run/v8",
+		// Message failures now retain their accepted grouping for correction.
+		Domain:    "acd.intent-plan-run/v9",
 		Request:   fingerprintRequest,
 		BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
 		Provider: input.Provider, Model: input.Model, Preset: input.Preset,
@@ -3213,7 +3212,7 @@ func repairIntentCandidatePlanLocally(
 	seen := make(map[string]struct{})
 	allowRedundantContext := false
 	for _, finding := range findings {
-		allowRedundantContext = allowRedundantContext || finding.Code == "capture_outside_window"
+		allowRedundantContext = allowRedundantContext || finding.Code == "capture_outside_window" || finding.Code == "candidate_capture_count_invalid"
 	}
 	for pass := 0; pass < 3; pass++ {
 		signature := localIntentPlanRepairSignature(current)
@@ -3267,7 +3266,9 @@ func repairRedundantIntentCandidateContext(req ai.IntentPlanRequestV2, plan ai.I
 	}
 	owner := make(map[int64]string)
 	claimed := make(map[int64]struct{})
+	published := make(map[string]bool)
 	for _, candidate := range req.Candidates {
+		published[candidate.CandidateID] = candidate.Status == state.IntentCandidatePublished || candidate.Status == state.IntentCandidateSoftPublished
 		for _, seq := range candidate.SelectedSeqs {
 			if _, ambiguous := claimed[seq]; ambiguous {
 				return plan, false
@@ -3285,8 +3286,13 @@ func repairRedundantIntentCandidateContext(req ai.IntentPlanRequestV2, plan ai.I
 	}
 	repaired := cloneIntentPlanV2(plan)
 	changed := false
+	kept := make([]ai.IntentCandidateAssignment, 0, len(repaired.Candidates))
 	for i := range repaired.Candidates {
 		candidate := &repaired.Candidates[i]
+		if len(candidate.SelectedSeqs) == 0 && published[candidate.CandidateID] {
+			changed = true
+			continue
+		}
 		selected := candidate.SelectedSeqs[:0]
 		for _, seq := range candidate.SelectedSeqs {
 			if _, current := offered[seq]; current {
@@ -3303,7 +3309,9 @@ func repairRedundantIntentCandidateContext(req ai.IntentPlanRequestV2, plan ai.I
 			return plan, false
 		}
 		candidate.SelectedSeqs = selected
+		kept = append(kept, *candidate)
 	}
+	repaired.Candidates = kept
 	for _, count := range offered {
 		if count != 1 {
 			return plan, false
