@@ -186,7 +186,7 @@ func TestIntentRecordedGoCallerOwnershipRejectsFalseRelationships(t *testing.T) 
 		"package app\nfunc TestHistory() { _ = \"PlanHistory()\" }\n",
 		"package app\nfunc TestHistory() { foreign.PlanHistory() }\n",
 	} {
-		if intentGoTestCallsOwnedFunction("history_test.go", []byte(body), intentGoRegressionSource{packageName: "app", names: map[string]bool{"PlanHistory": true}}) {
+		if intentGoPublishedReferenceContext("history_test.go", []byte(body), intentGoRegressionSource{packageName: "app", names: map[string]bool{"PlanHistory": true}}) != "" {
 			t.Fatalf("unowned test reference was admitted: %s", body)
 		}
 	}

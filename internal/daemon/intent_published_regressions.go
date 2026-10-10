@@ -230,10 +230,6 @@ ORDER BY event.seq DESC LIMIT ?`, args...)
 	return candidates, matched, nil
 }
 
-func intentGoTestCallsOwnedFunction(sourcePath string, contents []byte, source intentGoRegressionSource) bool {
-	return intentGoPublishedReferenceContext(sourcePath, contents, source) != ""
-}
-
 // Preserve the exact call or named-type lines that admitted published support.
 // Generic shared helper lines cannot displace this witness during clipping.
 func intentGoPublishedReferenceContext(sourcePath string, contents []byte, source intentGoRegressionSource) string {
