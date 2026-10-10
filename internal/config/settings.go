@@ -9,7 +9,7 @@ import (
 )
 
 // SettingsSchemaVersion is the on-disk operator configuration version.
-const SettingsSchemaVersion = 1
+const SettingsSchemaVersion = 2
 
 // Overrides contains only explicit persisted values. Removing a key clears
 // the override and restores inheritance; JSON null is rejected.
@@ -74,7 +74,7 @@ func NewDocument() *Document {
 }
 
 // ParseDocument decodes one JSON value while retaining unknown fields.
-// Documents written before settings existed (no version) are treated as v1.
+// Legacy documents are translated in memory; reading never writes an upgrade.
 func ParseDocument(body []byte) (*Document, error) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return nil, errors.New("acd config: empty document")
@@ -88,6 +88,7 @@ func ParseDocument(body []byte) (*Document, error) {
 		return nil, errors.New("acd config: parse: multiple JSON values")
 	}
 	doc := NewDocument()
+	doc.Version = 1
 	if value, ok := takeRaw(raw, "version"); ok {
 		if err := json.Unmarshal(value, &doc.Version); err != nil {
 			return nil, fmt.Errorf("acd config: version: %w", err)
@@ -115,6 +116,9 @@ func ParseDocument(body []byte) (*Document, error) {
 		doc.Settings = settings
 	}
 	doc.Extra = cloneRawMap(raw)
+	if doc.Version == 1 {
+		TranslateLegacyDocument(doc)
+	}
 	return doc, nil
 }
 

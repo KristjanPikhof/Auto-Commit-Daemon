@@ -51,9 +51,6 @@ func (s *Service) Apply(ctx context.Context, req ApplyRequest) (ApplyResult, err
 	if err := s.requireRepository("apply runtime revision"); err != nil {
 		return ApplyResult{}, err
 	}
-	if err := s.rejectWhileExperimentActive(ctx); err != nil {
-		return ApplyResult{}, err
-	}
 	return s.apply(ctx, req, true)
 }
 
@@ -175,8 +172,8 @@ func (s *Service) prepareRevisionInput(
 		return state.ConfigRevisionInput{}, fmt.Errorf("acd settings: restart required for changed fields: %s",
 			strings.Join(validation.RestartChanged, ", "))
 	}
-	if req.TestedFingerprint == "" || req.TestedFingerprint != validation.Fingerprint {
-		return state.ConfigRevisionInput{}, errors.New("acd settings: tested settings are stale; test the current draft again")
+	if req.TestedFingerprint != "" && req.TestedFingerprint != validation.Fingerprint {
+		return state.ConfigRevisionInput{}, errors.New("acd settings: reviewed settings are stale; review the current draft again")
 	}
 	if req.ExpectedGeneration > math.MaxInt64 {
 		return state.ConfigRevisionInput{}, errors.New("acd settings: saved generation is out of range")
@@ -227,9 +224,6 @@ func (s *Service) Revert(ctx context.Context, req RevertRequest) (ApplyResult, e
 	if err := s.requireRepository("revert runtime revision"); err != nil {
 		return ApplyResult{}, err
 	}
-	if err := s.rejectWhileExperimentActive(ctx); err != nil {
-		return ApplyResult{}, err
-	}
 	doc, err := s.store.Load()
 	if err != nil {
 		return ApplyResult{}, sanitizeError(err)
@@ -259,19 +253,7 @@ func (s *Service) Revert(ctx context.Context, req RevertRequest) (ApplyResult, e
 	return s.finishApply(ctx, revision, activation, true)
 }
 
-func (s *Service) rejectWhileExperimentActive(ctx context.Context) error {
-	if err := s.requireRepository("inspect runtime experiments"); err != nil {
-		return err
-	}
-	if _, active, err := state.ActiveConfigExperiment(ctx, s.db); err != nil {
-		return sanitizeError(err)
-	} else if active {
-		return errors.New("acd settings: cancel or finish the active experiment before applying another revision")
-	}
-	return nil
-}
-
-func revisionSnapshotJSON(values map[string]string, confirmations []ai.ConfirmationRequirement, presets ...config.PresetResolution) ([]byte, error) {
+func revisionSnapshotJSON(values map[string]string, confirmations []ai.ConfirmationRequirement, _ ...config.PresetResolution) ([]byte, error) {
 	payload := make(map[string]any, len(values))
 	for key, value := range values {
 		payload[key] = value
@@ -282,11 +264,6 @@ func revisionSnapshotJSON(values map[string]string, confirmations []ai.Confirmat
 	}
 	sort.Strings(consents)
 	payload["confirmations"] = consents
-	if len(presets) > 0 {
-		payload["preset_id"] = presets[0].ID()
-		payload["preset_version"] = presets[0].Version()
-		payload["customized"] = presets[0].Customized
-	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("acd settings: encode runtime snapshot: %w", err)

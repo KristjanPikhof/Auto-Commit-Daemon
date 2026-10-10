@@ -36,7 +36,7 @@ func TestSettingsActionApplyStoppedQueuesWithoutStartOrWake(t *testing.T) {
 	svc, _ := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: "deterministic", Success: true}, nil
 	}, func(context.Context, state.DaemonState) error { nudges.Add(1); return nil })
-	draft := map[string]string{config.FieldModel: "pinned-model", config.FieldIntentWindow: "7"}
+	draft := map[string]string{config.FieldModel: "pinned-model", config.FieldTimeout: "7s"}
 	validation, tested := testedDraft(t, svc, draft, nil)
 	result, err := svc.Apply(context.Background(), ApplyRequest{Values: draft,
 		TestedFingerprint: tested.Fingerprint, ExpectedGeneration: validation.SourceGeneration})
@@ -68,7 +68,7 @@ func TestSettingsActionApplyStoppedQueuesWithoutStartOrWake(t *testing.T) {
 	if _, ok := payload["capture.max_file_bytes"]; ok {
 		t.Fatal("revision persisted restart-only field")
 	}
-	if got := string(payload[config.FieldIntentWindow]); got != `"7"` {
+	if got := string(payload[config.FieldTimeout]); got != `"7s"` {
 		t.Fatalf("intent.window JSON = %s", got)
 	}
 	if got := string(payload["confirmations"]); got != `[]` {
@@ -113,7 +113,7 @@ func TestSettingsActionApplyRejectsStaleTestGenerationDesiredAndRestart(t *testi
 	changed := map[string]string{config.FieldModel: "two"}
 	_, err := svc.Apply(context.Background(), ApplyRequest{Values: changed,
 		TestedFingerprint: tested.Fingerprint, ExpectedGeneration: validation.SourceGeneration})
-	if err == nil || !strings.Contains(err.Error(), "tested settings are stale") {
+	if err == nil || !strings.Contains(err.Error(), "reviewed settings are stale") {
 		t.Fatalf("stale fingerprint error = %v", err)
 	}
 	restart := map[string]string{"capture.max_file_bytes": "1234"}
@@ -171,7 +171,7 @@ func TestSettingsActionApplyRequiresTypedRiskConfirmations(t *testing.T) {
 	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
 	}, nil)
-	draft := map[string]string{config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://gateway.example/v1",
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://gateway.example/v1",
 		config.FieldModel: "model", config.FieldDiffEgress: "true"}
 	confirmed := []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationDiffEgress}
 	validation, tested := testedDraft(t, svc, draft, confirmed)
@@ -184,7 +184,7 @@ func TestSettingsActionApplyRequiresTypedRiskConfirmations(t *testing.T) {
 	}
 }
 
-func TestSettingsIntentApplyRequiresCommandAndRepairConsent(t *testing.T) {
+func TestSettingsIntentApplyRequiresCommandConsent(t *testing.T) {
 	lookup := func(name string) (string, bool) {
 		if name == ai.EnvAPIKey {
 			return "hidden", true
@@ -196,7 +196,6 @@ func TestSettingsIntentApplyRequiresCommandAndRepairConsent(t *testing.T) {
 	}, nil)
 	draft := map[string]string{
 		config.FieldCommitStrategy:          "intent",
-		config.FieldCommitPreset:            "balanced",
 		config.FieldProvider:                "openai-compat",
 		config.FieldIntentVerification:      "fast",
 		config.FieldVerificationFastCommand: "go test ./...",
@@ -204,7 +203,6 @@ func TestSettingsIntentApplyRequiresCommandAndRepairConsent(t *testing.T) {
 	all := []ai.ConfirmationRequirement{
 		ai.ConfirmationDiffEgress,
 		ai.ConfirmationVerificationCommand,
-		ai.ConfirmationIntentRepair,
 	}
 	validation, tested := testedDraft(t, svc, draft, all)
 	_, err := svc.Apply(context.Background(), ApplyRequest{
@@ -216,7 +214,6 @@ func TestSettingsIntentApplyRequiresCommandAndRepairConsent(t *testing.T) {
 	if !errors.As(err, &confirmationErr) || !reflect.DeepEqual(confirmationErr.Missing,
 		[]ai.ConfirmationRequirement{
 			ai.ConfirmationVerificationCommand,
-			ai.ConfirmationIntentRepair,
 		}) {
 		t.Fatalf("Apply confirmation error = %v", err)
 	}
@@ -235,7 +232,6 @@ func TestSettingsApplyQueuesFingerprintBoundSetupValidation(t *testing.T) {
 	command := "go test ./... -run '^$'"
 	draft := map[string]string{
 		config.FieldCommitStrategy:          "intent",
-		config.FieldCommitPreset:            "balanced",
 		config.FieldProvider:                "openai-compat",
 		config.FieldDiffEgress:              "true",
 		config.FieldIntentVerification:      "fast",
@@ -244,7 +240,6 @@ func TestSettingsApplyQueuesFingerprintBoundSetupValidation(t *testing.T) {
 	confirmed := []ai.ConfirmationRequirement{
 		ai.ConfirmationDiffEgress,
 		ai.ConfirmationVerificationCommand,
-		ai.ConfirmationIntentRepair,
 	}
 	validation, tested := testedDraft(t, svc, draft, confirmed)
 	digest := sha256.Sum256([]byte(command))

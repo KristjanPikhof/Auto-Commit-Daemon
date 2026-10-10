@@ -98,7 +98,7 @@ func TestSettingsSnapshotReadOnlySecretSafeAndScoped(t *testing.T) {
 	store := config.NewStore(roots)
 	if err := store.Update(func(doc *config.Document) error {
 		doc.Settings.Global[config.FieldModel] = json.RawMessage(`"global-model"`)
-		doc.Settings.Profiles["fast"] = config.Profile{Fields: config.Overrides{config.FieldIntentWindow: json.RawMessage(`"4"`)}}
+		doc.Settings.Profiles["fast"] = config.Profile{Fields: config.Overrides{config.FieldVerificationFullTimeout: json.RawMessage(`"4m"`)}}
 		doc.Settings.Repositories[svc.repoHash] = config.RepositorySettings{Profile: "fast", Fields: config.Overrides{config.FieldCommitStrategy: json.RawMessage(`"intent"`)}}
 		return nil
 	}); err != nil {
@@ -169,7 +169,7 @@ func TestSettingsResolutionSeparatesProviderCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, _, _, err := svc.resolveDraft(doc, nil)
+	resolved, _, _, err := svc.resolveDraft(doc, map[string]string{config.FieldCommitStrategy: "intent"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,19 +281,16 @@ func TestGlobalServiceSavesFingerprintBoundSetupApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	draft := map[string]string{
-		config.FieldCommitStrategy:      "intent",
-		config.FieldCommitPreset:        "balanced",
-		config.FieldProvider:            "openai-compat",
-		config.FieldBaseURL:             "https://gateway.example/v1",
-		config.FieldModel:               "gateway-model",
-		config.FieldDiffEgress:          "true",
-		config.FieldIntentVerification:  "structural",
-		config.FieldIntentRepairEnabled: "true",
+		config.FieldCommitStrategy:     "intent",
+		config.FieldProvider:           "openai-compat",
+		config.FieldBaseURL:            "https://gateway.example/v1",
+		config.FieldModel:              "gateway-model",
+		config.FieldDiffEgress:         "true",
+		config.FieldIntentVerification: "structural",
 	}
 	confirmed := []ai.ConfirmationRequirement{
 		ai.ConfirmationEndpointCredentials,
 		ai.ConfirmationDiffEgress,
-		ai.ConfirmationIntentRepair,
 	}
 	validation, err := svc.Validate(context.Background(), draft, confirmed)
 	if err != nil || len(validation.Missing) != 0 {
@@ -317,7 +314,7 @@ func TestGlobalServiceSavesFingerprintBoundSetupApproval(t *testing.T) {
 	approval, ok := config.ActiveGlobalSetupApproval(doc)
 	if !ok || approval.Generation != 1 ||
 		!reflect.DeepEqual(approval.Confirmations,
-			[]string{"diff_egress", "endpoint_credentials", "intent_repair"}) {
+			[]string{"diff_egress", "endpoint_credentials"}) {
 		t.Fatalf("approval = %+v ok=%v", approval, ok)
 	}
 	if string(doc.Settings.Global[config.FieldModel]) != `"gateway-model"` ||
@@ -375,8 +372,7 @@ func TestGlobalServiceReplaceDropsStaleOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	draft := preview.Values
-	draft[config.FieldCommitStrategy] = "event"
-	draft[config.FieldCommitPreset] = "fast"
+	draft[config.FieldCommitStrategy] = "local"
 	draft[config.FieldProvider] = "deterministic"
 	draft[config.FieldIntentVerification] = "none"
 	draft[config.FieldTimeout] = ai.DefaultProviderTimeout.String()
@@ -415,8 +411,7 @@ func TestGlobalServiceReplaceDropsStaleOverrides(t *testing.T) {
 func TestGlobalServiceRejectsRepositoryVerificationApproval(t *testing.T) {
 	svc, _ := testGlobalService(t, nil, nil)
 	draft := map[string]string{
-		config.FieldCommitStrategy:     "event",
-		config.FieldCommitPreset:       "fast",
+		config.FieldCommitStrategy:     "local",
 		config.FieldIntentVerification: "structural",
 	}
 	validation, err := svc.Validate(context.Background(), draft, nil)
@@ -433,7 +428,7 @@ func TestGlobalServiceRejectsRepositoryVerificationApproval(t *testing.T) {
 	}
 }
 
-func TestSettingsSnapshotProjectsRuntimeAndExperiment(t *testing.T) {
+func TestSettingsSnapshotProjectsRuntimeWithoutLegacyExperiment(t *testing.T) {
 	svc, _ := testService(t, nil, nil, nil)
 	ctx := context.Background()
 	baseline := insertRevision(t, svc, "baseline", 0)
@@ -449,7 +444,7 @@ func TestSettingsSnapshotProjectsRuntimeAndExperiment(t *testing.T) {
 		t.Fatal("candidate request lost")
 	}
 	_, _ = state.RejectConfigActivation(ctx, svc.db, pending.ID, candidate.ID, "bad\x1b[31m provider")
-	exp, err := state.CreateConfigExperiment(ctx, svc.db, state.ConfigExperimentInput{
+	_, err = state.CreateConfigExperiment(ctx, svc.db, state.ConfigExperimentInput{
 		BaselineRevisionID: baseline.ID, CandidateRevisionID: candidate.ID,
 		WindowBudget: 10, FailurePolicy: "continue",
 	})
@@ -462,7 +457,7 @@ func TestSettingsSnapshotProjectsRuntimeAndExperiment(t *testing.T) {
 	}
 	if snapshot.AppliedRevisionID != baseline.ID || snapshot.LastKnownGoodRevisionID != baseline.ID ||
 		snapshot.DesiredRevisionID != candidate.ID || snapshot.DesiredRequestID != pending.ID ||
-		snapshot.Experiment == nil || snapshot.Experiment.ID != exp.ID || snapshot.Experiment.WindowBudget != 10 {
+		snapshot.Experiment != nil {
 		t.Fatalf("runtime projection = %+v", snapshot)
 	}
 	if strings.Contains(snapshot.PendingError, "\x1b") || !strings.Contains(snapshot.PendingError, "provider") {
@@ -483,9 +478,9 @@ func TestSettingsActionSaveRoutesScopesAndRejectsStaleGeneration(t *testing.T) {
 		Values: map[string]*string{config.FieldModel: &global}, ExpectedGeneration: 0}); !errors.Is(err, config.ErrStaleGeneration) {
 		t.Fatalf("stale Save error = %v", err)
 	}
-	profileValue := "3"
+	profileValue := "3m"
 	if _, err := svc.Save(context.Background(), SaveRequest{Scope: ScopeProfile, Profile: "fast",
-		Values: map[string]*string{config.FieldIntentWindow: &profileValue}, ExpectedGeneration: 1}); err != nil {
+		Values: map[string]*string{config.FieldVerificationFullTimeout: &profileValue}, ExpectedGeneration: 1}); err != nil {
 		t.Fatal(err)
 	}
 	doc, err := config.NewStore(roots).Load()
@@ -493,7 +488,7 @@ func TestSettingsActionSaveRoutesScopesAndRejectsStaleGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	if doc.Generation != 2 || string(doc.Settings.Repositories[svc.repoHash].Fields[config.FieldModel]) != `"repo-model"` ||
-		string(doc.Settings.Profiles["fast"].Fields[config.FieldIntentWindow]) != `"3"` || len(doc.Settings.Global) != 0 {
+		string(doc.Settings.Profiles["fast"].Fields[config.FieldVerificationFullTimeout]) != `"3m"` || len(doc.Settings.Global) != 0 {
 		t.Fatalf("scoped document = %+v", doc.Settings)
 	}
 }
@@ -502,12 +497,12 @@ func TestSettingsActionClearsEmptyRepositoryOverride(t *testing.T) {
 	svc, roots := testService(t, nil, nil, nil)
 	model := "repo-model"
 	profile := "strict"
-	window := "20"
+	timeout := "20m"
 	if _, err := svc.Save(context.Background(), SaveRequest{
 		Scope:   ScopeProfile,
 		Profile: profile,
 		Values: map[string]*string{
-			config.FieldIntentWindow: &window,
+			config.FieldVerificationFullTimeout: &timeout,
 		},
 		ExpectedGeneration: 0,
 	}); err != nil {
@@ -560,7 +555,7 @@ func TestSettingsActionProviderTestRequiresRisksAndInvalidatesFingerprint(t *tes
 		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true, Latency: time.Millisecond}, nil
 	}
 	svc, _ := testService(t, lookup, probe, nil)
-	draft := map[string]string{config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://example.test/v1", config.FieldModel: "model-a"}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://example.test/v1", config.FieldModel: "model-a"}
 	_, err := svc.TestProvider(context.Background(), draft, nil)
 	var confirmationErr *ConfirmationRequiredError
 	if !errors.As(err, &confirmationErr) || !reflect.DeepEqual(confirmationErr.Missing, []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials}) || probes.Load() != 0 {
@@ -577,7 +572,7 @@ func TestSettingsActionProviderTestRequiresRisksAndInvalidatesFingerprint(t *tes
 	}
 }
 
-func TestSettingsIntentPresetMaterializesRevisionMetadata(t *testing.T) {
+func TestFinishConfigIntentRevisionContainsOnlySupportedFields(t *testing.T) {
 	lookup := func(name string) (string, bool) {
 		if name == ai.EnvAPIKey {
 			return "hidden", true
@@ -585,23 +580,13 @@ func TestSettingsIntentPresetMaterializesRevisionMetadata(t *testing.T) {
 		return "", false
 	}
 	svc, _ := testService(t, lookup, nil, nil)
-	draft := map[string]string{
-		config.FieldCommitStrategy: "intent",
-		config.FieldCommitPreset:   "balanced",
-		config.FieldProvider:       "openai-compat",
-	}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "structural"}
 	validation, err := svc.Validate(context.Background(), draft, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if validation.Preset.Reference() != "intent.balanced@3" || validation.Preset.Customized {
-		t.Fatalf("preset = %+v", validation.Preset)
-	}
-	if validation.ResolvedHot[config.FieldIntentWindow] != "20" ||
-		validation.ResolvedHot[config.FieldIntentVerification] != "structural" ||
-		validation.ResolvedHot[config.FieldIntentRepairEnabled] != "true" ||
-		validation.ResolvedHot[config.FieldDiffEgress] != "true" {
-		t.Fatalf("balanced values = %#v", validation.ResolvedHot)
+	if validation.ResolvedHot[config.FieldIntentVerification] != "structural" || validation.ResolvedHot[config.FieldDiffEgress] != "false" {
+		t.Fatalf("explicit values lost: %#v", validation.ResolvedHot)
 	}
 	body, err := revisionSnapshotJSON(validation.ResolvedHot, nil, validation.Preset)
 	if err != nil {
@@ -611,19 +596,15 @@ func TestSettingsIntentPresetMaterializesRevisionMetadata(t *testing.T) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["preset_id"] != "intent.balanced" ||
-		payload["preset_version"] != float64(3) || payload["customized"] != false {
-		t.Fatalf("revision metadata = %#v", payload)
+	for _, name := range []string{"preset_id", "preset_version", "customized", config.FieldIntentWindow, config.FieldIntentRepairEnabled} {
+		if _, exists := payload[name]; exists {
+			t.Fatalf("retired metadata: %s", name)
+		}
 	}
-
-	draft[config.FieldIntentWindow] = "21"
-	custom, err := svc.Validate(context.Background(), draft, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !custom.Preset.Customized || custom.Fingerprint == validation.Fingerprint {
-		t.Fatalf("custom preset = %+v fingerprints=%q/%q",
-			custom.Preset, validation.Fingerprint, custom.Fingerprint)
+	draft[config.FieldModel] = "different-model"
+	changed, err := svc.Validate(context.Background(), draft, nil)
+	if err != nil || changed.Fingerprint == validation.Fingerprint {
+		t.Fatalf("hot edit not fingerprinted: %+v %v", changed, err)
 	}
 }
 
@@ -644,7 +625,7 @@ func TestSettingsProviderUsesProtectedCredentialBelowEnvironment(t *testing.T) {
 	if err := credentials.NewStore(roots).Set("sk-protected"); err != nil {
 		t.Fatal(err)
 	}
-	draft := map[string]string{config.FieldProvider: "openai-compat"}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat"}
 	if _, err := svc.TestProvider(context.Background(), draft, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -672,7 +653,7 @@ func TestSettingsActionProviderTestDoesNotRequireDiffEgressConfirmation(t *testi
 		}
 		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
 	}, nil)
-	draft := map[string]string{
+	draft := map[string]string{config.FieldCommitStrategy: "intent",
 		config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://example.test/v1",
 		config.FieldModel: "model-a", config.FieldDiffEgress: "true",
 	}
@@ -707,7 +688,7 @@ func TestSettingsActionProviderTestRedactsProbeError(t *testing.T) {
 		return ai.ProviderProbeResult{Provider: "openai-compat"},
 			errors.New("hidden-key\x1b[2J upstream rejected sk-HCKZa********UC3m")
 	}, nil)
-	_, err := svc.TestProvider(context.Background(), map[string]string{
+	_, err := svc.TestProvider(context.Background(), map[string]string{config.FieldCommitStrategy: "intent",
 		config.FieldProvider: "openai-compat", config.FieldModel: "model",
 	}, nil)
 	if err == nil || strings.Contains(err.Error(), "hidden-key") ||

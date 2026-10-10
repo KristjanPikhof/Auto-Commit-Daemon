@@ -6,6 +6,22 @@ import (
 	"strings"
 )
 
+// Deprecated: identifiers for old callers and the v1 translation boundary.
+const (
+	FieldCommitPreset           = "commit.preset"
+	FieldIntentWindow           = "intent.window"
+	FieldIntentMinPending       = "intent.min_pending"
+	FieldIntentSettleWindow     = "intent.settle_window"
+	FieldIntentMaxPendingAge    = "intent.max_pending_age"
+	FieldIntentRecentCommits    = "intent.recent_commits"
+	FieldIntentDeferLimit       = "intent.defer_limit"
+	FieldIntentRetryOnInvalid   = "intent.retry_on_invalid"
+	FieldIntentPathCoalescing   = "intent.path_coalescing"
+	FieldIntentRepairEnabled    = "intent.repair.enabled"
+	FieldIntentRepairHorizon    = "intent.repair.horizon"
+	FieldIntentRepairMaxCommits = "intent.repair.max_commits"
+)
+
 // Retired settings stay recognizable only for migration and actionable errors.
 var retiredFinishFields = map[string]bool{
 	FieldCommitPreset: true,
@@ -44,9 +60,11 @@ func TranslateLegacyDocument(doc *Document) {
 			}
 		}
 		var strategy string
-		if value, ok := values[FieldCommitStrategy]; ok && json.Unmarshal(value, &strategy) == nil && strategy == "event" {
+		if value, ok := values[FieldCommitStrategy]; ok && json.Unmarshal(value, &strategy) == nil {
 			old[FieldCommitStrategy] = cloneRaw(value)
-			values[FieldCommitStrategy] = json.RawMessage(`"local"`)
+			if strings.EqualFold(strings.TrimSpace(strategy), "event") {
+				values[FieldCommitStrategy] = json.RawMessage(`"local"`)
+			}
 		}
 		if len(old) > 0 {
 			archived[scope] = old
@@ -72,17 +90,15 @@ func TranslateLegacyDocument(doc *Document) {
 			approval.Confirmations = kept
 		}
 	}
-	if len(archived) > 0 {
-		if doc.Extra == nil {
-			doc.Extra = map[string]json.RawMessage{}
-		}
-		archive := map[string]any{"scopes": archived}
-		if previous, exists := doc.Extra["legacy_finish_settings"]; exists {
-			archive["previous"] = cloneRaw(previous)
-		}
-		body, _ := json.Marshal(archive)
-		doc.Extra["legacy_finish_settings"] = body
+	if doc.Extra == nil {
+		doc.Extra = map[string]json.RawMessage{}
 	}
+	archive := map[string]any{"version": 1, "scopes": archived}
+	if previous, exists := doc.Extra["legacy_finish_settings"]; exists {
+		archive["previous"] = cloneRaw(previous)
+	}
+	body, _ := json.Marshal(archive)
+	doc.Extra["legacy_finish_settings"] = body
 	doc.Version = SettingsSchemaVersion
 }
 
@@ -99,4 +115,85 @@ func TranslateLegacyEnvironment(lookup func(string) (string, bool)) func(string)
 		}
 		return value, set
 	}
+}
+
+// LegacyFinishDefaults preserves only supported values from the former preset
+// layer. Scopes are ordered from repository to profile to global, excluding
+// scopes omitted when inspecting inherited settings. Values remain below all
+// authored and environment overrides; they never grant provider consent.
+// Explicit setup must materialize effective persisted values before calling
+// RetireLegacyFinishDefaults. Loading or inspecting settings never does either.
+func LegacyFinishDefaults(doc *Document, scopes []string, lookup func(string) (string, bool)) Overrides {
+	if doc == nil {
+		return nil
+	}
+	var archive struct {
+		Version int                  `json:"version"`
+		Retired bool                 `json:"retired"`
+		Scopes  map[string]Overrides `json:"scopes"`
+	}
+	if json.Unmarshal(doc.Extra["legacy_finish_settings"], &archive) != nil || archive.Version != 1 || archive.Retired {
+		return nil
+	}
+	selector := func(field, env, fallback string) string {
+		for _, scope := range scopes {
+			var value string
+			if raw, ok := archive.Scopes[scope][field]; ok && json.Unmarshal(raw, &value) == nil {
+				return strings.ToLower(strings.TrimSpace(value))
+			}
+		}
+		if lookup != nil {
+			if value, ok := lookup(env); ok {
+				return strings.ToLower(strings.TrimSpace(value))
+			}
+		}
+		return fallback
+	}
+	strategy := selector(FieldCommitStrategy, "ACD_COMMIT_STRATEGY", "event")
+	presetDefault := "fast"
+	if strategy == "intent" {
+		presetDefault = "balanced"
+	}
+	preset := selector(FieldCommitPreset, "ACD_COMMIT_PRESET", presetDefault)
+	if (strategy != "event" && strategy != "intent") || (preset != "fast" && preset != "balanced" && preset != "quality") {
+		return nil
+	}
+	values := Overrides{FieldIntentVerification: json.RawMessage(`"none"`), FieldDiffEgress: json.RawMessage(`"true"`)}
+	if strategy == "event" && preset == "fast" {
+		values[FieldProvider] = json.RawMessage(`"deterministic"`)
+		values[FieldDiffEgress] = json.RawMessage(`"false"`)
+	}
+	if strategy == "intent" {
+		switch preset {
+		case "balanced":
+			values[FieldIntentVerification] = json.RawMessage(`"structural"`)
+		case "quality":
+			values[FieldIntentVerification] = json.RawMessage(`"full"`)
+		}
+	}
+	return values
+}
+
+// RetireLegacyFinishDefaults marks the fallback inactive while keeping all
+// archived provenance. Call only inside the explicit setup write transaction,
+// after materializing effective values for every authored scope.
+func RetireLegacyFinishDefaults(doc *Document) error {
+	if doc == nil {
+		return fmt.Errorf("acd config: nil document")
+	}
+	raw, exists := doc.Extra["legacy_finish_settings"]
+	if !exists {
+		return nil
+	}
+	var archive map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &archive); err != nil {
+		return fmt.Errorf("acd config: decode legacy finish settings: %w", err)
+	}
+	archive["retired"] = json.RawMessage(`true`)
+	body, err := json.Marshal(archive)
+	if err != nil {
+		return err
+	}
+	doc.Extra["legacy_finish_settings"] = body
+	return nil
 }
