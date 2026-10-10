@@ -290,6 +290,10 @@ one commit per capture; Intent mode may create several semantically atomic
 commits. The command never combines everything into one commit merely because
 of its name. If the terminal disconnects or the worker restarts, publication
 continues and the next `acd commit-all --yes` reconnects to the same drain.
+This is a priority request: ACD interrupts background planning and reviews the
+protected target immediately. It brings an existing goal-review deadline
+forward once, without relaxing commit quality or repeatedly calling a failed
+provider. Provider outages retain their retry schedule.
 If the worker socket is unavailable, the command can still read the saved
 target and its last error. A saved active run does not prove that a worker is
 publishing it; worker recovery remains necessary before it can continue.
@@ -297,6 +301,9 @@ Invalid Intent grouping can use the configured retry budget, capped at two
 corrections after the first plan. Repeated no-progress state then enters
 bounded replanning or a safe local unlock. A local group still requires a
 semantic commit message before publication.
+ACD restores missing declarations for known published prerequisites. A saved
+run stopped by this mismatch resumes automatically after ACD proves that the
+target is protected and the prerequisite's recorded version is still in Git.
 
 The barrier accepts only a completed checkpoint for the requested worktree,
 branch, generation, and observation. A checkpoint from another branch or
