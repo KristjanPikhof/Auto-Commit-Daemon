@@ -255,7 +255,7 @@ func EnsureCheckpointRef(ctx context.Context, repoDir, ref, commitOID string) (c
 // namespace. Setup's migration bridge uses refs/acd/migration/ while normal
 // checkpoint capture remains restricted to CheckpointRefPrefix.
 func EnsurePrivateRefDurable(ctx context.Context, repoDir, prefix, ref, commitOID string) (created bool, err error) {
-	if prefix != CheckpointRefPrefix && prefix != "refs/acd/migration/" {
+	if prefix != CheckpointRefPrefix && prefix != "refs/acd/migration/" && prefix != FinishRefPrefix {
 		return false, fmt.Errorf("git: unsupported private ref prefix %q", prefix)
 	}
 	if !strings.HasPrefix(ref, prefix) || len(ref) == len(prefix) {
