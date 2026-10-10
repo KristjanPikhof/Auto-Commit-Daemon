@@ -958,6 +958,8 @@ func IntentPlannerV2SystemPrompt(format ...CommitFormat) string {
 		purposefulCommitGroupingInstructions +
 		"Activity epochs and temporal proximity may trigger evaluation but cannot alone prove cohesion. " +
 		"Mark readiness=wait when any required companion is missing. A ready candidate must not depend on a waiting candidate. " +
+		"Do not invent companions solely because new tests are absent. Justify a missing companion with a concrete dependency or unresolved behavior in the supplied evidence. The host still runs configured verification against the proposed commit tree. " +
+		"A self-contained change with clear before/after behavior and no missing dependency is ready for host materialization and verification. Infer its useful purpose from that observable change; a separate design note or explanation of why the user wants it is not a prerequisite. " +
 		"Candidates with status=published supply existing baseline behavior through their recorded evidence. Do not call that behavior missing merely because its captures are not offered, and do not select those captures again. " +
 		"A later correction or regression test may complete its own useful goal against that baseline; keep any available unpublished support together and explain the new goal from its net change. " +
 		"Keep raw-source reasoning out of purpose, grouping_reason, and missing_companions. " +
