@@ -541,6 +541,9 @@ func intentDocumentChangeReferences(diff string) map[string]struct{} {
 	if len(diff) > 8<<10 {
 		diff = diff[:8<<10]
 	}
+	// Line wrapping must not erase an otherwise identical five-word witness.
+	// Carry four words across consecutive added lines; other diff records reset
+	// that carry so separate hunks and unchanged or removed text cannot join.
 	var tail []string
 	for _, line := range strings.Split(diff, "\n") {
 		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
