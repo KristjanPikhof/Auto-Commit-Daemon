@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -418,6 +417,19 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 	errCh := make(chan error, len(records))
 	closers := make([]io.Closer, 0, len(records)*2)
 	runtimes := make(map[string]*workerRuntime, len(records))
+	var runJobs sync.WaitGroup
+	defer func() {
+		cancel()
+		runJobs.Wait()
+		for _, runtime := range runtimes {
+			runtime.finishMu.Lock()
+			runtime.finishMu.Unlock()
+			runtime.finishJobs.Wait()
+		}
+		for i := len(closers) - 1; i >= 0; i-- {
+			_ = closers[i].Close()
+		}
+	}()
 	for _, record := range records {
 		wt, resolveErr := git.ResolveWorktree(cctx, record.Path)
 		if resolveErr != nil {
@@ -431,14 +443,6 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		restorePending, pendingErr := state.RestoreRepairPending(cctx, db)
 		if pendingErr != nil {
 			return fmt.Errorf("acd worker: inspect interrupted restore for %s: %w", record.Path, pendingErr)
-		}
-		if !restorePending {
-			if recoverErr := daemon.RecoverSelfPublicationsBeforePlanning(cctx, wt.Root, db); recoverErr != nil {
-				return fmt.Errorf("acd worker: recover publication journal for %s: %w", record.Path, recoverErr)
-			}
-		}
-		if _, reconcileErr := state.ReconcileCheckpointIntentMemberships(cctx, db, record.WorktreeID); reconcileErr != nil {
-			return fmt.Errorf("acd worker: reconcile checkpoint publication state for %s: %w", record.Path, reconcileErr)
 		}
 		opts, logCloser, buildErr := buildDaemonRunOptionsWithID(wt.Root, wt.GitDir, db, repositoryID)
 		if buildErr != nil {
@@ -465,16 +469,25 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		wakeTargets[record.WorktreeID] = wakeCh
 		wakeMu.Unlock()
 		opts.WakeCh = wakeCh
-		opts.EmptySweepThreshold = math.MaxInt
+		protectionGate := &sync.Mutex{}
+		opts.ProtectionGate = protectionGate
+		recovery := daemon.FinishWorker{RepoPath: wt.Root, RepositoryID: repositoryID, DB: db}
+		if _, recoveryErr := recovery.RecoverPrepared(cctx); recoveryErr != nil {
+			fmt.Fprintf(errOut, "Finish recovery for %s needs attention: %v; checkpoint protection continues.\n", wt.Root, recoveryErr)
+		}
+		opts.FinishRecoveryDone = true
 		runtimes[record.WorktreeID] = &workerRuntime{
 			record: record, worktree: wt, db: db, gate: gate,
+			roots: roots, workerCtx: cctx, protectionGate: protectionGate,
 			policy: restorepkg.ProtectionPolicy{
 				Sensitive: opts.SensitiveMatcher, SafeIgnore: opts.SafeIgnoreMatcher,
 				MaxFileBytes: opts.MaxFileBytes,
 			},
 			restoreHeld: restoreHeld,
 		}
+		runJobs.Add(1)
 		go func(path string, runOpts daemon.Options) {
+			defer runJobs.Done()
 			if runErr := daemon.Run(cctx, runOpts); runErr != nil && !errors.Is(runErr, context.Canceled) {
 				errCh <- fmt.Errorf("%s: %w", path, runErr)
 				return
@@ -507,9 +520,6 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 	}()
 	defer func() {
 		activityHints.Close()
-		for i := len(closers) - 1; i >= 0; i-- {
-			_ = closers[i].Close()
-		}
 	}()
 	select {
 	case <-cctx.Done():
@@ -747,31 +757,15 @@ func applyWorkerRestartOptions(roots paths.Roots, record central.RepoRecord, wt 
 	if err != nil {
 		return err
 	}
-	eventDays, err := parseInt("ACD_EVENT_RETENTION_DAYS")
-	if err != nil {
-		return err
-	}
 	clientSeconds, err := parseInt("ACD_CLIENT_TTL_SECONDS")
 	if err != nil {
 		return err
 	}
-	rewindSeconds, err := parseInt("ACD_REWIND_GRACE_SECONDS")
-	if err != nil {
-		return err
-	}
-	shadowGenerations, err := parseInt("ACD_SHADOW_RETENTION_GENERATIONS")
-	if err != nil {
-		return err
-	}
-	rewindGrace := time.Duration(rewindSeconds) * time.Second
 	opts.MaxFileBytes = maxBytes
-	opts.EventRetention = time.Duration(eventDays) * 24 * time.Hour
 	opts.ClientTTL = time.Duration(clientSeconds) * time.Second
 	opts.FsnotifyEnabled = truthyConfig(values["ACD_FSNOTIFY_ENABLED"])
 	opts.SensitiveMatcher = state.NewSensitiveMatcherFromValue(values["ACD_SENSITIVE_GLOBS"])
 	opts.SafeIgnoreMatcher = state.NewSafeIgnoreMatcherFromValues(values["ACD_SAFE_IGNORE"], values["ACD_SAFE_IGNORE_EXTRA"])
-	opts.RewindGrace = &rewindGrace
-	opts.ShadowRetentionGenerations = &shadowGenerations
 	if truthyConfig(values["ACD_TRACE"]) {
 		writer, traceErr := acdtrace.New(acdtrace.Options{Repo: wt.Root, GitDir: wt.GitDir, Dir: strings.TrimSpace(os.Getenv(acdtrace.EnvTraceDir))})
 		if traceErr == nil {
@@ -805,12 +799,17 @@ func truthyConfig(value string) bool {
 }
 
 type workerRuntime struct {
-	record      central.RepoRecord
-	worktree    git.Worktree
-	db          *state.DB
-	gate        *sync.RWMutex
-	policy      restorepkg.ProtectionPolicy
-	restoreHeld *atomic.Bool
+	roots          paths.Roots
+	workerCtx      context.Context
+	protectionGate *sync.Mutex
+	finishMu       sync.Mutex
+	finishJobs     sync.WaitGroup
+	record         central.RepoRecord
+	worktree       git.Worktree
+	db             *state.DB
+	gate           *sync.RWMutex
+	policy         restorepkg.ProtectionPolicy
+	restoreHeld    *atomic.Bool
 }
 
 type repositoryWorkerHandler struct {
@@ -834,6 +833,9 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 	runtime, err := h.runtime(request.WorktreeID)
 	if err != nil {
 		return nil, protocolFailure("worktree_not_found", err, false)
+	}
+	if request.Method == "finish_start" || request.Method == "finish_status" {
+		return h.handleFinish(ctx, runtime, request)
 	}
 	publicationDrainStart := request.Method == "publication_drain_start"
 	if publicationDrainStart {
@@ -1899,7 +1901,7 @@ func (h cliSupervisorHandler) HandleSupervisorRequest(ctx context.Context, reque
 			return nil, protocolFailure("repository_update_failed", err, false)
 		}
 		return result, nil
-	case "hint", "checkpoint_barrier", "publication_drain_start",
+	case "finish_start", "finish_status", "hint", "checkpoint_barrier", "publication_drain_start",
 		"publication_drain_status":
 		fallthrough
 	case "history", "restore_plan", "restore_apply", "repair":
