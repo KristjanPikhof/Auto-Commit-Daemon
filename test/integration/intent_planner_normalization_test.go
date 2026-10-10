@@ -201,6 +201,7 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 	if paused.ExitCode != 0 {
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
+	// Recovery needs independently meaningful goals after rejecting the plan.
 	writeFile(t, filepath.Join(repo, "reject-one.md"), "# Capture protection reference\n\nPreserve file versions in checkpoints before publication.\n")
 	writeFile(t, filepath.Join(repo, "reject-two.md"), "# Provider reconnection reference\n\nRetry temporary provider failures while captured work stays protected.\n")
 	rejectsPath := filepath.Join(repo, ".git", "acd", "planner-rejects.jsonl")
