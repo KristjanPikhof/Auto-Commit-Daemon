@@ -154,8 +154,29 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 		return fmt.Errorf("acd: unsupported human result %T", envelope.Data)
 	}
 	fmt.Fprintf(out, "Protection: %s\n", onOff(data.Enabled))
-	fmt.Fprintf(out, "Current changes saved: %s\n", yesNo(data.Protected))
+	fmt.Fprintf(out, "Last observed work saved: %s\n", yesNo(data.Protected))
 	fmt.Fprintf(out, "Branch commits: %s\n", publicationOutcomeLabel(data.PublicationOutcome, data.PublicationProgress))
+	if data.PublicationOutcome.CheckpointAvailable {
+		fmt.Fprintf(out, "Uncommitted work: %d saved path(s), %d current worktree path(s)\n", data.PublicationOutcome.PendingChanges, data.PublicationOutcome.WorktreeChanges)
+		if f := data.PublicationOutcome.Finish; f != nil {
+			fmt.Fprintf(out, "Finish %s: %s\n", f.RequestID, finishStatusSummary(f))
+			renderFinishStatusChecks(out, f)
+		}
+		if data.PublicationOutcome.LaterChanges > 0 {
+			fmt.Fprintf(out, "Later work: %d changed path(s), separate from the finish target\n", data.PublicationOutcome.LaterChanges)
+		}
+		worker := "not responsive"
+		if data.PublicationProgress.WorkerResponsive {
+			worker = "responsive"
+		}
+		fmt.Fprintf(out, "Worker: %s; heartbeat %ds ago\n", worker, data.PublicationProgress.HeartbeatAgeSeconds)
+	}
+	if h := data.PublicationOutcome.History; h != nil {
+		fmt.Fprintf(out, "History plan %s: %s\n", h.PlanID, h.State)
+	}
+	if data.PublicationOutcome.Legacy.Unpublished > 0 {
+		fmt.Fprintf(out, "Legacy archive: %d captured version(s) retained separately\n", data.PublicationOutcome.Legacy.Unpublished)
+	}
 	if data.PublicationOutcome.RecoveredChanges > 0 {
 		fmt.Fprintf(out, "Recovery: %d changes saved separately\n", data.PublicationOutcome.RecoveredChanges)
 	}
@@ -176,6 +197,15 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 }
 
 func publicationOutcomeLabel(outcome publicationOutcome, progress publicationProgressReport) string {
+	if outcome.CheckpointAvailable {
+		if outcome.BranchCommitted == nil {
+			return "unknown"
+		}
+		if *outcome.BranchCommitted {
+			return "saved work is on the current branch"
+		}
+		return fmt.Sprintf("%d saved path(s) await finish", outcome.PendingChanges)
+	}
 	if outcome.BranchCommitted == nil {
 		return "unknown"
 	}
