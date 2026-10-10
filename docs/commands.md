@@ -304,25 +304,19 @@ Invalid Intent grouping can use the configured retry budget, capped at two
 corrections after the first plan. Repeated no-progress state then enters
 bounded replanning or a safe local unlock. A local group still requires a
 semantic commit message before publication.
-ACD restores missing declarations for known published prerequisites. A saved
-run stopped by this mismatch resumes automatically after ACD proves that the
-target is protected and the prerequisite's recorded version is still in Git.
-It also orders declared prerequisites before their consumers and resumes a
-protected run when that ordering repair passes validation.
-Later documentation reviews can use a bounded set of recent published goals
-whose recorded versions still match Git. Those goals supply evidence without
-being selected for another commit.
-Corrections can also use an exact published predecessor after its goal has
-been superseded. ACD checks that the recorded version is still available.
-Related documentation can form one goal when its added lines contain matching
-descriptions of the same behavior. Time and directory proximity alone still
-cannot justify grouping.
-Absent new tests alone do not keep a goal waiting. A missing companion must
-follow from a concrete dependency or unresolved behavior in the supplied
-evidence. Configured checks still run against the proposed commit tree.
-ACD can use protected explanatory updates to clarify frozen goals when their
-Go tokens match. Compiler directives and cgo are excluded, and the later
-update remains outside the publication target.
+
+ACD can repair missing prerequisite declarations and their order, then resume
+a stopped run after proving that its target is protected. Later corrections
+and documentation reviews can use published work whose recorded version still
+matches Git, including work from a superseded goal. That context is never
+selected for another commit.
+
+Related documentation can form one goal when its added lines describe the same
+behavior. Missing companions require concrete evidence; a completed goal does
+not always need new tests. Protected Go comment updates can clarify a frozen
+goal only when code tokens match, with compiler directives and cgo excluded.
+Those updates remain outside the publication target. All changes still pass
+the [Intent goal and publication checks](intent-commit-flow.md).
 
 The barrier accepts only a completed checkpoint for the requested worktree,
 branch, generation, and observation. A checkpoint from another branch or
