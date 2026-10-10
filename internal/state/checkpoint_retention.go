@@ -19,6 +19,14 @@ func RetentionCheckpoints(ctx context.Context, db *DB, worktreeID string) ([]Ret
 	if db == nil {
 		return nil, errors.New("state: retention requires a database")
 	}
+	version, err := db.UserVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	finishReferences := ""
+	if version >= 31 {
+		finishReferences = ` OR EXISTS (SELECT 1 FROM finish_requests f WHERE f.checkpoint_id=cp.id AND f.state<>'completed')`
+	}
 	rows, err := db.readSQL().QueryContext(ctx, `
 SELECT cp.id,cp.worktree_id,cp.reason,cp.checkpoint_ref,cp.commit_oid,
        cp.seq,cp.created_ts,cp.retained,
@@ -39,7 +47,7 @@ SELECT cp.id,cp.worktree_id,cp.reason,cp.checkpoint_ref,cp.commit_oid,
            AND cp.id IN (r.target_checkpoint_id,
                          r.pre_restore_checkpoint_id,
                          r.post_restore_checkpoint_id)
-       ) AS unresolved
+       )`+finishReferences+` AS unresolved
 FROM checkpoints cp
 WHERE cp.worktree_id=? AND cp.phase='completed'
 ORDER BY cp.seq DESC`, worktreeID)
