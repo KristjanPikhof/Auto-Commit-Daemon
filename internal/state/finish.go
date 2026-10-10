@@ -250,6 +250,16 @@ func ActiveFinishRequest(ctx context.Context, db *DB, worktree string) (FinishRe
 	return activeFinish(ctx, db.readSQL(), worktree)
 }
 
+// LatestFinishRequest reports terminal failures as well as active work.
+func LatestFinishRequest(ctx context.Context, db *DB, worktree string) (FinishRequest, error) {
+	if version, err := finishReadVersion(ctx, db); err != nil {
+		return FinishRequest{}, err
+	} else if version < 31 {
+		return FinishRequest{}, ErrSetupRequired
+	}
+	return scanFinish(db.readSQL().QueryRowContext(ctx, finishSelect+` WHERE worktree_id=? ORDER BY created_ts DESC,request_id,attempt DESC LIMIT 1`, worktree))
+}
+
 func validateFinishCheckpoint(ctx context.Context, tx *sql.Tx, target FinishTarget) error {
 	var worktree, tree, phase, branch, head string
 	var retained, complete bool
