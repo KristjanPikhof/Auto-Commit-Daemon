@@ -1834,6 +1834,27 @@ func replayIntentBatch(
 		}
 	}
 	if len(window) == 0 {
+		if waitReason == "skipped_due_intent_goal_context_limit" &&
+			len(goalPending) > state.IntentCandidateMaxCaptures &&
+			opts.PublicationDrain == nil && len(cfg.targetEventSeqs) == 0 {
+			// Preserve the oversized background chain before rebuilding its
+			// current versions. A frozen publication target must stay unchanged.
+			recovered, err := ReconcileUnpublishedChain(ctx, repoRoot, db, RecoveryReconcileOptions{
+				GitDir: opts.GitDir, BranchRef: activeCtx.BranchRef,
+				BranchGeneration: activeCtx.BranchGeneration, FirstSeq: goalPending[0].Seq,
+				Trigger: "intent_goal_context_limit", Trace: opts.Trace,
+				EvidenceLimit: state.CompletedBranchTransitionProofLimit,
+				ArchiveOnly: true, InvalidateShadow: true,
+			})
+			if err != nil {
+				return sum, err
+			}
+			if recovered.Handled {
+				sum.RecaptureRequired = true
+				sum.HasMore = true
+				return sum, nil
+			}
+		}
 		if waitReason != "" {
 			sum.Skipped = true
 			sum.SkippedReason = waitReason
