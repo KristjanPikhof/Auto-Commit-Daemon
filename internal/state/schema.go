@@ -45,7 +45,8 @@ package state
 // v28 separates typed recovery reasons and immutable evidence from display text.
 // v29 records partial checkpoint coverage and bounded provider deadlines.
 // v30 preserves capture lineage when one old commit contributes to several goals.
-const SchemaVersion = 30
+// v31 adds immutable frozen finish targets and explicit bounded attempts.
+const SchemaVersion = 31
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -1256,7 +1257,7 @@ CREATE TABLE IF NOT EXISTS daily_rollups(
     daemon_uptime_seconds INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, repo_root)
 );
-` + checkpointCaptureIssuesDDL
+` + checkpointCaptureIssuesDDL + finishDDL
 
 const checkpointCaptureIssuesDDL = `
 CREATE TABLE IF NOT EXISTS checkpoint_capture_issues(
