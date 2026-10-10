@@ -111,7 +111,7 @@ func TestIntentGoTypedSupportRejectsLabelsAndShadowedOwners(t *testing.T) {
 		{"package other\nfunc Build() *Metadata {return &Metadata{}}\n", false},
 		{"package app\nfunc Build() *foreign.Metadata {return &foreign.Metadata{}}\n", false},
 	} {
-		if got := intentGoTestCallsOwnedFunction("proof.go", []byte(tc.code), source); got != tc.want {
+		if got := intentGoPublishedReferenceContext("proof.go", []byte(tc.code), source) != ""; got != tc.want {
 			t.Fatalf("typed proof=%t want=%t source=%s", got, tc.want, tc.code)
 		}
 	}
