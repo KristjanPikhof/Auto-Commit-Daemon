@@ -24,6 +24,10 @@ import (
 // resolveFinishWorkerConfig reads approved inputs only. It does not activate
 // authoring changes, build a provider, or run a project check.
 func resolveFinishWorkerConfig(ctx context.Context, roots paths.Roots, runtime *workerRuntime) (daemon.FinishWorkerConfig, error) {
+	return resolveFinishWorkerConfigInputs(ctx, roots, runtime, true)
+}
+
+func resolveFinishWorkerConfigInputs(ctx context.Context, roots paths.Roots, runtime *workerRuntime, withCredentials bool) (daemon.FinishWorkerConfig, error) {
 	var out daemon.FinishWorkerConfig
 	revision, found, err := finishApprovedRevision(ctx, runtime.db)
 	if err != nil {
@@ -54,7 +58,7 @@ func resolveFinishWorkerConfig(ctx context.Context, roots paths.Roots, runtime *
 	}
 	if out.Mode == "local" {
 		out.Provider.Mode, out.Provider.DiffEgress = "deterministic", false
-	} else if out.Provider.Mode == "openai-compat" {
+	} else if withCredentials && out.Provider.Mode == "openai-compat" {
 		out.Provider.APIKey, _, err = credentials.Resolve(credentials.NewStore(roots), os.LookupEnv)
 		if err != nil {
 			return out, err
