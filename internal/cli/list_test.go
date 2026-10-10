@@ -7,8 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -156,23 +156,23 @@ func TestSummarizeRepoCountsOnlyLiveClients(t *testing.T) {
 }
 
 func TestSummarizeRepoIntentWait(t *testing.T) {
-	for _, settle := range []bool{false, true} {
-		name := "batch"
-		if settle {
-			name = "settle"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		minPending int
+		reason     string
+		maxWait    int64
+	}{
+		{"batch", 3, "skipped_due_intent_batch_wait", 120},
+		{"settle", 2, "skipped_due_intent_settle_window", 60},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			withIsolatedHome(t)
 			_, dbPath, db := makeRepoStateDB(t)
 			ctx := context.Background()
 			now := time.Now()
-			minPending, reason, maxWait := "3", "skipped_due_intent_batch_wait", int64(120)
-			if settle {
-				minPending, reason, maxWait = "2", "skipped_due_intent_settle_window", 60
-			}
 			if err := state.MetaSetMany(ctx, db, map[string]string{
 				"commit.strategy": "intent", "intent.window": "2",
-				"intent.min_pending": minPending, "intent.settle_window": "1m",
+				"intent.min_pending": strconv.Itoa(tc.minPending), "intent.settle_window": "1m",
 				"intent.max_pending_age": "2m", "intent.defer_limit": "1",
 			}); err != nil {
 				t.Fatal(err)
@@ -184,9 +184,9 @@ func TestSummarizeRepoIntentWait(t *testing.T) {
 				t.Fatal(err)
 			}
 			wait := summary.intentWait
-			if wait == nil || wait.reason != reason || wait.visiblePending != 2 ||
-				wait.waitSeconds <= 0 || wait.waitSeconds > maxWait {
-				t.Fatalf("intent wait=%+v, want %s with 2 captures and 1..%d seconds", wait, reason, maxWait)
+			if wait == nil || wait.reason != tc.reason || wait.visiblePending != 2 || wait.minPending != tc.minPending ||
+				wait.waitSeconds <= 0 || wait.waitSeconds > tc.maxWait {
+				t.Fatalf("intent wait=%+v, want %s with 2/%d captures and 1..%d seconds", wait, tc.reason, tc.minPending, tc.maxWait)
 			}
 		})
 	}
@@ -277,50 +277,6 @@ func TestListWatchIntervalFlagParsesGoDuration(t *testing.T) {
 	if err := cmd.Execute(); err == nil {
 		t.Fatal("Execute invalid duration: got nil, want error")
 	}
-}
-
-type cancelAfterFramesWriter struct {
-	mu     sync.Mutex
-	buf    bytes.Buffer
-	done   chan struct{}
-	cancel context.CancelFunc
-	frames int
-	want   int
-	once   sync.Once
-}
-
-func newCancelAfterFramesWriter(cancel context.CancelFunc, want int) *cancelAfterFramesWriter {
-	return &cancelAfterFramesWriter{
-		done:   make(chan struct{}),
-		cancel: cancel,
-		want:   want,
-	}
-}
-
-func (w *cancelAfterFramesWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	n, err := w.buf.Write(p)
-	w.frames += strings.Count(string(p), "Updated:")
-	if w.frames >= w.want {
-		w.once.Do(func() {
-			w.cancel()
-			close(w.done)
-		})
-	}
-	return n, err
-}
-
-func (w *cancelAfterFramesWriter) String() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.String()
-}
-
-func (w *cancelAfterFramesWriter) frameCount() int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.frames
 }
 
 func TestPauseState_GitDirDerivation_Pinned(t *testing.T) {
