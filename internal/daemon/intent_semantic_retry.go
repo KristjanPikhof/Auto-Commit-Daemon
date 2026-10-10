@@ -395,11 +395,26 @@ func scheduleIntentSemanticRetry(ctx context.Context, db *state.DB, input Intent
 	if found {
 		count = min(previous.ReviewCount+1, 3)
 	}
+	delay := intentSemanticReviewDelay(count)
+	if len(input.TargetEventSeqs) > 0 {
+		var urgency intentPublicationUrgency
+		requested, requestErr := state.MetaGetJSON(ctx, db, metaKeyIntentPublicationUrgency, &urgency)
+		if requestErr != nil {
+			return IntentSemanticRetrySnapshot{}, requestErr
+		}
+		if requested && urgency.BranchRef == input.BranchRef && urgency.BranchGeneration == input.BranchGeneration &&
+			urgency.RequestedAtTS <= intentPlannerHealthTimestamp(now) && intentPlannerHealthTimestamp(now)-urgency.RequestedAtTS < (5*time.Minute).Seconds() {
+			if found && urgency.RequestedAtTS > previous.ScheduledAtTS {
+				count = 1
+			}
+			delay = time.Duration(count) * 30 * time.Second
+		}
+	}
 	record := IntentSemanticRetrySnapshot{
 		Version: 1, BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
 		EvidenceFingerprint: evidence, PlanFingerprint: run.Fingerprint,
 		ReviewCount: count, ScheduledAtTS: intentPlannerHealthTimestamp(scheduledAt),
-		RetryAtTS: intentPlannerHealthTimestamp(scheduledAt.Add(intentSemanticReviewDelay(count))),
+		RetryAtTS: intentPlannerHealthTimestamp(scheduledAt.Add(delay)),
 	}
 	if err := pruneIntentSemanticRetries(ctx, db, evidence, now); err != nil {
 		return IntentSemanticRetrySnapshot{}, err
