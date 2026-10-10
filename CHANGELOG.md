@@ -4,135 +4,51 @@
 
 ### Added
 
-- Add `acd history rewrite --new-branch` to reconstruct selected history from
-  exact recorded path versions. The worker checks each goal while later edits keep
-  entering checkpoints. Saved plans preserve the source branch and staging.
-- Audit bounded private ACD history for generic messages while publication is
-  idle, with unchanged-evidence caching and full capture lineage for split goals.
+- `acd history rewrite --new-branch NAME` rebuilds selected linear history from
+  exact recorded file versions. The worker verifies each proposed commit while
+  newer edits keep entering checkpoints. The source branch and staging stay intact.
+- Optional history repair reviews up to five recent private ACD commits with
+  generic, filename-only, or malformed messages. It records split-goal lineage and
+  skips unchanged evidence.
 
 ### Changed
 
-- Make `commit-all` interrupt background planning and request an immediate
-  goal review while keeping purposeful commit boundaries and safety checks.
-- Keep open goal paths and focused recorded evidence visible across planning
-  windows. Include available source/test/reference companions before publishing.
-- Schema v30 adds commit lineage for repartitioned repairs without replacing
-  the existing immutable repair mappings.
+- `commit-all` interrupts background planning for an immediate goal review,
+  preserving purposeful commit boundaries and publication checks.
+- Intent reviews use recorded implementation, tests, imports, command registration,
+  and documentation references across planning windows. Current work gets evidence
+  space before published context, with 64 KiB per capture and 256 KiB per review.
+- Schema v30 records split repair lineage without replacing earlier mappings.
+- Remove unused planning helpers and command wrappers. Parse recorded TypeScript
+  declarations once per file and reuse them during published-support reviews.
 
 ### Fixed
 
-- Use protected explanatory updates to clarify frozen goals when their Go
-  tokens match, without selecting later implementation changes.
-- Keep verified published predecessors visible after their goals are
-  superseded, so later corrections retain their implementation context.
-- Require concrete evidence for missing companions instead of treating the
-  absence of new tests as a reason to keep completed work waiting.
-- Recognize matching descriptions of the same behavior in added documentation,
-  so related guidance and release notes can form one Intent goal.
-- Put declared prerequisites before their consumers during Intent plan repair,
-  and resume protected runs whose saved plan can be safely reordered.
-- Bound recovery lookups by the dependencies in the saved plan, so accumulated
-  historical goals cannot prevent recovery.
-- Keep `commit-all` attached to its exact publication run when a newer run
-  becomes the latest, so completed commands stop waiting.
-- Restore known prerequisites after replacing a published candidate's ID.
-  Automatically resume protected runs stopped by that missing declaration.
-- Supply proven recent published behavior to later documentation reviews,
-  including correction feedback for stale missing-companion claims.
-- Allow history reconstruction to read larger generated diffs while keeping
-  provider evidence bounded and preserving every recorded file version.
-- Give history planners bounded feedback on conflicting capture assignments
-  so correction retries can resolve overlaps together.
-- Review a small frozen publication target together when aged captures would
-  otherwise wait separately for companions already inside that target.
-- Show documentation follow-ups proven published companions from the same
-  frozen target, so reviews do not wait for work already in the branch.
-- Keep verification cleanup diagnostics out of the approved command's output,
-  preserving its exact exit status and descendant cleanup.
-- Review valid provider waits once against supplied recorded evidence, without
-  forcing readiness or spending beyond the existing planning budget.
-- Keep large recorded implementations complete within bounded goal reviews,
-  allowing 64 KiB per capture and 256 KiB of focused live evidence.
-- Keep unresolved WAIT groups available for plan correction instead of treating
-  them as locked ready goals and rejecting their captures on the next attempt.
-- Keep current test and implementation detail ahead of older published context
-  within Intent's evidence limits. Retain the exact published reference used to
-  explain a pending goal when larger support diffs are clipped.
-- Find already-published Go and TypeScript support through recorded references,
-  so later corrections do not wait for code or tests already in the branch.
-- Report provider waits and frozen publication progress separately from
-  checkpoint scans, so ongoing capture cannot hide a stalled commit target.
-- Reoffer protected companions as a normal goal review when an overdue
-  singleton expands. Retry existing targets stopped by that request error.
-- Prefer the newest exact saved plan over stale candidate labels when reopening
-  unknown goals. Later purposeful plans still keep their boundaries.
-- Use bounded recorded TypeScript imports and exports to keep available mock
-  helpers and their callers with the regression they complete.
-- Reopen protected semantic rejections that also carry ordinary WAIT findings,
-  keeping real verification and publication safety failures blocked.
-- Keep waiting groups in the retry schedule when another group fails goal
-  review. Recover missing membership from saved plans without resetting waits.
-- Keep retained planner context read-only so providers cannot select captures
-  outside the offered window. Preserve its source evidence and prerequisites.
-- Release protected provisional groups saved with the legacy `Update files`
-  label, allowing normal goal planning to resume without changing provenance.
-- Persist provider retries at five minutes, ten minutes, then hourly across
-  restarts. Outages keep capture active and do not exhaust semantic attempts.
-- Recheck cached and saved plan quality; generic filename, raw-symbol, and
-  clipped messages remain protected for scheduled goal review. Age never makes
-  incomplete work publishable.
-- Keep local Intent evidence available without network sharing, and reject
-  grouping based only on shared prose or code comments.
-- Retain actual recorded ownership, caller, project, and named API references
-  before clipping large Intent evidence. Handle Swift test macros and paths
-  containing spaces without treating comments or quoted labels as symbols.
-- Resolve late test-table corrections using captured Go calls and published
-  companions proven to match the current commit.
-- Retain grouped Go constant ownership and named declarations through evidence
-  clipping, so related implementation and regression tests stay together.
-- Connect changed CLI documentation to its exact recorded command registration
-  and flags, keeping available constructors and regression tests together.
-- Rebuild CLI reference proof when applying saved history plans without reading
-  later worktree edits or trusting planner claims.
-- Reconsider rejected partial groups that overlap an existing capture owner,
-  instead of leaving the queue blocked by a derived duplicate assignment.
-- Preserve omitted captures as waiting work while complete verified goals
-  proceed. Recheck waits saved under the earlier planning contract after upgrade.
-- Review rejected goals after five minutes, ten minutes, then hourly for
-  unchanged evidence. Restarts preserve deadlines, and older one-hour waits
-  shorten automatically. Corrected plans keep valid goals and capture provenance.
-- Review valid provider plans that leave goals waiting instead of caching those
-  plans forever. Ready goals can continue while the unresolved part is reviewed.
-- Group proved Swift blank-line cleanup as one maintenance goal across older
-  review windows. Use complete recorded files and retain the normal safety checks.
-- Rebuild that maintenance proof when reconstructing history locally, so saved
-  plans cannot substitute an unverified formatting claim.
-- Respect the caller's explicit checkpoint deadline so maintenance returns its
-  coverage diagnostic before the client connection closes.
-- Honor explicit archive recovery for pending-only queues. Preserve the whole
-  captured chain before recapturing current files, without changing user staging.
-- Report actual recovery changes in JSON while keeping previews and no-ops clear.
-- Hold fallback messages that only name a captured symbol or heading for goal
-  review. Resume provider planning when the wait ends instead of repeating the
-  same local grouping.
-- Regroup protected implementation/test splits automatically. Keep finalized
-  Intents as prerequisites and rebuild cached plans that try to merge into them.
-- Correct redundant planner selections when they repeat the same Intent's
-  retained work, without accepting unknown captures or changing ownership.
-- Replan complete protected fallback partitions whose goal is still unknown,
-  instead of preserving unrelated changes as a fixed commit boundary.
-- Replan dependent goals when their rejected prerequisite invalidates a
-  retained plan, while keeping independent valid goals.
-- Mark transient list reads as refreshing and expose unknown protection in
-  JSON. Provider waits and active probes use the same status across views.
-- Keep status and list responsive when repositories have thousands of
-  captures and completed checkpoints.
-
-- Keep a stopped Intent run retryable when an AI outage leaves an oversized
-  fallback group waiting. Older stopped runs resume only after matching the
-  saved transport failure and proving the frozen target and branch are safe.
-- Report stopped publication in recovery previews. Explicit force recovery can
-  preserve the whole unpublished chain before recapturing current work.
+- Keep available implementation, test corrections, callers, and documentation
+  together. Rebuild stale or overlapping groups while preserving valid goals,
+  capture ownership, and prerequisite order. Published goals can supply context
+  for later corrections but cannot absorb new work.
+- Require evidence for missing companions. Published support must match the current
+  branch; omitted captures stay waiting. A small frozen target is reviewed together,
+  while later explanatory Go comments can clarify it only if code tokens match.
+- Retry rejected goals and provider waits after five minutes, ten minutes, then
+  hourly. Restarts preserve deadlines; transport failures do not consume semantic
+  attempts. Cached waits receive another review instead of blocking indefinitely.
+- Resume protected runs stopped by stale dependency declarations, expanded review
+  windows, or an oversized fallback during an AI outage. Recovery lookups stay
+  bounded, and branch, checkpoint, ownership, and verification checks still apply.
+- Prove Swift blank-line cleanup locally from complete recorded files, including
+  history reconstruction. Other edits retain normal goal checks.
+- Reconstruct large generated changes from their exact versions while bounding
+  provider evidence. Correction retries identify conflicting capture assignments.
+- Keep `commit-all` attached to its own run when a newer publication starts.
+  Status and list distinguish provider waits, frozen-target progress, checkpoint
+  scans, and transient reads, and stay responsive with large capture histories.
+- Honor explicit checkpoint deadlines and preserve verification command output,
+  exit status, and descendant cleanup.
+- Explicit archive recovery preserves the entire unpublished chain, including
+  pending-only queues, before recapturing work. Previews show stopped runs, and
+  JSON reports actual changes without claiming that previews or no-ops applied fixes.
 - Exclude compiler index caches under `-Xcc/` from capture and watching.
 
 ## v2026-10-04
