@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Validate proves structural completeness and recorded-version safety. Purpose
@@ -19,8 +20,12 @@ func Validate(evidence Evidence, plan Plan) error {
 	if !maps.Equal(plan.Base, evidence.Base) || !maps.Equal(plan.Target, evidence.Target) {
 		return planError("plan changed the frozen base or target")
 	}
+	neutral, err := validateNeutral(changes, plan.NeutralChangeIDs)
+	if err != nil {
+		return err
+	}
 	if maps.Equal(evidence.Base, evidence.Target) {
-		if len(plan.Steps) != 0 {
+		if len(plan.Steps) != 0 || len(neutral) != len(changes) {
 			return planError("net-zero work must not create commits")
 		}
 		return nil
@@ -28,6 +33,11 @@ func Validate(evidence Evidence, plan Plan) error {
 	current := CloneTree(evidence.Base)
 	used := make(map[string]bool, len(changes))
 	atomicOwners := make(map[string]int)
+	for id := range neutral {
+		if group := changes[id].AtomicGroup; group != "" {
+			atomicOwners[group] = -1
+		}
+	}
 	for index, step := range plan.Steps {
 		if strings.TrimSpace(step.Purpose) == "" || !safeText(step.Purpose) ||
 			strings.TrimSpace(step.Message) == "" || !safeText(step.Message) || len(step.ChangeIDs) == 0 {
@@ -36,11 +46,14 @@ func Validate(evidence Evidence, plan Plan) error {
 		if len(plan.Steps) > 1 && (strings.TrimSpace(step.Boundary) == "" || !safeText(step.Boundary)) {
 			return planError("step %d needs a useful split boundary", index+1)
 		}
-		previous := CloneTree(current)
+		previous := plan.Base
+		if index > 0 {
+			previous = plan.Steps[index-1].Tree
+		}
 		author := changes[step.ChangeIDs[0]].Author
 		for _, id := range step.ChangeIDs {
 			change, ok := changes[id]
-			if !ok || used[id] {
+			if !ok || used[id] || neutral[id] {
 				return planError("unknown or multiply assigned change %q", id)
 			}
 			if change.Author != author || step.Author != author {
@@ -72,10 +85,43 @@ func Validate(evidence Evidence, plan Plan) error {
 			return planError("step %d has no net change", index+1)
 		}
 	}
-	if len(used) != len(changes) || !maps.Equal(current, evidence.Target) {
+	if len(used)+len(neutral) != len(changes) || !maps.Equal(current, evidence.Target) {
 		return planError("plan does not cover the exact frozen target")
 	}
 	return nil
+}
+
+// Neutral changes retain provenance without manufacturing edit/revert commits.
+// Each omitted path cycle must return to its exact recorded starting version.
+// Emitted steps still replay from the base, so an omitted version cannot become
+// an unproven prerequisite for a surviving goal.
+func validateNeutral(changes map[string]Change, ids []string) (map[string]bool, error) {
+	neutral := make(map[string]bool, len(ids))
+	current := make(Tree)
+	starts := make(Tree)
+	for _, id := range ids {
+		change, ok := changes[id]
+		if !ok || neutral[id] {
+			return nil, planError("unknown or repeated neutral change %q", id)
+		}
+		if _, active := starts[change.Path]; !active {
+			starts[change.Path] = change.Before
+			current[change.Path] = change.Before
+		}
+		if current[change.Path] != change.Before {
+			return nil, planError("neutral changes omit a surviving version for %q", change.Path)
+		}
+		current[change.Path] = change.After
+		if change.After == starts[change.Path] {
+			delete(starts, change.Path)
+			delete(current, change.Path)
+		}
+		neutral[id] = true
+	}
+	if len(starts) != 0 {
+		return nil, planError("omitted changes are not independently net-zero")
+	}
+	return neutral, nil
 }
 
 func validateEvidence(evidence Evidence) (map[string]Change, error) {
@@ -142,7 +188,7 @@ func validateTree(tree Tree) error {
 }
 
 func safePath(name string) bool {
-	if name == "" || name == "." || path.Clean(name) != name || strings.HasPrefix(name, "/") ||
+	if !utf8.ValidString(name) || name == "" || name == "." || path.Clean(name) != name || strings.HasPrefix(name, "/") ||
 		name == ".." || strings.HasPrefix(name, "../") || strings.ContainsRune(name, '\x00') {
 		return false
 	}
@@ -172,6 +218,9 @@ func validEntry(entry Entry) bool {
 }
 
 func safeText(text string) bool {
+	if !utf8.ValidString(text) {
+		return false
+	}
 	for _, char := range text {
 		if unicode.IsControl(char) && char != '\n' && char != '\t' {
 			return false

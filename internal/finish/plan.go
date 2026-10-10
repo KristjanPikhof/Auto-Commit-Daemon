@@ -49,9 +49,10 @@ type Step struct {
 }
 
 type Plan struct {
-	Base   Tree   `json:"base"`
-	Target Tree   `json:"target"`
-	Steps  []Step `json:"steps"`
+	Base             Tree     `json:"base"`
+	Target           Tree     `json:"target"`
+	Steps            []Step   `json:"steps"`
+	NeutralChangeIDs []string `json:"neutral_change_ids,omitempty"`
 }
 
 func CloneTree(tree Tree) Tree {
@@ -84,10 +85,11 @@ func Build(evidence Evidence, goals []Goal) (Plan, error) {
 		return Plan{}, err
 	}
 	current := CloneTree(evidence.Base)
+	assigned := make(map[string]bool)
 	for _, goal := range goals {
 		step := Step{Goal: goal}
 		step.ChangeIDs = append([]string(nil), goal.ChangeIDs...)
-		for _, id := range goal.ChangeIDs {
+		for index, id := range goal.ChangeIDs {
 			change, ok := changes[id]
 			if !ok {
 				return Plan{}, planError("unknown change %q", id)
@@ -95,10 +97,18 @@ func Build(evidence Evidence, goals []Goal) (Plan, error) {
 			if err := apply(current, change); err != nil {
 				return Plan{}, err
 			}
-			step.Author = change.Author
+			assigned[id] = true
+			if index == 0 {
+				step.Author = change.Author
+			}
 		}
 		step.Tree = CloneTree(current)
 		plan.Steps = append(plan.Steps, step)
+	}
+	for _, change := range evidence.Changes {
+		if !assigned[change.ID] {
+			plan.NeutralChangeIDs = append(plan.NeutralChangeIDs, change.ID)
+		}
 	}
 	if err := Validate(evidence, plan); err != nil {
 		return Plan{}, err
