@@ -21,6 +21,12 @@
 
 ### Fixed
 
+- Use protected explanatory updates to clarify frozen goals when their Go
+  tokens match, without selecting later implementation changes.
+- Keep verified published predecessors visible after their goals are
+  superseded, so later corrections retain their implementation context.
+- Require concrete evidence for missing companions instead of treating the
+  absence of new tests as a reason to keep completed work waiting.
 - Recognize matching descriptions of the same behavior in added documentation,
   so related guidance and release notes can form one Intent goal.
 - Put declared prerequisites before their consumers during Intent plan repair,
