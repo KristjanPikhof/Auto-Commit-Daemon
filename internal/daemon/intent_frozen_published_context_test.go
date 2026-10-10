@@ -223,6 +223,19 @@ func TestIntentFrozenPublishedBaselineRejectsUnprovedAndExpandedContext(t *testi
 			case "privacy disabled":
 				copy.IncludeDiffs = false
 			}
+			if name == "no target" || name == "different target" || name == "over cap" {
+				if frozen, err := discoverIntentPublishedFrozenContext(ctx, f.db, copy); err != nil || len(frozen) != 0 {
+					t.Fatalf("invalid frozen membership admitted: candidates=%+v err=%v", frozen, err)
+				}
+				// Documentation can independently use a proven recent baseline.
+				// Invalid frozen membership grants no extra assignment authority.
+				got, err := loadPublishedIntentFormerCompanions(ctx, f.db, &copy, nil)
+				if err != nil || len(got) != 1 || got[0].Status != state.IntentCandidatePublished || len(got[0].Events) != 2 ||
+					len(copy.publishedContext[got[0].ID]) != 2 || !reflect.DeepEqual(copy.Captures, input.Captures) {
+					t.Fatalf("read-only documentation baseline lost its proof or changed offered work: candidates=%+v err=%v", got, err)
+				}
+				return
+			}
 			got, err := loadPublishedIntentFormerCompanions(ctx, f.db, &copy, nil)
 			if err != nil || len(got) != 0 || len(copy.frozenPublishedContext) != 0 {
 				t.Fatalf("unsafe baseline admitted: candidates=%+v marker=%v err=%v", got, copy.frozenPublishedContext, err)
