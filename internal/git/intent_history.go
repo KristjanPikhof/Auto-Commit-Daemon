@@ -31,6 +31,28 @@ type IntentHistoryRenamePair struct {
 	AfterPath  string
 }
 
+// IntentHistoryAuthors assigns stable boundary IDs in recorded order. Names
+// and email addresses stay local; author dates do not create new boundaries.
+func IntentHistoryAuthors(ctx context.Context, repoDir string, units []IntentHistoryUnit) (map[string]int, error) {
+	authors := make(map[string]int)
+	identities := make(map[string]int)
+	for _, unit := range units {
+		if authors[unit.OldOID] != 0 {
+			continue
+		}
+		author, err := commitAuthorEnv(ctx, repoDir, unit.OldOID)
+		if err != nil {
+			return nil, err
+		}
+		identity := author["GIT_AUTHOR_NAME"] + "\x00" + author["GIT_AUTHOR_EMAIL"]
+		if identities[identity] == 0 {
+			identities[identity] = len(identities) + 1
+		}
+		authors[unit.OldOID] = identities[identity]
+	}
+	return authors, nil
+}
+
 // ReadIntentHistoryRenamePairs retains Git's recorded similarity evidence for
 // delete/create units, including renames with edits. Both sides must remain in
 // one goal; treating them as independent changes can create invalid history.
@@ -163,6 +185,10 @@ func MaterializeIntentHistoryUnits(ctx context.Context, repoDir, baseTree string
 	if baseTree == "" || len(original) == 0 || len(original) > MaxIntentHistoryUnits || len(groups) == 0 || len(groups) > MaxIntentHistoryCommits {
 		return nil, errors.New("git intent history: invalid materialization input")
 	}
+	authors, err := IntentHistoryAuthors(ctx, repoDir, original)
+	if err != nil {
+		return nil, err
+	}
 	available := make(map[IntentHistoryUnit]bool, len(original))
 	var oldChain []string
 	oldSeen := make(map[string]struct{})
@@ -188,6 +214,9 @@ func MaterializeIntentHistoryUnits(ctx context.Context, repoDir, baseTree string
 			used, exists := available[unit]
 			if !exists || used {
 				return nil, errors.New("git intent history: fabricated or multiply owned transition")
+			}
+			if authors[unit.OldOID] != authors[group[0].OldOID] {
+				return nil, fmt.Errorf("git intent history: goal %d crosses an author boundary", groupIndex+1)
 			}
 			available[unit] = true
 			owners[unit.OldOID+"\x00"+unit.Path] = groupIndex
