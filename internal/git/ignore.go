@@ -103,7 +103,7 @@ func (c *IgnoreChecker) ensureLocked() error {
 	// index lock and refreshing index metadata while ACD is only classifying
 	// paths; restore relies on read-only scans leaving the live index
 	// byte-for-byte unchanged.
-	cmd.Env = scrubEnv(map[string]string{"GIT_OPTIONAL_LOCKS": "0"})
+	cmd.Env = scrubEnv(map[string]string{"GIT_OPTIONAL_LOCKS": "0", "GIT_LITERAL_PATHSPECS": "1"})
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
