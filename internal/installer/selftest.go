@@ -165,25 +165,45 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	if err := os.WriteFile(publicationGuidePath, []byte(publicationGuide), 0o644); err != nil {
 		return err
 	}
-	drainParams, _ := json.Marshal(map[string]bool{"drain_publication": true})
-	if _, err := selfTestRequest(ctx, client, registration.Record, "checkpoint_barrier", drainParams); err != nil {
+	// Protection alone must leave the branch unchanged. Only explicit finish
+	// is allowed to publish the complete protected batch.
+	if current, err := gitpkg.RevParse(ctx, repo, "HEAD"); err != nil || current != head {
+		return errors.New("setup self-test: checkpoint protection moved branch history")
+	}
+	finishParams, _ := json.Marshal(map[string]any{"purpose": "complete setup verification"})
+	response, err := selfTestRequest(ctx, client, registration.Record, "finish_start", finishParams)
+	if err != nil {
 		return err
 	}
-	// Keep publication from racing the restore assertions. The restore itself
-	// still runs through the real worker and operation gate; this hold only
-	// prevents the restoration checkpoint from being published between the
-	// apply response and the byte-for-byte HEAD/index checks below.
-	holdPath := scratchRoots.SetupPublicationHoldPath()
-	if err := os.WriteFile(holdPath, []byte("self-test restore verification\n"), 0o600); err != nil {
-		return fmt.Errorf("setup self-test: hold publication for restore verification: %w", err)
+	var request state.FinishRequest
+	if err := decodeInto(response.Data, &request); err != nil {
+		return err
 	}
-	defer os.Remove(holdPath)
+	for request.State == state.FinishRunning || request.State == state.FinishPrepared {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+		params, _ := json.Marshal(map[string]string{"request_id": request.ID})
+		response, err := selfTestRequest(ctx, client, registration.Record, "finish_status", params)
+		if err != nil {
+			return err
+		}
+		if err := decodeInto(response.Data, &request); err != nil {
+			return err
+		}
+	}
+	var result daemon.FinishResult
+	if request.State != state.FinishCompleted || json.Unmarshal(request.Result, &result) != nil || !result.Published || result.CommitsCreated != 1 {
+		return fmt.Errorf("setup self-test: explicit finish failed: %s %s", request.State, request.Reason)
+	}
 	headBefore, err := gitpkg.RevParse(ctx, repo, "HEAD")
 	if err != nil {
 		return err
 	}
 	if headBefore == head {
-		return errors.New("setup self-test: deterministic publication did not advance Git history")
+		return errors.New("setup self-test: explicit local finish did not advance Git history")
 	}
 	indexBefore, err := os.ReadFile(filepath.Join(wt.GitDir, "index"))
 	if err != nil {
