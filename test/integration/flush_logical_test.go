@@ -69,6 +69,7 @@ func TestFlush_LogicalCommitsWithin2s(t *testing.T) {
 	// Drop a file change under the threshold. A single edit cannot reach
 	// IntentMinPending=10, so without the flush bypass the daemon would
 	// wait the full IntentMaxPendingAge (5m) before publishing.
+	// A named new guide gives deterministic Intent a meaningful goal.
 	target := filepath.Join(repo, "flush-target.md")
 	if err := os.WriteFile(target, []byte("# Logical flush reference\n\nRequest immediate review of protected captures at a logical boundary.\n"), 0o644); err != nil {
 		t.Fatalf("write target file: %v", err)
