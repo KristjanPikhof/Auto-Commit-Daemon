@@ -24,6 +24,11 @@
 
 ### Fixed
 
+- Recover background queues that exceed the goal window after repeated edits to
+  one file. Preserve the captured versions, then recapture current work so
+  semantic publication can resume.
+- Reject history goals that combine different authors during planning and saved
+  plan validation. Give the planner author boundaries and a correction retry.
 - Keep available implementation, test corrections, callers, and documentation
   together. Rebuild stale or overlapping groups while preserving valid goals,
   capture ownership, and prerequisite order. Published goals can supply context
