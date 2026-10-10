@@ -169,10 +169,6 @@ type intentSourceCodeWitness struct {
 	Index     int
 }
 
-func intentSourceCodeWitnesses(diff string) []intentSourceCodeWitness {
-	return intentSourceCodeWitnessesForPath("", diff)
-}
-
 func intentSourceCodeWitnessesForPath(sourcePath, diff string) []intentSourceCodeWitness {
 	return intentSourceCodeWitnessesWithContext(sourcePath, diff, false)
 }
@@ -356,10 +352,6 @@ func intentSourceAPIReferences(sourcePath, diff string) map[string]struct{} {
 
 // Git's recorded hunk heading identifies an existing function whose body was
 // changed. A heading without an actual changed code line proves no relationship.
-func intentSourceEnclosingDeclarations(diff string) []intentSourceCodeWitness {
-	return intentSourceEnclosingDeclarationsForPath("", diff)
-}
-
 func intentSourceEnclosingDeclarationsForPath(sourcePath, diff string) []intentSourceCodeWitness {
 	raw := strings.Split(diff, "\n")
 	code := intentSourceCodeWitnessesForPath(sourcePath, diff)
