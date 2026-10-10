@@ -19,14 +19,19 @@ func TestIntentRecordedReferenceContextStaysBoundedAndFresh(t *testing.T) {
 	const changedLine = "+changed_code = 2\n"
 	diff := "+api_key = abcdef1234567890\n" + strings.Repeat(changedLine, ai.IntentStageDiffCap/len(changedLine)+1)
 	references := " python3 scripts/manifest.py\n"
-	first := includeIntentRecordedReferenceContext(diff, references)
+	render := func(diff, references string) string {
+		return prioritizeIntentRelationshipEvidence([]IntentCandidateCapture{{
+			CapturedDiff: prependIntentRecordedReferenceContext(diff, references),
+		}})[0]
+	}
+	first := render(diff, references)
 	if len(first) > ai.IntentStageDiffCap || strings.Contains(first, "abcdef1234567890") {
 		t.Fatal("recorded reference context exceeded its budget or leaked a secret")
 	}
-	if second := includeIntentRecordedReferenceContext(first, references); second != first {
+	if second := render(first, references); second != first {
 		t.Fatal("reloaded recorded evidence accumulated context")
 	}
-	if refreshed := includeIntentRecordedReferenceContext(first, ""); strings.Contains(refreshed, "scripts/manifest.py") {
+	if refreshed := render(first, ""); strings.Contains(refreshed, "scripts/manifest.py") {
 		t.Fatal("obsolete offered-path context remained after regrounding")
 	}
 }

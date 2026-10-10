@@ -82,7 +82,3 @@ func intentRecordedReferenceLines(diff string) string {
 	}
 	return ""
 }
-
-func includeIntentRecordedReferenceContext(diff, references string) string {
-	return truncateIntentEvidenceDiff(ai.RedactDiffSecrets(prependIntentRecordedReferenceContext(diff, references)), ai.IntentStageDiffCap)
-}
