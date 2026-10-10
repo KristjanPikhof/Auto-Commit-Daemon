@@ -62,6 +62,8 @@ Disabled repository records are preserved and their databases are left
 unchanged until their next `acd on`.
 
 The isolated setup self-test uses its own Git identity in a scratch repository.
+It checkpoints and publishes a small documentation guide, then restores and
+undoes that change to verify the file contents and Git integrity.
 Your global Git identity and repository settings are unchanged.
 
 Existing installations skip first-run questions and keep their current
