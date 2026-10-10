@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- Build and test with Go 1.26.9 to include the standard-library security fixes.
 - Recover background queues that exceed the goal window after repeated edits to
   one file. Preserve the captured versions, then recapture current work so
   semantic publication can resume.
