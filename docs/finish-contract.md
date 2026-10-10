@@ -202,7 +202,7 @@ intent-to-add. Its failure tells the user to keep their staging or rerun with
 
 With explicit consent, freeze the index's content identity, including entry
 modes, flags, staged deletions, and intent-to-add distinctions. The retained finish target tree uses approved index versions and deletions
-only for paths changed in the frozen staged selection, with complete-checkpoint
+only for paths changed in the frozen staged selection, with the base-preserving frozen target
 versions elsewhere. The source checkpoint still proves the original worktree
 bytes; keep its tree identity separate from the finish target tree. Unstaged differences on those paths remain live, protected
 work for a later finish. Preview lists this selection so staged-only bytes are
