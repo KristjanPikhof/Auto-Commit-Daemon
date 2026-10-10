@@ -1305,30 +1305,6 @@ func edgeSupportsCohesion(edge IntentCaptureDependency) bool {
 	}
 }
 
-func seqSetConnected(seqs []int64, adjacency map[int64]map[int64]struct{}) bool {
-	allowed := make(map[int64]struct{}, len(seqs))
-	for _, seq := range seqs {
-		allowed[seq] = struct{}{}
-	}
-	seen := map[int64]struct{}{seqs[0]: {}}
-	queue := []int64{seqs[0]}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		for next := range adjacency[current] {
-			if _, ok := allowed[next]; !ok {
-				continue
-			}
-			if _, ok := seen[next]; ok {
-				continue
-			}
-			seen[next] = struct{}{}
-			queue = append(queue, next)
-		}
-	}
-	return len(seen) == len(allowed)
-}
-
 func validAtomicityGate(gate IntentAtomicityGate) bool {
 	for _, candidate := range intentAtomicityGates {
 		if gate == candidate {
