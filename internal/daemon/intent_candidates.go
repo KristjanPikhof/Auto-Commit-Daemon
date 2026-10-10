@@ -557,6 +557,9 @@ func EvaluateIntentCandidates(
 	}
 	validationRequest = intentCandidateContinuationValidationRequest(
 		validationBaseRequest, continuations)
+	// Terminal-ID replacement can turn an internal edge into a dependency on
+	// already-published work. Restore its declaration without changing goals.
+	plan = declareIntentFallbackDependencies(validationRequest, plan)
 	if err := ai.ValidateIntentPlanV2(validationRequest, plan); err != nil {
 		return result, err
 	}
@@ -1683,6 +1686,10 @@ func chooseIntentCandidatePlan(
 		if err != nil {
 			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 		}
+		semanticRetry, err = expediteIntentSemanticRetry(ctx, db, semanticRetry, input, reviewNow)
+		if err != nil {
+			return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
+		}
 	}
 	if retryMatches && reviewNow.Before(time.Unix(0, int64(semanticRetry.RetryAtTS*1e9))) {
 		if run.ProgressState.String != "waiting_semantic_retry" {
@@ -1736,6 +1743,10 @@ func chooseIntentCandidatePlan(
 					return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 				}
 				retryMatches = true
+			}
+			semanticRetry, err = expediteIntentSemanticRetry(ctx, db, semanticRetry, input, reviewNow)
+			if err != nil {
+				return ai.IntentPlanV2{}, "", "", retryCount, false, nil, run, err
 			}
 			retryAt := time.Unix(0, int64(semanticRetry.RetryAtTS*1e9))
 			if reviewNow.Before(retryAt) {
