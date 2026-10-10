@@ -541,11 +541,13 @@ func intentDocumentChangeReferences(diff string) map[string]struct{} {
 	if len(diff) > 8<<10 {
 		diff = diff[:8<<10]
 	}
+	var tail []string
 	for _, line := range strings.Split(diff, "\n") {
 		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
+			tail = nil
 			continue
 		}
-		words := strings.FieldsFunc(strings.ToLower(line[1:]), func(r rune) bool { return !unicode.IsLetter(r) })
+		words := append(tail, strings.FieldsFunc(strings.ToLower(line[1:]), func(r rune) bool { return !unicode.IsLetter(r) })...)
 		for i := 0; i+5 <= len(words) && len(refs) < 128; i++ {
 			substantive := 0
 			for _, word := range words[i : i+5] {
@@ -557,6 +559,7 @@ func intentDocumentChangeReferences(diff string) map[string]struct{} {
 				refs[strings.Join(words[i:i+5], " ")] = struct{}{}
 			}
 		}
+		tail = words[max(0, len(words)-4):]
 	}
 	return refs
 }
