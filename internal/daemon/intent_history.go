@@ -120,6 +120,10 @@ func PlanIntentHistory(ctx context.Context, repo, branch string, chain []string,
 const intentHistoryRawDiffCap = 512 << 10
 
 func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHead string, units []git.IntentHistoryUnit, format ai.CommitFormat, includeDiffs bool) ([][]int, ai.IntentPlanRequestV2, error) {
+	authors, err := git.IntentHistoryAuthors(ctx, repo, units)
+	if err != nil {
+		return nil, ai.IntentPlanRequestV2{}, err
+	}
 	// A large history is represented by complete path chains, not by equally
 	// clipped commit messages. Every underlying transition retains ownership.
 	batches := make([][]int, 0, len(units))
@@ -131,7 +135,7 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHe
 		byPath := make(map[string]int)
 		for i, unit := range units {
 			index, ok := byPath[unit.Path]
-			if !ok {
+			if !ok || authors[units[batches[index][0]].OldOID] != authors[unit.OldOID] {
 				index = len(batches)
 				byPath[unit.Path] = index
 				batches = append(batches, nil)
@@ -144,7 +148,6 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHe
 	}
 	var captures []IntentCandidateCapture
 	var offered []ai.OfferedCapture
-	var err error
 	var offeredPaths []string
 	for _, batch := range batches {
 		offeredPaths = append(offeredPaths, units[batch[0]].Path)
@@ -155,12 +158,9 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHe
 			break
 		}
 		first, last := units[batch[0]], units[batch[len(batch)-1]]
-		before := baseTree
-		if len(batch) == 1 {
-			before, err = git.IntentHistoryBaseTree(ctx, repo, first.OldOID)
-			if err != nil {
-				return nil, ai.IntentPlanRequestV2{}, err
-			}
+		before, err := git.IntentHistoryBaseTree(ctx, repo, first.OldOID)
+		if err != nil {
+			return nil, ai.IntentPlanRequestV2{}, err
 		}
 		raw, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, intentHistoryRawDiffCap, "diff", "--no-ext-diff", "--unified=3", before, last.OldOID, "--", first.Path)
 		if err != nil {
@@ -238,7 +238,7 @@ func intentHistoryEvidence(ctx context.Context, repo, branch, baseTree, sourceHe
 				AfterMode:  sql.NullString{String: last.After.Mode, Valid: last.After.Mode != ""}}}
 		}
 		captures = append(captures, capture)
-		offered = append(offered, ai.OfferedCapture{Seq: seq, Path: first.Path, Op: op, Fidelity: "recorded_history", CapturedDiff: diff})
+		offered = append(offered, ai.OfferedCapture{Seq: seq, Path: first.Path, Op: op, Fidelity: "recorded_history", CapturedDiff: diff, HistoryAuthor: authors[first.OldOID]})
 	}
 	captures, err = proveIntentSwiftBlankLineMaintenance(ctx, repo, captures)
 	if err != nil {
