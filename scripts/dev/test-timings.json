@@ -1362,7 +1362,7 @@
     "TestIntentCandidatePlanPreflightBlocksProviderAttempt": 0.17,
     "TestIntentCandidatePlanPreflightSuppliesValidBaseline": 0.08,
     "TestIntentCandidatePlanRebuildsInvalidCompletedResolution": 0.14,
-    "TestIntentCandidatePlanRefusesNonTopologicalDependencyRepair": 0.001,
+    "TestIntentCandidatePlanOrdersProvenPrerequisitesWithoutChangingGoals": 0.001,
     "TestIntentCandidatePlanRepairsForcedDeferralFromBaseline": 0.2,
     "TestIntentCandidatePlanRepairsProvenHardDependencyDeclaration": 0.001,
     "TestIntentCandidatePlanReusesCompletedResolution": 0.1,
