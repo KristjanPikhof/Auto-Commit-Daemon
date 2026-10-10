@@ -33,4 +33,4 @@ Run `acd config get` to inspect effective repository settings and environment ov
 | `verification.fast.timeout` | `ACD_VERIFICATION_FAST_TIMEOUT` | `2m` | next work boundary | yes | no |
 | `verification.full.command` | `ACD_VERIFICATION_FULL_COMMAND` | none | next work boundary | yes | no |
 | `verification.full.timeout` | `ACD_VERIFICATION_FULL_TIMEOUT` | `10m` | next work boundary | yes | no |
-| `watch.fsnotify` | `ACD_FSNOTIFY_ENABLED` | `false` | restart required | yes | no |
+| `watch.fsnotify` | `ACD_FSNOTIFY_ENABLED` | `true` | restart required | yes | no |
