@@ -159,6 +159,9 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	if err != nil {
 		return controlWorktreeError("on", repoFlag, err)
 	}
+	if err := bootstrapControlSetup(ctx, lookup); err != nil {
+		return err
+	}
 
 	if err := ensureMutationSupervisor(ctx, lookup.Roots); err != nil {
 		if strings.Contains(err.Error(), "run `acd setup`") {
@@ -193,24 +196,6 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	res, err := inspectControl(ctx, lookup.Worktree.Root)
 	if err != nil {
 		return err
-	}
-	if res.RecoveryRequired {
-		recoveryErr := runFix(ctx, io.Discard, lookup.Worktree.Root, false, true, false, false, true)
-		res, err = inspectControl(ctx, lookup.Worktree.Root)
-		if err != nil {
-			return err
-		}
-		if recoveryErr != nil {
-			res.Command = "on"
-			res.Changed = len(actions) > 0
-			res.Actions = append(actions, "recovery_failed")
-			res.StatePreserved = true
-			if renderErr := renderControl(out, res, jsonOut); renderErr != nil {
-				return renderErr
-			}
-			return actionRequiredError("recovery_failed", fmt.Sprintf("acd on: automatic exact-chain recovery failed: %v", recoveryErr))
-		}
-		actions = append(actions, "recovered")
 	}
 	res.Command = "on"
 	res.Changed = len(actions) > 0
