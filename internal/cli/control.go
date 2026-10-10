@@ -257,10 +257,6 @@ func waitControlWorkerReady(ctx context.Context, lookup controlRepoLookup, timeo
 	}
 }
 
-func runControlOff(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
-	return runControlOffWithForce(ctx, out, repoFlag, jsonOut, false)
-}
-
 func runControlOffWithForce(ctx context.Context, out io.Writer, repoFlag string, jsonOut, force bool) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -532,15 +528,6 @@ func loadControlRepo(ctx context.Context, repoFlag string) (controlRepoLookup, e
 		Record:     rec,
 		Registered: ok,
 	}, nil
-}
-
-func controlDaemonRunning(ctx context.Context, rec central.RepoRecord) bool {
-	if rec.StateDB == "" || !fileExists(rec.StateDB) {
-		return false
-	}
-	report, err := buildStatusReport(ctx, rec, time.Now())
-	return err == nil && report.Daemon == "running" && !report.Stale &&
-		report.PID > 0 && identity.AliveContext(ctx, report.PID)
 }
 
 func applyControlStatus(res *controlResult, status statusReport) {

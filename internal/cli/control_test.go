@@ -734,7 +734,7 @@ func TestControlOffDisablesStopsPreservesAndIsIdempotent(t *testing.T) {
 	withIsolatedHome(t)
 	repo := makeUnregisteredStartRepo(t)
 	var offOut bytes.Buffer
-	if err := runControlOff(context.Background(), &offOut, repo, true); err != nil {
+	if err := runControlOffWithForce(context.Background(), &offOut, repo, true, false); err != nil {
 		t.Fatalf("off unconfigured repository: %v", err)
 	}
 	off := decodeControlResult(t, offOut.Bytes())
@@ -770,7 +770,7 @@ func TestControlOffUnknownRepoRecordsDurableOptOut(t *testing.T) {
 	repo := makeUnregisteredStartRepo(t)
 
 	var out bytes.Buffer
-	if err := runControlOff(context.Background(), &out, repo, true); err != nil {
+	if err := runControlOffWithForce(context.Background(), &out, repo, true, false); err != nil {
 		t.Fatalf("runControlOff: %v", err)
 	}
 	got := decodeControlResult(t, out.Bytes())
@@ -797,7 +797,7 @@ func TestControlOffUnknownDetachedRepoRecordsDurableOptOut(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runControlOff(ctx, &out, repo, true); err != nil {
+	if err := runControlOffWithForce(ctx, &out, repo, true, false); err != nil {
 		t.Fatalf("runControlOff detached: %v", err)
 	}
 	got := decodeControlResult(t, out.Bytes())
