@@ -145,70 +145,57 @@ func TestSetup_TextHarnessUninstallDocsUseProductCommand(t *testing.T) {
 	}
 }
 
-// --- per-harness happy-path tests ------------------------------------------
-
-func TestSetup_ClaudeCode_ExitsZero(t *testing.T) {
-	out, _, err := runSetupCmd(t, "claude-code")
-	if err != nil {
-		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
+func TestSetupHarnessOutput(t *testing.T) {
+	cases := []struct {
+		harness  string
+		snippets []string
+		footer   string
+		jsonKeys []string
+	}{
+		{"claude-code", []string{"claude-code/settings.snippet.json"}, "settings.json", []string{"hooks"}},
+		{"cursor", []string{"cursor/hooks.json"}, "hooks.json", []string{"version", "hooks"}},
+		{"codex", []string{"codex/hooks.json"}, "hooks.json", []string{"hooks"}},
+		{"opencode", []string{"opencode/hooks.snippet.yaml"}, ".config/opencode/hook/hooks.yaml", nil},
+		{"pi", []string{"pi/hooks.snippet.yaml"}, ".pi/agent/hook/hooks.yaml", nil},
+		{"shell", []string{"shell/direnv.envrc.snippet", "shell/zshrc.snippet.sh"}, "direnv", nil},
 	}
-}
-
-func TestSetup_ClaudeCode_ContainsSnippet(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "claude-code")
-	want := snippetBody(t, "claude-code/settings.snippet.json")
-	if !strings.Contains(out, strings.TrimSpace(want)) {
-		t.Errorf("snippet body not found in output.\nwant substring:\n%s\ngot:\n%s", want, out)
-	}
-}
-
-func TestSetup_ClaudeCode_ValidJSON(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "claude-code")
-	// Extract the JSON block: everything between the first '{' and the last '}'.
-	start := strings.Index(out, "{")
-	end := strings.LastIndex(out, "}")
-	if start == -1 || end == -1 || end <= start {
-		t.Fatalf("no JSON block found in output:\n%s", out)
-	}
-	jsonBlock := out[start : end+1]
-	var v interface{}
-	if err := json.Unmarshal([]byte(jsonBlock), &v); err != nil {
-		t.Fatalf("JSON parse error: %v\nblock:\n%s", err, jsonBlock)
-	}
-}
-
-func TestSetup_ClaudeCode_RawEmitsValidJSONOnly(t *testing.T) {
-	out, _, err := runSetupCmd(t, "claude-code", "--raw")
-	if err != nil {
-		t.Fatalf("acd setup claude-code --raw exit=%v\nstdout=%s", err, out)
-	}
-	var v interface{}
-	if err := json.Unmarshal([]byte(out), &v); err != nil {
-		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
-	}
-	assertTopLevelJSONKeys(t, []byte(out), "hooks")
-	if strings.HasPrefix(strings.TrimSpace(out), "//") {
-		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
-	}
-}
-
-func TestSetup_ClaudeCode_NoLegacyJSONMarker(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "claude-code")
-	start := strings.Index(out, "{")
-	end := strings.LastIndex(out, "}")
-	if start == -1 || end == -1 || end <= start {
-		t.Fatalf("no JSON block found in output:\n%s", out)
-	}
-	if strings.Contains(out[start:end+1], `_acd_managed`) {
-		t.Errorf("claude-code JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
-	}
-}
-
-func TestSetup_ClaudeCode_FooterInstructions(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "claude-code")
-	// README says "Merge the printed JSON into ~/.claude/settings.json"
-	if !strings.Contains(out, "settings.json") {
-		t.Errorf("footer instructions missing 'settings.json' in output:\n%s", out)
+	for _, tc := range cases {
+		t.Run(tc.harness, func(t *testing.T) {
+			out, _, err := runSetupCmd(t, tc.harness)
+			if err != nil {
+				t.Fatalf("setup: %v\n%s", err, out)
+			}
+			for _, path := range tc.snippets {
+				if want := strings.TrimSpace(snippetBody(t, path)); !strings.Contains(out, want) {
+					t.Errorf("output missing %s:\n%s", path, out)
+				}
+			}
+			if !strings.Contains(out, tc.footer) {
+				t.Errorf("output missing install path %q:\n%s", tc.footer, out)
+			}
+			if tc.jsonKeys == nil {
+				if !strings.Contains(out, "acd-managed: true") {
+					t.Errorf("output missing ownership marker:\n%s", out)
+				}
+				return
+			}
+			start, end := strings.Index(out, "{"), strings.LastIndex(out, "}")
+			if start < 0 || end <= start {
+				t.Fatalf("output missing JSON:\n%s", out)
+			}
+			assertTopLevelJSONKeys(t, []byte(out[start:end+1]), tc.jsonKeys...)
+			if strings.Contains(out[start:end+1], "_acd_managed") {
+				t.Errorf("JSON contains obsolete ownership marker:\n%s", out)
+			}
+			raw, _, err := runSetupCmd(t, tc.harness, "--raw")
+			if err != nil {
+				t.Fatalf("setup --raw: %v\n%s", err, raw)
+			}
+			assertTopLevelJSONKeys(t, []byte(raw), tc.jsonKeys...)
+			if raw != out[start:end+1]+"\n" {
+				t.Fatalf("raw and formatted JSON differ:\nraw: %s\nformatted: %s", raw, out[start:end+1])
+			}
+		})
 	}
 }
 
@@ -325,55 +312,6 @@ func TestSetup_ClaudeCode_SessionStartFailSoft(t *testing.T) {
 
 // --- cursor -----------------------------------------------------------------
 
-func TestSetup_Cursor_ExitsZero(t *testing.T) {
-	out, _, err := runSetupCmd(t, "cursor")
-	if err != nil {
-		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
-	}
-}
-
-func TestSetup_Cursor_ContainsSnippet(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "cursor")
-	want := snippetBody(t, "cursor/hooks.json")
-	if !strings.Contains(out, strings.TrimSpace(want)) {
-		t.Errorf("cursor snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
-	}
-}
-
-func TestSetup_Cursor_NoLegacyJSONMarker(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "cursor")
-	start := strings.Index(out, "{")
-	end := strings.LastIndex(out, "}")
-	if start == -1 || end == -1 || end <= start {
-		t.Fatalf("no JSON block found in output:\n%s", out)
-	}
-	if strings.Contains(out[start:end+1], `_acd_managed`) {
-		t.Errorf("cursor JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
-	}
-}
-
-func TestSetup_Cursor_FooterInstructions(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "cursor")
-	if !strings.Contains(out, "hooks.json") {
-		t.Errorf("footer missing 'hooks.json' in output:\n%s", out)
-	}
-}
-
-func TestSetup_Cursor_RawEmitsValidJSONOnly(t *testing.T) {
-	out, _, err := runSetupCmd(t, "cursor", "--raw")
-	if err != nil {
-		t.Fatalf("acd setup cursor --raw exit=%v\nstdout=%s", err, out)
-	}
-	var v interface{}
-	if err := json.Unmarshal([]byte(out), &v); err != nil {
-		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
-	}
-	assertTopLevelJSONKeys(t, []byte(out), "version", "hooks")
-	if strings.HasPrefix(strings.TrimSpace(out), "//") {
-		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
-	}
-}
-
 func TestSetup_Cursor_RawRejectsInvalidJSON(t *testing.T) {
 	bad := []byte(`{"version": 1, "hooks": {},}`)
 	withTemplatesFSOverride(t, map[string][]byte{"cursor/hooks.json": bad})
@@ -447,57 +385,6 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 }
 
 // --- codex ------------------------------------------------------------------
-
-func TestSetup_Codex_ExitsZero(t *testing.T) {
-	out, _, err := runSetupCmd(t, "codex")
-	if err != nil {
-		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
-	}
-}
-
-func TestSetup_Codex_ContainsSnippet(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "codex")
-	want := snippetBody(t, "codex/hooks.json")
-	if !strings.Contains(out, strings.TrimSpace(want)) {
-		t.Errorf("codex snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
-	}
-}
-
-func TestSetup_Codex_NoLegacyJSONMarker(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "codex")
-	start := strings.Index(out, "{")
-	end := strings.LastIndex(out, "}")
-	if start == -1 || end == -1 || end <= start {
-		t.Fatalf("no JSON block found in output:\n%s", out)
-	}
-	if strings.Contains(out[start:end+1], `_acd_managed`) {
-		t.Errorf("codex JSON output must not emit legacy _acd_managed marker:\n%s", out[start:end+1])
-	}
-}
-
-func TestSetup_Codex_FooterInstructions(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "codex")
-	if !strings.Contains(out, "hooks.json") {
-		t.Errorf("footer missing 'hooks.json' in output:\n%s", out)
-	}
-}
-
-func TestSetup_Codex_RawEmitsValidJSONOnly(t *testing.T) {
-	out, _, err := runSetupCmd(t, "codex", "--raw")
-	if err != nil {
-		t.Fatalf("acd setup codex --raw exit=%v\nstdout=%s", err, out)
-	}
-	// Raw output must parse as JSON without any pre/post comment wrapping;
-	// users will redirect this directly into ~/.codex/hooks.json.
-	var v interface{}
-	if err := json.Unmarshal([]byte(out), &v); err != nil {
-		t.Fatalf("--raw output must be valid JSON, got error %v\noutput:\n%s", err, out)
-	}
-	assertTopLevelJSONKeys(t, []byte(out), "hooks")
-	if strings.HasPrefix(strings.TrimSpace(out), "//") {
-		t.Errorf("--raw output must not start with comment wrapper:\n%s", out)
-	}
-}
 
 // TestSetup_Codex_RawRejectsInvalidJSON guards that `acd setup codex --raw`
 // refuses to emit a body that would silently corrupt ~/.codex/hooks.json.
@@ -682,36 +569,6 @@ func TestSetup_Codex_ActivityHooksUseOneEvent(t *testing.T) {
 
 // --- opencode ---------------------------------------------------------------
 
-func TestSetup_OpenCode_ExitsZero(t *testing.T) {
-	out, _, err := runSetupCmd(t, "opencode")
-	if err != nil {
-		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
-	}
-}
-
-func TestSetup_OpenCode_ContainsSnippet(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "opencode")
-	want := snippetBody(t, "opencode/hooks.snippet.yaml")
-	if !strings.Contains(out, strings.TrimSpace(want)) {
-		t.Errorf("opencode snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
-	}
-}
-
-func TestSetup_OpenCode_AcdManagedMarker(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "opencode")
-	if !strings.Contains(out, "acd-managed: true") {
-		t.Errorf("acd-managed marker not found in opencode output:\n%s", out)
-	}
-}
-
-func TestSetup_OpenCode_FooterInstructions(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "opencode")
-	// README says "~/.config/opencode/hook/hooks.yaml"
-	if !strings.Contains(out, ".config/opencode/hook/hooks.yaml") {
-		t.Errorf("footer missing '.config/opencode/hook/hooks.yaml' in output:\n%s", out)
-	}
-}
-
 func TestSetup_OpenCode_ActivityHooksUseUnifiedEvent(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
@@ -826,36 +683,6 @@ func TestSetup_OpenCode_ActivityHooksUseOneEvent(t *testing.T) {
 
 // --- pi ---------------------------------------------------------------------
 
-func TestSetup_Pi_ExitsZero(t *testing.T) {
-	out, _, err := runSetupCmd(t, "pi")
-	if err != nil {
-		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
-	}
-}
-
-func TestSetup_Pi_ContainsSnippet(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "pi")
-	want := snippetBody(t, "pi/hooks.snippet.yaml")
-	if !strings.Contains(out, strings.TrimSpace(want)) {
-		t.Errorf("pi snippet body not found.\nwant:\n%s\ngot:\n%s", want, out)
-	}
-}
-
-func TestSetup_Pi_AcdManagedMarker(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "pi")
-	if !strings.Contains(out, "acd-managed: true") {
-		t.Errorf("acd-managed marker not found in pi output:\n%s", out)
-	}
-}
-
-func TestSetup_Pi_FooterInstructions(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "pi")
-	// README says ".pi/agent/hook/hooks.yaml"
-	if !strings.Contains(out, ".pi/agent/hook/hooks.yaml") {
-		t.Errorf("footer missing '.pi/agent/hook/hooks.yaml' in output:\n%s", out)
-	}
-}
-
 func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
 	if strings.Contains(body, "uuidgen") {
@@ -910,42 +737,6 @@ func TestSetup_Pi_ActivityHooksUseOneEvent(t *testing.T) {
 }
 
 // --- shell ------------------------------------------------------------------
-
-func TestSetup_Shell_ExitsZero(t *testing.T) {
-	out, _, err := runSetupCmd(t, "shell")
-	if err != nil {
-		t.Fatalf("expected exit 0, got: %v\nstdout:\n%s", err, out)
-	}
-}
-
-func TestSetup_Shell_ContainsBothSnippets(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "shell")
-
-	wantDirenv := snippetBody(t, "shell/direnv.envrc.snippet")
-	if !strings.Contains(out, strings.TrimSpace(wantDirenv)) {
-		t.Errorf("shell direnv snippet not found in output:\n%s", out)
-	}
-
-	wantZshrc := snippetBody(t, "shell/zshrc.snippet.sh")
-	if !strings.Contains(out, strings.TrimSpace(wantZshrc)) {
-		t.Errorf("shell zshrc snippet not found in output:\n%s", out)
-	}
-}
-
-func TestSetup_Shell_AcdManagedMarker(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "shell")
-	if !strings.Contains(out, "acd-managed: true") {
-		t.Errorf("acd-managed marker not found in shell output:\n%s", out)
-	}
-}
-
-func TestSetup_Shell_FooterInstructions(t *testing.T) {
-	out, _, _ := runSetupCmd(t, "shell")
-	// README mentions "direnv" and "zsh"
-	if !strings.Contains(out, "direnv") {
-		t.Errorf("footer missing 'direnv' in shell output:\n%s", out)
-	}
-}
 
 // TestSetup_Shell_RawHasSeparatorAndParses verifies that `acd setup shell
 // --raw` emits a blank-line separator between the direnv and zshrc
