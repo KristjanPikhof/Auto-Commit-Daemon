@@ -121,33 +121,6 @@ func (c *composed) Generate(ctx context.Context, cc CommitContext) (Result, erro
 	return r, nil
 }
 
-func recordPromptFallback(ctx context.Context, strategy, primary, fallback, reason string) {
-	logger, meta, ok := prompttrace.From(ctx)
-	if !ok {
-		return
-	}
-	if meta.Strategy == "" {
-		meta.Strategy = strategy
-	}
-	reason = SanitizePlannerError(reason)
-	logger.Record(prompttrace.Record{
-		Stage:        "fallback",
-		Strategy:     meta.Strategy,
-		Provider:     primary,
-		Model:        meta.Model,
-		Seq:          meta.Seq,
-		OfferedSeqs:  append([]int64(nil), meta.OfferedSeqs...),
-		BranchRef:    meta.BranchRef,
-		Generation:   meta.Generation,
-		DiffIncluded: meta.DiffIncluded,
-		DiffCap:      meta.DiffCap,
-		Response: &prompttrace.Response{
-			FallbackProvider: fallback,
-			FallbackReason:   reason,
-		},
-	})
-}
-
 // PlanIntent returns primary planner errors and invalid plans to the worker,
 // which owns waiting and safe local grouping policy.
 //
