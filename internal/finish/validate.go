@@ -10,6 +10,12 @@ import (
 	"unicode/utf8"
 )
 
+// ValidateEvidence checks immutable input before provider or repository work.
+func ValidateEvidence(evidence Evidence) error {
+	_, err := validateEvidence(evidence)
+	return err
+}
+
 // Validate proves structural completeness and recorded-version safety. Purpose
 // quality and project correctness require the caller's planner and verifier.
 func Validate(evidence Evidence, plan Plan) error {
