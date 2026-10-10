@@ -3,10 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -238,256 +235,24 @@ func productListHasIndependentAttention(report statusReport) bool {
 }
 
 func readProductListRepo(ctx context.Context, record central.RepoRecord, now time.Time) (overview productListRepoOverview, err error) {
-	overview = productListRepoOverview{
-		report: statusReport{Repo: record.Path, RepoHash: record.RepoHash, Daemon: "stopped", Clients: []statusClient{}},
-	}
-	if !fileExists(record.StateDB) {
+	requested := record
+	if requested.StateDB == "" {
 		return overview, errors.New("state.db missing")
 	}
-	query := url.Values{}
-	query.Add("mode", "ro")
-	query.Add("_pragma", "query_only(ON)")
-	query.Add("_pragma", "busy_timeout(250)")
-	conn, err := sql.Open("sqlite", "file:"+record.StateDB+"?"+query.Encode())
+	overview.report, err = buildStatusReport(ctx, requested, now)
 	if err != nil {
 		return overview, err
 	}
-	conn.SetMaxOpenConns(1)
-	defer conn.Close()
-	if err := conn.PingContext(ctx); err != nil {
-		return overview, err
+	r := overview.report
+	overview.clients = len(r.Clients)
+	overview.lastActivity = laterProductListActivity(overview.lastActivity, r.CaptureHealth.LastProgressTS)
+	for _, client := range r.Clients {
+		overview.lastActivity = laterProductListActivity(overview.lastActivity, float64(client.LastSeenTS))
 	}
-	report := &overview.report
-	defer func() {
-		overview.unfinished = overview.unfinished || report.PendingEvents > 0 || report.BlockedConflicts > 0 ||
-			report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0 ||
-			report.Replay.State == "needs_attention" ||
-			report.checkpointPrepared || report.checkpointNeedsAction || report.UnpublishedCheckpoints > 0 ||
-			report.ObservationEpoch > report.CoveredEpoch ||
-			(report.LatestCheckpointID != "" && !report.Protected) ||
-			report.SelfPublication.PreparedCount > 0 || report.SelfPublication.GitAppliedCount > 0 ||
-			(report.PublicationDrain.ID != "" && report.PublicationDrain.Phase != state.PublicationDrainCompleted) ||
-			overview.rewriting
-	}()
-	var schemaVersion int
-	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&schemaVersion); err != nil {
-		return overview, err
+	if f := r.PublicationOutcome.Finish; f != nil {
+		overview.lastActivity = laterProductListActivity(overview.lastActivity, f.UpdatedTS)
 	}
-	if schemaVersion > state.SchemaVersion {
-		return overview, fmt.Errorf("state schema v%d is newer than supported v%d", schemaVersion, state.SchemaVersion)
-	}
-	var lastCommitTS sql.NullFloat64
-	var lastCommitOID sql.NullString
-	if err := conn.QueryRowContext(ctx, `SELECT commit_oid,published_ts FROM capture_events WHERE commit_oid IS NOT NULL ORDER BY seq DESC LIMIT 1`).Scan(&lastCommitOID, &lastCommitTS); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return overview, err
-	}
-	if lastCommitOID.Valid {
-		report.LastCommitOID = lastCommitOID.String
-	}
-	if lastCommitTS.Valid {
-		report.LastCommitTS = int64(lastCommitTS.Float64)
-		overview.lastActivity = laterProductListActivity(overview.lastActivity, lastCommitTS.Float64)
-	}
-	var newestCapture sql.NullFloat64
-	if err := conn.QueryRowContext(ctx, `SELECT captured_ts FROM capture_events ORDER BY seq DESC LIMIT 1`).Scan(&newestCapture); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return overview, err
-	}
-	if newestCapture.Valid {
-		overview.lastActivity = laterProductListActivity(overview.lastActivity, newestCapture.Float64)
-	}
-	for _, key := range []string{state.ActivityMetaKey, daemon.MetaKeyBranchTokenChangedAt} {
-		value, _, err := metaLookup(ctx, conn, key)
-		if err != nil {
-			return overview, err
-		}
-		ts, _ := strconv.ParseFloat(value, 64)
-		overview.lastActivity = laterProductListActivity(overview.lastActivity, ts)
-	}
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE state=?`, state.EventStatePending).Scan(&report.PendingEvents); err != nil {
-		return overview, err
-	}
-	if schemaVersion >= 20 {
-		if err := readProductListProtection(ctx, conn, report); err != nil {
-			return overview, err
-		}
-	}
-	var heartbeat float64
-	var branchRef sql.NullString
-	var generation sql.NullInt64
-	err = conn.QueryRowContext(ctx, `SELECT pid,mode,heartbeat_ts,branch_ref,branch_generation FROM daemon_state WHERE id=1`).Scan(
-		&report.PID, &report.Daemon, &heartbeat, &branchRef, &generation)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return overview, err
-	}
-	if err == nil {
-		report.HeartbeatTS = int64(heartbeat)
-		if heartbeat > 0 {
-			age := now.Sub(time.Unix(int64(heartbeat), 0))
-			report.HeartbeatAgeSeconds = int64(age.Seconds())
-			report.Stale = age > clientTTLForRepo(record.Path)
-		}
-	}
-	currentBranchRef, currentBranchGeneration, hasCurrentPair, pairErr :=
-		productListCurrentPair(ctx, conn, record.Path)
-	if pairErr != nil {
-		return overview, pairErr
-	}
-	if hasCurrentPair {
-		report.BranchRef = currentBranchRef
-		report.BranchGeneration = currentBranchGeneration
-	}
-	if schemaVersion >= 21 {
-		report.PublicationDrain, err = readStatusPublicationDrain(
-			ctx, conn, report.BranchRef, report.BranchGeneration)
-		if err != nil {
-			return overview, err
-		}
-		overview.lastActivity = laterProductListActivity(
-			overview.lastActivity, report.PublicationDrain.LastProgressTS)
-	}
-	clients, _, err := readProductListClients(ctx, conn, now, clientTTLForRepo(record.Path))
-	if err != nil {
-		return overview, err
-	}
-	overview.clients = clients
-	activeGeneration := report.BranchGeneration
-	blockers, err := loadRecoveryBlockerCounts(ctx, conn, report.BranchRef, activeGeneration)
-	if err != nil {
-		return overview, err
-	}
-	report.BlockedConflicts = blockers.TotalBlockedConflicts
-	report.ActiveBarriers = blockers.ActiveBlockedBarriersWithSuccessors
-	report.ActiveTerminalEvents = blockers.ActiveTerminalEvents
-
-	if info, err := pauseInfoForRepo(ctx, conn, record.StateDB, now); err != nil {
-		return overview, err
-	} else if info != nil {
-		report.Paused = true
-		report.Pause = info
-	}
-	if value, ok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at"); err != nil {
-		return overview, err
-	} else if ok {
-		report.BackpressurePaused = true
-		report.BackpressurePausedAt = value
-	}
-	if report.CaptureHealth, err = state.ReadCaptureHealth(ctx, conn); err != nil {
-		return overview, err
-	}
-	if report.CaptureHealth.Error != "" {
-		report.Protected = false
-		report.CaptureErrors = max(1, report.CaptureHealth.IssueCount)
-	}
-	if report.Configuration, err = loadConfigReadinessReport(ctx, conn, now); err != nil {
-		return overview, err
-	}
-	if report.Replay, err = loadReplayObservabilityReport(ctx, conn); err != nil {
-		return overview, err
-	}
-	if schemaVersion >= 15 {
-		report.IntentV2.SchemaVersion = schemaVersion
-	}
-	strategy, strategyErr := ResolveEffectiveCommitStrategy(ctx, conn)
-	if strategyErr != nil {
-		return overview, strategyErr
-	}
-	report.IntentStrategy.Strategy = string(strategy)
-	report.IntentStrategy.Active = strategy == "intent"
-	envIntent := intentStrategyFromEnv()
-	report.IntentStrategy.EffectiveProvider = envIntent.EffectiveProvider
-	report.IntentStrategy.EffectiveModel = envIntent.EffectiveModel
-	if value, ok, providerErr := metaLookup(ctx, conn, "ai.provider"); providerErr != nil {
-		return overview, providerErr
-	} else if ok && strings.TrimSpace(value) != "" {
-		report.IntentStrategy.EffectiveProvider = strings.TrimSpace(value)
-	}
-	if value, ok, modelErr := metaLookup(ctx, conn, "ai.model"); modelErr != nil {
-		return overview, modelErr
-	} else if ok {
-		report.IntentStrategy.EffectiveModel = strings.TrimSpace(value)
-	}
-	if report.IntentStrategy.Active && report.PendingEvents > 0 {
-		plannerHealth, warning, healthErr := loadIntentPlannerHealth(ctx, conn)
-		if healthErr != nil {
-			return overview, healthErr
-		}
-		report.IntentStrategy.PlannerHealth = plannerHealth
-		report.IntentStrategy.PlannerHealthWarning = warning
-		lastWindow, windowErr := loadLastIntentPlannerWindowForPairSQL(
-			ctx, conn, report.BranchRef, report.BranchGeneration)
-		if windowErr != nil {
-			return overview, windowErr
-		}
-		report.IntentStrategy.LastPlannerWindow = lastWindow
-		if lastWindow != nil {
-			report.IntentStrategy.ResolutionMode = lastWindow.ResolutionMode
-		}
-	}
-	if wait, waitErr := loadListIntentWaitSummary(ctx, conn); waitErr != nil {
-		return overview, waitErr
-	} else if wait != nil {
-		report.IntentStrategy.BatchWaitActive = true
-		report.IntentStrategy.BatchWaitReason = wait.reason
-		report.IntentStrategy.VisiblePendingEvents = wait.visiblePending
-		report.IntentStrategy.MinPending = wait.minPending
-		if wait.reason == "skipped_due_intent_settle_window" {
-			report.IntentStrategy.SettleTriggerInSeconds = wait.waitSeconds
-		} else {
-			report.IntentStrategy.AgeTriggerInSeconds = wait.waitSeconds
-		}
-	}
-	if schemaVersion >= 18 {
-		report.SelfPublication.Available = true
-		report.SelfPublication.Phase = "idle"
-		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(SUM(phase='prepared'),0),COALESCE(SUM(phase='git_applied'),0) FROM self_publications`).Scan(
-			&report.SelfPublication.PreparedCount, &report.SelfPublication.GitAppliedCount); err != nil {
-			return overview, err
-		}
-		if report.SelfPublication.PreparedCount > 0 || report.SelfPublication.GitAppliedCount > 0 {
-			report.SelfPublication.Phase = "active"
-		}
-	}
-	report.Busy = report.Daemon == "running" && !report.Stale &&
-		(report.PendingEvents > 0 || report.SelfPublication.Phase == "active" ||
-			(report.PublicationDrain.ID != "" && report.PublicationDrain.Phase != state.PublicationDrainCompleted && report.PublicationDrain.Phase != state.PublicationDrainNeedsAction) ||
-			report.Configuration.Configuration == "validating")
-	report.PublicationProgress, err = buildPublicationProgressReport(
-		ctx, conn, *report, now)
-	if err != nil {
-		return overview, err
-	}
-	if report.PublicationProgress.Phase == "history_reconstruction" {
-		report.Busy = true
-	}
-	report.OperationalState = statusOperationalStateWithDaemonAlive(*report,
-		report.Daemon == "running" && report.PID > 0 && !report.Stale)
-	if raw, _, err := metaLookup(ctx, conn, state.RewritePIDMetaKey); err != nil {
-		return overview, err
-	} else if raw != "" {
-		var owner state.RewriteActivity
-		if json.Unmarshal([]byte(raw), &owner) == nil && owner.PID > 0 {
-			fp, err := identity.CaptureContext(ctx, owner.PID)
-			overview.rewriting = err == nil && owner.Fingerprint != "" && daemon.FingerprintToken(fp) == owner.Fingerprint
-		}
-	}
-	// Outcome is optional enrichment. Activity and unfinished work must survive
-	// its timeout so a repository cannot disappear from the active dashboard.
-	if schemaVersion >= 20 {
-		outcome, outcomeErr := productListReadOutcome(ctx, conn, report.Protected, record.Path, currentBranchRef, currentBranchGeneration, hasCurrentPair)
-		report.PublicationOutcome = outcome
-		report.PublicationOutcome.ReasonCode = report.PublicationProgress.Phase
-		if health := report.IntentStrategy.PlannerHealth; health != nil &&
-			health.State == daemon.IntentPlannerCircuitOpen {
-			report.PublicationOutcome.RetryAt = health.NextProbeTS
-		}
-		if report.PublicationProgress.Phase == "goal_review_wait" {
-			report.PublicationOutcome.RetryAt = report.PublicationProgress.RetryAtTS
-		}
-		if outcomeErr != nil && !productListReadTransient(outcomeErr) {
-			return overview, outcomeErr
-		}
-	}
-
+	overview.unfinished = r.PublicationOutcome.PendingChanges > 0 || r.PublicationOutcome.WorktreeChanges > 0 || r.Busy || r.CaptureHealth.Error != ""
 	return overview, nil
 }
 
