@@ -68,27 +68,6 @@ func publicationDrainUnknownPlanDependency(ctx context.Context, db *state.DB, dr
 		drain.ID, drain.BranchRef, drain.BranchGeneration, len(drain.EventSeqs)).Scan(&safe); err != nil || !safe {
 		return false, err
 	}
-	candidateRows, err := db.ReadSQL().QueryContext(ctx, `SELECT id,status,readiness FROM intent_candidates
-WHERE branch_ref=? AND branch_generation=? ORDER BY id LIMIT ?`, drain.BranchRef, drain.BranchGeneration, state.IntentCandidateMaxOpenPerPair+1)
-	if err != nil {
-		return false, err
-	}
-	known := make(map[string]ai.IntentCandidateSummary)
-	for candidateRows.Next() {
-		var summary ai.IntentCandidateSummary
-		var readiness string
-		if err := candidateRows.Scan(&summary.CandidateID, &summary.Status, &readiness); err != nil {
-			candidateRows.Close()
-			return false, err
-		}
-		summary.Ready = readiness == state.IntentReadinessReady
-		known[summary.CandidateID] = summary
-	}
-	err = candidateRows.Err()
-	candidateRows.Close()
-	if err != nil || len(known) > state.IntentCandidateMaxOpenPerPair {
-		return false, err
-	}
 	target := make(map[int64]bool, len(drain.EventSeqs))
 	for _, seq := range drain.EventSeqs {
 		target[seq] = true
@@ -119,6 +98,10 @@ ORDER BY updated_ts DESC,fingerprint LIMIT 16`, drain.BranchRef, drain.BranchGen
 		within := true
 		seen := make(map[int64]bool)
 		listed := make(map[string]bool)
+		output := make(map[string]bool)
+		for _, candidate := range stored.Plan.Candidates {
+			output[candidate.CandidateID] = true
+		}
 		for _, candidate := range stored.Plan.Candidates {
 			for _, seq := range candidate.SelectedSeqs {
 				within = within && target[seq] && !seen[seq]
@@ -126,9 +109,23 @@ ORDER BY updated_ts DESC,fingerprint LIMIT 16`, drain.BranchRef, drain.BranchGen
 				req.OfferedCaptures = append(req.OfferedCaptures, ai.OfferedCapture{Seq: seq})
 			}
 			for _, dependency := range candidate.DependsOnCandidates {
-				if summary, found := known[dependency]; found && !listed[dependency] {
-					req.Candidates = append(req.Candidates, summary)
-					listed[dependency] = true
+				if output[dependency] || listed[dependency] {
+					continue
+				}
+				if len(listed) >= state.IntentCandidateMaxOpenPerPair {
+					within = false
+					break
+				}
+				listed[dependency] = true
+				prior, found, err := state.IntentCandidateByID(ctx, db, dependency)
+				if err != nil {
+					return false, err
+				}
+				if found && prior.BranchRef == drain.BranchRef && prior.BranchGeneration == drain.BranchGeneration {
+					req.Candidates = append(req.Candidates, ai.IntentCandidateSummary{
+						CandidateID: prior.ID, Status: prior.Status,
+						Ready: prior.Readiness == state.IntentReadinessReady,
+					})
 				}
 			}
 		}
@@ -138,6 +135,15 @@ ORDER BY updated_ts DESC,fingerprint LIMIT 16`, drain.BranchRef, drain.BranchGen
 		validationErr := ai.ValidateIntentPlanV2(req, stored.Plan)
 		if intentPlanHasUnknownCandidateDependency(validationErr) && validationErr.Error() == drain.LastError {
 			return true, nil
+		}
+		// Ordering a proven saved DAG changes no membership or readiness.
+		// Reopen only when that exact repair passes the complete validator.
+		if validationErr != nil && validationErr.Error() == drain.LastError {
+			repaired := cloneIntentPlanV2(stored.Plan)
+			repaired.Candidates = stableTopologicalIntentCandidates(repaired.Candidates)
+			if ai.ValidateIntentPlanV2(req, repaired) == nil {
+				return true, nil
+			}
 		}
 	}
 	return false, rows.Err()
