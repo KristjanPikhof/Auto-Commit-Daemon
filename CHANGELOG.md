@@ -21,6 +21,8 @@
 
 ### Fixed
 
+- Recognize matching descriptions of the same behavior in added documentation,
+  so related guidance and release notes can form one Intent goal.
 - Put declared prerequisites before their consumers during Intent plan repair,
   and resume protected runs whose saved plan can be safely reordered.
 - Bound recovery lookups by the dependencies in the saved plan, so accumulated

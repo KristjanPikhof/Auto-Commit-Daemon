@@ -312,6 +312,9 @@ protected run when that ordering repair passes validation.
 Later documentation reviews can use a bounded set of recent published goals
 whose recorded versions still match Git. Those goals supply evidence without
 being selected for another commit.
+Related documentation can form one goal when its added lines contain matching
+descriptions of the same behavior. Time and directory proximity alone still
+cannot justify grouping.
 
 The barrier accepts only a completed checkpoint for the requested worktree,
 branch, generation, and observation. A checkpoint from another branch or
