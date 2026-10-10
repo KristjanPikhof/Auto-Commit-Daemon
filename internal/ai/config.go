@@ -85,10 +85,12 @@ const (
 	DefaultIntentDeferLimit = 1
 )
 
-// CommitStrategy selects how pending capture events are turned into commits.
+// CommitStrategy selects how an explicit finish plans its commits.
 type CommitStrategy string
 
 const (
+	CommitStrategyLocal CommitStrategy = "local"
+	// CommitStrategyEvent is retained for legacy records until cutover readers migrate.
 	CommitStrategyEvent  CommitStrategy = "event"
 	CommitStrategyIntent CommitStrategy = "intent"
 )
@@ -139,9 +141,7 @@ type ProviderConfig struct {
 	// separate confirmation requirement when it is enabled.
 	DiffEgress bool
 
-	// CommitStrategy chooses the replay planner. The default is event,
-	// preserving one capture event per commit until intent planning is
-	// explicitly enabled.
+	// CommitStrategy chooses local or Intent planning for explicit finish.
 	CommitStrategy CommitStrategy
 
 	// CommitFormat chooses the commit-message subject format. The default
@@ -265,12 +265,10 @@ func normalizeCommitFormat(raw string) CommitFormat {
 
 func normalizeCommitStrategy(raw string) CommitStrategy {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", string(CommitStrategyEvent):
-		return CommitStrategyEvent
 	case string(CommitStrategyIntent):
 		return CommitStrategyIntent
 	default:
-		return CommitStrategyEvent
+		return CommitStrategyLocal
 	}
 }
 
