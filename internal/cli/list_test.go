@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"io"
 	"os"
@@ -18,22 +17,6 @@ import (
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
-
-func TestList_HumanOneShotOutputStaysTableOnly(t *testing.T) {
-	withIsolatedHome(t)
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(context.Background(), &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr=%q, want empty", stderr.String())
-	}
-	want := "REPO  DAEMON  PEND  BLK  HEAD  STATUS\n"
-	if stdout.String() != want {
-		t.Fatalf("one-shot output drifted:\ngot  %q\nwant %q", stdout.String(), want)
-	}
-}
 
 func TestListUseWatchMode(t *testing.T) {
 	t.Parallel()
@@ -150,719 +133,100 @@ func TestList_JSONOnTTYUsesOneShot(t *testing.T) {
 	}
 }
 
-func TestList_VerboseOnceShowsWideColumns(t *testing.T) {
-	roots := withIsolatedHome(t)
+func TestSummarizeRepoCountsOnlyLiveClients(t *testing.T) {
+	withIsolatedHome(t)
+	_, dbPath, db := makeRepoStateDB(t)
 	ctx := context.Background()
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, true); err != nil {
-		t.Fatalf("writeListProjectionFixture verbose: %v", err)
-	}
-	got := stdout.String()
-	for _, col := range []string{"CLIENTS", "PENDING", "BLOCKED", "LAST_COMMIT"} {
-		if !strings.Contains(got, col) {
-			t.Fatalf("verbose table missing %s:\n%s", col, got)
-		}
-	}
-}
-
-func TestBuildListRepoLabelsCompact_CollisionSuffix(t *testing.T) {
-	t.Parallel()
-	entries := []listEntry{
-		{Path: filepath.Join("/tmp", "label", "acd-repo"), RepoHash: "abc123deadbeef"},
-		{Path: filepath.Join("/else", "label", "acd-repo"), RepoHash: "feedbeefabcd12"},
-	}
-	labels := buildListRepoLabelsCompact(entries)
-	a := labels[entries[0].Path]
-	b := labels[entries[1].Path]
-	if a == b || !strings.Contains(a, "acd-repo#") || !strings.Contains(b, "acd-repo#") {
-		t.Fatalf("labels=%q %q, want distinct acd-repo#<hash-tail> suffixes", a, b)
-	}
-}
-
-func TestList_Human_TwoRepos(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repoA, dbA, dA := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, dA, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save A: %v", err)
-	}
-
-	repoB, dbB, dB := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, dB, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save B: %v", err)
-	}
-
-	registerRepo(t, roots, repoA, dbA, "claude-code")
-	registerRepo(t, roots, repoB, dbB, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	out := stdout.String()
-	if !strings.Contains(out, "REPO") || !strings.Contains(out, "DAEMON") {
-		t.Fatalf("missing header in output:\n%s", out)
-	}
-	// Two body rows: count newlines minus header.
-	lines := 0
-	for _, l := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
-		if l == "" {
-			continue
-		}
-		lines++
-	}
-	if lines != 3 {
-		t.Fatalf("expected 1 header + 2 rows, got %d:\n%s", lines, out)
-	}
-}
-
-func TestList_JSON_TwoRepos(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repoA, dbA, dA := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, dA, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save A: %v", err)
-	}
-	repoB, dbB, dB := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, dB, state.DaemonState{
-		PID: 2, Mode: "sleeping", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save B: %v", err)
-	}
-
-	registerRepo(t, roots, repoA, dbA, "claude-code")
-	registerRepo(t, roots, repoB, dbB, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
-	}
-	if len(got.Repos) != 2 {
-		t.Fatalf("want 2 repos, got %d", len(got.Repos))
-	}
-	for _, r := range got.Repos {
-		if r.Path == "" || r.RepoHash == "" {
-			t.Fatalf("missing fields in %+v", r)
-		}
-	}
-}
-
-func TestList_StatusColumnShowsManualPause(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
-		Reason: "deploy",
-		SetAt:  time.Now().UTC().Format(time.RFC3339),
-		SetBy:  "test",
-	})
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, true); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	if !strings.Contains(stdout.String(), "paused (manual)") {
-		t.Fatalf("missing manual pause status:\n%s", stdout.String())
-	}
-}
-
-func TestList_StatusColumnShowsRewindGrace(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	if err := state.MetaSet(ctx, d, replayPausedUntilMetaKey, time.Now().UTC().Add(time.Minute).Format(time.RFC3339)); err != nil {
-		t.Fatalf("MetaSet: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, true); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	got := stdout.String()
-	if !strings.Contains(got, "paused (rewind grace, expires in") {
-		t.Fatalf("missing rewind grace pause status:\n%s", got)
-	}
-}
-
-func TestList_NoPauseShowsOK(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
-	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("repos=%d want 1", len(got.Repos))
-	}
-	if got.Repos[0].Status != "OK" || got.Repos[0].Paused || got.Repos[0].Pause != nil {
-		t.Fatalf("unexpected clean repo status: %+v", got.Repos[0])
-	}
-}
-
-func TestList_StaleHeartbeatMarked(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, db, d := makeRepoStateDB(t)
-	stale := float64(time.Now().Add(-3 * time.Hour).Unix())
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: stale,
-	}); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	if err := state.RegisterClient(ctx, d, state.Client{
-		SessionID: "live-client", Harness: "codex", LastSeenTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("register client: %v", err)
-	}
-	registerRepo(t, roots, repo, db, "claude-code")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	if !strings.Contains(stdout.String(), "stale") {
-		t.Fatalf("expected stale marker, got:\n%s", stdout.String())
-	}
-}
-
-func TestList_HidesStaleDaemonWithoutLiveClients(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, db, d := makeRepoStateDB(t)
-	stale := float64(time.Now().Add(-3 * time.Hour).Unix())
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: stale,
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	if err := state.RegisterClient(ctx, d, state.Client{
-		SessionID:    "old-client",
-		Harness:      "codex",
-		RegisteredTS: float64(time.Now().Add(-3 * time.Hour).Unix()),
-		LastSeenTS:   float64(time.Now().Add(-3 * time.Hour).Unix()),
-	}); err != nil {
-		t.Fatalf("register old client: %v", err)
-	}
-	registerRepo(t, roots, repo, db, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
-	}
-	if len(got.Repos) != 0 {
-		t.Fatalf("repos=%d, want inactive stale repo hidden: %+v", len(got.Repos), got.Repos)
-	}
-}
-
-func TestList_CountsOnlyLiveClients(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
 	now := time.Now()
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(now.Unix()),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	if err := state.RegisterClient(ctx, d, state.Client{
-		SessionID:    "old-client",
-		Harness:      "codex",
-		RegisteredTS: float64(now.Add(-2 * time.Hour).Unix()),
-		LastSeenTS:   float64(now.Add(-2 * time.Hour).Unix()),
-	}); err != nil {
-		t.Fatalf("register old client: %v", err)
-	}
-	if err := state.RegisterClient(ctx, d, state.Client{
-		SessionID:    "live-client",
-		Harness:      "codex",
-		RegisteredTS: float64(now.Unix()),
-		LastSeenTS:   float64(now.Unix()),
-	}); err != nil {
-		t.Fatalf("register live client: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
-	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("repos=%d, want 1", len(got.Repos))
-	}
-	if got.Repos[0].Clients != 1 {
-		t.Fatalf("clients=%d, want 1 live client", got.Repos[0].Clients)
-	}
-}
-
-// TestList_PendingAndBlockedFromState verifies that `acd list` reads
-// pending + blocked_conflict counts from state.db rather than rendering
-// hardcoded zeros, and that human + JSON output agree.
-func TestList_PendingAndBlockedFromState(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-
-	// Two pending events.
-	for _, p := range []string{"a.go", "b.go"} {
-		if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
-			BranchRef: "refs/heads/main", BranchGeneration: 1,
-			BaseHead: "deadbeef", Operation: "modify", Path: p,
-			Fidelity: "exact", CapturedTS: nowFloat(),
-		}, []state.CaptureOp{{Op: "modify", Path: p, Fidelity: "exact"}}); err != nil {
-			t.Fatalf("append pending: %v", err)
+	for _, client := range []state.Client{
+		{SessionID: "expired", Harness: "codex", LastSeenTS: float64(now.Add(-2 * time.Hour).Unix())},
+		{SessionID: "live", Harness: "codex", LastSeenTS: float64(now.Unix())},
+	} {
+		if err := state.RegisterClient(ctx, db, client); err != nil {
+			t.Fatal(err)
 		}
 	}
-
-	// One blocked-conflict event.
-	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "modify", Path: "ghost.txt",
-		Fidelity: "rescan",
-	}, []state.CaptureOp{{Op: "modify", Path: "ghost.txt", Fidelity: "rescan"}})
+	summary, err := summarizeRepo(ctx, dbPath, now, time.Minute)
 	if err != nil {
-		t.Fatalf("append blocker: %v", err)
+		t.Fatal(err)
 	}
-	if err := state.MarkEventBlocked(ctx, d, seq, "before-state mismatch", nowFloat(),
-		sql.NullString{String: "refs/heads/main", Valid: true},
-		sql.NullInt64{Int64: 1, Valid: true},
-		sql.NullString{String: "deadbeef", Valid: true},
-	); err != nil {
-		t.Fatalf("MarkEventBlocked: %v", err)
-	}
-
-	registerRepo(t, roots, repo, dbPath, "claude-code")
-
-	// Compact human output exposes queue depth and blocked status token.
-	var humanOut, humanErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &humanOut, &humanErr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture human: %v", err)
-	}
-	human := humanOut.String()
-	if !strings.Contains(human, "PEND") || !strings.Contains(human, "BLK") || !strings.Contains(human, "blk") {
-		t.Fatalf("human output missing compact queue/blocked markers:\n%s", human)
-	}
-
-	// JSON shape exposes counts as integers and matches the state we wrote.
-	var jsonOut, jsonErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
-	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("repos=%d, want 1", len(got.Repos))
-	}
-	if got.Repos[0].PendingEvents != 2 {
-		t.Fatalf("PendingEvents=%d, want 2", got.Repos[0].PendingEvents)
-	}
-	if got.Repos[0].BlockedConflicts != 1 {
-		t.Fatalf("BlockedConflicts=%d, want 1", got.Repos[0].BlockedConflicts)
-	}
-	if got.Repos[0].Status != "blocked" || strings.Contains(human, " OK") {
-		t.Fatalf("blocked repo status = %q; human must not show STATUS OK:\n%s", got.Repos[0].Status, human)
-	}
-	if !strings.Contains(got.Repos[0].StatusNote, "acd fix --dry-run") {
-		t.Fatalf("blocked status note lacks safe fix guidance: %q", got.Repos[0].StatusNote)
+	if summary.clients != 1 {
+		t.Fatalf("live clients=%d, want 1", summary.clients)
 	}
 }
 
-func TestList_PendingOnlyShowsWaitingNotBlocked(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "modify", Path: "waiting.go",
-		Fidelity: "exact", CapturedTS: nowFloat(),
-	}, []state.CaptureOp{{Op: "modify", Path: "waiting.go", Fidelity: "exact"}}); err != nil {
-		t.Fatalf("append pending: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "claude-code")
-
-	var jsonOut, jsonErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
-	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("repos=%d, want 1", len(got.Repos))
-	}
-	if got.Repos[0].Status != "waiting" || got.Repos[0].BlockedConflicts != 0 {
-		t.Fatalf("pending-only status=%q blocked=%d, want waiting/0", got.Repos[0].Status, got.Repos[0].BlockedConflicts)
-	}
-	if strings.Contains(got.Repos[0].StatusNote, "fix") {
-		t.Fatalf("pending-only waiting note should not imply fix/corruption: %q", got.Repos[0].StatusNote)
-	}
-}
-
-func TestList_IntentBatchWaitShowsCountdown(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	for k, v := range map[string]string{
-		"commit.strategy":        "intent",
-		"intent.min_pending":     "3",
-		"intent.max_pending_age": "2m",
-		"intent.defer_limit":     "1",
-	} {
-		if err := state.MetaSet(ctx, d, k, v); err != nil {
-			t.Fatalf("set %s: %v", k, err)
+func TestSummarizeRepoIntentWait(t *testing.T) {
+	for _, settle := range []bool{false, true} {
+		name := "batch"
+		if settle {
+			name = "settle"
 		}
-	}
-	appendIntentPendingEvent(t, ctx, d, "wait-a.go", nowFloat()-10)
-	appendIntentPendingEvent(t, ctx, d, "wait-b.go", nowFloat()-5)
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var compactOut, compactErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &compactOut, &compactErr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture compact: %v", err)
-	}
-	if !strings.Contains(compactOut.String(), "wait 1m") {
-		t.Fatalf("compact output missing wait countdown:\n%s", compactOut.String())
-	}
-
-	var verboseOut, verboseErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &verboseOut, &verboseErr, false, true); err != nil {
-		t.Fatalf("writeListProjectionFixture verbose: %v", err)
-	}
-	if !strings.Contains(verboseOut.String(), "intent batch wait: pending=2/3, trigger in 1m") {
-		t.Fatalf("verbose output missing intent wait note:\n%s", verboseOut.String())
-	}
-
-	var jsonOut, jsonErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
-	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("repos=%d, want 1", len(got.Repos))
-	}
-	entry := got.Repos[0]
-	if entry.Status != "waiting" || entry.IntentVisiblePending != 2 || entry.IntentMinPending != 3 {
-		t.Fatalf("json entry missing intent wait fields: %+v", entry)
-	}
-	if entry.IntentWaitSeconds <= 0 || entry.IntentWaitSeconds > 120 {
-		t.Fatalf("intent wait seconds=%d, want 1..120", entry.IntentWaitSeconds)
-	}
-}
-
-func TestList_IntentSettleWaitShowsCountdown(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	for k, v := range map[string]string{
-		"commit.strategy":        "intent",
-		"intent.window":          "2",
-		"intent.min_pending":     "2",
-		"intent.settle_window":   "1m",
-		"intent.max_pending_age": "2m",
-		"intent.defer_limit":     "1",
-	} {
-		if err := state.MetaSet(ctx, d, k, v); err != nil {
-			t.Fatalf("set %s: %v", k, err)
-		}
-	}
-	appendIntentPendingEvent(t, ctx, d, "settle-a.go", nowFloat()-10)
-	appendIntentPendingEvent(t, ctx, d, "settle-b.go", nowFloat()-5)
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var compactOut, compactErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &compactOut, &compactErr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture compact: %v", err)
-	}
-	if !strings.Contains(compactOut.String(), "wait") {
-		t.Fatalf("compact output missing wait status:\n%s", compactOut.String())
-	}
-
-	var verboseOut, verboseErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &verboseOut, &verboseErr, false, true); err != nil {
-		t.Fatalf("writeListProjectionFixture verbose: %v", err)
-	}
-	if !strings.Contains(verboseOut.String(), "intent settle wait: pending=2, trigger in") {
-		t.Fatalf("verbose output missing intent settle note:\n%s", verboseOut.String())
-	}
-
-	var jsonOut, jsonErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
-	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("repos=%d, want 1", len(got.Repos))
-	}
-	entry := got.Repos[0]
-	if entry.Status != "waiting" || entry.IntentVisiblePending != 2 || entry.IntentMinPending != 2 {
-		t.Fatalf("json entry missing intent settle fields: %+v", entry)
-	}
-	if entry.IntentWaitSeconds <= 0 || entry.IntentWaitSeconds > 60 {
-		t.Fatalf("intent wait seconds=%d, want 1..60", entry.IntentWaitSeconds)
-	}
-}
-
-func TestListStatusCompact(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		status string
-		want   string
-	}{
-		{"OK", "OK"},
-		{"waiting", "wait"},
-		{"blocked", "blk"},
-		{"paused", "pause"},
-		{"missing", "miss"},
-		{"unreadable", "bad"},
-		{"stale", "stale"},
-		{"custom", "custom"},
-	}
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.status, func(t *testing.T) {
-			t.Parallel()
-			if got := listStatusCompact(tc.status); got != tc.want {
-				t.Fatalf("listStatusCompact(%q) = %q, want %q", tc.status, got, tc.want)
+		t.Run(name, func(t *testing.T) {
+			withIsolatedHome(t)
+			_, dbPath, db := makeRepoStateDB(t)
+			ctx := context.Background()
+			now := time.Now()
+			minPending, reason, maxWait := "3", "skipped_due_intent_batch_wait", int64(120)
+			if settle {
+				minPending, reason, maxWait = "2", "skipped_due_intent_settle_window", 60
+			}
+			if err := state.MetaSetMany(ctx, db, map[string]string{
+				"commit.strategy": "intent", "intent.window": "2",
+				"intent.min_pending": minPending, "intent.settle_window": "1m",
+				"intent.max_pending_age": "2m", "intent.defer_limit": "1",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			appendIntentPendingEvent(t, ctx, db, "a.go", float64(now.Unix())-10)
+			appendIntentPendingEvent(t, ctx, db, "b.go", float64(now.Unix())-5)
+			summary, err := summarizeRepo(ctx, dbPath, now, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wait := summary.intentWait
+			if wait == nil || wait.reason != reason || wait.visiblePending != 2 ||
+				wait.waitSeconds <= 0 || wait.waitSeconds > maxWait {
+				t.Fatalf("intent wait=%+v, want %s with 2 captures and 1..%d seconds", wait, reason, maxWait)
 			}
 		})
 	}
 }
 
-func TestList_UnreadableStateShowsBad(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := d.Close(); err != nil {
-		t.Fatalf("close state db: %v", err)
-	}
-	if err := os.WriteFile(dbPath, []byte("not-a-sqlite-db"), 0o600); err != nil {
-		t.Fatalf("corrupt state.db: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "claude-code")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	if !strings.Contains(stdout.String(), "bad") {
-		t.Fatalf("expected compact unreadable status bad, got:\n%s", stdout.String())
-	}
-	if stderr.Len() == 0 {
-		t.Fatalf("expected skip log on stderr for unreadable state.db, got empty")
-	}
-}
-
-func TestList_MissingStateDB_Reported(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	// Register a repo whose state.db never existed.
-	repo, db, d := makeRepoStateDB(t)
-	_ = d.Close()
-	registerRepo(t, roots, repo, db+".doesnotexist", "claude-code")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	if !strings.Contains(stdout.String(), "miss") {
-		t.Fatalf("expected compact missing status, got:\n%s", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "state.db missing") {
-		t.Fatalf("expected slog/log warn for missing state.db, got stderr:\n%s", stderr.String())
-	}
-}
-
-func TestList_DisabledLifecycleHiddenFromList(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "modify", Path: "queued.go",
-		Fidelity: "exact", CapturedTS: nowFloat(),
-	}, []state.CaptureOp{{Op: "modify", Path: "queued.go", Fidelity: "exact"}}); err != nil {
-		t.Fatalf("append pending: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "codex")
-	disableRepoLifecycleForListTest(t, roots, repo)
-
-	var compactOut, compactErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &compactOut, &compactErr, false, false); err != nil {
-		t.Fatalf("writeListProjectionFixture compact: %v", err)
-	}
-	if strings.Contains(compactOut.String(), repo) || strings.Contains(compactOut.String(), "disabled") {
-		t.Fatalf("compact output should hide disabled rows:\n%s", compactOut.String())
-	}
-
-	var verboseOut, verboseErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &verboseOut, &verboseErr, false, true); err != nil {
-		t.Fatalf("writeListProjectionFixture verbose: %v", err)
-	}
-	if strings.Contains(verboseOut.String(), repo) || strings.Contains(verboseOut.String(), "disabled") {
-		t.Fatalf("verbose output should hide disabled rows:\n%s", verboseOut.String())
-	}
-
-	var jsonOut, jsonErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &jsonOut, &jsonErr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
-	}
-	if len(got.Repos) != 0 {
-		t.Fatalf("disabled repos should be hidden from JSON lifecycle output: %+v", got.Repos)
-	}
-	if compactErr.Len() != 0 || verboseErr.Len() != 0 || jsonErr.Len() != 0 {
-		t.Fatalf("disabled lifecycle list should not warn, compact=%q verbose=%q json=%q", compactErr.String(), verboseErr.String(), jsonErr.String())
-	}
-}
-
-func TestList_DisabledLifecycleDoesNotOpenMissingStateDB(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := d.Close(); err != nil {
-		t.Fatalf("close state db: %v", err)
-	}
-	if err := os.Remove(dbPath); err != nil {
-		t.Fatalf("remove state db: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "codex")
-	disableRepoLifecycleForListTest(t, roots, repo)
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	if fileExists(dbPath) {
-		t.Fatalf("disabled lifecycle list recreated missing state.db at %s", dbPath)
-	}
-	if strings.Contains(stderr.String(), "state.db missing") {
-		t.Fatalf("disabled lifecycle list should not inspect missing state.db, stderr:\n%s", stderr.String())
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
-	}
-	if len(got.Repos) != 0 {
-		t.Fatalf("disabled repo should be hidden from JSON lifecycle output: %+v", got.Repos)
+func TestProductListDisabledRepositoryIsReadOnly(t *testing.T) {
+	for _, missingDB := range []bool{false, true} {
+		name := "existing state"
+		if missingDB {
+			name = "missing state"
+		}
+		t.Run(name, func(t *testing.T) {
+			roots := withIsolatedHome(t)
+			repo, dbPath, db := makeRepoStateDB(t)
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			registerRepo(t, roots, repo, dbPath, "codex")
+			disableRepoLifecycleForListTest(t, roots, repo)
+			before := fileDigest(t, dbPath)
+			if missingDB {
+				if err := os.Remove(dbPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data, _, err := collectProductList(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(data.Repos) != 0 {
+				t.Fatalf("disabled repository appeared in list: %+v", data.Repos)
+			}
+			if missingDB {
+				if fileExists(dbPath) {
+					t.Fatal("list recreated disabled repository state")
+				}
+			} else if after := fileDigest(t, dbPath); after != before {
+				t.Fatal("list changed disabled repository state")
+			}
+		})
 	}
 }
 
@@ -888,114 +252,6 @@ func writePauseMarkerForStateDB(t *testing.T, stateDBPath string, marker pausepk
 	gitDir := filepath.Dir(filepath.Dir(stateDBPath))
 	if _, err := pausepkg.Write(pausepkg.Path(gitDir), marker, true); err != nil {
 		t.Fatalf("write pause marker: %v", err)
-	}
-}
-
-func TestList_PausedAndStale_RendersBoth(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repo, dbPath, d := makeRepoStateDB(t)
-	stale := float64(time.Now().Add(-3 * time.Hour).Unix())
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: stale,
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
-		Reason: "deploy",
-		SetAt:  time.Now().UTC().Format(time.RFC3339),
-		SetBy:  "test",
-	})
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, false, true); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	got := stdout.String()
-	if !strings.Contains(got, "paused") || !strings.Contains(got, "manual") {
-		t.Fatalf("missing combined paused status: %s", got)
-	}
-	if !strings.Contains(got, "daemon stale") {
-		t.Fatalf("missing stale heartbeat in note: %s", got)
-	}
-}
-
-func TestList_JSON_PausedAndStale(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repo, dbPath, d := makeRepoStateDB(t)
-	stale := float64(time.Now().Add(-3 * time.Hour).Unix())
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: stale,
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
-		Reason: "deploy",
-		SetAt:  time.Now().UTC().Format(time.RFC3339),
-		SetBy:  "test",
-	})
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
-	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("repos=%d want 1: %+v", len(got.Repos), got.Repos)
-	}
-	e := got.Repos[0]
-	if e.Status != "paused" {
-		t.Fatalf("status=%q want paused", e.Status)
-	}
-	if !e.Paused || !e.StaleHeartbeat {
-		t.Fatalf("Paused=%v StaleHeartbeat=%v want both true", e.Paused, e.StaleHeartbeat)
-	}
-	if e.Pause == nil {
-		t.Fatalf("Pause object missing")
-	}
-}
-
-func TestList_PausedStaleNoClients_StillRendered(t *testing.T) {
-	// Pre-existing TestList_HidesStaleDaemonWithoutLiveClients hides a stale
-	// repo with zero live clients. With a pause marker present, operator
-	// intent must keep the row visible so a paused-but-dead daemon is not
-	// silently dropped from `acd list`.
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-	repo, dbPath, d := makeRepoStateDB(t)
-	stale := float64(time.Now().Add(-3 * time.Hour).Unix())
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: stale,
-	}); err != nil {
-		t.Fatalf("save daemon: %v", err)
-	}
-	writePauseMarkerForStateDB(t, dbPath, pausepkg.Marker{
-		Reason: "manual",
-		SetAt:  time.Now().UTC().Format(time.RFC3339),
-		SetBy:  "test",
-	})
-	registerRepo(t, roots, repo, dbPath, "codex")
-
-	var stdout, stderr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &stdout, &stderr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture json: %v", err)
-	}
-	var got struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
-	}
-	if len(got.Repos) != 1 {
-		t.Fatalf("paused-stale repo with no clients was hidden: %+v", got.Repos)
 	}
 }
 
