@@ -244,6 +244,9 @@ func replayIntentCandidateBatch(
 		itemBySeq[item.event.Seq] = item
 	}
 	publishedCandidates := make(map[string]struct{})
+	for _, id := range evaluation.VerifiedPublishedCandidateIDs {
+		publishedCandidates[id] = struct{}{}
+	}
 	visibleCandidateIDs := make(map[string]struct{},
 		len(evaluation.VisibleCandidateIDs))
 	for _, candidateID := range evaluation.VisibleCandidateIDs {
