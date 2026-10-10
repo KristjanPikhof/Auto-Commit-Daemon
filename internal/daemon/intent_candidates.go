@@ -3977,21 +3977,6 @@ func balancedIntentCompanionDependency(kind string) bool {
 	}
 }
 
-func holdIntentCandidatePlan(req ai.IntentPlanRequestV2) ai.IntentPlanV2 {
-	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}
-	for _, capture := range req.OfferedCaptures {
-		plan.Candidates = append(plan.Candidates, ai.IntentCandidateAssignment{
-			CandidateID:       stableGeneratedCandidateID(req, []int64{capture.Seq}),
-			SelectedSeqs:      []int64{capture.Seq},
-			Purpose:           "retain capture until quality planning is available",
-			Readiness:         ai.IntentCandidateWait,
-			MissingCompanions: []string{"quality planner is unavailable"},
-			GroupingReason:    "quality preset forbids planner-failure publication",
-		})
-	}
-	return plan
-}
-
 func normalizeIntentFallbackBoundaries(
 	req ai.IntentPlanRequestV2,
 ) ai.IntentPlanRequestV2 {
@@ -4741,51 +4726,6 @@ func holdBalancedFallbackAssignment(
 		"bounded fallback requires planner review"
 }
 
-func reuseIntentCandidatePartition(
-	req ai.IntentPlanRequestV2,
-	existing []state.IntentCandidate,
-) (ai.IntentPlanV2, bool) {
-	offered := make(map[int64]struct{}, len(req.OfferedCaptures))
-	for _, capture := range req.OfferedCaptures {
-		offered[capture.Seq] = struct{}{}
-	}
-	assigned := make(map[int64]struct{}, len(offered))
-	plan := ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2}
-	for _, candidate := range existing {
-		if candidate.AtomicityStatus.String != string(ai.IntentAtomicityPassed) ||
-			candidate.Readiness != state.IntentReadinessReady {
-			continue
-		}
-		var selected []int64
-		for _, event := range candidate.Events {
-			if _, ok := offered[event.EventSeq]; ok {
-				selected = append(selected, event.EventSeq)
-				assigned[event.EventSeq] = struct{}{}
-			}
-		}
-		if len(selected) == 0 {
-			continue
-		}
-		subject, _ := deterministicIntentCandidateMessage(req, selected)
-		plan.Candidates = append(plan.Candidates, ai.IntentCandidateAssignment{
-			CandidateID: candidate.ID, SelectedSeqs: selected,
-			Purpose: candidate.Purpose, Readiness: ai.IntentCandidateReady,
-			Subject: subject, GroupingReason: "reuse last valid candidate partition",
-		})
-	}
-	if len(assigned) != len(offered) {
-		return ai.IntentPlanV2{}, false
-	}
-	sort.Slice(plan.Candidates, func(i, j int) bool {
-		return plan.Candidates[i].SelectedSeqs[0] < plan.Candidates[j].SelectedSeqs[0]
-	})
-	addIntentCandidateDependencies(req, &plan)
-	if err := ai.ValidateIntentPlanV2(req, plan); err != nil {
-		return ai.IntentPlanV2{}, false
-	}
-	return plan, true
-}
-
 func intentDependencyComponents(req ai.IntentPlanRequestV2, includeSemantic bool) [][]int64 {
 	parent := make(map[int64]int64, len(req.OfferedCaptures))
 	for _, capture := range req.OfferedCaptures {
@@ -4891,51 +4831,6 @@ func addIntentCandidateDependencies(req ai.IntentPlanRequestV2, plan *ai.IntentP
 			}
 		}
 	}
-}
-
-func validateIntentCandidateComponent(
-	seqs []int64,
-	dependencies []state.IntentCaptureDependency,
-) error {
-	if len(seqs) <= 1 {
-		return nil
-	}
-	allowed := make(map[int64]struct{}, len(seqs))
-	for _, seq := range seqs {
-		allowed[seq] = struct{}{}
-	}
-	adj := make(map[int64][]int64, len(seqs))
-	for _, edge := range dependencies {
-		if edge.Strength == state.IntentDependencySoft &&
-			!strongIntentSemanticDependency(edge.Kind) {
-			continue
-		}
-		if _, ok := allowed[edge.PrerequisiteSeq]; !ok {
-			continue
-		}
-		if _, ok := allowed[edge.DependentSeq]; !ok {
-			continue
-		}
-		adj[edge.PrerequisiteSeq] = append(adj[edge.PrerequisiteSeq], edge.DependentSeq)
-		adj[edge.DependentSeq] = append(adj[edge.DependentSeq], edge.PrerequisiteSeq)
-	}
-	seen := map[int64]struct{}{seqs[0]: {}}
-	queue := []int64{seqs[0]}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		for _, next := range adj[current] {
-			if _, ok := seen[next]; ok {
-				continue
-			}
-			seen[next] = struct{}{}
-			queue = append(queue, next)
-		}
-	}
-	if len(seen) != len(seqs) {
-		return errors.New("candidate merges independent dependency components")
-	}
-	return nil
 }
 
 func strongIntentSemanticDependency(kind string) bool {
