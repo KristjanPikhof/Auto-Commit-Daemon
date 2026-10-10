@@ -317,7 +317,7 @@ acd uninstall
 
 ## Development
 
-Building from source requires Go 1.26.6:
+Building from source requires Go 1.26.9:
 
 ~~~bash
 make build
