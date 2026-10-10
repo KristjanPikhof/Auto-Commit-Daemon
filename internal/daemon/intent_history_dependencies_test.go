@@ -13,6 +13,70 @@ import (
 
 type successiveHistoryGoalsPlanner struct{}
 
+type correctingHistoryAuthorPlanner struct {
+	t     *testing.T
+	calls int
+}
+
+func (*correctingHistoryAuthorPlanner) Name() string { return "history-author-correction" }
+func (p *correctingHistoryAuthorPlanner) PlanIntentV2(ctx context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
+	p.calls++
+	if len(req.OfferedCaptures) != 2 || req.OfferedCaptures[0].HistoryAuthor == req.OfferedCaptures[1].HistoryAuthor {
+		p.t.Fatal("planner evidence omitted author boundaries")
+	}
+	plan, err := (successiveHistoryGoalsPlanner{}).PlanIntentV2(ctx, req)
+	if p.calls == 1 {
+		plan.Candidates = plan.Candidates[:1]
+		plan.Candidates[0].SelectedSeqs = []int64{1, 2}
+	} else if !strings.Contains(req.RetryCorrection, "author boundary") {
+		p.t.Fatalf("retry omitted rejected author boundary: %s", req.RetryCorrection)
+	}
+	return plan, err
+}
+
+func TestIntentHistoryCorrectsCrossAuthorGoalBeforeSaving(t *testing.T) {
+	t.Parallel()
+	f := newCaptureFixture(t)
+	ctx := context.Background()
+	firstBody := "package policy\n\nfunc ClampPendingWindow(pending int) int { return pending }\n"
+	first := mustCommitPath(t, f.dir, "policy.go", firstBody, "Bound capture planning windows")
+	second := mustCommitPath(t, f.dir, "policy.go", firstBody+"\nfunc ProviderRetryInterval(attempt int) int { return 300 }\n", "Schedule provider outage retries")
+	tree, err := git.RevParse(ctx, f.dir, second+"^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := git.CommitTreeWithIdentity(ctx, f.dir, tree, "Schedule provider outage retries", "Other Author", "other@example.com", first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, other, second); err != nil {
+		t.Fatal(err)
+	}
+	planner := &correctingHistoryAuthorPlanner{t: t}
+	plan, err := PlanIntentHistory(ctx, f.dir, f.cctx.BranchRef, []string{first, other}, planner, ai.CommitFormatImperative, true)
+	if err != nil || planner.calls != 2 || len(plan.Goals) != 2 {
+		t.Fatalf("cross-author goal did not receive a correction: calls=%d plan=%+v err=%v", planner.calls, plan, err)
+	}
+	plan.ID = "author-boundary-plan"
+	plan.TargetBranchRef = "refs/heads/author-goals"
+	replacements, err := ValidateIntentHistoryPlan(ctx, f.dir, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git.ApplyIntentHistoryReconstruction(ctx, f.dir, git.IntentHistoryReconstructionOptions{
+		SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead,
+		OldChain: plan.SourceChain, Replacements: replacements, PlanID: plan.ID, DryRun: true,
+	}); err != nil {
+		t.Fatalf("accepted plan cannot be previewed: %v", err)
+	}
+	plan.Goals[0].Units = []int{0, 1}
+	plan.Goals[0].TreeOID = tree
+	plan.Goals = plan.Goals[:1]
+	if _, err := ValidateIntentHistoryPlan(ctx, f.dir, plan); err == nil || !strings.Contains(err.Error(), "author boundary") {
+		t.Fatalf("saved plan accepted an edited cross-author goal: %v", err)
+	}
+}
+
 func (successiveHistoryGoalsPlanner) Name() string { return "successive-history-goals" }
 func (successiveHistoryGoalsPlanner) PlanIntentV2(_ context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
 	return ai.IntentPlanV2{ProtocolVersion: ai.IntentPlannerProtocolV2, Candidates: []ai.IntentCandidateAssignment{
