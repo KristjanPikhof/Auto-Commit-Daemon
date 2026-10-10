@@ -82,7 +82,7 @@ var fieldCatalog = []FieldDefinition{
 	{Name: "capture.sensitive_globs", Environment: "ACD_SENSITIVE_GLOBS", Kind: KindString, Boundary: ApplyRestart, Sensitive: true, Persistable: true},
 	{Name: "capture.safe_ignore", Environment: "ACD_SAFE_IGNORE", Default: "true", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
 	{Name: "capture.safe_ignore_extra", Environment: "ACD_SAFE_IGNORE_EXTRA", Kind: KindString, Boundary: ApplyRestart, Persistable: true},
-	{Name: "watch.fsnotify", Environment: "ACD_FSNOTIFY_ENABLED", Default: "false", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
+	{Name: "watch.fsnotify", Environment: "ACD_FSNOTIFY_ENABLED", Default: "true", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
 	{Name: "trace.enabled", Environment: "ACD_TRACE", Default: "false", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
 	{Name: "trace.prompt", Environment: "ACD_AI_PROMPT_TRACE", Default: "false", Kind: KindBool, Boundary: ApplyRestart, Sensitive: true, Persistable: true},
 	{Name: "client.ttl", Environment: "ACD_CLIENT_TTL_SECONDS", Default: "1800", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
