@@ -21,6 +21,8 @@
 
 ### Fixed
 
+- Keep `commit-all` attached to its exact publication run when a newer run
+  becomes the latest, so completed commands stop waiting.
 - Restore known prerequisites after replacing a published candidate's ID.
   Automatically resume protected runs stopped by that missing declaration.
 - Supply proven recent published behavior to later documentation reviews,
