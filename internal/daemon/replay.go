@@ -2092,6 +2092,19 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		}
 		return pending[:n], false, "", nil
 	}
+	if cfg.candidateMode && len(cfg.targetEventSeqs) > 0 && len(pending) > 1 &&
+		len(pending) <= cfg.window && len(pending) <= ai.IntentCandidateCaptureCap {
+		complete, err := completeProtectedIntentFrozenWindow(ctx, db, pending, cfg.targetEventSeqs)
+		if err != nil {
+			return nil, false, "", err
+		}
+		if complete {
+			// Offer the complete bounded remainder together. Separate valid WAIT
+			// owners cannot reoffer one another after aging selects a singleton.
+			// The planner still chooses goals through every ordinary gate.
+			return pending, false, "", nil
+		}
+	}
 	if cfg.candidateMode && len(cfg.targetEventSeqs) == 0 {
 		due, err := dueIntentSemanticReviewWindow(ctx, db, pending, cfg.window, time.Now().UTC())
 		if err != nil {

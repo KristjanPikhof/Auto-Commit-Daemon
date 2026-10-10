@@ -28,6 +28,12 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 	withReferences := make(map[int64]bool)
 	withRawDiff := make(map[int64]bool)
 	rawDiffs := make(map[int64]string)
+	publishedReferences := make(map[int64]string)
+	for _, capture := range captures {
+		if capture.Event.State == state.EventStatePublished {
+			publishedReferences[capture.Event.Seq] = intentRecordedReferenceLines(capture.CapturedDiff)
+		}
+	}
 	goCalls := make(map[int64]intentRecordedGoCalls)
 	var referenceNames intentReferenceNames
 	loadRawDiff := func(capture *IntentCandidateCapture) error {
@@ -81,7 +87,8 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 					return err
 				}
 			}
-			references = mergeIntentRecordedGoCallContext(goCalls[capture.Event.Seq].context, references)
+			references = mergeIntentRecordedGoCallContext(publishedReferences[capture.Event.Seq],
+				mergeIntentRecordedGoCallContext(goCalls[capture.Event.Seq].context, references))
 			capture.CapturedDiff = prependIntentRecordedReferenceContext(capture.CapturedDiff, references)
 			break
 		}
@@ -131,7 +138,8 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 				if err := loadRawDiff(capture); err != nil {
 					return nil, err
 				}
-				capture.CapturedDiff = prependIntentRecordedReferenceContext(capture.CapturedDiff, references)
+				capture.CapturedDiff = prependIntentRecordedReferenceContext(capture.CapturedDiff,
+					mergeIntentRecordedGoCallContext(publishedReferences[capture.Event.Seq], references))
 			}
 			break
 		}
@@ -210,7 +218,11 @@ func loadFocusedIntentGoalEvidence(ctx context.Context, input IntentCandidateEva
 		priorityCaptures[i].CapturedDiff = diffs[i]
 	}
 	diffs = prioritizeIntentRelationshipEvidence(priorityCaptures)
-	diffs = allocateIntentEvidenceDiffs(diffs, ai.HistoryRewriteTotalDiffCap)
+	preferred := make(map[int]bool)
+	for i, capture := range captures {
+		preferred[i] = newCaptures[capture.Event.Seq]
+	}
+	diffs = allocateIntentEvidenceDiffsPrioritized(diffs, ai.IntentGoalEvidenceTotalDiffCap, preferred)
 	for i := range captures {
 		if related[captures[i].Event.Seq] {
 			captures[i].CapturedDiff = diffs[i]
