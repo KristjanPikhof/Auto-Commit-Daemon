@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,14 +39,25 @@ func newFinishCmd() *cobra.Command {
 
 type finishCLIResult struct {
 	state.FinishRequest
-	Protected       bool     `json:"protected"`
-	Published       bool     `json:"published"`
-	NoChanges       bool     `json:"no_changes"`
-	CommitsCreated  int      `json:"commits_created"`
-	CommitOIDs      []string `json:"commit_oids"`
-	NewHead         string   `json:"new_head"`
-	StagedConsumed  bool     `json:"staged_consumed"`
-	WorktreeChanges int      `json:"worktree_changes"`
+	Repo                string               `json:"repo"`
+	WorktreeID          *string              `json:"worktree_id"`
+	BranchRef           *string              `json:"branch_ref"`
+	ExpectedHead        *string              `json:"expected_head"`
+	CheckpointID        *string              `json:"checkpoint_id"`
+	CheckpointTree      *string              `json:"checkpoint_tree"`
+	TargetTree          *string              `json:"target_tree"`
+	Mode                string               `json:"mode"`
+	Style               string               `json:"style"`
+	Verification        []daemon.FinishCheck `json:"verification"`
+	EvidenceFingerprint string               `json:"evidence_fingerprint"`
+	Protected           bool                 `json:"protected"`
+	Published           bool                 `json:"published"`
+	NoChanges           bool                 `json:"no_changes"`
+	CommitsCreated      int                  `json:"commits_created"`
+	CommitOIDs          []string             `json:"commit_oids"`
+	NewHead             string               `json:"new_head"`
+	StagedConsumed      bool                 `json:"staged_consumed"`
+	WorktreeChanges     int                  `json:"worktree_changes"`
 }
 
 func runFinish(ctx context.Context, out, progress io.Writer, repo string, params finishStartParams, jsonOut, quiet bool) error {
@@ -70,12 +83,12 @@ func runFinish(ctx context.Context, out, progress io.Writer, repo string, params
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return renderFinish(out, lookup, r, jsonOut, true)
+			return renderFinish(out, lookup, r, jsonOut, "finish_running")
 		case <-timer.C:
 		}
 		next, readErr := finishRequest(ctx, lookup, "finish_status", map[string]string{"request_id": r.ID})
 		if readErr != nil {
-			return renderFinish(out, lookup, r, jsonOut, true)
+			return renderFinish(out, lookup, r, jsonOut, "finish_status_unavailable")
 		}
 		r = next
 		if interval < time.Second {
@@ -85,11 +98,27 @@ func runFinish(ctx context.Context, out, progress io.Writer, repo string, params
 			}
 		}
 	}
-	return renderFinish(out, lookup, r, jsonOut, false)
+	return renderFinish(out, lookup, r, jsonOut, "")
 }
 
-func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest, jsonOut, detached bool) error {
-	result := finishCLIResult{FinishRequest: r, Protected: r.Target.CheckpointID != "", CommitOIDs: []string{}}
+func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest, jsonOut bool, waitCode string) error {
+	detached := waitCode != ""
+	result := finishCLIResult{FinishRequest: r, Repo: lookup.Worktree.Root, WorktreeID: finishIdentity(r.Target.WorktreeID), BranchRef: finishIdentity(r.Target.BranchRef), ExpectedHead: finishIdentity(r.Target.ExpectedHead), CheckpointID: finishIdentity(r.Target.CheckpointID), CheckpointTree: finishIdentity(r.Target.CheckpointTree), TargetTree: finishIdentity(r.Target.TargetTree), Mode: r.Target.Mode, Style: r.Target.Style, Verification: []daemon.FinishCheck{}, Protected: r.Target.CheckpointID != "", CommitOIDs: []string{}}
+	var plan daemon.FinishSavedPlan
+	if len(r.Plan) > 0 {
+		if err := json.Unmarshal(r.Plan, &plan); err != nil {
+			return fmt.Errorf("acd finish: invalid saved plan: %w", err)
+		}
+		for _, step := range plan.Steps {
+			result.Verification = append(result.Verification, step.Check)
+		}
+	}
+	targetJSON, err := json.Marshal(r.Target)
+	if err != nil {
+		return err
+	}
+	fingerprint := sha256.Sum256(targetJSON)
+	result.EvidenceFingerprint = hex.EncodeToString(fingerprint[:])
 	var saved daemon.FinishResult
 	if len(r.Result) > 0 {
 		if err := json.Unmarshal(r.Result, &saved); err != nil {
@@ -111,6 +140,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	count, countErr := productWorktreeChangeCount(readCtx, lookup.Worktree.Root)
 	result.WorktreeChanges = count
 	ok := r.State == state.FinishCompleted && !detached
+	exit, failureCode := finishExit(r, waitCode)
 	next := ""
 	if !ok {
 		next = "acd finish --retry " + r.ID
@@ -132,10 +162,9 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 		var failure *productError
 		if !ok {
-			failure = &productError{Code: r.ReasonCode, Message: r.Reason, Retryable: r.State == state.FinishFailed || detached}
+			failure = &productError{Code: failureCode, Message: r.Reason, Retryable: r.State == state.FinishFailed || detached}
 			if detached {
-				failure.Code = "finish_running"
-				failure.Message = "Work is saved; the worker continues this request"
+				failure.Message = "Work is saved; reconnect to inspect this request"
 			}
 		}
 		if err := renderAnyProductEnvelope(out, productEnvelope{OK: ok, State: stateName, Changed: true, Actions: []productAction{{Kind: "finish", Status: r.State, Target: lookup.Worktree.Root}}, NextAction: nextAction, Data: result, Error: failure}, true); err != nil {
@@ -145,25 +174,26 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		fmt.Fprintf(out, "Finish request: %s (attempt %d)\nWork saved in checkpoint: %s\n", r.ID, r.Attempt, r.Target.CheckpointID)
 		switch {
 		case detached:
-			fmt.Fprintln(out, "The worker continues this request.")
+			fmt.Fprintln(out, "Work is saved; reconnect to inspect this request.")
 		case r.State != state.FinishCompleted:
 			fmt.Fprintf(out, "Finish %s: %s\n", r.State, r.Reason)
 		case saved.NoChanges:
-			fmt.Fprintln(out, "No eligible changes to commit.")
+			fmt.Fprintln(out, "No changes to finish.\nPublished: 0 commit(s)")
 		case r.DryRun:
-			fmt.Fprintf(out, "Preview target: %s\n", r.Target.TargetTree)
-			var plan daemon.FinishSavedPlan
-			if err := json.Unmarshal(r.Plan, &plan); err != nil {
-				return err
-			}
+			fmt.Fprintf(out, "Finish preview\nTarget: %s\nPublished: no\n", r.Target.TargetTree)
 			for _, step := range plan.Steps {
 				fmt.Fprintf(out, "%s\n  Tree: %s; verification: %s; command executed: %t\n", step.Message, step.TreeOID, step.Check.Policy, step.Check.Executed)
 			}
 			fmt.Fprintln(out, "Run `acd finish` to freeze and finish the current work.")
 		default:
-			fmt.Fprintf(out, "Published %d commit(s):\n", result.CommitsCreated)
+			fmt.Fprintf(out, "Published: %d commit(s)\n", result.CommitsCreated)
 			for _, oid := range result.CommitOIDs {
 				fmt.Fprintln(out, oid)
+			}
+		}
+		if !r.DryRun {
+			for _, check := range result.Verification {
+				fmt.Fprintf(out, "Verification: %s; tree: %s; command executed: %t\n", check.Policy, check.TreeOID, check.Executed)
 			}
 		}
 		if countErr == nil && count > 0 {
@@ -174,15 +204,35 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 	}
 	if !ok {
-		exit := ExitActionRequired
-		code := r.ReasonCode
-		if detached {
-			exit = ExitUnavailable
-			code = "finish_running"
-		}
-		return &CommandError{Code: code, Message: "acd finish: work is saved; " + next, Exit: exit, Retryable: detached || r.State == state.FinishFailed, rendered: true}
+		return &CommandError{Code: failureCode, Message: "acd finish: work is saved; " + next, Exit: exit, Retryable: detached || r.State == state.FinishFailed, rendered: true}
 	}
 	return nil
+}
+
+func finishIdentity(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func finishExit(r state.FinishRequest, waitCode string) (int, string) {
+	if waitCode != "" {
+		return ExitUnavailable, waitCode
+	}
+	if r.State == state.FinishCompleted {
+		return ExitOK, ""
+	}
+	if r.ReasonCode == "provider_deadline" || r.ReasonCode == "provider_failure" {
+		return ExitUnavailable, "finish_unavailable"
+	}
+	if r.State == state.FinishNeedsAttention {
+		return ExitActionRequired, "finish_needs_attention"
+	}
+	if r.ReasonCode == "provider_input_too_large" {
+		return ExitActionRequired, r.ReasonCode
+	}
+	return ExitActionRequired, "finish_failed"
 }
 
 func productWorktreeChangeCount(ctx context.Context, repo string) (int, error) {
