@@ -27,9 +27,9 @@ const finishLegacyCheckpointID = "cp-1-0123456789abcdef"
 // These builders intentionally use the saved legacy DDL and SQL rather than
 // current state writers. A newer binary must not upgrade a fixture while making it.
 type finishLegacyFixture struct {
-	Root, Repo, DBPath, LinkedRepo                       string
-	SourceHead, TargetHead, Tree, Blob, CapturedOnlyBlob string
-	Env                                                  []string
+	Root, Repo, DBPath, LinkedRepo                                         string
+	SourceHead, TargetHead, CheckpointCommit, Tree, Blob, CapturedOnlyBlob string
+	Env                                                                    []string
 }
 
 type finishLegacyManifest struct {
@@ -77,16 +77,23 @@ func newFinishLegacyFixture(t *testing.T, scenario string) *finishLegacyFixture 
 	f.git(t, f.Repo, "add", "--", "work.txt")
 	f.Tree = f.gitText(t, f.Repo, "write-tree")
 	f.TargetHead = f.gitText(t, f.Repo, "commit-tree", f.Tree, "-p", f.SourceHead, "-m", "Complete legacy work")
+	checkpointEnv := append([]string(nil), f.Env...)
+	f.Env = envWith(f.Env, "GIT_AUTHOR_NAME=ACD Checkpoint", "GIT_AUTHOR_EMAIL=checkpoint@localhost",
+		"GIT_COMMITTER_NAME=ACD Checkpoint", "GIT_COMMITTER_EMAIL=checkpoint@localhost")
+	f.CheckpointCommit = f.gitText(t, f.Repo, "commit-tree", f.Tree, "-m", "acd checkpoint "+finishLegacyCheckpointID)
+	f.Env = checkpointEnv
 	f.git(t, f.Repo, "reset", "-q", f.SourceHead)
 	checkpointRef := "refs/acd/checkpoints/v1/" + finishLegacyWorktreeID + "/" + finishLegacyCheckpointID
-	f.git(t, f.Repo, "update-ref", checkpointRef, f.TargetHead)
+	f.git(t, f.Repo, "update-ref", checkpointRef, f.CheckpointCommit)
 	// This version exists only in the capture ledger, outside the final checkpoint.
 	writeFile(t, filepath.Join(f.Root, "captured-only.txt"), "earlier captured bytes\n")
 	f.CapturedOnlyBlob = f.gitText(t, f.Repo, "hash-object", "-w", "--", filepath.Join(f.Root, "captured-only.txt"))
 
 	f.DBPath = filepath.Join(f.Repo, ".git", "acd", "state.db")
-	writeFile(t, filepath.Join(f.Root, "config", "acd", "config.json"), `{"commit":{"strategy":"event","format":"imperative"}}`)
-	writeFile(t, filepath.Join(f.Repo, ".git", "acd", "config.json"), `{"commit":{"strategy":"intent","format":"conventional"}}`)
+	if err := os.MkdirAll(filepath.Dir(f.DBPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(f.Root, "config", "acd", "config.json"), `{"version":1,"generation":3,"settings":{"global":{"commit.strategy":"event","commit.format":"imperative"},"profiles":{"legacy-intent":{"fields":{"commit.strategy":"intent","commit.format":"conventional"}}}}}`)
 	db := f.openSQL(t, false)
 	defer db.Close()
 	f.execSQL(t, db, finishLegacyDDL(t))
@@ -100,7 +107,7 @@ VALUES(1,0,'create','work.txt',NULL,NULL,?,'100644','full'),
 	f.execSQL(t, db, `INSERT INTO operations(id,kind,worktree_id,phase,status,plan_digest,created_ts,updated_ts,completed_ts)
 VALUES('checkpoint-op','checkpoint',?,'completed','completed',?,3,4,4)`, finishLegacyWorktreeID, finishLegacyDigest([]byte(f.Tree)))
 	f.execSQL(t, db, `INSERT INTO checkpoints(id,seq,operation_id,worktree_id,reason,observation_epoch,coverage_epoch,observed_head,observed_ref,tree_oid,commit_oid,checkpoint_ref,phase,created_ts,completed_ts)
-VALUES(?,1,'checkpoint-op',?,'watch',2,2,?,'refs/heads/main',?,?,?,'completed',3,4)`, finishLegacyCheckpointID, finishLegacyWorktreeID, f.SourceHead, f.Tree, f.TargetHead, checkpointRef)
+VALUES(?,1,'checkpoint-op',?,'watch',2,2,?,'refs/heads/main',?,?,?,'completed',3,4)`, finishLegacyCheckpointID, finishLegacyWorktreeID, f.SourceHead, f.Tree, f.CheckpointCommit, checkpointRef)
 	f.execSQL(t, db, `INSERT INTO checkpoint_events(checkpoint_id,ord,event_seq) VALUES(?,0,1),(?,1,2)`, finishLegacyCheckpointID, finishLegacyCheckpointID)
 	f.execSQL(t, db, `INSERT INTO daemon_meta(key,value,updated_ts) VALUES('commit.strategy','intent',4),('commit.format','conventional',4)`)
 
@@ -124,14 +131,14 @@ VALUES('drain',?,?,'refs/heads/main',1,'intent','conventional','legacy-test','re
 	case "prepared", "git-applied":
 		// Legacy event-only digest: ord, event sequence and nullable candidate flag.
 		digest := finishLegacyDigest([]byte("0\x001\x000\x001\x002\x000\x00"))
-		f.execSQL(t, db, `INSERT INTO operations(id,kind,worktree_id,phase,status,created_ts,updated_ts) VALUES('publish-op','publication',?,'prepared','prepared',5,5)`, finishLegacyWorktreeID)
+		f.execSQL(t, db, `INSERT INTO operations(id,kind,phase,status,plan_digest,created_ts,updated_ts) VALUES('op_publication','self_publication','prepared','prepared',?,5,5)`, digest)
 		f.execSQL(t, db, `INSERT INTO self_publications(id,operation_id,branch_ref,branch_generation,source_head,target_commit_oid,target_tree_oid,membership_digest,member_count,phase,created_ts,updated_ts,completion_published_ts,completion_candidate_status)
-VALUES('publication','publish-op','refs/heads/main',1,?,?,?, ?,2,'prepared',5,5,6,'published')`, f.SourceHead, f.TargetHead, f.Tree, digest)
+VALUES('publication','op_publication','refs/heads/main',1,?,?,?, ?,2,'prepared',5,5,6,'published')`, f.SourceHead, f.TargetHead, f.Tree, digest)
 		f.execSQL(t, db, `INSERT INTO self_publication_members(publication_id,ord,event_seq) VALUES('publication',0,1),('publication',1,2)`)
 		if scenario == "git-applied" {
 			f.git(t, f.Repo, "update-ref", "refs/heads/main", f.TargetHead, f.SourceHead)
 			f.execSQL(t, db, `UPDATE self_publications SET phase='git_applied',git_applied_ts=6,updated_ts=6 WHERE id='publication'`)
-			f.execSQL(t, db, `UPDATE operations SET phase='git_applied',status='active',updated_ts=6 WHERE id='publish-op'`)
+			f.execSQL(t, db, `UPDATE operations SET phase='git_applied',status='active',updated_ts=6 WHERE id='op_publication'`)
 		}
 	case "history-repair", "older-schema":
 		f.seedRepair(t, db)
@@ -222,7 +229,13 @@ func (f *finishLegacyFixture) indexDigest(t *testing.T) string {
 // migration tests can compare the old evidence without relying on current APIs.
 func (f *finishLegacyFixture) manifest(t *testing.T) finishLegacyManifest {
 	t.Helper()
-	m := finishLegacyManifest{Refs: string(f.git(t, f.Repo, "for-each-ref", "--format=%(refname) %(objectname)")), Objects: map[string][]byte{}, Worktrees: map[string]finishLegacyWorktreeManifest{}, Config: map[string][]byte{}, Tables: map[string]json.RawMessage{}}
+	m := finishLegacyManifest{
+		Refs:      string(f.git(t, f.Repo, "for-each-ref", "--format=%(refname) %(objectname)")),
+		Objects:   map[string][]byte{},
+		Worktrees: map[string]finishLegacyWorktreeManifest{},
+		Config:    map[string][]byte{},
+		Tables:    map[string]json.RawMessage{},
+	}
 	for _, object := range strings.Split(f.gitText(t, f.Repo, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"), "\n") {
 		fields := strings.Fields(object)
 		m.Objects[fields[0]] = f.git(t, f.Repo, "cat-file", fields[1], fields[0])
@@ -231,7 +244,12 @@ func (f *finishLegacyFixture) manifest(t *testing.T) finishLegacyManifest {
 		if repo == "" {
 			continue
 		}
-		w := finishLegacyWorktreeManifest{Head: f.gitText(t, repo, "rev-parse", "HEAD"), Branch: f.gitText(t, repo, "symbolic-ref", "HEAD"), Index: f.index(t, repo), Files: map[string][]byte{}}
+		w := finishLegacyWorktreeManifest{
+			Head:   f.gitText(t, repo, "rev-parse", "HEAD"),
+			Branch: f.gitText(t, repo, "symbolic-ref", "HEAD"),
+			Index:  f.index(t, repo),
+			Files:  map[string][]byte{},
+		}
 		err := filepath.WalkDir(repo, func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -253,7 +271,7 @@ func (f *finishLegacyFixture) manifest(t *testing.T) finishLegacyManifest {
 		}
 		m.Worktrees[name] = w
 	}
-	for _, path := range []string{"repo/.git/config", "repo/.git/acd/config.json", "config/acd/config.json"} {
+	for _, path := range []string{"repo/.git/config", "config/acd/config.json"} {
 		m.Config[path] = finishLegacyReadFile(t, filepath.Join(f.Root, path))
 	}
 	db := f.openSQL(t, true)
@@ -363,6 +381,10 @@ func TestFinishLegacyFixtureRoundTrip(t *testing.T) {
 			if !strings.Contains(string(before.Objects[f.SourceHead]), "author Legacy Author <legacy@example.test>") {
 				t.Fatal("author provenance lost")
 			}
+			checkpoint := string(before.Objects[f.CheckpointCommit])
+			if strings.Contains(checkpoint, "\nparent ") || !strings.Contains(checkpoint, "author ACD Checkpoint <checkpoint@localhost>") {
+				t.Fatal("checkpoint must be rootless with the ACD identity")
+			}
 			if !strings.Contains(before.Refs, "refs/acd/checkpoints/v1/"+finishLegacyWorktreeID) {
 				t.Fatal("private checkpoint ref missing")
 			}
@@ -468,8 +490,45 @@ func TestFinishLegacyFixtureOlderSchemaUpgrade(t *testing.T) {
 	if !bytes.Equal(after.Tables["intent_repair_commit_lineage"], before.Tables["intent_repair_commits"]) {
 		t.Fatal("older-schema mapping provenance was not copied")
 	}
+	assertFinishLegacyEvidencePreserved(t, before, after)
+}
+
+// Allow additive tables and columns, but compare every original row and field.
+// Callers must account explicitly for any intentional legacy-state transitions.
+func assertFinishLegacyEvidencePreserved(t *testing.T, before, after finishLegacyManifest) {
+	t.Helper()
 	for table, evidence := range before.Tables {
-		if !bytes.Equal(evidence, after.Tables[table]) {
+		var oldRows, newRows []map[string]json.RawMessage
+		if err := json.Unmarshal(evidence, &oldRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(after.Tables[table], &newRows); err != nil {
+			t.Fatalf("retained table %s unavailable: %v", table, err)
+		}
+		if len(oldRows) != len(newRows) {
+			t.Fatalf("retained table %s row count changed", table)
+		}
+		if len(oldRows) == 0 {
+			continue
+		}
+		var projected []string
+		for _, row := range newRows {
+			original := map[string]json.RawMessage{}
+			for column := range oldRows[0] {
+				value, exists := row[column]
+				if !exists {
+					t.Fatalf("retained column %s.%s unavailable", table, column)
+				}
+				original[column] = value
+			}
+			data, err := json.Marshal(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			projected = append(projected, string(data))
+		}
+		sort.Strings(projected)
+		if string(evidence) != "["+strings.Join(projected, ",")+"]" {
 			t.Fatalf("upgrade changed retained table %s", table)
 		}
 	}
