@@ -234,7 +234,11 @@ func ApplyIntentV2MessageQuality(ctx context.Context, provider interface{ Name()
 		}
 		checked, err := applyIntentMessageQuality(ctx, provider, legacyReq, locked)
 		if err != nil {
-			return IntentPlanV2{}, err
+			// Keep the valid grouping available to the bounded correction loop.
+			// A message failure must not discard every other accepted goal.
+			finding := v2ValidationError(candidate.CandidateID, IntentAtomicityCompleteness,
+				"goal_message_unproven", fmt.Sprintf("repair the message for selected seqs %v; use a complete imperative subject of at most %d characters and meaningful body bullets", candidate.SelectedSeqs, SubjectCap))
+			return IntentPlanV2{}, errors.Join(err, rejectedIntentPlanV2(finding, plan))
 		}
 		out.Candidates[i].Subject = checked.Subject
 		out.Candidates[i].Body = checked.Body
