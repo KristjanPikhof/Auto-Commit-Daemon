@@ -312,18 +312,40 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 
 	repo := tempRepo(t)
 	sessionID := "intent-quiescence"
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("quiescence publication state: %s", sqliteExec(t, filepath.Join(repo, ".git", "acd", "state.db"),
+				`SELECT id,status,purpose,atomicity_summary FROM intent_candidates; SELECT fingerprint,resolution_mode,progress_state FROM intent_plan_runs;`))
+		}
+	})
 
 	// Seed the file under version control so the second write captures as
 	// a modify (not a create-then-modify) — the quiescence gate keys on
 	// path-touch recency regardless of op kind, but consistent ops keep
 	// the assertions about commit count clean.
-	target := filepath.Join(repo, "quiet.txt")
-	writeFile(t, target, "v0\n")
-	gitCommitAll(t, repo, "seed quiet.txt", "quiet.txt")
+	target := filepath.Join(repo, "quiet.md")
+	writeFile(t, target, "# Capture protection reference\n\nKeep captured work protected.\n")
+	gitCommitAll(t, repo, "Document capture protection", "quiet.md")
+
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := decodeIntentChatRequest(t, r)
+		writeNativeIntentCandidatesResponse(t, w, "call_quiet_capture", []map[string]any{
+			nativeReadyIntentCandidate("checkpoint-guide", offeredIntentSeqs(t, req),
+				"Document checkpoint protection guarantees",
+				"- Explain that captured file versions enter checkpoints before publication",
+				"the documentation completes the checkpoint protection explanation"),
+		})
+	}))
+	defer server.Close()
 
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key",
+		"ACD_AI_MODEL=gpt-6-luna",
+		trustEnv,
 		"ACD_INTENT_WINDOW=10",
 		"ACD_INTENT_MIN_PENDING=1",
 		"ACD_INTENT_SETTLE_WINDOW=0",
@@ -359,18 +381,18 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 	// wake between them so the daemon observes each transition); the
 	// quiescence gate must hold the planner offer until both are quiet
 	// for >= 2s.
-	writeFile(t, target, "v1\n")
+	writeFile(t, target, "# Capture protection reference\n\nSave captured file versions in checkpoints.\n")
 	wakeSession(t, ctx, env, repo, sessionID)
 	waitFor(t, "first capture pending", 5*time.Second, func() bool {
 		return sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM capture_events WHERE path='quiet.txt' AND state='pending'") == "1"
+			"SELECT COUNT(*) FROM capture_events WHERE path='quiet.md' AND state='pending'") == "1"
 	})
 	time.Sleep(500 * time.Millisecond)
-	writeFile(t, target, "v2\n")
+	writeFile(t, target, "# Capture protection reference\n\nSave captured file versions in checkpoints before publication.\n")
 	wakeSession(t, ctx, env, repo, sessionID)
 	waitFor(t, "second capture pending", 5*time.Second, func() bool {
 		return sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM capture_events WHERE path='quiet.txt' AND state='pending'") == "2"
+			"SELECT COUNT(*) FROM capture_events WHERE path='quiet.md' AND state='pending'") == "2"
 	})
 
 	// HEAD must NOT advance yet: the quiescence gate (2s) holds the
@@ -408,36 +430,35 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 		return head != headBefore && head != ""
 	})
 
-	// Both captures must be published, sharing one commit_oid (the planner
-	// saw a single coalesced offer). With deterministic provider the
-	// daemon's deterministic-coalesce path also produces one commit.
-	waitForEventState(t, dbPath, "quiet.txt", "published", 10*time.Second)
+	// Both captures must be published, sharing one commit_oid. The semantic
+	// planner sees a single coalesced offer with the completed explanation.
+	waitForEventState(t, dbPath, "quiet.md", "published", 10*time.Second)
 	distinct := sqliteScalar(t, dbPath,
-		"SELECT COUNT(DISTINCT commit_oid) FROM capture_events WHERE path='quiet.txt' AND state='published'")
+		"SELECT COUNT(DISTINCT commit_oid) FROM capture_events WHERE path='quiet.md' AND state='published'")
 	if distinct != "1" {
-		t.Fatalf("distinct commit_oid for quiet.txt published rows=%s want 1 (two saves must surface as one window)",
+		t.Fatalf("distinct commit_oid for quiet.md published rows=%s want 1 (two saves must surface as one window)",
 			distinct)
 	}
 	rows := sqliteScalar(t, dbPath,
-		"SELECT COUNT(*) FROM capture_events WHERE path='quiet.txt' AND state='published'")
+		"SELECT COUNT(*) FROM capture_events WHERE path='quiet.md' AND state='published'")
 	if rows != "2" {
-		t.Fatalf("published rows for quiet.txt=%s want 2", rows)
+		t.Fatalf("published rows for quiet.md=%s want 2", rows)
 	}
 	members := sqliteScalar(t, dbPath, `
 SELECT COUNT(*)
 FROM intent_candidate_events member
 JOIN capture_events capture ON capture.seq=member.event_seq
-WHERE capture.path='quiet.txt' AND member.membership_state='active'`)
+WHERE capture.path='quiet.md' AND member.membership_state='active'`)
 	if members != "2" {
-		t.Fatalf("active candidate members for quiet.txt=%s want 2", members)
+		t.Fatalf("active candidate members for quiet.md=%s want 2", members)
 	}
 	coalesced := sqliteScalar(t, dbPath, `
 SELECT COUNT(*)
 FROM intent_candidate_events member
 JOIN capture_events capture ON capture.seq=member.event_seq
-WHERE capture.path='quiet.txt' AND member.event_role='coalesced'
+WHERE capture.path='quiet.md' AND member.event_role='coalesced'
   AND member.membership_state='active'`)
 	if coalesced != "1" {
-		t.Fatalf("coalesced candidate members for quiet.txt=%s want 1", coalesced)
+		t.Fatalf("coalesced candidate members for quiet.md=%s want 1", coalesced)
 	}
 }
