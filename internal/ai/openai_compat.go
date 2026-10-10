@@ -57,6 +57,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
@@ -305,6 +306,109 @@ type OpenAIProvider struct {
 // Name reports the canonical identifier; sources stamped on Result are
 // useful for downstream telemetry.
 func (*OpenAIProvider) Name() string { return "openai-compat" }
+
+func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	goal := map[string]any{
+		"type": "object", "additionalProperties": false,
+		"required": []string{"purpose", "boundary", "message", "change_ids"},
+		"properties": map[string]any{
+			"purpose":    map[string]any{"type": "string"},
+			"boundary":   map[string]any{"type": "string"},
+			"message":    map[string]any{"type": "string"},
+			"change_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		},
+	}
+	return marshalOpenAIToolRequest(openAIToolRequestOptions{
+		Model: p.resolvedModel(), SystemPrompt: finishSystemPrompt, UserPrompt: string(data),
+		ToolName: "finish_plan", ToolDescription: "Plan completed purposes, safe recorded changes, and grounded messages",
+		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"goals"},
+			"properties": map[string]any{"goals": map[string]any{"type": "array", "items": goal}}},
+	})
+}
+
+// ExchangeFinish sends one HTTP request. Transport failures never retry or
+// invoke another provider; malformed output is returned to the bounded planner.
+func (p *OpenAIProvider) ExchangeFinish(ctx context.Context, body []byte) ([]byte, error) {
+	if strings.TrimSpace(p.APIKey) == "" {
+		return nil, errors.New("openai-compat: missing API key")
+	}
+	baseURL, err := normalizeOpenAIBaseURL(p.BaseURL, false)
+	if err != nil {
+		return nil, err
+	}
+	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	req.Header.Set("Accept", "application/json")
+	client := p.HTTP
+	if client == nil {
+		client = defaultOpenAIClient()
+	}
+	// Do not let an injected client redirect credentials or turn one paid
+	// exchange into several requests. Preserve its transport and timeout.
+	single := *client
+	single.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := single.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, subprocessResponseByteCap+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > subprocessResponseByteCap {
+		return nil, errors.New("openai-compat: response exceeds 1 MiB")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: "finish request rejected"}
+	}
+	arguments, err := parseFinishToolArguments(raw)
+	if err != nil {
+		return nil, &finishOutputError{Err: err, Raw: raw}
+	}
+	return arguments, nil
+}
+
+func parseFinishToolArguments(raw []byte) ([]byte, error) {
+	var response struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if !utf8.Valid(raw) {
+		return nil, errors.New("OpenAI response is not valid UTF-8")
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("decode OpenAI finish response: %w", err)
+	}
+	if len(response.Choices) != 1 || len(response.Choices[0].Message.ToolCalls) != 1 {
+		return nil, errors.New("OpenAI finish response must contain exactly one choice and finish_plan tool call")
+	}
+	function := response.Choices[0].Message.ToolCalls[0].Function
+	if function.Name != "finish_plan" || function.Arguments == "" {
+		return nil, errors.New("OpenAI finish response requires finish_plan arguments")
+	}
+	return []byte(function.Arguments), nil
+}
 
 // Generate POSTs the chat-completion request and parses the tool-call.
 func (p *OpenAIProvider) Generate(ctx context.Context, cc CommitContext) (Result, error) {
