@@ -160,7 +160,26 @@ func publicationDrainPublishedPlanDependency(ctx context.Context, repo string, d
 	const format = "intent planner v2: hard_dependency_undeclared: hard dependency %d -> %d crosses candidates without depends_on_candidates"
 	var from, to int64
 	if n, err := fmt.Sscanf(drain.LastError, format, &from, &to); err != nil || n != 2 || from <= 0 || to <= 0 || fmt.Sprintf(format, from, to) != drain.LastError {
-		return false, nil
+		const waitingFormat = "intent planner v2: dependency_not_ready: ready candidate depends on waiting persisted candidate %q"
+		var id string
+		if n, err := fmt.Sscanf(drain.LastError, waitingFormat, &id); err != nil || n != 1 || fmt.Sprintf(waitingFormat, id) != drain.LastError {
+			return false, nil
+		}
+		err := db.ReadSQL().QueryRowContext(ctx, `SELECT edge.prerequisite_seq,edge.dependent_seq
+FROM intent_capture_dependencies edge JOIN capture_events event ON event.seq=edge.prerequisite_seq
+JOIN intent_candidates candidate ON candidate.published_commit_oid=event.commit_oid
+JOIN publication_drain_events target ON target.event_seq=edge.dependent_seq
+WHERE candidate.id=? AND candidate.status IN ('published','superseded') AND event.state='published'
+ AND candidate.branch_ref=? AND candidate.branch_generation=?
+ AND edge.branch_ref=candidate.branch_ref AND edge.branch_generation=candidate.branch_generation
+ AND edge.strength='hard' AND target.drain_id=? ORDER BY edge.prerequisite_seq DESC LIMIT 1`,
+			id, drain.BranchRef, drain.BranchGeneration, drain.ID).Scan(&from, &to)
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
 	}
 	var safe bool
 	if err := db.ReadSQL().QueryRowContext(ctx, `SELECT
