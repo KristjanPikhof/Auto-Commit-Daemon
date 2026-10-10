@@ -69,8 +69,8 @@ func TestFlush_LogicalCommitsWithin2s(t *testing.T) {
 	// Drop a file change under the threshold. A single edit cannot reach
 	// IntentMinPending=10, so without the flush bypass the daemon would
 	// wait the full IntentMaxPendingAge (5m) before publishing.
-	target := filepath.Join(repo, "flush-target.txt")
-	if err := os.WriteFile(target, []byte("flush me\n"), 0o644); err != nil {
+	target := filepath.Join(repo, "flush-target.md")
+	if err := os.WriteFile(target, []byte("# Logical flush reference\n\nRequest immediate review of protected captures at a logical boundary.\n"), 0o644); err != nil {
 		t.Fatalf("write target file: %v", err)
 	}
 
@@ -116,10 +116,11 @@ func TestFlush_LogicalCommitsWithin2s(t *testing.T) {
 	}
 	if !advanced {
 		dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-		t.Fatalf("flush --logical did not advance HEAD within 2s\nbefore=%s\nstill=%s\nflush stdout=%s\nflush stderr=%s\nstate.db=%s",
+		diagnostic := sqliteExec(t, dbPath, `SELECT id,status,purpose,atomicity_summary FROM intent_candidates; SELECT fingerprint,resolution_mode,progress_state FROM intent_plan_runs;`)
+		t.Fatalf("flush --logical did not advance HEAD within 2s\nbefore=%s\nstill=%s\nflush stdout=%s\nflush stderr=%s\nstate.db=%s\nintent state=%s",
 			headBefore,
 			strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")),
-			flushRes.Stdout, flushRes.Stderr, dbPath)
+			flushRes.Stdout, flushRes.Stderr, dbPath, diagnostic)
 	}
 }
 
