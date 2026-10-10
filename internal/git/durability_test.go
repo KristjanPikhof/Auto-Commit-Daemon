@@ -145,6 +145,31 @@ func TestEnsureCheckpointRefRejectsCollision(t *testing.T) {
 	}
 }
 
+func TestFinishWorkerPrivateTargetPin(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	tree, err := WriteTreeDurable(ctx, repo, filepath.Join(t.TempDir(), "target.index"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := CommitTreeDurable(ctx, repo, tree, "finish target", "ACD Checkpoint", "checkpoint@localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := FinishRefPrefix + "worktree/request/target"
+	created, err := EnsurePrivateRefDurable(ctx, repo, FinishRefPrefix, ref, commit)
+	if err != nil || !created {
+		t.Fatalf("create private target=%t error=%v", created, err)
+	}
+	created, err = EnsurePrivateRefDurable(ctx, repo, FinishRefPrefix, ref, commit)
+	if err != nil || created {
+		t.Fatalf("identical pin=%t error=%v", created, err)
+	}
+	if _, err := EnsurePrivateRefDurable(ctx, repo, FinishRefPrefix, "refs/heads/unsafe", commit); err == nil {
+		t.Fatal("target pin escaped its private namespace")
+	}
+}
+
 func TestEnsureCheckpointRefSupportsSHA256Repository(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
