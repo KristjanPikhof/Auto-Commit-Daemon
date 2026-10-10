@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -70,7 +71,8 @@ type FinishDisclosure struct {
 	TextChangeIDs    []string `json:"text_change_ids,omitempty"`
 	BinaryChangeIDs  []string `json:"binary_change_ids,omitempty"`
 	Redacted         bool     `json:"redacted"`
-	RequestBytes     []int    `json:"request_bytes,omitempty"`
+	// RequestBytes measures encoded attempted exchanges, not peer receipt.
+	RequestBytes []int `json:"request_bytes,omitempty"`
 }
 
 type FinishPlanResult struct {
@@ -144,8 +146,8 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 	if options.Style != finish.StyleImperative && options.Style != finish.StyleConventional {
 		return result, finishFailure("invalid_options", errors.New("unsupported message style"))
 	}
-	if !utf8.ValidString(options.Purpose) {
-		return result, finishFailure("invalid_options", errors.New("purpose is not valid UTF-8"))
+	if err := finish.ValidatePurpose(options.Purpose); err != nil {
+		return result, finishFailure("invalid_options", err)
 	}
 	if options.Message != "" {
 		if err := finish.ValidateMessage(options.Style, options.Message); err != nil {
@@ -176,8 +178,7 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		return result, err
 	}
 	disclosure.Provider = transport.Name()
-	result.Disclosure = disclosure
-	for call := 0; call < 2; call++ {
+	for call := 0; ; call++ {
 		body, err := transport.EncodeFinishRequest(request)
 		if err != nil {
 			return result, finishFailure("provider_input", err)
@@ -195,6 +196,9 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		}
 		if err := ctx.Err(); err != nil {
 			return result, finishFailure("provider_deadline", err)
+		}
+		if result.Calls == 0 {
+			result.Disclosure = disclosure
 		}
 		result.Calls++
 		result.Disclosure.RequestBytes = append(result.Disclosure.RequestBytes, len(body))
@@ -225,17 +229,16 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 			return result, finishFailure("invalid_provider_plan", validationErr)
 		}
 		request.Correction = &FinishCorrection{
-			PreviousOutput:  RedactDiffSecrets(strings.ToValidUTF8(string(raw), "�")),
+			PreviousOutput:  finishRedactText(strings.ToValidUTF8(string(raw), "�")),
 			ValidationError: finishCorrectionError(validationErr),
 		}
 	}
-	panic("unreachable")
 }
 
 func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (FinishPlanRequest, FinishDisclosure, error) {
-	request := FinishPlanRequest{Style: options.Style, Purpose: RedactDiffSecrets(options.Purpose), Message: options.Message, DiffIncluded: options.DiffEgress}
-	disclosure := FinishDisclosure{MetadataIncluded: true, PurposeIncluded: options.Purpose != "", MessageIncluded: options.Message != "", Redacted: request.Purpose != options.Purpose}
-	ids := make(map[string]bool, len(evidence.Changes))
+	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress}
+	disclosure := FinishDisclosure{MetadataIncluded: true, PurposeIncluded: options.Purpose != "", MessageIncluded: options.Message != "", Redacted: request.Purpose != options.Purpose || request.Message != options.Message}
+	ids := make(map[string]finish.Change, len(evidence.Changes))
 	for _, change := range evidence.Changes {
 		identifiers := append([]string{change.ID, change.Author, change.AtomicGroup}, change.DependsOn...)
 		for _, identifier := range identifiers {
@@ -243,7 +246,7 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 				return request, disclosure, finishFailure("invalid_evidence", errors.New("recorded identifiers must be valid UTF-8"))
 			}
 		}
-		ids[change.ID] = true
+		ids[change.ID] = change
 		// Provenance belongs to local immutable state, never provider context.
 		change.Provenance = ""
 		change.DependsOn = slices.Clone(change.DependsOn)
@@ -251,13 +254,19 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 	}
 	seen := make(map[string]bool)
 	total := 0
+	transmittedTotal := 0
 	for _, diff := range options.Diffs {
-		if !ids[diff.ChangeID] || seen[diff.ChangeID] || diff.BeforeSize < 0 || diff.AfterSize < 0 || !utf8.ValidString(diff.Text) {
+		change, exists := ids[diff.ChangeID]
+		if !exists || seen[diff.ChangeID] || diff.BeforeSize < 0 || diff.AfterSize < 0 || !utf8.ValidString(diff.Text) {
 			return request, disclosure, finishFailure("invalid_evidence", errors.New("diff metadata must identify one recorded change with valid text and nonnegative sizes"))
 		}
 		seen[diff.ChangeID] = true
 		if diff.Binary && diff.Text != "" {
 			return request, disclosure, finishFailure("invalid_evidence", errors.New("binary content cannot be sent as text"))
+		}
+		gitlink := change.Before.Mode == "160000" || change.After.Mode == "160000"
+		if options.DiffEgress && !diff.Binary && !gitlink && diff.Text == "" {
+			return request, disclosure, finishFailure("invalid_evidence", errors.New("approved textual diff evidence is unavailable for a recorded change"))
 		}
 		if diff.Binary {
 			disclosure.BinaryChangeIDs = append(disclosure.BinaryChangeIDs, diff.ChangeID)
@@ -273,10 +282,17 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 			return request, disclosure, finishInputLimit(total, IntentGoalEvidenceTotalDiffCap)
 		}
 		if diff.Text != "" {
-			redacted := RedactDiffSecrets(diff.Text)
+			redacted := finishRedactText(diff.Text)
 			disclosure.Redacted = disclosure.Redacted || redacted != diff.Text
 			diff.Text = redacted
 			disclosure.TextChangeIDs = append(disclosure.TextChangeIDs, diff.ChangeID)
+		}
+		if len(diff.Text) > IntentStageDiffCap {
+			return request, disclosure, finishInputLimit(len(diff.Text), IntentStageDiffCap)
+		}
+		transmittedTotal += len(diff.Text)
+		if transmittedTotal > IntentGoalEvidenceTotalDiffCap {
+			return request, disclosure, finishInputLimit(transmittedTotal, IntentGoalEvidenceTotalDiffCap)
 		}
 		request.Diffs = append(request.Diffs, diff)
 	}
@@ -289,9 +305,12 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 // Correction errors retain their full validation detail. Operator errors are
 // bounded separately; clipping here would hide the reason for a rejected plan.
 func finishCorrectionError(err error) string {
-	text := RedactDiffSecrets(err.Error())
-	text = plannerErrorOpenAIKeyPattern.ReplaceAllString(text, "[REDACTED]")
+	text := finishRedactText(err.Error())
 	return plannerErrorURLPattern.ReplaceAllStringFunc(text, sanitizePlannerErrorURL)
+}
+
+func finishRedactText(text string) string {
+	return plannerErrorOpenAIKeyPattern.ReplaceAllString(RedactDiffSecrets(text), redactedSecret)
 }
 
 func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, error) {
@@ -309,18 +328,70 @@ func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOp
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return finish.Plan{}, errors.New("provider output must contain exactly one JSON object")
 	}
-	if options.Message != "" && (len(output.Goals) != 1 || output.Goals[0].Message != options.Message) {
+	if options.Message != "" && (len(output.Goals) != 1 || output.Goals[0].Message != finishRedactText(options.Message)) {
 		return finish.Plan{}, errors.New("supplied message requires one complete batch goal with the exact supplied message")
 	}
 	for _, goal := range output.Goals {
-		if err := finish.ValidateMessage(options.Style, goal.Message); err != nil {
+		message := goal.Message
+		if options.Message != "" {
+			message = options.Message
+		}
+		if err := finish.ValidateMessage(options.Style, message); err != nil {
 			return finish.Plan{}, err
 		}
 		if len(output.Goals) > 1 && strings.TrimSpace(goal.Boundary) == "" {
 			return finish.Plan{}, errors.New("every split goal requires a useful review or revert boundary")
 		}
+		if options.Message == "" {
+			if err := validateFinishGoalQuality(goal, evidence, options); err != nil {
+				return finish.Plan{}, err
+			}
+		}
 	}
-	return finish.Build(evidence, output.Goals)
+	plan, err := finish.Build(evidence, output.Goals)
+	if err != nil {
+		return finish.Plan{}, err
+	}
+	if options.Message != "" {
+		plan.Steps[0].Message = options.Message
+	}
+	return plan, nil
+}
+
+var finishVerificationClaim = regexp.MustCompile(`(?im)^(?:- )?(?:(?:all|the) )?(?:tests?|checks?|test suite|verification|build|lint)(?: (?:have|has|all))? (?:passed|pass|succeeded|successful|green)\b|\b(?:passed|verified) (?:all )?(?:tests?|checks?|test suite|build|lint)\b|\b(?:ran|executed) [\x60'"]?(?:go test|npm test|make test|pytest|tests|checks)\b`)
+
+func validateFinishGoalQuality(goal finish.Goal, evidence finish.Evidence, options FinishOptions) error {
+	paths := make(map[string]struct{})
+	selected := make(map[string]bool)
+	for _, id := range goal.ChangeIDs {
+		selected[id] = true
+	}
+	for _, change := range evidence.Changes {
+		if selected[change.ID] {
+			paths[change.Path] = struct{}{}
+		}
+	}
+	subject, body, _ := strings.Cut(goal.Message, "\n\n")
+	if isGenericSubject(subject) || isFilenameOnlySubject(subject, paths) || isTokenOnlySubject(subject) {
+		return errors.New("goal message must describe a completed semantic change, not generic edits, a filename, or a symbol")
+	}
+	if len(strings.Fields(goal.Purpose)) < 2 || isGenericSubject(goal.Purpose) || isFilenameOnlySubject(goal.Purpose, paths) {
+		return errors.New("goal purpose must explain the completed change, not a filename or generic edits")
+	}
+	if goal.Boundary != "" && len(strings.Fields(goal.Boundary)) < 3 {
+		return errors.New("split boundary must explain why this goal is useful to review or revert")
+	}
+	if finishVerificationClaim.MatchString(goal.Message) {
+		return errors.New("message cannot claim tests or verification ran or passed: no recorded verification results were supplied")
+	}
+	if options.DiffEgress && strings.Contains(strings.ToLower(goal.Purpose+" "+subject), "default") {
+		for _, diff := range options.Diffs {
+			if selected[diff.ChangeID] && strings.Contains(strings.ToLower(diff.Text), "default") && strings.TrimSpace(body) == "" {
+				return errors.New("default-setting goal needs body bullets explaining the grounded reason or impact")
+			}
+		}
+	}
+	return nil
 }
 
 type finishOutputError struct {
