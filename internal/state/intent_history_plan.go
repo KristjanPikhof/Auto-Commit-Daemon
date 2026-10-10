@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-const IntentHistoryPlanVersion = 1
+const IntentHistoryPlanVersion = 2
 const IntentHistoryPlanByteCap = 8 << 20
 const MetaKeyIntentHistoryRequest = "intent.history.request"
 const MetaKeyIntentHistoryWorker = "intent.history.worker"
@@ -41,21 +43,29 @@ type IntentHistoryGoal struct {
 	Units               []int    `json:"units"`
 	TreeOID             string   `json:"tree_oid"`
 	DependsOnCandidates []string `json:"depends_on_candidates,omitempty"`
+	OldOIDs             []string `json:"old_oids,omitempty"`
+	AuthorOID           string   `json:"author_oid,omitempty"`
 }
 
 // IntentHistoryPlan freezes both original provenance and proposed goal trees.
 // Explicit reconstruction creates a new branch and leaves the source untouched.
 type IntentHistoryPlan struct {
-	Version         int                 `json:"version"`
-	ID              string              `json:"id"`
-	SourceBranchRef string              `json:"source_branch_ref"`
-	TargetBranchRef string              `json:"target_branch_ref"`
-	ExpectedHead    string              `json:"expected_head"`
-	CommitFormat    string              `json:"commit_format"`
-	BaseTree        string              `json:"base_tree"`
-	SourceChain     []string            `json:"source_chain"`
-	Units           []IntentHistoryUnit `json:"units"`
-	Goals           []IntentHistoryGoal `json:"goals"`
+	Version                  int                 `json:"version"`
+	ID                       string              `json:"id"`
+	SourceBranchRef          string              `json:"source_branch_ref"`
+	TargetBranchRef          string              `json:"target_branch_ref"`
+	ExpectedHead             string              `json:"expected_head"`
+	CommitFormat             string              `json:"commit_format"`
+	BaseTree                 string              `json:"base_tree"`
+	SourceChain              []string            `json:"source_chain"`
+	Units                    []IntentHistoryUnit `json:"units"`
+	Goals                    []IntentHistoryGoal `json:"goals"`
+	Mode                     string              `json:"mode"`
+	MessagesOnly             bool                `json:"messages_only"`
+	RecreateUnchanged        []string            `json:"recreate_unchanged,omitempty"`
+	SourceRef                string              `json:"source_ref"`
+	VerificationConfigDigest string              `json:"verification_config_digest"`
+	SharedPlan               *finish.Plan        `json:"shared_plan,omitempty"`
 }
 
 type IntentHistoryRequest struct {
@@ -122,7 +132,7 @@ func LoadIntentHistoryPlan(ctx context.Context, db *DB, id string) (IntentHistor
 	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
 		return plan, false, err
 	}
-	if plan.Version != IntentHistoryPlanVersion || plan.ID != id {
+	if (plan.Version != 1 && plan.Version != IntentHistoryPlanVersion) || plan.ID != id {
 		return plan, false, errors.New("state: invalid history plan identity")
 	}
 	return plan, true, nil
