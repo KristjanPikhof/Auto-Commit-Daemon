@@ -290,6 +290,8 @@ one commit per capture; Intent mode may create several semantically atomic
 commits. The command never combines everything into one commit merely because
 of its name. If the terminal disconnects or the worker restarts, publication
 continues and the next `acd commit-all --yes` reconnects to the same drain.
+While waiting, the command follows that exact run even when newer work creates
+another run.
 This is a priority request: ACD interrupts background planning and reviews the
 protected target immediately. It brings an existing goal-review deadline
 forward once, without relaxing commit quality. For the first five minutes,
