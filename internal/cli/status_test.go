@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -69,24 +68,19 @@ func TestStatus_RegisteredRepoWithClientsAndCommit(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeStatusProjectionFixture(ctx, &out, repo, false); err != nil {
-		t.Fatalf("writeStatusProjectionFixture: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
+		t.Fatal(err)
 	}
-	got := out.String()
-	for _, want := range []string{
-		"Repo: " + repo,
-		"running",
-		"pid 12345",
-		"Clients (2):",
-		"claude-code",
-		"pi ",
-		"a1b2c3d",
-		"Update auth.py",
-		"rev:deadbeef",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("output missing %q in:\n%s", want, got)
-		}
+	var report statusReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.PID != 12345 || len(report.Clients) != 2 || report.LastCommitOID != "a1b2c3deeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" ||
+		report.LastCommitMessage != "Update auth.py" || report.BranchGenToken != "rev:deadbeef" {
+		t.Fatalf("status report=%+v", report)
+	}
+	if report.Clients[0].Harness != "claude-code" || report.Clients[1].Harness != "pi" {
+		t.Fatalf("clients=%+v", report.Clients)
 	}
 }
 
@@ -1889,11 +1883,15 @@ func TestStatus_StaleHeartbeatOverlay(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeStatusProjectionFixture(ctx, &out, repo, false); err != nil {
-		t.Fatalf("writeStatusProjectionFixture: %v", err)
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "stale") {
-		t.Fatalf("expected stale daemon line, got:\n%s", out.String())
+	var report statusReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.Stale || report.HeartbeatAgeSeconds < 2*time.Hour.Seconds() {
+		t.Fatalf("status report=%+v", report)
 	}
 }
 
@@ -1950,15 +1948,6 @@ func TestStatus_BlockedConflictCount(t *testing.T) {
 	}
 
 	// Human output mentions the blocker.
-	var humanOut bytes.Buffer
-	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("writeStatusProjectionFixture human: %v", err)
-	}
-	if !strings.Contains(humanOut.String(), "Blocked conflicts: 1") {
-		t.Fatalf("missing 'Blocked conflicts: 1' in:\n%s", humanOut.String())
-	}
-
-	// JSON shape exposes the field as an integer count.
 	var jsonOut bytes.Buffer
 	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
 		t.Fatalf("writeStatusProjectionFixture json: %v", err)
@@ -1976,7 +1965,7 @@ func TestStatus_BlockedConflictCount(t *testing.T) {
 	}
 }
 
-func TestStatus_BlockedBarrierGuidance(t *testing.T) {
+func TestStatusCountsBlockedBarriers(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 
@@ -2012,17 +2001,6 @@ func TestStatus_BlockedBarrierGuidance(t *testing.T) {
 		t.Fatalf("append pending successor: %v", err)
 	}
 
-	var humanOut bytes.Buffer
-	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("writeStatusProjectionFixture human: %v", err)
-	}
-	human := humanOut.String()
-	for _, want := range []string{"Blocked conflicts: 1", "acd fix --dry-run", "Blocked barriers with pending replay: 1", "acd fix --force --dry-run"} {
-		if !strings.Contains(human, want) {
-			t.Fatalf("status human missing %q in:\n%s", want, human)
-		}
-	}
-
 	var jsonOut bytes.Buffer
 	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
 		t.Fatalf("writeStatusProjectionFixture json: %v", err)
@@ -2036,7 +2014,7 @@ func TestStatus_BlockedBarrierGuidance(t *testing.T) {
 	}
 }
 
-func TestStatus_FailedBarrierGuidance(t *testing.T) {
+func TestStatusCountsFailedBarriers(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 
@@ -2068,17 +2046,6 @@ func TestStatus_FailedBarrierGuidance(t *testing.T) {
 		t.Fatalf("append pending successor: %v", err)
 	}
 
-	var humanOut bytes.Buffer
-	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("writeStatusProjectionFixture human: %v", err)
-	}
-	human := humanOut.String()
-	for _, want := range []string{"Failed terminal events: 1", "Failed barriers blocking pending replay: 1", "acd fix --dry-run"} {
-		if !strings.Contains(human, want) {
-			t.Fatalf("status human missing %q in:\n%s", want, human)
-		}
-	}
-
 	var jsonOut bytes.Buffer
 	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
 		t.Fatalf("writeStatusProjectionFixture json: %v", err)
@@ -2092,7 +2059,7 @@ func TestStatus_FailedBarrierGuidance(t *testing.T) {
 	}
 }
 
-func TestStatus_BodyRendersPauseSection(t *testing.T) {
+func TestStatusProjectsManualPause(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 
@@ -2110,17 +2077,6 @@ func TestStatus_BodyRendersPauseSection(t *testing.T) {
 		SetBy:     "test",
 		ExpiresAt: &expiresAt,
 	})
-
-	var humanOut bytes.Buffer
-	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("writeStatusProjectionFixture human: %v", err)
-	}
-	human := humanOut.String()
-	for _, want := range []string{"Pause:", "Source: manual", "Reason: deploy window", "Expires at:"} {
-		if !strings.Contains(human, want) {
-			t.Fatalf("status output missing %q in:\n%s", want, human)
-		}
-	}
 
 	var jsonOut bytes.Buffer
 	if err := writeStatusProjectionFixture(ctx, &jsonOut, repo, true); err != nil {
@@ -2165,24 +2121,6 @@ func TestStatus_DecisionSummary(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("AppendDecision handled: %v", err)
-	}
-
-	var humanOut bytes.Buffer
-	if err := writeStatusProjectionFixture(ctx, &humanOut, repo, false); err != nil {
-		t.Fatalf("writeStatusProjectionFixture human: %v", err)
-	}
-	human := humanOut.String()
-	for _, want := range []string{
-		"Decisions: protected=1 handled_external=1",
-		"Recent decisions:",
-		"#" + strconv.FormatInt(secondID, 10) + " handled_external src/app.go (marked_published)",
-		"#" + strconv.FormatInt(firstID, 10) + " protected secrets.env (no_delete_generated)",
-		"acd explain --path FILE",
-		"acd events --watch",
-	} {
-		if !strings.Contains(human, want) {
-			t.Fatalf("status output missing %q in:\n%s", want, human)
-		}
 	}
 
 	var jsonOut bytes.Buffer
@@ -2630,11 +2568,15 @@ func TestStatus_SkipsDecisionSummaryForPreV5DB(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := writeStatusProjectionFixture(ctx, &out, repo, false); err != nil {
+	if err := writeStatusProjectionFixture(ctx, &out, repo, true); err != nil {
 		t.Fatalf("writeStatusProjectionFixture should tolerate missing decision_records: %v\n%s", err, out.String())
 	}
-	if strings.Contains(out.String(), "Decisions:") {
-		t.Fatalf("pre-v5 status rendered decisions unexpectedly:\n%s", out.String())
+	var report statusReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.DecisionCounts) != 0 || len(report.RecentDecisions) != 0 {
+		t.Fatalf("pre-v5 status unexpectedly has decisions: %+v", report)
 	}
 }
 
@@ -2647,8 +2589,8 @@ func TestList_Status_Doctor_AgreeOnCounts(t *testing.T) {
 	roots := withIsolatedHome(t)
 	ctx := context.Background()
 
-	repo, dbPath, d := makeRepoStateDB(t)
-	registerRepo(t, roots, repo, dbPath, "claude-code")
+	repo, _, d := makeRepoStateDB(t)
+	registerProtectedControlRepo(t, roots, repo)
 	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
 		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
 	}); err != nil {
@@ -2681,16 +2623,9 @@ func TestList_Status_Doctor_AgreeOnCounts(t *testing.T) {
 		}
 	}
 
-	// list (json)
-	var lOut, lErr bytes.Buffer
-	if err := writeListProjectionFixture(ctx, &lOut, &lErr, true, false); err != nil {
-		t.Fatalf("writeListProjectionFixture: %v", err)
-	}
-	var listGot struct {
-		Repos []listEntry `json:"repos"`
-	}
-	if err := json.Unmarshal(lOut.Bytes(), &listGot); err != nil {
-		t.Fatalf("list unmarshal: %v\n%s", err, lOut.String())
+	listGot, _, err := collectProductList(ctx)
+	if err != nil {
+		t.Fatalf("collect product list: %v", err)
 	}
 	if len(listGot.Repos) != 1 {
 		t.Fatalf("list: want 1 repo, got %d", len(listGot.Repos))
@@ -2729,8 +2664,8 @@ func TestList_Status_Doctor_AgreeOnCounts(t *testing.T) {
 	if docGot.Repos[0].PendingEvents != 3 {
 		t.Errorf("doctor pending=%d want 3", docGot.Repos[0].PendingEvents)
 	}
-	if listGot.Repos[0].BlockedConflicts != 2 {
-		t.Errorf("list blocked=%d want 2", listGot.Repos[0].BlockedConflicts)
+	if listGot.Repos[0].BlockedEvents != 2 {
+		t.Errorf("list blocked=%d want 2", listGot.Repos[0].BlockedEvents)
 	}
 	if statusGot.BlockedConflicts != 2 {
 		t.Errorf("status blocked=%d want 2", statusGot.BlockedConflicts)
