@@ -332,9 +332,22 @@ func (w *FinishWorker) protect(ctx context.Context, wt git.Worktree, cfg FinishW
 	branch, head, err := finishBranchHead(ctx, wt.Root)
 	if err != nil {
 		branch = ""
-		head = ""
+		head, _ = git.RevParse(ctx, wt.Root, "HEAD")
 	} // Protection remains independent of unsafe publication state.
 	opts := cfg.Capture
+	base, err := readFinishTree(ctx, wt.Root, head)
+	if err != nil {
+		return state.Checkpoint{}, err
+	}
+	opts.SubmodulePaths = maps.Clone(opts.SubmodulePaths)
+	if opts.SubmodulePaths == nil {
+		opts.SubmodulePaths = map[string]bool{}
+	}
+	for path, entry := range base {
+		if entry.Mode == "160000" {
+			opts.SubmodulePaths[path] = true
+		}
+	}
 	opts.WorktreeID = checkpoint.WorktreeID(wt.Root)
 	opts.GitDir = wt.GitDir
 	opts.CheckpointStore = &checkpoint.Store{DB: w.DB}
@@ -618,16 +631,29 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 	if r.Target.WorktreeID != checkpoint.WorktreeID(wt.Root) || r.Target.ConfigDigest != digest {
 		return w.fail(r, state.ErrFinishIdentity)
 	}
-	if err := git.CheckFinishPublicationSafety(ctx, wt.Root, r.Target.BranchRef, r.Target.ExpectedHead, r.Target.IndexDigest, r.Target.IncludeStaged); err != nil {
+	planningCtx := ctx
+	if cfg.Mode == "intent" {
+		var planningCancel context.CancelFunc
+		planningCtx, planningCancel = context.WithDeadline(ctx, finishDeadline(r))
+		defer planningCancel()
+		if err := planningCtx.Err(); err != nil {
+			return w.fail(r, &ai.FinishPlanningError{Code: "provider_deadline", Err: err})
+		}
+	}
+	if err := git.CheckFinishPublicationSafety(planningCtx, wt.Root, r.Target.BranchRef, r.Target.ExpectedHead, r.Target.IndexDigest, r.Target.IncludeStaged); err != nil {
 		return w.fail(r, err)
 	}
-	evidence, baseTree, err := w.evidence(ctx, wt, r.Target, cfg)
+	evidence, baseTree, err := w.evidence(planningCtx, wt, r.Target, cfg)
 	if err != nil {
 		return w.fail(r, err)
 	}
 	if maps.Equal(evidence.Base, evidence.Target) {
 		result, _ := json.Marshal(FinishResult{DryRun: r.DryRun, NoChanges: true})
-		return state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishCompleted, Result: result})
+		completed, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishCompleted, Result: result})
+		if err != nil {
+			return w.fail(r, err)
+		}
+		return completed, nil
 	}
 	evalCtx, cancel := w.evaluationContext(ctx, wt, cfg, digest, r)
 	defer cancel()
@@ -646,7 +672,9 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 		}
 		if err == nil {
 			var diffs []ai.FinishDiff
-			diffs, err = finishProviderDiffs(evalCtx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress)
+			diffCtx, diffCancel := context.WithDeadline(evalCtx, finishDeadline(r))
+			diffs, err = finishProviderDiffs(diffCtx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress)
+			diffCancel()
 			if err == nil {
 				var planned ai.FinishPlanResult
 				planned, err = ai.PlanFinish(evalCtx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, BeforeCall: func(callCtx context.Context) error {
@@ -706,13 +734,17 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 	}
 	if r.DryRun {
 		result, _ := json.Marshal(FinishResult{DryRun: true})
-		return state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishCompleted, Plan: raw, Result: result})
+		completed, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishCompleted, Plan: raw, Result: result})
+		if err != nil {
+			return w.failPlan(r, saved, err)
+		}
+		return completed, nil
 	}
-	r, err = state.PrepareFinishPublication(ctx, w.DB, r.ID, r.Attempt, proof, raw)
+	prepared, err := state.PrepareFinishPublication(ctx, w.DB, r.ID, r.Attempt, proof, raw)
 	if err != nil {
-		return w.fail(r, err)
+		return w.failPlan(r, saved, err)
 	}
-	return w.publish(ctx, wt, r, false)
+	return w.publish(ctx, wt, prepared, false)
 }
 
 func (w *FinishWorker) fail(r state.FinishRequest, cause error) (state.FinishRequest, error) {
@@ -732,6 +764,10 @@ func (w *FinishWorker) failPlan(r state.FinishRequest, plan FinishSavedPlan, cau
 	var raw json.RawMessage
 	if len(plan.Steps) > 0 || plan.Disclosure.MetadataIncluded {
 		raw, _ = json.Marshal(plan)
+		if len(raw) > state.FinishJSONByteCap {
+			raw = nil
+			code = "finish_plan_too_large"
+		}
 	}
 	failed, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishFailed, Plan: raw, ReasonCode: code, Reason: ai.SanitizePlannerError(cause.Error())})
 	return failed, errors.Join(cause, err)
@@ -814,8 +850,11 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 		}
 		if !diff.Binary {
 			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, ai.IntentStageDiffCap+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", base, target, "--", ":(literal)"+change.Path)
+			if errors.Is(err, git.ErrStdoutOverflow) || len(out) > ai.IntentStageDiffCap {
+				return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diff is at least %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", len(out), ai.IntentStageDiffCap)}
+			}
 			if err != nil {
-				return nil, fmt.Errorf("provider_input_too_large: exact textual diff exceeds %d bytes: %w", ai.IntentStageDiffCap, err)
+				return nil, err
 			}
 			if strings.ContainsRune(string(out), 0) || !utf8.Valid(out) {
 				diff.Binary = true

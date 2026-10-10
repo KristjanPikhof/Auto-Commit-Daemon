@@ -449,7 +449,7 @@ func TestFinishWorkerCredentialRefreshRetriesSameTarget(t *testing.T) {
 		}
 		plan := string(completeFinishTestPlan(ai.FinishPlanRequest{Changes: []finish.Change{{ID: "goal.txt"}}}))
 		writer.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(writer).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]string{"content": plan}}}})
+		_ = json.NewEncoder(writer).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"type": "function", "function": map[string]string{"name": "finish_plan", "arguments": plan}}}}}}})
 	}))
 	defer server.Close()
 	w.Config.Mode = "intent"
@@ -468,5 +468,47 @@ func TestFinishWorkerCredentialRefreshRetriesSameTarget(t *testing.T) {
 	completed, err := w.Execute(context.Background(), retry.ID)
 	if err != nil || completed.State != state.FinishCompleted || calls.Load() != 1 {
 		t.Fatalf("credential refreshed %+v calls=%d: %v", completed, calls.Load(), err)
+	}
+}
+
+func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
+	for _, scenario := range []string{"expired", "oversized"} {
+		t.Run(scenario, func(t *testing.T) {
+			f, w := finishWorkerFixture(t)
+			body := "goal\n"
+			if scenario == "oversized" {
+				body = strings.Repeat("x", ai.IntentStageDiffCap+1024)
+			}
+			finishWrite(t, f.dir, "goal.txt", body)
+			p := &finishTestTransport{exchange: func(_ context.Context, r ai.FinishPlanRequest) ([]byte, error) { return completeFinishTestPlan(r), nil }}
+			w.Transport = p
+			w.Config.Mode = "intent"
+			w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
+			w.Config.Provider.Timeout = time.Second
+			if scenario == "expired" {
+				w.Config.Provider.Timeout = 100 * time.Millisecond
+			} else {
+				w.Config.Provider.DiffEgress = true
+			}
+			r := startFinishWorker(t, w, FinishOptions{})
+			if scenario == "expired" {
+				ctx, cancel := context.WithDeadline(context.Background(), finishDeadline(r))
+				<-ctx.Done()
+				cancel()
+			}
+			failed, err := w.Execute(context.Background(), r.ID)
+			if err == nil || failed.State != state.FinishFailed || p.calls.Load() != 0 {
+				t.Fatalf("bounded preparation %+v calls=%d: %v", failed, p.calls.Load(), err)
+			}
+			if scenario == "expired" && failed.ReasonCode != "provider_deadline" {
+				t.Fatalf("deadline reason %s", failed.ReasonCode)
+			}
+			if scenario == "oversized" && (failed.ReasonCode != "provider_input_too_large" || !strings.Contains(failed.Reason, "local finish") || !strings.Contains(failed.Reason, "bytes")) {
+				t.Fatalf("input guidance %s %s", failed.ReasonCode, failed.Reason)
+			}
+			if head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD"); head != r.Target.ExpectedHead {
+				t.Fatal("failed preparation published")
+			}
+		})
 	}
 }
