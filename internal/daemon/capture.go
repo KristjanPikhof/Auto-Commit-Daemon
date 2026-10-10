@@ -984,6 +984,54 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 	return summary, nil
 }
 
+// protectionIndexCache avoids reparsing an unchanged native index on idle scans.
+// It stores only Gitlink paths; checkpoint protection never writes the index.
+type protectionIndexCache struct {
+	digest string
+	paths  map[string]bool
+}
+
+func protectionSubmodulePaths(ctx context.Context, repo string, base map[string]bool, cache *protectionIndexCache) (map[string]bool, error) {
+	if cache == nil {
+		cache = &protectionIndexCache{}
+	}
+	digest, err := git.IndexContentDigest(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	if cache.paths == nil || cache.digest != digest {
+		entries, err := git.LsFilesIndex(ctx, repo, "")
+		if err != nil {
+			return nil, err
+		}
+		paths := map[string]bool{}
+		for _, entry := range entries {
+			if entry.Mode == "160000" {
+				paths[entry.Path] = true
+			}
+		}
+		// A changed index may be used conservatively for this scan, but it
+		// cannot populate the cache under the earlier digest.
+		after, err := git.IndexContentDigest(ctx, repo)
+		if err != nil {
+			return nil, err
+		}
+		cache.paths = paths
+		cache.digest = ""
+		if after == digest {
+			cache.digest = digest
+		}
+	}
+	paths := make(map[string]bool, len(base)+len(cache.paths))
+	for path, excluded := range base {
+		paths[path] = excluded
+	}
+	for path := range cache.paths {
+		paths[path] = true
+	}
+	return paths, nil
+}
+
 // ProtectWorktree runs the universal safety path without classifying or
 // publishing capture events. The normal worker uses it for every observed
 // tree, including detached HEAD, conflicts and active Git operations.
