@@ -12,6 +12,8 @@
 
 ### Changed
 
+- Make `commit-all` interrupt background planning and request an immediate
+  goal review while keeping purposeful commit boundaries and safety checks.
 - Keep open goal paths and focused recorded evidence visible across planning
   windows. Include available source/test/reference companions before publishing.
 - Schema v30 adds commit lineage for repartitioned repairs without replacing
@@ -19,6 +21,8 @@
 
 ### Fixed
 
+- Restore known prerequisites after replacing a published candidate's ID.
+  Automatically resume protected runs stopped by that missing declaration.
 - Allow history reconstruction to read larger generated diffs while keeping
   provider evidence bounded and preserving every recorded file version.
 - Give history planners bounded feedback on conflicting capture assignments
