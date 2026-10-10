@@ -933,6 +933,9 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 				anchorErr = recoverCommitAllStagingReview(ctx, runtime, branchRef, generation)
 			}
 			if anchorErr == nil {
+				anchorErr = daemon.RequestIntentPublicationReview(ctx, runtime.db, branchRef, generation, time.Now())
+			}
+			if anchorErr == nil {
 				activeDrain, activeErr := daemon.ActivePublicationDrainForPair(
 					ctx, runtime.db, branchRef, generation)
 				if activeErr != nil {

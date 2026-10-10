@@ -176,7 +176,26 @@ func publicationEvaluationIdentity(ctx context.Context, repoRoot, gitDir string,
 	if err != nil {
 		return "", err
 	}
-	data, err := json.Marshal([]any{token, runtime.DesiredRevisionID, runtime.AppliedRevisionID, candidates, restores, restoreTS})
+	drain, err := PublicationDrainBarrierForPair(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
+	if err != nil {
+		return "", err
+	}
+	var drainID string
+	var urgency intentPublicationUrgency
+	if drain != nil {
+		drainID = drain.ID
+	} else {
+		// A new foreground request cancels background evaluation. Reattaching
+		// to an already active target must not cancel its provider work.
+		_, err = state.MetaGetJSON(ctx, db, metaKeyIntentPublicationUrgency, &urgency)
+		if err != nil {
+			return "", err
+		}
+		if urgency.BranchRef != cctx.BranchRef || urgency.BranchGeneration != cctx.BranchGeneration {
+			urgency = intentPublicationUrgency{}
+		}
+	}
+	data, err := json.Marshal([]any{token, runtime.DesiredRevisionID, runtime.AppliedRevisionID, candidates, restores, restoreTS, drainID, urgency})
 	if err != nil {
 		return "", err
 	}

@@ -14,6 +14,35 @@ import (
 
 const MetaKeyIntentSemanticRetry = "intent.semantic.retry"
 
+const metaKeyIntentPublicationUrgency = "intent.publication.urgency"
+
+type intentPublicationUrgency struct {
+	BranchRef        string  `json:"branch_ref"`
+	BranchGeneration int64   `json:"branch_generation"`
+	RequestedAtTS    float64 `json:"requested_at_ts"`
+}
+
+// A user request is a priority change, not new capture evidence. It grants
+// one immediate review; a subsequently scheduled wait remains a timed wait.
+func RequestIntentPublicationReview(ctx context.Context, db *state.DB, branch string, generation int64, now time.Time) error {
+	return state.MetaSetJSON(ctx, db, metaKeyIntentPublicationUrgency, intentPublicationUrgency{
+		BranchRef: branch, BranchGeneration: generation, RequestedAtTS: intentPlannerHealthTimestamp(now),
+	})
+}
+
+func expediteIntentSemanticRetry(ctx context.Context, db *state.DB, record IntentSemanticRetrySnapshot, input IntentCandidateEvaluation, now time.Time) (IntentSemanticRetrySnapshot, error) {
+	if len(input.TargetEventSeqs) == 0 || intentPlannerHealthTimestamp(now) >= record.RetryAtTS {
+		return record, nil
+	}
+	var urgency intentPublicationUrgency
+	found, err := state.MetaGetJSON(ctx, db, metaKeyIntentPublicationUrgency, &urgency)
+	if err != nil || !found || urgency.BranchRef != input.BranchRef || urgency.BranchGeneration != input.BranchGeneration || urgency.RequestedAtTS <= record.ScheduledAtTS {
+		return record, err
+	}
+	record.RetryAtTS = max(record.ScheduledAtTS, intentPlannerHealthTimestamp(now))
+	return record, saveIntentSemanticRetry(ctx, db, record)
+}
+
 // IntentSemanticRetrySnapshot is one bounded review cooldown for unchanged
 // capture evidence. It contains no captured source or provider response.
 type IntentSemanticRetrySnapshot struct {
