@@ -105,6 +105,10 @@ dependency-safe forced-aging window, or the maximum pending age can release
 work sooner. Window and high-water limits bound each planning pass, not the
 durable pending queue. A larger queue remains checkpoint-protected and is
 offered to the planner in bounded passes.
+If repeated edits to one path exceed the goal window, background planning saves
+the unpublished chain on a recovery ref and recaptures the current files for
+normal goal planning. The branch, live files, and staging stay intact. An active
+publication target remains frozen.
 Optional integrations may provide boundaries, but filesystem protection does
 not depend on them.
 
@@ -161,7 +165,10 @@ files, and staging stay intact; later edits keep entering checkpoints.
 
 Plans are immutable and are revalidated at apply. The final tree must equal
 the selected source HEAD, every recorded transition must belong to one goal,
-and edited renames must stay together. Author boundaries also remain intact.
+and edited renames must stay together. Author boundaries also remain intact:
+the planner receives anonymous author IDs, and a goal that combines authors is
+rejected during planning and saved-plan validation. Planning retries can split
+the goal before it is accepted.
 ACD never invents an intermediate file version. Reconstruction is bounded to
 256 source/output commits and 256 focused path chains; larger independent
 selections must be narrowed. Structural verification alone does not claim that
