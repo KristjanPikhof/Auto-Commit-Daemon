@@ -352,9 +352,19 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	boot := now()
 	store := checkpointpkg.Store{DB: opts.DB}
-	if err := store.RecoverPrepared(ctx, opts.RepoPath); err != nil {
-		logger.Warn("checkpoint recovery requires attention; new protection remains active", "err", err)
-	}
+	func() {
+		if opts.OperationGate != nil {
+			opts.OperationGate.RLock()
+			defer opts.OperationGate.RUnlock()
+		}
+		if opts.ProtectionGate != nil {
+			opts.ProtectionGate.Lock()
+			defer opts.ProtectionGate.Unlock()
+		}
+		if err := store.RecoverPrepared(ctx, opts.RepoPath); err != nil {
+			logger.Warn("checkpoint recovery requires attention; new protection remains active", "err", err)
+		}
+	}()
 	if !opts.FinishRecoveryDone {
 		worker := FinishWorker{RepoPath: opts.RepoPath, DB: opts.DB, OperationGate: opts.OperationGate, ProtectionGate: opts.ProtectionGate}
 		if _, err := worker.RecoverPrepared(ctx); err != nil {
