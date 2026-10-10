@@ -72,6 +72,8 @@ type OfferedCapture struct {
 	Fidelity     string              `json:"fidelity"`
 	DeferCount   int                 `json:"defer_count"`
 	CapturedDiff string              `json:"captured_diff,omitempty"`
+	// HistoryAuthor identifies an author boundary without exposing identity.
+	HistoryAuthor int `json:"history_author,omitempty"`
 
 	// Preserve truncation across normalization before native metadata is attached.
 	// Keep this transient field out of provider JSON.
