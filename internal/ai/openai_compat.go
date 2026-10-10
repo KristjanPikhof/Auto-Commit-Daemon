@@ -92,6 +92,7 @@ func openAICommitMessageParameters(format CommitFormat) map[string]any {
 		"properties": map[string]any{
 			"subject": map[string]any{
 				"type":        "string",
+				"maxLength":   SubjectCap,
 				"description": subjectDescription,
 			},
 			"body": map[string]any{
