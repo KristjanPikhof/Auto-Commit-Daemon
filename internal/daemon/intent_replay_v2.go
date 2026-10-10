@@ -1446,10 +1446,6 @@ func runtimeIntentDependencyHints(
 	return append(hardHints, softHints...)
 }
 
-func runtimeIntentChangeIDs(diff string) map[string]struct{} {
-	return runtimeIntentChangeIDsForPath("", diff)
-}
-
 func runtimeIntentChangeIDsForPath(sourcePath, diff string) map[string]struct{} {
 	const maxChanges = 64
 	out := make(map[string]struct{})
