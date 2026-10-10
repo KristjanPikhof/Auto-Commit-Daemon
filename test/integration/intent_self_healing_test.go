@@ -36,80 +36,7 @@ func TestIntentWorktreeReliability(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	peers := make([]string, 3)
-	peerEnvs := make([][]string, 3)
-	peerRemoved := make([]*bool, 3)
-	for i := range peers {
-		peers[i] = filepath.Join(t.TempDir(), fmt.Sprintf("peer-%d", i+1))
-		peerEnvs[i] = withIsolatedHome(t)
-		runGitOK(t, repo, "worktree", "add", "-q", "-b", fmt.Sprintf("intent-peer-%d", i+1), peers[i])
-		peer := peers[i]
-		removed := new(bool)
-		peerRemoved[i] = removed
-		t.Cleanup(func() {
-			if *removed {
-				return
-			}
-			if err := removeIntentWorktree(repo, peer); err != nil {
-				t.Errorf("cleanup linked worktree %s: %v", peer, err)
-			}
-		})
-	}
-
-	// Canonical ownership permits one linked-worktree worker at a time. Drive
-	// each peer through the same transition, prove poll wakes do not spam the
-	// log, then stop it before handing ownership to the next worktree.
-	for i, peer := range peers {
-		peerEnv := peerEnvs[i]
-		session := fmt.Sprintf("intent-peer-%d", i+1)
-		started := startSessionJSON(t, ctx, peerEnv, peer, session, "shell",
-			"ACD_FSNOTIFY_ENABLED=0")
-		active := true
-		t.Cleanup(func() {
-			if active {
-				if err := stopIntentTestWorker(t, peerEnv, peer, session); err != nil {
-					t.Errorf("cleanup %s: %v", session, err)
-				}
-			}
-		})
-		peerGitDir := strings.TrimSpace(runGitOK(t, peer, "rev-parse", "--absolute-git-dir"))
-		peerDB := filepath.Join(peerGitDir, "acd", "state.db")
-		waitFor(t, session+" running", 8*time.Second, func() bool {
-			return sqliteScalar(t, peerDB, "SELECT mode FROM daemon_state WHERE id=1") == "running"
-		})
-		head := strings.TrimSpace(runGitOK(t, peer, "rev-parse", "HEAD"))
-		runGitOK(t, peer, "checkout", "--quiet", "--detach", head)
-		for range 3 {
-			wakeSession(t, ctx, peerEnv, peer, session)
-		}
-		waitFor(t, session+" detached marker", 8*time.Second, func() bool {
-			return sqliteScalar(t, peerDB, "SELECT COUNT(*) FROM daemon_meta WHERE key='detached_head_paused'") == "1"
-		})
-		logText := readDaemonLogTail(t, peerEnv, started.RepoHash)
-		message := "detached HEAD detected; capture and publication paused for this worktree"
-		if got := strings.Count(logText, message); got != 1 {
-			t.Fatalf("%s detach logs=%d want 1\n%s", session, got, logText)
-		}
-		canonicalPeer, err := filepath.EvalSymlinks(peer)
-		if err != nil {
-			t.Fatalf("canonicalize %s: %v", peer, err)
-		}
-		for _, field := range []string{`"repo_hash":"` + started.RepoHash + `"`, `"worktree":"` + canonicalPeer + `"`, `"git_dir":"`} {
-			if !strings.Contains(logText, field) {
-				t.Fatalf("%s detach log missing context %s\n%s", session, field, logText)
-			}
-		}
-		runGitOK(t, peer, "checkout", "--quiet", fmt.Sprintf("intent-peer-%d", i+1))
-		wakeSession(t, ctx, peerEnv, peer, session)
-		waitFor(t, session+" reattached marker cleared", 8*time.Second, func() bool {
-			return sqliteScalar(t, peerDB, "SELECT COUNT(*) FROM daemon_meta WHERE key='detached_head_paused'") == "0"
-		})
-		if err := stopIntentTestWorker(t, peerEnv, peer, session); err != nil {
-			t.Fatalf("stop %s: %v", session, err)
-		}
-		active = false
-		runGitOK(t, peer, "checkout", "--quiet", "--detach", head)
-	}
+	peers := exerciseIntentPeerTransitions(t, ctx, repo)
 
 	var plannerCalls atomic.Int32
 	var rewriteCalls atomic.Int32
@@ -405,15 +332,80 @@ AND (SELECT value FROM daemon_meta WHERE key='protection.covered_epoch')=(SELECT
 		t.Fatalf("stop intent-self-healing: %v", err)
 	}
 	mainActive = false
-	for i, peer := range peers {
-		if err := removeIntentWorktree(repo, peer); err != nil {
-			t.Fatalf("remove linked worktree %s: %v", peer, err)
-		}
-		*peerRemoved[i] = true
-		if _, err := os.Stat(peer); !os.IsNotExist(err) {
-			t.Fatalf("linked worktree still exists after cleanup: %s err=%v", peer, err)
-		}
+}
+
+// exerciseIntentPeerTransitions checks canonical ownership and detach logging
+// for three linked worktrees before the main worktree starts publishing.
+func exerciseIntentPeerTransitions(t *testing.T, ctx context.Context, repo string) []string {
+	t.Helper()
+	peers := make([]string, 3)
+	for i := range peers {
+		peers[i] = filepath.Join(t.TempDir(), fmt.Sprintf("peer-%d", i+1))
+		runGitOK(t, repo, "worktree", "add", "-q", "-b", fmt.Sprintf("intent-peer-%d", i+1), peers[i])
+		peer := peers[i]
+		t.Cleanup(func() {
+			if err := removeIntentWorktree(repo, peer); err != nil {
+				t.Errorf("cleanup linked worktree %s: %v", peer, err)
+			}
+		})
 	}
+
+	// Canonical ownership permits one linked-worktree worker at a time. Drive
+	// each peer through the same transition, prove poll wakes do not spam the
+	// log, then stop it before handing ownership to the next worktree.
+	for i, peer := range peers {
+		peerEnv := withIsolatedHome(t)
+		session := fmt.Sprintf("intent-peer-%d", i+1)
+		started := startSessionJSON(t, ctx, peerEnv, peer, session, "shell",
+			"ACD_FSNOTIFY_ENABLED=0")
+		active := true
+		t.Cleanup(func() {
+			if active {
+				if err := stopIntentTestWorker(t, peerEnv, peer, session); err != nil {
+					t.Errorf("cleanup %s: %v", session, err)
+				}
+			}
+		})
+		peerGitDir := strings.TrimSpace(runGitOK(t, peer, "rev-parse", "--absolute-git-dir"))
+		peerDB := filepath.Join(peerGitDir, "acd", "state.db")
+		waitFor(t, session+" running", 8*time.Second, func() bool {
+			return sqliteScalar(t, peerDB, "SELECT mode FROM daemon_state WHERE id=1") == "running"
+		})
+		head := strings.TrimSpace(runGitOK(t, peer, "rev-parse", "HEAD"))
+		runGitOK(t, peer, "checkout", "--quiet", "--detach", head)
+		for range 3 {
+			wakeSession(t, ctx, peerEnv, peer, session)
+		}
+		waitFor(t, session+" detached marker", 8*time.Second, func() bool {
+			return sqliteScalar(t, peerDB, "SELECT COUNT(*) FROM daemon_meta WHERE key='detached_head_paused'") == "1"
+		})
+		logText := readDaemonLogTail(t, peerEnv, started.RepoHash)
+		message := "detached HEAD detected; capture and publication paused for this worktree"
+		if got := strings.Count(logText, message); got != 1 {
+			t.Fatalf("%s detach logs=%d want 1\n%s", session, got, logText)
+		}
+		canonicalPeer, err := filepath.EvalSymlinks(peer)
+		if err != nil {
+			t.Fatalf("canonicalize %s: %v", peer, err)
+		}
+		for _, field := range []string{`"repo_hash":"` + started.RepoHash + `"`, `"worktree":"` + canonicalPeer + `"`, `"git_dir":"`} {
+			if !strings.Contains(logText, field) {
+				t.Fatalf("%s detach log missing context %s\n%s", session, field, logText)
+			}
+		}
+		runGitOK(t, peer, "checkout", "--quiet", fmt.Sprintf("intent-peer-%d", i+1))
+		wakeSession(t, ctx, peerEnv, peer, session)
+		waitFor(t, session+" reattached marker cleared", 8*time.Second, func() bool {
+			return sqliteScalar(t, peerDB, "SELECT COUNT(*) FROM daemon_meta WHERE key='detached_head_paused'") == "0"
+		})
+		if err := stopIntentTestWorker(t, peerEnv, peer, session); err != nil {
+			t.Fatalf("stop %s: %v", session, err)
+		}
+		active = false
+		runGitOK(t, peer, "checkout", "--quiet", "--detach", head)
+	}
+
+	return peers
 }
 
 func containsIntentPath(paths []string, want string) bool {
