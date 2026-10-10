@@ -122,7 +122,7 @@ func TestIntentProjectRecordedConfigurationProvesReleaseGoal(t *testing.T) {
 		t.Fatalf("release goal guessed a relationship without recorded project proof: %v", err)
 	}
 	references := intentProjectReferenceContext(req.OfferedCaptures[0].Path, intentRecordedVersionProject, []string{req.OfferedCaptures[0].Path, req.OfferedCaptures[1].Path})
-	req.OfferedCaptures[0].CapturedDiff = includeIntentRecordedReferenceContext(projectDiff, references)
+	req.OfferedCaptures[0].CapturedDiff = prependIntentRecordedReferenceContext(projectDiff, references)
 	if err := ValidateIntentGoalPlan(req, plan); err != nil {
 		t.Fatalf("actual recorded project configuration relationship was lost: %v", err)
 	}
