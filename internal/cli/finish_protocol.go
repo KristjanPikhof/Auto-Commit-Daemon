@@ -67,6 +67,37 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 	if runtime.restoreHeld != nil && runtime.restoreHeld.Load() {
 		return nil, protocolFailure("finish_busy", errors.New("finish: complete the pending restore first"), false)
 	}
+	// Reconnection uses the frozen attempt. A removed credential or a saved
+	// settings edit cannot prevent a client from observing its running job.
+	var active state.FinishRequest
+	var err error
+	if params.RetryID != "" {
+		if params.Purpose != "" || params.Message != "" || params.IncludeStaged {
+			return nil, protocolFailure("invalid_finish", errors.New("finish: retry cannot change purpose, message or staged consent"), false)
+		}
+		active, err = state.LoadFinishRequest(ctx, runtime.db, params.RetryID)
+		if err == nil && active.Target.WorktreeID != request.WorktreeID {
+			err = state.ErrFinishIdentity
+		}
+	} else {
+		active, err = state.ActiveFinishRequest(ctx, runtime.db, request.WorktreeID)
+	}
+	if err != nil && !errors.Is(err, state.ErrFinishNotFound) {
+		return nil, finishProtocolError(err)
+	}
+	if params.RetryID != "" && errors.Is(err, state.ErrFinishNotFound) {
+		return nil, finishProtocolError(err)
+	}
+	if err == nil && (active.State == state.FinishRunning || active.State == state.FinishPrepared || active.State == state.FinishNeedsAttention) {
+		matches := active.DryRun == params.DryRun
+		if params.RetryID == "" {
+			matches = matches && active.Target.Purpose == params.Purpose && active.Target.Message == params.Message && active.Target.IncludeStaged == params.IncludeStaged
+		}
+		if !matches {
+			return nil, finishProtocolError(state.ErrFinishBusy)
+		}
+		return active, nil
+	}
 	cfg, err := resolveFinishWorkerConfig(ctx, runtime.roots, runtime)
 	if err != nil {
 		return nil, finishProtocolError(err)
