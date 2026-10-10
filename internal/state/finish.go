@@ -29,7 +29,7 @@ var (
 	ErrFinishBudget   = errors.New("state: finish planning budget exhausted")
 )
 
-// FinishTarget is immutable across attempts. TargetRef pins an overlay tree;
+// FinishTarget is immutable across attempts. TargetRef pins the complete finish tree;
 // the source checkpoint remains the proof of the original worktree bytes.
 type FinishTarget struct {
 	Version         int    `json:"version"`
@@ -172,6 +172,9 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 	}
 	if target.TargetTree != target.CheckpointTree &&
 		(target.TargetRef == "" || target.TargetCommitOID == "") {
+		return "", ErrFinishIdentity
+	}
+	if target.TargetRef == "" && target.TargetCommitOID != "" {
 		return "", ErrFinishIdentity
 	}
 	if target.TargetRef != "" && (!strings.HasPrefix(target.TargetRef, "refs/acd/") || target.TargetCommitOID == "") {
@@ -350,6 +353,9 @@ func RetryFinishRequest(ctx context.Context, db *DB, id string, deadline float64
 		return r, err
 	}
 	if r.State == FinishRunning || r.State == FinishPrepared {
+		if r.DryRun != dryRun {
+			return r, ErrFinishBusy
+		}
 		return r, nil
 	}
 	if (r.State != FinishFailed && !(r.Attempt > 1 && r.State == FinishCompleted && r.DryRun)) || r.SupersededBy != "" || len(r.Publication) > 0 {
@@ -527,6 +533,11 @@ type FinishObjectPin struct {
 }
 
 func FinishObjectPins(ctx context.Context, db *DB, worktree string) ([]FinishObjectPin, error) {
+	if version, err := finishReadVersion(ctx, db); err != nil {
+		return nil, err
+	} else if version < 31 {
+		return nil, ErrSetupRequired
+	}
 	rows, err := db.readSQL().QueryContext(ctx, finishSelect+` WHERE worktree_id=? AND state<>'completed'`, worktree)
 	if err != nil {
 		return nil, err

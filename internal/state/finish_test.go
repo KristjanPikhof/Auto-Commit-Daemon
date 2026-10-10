@@ -45,7 +45,15 @@ func TestFinishStateOwnershipAndImmutableTarget(t *testing.T) {
 	ctx := context.Background()
 	db, _ := openTestDB(t)
 	r := finishFixture(t, db, 1)
+	malformed := r
+	malformed.Target.TargetCommitOID = "unpaired"
+	if _, _, err := StartFinishRequest(ctx, db, malformed); !errors.Is(err, ErrFinishIdentity) {
+		t.Fatalf("unpaired pin: %v", err)
+	}
 	saved := startFinishFixture(t, db, r)
+	if _, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, true); !errors.Is(err, ErrFinishBusy) {
+		t.Fatalf("preview attached to active apply: %v", err)
+	}
 	repeated := r
 	repeated.ID = "reconnect"
 	repeated.DeadlineTS += 100
@@ -134,6 +142,9 @@ func TestFinishStatePreparedJournalAndAttention(t *testing.T) {
 	if _, err := UpdateFinishRequest(ctx, db, r.ID, 1, FinishPrepared, FinishUpdate{State: FinishPrepared, Publication: json.RawMessage(`{"object_oid":"other"}`)}); !errors.Is(err, ErrFinishIdentity) {
 		t.Fatalf("journal mutated: %v", err)
 	}
+	if prepared.PlanID == "" {
+		t.Fatal("saved plan has no content identity")
+	}
 	attention, err := UpdateFinishRequest(ctx, db, r.ID, 1, FinishPrepared, FinishUpdate{State: FinishNeedsAttention, ReasonCode: "ambiguous_ref"})
 	if err != nil {
 		t.Fatal(err)
@@ -181,7 +192,7 @@ func TestFinishRetryRestartAndDurableBudget(t *testing.T) {
 	if n, err := InterruptFinishRequests(ctx, reopened, r.Target.WorktreeID); err != nil || n != 1 {
 		t.Fatalf("interrupt %d %v", n, err)
 	}
-	failed, err := LoadFinishRequest(ctx, reopened, r.ID)
+	failed, err := LatestFinishRequest(ctx, reopened, r.Target.WorktreeID)
 	if err != nil || failed.State != FinishFailed {
 		t.Fatalf("failure %+v %v", failed, err)
 	}
@@ -282,6 +293,9 @@ func TestFinishSchemaUpgradeAndReadOnly(t *testing.T) {
 	}
 	if _, err := LoadFinishRequest(ctx, readonly, "absent"); !errors.Is(err, ErrSetupRequired) {
 		t.Fatalf("old readonly load %v", err)
+	}
+	if _, err := FinishObjectPins(ctx, readonly, original.Target.WorktreeID); !errors.Is(err, ErrSetupRequired) {
+		t.Fatalf("old readonly pins: %v", err)
 	}
 	if version, err := readonly.UserVersion(ctx); err != nil || version != 30 {
 		t.Fatalf("readonly migrated %d %v", version, err)
