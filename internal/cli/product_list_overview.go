@@ -117,7 +117,7 @@ func productListEntryFromOverview(
 	if readErr != nil {
 		if productListReadTransient(readErr) && worker.State != "needs_action" {
 			activity := overview.lastActivity
-			stateName, operational := productStateProtected, "healthy_idle"
+			stateName, operational := productStateWaiting, "refreshing"
 			summary := "ACD is refreshing this repository's protection state."
 			if worker.State == "starting" || worker.State == "backoff" {
 				stateName, operational = productStatePublishing, "retrying"
@@ -127,8 +127,10 @@ func productListEntryFromOverview(
 				Repo: record.Path, RepoHash: record.RepoHash, Enabled: true,
 				State: stateName, WorkerState: worker.State,
 				OperationalState: operational, ProtectionUnknown: true,
-				LastActivityAt: formatProductListActivity(activity),
-				Summary:        summary, NextAction: "No action needed.",
+				PublicationProgress: publicationProgressReport{Phase: "protection_refresh"},
+				PublicationOutcome:  publicationOutcome{PendingClassification: true, ReasonCode: "protection_read_pending"},
+				LastActivityAt:      formatProductListActivity(activity),
+				Summary:             summary, NextAction: "No action needed.",
 				lastActivity: activity, UnfinishedWork: overview.unfinished,
 			}
 		}
@@ -150,7 +152,8 @@ func productListEntryFromOverview(
 	daemonAlive := report.Daemon == "running" && report.PID > 0 && !report.Stale
 	applyControlStatusWithDaemonAlive(&control, report, daemonAlive)
 	checkpointing := report.CaptureHealth.Error == "" && daemonAlive && report.CheckpointProtectionAvailable && !report.Protected &&
-		report.PublicationProgress.Origin != "intent_recovery" && report.PublicationProgress.Phase != "stalled" &&
+		report.PublicationProgress.Origin == "" &&
+		(report.PublicationProgress.Phase == "" || report.PublicationProgress.Phase == "checkpointing") &&
 		!productListHasIndependentAttention(report)
 	if checkpointing {
 		control.OK = true
@@ -448,13 +451,16 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		(report.PendingEvents > 0 || report.SelfPublication.Phase == "active" ||
 			(report.PublicationDrain.ID != "" && report.PublicationDrain.Phase != state.PublicationDrainCompleted && report.PublicationDrain.Phase != state.PublicationDrainNeedsAction) ||
 			report.Configuration.Configuration == "validating")
-	report.OperationalState = statusOperationalStateWithDaemonAlive(*report,
-		report.Daemon == "running" && report.PID > 0 && !report.Stale)
 	report.PublicationProgress, err = buildPublicationProgressReport(
 		ctx, conn, *report, now)
 	if err != nil {
 		return overview, err
 	}
+	if report.PublicationProgress.Phase == "history_reconstruction" {
+		report.Busy = true
+	}
+	report.OperationalState = statusOperationalStateWithDaemonAlive(*report,
+		report.Daemon == "running" && report.PID > 0 && !report.Stale)
 	if raw, _, err := metaLookup(ctx, conn, state.RewritePIDMetaKey); err != nil {
 		return overview, err
 	} else if raw != "" {
@@ -470,8 +476,12 @@ func readProductListRepo(ctx context.Context, record central.RepoRecord, now tim
 		outcome, outcomeErr := productListReadOutcome(ctx, conn, report.Protected, record.Path, currentBranchRef, currentBranchGeneration, hasCurrentPair)
 		report.PublicationOutcome = outcome
 		report.PublicationOutcome.ReasonCode = report.PublicationProgress.Phase
-		if health := report.IntentStrategy.PlannerHealth; health != nil {
+		if health := report.IntentStrategy.PlannerHealth; health != nil &&
+			health.State == daemon.IntentPlannerCircuitOpen {
 			report.PublicationOutcome.RetryAt = health.NextProbeTS
+		}
+		if report.PublicationProgress.Phase == "goal_review_wait" {
+			report.PublicationOutcome.RetryAt = report.PublicationProgress.RetryAtTS
 		}
 		if outcomeErr != nil && !productListReadTransient(outcomeErr) {
 			return overview, outcomeErr

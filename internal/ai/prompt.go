@@ -79,17 +79,14 @@ const BodyWrap = 72
 // multi-file changes — see IntentStageDiffCap.
 const DiffCap = 4000
 
-// IntentStageDiffCap is the per-stage byte cap applied to each captured
-// diff handed to the intent planner. The planner reasons across multiple
-// captures at once, so a 4 KiB cap (which works well for one-event commit
-// messages) routinely truncated the second/third captured diff before the
-// planner could see the file-level signature. The Wave 2 planner-atomicity
-// epic raises the per-stage cap to 16 KiB while leaving DiffCap unchanged
-// for the per-event commit path. Total payload size is still bounded by
-// the planner window size (ACD_INTENT_WINDOW, default 10) multiplied by
-// this cap, which stays comfortably under the openai-compat 1 MiB body
-// limit even at the upper window value.
-const IntentStageDiffCap = 16000
+// IntentStageDiffCap bounds each captured diff. A completed implementation can
+// exceed 16 KiB; clipping its middle can hide the code needed to review a goal.
+// The focused goal allocator also bounds the aggregate evidence below.
+const IntentStageDiffCap = 64 * 1024
+
+// IntentGoalEvidenceTotalDiffCap bounds focused live publication evidence.
+// Current changes receive detail before immutable published companion bodies.
+const IntentGoalEvidenceTotalDiffCap = 256 * 1024
 
 const commitMessageFormatInstructions = imperativeCommitMessageFormatInstructions
 
@@ -107,6 +104,8 @@ const purposefulCommitGroupingInstructions = "Identify the distinct goals in the
 	"Preserve supplied capture units, offered-sequence limits, and frozen targets; never invent intermediate file versions or pull in later captures to finish a group. " +
 	"Do not invent hypothetical companions. Identify actual missing dependencies from the supplied evidence; age and queue pressure do not prove completeness or waive safety checks. " +
 	"Assess each intermediate commit using its proposed contents and prerequisites, not the final combined worktree. " +
+	"Write the subject and body after fixing membership, from the net change between that commit's parent and proposed tree; omit reverted edits and incidental save history. " +
+	"A filename, symbol, or '<filename> code changes' does not establish a completed goal. If the supplied evidence cannot explain the goal, keep its captures waiting with a concrete reason instead of publishing a generic message. " +
 	"Prefer a few meaningful steps over save-by-save commits or one group containing unrelated purposes; do not target a fixed commit count. " +
 	"Examples: group a menu-state implementation, its tests, and an assertion correction as one change; group a placement document with its index link; group the same model-row presentation improvement across screens when those edits serve one goal. "
 

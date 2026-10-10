@@ -873,8 +873,14 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 		h.wakeActivityHint(request.WorktreeID)
 		return map[string]bool{"accepted": true}, nil
 	case "publication_drain_status":
+		var params struct {
+			DrainID string `json:"drain_id"`
+		}
+		if err := json.Unmarshal(request.Params, &params); len(request.Params) > 0 && err != nil {
+			return nil, protocolFailure("invalid_publication_status", err, false)
+		}
 		projection, projectionErr := state.ReadPublicationDrainProjection(
-			ctx, runtime.db.Path())
+			ctx, runtime.db.Path(), params.DrainID)
 		if projectionErr != nil {
 			return nil, protocolFailure(
 				"publication_status_failed", projectionErr, true)
@@ -931,6 +937,9 @@ func (h *repositoryWorkerHandler) HandleWorkerRequest(ctx context.Context, reque
 			generation, anchorErr := daemon.LoadBranchGeneration(ctx, runtime.db)
 			if anchorErr == nil && params.ConsumeStaged {
 				anchorErr = recoverCommitAllStagingReview(ctx, runtime, branchRef, generation)
+			}
+			if anchorErr == nil {
+				anchorErr = daemon.RequestIntentPublicationReview(ctx, runtime.db, branchRef, generation, time.Now())
 			}
 			if anchorErr == nil {
 				activeDrain, activeErr := daemon.ActivePublicationDrainForPair(

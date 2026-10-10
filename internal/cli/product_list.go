@@ -44,7 +44,7 @@ type productListEntry struct {
 	RepoHash              string                       `json:"-"`
 	Clients               int                          `json:"-"`
 	LastCommitOID         string                       `json:"-"`
-	ProtectionUnknown     bool                         `json:"-"`
+	ProtectionUnknown     bool                         `json:"protection_unknown,omitempty"`
 	UnfinishedWork        bool                         `json:"unfinished_work"`
 	lastActivity          time.Time
 }
@@ -162,10 +162,6 @@ func productListShellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-func runProductListOnce(ctx context.Context, out io.Writer, jsonOut, verbose bool) error {
-	return runProductListOnceView(ctx, out, jsonOut, verbose, false)
-}
-
 func runProductListOnceView(ctx context.Context, out io.Writer, jsonOut, verbose, showAll bool) error {
 	data, stateName, err := collectProductList(ctx)
 	if err != nil {
@@ -203,10 +199,6 @@ func productListRequiresAction(entries []productListEntry) bool {
 		}
 	}
 	return false
-}
-
-func runProductListWatch(ctx context.Context, out io.Writer, interval time.Duration, verbose bool) error {
-	return runProductListWatchView(ctx, out, interval, verbose, false)
 }
 
 func runProductListWatchView(ctx context.Context, out io.Writer, interval time.Duration, verbose, showAll bool) error {
@@ -273,6 +265,16 @@ func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]
 		}
 		previous, ok := lastKnown[entry.Repo]
 		if ok && productListPriority(previous) <= productListPriority(entry) {
+			if entry.OperationalState == "refreshing" && !previous.ActionRequired &&
+				previous.State != productStateNeedsAction && previous.OperationalState != "paused" &&
+				previous.OperationalState != "needs_attention" && previous.PublicationProgress.Phase != "needs_action" {
+				entry.UnfinishedWork = entry.UnfinishedWork || previous.UnfinishedWork
+				if previous.lastActivity.After(entry.lastActivity) {
+					entry.lastActivity, entry.LastActivityAt = previous.lastActivity, previous.LastActivityAt
+				}
+				entries[index] = entry
+				continue
+			}
 			previous.ProtectionUnknown = true
 			entries[index] = previous
 		}
@@ -283,10 +285,6 @@ func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]
 		}
 	}
 
-}
-
-func renderProductListTable(out io.Writer, entries []productListEntry, verbose bool) error {
-	return renderProductListDashboard(out, entries, verbose, true)
 }
 
 func renderProductListDashboard(out io.Writer, entries []productListEntry, verbose, showAll bool) error {
@@ -376,6 +374,12 @@ func productListProgressAge(entry productListEntry) string {
 }
 
 func productListPhase(entry productListEntry) string {
+	if entry.PublicationProgress.Phase == "protection_refresh" {
+		return "refreshing"
+	}
+	if entry.PublicationProgress.Phase == "history_reconstruction" {
+		return "history-reconstruct"
+	}
 	if entry.OperationalState == "rewriting" {
 		return "history-rewrite"
 	}
@@ -413,7 +417,13 @@ func productListPhase(entry productListEntry) string {
 			return "provider-wait:" + strings.ReplaceAll(formatDurationCompact(
 				time.Duration(progress.WaitRemainingSeconds)*time.Second), " ", "")
 		}
-		return "provider-wait"
+		return "provider-retry-due"
+	case "goal_review_wait":
+		if progress.WaitRemainingSeconds > 0 {
+			return "goal-review:" + strings.ReplaceAll(formatDurationCompact(
+				time.Duration(progress.WaitRemainingSeconds)*time.Second), " ", "")
+		}
+		return "goal-review-due"
 	case "provider_call":
 		return "provider-call"
 	case "verifying":
@@ -508,12 +518,16 @@ func productListStatus(entry productListEntry) string {
 		return "paused"
 	case entry.ActionRequired || entry.State == productStateNeedsAction || entry.OperationalState == "needs_attention":
 		return "needs action"
+	case entry.OperationalState == "refreshing":
+		return "refreshing"
 	case entry.PublicationProgress.Phase == "stalled":
 		return "stalled"
-	case entry.PublicationProgress.Phase == "provider_call" ||
+	case entry.PublicationProgress.Phase == "history_reconstruction" ||
+		entry.PublicationProgress.Phase == "provider_call" ||
 		entry.PublicationProgress.Phase == "verifying":
 		return "working"
 	case entry.PublicationProgress.Phase == "provider_wait" ||
+		entry.PublicationProgress.Phase == "goal_review_wait" ||
 		entry.PublicationProgress.Phase == "intent_wait" ||
 		entry.PublicationProgress.Phase == "rewind_wait" ||
 		entry.PublicationProgress.Phase == "config_wait":

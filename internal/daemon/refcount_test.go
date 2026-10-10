@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -17,15 +16,9 @@ import (
 // openTestDB returns a fresh per-test state DB.
 func openTestDB(t *testing.T) *state.DB {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "state.db")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return cloneDaemonTestState(t, ctx)
 }
 
 func registerClient(t *testing.T, db *state.DB, c state.Client) {

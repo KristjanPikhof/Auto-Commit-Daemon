@@ -29,9 +29,12 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -81,8 +84,8 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 	assertIntentV2RuntimeActive(t, repo)
 
 	headBefore := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
-	target := filepath.Join(repo, "deterministic-flush.txt")
-	writeFile(t, target, "flush me\n")
+	target := filepath.Join(repo, "capture-protection.md")
+	writeFile(t, target, "# Capture protection reference\n\nKeep changes protected before publication.\n")
 
 	// Wake first so capture observes the file before the flush. flush
 	// --logical only forces the planner past the count gate; it does not
@@ -95,7 +98,8 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitForEventState(t, dbPath, "deterministic-flush.txt", "pending", 5*time.Second)
+	waitForEventState(t, dbPath, "capture-protection.md", "pending", 5*time.Second)
+	frozenSeq := sqliteScalar(t, dbPath, "SELECT seq FROM capture_events WHERE path='capture-protection.md' AND state='pending' ORDER BY seq DESC LIMIT 1")
 	if headAfterWake := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")); headAfterWake != headBefore {
 		t.Fatalf("wake-only drain bypassed intent batch gate: HEAD=%s want %s", headAfterWake, headBefore)
 	}
@@ -122,23 +126,47 @@ func TestFlush_LogicalCommitsSingleEditWithDeterministicProvider(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !advanced {
-		t.Fatalf("flush --logical did not advance HEAD within 2s\nbefore=%s\nstill=%s\nflush stdout=%s\nflush stderr=%s",
+		// A slow final Git observation can miss a commit that already met the
+		// deadline. git_applied_ts is generated after the literal branch CAS;
+		// the capture and completion timestamps are not valid deadline proof.
+		head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
+		if head != headBefore {
+			query := fmt.Sprintf(`SELECT EXISTS(
+SELECT 1 FROM self_publications publication
+JOIN self_publication_members member ON member.publication_id=publication.id
+JOIN capture_events capture ON capture.seq=member.event_seq
+WHERE publication.source_head=%s AND publication.target_commit_oid=%s
+ AND publication.branch_ref='refs/heads/main' AND publication.member_count=1
+ AND member.event_seq=%s AND capture.path='capture-protection.md'
+ AND capture.branch_ref=publication.branch_ref
+ AND capture.branch_generation=publication.branch_generation
+ AND publication.phase IN ('git_applied','completed')
+ AND publication.git_applied_ts>=%.9f AND publication.git_applied_ts<=%.9f
+)`, sqliteQuote(headBefore), sqliteQuote(head), frozenSeq, float64(flushStart.UnixNano())/1e9, float64(deadline.UnixNano())/1e9)
+			if sqliteScalar(t, dbPath, query) == "1" {
+				advanced = true
+				t.Logf("post-CAS journal proves HEAD advanced within 2s; observation took %s", time.Since(flushStart))
+			}
+		}
+	}
+	if !advanced {
+		diagnostic := sqliteExec(t, dbPath, `SELECT id,status,purpose,atomicity_summary FROM intent_candidates; SELECT fingerprint,resolution_mode,progress_state FROM intent_plan_runs;`)
+		t.Fatalf("flush --logical did not advance HEAD within 2s\nbefore=%s\nstill=%s\nflush stdout=%s\nflush stderr=%s\nstate=%s",
 			headBefore,
 			strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD")),
-			flushRes.Stdout, flushRes.Stderr)
+			flushRes.Stdout, flushRes.Stderr, diagnostic)
 	}
 
-	// One commit, deterministic subject.
+	// Captured evidence supplies a meaningful deterministic goal message.
 	subj := headSubject(t, repo)
-	if subj != "Add deterministic-flush.txt" {
-		t.Fatalf("HEAD subject=%q want %q (deterministic provider must produce Add <basename>)",
-			subj, "Add deterministic-flush.txt")
+	if subj != "Add Capture protection reference" {
+		t.Fatalf("HEAD subject=%q want a grounded documentation goal", subj)
 	}
 }
 
-// A logical flush can publish a safe local group during a provider outage.
-// The provider circuit remains open instead of retrying for a commit message.
-func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
+// A logical flush protects its target while the provider is unavailable, then
+// publishes it with a meaningful provider message after a restart and retry.
+func TestFlush_LogicalWaitsDuringProviderOutageAndRecovers(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 binary required")
@@ -149,9 +177,28 @@ func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
 	repo := tempRepo(t)
 	sessionID := "intent-flush-provider-outage"
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
+	var available atomic.Bool
+	var providerHits atomic.Int32
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerHits.Add(1)
+		if !available.Load() {
+			http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		req := decodeIntentChatRequest(t, r)
+		var candidates []map[string]any
+		for _, capture := range offeredIntentCaptures(t, req) {
+			candidates = append(candidates, nativeReadyIntentCandidate("flush-capture", []int64{capture.Seq},
+				"Document protected capture recovery", "- Explain retained work and automatic provider recovery",
+				"the independent documentation change explains protected capture recovery"))
+		}
+		writeNativeIntentCandidatesResponse(t, w, "flush-recovered", candidates)
+	}))
+	defer server.Close()
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
-		"ACD_AI_PROVIDER=subprocess:missing-integration",
+		"ACD_AI_PROVIDER=openai-compat", "ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key", "ACD_AI_MODEL=gpt-6-luna", trustEnv,
 		"ACD_INTENT_MIN_PENDING=10",
 		"ACD_INTENT_MAX_PENDING_AGE=5m",
 		"ACD_INTENT_WINDOW=10",
@@ -180,6 +227,7 @@ func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
 	assertIntentV2RuntimeActive(t, repo)
 
 	startCount := commitCount(t, repo)
+	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	target := filepath.Join(repo, "semantic-provider-outage.txt")
 	writeFile(t, target, "publish from captured evidence\n")
 
@@ -192,6 +240,11 @@ func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	waitForEventState(t, dbPath, "semantic-provider-outage.txt", "pending", 5*time.Second)
+	t.Cleanup(func() {
+		if t.Failed() {
+			logOutageTestState(t, repo)
+		}
+	})
 
 	flushRes := runAcd(t, ctx, env, "flush",
 		"--repo", repo, "--session-id", sessionID, "--logical",
@@ -212,15 +265,30 @@ func TestFlush_LogicalPublishesDuringProviderOutage(t *testing.T) {
 		return json.Unmarshal([]byte(raw), &health) == nil && health.State == "open" &&
 			health.Failure == "transport" && health.Retry > health.Opened
 	})
-	waitForEventState(t, dbPath, "semantic-provider-outage.txt", "published", 10*time.Second)
-	if got := commitCount(t, repo); got != startCount+1 {
-		t.Fatalf("commit count=%d want %d", got, startCount+1)
+	assertProviderWaitPreservesCheckpoint(t, repo, "semantic-provider-outage.txt", "publish from captured evidence\n", startHead)
+	assertOutageStatusAndList(t, ctx, env, repo, 1)
+	if got := commitCount(t, repo); got != startCount || providerHits.Load() != 1 {
+		t.Fatalf("flush bypassed provider wait: commits=%d want=%d calls=%d", got, startCount, providerHits.Load())
+	}
+	if err := stopIntentTestWorker(t, env, repo, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	makeOutageProbeDue(t, repo)
+	available.Store(true)
+	restartOutageTestSession(t, ctx, env, repo, sessionID, "claude-code")
+	flushed := runAcd(t, ctx, env, "flush", "--repo", repo, "--session-id", sessionID, "--logical", "--json")
+	if flushed.ExitCode != 0 {
+		t.Fatalf("retry flush: %s %s", flushed.Stdout, flushed.Stderr)
+	}
+	waitForEventState(t, dbPath, "semantic-provider-outage.txt", "published", 15*time.Second)
+	if got := commitCount(t, repo); got != startCount+1 || providerHits.Load() != 2 {
+		t.Fatalf("reconnect commits=%d want=%d calls=%d", got, startCount+1, providerHits.Load())
 	}
 	if got := runGitOK(t, repo, "show", "HEAD:semantic-provider-outage.txt"); got != "publish from captured evidence\n" {
 		t.Fatalf("published bytes=%q", got)
 	}
-	if body := runGitOK(t, repo, "log", "-1", "--format=%b"); !strings.Contains(body, "semantic-provider-outage.txt") {
-		t.Fatalf("local message lost captured evidence: %q", body)
+	if subject := headSubject(t, repo); subject != "Document protected capture recovery" {
+		t.Fatalf("recovery lost purposeful provider message: %q", subject)
 	}
 }
 
@@ -244,18 +312,40 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 
 	repo := tempRepo(t)
 	sessionID := "intent-quiescence"
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("quiescence publication state: %s", sqliteExec(t, filepath.Join(repo, ".git", "acd", "state.db"),
+				`SELECT id,status,purpose,atomicity_summary FROM intent_candidates; SELECT fingerprint,resolution_mode,progress_state FROM intent_plan_runs;`))
+		}
+	})
 
 	// Seed the file under version control so the second write captures as
 	// a modify (not a create-then-modify) — the quiescence gate keys on
 	// path-touch recency regardless of op kind, but consistent ops keep
 	// the assertions about commit count clean.
-	target := filepath.Join(repo, "quiet.txt")
-	writeFile(t, target, "v0\n")
-	gitCommitAll(t, repo, "seed quiet.txt", "quiet.txt")
+	target := filepath.Join(repo, "quiet.md")
+	writeFile(t, target, "# Capture protection reference\n\nKeep captured work protected.\n")
+	gitCommitAll(t, repo, "Document capture protection", "quiet.md")
+
+	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := decodeIntentChatRequest(t, r)
+		writeNativeIntentCandidatesResponse(t, w, "call_quiet_capture", []map[string]any{
+			nativeReadyIntentCandidate("checkpoint-guide", offeredIntentSeqs(t, req),
+				"Document checkpoint protection guarantees",
+				"- Explain that captured file versions enter checkpoints before publication",
+				"the documentation completes the checkpoint protection explanation"),
+		})
+	}))
+	defer server.Close()
 
 	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
 	extra := []string{
 		"ACD_COMMIT_STRATEGY=intent",
+		"ACD_AI_PROVIDER=openai-compat",
+		"ACD_AI_BASE_URL=" + server.URL,
+		"ACD_AI_API_KEY=test-key",
+		"ACD_AI_MODEL=gpt-6-luna",
+		trustEnv,
 		"ACD_INTENT_WINDOW=10",
 		"ACD_INTENT_MIN_PENDING=1",
 		"ACD_INTENT_SETTLE_WINDOW=0",
@@ -291,18 +381,18 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 	// wake between them so the daemon observes each transition); the
 	// quiescence gate must hold the planner offer until both are quiet
 	// for >= 2s.
-	writeFile(t, target, "v1\n")
+	writeFile(t, target, "# Capture protection reference\n\nSave captured file versions in checkpoints.\n")
 	wakeSession(t, ctx, env, repo, sessionID)
 	waitFor(t, "first capture pending", 5*time.Second, func() bool {
 		return sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM capture_events WHERE path='quiet.txt' AND state='pending'") == "1"
+			"SELECT COUNT(*) FROM capture_events WHERE path='quiet.md' AND state='pending'") == "1"
 	})
 	time.Sleep(500 * time.Millisecond)
-	writeFile(t, target, "v2\n")
+	writeFile(t, target, "# Capture protection reference\n\nSave captured file versions in checkpoints before publication.\n")
 	wakeSession(t, ctx, env, repo, sessionID)
 	waitFor(t, "second capture pending", 5*time.Second, func() bool {
 		return sqliteScalar(t, dbPath,
-			"SELECT COUNT(*) FROM capture_events WHERE path='quiet.txt' AND state='pending'") == "2"
+			"SELECT COUNT(*) FROM capture_events WHERE path='quiet.md' AND state='pending'") == "2"
 	})
 
 	// HEAD must NOT advance yet: the quiescence gate (2s) holds the
@@ -340,36 +430,35 @@ func TestPathQuiescence_TwoSavesWithinWindowBecomeOneCapture(t *testing.T) {
 		return head != headBefore && head != ""
 	})
 
-	// Both captures must be published, sharing one commit_oid (the planner
-	// saw a single coalesced offer). With deterministic provider the
-	// daemon's deterministic-coalesce path also produces one commit.
-	waitForEventState(t, dbPath, "quiet.txt", "published", 10*time.Second)
+	// Both captures must be published, sharing one commit_oid. The semantic
+	// planner sees a single coalesced offer with the completed explanation.
+	waitForEventState(t, dbPath, "quiet.md", "published", 10*time.Second)
 	distinct := sqliteScalar(t, dbPath,
-		"SELECT COUNT(DISTINCT commit_oid) FROM capture_events WHERE path='quiet.txt' AND state='published'")
+		"SELECT COUNT(DISTINCT commit_oid) FROM capture_events WHERE path='quiet.md' AND state='published'")
 	if distinct != "1" {
-		t.Fatalf("distinct commit_oid for quiet.txt published rows=%s want 1 (two saves must surface as one window)",
+		t.Fatalf("distinct commit_oid for quiet.md published rows=%s want 1 (two saves must surface as one window)",
 			distinct)
 	}
 	rows := sqliteScalar(t, dbPath,
-		"SELECT COUNT(*) FROM capture_events WHERE path='quiet.txt' AND state='published'")
+		"SELECT COUNT(*) FROM capture_events WHERE path='quiet.md' AND state='published'")
 	if rows != "2" {
-		t.Fatalf("published rows for quiet.txt=%s want 2", rows)
+		t.Fatalf("published rows for quiet.md=%s want 2", rows)
 	}
 	members := sqliteScalar(t, dbPath, `
 SELECT COUNT(*)
 FROM intent_candidate_events member
 JOIN capture_events capture ON capture.seq=member.event_seq
-WHERE capture.path='quiet.txt' AND member.membership_state='active'`)
+WHERE capture.path='quiet.md' AND member.membership_state='active'`)
 	if members != "2" {
-		t.Fatalf("active candidate members for quiet.txt=%s want 2", members)
+		t.Fatalf("active candidate members for quiet.md=%s want 2", members)
 	}
 	coalesced := sqliteScalar(t, dbPath, `
 SELECT COUNT(*)
 FROM intent_candidate_events member
 JOIN capture_events capture ON capture.seq=member.event_seq
-WHERE capture.path='quiet.txt' AND member.event_role='coalesced'
+WHERE capture.path='quiet.md' AND member.event_role='coalesced'
   AND member.membership_state='active'`)
 	if coalesced != "1" {
-		t.Fatalf("coalesced candidate members for quiet.txt=%s want 1", coalesced)
+		t.Fatalf("coalesced candidate members for quiet.md=%s want 1", coalesced)
 	}
 }

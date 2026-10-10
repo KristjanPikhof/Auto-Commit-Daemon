@@ -67,17 +67,19 @@ type IntentCaptureDependency struct {
 	EvidenceHash string                   `json:"evidence_hash,omitempty"`
 }
 
-// IntentCandidateSummary carries durable candidate context without raw source.
+// IntentCandidateSummary carries goal metadata and optional transient recorded
+// evidence. CapturedEvidence uses the same opt-in diff policy as fresh captures.
 type IntentCandidateSummary struct {
-	CandidateID       string    `json:"candidate_id"`
-	Status            string    `json:"status"`
-	Purpose           string    `json:"purpose,omitempty"`
-	SelectedSeqs      []int64   `json:"selected_seqs,omitempty"`
-	Paths             []string  `json:"paths,omitempty"`
-	MissingCompanions []string  `json:"missing_companions,omitempty"`
-	Ready             bool      `json:"ready"`
-	CreatedAt         time.Time `json:"created_at,omitempty"`
-	UpdatedAt         time.Time `json:"updated_at,omitempty"`
+	CandidateID       string           `json:"candidate_id"`
+	Status            string           `json:"status"`
+	Purpose           string           `json:"purpose,omitempty"`
+	SelectedSeqs      []int64          `json:"selected_seqs,omitempty"`
+	Paths             []string         `json:"paths,omitempty"`
+	CapturedEvidence  []OfferedCapture `json:"captured_evidence,omitempty"`
+	MissingCompanions []string         `json:"missing_companions,omitempty"`
+	Ready             bool             `json:"ready"`
+	CreatedAt         time.Time        `json:"created_at,omitempty"`
+	UpdatedAt         time.Time        `json:"updated_at,omitempty"`
 }
 
 // IntentActivityBoundary contains no prompt text. Epoch is an opaque,
@@ -216,6 +218,13 @@ type IntentCandidateAssignment struct {
 	Subject             string                   `json:"subject,omitempty"`
 	Body                string                   `json:"body,omitempty"`
 	GroupingReason      string                   `json:"grouping_reason"`
+	hostRetainedWait    bool
+}
+
+// IsHostRetainedWait distinguishes an omitted capture protected by the host
+// from an explicit provider WAIT. The provider cannot set this private marker.
+func (candidate IntentCandidateAssignment) IsHostRetainedWait() bool {
+	return candidate.hostRetainedWait && candidate.Readiness == IntentCandidateWait
 }
 
 // IntentPlanV2 is the native candidate protocol response. Candidate order is
@@ -298,7 +307,8 @@ func DecodeIntentPlanV2(raw []byte, req IntentPlanRequestV2) (IntentPlanV2, erro
 	} else if !errors.Is(err, io.EOF) {
 		return IntentPlanV2{}, v2ValidationError("", IntentAtomicityCohesion, "response_trailing_data", err.Error())
 	}
-	if err := ValidateIntentPlanV2(req, plan); err != nil {
+	plan, err := retainUnassignedIntentCaptures(req, plan, ValidateIntentPlanV2(req, plan))
+	if err != nil {
 		return plan, rejectedIntentPlanV2(err, plan)
 	}
 	return plan, nil
@@ -332,6 +342,16 @@ func NewIntentPlanRequestV2(opts IntentPlanRequestV2Options) (IntentPlanRequestV
 		CommitFormat:           legacy.CommitFormat,
 		CapturedDiffTransform:  legacy.CapturedDiffTransform,
 	}
+	for i := range req.Candidates {
+		if len(req.Candidates[i].CapturedEvidence) == 0 {
+			continue
+		}
+		context, err := NewIntentPlanRequest(IntentPlanRequestOptions{OfferedCaptures: req.Candidates[i].CapturedEvidence, IncludeCapturedDiffs: opts.IncludeCapturedDiffs, CommitFormat: opts.CommitFormat})
+		if err != nil {
+			return IntentPlanRequestV2{}, fmt.Errorf("intent goal evidence: %w", err)
+		}
+		req.Candidates[i].CapturedEvidence = context.OfferedCaptures
+	}
 	if err := ValidateIntentPlanRequestV2(req); err != nil {
 		return IntentPlanRequestV2{}, err
 	}
@@ -357,7 +377,8 @@ func PlanIntentV2WithCompatibility(ctx context.Context, planner interface{ Name(
 			}
 			return AdaptIntentPlanV1(req, unsupported.LegacyPlan)
 		}
-		if err := validateNativeIntentPlanV2(req, plan); err != nil {
+		plan, err = retainUnassignedIntentCaptures(req, plan, validateNativeIntentPlanV2(req, plan))
+		if err != nil {
 			return plan, rejectedIntentPlanV2(err, plan)
 		}
 		return plan, nil
@@ -458,6 +479,7 @@ func ValidateIntentPlanRequestV2(req IntentPlanRequestV2) error {
 	}
 	candidateIDs := make(map[string]struct{}, len(req.Candidates))
 	candidateSeqOwners := make(map[int64]string)
+	evidenceCount := 0
 	for i, candidate := range req.Candidates {
 		if err := validateBoundedText("candidate_id", candidate.CandidateID, IntentCandidateIDCap, true); err != nil {
 			return fmt.Errorf("intent planner v2: candidates[%d]: %w", i, err)
@@ -487,6 +509,23 @@ func ValidateIntentPlanRequestV2(req IntentPlanRequestV2) error {
 			}
 			candidateSeqOwners[seq] = candidate.CandidateID
 			knownSeqs[seq] = struct{}{}
+		}
+		evidenceCount += len(candidate.CapturedEvidence)
+		if evidenceCount > IntentCandidateCaptureCap {
+			return fmt.Errorf("intent planner v2: goal evidence exceeds cap %d", IntentCandidateCaptureCap)
+		}
+		seenEvidence := make(map[int64]bool)
+		for _, capture := range candidate.CapturedEvidence {
+			if candidateSeqOwners[capture.Seq] != candidate.CandidateID || seenEvidence[capture.Seq] {
+				return fmt.Errorf("intent planner v2: goal evidence must belong exactly once to its recorded candidate")
+			}
+			seenEvidence[capture.Seq] = true
+			if err := validateBoundedText("evidence path", capture.Path, IntentContextPathCap, true); err != nil {
+				return err
+			}
+			if len(capture.CapturedDiff) > IntentStageDiffCap {
+				return fmt.Errorf("intent planner v2: goal evidence diff exceeds cap")
+			}
 		}
 		if err := validateContextPaths(candidate.Paths); err != nil {
 			return fmt.Errorf("intent planner v2: candidates[%d]: %w", i, err)
@@ -624,20 +663,6 @@ func ValidateIntentPlanV2(req IntentPlanRequestV2, plan IntentPlanV2) error {
 				fmt.Sprintf("offered seq %d is not assigned to a candidate", capture.Seq))
 		}
 	}
-	if req.ForcedAging {
-		for _, capture := range req.OfferedCaptures {
-			candidate := plan.Candidates[assignments[capture.Seq]]
-			if candidate.Readiness != IntentCandidateReady ||
-				len(candidate.MissingCompanions) > 0 {
-				return v2ValidationError(candidate.CandidateID,
-					IntentAtomicityCompleteness, "forced_capture_deferred",
-					fmt.Sprintf(
-						"forced-aging seq %d must be ready with no missing companions",
-						capture.Seq))
-			}
-		}
-	}
-
 	dependencies := make([]map[int]struct{}, len(plan.Candidates))
 	declaredDependencyIDs := make([]map[string]struct{}, len(plan.Candidates))
 	for i, candidate := range plan.Candidates {
@@ -903,13 +928,13 @@ func BuildIntentPlanV2UserPrompt(req IntentPlanRequestV2) (string, error) {
 	if err := ValidateIntentPlanRequestV2(req); err != nil {
 		return "", err
 	}
-	body, err := json.Marshal(req)
+	body, err := json.Marshal(intentPlanV2WireRequest(req))
 	if err != nil {
 		return "", fmt.Errorf("intent planner v2: marshal request: %w", err)
 	}
 	out := "Plan durable semantic commit candidates for these offered captures:\n" + string(body)
 	if correction := NormalizeIntentAtomicityCorrection(req.RetryCorrection); correction != "" {
-		out += "\n\nThe previous candidate plan failed atomicity validation:\n" + correction +
+		out += "\n\nReview the previous candidate plan against these recorded corrections:\n" + correction +
 			"\n\nReturn a corrected v2 candidate plan. Assign every offered seq exactly once, split disconnected components, preserve every hard dependency, and do not mark a candidate ready while it has missing companions."
 	}
 	return out, nil
@@ -925,11 +950,19 @@ func IntentPlannerV2SystemPrompt(format ...CommitFormat) string {
 	}
 	return "You are a semantic intent planner for atomic git commits. " +
 		"Return only a v2 candidate plan. Assign every offered seq to exactly one candidate. " +
+		"Output selected_seqs may contain only offered_captures seqs. Existing candidates' selected_seqs and captured_evidence are retained context, not additional assignments. " +
+		"readonly_evidence describes retained or published behavior without selectable capture IDs. readonly_dependencies name known candidate endpoints; honor hard prerequisites between different candidates through depends_on_candidates. " +
+		"To extend an existing mutable candidate, reuse its candidate_id and select only its offered additions; its retained members still belong to the goal and must satisfy completeness. " +
 		"Candidate order must be topological. Non-contiguous capture groups are allowed when dependency evidence proves independence and ordering. " +
+		"Historical captures with different history_author values must remain in separate goals; preserve prerequisite order across author boundaries. " +
 		"A group may add semantic cohesion not present in the dependency graph when the exact diffs prove one intent. Never group by time or directory alone. " +
 		purposefulCommitGroupingInstructions +
 		"Activity epochs and temporal proximity may trigger evaluation but cannot alone prove cohesion. " +
 		"Mark readiness=wait when any required companion is missing. A ready candidate must not depend on a waiting candidate. " +
+		"Do not invent companions solely because new tests are absent. Justify a missing companion with a concrete dependency or unresolved behavior in the supplied evidence. The host still runs configured verification against the proposed commit tree. " +
+		"A self-contained change with clear before/after behavior and no missing dependency is ready for host materialization and verification. Infer its useful purpose from that observable change; a separate design note or explanation of why the user wants it is not a prerequisite. " +
+		"Candidates with status=published supply existing baseline behavior through their recorded evidence. Do not call that behavior missing merely because its captures are not offered, and do not select those captures again. " +
+		"A later correction or regression test may complete its own useful goal against that baseline; keep any available unpublished support together and explain the new goal from its net change. " +
 		"Keep raw-source reasoning out of purpose, grouping_reason, and missing_companions. " +
 		CommitMessageFormatInstructions(selected) + " " +
 		"Keep grouping rationale in grouping_reason, not in the commit body."
@@ -1208,6 +1241,7 @@ func cloneCandidateSummaries(in []IntentCandidateSummary) []IntentCandidateSumma
 		out[i] = in[i]
 		out[i].SelectedSeqs = append([]int64(nil), in[i].SelectedSeqs...)
 		out[i].Paths = append([]string(nil), in[i].Paths...)
+		out[i].CapturedEvidence = append([]OfferedCapture(nil), in[i].CapturedEvidence...)
 		out[i].MissingCompanions = append([]string(nil), in[i].MissingCompanions...)
 	}
 	return out
@@ -1270,30 +1304,6 @@ func edgeSupportsCohesion(edge IntentCaptureDependency) bool {
 	default:
 		return true
 	}
-}
-
-func seqSetConnected(seqs []int64, adjacency map[int64]map[int64]struct{}) bool {
-	allowed := make(map[int64]struct{}, len(seqs))
-	for _, seq := range seqs {
-		allowed[seq] = struct{}{}
-	}
-	seen := map[int64]struct{}{seqs[0]: {}}
-	queue := []int64{seqs[0]}
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-		for next := range adjacency[current] {
-			if _, ok := allowed[next]; !ok {
-				continue
-			}
-			if _, ok := seen[next]; ok {
-				continue
-			}
-			seen[next] = struct{}{}
-			queue = append(queue, next)
-		}
-	}
-	return len(seen) == len(allowed)
 }
 
 func validAtomicityGate(gate IntentAtomicityGate) bool {

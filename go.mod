@@ -1,6 +1,6 @@
 module github.com/KristjanPikhof/Auto-Commit-Daemon
 
-go 1.26.6
+go 1.26.9
 
 require (
 	charm.land/huh/v2 v2.0.3

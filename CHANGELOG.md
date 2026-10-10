@@ -2,13 +2,61 @@
 
 ## Unreleased
 
+### Added
+
+- `acd history rewrite --new-branch NAME` rebuilds selected linear history from
+  exact recorded file versions. The worker verifies each proposed commit while
+  newer edits keep entering checkpoints. The source branch and staging stay intact.
+- Optional history repair reviews up to five recent private ACD commits with
+  generic, filename-only, or malformed messages. It records split-goal lineage and
+  skips unchanged evidence.
+
+### Changed
+
+- `commit-all` interrupts background planning for an immediate goal review,
+  preserving purposeful commit boundaries and publication checks.
+- Intent reviews use recorded implementation, tests, imports, command registration,
+  and documentation references across planning windows. Current work gets evidence
+  space before published context, with 64 KiB per capture and 256 KiB per review.
+- Schema v30 records split repair lineage without replacing earlier mappings.
+- Remove unused planning helpers and command wrappers. Parse recorded TypeScript
+  declarations once per file and reuse them during published-support reviews.
+
 ### Fixed
 
-- Keep a stopped Intent run retryable when an AI outage leaves an oversized
-  fallback group waiting. Older stopped runs resume only after matching the
-  saved transport failure and proving the frozen target and branch are safe.
-- Report stopped publication in recovery previews. Explicit force recovery can
-  preserve the whole unpublished chain before recapturing current work.
+- Give setup's isolated self-test meaningful documentation goals so Intent can
+  publish it, then verify that restore and undo preserve the expected file contents.
+- Build and test with Go 1.26.9 to include the standard-library security fixes.
+- Recover background queues that exceed the goal window after repeated edits to
+  one file. Preserve the captured versions, then recapture current work so
+  semantic publication can resume.
+- Reject history goals that combine different authors during planning and saved
+  plan validation. Give the planner author boundaries and a correction retry.
+- Keep available implementation, test corrections, callers, and documentation
+  together. Rebuild stale or overlapping groups while preserving valid goals,
+  capture ownership, and prerequisite order. Published goals can supply context
+  for later corrections but cannot absorb new work.
+- Require evidence for missing companions. Published support must match the current
+  branch; omitted captures stay waiting. A small frozen target is reviewed together,
+  while later explanatory Go comments can clarify it only if code tokens match.
+- Retry rejected goals and provider waits after five minutes, ten minutes, then
+  hourly. Restarts preserve deadlines; transport failures do not consume semantic
+  attempts. Cached waits receive another review instead of blocking indefinitely.
+- Resume protected runs stopped by stale dependency declarations, expanded review
+  windows, or an oversized fallback during an AI outage. Recovery lookups stay
+  bounded, and branch, checkpoint, ownership, and verification checks still apply.
+- Prove Swift blank-line cleanup locally from complete recorded files, including
+  history reconstruction. Other edits retain normal goal checks.
+- Reconstruct large generated changes from their exact versions while bounding
+  provider evidence. Correction retries identify conflicting capture assignments.
+- Keep `commit-all` attached to its own run when a newer publication starts.
+  Status and list distinguish provider waits, frozen-target progress, checkpoint
+  scans, and transient reads, and stay responsive with large capture histories.
+- Honor explicit checkpoint deadlines and preserve verification command output,
+  exit status, and descendant cleanup.
+- Explicit archive recovery preserves the entire unpublished chain, including
+  pending-only queues, before recapturing work. Previews show stopped runs, and
+  JSON reports actual changes without claiming that previews or no-ops applied fixes.
 - Exclude compiler index caches under `-Xcc/` from capture and watching.
 
 ## v2026-10-04

@@ -81,13 +81,11 @@ func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T)
 			return
 		}
 
-		// On retry the composed loop appends the validator message into the
-		// user prompt as a "Your previous capture_intent_plan tool call
-		// failed validation" block. Detect that suffix so we can prove the
-		// retry path actually fired.
+		// The correction must carry the exact validator finding, independent
+		// of the prompt heading shared with valid waiting-plan reviews.
 		for _, msg := range req.Messages {
-			if strings.Contains(msg.Content,
-				"previous candidate plan failed atomicity validation") {
+			if strings.Contains(msg.Content, "candidate=recovery-group") &&
+				strings.Contains(msg.Content, "code=ready_subject_empty") {
 				sawRetryCorrection.Store(true)
 			}
 		}
@@ -100,9 +98,9 @@ func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T)
 			plan = map[string]any{
 				"selected_seqs":    seqs,
 				"deferred_seqs":    []int64{},
-				"subject":          "Recovered after retry",
-				"body":             "Composed retry absorbed the first failure.",
-				"grouping_reason":  "second-attempt success",
+				"subject":          "Add composed recovery values",
+				"body":             "- Keep the recovery value producer with its composed consumer",
+				"grouping_reason":  "the recovery consumer uses the new producer",
 				"deferred_reasons": []map[string]any{},
 			}
 		}
@@ -140,9 +138,9 @@ func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T)
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
 	writeFile(t, filepath.Join(repo, "internal/recovery/one.go"),
-		"package recovery\n\nfunc One() {}\n")
+		"package recovery\n\nfunc RecoveryValue() int { return 1 }\n")
 	writeFile(t, filepath.Join(repo, "internal/recovery/two.go"),
-		"package recovery\n\nfunc Two() {}\n")
+		"package recovery\n\nfunc ComposedRecoveryValue() int { return RecoveryValue() + 1 }\n")
 
 	startCount := commitCount(t, repo)
 	resumed := runAcd(t, ctx, fullEnv, "resume", "--repo", repo, "--yes", "--json")
@@ -171,7 +169,7 @@ func TestIntentPlannerRecovery_RetryAbsorbsEligibleValidationError(t *testing.T)
 	if got, want := commitCount(t, repo), startCount+1; got != want {
 		t.Fatalf("commit count=%d want %d (retry must publish single grouped commit)", got, want)
 	}
-	if subj := headSubject(t, repo); subj != "Recovered after retry" {
+	if subj := headSubject(t, repo); subj != "Add composed recovery values" {
 		t.Fatalf("HEAD subject=%q want corrected plan subject", subj)
 	}
 	if plannerHits.Load() != 2 {
@@ -221,6 +219,7 @@ func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
 	t.Cleanup(func() { stopSessionForce(t, env, repo) })
 
 	var hits atomic.Int32
+	var factualReviews atomic.Int32
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
@@ -234,6 +233,42 @@ func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
 			return
 		}
 		if len(captures) == 1 {
+			var forced, factual bool
+			for _, message := range req.Messages {
+				const prefix = "Plan durable semantic commit candidates for these offered captures:\n"
+				if !strings.HasPrefix(message.Content, prefix) {
+					continue
+				}
+				var payload struct {
+					ForcedAging bool `json:"forced_aging"`
+				}
+				if err := json.NewDecoder(strings.NewReader(strings.TrimPrefix(message.Content, prefix))).Decode(&payload); err != nil {
+					t.Errorf("decode singleton planning context: %v", err)
+					return
+				}
+				forced = payload.ForcedAging
+				factual = strings.Contains(message.Content, "Review the waiting goals against these facts") &&
+					strings.Contains(message.Content, "no renderer clipping or omission")
+			}
+			if captures[0].Path != "overdue.go" {
+				t.Errorf("singleton offered path=%q want overdue.go", captures[0].Path)
+				return
+			}
+			if factual {
+				if count := factualReviews.Add(1); count != 1 {
+					t.Errorf("initial waiting goal received %d factual reviews, want 1", count)
+				}
+				seqs := []int64{captures[0].Seq}
+				writeIntentPlanResponse(t, w, "call_singleton_fact_review", map[string]any{
+					"deferred_seqs": seqs, "deferred_reasons": buildDeferredReasons(seqs),
+				})
+				return
+			}
+			if !forced {
+				t.Error("singleton semantic publication preceded its forced-aging request")
+				http.Error(w, "forced-aging context required", http.StatusBadRequest)
+				return
+			}
 			plan := map[string]any{
 				"selected_seqs":    []int64{captures[0].Seq},
 				"deferred_seqs":    []int64{},
@@ -330,11 +365,11 @@ func TestIntentPlannerRecovery_ForcedSingletonUsesProvider(t *testing.T) {
 				"WHERE capture.path='overdue.go' AND candidate.status='waiting'")
 		return got == "1"
 	})
-	// Capture how many hits the deferral pass cost. Must be at least 1
-	// (the defer call); subsequent tick must add one forced-singleton call.
+	// The incomplete goal remains WAIT after one factual review. A later
+	// forced-aging session still needs its own semantic provider response.
 	hitsAfterDefer := hits.Load()
-	if hitsAfterDefer == 0 {
-		t.Fatal("planner was never called for the first (defer) pass")
+	if hitsAfterDefer != 2 || factualReviews.Load() != 1 {
+		t.Fatalf("initial waiting plan calls=%d factual reviews=%d want 2/1", hitsAfterDefer, factualReviews.Load())
 	}
 
 	// Wait past IntentMaxPendingAge so the next replay tick treats the

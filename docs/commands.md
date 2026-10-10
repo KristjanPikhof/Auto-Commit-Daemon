@@ -62,6 +62,8 @@ Disabled repository records are preserved and their databases are left
 unchanged until their next `acd on`.
 
 The isolated setup self-test uses its own Git identity in a scratch repository.
+It checkpoints and publishes two small documentation guides, then restores and
+undoes that change to verify the file contents and Git integrity.
 Your global Git identity and repository settings are unchanged.
 
 Existing installations skip first-run questions and keep their current
@@ -157,6 +159,30 @@ History rewrite groups adjacent commits by intent unless you pass
 `--messages-only`. Its preview shows the selected and resulting commit counts,
 group membership, messages, and grouping reasons before any history changes.
 
+Use `--new-branch` when original commits mixed goals or interleaved related
+work. This reconstruction uses exact recorded path versions and preserves the
+original branch:
+
+~~~bash
+acd history rewrite --last 30 --new-branch feature-goals --plan-out goals.json
+acd history rewrite --show-plan goals.json
+acd history rewrite --apply goals.json --dry-run
+acd history rewrite --apply goals.json --yes
+acd history rewrite --show-plan goals.json
+~~~
+
+Apply queues the reviewed plan for the active worker. Capture continues while
+it checks each proposed tree using the repository's approved verification.
+`status` and `list` show `history-reconstruct`; `--show-plan` reports completion
+or the failure reason. The source branch is unchanged, so select the new branch
+when ready. Reconstruction plans are immutable; generate a new plan to change
+them. Legacy adjacent-commit plans still support `--edit`.
+
+Showing or previewing a plan does not migrate state. `--plan-out` can create a
+standalone preview before runtime setup. Apply requires a worker with the new
+reconstruction protocol and matching schema; an older worker is rejected
+without changing its database.
+
 Checkpoint prefixes are accepted only when unique. Restore is full-checkpoint
 only. Preview reports create, modify, delete, mode, symlink, untracked-overwrite
 and staged-overlap counts. Apply revalidates the plan digest, `HEAD` token,
@@ -186,6 +212,10 @@ publication progress, commit-all requests, and applied history rewrites.
 Worker heartbeats, setup/readiness checkpoints and background maintenance do
 not count as activity. Slow detail checks keep known activity and unfinished
 work visible.
+
+A read that exceeds its time budget shows `refreshing`, with unknown protection
+marked as `protection_unknown` in JSON. A later successful read shows the current
+queue and publication phase.
 
 A repository with pending, blocked, stalled, or incompletely protected work
 stays visible until that work is resolved. An otherwise idle repository drops
@@ -262,6 +292,13 @@ one commit per capture; Intent mode may create several semantically atomic
 commits. The command never combines everything into one commit merely because
 of its name. If the terminal disconnects or the worker restarts, publication
 continues and the next `acd commit-all --yes` reconnects to the same drain.
+While waiting, the command follows that exact run even when newer work creates
+another run.
+This is a priority request: ACD interrupts background planning and reviews the
+protected target immediately. It brings an existing goal-review deadline
+forward once, without relaxing commit quality. For the first five minutes,
+planning corrections retry after 30, 60, then 90 seconds. Longer waits return
+to the background schedule. Provider outages retain their retry schedule.
 If the worker socket is unavailable, the command can still read the saved
 target and its last error. A saved active run does not prove that a worker is
 publishing it; worker recovery remains necessary before it can continue.
@@ -269,6 +306,19 @@ Invalid Intent grouping can use the configured retry budget, capped at two
 corrections after the first plan. Repeated no-progress state then enters
 bounded replanning or a safe local unlock. A local group still requires a
 semantic commit message before publication.
+
+ACD can repair missing prerequisite declarations and their order, then resume
+a stopped run after proving that its target is protected. Later corrections
+and documentation reviews can use published work whose recorded version still
+matches Git, including work from a superseded goal. That context is never
+selected for another commit.
+
+Related documentation can form one goal when its added lines describe the same
+behavior. Missing companions require concrete evidence; a completed goal does
+not always need new tests. Protected Go comment updates can clarify a frozen
+goal only when code tokens match, with compiler directives and cgo excluded.
+Those updates remain outside the publication target. All changes still pass
+the [Intent goal and publication checks](intent-commit-flow.md).
 
 The barrier accepts only a completed checkpoint for the requested worktree,
 branch, generation, and observation. A checkpoint from another branch or
@@ -299,6 +349,12 @@ no longer matches the interrupted restore target.
 a stale publication run when every frozen member is already published or
 recovered. Workers perform that completion automatically during startup and
 normal branch recovery; the command is a fallback for a worker that cannot run.
+
+`acd support recover --force --dry-run` also previews preservation of a queue
+containing only pending work. Apply it with `--force --yes` to save the whole
+captured chain at a private recovery ref and restart capture from current files.
+Recovery keeps the working tree and staging intact. Preserved captures count as
+recovered work; branch commitment is reported separately.
 
 Recovery also reports incomplete capture coverage. With `--yes`, it asks the
 owning worker to retry a checkpoint and returns failure if coverage remains

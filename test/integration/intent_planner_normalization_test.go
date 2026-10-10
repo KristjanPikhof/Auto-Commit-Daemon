@@ -6,6 +6,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -93,8 +94,8 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 	if paused.ExitCode != 0 {
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
-	writeFile(t, filepath.Join(repo, "norm-one.txt"), "one\n")
-	writeFile(t, filepath.Join(repo, "norm-two.txt"), "two\n")
+	writeFile(t, filepath.Join(repo, "norm-one.md"), "# Capture protection reference\n")
+	writeFile(t, filepath.Join(repo, "norm-two.md"), "# Provider reconnection reference\n")
 
 	startCount := commitCount(t, repo)
 	resumed := runAcd(t, ctx, envWith(env, extra...), "resume", "--repo", repo, "--yes", "--json")
@@ -107,13 +108,13 @@ func TestIntentStrategy_OpenAIPlannerRejectsUnrepairedSelectedDeferredOverlap(t 
 	}
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	waitForEventState(t, dbPath, "norm-one.txt", "published", 10*time.Second)
+	waitForEventState(t, dbPath, "norm-one.md", "published", 10*time.Second)
 	waitFor(t, "evidence partition recovery", 10*time.Second, func() bool {
 		return sqliteScalar(t, dbPath, "SELECT CASE WHEN COUNT(*) >= 1 THEN 1 ELSE 0 END FROM intent_planner_windows WHERE resolution_mode='evidence_partition' AND validation_failure IS NOT NULL") == "1"
 	})
 
-	oidOne := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-one.txt' ORDER BY seq DESC LIMIT 1")
-	oidTwo := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-two.txt' ORDER BY seq DESC LIMIT 1")
+	oidOne := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-one.md' ORDER BY seq DESC LIMIT 1")
+	oidTwo := sqliteScalar(t, dbPath, "SELECT commit_oid FROM capture_events WHERE path = 'norm-two.md' ORDER BY seq DESC LIMIT 1")
 	if oidOne == "" {
 		t.Fatalf("norm-one fallback commit oid is empty")
 	}
@@ -200,8 +201,9 @@ func TestIntentStrategy_PlannerRejectsLogCapturesValidationFailure(t *testing.T)
 	if paused.ExitCode != 0 {
 		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s", paused.ExitCode, paused.Stdout, paused.Stderr)
 	}
-	writeFile(t, filepath.Join(repo, "reject-one.txt"), "one\n")
-	writeFile(t, filepath.Join(repo, "reject-two.txt"), "two\n")
+	// Recovery needs independently meaningful goals after rejecting the plan.
+	writeFile(t, filepath.Join(repo, "reject-one.md"), "# Capture protection reference\n\nPreserve file versions in checkpoints before publication.\n")
+	writeFile(t, filepath.Join(repo, "reject-two.md"), "# Provider reconnection reference\n\nRetry temporary provider failures while captured work stays protected.\n")
 	rejectsPath := filepath.Join(repo, ".git", "acd", "planner-rejects.jsonl")
 	if err := os.MkdirAll(filepath.Dir(rejectsPath), 0o755); err != nil {
 		t.Fatalf("mkdir rejects dir: %v", err)
@@ -258,6 +260,7 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 
 	var plannerHits atomic.Int32
 	var rewriteHits atomic.Int32
+	var available atomic.Bool
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, "wrong path", http.StatusNotFound)
@@ -271,11 +274,22 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 			return
 		}
 		plannerHits.Add(1)
+		if available.Load() {
+			var candidates []map[string]any
+			for _, capture := range offeredIntentCaptures(t, req) {
+				candidates = append(candidates, nativeReadyIntentCandidate("outage-"+capture.Path,
+					[]int64{capture.Seq}, "Document continued offline capture",
+					"- Explain how saved work survives a temporary provider outage",
+					"this independent document explains continued offline capture"))
+			}
+			writeNativeIntentCandidatesResponse(t, w, "outage-recovered", candidates)
+			return
+		}
 		http.Error(w, "planner temporarily unavailable", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	extra := []string{
@@ -297,9 +311,15 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	startCount := commitCount(t, repo)
+	t.Cleanup(func() {
+		if t.Failed() {
+			logOutageTestState(t, repo)
+		}
+	})
+	startHead := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	writeFile(t, filepath.Join(repo, "singleton-one.txt"), "one\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
-	waitForEventState(t, dbPath, "singleton-one.txt", "published", 10*time.Second)
+	assertProviderWaitPreservesCheckpoint(t, repo, "singleton-one.txt", "one\n", startHead)
 	waitFor(t, "planner circuit opens", 10*time.Second, func() bool {
 		raw := sqliteScalar(t, dbPath,
 			"SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
@@ -318,38 +338,156 @@ func TestIntentStrategy_SingletonTransportFailureOpensCircuit(t *testing.T) {
 	if got := rewriteHits.Load(); got != 0 {
 		t.Fatalf("message rewrite hits=%d want none during planner outage", got)
 	}
-	if got := runGitOK(t, repo, "show", "HEAD:singleton-one.txt"); got != "one\n" {
-		t.Fatalf("first published capture=%q", got)
-	}
+	before := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
 
 	writeFile(t, filepath.Join(repo, "singleton-two.txt"), "two\n")
 	wakeSession(t, ctx, envWith(env, extra...), repo, "intent-singleton-circuit")
-	waitForEventState(t, dbPath, "singleton-two.txt", "published", 10*time.Second)
+	assertProviderWaitPreservesCheckpoint(t, repo, "singleton-two.txt", "two\n", startHead)
+	assertOutageStatusAndList(t, ctx, envWith(env, extra...), repo, 2)
 
 	if got := plannerHits.Load(); got != 1 {
 		t.Fatalf("planner hits after cooldown bypass=%d want 1", got)
 	}
-	waitFor(t, "persisted planner circuit bypass", 10*time.Second, func() bool {
-		raw := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
-		var health struct {
-			State       string `json:"state"`
-			BypassCount uint64 `json:"bypass_count"`
-		}
-		return json.Unmarshal([]byte(raw), &health) == nil && health.State == "open" && health.BypassCount >= 1
-	})
 	if got := sqliteScalar(t, dbPath, `
 SELECT COUNT(*) FROM capture_events
-WHERE path IN ('singleton-one.txt','singleton-two.txt') AND state='pending'`); got != "0" {
-		t.Fatalf("pending captures=%s want 0", got)
+WHERE path IN ('singleton-one.txt','singleton-two.txt') AND state='pending'`); got != "2" {
+		t.Fatalf("pending captures=%s want 2", got)
 	}
-	if got := runGitOK(t, repo, "show", "HEAD:singleton-one.txt"); got != "one\n" {
-		t.Fatalf("first capture changed during circuit bypass: %q", got)
+	if got := commitCount(t, repo); got != startCount {
+		t.Fatalf("outage produced commits: %d want %d", got, startCount)
 	}
-	if got := runGitOK(t, repo, "show", "HEAD:singleton-two.txt"); got != "two\n" {
-		t.Fatalf("second published capture=%q", got)
+	fullEnv := envWith(env, extra...)
+	if err := stopIntentTestWorker(t, fullEnv, repo, "intent-singleton-circuit"); err != nil {
+		t.Fatal(err)
 	}
-	if got := commitCount(t, repo); got != startCount+2 {
-		t.Fatalf("commit count=%d want %d during provider outage",
-			got, startCount+2)
+	restartOutageTestSession(t, ctx, fullEnv, repo, "intent-singleton-circuit", "shell")
+	wakeSession(t, ctx, fullEnv, repo, "intent-singleton-circuit")
+	assertOutageStatusAndList(t, ctx, fullEnv, repo, 2)
+	after := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'")
+	if before != after || plannerHits.Load() != 1 || rewriteHits.Load() != 0 {
+		t.Fatalf("restart reset provider cooldown: before=%s after=%s calls=%d/%d", before, after, plannerHits.Load(), rewriteHits.Load())
+	}
+	if err := stopIntentTestWorker(t, fullEnv, repo, "intent-singleton-circuit"); err != nil {
+		t.Fatal(err)
+	}
+	makeOutageProbeDue(t, repo)
+	available.Store(true)
+	restartOutageTestSession(t, ctx, fullEnv, repo, "intent-singleton-circuit", "shell")
+	wakeSession(t, ctx, fullEnv, repo, "intent-singleton-circuit")
+	for path, body := range map[string]string{"singleton-one.txt": "one\n", "singleton-two.txt": "two\n"} {
+		waitForEventState(t, dbPath, path, "published", 15*time.Second)
+		if got := runGitOK(t, repo, "show", "HEAD:"+path); got != body {
+			t.Fatalf("reconnection changed protected bytes for %s: %q", path, got)
+		}
+	}
+	if got := commitCount(t, repo); got != startCount+2 || plannerHits.Load() != 2 || rewriteHits.Load() != 0 {
+		t.Fatalf("reconnection commits=%d want=%d provider calls=%d/%d", got, startCount+2, plannerHits.Load(), rewriteHits.Load())
+	}
+	if subject := headSubject(t, repo); subject != "Document continued offline capture" {
+		t.Fatalf("reconnection published a generic message: %q", subject)
+	}
+}
+
+// Advance only the derived retry deadline after the test-owned worker stops.
+// This exercises restart recovery without sleeping for a production cooldown.
+func makeOutageProbeDue(t *testing.T, repo string) {
+	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	sqliteExec(t, dbPath, fmt.Sprintf(`UPDATE daemon_meta SET value=json_set(value,'$.next_probe_ts',%d) WHERE key='intent.planner.health'`, time.Now().Unix()-1))
+}
+
+func logOutageTestState(t *testing.T, repo string) {
+	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	t.Logf("outage diagnostic: mode=%s pending=%s health=%s windows=%s candidates=%s", readDaemonStateMode(repo),
+		sqliteScalar(t, dbPath, "SELECT path||':'||state FROM capture_events"),
+		sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key='intent.planner.health'"),
+		sqliteScalar(t, dbPath, "SELECT resolution_mode||':'||COALESCE(validation_failure,'') FROM intent_planner_windows ORDER BY id DESC LIMIT 2"),
+		sqliteScalar(t, dbPath, "SELECT status||':'||COALESCE(verification_status,'')||':'||COALESCE(verification_output,'') FROM intent_candidates"))
+}
+
+func restartOutageTestSession(t *testing.T, ctx context.Context, env []string, repo, session, harness string) {
+	t.Helper()
+	enabled := runAcd(t, ctx, env, "on", "--repo", repo, "--json")
+	if enabled.ExitCode != 0 {
+		t.Fatalf("enable restarted outage worker: %s %s", enabled.Stdout, enabled.Stderr)
+	}
+	result := runAcd(t, ctx, env, "start", "--repo", repo, "--session-id", session, "--harness", harness, "--json")
+	if result.ExitCode != 0 {
+		t.Fatalf("restart outage worker: %s %s", result.Stdout, result.Stderr)
+	}
+	waitMode(t, repo, "running", 5*time.Second)
+}
+
+func assertOutageStatusAndList(t *testing.T, ctx context.Context, env []string, repo string, pending int) {
+	t.Helper()
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+	waitFor(t, "completed outage protection observation", 10*time.Second, func() bool {
+		return sqliteScalar(t, dbPath, `SELECT
+ (SELECT value FROM daemon_meta WHERE key='protection.complete')='true'
+ AND (SELECT value FROM daemon_meta WHERE key='protection.observation_epoch')=
+     (SELECT value FROM daemon_meta WHERE key='protection.covered_epoch')`) == "1"
+	})
+	canonicalRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type snapshot struct {
+		Repo              string `json:"repo"`
+		Protected         bool   `json:"protected"`
+		ProtectionUnknown bool   `json:"protection_unknown"`
+		Pending           int    `json:"pending_events"`
+		ActionRequired    bool   `json:"action_required"`
+		Progress          struct {
+			Phase      string `json:"phase"`
+			Remaining  int64  `json:"wait_remaining_seconds"`
+			Responsive bool   `json:"worker_responsive"`
+		} `json:"publication_progress"`
+		Outcome struct {
+			RetryAt float64 `json:"retry_at"`
+		} `json:"publication_outcome"`
+	}
+	for _, command := range []string{"status", "list"} {
+		args := []string{command, "--json"}
+		if command == "status" {
+			args = append(args, "--repo", repo)
+		}
+		var got snapshot
+		var result ExecResult
+		waitFor(t, "stable "+command+" provider retry observation", 10*time.Second, func() bool {
+			result = runAcd(t, ctx, env, args...)
+			if result.ExitCode != 0 {
+				return false
+			}
+			var payload struct {
+				Data json.RawMessage `json:"data"`
+			}
+			if json.Unmarshal([]byte(result.Stdout), &payload) != nil {
+				return false
+			}
+			got = snapshot{}
+			if command == "status" {
+				if json.Unmarshal(payload.Data, &got) != nil {
+					return false
+				}
+			} else {
+				var list struct {
+					Repos []snapshot `json:"repos"`
+				}
+				if json.Unmarshal(payload.Data, &list) != nil {
+					return false
+				}
+				for _, row := range list.Repos {
+					if row.Repo == canonicalRepo {
+						got = row
+						break
+					}
+				}
+			}
+			return !got.ProtectionUnknown && !(got.Progress.Phase == "checkpointing" && got.Progress.Responsive)
+		})
+		if got.Repo != canonicalRepo || !got.Protected || got.Pending != pending || got.ActionRequired || got.Progress.Phase != "provider_wait" || got.Progress.Remaining <= 0 || got.Outcome.RetryAt <= float64(time.Now().Unix()) {
+			t.Fatalf("%s hid protected provider retry: %+v\n%s", command, got, result.Stdout)
+		}
 	}
 }

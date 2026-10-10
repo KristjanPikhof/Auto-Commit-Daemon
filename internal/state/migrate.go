@@ -117,6 +117,16 @@ func (d *DB) Migrate(ctx context.Context) error {
 }
 
 func applyVersionedMigrations(ctx context.Context, tx *sql.Tx, cur int) error {
+	if cur < 30 {
+		// Preserve the original mapping rows and copy their provenance into the
+		// additive lineage relation. Only split transactions use the new relation.
+		if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO intent_repair_commit_lineage
+SELECT repair_id,ord,candidate_id,old_oid,new_oid FROM intent_repair_commits;
+`); err != nil {
+			return fmt.Errorf("state: migrate capture repair lineage: %w", err)
+		}
+	}
 	if cur < 29 {
 		if err := addColumnIfMissing(ctx, tx, "checkpoints", "coverage_complete", "INTEGER NOT NULL DEFAULT 1 CHECK (coverage_complete IN (0,1))"); err != nil {
 			return err

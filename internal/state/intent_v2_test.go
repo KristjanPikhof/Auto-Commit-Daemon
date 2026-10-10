@@ -426,7 +426,7 @@ INSERT INTO intent_candidate_events(
 		PlanDigest: testIntentRepairPlanDigest,
 		Commits:    commits,
 	})
-	if err == nil || !strings.Contains(err.Error(), "1..5") {
+	if err == nil || !strings.Contains(err.Error(), "count exceeds 5") {
 		t.Fatalf("repair cap err=%v", err)
 	}
 	var repairs int

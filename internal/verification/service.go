@@ -681,9 +681,11 @@ func runApprovedCommand(
 	// could run after the approved shell exited but before Go observed Wait.
 	// fd 3 preserves the command's real exit status before SIGKILL reaches the
 	// supervisor itself; Go repeats the group kill as a bounded fallback.
+	// Redirect supervisor cleanup output before announcing command completion.
 	const supervisorScript = `finish() {
 	status=$?
 	trap - EXIT HUP INT TERM
+	exec >/dev/null 2>&1
 	printf '%d\n' "$status" >&3
 	/bin/kill -KILL -- "-$$"
 	exit "$status"

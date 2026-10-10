@@ -68,11 +68,10 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "config", "--local", "user.email", "selftest@localhost"); err != nil {
 		return err
 	}
-	file := filepath.Join(repo, "file.txt")
-	if err := os.WriteFile(file, []byte("one\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Setup verification\n"), 0o644); err != nil {
 		return err
 	}
-	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "add", "file.txt"); err != nil {
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "add", "README.md"); err != nil {
 		return err
 	}
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "commit", "-m", "seed"); err != nil {
@@ -99,7 +98,7 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 		db.Close()
 		return err
 	}
-	initial, err := store.Create(ctx, checkpoint.Request{RepoRoot: repo, WorktreeID: checkpoint.WorktreeID(repo), Reason: state.CheckpointReasonMigration, ObservationEpoch: 1, CoverageEpoch: 1, ObservedHead: head, ObservedRef: "refs/heads/main", Entries: entries, Exclusions: exclusions})
+	initial, err := store.Create(ctx, checkpoint.Request{RepoRoot: repo, WorktreeID: checkpoint.WorktreeID(wt.Root), Reason: state.CheckpointReasonMigration, ObservationEpoch: 1, CoverageEpoch: 1, ObservedHead: head, ObservedRef: "refs/heads/main", Entries: entries, Exclusions: exclusions})
 	if err != nil {
 		db.Close()
 		return err
@@ -153,13 +152,17 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 			err, root, processErr, detail)
 	}
 	client := supervisor.Client{SocketPath: scratchRoots.SupervisorSocketPath(), Timeout: 45 * time.Second}
-	if err := os.WriteFile(file, []byte("two\n"), 0o644); err != nil {
+	captureGuidePath := filepath.Join(repo, "capture-protection.md")
+	captureGuide := "# Capture protection guide\n\nSave captured file versions in durable checkpoints before publication.\n"
+	if err := os.WriteFile(captureGuidePath, []byte(captureGuide), 0o644); err != nil {
 		return err
 	}
 	if _, err := selfTestRequest(ctx, client, registration.Record, "checkpoint_barrier", nil); err != nil {
 		return err
 	}
-	if err := os.WriteFile(file, []byte("three\n"), 0o644); err != nil {
+	publicationGuidePath := filepath.Join(repo, "publication-target.md")
+	publicationGuide := "# Publication target guide\n\nKeep later edits protected while the current publication target stays frozen.\n"
+	if err := os.WriteFile(publicationGuidePath, []byte(publicationGuide), 0o644); err != nil {
 		return err
 	}
 	drainParams, _ := json.Marshal(map[string]bool{"drain_publication": true})
@@ -215,6 +218,11 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	if indexAfter, readErr := os.ReadFile(filepath.Join(wt.GitDir, "index")); readErr != nil || string(indexAfter) != string(indexBefore) {
 		return errors.New("setup self-test: restore changed index")
 	}
+	for _, file := range []string{captureGuidePath, publicationGuidePath} {
+		if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("setup self-test: restore did not remove %s: %v", filepath.Base(file), err)
+		}
+	}
 	params, _ = json.Marshal(map[string]string{"id": restoreResult.UndoCheckpoint})
 	undoPreview, err := selfTestRequest(ctx, client, registration.Record, "restore_plan", params)
 	if err != nil {
@@ -226,6 +234,11 @@ func ScratchSelfTest(ctx context.Context, plan Plan) (returnErr error) {
 	params, _ = json.Marshal(map[string]string{"id": restoreResult.UndoCheckpoint, "plan_digest": planData.PlanDigest})
 	if _, err := selfTestRequest(ctx, client, registration.Record, "restore_apply", params); err != nil {
 		return err
+	}
+	for file, expected := range map[string]string{captureGuidePath: captureGuide, publicationGuidePath: publicationGuide} {
+		if content, err := os.ReadFile(file); err != nil || string(content) != expected {
+			return fmt.Errorf("setup self-test: undo did not restore %s: %v", filepath.Base(file), err)
+		}
 	}
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "fsck", "--no-dangling"); err != nil {
 		return err

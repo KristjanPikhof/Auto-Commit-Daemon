@@ -1395,6 +1395,7 @@ type intentReplayConfig struct {
 	commitFormat         ai.CommitFormat
 	plannerProvider      string
 	plannerModel         string
+	goalDependencies     []IntentDependencyHint
 }
 
 type unavailableIntentPlanner struct {
@@ -1672,6 +1673,7 @@ func replayIntentBatch(
 		sum.RecoveryMode = publicationFallbackSemanticReplan
 	}
 	quiescenceNow := pathQuiescenceNow()
+	goalPending := pending
 	if cfg.pathQuiescence > 0 && len(cfg.targetEventSeqs) > 0 &&
 		(cfg.semanticSalvage || cfg.atomicFallback) {
 		quiet, err := intentRecoveryTargetQuiescent(
@@ -1796,6 +1798,7 @@ func replayIntentBatch(
 					"daemon: atomic fallback planner has type %T", cfg.planner)
 			}
 			fallback.combineWindow = true
+			fallback.semanticPrefix = &cfg.forwardRecoveryPlan
 			cfg.planner = fallback
 		} else {
 			window, err = publicationDrainAtomicFallbackWindow(
@@ -1807,7 +1810,51 @@ func replayIntentBatch(
 	if err != nil {
 		return sum, err
 	}
+	if cfg.candidateMode && !cfg.atomicFallback && len(window) > 0 && len(goalPending) > len(window) {
+		window, err = expandIntentSwiftMaintenanceWindow(ctx, repoRoot, db, goalPending, window, cfg, quiescenceNow)
+		if err != nil {
+			return sum, err
+		}
+		if len(window) > 1 {
+			forced = false
+		}
+	}
+	if cfg.candidateMode && !cfg.atomicFallback && len(window) > 0 && len(goalPending) > len(window) {
+		var goalWait string
+		window, cfg.goalDependencies, goalWait, err = expandIntentGoalWindow(
+			ctx, repoRoot, db, activeCtx, goalPending, window, cfg, quiescenceNow)
+		if err != nil {
+			return sum, err
+		}
+		if goalWait != "" {
+			waitReason = goalWait
+		}
+		if len(window) > 1 {
+			forced = false
+		}
+	}
 	if len(window) == 0 {
+		if waitReason == "skipped_due_intent_goal_context_limit" &&
+			len(goalPending) > state.IntentCandidateMaxCaptures &&
+			opts.PublicationDrain == nil && len(cfg.targetEventSeqs) == 0 {
+			// Preserve the oversized background chain before rebuilding its
+			// current versions. A frozen publication target must stay unchanged.
+			recovered, err := ReconcileUnpublishedChain(ctx, repoRoot, db, RecoveryReconcileOptions{
+				GitDir: opts.GitDir, BranchRef: activeCtx.BranchRef,
+				BranchGeneration: activeCtx.BranchGeneration, FirstSeq: goalPending[0].Seq,
+				Trigger: "intent_goal_context_limit", Trace: opts.Trace,
+				EvidenceLimit: state.CompletedBranchTransitionProofLimit,
+				ArchiveOnly:   true, InvalidateShadow: true,
+			})
+			if err != nil {
+				return sum, err
+			}
+			if recovered.Handled {
+				sum.RecaptureRequired = true
+				sum.HasMore = true
+				return sum, nil
+			}
+		}
 		if waitReason != "" {
 			sum.Skipped = true
 			sum.SkippedReason = waitReason
@@ -2066,6 +2113,28 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 		}
 		return pending[:n], false, "", nil
 	}
+	if cfg.candidateMode && len(cfg.targetEventSeqs) > 0 && len(pending) > 1 &&
+		len(pending) <= cfg.window && len(pending) <= ai.IntentCandidateCaptureCap {
+		complete, err := completeProtectedIntentFrozenWindow(ctx, db, pending, cfg.targetEventSeqs)
+		if err != nil {
+			return nil, false, "", err
+		}
+		if complete {
+			// Offer the complete bounded remainder together. Separate valid WAIT
+			// owners cannot reoffer one another after aging selects a singleton.
+			// The planner still chooses goals through every ordinary gate.
+			return pending, false, "", nil
+		}
+	}
+	if cfg.candidateMode && len(cfg.targetEventSeqs) == 0 {
+		due, err := dueIntentSemanticReviewWindow(ctx, db, pending, cfg.window, time.Now().UTC())
+		if err != nil {
+			return nil, false, "", err
+		}
+		if len(due) > 0 {
+			return due, false, "", nil
+		}
+	}
 	var (
 		forcedEvent  state.CaptureEvent
 		forcedState  state.PlannerState
@@ -2139,6 +2208,15 @@ func selectIntentWindow(ctx context.Context, db *state.DB, pending []state.Captu
 	if !cfg.bypassBatchWait && !boundaryTriggered {
 		if waitReason := intentBatchWaitReason(pending, cfg, time.Now()); waitReason != "" {
 			return nil, false, waitReason, nil
+		}
+	}
+	if cfg.candidateMode && len(cfg.targetEventSeqs) == 0 && pending[0].BranchRef != "" {
+		fresh, err := freshIntentWindowAfterHeldGoal(ctx, db, pending, cfg.window)
+		if err != nil {
+			return nil, false, "", err
+		}
+		if len(fresh) > 0 {
+			return fresh, false, "", nil
 		}
 	}
 	n := cfg.window
@@ -2369,10 +2447,6 @@ func persistPathQuiescenceSnapshot(ctx context.Context, db *state.DB, gated int,
 		lastPersistedQuiescenceGated.Store(g64)
 	}
 	_ = state.MetaSet(ctx, db, MetaKeyPathQuiescenceUpdatedAt, time.Now().UTC().Format(time.RFC3339))
-}
-
-func intentBatchShouldWait(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) bool {
-	return intentBatchWaitReason(pending, cfg, now) != ""
 }
 
 func intentBatchWaitReason(pending []state.CaptureEvent, cfg intentReplayConfig, now time.Time) string {

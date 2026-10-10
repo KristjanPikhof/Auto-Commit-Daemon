@@ -218,11 +218,19 @@ Protection and Git publication are separate:
 An invalid or incomplete AI plan is not trusted. ACD can reject it, retry the
 provider, or rebuild the plan from the still-protected captures. If the
 provider remains unavailable, publication waits without losing the
-checkpoint.
+checkpoint. ACD keeps capturing and retries after five minutes, ten minutes,
+then hourly. Retry times survive restarts, and status shows when the next probe
+is due. Unrelated changes and incomplete goals cannot pass merely because they
+have waited a long time.
 
 Normal publication appends commits. Optional Intent repair can rewrite only a
 bounded recent suffix that ACD proves is private, unshared, and ACD-owned. It
 does not rewrite pushed or user-owned history.
+
+For an explicit history cleanup, `acd history rewrite --new-branch NAME` can
+split mixed commits and regroup interleaved work from recorded path versions.
+It saves a reviewable plan and delegates verification to the active worker.
+The original branch is preserved, and capture continues during reconstruction.
 
 Read [the architecture overview](docs/overview.md) and [protection and
 publication](docs/capture-replay.md) for the full durability protocol.
@@ -309,7 +317,7 @@ acd uninstall
 
 ## Development
 
-Building from source requires Go 1.26.6:
+Building from source requires Go 1.26.9:
 
 ~~~bash
 make build

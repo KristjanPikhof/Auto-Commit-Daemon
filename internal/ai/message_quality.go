@@ -30,6 +30,7 @@ const (
 	MessageQualityReasonBodyRequired       MessageQualityReasonCode = "body_required"
 	MessageQualityReasonMalformedBody      MessageQualityReasonCode = "malformed_body"
 	MessageQualityReasonMalformedSubject   MessageQualityReasonCode = "malformed_subject"
+	MessageQualityReasonTruncatedSubject   MessageQualityReasonCode = "truncated_subject"
 	MessageQualityReasonUnknownCommitType  MessageQualityReasonCode = "unknown_commit_type"
 	MessageQualityReasonSanitizedSubject   MessageQualityReasonCode = "sanitized_subject"
 	MessageQualityReasonSanitizedBody      MessageQualityReasonCode = "sanitized_body"
@@ -90,6 +91,9 @@ func EvaluateIntentPlanMessageQuality(req IntentPlanRequest, plan IntentPlan) Me
 	if subject != strings.TrimSpace(plan.Subject) {
 		report.add(MessageQualityReasonSanitizedSubject, "subject changes after sanitation")
 	}
+	if strings.HasSuffix(subject, "…") || strings.HasSuffix(strings.TrimSpace(plan.Subject), "...") {
+		report.add(MessageQualityReasonTruncatedSubject, "subject is clipped; rewrite the complete outcome within the subject limit")
+	}
 	if body != strings.TrimSpace(plan.Body) {
 		report.add(MessageQualityReasonSanitizedBody, "body changes after sanitation")
 	}
@@ -114,7 +118,7 @@ func EvaluateIntentPlanMessageQuality(req IntentPlanRequest, plan IntentPlan) Me
 	if isFilenameOnlySubject(subject, ctx.paths) {
 		report.add(MessageQualityReasonFilenameOnly, "subject only names a file or path")
 	}
-	if isTokenOnlySubject(subject) {
+	if isTokenOnlySubject(subject) || isCapturedSymbolOnlySubject(subject, ctx.captures) {
 		report.add(MessageQualityReasonTokenOnly, "subject only names a parsed token or symbol")
 	}
 
@@ -142,6 +146,7 @@ func (r MessageQualityReport) decide(plan IntentPlan) MessageQualityAction {
 		return MessageQualityFallback
 	}
 	if r.HasReason(MessageQualityReasonGenericSubject) ||
+		r.HasReason(MessageQualityReasonTruncatedSubject) ||
 		r.HasReason(MessageQualityReasonFilenameOnly) ||
 		r.HasReason(MessageQualityReasonTokenOnly) ||
 		r.HasReason(MessageQualityReasonBodyRequired) ||
@@ -250,10 +255,11 @@ var genericSubjectPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^(update|change|modify|fix|adjust|improve|refactor)\s+(file|files|stuff|things|changes|code|content|logic|data)$`),
 	regexp.MustCompile(`(?i)^(wip|changes|misc|miscellaneous|updates?)$`),
 	regexp.MustCompile(`(?i)^update\s+\d+\s+files?(?:\s+in\s+.+)?$`),
+	regexp.MustCompile(`(?i)^(add|remove|rename|update|fix|refactor|modify|change)\s+.+\s+(code|test|documentation|configuration|asset)\s+changes$`),
 }
 
 func isGenericSubject(subject string) bool {
-	subject = strings.TrimSpace(subject)
+	subject = strings.TrimSpace(subjectTailForQuality(subject))
 	for _, re := range genericSubjectPatterns {
 		if re.MatchString(subject) {
 			return true
@@ -262,12 +268,21 @@ func isGenericSubject(subject string) bool {
 	return false
 }
 
+// Conventional subjects use the same semantic quality bar as imperative ones.
+func subjectTailForQuality(subject string) string {
+	if prefix, rest, ok := strings.Cut(subject, ":"); ok &&
+		!strings.ContainsAny(prefix, " /\\") {
+		return strings.TrimSpace(rest)
+	}
+	return subject
+}
+
 func isFilenameOnlySubject(subject string, paths map[string]struct{}) bool {
 	subject = strings.TrimSpace(subject)
 	if subject == "" {
 		return false
 	}
-	tail := subjectTail(subject)
+	tail := subjectTail(subjectTailForQuality(subject))
 	if looksLikePathToken(tail) {
 		return true
 	}
@@ -305,19 +320,49 @@ func looksLikePathToken(s string) bool {
 }
 
 func isTokenOnlySubject(subject string) bool {
-	tail := strings.Trim(subjectTail(subject), "`'\" ")
+	tail := strings.Trim(subjectTail(subjectTailForQuality(subject)), "`'\" ")
 	if tail == "" || strings.Contains(tail, " ") || looksLikePathToken(tail) {
 		return false
 	}
 	if strings.Contains(tail, "_") || strings.Contains(tail, "-") {
 		return true
 	}
-	if hasInternalUpper(tail) && tail[0] >= 'a' && tail[0] <= 'z' {
+	if hasInternalUpper(tail) {
 		return true
 	}
 	switch strings.ToLower(tail) {
 	case "parsed", "total", "value", "data", "state", "result", "item", "items", "helper", "logic", "flow":
 		return true
+	}
+	return false
+}
+
+func isCapturedSymbolOnlySubject(subject string, captures []OfferedCapture) bool {
+	qualitySubject := subjectTailForQuality(subject)
+	tail := strings.Trim(subjectTail(qualitySubject), "`'\" ")
+	if tail == "" {
+		return false
+	}
+	for _, capture := range captures {
+		label := extractSymbol(capture.Path, capture.CapturedDiff)
+		if label == "" || !strings.EqualFold(label, tail) {
+			continue
+		}
+		switch changeClass(capture.Path) {
+		case "code", "tests":
+			return true
+		case "docs":
+			// A new named guide can be a complete goal. Updating an existing
+			// heading only identifies its location, not the changed behavior.
+			if capture.Op == "create" {
+				continue
+			}
+			fields := strings.Fields(qualitySubject)
+			if strings.EqualFold(qualitySubject, tail) || len(fields) > 0 &&
+				(strings.EqualFold(fields[0], "update") || strings.EqualFold(fields[0], "change") || strings.EqualFold(fields[0], "modify")) {
+				return true
+			}
+		}
 	}
 	return false
 }

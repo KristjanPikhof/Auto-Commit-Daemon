@@ -11,6 +11,7 @@ import (
 )
 
 func TestReconcileUnpublishedChainUsesCompletedRepairBase(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	afterRepair, err := git.HashObjectStdin(ctx, f.dir, []byte("after repair\n"))
@@ -70,6 +71,7 @@ func TestReconcileUnpublishedChainUsesCompletedRepairBase(t *testing.T) {
 }
 
 func TestReconcileUnpublishedChainProvesPublishedAcrossCompletedRepairs(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	anchorBefore, _ := git.HashObjectStdin(ctx, f.dir, []byte("anchor before\n"))
@@ -169,6 +171,7 @@ func TestReconcileUnpublishedChainProvesPublishedAcrossCompletedRepairs(t *testi
 }
 
 func TestReconcileUnpublishedChainUsesRestoredPreRepairContext(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))
@@ -256,6 +259,7 @@ func TestReconcileUnpublishedChainUsesRestoredPreRepairContext(t *testing.T) {
 }
 
 func TestReconcileUnpublishedChainUsesRestoredIntermediateRepairContext(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	a, _ := git.HashObjectStdin(ctx, f.dir, []byte("A\n"))

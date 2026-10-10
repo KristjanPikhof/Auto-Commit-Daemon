@@ -152,11 +152,12 @@ func UpdateIntentPlanRun(ctx context.Context, d *DB, run IntentPlanRun) error {
 UPDATE intent_plan_runs
 SET preserved_groups=?, unresolved_seqs=?, finding_codes=?,
     normalized_partition=?, progress_state=?, resolution_mode=?,
-    resolved_plan_json=?, completed=?,
+    resolved_plan_json=?, completed=?, provider_deadline_ts=?, attempt_count=?,
     updated_ts=?
 WHERE fingerprint=?`, string(preserved), string(unresolved), string(findings),
 		run.NormalizedPartition, run.ProgressState, run.ResolutionMode,
-		run.ResolvedPlanJSON, boolInt(run.Completed), nowSeconds(), run.Fingerprint)
+		run.ResolvedPlanJSON, boolInt(run.Completed), run.ProviderDeadlineTS, run.AttemptCount,
+		nowSeconds(), run.Fingerprint)
 	if err != nil {
 		return fmt.Errorf("state: update intent plan run: %w", err)
 	}
@@ -202,8 +203,9 @@ func scanIntentPlanRun(row *sql.Row) (IntentPlanRun, error) {
 	return run, nil
 }
 
-// StartIntentProviderBudget freezes a wall-clock deadline before a provider call.
-// Narrowed correction requests and worker restarts share this same budget.
+// StartIntentProviderBudget freezes the active semantic correction deadline.
+// Transport waits suspend this deadline; narrowed correction requests and
+// restarts during an active correction cycle retain it.
 func StartIntentProviderBudget(ctx context.Context, db *DB, run IntentPlanRun, deadline float64) (IntentPlanRun, error) {
 	if _, err := db.SQL().ExecContext(ctx, `UPDATE intent_plan_runs SET provider_deadline_ts=? WHERE fingerprint=? AND provider_deadline_ts=0`, deadline, run.Fingerprint); err != nil {
 		return run, err

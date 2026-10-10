@@ -154,7 +154,7 @@ func TestValidateIntentPlanV2RejectsReadyCandidateWithMissingCompanion(t *testin
 	}
 }
 
-func TestValidateIntentPlanV2RejectsDeferredForcedCapture(t *testing.T) {
+func TestValidateIntentPlanV2RetainsIncompleteForcedCapture(t *testing.T) {
 	req, err := NewIntentPlanRequestV2(IntentPlanRequestV2Options{
 		OfferedCaptures: []OfferedCapture{{
 			Seq: 1, Path: "a.go", Op: "modify",
@@ -166,16 +166,14 @@ func TestValidateIntentPlanV2RejectsDeferredForcedCapture(t *testing.T) {
 	}
 	candidate := readyCandidate("forced", []int64{1})
 	candidate.Readiness = IntentCandidateWait
-	candidate.MissingCompanions = []string{"a companion outside the forced window"}
+	candidate.MissingCompanions = []string{"the captured caller refers to an unavailable migration"}
 
 	err = ValidateIntentPlanV2(req, IntentPlanV2{
 		ProtocolVersion: IntentPlannerProtocolV2,
 		Candidates:      []IntentCandidateAssignment{candidate},
 	})
-	var validationErr *IntentPlanV2ValidationError
-	if !errors.As(err, &validationErr) ||
-		validationErr.Findings[0].Code != "forced_capture_deferred" {
-		t.Fatalf("error = %T %v", err, err)
+	if err != nil {
+		t.Fatalf("age waived a valid completeness wait: %v", err)
 	}
 }
 
@@ -351,7 +349,8 @@ func TestAdaptIntentPlanV1UsesStableDistinctCandidateIDsAcrossWindows(t *testing
 
 func TestNewIntentPlanRequestV2RedactsAndCapsDiff(t *testing.T) {
 	secret := "Authorization: Bearer sk-" + strings.Repeat("x", 80)
-	longDiff := secret + "\n" + strings.Repeat("+sensitive-looking-source\n", IntentStageDiffCap)
+	const changedLine = "+sensitive-looking-source\n"
+	longDiff := secret + "\n" + strings.Repeat(changedLine, IntentStageDiffCap/len(changedLine)+1)
 	req, err := NewIntentPlanRequestV2(IntentPlanRequestV2Options{
 		OfferedCaptures: []OfferedCapture{{
 			Seq: 1, Path: "a.go", Op: "modify", CapturedDiff: longDiff,
@@ -514,6 +513,12 @@ func TestIntentPlanV2SupportsPurposefulSteps(t *testing.T) {
 		"Separate a preparatory refactor from a later feature",
 		"Keep tests, imports, generated output, and other support changes with the behavior they complete",
 		"Give a broad behavior or default-setting change its own purpose",
+		"Candidates with status=published supply existing baseline behavior",
+		"Output selected_seqs may contain only offered_captures seqs",
+		"retained context, not additional assignments",
+		"reuse its candidate_id and select only its offered additions",
+		"Do not call that behavior missing merely because its captures are not offered",
+		"A later correction or regression test may complete its own useful goal against that baseline",
 	} {
 		if !strings.Contains(prompt, phrase) {
 			t.Fatalf("v2 planner missing purposeful grouping guidance %q", phrase)

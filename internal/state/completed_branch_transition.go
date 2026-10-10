@@ -275,7 +275,7 @@ func completedIntentRepairProof(
 		!repair.OldHead.Valid || repair.OldHead.String != transition.SourceHead ||
 		!repair.NewHead.Valid || repair.NewHead.String != transition.TargetHead ||
 		!repair.BackupRef.Valid || repair.BackupRef.String == "" ||
-		len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxCommits {
+		len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxMappings {
 		return IntentRepair{}, completedBranchTransitionProofError(
 			"intent repair %s has incomplete transition proof",
 			transition.ID)
@@ -355,9 +355,13 @@ func completedIntentRepairCommitChain(
 	seen := map[string]struct{}{current: {}}
 	chain := []string{current}
 	for step := 0; step < CompletedBranchTransitionProofLimit; step++ {
+		table, err := intentRepairMappingsTable(ctx, d.readSQL())
+		if err != nil {
+			return nil, err
+		}
 		rows, err := d.readSQL().QueryContext(ctx, `
-SELECT r.id,c.new_oid
-FROM intent_repair_commits c
+SELECT DISTINCT r.id,CASE WHEN r.old_head=c.old_oid THEN r.new_head ELSE c.new_oid END
+FROM `+table+` c
 JOIN intent_repairs r ON r.id=c.repair_id
 WHERE r.branch_ref=? AND r.branch_generation=?
   AND r.status='completed' AND c.old_oid=?

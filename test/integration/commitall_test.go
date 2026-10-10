@@ -5,6 +5,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os/exec"
@@ -27,6 +28,19 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	env := withIsolatedHome(t)
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	var plannerCalls atomic.Int32
+	type suppliedCapture struct {
+		Seq          int64  `json:"seq"`
+		Path         string `json:"path"`
+		Op           string `json:"op"`
+		CapturedDiff string `json:"captured_diff"`
+		FileMetadata struct {
+			Kind              string `json:"kind"`
+			BeforeBytes       int64  `json:"before_bytes"`
+			AfterBytes        int64  `json:"after_bytes"`
+			DiffOmittedReason string `json:"diff_omitted_reason"`
+		} `json:"file_metadata"`
+	}
+	var initialCapture atomic.Pointer[suppliedCapture]
 	server, trustEnv := newOpenAITestServer(t, http.HandlerFunc(func(
 		w http.ResponseWriter, r *http.Request,
 	) {
@@ -41,7 +55,54 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 			http.Error(w, "expected one offered capture", http.StatusBadRequest)
 			return
 		}
-		if plannerCalls.Add(1) == 1 {
+		var payload struct {
+			OfferedCaptures []suppliedCapture `json:"offered_captures"`
+		}
+		var prompt string
+		const prefix = "Plan durable semantic commit candidates for these offered captures:\n"
+		for _, message := range req.Messages {
+			if !strings.HasPrefix(message.Content, prefix) {
+				continue
+			}
+			prompt = message.Content
+			if err := json.NewDecoder(strings.NewReader(strings.TrimPrefix(prompt, prefix))).Decode(&payload); err != nil {
+				t.Errorf("decode cached-wait evidence: %v", err)
+				http.Error(w, "invalid offered evidence", http.StatusBadRequest)
+				return
+			}
+			break
+		}
+		if len(payload.OfferedCaptures) != 1 || payload.OfferedCaptures[0].Seq != seqs[0] {
+			t.Errorf("cached-wait wire evidence differs from offered sequence: %+v", payload.OfferedCaptures)
+			http.Error(w, "offered evidence required", http.StatusBadRequest)
+			return
+		}
+		capture := payload.OfferedCaptures[0]
+		call := plannerCalls.Add(1)
+		if call == 1 {
+			initialCapture.Store(&capture)
+		} else if original := initialCapture.Load(); original == nil || capture != *original {
+			t.Errorf("review or forced planning changed the captured evidence: %+v want %+v", capture, original)
+			http.Error(w, "original captured evidence required", http.StatusBadRequest)
+			return
+		}
+		if call == 2 {
+			fact := "Offered capture " + strconv.FormatInt(capture.Seq, 10) + " at " + strconv.Quote("forced.go") + " includes"
+			if !strings.Contains(prompt, "Review the previous candidate plan against these recorded corrections:") ||
+				!strings.Contains(prompt, fact) || !strings.Contains(prompt, "no renderer clipping or omission") ||
+				capture.Path != "forced.go" || capture.FileMetadata.Kind != "text" || capture.FileMetadata.DiffOmittedReason != "" ||
+				!strings.Contains(capture.CapturedDiff, "+func Ready() bool { return true }") || strings.Contains(capture.CapturedDiff, "... <truncated> ...") {
+				t.Errorf("second call did not factually review the same supplied evidence: %+v prompt=%s", capture, prompt)
+				http.Error(w, "factual evidence review required", http.StatusBadRequest)
+				return
+			}
+			if active := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM publication_drains WHERE phase='semantic'"); active != "0" {
+				t.Errorf("bounded factual review unexpectedly created an explicit target: active drains=%s", active)
+				http.Error(w, "ordinary factual review required", http.StatusBadRequest)
+				return
+			}
+		}
+		if call <= 2 {
 			writeNativeIntentCandidatesResponse(t, w, "call_wait", []map[string]any{{
 				"candidate_id": "cached-wait", "selected_seqs": seqs,
 				"purpose": "wait for a possible companion", "readiness": "wait",
@@ -50,8 +111,13 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 			}})
 			return
 		}
+		if call != 3 {
+			t.Errorf("unexpected cached-wait planner call: %d", call)
+			http.Error(w, "bounded planning required", http.StatusBadRequest)
+			return
+		}
 		if active := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM publication_drains WHERE phase='semantic' AND target_event_count=1"); active != "1" {
-			t.Errorf("second planner call preceded the explicit commit-all target: active drains=%s", active)
+			t.Errorf("third planner call preceded the explicit commit-all target: active drains=%s", active)
 			http.Error(w, "explicit publication target required", http.StatusBadRequest)
 			return
 		}
@@ -108,7 +174,7 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	}
 	hint("soft_boundary")
 	waitFor(t, "non-forced plan waits", 15*time.Second, func() bool {
-		return plannerCalls.Load() == 1 && sqliteScalar(t, dbPath,
+		return plannerCalls.Load() == 2 && sqliteScalar(t, dbPath,
 			"SELECT COUNT(*) FROM intent_candidates WHERE status='waiting'") == "1" &&
 			sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM intent_activity_boundaries WHERE consumed_ts IS NOT NULL") == "1"
 	})
@@ -119,7 +185,7 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 	}
 	assertWaiting := func() {
 		t.Helper()
-		if plannerCalls.Load() != 1 || sqliteScalar(t, dbPath, completedPlans) != waitFingerprint ||
+		if plannerCalls.Load() != 2 || sqliteScalar(t, dbPath, completedPlans) != waitFingerprint ||
 			sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM intent_candidates WHERE status='waiting'") != "1" ||
 			sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM capture_events WHERE state='pending'") != "1" {
 			t.Fatal("ordinary wake or restart changed the cached waiting target")
@@ -168,8 +234,8 @@ func TestCommitAllIntentReplansCachedWaitAfterRestart(t *testing.T) {
 		t.Fatalf("commit-all exit=%d\nstdout=%s\nstderr=%s",
 			result.ExitCode, result.Stdout, result.Stderr)
 	}
-	if got := plannerCalls.Load(); got != 2 {
-		t.Fatalf("planner calls=%d want 2; forced request reused cached wait", got)
+	if got := plannerCalls.Load(); got != 3 {
+		t.Fatalf("planner calls=%d want 3; forced request reused cached wait", got)
 	}
 	if dirty := strings.TrimSpace(runGitOK(t, repo, "status", "--porcelain")); dirty != "" {
 		t.Fatalf("commit-all left worktree dirty: %s", dirty)
@@ -335,7 +401,28 @@ func TestCommitAllIntentStrategyDeterministic(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary required")
 	}
-	repo, files := commitAllFixture(t)
+	repo := tempRepo(t)
+	// The deterministic planner can explain these complete guide additions.
+	// Keep the shared comment-only fixture for Event's path-order contract.
+	guides := map[string]string{
+		"guides/branch-safety.md":      "# Reject stale branch plans\n\nRecheck the expected branch head before applying a planned ref update.\n",
+		"guides/checkpoint.md":         "# Protected checkpoint capture\n\nA completed checkpoint preserves captured file versions before branch publication.\n",
+		"guides/later-work.md":         "# Protect later edits\n\nLeave new captures outside an active frozen target for the next publication plan.\n",
+		"guides/ownership.md":          "# Check canonical worker ownership\n\nUse the canonical daemon lock as the proof of repository worker ownership.\n",
+		"guides/provider-retry.md":     "# Provider reconnection intervals\n\nRetry temporary provider failures after five minutes, ten minutes, then hourly.\n",
+		"guides/snapshot-retention.md": "# Preserve recovery snapshots\n\nRetain recovery snapshots when normal publication cannot safely continue.\n",
+		"guides/rename-order.md":       "# Preserve rename dependencies\n\nKeep recorded rename chains ordered with their required file changes.\n",
+		"guides/staging.md":            "# Preserve staged user changes\n\nPublish captures with a temporary index so user staging remains intact.\n",
+		"guides/verification.md":       "# Verify proposed commit trees\n\nRun required checks against each proposed commit tree before updating branch refs.\n",
+	}
+	files := make([]string, 0, len(guides))
+	for path := range guides {
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	for _, path := range files {
+		writeFile(t, filepath.Join(repo, path), guides[path])
+	}
 	env := commitAllEnv(t, "intent", "deterministic")
 	env = activateIntentV2Runtime(t, repo, env...)
 	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))

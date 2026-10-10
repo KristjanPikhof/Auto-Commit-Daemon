@@ -806,6 +806,9 @@ func Run(ctx context.Context, opts Options) error {
 			logger.Warn("save daemon_state", "err", err.Error())
 		}
 	}
+	if err := state.MetaSetJSON(ctx, opts.DB, state.MetaKeyIntentHistoryWorker, state.IntentHistoryWorker{PID: pid, Fingerprint: fpToken, Protocol: state.IntentHistoryPlanVersion}); err != nil {
+		return fmt.Errorf("daemon: history worker capability: %w", err)
+	}
 	checkpointStore := checkpointpkg.Store{DB: opts.DB}
 	if err := checkpointStore.RecoverPrepared(ctx, opts.RepoPath); err != nil {
 		return fmt.Errorf("daemon: recover protection checkpoints: %w", err)
@@ -2935,6 +2938,11 @@ func Run(ctx context.Context, opts Options) error {
 					recoveredDrain, recoverErr = RecoverTransportWaitPublicationDrain(
 						passCtx, opts.RepoPath, opts.DB, *activeDrain, time.Now().UTC())
 				}
+				if recoverErr == nil && recoveredDrain == nil &&
+					publicationDrainRuntimeBlock(*activeDrain, passBundle) == "" {
+					recoveredDrain, recoverErr = RecoverUnknownIntentDependencyPublicationDrain(
+						passCtx, opts.RepoPath, opts.DB, *activeDrain, time.Now().UTC())
+				}
 				if recoverErr == nil && recoveredDrain == nil {
 					recoveredDrain, recoverErr = RecoverForcedIntentBoundPublicationDrain(
 						passCtx, opts.DB, cctx.BranchRef, cctx.BranchGeneration,
@@ -3122,7 +3130,7 @@ func Run(ctx context.Context, opts Options) error {
 							},
 						}
 						evaluationCtx = context.WithValue(evaluationCtx, publicationEvaluationKey{}, evaluation)
-						repSum, repErr = replay(evaluationCtx, opts.RepoPath, opts.DB, cctx, ReplayOpts{
+						replayOptions := ReplayOpts{
 							MessageFn:                  passBundle.MessageFn,
 							GitDir:                     opts.GitDir,
 							Trace:                      tracer,
@@ -3155,7 +3163,31 @@ func Run(ctx context.Context, opts Options) error {
 							SelfPublicationCheckpoint:  opts.selfPublicationCheckpoint,
 							RequireCompletedCheckpoint: true,
 							PublicationDrain:           activeDrain,
-						})
+						}
+						historyHandled, historyErr := ProcessIntentHistoryRequest(evaluationCtx, opts.RepoPath, opts.DB, passBundle)
+						if historyHandled {
+							repSum = ReplaySummary{BaseHead: cctx.BaseHead, Skipped: true, SkippedReason: "history_reconstruction", Disposition: ReplayDispositionProgress}
+							repErr = historyErr
+						} else if historyErr != nil {
+							repErr = historyErr
+						} else {
+							repSum, repErr = replay(evaluationCtx, opts.RepoPath, opts.DB, cctx, replayOptions)
+							if repErr == nil && !repSum.HasMore && activeDrain == nil && replayOptions.CommitStrategy == ai.CommitStrategyIntent {
+								repairCtx := cctx
+								if repSum.BaseHead != "" {
+									repairCtx.BaseHead = repSum.BaseHead
+								}
+								repaired, auditErr := MaybeRepairIntentHistory(evaluationCtx, opts.RepoPath, opts.GitDir, opts.DB, repairCtx, replayOptions)
+								if auditErr != nil {
+									repErr = auditErr
+								} else if repaired.Status == state.IntentRepairCompleted {
+									repSum.BaseHead = repaired.NewHead
+									repSum.InternalTransitionTargetOID = repaired.NewHead
+									repSum.Disposition = ReplayDispositionProgress
+								}
+							}
+						}
+
 						if evaluationCtx.Err() != nil && passCtx.Err() == nil {
 							evaluationFollowup = true
 							repSum.Disposition = ReplayDispositionTransientWait
@@ -3413,6 +3445,19 @@ func Run(ctx context.Context, opts Options) error {
 			currentDelay = opts.Scheduler.Reset()
 		default:
 			currentDelay = opts.Scheduler.NextIdle(currentDelay)
+		}
+
+		if passBundle.IntentHealth != nil {
+			currentDelay = intentProviderRetryDelay(currentDelay, passBundle.IntentHealth.Snapshot(), now())
+		}
+
+		if raw, ok, err := state.MetaGet(ctx, opts.DB, MetaKeyIntentSemanticRetry); err == nil && ok {
+			if retry, err := DecodeIntentSemanticRetrySnapshot(raw); err == nil && retry.BranchRef == cctx.BranchRef && retry.BranchGeneration == cctx.BranchGeneration {
+				remaining := time.Unix(0, int64(retry.RetryAtTS*float64(time.Second))).Sub(now())
+				if remaining > 0 && remaining < currentDelay {
+					currentDelay = remaining
+				}
+			}
 		}
 
 		// 4m. Sleep until the next tick or wake/shutdown/ctx event.

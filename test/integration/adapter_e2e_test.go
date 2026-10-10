@@ -23,7 +23,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -253,7 +252,7 @@ func runPauseResumeE2E(t *testing.T, bin string) {
 			shutdownDaemon(t, env, repo, sessionID)
 			return
 		}
-		waitDaemonStoppedOrKill(t, "pause-resume daemon stopped", repo)
+
 	})
 
 	// Use pausepkg.Path so a future marker-path refactor breaks the test
@@ -374,23 +373,6 @@ func addFailingJQ(t *testing.T, env []string) []string {
 		t.Fatalf("chmod fake jq: %v", err)
 	}
 	return prependPath(env, fakeBin)
-}
-
-func daemonStopped(repo string) bool {
-	if readDaemonStateMode(repo) == "stopped" {
-		return true
-	}
-	pid := readDaemonStatePID(repo)
-	return pid > 0 && syscall.Kill(pid, 0) != nil
-}
-
-func waitDaemonStoppedOrKill(t *testing.T, label, repo string) {
-	t.Helper()
-	// Session close no longer owns worker lifetime. The supervisor keeps one
-	// worker per enabled common directory; process-stop coverage belongs to
-	// supervisor tests rather than harness lifecycle tests.
-	_ = label
-	_ = repo
 }
 
 // runBash runs `bash -c command` with the given env and stdin. Returns
@@ -853,7 +835,7 @@ func runClaudeCodeE2E(t *testing.T, bin string) {
 		t.Fatalf("claude-code SessionEnd exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitDaemonStoppedOrKill(t, "claude-code daemon stopped", repo)
+
 }
 
 func runCodexE2E(t *testing.T, bin string) {
@@ -907,7 +889,6 @@ func runCodexE2E(t *testing.T, bin string) {
 		t.Fatalf("codex fallback stop exit=%d\nstdout=%s\nstderr=%s",
 			fallbackStop.ExitCode, fallbackStop.Stdout, fallbackStop.Stderr)
 	}
-	waitDaemonStoppedOrKill(t, "codex pwd-fallback daemon stopped", fallbackRepo)
 
 	// UserPromptSubmit -> acd wake.
 	upHook := pickHookByEvent(t, hooks, "UserPromptSubmit")
@@ -951,7 +932,7 @@ func runCodexE2E(t *testing.T, bin string) {
 		t.Fatalf("codex stop exit=%d\nstdout=%s\nstderr=%s",
 			tearDown.ExitCode, tearDown.Stdout, tearDown.Stderr)
 	}
-	waitDaemonStoppedOrKill(t, "codex daemon stopped", repo)
+
 }
 
 func runCursorE2E(t *testing.T, bin string) {
@@ -1014,7 +995,7 @@ func runCursorE2E(t *testing.T, bin string) {
 		t.Fatalf("cursor sessionEnd exit=%d\nstdout=%s\nstderr=%s",
 			endRes.ExitCode, endRes.Stdout, endRes.Stderr)
 	}
-	waitDaemonStoppedOrKill(t, "cursor daemon stopped", repo)
+
 }
 
 // assertActiveHookSelfHealsCursor mirrors assertActiveHookSelfHeals but runs
@@ -1199,7 +1180,7 @@ func runOpencodeE2E(t *testing.T, bin string) {
 		t.Fatalf("opencode acd-stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitDaemonStoppedOrKill(t, "opencode daemon stopped", repo)
+
 }
 
 func runPiE2E(t *testing.T, bin string) {
@@ -1256,7 +1237,7 @@ func runPiE2E(t *testing.T, bin string) {
 		t.Fatalf("pi acd-stop exit=%d\nstdout=%s\nstderr=%s",
 			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
 	}
-	waitDaemonStoppedOrKill(t, "pi daemon stopped", repo)
+
 }
 
 func runShellE2E(t *testing.T, bin string) {

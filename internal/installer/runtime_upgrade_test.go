@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -371,17 +370,6 @@ func serveRuntimeStatus(t *testing.T, roots paths.Roots, status supervisor.Statu
 		}
 	}()
 	t.Cleanup(func() { _ = listener.Close(); <-done })
-}
-
-func gitCommand(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	command := exec.Command("git", args...)
-	command.Dir = dir
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return err.Error() + ": " + strings.TrimSpace(string(output))
-	}
-	return ""
 }
 
 func userOwnershipForTest() string { return "user:" + strconv.Itoa(os.Getuid()) }

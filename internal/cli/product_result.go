@@ -161,6 +161,11 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	}
 	if data.ActionRequired && data.Summary != "" {
 		fmt.Fprintf(out, "Status: %s\n", data.Summary)
+	} else if data.PublicationProgress.Phase == "provider_wait" ||
+		data.PublicationProgress.Phase == "goal_review_wait" ||
+		data.PublicationProgress.Phase == "provider_call" ||
+		data.PublicationProgress.Phase == "history_reconstruction" {
+		fmt.Fprintf(out, "Status: %s\n", publicationProgressPhaseLabel(data.PublicationProgress))
 	}
 	if envelope.NextAction == nil {
 		fmt.Fprintln(out, "Next: No action needed.")
@@ -251,6 +256,12 @@ func renderProductPublicationProgress(
 
 func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 	switch progress.Phase {
+	case "history_reconstruction":
+		label := "reconstructing verified goals on a new branch"
+		if progress.WorkerResponsive {
+			label += "; file capture continues"
+		}
+		return label
 	case "idle":
 		return "idle"
 	case "checkpointing":
@@ -291,16 +302,27 @@ func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 		}
 		return "publishing one safe local group, then returning to Intent"
 	case "provider_wait":
+		capture := ""
+		if progress.WorkerResponsive {
+			capture = "; file capture continues"
+		}
 		if progress.WaitRemainingSeconds > 0 {
-			return fmt.Sprintf("waiting for the Intent provider retry (%s remaining)",
-				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
+			return fmt.Sprintf("waiting for the Intent provider retry (%s remaining)%s",
+				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second), capture)
 		}
-		if progress.Origin == "intent_recovery" {
-			return "waiting for the Intent provider before continuing automatic recovery"
-		}
-		return "waiting for the Intent provider to write a semantic commit message"
+		return "AI provider retry is due" + capture
 	case "provider_call":
 		return "waiting for the current Intent provider response"
+	case "goal_review_wait":
+		label := "Intent goal review retry is due"
+		if progress.WaitRemainingSeconds > 0 {
+			label = fmt.Sprintf("waiting to review unresolved Intent goals (%s remaining)",
+				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
+		}
+		if progress.WorkerResponsive {
+			label += "; file capture continues"
+		}
+		return label
 	case "verifying":
 		return "verifying the semantic group"
 	case "stalled":

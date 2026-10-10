@@ -9,6 +9,7 @@ import (
 )
 
 func TestExternalBridgeFrozenDrainLookupIsExactAndFailsClosed(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	if _, err := f.capture.db.SQL().ExecContext(ctx, `

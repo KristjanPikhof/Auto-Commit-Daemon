@@ -22,11 +22,81 @@ and atomicity fields, and 64 KiB verification output. Every hard ordering edge
 gets capacity first. ACD rebuilds the remaining soft evidence from active
 captures and drops the least current soft evidence when the graph is full.
 
+Open goals retain their purpose, affected paths, membership, and missing
+companions across planning windows. ACD retrieves recorded diffs for goals
+connected to the current work. That context follows the same diff permission
+and redaction rules as fresh captures. Later captures outside a frozen
+publication target remain input for the next plan.
+
+When a small frozen target's remaining captures fit the planning window, ACD
+reviews them together. An implementation and its available test can then finish
+the same goal instead of waiting in separate requests. Later captures stay
+protected for the next publication target.
+
+A documentation follow-up can also see proven published companions from its
+frozen target. ACD checks their recorded versions against the current branch and
+supplies them as context, without publishing them again.
+
 ## Gates
 
 A group publishes only after cohesion, completeness, separation, dependency,
 materialization, verification, and revertibility checks. No preset bypasses
 hard dependencies, materialization, or required verification.
+
+Ready groups need recorded source, test, registration, generated-file, or
+version-chain evidence. A planner explanation alone cannot join unrelated
+changes. Missing companions must follow from concrete evidence; a useful
+correction or documentation goal does not always need new implementation or tests.
+ACD rechecks message quality when it reloads a cached or saved plan.
+
+ACD uses captured file versions to connect changed owners and callers, even
+when the relevant call falls outside the edited lines. Go calls and types,
+static TypeScript imports and exports, script file references, and named APIs
+can supply that proof. Documented commands must match recorded registration
+and flags, such as `acd support recover --force --yes`; an option name alone
+is insufficient. Documentation can also connect through matching descriptions
+of the same behavior. Generic prose and comments do not establish code ownership.
+
+Published companions provide read-only context when their final recorded path,
+content, and mode match the current branch. Intermediate saves remain provenance.
+Lookup stays bounded, and filenames affect search order without proving a
+relationship. Published goals cannot absorb new captures. Stale plans that
+try to do so return to planning.
+
+Relationship lines survive evidence clipping. Live reviews allow 64 KiB per
+capture and 256 KiB in total, with current work ahead of older published context.
+ACD keeps complete lines from both ends of a clipped diff and retains the exact
+published call or type that admitted support. It reads recorded blobs rather
+than the live worktree. TypeScript declarations are parsed once per recorded
+file and reused across comparisons with published tests.
+
+For a frozen target, later protected explanatory Go edits can clarify intent
+only when their code tokens are identical and they contain no compiler
+directives. These comments supply context; they do not add later work to the
+publication target.
+
+Rejected goals and valid provider waits receive another review after five
+minutes, ten minutes, then hourly for unchanged evidence. Restarts preserve
+deadlines. Older one-hour waits shorten from their original start time, and
+an upgraded planning contract rechecks older cached waits once. ACD may review
+a wait once against supplied diff and published-reference facts within the
+existing planning budget. Readiness still requires every normal gate.
+
+Valid ready groups survive correction. Omitted captures remain waiting, and
+incomplete or overlapping groups return to planning together with goals whose
+prerequisites they invalidate. A provisional fallback partition is not a fixed
+commit boundary. Filename, raw-symbol, heading-only, and clipped messages still
+need goal review. Within a frozen target, ACD can regroup an implementation and
+its available tests; later captures stay protected for the next plan.
+
+For Swift blank-line cleanup, ACD can prove one maintenance goal from complete
+recorded before/after files. It groups whitespace removal from blank lines and
+extra trailing blank lines, including files left in older review windows.
+Multiline literals, ambiguous line endings, and other code edits use ordinary
+planning. Saved history plans rebuild this proof locally without provider access.
+
+Relationship checks cannot prove the human purpose or that a project builds.
+Configure a verification command when build or test results are required.
 
 Candidate evaluation normally waits until the newest capture has been quiet for
 the configured settle window. Filling the planning window does not skip that
@@ -35,6 +105,10 @@ dependency-safe forced-aging window, or the maximum pending age can release
 work sooner. Window and high-water limits bound each planning pass, not the
 durable pending queue. A larger queue remains checkpoint-protected and is
 offered to the planner in bounded passes.
+If repeated edits to one path exceed the goal window, background planning saves
+the unpublished chain on a recovery ref and recaptures the current files for
+normal goal planning. The branch, live files, and staging stay intact. An active
+publication target remains frozen.
 Optional integrations may provide boundaries, but filesystem protection does
 not depend on them.
 
@@ -73,6 +147,38 @@ builds or its tests pass; that requires a configured verification command.
 Existing planning-window bounds, frozen targets, and history-repair limits
 still apply. Planner guidance does not authorize rewriting published history.
 
+## History quality and reconstruction
+
+When publication is idle, optional Intent repair checks at most five recent,
+private, ACD-owned commits inside the configured repair horizon. A generic
+message can trigger goal planning from exact recorded path versions. The repair
+keeps immutable capture provenance and records each old-to-new commit relation,
+including a mixed commit that contributes to several goals. Unchanged safe or
+ineligible evidence is checked once. Shared or user-owned history remains a
+firm boundary.
+
+Explicit `acd history rewrite --new-branch NAME` uses the same goal checks on a
+selected linear history. It can split mixed commits and regroup interleaved
+changes using recorded whole-path versions. The active worker verifies each
+proposed commit tree before creating the new branch. The source branch, live
+files, and staging stay intact; later edits keep entering checkpoints.
+
+Plans are immutable and are revalidated at apply. The final tree must equal
+the selected source HEAD, every recorded transition must belong to one goal,
+and edited renames must stay together. Author boundaries also remain intact:
+the planner receives anonymous author IDs, and a goal that combines authors is
+rejected during planning and saved-plan validation. Planning retries can split
+the goal before it is accepted.
+ACD never invents an intermediate file version. Reconstruction is bounded to
+256 source/output commits and 256 focused path chains; larger independent
+selections must be narrowed. Structural verification alone does not claim that
+builds or tests passed.
+
+ACD reconstructs generated files from their exact recorded versions. Shortened
+provider evidence does not omit those changes from the resulting files.
+If a planner assigns the same path chain to several goals, ACD rejects the plan
+and identifies the conflicting assignments in its bounded correction retries.
+
 ## Presets
 
 | Preset | Publication behavior |
@@ -94,6 +200,42 @@ baseline must assign every visible capture, preserve hard-dependency closure,
 and pass the structural safety checks. Native v2 providers receive this
 baseline and may refine its grouping and messages.
 
+Retained work outside the offered window remains visible as read-only evidence.
+Only offered captures carry assignment IDs. Dependencies on retained work name
+the owning Intent, so the provider can understand prerequisites without trying
+to assign captures that are still waiting for a later review.
+
+Older local waiting groups labeled `Update files` can be regrouped when their
+recorded provenance proves they are provisional, unpublished, and protected.
+Purposeful waiting goals keep their boundaries and review deadlines.
+
+A stale label does not override a newer exact saved plan that identifies a
+protected group as an unknown goal. The newest native assignment decides this
+check; a later purposeful plan closes older fallback evidence.
+
+Rejecting a ready group does not remove other waiting groups from its retry
+schedule. Older schedules missing those members use the saved plan to recover
+still-pending work on the same branch, keeping the original retry deadline.
+
+TypeScript reference checks read at most 256 KiB per file and 2 MiB per window.
+Ambiguous modules, dynamic imports, and unsupported syntax provide no inferred
+relationship.
+
+History review uses the same recorded relationships from the selected source
+commits. Later worktree changes cannot alter the saved plan or its validation.
+
+Ordinary WAIT findings do not prevent a protected semantic rejection from being
+reviewed again. Materialization, verification, ownership, and branch safety are
+checked again before publication.
+
+An overdue singleton becomes a normal goal review when protected companions
+join it. Existing targets stopped by the old singleton request error reopen
+only when their remaining members are protected and no transaction is active.
+
+Fresh capture scans do not count as progress on a frozen publication target.
+Status and list keep its progress, provider waits, and goal-review deadlines
+visible while ACD protects newer edits.
+
 If the baseline is invalid, ACD records `preflight_blocked` and does not call
 the provider. A changed planning snapshot gets a new fingerprint and a fresh
 preflight. Unrelated maintenance warnings remain visible, but they do not block
@@ -106,13 +248,11 @@ membership with the same findings stops the retry loop early. Each narrowed
 correction request receives a newly validated baseline before another attempt
 is reserved.
 
-For forced aging, ACD may discard a missing companion invented by the model
-only when an exact baseline group proves that all available hard dependencies
-are complete. A real waiting dependency, missing object, materialization
-failure, verification failure, or branch-safety problem still blocks the work.
-Balanced fallback size limits apply to the local evidence partition. They do
-not turn a repaired semantic plan back into a waiting group merely because
-its existing membership spans more paths.
+Age can trigger another evaluation, but it never makes an incomplete group
+ready. ACD keeps a real missing companion, failed materialization, verification
+failure, or branch-safety problem waiting. A bounded lookahead retrieves
+available source/test/reference companions beyond the ordinary window;
+unrelated directory or time proximity does not expand the goal.
 
 An older run stopped by that mistaken size limit gets one automatic retry.
 ACD requires the recorded forced-aging failure, the matching size-limit hold,
@@ -146,19 +286,17 @@ new group receives a local message from its captured evidence and still passes
 materialization and verification. Planner windows report this as
 `dependent_message_fallback`.
 
-AI planning, corrections, and message repair share one `ai.timeout` budget per
-unchanged planning fingerprint (five minutes by default), with at most three
-semantic attempts. The deadline survives worker restart. A timeout, unavailable
-provider, or rejected plan can use the dependency-safe evidence partition
-without another AI call for commit messages. Valid groups and messages survive
-partial correction and restart. Local messages describe the captured operation;
-binary groups include filenames and sizes in the body.
+Each provider probe has an `ai.timeout` budget and each planning session has
+at most three semantic attempts. Valid groups and messages survive partial
+correction and restart. Transport failures leave the run retryable and do not
+spend the semantic attempt budget.
 
-This fallback preserves hard dependencies, complete goals, frozen targets,
-materialization, verification, and repair limits. Unknown companions stay
-protected until a safe group can be proved. Provider circuit backoff remains
-30 seconds, two minutes, then ten minutes, with one probe at a time. Transport
-failures do not consume semantic correction attempts.
+During an outage, checkpoints continue protecting new work. ACD retries after
+five minutes, ten minutes, then hourly, using a persisted schedule and one probe
+at a time. Local recovery still needs a complete goal, a useful evidence-based
+message, exact materialization, required verification, and the normal repair
+limits. Unknown companions and generic messages remain protected for later
+planning. An unchanged unresolved local plan receives a scheduled review.
 
 If the user applies a newer verified deterministic Intent configuration with
 the same message format, the existing journaled recovery path preserves the
@@ -204,8 +342,8 @@ target from the current `HEAD`.
 Recovery then alternates between two bounded modes:
 
 1. `semantic_replan` offers only unresolved target events to the configured
-   provider. Published events satisfy dependencies and appear only as recent
-   history.
+   provider. Verified published events satisfy dependencies and supply read-only
+   recorded context; they cannot be selected for publication again.
 2. If that plan stalls, `local_unlock` selects the smallest safe hard
    dependency component. A singleton is allowed. Its local message describes
    the captured evidence and passes message-quality checks. The next pass

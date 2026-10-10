@@ -86,6 +86,7 @@ func TestCaptureResilienceFourLargeAssets(t *testing.T) {
 }
 
 func TestCaptureResilienceNonRegularDoesNotBlockProtection(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	store := checkpointpkg.Store{DB: f.db}
@@ -130,6 +131,7 @@ func TestCaptureResilienceNonRegularDoesNotBlockProtection(t *testing.T) {
 }
 
 func TestCaptureResiliencePartialProtectionPreservesShadow(t *testing.T) {
+	t.Parallel()
 	if os.Geteuid() == 0 {
 		t.Skip("requires file permissions enforced for a non-root user")
 	}
@@ -212,34 +214,69 @@ func TestCaptureResiliencePartialProtectionPreservesShadow(t *testing.T) {
 }
 
 func TestCaptureResilienceLocalMessagesNeverCallAI(t *testing.T) {
-	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "assets/eng_autocomplete.bin", Op: "modify"}}}
-	plan := deterministicIntentCandidatePlan(req, true, false)
-	out, err := applyIntentFallbackMessageQuality(req, plan)
-	if err != nil || len(out.Candidates) != 1 || out.Candidates[0].Body == "" {
-		t.Fatalf("local fallback=%+v err=%v", out, err)
+	for _, testCase := range []struct {
+		name    string
+		capture ai.OfferedCapture
+		ready   bool
+	}{
+		{name: "documented_goal", ready: true, capture: ai.OfferedCapture{
+			Seq: 1, Path: "shortcuts.md", Op: "create",
+			CapturedDiff: "+# Keyboard shortcut reference\n",
+		}},
+		{name: "unknown_asset_goal", capture: ai.OfferedCapture{
+			Seq: 1, Path: "assets/eng_autocomplete.bin", Op: "modify",
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2,
+				OfferedCaptures: []ai.OfferedCapture{testCase.capture}}
+			plan := deterministicIntentCandidatePlan(req, true, false)
+			out, err := applyIntentFallbackMessageQuality(req, plan)
+			if err != nil || len(out.Candidates) != 1 {
+				t.Fatalf("local fallback=%+v err=%v", out, err)
+			}
+			candidate := out.Candidates[0]
+			if testCase.ready {
+				if candidate.Readiness != ai.IntentCandidateReady || candidate.Body == "" ||
+					candidate.Subject != "Add Keyboard shortcut reference" {
+					t.Fatalf("grounded local message=%+v", candidate)
+				}
+			} else if candidate.Readiness != ai.IntentCandidateWait || candidate.Subject != "" ||
+				len(candidate.MissingCompanions) == 0 || !reflect.DeepEqual(candidate.SelectedSeqs, []int64{1}) {
+				t.Fatalf("unknown goal was not retained: %+v", candidate)
+			}
+		})
 	}
 }
 
-func TestCaptureResilienceProviderBudgetStopsUnchangedCalls(t *testing.T) {
+func TestCaptureResilienceProviderTimeoutWaitsAndRetries(t *testing.T) {
 	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
-	planner := &blockingSemanticPlanner{entered: make(chan ai.IntentPlanRequestV2, 1)}
+	planner := &blockingSemanticPlanner{entered: make(chan ai.IntentPlanRequestV2, 2), release: make(chan struct{})}
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "independent.md", Op: "create"}}}
-	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, ProviderBudget: 200 * time.Millisecond}
+	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, ProviderBudget: time.Second}
+	clock := newIntentHealthClock()
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{Provider: IntentPlannerProviderIdentity{Provider: planner.Name()}, Now: clock.Now})
 	started := time.Now()
-	plan, fallback, _, _, _, _, first, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
-	if err != nil || fallback != "evidence_partition" || len(plan.Candidates) != 1 || !first.Completed {
-		t.Fatalf("budget result=%+v fallback=%s err=%v", first, fallback, err)
+	_, _, _, _, _, _, first, err := chooseIntentCandidatePlan(ctx, req, planner, health, 2, config.PresetFast, nil, db, input)
+	if !isIntentPlannerCircuitWait(err) || first.Completed || first.AttemptCount != 0 || first.ProviderDeadlineTS != 0 {
+		t.Fatalf("timeout result=%+v err=%v", first, err)
 	}
 	if time.Since(started) > 5*time.Second {
-		t.Fatal("provider budget did not bound wait")
+		t.Fatal("provider timeout did not bound wait")
 	}
 	if len(planner.entered) != 1 {
 		t.Fatal("provider call was not observed")
 	}
-	_, _, _, _, _, _, second, err := chooseIntentCandidatePlan(ctx, req, planner, nil, 2, config.PresetFast, nil, db, input)
-	if err != nil || second.ResolutionMode.String != "completed_plan_reuse" || len(planner.entered) != 1 || second.ProviderDeadlineTS != first.ProviderDeadlineTS {
-		t.Fatalf("budget reuse=%+v err=%v", second, err)
+	_, _, _, _, _, _, second, err := chooseIntentCandidatePlan(ctx, req, planner, health, 2, config.PresetFast, nil, db, input)
+	if !isIntentPlannerCircuitWait(err) || second.Completed || len(planner.entered) != 1 || second.Fingerprint != first.Fingerprint {
+		t.Fatalf("cooldown retry=%+v err=%v", second, err)
+	}
+	close(planner.release)
+	clock.Advance(5 * time.Minute)
+	plan, fallback, _, _, _, _, resumed, err := chooseIntentCandidatePlan(ctx, req, planner, health, 2, config.PresetFast, nil, db, input)
+	if err != nil || fallback != "" || !resumed.Completed || resumed.AttemptCount != 1 || len(plan.Candidates) != 1 || len(planner.entered) != 2 || resumed.Fingerprint != first.Fingerprint {
+		t.Fatalf("reconnected planning=%+v fallback=%s err=%v", resumed, fallback, err)
 	}
 }
 
@@ -324,10 +361,11 @@ func (p *interruptedPartialPlanner) PlanIntentV2(ctx context.Context, req ai.Int
 
 type unavailablePartialPlanner struct {
 	partialReplanIntentCandidatePlannerStub
+	recovered bool
 }
 
 func (p *unavailablePartialPlanner) PlanIntentV2(ctx context.Context, req ai.IntentPlanRequestV2) (ai.IntentPlanV2, error) {
-	if p.calls > 0 {
+	if p.calls > 0 && !p.recovered {
 		p.calls++
 		p.reqs = append(p.reqs, req)
 		return ai.IntentPlanV2{}, &IntentPlannerTransportFailure{Err: errors.New("provider unavailable")}
@@ -336,13 +374,41 @@ func (p *unavailablePartialPlanner) PlanIntentV2(ctx context.Context, req ai.Int
 }
 
 func TestCaptureResilienceFallbackPreservesValidatedGroups(t *testing.T) {
+	ctx := context.Background()
 	db := openIntentCandidateTestDB(t)
 	planner := &unavailablePartialPlanner{}
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "a.go", Op: "create"}, {Seq: 2, Path: "b.go", Op: "create"}}}
 	input := IntentCandidateEvaluation{BranchRef: "refs/heads/main", BranchGeneration: 1, Provider: planner.Name()}
-	plan, fallback, _, _, _, _, run, err := chooseIntentCandidatePlan(context.Background(), req, planner, nil, 2, config.PresetFast, nil, db, input)
-	if err != nil || fallback != "evidence_partition" || !run.Completed || len(plan.Candidates) != 2 || planner.calls != 2 || len(planner.reqs[1].OfferedCaptures) != 1 {
-		t.Fatalf("fallback=%s plan=%+v run=%+v calls=%d err=%v", fallback, plan, run, planner.calls, err)
+	clock := newIntentHealthClock()
+	health := NewIntentPlannerHealth(ctx, db, IntentPlannerHealthOptions{
+		Provider: IntentPlannerProviderIdentity{Provider: planner.Name()}, Now: clock.Now,
+	})
+	plan, _, _, _, _, _, waiting, err := chooseIntentCandidatePlan(ctx, req, planner, health, 2, config.PresetFast, nil, db, input)
+	if !isIntentPlannerCircuitWait(err) || waiting.Completed || len(plan.Candidates) != 0 ||
+		waiting.AttemptCount != 1 || waiting.ProgressState.String != "waiting_for_ai" ||
+		!reflect.DeepEqual(waiting.PreservedGroups, [][]int64{{1}}) ||
+		planner.calls != 2 || len(planner.reqs[1].OfferedCaptures) != 1 {
+		t.Fatalf("provider wait plan=%+v run=%+v calls=%d err=%v", plan, waiting, planner.calls, err)
+	}
+	stored, ok, err := state.IntentPlanRunByFingerprint(ctx, db, waiting.Fingerprint)
+	if err != nil || !ok || stored.Completed || stored.ProgressState.String != "waiting_for_ai" ||
+		!reflect.DeepEqual(stored.PreservedGroups, [][]int64{{1}}) {
+		t.Fatalf("durable provider wait=%+v ok=%v err=%v", stored, ok, err)
+	}
+	locked, partial := loadPreservedIntentGroups(req, stored)
+	if len(locked) != 1 || locked[0].CandidateID != "locked-a" ||
+		locked[0].Subject != "Update source change" ||
+		len(partial.OfferedCaptures) != 1 || partial.OfferedCaptures[0].Seq != 2 {
+		t.Fatalf("durable validated groups=%+v unresolved=%+v", locked, partial)
+	}
+	planner.recovered = true
+	clock.Advance(5 * time.Minute)
+	plan, fallback, _, _, _, _, resumed, err := chooseIntentCandidatePlan(ctx, req, planner, health, 2, config.PresetFast, nil, db, input)
+	if err != nil || fallback != "" || !resumed.Completed || len(plan.Candidates) != 2 ||
+		resumed.Fingerprint != waiting.Fingerprint || resumed.AttemptCount != 2 ||
+		planner.calls != 3 || len(planner.reqs[2].OfferedCaptures) != 1 ||
+		planner.reqs[2].OfferedCaptures[0].Seq != 2 {
+		t.Fatalf("reconnected groups=%+v run=%+v calls=%d err=%v", plan, resumed, planner.calls, err)
 	}
 	if plan.Candidates[0].CandidateID != "locked-a" || plan.Candidates[0].Subject != "Update source change" {
 		t.Fatalf("validated group changed: %+v", plan.Candidates)

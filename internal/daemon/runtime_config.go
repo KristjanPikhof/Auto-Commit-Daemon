@@ -598,7 +598,18 @@ func runtimeIntentIncludeDiffs(
 	confirmations map[string]struct{},
 	provider ai.Provider,
 ) bool {
-	if cfg.CommitStrategy != ai.CommitStrategyIntent || !ai.ProviderNeedsDiff(provider) {
+	if cfg.CommitStrategy != ai.CommitStrategyIntent {
+		return false
+	}
+	if cfg.Mode == "deterministic" {
+		switch provider.(type) {
+		case ai.DeterministicProvider, *ai.DeterministicProvider:
+			// This in-process planner needs captured evidence to name Intent
+			// goals. It never sends that evidence outside the worker.
+			return true
+		}
+	}
+	if !ai.ProviderNeedsDiff(provider) {
 		return false
 	}
 	if _, ok := confirmations[string(ai.ConfirmationDiffEgress)]; !ok {

@@ -12,6 +12,7 @@ import (
 )
 
 func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	opts := RecoveryReconcileOptions{
@@ -95,6 +96,7 @@ func TestReconcileExternalRepairBridgePublishesFirstChildAndPreservesDescendant(
 }
 
 func TestExternalRepairBridgeRejectsUnownedTargetPath(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{
 		includeUnownedPath: true,
 	})
@@ -130,6 +132,7 @@ func TestExternalRepairBridgeRejectsUnownedTargetPath(t *testing.T) {
 }
 
 func TestExternalRepairBridgeRejectsIncompleteRepairRestoration(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{
 		omitRestoredPath: true,
 	})
@@ -160,6 +163,7 @@ func TestExternalRepairBridgeRejectsIncompleteRepairRestoration(t *testing.T) {
 }
 
 func TestExternalRepairBridgeUsesCumulativeAdjacentRepairState(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{
 		includePriorRepair: true,
 	})
@@ -181,6 +185,7 @@ func TestExternalRepairBridgeUsesCumulativeAdjacentRepairState(t *testing.T) {
 }
 
 func TestExternalRepairBridgeRejectsEquivalentLaterProofRef(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	laterBlob, err := git.HashObjectStdin(ctx, f.capture.dir, []byte("other later work\n"))
@@ -219,6 +224,7 @@ func TestExternalRepairBridgeRejectsEquivalentLaterProofRef(t *testing.T) {
 }
 
 func TestExternalBridgeFirstParentProofRejectsBackwardReset(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	target, matched, err := firstParentChildSince(
 		context.Background(), f.capture.dir, f.live, f.target)
@@ -229,6 +235,7 @@ func TestExternalBridgeFirstParentProofRejectsBackwardReset(t *testing.T) {
 }
 
 func TestExternalBridgeAncestryProofFailsClosedPastBound(t *testing.T) {
+	t.Parallel()
 	proof := externalRepairBridgeAncestry{
 		commits:   map[string]struct{}{"reachable": {}},
 		truncated: true,
@@ -244,6 +251,7 @@ func TestExternalBridgeAncestryProofFailsClosedPastBound(t *testing.T) {
 }
 
 func TestExternalRepairEvidenceBudgetAggregatesAdjacentRepairs(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{
 		includePriorRepair: true,
 	})

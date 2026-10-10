@@ -51,6 +51,7 @@ func TestCompletedTransitionProofAttentionPersistsAndClears(t *testing.T) {
 }
 
 func TestRunAdoptsAlreadyCompletedIntentRepairBeforeStartupTransition(t *testing.T) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 2)
 	ctx := context.Background()
 	oldToken := branchTokenRev(f.plan.ExpectedHead, f.cctx.BranchRef)
@@ -116,6 +117,7 @@ func TestRunAdoptsAlreadyCompletedIntentRepairBeforeStartupTransition(t *testing
 }
 
 func TestCheckEventGenerationUsesCompletedRepairMappingAncestry(t *testing.T) {
+	t.Parallel()
 	f := newIntentRepairFixture(t, 2)
 	ctx := context.Background()
 	applied, err := ApplyIntentRepairTransaction(

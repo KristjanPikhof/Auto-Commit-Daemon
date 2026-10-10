@@ -493,12 +493,14 @@ func TestDefaultIntentDeferLimit_TunedToOne(t *testing.T) {
 	}
 }
 
-// TestIntentStageDiffCap_TunedTo16K asserts the per-stage planner diff cap
-// constant is 16000. Locks the contract documented in CLAUDE.md and
-// CHANGELOG so regressions surface in CI.
-func TestIntentStageDiffCap_TunedTo16K(t *testing.T) {
-	if ai.IntentStageDiffCap != 16000 {
-		t.Fatalf("IntentStageDiffCap=%d want 16000", ai.IntentStageDiffCap)
+// Keep complete implementation reviews bounded while preserving event and
+// history aggregate limits.
+func TestIntentStageDiffCap_TunedTo64K(t *testing.T) {
+	if ai.IntentStageDiffCap != 64*1024 {
+		t.Fatalf("IntentStageDiffCap=%d want 65536", ai.IntentStageDiffCap)
+	}
+	if ai.IntentGoalEvidenceTotalDiffCap != 256*1024 || ai.HistoryRewriteTotalDiffCap != 128*1024 {
+		t.Fatal("live or history aggregate evidence allowance changed")
 	}
 	if ai.DiffCap != 4000 {
 		t.Fatalf("DiffCap=%d want 4000 (per-event path must NOT change)", ai.DiffCap)

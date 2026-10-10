@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 )
 
 func TestRunCheckpointDuringBlockedMessage(t *testing.T) {
+	t.Parallel()
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -174,8 +176,13 @@ func TestPublicationEvaluationRejectsStaleResultAndJoins(t *testing.T) {
 }
 
 func TestRunCheckpointDuringProjectVerification(t *testing.T) {
+	t.Parallel()
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
+	startHead, err := git.RevParse(context.Background(), f.dir, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
 	control := t.TempDir()
 	marker, fifo := filepath.Join(control, "started"), filepath.Join(control, "release")
 	if err := syscall.Mkfifo(fifo, 0600); err != nil {
@@ -196,8 +203,18 @@ func TestRunCheckpointDuringProjectVerification(t *testing.T) {
 			replay: func(passCtx context.Context, repo string, db *state.DB, cctx CaptureContext, opts ReplayOpts) (ReplaySummary, error) {
 				opts.CommitStrategy = ai.CommitStrategyIntent
 				opts.IntentPreset = config.PresetBalanced
-				opts.IntentPlanner = ai.DeterministicProvider{}
+				opts.IntentPlanner = &intentGoalWindowPlanner{intentCandidatePlannerStub{plan: ai.IntentPlanV2{
+					ProtocolVersion: ai.IntentPlannerProtocolV2,
+					Candidates: []ai.IntentCandidateAssignment{{
+						CandidateID: "project-verification", SelectedSeqs: []int64{1},
+						Purpose: "explain approved project verification", Readiness: ai.IntentCandidateReady,
+						Subject:        "Document project verification",
+						Body:           "- Explain how approved checks validate a proposed commit",
+						GroupingReason: "the project verification guide is complete",
+					}},
+				}}}
 				opts.IntentHealth = nil
+				opts.IntentIncludeDiffs = true
 				opts.IntentSettleWindow = -1
 				opts.IntentBypassBatchWait = true
 				opts.IntentVerificationMode = "fast"
@@ -215,7 +232,8 @@ func TestRunCheckpointDuringProjectVerification(t *testing.T) {
 		}
 	})
 	waitForDaemonMode(t, f.db, "running", 3*time.Second)
-	if err := os.WriteFile(filepath.Join(f.dir, "verified.txt"), []byte("verify\n"), 0600); err != nil {
+	waitForPublicationEvaluationReady(t, ctx, f.db, "refs/heads/main", startHead, 3*time.Second)
+	if err := os.WriteFile(filepath.Join(f.dir, "project-verification.md"), []byte("# Project verification\nRun approved checks against the proposed commit before publication.\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	wake <- struct{}{}
@@ -277,7 +295,7 @@ func TestEventPublicationWaitsForSelectedProviderAndRecovers(t *testing.T) {
 		t.Fatal("event retry bypassed provider cooldown")
 	}
 	unavailable = false
-	now = now.Add(31 * time.Second)
+	now = now.Add(5*time.Minute + time.Second)
 	recovered, err := Replay(ctx, f.dir, f.db, f.cctx, opts)
 	if err != nil || recovered.Published != 1 || recovered.Failed != 0 {
 		t.Fatalf("recovery=%+v err=%v", recovered, err)
@@ -325,7 +343,7 @@ func TestLocalFallbackMessagesLeaveRecoveryProbeAvailable(t *testing.T) {
 	if err := health.Complete(ctx, permit, &IntentPlannerTransportFailure{Err: errors.New("outage")}); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(31 * time.Second)
+	now = now.Add(5*time.Minute + time.Second)
 	req := ai.IntentPlanRequestV2{ProtocolVersion: ai.IntentPlannerProtocolV2, OfferedCaptures: []ai.OfferedCapture{{Seq: 1, Path: "feature.go", Op: "create"}}}
 	plan := deterministicIntentCandidatePlan(req, true, false)
 	_, err = applyIntentFallbackMessageQuality(req, plan)
@@ -378,6 +396,7 @@ func (p *blockingSemanticPlanner) RewriteIntentMessage(context.Context, ai.Inten
 }
 
 func TestRunSemanticEvaluationProtectsAcrossRestartAndRejectsBranchChange(t *testing.T) {
+	t.Parallel()
 	for _, scenario := range []string{"restart", "branch-switch"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newDaemonFixture(t)
@@ -419,6 +438,7 @@ func TestRunSemanticEvaluationProtectsAcrossRestartAndRejectsBranchChange(t *tes
 				}
 			})
 			waitForDaemonMode(t, f.db, "running", 3*time.Second)
+			waitForPublicationEvaluationReady(t, base, f.db, "refs/heads/main", originalHead, 3*time.Second)
 			if err := os.WriteFile(filepath.Join(f.dir, "first.txt"), []byte("first semantic change\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -455,9 +475,12 @@ func TestRunSemanticEvaluationProtectsAcrossRestartAndRejectsBranchChange(t *tes
 				}
 				// Returning the old semantic response must not apply it on the new branch.
 				planner.release <- struct{}{}
+				deadline := time.Now().Add(5 * time.Second)
+				wake <- struct{}{}
+				waitForPublicationEvaluationReady(t, base, f.db, "refs/heads/new-branch", originalHead, time.Until(deadline))
 				select {
 				case <-planner.entered:
-				case <-time.After(5 * time.Second):
+				case <-time.After(time.Until(deadline)):
 					t.Fatal("worker did not rebuild after branch movement")
 				}
 				head, err := git.RevParse(base, f.dir, "HEAD")
@@ -504,6 +527,30 @@ func TestRunSemanticEvaluationProtectsAcrossRestartAndRejectsBranchChange(t *tes
 			})
 		})
 	}
+}
+
+func waitForPublicationEvaluationReady(t *testing.T, ctx context.Context, db *state.DB, branch, head string, budget time.Duration) {
+	t.Helper()
+	// Running proves ownership before the startup branch/shadow preparation.
+	// The accepted token and completed shadow seed make the worker ready to
+	// capture the test edit. A clean idle checkpoint is not a prerequisite.
+	waitFor(t, budget, "accepted publication context for "+branch, func() bool {
+		var token, acceptedHead, rawGeneration string
+		err := db.ReadSQL().QueryRowContext(ctx, `
+SELECT coalesce((SELECT value FROM daemon_meta WHERE key=?),''),
+       coalesce((SELECT value FROM daemon_meta WHERE key=?),''),
+       coalesce((SELECT value FROM daemon_meta WHERE key=?),'')`,
+			MetaKeyBranchToken, MetaKeyBranchHead, MetaKeyBranchGeneration).Scan(&token, &acceptedHead, &rawGeneration)
+		if err != nil || token != branchTokenRev(head, branch) || acceptedHead != head {
+			return false
+		}
+		generation, err := strconv.ParseInt(rawGeneration, 10, 64)
+		if err != nil || generation < 1 {
+			return false
+		}
+		ready, err := IsShadowBootstrapped(ctx, db, branch, generation)
+		return err == nil && ready
+	})
 }
 
 func TestPublicationMessageRejectsBlankProviderOutput(t *testing.T) {

@@ -17,11 +17,15 @@ def render(path):
         for record in records
         if record.get("Action") == "fail"
     }
+    timed_out = {
+        (record.get("Package"), record.get("Test", "").split("/")[0]) for record in records
+        if "panic: test timed out" in record.get("Output", "")
+    }
     for event in records:
         test = event.get("Test", "")
         if event.get("Action") not in ("output", "build-output"):
             continue
-        if test and (event.get("Package"), test.split("/")[0]) not in failed:
+        if test and (event.get("Package"), test.split("/")[0]) not in failed | timed_out:
             continue
         output = event.get("Output", "")
         if not output.startswith(("=== RUN", "=== PAUSE", "=== CONT", "=== NAME")):

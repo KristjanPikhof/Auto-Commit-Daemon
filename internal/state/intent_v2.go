@@ -25,6 +25,7 @@ const (
 	IntentCandidateLineageMaxPerPair     = 4096
 	IntentVerificationOutputMaxBytes     = 64 * 1024
 	IntentRepairMaxCommits               = 5
+	IntentRepairMaxMappings              = IntentRepairMaxCommits * IntentRepairMaxCommits
 	IntentRepairMaxMembers               = IntentCandidateMaxCaptures * IntentRepairMaxCommits
 
 	IntentCandidateOpen          = "open"
@@ -249,8 +250,55 @@ func SaveIntentCandidate(ctx context.Context, d *DB, candidate IntentCandidate) 
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := saveIntentCandidateTx(ctx, tx, candidate); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SaveIntentRepairCandidates atomically reassigns published captures to the
+// approved repair goals. Superseded membership stays available as provenance.
+func SaveIntentRepairCandidates(ctx context.Context, d *DB, candidates []IntentCandidate) error {
+	if d == nil || len(candidates) == 0 || len(candidates) > IntentRepairMaxCommits {
+		return errors.New("state: invalid repair candidate batch")
+	}
+	seenIDs := make(map[string]struct{})
+	seenEvents := make(map[int64]struct{})
+	for i := range candidates {
+		candidate := &candidates[i]
+		if candidate.Readiness == "" {
+			candidate.Readiness = IntentReadinessWait
+		}
+		if err := validateIntentCandidate(*candidate); err != nil {
+			return err
+		}
+		if _, duplicate := seenIDs[candidate.ID]; duplicate {
+			return errors.New("state: duplicate repair candidate")
+		}
+		seenIDs[candidate.ID] = struct{}{}
+		for _, event := range candidate.Events {
+			if _, duplicate := seenEvents[event.EventSeq]; duplicate {
+				return errors.New("state: repair capture has multiple goals")
+			}
+			seenEvents[event.EventSeq] = struct{}{}
+		}
+	}
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, candidate := range candidates {
+		if err := saveIntentCandidateTx(ctx, tx, candidate); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func saveIntentCandidateTx(ctx context.Context, tx *sql.Tx, candidate IntentCandidate) error {
 	var existingStatus string
-	err = tx.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`SELECT status FROM intent_candidates WHERE id=?`, candidate.ID,
 	).Scan(&existingStatus)
 	switch {
@@ -337,9 +385,6 @@ WHERE branch_ref=? AND branch_generation=? AND id<>?
         AND active_membership.membership_state='active'
   )`, now, candidate.BranchRef, candidate.BranchGeneration, candidate.ID); err != nil {
 		return fmt.Errorf("state: retire empty reassigned candidates: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("state: commit intent candidate save: %w", err)
 	}
 	return nil
 }
@@ -1530,9 +1575,9 @@ func TransitionIntentRepair(ctx context.Context, d *DB, id string, transition In
 		IntentCandidateSummaryMaxChars); err != nil {
 		return false, err
 	}
-	if len(transition.Commits) > IntentRepairMaxCommits {
+	if len(transition.Commits) > IntentRepairMaxMappings {
 		return false, fmt.Errorf("state: intent repair commit cap %d exceeded",
-			IntentRepairMaxCommits)
+			IntentRepairMaxMappings)
 	}
 	if transition.Status == IntentRepairGitApplied && transition.Commits == nil {
 		return false, errors.New(
@@ -1767,11 +1812,19 @@ func scanIntentRepair(row intentCandidateScanner) (IntentRepair, error) {
 }
 
 func replaceIntentRepairCommits(ctx context.Context, tx *sql.Tx, repairID string, commits []IntentRepairCommit) error {
-	if len(commits) == 0 || len(commits) > IntentRepairMaxCommits {
-		return fmt.Errorf("state: intent repair requires 1..%d commits", IntentRepairMaxCommits)
+	if len(commits) == 0 || len(commits) > IntentRepairMaxMappings {
+		return fmt.Errorf("state: intent repair requires 1..%d mappings", IntentRepairMaxMappings)
+	}
+	oldOIDs := make(map[string]struct{})
+	for _, commit := range commits {
+		oldOIDs[commit.OldOID] = struct{}{}
+	}
+	table := "intent_repair_commits"
+	if len(oldOIDs) < len(commits) {
+		table = "intent_repair_commit_lineage"
 	}
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM intent_repair_commits WHERE repair_id=?`, repairID); err != nil {
+		`DELETE FROM `+table+` WHERE repair_id=?`, repairID); err != nil {
 		return fmt.Errorf("state: clear intent repair commits: %w", err)
 	}
 	seen := make(map[string]struct{}, len(commits))
@@ -1779,12 +1832,13 @@ func replaceIntentRepairCommits(ctx context.Context, tx *sql.Tx, repairID string
 		if strings.TrimSpace(commit.OldOID) == "" {
 			return errors.New("state: intent repair commit has empty old oid")
 		}
-		if _, exists := seen[commit.OldOID]; exists {
-			return fmt.Errorf("state: duplicate intent repair old oid %s", commit.OldOID)
+		key := commit.OldOID + "\x00" + commit.CandidateID.String
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("state: duplicate intent repair old oid %s for candidate %s", commit.OldOID, commit.CandidateID.String)
 		}
-		seen[commit.OldOID] = struct{}{}
+		seen[key] = struct{}{}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO intent_repair_commits(
+INSERT INTO `+table+`(
     repair_id, ord, candidate_id, old_oid, new_oid
 ) VALUES (?, ?, ?, ?, ?)`,
 			repairID, ord, commit.CandidateID, commit.OldOID,
@@ -1855,7 +1909,7 @@ WHERE owned.repair_id=?
       OR
       (owned.prior_state='published' AND event.commit_oid IS NOT NULL
        AND EXISTS (
-           SELECT 1 FROM intent_repair_commits mapped
+           SELECT 1 FROM intent_repair_commit_mappings mapped
            WHERE mapped.repair_id=owned.repair_id
              AND mapped.candidate_id=owned.candidate_id
              AND mapped.old_oid=event.commit_oid
@@ -1966,7 +2020,7 @@ GROUP BY repair.id`, repairID).Scan(
 	var unmapped int
 	if err := tx.QueryRowContext(ctx, `
 SELECT COUNT(*)
-FROM intent_repair_commits mapped
+FROM intent_repair_commit_mappings mapped
 WHERE mapped.repair_id=?
   AND (
       mapped.candidate_id IS NULL
@@ -1987,9 +2041,13 @@ WHERE mapped.repair_id=?
 }
 
 func loadIntentRepairCommits(ctx context.Context, q intentV2Queryer, repairID string) ([]IntentRepairCommit, error) {
+	table, err := intentRepairMappingsTable(ctx, q)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := q.QueryContext(ctx, `
 SELECT repair_id, ord, candidate_id, old_oid, new_oid
-FROM intent_repair_commits
+FROM `+table+`
 WHERE repair_id=? ORDER BY ord`, repairID)
 	if err != nil {
 		return nil, fmt.Errorf("state: query intent repair commits: %w", err)
@@ -2016,9 +2074,13 @@ func loadIntentRepairCommitsBounded(
 	repairID string,
 	limit int,
 ) ([]IntentRepairCommit, bool, error) {
+	table, err := intentRepairMappingsTable(ctx, q)
+	if err != nil {
+		return nil, false, err
+	}
 	rows, err := q.QueryContext(ctx, `
 SELECT repair_id, ord, candidate_id, old_oid, new_oid
-FROM intent_repair_commits
+FROM `+table+`
 WHERE repair_id=? ORDER BY ord
 LIMIT ?`, repairID, limit+1)
 	if err != nil {
@@ -2348,9 +2410,20 @@ func validateIntentRepair(repair IntentRepair) error {
 		IntentCandidateSummaryMaxChars); err != nil {
 		return err
 	}
-	if len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxCommits {
-		return fmt.Errorf("state: intent repair requires 1..%d commits",
-			IntentRepairMaxCommits)
+	if len(repair.Commits) == 0 || len(repair.Commits) > IntentRepairMaxMappings {
+		return fmt.Errorf("state: intent repair requires 1..%d mappings",
+			IntentRepairMaxMappings)
+	}
+	oldOIDs := make(map[string]struct{})
+	candidates := make(map[string]struct{})
+	for _, commit := range repair.Commits {
+		oldOIDs[commit.OldOID] = struct{}{}
+		if commit.CandidateID.Valid {
+			candidates[commit.CandidateID.String] = struct{}{}
+		}
+	}
+	if len(oldOIDs) > IntentRepairMaxCommits || len(candidates) > IntentRepairMaxCommits {
+		return fmt.Errorf("state: intent repair source or goal count exceeds %d", IntentRepairMaxCommits)
 	}
 	if err := validateIntentRepairMembers(repair); err != nil {
 		return err
@@ -2501,4 +2574,15 @@ func sanitizedOutputTail(value string) string {
 		value = value[1:]
 	}
 	return value
+}
+
+func intentRepairMappingsTable(ctx context.Context, q intentV2Queryer) (string, error) {
+	var exists int
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='view' AND name='intent_repair_commit_mappings')`).Scan(&exists); err != nil {
+		return "", err
+	}
+	if exists != 0 {
+		return "intent_repair_commit_mappings", nil
+	}
+	return "intent_repair_commits", nil
 }

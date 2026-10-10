@@ -72,6 +72,8 @@ type OfferedCapture struct {
 	Fidelity     string              `json:"fidelity"`
 	DeferCount   int                 `json:"defer_count"`
 	CapturedDiff string              `json:"captured_diff,omitempty"`
+	// HistoryAuthor identifies an author boundary without exposing identity.
+	HistoryAuthor int `json:"history_author,omitempty"`
 
 	// Preserve truncation across normalization before native metadata is attached.
 	// Keep this transient field out of provider JSON.
@@ -84,6 +86,8 @@ type IntentFileMetadata struct {
 	BeforeBytes       int64  `json:"before_bytes"`
 	AfterBytes        int64  `json:"after_bytes"`
 	DiffOmittedReason string `json:"diff_omitted_reason,omitempty"`
+	swiftBlankLines   *intentSwiftBlankLineProof
+	cliReferences     *intentCLIReferenceProof
 }
 
 // IntentPlanRequest is the structured planner input shared by OpenAI-compatible
@@ -177,15 +181,17 @@ func NewIntentPlanRequest(opts IntentPlanRequestOptions) (IntentPlanRequest, err
 		if opts.IncludeCapturedDiffs {
 			input := cp.CapturedDiff
 			redacted := RedactDiffSecrets(input)
-			// Intent planner stage uses IntentStageDiffCap (16 KiB) rather
-			// than the per-event DiffCap (4 KiB) so the planner sees enough
-			// of each captured diff to reason about multi-file grouping.
+			// Keep complete ordinary implementation diffs when they fit the
+			// bounded Intent allowance. Event messages retain their own cap.
 			cp.CapturedDiff = Truncate(redacted, IntentStageDiffCap)
-			cp.CapturedDiffTruncated = cp.CapturedDiffTruncated || len(redacted) > IntentStageDiffCap
+			cp.CapturedDiffTruncated = cp.CapturedDiffTruncated || len(redacted) > IntentStageDiffCap ||
+				strings.Contains(redacted, "\n... <truncated> ...\n")
 			if cp.CapturedDiffTruncated && cp.FileMetadata != nil && cp.FileMetadata.Kind != "binary" {
 				cp.FileMetadata.DiffOmittedReason = "truncated"
 			}
-			req.CapturedDiffTransform = mergePromptTransformMetadata(req.CapturedDiffTransform, promptTransformMetadata(input, redacted, cp.CapturedDiff))
+			transform := promptTransformMetadata(input, redacted, cp.CapturedDiff)
+			transform.Truncated = transform.Truncated || cp.CapturedDiffTruncated
+			req.CapturedDiffTransform = mergePromptTransformMetadata(req.CapturedDiffTransform, transform)
 		} else {
 			cp.CapturedDiff = ""
 		}

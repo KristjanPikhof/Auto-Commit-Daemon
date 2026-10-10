@@ -563,6 +563,7 @@ SELECT COUNT(*) FROM checkpoints WHERE observed_ref=? AND observed_head=?`,
 }
 
 func TestExternalRepairBridgeRejectsPostProofCaptureAtomically(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	keys := seedExternalBridgeAtomicBaseline(t, ctx, f)
@@ -600,6 +601,7 @@ func TestExternalRepairBridgeRejectsPostProofCaptureAtomically(t *testing.T) {
 }
 
 func TestExternalRepairBridgeRejectsMissingLaterCaptureObjectAtomically(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	keys := seedExternalBridgeAtomicBaseline(t, ctx, f)
@@ -627,6 +629,7 @@ func TestExternalRepairBridgeRejectsMissingLaterCaptureObjectAtomically(t *testi
 }
 
 func TestExternalRepairBridgeRejectsBranchMoveBeforeCombinedLock(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	keys := seedExternalBridgeAtomicBaseline(t, ctx, f)

@@ -92,6 +92,7 @@ func openAICommitMessageParameters(format CommitFormat) map[string]any {
 		"properties": map[string]any{
 			"subject": map[string]any{
 				"type":        "string",
+				"maxLength":   SubjectCap,
 				"description": subjectDescription,
 			},
 			"body": map[string]any{
@@ -993,11 +994,6 @@ func buildOpenAIRequestWithTrace(model string, cc CommitContext, diffCap int) ([
 	return raw, transform, err
 }
 
-func buildOpenAIIntentPlanRequest(model string, plannerReq IntentPlanRequest) ([]byte, error) {
-	body, _, err := buildOpenAIIntentPlanRequestWithTrace(model, plannerReq)
-	return body, err
-}
-
 func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRequest) ([]byte, prompttrace.TransformMetadata, error) {
 	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
 	userPrompt, err := BuildIntentPlanUserPrompt(plannerReq)
@@ -1017,11 +1013,6 @@ func buildOpenAIIntentPlanRequestWithTrace(model string, plannerReq IntentPlanRe
 	return raw, plannerReq.CapturedDiffTransform, err
 }
 
-func buildOpenAIIntentPlanV2Request(model string, plannerReq IntentPlanRequestV2) ([]byte, error) {
-	body, _, err := buildOpenAIIntentPlanV2RequestWithTrace(model, plannerReq)
-	return body, err
-}
-
 func buildOpenAIIntentPlanV2RequestWithTrace(model string, plannerReq IntentPlanRequestV2) ([]byte, prompttrace.TransformMetadata, error) {
 	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
 	userPrompt, err := BuildIntentPlanV2UserPrompt(plannerReq)
@@ -1039,11 +1030,6 @@ func buildOpenAIIntentPlanV2RequestWithTrace(model string, plannerReq IntentPlan
 		Temperature:     0.2,
 	})
 	return raw, plannerReq.CapturedDiffTransform, err
-}
-
-func buildOpenAIIntentMessageRewriteRequest(model string, rewriteReq IntentMessageRewriteRequest) ([]byte, error) {
-	body, _, err := buildOpenAIIntentMessageRewriteRequestWithTrace(model, rewriteReq)
-	return body, err
 }
 
 // ProposeCommitRewrite POSTs a historical commit rewrite request and parses a

@@ -369,10 +369,14 @@ func publicationDrainCanReconnect(drain state.PublicationDrain, workerAvailable 
 // The durable drain remains readable when a worker socket disappears. Keep the
 // request-time filter at the call site so an unrelated earlier run cannot be
 // mistaken for the current commit-all request.
-func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup) (
+func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup, drainIDs ...string) (
 	state.PublicationDrainReadOnlyProjection, bool, error,
 ) {
-	response, err := callSupervisor(ctx, lookup, "publication_drain_status", nil, 2*time.Second)
+	var params json.RawMessage
+	if len(drainIDs) > 0 && drainIDs[0] != "" {
+		params, _ = json.Marshal(map[string]string{"drain_id": drainIDs[0]})
+	}
+	response, err := callSupervisor(ctx, lookup, "publication_drain_status", params, 2*time.Second)
 	if err == nil {
 		projection, decodeErr := decodeProductData[state.PublicationDrainReadOnlyProjection](response.Data)
 		return projection, decodeErr == nil, decodeErr
@@ -380,11 +384,12 @@ func readProductPublicationDrain(ctx context.Context, lookup controlRepoLookup) 
 	if ctx.Err() != nil {
 		return state.PublicationDrainReadOnlyProjection{}, false, ctx.Err()
 	}
-	return readProductPublicationDrainAfterWorkerFailure(ctx, lookup.Record.StateDB, err)
+	return readProductPublicationDrainAfterWorkerFailure(ctx, lookup.Record.StateDB, err, drainIDs...)
 }
 
 func readProductPublicationDrainAfterWorkerFailure(
 	ctx context.Context, dbPath string, workerErr error,
+	drainIDs ...string,
 ) (state.PublicationDrainReadOnlyProjection, bool, error) {
 	// A runtime compatibility failure is not a worker disconnect. Do not let
 	// an older local projection make an incompatible command look successful.
@@ -394,7 +399,7 @@ func readProductPublicationDrainAfterWorkerFailure(
 	if !fileExists(dbPath) {
 		return state.PublicationDrainReadOnlyProjection{}, false, workerErr
 	}
-	projection, readErr := state.ReadPublicationDrainProjection(ctx, dbPath)
+	projection, readErr := state.ReadPublicationDrainProjection(ctx, dbPath, drainIDs...)
 	if readErr != nil {
 		return state.PublicationDrainReadOnlyProjection{}, false, errors.Join(workerErr, readErr)
 	}
@@ -506,7 +511,7 @@ func waitForProductPublicationDrain(
 			remaining := latest.TargetEventCount - latest.PublishedEventCount
 			writeProductCommitAllProgress(progressOut, *latest, remaining)
 		case <-poll.C:
-			projection, live, err := readProductPublicationDrain(ctx, lookup)
+			projection, live, err := readProductPublicationDrain(ctx, lookup, result.DrainID)
 			if err != nil {
 				if workerUnavailableSince.IsZero() {
 					workerUnavailableSince = time.Now()

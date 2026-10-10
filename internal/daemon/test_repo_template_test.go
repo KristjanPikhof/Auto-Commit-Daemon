@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -139,4 +140,85 @@ func cloneDaemonTestRepo(t *testing.T, template daemonTestRepoTemplate) *daemonT
 	t.Cleanup(func() { _ = db.Close() })
 
 	return &daemonTestRepo{dir: dir, gitDir: gitDir, head: template.head, db: db}
+}
+
+// Pure state fixtures need the same empty schema, without repeating its DDL.
+// The template is checkpointed and closed before tests start; every copy owns
+// its file, WAL and normal production connections independently.
+func cloneDaemonTestState(t *testing.T, ctx context.Context) *state.DB {
+	t.Helper()
+	if daemonRepoTemplate.dir == "" {
+		t.Fatal("daemon state template was not initialized")
+	}
+	source := state.DBPathFromGitDir(filepath.Join(daemonRepoTemplate.dir, ".git"))
+	body, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read empty state template: %v", err)
+	}
+	destination := filepath.Join(t.TempDir(), state.DBFileName)
+	if err := os.WriteFile(destination, body, 0o600); err != nil {
+		t.Fatalf("copy private state template: %v", err)
+	}
+	db, err := state.Open(ctx, destination)
+	if err != nil {
+		t.Fatalf("open private cloned state: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func TestDaemonClonedStateFixturesStayPrivate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	templatePath := state.DBPathFromGitDir(filepath.Join(daemonRepoTemplate.dir, ".git"))
+	before, err := os.ReadFile(templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	templateInfo, err := os.Stat(templatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		name string
+		open func(*testing.T) *state.DB
+	}{
+		{"candidate", openIntentCandidateTestDB},
+		{"refcount", openTestDB},
+		{"provider health", newIntentHealthTestDB},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			first, second := fixture.open(t), fixture.open(t)
+			firstInfo, err := os.Stat(first.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondInfo, err := os.Stat(second.Path())
+			if err != nil || os.SameFile(firstInfo, secondInfo) || os.SameFile(firstInfo, templateInfo) {
+				t.Fatal("state fixtures share a writable file")
+			}
+			version, err := first.UserVersion(ctx)
+			if err != nil || version != state.SchemaVersion {
+				t.Fatalf("cloned schema version=%d err=%v", version, err)
+			}
+			capture := appendIntentCandidateCapture(t, first, "isolation.go", "create", "", "recorded-object")
+			pending, err := state.PendingEvents(ctx, second, 0)
+			if err != nil || len(pending) != 0 {
+				t.Fatal("private capture leaked into another fixture")
+			}
+			reopened, err := state.Open(ctx, first.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			pending, err = state.PendingEvents(ctx, reopened, 0)
+			if err != nil || len(pending) != 1 || pending[0].Seq != capture.Event.Seq {
+				t.Fatal("cloned database lost durable capture state on reopen")
+			}
+		})
+	}
+	after, err := os.ReadFile(templatePath)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("private fixtures modified the closed state template")
+	}
 }

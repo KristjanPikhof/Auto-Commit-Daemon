@@ -1187,7 +1187,14 @@ func marshalSubprocessPromptRequest(req subprocessRequest, inputDiff, outputDiff
 }
 
 func marshalSubprocessRequest(req subprocessRequest) ([]byte, error) {
-	body, err := json.Marshal(req)
+	var wire any = req
+	if req.PlannerRequestV2 != nil {
+		wire = struct {
+			subprocessRequest
+			PlannerRequestV2 intentPlanWireV2 `json:"planner_request_v2"`
+		}{subprocessRequest: req, PlannerRequestV2: intentPlanV2WireRequest(*req.PlannerRequestV2)}
+	}
+	body, err := json.Marshal(wire)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}

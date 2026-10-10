@@ -3182,7 +3182,9 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	hookDone := make(chan error, 1)
+	rollbackDone := make(chan struct{}, 1)
 	var hookOnce sync.Once
+	var rollbackOnce sync.Once
 	var wg sync.WaitGroup
 	checkHook, checkEntered, releaseCheck := oneShotBranchTokenCheckGate()
 	defer releaseCheck()
@@ -3199,6 +3201,9 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 					_, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", "HEAD", "refs/heads/main")
 					hookDone <- err
 				})
+			},
+			afterBranchTransitionRollback: func() {
+				rollbackOnce.Do(func() { rollbackDone <- struct{}{} })
 			},
 		})
 	}()
@@ -3219,8 +3224,11 @@ func TestRun_BranchRollbackPreservesOldShadowAtZeroRetention(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("branch transition hook did not run")
 	}
-	wakeCh <- struct{}{}
-	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-rollbackDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("branch transition rollback did not finish")
+	}
 	gen, _, _ := state.MetaGet(ctx, f.db, MetaKeyBranchGeneration)
 	if gen != "1" {
 		t.Fatalf("branch generation=%q want 1 after rollback", gen)
@@ -3747,6 +3755,7 @@ func TestBranchGenerationToken_RevAndMissing(t *testing.T) {
 }
 
 func TestRun_SameSHABranchSwitchCommitsToActiveBranch(t *testing.T) {
+	t.Parallel()
 	f := newDaemonFixture(t)
 	registerLiveClient(t, f.db)
 	ctx := context.Background()
@@ -4533,6 +4542,7 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 	}
 
 	wakeCh := make(chan struct{}, 4)
+	passDone := make(chan struct{}, 4)
 	shutdownCh := make(chan struct{}, 1)
 	manual := Scheduler{
 		Base:         1 * time.Hour,
@@ -4554,6 +4564,12 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 			WakeCh:      wakeCh,
 			ShutdownCh:  shutdownCh,
 			SkipSignals: true,
+			afterRunLoopWorkDecision: func(_, _ bool) {
+				select {
+				case passDone <- struct{}{}:
+				case <-ctx.Done():
+				}
+			},
 		})
 	}()
 	t.Cleanup(func() {
@@ -4563,6 +4579,17 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, seedHead, 2*time.Second)
+	// Startup publishes the mode and branch head before its first work pass
+	// finishes. Wait for that pass so the phase-one wake cannot be consumed
+	// while capture/replay is still processing the startup token.
+	waitFor(t, 2*time.Second, "startup work pass completes", func() bool {
+		select {
+		case <-passDone:
+			return true
+		default:
+			return false
+		}
+	})
 
 	// Force a divergence on disk in two deterministic phases:
 	//
@@ -4601,6 +4628,16 @@ func TestRun_PostFlushBranchTokenReCheck(t *testing.T) {
 	// fixed sleep so this is robust to slow runners.
 	wakeCh <- struct{}{}
 	waitForMetaValue(t, f.db, MetaKeyBranchHead, aheadHead, 3*time.Second)
+	// The persisted head changes within the pass. Finish that pass before
+	// resetting HEAD, so phase two exercises a settled ahead token.
+	waitFor(t, 3*time.Second, "ahead-token work pass completes", func() bool {
+		select {
+		case <-passDone:
+			return true
+		default:
+			return false
+		}
+	})
 
 	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "reset", "--hard", seedHead); err != nil {
 		t.Fatalf("git reset: %v", err)
@@ -5364,6 +5401,18 @@ func TestRun_WakeOnlyFlushCannotBypassIntentV2Cutover(t *testing.T) {
 	})
 	waitForDaemonMode(t, f.db, "running", 2*time.Second)
 
+	// Running proves ownership, while the first completed checkpoint proves
+	// startup has reached protection. Keep the wake-only scenario separate
+	// from the initial branch and shadow preparation.
+	waitFor(t, 10*time.Second, "startup protection checkpoint completed", func() bool {
+		var ready int
+		err := f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM checkpoints
+WHERE phase='completed' AND coverage_complete=1
+  AND observed_ref='refs/heads/main' AND observed_head=?`, startHead).Scan(&ready)
+		return err == nil && ready > 0
+	})
+
 	if err := os.WriteFile(filepath.Join(f.dir, "wake-only.txt"), []byte("v1\n"), 0o644); err != nil {
 		t.Fatalf("write wake-only: %v", err)
 	}
@@ -5375,9 +5424,19 @@ func TestRun_WakeOnlyFlushCannotBypassIntentV2Cutover(t *testing.T) {
 	waitFor(t, 2*time.Second, "wake flush request completed", func() bool {
 		return countFlushByStatus(t, f.db, "completed") >= 1
 	})
-	waitFor(t, 2*time.Second, "capture event remains pending", func() bool {
+	waitFor(t, 10*time.Second, "wake-only capture remains protected and pending", func() bool {
 		pending, err := state.PendingEvents(context.Background(), f.db, 0)
-		return err == nil && len(pending) == 1
+		if err != nil || len(pending) != 1 || pending[0].Path != "wake-only.txt" || pending[0].Operation != "create" {
+			return false
+		}
+		var protected int
+		err = f.db.ReadSQL().QueryRowContext(ctx, `
+SELECT COUNT(*) FROM checkpoint_events membership
+JOIN checkpoints checkpoint ON checkpoint.id=membership.checkpoint_id
+WHERE membership.event_seq=? AND checkpoint.phase='completed'
+  AND checkpoint.coverage_complete=1 AND checkpoint.observed_head=?`,
+			pending[0].Seq, startHead).Scan(&protected)
+		return err == nil && protected == 1
 	})
 	if planner.calls != 0 {
 		t.Fatalf("planner calls=%d want 0 before immutable v2 activation",

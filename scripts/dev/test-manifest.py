@@ -7,16 +7,21 @@ import re
 import sys
 
 
-def manifest(names, count, durations):
+def manifest(names, count, durations, parallel_names=None, case_parallelism=1):
     if count < 1 or len(names) != len(set(names)):
         raise ValueError("positive shard count and unique test names required")
     if any(not re.fullmatch(r"(?:Test|Example|Fuzz)\w*", name) for name in names):
         raise ValueError("unexpected Go test name")
+    if case_parallelism < 1:
+        raise ValueError("positive case parallelism required")
+    parallel_names = set(parallel_names or ())
+    costs = {name: durations.get(name, 1.0) / (case_parallelism if name in parallel_names else 1)
+             for name in names}
     shards = [{"tests": [], "estimated_seconds": 0.0} for _ in range(count)]
-    for name in sorted(names, key=lambda name: (-durations.get(name, 1.0), name)):
+    for name in sorted(names, key=lambda name: (-costs[name], name)):
         shard = min(shards, key=lambda shard: shard["estimated_seconds"])
         shard["tests"].append(name)
-        shard["estimated_seconds"] += durations.get(name, 1.0)
+        shard["estimated_seconds"] += costs[name]
     assigned = [name for shard in shards for name in shard["tests"]]
     if sorted(assigned) != sorted(names):
         raise ValueError("shards must select every test exactly once")
@@ -28,6 +33,7 @@ def manifest(names, count, durations):
 
 def timings(paths):
     result = {}
+    parallel = set()
     for path in paths:
         with open(path) as source:
             for line in source:
@@ -36,11 +42,22 @@ def timings(paths):
                 except json.JSONDecodeError:
                     continue
                 name = event.get("Test", "")
-                if event.get("Action") not in ("pass", "fail") or not name or "/" in name:
+                if not name or "/" in name:
                     continue
                 package = "./" + event["Package"].split("Auto-Commit-Daemon/", 1)[-1]
+                if event.get("Action") == "pause":
+                    parallel.add((package, name))
+                    continue
+                if event.get("Action") not in ("pass", "fail"):
+                    continue
                 bucket = result.setdefault(package, {})
                 bucket[name] = max(bucket.get(name, 0), event.get("Elapsed", 0.0), 0.001)
+    observed = {}
+    for package, name in sorted(parallel):
+        if name in result.get(package, {}):
+            observed.setdefault(package, []).append(name)
+    if observed:
+        result["_parallel_tests"] = observed
     return result
 
 
@@ -52,6 +69,7 @@ def main():
     balance.add_argument("count", type=int)
     balance.add_argument("names", type=pathlib.Path)
     balance.add_argument("--timings", type=pathlib.Path, default=pathlib.Path(__file__).with_name("test-timings.json"))
+    balance.add_argument("--parallelism", type=int, default=1)
     collect = commands.add_parser("timings")
     collect.add_argument("paths", nargs="+")
     pattern = commands.add_parser("pattern")
@@ -62,7 +80,8 @@ def main():
         value = timings(args.paths)
     elif args.command == "balance":
         durations = json.loads(args.timings.read_text()) if args.timings.exists() else {}
-        value = manifest(args.names.read_text().splitlines(), args.count, durations.get(args.package, {}))
+        value = manifest(args.names.read_text().splitlines(), args.count, durations.get(args.package, {}),
+                         durations.get("_parallel_tests", {}).get(args.package, []), args.parallelism)
         value["package"] = args.package
     else:
         value = json.loads(args.manifest.read_text())

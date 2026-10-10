@@ -17,6 +17,7 @@ import (
 )
 
 func TestExternalRepairBridgeRejectsRepairPlanDigestDrift(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	if _, err := f.capture.db.SQL().ExecContext(ctx, `
@@ -34,6 +35,7 @@ UPDATE intent_repairs SET plan_digest=? WHERE id='external-repair-bridge'`,
 }
 
 func TestExternalRepairBridgeRejectsFinalRepairMappingMismatch(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	if _, err := f.capture.db.SQL().ExecContext(ctx, `
@@ -54,6 +56,7 @@ WHERE repair_id='external-repair-bridge'
 }
 
 func TestRecoveredIntentRepairPlanDigestBoundsSealedMetadata(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	tree := externalBridgeTestTree(t, ctx, f, f.cctx.BaseHead)
@@ -101,6 +104,7 @@ func TestRecoveredIntentRepairPlanDigestBoundsSealedMetadata(t *testing.T) {
 }
 
 func TestRecoveredIntentRepairPlanDigestRejectsMissingMappedCommit(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	missingOID := strings.Repeat("f", len(f.cctx.BaseHead))
 	_, err := recoveredIntentRepairPlanDigest(
@@ -117,6 +121,7 @@ func TestRecoveredIntentRepairPlanDigestRejectsMissingMappedCommit(t *testing.T)
 }
 
 func TestRecoveredIntentRepairPlanDigestKeepsCancellationRetryable(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -136,6 +141,7 @@ func TestRecoveredIntentRepairPlanDigestKeepsCancellationRetryable(t *testing.T)
 }
 
 func TestExternalRepairBridgeRejectsMissingMappedCommit(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	missingOID := strings.Repeat("f", len(f.source))
@@ -160,6 +166,7 @@ WHERE id='external-repair-bridge'`, missingOID); err != nil {
 }
 
 func TestCanonicalRepairMappingValidatesSealedPlan(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		driftPlan  bool
@@ -236,6 +243,7 @@ WHERE id=? AND status='prepared'`, digest, newHead, repairID); err != nil {
 }
 
 func TestExternalRepairBridgeClassifiesHistoricalObjectDrift(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		memberSQL string
@@ -283,6 +291,7 @@ UPDATE capture_ops SET after_oid=? WHERE event_seq=? AND ord=0`,
 func TestExternalRepairBridgePublishesFrozenPrefixAndPreservesLaterCapture(
 	t *testing.T,
 ) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	laterBlob := externalBridgeTestBlob(t, ctx, f.capture, "later capture\n")
@@ -471,6 +480,7 @@ SELECT COUNT(*) FROM capture_events WHERE path='later.txt'`).Scan(
 }
 
 func TestExternalRepairBridgeUsesAuthoritativeRecaptureReset(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	var repairHead string
@@ -512,6 +522,7 @@ WHERE event_seq=? AND ord=0`,
 }
 
 func TestExternalRepairPublicationSuffixReconstructsCoalescedOps(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	const path = "coalesced.txt"
@@ -588,6 +599,7 @@ func TestExternalRepairPublicationSuffixReconstructsCoalescedOps(t *testing.T) {
 }
 
 func TestExternalRepairPublicationSuffixSharesEvidenceBudget(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	blob := externalBridgeTestBlob(t, ctx, f, "bounded publication\n")
@@ -623,6 +635,7 @@ func TestExternalRepairPublicationSuffixSharesEvidenceBudget(t *testing.T) {
 }
 
 func TestExternalRepairPublicationSuffixKeepsCancellationRetryable(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -639,6 +652,7 @@ func TestExternalRepairPublicationSuffixKeepsCancellationRetryable(t *testing.T)
 }
 
 func TestExternalRepairPublicationSuffixRejectsGitParentMismatch(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	const path = "bad-parent.txt"
@@ -678,6 +692,7 @@ func TestExternalRepairPublicationSuffixRejectsGitParentMismatch(t *testing.T) {
 }
 
 func TestExternalRepairPublicationSuffixRejectsMembershipDigestDrift(t *testing.T) {
+	t.Parallel()
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	const publicationID = "external-repair-publication"
@@ -710,6 +725,7 @@ WHERE id=?`, publicationID); err != nil {
 }
 
 func TestExternalBridgeChangedPathsClassifiesPathLimit(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
 	blob := externalBridgeTestBlob(t, ctx, f, "bounded path\n")
@@ -729,6 +745,7 @@ func TestExternalBridgeChangedPathsClassifiesPathLimit(t *testing.T) {
 }
 
 func TestExternalBridgeIndexStateChunksPathspecArguments(t *testing.T) {
+	t.Parallel()
 	f := newCaptureFixture(t)
 	paths := make([]string, 0, maxExternalRepairBridgePaths)
 	for i := 0; i < maxExternalRepairBridgePaths-1; i++ {
@@ -755,6 +772,7 @@ func TestExternalBridgeIndexStateChunksPathspecArguments(t *testing.T) {
 }
 
 func TestExternalBridgePathspecChunksRejectInvalidPathSets(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		paths []string

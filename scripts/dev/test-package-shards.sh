@@ -17,6 +17,24 @@ if ! [[ "$shard_count" =~ ^[1-9][0-9]*$ ]] ||
   echo "invalid shard count/index: $shard_count/$requested_shard" >&2
   exit 2
 fi
+case_parallelism=1
+expect_parallelism=false
+for argument in "$@"; do
+  if [[ "$expect_parallelism" == true ]]; then
+    case_parallelism=$argument
+    expect_parallelism=false
+    continue
+  fi
+  case "$argument" in
+    -parallel) expect_parallelism=true ;;
+    -parallel=*) case_parallelism=${argument#*=} ;;
+    -args) break ;;
+  esac
+done
+if [[ "$expect_parallelism" == true ]] || ! [[ "$case_parallelism" =~ ^[1-9][0-9]*$ ]]; then
+  echo "invalid test parallelism: $case_parallelism" >&2
+  exit 2
+fi
 output_root=$(mktemp -d "${TMPDIR:-/tmp}/acd-test-shards.XXXXXX")
 trap 'rm -rf "$output_root"' EXIT
 # Capture discovery separately: a compile failure must fail the lane rather
@@ -28,7 +46,8 @@ if [[ ! -s "$output_root/names" ]]; then
   echo "$package: no tests, examples, or fuzz targets found" >&2
   exit 1
 fi
-python3 scripts/dev/test-manifest.py balance "$package" "$shard_count" "$output_root/names" >"$output_root/manifest.json"
+python3 scripts/dev/test-manifest.py balance "$package" "$shard_count" "$output_root/names" \
+  --parallelism "$case_parallelism" >"$output_root/manifest.json"
 first=0
 last=$shard_count
 if [[ -n "$requested_shard" ]]; then

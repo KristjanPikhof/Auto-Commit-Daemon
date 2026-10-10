@@ -67,22 +67,31 @@ type IntentRepairPlan struct {
 	Paths      []string
 	MaxCommits int
 	Candidates []IntentRepairCandidatePlan
+	// AllowCaptureRepartition permits a mixed old commit to contribute separate
+	// captures to multiple goals. EventSeqs must still have exactly one owner.
+	AllowCaptureRepartition bool
+	// ExpectedFinalTree pins the materialized publication target. When omitted
+	// for quality-only repair, the original HEAD tree is required.
+	ExpectedFinalTree string
 	// VerifyCommit runs the already-approved repository check against each
 	// exact rebuilt commit before Git changes any refs.
 	VerifyCommit git.IntentRepairCommitVerifier
 }
 
 type IntentRepairResult struct {
-	ID           string
-	Status       string
-	Reason       string
-	OldHead      string
-	NewHead      string
-	BackupRef    string
-	Recovered    bool
-	PrunedRefs   int
-	CommitMap    map[string]string
-	CandidateMap map[string]string
+	ID         string
+	Status     string
+	Reason     string
+	OldHead    string
+	NewHead    string
+	BackupRef  string
+	Recovered  bool
+	PrunedRefs int
+	CommitMap  map[string]string
+	// CommitLineage preserves every old-to-new relation. CommitMap contains only
+	// unambiguous representatives; a mixed old commit has no single substitute.
+	CommitLineage map[string][]string
+	CandidateMap  map[string]string
 }
 
 // intentRepairAfterGitApply is a test hook for the process-death window after
@@ -153,6 +162,20 @@ func ApplyIntentRepairTransaction(
 	if err := validateIntentRepairMemberSnapshot(plan, members); err != nil {
 		return result, err
 	}
+	qualityOnly := true
+	for _, member := range members {
+		qualityOnly = qualityOnly && member.PriorState == state.EventStatePublished
+	}
+	if qualityOnly {
+		originalTree, err := git.RevParse(ctx, repoRoot, plan.ExpectedHead+"^{tree}")
+		if err != nil {
+			return result, err
+		}
+		if plan.ExpectedFinalTree != "" && plan.ExpectedFinalTree != originalTree {
+			return result, errors.New("daemon: intent repair: quality-only final tree differs from original HEAD")
+		}
+		plan.ExpectedFinalTree = originalTree
+	}
 
 	prepared := state.IntentRepair{
 		ID: plan.ID, BranchRef: plan.BranchRef,
@@ -174,11 +197,13 @@ func ApplyIntentRepairTransaction(
 		return result, failPreparedIntentRepair(ctx, db, plan.ID, errors.New(reason))
 	}
 	applied, err := git.ApplyIntentRepair(ctx, repoRoot, git.IntentRepairApplyOptions{
-		Eligibility:      eligibility,
-		RepairID:         plan.ID,
-		Replacements:     intentRepairGitReplacements(plan),
-		AllowRepartition: len(plan.OldChain) > 0,
-		VerifyCommit:     plan.VerifyCommit,
+		Eligibility:             eligibility,
+		RepairID:                plan.ID,
+		Replacements:            intentRepairGitReplacements(plan),
+		AllowRepartition:        len(plan.OldChain) > 0,
+		AllowCaptureRepartition: plan.AllowCaptureRepartition,
+		ExpectedFinalTree:       plan.ExpectedFinalTree,
+		VerifyCommit:            plan.VerifyCommit,
 	})
 	if err != nil {
 		return result, failPreparedIntentRepair(ctx, db, plan.ID, err)
@@ -192,13 +217,20 @@ func ApplyIntentRepairTransaction(
 		return skipped, nil
 	}
 	result = intentRepairResultFromApply(plan.ID, applied)
+	for i, candidate := range plan.Candidates {
+		mappingIndex := 0
+		for _, prior := range plan.Candidates[:i] {
+			mappingIndex += len(prior.Replaces)
+		}
+		result.CandidateMap[candidate.CandidateID] = applied.CommitMappings[mappingIndex].NewOID
+	}
 	if intentRepairAfterGitApply != nil {
 		if hookErr := intentRepairAfterGitApply(result); hookErr != nil {
 			return result, hookErr
 		}
 	}
 
-	mappings := intentRepairStateCommits(plan, result.CommitMap)
+	mappings := intentRepairStateCandidateCommits(plan, result.CandidateMap)
 	ok, err := state.TransitionIntentRepair(ctx, db, plan.ID, state.IntentRepairTransition{
 		ExpectedStatus: state.IntentRepairPrepared,
 		Status:         state.IntentRepairGitApplied,
@@ -358,7 +390,7 @@ func recoverIntentRepair(
 			return result, intentRepairRecoveryProofError(
 				"repair %s has an incomplete commit mapping", repair.ID)
 		}
-		result.CommitMap[mapping.OldOID] = mapping.NewOID.String
+		appendIntentRepairLineage(&result, mapping.OldOID, mapping.NewOID.String)
 		if mapping.CandidateID.Valid {
 			result.CandidateMap[mapping.CandidateID.String] = mapping.NewOID.String
 		}
@@ -410,7 +442,13 @@ func completeIntentRepair(
 			return intentRepairRecoveryProofError(
 				"repair %s is missing a new commit mapping", repairID)
 		}
-		reconcile[mapping.OldOID] = mapping.NewOID.String
+		if existing, ok := reconcile[mapping.OldOID]; !ok {
+			reconcile[mapping.OldOID] = mapping.NewOID.String
+		} else if existing != mapping.NewOID.String {
+			// An old mixed commit has several successors. The frozen capture
+			// membership is authoritative; do not guess a commit representative.
+			reconcile[mapping.OldOID] = ""
+		}
 		if mapping.CandidateID.Valid {
 			candidateID := mapping.CandidateID.String
 			if existing := candidates[candidateID]; existing != "" &&
@@ -514,6 +552,9 @@ func reconcileIntentRepairLedger(
 		}
 	}
 	for oldOID, newOID := range commitMap {
+		if newOID == "" {
+			continue
+		}
 		queries := []string{
 			`UPDATE decision_records SET commit_oid=? WHERE commit_oid=?`,
 			`UPDATE publish_state SET target_commit_oid=? WHERE target_commit_oid=?`,
@@ -608,7 +649,7 @@ func validateIntentRepairSettlement(
 SELECT COUNT(*)
 FROM (
     SELECT mapped.candidate_id
-    FROM intent_repair_commits mapped
+    FROM intent_repair_commit_mappings mapped
     WHERE mapped.repair_id=?
     GROUP BY mapped.candidate_id
     HAVING mapped.candidate_id IS NULL
@@ -691,7 +732,7 @@ WITH classified AS (
             WHEN owned.prior_state='published'
              AND event.state='published'
              AND EXISTS (
-                 SELECT 1 FROM intent_repair_commits mapped
+                 SELECT 1 FROM intent_repair_commit_mappings mapped
                  WHERE mapped.repair_id=owned.repair_id
                    AND mapped.candidate_id=owned.candidate_id
                    AND mapped.old_oid=event.commit_oid
@@ -701,7 +742,7 @@ WITH classified AS (
         CASE
             WHEN event.state='published'
              AND EXISTS (
-                 SELECT 1 FROM intent_repair_commits mapped
+                 SELECT 1 FROM intent_repair_commit_mappings mapped
                  WHERE mapped.repair_id=owned.repair_id
                    AND mapped.candidate_id=owned.candidate_id
                    AND mapped.new_oid=event.commit_oid
@@ -827,14 +868,16 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 				}
 				previousPosition = position
 			}
-			if _, duplicate := seen[oid]; duplicate {
+			if _, duplicate := seen[oid]; duplicate && !plan.AllowCaptureRepartition {
 				return fmt.Errorf("daemon: intent repair: duplicate replaced oid %s", oid)
 			}
-			seen[oid] = struct{}{}
-			count++
+			if _, exists := seen[oid]; !exists {
+				seen[oid] = struct{}{}
+				count++
+			}
 		}
 		if firstPosition >= 0 {
-			if firstPosition <= lastCandidatePosition {
+			if firstPosition <= lastCandidatePosition && !plan.AllowCaptureRepartition {
 				return errors.New(
 					"daemon: intent repair: candidates are not ordered by their earliest old commit",
 				)
@@ -844,6 +887,12 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 	}
 	if count > limit || count > git.MaxIntentRepairCommits {
 		return fmt.Errorf("daemon: intent repair: %d commits exceed limit %d", count, limit)
+	}
+	if len(plan.Candidates) > git.MaxIntentRepairCommits {
+		return fmt.Errorf("daemon: intent repair: candidates exceed limit %d", git.MaxIntentRepairCommits)
+	}
+	if plan.AllowCaptureRepartition && (len(plan.OldChain) == 0 || plan.ExpectedFinalTree == "") {
+		return errors.New("daemon: intent repair: capture repartition requires the old chain and exact final tree")
 	}
 	if len(plan.OldChain) > 0 {
 		if len(plan.OldChain) != count {
@@ -855,8 +904,7 @@ func validateIntentRepairPlan(plan IntentRepairPlan, cctx CaptureContext) error 
 			return errors.New("daemon: intent repair: old chain does not end at expected HEAD")
 		}
 		if _, ok := seen[plan.OldChain[0]]; !ok ||
-			len(plan.Candidates[0].Replaces) == 0 ||
-			plan.Candidates[0].Replaces[0] != plan.OldChain[0] {
+			(!plan.AllowCaptureRepartition && plan.Candidates[0].Replaces[0] != plan.OldChain[0]) {
 			return errors.New(
 				"daemon: intent repair: first candidate must own the oldest commit",
 			)
@@ -991,17 +1039,44 @@ func intentRepairStateCommits(plan IntentRepairPlan, commitMap map[string]string
 	return out
 }
 
+func intentRepairStateCandidateCommits(plan IntentRepairPlan, candidateMap map[string]string) []state.IntentRepairCommit {
+	out := intentRepairStateCommits(plan, nil)
+	for i := range out {
+		if oid := candidateMap[out[i].CandidateID.String]; oid != "" {
+			out[i].NewOID = sql.NullString{String: oid, Valid: true}
+		}
+	}
+	return out
+}
+
 func intentRepairResultFromApply(id string, applied git.IntentRepairApplyResult) IntentRepairResult {
 	result := IntentRepairResult{
 		ID: id, Status: state.IntentRepairGitApplied,
 		OldHead: applied.OldHead, NewHead: applied.NewHead,
 		BackupRef: applied.BackupRef, CommitMap: make(map[string]string),
-		CandidateMap: make(map[string]string),
+		CandidateMap: make(map[string]string), CommitLineage: make(map[string][]string),
 	}
 	for _, mapping := range applied.CommitMappings {
-		result.CommitMap[mapping.OldOID] = mapping.NewOID
+		appendIntentRepairLineage(&result, mapping.OldOID, mapping.NewOID)
 	}
 	return result
+}
+
+func appendIntentRepairLineage(result *IntentRepairResult, oldOID, newOID string) {
+	if result.CommitLineage == nil {
+		result.CommitLineage = make(map[string][]string)
+	}
+	for _, existing := range result.CommitLineage[oldOID] {
+		if existing == newOID {
+			return
+		}
+	}
+	result.CommitLineage[oldOID] = append(result.CommitLineage[oldOID], newOID)
+	if len(result.CommitLineage[oldOID]) == 1 {
+		result.CommitMap[oldOID] = newOID
+	} else {
+		delete(result.CommitMap, oldOID)
+	}
 }
 
 func persistSkippedIntentRepair(ctx context.Context, db *state.DB, plan IntentRepairPlan, reason string) (IntentRepairResult, error) {
@@ -1072,14 +1147,20 @@ func reconstructIntentRepairMappings(
 		return nil, intentRepairRecoveryProofError(
 			"repair %s has no old commit mapping", repair.ID)
 	}
-	baseOut, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
-		"rev-parse", repair.Commits[0].OldOID+"^")
+	oldest, err := intentRepairOldestMappedCommit(ctx, repoRoot, repair.Commits)
 	if err != nil {
+		return nil, err
+	}
+	base, err := git.RevParse(ctx, repoRoot, oldest+"^")
+	if err != nil && !errors.Is(err, git.ErrRefNotFound) {
 		return nil, fmt.Errorf("daemon: recover intent repair: resolve repair base: %w", err)
 	}
-	base := strings.TrimSpace(string(baseOut))
+	rangeSpec := head
+	if base != "" {
+		rangeSpec = base + ".." + head
+	}
 	out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout},
-		"rev-list", "--first-parent", "--reverse", base+".."+head)
+		"rev-list", "--first-parent", "--reverse", fmt.Sprintf("--max-count=%d", git.MaxIntentRepairCommits+1), rangeSpec)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: recover intent repair: inspect rebuilt chain: %w", err)
 	}
@@ -1115,6 +1196,38 @@ func reconstructIntentRepairMappings(
 		}
 	}
 	return mappings, nil
+}
+
+func intentRepairOldestMappedCommit(ctx context.Context, repoRoot string, mappings []state.IntentRepairCommit) (string, error) {
+	old := make(map[string]struct{})
+	for _, mapping := range mappings {
+		old[mapping.OldOID] = struct{}{}
+	}
+	var oldest string
+	for oid := range old {
+		out, err := git.Run(ctx, git.RunOpts{Dir: repoRoot, Timeout: git.DefaultReadTimeout}, "rev-list", "--parents", "-n", "1", oid)
+		if err != nil {
+			return "", err
+		}
+		fields := strings.Fields(string(out))
+		if len(fields) < 1 || fields[0] != oid || len(fields) > 2 {
+			return "", intentRepairRecoveryProofError("mapped old commit has invalid linear ancestry")
+		}
+		parent := ""
+		if len(fields) == 2 {
+			parent = fields[1]
+		}
+		if _, included := old[parent]; !included {
+			if oldest != "" {
+				return "", intentRepairRecoveryProofError("mapped old commits have multiple bases")
+			}
+			oldest = oid
+		}
+	}
+	if oldest == "" {
+		return "", intentRepairRecoveryProofError("mapped old commits have no base")
+	}
+	return oldest, nil
 }
 
 type intentRepairDigestCandidate struct {
@@ -1387,13 +1500,4 @@ func newIntentRepairID() (string, error) {
 		return "", fmt.Errorf("daemon: intent repair: allocate id: %w", err)
 	}
 	return hex.EncodeToString(raw[:]), nil
-}
-
-func sortedIntentRepairCandidateIDs(values map[string]string) []string {
-	out := make([]string, 0, len(values))
-	for value := range values {
-		out = append(out, value)
-	}
-	sort.Strings(out)
-	return out
 }

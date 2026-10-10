@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,33 +24,13 @@ func TestRetentionKeepsNewestHundredAndRefsSurviveGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	var oldestRef, newestRef, newestCommit string
+	createdAt := make([]time.Time, DefaultMinimumRetained+1)
 	for i := 0; i < DefaultMinimumRetained+1; i++ {
-		seq, appendErr := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-			BranchRef: "refs/heads/main", BranchGeneration: 1,
-			BaseHead: "seed", Operation: "modify", Path: fmt.Sprintf("file-%03d", i), Fidelity: "exact",
-		}, []state.CaptureOp{{Op: "modify", Path: fmt.Sprintf("file-%03d", i), Fidelity: "exact"}})
-		if appendErr != nil {
-			t.Fatal(appendErr)
-		}
-		created, createErr := store.Create(ctx, Request{
-			RepoRoot: repo, WorktreeID: worktreeID, Reason: state.CheckpointReasonPoll,
-			ObservationEpoch: int64(i + 1), CoverageEpoch: int64(i + 1),
-			Entries:   []Entry{{Path: "protected.txt", Mode: gitpkg.RegularFileMode, OID: blob}},
-			EventSeqs: []int64{seq}, Now: now.Add(-60*24*time.Hour + time.Duration(i)*time.Second),
-		})
-		if createErr != nil {
-			t.Fatal(createErr)
-		}
-		if err := state.MarkEventPublished(ctx, db, seq, state.EventStatePublished,
-			sql.NullString{String: "normal-commit", Valid: true}, sql.NullString{}, sql.NullString{}, float64(now.Unix())); err != nil {
-			t.Fatal(err)
-		}
-		if i == 0 {
-			oldestRef = created.Checkpoint.Ref
-		}
-		newestRef, newestCommit = created.Checkpoint.Ref, created.Checkpoint.CommitOID
+		createdAt[i] = now.Add(-60*24*time.Hour + time.Duration(i)*time.Second)
 	}
+	checkpoints := seedPublishedRetentionCheckpoints(t, ctx, store, repo, worktreeID, blob, createdAt)
+	oldestRef := checkpoints[0].Ref
+	newest := checkpoints[len(checkpoints)-1]
 	summary, err := store.ApplyRetention(ctx, repo, worktreeID, now)
 	if err != nil {
 		t.Fatal(err)
@@ -61,8 +44,8 @@ func TestRetentionKeepsNewestHundredAndRefsSurviveGC(t *testing.T) {
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "gc", "--prune=now"); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := gitpkg.RevParse(ctx, repo, newestRef); err != nil || got != newestCommit {
-		t.Fatalf("retained checkpoint after gc=(%q,%v), want %q", got, err, newestCommit)
+	if got, err := gitpkg.RevParse(ctx, repo, newest.Ref); err != nil || got != newest.CommitOID {
+		t.Fatalf("retained checkpoint after gc=(%q,%v), want %q", got, err, newest.CommitOID)
 	}
 }
 
@@ -118,10 +101,11 @@ func TestRetentionYoungCheckpointsUseOneUnionInventory(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	for i := 0; i < DefaultMinimumRetained+1; i++ {
-		createPublishedRetentionCheckpoint(
-			t, ctx, store, repo, worktreeID, blob, i, now.Add(-time.Hour))
+	createdAt := make([]time.Time, DefaultMinimumRetained+1)
+	for i := range createdAt {
+		createdAt[i] = now.Add(-time.Hour)
 	}
+	seedPublishedRetentionCheckpoints(t, ctx, store, repo, worktreeID, blob, createdAt)
 	inventoryCalls := 0
 	store.retentionInventory = func(
 		context.Context, string, []string,
@@ -153,18 +137,20 @@ func TestRetentionBudgetPrunesExactOldestPrefix(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	uniqueSizes := make(map[string]int64)
-	for i := 0; i < DefaultMinimumRetained+3; i++ {
-		createdAt := now.Add(-24 * time.Hour)
+	createdAt := make([]time.Time, DefaultMinimumRetained+3)
+	for i := range createdAt {
+		createdAt[i] = now.Add(-24 * time.Hour)
 		if i < 3 {
-			createdAt = now.Add(-8*24*time.Hour + time.Duration(i)*time.Second)
+			createdAt[i] = now.Add(-8*24*time.Hour + time.Duration(i)*time.Second)
 		}
-		ref := createPublishedRetentionCheckpoint(
-			t, ctx, store, repo, worktreeID, blob, i, createdAt)
+	}
+	checkpoints := seedPublishedRetentionCheckpoints(t, ctx, store, repo, worktreeID, blob, createdAt)
+	for i, checkpoint := range checkpoints {
 		switch i {
 		case 0, 1:
-			uniqueSizes[ref] = 3 << 30
+			uniqueSizes[checkpoint.Ref] = 3 << 30
 		case 2:
-			uniqueSizes[ref] = 1 << 30
+			uniqueSizes[checkpoint.Ref] = 1 << 30
 		}
 	}
 	inventoryCalls := 0
@@ -193,36 +179,118 @@ func TestRetentionBudgetPrunesExactOldestPrefix(t *testing.T) {
 	}
 }
 
-func createPublishedRetentionCheckpoint(
+// Retention tests need many completed snapshots, not repeated coverage of the
+// checkpoint writer. Keep distinct real commits and refs while sharing their
+// identical tree and batching Git setup. State still prepares and completes
+// every checkpoint with its published capture membership.
+func seedPublishedRetentionCheckpoints(
 	t *testing.T,
 	ctx context.Context,
 	store Store,
 	repo, worktreeID, blob string,
-	index int,
-	createdAt time.Time,
-) string {
+	createdAt []time.Time,
+) []state.Checkpoint {
 	t.Helper()
-	path := fmt.Sprintf("retention-%03d.txt", index)
-	seq, err := state.AppendCaptureEvent(ctx, store.DB, state.CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "seed", Operation: "modify", Path: path, Fidelity: "exact",
-	}, []state.CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
-	if err != nil {
-		t.Fatal(err)
+	if len(createdAt) == 0 || len(createdAt) > DefaultMinimumRetained+3 {
+		t.Fatal("retention fixture requires a bounded checkpoint batch")
 	}
-	created, err := store.Create(ctx, Request{
-		RepoRoot: repo, WorktreeID: worktreeID, Reason: state.CheckpointReasonPoll,
-		ObservationEpoch: int64(index + 1), CoverageEpoch: int64(index + 1),
-		Entries:   []Entry{{Path: "protected.txt", Mode: gitpkg.RegularFileMode, OID: blob}},
-		EventSeqs: []int64{seq}, Now: createdAt,
+	scratch := t.TempDir()
+	entries := []Entry{{Path: "protected.txt", Mode: gitpkg.RegularFileMode, OID: blob}}
+	tree, err := gitpkg.WriteTreeDurable(ctx, repo, filepath.Join(scratch, "checkpoint.index"), []gitpkg.IndexEntry{
+		{Path: entries[0].Path, Mode: entries[0].Mode, OID: entries[0].OID},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := state.MarkEventPublished(ctx, store.DB, seq, state.EventStatePublished,
-		sql.NullString{String: "normal-commit", Valid: true}, sql.NullString{},
-		sql.NullString{}, float64(createdAt.Unix())); err != nil {
+	checkpoints := make([]state.Checkpoint, len(createdAt))
+	var commitPaths strings.Builder
+	for i, now := range createdAt {
+		id, err := NewID(now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpoints[i] = state.Checkpoint{
+			ID: id, OperationID: "op-" + id, WorktreeID: worktreeID,
+			Reason: state.CheckpointReasonPoll, ObservationEpoch: int64(i + 1), CoverageEpoch: int64(i + 1),
+			TreeOID: tree, Ref: gitpkg.CheckpointRefPrefix + worktreeID + "/" + id,
+			CreatedTS: float64(now.UnixNano()) / float64(time.Second),
+		}
+		commitPath := filepath.Join(scratch, fmt.Sprintf("commit-%03d", i))
+		commit := fmt.Sprintf("tree %s\nauthor %s <%s> %d +0000\ncommitter %s <%s> %d +0000\n\nacd checkpoint %s\n",
+			tree, IdentityName, IdentityEmail, now.Unix(), IdentityName, IdentityEmail, now.Unix(), id)
+		if err := os.WriteFile(commitPath, []byte(commit), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		commitPaths.WriteString(commitPath + "\n")
+	}
+	out, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo, Stdin: strings.NewReader(commitPaths.String())},
+		"hash-object", "-w", "-t", "commit", "--stdin-paths", "--no-filters")
+	if err != nil {
 		t.Fatal(err)
 	}
-	return created.Checkpoint.Ref
+	commits := strings.Fields(string(out))
+	if len(commits) != len(checkpoints) {
+		t.Fatalf("created %d commit objects for %d checkpoints", len(commits), len(checkpoints))
+	}
+	seenCommits := make(map[string]bool)
+	var refs strings.Builder
+	refs.WriteString("start\n")
+	for i := range checkpoints {
+		checkpoint := &checkpoints[i]
+		checkpoint.CommitOID = commits[i]
+		if seenCommits[checkpoint.CommitOID] {
+			t.Fatal("checkpoint fixture reused a commit identity")
+		}
+		seenCommits[checkpoint.CommitOID] = true
+		capturePath := fmt.Sprintf("retention-%03d.txt", i)
+		seq, err := state.AppendCaptureEvent(ctx, store.DB, state.CaptureEvent{
+			BranchRef: "refs/heads/main", BranchGeneration: 1,
+			BaseHead: "seed", Operation: "modify", Path: capturePath, Fidelity: "exact",
+		}, []state.CaptureOp{{Op: "modify", Path: capturePath, Fidelity: "exact"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpoint.EventSeqs = []int64{seq}
+		digest := requestDigest(Request{RepoRoot: repo, WorktreeID: worktreeID, Reason: checkpoint.Reason,
+			ObservationEpoch: checkpoint.ObservationEpoch, CoverageEpoch: checkpoint.CoverageEpoch,
+			EventSeqs: checkpoint.EventSeqs}, entries, tree, checkpoint.CommitOID, checkpoint.Ref)
+		if _, err := state.PrepareCheckpoint(ctx, store.DB, *checkpoint, digest); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&refs, "create %s %s\n", checkpoint.Ref, checkpoint.CommitOID)
+	}
+	refs.WriteString("prepare\ncommit\n")
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo, Stdin: strings.NewReader(refs.String())},
+		"update-ref", "--no-deref", "--stdin"); err != nil {
+		t.Fatal(err)
+	}
+	out, err = gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "for-each-ref", "--format=%(refname) %(objectname)",
+		gitpkg.CheckpointRefPrefix+worktreeID+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("invalid checkpoint ref inventory: %q", line)
+		}
+		observed[fields[0]] = fields[1]
+	}
+	if len(observed) != len(checkpoints) {
+		t.Fatalf("created %d refs for %d checkpoints", len(observed), len(checkpoints))
+	}
+	for _, checkpoint := range checkpoints {
+		if observed[checkpoint.Ref] != checkpoint.CommitOID {
+			t.Fatalf("checkpoint ref %s lost its exact commit", checkpoint.Ref)
+		}
+		if err := state.CompleteCheckpoint(ctx, store.DB, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, checkpoint.CreatedTS); err != nil {
+			t.Fatal(err)
+		}
+		if err := state.MarkEventPublished(ctx, store.DB, checkpoint.EventSeqs[0], state.EventStatePublished,
+			sql.NullString{String: "normal-commit", Valid: true}, sql.NullString{}, sql.NullString{}, checkpoint.CreatedTS); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return checkpoints
 }

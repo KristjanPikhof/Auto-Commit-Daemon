@@ -46,6 +46,7 @@ func TestRecoveryReconciliationEvidenceLimitIsEnforced(t *testing.T) {
 }
 
 func TestRecoverUnavailableSemanticMessageArchivesWholeSuffix(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct{ name, phase, provider, reason string }{
 		{"local-needs-action", state.PublicationDrainNeedsAction, "deterministic", PublicationDrainSemanticMessageUnavailableReason},
 		{"local-semantic", state.PublicationDrainSemantic, "deterministic", ""},

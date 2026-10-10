@@ -56,6 +56,9 @@ type publicationDrainReport struct {
 // LastProgressTS: a fresh heartbeat proves that the worker is alive, not that
 // the publication frontier is moving.
 type publicationProgressReport struct {
+	HistoryPlanID          string  `json:"history_plan_id,omitempty"`
+	HistoryStatus          string  `json:"history_status,omitempty"`
+	HistoryError           string  `json:"history_error,omitempty"`
 	Strategy               string  `json:"strategy"`
 	PlannerProvider        string  `json:"planner_provider,omitempty"`
 	PlannerModel           string  `json:"planner_model,omitempty"`
@@ -72,6 +75,7 @@ type publicationProgressReport struct {
 	LastProgressTS         float64 `json:"last_progress_ts,omitempty"`
 	LastProgressAgeSeconds int64   `json:"last_progress_age_seconds,omitempty"`
 	WaitRemainingSeconds   int64   `json:"wait_remaining_seconds,omitempty"`
+	RetryAtTS              float64 `json:"retry_at,omitempty"`
 	TemporaryLocalFallback bool    `json:"temporary_local_fallback,omitempty"`
 	WorkerResponsive       bool    `json:"worker_responsive"`
 	HeartbeatAgeSeconds    int64   `json:"heartbeat_age_seconds,omitempty"`
@@ -501,15 +505,23 @@ FROM checkpoints`).Scan(&prepared, &needsAction); err != nil {
 				report.PublicationDrain.Phase != state.PublicationDrainCompleted &&
 				report.PublicationDrain.Phase != state.PublicationDrainNeedsAction) ||
 			report.Configuration.Configuration == "validating")
-	report.OperationalState = statusOperationalState(report)
 	progress, err := buildPublicationProgressReport(ctx, conn, report, now)
 	if err != nil {
 		return report, fmt.Errorf("publication progress: %w", err)
 	}
 	report.PublicationProgress = progress
+	if progress.Phase == "history_reconstruction" {
+		report.Busy = true
+	}
+	report.OperationalState = statusOperationalState(report)
 	report.PublicationOutcome.ReasonCode = progress.Phase
-	if health := report.IntentStrategy.PlannerHealth; health != nil && health.NextProbeTS > 0 {
+	if health := report.IntentStrategy.PlannerHealth; health != nil &&
+		health.State == daemon.IntentPlannerCircuitOpen && health.NextProbeTS > 0 {
 		report.PublicationOutcome.RetryAt = health.NextProbeTS
+	}
+
+	if progress.Phase == "goal_review_wait" {
+		report.PublicationOutcome.RetryAt = progress.RetryAtTS
 	}
 
 	return report, nil
@@ -529,6 +541,31 @@ func buildPublicationProgressReport(
 			report.PID > 0 && identity.Alive(report.PID),
 		HeartbeatAgeSeconds: report.HeartbeatAgeSeconds,
 	}
+	var history state.IntentHistoryRequest
+	if conn != nil {
+		raw, _, err := metaLookup(ctx, conn, state.MetaKeyIntentHistoryRequest)
+		if err != nil {
+			return progress, err
+		}
+		if raw != "" {
+			if err := json.Unmarshal([]byte(raw), &history); err != nil {
+				return progress, fmt.Errorf("history request: %w", err)
+			}
+		}
+	}
+	progress.HistoryPlanID, progress.HistoryStatus, progress.HistoryError = history.PlanID, history.Status, history.Error
+	historyActive := history.Status == "pending" || history.Status == "running"
+	var semanticRetry daemon.IntentSemanticRetrySnapshot
+	if conn != nil {
+		raw, _, err := metaLookup(ctx, conn, daemon.MetaKeyIntentSemanticRetry)
+		if err != nil {
+			return progress, err
+		}
+		if raw != "" {
+			semanticRetry, _ = daemon.DecodeIntentSemanticRetrySnapshot(raw)
+		}
+	}
+	semanticReviewWait := report.PendingEvents > 0 && report.IntentStrategy.ResolutionMode == "waiting_semantic_retry" && semanticRetry.BranchRef == report.BranchRef && semanticRetry.BranchGeneration == report.BranchGeneration && semanticRetry.RetryAtTS > 0
 	if progress.Strategy == "" {
 		progress.Strategy = "event"
 	}
@@ -653,6 +690,12 @@ func buildPublicationProgressReport(
 			progress.Phase = "verifying"
 			progress.WaitRemainingSeconds = 0
 			progress.TemporaryLocalFallback = false
+		case historyActive && progress.WorkerResponsive && report.Protected:
+			progress.Phase = "history_reconstruction"
+			progress.Origin = "history_reconstruction"
+			progress.LastProgressTS = history.UpdatedTS
+			progress.WaitRemainingSeconds = 0
+			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery && intentProviderCallActive(report):
 			progress.Phase = "provider_call"
 			progress.WaitRemainingSeconds = 0
@@ -663,7 +706,9 @@ func buildPublicationProgressReport(
 				report.IntentStrategy.PlannerHealth, now)
 			progress.TemporaryLocalFallback = false
 		case activeIntentRecovery:
-		case report.CheckpointProtectionAvailable && !report.Protected && progress.WorkerResponsive &&
+		// New observations have their own protection state. They do not
+		// replace the activity of an earlier frozen publication target.
+		case !activeDrain && report.CheckpointProtectionAvailable && !report.Protected && progress.WorkerResponsive &&
 			progress.Phase != "intent_verification_recovery":
 			progress.Phase = "checkpointing"
 		case intentProviderCallActive(report):
@@ -675,6 +720,11 @@ func buildPublicationProgressReport(
 			progress.WaitRemainingSeconds = intentProviderRetryRemainingSeconds(
 				report.IntentStrategy.PlannerHealth, now)
 			progress.TemporaryLocalFallback = false
+		case semanticReviewWait:
+			progress.Phase = "goal_review_wait"
+			progress.RetryAtTS = semanticRetry.RetryAtTS
+			progress.WaitRemainingSeconds = max(0, int64(semanticRetry.RetryAtTS-float64(now.UnixNano())/1e9+0.999))
+			progress.TemporaryLocalFallback = false
 		case !activeDrain && report.PendingEvents > 0 &&
 			progress.Phase != "intent_verification_recovery" &&
 			report.IntentStrategy.BatchWaitActive:
@@ -683,7 +733,8 @@ func buildPublicationProgressReport(
 				report.IntentStrategy)
 		}
 	}
-	if progress.Phase == "checkpointing" {
+	// A fresh scan proves capture health, not frozen publication progress.
+	if progress.Phase == "checkpointing" && !activeDrain {
 		progress.LastProgressTS = report.FullPollTS
 	}
 	if progress.LastProgressTS > 0 {
@@ -715,6 +766,10 @@ func buildPublicationProgressReport(
 		if progress.LastProgressTS == 0 {
 			progress.LastProgressAgeSeconds = 0
 		}
+	}
+	if health := report.IntentStrategy.PlannerHealth; health != nil &&
+		progress.Phase == "provider_wait" && health.State == daemon.IntentPlannerCircuitOpen {
+		progress.RetryAtTS = health.NextProbeTS
 	}
 	return progress, nil
 }
@@ -992,6 +1047,12 @@ func statusOperationalStateWithDaemonAlive(report statusReport, daemonAlive bool
 		report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
 		report.ActiveTerminalEvents > 0 || report.ActiveBarriers > 0:
 		return "needs_attention"
+	case report.PublicationProgress.Phase == "history_reconstruction" ||
+		report.PublicationProgress.Phase == "provider_call":
+		return "busy"
+	case report.PublicationProgress.Phase == "goal_review_wait" ||
+		report.PublicationProgress.Phase == "provider_wait":
+		return "waiting"
 	case report.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
 		report.PublicationDrain.FallbackMode == "semantic_replan":
 		return "planning"

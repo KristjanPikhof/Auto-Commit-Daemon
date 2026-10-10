@@ -591,7 +591,7 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 			continue
 		}
 		if !pair.hasTerminal && !stalePair && !pair.decisionLed &&
-			!pair.runtimeContractBlocked && !pair.semanticMessageUnavailable && !pair.stoppedPublication {
+			!pair.runtimeContractBlocked && !pair.semanticMessageUnavailable && !pair.stoppedPublication && !force {
 			continue
 		}
 		archiveOnly := force || currentHead == ""
@@ -614,6 +614,9 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		}
 		if pair.stoppedPublication {
 			reasonParts = append(reasonParts, "stopped publication drain")
+		}
+		if len(reasonParts) == 0 {
+			reasonParts = append(reasonParts, "explicit preservation of pending work")
 		}
 		plan.Actions = append(plan.Actions, fixAction{
 			ID:               fmt.Sprintf("%s:%s:%d:%d", fixActionReconcileUnpublishedChain, pair.branchRef, pair.generation, pair.firstSeq),

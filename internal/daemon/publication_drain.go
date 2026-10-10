@@ -604,7 +604,8 @@ func sameSupersededIntentMembership(
 // legacy graph builder after soft semantic evidence filled the shared edge
 // budget. The current builder reconstructs active evidence, keeps every hard
 // edge, and prunes only excess soft edges. New hard-cap and cycle failures use
-// distinct errors and remain needs_action.
+// distinct errors and remain needs_action. It also retries a protected target
+// stopped when member reoffering expanded an overdue singleton.
 func RecoverSoftDependencyCapPublicationDrain(
 	ctx context.Context,
 	db *state.DB,
@@ -613,8 +614,9 @@ func RecoverSoftDependencyCapPublicationDrain(
 	now time.Time,
 ) (*state.PublicationDrain, error) {
 	rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT id,last_error FROM publication_drains
-WHERE branch_ref=? AND branch_generation=? AND phase='needs_action' AND reason_code=''
+SELECT id,last_error,reason_code FROM publication_drains
+WHERE branch_ref=? AND branch_generation=? AND phase='needs_action'
+  AND reason_code IN ('','publication_failed')
 ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if err != nil {
 		return nil, err
@@ -623,14 +625,16 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if !rows.Next() {
 		return nil, rows.Err()
 	}
-	var id, recordedError string
-	if err := rows.Scan(&id, &recordedError); err != nil {
+	var id, recordedError, reasonCode string
+	if err := rows.Scan(&id, &recordedError, &reasonCode); err != nil {
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	if !legacySoftDependencyCapDrainError(recordedError) {
+	expandedCount := expandedForcedIntentWindowError(recordedError)
+	if !(reasonCode == "" && legacySoftDependencyCapDrainError(recordedError)) &&
+		!(reasonCode == "publication_failed" && expandedCount > 1) {
 		return nil, nil
 	}
 	drain, err := state.PublicationDrainByID(ctx, db, id)
@@ -644,6 +648,26 @@ ORDER BY created_ts DESC,id DESC LIMIT 1`, branchRef, generation)
 	if counts.terminal != 0 {
 		return nil, nil
 	}
+	if expandedCount > 1 {
+		pending := int64(len(drain.EventSeqs)) - counts.published - counts.recovered - counts.terminal
+		if drain.ReasonEvidence != "" || drain.CommitStrategy != string(ai.CommitStrategyIntent) || pending < int64(expandedCount) {
+			return nil, nil
+		}
+		var safe bool
+		if err := db.ReadSQL().QueryRowContext(ctx, `SELECT
+ NOT EXISTS(SELECT 1 FROM intent_repairs WHERE branch_ref=? AND branch_generation=? AND status IN ('prepared','git_applied'))
+ AND NOT EXISTS(SELECT 1 FROM operations WHERE worktree_id=? AND status IN ('prepared','active'))
+ AND (SELECT COUNT(*) FROM publication_drain_events target JOIN capture_events event ON event.seq=target.event_seq
+  WHERE target.drain_id=? AND event.state='pending' AND event.branch_ref=? AND event.branch_generation=?
+   AND EXISTS(SELECT 1 FROM checkpoint_events member JOIN checkpoints checkpoint ON checkpoint.id=member.checkpoint_id
+    WHERE member.event_seq=event.seq AND checkpoint.phase='completed' AND checkpoint.retained=1
+     AND checkpoint.coverage_complete=1 AND checkpoint.observed_ref=event.branch_ref))=?`,
+			drain.BranchRef, drain.BranchGeneration, drain.WorktreeID, drain.ID, drain.BranchRef, drain.BranchGeneration,
+			pending).Scan(&safe); err != nil || !safe {
+			return nil, err
+		}
+	}
+
 	var recoverablePublication int
 	if err := db.ReadSQL().QueryRowContext(ctx, `
 SELECT EXISTS(
@@ -666,6 +690,23 @@ SELECT EXISTS(
 		return nil, err
 	}
 	return &reopened, nil
+}
+
+// This constructor error precedes candidate evaluation and any Git write.
+func expandedForcedIntentWindowError(reason string) int {
+	text, ok := strings.CutPrefix(reason, "intent planner: forced-aging request offered ")
+	if !ok {
+		return 0
+	}
+	text, ok = strings.CutSuffix(text, " captures, want 1")
+	if !ok {
+		return 0
+	}
+	count, err := strconv.Atoi(text)
+	if err != nil || count < 2 || count > ai.IntentCandidateCaptureCap || strconv.Itoa(count) != text {
+		return 0
+	}
+	return count
 }
 
 // RecoverForcedIntentBoundPublicationDrain retries a drain stopped by the old
@@ -892,6 +933,16 @@ func ResumePublicationDrainCheckpointing(
 	if err != nil {
 		return drain, err
 	}
+	recheckingPlanDependency, err := publicationDrainUnknownPlanDependency(ctx, db, drain)
+	if err != nil {
+		return drain, err
+	}
+	if !recheckingPlanDependency {
+		recheckingPlanDependency, err = publicationDrainPublishedPlanDependency(ctx, repoRoot, db, drain)
+		if err != nil {
+			return drain, err
+		}
+	}
 	recheckingHeadAdvance := drain.Phase == state.PublicationDrainNeedsAction &&
 		publicationDrainReason(drain) == publicationReasonHeadChanged
 	recheckingRecoveredTarget := drain.Phase == state.PublicationDrainNeedsAction &&
@@ -900,12 +951,12 @@ func ResumePublicationDrainCheckpointing(
 		publicationDrainReason(drain) == publicationReasonSemanticUnavailable
 	if drain.Phase != state.PublicationDrainCheckpointing &&
 		!recheckingHeadAdvance && !recheckingRecoveredTarget &&
-		!recheckingSemanticMessage && !recheckingProviderWait {
+		!recheckingSemanticMessage && !recheckingProviderWait && !recheckingPlanDependency {
 		return drain, nil
 	}
 	fail := func(reason error) (state.PublicationDrain, error) {
 		if recheckingHeadAdvance || recheckingRecoveredTarget ||
-			recheckingSemanticMessage || recheckingProviderWait {
+			recheckingSemanticMessage || recheckingProviderWait || recheckingPlanDependency {
 			return drain, nil
 		}
 		nowTS := float64(now.UnixNano()) / 1e9
@@ -983,7 +1034,7 @@ func ResumePublicationDrainCheckpointing(
 		return fail(err)
 	}
 	if recheckingHeadAdvance || recheckingRecoveredTarget ||
-		recheckingSemanticMessage || recheckingProviderWait {
+		recheckingSemanticMessage || recheckingProviderWait || recheckingPlanDependency {
 		nowTS := float64(now.UnixNano()) / 1e9
 		if nowTS < drain.UpdatedTS {
 			nowTS = drain.UpdatedTS
@@ -1120,8 +1171,9 @@ func publicationDrainSalvageMode(drain state.PublicationDrain) string {
 // publicationDrainAtomicFallbackPlanner keeps every hard dependency component
 // in one commit and writes messages from the captured evidence.
 type publicationDrainAtomicFallbackPlanner struct {
-	commitFormat  ai.CommitFormat
-	combineWindow bool
+	commitFormat   ai.CommitFormat
+	combineWindow  bool
+	semanticPrefix *ai.IntentPlanV2
 }
 
 func configureAtomicIntentFallback(cfg *intentReplayConfig) {
@@ -1286,11 +1338,14 @@ func resolvedIntentForwardRecoveryPlan(
 			return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 		}
 	}
-	plan, _, err := loadResolvedIntentPlanRun(
-		request, run.ResolvedPlanJSON.String)
-	if err != nil {
+	// This reader proves frozen membership and prerequisite ordering. Its
+	// sequence-only request has no Git evidence for semantic classification;
+	// replay rebuilds that evidence and runs the goal gates before publication.
+	validationRequest := intentCandidateContinuationValidationRequest(request, envelope.Continuations)
+	if err := ai.ValidateIntentPlanV2(validationRequest, envelope.Plan); err != nil {
 		return ai.IntentPlanV2{}, intentForwardRecoveryPlanUnavailable, nil
 	}
+	plan := envelope.Plan
 	for _, candidate := range plan.Candidates {
 		unresolved := 0
 		for _, seq := range candidate.SelectedSeqs {
@@ -1590,7 +1645,13 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 		return ai.IntentPlanV2{}, err
 	}
 	plan := deterministicIntentCandidatePlan(req, false, true)
-	if p.combineWindow && len(plan.Candidates) > 1 {
+	if p.semanticPrefix != nil {
+		assignment, err := lockedIntentRecoveryPrefixMessage(req, *p.semanticPrefix)
+		if err != nil {
+			return ai.IntentPlanV2{}, err
+		}
+		plan.Candidates = []ai.IntentCandidateAssignment{assignment}
+	} else if p.combineWindow && len(plan.Candidates) > 1 {
 		selected := make([]int64, 0, len(req.OfferedCaptures))
 		for _, capture := range req.OfferedCaptures {
 			selected = append(selected, capture.Seq)
@@ -1615,6 +1676,50 @@ func (p publicationDrainAtomicFallbackPlanner) PlanIntentV2(
 			plan.Candidates[index].Subject, nil)
 	}
 	return applyIntentFallbackMessageQuality(req, plan)
+}
+
+// Reuse completed semantic goals for a recovery prefix. The selected tree still
+// passes the normal relationship, materialization, and configured verification
+// gates; a filename fallback must not replace an already proven goal message.
+func lockedIntentRecoveryPrefixMessage(req ai.IntentPlanRequestV2, cached ai.IntentPlanV2) (ai.IntentCandidateAssignment, error) {
+	selected := make(map[int64]bool, len(req.OfferedCaptures))
+	seqs := make([]int64, 0, len(req.OfferedCaptures))
+	for _, capture := range req.OfferedCaptures {
+		selected[capture.Seq] = true
+		seqs = append(seqs, capture.Seq)
+	}
+	covered := make(map[int64]bool, len(selected))
+	var subject string
+	var purposes []string
+	for _, candidate := range cached.Candidates {
+		included := false
+		for _, seq := range candidate.SelectedSeqs {
+			included = included || selected[seq]
+		}
+		if !included {
+			continue
+		}
+		if candidate.Readiness != ai.IntentCandidateReady {
+			return ai.IntentCandidateAssignment{}, errors.New("recovery prefix contains an incomplete semantic goal")
+		}
+		for _, seq := range candidate.SelectedSeqs {
+			if !selected[seq] || covered[seq] {
+				return ai.IntentCandidateAssignment{}, errors.New("recovery prefix changed semantic goal membership")
+			}
+			covered[seq] = true
+		}
+		subject = candidate.Subject
+		purposes = append(purposes, "- "+strings.TrimSpace(candidate.Purpose))
+	}
+	if len(covered) != len(selected) || len(selected) == 0 {
+		return ai.IntentCandidateAssignment{}, errors.New("recovery prefix does not match cached semantic goals")
+	}
+	return ai.IntentCandidateAssignment{
+		CandidateID: stableGeneratedCandidateID(req, seqs), SelectedSeqs: seqs,
+		Purpose: "complete the resolved semantic dependency prefix", Readiness: ai.IntentCandidateReady,
+		Subject: subject, Body: strings.Join(purposes, "\n"),
+		GroupingReason: "verification recovery keeps the resolved prerequisites with their consumer goal",
+	}, nil
 }
 
 func publicationDrainPendingEvents(
@@ -1846,6 +1951,13 @@ func UpdatePublicationDrainAfterReplay(
 		return state.AdvancePublicationDrain(ctx, db, drain.ID, update)
 	}
 	if !progressed && summary.Disposition == ReplayDispositionTransientWait {
+		if summary.SkippedReason == "intent_v2_waiting_semantic_retry" && !summary.PlannerCircuitOpen &&
+			drain.Phase == state.PublicationDrainEventFallback &&
+			drain.FallbackMode == publicationFallbackLocalUnlock {
+			// The local evidence did not establish a complete goal. Let the
+			// next durable review use the configured semantic planner.
+			update.FallbackMode = publicationFallbackSemanticReplan
+		}
 		if summary.SkippedReason == "intent_v2_waiting_message_rewrite" {
 			update.LastError = strings.TrimSpace(summary.DispositionReason)
 		} else if summary.SkippedReason == intentVerificationResourceWaitSkipReason {

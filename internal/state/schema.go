@@ -44,7 +44,8 @@ package state
 // so commit-all cannot consume staging added while its checkpoint was pending;
 // v28 separates typed recovery reasons and immutable evidence from display text.
 // v29 records partial checkpoint coverage and bounded provider deadlines.
-const SchemaVersion = 29
+// v30 preserves capture lineage when one old commit contributes to several goals.
+const SchemaVersion = 30
 
 // schemaDDL is the canonical per-repo state.db schema (§6.1).
 //
@@ -643,6 +644,34 @@ CREATE INDEX IF NOT EXISTS idx_intent_repair_commits_old_oid
 
 CREATE INDEX IF NOT EXISTS idx_intent_repair_commits_candidate
     ON intent_repair_commits(candidate_id, repair_id);
+
+-- v30: split mapping is additive; the original commit provenance is retained.
+CREATE TABLE IF NOT EXISTS intent_repair_commit_lineage(
+    repair_id TEXT NOT NULL,
+    ord INTEGER NOT NULL CHECK (ord >= 0),
+    candidate_id TEXT,
+    old_oid TEXT NOT NULL,
+    new_oid TEXT,
+    PRIMARY KEY (repair_id, ord),
+    UNIQUE (repair_id, old_oid, candidate_id),
+    FOREIGN KEY (repair_id) REFERENCES intent_repairs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_intent_repair_lineage_old_oid
+    ON intent_repair_commit_lineage(old_oid, repair_id);
+CREATE VIEW IF NOT EXISTS intent_repair_commit_mappings AS
+SELECT legacy.* FROM intent_repair_commits legacy
+WHERE NOT EXISTS (
+    SELECT 1 FROM intent_repair_commit_lineage split
+    WHERE split.repair_id=legacy.repair_id
+    GROUP BY split.old_oid HAVING COUNT(*)>1
+)
+UNION ALL
+SELECT split.* FROM intent_repair_commit_lineage split
+WHERE EXISTS (
+    SELECT 1 FROM intent_repair_commit_lineage proof
+    WHERE proof.repair_id=split.repair_id
+    GROUP BY proof.old_oid HAVING COUNT(*)>1
+);
 
 -- v24: immutable active candidate membership captured before an Intent repair
 -- may change Git. Legacy repairs deliberately have no rows here; consumers can

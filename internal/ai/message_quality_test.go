@@ -209,6 +209,60 @@ func TestEvaluateIntentPlanMessageQuality(t *testing.T) {
 	}
 }
 
+func TestIntentMessageQualityRejectsFilenameCodeChangeFallback(t *testing.T) {
+	t.Parallel()
+	for _, subject := range []string{
+		"Update transcriptionservice code changes",
+		"Add dependencycontainer code changes",
+		"Update client test changes",
+		"fix: Update transcriptionservice code changes",
+	} {
+		report := EvaluateIntentPlanMessageQuality(IntentPlanRequest{
+			OfferedCaptures: []OfferedCapture{{Seq: 1, Path: "Assistant/TranscriptionService.swift"}},
+		}, IntentPlan{SelectedSeqs: []int64{1}, Subject: subject})
+		if !report.HasReason(MessageQualityReasonGenericSubject) || report.Action != MessageQualityRewrite {
+			t.Fatalf("generic fallback accepted: subject=%q report=%+v", subject, report)
+		}
+	}
+}
+
+func TestIntentMessageQualityRejectsPascalCaseSymbolSubject(t *testing.T) {
+	t.Parallel()
+	for _, subject := range []string{"Add PublishRecordingArchive", "feat: PublishRecordingArchive"} {
+		report := EvaluateIntentPlanMessageQuality(IntentPlanRequest{
+			OfferedCaptures: []OfferedCapture{{Seq: 1, Path: "export.go", CapturedDiff: "+func PublishRecordingArchive() {}\n"}},
+		}, IntentPlan{SelectedSeqs: []int64{1}, Subject: subject})
+		if report.Action != MessageQualityRewrite || !report.HasReason(MessageQualityReasonTokenOnly) {
+			t.Fatalf("raw symbol escaped goal message policy: %+v", report)
+		}
+	}
+}
+
+func TestIntentMessageQualityRewritesClippedOutcomes(t *testing.T) {
+	t.Parallel()
+	for _, subject := range []string{
+		"Fix publication readiness after missing companion recovery",
+		"Fix publication readiness after...",
+	} {
+		report := EvaluateIntentPlanMessageQuality(IntentPlanRequest{
+			OfferedCaptures: []OfferedCapture{{Seq: 1, Path: "publication.go"}},
+		}, IntentPlan{SelectedSeqs: []int64{1}, Subject: subject})
+		if report.Action != MessageQualityRewrite || !report.HasReason(MessageQualityReasonTruncatedSubject) {
+			t.Fatalf("clipped semantic outcome accepted: subject=%q report=%+v", subject, report)
+		}
+	}
+}
+
+func TestIntentMessageQualityRejectsCapturedSingleWordSymbol(t *testing.T) {
+	t.Parallel()
+	report := EvaluateIntentPlanMessageQuality(IntentPlanRequest{
+		OfferedCaptures: []OfferedCapture{{Seq: 1, Path: "math.go", CapturedDiff: "+func One() int { return 1 }\n"}},
+	}, IntentPlan{SelectedSeqs: []int64{1}, Subject: "Add One"})
+	if report.Action != MessageQualityRewrite || !report.HasReason(MessageQualityReasonTokenOnly) {
+		t.Fatalf("captured symbol escaped semantic message policy: %+v", report)
+	}
+}
+
 func TestEvaluateIntentPlanMessageQuality_ConventionalFormat(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
 	req, err := NewIntentPlanRequest(IntentPlanRequestOptions{

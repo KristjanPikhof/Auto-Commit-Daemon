@@ -41,7 +41,7 @@ func TestProductListOnceNeedsActionJSONRendersThenExitsThree(t *testing.T) {
 	repo := registerProductListNeedsActionRepo(t)
 
 	var out bytes.Buffer
-	err := runProductListOnce(context.Background(), &out, true, false)
+	err := runProductListOnceView(context.Background(), &out, true, false, false)
 	if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
 		t.Fatalf("exit=%d rendered=%v err=%v, want rendered exit %d", ExitCode(err), ErrorRendered(err), err, ExitActionRequired)
 	}
@@ -77,7 +77,7 @@ func TestProductListOnceOffRepositoryRequiresAction(t *testing.T) {
 	repo := registerProductListOffRepo(t, roots, materializeTestRepo(t, false))
 
 	var out bytes.Buffer
-	err := runProductListOnce(context.Background(), &out, true, false)
+	err := runProductListOnceView(context.Background(), &out, true, false, false)
 	if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
 		t.Fatalf("exit=%d rendered=%v err=%v, want rendered exit %d", ExitCode(err), ErrorRendered(err), err, ExitActionRequired)
 	}
@@ -143,7 +143,7 @@ func TestProductListDrainAndPendingLabels(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := renderProductListTable(&out, entries, false); err != nil {
+	if err := renderProductListDashboard(&out, entries, false, true); err != nil {
 		t.Fatalf("render table: %v", err)
 	}
 	for _, row := range []struct {
@@ -215,7 +215,7 @@ func TestProductListLoadsCurrentProviderWait(t *testing.T) {
 	t.Setenv("ACD_AI_TIMEOUT", "1m")
 	ctx := context.Background()
 	repo, dbPath, db := makeRepoStateDB(t)
-	now := time.Now()
+	now := time.Now().Truncate(time.Second)
 	branchRef := "refs/heads/main"
 	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
 		PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(now.Unix()),
@@ -282,6 +282,7 @@ func TestProductListLoadsCurrentProviderWait(t *testing.T) {
 		State:               daemon.IntentPlannerCircuitOpen,
 		ProviderFingerprint: testPlannerHealthFingerprint(),
 		ConsecutiveFailures: 1,
+		NextProbeTS:         float64(now.Add(5 * time.Minute).Unix()),
 	}
 	if err := state.MetaSetJSON(ctx, db, daemon.MetaKeyIntentPlannerHealth, struct {
 		Version int `json:"version"`
@@ -311,6 +312,36 @@ func TestProductListLoadsCurrentProviderWait(t *testing.T) {
 	}, overview, nil)
 	if got := productListStatus(entry); got != "waiting" {
 		t.Fatalf("provider wait status=%q entry=%+v", got, entry)
+	}
+	if progress.WaitRemainingSeconds != 300 || overview.report.PublicationOutcome.RetryAt != health.NextProbeTS || productListPhase(entry) != "provider-wait:5m" {
+		t.Fatalf("list lost persisted retry deadline: progress=%+v outcome=%+v phase=%s", progress, overview.report.PublicationOutcome, productListPhase(entry))
+	}
+	for _, circuit := range []daemon.IntentPlannerCircuitState{
+		daemon.IntentPlannerCircuitOpen, daemon.IntentPlannerCircuitHalfOpen, daemon.IntentPlannerCircuitClosed,
+	} {
+		health.State = circuit
+		if err := state.MetaSetJSON(ctx, db, daemon.MetaKeyIntentPlannerHealth, struct {
+			Version int `json:"version"`
+			daemon.IntentPlannerHealthSnapshot
+		}{Version: 1, IntentPlannerHealthSnapshot: health}); err != nil {
+			t.Fatal(err)
+		}
+		overview, err := readProductListRepo(ctx, record, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		report, err := buildStatusReport(ctx, record, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantRetry := float64(0)
+		if circuit == daemon.IntentPlannerCircuitOpen {
+			wantRetry = health.NextProbeTS
+		}
+		if overview.report.PublicationOutcome.RetryAt != wantRetry || report.PublicationOutcome.RetryAt != wantRetry {
+			t.Fatalf("%s circuit exposed stale retry: list=%f status=%f want=%f", circuit,
+				overview.report.PublicationOutcome.RetryAt, report.PublicationOutcome.RetryAt, wantRetry)
+		}
 	}
 }
 
@@ -633,6 +664,46 @@ func TestProductListWatchKeepsKnownAttentionAcrossUnknownRead(t *testing.T) {
 	}
 }
 
+func TestProductListWatchShowsRefreshingAfterKnownWork(t *testing.T) {
+	for _, working := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unfinished=%t", working), func(t *testing.T) {
+			original := productListCollect
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			frames := 0
+			productListCollect = func(context.Context) (productListData, productState, error) {
+				frames++
+				entry := productListEntry{
+					Repo: "/repo", State: productStateProtected, OperationalState: "healthy_idle",
+					Protected: true, lastActivity: time.Now(),
+				}
+				if working {
+					entry.State, entry.OperationalState = productStatePublishing, "busy"
+					entry.PendingEvents, entry.UnfinishedWork = 2, true
+					entry.lastActivity = time.Now().Add(-2 * time.Hour)
+				}
+				if frames == 2 {
+					entry = productListEntry{
+						Repo: "/repo", State: productStateWaiting, OperationalState: "refreshing",
+						ProtectionUnknown:   true,
+						PublicationProgress: publicationProgressReport{Phase: "protection_refresh"},
+						PublicationOutcome:  publicationOutcome{PendingClassification: true},
+					}
+				}
+				return productListData{UpdatedAt: time.Now().UTC().Format(time.RFC3339), Repos: []productListEntry{entry}}, entry.State, nil
+			}
+			t.Cleanup(func() { productListCollect = original })
+			out := &productListFrameWriter{cancel: cancel, want: 2}
+			if err := runProductListWatchView(ctx, out, time.Millisecond, false, false); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(out.String(), "refreshing") < 1 || strings.Count(out.String(), "healthy") > 1 {
+				t.Fatalf("unavailable read hid unfinished work or claimed health:\n%s", out.String())
+			}
+		})
+	}
+}
+
 func TestProductListReadFailuresDoNotMigrate(t *testing.T) {
 	t.Run("pre-checkpoint schema", func(t *testing.T) {
 		dbPath := filepath.Join(t.TempDir(), "state.db")
@@ -851,9 +922,14 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
 		RepositoryID: record.RepositoryID, State: "running",
 	}, productListRepoOverview{}, context.DeadlineExceeded)
-	if entry.ActionRequired || entry.State != productStateProtected ||
-		productListStatus(entry) != "healthy" || !entry.ProtectionUnknown {
+	if entry.ActionRequired || entry.State != productStateWaiting ||
+		productListStatus(entry) != "refreshing" || !entry.ProtectionUnknown ||
+		productListPhase(entry) != "refreshing" || !entry.PublicationOutcome.PendingClassification {
 		t.Fatalf("transient read failure became an alert: %+v", entry)
+	}
+	encoded, err := json.Marshal(entry)
+	if err != nil || !bytes.Contains(encoded, []byte(`"protection_unknown":true`)) {
+		t.Fatalf("JSON hid the unavailable protection read: %s err=%v", encoded, err)
 	}
 	var out bytes.Buffer
 	if err := renderProductListDashboard(&out, []productListEntry{entry}, false, true); err != nil {
@@ -989,7 +1065,7 @@ func TestProductListSlowRepositoryDoesNotBlockOtherRows(t *testing.T) {
 	if elapsed := time.Since(started); elapsed < productListReadTimeout || elapsed > time.Second {
 		t.Fatalf("elapsed=%s, want one bounded repository timeout", elapsed)
 	}
-	if len(data.Repos) != 10 || stateName != productStateProtected {
+	if len(data.Repos) != 10 || stateName != productStateWaiting {
 		t.Fatalf("unexpected bounded result: state=%s repos=%+v", stateName, data.Repos)
 	}
 	var slow productListEntry
