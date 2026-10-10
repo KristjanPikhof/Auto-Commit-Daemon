@@ -985,10 +985,8 @@ func Capture(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureCon
 }
 
 // ProtectWorktree runs the universal safety path without classifying or
-// publishing capture events. Workers use it while Git state is unsafe for
-// publication (detached HEAD, conflicts, active operations, branch settle,
-// or a manual publication pause). It leaves shadow state untouched so the
-// next safe Capture pass can derive publication events normally.
+// publishing capture events. The normal worker uses it for every observed
+// tree, including detached HEAD, conflicts and active Git operations.
 func ProtectWorktree(ctx context.Context, repoRoot string, db *state.DB, cctx CaptureContext, opts CaptureOpts) (CaptureSummary, error) {
 	if repoRoot == "" || db == nil || opts.CheckpointStore == nil {
 		return CaptureSummary{}, errors.New("daemon: ProtectWorktree requires repo, db, and checkpoint store")
@@ -1104,6 +1102,7 @@ func completeProtectionCheckpoint(
 	}
 	barrierNeedsCheckpoint := requiredEpoch > 0 && epoch >= requiredEpoch
 	if !forceNew && !barrierNeedsCheckpoint && projection.Latest != nil && projection.Latest.WorktreeID == worktreeID &&
+		projection.Latest.ObservedHead == cctx.BaseHead && projection.Latest.ObservedRef == cctx.BranchRef &&
 		!summary.Partial && !projection.Latest.Partial && projection.Latest.Phase == state.CheckpointCompleted &&
 		digestOK && priorDigest == liveDigest {
 		if err := persistProtectionCoverage(ctx, db, epoch, projection.Latest.ID, liveDigest); err != nil {
@@ -1115,7 +1114,8 @@ func completeProtectionCheckpoint(
 	}
 
 	partialFingerprint := fmt.Sprintf("%s/%v", liveDigest, issues)
-	if summary.Partial && !forceNew && projection.Latest != nil && projection.Latest.WorktreeID == worktreeID && projection.Latest.Phase == state.CheckpointCompleted && projection.Latest.Partial {
+	if summary.Partial && !forceNew && projection.Latest != nil && projection.Latest.WorktreeID == worktreeID &&
+		projection.Latest.ObservedHead == cctx.BaseHead && projection.Latest.ObservedRef == cctx.BranchRef && projection.Latest.Phase == state.CheckpointCompleted && projection.Latest.Partial {
 		previous, _, err := state.MetaGet(ctx, db, "protection.partial_fingerprint")
 		if err != nil {
 			return err
@@ -1148,10 +1148,9 @@ func completeProtectionCheckpoint(
 	if summary.Partial {
 		summary.CheckpointID = result.Checkpoint.ID
 		return state.MetaSetMany(ctx, db, map[string]string{
-			MetaKeyProtectionCheckpointID:          summary.CheckpointID,
-			MetaKeyProtectionComplete:              "false",
-			"protection.partial_fingerprint":       partialFingerprint,
-			MetaKeyProtectionClassificationPending: "true",
+			MetaKeyProtectionCheckpointID:    summary.CheckpointID,
+			MetaKeyProtectionComplete:        "false",
+			"protection.partial_fingerprint": partialFingerprint,
 		})
 	}
 	if err := persistProtectionCoverage(ctx, db, epoch, result.Checkpoint.ID, liveDigest); err != nil {
@@ -1239,38 +1238,14 @@ func requiredProtectionCheckpointEpoch(
 }
 
 func persistProtectionCoverage(ctx context.Context, db *state.DB, epoch int64, checkpointID, liveDigest string) error {
-	classified, _, err := state.MetaGet(ctx, db, metaProtectionClassifiedDigest)
-	if err != nil {
-		return err
-	}
-	// A protected tree is not evidence that its newest edits have entered the
-	// publication queue. Persist that distinction before reporting coverage.
-	if classified != liveDigest {
-		if err := state.MetaSetMany(ctx, db, map[string]string{
-			MetaKeyProtectionClassificationPending:    "true",
-			MetaKeyProtectionClassificationCheckpoint: checkpointID,
-			MetaKeyProtectionClassificationEpoch:      strconv.FormatInt(epoch, 10),
-		}); err != nil {
-			return err
-		}
-	}
-	values := []struct {
-		key   string
-		value string
-	}{
-		{MetaKeyProtectionCoveredEpoch, strconv.FormatInt(epoch, 10)},
-		{MetaKeyProtectionCheckpointID, checkpointID},
-		{MetaKeyProtectionTreeDigest, liveDigest},
-		{MetaKeyProtectionComplete, "true"},
-		{MetaKeyProtectionFullPollTS, strconv.FormatFloat(float64(time.Now().UnixNano())/float64(time.Second), 'f', -1, 64)},
-		{MetaKeyProtectionWatcherQueueDepth, "0"},
-	}
-	for _, value := range values {
-		if err := state.MetaSet(ctx, db, value.key, value.value); err != nil {
-			return fmt.Errorf("daemon: persist %s: %w", value.key, err)
-		}
-	}
-	return nil
+	return state.MetaSetMany(ctx, db, map[string]string{
+		MetaKeyProtectionCoveredEpoch:      strconv.FormatInt(epoch, 10),
+		MetaKeyProtectionCheckpointID:      checkpointID,
+		MetaKeyProtectionTreeDigest:        liveDigest,
+		MetaKeyProtectionComplete:          "true",
+		MetaKeyProtectionFullPollTS:        strconv.FormatFloat(float64(time.Now().UnixNano())/float64(time.Second), 'f', -1, 64),
+		MetaKeyProtectionWatcherQueueDepth: "0",
+	})
 }
 
 // CompleteProtectionCoverage records that checkpointID durably covers the
