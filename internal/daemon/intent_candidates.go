@@ -143,6 +143,8 @@ type IntentCandidateEvaluationResult struct {
 	// this exact dependency/planner evaluation, including candidates whose
 	// already-published captures needed no new assignment.
 	VisibleCandidateIDs []string
+	// These baseline components passed the pinned HEAD post-image proof.
+	VerifiedPublishedCandidateIDs []string
 }
 
 // IntentSemanticFallbackRequiredError means the bounded semantic path was
@@ -298,12 +300,19 @@ func EvaluateIntentCandidates(
 	for _, candidate := range existing {
 		result.VisibleCandidateIDs = append(
 			result.VisibleCandidateIDs, candidate.ID)
+		if _, verified := input.publishedContext[candidate.ID]; verified {
+			result.VerifiedPublishedCandidateIDs = append(result.VerifiedPublishedCandidateIDs, candidate.ID)
+		}
 	}
 	allCaptures, err := loadCandidateCaptureContext(ctx, db, input, existing)
 	if err != nil {
 		return result, err
 	}
 	allCaptures, err = loadFocusedIntentGoalEvidence(ctx, input, existing, allCaptures)
+	if err != nil {
+		return result, err
+	}
+	allCaptures, err = loadProtectedIntentClarifications(ctx, db, input, allCaptures)
 	if err != nil {
 		return result, err
 	}
@@ -2728,8 +2737,8 @@ func newIntentPlanRun(
 		RejectLocalFallback  bool                   `json:"reject_local_fallback"`
 		AttemptLimit         int                    `json:"attempt_limit"`
 	}{
-		// Message failures now retain their accepted grouping for correction.
-		Domain:    "acd.intent-plan-run/v9",
+		// Reevaluate old waits under evidence-based companion requirements.
+		Domain:    "acd.intent-plan-run/v11",
 		Request:   fingerprintRequest,
 		BranchRef: input.BranchRef, BranchGeneration: input.BranchGeneration,
 		Provider: input.Provider, Model: input.Model, Preset: input.Preset,
