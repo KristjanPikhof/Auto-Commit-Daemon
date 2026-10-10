@@ -13,13 +13,21 @@ import (
 // membership. Recovery preserves work but does not put it on the branch.
 // BranchCommitted is unknown when checkpoint state is unavailable.
 type publicationOutcome struct {
-	PendingClassification bool    `json:"pending_classification"`
-	BranchCommitted       *bool   `json:"branch_committed"`
-	BranchChanges         int     `json:"branch_changes"`
-	RecoveredChanges      int     `json:"recovered_changes"`
-	WaitingChanges        int     `json:"waiting_changes"`
-	ReasonCode            string  `json:"reason_code,omitempty"`
-	RetryAt               float64 `json:"retry_at,omitempty"`
+	CheckpointAvailable   bool                `json:"checkpoint_available"`
+	Protected             bool                `json:"protected"`
+	PendingChanges        int                 `json:"pending_changes"`
+	WorktreeChanges       int                 `json:"worktree_changes"`
+	LaterChanges          int                 `json:"later_changes"`
+	CountsKnown           bool                `json:"counts_known"`
+	Finish                *finishStatusReport `json:"finish"`
+	Resolved              bool                `json:"-"`
+	PendingClassification bool                `json:"pending_classification"`
+	BranchCommitted       *bool               `json:"branch_committed"`
+	BranchChanges         int                 `json:"branch_changes"`
+	RecoveredChanges      int                 `json:"recovered_changes"`
+	WaitingChanges        int                 `json:"waiting_changes"`
+	ReasonCode            string              `json:"reason_code,omitempty"`
+	RetryAt               float64             `json:"retry_at,omitempty"`
 }
 
 // Build completed membership once. A correlated EXISTS can make SQLite scan
