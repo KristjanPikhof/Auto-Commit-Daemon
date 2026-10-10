@@ -312,9 +312,17 @@ protected run when that ordering repair passes validation.
 Later documentation reviews can use a bounded set of recent published goals
 whose recorded versions still match Git. Those goals supply evidence without
 being selected for another commit.
+Corrections can also use an exact published predecessor after its goal has
+been superseded. ACD checks that the recorded version is still available.
 Related documentation can form one goal when its added lines contain matching
 descriptions of the same behavior. Time and directory proximity alone still
 cannot justify grouping.
+Absent new tests alone do not keep a goal waiting. A missing companion must
+follow from a concrete dependency or unresolved behavior in the supplied
+evidence. Configured checks still run against the proposed commit tree.
+ACD can use protected explanatory updates to clarify frozen goals when their
+Go tokens match. Compiler directives and cgo are excluded, and the later
+update remains outside the publication target.
 
 The barrier accepts only a completed checkpoint for the requested worktree,
 branch, generation, and observation. A checkpoint from another branch or
