@@ -75,6 +75,9 @@ func finishProtectionRun(t *testing.T, f *captureFixture, change func(*Options))
 }
 func TestFinishProtectionSavesIdleAndStopNeverPublish(t *testing.T) {
 	f := newCaptureFixture(t)
+	if err := state.RecordCaptureHealth(context.Background(), f.db, "earlier failed scan", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
 	index := finishWorkerGit(t, f.dir, "ls-files", "--stage")
 	var calls atomic.Int32
@@ -113,6 +116,10 @@ func TestFinishProtectionSavesIdleAndStopNeverPublish(t *testing.T) {
 	}
 	if got := finishWorkerGit(t, f.dir, "ls-files", "--stage"); got != index {
 		t.Fatal("automatic staging", got)
+	}
+	health, err := state.ReadCaptureHealth(context.Background(), f.db.ReadSQL())
+	if err != nil || health.State != "healthy" || health.Error != "" {
+		t.Fatalf("stale scan health %+v: %v", health, err)
 	}
 	if calls.Load() != 0 {
 		t.Fatal("automatic message/provider work")
@@ -284,6 +291,10 @@ func TestFinishProtectionPartialCheckpointRecoversWithoutQueue(t *testing.T) {
 	if complete != "false" {
 		t.Fatal("partial checkpoint reported complete")
 	}
+	finishProtectionWait(t, func() bool {
+		health, err := state.ReadCaptureHealth(context.Background(), f.db.ReadSQL())
+		return err == nil && health.State == "blocked" && health.IssueCount > 0 && health.CheckpointID == cp.ID
+	})
 	if !finishProtectionHas(t, f, "readable.txt", "durable") {
 		t.Fatal("readable bytes not protected")
 	}
@@ -296,7 +307,117 @@ func TestFinishProtectionPartialCheckpointRecoversWithoutQueue(t *testing.T) {
 		t.Fatal("coverage did not recover")
 	}
 	stop()
+	health, err := state.ReadCaptureHealth(context.Background(), f.db.ReadSQL())
+	if err != nil || health.State != "healthy" || health.IssueCount != 0 || health.Error != "" {
+		t.Fatalf("recovered scan health %+v: %v", health, err)
+	}
 	if len(pendingOps(t, f.db)) != 0 {
 		t.Fatal("partial recovery created publication queue")
+	}
+}
+
+func TestFinishProtectionStartupRecoveryRunsOnlyWhenOwned(t *testing.T) {
+	for _, alreadyRecovered := range []bool{false, true} {
+		t.Run(fmt.Sprint(alreadyRecovered), func(t *testing.T) {
+			f, w := finishWorkerFixture(t)
+			finishWrite(t, f.dir, "goal.txt", "explicit finish work")
+			request := startFinishWorker(t, w, FinishOptions{Purpose: "completed work"})
+			_, stop := finishProtectionRun(t, f, func(o *Options) { o.FinishRecoveryDone = alreadyRecovered })
+			finishProtectionWait(t, func() bool {
+				stamp, ok, _ := state.LoadDaemonState(context.Background(), f.db)
+				return ok && stamp.Mode == "running"
+			})
+			got, err := state.LoadFinishRequest(context.Background(), f.db, request.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := state.FinishFailed
+			if alreadyRecovered {
+				want = state.FinishRunning
+			}
+			if got.State != want {
+				t.Fatalf("finish state %s want %s", got.State, want)
+			}
+			stop()
+		})
+	}
+}
+func TestFinishProtectionUnbornHead(t *testing.T) {
+	f := newCaptureFixture(t)
+	finishWorkerGit(t, f.dir, "update-ref", "-d", "refs/heads/main")
+	finishWrite(t, f.dir, "unborn.txt", "protected before first commit")
+	_, stop := finishProtectionRun(t, f, nil)
+	stop()
+	cp := finishProtectionLatest(t, f)
+	if cp.ObservedHead != "" || cp.ObservedRef != "refs/heads/main" {
+		t.Fatalf("unborn provenance %+v", cp)
+	}
+	if !finishProtectionHas(t, f, "unborn.txt", "protected before first commit") {
+		t.Fatal("unborn file missing")
+	}
+}
+
+func TestFinishProtectionExcludesTrackedGitlinkContents(t *testing.T) {
+	f := newCaptureFixture(t)
+	finishWorkerGit(t, f.dir, "update-index", "--add", "--cacheinfo", "160000,"+f.cctx.BaseHead+",vendor/sdk")
+	finishWorkerGit(t, f.dir, "commit", "-q", "-m", "Add external SDK reference")
+	finishWrite(t, f.dir, "vendor/sdk/private.txt", "external checkout bytes")
+	finishWrite(t, f.dir, "ordinary.txt", "eligible bytes")
+	_, stop := finishProtectionRun(t, f, nil)
+	stop()
+	cp := finishProtectionLatest(t, f)
+	names := finishWorkerGit(t, f.dir, "ls-tree", "-r", "--name-only", cp.CommitOID)
+	if strings.Contains(names, "vendor/sdk") {
+		t.Fatalf("Gitlink contents entered parent checkpoint: %s", names)
+	}
+	if !finishProtectionHas(t, f, "ordinary.txt", "eligible bytes") {
+		t.Fatal("ordinary bytes missing")
+	}
+}
+
+func TestFinishProtectionExcludesNewStagedGitlinkContents(t *testing.T) {
+	for _, explicitFinish := range []bool{false, true} {
+		t.Run(fmt.Sprint(explicitFinish), func(t *testing.T) {
+			f, w := finishWorkerFixture(t)
+			var wake chan struct{}
+			var stop func()
+			if !explicitFinish {
+				wake, stop = finishProtectionRun(t, f, nil)
+			}
+			finishWorkerGit(t, f.dir, "update-index", "--add", "--cacheinfo", "160000,"+f.cctx.BaseHead+",vendor/sdk")
+			finishWrite(t, f.dir, "vendor/sdk/plain.txt", "external checkout bytes")
+			finishWrite(t, f.dir, "ordinary.txt", "eligible bytes")
+			index := finishWorkerGit(t, f.dir, "ls-files", "--stage")
+			if explicitFinish {
+				wt, err := w.worktree(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.protect(context.Background(), wt, w.Config, true); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				wake <- struct{}{}
+				finishProtectionWait(t, func() bool {
+					cp := finishProtectionLatest(t, f)
+					if cp == nil {
+						return false
+					}
+					return strings.Contains(finishWorkerGit(t, f.dir, "ls-tree", "--name-only", cp.CommitOID), "ordinary.txt")
+				})
+				stop()
+			}
+			cp := finishProtectionLatest(t, f)
+			names := finishWorkerGit(t, f.dir, "ls-tree", "-r", "--name-only", cp.CommitOID)
+			if strings.Contains(names, "vendor/sdk") {
+				t.Fatalf("new Gitlink contents entered checkpoint: %s", names)
+			}
+			if !finishProtectionHas(t, f, "ordinary.txt", "eligible bytes") {
+				t.Fatal("unrelated ordinary bytes not protected")
+			}
+			if got := finishWorkerGit(t, f.dir, "ls-files", "--stage"); got != index {
+				t.Fatalf("native staging changed: %s", got)
+			}
+		})
 	}
 }
