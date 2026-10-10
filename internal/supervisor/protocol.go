@@ -44,7 +44,7 @@ var validMethods = map[string]struct{}{
 	"restore_plan": {}, "restore_apply": {}, "repair": {}, "shutdown": {},
 	"maintenance_begin": {}, "maintenance_renew": {}, "maintenance_end": {},
 	"restart_repository": {}, "stop_repository": {},
-	"worker_environment": {},
+	"worker_environment": {}, "finish_start": {}, "finish_status": {},
 }
 
 func (r Request) Validate() error {
