@@ -80,8 +80,13 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      - name: Install Linux shell hook dependency
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zsh
       - name: Require production test tools
-        run: command -v git && command -v sqlite3 && command -v script
+        run: command -v git && command -v sqlite3 && command -v script && command -v zsh
       - name: Run production integration shard
         env:
           ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/integration-results
@@ -120,7 +125,7 @@ jobs:
           ACD_TEST_PACKAGE_PARALLELISM: ${{ matrix.os.package-parallelism }}
           ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
         run: scripts/dev/test.sh support
-      - name: Run timing-sensitive daemon tests
+      - name: Run timing-sensitive verification test
         env:
           ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
         run: scripts/dev/test.sh sensitive

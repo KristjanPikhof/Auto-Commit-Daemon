@@ -5,7 +5,6 @@ cd "$(dirname "$0")/../.."
 shard_count=${ACD_TEST_SHARDS:-3}
 package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2}
 test_timeout=${ACD_TEST_TIMEOUT:-4m30s}
-timing_sensitive_daemon_tests='^(TestRun_(FsnotifyDrivesWake|LifecycleHappyPath|WakeBurstCoalesced|RealSIGUSR1|RepeatedEditsToSameFile_OrderedCommits|SelfTerminateNoClients|LongReplayHeartbeatStaysFreshAndJoinsOnCancellation)|TestReplay_IntentSingletonSupersededProbeTimeoutSettlesEvent|TestRunRecoveryHasMoreRequestsImmediateFollowup|TestRunCheckpointDuringProjectVerification)$'
 timing_sensitive_verification_tests='^(TestRunnerKillsBackgroundDescendantsAfterSuccessfulShell)$'
 output_root=
 started_seconds=$SECONDS
@@ -87,8 +86,7 @@ run_core() {
     -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-4}" -timeout "$test_timeout" &
   cli_pid=$!
   run_package_shard ./internal/daemon "$count" "$index" \
-    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-4}" -timeout "$test_timeout" \
-    -skip "$timing_sensitive_daemon_tests" &
+    -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-4}" -timeout "$test_timeout" &
   daemon_pid=$!
 
   if ! wait "$cli_pid"; then
@@ -152,9 +150,9 @@ run_support() {
 }
 
 run_sensitive() {
-  run_measured_tests sensitive ./internal/daemon ./internal/verification -p 1 \
+  run_measured_tests sensitive ./internal/verification -p 1 \
     -race -count=1 -parallel=2 -timeout "$test_timeout" \
-    -run "$timing_sensitive_daemon_tests|$timing_sensitive_verification_tests"
+    -run "$timing_sensitive_verification_tests"
 }
 
 run_stress_daemon() {
@@ -163,8 +161,7 @@ run_stress_daemon() {
 
   validate_shard "$count" "$index"
   run_package_shard ./internal/daemon "$count" "$index" \
-    -race -count=3 -timeout "$test_timeout" -failfast \
-    -skip "$timing_sensitive_daemon_tests"
+    -race -count=3 -timeout "$test_timeout" -failfast
 }
 
 run_stress_support() {
