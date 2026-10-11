@@ -51,21 +51,8 @@ type repoLifecycleConfig struct {
 	Autodiscovery *bool `json:"autodiscovery"`
 }
 
-// ImplicitRepoRegistrationAllowed loads the global autodiscovery policy using
-// the user's XDG config location.
-func ImplicitRepoRegistrationAllowed(caller PolicyCaller) (AutodiscoveryDecision, error) {
-	roots, err := paths.Resolve()
-	if err != nil {
-		return handlePolicyError(caller, AutodiscoveryDecision{
-			Allowed: false,
-			Source:  DecisionSourceDefault,
-		}, fmt.Errorf("acd config: resolve paths: %w", err))
-	}
-	return ImplicitRepoRegistrationAllowedFromRoots(caller, roots)
-}
-
-// ImplicitRepoRegistrationAllowedFromRoots is the testable form of
-// ImplicitRepoRegistrationAllowed.
+// ImplicitRepoRegistrationAllowedFromRoots reads the autodiscovery policy
+// from the supplied configuration roots.
 func ImplicitRepoRegistrationAllowedFromRoots(caller PolicyCaller, roots paths.Roots) (AutodiscoveryDecision, error) {
 	decision := AutodiscoveryDecision{
 		Allowed:    true,

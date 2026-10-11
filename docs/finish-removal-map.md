@@ -793,3 +793,15 @@ aggregation within the existing pinning flow. Focused race checks passed, follow
 by the real fresh-offline and staged-selection process cases. The complete local
 gate passed in 180.565 seconds before these fixes; only affected checks were
 repeated afterward. Hosted full integration and stress remain CI-owned.
+
+## Stale code cleanup
+
+The unused Git repair and reconstruction engines and the old history request
+queue are removed, together with their obsolete engine tests. Current history
+validation returns only an error; its membership, author, dependency, and source
+proof checks remain. Reader tests still cover edited renames and root commits.
+
+Unused checkpoint barrier APIs, drain projections, tracing helpers, wrappers,
+and unread runtime metadata writes are also removed. Legacy request fixtures
+still prove that archived queues cannot publish. Restore fixtures retain branch
+generation checks, and archive recovery readers and migration evidence remain.

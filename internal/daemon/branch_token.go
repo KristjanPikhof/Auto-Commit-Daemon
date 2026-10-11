@@ -15,50 +15,12 @@ import (
 // BranchTokenMissing is the canonical "no HEAD" token.
 const BranchTokenMissing = "missing"
 
-// Current HEAD observations and read-only legacy transition markers.
+// Retained legacy generation metadata used by recovery and restore.
 const (
-	// MetaKeyBranchGeneration stores the integer branch_generation value
-	// the run loop is currently using. Persisted across daemon restarts so
-	// queued events captured under generation N remain comparable to a
-	// freshly-booted daemon.
+	// MetaKeyBranchGeneration stores the capture generation recorded by the old runtime.
 	MetaKeyBranchGeneration = "branch.generation"
-	// MetaKeyBranchHead stores the last HEAD OID the run loop observed.
-	// Used to drive the ancestry-based ACD-vs-external classification on
-	// the next token transition.
+	// MetaKeyBranchHead stores the HEAD recorded alongside that generation.
 	MetaKeyBranchHead = "branch.head"
-	// MetaKeyBranchToken stores the raw last-known generation token
-	// ("rev:<sha>" / "missing"). Operator-facing breadcrumb.
-	MetaKeyBranchToken = "branch_token"
-	// MetaKeyBranchTokenChangedAt stamps the wall-clock seconds at which
-	// the token last changed. Operator breadcrumb only — the loop never
-	// reads it back.
-	MetaKeyBranchTokenChangedAt = "branch_token_changed_at"
-	// MetaKeyBranchTransitionNeedsAttention records contradictory durable
-	// evidence for an ACD-authored ref move. It keeps status honest when the
-	// daemon must fail closed instead of retrying an invalid journal forever.
-	MetaKeyBranchTransitionNeedsAttention = "branch.transition.needs_attention"
-	// MetaKeyDetachedHeadPaused is stamped when the daemon sees a detached
-	// HEAD. Checkpoint protection continues while publication is unavailable.
-	MetaKeyDetachedHeadPaused = "detached_head_paused"
-	// MetaKeyOperationInProgress stores the active git operation name when
-	// publication is unavailable during rebase, merge, cherry-pick, or bisect.
-	MetaKeyOperationInProgress = "operation_in_progress"
-	// MetaKeyOperationInProgressSetAt stamps the wall-clock seconds at which
-	// MetaKeyOperationInProgress was first observed. Used to detect stale
-	// markers (rebase aborted but the marker file lingered) and warn the
-	// operator without auto-clearing.
-	MetaKeyOperationInProgressSetAt = "operation_in_progress.set_at"
-	// MetaKeyOperationInProgressHead stamps the HEAD SHA observed when the
-	// marker first appeared. Used together with MetaKeyOperationInProgressSetAt
-	// to decide whether HEAD has moved since the marker showed up — the
-	// "stale" heuristic only fires when both the marker AND HEAD have been
-	// motionless for the threshold.
-	MetaKeyOperationInProgressHead = "operation_in_progress.head_at"
-	// MetaKeyManualPauseResumedAt stores the wall-clock seconds when
-	// `acd resume` removed a manual pause marker. The run loop uses this
-	// short-lived breadcrumb to distinguish a fast-forward that landed during
-	// a manual pause from an ordinary upstream pull observed while unpaused.
-	MetaKeyManualPauseResumedAt = "manual_pause.resumed_at"
 )
 
 // BranchGenerationToken returns the current generation token by resolving
@@ -124,10 +86,9 @@ func branchTokenMissing(branchRef string) string {
 
 // LoadBranchGeneration reads the persisted branch_generation from
 // daemon_meta. Returns (1, nil) when the key is absent — the legacy default
-// — so a fresh repo starts at generation 1 just like the in-memory seed.
-// Bad / unparseable values fall back to (1, nil) with no error so an
-// operator who hand-edits the row can't crash the daemon; the next bump
-// will overwrite the row anyway.
+// — so repositories without legacy metadata use generation 1.
+// Bad / unparseable values fall back to (1, nil) with no error so
+// malformed legacy metadata does not prevent recovery.
 func LoadBranchGeneration(ctx context.Context, db *state.DB) (int64, error) {
 	v, ok, err := state.MetaGet(ctx, db, MetaKeyBranchGeneration)
 	if err != nil {
@@ -141,19 +102,6 @@ func LoadBranchGeneration(ctx context.Context, db *state.DB) (int64, error) {
 		return 1, nil
 	}
 	return n, nil
-}
-
-// SaveBranchGeneration upserts the persisted branch_generation alongside
-// the last-known HEAD OID. Both values move in one transaction so readers
-// cannot observe a new generation paired with the prior HEAD (or vice versa).
-// The write is best-effort from the run loop's perspective — the loop logs a
-// warning but does not abort on failure. We nonetheless surface the underlying
-// error so tests can assert it.
-func SaveBranchGeneration(ctx context.Context, db *state.DB, generation int64, head string) error {
-	return state.MetaSetMany(ctx, db, map[string]string{
-		MetaKeyBranchGeneration: strconv.FormatInt(generation, 10),
-		MetaKeyBranchHead:       head,
-	})
 }
 
 // LoadBranchHead reads the last-known HEAD OID stored alongside the

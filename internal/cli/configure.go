@@ -36,7 +36,6 @@ var (
 		return settings.NewGlobalService(ctx, opts)
 	}
 	runConfigureWizard        = settingsui.RunConfigureWizard
-	confirmConfigurePreview   = settingsui.ConfirmConfigurePreview
 	configureCredentialStatus = func(roots paths.Roots, lookup func(string) (string, bool)) (credentials.Source, bool, error) {
 		store := credentials.NewStore(roots)
 		_, source, err := credentials.Resolve(store, lookup)

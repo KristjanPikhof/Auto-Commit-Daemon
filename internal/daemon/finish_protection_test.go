@@ -127,7 +127,7 @@ func TestFinishProtectionSavesIdleAndStopNeverPublish(t *testing.T) {
 	if err := f.db.ReadSQL().QueryRow("SELECT COUNT(*) FROM finish_requests").Scan(&requests); err != nil || requests != 0 {
 		t.Fatalf("idle protection started finish: requests=%d err=%v", requests, err)
 	}
-	if raw, ok, _ := state.MetaGet(context.Background(), f.db, MetaKeyProtectionClassificationPending); ok && raw == "true" {
+	if raw, ok, _ := state.MetaGet(context.Background(), f.db, "protection.classification_pending"); ok && raw == "true" {
 		t.Fatal("obsolete classification queue pending")
 	}
 	stamp, ok, err := state.LoadDaemonState(context.Background(), f.db)

@@ -23,6 +23,8 @@
 - Remove continuous replay, waiting candidates, drains, automatic history repair,
   fallback publication, experiments, and their obsolete settings and command aliases.
   The first-release `commit-all` compatibility command delegates only to finish.
+- Remove unused Git repair engines, the retired history request queue, and their
+  obsolete tests. Keep archive recovery and current history safety checks.
 - Settings Save/Apply is reviewed and synchronous without a provider probe.
   Connection tests remain separate explicit actions.
 - History rewrite shares the completed-goal model, retains saved-plan review and

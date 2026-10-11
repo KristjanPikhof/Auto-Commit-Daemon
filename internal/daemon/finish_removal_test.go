@@ -495,10 +495,6 @@ func TestFinishRemovalLegacyBridgeRequiresActivationWithoutMutation(t *testing.T
 	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
 	ctx := context.Background()
 	opts := RecoveryReconcileOptions{GitDir: f.capture.gitDir, BranchRef: f.capture.cctx.BranchRef, BranchGeneration: f.capture.cctx.BranchGeneration, FirstSeq: f.pendingSeqs[0], ExternalParentHead: f.source}
-	proof, err := ProveUnpublishedChain(ctx, f.capture.dir, f.capture.db, opts)
-	if err != nil || !proof.Handled || proof.CommitOID != f.target {
-		t.Fatalf("immutable legacy proof=%+v: %v", proof, err)
-	}
 	refs := gitRawOutput(t, ctx, f.capture.dir, "show-ref")
 	indexPath := filepath.Join(f.capture.gitDir, "index")
 	index, err := os.ReadFile(indexPath)

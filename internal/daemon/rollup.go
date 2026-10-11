@@ -26,11 +26,6 @@ import (
 // the aggregator falls back to the oldest event day in capture_events.
 const metaRollupLastDay = "rollup.last_day"
 
-// rollup.last_error_at records the unix-seconds timestamp of the last
-// failed RunDailyRollup attempt. It's diagnostic only — the run loop never
-// reads it back.
-const metaRollupLastErrorAt = "rollup.last_error_at"
-
 // dayLayout is the canonical UTC day key (YYYY-MM-DD). Lex order ==
 // chronological order, which is why daily_rollups uses it as the primary
 // key segment.

@@ -43,16 +43,15 @@ const EnvMaxFileBytes = "ACD_MAX_FILE_BYTES"
 const DefaultMaxFileBytes int64 = 5 << 20
 
 const (
-	MetaKeyProtectionObservationEpoch      = "protection.observation_epoch"
-	MetaKeyProtectionCoveredEpoch          = "protection.covered_epoch"
-	MetaKeyProtectionCheckpointID          = "protection.checkpoint_id"
-	MetaKeyProtectionComplete              = "protection.complete"
-	MetaKeyProtectionRetentionOverBudget   = "protection.retention_over_budget"
-	MetaKeyProtectionFullPollTS            = "protection.full_poll_ts"
-	MetaKeyProtectionWatcherQueueDepth     = "protection.watcher_queue_depth"
-	MetaKeyProtectionScope                 = "protection.scope"
-	MetaKeyProtectionTreeDigest            = "protection.tree_digest"
-	MetaKeyProtectionClassificationPending = "protection.classification_pending"
+	MetaKeyProtectionObservationEpoch    = "protection.observation_epoch"
+	MetaKeyProtectionCoveredEpoch        = "protection.covered_epoch"
+	MetaKeyProtectionCheckpointID        = "protection.checkpoint_id"
+	MetaKeyProtectionComplete            = "protection.complete"
+	MetaKeyProtectionRetentionOverBudget = "protection.retention_over_budget"
+	MetaKeyProtectionFullPollTS          = "protection.full_poll_ts"
+	MetaKeyProtectionWatcherQueueDepth   = "protection.watcher_queue_depth"
+	MetaKeyProtectionScope               = "protection.scope"
+	MetaKeyProtectionTreeDigest          = "protection.tree_digest"
 )
 
 func requiredProtectionCheckpointEpochKey(worktreeID string) string {

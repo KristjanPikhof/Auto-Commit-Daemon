@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -155,10 +154,8 @@ func classifyRecoveredIntentRepairMetadataError(
 }
 
 const (
-	intentRepairBackupRetention = 7 * 24 * time.Hour
-	intentRepairBackupCap       = 50
-	intentRepairMessageReadCap  = int64(64 << 10)
-	intentRepairAuthorReadCap   = int64(16 << 10)
+	intentRepairMessageReadCap = int64(64 << 10)
+	intentRepairAuthorReadCap  = int64(16 << 10)
 )
 
 func hashIntentRepairCandidates(

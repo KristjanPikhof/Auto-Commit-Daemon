@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,7 +25,7 @@ func TestRestorePreviewAndApplyPreserveHeadAndIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := daemon.SaveBranchGeneration(ctx, db, 7, headAtPreview); err != nil {
+	if err := seedBranchGeneration(ctx, db, 7, headAtPreview); err != nil {
 		t.Fatal(err)
 	}
 	headBefore, err := gitpkg.RevParse(ctx, repo, "HEAD")
@@ -133,7 +134,7 @@ func TestRepairCompletesInterruptedPostRestoreCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := daemon.SaveBranchGeneration(ctx, db, 7, head); err != nil {
+	if err := seedBranchGeneration(ctx, db, 7, head); err != nil {
 		t.Fatal(err)
 	}
 	restorePlan, err := Preview(ctx, repo, gitDir, db.Path(), target.ID)
@@ -207,7 +208,7 @@ func TestRestorePlanRecordsGenerationAndDetachedResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := daemon.SaveBranchGeneration(ctx, db, 7, head); err != nil {
+	if err := seedBranchGeneration(ctx, db, 7, head); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "checkout", "--detach", "HEAD"); err != nil {
@@ -802,7 +803,7 @@ func TestRestoreRepairRefusesBranchGenerationABA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := daemon.SaveBranchGeneration(ctx, item.db, item.plan.BranchGeneration+1, head); err != nil {
+	if err := seedBranchGeneration(ctx, item.db, item.plan.BranchGeneration+1, head); err != nil {
 		t.Fatal(err)
 	}
 	plan, err := PreviewRepair(ctx, item.db)
@@ -877,7 +878,7 @@ func transitionRestoreFixture(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := daemon.SaveBranchGeneration(ctx, db, 7, head); err != nil {
+	if err := seedBranchGeneration(ctx, db, 7, head); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(repo, "other.txt"), []byte("target\n"), 0o644); err != nil {
@@ -973,7 +974,7 @@ func prepareInterruptedRestoreMode(t *testing.T, ctx context.Context, detached b
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := daemon.SaveBranchGeneration(ctx, db, 7, head); err != nil {
+	if err := seedBranchGeneration(ctx, db, 7, head); err != nil {
 		t.Fatal(err)
 	}
 	if detached {
@@ -1118,4 +1119,11 @@ func assertProtectionOnlyRestore(t *testing.T, db *state.DB) {
 	if requests != 0 || retiredTables != 0 {
 		t.Fatalf("restore scheduled publication or initialized retired tables: requests=%d tables=%d", requests, retiredTables)
 	}
+}
+
+func seedBranchGeneration(ctx context.Context, db *state.DB, generation int64, head string) error {
+	return state.MetaSetMany(ctx, db, map[string]string{
+		daemon.MetaKeyBranchGeneration: strconv.FormatInt(generation, 10),
+		daemon.MetaKeyBranchHead:       head,
+	})
 }

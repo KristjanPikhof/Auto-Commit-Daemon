@@ -130,10 +130,6 @@ func openLock(path string) (*os.File, error) {
 	return f, nil
 }
 
-func writeDocument(path string, doc *Document) error {
-	return writeDocumentPrepared(path, doc, nil)
-}
-
 func writeDocumentPrepared(path string, doc *Document, prepare func([]byte) error) error {
 	body, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

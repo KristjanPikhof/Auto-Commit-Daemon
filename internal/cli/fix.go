@@ -991,7 +991,6 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 		if err := removePlannedPauseMarker(plan); err != nil {
 			return err
 		}
-		stampManualPauseResume(ctx, plan.GitDir)
 		for i := range plan.Actions {
 			if plan.Actions[i].Kind == fixActionClearExpiredManualPause {
 				plan.Actions[i].Applied = true
