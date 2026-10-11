@@ -26,3 +26,10 @@
 
 The hook log lives at `~/.local/state/acd/codex-hook.log`; remove it if you want
 a fully clean slate.
+
+Purge removes ACD state and private refs across registered worktrees. Project
+Git branches, commits, staging, and working files stay unchanged.
+
+Uninstall takes a final checkpoint before stopping protection; it never calls
+`acd finish` or publishes pending work. Saved checkpoints and history remain
+unless you explicitly approve data removal.

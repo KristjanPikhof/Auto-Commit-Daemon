@@ -28,3 +28,10 @@ want a fully clean slate.
 Do not confuse this with repo-local `.cursor/hooks.json`; acd never installs
 there. If you added acd entries under a project `.cursor/` tree manually, remove
 them separately.
+
+Purge removes ACD state and private refs across registered worktrees. Project
+Git branches, commits, staging, and working files stay unchanged.
+
+Uninstall takes a final checkpoint before stopping protection; it never calls
+`acd finish` or publishes pending work. Saved checkpoints and history remain
+unless you explicitly approve data removal.

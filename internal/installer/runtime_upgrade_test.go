@@ -3,7 +3,6 @@ package installer
 import (
 	"bufio"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net"
@@ -17,7 +16,6 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/migration"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
@@ -41,7 +39,7 @@ func TestShouldUpgradeRuntimeUsesCompatibilityAndOrdering(t *testing.T) {
 		{name: "same build", status: supervisor.Status{Version: options.SourceVersion, BinaryDigest: "source", Compatibility: compatibility}},
 		{name: "same version new bytes", status: supervisor.Status{Version: options.SourceVersion, BinaryDigest: "other", Compatibility: compatibility}, want: true},
 		{name: "newer runtime", status: supervisor.Status{Version: "v2026-08-07-181-g1234567", BinaryDigest: "new", Compatibility: compatibility}},
-		{name: "additive schema upgrade", status: supervisor.Status{Version: options.SourceVersion, BinaryDigest: "source", Compatibility: priorSchema}, want: true},
+		{name: "legacy schema needs checkpoint-first setup", status: supervisor.Status{Version: options.SourceVersion, BinaryDigest: "source", Compatibility: priorSchema}, err: "compatibility cutover"},
 		{name: "schema downgrade", status: supervisor.Status{Version: "v2026-08-07-181-g1234567", BinaryDigest: "new", Compatibility: futureSchema}, err: "run `acd setup` once"},
 		{name: "legacy runtime", status: supervisor.Status{Version: "v2026-08-07-179-g1234567"}, err: "run `acd setup` once"},
 	}
@@ -279,7 +277,7 @@ func TestCheckpointUpgradeRepositoriesUsesCleanGitDurabilityWhenWorkerIsDown(
 	}
 }
 
-func TestBackupCompatibleRuntimeStateCoversEnabledSafeMigrations(t *testing.T) {
+func TestBackupCompatibleRuntimeStateRefusesLegacyWithoutWrites(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "repo", "state.db")
@@ -290,58 +288,30 @@ func TestBackupCompatibleRuntimeStateCoversEnabledSafeMigrations(t *testing.T) {
 	if _, err := db.SQL().ExecContext(ctx, `PRAGMA user_version = 20`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.SQL().ExecContext(ctx, `
-DROP TABLE publication_drain_events;
-DROP TABLE publication_drains;`); err != nil {
-		t.Fatal(err)
-	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	registry := central.NewRegistry()
-	registry.Repos = []central.RepoRecord{{
-		Path: "/repo", StateDB: dbPath, RepositoryID: "0123456789abcdef",
-		WorktreeID: "fedcba9876543210",
-	}}
-	plans, err := backupCompatibleRuntimeState(ctx, registry,
-		filepath.Join(root, "backups"), state.SchemaVersion)
-	if err != nil {
-		t.Fatal(err)
+	registry.Repos = []central.RepoRecord{{Path: "/repo", StateDB: dbPath,
+		RepositoryID: "0123456789abcdef", WorktreeID: "fedcba9876543210"}}
+	backupRoot := filepath.Join(root, "backups")
+	plans, err := backupCompatibleRuntimeState(ctx, registry, backupRoot, state.SchemaVersion)
+	if err == nil || !strings.Contains(err.Error(), "acd setup") || len(plans) != 0 {
+		t.Fatalf("legacy compatibility migration=(%+v,%v), want explicit setup", plans, err)
 	}
-	if len(plans) != 1 || plans[0].FromVersion != 20 {
-		t.Fatalf("plans=%+v, want one v20 backup", plans)
+	after, err := os.ReadFile(dbPath)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("legacy refusal wrote state: %v", err)
 	}
-	if version, err := state.ReadUserVersion(ctx, plans[0].BackupPath); err != nil || version != 20 {
-		t.Fatalf("backup version=(%d,%v), want 20", version, err)
-	}
-	migrated, err := state.OpenRuntime(ctx, dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var migratedTable string
-	if err := migrated.ReadSQL().QueryRowContext(ctx, `
-SELECT name FROM sqlite_master WHERE type='table' AND name='publication_drains'`).
-		Scan(&migratedTable); err != nil || migratedTable != "publication_drains" {
-		t.Fatalf("migrated table=(%q,%v)", migratedTable, err)
-	}
-	if err := migrated.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := migration.Rollback(plans); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(backupRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy refusal wrote backup: %v", err)
 	}
 	if version, err := state.ReadUserVersion(ctx, dbPath); err != nil || version != 20 {
-		t.Fatalf("rolled back version=(%d,%v), want 20", version, err)
-	}
-	rolledBack, err := state.OpenReadOnly(ctx, dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rolledBack.Close()
-	if err := rolledBack.ReadSQL().QueryRowContext(ctx, `
-SELECT name FROM sqlite_master WHERE type='table' AND name='publication_drains'`).
-		Scan(&migratedTable); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("rollback retained v21 table: err=%v", err)
+		t.Fatalf("refusal version=(%d,%v), want20", version, err)
 	}
 }
 

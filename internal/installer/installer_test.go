@@ -129,16 +129,14 @@ func TestSetupRollbackRestoresConfigurationAndCredentialTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	values := map[string]string{
-		config.FieldCommitStrategy:      "event",
-		config.FieldCommitPreset:        "fast",
-		config.FieldCommitFormat:        "imperative",
-		config.FieldProvider:            "openai-compat",
-		config.FieldBaseURL:             ai.DefaultOpenAIBaseURL,
-		config.FieldModel:               "model-one",
-		config.FieldTimeout:             ai.DefaultProviderTimeout.String(),
-		config.FieldDiffEgress:          "false",
-		config.FieldIntentVerification:  "none",
-		config.FieldIntentRepairEnabled: "false",
+		config.FieldCommitStrategy:     "local",
+		config.FieldCommitFormat:       "imperative",
+		config.FieldProvider:           "openai-compat",
+		config.FieldBaseURL:            ai.DefaultOpenAIBaseURL,
+		config.FieldModel:              "model-one",
+		config.FieldTimeout:            ai.DefaultProviderTimeout.String(),
+		config.FieldDiffEgress:         "false",
+		config.FieldIntentVerification: "none",
 	}
 	service, err := settings.NewGlobalService(ctx, settings.Options{
 		Roots: roots,
@@ -299,7 +297,7 @@ func TestApplyFreshSetupPersistsV20AndDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings := doc.Settings.Global
-	if string(settings[config.FieldProvider]) != `"deterministic"` || string(settings[config.FieldCommitStrategy]) != `"intent"` {
+	if string(settings[config.FieldProvider]) != `"deterministic"` || string(settings[config.FieldCommitStrategy]) != `"local"` || string(settings[config.FieldCommitFormat]) != `"imperative"` {
 		t.Fatalf("settings=%v", settings)
 	}
 }

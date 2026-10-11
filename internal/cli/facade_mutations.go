@@ -414,12 +414,16 @@ func newUninstallCmd() *cobra.Command {
 		Long: `Show an uninstall plan, stop ACD services, and remove the managed
 installation only after confirmation.
 
-Repository checkpoints and databases are kept by default. Start with
---dry-run. Permanently deleting protected data requires both --purge-data and
---confirm-purge-data.`,
+Repository checkpoints and databases are kept by default. Start with --dry-run.
+--purge-data covers every registered project: remove verified .git/acd state
+and all ACD private checkpoint, finish, history, migration and recovery refs.
+Project Git branches, tags, commits, worktree files and staging are preserved.
+Missing worktrees are reported and skipped; unverified paths are never deleted.
+Permanently deleting protected data requires --confirm-purge-data as well.`,
 		Example: `  acd uninstall --dry-run
   acd uninstall --yes
-  acd uninstall --dry-run --purge-data`,
+  acd uninstall --dry-run --purge-data
+  acd uninstall --purge-data --confirm-purge-data --yes --non-interactive --expect-plan <digest>`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -450,6 +454,9 @@ Repository checkpoints and databases are kept by default. Start with
 					if action.Target != "" {
 						fmt.Fprintf(cmd.OutOrStdout(), "   Target: %s\n", action.Target)
 					}
+				}
+				for _, warning := range plan.Warnings {
+					fmt.Fprintln(cmd.OutOrStdout(), "Warning: "+warning)
 				}
 				if purgeData && !confirmPurge {
 					fmt.Fprintln(cmd.OutOrStdout(), "Protected data purge requires --confirm-purge-data when applying.")
@@ -487,9 +494,12 @@ Repository checkpoints and databases are kept by default. Start with
 				return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateOff, Changed: true, Actions: []productAction{{Kind: "uninstall", Status: "completed"}}, Data: result}, true)
 			}
 			if purgeData {
-				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled. All verified checkpoints and ACD data were permanently removed.")
+				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled. Verified ACD state and private refs were removed from all available registered projects. Project Git history, worktree files and staging were preserved.")
 			} else {
 				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled. Repository checkpoints and databases were preserved.")
+			}
+			for _, warning := range plan.Warnings {
+				fmt.Fprintln(cmd.OutOrStdout(), "Warning: "+warning)
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "Next: No action needed.")
 			return nil
@@ -497,7 +507,7 @@ Repository checkpoints and databases are kept by default. Start with
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the uninstall plan without changing anything")
 	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the reviewed uninstall plan")
-	cmd.Flags().BoolVar(&purgeData, "purge-data", false, "Also plan removal of checkpoint data after a second confirmation")
+	cmd.Flags().BoolVar(&purgeData, "purge-data", false, "Remove all registered projects' verified ACD state and private refs; preserve project Git history")
 	cmd.Flags().BoolVar(&confirmPurge, "confirm-purge-data", false, "Second explicit confirmation for permanent protected-data deletion")
 	cmd.Flags().BoolVar(&nonInteractive, "non-interactive", false, "Disable prompts; requires --yes and --expect-plan")
 	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Apply only this exact plan ID")
