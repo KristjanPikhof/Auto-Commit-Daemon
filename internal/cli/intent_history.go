@@ -176,7 +176,7 @@ func showIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan
 }
 
 func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, dryRun bool) error {
-	if _, err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
+	if err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
 		return err
 	}
 	lookup, err := loadControlRepo(ctx, repo)
@@ -219,7 +219,7 @@ func editFinishHistoryMessages(ctx context.Context, out io.Writer, repo string, 
 	if plan.Mode != "local" && !plan.MessagesOnly {
 		return errors.New("history rewrite: immutable goal reconstruction requires a new plan")
 	}
-	if _, err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
+	if err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
 		return err
 	}
 	editable := state.RewritePlan{ID: plan.ID, CommitFormat: plan.CommitFormat}
@@ -252,7 +252,7 @@ func editFinishHistoryMessages(ctx context.Context, out io.Writer, repo string, 
 		if _, err := git.EnsurePrivateRefDurable(ctx, repo, git.FinishRefPrefix, plan.SourceRef, plan.ExpectedHead); err != nil {
 			return err
 		}
-		if _, err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
+		if err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
 			return err
 		}
 		if file, err := os.Open(opts.editPlan); err == nil {

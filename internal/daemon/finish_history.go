@@ -245,7 +245,7 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 			plan.Goals = append(plan.Goals, goal)
 		}
 	}
-	_, err = ValidateIntentHistoryPlan(ctx, repo, plan)
+	err = ValidateIntentHistoryPlan(ctx, repo, plan)
 	return plan, err
 }
 
@@ -265,52 +265,52 @@ func finishHistoryTree(ctx context.Context, repo string, tree finish.Tree) (stri
 
 // ValidateIntentHistoryPlan validates exact recorded membership or a shared
 // purpose plan. Version-one plans remain inspectable, never silently upgraded.
-func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.IntentHistoryPlan) ([]git.IntentRepairReplacement, error) {
+func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.IntentHistoryPlan) error {
 	if plan.Version != state.IntentHistoryPlanVersion || len(plan.SourceChain) == 0 || (plan.Mode != "local" && plan.Mode != "intent") {
-		return nil, errors.New("history rewrite: legacy/invalid plan; create a new plan with the current CLI")
+		return errors.New("history rewrite: legacy/invalid plan; create a new plan with the current CLI")
 	}
 	if len(plan.ID) > 128 || strings.ContainsAny(plan.ID, "/\\ \t\r\n\x00") || plan.ID == "" {
-		return nil, state.ErrFinishIdentity
+		return state.ErrFinishIdentity
 	}
 	wt, err := git.ResolveWorktree(ctx, repo)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	expectedRef := git.FinishRefPrefix + checkpoint.WorktreeID(wt.Root) + "/history/" + plan.ID + "/source"
 	if plan.SourceRef != expectedRef {
-		return nil, state.ErrFinishIdentity
+		return state.ErrFinishIdentity
 	}
 	pinned, err := git.RevParse(ctx, repo, plan.SourceRef)
 	if err != nil || pinned != plan.ExpectedHead {
-		return nil, errors.Join(err, state.ErrFinishIdentity)
+		return errors.Join(err, state.ErrFinishIdentity)
 	}
 	evidence, units, base, err := finishHistoryEvidence(ctx, repo, plan.SourceChain)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var recorded []state.IntentHistoryUnit
 	for _, unit := range units {
 		recorded = append(recorded, stateHistoryUnit(unit))
 	}
 	if !reflect.DeepEqual(recorded, plan.Units) || base != plan.BaseTree {
-		return nil, errors.New("history rewrite: recorded provenance differs from saved plan")
+		return errors.New("history rewrite: recorded provenance differs from saved plan")
 	}
 	full := append(slices.Clone(plan.SourceChain), plan.RecreateUnchanged...)
 	if _, err := git.ReadIntentHistoryUnits(ctx, repo, full); err != nil {
-		return nil, err
+		return err
 	}
 	if full[len(full)-1] != plan.ExpectedHead {
-		return nil, errors.New("history rewrite: invalid frozen source head")
+		return errors.New("history rewrite: invalid frozen source head")
 	}
 	if plan.Mode == "local" || plan.MessagesOnly {
 		if len(plan.Goals) != len(plan.SourceChain) || plan.SharedPlan != nil {
-			return nil, errors.New("history rewrite: preserved membership differs")
+			return errors.New("history rewrite: preserved membership differs")
 		}
 		for index, goal := range plan.Goals {
 			oid := plan.SourceChain[index]
 			tree, err := git.RevParse(ctx, repo, oid+"^{tree}")
 			if err != nil {
-				return nil, err
+				return err
 			}
 			var indexes []int
 			for unitIndex, unit := range units {
@@ -319,28 +319,28 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 				}
 			}
 			if goal.TreeOID != tree || goal.AuthorOID != oid || !slices.Equal(goal.OldOIDs, []string{oid}) || !slices.Equal(goal.Units, indexes) {
-				return nil, errors.New("history rewrite: commit order, tree, author or membership changed")
+				return errors.New("history rewrite: commit order, tree, author or membership changed")
 			}
 		}
 	} else {
 		if plan.Mode != "intent" || plan.SharedPlan == nil {
-			return nil, errors.New("history rewrite: saved shared plan is required")
+			return errors.New("history rewrite: saved shared plan is required")
 		}
 		if err := finish.Validate(evidence, *plan.SharedPlan); err != nil {
-			return nil, err
+			return err
 		}
 		if len(plan.Goals) != len(plan.SharedPlan.Steps) {
-			return nil, errors.New("history rewrite: goal count differs from shared plan")
+			return errors.New("history rewrite: goal count differs from shared plan")
 		}
 		for index, step := range plan.SharedPlan.Steps {
 			goal := plan.Goals[index]
 			pinned, err := git.RevParse(ctx, repo, strings.TrimSuffix(plan.SourceRef, "/source")+"/goal-"+strconv.Itoa(index+1)+"^{tree}")
 			if err != nil || pinned != goal.TreeOID {
-				return nil, errors.Join(err, state.ErrFinishIdentity)
+				return errors.Join(err, state.ErrFinishIdentity)
 			}
 			tree, err := readFinishTree(ctx, repo, goal.TreeOID)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			var indexes []int
 			var oldOIDs []string
@@ -348,7 +348,7 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 				n, _ := strconv.Atoi(id)
 				n--
 				if n < 0 || n >= len(units) {
-					return nil, errors.New("history rewrite: unknown unit")
+					return errors.New("history rewrite: unknown unit")
 				}
 				indexes = append(indexes, n)
 				if !slices.Contains(oldOIDs, units[n].OldOID) {
@@ -356,33 +356,31 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 				}
 			}
 			if !reflect.DeepEqual(tree, step.Tree) || goal.Message != step.Message || goal.Purpose != step.Purpose || goal.Reason != step.Boundary || !slices.Equal(indexes, goal.Units) || !slices.Equal(oldOIDs, goal.OldOIDs) || len(oldOIDs) == 0 || goal.AuthorOID != oldOIDs[0] {
-				return nil, errors.New("history rewrite: saved goal differs from shared proof")
+				return errors.New("history rewrite: saved goal differs from shared proof")
 			}
 		}
 	}
-	var replacements []git.IntentRepairReplacement
 	for _, goal := range plan.Goals {
 		if plan.Mode == "intent" {
 			if len(plan.Goals) > 1 && strings.TrimSpace(goal.Reason) == "" {
-				return nil, errors.New("history rewrite: split goals require review or revert boundaries")
+				return errors.New("history rewrite: split goals require review or revert boundaries")
 			}
 			quality := finish.Goal{Purpose: goal.Purpose, Boundary: goal.Reason, Message: goal.Message}
 			for _, index := range goal.Units {
 				quality.ChangeIDs = append(quality.ChangeIDs, evidence.Changes[index].ID)
 			}
 			if err := ai.ValidateHistoryGoalQuality(quality, evidence); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		if err := finish.ValidatePurpose(goal.Purpose); err != nil {
-			return nil, err
+			return err
 		}
 		if err := finish.ValidateMessage(plan.CommitFormat, goal.Message); err != nil {
-			return nil, err
+			return err
 		}
-		replacements = append(replacements, git.IntentRepairReplacement{Replaces: slices.Clone(goal.OldOIDs), AuthorOID: goal.AuthorOID, TreeOID: goal.TreeOID, Message: goal.Message})
 	}
-	return replacements, nil
+	return nil
 }
 
 // ExecuteFinishHistoryRequest has no planning loop. Saved plans contain all
@@ -404,7 +402,7 @@ func (w *FinishWorker) ExecuteFinishHistoryRequest(ctx context.Context, plan sta
 		r.Status, r.Error = "failed", ai.SanitizePlannerError(cause.Error())
 		return r, errors.Join(cause, state.UpdateFinishHistoryRequest(recordCtx, w.DB, r, "running"))
 	}
-	if _, err := ValidateIntentHistoryPlan(ctx, w.RepoPath, plan); err != nil {
+	if err := ValidateIntentHistoryPlan(ctx, w.RepoPath, plan); err != nil {
 		return fail(err)
 	}
 	wt, cfg, digest, err := w.resolved(ctx)

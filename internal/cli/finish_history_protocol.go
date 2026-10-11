@@ -98,7 +98,7 @@ func (h *repositoryWorkerHandler) handleFinishHistory(ctx context.Context, runti
 	}
 	runtime.gate.RLock()
 	defer runtime.gate.RUnlock()
-	if _, err := daemon.ValidateIntentHistoryPlan(ctx, runtime.worktree.Root, plan); err != nil {
+	if err := daemon.ValidateIntentHistoryPlan(ctx, runtime.worktree.Root, plan); err != nil {
 		return nil, finishProtocolError(err)
 	}
 	if request.Method == "history_save" {

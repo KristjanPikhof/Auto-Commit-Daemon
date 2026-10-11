@@ -133,7 +133,7 @@ func TestFinishHistoryRewriteIntentInterleavedPurposeAndSavedProof(t *testing.T)
 		var edited state.IntentHistoryPlan
 		_ = json.Unmarshal(raw, &edited)
 		mutate(&edited)
-		if _, err := ValidateIntentHistoryPlan(t.Context(), f.dir, edited); err == nil {
+		if err := ValidateIntentHistoryPlan(t.Context(), f.dir, edited); err == nil {
 			t.Fatal("fabricated saved plan accepted")
 		}
 	}

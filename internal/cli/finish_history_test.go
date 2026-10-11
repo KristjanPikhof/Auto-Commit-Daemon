@@ -242,7 +242,7 @@ func TestFinishHistoryRewriteCLIMessageEditorKeepsMembershipWithoutAI(t *testing
 	if edited.ID == plan.ID || edited.Goals[0].Message != "Clarify recorded history" || edited.Goals[0].TreeOID != plan.Goals[0].TreeOID || edited.Goals[0].AuthorOID != plan.Goals[0].AuthorOID {
 		t.Fatalf("edited %+v", edited)
 	}
-	if _, err := daemon.ValidateIntentHistoryPlan(t.Context(), runtime.worktree.Root, edited); err != nil {
+	if err := daemon.ValidateIntentHistoryPlan(t.Context(), runtime.worktree.Root, edited); err != nil {
 		t.Fatal(err)
 	}
 }
