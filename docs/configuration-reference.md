@@ -23,7 +23,6 @@ Run `acd config get` to inspect effective repository settings and environment ov
 | `capture.safe_ignore` | `ACD_SAFE_IGNORE` | `true` | restart required | yes | no |
 | `capture.safe_ignore_extra` | `ACD_SAFE_IGNORE_EXTRA` | none | restart required | yes | no |
 | `capture.sensitive_globs` | `ACD_SENSITIVE_GLOBS` | not shown | restart required | yes | yes |
-| `client.ttl` | `ACD_CLIENT_TTL_SECONDS` | `1800` | restart required | yes | no |
 | `commit.format` | `ACD_COMMIT_FORMAT` | `imperative` | next work boundary | yes | no |
 | `commit.strategy` | `ACD_COMMIT_STRATEGY` | `local` | next work boundary | yes | no |
 | `intent.verification` | `ACD_INTENT_VERIFICATION` | `none` | next work boundary | yes | no |

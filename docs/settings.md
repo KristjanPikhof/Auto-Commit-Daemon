@@ -2,177 +2,156 @@
 
 ## Edit settings
 
-Run `acd config` to open the settings editor. It starts at **Global defaults**.
-Inside a Git worktree, choose **Editing** to switch to **This repository**.
-The selected scope stays visible while you edit.
-
 ~~~bash
 acd config
-acd config --scope global
 acd config --repo .
-acd config edit
+acd config --scope global
 acd config --accessible
 ~~~
 
-Select a field to change it. Model and endpoint remain editable after setup.
-The API key field accepts masked input and keeps the key in memory until Save
-passes its connection test. Keys use the protected store shared by repositories.
-If `ACD_AI_API_KEY` supplies the key, unset that variable before replacing the
-stored key through the editor.
+The editor starts at Global defaults unless you choose repository scope. The
+selected scope stays visible. Change a field, then choose Save changes to
+review affected repositories and required permissions. Review and apply are
+local: they do not contact a provider or run a project command.
 
-**Save changes** shows the changed values, affected repositories, and required
-permissions. After approval, ACD tests the connection, saves only edited fields,
-and queues runtime changes for the next safe boundary. A failed test keeps the
-editor open with your edits and leaves saved settings and credentials unchanged.
-If settings change in another terminal during review, reopen the editor to
-review those values before saving.
+Save persists reviewed values and applies supported hot settings synchronously
+to approved revisions. It does not start stopped workers, wake publication, or
+create a finish. Restart-required fields take effect on the next worker start.
+If another terminal changes settings during review, reopen the editor.
 
-Repository fields show where their value comes from. Select **Use inherited
-value** to remove one override. Other repository settings stay as they were.
-Advanced settings include verification commands, capture limits, and retention.
-Changing the commit mode preserves explicit advanced customizations.
+Choose Use inherited value to remove one repository override. To review removal
+of all repository overrides, save a reset draft and review it:
 
-Global saves update enabled repositories that inherit the changed values.
-The review lists repositories that keep their own overrides. Stopped workers
-stay stopped. Completion distinguishes queued activation, restart-required
-fields, and settings that were saved but could not yet be applied. A repository
-with another activation pending must finish it before a new save.
+~~~bash
+acd config reset --repo .
+acd config --repo .
+~~~
 
 ## Scope and precedence
 
-For `config get`, `set`, and `reset`, the default is repository scope inside a
-Git worktree and global scope outside one. Use `--scope repo|profile|global` to
-choose explicitly. The interactive editor always starts at global scope unless
-`--repo` or `--scope repo` is supplied.
+Noninteractive `get`, `set`, and `reset` default to repository scope inside a
+Git worktree and global scope outside one. Choose `--scope repo|profile|global`
+explicitly when needed. Global operations reject `--repo`.
 
-Resolution order is:
+For authored settings, resolution is:
 
 ~~~text
-invocation override
-internal experiment
-repository
-profile
-global
-environment
-preset
-default
+editor draft > repository > profile > global > environment
+             > translated legacy defaults > built-in default
 ~~~
 
-Repository identity uses the v20 worktree ID, so linked worktrees can retain
-distinct capture settings while sharing one common-directory worker.
+An explicit saved value takes precedence over an ordinary environment override.
+`acd config get` reports the source and any shadowed environment value. API-key
+resolution is separate: the environment credential takes precedence over the
+protected store.
 
-## Commands
+A finish uses the approved applied revision, or its last-known-good revision.
+Unapproved authoring edits do not replace that snapshot. An accepted finish
+keeps its frozen configuration even if settings change later. Linked worktrees
+retain separate worktree identities and scoped choices.
+
+If an approval was interrupted, reopen the editor, review the current settings,
+and save to replace that pending request. A concurrent change requires a fresh
+review. Pending settings remain unavailable to finish until explicitly applied.
 
 ~~~bash
 acd config get
-acd config get commit.preset
-acd config set commit.preset fast
-acd config set --scope global ai.provider deterministic
+acd config get commit.strategy
+acd config set --scope global commit.strategy local
+acd config set --scope global commit.format conventional
 acd config reset
-acd config credentials
 ~~~
 
-Interactive editing rejects `--json`. Noninteractive reads and writes use the
-stable product envelope. Global operations reject `--repo` rather than
-silently ignoring it.
+`set` and `reset` save authoring changes. Follow their printed editor command to
+review and apply them. Interactive editing rejects `--json`; supported
+noninteractive commands use the product JSON envelope.
 
-## Defaults
+## Defaults and modes
 
-Fresh setup recommends these settings after provider and privacy approval:
+| Setting | Fresh default |
+|---|---|
+| `commit.strategy` | `local` |
+| `commit.format` | `imperative` |
+| `ai.provider` | `deterministic` |
+| `ai.diff_egress` | `false` |
+| `intent.verification` | `none` |
+| `ai.timeout` | `5m` |
 
-~~~text
-ai.provider = openai-compat
-commit.strategy = intent
-commit.preset = balanced
-commit.format = imperative
-intent.verification = structural
-intent.repair.enabled = true
-ai.diff_egress = true
-~~~
+Local creates one complete batch commit when you run `acd finish`. It needs no
+credentials, network, or provider process. Supplied purpose explains the work;
+without context, a deterministic message describes observed changes.
 
-Choosing Local automatic commits instead saves `ai.provider = deterministic`
-and `ai.diff_egress = false`, without credentials or network access. A fresh
-noninteractive setup must specify the provider even in its dry-run preview.
+Intent uses an approved `openai-compat` or `subprocess:<name>` provider to plan
+completed goals. Deterministic is not an Intent provider. A failed Intent
+attempt stays failed until explicit retry; it never changes mode itself.
 
-These are global user defaults. The current repository and future repositories
-inherit them without repository-specific overrides. Repair is limited to
-recent, private, ACD-owned commits. It never rewrites pushed or user-owned
-history. The deterministic path needs no API key. Migration preserves every existing
-repository's effective provider, strategy, preset, verification, and repair
-values, including Event strategy inherited from old defaults.
+Both modes support imperative and conventional messages. Subjects are at most
+50 characters without a trailing period; conventional subjects use a supported
+scope-free `type: subject`. Context bullets use `- ` and wrap at 72 characters.
+A valid `--message` is preserved exactly. Under Intent, it still requires AI
+planning.
 
-A repository override takes precedence over later changes to global defaults.
-Use the reviewed inheritance flow when a repository should follow every global
-setting again:
+Migration preserves explicit supported choices and their provenance. Legacy
+Event strategy translates to Local batch semantics. Presets, planner windows,
+experiments, and automatic repair controls are retired; they do not authorize
+publication. Archived selectors can supply narrow verification/privacy defaults
+below authored values until reviewed settings materialize those choices.
 
-~~~bash
-acd config edit --repo . --inherit
-~~~
+## Project checks
 
-`acd config get` shows saved values and their sources. `config set` and
-`config reset` save authoring changes; their next-step message names the editor
-and matching scope for review and activation. `acd status --verbose` shows the
-provider and model the worker is currently using.
+Structural safety checks always run: recorded versions, safe membership and
+ordering, complete trees, and exact final target equality.
 
-An explicit change from AI to local mode may preserve the active unpublished
-target in recovery and recapture it under the new verified configuration. The
-preview explains this effect; an ambiguous target remains protected and needs
-attention. ACD returns to AI only when you select it again.
+| `intent.verification` | Project command |
+|---|---|
+| `none` | None |
+| `structural` | None |
+| `fast` | Approved `verification.fast.command` |
+| `full` | Approved `verification.full.command` |
 
-The preview states whether it will save a repository override, update global
-defaults, or remove an override. Local rules need no AI or network access, but
-they cannot generate a history rewrite plan. OpenAI-compatible providers can
-group selected history by default. Local subprocess providers must support the
-grouped history request, or you can use `acd history rewrite --messages-only`.
+The editor reviews command execution permission separately from provider and
+diff permissions. Applying that approval does not execute the command. Finish
+runs it in isolated candidate trees using the configured timeout. A missing
+command is reported as missing; a structural pass is not a test-suite pass.
+Reused evidence is labelled reused.
 
 ## Credentials and privacy
 
-Credentials remain in
-`${XDG_CONFIG_HOME:-$HOME/.config}/acd/credentials.json`, schema v1, under an
-owner-only directory and regular `0600` file. A credential is never written to
-repository state, logs, traces, status, diagnostics, errors, or support output.
+~~~bash
+acd config credentials status
+acd config credentials set
+acd config credentials remove
+~~~
 
-Environment credentials override the store. Network diff egress requires both
-a provider that declares it needs diffs and explicit approval. Setup and its
-self-test send no repository source. A selected network provider is tested
-with fixed synthetic text before setup writes anything.
+Keys live in the protected credential store, not repository configuration.
+Credential save and settings Apply do not test the connection. Optional
+explicit connection tests use fixed synthetic input, not repository content.
+Local mode does not inspect the credential store.
 
-Credential replacement is crash recoverable. The prior file stays only inside
-the protected credential directory until setup commits. Setup backups, plans,
-digests, JSON output, logs, errors, journals, state databases, and configuration
-files never contain the token.
-
-## Runtime application
-
-Hot fields apply between safe worker passes after the editor queues them.
-Restart-required fields apply when the supervisor next starts that worker.
-Saving global settings does not start stopped repositories or restart workers.
-For an activation failure after saving, reopen `acd config --repo PATH` and save
-the reviewed settings again. Existing active settings remain in use until the
-new revision is applied.
+Intent sends metadata and redacted supplied context. Sending redacted text
+diffs requires explicit approval; binaries remain metadata only. Custom
+endpoint credential disclosure, insecure HTTP, provider execution, and project
+command execution have separate permissions. See [AI providers](ai-providers.md).
 
 ## Repository consent
 
-Run `acd on` once in each repository that ACD should protect. Integration hooks
-do not register unknown repositories or re-enable disabled ones.
+`acd on` registers and enables the current repository. Hooks cannot register
+unknown repositories or re-enable disabled ones. Authored settings, provider
+approval, and repository registration are separate decisions.
 
-`repo_lifecycle.autodiscovery` and `ACD_REPO_AUTODISCOVERY` are deprecated.
-They remain parseable so existing configuration files keep their unknown
-fields, but they no longer grant repository consent or override `acd on`.
-
-See the generated [configuration reference](configuration-reference.md) for
-every supported setting, environment variable, default, apply boundary,
-persistence rule, and sensitivity classification.
+Run `acd off` to take a final checkpoint and stop protection for that repository.
+It does not commit the work. See [user workflows](user-workflows.md).
 
 ## Large files and provider waits
 
-`capture.max_file_bytes` (`ACD_MAX_FILE_BYTES`) defaults to 5 MiB. It is a
-buffering threshold: larger regular files stream into durable Git objects.
-ACD caps buffering at 32 MiB even if this setting is higher. It does not silently
-exclude large or binary files. Git-ignored and sensitive paths remain excluded.
+`capture.max_file_bytes` (`ACD_MAX_FILE_BYTES`) defaults to 5 MiB and controls
+buffering. Larger regular files stream into Git objects; the setting does not
+silently exclude them. Git-ignored and sensitive paths remain excluded.
 
-`ai.timeout` (`ACD_AI_TIMEOUT`) defaults to five minutes. Intent uses one
-persisted deadline for planning and corrections of unchanged evidence. Restart
-cannot renew that deadline. When AI cannot finish, safe local grouping and
-messages let publication continue; verification and dependency checks still
-apply. Invalid provider credentials remain a configuration error.
+`ai.timeout` (`ACD_AI_TIMEOUT`) defaults to five minutes. An Intent attempt has
+one persisted deadline for its initial planning exchange and optional combined
+correction. Restart does not renew it. Oversized provider input fails without
+clipping, while the complete checkpoint stays protected.
+
+The generated [configuration reference](configuration-reference.md) lists
+supported fields, environment names, defaults, and apply boundaries.

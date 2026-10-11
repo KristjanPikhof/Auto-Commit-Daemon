@@ -2,142 +2,120 @@
 
 ## Observation and coverage
 
-Every accepted watcher event, complete poll, or optional semantic hint advances
-`observation_epoch` and immediately marks protection incomplete. A worker may
-report `protected=true` only when:
+ACD saves eligible changes in private checkpoints while protection is on.
+Watcher events and complete safety polls mark coverage incomplete until a scan
+proves the latest observation. `protected=true` means the eligible scope has a
+completed durable checkpoint and no eligible read or stabilization failure.
+It does not mean the work has been committed to the branch.
 
-- no scan or checkpoint is in flight;
-- no eligible path failed reading or stabilization; and
-- `covered_epoch == observation_epoch`.
-
-When filesystem watching is enabled, its first event wakes the worker
-immediately. More events in the same burst use a 100 ms trailing debounce with
-a 500 ms hard limit, so continuous formatter activity cannot postpone
-observation indefinitely. The complete safety poll starts at 750 ms after
-activity and doubles while the repository stays idle, up to two minutes. It
-repairs watcher loss and remains the coverage authority.
+Complete polling repairs missed watcher events. An idle worker backs off;
+unchanged scans reuse existing protection evidence. Idle time, stop events,
+and integration hints never trigger a finish.
 
 ## Eligible scope
 
-Git-ignored, sensitive, and generated cache paths remain outside the protected
-scope. Regular files above `capture.max_file_bytes` stream into durable Git
-objects with bounded memory. File size alone no longer stops capture. The
-setting keeps its name for compatibility and now controls buffering.
+Git-ignored, sensitive, and generated cache paths remain excluded. Regular
+files, executable modes, symlink entries, deletions, and binary files retain
+their Git representation. Reads stay anchored beneath the opened repository
+directory and reject symlink ancestors, including directories replaced during
+a scan. Gitlinks stay distinct from ordinary files.
 
-The generated-cache guard also excludes `-Xcc/` compiler index directories,
-including output accidentally written inside an Xcode project. Existing
-captured work remains protected until publication or explicit recovery resolves
-it; adding an exclusion does not discard queued captures or remove tracked files.
+`capture.max_file_bytes` controls buffering, not eligibility. Larger regular
+files stream into durable objects. ACD caps buffering at 32 MiB. Sockets,
+FIFOs, and devices are outside Git's file model.
 
-An unreadable or changing eligible path makes coverage incomplete. ACD still
-saves readable files in a durable **partial checkpoint**, records the failed
-eligible paths and reasons, and retries with backoff. It keeps the last complete
-checkpoint. Partial checkpoints cannot satisfy a complete-checkpoint barrier
-or be used for full-tree restore.
-
-Independent documentation may publish when it neither touches nor references
-a failed path. Missing content can hide dependencies, so source, configuration,
-assets, and uncertain rename or delete companions wait for complete observation.
-ACD keeps these captures protected; it never treats a failed read as a deletion.
-Status reports incomplete coverage even when the pending queue is empty.
-Sockets, FIFOs, and devices are outside Git's file model and are not captured.
-
-The 50,000-event default backpressure limit bounds low-level publication work
-for one branch generation. It does not cap checkpoint protection: a completed
-checkpoint still records the full eligible worktree when the event queue is
-full. Paths that do not fit in the event queue stay out of capture-event and
-shadow ownership, then are classified again after publication drains below the
-limit.
+An unreadable or changing eligible path makes coverage incomplete. ACD saves
+readable files in a partial checkpoint, records the failure, and keeps the last
+complete checkpoint. It never guesses that a failed read is a deletion.
+Partial checkpoints cannot satisfy finish's fresh complete-checkpoint barrier
+or a full-tree restore. Protection retries independently of publication.
 
 ## Durable checkpoint completion
 
-1. Scan and hash eligible files; record failed coverage explicitly.
-2. Build a tree through a scratch index. Normal capture also appends low-level
-   capture records; protection-only scans defer classification.
-3. Write Git objects with supported fsync settings and reread them exactly.
-4. Insert the operation, checkpoint, membership, exclusions, object IDs, and
-   expected private ref as `prepared` in one full-synchronous SQLite
-   transaction.
-5. Create the private ref with create-only CAS.
-6. Observe its exact target.
-7. Atomically mark the checkpoint and operation `completed`.
-8. Allow publication to consume its member changes.
+ACD builds the protected tree with a scratch index, writes and verifies its Git
+objects, then records a prepared checkpoint and expected private ref in SQLite.
+It creates the ref with create-only compare-and-swap. Completion requires a
+direct private ref at the exact target, held under Git's native ref lock while
+SQLite records completion. The live index and worktree do not change.
 
-On recovery, absent prepared refs are retryable, exact expected refs complete
-forward, and a different target becomes durable `needs_action`. Recovery never
-guesses or deletes an ambiguous ref.
+Recovery completes an exact prepared ref forward. A symbolic ref or different
+target requires attention and remains untouched. Private refs keep retained
+objects reachable through Git garbage collection. Missing or malformed legacy
+objects prevent completed cutover, while independently available valid captured
+objects remain pinned for recovery. Legacy archive attention does not block
+current checkpoint protection or finish. History rewrite reads the selected
+current Git commits, independently of archived capture records.
 
-During a slow provider or verifier call, the worker continues making durable
-protection-only checkpoints. Their bytes are protected immediately; capture
-classification waits until the active evaluation finishes. The durable
-`protection.classification_pending` marker prevents status from claiming those
-bytes are already committed. It clears only after a complete capture has
-classified the observed work, including work held by the event-queue cap.
-History labels snapshots without capture membership `saved`.
+Upgrades check legacy objects and private refs in bounded
+batches. Each ref must still point directly to its recorded object; Git's native
+locks protect the checks and completion record. Missing or malformed evidence
+remains visible as attention and is checked again after the evidence changes.
+Later checkpoints reuse the immutable pins for already retained commits instead
+of creating another full archive. Each manifest keeps its own exact snapshot
+and recorded pin mapping; older refs remain retained.
+
+## The finish target
+
+`acd finish` requests a fresh complete checkpoint and freezes one target. The
+source checkpoint proves the saved worktree bytes. The publication target also
+preserves unchanged base entries outside the protected scope, including
+excluded paths and gitlinks. A change to an ignore rule does not silently delete
+an existing branch entry.
+
+Ordinary finish refuses staging. With `--include-staged`, only the frozen staged
+selection uses its index versions or deletions; other eligible paths use the
+frozen worktree versions. Unstaged differences on a selected path remain live
+work for a later finish. Staged excluded or sensitive paths are rejected, even
+with consent.
+
+Later edits continue to receive checkpoints during planning and verification.
+They do not expand the accepted request. A retry uses that same frozen target;
+a new ordinary finish freezes current work again.
+
+## Verification and publication
+
+Every candidate must use recorded path versions and produce a complete tree.
+ACD checks dependencies, rename groups, author boundaries, coverage, and exact
+final target equality. These structural checks always run.
+
+`none` and `structural` do not run project commands. `fast` and `full` use the
+approved configured command in an isolated candidate tree. Results distinguish
+executed checks, reused results, missing commands, and structural-only evidence.
+A structural pass is not a claim that tests ran.
+
+ACD builds and verifies the whole private commit chain before preparing its
+publication journal. One exact branch compare-and-swap publishes the tip.
+A failure before that mutation leaves the branch unchanged and the checkpoint
+retained. After-CAS interruption reports the proven branch outcome separately
+from any remaining index cleanup or journal completion. Finish never pushes.
+
+Publication rechecks the branch and index. Approved staging is consumed through
+Git's exclusive index lock using its frozen identity; new staging is never
+silently overwritten. Working files stay unchanged. After a crash, exact
+prepared proof can complete forward; ambiguity requires attention. A running
+request interrupted before preparation becomes failed and needs explicit retry.
 
 ## Unsafe Git states
 
-Protection continues during detached HEAD, conflicts, branch changes,
-merge/rebase/cherry-pick/bisect markers, manual publication pause, or staging
-that would be unsafe to publish. Publication resumes only after the existing
-branch-token and Git safety gates prove a stable target.
-
-## Publication behavior
-
-Only completed-checkpoint members enter publication. Existing Event and Intent
-semantics remain intact. Provider, planning, message, grouping, test, or
-verification problems never undo the completed checkpoint or its `protected`
-state. Status shows `waiting` while ACD pauses for a retry, `publishing` while
-it is actively retrying or rebuilding the plan, and `needs_action` only when
-bounded recovery is exhausted or ACD cannot prove a safe next step.
-
-Publication writes a specialized prepared record before branch mutation,
-uses a literal-ref compare-and-swap, observes the exact target, and atomically
-settles member changes and checkpoint publication links. Startup recovery
-proves source, parent, target, tree, membership, and ref ownership. Ambiguity
-stays `needs_action`.
-
-If every member of a stopped publication run is already `published` or
-`recovered`, the worker completes the run during startup or the next recovery
-pass. The proof uses the frozen membership in SQLite and does not change HEAD,
-the index, the worktree, or another branch.
+Protection continues during detached HEAD, conflicts, branch movement, and
+merge, rebase, cherry-pick, or bisect operations. Finish requires an attached,
+stable branch and safe Git state. Setup or restore can hold publication while
+their own operation completes. Neither condition grants permission to discard
+protected work.
 
 ## Retention
 
-ACD never prunes unpublished checkpoints, restore preimages, unresolved
-operations, or the newest complete checkpoint, even when a newer partial
-snapshot exists. Published checkpoints default to 30 days and at least 100
-retained. A soft 5 GiB budget may prune published
-checkpoints older than seven days but never below 100. Protected-only content
-over budget is retained and reported, never discarded.
+ACD retains unfinished finish targets, the newest complete checkpoint, restore
+preimages, unresolved operations, and legacy provenance needed for recovery.
+Referenced private objects survive `git gc --prune=now`.
 
-Expected private refs make retained objects survive `git gc --prune=now`.
+Older published or superseded protection snapshots can expire after 30 days,
+with at least 100 retained. The soft storage budget can prune eligible snapshots
+after seven days. The latest complete checkpoint and snapshots referenced by
+finish, restore, unresolved operations, or legacy recovery remain protected.
+Required content over budget stays retained and is reported.
 
-Checkpoint maintenance normally runs hourly. Failed checks retry after one,
-two, five, then fifteen minutes, with later retries fifteen minutes apart.
-The retry schedule survives worker restarts. A successful check clears the
-failure and returns to hourly maintenance.
-
-A failed inventory is reported as a maintenance failure, not a storage-budget
-warning. Status, list, doctor, and diagnose share the saved outcome. Detailed
-reports include the error, next check, and last successful storage measurement.
-Temporary failures retry automatically. An external prerequisite, such as the
-Xcode license agreement, names the action needed and is rechecked automatically.
-ACD does not accept licenses on the user's behalf.
-
-Interrupted pruning retries through the recorded ref proof. A moved ref remains
-untouched and requires attention until safe recovery can be proven. Independent
-checkpoint protection and publication continue while maintenance is waiting.
-`acd repo gc` cleans registration records; it does not clear maintenance errors
-or prune protected checkpoints.
-
-Capture health is shared by status, list, doctor, diagnose, and recovery.
-Reports separate worker responsiveness, capture progress, failure onset, affected
-paths, and the next retry. Brief stabilization failures show waiting; persistent
-or unreadable-path failures need attention while retries continue. Repeated
-unchanged failures reuse the partial checkpoint and do not repeat the same log
-line on every scan. A responsive worker does not prove queue progress.
-
-Published capture retention keeps records referenced by a publication drain,
-including a completed drain. Pruning an unrelated old capture cannot break the
-frozen membership ledger or its foreign keys.
+Maintenance retries interrupted work from exact ref proof. A moved ref remains
+untouched. Status and diagnostics distinguish storage warnings, maintenance
+failure, incomplete coverage, and worker responsiveness. A heartbeat alone
+does not prove the latest file changes are protected.

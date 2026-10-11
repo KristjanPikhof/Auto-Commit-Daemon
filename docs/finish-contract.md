@@ -13,7 +13,7 @@ pushes to a remote.
 
 | Command | Help summary | Success and mutation boundary |
 |---|---|---|
-| `acd on` | Protect this worktree continuously | Set up a missing initial configuration, enable this worktree, start its worker, and confirm a durable checkpoint. No credentials, AI request, project checks, or branch commit. |
+| `acd on` | Protect this worktree continuously | Set up a missing initial configuration, enable this worktree, start its worker, and confirm a durable checkpoint. No new finish request, credentials, AI request, project checks, or ordinary branch commit. Startup may settle an already authorized prepared publication through its exact saved proof. |
 | `acd off` | Save a final checkpoint and stop protection | Complete a final checkpoint before disabling the worktree. Retain snapshots and state. Create no branch commit; refuse to claim success if protection is incomplete. |
 | `acd finish [PURPOSE]` | Create local commits for the current protected batch | Freeze a fresh complete checkpoint and current attached HEAD, prepare and verify the whole chain, then publish once. The command itself authorizes publication; it needs no `--yes` or interactive prompt. |
 | `acd finish --dry-run [PURPOSE]` | Preview and verify a finish without publishing | Freeze a checkpoint, plan, and verify as an explicit request. Private objects and request evidence may be written, and Intent may contact its configured provider. Never change the branch, index, or live files. |
@@ -60,9 +60,8 @@ local mode. A user can change strategy explicitly and run a new finish.
 
 Imperative subjects name an action, such as `Preserve staged content during
 finish`. Conventional subjects use `type: subject`, such as
-`fix: preserve staged content`. Keep the existing scope-free contract. These
-are the two styles. "Authoritative"
-wording means imperative, not a third style. Messages must be nonempty, respect
+`fix: preserve staged content`. Both styles are scope-free. Older references to "authoritative"
+wording mean imperative, not a third style. Messages must be nonempty, respect
 the selected format, and contain no terminal control characters; body newlines
 remain valid.
 
@@ -159,10 +158,10 @@ make large regular files ineligible for protection.
 
 | Evidence | Bound |
 |---|---|
-| One included textual path diff | `ai.IntentStageDiffCap`, 64 KiB |
-| Aggregate textual finish evidence | `ai.IntentGoalEvidenceTotalDiffCap`, 256 KiB |
-| Aggregate history rewrite diffs | `ai.HistoryRewriteTotalDiffCap`, 128 KiB |
-| Serialized provider planning request | `ai.HistoryRewriteRequestByteCap`, 512 KiB |
+| One included textual path diff | `ai.FinishDiffByteCap`, 128 KiB |
+| Aggregate textual finish evidence | `ai.FinishEvidenceDiffByteCap`, 512 KiB |
+| Aggregate history rewrite diffs | `ai.FinishHistoryDiffByteCap`, 512 KiB |
+| Serialized provider planning request | `ai.FinishRequestByteCap`, 512 KiB |
 
 Measure actual serialized bytes and complete required evidence before sending.
 Exceeding a bound fails with `provider_input_too_large`, the measured size,
@@ -251,21 +250,27 @@ resolved-work booleans retain their earlier meaning alongside the exact outcome.
 | Empty finish | `0` | `No changes to finish`; `Published: 0 commit(s)`. |
 | Completed preview | `0` | `Finish preview`; ordered goals/messages and exact trees; `Published: no`; run a new `acd finish` to apply current work. |
 | Invalid arguments or incompatible retry options | `2 / invalid_argument` | Explain the invalid argument; make no request or mutation. |
-| Incomplete coverage | `3 / protection_incomplete` | List failed eligible paths safely; protection continues; repair readability/stability and run finish again. |
-| Staged selection without consent | `3 / staged_changes` | `Staged changes preserved`; use `--include-staged` only after review. |
-| Excluded staged path | `3 / staged_scope_excluded` | Identify the excluded path safely; preserve staging and require an explicit eligible selection. |
-| Changed frozen staging | `3 / staging_changed` | `Staging changed; current selection preserved`; new finish required. |
-| Unsafe/stale Git or ambiguous worktree ownership | `3 / unsafe_git_state` | Give the exact state and safe new-request/unblock action. |
+| Incomplete coverage | `3 / finish_rejected` | List failed eligible paths safely; protection continues; repair readability/stability and run finish again. |
+| Staged selection without consent | `3 / finish_rejected` | `Staged changes preserved`; use `--include-staged` only after review. |
+| Excluded staged path | `3 / finish_rejected` | Identify the excluded path safely; preserve staging and require an explicit eligible selection. |
+| Changed frozen staging before acceptance | `3 / finish_rejected` | `Staging changed; current selection preserved`; new finish required. |
+| Unsafe/stale Git or ambiguous worktree ownership | `3 / finish_rejected` before acceptance; `finish_failed` for a saved failed attempt | Give the exact state and safe new-request/unblock action. |
 | Different active request | `3 / finish_busy` | Report active request ID; reconnect to it or wait for its bounded outcome. |
-| Setup/runtime mismatch | `3 / setup_required` | State the mismatch; direct to explicit setup without upgrading other repositories. |
-| Unknown or foreign retry target | `2 / invalid_argument` | Explain target identity; no request mutation. |
+| Setup/runtime mismatch | `3 / runtime_upgrade_required` or `finish_rejected` | State the mismatch; direct to explicit setup without upgrading other repositories. |
+| Unknown or foreign retry target | `2 / finish_not_found` or `finish_identity_mismatch` | Explain target identity; no request mutation. |
 | Oversized evidence | `3 / provider_input_too_large` | Size/limit and guidance above; protected, unpublished. |
 | Provider rejection/invalid plan/failed verification | `3 / finish_failed` | Request ID, cause, verification evidence, and `acd finish --retry ID` when ownership permits. |
 | Provider timeout/transient transport failure | `4 / finish_unavailable` | Failed request ID and explicit retry; no automatic local fallback. |
 | Worker/supervisor unavailable before acceptance | `4 / supervisor_unavailable` | State whether a durable request exists; reconnect only to that proven request. |
-| Restarted pre-publication attempt | `3 / finish_interrupted` | Failed request ID and explicit retry; protection continues. |
+| Restarted pre-publication attempt | `3 / finish_failed` (saved reason `finish_interrupted`) | Failed request ID and explicit retry; protection continues. |
 | Ambiguous prepared transition | `3 / finish_needs_attention` | Exact proven branch/index facts and required user action; no guessed recovery. |
 | Unexpected internal failure | `1 / internal_error` | Safe error and request ID if saved; no false publication claim. |
+
+The error envelope code and the saved request reason are separate: startup safety
+refusals use `finish_rejected` with their safe cause in the message; a failed
+saved attempt retains its specific reason in request data. Provider deadline or
+transport failure uses `finish_unavailable`, oversized input uses
+`provider_input_too_large`, and other terminal failures use `finish_failed`.
 
 A disconnect cannot deliver a terminal result to that client. The durable
 request remains discoverable through status/list, and reconnect returns its
@@ -294,6 +299,10 @@ rejected rather than silently regenerated or applied.
 Upgrade preserves captures, immutable provenance, checkpoints, restore/history,
 and unfinished legacy publication evidence. Keep narrow read-only legacy
 decoders only where needed to inspect, preserve, or reject old plans safely.
+Archived evidence is separate from current work: `on` protects current changes,
+`finish` publishes a fresh protected target, and history rewrite uses the
+selected current Git commits as its source of truth. Legacy archive attention
+must not gate these commands or prepared current-finish recovery.
 Resolve prepared legacy mutations through exact proof; otherwise preserve a
 retryable or actionable record. Do not resume old planners, candidate waiting,
 aging, automatic repair, or semantic recovery loops. Retire their configuration,

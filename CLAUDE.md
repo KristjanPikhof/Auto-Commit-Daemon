@@ -1,12 +1,19 @@
 # Auto-Commit-Daemon
 
-ACD is a lightweight background tool that protects file changes and turns them
-into useful local Git commits.
+ACD protects eligible file changes in private Git checkpoints while users work.
+Users run `acd finish` when a change is ready. Ordinary protection never calls a
+provider, reads provider credentials, runs project checks, or starts publication.
+Startup may recover an already authorized prepared mutation from its exact saved
+proof; it cannot start a new finish.
 
-Intent mode is the main product experience. A user changes files, ACD captures
-the work, groups related changes by meaning, and creates semantic commits. The
-user should not need to stage files, choose commit boundaries, monitor a queue,
-or think about committing.
+Fresh installations use offline Local mode and imperative messages. Local finish
+creates one complete batch; optional Intent mode plans completed goals and safe
+semantic boundaries. Both modes require explicit finish. ACD never pushes.
+
+Keep the three workflows independent: `on` captures current changes, `finish`
+creates commits from a fresh protected target, and `history rewrite` uses the
+selected current Git history as its source of truth. Old archive records must
+not gate these workflows or enter a new rewrite plan.
 
 This file tells agents how to change ACD. README and `docs/` explain the product
 to users. `AGENTS.md` is a symlink to this file, so edit `CLAUDE.md` and preserve
@@ -14,37 +21,32 @@ the symlink.
 
 ## What ACD must do
 
-1. **Create semantic history.** Intent mode should produce coherent commits,
-   not generic filename commits or arbitrary time-based groups.
+1. **Protect continuously.** Keep eligible work durable before any publication,
+   including during provider failures, rejected plans, restarts, and branch movement.
+2. **Publish on request.** Freeze a fresh complete checkpoint and attached HEAD,
+   prepare and verify the whole private chain, then publish through one branch CAS.
+3. **Keep later work moving.** Later edits stay protected for the next finish and
+   never change the accepted request.
+4. **Use purposeful boundaries.** Intent produces complete goals and valid
+   intermediate commits. Local provides one honest offline batch.
+5. **Recover from proof.** Interrupted planning becomes a retryable failure;
+   prepared publication recovers only from exact saved branch/index evidence.
+   Ambiguous evidence remains `needs_attention`.
+6. **Stay quiet and truthful.** Avoid idle provider/check/commit work, busy loops,
+   full scans without cause, and writes that do not represent progress. Distinguish
+   protection, branch publication, recovery preservation, and required action.
 
-2. **Protect before publishing.** Provider failures, rejected plans, failed
-   verification, restarts, branch movement, and timeouts must not put captured
-   work at risk.
-
-3. **Recover automatically.** Retry temporary failures, rebuild invalid plans,
-   and restart from the last proven checkpoint state. Use `needs_attention`
-   only when ACD cannot prove a safe automatic path.
-
-4. **Keep new work moving.** Once publication starts, its target stays frozen.
-   Later captures remain protected and become input for later semantic commits.
-
-5. **Stay fast and quiet.** Avoid busy loops, frequent full-repository scans,
-   repeated provider calls for unchanged evidence, and database writes that do
-   not represent progress.
-
-6. **Tell the truth.** Status and list must clearly distinguish protection,
-   publication, waiting, active work, recovery, and required user action.
-
-Event mode is useful for compatibility and testing, but Intent mode is the
-experience we optimize for.
+Local and Intent are the supported strategies. Legacy Event settings translate
+into Local batches during explicit upgrade. No continuous publication engine,
+automatic history repair, or fallback mode remains.
 
 ## Terms
 
-- **capture:** one durable record of an observed file change
+- **capture:** one observed file version retained as checkpoint or legacy evidence
 - **checkpoint:** a Git snapshot proving eligible work is protected
-- **publication:** turning protected captures into branch commits
+- **publication:** applying a fully prepared finish chain to its branch
 - **Intent:** grouping related captures into semantic commits
-- **publication target:** the frozen captures currently being published
+- **publication target:** the frozen complete tree and identity of an explicit request
 - **recovered:** preserved in a protected recovery snapshot
 - **resolved:** published normally or safely recovered
 - **worker:** the process protecting one repository
@@ -73,12 +75,17 @@ Use `rg` to search if available. Preserve unrelated work.
 
 ACD self-hosts this repository:
 
-- Do not run `git add` or `git commit`.
-- Do not pause ACD for ordinary edits, builds, or isolated tests.
-- Pause only for history surgery, direct state recovery, or a test that
-  deliberately operates on this checkout.
-- Source changes do not update the installed runtime.
-- Install, restart, tag, push, or release only when explicitly requested.
+- Check installed runtime ownership once. An active older runtime still owns
+  automatic commits until explicitly upgraded; warnings do not make it inactive.
+- Do not run `git add` or `git commit`. Never force `acd commit-all` unless the
+  user specifically requests it.
+- With a verified finish-based runtime, use `acd finish` for authorized completed
+  work. Finish the task and checks without waiting or polling for publication.
+  Report failed or pending requests accurately.
+- Do not pause ACD for ordinary edits, builds, or isolated tests. Pause only for
+  history surgery, direct state recovery, or a test operating on this checkout.
+- Source changes do not update the installed runtime. Install, restart, tag,
+  push, or release only when explicitly requested.
 
 ## Safety rules
 
@@ -97,12 +104,12 @@ Ambiguous ref movement or publication remains `needs_attention`; never guess.
 Publication and recovery must preserve the live worktree, index, and user
 staging.
 
-Unsafe Git states may pause classification or publication, but completed
-checkpoint protection remains active.
+Unsafe Git states can prevent finish publication. Continuous checkpoint
+protection remains active where eligible files are readable.
 
 ### Intent and recovery
 
-Every visible capture must belong to exactly one Intent group.
+Every changed entry in a frozen Intent target must belong to exactly one goal.
 
 Hard dependencies, rename chains, create and delete order, and generated
 relationships must remain safe. Time and directory proximity cannot be the only
@@ -117,38 +124,41 @@ Each split needs a useful review or revert boundary and a valid intermediate
 state. Put prerequisites before consumers or in the same commit. Explain
 broader defaults and behavior changes from evidence. Age and queue pressure
 never waive completeness checks. Judge the proposed commit tree, not the final
-worktree. Existing publication targets and history-repair limits still apply.
+worktree. Frozen request identity, author boundaries, and explicit history-rewrite safety
+limits still apply.
 
-When a plan fails:
+An Intent attempt permits one planning call and at most one correction within
+one persisted deadline. Messages belong to that plan. Provider rejection,
+timeout, unavailable evidence, or exhausted budget fails the explicit request;
+there is no background semantic retry or silent Local fallback.
 
-1. Keep valid groups when possible.
-2. Retry or correct the unresolved part.
-3. Rebuild stale plans.
-4. Use safe evidence-based Intent recovery after bounded provider failures.
-5. Keep later captures protected for the next plan.
+A valid grounded plan can become one whole-batch goal only when it passes the
+same dependency, materialization, and verification checks. Never create generic
+per-file commits to escape a rejected plan.
 
-Evidence-based recovery must still respect dependencies, materialization, and
-verification. It must not become generic per-file commits.
+Client disconnect detaches from the accepted bounded job. Restart fails running
+planning retryably and recovers prepared publication without AI only through exact
+proof. Explicit retry preserves the frozen target and options; it cannot absorb
+later edits, silently rebase, or restore over the user's worktree.
 
-Restart planning from the last proven checkpoint state when current publication
-cannot continue. Do not restore files over the user's worktree.
-
-A provider rejection, timeout, or worker restart should recover automatically.
-It should not leave the repository permanently blocked.
+Keep legacy captures, journals, and immutable provenance readable for explicit
+migration, history, restore, and retention. Legacy rows are not an active queue.
 
 ### Observability and performance
 
 `acd status`, `acd list`, doctor, diagnose, and JSON output must agree.
 
-A healthy wait is not a stall. A responsive worker is not proof of queue
-progress. Report worker liveness and queue movement separately.
+Saved work awaiting finish is a healthy state. A responsive worker does not
+prove a branch commit. Report worker liveness and explicit request progress
+separately.
 
 Human status separates branch commits from recovery preservation. Deprecated
 JSON publication booleans retain their earlier resolved-work meaning; the shared
-publication outcome reports branch commitment, recovery, and pending classification.
+publication outcome reports branch commitment, recovery, saved work, and explicit
+request progress. Legacy classification flags do not imply background planning.
 
 Prefer event-driven wakeups. Polling is a safety net and should back off while
-idle. Keep scans, provider calls, queues, logs, and database work bounded.
+idle. Keep scans, explicit provider calls, logs, and database work bounded.
 
 ## Testing
 
@@ -158,7 +168,7 @@ A good regression test recreates the original problem, including restart,
 timeout, provider rejection, branch movement, queued captures, or recovery when
 those details caused the defect.
 
-Test the visible result as well as internal state. A queue fix should prove what
+Test the visible result as well as internal state. A progress fix should prove what
 `acd status` and `acd list` tell the user.
 
 Prefer observable milestones and durable state transitions over sleeps. Use

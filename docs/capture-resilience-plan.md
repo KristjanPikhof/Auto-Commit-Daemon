@@ -1,5 +1,8 @@
 # Capture and publication resilience
 
+> **Historical incident and implementation record.** Publication, queue, retry, and runtime-version statements below describe that earlier release. Current protection saves private checkpoints; publication requires an explicit finish. See [protection](capture-replay.md), [commands](commands.md), and the [finish contract](finish-contract.md). These source changes do not install or restart the runtime.
+
+
 Branch: `fix/capture-publication-resilience`
 
 ## Incident

@@ -1,9 +1,10 @@
 # Explicit finish removal map
 
-This is the execution inventory for Trekoon epic
+This is the baseline inventory and completed removal record for Trekoon epic
 `8a174f3b-5222-4740-9965-8376aaabbd1c`, measured at source commit
-`84ed324a6866ec4294319986d302160a774ea9c1`. It describes removal work, not the
-installed runtime. The runtime was active when execution began; this inventory
+`84ed324a6866ec4294319986d302160a774ea9c1`. Tables marked baseline preserve the original paths and planned dispositions;
+completed sections record the source implementation and scenario replacements.
+This document does not describe the installed runtime. The runtime was active when execution began; this inventory
 does not authorize installation, restart, live migration, or history changes.
 
 Ordinary edits must make private checkpoints only. Branch commits, provider calls,
@@ -35,11 +36,12 @@ Owners below are the lane names in Trekoon. `removal-daemon-lane`,
 replacement owners land. `test-gate-lane` removes retired assertions and stale
 selectors only after the replacement scenarios exist. `migration-lane` owns
 legacy proof reconciliation; `retention-lane` owns reachability and pruning.
-The final inventory lists every baseline production and test file by disposition.
+The exhaustive inventory lists every baseline production and test file by disposition.
+Deleted paths in those tables are historical references, not current interfaces.
 
-## Production paths and callers
+## Baseline production paths and callers
 
-| Current path / entry points | Current callers | Action and retained boundary | Owner |
+| Baseline path / entry points | Baseline callers | Action and retained boundary | Owner |
 |---|---|---|---|
 | `daemon.Run` in `internal/daemon/daemon.go` | Worker startup and supervisor worker server | Replace the automatic replay portion. Keep canonical ownership, wake coalescing, checkpoint scans, backoff, heartbeat, shutdown, maintenance, and explicit request handling. No edit, idle, queue age, or shutdown publication. | `capture-lane`, `worker-lane`; final deletion `removal-daemon-lane` |
 | `Capture`, `ProtectWorktree`, `BeginProtectionObservation` in `capture.go`; `classify.go`, `shadow_io.go` | Run loop; restore protection policy; legacy recovery | Use `ProtectWorktree` for normal checkpoint protection. Retain safe traversal, streamed blobs, exclusions, failed-path reporting, observation epochs, and stable reads. Retire normal capture-event/shadow classification, path-quiescence tracking and publication backpressure. Preserve recorded versions needed by restore/legacy readers. | `capture-lane`; cleanup `removal-daemon-lane` |
@@ -64,7 +66,7 @@ The final inventory lists every baseline production and test file by disposition
 | `intent_planner.go`, `intent_protocol_v2.go`, `intent_wire_v2.go`, `intent_unassigned.go`, `intent_maintenance.go`, `intent_cli_reference.go` | AI transports, daemon planning and history rewrite | Replace candidate/wait/window protocol with shared goal/tree plans. Keep complete implementation/caller/companion and purpose rules. Migrate explicit rewrite callers before deleting old schemas/prompts. | `ai-lane`, `history-lane`; deletion `removal-surface-lane` |
 | `intent_rejects.go`, `provider_probe.go`, `prompt.go`, `subject_fallback.go`, `rewrite_proposals.go`, `rewrite_gate.go` | AI diagnostics, setup and explicit rewrite | Keep privacy-safe rejection diagnostics, explicit connection tests, format validation and rewrite safeguards where used. Delete background retries/probes, per-event prompts and filename-message fallback. Do not turn planner failure into local mode. | `ai-lane`, `local-lane`, `history-lane`; cleanup `removal-surface-lane` |
 | `settings/experiment.go`, `comparison.go`, config presets and settings UI | Configure/edit/experiment and planner-window counters | Delete candidate experiments, budget windows, automatic revert and quality-dashboard comparisons. Keep provider credentials, precedence, approved verification and simple mode/style editing. | `config-lane`; deletion `removal-surface-lane` |
-| `integration_event.go`, `touch.go`, `wake.go`, templates and adapters | Tool/session/idle/stop hooks | Keep session ownership and protection hints. Remove logical-boundary publication; idle/stop is not task completion. Guidance permits explicit finish only for authorized completed work. | `hooks-lane`, `capture-lane`; aliases `removal-surface-lane` |
+| `integration_event.go`, `touch.go`, `wake.go`, templates and adapters | Tool/session/idle/stop hooks | Keep canonical worker ownership and protection hints. Remove session refcounts and logical-boundary publication; idle/stop is not task completion. Guidance permits explicit finish only for authorized completed work. | `hooks-lane`, `capture-lane`; aliases `removal-surface-lane` |
 | Supervisor `protocol.go`, `worker_server.go`, `worker_status.go`; installer revalidation and migration bridge | Worker dispatch, setup/upgrade transactions | Replace drain/request and queue fields; retain peer-UID checks, allowlist, exact binary/protocol identity, canonical repository locks and protection bridge. No automatic runtime upgrade is authorized. | `worker-lane`, `status-lane`, `onboarding-lane`, `migration-lane` |
 
 ## Safety dependencies to retain
@@ -74,9 +76,9 @@ The final inventory lists every baseline production and test file by disposition
 | Checkpoint durability and restart | `checkpoint.Store.Create`, `Store.RecoverPrepared`; `state.PrepareCheckpoint`; `git/durability.go`, `tree.go`, `object_inventory.go` | Objects reread durably, prepared SQLite identity, create-only private-ref CAS and exact completion. Preserve complete/partial coverage and streamed large files. | `capture-lane`, `retention-lane` |
 | Canonical ownership | `daemon.AcquireDaemonLock`, `AcquireControlLock`; `globalops/lock.go`; supervisor peer credentials and allowlist | PID/heartbeat are supporting evidence only. Retain mixed-version fencing and linked-worktree contention tests. Never bypass locks or delete state. | `worker-lane`, `onboarding-lane` |
 | Literal-ref publication | `git.UpdateRef`, `WithLockedExpectedRef`, `CreateRefsCAS`; `ProvePublicationAtHEAD`; `state/completed_branch_transition.go` | Expected source, exact complete chain/tree and final literal ref move. Preserve detached/conflict/foreign movement refusal and ambiguous crash evidence. | `git-lane`, `migration-lane` |
-| Staged consent | `git.IndexContentDigest`, `ConsumeApprovedIndex`; `state/staging_review.go`; existing self-publication frozen index fields | Refuse nonempty staging by default. `--include-staged` freezes exact index identity and preserves staged-only bytes. Source checkpoint remains its own immutable eligible-scope snapshot; merge with preserved base exclusions/gitlinks, then apply the approved staged overlay to pin the finish target. Final chain equals that target, not a later index/worktree. Consume only consented staging; never clear staging added later. | `git-lane`, `cli-lane`, `worker-lane` |
+| Staged consent | `git.IndexContentDigest`, `git/finish_publish.go`, `git/index_consent.go`; `state/finish_publication.go`; archived self-publication frozen index fields | Refuse nonempty staging by default. `--include-staged` freezes exact index identity and preserves staged-only bytes. Source checkpoint remains its own immutable eligible-scope snapshot; merge with preserved base exclusions/gitlinks, then apply the approved staged overlay to pin the finish target. Final chain equals that target, not a later index/worktree. Consume only consented staging; never clear staging added later. | `git-lane`, `cli-lane`, `worker-lane` |
 | Restore | `restore.PreviewWithPolicy`, `Apply`, `RepairWithPolicy`; safe filesystem implementations; `state/operations.go`, checkpoint/restore relations | Preview, preimage checkpoints, safe path claims, atomic replacements, unchanged HEAD/index and forward proof. Keep restore failures and preimage roots. | `migration-lane`, `retention-lane` |
-| Explicit history rewrite | CLI `intent_history.go`, `rewrite_commits.go`; daemon history plan; Git `intent_history.go`, `rewrite_apply.go`, `rewrite_selection.go`; state history/rewrite plans | Explicit selection/preview/apply, author identity, recorded versions, exact final tree, source-history refs and stale-plan refusal. Old plan inspection never starts mutation. | `history-lane` |
+| Explicit history rewrite | CLI `finish_history_protocol.go`, `rewrite_commits.go`; `ai/finish_history.go`; `git/finish_history.go`; `state/finish_history.go` and read-only legacy rewrite plans | Explicit selection/preview/apply, author identity, recorded versions, exact final tree, source-history refs and stale-plan refusal. Old plan inspection never starts mutation. | `history-lane` |
 | Privacy and transport | `ai/openai_compat.go`, `plugin_subprocess.go`, `provider.go`, `redact.go`, `error_sanitize.go`, `config.go`; `credentials/*`; `prompttrace/*`; safe ignore/sensitive matchers | Consent for diff egress, credential redaction and owner-only files; bounded cancellation/output for subprocess/HTTP. Retain opt-in raw traces only where documented. | `ai-lane`, `config-lane` |
 | Exact verification | `verification.NewApprovedCommand`, `Runner.Run`, `CheckStructural`, stale workspace cleanup; daemon runtime verifier | Verify each proposed commit tree in isolation. Structural checks are not a claim that project tests passed. Cache includes tree, command, environment identity and policy; report reuse honestly. Preserve cancellation and descendant process cleanup. | `plan-lane`, `worker-lane` |
 | Retention and compatibility | `checkpoint/retention.go`, `maintenance.go`; state checkpoint retention/recovery; migrations, readonly DB open, backup | Retain all unfinished targets, newest complete checkpoint, restore preimages and immutable legacy provenance; keep moved refs untouched. Disabled repositories and readonly commands do not migrate. | `migration-lane`, `retention-lane` |
@@ -103,7 +105,8 @@ replacement. Legacy parsing belongs only to the activation translation boundary.
 | `ai.provider`, `.base_url`, `.api_key`, `.model`, `.timeout`, `.ca_file`, `.diff_egress` and catalogued env counterparts | Keep transport/credentials/privacy/timeout. Protection does not construct or test a provider; Intent failure never selects deterministic mode automatically. |
 | `capture.max_file_bytes`, `.sensitive_globs`, `.safe_ignore`, `.safe_ignore_extra`; `watch.fsnotify`; `trace.enabled`, `.prompt` | Keep buffering, eligible scope, watcher and opt-in tracing. Large file size is a buffer threshold, not permission to discard bytes. |
 | `retention.event_days`, `recovery.rewind_grace`, `recovery.shadow_generations` | Replace event/shadow runtime policy with checkpoint/legacy retention. Keep old values only where required by historical cutover; never prune unresolved provenance (`retention-lane`). |
-| `client.ttl` / `ACD_CLIENT_TTL_SECONDS`; `ACD_REPO_AUTODISCOVERY` | Keep session/lifecycle and registration consent; no missing-repository provider setup or global migration. |
+| `client.ttl` / `ACD_CLIENT_TTL_SECONDS` | Retire session-count lifetime and archive authored values. Enabled workers protect continuously until off or shutdown. |
+| `ACD_REPO_AUTODISCOVERY` | Keep repository registration consent; no missing-repository provider setup or global migration. |
 | `ACD_INTENT_REJECTS_RAW` | Preserve only as an explicit privacy-sensitive reject-log opt-in if the retained finish diagnostic uses it. Remove candidate-schema assumptions and warn/document raw retention (`ai-lane`, `docs-lane`). |
 | Experiment/profile/preset source precedence and experiment window/expiry/revert controls | Delete experiment and preset sources. Preserve authored repository/global/environment precedence and credentials; retain profiles only if still used by the simplified configuration contract. |
 
@@ -131,7 +134,7 @@ for prepared/applied journals, partial/captured-only work and staged provenance.
 | `self_publications`, `self_publication_members`; `checkpoint_publications`; completed-branch transition proofs | Preserve and settle exact old journals; new finish publication records one complete chain/ref/index transition. Keep committed vs recovered outcome separate. `git-lane`, `migration-lane`. |
 | `operations`, `operation_steps`, `checkpoints`, `checkpoint_events`, `checkpoint_exclusions`, `checkpoint_capture_issues`, `restore_operations` | Keep durability, coverage, restore and ref proof; add explicit request/target associations without discarding old membership. `state-lane`, `capture-lane`, `retention-lane`. |
 | `recovery_snapshots`, `recovery_snapshot_events`, `rewrite_plans`, `rewrite_plan_commits`, `rewrite_plan_groups` | Keep immutable recovery/source-history references and explicit rewrite plan readers; migrate new explicit rewrite writers to shared plan as needed. `migration-lane`, `history-lane`. |
-| `daemon_state`, `daemon_clients`, `daemon_meta`, `decision_records`, `daily_rollups` | Keep lifecycle, capture coverage, truthful history/diagnostics and historical stats. Retire planner/circuit/window/replay metadata writes and dashboards. `worker-lane`, `status-lane`, `retention-lane`, `removal-state-lane`. |
+| `daemon_state`, `daemon_clients`, `daemon_meta`, `decision_records`, `daily_rollups` | Keep current daemon state, protection coverage, truthful history/diagnostics and historical stats. `daemon_clients` is archive-only and absent from fresh databases. Retire session writers and planner/circuit/window/replay metadata writes and dashboards. `worker-lane`, `status-lane`, `retention-lane`, `removal-state-lane`. |
 
 The old schema's immutable membership and lineage triggers remain necessary
 while their data is readable. Do not remove them just because new writers stop.
@@ -139,14 +142,27 @@ Readonly opens must remain readonly, must not run schema upgrades and must fail
 clearly on unsupported versions. New mutating activation rejects a newer schema
 rather than allowing an older binary to reinterpret finish records.
 
+State removal is complete in schema v33. Fresh repositories create only current
+protection, restore, configuration approval, and explicit Finish/history state.
+Supported v1 through v32 upgrades use the frozen schema in `state/schema_legacy.go` and
+preserve original rows, authors, membership seals, index consent, and private refs.
+Read-only views inspect optional archived tables without creating them.
+
+New candidate, drain, planner, flush, session, shadow, experiment, and background
+validation writers are removed. The remaining legacy code reads old proofs or
+settles an already prepared journal under exact ownership. Activation pins old
+versions before checkpoint protection starts. Unprovable old publication keeps
+its durable `needs_attention` result; it does not trigger shadow adoption or
+label the work committed. Legacy fixture construction now uses SQL only in tests.
+
 ## CLI, integrations, diagnostics and dependencies
 
 | Surface | Action and owner |
 |---|---|
 | Public `on`, `off`, `status`, `list`, `history`, `restore`, `config`, `setup`, doctor/support | Keep and replace behavior/projections through their lanes. Add public finish. On/off must not commit or test an AI connection. |
 | `commit-all` | Keep a small deprecated finish delegate for the first finish release only (`cli-lane`). Remove old scoped drain and fallback engine. |
-| Root compatibility `start`, `stop`, `daemon`, `wake`, `touch`, `flush`; helper extraction aliases | Remove obsolete root engine/hint aliases; keep canonical internal worker/supervisor/session/protection methods required by templates (`removal-surface-lane`, `hooks-lane`). `logical_boundary` no longer publishes. |
-| Root compatibility `init`, `configure`, `settings`, `auth`, `version`, `events`, `prompt`, `explain`, `fix`, `logs`, `stats`, `diagnose`, `recover`, `pause`, `resume`, `purge-events`, `gc`, `rewrite-commits`, `rewrite-all` | Assign each alias to `removal-surface-lane`: retire unnecessary compatibility wrappers after canonical commands/help tests migrate. Keep the underlying explicit history, config, lifecycle and support behavior; `purge-events` cannot become data deletion. `rewrite-all` currently refuses automatic rewrite and may remain a replacement hint only if the help contract needs it. |
+| Root compatibility `start`, `stop`, `daemon`, `wake`, `touch`, `flush`; helper extraction aliases | Remove obsolete root engine/hint aliases; keep canonical internal worker/supervisor/protection methods required by templates (`removal-surface-lane`, `hooks-lane`). `logical_boundary` no longer publishes. |
+| Root compatibility `init`, `configure`, `settings`, `auth`, `version`, `events`, `prompt`, `explain`, `fix`, `logs`, `stats`, `diagnose`, `recover`, `pause`, `resume`, `purge-events`, `gc`, `rewrite-commits`, `rewrite-all` | Assign each alias to `removal-surface-lane`: retire unnecessary compatibility wrappers after canonical commands/help tests migrate. Keep the underlying explicit history, config, lifecycle and support behavior; `purge-events` cannot become data deletion. `rewrite-all` is removed; explicit reconstruction uses `history rewrite`. |
 | `facade.go`, `config_facade.go`, `repo.go`, `internal_protocol.go`, supervisor method catalog | Remove config experiments/preset comparison and replay/drain dispatch; keep registry, auth, protection, restore and explicit finish/history RPC. `cli-lane`, `worker-lane`, `removal-surface-lane`. |
 | Intent strategy/V2 reports, planner window totals, provider circuit projection, replay conflicts/failures, batch-wait reasons, publication drain phase/mode/progress | Replace with source checkpoint coverage, explicit frozen request/result, retryable failure and legacy outcome. No pending-queue count may substitute for saved coverage. Shared status/list/doctor/diagnose must agree (`status-lane`). |
 | Claude Code, Codex, Cursor, OpenCode, Pi and shell templates; `adapter/detect.go`, integration merge and setup tests | Keep lifecycle/capture hooks, remove idle/stop automatic publication, add concise completed-task finish guidance. Synchronize template source and adapter/setup tests (`hooks-lane`). |
@@ -181,10 +197,12 @@ selectors/timings after the implementation owners record named replacements.
 | Integration production benchmarks, large ignored trees, lifecycle/stress, deadlock probes, support/PTY tests | Retain realistic resource/lifecycle/PTY and zero-idle-work bounds. Replace commit-per-save throughput metrics; do not claim speed improvements without measurements. | `integration-lane`, `test-gate-lane` |
 | `scripts/dev/test.sh`, `test-package-shards.sh`, `test-manifest.py`, `test-timings.json`, hosted workflows | Remove retired named selectors/timings and retain every replacement exactly once. Keep three local core shards, max two parallel tests per package process; hosted four core/four integration/support on Ubuntu/macOS, six daemon-stress and two Git/state-stress lanes. Five-minute wall-clock target, leaf target 4m30s/hard 5m. | `test-gate-lane` |
 
-Baseline `scripts/dev/test.sh` currently defaults `ACD_TEST_CASE_PARALLELISM` to 4
-in core shards, while the repository guidance and epic require at most 2.
-`test-gate-lane` must reconcile this when it edits the gate; this inventory does
-not alter execution settings or run the broad gate.
+The baseline core helper defaults to four parallel cases; the local gate now
+passes two explicitly for its three core shards. Hosted core, integration,
+support, and stress topology and timeout limits are preserved. Dynamic compiled
+name discovery assigns every live test, example, and fuzz entrypoint exactly once.
+The final source gate passed in 180.565 seconds; lint passed in 0.672 seconds.
+These are local results, not hosted CI or installed-runtime evidence.
 
 ## Documentation ownership
 
@@ -270,7 +288,9 @@ subtest count or runtime scenario count is inferred from those names.
 File names in each subsection are relative to that subsection. A Replace test
 row preserves its user scenario while retiring old API/scheduling assertions;
 a Legacy row keeps isolated proof/decoder fixtures. These are ownership
-assignments, not permission to delete a mixed file wholesale.
+planned assignments, not final file-presence claims or permission to delete a
+mixed file wholesale. The final outcome overrides below explain absent planned
+Keep/Legacy files and their retained replacement proofs.
 
 ### `cmd/acd`
 
@@ -565,3 +585,211 @@ tree. Non-Go surfaces are assigned in the settings, CLI/integration, docs and
 test-gate tables. Re-run the assignment check against the recorded baseline,
 then check for new source files after integration; the baseline is not a claim
 that later files are already reviewed.
+
+## Final file outcomes override baseline assignments
+
+The exhaustive tables above preserve the original plan. Their Keep/Replace/Legacy
+labels do not assert that a file remains in the finished source tree. Static
+path checks against the current checkout give these final baseline outcomes:
+
+| Baseline files | Still present | Removed or moved |
+|---|---:|---:|
+| 284 production files | 186 | 98 |
+| 332 test files | 168 | 164 |
+
+These counts describe baseline paths only. New Finish modules and tests are
+additional files; a surviving path can also contain a replaced implementation.
+The original baseline line counts and assignments remain unchanged for audit.
+
+All eight production files originally assigned Keep but now absent are accounted
+for below, together with their five absent Keep test files:
+
+| Absent baseline Keep paths | Final outcome and retained proof |
+|---|---|
+| `ai/message_format.go`, `ai/provider.go`; `ai/openai_compat_test.go` | Shared styles and message validation moved to `finish/message.go`; the old generic provider interface became the bounded Finish transport in `ai/finish_planner.go`. HTTP/subprocess implementations remain. `TestFinishLocalRejectUnsafeMessages`, `TestFinishIntentOpenAITransport`, `TestFinishIntentOpenAIRejectsFailureAndRedirect`, and `TestFinishIntentSubprocessOneExchange` retain format, transport, refusal, and one-exchange proof. |
+| `ai/rewrite_gate.go`, `ai/rewrite_proposals.go` and their test files | Retired proposal/gate interfaces are replaced by `ai/finish_history.go`, `finish/plan.go`, `git/finish_history.go`, and `state/finish_history.go`. `TestFinishPlanRenameAndAuthorBoundaries` and `TestFinishWorkflowHistorySavedPlanPreservesMembershipAndAuthors` plus `TestFinishWorkflowHistoryPurposefulGoalsAndStaleRefusal` retain author/tree/source-history safety. Automatic repair and mutable candidate scaffolding are removed. |
+| `cli/version.go` | The redundant command wrapper is removed. Version reporting lives in `cli/root.go` and `internal/version`; `TestRootVersionFlagAndFiniteCommandCatalog` retains the actual public flag and command catalog. |
+| `cli/prompt.go`, `cli/prompt_test.go` | Public old-planner prompt inspection is retired. Privacy, redaction, and exact bounded request disclosure remain in `ai/finish_planner.go`, `ai/redact.go`, and their Finish tests, including `TestFinishIntentPrivacyAndSuppliedMessage`. No replacement public prompt command is invented. |
+| `state/checkpoint_capture.go`, `state/checkpoint_capture_test.go` | New checkpoints do not append or attach old capture-event membership. Current protection uses `daemon/protection_entry.go`, checkpoint state/coverage, and exact Git trees. `TestFinishProtectionPartialCheckpointRecoversWithoutQueue` and `TestFinishSchemaFreshContainsOnlyCurrentState` prove protection without those tables. Archived membership still has read-only decoders, immutable pins, and explicit SQL fixtures. |
+| `state/daemon_clients.go` | Session registration/refcount writers are retired. Canonical worker ownership and protection hints remain. `TestFinishRemovalEmptyLegacyClientsKeepProtectionRunning` proves an upgraded database with an empty old client table cannot terminate protection. |
+
+The three absent integration files assigned Keep scenarios
+(`ai_providers_test.go`, `capture_resilience_test.go`, `lifecycle_test.go`) are
+scenario ports, not lost Keep obligations. Their current workflow, large-asset,
+provider-failure, shutdown and restart proofs are named in the integration tables
+below. No old per-save commit or session-flush expectation remains.
+
+Baseline Legacy labels were narrowed after actual callers migrated. Ten such
+production paths and thirteen Legacy test paths are absent: the removed daemon
+repair/live-index adoption engines and the state reconcile/flush/forward-recovery/
+waiting-plan/publication writers no longer run. Their original rows, immutable
+triggers, and captured objects survive in upgraded databases through the frozen
+`state/schema_legacy.go` archive. Current exact readers and settlement live in
+`state/finish_legacy.go`, `state/legacy_inventory.go`,
+`daemon/legacy_repair_proof.go`, `daemon/self_publication_recovery.go`, and
+`migration/finish_cutover.go`. `TestFinishSchemaUpgradePreservesOriginalEvidenceAndReadonlyBoundary`,
+`TestFinishLegacyImmutableCutoverAndReadOnlyProjection`, and
+`TestFinishRemovalLegacyBridgeRequiresActivationWithoutMutation` retain old-row,
+read-only, and fail-closed mutable-bridge evidence. Real migration integration
+fixtures retain ambiguous chain, linked-worktree, index, and captured-byte proof.
+
+Absent Replace paths are resolved by the current modules and scenario tables:
+`finish/*` owns complete goals and Local messages; `ai/finish_*` owns bounded
+Intent evidence; `daemon/finish.go` owns frozen requests;
+`git/finish_publish.go` and `state/finish_publication.go` own the complete-chain
+transaction; `finish_history` modules own explicit rewrite. Protection, restore,
+checkpoint retention, exact legacy readers, and current facade commands retain
+their dedicated safety tests. Removed candidate windows, automatic retry/repair,
+experiments, session lifetimes, and per-save publication have no runtime delegate.
+
+`ai/provider_error.go` remains: its small typed HTTP error is used by retained
+transport failure handling. It is not an old scheduler or provider interface.
+
+## Surface removal completed
+
+The CLI now uses direct Local/Intent and imperative/conventional choices. Reviewed
+settings apply synchronously to the exact immutable revision; saving a draft still
+requires review before activation. Setup and config editing do not test a provider
+unless the user chooses the connection test. Local ignores unrelated broken
+credentials. Read-only configuration keeps legacy scope precedence without writing
+settings, creating state, or resolving credentials.
+
+Removed the old configure wizard, preset/experiment and repair options, candidate
+and replay dashboards, prompt inspection, session commands, automatic drain RPCs,
+and hidden publication aliases. `commit-all` remains only the bounded Finish
+compatibility delegate. Help presents `finish` as the publication action. Retained
+history/activity and support recovery read old records and preserve exact legacy
+provenance; they cannot start the retired engine.
+
+Legacy archive tests now protect later edits through checkpoints and still verify
+original captured bytes, native staging, HEAD, and live files. Finish CLI/worker/Git
+scenarios cover staged refusal, approved overlay, later staging, immutable targets,
+and crash recovery. The old AI cooldown/queue dashboard assertions are retired.
+
+## Integration scenario replacements
+
+The retained integration scenarios use owned subprocesses and isolated settings,
+state, repositories, and credentials. They do not upgrade the installed runtime.
+
+| Earlier scenario | Current proof |
+|---|---|
+| Adapter start/stop sessions and automatic publication | Every supported hook advances protection, saves exact file bytes, and keeps the same worker owner. Hooks remain quiet when protection is disabled or the repository is unregistered. No client/session table or branch commit is created. |
+| Live settings queue reconciliation | An in-flight Finish keeps its approved configuration. The next Finish uses the newly approved revision. Invalid approval leaves the last valid revision intact, including after worker restart. |
+| Settings wizard and provider checks on save | The actual config editor retains terminal layouts, resizing, cancellation, confirmation retry, masked credentials, and visible narrow-terminal approval. Saving a key and declining permission send no provider requests. The removed configure route has no replacement command. |
+| Sensitive tracked-file reconciliation | Finish preserves the tracked sensitive file in the branch and leaves later private worktree edits intact while publishing eligible work. |
+| Activity/explain/watch ledger | Historical decisions remain readable without schema changes. The actual activity watch streams a newly appended decision. Current Finish outcomes have separate workflow and fault coverage. |
+| Populated automatic queue startup | An isolated archived database retains all old rows while the actual worker starts and protects new bytes. Fixture registration upgrades the schema before startup; this is not evidence that `on` performs a runtime upgrade. Migration tests cover that boundary separately. |
+| Active dashboard and process lifecycle | Repository selection uses recent protection/Finish activity without writing state. Real PTY child exit, scratch self-test, session supervisor ownership/upgrade, and multi-repository admission remain covered. |
+
+Independent review restored observable hook effects and short-terminal final
+approval coverage. Exact integration checks are recorded in the Trekoon task;
+hosted Linux/macOS shards own full integration and repeated stability coverage.
+
+## Integration fault and regression replacements
+
+The fault fixtures run the source binary with isolated configuration, temporary
+repositories and an explicitly preinstalled test runtime. They use the real
+supervisor, worker, HTTP/subprocess transports and Git transactions. Fresh
+bootstrap is a separate workflow test. The macOS service shim rejects every
+host-manager call except the exact legacy-label lookup returning absent.
+
+| Retired integration file | Preserved scenario and current proof |
+|---|---|
+| `active_chain_self_heal_test.go` | Failed target stays frozen while later edits remain saved: `TestFinishFaultProviderFailureRetryKeepsFrozenTarget`; ambiguous old chains: `TestFinishMigrationLosslessRealLegacyFixtures`. |
+| `ai_providers_test.go` | Local/Intent and both styles: `TestFinishWorkflowModesStylesAndCompleteGoals`; bounded HTTP correction, timeout and subprocess failure: the named `TestFinishFault` provider cases. Private TLS and commit-inspection utilities remain shared helpers. |
+| `capture_resilience_test.go` | Original four 14–22 MB binary assets plus code/tests/docs: `TestFinishFaultLargeAssetsStayProtectedDuringProviderOutage`, including exact checkpoint blobs and native staging. |
+| `commitall_test.go` | Complete selected target and neutral work: workflow mode/style cases; refusal, approved overlay and later staging: `TestFinishFaultStagedSelectionAndLaterStaging`. CLI unit tests retain the thin compatibility delegate. |
+| `dead_branch_prune_test.go` | Deleted-branch captured versions survive activation and GC without retargeting: `TestFinishFaultDeletedLegacyBranchKeepsCapturedVersions`. Automatic stale-generation pruning is removed. |
+| `flush_logical_test.go`, `intent_flush_test.go`, `lifecycle_test.go` | Many saves and hints protect work without AI, checks or branch commits; explicit finish/off and restart are covered by workflow and fault cases. Session flush acknowledgment and lifetime assertions are removed. |
+| `intent_atomicity_test.go`, `intent_strategy_test.go` | Complete implementation/test/docs goals, intermediate trees and exact messages/order: workflow mode/style cases. Branch movement and second attachment refuse the full chain: `TestFinishFaultBranchMovementAndLinkedOwnership`. |
+| `intent_planner_normalization_test.go`, `intent_planner_recovery_test.go` | Strict full-batch validation and one combined correction: `TestFinishFaultOneCombinedCorrection`, plus the Finish planner/validator package cases. Deferred candidate queues are removed. |
+| `intent_self_healing_test.go`, `publication_self_healing_test.go` | Failed checks, provider outage and explicit frozen retry: fault cases. Old automatic retry/fallback and repair loops are removed. |
+| `intent_history_worker_test.go`, `rewrite_commits_test.go` | Explicit saved history plans preserve authors, dates, membership, per-commit trees and neutral boundaries: both `TestFinishWorkflowHistory` cases. |
+| `regressions_test.go` | Actual scanner privacy/symlink, tracked excluded deletion, unsafe Git protection, branch movement, canonical locks and process fingerprint checks are retained as named fault/watchdog cases. Repeated saves are workflow cases. Session refcounts, automatic per-save commits and empty-client termination are removed. |
+| `self_heal_test.go`, `self_heal_blocked_test.go`, `squash_backlog_recovery_test.go` | Immutable old objects, rows, linked worktrees, staging and partial checkpoints: real migration fixtures. Support recovery still proves exact archive contents without retargeting. Runtime backlog repair is removed. |
+| `self_publication_transition_test.go` | Canonical lock after state-directory movement and across linked worktrees: two `TestFinishFaultCanonicalWriter` cases. Actual prepared/post-CAS worker restart: `TestFinishFaultPreparedRestartBeforeAndAfterCAS`; old journal settlement: migration fixtures; remaining native transaction boundaries: Git publication tests. |
+| `settings_experiment_test.go` | Experiments are removed. Approved settings and frozen request scope are covered by `settings_live_reload_test.go`; saved drafts do not activate themselves. |
+
+The retained watcher tests now prove checkpoint protection at initial/runtime
+watch-budget fallback, explicit disable and ordinary fsnotify wake without a
+hook. The large ignored-tree case still creates 50,000 files, checks the real
+scanner walks fewer than 1,000 eligible entries and bounds the worker barrier.
+Hook latency still measures ten real IPC calls and proves each edit reaches a
+checkpoint without a watcher or extra barrier. The shutdown probe preserves its
+30-second bound and checks all burst files survive the final checkpoint.
+
+`reliability_recover_test.go` and the two retained `fix_consolidated_test.go`
+scenarios now invoke `support recover`/`support diagnose`. Their SQL builders
+explicitly create archived tables; production writers are not restored. They
+retain exact pair/archive membership, branch provenance, recovery refs, backups,
+index/worktree preservation and selective generated-row cleanup. The old linked
+capture self-heal assertion is covered by migration plus canonical-owner cases;
+removed `recover`/`purge` alias warnings are covered by current help assertions.
+`session_runtime_test.go` keeps child cleanup, watchdog retry/escalation, reused
+PID refusal, concurrency limits and shared ownership checks. The opt-in benchmark
+measures idle resources and later checkpoint latency while an explicit Finish
+provider call is blocked.
+
+Restart tests distinguish a running exchange from a prepared transaction. A
+running exchange becomes failed on owned-worker restart and makes no automatic
+provider call; explicit retry retains the same target. Prepared recovery resumes
+only the saved full chain and reconciles the exact approved index identity.
+Completed-client reconnection reads the durable result and creates no new commit.
+
+
+## Final CLI and test-gate closure
+
+The command tree is traced from `newRootCmd` and its current facade constructors.
+Old constructor strings do not define public help when a facade replaces them.
+`finish` is canonical; the visible first-release `commit-all` delegate retains
+`--yes` consent for the exact staged selection. Retired root session, configure,
+prompt, and publication aliases are not compatibility engines.
+
+| Earlier assertion | Retained current scenario |
+|---|---|
+| Diagnose anchor/queue/circuit/automatic-retry guidance | `TestDiagnoseLegacyFailuresRemainPreservedWithoutAutonomousReplay` retains blocked, failed, and recorded-error rows with exact original HEAD/blob provenance and unchanged database bytes. Unknown archival counts remain unknown. Current request/coverage truth is covered by `TestFinishStatus*`. |
+| Doctor automatic repair and provider credential/PATH checks | `TestDoctor_LegacyBlockedConflictRemainsPreserved` and `TestDoctor_LegacyFailedCaptureRemainsPreserved` report saved attention without mutation. `TestDoctor_AISavedIntentDoesNotReadCredentials` and `TestDoctor_AISavedSubprocessDoesNotInspectOrRunProvider` prove inspection does not read credentials or execute providers. |
+| Watcher diagnostics hidden by the checkpoint projection | `TestDoctor_JSON_FsnotifyFields` and `TestDoctor_Human_FsnotifySection` retain exact saved watch counts, dropped events, and fallback reasons in both views. |
+| Root activity, explain, logs, and rewrite help | `TestEventsErrorsAndCommandHelp`, `TestExplainValidationAndHelp`, `TestLogsCommandRegisteredWithHelp`, and `TestHistoryRewriteExplainsExplicitSavedPlanWorkflow` use current namespaces while keeping flags, privacy, and explicit saved-plan boundaries. |
+| Setup requires a provider and probes on save | `TestSetupNonInteractiveDefaultsToOfflineLocal`, `TestSetupNonTTYUsesAccessibleWizard`, and `TestFinishRemovalIntentSetupKeepsConnectionTestOptional` retain real unattended/accessible flows with Local defaults and no required Intent provider probe. `TestSetupDryRunIntentIncludesExactTransportConsents` retains exact endpoint/privacy approval. |
+| Removed stop-session deferral in a subdirectory lookup test | `TestRepoLookupCommandsCanonicalizeSubdirBeforeRegistryLookup` now passes the actual subdirectory to `off`, proves the exact registered root/state DB, and refuses disabling without a proven final checkpoint or matching runtime. Registry/state checksums and empty success output remain asserted. Successful owned-runtime off is retained in workflow integration. |
+| Missing or unregistered log remediation | `TestLogsMissingLogReturnsActionableError` and `TestLogsUnregisteredRepoReturnsActionableError` point to `acd on`; missing logs retain doctor guidance. Real tail and appended-line follow tests remain. |
+| Subprocess cleanup conflated with a one-second startup assumption | `TestFinishRemovalSubprocessCloseKillsDescendants` grants a five-second startup exchange but keeps a separate seven-second Close limit, real descendant termination, process reaping, and joined response-reader proof for both EOF behaviors. The stalled-exchange deadline test remains separate. |
+
+The broad-gate timing inventory had 1,292 compiled entrypoints across 29 packages.
+Three/four/six-shard exact-once checks covered every name. Timing weights use only
+successful top-level case results from the recorded gates; failed or timed-out
+cases never supply durations. Historical live integration measurements remain
+unchanged, and 38 names were unmeasured at that gate. New tests use the default
+estimated cost until measured. No cases,
+repetitions, or safety assertions were dropped to meet the budget. Ubuntu real
+shell integration installs and checks `zsh`.
+
+Earlier failed full gates and their focused corrections remain in Trekoon
+rather than being presented as successful checks. The final complete local gate
+passed after source corrections, measured balancing, and cleanup of identified
+orphan workers belonging only to isolated test executables. No installed runtime,
+live repository state, manual branch/index mutation, push, or release was part of
+this source execution.
+
+## Final review fixes
+
+Six material findings were resolved without restoring automatic publication.
+These nine added regression entrypoints are discovered by the current shard
+runner along with the earlier inventory; no test selector drops them.
+
+| Finding | Final implementation and retained regression |
+|---|---|
+| Directory replaced by an outside or sensitive symlink during scanning | `daemon/protection_fs_unix.go` anchors enumeration, file reads, and symlink reads beneath the opened repository, rejecting symlink ancestors. `TestFinishProtectionRejectsAncestorSymlinkSwap` proves partial coverage, readable sibling protection, no secret Git objects, and unchanged HEAD/index/live content. |
+| Symbolic or unlocked private checkpoint proof | `git/durability.go` requires direct pins before reuse and under the prepared native ref lock; `checkpoint/store.go` completes SQLite under that lock. `TestFinishPrivatePinsRejectSymbolicAliases`, `TestFinishPrivatePinRejectsPostCreateSymbolicReplacement`, `TestFinishCheckpointRecoveryRejectsSymbolicPins`, and `TestFinishCheckpointCompletionHoldsNativePinLock` retain alias, creation-race, recovery, and concurrent-mutation proof. |
+| Malformed archived identity aborts preservation of valid objects | `migration/finish_cutover.go` aggregates invalid identities while pinning independently available objects. `TestFinishLegacyMalformedIdentityPreservesValidObjectsThroughGC` proves durable attention, no completed cutover, immutable original rows, native GC survival, and unchanged HEAD/index/worktree. |
+| Retired publication-drain RPC routes | Supervisor validation and forwarding no longer accept them. `TestSupervisorRejectsRetiredPublicationRequests` rejects the routes before worker contact; the existing supported-method test covers current Finish/history methods. The first-release CLI `commit-all` delegate remains. |
+| Reachable old commands and automatic replay advice | Activity, explain, and support recovery use current commands and distinguish archived decisions from new explicit finish work. `TestExplainArchivedDecisionsUseCurrentRecoveryCommands` complements the existing read-only missing-ledger and error/help cases. Historical detector strings and excluded-cache cleanup semantics remain. |
+| Interrupted settings approval blocks later Save | A newly reviewed Save may replace the exact pending desired revision through the existing compare-and-swap. `TestFinishConfigEditorSaveSupersedesInterruptedApproval` covers first approval, pending/acknowledged requests, stale review refusal, immutable revisions, no provider probe, and applied-only Finish settings. |
+
+Independent reviewers cleared every fix. Simplify removed stale absolute scanner
+paths, centralized locked checkpoint completion, and kept migration error
+aggregation within the existing pinning flow. Focused race checks passed, followed
+by the real fresh-offline and staged-selection process cases. The complete local
+gate passed in 180.565 seconds before these fixes; only affected checks were
+repeated afterward. Hosted full integration and stress remain CI-owned.

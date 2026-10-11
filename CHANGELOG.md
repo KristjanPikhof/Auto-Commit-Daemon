@@ -4,60 +4,75 @@
 
 ### Added
 
-- `acd history rewrite --new-branch NAME` rebuilds selected linear history from
-  exact recorded file versions. The worker verifies each proposed commit while
-  newer edits keep entering checkpoints. The source branch and staging stay intact.
-- Optional history repair reviews up to five recent private ACD commits with
-  generic, filename-only, or malformed messages. It records split-goal lineage and
-  skips unchanged evidence.
+- `acd finish [PURPOSE]` freezes a fresh complete checkpoint, checks the whole
+  proposed chain privately, and publishes through one branch update.
+- Finish supports exact messages, checked previews, explicit staged consent,
+  durable request progress, reconnect, and retry of the same frozen target.
+- Local finish works offline as one complete batch. Intent plans completed goals
+  with one provider call and at most one correction within a persisted deadline.
 
 ### Changed
 
-- `commit-all` interrupts background planning for an immediate goal review,
-  preserving purposeful commit boundaries and publication checks.
-- Intent reviews use recorded implementation, tests, imports, command registration,
-  and documentation references across planning windows. Current work gets evidence
-  space before published context, with 64 KiB per capture and 256 KiB per review.
-- Schema v30 records split repair lineage without replacing earlier mappings.
-- Remove unused planning helpers and command wrappers. Parse recorded TypeScript
-  declarations once per file and reuse them during published-support reviews.
+- File edits, hooks, idle time, and shutdown save checkpoints without AI,
+  credentials, project checks, or new publication. Startup can settle a previously
+  authorized prepared mutation only from its exact saved proof. `acd off` saves
+  a final checkpoint.
+- Fresh installations use Local mode and imperative messages. Explicit Intent,
+  message styles, privacy, and verification choices survive upgrade; legacy Event
+  settings become Local batches.
+- Remove continuous replay, waiting candidates, drains, automatic history repair,
+  fallback publication, experiments, and their obsolete settings and command aliases.
+  The first-release `commit-all` compatibility command delegates only to finish.
+- Settings Save/Apply is reviewed and synchronous without a provider probe.
+  Connection tests remain separate explicit actions.
+- History rewrite shares the completed-goal model, retains saved-plan review and
+  apply, authors and exact versions, and supports offline Local rewriting.
+- Status, list, history, doctor, and diagnostics distinguish saved work, branch
+  commits, recovery preservation, active requests, and required user action.
 
 ### Fixed
 
-- Give setup's isolated self-test meaningful documentation goals so Intent can
-  publish it, then verify that restore and undo preserve the expected file contents.
-- Build and test with Go 1.26.9 to include the standard-library security fixes.
-- Recover background queues that exceed the goal window after repeated edits to
-  one file. Preserve the captured versions, then recapture current work so
-  semantic publication can resume.
-- Reject history goals that combine different authors during planning and saved
-  plan validation. Give the planner author boundaries and a correction retry.
-- Keep available implementation, test corrections, callers, and documentation
-  together. Rebuild stale or overlapping groups while preserving valid goals,
-  capture ownership, and prerequisite order. Published goals can supply context
-  for later corrections but cannot absorb new work.
-- Require evidence for missing companions. Published support must match the current
-  branch; omitted captures stay waiting. A small frozen target is reviewed together,
-  while later explanatory Go comments can clarify it only if code tokens match.
-- Retry rejected goals and provider waits after five minutes, ten minutes, then
-  hourly. Restarts preserve deadlines; transport failures do not consume semantic
-  attempts. Cached waits receive another review instead of blocking indefinitely.
-- Resume protected runs stopped by stale dependency declarations, expanded review
-  windows, or an oversized fallback during an AI outage. Recovery lookups stay
-  bounded, and branch, checkpoint, ownership, and verification checks still apply.
-- Prove Swift blank-line cleanup locally from complete recorded files, including
-  history reconstruction. Other edits retain normal goal checks.
-- Reconstruct large generated changes from their exact versions while bounding
-  provider evidence. Correction retries identify conflicting capture assignments.
-- Keep `commit-all` attached to its own run when a newer publication starts.
-  Status and list distinguish provider waits, frozen-target progress, checkpoint
-  scans, and transient reads, and stay responsive with large capture histories.
-- Honor explicit checkpoint deadlines and preserve verification command output,
-  exit status, and descendant cleanup.
-- Explicit archive recovery preserves the entire unpublished chain, including
-  pending-only queues, before recapturing work. Previews show stopped runs, and
-  JSON reports actual changes without claiming that previews or no-ops applied fixes.
+- Accept complete finish and history diff evidence up to 512 KiB and individual
+  path diffs up to 128 KiB. Keep serialized provider requests bounded to 512 KiB.
+- Require Go 1.26.9 or later for the standard-library security fixes.
 - Exclude compiler index caches under `-Xcc/` from capture and watching.
+- Honor checkpoint deadlines and retain project command output, exit status, and
+  descendant cleanup during verification.
+- Preserve live worktree files, the native index, excluded tracked entries, and
+  submodule entries while building and publishing an explicit finish target.
+- Keep later edits protected and outside accepted requests. Worker restarts fail
+  interrupted planning retryably and recover prepared publication only from exact
+  saved branch/index evidence without another provider request.
+- Preserve legacy captured versions and immutable migration/retention provenance.
+  Read-only commands do not activate migrations or consult providers.
+- Batch legacy object and private-ref checks during upgrades and worker startup,
+  so large saved histories do not delay checkpoint protection with one Git
+  transaction per archived commit.
+- Reuse immutable legacy commit pins when later checkpoints change the inventory,
+  while retaining each manifest's exact snapshot and provenance.
+- Read original commit IDs from saved rewrite group members during upgrades,
+  instead of treating each member's JSON object as a commit ID.
+- Keep a healthy worker running when `acd on` is repeated, and wait for the
+  selected worktree's worker to become ready before confirming protection.
+- Leave the last completed `acd list` dashboard visible after Ctrl-C.
+- Keep lengthy legacy errors out of routine human status output. Full evidence
+  remains in JSON diagnostics.
+- Separate legacy archive attention from current protection, finish publication,
+  and history rewrite. Rewriting reads the selected current Git commits;
+  prepared finish recovery uses its own exact publication proof.
+- Make purge uninstall include verified new checkpoints and remove owned ACD
+  runtime files, repository state, and private archives across registered worktrees.
+  Preserve project Git history, staging, and live files; report unavailable targets.
+- Reject symlink ancestors during scans, including directories replaced between
+  enumeration and reading, while saving readable siblings in partial checkpoints.
+- Reject symbolic private pins and hold Git's native ref lock through checkpoint
+  completion. Preserve valid legacy objects even when another archived ID is malformed.
+- Allow a newly reviewed settings Save to replace interrupted approval without
+  using pending settings or accepting a stale review.
+- Remove obsolete drain RPC routes and use current commands in archived recovery
+  guidance.
+- Replace retired test fixtures with real protection and explicit-finish scenarios,
+  use observable lifecycle milestones, and balance the retained local/hosted lanes.
 
 ## v2026-10-04
 
