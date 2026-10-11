@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestCompatibilityLifecycleRequiresExplicitSession(t *testing.T) {
+func TestCompatibilityLifecycleRejectsRetiredCommandsWithoutState(t *testing.T) {
 	withIsolatedHome(t)
 	repo := initRepoForRepoLifecycle(t)
 	for _, command := range []string{"start", "stop"} {

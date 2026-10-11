@@ -2,30 +2,17 @@ package state
 
 import (
 	"context"
-
+	"fmt"
 	"testing"
 	"time"
 )
 
-// TestPendingEvents_DoesNotBlockHeartbeat asserts that PendingEvents reads
-// flow through the multi-connection read pool, so a long-running write
-// transaction holding the serialized writer connection cannot starve them.
-//
-// Before the read-pool routing fix, PendingEvents queried d.conn (writer
-// pool, MaxOpenConns=1). A replay drain holding a write tx would block the
-// heartbeat loop's PendingEvents call indefinitely.
-func TestPendingEvents_DoesNotBlockHeartbeat(t *testing.T) {
+// Finish status remains readable while an unrelated transaction holds the writer.
+func TestLoadFinishRequestDoesNotBlockBehindWriter(t *testing.T) {
 	t.Parallel()
-	d, _ := openLegacyTestDB(t)
+	d, _ := openTestDB(t)
 	ctx := context.Background()
-
-	// Seed one pending event so PendingEvents has something to scan.
-	if _, err := fixtureAppendCaptureEvent(ctx, d, CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: "deadbeef",
-		Operation: "create", Path: "f.txt", Fidelity: "exact",
-	}, nil); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	request := startFinishFixture(t, d, finishFixture(t, d, 1))
 
 	// Hold the writer connection inside a long transaction. SQLite WAL
 	// permits readers to keep working; the writer pool MaxOpenConns=1 means
@@ -45,33 +32,19 @@ func TestPendingEvents_DoesNotBlockHeartbeat(t *testing.T) {
 	go func() {
 		readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
-		_, err := PendingEvents(readCtx, d, 10)
+		loaded, err := LoadFinishRequest(readCtx, d, request.ID)
+		if err == nil && (loaded.ID != request.ID || loaded.State != FinishRunning) {
+			err = fmt.Errorf("finish request unavailable under writer hold: %+v", loaded)
+		}
 		done <- err
 	}()
 
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("PendingEvents under writer-hold: %v", err)
+			t.Fatalf("LoadFinishRequest under writer-hold: %v", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("PendingEvents blocked behind held writer tx — read pool not in use")
+		t.Fatal("LoadFinishRequest blocked behind held writer tx — read pool not in use")
 	}
-
-}
-
-// TestSchemaMigrate_AddsFlushRequestsIndex confirms the v4 schema bump
-// installs the (status, id) index that keeps ClaimNextFlushRequest off a
-// full-table scan after long uptime.
-func containsAny(s string, needles ...string) bool {
-	for _, n := range needles {
-		if n != "" && len(s) >= len(n) {
-			for i := 0; i+len(n) <= len(s); i++ {
-				if s[i:i+len(n)] == n {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }

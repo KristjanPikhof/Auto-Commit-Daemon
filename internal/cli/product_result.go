@@ -211,13 +211,6 @@ func publicationOutcomeLabel(outcome publicationOutcome, progress publicationPro
 		return "saved changes waiting for grouping"
 	}
 	if outcome.WaitingChanges > 0 {
-		if outcome.ReasonCode == "provider_wait" {
-			label := fmt.Sprintf("%d changes waiting for AI", outcome.WaitingChanges)
-			if outcome.RetryAt > 0 {
-				label += "; retry at " + time.Unix(int64(outcome.RetryAt), 0).Format(time.RFC3339)
-			}
-			return label
-		}
 		return fmt.Sprintf("%d changes waiting (%s)", outcome.WaitingChanges, publicationProgressPhaseLabel(progress))
 	}
 	if *outcome.BranchCommitted {

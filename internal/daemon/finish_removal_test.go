@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,27 +13,16 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 type externalRepairBridgeFixture struct {
-	capture         *captureFixture
-	source          string
-	target          string
-	live            string
-	pendingSeqs     []int64
-	drainEventCount int
-	repairCommits   map[int64]string
-}
-type externalRepairBridgeFixtureOptions struct {
-	includeUnownedPath bool
-	omitRestoredPath   bool
-	includePriorRepair bool
+	capture     *captureFixture
+	source      string
+	pendingSeqs []int64
 }
 
-func newExternalRepairBridgeFixture(
-	t *testing.T,
-	opts externalRepairBridgeFixtureOptions,
-) externalRepairBridgeFixture {
+func newExternalRepairBridgeFixture(t *testing.T) externalRepairBridgeFixture {
 	t.Helper()
 	f := newCaptureFixture(t)
 	ctx := context.Background()
@@ -55,46 +43,15 @@ func newExternalRepairBridgeFixture(
 	publishedFinal := blob("published suffix\n")
 	laterBlob := blob("later external work\n")
 	laterPending := blob("pending changed by later commit\n")
-	unownedBlob := blob("unowned target work\n")
-	priorOld := blob("prior repair old\n")
-	priorFinal := blob("prior repair final\n")
 
 	preRepair := commitTreeWithIndexUpdates(t, ctx, f, f.cctx.BaseHead, "pre-repair",
 		git.RegularFileMode+" "+pendingOld+"\tpending.txt",
-		git.RegularFileMode+" "+restoredOld+"\trestored.txt",
-		git.RegularFileMode+" "+priorOld+"\tprior.txt")
+		git.RegularFileMode+" "+restoredOld+"\trestored.txt")
 	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, preRepair, f.cctx.BaseHead); err != nil {
 		t.Fatalf("install pre-repair head: %v", err)
 	}
 	f.cctx.BaseHead = preRepair
-	repairEvents := make([]int64, 0, 3)
-	repairCommits := make(map[int64]string)
-	if opts.includePriorRepair {
-		priorEvent := appendRecoveryEvent(t, ctx, f, preRepair, state.CaptureOp{
-			Op: "modify", Path: "prior.txt",
-			BeforeOID: oidValue(priorOld), BeforeMode: oidValue(git.RegularFileMode),
-			AfterOID: oidValue(priorFinal), AfterMode: oidValue(git.RegularFileMode),
-		})
-		priorCommit := commitTreeWithIndexUpdates(
-			t, ctx, f, preRepair, "prior completed repair",
-			git.RegularFileMode+" "+priorFinal+"\tprior.txt")
-		if err := testutil.SeedLegacyCaptureOutcome(
-			ctx, f.db, priorEvent, state.EventStatePublished,
-			oidValue(priorCommit), sql.NullString{}, sql.NullString{}, 1); err != nil {
-			t.Fatalf("mark prior repair member published: %v", err)
-		}
-		seedCompletedExternalBridgeRepair(
-			t, ctx, f, "external-prior-repair", "external-prior-candidate",
-			preRepair, priorCommit, []int64{priorEvent})
-		if err := git.UpdateRef(
-			ctx, f.dir, f.cctx.BranchRef, priorCommit, preRepair); err != nil {
-			t.Fatalf("install prior repair head: %v", err)
-		}
-		preRepair = priorCommit
-		f.cctx.BaseHead = priorCommit
-		repairEvents = append(repairEvents, priorEvent)
-		repairCommits[priorEvent] = priorCommit
-	}
+	repairEvents := make([]int64, 0, 2)
 
 	repairPending := appendRecoveryEvent(t, ctx, f, preRepair, state.CaptureOp{
 		Op: "modify", Path: "pending.txt",
@@ -125,8 +82,6 @@ func newExternalRepairBridgeFixture(
 		t.Fatalf("install repair head: %v", err)
 	}
 	repairEvents = append(repairEvents, repairPending, repairRestored)
-	repairCommits[repairPending] = repairCommit
-	repairCommits[repairRestored] = repairCommit
 	publishedSuffix := appendRecoveryEvent(t, ctx, f, repairCommit, state.CaptureOp{
 		Op: "create", Path: "published.txt",
 		AfterOID: oidValue(publishedFinal), AfterMode: oidValue(git.RegularFileMode),
@@ -139,10 +94,7 @@ func newExternalRepairBridgeFixture(
 		git.RegularFileMode + " " + restoredOld + "\trestored.txt",
 		git.RegularFileMode + " " + publishedFinal + "\tpublished.txt",
 	}
-	if opts.includePriorRepair {
-		sourceUpdates = append(sourceUpdates,
-			git.RegularFileMode+" "+priorOld+"\tprior.txt")
-	}
+
 	source := commitTreeWithIndexUpdates(
 		t, ctx, f, repairCommit, "stale source", sourceUpdates...)
 	if err := git.UpdateRef(ctx, f.dir, f.cctx.BranchRef, source, repairCommit); err != nil {
@@ -175,19 +127,9 @@ func newExternalRepairBridgeFixture(
 	targetUpdates := []string{
 		git.RegularFileMode + " " + pendingFinal + "\tpending.txt",
 		git.RegularFileMode + " " + notesFinal + "\tnotes.txt",
+		git.RegularFileMode + " " + restoredFinal + "\trestored.txt",
 	}
-	if !opts.omitRestoredPath {
-		targetUpdates = append(targetUpdates,
-			git.RegularFileMode+" "+restoredFinal+"\trestored.txt")
-	}
-	if opts.includePriorRepair {
-		targetUpdates = append(targetUpdates,
-			git.RegularFileMode+" "+priorFinal+"\tprior.txt")
-	}
-	if opts.includeUnownedPath {
-		targetUpdates = append(targetUpdates,
-			git.RegularFileMode+" "+unownedBlob+"\tunowned.txt")
-	}
+
 	target := commitTreeWithIndexUpdates(
 		t, ctx, f, source, "external target", targetUpdates...)
 	live := commitTreeWithIndexUpdates(t, ctx, f, target, "later external work",
@@ -200,9 +142,8 @@ func newExternalRepairBridgeFixture(
 		t.Fatalf("reset isolated fixture to live descendant: %v", err)
 	}
 	return externalRepairBridgeFixture{
-		capture: f, source: source, target: target, live: live,
-		pendingSeqs: pendingSeqs, drainEventCount: len(drainSeqs),
-		repairCommits: repairCommits,
+		capture: f, source: source,
+		pendingSeqs: pendingSeqs,
 	}
 }
 func seedCompletedExternalBridgePublication(
@@ -492,7 +433,7 @@ func TestFinishRemovalEmptyLegacyClientsKeepProtectionRunning(t *testing.T) {
 }
 
 func TestFinishRemovalLegacyBridgeRequiresActivationWithoutMutation(t *testing.T) {
-	f := newExternalRepairBridgeFixture(t, externalRepairBridgeFixtureOptions{})
+	f := newExternalRepairBridgeFixture(t)
 	ctx := context.Background()
 	opts := RecoveryReconcileOptions{GitDir: f.capture.gitDir, BranchRef: f.capture.cctx.BranchRef, BranchGeneration: f.capture.cctx.BranchGeneration, FirstSeq: f.pendingSeqs[0], ExternalParentHead: f.source}
 	refs := gitRawOutput(t, ctx, f.capture.dir, "show-ref")

@@ -96,8 +96,6 @@ func TestFinishFaultCanonicalWriterAcrossLinkedWorktree(t *testing.T) {
 	}
 }
 
-// startDaemon is shared scaffolding: `acd start` + wait for mode=running.
-// Returns the parsed JSON for follow-up assertions.
 // sqliteScalar runs `sqlite3 db -- "SELECT ..."` and returns the trimmed
 // stdout. Failures fail the test (these are pure read-only probes).
 func sqliteScalar(t *testing.T, dbPath, query string) string {

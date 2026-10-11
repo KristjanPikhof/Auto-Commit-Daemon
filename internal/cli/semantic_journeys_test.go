@@ -93,23 +93,3 @@ func TestRestoreWithoutIDDoesNotApplyOutsideTerminal(t *testing.T) {
 		t.Fatal("nonterminal restore changed state")
 	}
 }
-
-func TestCompactStatusSeparatesAIWaitAndRecovery(t *testing.T) {
-	committed := false
-	var out bytes.Buffer
-	err := renderProductEnvelope(&out, productEnvelope{State: productStateWaiting, Data: productStatusData{
-		Enabled: true, Protected: true,
-		PublicationOutcome: publicationOutcome{BranchCommitted: &committed, WaitingChanges: 3, RecoveredChanges: 2, ReasonCode: "provider_wait"},
-	}}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range []string{"Protection: on", "Last observed work saved: yes", "Branch commits: 3 changes waiting for AI", "Recovery: 2 changes saved separately", "Next: No action needed."} {
-		if !strings.Contains(out.String(), line) {
-			t.Fatalf("missing %q: %s", line, &out)
-		}
-	}
-	if strings.Contains(out.String(), "Worker liveness") || strings.Contains(out.String(), "Published to Git") {
-		t.Fatalf("default status contains obsolete/detail output: %s", &out)
-	}
-}
