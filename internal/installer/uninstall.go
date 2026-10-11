@@ -219,7 +219,6 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 	if err != nil {
 		return Result{}, err
 	}
-	sessionStarted := false
 	forceNeedsAction := false
 	var purgeTxn *purgeTransaction
 	rollback := func(cause error) error {
@@ -227,13 +226,9 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 		if purgeTxn != nil {
 			purgeErr = purgeTxn.rollback(context.Background())
 		}
-		var sessionErr error
-		if sessionStarted && !plan.PriorService.SessionLoaded {
-			sessionErr = shutdownSupervisor(context.Background(), roots)
-		}
 		fileErr := restoreFiles(backups)
 		serviceErr := restoreServiceState(context.Background(), roots, executor, plan.Service, plan.PriorService)
-		rollbackErr := errors.Join(purgeErr, sessionErr, fileErr, serviceErr)
+		rollbackErr := errors.Join(purgeErr, fileErr, serviceErr)
 		if forceNeedsAction || rollbackErr != nil || errors.Is(cause, errPostMutationProof) || errors.Is(cause, gitpkg.ErrPrivateRefDeleteOutcomeUnknown) {
 			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "uninstall rollback or shutdown needs attention", true)
 		} else {
@@ -254,16 +249,26 @@ func ApplyUninstall(ctx context.Context, roots paths.Roots, plan UninstallPlan, 
 	if err := refuseLiveUninstallPublication(ctx, plan.Registry); err != nil {
 		return Result{}, rollback(err)
 	}
-	if plan.Service.Platform == "session" {
-		if err := supervisor.EnsureSession(ctx, roots, plan.Service.Binary, plan.Service.LogPath); err != nil {
-			return Result{}, rollback(err)
-		}
-		sessionStarted = true
-	}
 	client := supervisor.Client{SocketPath: roots.SupervisorSocketPath(), Timeout: supervisor.CheckpointBarrierTimeout}
 	for _, record := range plan.Registry.Repos {
 		if record.LifecycleDisabled() || uninstallTargetUnavailable(plan, record.Path) {
 			continue
+		}
+		wt, err := gitpkg.ResolveWorktree(ctx, record.Path)
+		if err != nil {
+			return Result{}, rollback(err)
+		}
+		// A stopped repository must stay stopped, especially when it has a
+		// prepared finish. The canonical lock proves no worker needs a barrier.
+		lock, err := daemon.AcquireDaemonLock(wt.GitDir)
+		if err == nil {
+			if err := lock.Release(); err != nil {
+				return Result{}, rollback(err)
+			}
+			continue
+		}
+		if !errors.Is(err, daemon.ErrDaemonLockHeld) {
+			return Result{}, rollback(err)
 		}
 		if err := waitSupervisorWorkersReady(ctx, roots, map[string]bool{record.RepositoryID: true}, 15*time.Minute, nil); err != nil {
 			return Result{}, rollback(fmt.Errorf("uninstall: wait for protected repository worker: %w", err))

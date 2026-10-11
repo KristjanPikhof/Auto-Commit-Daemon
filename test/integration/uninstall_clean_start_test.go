@@ -19,12 +19,14 @@ import (
 )
 
 func TestUninstallCleanStartPreservesProjectHistoryAndWork(t *testing.T) {
-	for _, scenario := range []string{"running-capture", "stopped-prepared-finish"} {
-		t.Run(scenario, func(t *testing.T) { testUninstallCleanStart(t, scenario == "stopped-prepared-finish") })
+	for _, scenario := range []string{"running-capture", "stopped-capture", "stopped-prepared-finish"} {
+		t.Run(scenario, func(t *testing.T) {
+			testUninstallCleanStart(t, scenario != "running-capture", scenario == "stopped-prepared-finish")
+		})
 	}
 }
 
-func testUninstallCleanStart(t *testing.T, stoppedPrepared bool) {
+func testUninstallCleanStart(t *testing.T, stopped, prepared bool) {
 	t.Helper()
 	f := newFinishFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
@@ -46,12 +48,16 @@ func testUninstallCleanStart(t *testing.T, stoppedPrepared bool) {
 	if err := os.Link(f.Bin, launcher); err != nil {
 		t.Fatal(err)
 	}
-	if stoppedPrepared {
-		prepareStoppedUninstallFinish(t, ctx, f)
+	// Finish protecting fixture setup before reviewing the purge inventory.
+	// A private ref still being prepared is not completed checkpoint proof.
+	f.Barrier(t, ctx)
+	if stopped {
+		prepareStoppedUninstallFinish(t, ctx, f, prepared)
 	}
 	var preview struct {
 		Data struct{ Digest string }
 	}
+	t.Log("Preview uninstall --dry-run --purge-data")
 	finishDecodeJSON(t, runAcd(t, ctx, f.Env, "uninstall", "--dry-run", "--purge-data", "--json"), &preview)
 	if preview.Data.Digest == "" {
 		t.Fatal("purge preview did not provide a review identity")
@@ -60,9 +66,10 @@ func testUninstallCleanStart(t *testing.T, stoppedPrepared bool) {
 	// extend the deletion inventory; final barrier/stop checkpoints must too.
 	currentPath := filepath.Join(f.Repo, "current-work.txt")
 	writeFile(t, currentPath, "latest uncommitted work\n")
-	if !stoppedPrepared {
+	if !stopped {
 		f.Barrier(t, ctx)
 	}
+	t.Log("Apply uninstall --purge-data with the reviewed plan")
 	result := runAcd(t, ctx, f.Env, "uninstall", "--purge-data", "--confirm-purge-data", "--yes", "--non-interactive", "--expect-plan", preview.Data.Digest, "--json")
 	var applied struct{ OK bool }
 	finishDecodeJSON(t, result, &applied)
@@ -95,7 +102,7 @@ func testUninstallCleanStart(t *testing.T, stoppedPrepared bool) {
 	}
 }
 
-func prepareStoppedUninstallFinish(t *testing.T, ctx context.Context, f *finishFixture) {
+func prepareStoppedUninstallFinish(t *testing.T, ctx context.Context, f *finishFixture, prepared bool) {
 	t.Helper()
 	status, err := checkpointRuntimeStatus(ctx, f.Roots)
 	if err != nil {
@@ -106,6 +113,9 @@ func prepareStoppedUninstallFinish(t *testing.T, ctx context.Context, f *finishF
 		t.Fatal(err)
 	}
 	shutdownCheckpointRuntime(t, f.Roots, supervisor.WorkerSocketPath(f.Roots, f.RepositoryID), process)
+	if !prepared {
+		return
+	}
 	db, err := state.Open(ctx, f.DBPath)
 	if err != nil {
 		t.Fatal(err)

@@ -211,6 +211,8 @@ acd uninstall
 
 Default uninstall preserves repository databases and private refs. Removing
 protected data requires a separate purge review and explicit confirmation.
+Running workers save a final checkpoint before stopping. Repositories that
+are already stopped stay stopped; uninstall does not resume a prepared finish.
 
 To start clean across registered worktrees:
 

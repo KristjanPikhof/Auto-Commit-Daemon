@@ -36,6 +36,8 @@
 
 ### Fixed
 
+- Keep stopped repositories stopped during uninstall instead of waiting for
+  absent workers or restarting a prepared finish.
 - Ask for a missing API key before saving Intent settings for an OpenAI-compatible
   provider. Setup previews distinguish required, reused, and newly entered
   credentials; upgrades reject first-setup flags instead of silently ignoring them.

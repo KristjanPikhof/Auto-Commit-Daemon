@@ -56,7 +56,9 @@ func TestStartFromPopulatedStateReachesFirstHeartbeat(t *testing.T) {
 		}
 	}
 	sql.WriteString("COMMIT;")
-	if out, err := exec.Command("sqlite3", dbPath, sql.String()).CombinedOutput(); err != nil {
+	seed := exec.CommandContext(ctx, "sqlite3", dbPath)
+	seed.Stdin = strings.NewReader(sql.String())
+	if out, err := seed.CombinedOutput(); err != nil {
 		t.Fatalf("seed %v %s", err, out)
 	}
 	before := sqliteScalar(t, dbPath, "SELECT COUNT(*) || '|' || (SELECT COUNT(*) FROM daemon_clients) || '|' || (SELECT COUNT(*) FROM shadow_paths) FROM flush_requests")
