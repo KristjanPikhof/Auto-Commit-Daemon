@@ -3,6 +3,7 @@ package checkpoint
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -173,4 +174,97 @@ func preparedCheckpointFixture(t *testing.T, ctx context.Context, repo string, d
 		t.Fatal(err)
 	}
 	return checkpoint
+}
+
+func TestFinishCheckpointRecoveryRejectsSymbolicPins(t *testing.T) {
+	for _, dangling := range []bool{false, true} {
+		t.Run(map[bool]string{false: "same-OID", true: "dangling"}[dangling], func(t *testing.T) {
+			ctx := context.Background()
+			repo, db := checkpointFixture(t, ctx)
+			cp := preparedCheckpointFixture(t, ctx, repo, db, "cp-1786061000003-0123456789abcdef", "op-alias")
+			target := "refs/acd/alias-target"
+			if !dangling {
+				if err := gitpkg.UpdateRef(ctx, repo, target, cp.CommitOID, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "symbolic-ref", cp.Ref, target); err != nil {
+				t.Fatal(err)
+			}
+			if err := (Store{DB: db}).RecoverPrepared(ctx, repo); !errors.Is(err, gitpkg.ErrCheckpointRefCollision) {
+				t.Fatalf("symbolic recovery error=%v", err)
+			}
+			projection, err := state.ReadCheckpointProjection(ctx, db.Path(), 10)
+			if err != nil || projection.Completed != 0 || projection.NeedsAction != 1 {
+				t.Fatalf("false completed coverage: %+v error=%v", projection, err)
+			}
+			if out, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "symbolic-ref", "--no-recurse", cp.Ref); err != nil || strings.TrimSpace(string(out)) != target {
+				t.Fatalf("ambiguous alias changed: %q error=%v", out, err)
+			}
+		})
+	}
+}
+
+func TestFinishCheckpointCompletionHoldsNativePinLock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	repo, db := checkpointFixture(t, ctx)
+	cp := preparedCheckpointFixture(t, ctx, repo, db, "cp-1786061000004-0123456789abcdef", "op-locked-complete")
+	if _, err := gitpkg.EnsureCheckpointRef(ctx, repo, cp.Ref, cp.CommitOID); err != nil {
+		t.Fatal(err)
+	}
+	// Hold SQLite's writer so completion remains inside its lock-held callback.
+	// This exercises the same completion function used by Create and recovery.
+	tx, err := db.SQL().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "INSERT INTO daemon_meta(key,value,updated_ts) VALUES('test.pin.writer','held',1)"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- (Store{DB: db}).complete(ctx, repo, cp, 0) }()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	lockPath := filepath.Join(repo, ".git", cp.Ref+".lock")
+	for {
+		if _, err := os.Stat(lockPath); err == nil {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("completion ended before native lock: %v", err)
+		case <-ctx.Done():
+			t.Fatal("completion did not acquire native pin lock")
+		case <-ticker.C:
+		}
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "symbolic-ref", cp.Ref, "refs/acd/alias-target"); err == nil {
+		t.Fatal("concurrent symbolic replacement succeeded during SQL completion")
+	}
+	if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "update-ref", "--no-deref", "-d", cp.Ref, cp.CommitOID); err == nil {
+		t.Fatal("concurrent deletion succeeded during SQL completion")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("completion did not finish after releasing SQLite writer")
+	}
+	projection, err := state.ReadCheckpointProjection(ctx, db.Path(), 10)
+	if err != nil || projection.Completed != 1 || projection.Prepared != 0 {
+		t.Fatalf("completed projection=%+v error=%v", projection, err)
+	}
+	if got, err := gitpkg.RevParse(ctx, repo, cp.Ref); err != nil || got != cp.CommitOID {
+		t.Fatalf("completed pin=%q error=%v", got, err)
+	}
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("native lock retained after completion: %v", err)
+	}
 }

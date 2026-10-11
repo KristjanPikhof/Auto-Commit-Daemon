@@ -139,13 +139,9 @@ func (s Store) Create(ctx context.Context, request Request) (Result, error) {
 	}
 	created, err := gitpkg.EnsureCheckpointRef(ctx, request.RepoRoot, checkpointRef, commitOID)
 	if err != nil {
-		if errors.Is(err, gitpkg.ErrCheckpointRefCollision) {
-			_ = state.MarkCheckpointNeedsAction(context.Background(), s.DB, id,
-				"checkpoint ref points at an unexpected object")
-		}
-		return Result{}, fmt.Errorf("checkpoint: create private ref: %w", err)
+		return Result{}, s.pinError(id, err)
 	}
-	if err := state.CompleteCheckpoint(ctx, s.DB, id, checkpointRef, commitOID,
+	if err := s.complete(ctx, request.RepoRoot, checkpoint,
 		float64(time.Now().UnixNano())/float64(time.Second)); err != nil {
 		return Result{}, fmt.Errorf("checkpoint: complete state: %w", err)
 	}
@@ -170,33 +166,35 @@ func (s Store) RecoverPrepared(ctx context.Context, repoRoot string) error {
 		if checkpoint.Phase == state.CheckpointNeedsAction {
 			continue
 		}
-		observed, err := gitpkg.RevParse(ctx, repoRoot, checkpoint.Ref)
-		switch {
-		case err == nil && observed == checkpoint.CommitOID:
-			if err := state.CompleteCheckpoint(ctx, s.DB, checkpoint.ID,
-				checkpoint.Ref, checkpoint.CommitOID, 0); err != nil {
-				return fmt.Errorf("checkpoint: recover exact ref %s: %w", checkpoint.ID, err)
-			}
-		case err == nil:
-			if markErr := state.MarkCheckpointNeedsAction(context.Background(), s.DB,
-				checkpoint.ID, "checkpoint ref points at an unexpected object"); markErr != nil {
-				return fmt.Errorf("checkpoint: mark ambiguous ref %s: %w", checkpoint.ID, markErr)
-			}
-			return fmt.Errorf("checkpoint: %w: %s points at %s, want %s",
-				gitpkg.ErrCheckpointRefCollision, checkpoint.Ref, observed, checkpoint.CommitOID)
-		case errors.Is(err, gitpkg.ErrRefNotFound):
-			if _, err := gitpkg.EnsureCheckpointRef(ctx, repoRoot, checkpoint.Ref, checkpoint.CommitOID); err != nil {
-				return fmt.Errorf("checkpoint: recreate ref %s: %w", checkpoint.ID, err)
-			}
-			if err := state.CompleteCheckpoint(ctx, s.DB, checkpoint.ID,
-				checkpoint.Ref, checkpoint.CommitOID, 0); err != nil {
-				return fmt.Errorf("checkpoint: complete recreated ref %s: %w", checkpoint.ID, err)
-			}
-		default:
-			return fmt.Errorf("checkpoint: inspect prepared ref %s: %w", checkpoint.ID, err)
+		if _, err := gitpkg.EnsureCheckpointRef(ctx, repoRoot, checkpoint.Ref, checkpoint.CommitOID); err != nil {
+			return s.pinError(checkpoint.ID, err)
+		}
+		if err := s.complete(ctx, repoRoot, checkpoint, 0); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// Complete SQLite only while Git proves and locks the exact direct pin.
+func (s Store) complete(ctx context.Context, repoRoot string, checkpoint state.Checkpoint, completedTS float64) error {
+	err := gitpkg.WithLockedPrivateRef(ctx, repoRoot, checkpoint.Ref, checkpoint.CommitOID, func(lockedCtx context.Context) error {
+		return state.CompleteCheckpoint(lockedCtx, s.DB, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, completedTS)
+	})
+	return s.pinError(checkpoint.ID, err)
+}
+
+func (s Store) pinError(id string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, gitpkg.ErrCheckpointRefCollision) {
+		if markErr := state.MarkCheckpointNeedsAction(context.Background(), s.DB, id,
+			"checkpoint ref is symbolic or points at an unexpected object"); markErr != nil {
+			return fmt.Errorf("checkpoint: mark ambiguous pin %s: %w (pin error: %v)", id, markErr, err)
+		}
+	}
+	return fmt.Errorf("checkpoint: prove private pin %s: %w", id, err)
 }
 
 // NewID returns the public checkpoint identifier format.
