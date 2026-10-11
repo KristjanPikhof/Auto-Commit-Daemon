@@ -121,8 +121,6 @@ func TranslateLegacyEnvironment(lookup func(string) (string, bool)) func(string)
 // layer. Scopes are ordered from repository to profile to global, excluding
 // scopes omitted when inspecting inherited settings. Values remain below all
 // authored and environment overrides; they never grant provider consent.
-// Explicit setup must materialize effective persisted values before calling
-// RetireLegacyFinishDefaults. Loading or inspecting settings never does either.
 func LegacyFinishDefaults(doc *Document, scopes []string, lookup func(string) (string, bool)) Overrides {
 	if doc == nil {
 		return nil
@@ -172,28 +170,4 @@ func LegacyFinishDefaults(doc *Document, scopes []string, lookup func(string) (s
 		}
 	}
 	return values
-}
-
-// RetireLegacyFinishDefaults marks the fallback inactive while keeping all
-// archived provenance. Call only inside the explicit setup write transaction,
-// after materializing effective values for every authored scope.
-func RetireLegacyFinishDefaults(doc *Document) error {
-	if doc == nil {
-		return fmt.Errorf("acd config: nil document")
-	}
-	raw, exists := doc.Extra["legacy_finish_settings"]
-	if !exists {
-		return nil
-	}
-	var archive map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &archive); err != nil {
-		return fmt.Errorf("acd config: decode legacy finish settings: %w", err)
-	}
-	archive["retired"] = json.RawMessage(`true`)
-	body, err := json.Marshal(archive)
-	if err != nil {
-		return err
-	}
-	doc.Extra["legacy_finish_settings"] = body
-	return nil
 }

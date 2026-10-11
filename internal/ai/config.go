@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -119,50 +118,6 @@ type ProviderValidation struct {
 	Confirmations []ConfirmationRequirement
 }
 
-// LoadProviderConfigFromEnv reads ACD_AI_* env vars and returns a
-// ProviderConfig with safe defaults applied. The mode prefix is
-// lowercased and trimmed; the subprocess plugin name (after the colon) is
-// preserved verbatim because plugin binaries on $PATH are case-sensitive
-// on Linux.
-func LoadProviderConfigFromEnv() ProviderConfig {
-	cfg := ProviderConfig{
-		Mode:           normalizeMode(os.Getenv(EnvProvider)),
-		BaseURL:        strings.TrimSpace(os.Getenv(EnvBaseURL)),
-		APIKey:         strings.TrimSpace(os.Getenv(EnvAPIKey)),
-		Model:          strings.TrimSpace(os.Getenv(EnvModel)),
-		CAFile:         strings.TrimSpace(os.Getenv(EnvCAFile)),
-		DiffEgress:     envTruthy(os.Getenv(EnvDiffEgress)),
-		CommitStrategy: normalizeCommitStrategy(os.Getenv(EnvCommitStrategy)),
-		CommitFormat:   normalizeCommitFormat(os.Getenv(EnvCommitFormat)),
-	}
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = DefaultOpenAIBaseURL
-	}
-	if cfg.Model == "" {
-		cfg.Model = DefaultOpenAIModel
-	}
-	if raw := strings.TrimSpace(os.Getenv(EnvTimeout)); raw != "" {
-		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
-			cfg.Timeout = d
-		} else if secs, err := strconv.ParseFloat(raw, 64); err == nil && secs > 0 {
-			cfg.Timeout = time.Duration(secs * float64(time.Second))
-		}
-	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = DefaultProviderTimeout
-	}
-	return cfg
-}
-
-func envTruthy(raw string) bool {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "1", "true", "yes", "on", "enabled":
-		return true
-	default:
-		return false
-	}
-}
-
 func normalizeCommitFormat(raw string) CommitFormat {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", string(CommitFormatImperative):
@@ -171,15 +126,6 @@ func normalizeCommitFormat(raw string) CommitFormat {
 		return CommitFormatConventional
 	default:
 		return CommitFormatImperative
-	}
-}
-
-func normalizeCommitStrategy(raw string) CommitStrategy {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case string(CommitStrategyIntent):
-		return CommitStrategyIntent
-	default:
-		return CommitStrategyLocal
 	}
 }
 

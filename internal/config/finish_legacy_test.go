@@ -125,22 +125,23 @@ func TestFinishConfigLegacyPresetFallbackPreservesEffectiveChoices(t *testing.T)
 	}
 }
 
-func TestFinishConfigLegacyFallbackRetirementKeepsProvenance(t *testing.T) {
-	doc, err := ParseDocument([]byte(`{"version":1,"settings":{"global":{"commit.strategy":"intent","commit.preset":"quality"}}}`))
+func TestFinishConfigInactiveLegacyDefaultsPreserveProvenance(t *testing.T) {
+	if len(LegacyFinishDefaults(NewDocument(), []string{"global"}, nil)) != 0 {
+		t.Fatal("new document received old preset defaults")
+	}
+	archived := NewDocument()
+	archive := json.RawMessage(`{"version":1,"retired":true,"scopes":{"global":{"commit.strategy":"intent","commit.preset":"quality"}}}`)
+	archived.Extra["legacy_finish_settings"] = archive
+	body, err := json.Marshal(archived)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(LegacyFinishDefaults(doc, []string{"global"}, nil)) == 0 {
-		t.Fatal("missing legacy choices")
-	}
-	if err := RetireLegacyFinishDefaults(doc); err != nil {
+	loaded, err := ParseDocument(body)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(LegacyFinishDefaults(doc, []string{"global"}, nil)) != 0 || !strings.Contains(string(doc.Extra["legacy_finish_settings"]), "quality") {
-		t.Fatal("fallback retirement discarded provenance or remained active")
-	}
-	if len(LegacyFinishDefaults(NewDocument(), []string{"global"}, nil)) != 0 {
-		t.Fatal("new document received old preset defaults")
+	if len(LegacyFinishDefaults(loaded, []string{"global"}, nil)) != 0 || string(loaded.Extra["legacy_finish_settings"]) != string(archive) {
+		t.Fatal("retired archive was reactivated or its provenance changed")
 	}
 }
 
