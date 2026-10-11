@@ -64,8 +64,8 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 	if runtime.workerCtx == nil || runtime.workerCtx.Err() != nil {
 		return nil, protocolFailure("worker_unavailable", errors.New("finish: protection worker is stopping; run `acd on`"), true)
 	}
-	if runtime.restoreHeld != nil && runtime.restoreHeld.Load() {
-		return nil, protocolFailure("finish_busy", errors.New("finish: complete the pending restore first"), false)
+	if workerPublicationHeld(runtime.roots.SetupPublicationHoldPath(), runtime.restoreHeld) {
+		return nil, protocolFailure("finish_busy", errors.New("finish: setup or restore holds publication; complete that operation first"), false)
 	}
 	// Reconnection uses the frozen attempt. A removed credential or a saved
 	// settings edit cannot prevent a client from observing its running job.
@@ -98,6 +98,11 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 		}
 		return active, nil
 	}
+	if _, exists, err := state.ActiveFinishHistoryRequest(ctx, runtime.db, request.WorktreeID); err != nil {
+		return nil, finishProtocolError(err)
+	} else if exists {
+		return nil, finishProtocolError(state.ErrFinishBusy)
+	}
 	cfg, err := resolveFinishWorkerConfig(ctx, runtime.roots, runtime)
 	if err != nil {
 		return nil, finishProtocolError(err)
@@ -111,8 +116,10 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 	}
 	if created && r.State == state.FinishRunning {
 		runtime.finishJobs.Add(1)
+		runtime.activeFinishJobs.Add(1)
 		go func() {
 			defer runtime.finishJobs.Done()
+			defer runtime.activeFinishJobs.Add(-1)
 			runtime.gate.RLock()
 			defer runtime.gate.RUnlock()
 			_, _ = worker.Execute(runtime.workerCtx, r.ID)

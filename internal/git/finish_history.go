@@ -18,10 +18,13 @@ type FinishHistoryGoal struct {
 }
 
 type FinishHistoryBuildOptions struct {
-	PlanID, WorktreeID, SourceBranchRef, TargetBranchRef, ExpectedHead, IndexDigest, SourceRef, LockToken string
-	SourceChain, RecreateUnchanged                                                                        []string
-	Goals                                                                                                 []FinishHistoryGoal
-	Verify                                                                                                func(context.Context, string, string, int) error
+	PlanID, WorktreeID               string
+	SourceBranchRef, TargetBranchRef string
+	ExpectedHead, IndexDigest        string
+	SourceRef, LockToken             string
+	SourceChain, RecreateUnchanged   []string
+	Goals                            []FinishHistoryGoal
+	Verify                           func(context.Context, string, string, int) error
 }
 
 // BuildFinishHistoryChain writes only a retained private chain. Every output
@@ -125,7 +128,7 @@ func BuildFinishHistoryChain(ctx context.Context, repo string, options FinishHis
 }
 
 func ValidateFinishHistoryProof(ctx context.Context, repo string, p state.FinishHistoryProof) error {
-	if p.Version != 1 || p.PlanID == "" || p.NewHead == "" || p.LockToken == "" || !isFullBranchRef(p.SourceBranchRef) || !isFullBranchRef(p.TargetBranchRef) || !strings.HasPrefix(p.SourceRef, FinishRefPrefix) || !strings.HasPrefix(p.ObjectRef, FinishRefPrefix) {
+	if p.Version != 1 || p.PlanID == "" || p.NewHead == "" || p.LockToken == "" || !isFullBranchRef(p.SourceBranchRef) || !isFullBranchRef(p.TargetBranchRef) || !strings.HasPrefix(p.SourceRef, FinishRefPrefix) || !strings.HasPrefix(p.ObjectRef, FinishRefPrefix) || p.BackupRef != "refs/acd/rewrite-backups/"+p.PlanID {
 		return ErrFinishUnsafe
 	}
 	for ref, expected := range map[string]string{p.SourceRef: p.ExpectedHead, p.ObjectRef: p.NewHead} {
@@ -198,33 +201,79 @@ func ApplyFinishHistoryProof(ctx context.Context, repo string, p state.FinishHis
 		return err
 	}
 	defer release()
+	headRelease, err := acquireFinishLock(filepath.Join(wt.GitDir, "HEAD.lock"), p.LockToken, resume)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if headRelease != nil {
+			headRelease()
+		}
+	}()
 	tip, tipErr := RevParse(ctx, repo, p.TargetBranchRef)
 	backup, backupErr := RevParse(ctx, repo, p.BackupRef)
 	post := tipErr == nil && tip == p.NewHead && backupErr == nil && backup == p.ExpectedHead
-	if post {
-		backup, err := RevParse(ctx, repo, p.BackupRef)
-		if err != nil || backup != p.ExpectedHead {
-			return errors.Join(err, ErrFinishUnsafe)
-		}
-	} else {
+	if !post {
 		if p.TargetBranchRef != p.SourceBranchRef && !errors.Is(tipErr, ErrRefNotFound) {
 			return ErrFinishUnsafe
 		}
 		if err := CheckFinishPublicationSafety(ctx, repo, p.SourceBranchRef, p.ExpectedHead, p.IndexDigest, false); err != nil {
 			return err
 		}
-		input := "start\n"
-		if p.TargetBranchRef == p.SourceBranchRef {
-			input += "update " + p.SourceBranchRef + " " + p.NewHead + " " + p.ExpectedHead + "\n"
-		} else {
-			input += "verify " + p.SourceBranchRef + " " + p.ExpectedHead + "\ncreate " + p.TargetBranchRef + " " + p.NewHead + "\n"
+		headIdentity, err := finishHeadIdentity(ctx, repo, wt.GitDir, p.SourceBranchRef)
+		if err != nil {
+			return err
 		}
-		input += "create " + p.BackupRef + " " + p.ExpectedHead + "\nprepare\ncommit\n"
-		if _, err := runDurable(ctx, repo, strings.NewReader(input), "reference", "update-ref", "--no-deref", "--stdin"); err != nil {
+		creates := map[string]string{p.BackupRef: p.ExpectedHead}
+		var replacement []string
+		if p.TargetBranchRef == p.SourceBranchRef {
+			replacement = []string{p.NewHead}
+		} else {
+			creates[p.TargetBranchRef] = p.NewHead
+		}
+		headRelease()
+		headRelease = nil
+		err = withLockedExpectedRefsTransaction(ctx, repo, p.SourceBranchRef, p.ExpectedHead, p.SourceRef, p.ExpectedHead, false, DefaultWriteTimeout, func(lockCtx context.Context) error {
+			if err := verifyFinishHeadIdentity(wt.GitDir, headIdentity); err != nil {
+				return err
+			}
+			if err := CheckFinishPublicationSafety(lockCtx, repo, p.SourceBranchRef, p.ExpectedHead, p.IndexDigest, false); err != nil {
+				return err
+			}
+			return ensureDirectFinishRef(lockCtx, repo, p.SourceRef)
+		}, creates, nil, replacement...)
+		if err != nil {
 			return fmt.Errorf("history rewrite: atomic refs: %w", err)
 		}
+		if headRelease == nil {
+			headRelease, err = acquireFinishLock(filepath.Join(wt.GitDir, "HEAD.lock"), p.LockToken, false)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	expectedSource := p.ExpectedHead
+	if p.SourceBranchRef == p.TargetBranchRef {
+		expectedSource = p.NewHead
+	}
+	if err := CheckFinishPublicationSafety(ctx, repo, p.SourceBranchRef, expectedSource, p.IndexDigest, false); err != nil {
+		return err
+	}
+	completionHead, err := finishHeadIdentity(ctx, repo, wt.GitDir, p.SourceBranchRef)
+	if err != nil {
+		return err
+	}
+	if p.TargetBranchRef == p.SourceBranchRef {
+		headRelease()
+		headRelease = nil
 	}
 	return withLockedExpectedRef(ctx, repo, p.TargetBranchRef, p.NewHead, p.ObjectRef, p.NewHead, false, func(lockCtx context.Context) error {
+		if err := verifyFinishHeadIdentity(wt.GitDir, completionHead); err != nil {
+			return err
+		}
+		if err := CheckFinishPublicationSafety(lockCtx, repo, p.SourceBranchRef, expectedSource, p.IndexDigest, false); err != nil {
+			return err
+		}
 		backup, err := RevParse(lockCtx, repo, p.BackupRef)
 		if err != nil || backup != p.ExpectedHead {
 			return errors.Join(err, ErrFinishUnsafe)
@@ -259,4 +308,24 @@ func VerifyPublishedFinishHistoryProof(ctx context.Context, repo string, p state
 		}
 	}
 	return nil
+}
+
+// PinFinishHistoryTree retains a generated complete tree through a private
+// rootless evidence commit; the commit is never part of rewritten branch history.
+func PinFinishHistoryTree(ctx context.Context, repo, ref, tree string) error {
+	if oid, err := RevParse(ctx, repo, ref); err == nil {
+		actual, err := RevParse(ctx, repo, oid+"^{tree}")
+		if err != nil || actual != tree {
+			return errors.Join(err, ErrFinishUnsafe)
+		}
+		return ensureDirectFinishRef(ctx, repo, ref)
+	} else if !errors.Is(err, ErrRefNotFound) {
+		return err
+	}
+	oid, err := CommitTreeDurable(ctx, repo, tree, "ACD history goal evidence", "ACD History", "acd-history@localhost")
+	if err != nil {
+		return err
+	}
+	_, err = EnsurePrivateRefDurable(ctx, repo, FinishRefPrefix, ref, oid)
+	return err
 }

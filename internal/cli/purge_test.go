@@ -4,61 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
-func TestPurgeEvents_RequiresSafeSelector(t *testing.T) {
-	repo, _, _ := makeRegisteredGitRepoStateDB(t)
-	var out bytes.Buffer
-	err := runPurgeEvents(context.Background(), &out, repo, false, false, false, false, false, true, true)
-	if err == nil || !strings.Contains(err.Error(), "pass --all") {
-		t.Fatalf("runPurgeEvents err=%v want safe-selector refusal", err)
-	}
-}
-
-func TestPurgeEvents_RequiresYesWhenApplying(t *testing.T) {
-	repo, _, _ := makeRegisteredGitRepoStateDB(t)
-	var out bytes.Buffer
-	err := runPurgeEvents(context.Background(), &out, repo, false, false, false, true, false, false, true)
-	if err == nil || !strings.Contains(err.Error(), "without --yes") {
-		t.Fatalf("runPurgeEvents err=%v want --yes refusal", err)
-	}
-}
-
-func TestPurgeEvents_RefusesAllSelectiveRecovery(t *testing.T) {
-	repo, stateDB, _ := makeRegisteredGitRepoStateDB(t)
-	before, err := fileSHA256(stateDB)
-	if err != nil {
-		t.Fatalf("checksum before: %v", err)
-	}
-	for _, tc := range []struct {
-		blocked bool
-		pending bool
-		failed  bool
-	}{
-		{blocked: true},
-		{pending: true},
-		{failed: true},
-	} {
-		var out bytes.Buffer
-		err := runPurgeEvents(context.Background(), &out, repo, tc.blocked, tc.pending, tc.failed, false, true, false, true)
-		if err == nil || !strings.Contains(err.Error(), "selective --blocked/--pending/--failed recovery is no longer supported") {
-			t.Fatalf("runPurgeEvents blocked=%v pending=%v failed=%v err=%v", tc.blocked, tc.pending, tc.failed, err)
-		}
-	}
-	after, err := fileSHA256(stateDB)
-	if err != nil {
-		t.Fatalf("checksum after: %v", err)
-	}
-	if before != after {
-		t.Fatalf("refused selective purge mutated state.db: before=%s after=%s", before, after)
-	}
-}
-
-func TestPurgeEvents_DryRunDelegatesArchiveOnlyFix(t *testing.T) {
+func TestSupportRecover_ArchiveOnlyPreview(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	stageRecoverableBarrierPair(t, context.Background(), repo, db, "refs/heads/main", 1)
 	before, err := fileSHA256(stateDB)
@@ -67,7 +19,7 @@ func TestPurgeEvents_DryRunDelegatesArchiveOnlyFix(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runPurgeEvents(context.Background(), &out, repo, false, false, false, true, false, true, true); err != nil {
+	if err := runFix(context.Background(), &out, repo, true, false, true, false, true); err != nil {
 		t.Fatalf("runPurgeEvents dry-run: %v\n%s", err, out.String())
 	}
 	var plan fixPlan
@@ -87,13 +39,13 @@ func TestPurgeEvents_DryRunDelegatesArchiveOnlyFix(t *testing.T) {
 	}
 }
 
-func TestPurgeEvents_AllArchivesWholePairWithoutDeletingRows(t *testing.T) {
+func TestSupportRecover_ArchivesWholePairWithoutDeletingRows(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
 	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
 
 	var out bytes.Buffer
-	if err := runPurgeEvents(ctx, &out, repo, false, false, false, true, true, false, true); err != nil {
+	if err := runFix(ctx, &out, repo, false, true, true, false, true); err != nil {
 		t.Fatalf("runPurgeEvents apply: %v\n%s", err, out.String())
 	}
 	assertFixEventState(t, ctx, db, first, state.EventStateRecovered)
@@ -124,7 +76,7 @@ func seedPurgeFixtureRows(t *testing.T, db *state.DB) {
 		{state.EventStatePending, "pending-a.txt"},
 		{state.EventStatePending, "pending-b.txt"},
 	} {
-		if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+		if _, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{
 			BranchRef: "refs/heads/main", BranchGeneration: 1,
 			BaseHead: "fixture-head", Operation: "modify", Path: row.path,
 			Fidelity: "exact", State: row.state,

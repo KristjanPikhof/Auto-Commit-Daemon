@@ -85,7 +85,6 @@ var fieldCatalog = []FieldDefinition{
 	{Name: "watch.fsnotify", Environment: "ACD_FSNOTIFY_ENABLED", Default: "true", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
 	{Name: "trace.enabled", Environment: "ACD_TRACE", Default: "false", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
 	{Name: "trace.prompt", Environment: "ACD_AI_PROMPT_TRACE", Default: "false", Kind: KindBool, Boundary: ApplyRestart, Sensitive: true, Persistable: true},
-	{Name: "client.ttl", Environment: "ACD_CLIENT_TTL_SECONDS", Default: "1800", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
 }
 
 func Catalog() []FieldDefinition { return append([]FieldDefinition(nil), fieldCatalog...) }
@@ -109,22 +108,16 @@ const (
 	SourceEnvironment       Source = "environment"
 	SourceDefault           Source = "default"
 	SourceLegacyTranslation Source = "legacy_translation"
-	// Deprecated: retained only while old CLI callers migrate.
-	SourceExperiment Source = "experiment"
-	SourcePreset     Source = "preset"
 )
 
 type ResolveInput struct {
 	Draft Overrides
 	// LegacyDefaults preserves supported v1 preset choices below authored/env values.
 	LegacyDefaults Overrides
-	// Deprecated: ignored; config experiments no longer affect resolution.
-	Experiment Overrides
-	Repository Overrides
-	Profile    Overrides
-	Global     Overrides
-	Preset     Overrides
-	LookupEnv  func(string) (string, bool)
+	Repository     Overrides
+	Profile        Overrides
+	Global         Overrides
+	LookupEnv      func(string) (string, bool)
 }
 
 type ShadowedEnvironment struct {
@@ -210,7 +203,7 @@ func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 }
 
 // ResolveRestartEnvironment resolves the restart-bound catalog for one
-// repository using the same precedence as the settings lab. Returned keys are
+// repository using the same precedence as the settings editor. Returned keys are
 // environment variable names because the existing daemon consumers parse
 // their established environment contracts at process startup.
 func ResolveRestartEnvironment(
@@ -294,9 +287,10 @@ func validateGlobalSetupApproval(doc *Document) error {
 		return errors.New("acd config: global setup approval has an invalid fingerprint")
 	}
 	allowed := map[string]bool{
-		"endpoint_credentials": true,
-		"subprocess_execution": true,
-		"diff_egress":          true,
+		"endpoint_credentials":          true,
+		"insecure_endpoint_credentials": true,
+		"subprocess_execution":          true,
+		"diff_egress":                   true,
 	}
 	seen := make(map[string]bool, len(approval.Confirmations))
 	for _, confirmation := range approval.Confirmations {

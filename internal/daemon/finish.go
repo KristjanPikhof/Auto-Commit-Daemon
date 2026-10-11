@@ -363,7 +363,6 @@ func (w *FinishWorker) protect(ctx context.Context, wt git.Worktree, cfg FinishW
 		return state.Checkpoint{}, fmt.Errorf("finish: inspect index Gitlinks: %w", err)
 	}
 	opts.WorktreeID = checkpoint.WorktreeID(wt.Root)
-	opts.GitDir = wt.GitDir
 	opts.CheckpointStore = &checkpoint.Store{DB: w.DB}
 	if fresh {
 		epoch, err := BeginProtectionObservation(ctx, w.DB)
@@ -596,7 +595,7 @@ func (t finishEvaluatedTransport) ExchangeFinish(ctx context.Context, body []byt
 
 func (w *FinishWorker) evaluationContext(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, digest string, r state.FinishRequest) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
-	evaluation := &publicationEvaluation{gate: w.OperationGate, db: w.DB, cancel: cancel, wake: w.Wake, files: w.Files, changes: w.Changes, shutdown: w.Shutdown, interval: w.EvaluationInterval}
+	evaluation := &publicationEvaluation{gate: w.OperationGate, cancel: cancel, wake: w.Wake, files: w.Files, changes: w.Changes, shutdown: w.Shutdown, interval: w.EvaluationInterval}
 	evaluation.identity = func(checkCtx context.Context) (string, error) {
 		_, _, current, err := w.resolved(checkCtx)
 		if err != nil {
@@ -875,9 +874,9 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 			}
 		}
 		if !diff.Binary {
-			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, ai.IntentStageDiffCap+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", base, target, "--", ":(literal)"+change.Path)
-			if errors.Is(err, git.ErrStdoutOverflow) || len(out) > ai.IntentStageDiffCap {
-				return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diff is at least %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", len(out), ai.IntentStageDiffCap)}
+			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, ai.FinishDiffByteCap+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", base, target, "--", ":(literal)"+change.Path)
+			if errors.Is(err, git.ErrStdoutOverflow) || len(out) > ai.FinishDiffByteCap {
+				return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diff is at least %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", len(out), ai.FinishDiffByteCap)}
 			}
 			if err != nil {
 				return nil, err
@@ -886,8 +885,8 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 				diff.Binary = true
 			} else {
 				totalBytes += len(out)
-				if totalBytes > ai.IntentGoalEvidenceTotalDiffCap {
-					return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diffs total %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", totalBytes, ai.IntentGoalEvidenceTotalDiffCap)}
+				if totalBytes > ai.FinishEvidenceDiffByteCap {
+					return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diffs total %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", totalBytes, ai.FinishEvidenceDiffByteCap)}
 				}
 				diff.Text = string(out)
 			}

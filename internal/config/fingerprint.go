@@ -10,7 +10,7 @@ import (
 // SettingsFingerprint binds the effective hot, persistable, non-secret
 // settings. Runtime consumers can
 // use it to verify a stored global approval without importing settings.
-func SettingsFingerprint(values map[string]string, _ PresetResolution) (string, error) {
+func SettingsFingerprint(values map[string]string) (string, error) {
 	payload := make(map[string]any)
 	for _, field := range Catalog() {
 		if field.Boundary == ApplyHot && field.Persistable && !field.Sensitive {

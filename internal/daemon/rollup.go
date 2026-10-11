@@ -62,6 +62,13 @@ func RunDailyRollup(ctx context.Context, db *state.DB, opts RunDailyRollupOpts) 
 	if opts.RepoPath == "" {
 		return 0, fmt.Errorf("daemon: RunDailyRollup: empty RepoPath")
 	}
+	legacy, err := state.LegacyTableExists(ctx, db.ReadSQL(), "capture_events")
+	if err != nil {
+		return 0, fmt.Errorf("daemon: rollup: inspect legacy captures: %w", err)
+	}
+	if !legacy {
+		return 0, nil
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now

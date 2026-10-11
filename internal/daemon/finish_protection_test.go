@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,7 +48,7 @@ func finishProtectionRun(t *testing.T, f *captureFixture, change func(*Options))
 	wake := make(chan struct{}, 1)
 	shutdown := make(chan struct{})
 	result := make(chan error, 1)
-	opts := Options{RepoPath: f.dir, GitDir: f.gitDir, DB: f.db, SkipSignals: true, WakeCh: wake, ShutdownCh: shutdown, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), BootGrace: time.Hour, Scheduler: Scheduler{Base: 15 * time.Millisecond, IdleCeiling: time.Hour, ErrorCeiling: 100 * time.Millisecond}}
+	opts := Options{RepoPath: f.dir, GitDir: f.gitDir, DB: f.db, SkipSignals: true, WakeCh: wake, ShutdownCh: shutdown, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Scheduler: Scheduler{Base: 15 * time.Millisecond, IdleCeiling: time.Hour, ErrorCeiling: 100 * time.Millisecond}}
 	if change != nil {
 		change(&opts)
 	}
@@ -80,10 +79,7 @@ func TestFinishProtectionSavesIdleAndStopNeverPublish(t *testing.T) {
 	}
 	head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
 	index := finishWorkerGit(t, f.dir, "ls-files", "--stage")
-	var calls atomic.Int32
-	wake, stop := finishProtectionRun(t, f, func(o *Options) {
-		o.MessageFn = func(context.Context, EventContext) (string, error) { calls.Add(1); return "unexpected", nil }
-	})
+	wake, stop := finishProtectionRun(t, f, nil)
 	for i := 0; i < 6; i++ {
 		body := fmt.Sprintf("save %d", i)
 		finishWrite(t, f.dir, "work.txt", body)
@@ -121,17 +117,15 @@ func TestFinishProtectionSavesIdleAndStopNeverPublish(t *testing.T) {
 	if err != nil || health.State != "healthy" || health.Error != "" {
 		t.Fatalf("stale scan health %+v: %v", health, err)
 	}
-	if calls.Load() != 0 {
-		t.Fatal("automatic message/provider work")
+	for _, table := range []string{"capture_events", "shadow_paths"} {
+		exists, err := state.LegacyTableExists(t.Context(), f.db.ReadSQL(), table)
+		if err != nil || exists {
+			t.Fatalf("fresh protection created legacy table %s: exists=%t err=%v", table, exists, err)
+		}
 	}
-	for _, table := range []string{"capture_events", "shadow_paths", "finish_requests"} {
-		var count int
-		if err := f.db.ReadSQL().QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
-			t.Fatal(err)
-		}
-		if count != 0 {
-			t.Fatalf("%s has %d rows", table, count)
-		}
+	var requests int
+	if err := f.db.ReadSQL().QueryRow("SELECT COUNT(*) FROM finish_requests").Scan(&requests); err != nil || requests != 0 {
+		t.Fatalf("idle protection started finish: requests=%d err=%v", requests, err)
 	}
 	if raw, ok, _ := state.MetaGet(context.Background(), f.db, MetaKeyProtectionClassificationPending); ok && raw == "true" {
 		t.Fatal("obsolete classification queue pending")

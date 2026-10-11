@@ -5,15 +5,12 @@ package migration
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +24,7 @@ import (
 type RepositoryPlan struct {
 	Record          central.RepoRecord            `json:"record"`
 	FromVersion     int                           `json:"from_version"`
+	LegacyDigest    string                        `json:"legacy_digest"`
 	Pairs           []state.UnresolvedCapturePair `json:"unresolved_pairs"`
 	Proofs          []daemon.RecoveryChainResult  `json:"proofs"`
 	BridgeSnapshots []BridgeSnapshot              `json:"bridge_snapshots,omitempty"`
@@ -35,6 +33,7 @@ type RepositoryPlan struct {
 }
 
 type Result struct {
+	Legacy            state.FinishLegacyCutover    `json:"legacy"`
 	Record            central.RepoRecord           `json:"record"`
 	CheckpointID      string                       `json:"checkpoint_id"`
 	RecoveryResults   []daemon.RecoveryChainResult `json:"recovery_results"`
@@ -106,37 +105,11 @@ func Preflight(ctx context.Context, record central.RepoRecord, backupPath string
 	if err != nil {
 		return RepositoryPlan{}, err
 	}
-	proofs, err := proveChains(ctx, wt.Root, record.StateDB, pairs)
+	digest, err := state.ReadLegacyEvidenceDigest(ctx, record.StateDB)
 	if err != nil {
 		return RepositoryPlan{}, err
 	}
-	return RepositoryPlan{Record: record, FromVersion: version, Pairs: pairs, Proofs: proofs, BackupPath: backupPath}, nil
-}
-
-func proveChains(ctx context.Context, repoRoot, dbPath string, pairs []state.UnresolvedCapturePair) ([]daemon.RecoveryChainResult, error) {
-	if len(pairs) == 0 {
-		return nil, nil
-	}
-	db, err := state.OpenReadOnly(ctx, dbPath)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-	proofs := make([]daemon.RecoveryChainResult, 0, len(pairs))
-	for _, pair := range pairs {
-		proof, proofErr := daemon.ProveUnpublishedChain(ctx, repoRoot, db, daemon.RecoveryReconcileOptions{
-			BranchRef: pair.BranchRef, BranchGeneration: pair.Generation,
-			FirstSeq: pair.FirstSeq, Trigger: "v20_migration_preflight", InvalidateShadow: true,
-		})
-		if proofErr != nil {
-			return nil, fmt.Errorf("migration: exact-chain preflight %s generation %d: %w", pair.BranchRef, pair.Generation, proofErr)
-		}
-		if !proof.Handled {
-			return nil, fmt.Errorf("migration: exact-chain preflight %s generation %d was not provable", pair.BranchRef, pair.Generation)
-		}
-		proofs = append(proofs, proof)
-	}
-	return proofs, nil
+	return RepositoryPlan{Record: record, FromVersion: version, Pairs: pairs, LegacyDigest: digest, BackupPath: backupPath}, nil
 }
 
 // ApplyAll acquires canonical repository locks in sorted common-directory
@@ -248,37 +221,20 @@ func applyRepository(ctx context.Context, plan RepositoryPlan) (Result, error) {
 	}
 	defer db.Close()
 	result := Result{Record: plan.Record}
-	if err := daemon.RecoverSelfPublicationsBeforePlanning(ctx, wt.Root, db); err != nil {
-		return Result{}, fmt.Errorf("migration: recover publication journal before membership repair: %w", err)
+	cutover, activationErr := ActivateFinish(ctx, wt.Root, db)
+	if activationErr != nil {
+		if !errors.Is(activationErr, ErrFinishLegacyAttention) {
+			return Result{}, activationErr
+		}
+		saved, readErr := state.LoadFinishLegacyCutover(ctx, db)
+		if readErr != nil || saved.State != "needs_attention" || saved.SnapshotRef == "" || saved.SnapshotRef != cutover.SnapshotRef || saved.SnapshotOID != cutover.SnapshotOID {
+			return Result{}, errors.Join(activationErr, readErr)
+		}
+		// Available objects and immutable attention are durable. Protection may start
+		// even when old branch publication cannot be proved; no native state changes.
 	}
-	for index, pair := range plan.Pairs {
-		recovered, err := daemon.ReconcileUnpublishedChain(ctx, wt.Root, db, daemon.RecoveryReconcileOptions{
-			GitDir: wt.GitDir, BranchRef: pair.BranchRef, BranchGeneration: pair.Generation,
-			FirstSeq: pair.FirstSeq, Trigger: "v20_migration", InvalidateShadow: true,
-		})
-		if err != nil {
-			return Result{}, fmt.Errorf("migration: ambiguous chain %s generation %d: %w", pair.BranchRef, pair.Generation, err)
-		}
-		if !recovered.Handled {
-			return Result{}, fmt.Errorf("migration: chain %s generation %d changed during cutover", pair.BranchRef, pair.Generation)
-		}
-		if index >= len(plan.Proofs) || !sameRecoveryProof(plan.Proofs[index], recovered) {
-			return Result{}, fmt.Errorf("migration: chain %s generation %d no longer matches the reviewed proof", pair.BranchRef, pair.Generation)
-		}
-		result.RecoveryResults = append(result.RecoveryResults, recovered)
-		if recovered.Outcome == state.EventStateRecovered {
-			imported, err := importRecoveryCheckpoint(ctx, wt, db, plan.Record.WorktreeID, recovered)
-			if err != nil {
-				return Result{}, err
-			}
-			proof := RefProof{Repo: wt.Root, Ref: imported.Ref, CommitOID: imported.CommitOID}
-			if err := appendCreatedRef(plan, proof); err != nil {
-				deleteErr := gitpkg.DeletePrivateRefDurable(context.Background(), wt.Root, gitpkg.CheckpointRefPrefix, imported.Ref, imported.CommitOID)
-				return Result{}, errors.Join(err, deleteErr)
-			}
-			result.CreatedRefs = append(result.CreatedRefs, proof)
-		}
-	}
+	result.Legacy = cutover
+
 	for _, snapshot := range plan.BridgeSnapshots {
 		imported, err := importBridgeCheckpoint(ctx, wt, db, plan.Record.WorktreeID, snapshot)
 		if err != nil {
@@ -291,9 +247,6 @@ func applyRepository(ctx context.Context, plan RepositoryPlan) (Result, error) {
 		}
 		result.CreatedRefs = append(result.CreatedRefs, proof)
 		result.BridgeCheckpoints = append(result.BridgeCheckpoints, imported.ID)
-	}
-	if _, err := state.ReconcileCheckpointIntentMemberships(ctx, db, plan.Record.WorktreeID); err != nil {
-		return Result{}, fmt.Errorf("migration: reconcile checkpoint publication membership: %w", err)
 	}
 	store := checkpoint.Store{DB: db}
 	entries, exclusions, err := scanProtectedEntriesForMigration(ctx, wt.Root, &store)
@@ -351,70 +304,6 @@ func scanProtectedEntriesForMigration(ctx context.Context, repoRoot string, stor
 		}
 	}
 	return nil, nil, fmt.Errorf("protection scan remained incomplete after %d attempts: %w", migrationScanAttempts, lastErr)
-}
-
-func importRecoveryCheckpoint(ctx context.Context, wt gitpkg.Worktree, db *state.DB, worktreeID string, recovered daemon.RecoveryChainResult) (state.Checkpoint, error) {
-	snapshot, ok, err := state.RecoverySnapshotByID(ctx, db, recovered.SnapshotID)
-	if err != nil || !ok {
-		return state.Checkpoint{}, fmt.Errorf("migration: load recovery snapshot %d: %w", recovered.SnapshotID, err)
-	}
-	members, err := state.RecoverySnapshotEvents(ctx, db, snapshot.ID)
-	if err != nil {
-		return state.Checkpoint{}, err
-	}
-	treeOID, err := gitpkg.RevParse(ctx, wt.Root, recovered.CommitOID+"^{tree}")
-	if err != nil {
-		return state.Checkpoint{}, err
-	}
-	now := time.Now()
-	id, err := checkpoint.NewID(now)
-	if err != nil {
-		return state.Checkpoint{}, err
-	}
-	commitOID, err := gitpkg.CommitTreeDurable(ctx, wt.Root, treeOID,
-		"acd checkpoint "+id+"\n", checkpoint.IdentityName, checkpoint.IdentityEmail)
-	if err != nil {
-		return state.Checkpoint{}, err
-	}
-	ref := gitpkg.CheckpointRefPrefix + worktreeID + "/" + id
-	eventSeqs := make([]int64, 0, len(members))
-	for _, member := range members {
-		eventSeqs = append(eventSeqs, member.EventSeq)
-	}
-	eventSeqs, err = state.UncheckpointedEventSeqs(ctx, db, eventSeqs)
-	if err != nil {
-		return state.Checkpoint{}, fmt.Errorf(
-			"migration: inspect recovery checkpoint ownership: %w", err)
-	}
-	head, _ := gitpkg.RevParse(ctx, wt.Root, "HEAD")
-	refOut, _ := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: wt.Root}, "symbolic-ref", "-q", "HEAD")
-	cp := state.Checkpoint{ID: id, OperationID: "op-" + id, WorktreeID: worktreeID,
-		Reason: state.CheckpointReasonMigrationRecovery, ObservedHead: head,
-		ObservedRef: strings.TrimSpace(string(refOut)), TreeOID: treeOID,
-		CommitOID: commitOID, Ref: ref, CreatedTS: float64(now.UnixNano()) / float64(time.Second),
-		EventSeqs: eventSeqs}
-	digestBytes := sha256.Sum256([]byte(strings.Join([]string{
-		id, worktreeID, treeOID, commitOID, recovered.RecoveryRef,
-		strconv.FormatInt(recovered.FirstSeq, 10), strconv.FormatInt(recovered.LastSeq, 10),
-	}, "\x00")))
-	planDigest := "sha256:" + hex.EncodeToString(digestBytes[:])
-	if _, err := state.PrepareCheckpoint(ctx, db, cp, planDigest); err != nil {
-		return state.Checkpoint{}, err
-	}
-	if _, err := gitpkg.EnsureCheckpointRef(ctx, wt.Root, ref, commitOID); err != nil {
-		return state.Checkpoint{}, err
-	}
-	if err := state.CompleteCheckpoint(ctx, db, id, ref, commitOID, 0); err != nil {
-		return state.Checkpoint{}, err
-	}
-	cp.Phase = state.CheckpointCompleted
-	return cp, nil
-}
-
-func sameRecoveryProof(planned, applied daemon.RecoveryChainResult) bool {
-	return planned.Handled == applied.Handled && planned.Outcome == applied.Outcome &&
-		planned.FirstSeq == applied.FirstSeq && planned.LastSeq == applied.LastSeq &&
-		planned.EventCount == applied.EventCount
 }
 
 func releaseLocks(locks []heldLock) {

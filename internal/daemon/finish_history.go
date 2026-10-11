@@ -89,8 +89,8 @@ func finishHistoryDiffs(ctx context.Context, repo string, evidence finish.Eviden
 			return nil, err
 		}
 		total += len(diffs[0].Text)
-		if total > ai.HistoryRewriteTotalDiffCap {
-			return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact history diffs total %d bytes; limit %d bytes; use local mode or a smaller explicit history range", total, ai.HistoryRewriteTotalDiffCap)}
+		if total > ai.FinishHistoryDiffByteCap {
+			return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact history diffs total %d bytes; limit %d bytes; use local mode or a smaller explicit history range", total, ai.FinishHistoryDiffByteCap)}
 		}
 		result = append(result, diffs[0])
 	}
@@ -226,6 +226,9 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 			if err != nil {
 				return plan, err
 			}
+			if err := git.PinFinishHistoryTree(ctx, repo, strings.TrimSuffix(plan.SourceRef, "/source")+"/goal-"+strconv.Itoa(index+1), tree); err != nil {
+				return plan, err
+			}
 			goal := state.IntentHistoryGoal{ID: "goal-" + strconv.Itoa(index+1), Purpose: step.Purpose, Reason: step.Boundary, Message: step.Message, TreeOID: tree}
 			for _, id := range step.ChangeIDs {
 				unitIndex, _ := strconv.Atoi(id)
@@ -265,6 +268,21 @@ func finishHistoryTree(ctx context.Context, repo string, tree finish.Tree) (stri
 func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.IntentHistoryPlan) ([]git.IntentRepairReplacement, error) {
 	if plan.Version != state.IntentHistoryPlanVersion || len(plan.SourceChain) == 0 || (plan.Mode != "local" && plan.Mode != "intent") {
 		return nil, errors.New("history rewrite: legacy/invalid plan; create a new plan with the current CLI")
+	}
+	if len(plan.ID) > 128 || strings.ContainsAny(plan.ID, "/\\ \t\r\n\x00") || plan.ID == "" {
+		return nil, state.ErrFinishIdentity
+	}
+	wt, err := git.ResolveWorktree(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	expectedRef := git.FinishRefPrefix + checkpoint.WorktreeID(wt.Root) + "/history/" + plan.ID + "/source"
+	if plan.SourceRef != expectedRef {
+		return nil, state.ErrFinishIdentity
+	}
+	pinned, err := git.RevParse(ctx, repo, plan.SourceRef)
+	if err != nil || pinned != plan.ExpectedHead {
+		return nil, errors.Join(err, state.ErrFinishIdentity)
 	}
 	evidence, units, base, err := finishHistoryEvidence(ctx, repo, plan.SourceChain)
 	if err != nil {
@@ -316,6 +334,10 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 		}
 		for index, step := range plan.SharedPlan.Steps {
 			goal := plan.Goals[index]
+			pinned, err := git.RevParse(ctx, repo, strings.TrimSuffix(plan.SourceRef, "/source")+"/goal-"+strconv.Itoa(index+1)+"^{tree}")
+			if err != nil || pinned != goal.TreeOID {
+				return nil, errors.Join(err, state.ErrFinishIdentity)
+			}
 			tree, err := readFinishTree(ctx, repo, goal.TreeOID)
 			if err != nil {
 				return nil, err
@@ -341,6 +363,9 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 	var replacements []git.IntentRepairReplacement
 	for _, goal := range plan.Goals {
 		if plan.Mode == "intent" {
+			if len(plan.Goals) > 1 && strings.TrimSpace(goal.Reason) == "" {
+				return nil, errors.New("history rewrite: split goals require review or revert boundaries")
+			}
 			quality := finish.Goal{Purpose: goal.Purpose, Boundary: goal.Reason, Message: goal.Message}
 			for _, index := range goal.Units {
 				quality.ChangeIDs = append(quality.ChangeIDs, evidence.Changes[index].ID)
@@ -454,4 +479,8 @@ func (w *FinishWorker) publishFinishHistory(ctx context.Context, r state.FinishH
 		err = errors.Join(err, state.UpdateFinishHistoryRequest(recordCtx, w.DB, r, from))
 	}
 	return r, err
+}
+
+func stateHistoryUnit(unit git.IntentHistoryUnit) state.IntentHistoryUnit {
+	return state.IntentHistoryUnit{OldOID: unit.OldOID, Path: unit.Path, Before: state.IntentHistoryVersion{OID: unit.Before.OID, Mode: unit.Before.Mode}, After: state.IntentHistoryVersion{OID: unit.After.OID, Mode: unit.After.Mode}}
 }

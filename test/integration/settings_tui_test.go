@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,135 +16,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestConfigureRealPTYNarrowResizeAccessibleAndNoColor(t *testing.T) {
-	t.Parallel()
-
-	repo := tempRepo(t)
-	baseEnv := envWith(withIsolatedHome(t), "TERM=xterm-256color")
-	bin := buildAcdBinary(t)
-
-	for _, tc := range []struct {
-		name       string
-		env        []string
-		cols, rows int
-		args       []string
-		input      string
-	}{
-		{name: "narrow", env: baseEnv, cols: 52, rows: 18, input: "\x03"},
-		{name: "accessible", env: baseEnv, cols: 58, rows: 20,
-			args: []string{"--accessible"}, input: "1\n\x00\x03"},
-		{name: "no_color", env: envWith(baseEnv, "NO_COLOR=1"),
-			cols: 72, rows: 24, input: "\x03"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			args := append([]string{"configure", "--repo", repo}, tc.args...)
-			command := append([]string{bin}, args...)
-			result := runPTYCommand(t, ctx, tc.env, tc.cols, tc.rows, 0, 0,
-				tc.input, command...)
-			if result.ExitCode == 0 {
-				t.Fatalf("cancelled configure unexpectedly succeeded\n%s",
-					result.Stdout)
-			}
-			if !strings.Contains(result.Stdout, "How should ACD work?") ||
-				!strings.Contains(result.Stdout, "Everyday work") {
-				t.Fatalf("configure choices unreadable at %dx%d\n%s",
-					tc.cols, tc.rows, result.Stdout)
-			}
-			if tc.name == "no_color" &&
-				!strings.Contains(result.Stdout, "Strict review") {
-				t.Fatalf("rich configure omitted experiences at %dx%d\n%s",
-					tc.cols, tc.rows, result.Stdout)
-			}
-			if (tc.name == "narrow" || tc.name == "accessible") &&
-				strings.Contains(result.Stdout, "\x1b[?1049h") {
-				t.Fatalf("linear configure entered alternate screen\n%q",
-					result.Stdout)
-			}
-			if (tc.name == "narrow" || tc.name == "accessible") &&
-				(strings.Contains(result.Stdout, "\x1b[?2026") ||
-					strings.Contains(result.Stdout, "\x1b[?2027")) {
-				t.Fatalf("linear configure queried terminal capabilities\n%q",
-					result.Stdout)
-			}
-			if tc.name == "no_color" &&
-				(strings.Contains(result.Stdout, "\x1b[38;") ||
-					strings.Contains(result.Stdout, "\x1b[48;")) {
-				t.Fatalf("NO_COLOR configure emitted color SGR\n%q",
-					result.Stdout)
-			}
-		})
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	resized := runPTYCommand(t, ctx, baseEnv, 100, 32, 52, 18,
-		"\x03", bin, "configure", "--repo", repo)
-	if resized.ExitCode == 0 ||
-		!strings.Contains(resized.Stdout, "How should ACD work?") ||
-		!strings.Contains(resized.Stdout, "Everyday work") {
-		t.Fatalf("resized configure transcript incomplete\n%s", resized.Stdout)
-	}
-}
-
-func TestConfigureFinalApprovalVisibleInNarrowPTY(t *testing.T) {
-	t.Parallel()
-
-	repo := tempRepo(t)
-	if err := os.WriteFile(filepath.Join(repo, "Makefile"),
-		[]byte("test:\n\t@true\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	env := envWith(withIsolatedHome(t),
-		"TERM=xterm-256color",
-		"ACD_AI_API_KEY=configure-test-key",
-		"ACD_AI_BASE_URL=https://provider.example.invalid/v1",
-	)
-	bin := buildAcdBinary(t)
-
-	// A short terminal selects the linear renderer for the whole wizard.
-	// Approve only the preview prerequisites, then cancel when the final
-	// approval is visible.
-	input := strings.Join([]string{
-		"1\n",      // OpenAI-compatible provider
-		"\n", "\n", // keep environment endpoint and default model
-	}, "") + "\x00\x03" // cancel the one approval before calls or writes
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	result := runPTYCommand(t, ctx, env, 120, 18, 0, 0, input,
-		bin, "configure", "--repo", repo,
-		"--strategy", "intent", "--preset", "quality")
-	if result.ExitCode == 0 {
-		t.Fatalf("cancelled configure unexpectedly succeeded\n%s", result.Stdout)
-	}
-	previewAt := strings.Index(result.Stdout, "ACD CONFIGURE PREVIEW")
-	if previewAt < 0 {
-		t.Fatalf("configure never reached final preview\n%s", result.Stdout)
-	}
-	final := result.Stdout[previewAt:]
-	for _, want := range []string{
-		"Verification: full",
-		"repository command will run in an ephemeral worktree: make test",
-		"eligible recent ACD-owned commits may be repaired automatically",
-		"Approve these permissions, save, and enable ACD?",
-	} {
-		if !strings.Contains(final, want) {
-			t.Errorf("final approval missing %q\n%s", want, final)
-		}
-	}
-	for _, rawMode := range []string{"\x1b[?25l", "\x1b[?2004h", "\x1b[?1004h"} {
-		if strings.Contains(final, rawMode) {
-			t.Errorf("final approval entered rich raw mode %q\n%q", rawMode, final)
-		}
-	}
-	for _, query := range []string{"\x1b[?2026", "\x1b[?2027"} {
-		if strings.Contains(result.Stdout, query) {
-			t.Errorf("linear configure queried terminal capability %q\n%q", query, result.Stdout)
-		}
-	}
-}
 
 func TestSettingsTUIProductionBinaryIsCGODisabled(t *testing.T) {
 	bin := buildAcdBinary(t)
@@ -263,7 +135,7 @@ func TestSettingsTUIKeyboardNoColorAccessibleAndDirtyDiscard(t *testing.T) {
 func TestSettingsTUIAccessibleActionFirstTestAndRiskDecline(t *testing.T) {
 	t.Parallel()
 	repo := tempRepo(t)
-	env := envWith(withIsolatedHome(t), "TERM=xterm-256color", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=synthetic-test-model", "ACD_AI_BASE_URL=https://example.invalid/v1", "ACD_AI_API_KEY=integration-placeholder")
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color", "ACD_COMMIT_STRATEGY=intent", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=synthetic-test-model", "ACD_AI_BASE_URL=https://example.invalid/v1", "ACD_AI_API_KEY=integration-placeholder")
 	bin := buildAcdBinary(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -287,16 +159,15 @@ func TestSettingsTUIRealPTYConfirmationRetryAndApplyDecline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	// Review a model edit, decline it, then review and approve the retained draft.
-	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00retained-model\n\x009\n\x00n\n\x009\n\x00y\n\x00", bin, "config", "--repo", repo, "--accessible")
-	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Waiting to apply") {
+	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00retained-model\n\x009\n\x00n\n\x009\n\x00y\n\x00", "bash", "-c", "cd "+shellQuote(repo)+" && exec "+shellQuote(bin)+" config --scope global --accessible")
+	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Settings saved") {
 		t.Fatalf("retry exit=%d\n%s", result.ExitCode, result.Stdout)
 	}
 	if strings.Count(result.Stdout, "Review changes") != 2 {
 		t.Fatal("declined review did not retain editable draft")
 	}
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM config_revisions"); got != "1" {
-		t.Fatalf("expected one approved activation, got %s", got)
+	if _, err := os.Stat(filepath.Join(repo, ".git", "acd", "state.db")); !os.IsNotExist(err) {
+		t.Fatal("global save created unregistered repository state")
 	}
 	if !strings.Contains(readOptionalFile(t, settingsConfigPath(env)), `"ai.model": "retained-model"`) {
 		t.Fatal("reviewed model was not saved")
@@ -311,7 +182,7 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	// Global is the initial scope even inside a worktree. Model is always editable.
-	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00global-model\n\x009\n\x00y\n\x00", bin, "config", "--accessible", "--scope", "global")
+	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "3\n\x00global-model\n\x009\n\x00y\n\x00", "bash", "-c", "cd "+shellQuote(repo)+" && exec "+shellQuote(bin)+" config --scope global --accessible")
 	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Global defaults") || !strings.Contains(result.Stdout, "Settings saved") {
 		t.Fatalf("global save exit=%d\n%s", result.ExitCode, result.Stdout)
 	}
@@ -331,33 +202,29 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 	}
 }
 
-func TestConfigEditorAPIKeyMaskedAndTestedInRealPTY(t *testing.T) {
+func TestConfigEditorAPIKeyMaskedAndSavedWithoutProbeInRealPTY(t *testing.T) {
 	t.Parallel()
 	var calls atomic.Int32
-	var wrongKey atomic.Bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
-		if r.Header.Get("Authorization") != "Bearer editor-secret-test-token" {
-			wrongKey.Store(true)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"test","type":"function","function":{"name":"commit_message","arguments":"{\"subject\":\"Test connection\",\"body\":\"\"}"}}]},"finish_reason":"tool_calls"}]}`))
+		t.Error("saving a key contacted the provider")
+		http.Error(w, "unexpected provider request", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
-	repo := tempRepo(t)
-	env := envWith(withIsolatedHome(t), "TERM=xterm-256color", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=synthetic-test-model", "ACD_AI_BASE_URL="+server.URL+"/v1", "ACD_AI_API_KEY=")
+	f := newFinishFixture(t, "TERM=xterm-256color", "ACD_COMMIT_STRATEGY=intent", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=synthetic-test-model", "ACD_AI_BASE_URL="+server.URL+"/v1", "ACD_AI_API_KEY=")
+	repo, env := f.Repo, f.Env
 	bin := buildAcdBinary(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "5\n\x00editor-secret-test-token\n\x009\n\x00y\n\x00", bin, "config", "--repo", repo, "--accessible")
-	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Waiting to apply") {
+	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Settings saved") {
 		t.Fatalf("API key editor exit=%d\n%s", result.ExitCode, result.Stdout)
 	}
 	if strings.Contains(result.Stdout, "editor-secret-test-token") {
 		t.Fatal("terminal exposed API key")
 	}
-	if calls.Load() != 1 || wrongKey.Load() {
-		t.Fatalf("probe count=%d wrongKey=%t", calls.Load(), wrongKey.Load())
+	if calls.Load() != 0 {
+		t.Fatalf("probe count=%d", calls.Load())
 	}
 	configPath := settingsConfigPath(env)
 	if strings.Contains(readOptionalFile(t, configPath), "editor-secret-test-token") {
@@ -370,11 +237,44 @@ func TestConfigEditorAPIKeyMaskedAndTestedInRealPTY(t *testing.T) {
 	}
 	body := readOptionalFile(t, credentialPath)
 	if !strings.Contains(body, "editor-secret-test-token") {
-		t.Fatal("tested key was not stored")
+		t.Fatal("approved key was not stored")
 	}
 	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	snapshot := sqliteScalar(t, dbPath, "SELECT snapshot_json FROM config_revisions ORDER BY id DESC LIMIT 1")
 	if strings.Contains(snapshot, "editor-secret-test-token") {
 		t.Fatal("key entered runtime revision")
+	}
+}
+
+func TestSettingsTUINarrowFinalApprovalRemainsVisibleAndDeclineSendsNothing(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); http.Error(w, "unexpected call", 500) }))
+	defer server.Close()
+	repo := tempRepo(t)
+	env := envWith(withIsolatedHome(t), "TERM=xterm-256color", "ACD_COMMIT_STRATEGY=intent", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=narrow-test", "ACD_AI_BASE_URL="+server.URL+"/v1", "ACD_AI_API_KEY=narrow-secret")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	result := runPTYCommand(t, ctx, env, 120, 18, 0, 0, "9\n\x00n\n\x0010\n\x00", buildAcdBinary(t), "config", "--repo", repo)
+	if result.ExitCode != 0 {
+		t.Fatalf("narrow approval %+v", result)
+	}
+	at := strings.Index(result.Stdout, "Review changes")
+	if at < 0 {
+		t.Fatalf("approval never visible: %s", result.Stdout)
+	}
+	final := result.Stdout[at:]
+	for _, want := range []string{fmt.Sprintf("Permission: send credentials to %s/v1", server.URL), "Save these changes and apply them where possible?"} {
+		if !strings.Contains(final, want) {
+			t.Errorf("final approval missing %q: %s", want, final)
+		}
+	}
+	for _, mode := range []string{"\x1b[?1049h", "\x1b[?25l", "\x1b[?2004h", "\x1b[?1004h", "\x1b[?2026", "\x1b[?2027"} {
+		if strings.Contains(result.Stdout, mode) {
+			t.Errorf("linear approval used raw terminal mode %q", mode)
+		}
+	}
+	if calls.Load() != 0 || strings.Contains(result.Stdout, "narrow-secret") || readOptionalFile(t, settingsConfigPath(env)) != "" {
+		t.Fatal("declined approval sent credentials or saved settings")
 	}
 }

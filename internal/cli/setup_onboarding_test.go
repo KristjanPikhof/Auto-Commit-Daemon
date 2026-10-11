@@ -3,7 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+
 	"errors"
 	"io"
 	"path/filepath"
@@ -16,20 +16,18 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settingsui"
 )
 
-func TestSetupNonInteractiveRequiresExplicitProvider(t *testing.T) {
+func TestSetupNonInteractiveDefaultsToOfflineLocal(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "")
 	cmd := newSetupCommand(false)
 	roots := paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}
-	_, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{}, true, true)
-	if err == nil || !strings.Contains(err.Error(), "requires --provider") {
-		t.Fatalf("missing provider: %v", err)
-	}
-	state, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{Provider: "deterministic"}, true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Selection.Provider != "deterministic" || state.Configuration.Values[config.FieldDiffEgress] != "false" || state.Credential != "" {
-		t.Fatalf("explicit offline setup changed: %+v", state.Selection)
+	for _, opts := range []setupOnboardingOptions{{}, {Provider: "deterministic"}} {
+		state, err := prepareSetupOnboarding(cmd, roots, opts, true, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Selection.Strategy != "local" || state.Selection.Provider != "deterministic" || state.Configuration.Values[config.FieldDiffEgress] != "false" || state.Credential != "" {
+			t.Fatalf("offline setup changed: %+v", state.Selection)
+		}
 	}
 }
 
@@ -75,43 +73,14 @@ func TestSetupRepositoryConsentIsSeparateAndReportsPartialSuccess(t *testing.T) 
 	}
 }
 
-func TestSetupDryRunRecommendsEverydayAIWithoutCredentials(t *testing.T) {
-	t.Setenv(ai.EnvAPIKey, "")
-	cmd := newSetupCommand(false)
-	cmd.SetIn(strings.NewReader(""))
-	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetErr(&bytes.Buffer{})
-	state, err := prepareSetupOnboarding(cmd, paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}, setupOnboardingOptions{}, true, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	values := state.Configuration.Values
-	if values[config.FieldCommitStrategy] != "intent" ||
-		values[config.FieldCommitPreset] != "balanced" ||
-		values[config.FieldCommitFormat] != "imperative" ||
-		values[config.FieldProvider] != "openai-compat" ||
-		values[config.FieldModel] != "gpt-6-luna" ||
-		values[config.FieldDiffEgress] != "true" ||
-		values[config.FieldIntentRepairEnabled] != "true" {
-		t.Fatalf("fresh values = %+v", values)
-	}
-	body, err := json.Marshal(state.Configuration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(body), "API_KEY") || strings.Contains(string(body), "sk-") {
-		t.Fatalf("serialized setup contains credential material: %s", body)
-	}
-}
-
-func TestSetupDryRunOpenAIIncludesPublicConsents(t *testing.T) {
+func TestSetupDryRunIntentIncludesExactTransportConsents(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "")
 	cmd := newSetupCommand(false)
 	cmd.SetIn(strings.NewReader(""))
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	state, err := prepareSetupOnboarding(cmd, paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}, setupOnboardingOptions{
-		Experience: "everyday", CommitFormat: "conventional",
+		Strategy: "intent", CommitFormat: "conventional",
 		Provider: "openai-compat", BaseURL: "http://gateway.example/v1/", Model: "model-one",
 	}, true, false)
 	if err != nil {
@@ -123,10 +92,11 @@ func TestSetupDryRunOpenAIIncludesPublicConsents(t *testing.T) {
 	want := map[ai.ConfirmationRequirement]bool{
 		ai.ConfirmationEndpointCredentials:         true,
 		ai.ConfirmationInsecureEndpointCredentials: true,
-		ai.ConfirmationDiffEgress:                  true,
-		ai.ConfirmationIntentRepair:                true,
 	}
 	for _, confirmation := range state.Configuration.Confirmations {
+		if confirmation == ai.ConfirmationDiffEgress {
+			t.Fatal("fresh setup authorized default diff transmission")
+		}
 		delete(want, confirmation)
 	}
 	if len(want) != 0 {
@@ -134,6 +104,9 @@ func TestSetupDryRunOpenAIIncludesPublicConsents(t *testing.T) {
 	}
 	if state.Configuration.Values[config.FieldCommitFormat] != "conventional" {
 		t.Fatalf("commit format = %q", state.Configuration.Values[config.FieldCommitFormat])
+	}
+	if state.Configuration.Values[config.FieldDiffEgress] != "false" {
+		t.Fatal("fresh setup enabled diff egress")
 	}
 }
 
@@ -154,11 +127,10 @@ func TestSetupNonTTYUsesAccessibleWizard(t *testing.T) {
 		opts settingsui.ConfigureWizardOptions,
 	) (settingsui.ConfigureSelection, error) {
 		accessible = opts.Accessible
-		if opts.Defaults[config.FieldProvider] != "openai-compat" {
-			t.Fatal("fresh setup did not recommend AI")
+		if opts.Defaults[config.FieldProvider] != "deterministic" || opts.Defaults[config.FieldCommitStrategy] != "local" || opts.Defaults[config.FieldCommitFormat] != "imperative" {
+			t.Fatalf("fresh accessible setup lost offline defaults: %+v", opts.Defaults)
 		}
 		selection := configureSelectionFromValues(opts.Defaults)
-		selection.Provider = "deterministic"
 		return selection, nil
 	}
 
@@ -189,7 +161,7 @@ func TestSetupRejectsUnsafeEndpointBeforeProviderCall(t *testing.T) {
 		"ftp://example.test/v1",
 	} {
 		_, err := prepareSetupOnboarding(cmd, paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}, setupOnboardingOptions{
-			Provider: "openai-compat", BaseURL: endpoint, Model: "model-one",
+			Strategy: "intent", Provider: "openai-compat", BaseURL: endpoint, Model: "model-one",
 		}, true, false)
 		if err == nil {
 			t.Fatalf("unsafe endpoint accepted: %s", endpoint)

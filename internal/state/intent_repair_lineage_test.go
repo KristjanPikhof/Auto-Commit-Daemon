@@ -3,14 +3,15 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 )
 
 func TestIntentRepairV30MigrationPreservesProvenanceAndAllowsSplitMapping(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	d, path := openTestDB(t)
-	if err := SaveIntentRepair(ctx, d, IntentRepair{ID: "legacy-mapping", BranchRef: "refs/heads/main", BranchGeneration: 2, ExpectedHead: "mixed", PlanDigest: testIntentRepairPlanDigest, MembershipMode: IntentRepairMembershipNone, Commits: []IntentRepairCommit{{CandidateID: sql.NullString{String: "goal-a", Valid: true}, OldOID: "mixed"}}}); err != nil {
+	d, path := openLegacyTestDB(t)
+	if err := fixtureSaveIntentRepair(ctx, d, IntentRepair{ID: "legacy-mapping", BranchRef: "refs/heads/main", BranchGeneration: 2, ExpectedHead: "mixed", PlanDigest: testIntentRepairPlanDigest, MembershipMode: IntentRepairMembershipNone, Commits: []IntentRepairCommit{{CandidateID: sql.NullString{String: "goal-a", Valid: true}, OldOID: "mixed"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.Close(); err != nil {
@@ -42,7 +43,10 @@ PRAGMA user_version=29;
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
 	}
-	migrated, err := OpenRuntime(ctx, path)
+	if _, err := OpenRuntime(ctx, path); !errors.Is(err, ErrSetupRequired) {
+		t.Fatalf("implicit upgrade: %v", err)
+	}
+	migrated, err := Open(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}

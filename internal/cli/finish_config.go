@@ -41,7 +41,7 @@ func resolveFinishWorkerConfigInputs(ctx context.Context, roots paths.Roots, run
 	} else {
 		values, approved, err = finishSavedValues(roots, runtime.worktree.Root)
 		if err == nil {
-			out.ConfigDigest, err = config.SettingsFingerprint(values, config.PresetResolution{})
+			out.ConfigDigest, err = config.SettingsFingerprint(values)
 		}
 	}
 	if err != nil {
@@ -87,27 +87,12 @@ func resolveFinishWorkerConfigInputs(ctx context.Context, roots paths.Roots, run
 }
 
 func finishApprovedRevision(ctx context.Context, db *state.DB) (state.ConfigRevision, bool, error) {
+	if db == nil {
+		return state.ConfigRevision{}, false, nil
+	}
 	active, err := state.RuntimeConfigActivationState(ctx, db)
 	if err != nil {
 		return state.ConfigRevision{}, false, err
-	}
-	if active.DesiredRevisionID.Valid && active.DesiredRequestID.Valid {
-		request, err := state.ActivationRequestByID(ctx, db, active.DesiredRequestID.Int64)
-		if err != nil {
-			return state.ConfigRevision{}, false, err
-		}
-		eligible := request.RevisionID == active.DesiredRevisionID.Int64 && (request.Status == state.ActivationPending || request.Status == state.ActivationAcknowledged || request.Status == state.ActivationApplied)
-		if eligible {
-			validation, exists, err := state.LatestConfigValidationForRequest(ctx, db, request.ID)
-			if err != nil {
-				return state.ConfigRevision{}, false, err
-			}
-			eligible = !exists || (validation.ActivationRequestID == request.ID && validation.RevisionID == request.RevisionID && validation.Status == state.ConfigValidationPassed)
-		}
-		if eligible {
-			revision, err := state.ConfigRevisionByID(ctx, db, request.RevisionID)
-			return revision, err == nil, err
-		}
 	}
 	for _, id := range []int64{active.AppliedRevisionID.Int64, active.LastKnownGoodRevisionID.Int64} {
 		if id > 0 {
@@ -116,7 +101,7 @@ func finishApprovedRevision(ctx context.Context, db *state.DB) (state.ConfigRevi
 		}
 	}
 	if active.DesiredRevisionID.Valid || active.DesiredRequestID.Valid {
-		return state.ConfigRevision{}, false, errors.New("finish: configuration is not approved for use; review its validation with acd config")
+		return state.ConfigRevision{}, false, errors.New("finish: configuration is not approved for use; approve its settings with acd config")
 	}
 	return state.ConfigRevision{}, false, nil
 }
@@ -147,7 +132,7 @@ func finishSavedValues(roots paths.Roots, repo string) (map[string]string, []ai.
 	if err != nil {
 		return nil, nil, err
 	}
-	fingerprint, err := config.SettingsFingerprint(values, config.PresetResolution{})
+	fingerprint, err := config.SettingsFingerprint(values)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -40,9 +40,7 @@ type ConfigureWizardOptions struct {
 // ConfigureSelection is an in-memory draft. Callers must discard Credential
 // after the protected store has accepted it.
 type ConfigureSelection struct {
-	Experience                  string
 	Strategy                    string
-	Preset                      string
 	CommitFormat                string
 	Provider                    string
 	Model                       string
@@ -58,7 +56,6 @@ type ConfigureSelection struct {
 	VerificationSource          string
 	ExecutionMode               string
 	VerificationApproved        bool
-	RepairApproved              bool
 	Confirmed                   bool
 }
 
@@ -74,7 +71,6 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	defaults := opts.Defaults
 	selection := ConfigureSelection{
 		Strategy:        fallback(defaults["commit.strategy"], "local"),
-		Preset:          defaults["commit.preset"],
 		CommitFormat:    fallback(defaults["commit.format"], "imperative"),
 		Provider:        fallback(defaults["ai.provider"], "deterministic"),
 		Model:           fallback(defaults["ai.model"], config.DefaultOpenAIModel),
@@ -93,14 +89,13 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 			return ConfigureSelection{}, err
 		}
 	}
-	selection.Experience = selection.Strategy
 	if opts.IncludeCommitFormat {
 		formatForm := huh.NewForm(huh.NewGroup(
 			huh.NewSelect[string]().Key("commit-format").Title("How should commit messages look?").
 				Description("Imperative: Fix setup retries. Conventional: fix: handle setup retries.").
 				Options(
-					huh.NewOption("Imperative (recommended)", "imperative"),
-					huh.NewOption("Conventional Commits", "conventional"),
+					huh.NewOption("Imperative (recommended): Fix setup retries", "imperative"),
+					huh.NewOption("Conventional: fix: handle setup retries", "conventional"),
 				).Value(&selection.CommitFormat),
 		))
 		if err := runConfigureForm(ctx, formatForm, opts); err != nil {
@@ -110,18 +105,18 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 
 	if selection.Strategy == "local" {
 		selection.Provider = "deterministic"
-	} else if opts.CredentialStatus != nil {
+	}
+	providerKind, subprocessName := configureProviderParts(selection.Provider)
+	configuredProviderKind := providerKind
+	if providerKind == "openai-compat" && opts.CredentialStatus != nil {
 		var err error
 		opts.HasCredential, err = opts.CredentialStatus()
 		if err != nil {
 			return ConfigureSelection{}, err
 		}
 	}
-	providerKind, subprocessName := configureProviderParts(selection.Provider)
 	providerReady := opts.ProviderConfigured && (providerKind == "subprocess" ||
-		(providerKind == "openai-compat" && opts.HasCredential) ||
-		(providerKind == "deterministic" &&
-			!(selection.Strategy == "intent" && selection.Preset == "quality")))
+		(providerKind == "openai-compat" && opts.HasCredential))
 	providerSelected := false
 	if selection.Strategy == "intent" && !providerReady {
 		options := []huh.Option[string]{
@@ -133,7 +128,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		}
 		providerForm := huh.NewForm(huh.NewGroup(
 			huh.NewSelect[string]().Key("provider").Title("Which provider should Intent use?").
-				Description("AI can group related code, tests, and documentation into one meaningful commit. Local rules work offline with more limited grouping and messages.").
+				Description("AI can group related code, tests, and documentation into one meaningful commit. Repository data is shared only with your approval.").
 				Options(options...).Value(&providerKind),
 		))
 		if err := runConfigureForm(ctx, providerForm, opts); err != nil {
@@ -143,6 +138,13 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	}
 	switch providerKind {
 	case "openai-compat":
+		if configuredProviderKind != "openai-compat" && opts.CredentialStatus != nil {
+			var err error
+			opts.HasCredential, err = opts.CredentialStatus()
+			if err != nil {
+				return ConfigureSelection{}, err
+			}
+		}
 		if providerSelected || !opts.OpenAIConfigured {
 			providerForm := huh.NewForm(huh.NewGroup(
 				huh.NewInput().Key("endpoint").
@@ -220,7 +222,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 
 func readConfigureSecret(input io.Reader, output io.Writer) (string, error) {
 	if file, ok := input.(*os.File); ok && term.IsTerminal(file.Fd()) {
-		if _, err := fmt.Fprint(output, "API key (masked; stored only after tests pass): "); err != nil {
+		if _, err := fmt.Fprint(output, "API key (masked; stored after approval): "); err != nil {
 			return "", err
 		}
 		value, err := term.ReadPassword(file.Fd())
@@ -230,7 +232,7 @@ func readConfigureSecret(input io.Reader, output io.Writer) (string, error) {
 		}
 		return strings.TrimSpace(string(value)), nil
 	}
-	if _, err := fmt.Fprintln(output, "API key: [read without rendering; stored only after tests pass]"); err != nil {
+	if _, err := fmt.Fprintln(output, "API key: [read without rendering; stored after approval]"); err != nil {
 		return "", err
 	}
 	line, err := readConfigureSecretLine(input, 32*1024)
@@ -270,55 +272,14 @@ func readConfigureSecretLine(input io.Reader, limit int) (string, error) {
 // projection before asking for the single apply confirmation.
 type ConfigurePreviewApproval struct {
 	Verification bool
-	Repair       bool
 	Apply        bool
 }
 
 type ConfigurePreviewApprovalOptions struct {
 	VerificationMode    string
 	VerificationCommand string
-	RepairEnabled       bool
-	RepairHorizon       string
-	RepairMaxCommits    string
 	Global              bool
 	Action              string
-}
-
-type ConfigureRecoveryChoice string
-
-const (
-	ConfigureRecoveryRetry    ConfigureRecoveryChoice = "retry"
-	ConfigureRecoverySwitch   ConfigureRecoveryChoice = "switch"
-	ConfigureRecoveryAdvanced ConfigureRecoveryChoice = "advanced"
-	ConfigureRecoveryLeave    ConfigureRecoveryChoice = "leave"
-)
-
-func ChooseConfigureRecovery(
-	ctx context.Context,
-	input io.Reader,
-	output io.Writer,
-	accessible bool,
-) (ConfigureRecoveryChoice, error) {
-	choice := ConfigureRecoveryRetry
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[ConfigureRecoveryChoice]().
-			Title("Previous configuration validation needs attention").
-			Description("The reviewed setup is preserved; capture remains active and commit publishing is paused.").
-			Options(
-				huh.NewOption("Retry the same exact check", ConfigureRecoveryRetry),
-				huh.NewOption("Switch experience", ConfigureRecoverySwitch),
-				huh.NewOption("Open advanced settings", ConfigureRecoveryAdvanced),
-				huh.NewOption("Leave capture-only state unchanged", ConfigureRecoveryLeave),
-			).Value(&choice),
-	))
-	if accessible || os.Getenv("NO_COLOR") != "" {
-		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
-	}
-	if err := form.WithAccessible(accessible).WithInput(input).
-		WithOutput(output).WithShowHelp(true).RunWithContext(ctx); err != nil {
-		return "", err
-	}
-	return choice, nil
 }
 
 // ConfirmConfigurePreview binds one consent to every permission shown in the
@@ -348,7 +309,6 @@ func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Wri
 	}
 	approval.Verification = approval.Apply &&
 		(opts.VerificationMode == "fast" || opts.VerificationMode == "full")
-	approval.Repair = approval.Apply && opts.RepairEnabled
 	return approval, nil
 }
 
@@ -370,41 +330,5 @@ func configureProviderParts(value string) (string, string) {
 		return value, ""
 	default:
 		return "openai-compat", ""
-	}
-}
-
-func configureVerificationMode(strategy, preset string) string {
-	if strategy != "intent" {
-		return "none"
-	}
-	switch preset {
-	case "balanced":
-		return "structural"
-	case "quality":
-		return "full"
-	default:
-		return "none"
-	}
-}
-
-func configureExperience(strategy, preset string) string {
-	switch {
-	case strategy == "event" && preset == "fast":
-		return "speed"
-	case strategy == "intent" && preset == "quality":
-		return "strict"
-	default:
-		return "everyday"
-	}
-}
-
-func configureExperienceMode(experience string) (string, string) {
-	switch experience {
-	case "speed":
-		return "event", "fast"
-	case "strict":
-		return "intent", "quality"
-	default:
-		return "intent", "balanced"
 	}
 }

@@ -53,6 +53,9 @@ var stopWaitTimeout = 5 * time.Second
 // stopPollInterval is the busy-loop polling cadence inside stopWaitTimeout.
 var stopPollInterval = 100 * time.Millisecond
 
+// Retained only to remove cache files left by pre-supervisor runtimes.
+const startCacheFilenamePrefix = "start-cache-"
+
 func runStopRegistry(ctx context.Context, out io.Writer, force, jsonOut bool, reg *central.Registry) error {
 	out_all := stopAllResult{
 		Stopped:  []stopRepoResult{},
@@ -126,24 +129,12 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	if err != nil {
 		return res, fmt.Errorf("acd stop: resolve git dir: %w", err)
 	}
-	// Old runtimes may still have cached session ownership. Remove all caches
-	// after a stop or failed forced stop; otherwise remove the closed session.
+	if sessionID != "" {
+		return res, invalidCommandError("session ownership has been removed; use `acd off` to stop protection")
+	}
 	defer func() {
-		if res.Stopped {
+		if res.Stopped || force {
 			removeAllStartCaches(gitDir)
-			return
-		}
-		if force {
-			// `force=true` and !Stopped means we either swallowed a
-			// SIGKILL ("daemon survived SIGKILL") or we never even
-			// got that far. Either way the cache cannot be trusted.
-			removeAllStartCaches(gitDir)
-			return
-		}
-		if sessionID != "" {
-			// Default-mode Deferred: caller's row was deregistered
-			// but peers remain. Drop just the caller's cache.
-			_ = os.Remove(startCachePath(gitDir, sessionID))
 		}
 	}()
 	clock, err := daemon.AcquireControlLock(gitDir)
@@ -153,65 +144,17 @@ func stopOneRepo(ctx context.Context, repo, sessionID string, force bool) (stopR
 	defer func() { _ = clock.Release() }()
 
 	dbPath := state.DBPathFromGitDir(gitDir)
-	if sessionID == "" {
-		st, _, err := state.LoadDaemonStateReadOnly(ctx, dbPath)
-		if err != nil {
-			return res, fmt.Errorf("acd stop: load daemon state read-only: %w", err)
-		}
-		res.DaemonPID = st.PID
-		load := func(ctx context.Context) (state.DaemonState, bool, error) {
-			return state.LoadDaemonStateReadOnly(ctx, dbPath)
-		}
-		res = stopDaemonProcess(ctx, res, st, force, load)
-		return res, nil
-	}
-
-	// Explicit-session stops update daemon_clients, so they must use the
-	// schema-aware writable path and refuse databases newer than this binary.
-	db, err := state.Open(ctx, dbPath)
+	st, _, err := state.LoadDaemonStateReadOnly(ctx, dbPath)
 	if err != nil {
-		return res, fmt.Errorf("acd stop: open state.db: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	st, _, err := state.LoadDaemonState(ctx, db)
-	if err != nil {
-		return res, fmt.Errorf("acd stop: load daemon state: %w", err)
+		return res, fmt.Errorf("acd off: load daemon state read-only: %w", err)
 	}
 	res.DaemonPID = st.PID
 	load := func(ctx context.Context) (state.DaemonState, bool, error) {
-		return state.LoadDaemonState(ctx, db)
+		return state.LoadDaemonStateReadOnly(ctx, dbPath)
 	}
-
-	// Refcount-aware explicit-session path: drop the caller's row first,
-	// then inspect remaining peers.
-	if !force {
-		existed, err := state.DeregisterClient(ctx, db, sessionID)
-		if err != nil {
-			return res, fmt.Errorf("acd stop: deregister: %w", err)
-		}
-		if !existed {
-			res.UnknownSession = true
-		}
-		remaining, err := state.CountClients(ctx, db)
-		if err != nil {
-			return res, fmt.Errorf("acd stop: count clients: %w", err)
-		}
-		if remaining > 0 {
-			res.Deferred = true
-			res.Peers = remaining
-			res.Reason = fmt.Sprintf("%d peer(s) remain", remaining)
-			return res, nil
-		}
-		res = stopDaemonProcess(ctx, res, st, false, load)
-		return res, nil
-	}
-
-	// --force path: optionally deregister the named session, then SIGTERM
-	// the daemon, escalate to SIGKILL after stopWaitTimeout.
-	_, _ = state.DeregisterClient(ctx, db, sessionID)
-	res = stopDaemonProcess(ctx, res, st, true, load)
+	res = stopDaemonProcess(ctx, res, st, force, load)
 	return res, nil
+
 }
 
 type daemonStateLoader func(context.Context) (state.DaemonState, bool, error)

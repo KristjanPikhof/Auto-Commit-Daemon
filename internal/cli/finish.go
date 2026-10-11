@@ -18,18 +18,33 @@ import (
 
 func newFinishCmd() *cobra.Command {
 	var params finishStartParams
-	cmd := &cobra.Command{Use: "finish [PURPOSE]", Short: "Commit the current protected work", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) > 0 {
-			params.Purpose = args[0]
-		}
-		if params.RetryID != "" && (len(args) > 0 || cmd.Flags().Changed("message") || cmd.Flags().Changed("include-staged")) {
-			return invalidCommandError("acd finish: --retry cannot change purpose, message or staged consent")
-		}
-		repo, _ := cmd.Flags().GetString("repo")
-		jsonOut, _ := cmd.Flags().GetBool("json")
-		quiet, _ := cmd.Flags().GetBool("quiet")
-		return runFinish(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), repo, params, jsonOut, quiet)
-	}}
+	cmd := &cobra.Command{Use: "finish [PURPOSE]", Short: "Commit the current protected work",
+		Long: `Create local commits from a fresh complete checkpoint of this worktree.
+
+Local mode commits the complete batch without a provider. Intent mode plans
+complete goals and verifies every proposed tree before publishing the chain.
+Later edits remain saved for the next finish. This command never pushes.
+
+Use --dry-run to plan and check without moving the branch or index. Staged
+changes require --include-staged. Retry a failed request with --retry ID to
+keep its exact frozen target.`,
+		Example: `  acd finish "Add offline checkout"
+  acd finish --message "Update setup guidance"
+  acd finish --dry-run
+  acd finish --include-staged
+  acd finish --retry REQUEST_ID`,
+		Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				params.Purpose = args[0]
+			}
+			if params.RetryID != "" && (len(args) > 0 || cmd.Flags().Changed("message") || cmd.Flags().Changed("include-staged")) {
+				return invalidCommandError("acd finish: --retry cannot change purpose, message or staged consent")
+			}
+			repo, _ := cmd.Flags().GetString("repo")
+			jsonOut, _ := cmd.Flags().GetBool("json")
+			quiet, _ := cmd.Flags().GetBool("quiet")
+			return runFinish(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), repo, params, jsonOut, quiet)
+		}}
 	cmd.Flags().BoolVar(&params.DryRun, "dry-run", false, "Plan and check without moving the branch or index")
 	cmd.Flags().BoolVar(&params.IncludeStaged, "include-staged", false, "Include the exact current staged selection")
 	cmd.Flags().StringVar(&params.RetryID, "retry", "", "Retry or reconnect to a saved request")

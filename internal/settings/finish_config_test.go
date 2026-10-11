@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,7 @@ func TestFinishConfigLocalApplyNeedsNoProviderTestOrCredentials(t *testing.T) {
 	svc, _ := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		probes.Add(1)
 		return ai.ProviderProbeResult{}, nil
-	}, nil)
+	})
 	svc.credentialLookup = func(string) (string, bool) { credentialsRead.Add(1); return "secret", true }
 	// An unusable provider is inert in local mode, including credential lookup.
 	draft := map[string]string{config.FieldProvider: "openai-compat", config.FieldBaseURL: "not-a-url", config.FieldCommitFormat: "conventional"}
@@ -27,7 +28,7 @@ func TestFinishConfigLocalApplyNeedsNoProviderTestOrCredentials(t *testing.T) {
 		t.Fatalf("offline validation=%+v error=%v", validation, err)
 	}
 	result, err := svc.Apply(context.Background(), ApplyRequest{Values: draft, ExpectedGeneration: validation.SourceGeneration})
-	if err != nil || !result.Queued {
+	if err != nil || !result.Applied {
 		t.Fatalf("offline apply=%+v error=%v", result, err)
 	}
 	if probes.Load() != 0 || credentialsRead.Load() != 0 {
@@ -50,7 +51,7 @@ func TestFinishConfigLocalApplyNeedsNoProviderTestOrCredentials(t *testing.T) {
 		}
 	}
 	var publication int
-	if err := svc.db.SQL().QueryRow("SELECT (SELECT COUNT(*) FROM publication_drains)+(SELECT COUNT(*) FROM flush_requests)").Scan(&publication); err != nil || publication != 0 {
+	if err := svc.db.SQL().QueryRow("SELECT (SELECT COUNT(*) FROM finish_requests)+(SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('publication_drains','flush_requests'))").Scan(&publication); err != nil || publication != 0 {
 		t.Fatalf("configuration requested publication: %d %v", publication, err)
 	}
 }
@@ -65,7 +66,7 @@ func TestFinishConfigIntentApplyDoesNotProbe(t *testing.T) {
 	}, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		probes.Add(1)
 		return ai.ProviderProbeResult{}, nil
-	}, nil)
+	})
 	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldDiffEgress: "true", config.FieldCommitFormat: "imperative"}
 	v, err := svc.Validate(context.Background(), draft, nil)
 	if err != nil {
@@ -75,7 +76,7 @@ func TestFinishConfigIntentApplyDoesNotProbe(t *testing.T) {
 		t.Fatalf("privacy approval=%v", v.Missing)
 	}
 	result, err := svc.Apply(context.Background(), ApplyRequest{Values: draft, ExpectedGeneration: v.SourceGeneration, Confirmations: []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress}})
-	if err != nil || !result.Queued || probes.Load() != 0 {
+	if err != nil || !result.Applied || probes.Load() != 0 {
 		t.Fatalf("Intent apply=%+v error=%v probes=%d", result, err, probes.Load())
 	}
 }
@@ -85,7 +86,7 @@ func TestFinishConfigLegacySnapshotIsReadonlyAndScoped(t *testing.T) {
 	svc, roots := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		probes.Add(1)
 		return ai.ProviderProbeResult{}, nil
-	}, nil)
+	})
 	if err := os.MkdirAll(roots.Config, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -114,9 +115,6 @@ func TestFinishConfigLegacySnapshotIsReadonlyAndScoped(t *testing.T) {
 			t.Fatal("legacy control exposed")
 		}
 	}
-	if repo.Experiment != nil || repo.PresetID != "" {
-		t.Fatal("retired dashboard exposed")
-	}
 	_ = svc.db.SQL().QueryRow("SELECT total_changes()").Scan(&after)
 	current, _ := os.ReadFile(roots.ConfigPath())
 	if string(body) != string(current) || before != after || probes.Load() != 0 {
@@ -134,12 +132,95 @@ func TestFinishConfigLegacySnapshotIsReadonlyAndScoped(t *testing.T) {
 }
 
 func TestFinishConfigRemovedSettingsFailWithGuidance(t *testing.T) {
-	svc, _ := testService(t, nil, nil, func(context.Context, state.DaemonState) error { return nil })
+	svc, _ := testService(t, nil, nil)
 	value := "10"
 	for _, name := range []string{config.FieldCommitPreset, config.FieldIntentWindow, config.FieldIntentRepairEnabled, "capture.max_pending_events"} {
 		_, err := svc.Save(context.Background(), SaveRequest{Scope: ScopeGlobal, Values: map[string]*string{name: &value}})
 		if err == nil || !strings.Contains(err.Error(), "was removed") || !strings.Contains(err.Error(), "acd finish") {
 			t.Fatalf("%s error=%v", name, err)
 		}
+	}
+}
+
+func TestFinishConfigApplyApprovesCommandWithoutExecutingIt(t *testing.T) {
+	for _, mode := range []string{"local", "intent"} {
+		t.Run(mode, func(t *testing.T) {
+			svc, _ := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+				t.Fatal("apply contacted provider")
+				return ai.ProviderProbeResult{}, nil
+			})
+			marker := filepath.Join(t.TempDir(), "project-check-ran")
+			command := "touch '" + marker + "'"
+			draft := map[string]string{config.FieldCommitStrategy: mode, config.FieldProvider: "openai-compat", config.FieldIntentVerification: "full", config.FieldVerificationFullCommand: command}
+			svc.credentialLookup = func(string) (string, bool) { return "approved-key", true }
+			validation, err := svc.Validate(context.Background(), draft, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(validation.Missing) != 1 || validation.Missing[0] != ai.ConfirmationVerificationCommand {
+				t.Fatalf("command approval = %v", validation.Missing)
+			}
+			if _, err := svc.Apply(context.Background(), ApplyRequest{Values: draft, ExpectedGeneration: validation.SourceGeneration}); err == nil {
+				t.Fatal("unapproved command applied")
+			}
+			result, err := svc.Apply(context.Background(), ApplyRequest{Values: draft, TestedFingerprint: validation.Fingerprint, ExpectedGeneration: validation.SourceGeneration, Confirmations: []ai.ConfirmationRequirement{ai.ConfirmationVerificationCommand}})
+			if err != nil || !result.Applied {
+				t.Fatalf("approved configuration = %+v: %v", result, err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("apply executed project check: %v", err)
+			}
+			revision, err := state.ConfigRevisionByID(context.Background(), svc.db, result.RevisionID)
+			if err != nil || !strings.Contains(revision.SnapshotJSON, command) || !strings.Contains(revision.SnapshotJSON, "verification_command") {
+				t.Fatalf("exact command/approval lost: %s: %v", revision.SnapshotJSON, err)
+			}
+		})
+	}
+}
+
+func TestFinishConfigIntentSubprocessIgnoresUnrelatedCredentials(t *testing.T) {
+	svc, _ := testService(t, nil, nil)
+	svc.credentialLookup = func(string) (string, bool) { t.Fatal("subprocess read API credentials"); return "", false }
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "subprocess:local-ai"}
+	validation, err := svc.Validate(context.Background(), draft, []ai.ConfirmationRequirement{ai.ConfirmationSubprocessExecution})
+	if err != nil || validation.ProviderConfig.APIKey != "" || len(validation.Missing) != 0 {
+		t.Fatalf("subprocess configuration = %+v: %v", validation, err)
+	}
+}
+
+func TestFinishConfigRejectsIntentWithoutAITransport(t *testing.T) {
+	svc, _ := testService(t, nil, nil)
+	_, err := svc.Apply(context.Background(), ApplyRequest{Values: map[string]string{config.FieldCommitStrategy: "intent"}})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "local") {
+		t.Fatalf("unusable Intent config approved: %v", err)
+	}
+	var revisions int
+	if err := svc.db.SQL().QueryRow("SELECT COUNT(*) FROM config_revisions").Scan(&revisions); err != nil || revisions != 0 {
+		t.Fatalf("invalid configuration stored: %d: %v", revisions, err)
+	}
+}
+
+func TestFinishConfigGlobalHTTPApprovalRemainsExactAndDoesNotProbe(t *testing.T) {
+	svc, roots := testGlobalService(t, func(name string) (string, bool) { return "approved-key", name == ai.EnvAPIKey }, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		t.Fatal("saving approval contacted provider")
+		return ai.ProviderProbeResult{}, nil
+	})
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldBaseURL: "http://127.0.0.1:12345/v1"}
+	confirmations := []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials}
+	validation, err := svc.Validate(context.Background(), draft, confirmations)
+	if err != nil || len(validation.Missing) != 0 {
+		t.Fatalf("HTTP consent = %+v: %v", validation, err)
+	}
+	_, err = svc.SaveGlobalSetup(context.Background(), SaveGlobalSetupRequest{Values: draft, TestedFingerprint: validation.Fingerprint, ExpectedGeneration: validation.SourceGeneration, Confirmations: confirmations})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := config.NewStore(roots).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, ok := config.ActiveGlobalSetupApproval(doc)
+	if !ok || approval.Fingerprint != validation.Fingerprint || len(approval.Confirmations) != 2 {
+		t.Fatalf("exact HTTP approval = %+v: %t", approval, ok)
 	}
 }

@@ -26,17 +26,6 @@ type FieldSnapshot struct {
 	InheritedValue      string
 }
 
-type ExperimentSnapshot struct {
-	ID                  int64
-	BaselineRevisionID  int64
-	CandidateRevisionID int64
-	WindowBudget        int
-	CompletedWindows    int
-	ExpiresAt           time.Time
-	FailurePolicy       string
-	Status              string
-}
-
 type Snapshot struct {
 	Scope                   Scope
 	Profile                 string
@@ -53,11 +42,7 @@ type Snapshot struct {
 	PendingStatus           string
 	DaemonMode              string
 	DaemonRunning           bool
-	Experiment              *ExperimentSnapshot `json:"-"`
 	Profiles                []string
-	PresetID                string `json:"-"`
-	PresetVersion           int    `json:"-"`
-	PresetCustomized        bool   `json:"-"`
 }
 
 // Snapshot projects authoring and runtime state without writing config or DB.
@@ -76,14 +61,12 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 	activeProfile := ""
 	currentInput := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)}
 	inheritedInput := currentInput
-	var selectedScope config.Overrides
 	switch scope {
 	case ScopeRepository:
 		activeProfile = repo.Profile
 		currentInput.Repository = repo.Fields
 		currentInput.Profile = doc.Settings.Profiles[activeProfile].Fields
 		currentInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"repository:" + s.repoHash, "profile:" + activeProfile, "global"}, s.lookupEnv)
-		selectedScope = currentInput.Repository
 		inheritedInput = currentInput
 		inheritedInput.Repository = nil
 		inheritedInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"profile:" + activeProfile, "global"}, s.lookupEnv)
@@ -91,12 +74,10 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 		activeProfile = profileName
 		currentInput.Profile = doc.Settings.Profiles[activeProfile].Fields
 		currentInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"profile:" + activeProfile, "global"}, s.lookupEnv)
-		selectedScope = currentInput.Profile
 		inheritedInput = currentInput
 		inheritedInput.Profile = nil
 		inheritedInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)
 	case ScopeGlobal:
-		selectedScope = currentInput.Global
 		inheritedInput.Global = nil
 		inheritedInput.LegacyDefaults = config.LegacyFinishDefaults(doc, nil, s.lookupEnv)
 	}
@@ -125,11 +106,11 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 			}
 		}
 	}
-	resolvedFields, _, err := config.ResolveAll(currentInput, selectedScope)
+	resolvedFields, err := config.ResolveAll(currentInput)
 	if err != nil {
 		return Snapshot{}, sanitizeError(err)
 	}
-	inheritedFields, _, err := config.ResolveAll(inheritedInput, nil)
+	inheritedFields, err := config.ResolveAll(inheritedInput)
 	if err != nil {
 		return Snapshot{}, sanitizeError(err)
 	}

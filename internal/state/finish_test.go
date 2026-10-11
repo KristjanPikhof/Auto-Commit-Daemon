@@ -309,7 +309,7 @@ func TestFinishSchemaUpgradeAndReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer upgraded.Close()
-	if version, err := upgraded.UserVersion(ctx); err != nil || version != 31 {
+	if version, err := upgraded.UserVersion(ctx); err != nil || version != SchemaVersion {
 		t.Fatalf("upgrade %d %v", version, err)
 	}
 	startFinishFixture(t, upgraded, original)

@@ -11,14 +11,7 @@ import (
 // Projection tests inspect the read-only report separately from the product
 // envelope. Human assertions use the production detail renderers.
 func renderStatusProjectionFixture(out io.Writer, report statusReport) error {
-	renderRuntimeConfigHuman(out, report.RuntimeConfig)
-	renderConfigReadinessHuman(out, report.Configuration)
-	renderReplayObservabilityHuman(out, report.Replay)
-	renderIntentV2Human(out, report.IntentV2)
-	renderSelfPublicationHuman(out, report.SelfPublication, "")
-	renderPublicationDrainHuman(out, report.PublicationDrain)
-	renderProductPublicationProgress(out, report.PublicationProgress)
-	renderIntentStrategyHuman(out, report.IntentStrategy)
+	renderFinishOutcomeHuman(out, report.PublicationOutcome)
 	return nil
 }
 

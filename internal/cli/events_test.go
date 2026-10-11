@@ -170,7 +170,7 @@ func TestEventsErrorsAndCommandHelp(t *testing.T) {
 
 	var out bytes.Buffer
 	err := runEvents(context.Background(), &out, repo, "", 0, 10, false, time.Millisecond, false)
-	if err == nil || !strings.Contains(err.Error(), "state.db missing") {
+	if err == nil || !strings.Contains(err.Error(), "state.db missing") || !strings.Contains(err.Error(), "acd on --repo") || strings.Contains(err.Error(), "acd start") {
 		t.Fatalf("missing state error = %v, want actionable missing state.db error", err)
 	}
 	if err := runEvents(context.Background(), io.Discard, repo, "", -1, 10, false, time.Millisecond, false); err == nil {
@@ -184,12 +184,12 @@ func TestEventsErrorsAndCommandHelp(t *testing.T) {
 	var helpOut, helpErr bytes.Buffer
 	root.SetOut(&helpOut)
 	root.SetErr(&helpErr)
-	root.SetArgs([]string{"events", "--help"})
+	root.SetArgs([]string{"history", "activity", "--help"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("events help: %v\nstderr:\n%s", err, helpErr.String())
 	}
 	help := helpOut.String()
-	for _, want := range []string{"Show product-facing ACD decisions", "--watch", "--path", "--since", "--limit"} {
+	for _, want := range []string{"Show when ACD protected a change", "--watch", "--path", "--since", "--limit"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("events help missing %q:\n%s", want, help)
 		}
@@ -215,6 +215,9 @@ func TestEventsMissingDecisionLedgerIsReadOnly(t *testing.T) {
 	}
 	if len(rep.Events) != 0 || !strings.Contains(rep.Message, "Decision ledger is not available") {
 		t.Fatalf("unexpected events report: %+v", rep)
+	}
+	if !strings.Contains(rep.Message, "acd status") || strings.Contains(rep.Message, "restart acd") {
+		t.Fatalf("missing-ledger guidance=%q", rep.Message)
 	}
 	if after := mustSHA256(t, dbPath); after != before {
 		t.Fatalf("state.db checksum changed: before=%s after=%s", before, after)
@@ -271,35 +274,21 @@ func TestEventsJSONIncludesPlannerWindowForEvent(t *testing.T) {
 	registerRepo(t, roots, repo, dbPath, "codex")
 	ctx := context.Background()
 
-	if _, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
-		PlannedTS:           40,
-		Provider:            sqlNullStr("openai-compat"),
-		Model:               sqlNullStr("gpt-test"),
-		BranchRef:           "refs/heads/main",
-		BranchGeneration:    1,
-		Source:              sqlNullStr("openai-compat"),
-		CommitFormat:        sqlNullStr("imperative"),
-		OfferedSeqs:         []int64{10, 12},
-		VisibleOriginalSeqs: []int64{10, 11, 12},
-		HiddenSeqs:          []int64{11},
-		SelectedGroups: []state.IntentPlannerWindowGroup{{
-			SelectedSeqs:   []int64{10},
-			OriginalSeqs:   []int64{10, 11},
-			Subject:        "Update parser",
-			GroupingReason: "related parser edits",
-		}},
-		DeferredSeqs: []int64{12},
-		DeferredReasons: []state.IntentPlannerWindowDeferredReason{{
-			Seq:    12,
-			Reason: "separate docs change",
-		}},
-		Events: []state.IntentPlannerWindowEvent{
-			{EventSeq: 10, Offered: true, Selected: true, GroupOrd: sql.NullInt64{Int64: 0, Valid: true}},
-			{EventSeq: 11, Hidden: true, Selected: true, GroupOrd: sql.NullInt64{Int64: 0, Valid: true}},
-			{EventSeq: 12, Offered: true, Deferred: true},
-		},
-	}); err != nil {
-		t.Fatalf("AppendIntentPlannerWindow: %v", err)
+	result, err := db.SQL().ExecContext(ctx, `INSERT INTO intent_planner_windows(planned_ts,provider,model,branch_ref,branch_generation,source,commit_format,offered_seqs,visible_original_seqs,hidden_seqs,selected_groups,deferred_seqs,deferred_reasons)
+VALUES(40,'openai-compat','gpt-test','refs/heads/main',1,'openai-compat','imperative',
+'[10,12]','[10,11,12]','[11]',
+'[{"selected_seqs":[10],"original_seqs":[10,11],"subject":"Update parser","grouping_reason":"related parser edits"}]',
+'[12]','[{"seq":12,"reason":"separate docs change"}]')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	windowID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SQL().ExecContext(ctx, `INSERT INTO intent_planner_window_events(window_id,event_seq,offered,hidden,selected,deferred,group_ord)
+VALUES(?,10,1,0,1,0,0),(?,11,0,1,1,0,0),(?,12,1,0,0,1,NULL)`, windowID, windowID, windowID); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
 		DecisionTS:  41,

@@ -14,6 +14,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 func TestRepoHelpIncludesLifecycleCommands(t *testing.T) {
@@ -39,7 +40,7 @@ func TestRepoDisable_StopsClearsCachesPreservesState(t *testing.T) {
 	_ = db.Close()
 	registerRepo(t, roots, repo, stateDB, "")
 	gitDir := filepath.Dir(filepath.Dir(stateDB))
-	cachePath := startCachePath(gitDir, "repo-disable-test")
+	cachePath := legacyStartCachePath(gitDir, "repo-disable-test")
 	if err := os.WriteFile(cachePath, []byte("{}"), 0o600); err != nil {
 		t.Fatalf("write cache: %v", err)
 	}
@@ -243,7 +244,7 @@ func TestRepoRemove_YesStopsClearsCachesAndRemovesRegistry(t *testing.T) {
 	_ = db.Close()
 	registerRepo(t, roots, repo, stateDB, "")
 	gitDir := filepath.Dir(filepath.Dir(stateDB))
-	cachePath := startCachePath(gitDir, "repo-remove-test")
+	cachePath := legacyStartCachePath(gitDir, "repo-remove-test")
 	if err := os.WriteFile(cachePath, []byte("{}"), 0o600); err != nil {
 		t.Fatalf("write cache: %v", err)
 	}
@@ -360,7 +361,7 @@ func TestRepoRemoveInteractive_RendersChoicesAndCancelPreservesRegistry(t *testi
 	}); err != nil {
 		t.Fatalf("save daemon state: %v", err)
 	}
-	if err := state.RegisterClient(ctx, db, state.Client{
+	if err := testutil.SeedLegacyClient(ctx, db, testutil.LegacyClient{
 		SessionID: "interactive-client", Harness: "codex", LastSeenTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("register client: %v", err)
@@ -633,19 +634,19 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save daemon state: %v", err)
 	}
-	if err := state.RegisterClient(ctx, activeDB, state.Client{
+	if err := testutil.SeedLegacyClient(ctx, activeDB, testutil.LegacyClient{
 		SessionID: "active-client", Harness: "codex", LastSeenTS: nowFloat(),
 	}); err != nil {
 		t.Fatalf("register active client: %v", err)
 	}
-	if _, err := state.AppendCaptureEvent(ctx, activeDB, state.CaptureEvent{
+	if _, err := testutil.SeedLegacyCapture(ctx, activeDB, state.CaptureEvent{
 		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: "base",
 		Operation: "modify", Path: "pending.txt", Fidelity: "exact",
 		State: state.EventStatePending, CapturedTS: nowFloat(),
 	}, nil); err != nil {
 		t.Fatalf("append pending event: %v", err)
 	}
-	if _, err := state.AppendCaptureEvent(ctx, activeDB, state.CaptureEvent{
+	if _, err := testutil.SeedLegacyCapture(ctx, activeDB, state.CaptureEvent{
 		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: "base",
 		Operation: "modify", Path: "blocked.txt", Fidelity: "exact",
 		State: state.EventStateBlockedConflict, CapturedTS: nowFloat(),
@@ -707,7 +708,7 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 		byPath[entry.Path] = entry
 	}
 	active := byPath[activeRepo]
-	if active.Status != "running" || active.Clients != 1 || active.PendingEvents != 1 || active.BlockedConflicts != 1 {
+	if active.Status != "running" || active.Clients != 1 || active.PendingEvents != 0 || active.BlockedConflicts != 0 {
 		t.Fatalf("active summary mismatch: %+v", active)
 	}
 	if byPath[stoppedRepo].Status != "stopped" {
@@ -724,32 +725,44 @@ func TestRepoList_ManagementSnapshotIncludesQueueAndMissingRows(t *testing.T) {
 	}
 }
 
-func TestRepoCommandViaRootAndSetupInitAliasStillWorks(t *testing.T) {
-	withIsolatedHome(t)
+func TestRepoCommandViaRootAndHiddenInitCompatibilityRoute(t *testing.T) {
+	roots := withIsolatedHome(t)
 	repo := initRepoForRepoLifecycle(t)
 	root := newRootCmd()
-	var out, errOut bytes.Buffer
+	command, remaining, err := root.Find([]string{"repo", "init"})
+	if err != nil || len(remaining) != 0 || command.Name() != "init" || !command.Hidden {
+		t.Fatalf("repo init compatibility route=%v remaining=%v err=%v", command, remaining, err)
+	}
+	if got := invocationCapabilities(command); !got.Repository || !got.JSON || !got.Quiet {
+		t.Fatalf("repo init capabilities=%+v", got)
+	}
+	var out bytes.Buffer
 	root.SetOut(&out)
-	root.SetErr(&errOut)
-	root.SetArgs([]string{"repo", "init", "--repo", repo, "--json"})
-	if err := root.ExecuteContext(context.Background()); ExitCode(err) != ExitActionRequired {
-		t.Fatalf("compat repo init exit=%d err=%v\nstderr:%s", ExitCode(err), err, errOut.String())
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"repo", "list", "--json"})
+	if err := root.ExecuteContext(t.Context()); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(errOut.String(), "compatibility alias") {
-		t.Fatalf("repo init compatibility warning missing: %q", errOut.String())
+	var envelope struct {
+		Data struct {
+			Repos []repoListEntry `json:"repos"`
+		} `json:"data"`
 	}
-
-	out.Reset()
-	errOut.Reset()
-	root = newRootCmd()
-	root.SetOut(&out)
-	root.SetErr(&errOut)
-	root.SetArgs([]string{"init", "claude-code", "--raw"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatalf("setup init alias failed: %v\nstderr:%s", err, errOut.String())
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil || len(envelope.Data.Repos) != 0 {
+		t.Fatalf("empty repo list: %v %s", err, out.String())
 	}
-	if !strings.Contains(errOut.String(), "compatibility alias") {
-		t.Fatalf("setup init alias warning missing: %q", errOut.String())
+	if strings.Contains(commandHelp(t, "setup"), "init claude-code") {
+		t.Fatal("setup advertises retired root init")
+	}
+	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
+		t.Fatalf("read-only commands created registry: %v", err)
+	}
+	wt, err := git.ResolveWorktree(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(state.DBPathFromGitDir(wt.GitDir)); !os.IsNotExist(err) {
+		t.Fatalf("read-only commands created state: %v", err)
 	}
 }
 

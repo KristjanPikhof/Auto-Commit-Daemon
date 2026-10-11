@@ -3,8 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +14,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settingsui"
@@ -25,7 +26,7 @@ func editorFixture(t *testing.T) *configEditor {
 	base := t.TempDir()
 	editor := &configEditor{roots: paths.Roots{Config: filepath.Join(base, "config"), Share: filepath.Join(base, "share"), State: filepath.Join(base, "state")}, lookup: func(string) (string, bool) { return "", false }, probe: func(_ context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: cfg.Mode, Success: true}, nil
-	}, nudge: func(context.Context, state.DaemonState) error { return nil }}
+	}}
 	return editor
 }
 func editorString(value string) *string { return &value }
@@ -58,7 +59,7 @@ func editorModel(t *testing.T, e *configEditor, scope string) settingsui.EditorF
 	return settingsui.EditorField{}
 }
 
-func TestConfigEditorGlobalModelSavePreservesSparseOverrides(t *testing.T) {
+func TestFinishRemovalConfigEditorGlobalModelSavePreservesSparseOverrides(t *testing.T) {
 	e := editorFixture(t)
 	editorSeed(t, e, func(doc *config.Document) { doc.Settings.Global[config.FieldModel] = json.RawMessage(`"old-model"`) })
 	draft := editorDraft(t, e, "global", map[string]*string{config.FieldModel: editorString("new-model")})
@@ -91,7 +92,7 @@ func TestConfigEditorGlobalModelSavePreservesSparseOverrides(t *testing.T) {
 	}
 }
 
-func TestConfigEditorRepositoryResetOnlyModelAndQueuesActivation(t *testing.T) {
+func TestFinishRemovalConfigEditorRepositoryResetAppliesExactRevision(t *testing.T) {
 	e := editorFixture(t)
 	e.repo = materializeTestRepo(t, false)
 	editorSeed(t, e, func(doc *config.Document) {
@@ -107,7 +108,7 @@ func TestConfigEditorRepositoryResetOnlyModelAndQueuesActivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(result, "Waiting to apply") {
+	if !strings.Contains(result, "Applied:") {
 		t.Fatal(result)
 	}
 	model := editorModel(t, e, "repo")
@@ -131,65 +132,156 @@ func TestConfigEditorRepositoryResetOnlyModelAndQueuesActivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.DesiredRevisionID.Int64 == 0 || runtime.AppliedRevisionID.Int64 != 0 {
+	if runtime.DesiredRevisionID.Int64 == 0 || runtime.AppliedRevisionID.Int64 != runtime.DesiredRevisionID.Int64 {
 		t.Fatalf("runtime=%+v", runtime)
 	}
 }
 
-func TestConfigEditorCredentialReplacementTestsBeforeSaving(t *testing.T) {
-	for _, reject := range []bool{false, true} {
-		t.Run(map[bool]string{false: "success", true: "rejected"}[reject], func(t *testing.T) {
+func TestFinishConfigEditorSaveSupersedesInterruptedApproval(t *testing.T) {
+	for _, scenario := range []string{"initial_pending", "pending", "acknowledged", "desired_changed_after_review"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.Background()
 			e := editorFixture(t)
-			editorSeed(t, e, func(doc *config.Document) {
-				doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"openai-compat"`)
-				doc.Settings.Global[config.FieldModel] = json.RawMessage(`"old-model"`)
-			})
-			if err := credentials.NewStore(e.roots).Set("old-test-key"); err != nil {
-				t.Fatal(err)
+			e.repo = materializeTestRepo(t, false)
+			e.probe = func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+				t.Fatal("reviewed settings save ran a provider")
+				return ai.ProviderProbeResult{}, nil
 			}
-			before, _ := os.ReadFile(e.roots.ConfigPath())
-			calls := 0
-			e.probe = func(_ context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
-				calls++
-				if cfg.APIKey != "new-test-key" {
-					t.Fatal("probe did not use staged key")
-				}
-				stored, _ := credentials.NewStore(e.roots).Read()
-				if stored != "old-test-key" {
-					t.Fatal("credential written before test")
-				}
-				if reject {
-					return ai.ProviderProbeResult{}, errors.New("provider rejected new-test-key")
-				}
-				return ai.ProviderProbeResult{Provider: cfg.Mode, Success: true}, nil
-			}
-			draft := editorDraft(t, e, "global", map[string]*string{config.FieldModel: editorString("new-model")})
-			draft.Credential = "new-test-key"
-			review, err := e.Review(context.Background(), draft)
+			db, err := state.Open(ctx, filepath.Join(e.repo, ".git", "acd", "state.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if calls != 0 || strings.Contains(review.Text, "new-test-key") {
-				t.Fatal("review probed or exposed credential")
+			defer db.Close()
+			var baseline state.ConfigRevision
+			if scenario != "initial_pending" {
+				baseline, _ = finishConfigRevision(t, db, map[string]any{config.FieldCommitFormat: "imperative"}, sql.NullInt64{}, true)
 			}
-			result, err := review.Save(context.Background())
-			if strings.Contains(result, "new-test-key") || err != nil && strings.Contains(err.Error(), "new-test-key") {
-				t.Fatal("credential leaked")
-			}
-			stored, _ := credentials.NewStore(e.roots).Read()
-			if reject {
-				after, _ := os.ReadFile(e.roots.ConfigPath())
-				if err == nil || stored != "old-test-key" || !bytes.Equal(before, after) {
-					t.Fatal("failed probe changed saved state")
+			pending, request := finishConfigRevision(t, db, map[string]any{config.FieldCommitFormat: "conventional"}, sql.NullInt64{Int64: baseline.ID, Valid: baseline.ID != 0}, false)
+			if scenario == "acknowledged" {
+				if ok, err := state.AcknowledgeConfigActivation(ctx, db, request.ID, pending.ID); err != nil || !ok {
+					t.Fatalf("acknowledge interrupted approval %t: %v", ok, err)
 				}
-			} else if err != nil || stored != "new-test-key" {
-				t.Fatalf("replacement failed: %v", err)
+			}
+			draft := editorDraft(t, e, "repo", map[string]*string{config.FieldCommitFormat: editorString("conventional")})
+			review, err := e.Review(ctx, draft)
+			if err != nil {
+				t.Fatalf("interrupted approval prevented review: %v", err)
+			}
+			approved, found, err := finishApprovedRevision(ctx, db)
+			if scenario == "initial_pending" {
+				if found || err == nil || !strings.Contains(err.Error(), "not approved") {
+					t.Fatalf("interrupted first approval became usable: %d/%t/%v", approved.ID, found, err)
+				}
+			} else if err != nil || !found || approved.ID != baseline.ID {
+				t.Fatalf("review changed approved settings: %d/%t/%v", approved.ID, found, err)
+			}
+			if scenario == "desired_changed_after_review" {
+				concurrent, _ := finishConfigRevision(t, db, map[string]any{config.FieldCommitFormat: "imperative"}, sql.NullInt64{Int64: pending.ID, Valid: true}, false)
+				if _, err := review.Save(ctx); err == nil || !strings.Contains(err.Error(), "review again") {
+					t.Fatalf("stale reviewed target saved: %v", err)
+				}
+				runtime, err := state.RuntimeConfigActivationState(ctx, db)
+				if err != nil || runtime.DesiredRevisionID.Int64 != concurrent.ID || runtime.AppliedRevisionID.Int64 != baseline.ID {
+					t.Fatalf("stale save changed runtime: %+v/%v", runtime, err)
+				}
+				if freshDraft := editorDraft(t, e, "repo", nil); freshDraft.Generation != draft.Generation {
+					t.Fatal("stale save wrote configuration")
+				}
+				return
+			}
+			result, err := review.Save(ctx)
+			if err != nil || !strings.Contains(result, "Applied:") || strings.Contains(result, "could not apply") {
+				t.Fatalf("explicit save did not recover approval: %q/%v", result, err)
+			}
+			runtime, err := state.RuntimeConfigActivationState(ctx, db)
+			if err != nil || runtime.DesiredRevisionID.Int64 == pending.ID || runtime.AppliedRevisionID.Int64 != runtime.DesiredRevisionID.Int64 {
+				t.Fatalf("runtime=%+v/%v", runtime, err)
+			}
+			approved, found, err = finishApprovedRevision(ctx, db)
+			if err != nil || !found || approved.ID != runtime.AppliedRevisionID.Int64 {
+				t.Fatalf("new approved settings=%d/%t/%v", approved.ID, found, err)
+			}
+			values, _, err := finishSnapshotValues(approved.SnapshotJSON)
+			if err != nil || values[config.FieldCommitFormat] != "conventional" {
+				t.Fatalf("approved style=%v/%v", values, err)
+			}
+			original, err := state.ConfigRevisionByID(ctx, db, pending.ID)
+			if err != nil || original.SnapshotJSON != pending.SnapshotJSON || original.SnapshotHash != pending.SnapshotHash {
+				t.Fatal("interrupted revision changed")
+			}
+			if ok, err := state.ApplyConfigActivation(ctx, db, request.ID, pending.ID); err != nil || ok {
+				t.Fatalf("superseded request can still apply: %t/%v", ok, err)
 			}
 		})
 	}
 }
 
-func TestConfigEditorRejectsStaleReviewAndEnvironmentKey(t *testing.T) {
+func TestFinishRemovalConfigEditorCredentialSaveDoesNotProbe(t *testing.T) {
+	e := editorFixture(t)
+	editorSeed(t, e, func(doc *config.Document) {
+		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
+		doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"openai-compat"`)
+	})
+	if err := credentials.NewStore(e.roots).Set("old-test-key"); err != nil {
+		t.Fatal(err)
+	}
+	e.probe = func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		t.Fatal("saving tested a connection")
+		return ai.ProviderProbeResult{}, nil
+	}
+	draft := editorDraft(t, e, "global", map[string]*string{config.FieldModel: editorString("new-model")})
+	draft.Credential = "new-test-key"
+	review, err := e.Review(context.Background(), draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(review.Text, "new-test-key") {
+		t.Fatal("review leaked credential")
+	}
+	result, err := review.Save(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := credentials.NewStore(e.roots).Read()
+	if err != nil || stored != "new-test-key" || strings.Contains(result, "new-test-key") {
+		t.Fatalf("credential save failed or leaked: %v", err)
+	}
+}
+
+func TestFinishRemovalConfigEditorLocalIgnoresBrokenCredentials(t *testing.T) {
+	e := editorFixture(t)
+	editorSeed(t, e, func(doc *config.Document) {
+		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"local"`)
+	})
+	credentialPath := credentials.NewStore(e.roots).Path()
+	if err := os.WriteFile(credentialPath, []byte("malformed protected credential"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e.lookup = func(key string) (string, bool) {
+		if key == ai.EnvAPIKey {
+			return "invalid\nkey", true
+		}
+		return "", false
+	}
+	e.probe = func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+		t.Fatal("Local probed provider")
+		return ai.ProviderProbeResult{}, nil
+	}
+	draft := editorDraft(t, e, "global", map[string]*string{config.FieldCommitFormat: editorString("conventional")})
+	review, err := e.Review(context.Background(), draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = review.Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(credentialPath)
+	if err != nil || string(body) != "malformed protected credential" {
+		t.Fatal("Local modified unrelated credential")
+	}
+}
+
+func TestFinishRemovalConfigEditorRejectsStaleReviewAndEnvironmentKey(t *testing.T) {
 	e := editorFixture(t)
 	draft := editorDraft(t, e, "global", map[string]*string{config.FieldModel: editorString("new-model")})
 	review, err := e.Review(context.Background(), draft)
@@ -218,7 +310,7 @@ func TestConfigEditorRejectsStaleReviewAndEnvironmentKey(t *testing.T) {
 	}
 }
 
-func TestConfigEditorPublicRoutesAndOutsideRepository(t *testing.T) {
+func TestFinishRemovalConfigEditorPublicRoutesAndOutsideRepository(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("TERM", "dumb")
 	old := runConfigEditorUI
@@ -257,7 +349,7 @@ func TestConfigEditorPublicRoutesAndOutsideRepository(t *testing.T) {
 	}
 }
 
-func TestConfigEditorGlobalSaveUpdatesInheritingRuntimeOnly(t *testing.T) {
+func TestFinishRemovalConfigEditorGlobalSaveUpdatesInheritingRuntimeOnly(t *testing.T) {
 	for _, scenario := range []string{"editor_change", "saved_cli_set", "saved_cli_reset"} {
 		t.Run(scenario, func(t *testing.T) { checkEditorGlobalActivation(t, scenario) })
 	}
@@ -283,11 +375,7 @@ func checkEditorGlobalActivation(t *testing.T, scenario string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tested, err := service.TestProvider(ctx, nil, validation.Confirmations)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseline, err := service.Apply(ctx, settings.ApplyRequest{TestedFingerprint: tested.Fingerprint, Confirmations: validation.Confirmations, ExpectedGeneration: validation.SourceGeneration})
+	baseline, err := service.Apply(ctx, settings.ApplyRequest{TestedFingerprint: validation.Fingerprint, Confirmations: validation.Confirmations, ExpectedGeneration: validation.SourceGeneration})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,12 +386,6 @@ func checkEditorGlobalActivation(t *testing.T, scenario string) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if ok, err := state.AcknowledgeConfigActivation(ctx, db, baseline.RequestID, baseline.RevisionID); err != nil || !ok {
-		t.Fatalf("ack: %t %v", ok, err)
-	}
-	if ok, err := state.ApplyConfigActivation(ctx, db, baseline.RequestID, baseline.RevisionID); err != nil || !ok {
-		t.Fatalf("apply: %t %v", ok, err)
-	}
 	editorSeed(t, e, func(doc *config.Document) {
 		doc.Settings.Repositories[central.CanonicalID(e.repo)] = config.RepositorySettings{Fields: config.Overrides{config.FieldCommitFormat: json.RawMessage(`"conventional"`)}}
 	})
@@ -344,7 +426,7 @@ func checkEditorGlobalActivation(t *testing.T, scenario string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.DesiredRevisionID.Int64 == baseline.RevisionID || runtime.AppliedRevisionID.Int64 != baseline.RevisionID {
+	if runtime.DesiredRevisionID.Int64 == baseline.RevisionID || runtime.AppliedRevisionID.Int64 != runtime.DesiredRevisionID.Int64 {
 		t.Fatalf("runtime=%+v", runtime)
 	}
 	revision, err := state.ConfigRevisionByID(ctx, db, runtime.DesiredRevisionID.Int64)
@@ -372,24 +454,7 @@ func checkEditorGlobalActivation(t *testing.T, scenario string) {
 	}
 }
 
-func TestConfigEditorPresetChangeKeepsAuthoredValues(t *testing.T) {
-	e := editorFixture(t)
-	e.repo = materializeTestRepo(t, false)
-	editorSeed(t, e, func(doc *config.Document) {
-		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
-		doc.Settings.Global[config.FieldCommitPreset] = json.RawMessage(`"fast"`)
-		doc.Settings.Repositories[central.CanonicalID(e.repo)] = config.RepositorySettings{Fields: config.Overrides{config.FieldIntentRepairHorizon: json.RawMessage(`"7m"`), config.FieldVerificationFullCommand: json.RawMessage(`"make quality"`)}}
-	})
-	projection, err := e.project("repo", map[string]*string{config.FieldCommitPreset: editorString("quality")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if projection.values[config.FieldIntentWindow] != "30" || projection.values[config.FieldIntentVerification] != "full" || projection.values[config.FieldIntentRepairHorizon] != "7m0s" || projection.values[config.FieldVerificationFullCommand] != "make quality" {
-		t.Fatalf("preset projection=%v", projection.values)
-	}
-}
-
-func TestConfigEditorGlobalVerificationNeedsRepositoryScopeBeforeProbe(t *testing.T) {
+func TestFinishRemovalConfigEditorGlobalVerificationNeedsRepositoryScopeBeforeProbe(t *testing.T) {
 	e := editorFixture(t)
 	calls := 0
 	e.probe = func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
@@ -405,7 +470,7 @@ func TestConfigEditorGlobalVerificationNeedsRepositoryScopeBeforeProbe(t *testin
 	}
 }
 
-func TestConfigEditorGlobalModelResetUsesCurrentDefault(t *testing.T) {
+func TestFinishRemovalConfigEditorGlobalModelResetUsesCurrentDefault(t *testing.T) {
 	e := editorFixture(t)
 	editorSeed(t, e, func(doc *config.Document) { doc.Settings.Global[config.FieldModel] = json.RawMessage(`"custom-model"`) })
 	before := editorModel(t, e, "global")
@@ -425,5 +490,126 @@ func TestConfigEditorGlobalModelResetUsesCurrentDefault(t *testing.T) {
 	after := editorModel(t, e, "global")
 	if after.Value != "gpt-6-luna" || after.Overridden {
 		t.Fatalf("reset model = %+v", after)
+	}
+}
+
+func TestFinishRemovalLegacyConfigReadOnlyScopeParity(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo := makeUnregisteredStartRepo(t)
+	worktree, err := git.ResolveWorktree(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo = worktree.Root
+	id := central.CanonicalID(repo)
+	body := []byte(`{"version":1,"generation":7,"settings":{"global":{"commit.strategy":"intent","commit.preset":"balanced"},"profiles":{"quality":{"fields":{"commit.preset":"quality"}}},"repositories":{"` + id + `":{"profile":"quality","fields":{"commit.strategy":"event"}}}}}`)
+	if err := os.MkdirAll(roots.Config, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(roots.ConfigPath(), body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	credentialPath := credentials.NewStore(roots).Path()
+	if err := os.WriteFile(credentialPath, []byte("broken credential"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(ai.EnvAPIKey, "invalid\nkey")
+	doc, err := config.NewStore(roots).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ scope, profile, want string }{{"global", "", "structural"}, {"profile", "quality", "full"}, {"repo", "", "none"}} {
+		t.Run(tc.scope, func(t *testing.T) {
+			target := resolvedConfigTarget{Document: doc, Scope: tc.scope, Profile: tc.profile, WorktreeID: id}
+			input, _ := configInput(target)
+			resolved, err := config.ResolveAll(input)
+			if err != nil || resolved[config.FieldIntentVerification].Value != tc.want {
+				t.Fatalf("legacy scope %s: %v err=%v", tc.scope, resolved, err)
+			}
+			var out bytes.Buffer
+			argRepo := ""
+			if tc.scope == "repo" {
+				argRepo = repo
+			}
+			if err := runConfigGet(t.Context(), &out, argRepo, configScopeOptions{Scope: tc.scope, Profile: tc.profile}, config.FieldIntentVerification, true); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), `"value": "`+tc.want+`"`) {
+				t.Fatal(out.String())
+			}
+		})
+	}
+	e := &configEditor{roots: roots, repo: repo, lookup: func(string) (string, bool) { return "", false }}
+	projection, err := e.project("repo", nil)
+	if err != nil || projection.values[config.FieldIntentVerification] != "none" {
+		t.Fatalf("editor=%v err=%v", projection.values, err)
+	}
+	for _, f := range projection.fields {
+		if f.Key == config.FieldIntentVerification && f.Inherited != "full" {
+			t.Fatalf("inherited scope=%+v", f)
+		}
+	}
+	after, err := os.ReadFile(roots.ConfigPath())
+	if err != nil || !bytes.Equal(body, after) {
+		t.Fatal("read rewrote legacy settings")
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "acd")); !os.IsNotExist(err) {
+		t.Fatal("config read created state")
+	}
+	if _, err := os.Stat(roots.ConfigLockPath()); !os.IsNotExist(err) {
+		t.Fatal("config read created lock")
+	}
+}
+
+func TestFinishRemovalPublicHelpAndRetiredCommands(t *testing.T) {
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"--help"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "acd finish") || strings.Contains(out.String(), "commit-all  ") {
+		t.Fatal(out.String())
+	}
+	for _, name := range []string{"start", "stop", "wake", "touch", "flush", "settings", "prompt", "pause", "resume"} {
+		root := newRootCmd()
+		command, remaining, err := root.Find([]string{name})
+		if err != nil || command != root || len(remaining) != 1 || remaining[0] != name {
+			t.Fatalf("retired command %s matched %v with args %v err=%v", name, command, remaining, err)
+		}
+	}
+	command, remaining, err := newRootCmd().Find([]string{"internal", "session"})
+	if err != nil || command.CommandPath() != "acd internal" || len(remaining) != 1 || remaining[0] != "session" {
+		t.Fatalf("session protocol remains: command=%v args=%v err=%v", command, remaining, err)
+	}
+
+}
+
+func TestFinishRemovalIntentSetupKeepsConnectionTestOptional(t *testing.T) {
+	roots := withIsolatedHome(t)
+	t.Setenv(ai.EnvAPIKey, "approved-test-key")
+	old := openConfigureGlobalSettingsService
+	t.Cleanup(func() { openConfigureGlobalSettingsService = old })
+	openConfigureGlobalSettingsService = func(ctx context.Context, opts settings.Options) (configureGlobalSettingsService, error) {
+		opts.Probe = func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
+			t.Fatal("setup probed provider")
+			return ai.ProviderProbeResult{}, nil
+		}
+		return settings.NewGlobalService(ctx, opts)
+	}
+	cmd := newSetupCommand(false)
+	if err := cmd.Flags().Set("expect-plan", "reviewed-plan"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{Strategy: "intent", Provider: "openai-compat", ConfirmDiffEgress: true}, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration.ProviderTestStatus != "optional_connection_test" {
+		t.Fatalf("test is not optional: %+v", state.Configuration)
+	}
+	if _, err := os.Stat(roots.ConfigPath()); !os.IsNotExist(err) {
+		t.Fatal("preparation wrote settings")
 	}
 }

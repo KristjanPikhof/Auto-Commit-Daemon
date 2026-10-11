@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,7 +92,7 @@ func TestRetentionDeduplicatesProtectedObjectBytes(t *testing.T) {
 	}
 }
 
-func TestRetentionYoungCheckpointsUseOneUnionInventory(t *testing.T) {
+func TestRetentionYoungCheckpointsUseBoundedUnionInventories(t *testing.T) {
 	ctx := context.Background()
 	repo, db := checkpointFixture(t, ctx)
 	worktreeID := WorktreeID(repo)
@@ -120,8 +121,8 @@ func TestRetentionYoungCheckpointsUseOneUnionInventory(t *testing.T) {
 	if summary.Pruned != 0 || summary.Retained != DefaultMinimumRetained+1 {
 		t.Fatalf("retention summary=%+v", summary)
 	}
-	if inventoryCalls != 1 {
-		t.Fatalf("inventory calls=%d want 1 for %d young checkpoints",
+	if inventoryCalls != 2 {
+		t.Fatalf("inventory calls=%d want 2 for %d young checkpoints",
 			inventoryCalls, DefaultMinimumRetained+1)
 	}
 }
@@ -190,8 +191,47 @@ func seedPublishedRetentionCheckpoints(
 	repo, worktreeID, blob string,
 	createdAt []time.Time,
 ) []state.Checkpoint {
+	return seedRetentionCheckpoints(t, ctx, store, repo, worktreeID, blob, createdAt, true)
+}
+
+func seedRetentionCheckpoints(
+	t *testing.T,
+	ctx context.Context,
+	store Store,
+	repo, worktreeID, blob string,
+	createdAt []time.Time,
+	cutover bool,
+) []state.Checkpoint {
 	t.Helper()
-	if len(createdAt) == 0 || len(createdAt) > DefaultMinimumRetained+3 {
+	if cutover {
+		saved, err := state.LoadFinishLegacyCutover(ctx, store.DB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if saved.WorktreeID == "" {
+			// These synthetic publication members model post-cutover history.
+			tree, err := gitpkg.WriteTreeDurable(ctx, repo, filepath.Join(t.TempDir(), "cutover.index"), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oid, err := gitpkg.CommitTreeDurable(ctx, repo, tree, "fixture cutover", IdentityName, IdentityEmail)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := "refs/acd/migration/finish-v1/" + worktreeID + "/fixture/snapshot"
+			if _, err = gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo}, "update-ref", ref, oid); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = state.PrepareFinishLegacyCutover(ctx, store.DB, worktreeID, state.FinishLegacyManifest{}, ref, oid, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = state.CompleteFinishLegacyCutover(ctx, store.DB, "", ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if len(createdAt) == 0 || len(createdAt) > 500 {
 		t.Fatal("retention fixture requires a bounded checkpoint batch")
 	}
 	scratch := t.TempDir()
@@ -243,7 +283,7 @@ func seedPublishedRetentionCheckpoints(
 		}
 		seenCommits[checkpoint.CommitOID] = true
 		capturePath := fmt.Sprintf("retention-%03d.txt", i)
-		seq, err := state.AppendCaptureEvent(ctx, store.DB, state.CaptureEvent{
+		seq, err := testutil.SeedLegacyCapture(ctx, store.DB, state.CaptureEvent{
 			BranchRef: "refs/heads/main", BranchGeneration: 1,
 			BaseHead: "seed", Operation: "modify", Path: capturePath, Fidelity: "exact",
 		}, []state.CaptureOp{{Op: "modify", Path: capturePath, Fidelity: "exact"}})
@@ -287,7 +327,7 @@ func seedPublishedRetentionCheckpoints(
 		if err := state.CompleteCheckpoint(ctx, store.DB, checkpoint.ID, checkpoint.Ref, checkpoint.CommitOID, checkpoint.CreatedTS); err != nil {
 			t.Fatal(err)
 		}
-		if err := state.MarkEventPublished(ctx, store.DB, checkpoint.EventSeqs[0], state.EventStatePublished,
+		if err := testutil.SeedLegacyCaptureOutcome(ctx, store.DB, checkpoint.EventSeqs[0], state.EventStatePublished,
 			sql.NullString{String: "normal-commit", Valid: true}, sql.NullString{}, sql.NullString{}, checkpoint.CreatedTS); err != nil {
 			t.Fatal(err)
 		}

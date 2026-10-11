@@ -216,6 +216,15 @@ func PrepareCheckpoint(ctx context.Context, d *DB, checkpoint Checkpoint, planDi
 	if err := validateCheckpoint(checkpoint, planDigest); err != nil {
 		return false, err
 	}
+	if len(checkpoint.EventSeqs) != 0 {
+		hasCaptures, err := legacyTableExists(ctx, d.ReadSQL(), "capture_events")
+		if err != nil {
+			return false, err
+		}
+		if !hasCaptures {
+			return false, ErrCheckpointIdentityMismatch
+		}
+	}
 	conn, err := d.conn.Conn(ctx)
 	if err != nil {
 		return false, fmt.Errorf("state: acquire checkpoint writer: %w", err)

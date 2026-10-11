@@ -14,23 +14,22 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 func makeProtectedControlRepoStateDB(t *testing.T) (repoDir, stateDB string, db *state.DB) {
 	t.Helper()
-	repoDir, stateDB, db = makeRepoStateDB(t)
-	if err := state.MetaSetMany(context.Background(), db, map[string]string{
-		daemon.MetaKeyProtectionObservationEpoch: "1",
-		daemon.MetaKeyProtectionCoveredEpoch:     "1",
-		daemon.MetaKeyProtectionCheckpointID:     "cp-1700000000000-0123456789abcdef",
-		daemon.MetaKeyProtectionComplete:         "true",
-	}); err != nil {
-		t.Fatalf("seed protected control projection: %v", err)
+	repoDir, stateDB, db = makeSeededRepoStateDB(t)
+	rec := central.RepoRecord{Path: repoDir, StateDB: stateDB, WorktreeID: checkpoint.WorktreeID(repoDir)}
+	sum := finishStatusCheckpoint(t, rec, db)
+	if !sum.Protected || sum.Partial {
+		t.Fatal("fixture protection incomplete")
 	}
 	return repoDir, stateDB, db
 }
@@ -138,7 +137,7 @@ func TestControlBareDisabledRepositoryReportsGitTruth(t *testing.T) {
 		t.Fatalf("dirty disabled status: %v", err)
 	}
 	dirty := decodeControlResult(t, dirtyOut.Bytes())
-	if dirty.WorktreeClean || dirty.AllChangesCommittedInGit || dirty.Published {
+	if dirty.WorktreeClean || dirty.AllChangesCommittedInGit || !dirty.Published || dirty.PublicationOutcome.WorktreeChanges != 1 {
 		t.Fatalf("dirty disabled status hid Git changes: %+v", dirty)
 	}
 }
@@ -179,35 +178,12 @@ func TestControlBareFreshHeartbeatWithDeadPIDNeedsAttention(t *testing.T) {
 		t.Fatalf("runControlStatus exit=%d err=%v", ExitCode(err), err)
 	}
 	got := decodeControlResult(t, out.Bytes())
-	if got.OK || got.Health != controlHealthNeedsAttention || got.NextAction != "Run `acd on` to start it." {
+	if got.OK || got.Health != controlHealthNeedsAttention || got.NextAction != "Run `acd on` to start protection." {
 		t.Fatalf("unexpected dead-pid health: %+v", got)
 	}
 }
 
-func TestApplyControlStatusDurableReplayBlockNeedsAttention(t *testing.T) {
-	status := statusReport{
-		Daemon: "running", PID: os.Getpid(),
-		Replay: replayObservabilityReport{
-			State: "needs_attention", ErrorRepeatCount: 3,
-		},
-	}
-	result := controlResult{OK: true, Health: controlHealthHealthy}
-	applyControlStatus(&result, status)
-	if result.OK || result.Health != controlHealthNeedsAttention ||
-		!strings.Contains(result.Summary, "safety block") {
-		t.Fatalf("control result=%+v", result)
-	}
-	if !result.RecoveryRequired {
-		t.Fatal("durable replay block did not request automatic recovery")
-	}
-	if !strings.Contains(result.NextAction, "acd support recover --dry-run") ||
-		!strings.Contains(result.NextAction, "acd support recover --yes") ||
-		strings.Contains(result.NextAction, "acd doctor") {
-		t.Fatalf("next action=%q", result.NextAction)
-	}
-}
-
-func TestApplyControlStatusIncompleteCheckpointNeedsAttention(t *testing.T) {
+func TestApplyControlStatusNewObservationWaitsForProtection(t *testing.T) {
 	status := statusReport{
 		Daemon:                        "running",
 		PID:                           os.Getpid(),
@@ -219,10 +195,10 @@ func TestApplyControlStatusIncompleteCheckpointNeedsAttention(t *testing.T) {
 
 	applyControlStatus(&result, status)
 
-	if result.OK || result.Health != controlHealthNeedsAttention || result.Protected {
-		t.Fatalf("incomplete checkpoint result=%+v", result)
+	if !result.OK || result.Health != controlHealthWaiting || result.Protected {
+		t.Fatalf("new observation incorrectly claimed protected: %+v", result)
 	}
-	if !strings.Contains(result.NextAction, "acd doctor") {
+	if result.NextAction != "No action needed." {
 		t.Fatalf("next action=%q", result.NextAction)
 	}
 }
@@ -243,29 +219,17 @@ func TestApplyControlStatusBusyCheckpointCompletesAutomatically(t *testing.T) {
 	if !result.OK || result.Health != controlHealthWaiting || result.Protected {
 		t.Fatalf("busy checkpoint result=%+v", result)
 	}
-	if !strings.Contains(result.NextAction, "completes automatically") || strings.Contains(result.NextAction, "acd doctor") {
+	if result.NextAction != "No action needed." {
 		t.Fatalf("busy checkpoint next action=%q", result.NextAction)
 	}
 }
 
-func TestApplyControlStatusManualPauseOutranksIncompleteCheckpoint(t *testing.T) {
-	status := statusReport{
-		Daemon:                        "running",
-		PID:                           os.Getpid(),
-		Paused:                        true,
-		Pause:                         &pauseInfo{Source: "manual", Reason: "repo surgery"},
-		CheckpointProtectionAvailable: true,
-		ObservationEpoch:              7,
-		CoveredEpoch:                  6,
-	}
-	result := controlResult{OK: true, Health: controlHealthHealthy}
-
-	applyControlStatus(&result, status)
-
-	if result.OK || result.Health != controlHealthNeedsAttention ||
-		!strings.Contains(result.Summary, "paused") ||
-		!strings.Contains(result.NextAction, "acd status") {
-		t.Fatalf("paused incomplete-checkpoint result=%+v", result)
+func TestApplyControlStatusRetiredPauseDoesNotStopSaving(t *testing.T) {
+	report := statusReport{Daemon: "running", PID: os.Getpid(), Paused: true, Pause: &pauseInfo{Source: "manual"}, ObservationEpoch: 7, CoveredEpoch: 6}
+	result := controlResult{}
+	applyControlStatus(&result, report)
+	if !result.OK || result.Health != controlHealthWaiting || result.Protected || !strings.Contains(result.Summary, "Saving") {
+		t.Fatalf("legacy publication pause blocked protection: %+v", result)
 	}
 }
 
@@ -297,7 +261,7 @@ func TestControlBareIgnoresHistoricalInactiveTerminalEvents(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save daemon state: %v", err)
 	}
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+	seq, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{
 		BranchRef:        "refs/heads/old-topic",
 		BranchGeneration: 7,
 		BaseHead:         "deadbeef",
@@ -308,11 +272,11 @@ func TestControlBareIgnoresHistoricalInactiveTerminalEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append historical conflict: %v", err)
 	}
-	if err := state.MarkEventBlocked(ctx, db, seq, "before-state mismatch", nowFloat(),
+	if err := seedLegacyBlockedCapture(ctx, db, seq, "before-state mismatch", nowFloat(),
 		sqlNullStr("refs/heads/old-topic"), sql.NullInt64{Int64: 7, Valid: true}, sqlNullStr("deadbeef")); err != nil {
 		t.Fatalf("mark historical conflict: %v", err)
 	}
-	failedSeq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+	failedSeq, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{
 		BranchRef:        "refs/heads/old-topic",
 		BranchGeneration: 7,
 		BaseHead:         "deadbeef",
@@ -323,11 +287,11 @@ func TestControlBareIgnoresHistoricalInactiveTerminalEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append historical failure: %v", err)
 	}
-	if err := state.MarkEventPublished(ctx, db, failedSeq, state.EventStateFailed,
+	if err := testutil.SeedLegacyCaptureOutcome(ctx, db, failedSeq, state.EventStateFailed,
 		sql.NullString{}, sqlNullStr("provider failed"), sql.NullString{}, nowFloat()); err != nil {
 		t.Fatalf("mark historical failure: %v", err)
 	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+	if _, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{
 		BranchRef:        "refs/heads/old-topic",
 		BranchGeneration: 7,
 		BaseHead:         "deadbeef",
@@ -346,7 +310,7 @@ func TestControlBareIgnoresHistoricalInactiveTerminalEvents(t *testing.T) {
 		t.Fatalf("runControlStatus: %v", err)
 	}
 	got := decodeControlResult(t, out.Bytes())
-	if !got.OK || got.Health == controlHealthNeedsAttention || got.BlockedEvents != 1 {
+	if !got.OK || !got.Protected || got.BlockedEvents != 0 || got.PublicationOutcome.Legacy.State != "needs_attention" || got.NextAction != "No action needed." {
 		t.Fatalf("historical conflict affected active health: %+v", got)
 	}
 }
@@ -368,7 +332,7 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("save daemon state: %v", err)
 			}
-			seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+			seq, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{
 				BranchRef: "refs/heads/main", BranchGeneration: 1,
 				BaseHead: "deadbeef", Operation: "modify", Path: "stuck.go",
 				Fidelity: "exact",
@@ -378,10 +342,10 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 			}
 			switch terminalState {
 			case state.EventStateBlockedConflict:
-				err = state.MarkEventBlocked(ctx, db, seq, "before-state mismatch", nowFloat(),
+				err = seedLegacyBlockedCapture(ctx, db, seq, "before-state mismatch", nowFloat(),
 					sqlNullStr("refs/heads/main"), sql.NullInt64{Int64: 1, Valid: true}, sqlNullStr("deadbeef"))
 			case state.EventStateFailed:
-				err = state.MarkEventPublished(ctx, db, seq, state.EventStateFailed,
+				err = testutil.SeedLegacyCaptureOutcome(ctx, db, seq, state.EventStateFailed,
 					sql.NullString{}, sqlNullStr("provider failed"), sql.NullString{}, nowFloat())
 			}
 			if err != nil {
@@ -392,18 +356,23 @@ func TestControlBareNeedsAttentionForActiveTailTerminalEvent(t *testing.T) {
 			}
 
 			var out bytes.Buffer
-			if err := runControlStatus(ctx, &out, repo, true); ExitCode(err) != ExitActionRequired {
-				t.Fatalf("runControlStatus exit=%d err=%v", ExitCode(err), err)
+			if err := runControlStatus(ctx, &out, repo, true); err != nil {
+				t.Fatalf("legacy attention blocked checkpoint protection: %v", err)
 			}
 			got := decodeControlResult(t, out.Bytes())
-			if got.OK || got.Health != controlHealthNeedsAttention || got.Published ||
-				got.CheckpointPublishedByACD || !strings.Contains(got.Summary, "safety block") {
-				t.Fatalf("active tail terminal event was not surfaced: %+v", got)
+			if !got.OK || !got.Protected || got.PublicationOutcome.Legacy.State != "needs_attention" || got.NextAction != "No action needed." {
+				t.Fatalf("legacy evidence or protection hidden: %+v", got)
 			}
-			if !strings.Contains(got.NextAction, "acd support recover --dry-run") ||
-				!strings.Contains(got.NextAction, "acd support recover --yes") {
-				t.Fatalf("active tail recovery action=%q", got.NextAction)
+			var stored string
+			conn, err := openStateDBReadOnly(ctx, state.DBPathFromGitDir(filepath.Join(repo, ".git")))
+			if err != nil {
+				t.Fatal(err)
 			}
+			defer conn.Close()
+			if err := conn.QueryRowContext(ctx, "SELECT state FROM capture_events WHERE seq=?", seq).Scan(&stored); err != nil || stored != terminalState {
+				t.Fatalf("inspection changed legacy state %q: %v", stored, err)
+			}
+
 		})
 	}
 }
@@ -423,14 +392,14 @@ func TestControlOnReturnsErrorAfterRenderingUnhealthyResult(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save daemon state: %v", err)
 	}
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+	seq, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		BaseHead: "deadbeef", Operation: "modify", Path: "stuck.go", Fidelity: "exact",
 	}, []state.CaptureOp{{Op: "modify", Path: "stuck.go", Fidelity: "exact"}})
 	if err != nil {
 		t.Fatalf("append terminal event: %v", err)
 	}
-	if err := state.MarkEventBlocked(ctx, db, seq, "before-state mismatch", nowFloat(),
+	if err := seedLegacyBlockedCapture(ctx, db, seq, "before-state mismatch", nowFloat(),
 		sqlNullStr("refs/heads/main"), sql.NullInt64{Int64: 1, Valid: true}, sqlNullStr("deadbeef")); err != nil {
 		t.Fatalf("mark terminal event: %v", err)
 	}
@@ -448,256 +417,34 @@ func TestControlOnReturnsErrorAfterRenderingUnhealthyResult(t *testing.T) {
 	}
 }
 
-func TestApplyControlStatusPlannerCircuitDegraded(t *testing.T) {
-	for _, tc := range []struct {
-		state    daemon.IntentPlannerCircuitState
-		nextText string
-	}{
-		{state: daemon.IntentPlannerCircuitOpen, nextText: "probe the provider automatically after cooldown"},
-		{state: daemon.IntentPlannerCircuitHalfOpen, nextText: "running the automatic provider probe"},
-	} {
-		t.Run(string(tc.state), func(t *testing.T) {
-			status := statusReport{
-				Daemon:        "running",
-				PID:           os.Getpid(),
-				CaptureErrors: 2,
-				IntentStrategy: intentStrategyReport{PlannerHealth: &daemon.IntentPlannerHealthSnapshot{
-					State: tc.state,
-				}},
-			}
-			res := controlResult{OK: true}
-			applyControlStatus(&res, status)
-			if res.Health != controlHealthDegraded ||
-				!strings.Contains(res.Summary, "semantic commit messages are waiting") ||
-				!strings.Contains(res.NextAction, tc.nextText) {
-				t.Fatalf("control result=%+v", res)
-			}
-		})
+func TestApplyControlStatusStorageWarningDoesNotGateCurrentWorkOnLegacyArchive(t *testing.T) {
+	report := statusReport{Daemon: "running", PID: os.Getpid(), Protected: true, CheckpointRetentionOverBudget: true, PublicationOutcome: publicationOutcome{Legacy: state.FinishLegacyCutover{State: "needs_attention", Reason: "Saved legacy proof needs inspection"}}}
+	result := controlResult{}
+	applyControlStatus(&result, report)
+	if !result.OK || !result.Protected || result.Health != controlHealthNeedsAttention || !strings.Contains(result.NextAction, "acd doctor") || !strings.Contains(result.Summary, "Legacy work remains preserved") || strings.Count(result.Summary, "exceed the storage budget") != 1 {
+		t.Fatalf("maintenance hid remediation or duplicated output: %+v", result)
 	}
 }
 
-func TestApplyControlStatusReportsIntentSalvageSubphase(t *testing.T) {
-	for _, tc := range []struct {
-		mode string
-		want string
-	}{
-		{mode: "semantic_replan", want: "replanning"},
-		{mode: "local_unlock", want: "one safe local group"},
-	} {
-		t.Run(tc.mode, func(t *testing.T) {
-			status := statusReport{
-				Daemon: "running", PID: os.Getpid(),
-				PublicationDrain: publicationDrainReport{
-					Available: true, ID: "drain",
-					Phase:        state.PublicationDrainEventFallback,
-					FallbackMode: tc.mode,
-				},
-			}
-			res := controlResult{OK: true}
-			applyControlStatus(&res, status)
-			if res.Health != controlHealthPublishing ||
-				!strings.Contains(strings.ToLower(res.Summary), tc.want) {
-				t.Fatalf("control result=%+v", res)
-			}
-		})
-	}
-}
-
-func TestApplyControlStatusUnreconstructibleDrainOffersForceRecovery(t *testing.T) {
-	for _, reason := range []string{
-		"publication_drain_runtime_contract_unavailable",
-		"publication_drain_environment_runtime_changed",
-	} {
-		t.Run(reason, func(t *testing.T) {
-			status := statusReport{
-				Daemon: "running", PID: os.Getpid(),
-				PublicationDrain: publicationDrainReport{
-					Available: true, ID: "drain",
-					Phase: state.PublicationDrainNeedsAction, LastError: reason,
-				},
-			}
-			res := controlResult{OK: true}
-
-			applyControlStatus(&res, status)
-
-			if res.OK || res.Health != controlHealthNeedsAttention ||
-				!strings.Contains(res.Summary, "captured work remains saved") ||
-				!strings.Contains(res.NextAction, "acd fix --force --dry-run") ||
-				!strings.Contains(res.NextAction, "acd fix --force --yes") {
-				t.Fatalf("control result=%+v", res)
-			}
-		})
-	}
-}
-
-func TestApplyControlStatusBlockedDrainExplainsCause(t *testing.T) {
-	const cause = "forced_capture_deferred: forced-aging seq 92343 must be ready with no missing companions"
-	status := statusReport{
-		Daemon: "running", PID: os.Getpid(),
-		PublicationDrain: publicationDrainReport{
-			Available: true, Phase: state.PublicationDrainNeedsAction,
-			LastError: cause,
-		},
-	}
-	result := controlResult{OK: true}
-	applyControlStatus(&result, status)
-	if result.OK || result.Health != controlHealthNeedsAttention ||
-		!strings.Contains(result.Summary, cause) ||
-		strings.Contains(result.NextAction, "acd doctor") ||
-		!strings.Contains(result.NextAction, "acd support diagnose") {
-		t.Fatalf("blocked drain control result=%+v", result)
-	}
-	var doctor bytes.Buffer
-	if err := renderProductEnvelope(&doctor, envelopeFromControl(result), false); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(doctor.String(), cause) ||
-		!strings.Contains(doctor.String(), "acd support diagnose") {
-		t.Fatalf("doctor output lacks blocker and next step: %s", doctor.String())
-	}
-}
-
-func TestApplyControlStatusRewindGraceIsWaiting(t *testing.T) {
-	status := statusReport{
-		Daemon: "running",
-		PID:    os.Getpid(),
-		Paused: true,
-		Pause: &pauseInfo{
-			Source:           "rewind_grace",
-			Reason:           "rewind grace",
-			ExpiresAt:        time.Now().UTC().Add(45 * time.Second).Format(time.RFC3339),
-			RemainingSeconds: 45,
-		},
-	}
-	res := controlResult{OK: true}
-
-	applyControlStatus(&res, status)
-
-	if !res.OK || res.Health != controlHealthWaiting {
-		t.Fatalf("rewind grace should be a healthy wait: %+v", res)
-	}
-	if !strings.Contains(res.Summary, "45s") || !strings.Contains(res.NextAction, "resume automatically") {
-		t.Fatalf("rewind grace guidance is not actionable: %+v", res)
-	}
-}
-
-func TestApplyControlStatusRewindGraceDoesNotHideRecoveryBlockers(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		mutate func(*statusReport)
-		want   string
-	}{
-		{
-			name: "backpressure",
-			mutate: func(status *statusReport) {
-				status.BackpressurePaused = true
-			},
-			want: "protected storage",
-		},
-		{
-			name: "terminal barrier",
-			mutate: func(status *statusReport) {
-				status.ActiveBarriers = 1
-			},
-			want: "blocked publication",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			status := statusReport{
-				Daemon: "running",
-				PID:    os.Getpid(),
-				Paused: true,
-				Pause: &pauseInfo{
-					Source:           "rewind_grace",
-					RemainingSeconds: 45,
-				},
-			}
-			tc.mutate(&status)
-			result := controlResult{OK: true}
-			applyControlStatus(&result, status)
-			if result.OK || result.Health != controlHealthNeedsAttention ||
-				!strings.Contains(result.Summary, tc.want) {
-				t.Fatalf("result=%+v", result)
-			}
-		})
-	}
-}
-
-func TestApplyControlStatusManualPauseStillNeedsAttention(t *testing.T) {
-	status := statusReport{
-		Daemon: "running",
-		PID:    os.Getpid(),
-		Paused: true,
-		Pause: &pauseInfo{
-			Source: "manual",
-			Reason: "repo surgery",
-		},
-	}
-	res := controlResult{OK: true}
-
-	applyControlStatus(&res, status)
-
-	if res.OK || res.Health != controlHealthNeedsAttention {
-		t.Fatalf("manual pause should still need attention: %+v", res)
-	}
-}
-
-func TestApplyControlStatusStorageWarningDoesNotHideRecoveryRequirement(t *testing.T) {
-	status := statusReport{
-		Daemon:                        "running",
-		PID:                           os.Getpid(),
-		CheckpointRetentionOverBudget: true,
-		ActiveBarriers:                1,
-	}
-	result := controlResult{OK: true}
-	applyControlStatus(&result, status)
-	if !result.RecoveryRequired || result.Health != controlHealthNeedsAttention {
-		t.Fatalf("result=%+v", result)
-	}
-}
-
-func TestApplyControlStatusPlannerCircuitRespectsBlockerPrecedence(t *testing.T) {
-	health := &daemon.IntentPlannerHealthSnapshot{State: daemon.IntentPlannerCircuitOpen}
-	for _, tc := range []struct {
-		name   string
-		mutate func(*statusReport)
-		want   string
-	}{
-		{name: "pause", mutate: func(s *statusReport) { s.Paused = true }, want: "paused"},
-		{name: "backpressure", mutate: func(s *statusReport) { s.BackpressurePaused = true }, want: "protected storage"},
-		{name: "barrier", mutate: func(s *statusReport) { s.ActiveBarriers = 1 }, want: "blocked publication"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			status := statusReport{
-				Daemon:         "running",
-				PID:            os.Getpid(),
-				IntentStrategy: intentStrategyReport{PlannerHealth: health},
-			}
-			tc.mutate(&status)
-			res := controlResult{OK: true}
-			applyControlStatus(&res, status)
-			if res.Health != controlHealthNeedsAttention || !strings.Contains(strings.ToLower(res.Summary), tc.want) {
-				t.Fatalf("control result=%+v", res)
-			}
-		})
-	}
-}
-
-func TestControlOnMissingRuntimeRefusesBeforeActivation(t *testing.T) {
+func TestControlOnFreshSetupFailurePreservesRepository(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo := makeUnregisteredStartRepo(t)
-	var setupRequired bytes.Buffer
-	if err := runControlOn(context.Background(), &setupRequired, repo, true); ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "setup") {
-		t.Fatalf("uncut repository on exit=%d err=%v", ExitCode(err), err)
+	lookup := controlRepoLookup{Roots: roots}
+	lookup.Worktree.Root = repo
+	err := bootstrapControlSetupWith(t.Context(), lookup,
+		func(context.Context, paths.Roots, installer.Options) (installer.Plan, error) {
+			return installer.Plan{FreshDefaults: true}, nil
+		},
+		func(context.Context, paths.Roots, installer.Plan, installer.ApplyOptions) (installer.Result, error) {
+			return installer.Result{}, errors.New("owned installation unavailable")
+		})
+	if err == nil || !strings.Contains(err.Error(), "repository was not enabled") {
+		t.Fatalf("failed bootstrap: %v", err)
 	}
-	if setupRequired.Len() != 0 {
-		t.Fatalf("uncut repository on emitted success output: %q", setupRequired.String())
-	}
-	if _, err := os.Stat(state.DBPathFromGitDir(filepath.Join(repo, ".git"))); !os.IsNotExist(err) {
-		t.Fatalf("acd on created repository state before runtime validation: %v", err)
-	}
-	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
-		t.Fatalf("acd on created registry before runtime validation: %v", err)
+	for _, path := range []string{state.DBPathFromGitDir(filepath.Join(repo, ".git")), roots.RegistryPath()} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("failed bootstrap created %s: %v", path, err)
+		}
 	}
 }
 
@@ -719,14 +466,6 @@ func TestControlOnMismatchedRuntimeRefusesBeforeActivation(t *testing.T) {
 	}
 	if _, err := os.Stat(roots.RegistryPath()); !os.IsNotExist(err) {
 		t.Fatalf("acd on created registry before runtime validation: %v", err)
-	}
-}
-
-func TestControlOnTreatsRewindGraceAsWaiting(t *testing.T) {
-	withIsolatedHome(t)
-	repo := makeUnregisteredStartRepo(t)
-	if err := runControlOn(context.Background(), io.Discard, repo, true); ExitCode(err) != ExitActionRequired {
-		t.Fatalf("uncut repository on exit=%d err=%v", ExitCode(err), err)
 	}
 }
 
@@ -828,7 +567,7 @@ func TestApplySupervisorWorkerFailureProvidesRepairThatMatchesCause(t *testing.T
 			name:    "safe schema upgrade",
 			error:   "acd worker: open /repo: state: checkpoint-first setup required: state database schema is v20, want v21",
 			summary: "safe schema upgrade",
-			next:    "Run `acd on`",
+			next:    "Run `acd setup`",
 		},
 		{
 			name:    "old owner",
@@ -884,102 +623,10 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
 		t.Fatalf("runControlStatus: %v", err)
 	}
-	for _, line := range []string{"Protection:", "Current changes saved:", "Branch commits:", "Next:"} {
+	for _, line := range []string{"Protection:", "Last observed work saved:", "Branch commits:", "Next:"} {
 		if got := strings.Count(out.String(), line); got != 1 {
 			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
 		}
-	}
-}
-
-func TestProductStatusShowsIntentQueueAndActiveTarget(t *testing.T) {
-	var out bytes.Buffer
-	progress := publicationProgressReport{
-		Strategy: "intent", Origin: "commit_all", Phase: "intent_planning",
-		QueuePending: 22, TargetRemaining: 2, TargetTotal: 2,
-		LastProgressTS: 1, LastProgressAgeSeconds: 3 * 60,
-		WorkerResponsive: true, HeartbeatAgeSeconds: 1,
-	}
-	envelope := productEnvelope{
-		OK: true, State: productStatePublishing, Actions: []productAction{},
-		Data: productStatusData{
-			Enabled: true, Protected: true, PublicationProgress: progress,
-			PublicationDrain: publicationDrainReport{
-				ID: "drain", Phase: state.PublicationDrainSemantic,
-				RemainingEvents: 2, TargetEvents: 2,
-			},
-		},
-	}
-	if err := renderProductEnvelope(&out, envelope, false); err != nil {
-		t.Fatal(err)
-	}
-	renderProductPublicationProgress(&out, progress)
-	for _, want := range []string{
-		"Commit mode: Intent",
-		"Publication queue: 22 protected change(s)",
-		"Active target: earlier commit-all request, 2 of 2 left",
-		"Publication phase: planning commit groups by Intent",
-		"Last queue movement: 3m ago",
-		"Worker liveness: responsive, heartbeat 1s ago",
-	} {
-		if !strings.Contains(out.String(), want) {
-			t.Fatalf("status missing %q:\n%s", want, out.String())
-		}
-	}
-	if strings.Contains(out.String(), "Commit-all progress:") {
-		t.Fatalf("status duplicated active target:\n%s", out.String())
-	}
-}
-
-func TestProductStatusSuppressesCompletedDrainAndWaitHasNoTarget(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		progress publicationProgressReport
-		drain    publicationDrainReport
-		want     string
-	}{
-		{
-			name: "completed drain is history",
-			progress: publicationProgressReport{
-				Strategy: "intent", Phase: "idle", WorkerResponsive: true,
-			},
-			drain: publicationDrainReport{
-				ID: "old", Phase: state.PublicationDrainCompleted,
-				TargetEvents: 2, PublishedEvents: 2,
-			},
-			want: "Publication phase: idle",
-		},
-		{
-			name: "ordinary intent wait",
-			progress: publicationProgressReport{
-				Strategy: "intent", Phase: "intent_wait", QueuePending: 3,
-				WaitRemainingSeconds: 42, WorkerResponsive: true,
-			},
-			want: "waiting normally for the Intent batch (42s remaining)",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			var out bytes.Buffer
-			envelope := productEnvelope{
-				OK: true, State: productStateWaiting,
-				Actions: []productAction{},
-				Data: productStatusData{
-					Enabled: true, Protected: true,
-					PublicationProgress: test.progress,
-					PublicationDrain:    test.drain,
-				},
-			}
-			if err := renderProductEnvelope(&out, envelope, false); err != nil {
-				t.Fatal(err)
-			}
-			renderProductPublicationProgress(&out, test.progress)
-			if !strings.Contains(out.String(), test.want) {
-				t.Fatalf("status missing %q:\n%s", test.want, out.String())
-			}
-			if strings.Contains(out.String(), "Active target:") ||
-				strings.Contains(out.String(), "Commit-all progress:") {
-				t.Fatalf("inactive target rendered as current:\n%s", out.String())
-			}
-		})
 	}
 }
 
@@ -1042,6 +689,10 @@ func decodeControlResult(t *testing.T, body []byte) controlResult {
 		Changed: envelope.Changed, Actions: actions,
 		StatePreserved:           envelope.Data.StatePreserved,
 		Protected:                envelope.Data.Protected,
+		PublicationOutcome:       envelope.Data.PublicationOutcome,
+		CaptureHealth:            envelope.Data.CaptureHealth,
+		PublicationProgress:      envelope.Data.PublicationProgress,
+		Daemon:                   envelope.Data.Worker,
 		Published:                envelope.Data.Published,
 		WorktreeClean:            envelope.Data.WorktreeClean,
 		AllChangesCommittedInGit: envelope.Data.AllChangesCommittedInGit,
@@ -1049,4 +700,36 @@ func decodeControlResult(t *testing.T, body []byte) controlResult {
 		CheckpointID:             envelope.Data.CheckpointID,
 	}
 	return got
+}
+
+func TestControlDisabledMissingDatabaseKeepsReadOnlyGitTruth(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, path, db := makeProtectedControlRepoStateDB(t)
+	registerProtectedControlRepo(t, roots, repo)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := central.WithLock(roots, func(reg *central.Registry) error {
+		reg.DisableRepo(central.RepoRemovalTarget{Path: repo, StateDB: path}, time.Now().Unix())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, dirty := range []bool{false, true} {
+		if dirty {
+			if err := os.WriteFile(filepath.Join(repo, "later.txt"), []byte("later"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		res, err := inspectControl(t.Context(), repo)
+		if err != nil || !res.OK || res.Health != controlHealthOff || res.WorktreeClean == dirty || res.AllChangesCommittedInGit == dirty || res.Protected || res.Published || res.PublicationOutcome.BranchCommitted != nil {
+			t.Fatalf("missing DB invented protection or lost Git truth: %+v %v", res, err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("status recreated missing DB: %v", err)
+		}
+	}
 }

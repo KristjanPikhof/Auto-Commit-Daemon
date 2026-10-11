@@ -108,7 +108,7 @@ func TestFinishConfigLegacyPresetFallbackPreservesEffectiveChoices(t *testing.T)
 			}
 			lookup := func(name string) (string, bool) { value, ok := tc.env[name]; return value, ok }
 			input := ResolveInput{Global: doc.Settings.Global, Profile: doc.Settings.Profiles["named"].Fields, Repository: doc.Settings.Repositories["repo"].Fields, LookupEnv: lookup, LegacyDefaults: LegacyFinishDefaults(doc, []string{"repository:repo", "profile:named", "global"}, lookup)}
-			fields, _, err := ResolveAll(input, nil)
+			fields, err := ResolveAll(input)
 			if err != nil || fields[FieldIntentVerification].EffectiveValue() != tc.verification || fields[FieldDiffEgress].EffectiveValue() != tc.egress {
 				t.Fatalf("verification=%+v egress=%+v err=%v", fields[FieldIntentVerification], fields[FieldDiffEgress], err)
 			}

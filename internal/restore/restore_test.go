@@ -66,14 +66,11 @@ func TestRestorePreviewAndApplyPreserveHeadAndIndex(t *testing.T) {
 	if _, err := state.ResolveCheckpoint(ctx, db.Path(), result.ResultCheckpoint); err != nil {
 		t.Fatalf("result checkpoint: %v", err)
 	}
-	var generation int64
-	if err := db.ReadSQL().QueryRowContext(ctx,
-		"SELECT branch_generation FROM capture_events ORDER BY seq DESC LIMIT 1").Scan(&generation); err != nil {
-		t.Fatal(err)
+	generation, err := daemon.LoadBranchGeneration(ctx, db)
+	if err != nil || generation != 7 {
+		t.Fatalf("restore changed generation=%d: %v", generation, err)
 	}
-	if generation != 7 {
-		t.Fatalf("restore event generation=%d want 7", generation)
-	}
+	assertProtectionOnlyRestore(t, db)
 }
 
 func TestRestorePreviewRefusesStagedOverlap(t *testing.T) {
@@ -192,16 +189,15 @@ func TestRepairCompletesInterruptedPostRestoreCheckpoint(t *testing.T) {
 	if result.UndoCheckpoint != pre.Checkpoint.ID || result.ResultCheckpoint == "" {
 		t.Fatalf("result=%+v", result)
 	}
-	var generation int64
-	if err := db.ReadSQL().QueryRowContext(ctx, `
-SELECT e.branch_generation
-FROM checkpoint_events ce JOIN capture_events e ON e.seq=ce.event_seq
-WHERE ce.checkpoint_id=?`, result.ResultCheckpoint).Scan(&generation); err != nil {
-		t.Fatal(err)
+	generation, err := daemon.LoadBranchGeneration(ctx, db)
+	if err != nil || generation != 7 {
+		t.Fatalf("repair changed generation=%d: %v", generation, err)
 	}
-	if generation != 7 {
-		t.Fatalf("repair event generation=%d want 7", generation)
+	created, err := state.ResolveCheckpoint(ctx, db.Path(), result.ResultCheckpoint)
+	if err != nil || created.ObservedRef != "refs/heads/main" || created.ObservedHead != head {
+		t.Fatalf("repair lost branch evidence: %+v, %v", created, err)
 	}
+	assertProtectionOnlyRestore(t, db)
 }
 
 func TestRestorePlanRecordsGenerationAndDetachedResult(t *testing.T) {
@@ -238,13 +234,7 @@ func TestRestorePlanRecordsGenerationAndDetachedResult(t *testing.T) {
 	if created.ObservedRef != "" {
 		t.Fatalf("detached result observed ref = %q", created.ObservedRef)
 	}
-	var events int
-	if err := db.ReadSQL().QueryRowContext(ctx, "SELECT COUNT(*) FROM capture_events").Scan(&events); err != nil {
-		t.Fatal(err)
-	}
-	if events != 0 {
-		t.Fatalf("detached restore created %d publication events", events)
-	}
+	assertProtectionOnlyRestore(t, db)
 }
 
 func TestRestorePreviewRefusesCurrentExclusions(t *testing.T) {
@@ -823,13 +813,7 @@ func TestRestoreRepairRefusesBranchGenerationABA(t *testing.T) {
 		!strings.Contains(err.Error(), "branch generation changed") {
 		t.Fatalf("repair error=%v, want generation ABA refusal", err)
 	}
-	var events int
-	if err := item.db.ReadSQL().QueryRowContext(ctx, "SELECT COUNT(*) FROM capture_events").Scan(&events); err != nil {
-		t.Fatal(err)
-	}
-	if events != 0 {
-		t.Fatalf("generation ABA repair created %d late publication events", events)
-	}
+	assertProtectionOnlyRestore(t, item.db)
 }
 
 func TestRestoreRepairUsesResolvedProtectionPolicy(t *testing.T) {
@@ -872,13 +856,7 @@ func TestRestoreRepairDetachedCreatesProtectionOnlyCheckpoint(t *testing.T) {
 	if created.ObservedRef != "" {
 		t.Fatalf("detached repair result observed ref=%q", created.ObservedRef)
 	}
-	var eventCount int
-	if err := item.db.ReadSQL().QueryRowContext(ctx, "SELECT COUNT(*) FROM capture_events").Scan(&eventCount); err != nil {
-		t.Fatal(err)
-	}
-	if eventCount != 0 {
-		t.Fatalf("detached repair created %d publication events", eventCount)
-	}
+	assertProtectionOnlyRestore(t, item.db)
 }
 
 type interruptedRestore struct {
@@ -1125,4 +1103,19 @@ func restoreFixture(t *testing.T, ctx context.Context) (string, string, *state.D
 		t.Fatal(err)
 	}
 	return repo, wt.GitDir, db, created.Checkpoint
+}
+
+// Restore saves checkpoints without creating implicit publication work.
+func assertProtectionOnlyRestore(t *testing.T, db *state.DB) {
+	t.Helper()
+	var requests, retiredTables int
+	if err := db.ReadSQL().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM finish_requests").Scan(&requests); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReadSQL().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='capture_events'").Scan(&retiredTables); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 || retiredTables != 0 {
+		t.Fatalf("restore scheduled publication or initialized retired tables: requests=%d tables=%d", requests, retiredTables)
+	}
 }

@@ -151,24 +151,25 @@ func TestFinishCLIClientDisconnectAndRetry(t *testing.T) {
 	clientCtx, cancel := context.WithCancel(context.Background())
 	serveIntentHistoryWorker(t, lookup, finishDisconnectHandler{handler, cancel})
 	_, _, _ = finishCLIExecute(t, clientCtx, lookup.Worktree.Root, "finish")
-	deadline := time.Now().Add(5 * time.Second)
-	var r state.FinishRequest
-	for {
-		var err error
-		r, err = state.LatestFinishRequest(t.Context(), runtime.db, lookup.Record.WorktreeID)
-		if err == nil && r.State == state.FinishCompleted {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("worker did not survive disconnect: %+v %v", r, err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	joined := make(chan struct{})
+	go func() {
+		runtime.finishJobs.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-time.After(30 * time.Second):
+		t.Fatal("detached finish worker did not join within its test budget")
+	}
+	r, err := state.LatestFinishRequest(t.Context(), runtime.db, lookup.Record.WorktreeID)
+	if err != nil || r.State != state.FinishCompleted {
+		t.Fatalf("worker did not survive disconnect: %+v %v", r, err)
 	}
 	if len(r.Result) == 0 {
 		t.Fatal("missing durable terminal result")
 	}
 	// Successful publication cannot be replayed through retry.
-	_, _, err := finishCLIExecute(t, t.Context(), lookup.Worktree.Root, "finish", "--retry", r.ID)
+	_, _, err = finishCLIExecute(t, t.Context(), lookup.Worktree.Root, "finish", "--retry", r.ID)
 	if ExitCode(err) != ExitActionRequired {
 		t.Fatalf("replayed completed publication: %v", err)
 	}

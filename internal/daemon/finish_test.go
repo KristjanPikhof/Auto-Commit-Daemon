@@ -250,43 +250,53 @@ func TestFinishWorkerProtectsDuringProviderAndReconnects(t *testing.T) {
 	w.Transport = p
 	w.Config.Mode = "intent"
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
-	w.Config.Provider.Timeout = 10 * time.Second
-	r := startFinishWorker(t, w, FinishOptions{})
-	ctx, cancel := context.WithCancel(context.Background())
+	// Use one deadline for the full lifecycle under the sharded race gate.
+	// Provider timeouts have separate coverage.
+	w.Config.Provider.Timeout = 30 * time.Second
+	w.Config.VerificationTimeout = 30 * time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	done := make(chan error, 1)
+	r, created, err := w.Start(ctx, FinishOptions{})
+	if err != nil || !created {
+		t.Fatalf("start %+v created=%t: %v", r, created, err)
+	}
+	done := make(chan struct{})
+	var executeErr error
 	go func() {
+		defer close(done)
 		w.OperationGate.RLock()
 		defer w.OperationGate.RUnlock()
-		_, err := w.Execute(ctx, r.ID)
-		done <- err
+		_, executeErr = w.Execute(ctx, r.ID)
 	}()
-	select {
-	case <-entered:
-	case <-time.After(3 * time.Second):
-		t.Fatal("provider not called")
-	}
 	t.Cleanup(func() {
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Error("provider job did not join")
+		case <-time.After(10 * time.Second):
+			t.Error("provider job did not join after cancellation")
 		}
 	})
+	select {
+	case <-entered:
+	case <-done:
+		t.Fatalf("execution ended before provider entry: %v", executeErr)
+	case <-ctx.Done():
+		t.Fatalf("provider entry: %v", ctx.Err())
+	}
 	finishWrite(t, f.dir, "later.txt", "protected while waiting\n")
 	wake <- struct{}{}
 	var protected string
-	waitFor(t, 3*time.Second, "checkpoint during provider", func() bool {
-		id, ok, _ := state.MetaGet(context.Background(), f.db, MetaKeyProtectionCheckpointID)
+	deadline, _ := ctx.Deadline()
+	waitFor(t, time.Until(deadline), "checkpoint during provider", func() bool {
+		id, ok, _ := state.MetaGet(ctx, f.db, MetaKeyProtectionCheckpointID)
 		if !ok || id == r.Target.CheckpointID {
 			return false
 		}
-		cp, err := state.ResolveCheckpoint(context.Background(), f.db.Path(), id)
+		cp, err := state.ResolveCheckpoint(ctx, f.db.Path(), id)
 		if err != nil {
 			return false
 		}
-		_, err = git.Run(context.Background(), git.RunOpts{Dir: f.dir}, "cat-file", "-e", cp.TreeOID+":later.txt")
+		_, err = git.Run(ctx, git.RunOpts{Dir: f.dir}, "cat-file", "-e", cp.TreeOID+":later.txt")
 		if err == nil {
 			protected = id
 		}
@@ -295,7 +305,7 @@ func TestFinishWorkerProtectsDuringProviderAndReconnects(t *testing.T) {
 	if protected == "" {
 		t.Fatal("later protection absent")
 	}
-	attached, err := w.Execute(context.Background(), r.ID)
+	attached, err := w.Execute(ctx, r.ID)
 	if err != nil || attached.ID != r.ID || attached.State != state.FinishRunning {
 		t.Fatalf("detached client attachment %+v: %v", attached, err)
 	}
@@ -304,15 +314,22 @@ func TestFinishWorkerProtectsDuringProviderAndReconnects(t *testing.T) {
 	}
 	close(release)
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
+	case <-done:
+		if executeErr != nil {
+			t.Fatal(executeErr)
 		}
-		done <- nil
-	case <-time.After(5 * time.Second):
-		t.Fatal("request did not complete")
+	case <-ctx.Done():
+		t.Fatalf("request did not complete within scenario deadline: %v", ctx.Err())
 	}
-	if _, err := git.Run(context.Background(), git.RunOpts{Dir: f.dir}, "cat-file", "-e", "HEAD:later.txt"); err == nil {
+	completed, err := state.LoadFinishRequest(ctx, f.db, r.ID)
+	if err != nil || completed.State != state.FinishCompleted || p.calls.Load() != 1 {
+		t.Fatalf("completed request %+v calls=%d: %v", completed, p.calls.Load(), err)
+	}
+	frozen, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "show", "HEAD:goal.txt")
+	if err != nil || string(frozen) != "frozen\n" {
+		t.Fatalf("frozen publication %q: %v", frozen, err)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "cat-file", "-e", "HEAD:later.txt"); err == nil {
 		t.Fatal("later protected bytes entered frozen publication")
 	}
 }
@@ -552,7 +569,7 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 			f, w := finishWorkerFixture(t)
 			body := "goal\n"
 			if scenario == "oversized" {
-				body = strings.Repeat("x", ai.IntentStageDiffCap+1024)
+				body = strings.Repeat("x", ai.FinishDiffByteCap+1024)
 			}
 			finishWrite(t, f.dir, "goal.txt", body)
 			p := &finishTestTransport{exchange: func(_ context.Context, r ai.FinishPlanRequest) ([]byte, error) { return completeFinishTestPlan(r), nil }}

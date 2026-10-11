@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
+
 	"os"
 	"strings"
 	"testing"
@@ -17,8 +17,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-func TestCredentialSetRefreshesOnlyApprovedRuntime(t *testing.T) {
-	for _, scenario := range []string{"corrected", "rejected", "environment_override", "pending_activation"} {
+func TestFinishRemovalCredentialRefreshAppliesOnlyApprovedRuntime(t *testing.T) {
+	for _, scenario := range []string{"corrected", "environment_override", "pending_activation"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
 			repo, _, db := makeRegisteredGitRepoStateDB(t)
@@ -32,6 +32,7 @@ func TestCredentialSetRefreshesOnlyApprovedRuntime(t *testing.T) {
 			}
 			store := config.NewStore(roots)
 			if err := store.Update(func(doc *config.Document) error {
+				doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
 				doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"openai-compat"`)
 				doc.Settings.Global[config.FieldModel] = json.RawMessage(`"kept-model"`)
 				return nil
@@ -39,18 +40,12 @@ func TestCredentialSetRefreshesOnlyApprovedRuntime(t *testing.T) {
 				t.Fatal(err)
 			}
 			var probeKey string
-			reject := false
-			nudges := 0
 			oldOpen := openCredentialSettingsService
 			openCredentialSettingsService = func(ctx context.Context, opts settings.Options) (*settings.Service, error) {
 				opts.Probe = func(_ context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 					probeKey = cfg.APIKey
-					if reject {
-						return ai.ProviderProbeResult{}, errors.New("rejected test credential " + cfg.APIKey)
-					}
 					return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
 				}
-				opts.Nudge = func(context.Context, state.DaemonState) error { nudges++; return nil }
 				return settings.NewService(ctx, opts)
 			}
 			t.Cleanup(func() { openCredentialSettingsService = oldOpen })
@@ -63,21 +58,11 @@ func TestCredentialSetRefreshesOnlyApprovedRuntime(t *testing.T) {
 				t.Fatal(err)
 			}
 			confirmed := validation.Confirmations
-			tested, err := service.TestProvider(ctx, nil, confirmed)
-			if err != nil {
-				t.Fatal(err)
-			}
-			baseline, err := service.Apply(ctx, settings.ApplyRequest{TestedFingerprint: tested.Fingerprint, Confirmations: confirmed, ExpectedGeneration: validation.SourceGeneration})
+			baseline, err := service.Apply(ctx, settings.ApplyRequest{TestedFingerprint: validation.Fingerprint, Confirmations: confirmed, ExpectedGeneration: validation.SourceGeneration})
 			if err != nil {
 				t.Fatal(err)
 			}
 			service.Close()
-			if ok, err := state.AcknowledgeConfigActivation(ctx, db, baseline.RequestID, baseline.RevisionID); err != nil || !ok {
-				t.Fatalf("ack: %t %v", ok, err)
-			}
-			if ok, err := state.ApplyConfigActivation(ctx, db, baseline.RequestID, baseline.RevisionID); err != nil || !ok {
-				t.Fatalf("apply: %t %v", ok, err)
-			}
 			if err := state.SaveDaemonState(ctx, db, state.DaemonState{PID: os.Getpid(), Mode: "running"}); err != nil {
 				t.Fatal(err)
 			}
@@ -101,7 +86,6 @@ func TestCredentialSetRefreshesOnlyApprovedRuntime(t *testing.T) {
 				expectedDesired = pending.ID
 			}
 			probeKey = ""
-			reject = scenario == "rejected"
 			if scenario == "environment_override" {
 				t.Setenv(ai.EnvAPIKey, "environment-test-key")
 			}
@@ -118,14 +102,11 @@ func TestCredentialSetRefreshesOnlyApprovedRuntime(t *testing.T) {
 				t.Fatal("credential refresh changed saved choices or inheritance")
 			}
 			if scenario != "corrected" {
-				if activation.DesiredRevisionID.Int64 != expectedDesired || nudges != 0 {
-					t.Fatalf("failed/shadowed credential activated: %+v nudges=%d", activation, nudges)
+				if activation.DesiredRevisionID.Int64 != expectedDesired {
+					t.Fatalf("failed/shadowed credential activated: %+v", activation)
 				}
 				if scenario == "pending_activation" && (commandErr == nil || probeKey != "") {
 					t.Fatalf("pending activation was not preserved: err=%v probed=%t", commandErr, probeKey != "")
-				}
-				if scenario == "rejected" && commandErr == nil {
-					t.Fatal("failed probe reported success")
 				}
 				if scenario == "environment_override" && (commandErr != nil || probeKey != "") {
 					t.Fatalf("environment override probed: keyset=%t err=%v", probeKey != "", commandErr)
@@ -135,15 +116,15 @@ func TestCredentialSetRefreshesOnlyApprovedRuntime(t *testing.T) {
 			if commandErr != nil {
 				t.Fatal(commandErr)
 			}
-			if probeKey != "corrected-test-key" || activation.DesiredRevisionID.Int64 <= baseline.RevisionID || activation.AppliedRevisionID.Int64 != baseline.RevisionID || nudges != 1 {
-				t.Fatalf("refresh state=%+v keyset=%t nudges=%d", activation, probeKey != "", nudges)
+			if probeKey != "" || activation.DesiredRevisionID.Int64 <= baseline.RevisionID || activation.AppliedRevisionID.Int64 != activation.DesiredRevisionID.Int64 {
+				t.Fatalf("refresh state=%+v probed=%t", activation, probeKey != "")
 			}
 			previous, _ := state.ConfigRevisionByID(ctx, db, baseline.RevisionID)
 			refreshed, err := state.ConfigRevisionByID(ctx, db, activation.DesiredRevisionID.Int64)
 			if err != nil || previous.SnapshotJSON != refreshed.SnapshotJSON {
 				t.Fatalf("refresh altered approved contract: %v\nbefore=%s\nafter=%s", err, previous.SnapshotJSON, refreshed.SnapshotJSON)
 			}
-			if !strings.Contains(out, repo) || !strings.Contains(out, "queued") {
+			if !strings.Contains(out, repo) || !strings.Contains(out, "applied") {
 				t.Fatalf("missing scoped activation outcome: %s", out)
 			}
 		})

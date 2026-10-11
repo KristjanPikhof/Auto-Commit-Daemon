@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// Deprecated: identifiers for old callers and the v1 translation boundary.
+// Identifiers used only for legacy translation and removed-setting guidance.
 const (
 	FieldCommitPreset           = "commit.preset"
 	FieldIntentWindow           = "intent.window"
@@ -32,7 +32,7 @@ var retiredFinishFields = map[string]bool{
 	FieldIntentRepairEnabled: true, FieldIntentRepairHorizon: true,
 	FieldIntentRepairMaxCommits:  true,
 	"capture.max_pending_events": true, "retention.event_days": true,
-	"recovery.rewind_grace": true, "recovery.shadow_generations": true,
+	"client.ttl": true, "recovery.rewind_grace": true, "recovery.shadow_generations": true,
 }
 
 // UnsupportedFieldError distinguishes removed publication controls from typos.

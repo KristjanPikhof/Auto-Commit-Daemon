@@ -114,26 +114,18 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 			initialized = false
 			message = "Choose a setting to edit. Changes are saved together."
 		case "commit.mode":
-			strategy, preset := "", ""
+			mode := "local"
 			for _, field := range snapshot.Fields {
 				if field.Key == "commit.strategy" {
-					strategy = field.Value
-				}
-				if field.Key == "commit.preset" {
-					preset = field.Value
+					mode = field.Value
 				}
 			}
-			mode := configureExperience(strategy, preset)
-			options := []huh.Option[string]{huh.NewOption("Everyday: semantic commits with safety checks", "everyday"), huh.NewOption("Maximum speed: immediate commits", "speed")}
-			if draft.Scope == "repo" {
-				options = append(options, huh.NewOption("Strict review: require project verification", "strict"))
-			}
-			if err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("Commit mode").Description("Advanced customizations are kept. Review the effective verification settings before saving.").Options(options...).Value(&mode))), opts); err != nil {
+			options := []huh.Option[string]{huh.NewOption("Local: one complete batch, offline", "local"), huh.NewOption("Intent: AI groups completed goals", "intent")}
+			if err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("Finish mode").Description("Branch commits are created when you run acd finish.").Options(options...).Value(&mode))), opts); err != nil {
 				return editorExitError(err)
 			}
-			strategy, preset = configureExperienceMode(mode)
-			draft.Changes["commit.strategy"], draft.Changes["commit.preset"] = &strategy, &preset
-			message = "Commit mode changed. Choose Save changes when ready."
+			draft.Changes["commit.strategy"] = &mode
+			message = "Finish mode changed. Choose Save changes when ready."
 		case "advanced":
 			advanced = !advanced
 		case "save":
@@ -154,12 +146,12 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 			if !approved {
 				continue
 			}
-			fmt.Fprintln(opts.Output, "Testing and saving settings...")
+			fmt.Fprintln(opts.Output, "Saving settings...")
 			result, err := review.Save(ctx)
 			if err != nil {
 				message = "Save did not finish: " + safeText(err.Error())
 				fmt.Fprintln(opts.Output, message)
-				// Keep edits so a failed connection can be corrected and retried.
+				// Keep edits so a failed save can be corrected and retried.
 				continue
 			}
 			fmt.Fprintln(opts.Output, result)
@@ -175,7 +167,7 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 				continue
 			}
 			draft.Credential = value
-			message = "New API key entered. It will be tested and stored securely when you save."
+			message = "New API key entered. It will be stored securely when you save."
 		default:
 			var field EditorField
 			for _, candidate := range snapshot.Fields {
@@ -225,17 +217,7 @@ func editorMenu(snapshot EditorSnapshot, draft EditorDraft, advanced bool, repo 
 	}
 	add := func(key string) {
 		if key == "commit.mode" {
-			strategy, preset := byKey["commit.strategy"].Value, byKey["commit.preset"].Value
-			label := strategy + " / " + preset
-			switch {
-			case strategy == "intent" && preset == "balanced":
-				label = "Everyday"
-			case strategy == "event" && preset == "fast":
-				label = "Maximum speed"
-			case strategy == "intent" && preset == "quality":
-				label = "Strict review"
-			}
-			rows = append(rows, huh.NewOption("Commit mode: "+label, key))
+			rows = append(rows, huh.NewOption("Finish mode: "+safeText(byKey["commit.strategy"].Value), key))
 			return
 		}
 		if key == "ai.api_key" {
@@ -306,7 +288,7 @@ func editEditorField(ctx context.Context, field EditorField, scope string, opts 
 		}
 		err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("AI provider").Options(
 			huh.NewOption("OpenAI-compatible connection", "openai-compat"),
-			huh.NewOption("Local automatic commits (no API key)", "deterministic"),
+			huh.NewOption("Local finish (no API key)", "deterministic"),
 			huh.NewOption("Local subprocess provider", "subprocess"),
 		).Value(&provider))), opts)
 		if err != nil {

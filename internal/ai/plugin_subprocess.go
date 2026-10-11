@@ -1,52 +1,4 @@
-// plugin_subprocess.go — subprocess plugin runner per spec §10.3.
-//
-// A subprocess plugin is an external binary on $PATH named
-// `acd-provider-<name>`. The daemon resolves the binary at construction,
-// spawns it once per daemon lifetime, and multiplexes JSONL requests over
-// the plugin's stdin (one request per line) and stdout (one response per
-// line). The plugin is single-threaded by contract; we serialize requests
-// from the daemon side too via a single owner goroutine.
-//
-// Wire format (one JSON object per line, both directions):
-//
-//	request:  {"version":1,"path":"...","op":"modify","old_path":"",
-//	            "diff":"...","repo_root":"/abs","branch":"refs/heads/main",
-//	            "multi_op":[{"path":"...","op":"...","old_path":"..."}],
-//	            "now":"2026-04-28T12:00:00Z"}
-//	response: {"version":1,"subject":"...","body":"...","error":""}
-//
-// Intent v2 capability negotiation is deliberately asymmetric so old plugins
-// never receive an unfamiliar request:
-//   - First request: the existing version=1/request_type=intent_plan envelope.
-//   - Native-capable response: capabilities includes "intent_plan_v2".
-//   - Native request: version=2/request_type=intent_plan_v2 with
-//     planner_protocol=v2 and planner_request_v2.
-//   - Native response: version=2/planner_protocol=v2 with intent_plan_v2.
-//
-// A plugin that omits the capability stays entirely on the v1 wire protocol;
-// its valid plan is adapted by the caller and labeled v1_compat.
-//
-// The legacy snapshot daemon never shipped a subprocess provider, so the
-// canonical wire shape lives in this file (and in the docstring above) as
-// the contract every harness must speak. Diff text is empty unless the daemon
-// opted in to sending diffs, then redacted and truncated before it reaches the
-// plugin. The `version` field exists so future shapes can be negotiated without
-// breaking older plugins.
-//
-// Lifecycle:
-//   - Spawn on first Generate after construction (or after a crash/timeout).
-//   - One owner goroutine per provider holds (stdin, stdout, process); a
-//     buffered request channel feeds it serialised work.
-//   - Per-request timeout (default 5m) is enforced via context.WithTimeout
-//     on the caller side. On timeout we kill the plugin so the next request
-//     gets a fresh process — a stuck plugin must never wedge the daemon.
-//   - On any I/O error or unexpected EOF on stdin/stdout the provider is
-//     marked "crashed"; the next Generate respawns the plugin from scratch.
-//   - Soft errors (plugin returns a non-empty `error` field) keep the
-//     plugin alive; only the current request fails so Compose() can fall
-//     back to deterministic.
-//   - Close() closes stdin (signalling EOF), waits up to 5s for clean exit,
-//     and escalates to SIGKILL if the plugin is still running.
+// Subprocess Finish exchanges use one bounded JSONL request per call.
 package ai
 
 import (
@@ -62,11 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/prompttrace"
 )
 
 // DefaultSubprocessTimeout is the per-request default per spec §10.3.
@@ -81,18 +30,6 @@ const subprocessShutdownGrace = 5 * time.Second
 // plugin from growing daemon memory without bound.
 const subprocessResponseByteCap = 1 << 20
 
-// pluginProtocolVersion is the integer carried in every request and
-// response. Bump when the wire shape changes incompatibly.
-const pluginProtocolVersion = 1
-
-const subprocessIntentV2Capability = "intent_plan_v2"
-
-const (
-	intentV2CapabilityUnknown int32 = iota
-	intentV2CapabilityLegacy
-	intentV2CapabilityNative
-)
-
 // LookPathFunc matches exec.LookPath's signature so tests can inject a
 // fake binary lookup without touching the real $PATH.
 type LookPathFunc func(string) (string, error)
@@ -101,41 +38,33 @@ type LookPathFunc func(string) (string, error)
 // back to safe defaults (Timeout=30s, LookPath=exec.LookPath, Logger=
 // slog.Default, Stderr=~/.local/state/acd/plugin-<name>.log).
 type SubprocessOptions struct {
-	Timeout      time.Duration // per-request hard timeout; 0 -> DefaultSubprocessTimeout
-	Logger       *slog.Logger  // optional; nil -> slog.Default
-	Env          []string      // additional env entries appended to os.Environ
-	LookPath     LookPathFunc  // resolves binary path; nil -> exec.LookPath
-	Stderr       io.Writer     // plugin stderr sink; nil -> per-plugin log file
-	CommitFormat CommitFormat  // empty -> imperative
+	Timeout  time.Duration // per-request hard timeout; 0 -> DefaultSubprocessTimeout
+	Logger   *slog.Logger  // optional; nil -> slog.Default
+	Env      []string      // additional env entries appended to os.Environ
+	LookPath LookPathFunc  // resolves binary path; nil -> exec.LookPath
+	Stderr   io.Writer     // plugin stderr sink; nil -> per-plugin log file
 }
 
-// SubprocessProvider implements Provider by talking JSONL to a long-lived
-// child process. Safe for concurrent Generate calls from multiple
+// SubprocessProvider implements FinishTransport using a long-lived JSONL
+// child process. Safe for concurrent ExchangeFinish calls from multiple
 // goroutines: requests are serialised through a single owner goroutine.
 type SubprocessProvider struct {
 	name       string // logical plugin name (without acd-provider- prefix)
 	binary     string // resolved absolute path to acd-provider-<name>
-	resolveErr error  // sticky error from initial LookPath; surfaced from Generate
+	resolveErr error  // sticky error from initial LookPath; surfaced from ExchangeFinish
 
 	timeout time.Duration
 	env     []string
 	stderr  io.Writer
 	logger  *slog.Logger
-	format  CommitFormat
-
-	intentV2Capability atomic.Int32
 
 	mu     sync.Mutex // guards plugin/closed
 	plugin *pluginSession
 	closed bool
 }
 
-// NewSubprocessProvider resolves acd-provider-<name> on $PATH (via opts.
-// LookPath) and returns a provider ready for Generate calls. If the
-// binary cannot be found the error is stored on the provider and surfaced
-// from the first Generate; the constructor does not fail so callers can
-// still wire `Compose(plugin, deterministic)` and have the deterministic
-// fallback fire cleanly when the plugin is missing.
+// NewSubprocessProvider resolves the plugin without spawning it. A lookup error
+// is returned by construction validation or the first explicit exchange.
 func NewSubprocessProvider(name string, opts SubprocessOptions) *SubprocessProvider {
 	timeout := opts.Timeout
 	if timeout <= 0 {
@@ -156,7 +85,6 @@ func NewSubprocessProvider(name string, opts SubprocessOptions) *SubprocessProvi
 		env:     append([]string(nil), opts.Env...),
 		stderr:  opts.Stderr,
 		logger:  logger,
-		format:  effectiveCommitFormat(opts.CommitFormat),
 	}
 
 	if strings.TrimSpace(name) == "" {
@@ -184,7 +112,7 @@ func (p *SubprocessProvider) EncodeFinishRequest(request FinishPlanRequest) ([]b
 		RequestType   string            `json:"request_type"`
 		SystemPrompt  string            `json:"system_prompt"`
 		FinishRequest FinishPlanRequest `json:"finish_request"`
-	}{Version: 1, RequestType: "finish_plan", SystemPrompt: finishSystemPrompt, FinishRequest: request})
+	}{Version: 1, RequestType: "finish_plan", SystemPrompt: finishPrompt(request), FinishRequest: request})
 }
 
 // ExchangeFinish deliberately bypasses capability negotiation and the legacy
@@ -218,530 +146,8 @@ func (p *SubprocessProvider) ExchangeFinish(ctx context.Context, body []byte) ([
 	return response.FinishPlan, nil
 }
 
-// Generate marshals cc into a JSONL line, writes it to the plugin, reads
-// one JSONL line back, sanitises subject + body, and returns the Result.
-//
-// Concurrent calls are safe: requests are serialised through the owner
-// goroutine (the plugin protocol is single-threaded by contract). Cancel
-// the supplied ctx to abort an in-flight request; if the deadline expires
-// or the caller cancels mid-flight we kill the plugin so the next Generate
-// gets a fresh process.
-func (p *SubprocessProvider) Generate(ctx context.Context, cc CommitContext) (Result, error) {
-	if err := ctx.Err(); err != nil {
-		return Result{}, err
-	}
-	if p.resolveErr != nil {
-		return Result{}, p.resolveErr
-	}
-
-	req := subprocessRequest{
-		Version:      pluginProtocolVersion,
-		CommitFormat: effectiveCommitFormat(firstCommitFormat(cc.CommitFormat, p.format)),
-		Path:         cc.Path,
-		Op:           cc.Op,
-		OldPath:      cc.OldPath,
-		Diff:         Truncate(RedactDiffSecrets(cc.DiffText), DiffCap),
-		RepoRoot:     cc.RepoRoot,
-		Branch:       cc.Branch,
-	}
-	for _, item := range cc.MultiOp {
-		req.MultiOp = append(req.MultiOp, subprocessOp{
-			Path:    item.Path,
-			Op:      item.Op,
-			OldPath: item.OldPath,
-		})
-	}
-	if !cc.Now.IsZero() {
-		req.Now = cc.Now.UTC().Format(time.RFC3339Nano)
-	}
-	requestBody, transform, err := marshalSubprocessPromptRequest(req, cc.DiffText, req.Diff)
-	if err != nil {
-		return Result{}, err
-	}
-	p.recordSubprocessRequest(ctx, requestBody, transform, prompttrace.Metadata{
-		Strategy:     "event",
-		DiffIncluded: req.Diff != "",
-		DiffCap:      DiffCap,
-	})
-
-	resp, err := p.exchangeBytesWithRetry(ctx, requestBody)
-	if err != nil {
-		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
-		return Result{}, err
-	}
-	if strings.TrimSpace(resp.Error) != "" {
-		// Soft fail: plugin is healthy, just couldn't satisfy this
-		// particular request. Compose() will fall back.
-		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
-		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Error: err.Error()})
-		return Result{}, err
-	}
-
-	composed := resp.Subject
-	if strings.TrimSpace(resp.Body) != "" {
-		composed = resp.Subject + "\n\n" + resp.Body
-	}
-	cleaned := SanitizeMessage(composed)
-	parts := strings.SplitN(cleaned, "\n\n", 2)
-	subj := parts[0]
-	var bodyOut string
-	if len(parts) == 2 {
-		bodyOut = parts[1]
-	}
-	if strings.TrimSpace(subj) == "" {
-		err := fmt.Errorf("subprocess:%s: empty subject after sanitize", p.name)
-		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{ValidationError: err.Error()})
-		return Result{}, err
-	}
-	if err := commitFormatValidationError("subprocess:"+p.name, validateCommitMessageFormat(req.CommitFormat, subj, bodyOut)); err != nil {
-		p.recordSubprocessResponse(ctx, "event", prompttrace.Response{ValidationError: err.Error()})
-		return Result{}, err
-	}
-	p.recordSubprocessResponse(ctx, "event", prompttrace.Response{Subject: subj, Body: bodyOut})
-	return Result{
-		Subject: subj,
-		Body:    bodyOut,
-		Source:  p.Name(),
-	}, nil
-}
-
-// PlanIntent asks the subprocess plugin to select/defer every offered capture.
-// The JSONL request uses request_type=intent_plan and carries the shared
-// IntentPlanRequest payload; response fields mirror IntentPlan.
-func (p *SubprocessProvider) PlanIntent(ctx context.Context, plannerReq IntentPlanRequest) (IntentPlan, error) {
-	if err := ctx.Err(); err != nil {
-		return IntentPlan{}, err
-	}
-	if p.resolveErr != nil {
-		return IntentPlan{}, p.resolveErr
-	}
-	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
-
-	req := subprocessRequest{
-		Version:        pluginProtocolVersion,
-		RequestType:    "intent_plan",
-		CommitFormat:   plannerReq.CommitFormat,
-		PlannerRequest: &plannerReq,
-	}
-	body, err := marshalSubprocessRequest(req)
-	if err != nil {
-		return IntentPlan{}, err
-	}
-	p.recordSubprocessRequest(ctx, body, plannerReq.CapturedDiffTransform, prompttrace.Metadata{
-		Strategy:     "intent",
-		OfferedSeqs:  offeredSeqs(plannerReq),
-		DiffIncluded: intentDiffIncluded(plannerReq),
-		// Intent stage uses IntentStageDiffCap so the planner sees enough
-		// per-capture context to group multi-file changes; per-event
-		// commit messages still cap at the legacy DiffCap.
-		DiffCap: IntentStageDiffCap,
-	})
-
-	resp, err := p.exchangeBytesWithRetry(ctx, body)
-	if err != nil {
-		var decodeErr *subprocessResponseDecodeError
-		if errors.As(err, &decodeErr) {
-			validationErr := intentPlanShapeValidationError(
-				fmt.Sprintf("subprocess:%s: %v", p.name, decodeErr),
-				decodeErr,
-			)
-			p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: validationErr.Error()})
-			return IntentPlan{}, validationErr
-		}
-		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
-		return IntentPlan{}, err
-	}
-	if strings.TrimSpace(resp.Error) != "" {
-		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
-		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{Error: err.Error()})
-		return IntentPlan{}, err
-	}
-
-	plan := IntentPlan{
-		SelectedSeqs:    resp.SelectedSeqs,
-		DeferredSeqs:    resp.DeferredSeqs,
-		Subject:         resp.Subject,
-		Body:            resp.Body,
-		GroupingReason:  resp.GroupingReason,
-		DeferredReasons: resp.DeferredReasons,
-		CommitGroups:    resp.CommitGroups,
-		Source:          p.Name(),
-	}
-	if strings.TrimSpace(plan.Subject) == "" {
-		cause := fmt.Errorf("subprocess:%s: intent plan returned empty subject", p.name)
-		err := intentPlanShapeValidationError(cause.Error(), cause)
-		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
-		return IntentPlan{}, err
-	}
-	plan.Subject, plan.Body = sanitizeSubjectBody(plan.Subject, plan.Body)
-	plan = NormalizeIntentPlanReasons(plan)
-	plan, dropped, synthesized, overlapRemoved := NormalizeIntentPlanDeferredReasons(plan)
-	if len(dropped) > 0 || len(synthesized) > 0 || len(overlapRemoved) > 0 {
-		attrs := []any{
-			slog.String("provider", p.Name()),
-			slog.String("plugin", p.name),
-		}
-		if len(dropped) > 0 {
-			attrs = append(attrs, slog.Any("dropped_seqs", dropped))
-		}
-		if len(synthesized) > 0 {
-			attrs = append(attrs, slog.Any("synthesized_seqs", synthesized))
-		}
-		if len(overlapRemoved) > 0 {
-			attrs = append(attrs, slog.Any("overlap_removed_seqs", overlapRemoved))
-		}
-		p.logger.Warn("intent planner: normalized deferred_reasons", attrs...)
-	}
-	if err := ValidateIntentPlan(plannerReq, plan); err != nil {
-		p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{ValidationError: err.Error()})
-		// Best-effort: serialize the plugin response for forensic replay.
-		// Marshal failure means the raw payload stays empty in the rejects
-		// log entry; the validator code/message are still persisted so an
-		// operator can always recover the validation context.
-		var rawBytes []byte
-		if marshaled, mErr := json.Marshal(resp); mErr == nil {
-			rawBytes = marshaled
-		}
-		LogRejectedIntentPlan(ctx, p.Name(), plannerReq, string(rawBytes), err)
-		return IntentPlan{}, err
-	}
-	p.recordSubprocessResponse(ctx, "intent", prompttrace.Response{
-		Subject:        plan.Subject,
-		Body:           plan.Body,
-		SelectedSeqs:   plan.SelectedSeqs,
-		DeferredSeqs:   plan.DeferredSeqs,
-		GroupingReason: plan.GroupingReason,
-	})
-	return plan, nil
-}
-
-// PlanIntentV2 negotiates native candidate planning with a safe v1 probe.
-// Unknown plugins first receive the exact legacy intent_plan envelope. A
-// v2-aware plugin advertises intent_plan_v2 in response capabilities, after
-// which the provider sends the version-2 request_type. Plugins that do not
-// advertise remain on the unchanged v1 wire shape and their valid response is
-// returned to the outer adapter as planner_protocol=v1_compat.
-func (p *SubprocessProvider) PlanIntentV2(ctx context.Context, plannerReq IntentPlanRequestV2) (IntentPlanV2, error) {
-	if err := ctx.Err(); err != nil {
-		return IntentPlanV2{}, err
-	}
-	if p.resolveErr != nil {
-		return IntentPlanV2{}, p.resolveErr
-	}
-	if err := ValidateIntentPlanRequestV2(plannerReq); err != nil {
-		return IntentPlanV2{}, err
-	}
-	plannerReq.CommitFormat = effectiveCommitFormat(plannerReq.CommitFormat)
-	legacyReq := LegacyIntentPlanRequest(plannerReq)
-
-	if p.intentV2Capability.Load() != intentV2CapabilityNative {
-		legacyResp, err := p.exchangeIntentV2Envelope(ctx, plannerReq, subprocessRequest{
-			Version:        pluginProtocolVersion,
-			RequestType:    "intent_plan",
-			CommitFormat:   plannerReq.CommitFormat,
-			PlannerRequest: &legacyReq,
-		}, "intent_v2_probe")
-		if err != nil {
-			return IntentPlanV2{}, err
-		}
-		if !hasSubprocessCapability(legacyResp.Capabilities, subprocessIntentV2Capability) {
-			p.intentV2Capability.Store(intentV2CapabilityLegacy)
-			return p.unsupportedIntentV2FromLegacyResponse(ctx, legacyReq, legacyResp)
-		}
-		p.intentV2Capability.Store(intentV2CapabilityNative)
-	}
-
-	req := subprocessRequest{
-		Version:          2,
-		RequestVersion:   2,
-		RequestType:      "intent_plan_v2",
-		PlannerProtocol:  IntentPlannerProtocolV2,
-		CommitFormat:     plannerReq.CommitFormat,
-		PlannerRequestV2: &plannerReq,
-	}
-	resp, err := p.exchangeIntentV2Envelope(ctx, plannerReq, req, "intent_v2")
-	if err != nil {
-		return IntentPlanV2{}, err
-	}
-
-	rawResponse, _ := json.Marshal(resp)
-	if resp.PlannerProtocol == IntentPlannerProtocolV2 {
-		if resp.Version != 2 {
-			err := v2ValidationError("", IntentAtomicityDependency,
-				"response_version_invalid", "native v2 response must use version 2")
-			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: err.Error()})
-			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), err)
-			return IntentPlanV2{}, err
-		}
-		if len(resp.IntentPlanV2) == 0 {
-			err := v2ValidationError("", IntentAtomicityCohesion,
-				"response_plan_missing", "native v2 response omitted intent_plan_v2")
-			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: err.Error()})
-			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), err)
-			return IntentPlanV2{}, err
-		}
-		plan, decodeErr := DecodeIntentPlanV2(resp.IntentPlanV2, plannerReq)
-		if decodeErr != nil {
-			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: decodeErr.Error()})
-			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), decodeErr)
-			return IntentPlanV2{}, decodeErr
-		}
-		if err := validateNativeIntentPlanV2(plannerReq, plan); err != nil {
-			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: err.Error()})
-			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), err)
-			return IntentPlanV2{}, err
-		}
-		for i := range plan.Candidates {
-			plan.Candidates[i].Subject, plan.Candidates[i].Body = sanitizeSubjectBody(
-				plan.Candidates[i].Subject,
-				plan.Candidates[i].Body,
-			)
-		}
-		if err := validateNativeIntentPlanV2(plannerReq, plan); err != nil {
-			p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: err.Error()})
-			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(rawResponse), err)
-			return IntentPlanV2{}, err
-		}
-		p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{
-			SelectedSeqs: candidatePlanSeqs(plan),
-		})
-		p.intentV2Capability.Store(intentV2CapabilityNative)
-		return plan, nil
-	}
-
-	p.intentV2Capability.Store(intentV2CapabilityLegacy)
-	return p.unsupportedIntentV2FromLegacyResponse(ctx, legacyReq, resp)
-}
-
-func (p *SubprocessProvider) exchangeIntentV2Envelope(
-	ctx context.Context,
-	plannerReq IntentPlanRequestV2,
-	req subprocessRequest,
-	strategy string,
-) (subprocessResponse, error) {
-	body, err := marshalSubprocessRequest(req)
-	if err != nil {
-		return subprocessResponse{}, err
-	}
-	p.recordSubprocessRequest(ctx, body, plannerReq.CapturedDiffTransform, prompttrace.Metadata{
-		Strategy:     strategy,
-		OfferedSeqs:  offeredSeqsV2(plannerReq),
-		DiffIncluded: intentDiffIncludedV2(plannerReq),
-		DiffCap:      IntentStageDiffCap,
-	})
-	resp, err := p.exchangeBytesWithRetry(ctx, body)
-	if err != nil {
-		var decodeErr *subprocessResponseDecodeError
-		if errors.As(err, &decodeErr) {
-			validationErr := v2ValidationError("", IntentAtomicityCohesion,
-				"response_decode_failed", fmt.Sprintf("subprocess:%s: %v", p.name, decodeErr))
-			p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{ValidationError: validationErr.Error()})
-			LogRejectedIntentPlanV2(ctx, p.Name(), plannerReq, string(decodeErr.raw), validationErr)
-			return subprocessResponse{}, validationErr
-		}
-		p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{Error: err.Error()})
-		return subprocessResponse{}, err
-	}
-	if strings.TrimSpace(resp.Error) != "" {
-		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
-		p.recordSubprocessResponse(ctx, strategy, prompttrace.Response{Error: err.Error()})
-		return subprocessResponse{}, err
-	}
-	return resp, nil
-}
-
-func (p *SubprocessProvider) unsupportedIntentV2FromLegacyResponse(
-	ctx context.Context,
-	legacyReq IntentPlanRequest,
-	resp subprocessResponse,
-) (IntentPlanV2, error) {
-	rawResponse, _ := json.Marshal(resp)
-	legacyPlan, legacyErr := p.legacyIntentPlanFromResponse(legacyReq, resp)
-	if legacyErr != nil {
-		p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{ValidationError: legacyErr.Error()})
-		LogRejectedIntentPlan(ctx, p.Name(), legacyReq, string(rawResponse), legacyErr)
-		return IntentPlanV2{}, legacyErr
-	}
-	p.recordSubprocessResponse(ctx, "intent_v2", prompttrace.Response{
-		Subject:        legacyPlan.Subject,
-		Body:           legacyPlan.Body,
-		SelectedSeqs:   legacyPlan.SelectedSeqs,
-		DeferredSeqs:   legacyPlan.DeferredSeqs,
-		GroupingReason: legacyPlan.GroupingReason,
-	})
-	return IntentPlanV2{}, &IntentPlannerV2UnsupportedError{LegacyPlan: legacyPlan}
-}
-
-func hasSubprocessCapability(capabilities []string, capability string) bool {
-	for _, candidate := range capabilities {
-		if candidate == capability {
-			return true
-		}
-	}
-	return false
-}
-
-func (p *SubprocessProvider) legacyIntentPlanFromResponse(req IntentPlanRequest, resp subprocessResponse) (IntentPlan, error) {
-	plan := IntentPlan{
-		SelectedSeqs:    resp.SelectedSeqs,
-		DeferredSeqs:    resp.DeferredSeqs,
-		Subject:         resp.Subject,
-		Body:            resp.Body,
-		GroupingReason:  resp.GroupingReason,
-		DeferredReasons: resp.DeferredReasons,
-		CommitGroups:    resp.CommitGroups,
-		Source:          p.Name(),
-	}
-	if strings.TrimSpace(plan.Subject) == "" {
-		cause := fmt.Errorf("subprocess:%s: intent plan returned empty subject", p.name)
-		return IntentPlan{}, intentPlanShapeValidationError(cause.Error(), cause)
-	}
-	plan.Subject, plan.Body = sanitizeSubjectBody(plan.Subject, plan.Body)
-	plan = NormalizeIntentPlanReasons(plan)
-	var dropped, synthesized, overlapRemoved []int64
-	plan, dropped, synthesized, overlapRemoved = NormalizeIntentPlanDeferredReasons(plan)
-	logIntentPlanNormalization(p.Name(), dropped, synthesized, overlapRemoved)
-	if err := ValidateIntentPlan(req, plan); err != nil {
-		return IntentPlan{}, err
-	}
-	return plan, nil
-}
-
-// RewriteIntentMessage asks the plugin to rewrite only subject/body for a
-// locked intent plan. The request_type keeps this distinct from intent_plan so
-// plugins cannot accidentally change grouping fields.
-func (p *SubprocessProvider) RewriteIntentMessage(ctx context.Context, rewriteReq IntentMessageRewriteRequest) (Result, error) {
-	if err := ctx.Err(); err != nil {
-		return Result{}, err
-	}
-	ctx = withPromptTraceStrategy(ctx, "intent_message_rewrite", rewriteReq.LockedPlan.SelectedSeqs, intentDiffIncluded(rewriteReq.PlannerRequest), IntentStageDiffCap)
-	if p.resolveErr != nil {
-		return Result{}, p.resolveErr
-	}
-	rewriteReq.CommitFormat = firstCommitFormat(rewriteReq.CommitFormat, rewriteReq.PlannerRequest.CommitFormat)
-
-	req := subprocessRequest{
-		Version:               pluginProtocolVersion,
-		RequestType:           "intent_message_rewrite",
-		CommitFormat:          rewriteReq.CommitFormat,
-		MessageRewriteRequest: &rewriteReq,
-	}
-	body, err := marshalSubprocessRequest(req)
-	if err != nil {
-		return Result{}, err
-	}
-	p.recordSubprocessRequest(ctx, body, rewriteReq.PlannerRequest.CapturedDiffTransform, prompttrace.Metadata{
-		Strategy:     "intent_message_rewrite",
-		OfferedSeqs:  append([]int64(nil), rewriteReq.LockedPlan.SelectedSeqs...),
-		DiffIncluded: intentDiffIncluded(rewriteReq.PlannerRequest),
-		DiffCap:      IntentStageDiffCap,
-	})
-
-	resp, err := p.exchangeBytesWithRetry(ctx, body)
-	if err != nil {
-		var decodeErr *subprocessResponseDecodeError
-		if errors.As(err, &decodeErr) {
-			validationErr := &IntentMessageRewriteValidationError{
-				Err: fmt.Errorf("subprocess:%s: %w", p.name, decodeErr),
-			}
-			p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{ValidationError: validationErr.Error()})
-			return Result{}, validationErr
-		}
-		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
-		return Result{}, err
-	}
-	if strings.TrimSpace(resp.Error) != "" {
-		err := fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
-		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Error: err.Error()})
-		return Result{}, err
-	}
-	if intentMessageRewriteSubjectEmpty(resp.Subject) {
-		validationErr := &IntentMessageRewriteValidationError{
-			Err: fmt.Errorf("subprocess:%s: empty subject after intent message rewrite sanitize", p.name),
-		}
-		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{ValidationError: validationErr.Error()})
-		return Result{}, validationErr
-	}
-
-	cleaned := SanitizeMessage(resp.Subject + "\n\n" + resp.Body)
-	parts := strings.SplitN(cleaned, "\n\n", 2)
-	result := Result{Subject: parts[0], Source: p.Name()}
-	if len(parts) == 2 {
-		result.Body = parts[1]
-	}
-	if strings.TrimSpace(result.Subject) == "" {
-		validationErr := &IntentMessageRewriteValidationError{
-			Err: fmt.Errorf("subprocess:%s: empty subject after intent message rewrite sanitize", p.name),
-		}
-		p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{ValidationError: validationErr.Error()})
-		return Result{}, validationErr
-	}
-	p.recordSubprocessResponse(ctx, "intent_message_rewrite", prompttrace.Response{Subject: result.Subject, Body: result.Body})
-	return result, nil
-}
-
-// ProposeCommitRewrite asks the plugin to rewrite one existing commit message.
-func (p *SubprocessProvider) ProposeCommitRewrite(ctx context.Context, rewriteReq CommitRewriteRequest) (Result, error) {
-	if err := ctx.Err(); err != nil {
-		return Result{}, err
-	}
-	if p.resolveErr != nil {
-		return Result{}, p.resolveErr
-	}
-	rewriteReq.CommitFormat = effectiveCommitFormat(rewriteReq.CommitFormat)
-	req := subprocessRequest{Version: pluginProtocolVersion, RequestType: "commit_rewrite_proposal", CommitFormat: rewriteReq.CommitFormat, CommitRewriteRequest: &rewriteReq}
-	body, err := marshalSubprocessRequest(req)
-	if err != nil {
-		return Result{}, err
-	}
-	resp, err := p.exchangeBytesWithRetry(ctx, body)
-	if err != nil {
-		return Result{}, err
-	}
-	if strings.TrimSpace(resp.Error) != "" {
-		return Result{}, fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
-	}
-	return ValidateCommitRewriteProposal(rewriteReq, Result{Subject: resp.Subject, Body: resp.Body, Source: p.Name()})
-}
-
-// ProposeHistoryRewritePlan asks the plugin for one ordered grouped rewrite
-// plan. Plugins that do not support this request should return a clear error;
-// callers can use --messages-only with the older proposal contract.
-func (p *SubprocessProvider) ProposeHistoryRewritePlan(ctx context.Context, planReq HistoryRewritePlanRequest) (HistoryRewritePlan, error) {
-	if err := ctx.Err(); err != nil {
-		return HistoryRewritePlan{}, err
-	}
-	if p.resolveErr != nil {
-		return HistoryRewritePlan{}, p.resolveErr
-	}
-	planReq.CommitFormat = effectiveCommitFormat(planReq.CommitFormat)
-	req := subprocessRequest{
-		Version:                   pluginProtocolVersion,
-		RequestType:               "history_rewrite_plan",
-		CommitFormat:              planReq.CommitFormat,
-		HistoryRewritePlanRequest: &planReq,
-	}
-	body, err := marshalSubprocessRequest(req)
-	if err != nil {
-		return HistoryRewritePlan{}, err
-	}
-	resp, err := p.exchangeBytesWithRetry(ctx, body)
-	if err != nil {
-		return HistoryRewritePlan{}, err
-	}
-	if strings.TrimSpace(resp.Error) != "" {
-		return HistoryRewritePlan{}, fmt.Errorf("subprocess:%s: %s", p.name, resp.Error)
-	}
-	if resp.HistoryRewritePlan == nil {
-		return HistoryRewritePlan{}, fmt.Errorf("subprocess:%s: provider does not support grouped history rewrites; update it or use --messages-only", p.name)
-	}
-	plan := *resp.HistoryRewritePlan
-	plan.Source = p.Name()
-	return ValidateHistoryRewritePlan(planReq, plan)
-}
-
 // Close shuts down the plugin process if running. Idempotent and safe to
-// call from any goroutine. After Close, Generate returns an error.
+// call from any goroutine. After Close, ExchangeFinish returns an error.
 func (p *SubprocessProvider) Close() error {
 	p.mu.Lock()
 	if p.closed {
@@ -760,7 +166,7 @@ func (p *SubprocessProvider) Close() error {
 }
 
 // acquire returns a live session, spawning one if necessary. The mutex
-// guards the (plugin, closed) pair so concurrent Generate calls only race
+// guards the (plugin, closed) pair so concurrent ExchangeFinish calls only race
 // to claim the existing session, never to spawn duplicates.
 func (p *SubprocessProvider) acquire() (*pluginSession, error) {
 	p.mu.Lock()
@@ -785,158 +191,22 @@ func (p *SubprocessProvider) acquire() (*pluginSession, error) {
 }
 
 // markCrashed tears down `session` if it is still the active plugin. The
-// next Generate will respawn through acquire().
+// next ExchangeFinish will respawn through acquire().
 func (p *SubprocessProvider) markCrashed(session *pluginSession) {
 	p.mu.Lock()
 	if p.plugin == session {
 		p.plugin = nil
 	}
 	p.mu.Unlock()
-	p.intentV2Capability.Store(intentV2CapabilityUnknown)
 	// shutdown is safe to call multiple times.
 	_ = session.shutdown(0)
 }
 
-// exchangeBytesWithRetry applies the subprocess lifecycle contract shared by
-// every request type: one bounded request, one retry after a process failure,
-// and no retry after cancellation or timeout.
-func (p *SubprocessProvider) exchangeBytesWithRetry(ctx context.Context, body []byte) (subprocessResponse, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-
-	var resp subprocessResponse
-	var err error
-	for attempt := 0; attempt < 2; attempt++ {
-		session, acquireErr := p.acquire()
-		if acquireErr != nil {
-			return subprocessResponse{}, acquireErr
-		}
-		resp, err = session.exchangeBytes(reqCtx, body)
-		if err == nil {
-			return resp, nil
-		}
-		p.markCrashed(session)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return subprocessResponse{}, err
-		}
-	}
-	return subprocessResponse{}, err
-}
-
-func (p *SubprocessProvider) recordSubprocessRequest(ctx context.Context, body []byte, transform prompttrace.TransformMetadata, fallback prompttrace.Metadata) {
-	logger, meta, ok := prompttrace.From(ctx)
-	if !ok {
-		return
-	}
-	if meta.Strategy == "" {
-		meta.Strategy = fallback.Strategy
-	}
-	if len(meta.OfferedSeqs) == 0 {
-		meta.OfferedSeqs = append([]int64(nil), fallback.OfferedSeqs...)
-	}
-	if meta.DiffCap == 0 {
-		meta.DiffCap = fallback.DiffCap
-	}
-	meta.DiffIncluded = meta.DiffIncluded || fallback.DiffIncluded
-	meta = promptTraceMetadata(meta, p.Name(), "")
-	logger.Record(prompttrace.Record{
-		Stage:              "request",
-		Strategy:           meta.Strategy,
-		Protocol:           meta.Protocol,
-		Provider:           meta.Provider,
-		Model:              meta.Model,
-		Seq:                meta.Seq,
-		OfferedSeqs:        append([]int64(nil), meta.OfferedSeqs...),
-		BranchRef:          meta.BranchRef,
-		Generation:         meta.Generation,
-		DiffIncluded:       meta.DiffIncluded,
-		DiffCap:            meta.DiffCap,
-		ConfigRevisionID:   meta.ConfigRevisionID,
-		ConfigProfile:      meta.ConfigProfile,
-		RetryCount:         meta.RetryCount,
-		Transform:          transform,
-		SubprocessEnvelope: append([]byte(nil), body...),
-	})
-}
-
-func (p *SubprocessProvider) recordSubprocessResponse(ctx context.Context, strategy string, response prompttrace.Response) {
-	logger, meta, ok := prompttrace.From(ctx)
-	if !ok {
-		return
-	}
-	if meta.Strategy == "" {
-		meta.Strategy = strategy
-	}
-	response.Error = SanitizePlannerError(response.Error)
-	response.ValidationError = SanitizePlannerError(response.ValidationError)
-	meta = promptTraceMetadata(meta, p.Name(), "")
-	logger.Record(prompttrace.Record{
-		Stage:            "response",
-		Strategy:         meta.Strategy,
-		Protocol:         meta.Protocol,
-		Provider:         meta.Provider,
-		Model:            meta.Model,
-		Seq:              meta.Seq,
-		OfferedSeqs:      append([]int64(nil), meta.OfferedSeqs...),
-		BranchRef:        meta.BranchRef,
-		Generation:       meta.Generation,
-		DiffIncluded:     meta.DiffIncluded,
-		DiffCap:          meta.DiffCap,
-		ConfigRevisionID: meta.ConfigRevisionID,
-		ConfigProfile:    meta.ConfigProfile,
-		RetryCount:       meta.RetryCount,
-		Response:         &response,
-	})
-}
-
-// subprocessRequest is the JSONL request envelope. Field tags fix the wire
-// names so the JSON shape matches the contract regardless of struct
-// renames.
-type subprocessRequest struct {
-	Version                   int                          `json:"version"`
-	RequestVersion            int                          `json:"request_version,omitempty"`
-	RequestType               string                       `json:"request_type,omitempty"`
-	PlannerProtocol           string                       `json:"planner_protocol,omitempty"`
-	CommitFormat              CommitFormat                 `json:"commit_format,omitempty"`
-	Path                      string                       `json:"path,omitempty"`
-	Op                        string                       `json:"op,omitempty"`
-	OldPath                   string                       `json:"old_path,omitempty"`
-	Diff                      string                       `json:"diff,omitempty"`
-	RepoRoot                  string                       `json:"repo_root,omitempty"`
-	Branch                    string                       `json:"branch,omitempty"`
-	MultiOp                   []subprocessOp               `json:"multi_op,omitempty"`
-	Now                       string                       `json:"now,omitempty"`
-	PlannerRequest            *IntentPlanRequest           `json:"planner_request,omitempty"`
-	PlannerRequestV2          *IntentPlanRequestV2         `json:"planner_request_v2,omitempty"`
-	MessageRewriteRequest     *IntentMessageRewriteRequest `json:"message_rewrite_request,omitempty"`
-	CommitRewriteRequest      *CommitRewriteRequest        `json:"commit_rewrite_request,omitempty"`
-	HistoryRewritePlanRequest *HistoryRewritePlanRequest   `json:"history_rewrite_plan_request,omitempty"`
-}
-
-// subprocessOp mirrors OpItem on the wire (field tags decouple the wire
-// shape from the Go field names).
-type subprocessOp struct {
-	Path    string `json:"path"`
-	Op      string `json:"op"`
-	OldPath string `json:"old_path,omitempty"`
-}
-
-// subprocessResponse is the JSONL response envelope.
+// subprocessResponse is the bounded Finish JSONL envelope.
 type subprocessResponse struct {
-	Version            int                 `json:"version"`
-	Capabilities       []string            `json:"capabilities,omitempty"`
-	PlannerProtocol    string              `json:"planner_protocol,omitempty"`
-	IntentPlanV2       json.RawMessage     `json:"intent_plan_v2,omitempty"`
-	Subject            string              `json:"subject"`
-	Body               string              `json:"body"`
-	Error              string              `json:"error"`
-	SelectedSeqs       []int64             `json:"selected_seqs,omitempty"`
-	DeferredSeqs       []int64             `json:"deferred_seqs,omitempty"`
-	GroupingReason     string              `json:"grouping_reason,omitempty"`
-	DeferredReasons    []DeferredReason    `json:"deferred_reasons,omitempty"`
-	CommitGroups       []IntentCommitGroup `json:"commit_groups,omitempty"`
-	HistoryRewritePlan *HistoryRewritePlan `json:"history_rewrite_plan,omitempty"`
-	FinishPlan         json.RawMessage     `json:"finish_plan,omitempty"`
+	Version    int             `json:"version"`
+	Error      string          `json:"error,omitempty"`
+	FinishPlan json.RawMessage `json:"finish_plan"`
 }
 
 // pluginRequest packages a request with its reply channel. The owner
@@ -989,10 +259,12 @@ type pluginSession struct {
 	stderr io.Closer
 	logger *slog.Logger
 
-	work     chan pluginRequest
-	done     chan struct{} // closed when run() exits
-	quit     chan struct{} // closed by shutdown to ask run() to exit promptly
-	quitOnce sync.Once
+	work         chan pluginRequest
+	done         chan struct{} // closed when run() exits
+	quit         chan struct{} // closed by shutdown to ask run() to exit promptly
+	quitOnce     sync.Once
+	shutdownOnce sync.Once
+	shutdownErr  error
 
 	deadMu sync.Mutex
 	deadFl bool
@@ -1002,8 +274,11 @@ type pluginSession struct {
 func startPlugin(name, binary string, extraEnv []string, stderr io.Writer, logger *slog.Logger) (*pluginSession, error) {
 	cmd := exec.Command(binary)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// A descendant retaining stderr must not leave Wait blocked indefinitely.
+	cmd.WaitDelay = time.Second
 	if len(extraEnv) > 0 {
-		// Compose: parent env + extras. We intentionally do not
+		// Add requested environment entries without replacing the parent environment.
+		// We intentionally do not
 		// strip parent env — plugin authors may rely on standard
 		// shell vars.
 		cmd.Env = append(cmd.Environ(), extraEnv...)
@@ -1184,18 +459,6 @@ func readLine(r *bufio.Reader, limit int) ([]byte, error) {
 	}
 }
 
-// exchange sends one request through the work channel, waits for the
-// reply, and respects ctx cancellation. If ctx fires before the reply
-// arrives we kill the process — this guarantees the next request gets a
-// fresh plugin rather than waiting on a stuck one.
-func (s *pluginSession) exchange(ctx context.Context, req subprocessRequest) (subprocessResponse, error) {
-	body, err := marshalSubprocessRequest(req)
-	if err != nil {
-		return subprocessResponse{}, err
-	}
-	return s.exchangeBytes(ctx, body)
-}
-
 func (s *pluginSession) exchangeBytes(ctx context.Context, body []byte) (subprocessResponse, error) {
 	reply := make(chan pluginReply, 1)
 	pr := pluginRequest{bytes: body, reply: reply}
@@ -1218,51 +481,7 @@ func (s *pluginSession) exchangeBytes(ctx context.Context, body []byte) (subproc
 	}
 }
 
-func marshalSubprocessPromptRequest(req subprocessRequest, inputDiff, outputDiff string) ([]byte, prompttrace.TransformMetadata, error) {
-	body, err := marshalSubprocessRequest(req)
-	if err != nil {
-		return nil, prompttrace.TransformMetadata{}, err
-	}
-	redacted := RedactDiffSecrets(inputDiff)
-	return body, promptTransformMetadata(inputDiff, redacted, outputDiff), nil
-}
-
-func marshalSubprocessRequest(req subprocessRequest) ([]byte, error) {
-	var wire any = req
-	if req.PlannerRequestV2 != nil {
-		wire = struct {
-			subprocessRequest
-			PlannerRequestV2 intentPlanWireV2 `json:"planner_request_v2"`
-		}{subprocessRequest: req, PlannerRequestV2: intentPlanV2WireRequest(*req.PlannerRequestV2)}
-	}
-	body, err := json.Marshal(wire)
-	if err != nil {
-		return nil, fmt.Errorf("encode request: %w", err)
-	}
-	if bytesContainNewline(body) {
-		// JSON encoding never produces a literal newline by default,
-		// but defense-in-depth: a future struct field with a custom
-		// marshaller could. JSONL framing breaks the moment a request
-		// straddles two lines.
-		return nil, errors.New("subprocess: encoded request contains newline")
-	}
-	return body, nil
-}
-
-// bytesContainNewline reports whether b includes a literal LF byte.
-// JSON marshalling escapes \n as \\n inside strings, so this should
-// always be false for our request struct, but we double-check.
-func bytesContainNewline(b []byte) bool {
-	for _, c := range b {
-		if c == '\n' {
-			return true
-		}
-	}
-	return false
-}
-
-// kill sends SIGKILL (via Process.Kill) and closes pipes. Safe to call
-// multiple times; subsequent calls are no-ops once the process has exited.
+// kill stops the plugin's process group and closes its pipes.
 func (s *pluginSession) kill() {
 	if s.cmd.Process != nil {
 		if err := syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL); err != nil {
@@ -1275,41 +494,46 @@ func (s *pluginSession) kill() {
 
 // shutdown signals the owner goroutine to exit, closes stdin to give the
 // plugin a clean EOF, and waits up to `grace` for the process to exit. On
-// timeout it escalates to SIGKILL. Always reaps the process to avoid
-// zombies. Pass grace=0 to skip the polite phase entirely (used on the
+// timeout it kills the process group and bounds the cleanup wait. Pass
+// grace=0 to skip the polite phase entirely (used on the
 // crash path where we already know the plugin is broken).
 func (s *pluginSession) shutdown(grace time.Duration) error {
-	// Tell run() to exit; safe to call multiple times.
-	s.quitOnce.Do(func() { close(s.quit) })
-
-	// Close stdin to signal EOF to the plugin.
-	_ = s.stdin.Close()
-
-	if grace > 0 {
+	s.shutdownOnce.Do(func() {
+		s.quitOnce.Do(func() { close(s.quit) })
+		_ = s.stdin.Close()
 		exited := make(chan error, 1)
+		// This is the only owner of cmd.Wait, including concurrent shutdowns.
 		go func() { exited <- s.cmd.Wait() }()
-		select {
-		case err := <-exited:
-			_ = s.stdout.Close()
-			if s.stderr != nil {
-				_ = s.stderr.Close()
+		if grace > 0 {
+			select {
+			case s.shutdownErr = <-exited:
+				// Reap completed; stop any remaining descendants as well.
+				s.kill()
+				s.finishShutdown()
+				return
+			case <-time.After(grace):
 			}
-			<-s.done
-			return err
-		case <-time.After(grace):
-			// fall through to kill
 		}
-	}
-	if s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	_ = s.stdout.Close()
-	_ = s.cmd.Wait()
+		s.kill()
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			s.shutdownErr = errors.New("subprocess: process cleanup exceeded its deadline")
+		}
+		s.finishShutdown()
+	})
+	return s.shutdownErr
+}
+
+func (s *pluginSession) finishShutdown() {
 	if s.stderr != nil {
 		_ = s.stderr.Close()
 	}
-	<-s.done
-	return nil
+	select {
+	case <-s.done:
+	case <-time.After(time.Second):
+		s.shutdownErr = errors.Join(s.shutdownErr, errors.New("subprocess: response reader cleanup exceeded its deadline"))
+	}
 }
 
 // markDead flips the dead flag once the owner goroutine exits.

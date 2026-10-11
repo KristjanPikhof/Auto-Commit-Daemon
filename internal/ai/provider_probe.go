@@ -3,13 +3,12 @@ package ai
 import (
 	"context"
 	"errors"
-	"io"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-// ProviderProbeResult is deliberately smaller than a provider Result. It
-// confirms only that the selected provider returned a valid commit-message
-// shape; model/plugin text is never returned to the settings surface.
+// ProviderProbeResult reports a synthetic connection test without provider text.
 type ProviderProbeResult struct {
 	Provider string
 	Latency  time.Duration
@@ -24,22 +23,28 @@ const maximumProviderProbeTimeout = 30 * time.Second
 // trace or repository-scoped values. The caller's cancellation still
 // propagates, and the request is capped at 30 seconds.
 func ProbeProviderConfig(ctx context.Context, cfg ProviderConfig) (ProviderProbeResult, error) {
-	provider, closer, err := BuildStrictProvider(cfg)
+	if err := ctx.Err(); err != nil {
+		return failedProviderProbe(normalizeMode(cfg.Mode), 0, err)
+	}
+	provider, closer, err := buildFinishTransport(cfg)
 	if err != nil {
 		return failedProviderProbe(normalizeMode(cfg.Mode), 0, err)
 	}
 	if closer != nil {
-		defer func(closer io.Closer) { _ = closer.Close() }(closer)
+		defer closer.Close()
 	}
 	return ProbeProvider(ctx, provider, cfg.Timeout, cfg.CommitFormat)
 }
 
-// ProbeProvider sends exactly one fixed synthetic event to provider. It does
+// ProbeProvider sends exactly one fixed synthetic Finish request. It does
 // not compose fallback, mutate planner health, start an experiment, write a
 // commit, or expose the returned subject/body.
-func ProbeProvider(ctx context.Context, provider Provider, timeout time.Duration, format CommitFormat) (ProviderProbeResult, error) {
+func ProbeProvider(ctx context.Context, provider FinishTransport, timeout time.Duration, format CommitFormat) (ProviderProbeResult, error) {
 	if provider == nil {
 		return failedProviderProbe("", 0, errors.New("ai: provider probe requires a provider"))
+	}
+	if err := ctx.Err(); err != nil {
+		return failedProviderProbe(provider.Name(), 0, err)
 	}
 	if timeout <= 0 || timeout > maximumProviderProbeTimeout {
 		timeout = maximumProviderProbeTimeout
@@ -50,11 +55,33 @@ func ProbeProvider(ctx context.Context, provider Provider, timeout time.Duration
 	defer stop()
 
 	started := time.Now()
-	_, err := provider.Generate(probeCtx, CommitContext{
-		Path:         "acd-settings-probe.txt",
-		Op:           "modify",
-		CommitFormat: effectiveCommitFormat(format),
-	})
+	entry := finish.Entry{OID: "1111111111111111111111111111111111111111", Mode: "100644"}
+	evidence := finish.Evidence{
+		Base:   finish.Tree{},
+		Target: finish.Tree{"acd-settings-probe.txt": entry},
+		Changes: []finish.Change{{
+			ID: "probe", Path: "acd-settings-probe.txt", After: entry, Author: "synthetic",
+		}},
+	}
+	options := FinishOptions{Style: string(normalizeCommitFormat(string(format))), Purpose: "Confirm provider connection"}
+	request, _, err := prepareFinishRequest(evidence, options)
+	var body []byte
+	if err == nil {
+		body, err = provider.EncodeFinishRequest(request)
+	}
+	if err == nil {
+		err = ctx.Err()
+		if err == nil {
+			err = probeCtx.Err()
+		}
+	}
+	if err == nil {
+		var output []byte
+		output, err = provider.ExchangeFinish(probeCtx, body)
+		if err == nil {
+			_, err = validateFinishOutput(output, evidence, options)
+		}
+	}
 	latency := time.Since(started)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

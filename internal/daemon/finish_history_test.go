@@ -34,6 +34,24 @@ func historyStartTest(t *testing.T, w *FinishWorker, plan state.IntentHistoryPla
 	return r
 }
 
+func TestFinishHistoryRewriteLegacyQueueNeverPublishes(t *testing.T) {
+	f, _ := finishWorkerFixture(t)
+	head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
+	if err := state.SaveIntentHistoryRequest(t.Context(), f.db, state.IntentHistoryRequest{PlanID: "legacy-plan", Status: "pending"}); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := state.MetaGet(t.Context(), f.db, state.MetaKeyIntentHistoryRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, stop := finishProtectionRun(t, f, nil)
+	stop()
+	after, _, err := state.MetaGet(t.Context(), f.db, state.MetaKeyIntentHistoryRequest)
+	if err != nil || before != after || finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != head {
+		t.Fatalf("legacy evidence or branch changed: %v", err)
+	}
+}
+
 func TestFinishHistoryRewriteLocalPreservesEmptyNeutralAuthorsAndStyles(t *testing.T) {
 	for _, style := range []string{finish.StyleImperative, finish.StyleConventional} {
 		t.Run(style, func(t *testing.T) {

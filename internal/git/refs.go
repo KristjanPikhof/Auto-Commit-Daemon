@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -410,11 +411,44 @@ func withLockedExpectedRefTimeout(
 	fn func(context.Context) error,
 	replacementOID ...string,
 ) error {
+	return withLockedExpectedRefsTransaction(ctx, repoDir, ref, expectedOID, secondaryRef, secondaryExpectedOID, requireRecoveryNamespace, transactionTimeout, fn, nil, nil, replacementOID...)
+}
+
+// withLockedExpectedRefsTransaction retains the existing ref-lock protocol and
+// may create reviewed refs atomically beside the primary CAS.
+func withLockedExpectedRefsTransaction(
+	ctx context.Context, repoDir, ref, expectedOID, secondaryRef, secondaryExpectedOID string,
+	requireRecoveryNamespace bool, transactionTimeout time.Duration,
+	fn func(context.Context) error, creates, verifies map[string]string, replacementOID ...string,
+) error {
+	return withLockedExpectedRefsChanges(ctx, repoDir, ref, expectedOID, secondaryRef, secondaryExpectedOID, requireRecoveryNamespace, transactionTimeout, fn, creates, verifies, nil, replacementOID...)
+}
+
+func withLockedExpectedRefsChanges(
+	ctx context.Context, repoDir, ref, expectedOID, secondaryRef, secondaryExpectedOID string,
+	requireRecoveryNamespace bool, transactionTimeout time.Duration,
+	fn func(context.Context) error, creates, verifies, deletes map[string]string, replacementOID ...string,
+) error {
 	if repoDir == "" {
 		return fmt.Errorf("git: locked ref verification called with empty repoDir")
 	}
 	if len(replacementOID) > 1 {
 		return fmt.Errorf("git: locked ref transaction accepts one replacement")
+	}
+	for createRef, oid := range creates {
+		if !isValidFullRef(createRef) || createRef == ref || createRef == secondaryRef || oid == "" || strings.ContainsAny(oid, " \t\r\n\x00") {
+			return errors.New("git: invalid atomic created ref")
+		}
+	}
+	for verifyRef, oid := range verifies {
+		if !isValidFullRef(verifyRef) || verifyRef == ref || verifyRef == secondaryRef || creates[verifyRef] != "" || oid == "" || strings.ContainsAny(oid, " \t\r\n\x00") {
+			return errors.New("git: invalid atomic verified ref")
+		}
+	}
+	for deleteRef, oid := range deletes {
+		if !isValidFullRef(deleteRef) || deleteRef == ref || deleteRef == secondaryRef || creates[deleteRef] != "" || verifies[deleteRef] != "" || !exactObjectID(oid) {
+			return errors.New("git: invalid atomic deleted ref")
+		}
 	}
 	newOID := ""
 	if len(replacementOID) == 1 {
@@ -465,7 +499,7 @@ func withLockedExpectedRefTimeout(
 	// still finishing. Preparation is bounded before the callback, and cleanup
 	// gets a fresh bound after the callback returns.
 	args := []string{"update-ref", "--no-deref", "--stdin"}
-	if newOID != "" {
+	if newOID != "" || len(creates) > 0 || len(deletes) > 0 {
 		args = append([]string{"-c", "core.fsync=reference", "-c", "core.fsyncMethod=fsync"}, args...)
 	}
 	cmd := exec.Command("git", args...)
@@ -584,6 +618,36 @@ func withLockedExpectedRefTimeout(
 	if secondaryRef != "" {
 		if err := write("verify " + secondaryRef + " " + secondaryExpectedOID); err != nil {
 			return failPrepare("verify secondary", err)
+		}
+	}
+	var verifyRefs []string
+	for verifyRef := range verifies {
+		verifyRefs = append(verifyRefs, verifyRef)
+	}
+	sort.Strings(verifyRefs)
+	for _, verifyRef := range verifyRefs {
+		if err := write("verify " + verifyRef + " " + verifies[verifyRef]); err != nil {
+			return failPrepare("verify", err)
+		}
+	}
+	var deleteRefs []string
+	for deleteRef := range deletes {
+		deleteRefs = append(deleteRefs, deleteRef)
+	}
+	sort.Strings(deleteRefs)
+	for _, deleteRef := range deleteRefs {
+		if err := write("delete " + deleteRef + " " + deletes[deleteRef]); err != nil {
+			return failPrepare("delete", err)
+		}
+	}
+	var createRefs []string
+	for createRef := range creates {
+		createRefs = append(createRefs, createRef)
+	}
+	sort.Strings(createRefs)
+	for _, createRef := range createRefs {
+		if err := write("create " + createRef + " " + creates[createRef]); err != nil {
+			return failPrepare("create", err)
 		}
 	}
 	if err := write("prepare"); err != nil {

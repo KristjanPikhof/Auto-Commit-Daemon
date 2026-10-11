@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -11,72 +10,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	acdtrace "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/trace"
 )
-
-func RecoverUnavailableSemanticMessagePublicationDrain(
-	ctx context.Context,
-	repoRoot string,
-	gitDir string,
-	db *state.DB,
-	drain state.PublicationDrain,
-	trace acdtrace.Logger,
-	now time.Time,
-) (*state.PublicationDrain, RecoveryChainResult, error) {
-	var result RecoveryChainResult
-	if drain.Phase == state.PublicationDrainCompleted ||
-		(drain.Phase == state.PublicationDrainNeedsAction &&
-			publicationDrainReason(drain) != publicationReasonSemanticUnavailable && publicationDrainReason(drain) != publicationReasonProviderConfiguration) {
-		return nil, result, nil
-	}
-	ready, err := publicationDrainHasAppliedAlternativeRuntime(ctx, db, drain)
-	if err != nil || !ready {
-		return nil, result, err
-	}
-	firstSeq, ok, err := firstUnpublishedRecoverySeq(
-		ctx, db, drain.BranchRef, drain.BranchGeneration)
-	if err != nil || !ok {
-		return nil, result, err
-	}
-	result, err = ReconcileUnpublishedChain(
-		ctx, repoRoot, db, RecoveryReconcileOptions{
-			GitDir:           gitDir,
-			BranchRef:        drain.BranchRef,
-			BranchGeneration: drain.BranchGeneration,
-			FirstSeq:         firstSeq,
-			Trigger:          "publication_drain_provider_changed",
-			Trace:            trace,
-			EvidenceLimit:    state.CompletedBranchTransitionProofLimit,
-			ArchiveOnly:      true,
-			InvalidateShadow: true,
-		})
-	if errors.Is(err, state.ErrCompletedBranchTransitionProof) {
-		// Automatic recovery must stay bounded. Leave the exact drain at its
-		// durable needs-action barrier so an explicit fix can preserve a larger
-		// suffix without turning every worker wake into another failed pass.
-		return nil, RecoveryChainResult{}, nil
-	}
-	if err != nil || !result.Handled {
-		return nil, result, err
-	}
-	if _, err := state.ReconcileResolvedPublicationDrains(
-		ctx, db, float64(now.UnixNano())/1e9); err != nil {
-		return nil, result, err
-	}
-	completed, err := state.PublicationDrainByID(ctx, db, drain.ID)
-	if err != nil {
-		return nil, result, err
-	}
-	if completed.Phase != state.PublicationDrainCompleted {
-		return nil, result, errors.New(
-			"daemon: semantic message recovery did not resolve publication drain")
-	}
-	return &completed, result, nil
-}
 
 const (
 	recoveryCommitIdentityName          = "Auto Commit Daemon"
@@ -84,6 +22,8 @@ const (
 	maxPublishedRecoveryContextCommits  = 64
 	maxPublishedRecoveryAncestryCommits = 4096
 )
+
+var errLegacyBridgeActivationRequired = errors.New("legacy work remains preserved; run acd setup to activate it before reconciliation")
 
 var errInvalidRecoveryObjectEvidence = errors.New(
 	"daemon: recovery object evidence is invalid")
@@ -95,11 +35,8 @@ func invalidRecoveryObjectEvidence(format string, args ...any) error {
 	return fmt.Errorf("%w: "+format, values...)
 }
 
-// RecoveryReconcileOptions identifies one immutable unpublished suffix. The
-// generic entrypoint deliberately accepts a pending first row: branch changes
-// and dead-branch cleanup must preserve pending-only chains before changing
-// generation metadata or reseeding the shadow. Replay uses the narrower
-// reconcileActiveBarrierChain wrapper below.
+// RecoveryReconcileOptions identifies immutable legacy evidence for explicit
+// migration or support recovery. Normal checkpointing and Finish do not use it.
 type RecoveryReconcileOptions struct {
 	GitDir           string
 	BranchRef        string
@@ -107,13 +44,13 @@ type RecoveryReconcileOptions struct {
 	FirstSeq         int64
 	Trigger          string
 	Trace            acdtrace.Logger
-	// EvidenceLimit bounds suffix loading for automatic callers. Zero keeps
+	// EvidenceLimit bounds suffix loading for callers. Zero keeps
 	// explicit/manual reconciliation unbounded; positive values are validated
 	// by the state layer against its global proof ceiling.
 	EvidenceLimit int
 	// ExternalParentHead is the persisted branch-token commit observed before
 	// a same-branch transition. It enables the narrow repaired-publication
-	// bridge proof; ordinary replay and archive recovery leave it empty.
+	// bridge proof; ordinary archive recovery leaves it empty.
 	ExternalParentHead string
 	// ArchiveOnly is required when a branch/dead-ref transition is already
 	// known to have invalidated external-publish proof. It still snapshots and
@@ -151,9 +88,6 @@ type RecoveryChainResult struct {
 	FirstSeq    int64
 	LastSeq     int64
 	EventCount  int
-	// AcceptedHead is set only when recovery atomically adopted the exact
-	// locked live branch head together with its replacement shadow.
-	AcceptedHead string
 }
 
 type recoveryPathState struct {
@@ -354,8 +288,7 @@ func ReconcileUnpublishedChain(
 				"%w: external repair bridge returned invalid event count %d",
 				state.ErrCompletedBranchTransitionProof, bridge.EventCount)
 		}
-		return reconcileExternalRepairBridge(
-			ctx, repoRoot, db, opts, live, chain, bridge)
+		return result, errLegacyBridgeActivationRequired
 	}
 	proofLiveHead := sameBranchRecoveryHead(live, opts.BranchRef)
 	proofChain, err := canonicalizeRecoveryProofEvents(
@@ -437,7 +370,7 @@ func ReconcileUnpublishedChain(
 
 	trigger := strings.TrimSpace(opts.Trigger)
 	if trigger == "" {
-		trigger = "automatic_chain_reconciliation"
+		trigger = "explicit_legacy_recovery"
 	}
 	transition := state.RecoveryChainTransition{
 		Expected: chain,
@@ -516,7 +449,7 @@ func ReconcileUnpublishedChain(
 		LastSeq:     snapshot.LastEventSeq,
 		EventCount:  snapshot.EventCount,
 	}
-	traceReplay(opts.Trace, repoRoot, CaptureContext{
+	traceLegacyRecovery(opts.Trace, repoRoot, CaptureContext{
 		BranchRef:        opts.BranchRef,
 		BranchGeneration: opts.BranchGeneration,
 		BaseHead:         live.head,
@@ -667,182 +600,6 @@ func canonicalizeRecoveryProofEvents(
 		proofEvents[i].Event.CommitOID.String = commitOID
 	}
 	return proofEvents, nil
-}
-
-// reconcileActiveBarrierChain uses the existence of any terminal row as its
-// gate, then delegates the active pair's entire unpublished chain from the
-// earliest pending/blocked/failed row. This keeps whole-pair shadow
-// invalidation aligned with the exact rows transitioned out of replay.
-func reconcileActiveBarrierChain(
-	ctx context.Context,
-	repoRoot string,
-	db *state.DB,
-	cctx CaptureContext,
-	opts ReplayOpts,
-) (RecoveryChainResult, error) {
-	var result RecoveryChainResult
-	_, _, ok, err := firstRecoveryBarrier(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
-	if err != nil || !ok {
-		return result, err
-	}
-	seq, ok, err := firstUnpublishedRecoverySeq(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
-	if err != nil || !ok {
-		return result, err
-	}
-	return ReconcileUnpublishedChain(ctx, repoRoot, db, RecoveryReconcileOptions{
-		GitDir:           opts.GitDir,
-		BranchRef:        cctx.BranchRef,
-		BranchGeneration: cctx.BranchGeneration,
-		FirstSeq:         seq,
-		Trigger:          "replay_terminal_barrier",
-		Trace:            opts.Trace,
-		InvalidateShadow: true,
-	})
-}
-
-// reconcileTransitionPair protects every unpublished row for one exact branch
-// token before callers change generation metadata or reseed shadow state. A
-// valid live HEAD always gets the normal exact proof; archiveOnly is reserved
-// for a missing/unresolvable live HEAD. A missing pair is an idempotent no-op.
-// Legacy bare-rev tokens have no branch ref, so they reconcile every exact
-// unpublished pair at that generation instead of falling back to unsafe
-// generation-wide cleanup.
-func reconcileTransitionPair(
-	ctx context.Context,
-	repoRoot string,
-	gitDir string,
-	db *state.DB,
-	branchRef string,
-	branchGeneration int64,
-	externalParentHead string,
-	archiveOnly bool,
-	expectedMissingRef string,
-	trigger string,
-	trace acdtrace.Logger,
-) (RecoveryChainResult, error) {
-	var result RecoveryChainResult
-	if branchRef == "" && branchGeneration > 0 {
-		rows, err := db.ReadSQL().QueryContext(ctx, `
-SELECT DISTINCT branch_ref
-FROM capture_events
-WHERE branch_generation = ?
-  AND branch_ref != ''
-  AND state IN (?, ?, ?)
-ORDER BY branch_ref`, branchGeneration,
-			state.EventStatePending, state.EventStateBlockedConflict, state.EventStateFailed)
-		if err != nil {
-			return result, fmt.Errorf("daemon: reconcile recovery generation: list exact pairs: %w", err)
-		}
-		var refs []string
-		for rows.Next() {
-			var ref string
-			if err := rows.Scan(&ref); err != nil {
-				_ = rows.Close()
-				return result, fmt.Errorf("daemon: reconcile recovery generation: scan branch ref: %w", err)
-			}
-			refs = append(refs, ref)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return result, fmt.Errorf("daemon: reconcile recovery generation: iterate branch refs: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return result, fmt.Errorf("daemon: reconcile recovery generation: close branch refs: %w", err)
-		}
-		for _, ref := range refs {
-			pair, err := reconcileTransitionPair(ctx, repoRoot, gitDir, db, ref,
-				branchGeneration, externalParentHead, archiveOnly,
-				expectedMissingRef, trigger, trace)
-			if err != nil {
-				return result, err
-			}
-			if !pair.Handled {
-				continue
-			}
-			if !result.Handled {
-				result = pair
-				continue
-			}
-			result.EventCount += pair.EventCount
-			result.LastSeq = pair.LastSeq
-			if result.Outcome != pair.Outcome {
-				result.Outcome = "mixed"
-			}
-			result.RecoveryRef = pair.RecoveryRef
-		}
-		return result, nil
-	}
-	seq, ok, err := firstUnpublishedRecoverySeq(ctx, db, branchRef, branchGeneration)
-	if err != nil || !ok {
-		return result, err
-	}
-	return ReconcileUnpublishedChain(ctx, repoRoot, db, RecoveryReconcileOptions{
-		GitDir:             gitDir,
-		BranchRef:          branchRef,
-		BranchGeneration:   branchGeneration,
-		FirstSeq:           seq,
-		Trigger:            trigger,
-		Trace:              trace,
-		ExternalParentHead: externalParentHead,
-		ArchiveOnly:        archiveOnly,
-		ExpectedMissingRef: expectedMissingRef,
-	})
-}
-
-func firstUnpublishedRecoverySeq(
-	ctx context.Context,
-	db *state.DB,
-	branchRef string,
-	branchGeneration int64,
-) (seq int64, ok bool, err error) {
-	if db == nil || branchRef == "" || branchGeneration < 1 {
-		return 0, false, nil
-	}
-	err = db.ReadSQL().QueryRowContext(ctx, `
-SELECT seq
-FROM capture_events
-WHERE branch_ref = ?
-  AND branch_generation = ?
-  AND state IN (?, ?, ?)
-ORDER BY seq ASC
-LIMIT 1`, branchRef, branchGeneration,
-		state.EventStatePending, state.EventStateBlockedConflict, state.EventStateFailed,
-	).Scan(&seq)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, fmt.Errorf("daemon: reconcile recovery chain: find first unpublished row: %w", err)
-	}
-	return seq, true, nil
-}
-
-func firstRecoveryBarrier(
-	ctx context.Context,
-	db *state.DB,
-	branchRef string,
-	branchGeneration int64,
-) (seq int64, eventState string, ok bool, err error) {
-	if db == nil || branchRef == "" || branchGeneration < 1 {
-		return 0, "", false, nil
-	}
-	err = db.ReadSQL().QueryRowContext(ctx, `
-SELECT seq, state
-FROM capture_events
-WHERE branch_ref = ?
-  AND branch_generation = ?
-  AND state IN (?, ?)
-ORDER BY seq ASC
-LIMIT 1`, branchRef, branchGeneration,
-		state.EventStateBlockedConflict, state.EventStateFailed,
-	).Scan(&seq, &eventState)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, "", false, nil
-	}
-	if err != nil {
-		return 0, "", false, fmt.Errorf("daemon: reconcile recovery chain: find barrier: %w", err)
-	}
-	return seq, eventState, true, nil
 }
 
 func representedPublishedContext(

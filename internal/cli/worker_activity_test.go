@@ -15,17 +15,16 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
-func TestWorkerCheckpointActivitySeparatesUserWorkFromReadiness(t *testing.T) {
+func TestFinishRemovalCheckpointHintPreservesArchivedActivity(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		params string
-		active bool
 	}{
-		{"setup readiness", "", false},
-		{"compatible upgrade", `{"kind":"checkpoint","drain_publication":false}`, false},
-		{"logical hook", `{"kind":"logical_boundary"}`, true},
-		{"session checkpoint", `{"kind":"checkpoint","session_id":"editor","harness":"codex"}`, true},
-		{"explicit publication", `{"drain_publication":true}`, true},
+		{"setup readiness", ""},
+		{"compatible upgrade", `{"kind":"checkpoint","drain_publication":false}`},
+		{"logical hook", `{"kind":"logical_boundary"}`},
+		{"session checkpoint", `{"kind":"checkpoint","session_id":"editor","harness":"codex"}`},
+		{"explicit publication", `{"drain_publication":true}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -36,7 +35,9 @@ func TestWorkerCheckpointActivitySeparatesUserWorkFromReadiness(t *testing.T) {
 				t.Fatal(err)
 			}
 			old := time.Now().Add(-2 * time.Hour).Unix()
-			state.RecordActivity(ctx, db, time.Unix(old, 0))
+			if err := state.MetaSet(ctx, db, "activity.last_event_ts", strconv.FormatInt(old, 10)); err != nil {
+				t.Fatal(err)
+			}
 			if err := state.MetaSet(ctx, db, daemon.MetaKeyBranchGeneration, "1"); err != nil {
 				t.Fatal(err)
 			}
@@ -58,7 +59,7 @@ func TestWorkerCheckpointActivitySeparatesUserWorkFromReadiness(t *testing.T) {
 			if !ok || data["protected"] != true {
 				t.Fatalf("checkpoint was not protected: %#v", response)
 			}
-			value, _, err := state.MetaGet(ctx, db, state.ActivityMetaKey)
+			value, _, err := state.MetaGet(ctx, db, "activity.last_event_ts")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -66,8 +67,8 @@ func TestWorkerCheckpointActivitySeparatesUserWorkFromReadiness(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.active && got <= old || !tc.active && got != old {
-				t.Fatalf("activity=%d old=%d meaningful=%v", got, old, tc.active)
+			if got != old {
+				t.Fatalf("checkpoint hint rewrote archived activity: got=%d old=%d", got, old)
 			}
 		})
 	}

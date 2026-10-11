@@ -16,8 +16,11 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
@@ -94,7 +97,7 @@ func TestDoctor_Bundle_LayoutMatchesSpec(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if err := state.RegisterClient(ctx, d, state.Client{
+	if err := testutil.SeedLegacyClient(ctx, d, testutil.LegacyClient{
 		SessionID: "sess-1", Harness: "claude-code",
 	}); err != nil {
 		t.Fatalf("client: %v", err)
@@ -393,282 +396,12 @@ func TestDoctor_Bundle_TwoRunsDistinctZips(t *testing.T) {
 	}
 }
 
-// TestDoctor_BlockedConflictSurfaced verifies that doctor exposes pending
-// + blocked_conflict counts and the most recent blocked event's path /
-// timestamp / error in both JSON and human output. Mirrors what `acd list`
-// and `acd status` report so all three commands agree on the same repo.
-func TestDoctor_BlockedConflictSurfaced(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, db, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 77, Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save state: %v", err)
-	}
-	// One pending event.
-	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "modify", Path: "live.go",
-		Fidelity: "exact",
-	}, []state.CaptureOp{{Op: "modify", Path: "live.go", Fidelity: "exact"}}); err != nil {
-		t.Fatalf("append pending: %v", err)
-	}
-	// One blocked-conflict event.
-	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "modify", Path: "stuck.go",
-		Fidelity: "rescan",
-	}, []state.CaptureOp{{Op: "modify", Path: "stuck.go", Fidelity: "rescan"}})
-	if err != nil {
-		t.Fatalf("append blocker: %v", err)
-	}
-	if err := state.MarkEventBlocked(ctx, d, seq, "before-state mismatch", nowFloat(),
-		sql.NullString{String: "refs/heads/main", Valid: true},
-		sql.NullInt64{Int64: 1, Valid: true},
-		sql.NullString{String: "deadbeef", Valid: true},
-	); err != nil {
-		t.Fatalf("MarkEventBlocked: %v", err)
-	}
-	registerRepo(t, roots, repo, db, "claude-code")
-	_ = d.Close()
-
-	// JSON shape: counts + last replay conflict info populated.
-	var jsonOut bytes.Buffer
-	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
-		t.Fatalf("runDoctor json: %v", err)
-	}
-	var rep doctorReport
-	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
-	}
-	if len(rep.Repos) != 1 {
-		t.Fatalf("expected 1 repo, got %d", len(rep.Repos))
-	}
-	rr := rep.Repos[0]
-	if rr.PendingEvents != 1 {
-		t.Errorf("PendingEvents=%d want 1", rr.PendingEvents)
-	}
-	if rr.BlockedConflicts != 1 {
-		t.Errorf("BlockedConflicts=%d want 1", rr.BlockedConflicts)
-	}
-	if rr.LastReplayConflictPath != "stuck.go" {
-		t.Errorf("LastReplayConflictPath=%q want stuck.go", rr.LastReplayConflictPath)
-	}
-	if rr.LastReplayConflictErr == "" {
-		t.Errorf("LastReplayConflictErr empty, want non-empty error message")
-	}
-	if rr.LastReplayConflictTS == 0 {
-		t.Errorf("LastReplayConflictTS=0, want non-zero")
-	}
-
-	// Human output renders pending and blocked lines, plus last conflict.
-	var humanOut bytes.Buffer
-	if err := runDoctor(ctx, &humanOut, false, "", false); err != nil {
-		t.Fatalf("runDoctor human: %v", err)
-	}
-	body := humanOut.String()
-	for _, want := range []string{"pending    : 1", "blocked    : 1", "stuck.go", "last conflict"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("doctor human output missing %q in:\n%s", want, body)
-		}
-	}
+func TestDoctor_LegacyBlockedConflictRemainsPreserved(t *testing.T) {
+	assertDoctorLegacyFailurePreserved(t, state.EventStateBlockedConflict)
 }
 
-func TestDoctor_IntentBatchWaitAddsOperationalNotes(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	registerRepo(t, roots, repo, dbPath, "codex")
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save state: %v", err)
-	}
-	if err := state.RegisterClient(ctx, d, state.Client{
-		SessionID: "intent-session", Harness: "codex", LastSeenTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("register client: %v", err)
-	}
-	if err := state.MetaSet(ctx, d, "commit.strategy", "intent"); err != nil {
-		t.Fatalf("set commit.strategy: %v", err)
-	}
-	appendIntentPendingEvent(t, ctx, d, "sparse.go", nowFloat()-30)
-	if err := d.Close(); err != nil {
-		t.Fatalf("close db: %v", err)
-	}
-
-	var jsonOut bytes.Buffer
-	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
-		t.Fatalf("runDoctor json: %v", err)
-	}
-	var rep doctorReport
-	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, jsonOut.String())
-	}
-	if len(rep.Repos) != 1 {
-		t.Fatalf("repos=%d want 1", len(rep.Repos))
-	}
-	rr := rep.Repos[0]
-	if !rr.IntentStrategy.BatchWaitActive ||
-		rr.IntentStrategy.MinPending != 10 ||
-		rr.IntentStrategy.MaxPendingAgeSeconds != 300 {
-		t.Fatalf("intent strategy = %+v, want defaulted active batch wait", rr.IntentStrategy)
-	}
-	notes := strings.Join(rr.Notes, "\n")
-	for _, want := range []string{
-		"intent replay is waiting",
-		"acd flush --logical --repo " + repo + " --session-id intent-session",
-		"explicit flushes bypass intent batch wait",
-		"registered active session id",
-		"lower ACD_INTENT_MIN_PENDING",
-		"ACD_COMMIT_STRATEGY=event",
-	} {
-		if !strings.Contains(notes, want) {
-			t.Fatalf("doctor notes missing %q: %v", want, rr.Notes)
-		}
-	}
-	if strings.Contains(notes, "run acd flush --logical for the active session") {
-		t.Fatalf("doctor notes still include bare logical flush hint: %v", rr.Notes)
-	}
-
-	var humanOut bytes.Buffer
-	if err := runDoctor(ctx, &humanOut, false, "", false); err != nil {
-		t.Fatalf("runDoctor human: %v", err)
-	}
-	if !strings.Contains(humanOut.String(), "batch wait : pending=1 min_pending=10") {
-		t.Fatalf("doctor human missing batch wait line:\n%s", humanOut.String())
-	}
-}
-
-func TestDoctorScopesPlannerStateToDaemonBranch(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, db := makeRepoStateDB(t)
-	registerRepo(t, roots, repo, dbPath, "codex")
-	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: nowFloat(),
-		BranchRef:        sql.NullString{String: "refs/heads/main", Valid: true},
-		BranchGeneration: sql.NullInt64{Int64: 2, Valid: true},
-	}); err != nil {
-		t.Fatalf("save state: %v", err)
-	}
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef: "refs/heads/old", BranchGeneration: 1, BaseHead: "old",
-		Operation: "modify", Path: "old.go", Fidelity: "exact", CapturedTS: 90,
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
-		DecisionTS: 95, Kind: state.DecisionKindIntentPlannerError,
-		EventSeq: sql.NullInt64{Int64: seq, Valid: true},
-		Path:     sql.NullString{String: "old.go", Valid: true},
-		Reason:   sql.NullString{String: "old branch provider failure", Valid: true},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
-		PlannedTS: 100, BranchRef: "refs/heads/old", BranchGeneration: 1,
-		OfferedSeqs: []int64{seq}, VisibleOriginalSeqs: []int64{seq},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	run, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
-		Fingerprint: "sha256:old-doctor-branch", BranchRef: "refs/heads/old",
-		BranchGeneration: 1, AttemptLimit: 3,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	run.ProgressState = sql.NullString{String: "waiting_message_rewrite", Valid: true}
-	run.ResolutionMode = sql.NullString{String: "waiting_message_rewrite", Valid: true}
-	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	var out bytes.Buffer
-	if err := runDoctor(ctx, &out, false, "", true); err != nil {
-		t.Fatal(err)
-	}
-	var report doctorReport
-	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
-		t.Fatal(err)
-	}
-	if len(report.Repos) != 1 {
-		t.Fatalf("repos=%d want 1", len(report.Repos))
-	}
-	strategy := report.Repos[0].IntentStrategy
-	if strategy.LastPlannerWindow != nil ||
-		strategy.ResolutionMode != "" || strategy.LastPlannerError != "" {
-		t.Fatalf("stale planner state crossed branch generation: %+v", strategy)
-	}
-}
-
-func TestDoctor_FailedBarrierSurfaced(t *testing.T) {
-	roots := withIsolatedHome(t)
-	ctx := context.Background()
-
-	repo, dbPath, d := makeRepoStateDB(t)
-	if err := state.SaveDaemonState(ctx, d, state.DaemonState{
-		PID: 77, Mode: "running", HeartbeatTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save state: %v", err)
-	}
-	seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "modify", Path: "bad.go",
-		Fidelity: "exact",
-	}, []state.CaptureOp{{Op: "modify", Path: "bad.go", Fidelity: "exact"}})
-	if err != nil {
-		t.Fatalf("append failed event: %v", err)
-	}
-	if err := state.MarkEventPublished(ctx, d, seq, state.EventStateFailed,
-		sql.NullString{}, sql.NullString{String: "commit-tree failed", Valid: true},
-		sql.NullString{}, nowFloat()); err != nil {
-		t.Fatalf("mark failed: %v", err)
-	}
-	if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
-		BranchRef: "refs/heads/main", BranchGeneration: 1,
-		BaseHead: "deadbeef", Operation: "modify", Path: "later.go",
-		Fidelity: "exact",
-	}, []state.CaptureOp{{Op: "modify", Path: "later.go", Fidelity: "exact"}}); err != nil {
-		t.Fatalf("append pending successor: %v", err)
-	}
-	registerRepo(t, roots, repo, dbPath, "claude-code")
-	_ = d.Close()
-
-	var jsonOut bytes.Buffer
-	if err := runDoctor(ctx, &jsonOut, false, "", true); err != nil {
-		t.Fatalf("runDoctor json: %v", err)
-	}
-	var rep doctorReport
-	if err := json.Unmarshal(jsonOut.Bytes(), &rep); err != nil {
-		t.Fatalf("unmarshal doctor: %v\n%s", err, jsonOut.String())
-	}
-	if len(rep.Repos) != 1 {
-		t.Fatalf("repos len=%d want 1", len(rep.Repos))
-	}
-	rr := rep.Repos[0]
-	if rr.FailedEvents != 1 || rr.FailedBlockingPending != 1 || rr.LastReplayFailurePath != "bad.go" {
-		t.Fatalf("failed doctor fields = %+v, want failed blocker bad.go", rr)
-	}
-
-	var humanOut bytes.Buffer
-	if err := runDoctor(ctx, &humanOut, false, "", false); err != nil {
-		t.Fatalf("runDoctor human: %v", err)
-	}
-	for _, want := range []string{"failed     : 1", "failed blockers : 1", "acd fix --dry-run", "last failure : bad.go"} {
-		if !strings.Contains(humanOut.String(), want) {
-			t.Fatalf("doctor human missing %q in:\n%s", want, humanOut.String())
-		}
-	}
+func TestDoctor_LegacyFailedCaptureRemainsPreserved(t *testing.T) {
+	assertDoctorLegacyFailurePreserved(t, state.EventStateFailed)
 }
 
 func TestDoctorBundleReadsPreDecisionLedgerDBReadOnly(t *testing.T) {
@@ -1008,53 +741,85 @@ func TestDoctor_NoCodexShadowWhenOnlyOneFile(t *testing.T) {
 	}
 }
 
-func TestDoctor_AIProviderOpenAICompatRequiresAPIKey(t *testing.T) {
-	_ = withIsolatedHome(t)
+func TestDoctor_AISavedIntentDoesNotReadCredentials(t *testing.T) {
+	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	t.Setenv(ai.EnvProvider, "openai-compat")
-	t.Setenv(ai.EnvAPIKey, "")
-
+	repo, path, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, path, "codex")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv("ACD_COMMIT_STRATEGY", "")
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
+		doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"openai-compat"`)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An unreadable credential path must not affect read-only diagnostics.
+	keyPath := credentials.NewStore(roots).Path()
+	if err := os.MkdirAll(keyPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	before := mustSHA256(t, path)
 	var out bytes.Buffer
-	if err := runDoctor(ctx, &out, false, "", true); err != nil {
-		t.Fatalf("runDoctor json: %v", err)
+	if err := runDoctor(withDoctorTarget(ctx, repo), &out, false, "", true); err != nil {
+		t.Fatal(err)
 	}
-	var rep doctorReport
-	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	var report doctorReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
 	}
-	if rep.AI.Provider != "openai-compat" {
-		t.Fatalf("provider=%q want openai-compat", rep.AI.Provider)
+	if report.AI.Provider != "openai-compat" || report.AI.APIKeySet || !strings.Contains(strings.Join(report.AI.Notes, " "), "Credentials are checked by an explicit Intent finish") {
+		t.Fatalf("read-only doctor attempted credential validation: %+v", report.AI)
 	}
-	if rep.AI.APIKeySet {
-		t.Fatalf("APIKeySet=true, want false")
-	}
-	if !strings.Contains(strings.Join(rep.AI.Notes, "\n"), ai.EnvAPIKey) {
-		t.Fatalf("AI notes missing API key warning: %+v", rep.AI)
+	if mustSHA256(t, path) != before {
+		t.Fatal("doctor changed state")
 	}
 }
 
-func TestDoctor_AISubprocessProviderChecksPATH(t *testing.T) {
-	_ = withIsolatedHome(t)
+func TestDoctor_AISavedSubprocessDoesNotInspectOrRunProvider(t *testing.T) {
+	roots := withIsolatedHome(t)
 	ctx := context.Background()
-	t.Setenv(ai.EnvProvider, "subprocess:missing")
-	t.Setenv("PATH", t.TempDir())
-
+	repo, path, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, path, "codex")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(ai.EnvProvider, "")
+	t.Setenv("ACD_COMMIT_STRATEGY", "")
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
+		doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"subprocess:present"`)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "called")
+	if err := os.WriteFile(filepath.Join(dir, "acd-provider-present"), []byte("#!/bin/sh\nprintf called > '"+marker+"'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	before := mustSHA256(t, path)
 	var out bytes.Buffer
-	if err := runDoctor(ctx, &out, false, "", true); err != nil {
-		t.Fatalf("runDoctor json: %v", err)
+	if err := runDoctor(withDoctorTarget(ctx, repo), &out, false, "", true); err != nil {
+		t.Fatal(err)
 	}
-	var rep doctorReport
-	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
-		t.Fatalf("unmarshal: %v\n%s", err, out.String())
+	var report doctorReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
 	}
-	if rep.AI.ProviderCommand != "acd-provider-missing" {
-		t.Fatalf("ProviderCommand=%q want acd-provider-missing", rep.AI.ProviderCommand)
+	if report.AI.Provider != "subprocess:present" || report.AI.ProviderCommand != "" || report.AI.ProviderCommandFound {
+		t.Fatalf("read-only doctor inspected provider availability: %+v", report.AI)
 	}
-	if rep.AI.ProviderCommandFound {
-		t.Fatalf("ProviderCommandFound=true, want false")
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("doctor invoked provider")
 	}
-	if !strings.Contains(strings.Join(rep.AI.Notes, "\n"), "not found on PATH") {
-		t.Fatalf("AI notes missing PATH warning: %+v", rep.AI)
+	if mustSHA256(t, path) != before {
+		t.Fatal("doctor changed state")
 	}
 }
 
@@ -1886,7 +1651,7 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 		tc := tc
 		t.Run(tc.harness, func(t *testing.T) {
 			body := readSnippet(t, tc.snippetPath)
-			if note := scanHookBodyDrift(tc.harness, body); note != "" {
+			if note := scanHookBodyDriftAt(tc.harness, body, ""); note != "" {
 				t.Fatalf("verbatim %s snippet should not report drift, got %q", tc.harness, note)
 			}
 			// Bodies should also be non-empty: at least the two active hooks
@@ -1901,7 +1666,7 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 				}
 			}
 			drifted := strings.Replace(string(body), "--event activity", "--event inactive", 1)
-			note := scanHookBodyDrift(tc.harness, []byte(drifted))
+			note := scanHookBodyDriftAt(tc.harness, []byte(drifted), "")
 			if note == "" {
 				t.Fatalf("%s drift snippet should report drift, got empty note", tc.harness)
 			}
@@ -1916,7 +1681,7 @@ func TestYAMLDrift_FromVerbatimSnippet(t *testing.T) {
 // flat schema into extractCursorFlatHookBodies and scanHookBodyDrift.
 func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
-	if note := scanHookBodyDrift("cursor", body); note != "" {
+	if note := scanHookBodyDriftAt("cursor", body, ""); note != "" {
 		t.Fatalf("verbatim cursor snippet should not report drift, got %q", note)
 	}
 	bodies := extractCursorFlatHookBodies(body, []string{"postToolUse", "afterFileEdit"})
@@ -1929,7 +1694,7 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 		}
 	}
 	drifted := strings.Replace(string(body), `--event activity`, `--event inactive`, 1)
-	note := scanHookBodyDrift("cursor", []byte(drifted))
+	note := scanHookBodyDriftAt("cursor", []byte(drifted), "")
 	if note == "" {
 		t.Fatalf("cursor drift snippet should report drift, got empty note")
 	}
@@ -1941,14 +1706,14 @@ func TestJSONDrift_FromVerbatimCursorSnippet(t *testing.T) {
 func TestJSONDrift_CursorSessionStartWrongSubcommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
 	drifted := strings.Replace(string(body), `--event session_open`, `--event activity`, 1)
-	note := scanHookBodyDrift("cursor", []byte(drifted))
+	note := scanHookBodyDriftAt("cursor", []byte(drifted), "")
 	if note == "" {
 		t.Fatalf("sessionStart wired to wake should report drift")
 	}
 }
 
 func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
-	note := scanHookBodyDrift("cursor", []byte(`{"version":1,"hooks":{}}`))
+	note := scanHookBodyDriftAt("cursor", []byte(`{"version":1,"hooks":{}}`), "")
 	if note == "" {
 		t.Fatalf("empty cursor hooks should report drift")
 	}
@@ -1960,7 +1725,7 @@ func TestJSONDrift_CursorMissingRequiredEvents(t *testing.T) {
 func TestJSONDrift_CursorRejectsMissingWakeCommand(t *testing.T) {
 	body := readSnippet(t, "cursor/hooks.json")
 	drifted := strings.Replace(string(body), `--event activity`, `--event inactive`, 1)
-	note := scanHookBodyDrift("cursor", []byte(drifted))
+	note := scanHookBodyDriftAt("cursor", []byte(drifted), "")
 	if note == "" {
 		t.Fatalf("active hook without acd wake should report drift")
 	}
@@ -2285,5 +2050,58 @@ func TestLooksLikeHookError_TightMatcher(t *testing.T) {
 				t.Fatalf("looksLikeHookError(%q) = %v, want %v", tc.line, got, tc.want)
 			}
 		})
+	}
+}
+
+func assertDoctorLegacyFailurePreserved(t *testing.T, outcome string) {
+	t.Helper()
+	roots := withIsolatedHome(t)
+	ctx := context.Background()
+	repo, path, db := makeRepoStateDB(t)
+	registerRepo(t, roots, repo, path, "codex")
+	head := seedDiagnoseCommit(t, repo)
+	blob, err := gitpkg.RevParse(ctx, repo, "HEAD:seed.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head, Operation: "modify", Path: "seed.txt", Fidelity: "exact"}, []state.CaptureOp{{Op: "modify", Path: "seed.txt", Fidelity: "exact", AfterOID: sql.NullString{String: blob, Valid: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testutil.SeedLegacyCaptureOutcome(ctx, db, seq, outcome, sql.NullString{}, sql.NullString{String: "original failed publication proof", Valid: true}, sql.NullString{}, nowFloat()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := mustSHA256(t, path)
+	var out bytes.Buffer
+	if err := runDoctor(ctx, &out, false, "", true); err != nil {
+		t.Fatal(err)
+	}
+	var report doctorReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Repos) != 1 {
+		t.Fatalf("missing repository: %+v", report)
+	}
+	legacy := report.Repos[0].PublicationOutcome.Legacy
+	if legacy.State != "needs_attention" || legacy.Unpublished != 0 || legacy.ReasonCode != "legacy_activation_required" {
+		t.Fatalf("legacy proof hidden: %+v", legacy)
+	}
+	out.Reset()
+	if err := runDoctor(ctx, &out, false, "", false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), legacy.Reason) {
+		t.Fatalf("missing preserved legacy work: %s", out.String())
+	}
+	if mustSHA256(t, path) != before {
+		t.Fatal("doctor changed original rows/provenance")
+	}
+	assertLegacyFailureProof(t, path, seq, outcome, "original failed publication proof", head, blob)
+	if actual, err := gitpkg.RevParse(ctx, repo, "HEAD"); err != nil || actual != head {
+		t.Fatal("doctor changed HEAD")
 	}
 }

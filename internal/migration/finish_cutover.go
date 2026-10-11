@@ -43,7 +43,12 @@ func ActivateFinish(ctx context.Context, repo string, db *state.DB) (state.Finis
 	if saved.WorktreeID == "" {
 		manifest, err := state.InventoryFinishLegacy(ctx, db)
 		if err != nil {
-			return saved, err
+			if ctx.Err() != nil {
+				return saved, ctx.Err()
+			}
+			ref, oid, _, pinErr := pinFinishLegacy(ctx, wt.Root, checkpoint.WorktreeID(wt.Root), manifest)
+			failed, writeErr := state.RecordFinishLegacyActivationFailure(ctx, db, "legacy_inventory_invalid", "Legacy selections could not be proved. Available versions are retained; repair the saved selection before finish: "+err.Error(), ref, oid)
+			return failed, errors.Join(ErrFinishLegacyAttention, err, pinErr, writeErr)
 		}
 		ref, oid, pins, err := pinFinishLegacy(ctx, wt.Root, checkpoint.WorktreeID(wt.Root), manifest)
 		if err != nil {
@@ -51,7 +56,9 @@ func ActivateFinish(ctx context.Context, repo string, db *state.DB) (state.Finis
 				return saved, ctx.Err()
 			}
 			code := "legacy_proof_ambiguous"
-			if errors.Is(err, errFinishLegacyObjectsMissing) {
+			if errors.Is(err, state.ErrFinishIdentity) {
+				code = "legacy_inventory_invalid"
+			} else if errors.Is(err, errFinishLegacyObjectsMissing) {
 				code = "legacy_object_missing"
 			}
 			saved, writeErr := state.RecordFinishLegacyActivationFailure(ctx, db, code, "Legacy available versions are retained. Restore the old object or ref proof, then activate protection again: "+err.Error(), ref, oid)
@@ -67,6 +74,18 @@ func ActivateFinish(ctx context.Context, repo string, db *state.DB) (state.Finis
 		r, writeErr := state.CompleteFinishLegacyCutover(ctx, db, code, reason)
 		return r, errors.Join(ErrFinishLegacyAttention, cause, writeErr)
 	}
+	complete := func() (state.FinishLegacyCutover, error) {
+		var completed state.FinishLegacyCutover
+		err := gitpkg.WithLockedPrivateRef(ctx, wt.Root, saved.SnapshotRef, saved.SnapshotOID, func(lockedCtx context.Context) error {
+			var err error
+			completed, err = state.CompleteFinishLegacyCutover(lockedCtx, db, "", "")
+			return err
+		})
+		if err != nil {
+			return attention("legacy_pin_moved", err)
+		}
+		return completed, nil
+	}
 	if saved.WorktreeID != checkpoint.WorktreeID(wt.Root) {
 		return attention("legacy_worktree_mismatch", errors.New("canonical worktree identity changed"))
 	}
@@ -74,29 +93,62 @@ func ActivateFinish(ctx context.Context, repo string, db *state.DB) (state.Finis
 	if err != nil {
 		return saved, err
 	}
+	refs := []gitpkg.RefExpectation{{Ref: saved.SnapshotRef, OID: saved.SnapshotOID}}
 	for _, p := range pins {
-		if err = verifyFinishLegacyPin(ctx, wt.Root, p.PinRef, p.PinOID); err != nil {
-			return attention("legacy_pin_moved", err)
-		}
+		refs = append(refs, gitpkg.RefExpectation{Ref: p.PinRef, OID: p.PinOID})
+	}
+	if err = gitpkg.VerifyPrivateRefs(ctx, wt.Root, refs); err != nil {
+		return attention("legacy_pin_moved", err)
+	}
+	var blobOIDs []string
+	for _, p := range pins {
 		if p.ObjectType == "blob" {
-			actual, readErr := gitpkg.LsTreeBlobOID(ctx, wt.Root, p.PinOID, p.ObjectOID)
-			if readErr != nil || actual != p.ObjectOID {
-				return attention("legacy_object_missing", fmt.Errorf("captured object %s is no longer proved: %w", p.ObjectOID, readErr))
-			}
+			blobOIDs = append(blobOIDs, p.ObjectOID)
 		}
 	}
-	if err = verifyFinishLegacyPin(ctx, wt.Root, saved.SnapshotRef, saved.SnapshotOID); err != nil {
-		return attention("legacy_pin_moved", err)
+	objectTypes, err := gitpkg.ObjectTypes(ctx, wt.Root, blobOIDs)
+	if err != nil {
+		return attention("legacy_object_missing", err)
+	}
+	// Blob pins share one flat snapshot tree; read it once rather than
+	// starting a Git process for every archived path version.
+	entries, err := gitpkg.LsTree(ctx, wt.Root, saved.SnapshotOID, false)
+	if err != nil {
+		return attention("legacy_object_missing", err)
+	}
+	blobs := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		if entry.Type == "blob" {
+			blobs[entry.Path] = entry.OID
+		}
+	}
+	for _, p := range pins {
+		if p.ObjectType == "blob" && (objectTypes[p.ObjectOID] != "blob" || p.PinOID != saved.SnapshotOID || blobs[p.ObjectOID] != p.ObjectOID) {
+			return attention("legacy_object_missing", fmt.Errorf("captured object %s is no longer proved", p.ObjectOID))
+		}
 	}
 	if saved.State == "completed" {
 		return saved, nil
 	}
-	if err = daemon.RecoverSelfPublicationsBeforePlanning(ctx, wt.Root, db); err != nil {
-		return attention("legacy_publication_ambiguous", err)
+	hasJournal, err := state.LegacyTableExists(ctx, db.ReadSQL(), "self_publications")
+	if err != nil {
+		return saved, err
+	}
+	if hasJournal {
+		if err = daemon.RecoverSelfPublicationsBeforePlanning(ctx, wt.Root, db); err != nil {
+			return attention("legacy_publication_ambiguous", err)
+		}
 	}
 	// Old repair engines rewrite capture OIDs. Preserve that provenance instead.
 	// A prepared row with no replacement and the exact old branch is inert;
 	// all other interrupted repairs retain their backup and require review.
+	hasRepairs, err := state.LegacyTableExists(ctx, db.ReadSQL(), "intent_repairs")
+	if err != nil {
+		return saved, err
+	}
+	if !hasRepairs {
+		return complete()
+	}
 	rows, err := db.ReadSQL().QueryContext(ctx, `SELECT id,branch_ref,status,expected_head,COALESCE(new_head,''),COALESCE(backup_ref,'') FROM intent_repairs WHERE status IN ('prepared','git_applied') ORDER BY id`)
 	if err != nil {
 		return saved, err
@@ -139,35 +191,40 @@ func ActivateFinish(ctx context.Context, repo string, db *state.DB) (state.Finis
 			return attention("legacy_repair_ambiguous", fmt.Errorf("repair %s has no proven unapplied outcome", r.id))
 		}
 	}
-	return state.CompleteFinishLegacyCutover(ctx, db, "", "")
+	return complete()
 }
 
 func pinFinishLegacy(ctx context.Context, repo, worktree string, m state.FinishLegacyManifest) (string, string, []state.FinishLegacyPin, error) {
 	digest := strings.TrimPrefix(state.FinishLegacyDigest(m), "sha256:")
-	prefix := "refs/acd/migration/finish-v1/" + worktree + "/" + digest + "/"
-	var entries []gitpkg.MktreeEntry
+	worktreePrefix := "refs/acd/migration/finish-v1/" + worktree + "/"
+	prefix := worktreePrefix + digest + "/"
+	var treeInput bytes.Buffer
 	var available []state.FinishLegacyObject
-	var missing error
+	var inventoryErr error
+	var valid []state.FinishLegacyObject
+	var oids []string
 	for _, o := range m.Objects {
 		_, decodeErr := hex.DecodeString(o.OID)
-		if decodeErr != nil || (len(o.OID) != 40 && len(o.OID) != 64) || (o.Type != "blob" && o.Type != "commit") {
-			return "", "", nil, state.ErrFinishIdentity
+		if decodeErr != nil || strings.ToLower(o.OID) != o.OID || (len(o.OID) != 40 && len(o.OID) != 64) || (o.Type != "blob" && o.Type != "commit") {
+			inventoryErr = errors.Join(inventoryErr, state.ErrFinishIdentity)
+			continue
 		}
-		if _, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo, Timeout: gitpkg.DefaultReadTimeout}, "cat-file", "-e", o.OID+"^{"+o.Type+"}"); err != nil {
-			if ctx.Err() != nil {
-				return "", "", nil, ctx.Err()
-			}
-			missing = errors.Join(errFinishLegacyObjectsMissing, missing, fmt.Errorf("legacy %s %s is unavailable: %w", o.Type, o.OID, err))
+		valid = append(valid, o)
+		oids = append(oids, o.OID)
+	}
+	types, err := gitpkg.ObjectTypes(ctx, repo, oids)
+	if err != nil {
+		return "", "", nil, err
+	}
+	for _, o := range valid {
+		if types[o.OID] != o.Type {
+			inventoryErr = errors.Join(inventoryErr, errFinishLegacyObjectsMissing, fmt.Errorf("legacy %s %s is unavailable (observed %s)", o.Type, o.OID, types[o.OID]))
 			continue
 		}
 		available = append(available, o)
 		if o.Type == "blob" {
-			entries = append(entries, gitpkg.MktreeEntry{Mode: "100644", Type: "blob", OID: o.OID, Path: o.OID})
+			fmt.Fprintf(&treeInput, "100644 blob %s\t%s\x00", o.OID, o.OID)
 		}
-	}
-	var treeInput bytes.Buffer
-	for _, entry := range entries {
-		fmt.Fprintf(&treeInput, "%s %s %s\t%s\x00", entry.Mode, entry.Type, entry.OID, entry.Path)
 	}
 	treeOutput, err := gitpkg.Run(ctx, gitpkg.RunOpts{Dir: repo, Stdin: &treeInput}, "-c", "core.fsync=loose-object", "-c", "core.fsyncMethod=fsync", "mktree", "-z")
 	if err != nil {
@@ -183,31 +240,29 @@ func pinFinishLegacy(ctx context.Context, repo, worktree string, m state.FinishL
 		return "", "", nil, err
 	}
 	actualTree, err := gitpkg.RevParse(ctx, repo, oid+"^{tree}")
-	if err != nil || actualTree != tree {
-		return "", "", nil, fmt.Errorf("legacy snapshot tree does not match frozen inventory: %w", err)
-	}
-	if _, err = gitpkg.EnsurePrivateRefDurable(ctx, repo, "refs/acd/migration/", snapshotRef, oid); err != nil {
+	if err != nil {
 		return "", "", nil, err
 	}
-	if err = verifyFinishLegacyPin(ctx, repo, snapshotRef, oid); err != nil {
-		return "", "", nil, err
+	if actualTree != tree {
+		return "", "", nil, errors.New("legacy snapshot tree does not match frozen inventory")
 	}
+	refs := []gitpkg.RefExpectation{{Ref: snapshotRef, OID: oid}}
 	var pins []state.FinishLegacyPin
 	for _, o := range available {
 		p := state.FinishLegacyPin{ObjectOID: o.OID, ObjectType: o.Type, PinRef: snapshotRef, PinOID: oid}
 		if o.Type == "commit" {
-			p.PinRef = prefix + "commits/" + o.OID
+			// Commit content never changes across manifests. New checkpoints
+			// must not recreate every retained legacy commit pin.
+			p.PinRef = worktreePrefix + "commits/" + o.OID
 			p.PinOID = o.OID
-			if _, err = gitpkg.EnsurePrivateRefDurable(ctx, repo, "refs/acd/migration/", p.PinRef, p.PinOID); err != nil {
-				return "", "", nil, err
-			}
-			if err = verifyFinishLegacyPin(ctx, repo, p.PinRef, p.PinOID); err != nil {
-				return "", "", nil, err
-			}
+			refs = append(refs, gitpkg.RefExpectation{Ref: p.PinRef, OID: p.PinOID})
 		}
 		pins = append(pins, p)
 	}
-	return snapshotRef, oid, pins, missing
+	if err = gitpkg.EnsurePrivateRefsDurable(ctx, repo, "refs/acd/migration/", refs); err != nil {
+		return "", "", nil, errors.Join(inventoryErr, err)
+	}
+	return snapshotRef, oid, pins, inventoryErr
 }
 
 func directFinishLegacyRef(ctx context.Context, repo, ref string) error {
@@ -220,17 +275,4 @@ func directFinishLegacyRef(ctx context.Context, repo, ref string) error {
 		return nil
 	}
 	return err
-}
-func verifyFinishLegacyPin(ctx context.Context, repo, ref, oid string) error {
-	if err := directFinishLegacyRef(ctx, repo, ref); err != nil {
-		return err
-	}
-	actual, err := gitpkg.RevParse(ctx, repo, ref)
-	if err != nil {
-		return err
-	}
-	if actual != oid {
-		return fmt.Errorf("legacy pin %s moved from %s to %s", ref, oid, actual)
-	}
-	return nil
 }

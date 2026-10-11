@@ -392,7 +392,7 @@ func createResultCheckpoint(ctx context.Context, db *state.DB, store checkpoint.
 		opts.WorktreeID = plan.WorktreeID
 		opts.ObservationEpoch = epoch
 		opts.CheckpointReason = state.CheckpointReasonRestore
-		summary, err := daemon.Capture(ctx, plan.RepoRoot, db, daemon.CaptureContext{
+		summary, err := daemon.ProtectWorktree(ctx, plan.RepoRoot, db, daemon.CaptureContext{
 			BranchRef: observedRef(plan.HeadToken), BranchGeneration: plan.BranchGeneration, BaseHead: head,
 		}, opts)
 		return summary.CheckpointID, err

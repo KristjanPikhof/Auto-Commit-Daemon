@@ -352,11 +352,17 @@ func (d *DB) runBootstrap(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }() // no-op if Commit succeeded
 
-	if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
+	ddl := schemaDDL
+	if cur > 0 && cur <= 32 {
+		ddl = LegacySchemaDDL
+	}
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("state: apply schema: %w", err)
 	}
-	if err := applyVersionedMigrations(ctx, tx, cur); err != nil {
-		return err
+	if cur > 0 {
+		if err := applyVersionedMigrations(ctx, tx, cur); err != nil {
+			return err
+		}
 	}
 
 	// Set the schema version. PRAGMA user_version is per-database (stored in

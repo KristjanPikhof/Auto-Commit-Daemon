@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
-	"strings"
+
 	"testing"
 )
 
@@ -52,7 +52,7 @@ VALUES ('v17.keep', 'yes', 1)`); err != nil {
 		TargetTreeOID:    "initial-tree",
 		Members:          []SelfPublicationMember{{EventSeq: migratedSeq}},
 	}
-	if created, err := PrepareSelfPublication(
+	if created, err := fixturePrepareSelfPublication(
 		ctx, migrated, migratedUnborn); err != nil || !created {
 		t.Fatalf("prepare migrated unborn publication=(%v,%v)", created, err)
 	}
@@ -73,41 +73,9 @@ VALUES ('v17.keep', 'yes', 1)`); err != nil {
 	assertSelfPublicationSchema(t, reopened.SQL())
 }
 
-func TestSelfPublicationPrepareAtomicallyLinksOperation(t *testing.T) {
-	ctx := context.Background()
-	d, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d.Close()
-	seq := appendSelfPublicationEvent(t, d, "refs/heads/main", 1, "linked.txt")
-	publication := SelfPublication{
-		ID: "linked-publication", BranchRef: "refs/heads/main", BranchGeneration: 1,
-		SourceHead: "source", TargetCommitOID: "target", TargetTreeOID: "tree",
-		Members: []SelfPublicationMember{{EventSeq: seq}},
-	}
-	if created, err := PrepareSelfPublication(ctx, d, publication); err != nil || !created {
-		t.Fatalf("PrepareSelfPublication=(%t,%v)", created, err)
-	}
-	loaded, ok, err := SelfPublicationByID(ctx, d, publication.ID)
-	if err != nil || !ok || !loaded.OperationID.Valid {
-		t.Fatalf("publication=%+v ok=%t err=%v", loaded, ok, err)
-	}
-	var kind, phase, status, digest string
-	if err := d.SQL().QueryRowContext(ctx, `
-SELECT kind,phase,status,plan_digest FROM operations WHERE id=?`,
-		loaded.OperationID.String).Scan(&kind, &phase, &status, &digest); err != nil {
-		t.Fatal(err)
-	}
-	if kind != "self_publication" || phase != OperationPrepared ||
-		status != OperationPrepared || digest != loaded.MembershipDigest {
-		t.Fatalf("operation=(%q,%q,%q,%q)", kind, phase, status, digest)
-	}
-}
-
 func TestSelfPublicationByIDBoundedCapsMembershipEvidence(t *testing.T) {
 	ctx := context.Background()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	first := appendSelfPublicationEvent(
 		t, d, "refs/heads/main", 1, "first.txt")
 	second := appendSelfPublicationEvent(
@@ -120,9 +88,9 @@ func TestSelfPublicationByIDBoundedCapsMembershipEvidence(t *testing.T) {
 			{EventSeq: first}, {EventSeq: second},
 		},
 	}
-	if created, err := PrepareSelfPublication(
+	if created, err := fixturePrepareSelfPublication(
 		ctx, d, publication); err != nil || !created {
-		t.Fatalf("PrepareSelfPublication=(%t,%v)", created, err)
+		t.Fatalf("fixturePrepareSelfPublication=(%t,%v)", created, err)
 	}
 	got, ok, rows, err := SelfPublicationByIDBounded(
 		ctx, d, publication.ID, 2)
@@ -139,15 +107,15 @@ func TestSelfPublicationByIDBoundedCapsMembershipEvidence(t *testing.T) {
 func TestSelfPublicationOperationTransitionsRequireExactCorrelation(t *testing.T) {
 	newPublication := func(t *testing.T, id string) (*DB, SelfPublication, int64, string) {
 		t.Helper()
-		db, _ := openTestDB(t)
+		db, _ := openLegacyTestDB(t)
 		seq := appendSelfPublicationEvent(t, db, "refs/heads/main", 1, id+".txt")
 		publication := SelfPublication{
 			ID: id, BranchRef: "refs/heads/main", BranchGeneration: 1,
 			SourceHead: "source", TargetCommitOID: "target", TargetTreeOID: "tree",
 			Members: []SelfPublicationMember{{EventSeq: seq}},
 		}
-		if created, err := PrepareSelfPublication(context.Background(), db, publication); err != nil || !created {
-			t.Fatalf("PrepareSelfPublication=(%t,%v)", created, err)
+		if created, err := fixturePrepareSelfPublication(context.Background(), db, publication); err != nil || !created {
+			t.Fatalf("fixturePrepareSelfPublication=(%t,%v)", created, err)
 		}
 		loaded, ok, err := SelfPublicationByID(context.Background(), db, id)
 		if err != nil || !ok || !loaded.OperationID.Valid {
@@ -262,102 +230,20 @@ PRAGMA user_version=18;`); err != nil {
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	projection, err := LoadSelfPublicationStateReadOnly(ctx, dbPath)
-	if err != nil || !projection.Available ||
-		projection.SchemaVersion != 18 ||
-		len(projection.Recoverable) != 2 ||
-		projection.Recoverable[0].Completion.CandidateStatus !=
-			SelfPublicationCompletionUnknown ||
-		projection.Recoverable[1].Completion.CandidateStatus !=
-			SelfPublicationCompletionUnknown ||
-		projection.UnknownRecoverable == nil ||
-		projection.UnknownRecoverable.ID != "v18-prepared" {
-		t.Fatalf("v18 read-only projection=%+v err=%v", projection, err)
-	}
-
-	migrated, err := Open(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("Open v18 fixture: %v", err)
-	}
-	assertSelfPublicationCompletionColumns(t, migrated.SQL())
-	for _, id := range []string{"v18-prepared", "v18-applied"} {
-		got, ok, err := SelfPublicationByID(ctx, migrated, id)
-		if err != nil || !ok ||
-			got.Completion.CandidateStatus !=
-				SelfPublicationCompletionUnknown ||
-			got.Completion.PublishedTS != 0 ||
-			got.Completion.SoftPublicationDeadline.Valid {
-			t.Fatalf("migrated %s=%+v ok=%v err=%v", id, got, ok, err)
-		}
-	}
-	if unknown, ok, err := FirstUnknownRecoverableSelfPublication(
-		ctx, migrated); err != nil || !ok || unknown.ID != "v18-prepared" {
-		t.Fatalf("first migrated unknown=%+v ok=%v err=%v",
-			unknown, ok, err)
-	}
-	if version, err := migrated.UserVersion(ctx); err != nil ||
-		version != SchemaVersion {
-		t.Fatalf("version=(%d,%v), want %d", version, err, SchemaVersion)
-	}
-	if err := migrated.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := Open(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("idempotent reopen: %v", err)
-	}
-	defer reopened.Close()
-	assertSelfPublicationCompletionColumns(t, reopened.SQL())
-	got, ok, err := SelfPublicationByID(ctx, reopened, "v18-applied")
-	if err != nil || !ok ||
-		got.Completion.CandidateStatus != SelfPublicationCompletionUnknown {
-		t.Fatalf("reopened v18-applied=%+v ok=%v err=%v", got, ok, err)
-	}
-}
-
-func TestReadOnlySelfPublicationV17DoesNotMigrate(t *testing.T) {
-	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "state.db")
-	d, err := Open(ctx, dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := d.Close(); err != nil {
-		t.Fatal(err)
-	}
-	downgradeSelfPublicationFixtureToV17(t, dbPath)
-
-	projection, err := LoadSelfPublicationStateReadOnly(ctx, dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if projection.Available || projection.SchemaVersion != 17 {
-		t.Fatalf("projection=%+v, want unavailable v17", projection)
-	}
-	raw, err := sql.Open(driverName, buildDSN(dbPath))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	var version, tables int
-	if err := raw.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		t.Fatal(err)
-	}
-	if err := raw.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM sqlite_master
-WHERE type='table' AND name LIKE 'self_publication%'`).Scan(&tables); err != nil {
-		t.Fatal(err)
-	}
-	if version != 17 || tables != 0 {
-		t.Fatalf("read-only inspection mutated db: version=%d tables=%d", version, tables)
+	version, err := ReadUserVersion(ctx, dbPath)
+	if err != nil || version != 18 {
+		t.Fatalf("readonly version=%d err=%v", version, err)
 	}
 }
 
 func TestSelfPublicationPhaseCASAndEventCompletion(t *testing.T) {
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	seq := appendSelfPublicationEvent(t, d, "refs/heads/main", 4, "event.go")
-	if err := RecordPlannerOffer(ctx, d, seq, 2); err != nil {
+	if err := func() error {
+		_, err := d.SQL().ExecContext(ctx, "INSERT INTO planner_state(event_seq,last_planned_ts) VALUES(?,2)", seq)
+		return err
+	}(); err != nil {
 		t.Fatal(err)
 	}
 	publication := SelfPublication{
@@ -371,18 +257,9 @@ func TestSelfPublicationPhaseCASAndEventCompletion(t *testing.T) {
 			EventSeq: seq,
 		}},
 	}
-	created, err := PrepareSelfPublication(ctx, d, publication)
+	created, err := fixturePrepareSelfPublication(ctx, d, publication)
 	if err != nil || !created {
-		t.Fatalf("PrepareSelfPublication=(%v,%v)", created, err)
-	}
-	created, err = PrepareSelfPublication(ctx, d, publication)
-	if err != nil || created {
-		t.Fatalf("idempotent prepare=(%v,%v)", created, err)
-	}
-	mismatched := publication
-	mismatched.TargetTreeOID = "other-tree"
-	if _, err := PrepareSelfPublication(ctx, d, mismatched); !errors.Is(err, ErrSelfPublicationIdentityMismatch) {
-		t.Fatalf("mismatched prepare err=%v", err)
+		t.Fatalf("fixturePrepareSelfPublication=(%v,%v)", created, err)
 	}
 	if _, err := CompleteSelfPublication(ctx, d, publication,
 		SelfPublicationCompletion{PublishedTS: 3}); !errors.Is(err, ErrSelfPublicationPhaseConflict) {
@@ -419,14 +296,15 @@ func TestSelfPublicationPhaseCASAndEventCompletion(t *testing.T) {
 		t.Fatalf("idempotent completion=(%v,%v)", completed, err)
 	}
 	assertSelfPublicationCompletedEvent(t, d, seq, "target")
-	if _, ok, err := PlannerStateForEvent(ctx, d, seq); err != nil || ok {
-		t.Fatalf("planner state after completion ok=%v err=%v", ok, err)
+	var plannerRows int
+	if err := d.ReadSQL().QueryRowContext(ctx, "SELECT COUNT(*) FROM planner_state WHERE event_seq=?", seq).Scan(&plannerRows); err != nil || plannerRows != 0 {
+		t.Fatalf("remaining planner=%d err=%v", plannerRows, err)
 	}
 	assertSelfPublicationMeta(t, d, "branch.generation", "4")
 	assertSelfPublicationMeta(t, d, "branch.head", "target")
 	assertSelfPublicationMeta(t, d, "branch_token",
 		"rev:target refs/heads/main")
-	publish, ok, err := LoadPublishState(ctx, d)
+	publish, ok, err := fixtureLoadPublishState(ctx, d)
 	if err != nil || !ok || publish.EventSeq.Int64 != seq ||
 		publish.SourceHead.String != "source" ||
 		publish.TargetCommitOID.String != "target" ||
@@ -435,29 +313,8 @@ func TestSelfPublicationPhaseCASAndEventCompletion(t *testing.T) {
 	}
 }
 
-func TestPrepareSelfPublicationRejectsUnknownCompletion(t *testing.T) {
-	d, _ := openTestDB(t)
-	ctx := context.Background()
-	seq := appendSelfPublicationEvent(
-		t, d, "refs/heads/main", 1, "unknown.go")
-	publication := SelfPublication{
-		ID: "unknown-completion", BranchRef: "refs/heads/main",
-		BranchGeneration: 1, SourceHead: "source",
-		TargetCommitOID: "target", TargetTreeOID: "tree",
-		Completion: SelfPublicationCompletion{
-			CandidateStatus: SelfPublicationCompletionUnknown,
-		},
-		Members: []SelfPublicationMember{{EventSeq: seq}},
-	}
-	if _, err := PrepareSelfPublication(
-		ctx, d, publication); err == nil ||
-		!strings.Contains(err.Error(), "invalid self-publication completion") {
-		t.Fatalf("PrepareSelfPublication unknown completion err=%v", err)
-	}
-}
-
-func TestSelfPublicationUnbornSourceFreshSchemaPrepareAndComplete(t *testing.T) {
-	d, _ := openTestDB(t)
+func TestSelfPublicationUnbornArchivedJournalCompletes(t *testing.T) {
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	seq := appendSelfPublicationEvent(
 		t, d, "refs/heads/unborn", 0, "initial.go")
@@ -470,9 +327,9 @@ func TestSelfPublicationUnbornSourceFreshSchemaPrepareAndComplete(t *testing.T) 
 		TargetTreeOID:    "initial-tree",
 		Members:          []SelfPublicationMember{{EventSeq: seq}},
 	}
-	if created, err := PrepareSelfPublication(
+	if created, err := fixturePrepareSelfPublication(
 		ctx, d, publication); err != nil || !created {
-		t.Fatalf("PrepareSelfPublication unborn=(%v,%v)", created, err)
+		t.Fatalf("fixturePrepareSelfPublication unborn=(%v,%v)", created, err)
 	}
 	if applied, err := MarkSelfPublicationGitApplied(
 		ctx, d, publication, 2); err != nil || !applied {
@@ -489,7 +346,7 @@ func TestSelfPublicationUnbornSourceFreshSchemaPrepareAndComplete(t *testing.T) 
 		got.Phase != SelfPublicationCompleted {
 		t.Fatalf("unborn journal=%+v ok=%v err=%v", got, ok, err)
 	}
-	publish, ok, err := LoadPublishState(ctx, d)
+	publish, ok, err := fixtureLoadPublishState(ctx, d)
 	if err != nil || !ok || !publish.SourceHead.Valid ||
 		publish.SourceHead.String != "" ||
 		publish.TargetCommitOID.String != publication.TargetCommitOID {
@@ -501,11 +358,11 @@ func TestSelfPublicationUnbornSourceFreshSchemaPrepareAndComplete(t *testing.T) 
 
 func TestSelfPublicationCandidateCompletionAndRollback(t *testing.T) {
 	t.Run("candidate soft publication", func(t *testing.T) {
-		d, _ := openTestDB(t)
+		d, _ := openLegacyTestDB(t)
 		ctx := context.Background()
 		seq1 := appendSelfPublicationEvent(t, d, "refs/heads/main", 9, "one.go")
 		seq2 := appendSelfPublicationEvent(t, d, "refs/heads/main", 9, "two.go")
-		if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+		if err := fixtureSaveIntentCandidate(ctx, d, IntentCandidate{
 			ID:               "candidate",
 			BranchRef:        "refs/heads/main",
 			BranchGeneration: 9,
@@ -535,7 +392,7 @@ func TestSelfPublicationCandidateCompletionAndRollback(t *testing.T) {
 				{EventSeq: seq2, CandidateID: sql.NullString{String: "candidate", Valid: true}},
 			},
 		}
-		if created, err := PrepareSelfPublication(ctx, d, publication); err != nil || !created {
+		if created, err := fixturePrepareSelfPublication(ctx, d, publication); err != nil || !created {
 			t.Fatalf("prepare=(%v,%v)", created, err)
 		}
 		if applied, err := MarkSelfPublicationGitApplied(ctx, d, publication, 10); err != nil || !applied {
@@ -549,18 +406,17 @@ func TestSelfPublicationCandidateCompletionAndRollback(t *testing.T) {
 			}); err != nil || !completed {
 			t.Fatalf("complete=(%v,%v)", completed, err)
 		}
-		candidate, ok, err := IntentCandidateByID(ctx, d, "candidate")
-		if err != nil || !ok || candidate.Status != IntentCandidateSoftPublished ||
-			candidate.PublishedCommitOID.String != "target-9" ||
-			candidate.SoftPublicationDeadline.Float64 != 20 {
-			t.Fatalf("candidate=%+v ok=%v err=%v", candidate, ok, err)
+		var status, commit string
+		var deadline float64
+		if err := d.ReadSQL().QueryRowContext(ctx, "SELECT status,published_commit_oid,soft_publication_deadline FROM intent_candidates WHERE id='candidate'").Scan(&status, &commit, &deadline); err != nil || status != IntentCandidateSoftPublished || commit != "target-9" || deadline != 20 {
+			t.Fatalf("candidate outcome %s %s %v: %v", status, commit, deadline, err)
 		}
 		assertSelfPublicationCompletedEvent(t, d, seq1, "target-9")
 		assertSelfPublicationCompletedEvent(t, d, seq2, "target-9")
 	})
 
 	t.Run("ownership change rolls back all completion writes", func(t *testing.T) {
-		d, _ := openTestDB(t)
+		d, _ := openLegacyTestDB(t)
 		ctx := context.Background()
 		seq1 := appendSelfPublicationEvent(t, d, "refs/heads/main", 2, "one.go")
 		seq2 := appendSelfPublicationEvent(t, d, "refs/heads/main", 2, "two.go")
@@ -576,7 +432,7 @@ func TestSelfPublicationCandidateCompletionAndRollback(t *testing.T) {
 				{EventSeq: seq2},
 			},
 		}
-		if _, err := PrepareSelfPublication(ctx, d, publication); err != nil {
+		if _, err := fixturePrepareSelfPublication(ctx, d, publication); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := MarkSelfPublicationGitApplied(ctx, d, publication, 3); err != nil {
@@ -606,7 +462,7 @@ func TestSelfPublicationCandidateCompletionAndRollback(t *testing.T) {
 		if err != nil || !ok || got.Phase != SelfPublicationGitApplied {
 			t.Fatalf("journal after rollback=%+v ok=%v err=%v", got, ok, err)
 		}
-		if _, ok, err := LoadPublishState(ctx, d); err != nil || ok {
+		if _, ok, err := fixtureLoadPublishState(ctx, d); err != nil || ok {
 			t.Fatalf("publish_state after rollback ok=%v err=%v", ok, err)
 		}
 		if _, ok, err := MetaGet(ctx, d, "branch.head"); err != nil || ok {
@@ -616,7 +472,7 @@ func TestSelfPublicationCandidateCompletionAndRollback(t *testing.T) {
 }
 
 func TestSelfPublicationAbandonAndImmutableIdentity(t *testing.T) {
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	seq := appendSelfPublicationEvent(t, d, "refs/heads/main", 1, "abandon.go")
 	publication := SelfPublication{
@@ -628,7 +484,7 @@ func TestSelfPublicationAbandonAndImmutableIdentity(t *testing.T) {
 		TargetTreeOID:    "tree",
 		Members:          []SelfPublicationMember{{EventSeq: seq}},
 	}
-	if _, err := PrepareSelfPublication(ctx, d, publication); err != nil {
+	if _, err := fixturePrepareSelfPublication(ctx, d, publication); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.SQL().ExecContext(ctx, `
@@ -663,116 +519,9 @@ DELETE FROM self_publication_members WHERE publication_id=?`,
 	if err != nil || len(recoverable) != 0 {
 		t.Fatalf("recoverable after abandon=%+v err=%v", recoverable, err)
 	}
-	pruned, err := PruneTerminalSelfPublicationsBefore(ctx, d, 6, 1)
-	if err != nil || pruned != 1 {
-		t.Fatalf("PruneTerminalSelfPublicationsBefore=(%d,%v)", pruned, err)
-	}
-	if _, ok, err := SelfPublicationByID(ctx, d, publication.ID); err != nil || ok {
-		t.Fatalf("pruned publication ok=%v err=%v", ok, err)
-	}
 	var members int
-	if err := d.SQL().QueryRowContext(ctx, `
-SELECT COUNT(*) FROM self_publication_members WHERE publication_id=?`,
-		publication.ID).Scan(&members); err != nil || members != 0 {
-		t.Fatalf("pruned membership count=%d err=%v", members, err)
-	}
-}
-
-func TestSelfPublicationOwnershipCASRejectsCandidateOmission(t *testing.T) {
-	d, _ := openTestDB(t)
-	ctx := context.Background()
-	seq := appendSelfPublicationEvent(t, d, "refs/heads/main", 3, "owned.go")
-	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
-		ID:               "owner",
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 3,
-		Status:           IntentCandidateReady,
-		Readiness:        IntentReadinessReady,
-		Events: []IntentCandidateEvent{{
-			EventSeq: seq, EventRole: "code",
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	publication := SelfPublication{
-		ID:               "omitted-owner",
-		BranchRef:        "refs/heads/main",
-		BranchGeneration: 3,
-		SourceHead:       "source",
-		TargetCommitOID:  "target",
-		TargetTreeOID:    "tree",
-		Members:          []SelfPublicationMember{{EventSeq: seq}},
-	}
-	if _, err := PrepareSelfPublication(ctx, d, publication); !errors.Is(
-		err, ErrSelfPublicationOwnershipChanged) {
-		t.Fatalf("event-only prepare with active candidate err=%v", err)
-	}
-}
-
-func TestSelfPublicationRejectsOverlappingLiveMembership(t *testing.T) {
-	d, _ := openTestDB(t)
-	ctx := context.Background()
-	seq := appendSelfPublicationEvent(t, d, "refs/heads/main", 5, "overlap.go")
-	first := SelfPublication{
-		ID: "first", BranchRef: "refs/heads/main", BranchGeneration: 5,
-		SourceHead: "source", TargetCommitOID: "first-target",
-		TargetTreeOID: "first-tree",
-		Members:       []SelfPublicationMember{{EventSeq: seq}},
-	}
-	second := SelfPublication{
-		ID: "second", BranchRef: "refs/heads/main", BranchGeneration: 5,
-		SourceHead: "source", TargetCommitOID: "first-target",
-		TargetTreeOID: "first-tree",
-		Members:       []SelfPublicationMember{{EventSeq: seq}},
-	}
-	if _, err := PrepareSelfPublication(ctx, d, first); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := PrepareSelfPublication(ctx, d, second); !errors.Is(
-		err, ErrSelfPublicationOwnershipChanged) {
-		t.Fatalf("overlapping prepare err=%v", err)
-	}
-	if _, err := AbandonSelfPublication(ctx, d, first, "CAS not attempted", 2); err != nil {
-		t.Fatal(err)
-	}
-	if created, err := PrepareSelfPublication(ctx, d, second); err != nil || !created {
-		t.Fatalf("prepare after abandon=(%v,%v)", created, err)
-	}
-}
-
-func TestSelfPublicationReadOnlyCurrentProjection(t *testing.T) {
-	d, dbPath := openTestDB(t)
-	ctx := context.Background()
-	seq1 := appendSelfPublicationEvent(t, d, "refs/heads/main", 1, "prepared.go")
-	seq2 := appendSelfPublicationEvent(t, d, "refs/heads/main", 1, "applied.go")
-	prepared := SelfPublication{
-		ID: "prepared", BranchRef: "refs/heads/main", BranchGeneration: 1,
-		SourceHead: "source", TargetCommitOID: "target-1",
-		TargetTreeOID: "tree-1",
-		Members:       []SelfPublicationMember{{EventSeq: seq1}},
-	}
-	applied := SelfPublication{
-		ID: "applied", BranchRef: "refs/heads/main", BranchGeneration: 1,
-		SourceHead: "target-1", TargetCommitOID: "target-2",
-		TargetTreeOID: "tree-2",
-		Members:       []SelfPublicationMember{{EventSeq: seq2}},
-	}
-	if _, err := PrepareSelfPublication(ctx, d, prepared); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := PrepareSelfPublication(ctx, d, applied); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := MarkSelfPublicationGitApplied(ctx, d, applied, 3); err != nil {
-		t.Fatal(err)
-	}
-	projection, err := LoadSelfPublicationStateReadOnly(ctx, dbPath)
-	if err != nil || !projection.Available ||
-		projection.SchemaVersion != SchemaVersion ||
-		projection.Prepared != 1 || projection.GitApplied != 1 ||
-		len(projection.Recoverable) != 2 ||
-		len(projection.Recoverable[0].Members) != 1 {
-		t.Fatalf("projection=%+v err=%v", projection, err)
+	if err := d.ReadSQL().QueryRowContext(ctx, "SELECT COUNT(*) FROM self_publication_members WHERE publication_id=?", publication.ID).Scan(&members); err != nil || members != 1 {
+		t.Fatalf("retained members=%d err=%v", members, err)
 	}
 }
 
@@ -784,7 +533,7 @@ func appendSelfPublicationEvent(
 	path string,
 ) int64 {
 	t.Helper()
-	seq, err := AppendCaptureEvent(context.Background(), d, CaptureEvent{
+	seq, err := fixtureAppendCaptureEvent(context.Background(), d, CaptureEvent{
 		BranchRef: branch, BranchGeneration: generation, BaseHead: "base",
 		Operation: "update", Path: path, Fidelity: "full",
 	}, nil)

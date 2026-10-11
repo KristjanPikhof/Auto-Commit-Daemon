@@ -97,9 +97,9 @@ func TestFinishCLIConfigLocalIsOfflineAndUsesApprovedSnapshot(t *testing.T) {
 	}
 }
 
-func TestFinishCLIConfigDesiredApprovalAndValidation(t *testing.T) {
+func TestFinishCLIConfigOnlyAppliedRevisionsAreApproved(t *testing.T) {
 	for _, baseline := range []bool{false, true} {
-		for _, status := range []string{"absent", "queued", "running", "failed", "passed", "rejected"} {
+		for _, status := range []string{"pending", "acknowledged", "rejected", "applied"} {
 			t.Run(fmt.Sprintf("baseline_%t/%s", baseline, status), func(t *testing.T) {
 				roots, runtime := finishConfigFixture(t)
 				ctx := context.Background()
@@ -108,39 +108,19 @@ func TestFinishCLIConfigDesiredApprovalAndValidation(t *testing.T) {
 					revision, _ := finishConfigRevision(t, runtime.db, map[string]any{config.FieldCommitFormat: "imperative"}, expected, true)
 					expected = sql.NullInt64{Int64: revision.ID, Valid: true}
 				}
-				payload := map[string]any{config.FieldCommitFormat: "conventional"}
-				var revision state.ConfigRevision
-				var request state.ConfigActivationRequest
-				if status == "absent" || status == "rejected" {
-					revision, request = finishConfigRevision(t, runtime.db, payload, expected, false)
-					if status == "rejected" {
-						if ok, err := state.RejectConfigActivation(ctx, runtime.db, request.ID, revision.ID, "not approved"); err != nil || !ok {
-							t.Fatalf("reject %t: %v", ok, err)
-						}
+				revision, request := finishConfigRevision(t, runtime.db, map[string]any{config.FieldCommitFormat: "conventional"}, expected, status == "applied")
+				if status == "acknowledged" {
+					if ok, err := state.AcknowledgeConfigActivation(ctx, runtime.db, request.ID, revision.ID); err != nil || !ok {
+						t.Fatalf("acknowledge %t: %v", ok, err)
 					}
-				} else {
-					body, _ := json.Marshal(payload)
-					var err error
-					var ok bool
-					var run state.ConfigValidationRun
-					revision, request, run, ok, err = state.CreateConfigActivationWithValidation(ctx, runtime.db, state.ConfigRevisionInput{Snapshot: body, Scope: "repo", Profile: "default"}, expected, state.ConfigValidationSpec{BranchRef: "refs/heads/main", BranchGeneration: 1, ExpectedHead: strings.Repeat("a", 40), Mode: "structural", CommandSource: "builtin", CommandDigest: strings.Repeat("b", 64), ApprovalID: "reviewed"})
-					if err != nil || !ok {
-						t.Fatalf("queue %t: %v", ok, err)
-					}
-					if status != "queued" {
-						if _, ok, err := state.ClaimNextConfigValidation(ctx, runtime.db, os.Getpid()); err != nil || !ok {
-							t.Fatalf("claim %t: %v", ok, err)
-						}
-						if status != "running" {
-							if ok, err := state.CompleteConfigValidation(ctx, runtime.db, run.ID, os.Getpid(), status, sql.NullInt64{Valid: true}, "", ""); err != nil || !ok {
-								t.Fatalf("complete %t: %v", ok, err)
-							}
-						}
+				}
+				if status == "rejected" {
+					if ok, err := state.RejectConfigActivation(ctx, runtime.db, request.ID, revision.ID, "not approved"); err != nil || !ok {
+						t.Fatalf("reject %t: %v", ok, err)
 					}
 				}
 				got, err := resolveFinishWorkerConfig(ctx, roots, runtime)
-				eligible := status == "absent" || status == "passed"
-				if !eligible && !baseline {
+				if status != "applied" && !baseline {
 					if err == nil || !strings.Contains(err.Error(), "not approved") {
 						t.Fatalf("unapproved initial config used %+v: %v", got, err)
 					}
@@ -150,7 +130,7 @@ func TestFinishCLIConfigDesiredApprovalAndValidation(t *testing.T) {
 					t.Fatal(err)
 				}
 				want := "imperative"
-				if eligible {
+				if status == "applied" {
 					want = "conventional"
 				}
 				if got.Style != want {
@@ -200,7 +180,7 @@ func TestFinishCLIConfigGlobalApprovalBindsEffectiveValues(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		fingerprint, err := config.SettingsFingerprint(values, config.PresetResolution{})
+		fingerprint, err := config.SettingsFingerprint(values)
 		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{Generation: doc.Generation + 1, Fingerprint: fingerprint, Confirmations: []string{"subprocess_execution"}}
 		return err
 	}); err != nil {

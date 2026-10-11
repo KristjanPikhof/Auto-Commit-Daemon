@@ -684,70 +684,7 @@ func TestFsnotifyWatcher_DiagnosticsCallback(t *testing.T) {
 // scheduler, a file write triggers a commit driven by fsnotify (not by
 // the poll tick). We use a base scheduler interval of 1 second and
 // assert the commit lands well under that.
-func TestRun_FsnotifyDrivesWake(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("fsnotify integration not exercised on windows in v1")
-	}
-	f := newDaemonFixture(t)
-	registerLiveClient(t, f.db)
 
-	startHead, err := gitRevParse(t, f.dir)
-	if err != nil {
-		t.Fatalf("rev-parse: %v", err)
-	}
-
-	shutdownCh := make(chan struct{}, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	var runErr error
-	go func() {
-		defer wg.Done()
-		runErr = Run(ctx, Options{
-			RepoPath: f.dir,
-			GitDir:   f.gitDir,
-			DB:       f.db,
-			Scheduler: Scheduler{
-				Base:         1 * time.Second,
-				IdleCeiling:  2 * time.Second,
-				ErrorCeiling: 2 * time.Second,
-			},
-			BootGrace:        30 * time.Second,
-			MessageFn:        DeterministicMessage,
-			ShutdownCh:       shutdownCh,
-			SkipSignals:      true,
-			FsnotifyEnabled:  true,
-			FsnotifyDebounce: 30 * time.Millisecond,
-		})
-	}()
-
-	waitForDaemonMode(t, f.db, "running", 2*time.Second)
-	waitForFsnotifyReady(t, f.db, 2*time.Second)
-
-	if err := os.WriteFile(filepath.Join(f.dir, "fast.txt"), []byte("fs\n"), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	// fsnotify + capture + commit should all complete well under the 1s
-	// scheduler base interval. Allow 1500ms of slack so we don't flake
-	// on slow CI.
-	newHead := waitForCommit(t, f.dir, startHead, 1500*time.Millisecond)
-	if newHead == startHead {
-		t.Fatalf("HEAD did not advance via fsnotify wake")
-	}
-
-	cancel()
-	wg.Wait()
-	if runErr != nil {
-		t.Fatalf("Run: %v", runErr)
-	}
-}
-
-// gitRevParse is a small wrapper that uses the existing git package to
-// resolve HEAD without dragging another import alias into the test file.
-// Defined here as a helper so other fsnotify tests can call it.
 func gitRevParse(t *testing.T, dir string) (string, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

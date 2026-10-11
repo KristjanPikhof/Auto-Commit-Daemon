@@ -14,7 +14,6 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	pathspkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 func TestChangedCommandCapabilityMatrix(t *testing.T) {
@@ -72,20 +71,15 @@ func TestChangedCommandCapabilitiesAreDeclarative(t *testing.T) {
 	}
 }
 
-func TestCompatibilityProtocolCommandsRetainJSONCapability(t *testing.T) {
-	for _, path := range [][]string{
-		{"start"}, {"stop"}, {"wake"}, {"touch"}, {"flush"}, {"daemon", "run"},
-		{"internal", "hint"}, {"internal", "session", "open"}, {"internal", "session", "close"},
-	} {
-		root := newRootCmd()
-		command, _, err := root.Find(path)
-		if err != nil {
-			t.Fatalf("find %v: %v", path, err)
-		}
-		capabilities := invocationCapabilities(command)
-		if !capabilities.Repository || !capabilities.JSON || !capabilities.Quiet {
-			t.Errorf("%s capabilities=%+v, want repository/JSON/quiet", command.CommandPath(), capabilities)
-		}
+func TestRetainedInternalHintDeclaresJSONCapability(t *testing.T) {
+	root := newRootCmd()
+	command, remaining, err := root.Find([]string{"internal", "hint"})
+	if err != nil || len(remaining) != 0 || command.Name() != "hint" {
+		t.Fatalf("find hint: %v %v", remaining, err)
+	}
+	capabilities := invocationCapabilities(command)
+	if !capabilities.Repository || !capabilities.JSON || !capabilities.Quiet {
+		t.Fatalf("hint capabilities=%+v", capabilities)
 	}
 }
 
@@ -152,47 +146,31 @@ func TestLexicalJSONAndParseFailuresRemainInvalidInput(t *testing.T) {
 	}
 }
 
-func TestInvocationCapabilitiesFailClosedAndCanonicalAliasesDeclareIntent(t *testing.T) {
+func TestInvocationCapabilitiesFailClosedAndCanonicalCommandsDeclareIntent(t *testing.T) {
 	root := newRootCmd()
 	internal, _, err := root.Find([]string{"internal"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := invocationCapabilities(internal); got != (commandCapabilities{}) {
-		t.Fatalf("undeclared internal capabilities=%+v, want fail-closed zero value", got)
+		t.Fatalf("undeclared internal capabilities=%+v", got)
 	}
 	if got := invocationCapabilities(root); !got.Repository || !got.JSON || !got.Quiet {
-		t.Fatalf("root capabilities=%+v, want explicit repository/JSON/quiet", got)
+		t.Fatalf("root capabilities=%+v", got)
 	}
-
-	tests := []struct {
-		alias       string
-		canonical   []string
-		replacement string
-	}{
-		{alias: "events", canonical: []string{"history", "activity"}, replacement: "acd history activity"},
-		{alias: "prompt", canonical: []string{"support", "prompt"}, replacement: "acd support prompt"},
-		{alias: "fix", canonical: []string{"support", "recover"}, replacement: "acd support recover"},
-		{alias: "recover", canonical: []string{"support", "recover"}, replacement: "acd support recover"},
-		{alias: "stats", canonical: []string{"repo", "stats"}, replacement: "acd repo stats"},
+	for _, path := range [][]string{{"history", "activity"}, {"history", "rewrite"}, {"support", "repair"}, {"repo", "stats"}, {"finish"}} {
+		command, remaining, err := root.Find(path)
+		if err != nil || len(remaining) != 0 || command.Name() != path[len(path)-1] {
+			t.Fatalf("find canonical %v: %v %v", path, remaining, err)
+		}
+		if got := invocationCapabilities(command); !got.JSON || !got.Quiet {
+			t.Errorf("%s capabilities=%+v", command.CommandPath(), got)
+		}
 	}
-	for _, test := range tests {
-		alias, _, err := root.Find([]string{test.alias})
-		if err != nil {
-			t.Fatalf("find alias %s: %v", test.alias, err)
-		}
-		canonical, _, err := root.Find(test.canonical)
-		if err != nil {
-			t.Fatalf("find canonical %v: %v", test.canonical, err)
-		}
-		if !alias.Hidden {
-			t.Errorf("alias %s is visible", test.alias)
-		}
-		if got := alias.Annotations["acd.compatibility.replacement"]; got != test.replacement {
-			t.Errorf("alias %s replacement=%q, want %q", test.alias, got, test.replacement)
-		}
-		if got, want := invocationCapabilities(alias), invocationCapabilities(canonical); got != want {
-			t.Errorf("alias %s capabilities=%+v, canonical=%+v", test.alias, got, want)
+	for _, retired := range []string{"events", "prompt", "fix", "recover", "stats"} {
+		command, _, err := root.Find([]string{retired})
+		if err == nil && command.Name() == retired {
+			t.Errorf("retired alias %s still registered", retired)
 		}
 	}
 }
@@ -348,31 +326,6 @@ func TestStableJSONEnvelopeHasMandatoryKeys(t *testing.T) {
 		if _, ok := value[key]; !ok {
 			t.Errorf("mandatory JSON key %q missing: %s", key, out.String())
 		}
-	}
-}
-
-func TestCheckpointDrainCreatesLogicalPublicationBoundary(t *testing.T) {
-	ctx := context.Background()
-	_, _, db := makeRepoStateDB(t)
-	defer db.Close()
-	params, err := json.Marshal(map[string]bool{"drain_publication": true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := applyWorkerActivityHint(ctx, db, params); err != nil {
-		t.Fatal(err)
-	}
-	flush, ok, err := state.ClaimNextFlushRequest(ctx, db)
-	if err != nil || !ok || flush.Command != "flush_logical" || !flush.NonBlocking {
-		t.Fatalf("publication drain flush=%+v ok=%t err=%v", flush, ok, err)
-	}
-	boundaries, err := state.PendingIntentActivityBoundaries(ctx, db, 0, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(boundaries) != 1 || boundaries[0].Kind != state.IntentBoundaryHard ||
-		boundaries[0].Source != "checkpoint_barrier_drain" {
-		t.Fatalf("publication drain boundaries=%+v", boundaries)
 	}
 }
 

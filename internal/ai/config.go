@@ -1,25 +1,4 @@
-// config.go — env-driven Provider selection for the daemon's replay path.
-//
-// Per spec §10.4, the run loop picks a commit-message provider by reading
-// ACD_AI_* environment variables. The defaults are conservative: an empty
-// or unrecognized ACD_AI_PROVIDER falls back to the deterministic generator
-// in event mode. Intent mode keeps explicitly semantic configuration fail
-// closed so setup errors cannot silently change commit semantics.
-//
-// Selection table:
-//
-//	ACD_AI_PROVIDER             | Resolved Provider chain
-//	----------------------------|--------------------------------------
-//	"" (unset)                  | DeterministicProvider
-//	"deterministic"             | DeterministicProvider
-//	"openai-compat" + APIKey    | Compose(OpenAIProvider, Deterministic)
-//	"openai-compat" no APIKey   | Event: deterministic; Intent: error
-//	"subprocess:<name>"         | Compose(Subprocess(name), Deterministic)
-//	any other value             | Event: deterministic; Intent: error
-//
-// The returned io.Closer is non-nil only when the chain holds a
-// SubprocessProvider; the daemon must Close() it on shutdown so the child
-// process is reaped cleanly.
+// Provider settings validate locally; transports are built only for explicit requests.
 package ai
 
 import (
@@ -39,59 +18,26 @@ import (
 // Env var names — kept exported so the CLI / docs can reference them
 // without re-typing the literal strings.
 const (
-	EnvProvider             = "ACD_AI_PROVIDER"
-	EnvBaseURL              = "ACD_AI_BASE_URL"
-	EnvAPIKey               = "ACD_AI_API_KEY"
-	EnvModel                = "ACD_AI_MODEL"
-	EnvTimeout              = "ACD_AI_TIMEOUT"
-	EnvCAFile               = "ACD_AI_CA_FILE"
-	EnvDiffEgress           = "ACD_AI_DIFF_EGRESS"
-	EnvCommitStrategy       = "ACD_COMMIT_STRATEGY"
-	EnvCommitFormat         = "ACD_COMMIT_FORMAT"
-	EnvIntentWindow         = "ACD_INTENT_WINDOW"
-	EnvIntentMinPending     = "ACD_INTENT_MIN_PENDING"
-	EnvIntentSettleWindow   = "ACD_INTENT_SETTLE_WINDOW"
-	EnvIntentMaxPendingAge  = "ACD_INTENT_MAX_PENDING_AGE"
-	EnvIntentRecentCommits  = "ACD_INTENT_RECENT_COMMITS"
-	EnvIntentDeferLimit     = "ACD_INTENT_DEFER_LIMIT"
-	EnvIntentRetryOnInvalid = "ACD_INTENT_RETRY_ON_INVALID"
+	EnvProvider       = "ACD_AI_PROVIDER"
+	EnvBaseURL        = "ACD_AI_BASE_URL"
+	EnvAPIKey         = "ACD_AI_API_KEY"
+	EnvModel          = "ACD_AI_MODEL"
+	EnvTimeout        = "ACD_AI_TIMEOUT"
+	EnvCAFile         = "ACD_AI_CA_FILE"
+	EnvDiffEgress     = "ACD_AI_DIFF_EGRESS"
+	EnvCommitStrategy = "ACD_COMMIT_STRATEGY"
+	EnvCommitFormat   = "ACD_COMMIT_FORMAT"
 )
 
 // DefaultProviderTimeout is the per-request timeout applied to the
 // OpenAI-compat HTTP provider when ACD_AI_TIMEOUT is unset or invalid.
 const DefaultProviderTimeout = 5 * time.Minute
 
-const (
-	DefaultIntentWindow        = 10
-	DefaultIntentMinPending    = 10
-	DefaultIntentSettleWindow  = 10 * time.Second
-	DefaultIntentMaxPendingAge = 5 * time.Minute
-	DefaultIntentRecentCommits = 5
-	// DefaultIntentRetryOnInvalid caps correction retries after typed
-	// planner validation errors. The first planner call is not counted as
-	// a retry, so the default allows up to three total planner attempts:
-	// initial attempt plus two correction attempts with RetryCorrection.
-	DefaultIntentRetryOnInvalid = 2
-	// DefaultIntentDeferLimit was 2 prior to the Wave 2 planner-atomicity
-	// epic. The retry loop in composed.PlanIntent (typed validation errors
-	// can trigger correction re-prompts) plus the rejects-log forensic surface mean
-	// an event that has already been deferred once is overwhelmingly
-	// likely to be planner churn rather than a legitimate "wait for
-	// related work" decision. Lowering the default to 1 forces the
-	// daemon's forced-aging singleton path sooner so deferred work lands
-	// promptly. Operators who want the historical behaviour can still set
-	// ACD_INTENT_DEFER_LIMIT=2 (or higher) explicitly; the env override
-	// is unchanged.
-	DefaultIntentDeferLimit = 1
-)
-
 // CommitStrategy selects how an explicit finish plans its commits.
 type CommitStrategy string
 
 const (
-	CommitStrategyLocal CommitStrategy = "local"
-	// CommitStrategyEvent is retained for legacy records until cutover readers migrate.
-	CommitStrategyEvent  CommitStrategy = "event"
+	CommitStrategyLocal  CommitStrategy = "local"
 	CommitStrategyIntent CommitStrategy = "intent"
 )
 
@@ -105,22 +51,18 @@ const (
 	CommitFormatConventional CommitFormat = "conventional"
 )
 
-// ProviderConfig captures the env-driven configuration for the replay
-// provider chain. Mode is the user-facing selector; the remaining fields
-// are consumed by the OpenAI-compat provider (or ignored when irrelevant).
+// ProviderConfig contains the connection and privacy settings for explicit requests.
 type ProviderConfig struct {
 	// Mode is one of "deterministic", "openai-compat", or
 	// "subprocess:<name>". An empty Mode is treated as "deterministic".
-	// Unknown values fall back to "deterministic" with a warning log.
+	// Unknown values are rejected. Local mode never constructs a transport.
 	Mode string
 
 	// BaseURL is the OpenAI-compatible chat-completions root. Empty
 	// resolves to DefaultOpenAIBaseURL.
 	BaseURL string
 
-	// APIKey is the bearer token for the OpenAI-compat provider. Empty
-	// when ACD_AI_PROVIDER=openai-compat causes a warn-and-degrade to
-	// deterministic.
+	// APIKey is required for OpenAI-compatible requests.
 	APIKey string
 
 	// Model is the OpenAI-compat model name. Empty resolves to
@@ -148,31 +90,7 @@ type ProviderConfig struct {
 	// is imperative, preserving the existing ACD message contract.
 	CommitFormat CommitFormat
 
-	// IntentWindow caps how many pending events the intent planner may
-	// consider at once.
-	IntentWindow int
-
-	// IntentMinPending is the preferred pending-count gate before a normal
-	// intent planning pass starts.
-	IntentMinPending int
-
-	// IntentSettleWindow is the extra burst-settle delay after the pending
-	// queue reaches IntentMinPending. Zero disables the settle gate.
-	IntentSettleWindow time.Duration
-
-	// IntentMaxPendingAge is the bounded wait escape hatch for sparse
-	// pending queues that have not reached IntentMinPending.
-	IntentMaxPendingAge time.Duration
-
-	// IntentRecentCommits caps recent commit context supplied to intent
-	// planning.
-	IntentRecentCommits int
-
-	// IntentDeferLimit caps how many times an event may be deferred before
-	// the planner must surface it as overdue.
-	IntentDeferLimit int
-
-	// Logger receives warning logs from BuildProvider's degraded paths.
+	// Logger receives subprocess lifecycle diagnostics.
 	// Nil falls back to slog.Default().
 	Logger *slog.Logger
 
@@ -192,7 +110,6 @@ const (
 	ConfirmationSubprocessExecution         ConfirmationRequirement = "subprocess_execution"
 	ConfirmationDiffEgress                  ConfirmationRequirement = "diff_egress"
 	ConfirmationVerificationCommand         ConfirmationRequirement = "verification_command"
-	ConfirmationIntentRepair                ConfirmationRequirement = "intent_repair"
 )
 
 // ProviderValidation is the non-secret result of validating provider
@@ -209,20 +126,14 @@ type ProviderValidation struct {
 // on Linux.
 func LoadProviderConfigFromEnv() ProviderConfig {
 	cfg := ProviderConfig{
-		Mode:                normalizeMode(os.Getenv(EnvProvider)),
-		BaseURL:             strings.TrimSpace(os.Getenv(EnvBaseURL)),
-		APIKey:              strings.TrimSpace(os.Getenv(EnvAPIKey)),
-		Model:               strings.TrimSpace(os.Getenv(EnvModel)),
-		CAFile:              strings.TrimSpace(os.Getenv(EnvCAFile)),
-		DiffEgress:          envTruthy(os.Getenv(EnvDiffEgress)),
-		CommitStrategy:      normalizeCommitStrategy(os.Getenv(EnvCommitStrategy)),
-		CommitFormat:        normalizeCommitFormat(os.Getenv(EnvCommitFormat)),
-		IntentWindow:        parsePositiveIntEnv(EnvIntentWindow, DefaultIntentWindow),
-		IntentMinPending:    parsePositiveIntEnv(EnvIntentMinPending, DefaultIntentMinPending),
-		IntentSettleWindow:  parseNonNegativeDurationEnv(EnvIntentSettleWindow, DefaultIntentSettleWindow),
-		IntentMaxPendingAge: parsePositiveDurationEnv(EnvIntentMaxPendingAge, DefaultIntentMaxPendingAge),
-		IntentRecentCommits: parsePositiveIntEnv(EnvIntentRecentCommits, DefaultIntentRecentCommits),
-		IntentDeferLimit:    parseNonNegativeIntEnv(EnvIntentDeferLimit, DefaultIntentDeferLimit),
+		Mode:           normalizeMode(os.Getenv(EnvProvider)),
+		BaseURL:        strings.TrimSpace(os.Getenv(EnvBaseURL)),
+		APIKey:         strings.TrimSpace(os.Getenv(EnvAPIKey)),
+		Model:          strings.TrimSpace(os.Getenv(EnvModel)),
+		CAFile:         strings.TrimSpace(os.Getenv(EnvCAFile)),
+		DiffEgress:     envTruthy(os.Getenv(EnvDiffEgress)),
+		CommitStrategy: normalizeCommitStrategy(os.Getenv(EnvCommitStrategy)),
+		CommitFormat:   normalizeCommitFormat(os.Getenv(EnvCommitFormat)),
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultOpenAIBaseURL
@@ -272,57 +183,6 @@ func normalizeCommitStrategy(raw string) CommitStrategy {
 	}
 }
 
-func parsePositiveIntEnv(name string, fallback int) int {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		return fallback
-	}
-	return n
-}
-
-func parseNonNegativeIntEnv(name string, fallback int) int {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return fallback
-	}
-	return n
-}
-
-func parsePositiveDurationEnv(name string, fallback time.Duration) time.Duration {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return fallback
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		return fallback
-	}
-	return d
-}
-
-func parseNonNegativeDurationEnv(name string, fallback time.Duration) time.Duration {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return fallback
-	}
-	if raw == "0" {
-		return 0
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d < 0 {
-		return fallback
-	}
-	return d
-}
-
 // normalizeMode trims whitespace, lowercases the prefix (the part before
 // any colon), and preserves the rest of the string (e.g. the subprocess
 // plugin name) verbatim. An empty string remains empty so callers can
@@ -338,36 +198,10 @@ func normalizeMode(raw string) string {
 	return strings.ToLower(raw)
 }
 
-// BuildProvider builds the selected runtime provider and preserves that choice
-// through failures. Only an unset or explicitly deterministic mode is local.
-func BuildProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
-	cfg.Mode = normalizeMode(cfg.Mode)
-	det := DeterministicProvider{CommitFormat: cfg.CommitFormat}
-	switch {
-	case cfg.Mode == "" || cfg.Mode == "deterministic":
-		return det, nil, nil
-	case cfg.Mode == "openai-compat":
-		if strings.TrimSpace(cfg.APIKey) == "" {
-			return nil, nil, &ProviderConfigurationError{Err: errors.New("openai-compat: missing API key")}
-		}
-	case strings.HasPrefix(cfg.Mode, "subprocess:"):
-		if strings.TrimSpace(strings.TrimPrefix(cfg.Mode, "subprocess:")) == "" {
-			return nil, nil, &ProviderConfigurationError{Err: errors.New("subprocess: missing plugin name")}
-		}
-	default:
-		return nil, nil, &ProviderConfigurationError{Err: fmt.Errorf("unrecognized provider %q", cfg.Mode)}
-	}
-	primary, closer, err := buildPrimaryProvider(cfg)
-	if err != nil {
-		return nil, nil, &ProviderConfigurationError{Err: err}
-	}
-	return Compose(primary, det), closer, nil
-}
-
-// BuildStrictProvider validates the selected connection, including subprocess
+// buildFinishTransport validates the selected connection, including subprocess
 // availability, and returns the primary provider without planning retries.
 // Callers own and must close closer.
-func BuildStrictProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
+func buildFinishTransport(cfg ProviderConfig) (FinishTransport, io.Closer, error) {
 	mode := normalizeMode(cfg.Mode)
 	if mode == "" {
 		mode = "deterministic"
@@ -376,7 +210,7 @@ func BuildStrictProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 	if _, err := ValidateProviderConfig(cfg); err != nil {
 		return nil, nil, err
 	}
-	primary, closer, err := buildPrimaryProvider(cfg)
+	primary, closer, err := buildPrimaryFinishTransport(cfg)
 	if err != nil {
 		return nil, nil, sanitizeProviderError(err)
 	}
@@ -394,6 +228,9 @@ func ValidateProviderConfig(cfg ProviderConfig) (ProviderValidation, error) {
 	mode := normalizeMode(cfg.Mode)
 	if mode == "" {
 		mode = "deterministic"
+	}
+	if cfg.CommitStrategy == CommitStrategyIntent && mode == "deterministic" {
+		return ProviderValidation{}, errors.New("ai: Intent requires an AI provider; choose local mode or configure an approved OpenAI-compatible or subprocess provider")
 	}
 	validation := ProviderValidation{}
 	switch {
@@ -433,10 +270,10 @@ func ValidateProviderConfig(cfg ProviderConfig) (ProviderValidation, error) {
 	return validation, nil
 }
 
-func buildPrimaryProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
+func buildPrimaryFinishTransport(cfg ProviderConfig) (FinishTransport, io.Closer, error) {
 	mode := normalizeMode(cfg.Mode)
 	if mode == "" || mode == "deterministic" {
-		return DeterministicProvider{CommitFormat: cfg.CommitFormat}, nil, nil
+		return nil, nil, errors.New("ai: explicit provider request requires a configured transport")
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -452,7 +289,7 @@ func buildPrimaryProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 			return nil, nil, err
 		}
 		primary := &OpenAIProvider{BaseURL: baseURL, APIKey: cfg.APIKey,
-			Model: cfg.Model, HTTP: httpClient, Format: cfg.CommitFormat}
+			Model: cfg.Model, HTTP: httpClient}
 		if strings.TrimSpace(cfg.CAFile) != "" {
 			return primary, httpIdleConnectionCloser{client: httpClient}, nil
 		}
@@ -461,7 +298,7 @@ func buildPrimaryProvider(cfg ProviderConfig) (Provider, io.Closer, error) {
 	if strings.HasPrefix(mode, "subprocess:") {
 		name := strings.TrimPrefix(mode, "subprocess:")
 		sp := NewSubprocessProvider(name, SubprocessOptions{
-			Timeout: cfg.Timeout, Logger: logger, CommitFormat: cfg.CommitFormat,
+			Timeout: cfg.Timeout, Logger: logger,
 			LookPath: cfg.subprocessLookPath, Stderr: cfg.subprocessStderr,
 		})
 		return sp, sp, nil
@@ -503,11 +340,6 @@ func sanitizeProviderError(err error) error {
 	}
 	return errors.New(SanitizePlannerError(err.Error()))
 }
-
-// errProviderUnused is reserved so future BuildProvider expansion (e.g. a
-// hard-fail mode) can surface a typed error without changing the
-// signature. Currently unused.
-var errProviderUnused = errors.New("ai: provider configuration error") //nolint:unused
 
 func openAIHTTPClient(timeout time.Duration, caFile string) (*http.Client, error) {
 	client := defaultOpenAIClient()

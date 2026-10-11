@@ -2,6 +2,7 @@ package central
 
 import (
 	"context"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 	"path/filepath"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func TestReconcileMissingReposDisablesUnresolvedRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+	if _, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{
 		BranchRef: "refs/heads/main", BranchGeneration: 1,
 		BaseHead: "base", Operation: "create", Path: "protected.txt",
 		Fidelity: "exact",

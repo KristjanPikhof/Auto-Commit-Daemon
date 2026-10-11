@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -87,7 +86,7 @@ func runIntegrationEvent(ctx context.Context, in io.Reader, event integrationEve
 	return runIntegrationEventWithSender(ctx, in, event, sendInternalHint)
 }
 
-type integrationHintSender func(context.Context, string, string, bool, string, string, string, int) error
+type integrationHintSender func(context.Context, string) error
 
 func runIntegrationEventWithSender(ctx context.Context, in io.Reader, event integrationEvent, send integrationHintSender) error {
 	if _, ok := supportedIntegrationHarnesses[event.Harness]; !ok {
@@ -103,9 +102,9 @@ func runIntegrationEventWithSender(ctx context.Context, in io.Reader, event inte
 		return nil
 	}
 
-	kind, sessionAction := integrationEventProtocol(normalized.Kind)
-	err = send(ctx, normalized.Repo, kind, false, sessionAction,
-		normalized.SessionID, normalized.Harness, normalized.WatchPID)
+	// Hooks report file activity. Session endings never select a publication
+	// target, and session/prompt identities are unnecessary for protection.
+	err = send(ctx, normalized.Repo)
 	if err != nil {
 		logIntegrationSessionOpenFailure(normalized, err)
 	}
@@ -118,48 +117,21 @@ func normalizeIntegrationEvent(in io.Reader, event integrationEvent) (integratio
 	event.Repo = strings.TrimSpace(event.Repo)
 	event.SessionID = strings.TrimSpace(event.SessionID)
 
-	needsPayload := event.SessionID == "" ||
-		(event.Repo == "" && (event.Harness == "codex" || event.Harness == "cursor"))
-	if needsPayload && (event.Harness == "claude-code" || event.Harness == "codex" || event.Harness == "cursor") {
+	if event.Repo == "" && (event.Harness == "codex" || event.Harness == "cursor") {
 		payload, err := decodeHookStdinPayload(in, "acd internal integration event")
 		if err != nil {
 			return event, err
 		}
 		if event.Harness == "cursor" {
-			if event.SessionID == "" {
-				event.SessionID, err = hookJSONRequiredScalar(payload, "conversation_id", "acd internal integration event")
-				if err != nil {
-					return event, err
-				}
-			}
-			if event.Repo == "" {
-				event.Repo, err = resolveCursorIntegrationRepo(payload)
-				if err != nil {
-					return event, err
-				}
-			}
+			event.Repo, err = resolveCursorIntegrationRepo(payload)
 		} else {
-			if event.SessionID == "" {
-				event.SessionID, err = hookJSONRequiredScalar(payload, "session_id", "acd internal integration event")
-				if err != nil {
-					return event, err
-				}
-			}
-			if event.Harness == "codex" && event.Repo == "" {
-				event.Repo, err = hookJSONOptionalScalar(payload, "cwd", "acd internal integration event")
-				if err != nil {
-					return event, err
-				}
-			}
+			event.Repo, err = integrationPayloadRepo(payload)
+		}
+		if err != nil {
+			return event, err
 		}
 	}
 
-	if event.SessionID == "" && event.Harness == "pi" && event.WatchPID > 0 {
-		event.SessionID = "pi-" + strconv.Itoa(event.WatchPID)
-	}
-	if event.SessionID == "" {
-		return event, errors.New("acd internal integration event: session identity is required")
-	}
 	if event.Repo == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -168,6 +140,18 @@ func normalizeIntegrationEvent(in io.Reader, event integrationEvent) (integratio
 		event.Repo = cwd
 	}
 	return event, nil
+}
+
+func integrationPayloadRepo(payload map[string]any) (string, error) {
+	value, present := payload["cwd"]
+	if !present || value == nil {
+		return "", nil
+	}
+	repo, ok := value.(string)
+	if !ok {
+		return "", errors.New("acd internal integration event: cwd must be a string")
+	}
+	return validateHookEmitScalar("cwd", repo, "acd internal integration event")
 }
 
 func resolveCursorIntegrationRepo(payload map[string]any) (string, error) {
@@ -187,7 +171,7 @@ func resolveCursorIntegrationRepo(payload map[string]any) (string, error) {
 			}
 		}
 	}
-	if cwd, err := hookJSONOptionalScalar(payload, "cwd", "acd internal integration event"); err != nil {
+	if cwd, err := integrationPayloadRepo(payload); err != nil {
 		return "", err
 	} else if cwd != "" {
 		return canonicalHookPath(cwd), nil
@@ -197,21 +181,6 @@ func resolveCursorIntegrationRepo(payload map[string]any) (string, error) {
 		return "", fmt.Errorf("acd internal integration event: get working directory: %w", err)
 	}
 	return canonicalHookPath(wd), nil
-}
-
-func integrationEventProtocol(event string) (kind, sessionAction string) {
-	switch event {
-	case "session_open", "activity":
-		return "wake", "open"
-	case "soft_boundary":
-		return "soft_boundary", ""
-	case "logical_boundary":
-		return "logical_boundary", ""
-	case "session_close":
-		return "wake", "close"
-	default:
-		return "", ""
-	}
 }
 
 func evaluateIntegrationRepo(ctx context.Context, repo string) integrationRepoDecision {

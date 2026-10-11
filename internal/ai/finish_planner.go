@@ -17,8 +17,12 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-// FinishTransport encodes the complete wire request before the caller spends a
-// planning call. ExchangeFinish performs exactly one exchange, without retry.
+const FinishDiffByteCap = 128 << 10
+const FinishEvidenceDiffByteCap = 512 << 10
+const FinishRequestByteCap = 512 << 10
+
+// FinishTransport encodes the complete request before a planning call is spent.
+// ExchangeFinish performs exactly one exchange, without retry.
 type FinishTransport interface {
 	Name() string
 	EncodeFinishRequest(FinishPlanRequest) ([]byte, error)
@@ -41,13 +45,14 @@ type FinishCorrection struct {
 }
 
 type FinishPlanRequest struct {
-	Style        string            `json:"style"`
-	Purpose      string            `json:"purpose,omitempty"`
-	Message      string            `json:"message,omitempty"`
-	Changes      []finish.Change   `json:"changes"`
-	Diffs        []FinishDiff      `json:"diffs,omitempty"`
-	DiffIncluded bool              `json:"diff_included"`
-	Correction   *FinishCorrection `json:"correction,omitempty"`
+	Style          string                 `json:"style"`
+	Purpose        string                 `json:"purpose,omitempty"`
+	Message        string                 `json:"message,omitempty"`
+	Changes        []finish.Change        `json:"changes"`
+	Diffs          []FinishDiff           `json:"diffs,omitempty"`
+	DiffIncluded   bool                   `json:"diff_included"`
+	Correction     *FinishCorrection      `json:"correction,omitempty"`
+	HistoryCommits []HistoryMessageCommit `json:"history_commits,omitempty"`
 }
 
 type FinishOptions struct {
@@ -118,18 +123,11 @@ func BuildFinishTransport(cfg ProviderConfig, approved []ConfirmationRequirement
 			return nil, nil, finishFailure("provider_approval_required", fmt.Errorf("missing explicit approval: %s", required))
 		}
 	}
-	provider, closer, err := BuildStrictProvider(cfg)
+	provider, closer, err := buildFinishTransport(cfg)
 	if err != nil {
 		return nil, nil, finishFailure("provider_configuration", err)
 	}
-	transport, ok := provider.(FinishTransport)
-	if !ok {
-		if closer != nil {
-			_ = closer.Close()
-		}
-		return nil, nil, finishFailure("provider_configuration", errors.New("configured provider does not support finish planning"))
-	}
-	return transport, closer, nil
+	return provider, closer, nil
 }
 
 // PlanFinish plans completed purposes and their messages in one exchange, with
@@ -183,8 +181,8 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		if err != nil {
 			return result, finishFailure("provider_input", err)
 		}
-		if len(body) > HistoryRewriteRequestByteCap {
-			return result, finishInputLimit(len(body), HistoryRewriteRequestByteCap)
+		if len(body) > FinishRequestByteCap {
+			return result, finishInputLimit(len(body), FinishRequestByteCap)
 		}
 		if err := ctx.Err(); err != nil {
 			return result, finishFailure("provider_deadline", err)
@@ -274,12 +272,12 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 		if !options.DiffEgress {
 			diff.Text = ""
 		}
-		if len(diff.Text) > IntentStageDiffCap {
-			return request, disclosure, finishInputLimit(len(diff.Text), IntentStageDiffCap)
+		if len(diff.Text) > FinishDiffByteCap {
+			return request, disclosure, finishInputLimit(len(diff.Text), FinishDiffByteCap)
 		}
 		total += len(diff.Text)
-		if total > IntentGoalEvidenceTotalDiffCap {
-			return request, disclosure, finishInputLimit(total, IntentGoalEvidenceTotalDiffCap)
+		if total > FinishEvidenceDiffByteCap {
+			return request, disclosure, finishInputLimit(total, FinishEvidenceDiffByteCap)
 		}
 		if diff.Text != "" {
 			redacted := finishRedactText(diff.Text)
@@ -287,12 +285,12 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 			diff.Text = redacted
 			disclosure.TextChangeIDs = append(disclosure.TextChangeIDs, diff.ChangeID)
 		}
-		if len(diff.Text) > IntentStageDiffCap {
-			return request, disclosure, finishInputLimit(len(diff.Text), IntentStageDiffCap)
+		if len(diff.Text) > FinishDiffByteCap {
+			return request, disclosure, finishInputLimit(len(diff.Text), FinishDiffByteCap)
 		}
 		transmittedTotal += len(diff.Text)
-		if transmittedTotal > IntentGoalEvidenceTotalDiffCap {
-			return request, disclosure, finishInputLimit(transmittedTotal, IntentGoalEvidenceTotalDiffCap)
+		if transmittedTotal > FinishEvidenceDiffByteCap {
+			return request, disclosure, finishInputLimit(transmittedTotal, FinishEvidenceDiffByteCap)
 		}
 		request.Diffs = append(request.Diffs, diff)
 	}

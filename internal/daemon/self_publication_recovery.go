@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+// SelfPublicationRecoveryOptions bounds legacy journal inspection. It never publishes new work.
+type SelfPublicationRecoveryOptions struct{ Limit int }
 
 const (
 	selfPublicationRecoveryLimit       = 50
@@ -53,7 +57,7 @@ func RecoverSelfPublications(
 	repoRoot string,
 	db *state.DB,
 	cctx CaptureContext,
-	opts ReplayOpts,
+	opts SelfPublicationRecoveryOptions,
 ) (SelfPublicationRecoverySummary, error) {
 	var summary SelfPublicationRecoverySummary
 	if ctx == nil {
@@ -164,7 +168,7 @@ func RecoverSelfPublicationsBeforePlanning(ctx context.Context, repoRoot string,
 	for {
 		summary, err := RecoverSelfPublications(ctx, repoRoot, db, CaptureContext{
 			BranchRef: branchRef, BranchGeneration: generation, BaseHead: baseHead,
-		}, ReplayOpts{Limit: 50})
+		}, SelfPublicationRecoveryOptions{Limit: 50})
 		if err != nil {
 			return err
 		}
@@ -359,6 +363,10 @@ func recoverSelfPublication(
 		if sourceMatches {
 			changed := false
 			abandon := func() error {
+				current, exists, refErr := resolveSelfPublicationRef(ctx, repoRoot, publication.BranchRef)
+				if refErr != nil || (publication.SourceHead == "" && exists) || (publication.SourceHead != "" && (!exists || current != publication.SourceHead)) {
+					return ambiguousSelfPublication(publication, "literal branch changed before abandonment", refErr)
+				}
 				var abandonErr error
 				changed, abandonErr = state.AbandonSelfPublication(
 					ctx, db, publication,
@@ -434,6 +442,10 @@ func recoverSelfPublication(
 		ctx, repoRoot, publication.BranchRef,
 		publication.TargetCommitOID,
 		func() error {
+			current, exists, refErr := resolveSelfPublicationRef(ctx, repoRoot, publication.BranchRef)
+			if refErr != nil || !exists || current != publication.TargetCommitOID {
+				return ambiguousSelfPublication(publication, "literal branch changed before completion", refErr)
+			}
 			var completeErr error
 			completed, completeErr = state.CompleteSelfPublication(
 				ctx, db, publication, completion)
@@ -709,3 +721,5 @@ func sanitizeSelfPublicationRecoveryIdentity(value string, limit int) string {
 	}
 	return value
 }
+
+func selfPublicationNow() float64 { return float64(time.Now().UnixNano()) / 1e9 }

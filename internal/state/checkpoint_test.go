@@ -18,6 +18,9 @@ func TestCheckpointPrepareCompleteAndReadOnlyProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.SQL().ExecContext(ctx, LegacySchemaDDL); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := db.SQL().ExecContext(ctx, `
 INSERT INTO capture_events(

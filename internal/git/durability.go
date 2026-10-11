@@ -264,41 +264,83 @@ func EnsurePrivateRefDurable(ctx context.Context, repoDir, prefix, ref, commitOI
 	if err := verifyObjectType(ctx, repoDir, commitOID, "commit"); err != nil {
 		return false, err
 	}
-	existing, err := RevParse(ctx, repoDir, ref)
+	if err := requireDirectPrivateRef(ctx, repoDir, ref); err != nil {
+		return false, err
+	}
+	_, err = RevParse(ctx, repoDir, ref)
 	if err == nil {
-		if existing == commitOID {
-			return false, nil
-		}
-		return false, fmt.Errorf("%w: %s points at %s, want %s",
-			ErrCheckpointRefCollision, ref, existing, commitOID)
+		return false, WithLockedPrivateRef(ctx, repoDir, ref, commitOID, func(context.Context) error { return nil })
 	}
 	if !errors.Is(err, ErrRefNotFound) {
-		return false, fmt.Errorf("git: resolve checkpoint ref: %w", err)
+		return false, fmt.Errorf("git: resolve private ref: %w", err)
 	}
 	zeroOID, err := repositoryZeroOID(ctx, repoDir)
 	if err != nil {
 		return false, err
 	}
-	if _, err := runDurable(ctx, repoDir, nil, "reference", "update-ref", "--no-deref", ref, commitOID, zeroOID); err != nil {
-		existing, readErr := RevParse(ctx, repoDir, ref)
-		if readErr == nil && existing == commitOID {
-			return false, nil
+	// A prepared native transaction holds the literal ref lock before the
+	// direct-ref check. Even a same-OID symbolic alias introduced after the
+	// initial read must be rejected before the create-only CAS commits.
+	err = withLockedExpectedRefTimeout(ctx, repoDir, ref, zeroOID, "", "", false,
+		DefaultWriteTimeout, func(lockedCtx context.Context) error {
+			return requireDirectPrivateRef(lockedCtx, repoDir, ref)
+		}, commitOID)
+	if err != nil {
+		if directErr := requireDirectPrivateRef(ctx, repoDir, ref); directErr != nil {
+			return false, directErr
 		}
+		_, readErr := RevParse(ctx, repoDir, ref)
 		if readErr == nil {
-			return false, fmt.Errorf("%w: %s raced to %s, want %s",
-				ErrCheckpointRefCollision, ref, existing, commitOID)
+			return false, WithLockedPrivateRef(ctx, repoDir, ref, commitOID, func(context.Context) error { return nil })
 		}
-		return false, fmt.Errorf("git: create checkpoint ref: %w", err)
+		return false, fmt.Errorf("git: create private ref: %w", err)
+	}
+	if err := WithLockedPrivateRef(ctx, repoDir, ref, commitOID, func(context.Context) error { return nil }); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// WithLockedPrivateRef proves a direct pin at the exact OID while fn updates
+// another store. Native --no-deref verification alone accepts same-OID symbolic
+// refs, so direct identity is checked again while Git owns the literal ref lock.
+func WithLockedPrivateRef(ctx context.Context, repoDir, ref, expectedOID string, fn func(context.Context) error) error {
+	if fn == nil {
+		return errors.New("git: private pin verification requires a callback")
+	}
+	if err := requireDirectPrivateRef(ctx, repoDir, ref); err != nil {
+		return err
 	}
 	observed, err := RevParse(ctx, repoDir, ref)
 	if err != nil {
-		return false, fmt.Errorf("git: reread checkpoint ref: %w", err)
+		return err
 	}
-	if observed != commitOID {
-		return false, fmt.Errorf("%w: %s reread as %s, want %s",
-			ErrCheckpointRefCollision, ref, observed, commitOID)
+	if observed != expectedOID {
+		return fmt.Errorf("%w: %s points at %s, want %s", ErrCheckpointRefCollision, ref, observed, expectedOID)
 	}
-	return true, nil
+	return withLockedExpectedRef(ctx, repoDir, ref, expectedOID, "", "", false,
+		func(lockedCtx context.Context) error {
+			if err := requireDirectPrivateRef(lockedCtx, repoDir, ref); err != nil {
+				return err
+			}
+			return fn(lockedCtx)
+		})
+}
+
+func requireDirectPrivateRef(ctx context.Context, repoDir, ref string) error {
+	if !isValidFullRef(ref) {
+		return fmt.Errorf("git: invalid private ref %q", ref)
+	}
+	_, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout},
+		"symbolic-ref", "--quiet", "--no-recurse", ref)
+	if err == nil {
+		return fmt.Errorf("%w: %s is symbolic", ErrCheckpointRefCollision, ref)
+	}
+	var commandErr *Error
+	if errors.As(err, &commandErr) && commandErr.ExitCode == 1 {
+		return nil
+	}
+	return fmt.Errorf("git: inspect direct private ref: %w", err)
 }
 
 func repositoryZeroOID(ctx context.Context, repoDir string) (string, error) {

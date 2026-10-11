@@ -17,6 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 const fixCheckpointTestDigest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -104,7 +105,7 @@ func TestFix_ReconcilesResolvedPublicationDrain(t *testing.T) {
 		applied.RowsChanged != 1 || applied.BackupPath == "" {
 		t.Fatalf("resolved drain apply=%+v action=%+v", applied, action)
 	}
-	drain, err := state.PublicationDrainByID(ctx, db, drainID)
+	drain, err := readLegacyDrainFixture(ctx, db, drainID)
 	if err != nil || drain.Phase != state.PublicationDrainCompleted ||
 		drain.PublishedEventCount != 1 || drain.LastError != "" {
 		t.Fatalf("resolved drain after fix=%+v err=%v", drain, err)
@@ -154,7 +155,7 @@ func TestFix_StoppedProviderDrainOffersWholeChainRecovery(t *testing.T) {
 	if action == nil || !action.Applied || action.RecoveryRef == "" {
 		t.Fatalf("applied recovery=%+v", applied)
 	}
-	drain, err := state.PublicationDrainByID(ctx, db, drainID)
+	drain, err := readLegacyDrainFixture(ctx, db, drainID)
 	if err != nil || drain.Phase != state.PublicationDrainCompleted {
 		t.Fatalf("drain=%+v err=%v", drain, err)
 	}
@@ -186,7 +187,7 @@ func TestFix_DryRunToleratesPreV5DB(t *testing.T) {
 func TestFix_ApplyClearsExpiredPauseAndDrainedBackpressure(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	if err := state.MetaSet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt, time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)); err != nil {
+	if err := state.MetaSet(ctx, db, "capture.backpressure_paused_at", time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed backpressure: %v", err)
 	}
 	markerPath := filepath.Join(repo, ".git", "acd", "paused")
@@ -205,7 +206,7 @@ func TestFix_ApplyClearsExpiredPauseAndDrainedBackpressure(t *testing.T) {
 	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
 		t.Fatalf("manual pause marker still exists: %v", err)
 	}
-	if _, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt); err != nil || ok {
+	if _, ok, err := state.MetaGet(ctx, db, "capture.backpressure_paused_at"); err != nil || ok {
 		t.Fatalf("backpressure meta remains: ok=%v err=%v", ok, err)
 	}
 }
@@ -242,7 +243,7 @@ func TestClearPublishBarrierClearsReplayErrorMetadata(t *testing.T) {
 			t.Fatalf("seed replay metadata %s: %v", key, err)
 		}
 	}
-	if err := state.SavePublishState(ctx, db, state.Publish{
+	if err := seedLegacyPublishFixture(ctx, db, legacyPublishFixture{
 		Status: "blocked_conflict",
 		Error:  sql.NullString{String: "stale replay failure", Valid: true},
 	}); err != nil {
@@ -261,7 +262,7 @@ func TestClearPublishBarrierClearsReplayErrorMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	publish, ok, err := state.LoadPublishState(ctx, db)
+	publish, ok, err := readLegacyPublishFixture(ctx, db)
 	if err != nil || !ok || publish.Status != "ok" || publish.Error.Valid {
 		t.Fatalf("publish state=%+v ok=%v err=%v", publish, ok, err)
 	}
@@ -282,7 +283,7 @@ func TestClearPublishBarrierClearsReplayErrorMetadata(t *testing.T) {
 func TestFix_CommitFailureDoesNotReportTransactionalActionApplied(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	if err := state.MetaSet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt,
+	if err := state.MetaSet(ctx, db, "capture.backpressure_paused_at",
 		time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed backpressure: %v", err)
 	}
@@ -302,7 +303,7 @@ func TestFix_CommitFailureDoesNotReportTransactionalActionApplied(t *testing.T) 
 	if action == nil || action.Applied || action.RowsChanged != 0 || plan.RowsChanged != 0 {
 		t.Fatalf("rolled-back action reported applied: action=%+v plan=%+v", action, plan)
 	}
-	if _, ok, err := state.MetaGet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt); err != nil || !ok {
+	if _, ok, err := state.MetaGet(ctx, db, "capture.backpressure_paused_at"); err != nil || !ok {
 		t.Fatalf("rollback lost backpressure marker: ok=%v err=%v", ok, err)
 	}
 	if _, ok, err := state.MetaGet(ctx, db, "capture.backpressure_overridden_at"); err != nil || ok {
@@ -483,11 +484,11 @@ func TestFix_ForceArchivesWholePairWithoutPeelingBarrier(t *testing.T) {
 	}
 }
 
-func TestFix_ForceRecoversUnreconstructibleDrainAndRecaptures(t *testing.T) {
+func TestFinishRemovalLegacyDrainRecoveryPreservesLaterCheckpoint(t *testing.T) {
 	for _, reason := range []string{
 		"publication_drain_runtime_contract_unavailable",
 		"publication_drain_environment_runtime_changed",
-		daemon.PublicationDrainSemanticMessageUnavailableReason,
+		"publication_drain_semantic_message_unavailable",
 	} {
 		t.Run(reason, func(t *testing.T) {
 			ctx := context.Background()
@@ -574,11 +575,11 @@ INSERT INTO publication_drain_events(drain_id,ord,event_seq) VALUES(?,0,?)`,
 				t.Fatalf("pre-v25 dry-run schema=%d err=%v", version, err)
 			}
 
-			migrated, err := state.OpenRuntime(ctx, stateDB)
+			migrated, err := state.Open(ctx, stateDB)
 			if err != nil {
 				t.Fatalf("migrate v24 drain: %v", err)
 			}
-			legacy, err := state.PublicationDrainByID(ctx, migrated, drainID)
+			legacy, err := readLegacyDrainFixture(ctx, migrated, drainID)
 			if err != nil || legacy.CommitStrategy != "" ||
 				legacy.CommitFormat != "" || legacy.Provider != "" {
 				t.Fatalf("unproved migration contract=%+v err=%v", legacy, err)
@@ -591,7 +592,7 @@ SET commit_strategy='intent',commit_format='imperative',
 WHERE id=?`, drainID); err != nil {
 					t.Fatal(err)
 				}
-			} else if reason == daemon.PublicationDrainSemanticMessageUnavailableReason {
+			} else if reason == "publication_drain_semantic_message_unavailable" {
 				if _, err := migrated.SQL().ExecContext(ctx, `
 UPDATE publication_drains
 SET commit_strategy='intent',commit_format='imperative',
@@ -711,45 +712,20 @@ UPDATE publication_drains SET phase='needs_action',last_error=? WHERE id=?`,
 			}
 			defer live.Close()
 			assertFixEventState(t, ctx, live, seq, state.EventStateRecovered)
-			drain, err := state.PublicationDrainByID(ctx, live, drainID)
+			drain, err := readLegacyDrainFixture(ctx, live, drainID)
 			if err != nil || drain.Phase != state.PublicationDrainCompleted ||
 				drain.PublishedEventCount != 1 || drain.LastError != "" {
 				t.Fatalf("settled drain=%+v err=%v", drain, err)
 			}
-			barrier, err := daemon.PublicationDrainBarrierForPair(
-				ctx, live, "refs/heads/main", 1)
-			if err != nil || barrier != nil {
-				t.Fatalf("publication barrier after recovery=%+v err=%v", barrier, err)
+			active, err := state.ActivePublicationDrainsForPair(ctx, live, "refs/heads/main", 1)
+			if err != nil || len(active) != 0 {
+				t.Fatalf("active legacy drains after recovery: %+v err=%v", active, err)
 			}
-			if bootstrapped, err := daemon.IsShadowBootstrapped(
-				ctx, live, "refs/heads/main", 1); err != nil || bootstrapped {
-				t.Fatalf("shadow after archive=%t err=%v", bootstrapped, err)
+			assertLaterRecoveryCheckpoint(t, ctx, repo, live, head, legacyPath, "protected legacy work\n")
+			if got := snapshot(); got != beforeGit {
+				t.Fatalf("checkpoint changed HEAD/index/worktree: before=%+v after=%+v", beforeGit, got)
 			}
 
-			cctx := daemon.CaptureContext{
-				BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
-			}
-			if _, err := daemon.BootstrapShadow(ctx, repo, live, cctx); err != nil {
-				t.Fatal(err)
-			}
-			checker := git.NewIgnoreChecker(repo)
-			defer checker.Close()
-			if _, err := daemon.Capture(ctx, repo, live, cctx, daemon.CaptureOpts{
-				IgnoreChecker: checker, SensitiveMatcher: state.NewSensitiveMatcher(),
-			}); err != nil {
-				t.Fatalf("recapture dirty work: %v", err)
-			}
-			var recapturedSeq int64
-			if err := live.SQL().QueryRowContext(ctx, `
-SELECT seq FROM capture_events
-WHERE seq>? AND branch_ref='refs/heads/main' AND branch_generation=1
-  AND path=? AND state='pending'
-ORDER BY seq DESC LIMIT 1`, seq, legacyPath).Scan(&recapturedSeq); err != nil {
-				t.Fatalf("find recaptured legacy work: %v", err)
-			}
-			if recapturedSeq == seq {
-				t.Fatalf("legacy event was not recaptured: old=%d new=%d", seq, recapturedSeq)
-			}
 		})
 	}
 }
@@ -831,7 +807,7 @@ func TestFix_BackupIncludesWALOnlyCommittedRows(t *testing.T) {
 func TestFix_BackupPrecedesSchemaMigration(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
-	if err := state.MetaSet(ctx, db, daemon.MetaKeyCaptureBackpressurePausedAt,
+	if err := state.MetaSet(ctx, db, "capture.backpressure_paused_at",
 		time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed backpressure: %v", err)
 	}
@@ -1261,7 +1237,7 @@ func TestFix_RecoveredGeneratedDeleteKeepsCaptureOps(t *testing.T) {
 		BeforeOID:  sql.NullString{String: generatedOID, Valid: true},
 		BeforeMode: sql.NullString{String: git.RegularFileMode, Valid: true},
 	}})
-	if err := state.RecordPlannerOffer(ctx, db, generated, 123); err != nil {
+	if err := seedLegacyPlannerOffer(ctx, db, generated, 123); err != nil {
 		t.Fatalf("RecordPlannerOffer: %v", err)
 	}
 
@@ -1290,7 +1266,7 @@ func TestFix_ReconcilePreservesUnrelatedPublishBreadcrumb(t *testing.T) {
 		Operation: "create", Path: "other.txt", Fidelity: "exact", State: state.EventStatePublished,
 		CommitOID: sql.NullString{String: head, Valid: true},
 	}, []state.CaptureOp{{Op: "create", Path: "other.txt", Fidelity: "exact"}})
-	if err := state.SavePublishState(ctx, db, state.Publish{
+	if err := seedLegacyPublishFixture(ctx, db, legacyPublishFixture{
 		EventSeq:         sql.NullInt64{Int64: unrelated, Valid: true},
 		BranchRef:        sql.NullString{String: "refs/heads/other", Valid: true},
 		BranchGeneration: sql.NullInt64{Int64: 9, Valid: true},
@@ -1301,7 +1277,7 @@ func TestFix_ReconcilePreservesUnrelatedPublishBreadcrumb(t *testing.T) {
 	}
 
 	runFixJSON(t, repo, false, true, false, false)
-	publish, ok, err := state.LoadPublishState(ctx, db)
+	publish, ok, err := readLegacyPublishFixture(ctx, db)
 	if err != nil || !ok {
 		t.Fatalf("LoadPublishState: ok=%v err=%v", ok, err)
 	}
@@ -1600,7 +1576,7 @@ INSERT INTO capture_events(
 		CreatedTS: 3, UpdatedTS: 3, LastProgressTS: 3,
 		EventSeqs: []int64{seq},
 	}
-	if created, err := state.PreparePublicationDrain(ctx, db, drain); err != nil || !created {
+	if created, err := testutil.SeedLegacyDrain(ctx, db, drain); err != nil || !created {
 		t.Fatalf("prepare drain=(%t,%v)", created, err)
 	}
 	return drainID, checkpointID
@@ -1674,7 +1650,7 @@ func stageRecoverableBarrierPair(t *testing.T, ctx context.Context, repo string,
 
 func appendFixEvent(t *testing.T, ctx context.Context, db *state.DB, ev state.CaptureEvent, ops []state.CaptureOp) int64 {
 	t.Helper()
-	seq, err := state.AppendCaptureEvent(ctx, db, ev, ops)
+	seq, err := testutil.SeedLegacyCapture(ctx, db, ev, ops)
 	if err != nil {
 		t.Fatalf("AppendCaptureEvent(%s): %v", ev.Path, err)
 	}
@@ -1740,7 +1716,7 @@ func seedGeneratedPendingFixFixture(t *testing.T, ctx context.Context, repo stri
 			AfterOID:   sql.NullString{String: strings.Repeat("b", 40), Valid: op != "delete"},
 			AfterMode:  sql.NullString{String: git.RegularFileMode, Valid: op != "delete"},
 		}})
-		if err := state.RecordPlannerOffer(ctx, db, seq, 123); err != nil {
+		if err := seedLegacyPlannerOffer(ctx, db, seq, 123); err != nil {
 			t.Fatalf("RecordPlannerOffer(%d): %v", seq, err)
 		}
 		return seq

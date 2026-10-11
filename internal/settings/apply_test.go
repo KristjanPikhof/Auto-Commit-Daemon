@@ -2,15 +2,15 @@ package settings
 
 import (
 	"context"
-	"crypto/sha256"
+
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
+
 	"os"
 	"reflect"
 	"strings"
-	"sync/atomic"
+
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
@@ -31,11 +31,10 @@ func testedDraft(t *testing.T, svc *Service, draft map[string]string, confirmati
 	return validation, tested
 }
 
-func TestSettingsActionApplyStoppedQueuesWithoutStartOrWake(t *testing.T) {
-	var nudges atomic.Int32
+func TestFinishRemovalApplyStoppedWithoutStartOrWake(t *testing.T) {
 	svc, _ := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: "deterministic", Success: true}, nil
-	}, func(context.Context, state.DaemonState) error { nudges.Add(1); return nil })
+	})
 	draft := map[string]string{config.FieldModel: "pinned-model", config.FieldTimeout: "7s"}
 	validation, tested := testedDraft(t, svc, draft, nil)
 	result, err := svc.Apply(context.Background(), ApplyRequest{Values: draft,
@@ -43,15 +42,15 @@ func TestSettingsActionApplyStoppedQueuesWithoutStartOrWake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if !result.Queued || result.Signaled || nudges.Load() != 0 || result.RevisionID == 0 || result.RequestID == 0 {
-		t.Fatalf("stopped apply = %+v nudges=%d", result, nudges.Load())
+	if !result.Applied || result.RevisionID == 0 || result.RequestID == 0 {
+		t.Fatalf("stopped apply = %+v", result)
 	}
 	runtimeState, _ := state.RuntimeConfigActivationState(context.Background(), svc.db)
-	if runtimeState.DesiredRevisionID.Int64 != result.RevisionID || runtimeState.AppliedRevisionID.Valid {
-		t.Fatalf("queued state = %+v", runtimeState)
+	if runtimeState.DesiredRevisionID.Int64 != result.RevisionID || runtimeState.AppliedRevisionID.Int64 != result.RevisionID {
+		t.Fatalf("applied state = %+v", runtimeState)
 	}
 	var flushes int
-	if err := svc.db.SQL().QueryRow(`SELECT COUNT(*) FROM flush_requests`).Scan(&flushes); err != nil || flushes != 0 {
+	if err := svc.db.SQL().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='flush_requests'`).Scan(&flushes); err != nil || flushes != 0 {
 		t.Fatalf("settings apply enqueued wake work: count=%d err=%v", flushes, err)
 	}
 	rev, err := state.ConfigRevisionByID(context.Background(), svc.db, result.RevisionID)
@@ -69,24 +68,18 @@ func TestSettingsActionApplyStoppedQueuesWithoutStartOrWake(t *testing.T) {
 		t.Fatal("revision persisted restart-only field")
 	}
 	if got := string(payload[config.FieldTimeout]); got != `"7s"` {
-		t.Fatalf("intent.window JSON = %s", got)
+		t.Fatalf("timeout JSON = %s", got)
 	}
 	if got := string(payload["confirmations"]); got != `[]` {
 		t.Fatalf("confirmations JSON = %s", got)
 	}
 }
 
-func TestSettingsActionApplyRunningUsesNudgeWithoutFlush(t *testing.T) {
-	var nudges atomic.Int32
+func TestFinishRemovalApplyRunningWithoutWake(t *testing.T) {
 	svc, _ := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: "deterministic", Success: true}, nil
-	}, func(_ context.Context, st state.DaemonState) error {
-		if st.PID != os.Getpid() {
-			t.Fatalf("nudge PID=%d", st.PID)
-		}
-		nudges.Add(1)
-		return nil
-	})
+	},
+	)
 	if err := state.SaveDaemonState(context.Background(), svc.db, state.DaemonState{PID: os.Getpid(), Mode: "running"}); err != nil {
 		t.Fatal(err)
 	}
@@ -94,20 +87,20 @@ func TestSettingsActionApplyRunningUsesNudgeWithoutFlush(t *testing.T) {
 	validation, tested := testedDraft(t, svc, draft, nil)
 	result, err := svc.Apply(context.Background(), ApplyRequest{Values: draft,
 		TestedFingerprint: tested.Fingerprint, ExpectedGeneration: validation.SourceGeneration})
-	if err != nil || !result.Signaled || nudges.Load() != 1 {
-		t.Fatalf("running Apply = %+v err=%v nudges=%d", result, err, nudges.Load())
+	if err != nil || !result.Applied {
+		t.Fatalf("running Apply = %+v err=%v", result, err)
 	}
 	var flushes int
-	_ = svc.db.SQL().QueryRow(`SELECT COUNT(*) FROM flush_requests`).Scan(&flushes)
+	_ = svc.db.SQL().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='flush_requests'`).Scan(&flushes)
 	if flushes != 0 {
-		t.Fatalf("settings nudge created %d flushes", flushes)
+		t.Fatalf("settings apply created %d flushes", flushes)
 	}
 }
 
 func TestSettingsActionApplyRejectsStaleTestGenerationDesiredAndRestart(t *testing.T) {
 	svc, _ := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: "deterministic", Success: true}, nil
-	}, nil)
+	})
 	draft := map[string]string{config.FieldModel: "one"}
 	validation, tested := testedDraft(t, svc, draft, nil)
 	changed := map[string]string{config.FieldModel: "two"}
@@ -140,7 +133,7 @@ func TestSettingsActionApplyRejectsStaleTestGenerationDesiredAndRestart(t *testi
 func TestSettingsActionApplyRejectsConcurrentSavedGeneration(t *testing.T) {
 	svc, roots := testService(t, nil, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: "deterministic", Success: true}, nil
-	}, nil)
+	})
 	draft := map[string]string{config.FieldModel: "draft"}
 	validation, tested := testedDraft(t, svc, draft, nil)
 	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
@@ -170,7 +163,7 @@ func TestSettingsActionApplyRequiresTypedRiskConfirmations(t *testing.T) {
 	}
 	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
-	}, nil)
+	})
 	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://gateway.example/v1",
 		config.FieldModel: "model", config.FieldDiffEgress: "true"}
 	confirmed := []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationDiffEgress}
@@ -193,7 +186,7 @@ func TestSettingsIntentApplyRequiresCommandConsent(t *testing.T) {
 	}
 	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
 		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
-	}, nil)
+	})
 	draft := map[string]string{
 		config.FieldCommitStrategy:          "intent",
 		config.FieldProvider:                "openai-compat",
@@ -219,63 +212,8 @@ func TestSettingsIntentApplyRequiresCommandConsent(t *testing.T) {
 	}
 }
 
-func TestSettingsApplyQueuesFingerprintBoundSetupValidation(t *testing.T) {
-	lookup := func(name string) (string, bool) {
-		if name == ai.EnvAPIKey {
-			return "hidden", true
-		}
-		return "", false
-	}
-	svc, _ := testService(t, lookup, func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error) {
-		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
-	}, nil)
-	command := "go test ./... -run '^$'"
-	draft := map[string]string{
-		config.FieldCommitStrategy:          "intent",
-		config.FieldProvider:                "openai-compat",
-		config.FieldDiffEgress:              "true",
-		config.FieldIntentVerification:      "fast",
-		config.FieldVerificationFastCommand: command,
-	}
-	confirmed := []ai.ConfirmationRequirement{
-		ai.ConfirmationDiffEgress,
-		ai.ConfirmationVerificationCommand,
-	}
-	validation, tested := testedDraft(t, svc, draft, confirmed)
-	digest := sha256.Sum256([]byte(command))
-	result, err := svc.Apply(context.Background(), ApplyRequest{
-		Values: draft, TestedFingerprint: tested.Fingerprint,
-		ExpectedGeneration: validation.SourceGeneration,
-		Confirmations:      confirmed,
-		SetupValidation: &SetupValidation{
-			BranchRef:        "refs/heads/main",
-			BranchGeneration: 2,
-			ExpectedHead:     strings.Repeat("a", 40),
-			Mode:             "fast",
-			CommandSource:    "Go language default",
-			CommandDigest:    fmt.Sprintf("%x", digest),
-			ApprovalID:       tested.Fingerprint,
-		},
-	})
-	if err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-	if result.ValidationRunID == 0 ||
-		result.ValidationStatus != state.ConfigValidationQueued {
-		t.Fatalf("result=%+v", result)
-	}
-	run, err := state.ConfigValidationByID(
-		context.Background(), svc.db, result.ValidationRunID,
-	)
-	if err != nil || run.RevisionID != result.RevisionID ||
-		run.ActivationRequestID != result.RequestID ||
-		run.CommandDigest != fmt.Sprintf("%x", digest) {
-		t.Fatalf("validation=%+v err=%v", run, err)
-	}
-}
-
 func TestSettingsActionRevertCreatesNewKnownGoodRevision(t *testing.T) {
-	svc, _ := testService(t, nil, nil, nil)
+	svc, _ := testService(t, nil, nil)
 	ctx := context.Background()
 	baseline := insertRevision(t, svc, "baseline", 0)
 	req, ok, err := state.RequestConfigActivation(ctx, svc.db, baseline.ID, sql.NullInt64{})
@@ -288,7 +226,7 @@ func TestSettingsActionRevertCreatesNewKnownGoodRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.RevisionID == baseline.ID || !result.Queued || result.Signaled {
+	if result.RevisionID == baseline.ID || !result.Applied {
 		t.Fatalf("Revert = %+v", result)
 	}
 	reverted, _ := state.ConfigRevisionByID(ctx, svc.db, result.RevisionID)
@@ -298,15 +236,11 @@ func TestSettingsActionRevertCreatesNewKnownGoodRevision(t *testing.T) {
 }
 
 func TestSettingsActionGlobalSaveNeverSignalsOrFansOut(t *testing.T) {
-	var nudges atomic.Int32
-	svc, _ := testService(t, nil, nil, func(context.Context, state.DaemonState) error { nudges.Add(1); return nil })
+	svc, _ := testService(t, nil, nil)
 	value := "global"
 	if _, err := svc.Save(context.Background(), SaveRequest{Scope: ScopeGlobal,
 		Values: map[string]*string{config.FieldModel: &value}, ExpectedGeneration: 0}); err != nil {
 		t.Fatal(err)
-	}
-	if nudges.Load() != 0 {
-		t.Fatalf("global save nudged %d daemons", nudges.Load())
 	}
 	var revisions, requests int
 	_ = svc.db.SQL().QueryRow(`SELECT COUNT(*) FROM config_revisions`).Scan(&revisions)

@@ -12,8 +12,8 @@ func TestDocumentedConfigurationCommands(t *testing.T) {
 
 	commands := [][]string{
 		{"config", "get"},
-		{"config", "get", "commit.preset"},
-		{"config", "set", "commit.preset", "fast"},
+		{"config", "get", "commit.strategy"},
+		{"config", "set", "commit.strategy", "local"},
 		{"config", "set", "--scope", "global", "ai.provider", "deterministic"},
 	}
 	for _, args := range commands {

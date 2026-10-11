@@ -2,7 +2,7 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
+
 	"errors"
 	"fmt"
 	"io"
@@ -28,17 +28,15 @@ import (
 var runConfigEditorUI = settingsui.RunEditor
 
 func newConfigEditorCmd() *cobra.Command {
-	legacy := newConfigureCmd()
-	legacyRun := legacy.RunE
 	var scope string
 	cmd := &cobra.Command{
 		Use: "edit", Short: "Edit and save global or repository settings",
 		Long: `Open an editable settings menu. Choose Global defaults or This repository,
-change values, then Save changes to review, test, and apply them together.
+change values, then Save changes to review and apply them.
 
 Only edited fields are saved. Repository fields can return to inherited values.
-API keys are masked and saved in the protected credential store after testing.
-Global changes update enabled repositories that inherit them at a safe boundary.
+API keys are masked and saved in the protected credential store.
+Global changes apply to repositories that inherit them.
 Stopped repositories remain stopped. Restart-required fields are identified.
 
 Without flags, the editor starts at Global defaults. --repo selects a repository.
@@ -46,14 +44,6 @@ Without flags, the editor starts at Global defaults. --repo selects a repository
 		Example: "  acd config\n  acd config edit --scope global\n  acd config edit --repo .\n  acd config --accessible",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			for _, name := range []string{"replace", "inherit", "strategy", "preset", "wait", "credential-stdin", "dry-run"} {
-				if cmd.Flags().Changed(name) {
-					if scope != "" {
-						return invalidCommandError("acd config: --scope cannot be combined with legacy setup flags")
-					}
-					return legacyRun(cmd, nil)
-				}
-			}
 			accessible, _ := cmd.Flags().GetBool("accessible")
 			if scope != "" && scope != "global" && scope != "repo" {
 				return invalidCommandError("acd config: --scope must be global or repo")
@@ -88,11 +78,8 @@ Without flags, the editor starts at Global defaults. --repo selects a repository
 			return runConfigEditorUI(cmd.Context(), backend, settingsui.EditorOptions{Input: cmd.InOrStdin(), Output: cmd.OutOrStdout(), Scope: selected, Repo: repo, Accessible: useAccessible, NoColor: os.Getenv("NO_COLOR") != ""})
 		},
 	}
-	cmd.Flags().AddFlagSet(legacy.Flags())
+	cmd.Flags().Bool("accessible", false, "Use linear prompts suitable for screen readers")
 	cmd.Flags().StringVar(&scope, "scope", "", "Start at global or repo settings")
-	for _, name := range []string{"replace", "inherit", "strategy", "preset", "wait", "credential-stdin", "dry-run"} {
-		_ = cmd.Flags().MarkHidden(name)
-	}
 	return cmd
 }
 
@@ -101,7 +88,6 @@ type configEditor struct {
 	repo   string
 	lookup func(string) (string, bool)
 	probe  settings.ProbeFunc
-	nudge  settings.NudgeFunc
 }
 
 type editorProjection struct {
@@ -125,11 +111,12 @@ func (e *configEditor) projectDocument(doc *config.Document, scope string, chang
 	if scope == "repo" && e.repo == "" {
 		return editorProjection{}, errors.New("repository settings require a Git worktree")
 	}
-	input := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: e.lookup}
+	input := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: e.lookup, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"global"}, e.lookup)}
 	selected := maps.Clone(doc.Settings.Global)
 	if scope == "repo" {
 		repo := doc.Settings.Repositories[central.CanonicalID(e.repo)]
 		input.Profile = doc.Settings.Profiles[repo.Profile].Fields
+		input.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"repository:" + central.CanonicalID(e.repo), "profile:" + repo.Profile, "global"}, e.lookup)
 		selected = maps.Clone(repo.Fields)
 	}
 	if selected == nil {
@@ -161,14 +148,17 @@ func (e *configEditor) projectDocument(doc *config.Document, scope string, chang
 	inheritedInput := input
 	if scope == "repo" {
 		inheritedInput.Repository = nil
+		repo := doc.Settings.Repositories[central.CanonicalID(e.repo)]
+		inheritedInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"profile:" + repo.Profile, "global"}, e.lookup)
 	} else {
 		inheritedInput.Global = nil
+		inheritedInput.LegacyDefaults = nil
 	}
-	resolved, _, err := config.ResolveAll(input, selected)
+	resolved, err := config.ResolveAll(input)
 	if err != nil {
 		return editorProjection{}, err
 	}
-	inherited, _, err := config.ResolveAll(inheritedInput, nil)
+	inherited, err := config.ResolveAll(inheritedInput)
 	if err != nil {
 		return editorProjection{}, err
 	}
@@ -191,24 +181,27 @@ func (e *configEditor) Load(_ context.Context, scope string, changes map[string]
 	if err != nil {
 		return settingsui.EditorSnapshot{}, err
 	}
-	_, source, err := credentials.Resolve(credentials.NewStore(e.roots), e.lookup)
-	found := source != credentials.SourceNone
-	if err != nil {
-		return settingsui.EditorSnapshot{}, err
-	}
-	credential := "Not configured (select to enter)"
-	if found {
-		credential = "Configured (select to replace)"
-	}
-	if source == credentials.SourceEnvironment {
-		credential = "Provided by ACD_AI_API_KEY"
+	source := credentials.SourceNone
+	credential := "Not needed in Local mode"
+	if projection.values[config.FieldCommitStrategy] == "intent" && projection.values[config.FieldProvider] == "openai-compat" {
+		_, source, err = credentials.Resolve(credentials.NewStore(e.roots), e.lookup)
+		if err != nil {
+			return settingsui.EditorSnapshot{}, err
+		}
+		credential = "Not configured (select to enter)"
+		if source == credentials.SourceFile {
+			credential = "Configured (select to replace)"
+		}
+		if source == credentials.SourceEnvironment {
+			credential = "Provided by ACD_AI_API_KEY"
+		}
 	}
 	return settingsui.EditorSnapshot{Generation: projection.document.Generation, Fields: projection.fields, Credential: credential, CredentialFromEnvironment: source == credentials.SourceEnvironment}, nil
 }
 
 func (e *configEditor) options(repo, secret string) settings.Options {
 	lookup := e.lookup
-	return settings.Options{Roots: e.roots, RepoPath: repo, LookupEnv: lookup, Probe: e.probe, Nudge: e.nudge, CredentialLookup: func(name string) (string, bool) {
+	return settings.Options{Roots: e.roots, RepoPath: repo, LookupEnv: lookup, Probe: e.probe, CredentialLookup: func(name string) (string, bool) {
 		value, found := lookup(name)
 		if name == ai.EnvAPIKey && strings.TrimSpace(value) == "" && secret != "" {
 			return secret, true
@@ -307,10 +300,10 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 		fmt.Fprintln(&review, "  API key: replace in the protected store (shared by repositories)")
 	}
 	if len(keys) == 0 && draft.Credential == "" {
-		fmt.Fprintln(&review, "  Test and apply the saved settings.")
+		fmt.Fprintln(&review, "  Apply the saved settings.")
 	}
 	fmt.Fprintf(&review, "Connection: %s / %s / %s\n", safePreviewText(plan.values[config.FieldProvider], 100), safePreviewText(plan.values[config.FieldModel], 0), safeEndpointPreview(plan.values[config.FieldBaseURL]))
-	fmt.Fprintf(&review, "Commit mode: %s / %s; verification: %s\n", projection.values[config.FieldCommitStrategy], projection.values[config.FieldCommitPreset], projection.values[config.FieldIntentVerification])
+	fmt.Fprintf(&review, "Commit mode: %s / %s; verification: %s\n", projection.values[config.FieldCommitStrategy], projection.values[config.FieldCommitFormat], projection.values[config.FieldIntentVerification])
 	writeEditorPermissions(&review, validation)
 	if len(validation.RestartChanged) > 0 {
 		fmt.Fprintln(&review, "Restart required for:", strings.Join(validation.RestartChanged, ", "))
@@ -321,7 +314,7 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 			return editorPlan{}, err
 		}
 		plan.targets = append(plan.targets, target)
-		fmt.Fprintln(&review, "Apply to this repository at its next safe work boundary. A stopped worker stays stopped.")
+		fmt.Fprintln(&review, "Apply this reviewed revision. A stopped worker stays stopped.")
 	} else {
 		targets, err := e.globalActivations(ctx, projection.document, draft, &review)
 		if err != nil {
@@ -354,8 +347,7 @@ func writeEditorPermissions(out io.Writer, validation settings.Validation) {
 		case ai.ConfirmationVerificationCommand:
 			mode := validation.ResolvedHot[config.FieldIntentVerification]
 			fmt.Fprintln(out, "Permission: run project verification:", strconv.Quote(validation.ResolvedHot["verification."+mode+".command"]))
-		case ai.ConfirmationIntentRepair:
-			fmt.Fprintf(out, "Permission: repair up to %s eligible recent ACD-owned commits within %s\n", validation.ResolvedHot[config.FieldIntentRepairMaxCommits], validation.ResolvedHot[config.FieldIntentRepairHorizon])
+
 		}
 	}
 }
@@ -393,9 +385,6 @@ func (e *configEditor) repositoryActivation(ctx context.Context, repo string, va
 	}
 	target.desired = runtime.DesiredRevisionID.Int64
 	target.applied = runtime.AppliedRevisionID.Int64
-	if target.desired != target.applied {
-		return target, fmt.Errorf("%s already has a settings change waiting to apply; wait for it before saving", safeRepoPreview(repo))
-	}
 	return target, nil
 }
 
@@ -541,66 +530,17 @@ func (e *configEditor) save(ctx context.Context, plan editorPlan) (string, error
 	if fresh.validation.ProviderConfig.APIKey != plan.validation.ProviderConfig.APIKey || fresh.text != plan.text || !maps.Equal(fresh.values, plan.values) || !editorTargetsEqual(fresh.targets, plan.targets) {
 		return "", errors.New("settings or affected repositories changed; review again before saving")
 	}
-	// Share successful synthetic probes across repositories using the same
-	// connection. This cache exists only for this save and is never serialized.
-	cached := *e
-	probes := map[editorProbeConnection]ai.ProviderProbeResult{}
-	probe := e.probe
-	if probe == nil {
-		probe = ai.ProbeProviderConfig
-	}
-	cached.probe = func(ctx context.Context, cfg ai.ProviderConfig) (ai.ProviderProbeResult, error) {
-		key := editorProbeConnection{mode: cfg.Mode, endpoint: cfg.BaseURL, model: cfg.Model, credential: cfg.APIKey, ca: cfg.CAFile, timeout: cfg.Timeout.String(), format: string(cfg.CommitFormat)}
-		if result, found := probes[key]; found {
-			return result, nil
-		}
-		result, err := probe(ctx, cfg)
-		if err == nil && result.Success {
-			probes[key] = result
-		}
-		return result, err
-	}
-	e = &cached
-	// All probes happen before authoring, credentials, or runtime state are written.
+	// Applying reviewed settings does not make a provider connection test.
 	service, err := e.validationService(ctx, plan.draft.Scope, plan.draft.Credential)
 	if err != nil {
 		return "", err
 	}
 	defer service.Close()
-	tested, err := service.TestProvider(ctx, plan.values, plan.validation.Confirmations)
-	if err != nil {
-		return "", err
-	}
-	if !tested.Success {
-		return "", errors.New("connection test failed; settings and API key were not saved")
-	}
 	for index := range plan.targets {
-		target := &plan.targets[index]
 		if plan.draft.Scope == "repo" {
-			target.confirmations = plan.validation.Confirmations
-			target.fingerprint = tested.Fingerprint
-			continue
+			plan.targets[index].confirmations = plan.validation.Confirmations
+			plan.targets[index].fingerprint = plan.validation.Fingerprint
 		}
-		validator, err := settings.NewValidationService(ctx, e.options(target.repo, plan.draft.Credential))
-		if err != nil {
-			return "", err
-		}
-		result, probeErr := validator.TestProvider(ctx, target.values, target.confirmations)
-		_ = validator.Close()
-		if probeErr != nil {
-			return "", probeErr
-		}
-		if !result.Success {
-			return "", fmt.Errorf("connection test failed for %s; settings were not saved", safeRepoPreview(target.repo))
-		}
-		target.fingerprint = result.Fingerprint
-	}
-	fresh, err = e.prepare(ctx, plan.draft)
-	if err != nil {
-		return "", err
-	}
-	if fresh.validation.ProviderConfig.APIKey != plan.validation.ProviderConfig.APIKey || fresh.text != plan.text || !editorTargetsEqual(fresh.targets, plan.targets) {
-		return "", errors.New("settings or affected repositories changed during testing; review again")
 	}
 	oldCredential, hadCredential := "", false
 	if plan.draft.Credential != "" {
@@ -616,7 +556,7 @@ func (e *configEditor) save(ctx context.Context, plan editorPlan) (string, error
 	}
 	generation := plan.draft.Generation
 	if plan.draft.Scope == "global" {
-		result, saveErr := service.SaveGlobalSetup(ctx, settings.SaveGlobalSetupRequest{Values: plan.values, Changes: plan.draft.Changes, TestedFingerprint: tested.Fingerprint, Confirmations: plan.validation.Confirmations, ExpectedGeneration: generation})
+		result, saveErr := service.SaveGlobalSetup(ctx, settings.SaveGlobalSetupRequest{Values: plan.values, Changes: plan.draft.Changes, TestedFingerprint: plan.validation.Fingerprint, Confirmations: plan.validation.Confirmations, ExpectedGeneration: generation})
 		err = saveErr
 		generation = result.Generation
 	} else {
@@ -636,7 +576,7 @@ func (e *configEditor) save(ctx context.Context, plan editorPlan) (string, error
 			fmt.Fprintf(&result, "Saved, but could not apply to %s: %s. Reopen acd config --repo %s and save to retry.\n", safeRepoPreview(target.repo), safePreviewText(applyErr.Error(), 500), productListShellQuote(target.repo))
 			continue
 		}
-		fmt.Fprintf(&result, "Waiting to apply: %s (revision %d, next safe boundary or next start).\n", safeRepoPreview(target.repo), applied.RevisionID)
+		fmt.Fprintf(&result, "Applied: %s (revision %d).\n", safeRepoPreview(target.repo), applied.RevisionID)
 	}
 	if len(plan.validation.RestartChanged) > 0 {
 		fmt.Fprintln(&result, "Restart required for:", strings.Join(plan.validation.RestartChanged, ", "))
@@ -663,21 +603,7 @@ func (e *configEditor) activate(ctx context.Context, target editorActivation, ge
 	}
 	defer service.Close()
 	request := settings.ApplyRequest{Values: target.values, TestedFingerprint: target.fingerprint, Confirmations: target.confirmations, ExpectedGeneration: generation, ExpectedDesiredRevision: target.desired}
-	// Full verification retains the same approval gate as repository setup.
-	if target.values[config.FieldIntentVerification] == "full" {
-		validationTarget, err := resolveConfigureValidationTarget(ctx, target.repo)
-		if err != nil {
-			return settings.ApplyResult{}, err
-		}
-		request.SetupValidation = editorSetupValidation(validationTarget, target)
-	}
 	return service.Apply(ctx, request)
-}
-
-func editorSetupValidation(validationTarget configureValidationTarget, target editorActivation) *settings.SetupValidation {
-	command := target.values[config.FieldVerificationFullCommand]
-	digest := sha256.Sum256([]byte(command))
-	return &settings.SetupValidation{BranchRef: validationTarget.BranchRef, BranchGeneration: validationTarget.BranchGeneration, ExpectedHead: validationTarget.ExpectedHead, Mode: "full", CommandSource: "settings editor", CommandDigest: fmt.Sprintf("%x", digest), ApprovalID: target.fingerprint}
 }
 
 // Validate individual connection inputs without requiring a key or making requests.
@@ -695,8 +621,4 @@ func validateEditorField(key, value string) error {
 	}
 	_, err := ai.ValidateProviderConfig(cfg)
 	return err
-}
-
-type editorProbeConnection struct {
-	mode, endpoint, model, credential, ca, timeout, format string
 }

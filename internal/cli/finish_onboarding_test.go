@@ -4,14 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"os"
 	"path/filepath"
+
 	"strings"
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
+
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
@@ -41,11 +43,11 @@ func TestFinishOnboardingLocalDefaultsWithoutCredentials(t *testing.T) {
 			if state.Selection.Strategy != "local" || values[config.FieldCommitFormat] != "imperative" || values[config.FieldIntentVerification] != "none" || values[config.FieldProvider] != "deterministic" || state.Credential != "" || state.Configuration.StoreCredential {
 				t.Fatalf("defaults %+v", state)
 			}
-			if _, exists := values[config.FieldCommitPreset]; exists {
+			if _, exists := values["commit.preset"]; exists {
 				t.Fatal("retired preset in setup")
 			}
-			if err := testSetupProvider(cmd, state); err != nil {
-				t.Fatal(err)
+			if state.Configuration.ProviderTestStatus != "optional_connection_test" {
+				t.Fatalf("setup forced connection test: %+v", state.Configuration)
 			}
 			if _, err := os.Stat(roots.ConfigPath()); !os.IsNotExist(err) {
 				t.Fatalf("preparation wrote settings: %v", err)

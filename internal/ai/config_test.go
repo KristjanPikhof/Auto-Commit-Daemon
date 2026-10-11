@@ -1,54 +1,12 @@
 package ai
 
 import (
-	"bytes"
-	"context"
 	"errors"
-	"io"
-	"log/slog"
-	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
-// captureHandler is a minimal slog.Handler that records every record so
-// tests can assert which warning fired on the degraded paths.
-type captureHandler struct {
-	mu      sync.Mutex
-	records []slog.Record
-}
-
-func (h *captureHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
-
-func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.records = append(h.records, r.Clone())
-	return nil
-}
-
-func (h *captureHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
-func (h *captureHandler) WithGroup(_ string) slog.Handler      { return h }
-
-func (h *captureHandler) findWarn(substr string) (slog.Record, bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, r := range h.records {
-		if r.Level >= slog.LevelWarn && strings.Contains(r.Message, substr) {
-			return r, true
-		}
-	}
-	return slog.Record{}, false
-}
-
-func quietLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelWarn}))
-}
-
-// TestLoadProviderConfigFromEnv_AllVars: every ACD_AI_* env var is read,
-// trimmed, and the prefix lowercased; missing vars take their defaults.
 func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	t.Setenv(EnvProvider, "  Subprocess:CustomPlugin  ")
 	t.Setenv(EnvBaseURL, "  https://gateway.example/v1  ")
@@ -58,12 +16,6 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	t.Setenv(EnvCAFile, "  /tmp/acd-test-ca.pem  ")
 	t.Setenv(EnvCommitStrategy, "  intent  ")
 	t.Setenv(EnvCommitFormat, "  conventional  ")
-	t.Setenv(EnvIntentWindow, "25")
-	t.Setenv(EnvIntentMinPending, "12")
-	t.Setenv(EnvIntentSettleWindow, "12s")
-	t.Setenv(EnvIntentMaxPendingAge, "90s")
-	t.Setenv(EnvIntentRecentCommits, "8")
-	t.Setenv(EnvIntentDeferLimit, "4")
 
 	cfg := LoadProviderConfigFromEnv()
 
@@ -91,24 +43,6 @@ func TestLoadProviderConfigFromEnv_AllVars(t *testing.T) {
 	if cfg.CommitFormat != CommitFormatConventional {
 		t.Fatalf("CommitFormat=%q want conventional", cfg.CommitFormat)
 	}
-	if cfg.IntentWindow != 25 {
-		t.Fatalf("IntentWindow=%d want 25", cfg.IntentWindow)
-	}
-	if cfg.IntentMinPending != 12 {
-		t.Fatalf("IntentMinPending=%d want 12", cfg.IntentMinPending)
-	}
-	if cfg.IntentSettleWindow != 12*time.Second {
-		t.Fatalf("IntentSettleWindow=%v want 12s", cfg.IntentSettleWindow)
-	}
-	if cfg.IntentMaxPendingAge != 90*time.Second {
-		t.Fatalf("IntentMaxPendingAge=%v want 90s", cfg.IntentMaxPendingAge)
-	}
-	if cfg.IntentRecentCommits != 8 {
-		t.Fatalf("IntentRecentCommits=%d want 8", cfg.IntentRecentCommits)
-	}
-	if cfg.IntentDeferLimit != 4 {
-		t.Fatalf("IntentDeferLimit=%d want 4", cfg.IntentDeferLimit)
-	}
 }
 
 // TestLoadProviderConfigFromEnv_Defaults: an empty env yields the
@@ -121,12 +55,6 @@ func TestLoadProviderConfigFromEnv_Defaults(t *testing.T) {
 	t.Setenv(EnvTimeout, "")
 	t.Setenv(EnvCommitStrategy, "")
 	t.Setenv(EnvCommitFormat, "")
-	t.Setenv(EnvIntentWindow, "")
-	t.Setenv(EnvIntentMinPending, "")
-	t.Setenv(EnvIntentSettleWindow, "")
-	t.Setenv(EnvIntentMaxPendingAge, "")
-	t.Setenv(EnvIntentRecentCommits, "")
-	t.Setenv(EnvIntentDeferLimit, "")
 
 	cfg := LoadProviderConfigFromEnv()
 	if cfg.Mode != "" {
@@ -141,29 +69,11 @@ func TestLoadProviderConfigFromEnv_Defaults(t *testing.T) {
 	if cfg.Timeout != DefaultProviderTimeout {
 		t.Fatalf("Timeout=%v want default", cfg.Timeout)
 	}
-	if cfg.CommitStrategy != CommitStrategyEvent {
-		t.Fatalf("CommitStrategy=%q want event", cfg.CommitStrategy)
+	if cfg.CommitStrategy != CommitStrategyLocal {
+		t.Fatalf("CommitStrategy=%q want local", cfg.CommitStrategy)
 	}
 	if cfg.CommitFormat != CommitFormatImperative {
 		t.Fatalf("CommitFormat=%q want imperative", cfg.CommitFormat)
-	}
-	if cfg.IntentWindow != DefaultIntentWindow {
-		t.Fatalf("IntentWindow=%d want %d", cfg.IntentWindow, DefaultIntentWindow)
-	}
-	if cfg.IntentMinPending != DefaultIntentMinPending {
-		t.Fatalf("IntentMinPending=%d want %d", cfg.IntentMinPending, DefaultIntentMinPending)
-	}
-	if cfg.IntentSettleWindow != DefaultIntentSettleWindow {
-		t.Fatalf("IntentSettleWindow=%v want %v", cfg.IntentSettleWindow, DefaultIntentSettleWindow)
-	}
-	if cfg.IntentMaxPendingAge != DefaultIntentMaxPendingAge {
-		t.Fatalf("IntentMaxPendingAge=%v want %v", cfg.IntentMaxPendingAge, DefaultIntentMaxPendingAge)
-	}
-	if cfg.IntentRecentCommits != DefaultIntentRecentCommits {
-		t.Fatalf("IntentRecentCommits=%d want %d", cfg.IntentRecentCommits, DefaultIntentRecentCommits)
-	}
-	if cfg.IntentDeferLimit != DefaultIntentDeferLimit {
-		t.Fatalf("IntentDeferLimit=%d want %d", cfg.IntentDeferLimit, DefaultIntentDeferLimit)
 	}
 }
 
@@ -184,12 +94,12 @@ func TestLoadProviderConfigFromEnv_CommitStrategy(t *testing.T) {
 		raw  string
 		want CommitStrategy
 	}{
-		{raw: "", want: CommitStrategyEvent},
-		{raw: "event", want: CommitStrategyEvent},
-		{raw: " EVENT ", want: CommitStrategyEvent},
+		{raw: "", want: CommitStrategyLocal},
+		{raw: "event", want: CommitStrategyLocal},
+		{raw: " EVENT ", want: CommitStrategyLocal},
 		{raw: "intent", want: CommitStrategyIntent},
 		{raw: " INTENT ", want: CommitStrategyIntent},
-		{raw: "unknown", want: CommitStrategyEvent},
+		{raw: "unknown", want: CommitStrategyLocal},
 	} {
 		t.Run(tc.raw, func(t *testing.T) {
 			t.Setenv(EnvCommitStrategy, tc.raw)
@@ -223,257 +133,14 @@ func TestLoadProviderConfigFromEnv_CommitFormat(t *testing.T) {
 	}
 }
 
-func TestLoadProviderConfigFromEnv_InvalidIntentNumbersFallBack(t *testing.T) {
-	t.Setenv(EnvIntentWindow, "0")
-	t.Setenv(EnvIntentMinPending, "0")
-	t.Setenv(EnvIntentSettleWindow, "not-a-duration")
-	t.Setenv(EnvIntentMaxPendingAge, "0")
-	t.Setenv(EnvIntentRecentCommits, "not-a-number")
-	t.Setenv(EnvIntentDeferLimit, "-1")
-
-	cfg := LoadProviderConfigFromEnv()
-	if cfg.IntentWindow != DefaultIntentWindow {
-		t.Fatalf("IntentWindow=%d want %d", cfg.IntentWindow, DefaultIntentWindow)
-	}
-	if cfg.IntentMinPending != DefaultIntentMinPending {
-		t.Fatalf("IntentMinPending=%d want %d", cfg.IntentMinPending, DefaultIntentMinPending)
-	}
-	if cfg.IntentSettleWindow != DefaultIntentSettleWindow {
-		t.Fatalf("IntentSettleWindow=%v want %v", cfg.IntentSettleWindow, DefaultIntentSettleWindow)
-	}
-	if cfg.IntentMaxPendingAge != DefaultIntentMaxPendingAge {
-		t.Fatalf("IntentMaxPendingAge=%v want %v", cfg.IntentMaxPendingAge, DefaultIntentMaxPendingAge)
-	}
-	if cfg.IntentRecentCommits != DefaultIntentRecentCommits {
-		t.Fatalf("IntentRecentCommits=%d want %d", cfg.IntentRecentCommits, DefaultIntentRecentCommits)
-	}
-	if cfg.IntentDeferLimit != DefaultIntentDeferLimit {
-		t.Fatalf("IntentDeferLimit=%d want %d", cfg.IntentDeferLimit, DefaultIntentDeferLimit)
-	}
-}
-
-func TestLoadProviderConfigFromEnv_InvalidIntentMaxPendingAgeFallsBack(t *testing.T) {
-	t.Setenv(EnvIntentMaxPendingAge, "not-a-duration")
-	cfg := LoadProviderConfigFromEnv()
-	if cfg.IntentMaxPendingAge != DefaultIntentMaxPendingAge {
-		t.Fatalf("IntentMaxPendingAge=%v want %v", cfg.IntentMaxPendingAge, DefaultIntentMaxPendingAge)
-	}
-}
-
-func TestLoadProviderConfigFromEnv_ZeroIntentDeferLimitAllowed(t *testing.T) {
-	t.Setenv(EnvIntentDeferLimit, "0")
-	cfg := LoadProviderConfigFromEnv()
-	if cfg.IntentDeferLimit != 0 {
-		t.Fatalf("IntentDeferLimit=%d want 0", cfg.IntentDeferLimit)
-	}
-}
-
-func TestLoadProviderConfigFromEnv_ZeroIntentSettleWindowAllowed(t *testing.T) {
-	for _, raw := range []string{"0", "0s"} {
-		t.Run(raw, func(t *testing.T) {
-			t.Setenv(EnvIntentSettleWindow, raw)
-			cfg := LoadProviderConfigFromEnv()
-			if cfg.IntentSettleWindow != 0 {
-				t.Fatalf("IntentSettleWindow=%v want 0", cfg.IntentSettleWindow)
-			}
-		})
-	}
-}
-
-// TestBuildProvider_DeterministicDefault: empty mode and "deterministic"
-// both yield DeterministicProvider with no closer.
-func TestBuildProvider_DeterministicDefault(t *testing.T) {
-	for _, mode := range []string{"", "deterministic"} {
-		mode := mode
-		t.Run(mode, func(t *testing.T) {
-			h := &captureHandler{}
-			cfg := ProviderConfig{Mode: mode, Logger: slog.New(h)}
-			p, closer, err := BuildProvider(cfg)
-			if err != nil {
-				t.Fatalf("BuildProvider: %v", err)
-			}
-			if closer != nil {
-				t.Fatalf("closer non-nil for deterministic")
-			}
-			if p.Name() != "deterministic" {
-				t.Fatalf("Name=%q want deterministic", p.Name())
-			}
-			if _, found := h.findWarn(""); found {
-				t.Fatalf("unexpected warning on deterministic path")
-			}
-		})
-	}
-}
-
-// TestBuildProvider_OpenAICompatComposed: a populated APIKey produces a
-// composed chain whose primary identifies as openai-compat.
-func TestBuildProvider_OpenAICompatComposed(t *testing.T) {
-	cfg := ProviderConfig{
-		Mode:    "openai-compat",
-		BaseURL: "https://api.example/v1",
-		APIKey:  "sk-test",
-		Model:   "gpt-test",
-		Logger:  quietLogger(),
-	}
-	p, closer, err := BuildProvider(cfg)
-	if err != nil {
-		t.Fatalf("BuildProvider: %v", err)
-	}
-	if closer != nil {
-		t.Fatalf("closer non-nil for openai-compat (no subprocess)")
-	}
-	want := "openai-compat+deterministic"
-	if p.Name() != want {
-		t.Fatalf("Name=%q want %q", p.Name(), want)
-	}
-}
-
-func TestBuildProvider_OpenAICompatRejectsInvalidBaseURL(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		baseURL   string
-		wantError string
-	}{
-		{
-			name:      "relative rejected",
-			baseURL:   "/v1",
-			wantError: "must be an absolute URL",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := ProviderConfig{
-				Mode:    "openai-compat",
-				BaseURL: tc.baseURL,
-				APIKey:  "sk-test",
-				Logger:  quietLogger(),
-			}
-			p, closer, err := BuildProvider(cfg)
-			if err == nil {
-				t.Fatalf("BuildProvider returned nil error")
-			}
-			if p != nil || closer != nil {
-				t.Fatalf("provider=%v closer=%v, want nils on invalid URL", p, closer)
-			}
-			if !strings.Contains(err.Error(), tc.wantError) {
-				t.Fatalf("error=%q want substring %q", err, tc.wantError)
-			}
-		})
-	}
-}
-
-// TestBuildProvider_OpenAICompatNoKeyDegrades: an empty APIKey logs a
-// warning and falls back to DeterministicProvider so misconfiguration
-// can never silently disable commit messages.
-func TestBuildProvider_OpenAICompatNoKeyRequiresConfiguration(t *testing.T) {
-	h := &captureHandler{}
-	cfg := ProviderConfig{
-		Mode:   "openai-compat",
-		APIKey: "",
-		Logger: slog.New(h),
-	}
-	p, _, err := BuildProvider(cfg)
-	if err == nil || p != nil || !ProviderNeedsConfiguration(err) {
-		t.Fatalf("configuration must remain actionable without fallback: %v %v", p, err)
-	}
-}
-
-func TestBuildProvider_IntentOpenAICompatNoKeyDoesNotDegrade(t *testing.T) {
-	p, closer, err := BuildProvider(ProviderConfig{
-		Mode:           "openai-compat",
-		CommitStrategy: CommitStrategyIntent,
-		Logger:         quietLogger(),
-	})
-	if err == nil || !strings.Contains(err.Error(), "missing API key") {
-		t.Fatalf("error=%v, want missing API key", err)
-	}
-	if p != nil || closer != nil {
-		t.Fatalf("provider=%v closer=%v, want no deterministic degradation",
-			p, closer)
-	}
-}
-
-func TestBuildProvider_OpenAICompatNoKeyIgnoresInvalidCA(t *testing.T) {
-	h := &captureHandler{}
-	provider, _, err := BuildProvider(ProviderConfig{
-		Mode: "openai-compat", APIKey: " ",
-		CAFile: filepath.Join(t.TempDir(), "missing.pem"),
-		Logger: slog.New(h),
-	})
-	if err == nil || provider != nil || !ProviderNeedsConfiguration(err) {
-		t.Fatalf("configuration must remain actionable without fallback: %v %v", provider, err)
-	}
-}
-
-func TestBuildProvider_Subprocess(t *testing.T) {
-	cfg := ProviderConfig{
-		Mode:               "subprocess:foo",
-		Timeout:            3 * time.Second,
-		Logger:             quietLogger(),
-		subprocessLookPath: func(string) (string, error) { return "", errors.New("missing") },
-	}
-	p, closer, err := BuildProvider(cfg)
-	if err != nil {
-		t.Fatalf("BuildProvider: %v", err)
-	}
-	if closer == nil {
-		t.Fatalf("closer nil for subprocess mode")
-	}
-	defer closer.Close()
-	want := "subprocess:foo+deterministic"
-	if p.Name() != want {
-		t.Fatalf("Name=%q want %q", p.Name(), want)
-	}
-
-	r, err := p.Generate(context.Background(), CommitContext{Path: "hello.txt", Op: "create"})
-	if err == nil || r.Subject != "" || r.Source == "deterministic" {
-		t.Fatalf("missing configured subprocess must wait: %+v err=%v", r, err)
-	}
-}
-
-func TestBuildProvider_SubprocessEmptyName(t *testing.T) {
-	h := &captureHandler{}
-	cfg := ProviderConfig{
-		Mode:   "subprocess:",
-		Logger: slog.New(h),
-	}
-	p, _, err := BuildProvider(cfg)
-	if err == nil || p != nil || !ProviderNeedsConfiguration(err) {
-		t.Fatalf("configuration must remain actionable without fallback: %v %v", p, err)
-	}
-}
-
-func TestBuildProvider_UnknownModeRequiresConfiguration(t *testing.T) {
-	h := &captureHandler{}
-	cfg := ProviderConfig{
-		Mode:   "garbage",
-		Logger: slog.New(h),
-	}
-	p, _, err := BuildProvider(cfg)
-	if err == nil || p != nil || !ProviderNeedsConfiguration(err) {
-		t.Fatalf("configuration must remain actionable without fallback: %v %v", p, err)
-	}
-}
-
-func TestBuildProvider_NilLoggerDoesNotPanic(t *testing.T) {
-	prev := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	var buf bytes.Buffer
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-
-	cfg := ProviderConfig{Mode: "garbage"}
-	p, _, err := BuildProvider(cfg)
-	if err == nil || p != nil || !ProviderNeedsConfiguration(err) {
-		t.Fatalf("configuration must remain actionable without fallback: %v %v", p, err)
-	}
-}
-
-func TestBuildStrictProviderRejectsDegradedConfiguration(t *testing.T) {
+func TestFinishRemovalTransportRejectsInvalidConfiguration(t *testing.T) {
 	tests := []struct {
 		name string
 		cfg  ProviderConfig
 		want string
 	}{
 		{name: "unknown", cfg: ProviderConfig{Mode: "mystery"}, want: "unknown provider"},
+		{name: "Intent without AI", cfg: ProviderConfig{Mode: "deterministic", CommitStrategy: CommitStrategyIntent}, want: "choose local mode"},
 		{name: "missing credential", cfg: ProviderConfig{Mode: "openai-compat", Model: "model"}, want: "missing API key"},
 		{name: "invalid endpoint", cfg: ProviderConfig{Mode: "openai-compat", APIKey: "secret", Model: "model", BaseURL: "ftp://example.test/v1"}, want: "unsupported ACD_AI_BASE_URL scheme"},
 		{name: "invalid model", cfg: ProviderConfig{Mode: "openai-compat", APIKey: "secret", Model: "bad\nmodel"}, want: "model is invalid"},
@@ -481,7 +148,7 @@ func TestBuildStrictProviderRejectsDegradedConfiguration(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			provider, closer, err := BuildStrictProvider(tc.cfg)
+			provider, closer, err := buildFinishTransport(tc.cfg)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error=%v, want %q", err, tc.want)
 			}
@@ -492,43 +159,6 @@ func TestBuildStrictProviderRejectsDegradedConfiguration(t *testing.T) {
 				t.Fatalf("error leaked API key: %q", err)
 			}
 		})
-	}
-}
-
-func TestBuildStrictProviderDoesNotComposeFallback(t *testing.T) {
-	provider, closer, err := BuildStrictProvider(ProviderConfig{Mode: "deterministic"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if closer != nil || provider.Name() != "deterministic" {
-		t.Fatalf("provider=%q closer=%v", provider.Name(), closer)
-	}
-
-	missing, missingCloser, err := BuildStrictProvider(ProviderConfig{
-		Mode: "subprocess:absent",
-		subprocessLookPath: func(string) (string, error) {
-			return "", errors.New("unavailable")
-		},
-	})
-	if err == nil || missing != nil || missingCloser != nil {
-		t.Fatalf("provider=%v closer=%v err=%v", missing, missingCloser, err)
-	}
-
-	// Runtime construction preserves the selected provider even when its
-	// subprocess is temporarily unavailable. Generation must surface the wait.
-	normal, normalCloser, err := BuildProvider(ProviderConfig{
-		Mode: "subprocess:absent",
-		subprocessLookPath: func(string) (string, error) {
-			return "", errors.New("unavailable")
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer normalCloser.Close()
-	result, err := normal.Generate(context.Background(), CommitContext{Path: "compat.txt", Op: "modify"})
-	if err == nil || result.Source == "deterministic" || result.Subject != "" {
-		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
 
@@ -606,19 +236,5 @@ func TestValidateProviderConfigRequiresHTTPWarningAndRejectsUnsafeURLs(t *testin
 				t.Fatalf("userinfo error must use credential-safe wording: %v", err)
 			}
 		}
-	}
-}
-
-func TestConfigIntentRetryContextOverridePreservesEnvCompatibility(t *testing.T) {
-	t.Setenv(EnvIntentRetryOnInvalid, "7")
-	if got := intentRetryOnInvalidLimit(context.Background()); got != 7 {
-		t.Fatalf("environment retry limit=%d want 7", got)
-	}
-	ctx := WithIntentRetryLimit(context.Background(), 2)
-	if got := intentRetryOnInvalidLimit(ctx); got != 2 {
-		t.Fatalf("context retry limit=%d want 2", got)
-	}
-	if got := intentRetryOnInvalidLimit(context.Background()); got != 7 {
-		t.Fatalf("override leaked outside pass: %d", got)
 	}
 }

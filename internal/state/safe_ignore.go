@@ -160,6 +160,11 @@ func NewSafeIgnoreMatcherFromValues(enabled, extra string) *SafeIgnoreMatcher {
 	return &SafeIgnoreMatcher{patterns: dedupeStrings(patterns)}
 }
 
+// NewSafeIgnoreMatcherFromPatterns restores the exact saved list, including disabled guards.
+func NewSafeIgnoreMatcherFromPatterns(patterns []string) *SafeIgnoreMatcher {
+	return &SafeIgnoreMatcher{patterns: append([]string(nil), patterns...)}
+}
+
 // Match reports whether rel matches any safe-ignore pattern.
 func (m *SafeIgnoreMatcher) Match(rel string) bool {
 	return m.match(rel, true)
@@ -283,6 +288,10 @@ func matchSafeIgnoreDirRootWithSelf(pattern, rel string, includeSelf bool) (stri
 func ScanGeneratedPendingDeletes(ctx context.Context, q queryer, matcher *SafeIgnoreMatcher, limit int) ([]GeneratedPendingGroup, error) {
 	if q == nil {
 		return nil, fmt.Errorf("state: ScanGeneratedPendingDeletes: nil queryer")
+	}
+	exists, err := legacyTableExists(ctx, q, "capture_events")
+	if err != nil || !exists {
+		return nil, err
 	}
 	if matcher == nil {
 		matcher = NewSafeIgnoreMatcher()

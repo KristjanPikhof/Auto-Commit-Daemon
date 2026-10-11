@@ -31,6 +31,9 @@ func TestFinishLegacyDurablePrepareResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.SQL().ExecContext(ctx, state.LegacySchemaDDL); err != nil {
+		t.Fatal(err)
+	}
 	blob, err := gitpkg.HashObjectStdinDurable(ctx, repo, []byte("older captured version\n"))
 	if err != nil {
 		t.Fatal(err)

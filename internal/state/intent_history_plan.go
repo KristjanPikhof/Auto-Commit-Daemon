@@ -48,7 +48,7 @@ type IntentHistoryGoal struct {
 }
 
 // IntentHistoryPlan freezes both original provenance and proposed goal trees.
-// Explicit reconstruction creates a new branch and leaves the source untouched.
+// The saved target chooses an in-place rewrite or a new branch.
 type IntentHistoryPlan struct {
 	Version                  int                 `json:"version"`
 	ID                       string              `json:"id"`
@@ -65,6 +65,9 @@ type IntentHistoryPlan struct {
 	RecreateUnchanged        []string            `json:"recreate_unchanged,omitempty"`
 	SourceRef                string              `json:"source_ref"`
 	VerificationConfigDigest string              `json:"verification_config_digest"`
+	Disclosure               json.RawMessage     `json:"disclosure,omitempty"`
+	PlanningDeadlineTS       float64             `json:"planning_deadline_ts,omitempty"`
+	PlanningCalls            int                 `json:"planning_calls,omitempty"`
 	SharedPlan               *finish.Plan        `json:"shared_plan,omitempty"`
 }
 

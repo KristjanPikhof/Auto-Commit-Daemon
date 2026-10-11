@@ -15,7 +15,6 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -39,32 +38,32 @@ const (
 // shape for every outcome; Actions is initialized to an empty slice rather
 // than null for the same reason.
 type controlResult struct {
-	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
-	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
-	OK                       bool                         `json:"ok"`
-	Command                  string                       `json:"command"`
-	Repo                     string                       `json:"repo"`
-	Health                   string                       `json:"health"`
-	Summary                  string                       `json:"summary"`
-	NextAction               string                       `json:"next_action"`
-	Registered               bool                         `json:"registered"`
-	Enabled                  bool                         `json:"enabled"`
-	Daemon                   string                       `json:"daemon"`
-	DaemonPID                int                          `json:"daemon_pid"`
-	PendingEvents            int                          `json:"pending_events"`
-	BlockedEvents            int                          `json:"blocked_events"`
-	Changed                  bool                         `json:"changed"`
-	Actions                  []string                     `json:"actions"`
-	StatePreserved           bool                         `json:"state_preserved"`
-	Protected                bool                         `json:"protected"`
-	Published                bool                         `json:"published"`
-	Busy                     bool                         `json:"busy"`
-	OperationalState         string                       `json:"operational_state"`
-	WorktreeClean            bool                         `json:"worktree_clean"`
-	AllChangesCommittedInGit bool                         `json:"all_changes_committed_in_git"`
-	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
-	CheckpointID             string                       `json:"checkpoint_id,omitempty"`
-	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
+	CaptureHealth            state.CaptureHealth `json:"capture_health"`
+	PublicationOutcome       publicationOutcome  `json:"publication_outcome"`
+	OK                       bool                `json:"ok"`
+	Command                  string              `json:"command"`
+	Repo                     string              `json:"repo"`
+	Health                   string              `json:"health"`
+	Summary                  string              `json:"summary"`
+	NextAction               string              `json:"next_action"`
+	Registered               bool                `json:"registered"`
+	Enabled                  bool                `json:"enabled"`
+	Daemon                   string              `json:"daemon"`
+	DaemonPID                int                 `json:"daemon_pid"`
+	PendingEvents            int                 `json:"pending_events"`
+	BlockedEvents            int                 `json:"blocked_events"`
+	Changed                  bool                `json:"changed"`
+	Actions                  []string            `json:"actions"`
+	StatePreserved           bool                `json:"state_preserved"`
+	Protected                bool                `json:"protected"`
+	Published                bool                `json:"published"`
+	Busy                     bool                `json:"busy"`
+	OperationalState         string              `json:"operational_state"`
+	WorktreeClean            bool                `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                `json:"checkpoint_published_by_acd"`
+	CheckpointID             string              `json:"checkpoint_id,omitempty"`
+
 	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
 	PublicationProgress      publicationProgressReport    `json:"publication_progress"`
 	RecoveryRequired         bool                         `json:"-"`
@@ -86,14 +85,13 @@ func newOnCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "on",
 		Short: "Start protecting this repository",
-		Long: `Start ACD protection for this repository.
+		Long: `Start checkpoint protection for this repository.
 
-ACD replaces any managed background worker for this repository, waits for the
-new worker to be ready, and confirms that current changes have a durable
-checkpoint. Running the command again is safe. Existing checkpoints are kept.
+First use initializes the local runtime with offline defaults. ACD starts the
+worker and confirms a durable checkpoint of current eligible changes.
+Running the command again is safe. Branch commits are created by acd finish.
 
-If ACD has not been installed or upgraded for checkpoint protection, run
-acd setup first. Recovery that needs your approval is never applied silently.`,
+Existing installations that need an upgrade direct you to acd setup.`,
 		Example: `  acd on
   acd on --repo /path/to/repo
   acd on --json`,
@@ -181,11 +179,17 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	if _, err := callSupervisor(ctx, lookup, "enable_repository", nil, 30*time.Second); err != nil {
 		return fmt.Errorf("acd on: %w", err)
 	}
-	if _, err := callSupervisor(ctx, lookup, "restart_repository", nil, 30*time.Second); err != nil {
-		return fmt.Errorf("acd on: restart worker: %w", err)
+	if controlWorkerNeedsRestart(ctx, lookup) {
+		if _, err := callSupervisor(ctx, lookup, "restart_repository", nil, 30*time.Second); err != nil {
+			return fmt.Errorf("acd on: restart worker: %w", err)
+		}
+		actions = append(actions, "restarted")
 	}
-	actions = append(actions, "restarted")
-	if err := waitControlWorkerReady(ctx, lookup, 10*time.Second); err != nil {
+	progress := out
+	if jsonOut {
+		progress = io.Discard
+	}
+	if err := waitControlWorkerReady(ctx, lookup, supervisor.CheckpointBarrierTimeout, progress); err != nil {
 		return err
 	}
 	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout); err != nil {
@@ -210,30 +214,62 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	return nil
 }
 
-func waitControlWorkerReady(ctx context.Context, lookup controlRepoLookup, timeout time.Duration) error {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(100 * time.Millisecond)
+// Reuse a responsive worker unless it must load a missing linked worktree.
+func controlWorkerNeedsRestart(ctx context.Context, lookup controlRepoLookup) bool {
+	worker, ok := readSupervisorWorkerStatus(ctx, lookup.Roots, lookup.Record.RepositoryID)
+	if !ok {
+		return false
+	}
+	if worker.State == "needs_action" {
+		return true
+	}
+	if !controlWorkerReady(ctx, lookup, worker) {
+		return false
+	}
+	response, err := supervisor.DoWorker(ctx, supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), supervisor.Request{
+		Version: supervisor.ProtocolVersion, ID: "control-worktree-status", Method: "status",
+		RepositoryID: lookup.Record.RepositoryID, WorktreeID: lookup.Record.WorktreeID,
+	}, time.Second)
+	return err == nil && response.Error != nil && response.Error.Code == "worktree_not_found"
+}
+
+func controlWorkerReady(ctx context.Context, lookup controlRepoLookup, worker supervisor.WorkerStatus) bool {
+	if worker.PID <= 0 {
+		return false
+	}
+	response, err := supervisor.DoWorker(ctx,
+		supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID),
+		supervisor.Request{Version: supervisor.ProtocolVersion, ID: "control-worker-ready",
+			Method: "status", RepositoryID: lookup.Record.RepositoryID}, time.Second)
+	if err != nil || !response.OK || response.Error != nil || response.Version != supervisor.ProtocolVersion {
+		return false
+	}
+	ready, err := decodeProductData[supervisor.WorkerReadiness](response.Data)
+	return err == nil && ready.Ready && ready.PID == worker.PID && ready.RepositoryID == worker.RepositoryID
+}
+
+func waitControlWorkerReady(ctx context.Context, lookup controlRepoLookup, timeout time.Duration, progress io.Writer) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
+	announced := false
 	for {
-		response, err := supervisor.DoWorker(ctx,
-			supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID),
-			supervisor.Request{
-				Version: supervisor.ProtocolVersion,
-				ID:      fmt.Sprintf("control-worker-ready-%d", time.Now().UnixNano()),
-				Method:  "status", RepositoryID: lookup.Record.RepositoryID,
-				WorktreeID: lookup.Record.WorktreeID,
-			}, time.Second)
-		if err == nil && response.OK && response.Version == supervisor.ProtocolVersion {
+		worker, ok := readSupervisorWorkerStatus(waitCtx, lookup.Roots, lookup.Record.RepositoryID)
+		if ok && controlWorkerReady(waitCtx, lookup, worker) {
 			return nil
 		}
+		if !announced {
+			fmt.Fprintln(progress, "Waiting for the repository worker to finish startup and protect this worktree…")
+			announced = true
+		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
+		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			message := "acd on: worker did not become ready"
-			if worker, ok := readSupervisorWorkerStatus(ctx, lookup.Roots,
-				lookup.Record.RepositoryID); ok && worker.LastError != "" {
+			if ok && worker.LastError != "" {
 				message += ": " + worker.LastError
 			}
 			return unavailableError(message + "; run `acd doctor`")
@@ -320,17 +356,6 @@ func callSupervisor(ctx context.Context, lookup controlRepoLookup, method string
 	return response, nil
 }
 
-// registerControlOptOut records lifecycle intent without opening state.db or
-// requiring an attached branch. This lets users turn ACD off safely during a
-// detached-HEAD inspection; acd on will create state when the repo is attached
-// again and ready to start.
-func registerControlOptOut(lookup controlRepoLookup) error {
-	return central.WithLock(lookup.Roots, func(reg *central.Registry) error {
-		_, err := reg.RegisterResolvedRepo(lookup.Worktree, "", time.Now().Unix())
-		return err
-	})
-}
-
 func inspectControl(ctx context.Context, repoFlag string) (controlResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -373,9 +398,19 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 		return base, nil
 	}
 	if lookup.Record.LifecycleDisabled() {
-		applyDisabledControlTruth(ctx, &base, lookup)
+		if fileExists(lookup.Record.StateDB) {
+			if status, err := buildStatusReport(ctx, lookup.Record, time.Now()); err == nil {
+				applyFinishControlStatus(&base, status, false)
+			}
+		}
+		if count, err := productWorktreeChangeCount(ctx, lookup.Worktree.Root); err == nil {
+			base.WorktreeClean = count == 0
+			base.AllChangesCommittedInGit = base.WorktreeClean
+			base.PublicationOutcome.WorktreeChanges = count
+		}
 		base.Health = controlHealthOff
 		base.Daemon = "stopped"
+		base.OK = true
 		base.Summary = "ACD protection is turned off for this repository."
 		base.NextAction = "Run `acd on` to enable it."
 		return base, nil
@@ -423,26 +458,6 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 	return base, nil
 }
 
-func applyDisabledControlTruth(
-	ctx context.Context,
-	result *controlResult,
-	lookup controlRepoLookup,
-) {
-	if fileExists(lookup.Record.StateDB) {
-		if status, err := buildStatusReport(ctx, lookup.Record, time.Now()); err == nil {
-			result.CheckpointPublishedByACD = status.CheckpointPublishedByACD
-			result.CheckpointID = status.LatestCheckpointID
-		}
-	}
-	body, err := git.Run(ctx, git.RunOpts{Dir: lookup.Worktree.Root},
-		"status", "--porcelain=v1", "--untracked-files=all")
-	if err == nil {
-		result.WorktreeClean = len(body) == 0
-		result.AllChangesCommittedInGit = result.WorktreeClean
-		result.Published = result.WorktreeClean
-	}
-}
-
 func readSupervisorStatus(ctx context.Context, roots paths.Roots) (supervisor.Status, bool) {
 	response, err := (supervisor.Client{
 		SocketPath: roots.SupervisorSocketPath(), Timeout: 500 * time.Millisecond,
@@ -483,7 +498,7 @@ func applySupervisorWorkerFailure(result *controlResult, worker supervisor.Worke
 	switch {
 	case strings.Contains(worker.LastError, "checkpoint-first setup required"):
 		result.Summary = "ACD could not start because its state database needs a safe schema upgrade."
-		result.NextAction = "Run `acd on`; it will back up and upgrade compatible state, then start a new worker."
+		result.NextAction = "Run `acd setup` to back up and upgrade state before starting protection. Preserved work remains saved."
 	case strings.Contains(worker.LastError, "acquire repository ownership"):
 		result.Summary = "ACD could not start because an older worker still owns this repository."
 		result.NextAction = "Run `acd on` to stop the managed worker and start a fresh one."
@@ -520,274 +535,7 @@ func applyControlStatus(res *controlResult, status statusReport) {
 }
 
 func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, daemonAlive bool) {
-	captureExplained := false
-	defer func() {
-		applyMaintenanceStatus(res, status)
-		if status.CaptureHealth.Error != "" && !captureExplained {
-			res.Summary += " Checkpoint protection is also incomplete: " + status.CaptureHealth.Error
-		}
-	}()
-	manualPause := status.Paused && (status.Pause == nil || status.Pause.Source != "rewind_grace")
-	res.Daemon = status.Daemon
-	res.DaemonPID = status.PID
-	res.PendingEvents = status.PendingEvents
-	res.BlockedEvents = status.BlockedConflicts
-	res.PublicationOutcome = status.PublicationOutcome
-	res.Protected = status.Protected
-	res.Published = checkpointPublishedByACD(status)
-	res.Busy = status.Busy
-	res.OperationalState = status.OperationalState
-	res.WorktreeClean = status.WorktreeClean
-	res.AllChangesCommittedInGit = status.AllChangesCommittedInGit
-	res.CheckpointPublishedByACD = res.Published
-	res.CheckpointID = status.LatestCheckpointID
-	res.PublicationDrain = status.PublicationDrain
-	res.CaptureHealth = status.CaptureHealth
-	res.PublicationProgress = status.PublicationProgress
-	res.RecoveryRequired = status.Replay.State == "needs_attention" ||
-		status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0 ||
-		(status.PublicationProgress.Origin == "intent_recovery" &&
-			status.PublicationProgress.Phase == "needs_action")
-
-	switch {
-	case status.IntentV2.SchemaVersion > 0 && !status.CheckpointProtectionAvailable:
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "This repository uses an older ACD protection format."
-		res.NextAction = "Run `acd setup` to upgrade it safely."
-	case status.Stale:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD background protection has stopped responding."
-		res.NextAction = "Run `acd on` to restart it."
-	case status.Daemon != "running" || !daemonAlive:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD is enabled, but background protection is not running."
-		res.NextAction = "Run `acd on` to start it."
-	case status.PublicationProgress.Origin == "intent_recovery" &&
-		status.PublicationProgress.Phase == "needs_action":
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = intentRecoveryVerificationAttentionSummary
-		res.NextAction = intentRecoveryVerificationAttentionNext
-	case manualPause:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD protection and publication are paused."
-		res.NextAction = "Run `acd status` to review the pause reason."
-	case status.BackpressurePaused:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD protection is paused because its protected storage is full."
-		res.NextAction = "Run `acd doctor` before clearing backpressure."
-	case status.Configuration.Configuration == "needs_attention":
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "The saved configuration did not pass validation. ACD is still protecting changes."
-		res.NextAction = "Run `acd config edit` to retry validation or select another experience."
-	case status.PublicationDrain.Phase == state.PublicationDrainNeedsAction &&
-		(status.PublicationDrain.LastError == "publication_drain_runtime_contract_unavailable" ||
-			status.PublicationDrain.LastError == "publication_drain_environment_runtime_changed"):
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "ACD can no longer reconstruct the exact runtime needed to resume this commit-all run. Your captured work remains saved."
-		res.NextAction = "Run `acd fix --force --dry-run`, review the archive-only recovery plan, then run `acd fix --force --yes`."
-	case status.PublicationDrain.Phase == state.PublicationDrainNeedsAction:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "The current commit-all run stopped at a safety check. Captured work remains saved."
-		if status.PublicationDrain.LastError != "" {
-			res.Summary += " Cause: " + status.PublicationDrain.LastError
-		}
-		res.NextAction = "Run `acd support diagnose` to inspect the blocked drain and its recovery options."
-	case status.Replay.State == "needs_attention":
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "A safety block stopped Git publication. Captured work remains saved."
-		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
-	case status.ActiveTerminalEvents > 0 || status.ActiveBarriers > 0:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "A blocked publication needs recovery on the active branch."
-		res.NextAction = "Run `acd support recover --dry-run`, review the plan, then run `acd support recover --yes`."
-	case status.CaptureHealth.State == "retrying":
-		captureExplained = true
-		res.Health = controlHealthWaiting
-		res.Summary = "Checkpoint coverage is incomplete while changed files stabilize. Readable files are saved."
-		res.NextAction = "ACD will retry automatically; see `acd doctor` for affected paths."
-	case status.CaptureHealth.State == "blocked":
-		captureExplained = true
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "Checkpoint protection is incomplete: " + status.CaptureHealth.Error
-		res.NextAction = "Run `acd doctor` to inspect the affected files. Readable files remain saved; ACD retries automatically."
-	case status.PublicationProgress.Phase == "verifying":
-		res.Health = controlHealthPublishing
-		if status.PublicationProgress.Origin == "intent_recovery" {
-			res.Summary = "ACD is verifying the semantic group for automatic recovery. The recovery target and your work remain protected."
-		} else {
-			res.Summary = "ACD is verifying the semantic group. Your work remains protected."
-		}
-		res.NextAction = "No action needed. ACD will continue when verification finishes."
-	case status.PublicationProgress.Phase == "goal_review_wait":
-		res.Health = controlHealthWaiting
-		res.Summary = publicationProgressPhaseLabel(status.PublicationProgress)
-		res.NextAction = "No action needed. ACD keeps capturing and reviews the unresolved goals automatically."
-	case status.PublicationProgress.Phase == "history_reconstruction":
-		res.Health = controlHealthPublishing
-		res.Summary = publicationProgressPhaseLabel(status.PublicationProgress)
-		res.NextAction = "No action needed. Inspect the saved history plan for its result."
-	case status.PublicationProgress.Phase == "provider_call":
-		res.Health = controlHealthPublishing
-		if status.PublicationProgress.Origin == "intent_recovery" {
-			res.Summary = "ACD is waiting for the current Intent provider response before continuing automatic recovery. The recovery target and your work remain protected."
-		} else if status.PublicationProgress.Origin == "commit_all" && !status.Protected {
-			res.Summary = "ACD is waiting for the current Intent provider response. The frozen target remains protected while ACD captures newer changes."
-		} else {
-			res.Summary = "ACD is waiting for the current Intent provider response. Your work remains protected."
-		}
-		res.NextAction = "No action needed. ACD will continue when the provider responds."
-	case status.PublicationProgress.Origin == "commit_all" && status.PublicationProgress.Phase == "provider_wait":
-		res.Health = controlHealthWaiting
-		res.Summary = "ACD is waiting for the Intent provider before continuing the frozen publication target. The target remains protected while file capture continues."
-		res.NextAction = "No action needed. ACD will retry the provider automatically."
-	case status.PendingEvents > 0 &&
-		status.IntentStrategy.ResolutionMode == "waiting_message_rewrite":
-		res.Health = controlHealthWaiting
-		res.Summary = "ACD is waiting for the Intent provider to write a semantic commit message. Your work remains protected."
-		res.NextAction = "No action needed. ACD will retry the provider automatically."
-	case status.PublicationProgress.Origin == "intent_recovery" &&
-		status.PublicationProgress.Phase == "provider_wait":
-		res.Health = controlHealthWaiting
-		res.Summary = "ACD is waiting for the Intent provider before continuing automatic recovery. The recovery target and your work remain protected."
-		if status.PublicationProgress.WaitRemainingSeconds > 0 {
-			res.NextAction = fmt.Sprintf(
-				"No action needed. ACD will retry in %s.",
-				formatDurationCompact(time.Duration(
-					status.PublicationProgress.WaitRemainingSeconds)*time.Second))
-		} else {
-			res.NextAction = "No action needed. ACD will retry the provider automatically."
-		}
-	case status.PublicationProgress.Phase == "stalled" && !status.Protected && status.CheckpointProtectionAvailable &&
-		status.PublicationProgress.Origin == "":
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = fmt.Sprintf("The worker is responsive, but checkpointing has not completed for %s. Current protection is incomplete.", formatDurationCompact(time.Duration(status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
-		res.NextAction = "Run `acd doctor` to inspect capture and checkpoint failures."
-	case status.PublicationProgress.Phase == "stalled":
-		res.Health = controlHealthDegraded
-		if status.PublicationProgress.Origin == "intent_recovery" {
-			recoveryActivity := "Automatic Intent recovery is active"
-			if status.PublicationProgress.TemporaryLocalFallback {
-				recoveryActivity = "ACD is widening a verified Intent group"
-			}
-			res.Summary = fmt.Sprintf(
-				"%s, but its target has not moved for %s. The worker is responsive and your work remains protected.",
-				recoveryActivity, formatDurationCompact(time.Duration(
-					status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
-			res.NextAction = "No action needed yet. ACD will keep replanning the exact recovery target; run `acd doctor` if this persists."
-		} else {
-			res.Summary = fmt.Sprintf(
-				"The worker is responsive, but the publication queue has not moved for %s. Your work remains protected.",
-				formatDurationCompact(time.Duration(
-					status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
-			if status.PublicationProgress.Origin == "commit_all" && !status.Protected {
-				res.Summary = fmt.Sprintf("The worker is responsive, but the publication target has not moved for %s. The frozen target remains protected while ACD captures newer changes.",
-					formatDurationCompact(time.Duration(status.PublicationProgress.LastProgressAgeSeconds)*time.Second))
-			}
-			res.NextAction = "No action needed yet. ACD will start bounded recovery automatically; run `acd doctor` if this persists."
-		}
-	case status.PublicationProgress.Origin == "intent_recovery":
-		res.Health = controlHealthPublishing
-		if status.PublicationProgress.Phase == "local_fallback" {
-			res.Summary = "ACD is widening a verified Intent group to recover the protected target."
-		} else {
-			res.Summary = "ACD is automatically rebuilding semantic commit groups for the protected changes."
-		}
-		res.NextAction = "No action needed. ACD will keep the exact recovery target protected and continue automatically."
-	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback &&
-		status.PublicationDrain.FallbackMode == "semantic_replan":
-		res.Health = controlHealthPublishing
-		res.Summary = "ACD is replanning the remaining protected changes by intent."
-		res.NextAction = "No action needed. If planning stalls, ACD will publish one local group and try intent again."
-	case status.PublicationDrain.Phase == state.PublicationDrainEventFallback:
-		res.Health = controlHealthPublishing
-		res.Summary = "ACD is publishing one safe local group to unblock intent planning."
-		res.NextAction = "No action needed. ACD will return to intent planning after this group."
-	case status.PublicationDrain.Phase == state.PublicationDrainNormalizing ||
-		status.PublicationDrain.Phase == state.PublicationDrainCheckpointing:
-		res.Health = controlHealthPublishing
-		res.Summary = "ACD is rebuilding the publication plan after a recoverable problem."
-		res.NextAction = "No action needed. Recovery continues automatically."
-	case status.PublicationDrain.Phase == state.PublicationDrainSemantic:
-		res.Health = controlHealthPublishing
-		res.Summary = "ACD is planning commits for the protected checkpoint."
-		res.NextAction = "No action needed. If planning stalls, ACD switches to safe local groups automatically."
-	case status.CheckpointProtectionAvailable && !status.Protected && status.Busy:
-		res.Health = controlHealthWaiting
-		res.Summary = "ACD is scanning recent changes and completing their protection checkpoint."
-		res.NextAction = "No action needed; checkpoint protection completes automatically."
-	case status.CheckpointProtectionAvailable && !status.Protected:
-		res.OK = false
-		res.Health = controlHealthNeedsAttention
-		res.Summary = "The latest observed changes are not yet covered by a completed checkpoint."
-		res.NextAction = "Run `acd doctor` if protection does not complete after the current scan."
-	case status.SelfPublication.GitAppliedCount > 0:
-		res.Health = controlHealthPublishing
-		res.Summary = "Current changes are checkpointed while ACD publishes Git commits."
-		res.NextAction = "No action needed."
-	case status.Paused && status.Pause != nil && status.Pause.Source == "rewind_grace":
-		res.Health = controlHealthWaiting
-		res.Summary = "ACD is briefly paused because Git history changed."
-		if status.Pause.RemainingSeconds > 0 {
-			res.Summary = fmt.Sprintf("ACD is briefly paused because Git history changed (%s remaining).",
-				formatDurationCompact(time.Duration(status.Pause.RemainingSeconds)*time.Second))
-		}
-		res.NextAction = "No action needed; capture and replay resume automatically."
-	case status.Configuration.Configuration == "validating":
-		res.Health = controlHealthWaiting
-		res.Summary = "ACD capture is active while configuration validation runs."
-		res.NextAction = "No action needed; commit publishing activates after validation passes."
-	case status.PendingEvents == 0 && status.IntentStrategy.LastPlannerWindow != nil &&
-		status.IntentStrategy.LastPlannerWindow.ResolutionMode == "evidence_partition":
-		res.Health = controlHealthHealthy
-		res.Summary = "ACD safely grouped and published the last batch using local dependency evidence."
-		res.NextAction = "No action needed."
-	case status.IntentStrategy.PlannerHealth != nil &&
-		(status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitOpen ||
-			status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen):
-		res.Health = controlHealthDegraded
-		res.Summary = "The Intent provider is temporarily unavailable, so semantic commit messages are waiting. Your work remains protected."
-		if status.IntentStrategy.PlannerHealth.State == daemon.IntentPlannerCircuitHalfOpen {
-			res.NextAction = "No immediate action needed; ACD is running the automatic provider probe. Run `acd doctor` for details."
-		} else {
-			res.NextAction = "No immediate action needed; ACD will probe the provider automatically after cooldown. Run `acd doctor` for details."
-		}
-	case status.IntentStrategy.PlannerHealthWarning != "":
-		res.Health = controlHealthDegraded
-		res.Summary = "ACD is running, but it could not read saved AI provider health information."
-		res.NextAction = "Run `acd doctor` for the safe metadata warning."
-	case status.Replay.State == "degraded":
-		res.Health = controlHealthDegraded
-		res.Summary = fmt.Sprintf("Git publication is retrying after %d consecutive error(s). Checkpoint protection remains active.", status.Replay.ErrorRepeatCount)
-		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the retrying state persists."
-	case status.CaptureErrors > 0 || status.IntentStrategy.PlannerErrorRateRecentWarn:
-		res.Health = controlHealthDegraded
-		res.Summary = "ACD is running with recoverable capture or planning errors."
-		res.NextAction = "No action needed; ACD will retry automatically. Run `acd doctor` if the degraded state persists."
-	case status.PendingEvents > 0 && status.IntentStrategy.Active && status.IntentStrategy.BatchWaitActive:
-		res.Health = controlHealthWaiting
-		res.Summary = fmt.Sprintf("ACD is waiting to group %d protected change(s) into a useful commit.", status.PendingEvents)
-		res.NextAction = "No action needed. ACD will publish when the batch is ready."
-	case status.PendingEvents > 0:
-		res.Health = controlHealthHealthy
-		res.Summary = fmt.Sprintf("ACD is publishing %d protected change(s).", status.PendingEvents)
-		res.NextAction = "No action needed."
-	default:
-		res.Health = controlHealthHealthy
-		res.Summary = "ACD is enabled and running normally."
-		res.NextAction = "No action needed."
-	}
+	applyFinishControlStatus(res, status, daemonAlive)
 }
 
 func controlWorktreeError(command, repoFlag string, err error) error {

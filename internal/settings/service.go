@@ -1,5 +1,4 @@
-// Package settings coordinates operator-authored configuration, strict
-// provider probes, and per-repository runtime activation state.
+// Package settings manages approved configuration and explicit connection probes.
 package settings
 
 import (
@@ -11,7 +10,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 	"unicode"
 
@@ -19,9 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -35,7 +31,6 @@ const (
 )
 
 type ProbeFunc func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error)
-type NudgeFunc func(context.Context, state.DaemonState) error
 
 type Options struct {
 	Roots            paths.Roots
@@ -43,7 +38,6 @@ type Options struct {
 	LookupEnv        func(string) (string, bool)
 	CredentialLookup func(string) (string, bool)
 	Probe            ProbeFunc
-	Nudge            NudgeFunc
 	Now              func() time.Time
 }
 
@@ -56,7 +50,6 @@ type Service struct {
 	lookupEnv        func(string) (string, bool)
 	credentialLookup func(string) (string, bool)
 	probe            ProbeFunc
-	nudge            NudgeFunc
 	now              func() time.Time
 	credentials      credentials.Store
 }
@@ -76,14 +69,13 @@ func NewValidationService(ctx context.Context, opts Options) (*Service, error) {
 // repository or opening repository state. Only global authoring operations are
 // available on the returned service.
 func NewGlobalService(_ context.Context, opts Options) (*Service, error) {
-	lookup, credentialLookup, probe, nudge, now := serviceDefaults(opts)
+	lookup, credentialLookup, probe, now := serviceDefaults(opts)
 	return &Service{
 		store:            config.NewStore(opts.Roots),
 		globalOnly:       true,
 		lookupEnv:        lookup,
 		credentialLookup: credentialLookup,
 		probe:            probe,
-		nudge:            nudge,
 		now:              now,
 		credentials:      credentials.NewStore(opts.Roots),
 	}, nil
@@ -105,10 +97,10 @@ func newService(ctx context.Context, opts Options, openState bool) (*Service, er
 			return nil, fmt.Errorf("acd settings: open state: %w", err)
 		}
 	}
-	lookup, credentialLookup, probe, nudge, now := serviceDefaults(opts)
+	lookup, credentialLookup, probe, now := serviceDefaults(opts)
 	return &Service{store: config.NewStore(opts.Roots), db: db, worktree: wt,
 		repoHash: repoHash, lookupEnv: lookup, credentialLookup: credentialLookup,
-		probe: probe, nudge: nudge, now: now,
+		probe: probe, now: now,
 		credentials: credentials.NewStore(opts.Roots)}, nil
 }
 
@@ -116,7 +108,6 @@ func serviceDefaults(opts Options) (
 	func(string) (string, bool),
 	func(string) (string, bool),
 	ProbeFunc,
-	NudgeFunc,
 	func() time.Time,
 ) {
 	rawLookup := opts.LookupEnv
@@ -132,15 +123,11 @@ func serviceDefaults(opts Options) (
 	if probe == nil {
 		probe = ai.ProbeProviderConfig
 	}
-	nudge := opts.Nudge
-	if nudge == nil {
-		nudge = fingerprintNudge
-	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
 	}
-	return lookup, credentialLookup, probe, nudge, now
+	return lookup, credentialLookup, probe, now
 }
 
 // settingsLookup keeps the provider credential out of the generic settings
@@ -163,7 +150,6 @@ type AuthoringPreview struct {
 	Values     map[string]string
 	Sources    map[string]config.Source
 	Generation uint64
-	Preset     config.PresetResolution `json:"-"`
 }
 
 // AuthoringPreview returns presentation-safe effective authoring values. It is
@@ -176,8 +162,8 @@ func (s *Service) AuthoringPreview() (AuthoringPreview, error) {
 	if err != nil {
 		return AuthoringPreview{}, sanitizeError(err)
 	}
-	input, selected := s.authoringResolutionInput(doc)
-	fields, preset, err := config.ResolveAll(input, selected)
+	input := s.authoringResolutionInput(doc)
+	fields, err := config.ResolveAll(input)
 	if err != nil {
 		return AuthoringPreview{}, sanitizeError(err)
 	}
@@ -190,7 +176,7 @@ func (s *Service) AuthoringPreview() (AuthoringPreview, error) {
 	}
 	return AuthoringPreview{
 		Values: hotValues(values), Sources: sources,
-		Generation: doc.Generation, Preset: preset,
+		Generation: doc.Generation,
 	}, nil
 }
 
@@ -389,7 +375,7 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 			doc.Settings.Global[name] = raw
 		}
 		if req.Changes != nil {
-			fields, _, err := config.ResolveAll(config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)}, doc.Settings.Global)
+			fields, err := config.ResolveAll(config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)})
 			if err != nil {
 				return err
 			}
@@ -448,7 +434,6 @@ type Validation struct {
 	RestartChanged   []string
 	ResolvedHot      map[string]string
 	ProviderConfig   ai.ProviderConfig
-	Preset           config.PresetResolution `json:"-"`
 	SourceGeneration uint64
 }
 
@@ -467,7 +452,7 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 	if err != nil {
 		return Validation{}, sanitizeError(err)
 	}
-	resolved, restartChanged, preset, err := s.resolveDraft(doc, draft)
+	resolved, restartChanged, err := s.resolveDraft(doc, draft)
 	if err != nil {
 		return Validation{}, err
 	}
@@ -508,13 +493,13 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 			missing = append(missing, item)
 		}
 	}
-	fingerprint, err := config.SettingsFingerprint(resolved, preset)
+	fingerprint, err := config.SettingsFingerprint(resolved)
 	if err != nil {
 		return Validation{}, err
 	}
 	return Validation{Fingerprint: fingerprint, Confirmations: required,
 		Missing: missing, RestartChanged: restartChanged, ResolvedHot: hotValues(resolved),
-		ProviderConfig: cfg, Preset: preset, SourceGeneration: doc.Generation}, nil
+		ProviderConfig: cfg, SourceGeneration: doc.Generation}, nil
 }
 
 type ProviderTestResult struct {
@@ -552,8 +537,7 @@ func providerTestConfirmations(confirmations []ai.ConfirmationRequirement) []ai.
 	out := make([]ai.ConfirmationRequirement, 0, len(confirmations))
 	for _, confirmation := range confirmations {
 		if confirmation != ai.ConfirmationDiffEgress &&
-			confirmation != ai.ConfirmationVerificationCommand &&
-			confirmation != ai.ConfirmationIntentRepair {
+			confirmation != ai.ConfirmationVerificationCommand {
 			out = append(out, confirmation)
 		}
 	}
@@ -574,36 +558,36 @@ func missingConfirmations(required, confirmed []ai.ConfirmationRequirement) []ai
 	return missing
 }
 
-func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (map[string]string, []string, config.PresetResolution, error) {
-	baseInput, selected := s.authoringResolutionInput(doc)
-	baseFields, _, err := config.ResolveAll(baseInput, selected)
+func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (map[string]string, []string, error) {
+	baseInput := s.authoringResolutionInput(doc)
+	baseFields, err := config.ResolveAll(baseInput)
 	if err != nil {
-		return nil, nil, config.PresetResolution{}, sanitizeError(err)
+		return nil, nil, sanitizeError(err)
 	}
 	draftOverrides := config.Overrides{}
 	var restartChanged []string
 	for name, raw := range draft {
 		field, ok := config.LookupField(name)
 		if !ok {
-			return nil, nil, config.PresetResolution{}, config.UnsupportedFieldError(cleanText(name))
+			return nil, nil, config.UnsupportedFieldError(cleanText(name))
 		}
 		if field.Sensitive || !field.Persistable {
 			continue
 		}
 		if hasUnsafeText(raw) {
-			return nil, nil, config.PresetResolution{}, fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
+			return nil, nil, fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
 		}
 		normalized, err := normalizeDraftValue(field, raw)
 		if err != nil {
-			return nil, nil, config.PresetResolution{}, err
+			return nil, nil, err
 		}
 		draftOverrides[name], _ = json.Marshal(normalized)
 	}
 	draftInput := baseInput
 	draftInput.Draft = draftOverrides
-	resolvedFields, preset, err := config.ResolveAll(draftInput, draftOverrides)
+	resolvedFields, err := config.ResolveAll(draftInput)
 	if err != nil {
-		return nil, nil, config.PresetResolution{}, sanitizeError(err)
+		return nil, nil, sanitizeError(err)
 	}
 	resolved := make(map[string]string, len(resolvedFields))
 	for _, field := range config.Catalog() {
@@ -614,19 +598,19 @@ func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (m
 		}
 	}
 	sort.Strings(restartChanged)
-	return resolved, restartChanged, preset, nil
+	return resolved, restartChanged, nil
 }
 
-func (s *Service) authoringResolutionInput(doc *config.Document) (config.ResolveInput, config.Overrides) {
+func (s *Service) authoringResolutionInput(doc *config.Document) config.ResolveInput {
 	input := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)}
 	if s.globalOnly {
-		return input, doc.Settings.Global
+		return input
 	}
 	repository := doc.Settings.Repositories[s.repoHash]
 	input.Repository = repository.Fields
 	input.Profile = doc.Settings.Profiles[repository.Profile].Fields
 	input.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"repository:" + s.repoHash, "profile:" + repository.Profile, "global"}, s.lookupEnv)
-	return input, repository.Fields
+	return input
 }
 
 func persistedField(name string) (config.FieldDefinition, error) {
@@ -691,6 +675,9 @@ func (s *Service) providerConfig(values map[string]string) (ai.ProviderConfig, e
 		base.DiffEgress = false
 		return base, nil
 	}
+	if base.Mode != "openai-compat" {
+		return base, nil
+	}
 	key, _, err := credentials.Resolve(s.credentials, s.credentialLookup)
 	if err != nil {
 		return ai.ProviderConfig{}, sanitizeError(err)
@@ -721,26 +708,6 @@ func validateScope(scope Scope, profile string) error {
 	default:
 		return fmt.Errorf("acd settings: unsupported scope %q", cleanText(string(scope)))
 	}
-}
-
-func fingerprintNudge(_ context.Context, st state.DaemonState) error {
-	if st.PID <= 0 || !identity.Alive(st.PID) {
-		return nil
-	}
-	if !st.DaemonFingerprint.Valid || st.DaemonFingerprint.String == "" {
-		return errors.New("acd settings: daemon fingerprint unavailable")
-	}
-	fingerprint, err := identity.Capture(st.PID)
-	if err != nil {
-		return errors.New("acd settings: daemon identity unavailable")
-	}
-	if daemon.FingerprintToken(fingerprint) != st.DaemonFingerprint.String {
-		return errors.New("acd settings: daemon fingerprint mismatch")
-	}
-	if err := syscall.Kill(st.PID, syscall.SIGUSR1); err != nil {
-		return fmt.Errorf("acd settings: signal daemon: %w", err)
-	}
-	return nil
 }
 
 func cleanText(value string) string {

@@ -20,17 +20,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spf13/cobra"
-
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/adapter"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	daemonpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/version"
 )
@@ -43,6 +38,7 @@ func withDoctorTarget(ctx context.Context, repo string) context.Context {
 
 // doctorRepoReport is the per-repo block inside the doctor report.
 type doctorRepoReport struct {
+	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
 	Path                     string                       `json:"path"`
 	RepoHash                 string                       `json:"repo_hash"`
 	StateDB                  string                       `json:"state_db"`
@@ -69,11 +65,6 @@ type doctorRepoReport struct {
 	BlockedConflicts         int                          `json:"blocked_conflicts"`
 	FailedEvents             int                          `json:"failed_events"`
 	FailedBlockingPending    int                          `json:"failed_blocking_pending"`
-	IntentStrategy           intentStrategyReport         `json:"intent_strategy"`
-	Configuration            configReadinessReport        `json:"configuration"`
-	Replay                   replayObservabilityReport    `json:"replay"`
-	IntentV2                 intentV2Report               `json:"intent_v2"`
-	SelfPublication          selfPublicationReport        `json:"self_publication"`
 	LastReplayConflictTS     int64                        `json:"last_replay_conflict_ts,omitempty"`
 	LastReplayConflictPath   string                       `json:"last_replay_conflict_path,omitempty"`
 	LastReplayConflictErr    string                       `json:"last_replay_conflict_error,omitempty"`
@@ -88,7 +79,6 @@ type doctorRepoReport struct {
 	AllChangesCommittedInGit bool                         `json:"all_changes_committed_in_git"`
 	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
 	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
-	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
 }
 
 type doctorHarnessReport struct {
@@ -150,33 +140,6 @@ type doctorReport struct {
 	Harnesses            []doctorHarnessReport `json:"harnesses"`
 	AI                   doctorAIReport        `json:"ai"`
 	Repos                []doctorRepoReport    `json:"repos"`
-}
-
-func newDoctorCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "doctor",
-		Short: "Collect install/runtime diagnostics and support bundles",
-		Long: `Collect broad install and runtime diagnostics across acd state.
-
-Doctor checks the central registry, daemon liveness, harness installs, AI provider settings, safe-ignore and sensitive-glob configuration, fsnotify status, and recent daemon log tails. Use --bundle to write a zip with sanitized diagnostic files for sharing.
-
-Doctor is the support/health command, not the daily "why" view. Use acd status for the current repo snapshot, acd events to follow product decisions, acd explain for path or commit answers, and acd diagnose for focused replay/branch blockers.`,
-		Example: `  acd doctor
-  acd doctor --json
-  acd doctor --bundle
-  acd doctor --bundle --output /tmp
-  acd explain --path internal/state/schema.go
-  acd events --watch`,
-		RunE: func(c *cobra.Command, args []string) error {
-			jsonOut, _ := c.Flags().GetBool("json")
-			bundle, _ := c.Flags().GetBool("bundle")
-			outputDir, _ := c.Flags().GetString("output")
-			return runDoctor(c.Context(), c.OutOrStdout(), bundle, outputDir, jsonOut)
-		},
-	}
-	cmd.Flags().Bool("bundle", false, "Write a doctor zip to ~/Downloads (or --output)")
-	cmd.Flags().String("output", "", "Override the directory for --bundle (default ~/Downloads)")
-	return cmd
 }
 
 func runDoctor(ctx context.Context, out io.Writer, bundle bool, outputDir string, jsonOut bool) error {
@@ -292,12 +255,12 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 		if fileExists(rec.StateDB) {
 			rr.StateDBReadable = readRepoState(ctx, &rr, rec.Path, rec.StateDB)
 			if status, statusErr := buildStatusReport(ctx, rec, time.Now()); statusErr == nil {
+				rr.PublicationOutcome = status.PublicationOutcome
 				rr.Busy = status.Busy
 				rr.OperationalState = status.OperationalState
 				rr.WorktreeClean = status.WorktreeClean
 				rr.AllChangesCommittedInGit = status.AllChangesCommittedInGit
 				rr.CheckpointPublishedByACD = status.CheckpointPublishedByACD
-				rr.PublicationDrain = status.PublicationDrain
 				rr.CheckpointMaintenance = status.CheckpointMaintenance
 				rr.CaptureHealth = status.CaptureHealth
 				if details := maintenanceDetails(status.CheckpointMaintenance); details != "" {
@@ -321,37 +284,15 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 }
 
 func collectDoctorAIForRepo(ctx context.Context, roots paths.Roots, repo string) doctorAIReport {
-	service, err := settings.NewValidationService(ctx, settings.Options{Roots: roots, RepoPath: repo})
+	values, _, err := finishReadOnlyConfigValues(ctx, roots, repo)
 	if err != nil {
-		report := collectDoctorAI()
-		report.Notes = append(report.Notes, "effective repository settings unavailable: "+err.Error())
-		return report
+		return doctorAIReport{Notes: []string{"Saved settings could not be read: " + err.Error()}}
 	}
-	cfg, err := service.AuthoringProviderConfig()
-	if err != nil {
-		report := collectDoctorAI()
-		report.Notes = append(report.Notes, "effective repository provider unavailable: "+err.Error())
-		return report
+	provider := "local"
+	if values["commit.strategy"] == "intent" {
+		provider = values["ai.provider"]
 	}
-	provider := cfg.Mode
-	if provider == "" {
-		provider = "deterministic"
-	}
-	report := doctorAIReport{Provider: provider, APIKeySet: strings.TrimSpace(cfg.APIKey) != ""}
-	if provider == "openai-compat" && !report.APIKeySet {
-		report.Notes = append(report.Notes, "effective provider requires a credential; checkpoint protection remains active")
-	}
-	if strings.HasPrefix(provider, "subprocess:") {
-		name := strings.TrimSpace(strings.TrimPrefix(provider, "subprocess:"))
-		report.ProviderCommand = "acd-provider-" + name
-		if path, lookupErr := exec.LookPath(report.ProviderCommand); lookupErr == nil {
-			report.ProviderCommandFound = true
-			report.ProviderCommandPath = path
-		} else {
-			report.Notes = append(report.Notes, report.ProviderCommand+" not found on PATH")
-		}
-	}
-	return report
+	return doctorAIReport{Provider: provider, Notes: []string{"Credentials are checked by an explicit Intent finish or connection test."}}
 }
 
 func collectDoctorHarnesses() []doctorHarnessReport {
@@ -500,30 +441,8 @@ var driftRemediationCommands = map[string]string{
 	"pi":          "acd setup --integrations=pi",
 }
 
-// scanHookBodyDrift inspects the installed config body for the named harness
-// and returns a non-empty note when one or more lifecycle command bodies are
-// missing their canonical command. Active hooks are:
-//
-//   - claude-code, codex : PreToolUse + PostToolUse entries inside nested JSON
-//     "hooks" map (PascalCase event keys)
-//   - cursor             : sessionStart/postToolUse/afterFileEdit/stop/sessionEnd
-//     flat JSON entries (camelCase keys, top-level `command` per hook)
-//   - opencode, pi       : YAML hook items whose `event:` is `tool.before.*`
-//     or `tool.after.*`
-//
-// Returns "" when no drift is detected, when the harness has no
-// active-hook concept (shell), or when the config cannot be parsed at all
-// (we leave silent rather than scream — drift detection is opportunistic).
-func scanHookBodyDrift(name string, body []byte) string {
-	return scanHookBodyDriftAt(name, body, "")
-}
-
-// scanHookBodyDriftAt is the legacy-aware variant of scanHookBodyDrift. When
-// matchedPath is non-empty (the marker lives on a path other than the
-// canonical primary), the returned note names the matched file in a merge-
-// only remediation so we never recommend a destructive overwrite of a user-
-// authored canonical file. When matchedPath is empty, behaves identically to
-// the canonical-path remediation.
+// scanHookBodyDriftAt checks the installed commands. A noncanonical path gets
+// merge guidance for that file, preserving any user-authored primary config.
 func scanHookBodyDriftAt(name string, body []byte, matchedPath string) string {
 	var stale int
 	switch name {
@@ -564,7 +483,7 @@ var cursorLifecycleEvents = map[string]string{
 	"sessionStart":  "session_open",
 	"postToolUse":   "activity",
 	"afterFileEdit": "activity",
-	"stop":          "logical_boundary",
+	"stop":          "activity",
 	"sessionEnd":    "session_close",
 }
 
@@ -1176,35 +1095,11 @@ func parseLogTimestamp(ln string) (time.Time, bool) {
 }
 
 func collectDoctorAI() doctorAIReport {
-	cfg := ai.LoadProviderConfigFromEnv()
-	provider := cfg.Mode
-	if provider == "" {
-		provider = "deterministic"
+	provider := "local"
+	if os.Getenv("ACD_COMMIT_STRATEGY") == "intent" {
+		provider = os.Getenv("ACD_AI_PROVIDER")
 	}
-	rep := doctorAIReport{
-		Provider: provider,
-	}
-	switch {
-	case provider == "openai-compat":
-		rep.APIKeySet = strings.TrimSpace(os.Getenv(ai.EnvAPIKey)) != ""
-		if !rep.APIKeySet {
-			rep.Notes = append(rep.Notes, "ACD_AI_PROVIDER=openai-compat but ACD_AI_API_KEY is not set")
-		}
-	case strings.HasPrefix(provider, "subprocess:"):
-		name := strings.TrimSpace(strings.TrimPrefix(provider, "subprocess:"))
-		if name == "" {
-			rep.Notes = append(rep.Notes, "ACD_AI_PROVIDER=subprocess: is missing a provider name")
-			break
-		}
-		rep.ProviderCommand = "acd-provider-" + name
-		if path, err := exec.LookPath(rep.ProviderCommand); err == nil {
-			rep.ProviderCommandFound = true
-			rep.ProviderCommandPath = path
-		} else {
-			rep.Notes = append(rep.Notes, rep.ProviderCommand+" not found on PATH")
-		}
-	}
-	return rep
+	return doctorAIReport{Provider: provider}
 }
 
 var doctorProcessList = defaultDoctorProcessList
@@ -1320,246 +1215,37 @@ func doctorRepoIdentity(ctx context.Context, repo string) (string, error) {
 // readRepoState opens the per-repo DB read-only and fills the report fields
 // we can derive from daemon_state, daemon_clients and daemon_meta.
 func readRepoState(ctx context.Context, rr *doctorRepoReport, repoPath, dbPath string) bool {
-	conn, err := openStateDBReadOnly(ctx, dbPath)
+	report, err := buildStatusReport(ctx, central.RepoRecord{Path: repoPath, StateDB: dbPath}, time.Now())
 	if err != nil {
-		rr.Notes = append(rr.Notes, "state.db open failed: "+err.Error())
+		rr.Notes = append(rr.Notes, "Protection state could not be read: "+err.Error())
 		return false
 	}
-	defer conn.Close()
-	ttl := clientTTLForRepo(repoPath)
-
-	var pid int
-	var mode string
-	var heartbeatTS sql.NullFloat64
-	var branchRef sql.NullString
-	var branchGeneration sql.NullInt64
-	row := conn.QueryRowContext(ctx, `SELECT pid, mode, heartbeat_ts, branch_ref, branch_generation FROM daemon_state WHERE id = 1`)
-	if err := row.Scan(&pid, &mode, &heartbeatTS, &branchRef, &branchGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		rr.Notes = append(rr.Notes, "daemon_state read failed: "+err.Error())
-		return true
-	} else if err == nil {
-		rr.DaemonPID = pid
-		rr.DaemonMode = mode
-		rr.DaemonAlive = pid > 0 && identity.Alive(pid)
-		if heartbeatTS.Valid && heartbeatTS.Float64 > 0 {
-			rr.HeartbeatTS = int64(heartbeatTS.Float64)
-			age := time.Since(time.Unix(int64(heartbeatTS.Float64), 0))
-			rr.HeartbeatAgeS = int64(age.Seconds())
-			if age > ttl {
-				rr.HeartbeatStale = true
-			}
-		}
+	rr.PublicationOutcome = report.PublicationOutcome
+	rr.DaemonPID, rr.DaemonMode = report.PID, report.Daemon
+	rr.DaemonAlive = report.PublicationProgress.WorkerResponsive
+	rr.HeartbeatTS, rr.HeartbeatAgeS, rr.HeartbeatStale = report.HeartbeatTS, report.HeartbeatAgeSeconds, report.Stale
+	rr.Clients = len(report.Clients)
+	rr.CaptureHealth = report.CaptureHealth
+	rr.LastCaptureError = report.CaptureHealth.Error
+	rr.Busy, rr.OperationalState = report.Busy, report.OperationalState
+	rr.WorktreeClean, rr.AllChangesCommittedInGit = report.WorktreeClean, report.AllChangesCommittedInGit
+	rr.CheckpointPublishedByACD, rr.CheckpointMaintenance = report.CheckpointPublishedByACD, report.CheckpointMaintenance
+	control := controlResult{Enabled: true}
+	applyFinishControlStatus(&control, report, report.PublicationProgress.WorkerResponsive)
+	if control.NextAction != "No action needed." {
+		rr.Notes = append(rr.Notes, control.NextAction)
 	}
-	if n, err := countDoctorClients(ctx, conn); err == nil {
-		rr.Clients = n
-		if n > 0 {
-			if sessionID, err := latestDoctorClientSession(ctx, conn); err == nil {
-				rr.FlushSessionID = sessionID
-			}
-		}
+	conn, err := openStateDBReadOnly(ctx, dbPath)
+	if err == nil {
+		defer conn.Close()
+		rr.FsnotifyMode, _, _ = metaLookup(ctx, conn, "fsnotify.mode")
+		rr.FsnotifyFallbackReason, _, _ = metaLookup(ctx, conn, "fsnotify.fallback_reason")
+		watches, _, _ := metaLookup(ctx, conn, "fsnotify.watch_count")
+		rr.FsnotifyWatches, _ = strconv.Atoi(watches)
+		dropped, _, _ := metaLookup(ctx, conn, "fsnotify.dropped_events")
+		rr.FsnotifyDropped, _ = strconv.Atoi(dropped)
 	}
-
-	// fsnotify diagnostics — defensive: missing keys mean "not yet
-	// recorded by the fsnotify lane". We do not invent values.
-	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.mode"); ok {
-		rr.FsnotifyMode = v
-	}
-	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.watch_count"); ok {
-		if n, perr := strconv.Atoi(v); perr == nil {
-			rr.FsnotifyWatches = n
-		}
-	}
-	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.dropped_events"); ok {
-		if n, perr := strconv.Atoi(v); perr == nil {
-			rr.FsnotifyDropped = n
-		}
-	}
-	if v, ok, _ := metaLookup(ctx, conn, "fsnotify.fallback_reason"); ok && v != "" {
-		rr.FsnotifyFallbackReason = v
-	}
-	if v, ok, _ := metaLookup(ctx, conn, "last_capture_error"); ok && v != "" {
-		rr.LastCaptureError = v
-	}
-
-	// Pending FIFO depth + terminal blocked-conflict count.
-	// Best-effort: a missing capture_events table (older schema) yields a
-	// note rather than failing the whole doctor run.
-	if n, err := countEventsByStateSQL(ctx, conn, state.EventStatePending); err == nil {
-		rr.PendingEvents = n
-	} else {
-		rr.Notes = append(rr.Notes, "pending events count failed: "+err.Error())
-	}
-	if n, err := countEventsByStateSQL(ctx, conn, state.EventStateBlockedConflict); err == nil {
-		rr.BlockedConflicts = n
-	} else {
-		rr.Notes = append(rr.Notes, "blocked conflicts count failed: "+err.Error())
-	}
-	if n, err := countEventsByStateSQL(ctx, conn, state.EventStateFailed); err == nil {
-		rr.FailedEvents = n
-	} else {
-		rr.Notes = append(rr.Notes, "failed events count failed: "+err.Error())
-	}
-	if n, err := countBlockingTerminalEvents(ctx, conn, state.EventStateFailed); err == nil {
-		rr.FailedBlockingPending = n
-	} else {
-		rr.Notes = append(rr.Notes, "failed blocking pending count failed: "+err.Error())
-	}
-	if intentStrategy, err := loadIntentStrategyReportForPair(
-		ctx, conn, branchRef.String, branchGeneration.Int64); err == nil {
-		rr.IntentStrategy = intentStrategy
-		rr.IntentStrategy.RejectLogPath = plannerRejectLogPath(dbPath)
-		rr.Notes = append(rr.Notes, doctorIntentStrategyNotes(rr.IntentStrategy, repoPath, rr.FlushSessionID)...)
-		if rr.IntentStrategy.LastPlannerError != "" && rr.IntentStrategy.RejectLogPath != "" {
-			rr.Notes = append(rr.Notes,
-				"planner rejects for this worktree: "+rr.IntentStrategy.RejectLogPath)
-		}
-	} else {
-		rr.Notes = append(rr.Notes, "intent planner summary failed: "+err.Error())
-	}
-	if intentV2, err := loadIntentV2Report(ctx, conn); err == nil {
-		rr.IntentV2 = intentV2
-		if intentV2.NeedsAttention != "" {
-			rr.Notes = append(rr.Notes,
-				"Intent v2 replay stopped; capture remains durable; run acd config edit")
-		}
-	} else {
-		rr.Notes = append(rr.Notes, "Intent v2 summary failed: "+err.Error())
-	}
-	if replay, err := loadReplayObservabilityReport(ctx, conn); err == nil {
-		rr.Replay = replay
-		if replay.State == "needs_attention" {
-			rr.Notes = append(rr.Notes,
-				"replay is repeatedly failing; inspect acd diagnose")
-		}
-	} else {
-		rr.Notes = append(rr.Notes,
-			"replay observability failed: "+err.Error())
-	}
-	if publication, err := loadSelfPublicationReport(
-		ctx, conn, dbPath, time.Now(), rr.DaemonProcessCount,
-	); err == nil {
-		rr.SelfPublication = publication
-		if publication.Remediation != "" {
-			rr.Notes = append(rr.Notes, publication.Remediation)
-		}
-	} else {
-		rr.Notes = append(rr.Notes,
-			"self-publication observability failed: "+err.Error())
-	}
-	if readiness, err := loadConfigReadinessReport(ctx, conn, time.Now()); err == nil {
-		rr.Configuration = readiness
-		if readiness.Configuration == "needs_attention" {
-			rr.Notes = append(rr.Notes,
-				"configuration validation needs attention; run acd config edit")
-		}
-	} else {
-		rr.Notes = append(rr.Notes,
-			"configuration readiness failed: "+err.Error())
-	}
-
-	// Most recent terminal blocked_conflict event — gives the operator a
-	// concrete path + timestamp to investigate without rummaging the DB.
-	if rr.BlockedConflicts > 0 {
-		row := conn.QueryRowContext(ctx,
-			`SELECT path, published_ts, error FROM capture_events
-			 WHERE state = ?
-			 ORDER BY seq DESC LIMIT 1`, state.EventStateBlockedConflict)
-		var path string
-		var ts sql.NullFloat64
-		var errMsg sql.NullString
-		if err := row.Scan(&path, &ts, &errMsg); err == nil {
-			rr.LastReplayConflictPath = path
-			if ts.Valid {
-				rr.LastReplayConflictTS = int64(ts.Float64)
-			}
-			if errMsg.Valid {
-				rr.LastReplayConflictErr = errMsg.String
-			}
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			rr.Notes = append(rr.Notes, "last replay conflict lookup failed: "+err.Error())
-		}
-	}
-	if rr.FailedEvents > 0 {
-		row := conn.QueryRowContext(ctx,
-			`SELECT path, published_ts, error FROM capture_events
-			 WHERE state = ?
-			 ORDER BY seq DESC LIMIT 1`, state.EventStateFailed)
-		var path string
-		var ts sql.NullFloat64
-		var errMsg sql.NullString
-		if err := row.Scan(&path, &ts, &errMsg); err == nil {
-			rr.LastReplayFailurePath = path
-			if ts.Valid {
-				rr.LastReplayFailureTS = int64(ts.Float64)
-			}
-			if errMsg.Valid {
-				rr.LastReplayFailureErr = errMsg.String
-			}
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			rr.Notes = append(rr.Notes, "last replay failure lookup failed: "+err.Error())
-		}
-	}
-
 	return true
-}
-
-func doctorIntentStrategyNotes(r intentStrategyReport, repoPath, sessionID string) []string {
-	if !r.BatchWaitActive {
-		return nil
-	}
-	if r.BatchWaitReason == "skipped_due_intent_settle_window" {
-		wait := formatDurationCompact(time.Duration(r.SettleTriggerInSeconds) * time.Second)
-		sessionHint := sessionID
-		if sessionHint == "" {
-			sessionHint = "<active-session-id>"
-		}
-		return []string{
-			fmt.Sprintf("intent replay reached min pending and is waiting for the latest capture to stay quiet for %s (about %s remaining)", formatDurationCompact(time.Duration(r.SettleWindowSeconds)*time.Second), wait),
-			fmt.Sprintf("to publish now, run acd flush --logical --repo %s --session-id %s; explicit flushes bypass intent batch wait and require a registered active session id", repoPath, sessionHint),
-			"to shorten burst collection, lower ACD_INTENT_SETTLE_WINDOW and restart acd",
-			"to disable batching, set ACD_COMMIT_STRATEGY=event and restart acd",
-		}
-	}
-	wait := formatDurationCompact(time.Duration(r.AgeTriggerInSeconds) * time.Second)
-	need := r.MinPending - r.VisiblePendingEvents
-	if need < 0 {
-		need = 0
-	}
-	sessionHint := sessionID
-	if sessionHint == "" {
-		sessionHint = "<active-session-id>"
-	}
-	return []string{
-		fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining)", need, formatDurationCompact(time.Duration(r.MaxPendingAgeSeconds)*time.Second), wait),
-		fmt.Sprintf("to publish now, run acd flush --logical --repo %s --session-id %s; explicit flushes bypass intent batch wait and require a registered active session id", repoPath, sessionHint),
-		"for sparse repos, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE and restart acd",
-		"to disable batching, set ACD_COMMIT_STRATEGY=event and restart acd",
-	}
-}
-
-func countDoctorClients(ctx context.Context, conn *sql.DB) (int, error) {
-	var n int
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM daemon_clients`).Scan(&n); err != nil {
-		return 0, err
-	}
-	return n, nil
-}
-
-func latestDoctorClientSession(ctx context.Context, conn *sql.DB) (string, error) {
-	var sessionID string
-	if err := conn.QueryRowContext(ctx, `SELECT session_id FROM daemon_clients ORDER BY last_seen_ts DESC LIMIT 1`).Scan(&sessionID); err != nil {
-		return "", err
-	}
-	return sessionID, nil
-}
-
-func countEventsByStateSQL(ctx context.Context, conn *sql.DB, stateName string) (int, error) {
-	var n int
-	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE state = ?`, stateName).Scan(&n); err != nil {
-		return 0, err
-	}
-	return n, nil
 }
 
 // tailLogLines returns the last n lines of path. Best-effort: errors yield
@@ -1626,9 +1312,7 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		}
 	}
 	fmt.Fprintf(out, "  ai provider : %s\n", r.AI.Provider)
-	if r.AI.Provider == "openai-compat" {
-		fmt.Fprintf(out, "                api key set=%v\n", r.AI.APIKeySet)
-	}
+
 	if r.AI.ProviderCommand != "" {
 		fmt.Fprintf(out, "                command=%s found=%v", r.AI.ProviderCommand, r.AI.ProviderCommandFound)
 		if r.AI.ProviderCommandPath != "" {
@@ -1655,16 +1339,26 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		if rr.DaemonProcessCount > 0 {
 			fmt.Fprintf(out, "      processes  : %d %v\n", rr.DaemonProcessCount, rr.DaemonProcessPIDs)
 		}
-		fmt.Fprintf(out, "      clients    : %d\n", rr.Clients)
-		fmt.Fprintf(out, "      pending    : %d\n", rr.PendingEvents)
-		if rr.PublicationDrain.ID != "" {
-			fmt.Fprintf(out,
-				"      drain      : %s phase=%s remaining=%d/%d commits=%d\n",
-				rr.PublicationDrain.ID, rr.PublicationDrain.Phase,
-				rr.PublicationDrain.RemainingEvents,
-				rr.PublicationDrain.TargetEvents,
-				rr.PublicationDrain.CommitCount)
+		fmt.Fprintf(out, "      legacy clients: %d\n", rr.Clients)
+		if rr.FsnotifyMode != "" {
+			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
+				rr.FsnotifyMode, rr.FsnotifyWatches, rr.FsnotifyDropped)
+			if rr.FsnotifyFallbackReason != "" {
+				fmt.Fprintf(out, " fallback=%s", rr.FsnotifyFallbackReason)
+			}
+			fmt.Fprintln(out)
 		}
+		if rr.PublicationOutcome.CheckpointAvailable {
+			renderFinishOutcomeHuman(out, rr.PublicationOutcome)
+			if rr.CaptureHealth.Error != "" {
+				fmt.Fprintf(out, "      protection : %s\n", rr.CaptureHealth.Error)
+			}
+			for _, note := range rr.Notes {
+				fmt.Fprintf(out, "      note       : %s\n", note)
+			}
+			continue
+		}
+		fmt.Fprintf(out, "      pending    : %d\n", rr.PendingEvents)
 		if rr.BlockedConflicts > 0 {
 			fmt.Fprintf(out, "      blocked    : %d\n", rr.BlockedConflicts)
 			if rr.LastReplayConflictPath != "" {
@@ -1682,7 +1376,7 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 		if rr.FailedEvents > 0 {
 			fmt.Fprintf(out, "      failed     : %d\n", rr.FailedEvents)
 			if rr.FailedBlockingPending > 0 {
-				fmt.Fprintf(out, "      failed blockers : %d pending successors; run acd fix --dry-run\n", rr.FailedBlockingPending)
+				fmt.Fprintf(out, "      failed blockers : %d pending successors; run acd support recover --dry-run\n", rr.FailedBlockingPending)
 			}
 			if rr.LastReplayFailurePath != "" {
 				bits := []string{rr.LastReplayFailurePath}
@@ -1695,46 +1389,6 @@ func renderDoctorHuman(out io.Writer, r doctorReport) error {
 				}
 				fmt.Fprintf(out, "      last failure : %s\n", strings.Join(bits, " "))
 			}
-		}
-		if rr.IntentStrategy.Active || rr.IntentStrategy.DeferredEvents > 0 || rr.IntentStrategy.LastPlannerError != "" {
-			fmt.Fprintf(out, "      strategy   : %s active=%v deferred=%d forced_ready=%d\n",
-				valueOrUnset(rr.IntentStrategy.Strategy), rr.IntentStrategy.Active, rr.IntentStrategy.DeferredEvents, rr.IntentStrategy.ForcedAgingReady)
-			if rr.IntentStrategy.BatchWaitActive {
-				if rr.IntentStrategy.BatchWaitReason == "skipped_due_intent_settle_window" {
-					fmt.Fprintf(out, "      settle wait: pending=%d newest_age=%s settle=%s trigger_in=%s\n",
-						rr.IntentStrategy.VisiblePendingEvents,
-						formatDurationCompact(time.Duration(rr.IntentStrategy.NewestPendingAgeSeconds)*time.Second),
-						formatDurationCompact(time.Duration(rr.IntentStrategy.SettleWindowSeconds)*time.Second),
-						formatDurationCompact(time.Duration(rr.IntentStrategy.SettleTriggerInSeconds)*time.Second))
-				} else {
-					fmt.Fprintf(out, "      batch wait : pending=%d min_pending=%d oldest_age=%s max_age=%s trigger_in=%s\n",
-						rr.IntentStrategy.VisiblePendingEvents,
-						rr.IntentStrategy.MinPending,
-						formatDurationCompact(time.Duration(rr.IntentStrategy.OldestPendingAgeSeconds)*time.Second),
-						formatDurationCompact(time.Duration(rr.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
-						formatDurationCompact(time.Duration(rr.IntentStrategy.AgeTriggerInSeconds)*time.Second))
-				}
-			}
-			if rr.IntentStrategy.LastPlannerError != "" {
-				fmt.Fprintf(out, "      planner err: seq %d %s\n",
-					rr.IntentStrategy.LastPlannerErrorEventSeq, rr.IntentStrategy.LastPlannerError)
-			}
-		}
-		if rr.IntentV2.Available {
-			renderIntentV2Human(out, rr.IntentV2)
-		}
-		if rr.Configuration.Available {
-			renderConfigReadinessHuman(out, rr.Configuration)
-		}
-		renderReplayObservabilityHuman(out, rr.Replay)
-		renderSelfPublicationHuman(out, rr.SelfPublication, "      ")
-		if rr.FsnotifyMode != "" {
-			fmt.Fprintf(out, "      watcher    : mode=%s watches=%d dropped=%d",
-				rr.FsnotifyMode, rr.FsnotifyWatches, rr.FsnotifyDropped)
-			if rr.FsnotifyFallbackReason != "" {
-				fmt.Fprintf(out, " fallback=%s", rr.FsnotifyFallbackReason)
-			}
-			fmt.Fprintln(out)
 		}
 		if rr.LastCaptureError != "" {
 			fmt.Fprintf(out, "      last error : %s\n", rr.LastCaptureError)
@@ -2086,10 +1740,6 @@ func sanitizeReport(r doctorReport) doctorReport {
 		}
 		if rr.LastCaptureError != "" {
 			c.LastCaptureError = string(sanitizeBytes([]byte(rr.LastCaptureError)))
-		}
-		if rr.Replay.LastError != "" {
-			c.Replay.LastError = string(
-				sanitizeBytes([]byte(rr.Replay.LastError)))
 		}
 		repos = append(repos, c)
 	}

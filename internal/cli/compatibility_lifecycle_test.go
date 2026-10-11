@@ -12,7 +12,7 @@ import (
 func TestCompatibilityLifecycleRequiresExplicitSession(t *testing.T) {
 	withIsolatedHome(t)
 	repo := initRepoForRepoLifecycle(t)
-	for command, replacement := range map[string]string{"start": "on", "stop": "off"} {
+	for _, command := range []string{"start", "stop"} {
 		t.Run(command, func(t *testing.T) {
 			root := newRootCmd()
 			var out bytes.Buffer
@@ -20,7 +20,7 @@ func TestCompatibilityLifecycleRequiresExplicitSession(t *testing.T) {
 			root.SetErr(&out)
 			root.SetArgs([]string{command, "--repo", repo, "--json"})
 			err := root.ExecuteContext(context.Background())
-			if err == nil || !strings.Contains(err.Error(), "acd "+replacement) {
+			if err == nil || !strings.Contains(err.Error(), "unknown command") {
 				t.Fatalf("missing product guidance: %v", err)
 			}
 			if _, err := os.Stat(filepath.Join(repo, ".git", "acd")); !os.IsNotExist(err) {
@@ -59,8 +59,8 @@ func TestCompatibilityHintsPreserveRepositoryOptIn(t *testing.T) {
 			root.SetOut(&bytes.Buffer{})
 			root.SetErr(&bytes.Buffer{})
 			root.SetArgs([]string{command, "--repo", nested, "--session-id", "editor", "--json"})
-			if err := root.ExecuteContext(t.Context()); err != nil {
-				t.Fatalf("unregistered hook should be a harmless no-op: %v", err)
+			if err := root.ExecuteContext(t.Context()); err == nil {
+				t.Fatal("retired hint route was accepted")
 			}
 			if _, err := os.Stat(filepath.Join(repo, ".git", "acd")); !os.IsNotExist(err) {
 				t.Fatalf("hint created repository state: %v", err)

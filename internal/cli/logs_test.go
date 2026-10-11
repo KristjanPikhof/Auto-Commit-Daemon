@@ -74,7 +74,7 @@ func TestLogsMissingLogReturnsActionableError(t *testing.T) {
 		t.Fatal("runLogs returned nil error for missing log")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "daemon log missing") || !strings.Contains(msg, "acd start --repo") || !strings.Contains(msg, "acd doctor") {
+	if !strings.Contains(msg, "daemon log missing") || !strings.Contains(msg, "acd on --repo") || !strings.Contains(msg, "acd doctor") {
 		t.Fatalf("missing log error is not actionable: %v", err)
 	}
 }
@@ -88,7 +88,7 @@ func TestLogsUnregisteredRepoReturnsActionableError(t *testing.T) {
 	if err == nil {
 		t.Fatal("runLogs returned nil error for unregistered repo")
 	}
-	if !strings.Contains(err.Error(), "is not registered") || !strings.Contains(err.Error(), "acd start --repo") {
+	if !strings.Contains(err.Error(), "is not registered") || !strings.Contains(err.Error(), "acd on --repo") {
 		t.Fatalf("unregistered repo error is not actionable: %v", err)
 	}
 }
@@ -157,12 +157,12 @@ func TestLogsCommandRegisteredWithHelp(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&errOut)
-	root.SetArgs([]string{"logs", "--help"})
+	root.SetArgs([]string{"support", "logs", "--help"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("execute help: %v\nstderr:\n%s", err, errOut.String())
 	}
 	help := out.String()
-	for _, want := range []string{"Print the current repo daemon log tail", "--lines", "--follow", "Full AI prompt traces are stored separately"} {
+	for _, want := range []string{"Print recent background-worker log entries", "--lines", "--follow", "raw JSONL", "local paths", "acd support bundle"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("logs help missing %q:\n%s", want, help)
 		}

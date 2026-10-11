@@ -5,62 +5,15 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
-
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
-
-func newRecoverCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:    "recover",
-		Short:  "[DEPRECATED] Run safe recovery (use `acd fix [--clear-pause]`)",
-		Hidden: true,
-		Long: `DEPRECATED: ` + "`acd recover`" + ` delegates to ` + "`acd fix`" + `.
-
-It never retargets captured rows across refs or generations. Each exact
-unpublished pair is proven against stable HEAD or protected at a hidden
-recovery ref before queue state changes.`,
-		Example: `  acd fix --dry-run
-  acd fix --yes
-  acd fix --yes --clear-pause`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			repo, _ := cmd.Flags().GetString("repo")
-			auto, _ := cmd.Flags().GetBool("auto")
-			dryRun, _ := cmd.Flags().GetBool("dry-run")
-			yes, _ := cmd.Flags().GetBool("yes")
-			jsonOut, _ := cmd.Flags().GetBool("json")
-			clearPause, _ := cmd.Flags().GetBool("clear-pause")
-			fmt.Fprintln(cmd.ErrOrStderr(), "acd recover is deprecated; use acd fix [--clear-pause]. See acd fix --help.")
-			return runRecover(cmd.Context(), cmd.OutOrStdout(), repo, auto, dryRun, yes, jsonOut, clearPause)
-		},
-	}
-	cmd.Flags().Bool("auto", false, "(deprecated) Plan recovery automatically from current HEAD")
-	cmd.Flags().Bool("dry-run", false, "(deprecated) Show the safe fix plan without mutating state")
-	cmd.Flags().Bool("yes", false, "(deprecated) Apply safe recovery without an interactive prompt")
-	cmd.Flags().Bool("clear-pause", false, "(deprecated) Also remove the manual pause marker")
-	return cmd
-}
-
-func runRecover(ctx context.Context, out io.Writer, repo string, auto, dryRun, yes, jsonOut, clearPause bool) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if !auto && !dryRun {
-		return fmt.Errorf("acd recover: pass --auto to derive a recovery plan, or --dry-run to inspect first")
-	}
-	if !dryRun && !yes {
-		return fmt.Errorf("acd recover: refusing to mutate state without --yes")
-	}
-	return runFix(ctx, out, repo, dryRun, yes, false, clearPause, jsonOut)
-}
 
 func recoverRepoRecord(repo string) (central.RepoRecord, error) {
 	rec, _, abs, err := lookupRegisteredRepo("recover", repo)

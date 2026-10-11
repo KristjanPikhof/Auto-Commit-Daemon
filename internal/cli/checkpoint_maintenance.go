@@ -28,7 +28,7 @@ func maintenanceDetails(m checkpoint.MaintenanceStatus) string {
 		parts = append(parts, m.Error)
 	}
 	if m.LastSuccessTS > 0 {
-		parts = append(parts, fmt.Sprintf("Last measured: %d bytes retained, %d protected; budget %d bytes.",
+		parts = append(parts, fmt.Sprintf("Last measured: %d bytes of retained Git content, %d protected; budget %d bytes.",
 			m.ContentBytes, m.ProtectedBytes, checkpoint.DefaultContentBudget))
 	}
 	if m.NextAttemptTS > 0 {
@@ -47,12 +47,12 @@ func applyMaintenanceStatus(res *controlResult, report statusReport) {
 	if m.Summary() == "" {
 		return
 	}
-	if res.Health == controlHealthNeedsAttention {
+	if res.Health == controlHealthNeedsAttention || (res.PublicationOutcome.Finish != nil && (res.PublicationOutcome.Finish.State == "failed" || res.PublicationOutcome.Finish.State == "needs_attention")) {
 		// Preserve the more urgent protection/publication failure and its remedy.
 		res.Summary += " " + maintenanceDetails(m)
 		return
 	}
-	if res.Health == controlHealthHealthy && report.PendingEvents == 0 {
+	if res.Health == controlHealthHealthy && report.PendingEvents == 0 && res.PublicationOutcome.Legacy.State != "needs_attention" {
 		res.Summary = maintenanceDetails(m)
 	} else {
 		res.Summary += " " + maintenanceDetails(m)

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 var (
@@ -21,6 +23,58 @@ var (
 	testRepoFixturesRoot string
 	testRepoFixturesErr  error
 )
+
+func seedLegacyBlockedCapture(ctx context.Context, db *state.DB, seq int64, failure string, ts float64, branch sql.NullString, generation sql.NullInt64, head sql.NullString) error {
+	if err := testutil.SeedLegacyCaptureOutcome(ctx, db, seq, state.EventStateBlockedConflict, sql.NullString{}, sql.NullString{String: failure, Valid: true}, sql.NullString{}, ts); err != nil {
+		return err
+	}
+	_, err := db.SQL().ExecContext(ctx, `INSERT INTO publish_state(id,event_seq,branch_ref,branch_generation,source_head,status,error,updated_ts)
+VALUES(1,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET event_seq=excluded.event_seq,branch_ref=excluded.branch_ref,branch_generation=excluded.branch_generation,source_head=excluded.source_head,status=excluded.status,error=excluded.error,updated_ts=excluded.updated_ts`, seq, branch, generation, head, state.EventStateBlockedConflict, failure, ts)
+	return err
+}
+
+func readLegacyDrainFixture(ctx context.Context, db *state.DB, id string) (state.PublicationDrain, error) {
+	var drain state.PublicationDrain
+	err := db.ReadSQL().QueryRowContext(ctx, `SELECT phase,published_event_count,last_error,commit_strategy,commit_format,provider FROM publication_drains WHERE id=?`, id).Scan(&drain.Phase, &drain.PublishedEventCount, &drain.LastError, &drain.CommitStrategy, &drain.CommitFormat, &drain.Provider)
+	return drain, err
+}
+
+type legacyPublishFixture struct {
+	EventSeq         sql.NullInt64
+	BranchRef        sql.NullString
+	BranchGeneration sql.NullInt64
+	SourceHead       sql.NullString
+	Status           string
+	Error            sql.NullString
+}
+
+func seedLegacyPublishFixture(ctx context.Context, db *state.DB, p legacyPublishFixture) error {
+	_, err := db.SQL().ExecContext(ctx, `INSERT INTO publish_state(id,event_seq,branch_ref,branch_generation,source_head,status,error,updated_ts) VALUES(1,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET event_seq=excluded.event_seq,branch_ref=excluded.branch_ref,branch_generation=excluded.branch_generation,source_head=excluded.source_head,status=excluded.status,error=excluded.error,updated_ts=excluded.updated_ts`, p.EventSeq, p.BranchRef, p.BranchGeneration, p.SourceHead, p.Status, p.Error, nowFloat())
+	return err
+}
+
+func readLegacyPublishFixture(ctx context.Context, db *state.DB) (legacyPublishFixture, bool, error) {
+	var p legacyPublishFixture
+	err := db.ReadSQL().QueryRowContext(ctx, `SELECT event_seq,branch_ref,branch_generation,source_head,status,error FROM publish_state WHERE id=1`).Scan(&p.EventSeq, &p.BranchRef, &p.BranchGeneration, &p.SourceHead, &p.Status, &p.Error)
+	if errors.Is(err, sql.ErrNoRows) {
+		return p, false, nil
+	}
+	return p, err == nil, err
+}
+
+func seedLegacyPlannerOffer(ctx context.Context, db *state.DB, seq int64, ts float64) error {
+	_, err := db.SQL().ExecContext(ctx, `INSERT INTO planner_state(event_seq,last_planned_ts) VALUES(?,?)`, seq, ts)
+	return err
+}
+
+func readLegacyDrainByCheckpointFixture(ctx context.Context, db *state.DB, id string) (state.PublicationDrain, bool, error) {
+	var drain state.PublicationDrain
+	err := db.ReadSQL().QueryRowContext(ctx, `SELECT staged_consent,staged_consumed FROM publication_drains WHERE checkpoint_id=?`, id).Scan(&drain.StagedConsent, &drain.StagedConsumed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return drain, false, nil
+	}
+	return drain, err == nil, err
+}
 
 func TestMain(m *testing.M) {
 	code := m.Run()
@@ -51,7 +105,7 @@ func withIsolatedHome(t *testing.T) paths.Roots {
 }
 
 // makeRepoStateDB creates a real Git repo with .git/acd/state.db at <repoDir>
-// with the canonical schema applied. Returns the canonical repo dir,
+// with the archived schema installed for legacy support fixtures. Returns the canonical repo dir,
 // .git/acd/state.db path, and a state.DB handle the caller can write fixture
 // rows into.
 //
@@ -131,6 +185,11 @@ func initTestRepoFixtures() {
 	dbPath := state.DBPathFromGitDir(filepath.Join(empty, ".git"))
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
+		testRepoFixturesErr = err
+		return
+	}
+	if err := testutil.InitLegacy(ctx, db); err != nil {
+		_ = db.Close()
 		testRepoFixturesErr = err
 		return
 	}

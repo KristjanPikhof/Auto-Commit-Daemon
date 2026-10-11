@@ -12,6 +12,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 func TestExplainPathUsesDecisionAndPendingState(t *testing.T) {
@@ -29,7 +30,7 @@ func TestExplainPathUsesDecisionAndPendingState(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AppendDecision: %v", err)
 	}
-	if _, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
+	if _, err := testutil.SeedLegacyCapture(ctx, db, state.CaptureEvent{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
 		BaseHead:         "deadbeef",
@@ -48,7 +49,8 @@ func TestExplainPathUsesDecisionAndPendingState(t *testing.T) {
 	for _, want := range []string{
 		"Path: secret.env",
 		"Skipped protected path secret.env",
-		"Replay is still pending for this path",
+		"Archived captures remain unpublished for this path",
+		"acd support diagnose",
 		"protected",
 	} {
 		if !strings.Contains(got, want) {
@@ -170,11 +172,53 @@ func TestExplainMissingDecisionLedgerIsReadOnly(t *testing.T) {
 	if rep.DecisionLedgerAvailable || !strings.Contains(rep.Explanation, "Decision ledger is not available") {
 		t.Fatalf("unexpected explain report: %+v", rep)
 	}
+	if !strings.Contains(rep.Recommended, "acd status") || strings.Contains(rep.Recommended, "restart acd") {
+		t.Fatalf("missing-ledger recommendation=%q", rep.Recommended)
+	}
 	if after := mustSHA256(t, dbPath); after != before {
 		t.Fatalf("state.db checksum changed: before=%s after=%s", before, after)
 	}
 	if got := readUserVersionReadOnly(t, dbPath); got != versionBefore {
 		t.Fatalf("user_version changed: before=%d after=%d", versionBefore, got)
+	}
+}
+
+func TestExplainArchivedDecisionsUseCurrentRecoveryCommands(t *testing.T) {
+	roots := withIsolatedHome(t)
+	repo, _, db := makeExplainRepo(t, roots)
+	ctx := context.Background()
+	for _, scenario := range []struct {
+		kind, command string
+	}{
+		{state.DecisionKindIntentDeferred, "acd support diagnose"},
+		{state.DecisionKindIntentForced, "acd support diagnose"},
+		{state.DecisionKindIntentPlannerError, "acd support diagnose"},
+		{state.DecisionKindBlocked, "acd support recover --dry-run"},
+		{state.DecisionKindCaptured, "acd history activity --watch"},
+	} {
+		t.Run(scenario.kind, func(t *testing.T) {
+			if _, err := state.AppendDecision(ctx, db, state.DecisionRecord{
+				Kind: scenario.kind, Path: sqlNullStr("saved.go"), Reason: sqlNullStr("original archived reason"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			if err := runExplain(ctx, &out, repo, "", "", false, 0, 10, true); err != nil {
+				t.Fatal(err)
+			}
+			var report explainReport
+			if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(report.Recommended, scenario.command) {
+				t.Fatalf("archived %s recommendation=%q", scenario.kind, report.Recommended)
+			}
+			for _, retired := range []string{"acd events", "acd diagnose", "acd fix", "replay will", "falls back", "being forced"} {
+				if strings.Contains(report.Recommended, retired) {
+					t.Fatalf("archived decision promises retired behavior: %q", report.Recommended)
+				}
+			}
+		})
 	}
 }
 
@@ -193,7 +237,7 @@ func TestExplainValidationAndHelp(t *testing.T) {
 	var out, errOut bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&errOut)
-	root.SetArgs([]string{"explain", "--help"})
+	root.SetArgs([]string{"history", "explain", "--help"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("explain help: %v\nstderr:\n%s", err, errOut.String())
 	}

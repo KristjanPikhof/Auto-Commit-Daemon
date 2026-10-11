@@ -12,10 +12,10 @@ import (
 
 func TestDecisionRecordsRoundTripAndQueries(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 
-	evSeq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+	evSeq, err := fixtureAppendCaptureEvent(ctx, d, CaptureEvent{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 3,
 		BaseHead:         "abc123",
@@ -24,7 +24,7 @@ func TestDecisionRecordsRoundTripAndQueries(t *testing.T) {
 		Fidelity:         "exact",
 	}, []CaptureOp{{Op: "modify", Path: "src/app.go", Fidelity: "exact"}})
 	if err != nil {
-		t.Fatalf("AppendCaptureEvent: %v", err)
+		t.Fatalf("fixtureAppendCaptureEvent: %v", err)
 	}
 
 	firstID, err := AppendDecision(ctx, d, DecisionRecord{
@@ -119,7 +119,7 @@ func TestDecisionRecordsRoundTripAndQueries(t *testing.T) {
 
 func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 
 	type eventCase struct {
@@ -136,7 +136,7 @@ func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
 	decisionIDs := make(map[int64]int64, len(cases))
 	for i, tc := range cases {
 		path := fmt.Sprintf("src/%s.go", tc.name)
-		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+		seq, err := fixtureAppendCaptureEvent(ctx, d, CaptureEvent{
 			BranchRef:        "refs/heads/main",
 			BranchGeneration: 1,
 			BaseHead:         fmt.Sprintf("base-%s", tc.name),
@@ -149,7 +149,7 @@ func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
 			CommitOID:        sqlNullStr(fmt.Sprintf("commit-%s", tc.name)),
 		}, []CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
 		if err != nil {
-			t.Fatalf("AppendCaptureEvent %s: %v", tc.name, err)
+			t.Fatalf("fixtureAppendCaptureEvent %s: %v", tc.name, err)
 		}
 		id, err := AppendDecision(ctx, d, DecisionRecord{
 			DecisionTS:  float64(30 + i),
@@ -166,20 +166,15 @@ func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
 		decisionIDs[seq] = id
 	}
 
-	publishedPruned, err := PrunePublishedEventsBefore(ctx, d, 100)
+	publishedPruned, err := fixtureDeletePublishedEvents(ctx, d)
 	if err != nil {
 		t.Fatalf("PrunePublishedEventsBefore: %v", err)
 	}
 	if publishedPruned != 1 {
 		t.Fatalf("published pruned = %d, want 1", publishedPruned)
 	}
-	terminalPruned, err := PruneTerminalEventsBefore(ctx, d, 100)
-	if err != nil {
-		t.Fatalf("PruneTerminalEventsBefore: %v", err)
-	}
-	if terminalPruned != 0 {
-		t.Fatalf("terminal pruned = %d, want 0 without recovery refs", terminalPruned)
-	}
+	// Failed and blocked archived captures remain immutable without a recovery
+	// proof. Only the published fixture row is removed for this FK regression.
 
 	for _, seq := range seqs {
 		var eventCount int
@@ -209,7 +204,7 @@ func TestDecisionRecordsEventSeqSurvivesPrune(t *testing.T) {
 
 func TestDecisionRecordsValidateAndClamp(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 
 	if _, err := AppendDecision(ctx, d, DecisionRecord{}); err == nil {
@@ -334,7 +329,7 @@ PRAGMA user_version = 5;`); err != nil {
 	if fkCount != 0 {
 		t.Fatalf("decision_records foreign keys = %d, want 0", fkCount)
 	}
-	pruned, err := PrunePublishedEventsBefore(ctx, d, 100)
+	pruned, err := fixtureDeletePublishedEvents(ctx, d)
 	if err != nil {
 		t.Fatalf("PrunePublishedEventsBefore: %v", err)
 	}
@@ -409,7 +404,7 @@ PRAGMA user_version = 4;`); err != nil {
 
 func TestDecisionRecordsConcurrentAppendAndCursor(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 
 	const writers = 8

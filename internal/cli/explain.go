@@ -18,18 +18,17 @@ import (
 const defaultExplainLimit = 10
 
 type explainReport struct {
-	Repo                    string         `json:"repo"`
-	Mode                    string         `json:"mode"`
-	Path                    string         `json:"path,omitempty"`
-	Commit                  string         `json:"commit,omitempty"`
-	CurrentState            string         `json:"current_state,omitempty"`
-	PendingEvents           int            `json:"pending_events,omitempty"`
-	Explanation             string         `json:"explanation"`
-	Recommended             string         `json:"recommended_next_step"`
-	DecisionCursor          int64          `json:"decision_cursor,omitempty"`
-	DecisionLedgerAvailable bool           `json:"decision_ledger_available"`
-	Decisions               []eventEntry   `json:"decisions"`
-	IntentV2                intentV2Report `json:"intent_v2"`
+	Repo                    string       `json:"repo"`
+	Mode                    string       `json:"mode"`
+	Path                    string       `json:"path,omitempty"`
+	Commit                  string       `json:"commit,omitempty"`
+	CurrentState            string       `json:"current_state,omitempty"`
+	PendingEvents           int          `json:"pending_events,omitempty"`
+	Explanation             string       `json:"explanation"`
+	Recommended             string       `json:"recommended_next_step"`
+	DecisionCursor          int64        `json:"decision_cursor,omitempty"`
+	DecisionLedgerAvailable bool         `json:"decision_ledger_available"`
+	Decisions               []eventEntry `json:"decisions"`
 }
 
 func newExplainCmd() *cobra.Command {
@@ -118,11 +117,6 @@ func collectExplain(ctx context.Context, repo, path, commit string, last bool, s
 
 func buildExplainReport(ctx context.Context, repo string, db *sql.DB, path, commit string, last bool, since int64, limit int) (explainReport, error) {
 	report := explainReport{Repo: repo}
-	intentV2, err := loadIntentV2Report(ctx, db)
-	if err != nil {
-		return report, fmt.Errorf("acd explain: Intent v2 summary: %w", err)
-	}
-	report.IntentV2 = intentV2
 	var rows []state.DecisionRecord
 	hasLedger, err := sqliteTableExists(ctx, db, "decision_records")
 	if err != nil {
@@ -203,21 +197,21 @@ LIMIT ?`, resolved, limit)
 func summarizeExplain(report explainReport) (string, string) {
 	if len(report.Decisions) == 0 {
 		if !report.DecisionLedgerAvailable {
-			return missingDecisionLedgerMessage, "Run `acd status`; start or restart acd with a current version if you need product decision history."
+			return missingDecisionLedgerMessage, "Run `acd status` for current protection and finish requests, or `acd history` for saved snapshots."
 		}
 		if report.DecisionCursor > 0 && report.Mode == "recent" {
-			return "No ACD decisions have been recorded after that cursor.", "Run `acd events --watch` to stream newly appended decisions."
+			return "No archived ACD decisions have been recorded after that cursor.", "Run `acd history activity --watch` to follow recorded activity."
 		}
 		switch report.Mode {
 		case "path":
 			if report.PendingEvents > 0 {
-				return "ACD has pending captured work for this path, but no product decision has been recorded yet.", "Run `acd events --path <path>` or `acd status`; replay should publish it when unblocked."
+				return "Archived captures for this path remain unpublished, with no recorded decision.", "Run `acd support diagnose` to inspect preserved work; use `acd finish` to publish new saved work."
 			}
 			return "No ACD decision is recorded for this path yet.", "Check whether the file is ignored, sensitive, unchanged, or outside the registered repo."
 		case "commit":
-			return "No ACD decision is linked to this commit.", "Use `acd events --limit 20` or `git log` to inspect nearby activity."
+			return "No ACD decision is linked to this commit.", "Use `acd history activity --limit 20` or `git log` to inspect nearby activity."
 		default:
-			return "No ACD decisions have been recorded yet.", "Start the daemon and make a tracked change, then run `acd events` or `acd explain --path <path>`."
+			return "No archived ACD decisions have been recorded.", "Run `acd on` to save changes, `acd status` to inspect protection, and `acd finish` when work is ready to publish."
 		}
 	}
 	latest := report.Decisions[0]
@@ -232,7 +226,7 @@ func summarizeExplain(report explainReport) (string, string) {
 	}
 	next := nextStepByKind(latest)
 	if report.Mode == "path" && report.PendingEvents > 0 {
-		next = "Replay is still pending for this path; run `acd status` to check blockers."
+		next = "Archived captures remain unpublished for this path; run `acd support diagnose` to inspect preserved work."
 	}
 	return explanation, next
 }
@@ -244,9 +238,9 @@ func explainByKind(d eventEntry) string {
 	}
 	switch d.Kind {
 	case state.DecisionKindIntentDeferred:
-		return fmt.Sprintf("ACD deferred %s from the current intent planning window because %s.", path, fallback(d.Reason, "the planner selected a different group"))
+		return fmt.Sprintf("An earlier ACD version deferred %s from an intent planning window because %s.", path, fallback(d.Reason, "the planner selected a different group"))
 	case state.DecisionKindIntentForced:
-		return fmt.Sprintf("ACD forced %s into a one-item intent planning window after repeated deferrals.", path)
+		return fmt.Sprintf("An earlier ACD version forced %s into a one-item intent planning window after repeated deferrals.", path)
 	case state.DecisionKindIntentPlannerError:
 		return fmt.Sprintf("ACD rejected an intent planner result for %s because %s.", path, fallback(d.Reason, "the planner output failed validation"))
 	case state.DecisionKindProtected, state.DecisionKindSkipped:
@@ -268,18 +262,14 @@ func nextStepByKind(d eventEntry) string {
 	switch d.Kind {
 	case state.DecisionKindProtected, state.DecisionKindSkipped:
 		return "No action is needed unless you want to change ignore/sensitive settings."
-	case state.DecisionKindIntentDeferred:
-		return "No action needed; replay will reconsider this capture in a later intent planning window."
-	case state.DecisionKindIntentForced:
-		return "No action needed; this capture is being forced through a one-item planning window."
-	case state.DecisionKindIntentPlannerError:
-		return "No action needed unless this repeats; ACD falls back to deterministic planning for safety."
+	case state.DecisionKindIntentDeferred, state.DecisionKindIntentForced, state.DecisionKindIntentPlannerError:
+		return "This archived decision does not schedule publication. Run `acd support diagnose` to inspect preserved work; use `acd finish` for new saved work."
 	case state.DecisionKindHandledExternal, state.DecisionKindSupersededExternal, state.DecisionKindCommitted:
 		return "No action needed."
 	case state.DecisionKindBlocked:
-		return "Run `acd diagnose` or `acd fix --dry-run`."
+		return "Run `acd support diagnose` or `acd support recover --dry-run`."
 	default:
-		return "Run `acd events --watch` for live decisions."
+		return "Run `acd history activity --watch` for recorded activity."
 	}
 }
 
@@ -322,7 +312,6 @@ func renderExplainHuman(out io.Writer, report explainReport) error {
 	}
 	fmt.Fprintf(out, "Explanation: %s\n", report.Explanation)
 	fmt.Fprintf(out, "Next: %s\n", report.Recommended)
-	renderIntentV2Human(out, report.IntentV2)
 	if len(report.Decisions) > 0 {
 		fmt.Fprintln(out, "\nRecent decisions:")
 		return renderEventsTable(out, report.Decisions)

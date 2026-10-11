@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
@@ -28,11 +29,36 @@ type RetentionSummary struct {
 }
 
 func (s Store) RecoverRetention(ctx context.Context, repoRoot string) error {
+	if err := state.CheckRetentionLegacyProof(ctx, s.DB); err != nil {
+		return err
+	}
 	items, err := state.PreparedCheckpointPrunes(ctx, s.DB)
 	if err != nil {
 		return err
 	}
 	for _, item := range items {
+		var worktree string
+		if err := s.DB.ReadSQL().QueryRowContext(ctx, "SELECT worktree_id FROM checkpoints WHERE id=?", item.CheckpointID).Scan(&worktree); err != nil {
+			return err
+		}
+		checkpoints, err := state.RetentionCheckpoints(ctx, s.DB, worktree)
+		if err != nil {
+			return err
+		}
+		allowed := false
+		retainedRank := 0
+		for _, cp := range checkpoints {
+			if cp.ID == item.CheckpointID {
+				allowed = retainedRank >= DefaultMinimumRetained && cp.Ref == item.Ref && cp.CommitOID == item.CommitOID && (cp.Published || cp.Superseded) && !cp.Unresolved && !cp.LatestComplete && cp.Reason != state.CheckpointReasonPreRestore
+			}
+			if cp.Retained {
+				retainedRank++
+			}
+		}
+		if !allowed {
+			_ = state.AdvanceOperation(ctx, s.DB, item.OperationID, state.OperationNeedsAttention, state.OperationNeedsAttention, "checkpoint acquired a new retention obligation")
+			return errors.New("checkpoint: interrupted prune acquired a new retention obligation")
+		}
 		if err := gitpkg.DeletePrivateRefDurable(ctx, repoRoot, gitpkg.CheckpointRefPrefix, item.Ref, item.CommitOID); err != nil {
 			_ = state.AdvanceOperation(context.Background(), s.DB, item.OperationID,
 				state.OperationNeedsAttention, state.OperationNeedsAttention, "checkpoint retention ref changed")
@@ -60,14 +86,18 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 	if err != nil {
 		return summary, err
 	}
+	extraRefs, err := s.retentionEvidenceRefs(ctx, repoRoot, worktreeID, checkpoints)
+	if err != nil {
+		return summary, retentionSafetyError{err}
+	}
 	objects, err := s.inventoryRetentionRefs(ctx, repoRoot,
-		retentionRefs(checkpoints, nil))
+		append(retentionRefs(checkpoints, nil), extraRefs...))
 	if err != nil {
 		return summary, fmt.Errorf("checkpoint: inventory retained refs: %w", err)
 	}
 	summary.ContentBytes = inventoryBytes(objects)
 	candidates, err := s.retentionCandidates(
-		ctx, repoRoot, checkpoints, now, summary.ContentBytes)
+		ctx, repoRoot, checkpoints, extraRefs, now, summary.ContentBytes)
 	if err != nil {
 		return summary, err
 	}
@@ -77,18 +107,18 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 	}
 	if len(candidates) > 0 {
 		objects, err = s.inventoryRetentionRefs(ctx, repoRoot,
-			retentionRefs(checkpoints, candidateIDs))
+			append(retentionRefs(checkpoints, candidateIDs), extraRefs...))
 		if err != nil {
 			return summary, fmt.Errorf("checkpoint: inventory retained refs after pruning: %w", err)
 		}
 		summary.ContentBytes = inventoryBytes(objects)
 	}
-	protectedRefs := make([]string, 0)
+	protectedRefs := append([]string(nil), extraRefs...)
 	for _, item := range checkpoints {
 		if !item.Retained || candidateIDs[item.ID] {
 			continue
 		}
-		if !item.Published || item.Unresolved || item.Reason == state.CheckpointReasonPreRestore {
+		if (!item.Published && !item.Superseded) || item.Unresolved || item.LatestComplete || item.Reason == state.CheckpointReasonPreRestore {
 			protectedRefs = append(protectedRefs, item.Ref)
 		}
 	}
@@ -120,6 +150,9 @@ func (s Store) ApplyRetention(ctx context.Context, repoRoot, worktreeID string, 
 			summary.Retained++
 		}
 	}
+	if _, err := state.CompactPrunedCheckpoints(ctx, s.DB, worktreeID, state.CheckpointRetentionBatchLimit); err != nil {
+		return summary, retentionSafetyError{err}
+	}
 	summary.OverBudget = summary.ContentBytes > DefaultContentBudget
 	return summary, nil
 }
@@ -133,14 +166,23 @@ func (s Store) retentionCandidates(
 	ctx context.Context,
 	repoRoot string,
 	checkpoints []state.RetentionCheckpoint,
+	extraRefs []string,
 	now time.Time,
 	contentBytes int64,
 ) ([]state.RetentionCheckpoint, error) {
 	eligible := make([]retentionCandidate, 0)
+	retainedRank := map[string]int{}
+	rank := 0
+	for _, cp := range checkpoints {
+		if cp.Retained {
+			retainedRank[cp.ID] = rank
+			rank++
+		}
+	}
 	for index := len(checkpoints) - 1; index >= 0; index-- {
 		item := checkpoints[index]
-		if !item.Retained || !item.Published || item.Unresolved || item.LatestComplete ||
-			index < DefaultMinimumRetained ||
+		if !item.Retained || (!item.Published && !item.Superseded) || item.Unresolved || item.LatestComplete ||
+			retainedRank[item.ID] < DefaultMinimumRetained ||
 			item.Reason == state.CheckpointReasonPreRestore {
 			continue
 		}
@@ -153,6 +195,9 @@ func (s Store) retentionCandidates(
 			checkpoint: item,
 			expired:    age >= DefaultPublishedRetention,
 		})
+		if len(eligible) == state.CheckpointRetentionBatchLimit {
+			break
+		}
 	}
 	if contentBytes <= DefaultContentBudget {
 		return expiredRetentionCandidates(eligible), nil
@@ -175,7 +220,7 @@ func (s Store) retentionCandidates(
 			excluded[candidate.checkpoint.ID] = true
 		}
 		objects, err := s.inventoryRetentionRefs(ctx, repoRoot,
-			retentionRefs(checkpoints, excluded))
+			append(retentionRefs(checkpoints, excluded), extraRefs...))
 		if err != nil {
 			return nil, fmt.Errorf("checkpoint: evaluate retention budget: %w", err)
 		}
@@ -244,4 +289,53 @@ func inventoryBytes(objects map[string]int64) int64 {
 		total += size
 	}
 	return total
+}
+
+// Retain every private proof namespace, including durable refs left by a crash
+// before its SQLite journal pointer. Known journal refs must still match exactly.
+func (s Store) retentionEvidenceRefs(ctx context.Context, repo, worktree string, checkpoints []state.RetentionCheckpoint) ([]string, error) {
+	pins, err := state.RetentionObjectPins(ctx, s.DB, worktree)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := gitpkg.RunWithLimit(ctx, gitpkg.RunOpts{Dir: repo}, 8<<20, "for-each-ref", "--format=%(refname) %(objectname) %(symref)", "refs/acd/")
+	if err != nil {
+		return nil, err
+	}
+	refs := map[string]string{}
+	checkpointRefs := map[string]string{}
+	for _, cp := range checkpoints {
+		if cp.Retained {
+			checkpointRefs[cp.Ref] = cp.CommitOID
+		}
+	}
+	var extras []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("checkpoint: private proof ref is symbolic or malformed: %s", line)
+		}
+		refs[fields[0]] = fields[1]
+		if _, known := checkpointRefs[fields[0]]; !known {
+			extras = append(extras, fields[0])
+		}
+	}
+	for ref, oid := range checkpointRefs {
+		if refs[ref] != oid {
+			return nil, fmt.Errorf("checkpoint: retained checkpoint ref %s is missing or moved", ref)
+		}
+	}
+	for _, p := range pins {
+		oid, exists := refs[p.Ref]
+		if !exists && p.Optional {
+			continue
+		}
+		if !exists || oid != p.CommitOID {
+			return nil, fmt.Errorf("checkpoint: retained evidence ref %s is missing or moved; restore its exact saved proof", p.Ref)
+		}
+	}
+	return extras, nil
 }

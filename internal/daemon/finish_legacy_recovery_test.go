@@ -25,7 +25,7 @@ func TestFinishLegacySymbolicBranchCannotSettleOldJournal(t *testing.T) {
 			if _, err := git.Run(ctx, git.RunOpts{Dir: f.dir}, "symbolic-ref", publication.BranchRef, "refs/heads/alias-target"); err != nil {
 				t.Fatal(err)
 			}
-			_, err := RecoverSelfPublications(ctx, f.dir, f.db, f.cctx, ReplayOpts{})
+			_, err := RecoverSelfPublications(ctx, f.dir, f.db, f.cctx, SelfPublicationRecoveryOptions{})
 			if !errors.Is(err, ErrSelfPublicationRecoveryAmbiguous) {
 				t.Fatalf("branch alias accepted: %v", err)
 			}

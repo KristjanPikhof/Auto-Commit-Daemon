@@ -16,16 +16,15 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settings"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 type productDoctorSettings struct {
+	Style              string   `json:"style"`
 	Provider           string   `json:"provider"`
 	ProviderSource     string   `json:"provider_source"`
 	Strategy           string   `json:"strategy"`
 	StrategySource     string   `json:"strategy_source"`
-	Preset             string   `json:"preset"`
 	Verification       string   `json:"verification"`
 	RepairEnabled      bool     `json:"repair_enabled"`
 	DiffEgressEnabled  bool     `json:"diff_egress_enabled"`
@@ -67,7 +66,7 @@ the exact next command to run.`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include queue, provider, phase, and worker details")
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include finish progress, protection, and worker details")
 	return cmd
 }
 
@@ -150,35 +149,30 @@ func collectProductDoctorSettings(ctx context.Context, repo string) productDocto
 		details.ConfigurationNotes = append(details.ConfigurationNotes, err.Error())
 		return details
 	}
-	service, err := settings.NewValidationService(ctx, settings.Options{Roots: roots, RepoPath: repo})
+	values, source, err := finishReadOnlyConfigValues(ctx, roots, repo)
 	if err != nil {
 		details.ConfigurationNotes = append(details.ConfigurationNotes, err.Error())
 		return details
 	}
-	defer service.Close()
-	preview, err := service.AuthoringPreview()
-	if err != nil {
-		details.ConfigurationNotes = append(details.ConfigurationNotes, err.Error())
-		return details
+	details.Provider = values[config.FieldProvider]
+	details.ProviderSource = source
+	details.Strategy = values[config.FieldCommitStrategy]
+	details.StrategySource = source
+	if details.Strategy == "local" {
+		details.Provider = "local"
 	}
-	details.Provider = preview.Values[config.FieldProvider]
-	details.ProviderSource = string(preview.Sources[config.FieldProvider])
-	details.Strategy = preview.Values[config.FieldCommitStrategy]
-	details.StrategySource = string(preview.Sources[config.FieldCommitStrategy])
-	details.Preset = preview.Values[config.FieldCommitPreset]
-	details.Verification = preview.Values[config.FieldIntentVerification]
-	details.RepairEnabled = truthyConfig(preview.Values[config.FieldIntentRepairEnabled])
-	details.DiffEgressEnabled = truthyConfig(preview.Values[config.FieldDiffEgress])
+	details.Style = values[config.FieldCommitFormat]
+	details.Verification = values[config.FieldIntentVerification]
+	details.DiffEgressEnabled = truthyConfig(values[config.FieldDiffEgress])
 	return details
 }
 
 func renderProductDoctorSettings(out io.Writer, details productDoctorSettings) {
 	fmt.Fprintln(out, "\nCommit settings:")
 	fmt.Fprintf(out, "  AI provider: %s (from %s)\n", valueOrUnset(details.Provider), valueOrUnset(details.ProviderSource))
-	fmt.Fprintf(out, "  Commit style: %s / %s (from %s)\n", valueOrUnset(details.Strategy),
-		valueOrUnset(details.Preset), valueOrUnset(details.StrategySource))
+	fmt.Fprintf(out, "  Finish mode: %s (from %s)\n", valueOrUnset(details.Strategy), valueOrUnset(details.StrategySource))
+	fmt.Fprintf(out, "  Message style: %s\n", valueOrUnset(details.Style))
 	fmt.Fprintf(out, "  Project checks: %s\n", valueOrUnset(details.Verification))
-	fmt.Fprintf(out, "  Automatic repair: %s\n", yesNo(details.RepairEnabled))
 	fmt.Fprintf(out, "  Share file differences with AI: %s\n", yesNo(details.DiffEgressEnabled))
 	for _, note := range details.ConfigurationNotes {
 		fmt.Fprintf(out, "  Note: %s\n", note)
@@ -212,8 +206,7 @@ func renderProductDiagnoseReport(out io.Writer, report diagnoseReport) error {
 			Actions: []productAction{}, NextAction: &next, Data: report,
 		})
 	}
-	if report.PublicationDrain.Phase == state.PublicationDrainNeedsAction ||
-		report.OperationalState == "needs_attention" {
+	if report.OperationalState == "needs_attention" {
 		next := "Review the blocked drain and run `acd support logs --lines 100` for the failure context."
 		return renderJSONEnvelope(out, productEnvelope{
 			OK: true, State: productStateNeedsAction,
@@ -292,17 +285,6 @@ func runProductEvents(
 		return runEvents(ctx, out, repo, path, since, limit, watch, interval, false)
 	}
 	report, err := collectEvents(ctx, repo, path, since, limit)
-	if err != nil {
-		return err
-	}
-	return renderAdvancedResult(out, productStateProtected, report)
-}
-
-func runProductPrompt(ctx context.Context, out io.Writer, repo string, last bool, seq int64, jsonOut bool) error {
-	if !jsonOut {
-		return runPrompt(ctx, out, repo, last, seq, false)
-	}
-	report, err := collectPrompt(ctx, repo, last, seq)
 	if err != nil {
 		return err
 	}
@@ -459,14 +441,26 @@ func loadCheckpointHistory(ctx context.Context, repo string) ([]historyEntry, er
 		return nil, fmt.Errorf("acd history: open state.db read-only: %w", err)
 	}
 	defer db.Close()
+	coverage := "cp.coverage_complete"
+	if projection.SchemaVersion < 29 {
+		coverage = "1"
+	}
+	hasCaptures, err := state.LegacyTableExists(ctx, db, "capture_events")
+	if err != nil {
+		return nil, fmt.Errorf("acd history: inspect legacy evidence: %w", err)
+	}
+	membership := "COUNT(ce.event_seq), 0, 0"
+	legacyJoin := ""
+	if hasCaptures {
+		membership = "COUNT(ce.event_seq), COALESCE(SUM(e.state='published'),0), COALESCE(SUM(e.state='recovered'),0)"
+		legacyJoin = "LEFT JOIN capture_events e ON e.seq=ce.event_seq"
+	}
 	rows, err := db.QueryContext(ctx, `
-SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid, cp.retained, cp.coverage_complete,
-       COUNT(ce.event_seq),
-       COALESCE(SUM(CASE WHEN e.state='published' THEN 1 ELSE 0 END), 0),
-       COALESCE(SUM(CASE WHEN e.state='recovered' THEN 1 ELSE 0 END), 0)
+SELECT cp.id, cp.seq, cp.reason, cp.phase, cp.created_ts, cp.commit_oid, cp.retained, `+coverage+`,
+       `+membership+`
 FROM checkpoints cp
 LEFT JOIN checkpoint_events ce ON ce.checkpoint_id=cp.id
-LEFT JOIN capture_events e ON e.seq=ce.event_seq
+`+legacyJoin+`
 GROUP BY cp.id
 ORDER BY cp.seq DESC
 LIMIT 100`)
@@ -486,7 +480,7 @@ LIMIT 100`)
 		}
 		entry.Published = entry.Phase == state.CheckpointCompleted && entry.EventCount > 0 && publishedEvents+entry.RecoveredEvents == entry.EventCount
 		entry.Outcome = checkpointOutcome(entry.Phase, entry.EventCount, publishedEvents, entry.RecoveredEvents)
-		entry.PublicationOutcome = publicationOutcome{CheckpointAvailable: true, Protected: complete && entry.Phase == state.CheckpointCompleted, Resolved: entry.Published, RecoveredChanges: entry.RecoveredEvents}
+		entry.PublicationOutcome = publicationOutcome{CheckpointAvailable: true, Protected: entry.Retained && complete && entry.Phase == state.CheckpointCompleted, Resolved: entry.Published, RecoveredChanges: entry.RecoveredEvents}
 		if !complete {
 			entry.Published = false
 			entry.Outcome = "partial"
@@ -618,7 +612,7 @@ sharing it. This command does not change repository state.`,
 		},
 	}
 	bundle.Flags().String("output", "", "Folder for the support archive")
-	cmd.AddCommand(diagnose, logs, repair, newSupportRecoverCmd(), newSupportPromptCmd(),
+	cmd.AddCommand(diagnose, logs, repair, newSupportRecoverCmd(),
 		withInvocationCapabilities(bundle, commandCapabilities{Repository: true, JSON: true, Quiet: true}))
 	return cmd
 }
@@ -704,30 +698,6 @@ or --watch to keep showing new activity until interrupted.`
 		commandCapabilities{Repository: true, JSON: true, Quiet: true, Streaming: true})
 }
 
-func newSupportPromptCmd() *cobra.Command {
-	command := newPromptCmd()
-	command.Use = "prompt"
-	command.Short = "Show a recorded AI request for troubleshooting"
-	command.Long = `Show a locally recorded AI request for one repository.
-
-These records exist only when AI prompt tracing was enabled. They can contain
-sensitive source context, so review them before sharing. With no selector, ACD
-shows the newest record. Use --seq to select one protected change or batch.`
-	command.Example = `  acd support prompt
-  acd support prompt --last
-  acd support prompt --seq 42
-  acd support prompt --seq 42 --json`
-	command.RunE = func(cmd *cobra.Command, _ []string) error {
-		repo, _ := cmd.Flags().GetString("repo")
-		jsonOut, _ := cmd.Flags().GetBool("json")
-		last, _ := cmd.Flags().GetBool("last")
-		seq, _ := cmd.Flags().GetInt64("seq")
-		return runProductPrompt(cmd.Context(), cmd.OutOrStdout(), repo, last, seq, jsonOut)
-	}
-	command.Flags().Lookup("seq").Usage = "Show the newest record for this protected change or batch number"
-	return withInvocationCapabilities(command, commandCapabilities{Repository: true, JSON: true, Quiet: true})
-}
-
 func newSupportRecoverCmd() *cobra.Command {
 	command := newFixCmd()
 	command.Use = "recover"
@@ -805,83 +775,4 @@ central statistics database across all registered repositories.`
 		return runProductStats(cmd.Context(), cmd.OutOrStdout(), since, jsonOut)
 	}
 	return withInvocationCapabilities(command, commandCapabilities{JSON: true, Quiet: true})
-}
-
-func newRecoverCompatibilityDelegate() *cobra.Command {
-	var auto, dryRun, yes, clearPause bool
-	command := &cobra.Command{
-		Use: "recover", Hidden: true, Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if !auto && !dryRun {
-				return invalidCommandError("acd recover: pass --auto to derive a recovery plan, or --dry-run to inspect first")
-			}
-			if !dryRun && !yes {
-				return invalidCommandError("acd recover: refusing to mutate state without --yes")
-			}
-			repo, _ := cmd.Flags().GetString("repo")
-			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runProductFix(cmd.Context(), cmd.OutOrStdout(), repo,
-				dryRun, yes, false, clearPause, jsonOut)
-		},
-	}
-	command.Flags().BoolVar(&auto, "auto", false, "Derive recovery from current HEAD")
-	command.Flags().BoolVar(&dryRun, "dry-run", false, "Show the recovery plan without mutation")
-	command.Flags().BoolVar(&yes, "yes", false, "Apply proved recovery")
-	command.Flags().BoolVar(&clearPause, "clear-pause", false, "Also remove the manual pause marker")
-	return withInvocationCapabilities(command, commandCapabilities{Repository: true, JSON: true, Quiet: true})
-}
-
-func newEventsCompatibilityDelegate() *cobra.Command {
-	command := renameCompatibility(newHistoryActivityCmd(), "events")
-	command.Short = "Show product decisions for the current repo"
-	command.Long = `Show product-facing ACD decisions for the current repo.
-
-The events command reads the durable decision ledger instead of raw daemon
-JSONL logs. Use --path to focus on one path, --since with a decision cursor to
-resume polling, and --watch to stream appended decisions until interrupted.
-With --watch and no --since, events prints only decisions appended after watch starts.`
-	command.Example = `  acd events
-  acd events --path internal/state/schema.go
-  acd events --since 42 --limit 100
-  acd events --watch
-  acd events --json`
-	return command
-}
-
-func newLogsCompatibilityDelegate() *cobra.Command {
-	command := renameCompatibility(newSupportLogsCmd(), "logs")
-	command.Short = "Print the current repo daemon log tail"
-	command.Long = `Print the current repo daemon log tail as raw JSONL.
-
-The default repo is the current working directory. By default acd logs prints
-the last 100 raw log lines and exits. Use --lines to choose the initial tail
-length, or --follow to keep streaming appended lines until interrupted. For
-bundled diagnostics and sanitized tails, use acd doctor or acd doctor --bundle.
-Full AI prompt traces are stored separately and require ACD_AI_PROMPT_TRACE=1
-plus acd prompt.`
-	command.Example = `  acd logs
-  acd logs --lines 200
-  acd logs --follow
-  acd logs --repo /path/to/repo --lines 50 --follow`
-	return command
-}
-
-func hideCompatibility(command *cobra.Command, replacement string, protocol bool) *cobra.Command {
-	command.Hidden = true
-	if command.Annotations == nil {
-		command.Annotations = map[string]string{}
-	}
-	command.Annotations["acd.compatibility.replacement"] = replacement
-	if command.RunE == nil {
-		return command
-	}
-	run := command.RunE
-	command.RunE = func(cmd *cobra.Command, args []string) error {
-		if !protocol {
-			fmt.Fprintf(cmd.ErrOrStderr(), "warning: acd %s is a compatibility alias; use %s\n",
-				command.Name(), replacement)
-		}
-		return run(cmd, args)
-	}
-	return command
 }

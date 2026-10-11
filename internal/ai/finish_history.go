@@ -11,6 +11,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
+const FinishHistoryDiffByteCap = FinishEvidenceDiffByteCap
+
 type HistoryMessageCommit struct {
 	ID              string   `json:"id"`
 	TreeOID         string   `json:"tree_oid"`
@@ -69,8 +71,8 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		for _, diff := range diffs {
 			total += len(diff.Text)
 		}
-		if total > HistoryRewriteTotalDiffCap {
-			return nil, result, finishInputLimit(total, HistoryRewriteTotalDiffCap)
+		if total > FinishHistoryDiffByteCap {
+			return nil, result, finishInputLimit(total, FinishHistoryDiffByteCap)
 		}
 	}
 	disclosure.Provider = transport.Name()
@@ -79,8 +81,8 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		if err != nil {
 			return nil, result, err
 		}
-		if len(body) > HistoryRewriteRequestByteCap {
-			return nil, result, finishInputLimit(len(body), HistoryRewriteRequestByteCap)
+		if len(body) > FinishRequestByteCap {
+			return nil, result, finishInputLimit(len(body), FinishRequestByteCap)
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, result, finishFailure("provider_deadline", err)

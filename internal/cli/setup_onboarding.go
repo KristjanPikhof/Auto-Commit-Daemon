@@ -18,7 +18,6 @@ import (
 )
 
 type setupOnboardingOptions struct {
-	Experience                 string
 	Strategy                   string
 	CommitFormat               string
 	Provider                   string
@@ -30,7 +29,6 @@ type setupOnboardingOptions struct {
 	ConfirmEndpointCredentials bool
 	ConfirmInsecureHTTP        bool
 	ConfirmDiffEgress          bool
-	ConfirmIntentRepair        bool
 }
 
 type setupOnboardingState struct {
@@ -52,14 +50,7 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	}
 	strategy := strings.ToLower(strings.TrimSpace(opts.Strategy))
 	if strategy == "" {
-		switch strings.ToLower(strings.TrimSpace(opts.Experience)) {
-		case "everyday":
-			strategy = "intent"
-		case "speed", "":
-			strategy = "local"
-		default:
-			return nil, invalidCommandError("acd setup: legacy --experience must be everyday or speed")
-		}
+		strategy = "local"
 	}
 	if strategy != "local" && strategy != "intent" {
 		return nil, invalidCommandError("acd setup: --strategy must be local or intent")
@@ -116,8 +107,6 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 
 	selection := configureSelectionFromValues(values)
 	var err error
-	selection.Experience = strategy
-	selection.RepairApproved = false
 	interactive := !dryRun && !nonInteractive
 	if interactive {
 		accessible := opts.Accessible ||
@@ -127,7 +116,7 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 			configureTerminalTooShort(cmd.OutOrStdout())
 		selection, err = runConfigureWizard(cmd.Context(), settingsui.ConfigureWizardOptions{
 			Input: cmd.InOrStdin(), Output: cmd.OutOrStdout(), Accessible: accessible,
-			Defaults: values, ExplicitMode: strings.TrimSpace(opts.Strategy) != "" || strings.TrimSpace(opts.Experience) != "",
+			Defaults: values, ExplicitMode: strings.TrimSpace(opts.Strategy) != "",
 			CredentialStatus: credentialStatus,
 			RepositoryScoped: false, HasCredential: hasCredential,
 			CredentialFromStdin: opts.CredentialStdin,
@@ -141,7 +130,6 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 		if credential != "" {
 			selection.Credential = credential
 		}
-		selection.RepairApproved = false
 		values = selectionDraft(selection)
 	} else {
 		selection.Credential = credential
@@ -165,7 +153,6 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 		values[config.FieldDiffEgress] = "false"
 	}
 	selection.DiffContextApproved = values[config.FieldDiffEgress] == "true"
-	selection.RepairApproved = false
 	confirmations := selectionConfirmations(selection)
 	if nonInteractive && !dryRun {
 		if err := requireSetupConfirmations(opts, confirmations); err != nil {
@@ -217,8 +204,6 @@ func requireSetupConfirmations(opts setupOnboardingOptions, required []ai.Confir
 			confirmed, flag = opts.ConfirmInsecureHTTP, "--confirm-insecure-http"
 		case ai.ConfirmationDiffEgress:
 			confirmed, flag = opts.ConfirmDiffEgress, "--confirm-diff-egress"
-		case ai.ConfirmationIntentRepair:
-			confirmed, flag = opts.ConfirmIntentRepair, "--confirm-intent-repair"
 		default:
 			continue
 		}
@@ -229,85 +214,7 @@ func requireSetupConfirmations(opts setupOnboardingOptions, required []ai.Confir
 	return nil
 }
 
-func testSetupProvider(cmd *cobra.Command, state *setupOnboardingState) error {
-	if state == nil || state.Selection.Strategy == "local" {
-		return nil
-	}
-	service, err := openConfigureGlobalSettingsService(cmd.Context(),
-		configureSettingsOptions(state.Roots, "", configureLookupEnv(state.Credential)))
-	if err != nil {
-		return fmt.Errorf("acd setup: open provider test: %w", err)
-	}
-	defer service.Close()
-	for {
-		fmt.Fprintln(cmd.ErrOrStderr(), "Testing the provider with fixed synthetic content. No repository data is sent.")
-		result, testErr := service.TestProvider(cmd.Context(), state.Draft, state.Confirmations)
-		if testErr == nil && result.Success && result.Fingerprint == state.Configuration.Fingerprint {
-			return nil
-		}
-		if !state.Interactive {
-			if testErr == nil {
-				testErr = errors.New("provider rejected the synthetic request")
-			}
-			return fmt.Errorf("acd setup: provider test failed; nothing was written: %w", testErr)
-		}
-		fmt.Fprintln(cmd.ErrOrStderr(), "The connection test failed. Nothing has been changed.")
-		fmt.Fprint(cmd.ErrOrStderr(), "Retry, edit the connection, use the local provider, or exit? [r/e/l/q] ")
-		var answer string
-		if _, scanErr := fmt.Fscanln(cmd.InOrStdin(), &answer); scanErr != nil {
-			return errors.New("acd setup: connection test stopped; nothing was written")
-		}
-		switch strings.ToLower(strings.TrimSpace(answer)) {
-		case "r", "retry":
-			continue
-		case "e", "edit":
-			return errSetupEditConnection
-		case "l", "local":
-			return errSetupUseLocalProvider
-		default:
-			return errors.New("acd setup: setup stopped; nothing was written")
-		}
-	}
-}
-
-func useLocalSetupProvider(cmd *cobra.Command, state *setupOnboardingState) (*setupOnboardingState, error) {
-	values := cloneConfigureValues(state.Draft)
-	values[config.FieldCommitStrategy] = "local"
-	values[config.FieldProvider] = "deterministic"
-	values[config.FieldDiffEgress] = "false"
-	selection := configureSelectionFromValues(values)
-	selection.Experience = state.Selection.Experience
-	selection.Provider = "deterministic"
-	selection.DiffContextApproved = false
-	selection.RepairApproved = values[config.FieldIntentRepairEnabled] == "true"
-	confirmations := selectionConfirmations(selection)
-	service, err := openConfigureGlobalSettingsService(cmd.Context(), settings.Options{Roots: state.Roots})
-	if err != nil {
-		return nil, fmt.Errorf("acd setup: prepare local provider: %w", err)
-	}
-	defer service.Close()
-	validation, err := service.Validate(cmd.Context(), values, confirmations)
-	if err != nil {
-		return nil, fmt.Errorf("acd setup: validate local provider: %w", err)
-	}
-	return &setupOnboardingState{
-		Configuration: installer.SetupConfiguration{
-			Values: values, Fingerprint: validation.Fingerprint,
-			Confirmations: confirmations, SourceGeneration: validation.SourceGeneration,
-			CredentialSource:   credentials.SourceNone,
-			ProviderTestStatus: "optional_connection_test",
-		},
-		Selection: selection, Draft: values, Confirmations: confirmations,
-		Roots: state.Roots, Interactive: true,
-	}, nil
-}
-
-var (
-	errSetupEditConnection   = errors.New("setup: edit connection")
-	errSetupUseLocalProvider = errors.New("setup: use local provider")
-)
-
-func setupExperience(values map[string]string) string {
+func setupModeLabel(values map[string]string) string {
 	if values[config.FieldCommitStrategy] == "intent" {
 		return "Intent"
 	}
