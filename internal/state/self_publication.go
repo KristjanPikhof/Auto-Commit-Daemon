@@ -36,10 +36,6 @@ const (
 	// by Intent v2. Publication recovery stays bounded even if a caller passes
 	// a malformed or unexpectedly large membership set.
 	SelfPublicationMaxMembers = 256
-
-	// SelfPublicationMaxPruneBatch bounds terminal journal maintenance so it
-	// cannot monopolize the single SQLite writer or run-loop work budget.
-	SelfPublicationMaxPruneBatch = 100
 )
 
 const (
@@ -95,22 +91,6 @@ type SelfPublicationCompletion struct {
 	CandidateStatus         string
 	SoftPublicationDeadline sql.NullFloat64
 	BranchToken             string
-}
-
-// SelfPublicationReadOnlyProjection is safe for status/diagnostic callers.
-// Pre-v18 databases return Available=false without creating or migrating
-// anything. Recoverable is capped and ordered oldest-first.
-type SelfPublicationReadOnlyProjection struct {
-	Available          bool
-	SchemaVersion      int
-	Prepared           int
-	GitApplied         int
-	Completed          int
-	Abandoned          int
-	Recoverable        []SelfPublication
-	NeedsAttention     string
-	AttentionBlockerID string
-	UnknownRecoverable *SelfPublication
 }
 
 // SelfPublicationMembershipDigest returns the canonical identity digest for

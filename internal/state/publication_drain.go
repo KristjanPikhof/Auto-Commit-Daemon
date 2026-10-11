@@ -8,21 +8,13 @@ import (
 )
 
 const (
-	PublicationDrainCheckpointing = "checkpointing"
-	PublicationDrainSemantic      = "semantic"
-	PublicationDrainNormalizing   = "normalizing"
 	PublicationDrainEventFallback = "event_fallback"
 	PublicationDrainCompleted     = "completed"
 	PublicationDrainNeedsAction   = "needs_action"
 )
 
 var (
-	ErrPublicationDrainNotFound = errors.New("state: publication drain not found")
-	ErrPublicationDrainIdentity = errors.New("state: publication drain identity mismatch")
-	ErrPublicationDrainPhase    = errors.New("state: publication drain phase conflict")
-	ErrPublicationDrainProgress = errors.New("state: publication drain progress regression")
-	ErrPublicationDrainRuntime  = errors.New("state: publication drain runtime contract unavailable")
-	ErrPublicationDrainBarrier  = errors.New("state: unresolved publication drain blocks new drain")
+	ErrPublicationDrainPhase = errors.New("state: publication drain phase conflict")
 )
 
 // PublicationDrain is one resumable publication operation over the immutable
@@ -61,31 +53,6 @@ type PublicationDrain struct {
 	LastProgressTS          float64
 	CompletedTS             sql.NullFloat64
 	EventSeqs               []int64
-}
-
-type PublicationDrainUpdate struct {
-	ExpectedPhase           string
-	Phase                   string
-	PublishedEventCount     int64
-	SemanticRebuildAttempts int64
-	EventFallbackCount      int64
-	CommitCount             int64
-	FallbackMode            string
-	LastError               string
-	ReasonCode              string
-	ReasonEvidence          string
-	StagedConsent           bool
-	StagedConsumed          bool
-	UpdatedTS               float64
-	LastProgressTS          float64
-	CompletedTS             sql.NullFloat64
-}
-
-type PublicationDrainReadOnlyProjection struct {
-	Available     bool
-	SchemaVersion int
-	Active        []PublicationDrain
-	Latest        *PublicationDrain
 }
 
 // PublicationDrainReconciliation describes a drain whose immutable target is
@@ -212,9 +179,6 @@ func ActivePublicationDrainsForPair(
 	return drains, nil
 }
 
-// ReadPublicationDrainProjection opens an existing DB read-only. Pre-v21
-// repositories report Available=false and are never migrated as a side effect.
-
 const publicationDrainSelect = `
 SELECT id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
  commit_strategy,commit_format,config_revision_id,provider,provider_model,
@@ -222,13 +186,6 @@ SELECT id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
  target_event_count,published_event_count,semantic_rebuild_attempts,
  event_fallback_count,commit_count,fallback_mode,last_error,staged_consent,staged_consumed,
  reason_code,reason_evidence,expected_index_digest,created_ts,updated_ts,last_progress_ts,completed_ts
-FROM publication_drains`
-
-const legacyPublicationDrainSelect = `
-SELECT id,checkpoint_id,worktree_id,branch_ref,branch_generation,phase,
- target_event_count,published_event_count,semantic_rebuild_attempts,
- event_fallback_count,commit_count,fallback_mode,last_error,staged_consent,staged_consumed,
- created_ts,updated_ts,last_progress_ts,completed_ts
 FROM publication_drains`
 
 type publicationDrainCandidateQuery interface {

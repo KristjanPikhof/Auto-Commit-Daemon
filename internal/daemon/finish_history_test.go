@@ -37,16 +37,16 @@ func historyStartTest(t *testing.T, w *FinishWorker, plan state.IntentHistoryPla
 func TestFinishHistoryRewriteLegacyQueueNeverPublishes(t *testing.T) {
 	f, _ := finishWorkerFixture(t)
 	head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
-	if err := state.SaveIntentHistoryRequest(t.Context(), f.db, state.IntentHistoryRequest{PlanID: "legacy-plan", Status: "pending"}); err != nil {
+	if err := state.MetaSetJSON(t.Context(), f.db, "intent.history.request", map[string]string{"plan_id": "legacy-plan", "status": "pending"}); err != nil {
 		t.Fatal(err)
 	}
-	before, _, err := state.MetaGet(t.Context(), f.db, state.MetaKeyIntentHistoryRequest)
+	before, _, err := state.MetaGet(t.Context(), f.db, "intent.history.request")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, stop := finishProtectionRun(t, f, nil)
 	stop()
-	after, _, err := state.MetaGet(t.Context(), f.db, state.MetaKeyIntentHistoryRequest)
+	after, _, err := state.MetaGet(t.Context(), f.db, "intent.history.request")
 	if err != nil || before != after || finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != head {
 		t.Fatalf("legacy evidence or branch changed: %v", err)
 	}

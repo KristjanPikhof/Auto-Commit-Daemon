@@ -350,3 +350,17 @@ INSERT INTO capture_events(
 	}
 	return checkpoint
 }
+
+// IntentRepairTransition applies one compare-and-swap state transition and,
+// when supplied, replaces the old-to-new commit mapping in the same
+// transaction.
+type IntentRepairTransition struct {
+	ExpectedStatus string
+	Status         string
+	BackupRef      sql.NullString
+	OldHead        sql.NullString
+	NewHead        sql.NullString
+	Error          string
+	Commits        []IntentRepairCommit
+	TransitionTS   float64
+}

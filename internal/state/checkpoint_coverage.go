@@ -22,22 +22,6 @@ type coverageQuery interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func CurrentCaptureIssues(ctx context.Context, db *DB) ([]CheckpointCaptureIssue, error) {
-	id, ok, err := MetaGet(ctx, db, "protection.checkpoint_id")
-	if err != nil || !ok || id == "" {
-		return nil, err
-	}
-	checkpoint := Checkpoint{ID: id}
-	err = loadCheckpointCoverage(ctx, db.ReadSQL(), &checkpoint)
-	if err != nil {
-		return nil, err
-	}
-	if checkpoint.Partial && len(checkpoint.CaptureIssues) == 0 {
-		return nil, errors.New("partial checkpoint capture scope is unavailable")
-	}
-	return checkpoint.CaptureIssues, nil
-}
-
 func loadCheckpointCoverage(ctx context.Context, query coverageQuery, checkpoint *Checkpoint) error {
 	if err := query.QueryRowContext(ctx, `SELECT coverage_complete=0 FROM checkpoints WHERE id=?`, checkpoint.ID).Scan(&checkpoint.Partial); err != nil {
 		return err

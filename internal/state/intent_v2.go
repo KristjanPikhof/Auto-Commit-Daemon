@@ -11,17 +11,10 @@ import (
 )
 
 const (
-	IntentCandidateMaxCaptures           = 256
-	IntentCandidateMaxOpenPerPair        = 128
-	IntentDependencyMaxPerPair           = 4096
-	IntentCandidatePurposeMaxChars       = 512
-	IntentCandidateSummaryMaxChars       = 2048
-	IntentCandidateLineageReasonMaxChars = 512
-	IntentCandidateLineageMaxPerPair     = 4096
-	IntentVerificationOutputMaxBytes     = 64 * 1024
-	IntentRepairMaxCommits               = 5
-	IntentRepairMaxMappings              = IntentRepairMaxCommits * IntentRepairMaxCommits
-	IntentRepairMaxMembers               = IntentCandidateMaxCaptures * IntentRepairMaxCommits
+	IntentCandidateMaxCaptures = 256
+	IntentRepairMaxCommits     = 5
+	IntentRepairMaxMappings    = IntentRepairMaxCommits * IntentRepairMaxCommits
+	IntentRepairMaxMembers     = IntentCandidateMaxCaptures * IntentRepairMaxCommits
 
 	IntentCandidateOpen          = "open"
 	IntentCandidateWaiting       = "waiting"
@@ -29,26 +22,15 @@ const (
 	IntentCandidateSoftPublished = "soft_published"
 	IntentCandidatePublished     = "published"
 	IntentCandidateSuperseded    = "superseded"
-	IntentCandidateBlocked       = "blocked"
-	IntentCandidateFailed        = "failed"
 
 	IntentReadinessReady = "ready"
 	IntentReadinessWait  = "wait"
 
-	IntentMembershipActive     = "active"
-	IntentMembershipSuperseded = "superseded"
-
-	IntentDependencyHard = "hard"
-	IntentDependencySoft = "soft"
-
-	IntentBoundarySoft = "soft"
-	IntentBoundaryHard = "hard"
+	IntentMembershipActive = "active"
 
 	IntentRepairPrepared   = "prepared"
 	IntentRepairGitApplied = "git_applied"
 	IntentRepairCompleted  = "completed"
-	IntentRepairSkipped    = "skipped"
-	IntentRepairFailed     = "failed"
 
 	IntentRepairMembershipLegacy = "legacy"
 	IntentRepairMembershipFrozen = "frozen"
@@ -133,20 +115,6 @@ type IntentRepairMember struct {
 	CandidateID string
 	EventSeq    int64
 	PriorState  string
-}
-
-// IntentRepairTransition applies one compare-and-swap state transition and,
-// when supplied, replaces the old-to-new commit mapping in the same
-// transaction.
-type IntentRepairTransition struct {
-	ExpectedStatus string
-	Status         string
-	BackupRef      sql.NullString
-	OldHead        sql.NullString
-	NewHead        sql.NullString
-	Error          string
-	Commits        []IntentRepairCommit
-	TransitionTS   float64
 }
 
 type intentCandidateScanner interface {

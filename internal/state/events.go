@@ -71,13 +71,6 @@ type CaptureOp struct {
 	Fidelity   string
 }
 
-// PendingCaptureQueueSummary reports every pending capture_event row,
-// independent of replay barrier visibility.
-type PendingCaptureQueueSummary struct {
-	Count     int
-	OldestSeq int64
-}
-
 type UnresolvedCapturePair struct {
 	BranchRef  string
 	Generation int64

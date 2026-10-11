@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestResiliencePartialCheckpointRejectsFullBarrierAndRestore(t *testing.T) {
+func TestResiliencePartialCheckpointRejectsRestoreAndPreservesCoverage(t *testing.T) {
 	ctx := context.Background()
 	db, _ := openLegacyTestDB(t)
 	cp := Checkpoint{ID: "cp-123-0123456789abcdef", OperationID: "partial-op", WorktreeID: "0123456789abcdef", Reason: CheckpointReasonPoll, ObservationEpoch: 9, CoverageEpoch: 9, ObservedRef: "refs/heads/main", TreeOID: "tree", CommitOID: "commit", Ref: "refs/acd/checkpoints/v1/0123456789abcdef/cp-123-0123456789abcdef", Partial: true, CaptureIssues: []CheckpointCaptureIssue{{Path: "missing.go", Reason: "unreadable"}}}
@@ -18,9 +18,6 @@ func TestResiliencePartialCheckpointRejectsFullBarrierAndRestore(t *testing.T) {
 	}
 	if _, err := ResolveCheckpoint(ctx, db.Path(), cp.ID); !errors.Is(err, ErrCheckpointPartial) {
 		t.Fatalf("restore err=%v", err)
-	}
-	if _, ok, err := CompletedCheckpointForBarrier(ctx, db, cp.WorktreeID, 1, 0, cp.ObservedRef); err != nil || ok {
-		t.Fatalf("barrier accepted partial: ok=%t err=%v", ok, err)
 	}
 	if _, err := PrepareCheckpoint(ctx, db, cp, checkpointTestDigest); err != nil {
 		t.Fatal(err)
