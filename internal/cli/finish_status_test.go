@@ -19,6 +19,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
@@ -441,6 +442,49 @@ func TestFinishStatusActiveHistoryPlan(t *testing.T) {
 	finishStatusAssertViews(t, rec, db, report)
 }
 
+func TestFinishStatusPublicationAttentionRequiresAction(t *testing.T) {
+	for _, operation := range []string{"finish", "history"} {
+		t.Run(operation, func(t *testing.T) {
+			rec, db, worker := finishStatusFixture(t)
+			finishStatusWrite(t, rec.Path, "saved.txt", "saved work")
+			finishStatusCheckpoint(t, rec, db)
+			if operation == "finish" {
+				request, _, err := worker.Start(t.Context(), daemon.FinishOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := state.UpdateFinishRequest(t.Context(), db, request.ID, request.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishPrepared, Plan: json.RawMessage(`{}`), Publication: json.RawMessage(`{}`)}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := state.UpdateFinishRequest(t.Context(), db, request.ID, request.Attempt, state.FinishPrepared, state.FinishUpdate{State: state.FinishNeedsAttention, ReasonCode: "ambiguous_ref", Reason: "Branch publication could not be proven"}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				request, _, err := state.StartFinishHistoryRequest(t.Context(), db, state.FinishHistoryRequest{PlanID: "history-attention", WorktreeID: rec.WorktreeID, ConfigDigest: "approved", IndexDigest: "saved-index", DeadlineTS: float64(time.Now().Add(time.Minute).Unix())})
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Status = "needs_attention"
+				request.Error = "Branch publication could not be proven"
+				if err := state.UpdateFinishHistoryRequest(t.Context(), db, request, "running"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			report := finishStatusRead(t, rec, db)
+			var control controlResult
+			applyControlStatusWithDaemonAlive(&control, report, true)
+			if !control.Protected || control.OK || control.Health != controlHealthNeedsAttention {
+				t.Fatalf("publication attention hidden by healthy protection: %+v", control)
+			}
+			entry := productListEntryFromOverview(rec, supervisor.WorkerStatus{}, productListRepoOverview{report: report}, nil)
+			if !entry.Protected || !entry.ActionRequired || entry.State != productStateNeedsAction {
+				t.Fatalf("list hides publication attention: %+v", entry)
+			}
+			finishStatusAssertViews(t, rec, db, report)
+		})
+	}
+}
+
 func TestFinishStatusUsesSavedProtectionScope(t *testing.T) {
 	rec, db, _ := finishStatusFixture(t)
 	finishStatusWrite(t, rec.Path, "custom.secret", "excluded")
@@ -503,6 +547,46 @@ func TestFinishStatusDefaultAllowedTemplateScope(t *testing.T) {
 	finishStatusAssertViews(t, rec, db, report)
 }
 
+func TestFinishStatusRejectsInvalidCheckpointRef(t *testing.T) {
+	for _, scenario := range []string{"missing", "moved", "symbolic"} {
+		t.Run(scenario, func(t *testing.T) {
+			rec, db, _ := finishStatusFixture(t)
+			finishStatusWrite(t, rec.Path, "saved.txt", "saved work")
+			sum := finishStatusCheckpoint(t, rec, db)
+			cp, err := state.ResolveCheckpoint(t.Context(), rec.StateDB, sum.CheckpointID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch scenario {
+			case "missing":
+				finishStatusGit(t, rec.Path, "update-ref", "-d", cp.Ref)
+			case "moved":
+				finishStatusGit(t, rec.Path, "update-ref", cp.Ref, "HEAD")
+			case "symbolic":
+				aliasTarget := "refs/acd/status-test-target"
+				finishStatusGit(t, rec.Path, "update-ref", aliasTarget, cp.CommitOID)
+				finishStatusGit(t, rec.Path, "symbolic-ref", cp.Ref, aliasTarget)
+			}
+			report := finishStatusRead(t, rec, db)
+			if report.Protected || report.PublicationOutcome.Protected || report.PublicationOutcome.CountsKnown || report.PublicationOutcome.BranchCommitted != nil || report.CaptureHealth.State != "blocked" {
+				t.Fatalf("status accepted invalid checkpoint ref: %+v", report.PublicationOutcome)
+			}
+			entry := productListEntryFromOverview(rec, supervisor.WorkerStatus{}, productListRepoOverview{report: report}, nil)
+			if entry.Protected || !entry.ActionRequired || entry.State != productStateNeedsAction {
+				t.Fatalf("list accepted invalid checkpoint ref: %+v", entry)
+			}
+			finishStatusAssertViews(t, rec, db, report)
+			refs, err := git.Run(t.Context(), git.RunOpts{Dir: rec.Path}, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", cp.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyFinishCheckpointRef(t.Context(), rec.Path, cp); err == nil {
+				t.Fatalf("read-only diagnostics repaired the invalid ref: %q", refs)
+			}
+		})
+	}
+}
+
 func TestFinishStatusIgnoreAmbiguityDoesNotClaimCommitment(t *testing.T) {
 	rec, db, _ := finishStatusFixture(t)
 	finishStatusWrite(t, rec.Path, "gone.txt", "tracked before capture")
@@ -522,6 +606,47 @@ func TestFinishStatusIgnoreAmbiguityDoesNotClaimCommitment(t *testing.T) {
 	finishStatusAssertViews(t, rec, db, report)
 	if after := finishStatusGit(t, rec.Path, "ls-files", "--stage"); after != before {
 		t.Fatal("status mutated staged deletion")
+	}
+}
+
+func TestFinishStatusSparseCheckoutCountsEligibleChanges(t *testing.T) {
+	for _, sparseIndex := range []bool{false, true} {
+		name := "full-index"
+		if sparseIndex {
+			name = "sparse-index"
+		}
+		t.Run(name, func(t *testing.T) {
+			rec, db, worker := finishStatusFixture(t)
+			finishStatusWrite(t, rec.Path, "visible/file.txt", "base")
+			finishStatusWrite(t, rec.Path, "hidden/file.txt", "keep")
+			finishStatusGit(t, rec.Path, "add", "visible", "hidden")
+			finishStatusGit(t, rec.Path, "commit", "-m", "Seed sparse checkout")
+			args := []string{"sparse-checkout", "init", "--cone"}
+			if sparseIndex {
+				args = append(args, "--sparse-index")
+			}
+			finishStatusGit(t, rec.Path, args...)
+			finishStatusGit(t, rec.Path, "sparse-checkout", "set", "visible")
+			finishStatusWrite(t, rec.Path, "visible/file.txt", "changed")
+			finishStatusCheckpoint(t, rec, db)
+			report := finishStatusRead(t, rec, db)
+			if !report.PublicationOutcome.CountsKnown || report.PublicationOutcome.PendingChanges != 1 {
+				t.Fatalf("sparse omission counted as deletion: %+v", report.PublicationOutcome)
+			}
+			request, _, err := worker.Start(t.Context(), daemon.FinishOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if completed, err := worker.Execute(t.Context(), request.ID); err != nil || completed.State != state.FinishCompleted {
+				t.Fatalf("finish=%+v err=%v", completed, err)
+			}
+			finishStatusCheckpoint(t, rec, db)
+			report = finishStatusRead(t, rec, db)
+			if !report.Protected || !report.PublicationOutcome.CountsKnown || report.PublicationOutcome.PendingChanges != 0 || report.OperationalState != "up_to_date" {
+				t.Fatalf("completed sparse finish still has pending work: %+v", report.PublicationOutcome)
+			}
+			finishStatusAssertViews(t, rec, db, report)
+		})
 	}
 }
 

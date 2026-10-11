@@ -12,9 +12,17 @@ Complete polling repairs missed watcher events. An idle worker backs off;
 unchanged scans reuse existing protection evidence. Idle time, stop events,
 and integration hints never trigger a finish.
 
+Reusing a checkpoint requires its private ref to still point directly to the
+recorded commit. A missing, moved, or symbolic ref leaves coverage incomplete;
+read-only status also reports the failed proof. ACD does not replace ambiguous
+evidence.
+
 ## Eligible scope
 
-Git-ignored, sensitive, and generated cache paths remain excluded. Regular
+Git-ignored, sensitive, and generated cache paths remain excluded. Every scan,
+including the fresh scan for `finish`, honors root and nested `.gitignore` rules
+and their negations. Finish also checks eligibility before copying checkpoint
+entries into its target. Regular
 files, executable modes, symlink entries, deletions, and binary files retain
 their Git representation. Reads stay anchored beneath the opened repository
 directory and reject symlink ancestors, including directories replaced during
@@ -62,6 +70,10 @@ preserves unchanged base entries outside the protected scope, including
 excluded paths and gitlinks. A change to an ignore rule does not silently delete
 an existing branch entry.
 
+Tracked files omitted by sparse checkout stay in the publication target. Their
+absence is not a deletion. Changes to files present in the checkout and explicit
+staged deletions still use the frozen versions.
+
 Ordinary finish refuses staging. With `--include-staged`, only the frozen staged
 selection uses its index versions or deletions; other eligible paths use the
 frozen worktree versions. Unstaged differences on a selected path remain live
@@ -94,6 +106,9 @@ Git's exclusive index lock using its frozen identity; new staging is never
 silently overwritten. Working files stay unchanged. After a crash, exact
 prepared proof can complete forward; ambiguity requires attention. A running
 request interrupted before preparation becomes failed and needs explicit retry.
+
+Ambiguous finish or history publication requires attention in status and list,
+even while checkpoint protection remains healthy.
 
 ## Unsafe Git states
 

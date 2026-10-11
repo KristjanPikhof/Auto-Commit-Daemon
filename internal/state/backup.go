@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 // QuickCheck validates an existing database without creating or migrating it.
@@ -15,7 +17,7 @@ func QuickCheck(ctx context.Context, dbPath string) error {
 	q := url.Values{}
 	q.Set("mode", "ro")
 	q.Add("_pragma", "query_only(ON)")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return err
 	}
@@ -43,7 +45,7 @@ func BackupDatabase(ctx context.Context, dbPath, destination string) error {
 	}
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return err
 	}

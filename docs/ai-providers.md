@@ -94,6 +94,10 @@ a single persisted deadline. `ai.timeout` defaults to five minutes. Transport
 failure, missing credentials, invalid output, or deadline exhaustion fails the
 request. There is no automatic retry timer or Local fallback.
 
+Messages-only history planning follows the same rule. Invalid response framing,
+including an unsupported protocol version, requires correction or fails the
+request even when the enclosed goals are valid.
+
 Completed checkpoints remain protected. Correct the cause and explicitly retry
 with `acd finish --retry REQUEST_ID`, or choose Local in reviewed settings and
 start a new finish. Retry keeps the frozen target; it does not include later

@@ -893,8 +893,8 @@ func externalBridgeIndexState(
 				"daemon: external repair bridge: read tree %s: %w", rev, err)
 		}
 		requested := make(map[string]struct{}, len(chunk))
-		for _, spec := range chunk {
-			requested[strings.TrimPrefix(spec, ":(literal)")] = struct{}{}
+		for _, path := range chunk {
+			requested[path] = struct{}{}
 		}
 		for _, entry := range entries {
 			if _, ok := requested[entry.Path]; !ok {
@@ -938,7 +938,7 @@ func externalBridgePathspecChunks(
 	}
 	// Keep the explicitly controlled argv far below macOS ARG_MAX. Count the
 	// executable and each terminating NUL as well as Git's fixed arguments.
-	baseBytes := argvBytes("git", "ls-tree", "-z", rev, "--")
+	baseBytes := argvBytes("git", "--literal-pathspecs", "ls-tree", "-z", rev, "--")
 	if baseBytes >= externalBridgeGitArgvByteCap {
 		return nil, fmt.Errorf(
 			"%w: external repair bridge: tree revision exceeds the Git argument bound",
@@ -949,31 +949,30 @@ func externalBridgePathspecChunks(
 	chunk := make([]string, 0, len(paths))
 	chunkBytes := baseBytes
 	for _, path := range paths {
-		spec := git.LiteralPathspec(path)
-		if spec == "" {
+		if path == "" {
 			return nil, fmt.Errorf(
 				"%w: external repair bridge: tree proof has an empty path",
 				state.ErrCompletedBranchTransitionProof)
 		}
-		if _, duplicate := seen[spec]; duplicate {
+		if _, duplicate := seen[path]; duplicate {
 			return nil, fmt.Errorf(
 				"%w: external repair bridge: tree proof has duplicate path %q",
 				state.ErrCompletedBranchTransitionProof, path)
 		}
-		seen[spec] = struct{}{}
-		specBytes := len(spec) + 1
-		if baseBytes+specBytes > externalBridgeGitArgvByteCap {
+		seen[path] = struct{}{}
+		pathBytes := len(path) + 1
+		if baseBytes+pathBytes > externalBridgeGitArgvByteCap {
 			return nil, fmt.Errorf(
 				"%w: external repair bridge: tree proof path %q exceeds the Git argument bound",
 				state.ErrCompletedBranchTransitionProof, path)
 		}
-		if chunkBytes+specBytes > externalBridgeGitArgvByteCap {
+		if chunkBytes+pathBytes > externalBridgeGitArgvByteCap {
 			chunks = append(chunks, chunk)
 			chunk = make([]string, 0, len(paths)-len(seen)+1)
 			chunkBytes = baseBytes
 		}
-		chunk = append(chunk, spec)
-		chunkBytes += specBytes
+		chunk = append(chunk, path)
+		chunkBytes += pathBytes
 	}
 	if len(chunk) > 0 {
 		chunks = append(chunks, chunk)

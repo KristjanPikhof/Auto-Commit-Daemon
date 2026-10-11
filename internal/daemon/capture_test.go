@@ -46,6 +46,53 @@ func newCaptureFixture(t *testing.T) *captureFixture {
 	}
 }
 
+func TestProtectWorktreeVerifiesReusedCheckpointPin(t *testing.T) {
+	for _, pin := range []string{"exact", "missing", "moved", "symbolic"} {
+		t.Run(pin, func(t *testing.T) {
+			f := newCaptureFixture(t)
+			store := checkpointpkg.Store{DB: f.db}
+			opts := CaptureOpts{IgnoreChecker: f.ig, CheckpointStore: &store}
+			first, err := ProtectWorktree(t.Context(), f.dir, f.db, f.cctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cp, err := state.ResolveCheckpoint(t.Context(), f.db.Path(), first.CheckpointID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch pin {
+			case "missing":
+				_, err = git.Run(t.Context(), git.RunOpts{Dir: f.dir}, "update-ref", "-d", cp.Ref, cp.CommitOID)
+			case "moved":
+				_, err = git.Run(t.Context(), git.RunOpts{Dir: f.dir}, "update-ref", cp.Ref, f.cctx.BaseHead, cp.CommitOID)
+			case "symbolic":
+				const alias = "refs/acd/reuse-test"
+				_, err = git.Run(t.Context(), git.RunOpts{Dir: f.dir}, "update-ref", alias, cp.CommitOID)
+				if err == nil {
+					_, err = git.Run(t.Context(), git.RunOpts{Dir: f.dir}, "symbolic-ref", cp.Ref, alias)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, scanErr := ProtectWorktree(t.Context(), f.dir, f.db, f.cctx, opts)
+			wantComplete := "false"
+			if pin == "exact" {
+				wantComplete = "true"
+				if scanErr != nil || !second.Protected || second.CheckpointID != first.CheckpointID {
+					t.Fatalf("valid pin was not reused: summary=%+v err=%v", second, scanErr)
+				}
+			} else if scanErr == nil || second.Protected {
+				t.Fatalf("invalid pin was reported as protected: summary=%+v err=%v", second, scanErr)
+			}
+			complete, _, err := state.MetaGet(t.Context(), f.db, MetaKeyProtectionComplete)
+			if err != nil || complete != wantComplete {
+				t.Fatalf("protection complete=%q err=%v; want %s", complete, err, wantComplete)
+			}
+		})
+	}
+}
+
 func TestFinishRemovalScanReusesExactIndexedOversizeBlob(t *testing.T) {
 	f := newCaptureFixture(t)
 	path := "tracked-large.bin"

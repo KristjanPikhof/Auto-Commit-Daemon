@@ -7,6 +7,8 @@ import (
 	"fmt"
 
 	"net/url"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 // Capture event lifecycle state values stored in capture_events.state.
@@ -84,7 +86,7 @@ func ReadUnresolvedCapturePairs(ctx context.Context, dbPath string) ([]Unresolve
 	q := url.Values{}
 	q.Set("mode", "ro")
 	q.Add("_pragma", "query_only(ON)")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return nil, err
 	}

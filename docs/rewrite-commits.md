@@ -71,6 +71,9 @@ configuration and source evidence. It checks every candidate and the whole
 chain before one publication transaction. Later file edits remain protected
 and are not overwritten. A changed index or branch aborts unsafe apply.
 
+Before moving a branch, ACD durably saves the prepared rewrite proof with full
+SQLite synchronization. Restart recovery uses that exact proof.
+
 A private backup ref retains the original HEAD before in-place rewriting.
 `--new-branch` rejects an existing target and preserves the original branch;
 it does not check out the new branch. Saved plans are bound to their exact

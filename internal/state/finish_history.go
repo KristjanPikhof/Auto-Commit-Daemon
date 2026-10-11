@@ -115,11 +115,11 @@ func StartFinishHistoryRequest(ctx context.Context, db *DB, r FinishHistoryReque
 	if r.PlanID == "" || r.WorktreeID == "" || r.ConfigDigest == "" || r.IndexDigest == "" || r.DeadlineTS <= 0 {
 		return r, false, ErrFinishIdentity
 	}
-	tx, err := db.conn.BeginTx(ctx, nil)
+	tx, cleanup, err := beginFinishWrite(ctx, db)
 	if err != nil {
 		return r, false, err
 	}
-	defer tx.Rollback()
+	defer cleanup()
 	active, exists, err := readFinishHistoryRequest(tx.QueryRowContext(ctx, `SELECT request_json,status,proof_json,result_json,error,checks_json FROM finish_history_requests WHERE worktree_id=? AND status IN ('running','prepared','needs_attention')`, r.WorktreeID))
 	if err != nil {
 		return r, false, err
@@ -159,11 +159,11 @@ func UpdateFinishHistoryRequest(ctx context.Context, db *DB, r FinishHistoryRequ
 	if len(r.Proof) > IntentHistoryPlanByteCap || len(r.Result) > IntentHistoryPlanByteCap || len(r.Checks) > IntentHistoryPlanByteCap {
 		return errors.New("state: history evidence exceeds limit")
 	}
-	tx, err := db.conn.BeginTx(ctx, nil)
+	tx, cleanup, err := beginFinishWrite(ctx, db)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer cleanup()
 	result, err := tx.ExecContext(ctx, `UPDATE finish_history_requests SET status=?,proof_json=?,result_json=?,error=?,checks_json=? WHERE plan_id=? AND attempt=? AND status=?`, r.Status, string(r.Proof), string(r.Result), r.Error, string(r.Checks), r.PlanID, r.Attempt, from)
 	if err != nil {
 		return err

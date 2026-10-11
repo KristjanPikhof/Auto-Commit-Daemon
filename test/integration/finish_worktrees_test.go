@@ -239,6 +239,12 @@ func TestFinishFaultRealScannerPrivacyAndSymlink(t *testing.T) {
 	if !result.OK || !result.Data.Published {
 		t.Fatalf("eligible finish %+v", result)
 	}
+	publishedTree := runGitOK(t, f.Repo, "ls-tree", "-r", "HEAD")
+	for _, private := range []string{"secret.txt", ".env", "ignored/private.txt", "private.bin"} {
+		if strings.Contains(publishedTree, private) {
+			t.Fatalf("excluded bytes entered finished branch: %s", publishedTree)
+		}
+	}
 	if runGitOK(t, f.Repo, "show", "HEAD:link") != outside {
 		t.Fatal("symlink target identity changed")
 	}

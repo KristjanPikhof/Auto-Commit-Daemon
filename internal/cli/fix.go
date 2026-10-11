@@ -1008,7 +1008,7 @@ func openFixBackupDB(ctx context.Context, stateDB string) (*sql.DB, error) {
 	q := url.Values{}
 	q.Add("mode", "rw")
 	q.Add("_pragma", "busy_timeout(5000)")
-	conn, err := sql.Open("sqlite", "file:"+stateDB+"?"+q.Encode())
+	conn, err := sql.Open("sqlite", paths.DatabaseURI(stateDB, q))
 	if err != nil {
 		return nil, fmt.Errorf("acd fix: open state.db for pre-migration backup: %w", err)
 	}

@@ -36,6 +36,25 @@
 
 ### Fixed
 
+- Honor root and nested Git ignore rules during fresh finish scans, including
+  scans without a supplied ignore checker. Excluded checkpoint entries cannot
+  enter a new finish target.
+- Preserve tracked files omitted by sparse checkout when finishing changes,
+  including repositories that use a sparse index. Do not count those omitted
+  files as saved deletions in status.
+- Keep restarted protection workers running after maintenance or restart
+  requests end, and stop them with their supervisor.
+- Keep state databases at the requested path when repository names contain
+  `?`, `#`, or literal percent escapes.
+- Treat captured filenames literally in Git tree and index lookups.
+- Verify the exact private ref before reusing an unchanged checkpoint as
+  protection evidence, and report invalid pins in read-only status views.
+- Save prepared history rewrite proof with full SQLite synchronization before
+  moving a Git branch.
+- Reject unsupported provider response versions in messages-only history
+  planning through the same bounded correction used for invalid goals.
+- Report ambiguous finish and history publication as requiring action while
+  continuing to report healthy checkpoint protection separately.
 - Accept complete finish and history diff evidence up to 512 KiB and individual
   path diffs up to 128 KiB. Keep serialized provider requests bounded to 512 KiB.
 - Require Go 1.26.9 or later for the standard-library security fixes.

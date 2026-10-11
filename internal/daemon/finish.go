@@ -437,22 +437,42 @@ func finishEligibility(ctx context.Context, repo string, paths []string, opts Ca
 }
 
 func finishEligibleTarget(ctx context.Context, repo string, base, source finish.Tree, opts CaptureOpts) (finish.Tree, error) {
-	paths := make([]string, 0, len(base))
+	paths := make([]string, 0, len(base)+len(source))
 	for path := range base {
 		paths = append(paths, path)
+	}
+	for path := range source {
+		if _, exists := base[path]; !exists {
+			paths = append(paths, path)
+		}
 	}
 	eligible, err := finishEligibility(ctx, repo, paths, opts)
 	if err != nil {
 		return nil, err
 	}
+	// Sparse checkout deliberately leaves skip-worktree entries absent. Their
+	// absence from the worktree checkpoint is not an eligible deletion. Git
+	// expands a sparse index here unless --sparse is requested.
+	indexFlags, err := git.Run(ctx, git.RunOpts{Dir: repo}, "ls-files", "-v", "-z")
+	if err != nil {
+		return nil, err
+	}
+	skipWorktree := map[string]bool{}
+	for _, entry := range strings.Split(string(indexFlags), "\x00") {
+		if len(entry) >= 3 && (entry[0] == 'S' || entry[0] == 's') {
+			skipWorktree[entry[2:]] = true
+		}
+	}
 	target := finish.CloneTree(base)
 	for path, entry := range base {
-		if entry.Mode != "160000" && eligible[path] {
+		if entry.Mode != "160000" && eligible[path] && !skipWorktree[path] {
 			delete(target, path)
 		}
 	}
 	for path, entry := range source {
-		target[path] = entry
+		if eligible[path] && entry.Mode != "160000" {
+			target[path] = entry
+		}
 	}
 	return target, nil
 }

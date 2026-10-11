@@ -37,6 +37,9 @@ Repository commands refuse an incompatible runtime and direct you to
 An existing older runtime can keep making automatic commits until you
 explicitly upgrade it.
 
+Restarted workers belong to the supervisor and keep running after the request
+that started them ends. They stop when the supervisor stops.
+
 Local IPC uses bounded requests with repository and worktree identity. Read-only
 status, list, doctor, and diagnose inspect existing evidence without building
 providers, migrating databases, or starting publication. Mutations require the
@@ -59,6 +62,10 @@ refs/acd/checkpoints/v1/<worktree-id>/cp-<milliseconds>-<random>
 SQLite records its identity, tree, coverage, exclusions, and ref proof. A
 completed checkpoint is protection evidence, not a branch commit. Repeated
 unchanged scans do not create a publication queue or call AI.
+
+State database paths preserve filesystem characters such as `?`, `#`, and `%`.
+Git lookups treat captured filenames literally, including names that resemble
+Git pathspec syntax.
 
 See [protection and publication](capture-replay.md) for coverage and retention.
 

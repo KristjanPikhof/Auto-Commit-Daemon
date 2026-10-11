@@ -141,7 +141,7 @@ func buildStatsDSN(dbPath string) string {
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "busy_timeout(5000)")
-	return "file:" + dbPath + "?" + q.Encode()
+	return paths.DatabaseURI(dbPath, q)
 }
 
 // bootstrap applies DDL + stamps user_version. Idempotent.

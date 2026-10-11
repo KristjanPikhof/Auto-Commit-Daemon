@@ -18,6 +18,8 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 type diagnoseAnchorReport struct {
@@ -197,7 +199,7 @@ func openStateDBReadOnly(ctx context.Context, dbPath string) (*sql.DB, error) {
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
-	conn, err := sql.Open("sqlite", "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open("sqlite", paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return nil, fmt.Errorf("open state.db read-only: %w", err)
 	}

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 // LegacyWorkSummary is the source-only v19 safety projection used when a
@@ -27,7 +29,7 @@ func ReadLegacyWorkSummary(ctx context.Context, dbPath string) (LegacyWorkSummar
 	q := url.Values{}
 	q.Add("mode", "ro")
 	q.Add("_pragma", "busy_timeout(5000)")
-	db, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	db, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return summary, err
 	}

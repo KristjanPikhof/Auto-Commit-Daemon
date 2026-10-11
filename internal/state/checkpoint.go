@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 const (
@@ -49,7 +51,7 @@ func ResolveCheckpoint(ctx context.Context, dbPath, idOrPrefix string) (Checkpoi
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return Checkpoint{}, err
 	}
@@ -372,7 +374,7 @@ func ReadCheckpointProjection(ctx context.Context, dbPath string, recoverableLim
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return projection, fmt.Errorf("state: open checkpoint projection: %w", err)
 	}

@@ -17,7 +17,8 @@ type TreeEntry struct {
 }
 
 // LsTree runs `git ls-tree -z [-r] <rev> [-- <paths...>]` and parses the
-// NUL-delimited output. Recursive=true expands tree entries.
+// NUL-delimited output. Recursive=true expands tree entries. Paths are literal
+// repository-relative filenames, not Git pathspec expressions.
 func LsTree(ctx context.Context, repoDir, rev string, recursive bool, paths ...string) ([]TreeEntry, error) {
 	args := lsTreeArgs(rev, recursive, paths)
 	out, err := Run(ctx, RunOpts{Dir: repoDir, Timeout: DefaultReadTimeout}, args...)
@@ -28,7 +29,7 @@ func LsTree(ctx context.Context, repoDir, rev string, recursive bool, paths ...s
 }
 
 // LsTreeLimited is LsTree with a fixed stdout cap. Use it when the caller
-// accepts repository-derived path lists and must keep read work bounded.
+// accepts literal repository-relative paths and must keep read work bounded.
 func LsTreeLimited(
 	ctx context.Context,
 	repoDir string,
@@ -47,7 +48,7 @@ func LsTreeLimited(
 }
 
 func lsTreeArgs(rev string, recursive bool, paths []string) []string {
-	args := []string{"ls-tree", "-z"}
+	args := []string{"--literal-pathspecs", "ls-tree", "-z"}
 	if recursive {
 		args = append(args, "-r")
 	}
@@ -310,7 +311,7 @@ func LsFilesIndex(ctx context.Context, repoDir, indexFile string, paths ...strin
 	args := []string{"ls-files", "-s", "-z"}
 	if len(paths) > 0 {
 		args = append(args, "--")
-		args = append(args, paths...)
+		args = append(args, LiteralPathspecs(paths)...)
 	}
 	extra := map[string]string{}
 	if indexFile != "" {
@@ -459,7 +460,7 @@ func liveIndexBeforeMatches(ctx context.Context, repoDir string, op LiveIndexOp,
 }
 
 func liveIndexDebugFlags(ctx context.Context, repoDir, path string) (string, error) {
-	out, err := Run(ctx, RunOpts{Dir: repoDir}, "ls-files", "--debug", "-z", "--", path)
+	out, err := Run(ctx, RunOpts{Dir: repoDir}, "ls-files", "--debug", "-z", "--", LiteralPathspec(path))
 	if err != nil {
 		return "", err
 	}

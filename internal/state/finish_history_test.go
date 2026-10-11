@@ -6,6 +6,34 @@ import (
 	"testing"
 )
 
+func TestFinishHistoryPreparedProofIsFullySynchronous(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := t.Context()
+	if _, err := db.SQL().ExecContext(ctx, `
+CREATE TABLE history_durability(synchronous INTEGER);
+CREATE TRIGGER record_history_preparation AFTER UPDATE OF status ON finish_history_requests
+WHEN NEW.status='prepared'
+BEGIN INSERT INTO history_durability SELECT synchronous FROM pragma_synchronous; END;
+`); err != nil {
+		t.Fatal(err)
+	}
+	r, _, err := StartFinishHistoryRequest(ctx, db, FinishHistoryRequest{PlanID: "plan", WorktreeID: "worktree", DeadlineTS: nowSeconds() + 300, IndexDigest: "index", ConfigDigest: "approved"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Status, r.Proof = "prepared", json.RawMessage(`{"plan_id":"plan"}`)
+	if err := UpdateFinishHistoryRequest(ctx, db, r, "running"); err != nil {
+		t.Fatal(err)
+	}
+	var synchronous int
+	if err := db.ReadSQL().QueryRowContext(ctx, "SELECT synchronous FROM history_durability").Scan(&synchronous); err != nil {
+		t.Fatal(err)
+	}
+	if synchronous != 2 {
+		t.Fatalf("prepared history proof used synchronous=%d, want FULL (2) before branch mutation", synchronous)
+	}
+}
+
 func TestFinishHistoryRewriteJournalRetainsAttemptsAndImmutableMappings(t *testing.T) {
 	db, _ := openTestDB(t)
 	ctx := t.Context()

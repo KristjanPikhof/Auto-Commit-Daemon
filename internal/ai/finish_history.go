@@ -111,14 +111,18 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		if err := ctx.Err(); err != nil {
 			return nil, result, finishFailure("provider_deadline", err)
 		}
-		goals, err := validateHistoryMessages(raw, evidence, commits, options)
-		if err == nil {
+		var goals []finish.Goal
+		validationErr := exchangeErr
+		if validationErr == nil {
+			goals, validationErr = validateHistoryMessages(raw, evidence, commits, options)
+		}
+		if validationErr == nil {
 			return goals, result, nil
 		}
 		if call == 1 {
-			return nil, result, finishFailure("invalid_plan", err)
+			return nil, result, finishFailure("invalid_plan", validationErr)
 		}
-		request.Correction = &FinishCorrection{PreviousOutput: finishRedactText(string(raw)), ValidationError: finishCorrectionError(err)}
+		request.Correction = &FinishCorrection{PreviousOutput: finishRedactText(string(raw)), ValidationError: finishCorrectionError(validationErr)}
 	}
 	return nil, result, errors.New("history messages: bounded attempts exhausted")
 }

@@ -501,7 +501,7 @@ func representedPublishedContext(
 			paths = append(paths, path)
 		}
 		sort.Strings(paths)
-		entries, err := git.LsTree(ctx, repoRoot, commitOID, false, git.LiteralPathspecs(paths)...)
+		entries, err := git.LsTree(ctx, repoRoot, commitOID, false, paths...)
 		if err != nil {
 			return nil, fmt.Errorf("daemon: reconcile recovery chain: read published context commit %s: %w",
 				commitOID, err)
@@ -622,7 +622,7 @@ func excludeSeedRepresentedPublishedContext(
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
-	entries, err := git.LsTree(ctx, repoRoot, baseHead, false, git.LiteralPathspecs(paths)...)
+	entries, err := git.LsTree(ctx, repoRoot, baseHead, false, paths...)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: reconcile recovery chain: read published context seed %s: %w",
 			baseHead, err)
@@ -1080,7 +1080,7 @@ func materializeRecoveryTree(
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
-	entries, err := git.LsFilesIndex(ctx, repoRoot, indexFile, git.LiteralPathspecs(paths)...)
+	entries, err := git.LsFilesIndex(ctx, repoRoot, indexFile, paths...)
 	if err != nil {
 		return "", nil, fmt.Errorf("daemon: reconcile recovery chain: read final index: %w", err)
 	}
@@ -1180,7 +1180,7 @@ func materializeRecoveryState(
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
-	entries, err := git.LsTree(ctx, repoRoot, baseHead, false, git.LiteralPathspecs(paths)...)
+	entries, err := git.LsTree(ctx, repoRoot, baseHead, false, paths...)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: prove recovery chain: read base tree %s: %w", baseHead, err)
 	}
@@ -1243,7 +1243,7 @@ func applyRecoveryEventInMemory(
 			if !canReset {
 				return conflict, nil
 			}
-			entries, err := git.LsTree(ctx, repoRoot, item.Event.BaseHead, false, git.LiteralPathspecs([]string{op.Path})...)
+			entries, err := git.LsTree(ctx, repoRoot, item.Event.BaseHead, false, op.Path)
 			if err != nil {
 				return "", err
 			}
@@ -1370,7 +1370,7 @@ func recoveryStatesMatchTree(
 	for _, state := range states {
 		paths = append(paths, state.Path)
 	}
-	entries, err := git.LsTree(ctx, repoRoot, rev, false, git.LiteralPathspecs(paths)...)
+	entries, err := git.LsTree(ctx, repoRoot, rev, false, paths...)
 	if err != nil {
 		return false, err
 	}

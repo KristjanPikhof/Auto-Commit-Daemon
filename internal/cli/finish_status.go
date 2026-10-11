@@ -249,62 +249,75 @@ func readFinishStatusReport(ctx context.Context, rec central.RepoRecord, now tim
 		if err != nil {
 			return report, err
 		}
-		if cp.Partial || cp.Phase != state.CheckpointCompleted {
+		if proofErr := verifyFinishCheckpointRef(ctx, rec.Path, cp); proofErr != nil {
+			if ctx.Err() != nil {
+				return report, ctx.Err()
+			}
 			report.Protected = false
 			outcome.Protected = false
-		}
-		if cp.Partial && report.CaptureHealth.Error == "" {
-			report.CaptureHealth = state.CaptureHealth{State: "blocked", Error: "Some eligible files could not be checkpointed.", CheckpointID: cp.ID, IssueCount: len(cp.CaptureIssues), Issues: cp.CaptureIssues}
-		}
-		count, err := finishSavedChangeCount(ctx, scope, rec.Path, head, cp.TreeOID)
-		if errors.Is(err, errFinishScopeUnknown) {
-			scopeKnown = false
-			err = nil
-		}
-		if err != nil {
-			return report, err
-		}
-		outcome.PendingChanges = count
-		outcome.WaitingChanges = count
-		outcome.CountsKnown = scopeKnown
-		committed := count == 0
-		outcome.BranchCommitted = &committed
-		if outcome.Finish != nil && outcome.Finish.sourceTree != "" {
-			outcome.LaterChanges, err = finishSavedChangeCount(ctx, scope, rec.Path, outcome.Finish.sourceTree, cp.TreeOID)
+			report.CaptureErrors = max(1, report.CaptureErrors)
+			report.CaptureHealth.State = "blocked"
+			report.CaptureHealth.Error = "Checkpoint protection could not be verified: " + proofErr.Error()
+			report.CaptureHealth.CheckpointID = cp.ID
+			report.CaptureHealth.IssueCount = max(1, report.CaptureHealth.IssueCount)
+		} else {
+			if cp.Partial || cp.Phase != state.CheckpointCompleted {
+				report.Protected = false
+				outcome.Protected = false
+			}
+			if cp.Partial && report.CaptureHealth.Error == "" {
+				report.CaptureHealth = state.CaptureHealth{State: "blocked", Error: "Some eligible files could not be checkpointed.", CheckpointID: cp.ID, IssueCount: len(cp.CaptureIssues), Issues: cp.CaptureIssues}
+			}
+			count, err := finishSavedChangeCount(ctx, scope, rec.Path, head, cp.TreeOID)
 			if errors.Is(err, errFinishScopeUnknown) {
 				scopeKnown = false
-				outcome.CountsKnown = false
 				err = nil
 			}
 			if err != nil {
 				return report, err
 			}
-		}
-		var events, published, recovered int
-		hasCaptures, err := state.LegacyTableExists(ctx, db, "capture_events")
-		if err != nil {
-			return report, err
-		}
-		if hasCaptures {
-			err = db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(e.state='published'),0),COALESCE(SUM(e.state='recovered'),0) FROM checkpoint_events ce JOIN capture_events e ON e.seq=ce.event_seq WHERE ce.checkpoint_id=?`, cp.ID).Scan(&events, &published, &recovered)
-		} else {
-			// Missing legacy evidence cannot resolve existing archived membership.
-			err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM checkpoint_events WHERE checkpoint_id=?`, cp.ID).Scan(&events)
-		}
-		if err != nil {
-			return report, err
-		}
-		outcome.RecoveredChanges = recovered
-		// Deprecated booleans retain resolved-work semantics for legacy membership.
-		outcome.Resolved = (events > 0 && events == published+recovered) || (events == 0 && scopeKnown && committed)
-		if cp.Partial || !scopeKnown {
-			outcome.CountsKnown = false
-			outcome.BranchCommitted = nil
-			outcome.PendingChanges = 0
-			outcome.WaitingChanges = 0
-			outcome.LaterChanges = 0
-			if cp.Partial {
-				outcome.Resolved = false
+			outcome.PendingChanges = count
+			outcome.WaitingChanges = count
+			outcome.CountsKnown = scopeKnown
+			committed := count == 0
+			outcome.BranchCommitted = &committed
+			if outcome.Finish != nil && outcome.Finish.sourceTree != "" {
+				outcome.LaterChanges, err = finishSavedChangeCount(ctx, scope, rec.Path, outcome.Finish.sourceTree, cp.TreeOID)
+				if errors.Is(err, errFinishScopeUnknown) {
+					scopeKnown = false
+					outcome.CountsKnown = false
+					err = nil
+				}
+				if err != nil {
+					return report, err
+				}
+			}
+			var events, published, recovered int
+			hasCaptures, err := state.LegacyTableExists(ctx, db, "capture_events")
+			if err != nil {
+				return report, err
+			}
+			if hasCaptures {
+				err = db.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(e.state='published'),0),COALESCE(SUM(e.state='recovered'),0) FROM checkpoint_events ce JOIN capture_events e ON e.seq=ce.event_seq WHERE ce.checkpoint_id=?`, cp.ID).Scan(&events, &published, &recovered)
+			} else {
+				// Missing legacy evidence cannot resolve existing archived membership.
+				err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM checkpoint_events WHERE checkpoint_id=?`, cp.ID).Scan(&events)
+			}
+			if err != nil {
+				return report, err
+			}
+			outcome.RecoveredChanges = recovered
+			// Deprecated booleans retain resolved-work semantics for legacy membership.
+			outcome.Resolved = (events > 0 && events == published+recovered) || (events == 0 && scopeKnown && committed)
+			if cp.Partial || !scopeKnown {
+				outcome.CountsKnown = false
+				outcome.BranchCommitted = nil
+				outcome.PendingChanges = 0
+				outcome.WaitingChanges = 0
+				outcome.LaterChanges = 0
+				if cp.Partial {
+					outcome.Resolved = false
+				}
 			}
 		}
 	}
@@ -357,6 +370,23 @@ func readFinishCheckpoint(ctx context.Context, path, id string) (state.Checkpoin
 		return *projection.Latest, nil
 	}
 	return state.ResolveCheckpoint(ctx, path, id)
+}
+
+// Observe the literal pin without acquiring ref locks or repairing it. SQLite
+// coverage alone cannot prove that Git still retains the checkpoint.
+func verifyFinishCheckpointRef(ctx context.Context, repo string, cp state.Checkpoint) error {
+	if cp.Ref == "" || cp.CommitOID == "" {
+		return errors.New("checkpoint ref identity is missing")
+	}
+	body, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultReadTimeout}, 1<<20, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", cp.Ref)
+	if err != nil {
+		return err
+	}
+	expected := cp.Ref + "\x00" + cp.CommitOID + "\x00"
+	if strings.TrimSuffix(string(body), "\n") != expected {
+		return errors.New("checkpoint ref is missing, moved, or symbolic")
+	}
+	return nil
 }
 
 // Count only eligible saved paths. Missing excluded entries in a checkpoint
@@ -430,9 +460,27 @@ func finishSavedChangeCount(ctx context.Context, scope daemon.ProtectionScope, r
 	// For omitted base entries, a live ignore match cannot distinguish exclusion
 	// from deletion, so do not invent an exact count from it.
 	if len(absent) > 0 {
+		// Match finish eligibility: skip-worktree entries are deliberately
+		// omitted by sparse checkout, rather than saved deletions.
+		flags, err := git.Run(ctx, git.RunOpts{Dir: repo, Timeout: git.DefaultReadTimeout}, "ls-files", "-v", "-z")
+		if err != nil {
+			return 0, err
+		}
+		skipWorktree := map[string]bool{}
+		for _, entry := range strings.Split(string(flags), "\x00") {
+			if len(entry) >= 3 && (entry[0] == 'S' || entry[0] == 's') {
+				skipWorktree[entry[2:]] = true
+			}
+		}
+		omitted := absent[:0]
+		for _, path := range absent {
+			if !skipWorktree[path] {
+				omitted = append(omitted, path)
+			}
+		}
 		checker := git.NewIgnoreChecker(repo)
 		defer checker.Close()
-		ignored, err := checker.Check(ctx, absent)
+		ignored, err := checker.Check(ctx, omitted)
 		if err != nil {
 			return 0, err
 		}
@@ -523,6 +571,8 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 				res.NextAction = "Run `acd finish --retry " + f.RequestID + "` to retry the saved target."
 			}
 			if f.State == state.FinishNeedsAttention {
+				res.OK = false
+				res.Health = controlHealthNeedsAttention
 				res.NextAction = "Run `acd doctor` to inspect the saved publication proof."
 			}
 		}
@@ -536,6 +586,8 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 	if h := report.PublicationOutcome.History; h != nil && res.OK && !finishStatusTakesPriority(report.PublicationOutcome.Finish) && (h.State == "running" || h.State == "prepared" || h.State == "needs_attention") {
 		res.Summary = "History plan " + h.PlanID + ": " + h.State + ". Checkpoint protection continues."
 		if h.State == "needs_attention" {
+			res.OK = false
+			res.Health = controlHealthNeedsAttention
 			res.NextAction = "Run `acd doctor` to inspect the saved history proof."
 		}
 	}

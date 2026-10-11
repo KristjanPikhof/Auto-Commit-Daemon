@@ -279,8 +279,10 @@ func completeProtectionCheckpoint(
 		projection.Latest.ObservedHead == cctx.BaseHead && projection.Latest.ObservedRef == cctx.BranchRef &&
 		!summary.Partial && !projection.Latest.Partial && projection.Latest.Phase == state.CheckpointCompleted &&
 		digestOK && priorDigest == liveDigest {
-		if err := persistProtectionCoverage(ctx, db, epoch, projection.Latest.ID, liveDigest, protectionScope(opts, projection.Latest.ID)); err != nil {
-			return err
+		if err := git.WithLockedPrivateRef(ctx, repoRoot, projection.Latest.Ref, projection.Latest.CommitOID, func(lockedCtx context.Context) error {
+			return persistProtectionCoverage(lockedCtx, db, epoch, projection.Latest.ID, liveDigest, protectionScope(opts, projection.Latest.ID))
+		}); err != nil {
+			return fmt.Errorf("daemon: prove reused protection checkpoint: %w", err)
 		}
 		summary.CheckpointID = projection.Latest.ID
 		summary.Protected = true
@@ -607,6 +609,10 @@ func walkLive(ctx context.Context, repoRoot string, opts walkOpts) (map[string]L
 	}
 	defer tree.Close()
 	opts.tree = tree
+	if opts.ignoreChecker == nil {
+		opts.ignoreChecker = git.NewIgnoreChecker(repoRoot)
+		defer opts.ignoreChecker.Close()
+	}
 	if opts.hashOnly || opts.durable {
 		hasher, err := git.NewBlobHasher(ctx, repoRoot)
 		if err != nil {

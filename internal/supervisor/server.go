@@ -91,6 +91,7 @@ type Server struct {
 	maintenance map[string]MaintenanceLease
 	closing     bool
 	cancel      context.CancelFunc
+	workerCtx   context.Context
 	command     func(context.Context, string, ...string) ([]byte, error)
 }
 
@@ -126,6 +127,7 @@ func (s *Server) Run(ctx context.Context) error {
 	defer runCancel()
 	s.mu.Lock()
 	s.cancel = runCancel
+	s.workerCtx = runCtx
 	s.mu.Unlock()
 	ctx = runCtx
 	if s.Roots.State == "" || s.Roots.Share == "" {
@@ -629,7 +631,13 @@ func (s *Server) startWorkerLocked(ctx context.Context, worker *workerProcess) {
 		return
 	}
 	_ = RemoveWorkerRuntimeStatus(s.Roots, worker.id)
-	cmd := exec.CommandContext(ctx, s.BinaryPath, args...)
+	// Request contexts bound reconciliation, not the lifetime of a protection
+	// worker. Maintenance and restart requests end as soon as they respond.
+	workerCtx := s.workerCtx
+	if workerCtx == nil {
+		workerCtx = context.Background()
+	}
+	cmd := exec.CommandContext(workerCtx, s.BinaryPath, args...)
 	cmd.Env = ProcessEnvironment(s.Roots, os.Environ())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

@@ -156,7 +156,7 @@ func readDaemonPidAndHeartbeat(ctx context.Context, dbPath string) (pid int, hea
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
-	dsn := "file:" + dbPath + "?" + q.Encode()
+	dsn := paths.DatabaseURI(dbPath, q)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return 0, 0, fmt.Errorf("open: %w", err)
