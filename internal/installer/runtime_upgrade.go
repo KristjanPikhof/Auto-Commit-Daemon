@@ -217,7 +217,7 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 		return false, err
 	}
 	if registry.Version != options.Compatibility.RegistryVersion {
-		return false, fmt.Errorf("runtime upgrade: registry v%d requires full `acd setup`", registry.Version)
+		return false, fmt.Errorf("Repository list v%d requires full `acd setup`.", registry.Version)
 	}
 	integrationSelection := options.Integrations
 	if integrationSelection == "" {
@@ -342,7 +342,7 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 	ready, err := runtimeStatus(ctx, roots)
 	if err != nil || ready.Version != options.SourceVersion || ready.BinaryDigest != sourceDigest || !ready.Compatibility.Equal(options.Compatibility) {
 		if err == nil {
-			err = fmt.Errorf("runtime upgrade: restarted supervisor did not report the installed compatibility contract")
+			err = fmt.Errorf("Restarted supervisor did not report the installed compatibility contract.")
 		}
 		return false, rollback(err)
 	}
@@ -369,7 +369,7 @@ func backupCompatibleRuntimeState(
 	targetVersion int,
 ) ([]migration.RepositoryPlan, error) {
 	if targetVersion != state.SchemaVersion {
-		return nil, fmt.Errorf("runtime upgrade: target state schema v%d does not match this binary's v%d",
+		return nil, fmt.Errorf("Target state data format v%d does not match this binary's v%d.",
 			targetVersion, state.SchemaVersion)
 	}
 	records := append([]central.RepoRecord(nil), registry.Repos...)
@@ -389,7 +389,7 @@ func backupCompatibleRuntimeState(
 			continue
 		}
 		if !state.CanRuntimeMigrate(version, targetVersion) {
-			return plans, fmt.Errorf("runtime upgrade: %s uses state schema v%d; run `acd setup` to upgrade it safely",
+			return plans, fmt.Errorf("%s uses state data format v%d; run `acd setup` to upgrade it safely.",
 				record.Path, version)
 		}
 		digest := sha256.Sum256([]byte(record.StateDB))
@@ -426,7 +426,7 @@ func waitForCompatibleRuntimeWorkers(
 				}
 				for _, record := range pending {
 					if record.RepositoryID == worker.RepositoryID {
-						return fmt.Errorf("runtime upgrade: worker for %s could not start: %s",
+						return fmt.Errorf("Worker for %s could not start: %s.",
 							record.Path, worker.LastError)
 					}
 				}
@@ -604,7 +604,7 @@ func proveRuntimeUpgradeGitDurable(
 	if len(status) != 0 {
 		if err := proveRuntimeUpgradeCheckpoint(ctx, record); err != nil {
 			return errors.Join(errors.New(
-				"runtime upgrade: worker is unavailable and the worktree has uncheckpointed changes"), err)
+				"Worker is unavailable and the worktree has uncheckpointed changes."), err)
 		}
 	}
 	return nil
@@ -624,7 +624,7 @@ func proveRuntimeUpgradeCheckpoint(
 	if version != state.SchemaVersion &&
 		!state.CanRuntimeMigrate(version, state.SchemaVersion) {
 		return fmt.Errorf(
-			"runtime upgrade: protected state schema v%d is not runtime-compatible",
+			"Protected state data format v%d is not running ACD-compatible.",
 			version)
 	}
 	db, err := state.OpenReadOnly(ctx, record.StateDB)
@@ -669,7 +669,7 @@ WHERE key IN (
 		return fmt.Errorf("runtime upgrade: verify completed checkpoint: %w", err)
 	}
 	if phase != state.CheckpointCompleted {
-		return fmt.Errorf("runtime upgrade: checkpoint %s is %s", checkpointID, phase)
+		return fmt.Errorf("Checkpoint %s is %s.", checkpointID, phase)
 	}
 	return nil
 }

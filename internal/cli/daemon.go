@@ -20,18 +20,18 @@ func buildDaemonRunOptionsWithID(repo, gitDir string, db *state.DB, repositoryID
 
 	roots, err := paths.Resolve()
 	if err != nil {
-		return daemon.Options{}, nil, fmt.Errorf("acd daemon run: resolve paths: %w", err)
+		return daemon.Options{}, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd daemon run: resolve paths: %w", err)
 	}
 	repoHash := strings.TrimSpace(repositoryID)
 	if repoHash == "" {
 		repoHash, err = paths.RepoHash(repo)
 		if err != nil {
-			return daemon.Options{}, nil, fmt.Errorf("acd daemon run: compute repo hash: %w", err)
+			return daemon.Options{}, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd daemon run: compute repo hash: %w", err)
 		}
 	}
 	runLogger, logCloser, err := acdlogger.New(acdlogger.Options{Path: roots.RepoLogPath(repoHash)})
 	if err != nil {
-		return daemon.Options{}, nil, fmt.Errorf("acd daemon run: open daemon log: %w", err)
+		return daemon.Options{}, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd daemon run: open daemon log: %w", err)
 	}
 
 	return daemon.Options{

@@ -74,13 +74,13 @@ func (m MaintenanceStatus) NeedsAction() bool {
 func (m MaintenanceStatus) Summary() string {
 	switch m.State {
 	case "retrying":
-		return "Checkpoint maintenance failed; ACD will retry automatically."
+		return "ACD could not clean up older checkpoints. It will retry automatically."
 	case "prerequisite":
-		return "Checkpoint maintenance is waiting for the Xcode license agreement."
+		return "ACD cannot clean up older checkpoints until you review the Xcode license."
 	case "needs_action":
-		return "Checkpoint maintenance stopped at a safety check. Protected data was retained."
+		return "ACD stopped checkpoint cleanup to keep saved work safe."
 	case "over_budget":
-		return "Protected checkpoints and saved finish evidence exceed the storage budget. Protected data was retained."
+		return "Saved work uses more space than ACD's storage limit. ACD kept it safe."
 	default:
 		return ""
 	}
@@ -91,9 +91,9 @@ func (m MaintenanceStatus) NextAction() string {
 	case "prerequisite":
 		return "Review the Xcode license with `sudo xcodebuild -license` in a terminal. ACD will recheck automatically."
 	case "needs_action", "over_budget":
-		return "Run `acd doctor` to review checkpoint maintenance details."
+		return "Run acd doctor to review checkpoint cleanup."
 	default:
-		return "No action needed. ACD will retry checkpoint maintenance automatically."
+		return "No action needed. ACD will retry checkpoint cleanup automatically."
 	}
 }
 
@@ -164,7 +164,7 @@ func (s Store) Maintain(ctx context.Context, repo, worktree string, now time.Tim
 	if err := state.MetaSetMany(ctx, s.DB, map[string]string{
 		MaintenanceMetaKey: string(raw), "protection.retention_over_budget": fmt.Sprint(result.OverBudget),
 	}); err != nil {
-		return previous.failed(now, fmt.Errorf("save checkpoint maintenance: %w", err)), err
+		return previous.failed(now, fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: save checkpoint maintenance: %w", err)), err
 	}
 	return result, nil
 }

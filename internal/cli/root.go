@@ -35,6 +35,17 @@ func Execute() error {
 		return nil
 	}
 	err = classifyCobraError(err)
+	var usageError *CommandError
+	if errors.As(err, &usageError) && usageError.Exit == ExitInvalid {
+		usageError.Message = strings.ReplaceAll(usageError.Message, "arg(s)", "argument(s)")
+		if !strings.Contains(usageError.Message, "Next:") {
+			command := root
+			if selected, _, findErr := root.Find(os.Args[1:]); findErr == nil {
+				command = selected
+			}
+			usageError.Message += "\nNext: Run `" + command.CommandPath() + " --help` for usage."
+		}
+	}
 	if !requestedJSON || (stdout != nil && stdout.BytesWritten() != 0) {
 		return err
 	}
@@ -157,7 +168,7 @@ func newRootCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:           "acd",
-		Short:         "Protect your work and publish clear local Git commits",
+		Short:         "Protect your work and create local Git commits",
 		Version:       version.String(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -168,7 +179,7 @@ func newRootCmd() *cobra.Command {
 		PersistentPreRunE: func(c *cobra.Command, _ []string) error {
 			level, err := parseLogLevel(logLevel)
 			if err != nil {
-				return invalidCommandError("acd: %v", err)
+				return invalidCommandError("ACD could not check protection.\nNext: run acd doctor.\nDetails: acd: %v", err)
 			}
 			if err := validateInvocationCapabilities(c); err != nil {
 				return err

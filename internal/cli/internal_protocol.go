@@ -154,11 +154,11 @@ func sendInternalHintToRepo(ctx context.Context, record central.RepoRecord, root
 func runSupervisor(ctx context.Context, _ io.Writer, _ io.Writer) error {
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd supervisor: resolve paths: %w", err)
+		return fmt.Errorf("acd supervisor: resolve paths\nDetails: %w", err)
 	}
 	binary, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("acd supervisor: resolve executable: %w", err)
+		return fmt.Errorf("acd supervisor: resolve executable\nDetails: %w", err)
 	}
 	binaryDigest, err := version.FileDigest(binary)
 	if err != nil {
@@ -212,7 +212,7 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 	}
 	lock, err := daemon.AcquireDaemonLock(firstWT.GitDir)
 	if err != nil {
-		return fmt.Errorf("acd worker: acquire repository ownership: %w", err)
+		return fmt.Errorf("acd worker: acquire repository ownership\nDetails: %w", err)
 	}
 	defer lock.Release()
 
@@ -263,12 +263,12 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		}
 		db, openErr := state.OpenRuntime(cctx, record.StateDB)
 		if openErr != nil {
-			return fmt.Errorf("acd worker: open %s: %w", record.Path, openErr)
+			return fmt.Errorf("acd worker: open %s\nDetails: %w", record.Path, openErr)
 		}
 		closers = append(closers, db)
 		restorePending, pendingErr := state.RestoreRepairPending(cctx, db)
 		if pendingErr != nil {
-			return fmt.Errorf("acd worker: inspect interrupted restore for %s: %w", record.Path, pendingErr)
+			return fmt.Errorf("acd worker: inspect interrupted restore for %s\nDetails: %w", record.Path, pendingErr)
 		}
 		opts, logCloser, buildErr := buildDaemonRunOptionsWithID(wt.Root, wt.GitDir, db, repositoryID)
 		if buildErr != nil {
@@ -312,7 +312,7 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		go func(path string, runOpts daemon.Options) {
 			defer runJobs.Done()
 			if runErr := daemon.Run(cctx, runOpts); runErr != nil && !errors.Is(runErr, context.Canceled) {
-				errCh <- fmt.Errorf("%s: %w", path, runErr)
+				errCh <- fmt.Errorf("%s\nDetails: %w", path, runErr)
 				return
 			}
 			errCh <- nil
@@ -355,7 +355,7 @@ func runRepositoryWorkerAtRoots(ctx context.Context, errOut io.Writer, roots pat
 		return runErr
 	case serverErr := <-workerServerErr:
 		cancel()
-		return fmt.Errorf("acd worker: control server: %w", serverErr)
+		return fmt.Errorf("acd worker: control server\nDetails: %w", serverErr)
 	}
 }
 
@@ -388,14 +388,14 @@ func inheritSupervisorWorkerEnvironment(ctx context.Context, roots paths.Roots, 
 		SocketPath: roots.SupervisorSocketPath(), Timeout: 5 * time.Second,
 	}).Do(ctx, request)
 	if err != nil {
-		return fmt.Errorf("acd worker: read supervisor environment: %w", err)
+		return fmt.Errorf("acd worker: read supervisor environment\nDetails: %w", err)
 	}
 	if response.Error != nil {
 		return fmt.Errorf("acd worker: read supervisor environment: %s", response.Error.Message)
 	}
 	body, err := json.Marshal(response.Data)
 	if err != nil {
-		return fmt.Errorf("acd worker: encode supervisor environment: %w", err)
+		return fmt.Errorf("acd worker: encode supervisor environment\nDetails: %w", err)
 	}
 	var values map[string]string
 	if err := json.Unmarshal(body, &values); err != nil {
@@ -406,7 +406,7 @@ func inheritSupervisorWorkerEnvironment(ctx context.Context, roots paths.Roots, 
 	}
 	for name, value := range values {
 		if err := os.Setenv(name, value); err != nil {
-			return fmt.Errorf("acd worker: apply supervisor environment %s: %w", name, err)
+			return fmt.Errorf("acd worker: apply supervisor environment %s\nDetails: %w", name, err)
 		}
 	}
 	return nil
@@ -554,7 +554,7 @@ func applyWorkerRootEnvironment(roots paths.Roots) error {
 		"XDG_CONFIG_HOME": filepath.Dir(roots.Config),
 	} {
 		if err := os.Setenv(name, value); err != nil {
-			return fmt.Errorf("acd worker: set %s: %w", name, err)
+			return fmt.Errorf("acd worker: set %s\nDetails: %w", name, err)
 		}
 	}
 	return nil
@@ -563,16 +563,16 @@ func applyWorkerRootEnvironment(roots paths.Roots) error {
 func applyWorkerRestartOptions(roots paths.Roots, record central.RepoRecord, wt git.Worktree, opts *daemon.Options) error {
 	document, err := config.NewStore(roots).Load()
 	if err != nil {
-		return fmt.Errorf("acd worker: load repository configuration: %w", err)
+		return fmt.Errorf("acd worker: load repository configuration\nDetails: %w", err)
 	}
 	values, err := config.ResolveRestartEnvironment(document, record.WorktreeID, os.LookupEnv)
 	if err != nil {
-		return fmt.Errorf("acd worker: resolve repository configuration: %w", err)
+		return fmt.Errorf("acd worker: resolve repository configuration\nDetails: %w", err)
 	}
 	parseInt := func(name string) (int64, error) {
 		value, err := strconv.ParseInt(strings.TrimSpace(values[name]), 10, 64)
 		if err != nil {
-			return 0, fmt.Errorf("%s=%q: %w", name, values[name], err)
+			return 0, fmt.Errorf("%s=%q\nDetails: %w", name, values[name], err)
 		}
 		return value, nil
 	}

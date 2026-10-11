@@ -1093,7 +1093,7 @@ func TestSetupProgressShowsPhaseAndHeartbeat(t *testing.T) {
 	if !strings.Contains(got, "Setup: Scanning registered repositories\n") {
 		t.Fatalf("missing phase progress: %q", got)
 	}
-	if !strings.Contains(got, "Setup: still working on scanning registered repositories") {
+	if !strings.Contains(got, "Setup: scanning registered repositories") {
 		t.Fatalf("missing heartbeat: %q", got)
 	}
 	if strings.Contains(got, "(0s elapsed)") {

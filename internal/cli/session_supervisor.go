@@ -28,22 +28,22 @@ func ensureMutationSupervisorMode(ctx context.Context, roots paths.Roots, backgr
 	binary := roots.ManagedBinaryPath()
 	info, err := os.Stat(binary)
 	if err != nil {
-		return nil, fmt.Errorf("managed ACD binary is unavailable; run `acd setup`: %w", err)
+		return nil, fmt.Errorf("ACD's installed program is unavailable.\nNext: run acd setup.\nDetails: %w", err)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, errors.New("managed ACD binary is not a regular file; run `acd setup`")
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return nil, fmt.Errorf("resolve ACD executable: %w", err)
+		return nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: resolve ACD executable: %w", err)
 	}
 	sourceDigest, err := version.FileDigest(executable)
 	if err != nil {
-		return nil, fmt.Errorf("digest ACD executable: %w", err)
+		return nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: digest ACD executable: %w", err)
 	}
 	managedDigest, err := version.FileDigest(binary)
 	if err != nil {
-		return nil, fmt.Errorf("digest managed ACD binary; run `acd setup`: %w", err)
+		return nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: digest managed ACD binary; run `acd setup`: %w", err)
 	}
 	if managedDigest != sourceDigest {
 		return nil, errors.New("the installed ACD runtime does not match this command; run `acd setup` to review and apply the global upgrade")

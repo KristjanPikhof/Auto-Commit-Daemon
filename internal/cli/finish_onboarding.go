@@ -21,17 +21,17 @@ func bootstrapControlSetupWith(ctx context.Context, lookup controlRepoLookup,
 	if _, err := os.Lstat(lookup.Roots.ManagedBinaryPath()); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("acd on: inspect runtime: %w", err)
+		return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: inspect runtime: %w", err)
 	}
 	plan, err := build(ctx, lookup.Roots, installer.Options{Repo: lookup.Worktree.Root, Integrations: "none", NonInteractive: true})
 	if err != nil {
-		return fmt.Errorf("acd on: prepare initial setup: %w", err)
+		return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: prepare initial setup: %w", err)
 	}
 	if plan.ExistingInstall || !plan.FreshDefaults || len(plan.Repositories) != 0 {
-		return actionRequiredError("setup_required", "acd on: existing user setup requires an explicit upgrade; run `acd setup`")
+		return actionRequiredError("setup_required", "acd on: upgrade your existing ACD installation first. Run acd setup to review the upgrade.")
 	}
 	if _, err := apply(ctx, lookup.Roots, plan, installer.ApplyOptions{}); err != nil {
-		return fmt.Errorf("acd on: initial setup failed; repository was not enabled: %w", err)
+		return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: initial setup failed; repository was not enabled: %w", err)
 	}
 	return nil
 }

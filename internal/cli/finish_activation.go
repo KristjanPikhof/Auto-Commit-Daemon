@@ -14,7 +14,7 @@ import (
 func activateWorkerFinish(ctx context.Context, out io.Writer, repo, repositoryID, worktreeID string, db *state.DB, publicationHeld bool) {
 	attention := func(err error) {
 		if err != nil {
-			fmt.Fprintf(out, "Finish activation for %s needs attention: %v; checkpoint protection continues.\n", repo, err)
+			fmt.Fprintf(out, "An interrupted finish needs review for %s. Protection continues.\nDetails: %v\n", repo, err)
 		}
 	}
 	attention(state.InterruptFinishHistoryRequests(ctx, db, worktreeID))

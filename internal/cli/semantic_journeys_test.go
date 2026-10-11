@@ -31,7 +31,7 @@ func TestRecoveryHistoryDoesNotHideCurrentPublicationActivity(t *testing.T) {
 	report := finishStatusRead(t, record, db)
 	var preserved bytes.Buffer
 	renderFinishOutcomeHuman(&preserved, report.PublicationOutcome)
-	if report.PublicationOutcome.RecoveredChanges != 1 || !strings.Contains(preserved.String(), "Recovery: 1 legacy changes saved separately") {
+	if report.PublicationOutcome.RecoveredChanges != 1 || !strings.Contains(preserved.String(), "Recovery: 1 older changes saved separately") {
 		t.Fatalf("recovery preservation was hidden: %+v %s", report.PublicationOutcome, &preserved)
 	}
 

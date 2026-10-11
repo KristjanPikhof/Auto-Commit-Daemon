@@ -80,11 +80,11 @@ func newConfigResetCmd() *cobra.Command {
 	var options configScopeOptions
 	cmd := &cobra.Command{
 		Use: "reset [KEY]", Short: "Remove saved settings and use inherited defaults", Args: cobra.MaximumNArgs(1),
-		Long: `Remove one saved setting, or all settings in the selected scope when
-no key is supplied. ACD then uses the next inherited value.
+		Long: `Remove one saved setting, or all settings in the selected scope when no key is
+supplied. ACD then uses the next inherited value.
 
-The command saves a draft. Review the inherited settings with acd config before
-applying them.`,
+The command saves a draft. Review the inherited settings with acd config
+before applying them.`,
 		Example: `  acd config reset commit.strategy
   acd config reset --scope global`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -204,7 +204,7 @@ func runConfigSet(ctx context.Context, out io.Writer, repo string, options confi
 	}
 	definition, ok := config.LookupField(key)
 	if !ok || !definition.Persistable || definition.Sensitive {
-		return invalidCommandError("acd config set: field %q cannot be persisted; use `acd config credentials` for secrets", key)
+		return invalidCommandError("Field %q cannot be saved; use `acd config credentials` for secrets.", key)
 	}
 	raw, err := normalizedConfigRaw(definition, value)
 	if err != nil {
@@ -363,9 +363,9 @@ func runProductCredentialStatus(out io.Writer, jsonOut bool) error {
 		return renderJSONEnvelope(out, productEnvelope{OK: true, State: productStateOff,
 			Actions: []productAction{}, Data: data})
 	}
-	fmt.Fprintf(out, "Credential source: %s\n", source)
-	fmt.Fprintf(out, "Protected file configured: %t\n", status.ProtectedFileSet)
-	fmt.Fprintf(out, "Protected file: %s\n", status.Path)
+	fmt.Fprintf(out, "API key source: %s\n", source)
+	fmt.Fprintf(out, "Saved API key: %s\n", yesNo(status.ProtectedFileSet))
+	fmt.Fprintf(out, "Saved key location: %s\n", status.Path)
 	return nil
 }
 

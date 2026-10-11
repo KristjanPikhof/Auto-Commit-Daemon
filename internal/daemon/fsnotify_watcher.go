@@ -222,7 +222,7 @@ func NewFsnotifyWatcher(opts FsnotifyOptions) (*FsnotifyWatcher, error) {
 
 	// Honor the disable toggle before touching the OS.
 	if envFlag(EnvDisableFsnotify) {
-		w.fallbackToPoll(FallbackDisabled, "ACD_DISABLE_FSNOTIFY=1; running poll-only")
+		w.fallbackToPoll(FallbackDisabled, "File change notifications are unavailable; periodic scans will continue.\nDetails: ACD_DISABLE_FSNOTIFY=1; running poll-only")
 		return w, nil
 	}
 
@@ -242,7 +242,7 @@ func NewFsnotifyWatcher(opts FsnotifyOptions) (*FsnotifyWatcher, error) {
 		if errors.Is(err, errBudgetExceeded) {
 			w.clearWatchedLocked()
 			w.fallbackToPoll(FallbackBudgetExceeded,
-				"pre-walk would exceed watch budget; running poll-only")
+				"File change notifications are unavailable; periodic scans will continue.\nDetails: pre-walk would exceed watch budget; running poll-only")
 			return w, nil
 		}
 		// Any other error: cancel watcher-scoped ctx so no goroutines leak.
@@ -780,7 +780,7 @@ func (w *FsnotifyWatcher) dispatch(ctx context.Context) {
 			w.logger.Warn("fsnotify error", "err", err.Error(), "streak", consecutiveErrors)
 			if consecutiveErrors >= MaxConsecutiveErrors {
 				w.fallbackToPoll(FallbackErrorsExceeded,
-					"fsnotify error streak exceeded; running poll-only")
+					"File change notifications are unavailable; periodic scans will continue.\nDetails: fsnotify error streak exceeded; running poll-only")
 				stopAll()
 				return
 			}
@@ -829,7 +829,7 @@ func (w *FsnotifyWatcher) rewalkWorker() {
 			if err := w.preWalk(w.watcherCtx, path); err != nil {
 				if errors.Is(err, errBudgetExceeded) {
 					w.fallbackToPoll(FallbackBudgetExceeded,
-						"runtime watch growth exceeded budget; running poll-only")
+						"File change notifications are unavailable; periodic scans will continue.\nDetails: runtime watch growth exceeded budget; running poll-only")
 					// Drain the rest: poll mode means no further rewalks.
 					return
 				}

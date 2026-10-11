@@ -22,7 +22,7 @@ var signalProcess = func(pid int, sig syscall.Signal, expectedFingerprint string
 	if expectedFingerprint != "" {
 		fp, err := captureProcessFingerprint(pid)
 		if err == nil && daemon.FingerprintToken(fp) != expectedFingerprint {
-			return fmt.Errorf("verify process identity for pid %d: fingerprint mismatch", pid)
+			return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: verify process identity for pid %d: fingerprint mismatch", pid)
 		}
 	}
 	return killProcess(pid, sig)

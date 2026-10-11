@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -86,7 +85,8 @@ func newEventsCmd() *cobra.Command {
 The events command reads the durable decision ledger instead of raw daemon
 JSONL logs. Use --path to focus on one path, --since with a decision cursor to
 resume polling, and --watch to stream appended decisions until interrupted.
-With --watch and no --since, events prints only decisions appended after watch starts.`,
+With --watch and no --since, events prints only decisions appended after watch
+starts.`,
 		Example: `  acd events
   acd events --path internal/state/schema.go
   acd events --since 42 --limit 100
@@ -142,7 +142,7 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 
 	hasLedger, err := sqliteTableExists(ctx, db, "decision_records")
 	if err != nil {
-		return fmt.Errorf("acd events: decision table check: %w", err)
+		return fmt.Errorf("acd events: decision table check\nDetails: %w", err)
 	}
 	if !hasLedger {
 		return renderEvents(ctx, out, db, rec.Path, nil, since, jsonOut, true, missingDecisionLedgerMessage)
@@ -153,7 +153,7 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 	if since == 0 {
 		cursor, err = latestDecisionIDSQL(ctx, db)
 		if err != nil {
-			return fmt.Errorf("acd events: latest cursor: %w", err)
+			return fmt.Errorf("acd events: latest cursor\nDetails: %w", err)
 		}
 	} else {
 		rows, err = loadDecisionEvents(ctx, db, path, since, limit)
@@ -190,7 +190,7 @@ WHERE path = ? AND id > ?
 ORDER BY id ASC
 LIMIT ?`, path, since, limit)
 		if err != nil {
-			return nil, fmt.Errorf("acd events: query path decisions since cursor: %w", err)
+			return nil, fmt.Errorf("acd events: query path decisions since cursor\nDetails: %w", err)
 		}
 	case path != "":
 		rows, err = queryDecisionRecordsSQL(ctx, db, `
@@ -201,7 +201,7 @@ WHERE path = ?
 ORDER BY id DESC
 LIMIT ?`, path, limit)
 		if err != nil {
-			return nil, fmt.Errorf("acd events: query path decisions: %w", err)
+			return nil, fmt.Errorf("acd events: query path decisions\nDetails: %w", err)
 		}
 	case since > 0:
 		rows, err = queryDecisionRecordsSQL(ctx, db, `
@@ -212,7 +212,7 @@ WHERE id > ?
 ORDER BY id ASC
 LIMIT ?`, since, limit)
 		if err != nil {
-			return nil, fmt.Errorf("acd events: query decisions since cursor: %w", err)
+			return nil, fmt.Errorf("acd events: query decisions since cursor\nDetails: %w", err)
 		}
 	default:
 		rows, err = queryDecisionRecordsSQL(ctx, db, `
@@ -222,7 +222,7 @@ FROM decision_records
 ORDER BY id DESC
 LIMIT ?`, limit)
 		if err != nil {
-			return nil, fmt.Errorf("acd events: query recent decisions: %w", err)
+			return nil, fmt.Errorf("acd events: query recent decisions\nDetails: %w", err)
 		}
 	}
 	return rows, nil
@@ -325,7 +325,7 @@ func collectEvents(ctx context.Context, repo, path string, since int64, limit in
 	defer db.Close()
 	hasLedger, err := sqliteTableExists(ctx, db, "decision_records")
 	if err != nil {
-		return eventsReport{}, fmt.Errorf("acd events: decision table check: %w", err)
+		return eventsReport{}, fmt.Errorf("acd events: decision table check\nDetails: %w", err)
 	}
 	if !hasLedger {
 		return buildEventsReport(ctx, db, rec.Path, nil, since, missingDecisionLedgerMessage)
@@ -338,7 +338,7 @@ func collectEvents(ctx context.Context, repo, path string, since int64, limit in
 	if since == 0 && cursor == 0 {
 		cursor, err = latestDecisionIDSQL(ctx, db)
 		if err != nil {
-			return eventsReport{}, fmt.Errorf("acd events: latest cursor: %w", err)
+			return eventsReport{}, fmt.Errorf("acd events: latest cursor\nDetails: %w", err)
 		}
 	}
 	return buildEventsReport(ctx, db, rec.Path, rows, cursor, "")
@@ -381,7 +381,7 @@ func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, r
 		enc := json.NewEncoder(out)
 		for _, entry := range entries {
 			if err := enc.Encode(entry); err != nil {
-				return fmt.Errorf("acd events: write json event: %w", err)
+				return fmt.Errorf("acd events: write json event\nDetails: %w", err)
 			}
 		}
 		return nil
@@ -409,45 +409,18 @@ func renderEventsReport(out io.Writer, report eventsReport, jsonOut bool) error 
 }
 
 func renderEventsTable(out io.Writer, entries []eventEntry) error {
-	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tTIME\tKIND\tPATH\tACTION\tMESSAGE")
 	for _, entry := range entries {
-		path := entry.Path
-		if path == "" {
-			path = "-"
-		}
-		action := entry.ActionTaken
-		if action == "" {
-			action = "-"
-		}
 		message := entry.UserMessage
 		if message == "" {
 			message = entry.Reason
 		}
-		if message == "" {
-			message = "-"
+		fmt.Fprintf(out, "Activity %d | %s\n", entry.ID, safePreviewText(entry.Time, 0))
+		if entry.Path != "" {
+			fmt.Fprintf(out, "  Path: %q\n", entry.Path)
 		}
-		if len(entry.GroupedSeqs) > 1 {
-			message = fmt.Sprintf("%s seqs=%s", message, formatSeqs(entry.GroupedSeqs))
-		}
-		if entry.PlannerWindow != nil {
-			message = fmt.Sprintf("%s planner_window=%d offered=%s",
-				message, entry.PlannerWindow.ID, formatSeqs(entry.PlannerWindow.OfferedSeqs))
-			if len(entry.PlannerWindow.HiddenSeqs) > 0 {
-				message = fmt.Sprintf("%s hidden=%s", message, formatSeqs(entry.PlannerWindow.HiddenSeqs))
-			}
-		}
-		if entry.CandidateID != "" {
-			message = fmt.Sprintf("%s candidate=%s status=%s atomicity=%s verification=%s",
-				message, entry.CandidateID, valueOrUnset(entry.CandidateStatus),
-				valueOrUnset(entry.AtomicityStatus),
-				valueOrUnset(entry.VerificationStatus))
-		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
-			entry.ID, entry.Time, entry.Kind, path, action, message)
-	}
-	if err := tw.Flush(); err != nil {
-		return fmt.Errorf("acd events: flush output: %w", err)
+		fmt.Fprintf(out, "  Action: %s\n", safePreviewText(strings.ReplaceAll(entry.ActionTaken, "_", " "), 0))
+		fmt.Fprintln(out, consoleProse(consoleCause(message)))
+		fmt.Fprintln(out)
 	}
 	return nil
 }
@@ -513,15 +486,15 @@ func enrichEventEntries(ctx context.Context, db *sql.DB, entries []eventEntry) e
 	cache := map[string]decisionCommitSummary{}
 	hasPlannerWindows, err := sqliteTableExists(ctx, db, "intent_planner_window_events")
 	if err != nil {
-		return fmt.Errorf("acd events: intent planner window table check: %w", err)
+		return fmt.Errorf("acd events: intent planner window table check\nDetails: %w", err)
 	}
 	hasCandidates, err := sqliteTableExists(ctx, db, "intent_candidate_events")
 	if err != nil {
-		return fmt.Errorf("acd events: Intent v2 candidate table check: %w", err)
+		return fmt.Errorf("acd events: Intent v2 candidate table check\nDetails: %w", err)
 	}
 	hasRepairs, err := sqliteTableExists(ctx, db, "intent_repair_commits")
 	if err != nil {
-		return fmt.Errorf("acd events: Intent v2 repair table check: %w", err)
+		return fmt.Errorf("acd events: Intent v2 repair table check\nDetails: %w", err)
 	}
 	candidateBySeq := map[int64]eventCandidateSummary{}
 	repairByCandidate := map[string]string{}
@@ -622,7 +595,7 @@ WHERE ce.membership_state='active' AND ce.event_seq IN (`+
 			strings.Join(marks, ",")+`)
 ORDER BY ce.event_seq, c.updated_ts DESC, c.id DESC`, args...)
 		if err != nil {
-			return nil, fmt.Errorf("acd events: query Intent v2 candidates: %w", err)
+			return nil, fmt.Errorf("acd events: query Intent v2 candidates\nDetails: %w", err)
 		}
 		for rows.Next() {
 			var seq int64
@@ -630,7 +603,7 @@ ORDER BY ce.event_seq, c.updated_ts DESC, c.id DESC`, args...)
 			if err := rows.Scan(&seq, &id, &status, &protocol, &atomicity,
 				&verification); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("acd events: scan Intent v2 candidate: %w", err)
+				return nil, fmt.Errorf("acd events: scan Intent v2 candidate\nDetails: %w", err)
 			}
 			if _, exists := out[seq]; exists {
 				continue
@@ -645,7 +618,7 @@ ORDER BY ce.event_seq, c.updated_ts DESC, c.id DESC`, args...)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("acd events: iterate Intent v2 candidates: %w", err)
+			return nil, fmt.Errorf("acd events: iterate Intent v2 candidates\nDetails: %w", err)
 		}
 		rows.Close()
 	}
@@ -687,14 +660,14 @@ JOIN intent_repairs r ON r.id=rc.repair_id
 WHERE rc.candidate_id IN (`+strings.Join(marks, ",")+`)
 ORDER BY rc.candidate_id, r.updated_ts DESC, r.id DESC`, args...)
 		if err != nil {
-			return nil, fmt.Errorf("acd events: query Intent v2 repairs: %w", err)
+			return nil, fmt.Errorf("acd events: query Intent v2 repairs\nDetails: %w", err)
 		}
 		for rows.Next() {
 			var id string
 			var status sql.NullString
 			if err := rows.Scan(&id, &status); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("acd events: scan Intent v2 repair: %w", err)
+				return nil, fmt.Errorf("acd events: scan Intent v2 repair\nDetails: %w", err)
 			}
 			if _, exists := out[id]; !exists {
 				out[id] = sanitizeObservabilityText(status.String)
@@ -702,7 +675,7 @@ ORDER BY rc.candidate_id, r.updated_ts DESC, r.id DESC`, args...)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("acd events: iterate Intent v2 repairs: %w", err)
+			return nil, fmt.Errorf("acd events: iterate Intent v2 repairs\nDetails: %w", err)
 		}
 		rows.Close()
 	}
@@ -721,7 +694,7 @@ FROM decision_records
 WHERE commit_oid = ? AND event_seq IS NOT NULL
 ORDER BY event_seq ASC`, commitOID)
 	if err != nil {
-		return decisionCommitSummary{}, fmt.Errorf("acd events: query commit grouped seqs: %w", err)
+		return decisionCommitSummary{}, fmt.Errorf("acd events: query commit grouped seqs\nDetails: %w", err)
 	}
 	defer rows.Close()
 	var summary decisionCommitSummary
@@ -730,7 +703,7 @@ ORDER BY event_seq ASC`, commitOID)
 		var seq int64
 		var action, reason sql.NullString
 		if err := rows.Scan(&seq, &action, &reason); err != nil {
-			return decisionCommitSummary{}, fmt.Errorf("acd events: scan commit grouped seq: %w", err)
+			return decisionCommitSummary{}, fmt.Errorf("acd events: scan commit grouped seq\nDetails: %w", err)
 		}
 		if _, ok := seen[seq]; !ok {
 			summary.Seqs = append(summary.Seqs, seq)
@@ -741,7 +714,7 @@ ORDER BY event_seq ASC`, commitOID)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return decisionCommitSummary{}, fmt.Errorf("acd events: iter commit grouped seqs: %w", err)
+		return decisionCommitSummary{}, fmt.Errorf("acd events: iter commit grouped seqs\nDetails: %w", err)
 	}
 	return summary, nil
 }

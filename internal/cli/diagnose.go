@@ -113,9 +113,14 @@ func newDiagnoseCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "diagnose",
 		Short: "Inspect replay blockers and branch anchors without mutating state",
-		Long: `Inspect replay blockers, pending depth, branch anchor state, git-operation markers, and remediation hints for one repo.
+		Long: `Inspect replay blockers, pending depth, branch anchor state, git-operation
+markers, and remediation hints for one repo.
 
-The default repo is the current working directory. Diagnose opens state read-only and verifies the state DB checksum before and after inspection. Pending-only intent queues are reported as waiting/draining, while terminal barriers point to acd fix --dry-run and archive-only recovery previews when needed.`,
+The default repo is the current working directory. Diagnose opens state
+read-only and verifies the state DB checksum before and after inspection.
+Pending-only intent queues are reported as waiting/draining, while terminal
+barriers point to acd fix --dry-run and archive-only recovery previews when
+needed.`,
 		Example: `  acd diagnose
   acd diagnose --repo /path/to/repo
   acd diagnose --json
@@ -155,7 +160,7 @@ func collectDiagnose(ctx context.Context, repo string) (diagnoseReport, error) {
 
 	report, err := buildDiagnoseReport(ctx, rec)
 	if err != nil {
-		return diagnoseReport{}, fmt.Errorf("acd diagnose: %w", err)
+		return diagnoseReport{}, fmt.Errorf("acd diagnose\nDetails: %w", err)
 	}
 
 	return report, nil
@@ -229,7 +234,11 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		for _, next := range r.Remediation {
 			fmt.Fprintf(out, "Next: %s\n", next)
 		}
-		fmt.Fprintf(out, "Read-only state checksum unchanged: %s\n", yesNo(r.StateDBChecksumVerified))
+		if r.StateDBChecksumVerified {
+			fmt.Fprintln(out, "Diagnostics did not change saved data.")
+		} else {
+			fmt.Fprintln(out, "Saved data stability could not be confirmed.")
+		}
 		return nil
 	}
 
@@ -281,14 +290,14 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 	}
 
 	if len(r.GeneratedPending) > 0 {
-		fmt.Fprintln(out, "Generated pending deletes:")
+		fmt.Fprintln(out, "Saved deletions in generated folders:")
 		for _, group := range r.GeneratedPending {
 			fmt.Fprintf(out, "  - root=%s pending=%d tracked=%d seq=%d..%d pattern=%s\n",
 				group.Root, group.PendingCount, group.TrackedCount, group.OldestSeq, group.NewestSeq, group.Pattern)
 		}
 	}
 
-	fmt.Fprintln(out, "Terminal replay barrier histogram:")
+	fmt.Fprintln(out, "Archived changes blocked from being committed:")
 	if len(r.BlockedHistogram) == 0 {
 		fmt.Fprintln(out, "  none")
 	} else {
@@ -297,7 +306,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		}
 	}
 
-	fmt.Fprintln(out, "Recent replay barriers:")
+	fmt.Fprintln(out, "Recent archived changes that could not be committed:")
 	if len(r.RecentBlocked) == 0 {
 		fmt.Fprintln(out, "  none")
 	} else {
@@ -321,7 +330,7 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 		)
 	}
 
-	fmt.Fprintln(out, "Suggested remediation:")
+	fmt.Fprintln(out, "Next steps:")
 	for _, item := range r.Remediation {
 		fmt.Fprintf(out, "  - %s\n", item)
 	}

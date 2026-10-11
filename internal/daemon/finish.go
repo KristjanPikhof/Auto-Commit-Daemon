@@ -504,7 +504,7 @@ func overlayFinishIndex(ctx context.Context, repo string, base, target finish.Tr
 	for _, path := range paths {
 		entry, exists := index[path]
 		if !eligible[path] || entry.Mode == "160000" || base[path].Mode == "160000" {
-			return fmt.Errorf("staged_scope_excluded: staged selection contains an excluded path")
+			return fmt.Errorf("Your staged selection includes an item ACD does not protect.\nNext: Review the staged selection and ACD exclusion settings before trying finish again.")
 		}
 		if exists {
 			target[path] = finish.Entry{Mode: entry.Mode, OID: entry.OID}

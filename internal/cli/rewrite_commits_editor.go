@@ -104,21 +104,21 @@ func parseRewritePlanEditText(data []byte, base state.RewritePlan) ([]state.Rewr
 		}
 		reason, err := scanRewriteEditBlock(s, "ACD_GROUP_REASON")
 		if err != nil {
-			return nil, fmt.Errorf("acd history rewrite: invalid text plan group %d reason: %w", len(groups)+1, err)
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan group %d reason\nDetails: %w", len(groups)+1, err)
 		}
 		if !s.Scan() || strings.TrimSpace(s.Text()) != "message <<ACD_COMMIT_MESSAGE" {
 			return nil, fmt.Errorf("acd history rewrite: invalid text plan group %d: expected message marker", len(groups)+1)
 		}
 		message, err := scanRewriteEditBlock(s, "ACD_COMMIT_MESSAGE")
 		if err != nil {
-			return nil, fmt.Errorf("acd history rewrite: invalid text plan group %d message: %w", len(groups)+1, err)
+			return nil, fmt.Errorf("acd history rewrite: invalid text plan group %d message\nDetails: %w", len(groups)+1, err)
 		}
 		group.GroupingReason = reason
 		group.ProposedMessage = message
 		groups = append(groups, group)
 	}
 	if err := s.Err(); err != nil {
-		return nil, fmt.Errorf("acd history rewrite: read text plan: %w", err)
+		return nil, fmt.Errorf("acd history rewrite: read text plan\nDetails: %w", err)
 	}
 	return validateEditedRewriteGroups(base, groups, "text")
 }
@@ -154,13 +154,13 @@ func parseRewritePlanEditJSON(data []byte, base state.RewritePlan) ([]state.Rewr
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: %w", err)
+		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan\nDetails: %w", err)
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		if err == nil {
 			return nil, errors.New("acd history rewrite: invalid JSON plan: trailing JSON value")
 		}
-		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: trailing data: %w", err)
+		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: trailing data\nDetails: %w", err)
 	}
 	if strings.TrimSpace(doc.PlanID) != "" && doc.PlanID != base.ID {
 		return nil, fmt.Errorf("acd history rewrite: invalid JSON plan: plan_id %q, want %q", doc.PlanID, base.ID)
@@ -277,7 +277,7 @@ func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.R
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return nil, false, fmt.Errorf("acd history rewrite: editor failed: %w", err)
+		return nil, false, fmt.Errorf("acd history rewrite: editor failed\nDetails: %w", err)
 	}
 	edited, err := os.ReadFile(path)
 	if err != nil {

@@ -566,19 +566,19 @@ func TestApplySupervisorWorkerFailureProvidesRepairThatMatchesCause(t *testing.T
 		{
 			name:    "safe schema upgrade",
 			error:   "acd worker: open /repo: state: checkpoint-first setup required: state database schema is v20, want v21",
-			summary: "safe schema upgrade",
-			next:    "Run `acd setup`",
+			summary: "saved data needs an upgrade",
+			next:    "Run acd setup",
 		},
 		{
 			name:    "old owner",
 			error:   "acd worker: acquire repository ownership: already owned",
-			summary: "older worker",
-			next:    "Run `acd on`",
+			summary: "older ACD process",
+			next:    "Run acd on",
 		},
 		{
 			name:    "unknown startup failure",
 			error:   "acd worker: provider configuration is invalid",
-			summary: "startup error",
+			summary: "could not restart protection",
 			next:    "acd support logs --lines 100",
 		},
 	}
@@ -623,7 +623,7 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
 		t.Fatalf("runControlStatus: %v", err)
 	}
-	for _, line := range []string{"Protection:", "Last observed work saved:", "Branch commits:", "Next:"} {
+	for _, line := range []string{"Protection:", "Last checked changes saved:", "Git commits:", "Next:"} {
 		if got := strings.Count(out.String(), line); got != 1 {
 			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
 		}
@@ -669,7 +669,7 @@ func decodeControlResult(t *testing.T, body []byte) controlResult {
 	} else if envelope.State == productStateNeedsAction {
 		health = controlHealthNeedsAttention
 	}
-	if envelope.Data.Summary == "The current directory is not inside a Git worktree." {
+	if envelope.Data.Summary == "This directory is not inside a Git repository." {
 		health = controlHealthNotRepo
 	}
 	actions := make([]string, 0, len(envelope.Actions))

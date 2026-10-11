@@ -28,8 +28,8 @@ func newAuthCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "auth",
 		Short: "Manage the protected provider credential",
-		Long: `Manage the optional OpenAI-compatible API key stored in the protected
-XDG credential file. ACD_AI_API_KEY remains higher priority. Secret values are
+		Long: `Manage the optional OpenAI-compatible API key stored in the protected XDG
+credential file. ACD_AI_API_KEY remains higher priority. Secret values are
 never printed by these commands.`,
 		Args: cobra.NoArgs,
 	}
@@ -41,12 +41,13 @@ func newAuthSetCmd() *cobra.Command {
 	var fromStdin bool
 	cmd := &cobra.Command{
 		Use:   "set",
-		Short: "Store a protected OpenAI-compatible API key",
-		Long: `Read an API key from a masked terminal prompt or, with --stdin, from
-standard input. No command-line flag accepts a literal secret.
+		Short: "Save an API key for your AI service",
+		Long: `Read an API key from a masked terminal prompt or, with --stdin, from standard
+input. No command-line flag accepts a literal secret.
 
-For the current enabled repository (or --repo), ACD tests the stored credential
-and queues its existing runtime settings again. Other repositories are unchanged.`,
+For the current enabled repository (or --repo), ACD tests the stored
+credential and queues its existing runtime settings again. Other repositories
+are unchanged.`,
 		Example: "  acd auth set\n  printf '%s\\n' \"$ACD_AI_API_KEY\" | acd auth set --stdin",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -79,8 +80,8 @@ func newAuthStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: "Show the active credential source without its value",
-		Long: `Show whether ACD is using the protected credential file, an
-environment variable, or no API key. The secret value is never printed.`,
+		Long: `Show whether ACD is using the protected credential file, an environment
+variable, or no API key. The secret value is never printed.`,
 		Example: `  acd config credentials status
   acd config credentials status --json`,
 		Args: cobra.NoArgs,
@@ -123,8 +124,8 @@ func newAuthRemoveCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "remove",
 		Short: "Remove the protected provider credential",
-		Long: `Remove only the API key stored in ACD's protected credential file.
-An ACD_AI_API_KEY environment variable is not changed.`,
+		Long: `Remove only the API key stored in ACD's protected credential file. An
+ACD_AI_API_KEY environment variable is not changed.`,
 		Example: `  acd config credentials remove
   acd config credentials remove --yes`,
 		Args: cobra.NoArgs,
@@ -142,9 +143,9 @@ An ACD_AI_API_KEY environment variable is not changed.`,
 				return fmt.Errorf("acd auth remove: %w", err)
 			}
 			if removed {
-				fmt.Fprintln(cmd.OutOrStdout(), "Removed protected provider credential")
+				fmt.Fprintln(cmd.OutOrStdout(), "Saved API key removed.")
 			} else {
-				fmt.Fprintln(cmd.OutOrStdout(), "Protected provider credential was not configured")
+				fmt.Fprintln(cmd.OutOrStdout(), "There is no saved API key to remove.")
 			}
 			return nil
 		},

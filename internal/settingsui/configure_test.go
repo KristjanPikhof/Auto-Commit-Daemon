@@ -48,7 +48,7 @@ func TestFinishRemovalWizardStagesIntentWithoutTests(t *testing.T) {
 	}
 	for _, want := range []string{
 		"How should finish create commits?", "Which provider should Intent use?",
-		"OpenAI-compatible endpoint", "Model", "API key",
+		"AI service URL (OpenAI compatible)", "Model", "API key",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output missing %q\n%s", want, out.String())

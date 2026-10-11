@@ -18,16 +18,18 @@ import (
 
 func newFinishCmd() *cobra.Command {
 	var params finishStartParams
-	cmd := &cobra.Command{Use: "finish [PURPOSE]", Short: "Commit the current protected work",
-		Long: `Create local commits from a fresh complete checkpoint of this worktree.
+	cmd := &cobra.Command{Use: "finish [PURPOSE]", Short: "Create Git commits from your saved changes",
+		Long: `Create local Git commits from a fresh snapshot of this working copy.
 
-Local mode commits the complete batch without a provider. Intent mode plans
-complete goals and verifies every proposed tree before publishing the chain.
-Later edits remain saved for the next finish. This command never pushes.
+Local mode creates one commit. Intent mode uses the approved AI provider to
+group completed work into commits. Later edits stay saved for your next
+finish. ACD never pushes.
 
-Use --dry-run to plan and check without moving the branch or index. Staged
-changes require --include-staged. Retry a failed request with --retry ID to
-keep its exact frozen target.`,
+Use --dry-run to plan and check without adding commits to your branch. It can
+save private snapshots, call AI in Intent mode, and run configured checks. Add
+--include-staged to include your exact current staged selection. Use --retry
+ID to reconnect or retry the same saved request; it keeps its original
+changes, purpose, message, and staged selection.`,
 		Example: `  acd finish "Add offline checkout"
   acd finish --message "Update setup guidance"
   acd finish --dry-run
@@ -91,7 +93,7 @@ func runFinish(ctx context.Context, out, progress io.Writer, repo string, params
 	lastStage := ""
 	for r.State == state.FinishRunning || r.State == state.FinishPrepared {
 		if !quiet && !jsonOut && r.Stage != lastStage {
-			fmt.Fprintf(progress, "Finish %s: %s (work saved in checkpoint %s)\n", r.ID, r.Stage, r.Target.CheckpointID)
+			fmt.Fprintln(progress, finishStageLabel(r.Stage))
 			lastStage = r.Stage
 		}
 		timer := time.NewTimer(interval)
@@ -122,7 +124,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	var plan daemon.FinishSavedPlan
 	if len(r.Plan) > 0 {
 		if err := json.Unmarshal(r.Plan, &plan); err != nil {
-			return fmt.Errorf("acd finish: invalid saved plan: %w", err)
+			return fmt.Errorf("acd finish: invalid saved plan\nDetails: %w", err)
 		}
 		for _, step := range plan.Steps {
 			result.Verification = append(result.Verification, step.Check)
@@ -137,14 +139,14 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	var saved daemon.FinishResult
 	if len(r.Result) > 0 {
 		if err := json.Unmarshal(r.Result, &saved); err != nil {
-			return fmt.Errorf("acd finish: invalid saved result: %w", err)
+			return fmt.Errorf("acd finish: invalid saved result\nDetails: %w", err)
 		}
 	}
 	result.Published, result.NoChanges, result.CommitsCreated, result.NewHead, result.StagedConsumed = saved.Published, saved.NoChanges, saved.CommitsCreated, saved.NewHead, saved.StagedConsumed
 	if saved.Published {
 		var proof state.FinishPublicationProof
 		if err := json.Unmarshal(r.Publication, &proof); err != nil {
-			return fmt.Errorf("acd finish: invalid publication proof: %w", err)
+			return fmt.Errorf("acd finish: invalid publication proof\nDetails: %w", err)
 		}
 		for _, commit := range proof.Commits {
 			result.CommitOIDs = append(result.CommitOIDs, commit.OID)
@@ -158,8 +160,12 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	exit, failureCode := finishExit(r, waitCode)
 	next := ""
 	if !ok {
-		next = "acd finish --retry " + r.ID
-		if r.DryRun {
+		if r.State == state.FinishNeedsAttention {
+			next = "acd doctor"
+		} else {
+			next = "acd finish --retry " + r.ID
+		}
+		if r.DryRun && r.State != state.FinishNeedsAttention {
 			next += " --dry-run"
 		}
 	}
@@ -186,40 +192,50 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			return err
 		}
 	} else {
-		fmt.Fprintf(out, "Finish request: %s (attempt %d)\nWork saved in checkpoint: %s\n", r.ID, r.Attempt, r.Target.CheckpointID)
 		switch {
 		case detached:
-			fmt.Fprintln(out, "Work is saved; reconnect to inspect this request.")
+			fmt.Fprintln(out, "Your saved finish request is still available.")
 		case r.State != state.FinishCompleted:
-			fmt.Fprintf(out, "Finish %s: %s\n", r.State, r.Reason)
-		case saved.NoChanges:
-			fmt.Fprintln(out, "No changes to finish.\nPublished: 0 commit(s)")
-		case r.DryRun:
-			fmt.Fprintf(out, "Finish preview\nTarget: %s\nPublished: no\n", r.Target.TargetTree)
-			for _, step := range plan.Steps {
-				fmt.Fprintf(out, "%s\n  Tree: %s; verification: %s; command executed: %t\n", step.Message, step.TreeOID, step.Check.Policy, step.Check.Executed)
+			if r.State == state.FinishNeedsAttention {
+				fmt.Fprintln(out, "Finish needs attention.")
+			} else {
+				fmt.Fprintln(out, "Finish failed.")
 			}
-			fmt.Fprintln(out, "Run `acd finish` to freeze and finish the current work.")
+			fmt.Fprintf(out, "Reason: %s\n", consoleProse(consoleCause(r.Reason)))
+		case saved.NoChanges:
+			fmt.Fprintln(out, "No changes to commit.")
+		case r.DryRun:
+			fmt.Fprintln(out, "Finish preview\nNo commits were added to your branch.")
+			for _, step := range plan.Steps {
+				fmt.Fprintf(out, "%s\n  %s\n", consoleProse(step.Message), finishCheckLabel(step.Check))
+			}
+			fmt.Fprintln(out, "Next: Run `acd finish` when the current work is ready.")
 		default:
-			fmt.Fprintf(out, "Published: %d commit(s)\n", result.CommitsCreated)
-			for _, oid := range result.CommitOIDs {
-				fmt.Fprintln(out, oid)
+			fmt.Fprintln(out, commitCountLabel(result.CommitsCreated))
+		}
+		if !ok {
+			fmt.Fprintf(out, "Request: %s\n", safePreviewText(r.ID, 0))
+			if result.Protected {
+				fmt.Fprintln(out, "Changes for this request: saved.")
 			}
 		}
 		if !r.DryRun {
 			for _, check := range result.Verification {
-				fmt.Fprintf(out, "Verification: %s; tree: %s; command executed: %t\n", check.Policy, check.TreeOID, check.Executed)
+				fmt.Fprintln(out, finishCheckLabel(check))
 			}
 		}
 		if countErr == nil && count > 0 {
-			fmt.Fprintf(out, "Current worktree: %d changed path(s); later work stays separate from this request.\n", count)
+			fmt.Fprintf(out, "Current working copy: %d changed items outside Git commits.\n", count)
 		}
 		if next != "" {
 			fmt.Fprintf(out, "Next: %s\n", next)
+			if detached || r.State == state.FinishFailed {
+				fmt.Fprintln(out, "Retry reconnects to this request or restarts it after failure, using the same saved changes.")
+			}
 		}
 	}
 	if !ok {
-		return &CommandError{Code: failureCode, Message: "acd finish: work is saved; " + next, Exit: exit, Retryable: detached || r.State == state.FinishFailed, rendered: true}
+		return &CommandError{Code: failureCode, Message: "Finish requires attention. Next: " + next, Exit: exit, Retryable: detached || r.State == state.FinishFailed, rendered: true}
 	}
 	return nil
 }

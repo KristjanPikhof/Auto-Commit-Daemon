@@ -100,7 +100,7 @@ func productListEntryFromOverview(
 		return productListEntry{
 			Repo: record.Path, RepoHash: record.RepoHash, ActionRequired: true, State: productStateNeedsAction,
 			OperationalState: "needs_attention", LastActivityAt: formatProductListActivity(activity),
-			Summary:      "This repository needs the current ACD protection format.",
+			Summary:      "Upgrade ACD before protecting this repository.",
 			NextAction:   productListTargetAction("Run `acd setup` to upgrade and enable protection.", record.Path),
 			lastActivity: activity, UnfinishedWork: overview.unfinished,
 		}
@@ -109,10 +109,10 @@ func productListEntryFromOverview(
 		if productListReadTransient(readErr) && worker.State != "needs_action" {
 			activity := overview.lastActivity
 			stateName, operational := productStateWaiting, "refreshing"
-			summary := "ACD is refreshing this repository's protection state."
+			summary := "ACD is checking protection for this repository."
 			if worker.State == "starting" || worker.State == "backoff" {
 				stateName, operational = productStatePublishing, "retrying"
-				summary = "ACD is starting or retrying the background worker."
+				summary = "ACD is starting background protection."
 			}
 			return productListEntry{
 				Repo: record.Path, RepoHash: record.RepoHash, Enabled: true,
@@ -130,7 +130,7 @@ func productListEntryFromOverview(
 			Repo: record.Path, RepoHash: record.RepoHash, Enabled: true, ActionRequired: true,
 			State: productStateNeedsAction, WorkerState: worker.State,
 			OperationalState: "needs_attention", LastActivityAt: formatProductListActivity(activity),
-			Summary:      "ACD could not read this repository's protection state.",
+			Summary:      "ACD could not check protection for this repository.",
 			NextAction:   productListTargetAction("Run `acd doctor` for details.", record.Path),
 			lastActivity: activity, UnfinishedWork: overview.unfinished,
 		}
@@ -148,7 +148,7 @@ func productListEntryFromOverview(
 	if checkpointing {
 		control.OK = true
 		control.Health = controlHealthPublishing
-		control.Summary = "ACD is checkpointing the latest observed changes."
+		control.Summary = "ACD is saving the latest changes it checked."
 		control.NextAction = "No action needed."
 	}
 	if worker.RepositoryID != "" {
@@ -157,7 +157,7 @@ func productListEntryFromOverview(
 			!productListHasIndependentAttention(report) {
 			control.OK = true
 			control.Health = controlHealthPublishing
-			control.Summary = "ACD is starting or retrying the background worker."
+			control.Summary = "ACD is starting background protection."
 			control.NextAction = "No action needed."
 		}
 	}

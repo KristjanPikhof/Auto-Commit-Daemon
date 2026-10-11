@@ -10,7 +10,7 @@ import (
 func main() {
 	if err := cli.Execute(); err != nil {
 		if !cli.ErrorRendered(err) {
-			fmt.Fprintln(os.Stderr, "acd:", err)
+			fmt.Fprintln(os.Stderr, cli.ConsoleError(err))
 		}
 		os.Exit(cli.ExitCode(err))
 	}

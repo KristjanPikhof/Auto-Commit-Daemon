@@ -252,11 +252,11 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	}
 	plan.Actions = []Action{
 		{Kind: "backup", Target: backupRoot, Detail: "Back up every existing file and repository database"},
-		{Kind: "install_binary", Target: plan.ManagedBinary, Detail: "Atomically copy this ACD executable"},
+		{Kind: "install_binary", Target: plan.ManagedBinary, Detail: "Install this ACD version"},
 	}
 	if len(repoPlans) > 0 {
 		plan.Actions = append(plan.Actions,
-			Action{Kind: "migrate", Target: fmt.Sprintf("%d enabled repositories", len(repoPlans)), Detail: "Apply the all-or-nothing checkpoint cutover"})
+			Action{Kind: "migrate", Target: fmt.Sprintf("%d enabled repositories", len(repoPlans)), Detail: "Upgrade protection data for all enabled repositories"})
 	}
 	if deferredRepositories > 0 {
 		plan.Actions = append(plan.Actions, Action{
@@ -266,8 +266,8 @@ func BuildPlan(ctx context.Context, roots paths.Roots, options Options) (Plan, e
 	}
 	plan.Actions = append(plan.Actions,
 		Action{Kind: supervisorActionKind(plan.Service), Target: supervisorActionTarget(plan), Detail: supervisorActionDetail(plan.Service)},
-		Action{Kind: "write_registry", Target: roots.RegistryPath(), Detail: "Persist common-directory and worktree identities"},
-		Action{Kind: "self_test", Target: backupRoot, Detail: "Run isolated checkpoint, publish, and restore verification"},
+		Action{Kind: "write_registry", Target: roots.RegistryPath(), Detail: "Save the registered repository list"},
+		Action{Kind: "self_test", Target: backupRoot, Detail: "Check that ACD can save changes, create commits, and restore files in a temporary repository"},
 	)
 	if plan.FreshDefaults && plan.Configuration != nil {
 		plan.Actions = append(plan.Actions, Action{
@@ -340,7 +340,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if options.Executor == nil {
 		options.Executor = OSExecutor{}
 	}
-	emitProgress(options, "prepare", "Preparing the setup transaction")
+	emitProgress(options, "prepare", "Preparing setup")
 	journal, err := globalops.Open(ctx, roots.OperationsDBPath())
 	if err != nil {
 		return Result{}, err
@@ -418,16 +418,16 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		return credentialReplacement.Rollback()
 	}
 	rollbackFiles := func(cause error) error {
-		emitProgress(options, "rollback", "Setup failed; restoring all backed-up state")
+		emitProgress(options, "rollback", "Setup failed. Restoring the previous installation.")
 		credentialErr := rollbackCredential()
 		fileErr := restoreFiles(backups)
 		serviceErr := restoreQuiescedService(nil)
 		if fileErr != nil || serviceErr != nil || errors.Is(cause, errPostMutationProof) {
 			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup rollback incomplete", true)
-			emitProgress(options, "needs_attention", "Rollback could not be fully verified; run `acd doctor`")
+			emitProgress(options, "needs_attention", "ACD could not confirm that everything was restored. Run acd doctor.")
 		} else {
 			_ = journal.Advance(context.Background(), plan.OperationID, "rolled_back", "setup rolled back", true)
-			emitProgress(options, "rolled_back", "Rollback completed; the previous ACD state is unchanged")
+			emitProgress(options, "rolled_back", "The previous ACD installation was restored.")
 		}
 		return errors.Join(cause, credentialErr, fileErr, serviceErr)
 	}
@@ -485,7 +485,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	migrationApplied := false
 	supervisorStarted := false
 	rollback := func(cause error) error {
-		emitProgress(options, "rollback", "Setup failed; restoring all backed-up files, databases, refs, and service state")
+		emitProgress(options, "rollback", "Setup failed. Restoring the previous installation and saved data.")
 		bridge.Stop()
 		retainedBridgeCheckpoints := bridge.CreatedCount()
 		manifestErr := bridge.WriteRecoveryManifest(filepath.Join(plan.BackupRoot, "migration-bridge-recovery.json"))
@@ -507,13 +507,13 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		rollbackErr := errors.Join(credentialErr, stopErr, fileErr, dbErr, serviceErr, manifestErr)
 		if rollbackErr != nil || errors.Is(cause, errPostMutationProof) {
 			_ = journal.Advance(context.Background(), plan.OperationID, "needs_attention", "setup rollback incomplete", true)
-			emitProgress(options, "needs_attention", "Rollback could not be fully verified; run `acd doctor`")
+			emitProgress(options, "needs_attention", "ACD could not confirm that everything was restored. Run acd doctor.")
 		} else {
 			detail := "setup rolled back"
-			message := "Rollback completed; the previous ACD state is unchanged"
+			message := "The previous ACD installation was restored."
 			if retainedBridgeCheckpoints > 0 {
 				detail = fmt.Sprintf("setup rolled back with %d retained migration recovery checkpoints", retainedBridgeCheckpoints)
-				message = fmt.Sprintf("Rollback completed; retained %d migration recovery checkpoints", retainedBridgeCheckpoints)
+				message = fmt.Sprintf("The previous installation was restored. ACD kept %d recovery snapshots.", retainedBridgeCheckpoints)
 			}
 			_ = journal.Advance(context.Background(), plan.OperationID, "rolled_back", detail, true)
 			emitProgress(options, "rolled_back", message)
@@ -600,7 +600,7 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 	if selfTest == nil {
 		selfTest = ScratchSelfTest
 	}
-	emitProgress(options, "self_test", "Running isolated checkpoint, publication, and restore checks")
+	emitProgress(options, "self_test", "Checking saving, committing, and restoring in a temporary repository")
 	if err := selfTest(ctx, plan); err != nil {
 		return Result{}, rollback(err)
 	}
@@ -735,7 +735,7 @@ func migrateRepositoryConfigKeys(roots paths.Roots, registry *central.Registry, 
 				oldBody, _ := json.Marshal(oldSettings)
 				currentBody, _ := json.Marshal(current)
 				if string(oldBody) != string(currentBody) {
-					return fmt.Errorf("setup: repository config identity collision for %s", record.Path)
+					return fmt.Errorf("Repository config identity collision for %s.", record.Path)
 				}
 			} else {
 				document.Settings.Repositories[record.WorktreeID] = oldSettings
@@ -892,7 +892,7 @@ func installBackupNoReplace(item fileBackup) error {
 		return err
 	}
 	if fileDigest(body, item.Mode) != item.Digest {
-		return fmt.Errorf("setup: backup digest mismatch for %s", item.Target)
+		return fmt.Errorf("Backup digest mismatch for %s.", item.Target)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(item.Target), ".acd-rollback-restore-")
 	if err != nil {
@@ -962,7 +962,7 @@ func currentFileDigest(path string) (string, error) {
 		return "", err
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("setup: mutation target is not a regular file: %s", path)
+		return "", fmt.Errorf("Mutation target is not a regular file: %s.", path)
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -1112,9 +1112,9 @@ func supervisorActionDetail(service supervisor.ServiceDefinition) string {
 
 func supervisorStartProgress(service supervisor.ServiceDefinition) string {
 	if service.Platform == "session" {
-		return "Starting the repository-scoped macOS session supervisor"
+		return "Starting background protection in this macOS session"
 	}
-	return "Starting the user supervisor"
+	return "Starting background protection"
 }
 
 func loadService(ctx context.Context, roots paths.Roots, executor Executor, service supervisor.ServiceDefinition) error {
@@ -1338,14 +1338,14 @@ func waitSupervisorReady(ctx context.Context, roots paths.Roots, repositoryID st
 // Both full setup and compatible/no-op setup must prove the same readiness
 // before claiming that enabled worktrees are protected by the current runtime.
 func verifySetupReadiness(ctx context.Context, roots paths.Roots, registry *central.Registry, options ApplyOptions, phase string) error {
-	emitProgress(options, phase, "Verifying running versions and repository checkpoint protection")
+	emitProgress(options, phase, "Checking the installed version and repository protection")
 	if options.Ready != nil {
 		return options.Ready(ctx, roots, registry)
 	}
 	return waitSetupWorkersWithProgress(ctx, roots, registry, func(ready, total int) {
-		emitProgress(options, phase, fmt.Sprintf("Repository workers ready: %d of %d", ready, total))
+		emitProgress(options, phase, fmt.Sprintf("Repositories ready: %d of %d", ready, total))
 	}, func(completed, total int, path string) {
-		emitProgress(options, phase, fmt.Sprintf("Confirming checkpoint coverage %d of %d: %s", completed, total, path))
+		emitProgress(options, phase, fmt.Sprintf("Checking saved changes %d of %d: %s", completed, total, path))
 	})
 }
 
@@ -1454,7 +1454,7 @@ func confirmSetupCheckpointCoverage(ctx context.Context, client supervisor.Clien
 		return fmt.Errorf("setup: worktree %s checkpoint barrier: %w", record.Path, callErr)
 	}
 	if response.Error != nil {
-		return fmt.Errorf("setup: worktree %s checkpoint barrier: %s", record.Path, response.Error.Message)
+		return fmt.Errorf("Worktree %s checkpoint barrier: %s.", record.Path, response.Error.Message)
 	}
 	var barrier struct {
 		Protected bool `json:"protected"`
@@ -1463,7 +1463,7 @@ func confirmSetupCheckpointCoverage(ctx context.Context, client supervisor.Clien
 		return fmt.Errorf("setup: worktree %s did not confirm checkpoint coverage", record.Path)
 	}
 	if schema, readErr := state.ReadUserVersion(ctx, record.StateDB); readErr != nil || schema != state.SchemaVersion {
-		return fmt.Errorf("setup: worktree %s schema is not v%d", record.Path, state.SchemaVersion)
+		return fmt.Errorf("Worktree %s data format is not v%d.", record.Path, state.SchemaVersion)
 	}
 	return nil
 }

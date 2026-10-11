@@ -35,9 +35,9 @@ func newProductStatusCmd() *cobra.Command {
 	var verbose bool
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Show protection, Git publication, and the next step",
-		Long: `Show whether ACD is running, whether current changes are protected,
-and whether those changes have been published to local Git.
+		Short: "Show saved work, commit status, and the next step",
+		Long: `Show whether ACD is running, whether current changes are protected, and
+whether those changes have been published to local Git.
 
 The command does not change anything. If action is needed, the last line gives
 the exact next command to run.`,
@@ -59,9 +59,12 @@ the exact next command to run.`,
 				return err
 			}
 			renderProductPublicationProgress(cmd.OutOrStdout(), result.PublicationProgress)
+			if detail := maintenanceDetails(result.CheckpointMaintenance); detail != "" {
+				fmt.Fprintln(cmd.OutOrStdout(), consoleProse(detail))
+			}
 			renderProductDoctorWorker(cmd.OutOrStdout(), result)
 			if !result.OK {
-				return actionRequiredError("needs_action", result.Summary)
+				return &CommandError{Code: "needs_action", Message: result.Summary, Exit: ExitActionRequired, rendered: true}
 			}
 			return nil
 		},
@@ -76,8 +79,8 @@ func newProductDoctorCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Explain ACD problems and show how to fix them",
-		Long: `Check the installation, background worker, protection state, and
-active configuration for one repository.
+		Long: `Check the installation, background worker, protection state, and active
+configuration for one repository.
 
 Doctor does not change anything. It explains the current problem and prints a
 safe next step. Use --bundle only when you need a sanitized archive for
@@ -128,17 +131,14 @@ func renderProductDoctorWorker(out io.Writer, status controlResult) {
 	if status.SupervisorWorkerState == "" {
 		return
 	}
-	fmt.Fprintln(out, "\nWorker:")
-	fmt.Fprintf(out, "  State: %s", strings.ReplaceAll(status.SupervisorWorkerState, "_", " "))
+	fmt.Fprintln(out, "Background protection:")
+	fmt.Fprintf(out, "  Status: %s", strings.ReplaceAll(status.SupervisorWorkerState, "_", " "))
 	if status.SupervisorWorkerRestarts > 0 {
-		fmt.Fprintf(out, " after %d restart attempt(s)", status.SupervisorWorkerRestarts)
+		fmt.Fprintf(out, " after %d attempts to restart", status.SupervisorWorkerRestarts)
 	}
 	fmt.Fprintln(out)
 	if status.SupervisorWorkerError != "" {
-		fmt.Fprintf(out, "  Cause: %s\n", status.SupervisorWorkerError)
-	}
-	if status.NextAction != "" && status.NextAction != "No action needed." {
-		fmt.Fprintf(out, "  Fix: %s\n", status.NextAction)
+		fmt.Fprintf(out, "  Details: %s\n", consoleProse(status.SupervisorWorkerError))
 	}
 }
 
@@ -168,7 +168,7 @@ func collectProductDoctorSettings(ctx context.Context, repo string) productDocto
 }
 
 func renderProductDoctorSettings(out io.Writer, details productDoctorSettings) {
-	fmt.Fprintln(out, "\nCommit settings:")
+	fmt.Fprintln(out, "Commit settings:")
 	fmt.Fprintf(out, "  AI provider: %s (from %s)\n", valueOrUnset(details.Provider), valueOrUnset(details.ProviderSource))
 	fmt.Fprintf(out, "  Finish mode: %s (from %s)\n", valueOrUnset(details.Strategy), valueOrUnset(details.StrategySource))
 	fmt.Fprintf(out, "  Message style: %s\n", valueOrUnset(details.Style))
@@ -230,11 +230,11 @@ func runProductDoctorBundle(ctx context.Context, out io.Writer, output string, j
 	}
 	report, err := collectDoctorReport(ctx)
 	if err != nil {
-		return fmt.Errorf("acd doctor: collect: %w", err)
+		return fmt.Errorf("acd doctor: collect\nDetails: %w", err)
 	}
 	bundle, err := writeDoctorBundle(ctx, report, output)
 	if err != nil {
-		return fmt.Errorf("acd doctor: bundle: %w", err)
+		return fmt.Errorf("acd doctor: bundle\nDetails: %w", err)
 	}
 	return renderAdvancedResult(out, productStateProtected, bundle)
 }
@@ -385,8 +385,8 @@ func newHistoryCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "history",
 		Short: "Show checkpoints and whether Git contains them",
-		Long: `Show recent protected checkpoints for this repository and whether
-each checkpoint has been published to local Git.
+		Long: `Show recent protected checkpoints for this repository and whether each
+checkpoint has been published to local Git.
 
 Use the subcommands to inspect activity, explain a decision, or safely rewrite
 commit messages. History commands do not rewrite commits unless you explicitly
@@ -431,7 +431,7 @@ func loadCheckpointHistory(ctx context.Context, repo string) ([]historyEntry, er
 	}
 	projection, err := state.ReadCheckpointProjection(ctx, record.StateDB, 100)
 	if err != nil {
-		return nil, fmt.Errorf("acd history: %w", err)
+		return nil, fmt.Errorf("acd history\nDetails: %w", err)
 	}
 	if !projection.Available {
 		return nil, fmt.Errorf("acd history: checkpoint history is unavailable; run `acd setup` to cut over this repository")
@@ -447,7 +447,7 @@ func loadCheckpointHistory(ctx context.Context, repo string) ([]historyEntry, er
 	}
 	hasCaptures, err := state.LegacyTableExists(ctx, db, "capture_events")
 	if err != nil {
-		return nil, fmt.Errorf("acd history: inspect legacy evidence: %w", err)
+		return nil, fmt.Errorf("acd history: inspect legacy evidence\nDetails: %w", err)
 	}
 	membership := "COUNT(ce.event_seq), 0, 0"
 	legacyJoin := ""
@@ -465,7 +465,7 @@ GROUP BY cp.id
 ORDER BY cp.seq DESC
 LIMIT 100`)
 	if err != nil {
-		return nil, fmt.Errorf("acd history: query checkpoints: %w", err)
+		return nil, fmt.Errorf("acd history: query checkpoints\nDetails: %w", err)
 	}
 	defer rows.Close()
 	entries := make([]historyEntry, 0)
@@ -476,7 +476,7 @@ LIMIT 100`)
 		if err := rows.Scan(&entry.ID, &entry.Sequence, &entry.Reason,
 			&entry.Phase, &entry.CreatedTS, &entry.CommitOID, &entry.Retained, &complete,
 			&entry.EventCount, &publishedEvents, &entry.RecoveredEvents); err != nil {
-			return nil, fmt.Errorf("acd history: scan checkpoint: %w", err)
+			return nil, fmt.Errorf("acd history: scan checkpoint\nDetails: %w", err)
 		}
 		entry.Published = entry.Phase == state.CheckpointCompleted && entry.EventCount > 0 && publishedEvents+entry.RecoveredEvents == entry.EventCount
 		entry.Outcome = checkpointOutcome(entry.Phase, entry.EventCount, publishedEvents, entry.RecoveredEvents)
@@ -489,7 +489,7 @@ LIMIT 100`)
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("acd history: iterate checkpoints: %w", err)
+		return nil, fmt.Errorf("acd history: iterate checkpoints\nDetails: %w", err)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -562,7 +562,7 @@ func newConfigNamespaceCmd() *cobra.Command {
 func newConfigCredentialsCmd() *cobra.Command {
 	credentials := newAuthCmd()
 	credentials.Use = "credentials"
-	credentials.Short = "Manage the protected provider credential"
+	credentials.Short = "Manage the saved AI API key"
 	credentials.Example = `  acd config credentials status
   acd config credentials set
   acd config credentials remove`
@@ -584,8 +584,8 @@ func newConfigCredentialsCmd() *cobra.Command {
 
 func newSupportNamespaceCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "support", Short: "Inspect and safely repair ACD problems", Hidden: true,
-		Long: `Use read-only diagnostics first. Recovery and repair commands show a
-preview before they change anything and require explicit confirmation.`,
+		Long: `Use read-only diagnostics first. Recovery and repair commands show a preview
+before they change anything and require explicit confirmation.`,
 		Example: `  acd support diagnose
   acd support logs --lines 100
   acd support recover --dry-run`}
@@ -702,12 +702,7 @@ func newSupportRecoverCmd() *cobra.Command {
 	command := newFixCmd()
 	command.Use = "recover"
 	command.Short = "Preview or recover protected work that cannot publish"
-	command.Long = `Preview or recover protected work when Git publication cannot
-continue safely.
-
-The default is read-only. Add --yes only after reviewing the plan. ACD applies
-recovery only when it can prove the result. Use --force to preserve unresolved
-work in a private recovery archive instead of trying to publish it.`
+	command.Long = "Preview recovery of older saved work that ACD cannot add to Git safely.\n\nReview the plan before using --yes to apply it. Recovery does not start a new\nfinish request or rewrite current Git history. Use --force only to preserve\nunresolved work in a private recovery archive. Run acd status for current work."
 	command.Example = `  acd support recover --dry-run
   acd support recover --yes
   acd support recover --force --dry-run
@@ -731,8 +726,8 @@ work in a private recovery archive instead of trying to publish it.`
 
 func newProductRepoNamespaceCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "repo", Short: "Manage registered repositories", Hidden: true, Args: cobra.NoArgs,
-		Long: `List every registered repository, remove an old registration, clean
-up missing entries, or view activity totals.
+		Long: `List every registered repository, remove an old registration, clean up missing
+entries, or view activity totals.
 
 Use acd list for the everyday protection dashboard. These commands are for
 registration and storage maintenance.`,

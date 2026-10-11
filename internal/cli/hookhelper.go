@@ -169,7 +169,7 @@ func decodeHookStdinPayload(in io.Reader, prefix string) (map[string]any, error)
 	limited := io.LimitReader(in, hookStdinLimit+1)
 	raw, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, fmt.Errorf("%s: read stdin: %w", prefix, err)
+		return nil, fmt.Errorf("%s: read stdin\nDetails: %w", prefix, err)
 	}
 	if len(raw) > hookStdinLimit {
 		return nil, fmt.Errorf("%s: stdin exceeded %d byte limit (1 MiB); refusing to decode truncated JSON", prefix, hookStdinLimit)
@@ -261,7 +261,7 @@ func resolveCursorHookRepo(ctx context.Context, payload map[string]any) (string,
 
 	wd, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("%s: get working directory: %w", prefix, err)
+		return "", fmt.Errorf("%s: get working directory\nDetails: %w", prefix, err)
 	}
 	return validateHookEmitScalar("repo", canonicalHookPath(wd), prefix)
 }

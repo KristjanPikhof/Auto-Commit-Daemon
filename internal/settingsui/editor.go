@@ -83,7 +83,7 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 		}
 		action := ""
 		fields := editorMenu(snapshot, draft, advanced, opts.Repo)
-		form := huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("ACD Settings · " + editorScopeLabel(draft.Scope, opts.Repo)).Description(message).Options(fields...).Value(&action).Height(12)))
+		form := huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("ACD settings: " + editorScopeLabel(draft.Scope, opts.Repo)).Description(message).Options(fields...).Value(&action).Height(12)))
 		if err := runEditorForm(ctx, form, opts); err != nil {
 			return editorExitError(err)
 		}
@@ -108,7 +108,7 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 				continue
 			}
 			if editorDirty(draft) {
-				discard, err := editorConfirm(ctx, "Discard unsaved changes before switching scope?", opts)
+				discard, err := editorConfirm(ctx, "Discard unsaved changes and switch settings?", opts)
 				if err != nil {
 					return editorExitError(err)
 				}
@@ -127,7 +127,7 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 					mode = field.Value
 				}
 			}
-			options := []huh.Option[string]{huh.NewOption("Local: one complete batch, offline", "local"), huh.NewOption("Intent: AI groups completed goals", "intent")}
+			options := []huh.Option[string]{huh.NewOption("Local: One commit for all finished work, offline", "local"), huh.NewOption("Intent: AI groups finished work into commits", "intent")}
 			if err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("Finish mode").Description("Branch commits are created when you run acd finish.").Options(options...).Value(&mode))), opts); err != nil {
 				return editorExitError(err)
 			}
@@ -306,8 +306,8 @@ func editEditorField(ctx context.Context, field EditorField, scope string, opts 
 		}
 		err := runEditorForm(ctx, huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Title("AI provider").Options(
 			huh.NewOption("OpenAI-compatible connection", "openai-compat"),
-			huh.NewOption("Local finish (no API key)", "deterministic"),
-			huh.NewOption("Local subprocess provider", "subprocess"),
+			huh.NewOption("Local mode: No AI or API key", "deterministic"),
+			huh.NewOption("Local AI program", "subprocess"),
 		).Value(&provider))), opts)
 		if err != nil {
 			return "", false, err
@@ -327,6 +327,12 @@ func editEditorField(ctx context.Context, field EditorField, scope string, opts 
 		choices := []huh.Option[string]{}
 		for _, choice := range desc.Choices {
 			label := choice
+			switch field.Key {
+			case "intent.verification":
+				label = map[string]string{"none": "No project checks", "structural": "Structure checks only", "fast": "Quick project checks", "full": "Full project checks"}[choice]
+			case "commit.format":
+				label = map[string]string{"imperative": "Imperative: Fix setup retries", "conventional": "Conventional: fix: handle setup retries"}[choice]
+			}
 			if choice == "true" {
 				label = "On"
 			} else if choice == "false" {
@@ -351,7 +357,7 @@ func runEditorForm(ctx context.Context, form *huh.Form, opts EditorOptions) erro
 	if opts.NoColor {
 		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
 	}
-	return form.WithAccessible(opts.Accessible).WithInput(opts.Input).WithOutput(opts.Output).WithShowHelp(true).RunWithContext(ctx)
+	return form.WithKeyMap(readableKeyMap()).WithAccessible(opts.Accessible).WithInput(opts.Input).WithOutput(readableOutput(opts.Output, opts.Accessible)).WithShowHelp(true).RunWithContext(ctx)
 }
 func editorScopeLabel(scope, repo string) string {
 	if scope == "repo" {

@@ -129,8 +129,15 @@ func generateFinishHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 		return err
 	}
 	if !opts.planOnly && opts.yes && !opts.dryRun {
-		if err := applyIntentHistoryPlan(ctx, io.Discard, repo, plan, false); err != nil {
+		applyOut := out
+		if jsonOut {
+			applyOut = io.Discard
+		}
+		if err := applyIntentHistoryPlan(ctx, applyOut, repo, plan, false); err != nil {
 			return err
+		}
+		if !jsonOut {
+			return nil
 		}
 	}
 	if jsonOut {
@@ -142,9 +149,9 @@ func generateFinishHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 }
 
 func printIntentHistoryPlan(out io.Writer, plan state.IntentHistoryPlan) {
-	fmt.Fprintf(out, "History rewrite: %d original commits -> %d goals\nSource: %s\nTarget: %s\n", len(plan.SourceChain), len(plan.Goals), plan.SourceBranchRef, plan.TargetBranchRef)
+	fmt.Fprintf(out, "History rewrite: %d original commits -> %d proposed commits\nOriginal branch: %s\nResult branch: %s\n", len(plan.SourceChain), len(plan.Goals), plan.SourceBranchRef, plan.TargetBranchRef)
 	for _, goal := range plan.Goals {
-		fmt.Fprintf(out, "- %s\n  Purpose: %s\n  Boundary: %s\n", strings.SplitN(goal.Message, "\n", 2)[0], goal.Purpose, goal.Reason)
+		fmt.Fprintf(out, "- %s\n  Purpose: %s\n  Why this is one commit: %s\n", strings.SplitN(goal.Message, "\n", 2)[0], goal.Purpose, goal.Reason)
 	}
 }
 
@@ -167,9 +174,9 @@ func showIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan
 	}
 	printIntentHistoryPlan(out, plan)
 	if r := view.WorkerRequest; r != nil {
-		fmt.Fprintf(out, "Worker status: %s\n", r.Status)
+		fmt.Fprintf(out, "Rewrite status: %s\n", strings.ReplaceAll(r.Status, "_", " "))
 		if r.Error != "" {
-			fmt.Fprintln(out, r.Error)
+			fmt.Fprintln(out, "Details:", consoleProse(consoleCause(r.Error)))
 		}
 	}
 	return nil
@@ -194,21 +201,31 @@ func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, pla
 	for r.Status == "running" || r.Status == "prepared" {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("history rewrite: request %s is saved; reconnect with --show-plan %s: %w", r.PlanID, r.PlanID, ctx.Err())
+			return fmt.Errorf("history rewrite: request %s is saved; reconnect with --show-plan %s\nDetails: %w", r.PlanID, r.PlanID, ctx.Err())
 		case <-time.After(100 * time.Millisecond):
 		}
 		r, err = historyRequest(ctx, lookup, "history_status", finishHistoryParams{PlanID: plan.ID})
 		if err != nil {
-			return fmt.Errorf("history rewrite: request %s is saved; inspect --show-plan %s: %w", plan.ID, plan.ID, err)
+			return fmt.Errorf("history rewrite: request %s is saved; inspect --show-plan %s\nDetails: %w", plan.ID, plan.ID, err)
 		}
 	}
 	if r.Status != "completed" {
-		return errors.New("history rewrite: " + r.Status + ": " + r.Error)
+		action := "Review the saved plan with `acd history rewrite --show-plan " + plan.ID + "` and address the cause before applying it again."
+		summary := "History rewrite failed."
+		if r.Status == "needs_attention" {
+			summary = "History rewrite needs attention."
+			action = "Run `acd doctor`."
+		}
+		return errors.New(summary + "\nReason: " + safePreviewText(r.Error, 0) + "\nNext: " + action)
 	}
 	if dryRun {
-		fmt.Fprintln(out, "Preview passed: every output tree was verified. Branch references were unchanged.")
+		fmt.Fprintln(out, "Preview passed. Each proposed commit passed the configured verification.\nThe branches were unchanged.")
 	} else {
-		fmt.Fprintln(out, "History rewrite completed; original history remains reachable through its backup and evidence refs.")
+		fmt.Fprintln(out, "History rewrite completed.\nThe original history is kept in a private backup.")
+		var proof state.FinishHistoryProof
+		if json.Unmarshal(r.Proof, &proof) == nil && proof.BackupRef != "" {
+			fmt.Fprintf(out, "Original history backup: %s\n", safePreviewText(proof.BackupRef, 0))
+		}
 	}
 	return nil
 }
@@ -276,8 +293,15 @@ func editFinishHistoryMessages(ctx context.Context, out io.Writer, repo string, 
 		}
 	}
 	if opts.yes && !opts.planOnly && !opts.dryRun {
-		if err := applyIntentHistoryPlan(ctx, io.Discard, repo, plan, false); err != nil {
+		applyOut := out
+		if jsonOut {
+			applyOut = io.Discard
+		}
+		if err := applyIntentHistoryPlan(ctx, applyOut, repo, plan, false); err != nil {
 			return err
+		}
+		if !jsonOut {
+			return nil
 		}
 	}
 	if jsonOut {

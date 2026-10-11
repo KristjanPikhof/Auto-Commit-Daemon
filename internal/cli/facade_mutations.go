@@ -29,9 +29,9 @@ func newRestoreCmd() *cobra.Command {
 	var yes bool
 	cmd := &cobra.Command{
 		Use:   "restore [ID]",
-		Short: "Preview or bring back a protected checkpoint",
-		Long: `Preview the files that a checkpoint would restore into the working
-tree. Add --yes to apply the exact preview after ACD checks it again.
+		Short: "Preview or restore saved files",
+		Long: `Preview the files that a checkpoint would restore into the working tree. Add
+--yes to apply the exact preview after ACD checks it again.
 
 Restore does not move Git HEAD or change the staging area. ACD creates an undo
 checkpoint before it applies the restore. With no ID, a terminal shows a
@@ -101,7 +101,7 @@ func runRestoreWithConfirmation(ctx context.Context, out io.Writer, repo, id str
 		return err
 	}
 	if record.RepositoryID == "" || record.WorktreeID == "" {
-		return fmt.Errorf("acd restore: repository requires `acd setup` checkpoint cutover")
+		return fmt.Errorf("Repository requires `acd setup` checkpoint upgrade.")
 	}
 	worktree, err := gitpkg.ResolveWorktree(ctx, repoRoot)
 	if err != nil {
@@ -156,7 +156,7 @@ func runRestoreWithConfirmation(ctx context.Context, out io.Writer, repo, id str
 			Changed: true, Actions: []productAction{{Kind: "restore", Status: "completed", Target: plan.CheckpointID}}, Data: result}, true)
 	}
 	fmt.Fprintf(out, "Restored checkpoint: %s\n", result.RestoredCheckpoint)
-	fmt.Fprintln(out, "Status: Files were restored into the working tree. Git HEAD and staged changes were not changed.")
+	fmt.Fprintln(out, "Files restored. Your Git commits and staged changes are unchanged.")
 	fmt.Fprintf(out, "Next: To undo this restore, run `acd restore %s`.\n", result.UndoCheckpoint)
 	return nil
 }
@@ -186,7 +186,7 @@ func renderRestorePlan(out io.Writer, plan restorepkg.Plan, jsonOut bool) error 
 	var next *string
 	if !plan.CanApply || plan.Refusal != "" {
 		stateName = productStateNeedsAction
-		message := plan.Refusal
+		message := restoreNextAction(plan.Refusal)
 		next = &message
 	} else {
 		message := "acd restore " + plan.CheckpointID + " --yes"
@@ -200,16 +200,16 @@ func renderRestorePlan(out io.Writer, plan restorepkg.Plan, jsonOut bool) error 
 	for _, path := range plan.Paths {
 		fmt.Fprintf(out, "  %q\n", path)
 	}
-	fmt.Fprintf(out, "Create: %d  Modify: %d  Delete: %d  Mode: %d  Symlink: %d\n",
+	fmt.Fprintf(out, "Files to create: %d\nFiles to update: %d\nFiles to delete: %d\nPermission changes: %d\nSymbolic links: %d\n",
 		plan.Counts.Created, plan.Counts.Modified, plan.Counts.Deleted,
 		plan.Counts.ModeChanged, plan.Counts.Symlinks)
-	fmt.Fprintf(out, "Untracked overwrites: %d  Staged overlaps: %d\n",
+	fmt.Fprintf(out, "Unsaved-to-Git files to overwrite: %d\nStaged files affected: %d\n",
 		plan.Counts.UntrackedOverwrite, plan.Counts.StagedOverlap)
 	if plan.Refusal != "" {
 		fmt.Fprintf(out, "Status: Cannot restore safely. %s\n", plan.Refusal)
-		fmt.Fprintln(out, "Next: Resolve the reported conflict, then preview the restore again.")
+		fmt.Fprintln(out, "Next:", consoleProse(restoreNextAction(plan.Refusal)))
 	} else {
-		fmt.Fprintln(out, "Changed: no")
+		fmt.Fprintln(out, "Preview only. No files changed.")
 		fmt.Fprintf(out, "Next: Run `acd restore %s --yes` to apply this preview.\n", plan.CheckpointID)
 	}
 	return nil
@@ -220,8 +220,8 @@ func newProductRepairCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "repair",
 		Short: "Finish an interrupted ACD operation when it is safe",
-		Long: `Check for an interrupted setup or restore operation and show whether
-ACD can finish it safely.
+		Long: `Check for an interrupted setup or restore operation and show whether ACD can
+finish it safely.
 
 The default is a read-only preview. Add --yes only after reviewing the plan.
 ACD refuses the repair when it cannot prove the expected state.`,
@@ -411,15 +411,16 @@ func newUninstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "uninstall",
 		Short: "Remove ACD and keep protected data by default",
-		Long: `Show an uninstall plan, stop ACD services, and remove the managed
-installation only after confirmation.
+		Long: `Show an uninstall plan, stop ACD services, and remove the managed installation
+only after confirmation.
 
-Repository checkpoints and databases are kept by default. Start with --dry-run.
---purge-data covers every registered project: remove verified .git/acd state
-and all ACD private checkpoint, finish, history, migration and recovery refs.
-Project Git branches, tags, commits, worktree files and staging are preserved.
-Missing worktrees are reported and skipped; unverified paths are never deleted.
-Permanently deleting protected data requires --confirm-purge-data as well.`,
+Repository checkpoints and databases are kept by default. Start with
+--dry-run. --purge-data covers every registered project: remove verified
+.git/acd state and all ACD private checkpoint, finish, history, migration and
+recovery refs. Project Git branches, tags, commits, worktree files and staging
+are preserved. Missing worktrees are reported and skipped; unverified paths
+are never deleted. Permanently deleting protected data requires
+--confirm-purge-data as well.`,
 		Example: `  acd uninstall --dry-run
   acd uninstall --yes
   acd uninstall --dry-run --purge-data
@@ -442,26 +443,17 @@ Permanently deleting protected data requires --confirm-purge-data as well.`,
 				return fmt.Errorf("acd uninstall: %w", err)
 			}
 			if expectedPlan != "" && expectedPlan != plan.Digest {
-				return invalidCommandError("acd uninstall: plan digest changed: got %s, expected %s", plan.Digest, expectedPlan)
+				return invalidCommandError("Plan digest changed: got %s, expected %s.", plan.Digest, expectedPlan)
 			}
 			if dryRun || !yes {
 				if jsonOut {
 					return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateOff, Actions: []productAction{}, Data: plan}, true)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "Uninstall plan: %s\n", plan.Digest)
-				for index, action := range plan.Actions {
-					fmt.Fprintf(cmd.OutOrStdout(), "%d. %s\n", index+1, action.Detail)
-					if action.Target != "" {
-						fmt.Fprintf(cmd.OutOrStdout(), "   Target: %s\n", action.Target)
-					}
-				}
-				for _, warning := range plan.Warnings {
-					fmt.Fprintln(cmd.OutOrStdout(), "Warning: "+warning)
-				}
+				renderUninstallPlan(cmd.OutOrStdout(), plan)
 				if purgeData && !confirmPurge {
-					fmt.Fprintln(cmd.OutOrStdout(), "Protected data purge requires --confirm-purge-data when applying.")
+					fmt.Fprintln(cmd.OutOrStdout(), "To permanently delete saved ACD data, also add --confirm-purge-data.")
 				}
-				fmt.Fprintln(cmd.OutOrStdout(), "Changed: no. Review this plan before applying it.")
+				fmt.Fprintln(cmd.OutOrStdout(), "Preview only. No changes made.")
 				return nil
 			}
 			if nonInteractive && expectedPlan == "" {
@@ -471,7 +463,8 @@ Permanently deleting protected data requires --confirm-purge-data as well.`,
 				return invalidCommandError("acd uninstall: --purge-data requires the second --confirm-purge-data confirmation")
 			}
 			if !nonInteractive {
-				fmt.Fprint(cmd.ErrOrStderr(), "Apply this uninstall plan? [y/N] ")
+				renderUninstallPlan(cmd.ErrOrStderr(), plan)
+				fmt.Fprint(cmd.ErrOrStderr(), "Uninstall ACD using the plan shown above? [y/N] ")
 				answer, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
 				answer = strings.ToLower(strings.TrimSpace(answer))
 				if answer != "y" && answer != "yes" {
@@ -494,22 +487,34 @@ Permanently deleting protected data requires --confirm-purge-data as well.`,
 				return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateOff, Changed: true, Actions: []productAction{{Kind: "uninstall", Status: "completed"}}, Data: result}, true)
 			}
 			if purgeData {
-				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled. Verified ACD state and private refs were removed from all available registered projects. Project Git history, worktree files and staging were preserved.")
+				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled.\nSaved ACD data was deleted from available registered projects.\nYour project files, Git commits, and staged changes are unchanged.")
 			} else {
-				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled. Repository checkpoints and databases were preserved.")
+				fmt.Fprintln(cmd.OutOrStdout(), "ACD uninstalled.\nYour saved ACD history is still on this computer.")
 			}
 			for _, warning := range plan.Warnings {
 				fmt.Fprintln(cmd.OutOrStdout(), "Warning: "+warning)
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), "Next: No action needed.")
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show the uninstall plan without changing anything")
 	cmd.Flags().BoolVar(&yes, "yes", false, "Apply the reviewed uninstall plan")
 	cmd.Flags().BoolVar(&purgeData, "purge-data", false, "Remove all registered projects' verified ACD state and private refs; preserve project Git history")
-	cmd.Flags().BoolVar(&confirmPurge, "confirm-purge-data", false, "Second explicit confirmation for permanent protected-data deletion")
+	cmd.Flags().BoolVar(&confirmPurge, "confirm-purge-data", false, "Confirm permanent deletion of saved ACD data")
 	cmd.Flags().BoolVar(&nonInteractive, "non-interactive", false, "Disable prompts; requires --yes and --expect-plan")
-	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Apply only this exact plan ID")
+	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Apply only the plan with this ID")
 	return cmd
+}
+
+func renderUninstallPlan(out io.Writer, plan installer.UninstallPlan) {
+	fmt.Fprintf(out, "Uninstall plan: %s\n", plan.Digest)
+	for index, action := range plan.Actions {
+		fmt.Fprintf(out, "%d. %s\n", index+1, action.Detail)
+		if action.Target != "" {
+			fmt.Fprintf(out, "   Target: %s\n", action.Target)
+		}
+	}
+	for _, warning := range plan.Warnings {
+		fmt.Fprintln(out, "Warning: "+warning)
+	}
 }

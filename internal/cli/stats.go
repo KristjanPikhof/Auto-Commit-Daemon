@@ -59,9 +59,11 @@ func newStatsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stats",
 		Short: "Aggregated commits/events/bytes across all repos",
-		Long: `Print aggregate commit, event, file, byte, and error counts from the central stats database.
+		Long: `Print aggregate commit, event, file, byte, and error counts from the central
+stats database.
 
-Stats are across all registered repos and default to the last 7 days. Use --since with a duration such as 24h, 30d, or 1y, and --json for automation.`,
+Stats are across all registered repos and default to the last 7 days. Use
+--since with a duration such as 24h, 30d, or 1y, and --json for automation.`,
 		Example: `  acd stats
   acd stats --since 30d
   acd stats --since 1y --json
@@ -96,7 +98,7 @@ func collectStats(ctx context.Context, sinceStr string) (statsReport, error) {
 	}
 	d, err := parseSince(sinceStr)
 	if err != nil {
-		return statsReport{}, fmt.Errorf("acd stats: %w", err)
+		return statsReport{}, fmt.Errorf("acd stats\nDetails: %w", err)
 	}
 	now := time.Now()
 	until := now
@@ -104,17 +106,17 @@ func collectStats(ctx context.Context, sinceStr string) (statsReport, error) {
 
 	roots, err := paths.Resolve()
 	if err != nil {
-		return statsReport{}, fmt.Errorf("acd stats: resolve paths: %w", err)
+		return statsReport{}, fmt.Errorf("acd stats: resolve paths\nDetails: %w", err)
 	}
 	db, err := central.Open(ctx, roots)
 	if err != nil {
-		return statsReport{}, fmt.Errorf("acd stats: open stats.db: %w", err)
+		return statsReport{}, fmt.Errorf("acd stats: open stats.db\nDetails: %w", err)
 	}
 	defer db.Close()
 
 	rows, err := db.ListRollupsSince(ctx, since.Unix())
 	if err != nil {
-		return statsReport{}, fmt.Errorf("acd stats: list rollups: %w", err)
+		return statsReport{}, fmt.Errorf("acd stats: list rollups\nDetails: %w", err)
 	}
 
 	report := buildStatsReport(rows, since, until)
@@ -188,7 +190,7 @@ func renderStatsHuman(out io.Writer, r statsReport, sinceLabel string) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(tw, "  Commits\t%s\n", formatThousands(r.Totals.Commits))
 	fmt.Fprintf(tw, "  Events\t%s\n", formatThousands(r.Totals.Events))
-	fmt.Fprintf(tw, "  Files\t%s unique\n", formatThousands(r.Totals.FilesChanged))
+	fmt.Fprintf(tw, "  Files\t%s different files\n", formatThousands(r.Totals.FilesChanged))
 	fmt.Fprintf(tw, "  Bytes\t%s\n", formatBytesSigned(r.Totals.BytesChanged))
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("flush totals: %w", err)

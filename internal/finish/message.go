@@ -16,7 +16,7 @@ const (
 
 func ValidatePurpose(purpose string) error {
 	if !messageTextSafe(purpose) {
-		return fmt.Errorf("finish: purpose contains invalid text or control characters")
+		return fmt.Errorf("The purpose contains unsupported text. Use plain readable text.")
 	}
 	return nil
 }
@@ -25,18 +25,18 @@ func ValidatePurpose(purpose string) error {
 // truncating, or silently repairing the supplied text.
 func ValidateMessage(style, message string) error {
 	if !messageTextSafe(message) {
-		return fmt.Errorf("finish: message must contain valid text without control characters")
+		return fmt.Errorf("The commit message contains unsupported text. Use readable text and line breaks.")
 	}
 	lines := strings.Split(strings.TrimRight(message, "\n"), "\n")
 	subject := lines[0]
 	if strings.TrimSpace(subject) != subject || subject == "" || utf8.RuneCountInString(subject) > SubjectLimit || strings.HasSuffix(subject, ".") {
-		return fmt.Errorf("finish: subject must be nonempty, at most %d characters, and have no trailing period", SubjectLimit)
+		return fmt.Errorf("Write a commit subject of 1 to %d characters, without leading or trailing spaces or a final period.", SubjectLimit)
 	}
 	switch style {
 	case StyleImperative:
 		words := strings.Fields(subject)
 		if len(words) < 2 || strings.HasSuffix(words[0], ":") || !unicode.IsLetter([]rune(subject)[0]) {
-			return fmt.Errorf("finish: imperative subject must name an action and what changed")
+			return fmt.Errorf("Start the commit subject with an action, for example: \"Fix startup errors\".")
 		}
 	case StyleConventional:
 		typ, description, ok := strings.Cut(subject, ": ")
@@ -62,7 +62,7 @@ func ValidateMessage(style, message string) error {
 			continue
 		}
 		if !bulletSeen || !strings.HasPrefix(line, "  ") || strings.HasPrefix(strings.TrimSpace(line), "- ") {
-			return fmt.Errorf("finish: body must use '- ' bullets with indented continuations")
+			return fmt.Errorf("Write each body item as a '- ' bullet. Indent continuation lines by at least two spaces.")
 		}
 	}
 	return nil

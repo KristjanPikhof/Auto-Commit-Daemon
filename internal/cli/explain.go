@@ -120,7 +120,7 @@ func buildExplainReport(ctx context.Context, repo string, db *sql.DB, path, comm
 	var rows []state.DecisionRecord
 	hasLedger, err := sqliteTableExists(ctx, db, "decision_records")
 	if err != nil {
-		return report, fmt.Errorf("acd explain: decision table check: %w", err)
+		return report, fmt.Errorf("acd explain: decision table check\nDetails: %w", err)
 	}
 	report.DecisionLedgerAvailable = hasLedger
 	switch {
@@ -147,7 +147,7 @@ func buildExplainReport(ctx context.Context, repo string, db *sql.DB, path, comm
 		}
 		resolved, rerr := git.RevParse(ctx, repo, rev)
 		if rerr != nil {
-			return report, fmt.Errorf("acd explain: resolve commit %s: %w", rev, rerr)
+			return report, fmt.Errorf("acd explain: resolve commit %s\nDetails: %w", rev, rerr)
 		}
 		report.Commit = resolved
 		if !hasLedger {
@@ -180,7 +180,7 @@ LIMIT ?`, resolved, limit)
 		rows, err = loadDecisionEvents(ctx, db, "", 0, limit)
 	}
 	if err != nil {
-		return report, fmt.Errorf("acd explain: query decisions: %w", err)
+		return report, fmt.Errorf("acd explain: query decisions\nDetails: %w", err)
 	}
 	report.DecisionCursor = maxDecisionCursor(rows, since)
 	report.Decisions = make([]eventEntry, 0, len(rows))
@@ -188,7 +188,7 @@ LIMIT ?`, resolved, limit)
 		report.Decisions = append(report.Decisions, decisionEntry(row))
 	}
 	if err := enrichEventEntries(ctx, db, report.Decisions); err != nil {
-		return report, fmt.Errorf("acd explain: enrich decisions: %w", err)
+		return report, fmt.Errorf("acd explain: enrich decisions\nDetails: %w", err)
 	}
 	report.Explanation, report.Recommended = summarizeExplain(report)
 	return report, nil

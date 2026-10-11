@@ -84,7 +84,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	if !opts.ExplicitMode {
 		form := huh.NewForm(huh.NewGroup(huh.NewSelect[string]().Key("strategy").Title("How should finish create commits?").
 			Description("Files are saved continuously. Branch commits are created only when you run acd finish.").
-			Options(huh.NewOption("Local: one complete batch, offline (recommended)", "local"), huh.NewOption("Intent: AI groups completed goals", "intent")).Value(&selection.Strategy)))
+			Options(huh.NewOption("Local: One commit for all finished work, offline (recommended)", "local"), huh.NewOption("Intent: AI groups finished work into commits", "intent")).Value(&selection.Strategy)))
 		if err := runConfigureForm(ctx, form, opts); err != nil {
 			return ConfigureSelection{}, err
 		}
@@ -121,7 +121,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	if selection.Strategy == "intent" && !providerReady {
 		options := []huh.Option[string]{
 			huh.NewOption("OpenAI-compatible connection", "openai-compat"),
-			huh.NewOption("Local AI subprocess", "subprocess"),
+			huh.NewOption("Local AI program", "subprocess"),
 		}
 		if providerKind == "deterministic" {
 			providerKind = "openai-compat"
@@ -148,7 +148,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		if providerSelected || !opts.OpenAIConfigured {
 			providerForm := huh.NewForm(huh.NewGroup(
 				huh.NewInput().Key("endpoint").
-					Title("OpenAI-compatible endpoint").
+					Title("AI service URL (OpenAI compatible)").
 					Description("Use the base URL ending in /v1.").
 					Value(&selection.BaseURL),
 				huh.NewInput().Key("model").
@@ -196,8 +196,8 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 	case "subprocess":
 		subprocessName = fallback(subprocessName, "acd-ai")
 		form := huh.NewForm(huh.NewGroup(
-			huh.NewInput().Key("subprocess").Title("Subprocess plugin name").Description(
-				"ACD executes acd-ai-<name> from PATH.").Value(&subprocessName),
+			huh.NewInput().Key("subprocess").Title("Local AI program name").Description(
+				"ACD runs acd-ai-<name>. The program must be installed and available in your terminal.").Value(&subprocessName),
 		))
 		if err := runConfigureForm(ctx, form, opts); err != nil {
 			return ConfigureSelection{}, err
@@ -237,7 +237,7 @@ func readConfigureSecret(input io.Reader, output io.Writer) (string, error) {
 		}
 		return secret, nil
 	}
-	if _, err := fmt.Fprintln(output, "API key: [read without rendering; stored after approval]"); err != nil {
+	if _, err := fmt.Fprintln(output, "API key (hidden; saved only after approval):"); err != nil {
 		return "", err
 	}
 	line, err := readConfigureSecretLine(input, 32*1024)
@@ -308,7 +308,7 @@ func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Wri
 		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
 	}
 	form = form.WithAccessible(accessible)
-	if err := form.WithInput(input).WithOutput(output).
+	if err := form.WithKeyMap(readableKeyMap()).WithInput(input).WithOutput(readableOutput(output, accessible)).
 		WithShowHelp(true).RunWithContext(ctx); err != nil {
 		return ConfigurePreviewApproval{}, err
 	}
@@ -321,7 +321,7 @@ func runConfigureForm(ctx context.Context, form *huh.Form, opts ConfigureWizardO
 	if opts.Accessible || os.Getenv("NO_COLOR") != "" {
 		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
 	}
-	return form.WithAccessible(opts.Accessible).WithInput(opts.Input).WithOutput(opts.Output).
+	return form.WithKeyMap(readableKeyMap()).WithAccessible(opts.Accessible).WithInput(opts.Input).WithOutput(readableOutput(opts.Output, opts.Accessible)).
 		WithShowHelp(true).RunWithContext(ctx)
 }
 

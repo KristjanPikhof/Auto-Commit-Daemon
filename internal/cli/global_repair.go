@@ -228,7 +228,7 @@ func previewGlobalRepair(ctx context.Context, roots paths.Roots) (globalRepairPl
 func applyGlobalRepair(ctx context.Context, roots paths.Roots, reviewed globalRepairPlan) error {
 	lock, err := globalops.AcquireUserLock(ctx, roots.OperationsDBPath())
 	if err != nil {
-		return fmt.Errorf("acd support repair: acquire user lifecycle lock: %w", err)
+		return fmt.Errorf("acd support repair: acquire user lifecycle lock\nDetails: %w", err)
 	}
 	defer lock.Release()
 	current, found, err := previewGlobalRepair(ctx, roots)
@@ -402,26 +402,26 @@ func finishSetupCleanup(ctx context.Context, roots paths.Roots, plan globalRepai
 	if len(plan.setupHoldBody) > 0 {
 		body, err := os.ReadFile(roots.SetupPublicationHoldPath())
 		if err != nil {
-			return fmt.Errorf("acd support repair: re-read setup publication hold: %w", err)
+			return fmt.Errorf("acd support repair: re-read setup publication hold\nDetails: %w", err)
 		}
 		if string(body) != string(plan.setupHoldBody) {
 			return errors.New("acd support repair: setup publication hold changed; preview again")
 		}
 		if err := os.Remove(roots.SetupPublicationHoldPath()); err != nil {
-			return fmt.Errorf("acd support repair: remove setup publication hold: %w", err)
+			return fmt.Errorf("acd support repair: remove setup publication hold\nDetails: %w", err)
 		}
 		if err := syncGlobalRepairDirectory(filepath.Dir(roots.SetupPublicationHoldPath())); err != nil {
-			return fmt.Errorf("acd support repair: sync setup publication hold removal: %w", err)
+			return fmt.Errorf("acd support repair: sync setup publication hold removal\nDetails: %w", err)
 		}
 	}
 	for _, proof := range plan.bridgeRefs {
 		if err := gitpkg.DeletePrivateRefDurable(ctx, proof.Repo, setupMigrationRefPrefix,
 			proof.Ref, proof.CommitOID); err != nil {
-			return fmt.Errorf("acd support repair: clean temporary bridge ref %s: %w", proof.Ref, err)
+			return fmt.Errorf("acd support repair: clean temporary bridge ref %s\nDetails: %w", proof.Ref, err)
 		}
 	}
 	if err := migration.CleanupBridgeRecoveryManifests(ctx, plan.recoveryManifests); err != nil {
-		return fmt.Errorf("acd support repair: clean retained migration recovery refs: %w", err)
+		return fmt.Errorf("acd support repair: clean retained migration recovery refs\nDetails: %w", err)
 	}
 	return nil
 }
@@ -463,9 +463,9 @@ func runGlobalOnlyRepair(
 				Actions: []productAction{}, NextAction: next, Data: preview}, true)
 		}
 		for _, plan := range plans {
-			fmt.Fprintf(out, "Global setup operation %s needs repair.\n", plan.OperationID)
+			fmt.Fprintf(out, "An interrupted setup needs repair.\nOperation: %s\n", plan.OperationID)
 			if plan.CanRepair {
-				fmt.Fprintf(out, "Proved safe through committed setup %s.\n", plan.ProvingOperationID)
+				fmt.Fprintf(out, "A later completed setup confirms this repair is safe.\nSetup: %s\n", plan.ProvingOperationID)
 			} else {
 				fmt.Fprintf(out, "Cannot repair automatically: %s\n", plan.Refusal)
 			}
@@ -490,7 +490,7 @@ func runGlobalOnlyRepair(
 		}
 		actions = append(actions, productAction{Kind: "global_repair", Status: "completed", Target: plan.OperationID})
 		if !jsonOut {
-			fmt.Fprintf(out, "Resolved global setup operation %s.\n", plan.OperationID)
+			fmt.Fprintf(out, "Repaired the interrupted setup.\nOperation: %s\n", plan.OperationID)
 		}
 	}
 	if jsonOut {
@@ -597,7 +597,7 @@ func verifyOperationRef(ctx context.Context, repo, ref, expected string) error {
 	}
 	actual, err := gitpkg.RevParse(ctx, repo, ref)
 	if err != nil {
-		return fmt.Errorf("resolve retained ref %s: %w", ref, err)
+		return fmt.Errorf("resolve retained ref %s\nDetails: %w", ref, err)
 	}
 	if actual != expected {
 		return fmt.Errorf("retained ref %s points to %s, expected %s", ref, actual, expected)

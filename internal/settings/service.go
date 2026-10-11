@@ -444,7 +444,7 @@ func (e *ConfirmationRequiredError) Error() string {
 	for i := range e.Missing {
 		values[i] = string(e.Missing[i])
 	}
-	return "acd settings: explicit confirmation required: " + strings.Join(values, ", ")
+	return "These settings need your approval. Open acd config to review the requested permissions: " + strings.Join(values, ", ")
 }
 
 func (s *Service) Validate(ctx context.Context, draft map[string]string, confirmed []ai.ConfirmationRequirement) (Validation, error) {

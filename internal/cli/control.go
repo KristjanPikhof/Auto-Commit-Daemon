@@ -85,13 +85,14 @@ func newOnCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "on",
 		Short: "Start protecting this repository",
-		Long: `Start checkpoint protection for this repository.
+		Long: `Start saving changes in this repository.
 
-First use initializes the local runtime with offline defaults. ACD starts the
-worker and confirms a durable checkpoint of current eligible changes.
-Running the command again is safe. Branch commits are created by acd finish.
+On first use, ACD installs its local program and saves the current files
+included in protection. Run acd finish when you are ready to create Git
+commits.
 
-Existing installations that need an upgrade direct you to acd setup.`,
+You can run acd on again safely. If an existing installation needs an upgrade,
+run acd setup.`,
 		Example: `  acd on
   acd on --repo /path/to/repo
   acd on --json`,
@@ -99,7 +100,8 @@ Existing installations that need an upgrade direct you to acd setup.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
-			return runControlOn(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut)
+			quiet, _ := cmd.Flags().GetBool("quiet")
+			return runControlOnWithProgress(cmd.Context(), cmd.OutOrStdout(), repo, jsonOut, quiet)
 		},
 	}
 }
@@ -109,15 +111,13 @@ func newOffCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "off",
 		Short: "Save a final checkpoint and stop protection",
-		Long: `Save a final durable checkpoint, then stop ACD protection for this
-repository.
+		Long: `Save the latest changes, then stop protection for this repository.
 
-Existing checkpoints and ACD state are kept, so you can turn protection on
-again later. Running the command again is safe.
+ACD keeps existing checkpoints so you can restore saved work or turn
+protection on again later. You can run acd off again safely.
 
-If ACD cannot confirm the final checkpoint, protection stays on and the output
-explains what to do next. Use --force only when you accept stopping without a
-confirmed current checkpoint.`,
+If ACD cannot confirm the final save, protection stays on. Use --force only if
+you accept stopping without confirming that your latest changes are saved.`,
 		Example: `  acd off
   acd off --repo /path/to/repo
   acd off --json`,
@@ -144,12 +144,16 @@ func runControlStatus(ctx context.Context, out io.Writer, repoFlag string, jsonO
 		return err
 	}
 	if res.Health == controlHealthNeedsAttention || res.Health == controlHealthNotRepo {
-		return actionRequiredError("needs_action", res.Summary)
+		return &CommandError{Code: "needs_action", Message: res.Summary, Exit: ExitActionRequired, rendered: true}
 	}
 	return nil
 }
 
 func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut bool) error {
+	return runControlOnWithProgress(ctx, out, repoFlag, jsonOut, false)
+}
+
+func runControlOnWithProgress(ctx context.Context, out io.Writer, repoFlag string, jsonOut, quiet bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -177,23 +181,23 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 	}
 	actions = append(actions, preparationActions...)
 	if _, err := callSupervisor(ctx, lookup, "enable_repository", nil, 30*time.Second); err != nil {
-		return fmt.Errorf("acd on: %w", err)
+		return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: %w", err)
 	}
 	if controlWorkerNeedsRestart(ctx, lookup) {
 		if _, err := callSupervisor(ctx, lookup, "restart_repository", nil, 30*time.Second); err != nil {
-			return fmt.Errorf("acd on: restart worker: %w", err)
+			return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: restart worker: %w", err)
 		}
 		actions = append(actions, "restarted")
 	}
 	progress := out
-	if jsonOut {
+	if jsonOut || quiet {
 		progress = io.Discard
 	}
 	if err := waitControlWorkerReady(ctx, lookup, supervisor.CheckpointBarrierTimeout, progress); err != nil {
 		return err
 	}
 	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout); err != nil {
-		return actionRequiredError("checkpoint_barrier_failed", fmt.Sprintf("acd on: initial checkpoint barrier failed: %v; run `acd doctor`", err))
+		return actionRequiredError("checkpoint_barrier_failed", fmt.Sprintf("acd on: ACD could not confirm that your current changes are saved.\nNext: run acd doctor.\nDetails: %v", err))
 	}
 	actions = append(actions, "checkpointed")
 
@@ -209,7 +213,7 @@ func runControlOn(ctx context.Context, out io.Writer, repoFlag string, jsonOut b
 		return err
 	}
 	if !res.OK {
-		return actionRequiredError("needs_action", fmt.Sprintf("acd on: repository remains unhealthy: %s", res.Summary))
+		return &CommandError{Code: "needs_action", Message: res.Summary, Exit: ExitActionRequired, rendered: true}
 	}
 	return nil
 }
@@ -260,7 +264,7 @@ func waitControlWorkerReady(ctx context.Context, lookup controlRepoLookup, timeo
 			return nil
 		}
 		if !announced {
-			fmt.Fprintln(progress, "Waiting for the repository worker to finish startup and protect this worktree…")
+			fmt.Fprintln(progress, "Starting protection and saving your changes...")
 			announced = true
 		}
 		select {
@@ -268,11 +272,11 @@ func waitControlWorkerReady(ctx context.Context, lookup controlRepoLookup, timeo
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			message := "acd on: worker did not become ready"
+			message := "acd on: protection did not start in time"
 			if ok && worker.LastError != "" {
 				message += ": " + worker.LastError
 			}
-			return unavailableError(message + "; run `acd doctor`")
+			return unavailableError(message + "\nNext: run acd doctor.")
 		case <-ticker.C:
 		}
 	}
@@ -298,7 +302,7 @@ func runControlOffWithForce(ctx context.Context, out io.Writer, repoFlag string,
 	}
 	if lookup.Record.LifecycleDisabled() {
 		if _, err := callSupervisor(ctx, lookup, "stop_repository", nil, 30*time.Second); err != nil {
-			return fmt.Errorf("acd off: stop worker: %w", err)
+			return fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: acd off: stop worker: %w", err)
 		}
 		res, inspectErr := inspectControl(ctx, lookup.Worktree.Root)
 		if inspectErr != nil {
@@ -309,18 +313,18 @@ func runControlOffWithForce(ctx context.Context, out io.Writer, repoFlag string,
 	}
 	if _, err := callSupervisor(ctx, lookup, "checkpoint_barrier", nil, supervisor.CheckpointBarrierTimeout); err != nil {
 		if !force {
-			return actionRequiredError("checkpoint_barrier_failed", fmt.Sprintf("acd off: final checkpoint barrier failed: %v; rerun with --force only if you accept unconfirmed protection", err))
+			return actionRequiredError("checkpoint_barrier_failed", fmt.Sprintf("acd off: ACD could not confirm that your latest changes are saved. Protection is still on.\nNext: run acd doctor.\nUse acd off --force only to stop without confirming those changes are saved.\nDetails: %v", err))
 		}
 		actions = append(actions, "checkpoint_unconfirmed")
 	} else {
 		actions = append(actions, "checkpointed")
 	}
 	if _, err := callSupervisor(ctx, lookup, "disable_repository", nil, 30*time.Second); err != nil {
-		return fmt.Errorf("acd off: %w", err)
+		return fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: acd off: %w", err)
 	}
 	actions = append(actions, "disabled")
 	if _, err := callSupervisor(ctx, lookup, "stop_repository", nil, 30*time.Second); err != nil {
-		return fmt.Errorf("acd off: stop worker: %w", err)
+		return fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: acd off: stop worker: %w", err)
 	}
 	actions = append(actions, "stopped")
 
@@ -373,8 +377,8 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 			base.OK = false
 			base.Repo = controlRequestedPath(repoFlag)
 			base.Health = controlHealthNotRepo
-			base.Summary = "The current directory is not inside a Git worktree."
-			base.NextAction = "Run `acd` from inside a Git worktree."
+			base.Summary = "This directory is not inside a Git repository."
+			base.NextAction = "Run acd from inside your Git repository, or use acd --repo /path/to/repo."
 			return base, nil
 		}
 		return controlResult{}, err
@@ -393,7 +397,7 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 	if lookup.Record.RepositoryID == "" || lookup.Record.WorktreeID == "" {
 		base.Health = controlHealthOff
 		base.Daemon = "stopped"
-		base.Summary = "This repository needs the current ACD protection format."
+		base.Summary = "Upgrade ACD before protecting this repository."
 		base.NextAction = "Run `acd setup` to upgrade and enable protection."
 		return base, nil
 	}
@@ -420,8 +424,8 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 		base.OK = false
 		base.Health = controlHealthNeedsAttention
 		base.Daemon = "stopped"
-		base.Summary = "ACD cannot find this repository's protection database."
-		base.NextAction = "Run `acd on` to recreate state and start ACD."
+		base.Summary = "ACD cannot find the saved protection data for this repository."
+		base.NextAction = "Run acd on to start protection. If it fails, run acd doctor."
 		return base, nil
 	}
 
@@ -429,7 +433,7 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 	if err != nil {
 		base.OK = false
 		base.Health = controlHealthNeedsAttention
-		base.Summary = "ACD could not read the current repository health."
+		base.Summary = "ACD could not check protection for this repository."
 		base.NextAction = "Run `acd doctor` for details."
 		return base, nil
 	}
@@ -441,7 +445,7 @@ func inspectControl(ctx context.Context, repoFlag string) (controlResult, error)
 			if supervisorStatus.Version != "" && supervisorStatus.Version != base.CLIVersion {
 				base.Health = controlHealthNeedsAttention
 				base.Summary = fmt.Sprintf("The CLI version %s does not match supervisor version %s.", base.CLIVersion, supervisorStatus.Version)
-				base.NextAction = "Run `acd setup` to install the matching managed binary."
+				base.NextAction = "Run acd setup to review and apply the upgrade."
 			}
 			for _, worker := range supervisorStatus.Workers {
 				if worker.RepositoryID != lookup.Record.RepositoryID {
@@ -497,13 +501,13 @@ func applySupervisorWorkerFailure(result *controlResult, worker supervisor.Worke
 	result.Health = controlHealthNeedsAttention
 	switch {
 	case strings.Contains(worker.LastError, "checkpoint-first setup required"):
-		result.Summary = "ACD could not start because its state database needs a safe schema upgrade."
-		result.NextAction = "Run `acd setup` to back up and upgrade state before starting protection. Preserved work remains saved."
+		result.Summary = "ACD could not start because its saved data needs an upgrade."
+		result.NextAction = "Run acd setup to back up and upgrade ACD's saved data. Existing saved work is retained."
 	case strings.Contains(worker.LastError, "acquire repository ownership"):
-		result.Summary = "ACD could not start because an older worker still owns this repository."
-		result.NextAction = "Run `acd on` to stop the managed worker and start a fresh one."
+		result.Summary = "ACD could not start because an older ACD process is still protecting this repository."
+		result.NextAction = "Run acd on to restart protection."
 	default:
-		result.Summary = "ACD tried to restart the worker, but the startup error still needs attention."
+		result.Summary = "ACD could not restart protection."
 		result.NextAction = "Run `acd on` once. If it still fails, run `acd support logs --lines 100`."
 	}
 }
@@ -515,11 +519,11 @@ func loadControlRepo(ctx context.Context, repoFlag string) (controlRepoLookup, e
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return controlRepoLookup{}, fmt.Errorf("resolve paths: %w", err)
+		return controlRepoLookup{}, fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: resolve paths: %w", err)
 	}
 	reg, err := central.Load(roots)
 	if err != nil {
-		return controlRepoLookup{}, fmt.Errorf("load registry: %w", err)
+		return controlRepoLookup{}, fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: load registry: %w", err)
 	}
 	rec, ok := findRepo(reg, wt.Root, state.DBPathFromGitDir(wt.GitDir))
 	return controlRepoLookup{
@@ -540,9 +544,9 @@ func applyControlStatusWithDaemonAlive(res *controlResult, status statusReport, 
 
 func controlWorktreeError(command, repoFlag string, err error) error {
 	if errors.Is(err, git.ErrNotWorktree) {
-		return fmt.Errorf("acd %s: repo %q is not inside a Git worktree: %w", command, repoFlag, err)
+		return fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: acd %s: repo %q is not inside a Git worktree: %w", command, repoFlag, err)
 	}
-	return fmt.Errorf("acd %s: %w", command, err)
+	return fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: acd %s: %w", command, err)
 }
 
 func controlRequestedPath(repoFlag string) string {

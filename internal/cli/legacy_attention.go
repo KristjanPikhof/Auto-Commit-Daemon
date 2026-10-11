@@ -20,12 +20,13 @@ func legacyAttentionSummary(reason string) string {
 func legacyAttentionAction(legacy state.FinishLegacyCutover) string {
 	switch legacy.ReasonCode {
 	case "legacy_object_missing", "legacy_inventory_invalid", "legacy_proof_ambiguous", "legacy_publication_ambiguous", "legacy_repair_ambiguous", "legacy_archive_unreadable":
-		return "Inspect `acd support diagnose --json` to recover the archived proof. Archived errors do not block current protection, finish, or history rewrite."
+		return "Run acd support diagnose --json to inspect older saved data. Current protection, finish, and history rewrite remain available."
 	default:
-		return "Run `acd setup` to inspect the preserved legacy archive. Archived errors do not block current protection, finish, or history rewrite."
+		return "Run acd setup to review older saved data. Current protection, finish, and history rewrite remain available."
 	}
 }
 
 func renderLegacyAttention(out io.Writer, legacy state.FinishLegacyCutover) {
-	fmt.Fprintf(out, "Legacy attention: %s %s\n", legacyAttentionSummary(legacy.Reason), legacyAttentionAction(legacy))
+	fmt.Fprintln(out, "Older saved data needs review. Current protection, finish, and history rewrite remain available.")
+	fmt.Fprintln(out, "For details: Run acd support diagnose --json.")
 }

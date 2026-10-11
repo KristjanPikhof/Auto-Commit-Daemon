@@ -34,13 +34,13 @@ func newConfigEditorCmd() *cobra.Command {
 		Long: `Open an editable settings menu. Choose Global defaults or This repository,
 change values, then Save changes to review and apply them.
 
-Only edited fields are saved. Repository fields can return to inherited values.
-API keys are masked and saved in the protected credential store.
-Global changes apply to repositories that inherit them.
-Stopped repositories remain stopped. Restart-required fields are identified.
+Only edited fields are saved. Repository fields can return to inherited
+values. API keys are masked and saved in the protected credential store.
+Global changes apply to repositories that inherit them. Stopped repositories
+remain stopped. Restart-required fields are identified.
 
-Without flags, the editor starts at Global defaults. --repo selects a repository.
---accessible uses linear prompts suitable for screen readers.`,
+Without flags, the editor starts at Global defaults. --repo selects a
+repository. --accessible uses linear prompts suitable for screen readers.`,
 		Example: "  acd config\n  acd config edit --scope global\n  acd config edit --repo .\n  acd config --accessible",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -190,7 +190,7 @@ func (e *configEditor) Load(_ context.Context, scope string, changes map[string]
 		}
 		credential = "Not configured (select to enter)"
 		if source == credentials.SourceFile {
-			credential = "Configured (select to replace)"
+			credential = "Saved (select to replace)"
 		}
 		if source == credentials.SourceEnvironment {
 			credential = "Provided by ACD_AI_API_KEY"
@@ -293,18 +293,18 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 	for _, key := range keys {
 		suffix := ""
 		if draft.Changes[key] == nil {
-			suffix = " (restore inheritance)"
+			suffix = " (use defaults again)"
 		}
 		fmt.Fprintf(&review, "  %s: %s → %s%s\n", key, editorDisplayValue(key, before.values[key]), editorDisplayValue(key, projection.values[key]), suffix)
 	}
 	if draft.Credential != "" {
-		fmt.Fprintln(&review, "  API key: replace in the protected store (shared by repositories)")
+		fmt.Fprintln(&review, "  API key: Replace the saved key shared by your repositories.")
 	}
 	if len(keys) == 0 && draft.Credential == "" {
 		fmt.Fprintln(&review, "  Apply the saved settings.")
 	}
-	fmt.Fprintf(&review, "Connection: %s / %s / %s\n", safePreviewText(plan.values[config.FieldProvider], 100), safePreviewText(plan.values[config.FieldModel], 0), safeEndpointPreview(plan.values[config.FieldBaseURL]))
-	fmt.Fprintf(&review, "Commit mode: %s / %s; verification: %s\n", projection.values[config.FieldCommitStrategy], projection.values[config.FieldCommitFormat], projection.values[config.FieldIntentVerification])
+	fmt.Fprintf(&review, "AI service: %s\nModel: %s\nURL: %s\n", safePreviewText(plan.values[config.FieldProvider], 100), safePreviewText(plan.values[config.FieldModel], 0), safeEndpointPreview(plan.values[config.FieldBaseURL]))
+	fmt.Fprintf(&review, "Finish mode: %s\nMessage style: %s\nChecks before committing: %s\n", projection.values[config.FieldCommitStrategy], projection.values[config.FieldCommitFormat], projection.values[config.FieldIntentVerification])
 	writeEditorPermissions(&review, validation)
 	if len(validation.RestartChanged) > 0 {
 		fmt.Fprintln(&review, "Restart required for:", strings.Join(validation.RestartChanged, ", "))
@@ -315,7 +315,7 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 			return editorPlan{}, err
 		}
 		plan.targets = append(plan.targets, target)
-		fmt.Fprintln(&review, "Apply this reviewed revision. A stopped worker stays stopped.")
+		fmt.Fprintln(&review, "Apply these settings. Repositories with protection off will stay off.")
 	} else {
 		targets, err := e.globalActivations(ctx, projection.document, draft, &review)
 		if err != nil {
@@ -338,16 +338,16 @@ func writeEditorPermissions(out io.Writer, validation settings.Validation) {
 	for _, requirement := range validation.Confirmations {
 		switch requirement {
 		case ai.ConfirmationEndpointCredentials:
-			fmt.Fprintln(out, "Permission: send credentials to", safeEndpointPreview(validation.ProviderConfig.BaseURL))
+			fmt.Fprintln(out, "Allow sending your API key to", safeEndpointPreview(validation.ProviderConfig.BaseURL))
 		case ai.ConfirmationInsecureEndpointCredentials:
 			fmt.Fprintln(out, "Permission: use an unencrypted HTTP connection")
 		case ai.ConfirmationDiffEgress:
-			fmt.Fprintln(out, "Permission: send redacted repository changes to the selected provider")
+			fmt.Fprintln(out, "Allow sending filtered repository changes to this AI service")
 		case ai.ConfirmationSubprocessExecution:
-			fmt.Fprintln(out, "Permission: run the selected local provider: "+strconv.Quote(validation.ProviderConfig.Mode))
+			fmt.Fprintln(out, "Allow running this local AI program: "+strconv.Quote(validation.ProviderConfig.Mode))
 		case ai.ConfirmationVerificationCommand:
 			mode := validation.ResolvedHot[config.FieldIntentVerification]
-			fmt.Fprintln(out, "Permission: run project verification:", strconv.Quote(validation.ResolvedHot["verification."+mode+".command"]))
+			fmt.Fprintln(out, "Allow running this check command:", strconv.Quote(validation.ResolvedHot["verification."+mode+".command"]))
 
 		}
 	}
@@ -498,10 +498,10 @@ func (e *configEditor) globalActivations(ctx context.Context, doc *config.Docume
 			}
 		}
 		if restart {
-			fmt.Fprintf(out, "Restart-required fields take effect on next start: %s\n", safeRepoPreview(record.Path))
+			fmt.Fprintf(out, "These settings take effect when protection restarts: %s\n", safeRepoPreview(record.Path))
 		}
 		if !changedHot && !keyChanged {
-			fmt.Fprintf(out, "Already using reviewed runtime settings: %s\n", safeRepoPreview(record.Path))
+			fmt.Fprintf(out, "Already using these settings: %s\n", safeRepoPreview(record.Path))
 			continue
 		}
 		target.values = values
@@ -572,12 +572,12 @@ func (e *configEditor) save(ctx context.Context, plan editorPlan) (string, error
 	var result strings.Builder
 	fmt.Fprintln(&result, "Settings saved.")
 	for _, target := range plan.targets {
-		applied, applyErr := e.activate(ctx, target, generation, plan.draft.Credential)
+		_, applyErr := e.activate(ctx, target, generation, plan.draft.Credential)
 		if applyErr != nil {
-			fmt.Fprintf(&result, "Saved, but could not apply to %s: %s. Reopen acd config --repo %s and save to retry.\n", safeRepoPreview(target.repo), safePreviewText(applyErr.Error(), 500), productListShellQuote(target.repo))
+			fmt.Fprintf(&result, "Settings saved, but not applied to %s.\nDetails: %s\nNext: Run acd config --repo %s, then choose Save changes.\n", safeRepoPreview(target.repo), safePreviewText(applyErr.Error(), 500), productListShellQuote(target.repo))
 			continue
 		}
-		fmt.Fprintf(&result, "Applied: %s (revision %d).\n", safeRepoPreview(target.repo), applied.RevisionID)
+		fmt.Fprintf(&result, "Settings applied: %s\n", safeRepoPreview(target.repo))
 	}
 	if len(plan.validation.RestartChanged) > 0 {
 		fmt.Fprintln(&result, "Restart required for:", strings.Join(plan.validation.RestartChanged, ", "))
