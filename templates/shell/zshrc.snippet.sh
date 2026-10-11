@@ -1,14 +1,12 @@
 # acd-managed: true
-# Add to ~/.zshrc to auto-register every shell session inside a git repo.
-acd_auto_start() {
+# Add to ~/.zshrc to wake protection in registered, enabled repositories.
+acd_wake_protection() {
     if command -v acd >/dev/null 2>&1 && git rev-parse --show-toplevel >/dev/null 2>&1; then
         local repo=$(git rev-parse --show-toplevel)
-        export ACD_SESSION_ID=${ACD_SESSION_ID:-$(uuidgen)}
-        acd internal session open --session-id "$ACD_SESSION_ID" --harness shell \
-                  --watch-pid "$$" --repo "$repo" >/dev/null 2>&1
+        acd internal hint --repo "$repo" >/dev/null 2>&1 || true
     fi
 }
-# Hook into chpwd so every cd into a repo triggers registration.
+# Changing directory never enables a repository or publishes work.
 autoload -U add-zsh-hook
-add-zsh-hook chpwd acd_auto_start
-acd_auto_start
+add-zsh-hook chpwd acd_wake_protection
+acd_wake_protection

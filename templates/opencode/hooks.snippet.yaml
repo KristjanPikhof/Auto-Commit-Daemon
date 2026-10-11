@@ -7,8 +7,6 @@ hooks:
           acd internal integration event \
             --harness opencode \
             --event session_open \
-            --session-id "$OPENCODE_SESSION_ID" \
-            --watch-pid "$PPID" \
             --repo "$OPENCODE_PROJECT_DIR"
 
   - id: acd-wake-tool-before
@@ -18,8 +16,6 @@ hooks:
           acd internal integration event \
             --harness opencode \
             --event activity \
-            --session-id "$OPENCODE_SESSION_ID" \
-            --watch-pid "$PPID" \
             --repo "$OPENCODE_PROJECT_DIR"
 
   - id: acd-wake-tool-after
@@ -29,18 +25,15 @@ hooks:
           acd internal integration event \
             --harness opencode \
             --event activity \
-            --session-id "$OPENCODE_SESSION_ID" \
-            --watch-pid "$PPID" \
             --repo "$OPENCODE_PROJECT_DIR"
 
-  - id: acd-flush-idle
+  - id: acd-wake-idle
     event: session.idle
     actions:
       - bash: |
           acd internal integration event \
             --harness opencode \
-            --event logical_boundary \
-            --session-id "$OPENCODE_SESSION_ID" \
+            --event activity \
             --repo "$OPENCODE_PROJECT_DIR"
 
   - id: acd-stop
@@ -50,5 +43,4 @@ hooks:
           acd internal integration event \
             --harness opencode \
             --event session_close \
-            --session-id "$OPENCODE_SESSION_ID" \
             --repo "$OPENCODE_PROJECT_DIR"

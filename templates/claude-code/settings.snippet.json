@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'acd internal integration event --harness claude-code --event session_open --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" --watch-pid \"$PPID\"'"
+            "command": "bash -c 'acd internal integration event --harness claude-code --event session_open --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'acd internal integration event --harness claude-code --event activity --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" --watch-pid \"$PPID\"'"
+            "command": "bash -c 'acd internal integration event --harness claude-code --event activity --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'acd internal integration event --harness claude-code --event activity --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\" --watch-pid \"$PPID\"'"
+            "command": "bash -c 'acd internal integration event --harness claude-code --event activity --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'acd internal integration event --harness claude-code --event logical_boundary --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
+            "command": "bash -c 'acd internal integration event --harness claude-code --event activity --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"'"
           }
         ]
       }
