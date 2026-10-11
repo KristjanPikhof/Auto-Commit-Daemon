@@ -752,12 +752,6 @@
     "TestFinishPlanRenameAndAuthorBoundaries": 0.001
   },
   "./internal/git": {
-    "TestApplyRewritePlanCreatesBackupAndRecreatesDescendants": 1.78,
-    "TestApplyRewritePlanDryRunProgressIsValidationOnly": 0.77,
-    "TestApplyRewritePlanGroupsAdjacentCommitsAndPreservesTree": 1.73,
-    "TestApplyRewritePlanPreservesOriginalAuthorMetadata": 0.99,
-    "TestApplyRewritePlanProgressCallbackOrder": 1.75,
-    "TestApplyRewritePlanRefusesMovedHeadWithoutBackup": 0.8,
     "TestBlobHasherMatchesGitAndDurablyWritesMissingObjects": 0.37,
     "TestCatFileBlob_TruncatesAtLimit": 0.35,
     "TestCheck_LargePathBatch_NoDeadlock": 0.25,
@@ -856,7 +850,6 @@
     "TestShowToplevelAndAbsoluteGitDir": 0.28,
     "TestUpdateIndexInfoWithIsolatedIndex": 0.39,
     "TestUpdateRefCompareAndSwapRejectsStaleOld": 0.49,
-    "TestValidateRewriteGroupSemanticsRejectsMixedAuthorsAndEmptyNetChange": 1.36,
     "TestWithLockedAbsentRefBlocksConcurrentCreation": 0.63,
     "TestWithLockedAbsentRefSupportsSHA256Repository": 0.18,
     "TestWithLockedExpectedRefBlocksConcurrentBranchMutation": 0.94,
