@@ -124,6 +124,12 @@ acd config credentials remove
 ~~~
 
 Keys live in the protected credential store, not repository configuration.
+Intent with an OpenAI-compatible provider requires a key from that provider.
+Fresh setup asks for a missing key; the settings editor also asks before saving
+Intent settings. The key stays masked and is stored only after approval. An
+existing environment or stored key is reused. Local mode and local subprocess
+providers do not require this API key.
+
 Credential save and settings Apply do not test the connection. Optional
 explicit connection tests use fixed synthetic input, not repository content.
 Local mode does not inspect the credential store.

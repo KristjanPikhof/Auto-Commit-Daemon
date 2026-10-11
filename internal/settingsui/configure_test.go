@@ -117,3 +117,22 @@ func TestConfigureSecretReaderDoesNotConsumeFollowingAnswers(t *testing.T) {
 		t.Fatalf("remaining=%q err=%v", remaining.String(), err)
 	}
 }
+
+func TestIntentWizardRequiresCredentialForConfiguredExternalProvider(t *testing.T) {
+	var out bytes.Buffer
+	selection, err := RunConfigureWizard(t.Context(), ConfigureWizardOptions{
+		Input: &bytewiseReader{r: strings.NewReader("\n\n\nnew-provider-key\n")}, Output: &out, Accessible: true,
+		ExplicitMode: true, ProviderConfigured: true, OpenAIConfigured: true, HasCredential: true,
+		CredentialStatus: func() (bool, error) { return false, nil },
+		Defaults:         map[string]string{"commit.strategy": "intent", "ai.provider": "openai-compat", "ai.base_url": "https://gateway.example/v1", "ai.model": "gateway-model"},
+	})
+	if err != nil {
+		t.Fatalf("wizard: %v\n%s", err, out.String())
+	}
+	if selection.Credential != "new-provider-key" || selection.Provider != "openai-compat" {
+		t.Fatal("external provider was left without a credential")
+	}
+	if !strings.Contains(out.String(), "requires an API key") || strings.Contains(out.String(), "new-provider-key") {
+		t.Fatalf("missing explanation or secret leaked: %s", out.String())
+	}
+}

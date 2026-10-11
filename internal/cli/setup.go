@@ -170,6 +170,16 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	if err != nil {
 		return fmt.Errorf("acd setup: %w", err)
 	}
+	if !plan.FreshDefaults {
+		for _, name := range []string{
+			"strategy", "commit-format", "provider", "base-url", "model", "ca-file",
+			"credential-stdin", "confirm-endpoint-credentials", "confirm-insecure-http", "confirm-diff-egress",
+		} {
+			if flagWasSet(cmd, name) {
+				return invalidCommandError("acd setup: --%s is for first setup; use `acd config` to change an existing installation's preferences or credentials", name)
+			}
+		}
+	}
 	var onboardingState *setupOnboardingState
 	if plan.FreshDefaults {
 		onboardingState, err = prepareSetupOnboarding(cmd, roots, onboarding, dryRun, nonInteractive)
@@ -389,12 +399,19 @@ func renderSetupPlan(cmd *cobra.Command, plan installer.Plan, jsonOut bool) erro
 		if values["intent.repair.enabled"] == "true" {
 			fmt.Fprintln(cmd.OutOrStdout(), "Repair: limited to recent, private, ACD-owned commits. Pushed and user-owned history is never rewritten.")
 		}
-		if plan.Configuration.CredentialSource == "environment" {
+		switch {
+		case values["commit.strategy"] != "intent":
+			fmt.Fprintln(cmd.OutOrStdout(), "Credential: not needed for Local mode.")
+		case values["ai.provider"] != "openai-compat":
+			fmt.Fprintln(cmd.OutOrStdout(), "Credential: not needed for this provider.")
+		case plan.Configuration.CredentialSource == "environment":
 			fmt.Fprintln(cmd.OutOrStdout(), "Credential: ACD_AI_API_KEY from the environment. No credential file will be written.")
-		} else if plan.Configuration.StoreCredential {
+		case plan.Configuration.StoreCredential:
 			fmt.Fprintln(cmd.OutOrStdout(), "Credential: stored in the protected user credential file with mode 0600.")
-		} else {
-			fmt.Fprintln(cmd.OutOrStdout(), "Credential: not needed for the local provider.")
+		case plan.Configuration.CredentialSource == "protected_file":
+			fmt.Fprintln(cmd.OutOrStdout(), "Credential: reuse the protected user credential file.")
+		default:
+			fmt.Fprintln(cmd.OutOrStdout(), "Credential: required; interactive setup will ask for an API key, or supply ACD_AI_API_KEY or --credential-stdin.")
 		}
 	}
 	for _, warning := range plan.Warnings {

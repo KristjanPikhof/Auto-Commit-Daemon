@@ -177,7 +177,7 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	if len(validation.Missing) > 0 {
 		return nil, &settings.ConfirmationRequiredError{Missing: validation.Missing}
 	}
-	if selection.Strategy == "intent" && selection.Provider == "openai-compat" && credentialSource == credentials.SourceNone {
+	if selection.Strategy == "intent" && selection.Provider == "openai-compat" && credentialSource == credentials.SourceNone && selection.Credential != "" {
 		credentialSource = credentials.SourceFile
 	}
 	storeCredential := selection.Strategy == "intent" && selection.Provider == "openai-compat" && selection.Credential != "" && credentialSource != credentials.SourceEnvironment

@@ -185,6 +185,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 			}
 		}
 		if !opts.HasCredential && !opts.CredentialFromStdin {
+			fmt.Fprintln(opts.Output, "Intent with an OpenAI-compatible provider requires an API key from that provider.")
 			credential, readErr := readConfigureSecret(opts.Input, opts.Output)
 			if readErr != nil {
 				return ConfigureSelection{}, readErr
@@ -230,7 +231,11 @@ func readConfigureSecret(input io.Reader, output io.Writer) (string, error) {
 		if err != nil {
 			return "", errors.New("configure wizard: read masked API key")
 		}
-		return strings.TrimSpace(string(value)), nil
+		secret := strings.TrimSpace(string(value))
+		if secret == "" {
+			return "", errors.New("configure wizard: API key is required")
+		}
+		return secret, nil
 	}
 	if _, err := fmt.Fprintln(output, "API key: [read without rendering; stored after approval]"); err != nil {
 		return "", err

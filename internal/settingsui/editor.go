@@ -29,6 +29,7 @@ type EditorSnapshot struct {
 	Fields                    []EditorField
 	Credential                string
 	CredentialFromEnvironment bool
+	CredentialMissing         bool
 }
 
 type EditorReview struct {
@@ -60,6 +61,7 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 		opts.Scope = "global"
 	}
 	draft := EditorDraft{Scope: opts.Scope, Changes: map[string]*string{}}
+	credentialRequested := false
 	advanced := false
 	message := "Choose a setting to edit. Changes are saved together."
 	initialized := false
@@ -67,6 +69,10 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 		snapshot, err := backend.Load(ctx, draft.Scope, draft.Changes)
 		if err != nil {
 			return err
+		}
+		if credentialRequested && !snapshot.CredentialMissing {
+			draft.Credential = ""
+			credentialRequested = false
 		}
 		if !initialized {
 			draft.Generation = snapshot.Generation
@@ -111,6 +117,7 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 				}
 			}
 			draft = EditorDraft{Scope: scope, Changes: map[string]*string{}}
+			credentialRequested = false
 			initialized = false
 			message = "Choose a setting to edit. Changes are saved together."
 		case "commit.mode":
@@ -129,6 +136,16 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 		case "advanced":
 			advanced = !advanced
 		case "save":
+			if snapshot.CredentialMissing && draft.Credential == "" {
+				fmt.Fprintln(opts.Output, "Intent with an OpenAI-compatible provider requires an API key. It will be stored securely only after you approve these changes.")
+				credential, err := readConfigureSecret(opts.Input, opts.Output)
+				if err != nil {
+					message = "Cannot save: " + safeText(err.Error())
+					continue
+				}
+				draft.Credential = credential
+				credentialRequested = true
+			}
 			review, err := backend.Review(ctx, draft)
 			if err != nil {
 				message = "Cannot save: " + safeText(err.Error())
@@ -167,6 +184,7 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 				continue
 			}
 			draft.Credential = value
+			credentialRequested = false
 			message = "New API key entered. It will be stored securely when you save."
 		default:
 			var field EditorField

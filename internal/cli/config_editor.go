@@ -196,7 +196,8 @@ func (e *configEditor) Load(_ context.Context, scope string, changes map[string]
 			credential = "Provided by ACD_AI_API_KEY"
 		}
 	}
-	return settingsui.EditorSnapshot{Generation: projection.document.Generation, Fields: projection.fields, Credential: credential, CredentialFromEnvironment: source == credentials.SourceEnvironment}, nil
+	missing := projection.values[config.FieldCommitStrategy] == "intent" && projection.values[config.FieldProvider] == "openai-compat" && source == credentials.SourceNone
+	return settingsui.EditorSnapshot{Generation: projection.document.Generation, Fields: projection.fields, Credential: credential, CredentialFromEnvironment: source == credentials.SourceEnvironment, CredentialMissing: missing}, nil
 }
 
 func (e *configEditor) options(repo, secret string) settings.Options {

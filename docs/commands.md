@@ -75,6 +75,9 @@ state until explicitly activated. Ambiguous legacy publication can remain
 commands inspect old records without upgrading them.
 
 Setup installation and repository enablement are separate consent steps.
+After installation, use `acd config` to change the finish mode, provider, or
+credentials. Setup upgrades preserve those settings and reject first-setup
+preference flags rather than ignoring them.
 Compatibility `setup --repo PATH` retains global scope and prints the follow-up
 `acd on --repo PATH`. Unattended setup does not grant repository consent.
 

@@ -36,6 +36,9 @@
 
 ### Fixed
 
+- Ask for a missing API key before saving Intent settings for an OpenAI-compatible
+  provider. Setup previews distinguish required, reused, and newly entered
+  credentials; upgrades reject first-setup flags instead of silently ignoring them.
 - Honor root and nested Git ignore rules during fresh finish scans, including
   scans without a supplied ignore checker. Excluded checkpoint entries cannot
   enter a new finish target.

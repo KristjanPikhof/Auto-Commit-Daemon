@@ -204,45 +204,55 @@ func TestSettingsTUIRealPTYActionsAndErrorRestoration(t *testing.T) {
 
 func TestConfigEditorAPIKeyMaskedAndSavedWithoutProbeInRealPTY(t *testing.T) {
 	t.Parallel()
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		t.Error("saving a key contacted the provider")
-		http.Error(w, "unexpected provider request", http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-	f := newFinishFixture(t, "TERM=xterm-256color", "ACD_COMMIT_STRATEGY=intent", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=synthetic-test-model", "ACD_AI_BASE_URL="+server.URL+"/v1", "ACD_AI_API_KEY=")
-	repo, env := f.Repo, f.Env
-	bin := buildAcdBinary(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, "5\n\x00editor-secret-test-token\n\x009\n\x00y\n\x00", bin, "config", "--repo", repo, "--accessible")
-	if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Settings saved") {
-		t.Fatalf("API key editor exit=%d\n%s", result.ExitCode, result.Stdout)
-	}
-	if strings.Contains(result.Stdout, "editor-secret-test-token") {
-		t.Fatal("terminal exposed API key")
-	}
-	if calls.Load() != 0 {
-		t.Fatalf("probe count=%d", calls.Load())
-	}
-	configPath := settingsConfigPath(env)
-	if strings.Contains(readOptionalFile(t, configPath), "editor-secret-test-token") {
-		t.Fatal("key entered ordinary config")
-	}
-	credentialPath := filepath.Join(filepath.Dir(configPath), "credentials.json")
-	info, err := os.Stat(credentialPath)
-	if err != nil || info.Mode().Perm() != 0600 {
-		t.Fatalf("credential storage permissions: %v", err)
-	}
-	body := readOptionalFile(t, credentialPath)
-	if !strings.Contains(body, "editor-secret-test-token") {
-		t.Fatal("approved key was not stored")
-	}
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	snapshot := sqliteScalar(t, dbPath, "SELECT snapshot_json FROM config_revisions ORDER BY id DESC LIMIT 1")
-	if strings.Contains(snapshot, "editor-secret-test-token") {
-		t.Fatal("key entered runtime revision")
+	for _, tc := range []struct{ name, input string }{
+		{"manual", "5\n\x00editor-secret-test-token\n\x009\n\x00y\n\x00"},
+		{"required_on_save", "9\n\x00editor-secret-test-token\n\x00y\n\x00"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				t.Error("saving a key contacted the provider")
+				http.Error(w, "unexpected provider request", http.StatusServiceUnavailable)
+			}))
+			defer server.Close()
+			f := newFinishFixture(t, "TERM=xterm-256color", "ACD_COMMIT_STRATEGY=intent", "ACD_AI_PROVIDER=openai-compat", "ACD_AI_MODEL=synthetic-test-model", "ACD_AI_BASE_URL="+server.URL+"/v1", "ACD_AI_API_KEY=")
+			repo, env := f.Repo, f.Env
+			bin := buildAcdBinary(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			result := runPTYCommand(t, ctx, env, 84, 30, 0, 0, tc.input, bin, "config", "--repo", repo, "--accessible")
+			if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Settings saved") {
+				t.Fatalf("API key editor exit=%d\n%s", result.ExitCode, result.Stdout)
+			}
+			if tc.name == "required_on_save" && !strings.Contains(result.Stdout, "requires an API key") {
+				t.Fatalf("missing required credential prompt: %s", result.Stdout)
+			}
+			if strings.Contains(result.Stdout, "editor-secret-test-token") {
+				t.Fatal("terminal exposed API key")
+			}
+			if calls.Load() != 0 {
+				t.Fatalf("probe count=%d", calls.Load())
+			}
+			configPath := settingsConfigPath(env)
+			if strings.Contains(readOptionalFile(t, configPath), "editor-secret-test-token") {
+				t.Fatal("key entered ordinary config")
+			}
+			credentialPath := filepath.Join(filepath.Dir(configPath), "credentials.json")
+			info, err := os.Stat(credentialPath)
+			if err != nil || info.Mode().Perm() != 0600 {
+				t.Fatalf("credential storage permissions: %v", err)
+			}
+			body := readOptionalFile(t, credentialPath)
+			if !strings.Contains(body, "editor-secret-test-token") {
+				t.Fatal("approved key was not stored")
+			}
+			dbPath := filepath.Join(repo, ".git", "acd", "state.db")
+			snapshot := sqliteScalar(t, dbPath, "SELECT snapshot_json FROM config_revisions ORDER BY id DESC LIMIT 1")
+			if strings.Contains(snapshot, "editor-secret-test-token") {
+				t.Fatal("key entered runtime revision")
+			}
+		})
 	}
 }
 
