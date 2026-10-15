@@ -25,8 +25,9 @@ merged commands in `/hooks`. Use `acd doctor` for drift and
 ## Recommended agent instructions
 
 Add the [shared ACD guidance](../agent-guidance.md) to your global or repository
-`AGENTS.md`, or your tool's equivalent instruction file. `acd setup` prints the
-recommended text without editing instruction files.
+`AGENTS.md`, or your tool's equivalent instruction file. Run `acd setup agents`
+for the guided preview, or `acd setup agents --manual` for commands and the
+instruction copy. Adding the section to a file requires an explicit choice.
 
 ## Agent task completion
 

@@ -19,12 +19,42 @@ publication. Merely saving a file or sending a hook is not that authorization.
 Review staging and use `--include-staged` only for an approved exact selection.
 Never make manual Git commits to bypass an active ACD owner.
 
-After installation, `acd setup` recommends a copy-ready section for your global
-or repository `AGENTS.md`, or your coding tool's equivalent instruction file.
-The [shared guidance](../templates/agent-guidance.md) tells agents to check ACD
-before editing and finish authorized work after the relevant checks. Setup
-prints the recommendation without editing your instruction files. JSON setup
-results include it as `recommended_agent_instructions`.
+Run `acd setup agents` after installing ACD. The guide helps you choose tools,
+preview hook changes, and copy the [shared ACD guidance](../templates/agent-guidance.md)
+into `AGENTS.md` or your coding tool's instruction file. Regular `acd setup`
+points to this guide instead of printing the instruction copy.
+
+~~~bash
+acd setup agents
+acd setup agents --manual
+acd setup agents --integrations=codex --instructions-file=AGENTS.md --dry-run
+acd setup agents --integrations=codex --instructions-file=AGENTS.md --yes
+~~~
+
+The guide prints copy-ready commands at every preview. `--manual` and
+`--dry-run` change nothing, even with `--yes`. Outside a terminal, the default
+is also a preview. Use `--integrations=none` when you only want the instruction
+step. Hook changes reuse the existing setup transaction, including any runtime
+update shown in the preview.
+
+Instructions default to copy only. In the guide, choose `repo` for the current
+repository's `AGENTS.md`, or `file` for a global or custom path such as
+`~/.codex/AGENTS.md`. `--instructions-file PATH` selects a file directly.
+With `--repo`, relative instruction paths use that worktree's root; otherwise
+they use the current directory.
+Applying keeps unrelated content and symlinks, backs up existing content, and
+updates only the section between ACD's markers. Repeated runs do not add another
+section. Existing ACD guidance without those markers stays untouched for manual
+review. A changed file or symlink requires a fresh preview.
+
+Repository protection is a separate choice. The guide asks before including it;
+scripts must explicitly pass `--protect --repo PATH`. Configured hooks do not
+prove your coding tool has loaded them. Follow any reload instructions from
+the tool and use `acd doctor` in the repository to check protection.
+
+JSON agent previews include the copy as `recommended_agent_instructions`, plus
+the setup plan, instruction destination, and manual commands. Existing user
+instruction content is omitted from JSON.
 
 ~~~bash
 acd status

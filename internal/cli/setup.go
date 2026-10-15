@@ -90,9 +90,11 @@ provider settings are optional.
 
 After installation, interactive setup asks separately whether to protect the
 current repository. You can also run acd on in each repository.
+Run acd setup agents for guided hooks and agent instructions.
 On macOS, run setup from the terminal or coding tool that should own the
 background service. Full Disk Access is not required.`,
 		Example: `  acd setup
+  acd setup agents
   acd setup --dry-run
   acd setup --yes --non-interactive --expect-plan sha256:...`,
 		Args:         cobra.RangeArgs(0, 1),
@@ -146,6 +148,9 @@ background service. Full Disk Access is not required.`,
 	cmd.Flags().BoolVar(&onboarding.ConfirmInsecureHTTP, "confirm-insecure-http", false, "Allow unencrypted HTTP after reviewing the warning")
 	cmd.Flags().BoolVar(&onboarding.ConfirmDiffEgress, "confirm-diff-egress", false, "Allow redacted repository changes to be sent later")
 	_ = cmd.Flags().MarkHidden("raw")
+	if !initCompat {
+		cmd.AddCommand(withInvocationCapabilities(newSetupAgentsCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}))
+	}
 	return cmd
 }
 
@@ -239,22 +244,17 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	if err != nil {
 		return fmt.Errorf("acd setup: %w", err)
 	}
-	agentGuidance, err := fs.ReadFile(templatesFS, "agent-guidance.md")
-	if err != nil {
-		return fmt.Errorf("acd setup: installation succeeded, but recommended agent instructions could not be read: %w", err)
-	}
 	if jsonOut {
 		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateReady, Changed: result.Changed,
 			Actions: []productAction{{Kind: "setup", Status: "completed", Target: plan.ManagedBinary}}, Data: struct {
-				Result                       installer.Result `json:"result"`
-				Plan                         installer.Plan   `json:"plan"`
-				RecommendedAgentInstructions string           `json:"recommended_agent_instructions"`
-			}{Result: result, Plan: plan, RecommendedAgentInstructions: string(agentGuidance)}}, true)
+				Result installer.Result `json:"result"`
+				Plan   installer.Plan   `json:"plan"`
+			}{Result: result, Plan: plan}}, true)
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Setup complete.")
 	fmt.Fprintf(cmd.OutOrStdout(), "ACD version: %s\nProtection checked for enabled repositories.\n", version.String())
 	fmt.Fprintln(cmd.OutOrStdout(), "Existing repositories kept their protection settings.")
-	renderSetupAgentGuidance(cmd.OutOrStdout(), string(agentGuidance))
+	fmt.Fprintln(cmd.OutOrStdout(), "Agent setup: Run `acd setup agents` for hooks and agent instructions.")
 	if onboardingState != nil {
 		fmt.Fprintf(cmd.OutOrStdout(), "Preferences: %s, %s commits, %s provider.\n",
 			setupModeLabel(onboardingState.Draft),
@@ -271,11 +271,6 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	}
 	renderSetupNextAction(cmd.OutOrStdout(), plan)
 	return nil
-}
-
-func renderSetupAgentGuidance(out io.Writer, guidance string) {
-	fmt.Fprintln(out, "\nRecommended: add the following to your global or repository AGENTS.md (or your tool's equivalent instruction file). Setup leaves these files unchanged.")
-	fmt.Fprintf(out, "\n%s\n", guidance)
 }
 
 // Installation consent never includes repository enablement. Use the same

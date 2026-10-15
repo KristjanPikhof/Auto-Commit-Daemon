@@ -118,8 +118,12 @@ func TestFinishIntegrationHintsEmbeddedGuidance(t *testing.T) {
 func TestSetupAgentGuidanceRecommendation(t *testing.T) {
 	guidance := snippetBody(t, "agent-guidance.md")
 	var out bytes.Buffer
-	renderSetupAgentGuidance(&out, guidance)
-	if !strings.Contains(out.String(), guidance) || !strings.Contains(out.String(), "Setup leaves these files unchanged") {
+	cmd := newRootCmd()
+	cmd.SetOut(&out)
+	if err := renderSetupAgentsPlan(cmd, setupAgentsPlan{Guidance: guidance}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), guidance) || !strings.Contains(out.String(), "Copy only. Instruction files stay unchanged.") {
 		t.Fatalf("missing copy-ready recommendation: %s", out.String())
 	}
 	for _, required := range []string{"acd status", "acd finish", "relevant checks", "before handoff", "Preserve unrelated work", "Preserve user staging", "Questions and reviews do not authorize commits", "Do not", "retry finish automatically"} {
@@ -1137,7 +1141,7 @@ func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.Join(strings.Fields(out.String()), " ")
-	for _, required := range []string{"macOS", "Full Disk Access is not required", "without credentials or network access", "Intent and provider setup are optional"} {
+	for _, required := range []string{"macOS", "Full Disk Access is not required", "Fresh setup uses offline Local mode", "Intent mode and AI provider settings are optional", "acd setup agents"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("setup help missing %q:\n%s", required, got)
 		}

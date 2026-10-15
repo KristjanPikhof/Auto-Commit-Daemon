@@ -4,8 +4,10 @@
 
 ### Added
 
-- Setup recommends a copy-ready `AGENTS.md` section for checking ACD ownership
-  and finishing authorized tasks. Instruction files remain unchanged.
+- `acd setup agents` guides tool selection, previews hook and runtime changes,
+  and provides copy-ready commands and `AGENTS.md` instructions. Users can
+  apply a marked instruction section to a chosen file and explicitly enable
+  repository protection. Regular setup points to the guide.
 
 - `acd finish [PURPOSE]` freezes a fresh complete checkpoint, checks the whole
   proposed chain privately, and publishes through one branch update.
@@ -42,6 +44,9 @@
   commits, recovery preservation, active requests, and required user action.
 
 ### Fixed
+
+- Keep macOS setup hook changes tied to their reviewed preview. Changed hooks
+  require a fresh preview, and choosing no hooks stays an empty selection.
 
 - Show interrupted finish recovery in doctor, status, list, and JSON even while
   protection is scanning. Explicit support recovery preserves the saved request

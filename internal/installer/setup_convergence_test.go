@@ -51,8 +51,10 @@ func TestCompatibleSetupNoopStillChecksProtection(t *testing.T) {
 				t.Fatal(err)
 			}
 			serveRuntimeStatus(t, roots, supervisor.Status{PID: os.Getpid(), Version: version.String(), BinaryDigest: digest, Compatibility: RuntimeCompatibility()})
-			plan := Plan{Mode: "compatible_upgrade", OperationID: "noop", SourceExecutable: executable, Registry: central.NewRegistry()}
-			plan.Digest = digestPlan(plan)
+			plan, err := BuildPlan(context.Background(), roots, Options{Executable: executable, Integrations: "none"})
+			if err != nil {
+				t.Fatal(err)
+			}
 			sentinel := errors.New("checkpoint could not be confirmed")
 			calls := 0
 			result, err := Apply(context.Background(), roots, plan, ApplyOptions{Ready: func(_ context.Context, _ paths.Roots, got *central.Registry) error {
@@ -72,6 +74,51 @@ func TestCompatibleSetupNoopStillChecksProtection(t *testing.T) {
 				t.Fatalf("Apply err=%v", err)
 			}
 		})
+	}
+}
+
+func TestCompatibleSetupRejectsHookEditsAfterPreview(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("compatible upgrades use macOS session supervision")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	roots := convergenceRoots(t)
+	executable := filepath.Join(roots.State, "source")
+	if err := os.MkdirAll(roots.State, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("same binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := version.FileDigest(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveRuntimeStatus(t, roots, supervisor.Status{PID: os.Getpid(), Version: version.String(), BinaryDigest: digest, Compatibility: RuntimeCompatibility()})
+	hooks := filepath.Join(home, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(hooks), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hooks, []byte(`{"hooks":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildPlan(t.Context(), roots, Options{Executable: executable, Integrations: "codex"})
+	if err != nil || plan.Mode != "compatible_upgrade" {
+		t.Fatalf("preview: %+v: %v", plan, err)
+	}
+	later := []byte(`{"hooks":{},"later":"user edits"}`)
+	if err := os.WriteFile(hooks, later, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(t.Context(), roots, plan, ApplyOptions{}); err == nil || !strings.Contains(err.Error(), "changed after preview") {
+		t.Fatalf("stale hook preview accepted: %v", err)
+	}
+	if body, err := os.ReadFile(hooks); err != nil || string(body) != string(later) {
+		t.Fatalf("later hooks overwritten: %q: %v", body, err)
+	}
+	if _, err := os.Stat(roots.ManagedBinaryPath()); !os.IsNotExist(err) {
+		t.Fatalf("stale preview changed runtime: %v", err)
 	}
 }
 

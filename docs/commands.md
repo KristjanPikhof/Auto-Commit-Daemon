@@ -14,6 +14,7 @@ compatibility alias:
 |---|---|
 | `acd config` | Review and save global or repository settings and permissions. |
 | `acd setup` | Review installation, integrations, and an explicit runtime upgrade. |
+| `acd setup agents` | Guide hook setup, agent instructions, and optional repository protection. |
 | `acd status` | Read current protection, branch outcome, and explicit request state. |
 | `acd on` | Enable this worktree and confirm a complete checkpoint. |
 | `acd off` | Save a final checkpoint, disable protection, and stop its worker. |
@@ -34,6 +35,7 @@ such as `list` reject `--repo`; they already operate across repositories.
 ~~~bash
 acd setup --dry-run
 acd setup
+acd setup agents
 acd on
 acd off
 ~~~
@@ -75,6 +77,12 @@ state until explicitly activated. Ambiguous legacy publication can remain
 commands inspect old records without upgrading them.
 
 Setup installation and repository enablement are separate consent steps.
+For coding tools, run `acd setup agents`. It previews hook changes, prints the
+copy-ready `AGENTS.md` section, and offers to add it to a chosen instruction
+file. Use `--manual` for instructions and commands without changes, or
+`--dry-run` to preview specific options. Non-terminal runs preview by default;
+`--yes` applies the displayed options. Adding instructions and enabling
+protection are explicit choices. See [the agent setup guide](multi-tool.md).
 After installation, use `acd config` to change the finish mode, provider, or
 credentials. Setup upgrades preserve those settings and reject first-setup
 preference flags rather than ignoring them.
