@@ -31,9 +31,29 @@ func TestProductListAllNeedsActionHumanRendersThenExitsThree(t *testing.T) {
 	if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
 		t.Fatalf("exit=%d rendered=%v err=%v, want rendered exit %d", ExitCode(err), ErrorRendered(err), err, ExitActionRequired)
 	}
-	for _, want := range []string{"Saved:", "Changes:", "needs action", "no"} {
+	for _, want := range []string{"SAVED", "CHANGES", "needs action", "no"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("human output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestProductListCompactTableKeepsEveryRepository(t *testing.T) {
+	entries := make([]productListEntry, 40)
+	for index := range entries {
+		entries[index] = productListEntry{Repo: fmt.Sprintf("/repo-%02d", index), Protected: true}
+	}
+	var out bytes.Buffer
+	if err := renderProductListSelection(&out, entries, 0, false, true); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 41 || !strings.Contains(lines[0], "SAVED") || strings.Contains(out.String(), "\033") {
+		t.Fatalf("expected a header and one row per repository: %s", out.String())
+	}
+	for index := range entries {
+		if !strings.HasPrefix(lines[index+1], fmt.Sprintf("repo-%02d", index)) {
+			t.Fatalf("repository missing or reordered: %s", lines[index+1])
 		}
 	}
 }
@@ -189,7 +209,7 @@ func TestProductListPersistentFlagsAreHandled(t *testing.T) {
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("list --quiet: %v", err)
 		}
-		if !strings.Contains(out.String(), "Saved:") {
+		if !strings.Contains(out.String(), "No recently active repositories.") {
 			t.Fatalf("quiet suppressed the final result:\n%s", out.String())
 		}
 	})
@@ -312,7 +332,7 @@ func TestProductListAllControlsOnlyHumanFiltering(t *testing.T) {
 	if err := runProductListOnceView(context.Background(), &compact, false, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(compact.String(), "7 repositories hidden; use acd list --all") || strings.Contains(compact.String(), "repo-6") {
+	if !strings.Contains(compact.String(), "7 idle repositories hidden. Use acd list --all") || strings.Contains(compact.String(), "repo-6") {
 		t.Fatalf("default view did not stay compact:\n%s", compact.String())
 	}
 
@@ -617,11 +637,11 @@ func TestProductListHooksCountButWorkerHeartbeatsDoNot(t *testing.T) {
 func TestProductListCompactLabelsDisambiguateCollisions(t *testing.T) {
 	entries := []productListEntry{
 		{Repo: "/work/team/project", RepoHash: "abcdef123", State: productStateProtected},
-		{Repo: "/personal/project", RepoHash: "123456789", State: productStateProtected},
+		{Repo: "/personal/project", RepoHash: "abcdef123", State: productStateProtected},
 		{Repo: "/work/unique", State: productStateProtected},
 	}
 	labels := productListLabels(entries)
-	want := []string{"project [abcdef]", "project [123456]", "unique"}
+	want := []string{"project [91452d]", "project [547503]", "unique"}
 	for index := range want {
 		if labels[index] != want[index] {
 			t.Fatalf("label[%d]=%q, want %q", index, labels[index], want[index])
@@ -692,7 +712,7 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	}, productListRepoOverview{}, context.DeadlineExceeded)
 	if entry.ActionRequired || entry.State != productStateWaiting ||
 		productListStatus(entry) != "refreshing" || !entry.ProtectionUnknown ||
-		productListPhase(entry) != "refreshing" || !entry.PublicationOutcome.PendingClassification {
+		productListPhase(entry) != "checking protection" || !entry.PublicationOutcome.PendingClassification {
 		t.Fatalf("transient read failure became an alert: %+v", entry)
 	}
 	encoded, err := json.Marshal(entry)
@@ -703,7 +723,9 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	if err := renderProductListSelection(&out, []productListEntry{entry}, 0, false, true); err != nil {
 		t.Fatal(err)
 	}
-	if line := productListLineForRepo(t, out.String(), "repo"); !strings.Contains(line, "-     -") {
+	line := productListLineForRepo(t, out.String(), "repo")
+	columns := strings.Fields(line)
+	if len(columns) < 4 || columns[1] != "-" || columns[2] != "?" || columns[3] != "-" {
 		t.Fatalf("unknown protection was not rendered distinctly: %s", line)
 	}
 

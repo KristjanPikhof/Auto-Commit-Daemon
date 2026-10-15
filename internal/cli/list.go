@@ -1,25 +1,16 @@
 package cli
 
 import (
-	"github.com/mattn/go-isatty"
 	"os"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	_ "modernc.org/sqlite"
 )
 
 const defaultListWatchInterval = 2 * time.Second
 
-// listUseWatchMode reports whether acd list should run the live dashboard.
-// Explicit --once disables watch; explicit --watch enables it; otherwise TTY
-// stdout defaults to watch.
-func listUseWatchMode(stdout *os.File, once, watchExplicit bool) bool {
-	if once {
-		return false
-	}
-	if watchExplicit {
-		return true
-	}
+func listOutputIsTerminal(stdout *os.File) bool {
 	if stdout == nil {
 		return false
 	}

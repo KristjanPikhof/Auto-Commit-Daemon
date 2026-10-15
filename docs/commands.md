@@ -98,9 +98,14 @@ local Git commits, and the next action when needed. Use `status --verbose` or
 `--json` for saved request IDs, hashes, checks, and background process details.
 A saved checkpoint does not mean a Git commit was created.
 
-`list` uses repository blocks. Repositories requiring action remain visible;
-`--all` also shows idle repositories. Redirected `list --watch` appends dated
-updates without terminal screen controls. `on --quiet` hides the startup wait.
+`list` prints a compact table once and exits, leaving terminal scrollback
+available. Each row shows a repository's saved coverage, pending changes, mode,
+and status. Repositories requiring action remain visible, with next steps below
+the table. `--all` includes idle repositories; `--verbose` shows detailed
+repository blocks. Use `list --watch` for live refresh until Ctrl-C. Redirected
+watch output appends dated updates without terminal screen controls.
+`--once` remains an explicit alias for the default snapshot. `on --quiet` hides
+the startup wait.
 
 A failed finish can be retried after its cause is resolved. A finish needing
 attention points to `acd doctor`; retry does not bypass missing safety evidence.

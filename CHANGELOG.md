@@ -16,6 +16,10 @@
 
 ### Changed
 
+- Restore compact repository rows in `acd list`. The default prints one
+  scrollable snapshot; use `--watch` for live refresh and `--verbose` for details.
+  Linked worktrees have distinct labels even when their repository names match.
+
 - File edits, hooks, idle time, and shutdown save checkpoints without AI,
   credentials, project checks, or new publication. Startup can settle a previously
   authorized prepared mutation only from its exact saved proof. `acd off` saves
