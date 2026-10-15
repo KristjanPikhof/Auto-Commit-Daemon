@@ -19,6 +19,13 @@ publication. Merely saving a file or sending a hook is not that authorization.
 Review staging and use `--include-staged` only for an approved exact selection.
 Never make manual Git commits to bypass an active ACD owner.
 
+After installation, `acd setup` recommends a copy-ready section for your global
+or repository `AGENTS.md`, or your coding tool's equivalent instruction file.
+The [shared guidance](../templates/agent-guidance.md) tells agents to check ACD
+before editing and finish authorized work after the relevant checks. Setup
+prints the recommendation without editing your instruction files. JSON setup
+results include it as `recommended_agent_instructions`.
+
 ~~~bash
 acd status
 acd finish "Complete the approved checkout change"

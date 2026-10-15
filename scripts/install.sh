@@ -77,5 +77,6 @@ echo "     Setup explains each choice and installs the shared runtime"
 echo "  3) Enter each Git repository you want to protect"
 echo "  4) Run: acd on"
 echo "  5) Confirm: acd status"
+echo "  6) Add the AGENTS.md guidance recommended by setup to your agent instructions"
 echo
 echo "Tip: set ACD_VERSION=vYYYY-MM-DD to install a specific release."

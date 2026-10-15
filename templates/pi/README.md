@@ -18,6 +18,12 @@ quietly ignores repositories where protection is not active.
 
 Use `acd doctor` for drift and `acd uninstall --dry-run` for safe removal.
 
+## Recommended agent instructions
+
+Add the [shared ACD guidance](../agent-guidance.md) to your global or repository
+`AGENTS.md`, or your tool's equivalent instruction file. `acd setup` prints the
+recommended text without editing instruction files.
+
 ## Agent task completion
 
 Once the requested job and relevant checks are complete, call `acd finish` in

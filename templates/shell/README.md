@@ -13,6 +13,12 @@ Filesystem watching and bounded polling provide protection without it.
 Enable or disable repositories with `acd on` and `acd off`. Use
 `acd uninstall --dry-run` to preview removal of only the verified owned block.
 
+## Recommended agent instructions
+
+Add the [shared ACD guidance](../agent-guidance.md) to your global or repository
+`AGENTS.md`, or your tool's equivalent instruction file. `acd setup` prints the
+recommended text without editing instruction files.
+
 ## Agent task completion
 
 Once the requested job and relevant checks are complete, call `acd finish` in

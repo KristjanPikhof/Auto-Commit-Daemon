@@ -6,5 +6,5 @@ package templates
 
 import "embed"
 
-//go:embed claude-code codex cursor opencode pi shell
+//go:embed claude-code codex cursor opencode pi shell agent-guidance.md
 var FS embed.FS

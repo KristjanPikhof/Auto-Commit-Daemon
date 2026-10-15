@@ -239,16 +239,22 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	if err != nil {
 		return fmt.Errorf("acd setup: %w", err)
 	}
+	agentGuidance, err := fs.ReadFile(templatesFS, "agent-guidance.md")
+	if err != nil {
+		return fmt.Errorf("acd setup: installation succeeded, but recommended agent instructions could not be read: %w", err)
+	}
 	if jsonOut {
 		return renderAnyProductEnvelope(cmd.OutOrStdout(), productEnvelope{OK: true, State: productStateReady, Changed: result.Changed,
 			Actions: []productAction{{Kind: "setup", Status: "completed", Target: plan.ManagedBinary}}, Data: struct {
-				Result installer.Result `json:"result"`
-				Plan   installer.Plan   `json:"plan"`
-			}{Result: result, Plan: plan}}, true)
+				Result                       installer.Result `json:"result"`
+				Plan                         installer.Plan   `json:"plan"`
+				RecommendedAgentInstructions string           `json:"recommended_agent_instructions"`
+			}{Result: result, Plan: plan, RecommendedAgentInstructions: string(agentGuidance)}}, true)
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Setup complete.")
 	fmt.Fprintf(cmd.OutOrStdout(), "ACD version: %s\nProtection checked for enabled repositories.\n", version.String())
 	fmt.Fprintln(cmd.OutOrStdout(), "Existing repositories kept their protection settings.")
+	renderSetupAgentGuidance(cmd.OutOrStdout(), string(agentGuidance))
 	if onboardingState != nil {
 		fmt.Fprintf(cmd.OutOrStdout(), "Preferences: %s, %s commits, %s provider.\n",
 			setupModeLabel(onboardingState.Draft),
@@ -265,6 +271,11 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	}
 	renderSetupNextAction(cmd.OutOrStdout(), plan)
 	return nil
+}
+
+func renderSetupAgentGuidance(out io.Writer, guidance string) {
+	fmt.Fprintln(out, "\nRecommended: add the following to your global or repository AGENTS.md (or your tool's equivalent instruction file). Setup leaves these files unchanged.")
+	fmt.Fprintf(out, "\n%s\n", guidance)
 }
 
 // Installation consent never includes repository enablement. Use the same

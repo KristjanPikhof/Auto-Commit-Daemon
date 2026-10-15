@@ -4,6 +4,9 @@
 
 ### Added
 
+- Setup recommends a copy-ready `AGENTS.md` section for checking ACD ownership
+  and finishing authorized tasks. Instruction files remain unchanged.
+
 - `acd finish [PURPOSE]` freezes a fresh complete checkpoint, checks the whole
   proposed chain privately, and publishes through one branch update.
 - Finish supports exact messages, checked previews, explicit staged consent,
