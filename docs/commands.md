@@ -106,6 +106,15 @@ A failed finish can be retried after its cause is resolved. A finish needing
 attention points to `acd doctor`; retry does not bypass missing safety evidence.
 A retry can restart the saved request and always keeps its original changes.
 
+When a finish remains interrupted after branch or index changes, doctor points
+to `acd support recover --force --dry-run`. Review that plan, then use
+`acd support recover --force --yes` to preserve the request and release its
+block on new finishes. Recovery backs up the database and verifies the saved
+private snapshots. It preserves the original request and publication evidence;
+it does not claim completion or consume staging. Current files and branches
+stay unchanged. Review `git diff` and `git diff --cached` before a new finish.
+Missing or changed snapshot proof keeps the request blocked.
+
 Check results say whether a project command ran, an earlier result was reused,
 or no project checks were configured. Structure checks alone do not mean the
 project's tests passed.

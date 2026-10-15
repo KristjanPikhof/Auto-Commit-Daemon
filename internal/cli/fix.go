@@ -110,8 +110,11 @@ type fixAction struct {
 	RecoveryRef       string  `json:"recovery_ref,omitempty"`
 	DrainID           string  `json:"drain_id,omitempty"`
 	CheckpointID      string  `json:"checkpoint_id,omitempty"`
+	RequestID         string  `json:"request_id,omitempty"`
+	Attempt           int     `json:"attempt,omitempty"`
 	TargetEvents      *int64  `json:"target_events,omitempty"`
 	ResolvedEvents    *int64  `json:"resolved_events,omitempty"`
+	finishRequest     *state.FinishRequest
 }
 
 func newFixCmd() *cobra.Command {
@@ -335,6 +338,9 @@ func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clea
 	}
 
 	if err := planManualPauseFix(ctx, gitDir, &plan); err != nil {
+		return fixPlan{}, err
+	}
+	if err := planFinishRecovery(ctx, conn, &plan); err != nil {
 		return fixPlan{}, err
 	}
 	if err := planBackpressureFix(ctx, conn, &plan); err != nil {
@@ -865,6 +871,12 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	// never remove captured work before the hidden proof/recovery ref exists.
 	for i := range plan.Actions {
 		action := &plan.Actions[i]
+		if action.Kind == fixActionPreserveFinish {
+			if err := applyFinishRecovery(ctx, db, plan, action); err != nil {
+				return err
+			}
+			continue
+		}
 		if action.Kind != fixActionReconcileUnpublishedChain {
 			continue
 		}
@@ -893,10 +905,17 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 			plan.RowsChanged += int64(result.EventCount)
 		}
 	}
-	reconciledDrains, err := state.ReconcileResolvedPublicationDrains(
-		ctx, db, float64(time.Now().UTC().UnixNano())/1e9)
+	hasDrains, err := state.LegacyTableExists(ctx, db.SQL(), "publication_drains")
 	if err != nil {
-		return fmt.Errorf("acd fix: complete resolved publication drains: %w", err)
+		return err
+	}
+	var reconciledDrains []state.PublicationDrainReconciliation
+	if hasDrains {
+		reconciledDrains, err = state.ReconcileResolvedPublicationDrains(
+			ctx, db, float64(time.Now().UTC().UnixNano())/1e9)
+		if err != nil {
+			return fmt.Errorf("acd fix: complete resolved publication drains: %w", err)
+		}
 	}
 	for _, drain := range reconciledDrains {
 		matched := false
@@ -924,6 +943,7 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	transactional := false
 	for _, action := range plan.Actions {
 		if action.Kind != fixActionReconcileUnpublishedChain &&
+			action.Kind != fixActionPreserveFinish &&
 			action.Kind != fixActionCompleteResolvedDrain &&
 			action.Kind != fixActionClearExpiredManualPause {
 			transactional = true
@@ -948,6 +968,7 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 		nowSec := float64(time.Now().UTC().UnixNano()) / 1e9
 		for i := range plan.Actions {
 			if plan.Actions[i].Kind == fixActionReconcileUnpublishedChain ||
+				plan.Actions[i].Kind == fixActionPreserveFinish ||
 				plan.Actions[i].Kind == fixActionCompleteResolvedDrain ||
 				plan.Actions[i].Kind == fixActionClearExpiredManualPause {
 				continue
@@ -1075,6 +1096,9 @@ func revalidateFixPauseState(plan *fixPlan) error {
 
 func verifyFixPostApply(ctx context.Context, conn *sql.DB, plan *fixPlan) error {
 	var errs []string
+	if err := verifyFinishRecovery(ctx, conn, plan); err != nil {
+		errs = append(errs, err.Error())
+	}
 	hasPublicationDrains, err := sqliteTableExists(ctx, conn, "publication_drains")
 	if err != nil {
 		return fmt.Errorf("acd fix: verify publication drain ledger: %w", err)
@@ -1390,7 +1414,9 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		fmt.Fprintln(out, "Actions:")
 		for _, action := range plan.Actions {
 			target := ""
-			if action.Kind == fixActionDropGeneratedPending {
+			if action.Kind == fixActionPreserveFinish {
+				target = fmt.Sprintf(" request=%s attempt=%d checkpoint=%s", action.RequestID, action.Attempt, action.CheckpointID)
+			} else if action.Kind == fixActionDropGeneratedPending {
 				target = fmt.Sprintf(" root=%s pending=%d tracked=%d seq=%d..%d",
 					action.GeneratedRoot, action.PendingCount, action.TrackedCount, action.OldestSeq, action.NewestSeq)
 			} else if action.Kind == fixActionReconcileUnpublishedChain {

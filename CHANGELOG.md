@@ -36,6 +36,12 @@
 
 ### Fixed
 
+- Show interrupted finish recovery in doctor, status, list, and JSON even while
+  protection is scanning. Explicit support recovery preserves the saved request
+  and releases its block without changing current files, branches, or staging.
+- Retain recorded publication success when a later recovery attempt encounters
+  branch movement or changed Git state.
+
 - Shorten console messages, help, settings labels, and next steps. Keep technical
   causes in diagnostic details and preserve machine-readable values.
 - Keep repositories requiring action visible in `list`, show their next step,

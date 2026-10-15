@@ -627,6 +627,23 @@ func verifyFinishProof(ctx context.Context, repo string, p FinishPublicationProo
 	return nil
 }
 
+// WithPreservedFinishPublication proves the saved chain remains pinned while
+// explicit recovery closes its request. It makes no publication claim and
+// neither locks nor changes the current branch, HEAD, or index.
+func WithPreservedFinishPublication(ctx context.Context, repo string, p FinishPublicationProof, fn func(context.Context) error) error {
+	if err := state.ValidateFinishPublicationProof(p); err != nil {
+		return err
+	}
+	// The original branch may have moved or disappeared. Only private chain
+	// evidence is needed to preserve the request, never to publish it.
+	for _, commit := range p.Commits {
+		if err := verifyFinishCommit(ctx, repo, commit); err != nil {
+			return err
+		}
+	}
+	return WithLockedPrivateRef(ctx, repo, p.ObjectRef, p.ObjectOID, fn)
+}
+
 // WithProvenFinishPublication holds the final ref and index identity while the
 // caller completes its SQLite journal. It changes no refs, index or live files.
 func WithProvenFinishPublication(ctx context.Context, repo string, p FinishPublicationProof, fn func() error) error {

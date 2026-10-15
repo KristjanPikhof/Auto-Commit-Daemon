@@ -510,6 +510,9 @@ func finishStatusSummary(f *finishStatusReport) string {
 			return commitCountLabel(f.CommitsCreated)
 		}
 	case state.FinishFailed:
+		if f.ReasonCode == "finish_preserved" {
+			return "Interrupted finish preserved. Review current changes before a new finish."
+		}
 		return "Failed: " + consoleCause(f.Reason) + " The requested changes remain saved."
 	case state.FinishNeedsAttention:
 		return "Needs attention: " + consoleCause(f.Reason) + " The requested changes remain saved."
@@ -570,11 +573,6 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 			if f.State == state.FinishFailed {
 				res.NextAction = "After resolving the cause, run `acd finish --retry " + f.RequestID + "` to retry the same saved changes."
 			}
-			if f.State == state.FinishNeedsAttention {
-				res.OK = false
-				res.Health = controlHealthNeedsAttention
-				res.NextAction = "Run acd doctor to review the interrupted commit."
-			}
 		}
 		if res.NextAction == "No action needed." && (report.PublicationOutcome.PendingChanges > 0 || report.PublicationOutcome.WorktreeChanges > 0 || !report.PublicationOutcome.CountsKnown) {
 			res.NextAction = "Run `acd finish` when this work is complete."
@@ -592,6 +590,18 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 		}
 	}
 	applyMaintenanceStatus(res, report)
+	// Saving new edits and a blocked finish are independent. Neither a pending
+	// scan nor a maintenance warning may hide the request that blocks finish.
+	if f := report.PublicationOutcome.Finish; f != nil {
+		if f.State == state.FinishNeedsAttention {
+			res.OK = false
+			res.Health = controlHealthNeedsAttention
+			res.NextAction = "Run `acd support recover --force --dry-run` to review preserving the interrupted finish. After reviewing it, use `acd support recover --force --yes` to release its block. Current files, staging, and branches stay unchanged."
+		}
+		if f.ReasonCode == "finish_preserved" && report.Daemon == "running" && alive && report.CaptureHealth.Error == "" {
+			res.NextAction = "Review `git diff` and `git diff --cached`, then run a new `acd finish` for the current work."
+		}
+	}
 }
 
 func renderFinishStatusChecks(out io.Writer, f *finishStatusReport) {

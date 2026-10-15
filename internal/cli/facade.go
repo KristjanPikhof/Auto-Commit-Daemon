@@ -114,6 +114,9 @@ support.`,
 					return err
 				}
 				renderProductDoctorWorker(cmd.OutOrStdout(), status)
+				if f := status.PublicationOutcome.Finish; f != nil && f.State == state.FinishNeedsAttention {
+					fmt.Fprintf(cmd.OutOrStdout(), "Interrupted finish:\n  Request: %s\n  Target branch: %s\n", f.RequestID, strings.TrimPrefix(f.BranchRef, "refs/heads/"))
+				}
 				renderProductDoctorSettings(cmd.OutOrStdout(), details)
 			}
 			if envelope.State == productStateNeedsAction {
@@ -192,6 +195,13 @@ func runProductDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut
 }
 
 func renderProductDiagnoseReport(out io.Writer, report diagnoseReport) error {
+	if f := report.PublicationOutcome.Finish; f != nil && f.State == state.FinishNeedsAttention {
+		next := strings.Join(report.Remediation, " ")
+		return renderJSONEnvelope(out, productEnvelope{
+			OK: true, State: productStateNeedsAction,
+			Actions: []productAction{}, NextAction: &next, Data: report,
+		})
+	}
 	if report.OperationalState == "paused" {
 		next := "Run `acd status` to review the pause reason."
 		return renderJSONEnvelope(out, productEnvelope{
@@ -702,7 +712,7 @@ func newSupportRecoverCmd() *cobra.Command {
 	command := newFixCmd()
 	command.Use = "recover"
 	command.Short = "Preview or recover protected work that cannot publish"
-	command.Long = "Preview recovery of older saved work that ACD cannot add to Git safely.\n\nReview the plan before using --yes to apply it. Recovery does not start a new\nfinish request or rewrite current Git history. Use --force only to preserve\nunresolved work in a private recovery archive. Run acd status for current work."
+	command.Long = "Preview recovery of saved work or an interrupted finish.\n\nReview the plan before using --yes to apply it. With --force, recovery can\npreserve an interrupted finish's private snapshots and evidence, then release\nits block on new requests. This does not claim the old finish completed or\nconsume staging. Current branches, files, and staging stay unchanged. Review\ncurrent changes before starting a new finish."
 	command.Example = `  acd support recover --dry-run
   acd support recover --yes
   acd support recover --force --dry-run

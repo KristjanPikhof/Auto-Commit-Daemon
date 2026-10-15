@@ -207,6 +207,69 @@ func TestFinishFaultPreparedRestartBeforeAndAfterCAS(t *testing.T) {
 	}
 }
 
+func TestFinishInterruptedRecoveryAfterBranchAdvance(t *testing.T) {
+	f := newFinishFixture(t)
+	if result := f.Run(t, t.Context(), "off", "--json"); result.ExitCode != 0 {
+		t.Fatalf("stop fixture protection: %+v", result)
+	}
+	db, err := state.Open(t.Context(), f.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := daemon.FinishWorker{RepoPath: f.Repo, RepositoryID: f.RepositoryID, DB: db, Config: daemon.FinishWorkerConfig{Mode: "local", Style: "imperative", ConfigDigest: "approved-restart-fixture", AuthorName: "ACD Integration", AuthorEmail: "integration@example.com", VerificationMode: "none", VerificationTimeout: time.Minute}}
+	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "completed goal\n")
+	request, _, err := worker.Start(t.Context(), daemon.FinishOptions{Purpose: "Complete original goal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err = worker.Execute(t.Context(), request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a lost journal completion after the exact Git mutation.
+	if _, err := db.SQL().ExecContext(t.Context(), "UPDATE finish_requests SET state='prepared',result_json='' WHERE request_id=?", request.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runGitOK(t, f.Repo, "commit", "--allow-empty", "-m", "Advance original branch")
+	runGitOK(t, f.Repo, "switch", "-c", "next-task")
+	writeFile(t, filepath.Join(f.Repo, "staged.txt"), "new staging\n")
+	runGitOK(t, f.Repo, "add", "staged.txt")
+	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "later live edit\n")
+	head := runGitOK(t, f.Repo, "rev-parse", "HEAD")
+	index := runGitOK(t, f.Repo, "ls-files", "--stage")
+	f.Run(t, t.Context(), "on", "--json")
+	f.Barrier(t, t.Context())
+	doctor := f.Run(t, t.Context(), "doctor", "--json")
+	if doctor.ExitCode != 3 || !strings.Contains(doctor.Stdout, "recover --force --dry-run") || !strings.Contains(doctor.Stdout, request.ID) {
+		t.Fatalf("doctor omitted interrupted finish: %+v", doctor)
+	}
+	preview := f.Run(t, t.Context(), "support", "recover", "--force", "--dry-run", "--json")
+	if preview.ExitCode != 0 || !strings.Contains(preview.Stdout, "preserve_interrupted_finish") {
+		t.Fatalf("recovery preview: %+v", preview)
+	}
+	recovered := f.Run(t, t.Context(), "support", "recover", "--force", "--yes", "--json")
+	if recovered.ExitCode != 0 || !strings.Contains(recovered.Stdout, "preserved") {
+		t.Fatalf("recover interrupted request: %+v", recovered)
+	}
+	if runGitOK(t, f.Repo, "rev-parse", "HEAD") != head || runGitOK(t, f.Repo, "ls-files", "--stage") != index || strings.TrimSpace(runGitOK(t, f.Repo, "branch", "--show-current")) != "next-task" {
+		t.Fatal("recovery changed branch or staging")
+	}
+	if body, err := os.ReadFile(filepath.Join(f.Repo, "goal.txt")); err != nil || string(body) != "later live edit\n" {
+		t.Fatalf("recovery changed live edits: %q %v", body, err)
+	}
+	if state := sqliteScalar(t, f.DBPath, "SELECT reason_code FROM finish_requests WHERE request_id='"+request.ID+"'"); state != "finish_preserved" {
+		t.Fatalf("recovery state: %s", state)
+	}
+	f.Barrier(t, t.Context())
+	next := f.Run(t, t.Context(), "finish", "Complete next task", "--dry-run", "--include-staged", "--json")
+	if next.ExitCode != 0 {
+		t.Fatalf("new finish remains blocked: %+v", next)
+	}
+}
+
 func TestFinishFaultRealScannerPrivacyAndSymlink(t *testing.T) {
 	t.Parallel()
 	f := newFinishFixture(t, "ACD_SENSITIVE_GLOBS=")

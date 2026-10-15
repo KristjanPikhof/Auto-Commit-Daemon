@@ -65,6 +65,12 @@ func TestFinishPublicationJournalAndCompletion(t *testing.T) {
 	if err := json.Unmarshal(attention.Result, &reported); err != nil || !reported.Published || reported.IndexReconciled {
 		t.Fatalf("branch outcome lost %+v: %v", reported, err)
 	}
+	// A restarted worker sees a newer branch tip and returns no new proof.
+	// That observation must not erase the durable post-publication result.
+	attention, err = MarkFinishPublicationAttention(ctx, db, r.ID, r.Attempt, "Branch advanced after publication", FinishPublicationResult{})
+	if err != nil || json.Unmarshal(attention.Result, &reported) != nil || !reported.Published {
+		t.Fatalf("recovery erased publication: %+v: %v", attention, err)
+	}
 	result := partial
 	result.IndexReconciled = true
 	result.StagedConsumed = true

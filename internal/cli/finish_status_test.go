@@ -414,7 +414,7 @@ func TestFinishStatusRecoveredLegacyIsSavedNotBranchCommitted(t *testing.T) {
 	}
 	var control controlResult
 	applyControlStatusWithDaemonAlive(&control, report, true)
-	if !control.OK || !strings.Contains(control.NextAction, "acd finish") || !strings.Contains(control.Summary, "Legacy work remains preserved") {
+	if !control.OK || !strings.Contains(control.NextAction, "acd finish") || !strings.Contains(control.Summary, "Older saved work is retained separately.") {
 		t.Fatalf("migration attention blocked healthy protection %+v", control)
 	}
 	finishStatusAssertViews(t, rec, db, report)
@@ -683,7 +683,7 @@ func TestFinishStatusCompletedHistoryCannotOverrideCurrentFinish(t *testing.T) {
 			if strings.Contains(control.Summary, "old-history") || !control.OK || report.PublicationOutcome.History != nil {
 				t.Fatalf("old history overrode finish %+v", control)
 			}
-			if phase == "planning" && (!strings.Contains(control.Summary, "planning") || !report.Busy) {
+			if phase == "planning" && (!strings.Contains(control.Summary, "Preparing your commits.") || !report.Busy) {
 				t.Fatal("current planning phase lost")
 			}
 			if phase == "failed" && (!strings.Contains(control.NextAction, request.ID) || !strings.Contains(control.Summary, "Provider unavailable")) {

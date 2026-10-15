@@ -110,6 +110,14 @@ request interrupted before preparation becomes failed and needs explicit retry.
 Ambiguous finish or history publication requires attention in status and list,
 even while checkpoint protection remains healthy.
 
+For an interrupted finish, explicit support recovery can verify and retain its
+private checkpoint, target, and prepared chain, then release the request's
+block on new finishes. It keeps all original publication and staging evidence
+and makes no new publication claim. This recovery requires a reviewed
+`acd support recover --force --dry-run` followed by `--force --yes`. It leaves
+current branches, files, and staging unchanged. Startup never performs this
+recovery automatically, and missing private proof still requires attention.
+
 ## Unsafe Git states
 
 Protection continues during detached HEAD, conflicts, branch movement, and

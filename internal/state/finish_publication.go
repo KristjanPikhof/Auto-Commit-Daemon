@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 )
 
@@ -174,11 +175,45 @@ func MarkFinishPublicationAttention(ctx context.Context, db *DB, id string, atte
 	if attempt != p.Attempt || !validFinishPublicationResult(p, result) {
 		return r, ErrFinishIdentity
 	}
+	// A later recovery failure cannot undo an already observed publication.
+	var saved FinishPublicationResult
+	if json.Unmarshal(r.Result, &saved) == nil && validFinishPublicationResult(p, saved) && saved.Published {
+		if !result.Published || saved.IndexReconciled {
+			result = saved
+		}
+	}
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return r, err
 	}
 	return UpdateFinishRequest(ctx, db, id, attempt, r.State, FinishUpdate{State: FinishNeedsAttention, ReasonCode: "finish_needs_attention", Reason: reason, Result: raw})
+}
+
+// PreserveFinishRequest releases an ambiguous request only through explicit
+// recovery. The caller holds its exact private pins and the worker lock. Keep
+// all evidence, including publication uncertainty, without touching Git.
+func PreserveFinishRequest(ctx context.Context, db *DB, expected FinishRequest) error {
+	tx, cleanup, err := beginFinishWrite(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	r, err := loadFinish(ctx, tx, expected.ID)
+	if err != nil {
+		return err
+	}
+	if r.State != FinishNeedsAttention || !reflect.DeepEqual(r, expected) {
+		return ErrFinishState
+	}
+	if err := validateFinishCheckpoint(ctx, tx, r.Target); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE finish_requests SET state='failed',stage='',reason_code='finish_preserved',reason=?,updated_ts=? WHERE request_id=? AND attempt=? AND state='needs_attention'`,
+		"The interrupted finish is preserved in private snapshots. Its publication and staging evidence remain unchanged. Review current changes and start a new finish.", nowSeconds(), r.ID, r.Attempt)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func validFinishPublicationResult(p FinishPublicationProof, result FinishPublicationResult) bool {

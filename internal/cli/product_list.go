@@ -482,6 +482,9 @@ func productListStatus(entry productListEntry) string {
 		if f.State == state.FinishNeedsAttention {
 			return "finish needs review"
 		}
+		if f.ReasonCode == "finish_preserved" {
+			return "finish preserved"
+		}
 		return "finish failed"
 	}
 
