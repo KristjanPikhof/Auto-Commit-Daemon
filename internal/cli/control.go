@@ -87,9 +87,9 @@ func newOnCmd() *cobra.Command {
 		Short: "Start protecting this repository",
 		Long: `Start saving changes in this repository.
 
-On first use, ACD installs its local program and saves the current files
-included in protection. Run acd finish when you are ready to create Git
-commits.
+On first use, ACD installs its local program with offline defaults.
+It saves the current files included in protection. Run acd finish when
+you are ready to create Git commits.
 
 You can run acd on again safely. If an existing installation needs an upgrade,
 run acd setup.`,

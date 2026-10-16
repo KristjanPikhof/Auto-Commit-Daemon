@@ -104,7 +104,7 @@ func TestRepoLookupCommandsCanonicalizeSubdirBeforeRegistryLookup(t *testing.T) 
 		stateBefore := mustSHA256(t, stateDB)
 		var out bytes.Buffer
 		err = runControlOffWithForce(ctx, &out, subdir, true, false)
-		if ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "final checkpoint barrier failed") || !strings.Contains(err.Error(), "acd setup") {
+		if ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "ACD could not confirm that your latest changes are saved. Protection is still on.") || !strings.Contains(err.Error(), "acd setup") {
 			t.Fatalf("off must require a proven checkpoint before disabling without an installed runtime: %v", err)
 		}
 		if out.Len() != 0 || mustSHA256(t, roots.RegistryPath()) != registryBefore || mustSHA256(t, stateDB) != stateBefore {
@@ -233,7 +233,7 @@ func TestRepoLookupRejectsNonGitWithoutRegistryMutation(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected non-Git error")
 			}
-			if !strings.Contains(err.Error(), "not inside a Git worktree") {
+			if !strings.Contains(err.Error(), "not in a Git repository") {
 				t.Fatalf("expected clear non-Git error, got %v", err)
 			}
 			if _, statErr := os.Stat(roots.RegistryPath()); !os.IsNotExist(statErr) {

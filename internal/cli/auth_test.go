@@ -55,7 +55,7 @@ func TestAuthSetStatusAndRemove(t *testing.T) {
 		t.Fatal("auth remove succeeded without --yes")
 	}
 	out, _, err = executeAuth(t, "", "config", "credentials", "remove", "--yes")
-	if err != nil || !strings.Contains(out, "Removed") {
+	if err != nil || !strings.Contains(out, "Saved API key removed.") {
 		t.Fatalf("auth remove out=%q err=%v", out, err)
 	}
 }

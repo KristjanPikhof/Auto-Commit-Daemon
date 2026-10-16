@@ -177,11 +177,13 @@ VALUES (%f, 'blocked', 'watch.txt', 'before-state mismatch', 'blocked_conflict',
 		t.Fatalf("insert watched decision: %v\n%s", err, out)
 	}
 
+	var watched strings.Builder
 	deadline := time.After(5 * time.Second)
 	for {
 		select {
 		case line := <-lines:
-			if strings.Contains(line, "blocked") && strings.Contains(line, "watch.txt") {
+			watched.WriteString(line + "\n")
+			if strings.Contains(watched.String(), `Path: "watch.txt"`) && strings.Contains(watched.String(), "Action: blocked conflict") && strings.Contains(watched.String(), "watch observed this decision") {
 				stopWatch()
 				_ = cmd.Wait()
 				<-scanDone

@@ -65,7 +65,7 @@ func TestFinishHistoryRewriteCLICanonicalPreviewApplyAndReadonlyShow(t *testing.
 	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, true); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "every output tree was verified") {
+	if !strings.Contains(out.String(), "Each proposed commit passed the configured verification.") {
 		t.Fatal(out.String())
 	}
 	if head, _ := git.RevParse(t.Context(), runtime.worktree.Root, "HEAD"); head != plan.ExpectedHead {

@@ -67,8 +67,12 @@ func newRewriteCommitsCmd() *cobra.Command {
 3. Review it with --show-plan or --edit.
 4. Preview with --apply PLAN --dry-run, then apply with --apply PLAN --yes.
 
-Applying changes Git history. ACD creates a private backup first. Merge
-commits are not supported. Your working files stay unchanged.
+Use a saved plan ID or a standalone plan file. The --edit option opens
+$EDITOR so you can review and change the plan before applying it.
+Normal ACD protection never runs this command.
+
+Applying changes Git history. ACD creates a private backup ref first.
+Merge commits are not supported. Your working files stay unchanged.
 
 Local mode preserves original order and grouping. Intent mode can regroup
 completed work. Use --messages-only to preserve each selected commit,

@@ -202,7 +202,7 @@ func TestFinishWorkerStagedOverlayAndExcludedBase(t *testing.T) {
 		t.Fatal("sensitive live bytes changed")
 	}
 	finishWorkerGit(t, f.dir, "add", "-f", ".env")
-	if _, _, err := w.Start(context.Background(), FinishOptions{IncludeStaged: true}); err == nil || !strings.Contains(err.Error(), "staged_scope_excluded") {
+	if _, _, err := w.Start(context.Background(), FinishOptions{IncludeStaged: true}); err == nil || !strings.Contains(err.Error(), "Your staged selection includes an item ACD does not protect.") {
 		t.Fatalf("excluded staged consent bypass: %v", err)
 	}
 }
@@ -226,7 +226,7 @@ func TestFinishWorkerPreservesGitlinks(t *testing.T) {
 		t.Fatalf("Gitlink preview %+v: %v", completed, err)
 	}
 	finishWorkerGit(t, f.dir, "update-index", "--cacheinfo", "160000,"+finishWorkerGit(t, f.dir, "rev-parse", "HEAD")+",vendor/sdk")
-	if _, _, err := w.Start(context.Background(), FinishOptions{IncludeStaged: true}); err == nil || !strings.Contains(err.Error(), "staged_scope_excluded") {
+	if _, _, err := w.Start(context.Background(), FinishOptions{IncludeStaged: true}); err == nil || !strings.Contains(err.Error(), "Your staged selection includes an item ACD does not protect.") {
 		t.Fatalf("staged Gitlink accepted: %v", err)
 	}
 }

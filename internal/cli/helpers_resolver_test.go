@@ -75,7 +75,7 @@ func TestResolveRepoRejectsNonGitDirectory(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected non-Git directory error")
 	}
-	if !strings.Contains(err.Error(), "not inside a Git worktree") {
+	if !strings.Contains(err.Error(), "not in a Git repository") {
 		t.Fatalf("expected clear not-in-worktree message, got %v", err)
 	}
 }
