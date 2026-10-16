@@ -101,10 +101,20 @@ current coverage. Saved history remains available.
 
 ## Console output
 
-Normal output shows whether checked changes are saved, whether they are in
-local Git commits, and the next action when needed. Use `status --verbose` or
-`--json` for saved request IDs, hashes, checks, and background process details.
+Normal output leads with current protection and Git commit status.
+`Action required` marks a problem ACD cannot safely resolve on its own.
+Suggestions such as finishing saved work or configuring hooks are labeled
+`Optional`. ACD handles protection scans and automatic capture retries itself.
+Creating commits and approving recovery remain explicit user decisions.
+Use `status --verbose` or `--json` for saved request IDs, hashes, checks, and
+background process details.
 A saved checkpoint does not mean a Git commit was created.
+
+An old failed finish does not require a retry when current work is already
+committed. Normal status omits that failure; verbose output and JSON retain the
+saved request. When current work is ready, a new `acd finish` uses current files.
+Setup prints each phase once, with progress reminders only while a phase takes
+time, instead of printing every repository check.
 
 `list` prints a compact table once and exits, leaving terminal scrollback
 available. Each row shows a repository's saved coverage, pending changes, mode,

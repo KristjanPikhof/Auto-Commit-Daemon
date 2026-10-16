@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,6 +68,43 @@ func TestFinishWorkflowRepeatedReleaseBumps(t *testing.T) {
 			t.Fatalf("build %d left changes: %s", build, dirty)
 		}
 		assertFinishWorkflowStatus(t, ctx, f, true)
+	}
+}
+
+func TestFinishWorkflowCommittedWorkIgnoresOldFailedRequest(t *testing.T) {
+	var calls atomic.Int32
+	f := finishIntentFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeFinishChatArguments(t, w, `{"goals":[{"purpose":"Unrecorded work","message":"Complete unrecorded work","change_ids":["not-recorded"]}]}`)
+	}, "10s")
+	writeFile(t, filepath.Join(f.Repo, "version.txt"), "174\n")
+	failed := finishRunJSON(t, f, "finish", "Update release version")
+	if failed.OK || failed.Data.State != state.FinishFailed || calls.Load() != 2 {
+		t.Fatalf("request did not fail as expected: %+v, calls=%d", failed, calls.Load())
+	}
+	writeFile(t, filepath.Join(f.Repo, "version.txt"), "175\n")
+	runGitOK(t, f.Repo, "add", "version.txt")
+	runGitOK(t, f.Repo, "commit", "-m", "Update release version")
+	f.Barrier(t, t.Context())
+	assertFinishWorkflowStatus(t, t.Context(), f, true)
+	for _, command := range []string{"status", "on"} {
+		result := f.Run(t, t.Context(), command)
+		if result.ExitCode != 0 || !strings.Contains(result.Stdout, "No action needed.") {
+			t.Fatalf("%s lost current state: %+v", command, result)
+		}
+		for _, unwanted := range []string{"--retry", failed.Data.ID, "invalid_provider_plan", "Later changes:"} {
+			if strings.Contains(result.Stdout, unwanted) {
+				t.Fatalf("%s presented old request as a task:\n%s", command, result.Stdout)
+			}
+		}
+		t.Logf("%s:\n%s", command, result.Stdout)
+	}
+	detailed := f.Run(t, t.Context(), "status", "--verbose")
+	if detailed.ExitCode != 0 || !strings.Contains(detailed.Stdout, failed.Data.ID) {
+		t.Fatalf("verbose output lost request evidence: %+v", detailed)
+	}
+	if calls.Load() != 2 {
+		t.Fatal("status or protection retried the provider automatically")
 	}
 }
 

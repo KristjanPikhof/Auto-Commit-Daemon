@@ -1132,6 +1132,20 @@ func TestSetupProgressIsSilentForQuietOrJSON(t *testing.T) {
 	}
 }
 
+func TestSetupProgressCollapsesRepositoryUpdates(t *testing.T) {
+	var out bytes.Buffer
+	progress := newSetupProgress(&out, false, 0)
+	progress.Update(installer.Progress{Phase: "readiness", Detail: "Checking repository protection"})
+	for _, detail := range []string{"Repositories ready: 0 of 2", "Repositories ready: 2 of 2", "Checking saved changes 1 of 2: /first/repository", "Checking saved changes 2 of 2: /second/repository"} {
+		progress.Update(installer.Progress{Phase: "readiness", Detail: detail})
+	}
+	progress.Update(installer.Progress{Phase: "completed", Detail: "Setup completed"})
+	progress.Close()
+	if got, want := out.String(), "Setup: Checking repository protection\nSetup: Setup completed\n"; got != want {
+		t.Fatalf("repository checks flooded output:\n%s", got)
+	}
+}
+
 func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
 	cmd := newSetupCmd()
 	var out bytes.Buffer

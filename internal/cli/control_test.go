@@ -623,7 +623,7 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
 		t.Fatalf("runControlStatus: %v", err)
 	}
-	for _, line := range []string{"Protection:", "Last checked changes saved:", "Git commits:", "Next:"} {
+	for _, line := range []string{"Protection:", "Git commits:", "Optional:"} {
 		if got := strings.Count(out.String(), line); got != 1 {
 			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
 		}

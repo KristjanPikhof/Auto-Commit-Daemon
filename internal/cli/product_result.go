@@ -158,17 +158,32 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 		}
 	}
 	fmt.Fprintf(out, "Protection: %s\n", onOff(data.Enabled))
-	fmt.Fprintf(out, "Last checked changes saved: %s\n", yesNo(data.Protected))
-	fmt.Fprintf(out, "Git commits: %s\n", publicationOutcomeLabel(data.PublicationOutcome, data.PublicationProgress))
+	if data.AllChangesCommittedInGit && data.PublicationOutcome.CountsKnown && data.PublicationOutcome.PendingChanges == 0 {
+		fmt.Fprintln(out, "Git commits: all current changes are committed.")
+	} else {
+		fmt.Fprintf(out, "Git commits: %s\n", publicationOutcomeLabel(data.PublicationOutcome, data.PublicationProgress))
+	}
+	if data.Enabled && !data.ActionRequired {
+		switch {
+		case data.CaptureHealth.State == "retrying":
+			fmt.Fprintln(out, "ACD is retrying automatically. Other readable changes remain saved.")
+		case !data.Protected && data.Worker == "running":
+			fmt.Fprintln(out, "ACD is checking and saving the latest changes automatically.")
+		}
+	}
 	if data.PublicationOutcome.CheckpointAvailable {
 		if !data.PublicationOutcome.CountsKnown || data.PublicationOutcome.WorktreeChanges != data.PublicationOutcome.PendingChanges {
 			renderFinishUncommitted(out, data.PublicationOutcome)
 		}
-		if f := data.PublicationOutcome.Finish; f != nil {
-			fmt.Fprintf(out, "Finish: %s\n", consoleProse(finishStatusSummary(f)))
-			renderFinishStatusChecks(out, f)
+		if f := data.PublicationOutcome.Finish; finishStatusTakesPriority(f) {
+			switch f.State {
+			case state.FinishNeedsAttention:
+				fmt.Fprintln(out, "Finish needs attention. The requested changes remain saved.")
+			default:
+				fmt.Fprintln(out, finishStatusSummary(f))
+			}
 		}
-		if data.PublicationOutcome.LaterChanges > 0 {
+		if data.Busy && data.PublicationOutcome.LaterChanges > 0 {
 			fmt.Fprintf(out, "Later changes: %d changed items for the next finish\n", data.PublicationOutcome.LaterChanges)
 		}
 
@@ -185,7 +200,7 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	if data.PublicationOutcome.RecoveredChanges > 0 {
 		fmt.Fprintf(out, "Recovery: %d changes saved separately from the branch\n", data.PublicationOutcome.RecoveredChanges)
 	}
-	if data.ActionRequired && data.Summary != "" && data.PublicationOutcome.Finish == nil {
+	if data.ActionRequired && data.Summary != "" && (!finishStatusTakesPriority(data.PublicationOutcome.Finish) || data.CaptureHealth.Error != "") {
 		summary := data.Summary
 		if maintenance := data.CheckpointMaintenance.Summary(); maintenance != "" {
 			if before, _, found := strings.Cut(summary, maintenance); found {
@@ -196,9 +211,15 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 
 	}
 	if envelope.NextAction == nil {
-		fmt.Fprintln(out, "Next: No action needed.")
+		if data.ActionRequired {
+			fmt.Fprintln(out, "\nAction required: Run `acd doctor` to inspect the problem.")
+		} else {
+			fmt.Fprintln(out, "No action needed.")
+		}
+	} else if data.ActionRequired {
+		fmt.Fprintf(out, "\nAction required: %s\n", consoleProse(*envelope.NextAction))
 	} else {
-		fmt.Fprintf(out, "Next: %s\n", *envelope.NextAction)
+		fmt.Fprintf(out, "\nOptional: %s\n", consoleProse(*envelope.NextAction))
 	}
 	return nil
 }
@@ -210,6 +231,9 @@ func publicationOutcomeLabel(outcome publicationOutcome, progress publicationPro
 		}
 		if *outcome.BranchCommitted {
 			return "saved work is committed on this branch"
+		}
+		if outcome.PendingChanges == 1 {
+			return "1 saved item waiting for acd finish"
 		}
 		return fmt.Sprintf("%d saved items waiting for acd finish", outcome.PendingChanges)
 	}

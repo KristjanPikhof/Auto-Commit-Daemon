@@ -384,7 +384,7 @@ func productListTarget(entry productListEntry) string {
 	if h := entry.PublicationOutcome.History; h != nil {
 		return "history:" + h.PlanID[:min(8, len(h.PlanID))]
 	}
-	if f := entry.PublicationOutcome.Finish; f != nil {
+	if f := entry.PublicationOutcome.Finish; f != nil && f.State != state.FinishFailed {
 		return "finish:" + f.RequestID[:min(8, len(f.RequestID))]
 	}
 	return "-"
@@ -404,7 +404,7 @@ func productListPhase(entry productListEntry) string {
 		if h := entry.PublicationOutcome.History; h != nil {
 			return "history-" + h.State
 		}
-		if f := entry.PublicationOutcome.Finish; f != nil {
+		if f := entry.PublicationOutcome.Finish; f != nil && f.State != state.FinishFailed {
 			if f.Stage != "" {
 				return f.Stage
 			}
@@ -506,14 +506,8 @@ func productListDisplayStatus(entry productListEntry) string {
 }
 
 func productListStatus(entry productListEntry) string {
-	if f := entry.PublicationOutcome.Finish; entry.PublicationOutcome.CheckpointAvailable && f != nil && (f.State == state.FinishFailed || f.State == state.FinishNeedsAttention) {
-		if f.State == state.FinishNeedsAttention {
-			return "finish needs review"
-		}
-		if f.ReasonCode == "finish_preserved" {
-			return "finish preserved"
-		}
-		return "finish failed"
+	if f := entry.PublicationOutcome.Finish; entry.PublicationOutcome.CheckpointAvailable && f != nil && f.State == state.FinishNeedsAttention {
+		return "finish needs review"
 	}
 
 	switch {

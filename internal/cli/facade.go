@@ -58,6 +58,7 @@ the exact next command to run.`,
 			if err := renderControl(cmd.OutOrStdout(), result, false); err != nil {
 				return err
 			}
+			renderFinishRequestDetails(cmd.OutOrStdout(), result.PublicationOutcome.Finish)
 			renderProductPublicationProgress(cmd.OutOrStdout(), result.PublicationProgress)
 			if detail := maintenanceDetails(result.CheckpointMaintenance); detail != "" {
 				fmt.Fprintln(cmd.OutOrStdout(), consoleProse(detail))
@@ -114,9 +115,7 @@ support.`,
 					return err
 				}
 				renderProductDoctorWorker(cmd.OutOrStdout(), status)
-				if f := status.PublicationOutcome.Finish; f != nil && f.State == state.FinishNeedsAttention {
-					fmt.Fprintf(cmd.OutOrStdout(), "Interrupted finish:\n  Request: %s\n  Target branch: %s\n", f.RequestID, strings.TrimPrefix(f.BranchRef, "refs/heads/"))
-				}
+				renderFinishRequestDetails(cmd.OutOrStdout(), status.PublicationOutcome.Finish)
 				renderProductDoctorSettings(cmd.OutOrStdout(), details)
 			}
 			if envelope.State == productStateNeedsAction {
@@ -128,6 +127,19 @@ support.`,
 	cmd.Flags().BoolVar(&bundle, "bundle", false, "Create a sanitized support archive")
 	cmd.Flags().StringVar(&output, "output", "", "Folder for the support archive")
 	return cmd
+}
+
+func renderFinishRequestDetails(out io.Writer, f *finishStatusReport) {
+	if f == nil {
+		return
+	}
+	heading := "Last finish"
+	if f.State == state.FinishNeedsAttention {
+		heading = "Interrupted finish"
+	}
+	fmt.Fprintf(out, "\n%s:\n  Request: %s\n  Target branch: %s\n  Result: %s\n",
+		heading, f.RequestID, strings.TrimPrefix(f.BranchRef, "refs/heads/"), consoleProse(finishStatusSummary(f)))
+	renderFinishStatusChecks(out, f)
 }
 
 func renderProductDoctorWorker(out io.Writer, status controlResult) {

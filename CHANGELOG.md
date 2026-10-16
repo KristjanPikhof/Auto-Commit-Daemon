@@ -45,6 +45,11 @@
 
 ### Fixed
 
+- Keep old failed finish requests out of current status and retry suggestions
+  when current work is already committed. Retain request details in verbose
+  output and JSON. Separate optional commands from required actions, report
+  automatic retries as automatic, and collapse repeated setup progress.
+
 - Record finish completion before releasing Git locks, avoiding a race that left
   successful commits marked as needing attention.
   Retain the filesystem cause when acquiring a Git lock fails.

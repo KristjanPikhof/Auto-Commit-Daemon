@@ -213,7 +213,7 @@ func productListReadTransient(err error) bool {
 
 func productListHasIndependentAttention(report statusReport) bool {
 	f := report.PublicationOutcome.Finish
-	return report.CheckpointRetentionOverBudget || report.CheckpointMaintenance.NeedsAction() || report.checkpointNeedsAction || report.CaptureHealth.State == "blocked" || (f != nil && (f.State == state.FinishFailed || f.State == state.FinishNeedsAttention))
+	return report.CheckpointRetentionOverBudget || report.CheckpointMaintenance.NeedsAction() || report.checkpointNeedsAction || report.CaptureHealth.State == "blocked" || (f != nil && f.State == state.FinishNeedsAttention)
 }
 
 func readProductListRepo(ctx context.Context, record central.RepoRecord, now time.Time) (overview productListRepoOverview, err error) {

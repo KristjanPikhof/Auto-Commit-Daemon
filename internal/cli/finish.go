@@ -209,7 +209,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			for _, step := range plan.Steps {
 				fmt.Fprintf(out, "%s\n  %s\n", consoleProse(step.Message), finishCheckLabel(step.Check))
 			}
-			fmt.Fprintln(out, "Next: Run `acd finish` when the current work is ready.")
+			fmt.Fprintln(out, "Optional: Run `acd finish` when the current work is ready.")
 		default:
 			fmt.Fprintln(out, commitCountLabel(result.CommitsCreated))
 		}
@@ -228,7 +228,11 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			fmt.Fprintf(out, "Current working copy: %d changed items outside Git commits.\n", count)
 		}
 		if next != "" {
-			fmt.Fprintf(out, "Next: %s\n", next)
+			label := "Optional"
+			if r.State == state.FinishNeedsAttention {
+				label = "Action required"
+			}
+			fmt.Fprintf(out, "\n%s: %s\n", label, next)
 			if detached || r.State == state.FinishFailed {
 				fmt.Fprintln(out, "Retry reconnects to this request or restarts it after failure, using the same saved changes.")
 			}
