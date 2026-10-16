@@ -396,7 +396,7 @@ func TestFinishWorkerCommandChecksAndRestart(t *testing.T) {
 				if _, err := state.PrepareFinishPublication(context.Background(), f.db, r.ID, r.Attempt, p, json.RawMessage(`{"steps":1}`)); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := git.ApplyFinishPublication(context.Background(), wt.Root, p, false); err != nil {
+				if _, err := git.ApplyFinishPublication(context.Background(), wt.Root, p, false, nil); err != nil {
 					t.Fatal(err)
 				}
 				recovery := &FinishWorker{RepoPath: f.dir, DB: f.db}

@@ -171,7 +171,7 @@ func TestFinishFaultPreparedRestartBeforeAndAfterCAS(t *testing.T) {
 				t.Fatalf("prepare: target=%+v proof=%+v err=%v", request.Target, proof, err)
 			}
 			if applied {
-				if _, err := gitpkg.ApplyFinishPublication(t.Context(), f.Repo, proof, false); err != nil {
+				if _, err := gitpkg.ApplyFinishPublication(t.Context(), f.Repo, proof, false, nil); err != nil {
 					db.Close()
 					t.Fatal(err)
 				}

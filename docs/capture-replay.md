@@ -107,6 +107,9 @@ silently overwritten. Working files stay unchanged. After a crash, exact
 prepared proof can complete forward; ambiguity requires attention. A running
 request interrupted before preparation becomes failed and needs explicit retry.
 
+Finish holds the index and prepared ref locks until completion is recorded.
+Lock failures retain the underlying filesystem error in diagnostic details.
+
 Ambiguous finish or history publication requires attention in status and list,
 even while checkpoint protection remains healthy.
 

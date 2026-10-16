@@ -363,7 +363,7 @@ func acquireFinishLock(path, token string, resume bool) (func(), error) {
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrFinishLock, filepath.Base(path))
+		return nil, fmt.Errorf("%w: %s: %w", ErrFinishLock, filepath.Base(path), err)
 	}
 	release := func() {
 		_ = file.Close()
@@ -403,11 +403,13 @@ func syncFinishDirectory(path string) error {
 // ApplyFinishPublication accepts only an already-journaled proof. Resume must
 // be used exclusively by the canonical worker after it proves the previous
 // owner has stopped. It can reclaim this proof's exact lock markers only.
-func ApplyFinishPublication(ctx context.Context, repo string, proof FinishPublicationProof, resume bool) (FinishPublicationResult, error) {
-	return applyFinishPublication(ctx, repo, proof, resume, nil)
+// The completion callback records the journal result while the exact refs and
+// index remain locked. Nil applies the Git transition without completing a journal.
+func ApplyFinishPublication(ctx context.Context, repo string, proof FinishPublicationProof, resume bool, complete func(FinishPublicationResult) error) (FinishPublicationResult, error) {
+	return applyFinishPublication(ctx, repo, proof, resume, complete, nil)
 }
 
-func applyFinishPublication(ctx context.Context, repo string, p FinishPublicationProof, resume bool, fault func(string) error) (FinishPublicationResult, error) {
+func applyFinishPublication(ctx context.Context, repo string, p FinishPublicationProof, resume bool, complete func(FinishPublicationResult) error, fault func(string) error) (FinishPublicationResult, error) {
 	var result FinishPublicationResult
 	if err := state.ValidateFinishPublicationProof(p); err != nil {
 		return result, err
@@ -556,6 +558,9 @@ func applyFinishPublication(ctx context.Context, repo string, p FinishPublicatio
 		if current == p.CleanIndexDigest {
 			result.IndexReconciled = true
 			result.StagedConsumed = p.IncludeStaged
+			if complete != nil {
+				return complete(result)
+			}
 			return nil
 		}
 		if current != p.IndexDigest {
@@ -596,7 +601,13 @@ func applyFinishPublication(ctx context.Context, repo string, p FinishPublicatio
 		}
 		result.IndexReconciled = true
 		result.StagedConsumed = p.IncludeStaged
-		return boundary("after_index")
+		if err := boundary("after_index"); err != nil {
+			return err
+		}
+		if complete != nil {
+			return complete(result)
+		}
+		return nil
 	})
 	return result, err
 }
@@ -642,43 +653,4 @@ func WithPreservedFinishPublication(ctx context.Context, repo string, p FinishPu
 		}
 	}
 	return WithLockedPrivateRef(ctx, repo, p.ObjectRef, p.ObjectOID, fn)
-}
-
-// WithProvenFinishPublication holds the final ref and index identity while the
-// caller completes its SQLite journal. It changes no refs, index or live files.
-func WithProvenFinishPublication(ctx context.Context, repo string, p FinishPublicationProof, fn func() error) error {
-	if err := state.ValidateFinishPublicationProof(p); err != nil {
-		return err
-	}
-	if err := verifyFinishProof(ctx, repo, p); err != nil {
-		return err
-	}
-	worktree, err := ResolveWorktree(ctx, repo)
-	if err != nil {
-		return err
-	}
-	if worktree.GitDir != p.GitDir {
-		return ErrFinishUnsafe
-	}
-	release, err := acquireFinishLock(filepath.Join(worktree.GitDir, "index.lock"), p.LockToken, false)
-	if err != nil {
-		return err
-	}
-	defer release()
-	headIdentity, err := finishHeadIdentity(ctx, repo, worktree.GitDir, p.BranchRef)
-	if err != nil {
-		return err
-	}
-	return withLockedExpectedRef(ctx, repo, p.BranchRef, p.NewHead, p.ObjectRef, p.ObjectOID, false, func(lockCtx context.Context) error {
-		if err := verifyFinishHeadIdentity(worktree.GitDir, headIdentity); err != nil {
-			return err
-		}
-		if err := ensureDirectFinishRef(lockCtx, repo, p.ObjectRef); err != nil {
-			return err
-		}
-		if err := CheckFinishPublicationSafety(lockCtx, repo, p.BranchRef, p.NewHead, p.CleanIndexDigest, true); err != nil {
-			return err
-		}
-		return fn()
-	})
 }

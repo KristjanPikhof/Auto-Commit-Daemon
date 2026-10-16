@@ -45,6 +45,10 @@
 
 ### Fixed
 
+- Record finish completion before releasing Git locks, avoiding a race that left
+  successful commits marked as needing attention.
+  Retain the filesystem cause when acquiring a Git lock fails.
+
 - Keep macOS setup hook changes tied to their reviewed preview. Changed hooks
   require a fresh preview, and choosing no hooks stays an empty selection.
 

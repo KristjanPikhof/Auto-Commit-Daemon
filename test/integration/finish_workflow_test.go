@@ -47,6 +47,28 @@ func decodeFinishWorkflow(t *testing.T, result ExecResult) finishWorkflowResult 
 	return envelope.Data
 }
 
+func TestFinishWorkflowRepeatedReleaseBumps(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	f := newFinishFixture(t)
+	for build := 174; build <= 175; build++ {
+		body := fmt.Sprintf("CURRENT_PROJECT_VERSION = %d;\n", build)
+		writeFile(t, filepath.Join(f.Repo, "project.pbxproj"), body)
+		f.Barrier(t, ctx)
+		result := decodeFinishWorkflow(t, f.Run(t, ctx, "finish", "Update release build number", "--json"))
+		if result.State != state.FinishCompleted || !result.Published || result.CommitsCreated != 1 {
+			t.Fatalf("build %d finish: %+v", build, result)
+		}
+		if got := runGitOK(t, f.Repo, "show", "HEAD:project.pbxproj"); got != body {
+			t.Fatalf("build %d committed %q", build, got)
+		}
+		if dirty := runGitOK(t, f.Repo, "status", "--porcelain"); dirty != "" {
+			t.Fatalf("build %d left changes: %s", build, dirty)
+		}
+		assertFinishWorkflowStatus(t, ctx, f, true)
+	}
+}
+
 func TestFinishWorkflowModesStylesAndCompleteGoals(t *testing.T) {
 	for _, mode := range []string{"local", "intent"} {
 		for _, style := range []string{finish.StyleImperative, finish.StyleConventional} {
