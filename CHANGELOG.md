@@ -18,6 +18,8 @@
 
 ### Changed
 
+- Allow repeated setup in repositories created with the finish workflow while
+  background checkpoints continue.
 - Restore compact repository rows in `acd list`. The default prints one
   scrollable snapshot; use `--watch` for live refresh and `--verbose` for details.
   Linked worktrees have distinct labels even when their repository names match.

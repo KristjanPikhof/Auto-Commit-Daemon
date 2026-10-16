@@ -70,7 +70,9 @@ require their exact permissions. HTTP additionally needs
 and provider redirects are refused.
 
 Setup preview writes nothing and runs no provider, service, migration, or Git
-mutation. Apply uses the reviewed plan and preserves database backups and private
+mutation. In repositories created with the finish workflow, ordinary background
+saves do not invalidate a reviewed setup plan. Changes to preserved legacy
+evidence still require a new preview. Apply preserves database backups and private
 provenance during an incompatible upgrade. Disabled repositories keep their old
 state until explicitly activated. Ambiguous legacy publication can remain
 `needs_attention` without blocking current protection, finish, or history rewrite. Current read-only
