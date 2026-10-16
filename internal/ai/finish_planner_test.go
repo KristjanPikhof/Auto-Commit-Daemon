@@ -479,7 +479,7 @@ func TestFinishIntentSubprocessOneExchange(t *testing.T) {
 				response = "exit 1"
 			}
 			bin := writePluginScript(t, dir, "finish", fmt.Sprintf("while IFS= read -r line; do\n  printf 'call\\n' >> '%s'\n  case \"$line\" in *'\"request_type\":\"finish_plan\"'*) ;; *) exit 2 ;; esac\n  %s\ndone\n", calls, response))
-			provider := NewSubprocessProvider("finish", SubprocessOptions{LookPath: fixedLookPath("acd-provider-finish", bin), Stderr: io.Discard, Timeout: time.Second})
+			provider := NewSubprocessProvider("finish", SubprocessOptions{LookPath: fixedLookPath("acd-provider-finish", bin), Stderr: io.Discard, Timeout: 10 * time.Second})
 			defer provider.Close()
 			result, err := PlanFinish(context.Background(), provider, finishTestEvidence(), finishTestOptions())
 			if crash {

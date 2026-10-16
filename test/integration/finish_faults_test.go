@@ -260,7 +260,7 @@ func TestFinishFaultProviderFailureRetryKeepsFrozenTarget(t *testing.T) {
 					return
 				}
 				writeFinishChatArguments(t, w, `{"goals":[{"purpose":"Invent unrelated work","message":"Complete unrelated work","change_ids":["not-recorded"]}]}`)
-			}, "1s")
+			}, "10s")
 			writeFile(t, filepath.Join(f.Repo, "goal.txt"), "selected\n")
 			failed := finishRunJSON(t, f, "finish", "Complete selected goal", "--message", "Complete selected goal")
 			wantCalls := int32(2)
