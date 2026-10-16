@@ -8,13 +8,16 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 func TestSetupAgentsGuidedDeclineAndApply(t *testing.T) {
-	f := newFinishFixture(t)
+	f := newAgentSetupFixture(t)
 	home := envValue(f.Env, "HOME")
 	hooks := filepath.Join(home, ".codex", "hooks.json")
 	instructions := filepath.Join(f.Repo, "AGENTS.md")
@@ -76,7 +79,7 @@ func TestSetupAgentsGuidedDeclineAndApply(t *testing.T) {
 }
 
 func TestSetupAgentsProtectionRequiresExplicitSelection(t *testing.T) {
-	f := newFinishFixture(t)
+	f := newAgentSetupFixture(t)
 	repo := tempRepo(t)
 	writeFile(t, filepath.Join(repo, "goal.txt"), "new protected work\n")
 	preview := runAcd(t, t.Context(), f.Env, "--repo", repo, "setup", "agents", "--integrations=none", "--protect", "--dry-run", "--json")
@@ -91,7 +94,60 @@ func TestSetupAgentsProtectionRequiresExplicitSelection(t *testing.T) {
 		t.Fatalf("explicit protection: %+v", applied)
 	}
 	status := runAcd(t, t.Context(), f.Env, "--repo", repo, "status", "--json")
-	if status.ExitCode != 0 || !strings.Contains(status.Stdout, `"protected": true`) {
-		t.Fatalf("protection not confirmed: %+v", status)
+	var report struct {
+		Data struct {
+			Enabled        bool   `json:"enabled"`
+			ActionRequired bool   `json:"action_required"`
+			CheckpointID   string `json:"checkpoint_id"`
+		} `json:"data"`
 	}
+	if err := json.Unmarshal([]byte(status.Stdout), &report); err != nil || status.ExitCode != 0 || !report.Data.Enabled || report.Data.ActionRequired || report.Data.CheckpointID == "" {
+		t.Fatalf("protection not confirmed: %+v: %v", status, err)
+	}
+	// Status may observe the next automatic scan. Prove the enabled repository
+	// already has the promised durable checkpoint rather than requiring idle time.
+	checkpoint, err := state.ResolveCheckpoint(t.Context(), filepath.Join(repo, ".git", "acd", "state.db"), report.Data.CheckpointID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := strings.TrimSpace(runGitOK(t, repo, "show", checkpoint.TreeOID+":goal.txt")); body != "new protected work" {
+		t.Fatalf("enabled repository has no saved goal: %q", body)
+	}
+}
+
+// The fixture owns a real supervisor directly. On Linux, setup must not use
+// the host user's systemd instance, which does not share the temporary HOME.
+// Only the service-install boundary is simulated; setup still applies hooks,
+// instructions, registration, and checkpoint barriers through the real CLI.
+func newAgentSetupFixture(t *testing.T) *finishFixture {
+	t.Helper()
+	f := newFinishFixture(t)
+	if runtime.GOOS != "linux" {
+		return f
+	}
+	dir := t.TempDir()
+	violations := filepath.Join(dir, "unexpected-systemctl")
+	body := `#!/bin/sh
+case "$*" in
+  '--user is-active --quiet acd-supervisor.service'|'--user is-enabled --quiet acd-supervisor.service')
+    exit 1 ;;
+  '--user daemon-reload'|'--user enable --now acd-supervisor.service')
+    exit 0 ;;
+  *)
+    printf 'Unexpected fixture systemctl command: %s\n' "$*" >> "$ACD_INTEGRATION_SYSTEMCTL_VIOLATIONS"
+    exit 97 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if body, err := os.ReadFile(violations); err == nil {
+			t.Errorf("unexpected service manager call: %s", body)
+		} else if !os.IsNotExist(err) {
+			t.Error(err)
+		}
+	})
+	f.Env = envWith(f.Env, "PATH="+dir+string(os.PathListSeparator)+envValue(f.Env, "PATH"), "ACD_INTEGRATION_SYSTEMCTL_VIOLATIONS="+violations)
+	return f
 }

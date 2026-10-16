@@ -600,6 +600,7 @@ func TestApplySupervisorWorkerFailureProvidesRepairThatMatchesCause(t *testing.T
 func TestRenderProductDoctorWorkerShowsCauseAndFix(t *testing.T) {
 	var out bytes.Buffer
 	status := controlResult{
+		Health: controlHealthNeedsAttention, Enabled: true, Registered: true,
 		SupervisorWorkerState: "needs_action", SupervisorWorkerRestarts: 5,
 		SupervisorWorkerError: "schema is v20, want v21",
 		NextAction:            "Run `acd on` to repair it.",
@@ -611,7 +612,7 @@ func TestRenderProductDoctorWorkerShowsCauseAndFix(t *testing.T) {
 	for _, want := range []string{
 		"Status: needs action after 5 attempts to restart",
 		"Details: schema is v20, want v21",
-		"Next: Run `acd on` to repair it.",
+		"Action required: Run `acd on` to repair it.",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("doctor output missing %q:\n%s", want, out.String())

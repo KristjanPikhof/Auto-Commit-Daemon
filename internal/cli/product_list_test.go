@@ -927,6 +927,17 @@ func materializeProductListRepoWithSpaces(t *testing.T) string {
 	return realTarget
 }
 
+func productListLineForRepo(t *testing.T, output, repo string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, repo+" ") {
+			return line
+		}
+	}
+	t.Fatalf("repository row %q missing:\n%s", repo, output)
+	return ""
+}
+
 type productListFrameWriter struct {
 	mu     sync.Mutex
 	buf    bytes.Buffer
