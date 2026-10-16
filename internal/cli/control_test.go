@@ -421,7 +421,7 @@ func TestApplyControlStatusStorageWarningDoesNotGateCurrentWorkOnLegacyArchive(t
 	report := statusReport{Daemon: "running", PID: os.Getpid(), Protected: true, CheckpointRetentionOverBudget: true, PublicationOutcome: publicationOutcome{Legacy: state.FinishLegacyCutover{State: "needs_attention", Reason: "Saved legacy proof needs inspection"}}}
 	result := controlResult{}
 	applyControlStatus(&result, report)
-	if !result.OK || !result.Protected || result.Health != controlHealthNeedsAttention || !strings.Contains(result.NextAction, "acd doctor") || !strings.Contains(result.Summary, "Legacy work remains preserved") || strings.Count(result.Summary, "exceed the storage budget") != 1 {
+	if !result.OK || !result.Protected || result.Health != controlHealthNeedsAttention || !strings.Contains(result.NextAction, "acd doctor") || !strings.Contains(result.Summary, "Older saved work is retained separately") || strings.Count(result.Summary, "uses more space than ACD's storage limit") != 1 {
 		t.Fatalf("maintenance hid remediation or duplicated output: %+v", result)
 	}
 }
@@ -599,15 +599,19 @@ func TestApplySupervisorWorkerFailureProvidesRepairThatMatchesCause(t *testing.T
 
 func TestRenderProductDoctorWorkerShowsCauseAndFix(t *testing.T) {
 	var out bytes.Buffer
-	renderProductDoctorWorker(&out, controlResult{
+	status := controlResult{
 		SupervisorWorkerState: "needs_action", SupervisorWorkerRestarts: 5,
 		SupervisorWorkerError: "schema is v20, want v21",
 		NextAction:            "Run `acd on` to repair it.",
-	})
+	}
+	if err := renderProductEnvelope(&out, envelopeFromControl(status), false); err != nil {
+		t.Fatal(err)
+	}
+	renderProductDoctorWorker(&out, status)
 	for _, want := range []string{
-		"State: needs action after 5 restart attempt(s)",
-		"Cause: schema is v20, want v21",
-		"Fix: Run `acd on` to repair it.",
+		"Status: needs action after 5 attempts to restart",
+		"Details: schema is v20, want v21",
+		"Next: Run `acd on` to repair it.",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("doctor output missing %q:\n%s", want, out.String())

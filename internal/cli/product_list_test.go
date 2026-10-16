@@ -189,7 +189,7 @@ func TestProductListPersistentFlagsAreHandled(t *testing.T) {
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("list --quiet: %v", err)
 		}
-		if !strings.Contains(out.String(), "Saved:") {
+		if !strings.Contains(out.String(), "No recently active repositories.") {
 			t.Fatalf("quiet suppressed the final result:\n%s", out.String())
 		}
 	})
@@ -312,7 +312,7 @@ func TestProductListAllControlsOnlyHumanFiltering(t *testing.T) {
 	if err := runProductListOnceView(context.Background(), &compact, false, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(compact.String(), "7 repositories hidden; use acd list --all") || strings.Contains(compact.String(), "repo-6") {
+	if !strings.Contains(compact.String(), "7 idle repositories hidden. Use acd list --all") || strings.Contains(compact.String(), "repo-6") {
 		t.Fatalf("default view did not stay compact:\n%s", compact.String())
 	}
 
@@ -692,7 +692,7 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	}, productListRepoOverview{}, context.DeadlineExceeded)
 	if entry.ActionRequired || entry.State != productStateWaiting ||
 		productListStatus(entry) != "refreshing" || !entry.ProtectionUnknown ||
-		productListPhase(entry) != "refreshing" || !entry.PublicationOutcome.PendingClassification {
+		productListPhase(entry) != "checking protection" || !entry.PublicationOutcome.PendingClassification {
 		t.Fatalf("transient read failure became an alert: %+v", entry)
 	}
 	encoded, err := json.Marshal(entry)
@@ -703,8 +703,8 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	if err := renderProductListSelection(&out, []productListEntry{entry}, 0, false, true); err != nil {
 		t.Fatal(err)
 	}
-	if line := productListLineForRepo(t, out.String(), "repo"); !strings.Contains(line, "-     -") {
-		t.Fatalf("unknown protection was not rendered distinctly: %s", line)
+	if !strings.Contains(out.String(), "repo\n  Saved: - | Changes: ?") {
+		t.Fatalf("unknown protection was not rendered distinctly: %s", out.String())
 	}
 
 	entry = productListEntryFromOverview(record, supervisor.WorkerStatus{
@@ -903,17 +903,6 @@ func materializeProductListRepoWithSpaces(t *testing.T) string {
 		t.Fatalf("canonicalize spaced repository path: %v", err)
 	}
 	return realTarget
-}
-
-func productListLineForRepo(t *testing.T, output, repo string) string {
-	t.Helper()
-	for _, line := range strings.Split(output, "\n") {
-		if strings.HasPrefix(line, repo+" ") {
-			return line
-		}
-	}
-	t.Fatalf("repository row %q missing:\n%s", repo, output)
-	return ""
 }
 
 type productListFrameWriter struct {

@@ -32,7 +32,7 @@ func TestCaptureHealthTruthWithResponsiveWorkerAndEmptyQueue(t *testing.T) {
 	}
 	control := controlResult{OK: true, Enabled: true, Registered: true}
 	applyControlStatusWithDaemonAlive(&control, status, true)
-	if control.OK || control.Protected || control.Health != controlHealthNeedsAttention || !strings.Contains(control.Summary, "incomplete") {
+	if control.OK || control.Protected || control.Health != controlHealthNeedsAttention || !strings.Contains(control.Summary, "Some changes could not be saved: eligible file unreadable") {
 		t.Fatalf("status masks failure: %+v", control)
 	}
 	if envelope := envelopeFromControl(control); envelope.State != productStateNeedsAction {
@@ -47,7 +47,7 @@ func TestCaptureHealthTruthWithResponsiveWorkerAndEmptyQueue(t *testing.T) {
 	}
 	entry := productListEntry{State: productStateNeedsAction, CaptureHealth: status.CaptureHealth, PublicationProgress: status.PublicationProgress,
 		PublicationOutcome: publicationOutcome{RecoveredChanges: 1, BranchCommitted: &control.Published}}
-	if productListPhase(entry) != "protection-incomplete" || productListStatus(entry) != "needs action" || !strings.Contains(publicationProgressPhaseLabel(status.PublicationProgress), "incomplete capture") {
+	if productListPhase(entry) != "protection-incomplete" || productListStatus(entry) != "needs action" || !strings.Contains(publicationProgressPhaseLabel(status.PublicationProgress), "some changes could not be saved") {
 		t.Fatalf("human views mask capture failure: phase=%q status=%q", productListPhase(entry), productListStatus(entry))
 	}
 	plan, err := buildFixPlan(ctx, repo, dbPath, true, false, false)
@@ -58,7 +58,7 @@ func TestCaptureHealthTruthWithResponsiveWorkerAndEmptyQueue(t *testing.T) {
 	if err := renderFix(&output, plan, false); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(output.String(), "state is healthy") || strings.Contains(output.String(), "stop the shared runtime") || !strings.Contains(output.String(), "protection is incomplete") {
+	if strings.Contains(output.String(), "state is healthy") || strings.Contains(output.String(), "stop the shared runtime") || !strings.Contains(output.String(), "Saving changes is incomplete") {
 		t.Fatalf("recovery masks failure: %s", output.String())
 	}
 	output.Reset()

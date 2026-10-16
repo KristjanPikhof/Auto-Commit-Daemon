@@ -39,7 +39,7 @@ func TestProductListWatchKeepsRowsInPlace(t *testing.T) {
 	}
 }
 
-func TestProductListHiddenWarningDoesNotFailCompactSnapshot(t *testing.T) {
+func TestProductListIdleWarningRemainsVisibleInCompactSnapshot(t *testing.T) {
 	original := productListCollect
 	t.Cleanup(func() { productListCollect = original })
 	productListCollect = func(context.Context) (productListData, productState, error) {
@@ -50,7 +50,7 @@ func TestProductListHiddenWarningDoesNotFailCompactSnapshot(t *testing.T) {
 		json, all bool
 		exit      int
 	}{
-		{"compact", false, false, 0}, {"all", false, true, ExitActionRequired}, {"json", true, false, ExitActionRequired},
+		{"compact", false, false, ExitActionRequired}, {"all", false, true, ExitActionRequired}, {"json", true, false, ExitActionRequired},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
@@ -58,7 +58,7 @@ func TestProductListHiddenWarningDoesNotFailCompactSnapshot(t *testing.T) {
 			if ExitCode(err) != tc.exit {
 				t.Fatalf("exit=%d want=%d: %v", ExitCode(err), tc.exit, err)
 			}
-			if tc.name == "compact" && (!strings.Contains(out.String(), "No active repositories") || strings.Contains(out.String(), "idle-warning")) {
+			if tc.name == "compact" && (!strings.Contains(out.String(), "idle-warning") || !strings.Contains(out.String(), "needs action")) {
 				t.Fatal(out.String())
 			}
 		})
@@ -163,7 +163,7 @@ func TestProductListMaintenanceDoesNotHideProtectionFailure(t *testing.T) {
 		report := statusReport{Daemon: "running", PID: os.Getpid(), CaptureHealth: state.CaptureHealth{State: "blocked", Error: "eligible file unreadable"}, CheckpointMaintenance: m}
 		result := controlResult{OK: true}
 		applyControlStatus(&result, report)
-		if result.Health != controlHealthNeedsAttention || !strings.HasPrefix(result.Summary, "Checkpoint protection is incomplete") || !strings.Contains(result.NextAction, "acd doctor") {
+		if result.Health != controlHealthNeedsAttention || !strings.HasPrefix(result.Summary, "Some changes could not be saved: eligible file unreadable") || !strings.Contains(result.NextAction, "acd doctor") {
 			t.Fatalf("maintenance hid blocker: %+v", result)
 		}
 	}

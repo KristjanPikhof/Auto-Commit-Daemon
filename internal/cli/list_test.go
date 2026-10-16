@@ -90,10 +90,8 @@ func TestList_OnceProducesSingleSnapshot(t *testing.T) {
 	if strings.Contains(got, "Updated:") {
 		t.Fatalf("--once should not use watch frames:\n%s", got)
 	}
-	for _, want := range []string{"Saved:", "Changes:", "Status:"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("expected repository block %q:\n%s", want, got)
-		}
+	if got != "No recently active repositories. Use acd list --all to see every enabled repository.\n" {
+		t.Fatalf("expected one empty snapshot:\n%s", got)
 	}
 	if strings.Contains(got, "DAEMON") {
 		t.Fatalf("expected repository block:\n%s", got)

@@ -8,14 +8,14 @@ import (
 
 func TestProductListLegacyWarningPreservesCurrentStatus(t *testing.T) {
 	for _, scenario := range []struct {
-		name, operational, finishState, status string
-		state                                  productState
+		name, operational, finishState, status, display string
+		state                                           productState
 	}{
-		{"healthy", "up_to_date", "", "healthy", productStateProtected},
-		{"checkpointing", "checkpointing", "", "waiting", productStateWaiting},
-		{"finishing", "finishing", state.FinishRunning, "working", productStatePublishing},
-		{"finish-failed", "saved", state.FinishFailed, "finish failed", productStateNeedsAction},
-		{"finish-attention", "saved", state.FinishNeedsAttention, "finish needs_attention", productStateNeedsAction},
+		{"healthy", "up_to_date", "", "healthy", "ready", productStateProtected},
+		{"checkpointing", "checkpointing", "", "waiting", "saved, awaiting finish", productStateWaiting},
+		{"finishing", "finishing", state.FinishRunning, "working", "Finish is in progress.", productStatePublishing},
+		{"finish-failed", "saved", state.FinishFailed, "finish failed", "finish failed", productStateNeedsAction},
+		{"finish-attention", "saved", state.FinishNeedsAttention, "finish needs review", "finish needs review", productStateNeedsAction},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			entry := productListEntry{State: scenario.state, OperationalState: scenario.operational}
@@ -28,7 +28,7 @@ func TestProductListLegacyWarningPreservesCurrentStatus(t *testing.T) {
 			if got := productListStatus(entry); got != scenario.status {
 				t.Fatalf("current status=%q, want %q", got, scenario.status)
 			}
-			want := scenario.status + " (maintenance retry) (legacy archive attention)"
+			want := scenario.display + " (cleanup retry) (older saved data needs review)"
 			if got := productListDisplayStatus(entry); got != want {
 				t.Fatalf("display status=%q, want %q", got, want)
 			}

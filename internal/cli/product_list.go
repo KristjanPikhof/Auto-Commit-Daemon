@@ -335,6 +335,9 @@ func renderProductListSelection(out io.Writer, visible []productListEntry, hidde
 }
 
 func productListSavedWork(entry productListEntry) string {
+	if entry.ProtectionUnknown {
+		return "?"
+	}
 	if entry.PublicationOutcome.CheckpointAvailable {
 		if !entry.PublicationOutcome.CountsKnown {
 			return "?"

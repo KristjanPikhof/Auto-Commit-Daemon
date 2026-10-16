@@ -13,6 +13,9 @@
 
 ### Changed
 
+- Keep offline setup, saved-plan editing, and history safety details in command help.
+- Show unknown change counts while repository protection is being checked.
+
 - File edits, hooks, idle time, and shutdown save checkpoints without AI,
   credentials, project checks, or new publication. Startup can settle a previously
   authorized prepared mutation only from its exact saved proof. `acd off` saves

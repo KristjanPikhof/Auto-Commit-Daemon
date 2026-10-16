@@ -17,7 +17,7 @@ import (
 )
 
 func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
-	help := commandHelp(t, "history rewrite")
+	help := strings.Join(strings.Fields(commandHelp(t, "history rewrite")), " ")
 	for _, want := range []string{
 		"--from-sha 8f4c2a1",
 		"--range-sha",
@@ -43,7 +43,7 @@ func TestRewriteCommitsHelpIncludesContract(t *testing.T) {
 func TestHistoryRewriteHelpIncludesProviderFreeEditContract(t *testing.T) {
 	for _, command := range []string{"history rewrite"} {
 		t.Run(command, func(t *testing.T) {
-			help := commandHelp(t, command)
+			help := strings.Join(strings.Fields(commandHelp(t, command)), " ")
 			for _, want := range []string{
 				"--edit",
 				"$EDITOR",

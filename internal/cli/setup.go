@@ -84,7 +84,8 @@ func newSetupCommand(initCompat bool) *cobra.Command {
 Setup installs ACD, starts background protection, and configures integrations.
 It can undo the installation if an apply step fails.
 
-Use --dry-run to preview the plan. Fresh setup uses offline Local mode;
+Use --dry-run to preview the plan. Fresh setup uses Local mode, which works
+without credentials or network access.
 Git commits are created only when you run acd finish. Intent mode and AI
 provider settings are optional.
 
