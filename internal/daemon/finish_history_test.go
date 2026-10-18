@@ -118,7 +118,7 @@ func TestFinishHistoryRewriteIntentInterleavedPurposeAndSavedProof(t *testing.T)
 		for _, c := range r.Changes {
 			ids[c.Path] = append(ids[c.Path], c.ID)
 		}
-		raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Complete alpha behavior", Boundary: "Keep alpha and its correction together", Message: "Complete alpha behavior", ChangeIDs: ids["a.txt"]}, {Purpose: "Complete beta behavior", Boundary: "Keep the independent beta outcome reviewable", Message: "Complete beta behavior", ChangeIDs: ids["b.txt"]}}})
+		raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Complete alpha behavior", Boundary: "Keep alpha and its correction together", Message: "Complete alpha behavior\n\n- Keep the alpha outcome and its correction together.", ChangeIDs: ids["a.txt"]}, {Purpose: "Complete beta behavior", Boundary: "Keep the independent beta outcome reviewable", Message: "Complete beta behavior\n\n- Preserve the independent beta outcome.", ChangeIDs: ids["b.txt"]}}})
 		return raw, nil
 	}}
 	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{a, b, correction}, []string{suffix}, transport, FinishHistoryOptions{Mode: "intent", Style: "imperative", Deadline: time.Now().Add(time.Minute), VerificationConfigDigest: w.Config.ConfigDigest})
@@ -218,7 +218,7 @@ func TestFinishHistoryRewriteMessagesOnlyCorrectionPreservesMembership(t *testin
 		}
 		var goals []finish.Goal
 		for _, c := range r.HistoryCommits {
-			goals = append(goals, finish.Goal{Purpose: "Preserve recorded outcome", Boundary: "Keep original membership", Message: "Preserve recorded outcome", ChangeIDs: []string{c.ID}})
+			goals = append(goals, finish.Goal{Purpose: "Preserve recorded outcome", Boundary: "Keep original membership", Message: "Preserve recorded outcome\n\n- Keep the original authored boundary.", ChangeIDs: []string{c.ID}})
 		}
 		raw, _ := json.Marshal(map[string]any{"goals": goals})
 		return raw, nil

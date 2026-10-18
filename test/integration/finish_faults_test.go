@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -69,7 +70,10 @@ func writeFinishChatResponse(t *testing.T, w http.ResponseWriter, r finishChatRe
 	if r.Plan.Style == "conventional" && r.Plan.Message == "" {
 		message = "chore: " + message
 	}
-	arguments, err := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: r.Plan.Purpose, Message: message, ChangeIDs: ids}}})
+	if r.Plan.Message == "" {
+		message += "\n\n- Keep the completed request separate from later edits."
+	}
+	arguments, err := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: r.Plan.Purpose, Boundary: "Keep the supplied complete request together", Message: message, ChangeIDs: ids}}})
 	if err != nil {
 		t.Error(err)
 		return
@@ -279,7 +283,7 @@ func TestFinishFaultProviderFailureRetryKeepsFrozenTarget(t *testing.T) {
 			finishAssertSavedViews(t, f, 2)
 			succeeds.Store(true)
 			retry := finishRunJSON(t, f, "finish", "--retry", failed.Data.ID)
-			if !retry.OK || !retry.Data.Published || retry.Data.Attempt != 2 || retry.Data.Target != failed.Data.Target || calls.Load() != wantCalls+1 {
+			if !retry.OK || !retry.Data.Published || retry.Data.Attempt != 2 || !reflect.DeepEqual(retry.Data.Target, failed.Data.Target) || calls.Load() != wantCalls+1 {
 				t.Fatalf("frozen retry %+v calls=%d", retry, calls.Load())
 			}
 			if got := runGitOK(t, f.Repo, "show", "HEAD:goal.txt"); got != "selected\n" {
@@ -471,7 +475,7 @@ func TestFinishFaultRunningRequestRestartRequiresFrozenRetry(t *testing.T) {
 	oldPID := readDaemonStatePID(f.Repo)
 	f.Restart(t, t.Context())
 	interrupted := finishWaitRequest(t, f, request.ID)
-	if interrupted.State != state.FinishFailed || interrupted.Target != request.Target || interrupted.Attempt != 1 {
+	if interrupted.State != state.FinishFailed || !reflect.DeepEqual(interrupted.Target, request.Target) || interrupted.Attempt != 1 {
 		t.Fatalf("restart changed request: %+v", interrupted)
 	}
 	if readDaemonStatePID(f.Repo) == oldPID || calls.Load() != 1 || strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")) != f.BaseHead {
@@ -483,7 +487,7 @@ func TestFinishFaultRunningRequestRestartRequiresFrozenRetry(t *testing.T) {
 	finishAssertSavedViews(t, f, 2)
 	retryAllowed.Store(true)
 	retried := finishRunJSON(t, f, "finish", "--retry", request.ID)
-	if !retried.OK || retried.Data.ID != request.ID || retried.Data.Attempt != 2 || retried.Data.Target != request.Target || calls.Load() != 2 {
+	if !retried.OK || retried.Data.ID != request.ID || retried.Data.Attempt != 2 || !reflect.DeepEqual(retried.Data.Target, request.Target) || calls.Load() != 2 {
 		t.Fatalf("explicit frozen retry: %+v calls=%d", retried, calls.Load())
 	}
 	if runGitOK(t, f.Repo, "show", "HEAD:goal.txt") != "frozen before restart\n" {

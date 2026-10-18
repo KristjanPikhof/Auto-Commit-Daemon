@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,7 +77,7 @@ func completeFinishTestPlan(request ai.FinishPlanRequest) []byte {
 	for _, change := range request.Changes {
 		ids = append(ids, change.ID)
 	}
-	raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Preserve completed changes", Message: "Preserve completed changes", ChangeIDs: ids}}})
+	raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Preserve completed changes", Boundary: "The supplied changes complete the requested batch", Message: "Preserve completed changes\n\n- Publish the requested goal without later edits.", ChangeIDs: ids}}})
 	return raw
 }
 
@@ -256,7 +257,7 @@ func TestFinishWorkerProtectsDuringProviderAndReconnects(t *testing.T) {
 	w.Config.VerificationTimeout = 30 * time.Second
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	r, created, err := w.Start(ctx, FinishOptions{})
+	r, created, err := w.Start(ctx, FinishOptions{Purpose: "Publish this goal without absorbing later edits"})
 	if err != nil || !created {
 		t.Fatalf("start %+v created=%t: %v", r, created, err)
 	}
@@ -341,7 +342,7 @@ func TestFinishWorkerBoundedFailureAndExplicitRetry(t *testing.T) {
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	p := &finishTestTransport{exchange: func(context.Context, ai.FinishPlanRequest) ([]byte, error) { return []byte(`{"goals":[]}`), nil }}
 	w.Transport = p
-	r := startFinishWorker(t, w, FinishOptions{})
+	r := startFinishWorker(t, w, FinishOptions{Purpose: "Publish this goal without absorbing later edits"})
 	failed, err := w.Execute(context.Background(), r.ID)
 	if err == nil || failed.State != state.FinishFailed || failed.PlanningCalls != 2 || p.calls.Load() != 2 {
 		t.Fatalf("bounded failure %+v calls=%d: %v", failed, p.calls.Load(), err)
@@ -355,7 +356,7 @@ func TestFinishWorkerBoundedFailureAndExplicitRetry(t *testing.T) {
 		return completeFinishTestPlan(request), nil
 	}
 	retry, created, err := w.Start(context.Background(), FinishOptions{RetryID: r.ID, DryRun: true})
-	if err != nil || !created || retry.Attempt != 2 || retry.Target != r.Target {
+	if err != nil || !created || retry.Attempt != 2 || !reflect.DeepEqual(retry.Target, r.Target) {
 		t.Fatalf("retry %+v created=%t: %v", retry, created, err)
 	}
 	completed, err := w.Execute(context.Background(), retry.ID)
@@ -547,14 +548,14 @@ func TestFinishWorkerCredentialRefreshRetriesSameTarget(t *testing.T) {
 	w.Config.Mode = "intent"
 	w.Config.Provider = ai.ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, Model: "test-model", Timeout: 3 * time.Second, CommitStrategy: ai.CommitStrategyIntent, CommitFormat: ai.CommitFormatImperative}
 	w.Config.Approved = []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials}
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Publish this goal without absorbing later edits"})
 	failed, err := w.Execute(context.Background(), r.ID)
 	if err == nil || failed.State != state.FinishFailed || calls.Load() != 0 {
 		t.Fatalf("missing credential %+v calls=%d: %v", failed, calls.Load(), err)
 	}
 	w.Config.Provider.APIKey = "refreshed-token"
 	retry, created, err := w.Start(context.Background(), FinishOptions{RetryID: r.ID, DryRun: true})
-	if err != nil || !created || retry.Target != r.Target {
+	if err != nil || !created || !reflect.DeepEqual(retry.Target, r.Target) {
 		t.Fatalf("credential retry %+v: %v", retry, err)
 	}
 	completed, err := w.Execute(context.Background(), retry.ID)
@@ -582,7 +583,7 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 			} else {
 				w.Config.Provider.DiffEgress = true
 			}
-			r := startFinishWorker(t, w, FinishOptions{})
+			r := startFinishWorker(t, w, FinishOptions{Purpose: "Publish this goal without absorbing later edits"})
 			if scenario == "expired" {
 				ctx, cancel := context.WithDeadline(context.Background(), finishDeadline(r))
 				<-ctx.Done()

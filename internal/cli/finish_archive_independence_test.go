@@ -81,7 +81,7 @@ func finishArchiveIntentProvider(t *testing.T, runtime *workerRuntime) *atomic.I
 			ids = append(ids, change.ID)
 		}
 		calls.Add(1)
-		plan, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Complete current behavior", Boundary: "Keep the selected current changes together", Message: "Complete current behavior", ChangeIDs: ids}}})
+		plan, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Complete current behavior", Boundary: "Keep the selected current changes together", Message: "Complete current behavior\n\n- Preserve the current behavior without changing other work.", ChangeIDs: ids}}})
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"type": "function", "function": map[string]string{"name": "finish_plan", "arguments": string(plan)}}}}}}})
 	}))

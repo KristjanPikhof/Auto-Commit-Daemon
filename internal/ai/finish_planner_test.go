@@ -48,7 +48,7 @@ func finishTestEvidence() finish.Evidence {
 	return finish.Evidence{Base: base, Target: target, Changes: finish.NetChanges(base, target, "author-a")}
 }
 func finishTestOptions() FinishOptions {
-	return FinishOptions{Deadline: time.Now().Add(time.Minute), Style: finish.StyleImperative}
+	return FinishOptions{Deadline: time.Now().Add(time.Minute), Style: finish.StyleImperative, Purpose: "Keep authored settings ahead of defaults", RequireCompletionContext: true}
 }
 func finishTestOutput(goals ...finish.Goal) []byte {
 	body, err := json.Marshal(struct {
@@ -99,12 +99,12 @@ func TestFinishIntentCompletedGoals(t *testing.T) {
 			evidence.Changes = append(evidence.Changes, finish.Change{ID: "settings-correction", Path: "settings.go", Before: evidence.Target["settings.go"], After: last, Author: "a", DependsOn: []string{"settings.go"}})
 			evidence.Target["settings.go"] = last
 			goals := []finish.Goal{
-				{Purpose: "Extract the reusable settings parser", Boundary: "Review parser independently of the new default", Message: "Extract reusable settings parser", ChangeIDs: paths[:2]},
+				{Purpose: "Extract the reusable settings parser", Boundary: "Review parser independently of the new default", Message: "Extract reusable settings parser\n\n- Share parsing before changing setup behavior.", ChangeIDs: paths[:2]},
 				{Purpose: "Add explicit offline finish", Boundary: "Review batch completion before changing setup defaults", Message: "Add explicit offline finish\n\n- Save a complete protected batch on request.", ChangeIDs: paths[2:4]},
 				{Purpose: "Default new setups to offline finish", Boundary: "Revert default behavior while keeping explicit finish", Message: "Default new setups to offline finish\n\n- Keep initial protection independent of credentials.", ChangeIDs: append(slices.Clone(paths[4:]), "settings-correction")},
 			}
 			if style == finish.StyleConventional {
-				goals[0].Message = "refactor: extract settings parser"
+				goals[0].Message = "refactor: extract settings parser\n\n- Share parsing before changing setup behavior."
 				goals[1].Message = "feat: add explicit offline finish\n\n- Save a complete protected batch on request."
 				goals[2].Message = "feat: default new setups to offline finish\n\n- Keep initial protection independent of credentials."
 			}
@@ -112,7 +112,7 @@ func TestFinishIntentCompletedGoals(t *testing.T) {
 				if request.Style != style || request.Purpose != "New users should protect work without credentials" {
 					t.Fatalf("request = %+v", request)
 				}
-				return finishTestOutput(goals...), nil
+				return finishTestOutput(goals[2], goals[1], goals[0]), nil
 			}}
 			options := finishTestOptions()
 			options.Style = style
@@ -134,7 +134,7 @@ func TestFinishIntentCompletedGoals(t *testing.T) {
 func TestFinishIntentCombinedCorrection(t *testing.T) {
 	evidence := finishTestEvidence()
 	for _, bad := range []string{
-		`{"goals":[{"purpose":"Fabricate","message":"Preserve explicit settings","change_ids":["imagined"]}]}`,
+		`{"goals":[{"purpose":"Fabricate","message":"Preserve explicit settings\n\n- Keep authored values ahead of defaults.","change_ids":["imagined"]}]}`,
 		`{"goals":[{"purpose":"Incomplete","message":"fix(settings): change settings","change_ids":["settings.go"]}]}`,
 		`{"goals":[],"tree":{"settings.go":"fabricated"}}`,
 		`not json`,
@@ -176,7 +176,7 @@ func TestFinishIntentCombinedCorrection(t *testing.T) {
 func TestFinishIntentSemanticQualityCorrection(t *testing.T) {
 	evidence := finishTestEvidence()
 	for _, style := range []string{finish.StyleImperative, finish.StyleConventional} {
-		for _, scenario := range []string{"generic", "filename", "purpose", "boundary", "test claim", "default impact"} {
+		for _, scenario := range []string{"generic", "filename", "purpose", "boundary", "test claim", "default impact", "missing reason"} {
 			t.Run(style+"/"+scenario, func(t *testing.T) {
 				options := finishTestOptions()
 				options.Style = style
@@ -186,6 +186,8 @@ func TestFinishIntentSemanticQualityCorrection(t *testing.T) {
 				}
 				bad := goal
 				switch scenario {
+				case "missing reason":
+					bad.Message = strings.Split(goal.Message, "\n")[0]
 				case "generic":
 					bad.Message = "Update files"
 				case "filename":
@@ -474,7 +476,7 @@ func TestFinishIntentSubprocessOneExchange(t *testing.T) {
 		t.Run(fmt.Sprint(crash), func(t *testing.T) {
 			dir := t.TempDir()
 			calls := filepath.Join(dir, "calls")
-			response := `printf '%s\n' '{"version":1,"finish_plan":{"goals":[{"purpose":"Preserve settings","message":"Preserve explicit settings","change_ids":["settings.go"]}]}}'`
+			response := `printf '%s\n' '{"version":1,"finish_plan":{"goals":[{"purpose":"Preserve settings","message":"Preserve explicit settings\n\n- Keep authored values ahead of defaults.","change_ids":["settings.go"]}]}}'`
 			if crash {
 				response = "exit 1"
 			}

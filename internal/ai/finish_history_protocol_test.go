@@ -19,8 +19,8 @@ func TestHistoryMessagesRejectsInvalidSubprocessVersion(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			evidence := finishTestEvidence()
-			commits := []HistoryMessageCommit{{ID: "original", Author: "author-a", TreeOID: strings.Repeat("a", 40), OriginalMessage: "Preserve authored settings", ChangeIDs: []string{evidence.Changes[0].ID}}}
-			goals := finishTestOutput(finish.Goal{Purpose: "Preserve authored settings", Boundary: "Keep the original authored scope", Message: "Preserve authored settings", ChangeIDs: []string{"original"}})
+			commits := []HistoryMessageCommit{{ID: "original", Author: "author-a", TreeOID: strings.Repeat("a", 40), OriginalMessage: "Preserve authored settings\n\n- Keep authored values ahead of defaults.", ChangeIDs: []string{evidence.Changes[0].ID}}}
+			goals := finishTestOutput(finish.Goal{Purpose: "Preserve authored settings", Boundary: "Keep the original authored scope", Message: "Preserve authored settings\n\n- Keep authored values ahead of defaults.", ChangeIDs: []string{"original"}})
 			response := fmt.Sprintf(`{"version":2,"finish_plan":%s}`, goals)
 			script := "while IFS= read -r line; do\n printf '%s\\n' '" + response + "'\n done\n"
 			if corrected {
