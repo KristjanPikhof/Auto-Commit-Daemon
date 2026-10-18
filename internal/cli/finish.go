@@ -25,6 +25,11 @@ Local mode creates one commit. Intent mode uses the approved AI provider to
 group completed work into commits. Later edits stay saved for your next
 finish. ACD never pushes.
 
+Supply PURPOSE as context describing what changed and why. Intent uses it to
+explain decisions and choose useful steps. Without shared code diffs, context
+is required. --message instead requests one batch with that exact message;
+it disables automatic splitting, including in Intent mode.
+
 Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
 --include-staged to include your exact current staged selection. Use --retry
@@ -50,7 +55,7 @@ changes, purpose, message, and staged selection.`,
 	cmd.Flags().BoolVar(&params.DryRun, "dry-run", false, "Plan and check without moving the branch or index")
 	cmd.Flags().BoolVar(&params.IncludeStaged, "include-staged", false, "Include the exact current staged selection")
 	cmd.Flags().StringVar(&params.RetryID, "retry", "", "Retry or reconnect to a saved request")
-	cmd.Flags().StringVar(&params.Message, "message", "", "Use this exact commit message")
+	cmd.Flags().StringVar(&params.Message, "message", "", "Create one batch commit with this exact message (disables splitting)")
 	return cmd
 }
 
@@ -157,11 +162,14 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	count, countErr := productWorktreeChangeCount(readCtx, lookup.Worktree.Root)
 	result.WorktreeChanges = count
 	ok := r.State == state.FinishCompleted && !detached
+	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required"
 	exit, failureCode := finishExit(r, waitCode)
 	next := ""
 	if !ok {
 		if r.State == state.FinishNeedsAttention {
 			next = "acd doctor"
+		} else if r.ReasonCode == "provider_context_required" {
+			next = `acd finish "what changed and why"`
 		} else {
 			next = "acd finish --retry " + r.ID
 		}
@@ -183,7 +191,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 		var failure *productError
 		if !ok {
-			failure = &productError{Code: failureCode, Message: r.Reason, Retryable: r.State == state.FinishFailed || detached}
+			failure = &productError{Code: failureCode, Message: r.Reason, Retryable: retryable}
 			if detached {
 				failure.Message = "Work is saved; reconnect to inspect this request"
 			}
@@ -206,8 +214,14 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			fmt.Fprintln(out, "No changes to commit.")
 		case r.DryRun:
 			fmt.Fprintln(out, "Finish preview\nNo commits were added to your branch.")
+			if plan.Disclosure.MetadataIncluded && len(plan.Disclosure.TextChangeIDs) == 0 {
+				fmt.Fprintln(out, "Plan based on supplied context and file metadata; code diffs were not shared.")
+			}
 			for _, step := range plan.Steps {
 				fmt.Fprintf(out, "%s\n  %s\n", consoleProse(step.Message), finishCheckLabel(step.Check))
+				if step.Boundary != "" {
+					fmt.Fprintf(out, "  Boundary: %s\n", consoleProse(step.Boundary))
+				}
 			}
 			fmt.Fprintln(out, "Optional: Run `acd finish` when the current work is ready.")
 		default:
@@ -233,13 +247,13 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 				label = "Action required"
 			}
 			fmt.Fprintf(out, "\n%s: %s\n", label, next)
-			if detached || r.State == state.FinishFailed {
+			if strings.Contains(next, "--retry") {
 				fmt.Fprintln(out, "Retry reconnects to this request or restarts it after failure, using the same saved changes.")
 			}
 		}
 	}
 	if !ok {
-		return &CommandError{Code: failureCode, Message: "Finish requires attention. Next: " + next, Exit: exit, Retryable: detached || r.State == state.FinishFailed, rendered: true}
+		return &CommandError{Code: failureCode, Message: "Finish requires attention. Next: " + next, Exit: exit, Retryable: retryable, rendered: true}
 	}
 	return nil
 }
@@ -264,7 +278,7 @@ func finishExit(r state.FinishRequest, waitCode string) (int, string) {
 	if r.State == state.FinishNeedsAttention {
 		return ExitActionRequired, "finish_needs_attention"
 	}
-	if r.ReasonCode == "provider_input_too_large" {
+	if r.ReasonCode == "provider_input_too_large" || r.ReasonCode == "provider_context_required" {
 		return ExitActionRequired, r.ReasonCode
 	}
 	return ExitActionRequired, "finish_failed"

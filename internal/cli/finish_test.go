@@ -14,6 +14,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -47,6 +48,53 @@ func finishCLIFixture(t *testing.T) (controlRepoLookup, *workerRuntime, *reposit
 	handler := &repositoryWorkerHandler{repositoryID: lookup.Record.RepositoryID, runtimes: map[string]*workerRuntime{lookup.Record.WorktreeID: runtime}}
 	t.Cleanup(func() { cancel(); runtime.finishMu.Lock(); runtime.finishMu.Unlock(); runtime.finishJobs.Wait() })
 	return lookup, runtime, handler
+}
+
+func TestFinishCLIPreviewExplainsEvidenceAndDecisionBoundary(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	plan, _ := json.Marshal(daemon.FinishSavedPlan{Disclosure: ai.FinishDisclosure{MetadataIncluded: true}, Steps: []daemon.FinishPlanStep{{Goal: finish.Goal{
+		Message:  "Preserve selected models\n\n- Preference edits should not reset the selected model.",
+		Boundary: "Review model selection separately from Fast requests",
+	}}}})
+	r := state.FinishRequest{ID: "finish-preview", State: state.FinishCompleted, DryRun: true, Target: state.FinishTarget{Mode: "intent"}, Plan: plan, Result: json.RawMessage(`{"dry_run":true}`)}
+	var out bytes.Buffer
+	if err := renderFinish(&out, lookup, r, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"code diffs were not shared", "Preference edits should not reset", "Boundary: Review model selection separately"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("preview omitted %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestFinishCLIHelpDistinguishesContextFromExactBatch(t *testing.T) {
+	var out bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"finish", "--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"what changed and why", "disables automatic splitting", "Create one batch commit with this exact message"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("help omitted %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestFinishCLIContextFailureNeedsANewRequest(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	r := state.FinishRequest{ID: "finish-context", State: state.FinishFailed, ReasonCode: "provider_context_required", Reason: "Supply what changed and why", Target: state.FinishTarget{CheckpointID: "saved"}}
+	var out bytes.Buffer
+	err := renderFinish(&out, lookup, r, true, "")
+	var response productEnvelope
+	if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if err == nil || response.Error == nil || response.Error.Retryable || response.NextAction == nil || !strings.Contains(*response.NextAction, "what changed and why") || strings.Contains(out.String(), "--retry") {
+		t.Fatalf("unchanged retry suggested for missing context: %s %v", out.String(), err)
+	}
 }
 
 func finishCLIExecute(t *testing.T, ctx context.Context, repo string, args ...string) (finishCLIResult, string, error) {
