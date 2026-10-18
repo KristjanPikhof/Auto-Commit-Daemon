@@ -114,24 +114,33 @@ func TestFinishWorkflowModesStylesAndCompleteGoals(t *testing.T) {
 			t.Run(mode+"/"+style, func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 				defer cancel()
-				pluginDir := t.TempDir()
-				calls := filepath.Join(pluginDir, "calls")
+				var calls atomic.Int32
 				message := func(subject, why string) string {
 					if style == finish.StyleConventional {
 						subject = "feat: " + subject
 					}
 					return subject + "\n\n- " + why
 				}
-				response, _ := json.Marshal(map[string]any{"version": 1, "finish_plan": map[string]any{"goals": []finish.Goal{
-					{Purpose: "Preserve settings across reloads", Boundary: "Settings storage is an independent behavior", Message: message("Preserve settings across reloads", "Keep stored fields when settings are loaded"), ChangeIDs: []string{"settings.go", "settings_test.go", "docs/settings.md"}},
-					{Purpose: "Show disabled protection status", Boundary: "The status badge can be reviewed independently", Message: message("Show disabled protection status", "Explain when protection is disabled"), ChangeIDs: []string{"badge.go", "badge_test.go"}},
-				}}})
-				script := fmt.Sprintf("#!/bin/sh\nwhile IFS= read -r line; do printf 'call\\n' >> '%s'; printf '%%s\\n' '%s'; done\n", calls, response)
-				if err := os.WriteFile(filepath.Join(pluginDir, "acd-provider-workflow"), []byte(script), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				f := newFinishFixture(t, "PATH="+pluginDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-				f.Apply(t, ctx, map[string]string{config.FieldCommitStrategy: mode, config.FieldCommitFormat: style, config.FieldProvider: "subprocess:workflow", config.FieldDiffEgress: "true"}, ai.ConfirmationSubprocessExecution, ai.ConfirmationDiffEgress)
+				server, trust := newOpenAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					request := decodeFinishChatRequest(t, r).Plan
+					goals := []finish.Goal{
+						{Purpose: "Preserve settings across reloads", Boundary: "Settings storage is an independent behavior", Message: message("Preserve settings across reloads", "Keep stored fields when settings are loaded")},
+						{Purpose: "Show disabled protection status", Boundary: "The status badge can be reviewed independently", Message: message("Show disabled protection status", "Explain when protection is disabled")},
+					}
+					for _, change := range request.Changes {
+						group := 0
+						if strings.HasPrefix(change.Path, "badge") {
+							group = 1
+						}
+						goals[group].ChangeIDs = append(goals[group].ChangeIDs, change.ID)
+					}
+					response, _ := json.Marshal(map[string]any{"goals": goals})
+					writeFinishChatArguments(t, w, string(response))
+				}))
+				t.Cleanup(server.Close)
+				f := newFinishFixture(t, "ACD_AI_API_KEY=fixture-key")
+				f.Apply(t, ctx, map[string]string{config.FieldCommitStrategy: mode, config.FieldCommitFormat: style, config.FieldProvider: "openai-compat", config.FieldBaseURL: server.URL, config.FieldCAFile: strings.TrimPrefix(trust, "ACD_AI_CA_FILE="), config.FieldModel: "workflow", config.FieldDiffEgress: "true"}, ai.ConfirmationEndpointCredentials, ai.ConfirmationDiffEgress)
 				index := runGitOK(t, f.Repo, "ls-files", "--stage")
 				for version := 1; version <= 3; version++ {
 					writeFile(t, filepath.Join(f.Repo, "settings.go"), fmt.Sprintf("package example\n\nfunc Load() int { return %d }\n", version))
@@ -150,8 +159,8 @@ func TestFinishWorkflowModesStylesAndCompleteGoals(t *testing.T) {
 				if head := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")); head != f.BaseHead {
 					t.Fatal("saving files moved HEAD")
 				}
-				if _, err := os.Stat(calls); !os.IsNotExist(err) {
-					t.Fatalf("idle protection called a provider: %v", err)
+				if calls.Load() != 0 {
+					t.Fatal("idle protection called a provider")
 				}
 				db := f.OpenDB(t)
 				var requests int
@@ -194,11 +203,10 @@ func TestFinishWorkflowModesStylesAndCompleteGoals(t *testing.T) {
 					if strings.Contains(first, "badge") {
 						t.Fatalf("independent goal leaked into first tree: %s", first)
 					}
-					raw, err := os.ReadFile(calls)
-					if err != nil || strings.Count(string(raw), "call\n") != 2 {
-						t.Fatalf("provider exchanges=%s err=%v", raw, err)
+					if calls.Load() != 2 {
+						t.Fatalf("provider exchanges=%d", calls.Load())
 					}
-				} else if _, err := os.Stat(calls); !os.IsNotExist(err) {
+				} else if calls.Load() != 0 {
 					t.Fatal("Local finish called a provider")
 				}
 				for _, check := range published.Verification {

@@ -38,6 +38,11 @@ func Validate(evidence Evidence, plan Plan) error {
 	}
 	current := CloneTree(evidence.Base)
 	used := make(map[string]bool, len(changes))
+	order := make(map[string]int, len(changes))
+	for index, change := range evidence.Changes {
+		order[change.ID] = index
+	}
+	lastVersion := make(map[string]int)
 	atomicOwners := make(map[string]int)
 	for id := range neutral {
 		if group := changes[id].AtomicGroup; group != "" {
@@ -65,6 +70,10 @@ func Validate(evidence Evidence, plan Plan) error {
 			if change.Author != author || step.Author != author {
 				return planError("step %d crosses an author boundary", index+1)
 			}
+			if previous, exists := lastVersion[change.Path]; exists && order[id] < previous {
+				return planError("recorded version order changed for %q", change.Path)
+			}
+			lastVersion[change.Path] = order[id]
 			for _, prerequisite := range change.DependsOn {
 				if !used[prerequisite] {
 					return planError("change %q is missing prerequisite %q", id, prerequisite)
@@ -169,7 +178,7 @@ func validateEvidence(evidence Evidence) (map[string]Change, error) {
 
 func apply(tree Tree, change Change) error {
 	if tree[change.Path] != change.Before {
-		return planError("prerequisite version is missing for %q", change.Path)
+		return planError("prerequisite version is missing for %q (change %q)", change.Path, change.ID)
 	}
 	if change.After == (Entry{}) {
 		delete(tree, change.Path)
