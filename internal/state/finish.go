@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	FinishVersion        = 1
+	FinishVersion        = 2
 	FinishRunning        = "running"
 	FinishPrepared       = "prepared"
 	FinishCompleted      = "completed"
@@ -49,7 +49,20 @@ type FinishTarget struct {
 	ConfigDigest    string `json:"config_digest"`
 	Purpose         string `json:"purpose,omitempty"`
 	Message         string `json:"message,omitempty"`
+
+	Checkpoints []FinishCheckpoint `json:"checkpoints,omitempty"`
 }
+
+// FinishCheckpoint pins an exact recorded version independently of checkpoint
+// retention. The private alias and identity stay fixed across explicit retries.
+type FinishCheckpoint struct {
+	ID        string `json:"id"`
+	Ref       string `json:"ref"`
+	CommitOID string `json:"commit_oid"`
+	TreeOID   string `json:"tree_oid"`
+}
+
+const FinishCheckpointLimit = 256
 
 // FinishRequest stores one attempt, not a background retry queue. Loading an ID
 // returns its latest attempt; older attempts retain their original evidence.
@@ -163,7 +176,7 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 	if target.Version == 0 {
 		target.Version = FinishVersion
 	}
-	if target.Version != FinishVersion || target.RepositoryID == "" || target.WorktreeID == "" ||
+	if (target.Version != 1 && target.Version != FinishVersion) || (target.Version == 1 && len(target.Checkpoints) > 0) || target.RepositoryID == "" || target.WorktreeID == "" ||
 		!strings.HasPrefix(target.BranchRef, "refs/heads/") || target.CheckpointID == "" ||
 		target.CheckpointTree == "" || target.TargetTree == "" || target.IndexDigest == "" ||
 		target.ConfigDigest == "" || (target.Mode != "local" && target.Mode != "intent") ||
@@ -179,6 +192,17 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 	}
 	if target.TargetRef != "" && (!strings.HasPrefix(target.TargetRef, "refs/acd/") || target.TargetCommitOID == "") {
 		return "", ErrFinishIdentity
+	}
+	if len(target.Checkpoints) > FinishCheckpointLimit || (len(target.Checkpoints) > 0 && (target.Mode != "intent" || target.Message != "" || target.IncludeStaged)) {
+		return "", ErrFinishIdentity
+	}
+	seen := make(map[string]bool)
+	for _, cp := range target.Checkpoints {
+		if cp.ID == "" || cp.TreeOID == "" || cp.CommitOID == "" || seen[cp.ID] ||
+			!strings.HasPrefix(cp.Ref, "refs/acd/finish/"+target.WorktreeID+"/") {
+			return "", ErrFinishIdentity
+		}
+		seen[cp.ID] = true
 	}
 	raw, err := json.Marshal(target)
 	if err != nil {
@@ -288,6 +312,22 @@ func validateFinishCheckpoint(ctx context.Context, tx *sql.Tx, target FinishTarg
 	return nil
 }
 
+func validateFinishCheckpointVersions(ctx context.Context, tx *sql.Tx, target FinishTarget) error {
+	var lastSeq int64
+	for _, cp := range target.Checkpoints {
+		var seq int64
+		err := tx.QueryRowContext(ctx, `SELECT seq FROM checkpoints WHERE id=? AND worktree_id=? AND tree_oid=? AND commit_oid=?
+ AND observed_ref=? AND observed_head=? AND phase='completed' AND retained=1 AND coverage_complete=1
+ AND seq<(SELECT seq FROM checkpoints WHERE id=?)`, cp.ID, target.WorktreeID, cp.TreeOID, cp.CommitOID,
+			target.BranchRef, target.ExpectedHead, target.CheckpointID).Scan(&seq)
+		if err != nil || seq <= lastSeq {
+			return ErrFinishIdentity
+		}
+		lastSeq = seq
+	}
+	return nil
+}
+
 func insertFinish(ctx context.Context, tx *sql.Tx, r FinishRequest, targetJSON string) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO finish_requests(request_id,attempt,worktree_id,checkpoint_id,target_json,state,stage,dry_run,deadline_ts,created_ts,updated_ts)
  VALUES(?,?,?,?,?,'running','preparing',?,?,?,?)`, r.ID, r.Attempt, r.Target.WorktreeID, r.Target.CheckpointID, targetJSON, r.DryRun, r.DeadlineTS, r.CreatedTS, r.UpdatedTS)
@@ -326,6 +366,9 @@ func StartFinishRequest(ctx context.Context, db *DB, r FinishRequest) (FinishReq
 		return FinishRequest{}, false, ErrFinishBudget
 	}
 	if err := validateFinishCheckpoint(ctx, tx, r.Target); err != nil {
+		return FinishRequest{}, false, err
+	}
+	if err := validateFinishCheckpointVersions(ctx, tx, r.Target); err != nil {
 		return FinishRequest{}, false, err
 	}
 	r.Attempt = 1
@@ -565,6 +608,9 @@ func FinishObjectPins(ctx context.Context, db *DB, worktree string) ([]FinishObj
 		}
 		if r.Target.TargetRef != "" {
 			pins = append(pins, FinishObjectPin{r.ID, r.Attempt, r.Target.TargetRef, r.Target.TargetCommitOID})
+		}
+		for _, cp := range r.Target.Checkpoints {
+			pins = append(pins, FinishObjectPin{r.ID, r.Attempt, cp.Ref, cp.CommitOID})
 		}
 		if len(r.Publication) > 0 {
 			var pin struct {

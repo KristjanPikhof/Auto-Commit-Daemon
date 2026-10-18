@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -197,7 +198,7 @@ func TestFinishRetryRestartAndDurableBudget(t *testing.T) {
 		t.Fatalf("failure %+v %v", failed, err)
 	}
 	retried, err := RetryFinishRequest(ctx, reopened, r.ID, nowSeconds()+600, true)
-	if err != nil || retried.Attempt != 2 || retried.PlanningCalls != 0 || !retried.DryRun || retried.Target != r.Target {
+	if err != nil || retried.Attempt != 2 || retried.PlanningCalls != 0 || !retried.DryRun || !reflect.DeepEqual(retried.Target, r.Target) {
 		t.Fatalf("retry %+v %v", retried, err)
 	}
 	if _, err := ConsumeFinishPlanningCall(ctx, reopened, r.ID, 1); !errors.Is(err, ErrFinishBudget) {
@@ -207,7 +208,7 @@ func TestFinishRetryRestartAndDurableBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	applied, err := RetryFinishRequest(ctx, reopened, r.ID, nowSeconds()+600, false)
-	if err != nil || applied.Attempt != 3 || applied.DryRun || applied.Target != r.Target {
+	if err != nil || applied.Attempt != 3 || applied.DryRun || !reflect.DeepEqual(applied.Target, r.Target) {
 		t.Fatalf("after preview %+v %v", applied, err)
 	}
 	var originalCalls int
@@ -226,7 +227,7 @@ func TestFinishRetrySupersedeAndDeadline(t *testing.T) {
 	}
 	next := startFinishFixture(t, db, finishFixture(t, db, 2))
 	old, err := LoadFinishRequest(ctx, db, first.ID)
-	if err != nil || old.SupersededBy != next.ID || old.Target != first.Target {
+	if err != nil || old.SupersededBy != next.ID || !reflect.DeepEqual(old.Target, first.Target) {
 		t.Fatalf("supersede %+v %v", old, err)
 	}
 	if _, err := RetryFinishRequest(ctx, db, first.ID, nowSeconds()+300, false); !errors.Is(err, ErrFinishState) {
