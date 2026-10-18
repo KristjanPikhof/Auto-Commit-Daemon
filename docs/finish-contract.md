@@ -129,9 +129,12 @@ An active attempt keeps the credentials it started with.
 
 ## Planning, provider bounds, and verification
 
-Plan completed goals before assigning changed paths. Keep implementation,
-callers, imports, tests, generated output, and relevant documentation together
-when they complete one goal. Put prerequisites first or in the same commit.
+Plan useful completed steps within the overall task before assigning changes.
+A behavior-preserving prerequisite and its feature can be separate commits;
+dependencies establish order rather than requiring one feature-wide batch.
+Keep each step's implementation, callers, tests, generated output, and relevant
+documentation together. Generated messages need a short body explaining the
+grounded reason or practical impact; internal purpose and boundary do not replace it.
 Each split needs a useful review/revert boundary and a valid intermediate tree.
 Different files, directories, save times, age, and queue pressure do not justify
 splits. Available unpublished corrections belong with the change they correct.
@@ -145,12 +148,24 @@ Coverage and equality are structural evidence, not proof that project tests ran.
 
 One Intent attempt allows one planning call plus at most one correction within
 one persisted `ai.timeout` deadline (default five minutes). Messages belong to
-that plan, so they have no separate retry loop. A valid AI plan whose proposed
-splits cannot produce complete safe candidates may collapse to one whole-batch
-goal using the provider's grounded purpose/message and all the same checks.
-This is conservative handling of a valid plan, not local fallback. Provider
-failure, malformed or incomplete output, unavailable evidence, and exhausted
-budget fail the request instead.
+that plan, so they have no separate retry loop. One batch must explain why the
+recorded changes do not support useful safe steps. Failed intermediate checks,
+provider failure, malformed or incomplete output, unavailable evidence, and
+exhausted budget fail the request instead of silently combining commits.
+
+Normal Intent finish can freeze earlier retained checkpoints in the same
+worktree and uninterrupted observed branch/HEAD window, up to 256 checkpoints.
+Restore, migration, and legacy capture membership also end the window. Select
+only versions on final changed eligible paths, keep rename/deletion transitions
+complete, and preserve each path's order. Pin selected snapshots through exact
+private finish refs before accepting the request. Retry uses those pins even
+if the original checkpoint refs are later pruned. Requests with exact messages
+or staged consent keep final-only evidence. No later checkpoint enters a retry.
+
+When no text diffs are shared, new finish requests require supplied context or
+an exact message. `provider_context_required` spends no provider call and needs
+a new request with context, not a retry with unchanged input. Existing history
+rewrite selection and Local behavior remain independent of that requirement.
 
 Provider inputs reuse existing byte limits. These bounds are separate from
 checkpoint storage; `capture.max_file_bytes` controls buffering and does not

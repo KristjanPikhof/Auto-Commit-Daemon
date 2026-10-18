@@ -49,6 +49,12 @@ Approving text diffs permits their redacted content to be sent to the selected
 provider. A local subprocess is also a recipient; being local does not grant
 it implicit permission.
 
+Without shared text diffs, a new Intent finish requires completion context or
+an exact batch message. Describe the problem, approach, and constraints in the
+quoted purpose. ACD does not enable diff sharing automatically. Metadata-only
+previews say that code diffs were not shared. When recorded intermediate versions
+are used, approved diffs describe each exact transition, not repeated final diffs.
+
 Binary or invalid-text blobs are metadata only. Their complete objects remain
 available locally for exact tree verification. Limits are independent of
 checkpoint storage:

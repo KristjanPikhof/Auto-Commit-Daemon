@@ -105,6 +105,12 @@ acd finish --include-staged
 acd finish --retry REQUEST_ID
 ~~~
 
+For Intent, give context about what changed and why so ACD can explain useful
+steps within the task. Generated messages include a short reason or concrete
+impact. If code diffs are not shared, context or an exact message is required.
+`--message` deliberately creates one batch and disables automatic splitting.
+See the [Intent flow](docs/intent-commit-flow.md) for recorded versions and previews.
+
 Finish freezes a fresh complete checkpoint, the attached branch and HEAD, and
 its options. It builds and checks the whole commit chain privately before one
 branch update. Later edits keep entering checkpoints for the next finish. The

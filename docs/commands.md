@@ -159,8 +159,12 @@ creates one complete batch commit without provider or network access. Intent
 uses the approved provider to plan completed goals and valid intermediate trees.
 A provider failure ends this request; it never switches to Local automatically.
 
-The optional quoted purpose supplies context. `--message` supplies the complete
-subject and optional body for one batch commit. Both modes support imperative
+The quoted purpose supplies context about what changed and why. Intent uses it
+to identify useful steps and explain decisions; when no text diffs are shared,
+context or an exact message is required. `--message` supplies the complete
+subject and optional body for one batch commit and disables automatic splitting.
+Generated Intent messages include a short reason or practical impact in the body.
+Both modes support imperative
 subjects (`Preserve staged content`) and scope-free conventional subjects
 (`fix: preserve staged content`). Change mode or style through reviewed settings.
 

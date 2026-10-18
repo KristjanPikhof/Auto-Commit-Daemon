@@ -18,6 +18,15 @@
 
 ### Changed
 
+- Plan useful Intent steps within a feature and include a grounded reason or
+  practical impact in generated messages. Metadata-only finish needs completion
+  context or an exact message. Help explains that `--message` disables splitting;
+  previews show proposed boundaries and when code diffs were not shared.
+- Freeze current checkpoint versions for safe same-file Intent steps. Preserve
+  selected versions through retention and retry without absorbing later saves;
+  order the commits by their dependencies and each commit's versions by recorded
+  order. Keep exact-message and staged-selection requests on final-only evidence.
+
 - Allow repeated setup in repositories created with the finish workflow while
   background checkpoints continue.
 - Restore compact repository rows in `acd list`. The default prints one
