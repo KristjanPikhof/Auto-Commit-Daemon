@@ -22,6 +22,13 @@ active hook sends one event to ACD instead of separate session and wake calls.
 Use `acd doctor` to inspect integration drift. Use `acd uninstall --dry-run`
 before removing verified owned entries.
 
+## Recommended agent instructions
+
+Add the [shared ACD guidance](../agent-guidance.md) to your global or repository
+`AGENTS.md`, or your tool's equivalent instruction file. Run `acd setup agents`
+for the guided preview, or `acd setup agents --manual` for commands and the
+instruction copy. Adding the section to a file requires an explicit choice.
+
 ## Agent task completion
 
 Once the requested job and relevant checks are complete, call `acd finish` in

@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -57,15 +58,15 @@ func newProductListCmd() *cobra.Command {
 	var interval time.Duration
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "Show live protection and commit progress",
+		Short: "Show protection and commit progress",
 		Long: `Show repositories active in the last hour, including those that need action,
 and repositories with unfinished work. Repositories that need action stay
-visible. Other idle repositories are hidden. Repository blocks stay in place
-while the view refreshes.
+visible. Other idle repositories are hidden. The compact table prints once,
+so you can scroll through it in your terminal.
 
-In a terminal, the dashboard refreshes until you stop it with Ctrl-C. Use
---once for one snapshot, --all for every enabled repository, or --verbose for
-operational details. Use acd repo list for the static registration inventory.`,
+Use --watch to refresh until Ctrl-C, --all for every enabled repository, or
+--verbose for operational details. Use acd repo list for the static registration
+inventory.`,
 		Example: `  acd list
   acd list --once
   acd list --all
@@ -95,17 +96,17 @@ operational details. Use acd repo list for the static registration inventory.`,
 				return invalidCommandError("acd list: --watch does not support --json")
 			}
 			stdout, _ := cmd.OutOrStdout().(*os.File)
-			if listUseWatchMode(stdout, once, watch) && !jsonOut {
+			if watch {
 				watchCtx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 				defer stop()
 				return runProductListWatchDisplay(watchCtx, cmd.OutOrStdout(), interval,
-					verbose, showAll, listUseWatchMode(stdout, false, false))
+					verbose, showAll, listOutputIsTerminal(stdout))
 			}
 			return runProductListOnceView(cmd.Context(), cmd.OutOrStdout(), jsonOut, verbose, showAll)
 		},
 	}
-	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh until Ctrl-C (default in a terminal)")
-	cmd.Flags().BoolVar(&once, "once", false, "Print one snapshot and exit")
+	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh until Ctrl-C")
+	cmd.Flags().BoolVar(&once, "once", false, "Print one snapshot and exit (default)")
 	cmd.Flags().BoolVar(&showAll, "all", false, "Include every enabled repository")
 	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include background activity and diagnostic details")
 	cmd.Flags().BoolVar(&interactive, "interactive", false, "Open the advanced repository manager")
@@ -298,19 +299,28 @@ func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]
 }
 
 func renderProductListSelection(out io.Writer, visible []productListEntry, hidden int, verbose, showAll bool) error {
+	if !verbose {
+		if err := renderProductListTable(out, visible); err != nil {
+			return err
+		}
+	}
 	labels := productListLabels(visible)
 	for index, entry := range visible {
+		if !verbose {
+			if (entry.ActionRequired || entry.State == productStateNeedsAction) && entry.NextAction != "" {
+				fmt.Fprintf(out, "\n%s: %s\n", safePreviewText(labels[index], 0), consoleProse(entry.NextAction))
+			}
+			continue
+		}
 		fmt.Fprintf(out, "%s\n  Saved: %s | Changes: %s\n  Status: %s\n",
 			safePreviewText(labels[index], 0), productListSafety(entry), productListSavedWork(entry), safePreviewText(productListDisplayStatus(entry), 0))
-		if verbose {
-			fmt.Fprintf(out, "  Repository: %s\n  Mode: %s | Last progress: %s\n",
-				safePreviewText(homeShort(entry.Repo), 0), productListMode(entry), productListProgressAge(entry))
-			fmt.Fprintf(out, "  Background protection: %s\n", safePreviewText(valueOrDash(entry.WorkerState), 0))
-			fmt.Fprintf(out, "  Older tool sessions: %d | Issues: %d\n  Last commit: %s\n", entry.Clients, entry.BlockedEvents, safePreviewText(productListLastCommit(entry.LastCommitOID), 0))
-			fmt.Fprintln(out, consoleProse("  Details: "+entry.Summary))
-			if summary := entry.CheckpointMaintenance.Summary(); summary != "" && !strings.Contains(entry.Summary, summary) {
-				fmt.Fprintln(out, consoleProse("  Cleanup: "+maintenanceDetails(entry.CheckpointMaintenance)))
-			}
+		fmt.Fprintf(out, "  Repository: %s\n  Mode: %s | Last progress: %s\n",
+			safePreviewText(homeShort(entry.Repo), 0), productListMode(entry), productListProgressAge(entry))
+		fmt.Fprintf(out, "  Background protection: %s\n", safePreviewText(valueOrDash(entry.WorkerState), 0))
+		fmt.Fprintf(out, "  Older tool sessions: %d | Issues: %d\n  Last commit: %s\n", entry.Clients, entry.BlockedEvents, safePreviewText(productListLastCommit(entry.LastCommitOID), 0))
+		fmt.Fprintln(out, consoleProse("  Details: "+entry.Summary))
+		if summary := entry.CheckpointMaintenance.Summary(); summary != "" && !strings.Contains(entry.Summary, summary) {
+			fmt.Fprintln(out, consoleProse("  Cleanup: "+maintenanceDetails(entry.CheckpointMaintenance)))
 		}
 		if entry.ActionRequired || entry.State == productStateNeedsAction {
 			if entry.NextAction != "" {
@@ -332,6 +342,21 @@ func renderProductListSelection(out io.Writer, visible []productListEntry, hidde
 		return err
 	}
 	return nil
+}
+
+func renderProductListTable(out io.Writer, entries []productListEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	labels := productListLabels(entries)
+	table := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(table, "REPOSITORY\tSAVED\tCHANGES\tMODE\tSTATUS")
+	for index, entry := range entries {
+		fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n", safePreviewText(labels[index], 0),
+			productListSafety(entry), productListSavedWork(entry), safePreviewText(productListMode(entry), 0),
+			safePreviewText(productListDisplayStatus(entry), 0))
+	}
+	return table.Flush()
 }
 
 func productListSavedWork(entry productListEntry) string {
@@ -359,7 +384,7 @@ func productListTarget(entry productListEntry) string {
 	if h := entry.PublicationOutcome.History; h != nil {
 		return "history:" + h.PlanID[:min(8, len(h.PlanID))]
 	}
-	if f := entry.PublicationOutcome.Finish; f != nil {
+	if f := entry.PublicationOutcome.Finish; f != nil && f.State != state.FinishFailed {
 		return "finish:" + f.RequestID[:min(8, len(f.RequestID))]
 	}
 	return "-"
@@ -379,7 +404,7 @@ func productListPhase(entry productListEntry) string {
 		if h := entry.PublicationOutcome.History; h != nil {
 			return "history-" + h.State
 		}
-		if f := entry.PublicationOutcome.Finish; f != nil {
+		if f := entry.PublicationOutcome.Finish; f != nil && f.State != state.FinishFailed {
 			if f.Stage != "" {
 				return f.Stage
 			}
@@ -481,11 +506,8 @@ func productListDisplayStatus(entry productListEntry) string {
 }
 
 func productListStatus(entry productListEntry) string {
-	if f := entry.PublicationOutcome.Finish; entry.PublicationOutcome.CheckpointAvailable && f != nil && (f.State == state.FinishFailed || f.State == state.FinishNeedsAttention) {
-		if f.State == state.FinishNeedsAttention {
-			return "finish needs review"
-		}
-		return "finish failed"
+	if f := entry.PublicationOutcome.Finish; entry.PublicationOutcome.CheckpointAvailable && f != nil && f.State == state.FinishNeedsAttention {
+		return "finish needs review"
 	}
 
 	switch {
@@ -551,13 +573,8 @@ func productListLabels(entries []productListEntry) []string {
 		if counts[label] < 2 {
 			continue
 		}
-		hash := entries[index].RepoHash
-		if len(hash) > 6 {
-			hash = hash[:6]
-		}
-		if hash == "" {
-			hash = filepath.Base(filepath.Dir(entries[index].Repo))
-		}
+		// Linked worktrees share a repository hash but need distinct labels.
+		hash := checkpoint.WorktreeID(entries[index].Repo)[:6]
 		labels[index] = fmt.Sprintf("%s [%s]", label, hash)
 	}
 	return labels

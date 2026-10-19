@@ -822,14 +822,13 @@ func (w *FinishWorker) publish(ctx context.Context, wt git.Worktree, r state.Fin
 	if err != nil {
 		return r, err
 	}
-	result, applyErr := git.ApplyFinishPublication(ctx, wt.Root, p, resume)
-	if applyErr == nil {
-		applyErr = git.WithProvenFinishPublication(ctx, wt.Root, p, func() error {
-			var err error
-			r, err = state.CompleteFinishPublication(ctx, w.DB, r.ID, r.Attempt, result)
-			return err
-		})
-	}
+	result, applyErr := git.ApplyFinishPublication(ctx, wt.Root, p, resume, func(result git.FinishPublicationResult) error {
+		completed, err := state.CompleteFinishPublication(ctx, w.DB, r.ID, r.Attempt, result)
+		if err == nil {
+			r = completed
+		}
+		return err
+	})
 	if applyErr == nil {
 		return r, nil
 	}

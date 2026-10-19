@@ -39,7 +39,7 @@ func TestProductListWatchKeepsRowsInPlace(t *testing.T) {
 	}
 }
 
-func TestProductListIdleWarningRemainsVisibleInCompactSnapshot(t *testing.T) {
+func TestProductListIdleAttentionRemainsVisible(t *testing.T) {
 	original := productListCollect
 	t.Cleanup(func() { productListCollect = original })
 	productListCollect = func(context.Context) (productListData, productState, error) {
@@ -58,7 +58,7 @@ func TestProductListIdleWarningRemainsVisibleInCompactSnapshot(t *testing.T) {
 			if ExitCode(err) != tc.exit {
 				t.Fatalf("exit=%d want=%d: %v", ExitCode(err), tc.exit, err)
 			}
-			if tc.name == "compact" && (!strings.Contains(out.String(), "idle-warning") || !strings.Contains(out.String(), "needs action")) {
+			if !strings.Contains(out.String(), "idle-warning") || strings.Contains(out.String(), "No recently active repositories") {
 				t.Fatal(out.String())
 			}
 		})

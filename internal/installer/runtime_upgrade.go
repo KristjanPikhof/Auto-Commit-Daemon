@@ -43,6 +43,8 @@ type RuntimeUpgradeOptions struct {
 	// the checkpoint barrier before any binary replacement. A failed probe
 	// leaves the old runtime and every repository untouched.
 	AllowUnadvertised bool
+	// Explicit setup must keep its reviewed hook selection and preimages.
+	reviewedSetup *Plan
 }
 
 func RuntimeCompatibility() supervisor.Compatibility {
@@ -175,6 +177,11 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 	if options.SourceExecutable == "" || options.SourceVersion == "" || options.Compatibility == (supervisor.Compatibility{}) {
 		return false, errors.New("runtime upgrade: incomplete source compatibility")
 	}
+	if options.reviewedSetup != nil {
+		if err := revalidateSetupPlan(ctx, roots, *options.reviewedSetup, false); err != nil {
+			return false, err
+		}
+	}
 	sourceDigest, err := version.FileDigest(options.SourceExecutable)
 	if err != nil {
 		return false, fmt.Errorf("runtime upgrade: digest source executable: %w", err)
@@ -211,6 +218,11 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 	upgrade, err = shouldUpgradeRuntime(status, sourceDigest, options)
 	if err != nil || !upgrade {
 		return false, err
+	}
+	if options.reviewedSetup != nil {
+		if err := revalidateSetupPlan(ctx, roots, *options.reviewedSetup, false); err != nil {
+			return false, err
+		}
 	}
 	registry, err := central.Load(roots)
 	if err != nil {
@@ -321,6 +333,15 @@ func ApplyCompatibleRuntime(ctx context.Context, roots paths.Roots, options Runt
 	for _, plan := range integrationPlans {
 		if !plan.Changed {
 			continue
+		}
+		current, err := os.ReadFile(plan.Target)
+		if errors.Is(err, os.ErrNotExist) {
+			current = nil
+		} else if err != nil {
+			return false, rollback(err)
+		}
+		if sha256String(current) != plan.BeforeDigest {
+			return false, rollback(fmt.Errorf("setup: integration changed after preview: %s", plan.Target))
 		}
 		if err := writeAtomic(plan.Target, plan.Content, 0o600); err != nil {
 			return false, rollback(err)

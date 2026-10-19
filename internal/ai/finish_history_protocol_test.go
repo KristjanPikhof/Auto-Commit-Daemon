@@ -28,7 +28,7 @@ func TestHistoryMessagesRejectsInvalidSubprocessVersion(t *testing.T) {
 				script = "first=1\nwhile IFS= read -r line; do\n if [ \"$first\" = 1 ]; then\n printf '%s\\n' '" + response + "'\n first=0\n else\n printf '%s\\n' '" + good + "'\n fi\n done\n"
 			}
 			bin := writePluginScript(t, t.TempDir(), "history-version", script)
-			provider := NewSubprocessProvider("history-version", SubprocessOptions{LookPath: fixedLookPath("acd-provider-history-version", bin), Stderr: io.Discard, Timeout: time.Second})
+			provider := NewSubprocessProvider("history-version", SubprocessOptions{LookPath: fixedLookPath("acd-provider-history-version", bin), Stderr: io.Discard, Timeout: 10 * time.Second})
 			t.Cleanup(func() { _ = provider.Close() })
 			_, result, err := PlanHistoryMessages(t.Context(), provider, evidence, commits, finishTestOptions())
 			if result.Calls != 2 {

@@ -88,6 +88,9 @@ func TestFinishIntegrationHintsEmbeddedGuidance(t *testing.T) {
 	for _, harness := range []string{"claude-code", "codex", "cursor", "opencode", "pi", "shell"} {
 		t.Run(harness, func(t *testing.T) {
 			readme := snippetBody(t, harness+"/README.md")
+			if !strings.Contains(readme, "../agent-guidance.md") || !strings.Contains(readme, "AGENTS.md") {
+				t.Fatal("integration does not recommend the shared agent instructions")
+			}
 			for _, required := range []string{"acd finish --repo /path/to/worktree", "authorize committing", "Local", "Intent", "Fix setup retries", "fix: handle setup retries", "retry finish automatically", "prompt text"} {
 				if !strings.Contains(readme, required) {
 					t.Errorf("missing task completion guidance %q", required)
@@ -109,6 +112,24 @@ func TestFinishIntegrationHintsEmbeddedGuidance(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSetupAgentGuidanceRecommendation(t *testing.T) {
+	guidance := snippetBody(t, "agent-guidance.md")
+	var out bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&out)
+	if err := renderSetupAgentsPlan(cmd, setupAgentsPlan{Guidance: guidance}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), guidance) || !strings.Contains(out.String(), "Copy only. Instruction files stay unchanged.") {
+		t.Fatalf("missing copy-ready recommendation: %s", out.String())
+	}
+	for _, required := range []string{"acd status", "acd finish", "relevant checks", "before handoff", "Preserve unrelated work", "Preserve user staging", "Questions and reviews do not authorize commits", "Do not", "retry finish automatically"} {
+		if !strings.Contains(guidance, required) {
+			t.Errorf("agent instructions omit %q", required)
+		}
 	}
 }
 
@@ -1111,6 +1132,20 @@ func TestSetupProgressIsSilentForQuietOrJSON(t *testing.T) {
 	}
 }
 
+func TestSetupProgressCollapsesRepositoryUpdates(t *testing.T) {
+	var out bytes.Buffer
+	progress := newSetupProgress(&out, false, 0)
+	progress.Update(installer.Progress{Phase: "readiness", Detail: "Checking repository protection"})
+	for _, detail := range []string{"Repositories ready: 0 of 2", "Repositories ready: 2 of 2", "Checking saved changes 1 of 2: /first/repository", "Checking saved changes 2 of 2: /second/repository"} {
+		progress.Update(installer.Progress{Phase: "readiness", Detail: detail})
+	}
+	progress.Update(installer.Progress{Phase: "completed", Detail: "Setup completed"})
+	progress.Close()
+	if got, want := out.String(), "Setup: Checking repository protection\nSetup: Setup completed\n"; got != want {
+		t.Fatalf("repository checks flooded output:\n%s", got)
+	}
+}
+
 func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
 	cmd := newSetupCmd()
 	var out bytes.Buffer
@@ -1120,7 +1155,7 @@ func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.Join(strings.Fields(out.String()), " ")
-	for _, required := range []string{"macOS", "Full Disk Access is not required", "without credentials or network access", "provider settings are optional"} {
+	for _, required := range []string{"macOS", "Full Disk Access is not required", "Fresh setup uses Local mode", "without credentials or network access", "Intent mode and AI provider settings are optional", "acd setup agents"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("setup help missing %q:\n%s", required, got)
 		}

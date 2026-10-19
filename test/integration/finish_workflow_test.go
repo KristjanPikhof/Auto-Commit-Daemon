@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +47,65 @@ func decodeFinishWorkflow(t *testing.T, result ExecResult) finishWorkflowResult 
 		t.Fatalf("finish returned an unsuccessful envelope: %s", result.Stdout)
 	}
 	return envelope.Data
+}
+
+func TestFinishWorkflowRepeatedReleaseBumps(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	f := newFinishFixture(t)
+	for build := 174; build <= 175; build++ {
+		body := fmt.Sprintf("CURRENT_PROJECT_VERSION = %d;\n", build)
+		writeFile(t, filepath.Join(f.Repo, "project.pbxproj"), body)
+		f.Barrier(t, ctx)
+		result := decodeFinishWorkflow(t, f.Run(t, ctx, "finish", "Update release build number", "--json"))
+		if result.State != state.FinishCompleted || !result.Published || result.CommitsCreated != 1 {
+			t.Fatalf("build %d finish: %+v", build, result)
+		}
+		if got := runGitOK(t, f.Repo, "show", "HEAD:project.pbxproj"); got != body {
+			t.Fatalf("build %d committed %q", build, got)
+		}
+		if dirty := runGitOK(t, f.Repo, "status", "--porcelain"); dirty != "" {
+			t.Fatalf("build %d left changes: %s", build, dirty)
+		}
+		assertFinishWorkflowStatus(t, ctx, f, true)
+	}
+}
+
+func TestFinishWorkflowCommittedWorkIgnoresOldFailedRequest(t *testing.T) {
+	var calls atomic.Int32
+	f := finishIntentFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeFinishChatArguments(t, w, `{"goals":[{"purpose":"Unrecorded work","message":"Complete unrecorded work","change_ids":["not-recorded"]}]}`)
+	}, "10s")
+	writeFile(t, filepath.Join(f.Repo, "version.txt"), "174\n")
+	failed := finishRunJSON(t, f, "finish", "Update release version")
+	if failed.OK || failed.Data.State != state.FinishFailed || calls.Load() != 2 {
+		t.Fatalf("request did not fail as expected: %+v, calls=%d", failed, calls.Load())
+	}
+	writeFile(t, filepath.Join(f.Repo, "version.txt"), "175\n")
+	runGitOK(t, f.Repo, "add", "version.txt")
+	runGitOK(t, f.Repo, "commit", "-m", "Update release version")
+	f.Barrier(t, t.Context())
+	assertFinishWorkflowStatus(t, t.Context(), f, true)
+	for _, command := range []string{"status", "on"} {
+		result := f.Run(t, t.Context(), command)
+		if result.ExitCode != 0 || !strings.Contains(result.Stdout, "No action needed.") {
+			t.Fatalf("%s lost current state: %+v", command, result)
+		}
+		for _, unwanted := range []string{"--retry", failed.Data.ID, "invalid_provider_plan", "Later changes:"} {
+			if strings.Contains(result.Stdout, unwanted) {
+				t.Fatalf("%s presented old request as a task:\n%s", command, result.Stdout)
+			}
+		}
+		t.Logf("%s:\n%s", command, result.Stdout)
+	}
+	detailed := f.Run(t, t.Context(), "status", "--verbose")
+	if detailed.ExitCode != 0 || !strings.Contains(detailed.Stdout, failed.Data.ID) {
+		t.Fatalf("verbose output lost request evidence: %+v", detailed)
+	}
+	if calls.Load() != 2 {
+		t.Fatal("status or protection retried the provider automatically")
+	}
 }
 
 func TestFinishWorkflowModesStylesAndCompleteGoals(t *testing.T) {

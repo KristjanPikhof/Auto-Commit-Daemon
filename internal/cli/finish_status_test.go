@@ -277,8 +277,8 @@ func TestFinishStatusPlanningCheckingFailedAndPublication(t *testing.T) {
 					t.Fatal("lost running check evidence")
 				}
 			case "failed":
-				if report.Busy || !strings.Contains(control.NextAction, r.ID) {
-					t.Fatal("failed retry target not shown")
+				if report.Busy || !strings.Contains(control.NextAction, "acd finish") || strings.Contains(control.NextAction, r.ID) {
+					t.Fatal("failed request should offer a fresh finish for current work")
 				}
 			case "preview":
 				if outcome.Finish.Published || outcome.PendingChanges != 1 {
@@ -414,7 +414,7 @@ func TestFinishStatusRecoveredLegacyIsSavedNotBranchCommitted(t *testing.T) {
 	}
 	var control controlResult
 	applyControlStatusWithDaemonAlive(&control, report, true)
-	if !control.OK || !strings.Contains(control.NextAction, "acd finish") || !strings.Contains(control.Summary, "Older saved work is retained separately") {
+	if !control.OK || !strings.Contains(control.NextAction, "acd finish") || !strings.Contains(control.Summary, "Older saved work is retained separately.") {
 		t.Fatalf("migration attention blocked healthy protection %+v", control)
 	}
 	finishStatusAssertViews(t, rec, db, report)
@@ -686,8 +686,13 @@ func TestFinishStatusCompletedHistoryCannotOverrideCurrentFinish(t *testing.T) {
 			if phase == "planning" && (!strings.Contains(control.Summary, "Preparing your commits.") || !report.Busy) {
 				t.Fatal("current planning phase lost")
 			}
-			if phase == "failed" && (!strings.Contains(control.NextAction, request.ID) || !strings.Contains(control.Summary, "Provider unavailable")) {
-				t.Fatal("current retry target lost")
+			if phase == "failed" {
+				if !strings.Contains(control.NextAction, "acd finish") || strings.Contains(control.NextAction, request.ID) {
+					t.Fatal("failed request should offer current work instead of requiring a retry")
+				}
+				if f := report.PublicationOutcome.Finish; f == nil || f.RequestID != request.ID || f.Reason != "Provider unavailable" {
+					t.Fatal("failed request evidence lost from diagnostics")
+				}
 			}
 			finishStatusAssertViews(t, rec, db, report)
 		})

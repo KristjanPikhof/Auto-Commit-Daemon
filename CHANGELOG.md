@@ -4,6 +4,11 @@
 
 ### Added
 
+- `acd setup agents` guides tool selection, previews hook and runtime changes,
+  and provides copy-ready commands and `AGENTS.md` instructions. Users can
+  apply a marked instruction section to a chosen file and explicitly enable
+  repository protection. Regular setup points to the guide.
+
 - `acd finish [PURPOSE]` freezes a fresh complete checkpoint, checks the whole
   proposed chain privately, and publishes through one branch update.
 - Finish supports exact messages, checked previews, explicit staged consent,
@@ -13,8 +18,11 @@
 
 ### Changed
 
-- Keep offline setup, saved-plan editing, and history safety details in command help.
-- Show unknown change counts while repository protection is being checked.
+- Allow repeated setup in repositories created with the finish workflow while
+  background checkpoints continue.
+- Restore compact repository rows in `acd list`. The default prints one
+  scrollable snapshot; use `--watch` for live refresh and `--verbose` for details.
+  Linked worktrees have distinct labels even when their repository names match.
 
 - File edits, hooks, idle time, and shutdown save checkpoints without AI,
   credentials, project checks, or new publication. Startup can settle a previously
@@ -38,6 +46,24 @@
   commits, recovery preservation, active requests, and required user action.
 
 ### Fixed
+
+- Keep old failed finish requests out of current status and retry suggestions
+  when current work is already committed. Retain request details in verbose
+  output and JSON. Separate optional commands from required actions, report
+  automatic retries as automatic, and collapse repeated setup progress.
+
+- Record finish completion before releasing Git locks, avoiding a race that left
+  successful commits marked as needing attention.
+  Retain the filesystem cause when acquiring a Git lock fails.
+
+- Keep macOS setup hook changes tied to their reviewed preview. Changed hooks
+  require a fresh preview, and choosing no hooks stays an empty selection.
+
+- Show interrupted finish recovery in doctor, status, list, and JSON even while
+  protection is scanning. Explicit support recovery preserves the saved request
+  and releases its block without changing current files, branches, or staging.
+- Retain recorded publication success when a later recovery attempt encounters
+  branch movement or changed Git state.
 
 - Shorten console messages, help, settings labels, and next steps. Keep technical
   causes in diagnostic details and preserve machine-readable values.

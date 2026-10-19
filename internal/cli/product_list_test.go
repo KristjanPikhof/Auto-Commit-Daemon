@@ -31,9 +31,29 @@ func TestProductListAllNeedsActionHumanRendersThenExitsThree(t *testing.T) {
 	if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
 		t.Fatalf("exit=%d rendered=%v err=%v, want rendered exit %d", ExitCode(err), ErrorRendered(err), err, ExitActionRequired)
 	}
-	for _, want := range []string{"Saved:", "Changes:", "needs action", "no"} {
+	for _, want := range []string{"SAVED", "CHANGES", "needs action", "no"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("human output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestProductListCompactTableKeepsEveryRepository(t *testing.T) {
+	entries := make([]productListEntry, 40)
+	for index := range entries {
+		entries[index] = productListEntry{Repo: fmt.Sprintf("/repo-%02d", index), Protected: true}
+	}
+	var out bytes.Buffer
+	if err := renderProductListSelection(&out, entries, 0, false, true); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 41 || !strings.Contains(lines[0], "SAVED") || strings.Contains(out.String(), "\033") {
+		t.Fatalf("expected a header and one row per repository: %s", out.String())
+	}
+	for index := range entries {
+		if !strings.HasPrefix(lines[index+1], fmt.Sprintf("repo-%02d", index)) {
+			t.Fatalf("repository missing or reordered: %s", lines[index+1])
 		}
 	}
 }
@@ -617,11 +637,11 @@ func TestProductListHooksCountButWorkerHeartbeatsDoNot(t *testing.T) {
 func TestProductListCompactLabelsDisambiguateCollisions(t *testing.T) {
 	entries := []productListEntry{
 		{Repo: "/work/team/project", RepoHash: "abcdef123", State: productStateProtected},
-		{Repo: "/personal/project", RepoHash: "123456789", State: productStateProtected},
+		{Repo: "/personal/project", RepoHash: "abcdef123", State: productStateProtected},
 		{Repo: "/work/unique", State: productStateProtected},
 	}
 	labels := productListLabels(entries)
-	want := []string{"project [abcdef]", "project [123456]", "unique"}
+	want := []string{"project [91452d]", "project [547503]", "unique"}
 	for index := range want {
 		if labels[index] != want[index] {
 			t.Fatalf("label[%d]=%q, want %q", index, labels[index], want[index])
@@ -703,8 +723,10 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	if err := renderProductListSelection(&out, []productListEntry{entry}, 0, false, true); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "repo\n  Saved: - | Changes: ?") {
-		t.Fatalf("unknown protection was not rendered distinctly: %s", out.String())
+	line := productListLineForRepo(t, out.String(), "repo")
+	columns := strings.Fields(line)
+	if len(columns) < 4 || columns[1] != "-" || columns[2] != "?" || columns[3] != "-" {
+		t.Fatalf("unknown protection was not rendered distinctly: %s", line)
 	}
 
 	entry = productListEntryFromOverview(record, supervisor.WorkerStatus{
@@ -903,6 +925,17 @@ func materializeProductListRepoWithSpaces(t *testing.T) string {
 		t.Fatalf("canonicalize spaced repository path: %v", err)
 	}
 	return realTarget
+}
+
+func productListLineForRepo(t *testing.T, output, repo string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, repo+" ") {
+			return line
+		}
+	}
+	t.Fatalf("repository row %q missing:\n%s", repo, output)
+	return ""
 }
 
 type productListFrameWriter struct {

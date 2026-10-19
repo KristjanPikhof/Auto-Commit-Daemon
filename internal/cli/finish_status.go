@@ -333,6 +333,12 @@ func readFinishStatusReport(ctx context.Context, rec central.RepoRecord, now tim
 			report.LastCommitOID = f.NewHead
 			report.LastCommitTS = int64(f.UpdatedTS)
 		}
+		if f.State == state.FinishFailed {
+			if outcome.CountsKnown && outcome.PendingChanges == 0 && outcome.WorktreeChanges == 0 {
+				outcome.LaterChanges = 0
+			}
+			report.PublicationProgress.Phase = "saved"
+		}
 	}
 	if h := outcome.History; h != nil && (h.State == "running" || h.State == "prepared") && !finishStatusTakesPriority(outcome.Finish) {
 		report.Busy = true
@@ -351,7 +357,7 @@ func readFinishStatusReport(ctx context.Context, rec central.RepoRecord, now tim
 		report.OperationalState = "finishing"
 	} else if !report.Protected {
 		report.OperationalState = "checkpointing"
-		if outcome.Finish == nil {
+		if !finishStatusTakesPriority(outcome.Finish) {
 			report.PublicationProgress.Phase = "checkpointing"
 		}
 	} else if outcome.CountsKnown && outcome.PendingChanges == 0 && liveCount == 0 {
@@ -510,6 +516,9 @@ func finishStatusSummary(f *finishStatusReport) string {
 			return commitCountLabel(f.CommitsCreated)
 		}
 	case state.FinishFailed:
+		if f.ReasonCode == "finish_preserved" {
+			return "Interrupted finish preserved. Review current changes before a new finish."
+		}
 		return "Failed: " + consoleCause(f.Reason) + " The requested changes remain saved."
 	case state.FinishNeedsAttention:
 		return "Needs attention: " + consoleCause(f.Reason) + " The requested changes remain saved."
@@ -522,7 +531,7 @@ func finishStatusSummary(f *finishStatusReport) string {
 }
 
 func finishStatusTakesPriority(f *finishStatusReport) bool {
-	return f != nil && f.State != state.FinishCompleted
+	return f != nil && (f.State == state.FinishRunning || f.State == state.FinishPrepared || f.State == state.FinishNeedsAttention)
 }
 
 func applyFinishControlStatus(res *controlResult, report statusReport, alive bool) {
@@ -557,6 +566,8 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 		if report.CaptureHealth.State == "retrying" {
 			res.OK = true
 			res.Health = controlHealthWaiting
+			res.Summary = "ACD is retrying automatically. Other readable changes remain saved."
+			res.NextAction = "No action needed."
 		}
 	case !report.Protected:
 		res.Health = controlHealthWaiting
@@ -565,16 +576,8 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 		res.Health = controlHealthPublishing
 		res.Summary = finishStatusSummary(report.PublicationOutcome.Finish)
 	default:
-		if f := report.PublicationOutcome.Finish; f != nil {
+		if f := report.PublicationOutcome.Finish; finishStatusTakesPriority(f) {
 			res.Summary = finishStatusSummary(f)
-			if f.State == state.FinishFailed {
-				res.NextAction = "After resolving the cause, run `acd finish --retry " + f.RequestID + "` to retry the same saved changes."
-			}
-			if f.State == state.FinishNeedsAttention {
-				res.OK = false
-				res.Health = controlHealthNeedsAttention
-				res.NextAction = "Run acd doctor to review the interrupted commit."
-			}
 		}
 		if res.NextAction == "No action needed." && (report.PublicationOutcome.PendingChanges > 0 || report.PublicationOutcome.WorktreeChanges > 0 || !report.PublicationOutcome.CountsKnown) {
 			res.NextAction = "Run `acd finish` when this work is complete."
@@ -592,6 +595,15 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 		}
 	}
 	applyMaintenanceStatus(res, report)
+	// Saving new edits and a blocked finish are independent. Neither a pending
+	// scan nor a maintenance warning may hide the request that blocks finish.
+	if f := report.PublicationOutcome.Finish; f != nil {
+		if f.State == state.FinishNeedsAttention {
+			res.OK = false
+			res.Health = controlHealthNeedsAttention
+			res.NextAction = "Review the interrupted finish with `acd support recover --force --dry-run`. Recovery needs your approval."
+		}
+	}
 }
 
 func renderFinishStatusChecks(out io.Writer, f *finishStatusReport) {

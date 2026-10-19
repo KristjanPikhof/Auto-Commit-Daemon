@@ -85,7 +85,22 @@ func TestFinishPublicationOneCASPreservesWorktree(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("later edit\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			result, err := ApplyFinishPublication(ctx, repo, p, false)
+			called := false
+			result, err := ApplyFinishPublication(ctx, repo, p, false, func(result FinishPublicationResult) error {
+				called = true
+				if !result.Published || !result.IndexReconciled {
+					t.Fatalf("journal result %+v", result)
+				}
+				for _, name := range []string{"index.lock", "HEAD.lock"} {
+					if _, err := os.Stat(filepath.Join(p.GitDir, name)); err != nil {
+						t.Fatalf("journal completed without %s: %v", name, err)
+					}
+				}
+				return nil
+			})
+			if !called {
+				t.Fatal("journal completion callback not called")
+			}
 			if err != nil || !result.Published || !result.IndexReconciled || result.StagedConsumed != staged || result.CommitsCreated != 2 {
 				t.Fatalf("result %+v: %v", result, err)
 			}
@@ -98,10 +113,6 @@ func TestFinishPublicationOneCASPreservesWorktree(t *testing.T) {
 			}
 			if stagedNow := finishGitRun(t, repo, "diff", "--cached", "--name-only"); stagedNow != "" {
 				t.Fatalf("unreconciled index: %s", stagedNow)
-			}
-			called := false
-			if err := WithProvenFinishPublication(ctx, repo, p, func() error { called = true; return nil }); err != nil || !called {
-				t.Fatalf("journal proof: %v", err)
 			}
 		})
 	}
@@ -130,6 +141,49 @@ func TestFinishPublicationVerificationFailureIsPrivate(t *testing.T) {
 	}
 }
 
+func TestFinishPublicationCompletionFailureCanRecover(t *testing.T) {
+	repo, opts := finishGitFixture(t, false)
+	p := buildFinishFixture(t, repo, opts)
+	journalErr := errors.New("journal unavailable")
+	result, err := ApplyFinishPublication(context.Background(), repo, p, false, func(FinishPublicationResult) error {
+		return journalErr
+	})
+	if !errors.Is(err, journalErr) || !result.Published || !result.IndexReconciled {
+		t.Fatalf("completion failure %+v: %v", result, err)
+	}
+	before := finishGitRun(t, repo, "reflog", "show", "--format=%H", "refs/heads/main")
+	called := false
+	result, err = ApplyFinishPublication(context.Background(), repo, p, true, func(FinishPublicationResult) error {
+		called = true
+		return nil
+	})
+	if err != nil || !called || !result.Published || !result.IndexReconciled {
+		t.Fatalf("recovery %+v called=%t: %v", result, called, err)
+	}
+	if after := finishGitRun(t, repo, "reflog", "show", "--format=%H", "refs/heads/main"); after != before {
+		t.Fatal("journal recovery published again")
+	}
+	for _, name := range []string{"index.lock", "HEAD.lock"} {
+		if _, err := os.Stat(filepath.Join(p.GitDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("recovery left %s: %v", name, err)
+		}
+	}
+}
+
+func TestFinishLockPreservesFilesystemError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.lock")
+	if err := os.WriteFile(path, []byte("another Git writer"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := acquireFinishLock(path, strings.Repeat("a", 64), false)
+	if !errors.Is(err, ErrFinishLock) || !errors.Is(err, os.ErrExist) {
+		t.Fatalf("missing lock or filesystem cause: %v", err)
+	}
+	if body, err := os.ReadFile(path); err != nil || string(body) != "another Git writer" {
+		t.Fatalf("foreign lock changed: %q: %v", body, err)
+	}
+}
+
 func TestFinishPublicationCrashRecovery(t *testing.T) {
 	for _, boundary := range []string{"locked", "before_cas", "after_cas", "before_index", "after_index"} {
 		t.Run(boundary, func(t *testing.T) {
@@ -137,7 +191,7 @@ func TestFinishPublicationCrashRecovery(t *testing.T) {
 			p := buildFinishFixture(t, repo, opts)
 			before := finishGitRun(t, repo, "reflog", "show", "--format=%H", "refs/heads/main")
 			crash := errors.New("worker stopped")
-			_, err := applyFinishPublication(context.Background(), repo, p, false, func(at string) error {
+			_, err := applyFinishPublication(context.Background(), repo, p, false, nil, func(at string) error {
 				if at == boundary {
 					return crash
 				}
@@ -155,11 +209,11 @@ func TestFinishPublicationCrashRecovery(t *testing.T) {
 					t.Fatalf("owned lock %s: %q %v", name, body, err)
 				}
 			}
-			result, err := ApplyFinishPublication(context.Background(), repo, p, true)
+			result, err := ApplyFinishPublication(context.Background(), repo, p, true, nil)
 			if err != nil || !result.Published || !result.IndexReconciled {
 				t.Fatalf("resume %+v: %v", result, err)
 			}
-			result, err = ApplyFinishPublication(context.Background(), repo, p, true)
+			result, err = ApplyFinishPublication(context.Background(), repo, p, true, nil)
 			if err != nil || !result.IndexReconciled {
 				t.Fatalf("idempotent resume %+v: %v", result, err)
 			}
@@ -176,7 +230,7 @@ func TestFinishPublicationPreservesLaterStaging(t *testing.T) {
 			repo, opts := finishGitFixture(t, true)
 			p := buildFinishFixture(t, repo, opts)
 			if published {
-				_, _ = applyFinishPublication(context.Background(), repo, p, false, func(at string) error {
+				_, _ = applyFinishPublication(context.Background(), repo, p, false, nil, func(at string) error {
 					if at == "after_cas" {
 						return errors.New("stop")
 					}
@@ -195,7 +249,7 @@ func TestFinishPublicationPreservesLaterStaging(t *testing.T) {
 			}
 			finishGitRun(t, repo, "add", "a.txt")
 			later, _ := IndexContentDigest(context.Background(), repo)
-			result, err := ApplyFinishPublication(context.Background(), repo, p, true)
+			result, err := ApplyFinishPublication(context.Background(), repo, p, true, nil)
 			if !errors.Is(err, ErrStagingChanged) || result.Published != published || result.IndexReconciled {
 				t.Fatalf("later staging %+v: %v", result, err)
 			}
@@ -245,7 +299,7 @@ func TestFinishPublicationUnsafeOwnership(t *testing.T) {
 				want = ErrFinishLock
 			case "symbolic_branch", "symbolic_branch_after_cas":
 				if scenario == "symbolic_branch_after_cas" {
-					if _, err := ApplyFinishPublication(context.Background(), repo, p, false); err != nil {
+					if _, err := ApplyFinishPublication(context.Background(), repo, p, false, nil); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -290,7 +344,7 @@ func TestFinishPublicationUnsafeOwnership(t *testing.T) {
 			case "moved_branch":
 				finishGitRun(t, repo, "commit", "--allow-empty", "-m", "Other work")
 			}
-			_, err := ApplyFinishPublication(context.Background(), repo, p, true)
+			_, err := ApplyFinishPublication(context.Background(), repo, p, true, nil)
 			if !errors.Is(err, want) {
 				t.Fatalf("unsafe %s: %v", scenario, err)
 			}
@@ -323,7 +377,7 @@ func TestFinishPublicationRejectsHEADReplacementAtPrepare(t *testing.T) {
 	if err := os.WriteFile(hook, []byte(body), 0700); err != nil {
 		t.Fatal(err)
 	}
-	result, err := ApplyFinishPublication(context.Background(), repo, p, false)
+	result, err := ApplyFinishPublication(context.Background(), repo, p, false, nil)
 	if !errors.Is(err, ErrFinishUnsafe) || result.Published {
 		t.Fatalf("changed HEAD identity %+v: %v", result, err)
 	}
@@ -342,7 +396,7 @@ func TestFinishPublicationRejectsSecondWorktreeAtPrepare(t *testing.T) {
 	if err := os.WriteFile(hook, []byte(body), 0700); err != nil {
 		t.Fatal(err)
 	}
-	result, err := ApplyFinishPublication(context.Background(), repo, p, false)
+	result, err := ApplyFinishPublication(context.Background(), repo, p, false, nil)
 	if !errors.Is(err, ErrFinishUnsafe) || result.Published {
 		t.Fatalf("second owner during prepare %+v: %v", result, err)
 	}
@@ -366,7 +420,7 @@ func TestFinishPublicationUnbornBranch(t *testing.T) {
 			}
 			opts := FinishBuildOptions{RequestID: "root", Attempt: 1, WorktreeID: "0123456789abcdef", BranchRef: "refs/heads/main", TargetTree: tree, IndexDigest: digest, ObjectRef: FinishRefPrefix + "root/1", Commits: []FinishCommit{{TreeOID: tree, Message: "Add root", AuthorName: "Original Author", AuthorEmail: "original@example.com", AuthorDate: "2025-01-02T03:04:05Z"}}}
 			p := buildFinishFixture(t, repo, opts)
-			result, err := ApplyFinishPublication(context.Background(), repo, p, false)
+			result, err := ApplyFinishPublication(context.Background(), repo, p, false, nil)
 			if err != nil || !result.IndexReconciled {
 				t.Fatalf("root %+v: %v", result, err)
 			}

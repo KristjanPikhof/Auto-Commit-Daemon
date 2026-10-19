@@ -55,6 +55,10 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Start protecting, then finish a change
 
+For coding agents, run `acd setup agents` to choose hooks and get the
+copy-ready `AGENTS.md` instructions. The guide previews changes before applying
+them. Use `acd setup agents --manual` for commands and instructions only.
+
 Run commands from any directory inside the worktree, or select it with
 `--repo /path/to/worktree`. Linked worktrees have separate protected batches.
 

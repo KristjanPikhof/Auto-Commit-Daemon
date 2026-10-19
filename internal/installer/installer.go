@@ -307,6 +307,10 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 		return Result{}, errors.New("setup: plan digest mismatch")
 	}
 	if plan.Mode == "compatible_upgrade" {
+		selection := "none"
+		if len(plan.Integrations) > 0 {
+			selection = strings.Join(plan.Integrations, ",")
+		}
 		forceReplacement := false
 		for _, integrationPlan := range plan.IntegrationPlans {
 			if integrationPlan.Changed {
@@ -318,7 +322,8 @@ func Apply(ctx context.Context, roots paths.Roots, plan Plan, options ApplyOptio
 			SourceExecutable:             plan.SourceExecutable,
 			SourceVersion:                version.String(),
 			Compatibility:                RuntimeCompatibility(),
-			Integrations:                 strings.Join(plan.Integrations, ","),
+			Integrations:                 selection,
+			reviewedSetup:                &plan,
 			Force:                        forceReplacement,
 			AllowUnadvertised:            true,
 			AllowSameDistanceReplacement: true,

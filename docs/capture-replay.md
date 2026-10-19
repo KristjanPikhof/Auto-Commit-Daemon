@@ -107,8 +107,19 @@ silently overwritten. Working files stay unchanged. After a crash, exact
 prepared proof can complete forward; ambiguity requires attention. A running
 request interrupted before preparation becomes failed and needs explicit retry.
 
+Finish holds the index and prepared ref locks until completion is recorded.
+Lock failures retain the underlying filesystem error in diagnostic details.
+
 Ambiguous finish or history publication requires attention in status and list,
 even while checkpoint protection remains healthy.
+
+For an interrupted finish, explicit support recovery can verify and retain its
+private checkpoint, target, and prepared chain, then release the request's
+block on new finishes. It keeps all original publication and staging evidence
+and makes no new publication claim. This recovery requires a reviewed
+`acd support recover --force --dry-run` followed by `--force --yes`. It leaves
+current branches, files, and staging unchanged. Startup never performs this
+recovery automatically, and missing private proof still requires attention.
 
 ## Unsafe Git states
 

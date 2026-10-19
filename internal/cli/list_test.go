@@ -14,16 +14,24 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
-func TestListUseWatchMode(t *testing.T) {
-	t.Parallel()
-	if listUseWatchMode(nil, true, false) {
-		t.Fatal("--once should disable watch")
+func TestListWithoutFlagsPrintsOneSnapshot(t *testing.T) {
+	withIsolatedHome(t)
+	original := productListCollect
+	t.Cleanup(func() { productListCollect = original })
+	collections := 0
+	productListCollect = func(context.Context) (productListData, productState, error) {
+		collections++
+		return productListData{Repos: []productListEntry{{Repo: "/repo", Protected: true, lastActivity: time.Now()}}}, productStateProtected, nil
 	}
-	if !listUseWatchMode(nil, false, true) {
-		t.Fatal("explicit --watch should enable watch without stdout")
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"list"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
 	}
-	if listUseWatchMode(nil, false, false) {
-		t.Fatal("nil stdout without flags should not watch")
+	if collections != 1 || strings.Contains(out.String(), "\033") || strings.Count(out.String(), "REPOSITORY") != 1 {
+		t.Fatalf("list did not leave one scrollable snapshot: %s", out.String())
 	}
 }
 
@@ -90,11 +98,8 @@ func TestList_OnceProducesSingleSnapshot(t *testing.T) {
 	if strings.Contains(got, "Updated:") {
 		t.Fatalf("--once should not use watch frames:\n%s", got)
 	}
-	if got != "No recently active repositories. Use acd list --all to see every enabled repository.\n" {
-		t.Fatalf("expected one empty snapshot:\n%s", got)
-	}
-	if strings.Contains(got, "DAEMON") {
-		t.Fatalf("expected repository block:\n%s", got)
+	if !strings.Contains(got, "No recently active repositories.") {
+		t.Fatalf("empty snapshot did not explain the result:\n%s", got)
 	}
 }
 

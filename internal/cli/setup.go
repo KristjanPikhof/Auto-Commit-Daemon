@@ -91,9 +91,11 @@ provider settings are optional.
 
 After installation, interactive setup asks separately whether to protect the
 current repository. You can also run acd on in each repository.
+Run acd setup agents for guided hooks and agent instructions.
 On macOS, run setup from the terminal or coding tool that should own the
 background service. Full Disk Access is not required.`,
 		Example: `  acd setup
+  acd setup agents
   acd setup --dry-run
   acd setup --yes --non-interactive --expect-plan sha256:...`,
 		Args:         cobra.RangeArgs(0, 1),
@@ -147,6 +149,9 @@ background service. Full Disk Access is not required.`,
 	cmd.Flags().BoolVar(&onboarding.ConfirmInsecureHTTP, "confirm-insecure-http", false, "Allow unencrypted HTTP after reviewing the warning")
 	cmd.Flags().BoolVar(&onboarding.ConfirmDiffEgress, "confirm-diff-egress", false, "Allow redacted repository changes to be sent later")
 	_ = cmd.Flags().MarkHidden("raw")
+	if !initCompat {
+		cmd.AddCommand(withInvocationCapabilities(newSetupAgentsCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}))
+	}
 	return cmd
 }
 
@@ -249,7 +254,7 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	}
 	fmt.Fprintln(cmd.OutOrStdout(), "Setup complete.")
 	fmt.Fprintf(cmd.OutOrStdout(), "ACD version: %s\nProtection checked for enabled repositories.\n", version.String())
-	fmt.Fprintln(cmd.OutOrStdout(), "Existing repositories kept their protection settings.")
+	fmt.Fprintln(cmd.OutOrStdout(), "\nOptional: Run `acd setup agents` to configure coding-tool hooks and instructions.")
 	if onboardingState != nil {
 		fmt.Fprintf(cmd.OutOrStdout(), "Preferences: %s, %s commits, %s provider.\n",
 			setupModeLabel(onboardingState.Draft),
@@ -271,11 +276,11 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 // Installation consent never includes repository enablement. Use the same
 // operation as `acd on`, which confirms the initial checkpoint before success.
 func offerSetupProtection(cmd *cobra.Command, repo string, enable func(context.Context, io.Writer, string, bool) error) error {
-	fmt.Fprintf(cmd.ErrOrStderr(), "Protect %s now? [y/N] ", repo)
+	fmt.Fprintf(cmd.ErrOrStderr(), "\nProtect %s now? [y/N] ", repo)
 	var answer string
 	_, _ = fmt.Fscanln(cmd.InOrStdin(), &answer)
 	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
-		fmt.Fprintln(cmd.OutOrStdout(), "Next: Run `acd on` in this repository when you want protection.")
+		fmt.Fprintln(cmd.OutOrStdout(), "Optional: Run `acd on` here when you want protection.")
 		return nil
 	}
 	if err := enable(cmd.Context(), cmd.OutOrStdout(), repo, false); err != nil {
@@ -292,10 +297,10 @@ func renderSetupNextAction(out io.Writer, plan installer.Plan) {
 		return
 	}
 	if plan.FreshDefaults {
-		fmt.Fprintln(out, "Next: Run `acd on` inside each repository you want ACD to protect.")
+		fmt.Fprintln(out, "Optional: Run `acd on` inside each repository you want ACD to protect.")
 		return
 	}
-	fmt.Fprintln(out, "Next: No action needed. Run `acd on` inside any new repository you want to protect.")
+	fmt.Fprintln(out, "No action needed.\nOptional: Run `acd on` inside any new repository you want to protect.")
 }
 
 type setupProgress struct {
@@ -327,13 +332,16 @@ func (p *setupProgress) Update(update installer.Progress) {
 		return
 	}
 	p.mu.Lock()
-	if update.Phase != p.phase {
+	defer p.mu.Unlock()
+	changed := update.Phase != p.phase
+	if changed {
 		p.phase = update.Phase
 		p.started = time.Now()
 	}
 	p.detail = update.Detail
-	fmt.Fprintf(p.out, "Setup: %s\n", update.Detail)
-	p.mu.Unlock()
+	if changed {
+		fmt.Fprintf(p.out, "Setup: %s\n", update.Detail)
+	}
 }
 
 func (p *setupProgress) heartbeat() {

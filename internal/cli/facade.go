@@ -58,6 +58,7 @@ the exact next command to run.`,
 			if err := renderControl(cmd.OutOrStdout(), result, false); err != nil {
 				return err
 			}
+			renderFinishRequestDetails(cmd.OutOrStdout(), result.PublicationOutcome.Finish)
 			renderProductPublicationProgress(cmd.OutOrStdout(), result.PublicationProgress)
 			if detail := maintenanceDetails(result.CheckpointMaintenance); detail != "" {
 				fmt.Fprintln(cmd.OutOrStdout(), consoleProse(detail))
@@ -114,6 +115,7 @@ support.`,
 					return err
 				}
 				renderProductDoctorWorker(cmd.OutOrStdout(), status)
+				renderFinishRequestDetails(cmd.OutOrStdout(), status.PublicationOutcome.Finish)
 				renderProductDoctorSettings(cmd.OutOrStdout(), details)
 			}
 			if envelope.State == productStateNeedsAction {
@@ -125,6 +127,19 @@ support.`,
 	cmd.Flags().BoolVar(&bundle, "bundle", false, "Create a sanitized support archive")
 	cmd.Flags().StringVar(&output, "output", "", "Folder for the support archive")
 	return cmd
+}
+
+func renderFinishRequestDetails(out io.Writer, f *finishStatusReport) {
+	if f == nil {
+		return
+	}
+	heading := "Last finish"
+	if f.State == state.FinishNeedsAttention {
+		heading = "Interrupted finish"
+	}
+	fmt.Fprintf(out, "\n%s:\n  Request: %s\n  Target branch: %s\n  Result: %s\n",
+		heading, f.RequestID, strings.TrimPrefix(f.BranchRef, "refs/heads/"), consoleProse(finishStatusSummary(f)))
+	renderFinishStatusChecks(out, f)
 }
 
 func renderProductDoctorWorker(out io.Writer, status controlResult) {
@@ -192,6 +207,13 @@ func runProductDiagnose(ctx context.Context, out io.Writer, repo string, jsonOut
 }
 
 func renderProductDiagnoseReport(out io.Writer, report diagnoseReport) error {
+	if f := report.PublicationOutcome.Finish; f != nil && f.State == state.FinishNeedsAttention {
+		next := strings.Join(report.Remediation, " ")
+		return renderJSONEnvelope(out, productEnvelope{
+			OK: true, State: productStateNeedsAction,
+			Actions: []productAction{}, NextAction: &next, Data: report,
+		})
+	}
 	if report.OperationalState == "paused" {
 		next := "Run `acd status` to review the pause reason."
 		return renderJSONEnvelope(out, productEnvelope{
@@ -702,7 +724,7 @@ func newSupportRecoverCmd() *cobra.Command {
 	command := newFixCmd()
 	command.Use = "recover"
 	command.Short = "Preview or recover protected work that cannot publish"
-	command.Long = "Preview recovery of older saved work that ACD cannot add to Git safely.\n\nReview the plan before using --yes to apply it. Recovery does not start a new\nfinish request or rewrite current Git history. Use --force only to preserve\nunresolved work in a private recovery archive. Run acd status for current work."
+	command.Long = "Preview recovery of saved work or an interrupted finish.\n\nReview the plan before using --yes to apply it. With --force, recovery can\npreserve an interrupted finish's private snapshots and evidence, then release\nits block on new requests. This does not claim the old finish completed or\nconsume staging. Current branches, files, and staging stay unchanged. Review\ncurrent changes before starting a new finish."
 	command.Example = `  acd support recover --dry-run
   acd support recover --yes
   acd support recover --force --dry-run

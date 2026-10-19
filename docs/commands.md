@@ -14,6 +14,7 @@ compatibility alias:
 |---|---|
 | `acd config` | Review and save global or repository settings and permissions. |
 | `acd setup` | Review installation, integrations, and an explicit runtime upgrade. |
+| `acd setup agents` | Guide hook setup, agent instructions, and optional repository protection. |
 | `acd status` | Read current protection, branch outcome, and explicit request state. |
 | `acd on` | Enable this worktree and confirm a complete checkpoint. |
 | `acd off` | Save a final checkpoint, disable protection, and stop its worker. |
@@ -34,6 +35,7 @@ such as `list` reject `--repo`; they already operate across repositories.
 ~~~bash
 acd setup --dry-run
 acd setup
+acd setup agents
 acd on
 acd off
 ~~~
@@ -68,13 +70,21 @@ require their exact permissions. HTTP additionally needs
 and provider redirects are refused.
 
 Setup preview writes nothing and runs no provider, service, migration, or Git
-mutation. Apply uses the reviewed plan and preserves database backups and private
+mutation. In repositories created with the finish workflow, ordinary background
+saves do not invalidate a reviewed setup plan. Changes to preserved legacy
+evidence still require a new preview. Apply preserves database backups and private
 provenance during an incompatible upgrade. Disabled repositories keep their old
 state until explicitly activated. Ambiguous legacy publication can remain
 `needs_attention` without blocking current protection, finish, or history rewrite. Current read-only
 commands inspect old records without upgrading them.
 
 Setup installation and repository enablement are separate consent steps.
+For coding tools, run `acd setup agents`. It previews hook changes, prints the
+copy-ready `AGENTS.md` section, and offers to add it to a chosen instruction
+file. Use `--manual` for instructions and commands without changes, or
+`--dry-run` to preview specific options. Non-terminal runs preview by default;
+`--yes` applies the displayed options. Adding instructions and enabling
+protection are explicit choices. See [the agent setup guide](multi-tool.md).
 After installation, use `acd config` to change the finish mode, provider, or
 credentials. Setup upgrades preserve those settings and reject first-setup
 preference flags rather than ignoring them.
@@ -93,18 +103,42 @@ current coverage. Saved history remains available.
 
 ## Console output
 
-Normal output shows whether checked changes are saved, whether they are in
-local Git commits, and the next action when needed. Use `status --verbose` or
-`--json` for saved request IDs, hashes, checks, and background process details.
+Normal output leads with current protection and Git commit status.
+`Action required` marks a problem ACD cannot safely resolve on its own.
+Suggestions such as finishing saved work or configuring hooks are labeled
+`Optional`. ACD handles protection scans and automatic capture retries itself.
+Creating commits and approving recovery remain explicit user decisions.
+Use `status --verbose` or `--json` for saved request IDs, hashes, checks, and
+background process details.
 A saved checkpoint does not mean a Git commit was created.
 
-`list` uses repository blocks. Repositories requiring action remain visible;
-`--all` also shows idle repositories. Redirected `list --watch` appends dated
-updates without terminal screen controls. `on --quiet` hides the startup wait.
+An old failed finish does not require a retry when current work is already
+committed. Normal status omits that failure; verbose output and JSON retain the
+saved request. When current work is ready, a new `acd finish` uses current files.
+Setup prints each phase once, with progress reminders only while a phase takes
+time, instead of printing every repository check.
+
+`list` prints a compact table once and exits, leaving terminal scrollback
+available. Each row shows a repository's saved coverage, pending changes, mode,
+and status. Repositories requiring action remain visible, with next steps below
+the table. `--all` includes idle repositories; `--verbose` shows detailed
+repository blocks. Use `list --watch` for live refresh until Ctrl-C. Redirected
+watch output appends dated updates without terminal screen controls.
+`--once` remains an explicit alias for the default snapshot. `on --quiet` hides
+the startup wait.
 
 A failed finish can be retried after its cause is resolved. A finish needing
 attention points to `acd doctor`; retry does not bypass missing safety evidence.
 A retry can restart the saved request and always keeps its original changes.
+
+When a finish remains interrupted after branch or index changes, doctor points
+to `acd support recover --force --dry-run`. Review that plan, then use
+`acd support recover --force --yes` to preserve the request and release its
+block on new finishes. Recovery backs up the database and verifies the saved
+private snapshots. It preserves the original request and publication evidence;
+it does not claim completion or consume staging. Current files and branches
+stay unchanged. Review `git diff` and `git diff --cached` before a new finish.
+Missing or changed snapshot proof keeps the request blocked.
 
 Check results say whether a project command ran, an earlier result was reused,
 or no project checks were configured. Structure checks alone do not mean the

@@ -14,7 +14,7 @@ func TestProductListLegacyWarningPreservesCurrentStatus(t *testing.T) {
 		{"healthy", "up_to_date", "", "healthy", "ready", productStateProtected},
 		{"checkpointing", "checkpointing", "", "waiting", "saved, awaiting finish", productStateWaiting},
 		{"finishing", "finishing", state.FinishRunning, "working", "Finish is in progress.", productStatePublishing},
-		{"finish-failed", "saved", state.FinishFailed, "finish failed", "finish failed", productStateNeedsAction},
+		{"finish-failed", "saved", state.FinishFailed, "healthy", "ready", productStateProtected},
 		{"finish-attention", "saved", state.FinishNeedsAttention, "finish needs review", "finish needs review", productStateNeedsAction},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {

@@ -244,6 +244,11 @@ func activeFinish(ctx context.Context, q finishReader, worktree string) (FinishR
 	return scanFinish(q.QueryRowContext(ctx, finishSelect+` WHERE worktree_id=? AND state IN ('running','prepared','needs_attention')`, worktree))
 }
 
+// ReadActiveFinishRequest inspects existing evidence without opening a writer.
+func ReadActiveFinishRequest(ctx context.Context, conn *sql.DB, worktree string) (FinishRequest, error) {
+	return activeFinish(ctx, conn, worktree)
+}
+
 func ActiveFinishRequest(ctx context.Context, db *DB, worktree string) (FinishRequest, error) {
 	if version, err := finishReadVersion(ctx, db); err != nil {
 		return FinishRequest{}, err
