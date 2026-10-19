@@ -398,12 +398,12 @@ func (w *FinishWorker) protect(ctx context.Context, wt git.Worktree, cfg FinishW
 	return cp, nil
 }
 
-func readFinishTree(ctx context.Context, repo, tree string) (finish.Tree, error) {
+func readFinishTree(ctx context.Context, repo, tree string, paths ...string) (finish.Tree, error) {
 	result := finish.Tree{}
 	if tree == "" {
 		return result, nil
 	}
-	entries, err := git.LsTree(ctx, repo, tree, true)
+	entries, err := git.LsTree(ctx, repo, tree, true, paths...)
 	if err != nil {
 		return nil, err
 	}

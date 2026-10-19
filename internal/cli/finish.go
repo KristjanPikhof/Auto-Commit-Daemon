@@ -80,6 +80,7 @@ type finishCLIResult struct {
 	NewHead             string               `json:"new_head"`
 	StagedConsumed      bool                 `json:"staged_consumed"`
 	WorktreeChanges     int                  `json:"worktree_changes"`
+	SnapshotSavedAt     string               `json:"snapshot_saved_at,omitempty"`
 }
 
 func runFinish(ctx context.Context, out, progress io.Writer, repo string, params finishStartParams, jsonOut, quiet bool) error {
@@ -89,6 +90,13 @@ func runFinish(ctx context.Context, out, progress io.Writer, repo string, params
 	}
 	if !lookup.Registered || lookup.Record.LifecycleDisabled() {
 		return actionRequiredError("protection_required", "acd finish: enable protection first with `acd on`")
+	}
+	if !quiet && !jsonOut {
+		if params.RetryID != "" {
+			fmt.Fprintln(progress, "Reconnecting to the saved finish request; later edits stay for the next finish.")
+		} else {
+			fmt.Fprintln(progress, "Saving current changes for this finish. Later edits stay for the next finish.")
+		}
 	}
 	r, err := finishRequest(ctx, lookup, "finish_start", params)
 	if err != nil {
@@ -161,6 +169,11 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	defer cancel()
 	count, countErr := productWorktreeChangeCount(readCtx, lookup.Worktree.Root)
 	result.WorktreeChanges = count
+	if r.Target.CheckpointID != "" {
+		if cp, err := state.ResolveCheckpoint(readCtx, state.DBPathFromGitDir(lookup.Worktree.GitDir), r.Target.CheckpointID); err == nil {
+			result.SnapshotSavedAt = time.Unix(0, int64(cp.CreatedTS*float64(time.Second))).Local().Format(time.RFC3339)
+		}
+	}
 	ok := r.State == state.FinishCompleted && !detached
 	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required" && r.ReasonCode != "provider_diffs_required"
 	exit, failureCode := finishExit(r, waitCode)
@@ -236,12 +249,26 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			}
 		}
 		if !r.DryRun {
+			shown := make(map[string]bool)
 			for _, check := range result.Verification {
-				fmt.Fprintln(out, finishCheckLabel(check))
+				label := finishCheckLabel(check)
+				if !shown[label] {
+					fmt.Fprintln(out, label)
+					shown[label] = true
+				}
 			}
 		}
 		if countErr == nil && count > 0 {
-			fmt.Fprintf(out, "Current working copy: %d changed items outside Git commits.\n", count)
+			fmt.Fprintf(out, "Uncommitted files remaining: %d.\n", count)
+			if saved.Published {
+				if result.SnapshotSavedAt != "" {
+					fmt.Fprintf(out, "This finish used the snapshot saved at %s.\n", result.SnapshotSavedAt)
+				}
+				fmt.Fprintln(out, "Later edits and excluded files stay in your working copy.")
+				fmt.Fprintln(out, "Inspect them with `git status --short`. Run `acd finish` when the remaining work is ready.")
+			}
+		} else if countErr == nil && saved.Published {
+			fmt.Fprintln(out, "Working copy: clean.")
 		}
 		if next != "" {
 			label := "Optional"

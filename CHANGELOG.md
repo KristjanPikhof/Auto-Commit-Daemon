@@ -60,6 +60,9 @@
 
 ### Fixed
 
+- Explain remaining uncommitted files after finish, show the saved snapshot's
+  time, and print repeated project-check results once. Read only relevant paths
+  from retained checkpoint versions during Intent preparation.
 - Read long process command lines completely during ownership checks and
   diagnostics, so unrelated processes cannot prevent safe recovery.
 - Treat deadline-cancelled Git reads in `acd list` as incomplete checks. Keep

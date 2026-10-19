@@ -31,6 +31,23 @@ func finishCaptureVersion(t *testing.T, w *FinishWorker) state.Checkpoint {
 	return cp
 }
 
+func TestFinishVersionReadsOnlyChangedPaths(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "selected[1].txt", "recorded version\n")
+	finishWrite(t, f.dir, "unrelated.txt", "unrelated content\n")
+	cp := finishCaptureVersion(t, w)
+	proof := state.FinishCheckpoint{ID: cp.ID, Ref: cp.Ref, CommitOID: cp.CommitOID, TreeOID: cp.TreeOID}
+	err := withFinishVersion(t.Context(), f.dir, proof, []string{"selected[1].txt", "missing.txt"}, func(_ context.Context, tree finish.Tree) error {
+		if len(tree) != 1 || tree["selected[1].txt"].OID == "" {
+			t.Fatalf("checkpoint read included unrelated paths or lost a literal filename: %+v", tree)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func finishDecisionFixture(t *testing.T) (*captureFixture, *FinishWorker, state.Checkpoint) {
 	t.Helper()
 	f, w := finishWorkerFixture(t)

@@ -34,13 +34,13 @@ func finishVersionTree(current, snapshot finish.Tree, paths []string) finish.Tre
 }
 
 // withFinishVersion proves the pin before reading any recorded path versions.
-func withFinishVersion(ctx context.Context, repo string, cp state.FinishCheckpoint, use func(context.Context, finish.Tree) error) error {
+func withFinishVersion(ctx context.Context, repo string, cp state.FinishCheckpoint, paths []string, use func(context.Context, finish.Tree) error) error {
 	return git.WithLockedPrivateRef(ctx, repo, cp.Ref, cp.CommitOID, func(locked context.Context) error {
 		tree, err := git.RevParse(locked, repo, cp.CommitOID+"^{tree}")
 		if err != nil || tree != cp.TreeOID {
 			return errors.Join(err, state.ErrFinishIdentity)
 		}
-		snapshot, err := readFinishTree(locked, repo, tree)
+		snapshot, err := readFinishTree(locked, repo, tree, paths...)
 		if err != nil {
 			return err
 		}
@@ -73,7 +73,7 @@ func (w *FinishWorker) freezeFinishCheckpoints(ctx context.Context, wt git.Workt
 	var versions []state.FinishCheckpoint
 	for _, source := range checkpoints {
 		proof := state.FinishCheckpoint{ID: source.ID, Ref: source.Ref, CommitOID: source.CommitOID, TreeOID: source.TreeOID}
-		err := withFinishVersion(ctx, wt.Root, proof, func(locked context.Context, snapshot finish.Tree) error {
+		err := withFinishVersion(ctx, wt.Root, proof, paths, func(locked context.Context, snapshot finish.Tree) error {
 			next := finishVersionTree(current, snapshot, paths)
 			if maps.Equal(current, next) || maps.Equal(next, frozen) {
 				return nil
@@ -100,7 +100,7 @@ func finishCheckpointChanges(ctx context.Context, repo, baseTree string, target 
 	previous := make(map[string]string)
 	var changes []finish.Change
 	for index, cp := range target.Checkpoints {
-		err := withFinishVersion(ctx, repo, cp, func(_ context.Context, snapshot finish.Tree) error {
+		err := withFinishVersion(ctx, repo, cp, paths, func(_ context.Context, snapshot finish.Tree) error {
 			next := finishVersionTree(current, snapshot, paths)
 			for _, change := range finish.NetChanges(current, next, "author-1") {
 				change.ID = fmt.Sprintf("checkpoint-%d:%s", index, change.Path)

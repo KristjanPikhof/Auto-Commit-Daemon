@@ -179,6 +179,13 @@ linked worktrees prevent publication without disabling protection. An empty
 finish succeeds without creating a commit; an attached unborn branch can receive
 its first commit.
 
+Finish announces that later edits belong to the next finish before preparing
+commits. If files still have uncommitted changes afterward, it shows their count
+and the saved snapshot's time. Use `git status --short` to inspect them, then run
+`acd finish` when that work is ready. Excluded files remain uncommitted.
+When nothing remains, finish reports a clean working copy. Repeated project-check
+results appear once; JSON keeps each commit's result.
+
 Ordinary finish refuses staging. `--include-staged` approves only the exact
 current selection, including staged-only bytes and deletions. Unstaged changes
 on those paths remain live for later work. Excluded staged paths are refused.
