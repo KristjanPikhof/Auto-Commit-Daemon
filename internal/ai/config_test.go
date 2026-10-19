@@ -14,6 +14,8 @@ func TestFinishRemovalTransportRejectsInvalidConfiguration(t *testing.T) {
 	}{
 		{name: "unknown", cfg: ProviderConfig{Mode: "mystery"}, want: "unknown provider"},
 		{name: "Intent without AI", cfg: ProviderConfig{Mode: "deterministic", CommitStrategy: CommitStrategyIntent}, want: "choose local mode"},
+		{name: "Intent without code sharing", cfg: ProviderConfig{Mode: "openai-compat", CommitStrategy: CommitStrategyIntent}, want: "requires redacted code diffs"},
+		{name: "local program without code sharing", cfg: ProviderConfig{Mode: "subprocess:local", CommitStrategy: CommitStrategyIntent}, want: "requires redacted code diffs"},
 		{name: "missing credential", cfg: ProviderConfig{Mode: "openai-compat", Model: "model"}, want: "missing API key"},
 		{name: "invalid endpoint", cfg: ProviderConfig{Mode: "openai-compat", APIKey: "secret", Model: "model", BaseURL: "ftp://example.test/v1"}, want: "unsupported ACD_AI_BASE_URL scheme"},
 		{name: "invalid model", cfg: ProviderConfig{Mode: "openai-compat", APIKey: "secret", Model: "bad\nmodel"}, want: "model is invalid"},

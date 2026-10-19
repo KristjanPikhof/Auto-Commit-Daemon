@@ -58,15 +58,19 @@ func resolveFinishWorkerConfigInputs(ctx context.Context, roots paths.Roots, run
 	}
 	if out.Mode == "local" {
 		out.Provider.Mode, out.Provider.DiffEgress = "deterministic", false
-	} else if withCredentials && out.Provider.Mode == "openai-compat" {
-		out.Provider.APIKey, _, err = credentials.Resolve(credentials.NewStore(roots), os.LookupEnv)
-		if err != nil {
-			return out, err
-		}
+	}
+	if out.Mode == "intent" && withCredentials && !out.Provider.DiffEgress {
+		return out, ai.ErrIntentDiffsRequired
 	}
 	out.VerificationMode = values[config.FieldIntentVerification]
 	if err := finishRequireApprovals(out); err != nil {
 		return out, err
+	}
+	if out.Mode == "intent" && withCredentials && out.Provider.Mode == "openai-compat" {
+		out.Provider.APIKey, _, err = credentials.Resolve(credentials.NewStore(roots), os.LookupEnv)
+		if err != nil {
+			return out, err
+		}
 	}
 	out.VerificationTimeout = 5 * time.Minute
 	if out.VerificationMode == "fast" || out.VerificationMode == "full" {

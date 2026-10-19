@@ -250,6 +250,7 @@ func TestFinishWorkerProtectsDuringProviderAndReconnects(t *testing.T) {
 	}}
 	w.Transport = p
 	w.Config.Mode = "intent"
+	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	// Use one deadline for the full lifecycle under the sharded race gate.
 	// Provider timeouts have separate coverage.
@@ -339,6 +340,7 @@ func TestFinishWorkerBoundedFailureAndExplicitRetry(t *testing.T) {
 	f, w := finishWorkerFixture(t)
 	finishWrite(t, f.dir, "goal.txt", "frozen\n")
 	w.Config.Mode = "intent"
+	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	p := &finishTestTransport{exchange: func(context.Context, ai.FinishPlanRequest) ([]byte, error) { return []byte(`{"goals":[]}`), nil }}
 	w.Transport = p
@@ -546,8 +548,9 @@ func TestFinishWorkerCredentialRefreshRetriesSameTarget(t *testing.T) {
 	}))
 	defer server.Close()
 	w.Config.Mode = "intent"
-	w.Config.Provider = ai.ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, Model: "test-model", Timeout: 3 * time.Second, CommitStrategy: ai.CommitStrategyIntent, CommitFormat: ai.CommitFormatImperative}
-	w.Config.Approved = []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials}
+	w.Config.Provider.DiffEgress = true
+	w.Config.Provider = ai.ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, Model: "test-model", Timeout: 3 * time.Second, CommitStrategy: ai.CommitStrategyIntent, CommitFormat: ai.CommitFormatImperative, DiffEgress: true}
+	w.Config.Approved = []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials, ai.ConfirmationDiffEgress}
 	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Publish this goal without absorbing later edits"})
 	failed, err := w.Execute(context.Background(), r.ID)
 	if err == nil || failed.State != state.FinishFailed || calls.Load() != 0 {
@@ -576,6 +579,7 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 			p := &finishTestTransport{exchange: func(_ context.Context, r ai.FinishPlanRequest) ([]byte, error) { return completeFinishTestPlan(r), nil }}
 			w.Transport = p
 			w.Config.Mode = "intent"
+			w.Config.Provider.DiffEgress = true
 			w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 			w.Config.Provider.Timeout = time.Second
 			if scenario == "expired" {

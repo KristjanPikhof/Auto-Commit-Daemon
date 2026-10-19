@@ -33,7 +33,7 @@ func TestFinishHistoryRewriteCorrectsCrossAuthorGoalBeforeSaving(t *testing.T) {
 		raw, _ := json.Marshal(map[string]any{"goals": goals})
 		return raw, nil
 	}}
-	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{first, second}, nil, transport, FinishHistoryOptions{Mode: "intent", Style: "imperative", Deadline: time.Now().Add(time.Minute)})
+	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{first, second}, nil, transport, FinishHistoryOptions{Mode: "intent", DiffEgress: true, Style: "imperative", Deadline: time.Now().Add(time.Minute)})
 	if err != nil || transport.calls.Load() != 2 || len(plan.Goals) != 2 {
 		t.Fatalf("correction %+v %v", plan, err)
 	}
@@ -50,7 +50,7 @@ func TestFinishHistoryRewriteSavedPrerequisitesPreserveSuccessiveGoalTrees(t *te
 		raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Bound capture planning windows", Boundary: "Keep window limits independently reviewable", Message: "Bound capture planning windows\n\n- Keep planning work within a fixed window.", ChangeIDs: []string{r.Changes[0].ID}}, {Purpose: "Schedule provider outage retries", Boundary: "Add retry policy after its prerequisite", Message: "Schedule provider outage retries\n\n- Bound retries while the provider is unavailable.", ChangeIDs: []string{r.Changes[1].ID}}}})
 		return raw, nil
 	}}
-	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{first, second}, nil, transport, FinishHistoryOptions{Mode: "intent", Style: "imperative", Deadline: time.Now().Add(time.Minute), VerificationConfigDigest: w.Config.ConfigDigest})
+	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{first, second}, nil, transport, FinishHistoryOptions{Mode: "intent", DiffEgress: true, Style: "imperative", Deadline: time.Now().Add(time.Minute), VerificationConfigDigest: w.Config.ConfigDigest})
 	if err != nil {
 		t.Fatal(err)
 	}

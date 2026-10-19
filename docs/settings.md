@@ -73,7 +73,7 @@ noninteractive commands use the product JSON envelope.
 | `commit.strategy` | `local` |
 | `commit.format` | `imperative` |
 | `ai.provider` | `deterministic` |
-| `ai.diff_egress` | `false` |
+| `ai.diff_egress` | `false`; Intent setup proposes `true` for approval |
 | `intent.verification` | `none` |
 | `ai.timeout` | `5m` |
 
@@ -134,8 +134,10 @@ Credential save and settings Apply do not test the connection. Optional
 explicit connection tests use fixed synthetic input, not repository content.
 Local mode does not inspect the credential store.
 
-Intent sends metadata and redacted supplied context. Sending redacted text
-diffs requires explicit approval; binaries remain metadata only. Custom
+Intent requires redacted code diffs and includes sharing in the setup approval
+review. Existing installations must enable `ai.diff_egress` and approve sharing
+in `acd config`; upgrade does not change consent. Local remains offline with
+sharing disabled. Binaries remain metadata only. Custom
 endpoint credential disclosure, insecure HTTP, provider execution, and project
 command execution have separate permissions. See [AI providers](ai-providers.md).
 

@@ -48,11 +48,13 @@ Git, not just internal planning metadata. Test counts and lists of components
 do not explain a decision. Available corrections stay with the step they correct.
 
 Supply completion context describing the problem, approach, and constraints.
-When text diffs are not shared, a new Intent finish needs context or an exact
-message; filenames alone cannot establish intent. A missing-context failure
-needs a new finish with context, since retry preserves the original input.
-Diff sharing remains an explicit settings choice. Previews identify plans made
-without code diffs and show each proposed boundary.
+Intent requires approved redacted diffs for every recorded text change. Setup
+includes sharing in its approval review. Existing installations must approve it
+in `acd config`; upgrades and retries keep the original privacy settings.
+Completion context supplements the code and is required for binary-only work
+unless an exact batch message is supplied. Missing approval or context needs a
+new finish after correcting the input, since retry preserves the original
+settings and purpose. Previews show each proposed boundary.
 
 The planner chooses which changes belong together. ACD orders the commits by
 their version dependencies and replays selected versions in recorded order.

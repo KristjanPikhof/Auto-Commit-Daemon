@@ -26,9 +26,9 @@ group completed work into commits. Later edits stay saved for your next
 finish. ACD never pushes.
 
 Supply PURPOSE as context describing what changed and why. Intent uses it to
-explain decisions and choose useful steps. Without shared code diffs, context
-is required. --message instead requests one batch with that exact message;
-it disables automatic splitting, including in Intent mode.
+explain decisions and choose useful steps. Intent requires approved redacted
+code diffs. Binary-only changes also need context. --message requests one batch
+with that exact message and disables automatic splitting, including in Intent.
 
 Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
@@ -162,7 +162,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	count, countErr := productWorktreeChangeCount(readCtx, lookup.Worktree.Root)
 	result.WorktreeChanges = count
 	ok := r.State == state.FinishCompleted && !detached
-	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required"
+	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required" && r.ReasonCode != "provider_diffs_required"
 	exit, failureCode := finishExit(r, waitCode)
 	next := ""
 	if !ok {
@@ -170,10 +170,12 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			next = "acd doctor"
 		} else if r.ReasonCode == "provider_context_required" {
 			next = `acd finish "what changed and why"`
+		} else if r.ReasonCode == "provider_diffs_required" {
+			next = "Approve code sharing with acd config, then start a new acd finish"
 		} else {
 			next = "acd finish --retry " + r.ID
 		}
-		if r.DryRun && r.State != state.FinishNeedsAttention {
+		if r.DryRun && r.State != state.FinishNeedsAttention && r.ReasonCode != "provider_diffs_required" {
 			next += " --dry-run"
 		}
 	}
@@ -278,7 +280,7 @@ func finishExit(r state.FinishRequest, waitCode string) (int, string) {
 	if r.State == state.FinishNeedsAttention {
 		return ExitActionRequired, "finish_needs_attention"
 	}
-	if r.ReasonCode == "provider_input_too_large" || r.ReasonCode == "provider_context_required" {
+	if r.ReasonCode == "provider_input_too_large" || r.ReasonCode == "provider_context_required" || r.ReasonCode == "provider_diffs_required" {
 		return ExitActionRequired, r.ReasonCode
 	}
 	return ExitActionRequired, "finish_failed"

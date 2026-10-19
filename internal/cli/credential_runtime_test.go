@@ -34,6 +34,7 @@ func TestFinishRemovalCredentialRefreshAppliesOnlyApprovedRuntime(t *testing.T) 
 			if err := store.Update(func(doc *config.Document) error {
 				doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
 				doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"openai-compat"`)
+				doc.Settings.Global[config.FieldDiffEgress] = json.RawMessage(`true`)
 				doc.Settings.Global[config.FieldModel] = json.RawMessage(`"kept-model"`)
 				return nil
 			}); err != nil {

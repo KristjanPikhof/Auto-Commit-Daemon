@@ -100,11 +100,11 @@ func finishIntentFixtureWithSettings(t *testing.T, handler http.HandlerFunc, tim
 	server, trust := newOpenAITestServer(t, handler)
 	t.Cleanup(server.Close)
 	f := newFinishFixture(t, "ACD_AI_API_KEY=fixture-key")
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldBaseURL: server.URL, config.FieldCAFile: strings.TrimPrefix(trust, "ACD_AI_CA_FILE="), config.FieldModel: "finish-fixture", config.FieldTimeout: timeout}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldBaseURL: server.URL, config.FieldCAFile: strings.TrimPrefix(trust, "ACD_AI_CA_FILE="), config.FieldModel: "finish-fixture", config.FieldTimeout: timeout}
 	for key, value := range extra {
 		draft[key] = value
 	}
-	f.Apply(t, t.Context(), draft, append(confirmed, ai.ConfirmationEndpointCredentials)...)
+	f.Apply(t, t.Context(), draft, append(confirmed, ai.ConfirmationEndpointCredentials, ai.ConfirmationDiffEgress)...)
 	return f
 }
 
@@ -397,7 +397,7 @@ func TestFinishFaultSubprocessFailureDoesNotFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := newFinishFixture(t, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	f.Apply(t, t.Context(), map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "subprocess:fail", config.FieldTimeout: "2s"}, ai.ConfirmationSubprocessExecution)
+	f.Apply(t, t.Context(), map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "subprocess:fail", config.FieldTimeout: "2s"}, ai.ConfirmationSubprocessExecution, ai.ConfirmationDiffEgress)
 	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "protected\n")
 	failed := finishRunJSON(t, f, "finish", "Complete protected goal", "--message", "Complete protected goal")
 	raw, err := os.ReadFile(spawns)

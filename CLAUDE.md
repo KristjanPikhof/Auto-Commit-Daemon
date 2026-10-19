@@ -127,8 +127,9 @@ Each split needs a useful review or revert boundary and a valid intermediate
 state. Put prerequisites before consumers or in the same commit. Explain
 the reason or practical impact in each generated message, not only internal
 planning metadata. Explain broader defaults and behavior changes from evidence.
-Use completion context for automatic grouping; an exact `--message` requests
-one complete batch. Age and queue pressure
+Intent requires approved redacted code diffs on every planning path; completion
+context supplements that evidence. Local remains offline. Existing settings
+retain their consent on upgrade. An exact `--message` requests one complete batch. Age and queue pressure
 never waive completeness checks. Judge the proposed commit tree, not the final
 worktree. Frozen request identity, author boundaries, and explicit history-rewrite safety
 limits still apply.

@@ -162,10 +162,13 @@ private finish refs before accepting the request. Retry uses those pins even
 if the original checkpoint refs are later pruned. Requests with exact messages
 or staged consent keep final-only evidence. No later checkpoint enters a retry.
 
-When no text diffs are shared, new finish requests require supplied context or
-an exact message. `provider_context_required` spends no provider call and needs
-a new request with context, not a retry with unchanged input. Existing history
-rewrite selection and Local behavior remain independent of that requirement.
+All Intent planning requires approved redacted text diffs, including exact
+messages, dry runs, and both history planning paths. `provider_diffs_required`
+spends no provider call and needs a new request after approved configuration
+changes. Completion context cannot replace required text evidence. Binary-only
+finish also needs supplied context or an exact message;
+`provider_context_required` needs a new request with that context. Local stays
+offline, and history selection remains independent of finish checkpoints.
 
 Provider inputs reuse existing byte limits. These bounds are separate from
 checkpoint storage; `capture.max_file_bytes` controls buffering and does not
@@ -187,8 +190,9 @@ split by age, or send partial input while describing it as complete. Binary
 entries use declared object/type/size metadata and exact Git objects for tree
 validation; report that their content was not sent as text.
 
-Diff egress remains off by default. Intent must honor explicit repository
-provider, subprocess, and diff-egress approval; redact secrets before allowed
+Intent setup includes code sharing in its explicit approval review. Existing
+settings and approvals remain unchanged on upgrade. Intent must honor explicit
+repository provider, subprocess, and diff-egress approval; redact secrets before allowed
 transmission. Disclose metadata, supplied purpose/message, and allowed diff
 content sent to that provider. Local mode sends nothing. Status, list, doctor,
 and diagnose neither build providers nor migrate/write state. Logs, JSON,

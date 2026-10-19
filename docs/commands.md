@@ -160,8 +160,8 @@ uses the approved provider to plan completed goals and valid intermediate trees.
 A provider failure ends this request; it never switches to Local automatically.
 
 The quoted purpose supplies context about what changed and why. Intent uses it
-to identify useful steps and explain decisions; when no text diffs are shared,
-context or an exact message is required. `--message` supplies the complete
+to identify useful steps and explain decisions. Intent requires approved
+redacted code diffs; binary-only work also needs context or an exact message. `--message` supplies the complete
 subject and optional body for one batch commit and disables automatic splitting.
 Generated Intent messages include a short reason or practical impact in the body.
 Both modes support imperative

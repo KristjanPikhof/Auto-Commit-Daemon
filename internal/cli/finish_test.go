@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
@@ -94,6 +96,20 @@ func TestFinishCLIContextFailureNeedsANewRequest(t *testing.T) {
 	}
 	if err == nil || response.Error == nil || response.Error.Retryable || response.NextAction == nil || !strings.Contains(*response.NextAction, "what changed and why") || strings.Contains(out.String(), "--retry") {
 		t.Fatalf("unchanged retry suggested for missing context: %s %v", out.String(), err)
+	}
+}
+
+func TestFinishCLIDiffApprovalFailureNeedsANewRequest(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	r := state.FinishRequest{ID: "finish-diffs", DryRun: true, State: state.FinishFailed, ReasonCode: "provider_diffs_required", Reason: ai.ErrIntentDiffsRequired.Error(), Target: state.FinishTarget{CheckpointID: "saved"}}
+	var out bytes.Buffer
+	err := renderFinish(&out, lookup, r, true, "")
+	var response productEnvelope
+	if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if err == nil || response.Error == nil || response.Error.Code != "provider_diffs_required" || response.Error.Retryable || response.NextAction == nil || !strings.Contains(*response.NextAction, "acd config") || strings.Contains(out.String(), "--retry") {
+		t.Fatalf("unchanged retry suggested for missing code sharing: %s %v", out.String(), err)
 	}
 }
 
@@ -281,6 +297,7 @@ func TestFinishCLIFlagsAndProtectionRemedy(t *testing.T) {
 
 func TestFinishCLIReconnectIgnoresChangedCredentials(t *testing.T) {
 	lookup, runtime, handler := finishCLIFixture(t)
+	finishConfigRevision(t, runtime.db, map[string]any{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldDiffEgress: true, "confirmations": []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress}}, sql.NullInt64{}, true)
 	t.Setenv(ai.EnvCommitStrategy, "intent")
 	t.Setenv(ai.EnvProvider, "openai-compat")
 	t.Setenv(ai.EnvAPIKey, "test-frozen-key")

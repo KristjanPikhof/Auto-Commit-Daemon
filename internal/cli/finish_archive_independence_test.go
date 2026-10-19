@@ -88,10 +88,10 @@ func finishArchiveIntentProvider(t *testing.T, runtime *workerRuntime) *atomic.I
 	t.Cleanup(server.Close)
 	t.Setenv(ai.EnvAPIKey, "archive-independence-key")
 	finishConfigRevision(t, runtime.db, map[string]any{
-		config.FieldCommitStrategy: "intent", config.FieldCommitFormat: "imperative",
+		config.FieldCommitStrategy: "intent", config.FieldDiffEgress: true, config.FieldCommitFormat: "imperative",
 		config.FieldProvider: "openai-compat", config.FieldBaseURL: server.URL,
 		config.FieldModel: "archive-independence-model", config.FieldIntentVerification: "none",
-		"confirmations": []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials},
+		"confirmations": []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials, ai.ConfirmationDiffEgress},
 	}, sql.NullInt64{}, true)
 	return calls
 }

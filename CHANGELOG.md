@@ -18,10 +18,14 @@
 
 ### Changed
 
+- Require approved redacted code diffs for all Intent planning, including
+  previews, exact messages, and history message rewrites. Intent setup includes
+  sharing in its approval review. Existing privacy settings survive upgrade;
+  disabled sharing needs approval before a new Intent request. Local stays
+  offline, and binary-only finish still needs context or an exact message.
 - Plan useful Intent steps within a feature and include a grounded reason or
-  practical impact in generated messages. Metadata-only finish needs completion
-  context or an exact message. Help explains that `--message` disables splitting;
-  previews show proposed boundaries and when code diffs were not shared.
+  practical impact in generated messages. Help explains that `--message`
+  disables splitting; previews show proposed boundaries.
 - Freeze current checkpoint versions for safe same-file Intent steps. Preserve
   selected versions through retention and retry without absorbing later saves;
   order the commits by their dependencies and each commit's versions by recorded

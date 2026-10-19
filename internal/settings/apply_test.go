@@ -189,6 +189,7 @@ func TestSettingsIntentApplyRequiresCommandConsent(t *testing.T) {
 	})
 	draft := map[string]string{
 		config.FieldCommitStrategy:          "intent",
+		config.FieldDiffEgress:              "true",
 		config.FieldProvider:                "openai-compat",
 		config.FieldIntentVerification:      "fast",
 		config.FieldVerificationFastCommand: "go test ./...",

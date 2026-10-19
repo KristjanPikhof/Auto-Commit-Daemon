@@ -11,7 +11,7 @@ import (
 
 func TestFinishHistoryAcceptsCompleteModerateRange(t *testing.T) {
 	evidence := finish.Evidence{Base: finish.Tree{}, Target: finish.Tree{}}
-	options := finishTestOptions()
+	options := finishTestOptions(evidence)
 	options.DiffEgress = true
 	var ids []string
 	for i := 0; i < 6; i++ {
@@ -52,12 +52,12 @@ func TestFinishHistoryRewriteMessageTransportRedactsAndStopsCancelledBudget(t *t
 		}
 		return finishTestOutput(finish.Goal{Purpose: "Preserve authored settings", Boundary: "Keep the original authored scope", Message: "Preserve authored settings\n\n- Keep authored values ahead of defaults.", ChangeIDs: []string{"original"}}), nil
 	}}
-	_, result, err := PlanHistoryMessages(t.Context(), provider, evidence, commits, finishTestOptions())
+	_, result, err := PlanHistoryMessages(t.Context(), provider, evidence, commits, finishTestOptions(evidence))
 	if err != nil || !result.Disclosure.Redacted || result.Calls != 1 {
 		t.Fatalf("redaction %+v %v", result, err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	options := finishTestOptions()
+	options := finishTestOptions(evidence)
 	options.BeforeCall = func(context.Context) error { cancel(); return nil }
 	_, _, err = PlanHistoryMessages(ctx, provider, evidence, commits, options)
 	if err == nil || len(provider.requests) != 1 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -211,24 +212,28 @@ func TestFinishWorkerKeepsStagedAndExactMessageBatchesOutOfVersions(t *testing.T
 	}
 }
 
-func TestFinishWorkerMetadataOnlyNeedsContextWithoutPublication(t *testing.T) {
-	f, w := finishWorkerFixture(t)
-	finishWrite(t, f.dir, "goal.txt", "protected\n")
-	w.Config.Mode = "intent"
-	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
-	provider := &finishTestTransport{exchange: func(context.Context, ai.FinishPlanRequest) ([]byte, error) {
-		return nil, errors.New("must not call provider")
-	}}
-	w.Transport = provider
-	r := startFinishWorker(t, w, FinishOptions{})
-	failed, err := w.Execute(t.Context(), r.ID)
-	if err == nil || failed.ReasonCode != "provider_context_required" || failed.State != state.FinishFailed || provider.calls.Load() != 0 {
-		t.Fatalf("metadata-only request guessed intent: %+v %v", failed, err)
-	}
-	if _, err := state.ResolveCheckpoint(t.Context(), f.db.Path(), r.Target.CheckpointID); err != nil {
-		t.Fatal("context failure lost protected work")
-	}
-	if finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != r.Target.ExpectedHead {
-		t.Fatal("insufficient context moved the branch")
+func TestFinishWorkerRequiresDiffsEvenWithCompletionContext(t *testing.T) {
+	for _, options := range []FinishOptions{{Purpose: "Publish the completed protected goal"}, {DryRun: true, Purpose: "Preview the completed protected goal"}, {Message: "Preserve completed behavior"}} {
+		t.Run(fmt.Sprintf("preview_%t_message_%t", options.DryRun, options.Message != ""), func(t *testing.T) {
+			f, w := finishWorkerFixture(t)
+			finishWrite(t, f.dir, "goal.txt", "protected\n")
+			w.Config.Mode = "intent"
+			w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
+			provider := &finishTestTransport{exchange: func(context.Context, ai.FinishPlanRequest) ([]byte, error) {
+				return nil, errors.New("must not call provider")
+			}}
+			w.Transport = provider
+			r := startFinishWorker(t, w, options)
+			failed, err := w.Execute(t.Context(), r.ID)
+			if err == nil || failed.ReasonCode != "provider_diffs_required" || failed.State != state.FinishFailed || provider.calls.Load() != 0 {
+				t.Fatalf("request without diffs guessed intent: %+v %v", failed, err)
+			}
+			if _, err := state.ResolveCheckpoint(t.Context(), f.db.Path(), r.Target.CheckpointID); err != nil {
+				t.Fatal("context failure lost protected work")
+			}
+			if finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != r.Target.ExpectedHead {
+				t.Fatal("insufficient context moved the branch")
+			}
+		})
 	}
 }

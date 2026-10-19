@@ -169,7 +169,7 @@ func TestSettingsResolutionSeparatesProviderCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, _, err := svc.resolveDraft(doc, map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat"})
+	resolved, _, err := svc.resolveDraft(doc, map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +547,7 @@ func TestSettingsActionProviderTestRequiresRisksAndInvalidatesFingerprint(t *tes
 		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true, Latency: time.Millisecond}, nil
 	}
 	svc, _ := testService(t, lookup, probe)
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://example.test/v1", config.FieldModel: "model-a"}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://example.test/v1", config.FieldModel: "model-a"}
 	_, err := svc.TestProvider(context.Background(), draft, nil)
 	var confirmationErr *ConfirmationRequiredError
 	if !errors.As(err, &confirmationErr) || !reflect.DeepEqual(confirmationErr.Missing, []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials}) || probes.Load() != 0 {
@@ -572,12 +572,12 @@ func TestFinishConfigIntentRevisionContainsOnlySupportedFields(t *testing.T) {
 		return "", false
 	}
 	svc, _ := testService(t, lookup, nil)
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "structural"}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "structural"}
 	validation, err := svc.Validate(context.Background(), draft, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if validation.ResolvedHot[config.FieldIntentVerification] != "structural" || validation.ResolvedHot[config.FieldDiffEgress] != "false" {
+	if validation.ResolvedHot[config.FieldIntentVerification] != "structural" || validation.ResolvedHot[config.FieldDiffEgress] != "true" {
 		t.Fatalf("explicit values lost: %#v", validation.ResolvedHot)
 	}
 	body, err := revisionSnapshotJSON(validation.ResolvedHot, nil)
@@ -617,7 +617,7 @@ func TestSettingsProviderUsesProtectedCredentialBelowEnvironment(t *testing.T) {
 	if err := credentials.NewStore(roots).Set("sk-protected"); err != nil {
 		t.Fatal(err)
 	}
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat"}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat"}
 	if _, err := svc.TestProvider(context.Background(), draft, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -645,9 +645,9 @@ func TestSettingsActionProviderTestDoesNotRequireDiffEgressConfirmation(t *testi
 		}
 		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
 	})
-	draft := map[string]string{config.FieldCommitStrategy: "intent",
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true",
 		config.FieldProvider: "openai-compat", config.FieldBaseURL: "https://example.test/v1",
-		config.FieldModel: "model-a", config.FieldDiffEgress: "true",
+		config.FieldModel: "model-a",
 	}
 	confirmed := []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials}
 	result, err := svc.TestProvider(context.Background(), draft, confirmed)
@@ -680,7 +680,7 @@ func TestSettingsActionProviderTestRedactsProbeError(t *testing.T) {
 		return ai.ProviderProbeResult{Provider: "openai-compat"},
 			errors.New("hidden-key\x1b[2J upstream rejected sk-HCKZa********UC3m")
 	})
-	_, err := svc.TestProvider(context.Background(), map[string]string{config.FieldCommitStrategy: "intent",
+	_, err := svc.TestProvider(context.Background(), map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true",
 		config.FieldProvider: "openai-compat", config.FieldModel: "model",
 	}, nil)
 	if err == nil || strings.Contains(err.Error(), "hidden-key") ||

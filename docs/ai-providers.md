@@ -41,7 +41,13 @@ planner's raw rejection log or automatic prompt-trace writer.
 
 ## Privacy contract
 
-Diff egress is off by default. Intent metadata includes paths, recorded
+Local sends no code. Intent requires approved redacted code diffs for finish,
+previews, and history planning, including messages-only rewrites. Intent setup
+includes sharing in its approval review. Existing installations keep their
+settings; if sharing is disabled, approve it in `acd config` before starting a
+new Intent request. ACD never enables it during upgrade or retry.
+
+Intent metadata includes paths, recorded
 operations and versions, object identities, sizes, and file kind. Supplied
 purpose and message can also enter the provider request; ACD redacts their
 provider copies. The exact valid user message remains local for publication.
@@ -49,11 +55,12 @@ Approving text diffs permits their redacted content to be sent to the selected
 provider. A local subprocess is also a recipient; being local does not grant
 it implicit permission.
 
-Without shared text diffs, a new Intent finish requires completion context or
-an exact batch message. Describe the problem, approach, and constraints in the
-quoted purpose. ACD does not enable diff sharing automatically. Metadata-only
-previews say that code diffs were not shared. When recorded intermediate versions
-are used, approved diffs describe each exact transition, not repeated final diffs.
+Completion context explains the problem, approach, and constraints behind the
+code. It supplements the diffs rather than replacing them. A binary-only finish
+needs context or an exact batch message because its content cannot enter a text
+request. When recorded intermediate versions are used, diffs describe each exact
+transition, not repeated final diffs. Missing text evidence fails before a
+provider call; ACD does not substitute a metadata-only plan.
 
 Binary or invalid-text blobs are metadata only. Their complete objects remain
 available locally for exact tree verification. Limits are independent of

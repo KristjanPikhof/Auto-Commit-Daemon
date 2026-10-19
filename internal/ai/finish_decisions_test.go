@@ -33,7 +33,7 @@ func TestFinishIntentReplaysSelectedVersionsInOrder(t *testing.T) {
 			provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
 				return finishTestOutput(goals...), nil
 			}}
-			result, err := PlanFinish(t.Context(), provider, evidence, finishTestOptions())
+			result, err := PlanFinish(t.Context(), provider, evidence, finishTestOptions(evidence))
 			expectedSteps := 1
 			if split {
 				expectedSteps = 2
@@ -70,7 +70,7 @@ func TestFinishIntentRejectsInterleavedGroups(t *testing.T) {
 		}
 		return finishTestOutput(first, second), nil
 	}}
-	result, err := PlanFinish(t.Context(), provider, evidence, finishTestOptions())
+	result, err := PlanFinish(t.Context(), provider, evidence, finishTestOptions(evidence))
 	finishAssertError(t, err, "invalid_provider_plan")
 	if result.Calls != 2 || len(result.Plan.Steps) != 0 {
 		t.Fatalf("conflicting groups changed or accepted: %+v", result)
@@ -94,16 +94,16 @@ func TestFinishIntentCorrectionIncludesAllMembershipConflicts(t *testing.T) {
 		}
 		return finishTestOutput(goal), nil
 	}}
-	result, err := PlanFinish(t.Context(), provider, evidence, finishTestOptions())
+	result, err := PlanFinish(t.Context(), provider, evidence, finishTestOptions(evidence))
 	if err != nil || result.Calls != 2 || len(result.Plan.Steps) != 1 || !maps.Equal(result.Plan.Steps[0].Tree, evidence.Target) {
 		t.Fatalf("combined membership correction failed: %+v %v", result, err)
 	}
 }
 
 func TestFinishIntentRequiresGroundedContext(t *testing.T) {
-	for _, source := range []string{"metadata", "context", "diffs", "exact message", "binary only"} {
+	for _, source := range []string{"context", "diffs", "exact message", "binary only"} {
 		t.Run(source, func(t *testing.T) {
-			options := finishTestOptions()
+			options := finishTestOptions(finishTestEvidence())
 			options.Purpose = ""
 			switch source {
 			case "context":
@@ -125,7 +125,7 @@ func TestFinishIntentRequiresGroundedContext(t *testing.T) {
 				return finishTestOutput(goal), nil
 			}}
 			result, err := PlanFinish(t.Context(), provider, finishTestEvidence(), options)
-			if source == "metadata" || source == "binary only" {
+			if source == "binary only" {
 				var failure *FinishPlanningError
 				if !errors.As(err, &failure) || failure.Code != "provider_context_required" || failure.Retryable() {
 					t.Fatalf("missing context needs a new request: %v", err)
@@ -159,7 +159,7 @@ func TestFinishIntentSingleBatchExplainsItsBoundary(t *testing.T) {
 		}
 		return finishTestOutput(goal), nil
 	}}
-	result, err := PlanFinish(t.Context(), provider, evidence, finishTestOptions())
+	result, err := PlanFinish(t.Context(), provider, evidence, finishTestOptions(evidence))
 	if err != nil || result.Calls != 2 || len(result.Plan.Steps) != 1 || result.Plan.Steps[0].Boundary == "" {
 		t.Fatalf("unexplained batch accepted: %+v %v", result, err)
 	}
@@ -179,8 +179,51 @@ func TestFinishIntentDoesNotLeaveReasonOnlyInMetadata(t *testing.T) {
 		}
 		return finishTestOutput(goal), nil
 	}}
-	result, err := PlanFinish(t.Context(), provider, finishTestEvidence(), finishTestOptions())
+	result, err := PlanFinish(t.Context(), provider, finishTestEvidence(), finishTestOptions(finishTestEvidence()))
 	if err != nil || result.Calls != 2 || !strings.Contains(result.Plan.Steps[0].Message, "cannot overwrite") {
 		t.Fatalf("published reason lost: %+v %v", result, err)
+	}
+}
+
+func TestIntentPlanningRequiresDiffsAcrossEntryPoints(t *testing.T) {
+	evidence := finishTestEvidence()
+	commits := []HistoryMessageCommit{{ID: "original", Author: "author-a", TreeOID: strings.Repeat("a", 40), OriginalMessage: "Preserve authored settings", ChangeIDs: []string{evidence.Changes[0].ID}}}
+	for _, entry := range []string{"finish", "exact message", "history messages"} {
+		for _, missing := range []string{"approval", "text evidence"} {
+			t.Run(entry+"/"+missing, func(t *testing.T) {
+				options := finishTestOptions(evidence)
+				if missing == "approval" {
+					options.DiffEgress = false
+				} else {
+					options.Diffs = nil
+				}
+				if entry == "exact message" {
+					options.Message = "Preserve authored settings"
+				}
+				paid := 0
+				options.BeforeCall = func(context.Context) error { paid++; return nil }
+				provider := &finishFakeTransport{exchange: func(context.Context, FinishPlanRequest) ([]byte, error) {
+					t.Fatal("incomplete code evidence reached provider")
+					return nil, nil
+				}}
+				var result FinishPlanResult
+				var err error
+				if entry == "history messages" {
+					_, result, err = PlanHistoryMessages(t.Context(), provider, evidence, commits, options)
+				} else {
+					result, err = PlanFinish(t.Context(), provider, evidence, options)
+				}
+				var failure *FinishPlanningError
+				if !errors.As(err, &failure) || paid != 0 || result.Calls != 0 || len(provider.requests) != 0 {
+					t.Fatalf("invalid input spent a call: %+v %v paid=%d", result, err, paid)
+				}
+				if missing == "approval" && (failure.Code != "provider_diffs_required" || failure.Retryable()) {
+					t.Fatalf("code sharing needs approval and a new request: %v", failure)
+				}
+				if missing == "text evidence" && failure.Code != "invalid_evidence" {
+					t.Fatalf("missing transition was not rejected: %v", failure)
+				}
+			})
+		}
 	}
 }

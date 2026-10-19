@@ -30,7 +30,7 @@ func TestHistoryMessagesRejectsInvalidSubprocessVersion(t *testing.T) {
 			bin := writePluginScript(t, t.TempDir(), "history-version", script)
 			provider := NewSubprocessProvider("history-version", SubprocessOptions{LookPath: fixedLookPath("acd-provider-history-version", bin), Stderr: io.Discard, Timeout: 10 * time.Second})
 			t.Cleanup(func() { _ = provider.Close() })
-			_, result, err := PlanHistoryMessages(t.Context(), provider, evidence, commits, finishTestOptions())
+			_, result, err := PlanHistoryMessages(t.Context(), provider, evidence, commits, finishTestOptions(evidence))
 			if result.Calls != 2 {
 				t.Fatalf("invalid protocol version bypassed correction: calls=%d error=%v", result.Calls, err)
 			}

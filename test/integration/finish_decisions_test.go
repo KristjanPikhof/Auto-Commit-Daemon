@@ -75,3 +75,47 @@ func TestFinishWorkflowSameFileDecisions(t *testing.T) {
 	f.Barrier(t, t.Context())
 	assertFinishWorkflowStatus(t, t.Context(), f, true)
 }
+
+func TestFinishWorkflowSharesCodeInEveryPlanningExchange(t *testing.T) {
+	var calls atomic.Int32
+	f := finishIntentFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		request := decodeFinishChatRequest(t, r)
+		if !request.Plan.DiffIncluded || len(request.Plan.Diffs) != len(request.Plan.Changes) {
+			t.Error("planning exchange omitted required code evidence")
+		}
+		text := ""
+		for _, diff := range request.Plan.Diffs {
+			text += diff.Text
+		}
+		if !strings.Contains(text, "+const allow = true") || strings.Contains(text, "abcdefgh12345678") || !strings.Contains(text, "[REDACTED_SECRET]") {
+			t.Error("planning exchange lost changed code or sent an unredacted credential")
+		}
+		if request.Plan.Correction == nil {
+			writeFinishChatArguments(t, w, `{"goals":[]}`)
+			return
+		}
+		if request.Plan.Purpose == "" {
+			request.Plan.Purpose = request.Plan.Message
+		}
+		writeFinishChatResponse(t, w, request)
+	}, "30s")
+	writeFile(t, filepath.Join(f.Repo, "policy.go"), "package policy\nconst allow = true\n// api_key=abcdefgh12345678\n")
+	f.Barrier(t, t.Context())
+	for _, args := range [][]string{
+		{"finish", "Allow the completed policy", "--dry-run", "--json"},
+		{"finish", "--message", "Allow the completed policy", "--dry-run", "--json"},
+		{"finish", "Allow the completed policy", "--json"},
+	} {
+		result := decodeFinishWorkflow(t, f.Run(t, t.Context(), args...))
+		if result.PlanningCalls != 2 {
+			t.Fatalf("correction was not checked: %+v", result)
+		}
+	}
+	if calls.Load() != 6 {
+		t.Fatalf("exchanges=%d want=6", calls.Load())
+	}
+	if status := strings.TrimSpace(runGitOK(t, f.Repo, "status", "--porcelain")); status != "" {
+		t.Fatalf("publication changed live work: %s", status)
+	}
+}
