@@ -215,7 +215,7 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		selection.VerificationSource = "saved setting"
 	}
 	selection.ExecutionMode = "explicit finish"
-	selection.DiffContextApproved = selection.Strategy == "intent" && defaults["ai.diff_egress"] == "true"
+	selection.DiffContextApproved = selection.Strategy == "intent"
 	selection.EndpointCredentialsApproved = selection.Provider == "openai-compat" && strings.TrimRight(strings.TrimSpace(selection.BaseURL), "/") != "https://api.openai.com/v1"
 	selection.SubprocessApproved = strings.HasPrefix(selection.Provider, "subprocess:")
 	return selection, nil

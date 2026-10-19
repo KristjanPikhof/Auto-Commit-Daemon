@@ -36,6 +36,7 @@ change values, then Save changes to review and apply them.
 
 Only edited fields are saved. Repository fields can return to inherited
 values. API keys are masked and saved in the protected credential store.
+Choosing Intent includes its required code sharing in the approval review.
 Global changes apply to repositories that inherit them. Stopped repositories
 remain stopped. Restart-required fields are identified.
 
@@ -342,7 +343,7 @@ func writeEditorPermissions(out io.Writer, validation settings.Validation) {
 		case ai.ConfirmationInsecureEndpointCredentials:
 			fmt.Fprintln(out, "Permission: use an unencrypted HTTP connection")
 		case ai.ConfirmationDiffEgress:
-			fmt.Fprintln(out, "Allow sending filtered repository changes to this AI service")
+			fmt.Fprintln(out, "Allow sending redacted code diffs to this AI service (required for Intent)")
 		case ai.ConfirmationSubprocessExecution:
 			fmt.Fprintln(out, "Allow running this local AI program: "+strconv.Quote(validation.ProviderConfig.Mode))
 		case ai.ConfirmationVerificationCommand:
