@@ -414,15 +414,35 @@ func TestFinishFaultLargeAssetsStayProtectedDuringProviderOutage(t *testing.T) {
 	f := finishIntentFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		request := decodeFinishChatRequest(t, r)
 		calls.Add(1)
-		if request.Plan.DiffIncluded || len(request.Plan.Diffs) != 0 {
-			t.Error("binary contents reached provider")
+		paths := make(map[string]string)
+		for _, change := range request.Plan.Changes {
+			paths[change.ID] = change.Path
+		}
+		binaries, texts := 0, 0
+		for _, diff := range request.Plan.Diffs {
+			if strings.HasPrefix(paths[diff.ChangeID], "assets/") {
+				binaries++
+				if !diff.Binary || diff.Text != "" {
+					t.Error("binary contents reached provider")
+				}
+			} else {
+				texts++
+				if diff.Binary || diff.Text == "" {
+					t.Error("approved code evidence did not reach provider")
+				}
+			}
+		}
+		if !request.Plan.DiffIncluded || binaries != 4 || texts != 4 {
+			t.Errorf("incomplete mixed evidence: shared=%t binaries=%d texts=%d", request.Plan.DiffIncluded, binaries, texts)
 		}
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 	}, "10s")
 	names := []string{"eng_autocomplete.bin", "est_autocomplete.bin", "rus_autocomplete.bin", "spa_autocomplete.bin"}
 	sizes := []int{14832809, 21685601, 18343302, 15617454}
 	for i, name := range names {
-		writeFile(t, filepath.Join(f.Repo, "assets", name), string(bytes.Repeat([]byte{byte(i)}, sizes[i])))
+		body := bytes.Repeat([]byte{byte(i + 1)}, sizes[i])
+		body[0] = 0 // Git detects binary content from a NUL, not the .bin suffix.
+		writeFile(t, filepath.Join(f.Repo, "assets", name), string(body))
 	}
 	writeFile(t, filepath.Join(f.Repo, "autocomplete.go"), "package autocomplete\n")
 	writeFile(t, filepath.Join(f.Repo, "autocomplete_test.go"), "package autocomplete\n")
