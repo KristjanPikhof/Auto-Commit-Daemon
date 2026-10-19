@@ -715,6 +715,10 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 		productListPhase(entry) != "checking protection" || !entry.PublicationOutcome.PendingClassification {
 		t.Fatalf("transient read failure became an alert: %+v", entry)
 	}
+	visible, hidden := selectProductListEntriesAt([]productListEntry{entry}, false, time.Now())
+	if len(visible) != 1 || hidden != 0 {
+		t.Fatal("unknown activity was treated as an idle repository")
+	}
 	encoded, err := json.Marshal(entry)
 	if err != nil || !bytes.Contains(encoded, []byte(`"protection_unknown":true`)) {
 		t.Fatalf("JSON hid the unavailable protection read: %s err=%v", encoded, err)
@@ -823,50 +827,68 @@ func TestProductListCollectionIsBoundedAndReadsSupervisorOnce(t *testing.T) {
 }
 
 func TestProductListSlowRepositoryDoesNotBlockOtherRows(t *testing.T) {
-	roots := withIsolatedHome(t)
-	if err := central.WithLock(roots, func(registry *central.Registry) error {
-		for index := 0; index < 10; index++ {
-			path := filepath.Join(t.TempDir(), fmt.Sprintf("repo-%02d", index))
-			registry.UpsertRepo(path, fmt.Sprintf("%016x", index+1), filepath.Join(path, "state.db"), "codex", int64(index+1))
-			record := &registry.Repos[len(registry.Repos)-1]
-			record.RepositoryID = fmt.Sprintf("%016x", index+1)
-			record.WorktreeID = fmt.Sprintf("%016x", index+101)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"context deadline", context.DeadlineExceeded},
+		{"cancelled Git read", errors.New("git --literal-pathspecs ls-tree: signal: killed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			roots := withIsolatedHome(t)
+			if err := central.WithLock(roots, func(registry *central.Registry) error {
+				for index := 0; index < 10; index++ {
+					path := filepath.Join(t.TempDir(), fmt.Sprintf("repo-%02d", index))
+					registry.UpsertRepo(path, fmt.Sprintf("%016x", index+1), filepath.Join(path, "state.db"), "codex", int64(index+1))
+					record := &registry.Repos[len(registry.Repos)-1]
+					record.RepositoryID = fmt.Sprintf("%016x", index+1)
+					record.WorktreeID = fmt.Sprintf("%016x", index+101)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
 
-	originalReader := productListReadRepo
-	t.Cleanup(func() { productListReadRepo = originalReader })
-	productListReadRepo = func(ctx context.Context, record central.RepoRecord, now time.Time) (productListRepoOverview, error) {
-		if strings.HasSuffix(record.Path, "repo-00") {
-			<-ctx.Done()
-			return productListRepoOverview{}, ctx.Err()
-		}
-		return healthyProductListOverview(record, now), nil
-	}
+			originalReader := productListReadRepo
+			t.Cleanup(func() { productListReadRepo = originalReader })
+			productListReadRepo = func(ctx context.Context, record central.RepoRecord, now time.Time) (productListRepoOverview, error) {
+				if strings.HasSuffix(record.Path, "repo-00") {
+					<-ctx.Done()
+					return productListRepoOverview{}, tc.err
+				}
+				return healthyProductListOverview(record, now), nil
+			}
 
-	started := time.Now()
-	data, stateName, err := collectProductList(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := time.Since(started); elapsed < productListReadTimeout || elapsed > time.Second {
-		t.Fatalf("elapsed=%s, want one bounded repository timeout", elapsed)
-	}
-	if len(data.Repos) != 10 || stateName != productStateWaiting {
-		t.Fatalf("unexpected bounded result: state=%s repos=%+v", stateName, data.Repos)
-	}
-	var slow productListEntry
-	for _, entry := range data.Repos {
-		if strings.HasSuffix(entry.Repo, "repo-00") {
-			slow = entry
-			break
-		}
-	}
-	if slow.Repo == "" || slow.ActionRequired || !slow.ProtectionUnknown {
-		t.Fatalf("slow repository was not retained as a transient unknown: %+v", slow)
+			started := time.Now()
+			data, stateName, err := collectProductList(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if elapsed := time.Since(started); elapsed < productListReadTimeout || elapsed > time.Second {
+				t.Fatalf("elapsed=%s, want one bounded repository timeout", elapsed)
+			}
+			if len(data.Repos) != 10 || stateName != productStateWaiting {
+				t.Fatalf("unexpected bounded result: state=%s repos=%d", stateName, len(data.Repos))
+			}
+			var slow productListEntry
+			for _, entry := range data.Repos {
+				if strings.HasSuffix(entry.Repo, "repo-00") {
+					slow = entry
+					break
+				}
+			}
+			if slow.Repo == "" || slow.ActionRequired || !slow.ProtectionUnknown {
+				t.Fatalf("slow repository was not retained as a transient unknown: %+v", slow)
+			}
+			var out bytes.Buffer
+			if err := renderProductListSelection(&out, data.Repos, 0, false, true); err != nil {
+				t.Fatal(err)
+			}
+			columns := strings.Fields(productListLineForRepo(t, out.String(), "repo-00"))
+			if len(columns) < 5 || columns[1] != "-" || columns[2] != "?" || strings.Join(columns[4:], " ") != "checking protection" || productListStatus(slow) != "refreshing" || strings.Contains(out.String(), "acd doctor") {
+				t.Fatalf("expired read was shown as a repository failure:\n%s", out.String())
+			}
+		})
 	}
 }
 

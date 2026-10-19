@@ -438,7 +438,7 @@ func selectProductListEntriesAt(entries []productListEntry, showAll bool, now ti
 	}
 	visible := make([]productListEntry, 0, len(entries))
 	for _, entry := range entries {
-		if entry.ActionRequired || entry.State == productStateNeedsAction || entry.UnfinishedWork || entry.PendingEvents > 0 || entry.BlockedEvents > 0 ||
+		if entry.ActionRequired || entry.State == productStateNeedsAction || entry.ProtectionUnknown || entry.UnfinishedWork || entry.PendingEvents > 0 || entry.BlockedEvents > 0 ||
 			(!entry.lastActivity.IsZero() && entry.lastActivity.After(now.Add(-productListActiveWindow))) {
 			visible = append(visible, entry)
 		}

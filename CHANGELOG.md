@@ -60,6 +60,12 @@
 
 ### Fixed
 
+- Treat deadline-cancelled Git reads in `acd list` as incomplete checks. Keep
+  those rows visible with unknown coverage and counts instead of false
+  repository failures and doctor instructions.
+- Include required code-sharing approval when saving an existing Intent
+  configuration, so users can review and approve it without reselecting Intent.
+
 - Keep old failed finish requests out of current status and retry suggestions
   when current work is already committed. Retain request details in verbose
   output and JSON. Separate optional commands from required actions, report

@@ -64,7 +64,7 @@ Use `--integrations auto|none|NAME,...`, `--strategy local|intent`,
 `--commit-format imperative|conventional`, and the provider's `--provider`,
 `--base-url`, `--model`, and `--ca-file` options for the reviewed plan. Bearer
 credentials come from `ACD_AI_API_KEY` or `--credential-stdin`, never a command-line
-secret argument. Intent endpoint access and optional redacted diff transmission
+secret argument. Intent endpoint access and redacted code sharing
 require their exact permissions. HTTP additionally needs
 `--confirm-insecure-http`; URLs containing credentials, queries, or fragments
 and provider redirects are refused.
@@ -124,6 +124,9 @@ and status. Repositories requiring action remain visible, with next steps below
 the table. `--all` includes idle repositories; `--verbose` shows detailed
 repository blocks. Use `list --watch` for live refresh until Ctrl-C. Redirected
 watch output appends dated updates without terminal screen controls.
+If a repository read times out, its row shows `checking protection`, with `-`
+for saved coverage and `?` for pending changes. An incomplete read does not
+require a repair.
 `--once` remains an explicit alias for the default snapshot. `on --quiet` hides
 the startup wait.
 

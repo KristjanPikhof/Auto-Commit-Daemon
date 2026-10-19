@@ -73,6 +73,10 @@ func collectProductListOverview(ctx context.Context) (productListData, productSt
 			readCtx, cancel := context.WithTimeout(ctx, productListReadTimeout)
 			defer cancel()
 			overview, readErr := productListReadRepo(readCtx, record, now)
+			// Git may report only a killed process when this read expires.
+			if ctxErr := readCtx.Err(); readErr != nil && ctxErr != nil {
+				readErr = errors.Join(readErr, ctxErr)
+			}
 			entries[index] = productListEntryFromOverview(record, workers[record.RepositoryID], overview, readErr)
 		}()
 	}

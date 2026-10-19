@@ -134,10 +134,10 @@ Credential save and settings Apply do not test the connection. Optional
 explicit connection tests use fixed synthetic input, not repository content.
 Local mode does not inspect the credential store.
 
-Intent requires redacted code diffs and includes sharing in the setup approval
-review. Existing installations must enable `ai.diff_egress` and approve sharing
-in `acd config`; upgrade does not change consent. Local remains offline with
-sharing disabled. Binaries remain metadata only. Custom
+Intent requires redacted code diffs. Setup and `acd config` propose missing
+sharing for approval, including when saving existing Intent settings. Sharing
+changes only after approval; upgrade preserves existing consent. Local remains
+offline with sharing disabled. Binaries remain metadata only. Custom
 endpoint credential disclosure, insecure HTTP, provider execution, and project
 command execution have separate permissions. See [AI providers](ai-providers.md).
 

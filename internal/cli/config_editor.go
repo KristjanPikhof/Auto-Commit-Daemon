@@ -244,12 +244,22 @@ func (e *configEditor) Review(ctx context.Context, draft settingsui.EditorDraft)
 }
 
 func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft) (editorPlan, error) {
+	draft.Changes = cloneEditorChanges(draft.Changes)
 	projection, err := e.project(draft.Scope, draft.Changes)
 	if err != nil {
 		return editorPlan{}, err
 	}
 	if projection.document.Generation != draft.Generation {
 		return editorPlan{}, errors.New("settings changed while this editor was open; reopen it to review the latest values")
+	}
+	if _, edited := draft.Changes[config.FieldDiffEgress]; !edited &&
+		projection.values[config.FieldCommitStrategy] == "intent" && projection.values[config.FieldDiffEgress] != "true" {
+		sharing := "true"
+		draft.Changes[config.FieldDiffEgress] = &sharing
+		projection, err = e.projectDocument(projection.document, draft.Scope, draft.Changes)
+		if err != nil {
+			return editorPlan{}, err
+		}
 	}
 	if draft.Credential != "" {
 		if value, _ := e.lookup(ai.EnvAPIKey); strings.TrimSpace(value) != "" {
@@ -274,7 +284,6 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 	if err != nil {
 		return editorPlan{}, err
 	}
-	draft.Changes = cloneEditorChanges(draft.Changes)
 	plan := editorPlan{draft: draft, values: projection.values, validation: validation}
 	var review strings.Builder
 	scope := "Global defaults"
