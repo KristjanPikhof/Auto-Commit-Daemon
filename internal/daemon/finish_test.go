@@ -548,8 +548,8 @@ func TestFinishWorkerCredentialRefreshRetriesSameTarget(t *testing.T) {
 	}))
 	defer server.Close()
 	w.Config.Mode = "intent"
-	w.Config.Provider.DiffEgress = true
-	w.Config.Provider = ai.ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, Model: "test-model", Timeout: 3 * time.Second, CommitStrategy: ai.CommitStrategyIntent, CommitFormat: ai.CommitFormatImperative, DiffEgress: true}
+	// This exercises credential refresh, not a race with Git preparation.
+	w.Config.Provider = ai.ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, Model: "test-model", Timeout: time.Minute, CommitStrategy: ai.CommitStrategyIntent, CommitFormat: ai.CommitFormatImperative, DiffEgress: true}
 	w.Config.Approved = []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials, ai.ConfirmationDiffEgress}
 	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Publish this goal without absorbing later edits"})
 	failed, err := w.Execute(context.Background(), r.ID)
