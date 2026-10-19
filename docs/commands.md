@@ -64,7 +64,7 @@ Use `--integrations auto|none|NAME,...`, `--strategy local|intent`,
 `--commit-format imperative|conventional`, and the provider's `--provider`,
 `--base-url`, `--model`, and `--ca-file` options for the reviewed plan. Bearer
 credentials come from `ACD_AI_API_KEY` or `--credential-stdin`, never a command-line
-secret argument. Intent endpoint access and optional redacted diff transmission
+secret argument. Intent endpoint access and redacted code sharing
 require their exact permissions. HTTP additionally needs
 `--confirm-insecure-http`; URLs containing credentials, queries, or fragments
 and provider redirects are refused.
@@ -124,6 +124,9 @@ and status. Repositories requiring action remain visible, with next steps below
 the table. `--all` includes idle repositories; `--verbose` shows detailed
 repository blocks. Use `list --watch` for live refresh until Ctrl-C. Redirected
 watch output appends dated updates without terminal screen controls.
+If a repository read times out, its row shows `checking protection`, with `-`
+for saved coverage and `?` for pending changes. An incomplete read does not
+require a repair.
 `--once` remains an explicit alias for the default snapshot. `on --quiet` hides
 the startup wait.
 
@@ -159,8 +162,12 @@ creates one complete batch commit without provider or network access. Intent
 uses the approved provider to plan completed goals and valid intermediate trees.
 A provider failure ends this request; it never switches to Local automatically.
 
-The optional quoted purpose supplies context. `--message` supplies the complete
-subject and optional body for one batch commit. Both modes support imperative
+The quoted purpose supplies context about what changed and why. Intent uses it
+to identify useful steps and explain decisions. Intent requires approved
+redacted code diffs; binary-only work also needs context or an exact message. `--message` supplies the complete
+subject and optional body for one batch commit and disables automatic splitting.
+Generated Intent messages include a short reason or practical impact in the body.
+Both modes support imperative
 subjects (`Preserve staged content`) and scope-free conventional subjects
 (`fix: preserve staged content`). Change mode or style through reviewed settings.
 
@@ -171,6 +178,13 @@ HEAD, conflicts, active Git operations, moved refs, and ambiguous same-branch
 linked worktrees prevent publication without disabling protection. An empty
 finish succeeds without creating a commit; an attached unborn branch can receive
 its first commit.
+
+Finish announces that later edits belong to the next finish before preparing
+commits. If files still have uncommitted changes afterward, it shows their count
+and the saved snapshot's time. Use `git status --short` to inspect them, then run
+`acd finish` when that work is ready. Excluded files remain uncommitted.
+When nothing remains, finish reports a clean working copy. Repeated project-check
+results appear once; JSON keeps each commit's result.
 
 Ordinary finish refuses staging. `--include-staged` approves only the exact
 current selection, including staged-only bytes and deletions. Unstaged changes

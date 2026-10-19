@@ -65,6 +65,9 @@ func TestConfigEditorIntentPromptsForMissingCredentialBeforeSave(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, field := range snapshot.Fields {
+				if field.Key == config.FieldDiffEgress && approve && field.Value != "true" {
+					t.Fatal("Intent selection did not save approved code sharing")
+				}
 				if field.Key == config.FieldProvider && tc.name == "change to local provider" && field.Value != "deterministic" {
 					t.Fatalf("provider=%s want=deterministic", field.Value)
 				}

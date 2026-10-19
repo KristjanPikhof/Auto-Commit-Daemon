@@ -62,7 +62,7 @@ func finishStageLabel(stage string) string {
 
 func finishCheckLabel(check daemon.FinishCheck) string {
 	if check.Policy == "none" {
-		return "Project checks: not configured."
+		return "Project checks: skipped (none configured)."
 	}
 	if check.Policy == "structural" || check.Result.Mode == verification.ModeStructural {
 		return "Project checks: not run; only structural checks were configured."

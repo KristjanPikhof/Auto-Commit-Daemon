@@ -67,7 +67,7 @@ func TestFinishConfigIntentApplyDoesNotProbe(t *testing.T) {
 		probes.Add(1)
 		return ai.ProviderProbeResult{}, nil
 	})
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldDiffEgress: "true", config.FieldCommitFormat: "imperative"}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldCommitFormat: "imperative"}
 	v, err := svc.Validate(context.Background(), draft, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -151,9 +151,9 @@ func TestFinishConfigApplyApprovesCommandWithoutExecutingIt(t *testing.T) {
 			})
 			marker := filepath.Join(t.TempDir(), "project-check-ran")
 			command := "touch '" + marker + "'"
-			draft := map[string]string{config.FieldCommitStrategy: mode, config.FieldProvider: "openai-compat", config.FieldIntentVerification: "full", config.FieldVerificationFullCommand: command}
+			draft := map[string]string{config.FieldCommitStrategy: mode, config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "full", config.FieldVerificationFullCommand: command}
 			svc.credentialLookup = func(string) (string, bool) { return "approved-key", true }
-			validation, err := svc.Validate(context.Background(), draft, nil)
+			validation, err := svc.Validate(context.Background(), draft, []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -163,7 +163,7 @@ func TestFinishConfigApplyApprovesCommandWithoutExecutingIt(t *testing.T) {
 			if _, err := svc.Apply(context.Background(), ApplyRequest{Values: draft, ExpectedGeneration: validation.SourceGeneration}); err == nil {
 				t.Fatal("unapproved command applied")
 			}
-			result, err := svc.Apply(context.Background(), ApplyRequest{Values: draft, TestedFingerprint: validation.Fingerprint, ExpectedGeneration: validation.SourceGeneration, Confirmations: []ai.ConfirmationRequirement{ai.ConfirmationVerificationCommand}})
+			result, err := svc.Apply(context.Background(), ApplyRequest{Values: draft, TestedFingerprint: validation.Fingerprint, ExpectedGeneration: validation.SourceGeneration, Confirmations: []ai.ConfirmationRequirement{ai.ConfirmationVerificationCommand, ai.ConfirmationDiffEgress}})
 			if err != nil || !result.Applied {
 				t.Fatalf("approved configuration = %+v: %v", result, err)
 			}
@@ -181,8 +181,8 @@ func TestFinishConfigApplyApprovesCommandWithoutExecutingIt(t *testing.T) {
 func TestFinishConfigIntentSubprocessIgnoresUnrelatedCredentials(t *testing.T) {
 	svc, _ := testService(t, nil, nil)
 	svc.credentialLookup = func(string) (string, bool) { t.Fatal("subprocess read API credentials"); return "", false }
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "subprocess:local-ai"}
-	validation, err := svc.Validate(context.Background(), draft, []ai.ConfirmationRequirement{ai.ConfirmationSubprocessExecution})
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "subprocess:local-ai"}
+	validation, err := svc.Validate(context.Background(), draft, []ai.ConfirmationRequirement{ai.ConfirmationSubprocessExecution, ai.ConfirmationDiffEgress})
 	if err != nil || validation.ProviderConfig.APIKey != "" || len(validation.Missing) != 0 {
 		t.Fatalf("subprocess configuration = %+v: %v", validation, err)
 	}
@@ -205,8 +205,8 @@ func TestFinishConfigGlobalHTTPApprovalRemainsExactAndDoesNotProbe(t *testing.T)
 		t.Fatal("saving approval contacted provider")
 		return ai.ProviderProbeResult{}, nil
 	})
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldBaseURL: "http://127.0.0.1:12345/v1"}
-	confirmations := []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldBaseURL: "http://127.0.0.1:12345/v1"}
+	confirmations := []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials, ai.ConfirmationDiffEgress}
 	validation, err := svc.Validate(context.Background(), draft, confirmations)
 	if err != nil || len(validation.Missing) != 0 {
 		t.Fatalf("HTTP consent = %+v: %v", validation, err)
@@ -220,7 +220,7 @@ func TestFinishConfigGlobalHTTPApprovalRemainsExactAndDoesNotProbe(t *testing.T)
 		t.Fatal(err)
 	}
 	approval, ok := config.ActiveGlobalSetupApproval(doc)
-	if !ok || approval.Fingerprint != validation.Fingerprint || len(approval.Confirmations) != 2 {
+	if !ok || approval.Fingerprint != validation.Fingerprint || len(approval.Confirmations) != 3 {
 		t.Fatalf("exact HTTP approval = %+v: %t", approval, ok)
 	}
 }

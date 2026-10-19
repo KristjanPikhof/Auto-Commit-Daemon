@@ -81,17 +81,17 @@ func finishArchiveIntentProvider(t *testing.T, runtime *workerRuntime) *atomic.I
 			ids = append(ids, change.ID)
 		}
 		calls.Add(1)
-		plan, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Complete current behavior", Boundary: "Keep the selected current changes together", Message: "Complete current behavior", ChangeIDs: ids}}})
+		plan, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Complete current behavior", Boundary: "Keep the selected current changes together", Message: "Complete current behavior\n\n- Preserve the current behavior without changing other work.", ChangeIDs: ids}}})
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"type": "function", "function": map[string]string{"name": "finish_plan", "arguments": string(plan)}}}}}}})
 	}))
 	t.Cleanup(server.Close)
 	t.Setenv(ai.EnvAPIKey, "archive-independence-key")
 	finishConfigRevision(t, runtime.db, map[string]any{
-		config.FieldCommitStrategy: "intent", config.FieldCommitFormat: "imperative",
+		config.FieldCommitStrategy: "intent", config.FieldDiffEgress: true, config.FieldCommitFormat: "imperative",
 		config.FieldProvider: "openai-compat", config.FieldBaseURL: server.URL,
 		config.FieldModel: "archive-independence-model", config.FieldIntentVerification: "none",
-		"confirmations": []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials},
+		"confirmations": []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials, ai.ConfirmationDiffEgress},
 	}, sql.NullInt64{}, true)
 	return calls
 }

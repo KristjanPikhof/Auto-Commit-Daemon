@@ -47,8 +47,12 @@ func finishTestEvidence() finish.Evidence {
 	target := finish.Tree{"settings.go": finishTestEntry("b")}
 	return finish.Evidence{Base: base, Target: target, Changes: finish.NetChanges(base, target, "author-a")}
 }
-func finishTestOptions() FinishOptions {
-	return FinishOptions{Deadline: time.Now().Add(time.Minute), Style: finish.StyleImperative}
+func finishTestOptions(evidence finish.Evidence) FinishOptions {
+	options := FinishOptions{Deadline: time.Now().Add(time.Minute), Style: finish.StyleImperative, Purpose: "Keep authored settings ahead of defaults", DiffEgress: true, RequireCompletionContext: true}
+	for _, change := range evidence.Changes {
+		options.Diffs = append(options.Diffs, FinishDiff{ChangeID: change.ID, Text: "- previous recorded value\n+ next recorded value\n"})
+	}
+	return options
 }
 func finishTestOutput(goals ...finish.Goal) []byte {
 	body, err := json.Marshal(struct {
@@ -99,12 +103,12 @@ func TestFinishIntentCompletedGoals(t *testing.T) {
 			evidence.Changes = append(evidence.Changes, finish.Change{ID: "settings-correction", Path: "settings.go", Before: evidence.Target["settings.go"], After: last, Author: "a", DependsOn: []string{"settings.go"}})
 			evidence.Target["settings.go"] = last
 			goals := []finish.Goal{
-				{Purpose: "Extract the reusable settings parser", Boundary: "Review parser independently of the new default", Message: "Extract reusable settings parser", ChangeIDs: paths[:2]},
+				{Purpose: "Extract the reusable settings parser", Boundary: "Review parser independently of the new default", Message: "Extract reusable settings parser\n\n- Share parsing before changing setup behavior.", ChangeIDs: paths[:2]},
 				{Purpose: "Add explicit offline finish", Boundary: "Review batch completion before changing setup defaults", Message: "Add explicit offline finish\n\n- Save a complete protected batch on request.", ChangeIDs: paths[2:4]},
 				{Purpose: "Default new setups to offline finish", Boundary: "Revert default behavior while keeping explicit finish", Message: "Default new setups to offline finish\n\n- Keep initial protection independent of credentials.", ChangeIDs: append(slices.Clone(paths[4:]), "settings-correction")},
 			}
 			if style == finish.StyleConventional {
-				goals[0].Message = "refactor: extract settings parser"
+				goals[0].Message = "refactor: extract settings parser\n\n- Share parsing before changing setup behavior."
 				goals[1].Message = "feat: add explicit offline finish\n\n- Save a complete protected batch on request."
 				goals[2].Message = "feat: default new setups to offline finish\n\n- Keep initial protection independent of credentials."
 			}
@@ -112,9 +116,9 @@ func TestFinishIntentCompletedGoals(t *testing.T) {
 				if request.Style != style || request.Purpose != "New users should protect work without credentials" {
 					t.Fatalf("request = %+v", request)
 				}
-				return finishTestOutput(goals...), nil
+				return finishTestOutput(goals[2], goals[1], goals[0]), nil
 			}}
-			options := finishTestOptions()
+			options := finishTestOptions(evidence)
 			options.Style = style
 			options.Purpose = "New users should protect work without credentials"
 			result, err := PlanFinish(context.Background(), provider, evidence, options)
@@ -134,14 +138,14 @@ func TestFinishIntentCompletedGoals(t *testing.T) {
 func TestFinishIntentCombinedCorrection(t *testing.T) {
 	evidence := finishTestEvidence()
 	for _, bad := range []string{
-		`{"goals":[{"purpose":"Fabricate","message":"Preserve explicit settings","change_ids":["imagined"]}]}`,
+		`{"goals":[{"purpose":"Fabricate","message":"Preserve explicit settings\n\n- Keep authored values ahead of defaults.","change_ids":["imagined"]}]}`,
 		`{"goals":[{"purpose":"Incomplete","message":"fix(settings): change settings","change_ids":["settings.go"]}]}`,
 		`{"goals":[],"tree":{"settings.go":"fabricated"}}`,
 		`not json`,
 	} {
 		t.Run(bad[:min(25, len(bad))], func(t *testing.T) {
 			calls := 0
-			options := finishTestOptions()
+			options := finishTestOptions(evidence)
 			var deadlines []time.Time
 			options.BeforeCall = func(ctx context.Context) error {
 				calls++
@@ -166,7 +170,7 @@ func TestFinishIntentCombinedCorrection(t *testing.T) {
 		})
 	}
 	provider := &finishFakeTransport{exchange: func(context.Context, FinishPlanRequest) ([]byte, error) { return []byte(`{"goals":[]}`), nil }}
-	result, err := PlanFinish(context.Background(), provider, evidence, finishTestOptions())
+	result, err := PlanFinish(context.Background(), provider, evidence, finishTestOptions(evidence))
 	finishAssertError(t, err, "invalid_provider_plan")
 	if result.Calls != 2 {
 		t.Fatalf("calls=%d", result.Calls)
@@ -176,9 +180,9 @@ func TestFinishIntentCombinedCorrection(t *testing.T) {
 func TestFinishIntentSemanticQualityCorrection(t *testing.T) {
 	evidence := finishTestEvidence()
 	for _, style := range []string{finish.StyleImperative, finish.StyleConventional} {
-		for _, scenario := range []string{"generic", "filename", "purpose", "boundary", "test claim", "default impact"} {
+		for _, scenario := range []string{"generic", "filename", "purpose", "boundary", "test claim", "default impact", "missing reason"} {
 			t.Run(style+"/"+scenario, func(t *testing.T) {
-				options := finishTestOptions()
+				options := finishTestOptions(evidence)
 				options.Style = style
 				goal := finishTestGoal(evidence)
 				if style == finish.StyleConventional {
@@ -186,6 +190,8 @@ func TestFinishIntentSemanticQualityCorrection(t *testing.T) {
 				}
 				bad := goal
 				switch scenario {
+				case "missing reason":
+					bad.Message = strings.Split(goal.Message, "\n")[0]
 				case "generic":
 					bad.Message = "Update files"
 				case "filename":
@@ -227,7 +233,7 @@ func TestFinishIntentSemanticQualityCorrection(t *testing.T) {
 func TestFinishIntentPrivacyAndSuppliedMessage(t *testing.T) {
 	evidence := finishTestEvidence()
 	evidence.Changes[0].Provenance = "local immutable provenance must stay local"
-	options := finishTestOptions()
+	options := finishTestOptions(evidence)
 	options.Purpose = "Rotate password=abcdefgh12345678"
 	options.Message = "Rotate service credentials\n\n- Replace password=abcdefgh12345678."
 	options.Diffs = []FinishDiff{{ChangeID: "settings.go", Text: "+password=abcdefgh12345678\n", BeforeSize: 12, AfterSize: 20}}
@@ -247,6 +253,13 @@ func TestFinishIntentPrivacyAndSuppliedMessage(t *testing.T) {
 				return finishTestOutput(goal), nil
 			}}
 			result, err := PlanFinish(context.Background(), provider, evidence, options)
+			if !allowed {
+				var failure *FinishPlanningError
+				if !errors.As(err, &failure) || failure.Code != "provider_diffs_required" || failure.Retryable() || result.Calls != 0 || len(provider.requests) != 0 {
+					t.Fatalf("unapproved code sharing reached provider: %+v %v", result, err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -272,7 +285,7 @@ func TestFinishIntentBoundsAndNoFallback(t *testing.T) {
 	evidence := finishTestEvidence()
 	for _, scenario := range []string{"transport failure", "budget", "expired", "missing deadline", "missing diff", "binary text", "per-path cap", "redaction cap", "aggregate cap", "serialized cap", "invalid purpose", "invalid identifiers", "no-op"} {
 		t.Run(scenario, func(t *testing.T) {
-			options := finishTestOptions()
+			options := finishTestOptions(evidence)
 			input := evidence
 			code := ""
 			paid := 0
@@ -294,6 +307,7 @@ func TestFinishIntentBoundsAndNoFallback(t *testing.T) {
 				options.Deadline = time.Time{}
 			case "missing diff":
 				code = "invalid_evidence"
+				options.Diffs = nil
 				options.DiffEgress = true
 			case "binary text":
 				code = "invalid_evidence"
@@ -307,6 +321,7 @@ func TestFinishIntentBoundsAndNoFallback(t *testing.T) {
 				options.DiffEgress = true
 				options.Diffs = []FinishDiff{{ChangeID: "settings.go", Text: strings.Repeat("token=12345678\n", FinishDiffByteCap/len("token=12345678\n"))}}
 			case "aggregate cap":
+				options.Diffs = nil
 				code = "provider_input_too_large"
 				options.DiffEgress = true
 				input = finish.Evidence{Base: finish.Tree{}, Target: finish.Tree{}}
@@ -350,7 +365,7 @@ func TestFinishIntentBoundsAndNoFallback(t *testing.T) {
 			}
 		})
 	}
-	options := finishTestOptions()
+	options := finishTestOptions(evidence)
 	options.Deadline = time.Now().Add(25 * time.Millisecond)
 	provider := &finishFakeTransport{exchange: func(ctx context.Context, _ FinishPlanRequest) ([]byte, error) { <-ctx.Done(); return nil, ctx.Err() }}
 	result, err := PlanFinish(context.Background(), provider, evidence, options)
@@ -361,7 +376,7 @@ func TestFinishIntentBoundsAndNoFallback(t *testing.T) {
 
 func TestFinishIntentExactSerializedCapAndCorrectionCap(t *testing.T) {
 	evidence := finishTestEvidence()
-	options := finishTestOptions()
+	options := finishTestOptions(evidence)
 	provider := &finishFakeTransport{exchange: func(context.Context, FinishPlanRequest) ([]byte, error) {
 		return finishTestOutput(finishTestGoal(evidence)), nil
 	}}
@@ -389,7 +404,7 @@ func TestFinishIntentExactSerializedCapAndCorrectionCap(t *testing.T) {
 
 func TestFinishIntentCorrectionConsumesBudget(t *testing.T) {
 	evidence := finishTestEvidence()
-	options := finishTestOptions()
+	options := finishTestOptions(evidence)
 	paid := 0
 	options.BeforeCall = func(context.Context) error {
 		paid++
@@ -417,7 +432,7 @@ func TestFinishIntentOpenAIRejectsFailureAndRedirect(t *testing.T) {
 			}))
 			defer server.Close()
 			provider := &OpenAIProvider{BaseURL: server.URL, APIKey: "test-key", HTTP: server.Client()}
-			result, err := PlanFinish(context.Background(), provider, finishTestEvidence(), finishTestOptions())
+			result, err := PlanFinish(context.Background(), provider, finishTestEvidence(), finishTestOptions(finishTestEvidence()))
 			finishAssertError(t, err, "provider_failure")
 			if result.Calls != 1 || requests.Load() != 1 {
 				t.Fatalf("hidden HTTP calls: result=%+v requests=%d", result, requests.Load())
@@ -442,11 +457,11 @@ func TestFinishIntentOpenAITransport(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "finish_plan", "arguments": arguments}}}}}}})
 	}))
 	defer server.Close()
-	cfg := ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, APIKey: "test-key", Model: DefaultOpenAIModel, CommitStrategy: CommitStrategyIntent}
+	cfg := ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, APIKey: "test-key", Model: DefaultOpenAIModel, CommitStrategy: CommitStrategyIntent, DiffEgress: true}
 	if _, _, err := BuildFinishTransport(cfg, nil); err == nil {
 		t.Fatal("unapproved endpoint accepted")
 	}
-	transport, closer, err := BuildFinishTransport(cfg, []ConfirmationRequirement{ConfirmationEndpointCredentials, ConfirmationInsecureEndpointCredentials})
+	transport, closer, err := BuildFinishTransport(cfg, []ConfirmationRequirement{ConfirmationEndpointCredentials, ConfirmationInsecureEndpointCredentials, ConfirmationDiffEgress})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +471,7 @@ func TestFinishIntentOpenAITransport(t *testing.T) {
 	if requests.Load() != 0 {
 		t.Fatal("provider construction made a request")
 	}
-	result, err := PlanFinish(context.Background(), transport, evidence, finishTestOptions())
+	result, err := PlanFinish(context.Background(), transport, evidence, finishTestOptions(evidence))
 	if err != nil || result.Calls != 1 || requests.Load() != 1 {
 		t.Fatalf("result=%+v err=%v requests=%d", result, err, requests.Load())
 	}
@@ -474,14 +489,14 @@ func TestFinishIntentSubprocessOneExchange(t *testing.T) {
 		t.Run(fmt.Sprint(crash), func(t *testing.T) {
 			dir := t.TempDir()
 			calls := filepath.Join(dir, "calls")
-			response := `printf '%s\n' '{"version":1,"finish_plan":{"goals":[{"purpose":"Preserve settings","message":"Preserve explicit settings","change_ids":["settings.go"]}]}}'`
+			response := `printf '%s\n' '{"version":1,"finish_plan":{"goals":[{"purpose":"Preserve settings","message":"Preserve explicit settings\n\n- Keep authored values ahead of defaults.","change_ids":["settings.go"]}]}}'`
 			if crash {
 				response = "exit 1"
 			}
 			bin := writePluginScript(t, dir, "finish", fmt.Sprintf("while IFS= read -r line; do\n  printf 'call\\n' >> '%s'\n  case \"$line\" in *'\"request_type\":\"finish_plan\"'*) ;; *) exit 2 ;; esac\n  %s\ndone\n", calls, response))
 			provider := NewSubprocessProvider("finish", SubprocessOptions{LookPath: fixedLookPath("acd-provider-finish", bin), Stderr: io.Discard, Timeout: 10 * time.Second})
 			defer provider.Close()
-			result, err := PlanFinish(context.Background(), provider, finishTestEvidence(), finishTestOptions())
+			result, err := PlanFinish(context.Background(), provider, finishTestEvidence(), finishTestOptions(finishTestEvidence()))
 			if crash {
 				finishAssertError(t, err, "provider_failure")
 			} else if err != nil {

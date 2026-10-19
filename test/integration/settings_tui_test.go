@@ -143,6 +143,9 @@ func TestSettingsTUIAccessibleActionFirstTestAndRiskDecline(t *testing.T) {
 	if declined.ExitCode != 0 || !strings.Contains(declined.Stdout, "Allow sending your API key to https://example.invalid/v1") {
 		t.Fatalf("decline exit=%d\n%s", declined.ExitCode, declined.Stdout)
 	}
+	if !strings.Contains(declined.Stdout, "Allow sending redacted code diffs") {
+		t.Fatal("existing Intent settings did not review required code sharing")
+	}
 	if strings.Contains(declined.Stdout, "integration-placeholder") || strings.Contains(declined.Stdout, "Testing and saving") {
 		t.Fatal("declined review probed or leaked key")
 	}
@@ -225,6 +228,9 @@ func TestConfigEditorAPIKeyMaskedAndSavedWithoutProbeInRealPTY(t *testing.T) {
 			if result.ExitCode != 0 || !strings.Contains(result.Stdout, "Settings saved") {
 				t.Fatalf("API key editor exit=%d\n%s", result.ExitCode, result.Stdout)
 			}
+			if !strings.Contains(result.Stdout, "Allow sending redacted code diffs") {
+				t.Fatal("saving an Intent key did not review required code sharing")
+			}
 			if tc.name == "required_on_save" && !strings.Contains(result.Stdout, "requires an API key") {
 				t.Fatalf("missing required credential prompt: %s", result.Stdout)
 			}
@@ -274,7 +280,7 @@ func TestSettingsTUINarrowFinalApprovalRemainsVisibleAndDeclineSendsNothing(t *t
 		t.Fatalf("approval never visible: %s", result.Stdout)
 	}
 	final := result.Stdout[at:]
-	for _, want := range []string{fmt.Sprintf("Allow sending your API key to %s/v1", server.URL), "Save these changes and apply them where possible?"} {
+	for _, want := range []string{fmt.Sprintf("Allow sending your API key to %s/v1", server.URL), "Allow sending redacted code diffs", "Save these changes and apply them where possible?"} {
 		if !strings.Contains(final, want) {
 			t.Errorf("final approval missing %q: %s", want, final)
 		}

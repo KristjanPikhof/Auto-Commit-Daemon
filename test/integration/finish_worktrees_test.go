@@ -186,7 +186,7 @@ func TestFinishFaultPreparedRestartBeforeAndAfterCAS(t *testing.T) {
 			}
 			f.Barrier(t, t.Context())
 			saved := finishWaitRequest(t, f, request.ID)
-			if saved.State != state.FinishCompleted || saved.PlanningCalls != 0 || saved.Attempt != 1 || saved.Target != request.Target {
+			if saved.State != state.FinishCompleted || saved.PlanningCalls != 0 || saved.Attempt != 1 || !reflect.DeepEqual(saved.Target, request.Target) {
 				t.Fatalf("prepared recovery %+v", saved)
 			}
 			if strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")) != proof.NewHead || commitCount(t, f.Repo) != 2 {

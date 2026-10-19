@@ -20,7 +20,7 @@ var fieldDescriptors = []FieldDescriptor{
 	{Key: "ai.timeout", Label: "AI time limit", Description: "Maximum time to wait for the AI service"},
 	{Key: "ai.ca_file", Label: "Trusted certificate file", Description: "Certificate file used to trust your AI service"},
 	{Key: "ai.api_key", Label: "API key", Description: "Uses ACD_AI_API_KEY or the key saved by ACD"},
-	{Key: "ai.diff_egress", Label: "Share changes with AI", Description: "Allow ACD to send filtered changes to your AI service; filtering cannot guarantee that all secrets are removed", Choices: []string{"false", "true"}},
+	{Key: "ai.diff_egress", Label: "Share changes with AI", Description: "Required for Intent: send redacted code diffs to your AI service; filtering cannot guarantee that all secrets are removed", Choices: []string{"false", "true"}},
 	{Key: "commit.strategy", Label: "Finish mode", Description: "Local makes one commit; Intent asks AI to group completed work", Choices: []string{"local", "intent"}},
 	{Key: "commit.format", Label: "Commit format", Description: "Imperative or conventional", Choices: []string{"imperative", "conventional"}},
 	{Key: "intent.verification", Label: "Checks before committing", Description: "Checks ACD runs before adding finished work to Git", Choices: []string{"none", "structural", "fast", "full"}},

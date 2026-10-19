@@ -71,6 +71,25 @@ func TestFinishPlanRecordedVersionsAndPrerequisites(t *testing.T) {
 	}
 }
 
+func TestFinishPlanCannotReorderRepeatedPathVersions(t *testing.T) {
+	evidence := Evidence{Base: Tree{"api": planEntry("a")}, Target: Tree{"api": planEntry("c")}, Changes: []Change{
+		{ID: "first", Path: "api", Before: planEntry("a"), After: planEntry("b")},
+		{ID: "undo", Path: "api", Before: planEntry("b"), After: planEntry("a")},
+		{ID: "restore", Path: "api", Before: planEntry("a"), After: planEntry("b")},
+		{ID: "feature", Path: "api", Before: planEntry("b"), After: planEntry("c")},
+	}}
+	goal := Goal{Purpose: "Complete the final behavior", Message: "Complete final behavior", ChangeIDs: []string{"restore", "undo", "first", "feature"}}
+	if _, err := Build(evidence, []Goal{goal}); err == nil {
+		t.Fatal("matching preimages allowed a false recorded order")
+	}
+	// The earlier edit/revert pair can remain neutral provenance without
+	// forcing development noise into the branch's useful steps.
+	goal.ChangeIDs = []string{"restore", "feature"}
+	if _, err := Build(evidence, []Goal{goal}); err != nil {
+		t.Fatalf("neutral cycle could not be omitted: %v", err)
+	}
+}
+
 func TestFinishPlanRenameAndAuthorBoundaries(t *testing.T) {
 	evidence := Evidence{
 		Base: Tree{"old": planEntry("a")}, Target: Tree{"new": planEntry("b")},

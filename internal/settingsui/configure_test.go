@@ -24,7 +24,7 @@ func TestFinishRemovalWizardStagesIntentWithoutTests(t *testing.T) {
 		Accessible: true, DetectedQuickCommand: "go test ./... -run '^$'",
 		DetectedQuickSource: "Go language default",
 		Defaults: map[string]string{
-			"commit.strategy": "intent", "intent.verification": "structural", "ai.diff_egress": "true",
+			"commit.strategy": "intent", "intent.verification": "structural", "ai.diff_egress": "false",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
 			"ai.model": "gpt-6-luna", "ai.base_url": "https://api.openai.com/v1",
 			"ai.timeout": "30s",

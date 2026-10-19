@@ -115,14 +115,21 @@ Hard dependencies, rename chains, create and delete order, and generated
 relationships must remain safe. Time and directory proximity cannot be the only
 reason for grouping unrelated work.
 
-Plan completed goals before assigning files to commits. Keep implementation,
+Plan useful completed steps within the overall goal before assigning changes.
+A feature can contain a working refactor, its consumer, and a broader policy
+decision. Dependencies determine order; they do not by themselves require one
+commit. Keep implementation,
 callers, tests, imports, generated output, and relevant documentation together
 when they complete one goal. Available unpublished corrections belong with the
 change they correct. Different files or screens do not justify a split.
 
 Each split needs a useful review or revert boundary and a valid intermediate
 state. Put prerequisites before consumers or in the same commit. Explain
-broader defaults and behavior changes from evidence. Age and queue pressure
+the reason or practical impact in each generated message, not only internal
+planning metadata. Explain broader defaults and behavior changes from evidence.
+Intent requires approved redacted code diffs on every planning path; completion
+context supplements that evidence. Local remains offline. Existing settings
+retain their consent on upgrade. An exact `--message` requests one complete batch. Age and queue pressure
 never waive completeness checks. Judge the proposed commit tree, not the final
 worktree. Frozen request identity, author boundaries, and explicit history-rewrite safety
 limits still apply.

@@ -8,6 +8,10 @@ ACD protects changes in private checkpoints. `acd finish` creates branch commits
 - When committing is authorized, run `acd finish "Complete the task goal"`
   after the task and relevant checks are complete, before handoff or a branch
   switch. During longer tasks, finish complete, verified milestones separately.
+- Supply context about the problem, chosen approach, and constraints so Intent
+  can explain decisions and identify useful steps within the task. Use an exact
+  `--message` only for an intentional single batch; it disables splitting.
+  Review the actual commit boundaries and reasons before claiming success.
 - Review the whole diff first: finish includes all eligible pending changes in
   the worktree. Preserve unrelated work and use an isolated worktree when needed.
   Preserve user staging; use `--include-staged` only for an authorized selection.

@@ -145,11 +145,11 @@ func TestFinishCLIConfigExactCommandConsentAndCredentials(t *testing.T) {
 	for _, consent := range []bool{false, true} {
 		t.Run(fmt.Sprintf("consent_%t", consent), func(t *testing.T) {
 			roots, runtime := finishConfigFixture(t)
-			confirmed := []string{}
+			confirmed := []string{string(ai.ConfirmationDiffEgress)}
 			if consent {
 				confirmed = append(confirmed, string(ai.ConfirmationVerificationCommand))
 			}
-			finishConfigRevision(t, runtime.db, map[string]any{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "printf approved", config.FieldVerificationFastTimeout: "17s", "confirmations": confirmed}, sql.NullInt64{}, true)
+			finishConfigRevision(t, runtime.db, map[string]any{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldDiffEgress: true, config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "printf approved", config.FieldVerificationFastTimeout: "17s", "confirmations": confirmed}, sql.NullInt64{}, true)
 			t.Setenv("ACD_AI_API_KEY", "first-token")
 			got, err := resolveFinishWorkerConfig(context.Background(), roots, runtime)
 			if !consent {
@@ -176,17 +176,18 @@ func TestFinishCLIConfigGlobalApprovalBindsEffectiveValues(t *testing.T) {
 	if err := store.Update(func(doc *config.Document) error {
 		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
 		doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"subprocess:approved"`)
+		doc.Settings.Global[config.FieldDiffEgress] = json.RawMessage(`true`)
 		values, err := finishResolveValues(config.ResolveInput{Global: doc.Settings.Global})
 		if err != nil {
 			return err
 		}
 		fingerprint, err := config.SettingsFingerprint(values)
-		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{Generation: doc.Generation + 1, Fingerprint: fingerprint, Confirmations: []string{"subprocess_execution"}}
+		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{Generation: doc.Generation + 1, Fingerprint: fingerprint, Confirmations: []string{"subprocess_execution", "diff_egress"}}
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := resolveFinishWorkerConfig(context.Background(), roots, runtime); err != nil || got.Provider.Mode != "subprocess:approved" || len(got.Approved) != 1 {
+	if got, err := resolveFinishWorkerConfig(context.Background(), roots, runtime); err != nil || got.Provider.Mode != "subprocess:approved" || len(got.Approved) != 2 {
 		t.Fatalf("exact global approval rejected %+v: %v", got, err)
 	}
 	if err := store.Update(func(doc *config.Document) error {
@@ -240,5 +241,35 @@ func TestFinishCLIConfigLegacyDefaultsAndAbsentAuthor(t *testing.T) {
 	after, err := os.ReadFile(roots.ConfigPath())
 	if !os.IsNotExist(err) || len(after) != 0 {
 		t.Fatal("resolution recreated authoring config")
+	}
+}
+
+func TestFinishCLIConfigRejectsUnsharedCodeBeforeReadingCredentials(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			roots, runtime := finishConfigFixture(t)
+			finishConfigRevision(t, runtime.db, map[string]any{
+				config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat",
+				config.FieldDiffEgress: enabled,
+			}, sql.NullInt64{}, true)
+			t.Setenv(ai.EnvAPIKey, "invalid\ncredential")
+			_, err := resolveFinishWorkerConfig(t.Context(), roots, runtime)
+			if err == nil || !strings.Contains(err.Error(), "acd config") || !strings.Contains(err.Error(), "diff") {
+				t.Fatalf("missing code sharing was not rejected before credentials: %v", err)
+			}
+		})
+	}
+}
+
+func TestFinishCLIConfigSavedHistoryNeedsNoNewCodeApproval(t *testing.T) {
+	roots, runtime := finishConfigFixture(t)
+	finishConfigRevision(t, runtime.db, map[string]any{
+		config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat",
+		config.FieldDiffEgress: false,
+	}, sql.NullInt64{}, true)
+	t.Setenv(ai.EnvAPIKey, "invalid\ncredential")
+	cfg, err := resolveFinishWorkerConfigInputs(t.Context(), roots, runtime, false)
+	if err != nil || cfg.Provider.DiffEgress || cfg.Provider.APIKey != "" {
+		t.Fatalf("applying saved history required new code sharing: %+v %v", cfg, err)
 	}
 }

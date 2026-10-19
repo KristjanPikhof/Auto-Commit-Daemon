@@ -1122,10 +1122,13 @@ func defaultDoctorProcessList(ctx context.Context) ([]doctorProcess, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseDoctorProcesses(string(out)), nil
+}
+
+func parseDoctorProcesses(output string) []doctorProcess {
 	var processes []doctorProcess
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			continue
 		}
@@ -1142,7 +1145,7 @@ func defaultDoctorProcessList(ctx context.Context) ([]doctorProcess, error) {
 			Command: strings.TrimSpace(strings.TrimPrefix(line, fields[0])),
 		})
 	}
-	return processes, scanner.Err()
+	return processes
 }
 
 func findDaemonProcesses(ctx context.Context, repo string) []int {

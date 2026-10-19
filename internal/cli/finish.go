@@ -25,6 +25,11 @@ Local mode creates one commit. Intent mode uses the approved AI provider to
 group completed work into commits. Later edits stay saved for your next
 finish. ACD never pushes.
 
+Supply PURPOSE as context describing what changed and why. Intent uses it to
+explain decisions and choose useful steps. Intent requires approved redacted
+code diffs. Binary-only changes also need context. --message requests one batch
+with that exact message and disables automatic splitting, including in Intent.
+
 Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
 --include-staged to include your exact current staged selection. Use --retry
@@ -50,7 +55,7 @@ changes, purpose, message, and staged selection.`,
 	cmd.Flags().BoolVar(&params.DryRun, "dry-run", false, "Plan and check without moving the branch or index")
 	cmd.Flags().BoolVar(&params.IncludeStaged, "include-staged", false, "Include the exact current staged selection")
 	cmd.Flags().StringVar(&params.RetryID, "retry", "", "Retry or reconnect to a saved request")
-	cmd.Flags().StringVar(&params.Message, "message", "", "Use this exact commit message")
+	cmd.Flags().StringVar(&params.Message, "message", "", "Create one batch commit with this exact message (disables splitting)")
 	return cmd
 }
 
@@ -75,6 +80,7 @@ type finishCLIResult struct {
 	NewHead             string               `json:"new_head"`
 	StagedConsumed      bool                 `json:"staged_consumed"`
 	WorktreeChanges     int                  `json:"worktree_changes"`
+	SnapshotSavedAt     string               `json:"snapshot_saved_at,omitempty"`
 }
 
 func runFinish(ctx context.Context, out, progress io.Writer, repo string, params finishStartParams, jsonOut, quiet bool) error {
@@ -84,6 +90,13 @@ func runFinish(ctx context.Context, out, progress io.Writer, repo string, params
 	}
 	if !lookup.Registered || lookup.Record.LifecycleDisabled() {
 		return actionRequiredError("protection_required", "acd finish: enable protection first with `acd on`")
+	}
+	if !quiet && !jsonOut {
+		if params.RetryID != "" {
+			fmt.Fprintln(progress, "Reconnecting to the saved finish request; later edits stay for the next finish.")
+		} else {
+			fmt.Fprintln(progress, "Saving current changes for this finish. Later edits stay for the next finish.")
+		}
 	}
 	r, err := finishRequest(ctx, lookup, "finish_start", params)
 	if err != nil {
@@ -156,16 +169,26 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	defer cancel()
 	count, countErr := productWorktreeChangeCount(readCtx, lookup.Worktree.Root)
 	result.WorktreeChanges = count
+	if r.Target.CheckpointID != "" {
+		if cp, err := state.ResolveCheckpoint(readCtx, state.DBPathFromGitDir(lookup.Worktree.GitDir), r.Target.CheckpointID); err == nil {
+			result.SnapshotSavedAt = time.Unix(0, int64(cp.CreatedTS*float64(time.Second))).Local().Format(time.RFC3339)
+		}
+	}
 	ok := r.State == state.FinishCompleted && !detached
+	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required" && r.ReasonCode != "provider_diffs_required"
 	exit, failureCode := finishExit(r, waitCode)
 	next := ""
 	if !ok {
 		if r.State == state.FinishNeedsAttention {
 			next = "acd doctor"
+		} else if r.ReasonCode == "provider_context_required" {
+			next = `acd finish "what changed and why"`
+		} else if r.ReasonCode == "provider_diffs_required" {
+			next = "Approve code sharing with acd config, then start a new acd finish"
 		} else {
 			next = "acd finish --retry " + r.ID
 		}
-		if r.DryRun && r.State != state.FinishNeedsAttention {
+		if r.DryRun && r.State != state.FinishNeedsAttention && r.ReasonCode != "provider_diffs_required" {
 			next += " --dry-run"
 		}
 	}
@@ -183,7 +206,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 		var failure *productError
 		if !ok {
-			failure = &productError{Code: failureCode, Message: r.Reason, Retryable: r.State == state.FinishFailed || detached}
+			failure = &productError{Code: failureCode, Message: r.Reason, Retryable: retryable}
 			if detached {
 				failure.Message = "Work is saved; reconnect to inspect this request"
 			}
@@ -206,8 +229,14 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			fmt.Fprintln(out, "No changes to commit.")
 		case r.DryRun:
 			fmt.Fprintln(out, "Finish preview\nNo commits were added to your branch.")
+			if plan.Disclosure.MetadataIncluded && len(plan.Disclosure.TextChangeIDs) == 0 {
+				fmt.Fprintln(out, "Plan based on supplied context and file metadata; code diffs were not shared.")
+			}
 			for _, step := range plan.Steps {
 				fmt.Fprintf(out, "%s\n  %s\n", consoleProse(step.Message), finishCheckLabel(step.Check))
+				if step.Boundary != "" {
+					fmt.Fprintf(out, "  Boundary: %s\n", consoleProse(step.Boundary))
+				}
 			}
 			fmt.Fprintln(out, "Optional: Run `acd finish` when the current work is ready.")
 		default:
@@ -220,12 +249,26 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			}
 		}
 		if !r.DryRun {
+			shown := make(map[string]bool)
 			for _, check := range result.Verification {
-				fmt.Fprintln(out, finishCheckLabel(check))
+				label := finishCheckLabel(check)
+				if !shown[label] {
+					fmt.Fprintln(out, label)
+					shown[label] = true
+				}
 			}
 		}
 		if countErr == nil && count > 0 {
-			fmt.Fprintf(out, "Current working copy: %d changed items outside Git commits.\n", count)
+			fmt.Fprintf(out, "Uncommitted files remaining: %d.\n", count)
+			if saved.Published {
+				if result.SnapshotSavedAt != "" {
+					fmt.Fprintf(out, "This finish used the snapshot saved at %s.\n", result.SnapshotSavedAt)
+				}
+				fmt.Fprintln(out, "Later edits and excluded files stay in your working copy.")
+				fmt.Fprintln(out, "Inspect them with `git status --short`. Run `acd finish` when the remaining work is ready.")
+			}
+		} else if countErr == nil && saved.Published {
+			fmt.Fprintln(out, "Working copy: clean.")
 		}
 		if next != "" {
 			label := "Optional"
@@ -233,13 +276,13 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 				label = "Action required"
 			}
 			fmt.Fprintf(out, "\n%s: %s\n", label, next)
-			if detached || r.State == state.FinishFailed {
+			if strings.Contains(next, "--retry") {
 				fmt.Fprintln(out, "Retry reconnects to this request or restarts it after failure, using the same saved changes.")
 			}
 		}
 	}
 	if !ok {
-		return &CommandError{Code: failureCode, Message: "Finish requires attention. Next: " + next, Exit: exit, Retryable: detached || r.State == state.FinishFailed, rendered: true}
+		return &CommandError{Code: failureCode, Message: "Finish requires attention. Next: " + next, Exit: exit, Retryable: retryable, rendered: true}
 	}
 	return nil
 }
@@ -264,7 +307,7 @@ func finishExit(r state.FinishRequest, waitCode string) (int, string) {
 	if r.State == state.FinishNeedsAttention {
 		return ExitActionRequired, "finish_needs_attention"
 	}
-	if r.ReasonCode == "provider_input_too_large" {
+	if r.ReasonCode == "provider_input_too_large" || r.ReasonCode == "provider_context_required" || r.ReasonCode == "provider_diffs_required" {
 		return ExitActionRequired, r.ReasonCode
 	}
 	return ExitActionRequired, "finish_failed"

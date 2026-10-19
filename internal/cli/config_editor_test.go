@@ -221,6 +221,7 @@ func TestFinishRemovalConfigEditorCredentialSaveDoesNotProbe(t *testing.T) {
 	editorSeed(t, e, func(doc *config.Document) {
 		doc.Settings.Global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
 		doc.Settings.Global[config.FieldProvider] = json.RawMessage(`"openai-compat"`)
+		doc.Settings.Global[config.FieldDiffEgress] = json.RawMessage(`true`)
 	})
 	if err := credentials.NewStore(e.roots).Set("old-test-key"); err != nil {
 		t.Fatal(err)

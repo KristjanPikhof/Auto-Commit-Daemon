@@ -64,11 +64,9 @@ func ProbeProvider(ctx context.Context, provider FinishTransport, timeout time.D
 		}},
 	}
 	options := FinishOptions{Style: string(normalizeCommitFormat(string(format))), Purpose: "Confirm provider connection"}
-	request, _, err := prepareFinishRequest(evidence, options)
-	var body []byte
-	if err == nil {
-		body, err = provider.EncodeFinishRequest(request)
-	}
+	// The fixed connection probe has no repository content or planning consent.
+	request := FinishPlanRequest{Style: options.Style, Purpose: options.Purpose, Changes: evidence.Changes}
+	body, err := provider.EncodeFinishRequest(request)
 	if err == nil {
 		err = ctx.Err()
 		if err == nil {

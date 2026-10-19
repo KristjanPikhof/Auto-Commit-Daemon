@@ -36,6 +36,7 @@ change values, then Save changes to review and apply them.
 
 Only edited fields are saved. Repository fields can return to inherited
 values. API keys are masked and saved in the protected credential store.
+Choosing Intent includes its required code sharing in the approval review.
 Global changes apply to repositories that inherit them. Stopped repositories
 remain stopped. Restart-required fields are identified.
 
@@ -243,12 +244,22 @@ func (e *configEditor) Review(ctx context.Context, draft settingsui.EditorDraft)
 }
 
 func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft) (editorPlan, error) {
+	draft.Changes = cloneEditorChanges(draft.Changes)
 	projection, err := e.project(draft.Scope, draft.Changes)
 	if err != nil {
 		return editorPlan{}, err
 	}
 	if projection.document.Generation != draft.Generation {
 		return editorPlan{}, errors.New("settings changed while this editor was open; reopen it to review the latest values")
+	}
+	if _, edited := draft.Changes[config.FieldDiffEgress]; !edited &&
+		projection.values[config.FieldCommitStrategy] == "intent" && projection.values[config.FieldDiffEgress] != "true" {
+		sharing := "true"
+		draft.Changes[config.FieldDiffEgress] = &sharing
+		projection, err = e.projectDocument(projection.document, draft.Scope, draft.Changes)
+		if err != nil {
+			return editorPlan{}, err
+		}
 	}
 	if draft.Credential != "" {
 		if value, _ := e.lookup(ai.EnvAPIKey); strings.TrimSpace(value) != "" {
@@ -273,7 +284,6 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 	if err != nil {
 		return editorPlan{}, err
 	}
-	draft.Changes = cloneEditorChanges(draft.Changes)
 	plan := editorPlan{draft: draft, values: projection.values, validation: validation}
 	var review strings.Builder
 	scope := "Global defaults"
@@ -342,7 +352,7 @@ func writeEditorPermissions(out io.Writer, validation settings.Validation) {
 		case ai.ConfirmationInsecureEndpointCredentials:
 			fmt.Fprintln(out, "Permission: use an unencrypted HTTP connection")
 		case ai.ConfirmationDiffEgress:
-			fmt.Fprintln(out, "Allow sending filtered repository changes to this AI service")
+			fmt.Fprintln(out, "Allow sending redacted code diffs to this AI service (required for Intent)")
 		case ai.ConfirmationSubprocessExecution:
 			fmt.Fprintln(out, "Allow running this local AI program: "+strconv.Quote(validation.ProviderConfig.Mode))
 		case ai.ConfirmationVerificationCommand:

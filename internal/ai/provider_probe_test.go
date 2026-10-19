@@ -53,7 +53,7 @@ func (p *probeCaptureProvider) ExchangeFinish(ctx context.Context, body []byte) 
 	if p.request.Style == "conventional" {
 		message = "chore: confirm provider connection"
 	}
-	return json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Confirm provider connection", Message: message, ChangeIDs: []string{"probe"}}}})
+	return json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Confirm provider connection", Message: message + "\n\n- Confirm planning works with synthetic input.", ChangeIDs: []string{"probe"}}}})
 }
 
 func TestFinishRemovalProviderProbeBothStylesAndNoCorrection(t *testing.T) {
@@ -188,7 +188,7 @@ func TestFinishRemovalProviderProbeConfigClosesOwnedSubprocess(t *testing.T) {
 	script := filepath.Join(dir, "acd-provider-probe")
 	contents := "#!/bin/sh\n" +
 		"IFS= read -r request || exit 1\n" +
-		"printf '%s\\n' '{\"version\":1,\"finish_plan\":{\"goals\":[{\"purpose\":\"Confirm provider connection\",\"message\":\"Confirm provider connection\",\"change_ids\":[\"probe\"]}]}}'\n" +
+		"printf '%s\\n' '{\"version\":1,\"finish_plan\":{\"goals\":[{\"purpose\":\"Confirm provider connection\",\"message\":\"Confirm provider connection\\n\\n- Confirm planning works with synthetic input.\",\"change_ids\":[\"probe\"]}]}}'\n" +
 		"IFS= read -r ignored || printf closed > '" + marker + "'\n"
 	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)

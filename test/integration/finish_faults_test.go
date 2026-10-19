@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -69,7 +70,10 @@ func writeFinishChatResponse(t *testing.T, w http.ResponseWriter, r finishChatRe
 	if r.Plan.Style == "conventional" && r.Plan.Message == "" {
 		message = "chore: " + message
 	}
-	arguments, err := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: r.Plan.Purpose, Message: message, ChangeIDs: ids}}})
+	if r.Plan.Message == "" {
+		message += "\n\n- Keep the completed request separate from later edits."
+	}
+	arguments, err := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: r.Plan.Purpose, Boundary: "Keep the supplied complete request together", Message: message, ChangeIDs: ids}}})
 	if err != nil {
 		t.Error(err)
 		return
@@ -96,11 +100,11 @@ func finishIntentFixtureWithSettings(t *testing.T, handler http.HandlerFunc, tim
 	server, trust := newOpenAITestServer(t, handler)
 	t.Cleanup(server.Close)
 	f := newFinishFixture(t, "ACD_AI_API_KEY=fixture-key")
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldBaseURL: server.URL, config.FieldCAFile: strings.TrimPrefix(trust, "ACD_AI_CA_FILE="), config.FieldModel: "finish-fixture", config.FieldTimeout: timeout}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldBaseURL: server.URL, config.FieldCAFile: strings.TrimPrefix(trust, "ACD_AI_CA_FILE="), config.FieldModel: "finish-fixture", config.FieldTimeout: timeout}
 	for key, value := range extra {
 		draft[key] = value
 	}
-	f.Apply(t, t.Context(), draft, append(confirmed, ai.ConfirmationEndpointCredentials)...)
+	f.Apply(t, t.Context(), draft, append(confirmed, ai.ConfirmationEndpointCredentials, ai.ConfirmationDiffEgress)...)
 	return f
 }
 
@@ -279,7 +283,7 @@ func TestFinishFaultProviderFailureRetryKeepsFrozenTarget(t *testing.T) {
 			finishAssertSavedViews(t, f, 2)
 			succeeds.Store(true)
 			retry := finishRunJSON(t, f, "finish", "--retry", failed.Data.ID)
-			if !retry.OK || !retry.Data.Published || retry.Data.Attempt != 2 || retry.Data.Target != failed.Data.Target || calls.Load() != wantCalls+1 {
+			if !retry.OK || !retry.Data.Published || retry.Data.Attempt != 2 || !reflect.DeepEqual(retry.Data.Target, failed.Data.Target) || calls.Load() != wantCalls+1 {
 				t.Fatalf("frozen retry %+v calls=%d", retry, calls.Load())
 			}
 			if got := runGitOK(t, f.Repo, "show", "HEAD:goal.txt"); got != "selected\n" {
@@ -393,7 +397,7 @@ func TestFinishFaultSubprocessFailureDoesNotFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := newFinishFixture(t, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	f.Apply(t, t.Context(), map[string]string{config.FieldCommitStrategy: "intent", config.FieldProvider: "subprocess:fail", config.FieldTimeout: "2s"}, ai.ConfirmationSubprocessExecution)
+	f.Apply(t, t.Context(), map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "subprocess:fail", config.FieldTimeout: "2s"}, ai.ConfirmationSubprocessExecution, ai.ConfirmationDiffEgress)
 	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "protected\n")
 	failed := finishRunJSON(t, f, "finish", "Complete protected goal", "--message", "Complete protected goal")
 	raw, err := os.ReadFile(spawns)
@@ -410,15 +414,35 @@ func TestFinishFaultLargeAssetsStayProtectedDuringProviderOutage(t *testing.T) {
 	f := finishIntentFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		request := decodeFinishChatRequest(t, r)
 		calls.Add(1)
-		if request.Plan.DiffIncluded || len(request.Plan.Diffs) != 0 {
-			t.Error("binary contents reached provider")
+		paths := make(map[string]string)
+		for _, change := range request.Plan.Changes {
+			paths[change.ID] = change.Path
+		}
+		binaries, texts := 0, 0
+		for _, diff := range request.Plan.Diffs {
+			if strings.HasPrefix(paths[diff.ChangeID], "assets/") {
+				binaries++
+				if !diff.Binary || diff.Text != "" {
+					t.Error("binary contents reached provider")
+				}
+			} else {
+				texts++
+				if diff.Binary || diff.Text == "" {
+					t.Error("approved code evidence did not reach provider")
+				}
+			}
+		}
+		if !request.Plan.DiffIncluded || binaries != 4 || texts != 4 {
+			t.Errorf("incomplete mixed evidence: shared=%t binaries=%d texts=%d", request.Plan.DiffIncluded, binaries, texts)
 		}
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 	}, "10s")
 	names := []string{"eng_autocomplete.bin", "est_autocomplete.bin", "rus_autocomplete.bin", "spa_autocomplete.bin"}
 	sizes := []int{14832809, 21685601, 18343302, 15617454}
 	for i, name := range names {
-		writeFile(t, filepath.Join(f.Repo, "assets", name), string(bytes.Repeat([]byte{byte(i)}, sizes[i])))
+		body := bytes.Repeat([]byte{byte(i + 1)}, sizes[i])
+		body[0] = 0 // Git detects binary content from a NUL, not the .bin suffix.
+		writeFile(t, filepath.Join(f.Repo, "assets", name), string(body))
 	}
 	writeFile(t, filepath.Join(f.Repo, "autocomplete.go"), "package autocomplete\n")
 	writeFile(t, filepath.Join(f.Repo, "autocomplete_test.go"), "package autocomplete\n")
@@ -471,7 +495,7 @@ func TestFinishFaultRunningRequestRestartRequiresFrozenRetry(t *testing.T) {
 	oldPID := readDaemonStatePID(f.Repo)
 	f.Restart(t, t.Context())
 	interrupted := finishWaitRequest(t, f, request.ID)
-	if interrupted.State != state.FinishFailed || interrupted.Target != request.Target || interrupted.Attempt != 1 {
+	if interrupted.State != state.FinishFailed || !reflect.DeepEqual(interrupted.Target, request.Target) || interrupted.Attempt != 1 {
 		t.Fatalf("restart changed request: %+v", interrupted)
 	}
 	if readDaemonStatePID(f.Repo) == oldPID || calls.Load() != 1 || strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")) != f.BaseHead {
@@ -483,7 +507,7 @@ func TestFinishFaultRunningRequestRestartRequiresFrozenRetry(t *testing.T) {
 	finishAssertSavedViews(t, f, 2)
 	retryAllowed.Store(true)
 	retried := finishRunJSON(t, f, "finish", "--retry", request.ID)
-	if !retried.OK || retried.Data.ID != request.ID || retried.Data.Attempt != 2 || retried.Data.Target != request.Target || calls.Load() != 2 {
+	if !retried.OK || retried.Data.ID != request.ID || retried.Data.Attempt != 2 || !reflect.DeepEqual(retried.Data.Target, request.Target) || calls.Load() != 2 {
 		t.Fatalf("explicit frozen retry: %+v calls=%d", retried, calls.Load())
 	}
 	if runGitOK(t, f.Repo, "show", "HEAD:goal.txt") != "frozen before restart\n" {

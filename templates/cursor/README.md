@@ -38,8 +38,11 @@ authorize committing:
 acd finish --repo /path/to/worktree 'Complete the settings update'
 ~~~
 
-Use a brief technical purpose. Keep prompt transcripts, secrets, and customer
-data out of it. Hooks do not send or store prompt text.
+Describe the problem, approach, and constraints in the purpose so Intent can
+explain decisions and choose useful steps within the task. Use `--message` only
+for an intentional single batch; it disables splitting. Review the actual commit
+boundaries and reasons before handoff. Keep prompt transcripts, secrets, and
+customer data out of the context. Hooks do not send or store prompt text.
 
 Local mode creates one complete batch without AI and is the default. Intent
 uses the approved provider to group completed goals. Either mode supports

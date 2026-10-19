@@ -32,6 +32,9 @@ const (
 // OpenAI-compat HTTP provider when ACD_AI_TIMEOUT is unset or invalid.
 const DefaultProviderTimeout = 5 * time.Minute
 
+// ErrIntentDiffsRequired keeps AI planning from substituting metadata for code.
+var ErrIntentDiffsRequired = errors.New("Intent requires redacted code diffs; enable ai.diff_egress and approve sharing in acd config, or choose Local mode")
+
 // CommitStrategy selects how an explicit finish plans its commits.
 type CommitStrategy string
 
@@ -177,6 +180,9 @@ func ValidateProviderConfig(cfg ProviderConfig) (ProviderValidation, error) {
 	}
 	if cfg.CommitStrategy == CommitStrategyIntent && mode == "deterministic" {
 		return ProviderValidation{}, errors.New("ai: Intent requires an AI provider; choose local mode or configure an approved OpenAI-compatible or subprocess provider")
+	}
+	if cfg.CommitStrategy == CommitStrategyIntent && !cfg.DiffEgress {
+		return ProviderValidation{}, ErrIntentDiffsRequired
 	}
 	validation := ProviderValidation{}
 	switch {

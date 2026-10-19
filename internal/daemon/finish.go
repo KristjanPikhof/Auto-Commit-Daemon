@@ -301,6 +301,12 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 		repoID = checkpoint.WorktreeID(wt.CommonDir)
 	}
 	frozen := state.FinishTarget{Version: state.FinishVersion, RepositoryID: repoID, WorktreeID: worktreeID, BranchRef: branch, ExpectedHead: head, CheckpointID: cp.ID, CheckpointTree: cp.TreeOID, TargetTree: tree, IndexDigest: index, IncludeStaged: options.IncludeStaged, Mode: cfg.Mode, Style: cfg.Style, ConfigDigest: digest, Purpose: options.Purpose, Message: options.Message}
+	if cfg.Mode == "intent" && options.Message == "" && !options.IncludeStaged && !maps.Equal(base, target) {
+		frozen.Checkpoints, err = w.freezeFinishCheckpoints(ctx, wt, cp, frozen, id, base, target)
+		if err != nil {
+			return active, false, err
+		}
+	}
 	if tree != cp.TreeOID {
 		commit, err := git.CommitTreeDurable(ctx, wt.Root, tree, "acd finish target "+id, checkpoint.IdentityName, checkpoint.IdentityEmail)
 		if err != nil {
@@ -392,12 +398,12 @@ func (w *FinishWorker) protect(ctx context.Context, wt git.Worktree, cfg FinishW
 	return cp, nil
 }
 
-func readFinishTree(ctx context.Context, repo, tree string) (finish.Tree, error) {
+func readFinishTree(ctx context.Context, repo, tree string, paths ...string) (finish.Tree, error) {
 	result := finish.Tree{}
 	if tree == "" {
 		return result, nil
 	}
-	entries, err := git.LsTree(ctx, repo, tree, true)
+	entries, err := git.LsTree(ctx, repo, tree, true, paths...)
 	if err != nil {
 		return nil, err
 	}
@@ -568,6 +574,15 @@ func (w *FinishWorker) evidence(ctx context.Context, wt git.Worktree, target sta
 	}
 	if err := finishRenameGroups(ctx, wt.Root, baseTree, target.TargetTree, evidence.Changes); err != nil {
 		return evidence, "", err
+	}
+	if len(target.Checkpoints) > 0 {
+		evidence.Changes, err = finishCheckpointChanges(ctx, wt.Root, baseTree, target, evidence)
+		if err != nil {
+			return evidence, "", err
+		}
+		if err := finishRenameGroups(ctx, wt.Root, baseTree, target.TargetTree, evidence.Changes); err != nil {
+			return evidence, "", err
+		}
 	}
 	return evidence, baseTree, finish.ValidateEvidence(evidence)
 }
@@ -784,7 +799,7 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	if err != nil {
 		return finish.Plan{}, ai.FinishDisclosure{}, err
 	}
-	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, BeforeCall: func(callCtx context.Context) error {
+	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, BeforeCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}})
@@ -893,7 +908,11 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 			}
 		}
 		if !diff.Binary {
-			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, ai.FinishDiffByteCap+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", base, target, "--", ":(literal)"+change.Path)
+			diffBase, diffTarget := base, target
+			if change.BeforeTree != "" && change.AfterTree != "" {
+				diffBase, diffTarget = change.BeforeTree, change.AfterTree
+			}
+			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, ai.FinishDiffByteCap+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", diffBase, diffTarget, "--", ":(literal)"+change.Path)
 			if errors.Is(err, git.ErrStdoutOverflow) || len(out) > ai.FinishDiffByteCap {
 				return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diff is at least %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", len(out), ai.FinishDiffByteCap)}
 			}

@@ -157,7 +157,7 @@ func validateHistoryMessages(raw []byte, evidence finish.Evidence, commits []His
 		}
 		quality := goal
 		quality.ChangeIDs = commits[index].ChangeIDs
-		if err := validateFinishGoalQuality(quality, evidence, options); err != nil {
+		if err := validateFinishGoalQuality(quality, evidence); err != nil {
 			return nil, err
 		}
 	}
@@ -167,5 +167,5 @@ func validateHistoryMessages(raw []byte, evidence finish.Evidence, commits []His
 // ValidateHistoryGoalQuality rechecks saved Intent messages against their
 // recorded membership without opening a provider or exposing any source text.
 func ValidateHistoryGoalQuality(goal finish.Goal, evidence finish.Evidence) error {
-	return validateFinishGoalQuality(goal, evidence, FinishOptions{})
+	return validateFinishGoalQuality(goal, evidence)
 }

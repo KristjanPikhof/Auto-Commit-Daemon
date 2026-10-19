@@ -47,7 +47,12 @@ func TestFinishWorkflowHistorySavedPlanPreservesMembershipAndAuthors(t *testing.
 				index := runGitOK(t, f.Repo, "ls-files", "--stage")
 				var goals []finish.Goal
 				for position, oid := range originals {
-					message := []string{"Preserve stored settings", "Record another setting", "Restore the recorded setting", "Preserve recorded empty history"}[position]
+					message := []string{
+						"Preserve stored settings\n\n- Retain the recorded value when reviewing stored settings.",
+						"Record another setting\n\n- Preserve the intermediate value as its own authored decision.",
+						"Restore the recorded setting\n\n- Restore the prior value without removing the authored transition.",
+						"Preserve recorded empty history\n\n- Retain the authored checkpoint even though its tree is unchanged.",
+					}[position]
 					if style == finish.StyleConventional {
 						message = "chore: " + message
 					}
@@ -136,7 +141,7 @@ func TestFinishWorkflowHistoryPurposefulGoalsAndStaleRefusal(t *testing.T) {
 		runGitOK(t, f.Repo, "commit", "-qm", "Record protection changes")
 	}
 	f.Barrier(t, ctx)
-	response := `{"version":1,"finish_plan":{"goals":[{"purpose":"Require retained protection","message":"Require retained protection\n\n- Keep protection behavior and its direct test together","change_ids":["1","2"]}]}}`
+	response := `{"version":1,"finish_plan":{"goals":[{"purpose":"Require retained protection","boundary":"Protection behavior and its direct regression complete one change","message":"Require retained protection\n\n- Keep protection behavior and its direct test together","change_ids":["1","2"]}]}}`
 	if err := os.WriteFile(filepath.Join(pluginDir, "acd-provider-purpose"), []byte("#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' '"+response+"'; done\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -94,11 +94,9 @@ func TestSetupDryRunIntentIncludesExactTransportConsents(t *testing.T) {
 	want := map[ai.ConfirmationRequirement]bool{
 		ai.ConfirmationEndpointCredentials:         true,
 		ai.ConfirmationInsecureEndpointCredentials: true,
+		ai.ConfirmationDiffEgress:                  true,
 	}
 	for _, confirmation := range state.Configuration.Confirmations {
-		if confirmation == ai.ConfirmationDiffEgress {
-			t.Fatal("fresh setup authorized default diff transmission")
-		}
 		delete(want, confirmation)
 	}
 	if len(want) != 0 {
@@ -107,8 +105,8 @@ func TestSetupDryRunIntentIncludesExactTransportConsents(t *testing.T) {
 	if state.Configuration.Values[config.FieldCommitFormat] != "conventional" {
 		t.Fatalf("commit format = %q", state.Configuration.Values[config.FieldCommitFormat])
 	}
-	if state.Configuration.Values[config.FieldDiffEgress] != "false" {
-		t.Fatal("fresh setup enabled diff egress")
+	if state.Configuration.Values[config.FieldDiffEgress] != "true" {
+		t.Fatal("Intent setup omitted required code sharing from its review")
 	}
 }
 
@@ -263,5 +261,23 @@ func TestSetupExistingInstallRejectsFirstSetupOptions(t *testing.T) {
 	}
 	if after, err := fileSHA256(roots.ConfigPath()); err != nil || after != before {
 		t.Fatalf("setup preview changed existing preferences: %v", err)
+	}
+}
+
+func TestSetupIntentRequiresExplicitCodeSharingApproval(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "setup-test-key")
+	cmd := newSetupCommand(false)
+	if err := cmd.Flags().Set("expect-plan", "reviewed-plan"); err != nil {
+		t.Fatal(err)
+	}
+	roots := paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}
+	opts := setupOnboardingOptions{Strategy: "intent"}
+	if _, err := prepareSetupOnboarding(cmd, roots, opts, false, true); err == nil || !strings.Contains(err.Error(), "--confirm-diff-egress") {
+		t.Fatalf("noninteractive Intent setup skipped sharing approval: %v", err)
+	}
+	opts.ConfirmDiffEgress = true
+	state, err := prepareSetupOnboarding(cmd, roots, opts, false, true)
+	if err != nil || state.Configuration.Values[config.FieldDiffEgress] != "true" {
+		t.Fatalf("approved Intent setup lost code sharing: %+v %v", state, err)
 	}
 }

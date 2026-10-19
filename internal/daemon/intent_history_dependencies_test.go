@@ -20,7 +20,7 @@ func TestFinishHistoryRewriteCorrectsCrossAuthorGoalBeforeSaving(t *testing.T) {
 	finishWorkerGit(t, f.dir, "config", "user.email", "other@example.com")
 	second := mustCommitPath(t, f.dir, "policy.go", "package policy\nfunc Window()int{return 64}\nfunc Retry()int{return 300}\n", "Schedule provider outage retries")
 	transport := &finishTestTransport{exchange: func(_ context.Context, r ai.FinishPlanRequest) ([]byte, error) {
-		goals := []finish.Goal{{Purpose: "Bound capture planning windows", Boundary: "Keep window limits independently reviewable", Message: "Bound capture planning windows", ChangeIDs: []string{r.Changes[0].ID}}, {Purpose: "Schedule provider outage retries", Boundary: "Keep retry policy independently reviewable", Message: "Schedule provider outage retries", ChangeIDs: []string{r.Changes[1].ID}}}
+		goals := []finish.Goal{{Purpose: "Bound capture planning windows", Boundary: "Keep window limits independently reviewable", Message: "Bound capture planning windows\n\n- Keep planning work within a fixed window.", ChangeIDs: []string{r.Changes[0].ID}}, {Purpose: "Schedule provider outage retries", Boundary: "Keep retry policy independently reviewable", Message: "Schedule provider outage retries\n\n- Bound retries while the provider is unavailable.", ChangeIDs: []string{r.Changes[1].ID}}}
 		if r.Changes[0].Author == r.Changes[1].Author {
 			t.Fatal("author boundary missing")
 		}
@@ -33,7 +33,7 @@ func TestFinishHistoryRewriteCorrectsCrossAuthorGoalBeforeSaving(t *testing.T) {
 		raw, _ := json.Marshal(map[string]any{"goals": goals})
 		return raw, nil
 	}}
-	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{first, second}, nil, transport, FinishHistoryOptions{Mode: "intent", Style: "imperative", Deadline: time.Now().Add(time.Minute)})
+	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{first, second}, nil, transport, FinishHistoryOptions{Mode: "intent", DiffEgress: true, Style: "imperative", Deadline: time.Now().Add(time.Minute)})
 	if err != nil || transport.calls.Load() != 2 || len(plan.Goals) != 2 {
 		t.Fatalf("correction %+v %v", plan, err)
 	}
@@ -47,10 +47,10 @@ func TestFinishHistoryRewriteSavedPrerequisitesPreserveSuccessiveGoalTrees(t *te
 	first := mustCommitPath(t, f.dir, "policy.go", "package policy\nfunc Window()int{return 64}\n", "Bound capture planning windows")
 	second := mustCommitPath(t, f.dir, "policy.go", "package policy\nfunc Window()int{return 64}\nfunc Retry()int{return 300}\n", "Schedule provider outage retries")
 	transport := &finishTestTransport{exchange: func(_ context.Context, r ai.FinishPlanRequest) ([]byte, error) {
-		raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Bound capture planning windows", Boundary: "Keep window limits independently reviewable", Message: "Bound capture planning windows", ChangeIDs: []string{r.Changes[0].ID}}, {Purpose: "Schedule provider outage retries", Boundary: "Add retry policy after its prerequisite", Message: "Schedule provider outage retries", ChangeIDs: []string{r.Changes[1].ID}}}})
+		raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Bound capture planning windows", Boundary: "Keep window limits independently reviewable", Message: "Bound capture planning windows\n\n- Keep planning work within a fixed window.", ChangeIDs: []string{r.Changes[0].ID}}, {Purpose: "Schedule provider outage retries", Boundary: "Add retry policy after its prerequisite", Message: "Schedule provider outage retries\n\n- Bound retries while the provider is unavailable.", ChangeIDs: []string{r.Changes[1].ID}}}})
 		return raw, nil
 	}}
-	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{first, second}, nil, transport, FinishHistoryOptions{Mode: "intent", Style: "imperative", Deadline: time.Now().Add(time.Minute), VerificationConfigDigest: w.Config.ConfigDigest})
+	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{first, second}, nil, transport, FinishHistoryOptions{Mode: "intent", DiffEgress: true, Style: "imperative", Deadline: time.Now().Add(time.Minute), VerificationConfigDigest: w.Config.ConfigDigest})
 	if err != nil {
 		t.Fatal(err)
 	}

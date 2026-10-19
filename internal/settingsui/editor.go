@@ -132,6 +132,10 @@ func RunEditor(ctx context.Context, backend EditorBackend, opts EditorOptions) e
 				return editorExitError(err)
 			}
 			draft.Changes["commit.strategy"] = &mode
+			if mode == "intent" {
+				sharing := "true"
+				draft.Changes["ai.diff_egress"] = &sharing
+			}
 			message = "Finish mode changed. Choose Save changes when ready."
 		case "advanced":
 			advanced = !advanced

@@ -105,6 +105,13 @@ acd finish --include-staged
 acd finish --retry REQUEST_ID
 ~~~
 
+For Intent, give context about what changed and why so ACD can explain useful
+steps within the task. Generated messages include a short reason or concrete
+impact. Intent requires approved redacted code diffs; binary-only changes also
+need completion context or an exact message.
+`--message` deliberately creates one batch and disables automatic splitting.
+See the [Intent flow](docs/intent-commit-flow.md) for recorded versions and previews.
+
 Finish freezes a fresh complete checkpoint, the attached branch and HEAD, and
 its options. It builds and checks the whole commit chain privately before one
 branch update. Later edits keep entering checkpoints for the next finish. The
@@ -168,8 +175,10 @@ results reused, and checks that were not configured. Structural checks alone do
 not mean project tests passed.
 
 Git-ignored and sensitive paths stay outside protection. Excluded tracked entries
-and submodule entries remain in the finish base tree. Diff egress is off by
-default and needs explicit approval. Local sends nothing to a provider. Status,
+and submodule entries remain in the finish base tree. Intent setup includes
+redacted code sharing in its approval review. Existing installations keep their
+privacy settings and must approve sharing before using Intent. Local sends
+nothing to a provider. Status,
 list, doctor, and diagnose read state without provider construction or migration.
 See [providers and privacy](docs/ai-providers.md).
 

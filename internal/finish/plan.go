@@ -23,6 +23,9 @@ type Change struct {
 	DependsOn   []string `json:"depends_on,omitempty"`
 	AtomicGroup string   `json:"atomic_group,omitempty"`
 	Provenance  string   `json:"provenance,omitempty"`
+	// Local snapshot witnesses for exact per-version diffs, never sent to AI.
+	BeforeTree string `json:"-"`
+	AfterTree  string `json:"-"`
 }
 
 // Evidence is supplied by the caller from immutable snapshots or history.

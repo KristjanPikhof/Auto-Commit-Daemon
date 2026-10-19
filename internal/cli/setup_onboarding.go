@@ -78,6 +78,7 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 		}
 	}
 	values[config.FieldCommitStrategy], values[config.FieldCommitFormat], values[config.FieldProvider] = strategy, format, provider
+	values[config.FieldDiffEgress] = fmt.Sprint(strategy == "intent")
 	values[config.FieldModel] = fallbackConfigureValue(strings.TrimSpace(opts.Model), config.DefaultOpenAIModel)
 	values[config.FieldBaseURL] = fallbackConfigureValue(strings.TrimSpace(opts.BaseURL), ai.DefaultOpenAIBaseURL)
 	values[config.FieldCAFile] = strings.TrimSpace(opts.CAFile)
@@ -150,8 +151,8 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 		selection.Credential = ""
 		credential = ""
 		credentialSource = credentials.SourceNone
-		values[config.FieldDiffEgress] = "false"
 	}
+	values[config.FieldDiffEgress] = fmt.Sprint(selection.Strategy == "intent")
 	selection.DiffContextApproved = values[config.FieldDiffEgress] == "true"
 	confirmations := selectionConfirmations(selection)
 	if nonInteractive && !dryRun {

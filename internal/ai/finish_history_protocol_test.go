@@ -19,8 +19,8 @@ func TestHistoryMessagesRejectsInvalidSubprocessVersion(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			evidence := finishTestEvidence()
-			commits := []HistoryMessageCommit{{ID: "original", Author: "author-a", TreeOID: strings.Repeat("a", 40), OriginalMessage: "Preserve authored settings", ChangeIDs: []string{evidence.Changes[0].ID}}}
-			goals := finishTestOutput(finish.Goal{Purpose: "Preserve authored settings", Boundary: "Keep the original authored scope", Message: "Preserve authored settings", ChangeIDs: []string{"original"}})
+			commits := []HistoryMessageCommit{{ID: "original", Author: "author-a", TreeOID: strings.Repeat("a", 40), OriginalMessage: "Preserve authored settings\n\n- Keep authored values ahead of defaults.", ChangeIDs: []string{evidence.Changes[0].ID}}}
+			goals := finishTestOutput(finish.Goal{Purpose: "Preserve authored settings", Boundary: "Keep the original authored scope", Message: "Preserve authored settings\n\n- Keep authored values ahead of defaults.", ChangeIDs: []string{"original"}})
 			response := fmt.Sprintf(`{"version":2,"finish_plan":%s}`, goals)
 			script := "while IFS= read -r line; do\n printf '%s\\n' '" + response + "'\n done\n"
 			if corrected {
@@ -30,7 +30,7 @@ func TestHistoryMessagesRejectsInvalidSubprocessVersion(t *testing.T) {
 			bin := writePluginScript(t, t.TempDir(), "history-version", script)
 			provider := NewSubprocessProvider("history-version", SubprocessOptions{LookPath: fixedLookPath("acd-provider-history-version", bin), Stderr: io.Discard, Timeout: 10 * time.Second})
 			t.Cleanup(func() { _ = provider.Close() })
-			_, result, err := PlanHistoryMessages(t.Context(), provider, evidence, commits, finishTestOptions())
+			_, result, err := PlanHistoryMessages(t.Context(), provider, evidence, commits, finishTestOptions(evidence))
 			if result.Calls != 2 {
 				t.Fatalf("invalid protocol version bypassed correction: calls=%d error=%v", result.Calls, err)
 			}

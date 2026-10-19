@@ -18,6 +18,19 @@
 
 ### Changed
 
+- Require approved redacted code diffs for all Intent planning, including
+  previews, exact messages, and history message rewrites. Intent setup includes
+  sharing in its approval review. Existing privacy settings survive upgrade;
+  disabled sharing needs approval before a new Intent request. Local stays
+  offline, and binary-only finish still needs context or an exact message.
+- Plan useful Intent steps within a feature and include a grounded reason or
+  practical impact in generated messages. Help explains that `--message`
+  disables splitting; previews show proposed boundaries.
+- Freeze current checkpoint versions for safe same-file Intent steps. Preserve
+  selected versions through retention and retry without absorbing later saves;
+  order the commits by their dependencies and each commit's versions by recorded
+  order. Keep exact-message and staged-selection requests on final-only evidence.
+
 - Allow repeated setup in repositories created with the finish workflow while
   background checkpoints continue.
 - Restore compact repository rows in `acd list`. The default prints one
@@ -46,6 +59,17 @@
   commits, recovery preservation, active requests, and required user action.
 
 ### Fixed
+
+- Explain remaining uncommitted files after finish, show the saved snapshot's
+  time, and print repeated project-check results once. Read only relevant paths
+  from retained checkpoint versions during Intent preparation.
+- Read long process command lines completely during ownership checks and
+  diagnostics, so unrelated processes cannot prevent safe recovery.
+- Treat deadline-cancelled Git reads in `acd list` as incomplete checks. Keep
+  those rows visible with unknown coverage and counts instead of false
+  repository failures and doctor instructions.
+- Include required code-sharing approval when saving an existing Intent
+  configuration, so users can review and approve it without reselecting Intent.
 
 - Keep old failed finish requests out of current status and retry suggestions
   when current work is already committed. Retain request details in verbose

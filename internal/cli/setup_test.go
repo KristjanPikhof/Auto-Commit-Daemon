@@ -91,7 +91,7 @@ func TestFinishIntegrationHintsEmbeddedGuidance(t *testing.T) {
 			if !strings.Contains(readme, "../agent-guidance.md") || !strings.Contains(readme, "AGENTS.md") {
 				t.Fatal("integration does not recommend the shared agent instructions")
 			}
-			for _, required := range []string{"acd finish --repo /path/to/worktree", "authorize committing", "Local", "Intent", "Fix setup retries", "fix: handle setup retries", "retry finish automatically", "prompt text"} {
+			for _, required := range []string{"acd finish --repo /path/to/worktree", "authorize committing", "Local", "Intent", "Fix setup retries", "fix: handle setup retries", "retry finish automatically", "prompt text", "problem, approach, and constraints", "--message", "disables splitting", "actual commit"} {
 				if !strings.Contains(readme, required) {
 					t.Errorf("missing task completion guidance %q", required)
 				}
@@ -126,7 +126,7 @@ func TestSetupAgentGuidanceRecommendation(t *testing.T) {
 	if !strings.Contains(out.String(), guidance) || !strings.Contains(out.String(), "Copy only. Instruction files stay unchanged.") {
 		t.Fatalf("missing copy-ready recommendation: %s", out.String())
 	}
-	for _, required := range []string{"acd status", "acd finish", "relevant checks", "before handoff", "Preserve unrelated work", "Preserve user staging", "Questions and reviews do not authorize commits", "Do not", "retry finish automatically"} {
+	for _, required := range []string{"acd status", "acd finish", "relevant checks", "before handoff", "Preserve unrelated work", "Preserve user staging", "Questions and reviews do not authorize commits", "Do not", "retry finish automatically", "chosen approach", "disables splitting", "actual commit boundaries"} {
 		if !strings.Contains(guidance, required) {
 			t.Errorf("agent instructions omit %q", required)
 		}
