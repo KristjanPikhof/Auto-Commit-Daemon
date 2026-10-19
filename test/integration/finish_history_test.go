@@ -47,7 +47,12 @@ func TestFinishWorkflowHistorySavedPlanPreservesMembershipAndAuthors(t *testing.
 				index := runGitOK(t, f.Repo, "ls-files", "--stage")
 				var goals []finish.Goal
 				for position, oid := range originals {
-					message := []string{"Preserve stored settings", "Record another setting", "Restore the recorded setting", "Preserve recorded empty history"}[position]
+					message := []string{
+						"Preserve stored settings\n\n- Retain the recorded value when reviewing stored settings.",
+						"Record another setting\n\n- Preserve the intermediate value as its own authored decision.",
+						"Restore the recorded setting\n\n- Restore the prior value without removing the authored transition.",
+						"Preserve recorded empty history\n\n- Retain the authored checkpoint even though its tree is unchanged.",
+					}[position]
 					if style == finish.StyleConventional {
 						message = "chore: " + message
 					}
