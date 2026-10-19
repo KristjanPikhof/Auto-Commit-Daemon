@@ -244,7 +244,7 @@ func TestProductListTerminalInterruptKeepsCompletedSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored := strings.Split(out.String(), "\033[?1049l")
-	if len(restored) != 2 || !strings.Contains(restored[1], "completed snapshot") || !strings.Contains(restored[1], "No active repositories") || strings.Contains(out.String(), "partial refresh") {
+	if len(restored) != 2 || !strings.Contains(restored[1], "completed snapshot") || !strings.Contains(restored[1], "No recently active repositories") || strings.Contains(out.String(), "partial refresh") {
 		t.Fatalf("final terminal snapshot: %q", out.String())
 	}
 }

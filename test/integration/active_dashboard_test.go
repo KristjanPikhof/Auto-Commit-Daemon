@@ -60,7 +60,7 @@ func TestActiveDashboardWorksOutsideRepositories(t *testing.T) {
 	}
 	outside := t.TempDir()
 	compact := runAcdFromDir(t, ctx, env, outside, "list", "--once", "--verbose")
-	if compact.ExitCode != 3 || !strings.Contains(compact.Stdout, active) || strings.Contains(compact.Stdout, idle) || !strings.Contains(compact.Stdout, "Xcode license") {
+	if compact.ExitCode != 3 || !strings.Contains(compact.Stdout, active) || !strings.Contains(compact.Stdout, idle) || !strings.Contains(compact.Stdout, "Xcode license") {
 		t.Fatalf("compact: %+v; exhaustive: %+v", compact, runAcdFromDir(t, ctx, env, outside, "list", "--json"))
 	}
 	all := runAcdFromDir(t, ctx, env, outside, "list", "--json")

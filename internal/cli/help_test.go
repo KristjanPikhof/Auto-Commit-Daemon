@@ -14,8 +14,8 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 	}{
 		{"setup", []string{"acd setup --dry-run", "--non-interactive", "--integrations"}},
 		{"status", []string{"current changes are protected", "exact next command", "--repo"}},
-		{"on", []string{"Start checkpoint protection", "offline defaults", "durable checkpoint", "acd finish", "--repo"}},
-		{"off", []string{"final durable checkpoint", "--force"}},
+		{"on", []string{"Start saving changes", "offline defaults", "saves the current files", "acd finish", "--repo"}},
+		{"off", []string{"confirm the final save", "protection stays on", "--force"}},
 		{"list", []string{"last hour", "unfinished work", "need action", "Ctrl-C", "--watch", "--once", "--all"}},
 		{"finish", []string{"acd finish", "--dry-run", "--include-staged", "--retry", "--message"}},
 		{"history", []string{"recent protected checkpoints", "--activity", "activity", "rewrite"}},

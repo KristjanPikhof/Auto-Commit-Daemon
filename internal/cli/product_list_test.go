@@ -31,7 +31,7 @@ func TestProductListAllNeedsActionHumanRendersThenExitsThree(t *testing.T) {
 	if ExitCode(err) != ExitActionRequired || !ErrorRendered(err) {
 		t.Fatalf("exit=%d rendered=%v err=%v, want rendered exit %d", ExitCode(err), ErrorRendered(err), err, ExitActionRequired)
 	}
-	for _, want := range []string{"REPO", "SAFE", "needs action", "no"} {
+	for _, want := range []string{"Saved:", "Changes:", "needs action", "no"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("human output missing %q:\n%s", want, out.String())
 		}
@@ -189,7 +189,7 @@ func TestProductListPersistentFlagsAreHandled(t *testing.T) {
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("list --quiet: %v", err)
 		}
-		if !strings.Contains(out.String(), "REPO") {
+		if !strings.Contains(out.String(), "No recently active repositories.") {
 			t.Fatalf("quiet suppressed the final result:\n%s", out.String())
 		}
 	})
@@ -226,11 +226,11 @@ func TestProductListSelectionShowsAllRecentActivity(t *testing.T) {
 	}
 	sortProductListEntries(entries)
 	visible, hidden := selectProductListEntriesAt(entries, false, now)
-	if len(visible) != 11 || hidden != 1 {
+	if len(visible) != 12 || hidden != 0 {
 		t.Fatalf("visible=%d hidden=%d", len(visible), hidden)
 	}
-	if productListContainsRepo(visible, "/broken-idle") {
-		t.Fatal("idle warning pinned a row")
+	if !productListContainsRepo(visible, "/broken-idle") {
+		t.Fatal("idle repository requiring action was hidden")
 	}
 	all, hidden := selectProductListEntriesAt(entries, true, now)
 	if len(all) != len(entries) || hidden != 0 {
@@ -267,7 +267,7 @@ func TestProductListSelectionKeepsPausedUnfinishedWork(t *testing.T) {
 		{Repo: "/worker-restart", OperationalState: "retrying", WorkerState: "starting"},
 	}
 	visible, hidden := selectProductListEntries(entries, false)
-	if len(visible) != 1 || visible[0].Repo != "/blocked-drain" || hidden != 2 {
+	if len(visible) != 2 || !productListContainsRepo(visible, "/blocked-drain") || !productListContainsRepo(visible, "/paused-idle") || hidden != 1 {
 		t.Fatalf("visible=%+v hidden=%d", visible, hidden)
 	}
 }
@@ -312,7 +312,7 @@ func TestProductListAllControlsOnlyHumanFiltering(t *testing.T) {
 	if err := runProductListOnceView(context.Background(), &compact, false, false, false); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(compact.String(), "7 repositories hidden; use acd list --all") || strings.Contains(compact.String(), "repo-6") {
+	if !strings.Contains(compact.String(), "7 idle repositories hidden. Use acd list --all") || strings.Contains(compact.String(), "repo-6") {
 		t.Fatalf("default view did not stay compact:\n%s", compact.String())
 	}
 
@@ -469,7 +469,7 @@ func TestProductListWatchShowsRefreshingAfterKnownWork(t *testing.T) {
 			if err := runProductListWatchDisplay(ctx, out, time.Millisecond, false, false, false); err != nil {
 				t.Fatal(err)
 			}
-			if strings.Count(out.String(), "refreshing") < 1 || strings.Count(out.String(), "healthy") > 1 {
+			if strings.Count(out.String(), "checking protection") < 1 || strings.Count(out.String(), "ready") > 1 {
 				t.Fatalf("unavailable read hid unfinished work or claimed health:\n%s", out.String())
 			}
 		})
@@ -692,7 +692,7 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	}, productListRepoOverview{}, context.DeadlineExceeded)
 	if entry.ActionRequired || entry.State != productStateWaiting ||
 		productListStatus(entry) != "refreshing" || !entry.ProtectionUnknown ||
-		productListPhase(entry) != "refreshing" || !entry.PublicationOutcome.PendingClassification {
+		productListPhase(entry) != "checking protection" || !entry.PublicationOutcome.PendingClassification {
 		t.Fatalf("transient read failure became an alert: %+v", entry)
 	}
 	encoded, err := json.Marshal(entry)
@@ -703,8 +703,8 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 	if err := renderProductListSelection(&out, []productListEntry{entry}, 0, false, true); err != nil {
 		t.Fatal(err)
 	}
-	if line := productListLineForRepo(t, out.String(), "repo"); !strings.Contains(line, "-     -") {
-		t.Fatalf("unknown protection was not rendered distinctly: %s", line)
+	if !strings.Contains(out.String(), "repo\n  Saved: - | Changes: ?") {
+		t.Fatalf("unknown protection was not rendered distinctly: %s", out.String())
 	}
 
 	entry = productListEntryFromOverview(record, supervisor.WorkerStatus{
@@ -726,7 +726,7 @@ func TestProductListVerboseIncludesOperationalDetails(t *testing.T) {
 	if err := renderProductListSelection(&out, []productListEntry{entry}, 0, true, false); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"REPOSITORY", "WORKER", "LEGACY CLIENTS", "ISSUES", "LAST COMMIT", "needs action", "acd doctor --repo '/repo'"} {
+	for _, want := range []string{"Repository:", "Background protection:", "Older tool sessions:", "Issues:", "Last commit:", "needs action", "acd doctor --repo '/repo'"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("verbose output missing %q:\n%s", want, out.String())
 		}
@@ -903,17 +903,6 @@ func materializeProductListRepoWithSpaces(t *testing.T) string {
 		t.Fatalf("canonicalize spaced repository path: %v", err)
 	}
 	return realTarget
-}
-
-func productListLineForRepo(t *testing.T, output, repo string) string {
-	t.Helper()
-	for _, line := range strings.Split(output, "\n") {
-		if strings.HasPrefix(line, repo+" ") {
-			return line
-		}
-	}
-	t.Fatalf("repository row %q missing:\n%s", repo, output)
-	return ""
 }
 
 type productListFrameWriter struct {

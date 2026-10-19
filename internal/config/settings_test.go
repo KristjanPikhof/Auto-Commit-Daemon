@@ -320,7 +320,7 @@ func TestResolvePrecedenceAndShadowedEnvironment(t *testing.T) {
 func TestResolveClearToInheritAndSecretExclusion(t *testing.T) {
 	doc := NewDocument()
 	doc.Settings.Global[FieldAPIKey] = rawString("must-not-persist")
-	if err := ValidateDocument(doc); err == nil || !strings.Contains(err.Error(), "cannot be persisted") {
+	if err := ValidateDocument(doc); err == nil || !strings.Contains(err.Error(), "cannot be saved") {
 		t.Fatalf("ValidateDocument secret error = %v", err)
 	}
 	delete(doc.Settings.Global, FieldAPIKey)

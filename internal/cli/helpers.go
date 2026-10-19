@@ -50,7 +50,7 @@ func resolveRepo(repo string) (string, error) {
 	wt, err := git.ResolveWorktree(context.Background(), repo)
 	if err != nil {
 		if errors.Is(err, git.ErrNotWorktree) {
-			return "", fmt.Errorf("cli: repo %q is not inside a Git worktree: %w", repo, err)
+			return "", fmt.Errorf("This folder is not in a Git repository: %q.\nNext: Run the command inside a Git working copy, or select it with --repo.\nDetails: %w", repo, err)
 		}
 		return "", err
 	}
@@ -65,7 +65,7 @@ func lookupRegisteredRepo(command, repo string) (central.RepoRecord, paths.Roots
 	wt, err := git.ResolveWorktree(context.Background(), repo)
 	if err != nil {
 		if errors.Is(err, git.ErrNotWorktree) {
-			return central.RepoRecord{}, paths.Roots{}, "", fmt.Errorf("cli: repo %q is not inside a Git worktree: %w", repo, err)
+			return central.RepoRecord{}, paths.Roots{}, "", fmt.Errorf("This folder is not in a Git repository: %q.\nNext: Run the command inside a Git working copy, or select it with --repo.\nDetails: %w", repo, err)
 		}
 		return central.RepoRecord{}, paths.Roots{}, "", err
 	}

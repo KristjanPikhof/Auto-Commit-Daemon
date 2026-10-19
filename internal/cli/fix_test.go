@@ -1146,7 +1146,7 @@ func TestFix_SecondPairFailureReportsIncompleteApply(t *testing.T) {
 	if err := renderFix(&human, plan, false); err != nil {
 		t.Fatalf("render incomplete human result: %v", err)
 	}
-	if !strings.Contains(human.String(), "Fix incomplete") || !strings.Contains(human.String(), "missing") {
+	if !strings.Contains(human.String(), "Recovery incomplete") || !strings.Contains(human.String(), "missing") {
 		t.Fatalf("human output hid partial failure:\n%s", human.String())
 	}
 }

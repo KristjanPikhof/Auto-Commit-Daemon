@@ -37,7 +37,7 @@ func TestStatusPublicationTruthSeparatesGitAndACD(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, body := range map[string]string{"shared": shared.String(), "status": product.String()} {
-		if !strings.Contains(body, report.PublicationOutcome.Legacy.Reason) || !strings.Contains(body, "acd setup") || strings.Contains(body, "Legacy archive: 0") {
+		if !strings.Contains(body, "Older saved data needs review") || !strings.Contains(body, "acd support diagnose --json") || strings.Contains(body, "Older saved versions: 0") {
 			t.Fatalf("%s hid unknown-count legacy attention: %s", name, body)
 		}
 	}

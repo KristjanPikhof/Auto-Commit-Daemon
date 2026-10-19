@@ -91,6 +91,25 @@ disabled worktrees are never enabled by hooks. `off` waits for a final complete 
 protection enabled. `off --force` explicitly accepts stopping without confirmed
 current coverage. Saved history remains available.
 
+## Console output
+
+Normal output shows whether checked changes are saved, whether they are in
+local Git commits, and the next action when needed. Use `status --verbose` or
+`--json` for saved request IDs, hashes, checks, and background process details.
+A saved checkpoint does not mean a Git commit was created.
+
+`list` uses repository blocks. Repositories requiring action remain visible;
+`--all` also shows idle repositories. Redirected `list --watch` appends dated
+updates without terminal screen controls. `on --quiet` hides the startup wait.
+
+A failed finish can be retried after its cause is resolved. A finish needing
+attention points to `acd doctor`; retry does not bypass missing safety evidence.
+A retry can restart the saved request and always keeps its original changes.
+
+Check results say whether a project command ran, an earlier result was reused,
+or no project checks were configured. Structure checks alone do not mean the
+project's tests passed.
+
 ## Finish
 
 ~~~bash

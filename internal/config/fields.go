@@ -314,7 +314,7 @@ func validateOverrides(scope string, values Overrides) error {
 			return fmt.Errorf("acd config: %s: %w", scope, UnsupportedFieldError(name))
 		}
 		if !field.Persistable {
-			return fmt.Errorf("acd config: %s: field %q is secret or environment-only and cannot be persisted", scope, name)
+			return fmt.Errorf("%s: field %q is secret or environment-only and cannot be saved.", scope, name)
 		}
 		if _, err := validateRaw(field, raw, true); err != nil {
 			return fmt.Errorf("acd config: %s: %w", scope, err)
@@ -325,10 +325,10 @@ func validateOverrides(scope string, values Overrides) error {
 
 func validateRaw(field FieldDefinition, raw json.RawMessage, persisted bool) (string, error) {
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return "", fmt.Errorf("field %q: null is not persisted; remove the key to inherit", field.Name)
+		return "", fmt.Errorf("Field %q: null is not saved; remove the key to inherit.", field.Name)
 	}
 	if persisted && !field.Persistable {
-		return "", fmt.Errorf("field %q cannot be persisted", field.Name)
+		return "", fmt.Errorf("Field %q cannot be saved.", field.Name)
 	}
 	var value any
 	if err := json.Unmarshal(raw, &value); err != nil {
@@ -346,7 +346,7 @@ func validateRaw(field FieldDefinition, raw json.RawMessage, persisted bool) (st
 		}
 		text = strconv.FormatInt(int64(v), 10)
 	default:
-		return "", fmt.Errorf("field %q requires a scalar value", field.Name)
+		return "", fmt.Errorf("Field %q requires a scalar value.", field.Name)
 	}
 	return normalizeValue(field, text)
 }
@@ -408,7 +408,7 @@ func normalizeValue(field FieldDefinition, raw string) (string, error) {
 		}
 		return duration.String(), nil
 	default:
-		return "", fmt.Errorf("field %q has unsupported type", field.Name)
+		return "", fmt.Errorf("Field %q has unsupported type.", field.Name)
 	}
 }
 

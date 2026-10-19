@@ -12,5 +12,5 @@ type ProviderHTTPError struct {
 }
 
 func (e *ProviderHTTPError) Error() string {
-	return fmt.Sprintf("openai-compat: http %d: %s", e.StatusCode, e.Detail)
+	return fmt.Sprintf("The AI provider rejected the request (HTTP %d).\nDetails: %s\nNext: Review the provider settings and account before retrying.", e.StatusCode, e.Detail)
 }

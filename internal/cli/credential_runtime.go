@@ -83,14 +83,14 @@ func refreshCredentialRuntime(ctx context.Context, out io.Writer, roots paths.Ro
 			return fmt.Errorf("credential saved, but active setting %s cannot be preserved; use acd config edit", key)
 		}
 	}
-	applied, err := service.Apply(ctx, settings.ApplyRequest{
+	_, err = service.Apply(ctx, settings.ApplyRequest{
 		Values: values, Confirmations: confirmations, TestedFingerprint: validated.Fingerprint,
 		ExpectedGeneration: snapshot.SavedGeneration, ExpectedDesiredRevision: snapshot.DesiredRevisionID,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "Credential saved. Revision %d applied to %s; existing settings and approvals are preserved.\n", applied.RevisionID, worktree.Root)
+	fmt.Fprintf(out, "API key saved and applied to %s.\n", safeRepoPreview(worktree.Root))
 	return nil
 }
 
@@ -116,7 +116,7 @@ func credentialRuntimeContract(encoded string) (map[string]string, []ai.Confirma
 		}
 		var value string
 		if err := json.Unmarshal(data, &value); err != nil {
-			return nil, nil, fmt.Errorf("active runtime setting %s is unreadable", field.Name)
+			return nil, nil, fmt.Errorf("Active running ACD setting %s is unreadable.", field.Name)
 		}
 		values[field.Name] = value
 	}

@@ -29,9 +29,9 @@ func newLogsCmd() *cobra.Command {
 The default repo is the current working directory. By default acd logs prints
 the last 100 raw log lines and exits. Use --lines to choose the initial tail
 length, or --follow to keep streaming appended lines until interrupted. For
-bundled diagnostics and sanitized tails, use acd doctor or acd doctor --bundle.
-Full AI prompt traces are stored separately and require ACD_AI_PROMPT_TRACE=1
-plus acd prompt.`,
+bundled diagnostics and sanitized tails, use acd doctor or acd doctor
+--bundle. Full AI prompt traces are stored separately and require
+ACD_AI_PROMPT_TRACE=1 plus acd prompt.`,
 		Example: `  acd logs
   acd logs --lines 200
   acd logs --follow
@@ -65,7 +65,7 @@ func runLogs(ctx context.Context, out io.Writer, repo string, lines int, follow 
 	}
 	for _, line := range tail {
 		if _, err := fmt.Fprintln(out, line); err != nil {
-			return fmt.Errorf("acd logs: write output: %w", err)
+			return fmt.Errorf("acd logs: write output\nDetails: %w", err)
 		}
 	}
 	if follow {
@@ -87,14 +87,14 @@ func collectLogTail(repo string, lines int) ([]string, string, int64, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, "", 0, fmt.Errorf("acd logs: daemon log missing for repo %s at %s (try `acd on --repo %s` or run `acd doctor`)", abs, logPath, abs)
 		}
-		return nil, "", 0, fmt.Errorf("acd logs: stat daemon log %s: %w", logPath, err)
+		return nil, "", 0, fmt.Errorf("acd logs: stat daemon log %s\nDetails: %w", logPath, err)
 	}
 	if lines == 0 {
 		return []string{}, logPath, info.Size(), nil
 	}
 	tail, offset, err := readLastLogLines(logPath, lines)
 	if err != nil {
-		return nil, "", 0, fmt.Errorf("acd logs: read daemon log %s: %w", logPath, err)
+		return nil, "", 0, fmt.Errorf("acd logs: read daemon log %s\nDetails: %w", logPath, err)
 	}
 	return tail, logPath, offset, nil
 }
@@ -155,7 +155,7 @@ func followLog(ctx context.Context, out io.Writer, path string, offset int64, in
 		case errors.Is(err, os.ErrNotExist):
 			offset = 0
 		default:
-			return fmt.Errorf("acd logs: follow daemon log %s: %w", path, err)
+			return fmt.Errorf("acd logs: follow daemon log %s\nDetails: %w", path, err)
 		}
 
 		timer.Reset(interval)

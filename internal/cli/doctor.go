@@ -148,13 +148,13 @@ func runDoctor(ctx context.Context, out io.Writer, bundle bool, outputDir string
 	}
 	rep, err := collectDoctorReport(ctx)
 	if err != nil {
-		return fmt.Errorf("acd doctor: collect: %w", err)
+		return fmt.Errorf("acd doctor: collect\nDetails: %w", err)
 	}
 
 	if bundle {
 		bres, err := writeDoctorBundle(ctx, rep, outputDir)
 		if err != nil {
-			return fmt.Errorf("acd doctor: bundle: %w", err)
+			return fmt.Errorf("acd doctor: bundle\nDetails: %w", err)
 		}
 		if jsonOut {
 			enc := json.NewEncoder(out)
@@ -217,7 +217,7 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 
 	roots, err := paths.Resolve()
 	if err != nil {
-		return rep, fmt.Errorf("resolve paths: %w", err)
+		return rep, fmt.Errorf("resolve paths\nDetails: %w", err)
 	}
 	target, _ := ctx.Value(doctorTargetContextKey{}).(string)
 	if target != "" {
@@ -233,7 +233,7 @@ func collectDoctorReport(ctx context.Context) (doctorReport, error) {
 	rep.RegistryPath = roots.RegistryPath()
 	reg, err := central.Load(roots)
 	if err != nil {
-		return rep, fmt.Errorf("load registry: %w", err)
+		return rep, fmt.Errorf("load registry\nDetails: %w", err)
 	}
 	for _, rec := range reg.Repos {
 		if target != "" && filepath.Clean(rec.Path) != filepath.Clean(target) {
@@ -1438,18 +1438,18 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 	if outputDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return bundleResult{}, fmt.Errorf("home dir: %w", err)
+			return bundleResult{}, fmt.Errorf("home dir\nDetails: %w", err)
 		}
 		outputDir = filepath.Join(home, "Downloads")
 	}
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return bundleResult{}, fmt.Errorf("mkdir output: %w", err)
+		return bundleResult{}, fmt.Errorf("mkdir output\nDetails: %w", err)
 	}
 	stamp := time.Now().UTC().Format("20060102-150405")
 	zipPath := filepath.Join(outputDir, "acd-doctor-"+stamp+".zip")
 	f, err := os.OpenFile(zipPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return bundleResult{}, fmt.Errorf("create zip: %w", err)
+		return bundleResult{}, fmt.Errorf("create zip\nDetails: %w", err)
 	}
 	defer f.Close()
 
@@ -1474,7 +1474,7 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 		return bundleResult{}, fmt.Errorf("marshal manifest: %w", err)
 	}
 	if err := add("manifest.json", manifest); err != nil {
-		return bundleResult{}, fmt.Errorf("write manifest: %w", err)
+		return bundleResult{}, fmt.Errorf("write manifest\nDetails: %w", err)
 	}
 	if err := add("acd-version.txt", []byte(rep.ACDVersion+"\n")); err != nil {
 		return bundleResult{}, err
@@ -1510,7 +1510,7 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 	}
 	registry, err := central.Load(roots)
 	if err != nil {
-		return bundleResult{}, fmt.Errorf("load registry: %w", err)
+		return bundleResult{}, fmt.Errorf("load registry\nDetails: %w", err)
 	}
 	included := make(map[string]struct{}, len(rep.Repos))
 	for _, repo := range rep.Repos {
@@ -1575,10 +1575,10 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 	}
 
 	if err := zw.Close(); err != nil {
-		return bundleResult{}, fmt.Errorf("close zip: %w", err)
+		return bundleResult{}, fmt.Errorf("close zip\nDetails: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return bundleResult{}, fmt.Errorf("close file: %w", err)
+		return bundleResult{}, fmt.Errorf("close file\nDetails: %w", err)
 	}
 	st, err := os.Stat(zipPath)
 	if err != nil {
@@ -1592,7 +1592,7 @@ func writeDoctorBundle(ctx context.Context, rep doctorReport, outputDir string) 
 func writeRepoBundleFiles(ctx context.Context, zw *zip.Writer, base, dbPath string, files *int) error {
 	conn, err := openStateDBReadOnly(ctx, dbPath)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		return fmt.Errorf("open\nDetails: %w", err)
 	}
 	defer conn.Close()
 

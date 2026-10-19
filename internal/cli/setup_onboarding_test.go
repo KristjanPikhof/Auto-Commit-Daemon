@@ -180,8 +180,8 @@ func TestSetupPlanCredentialSummary(t *testing.T) {
 		{name: "local", strategy: "local", provider: "deterministic", want: "Credential: not needed for Local mode."},
 		{name: "missing", strategy: "intent", provider: "openai-compat", want: "Credential: required; interactive setup will ask for an API key", source: credentials.SourceNone},
 		{name: "saved", strategy: "intent", provider: "openai-compat", want: "Credential: reuse the protected user credential file.", source: credentials.SourceFile},
-		{name: "new", strategy: "intent", provider: "openai-compat", want: "Credential: stored in the protected user credential file with mode 0600.", source: credentials.SourceFile, store: true},
-		{name: "environment", strategy: "intent", provider: "openai-compat", want: "Credential: ACD_AI_API_KEY from the environment.", source: credentials.SourceEnvironment},
+		{name: "new", strategy: "intent", provider: "openai-compat", want: "API key: ACD will save it in a file only your user account can read.", source: credentials.SourceFile, store: true},
+		{name: "environment", strategy: "intent", provider: "openai-compat", want: "API key: Uses ACD_AI_API_KEY from this environment.", source: credentials.SourceEnvironment},
 		{name: "subprocess", strategy: "intent", provider: "subprocess:acd-ai", want: "Credential: not needed for this provider."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

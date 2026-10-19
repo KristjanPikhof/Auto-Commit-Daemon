@@ -60,36 +60,28 @@ func newRewriteCommitsCmd() *cobra.Command {
 		Use:     "rewrite-commits (--from-nr <n> | --from-sha <sha> | --range-nr <start-end> | --range-sha <base>..<head> | --last <n>) [--plan-out FILE] | --edit <plan-id-or-file>",
 		Aliases: []string{"edit-commits", "edit-commit"},
 		Short:   "Review and improve commit messages on this branch",
-		Long: `Create a reviewable plan that improves commit messages in a linear
-part of the current branch. Normal ACD protection never runs this command.
+		Long: `Review and change selected commits on this branch.
 
-Recommended workflow:
-  1. Select commits with --last, --from-sha, --from-nr, --range-sha, or
-     --range-nr.
-  2. Save a plan with --plan-only or --plan-out.
-  3. Review it with --show-plan or --edit.
-  4. Preview the apply with --dry-run, then confirm it with --yes.
+1. Select commits with --last, --from-sha, --from-nr, --range-sha or --range-nr.
+2. Save a plan with --plan-only or --plan-out FILE.
+3. Review it with --show-plan or --edit.
+4. Preview with --apply PLAN --dry-run, then apply with --apply PLAN --yes.
 
-Applying a plan rewrites Git history. ACD first verifies that the selected
-commits are safe to rewrite and creates a private backup ref. Merge commits are
-not supported. Working-tree files are not changed.
+Use a saved plan ID or a standalone plan file. The --edit option opens
+$EDITOR so you can review and change the plan before applying it.
+Normal ACD protection never runs this command.
 
-Local mode preserves original commit order and grouping without AI. Intent
-plans completed goals from exact recorded versions. Use --messages-only to
-keep every original commit, including empty commits. Showing, editing, and
-applying saved plans make no AI request.
+Applying changes Git history. ACD creates a private backup ref first.
+Merge commits are not supported. Your working files stay unchanged.
 
-Use --new-branch NAME to reconstruct complete goals from recorded path versions.
-This can split mixed commits and regroup interleaved work in Intent mode.
-The original branch is preserved. An active ACD worker verifies and applies the saved plan while
-capture protection continues.
+Local mode preserves original order and grouping. Intent mode can regroup
+completed work. Use --messages-only to preserve each selected commit,
+including empty commits. Use --new-branch NAME to keep the original branch.
 
-Use --edit with a saved plan ID or file to review local or messages-only
-messages in $EDITOR. Editing creates a new plan revision and updates a
-standalone plan file. Purposeful goal plans require a new plan to change goals. The command prints the plan ID or file it saved.
-
-Progress is written to stderr so stdout stays usable for command results and
---json. Use --progress plain for copyable progress, or --quiet to hide it.`,
+An active protection worker must check and apply the plan. Showing, editing,
+and applying a saved plan make no AI request. Use --progress plain for
+copyable progress, or --quiet to hide progress. See docs/rewrite-commits.md
+for details.`,
 		Example: `  acd config edit
   acd history rewrite --last 5 --plan-only
   acd history rewrite --from-sha 8f4c2a1 --plan-out rewrite.json
@@ -256,7 +248,7 @@ func showSavedRewritePlan(ctx context.Context, out io.Writer, repoFlag, ref stri
 	}
 	plan, err := readRewritePlanRef(ctx, repo, ref)
 	if err != nil {
-		return fmt.Errorf("acd history rewrite: read show plan: %w", err)
+		return fmt.Errorf("acd history rewrite: read show plan\nDetails: %w", err)
 	}
 	if jsonOut {
 		enc := json.NewEncoder(out)
@@ -287,7 +279,7 @@ func readRewritePlanRef(ctx context.Context, repo, ref string) (state.RewritePla
 	}
 	db, err := state.OpenReadOnly(ctx, dbPath)
 	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("open state db: %w", err)
+		return state.RewritePlan{}, fmt.Errorf("open state db\nDetails: %w", err)
 	}
 	defer db.Close()
 	plan, ok, err := state.LoadRewritePlan(ctx, db, ref)
@@ -323,7 +315,7 @@ func readRewritePlanFile(path string) (state.RewritePlan, error) {
 func rewriteStateDBPath(ctx context.Context, repo string) (string, error) {
 	gitDir, err := git.AbsoluteGitDir(ctx, repo)
 	if err != nil {
-		return "", fmt.Errorf("acd history rewrite: resolve git dir: %w", err)
+		return "", fmt.Errorf("acd history rewrite: resolve git dir\nDetails: %w", err)
 	}
 	return state.DBPathFromGitDir(gitDir), nil
 }

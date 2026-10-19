@@ -45,7 +45,7 @@ func loadRecoveryBlockerCounts(ctx context.Context, conn *sql.DB, activeBranchRe
 	if err := conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStateBlockedConflict).Scan(&c.TotalBlockedConflicts); err != nil {
-		return c, fmt.Errorf("total blocked conflicts: %w", err)
+		return c, fmt.Errorf("total blocked conflicts\nDetails: %w", err)
 	}
 	if activeBranchRef != "" {
 		n, err := countTerminalBarriersWithSuccessors(ctx, conn, state.EventStateBlockedConflict, activeBranchRef, activeGeneration)
@@ -62,7 +62,7 @@ WHERE branch_ref = ?
 			activeBranchRef, activeGeneration,
 			state.EventStateBlockedConflict, state.EventStateFailed,
 		).Scan(&c.ActiveTerminalEvents); err != nil {
-			return c, fmt.Errorf("active terminal events: %w", err)
+			return c, fmt.Errorf("active terminal events\nDetails: %w", err)
 		}
 	}
 	failed, err := countTerminalBarriersWithSuccessors(ctx, conn, state.EventStateFailed, "", 0)
@@ -72,7 +72,7 @@ WHERE branch_ref = ?
 	c.FailedBarriersWithSuccessors = failed
 	pendingOnly, err := countPendingOnlyIntentDepth(ctx, conn)
 	if err != nil {
-		return c, fmt.Errorf("pending-only intent depth: %w", err)
+		return c, fmt.Errorf("pending-only intent depth\nDetails: %w", err)
 	}
 	c.PendingOnlyIntentDepth = pendingOnly
 	return c, nil

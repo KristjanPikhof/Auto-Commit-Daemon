@@ -7,14 +7,14 @@ INSTALL_DIR="${ACD_INSTALL_DIR:-$HOME/.local/bin}"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$OS" in
   darwin|linux) ;;
-  *) echo "unsupported os: $OS" >&2; exit 1 ;;
+  *) echo "This installer supports macOS and Linux. Your system is $OS." >&2; exit 1 ;;
 esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64|amd64)  ARCH=amd64 ;;
   arm64|aarch64) ARCH=arm64 ;;
-  *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
+  *) echo "This installer supports Intel/AMD 64-bit and ARM 64-bit computers. Your architecture is $ARCH." >&2; exit 1 ;;
 esac
 
 VERSION="${ACD_VERSION:-}"

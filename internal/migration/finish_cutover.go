@@ -47,7 +47,7 @@ func ActivateFinish(ctx context.Context, repo string, db *state.DB) (state.Finis
 				return saved, ctx.Err()
 			}
 			ref, oid, _, pinErr := pinFinishLegacy(ctx, wt.Root, checkpoint.WorktreeID(wt.Root), manifest)
-			failed, writeErr := state.RecordFinishLegacyActivationFailure(ctx, db, "legacy_inventory_invalid", "Legacy selections could not be proved. Available versions are retained; repair the saved selection before finish: "+err.Error(), ref, oid)
+			failed, writeErr := state.RecordFinishLegacyActivationFailure(ctx, db, "legacy_inventory_invalid", "Older saved work needs review. Available versions are retained separately; run acd doctor. Details: "+err.Error(), ref, oid)
 			return failed, errors.Join(ErrFinishLegacyAttention, err, pinErr, writeErr)
 		}
 		ref, oid, pins, err := pinFinishLegacy(ctx, wt.Root, checkpoint.WorktreeID(wt.Root), manifest)
@@ -61,7 +61,7 @@ func ActivateFinish(ctx context.Context, repo string, db *state.DB) (state.Finis
 			} else if errors.Is(err, errFinishLegacyObjectsMissing) {
 				code = "legacy_object_missing"
 			}
-			saved, writeErr := state.RecordFinishLegacyActivationFailure(ctx, db, code, "Legacy available versions are retained. Restore the old object or ref proof, then activate protection again: "+err.Error(), ref, oid)
+			saved, writeErr := state.RecordFinishLegacyActivationFailure(ctx, db, code, "Older saved work needs review. Available versions are retained separately; run acd doctor. Details: "+err.Error(), ref, oid)
 			return saved, errors.Join(ErrFinishLegacyAttention, err, writeErr)
 		}
 		saved, err = state.PrepareFinishLegacyCutover(ctx, db, checkpoint.WorktreeID(wt.Root), manifest, ref, oid, pins)

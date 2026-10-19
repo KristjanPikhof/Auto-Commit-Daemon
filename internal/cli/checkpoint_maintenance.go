@@ -25,14 +25,14 @@ func maintenanceDetails(m checkpoint.MaintenanceStatus) string {
 	}
 	parts := []string{m.Summary()}
 	if m.Error != "" {
-		parts = append(parts, m.Error)
+		parts = append(parts, "Details: "+safePreviewText(m.Error, 0))
 	}
 	if m.LastSuccessTS > 0 {
-		parts = append(parts, fmt.Sprintf("Last measured: %d bytes of retained Git content, %d protected; budget %d bytes.",
+		parts = append(parts, fmt.Sprintf("Storage: %d bytes used, %d bytes needed to keep saved work; limit %d bytes.",
 			m.ContentBytes, m.ProtectedBytes, checkpoint.DefaultContentBudget))
 	}
 	if m.NextAttemptTS > 0 {
-		parts = append(parts, "Next check: "+time.Unix(m.NextAttemptTS, 0).UTC().Format(time.RFC3339)+".")
+		parts = append(parts, "Next cleanup check: "+time.Unix(m.NextAttemptTS, 0).UTC().Format(time.RFC3339)+".")
 	}
 	return strings.Join(parts, " ")
 }

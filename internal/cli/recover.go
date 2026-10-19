@@ -34,7 +34,7 @@ func refuseRecoverWhenDaemonAliveSQL(ctx context.Context, conn *sql.DB) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("acd recover: load daemon state: %w", err)
+		return fmt.Errorf("acd recover: load daemon state\nDetails: %w", err)
 	}
 	return refuseRecoverWhenDaemonPIDAlive(ctx, pid, mode)
 }
@@ -42,7 +42,7 @@ func refuseRecoverWhenDaemonAliveSQL(ctx context.Context, conn *sql.DB) error {
 func refuseRecoverWhenDaemonAlive(ctx context.Context, db *state.DB) error {
 	st, ok, err := state.LoadDaemonState(ctx, db)
 	if err != nil {
-		return fmt.Errorf("acd recover: load daemon state: %w", err)
+		return fmt.Errorf("acd recover: load daemon state\nDetails: %w", err)
 	}
 	if !ok || st.PID <= 0 {
 		return nil
@@ -98,26 +98,26 @@ func backupStateDB(ctx context.Context, conn *sql.DB, stateDB string) (string, e
 		return "", err
 	}
 	if err := os.Chmod(backup, 0o600); err != nil {
-		return removeOnError(fmt.Errorf("chmod backup: %w", err))
+		return removeOnError(fmt.Errorf("chmod backup\nDetails: %w", err))
 	}
 	verify, err := openStateDBReadOnly(ctx, backup)
 	if err != nil {
-		return removeOnError(fmt.Errorf("open backup for verification: %w", err))
+		return removeOnError(fmt.Errorf("open backup for verification\nDetails: %w", err))
 	}
 	var integrity string
 	checkErr := verify.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&integrity)
 	closeErr := verify.Close()
 	if checkErr != nil {
-		return removeOnError(fmt.Errorf("verify backup integrity: %w", checkErr))
+		return removeOnError(fmt.Errorf("verify backup integrity\nDetails: %w", checkErr))
 	}
 	if closeErr != nil {
-		return removeOnError(fmt.Errorf("close verified backup: %w", closeErr))
+		return removeOnError(fmt.Errorf("close verified backup\nDetails: %w", closeErr))
 	}
 	if !strings.EqualFold(strings.TrimSpace(integrity), "ok") {
 		return removeOnError(fmt.Errorf("verify backup integrity: %s", integrity))
 	}
 	if _, err := os.Stat(backup); err != nil {
-		return removeOnError(fmt.Errorf("stat verified backup: %w", err))
+		return removeOnError(fmt.Errorf("stat verified backup\nDetails: %w", err))
 	}
 	return backup, nil
 }

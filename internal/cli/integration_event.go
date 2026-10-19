@@ -135,7 +135,7 @@ func normalizeIntegrationEvent(in io.Reader, event integrationEvent) (integratio
 	if event.Repo == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return event, fmt.Errorf("acd internal integration event: get working directory: %w", err)
+			return event, fmt.Errorf("acd internal integration event: get working directory\nDetails: %w", err)
 		}
 		event.Repo = cwd
 	}
@@ -178,7 +178,7 @@ func resolveCursorIntegrationRepo(payload map[string]any) (string, error) {
 	}
 	wd, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("acd internal integration event: get working directory: %w", err)
+		return "", fmt.Errorf("acd internal integration event: get working directory\nDetails: %w", err)
 	}
 	return canonicalHookPath(wd), nil
 }
@@ -239,13 +239,13 @@ func nearestGitMarkerRoot(repo string) (string, error) {
 	if strings.TrimSpace(repo) == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return "", fmt.Errorf("acd integration gate: get working directory: %w", err)
+			return "", fmt.Errorf("acd integration gate: get working directory\nDetails: %w", err)
 		}
 		repo = cwd
 	}
 	abs, err := filepath.Abs(repo)
 	if err != nil {
-		return "", fmt.Errorf("acd integration gate: resolve %q: %w", repo, err)
+		return "", fmt.Errorf("acd integration gate: resolve %q\nDetails: %w", repo, err)
 	}
 	abs = filepath.Clean(abs)
 	if real, resolveErr := filepath.EvalSymlinks(abs); resolveErr == nil {
@@ -256,7 +256,7 @@ func nearestGitMarkerRoot(repo string) (string, error) {
 		return "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("acd integration gate: inspect %s: %w", abs, err)
+		return "", fmt.Errorf("acd integration gate: inspect %s\nDetails: %w", abs, err)
 	}
 	if !info.IsDir() {
 		return "", nil
@@ -268,7 +268,7 @@ func nearestGitMarkerRoot(repo string) (string, error) {
 			return dir, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("acd integration gate: inspect %s: %w", filepath.Join(dir, ".git"), err)
+			return "", fmt.Errorf("acd integration gate: inspect %s\nDetails: %w", filepath.Join(dir, ".git"), err)
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {

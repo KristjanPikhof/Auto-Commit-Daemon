@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -60,9 +59,9 @@ func newProductListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "Show live protection and commit progress",
 		Long: `Show repositories active in the last hour, including those that need action,
-and repositories with unfinished work. Idle repositories disappear even if
-they have a maintenance warning. Rows stay in place while the dashboard
-refreshes; newly active repositories append.
+and repositories with unfinished work. Repositories that need action stay
+visible. Other idle repositories are hidden. Repository blocks stay in place
+while the view refreshes.
 
 In a terminal, the dashboard refreshes until you stop it with Ctrl-C. Use
 --once for one snapshot, --all for every enabled repository, or --verbose for
@@ -78,13 +77,13 @@ operational details. Use acd repo list for the static registration inventory.`,
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			repo, _ := cmd.Flags().GetString("repo")
 			if repo != "" {
-				return invalidCommandError("acd list: --repo is not supported; list already shows every enabled repository")
+				return invalidCommandError("acd list: --repo is not supported. Use acd status --repo /path/to/repo for one repository.")
 			}
 			if watch && once {
 				return invalidCommandError("acd list: --watch and --once cannot be combined")
 			}
 			if interval <= 0 {
-				return invalidCommandError("acd list: --interval must be positive")
+				return invalidCommandError("acd list: --interval must be longer than 0s, for example --interval 5s")
 			}
 			if interactive {
 				if jsonOut || watch || once || showAll {
@@ -105,10 +104,10 @@ operational details. Use acd repo list for the static registration inventory.`,
 			return runProductListOnceView(cmd.Context(), cmd.OutOrStdout(), jsonOut, verbose, showAll)
 		},
 	}
-	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh until interrupted (default on a TTY)")
+	cmd.Flags().BoolVar(&watch, "watch", false, "Refresh until Ctrl-C (default in a terminal)")
 	cmd.Flags().BoolVar(&once, "once", false, "Print one snapshot and exit")
 	cmd.Flags().BoolVar(&showAll, "all", false, "Include every enabled repository")
-	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include operational details and next actions")
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "Include background activity and diagnostic details")
 	cmd.Flags().BoolVar(&interactive, "interactive", false, "Open the advanced repository manager")
 	cmd.Flags().DurationVar(&interval, "interval", defaultListWatchInterval, "Refresh interval")
 	return cmd
@@ -164,7 +163,7 @@ func productListShellQuote(value string) string {
 func runProductListOnceView(ctx context.Context, out io.Writer, jsonOut, verbose, showAll bool) error {
 	data, stateName, err := collectProductList(ctx)
 	if err != nil {
-		return fmt.Errorf("acd list: %w", err)
+		return fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: acd list: %w", err)
 	}
 	entries := data.Repos
 	if jsonOut {
@@ -226,7 +225,7 @@ func runProductListWatchDisplay(
 				interrupted = true
 				return nil
 			}
-			return fmt.Errorf("acd list: %w", err)
+			return fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: acd list: %w", err)
 		}
 		if ctx.Err() != nil {
 			interrupted = true
@@ -244,7 +243,9 @@ func runProductListWatchDisplay(
 			fmt.Fprint(out, "\033[?1049h\033[?25l")
 			terminalStarted = true
 		}
-		fmt.Fprint(out, "\033[2J\033[H")
+		if terminalScreen {
+			fmt.Fprint(out, "\033[2J\033[H")
+		}
 		completedFrame := frame.String()
 		if _, err := io.WriteString(out, completedFrame); err != nil {
 			return err
@@ -298,52 +299,45 @@ func stabilizeProductListFrame(entries []productListEntry, lastKnown map[string]
 
 func renderProductListSelection(out io.Writer, visible []productListEntry, hidden int, verbose, showAll bool) error {
 	labels := productListLabels(visible)
-	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	if verbose {
-		fmt.Fprintln(tw, "REPOSITORY\tWORKER\tLEGACY CLIENTS\tSAFE\tMODE\tWORK\tTARGET\tLAST MOVE\tPHASE\tISSUES\tLAST COMMIT\tSTATUS\tDETAILS")
-	} else {
-		fmt.Fprintln(tw, "REPO\tSAFE\tMODE\tWORK\tTARGET\tLAST MOVE\tPHASE\tSTATUS")
-	}
 	for index, entry := range visible {
+		fmt.Fprintf(out, "%s\n  Saved: %s | Changes: %s\n  Status: %s\n",
+			safePreviewText(labels[index], 0), productListSafety(entry), productListSavedWork(entry), safePreviewText(productListDisplayStatus(entry), 0))
 		if verbose {
-			details := entry.Summary
-			if entry.CheckpointMaintenance.Summary() != "" && !strings.Contains(details, entry.CheckpointMaintenance.Summary()) {
-				details += " " + maintenanceDetails(entry.CheckpointMaintenance)
+			fmt.Fprintf(out, "  Repository: %s\n  Mode: %s | Last progress: %s\n",
+				safePreviewText(homeShort(entry.Repo), 0), productListMode(entry), productListProgressAge(entry))
+			fmt.Fprintf(out, "  Background protection: %s\n", safePreviewText(valueOrDash(entry.WorkerState), 0))
+			fmt.Fprintf(out, "  Older tool sessions: %d | Issues: %d\n  Last commit: %s\n", entry.Clients, entry.BlockedEvents, safePreviewText(productListLastCommit(entry.LastCommitOID), 0))
+			fmt.Fprintln(out, consoleProse("  Details: "+entry.Summary))
+			if summary := entry.CheckpointMaintenance.Summary(); summary != "" && !strings.Contains(entry.Summary, summary) {
+				fmt.Fprintln(out, consoleProse("  Cleanup: "+maintenanceDetails(entry.CheckpointMaintenance)))
 			}
-			if entry.NextAction != "" && entry.NextAction != "No action needed." {
-				details = strings.TrimSpace(details + " " + entry.NextAction)
-			}
-			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
-				homeShort(entry.Repo), valueOrDash(entry.WorkerState), entry.Clients,
-				productListSafety(entry), productListMode(entry), productListSavedWork(entry),
-				productListTarget(entry), productListProgressAge(entry), productListPhase(entry),
-				entry.BlockedEvents, productListLastCommit(entry.LastCommitOID),
-				productListDisplayStatus(entry), details)
-			continue
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", labels[index],
-			productListSafety(entry), productListMode(entry), productListSavedWork(entry),
-			productListTarget(entry), productListProgressAge(entry), productListPhase(entry),
-			productListDisplayStatus(entry))
+		if entry.ActionRequired || entry.State == productStateNeedsAction {
+			if entry.NextAction != "" {
+				fmt.Fprintln(out, "  Next:", safePreviewText(entry.NextAction, 0))
+				fmt.Fprintf(out, "  Repository: %s\n", productListShellQuote(entry.Repo))
+			}
+		}
+		fmt.Fprintln(out)
 	}
 	if len(visible) == 0 {
 		if showAll {
-			fmt.Fprintln(tw, "No enabled repositories.")
+			fmt.Fprintln(out, "No enabled repositories.")
 		} else {
-			fmt.Fprintln(tw, "No active repositories; use acd list --all to see every enabled repository.")
+			fmt.Fprintln(out, "No recently active repositories. Use acd list --all to see every enabled repository.")
 		}
 	}
-	if err := tw.Flush(); err != nil {
-		return err
-	}
 	if hidden > 0 {
-		_, err := fmt.Fprintf(out, "%d repositories hidden; use acd list --all\n", hidden)
+		_, err := fmt.Fprintf(out, "%d idle repositories hidden. Use acd list --all to include them.\n", hidden)
 		return err
 	}
 	return nil
 }
 
 func productListSavedWork(entry productListEntry) string {
+	if entry.ProtectionUnknown {
+		return "?"
+	}
 	if entry.PublicationOutcome.CheckpointAvailable {
 		if !entry.PublicationOutcome.CountsKnown {
 			return "?"
@@ -394,7 +388,7 @@ func productListPhase(entry productListEntry) string {
 		return entry.OperationalState
 	}
 	if entry.PublicationProgress.Phase == "protection_refresh" {
-		return "refreshing"
+		return "checking protection"
 	}
 	if entry.OperationalState == "rewriting" {
 		return "history-rewrite"
@@ -419,7 +413,7 @@ func selectProductListEntriesAt(entries []productListEntry, showAll bool, now ti
 	}
 	visible := make([]productListEntry, 0, len(entries))
 	for _, entry := range entries {
-		if entry.UnfinishedWork || entry.PendingEvents > 0 || entry.BlockedEvents > 0 ||
+		if entry.ActionRequired || entry.State == productStateNeedsAction || entry.UnfinishedWork || entry.PendingEvents > 0 || entry.BlockedEvents > 0 ||
 			(!entry.lastActivity.IsZero() && entry.lastActivity.After(now.Add(-productListActiveWindow))) {
 			visible = append(visible, entry)
 		}
@@ -454,25 +448,44 @@ func orderProductListFrame(entries []productListEntry, previous []string) ([]pro
 
 func productListDisplayStatus(entry productListEntry) string {
 	status := productListStatus(entry)
+	switch status {
+	case "waiting":
+		status = "saved, awaiting finish"
+	case "working":
+		status = "saving changes"
+	case "healthy":
+		status = "ready"
+	case "refreshing":
+		status = "checking protection"
+	}
+	if f := entry.PublicationOutcome.Finish; f != nil && (f.State == state.FinishRunning || f.State == state.FinishPrepared) {
+		status = finishStageLabel(f.Stage)
+	}
+	if h := entry.PublicationOutcome.History; h != nil {
+		status = "history rewrite: " + strings.ReplaceAll(h.State, "_", " ")
+	}
 	switch entry.CheckpointMaintenance.State {
 	case "retrying":
-		status += " (maintenance retry)"
+		status += " (cleanup retry)"
 	case "prerequisite":
 		status += " (Xcode license)"
 	case "needs_action":
-		status += " (maintenance safety check)"
+		status += " (cleanup needs review)"
 	case "over_budget":
-		status += " (checkpoint storage)"
+		status += " (storage limit reached)"
 	}
 	if entry.PublicationOutcome.Legacy.State == "needs_attention" {
-		status += " (legacy archive attention)"
+		status += " (older saved data needs review)"
 	}
 	return status
 }
 
 func productListStatus(entry productListEntry) string {
 	if f := entry.PublicationOutcome.Finish; entry.PublicationOutcome.CheckpointAvailable && f != nil && (f.State == state.FinishFailed || f.State == state.FinishNeedsAttention) {
-		return "finish " + f.State
+		if f.State == state.FinishNeedsAttention {
+			return "finish needs review"
+		}
+		return "finish failed"
 	}
 
 	switch {

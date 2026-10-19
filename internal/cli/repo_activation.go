@@ -24,12 +24,12 @@ func prepareControlRepository(ctx context.Context, lookup controlRepoLookup) (co
 		return lookup, nil, nil
 	}
 	if err := git.DurabilitySupport(ctx, lookup.Worktree.Root); err != nil {
-		return lookup, nil, fmt.Errorf("acd on: Git durability support: %w", err)
+		return lookup, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: Git durability support: %w", err)
 	}
 
 	lifecycleLock, err := globalops.AcquireUserLock(ctx, lookup.Roots.OperationsDBPath())
 	if err != nil {
-		return lookup, nil, fmt.Errorf("acd on: acquire user lifecycle lock: %w", err)
+		return lookup, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: acquire user lifecycle lock: %w", err)
 	}
 	defer lifecycleLock.Release()
 
@@ -47,28 +47,28 @@ func prepareControlRepository(ctx context.Context, lookup controlRepoLookup) (co
 
 	registry, err := central.Load(current.Roots)
 	if err != nil {
-		return current, nil, fmt.Errorf("acd on: load registry: %w", err)
+		return current, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: load registry: %w", err)
 	}
 	if registry.Version != central.RegistryVersion {
-		return current, nil, fmt.Errorf("%w: repository registry is v%d, want v%d; run `acd setup`",
+		return current, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: %w: repository registry is v%d, want v%d; run `acd setup`",
 			state.ErrSetupRequired, registry.Version, central.RegistryVersion)
 	}
 	registration, err := registry.RegisterResolvedRepo(current.Worktree, "", time.Now().Unix())
 	if err != nil {
-		return current, nil, fmt.Errorf("acd on: prepare repository registration: %w", err)
+		return current, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: prepare repository registration: %w", err)
 	}
 	record := registration.Record
 	version, versionErr := state.ReadUserVersion(ctx, record.StateDB)
 	needsMigration := errors.Is(versionErr, os.ErrNotExist) || version != state.SchemaVersion
 	if versionErr != nil && !errors.Is(versionErr, os.ErrNotExist) {
-		return current, nil, fmt.Errorf("acd on: inspect repository protection data: %w", versionErr)
+		return current, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: inspect repository protection data: %w", versionErr)
 	}
 	if version > state.SchemaVersion {
-		return current, nil, fmt.Errorf("acd on: repository protection data uses future schema v%d", version)
+		return current, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: repository protection data uses future schema v%d", version)
 	}
 	if !needsMigration {
 		if err := state.QuickCheck(ctx, record.StateDB); err != nil {
-			return current, nil, fmt.Errorf("acd on: check repository protection data: %w", err)
+			return current, nil, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: check repository protection data: %w", err)
 		}
 	}
 
@@ -79,15 +79,15 @@ func prepareControlRepository(ctx context.Context, lookup controlRepoLookup) (co
 			backupRoot := filepath.Join(current.Roots.SetupRoot(),
 				fmt.Sprintf("repo-on-%d-%s", time.Now().UnixNano(), record.WorktreeID))
 			if err := os.MkdirAll(backupRoot, 0o700); err != nil {
-				return fmt.Errorf("acd on: create repository migration backup: %w", err)
+				return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: create repository migration backup: %w", err)
 			}
 			plan, err := migration.Preflight(operationCtx, record,
 				filepath.Join(backupRoot, "state.db"))
 			if err != nil {
-				return fmt.Errorf("acd on: prepare repository protection data: %w", err)
+				return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: prepare repository protection data: %w", err)
 			}
 			if _, err := migration.ApplyAll(operationCtx, []migration.RepositoryPlan{plan}); err != nil {
-				return fmt.Errorf("acd on: upgrade repository protection data: %w", err)
+				return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: upgrade repository protection data: %w", err)
 			}
 			migrationPlan = &plan
 		}
@@ -112,7 +112,7 @@ func prepareControlRepository(ctx context.Context, lookup controlRepoLookup) (co
 			if migrationPlan != nil {
 				registryErr = errors.Join(registryErr, migration.Rollback([]migration.RepositoryPlan{*migrationPlan}))
 			}
-			return fmt.Errorf("acd on: persist repository enablement: %w", registryErr)
+			return fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: persist repository enablement: %w", registryErr)
 		}
 		if migrationPlan != nil {
 			actions = append(actions, "migrated")
@@ -147,7 +147,7 @@ func controlRepositoryNeedsPreparation(ctx context.Context, lookup controlRepoLo
 	}
 	version, err := state.ReadUserVersion(ctx, lookup.Record.StateDB)
 	if err != nil {
-		return false, fmt.Errorf("acd on: inspect repository protection data: %w", err)
+		return false, fmt.Errorf("ACD could not start protection.\nNext: run acd doctor.\nDetails: acd on: inspect repository protection data: %w", err)
 	}
 	return version != state.SchemaVersion, nil
 }

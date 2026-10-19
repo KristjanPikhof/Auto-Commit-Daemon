@@ -224,7 +224,7 @@ func executeFix(ctx context.Context, repo string, dryRun, yes, force, clearPause
 			plan.CaptureHealth = report.CaptureHealth
 			if retryErr != nil {
 				markFixIncomplete(&plan, retryErr)
-				return &plan, fmt.Errorf("acd support recover: checkpoint retry failed: %w", retryErr)
+				return &plan, fmt.Errorf("acd support recover: checkpoint retry failed\nDetails: %w", retryErr)
 			}
 		}
 		if plan.CaptureHealth.Error != "" {
@@ -244,10 +244,10 @@ func applyFixPlanWithRuntimeQuiesced(
 ) error {
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd fix: resolve runtime roots: %w", err)
+		return fmt.Errorf("acd fix: resolve runtime roots\nDetails: %w", err)
 	}
 	if err := prepareFixMutationSupervisor(ctx, roots); err != nil {
-		return fmt.Errorf("acd fix: prepare managed runtime maintenance: %w", err)
+		return fmt.Errorf("acd fix: prepare managed runtime maintenance\nDetails: %w", err)
 	}
 	return withQuiescedFixRuntime(ctx, roots, rec.RepositoryID, func(operationCtx context.Context) error {
 		fresh, buildErr := buildFixPlan(operationCtx, rec.Path, rec.StateDB, false, force, clearPause)
@@ -274,15 +274,15 @@ func markFixIncomplete(plan *fixPlan, err error) {
 func buildFixPlan(ctx context.Context, repo, stateDB string, dryRun, force, clearPause bool) (fixPlan, error) {
 	gitDir, err := resolveGitDir(ctx, repo)
 	if err != nil {
-		return fixPlan{}, fmt.Errorf("acd fix: resolve git dir: %w", err)
+		return fixPlan{}, fmt.Errorf("acd fix: resolve git dir\nDetails: %w", err)
 	}
 	branchRef, err := git.RunBranchRef(ctx, repo)
 	if err != nil {
-		return fixPlan{}, fmt.Errorf("acd fix: resolve HEAD branch: %w", err)
+		return fixPlan{}, fmt.Errorf("acd fix: resolve HEAD branch\nDetails: %w", err)
 	}
 	head, err := git.RevParse(ctx, repo, "HEAD")
 	if err != nil && !errors.Is(err, git.ErrRefNotFound) {
-		return fixPlan{}, fmt.Errorf("acd fix: resolve HEAD: %w", err)
+		return fixPlan{}, fmt.Errorf("acd fix: resolve HEAD\nDetails: %w", err)
 	}
 	if errors.Is(err, git.ErrRefNotFound) {
 		head = ""
@@ -404,7 +404,7 @@ func resolvedPublicationDrainAction(
 	return fixAction{
 		ID:             fixActionCompleteResolvedDrain + ":" + drain.ID,
 		Kind:           fixActionCompleteResolvedDrain,
-		Description:    "complete a publication run whose protected changes are already resolved",
+		Description:    "mark the older commit request complete after confirming its changes are committed or recovered",
 		Reason:         reason,
 		DrainID:        drain.ID,
 		CheckpointID:   drain.CheckpointID,
@@ -520,7 +520,7 @@ WHERE e.state IN (?, ?, ?)
 ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		queryArgs...)
 	if err != nil {
-		return fmt.Errorf("acd fix: scan unpublished recovery pairs: %w", err)
+		return fmt.Errorf("acd fix: scan unpublished recovery pairs\nDetails: %w", err)
 	}
 	defer rows.Close()
 
@@ -536,7 +536,7 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 			&semanticMessageUnavailable,
 			&stoppedPublication,
 		); err != nil {
-			return fmt.Errorf("acd fix: scan unpublished recovery row: %w", err)
+			return fmt.Errorf("acd fix: scan unpublished recovery row\nDetails: %w", err)
 		}
 		key := fmt.Sprintf("%s\x00%d", branchRef, generation)
 		pair := pairs[key]
@@ -558,7 +558,7 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		pair.stoppedPublication = pair.stoppedPublication || stoppedPublication
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("acd fix: iterate unpublished recovery rows: %w", err)
+		return fmt.Errorf("acd fix: iterate unpublished recovery rows\nDetails: %w", err)
 	}
 
 	for _, key := range order {
@@ -625,7 +625,7 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 		plan.Actions = append(plan.Actions, fixAction{
 			ID:               fmt.Sprintf("%s:%s:%d:%d", fixActionReconcileUnpublishedChain, pair.branchRef, pair.generation, pair.firstSeq),
 			Kind:             fixActionReconcileUnpublishedChain,
-			Description:      "prove or preserve the exact unpublished branch/generation chain",
+			Description:      "check older saved work and preserve it safely",
 			Reason:           strings.Join(reasonParts, "; "),
 			Seq:              pair.firstSeq,
 			BranchRef:        pair.branchRef,
@@ -649,7 +649,7 @@ func daemonAliveSQL(ctx context.Context, conn *sql.DB) (bool, string, error) {
 		return false, "", nil
 	}
 	if err != nil {
-		return false, "", fmt.Errorf("acd fix: load daemon state: %w", err)
+		return false, "", fmt.Errorf("acd fix: load daemon state\nDetails: %w", err)
 	}
 	switch mode {
 	case "running", "starting", "draining":
@@ -663,7 +663,7 @@ func daemonAliveSQL(ctx context.Context, conn *sql.DB) (bool, string, error) {
 func planManualPauseFix(ctx context.Context, gitDir string, plan *fixPlan) error {
 	marker, ok, err := ReadMarker(gitDir)
 	if err != nil {
-		return fmt.Errorf("acd fix: read manual pause marker: %w", err)
+		return fmt.Errorf("acd fix: read manual pause marker\nDetails: %w", err)
 	}
 	markerPath := pausepkg.Path(gitDir)
 	if !ok {
@@ -671,7 +671,7 @@ func planManualPauseFix(ctx context.Context, gitDir string, plan *fixPlan) error
 	}
 	markerInfo, err := os.Lstat(markerPath)
 	if err != nil {
-		return fmt.Errorf("acd fix: stat planned manual pause marker: %w", err)
+		return fmt.Errorf("acd fix: stat planned manual pause marker\nDetails: %w", err)
 	}
 	if !markerInfo.Mode().IsRegular() {
 		return fmt.Errorf("acd fix: manual pause marker %s is not a regular file", markerPath)
@@ -683,7 +683,7 @@ func planManualPauseFix(ctx context.Context, gitDir string, plan *fixPlan) error
 		plan.Actions = append(plan.Actions, fixAction{
 			ID:          fixActionClearExpiredManualPause,
 			Kind:        fixActionClearExpiredManualPause,
-			Description: "remove manual pause marker after safe recovery",
+			Description: "resume protection after recovery",
 			Reason:      "operator explicitly requested --clear-pause",
 			SetAt:       marker.SetAt,
 		})
@@ -705,7 +705,7 @@ func planManualPauseFix(ctx context.Context, gitDir string, plan *fixPlan) error
 	plan.Actions = append(plan.Actions, fixAction{
 		ID:          fixActionClearExpiredManualPause,
 		Kind:        fixActionClearExpiredManualPause,
-		Description: "remove expired manual pause marker",
+		Description: "resume protection after the pause expires",
 		Reason:      "manual pause TTL has expired",
 		SetAt:       marker.SetAt,
 	})
@@ -720,7 +720,7 @@ func planBackpressureFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error
 	}
 	setAt, ok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at")
 	if err != nil {
-		return fmt.Errorf("acd fix: read backpressure meta: %w", err)
+		return fmt.Errorf("acd fix: read backpressure meta\nDetails: %w", err)
 	}
 	if !ok {
 		return nil
@@ -729,7 +729,7 @@ func planBackpressureFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error
 	if err := conn.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStatePending).Scan(&pending); err != nil {
-		return fmt.Errorf("acd fix: count pending events: %w", err)
+		return fmt.Errorf("acd fix: count pending events\nDetails: %w", err)
 	}
 	if pending > 0 {
 		plan.Suggestions = append(plan.Suggestions, fmt.Sprintf("Capture backpressure is still active with %d pending events; wait for replay to drain or run `acd resume --accept-overflow` if accepting dropped events is intentional.", pending))
@@ -738,7 +738,7 @@ func planBackpressureFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error
 	plan.Actions = append(plan.Actions, fixAction{
 		ID:          fixActionClearDrainedBackpressure,
 		Kind:        fixActionClearDrainedBackpressure,
-		Description: "clear drained capture backpressure gate",
+		Description: "resume saving changes after the backlog has cleared",
 		Reason:      "backpressure marker is set but no pending events remain",
 		SetAt:       setAt,
 	})
@@ -748,7 +748,7 @@ func planBackpressureFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error
 func planGeneratedPendingCleanup(ctx context.Context, conn *sql.DB, repo string, plan *fixPlan) error {
 	groups, err := state.ScanGeneratedPendingDeletes(ctx, conn, state.NewSafeIgnoreMatcher(), 0)
 	if err != nil {
-		return fmt.Errorf("acd fix: scan generated pending deletes: %w", err)
+		return fmt.Errorf("acd fix: scan generated pending deletes\nDetails: %w", err)
 	}
 	if len(groups) == 0 {
 		return nil
@@ -759,7 +759,7 @@ func planGeneratedPendingCleanup(ctx context.Context, conn *sql.DB, repo string,
 	}
 	tracked, err := git.CountTrackedPathsUnder(ctx, repo, roots...)
 	if err != nil {
-		return fmt.Errorf("acd fix: count tracked generated roots: %w", err)
+		return fmt.Errorf("acd fix: count tracked generated roots\nDetails: %w", err)
 	}
 	for _, group := range groups {
 		trackedCount := tracked[group.Root]
@@ -803,9 +803,9 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	daemonLock, err := daemon.AcquireDaemonLock(plan.GitDir)
 	if err != nil {
 		if errors.Is(err, daemon.ErrDaemonLockHeld) {
-			return fmt.Errorf("acd fix: refusing while the per-repo daemon owns daemon.lock: %w", err)
+			return fmt.Errorf("acd fix: refusing while the per-repo daemon owns daemon.lock\nDetails: %w", err)
 		}
-		return fmt.Errorf("acd fix: acquire daemon.lock: %w", err)
+		return fmt.Errorf("acd fix: acquire daemon.lock\nDetails: %w", err)
 	}
 	defer func() { _ = daemonLock.Release() }()
 
@@ -837,7 +837,7 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 	}
 	plan.BackupPath = backup
 	if err := backupConn.Close(); err != nil {
-		return fmt.Errorf("acd fix: close pre-migration backup connection: %w", err)
+		return fmt.Errorf("acd fix: close pre-migration backup connection\nDetails: %w", err)
 	}
 	if plan.afterBackup != nil {
 		plan.afterBackup()
@@ -1024,11 +1024,11 @@ func openFixBackupDB(ctx context.Context, stateDB string) (*sql.DB, error) {
 func revalidateFixApplySafety(ctx context.Context, plan *fixPlan) error {
 	branchRef, err := git.RunBranchRef(ctx, plan.Repo)
 	if err != nil {
-		return fmt.Errorf("acd fix: recheck HEAD branch: %w", err)
+		return fmt.Errorf("acd fix: recheck HEAD branch\nDetails: %w", err)
 	}
 	head, err := git.RevParse(ctx, plan.Repo, "HEAD")
 	if err != nil && !errors.Is(err, git.ErrRefNotFound) {
-		return fmt.Errorf("acd fix: recheck HEAD: %w", err)
+		return fmt.Errorf("acd fix: recheck HEAD\nDetails: %w", err)
 	}
 	if errors.Is(err, git.ErrRefNotFound) {
 		head = ""
@@ -1048,7 +1048,7 @@ func revalidateFixApplySafety(ctx context.Context, plan *fixPlan) error {
 func revalidateFixPauseState(plan *fixPlan) error {
 	marker, ok, err := pausepkg.Read(plan.GitDir)
 	if err != nil {
-		return fmt.Errorf("acd fix: re-read manual pause marker: %w", err)
+		return fmt.Errorf("acd fix: re-read manual pause marker\nDetails: %w", err)
 	}
 	if plan.plannedPauseMarker == nil {
 		if ok {
@@ -1061,7 +1061,7 @@ func revalidateFixPauseState(plan *fixPlan) error {
 	}
 	info, err := os.Lstat(plan.ManualPausePath)
 	if err != nil {
-		return fmt.Errorf("acd fix: stat manual pause marker: %w", err)
+		return fmt.Errorf("acd fix: stat manual pause marker\nDetails: %w", err)
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("acd fix: manual pause marker %s is not a regular file", plan.ManualPausePath)
@@ -1092,7 +1092,7 @@ func verifyFixPostApply(ctx context.Context, conn *sql.DB, plan *fixPlan) error 
 	}
 	counts, err := loadRecoveryBlockerCounts(ctx, conn, plan.CurrentBranchRef, plan.Generation)
 	if err != nil {
-		return fmt.Errorf("acd fix: verify post-apply blockers: %w", err)
+		return fmt.Errorf("acd fix: verify post-apply blockers\nDetails: %w", err)
 	}
 	if counts.ActiveBlockedBarriersWithSuccessors > 0 || counts.FailedBarriersWithSuccessors > 0 {
 		plan.RemainingBlockers = &fixBlockerVerification{
@@ -1125,7 +1125,7 @@ func preflightFixFS(plan *fixPlan) error {
 			return err
 		}
 		if err := checkParentDirWritable(plan.ManualPausePath); err != nil {
-			return fmt.Errorf("acd fix: manual pause marker parent not writable: %w", err)
+			return fmt.Errorf("acd fix: manual pause marker parent not writable\nDetails: %w", err)
 		}
 	}
 	return nil
@@ -1180,7 +1180,7 @@ func removePlannedPauseMarker(plan *fixPlan) error {
 	if _, err := os.Lstat(plan.ManualPausePath); err == nil {
 		return fmt.Errorf("acd fix: planned pause marker removed, but a new marker was created and preserved at %s", plan.ManualPausePath)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("acd fix: check for replacement pause marker after removal: %w", err)
+		return fmt.Errorf("acd fix: check for replacement pause marker after removal\nDetails: %w", err)
 	}
 	return nil
 }
@@ -1214,11 +1214,11 @@ func preserveQuarantinedPauseMarker(originalPath, quarantinePath string, cause e
 			_ = os.Remove(filepath.Dir(quarantinePath))
 			return fmt.Errorf("acd fix: %v; current marker restored without removal at %s", cause, originalPath)
 		} else if !errors.Is(linkErr, os.ErrExist) {
-			return fmt.Errorf("acd fix: %v; marker preserved at %s after restore failed: %w",
+			return fmt.Errorf("acd fix: %v; marker preserved at %s after restore failed\nDetails: %w",
 				cause, quarantinePath, linkErr)
 		}
 	} else if err != nil {
-		return fmt.Errorf("acd fix: %v; marker preserved at %s after original-path probe failed: %w",
+		return fmt.Errorf("acd fix: %v; marker preserved at %s after original-path probe failed\nDetails: %w",
 			cause, quarantinePath, err)
 	}
 	return fmt.Errorf("acd fix: %v; marker preserved at quarantine path %s because a marker exists at %s",
@@ -1233,7 +1233,7 @@ func applyFixAction(ctx context.Context, tx *sql.Tx, action fixAction, nowSec fl
 		var changed int64
 		res, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, "capture.backpressure_paused_at")
 		if err != nil {
-			return 0, fmt.Errorf("acd fix: clear backpressure: %w", err)
+			return 0, fmt.Errorf("acd fix: clear backpressure\nDetails: %w", err)
 		}
 		if n, rerr := res.RowsAffected(); rerr == nil {
 			changed += n
@@ -1243,7 +1243,7 @@ INSERT INTO daemon_meta(key, value, updated_ts) VALUES (?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ts = excluded.updated_ts`,
 			"capture.backpressure_overridden_at", time.Now().UTC().Format(time.RFC3339), nowSec)
 		if err != nil {
-			return 0, fmt.Errorf("acd fix: stamp backpressure override: %w", err)
+			return 0, fmt.Errorf("acd fix: stamp backpressure override\nDetails: %w", err)
 		}
 		if n, rerr := res.RowsAffected(); rerr == nil {
 			changed += n
@@ -1271,7 +1271,7 @@ WHERE event_seq IN (`+placeholders+`)
       SELECT 1 FROM capture_events e
       WHERE e.seq = planner_state.event_seq AND e.state = 'pending' AND e.operation = 'delete'
   )`, args...); err != nil {
-			return 0, fmt.Errorf("acd fix: delete generated planner state for %s: %w", action.GeneratedRoot, err)
+			return 0, fmt.Errorf("acd fix: delete generated planner state for %s\nDetails: %w", action.GeneratedRoot, err)
 		}
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM capture_ops
@@ -1280,13 +1280,13 @@ WHERE event_seq IN (`+placeholders+`)
       SELECT 1 FROM capture_events e
       WHERE e.seq = capture_ops.event_seq AND e.state = 'pending' AND e.operation = 'delete'
   )`, args...); err != nil {
-			return 0, fmt.Errorf("acd fix: delete generated capture ops for %s: %w", action.GeneratedRoot, err)
+			return 0, fmt.Errorf("acd fix: delete generated capture ops for %s\nDetails: %w", action.GeneratedRoot, err)
 		}
 		eventArgs := append(int64Args(chunk), state.EventStatePending, "delete")
 		res, err := tx.ExecContext(ctx,
 			`DELETE FROM capture_events WHERE seq IN (`+placeholders+`) AND state = ? AND operation = ?`, eventArgs...)
 		if err != nil {
-			return 0, fmt.Errorf("acd fix: delete generated pending events for %s: %w", action.GeneratedRoot, err)
+			return 0, fmt.Errorf("acd fix: delete generated pending events for %s\nDetails: %w", action.GeneratedRoot, err)
 		}
 		n, _ := res.RowsAffected()
 		changed += n
@@ -1329,7 +1329,7 @@ func clearPublishBarrierIfSafe(ctx context.Context, tx *sql.Tx, nowSec float64) 
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
 		state.EventStateBlockedConflict).Scan(&blocked); err != nil {
-		return fmt.Errorf("acd fix: count remaining blocked conflicts: %w", err)
+		return fmt.Errorf("acd fix: count remaining blocked conflicts\nDetails: %w", err)
 	}
 	if blocked > 0 {
 		return nil
@@ -1350,7 +1350,7 @@ WHERE id = 1`, nowSec); err != nil {
 		"replay.error_last_seen_ts",
 	} {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, key); err != nil {
-			return fmt.Errorf("acd fix: clear daemon_meta %s: %w", key, err)
+			return fmt.Errorf("acd fix: clear daemon_meta %s\nDetails: %w", key, err)
 		}
 	}
 	return nil
@@ -1370,7 +1370,7 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 	} else if !plan.DryRun {
 		mode = "checked"
 	}
-	fmt.Fprintf(out, "Fix %s for %s\n", mode, plan.Repo)
+	fmt.Fprintf(out, "Recovery %s for %s\n", mode, plan.Repo)
 	if plan.CurrentBranchRef != "" || plan.CurrentHead != "" {
 		fmt.Fprintf(out, "Anchor: %s @ %s generation=%d\n",
 			valueOrUnset(plan.CurrentBranchRef), valueOrUnset(plan.CurrentHead), plan.Generation)
@@ -1380,7 +1380,7 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 	}
 	if len(plan.Actions) == 0 {
 		if plan.CaptureHealth.Error != "" {
-			fmt.Fprintf(out, "No publication repair applies. Checkpoint protection is incomplete: %s\n", plan.CaptureHealth.Error)
+			fmt.Fprintf(out, "Saving changes is incomplete. No commit recovery applies.\nReason: %s\n", plan.CaptureHealth.Error)
 		} else if len(plan.Unsafe) == 0 && !plan.Incomplete {
 			fmt.Fprintln(out, "Repository recovery state is healthy; no changes are needed.")
 		} else {
@@ -1418,19 +1418,19 @@ func renderFix(out io.Writer, plan fixPlan, jsonOut bool) error {
 		}
 	}
 	if len(plan.Unsafe) > 0 {
-		fmt.Fprintln(out, "Unsafe:")
+		fmt.Fprintln(out, "Cannot apply safely:")
 		for _, item := range plan.Unsafe {
 			fmt.Fprintf(out, "- %s\n", item)
 		}
 	}
 	if len(plan.Suggestions) > 0 {
-		fmt.Fprintln(out, "Suggested manual steps:")
+		fmt.Fprintln(out, "Next steps:")
 		for _, item := range plan.Suggestions {
 			fmt.Fprintf(out, "- %s\n", item)
 		}
 	}
 	if plan.Incomplete || len(plan.VerifyErrors) > 0 {
-		fmt.Fprintln(out, "Fix incomplete:")
+		fmt.Fprintln(out, "Recovery incomplete:")
 		for _, item := range plan.VerifyErrors {
 			fmt.Fprintf(out, "- %s\n", item)
 		}

@@ -13,6 +13,9 @@
 
 ### Changed
 
+- Keep offline setup, saved-plan editing, and history safety details in command help.
+- Show unknown change counts while repository protection is being checked.
+
 - File edits, hooks, idle time, and shutdown save checkpoints without AI,
   credentials, project checks, or new publication. Startup can settle a previously
   authorized prepared mutation only from its exact saved proof. `acd off` saves
@@ -35,6 +38,17 @@
   commits, recovery preservation, active requests, and required user action.
 
 ### Fixed
+
+- Shorten console messages, help, settings labels, and next steps. Keep technical
+  causes in diagnostic details and preserve machine-readable values.
+- Keep repositories requiring action visible in `list`, show their next step,
+  and use readable repository blocks. Redirected watch output has no screen
+  control characters. Quiet startup hides the optional waiting line.
+- Report completed history rewrites, show uninstall plans before confirmation,
+  and warn when forced stop cannot confirm the latest save. Show status errors
+  once and direct blocked finish requests to doctor rather than retry.
+- Distinguish project commands that ran, reused results, structure-only checks,
+  and unconfigured checks. The uninstall script uses the reviewed CLI workflow.
 
 - Keep stopped repositories stopped during uninstall instead of waiting for
   absent workers or restarting a prepared finish.

@@ -33,7 +33,7 @@ func withQuiescedRepositoryRuntimeForCommand(
 	}
 	registry, err := central.Load(roots)
 	if err != nil {
-		return fmt.Errorf("%s: load registry for runtime maintenance: %w", command, err)
+		return fmt.Errorf("%s: load registry for runtime maintenance\nDetails: %w", command, err)
 	}
 	enabled := make([]central.RepoRecord, 0)
 	for _, record := range registry.Repos {
@@ -46,7 +46,7 @@ func withQuiescedRepositoryRuntimeForCommand(
 	defer cancelCheckpoints()
 	for _, record := range enabled {
 		if err := checkpointWorktreeBeforeMaintenance(checkpointCtx, client, repositoryID, record.WorktreeID); err != nil {
-			return fmt.Errorf("%s: protect worktree %s before maintenance: %w", command, record.Path, err)
+			return fmt.Errorf("%s: protect worktree %s before maintenance\nDetails: %w", command, record.Path, err)
 		}
 	}
 
@@ -56,7 +56,7 @@ func withQuiescedRepositoryRuntimeForCommand(
 		DeadlineMS: time.Now().Add(30 * time.Second).UnixMilli(),
 	})
 	if err != nil {
-		return fmt.Errorf("%s: stop shared repository worker: %w", command, err)
+		return fmt.Errorf("%s: stop shared repository worker\nDetails: %w", command, err)
 	}
 	if beginResponse.Error != nil {
 		return fmt.Errorf("%s: stop shared repository worker: %s", command, beginResponse.Error.Message)
@@ -91,7 +91,7 @@ func withQuiescedRepositoryRuntimeForCommand(
 	}
 	endCancel()
 	if endErr != nil {
-		endErr = fmt.Errorf("%s: restore shared repository worker: %w", command, endErr)
+		endErr = fmt.Errorf("%s: restore shared repository worker\nDetails: %w", command, endErr)
 	}
 	return errors.Join(operationErr, renewErr, endErr)
 }

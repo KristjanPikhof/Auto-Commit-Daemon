@@ -73,7 +73,7 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(target), &r.Target); err != nil {
-		return nil, fmt.Errorf("finish target: %w", err)
+		return nil, fmt.Errorf("ACD could not read the saved finish details.\nNext: run acd doctor.\nDetails: finish target: %w", err)
 	}
 	report := &finishStatusReport{
 		RequestID: r.ID, Attempt: r.Attempt, State: r.State, Stage: r.Stage,
@@ -85,7 +85,7 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 	if result != "" {
 		var saved daemon.FinishResult
 		if err := json.Unmarshal([]byte(result), &saved); err != nil {
-			return nil, fmt.Errorf("finish result: %w", err)
+			return nil, fmt.Errorf("ACD could not read the saved finish details.\nNext: run acd doctor.\nDetails: finish result: %w", err)
 		}
 		report.Published = saved.Published
 		report.NoChanges = saved.NoChanges
@@ -95,7 +95,7 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 	if plan != "" {
 		var saved daemon.FinishSavedPlan
 		if err := json.Unmarshal([]byte(plan), &saved); err != nil {
-			return nil, fmt.Errorf("finish checks: %w", err)
+			return nil, fmt.Errorf("ACD could not read the saved finish details.\nNext: run acd doctor.\nDetails: finish checks: %w", err)
 		}
 		for _, step := range saved.Steps {
 			if step.Check.TreeOID != "" {
@@ -145,7 +145,7 @@ func readFinishStatusReport(ctx context.Context, rec central.RepoRecord, now tim
 		return report, err
 	}
 	if schema > state.SchemaVersion {
-		return report, fmt.Errorf("state schema %d is newer than supported %d", schema, state.SchemaVersion)
+		return report, fmt.Errorf("ACD could not check protection.\nNext: run acd doctor.\nDetails: state schema %d is newer than supported %d", schema, state.SchemaVersion)
 	}
 	if schema < 20 {
 		return report, nil
@@ -257,7 +257,7 @@ func readFinishStatusReport(ctx context.Context, rec central.RepoRecord, now tim
 			outcome.Protected = false
 			report.CaptureErrors = max(1, report.CaptureErrors)
 			report.CaptureHealth.State = "blocked"
-			report.CaptureHealth.Error = "Checkpoint protection could not be verified: " + proofErr.Error()
+			report.CaptureHealth.Error = "ACD could not verify the saved checkpoint: " + proofErr.Error()
 			report.CaptureHealth.CheckpointID = cp.ID
 			report.CaptureHealth.IssueCount = max(1, report.CaptureHealth.IssueCount)
 		} else {
@@ -266,7 +266,7 @@ func readFinishStatusReport(ctx context.Context, rec central.RepoRecord, now tim
 				outcome.Protected = false
 			}
 			if cp.Partial && report.CaptureHealth.Error == "" {
-				report.CaptureHealth = state.CaptureHealth{State: "blocked", Error: "Some eligible files could not be checkpointed.", CheckpointID: cp.ID, IssueCount: len(cp.CaptureIssues), Issues: cp.CaptureIssues}
+				report.CaptureHealth = state.CaptureHealth{State: "blocked", Error: "ACD could not save some files included in protection.", CheckpointID: cp.ID, IssueCount: len(cp.CaptureIssues), Issues: cp.CaptureIssues}
 			}
 			count, err := finishSavedChangeCount(ctx, scope, rec.Path, head, cp.TreeOID)
 			if errors.Is(err, errFinishScopeUnknown) {
@@ -507,18 +507,18 @@ func finishStatusSummary(f *finishStatusReport) string {
 			return "No changes to commit."
 		}
 		if f.Published {
-			return fmt.Sprintf("Completed: %d commit(s) on the branch.", f.CommitsCreated)
+			return commitCountLabel(f.CommitsCreated)
 		}
 	case state.FinishFailed:
-		return "Failed: " + f.Reason + " Work remains saved."
+		return "Failed: " + consoleCause(f.Reason) + " The requested changes remain saved."
 	case state.FinishNeedsAttention:
-		return "Publication needs attention: " + f.Reason + " Work remains saved."
+		return "Needs attention: " + consoleCause(f.Reason) + " The requested changes remain saved."
 	}
 	stage := f.Stage
 	if stage == "" {
 		stage = f.State
 	}
-	return "Running: " + stage + "; work remains saved."
+	return finishStageLabel(stage)
 }
 
 func finishStatusTakesPriority(f *finishStatusReport) bool {
@@ -542,7 +542,7 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 	res.CaptureHealth = report.CaptureHealth
 	res.PublicationProgress = report.PublicationProgress
 	res.NextAction = "No action needed."
-	res.Summary = "Last observed work is saved."
+	res.Summary = "The changes ACD last checked are saved."
 	switch {
 	case report.Stale || report.Daemon != "running" || !alive:
 		res.OK = false
@@ -552,8 +552,8 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 	case report.CaptureHealth.Error != "":
 		res.OK = false
 		res.Health = controlHealthNeedsAttention
-		res.Summary = "Checkpoint protection is incomplete: " + report.CaptureHealth.Error
-		res.NextAction = "Run `acd doctor` to inspect unreadable or unstable files. Readable work remains saved."
+		res.Summary = "Some changes could not be saved: " + report.CaptureHealth.Error
+		res.NextAction = "Run acd doctor to see which files could not be saved. Other readable changes remain saved."
 		if report.CaptureHealth.State == "retrying" {
 			res.OK = true
 			res.Health = controlHealthWaiting
@@ -568,12 +568,12 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 		if f := report.PublicationOutcome.Finish; f != nil {
 			res.Summary = finishStatusSummary(f)
 			if f.State == state.FinishFailed {
-				res.NextAction = "Run `acd finish --retry " + f.RequestID + "` to retry the saved target."
+				res.NextAction = "After resolving the cause, run `acd finish --retry " + f.RequestID + "` to retry the same saved changes."
 			}
 			if f.State == state.FinishNeedsAttention {
 				res.OK = false
 				res.Health = controlHealthNeedsAttention
-				res.NextAction = "Run `acd doctor` to inspect the saved publication proof."
+				res.NextAction = "Run acd doctor to review the interrupted commit."
 			}
 		}
 		if res.NextAction == "No action needed." && (report.PublicationOutcome.PendingChanges > 0 || report.PublicationOutcome.WorktreeChanges > 0 || !report.PublicationOutcome.CountsKnown) {
@@ -581,14 +581,14 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 		}
 	}
 	if legacy := report.PublicationOutcome.Legacy; legacy.State == "needs_attention" && res.OK {
-		res.Summary += " Legacy work remains preserved: " + legacyAttentionSummary(legacy.Reason)
+		res.Summary += " Older saved work is retained separately."
 	}
 	if h := report.PublicationOutcome.History; h != nil && res.OK && !finishStatusTakesPriority(report.PublicationOutcome.Finish) && (h.State == "running" || h.State == "prepared" || h.State == "needs_attention") {
 		res.Summary = "History plan " + h.PlanID + ": " + h.State + ". Checkpoint protection continues."
 		if h.State == "needs_attention" {
 			res.OK = false
 			res.Health = controlHealthNeedsAttention
-			res.NextAction = "Run `acd doctor` to inspect the saved history proof."
+			res.NextAction = "Run acd doctor to review the interrupted history rewrite."
 		}
 	}
 	applyMaintenanceStatus(res, report)
@@ -596,45 +596,39 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 
 func renderFinishStatusChecks(out io.Writer, f *finishStatusReport) {
 	for _, check := range f.Verification {
-		fmt.Fprintf(out, "Check: %s, %s", check.Policy, check.Result.Status)
-		if check.Executed {
-			fmt.Fprint(out, " (executed)")
-		} else if check.Reused {
-			fmt.Fprint(out, " (reused)")
-		}
-		fmt.Fprintln(out)
+		fmt.Fprintln(out, finishCheckLabel(check))
 	}
 }
 
 func renderFinishUncommitted(out io.Writer, outcome publicationOutcome) {
 	if outcome.CountsKnown {
-		fmt.Fprintf(out, "Uncommitted work: %d saved path(s), %d current worktree path(s)\n", outcome.PendingChanges, outcome.WorktreeChanges)
+		fmt.Fprintf(out, "Changes outside Git commits: %d saved, %d currently in your files\n", outcome.PendingChanges, outcome.WorktreeChanges)
 		return
 	}
-	fmt.Fprintf(out, "Uncommitted work: saved scope incomplete, %d current worktree path(s)\n", outcome.WorktreeChanges)
+	fmt.Fprintf(out, "Changes outside Git commits: saved count unavailable; %d currently in your files\n", outcome.WorktreeChanges)
 }
 
 func renderFinishOutcomeHuman(out io.Writer, outcome publicationOutcome) {
-	fmt.Fprintf(out, "Last observed work saved: %s\n", yesNo(outcome.Protected))
+	fmt.Fprintf(out, "Last checked changes saved: %s\n", yesNo(outcome.Protected))
 	renderFinishUncommitted(out, outcome)
 	if f := outcome.Finish; f != nil {
-		fmt.Fprintf(out, "Finish %s: %s\n", f.RequestID, finishStatusSummary(f))
+		fmt.Fprintf(out, "Finish: %s\n", consoleProse(finishStatusSummary(f)))
 		renderFinishStatusChecks(out, f)
 	}
 	if h := outcome.History; h != nil {
-		fmt.Fprintf(out, "History plan %s: %s\n", h.PlanID, h.State)
+		fmt.Fprintf(out, "History rewrite: %s\nPlan: %s\n", h.PlanID, h.State)
 	}
 	if legacy := outcome.Legacy; legacy.State == "needs_attention" {
 		renderLegacyAttention(out, legacy)
 	}
 	if outcome.Legacy.Unpublished > 0 {
-		fmt.Fprintf(out, "Legacy archive: %d captured version(s) retained separately\n", outcome.Legacy.Unpublished)
+		fmt.Fprintf(out, "Older saved versions: %d retained\n", outcome.Legacy.Unpublished)
 	}
 	if outcome.RecoveredChanges > 0 {
-		fmt.Fprintf(out, "Recovery: %d legacy changes saved separately\n", outcome.RecoveredChanges)
+		fmt.Fprintf(out, "Recovery: %d older changes saved separately from the branch\n", outcome.RecoveredChanges)
 	}
 	if outcome.LaterChanges > 0 {
-		fmt.Fprintf(out, "Later work: %d changed path(s), separate from finish target\n", outcome.LaterChanges)
+		fmt.Fprintf(out, "Later changes: %d changed items for the next finish\n", outcome.LaterChanges)
 	}
 }
 

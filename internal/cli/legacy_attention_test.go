@@ -28,8 +28,11 @@ func TestLegacyAttentionBoundsHumanEvidenceWithoutHidingRecovery(t *testing.T) {
 	if err := renderProductEnvelope(&product, envelopeFromControl(result), false); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{"summary": result.Summary, "shared": shared.String(), "product": product.String()} {
-		if len(body) > 1500 || !strings.Contains(body, "legacy blob abc") || !strings.Contains(body, "acd support diagnose --json") {
+	if !strings.Contains(result.Summary, "Older saved work is retained separately") {
+		t.Fatalf("summary hid retained work: %q", result.Summary)
+	}
+	for name, body := range map[string]string{"shared": shared.String(), "product": product.String()} {
+		if len(body) > 1500 || !strings.Contains(body, "Older saved data needs review") || !strings.Contains(body, "acd support diagnose --json") {
 			t.Fatalf("%s lost useful evidence or flooded output: %q", name, body)
 		}
 	}

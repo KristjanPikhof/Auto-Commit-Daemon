@@ -153,7 +153,7 @@ func selectionConfirmations(selection settingsui.ConfigureSelection) []ai.Confir
 
 func rollbackConfigureCredential(roots paths.Roots, changed, previousSet bool, previous string) string {
 	if !changed {
-		return "not needed"
+		return "No API key restore was needed."
 	}
 	var err error
 	if previousSet {
@@ -164,9 +164,9 @@ func rollbackConfigureCredential(roots paths.Roots, changed, previousSet bool, p
 	clearString := []byte(previous)
 	clearBytes(clearString)
 	if err != nil {
-		return "protected credential restore failed; use `acd auth status` and `acd auth set --stdin`"
+		return "The previous API key could not be restored. Run acd config credentials status, then acd config credentials set --stdin."
 	}
-	return "protected credential restored"
+	return "The previous API key was restored."
 }
 
 func safePreviewText(value string, limit int) string {

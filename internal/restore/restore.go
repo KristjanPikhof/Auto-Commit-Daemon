@@ -201,7 +201,7 @@ func PreviewWithPolicy(
 		target: target, changes: changes, current: current, policy: policy,
 	}
 	if counts.StagedOverlap > 0 {
-		plan.Refusal = "restore overlaps staged paths; commit or unstage them first"
+		plan.Refusal = "The restore would change staged files. Review the staged selection before restoring."
 	}
 	plan.PlanDigest = digestPlan(plan)
 	return plan, nil
@@ -429,7 +429,7 @@ func PreviewRepair(ctx context.Context, db *state.DB) (RepairPlan, error) {
 		plan.PreCheckpoint = operation.PreCheckpointID.String
 	}
 	if plan.PreCheckpoint == "" {
-		plan.Refusal = "restore pre-checkpoint identity is missing"
+		plan.Refusal = "ACD cannot verify the undo snapshot for this restore. Run acd doctor."
 		return plan, nil
 	}
 	plan.CanRepair = true
@@ -1273,7 +1273,7 @@ func rollback(
 			continue
 		}
 		if !stored.Exists || !stored.Mode.IsRegular() {
-			combined = errors.Join(combined, fmt.Errorf("restore: durable preimage for %s is missing", entry.Path))
+			combined = errors.Join(combined, fmt.Errorf("Durable original file copy for %s is missing.", entry.Path))
 			continue
 		}
 		if entry.Symlink {
@@ -1309,7 +1309,7 @@ func manifestHasAncestor(entries []backupEntry, relative string) bool {
 
 func backupFilePath(backupRelative string, entry backupEntry) (string, error) {
 	if entry.BackupFile == "" || filepath.Base(entry.BackupFile) != entry.BackupFile {
-		return "", fmt.Errorf("restore: unsafe backup identity for %s", entry.Path)
+		return "", fmt.Errorf("Unsafe backup identity for %s.", entry.Path)
 	}
 	return backupRelative + "/" + entry.BackupFile, nil
 }

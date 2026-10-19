@@ -1,6 +1,6 @@
 # Pi integration
 
-Install or update transactionally:
+Install or update:
 
 ~~~bash
 acd setup --integrations=pi

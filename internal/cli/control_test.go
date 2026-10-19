@@ -421,7 +421,7 @@ func TestApplyControlStatusStorageWarningDoesNotGateCurrentWorkOnLegacyArchive(t
 	report := statusReport{Daemon: "running", PID: os.Getpid(), Protected: true, CheckpointRetentionOverBudget: true, PublicationOutcome: publicationOutcome{Legacy: state.FinishLegacyCutover{State: "needs_attention", Reason: "Saved legacy proof needs inspection"}}}
 	result := controlResult{}
 	applyControlStatus(&result, report)
-	if !result.OK || !result.Protected || result.Health != controlHealthNeedsAttention || !strings.Contains(result.NextAction, "acd doctor") || !strings.Contains(result.Summary, "Legacy work remains preserved") || strings.Count(result.Summary, "exceed the storage budget") != 1 {
+	if !result.OK || !result.Protected || result.Health != controlHealthNeedsAttention || !strings.Contains(result.NextAction, "acd doctor") || !strings.Contains(result.Summary, "Older saved work is retained separately") || strings.Count(result.Summary, "uses more space than ACD's storage limit") != 1 {
 		t.Fatalf("maintenance hid remediation or duplicated output: %+v", result)
 	}
 }
@@ -566,19 +566,19 @@ func TestApplySupervisorWorkerFailureProvidesRepairThatMatchesCause(t *testing.T
 		{
 			name:    "safe schema upgrade",
 			error:   "acd worker: open /repo: state: checkpoint-first setup required: state database schema is v20, want v21",
-			summary: "safe schema upgrade",
-			next:    "Run `acd setup`",
+			summary: "saved data needs an upgrade",
+			next:    "Run acd setup",
 		},
 		{
 			name:    "old owner",
 			error:   "acd worker: acquire repository ownership: already owned",
-			summary: "older worker",
-			next:    "Run `acd on`",
+			summary: "older ACD process",
+			next:    "Run acd on",
 		},
 		{
 			name:    "unknown startup failure",
 			error:   "acd worker: provider configuration is invalid",
-			summary: "startup error",
+			summary: "could not restart protection",
 			next:    "acd support logs --lines 100",
 		},
 	}
@@ -599,15 +599,19 @@ func TestApplySupervisorWorkerFailureProvidesRepairThatMatchesCause(t *testing.T
 
 func TestRenderProductDoctorWorkerShowsCauseAndFix(t *testing.T) {
 	var out bytes.Buffer
-	renderProductDoctorWorker(&out, controlResult{
+	status := controlResult{
 		SupervisorWorkerState: "needs_action", SupervisorWorkerRestarts: 5,
 		SupervisorWorkerError: "schema is v20, want v21",
 		NextAction:            "Run `acd on` to repair it.",
-	})
+	}
+	if err := renderProductEnvelope(&out, envelopeFromControl(status), false); err != nil {
+		t.Fatal(err)
+	}
+	renderProductDoctorWorker(&out, status)
 	for _, want := range []string{
-		"State: needs action after 5 restart attempt(s)",
-		"Cause: schema is v20, want v21",
-		"Fix: Run `acd on` to repair it.",
+		"Status: needs action after 5 attempts to restart",
+		"Details: schema is v20, want v21",
+		"Next: Run `acd on` to repair it.",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("doctor output missing %q:\n%s", want, out.String())
@@ -623,7 +627,7 @@ func TestControlBareHumanAnswersProtectionQuestions(t *testing.T) {
 	if err := runControlStatus(context.Background(), &out, repo, false); err != nil {
 		t.Fatalf("runControlStatus: %v", err)
 	}
-	for _, line := range []string{"Protection:", "Last observed work saved:", "Branch commits:", "Next:"} {
+	for _, line := range []string{"Protection:", "Last checked changes saved:", "Git commits:", "Next:"} {
 		if got := strings.Count(out.String(), line); got != 1 {
 			t.Fatalf("%s line count=%d\n%s", line, got, out.String())
 		}
@@ -669,7 +673,7 @@ func decodeControlResult(t *testing.T, body []byte) controlResult {
 	} else if envelope.State == productStateNeedsAction {
 		health = controlHealthNeedsAttention
 	}
-	if envelope.Data.Summary == "The current directory is not inside a Git worktree." {
+	if envelope.Data.Summary == "This directory is not inside a Git repository." {
 		health = controlHealthNotRepo
 	}
 	actions := make([]string, 0, len(envelope.Actions))

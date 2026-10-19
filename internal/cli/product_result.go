@@ -152,38 +152,47 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 	if !ok {
 		return fmt.Errorf("acd: unsupported human result %T", envelope.Data)
 	}
+	for _, action := range envelope.Actions {
+		if action.Kind == "checkpoint_unconfirmed" {
+			fmt.Fprintln(out, "Protection stopped. ACD could not confirm that the latest eligible changes are saved.")
+		}
+	}
 	fmt.Fprintf(out, "Protection: %s\n", onOff(data.Enabled))
-	fmt.Fprintf(out, "Last observed work saved: %s\n", yesNo(data.Protected))
-	fmt.Fprintf(out, "Branch commits: %s\n", publicationOutcomeLabel(data.PublicationOutcome, data.PublicationProgress))
+	fmt.Fprintf(out, "Last checked changes saved: %s\n", yesNo(data.Protected))
+	fmt.Fprintf(out, "Git commits: %s\n", publicationOutcomeLabel(data.PublicationOutcome, data.PublicationProgress))
 	if data.PublicationOutcome.CheckpointAvailable {
-		renderFinishUncommitted(out, data.PublicationOutcome)
+		if !data.PublicationOutcome.CountsKnown || data.PublicationOutcome.WorktreeChanges != data.PublicationOutcome.PendingChanges {
+			renderFinishUncommitted(out, data.PublicationOutcome)
+		}
 		if f := data.PublicationOutcome.Finish; f != nil {
-			fmt.Fprintf(out, "Finish %s: %s\n", f.RequestID, finishStatusSummary(f))
+			fmt.Fprintf(out, "Finish: %s\n", consoleProse(finishStatusSummary(f)))
 			renderFinishStatusChecks(out, f)
 		}
 		if data.PublicationOutcome.LaterChanges > 0 {
-			fmt.Fprintf(out, "Later work: %d changed path(s), separate from the finish target\n", data.PublicationOutcome.LaterChanges)
+			fmt.Fprintf(out, "Later changes: %d changed items for the next finish\n", data.PublicationOutcome.LaterChanges)
 		}
-		worker := "not responsive"
-		if data.PublicationProgress.WorkerResponsive {
-			worker = "responsive"
-		}
-		fmt.Fprintf(out, "Worker: %s; heartbeat %ds ago\n", worker, data.PublicationProgress.HeartbeatAgeSeconds)
+
 	}
 	if h := data.PublicationOutcome.History; h != nil {
-		fmt.Fprintf(out, "History plan %s: %s\n", h.PlanID, h.State)
+		fmt.Fprintf(out, "History rewrite: %s\n", safePreviewText(strings.ReplaceAll(h.State, "_", " "), 0))
 	}
 	if legacy := data.PublicationOutcome.Legacy; legacy.State == "needs_attention" {
 		renderLegacyAttention(out, legacy)
 	}
 	if data.PublicationOutcome.Legacy.Unpublished > 0 {
-		fmt.Fprintf(out, "Legacy archive: %d captured version(s) retained separately\n", data.PublicationOutcome.Legacy.Unpublished)
+		fmt.Fprintf(out, "Older saved versions: %d retained\n", data.PublicationOutcome.Legacy.Unpublished)
 	}
 	if data.PublicationOutcome.RecoveredChanges > 0 {
-		fmt.Fprintf(out, "Recovery: %d changes saved separately\n", data.PublicationOutcome.RecoveredChanges)
+		fmt.Fprintf(out, "Recovery: %d changes saved separately from the branch\n", data.PublicationOutcome.RecoveredChanges)
 	}
-	if data.ActionRequired && data.Summary != "" {
-		fmt.Fprintf(out, "Status: %s\n", data.Summary)
+	if data.ActionRequired && data.Summary != "" && data.PublicationOutcome.Finish == nil {
+		summary := data.Summary
+		if maintenance := data.CheckpointMaintenance.Summary(); maintenance != "" {
+			if before, _, found := strings.Cut(summary, maintenance); found {
+				summary = before + maintenance
+			}
+		}
+		fmt.Fprintf(out, "Status: %s\n", consoleProse(summary))
 
 	}
 	if envelope.NextAction == nil {
@@ -200,18 +209,18 @@ func publicationOutcomeLabel(outcome publicationOutcome, progress publicationPro
 			return "unknown"
 		}
 		if *outcome.BranchCommitted {
-			return "saved work is on the current branch"
+			return "saved work is committed on this branch"
 		}
-		return fmt.Sprintf("%d saved path(s) await finish", outcome.PendingChanges)
+		return fmt.Sprintf("%d saved items waiting for acd finish", outcome.PendingChanges)
 	}
 	if outcome.BranchCommitted == nil {
 		return "unknown"
 	}
 	if outcome.PendingClassification && outcome.WaitingChanges == 0 {
-		return "saved changes waiting for grouping"
+		return "older saved changes awaiting review"
 	}
 	if outcome.WaitingChanges > 0 {
-		return fmt.Sprintf("%d changes waiting (%s)", outcome.WaitingChanges, publicationProgressPhaseLabel(progress))
+		return fmt.Sprintf("%d older changes awaiting review (%s)", outcome.WaitingChanges, publicationProgressPhaseLabel(progress))
 	}
 	if *outcome.BranchCommitted {
 		return "up to date"
@@ -226,27 +235,23 @@ func renderProductPublicationProgress(out io.Writer, progress publicationProgres
 	if progress.Strategy != "" {
 		fmt.Fprintf(out, "Finish mode: %s\n", progress.Strategy)
 	}
-	fmt.Fprintf(out, "Observed activity: %s\n", publicationProgressPhaseLabel(progress))
+	fmt.Fprintf(out, "Current activity: %s\n", publicationProgressPhaseLabel(progress))
 	if progress.LastProgressTS > 0 {
-		fmt.Fprintf(out, "Last protection progress: %s ago\n", formatDurationCompact(time.Duration(progress.LastProgressAgeSeconds)*time.Second))
+		fmt.Fprintf(out, "Last save progress: %s ago\n", formatDurationCompact(time.Duration(progress.LastProgressAgeSeconds)*time.Second))
 	}
-	worker := "not responsive"
-	if progress.WorkerResponsive {
-		worker = "responsive"
-	}
-	fmt.Fprintf(out, "Worker: %s; heartbeat %ds ago\n", worker, progress.HeartbeatAgeSeconds)
+
 }
 
 func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 	switch progress.Phase {
 	case "capture_retry", "capture_blocked", "protection_incomplete":
-		return "incomplete capture; checkpoint protection needs attention"
+		return "some changes could not be saved"
 	case "protection_refresh":
 		return "saving observed work"
 	case "saved":
 		return "saved; ready for finish"
 	default:
-		return strings.ReplaceAll(progress.Phase, "_", " ")
+		return "activity unavailable"
 	}
 }
 

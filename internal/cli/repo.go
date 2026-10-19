@@ -74,8 +74,8 @@ func newRepoListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List every registered repository",
-		Long: `List all repository registrations, including repositories that are
-disabled, missing, stopped, or missing their ACD database.
+		Long: `List all repository registrations, including repositories that are disabled,
+missing, stopped, or missing their ACD database.
 
 Use acd list for the simpler dashboard of enabled repositories. This command
 is intended for registration cleanup and troubleshooting.`,
@@ -94,7 +94,7 @@ func runRepoManageWithInput(ctx context.Context, out io.Writer, in io.Reader, ve
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd repo manage: resolve paths: %w", err)
+		return fmt.Errorf("acd repo manage: resolve paths\nDetails: %w", err)
 	}
 	mode := repoManageCompact
 	if verbose {
@@ -112,7 +112,7 @@ func runRepoManageWithInput(ctx context.Context, out io.Writer, in io.Reader, ve
 		fmt.Fprint(out, "repo manage> ")
 		line, readErr := reader.ReadString('\n')
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return fmt.Errorf("acd repo manage: read command: %w", readErr)
+			return fmt.Errorf("acd repo manage: read command\nDetails: %w", readErr)
 		}
 		cmd := strings.TrimSpace(line)
 		if cmd == "" {
@@ -134,7 +134,7 @@ func runRepoManageWithInput(ctx context.Context, out io.Writer, in io.Reader, ve
 func loadRepoManagementEntries(ctx context.Context, roots paths.Roots) ([]repoListEntry, error) {
 	reg, err := central.Load(roots)
 	if err != nil {
-		return nil, fmt.Errorf("acd repo manage: load registry: %w", err)
+		return nil, fmt.Errorf("acd repo manage: load registry\nDetails: %w", err)
 	}
 	return collectRepoManagementEntries(ctx, reg.Repos), nil
 }
@@ -212,12 +212,14 @@ func newRepoRemoveCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "remove",
 		Short: "Preview or remove a repository registration",
-		Long: `Preview or remove one repository from ACD's registry.
+		Long: `Preview removal of an ACD repository registration.
 
-Use --dry-run for a read-only preview. Add --yes to remove the registration and
-its start cache. Protected checkpoints and the repository database are kept
-unless you also pass --purge-state. Without flags, the command opens the
-interactive repository manager.`,
+Use --dry-run to see the plan. Add --yes to stop protection and remove the
+registration. Saved ACD data stays available unless you also use
+--purge-state. Permanent deletion requires a separate confirmation.
+
+With no selection flags, choose repositories from an interactive list. To
+temporarily stop protection and keep registration, use acd off.`,
 		Example: `  acd repo remove
   acd repo remove --repo /path/to/repo
   acd repo remove --dry-run
@@ -242,11 +244,11 @@ func collectRepoList(ctx context.Context) ([]repoListEntry, error) {
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return nil, fmt.Errorf("acd repo list: resolve paths: %w", err)
+		return nil, fmt.Errorf("acd repo list: resolve paths\nDetails: %w", err)
 	}
 	reg, err := central.Load(roots)
 	if err != nil {
-		return nil, fmt.Errorf("acd repo list: load registry: %w", err)
+		return nil, fmt.Errorf("acd repo list: load registry\nDetails: %w", err)
 	}
 	return collectRepoManagementEntries(ctx, reg.Repos), nil
 }
@@ -263,19 +265,12 @@ func runRepoList(ctx context.Context, out io.Writer, jsonOut bool) error {
 			Repos []repoListEntry `json:"repos"`
 		}{Repos: entries})
 	}
-	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "REPOSITORY\tWORKER\tTOOLS\tWAITING\tBLOCKED\tSTATUS")
 	for _, entry := range entries {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%d\t%s\n",
-			homeShort(entry.Path),
-			repoEntryDaemon(entry),
-			entry.Clients,
-			entry.PendingEvents,
-			entry.BlockedConflicts,
-			entry.Status)
-	}
-	if err := tw.Flush(); err != nil {
-		return fmt.Errorf("acd repo list: flush: %w", err)
+		fmt.Fprintf(out, "%s\n  Registration: saved | Protection: %s\n  Status: %s\n",
+			safePreviewText(homeShort(entry.Path), 0), safePreviewText(repoEntryDaemon(entry), 0), consoleProse(entry.Status))
+		if entry.PendingEvents > 0 || entry.BlockedConflicts > 0 {
+			fmt.Fprintf(out, "  Archived waiting records: %d | Archived blocked records: %d\n", entry.PendingEvents, entry.BlockedConflicts)
+		}
 	}
 	if len(entries) == 0 {
 		fmt.Fprintln(out, "No repositories are registered.")
@@ -342,7 +337,7 @@ func applyRepoLifecycle(ctx context.Context, roots paths.Roots, target central.R
 	}
 	reg, err := central.Load(roots)
 	if err != nil {
-		return repoLifecycleCommandResult{}, fmt.Errorf("acd repo %s: load registry: %w", action, err)
+		return repoLifecycleCommandResult{}, fmt.Errorf("acd repo %s: load registry\nDetails: %w", action, err)
 	}
 	rec, ok := reg.FindRepo(target.Path, target.StateDB)
 	if !ok {
@@ -366,7 +361,7 @@ func applyRepoLifecycle(ctx context.Context, roots paths.Roots, target central.R
 		}
 		return nil
 	}); err != nil {
-		return repoLifecycleCommandResult{}, fmt.Errorf("acd repo %s: update registry: %w", action, err)
+		return repoLifecycleCommandResult{}, fmt.Errorf("acd repo %s: update registry\nDetails: %w", action, err)
 	}
 	if changed.NotFound {
 		return repoLifecycleCommandResult{}, repoLifecycleUnknownTargetError(action, target)
@@ -379,7 +374,7 @@ func applyRepoLifecycle(ctx context.Context, roots paths.Roots, target central.R
 		stopRes, err := repoDisableStopOneRepo(ctx, rec.Path, "", true)
 		res.Stopped = &stopRes
 		if err != nil {
-			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: stop daemon: %w", err)
+			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: stop daemon\nDetails: %w", err)
 		}
 		if !stopRes.Stopped {
 			return repoLifecycleCommandResult{}, fmt.Errorf("acd repo disable: daemon did not stop: %s", stopRes.Reason)
@@ -412,7 +407,7 @@ func runRepoRemoveWithInput(ctx context.Context, out io.Writer, in io.Reader, re
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd repo remove: resolve paths: %w", err)
+		return fmt.Errorf("acd repo remove: resolve paths\nDetails: %w", err)
 	}
 	if !yes && !dryRun && !jsonOut && repoFlag == "" {
 		return runRepoRemoveInteractive(ctx, roots, out, in, purgeState)
@@ -496,7 +491,7 @@ func applyRepoRemove(ctx context.Context, roots paths.Roots, target central.Repo
 		stopRes, err := repoRemoveStopOneRepo(ctx, res.RemovedRecord.Path, "", true)
 		res.Stopped = &stopRes
 		if err != nil {
-			return repoRemoveResult{}, fmt.Errorf("acd repo remove: stop daemon: %w", err)
+			return repoRemoveResult{}, fmt.Errorf("acd repo remove: stop daemon\nDetails: %w", err)
 		}
 		if !stopRes.Stopped {
 			return repoRemoveResult{}, fmt.Errorf("acd repo remove: daemon did not stop: %s", stopRes.Reason)
@@ -507,7 +502,7 @@ func applyRepoRemove(ctx context.Context, roots paths.Roots, target central.Repo
 		removed = reg.RemoveRepo(ctx, target)
 		return nil
 	}); err != nil {
-		return repoRemoveResult{}, fmt.Errorf("acd repo remove: update registry: %w", err)
+		return repoRemoveResult{}, fmt.Errorf("acd repo remove: update registry\nDetails: %w", err)
 	}
 	res.Removed = removed.Removed
 	res.NotFound = removed.NotFound
@@ -527,7 +522,7 @@ func applyRepoRemove(ctx context.Context, roots paths.Roots, target central.Repo
 				return repoRemoveResult{}, fmt.Errorf("acd repo remove: refusing to purge non-acd state path %s", res.Safety.StateDir)
 			}
 			if err := os.RemoveAll(res.Safety.StateDir); err != nil {
-				return repoRemoveResult{}, fmt.Errorf("acd repo remove: purge state: %w", err)
+				return repoRemoveResult{}, fmt.Errorf("acd repo remove: purge state\nDetails: %w", err)
 			}
 			res.StatePurged = true
 			res.StatePreserved = false
@@ -539,7 +534,7 @@ func applyRepoRemove(ctx context.Context, roots paths.Roots, target central.Repo
 func runRepoRemoveInteractive(ctx context.Context, roots paths.Roots, out io.Writer, in io.Reader, purgeState bool) error {
 	reg, err := central.Load(roots)
 	if err != nil {
-		return fmt.Errorf("acd repo remove: load registry: %w", err)
+		return fmt.Errorf("acd repo remove: load registry\nDetails: %w", err)
 	}
 	entries := collectRepoManagementEntries(ctx, reg.Repos)
 	if len(entries) == 0 {
@@ -569,11 +564,11 @@ func runRepoRemoveInteractive(ctx context.Context, roots paths.Roots, out io.Wri
 		previews = append(previews, preview)
 	}
 	renderRepoRemovePreview(out, previews, purgeState)
-	if !readExactConfirmation(out, reader, "Type remove to remove selected repo(s): ", "remove") {
+	if !readExactConfirmation(out, reader, "Type remove to stop protection and remove the selected registrations: ", "remove") {
 		fmt.Fprintln(out, "acd repo remove: canceled")
 		return nil
 	}
-	if purgeState && !readExactConfirmation(out, reader, "Type purge to delete selected .git/acd state: ", "purge") {
+	if purgeState && !readExactConfirmation(out, reader, "Type purge to permanently delete the selected repositories’ saved ACD data: ", "purge") {
 		fmt.Fprintln(out, "acd repo remove: canceled; purge requires explicit confirmation")
 		return nil
 	}
@@ -611,7 +606,7 @@ func readRepoRemoveSelection(out io.Writer, reader *bufio.Reader, count int) ([]
 		fmt.Fprint(out, "Select repo number(s) to remove, or c to cancel: ")
 		line, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
-			return nil, false, fmt.Errorf("acd repo remove: read selection: %w", err)
+			return nil, false, fmt.Errorf("acd repo remove: read selection\nDetails: %w", err)
 		}
 		line = strings.TrimSpace(line)
 		if line == "" || isCancelInput(line) {
@@ -665,8 +660,7 @@ func renderRepoRemovePreview(out io.Writer, previews []repoRemoveResult, purgeSt
 		if res.Safety.DaemonAlive {
 			fmt.Fprintf(out, "      stop daemon : %s pid=%d\n", res.Safety.DaemonMode, res.Safety.DaemonPID)
 		}
-		fmt.Fprintln(out, "      registry    : remove row")
-		fmt.Fprintln(out, "      start cache : clear")
+		fmt.Fprintln(out, "      ACD registration: remove")
 		if purgeState {
 			fmt.Fprintf(out, "      state       : purge %s\n", res.Safety.StateDir)
 		} else {
@@ -706,13 +700,13 @@ func repoRemovalTargetForCommand(ctx context.Context, repoFlag, command string) 
 	if path == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			return central.RepoRemovalTarget{}, fmt.Errorf("acd %s: get cwd: %w", command, err)
+			return central.RepoRemovalTarget{}, fmt.Errorf("acd %s: get cwd\nDetails: %w", command, err)
 		}
 		path = cwd
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return central.RepoRemovalTarget{}, fmt.Errorf("acd %s: abs %q: %w", command, path, err)
+		return central.RepoRemovalTarget{}, fmt.Errorf("acd %s: abs %q\nDetails: %w", command, path, err)
 	}
 	return central.RepoRemovalTarget{Path: filepath.Clean(abs)}, nil
 }
@@ -729,7 +723,7 @@ func isSafeRepoStatePurge(s central.RepoRemovalSafety) bool {
 func previewRepoRemoval(ctx context.Context, roots paths.Roots, target central.RepoRemovalTarget) (central.RepoRemovalResult, error) {
 	reg, err := central.Load(roots)
 	if err != nil {
-		return central.RepoRemovalResult{}, fmt.Errorf("acd repo remove: load registry: %w", err)
+		return central.RepoRemovalResult{}, fmt.Errorf("acd repo remove: load registry\nDetails: %w", err)
 	}
 	if rec, ok := reg.FindRepo(target.Path, target.StateDB); ok {
 		recCopy := rec
@@ -820,7 +814,7 @@ func renderRepoRemove(out io.Writer, res repoRemoveResult, jsonOut bool) error {
 		if res.PurgeState {
 			fmt.Fprintln(out, "Protected data: would be permanently deleted with --yes --purge-state")
 		}
-		fmt.Fprintln(out, "Changed: no")
+		fmt.Fprintln(out, "Nothing changed.")
 		fmt.Fprintln(out, "Next: Add `--yes` to apply this preview.")
 		return nil
 	}

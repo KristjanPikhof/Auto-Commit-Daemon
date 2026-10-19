@@ -612,7 +612,7 @@ func TestRepoList_HumanOutputOmitsStateDBColumn(t *testing.T) {
 		t.Fatalf("runRepoList: %v", err)
 	}
 	text := out.String()
-	for _, want := range []string{"REPOSITORY", "WORKER", "TOOLS", "WAITING", "BLOCKED", "STATUS", repo, "stopped"} {
+	for _, want := range []string{"Registration:", "Protection:", "Status:", repo, "stopped"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("human repo list output missing %q:\n%s", want, text)
 		}

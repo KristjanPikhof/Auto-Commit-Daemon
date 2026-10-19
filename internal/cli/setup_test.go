@@ -1093,7 +1093,7 @@ func TestSetupProgressShowsPhaseAndHeartbeat(t *testing.T) {
 	if !strings.Contains(got, "Setup: Scanning registered repositories\n") {
 		t.Fatalf("missing phase progress: %q", got)
 	}
-	if !strings.Contains(got, "Setup: still working on scanning registered repositories") {
+	if !strings.Contains(got, "Setup: scanning registered repositories") {
 		t.Fatalf("missing heartbeat: %q", got)
 	}
 	if strings.Contains(got, "(0s elapsed)") {
@@ -1120,7 +1120,7 @@ func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.Join(strings.Fields(out.String()), " ")
-	for _, required := range []string{"macOS", "Full Disk Access is not required", "without credentials or network access", "Intent and provider setup are optional"} {
+	for _, required := range []string{"macOS", "Full Disk Access is not required", "without credentials or network access", "provider settings are optional"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("setup help missing %q:\n%s", required, got)
 		}

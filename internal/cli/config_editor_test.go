@@ -108,7 +108,7 @@ func TestFinishRemovalConfigEditorRepositoryResetAppliesExactRevision(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(result, "Applied:") {
+	if !strings.Contains(result, "Settings applied:") {
 		t.Fatal(result)
 	}
 	model := editorModel(t, e, "repo")
@@ -190,7 +190,7 @@ func TestFinishConfigEditorSaveSupersedesInterruptedApproval(t *testing.T) {
 				return
 			}
 			result, err := review.Save(ctx)
-			if err != nil || !strings.Contains(result, "Applied:") || strings.Contains(result, "could not apply") {
+			if err != nil || !strings.Contains(result, "Settings applied:") || strings.Contains(result, "could not apply") {
 				t.Fatalf("explicit save did not recover approval: %q/%v", result, err)
 			}
 			runtime, err := state.RuntimeConfigActivationState(ctx, db)

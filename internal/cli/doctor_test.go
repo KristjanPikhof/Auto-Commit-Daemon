@@ -2094,7 +2094,7 @@ func assertDoctorLegacyFailurePreserved(t *testing.T, outcome string) {
 	if err := runDoctor(ctx, &out, false, "", false); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), legacy.Reason) {
+	if !strings.Contains(out.String(), "Older saved data needs review.") || !strings.Contains(out.String(), "acd support diagnose --json") {
 		t.Fatalf("missing preserved legacy work: %s", out.String())
 	}
 	if mustSHA256(t, path) != before {

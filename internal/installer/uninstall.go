@@ -92,10 +92,10 @@ func BuildUninstallPlan(ctx context.Context, roots paths.Roots, purge bool) (Uni
 				if sha256String(launcherBody) == plan.ManagedBinaryDigest {
 					plan.Launcher, plan.LauncherDigest = launcher, sha256String(launcherBody)
 				} else {
-					plan.Warnings = append(plan.Warnings, "Preserve unverified launcher: "+launcher)
+					plan.Warnings = append(plan.Warnings, "ACD cannot verify ownership; keep this launcher: "+launcher)
 				}
 			} else {
-				plan.Warnings = append(plan.Warnings, "Preserve unverified launcher: "+launcher)
+				plan.Warnings = append(plan.Warnings, "ACD cannot verify ownership; keep this launcher: "+launcher)
 			}
 		} else if !errors.Is(statErr, os.ErrNotExist) {
 			return UninstallPlan{}, statErr
@@ -116,7 +116,7 @@ func BuildUninstallPlan(ctx context.Context, roots paths.Roots, purge bool) (Uni
 				if !errors.Is(targetErr, os.ErrNotExist) {
 					return UninstallPlan{}, targetErr
 				}
-				target = PurgeTarget{RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID, RepoRoot: record.Path, Unavailable: "Worktree missing; state directory and private refs not verified or deleted"}
+				target = PurgeTarget{RepositoryID: record.RepositoryID, WorktreeID: record.WorktreeID, RepoRoot: record.Path, Unavailable: "Repository folder missing. Its saved ACD data was kept."}
 				missing[record.Path] = true
 				plan.Warnings = append(plan.Warnings, target.Unavailable+": "+record.Path)
 			} else {
@@ -135,10 +135,10 @@ func BuildUninstallPlan(ctx context.Context, roots paths.Roots, purge bool) (Uni
 		}
 	}
 	supervisorTarget := service.Path
-	supervisorDetail := "Stop workers and unload the user supervisor"
+	supervisorDetail := "Stop ACD background protection"
 	if service.Platform == "session" {
 		supervisorTarget = service.Binary
-		supervisorDetail = "Stop the repository-scoped macOS session supervisor"
+		supervisorDetail = "Stop ACD background protection for this session"
 	}
 	plan.Actions = append(plan.Actions, Action{Kind: "stop_supervisor", Target: supervisorTarget, Detail: supervisorDetail})
 	for _, item := range removals {
@@ -154,7 +154,7 @@ func BuildUninstallPlan(ctx context.Context, roots paths.Roots, purge bool) (Uni
 				plan.Actions = append(plan.Actions, Action{Kind: "skip_unavailable_repository", Target: target.RepoRoot, Detail: target.Unavailable})
 				continue
 			}
-			plan.Actions = append(plan.Actions, Action{Kind: "purge_repository_data", Target: target.StateDir, Detail: "Delete verified ACD state and all ACD private checkpoint, finish, history, migration and recovery refs; preserve project Git branches, tags, commits, worktree and index"})
+			plan.Actions = append(plan.Actions, Action{Kind: "purge_repository_data", Target: target.StateDir, Detail: "Permanently delete saved ACD history and recovery data. Keep project files and Git history."})
 		}
 	}
 
@@ -435,7 +435,7 @@ func buildPurgeTarget(ctx context.Context, record central.RepoRecord, includeRef
 		}
 		fields := strings.Fields(line)
 		if len(fields) != 2 || !strings.HasPrefix(fields[0], "refs/acd/") {
-			return PurgeTarget{}, fmt.Errorf("uninstall: ambiguous private ref inventory; inspect symbolic refs before purge")
+			return PurgeTarget{}, fmt.Errorf("Ambiguous private ref inventory; inspect symbolic Git references before purge.")
 		}
 		target.Refs = append(target.Refs, gitpkg.RefExpectation{Ref: fields[0], OID: fields[1]})
 	}

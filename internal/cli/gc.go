@@ -42,8 +42,8 @@ func newGCCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "gc",
 		Short: "Remove stale repository registrations",
-		Long: `Remove registry entries for repositories that are missing, have no
-ACD database, or have been stopped for at least 30 days.
+		Long: `Remove registry entries for repositories that are missing, have no ACD
+database, or have been stopped for at least 30 days.
 
 The command does not edit repository databases or protected changes. Run
 acd repo list first to review every registration.`,
@@ -63,7 +63,7 @@ func runGC(ctx context.Context, out io.Writer, jsonOut bool) error {
 	}
 	roots, err := paths.Resolve()
 	if err != nil {
-		return fmt.Errorf("acd gc: resolve paths: %w", err)
+		return fmt.Errorf("acd gc: resolve paths\nDetails: %w", err)
 	}
 
 	var report gcReport
@@ -87,7 +87,7 @@ func runGC(ctx context.Context, out io.Writer, jsonOut bool) error {
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("acd gc: %w", err)
+		return fmt.Errorf("acd gc\nDetails: %w", err)
 	}
 
 	if jsonOut {
@@ -103,7 +103,7 @@ func runGC(ctx context.Context, out io.Writer, jsonOut bool) error {
 		return enc.Encode(report)
 	}
 	if len(report.Dropped) == 0 {
-		fmt.Fprintf(out, "acd gc: nothing to prune (kept %d repos)\n", report.Kept)
+		fmt.Fprintf(out, "No old registrations to remove. Kept %d repositories.\n", report.Kept)
 		return nil
 	}
 	fmt.Fprintf(out, "acd gc: pruned %d entries, kept %d\n", len(report.Dropped), report.Kept)
@@ -159,7 +159,7 @@ func readDaemonPidAndHeartbeat(ctx context.Context, dbPath string) (pid int, hea
 	dsn := paths.DatabaseURI(dbPath, q)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return 0, 0, fmt.Errorf("open: %w", err)
+		return 0, 0, fmt.Errorf("open\nDetails: %w", err)
 	}
 	defer conn.Close()
 	if err := conn.PingContext(ctx); err != nil {
@@ -171,7 +171,7 @@ func readDaemonPidAndHeartbeat(ctx context.Context, dbPath string) (pid int, hea
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, 0, nil
 		}
-		return 0, 0, fmt.Errorf("scan: %w", err)
+		return 0, 0, fmt.Errorf("scan\nDetails: %w", err)
 	}
 	return pid, heartbeatTS, nil
 }

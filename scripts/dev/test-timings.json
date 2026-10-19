@@ -412,7 +412,7 @@
     "TestProductListCompactLabelsDisambiguateCollisions": 0.001,
     "TestProductListDisabledRepositoryIsReadOnly": 0.18,
     "TestProductListDistinguishesRewriteExecutionFromProposal": 1.51,
-    "TestProductListHiddenWarningDoesNotFailCompactSnapshot": 0.01,
+    "TestProductListIdleWarningRemainsVisibleInCompactSnapshot": 0.01,
     "TestProductListHooksCountButWorkerHeartbeatsDoNot": 0.25,
     "TestProductListIncompleteCheckpointIsWorking": 0.001,
     "TestProductListMaintenanceDoesNotHideProtectionFailure": 0.001,
