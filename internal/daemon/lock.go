@@ -20,7 +20,6 @@
 package daemon
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -365,10 +364,13 @@ func listDaemonOwnerProcesses(ctx context.Context) ([]daemonOwnerProcess, error)
 	if err != nil {
 		return nil, err
 	}
+	return parseDaemonOwnerProcesses(string(out)), nil
+}
+
+func parseDaemonOwnerProcesses(output string) []daemonOwnerProcess {
 	var processes []daemonOwnerProcess
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
@@ -382,7 +384,7 @@ func listDaemonOwnerProcesses(ctx context.Context) ([]daemonOwnerProcess, error)
 				strings.TrimPrefix(line, fields[0])),
 		})
 	}
-	return processes, scanner.Err()
+	return processes
 }
 
 func daemonOwnerRepoIdentity(ctx context.Context, repo string) (string, error) {

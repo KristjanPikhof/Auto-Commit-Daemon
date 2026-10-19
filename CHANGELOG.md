@@ -60,6 +60,8 @@
 
 ### Fixed
 
+- Read long process command lines completely during ownership checks and
+  diagnostics, so unrelated processes cannot prevent safe recovery.
 - Treat deadline-cancelled Git reads in `acd list` as incomplete checks. Keep
   those rows visible with unknown coverage and counts instead of false
   repository failures and doctor instructions.
