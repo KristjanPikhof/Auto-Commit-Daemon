@@ -1,168 +1,119 @@
 # Architecture overview
 
-ACD separates durable protection from Git publication.
-
-You change files, ACD captures them, groups related changes by intent, creates
-semantic local commits, and leaves you with a clean Git history.
-
-![From file changes to clean Git history](assets/acd-workflow.png)
-
-ACD validates every grouping plan before publication. If an AI-generated plan
-is invalid or unsafe, ACD rejects it and retries or rebuilds the plan. The
-completed checkpoint remains protected throughout that loop.
+ACD protects eligible file changes continuously. It creates branch commits only
+when you run `acd finish`. Saving files, leaving an editor, going idle, or
+stopping a worker does not authorize a new publication. Startup can complete an
+already authorized prepared publication from exact saved proof.
 
 ~~~text
-optional filesystem watch + complete poll + optional hints
-                    |
-                    v
-          protection scheduler
-                    |
-        completed private checkpoint ref
-                    |
-                    v
-          publication scheduler
-     group -> verify -> message -> Git CAS
-                    |
-                    v
-          ordinary local Git commit
+file changes -> protection scan -> private checkpoint
+                                      |
+                                acd finish
+                                      |
+                         freeze -> plan -> verify
+                                      |
+                         one branch compare-and-swap
 ~~~
 
-Provider, grouping, test, or verification failures can delay the lower half;
-they cannot prevent a successful protection scan from completing the upper
-half.
+Fresh installations use offline Local mode with imperative messages. Intent
+uses an approved AI provider to plan completed goals. Both modes use the same
+checkpoint, tree, staging, and publication safety checks.
 
 ## Process boundaries
 
-One user-level supervisor owns desired state. It groups linked worktrees by
-canonical Git common directory and runs one isolated worker for each group.
-The supervisor never opens repository SQLite as a writer. Workers own their
-repositories under the canonical common-directory lock.
+A per-user supervisor groups registered worktrees by canonical Git common
+directory. One worker owns each group under the daemon lock. Linked worktrees
+have separate identities, checkpoints, and settings. PID files and heartbeats
+support diagnosis; they do not replace the ownership lock.
 
-On macOS the supervisor and workers are descendants of the first authorized
-Terminal or agent application that starts them. One owner-only socket is shared
-by all processes for that user; the server verifies the peer UID before reading
-a request, and repository IDs are still restricted by the registered allowlist.
-ACD therefore needs no Full Disk Access and does not install a launchd service.
-Mutating commands and supported integration hints start the supervisor when it
-is absent; after logout or reboot, protection resumes on that first invocation.
-Linux uses a persistent systemd user service.
+On macOS the supervisor and workers descend from the application that starts
+them. ACD uses an owner-only socket and checks the peer UID and repository
+allowlist. It does not install a launchd service. Linux uses a systemd user
+service. Protection resumes through the matching installed runtime.
 
-Local newline-delimited JSON IPC uses schema v1, request IDs, strict method
-validation, worktree identity, and bounded deadlines. Mutations fail closed if
-the supervisor or worker is unavailable. Read-only status may use an existing
-SQLite projection.
+The supervisor checks the managed binary digest and protocol compatibility.
+Repository commands refuse an incompatible runtime and direct you to
+`acd setup`. Source changes in a checkout do not update an installed runtime.
+An existing older runtime can keep making automatic commits until you
+explicitly upgrade it.
 
-The supervisor restarts a crashed worker after 1, 2, 5, 10, then 30 seconds.
-Backoff resets after five healthy minutes. Repeated crashes surface as
-`needs_action` while bounded retries continue.
+Restarted workers belong to the supervisor and keep running after the request
+that started them ends. They stop when the supervisor stops.
 
-The supervisor advertises protocol, registry, repository-state, and integration
-compatibility plus the exact managed-binary digest. Repository mutations and
-hooks require that runtime to match the CLI exactly. A mismatch is a
-fail-closed `acd setup` boundary; ordinary repository activity never replaces
-the binary or upgrades unrelated repositories.
+Local IPC uses bounded requests with repository and worktree identity. Read-only
+status, list, doctor, and diagnose inspect existing evidence without building
+providers, migrating databases, or starting publication. Mutations require the
+canonical owner.
 
-Integration hooks start or wake only repositories that are already registered
-and enabled. Unknown and disabled repositories are skipped without creating
-state; human-facing output points to `acd on`. Idle, stop, and session-close
-boundary hints preserve and log the real command exit code but return success,
-because they refine commit grouping and cleanup rather than establish current
-protection.
+## Protection
 
-## Repository identity
+The worker watches for changes and performs complete safety scans. A complete
+checkpoint proves the current eligible scope; failed reads leave coverage
+incomplete and retain readable content in a partial checkpoint. Ignored and
+sensitive paths stay outside that scope. Large regular files stream into Git
+objects with bounded memory.
 
-Registry v2 identifies a repository by the first 16 lowercase hex characters
-of SHA-256 over its canonical Git common directory. A worktree uses the same
-construction over its canonical root. Old path hashes remain migration
-metadata only.
-
-The worker daemon log is stored at
-`${XDG_STATE_HOME:-$HOME/.local/state}/acd/<repo-hash>/daemon.log`. Linked
-worktrees share that common-directory log. Each worktree record includes
-`repo_hash`, `worktree`, and `git_dir`; attached-branch records also include
-`branch_ref` and the known `branch_generation`. Planner reject logs are not
-shared. They stay under the exact worktree Git directory described in
-[AI providers](ai-providers.md#failure-behavior).
-
-## Checkpoint store
-
-A checkpoint is a rootless Git commit whose tree contains the complete
-eligible protected scope. A private ref makes its objects reachable:
+A checkpoint is a rootless Git commit retained by a private ref:
 
 ~~~text
 refs/acd/checkpoints/v1/<worktree-id>/cp-<milliseconds>-<random>
 ~~~
 
-SQLite v21 records immutable operation identity, checkpoint phases, exact
-capture-event membership, privacy-safe exclusion counts, publication links,
-restore relationships, and durable publication drains. A drain stores one
-frozen target, progress counters, bounded semantic attempts, local fallback,
-staged consent, and restart-safe phase state. The specialized publication
-record remains the authoritative branch-ref CAS proof and links to the general
-operation.
+SQLite records its identity, tree, coverage, exclusions, and ref proof. A
+completed checkpoint is protection evidence, not a branch commit. Repeated
+unchanged scans do not create a publication queue or call AI.
 
-SQLite v24 freezes the capture membership of each new Intent history repair.
-Completed repairs and normal publications use the same durable branch
-transition proof, so a worker can recover either ref move after a restart.
-SQLite v25 freezes each publication drain's commit strategy, message format,
-configuration revision, and provider identity. A restart therefore continues
-the same publication contract instead of reinterpreting Intent work as Event
-work.
+State database paths preserve filesystem characters such as `?`, `#`, and `%`.
+Git lookups treat captured filenames literally, including names that resemble
+Git pathspec syntax.
 
-## Publication evaluation and capture
+See [protection and publication](capture-replay.md) for coverage and retention.
 
-The repository worker remains the sole authority for Git and durable lifecycle
-changes. It prepares immutable provider, materialization, and verification
-inputs; a bounded background evaluation performs that slow call in isolation.
-While it waits, the worker releases the operation gate and services watcher,
-checkpoint, and polling work through protection-only checkpoints. These snapshots
-save the exact file bytes without changing the active capture membership or
-shadow baseline. Normal capture classifies those edits after evaluation returns.
+## Explicit publication
 
-Only one evaluation runs per worktree. The runtime lease remains alive until it
-finishes or cancellation joins it. Before applying a result, the worker reacquires
-the gate and verifies branch, candidate, configuration, and restore evidence.
-Stale results are discarded. Later protected edits do not invalidate the frozen
-target. Referenced checkpoints and recovery records remain retained.
+Finish obtains a fresh complete checkpoint and freezes the attached branch,
+expected HEAD, target tree, index identity, mode, style, settings, and consent.
+Later edits remain protected for another finish.
 
-## Publication
+Local creates one complete batch commit without a provider. Intent plans useful
+review or revert boundaries using exact recorded versions. ACD materializes
+and checks every proposed tree privately, then prepares the whole commit chain
+before one compare-and-swap moves the branch. A failed candidate cannot publish
+part of that chain. The live worktree stays untouched.
 
-Event strategy retains one captured change per local commit. Intent strategy
-can group changes across completed checkpoints, subject to existing dependency,
-materialization, verification, revertibility, and exact-ref CAS gates. Only
-events belonging to completed checkpoints are eligible.
+Slow provider calls and approved project checks release the operation gate so
+checkpoint protection can continue. The worker owns the accepted request;
+closing the client detaches its display. Reconnecting uses the saved request
+ID. Failed requests need an explicit retry; a restart does not start a new AI
+attempt. Prepared publication resumes only from exact saved proof. Ambiguous
+proof requires attention.
 
-An active drain publishes only its immutable frozen target. Later captures get
-normal checkpoint protection but wait outside that target. Planner failure can
-move the drain through normalization to local atomic dependency groups.
-Neither path bypasses materialization, verification, exact-ref CAS, or the
-self-publication journal. Client cancellation stops only the wait display.
+See [Intent finish flow](intent-commit-flow.md), [provider failure behavior](ai-providers.md#failure-behavior),
+and the detailed [finish contract](finish-contract.md).
 
-Unsafe Git states suspend publication but never protection. A checkpoint is
-published only when all member events have completed normal commit mappings.
-No component pushes automatically.
+## Restore and history
 
-## Restore
+Restore previews a retained complete checkpoint, saves current preimages, and
+applies confirmed file replacements. It preserves HEAD and the index and
+prints an undo checkpoint. Interrupted restores require exact forward proof.
 
-Restore computes a full-tree plan, checkpoints the current state, journals
-filesystem preimages, applies same-directory atomic replacements, preserves
-the index and `HEAD`, then checkpoints the result. The pre-restore checkpoint
-is the undo target.
+History rewriting is a separate explicit selection, plan, preview, and apply
+operation. It retains the original source history and checks exact branch and
+index identity. It never runs because files were saved or an editor stopped.
+See [history rewriting](rewrite-commits.md).
 
-If files were applied but the final checkpoint failed, forward repair proves
-the current protected tree equals the target before creating the missing
-checkpoint and completing the operation.
+## Configuration and upgrades
 
-## Global transactions
+Reviewed settings become an approved revision synchronously. Saving or applying
+settings does not test a provider, run a project command, start a worker, or
+publish work. A new finish uses the approved snapshot; an accepted finish keeps
+its frozen settings.
 
-Setup, upgrade, uninstall, configuration, registry, integration, and platform
-lifecycle mutations are recorded in the global operations database. Plans have
-immutable SHA-256 digests. Every touched file has a type/mode/owner/digest
-preimage and prior platform lifecycle state.
+Setup, upgrade, and uninstall use reviewed global plans with rollback preimages.
+An incompatible upgrade covers enabled repositories; disabled repositories stay
+disabled until their next explicit activation. Legacy checkpoints and immutable
+publication evidence remain retained. Unprovable legacy mutations block
+publication rather than restart the old planner.
 
-An incompatible setup cutover spans enabled repositories only. A temporary
-protection bridge covers concurrent edits, repository locks are acquired in
-sorted common-directory order, and held workers must prove current coverage
-before global commit. Disabled records and database versions remain unchanged
-until their next `acd on`. Any ambiguous legacy proof in an enabled repository
-aborts the entire transaction.
+The retired automatic publication design is preserved in the
+[legacy Intent flow](legacy-intent-commit-flow.md).

@@ -47,23 +47,23 @@ type productEnvelope struct {
 }
 
 type productStatusData struct {
-	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
-	PublicationOutcome       publicationOutcome           `json:"publication_outcome"`
-	Repo                     string                       `json:"repo"`
-	Command                  string                       `json:"command"`
-	Registered               bool                         `json:"registered"`
-	Enabled                  bool                         `json:"enabled"`
-	Worker                   string                       `json:"worker"`
-	Protected                bool                         `json:"protected"`
-	Published                bool                         `json:"published"`
-	Busy                     bool                         `json:"busy"`
-	OperationalState         string                       `json:"operational_state"`
-	WorktreeClean            bool                         `json:"worktree_clean"`
-	AllChangesCommittedInGit bool                         `json:"all_changes_committed_in_git"`
-	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
-	ActionRequired           bool                         `json:"action_required"`
-	CheckpointID             string                       `json:"checkpoint_id,omitempty"`
-	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
+	CaptureHealth            state.CaptureHealth `json:"capture_health"`
+	PublicationOutcome       publicationOutcome  `json:"publication_outcome"`
+	Repo                     string              `json:"repo"`
+	Command                  string              `json:"command"`
+	Registered               bool                `json:"registered"`
+	Enabled                  bool                `json:"enabled"`
+	Worker                   string              `json:"worker"`
+	Protected                bool                `json:"protected"`
+	Published                bool                `json:"published"`
+	Busy                     bool                `json:"busy"`
+	OperationalState         string              `json:"operational_state"`
+	WorktreeClean            bool                `json:"worktree_clean"`
+	AllChangesCommittedInGit bool                `json:"all_changes_committed_in_git"`
+	CheckpointPublishedByACD bool                `json:"checkpoint_published_by_acd"`
+	ActionRequired           bool                `json:"action_required"`
+	CheckpointID             string              `json:"checkpoint_id,omitempty"`
+
 	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
 	PublicationProgress      publicationProgressReport    `json:"publication_progress"`
 	PendingEvents            int                          `json:"pending_events"`
@@ -125,7 +125,6 @@ func envelopeFromControl(result controlResult) productEnvelope {
 			CheckpointPublishedByACD: result.CheckpointPublishedByACD,
 			ActionRequired:           actionRequired,
 			CheckpointID:             result.CheckpointID,
-			PublicationDrain:         result.PublicationDrain,
 			CaptureHealth:            result.CaptureHealth,
 			PublicationProgress:      result.PublicationProgress,
 			CheckpointMaintenance:    result.CheckpointMaintenance,
@@ -154,18 +153,38 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 		return fmt.Errorf("acd: unsupported human result %T", envelope.Data)
 	}
 	fmt.Fprintf(out, "Protection: %s\n", onOff(data.Enabled))
-	fmt.Fprintf(out, "Current changes saved: %s\n", yesNo(data.Protected))
+	fmt.Fprintf(out, "Last observed work saved: %s\n", yesNo(data.Protected))
 	fmt.Fprintf(out, "Branch commits: %s\n", publicationOutcomeLabel(data.PublicationOutcome, data.PublicationProgress))
+	if data.PublicationOutcome.CheckpointAvailable {
+		renderFinishUncommitted(out, data.PublicationOutcome)
+		if f := data.PublicationOutcome.Finish; f != nil {
+			fmt.Fprintf(out, "Finish %s: %s\n", f.RequestID, finishStatusSummary(f))
+			renderFinishStatusChecks(out, f)
+		}
+		if data.PublicationOutcome.LaterChanges > 0 {
+			fmt.Fprintf(out, "Later work: %d changed path(s), separate from the finish target\n", data.PublicationOutcome.LaterChanges)
+		}
+		worker := "not responsive"
+		if data.PublicationProgress.WorkerResponsive {
+			worker = "responsive"
+		}
+		fmt.Fprintf(out, "Worker: %s; heartbeat %ds ago\n", worker, data.PublicationProgress.HeartbeatAgeSeconds)
+	}
+	if h := data.PublicationOutcome.History; h != nil {
+		fmt.Fprintf(out, "History plan %s: %s\n", h.PlanID, h.State)
+	}
+	if legacy := data.PublicationOutcome.Legacy; legacy.State == "needs_attention" {
+		renderLegacyAttention(out, legacy)
+	}
+	if data.PublicationOutcome.Legacy.Unpublished > 0 {
+		fmt.Fprintf(out, "Legacy archive: %d captured version(s) retained separately\n", data.PublicationOutcome.Legacy.Unpublished)
+	}
 	if data.PublicationOutcome.RecoveredChanges > 0 {
 		fmt.Fprintf(out, "Recovery: %d changes saved separately\n", data.PublicationOutcome.RecoveredChanges)
 	}
 	if data.ActionRequired && data.Summary != "" {
 		fmt.Fprintf(out, "Status: %s\n", data.Summary)
-	} else if data.PublicationProgress.Phase == "provider_wait" ||
-		data.PublicationProgress.Phase == "goal_review_wait" ||
-		data.PublicationProgress.Phase == "provider_call" ||
-		data.PublicationProgress.Phase == "history_reconstruction" {
-		fmt.Fprintf(out, "Status: %s\n", publicationProgressPhaseLabel(data.PublicationProgress))
+
 	}
 	if envelope.NextAction == nil {
 		fmt.Fprintln(out, "Next: No action needed.")
@@ -176,6 +195,15 @@ func renderProductEnvelope(out io.Writer, envelope productEnvelope, jsonOut bool
 }
 
 func publicationOutcomeLabel(outcome publicationOutcome, progress publicationProgressReport) string {
+	if outcome.CheckpointAvailable {
+		if outcome.BranchCommitted == nil {
+			return "unknown"
+		}
+		if *outcome.BranchCommitted {
+			return "saved work is on the current branch"
+		}
+		return fmt.Sprintf("%d saved path(s) await finish", outcome.PendingChanges)
+	}
 	if outcome.BranchCommitted == nil {
 		return "unknown"
 	}
@@ -183,13 +211,6 @@ func publicationOutcomeLabel(outcome publicationOutcome, progress publicationPro
 		return "saved changes waiting for grouping"
 	}
 	if outcome.WaitingChanges > 0 {
-		if outcome.ReasonCode == "provider_wait" {
-			label := fmt.Sprintf("%d changes waiting for AI", outcome.WaitingChanges)
-			if outcome.RetryAt > 0 {
-				label += "; retry at " + time.Unix(int64(outcome.RetryAt), 0).Format(time.RFC3339)
-			}
-			return label
-		}
 		return fmt.Sprintf("%d changes waiting (%s)", outcome.WaitingChanges, publicationProgressPhaseLabel(progress))
 	}
 	if *outcome.BranchCommitted {
@@ -201,167 +222,31 @@ func publicationOutcomeLabel(outcome publicationOutcome, progress publicationPro
 	return "waiting for current changes to be saved"
 }
 
-func renderProductPublicationProgress(
-	out io.Writer,
-	progress publicationProgressReport,
-) {
-	if progress.Strategy == "" {
-		return
+func renderProductPublicationProgress(out io.Writer, progress publicationProgressReport) {
+	if progress.Strategy != "" {
+		fmt.Fprintf(out, "Finish mode: %s\n", progress.Strategy)
 	}
-	strategy := strings.ToUpper(progress.Strategy[:1]) + progress.Strategy[1:]
-	if progress.TemporaryLocalFallback {
-		if progress.Origin == "intent_recovery" {
-			strategy += " (verified Intent-group widening active)"
-		} else {
-			strategy += " (temporary local fallback active)"
-		}
-	}
-	fmt.Fprintf(out, "Commit mode: %s\n", strategy)
-	if progress.PlannerProvider != "" {
-		planner := progress.PlannerProvider
-		if progress.PlannerModel != "" {
-			planner += " / " + progress.PlannerModel
-		}
-		fmt.Fprintf(out, "Intent provider: %s\n",
-			planner)
-	}
-	fmt.Fprintf(out, "Publication queue: %d protected change(s)\n",
-		progress.QueuePending)
-	if progress.Origin == "commit_all" && progress.TargetTotal > 0 {
-		fmt.Fprintf(out, "Active target: earlier commit-all request, %d of %d left\n",
-			progress.TargetRemaining, progress.TargetTotal)
-	} else if progress.Origin == "intent_recovery" && progress.TargetTotal > 0 {
-		fmt.Fprintf(out, "Active target: automatic Intent recovery, %d of %d left\n",
-			progress.TargetRemaining, progress.TargetTotal)
-	}
-	fmt.Fprintf(out, "Publication phase: %s\n",
-		publicationProgressPhaseLabel(progress))
-	if progress.NeedsAttention && progress.AttentionReason != "" {
-		fmt.Fprintf(out, "Recovery reason: %s\n", progress.AttentionReason)
-	}
+	fmt.Fprintf(out, "Observed activity: %s\n", publicationProgressPhaseLabel(progress))
 	if progress.LastProgressTS > 0 {
-		fmt.Fprintf(out, "Last queue movement: %s ago\n",
-			formatDurationCompact(time.Duration(progress.LastProgressAgeSeconds)*time.Second))
+		fmt.Fprintf(out, "Last protection progress: %s ago\n", formatDurationCompact(time.Duration(progress.LastProgressAgeSeconds)*time.Second))
 	}
 	worker := "not responsive"
 	if progress.WorkerResponsive {
 		worker = "responsive"
-		if progress.HeartbeatAgeSeconds >= 0 {
-			worker += ", heartbeat " + formatDurationCompact(
-				time.Duration(progress.HeartbeatAgeSeconds)*time.Second) + " ago"
-		}
 	}
-	fmt.Fprintf(out, "Worker liveness: %s\n", worker)
+	fmt.Fprintf(out, "Worker: %s; heartbeat %ds ago\n", worker, progress.HeartbeatAgeSeconds)
 }
 
 func publicationProgressPhaseLabel(progress publicationProgressReport) string {
 	switch progress.Phase {
-	case "history_reconstruction":
-		label := "reconstructing verified goals on a new branch"
-		if progress.WorkerResponsive {
-			label += "; file capture continues"
-		}
-		return label
-	case "idle":
-		return "idle"
-	case "checkpointing":
-		return "saving the protected checkpoint"
-	case "capture_retry":
-		return "retrying incomplete capture while files stabilize"
-	case "capture_blocked":
-		return "incomplete capture; inspect affected paths with acd doctor"
-	case "paused":
-		return "paused by the user"
-	case "rewind_wait":
-		if progress.WaitRemainingSeconds > 0 {
-			return fmt.Sprintf("waiting after a Git history change (%s remaining)",
-				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
-		}
-		return "waiting after a Git history change"
-	case "config_wait":
-		return "waiting for configuration validation"
-	case "intent_wait":
-		if progress.WaitRemainingSeconds > 0 {
-			return fmt.Sprintf("waiting normally for the Intent batch (%s remaining)",
-				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
-		}
-		return "waiting normally for the Intent batch"
-	case "intent_planning":
-		return "planning commit groups by Intent"
-	case "intent_replanning":
-		return "recovering by replanning commit groups by Intent"
-	case "intent_processing":
-		return "grouping and publishing by Intent"
-	case "intent_verification_recovery":
-		return "verification failed; automatic checkpoint replan pending"
-	case "recovering":
-		return "recovering the publication plan"
-	case "local_fallback":
-		if progress.Origin == "intent_recovery" {
-			return "widening a verified Intent group to recover the protected target"
-		}
-		return "publishing one safe local group, then returning to Intent"
-	case "provider_wait":
-		capture := ""
-		if progress.WorkerResponsive {
-			capture = "; file capture continues"
-		}
-		if progress.WaitRemainingSeconds > 0 {
-			return fmt.Sprintf("waiting for the Intent provider retry (%s remaining)%s",
-				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second), capture)
-		}
-		return "AI provider retry is due" + capture
-	case "provider_call":
-		return "waiting for the current Intent provider response"
-	case "goal_review_wait":
-		label := "Intent goal review retry is due"
-		if progress.WaitRemainingSeconds > 0 {
-			label = fmt.Sprintf("waiting to review unresolved Intent goals (%s remaining)",
-				formatDurationCompact(time.Duration(progress.WaitRemainingSeconds)*time.Second))
-		}
-		if progress.WorkerResponsive {
-			label += "; file capture continues"
-		}
-		return label
-	case "verifying":
-		return "verifying the semantic group"
-	case "stalled":
-		if progress.Origin == "intent_recovery" {
-			return "automatic Intent recovery active; no target movement yet"
-		}
-		return "stalled; bounded automatic recovery is expected to start"
-	case "retrying":
-		return "retrying publication automatically"
-	case "needs_action":
-		if progress.Origin == "intent_recovery" {
-			return intentRecoveryVerificationAttentionSummary + " " +
-				intentRecoveryVerificationAttentionNext
-		}
-		return "stopped at a safety check"
-	case "event_publishing":
-		return "publishing captured events"
+	case "capture_retry", "capture_blocked", "protection_incomplete":
+		return "incomplete capture; checkpoint protection needs attention"
+	case "protection_refresh":
+		return "saving observed work"
+	case "saved":
+		return "saved; ready for finish"
 	default:
 		return strings.ReplaceAll(progress.Phase, "_", " ")
-	}
-}
-
-func publicationPhaseLabel(phase string, fallbackMode string) string {
-	switch phase {
-	case "checkpointing":
-		return "saving the checkpoint"
-	case "normalizing":
-		return "preparing a safe publication plan"
-	case "semantic":
-		return "planning commit groups"
-	case "event_fallback":
-		if fallbackMode == "semantic_replan" {
-			return "replanning commit groups by intent"
-		}
-		return "publishing safe commit groups"
-	case "needs_action":
-		return "blocked and waiting for action"
-	default:
-		return "working"
 	}
 }
 

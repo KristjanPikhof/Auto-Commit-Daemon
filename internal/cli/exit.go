@@ -24,7 +24,12 @@ type CommandError struct {
 	rendered  bool
 }
 
-func (e *CommandError) Error() string { return e.Message }
+func (e *CommandError) Error() string {
+	if e.Code == "finish_needs_attention" {
+		return legacyAttentionSummary(e.Message)
+	}
+	return e.Message
+}
 
 func (e *CommandError) Unwrap() error { return nil }
 

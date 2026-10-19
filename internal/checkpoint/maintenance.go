@@ -80,7 +80,7 @@ func (m MaintenanceStatus) Summary() string {
 	case "needs_action":
 		return "Checkpoint maintenance stopped at a safety check. Protected data was retained."
 	case "over_budget":
-		return "Retained checkpoints exceed the storage budget. Protected data was retained."
+		return "Protected checkpoints and saved finish evidence exceed the storage budget. Protected data was retained."
 	default:
 		return ""
 	}

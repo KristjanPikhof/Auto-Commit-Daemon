@@ -1,6 +1,8 @@
 .plan/
 /bin/
 /dist/
+/.tmp/
+/.trekoon/
 *.test
 *.log
 .acd/

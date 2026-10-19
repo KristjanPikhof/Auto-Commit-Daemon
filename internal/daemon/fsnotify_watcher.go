@@ -35,9 +35,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
-
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/fsnotify/fsnotify"
 )
 
 // EnvDisableFsnotify is the toggle that forces poll-only mode at watcher

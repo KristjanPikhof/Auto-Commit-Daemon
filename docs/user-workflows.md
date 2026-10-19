@@ -1,14 +1,14 @@
 # User workflows
 
-## Install ACD
+## Install and enable protection
 
-Homebrew is the shortest installation path:
+Install the released CLI with Homebrew:
 
 ~~~bash
 brew install KristjanPikhof/tap/acd
 ~~~
 
-The verified release installer is the alternative:
+Or use the verified release installer:
 
 ~~~bash
 curl -fsSL \
@@ -17,29 +17,8 @@ curl -fsSL \
 export PATH="$HOME/.local/bin:$PATH"
 ~~~
 
-See the [README requirements](../README.md#requirements) before enabling your
-first repository.
-
-## Set up ACD once
-
-~~~bash
-acd setup
-~~~
-
-Setup configures the shared runtime, integrations, grouping, commit format,
-repair limit, and provider. AI semantic commits with Everyday checks are
-recommended. Local automatic commits are an explicit offline alternative with
-more limited grouping and messages.
-
-An OpenAI-compatible setup asks for its endpoint, model, and bearer token. It
-sends one fixed synthetic request after you approve the plan, without sending
-repository content during that test.
-
-`acd setup` verifies the running installation before reporting readiness.
-In a terminal it then offers to protect the current repository, with separate
-consent. It confirms protection only after a completed checkpoint.
-
-## Enable a repository
+See the [README requirements](../README.md#requirements) for platform tools.
+Then enable one repository:
 
 ~~~bash
 cd /path/to/repository
@@ -47,119 +26,139 @@ acd on
 acd status
 ~~~
 
-`acd on` registers and enables only that repository, then waits for a verified
-checkpoint. `acd status` should report protection on, current changes
-protected, and no action needed. Your setup choices become the defaults for
-repositories you enable later.
+Fresh `acd on` creates missing protection with offline Local defaults and waits
+for a complete checkpoint. It needs no provider or credential. An incompatible
+installed runtime requires the explicit reviewed `acd setup` upgrade first.
+Hooks cannot grant repository consent for you.
 
-## Daily check
+`acd setup` is also the advanced entry for integrations and configuration.
+Use `acd setup --accessible` or `acd config --accessible` for linear prompts.
+
+## Save and finish
+
+Edit and save normally. Check protection whenever useful:
 
 ~~~bash
-acd
+acd status
+acd list --once
 acd history
 ~~~
 
-`Branch commits` waiting with `Current changes saved: yes` means work is safe and Git
-publication is delayed. The final `Next:` line gives the exact command only
-when action is necessary.
-
-The human status output keeps the main questions separate:
-
-| Output | Meaning |
-|---|---|
-| `Protection` | Whether background protection is on. |
-| `Current changes saved` | Whether the latest observation has a completed durable checkpoint. |
-| `Branch commits` | Committed work or the reason protected changes are waiting. |
-| `Recovery` | Changes preserved separately from normal branch history. |
-| `Next` | An actionable command, or `No action needed.` |
-
-`acd status --verbose` also shows the provider, queue, active target, phase,
-last queue movement, and worker heartbeat. A heartbeat shows liveness; it does
-not prove publication progress.
-
-These fields are independent. Current changes can remain protected while Git
-publication is waiting or needs recovery.
-
-For a quick check, run `acd list`. A changing `QUEUE` or `TARGET` proves
-durable progress. If neither moves, `PHASE` shows whether ACD is waiting for a
-provider retry, calling the provider, running verification, or recovering.
-`acd status` gives the same state in full sentences and says whether any action
-is actually required.
-
-## Publication is delayed
-
-Run `acd doctor`. ACD may be waiting to group related changes, for a Git
-operation to finish, for a project check to pass, or for an AI provider to
-recover. A failed project check normally starts automatic checkpoint
-replanning; `Publication phase` says so while ACD keeps working. Doctor tells
-you when a restart or another command is actually required. Do not delete ACD
-databases, private refs, ownership locks, or sockets. Completed checkpoints
-remain protected while publication waits.
-
-For an explicit all-changes drain, run:
+Protection and branch publication are separate. Saved changes can remain
+uncommitted indefinitely until you explicitly finish them:
 
 ~~~bash
-acd commit-all --yes
+acd finish "Add offline checkout"
 ~~~
 
-The command freezes one target, waits until it is published, and shows how many
-protected changes remain and how many commits have been created. Closing the
-terminal only detaches the display. The background worker keeps publishing,
-and the next `acd commit-all --yes` reconnects to the same run.
+Local creates one complete offline batch. Intent plans completed goals through
+the approved provider. Both verify exact trees and preserve live working files.
+Neither pushes. If the frozen target equals HEAD, finish reports no changes
+and creates no empty commit.
 
-If semantic planning cannot make progress, the worker recovers on its own. It
-records a restart-safe transition, removes unsafe mixed membership, and asks
-the Intent planner to regroup only the remaining target. If the new plan still
-cannot move, ACD commits the smallest safe dependency group locally, even when
-that group contains one change. It then tries Intent planning again from the
-new `HEAD`. Existing commits are not rewritten.
+To supply an exact message that matches your selected style:
 
-If the configured provider is unavailable, ACD can publish a dependency-safe
-local group with an evidence-based message. It does not ask the same unavailable
-provider to rewrite that message. Ambiguous groups remain protected. Recovery
-also runs during normal background publication. It does not require another `commit-all`, a database
-purge, or a manual Git commit.
+~~~bash
+acd finish --message "Preserve staged content during finish"
+# With commit.format=conventional:
+acd finish --message "fix: preserve staged content"
+~~~
 
-This command is also the normal way to let ACD include staged changes. ACD
-verifies the full private checkpoint before clearing the staging area back to
-`HEAD`. Working files do not change. The checkpoint still contains staged,
-unstaged, and untracked content. Ordinary background publication never clears
-staged changes.
+A supplied message does not bypass the provider in Intent mode. Use reviewed
+Local settings for an offline finish.
 
-Later edits are protected normally but do not expand or starve the frozen
-target. Status reports `planning` during pending-only Intent replanning,
-`event_fallback` during one local unlock, and `self_healing` while restoring a
-restart-safe recovery stage. No action is needed in those states. ACD asks for
-attention only when safety proof is impossible, such as exhausted verification
-recovery, ambiguous self-publication, an unresolved conflict, a missing Git
-object, an oversized or cyclic hard dependency component, or unsafe branch
-ownership. Detached `HEAD`, a manual pause, and an active Git operation wait
-without discarding protected work.
+## Preview and staged work
+
+~~~bash
+acd finish --dry-run "Add offline checkout"
+~~~
+
+Dry run plans and checks an explicit target. It can write private evidence,
+call Intent AI, and execute approved project checks. It leaves the branch,
+index, and working files unchanged. Run a new ordinary finish afterward to
+freeze current work again.
+
+Ordinary finish refuses staged content. Keep your staging, or review it and
+explicitly include that exact selection:
+
+~~~bash
+acd finish --include-staged "Complete checkout validation"
+~~~
+
+For selected paths, the target uses frozen index content or deletions. Unstaged
+differences on those paths stay in your worktree for the next finish. Other
+eligible worktree changes enter the batch. Excluded or sensitive staged paths
+are rejected. A changed index aborts publication rather than clearing staging
+added later.
+
+During a long attempt, later edits continue to receive checkpoints and remain
+outside its frozen target. First-release `acd commit-all` is a visible
+deprecated delegate to finish; prefer `acd finish` in new scripts.
+
+## A finish fails or the terminal closes
+
+A failed provider, rejected plan, failed check, unsafe branch, or changed index
+leaves work protected. Read the request ID and reason:
+
+~~~bash
+acd status --verbose
+acd doctor
+acd finish --retry REQUEST_ID
+~~~
+
+Closing the terminal detaches the display while the worker owns the accepted
+request. Retry reconnects to active work or explicitly retries a failed target.
+It does not add later edits or change purpose, message, or staged consent.
+Use `--retry REQUEST_ID --dry-run` only for a failed target preview; it does not
+turn a completed dry run into publication.
+
+Intent has one planning exchange and at most one correction under a fixed
+deadline. It never falls back to Local. Correct credentials or the cause before
+retrying. To change the work or mode, review settings and start a new finish.
+Prepared publication recovers from exact saved proof after restart; an
+interrupted running attempt becomes failed rather than making new AI calls.
+
+`none` and `structural` verification run safety checks without project commands.
+`fast` and `full` use approved configured commands. Read the reported evidence;
+missing or reused checks are not freshly executed tests.
 
 ## Restore a checkpoint
 
 ~~~bash
-acd restore                 # terminal picker
-acd history                 # IDs for scripting
-acd restore cp-...
-acd restore cp-... --yes
+acd history
+acd restore cp-...          # preview
+acd restore cp-... --yes    # apply the checked preview
 ~~~
 
-The terminal picker shows retained completed checkpoints, then the selected
-file preview and a separate apply confirmation. Outside a terminal, an ID is
-required. Preview first. Resolve staged overlap before applying. Restore leaves `HEAD`
-and the index unchanged and prints an undo command using the pre-restore
-checkpoint.
+Bare `acd restore` opens a terminal picker. Scripts must supply an ID. Restore
+saves current preimages, preserves HEAD and the index, and prints an undo
+checkpoint. Resolve staged overlap before apply.
 
-If status reports an interrupted post-restore checkpoint:
+If a post-restore checkpoint was interrupted, inspect the exact repair plan:
 
 ~~~bash
 acd support repair
 acd support repair --yes
 ~~~
 
-Repair applies only if the current protected tree still exactly matches the
-restore target.
+Forward repair requires the protected tree to match the restore target. Do not
+delete locks, databases, or private refs to bypass unclear ownership.
+
+## Rewrite existing history
+
+History rewriting is an independent explicit operation:
+
+~~~bash
+acd history rewrite --last 5 --plan-only
+acd history rewrite --show-plan PLAN_ID
+acd history rewrite --apply PLAN_ID --dry-run
+acd history rewrite --apply PLAN_ID --yes
+~~~
+
+Local preserves original grouping and order without AI. Intent can reconstruct
+completed goals. Use `--messages-only` to retain every original commit or
+`--new-branch NAME` to preserve the source branch. Read the
+[history rewrite guide](rewrite-commits.md) before applying.
 
 ## Turn protection off and on
 
@@ -168,18 +167,29 @@ acd off
 acd on
 ~~~
 
-`acd off` takes a final checkpoint, disables the repository, and waits for its
-managed worker to stop. If the checkpoint cannot be confirmed, ACD stays on.
-Use `acd off --force` only when you accept that risk.
+Off takes a final checkpoint, disables the repository, and stops its worker.
+It does not start a finish. If final protection cannot be confirmed, ACD stays on;
+`--force` explicitly accepts that risk. On re-enables only the selected
+repository and confirms fresh protection. Existing checkpoint history remains.
+Startup can recover an already authorized prepared publication from exact saved
+proof; it never creates a new finish or AI attempt.
 
-`acd on` registers an unknown repository or re-enables a disabled one. It
-backs up and migrates only that repository when needed, replaces its managed
-worker, and confirms a new checkpoint. If the shared runtime does not exactly
-match the CLI, run `acd setup` first. If ACD cannot prove that activation or
-recovery is safe, it leaves the repository unregistered or disabled when
-possible and tells you what to run. Neither command deletes checkpoint history.
+## Upgrade and diagnose
 
-## Diagnose locally
+Source changes and a newer CLI do not replace an older running installation.
+An old runtime can still commit automatically until you explicitly upgrade:
+
+~~~bash
+acd setup --dry-run
+acd setup
+~~~
+
+Review the upgrade plan. It preserves supported settings, checkpoints, restore
+history, and unfinished legacy provenance. Disabled repositories stay disabled.
+Ambiguous legacy publication proof requires attention and does not authorize
+restarting the retired planner.
+
+For local evidence:
 
 ~~~bash
 acd doctor
@@ -188,42 +198,9 @@ acd support logs
 acd support bundle
 ~~~
 
-Start with `acd doctor`. It shows the worker state, the latest safe startup
-error, and the command that matches the problem. Use `acd support diagnose
---json` when you need the full local report, and `acd support logs` when doctor
-asks you to inspect startup details. Credentials, provider responses, and raw
-source content are redacted by default.
-
-ACD completes an old publication run automatically when every protected change
-is already published or preserved in recovery. This also works after switching
-branches or restarting the worker.
-
-If ACD cannot prove that the run is complete, preview the remaining recovery:
-
-~~~bash
-acd support recover --dry-run
-acd support recover --yes
-~~~
-
-Apply mode checkpoints every enabled linked worktree in the repository. It
-then stops the shared repository worker, rechecks the plan, performs recovery,
-and starts protection again. You do not need to switch to an old branch or run
-`acd off` first. Other repositories keep running.
-
-## Upgrade from v19
-
-Run `acd setup`. The incompatible-upgrade plan covers enabled repositories
-only. Disabled records remain disabled and their databases are migrated later,
-one at a time, by `acd on`. Missing enabled worktrees with unresolved captured
-state, failed SQLite checks, unsafe Git operations, missing objects,
-insufficient disk, or ambiguous exact-chain proof block the global cutover.
-
-Before global commit, any failure restores database, service, integration,
-configuration, and registry preimages. A migration bridge ref containing an
-otherwise unrepresented concurrent edit is retained with a recovery manifest
-rather than deleted.
-
-After commit, recovery is forward-only through `acd support repair`.
+Status and diagnostics do not test providers or write repository state. Worker
+liveness and complete protection are separate facts. Use the specific next
+action in the report rather than treating every wait as a failure.
 
 ## Uninstall
 
@@ -232,6 +209,18 @@ acd uninstall --dry-run
 acd uninstall
 ~~~
 
-Default uninstall preserves repository databases and private refs. To remove
-protected data, review the separate purge plan and provide the second explicit
-confirmation. Never manually remove ownership locks or broad ACD directories.
+Default uninstall preserves repository databases and private refs. Removing
+protected data requires a separate purge review and explicit confirmation.
+Running workers save a final checkpoint before stopping. Repositories that
+are already stopped stay stopped; uninstall does not resume a prepared finish.
+
+To start clean across registered worktrees:
+
+~~~bash
+acd uninstall --dry-run --purge-data
+acd uninstall --purge-data --confirm-purge-data
+~~~
+
+This removes the runtime, ACD repository databases and directories, and private
+checkpoint and archive refs. Project Git history, staging, and working files
+stay unchanged. Run setup again when you want to reinstall.

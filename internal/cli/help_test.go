@@ -14,23 +14,22 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 	}{
 		{"setup", []string{"acd setup --dry-run", "--non-interactive", "--integrations"}},
 		{"status", []string{"current changes are protected", "exact next command", "--repo"}},
-		{"on", []string{"Start ACD protection", "background worker", "--repo"}},
+		{"on", []string{"Start checkpoint protection", "offline defaults", "durable checkpoint", "acd finish", "--repo"}},
 		{"off", []string{"final durable checkpoint", "--force"}},
 		{"list", []string{"last hour", "unfinished work", "need action", "Ctrl-C", "--watch", "--once", "--all"}},
-		{"commit-all", []string{"does not squash", "--dry-run", "--yes"}},
+		{"finish", []string{"acd finish", "--dry-run", "--include-staged", "--retry", "--message"}},
 		{"history", []string{"recent protected checkpoints", "--activity", "activity", "rewrite"}},
 		{"restore", []string{"restore [ID]", "checkpoint picker", "--yes"}},
 		{"doctor", []string{"safe next step", "--bundle", "--output"}},
 		{"uninstall", []string{"kept by default", "--dry-run", "--purge-data"}},
 		{"config", []string{"get", "set", "credentials"}},
-		{"support", []string{"diagnose", "logs", "repair", "recover", "prompt", "bundle"}},
+		{"support", []string{"diagnose", "logs", "repair", "recover", "bundle"}},
 		{"repo", []string{"list", "remove", "gc", "stats"}},
 		{"config credentials", []string{"protected provider credential", "set", "status", "remove"}},
 		{"support diagnose", []string{"acd support diagnose", "acd support recover", "--repo"}},
 		{"support logs", []string{"acd support logs", "--follow", "--repo"}},
 		{"history explain", []string{"acd history explain", "--path", "--commit"}},
 		{"history activity", []string{"acd history activity", "--watch", "--since"}},
-		{"support prompt", []string{"acd support prompt", "--seq", "--json"}},
 		{"support recover", []string{"acd support recover", "--dry-run", "--force"}},
 		{"repo stats", []string{"acd repo stats", "--since", "--json"}},
 	}
@@ -50,7 +49,7 @@ func TestMajorCommandHelpIncludesWorkflowExamples(t *testing.T) {
 func TestRootHelpLinksPublicationAndRewriteWorkflows(t *testing.T) {
 	help := commandHelp(t, "")
 	for _, want := range []string{
-		"acd commit-all --dry-run",
+		"acd finish",
 		"acd history rewrite --help",
 		"acd config",
 		"acd repo --help",
@@ -62,9 +61,9 @@ func TestRootHelpLinksPublicationAndRewriteWorkflows(t *testing.T) {
 	}
 }
 
-func TestRewriteAllExplainsTheSafeReplacement(t *testing.T) {
-	help := commandHelp(t, "rewrite-all")
-	for _, want := range []string{"does not rewrite all", "acd history rewrite", "--plan-only", "--dry-run", "--yes"} {
+func TestHistoryRewriteExplainsExplicitSavedPlanWorkflow(t *testing.T) {
+	help := commandHelp(t, "history rewrite")
+	for _, want := range []string{"acd history rewrite", "--plan-only", "--plan-out", "--apply", "--dry-run", "--yes"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("rewrite-all help missing %q:\n%s", want, help)
 		}
@@ -73,12 +72,12 @@ func TestRewriteAllExplainsTheSafeReplacement(t *testing.T) {
 
 func TestCanonicalHelpIsCompleteAndPlain(t *testing.T) {
 	commands := []string{
-		"setup", "status", "on", "off", "list", "commit-all", "history",
+		"setup", "status", "on", "off", "list", "finish", "history",
 		"history activity", "history explain", "history rewrite", "restore", "doctor", "uninstall",
 		"config", "config get", "config set", "config edit", "config reset", "config credentials",
 		"config credentials set", "config credentials status", "config credentials remove",
 		"support", "support diagnose", "support logs", "support repair", "support recover",
-		"support prompt", "support bundle", "repo", "repo list", "repo remove", "repo gc", "repo stats",
+		"support bundle", "repo", "repo list", "repo remove", "repo gc", "repo stats",
 	}
 	for _, path := range commands {
 		t.Run(path, func(t *testing.T) {
@@ -114,7 +113,6 @@ func TestCanonicalAdvancedHelpDoesNotRecommendHiddenAliases(t *testing.T) {
 		{"support logs", []string{"acd logs", "acd doctor", "acd prompt"}},
 		{"history explain", []string{"acd explain"}},
 		{"history activity", []string{"acd events"}},
-		{"support prompt", []string{"acd prompt"}},
 		{"support recover", []string{"acd fix", "acd recover"}},
 		{"repo stats", []string{"acd stats"}},
 	}

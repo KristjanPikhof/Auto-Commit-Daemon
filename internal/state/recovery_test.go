@@ -16,6 +16,9 @@ func TestRecoverySnapshotSchemaV12MigrationRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open v12 seed: %v", err)
 	}
+	if _, err := d.SQL().ExecContext(ctx, LegacySchemaDDL); err != nil {
+		t.Fatal(err)
+	}
 	seq := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 7,
 		"base-before-upgrade", "pending.txt", EventStatePending)
 	if _, err := AppendDecision(ctx, d, DecisionRecord{
@@ -108,7 +111,7 @@ PRAGMA user_version = 11;`); err != nil {
 
 func TestRecoveryChainLoadScopedOrdered(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 
 	_ = appendRecoveryTestEvent(t, ctx, d, "refs/heads/other", 4,
@@ -145,7 +148,7 @@ func TestRecoveryChainLoadScopedOrdered(t *testing.T) {
 
 func TestBoundedRecoveryChainMatchesCompleteBulkLoad(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	first := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
 		"base-one", "one.txt", EventStatePending)
@@ -169,7 +172,7 @@ func TestBoundedRecoveryChainMatchesCompleteBulkLoad(t *testing.T) {
 
 func TestBoundedRecoveryChainRejectsEventOverflow(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	first := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
 		"base-one", "one.txt", EventStatePending)
@@ -185,7 +188,7 @@ func TestBoundedRecoveryChainRejectsEventOverflow(t *testing.T) {
 
 func TestBoundedRecoveryChainRejectsOperationOverflow(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	first := appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
 		"base-one", "one.txt", EventStatePending)
@@ -207,7 +210,7 @@ INSERT INTO capture_ops(
 
 func TestPublishedRecoveryContextLoadScopedOrdered(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 
 	_ = appendRecoveryTestEvent(t, ctx, d, "refs/heads/main", 4,
@@ -245,14 +248,14 @@ func TestPublishedRecoveryContextLoadScopedOrdered(t *testing.T) {
 
 func TestPublishedRecoveryContextLoadIncludesRenameClosure(t *testing.T) {
 	t.Parallel()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	const branchRef = "refs/heads/main"
 	const generation = int64(4)
 
 	appendRename := func(oldPath, path string) int64 {
 		t.Helper()
-		seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+		seq, err := fixtureAppendCaptureEvent(ctx, d, CaptureEvent{
 			BranchRef: branchRef, BranchGeneration: generation,
 			BaseHead: "base", Operation: "rename", Path: path,
 			OldPath: sqlNullStr(oldPath), Fidelity: "exact",
@@ -264,7 +267,7 @@ func TestPublishedRecoveryContextLoadIncludesRenameClosure(t *testing.T) {
 			Fidelity: "exact",
 		}})
 		if err != nil {
-			t.Fatalf("AppendCaptureEvent rename %s -> %s: %v", oldPath, path, err)
+			t.Fatalf("fixtureAppendCaptureEvent rename %s -> %s: %v", oldPath, path, err)
 		}
 		return seq
 	}
@@ -413,7 +416,7 @@ func TestRecoveryChainTransitionAdoptsBranchAtomically(t *testing.T) {
 	assertRecoveryBookkeeping(
 		t, d, snapshot, chain, DecisionKindRecoveryPublished)
 
-	if _, ok, err := GetShadowPath(
+	if _, ok, err := fixtureGetShadowPath(
 		ctx, d, branchRef, generation, oldShadow.Path); err != nil || ok {
 		t.Fatalf("old shadow survived adoption: ok=%v err=%v", ok, err)
 	}
@@ -428,7 +431,7 @@ WHERE branch_ref = ? AND branch_generation = ?`,
 		t.Fatalf("adopted shadow rows=%d want %d", shadowCount, len(shadowRows))
 	}
 	for _, want := range shadowRows {
-		got, ok, err := GetShadowPath(
+		got, ok, err := fixtureGetShadowPath(
 			ctx, d, branchRef, generation, want.Path)
 		if err != nil || !ok || got.Operation != want.Operation ||
 			got.Mode != want.Mode || got.OID != want.OID ||
@@ -507,14 +510,14 @@ func TestRecoveryChainTransitionAdoptionRejectsAppendedCapture(t *testing.T) {
 
 	assertRecoveryNoPartialMutation(t, d, chain, unexpectedSeq)
 	assertRecoveryEventPending(t, ctx, d, laterSeq)
-	if got, ok, err := GetShadowPath(
+	if got, ok, err := fixtureGetShadowPath(
 		ctx, d, branchRef, generation, oldShadow.Path); err != nil || !ok ||
 		got.Operation != oldShadow.Operation || got.OID != oldShadow.OID ||
 		got.BaseHead != oldShadow.BaseHead || got.Fidelity != oldShadow.Fidelity {
 		t.Fatalf("old shadow after rejected adoption=(%+v,%v,%v) want %+v",
 			got, ok, err, oldShadow)
 	}
-	if _, ok, err := GetShadowPath(
+	if _, ok, err := fixtureGetShadowPath(
 		ctx, d, branchRef, generation, "new-shadow.txt"); err != nil || ok {
 		t.Fatalf("proposed shadow appeared after rejection: ok=%v err=%v", ok, err)
 	}
@@ -591,7 +594,7 @@ func TestRecoveryChainTransitionSupersedesIntentCandidate(t *testing.T) {
 	contextSeq := appendRecoveryTestEvent(t, ctx, d,
 		chain[0].Event.BranchRef, chain[0].Event.BranchGeneration,
 		"context-base", "candidate-context.txt", EventStatePublished)
-	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+	if err := fixtureSaveIntentCandidate(ctx, d, IntentCandidate{
 		ID:               "recovery-candidate",
 		BranchRef:        chain[0].Event.BranchRef,
 		BranchGeneration: chain[0].Event.BranchGeneration,
@@ -604,7 +607,7 @@ func TestRecoveryChainTransitionSupersedesIntentCandidate(t *testing.T) {
 			{EventSeq: contextSeq, EventRole: "context"},
 		},
 	}); err != nil {
-		t.Fatalf("SaveIntentCandidate: %v", err)
+		t.Fatalf("fixtureSaveIntentCandidate: %v", err)
 	}
 
 	if _, err := TransitionRecoveryChain(ctx, d, RecoveryChainTransition{
@@ -648,7 +651,7 @@ func TestRecoveryChainTransitionRollsBackCandidateRetirement(t *testing.T) {
 	t.Parallel()
 	d, chain := seedRecoveryTestChain(t)
 	ctx := context.Background()
-	if err := SaveIntentCandidate(ctx, d, IntentCandidate{
+	if err := fixtureSaveIntentCandidate(ctx, d, IntentCandidate{
 		ID:               "rollback-candidate",
 		BranchRef:        chain[0].Event.BranchRef,
 		BranchGeneration: chain[0].Event.BranchGeneration,
@@ -660,7 +663,7 @@ func TestRecoveryChainTransitionRollsBackCandidateRetirement(t *testing.T) {
 			{EventSeq: chain[1].Event.Seq, EventRole: "test"},
 		},
 	}); err != nil {
-		t.Fatalf("SaveIntentCandidate: %v", err)
+		t.Fatalf("fixtureSaveIntentCandidate: %v", err)
 	}
 	if _, err := d.SQL().ExecContext(ctx, `
 CREATE TRIGGER recovery_abort_candidate_retirement
@@ -809,17 +812,17 @@ END`, secondSeq)); err != nil {
 
 func seedRecoveryTestChain(t *testing.T) (*DB, []RecoveryChainEvent) {
 	t.Helper()
-	d, _ := openTestDB(t)
+	d, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	const branchRef = "refs/heads/main"
 	const generation = int64(3)
 
 	first := appendRecoveryTestEvent(t, ctx, d, branchRef, generation,
 		"base-one", "first.txt", EventStatePending)
-	if err := MarkEventBlocked(ctx, d, first, "before-state mismatch", 10,
+	if err := fixtureMarkEventBlocked(ctx, d, first, "before-state mismatch", 10,
 		sqlNullStr(branchRef), sql.NullInt64{Int64: generation, Valid: true},
 		sqlNullStr("base-one")); err != nil {
-		t.Fatalf("MarkEventBlocked: %v", err)
+		t.Fatalf("fixtureMarkEventBlocked: %v", err)
 	}
 	second := appendRecoveryTestEvent(t, ctx, d, branchRef, generation,
 		"base-two", "second.txt", EventStatePending)
@@ -847,7 +850,7 @@ VALUES (?, 1, 1)`, seq); err != nil {
 
 func appendRecoveryTestEvent(t *testing.T, ctx context.Context, d *DB, branchRef string, generation int64, baseHead, path, eventState string) int64 {
 	t.Helper()
-	seq, err := AppendCaptureEvent(ctx, d, CaptureEvent{
+	seq, err := fixtureAppendCaptureEvent(ctx, d, CaptureEvent{
 		BranchRef:        branchRef,
 		BranchGeneration: generation,
 		BaseHead:         baseHead,
@@ -865,7 +868,7 @@ func appendRecoveryTestEvent(t *testing.T, ctx context.Context, d *DB, branchRef
 		Fidelity:   "exact",
 	}})
 	if err != nil {
-		t.Fatalf("AppendCaptureEvent %s: %v", path, err)
+		t.Fatalf("fixtureAppendCaptureEvent %s: %v", path, err)
 	}
 	return seq
 }
@@ -885,7 +888,7 @@ func seedRecoveryAdoptionBaseline(
 		Mode: sqlNullStr("100644"), OID: sqlNullStr("old-blob"),
 		BaseHead: "old-live-head", Fidelity: "full",
 	}
-	if err := UpsertShadowPath(ctx, d, oldShadow); err != nil {
+	if err := fixtureUpsertShadowPath(ctx, d, oldShadow); err != nil {
 		t.Fatalf("seed adoption shadow: %v", err)
 	}
 	meta := map[string]string{
@@ -966,9 +969,9 @@ FROM capture_events WHERE seq = ?`, expected.Event.Seq).Scan(
 				expected.Event.Seq, branchRef, generation, baseHead, operation, path,
 				oldPath, fidelity, expected.Event)
 		}
-		ops, err := LoadCaptureOps(ctx, d, expected.Event.Seq)
+		ops, err := fixtureLoadCaptureOps(ctx, d, expected.Event.Seq)
 		if err != nil {
-			t.Fatalf("LoadCaptureOps seq=%d: %v", expected.Event.Seq, err)
+			t.Fatalf("fixtureLoadCaptureOps seq=%d: %v", expected.Event.Seq, err)
 		}
 		if !sameRecoveryChain(
 			[]RecoveryChainEvent{{Event: expected.Event, Ops: ops}},

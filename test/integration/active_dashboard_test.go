@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +20,15 @@ func TestActiveDashboardWorksOutsideRepositories(t *testing.T) {
 	ctx := context.Background()
 	env := withIsolatedHome(t)
 	active, idle := tempRepo(t), tempRepo(t)
+	var err error
+	active, err = filepath.EvalSymlinks(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idle, err = filepath.EvalSymlinks(idle)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, repo := range []string{active, idle} {
 		prepareCheckpointRegistration(t, env, repo)
 		db, err := state.Open(ctx, filepath.Join(repo, ".git", "acd", "state.db"))
@@ -31,7 +39,9 @@ func TestActiveDashboardWorksOutsideRepositories(t *testing.T) {
 		if repo == idle {
 			at = at.Add(-2 * time.Hour)
 		}
-		state.RecordActivity(ctx, db, at)
+		if err := state.MetaSetJSON(ctx, db, "capture.health", state.CaptureHealth{State: "healthy", LastProgressTS: float64(at.Unix())}); err != nil {
+			t.Fatal(err)
+		}
 		if err := state.MetaSetJSON(ctx, db, checkpoint.MaintenanceMetaKey, checkpoint.MaintenanceStatus{State: "prerequisite", Error: "Xcode license agreements"}); err != nil {
 			t.Fatal(err)
 		}
@@ -75,27 +85,5 @@ func TestActiveDashboardWorksOutsideRepositories(t *testing.T) {
 		if !bytes.Equal(original, after) {
 			t.Fatalf("read-only list changed %s", path)
 		}
-	}
-}
-
-func assertRecentDashboardActivity(t *testing.T, repo string) {
-	t.Helper()
-	ctx := context.Background()
-	db, err := state.Open(ctx, filepath.Join(repo, ".git", "acd", "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	raw, ok, err := state.MetaGet(ctx, db, state.ActivityMetaKey)
-	if err != nil || !ok {
-		t.Fatalf("activity missing: %q %v", raw, err)
-	}
-	ts, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || time.Since(time.Unix(ts, 0)) > time.Minute {
-		t.Fatalf("activity not recent: %q %v", raw, err)
-	}
-	active, _, err := state.MetaGet(ctx, db, state.RewritePIDMetaKey)
-	if err != nil || active != "" {
-		t.Fatalf("completed operation still active: %q %v", active, err)
 	}
 }

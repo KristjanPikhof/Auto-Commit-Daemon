@@ -1,5 +1,8 @@
 # v19 to v20 checkpoint cutover
 
+> **Historical v19-to-v20 design.** This page records the earlier automatic-publication cutover and its safety provenance. It is not the current upgrade procedure or a statement about the installed runtime. For the finish-based release, use [setup and commands](commands.md) and the [explicit finish contract](finish-contract.md).
+
+
 ACD upgrades all registered repositories in one transaction through
 `acd setup`. There is no legacy engine mode, dual-read period, staged
 production rollout, or automatic post-commit downgrade.

@@ -1,32 +1,36 @@
 # Multiple tools in one repository
 
-ACD protection is tool-independent. Editors, terminals, agent harnesses, and
-other local processes can modify the same worktree; watching plus complete
-polling observes the resulting filesystem state.
+ACD protection observes filesystem changes from editors, terminals, agents,
+and other local tools. Optional integrations send wake hints to the same worker;
+they do not create a second protection engine or commit boundaries.
 
-Optional integrations add semantic or boundary hints. Duplicate hints are
-idempotent observations and do not create a second protection engine.
+Hooks contact only registered, enabled repositories through a matching runtime.
+Unknown or disabled repositories are skipped without registration or state
+creation. Tool stop, idle, and session-close events are activity hints. They do
+not mean the task is complete and never start Finish, retry AI, clear staging,
+or rewrite history. Templates do not forward prompts or session identifiers.
 
-Some tools install hooks for every workspace. Each ACD hook checks the nearest
-Git root against ACD's registry before it contacts the supervisor. Repositories
-where ACD is off, disabled, or not registered are ignored without creating
-state or showing a hook error.
+One worker owns a Git common directory. Linked worktrees retain distinct
+identities and checkpoints. You can enable each explicitly with `acd on`
+inside that worktree or with `--repo PATH`.
 
-One worker owns each Git common directory, so linked worktrees share ownership
-while retaining distinct worktree identities and settings. Publication uses
-the current exact branch token and suspends during transitions or unsafe Git
-state.
-
-When another tool also creates commits, ACD reconciles the external branch
-movement before publishing. If exact ancestry/tree proof is impossible, it
-reports `needs_action` rather than discarding or guessing.
+An agent may run `acd finish` for completed work only when the user authorized
+publication. Merely saving a file or sending a hook is not that authorization.
+Review staging and use `--include-staged` only for an approved exact selection.
+Never make manual Git commits to bypass an active ACD owner.
 
 ~~~bash
 acd status
+acd finish "Complete the approved checkout change"
 acd history --activity
 acd doctor
 ~~~
 
-Avoid running two unrelated automatic commit publishers against the same
-branch. Checkpoint protection remains safe, but publication may wait repeatedly
-on external movement.
+If another tool moves the branch or changes the index during a finish, ACD
+requires the frozen publication proof to match. Later file edits stay protected,
+but they do not expand the request. Inspect a failed request and explicitly
+retry or start a fresh finish; a hook does not resolve stale proof.
+
+Source and installed runtime can differ. An existing older runtime may still
+publish automatically until an explicit `acd setup` upgrade. Integrations refuse
+an incompatible runtime rather than replacing it during normal activity.

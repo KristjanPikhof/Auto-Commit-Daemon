@@ -1,112 +1,104 @@
 # AI providers
 
-Fresh interactive setup recommends AI semantic commits. You choose the provider
-and approve its access. The explicit deterministic option works without
-credentials, network requests, or source sharing. Upgrades preserve saved choices.
+Local finish is offline. It builds no provider, reads no credentials, launches
+no provider process, and sends no source content. Intent requires an explicitly
+configured and approved AI provider.
 
-| Provider | Credential | Source diff |
+| Mode or provider | Execution | Input |
 |---|---|---|
-| `deterministic` | None | Inside the worker only |
-| `openai-compat` | Protected credential store or environment | Only with explicit diff-egress approval and provider declaration |
-| `subprocess:<name>` | Provider-specific | Local process receives only its approved input contract |
+| Local (`deterministic`) | Inside the worker | No provider request |
+| Intent (`openai-compat`) | Reviewed HTTP endpoint | Bounded metadata and approved redacted text |
+| Intent (`subprocess:<name>`) | Approved local executable | The same bounded planning contract |
 
-The built-in local Intent planner uses bounded, redacted captured evidence
-inside the worker. Network and subprocess permissions stay separate.
+Selecting Intent with `deterministic` is invalid. Choose Local for offline work
+or configure an AI transport in `acd config`.
 
-Open `acd config`, choose global or repository scope, and edit the provider,
-model, endpoint, or API key. Save reviews the permissions and tests the connection
-before storing a replacement key. A global save also queues inherited changes
-for enabled repositories. The standalone credential command remains available:
+## Credentials and configuration
 
 ~~~bash
 acd config
+acd config credentials status
 acd config credentials set
 ~~~
 
-`acd config credentials set` stores the key securely and tests it with synthetic
-content for the current enabled OpenAI-compatible repository. Use `--repo PATH`
-to select one.
-After a successful test, ACD queues the repository's existing settings again so
-work waiting on corrected credentials can resume. Saved provider choices and
-source-sharing approvals stay intact. Other running repositories are unchanged.
-An environment key still takes precedence over the stored key.
+The protected credential store is
+`${XDG_CONFIG_HOME:-$HOME/.config}/acd/credentials.json`, under an owner-only
+directory with a regular `0600` file. An environment API key takes precedence
+over the stored key and is not persisted.
+
+Saving credentials or applying reviewed settings makes no provider request.
+Validation checks configuration and permissions locally. An explicitly invoked
+connection test through the settings API sends one fixed synthetic request,
+uses no repository source, and has a maximum 30-second budget. It does not retry
+or become a background readiness check. The command-line editor does not
+require a successful connection test to Save.
+
+Provider credential values stay out of repository state, plan fingerprints,
+ordinary logs, JSON, diagnostics, and support output. Errors use redacted summaries. When
+sharing older opt-in trace files, inspect them first: redacted diagnostic
+content can still contain source text. New Finish does not use the retired
+planner's raw rejection log or automatic prompt-trace writer.
 
 ## Privacy contract
 
-Network content is redacted and bounded. A network provider receives diffs
-only when it declares `NeedsDiff` and diff egress is explicitly enabled.
-Binary contents never enter planner requests. Native Intent input includes
-filenames, operations, blob sizes, file kind, and the reason a diff was omitted.
-Text diffs keep the existing redaction, size bounds, and egress permission.
-Native metadata marks text diffs shortened by the size limit.
-Older provider protocols keep their existing filename and operation fields.
-Credentials never enter state, logs, status, diagnostics, traces, plan
-fingerprints, or test output. Full provider payloads stay out of ordinary
-diagnostics. `ACD_AI_PROMPT_TRACE` is an explicit local opt-in that records
-redacted and truncated provider requests which may still contain source text.
-Rejected-plan logs omit the raw response by default.
-`ACD_INTENT_REJECTS_RAW` is a separate opt-in that stores that response in the
-worktree-local reject log described below.
+Diff egress is off by default. Intent metadata includes paths, recorded
+operations and versions, object identities, sizes, and file kind. Supplied
+purpose and message can also enter the provider request; ACD redacts their
+provider copies. The exact valid user message remains local for publication.
+Approving text diffs permits their redacted content to be sent to the selected
+provider. A local subprocess is also a recipient; being local does not grant
+it implicit permission.
 
-Strict provider tests use fixed synthetic content and no repository source.
-First setup tests the selected provider after review and before any write. Its
-scratch self-test does not call a network provider.
+Binary or invalid-text blobs are metadata only. Their complete objects remain
+available locally for exact tree verification. Limits are independent of
+checkpoint storage:
+
+| Input | Maximum |
+|---|---|
+| One textual path diff | 128 KiB |
+| Aggregate finish diffs | 512 KiB |
+| Aggregate history diffs | 512 KiB |
+| Serialized planning request, including a correction | 512 KiB per exchange |
+
+ACD measures complete input before sending. It fails oversized evidence with
+`provider_input_too_large` and guidance to choose Local or a smaller explicit
+history range. It does not clip text or silently omit eligible changes.
+
+Saved disclosure identifies the attempted provider input and redaction. Encoded
+request byte counts measure attempted exchanges; they do not prove the peer
+received a payload after a network failure.
 
 ## OpenAI-compatible endpoints
 
-The provider supports an explicit base URL, model, timeout, CA file, and API
-key. Endpoint credentials are stored in the existing protected credential
-file. Environment credentials win without being persisted.
+Configure the base URL, model, timeout, and optional CA certificate in
+`acd config`. Custom endpoint credential disclosure, unencrypted HTTP, and
+diff egress have separate approvals. HTTPS is the default. HTTP can expose the
+bearer token and content in transit.
 
-Use a custom endpoint only after reviewing its data handling. A saved endpoint
-does not itself grant diff egress.
-
-HTTPS is the safe default. HTTP requires a separate warning approval because
-the bearer token and request content can be read or changed in transit. ACD
-refuses redirects and endpoint URLs with embedded credentials, query strings,
-fragments, control characters, or unsupported schemes. A custom CA certificate
-is available under the optional connection settings.
+ACD rejects redirects, embedded URL credentials, query strings, fragments,
+control characters, and unsupported schemes. Each exchange performs one HTTP
+request with bounded response size and cancellation.
 
 ## Subprocess providers
 
-Subprocess providers are unsandboxed local programs and inherit worker
-privileges. Pin and review them like any executable on `PATH`. Protocol v1 is
-adapted for compatibility and cannot claim native Intent readiness.
+Subprocess providers are unsandboxed programs with worker privileges. Review
+the executable and its protocol before approving it. The retained transport
+accepts a Finish planning exchange; old event, candidate, and repair protocols
+are not planning alternatives. Cancellation and Close terminate the owned
+process group and join its readers within bounded cleanup.
 
 ## Failure behavior
 
-Provider failures do not affect completed checkpoints or `protected=true`.
-Malformed plans are repaired locally, partially replanned, or replaced with a
-verified evidence partition. This applies to Fast, Balanced, and Quality.
+Intent allows one planning exchange and at most one combined correction under
+a single persisted deadline. `ai.timeout` defaults to five minutes. Transport
+failure, missing credentials, invalid output, or deadline exhaustion fails the
+request. There is no automatic retry timer or Local fallback.
 
-Each provider probe gets an `ai.timeout` budget, five minutes by default.
-Connection failures and timeouts leave the planning run retryable. Capture and
-checkpoint protection continue while publication waits. A failed connection
-does not consume a semantic correction attempt or permanently cache a local
-message as the completed plan.
+Messages-only history planning follows the same rule. Invalid response framing,
+including an unsupported protocol version, requires correction or fails the
+request even when the enclosed goals are valid.
 
-The retry schedule is five minutes after the first failure, ten minutes after
-the next, then one hour after subsequent failures. The next probe time survives
-a worker restart. Only one probe runs at a time; file events still wake capture
-immediately. Status and list show the retry countdown, then `provider-retry-due`
-when the scheduled time has arrived.
-
-A rejected semantic plan is a separate failure. ACD keeps valid groups and
-corrects the unresolved part within the bounded planning session. An unchanged
-unresolved goal gets a scheduled review instead of repeated calls every poll.
-Incorrect credentials or missing required configuration still require a
-settings correction.
-
-Local recovery messages must describe an outcome supported by the captured
-changes. Filename messages, raw code symbols, clipped subjects, and generic
-phrases such as `Update export code changes` do not pass Intent quality checks.
-When ACD cannot write a useful message, it keeps the work protected for later
-planning. An outage never grants permission to publish an incomplete goal.
-
-Rejected plans are written to the exact worktree Git directory at
-`<gitDir>/acd/planner-rejects.jsonl`. Linked worktrees therefore keep separate
-reject logs. By default each row omits the raw response and records its byte
-count, SHA-256 digest, typed failure, and a small parsed-plan summary. Explicit
-raw-retention opt-in stores the response as well. The current file rotates at
-5 MiB and keeps one `.1` file. A reject-log write failure never blocks capture
-or publication fallback.
+Completed checkpoints remain protected. Correct the cause and explicitly retry
+with `acd finish --retry REQUEST_ID`, or choose Local in reviewed settings and
+start a new finish. Retry keeps the frozen target; it does not include later
+edits. Status, list, and doctor never contact a provider.

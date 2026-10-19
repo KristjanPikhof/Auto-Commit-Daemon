@@ -17,6 +17,8 @@ import (
 	// so isSQLiteLocked can match against the typed *sqlite.Error returned
 	// by the driver in addition to the substring fallback.
 	sqlite "modernc.org/sqlite"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 // SQLite primary result codes we care about for retry logic. Defined locally
@@ -242,7 +244,7 @@ func OpenReadOnly(ctx context.Context, dbPath string) (*DB, error) {
 	q.Set("mode", "ro")
 	q.Add("_pragma", "query_only(ON)")
 	q.Add("_pragma", "busy_timeout(5000)")
-	dsn := "file:" + dbPath + "?" + q.Encode()
+	dsn := paths.DatabaseURI(dbPath, q)
 	conn, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("state: open read-only: %w", err)
@@ -282,7 +284,7 @@ func ReadUserVersion(ctx context.Context, dbPath string) (int, error) {
 	q.Set("mode", "ro")
 	q.Add("_pragma", "query_only(ON)")
 	q.Add("_pragma", "busy_timeout(5000)")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return 0, fmt.Errorf("state: inspect schema: %w", err)
 	}
@@ -303,7 +305,7 @@ func buildDSN(dbPath string) string {
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "busy_timeout(5000)")
-	return "file:" + dbPath + "?" + q.Encode()
+	return paths.DatabaseURI(dbPath, q)
 }
 
 // bootstrapWithRetry runs the schema bootstrap with a small backoff loop on
@@ -352,11 +354,17 @@ func (d *DB) runBootstrap(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }() // no-op if Commit succeeded
 
-	if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
+	ddl := schemaDDL
+	if cur > 0 && cur <= 32 {
+		ddl = LegacySchemaDDL
+	}
+	if _, err := tx.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("state: apply schema: %w", err)
 	}
-	if err := applyVersionedMigrations(ctx, tx, cur); err != nil {
-		return err
+	if cur > 0 {
+		if err := applyVersionedMigrations(ctx, tx, cur); err != nil {
+			return err
+		}
 	}
 
 	// Set the schema version. PRAGMA user_version is per-database (stored in

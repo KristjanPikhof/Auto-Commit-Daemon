@@ -20,7 +20,7 @@ func TestRootHelpExposesSettingsAndProductCommands(t *testing.T) {
 		t.Fatalf("stderr=%q", errOut.String())
 	}
 	got := out.String()
-	for _, command := range []string{"setup", "config", "status", "on", "off", "list", "commit-all", "history", "restore", "doctor", "uninstall"} {
+	for _, command := range []string{"setup", "config", "status", "on", "off", "list", "finish", "history", "restore", "doctor", "uninstall"} {
 		if !strings.Contains(got, "  "+command) {
 			t.Fatalf("help missing %s:\n%s", command, got)
 		}
@@ -36,25 +36,38 @@ func TestRootHelpExposesSettingsAndProductCommands(t *testing.T) {
 			visible++
 		}
 	}
-	if visible != 11 {
-		t.Fatalf("visible root commands=%d want=11", visible)
+	if visible != 12 {
+		t.Fatalf("visible root commands=%d want=12", visible)
 	}
 }
 
-func TestRootVersionFlagAndHiddenAliasMatch(t *testing.T) {
-	run := func(args ...string) string {
-		t.Helper()
-		root := newRootCmd()
-		var out bytes.Buffer
-		root.SetOut(&out)
-		root.SetErr(&bytes.Buffer{})
-		root.SetArgs(args)
-		if err := root.ExecuteContext(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		return out.String()
+func TestRootVersionFlagAndFiniteCommandCatalog(t *testing.T) {
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"--version"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	if flag, alias := run("--version"), run("version"); flag != alias {
-		t.Fatalf("version outputs differ: flag=%q alias=%q", flag, alias)
+	if got, want := out.String(), "acd version "+root.Version+"\n"; got != want {
+		t.Fatalf("version=%q want=%q", got, want)
+	}
+	expected := map[string]bool{"setup": false, "status": false, "on": false, "off": false, "list": false, "finish": false, "commit-all": false, "history": false, "restore": false, "doctor": false, "uninstall": false, "config": false, "support": true, "repo": true, "internal": true}
+	for _, command := range newRootCmd().Commands() {
+		hidden, ok := expected[command.Name()]
+		if !ok || command.Hidden != hidden {
+			t.Fatalf("unexpected root command %s hidden=%t", command.Name(), command.Hidden)
+		}
+		delete(expected, command.Name())
+	}
+	if len(expected) != 0 {
+		t.Fatalf("missing commands %v", expected)
+	}
+	for _, retired := range []string{"version", "init", "events", "prompt", "fix", "recover", "stats", "start", "stop", "flush", "rewrite-commits"} {
+		command, _, err := newRootCmd().Find([]string{retired})
+		if err == nil && command.Name() == retired {
+			t.Fatalf("retired root command %s remains", retired)
+		}
 	}
 }

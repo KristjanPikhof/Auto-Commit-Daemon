@@ -111,13 +111,13 @@ func TestSafeIgnoreMatchRootReturnsConcreteGeneratedRoot(t *testing.T) {
 func TestScanGeneratedPendingDeletesGroupsSafeIgnoreRoots(t *testing.T) {
 	t.Setenv(EnvSafeIgnore, "")
 	t.Setenv(EnvSafeIgnoreExtra, "")
-	db, _ := openTestDB(t)
+	db, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	head := "0123456789012345678901234567890123456789"
 
 	appendEvent := func(op, path, st string) int64 {
 		t.Helper()
-		seq, err := AppendCaptureEvent(ctx, db, CaptureEvent{
+		seq, err := fixtureAppendCaptureEvent(ctx, db, CaptureEvent{
 			BranchRef:        "refs/heads/main",
 			BranchGeneration: 1,
 			BaseHead:         head,
@@ -127,7 +127,7 @@ func TestScanGeneratedPendingDeletesGroupsSafeIgnoreRoots(t *testing.T) {
 			State:            st,
 		}, nil)
 		if err != nil {
-			t.Fatalf("AppendCaptureEvent(%s,%s,%s): %v", op, path, st, err)
+			t.Fatalf("fixtureAppendCaptureEvent(%s,%s,%s): %v", op, path, st, err)
 		}
 		return seq
 	}
@@ -163,10 +163,10 @@ func TestScanGeneratedPendingDeletesGroupsSafeIgnoreRoots(t *testing.T) {
 func TestScanGeneratedPendingDeletesIgnoresSameNamedFile(t *testing.T) {
 	t.Setenv(EnvSafeIgnore, "")
 	t.Setenv(EnvSafeIgnoreExtra, "")
-	db, _ := openTestDB(t)
+	db, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 
-	if _, err := AppendCaptureEvent(ctx, db, CaptureEvent{
+	if _, err := fixtureAppendCaptureEvent(ctx, db, CaptureEvent{
 		BranchRef:        "refs/heads/main",
 		BranchGeneration: 1,
 		BaseHead:         "0123456789012345678901234567890123456789",
@@ -175,7 +175,7 @@ func TestScanGeneratedPendingDeletesIgnoresSameNamedFile(t *testing.T) {
 		Fidelity:         "full",
 		State:            EventStatePending,
 	}, nil); err != nil {
-		t.Fatalf("AppendCaptureEvent: %v", err)
+		t.Fatalf("fixtureAppendCaptureEvent: %v", err)
 	}
 
 	groups, err := ScanGeneratedPendingDeletes(ctx, db.ReadSQL(), NewSafeIgnoreMatcher(), 0)

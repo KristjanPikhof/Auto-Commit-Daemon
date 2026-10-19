@@ -7,8 +7,6 @@ hooks:
           acd internal integration event \
             --harness pi \
             --event session_open \
-            --session-id "${PI_SESSION_ID:-}" \
-            --watch-pid "$PPID" \
             --repo "$PI_PROJECT_DIR"
 
   - id: acd-wake-tool-before
@@ -18,8 +16,6 @@ hooks:
           acd internal integration event \
             --harness pi \
             --event activity \
-            --session-id "${PI_SESSION_ID:-}" \
-            --watch-pid "$PPID" \
             --repo "$PI_PROJECT_DIR"
 
   - id: acd-wake-tool-after
@@ -29,19 +25,15 @@ hooks:
           acd internal integration event \
             --harness pi \
             --event activity \
-            --session-id "${PI_SESSION_ID:-}" \
-            --watch-pid "$PPID" \
             --repo "$PI_PROJECT_DIR"
 
-  - id: acd-flush-idle
+  - id: acd-wake-idle
     event: session.idle
     actions:
       - bash: |
           acd internal integration event \
             --harness pi \
-            --event logical_boundary \
-            --session-id "${PI_SESSION_ID:-}" \
-            --watch-pid "$PPID" \
+            --event activity \
             --repo "$PI_PROJECT_DIR"
 
   - id: acd-stop
@@ -51,6 +43,4 @@ hooks:
           acd internal integration event \
             --harness pi \
             --event session_close \
-            --session-id "${PI_SESSION_ID:-}" \
-            --watch-pid "$PPID" \
             --repo "$PI_PROJECT_DIR"

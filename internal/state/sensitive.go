@@ -209,6 +209,14 @@ func (m *SensitiveMatcher) MatchDirectory(rel string) bool {
 	return false
 }
 
+// NewSensitiveMatcherFromPatterns restores an already approved protection scope.
+func NewSensitiveMatcherFromPatterns(deny, allow []string) *SensitiveMatcher {
+	return newSensitiveMatcher(sensitiveGlobConfig{deny: append([]string(nil), deny...), allow: append([]string(nil), allow...)})
+}
+
+// AllowPatterns returns a copy of the saved sensitivity exceptions.
+func (m *SensitiveMatcher) AllowPatterns() []string { return append([]string(nil), m.allow...) }
+
 // Patterns returns a copy of the precomputed pattern list (for diagnostics).
 func (m *SensitiveMatcher) Patterns() []string {
 	out := make([]string, len(m.patterns))

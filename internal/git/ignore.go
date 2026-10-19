@@ -183,6 +183,12 @@ func (c *IgnoreChecker) Check(ctx context.Context, paths []string) ([]bool, erro
 	// Build the NUL-delimited stdin payload.
 	var buf bytes.Buffer
 	for _, p := range paths {
+		// check-ignore rejects pathspec magic, including Git's global literal
+		// mode. A relative prefix makes filenames beginning with :( ordinary
+		// paths without changing their ignore matching.
+		if strings.HasPrefix(p, ":(") {
+			buf.WriteString("./")
+		}
 		buf.WriteString(p)
 		buf.WriteByte(0)
 	}

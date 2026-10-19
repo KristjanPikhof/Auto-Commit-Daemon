@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -183,9 +184,7 @@ func TestDaemonClonedStateFixturesStayPrivate(t *testing.T) {
 		name string
 		open func(*testing.T) *state.DB
 	}{
-		{"candidate", openIntentCandidateTestDB},
 		{"refcount", openTestDB},
-		{"provider health", newIntentHealthTestDB},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			first, second := fixture.open(t), fixture.open(t)
@@ -201,7 +200,10 @@ func TestDaemonClonedStateFixturesStayPrivate(t *testing.T) {
 			if err != nil || version != state.SchemaVersion {
 				t.Fatalf("cloned schema version=%d err=%v", version, err)
 			}
-			capture := appendIntentCandidateCapture(t, first, "isolation.go", "create", "", "recorded-object")
+			seq, err := testutil.SeedLegacyCapture(ctx, first, state.CaptureEvent{BranchRef: "refs/heads/main", BranchGeneration: 1, Operation: "create", Path: "isolation.go", Fidelity: "full"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
 			pending, err := state.PendingEvents(ctx, second, 0)
 			if err != nil || len(pending) != 0 {
 				t.Fatal("private capture leaked into another fixture")
@@ -212,7 +214,7 @@ func TestDaemonClonedStateFixturesStayPrivate(t *testing.T) {
 			}
 			defer reopened.Close()
 			pending, err = state.PendingEvents(ctx, reopened, 0)
-			if err != nil || len(pending) != 1 || pending[0].Seq != capture.Event.Seq {
+			if err != nil || len(pending) != 1 || pending[0].Seq != seq {
 				t.Fatal("cloned database lost durable capture state on reopen")
 			}
 		})

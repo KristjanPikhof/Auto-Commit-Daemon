@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -184,36 +183,11 @@ func AdvanceOperation(ctx context.Context, db *DB, operationID, phase, status, s
 	return nil
 }
 
-func CompleteOperationStep(ctx context.Context, db *DB, operationID string, sequence int, phase string) error {
-	now := float64(time.Now().UnixNano()) / float64(time.Second)
-	result, err := db.conn.ExecContext(ctx, `UPDATE operation_steps SET phase=?,completed_ts=? WHERE operation_id=? AND ord=?`,
-		phase, now, operationID, sequence)
-	if err != nil {
-		return err
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
 func PrepareRestoreOperation(ctx context.Context, db *DB, operationID, targetCheckpointID, planDigest string) error {
 	now := float64(time.Now().UnixNano()) / float64(time.Second)
 	_, err := db.conn.ExecContext(ctx, `INSERT INTO restore_operations(operation_id,target_checkpoint_id,plan_digest,phase,created_ts,updated_ts)
 VALUES(?,?,?,?,?,?)`, operationID, targetCheckpointID, planDigest, OperationPrepared, now, now)
 	return err
-}
-
-func CompleteRestoreOperation(ctx context.Context, db *DB, operationID, preCheckpointID, postCheckpointID, phase string) error {
-	result, err := db.conn.ExecContext(ctx, `UPDATE restore_operations SET pre_restore_checkpoint_id=?,post_restore_checkpoint_id=?,phase=?,updated_ts=? WHERE operation_id=?`,
-		preCheckpointID, postCheckpointID, phase, float64(time.Now().UnixNano())/float64(time.Second), operationID)
-	if err != nil {
-		return err
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		return sql.ErrNoRows
-	}
-	return nil
 }
 
 func AdvanceRestoreOperation(ctx context.Context, db *DB, operationID, preCheckpointID, postCheckpointID, phase string) error {
@@ -283,77 +257,4 @@ FROM operation_steps WHERE operation_id=? ORDER BY ord`, operationID)
 		steps = append(steps, step)
 	}
 	return steps, rows.Err()
-}
-
-func UncheckpointedEventSeqsSince(ctx context.Context, db *DB, capturedAfter float64) ([]int64, error) {
-	rows, err := db.conn.QueryContext(ctx, `
-SELECT e.seq FROM capture_events e
-LEFT JOIN checkpoint_events ce ON ce.event_seq=e.seq
-WHERE ce.event_seq IS NULL AND e.captured_ts>=?
-ORDER BY e.seq`, capturedAfter)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []int64
-	for rows.Next() {
-		var seq int64
-		if err := rows.Scan(&seq); err != nil {
-			return nil, err
-		}
-		result = append(result, seq)
-	}
-	return result, rows.Err()
-}
-
-// UncheckpointedEventSeqs returns the requested event sequences that do not
-// already belong to an immutable checkpoint, preserving caller order. This is
-// used by restartable migrations that may encounter recovery snapshots whose
-// events were protected by an earlier setup attempt.
-func UncheckpointedEventSeqs(
-	ctx context.Context,
-	db *DB,
-	eventSeqs []int64,
-) ([]int64, error) {
-	if db == nil {
-		return nil, errors.New("state: uncheckpointed events require state")
-	}
-	owned := make(map[int64]struct{})
-	const batchSize = 500
-	for start := 0; start < len(eventSeqs); start += batchSize {
-		end := min(start+batchSize, len(eventSeqs))
-		placeholders := make([]string, 0, end-start)
-		args := make([]any, 0, end-start)
-		for _, seq := range eventSeqs[start:end] {
-			if seq <= 0 {
-				return nil, errors.New("state: invalid checkpoint event sequence")
-			}
-			placeholders = append(placeholders, "?")
-			args = append(args, seq)
-		}
-		rows, err := db.readSQL().QueryContext(ctx, `
-SELECT event_seq FROM checkpoint_events
-WHERE event_seq IN (`+strings.Join(placeholders, ",")+`)`, args...)
-		if err != nil {
-			return nil, fmt.Errorf("state: inspect checkpoint ownership: %w", err)
-		}
-		for rows.Next() {
-			var seq int64
-			if err := rows.Scan(&seq); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			owned[seq] = struct{}{}
-		}
-		if err := rows.Close(); err != nil {
-			return nil, err
-		}
-	}
-	result := make([]int64, 0, len(eventSeqs))
-	for _, seq := range eventSeqs {
-		if _, exists := owned[seq]; !exists {
-			result = append(result, seq)
-		}
-	}
-	return result, nil
 }

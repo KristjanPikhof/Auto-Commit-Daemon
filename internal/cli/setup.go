@@ -5,7 +5,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -69,10 +68,6 @@ func newSetupCmd() *cobra.Command {
 	return newSetupCommand(false)
 }
 
-func newSetupInitCompatCmd() *cobra.Command {
-	return newSetupCommand(true)
-}
-
 func newSetupCommand(initCompat bool) *cobra.Command {
 	var dryRun, yes, nonInteractive, rawFlag bool
 	var expectedPlan, integrations string
@@ -91,10 +86,8 @@ service, and updates user-level integrations as one rollback-safe operation.
 After installation, interactive setup offers to protect the current repository
 with a separate confirmation. You can also run acd on in each repository.
 
-Start with --dry-run when you want a preview. Fresh setup recommends AI semantic
-commits and tests the selected connection using synthetic content. Local automatic
-commits remain available without credentials or network access. Fresh unattended
-setup requires --provider openai-compat or --provider deterministic. On macOS, run setup
+Start with --dry-run when you want a preview. Fresh setup uses local commits, created only by acd finish, without
+credentials or network access. Intent and provider setup are optional. On macOS, run setup
 from the terminal or coding tool that should own the ACD service.
 Full Disk Access is not required.`,
 		Example: `  acd setup
@@ -111,9 +104,9 @@ Full Disk Access is not required.`,
 			if len(args) == 1 {
 				for _, name := range []string{
 					"dry-run", "yes", "non-interactive", "expect-plan", "integrations", "repo",
-					"experience", "commit-format", "provider", "base-url", "model", "ca-file",
+					"strategy", "experience", "commit-format", "provider", "base-url", "model", "ca-file",
 					"credential-stdin", "accessible", "confirm-endpoint-credentials",
-					"confirm-insecure-http", "confirm-diff-egress", "confirm-intent-repair",
+					"confirm-insecure-http", "confirm-diff-egress",
 				} {
 					if flagWasSet(cmd, name) {
 						return invalidCommandError("acd setup %s: --%s is not supported by the compatibility print route", args[0], name)
@@ -138,7 +131,8 @@ Full Disk Access is not required.`,
 	cmd.Flags().StringVar(&expectedPlan, "expect-plan", "", "Apply only this exact plan ID")
 	cmd.Flags().StringVar(&integrations, "integrations", "auto", "Coding-tool integrations: auto, none, or a comma-separated list")
 	cmd.Flags().BoolVar(&rawFlag, "raw", false, "Compatibility: print a harness snippet without instructions")
-	cmd.Flags().StringVar(&onboarding.Experience, "experience", "", "First setup: everyday or speed")
+	cmd.Flags().StringVar(&onboarding.Strategy, "strategy", "", "First setup: local (default) or intent")
+	_ = cmd.Flags().MarkHidden("experience")
 	cmd.Flags().StringVar(&onboarding.CommitFormat, "commit-format", "", "First setup: imperative or conventional")
 	cmd.Flags().StringVar(&onboarding.Provider, "provider", "", "First setup: deterministic or openai-compat")
 	cmd.Flags().StringVar(&onboarding.BaseURL, "base-url", "", "OpenAI-compatible base URL")
@@ -149,7 +143,6 @@ Full Disk Access is not required.`,
 	cmd.Flags().BoolVar(&onboarding.ConfirmEndpointCredentials, "confirm-endpoint-credentials", false, "Allow the bearer token to be sent to the reviewed endpoint")
 	cmd.Flags().BoolVar(&onboarding.ConfirmInsecureHTTP, "confirm-insecure-http", false, "Allow unencrypted HTTP after reviewing the warning")
 	cmd.Flags().BoolVar(&onboarding.ConfirmDiffEgress, "confirm-diff-egress", false, "Allow redacted repository changes to be sent later")
-	cmd.Flags().BoolVar(&onboarding.ConfirmIntentRepair, "confirm-intent-repair", false, "Allow bounded repair of private ACD-owned commits")
 	_ = cmd.Flags().MarkHidden("raw")
 	return cmd
 }
@@ -176,6 +169,16 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	planningProgress.Close()
 	if err != nil {
 		return fmt.Errorf("acd setup: %w", err)
+	}
+	if !plan.FreshDefaults {
+		for _, name := range []string{
+			"strategy", "commit-format", "provider", "base-url", "model", "ca-file",
+			"credential-stdin", "confirm-endpoint-credentials", "confirm-insecure-http", "confirm-diff-egress",
+		} {
+			if flagWasSet(cmd, name) {
+				return invalidCommandError("acd setup: --%s is for first setup; use `acd config` to change an existing installation's preferences or credentials", name)
+			}
+		}
 	}
 	var onboardingState *setupOnboardingState
 	if plan.FreshDefaults {
@@ -215,38 +218,6 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 			return nil
 		}
 	}
-	for onboardingState != nil {
-		testErr := testSetupProvider(cmd, onboardingState)
-		if testErr == nil {
-			break
-		}
-		if errors.Is(testErr, errSetupUseLocalProvider) {
-			onboardingState, err = useLocalSetupProvider(cmd, onboardingState)
-		} else if errors.Is(testErr, errSetupEditConnection) {
-			onboardingState, err = prepareSetupOnboarding(cmd, roots, onboarding, false, false)
-		} else {
-			return testErr
-		}
-		if err != nil {
-			return err
-		}
-		plan, err = installer.BuildPlan(cmd.Context(), roots, installer.Options{
-			Repo: repo, Integrations: integrations, Configuration: &onboardingState.Configuration,
-		})
-		if err != nil {
-			return fmt.Errorf("acd setup: rebuild changed provider plan: %w", err)
-		}
-		if err := renderSetupPlan(cmd, plan, false); err != nil {
-			return err
-		}
-		fmt.Fprint(cmd.ErrOrStderr(), "Apply this changed setup plan? [y/N] ")
-		var answer string
-		_, _ = fmt.Fscanln(cmd.InOrStdin(), &answer)
-		answer = strings.ToLower(strings.TrimSpace(answer))
-		if answer != "y" && answer != "yes" {
-			return errors.New("acd setup: setup stopped; nothing was written")
-		}
-	}
 	progress := newSetupProgress(cmd.ErrOrStderr(), jsonOut || quiet, 10*time.Second)
 	defer progress.Close()
 	applyOptions := installer.ApplyOptions{
@@ -279,10 +250,12 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 	fmt.Fprintln(cmd.OutOrStdout(), "Repositories: Existing enablement was preserved; no repository was added.")
 	if onboardingState != nil {
 		fmt.Fprintf(cmd.OutOrStdout(), "Preferences: %s, %s commits, %s provider.\n",
-			setupExperience(onboardingState.Draft),
+			setupModeLabel(onboardingState.Draft),
 			onboardingState.Selection.CommitFormat,
 			onboardingState.Selection.Provider)
-		fmt.Fprintln(cmd.OutOrStdout(), "Provider test: passed with synthetic content.")
+		if onboardingState.Selection.Strategy == "intent" {
+			fmt.Fprintln(cmd.OutOrStdout(), "Connection test: optional; run it from acd config when needed.")
+		}
 	}
 	if !nonInteractive && !yes && !quiet && settingsInputTTY(cmd.InOrStdin()) && settingsOutputTTY(cmd.OutOrStdout()) {
 		lookup, lookupErr := loadControlRepo(cmd.Context(), repo)
@@ -408,7 +381,7 @@ func renderSetupPlan(cmd *cobra.Command, plan installer.Plan, jsonOut bool) erro
 	if plan.Configuration != nil {
 		values := plan.Configuration.Values
 		fmt.Fprintf(cmd.OutOrStdout(), "Preferences: %s, %s commit messages.\n",
-			setupExperience(values), values["commit.format"])
+			setupModeLabel(values), values["commit.format"])
 		fmt.Fprintf(cmd.OutOrStdout(), "Provider: %s", values["ai.provider"])
 		if values["ai.provider"] == "openai-compat" {
 			fmt.Fprintf(cmd.OutOrStdout(), " at %s using %s", values["ai.base_url"], values["ai.model"])
@@ -426,12 +399,19 @@ func renderSetupPlan(cmd *cobra.Command, plan installer.Plan, jsonOut bool) erro
 		if values["intent.repair.enabled"] == "true" {
 			fmt.Fprintln(cmd.OutOrStdout(), "Repair: limited to recent, private, ACD-owned commits. Pushed and user-owned history is never rewritten.")
 		}
-		if plan.Configuration.CredentialSource == "environment" {
+		switch {
+		case values["commit.strategy"] != "intent":
+			fmt.Fprintln(cmd.OutOrStdout(), "Credential: not needed for Local mode.")
+		case values["ai.provider"] != "openai-compat":
+			fmt.Fprintln(cmd.OutOrStdout(), "Credential: not needed for this provider.")
+		case plan.Configuration.CredentialSource == "environment":
 			fmt.Fprintln(cmd.OutOrStdout(), "Credential: ACD_AI_API_KEY from the environment. No credential file will be written.")
-		} else if plan.Configuration.StoreCredential {
+		case plan.Configuration.StoreCredential:
 			fmt.Fprintln(cmd.OutOrStdout(), "Credential: stored in the protected user credential file with mode 0600.")
-		} else {
-			fmt.Fprintln(cmd.OutOrStdout(), "Credential: not needed for the local provider.")
+		case plan.Configuration.CredentialSource == "protected_file":
+			fmt.Fprintln(cmd.OutOrStdout(), "Credential: reuse the protected user credential file.")
+		default:
+			fmt.Fprintln(cmd.OutOrStdout(), "Credential: required; interactive setup will ask for an API key, or supply ACD_AI_API_KEY or --credential-stdin.")
 		}
 	}
 	for _, warning := range plan.Warnings {

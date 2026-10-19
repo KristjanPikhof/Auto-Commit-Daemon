@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
 	"time"
 
@@ -27,17 +26,6 @@ type FieldSnapshot struct {
 	InheritedValue      string
 }
 
-type ExperimentSnapshot struct {
-	ID                  int64
-	BaselineRevisionID  int64
-	CandidateRevisionID int64
-	WindowBudget        int
-	CompletedWindows    int
-	ExpiresAt           time.Time
-	FailurePolicy       string
-	Status              string
-}
-
 type Snapshot struct {
 	Scope                   Scope
 	Profile                 string
@@ -54,11 +42,7 @@ type Snapshot struct {
 	PendingStatus           string
 	DaemonMode              string
 	DaemonRunning           bool
-	Experiment              *ExperimentSnapshot
 	Profiles                []string
-	PresetID                string
-	PresetVersion           int
-	PresetCustomized        bool
 }
 
 // Snapshot projects authoring and runtime state without writing config or DB.
@@ -75,26 +59,27 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 	}
 	repo := doc.Settings.Repositories[s.repoHash]
 	activeProfile := ""
-	currentInput := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}
+	currentInput := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)}
 	inheritedInput := currentInput
-	var selectedScope config.Overrides
 	switch scope {
 	case ScopeRepository:
 		activeProfile = repo.Profile
 		currentInput.Repository = repo.Fields
 		currentInput.Profile = doc.Settings.Profiles[activeProfile].Fields
-		selectedScope = currentInput.Repository
+		currentInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"repository:" + s.repoHash, "profile:" + activeProfile, "global"}, s.lookupEnv)
 		inheritedInput = currentInput
 		inheritedInput.Repository = nil
+		inheritedInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"profile:" + activeProfile, "global"}, s.lookupEnv)
 	case ScopeProfile:
 		activeProfile = profileName
 		currentInput.Profile = doc.Settings.Profiles[activeProfile].Fields
-		selectedScope = currentInput.Profile
+		currentInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"profile:" + activeProfile, "global"}, s.lookupEnv)
 		inheritedInput = currentInput
 		inheritedInput.Profile = nil
+		inheritedInput.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)
 	case ScopeGlobal:
-		selectedScope = currentInput.Global
 		inheritedInput.Global = nil
+		inheritedInput.LegacyDefaults = config.LegacyFinishDefaults(doc, nil, s.lookupEnv)
 	}
 	runtimeState, err := state.RuntimeConfigActivationState(ctx, s.db)
 	if err != nil {
@@ -121,11 +106,11 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 			}
 		}
 	}
-	resolvedFields, preset, err := config.ResolveAll(currentInput, selectedScope)
+	resolvedFields, err := config.ResolveAll(currentInput)
 	if err != nil {
 		return Snapshot{}, sanitizeError(err)
 	}
-	inheritedFields, _, err := config.ResolveAll(inheritedInput, nil)
+	inheritedFields, err := config.ResolveAll(inheritedInput)
 	if err != nil {
 		return Snapshot{}, sanitizeError(err)
 	}
@@ -158,24 +143,19 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 		return Snapshot{}, sanitizeError(err)
 	}
 	running := ds.PID > 0 && ds.Mode != "stopped" && identity.Alive(ds.PID)
-	experiment, err := latestExperimentSnapshot(ctx, s.db)
-	if err != nil {
-		return Snapshot{}, err
-	}
 	profiles := make([]string, 0, len(doc.Settings.Profiles))
 	for name := range doc.Settings.Profiles {
 		profiles = append(profiles, cleanText(name))
 	}
 	sort.Strings(profiles)
 	out := Snapshot{Scope: scope, Profile: activeProfile, RepoHash: s.repoHash, Profiles: profiles,
-		PresetID: preset.ID(), PresetVersion: preset.Version(), PresetCustomized: preset.Customized,
 		SavedGeneration: doc.Generation, Fields: fields,
 		DesiredRevisionID:       nullableValue(runtimeState.DesiredRevisionID),
 		AppliedRevisionID:       nullableValue(runtimeState.AppliedRevisionID),
 		LastKnownGoodRevisionID: nullableValue(runtimeState.LastKnownGoodRevisionID),
 		DesiredRequestID:        nullableValue(runtimeState.DesiredRequestID),
 		PendingError:            cleanText(runtimeState.LastError.String), DaemonMode: cleanText(ds.Mode),
-		DaemonRunning: running, Experiment: experiment}
+		DaemonRunning: running}
 	if runtimeState.DesiredRequestID.Valid {
 		request, requestErr := state.ActivationRequestByID(ctx, s.db, runtimeState.DesiredRequestID.Int64)
 		if requestErr == nil {
@@ -190,30 +170,6 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 		}
 	}
 	return out, nil
-}
-
-func latestExperimentSnapshot(ctx context.Context, d *state.DB) (*ExperimentSnapshot, error) {
-	var out ExperimentSnapshot
-	var expires sql.NullFloat64
-	err := d.ReadSQL().QueryRowContext(ctx, `
-SELECT id, baseline_revision_id, candidate_revision_id, window_budget,
-       completed_windows, expires_ts, failure_policy, status
-FROM config_experiments ORDER BY id DESC LIMIT 1`).Scan(
-		&out.ID, &out.BaselineRevisionID, &out.CandidateRevisionID,
-		&out.WindowBudget, &out.CompletedWindows, &expires,
-		&out.FailurePolicy, &out.Status)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("acd settings: read experiment state: %w", sanitizeError(err))
-	}
-	if expires.Valid {
-		out.ExpiresAt = time.Unix(0, int64(expires.Float64*float64(time.Second)))
-	}
-	out.FailurePolicy = cleanText(out.FailurePolicy)
-	out.Status = cleanText(out.Status)
-	return &out, nil
 }
 
 func nullableValue(value sql.NullInt64) int64 {

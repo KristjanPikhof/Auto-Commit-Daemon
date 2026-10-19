@@ -15,39 +15,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-// defaultClientTTL is the heartbeat freshness window per D21 (§7.6 stale
-// overlay). Override via env ACD_CLIENT_TTL_SECONDS.
-const defaultClientTTLSeconds = 1800
-
-func displayProvider(provider string) string {
-	provider = strings.TrimSpace(provider)
-	switch {
-	case provider == "", provider == "deterministic":
-		return "Local rules"
-	case provider == "openai-compat":
-		return "OpenAI-compatible"
-	case strings.HasPrefix(provider, "subprocess:"):
-		return "Local subprocess " + strings.TrimPrefix(provider, "subprocess:")
-	default:
-		return provider
-	}
-}
-
-// clientTTL returns the configured heartbeat freshness window.
-func clientTTL() time.Duration {
-	if v := os.Getenv("ACD_CLIENT_TTL_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return defaultClientTTLSeconds * time.Second
-}
-
-// parseSince parses a Go duration extended with the `d` suffix (Nd → N*24h).
-// The suffix `y` is also accepted (Ny → N*365*24h) so `--since 1y` works as
-// shown in the §7.8 examples.
-//
-// Plain Go durations (e.g. "24h", "90m") are passed through unchanged.
 func parseSince(s string) (time.Duration, error) {
 	if s == "" {
 		return 0, errors.New("empty duration")
@@ -115,7 +82,7 @@ func lookupRegisteredRepo(command, repo string) (central.RepoRecord, paths.Roots
 	if rec, ok := findRepo(reg, abs, stateDB); ok {
 		return rec, roots, abs, nil
 	}
-	return central.RepoRecord{}, paths.Roots{}, abs, fmt.Errorf("acd %s: repo %s is not registered (try `acd start --repo %s`)", command, abs, abs)
+	return central.RepoRecord{}, paths.Roots{}, abs, fmt.Errorf("acd %s: repo %s is not registered (try `acd on --repo %s`)", command, abs, abs)
 }
 
 // formatDurationCompact renders a duration as "2s", "47s", "3m 14s",

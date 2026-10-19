@@ -33,13 +33,10 @@ var eventsWatchPollInterval = defaultEventsWatchInterval
 var eventsWatchReadyHook func()
 
 type eventsReport struct {
-	Repo          string                    `json:"repo"`
-	Cursor        int64                     `json:"cursor"`
-	Events        []eventEntry              `json:"events"`
-	Message       string                    `json:"message,omitempty"`
-	Configuration configReadinessReport     `json:"configuration"`
-	Replay        replayObservabilityReport `json:"replay"`
-	IntentV2      intentV2Report            `json:"intent_v2"`
+	Repo    string       `json:"repo"`
+	Cursor  int64        `json:"cursor"`
+	Events  []eventEntry `json:"events"`
+	Message string       `json:"message,omitempty"`
 }
 
 type eventEntry struct {
@@ -176,7 +173,7 @@ func runEvents(ctx context.Context, out io.Writer, repo, path string, since int6
 	return followEvents(ctx, out, db, rec.Path, path, cursor, limit, interval, jsonOut)
 }
 
-const missingDecisionLedgerMessage = "Decision ledger is not available in this state.db yet; start or restart acd with a current version to record product decisions."
+const missingDecisionLedgerMessage = "Decision ledger is not available in this state.db; archived decisions require a legacy ledger. Use `acd status` for current protection and finish requests."
 
 func loadDecisionEvents(ctx context.Context, db *sql.DB, path string, since int64, limit int) ([]state.DecisionRecord, error) {
 	var (
@@ -271,7 +268,7 @@ func eventsRepoRecord(repo string) (central.RepoRecord, error) {
 		return central.RepoRecord{}, err
 	}
 	if !fileExists(rec.StateDB) {
-		return central.RepoRecord{}, fmt.Errorf("acd events: state.db missing for repo %s (try `acd start --repo %s`)", abs, abs)
+		return central.RepoRecord{}, fmt.Errorf("acd history activity: state.db missing for repo %s (try `acd on --repo %s`)", abs, abs)
 	}
 	return rec, nil
 }
@@ -365,19 +362,7 @@ func buildEventsReport(ctx context.Context, db *sql.DB, repo string, rows []stat
 	if err != nil {
 		return eventsReport{}, err
 	}
-	intentV2, err := loadIntentV2Report(ctx, db)
-	if err != nil {
-		return eventsReport{}, fmt.Errorf("acd events: Intent v2 summary: %w", err)
-	}
-	readiness, err := loadConfigReadinessReport(ctx, db, time.Now())
-	if err != nil {
-		return eventsReport{}, fmt.Errorf("acd events: configuration readiness: %w", err)
-	}
-	replay, err := loadReplayObservabilityReport(ctx, db)
-	if err != nil {
-		return eventsReport{}, fmt.Errorf("acd events: replay observability: %w", err)
-	}
-	return eventsReport{Repo: repo, Cursor: cursor, Events: entries, Message: message, Configuration: readiness, Replay: replay, IntentV2: intentV2}, nil
+	return eventsReport{Repo: repo, Cursor: cursor, Events: entries, Message: message}, nil
 }
 
 func renderEvents(ctx context.Context, out io.Writer, db *sql.DB, repo string, rows []state.DecisionRecord, cursor int64, jsonOut, includeEnvelope bool, message string) error {
@@ -412,14 +397,6 @@ func renderEventsReport(out io.Writer, report eventsReport, jsonOut bool) error 
 	}
 	fmt.Fprintf(out, "Repo: %s\n", report.Repo)
 	fmt.Fprintf(out, "Cursor: %d\n\n", report.Cursor)
-	renderConfigReadinessHuman(out, report.Configuration)
-	if report.Configuration.Available {
-		fmt.Fprintln(out)
-	}
-	renderReplayObservabilityHuman(out, report.Replay)
-	fmt.Fprintln(out)
-	renderIntentV2Human(out, report.IntentV2)
-	fmt.Fprintln(out)
 	if len(report.Events) == 0 {
 		message := report.Message
 		if message == "" {
@@ -777,18 +754,4 @@ func maxDecisionCursor(rows []state.DecisionRecord, fallback int64) int64 {
 		}
 	}
 	return maxID
-}
-
-func parseDecisionCursor(s string) (int64, error) {
-	if s == "" {
-		return 0, nil
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid decision cursor %q: %w", s, err)
-	}
-	if n < 0 {
-		return 0, fmt.Errorf("decision cursor must be non-negative: %d", n)
-	}
-	return n, nil
 }

@@ -454,13 +454,13 @@ func collectRepoManagementEntries(ctx context.Context, repos []central.RepoRecor
 			entry.PID = safety.DaemonPID
 		}
 		if safety.StateDBExists && safety.DaemonStateError == "" {
-			if summary, err := summarizeRepo(ctx, rec.StateDB, now, clientTTLForRepo(rec.Path)); err == nil {
-				entry.Daemon = summary.daemon
-				entry.PID = summary.pid
-				entry.Clients = summary.clients
-				entry.PendingEvents = summary.pendingEvents
-				entry.BlockedConflicts = summary.blockedConflicts
-				if summary.daemon == "stale" {
+			if summary, err := buildStatusReport(ctx, rec, now); err == nil {
+				entry.Daemon = summary.Daemon
+				entry.PID = summary.PID
+				entry.Clients = len(summary.Clients)
+				entry.PendingEvents = summary.PendingEvents
+				entry.BlockedConflicts = summary.BlockedConflicts
+				if summary.Daemon == "stale" {
 					entry.Status = "stale"
 				}
 			}

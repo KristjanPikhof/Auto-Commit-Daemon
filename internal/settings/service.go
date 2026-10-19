@@ -1,5 +1,4 @@
-// Package settings coordinates operator-authored configuration, strict
-// provider probes, and per-repository runtime activation state.
+// Package settings manages approved configuration and explicit connection probes.
 package settings
 
 import (
@@ -10,9 +9,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unicode"
 
@@ -20,9 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -36,7 +31,6 @@ const (
 )
 
 type ProbeFunc func(context.Context, ai.ProviderConfig) (ai.ProviderProbeResult, error)
-type NudgeFunc func(context.Context, state.DaemonState) error
 
 type Options struct {
 	Roots            paths.Roots
@@ -44,7 +38,6 @@ type Options struct {
 	LookupEnv        func(string) (string, bool)
 	CredentialLookup func(string) (string, bool)
 	Probe            ProbeFunc
-	Nudge            NudgeFunc
 	Now              func() time.Time
 }
 
@@ -57,7 +50,6 @@ type Service struct {
 	lookupEnv        func(string) (string, bool)
 	credentialLookup func(string) (string, bool)
 	probe            ProbeFunc
-	nudge            NudgeFunc
 	now              func() time.Time
 	credentials      credentials.Store
 }
@@ -77,14 +69,13 @@ func NewValidationService(ctx context.Context, opts Options) (*Service, error) {
 // repository or opening repository state. Only global authoring operations are
 // available on the returned service.
 func NewGlobalService(_ context.Context, opts Options) (*Service, error) {
-	lookup, credentialLookup, probe, nudge, now := serviceDefaults(opts)
+	lookup, credentialLookup, probe, now := serviceDefaults(opts)
 	return &Service{
 		store:            config.NewStore(opts.Roots),
 		globalOnly:       true,
 		lookupEnv:        lookup,
 		credentialLookup: credentialLookup,
 		probe:            probe,
-		nudge:            nudge,
 		now:              now,
 		credentials:      credentials.NewStore(opts.Roots),
 	}, nil
@@ -106,10 +97,10 @@ func newService(ctx context.Context, opts Options, openState bool) (*Service, er
 			return nil, fmt.Errorf("acd settings: open state: %w", err)
 		}
 	}
-	lookup, credentialLookup, probe, nudge, now := serviceDefaults(opts)
+	lookup, credentialLookup, probe, now := serviceDefaults(opts)
 	return &Service{store: config.NewStore(opts.Roots), db: db, worktree: wt,
 		repoHash: repoHash, lookupEnv: lookup, credentialLookup: credentialLookup,
-		probe: probe, nudge: nudge, now: now,
+		probe: probe, now: now,
 		credentials: credentials.NewStore(opts.Roots)}, nil
 }
 
@@ -117,7 +108,6 @@ func serviceDefaults(opts Options) (
 	func(string) (string, bool),
 	func(string) (string, bool),
 	ProbeFunc,
-	NudgeFunc,
 	func() time.Time,
 ) {
 	rawLookup := opts.LookupEnv
@@ -133,15 +123,11 @@ func serviceDefaults(opts Options) (
 	if probe == nil {
 		probe = ai.ProbeProviderConfig
 	}
-	nudge := opts.Nudge
-	if nudge == nil {
-		nudge = fingerprintNudge
-	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
 	}
-	return lookup, credentialLookup, probe, nudge, now
+	return lookup, credentialLookup, probe, now
 }
 
 // settingsLookup keeps the provider credential out of the generic settings
@@ -164,7 +150,6 @@ type AuthoringPreview struct {
 	Values     map[string]string
 	Sources    map[string]config.Source
 	Generation uint64
-	Preset     config.PresetResolution
 }
 
 // AuthoringPreview returns presentation-safe effective authoring values. It is
@@ -177,8 +162,8 @@ func (s *Service) AuthoringPreview() (AuthoringPreview, error) {
 	if err != nil {
 		return AuthoringPreview{}, sanitizeError(err)
 	}
-	input, selected := s.authoringResolutionInput(doc)
-	fields, preset, err := config.ResolveAll(input, selected)
+	input := s.authoringResolutionInput(doc)
+	fields, err := config.ResolveAll(input)
 	if err != nil {
 		return AuthoringPreview{}, sanitizeError(err)
 	}
@@ -191,7 +176,7 @@ func (s *Service) AuthoringPreview() (AuthoringPreview, error) {
 	}
 	return AuthoringPreview{
 		Values: hotValues(values), Sources: sources,
-		Generation: doc.Generation, Preset: preset,
+		Generation: doc.Generation,
 	}, nil
 }
 
@@ -345,8 +330,8 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 	if validation.SourceGeneration != req.ExpectedGeneration {
 		return SaveGlobalSetupResult{}, errors.New("acd settings: stale saved generation; refresh before saving")
 	}
-	if req.TestedFingerprint == "" || req.TestedFingerprint != validation.Fingerprint {
-		return SaveGlobalSetupResult{}, errors.New("acd settings: tested settings are stale; test the current draft again")
+	if req.TestedFingerprint != "" && req.TestedFingerprint != validation.Fingerprint {
+		return SaveGlobalSetupResult{}, errors.New("acd settings: reviewed settings are stale; review the current draft again")
 	}
 	if len(validation.Missing) > 0 {
 		return SaveGlobalSetupResult{}, &ConfirmationRequiredError{Missing: validation.Missing}
@@ -390,7 +375,7 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 			doc.Settings.Global[name] = raw
 		}
 		if req.Changes != nil {
-			fields, _, err := config.ResolveAll(config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}, doc.Settings.Global)
+			fields, err := config.ResolveAll(config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)})
 			if err != nil {
 				return err
 			}
@@ -429,7 +414,7 @@ func globalSetupConfirmations(values []ai.ConfirmationRequirement) ([]string, er
 		switch value {
 		case ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials,
 			ai.ConfirmationSubprocessExecution,
-			ai.ConfirmationDiffEgress, ai.ConfirmationIntentRepair:
+			ai.ConfirmationDiffEgress:
 		default:
 			return nil, fmt.Errorf("acd settings: unsupported global confirmation %q", cleanText(string(value)))
 		}
@@ -449,7 +434,6 @@ type Validation struct {
 	RestartChanged   []string
 	ResolvedHot      map[string]string
 	ProviderConfig   ai.ProviderConfig
-	Preset           config.PresetResolution
 	SourceGeneration uint64
 }
 
@@ -468,7 +452,7 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 	if err != nil {
 		return Validation{}, sanitizeError(err)
 	}
-	resolved, restartChanged, preset, err := s.resolveDraft(doc, draft)
+	resolved, restartChanged, err := s.resolveDraft(doc, draft)
 	if err != nil {
 		return Validation{}, err
 	}
@@ -476,9 +460,13 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 	if err != nil {
 		return Validation{}, err
 	}
-	providerValidation, err := ai.ValidateProviderConfig(cfg)
-	if err != nil {
-		return Validation{}, sanitizeError(err)
+	var required []ai.ConfirmationRequirement
+	if cfg.CommitStrategy == ai.CommitStrategyIntent {
+		providerValidation, err := ai.ValidateProviderConfig(cfg)
+		if err != nil {
+			return Validation{}, sanitizeError(err)
+		}
+		required = append(required, providerValidation.Confirmations...)
 	}
 	verificationMode := resolved[config.FieldIntentVerification]
 	verificationCommand := ""
@@ -490,14 +478,10 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 	}
 	if (verificationMode == "fast" || verificationMode == "full") &&
 		strings.TrimSpace(verificationCommand) == "" {
-		return Validation{}, errors.New("acd settings: preset-required verification command is not configured")
+		return Validation{}, errors.New("acd settings: approved verification command is not configured")
 	}
-	required := append([]ai.ConfirmationRequirement(nil), providerValidation.Confirmations...)
 	if verificationMode == "fast" || verificationMode == "full" {
 		required = append(required, ai.ConfirmationVerificationCommand)
-	}
-	if resolved[config.FieldIntentRepairEnabled] == "true" {
-		required = append(required, ai.ConfirmationIntentRepair)
 	}
 	confirmedSet := make(map[ai.ConfirmationRequirement]bool, len(confirmed))
 	for _, item := range confirmed {
@@ -509,13 +493,13 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 			missing = append(missing, item)
 		}
 	}
-	fingerprint, err := config.SettingsFingerprint(resolved, preset)
+	fingerprint, err := config.SettingsFingerprint(resolved)
 	if err != nil {
 		return Validation{}, err
 	}
 	return Validation{Fingerprint: fingerprint, Confirmations: required,
 		Missing: missing, RestartChanged: restartChanged, ResolvedHot: hotValues(resolved),
-		ProviderConfig: cfg, Preset: preset, SourceGeneration: doc.Generation}, nil
+		ProviderConfig: cfg, SourceGeneration: doc.Generation}, nil
 }
 
 type ProviderTestResult struct {
@@ -536,6 +520,9 @@ func (s *Service) TestProvider(ctx context.Context, draft map[string]string, con
 	if len(missing) > 0 {
 		return ProviderTestResult{}, &ConfirmationRequiredError{Missing: missing}
 	}
+	if validation.ProviderConfig.CommitStrategy == ai.CommitStrategyLocal {
+		return ProviderTestResult{Fingerprint: validation.Fingerprint, Provider: "local", Success: true}, nil
+	}
 	result, err := s.probe(ctx, validation.ProviderConfig)
 	out := ProviderTestResult{Fingerprint: validation.Fingerprint,
 		Provider: cleanText(result.Provider), Latency: result.Latency,
@@ -550,8 +537,7 @@ func providerTestConfirmations(confirmations []ai.ConfirmationRequirement) []ai.
 	out := make([]ai.ConfirmationRequirement, 0, len(confirmations))
 	for _, confirmation := range confirmations {
 		if confirmation != ai.ConfirmationDiffEgress &&
-			confirmation != ai.ConfirmationVerificationCommand &&
-			confirmation != ai.ConfirmationIntentRepair {
+			confirmation != ai.ConfirmationVerificationCommand {
 			out = append(out, confirmation)
 		}
 	}
@@ -572,36 +558,36 @@ func missingConfirmations(required, confirmed []ai.ConfirmationRequirement) []ai
 	return missing
 }
 
-func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (map[string]string, []string, config.PresetResolution, error) {
-	baseInput, selected := s.authoringResolutionInput(doc)
-	baseFields, _, err := config.ResolveAll(baseInput, selected)
+func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (map[string]string, []string, error) {
+	baseInput := s.authoringResolutionInput(doc)
+	baseFields, err := config.ResolveAll(baseInput)
 	if err != nil {
-		return nil, nil, config.PresetResolution{}, sanitizeError(err)
+		return nil, nil, sanitizeError(err)
 	}
 	draftOverrides := config.Overrides{}
 	var restartChanged []string
 	for name, raw := range draft {
 		field, ok := config.LookupField(name)
 		if !ok {
-			return nil, nil, config.PresetResolution{}, fmt.Errorf("acd settings: unsupported field %q", cleanText(name))
+			return nil, nil, config.UnsupportedFieldError(cleanText(name))
 		}
 		if field.Sensitive || !field.Persistable {
 			continue
 		}
 		if hasUnsafeText(raw) {
-			return nil, nil, config.PresetResolution{}, fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
+			return nil, nil, fmt.Errorf("acd settings: field %q contains unsafe text", field.Name)
 		}
 		normalized, err := normalizeDraftValue(field, raw)
 		if err != nil {
-			return nil, nil, config.PresetResolution{}, err
+			return nil, nil, err
 		}
 		draftOverrides[name], _ = json.Marshal(normalized)
 	}
 	draftInput := baseInput
-	draftInput.Experiment = draftOverrides
-	resolvedFields, preset, err := config.ResolveAll(draftInput, draftOverrides)
+	draftInput.Draft = draftOverrides
+	resolvedFields, err := config.ResolveAll(draftInput)
 	if err != nil {
-		return nil, nil, config.PresetResolution{}, sanitizeError(err)
+		return nil, nil, sanitizeError(err)
 	}
 	resolved := make(map[string]string, len(resolvedFields))
 	for _, field := range config.Catalog() {
@@ -612,24 +598,25 @@ func (s *Service) resolveDraft(doc *config.Document, draft map[string]string) (m
 		}
 	}
 	sort.Strings(restartChanged)
-	return resolved, restartChanged, preset, nil
+	return resolved, restartChanged, nil
 }
 
-func (s *Service) authoringResolutionInput(doc *config.Document) (config.ResolveInput, config.Overrides) {
-	input := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv}
+func (s *Service) authoringResolutionInput(doc *config.Document) config.ResolveInput {
+	input := config.ResolveInput{Global: doc.Settings.Global, LookupEnv: s.lookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"global"}, s.lookupEnv)}
 	if s.globalOnly {
-		return input, doc.Settings.Global
+		return input
 	}
 	repository := doc.Settings.Repositories[s.repoHash]
 	input.Repository = repository.Fields
 	input.Profile = doc.Settings.Profiles[repository.Profile].Fields
-	return input, repository.Fields
+	input.LegacyDefaults = config.LegacyFinishDefaults(doc, []string{"repository:" + s.repoHash, "profile:" + repository.Profile, "global"}, s.lookupEnv)
+	return input
 }
 
 func persistedField(name string) (config.FieldDefinition, error) {
 	field, ok := config.LookupField(name)
 	if !ok {
-		return config.FieldDefinition{}, fmt.Errorf("acd settings: unsupported field %q", cleanText(name))
+		return config.FieldDefinition{}, config.UnsupportedFieldError(cleanText(name))
 	}
 	if !field.Persistable || (field.Sensitive && name == config.FieldAPIKey) {
 		return config.FieldDefinition{}, fmt.Errorf("acd settings: field %q is environment-only", field.Name)
@@ -671,27 +658,26 @@ func normalizeDraftValue(field config.FieldDefinition, value string) (string, er
 }
 
 func (s *Service) providerConfig(values map[string]string) (ai.ProviderConfig, error) {
-	base := ai.LoadProviderConfigFromEnv()
-	base.Mode = values[config.FieldProvider]
-	base.BaseURL = values[config.FieldBaseURL]
-	base.Model = values[config.FieldModel]
-	base.CAFile = values[config.FieldCAFile]
-	base.DiffEgress = values[config.FieldDiffEgress] == "true"
-	base.CommitStrategy = ai.CommitStrategy(values[config.FieldCommitStrategy])
-	base.CommitFormat = ai.CommitFormat(values[config.FieldCommitFormat])
+	base := ai.ProviderConfig{
+		Mode: values[config.FieldProvider], BaseURL: values[config.FieldBaseURL],
+		Model: values[config.FieldModel], CAFile: values[config.FieldCAFile],
+		DiffEgress:     values[config.FieldDiffEgress] == "true",
+		CommitStrategy: ai.CommitStrategy(values[config.FieldCommitStrategy]),
+		CommitFormat:   ai.CommitFormat(values[config.FieldCommitFormat]),
+	}
 	var err error
 	if base.Timeout, err = time.ParseDuration(values[config.FieldTimeout]); err != nil {
 		return ai.ProviderConfig{}, errors.New("acd settings: invalid provider timeout")
 	}
-	base.IntentWindow, err = strconv.Atoi(values[config.FieldIntentWindow])
-	if err != nil {
-		return ai.ProviderConfig{}, errors.New("acd settings: invalid intent window")
+	if base.CommitStrategy == ai.CommitStrategyLocal {
+		// Provider values are inert in local mode; do not read credentials.
+		base.Mode = "deterministic"
+		base.DiffEgress = false
+		return base, nil
 	}
-	base.IntentMinPending, _ = strconv.Atoi(values[config.FieldIntentMinPending])
-	base.IntentSettleWindow, _ = time.ParseDuration(values[config.FieldIntentSettleWindow])
-	base.IntentMaxPendingAge, _ = time.ParseDuration(values[config.FieldIntentMaxPendingAge])
-	base.IntentRecentCommits, _ = strconv.Atoi(values[config.FieldIntentRecentCommits])
-	base.IntentDeferLimit, _ = strconv.Atoi(values[config.FieldIntentDeferLimit])
+	if base.Mode != "openai-compat" {
+		return base, nil
+	}
 	key, _, err := credentials.Resolve(s.credentials, s.credentialLookup)
 	if err != nil {
 		return ai.ProviderConfig{}, sanitizeError(err)
@@ -722,26 +708,6 @@ func validateScope(scope Scope, profile string) error {
 	default:
 		return fmt.Errorf("acd settings: unsupported scope %q", cleanText(string(scope)))
 	}
-}
-
-func fingerprintNudge(_ context.Context, st state.DaemonState) error {
-	if st.PID <= 0 || !identity.Alive(st.PID) {
-		return nil
-	}
-	if !st.DaemonFingerprint.Valid || st.DaemonFingerprint.String == "" {
-		return errors.New("acd settings: daemon fingerprint unavailable")
-	}
-	fingerprint, err := identity.Capture(st.PID)
-	if err != nil {
-		return errors.New("acd settings: daemon identity unavailable")
-	}
-	if daemon.FingerprintToken(fingerprint) != st.DaemonFingerprint.String {
-		return errors.New("acd settings: daemon fingerprint mismatch")
-	}
-	if err := syscall.Kill(st.PID, syscall.SIGUSR1); err != nil {
-		return fmt.Errorf("acd settings: signal daemon: %w", err)
-	}
-	return nil
 }
 
 func cleanText(value string) string {

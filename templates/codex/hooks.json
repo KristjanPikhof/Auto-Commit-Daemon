@@ -6,7 +6,7 @@
           {
             "type": "command",
             "timeout": 15,
-            "command": "bash -c 'acd internal integration event --harness codex --event session_open --watch-pid \"$PPID\"'"
+            "command": "bash -c 'acd internal integration event --harness codex --event session_open'"
           }
         ]
       }
@@ -17,7 +17,7 @@
           {
             "type": "command",
             "timeout": 15,
-            "command": "bash -c 'acd internal integration event --harness codex --event activity --watch-pid \"$PPID\"'"
+            "command": "bash -c 'acd internal integration event --harness codex --event activity'"
           }
         ]
       }
@@ -29,7 +29,7 @@
           {
             "type": "command",
             "timeout": 15,
-            "command": "bash -c 'acd internal integration event --harness codex --event activity --watch-pid \"$PPID\"'"
+            "command": "bash -c 'acd internal integration event --harness codex --event activity'"
           }
         ]
       }
@@ -41,7 +41,7 @@
           {
             "type": "command",
             "timeout": 15,
-            "command": "bash -c 'acd internal integration event --harness codex --event activity --watch-pid \"$PPID\"'"
+            "command": "bash -c 'acd internal integration event --harness codex --event activity'"
           }
         ]
       }
@@ -52,7 +52,7 @@
           {
             "type": "command",
             "timeout": 5,
-            "command": "bash -c 'acd internal integration event --harness codex --event soft_boundary'"
+            "command": "bash -c 'acd internal integration event --harness codex --event activity'"
           }
         ]
       }

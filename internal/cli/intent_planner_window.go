@@ -8,8 +8,19 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
+
+type legacyPlannerWindowGroup struct {
+	SelectedSeqs   []int64 `json:"selected_seqs"`
+	OriginalSeqs   []int64 `json:"original_seqs,omitempty"`
+	Subject        string  `json:"subject,omitempty"`
+	GroupingReason string  `json:"grouping_reason,omitempty"`
+}
+
+type legacyPlannerWindowDeferredReason struct {
+	Seq    int64  `json:"seq"`
+	Reason string `json:"reason"`
+}
 
 type intentPlannerWindowSummary struct {
 	ID                     int64                                         `json:"id"`
@@ -27,9 +38,9 @@ type intentPlannerWindowSummary struct {
 	OfferedSeqs            []int64                                       `json:"offered_seqs,omitempty"`
 	VisibleOriginalSeqs    []int64                                       `json:"visible_original_seqs,omitempty"`
 	HiddenSeqs             []int64                                       `json:"hidden_seqs,omitempty"`
-	SelectedGroups         []state.IntentPlannerWindowGroup              `json:"selected_groups,omitempty"`
+	SelectedGroups         []legacyPlannerWindowGroup                    `json:"selected_groups,omitempty"`
 	DeferredSeqs           []int64                                       `json:"deferred_seqs,omitempty"`
-	DeferredReasons        []state.IntentPlannerWindowDeferredReason     `json:"deferred_reasons,omitempty"`
+	DeferredReasons        []legacyPlannerWindowDeferredReason           `json:"deferred_reasons,omitempty"`
 	PlanAttempt            int                                           `json:"plan_attempt,omitempty"`
 	PlanAttemptLimit       int                                           `json:"plan_attempt_limit,omitempty"`
 	UnresolvedCaptureCount int                                           `json:"unresolved_capture_count,omitempty"`
@@ -48,62 +59,6 @@ type intentPlannerWindowEventParticipationSummary struct {
 	Selected bool  `json:"selected,omitempty"`
 	Deferred bool  `json:"deferred,omitempty"`
 	GroupOrd int64 `json:"group_ord,omitempty"`
-}
-
-func loadLastIntentPlannerWindowSQL(ctx context.Context, conn *sql.DB) (*intentPlannerWindowSummary, error) {
-	return loadLastIntentPlannerWindowSQLWithFilter(ctx, conn, "", nil)
-}
-
-func loadLastIntentPlannerWindowForPairSQL(
-	ctx context.Context,
-	conn *sql.DB,
-	branchRef string,
-	branchGeneration int64,
-) (*intentPlannerWindowSummary, error) {
-	if branchRef == "" {
-		return nil, nil
-	}
-	return loadLastIntentPlannerWindowSQLWithFilter(
-		ctx,
-		conn,
-		"WHERE w.branch_ref=? AND w.branch_generation=?",
-		[]any{branchRef, branchGeneration},
-	)
-}
-
-func loadLastIntentPlannerWindowSQLWithFilter(
-	ctx context.Context,
-	conn *sql.DB,
-	filter string,
-	args []any,
-) (*intentPlannerWindowSummary, error) {
-	ok, err := sqliteTableExists(ctx, conn, "intent_planner_windows")
-	if err != nil {
-		return nil, fmt.Errorf("intent planner windows table check: %w", err)
-	}
-	if !ok {
-		return nil, nil
-	}
-	rows, err := conn.QueryContext(ctx, intentPlannerWindowSelectSQL+`
-	FROM intent_planner_windows w
-	`+filter+`
-	ORDER BY w.id DESC
-	LIMIT 1`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query last intent planner window: %w", err)
-	}
-	defer rows.Close()
-	windows, err := scanIntentPlannerWindowSummaries(rows)
-	if err != nil {
-		return nil, err
-	}
-	if len(windows) == 0 {
-		return nil, nil
-	}
-	if err := enrichIntentPlannerWindowRun(ctx, conn, &windows[0]); err != nil {
-		return nil, err
-	}
-	return &windows[0], nil
 }
 
 func enrichIntentPlannerWindowRun(ctx context.Context, conn *sql.DB, win *intentPlannerWindowSummary) error {
@@ -220,21 +175,6 @@ SELECT w.id, w.planned_ts, w.provider, w.model, w.branch_ref, w.branch_generatio
        w.source, w.commit_format, w.forced, w.forced_reason, w.validation_failure,
        w.offered_seqs, w.visible_original_seqs, w.hidden_seqs, w.selected_groups,
        w.deferred_seqs, w.deferred_reasons`
-
-func scanIntentPlannerWindowSummaries(rows *sql.Rows) ([]intentPlannerWindowSummary, error) {
-	var out []intentPlannerWindowSummary
-	for rows.Next() {
-		win, err := scanIntentPlannerWindowSummary(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, win)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iter intent planner windows: %w", err)
-	}
-	return out, nil
-}
 
 func scanIntentPlannerWindowSummariesWithEvent(rows *sql.Rows, eventSeq int64) ([]intentPlannerWindowSummary, error) {
 	var out []intentPlannerWindowSummary

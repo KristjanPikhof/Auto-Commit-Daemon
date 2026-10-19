@@ -2,27 +2,19 @@ package cli
 
 import (
 	"context"
-	"path/filepath"
-	"strings"
 	"testing"
 
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
-func TestPublicationOutcomeLargeHistoryBuildsCompletedMembershipOnce(t *testing.T) {
-	t.Parallel()
+func TestFinishStatusHistoryBoundsLargeArchiveProjection(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "state.db")
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
+	repo, dbPath, db := makeRegisteredGitRepoStateDB(t)
+	if err := testutil.InitLegacy(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
-	// The real dashboard hit a quadratic plan with thousands of checkpoints
-	// and captures. Include unrelated branches/generations, unfinished
-	// checkpoints, and an uncheckpointed capture so the cheaper plan must
-	// preserve the publication proof rather than just count history rows.
+	// Large legacy archives must remain bounded, read-only, and retain exact
+	// checkpoint membership and recovery meaning in the current history route.
 	const historySize = 4096
 	for _, query := range []string{
 		`WITH RECURSIVE numbers(n) AS (
@@ -61,53 +53,24 @@ SELECT id,0,seq FROM checkpoints`,
 			t.Fatal(err)
 		}
 	}
-	if err := state.MetaSet(ctx, db, daemon.MetaKeyProtectionClassificationPending, "true"); err != nil {
-		t.Fatal(err)
-	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	before := fileDigest(t, dbPath)
-	readOnly, err := state.OpenReadOnly(ctx, dbPath)
+	entries, err := loadCheckpointHistory(ctx, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = readOnly.Close() })
-	// Assert the engine's actual work shape, not an elapsed-time threshold.
-	// A correlated subquery was what repeatedly scanned completed history
-	// until every dashboard read exhausted its fixed request budget.
-	rows, err := readOnly.ReadSQL().QueryContext(ctx,
-		"EXPLAIN QUERY PLAN "+publicationOutcomeSelectSQL,
-		"refs/heads/main", 7, "refs/heads/main", 7)
-	if err != nil {
-		t.Fatal(err)
+	if len(entries) != 100 || entries[0].Sequence != historySize || entries[99].Sequence != historySize-99 {
+		t.Fatalf("unbounded or unordered history: %d entries", len(entries))
 	}
-	for rows.Next() {
-		var id, parent, unused int
-		var detail string
-		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
-			_ = rows.Close()
-			t.Fatal(err)
+	for _, entry := range entries {
+		if entry.EventCount != 1 {
+			t.Fatalf("lost archived membership: %+v", entry)
 		}
-		if strings.Contains(strings.ToUpper(detail), "CORRELATED") {
-			_ = rows.Close()
-			t.Fatalf("publication projection repeats work for every capture: %s", detail)
+		if entry.Sequence%4 == 2 && (entry.Outcome != "recovered" || entry.RecoveredEvents != 1 || entry.PublicationOutcome.BranchCommitted == nil || *entry.PublicationOutcome.BranchCommitted) {
+			t.Fatalf("recovery became branch commitment: %+v", entry)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if err := rows.Close(); err != nil {
-		t.Fatal(err)
-	}
-	outcome, err := readPublicationOutcomeForPair(ctx, readOnly.ReadSQL(), false,
-		"", "refs/heads/main", 7, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if outcome.BranchChanges != historySize/8 || outcome.RecoveredChanges != historySize/4 ||
-		outcome.WaitingChanges != historySize/8 || !outcome.PendingClassification || outcome.BranchCommitted != nil {
-		t.Fatalf("completed membership lost exact branch/protection semantics: %+v", outcome)
 	}
 	if fileDigest(t, dbPath) != before {
 		t.Fatal("publication projection wrote or migrated state")

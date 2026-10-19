@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 func TestRecoveryBlockerCountsDistinguishActiveAndNonActiveRows(t *testing.T) {
@@ -24,21 +25,21 @@ func TestRecoveryBlockerCountsDistinguishActiveAndNonActiveRows(t *testing.T) {
 
 	appendBlocked := func(branch string, gen int64, path string) {
 		t.Helper()
-		seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		seq, err := testutil.SeedLegacyCapture(ctx, d, state.CaptureEvent{
 			BranchRef: branch, BranchGeneration: gen,
 			BaseHead: "deadbeef", Operation: "modify", Path: path, Fidelity: "exact",
 		}, []state.CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
 		if err != nil {
 			t.Fatalf("append blocked %s: %v", path, err)
 		}
-		if err := state.MarkEventBlocked(ctx, d, seq, "before-state mismatch", nowFloat(),
+		if err := seedLegacyBlockedCapture(ctx, d, seq, "before-state mismatch", nowFloat(),
 			sqlNullStr(branch), sql.NullInt64{Int64: gen, Valid: true}, sqlNullStr("deadbeef")); err != nil {
 			t.Fatalf("mark blocked %s: %v", path, err)
 		}
 	}
 	appendPending := func(branch string, gen int64, path string) {
 		t.Helper()
-		if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		if _, err := testutil.SeedLegacyCapture(ctx, d, state.CaptureEvent{
 			BranchRef: branch, BranchGeneration: gen,
 			BaseHead: "deadbeef", Operation: "modify", Path: path, Fidelity: "exact",
 		}, []state.CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}}); err != nil {
@@ -47,14 +48,14 @@ func TestRecoveryBlockerCountsDistinguishActiveAndNonActiveRows(t *testing.T) {
 	}
 	appendFailed := func(branch string, gen int64, path string) {
 		t.Helper()
-		seq, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		seq, err := testutil.SeedLegacyCapture(ctx, d, state.CaptureEvent{
 			BranchRef: branch, BranchGeneration: gen,
 			BaseHead: "deadbeef", Operation: "modify", Path: path, Fidelity: "exact",
 		}, []state.CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}})
 		if err != nil {
 			t.Fatalf("append failed %s: %v", path, err)
 		}
-		if err := state.MarkEventPublished(ctx, d, seq, state.EventStateFailed,
+		if err := testutil.SeedLegacyCaptureOutcome(ctx, d, seq, state.EventStateFailed,
 			sql.NullString{}, sqlNullStr("commit failed"), sql.NullString{}, nowFloat()); err != nil {
 			t.Fatalf("mark failed %s: %v", path, err)
 		}
@@ -94,7 +95,7 @@ func TestRecoveryBlockerCountsPendingOnlyRepo(t *testing.T) {
 	ctx := context.Background()
 	_, _, d := makeRepoStateDB(t)
 	for _, path := range []string{"one.go", "two.go"} {
-		if _, err := state.AppendCaptureEvent(ctx, d, state.CaptureEvent{
+		if _, err := testutil.SeedLegacyCapture(ctx, d, state.CaptureEvent{
 			BranchRef: "refs/heads/main", BranchGeneration: 1,
 			BaseHead: "deadbeef", Operation: "modify", Path: path, Fidelity: "exact",
 		}, []state.CaptureOp{{Op: "modify", Path: path, Fidelity: "exact"}}); err != nil {

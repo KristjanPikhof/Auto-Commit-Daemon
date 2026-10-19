@@ -1,17 +1,6 @@
 //go:build integration
-// +build integration
 
 package integration_test
-
-// adapter_e2e_test.go — §7.9 / §9 end-to-end coverage. Each subtest renders a
-// harness's snippet via `acd setup <harness>`, executes the start-equivalent
-// command(s) under a fake harness env (mock CLAUDE_PROJECT_DIR /
-// OPENCODE_SESSION_ID / PI_SESSION_ID / etc.), and asserts the daemon's
-// per-repo state.db has the expected daemon_clients row (session_id + harness).
-// Then runs the stop-equivalent command (or `acd stop --force` fallback) so
-// the daemon shuts down cleanly between subtests.
-//
-// Skip rules: bash missing → skip the file; Windows → skip the file.
 
 import (
 	"context"
@@ -22,346 +11,154 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
-	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/templates"
 )
 
-// TestAdapterE2E orchestrates the five harness subtests.
+func adapterHooks(t *testing.T, harness string) []hookSpec {
+	t.Helper()
+	switch harness {
+	case "claude-code":
+		return parseClaudeCodeSnippet(t, readSnippet(t, "claude-code/settings.snippet.json"))
+	case "codex":
+		return parseCodexHooksJSON(t, readSnippet(t, "codex/hooks.json"))
+	case "cursor":
+		return parseCursorHooksJSON(t, readSnippet(t, "cursor/hooks.json"))
+	case "opencode", "pi":
+		return parseYAMLBashBlocks(t, readSnippet(t, harness+"/hooks.snippet.yaml"))
+	case "shell":
+		return []hookSpec{{Event: "direnv", Command: readSnippet(t, "shell/direnv.envrc.snippet")}, {Event: "zsh", Command: "zsh -f -c " + shellQuote(readSnippet(t, "shell/zshrc.snippet.sh")+"\nacd_wake_protection")}}
+	default:
+		t.Fatal("unknown harness", harness)
+		return nil
+	}
+}
+
+func adapterInvocation(env []string, bin, repo string) ([]string, string) {
+	env = prependPath(env, filepath.Dir(bin))
+	env = envWith(env, "CLAUDE_PROJECT_DIR="+repo, "OPENCODE_PROJECT_DIR="+repo, "PI_PROJECT_DIR="+repo)
+	payload := fmt.Sprintf(`{"session_id":"adapter","conversation_id":"adapter","cwd":%q,"workspace_roots":[%q]}`, repo, repo)
+	return env, payload
+}
+
 func TestAdapterE2E(t *testing.T) {
-	t.Parallel()
-	if runtime.GOOS == "windows" {
-		t.Skip("adapter e2e: Windows snippets not in scope for v1")
+	for _, harness := range []string{"claude-code", "codex", "cursor", "opencode", "pi", "shell"} {
+		t.Run(harness, func(t *testing.T) {
+			f := newFinishFixture(t, "ACD_DISABLE_FSNOTIFY=1")
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			env, payload := adapterInvocation(f.Env, f.Bin, f.Repo)
+			env = addFailingJQ(t, env)
+			resolved := runBash(t, ctx, env, "", "bash -c 'command -v acd'")
+			if strings.TrimSpace(resolved.Stdout) != f.Bin {
+				t.Fatalf("hook resolves unexpected binary: %+v want %s", resolved, f.Bin)
+			}
+			hookDir := f.Repo
+			if harness == "cursor" {
+				installCursorHooks(t, envValue(env, "HOME"))
+				hookDir = filepath.Join(envValue(env, "HOME"), ".cursor")
+			}
+			for i, hook := range adapterHooks(t, harness) {
+				path := fmt.Sprintf("hook-%d.txt", i)
+				waitFor(t, "completed protection before hook", 5*time.Second, func() bool {
+					return sqliteScalar(t, f.DBPath, "SELECT value FROM daemon_meta WHERE key='protection.complete'") == "true"
+				})
+				before, err := strconv.ParseInt(sqliteScalar(t, f.DBPath, "SELECT value FROM daemon_meta WHERE key='protection.observation_epoch'"), 10, 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+				owner := readDaemonStatePID(f.Repo)
+				if owner <= 0 {
+					t.Fatal("enabled worker has no owner")
+				}
+				writeFile(t, filepath.Join(f.Repo, path), hook.Event+"\n")
+				result := runBash(t, ctx, env, payload, "cd "+shellQuote(hookDir)+" && "+hook.Command)
+				if result.ExitCode != 0 || result.Stdout != "" {
+					t.Fatalf("%s hook: %+v", hook.Event, result)
+				}
+				after, err := strconv.ParseInt(sqliteScalar(t, f.DBPath, "SELECT value FROM daemon_meta WHERE key='protection.observation_epoch'"), 10, 64)
+				if err != nil || after <= before {
+					log, _ := os.ReadFile(filepath.Join(f.Roots.State, harness+"-hook.log"))
+					t.Fatalf("hook did not report observation: %d -> %d %v; complete=%s stderr=%s log=%s command=%s", before, after, err, sqliteScalar(t, f.DBPath, "SELECT value FROM daemon_meta WHERE key='protection.complete'"), result.Stderr, log, hook.Command)
+				}
+				waitFor(t, "hook protects "+hook.Event, 5*time.Second, func() bool {
+					ref := sqliteScalar(t, f.DBPath, "SELECT checkpoint_ref FROM checkpoints WHERE phase='completed' AND coverage_complete=1 ORDER BY seq DESC LIMIT 1")
+					out, err := runGit(f.Repo, "show", ref+":"+path)
+					return err == nil && out == hook.Event+"\n"
+				})
+				if readDaemonStatePID(f.Repo) != owner || readDaemonStateMode(f.Repo) != "running" {
+					t.Fatal("hook changed worker ownership or stopped protection")
+				}
+			}
+			if got := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")); got != f.BaseHead {
+				t.Fatal("hook created branch commits")
+			}
+			db := f.OpenDB(t)
+			exists, err := state.LegacyTableExists(ctx, db.ReadSQL(), "daemon_clients")
+			if err != nil || exists {
+				t.Fatalf("hook created client/session state: %v %v", exists, err)
+			}
+			off := f.Run(t, ctx, "off", "--json")
+			if off.ExitCode != 0 {
+				t.Fatalf("off %+v", off)
+			}
+			env, payload = adapterInvocation(f.Env, f.Bin, f.Repo)
+			for _, hook := range adapterHooks(t, harness) {
+				result := runBash(t, ctx, env, payload, "cd "+shellQuote(hookDir)+" && "+hook.Command)
+				if result.ExitCode != 0 || result.Stdout != "" {
+					t.Fatalf("disabled hook %+v", result)
+				}
+			}
+			registry, err := central.Load(f.Roots)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, record := range registry.Repos {
+				if !record.LifecycleDisabled() {
+					t.Fatal("hook re-enabled disabled protection")
+				}
+			}
+		})
 	}
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("adapter e2e: bash not on PATH")
-	}
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("adapter e2e: sqlite3 binary required for daemon_clients probes")
-	}
-
-	// Ensure init renders for every harness up-front so a missing snippet
-	// surfaces as one obvious failure rather than five copies.
-	bin := buildAcdBinary(t)
-	for _, h := range []string{"claude-code", "codex", "cursor", "opencode", "pi", "shell"} {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		out := runAcd(t, ctx, os.Environ(), "setup", h)
-		cancel()
-		if out.ExitCode != 0 {
-			t.Fatalf("acd setup %s exit=%d\nstdout=%s\nstderr=%s",
-				h, out.ExitCode, out.Stdout, out.Stderr)
-		}
-		if len(strings.TrimSpace(out.Stdout)) == 0 {
-			t.Fatalf("acd setup %s emitted empty stdout", h)
-		}
-	}
-
-	t.Run("claude-code", func(t *testing.T) {
-		runClaudeCodeE2E(t, bin)
-	})
-	t.Run("codex", func(t *testing.T) {
-		runCodexE2E(t, bin)
-		runCodexMissingAcdIsConfigurationError(t)
-		runCodexLegacyTOMLAutoDetect(t, bin)
-	})
-	t.Run("cursor", func(t *testing.T) {
-		runCursorE2E(t, bin)
-	})
-	t.Run("opencode", func(t *testing.T) {
-		runOpencodeE2E(t, bin)
-	})
-	t.Run("pi", func(t *testing.T) {
-		runPiE2E(t, bin)
-	})
-	t.Run("shell", func(t *testing.T) {
-		runShellE2E(t, bin)
-	})
-	t.Run("pause-resume", func(t *testing.T) {
-		runPauseResumeE2E(t, bin)
-	})
+	runCodexMissingAcdIsConfigurationError(t)
+	runCodexLegacyTOMLAutoDetect(t, buildAcdBinary(t))
 }
 
 func TestAdapterE2E_InactiveRepositoriesAreSilent(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("adapter e2e: Windows snippets not in scope for v1")
-	}
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("adapter e2e: bash not on PATH")
-	}
-	bin := buildAcdBinary(t)
-	binDir := filepath.Dir(bin)
-
-	adapters := []struct {
-		name    string
-		command func(*testing.T) string
-		invoke  func(*testing.T, string, string, string) ([]string, string)
-	}{
-		{
-			name: "claude-code",
-			command: func(t *testing.T) string {
-				return pickHookByEvent(t, parseClaudeCodeSnippet(t,
-					readSnippet(t, "claude-code/settings.snippet.json")), "SessionStart").Command
-			},
-			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
-				return adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo),
-					fmt.Sprintf(`{"session_id":%q}`, session)
-			},
-		},
-		{
-			name: "codex",
-			command: func(t *testing.T) string {
-				return pickHookByEvent(t, parseCodexHooksJSON(t,
-					readSnippet(t, "codex/hooks.json")), "SessionStart").Command
-			},
-			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
-				return adapterEnv(t, binDir), fmt.Sprintf(`{"session_id":%q,"cwd":%q}`, session, repo)
-			},
-		},
-		{
-			name: "cursor",
-			command: func(t *testing.T) string {
-				return pickHookByEvent(t, parseCursorHooksJSON(t,
-					readSnippet(t, "cursor/hooks.json")), "sessionStart").Command
-			},
-			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
-				return adapterEnv(t, binDir),
-					fmt.Sprintf(`{"conversation_id":%q,"workspace_roots":[%q]}`, session, repo)
-			},
-		},
-		{
-			name: "opencode",
-			command: func(t *testing.T) string {
-				return pickHookByEvent(t, parseYAMLBashBlocks(t,
-					readSnippet(t, "opencode/hooks.snippet.yaml")), "acd-start").Command
-			},
-			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
-				return adapterEnv(t, binDir, "OPENCODE_PROJECT_DIR="+repo,
-					"OPENCODE_SESSION_ID="+session), ""
-			},
-		},
-		{
-			name: "pi",
-			command: func(t *testing.T) string {
-				return pickHookByEvent(t, parseYAMLBashBlocks(t,
-					readSnippet(t, "pi/hooks.snippet.yaml")), "acd-start").Command
-			},
-			invoke: func(t *testing.T, binDir, repo, session string) ([]string, string) {
-				return adapterEnv(t, binDir, "PI_PROJECT_DIR="+repo,
-					"PI_SESSION_ID="+session), ""
-			},
-		},
-	}
-
-	for _, adapter := range adapters {
-		adapter := adapter
-		for _, scenario := range []string{"non-git", "unregistered", "disabled"} {
-			t.Run(adapter.name+"/"+scenario, func(t *testing.T) {
+	for _, harness := range []string{"claude-code", "codex", "cursor", "opencode", "pi", "shell"} {
+		for _, gitRepo := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/git=%t", harness, gitRepo), func(t *testing.T) {
 				repo := t.TempDir()
-				if scenario != "non-git" {
+				if gitRepo {
 					repo = tempRepo(t)
 				}
-				env, stdin := adapter.invoke(t, binDir, repo, "inactive-"+adapter.name)
-				if scenario == "disabled" {
-					roots, _ := prepareCheckpointRegistration(t, env, repo)
-					if err := central.WithLock(roots, func(registry *central.Registry) error {
-						result := registry.DisableRepo(central.RepoRemovalTarget{Path: repo}, time.Now().Unix())
-						if result.NotFound || !result.Record.LifecycleDisabled() {
-							return fmt.Errorf("disable repository: %+v", result)
-						}
-						return nil
-					}); err != nil {
-						t.Fatal(err)
-					}
-				}
-
+				env, payload := adapterInvocation(withIsolatedHome(t), buildAcdBinary(t), repo)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				res := runBash(t, ctx, env, stdin, adapter.command(t))
-				if res.ExitCode != 0 || res.Stdout != "" {
-					t.Fatalf("inactive %s hook exit=%d stdout=%q stderr=%q",
-						scenario, res.ExitCode, res.Stdout, res.Stderr)
+				for _, hook := range adapterHooks(t, harness) {
+					result := runBash(t, ctx, env, payload, "cd "+shellQuote(repo)+" && "+hook.Command)
+					if result.ExitCode != 0 || result.Stdout != "" {
+						t.Fatalf("inactive hook %+v", result)
+					}
 				}
-				stateRoot := envValue(env, "XDG_STATE_HOME")
-				if path := filepath.Join(stateRoot, "acd", adapter.name+"-hook.log"); integrationPathExists(path) {
-					t.Fatalf("inactive hook wrote %s", path)
-				}
-				if socket := filepath.Join(stateRoot, "acd", "run", "supervisor.sock"); integrationPathExists(socket) {
-					t.Fatalf("inactive hook started the supervisor at %s", socket)
-				}
-				if scenario == "unregistered" && integrationPathExists(filepath.Join(repo, ".git", "acd")) {
-					t.Fatal("unregistered hook created repository state")
+				for _, path := range []string{filepath.Join(repo, ".git", "acd"), filepath.Join(envValue(env, "XDG_STATE_HOME"), "acd", "run", "supervisor.sock")} {
+					if _, err := os.Stat(path); !os.IsNotExist(err) {
+						t.Fatalf("inactive hook wrote %s: %v", path, err)
+					}
 				}
 			})
 		}
 	}
 }
 
-func integrationPathExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-// runPauseResumeE2E covers P2 finding 15: drives `acd pause` / `acd resume`
-// against a daemon spawned through the existing claude-code harness lifecycle
-// and asserts the on-disk marker, marker mode, and `acd status --json`
-// projection of the pause state in both directions. We reuse the claude-code
-// path (vs reimplementing daemon spawn) so this stays one of the AdapterE2E
-// subtests instead of a parallel scaffold.
-func runPauseResumeE2E(t *testing.T, bin string) {
-	body := readSnippet(t, "claude-code/settings.snippet.json")
-	hooks := parseClaudeCodeSnippet(t, body)
-
-	repo := tempRepo(t)
-	binDir := filepath.Dir(bin)
-	sessionID := "e2e-pause-resume"
-	stdin := fmt.Sprintf(`{"session_id":"%s"}`, sessionID)
-
-	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
-	env = addFailingJQ(t, env)
-	ensureCheckpointRuntime(t, env, repo, bin)
-
-	// Drive the claude-code SessionStart hook so the daemon comes up under
-	// the same code path the harness uses in production.
-	startHook := pickHookByEvent(t, hooks, "SessionStart")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	res := runBash(t, ctx, env, stdin, startHook.Command)
-	if res.ExitCode != 0 {
-		t.Fatalf("pause-resume SessionStart exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-	waitFor(t, "pause-resume daemon mode==running", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
-
-	// Always tear down the daemon, even on assertion failure, so subsequent
-	// subtests start from a clean slate.
-	t.Cleanup(func() {
-		stopHook := pickHookByEvent(t, hooks, "SessionEnd")
-		stopRes := runBash(t, ctx, env, stdin, stopHook.Command)
-		if stopRes.ExitCode != 0 {
-			// Fall back to forced stop so we never leave a stray daemon
-			// behind.
-			t.Logf("pause-resume SessionEnd exit=%d (stdout=%s stderr=%s); forcing stop",
-				stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
-			shutdownDaemon(t, env, repo, sessionID)
-			return
-		}
-
-	})
-
-	// Use pausepkg.Path so a future marker-path refactor breaks the test
-	// instead of rubber-stamping a stale hardcoded location.
-	markerPath := pausepkg.Path(filepath.Join(repo, ".git"))
-
-	// Step 1: `acd pause --reason e2e --yes` writes a 0o600 marker.
-	pauseRes := runAcd(t, ctx, env,
-		"pause", "--repo", repo, "--reason", "e2e", "--yes", "--json")
-	if pauseRes.ExitCode != 0 {
-		t.Fatalf("acd pause exit=%d\nstdout=%s\nstderr=%s",
-			pauseRes.ExitCode, pauseRes.Stdout, pauseRes.Stderr)
-	}
-	info, err := os.Lstat(markerPath)
-	if err != nil {
-		t.Fatalf("stat pause marker: %v", err)
-	}
-	if !info.Mode().IsRegular() {
-		t.Fatalf("pause marker is not a regular file: mode=%v", info.Mode())
-	}
-	// Permissions: 0o600. We test only the lower 9 bits because the temp file
-	// publish path may set additional bits (e.g. setgid via umask) on some
-	// platforms; the security-relevant part is "no world/group access".
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("pause marker mode=%o want 0o600", perm)
-	}
-
-	// Step 2: `acd status --json` reflects paused=true with source=manual.
-	assertStatusPause(t, ctx, env, repo, true, "manual")
-
-	// Step 3: `acd resume --yes` removes the marker.
-	resumeRes := runAcd(t, ctx, env, "resume", "--repo", repo, "--yes", "--json")
-	if resumeRes.ExitCode != 0 {
-		t.Fatalf("acd resume exit=%d\nstdout=%s\nstderr=%s",
-			resumeRes.ExitCode, resumeRes.Stdout, resumeRes.Stderr)
-	}
-	if _, err := os.Lstat(markerPath); !os.IsNotExist(err) {
-		t.Fatalf("pause marker still present after acd resume: err=%v", err)
-	}
-
-	// Step 4: `acd status --json` reflects paused=false (Pause field absent).
-	assertStatusPause(t, ctx, env, repo, false, "")
-}
-
-// assertStatusPause runs `acd status --json` and verifies the paused/source
-// fields. wantSource is ignored when wantPaused==false.
-func assertStatusPause(t *testing.T, ctx context.Context, env []string, repo string, wantPaused bool, wantSource string) {
-	t.Helper()
-	res := runAcd(t, ctx, env, "status", "--repo", repo, "--json")
-	wantExit := 0
-	if wantPaused {
-		wantExit = 3
-	}
-	if res.ExitCode != wantExit {
-		t.Fatalf("acd status exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-	var rep struct {
-		State string `json:"state"`
-		Data  struct {
-			Summary string `json:"summary"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(res.Stdout), &rep); err != nil {
-		t.Fatalf("decode status json: %v\nstdout=%s", err, res.Stdout)
-	}
-	if wantPaused && rep.State != "needs_action" {
-		t.Fatalf("acd status state=%q want needs_action while paused (%s)\nstdout=%s",
-			rep.State, wantSource, res.Stdout)
-	}
-	if !wantPaused && rep.State == "needs_action" && strings.Contains(strings.ToLower(rep.Data.Summary), "paused") {
-		t.Fatalf("acd status remains paused after resume\nstdout=%s", res.Stdout)
-	}
-}
-
-// -----------------------------------------------------------------------------
-// helpers
-// -----------------------------------------------------------------------------
-
-// adapterEnv stitches isolated $HOME, the binary's directory on PATH, and any
-// per-harness extras into one env slice.
-func adapterEnv(t *testing.T, binDir string, extras ...string) []string {
-	t.Helper()
-	base := withIsolatedHome(t)
-	// Prepend binDir to PATH so `acd` resolves inside `bash -c '...'` even
-	// without an absolute path.
-	pathPrepended := false
-	for i, kv := range base {
-		if strings.HasPrefix(kv, "PATH=") {
-			base[i] = "PATH=" + binDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
-			pathPrepended = true
-			break
-		}
-	}
-	if !pathPrepended {
-		base = append(base, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	}
-	return envWith(base, extras...)
-}
-
 func prependPath(env []string, dir string) []string {
-	out := append([]string{}, env...)
-	for i, kv := range out {
-		if strings.HasPrefix(kv, "PATH=") {
-			out[i] = "PATH=" + dir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
-			return out
-		}
-	}
-	return append(out, "PATH="+dir)
+	return envWith(env, "PATH="+dir+string(os.PathListSeparator)+envValue(env, "PATH"))
 }
 
 func addFailingJQ(t *testing.T, env []string) []string {
@@ -377,6 +174,7 @@ func addFailingJQ(t *testing.T, env []string) []string {
 
 // runBash runs `bash -c command` with the given env and stdin. Returns
 // stdout, stderr, exit code.
+
 func runBash(t *testing.T, ctx context.Context, env []string, stdin, command string) ExecResult {
 	t.Helper()
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
@@ -405,6 +203,7 @@ func runBash(t *testing.T, ctx context.Context, env []string, stdin, command str
 }
 
 // readSnippet reads a verbatim snippet file from the embedded templates FS.
+
 func readSnippet(t *testing.T, path string) string {
 	t.Helper()
 	b, err := fs.ReadFile(templates.FS, path)
@@ -427,6 +226,7 @@ type hookSpec struct {
 // `hooks` array of {type:"command", command:"…"} handlers. The matcher field
 // is not used here — every command is exercised through the same fake stdin
 // payload.
+
 func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 	t.Helper()
 	var doc struct {
@@ -459,6 +259,7 @@ func parseClaudeCodeSnippet(t *testing.T, body string) []hookSpec {
 // hookSpec per registered command. The schema mirrors claude-code:
 // hooks.<EventName> is an array of entries, each with optional matcher and a
 // hooks array of {type, timeout, command} handlers.
+
 func parseCodexHooksJSON(t *testing.T, body string) []hookSpec {
 	t.Helper()
 	var doc struct {
@@ -497,6 +298,7 @@ func parseCodexHooksJSON(t *testing.T, body string) []hookSpec {
 // parseCursorHooksJSON walks templates/cursor/hooks.json. Cursor uses a flat
 // schema: hooks.<eventName>[] entries each carry command and timeout directly
 // (no nested type/hooks arrays like codex).
+
 func parseCursorHooksJSON(t *testing.T, body string) []hookSpec {
 	t.Helper()
 	var doc struct {
@@ -527,6 +329,7 @@ func parseCursorHooksJSON(t *testing.T, body string) []hookSpec {
 }
 
 // installCursorHooks copies the embedded hooks.json into isolated $HOME/.cursor.
+
 func installCursorHooks(t *testing.T, home string) {
 	t.Helper()
 	cursorDir := filepath.Join(home, ".cursor")
@@ -539,23 +342,6 @@ func installCursorHooks(t *testing.T, home string) {
 	}
 }
 
-func homeFromEnv(env []string) string {
-	for _, kv := range env {
-		if strings.HasPrefix(kv, "HOME=") {
-			return strings.TrimPrefix(kv, "HOME=")
-		}
-	}
-	return ""
-}
-
-// runCursorHook executes a hooks.json command with cwd=$HOME/.cursor, matching
-// Cursor's user-global hook working directory.
-func runCursorHook(t *testing.T, ctx context.Context, env []string, home, stdin, command string) ExecResult {
-	t.Helper()
-	cursorDir := filepath.Join(home, ".cursor")
-	return runBash(t, ctx, env, stdin, "cd "+shellQuote(cursorDir)+" && "+command)
-}
-
 // parseYAMLBashBlocks extracts every `bash: |` heredoc block from an
 // opencode/pi-style YAML hook snippet, plus the surrounding `id:` so we can
 // pick the start/stop one. Returns specs in document order.
@@ -563,6 +349,7 @@ func runCursorHook(t *testing.T, ctx context.Context, env []string, home, stdin,
 // We avoid pulling in a YAML dependency by walking lines and tracking the
 // current `id:` and `event:` fields, then collecting the multi-line bash
 // body that follows `bash: |` until indentation drops back.
+
 func parseYAMLBashBlocks(t *testing.T, body string) []hookSpec {
 	t.Helper()
 	lines := strings.Split(body, "\n")
@@ -615,6 +402,7 @@ func parseYAMLBashBlocks(t *testing.T, body string) []hookSpec {
 
 // pickHookByEvent returns the first hook whose Event field contains the
 // given substring (case-sensitive). Fails the test if none matches.
+
 func pickHookByEvent(t *testing.T, hooks []hookSpec, want string) hookSpec {
 	t.Helper()
 	for _, h := range hooks {
@@ -626,396 +414,6 @@ func pickHookByEvent(t *testing.T, hooks []hookSpec, want string) hookSpec {
 	return hookSpec{}
 }
 
-func assertIntegrationEventCommand(
-	t *testing.T,
-	command string,
-	harness string,
-	event string,
-) {
-	t.Helper()
-	if strings.Count(command, "acd internal integration event") != 1 {
-		t.Fatalf("%s %s hook must invoke one integration event, got: %s", harness, event, command)
-	}
-	for _, want := range []string{"--harness " + harness, "--event " + event} {
-		if !strings.Contains(command, want) {
-			t.Fatalf("%s hook missing %q, got: %s", event, want, command)
-		}
-	}
-	for _, obsolete := range []string{"internal session open", "internal hint", "integration stdin-extract", "integration cursor-extract"} {
-		if strings.Contains(command, obsolete) {
-			t.Fatalf("%s hook still contains legacy command %q: %s", event, obsolete, command)
-		}
-	}
-}
-
-// clientRow models one daemon_clients row from the per-repo state.db.
-type clientRow struct {
-	SessionID string
-	Harness   string
-}
-
-// readClients returns every daemon_clients row in the repo's state.db.
-func readClients(t *testing.T, repo string) []clientRow {
-	t.Helper()
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		return nil
-	}
-	out, err := exec.Command("sqlite3", "-separator", "|", dbPath,
-		"SELECT session_id, harness FROM daemon_clients").CombinedOutput()
-	if err != nil {
-		t.Fatalf("sqlite3 daemon_clients: %v\n%s", err, out)
-	}
-	var rows []clientRow
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "|", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		rows = append(rows, clientRow{SessionID: parts[0], Harness: parts[1]})
-	}
-	return rows
-}
-
-func assertLatestActivityBoundary(
-	t *testing.T,
-	repo string,
-	wantKind string,
-	wantSource string,
-) {
-	t.Helper()
-	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
-	out, err := exec.Command("sqlite3", "-separator", "|", dbPath, `
-SELECT kind, source, branch_ref IS NULL, branch_generation IS NULL
-FROM intent_activity_boundaries ORDER BY epoch DESC LIMIT 1`).CombinedOutput()
-	if err != nil {
-		t.Fatalf("sqlite3 intent_activity_boundaries: %v\n%s", err, out)
-	}
-	got := strings.TrimSpace(string(out))
-	want := wantKind + "|" + wantSource + "|1|1"
-	if got != want {
-		t.Fatalf("latest activity boundary=%q want %q", got, want)
-	}
-}
-
-// assertClientRow polls daemon_clients for up to timeout, asserting a row
-// with the given session_id + harness. Fails the test on timeout.
-func assertClientRow(t *testing.T, repo, sessionID, harness string, timeout time.Duration) {
-	t.Helper()
-	waitFor(t, fmt.Sprintf("daemon_clients row session=%s harness=%s", sessionID, harness),
-		timeout, func() bool {
-			for _, c := range readClients(t, repo) {
-				if c.SessionID == sessionID && c.Harness == harness {
-					return true
-				}
-			}
-			return false
-		})
-}
-
-// shutdownDaemon force-stops any running daemon for `repo` so subsequent
-// subtests start from a clean slate. Errors are surfaced via t.Logf so a
-// stuck cleanup does not mask the real assertion failure.
-func shutdownDaemon(t *testing.T, env []string, repo, sessionID string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	res := runAcd(t, ctx, env,
-		"stop", "--repo", repo, "--session-id", sessionID, "--force", "--json")
-	if res.ExitCode != 0 {
-		t.Logf("cleanup acd stop --force exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-}
-
-func assertActiveHookSelfHeals(t *testing.T, label string, ctx context.Context, env []string, repo, sessionID, harness string, hook hookSpec, stdin string) {
-	t.Helper()
-	if healRes := runBash(t, ctx, env, stdin, hook.Command); healRes.ExitCode != 0 {
-		t.Fatalf("%s active-hook idempotency exit=%d\nstdout=%s\nstderr=%s",
-			label, healRes.ExitCode, healRes.Stdout, healRes.Stderr)
-	}
-	waitFor(t, label+" worker remains running after repeated hint", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, harness, 5*time.Second)
-}
-
-// assertActiveHookSurvivesRejectedStopAll proves the removed registry-wide
-// stop alias cannot disrupt a running worker or its registered client.
-func assertActiveHookSurvivesRejectedStopAll(t *testing.T, label string, ctx context.Context, env []string, repo, sessionID, harness string, hook hookSpec, stdin string) {
-	t.Helper()
-	selfHealStop := runBash(t, ctx, env, "",
-		"acd stop --all --force >/dev/null 2>&1")
-	if selfHealStop.ExitCode == 0 {
-		t.Fatalf("%s stop --all unexpectedly succeeded\nstdout=%s\nstderr=%s",
-			label, selfHealStop.Stdout, selfHealStop.Stderr)
-	}
-	if healRes := runBash(t, ctx, env, stdin, hook.Command); healRes.ExitCode != 0 {
-		t.Fatalf("%s active hook failed after rejected stop --all exit=%d\nstdout=%s\nstderr=%s",
-			label, healRes.ExitCode, healRes.Stdout, healRes.Stderr)
-	}
-	waitFor(t, label+" worker remains running after rejected stop --all", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, harness, 5*time.Second)
-}
-
-// -----------------------------------------------------------------------------
-// per-harness flows
-// -----------------------------------------------------------------------------
-
-func runClaudeCodeE2E(t *testing.T, bin string) {
-	body := readSnippet(t, "claude-code/settings.snippet.json")
-	hooks := parseClaudeCodeSnippet(t, body)
-
-	repo := tempRepo(t)
-	binDir := filepath.Dir(bin)
-	sessionID := "e2e-claude-code"
-	stdin := fmt.Sprintf(`{"session_id":"%s"}`, sessionID)
-
-	// Fake claude-code env: CLAUDE_PROJECT_DIR points at the repo so the
-	// snippet's ${CLAUDE_PROJECT_DIR:-$PWD} expansion picks it up.
-	env := adapterEnv(t, binDir, "CLAUDE_PROJECT_DIR="+repo)
-	env = addFailingJQ(t, env)
-	ensureCheckpointRuntime(t, env, repo, bin)
-
-	startHook := pickHookByEvent(t, hooks, "SessionStart")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	res := runBash(t, ctx, env, stdin, startHook.Command)
-	if res.ExitCode != 0 {
-		t.Fatalf("claude-code SessionStart exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-
-	waitFor(t, "claude-code daemon mode==running", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "claude-code", 5*time.Second)
-
-	// Exercise PreToolUse so we know `acd wake` works through the same
-	// JSON-piped path the snippet expects in production.
-	wakeHook := pickHookByEvent(t, hooks, "PreToolUse")
-	wakeRes := runBash(t, ctx, env, stdin, wakeHook.Command)
-	if wakeRes.ExitCode != 0 {
-		t.Fatalf("claude-code PreToolUse exit=%d\nstdout=%s\nstderr=%s",
-			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
-	}
-	assertActiveHookSelfHeals(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
-
-	// The removed registry-wide stop alias must not disrupt active hooks.
-	assertActiveHookSurvivesRejectedStopAll(t, "claude-code", ctx, env, repo, sessionID, "claude-code", wakeHook, stdin)
-
-	// Stop is a logical boundary. The daemon must remain alive because Stop
-	// fires when Claude finishes a turn, not when the session closes. The
-	// request itself drives the bypass-min-pending
-	// commit; we cover the commit-within-2s timing in the dedicated
-	// flush_logical integration test.
-	turnStopHook := pickHookByEvent(t, hooks, "Stop")
-	if turnStopHook.Command == "" {
-		t.Fatalf("claude-code snippet missing Stop hook entry")
-	}
-	assertIntegrationEventCommand(t, turnStopHook.Command, "claude-code", "logical_boundary")
-	if turnRes := runBash(t, ctx, env, stdin, turnStopHook.Command); turnRes.ExitCode != 0 {
-		t.Fatalf("claude-code Stop (turn end) exit=%d\nstdout=%s\nstderr=%s",
-			turnRes.ExitCode, turnRes.Stdout, turnRes.Stderr)
-	}
-	if mode := readDaemonStateMode(repo); mode != "running" {
-		t.Fatalf("claude-code daemon mode after Stop=%q; want running (Stop must flush, not stop)", mode)
-	}
-
-	// SessionEnd → acd stop. The daemon should shut down because this is
-	// the only registered session.
-	stopHook := pickHookByEvent(t, hooks, "SessionEnd")
-	stopRes := runBash(t, ctx, env, stdin, stopHook.Command)
-	if stopRes.ExitCode != 0 {
-		t.Fatalf("claude-code SessionEnd exit=%d\nstdout=%s\nstderr=%s",
-			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
-	}
-
-}
-
-func runCodexE2E(t *testing.T, bin string) {
-	body := readSnippet(t, "codex/hooks.json")
-	hooks := parseCodexHooksJSON(t, body)
-
-	repo := tempRepo(t)
-	binDir := filepath.Dir(bin)
-	sessionID := "e2e-codex"
-	// Codex hooks v2: cwd comes from stdin, not CODEX_PROJECT_DIR.
-	stdin := fmt.Sprintf(`{"session_id":"%s","cwd":"%s"}`, sessionID, repo)
-
-	// Run the bash subprocess outside the repo so the snippet must source the
-	// repo path from the stdin cwd field rather than $PWD.
-	env := adapterEnv(t, binDir)
-	ensureCheckpointRuntime(t, env, repo, bin)
-
-	startHook := pickHookByEvent(t, hooks, "SessionStart")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	res := runBash(t, ctx, env, stdin, startHook.Command)
-	if res.ExitCode != 0 {
-		t.Fatalf("codex SessionStart exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-	waitFor(t, "codex daemon mode==running", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "codex", 5*time.Second)
-
-	// Missing cwd falls back to the hook process working directory rather than
-	// silently skipping the hook.
-	fallbackRepo := tempRepo(t)
-	fallbackSessionID := "e2e-codex-pwd-fallback"
-	fallbackStdin := fmt.Sprintf(`{"session_id":"%s"}`, fallbackSessionID)
-	ensureCheckpointRuntime(t, env, fallbackRepo, bin)
-	fallbackCommand := "cd " + shellQuote(fallbackRepo) + " && " + startHook.Command
-	fallbackRes := runBash(t, ctx, env, fallbackStdin, fallbackCommand)
-	if fallbackRes.ExitCode != 0 {
-		t.Fatalf("codex SessionStart without cwd exit=%d\nstdout=%s\nstderr=%s",
-			fallbackRes.ExitCode, fallbackRes.Stdout, fallbackRes.Stderr)
-	}
-	waitFor(t, "codex daemon mode==running with pwd fallback", 10*time.Second, func() bool {
-		return readDaemonStateMode(fallbackRepo) == "running"
-	})
-	assertClientRow(t, fallbackRepo, fallbackSessionID, "codex", 5*time.Second)
-	fallbackStop := runBash(t, ctx, env, "",
-		"acd stop --session-id "+shellQuote(fallbackSessionID)+
-			" --repo "+shellQuote(fallbackRepo)+" --force >/dev/null 2>&1")
-	if fallbackStop.ExitCode != 0 {
-		t.Fatalf("codex fallback stop exit=%d\nstdout=%s\nstderr=%s",
-			fallbackStop.ExitCode, fallbackStop.Stdout, fallbackStop.Stderr)
-	}
-
-	// UserPromptSubmit -> acd wake.
-	upHook := pickHookByEvent(t, hooks, "UserPromptSubmit")
-	if upRes := runBash(t, ctx, env, stdin, upHook.Command); upRes.ExitCode != 0 {
-		t.Fatalf("codex UserPromptSubmit exit=%d\nstdout=%s\nstderr=%s",
-			upRes.ExitCode, upRes.Stdout, upRes.Stderr)
-	}
-
-	assertActiveHookSelfHeals(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
-
-	// The removed registry-wide stop alias must not disrupt active hooks.
-	assertActiveHookSurvivesRejectedStopAll(t, "codex", ctx, env, repo, sessionID, "codex", upHook, stdin)
-
-	// PreToolUse -> acd wake (matcher path).
-	preHook := pickHookByEvent(t, hooks, "PreToolUse")
-	if preRes := runBash(t, ctx, env, stdin, preHook.Command); preRes.ExitCode != 0 {
-		t.Fatalf("codex PreToolUse exit=%d\nstdout=%s\nstderr=%s",
-			preRes.ExitCode, preRes.Stdout, preRes.Stderr)
-	}
-
-	// Stop records a soft boundary. Daemon must remain alive because
-	// PostToolUse replay can still be draining when Stop fires. The soft epoch
-	// triggers candidate evaluation without the hard logical-flush bypass.
-	stopHook := pickHookByEvent(t, hooks, "Stop")
-	assertIntegrationEventCommand(t, stopHook.Command, "codex", "soft_boundary")
-	if stopRes := runBash(t, ctx, env, stdin, stopHook.Command); stopRes.ExitCode != 0 {
-		t.Fatalf("codex Stop exit=%d\nstdout=%s\nstderr=%s",
-			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
-	}
-	assertLatestActivityBoundary(t, repo, "soft", "touch_soft_boundary")
-	if mode := readDaemonStateMode(repo); mode != "running" {
-		t.Fatalf("codex daemon mode after Stop=%q, want running (Stop must record a soft boundary, not stop)", mode)
-	}
-
-	// Production cleanup relies on watch_pid death + refcount sweep; in the
-	// test we drive shutdown explicitly with `acd stop --force`.
-	tearDown := runBash(t, ctx, env, "",
-		"acd stop --session-id "+shellQuote(sessionID)+
-			" --repo "+shellQuote(repo)+" --force >/dev/null 2>&1")
-	if tearDown.ExitCode != 0 {
-		t.Fatalf("codex stop exit=%d\nstdout=%s\nstderr=%s",
-			tearDown.ExitCode, tearDown.Stdout, tearDown.Stderr)
-	}
-
-}
-
-func runCursorE2E(t *testing.T, bin string) {
-	body := readSnippet(t, "cursor/hooks.json")
-	hooks := parseCursorHooksJSON(t, body)
-
-	repo := tempRepo(t)
-	binDir := filepath.Dir(bin)
-	sessionID := "e2e-cursor"
-	stdin := fmt.Sprintf(`{"conversation_id":%q,"workspace_roots":[%q]}`,
-		sessionID, repo)
-
-	env := adapterEnv(t, binDir)
-	ensureCheckpointRuntime(t, env, repo, bin)
-	home := homeFromEnv(env)
-	if home == "" {
-		t.Fatal("cursor e2e: HOME missing from env")
-	}
-	installCursorHooks(t, home)
-
-	startHook := pickHookByEvent(t, hooks, "sessionStart")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	res := runCursorHook(t, ctx, env, home, stdin, startHook.Command)
-	if res.ExitCode != 0 {
-		t.Fatalf("cursor sessionStart exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-	waitFor(t, "cursor daemon mode==running", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "cursor", 5*time.Second)
-
-	wakeHook := pickHookByEvent(t, hooks, "postToolUse")
-	if wakeRes := runCursorHook(t, ctx, env, home, stdin, wakeHook.Command); wakeRes.ExitCode != 0 {
-		t.Fatalf("cursor postToolUse exit=%d\nstdout=%s\nstderr=%s",
-			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
-	}
-	assertActiveHookSelfHealsCursor(t, "cursor", ctx, env, home, repo, sessionID, wakeHook, stdin)
-
-	afterEditHook := pickHookByEvent(t, hooks, "afterFileEdit")
-	assertIntegrationEventCommand(t, afterEditHook.Command, "cursor", "activity")
-	if afterRes := runCursorHook(t, ctx, env, home, stdin, afterEditHook.Command); afterRes.ExitCode != 0 {
-		t.Fatalf("cursor afterFileEdit exit=%d\nstdout=%s\nstderr=%s",
-			afterRes.ExitCode, afterRes.Stdout, afterRes.Stderr)
-	}
-
-	flushHook := pickHookByEvent(t, hooks, "stop")
-	assertIntegrationEventCommand(t, flushHook.Command, "cursor", "logical_boundary")
-	if flushRes := runCursorHook(t, ctx, env, home, stdin, flushHook.Command); flushRes.ExitCode != 0 {
-		t.Fatalf("cursor stop (flush) exit=%d\nstdout=%s\nstderr=%s",
-			flushRes.ExitCode, flushRes.Stdout, flushRes.Stderr)
-	}
-	if mode := readDaemonStateMode(repo); mode != "running" {
-		t.Fatalf("cursor daemon mode after stop=%q; want running (stop must flush, not stop daemon)", mode)
-	}
-
-	endHook := pickHookByEvent(t, hooks, "sessionEnd")
-	if endRes := runCursorHook(t, ctx, env, home, stdin, endHook.Command); endRes.ExitCode != 0 {
-		t.Fatalf("cursor sessionEnd exit=%d\nstdout=%s\nstderr=%s",
-			endRes.ExitCode, endRes.Stdout, endRes.Stderr)
-	}
-
-}
-
-// assertActiveHookSelfHealsCursor mirrors assertActiveHookSelfHeals but runs
-// hook bodies from $HOME/.cursor like Cursor does in production.
-func assertActiveHookSelfHealsCursor(t *testing.T, label string, ctx context.Context, env []string, home, repo, sessionID string, hook hookSpec, stdin string) {
-	t.Helper()
-	if healRes := runCursorHook(t, ctx, env, home, stdin, hook.Command); healRes.ExitCode != 0 {
-		t.Fatalf("%s active-hook idempotency exit=%d\nstdout=%s\nstderr=%s",
-			label, healRes.ExitCode, healRes.Stdout, healRes.Stderr)
-	}
-	waitFor(t, label+" daemon mode==running after self-heal", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "cursor", 5*time.Second)
-}
-
-// runCodexLegacyTOMLAutoDetect ensures `acd setup` with no harness arg still
-// resolves to codex when only the legacy `~/.codex/config.toml` carries the
-// acd marker (hooks.json absent). Codex hooks v2 added hooks.json discovery
-// but must keep the legacy TOML install detectable.
 func runCodexLegacyTOMLAutoDetect(t *testing.T, bin string) {
 	binDir := filepath.Dir(bin)
 	base := withIsolatedHome(t)
@@ -1042,7 +440,7 @@ func runCodexLegacyTOMLAutoDetect(t *testing.T, bin string) {
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	res := runAcdFromDir(t, ctx, env, tempRepo(t), "setup", "--provider", "deterministic")
+	res := runAcdFromDir(t, ctx, env, tempRepo(t), "setup", "--dry-run", "--provider", "deterministic")
 	if res.ExitCode != 0 {
 		t.Fatalf("acd setup auto-detect with legacy codex TOML exit=%d\nstdout=%s\nstderr=%s",
 			res.ExitCode, res.Stdout, res.Stderr)
@@ -1084,6 +482,7 @@ func runCodexMissingAcdIsConfigurationError(t *testing.T) {
 // TestAdapterE2E_Codex_BrokenBinary proves command configuration errors stay
 // visible. ACD runtime failures fail open inside the command, but a binary
 // that cannot execute the integration protocol is not an ACD runtime result.
+
 func TestAdapterE2E_Codex_BrokenBinary(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("adapter e2e: Windows snippets not in scope for v1")
@@ -1126,203 +525,6 @@ func TestAdapterE2E_Codex_BrokenBinary(t *testing.T) {
 	}
 }
 
-func runOpencodeE2E(t *testing.T, bin string) {
-	body := readSnippet(t, "opencode/hooks.snippet.yaml")
-	hooks := parseYAMLBashBlocks(t, body)
-
-	repo := tempRepo(t)
-	binDir := filepath.Dir(bin)
-	sessionID := "e2e-opencode"
-	env := adapterEnv(t, binDir,
-		"OPENCODE_SESSION_ID="+sessionID,
-		"OPENCODE_PROJECT_DIR="+repo,
-	)
-	ensureCheckpointRuntime(t, env, repo, bin)
-
-	startHook := pickHookByEvent(t, hooks, "acd-start")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	res := runBash(t, ctx, env, "", startHook.Command)
-	if res.ExitCode != 0 {
-		t.Fatalf("opencode acd-start exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-	waitFor(t, "opencode daemon mode==running", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "opencode", 5*time.Second)
-
-	wakeHook := pickHookByEvent(t, hooks, "acd-wake-tool-before")
-	wakeRes := runBash(t, ctx, env, "", wakeHook.Command)
-	if wakeRes.ExitCode != 0 {
-		t.Fatalf("opencode acd-wake-tool-before exit=%d\nstdout=%s\nstderr=%s",
-			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
-	}
-	assertActiveHookSelfHeals(t, "opencode", ctx, env, repo, sessionID, "opencode", wakeHook, "")
-
-	// Idle records a logical boundary and does not end the session.
-	idleHook := pickHookByEvent(t, hooks, "acd-flush-idle")
-	if idleHook.Command == "" {
-		t.Fatalf("opencode snippet missing acd-flush-idle entry (legacy acd-touch-idle id no longer recognised)")
-	}
-	assertIntegrationEventCommand(t, idleHook.Command, "opencode", "logical_boundary")
-	if idleRes := runBash(t, ctx, env, "", idleHook.Command); idleRes.ExitCode != 0 {
-		t.Fatalf("opencode acd-flush-idle exit=%d\nstdout=%s\nstderr=%s",
-			idleRes.ExitCode, idleRes.Stdout, idleRes.Stderr)
-	}
-	if mode := readDaemonStateMode(repo); mode != "running" {
-		t.Fatalf("opencode daemon mode after idle=%q; want running", mode)
-	}
-
-	stopHook := pickHookByEvent(t, hooks, "acd-stop")
-	stopRes := runBash(t, ctx, env, "", stopHook.Command)
-	if stopRes.ExitCode != 0 {
-		t.Fatalf("opencode acd-stop exit=%d\nstdout=%s\nstderr=%s",
-			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
-	}
-
-}
-
-func runPiE2E(t *testing.T, bin string) {
-	body := readSnippet(t, "pi/hooks.snippet.yaml")
-	hooks := parseYAMLBashBlocks(t, body)
-
-	repo := tempRepo(t)
-	binDir := filepath.Dir(bin)
-	sessionID := "e2e-pi"
-	env := adapterEnv(t, binDir,
-		"PI_SESSION_ID="+sessionID,
-		"PI_PROJECT_DIR="+repo,
-	)
-	ensureCheckpointRuntime(t, env, repo, bin)
-
-	startHook := pickHookByEvent(t, hooks, "acd-start")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	res := runBash(t, ctx, env, "", startHook.Command)
-	if res.ExitCode != 0 {
-		t.Fatalf("pi acd-start exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-	waitFor(t, "pi daemon mode==running", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	assertClientRow(t, repo, sessionID, "pi", 5*time.Second)
-
-	wakeHook := pickHookByEvent(t, hooks, "acd-wake-tool-before")
-	wakeRes := runBash(t, ctx, env, "", wakeHook.Command)
-	if wakeRes.ExitCode != 0 {
-		t.Fatalf("pi acd-wake-tool-before exit=%d\nstdout=%s\nstderr=%s",
-			wakeRes.ExitCode, wakeRes.Stdout, wakeRes.Stderr)
-	}
-	assertActiveHookSelfHeals(t, "pi", ctx, env, repo, sessionID, "pi", wakeHook, "")
-
-	// Idle records a logical boundary and leaves the daemon running.
-	idleHook := pickHookByEvent(t, hooks, "acd-flush-idle")
-	if idleHook.Command == "" {
-		t.Fatalf("pi snippet missing acd-flush-idle entry (legacy acd-touch-idle id no longer recognised)")
-	}
-	assertIntegrationEventCommand(t, idleHook.Command, "pi", "logical_boundary")
-	if idleRes := runBash(t, ctx, env, "", idleHook.Command); idleRes.ExitCode != 0 {
-		t.Fatalf("pi acd-flush-idle exit=%d\nstdout=%s\nstderr=%s",
-			idleRes.ExitCode, idleRes.Stdout, idleRes.Stderr)
-	}
-	if mode := readDaemonStateMode(repo); mode != "running" {
-		t.Fatalf("pi daemon mode after idle=%q; want running", mode)
-	}
-
-	stopHook := pickHookByEvent(t, hooks, "acd-stop")
-	stopRes := runBash(t, ctx, env, "", stopHook.Command)
-	if stopRes.ExitCode != 0 {
-		t.Fatalf("pi acd-stop exit=%d\nstdout=%s\nstderr=%s",
-			stopRes.ExitCode, stopRes.Stdout, stopRes.Stderr)
-	}
-
-}
-
-func runShellE2E(t *testing.T, bin string) {
-	// The direnv envrc snippet generates `SID=$(uuidgen)` and exports
-	// ACD_SESSION_ID. To make the assertion deterministic without rewriting
-	// the snippet, we shadow `uuidgen` with a stub on PATH that prints a
-	// known UUID, then read $ACD_SESSION_ID back out via a marker file.
-	body := readSnippet(t, "shell/direnv.envrc.snippet")
-	if !strings.Contains(body, "acd internal session open") {
-		t.Skip("shell direnv snippet has no session-open invocation")
-	}
-
-	repo := tempRepo(t)
-	binDir := filepath.Dir(bin)
-	sessionID := "e2e-shell"
-
-	// Stage a fake `uuidgen` on a private bin dir so the snippet's
-	// `$(uuidgen)` returns our predictable session id.
-	fakeBin := t.TempDir()
-	stub := filepath.Join(fakeBin, "uuidgen")
-	writeFile(t, stub, "#!/usr/bin/env bash\necho '"+sessionID+"'\n")
-	if err := os.Chmod(stub, 0o755); err != nil {
-		t.Fatalf("chmod uuidgen stub: %v", err)
-	}
-
-	// Prepend fakeBin and binDir to PATH (fakeBin first so its uuidgen
-	// wins over any system uuidgen).
-	env := withIsolatedHome(t)
-	for i, kv := range env {
-		if strings.HasPrefix(kv, "PATH=") {
-			env[i] = "PATH=" + fakeBin + string(os.PathListSeparator) +
-				binDir + string(os.PathListSeparator) +
-				strings.TrimPrefix(kv, "PATH=")
-			break
-		}
-	}
-	ensureCheckpointRuntime(t, env, repo, bin)
-
-	// Run the snippet body inside the repo. The snippet defines a function
-	// + sets a trap; we need to keep the trap from killing our daemon when
-	// the bash subshell exits, so we replace the EXIT trap with a no-op
-	// after the snippet body executes. The simplest path: copy the snippet
-	// and strip the `trap` line.
-	stripped := stripTrapLines(body)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := "set -e; cd " + shellQuote(repo) + "; " + stripped
-	res := runBash(t, ctx, env, "", cmd)
-	if res.ExitCode != 0 {
-		t.Fatalf("shell direnv snippet exit=%d\nstdout=%s\nstderr=%s",
-			res.ExitCode, res.Stdout, res.Stderr)
-	}
-
-	waitFor(t, "shell daemon mode==running", 10*time.Second, func() bool {
-		return readDaemonStateMode(repo) == "running"
-	})
-	// The shell that supplied watch_pid has exited, so the worker may expire
-	// the optional hint immediately. Successful command execution plus the
-	// running worker proves the integration route was accepted.
-
-	// The shell snippet's stop path runs from a direnv unload trap which
-	// we cannot reliably simulate here. Force-stop via `acd stop` so the
-	// daemon shuts down before the test exits.
-	shutdownDaemon(t, env, repo, sessionID)
-}
-
-// stripTrapLines removes any `trap ... EXIT` line from a bash snippet so the
-// test subshell's exit does not propagate `acd stop` and pre-empt our
-// assertions. The direnv snippet's stop path is verified separately in the
-// shutdownDaemon cleanup at the end of the subtest.
-func stripTrapLines(body string) string {
-	var keep []string
-	for _, line := range strings.Split(body, "\n") {
-		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, "trap ") {
-			continue
-		}
-		keep = append(keep, line)
-	}
-	return strings.Join(keep, "\n")
-}
-
-// shellQuote wraps a string in single quotes, escaping any embedded single
-// quotes for bash -c consumption.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

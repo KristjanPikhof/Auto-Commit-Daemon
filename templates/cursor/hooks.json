@@ -21,7 +21,7 @@
     ],
     "stop": [
       {
-        "command": "bash -c 'acd internal integration event --harness cursor --event logical_boundary'",
+        "command": "bash -c 'acd internal integration event --harness cursor --event activity'",
         "timeout": 5
       }
     ],

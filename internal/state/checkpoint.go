@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 const (
@@ -49,7 +51,7 @@ func ResolveCheckpoint(ctx context.Context, dbPath, idOrPrefix string) (Checkpoi
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return Checkpoint{}, err
 	}
@@ -148,64 +150,6 @@ type CheckpointReadOnlyProjection struct {
 	Recoverable   []Checkpoint
 }
 
-// LatestCheckpointSeq returns the current durable checkpoint sequence. A
-// publication barrier records this before requesting fresh coverage so older
-// checkpoints cannot satisfy the new observation after epoch counters reset.
-func LatestCheckpointSeq(ctx context.Context, db *DB) (int64, error) {
-	if db == nil {
-		return 0, errors.New("state: LatestCheckpointSeq: nil db")
-	}
-	var seq int64
-	if err := db.ReadSQL().QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(seq),0) FROM checkpoints`).Scan(&seq); err != nil {
-		return 0, fmt.Errorf("state: latest checkpoint sequence: %w", err)
-	}
-	return seq, nil
-}
-
-// CompletedCheckpointForBarrier returns the newest completed checkpoint that
-// was created after the barrier began and covers one worktree observation on
-// the requested branch. A shared metadata pointer may refer to another linked
-// worktree, so publication barriers select their checkpoint from the durable
-// identity instead.
-func CompletedCheckpointForBarrier(
-	ctx context.Context,
-	db *DB,
-	worktreeID string,
-	minimumCoverageEpoch int64,
-	minimumCheckpointSeq int64,
-	branchRef string,
-) (Checkpoint, bool, error) {
-	if db == nil {
-		return Checkpoint{}, false, errors.New(
-			"state: CompletedCheckpointForBarrier: nil db")
-	}
-	if len(worktreeID) != 16 || minimumCoverageEpoch < 0 ||
-		minimumCheckpointSeq < 0 ||
-		strings.TrimSpace(branchRef) == "" {
-		return Checkpoint{}, false, ErrCheckpointIdentityMismatch
-	}
-	var id string
-	err := db.ReadSQL().QueryRowContext(ctx, `
-SELECT id FROM checkpoints
-WHERE phase='completed' AND coverage_complete=1 AND worktree_id=? AND coverage_epoch>=? AND seq>?
-  AND observed_ref=?
-ORDER BY seq DESC LIMIT 1`,
-		worktreeID, minimumCoverageEpoch, minimumCheckpointSeq, branchRef).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Checkpoint{}, false, nil
-	}
-	if err != nil {
-		return Checkpoint{}, false, fmt.Errorf(
-			"state: select completed publication checkpoint: %w", err)
-	}
-	checkpoint, ok, err := checkpointByIDQuery(ctx, db.ReadSQL(), id, true)
-	if err != nil {
-		return Checkpoint{}, false, err
-	}
-	return checkpoint, ok, nil
-}
-
 // PrepareCheckpoint persists the immutable checkpoint identity with FULL
 // SQLite synchronization before the private Git ref may be created. Reusing
 // an ID with the exact same identity is idempotent; any mismatch fails closed.
@@ -215,6 +159,15 @@ func PrepareCheckpoint(ctx context.Context, d *DB, checkpoint Checkpoint, planDi
 	}
 	if err := validateCheckpoint(checkpoint, planDigest); err != nil {
 		return false, err
+	}
+	if len(checkpoint.EventSeqs) != 0 {
+		hasCaptures, err := legacyTableExists(ctx, d.ReadSQL(), "capture_events")
+		if err != nil {
+			return false, err
+		}
+		if !hasCaptures {
+			return false, ErrCheckpointIdentityMismatch
+		}
 	}
 	conn, err := d.conn.Conn(ctx)
 	if err != nil {
@@ -421,7 +374,7 @@ func ReadCheckpointProjection(ctx context.Context, dbPath string, recoverableLim
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return projection, fmt.Errorf("state: open checkpoint projection: %w", err)
 	}

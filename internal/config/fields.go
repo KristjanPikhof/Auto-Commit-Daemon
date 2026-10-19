@@ -40,19 +40,7 @@ const (
 	FieldCAFile                  = "ai.ca_file"
 	FieldDiffEgress              = "ai.diff_egress"
 	FieldCommitStrategy          = "commit.strategy"
-	FieldCommitPreset            = "commit.preset"
 	FieldCommitFormat            = "commit.format"
-	FieldIntentWindow            = "intent.window"
-	FieldIntentMinPending        = "intent.min_pending"
-	FieldIntentSettleWindow      = "intent.settle_window"
-	FieldIntentMaxPendingAge     = "intent.max_pending_age"
-	FieldIntentRecentCommits     = "intent.recent_commits"
-	FieldIntentDeferLimit        = "intent.defer_limit"
-	FieldIntentRetryOnInvalid    = "intent.retry_on_invalid"
-	FieldIntentPathCoalescing    = "intent.path_coalescing"
-	FieldIntentRepairEnabled     = "intent.repair.enabled"
-	FieldIntentRepairHorizon     = "intent.repair.horizon"
-	FieldIntentRepairMaxCommits  = "intent.repair.max_commits"
 	FieldIntentVerification      = "intent.verification"
 	FieldVerificationFastCommand = "verification.fast.command"
 	FieldVerificationFastTimeout = "verification.fast.timeout"
@@ -83,37 +71,20 @@ var fieldCatalog = []FieldDefinition{
 	{Name: FieldTimeout, Environment: "ACD_AI_TIMEOUT", Default: "5m", Kind: KindDuration, PlainSeconds: true, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCAFile, Environment: "ACD_AI_CA_FILE", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldDiffEgress, Environment: "ACD_AI_DIFF_EGRESS", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldCommitStrategy, Environment: "ACD_COMMIT_STRATEGY", Default: "event", Kind: KindString, Choices: []string{"event", "intent"}, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldCommitPreset, Environment: "ACD_COMMIT_PRESET", Default: "fast", Kind: KindString, Choices: []string{"fast", "balanced", "quality"}, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldCommitStrategy, Environment: "ACD_COMMIT_STRATEGY", Default: "local", Kind: KindString, Choices: []string{"local", "intent"}, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCommitFormat, Environment: "ACD_COMMIT_FORMAT", Default: "imperative", Kind: KindString, Choices: []string{"imperative", "conventional"}, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentWindow, Environment: "ACD_INTENT_WINDOW", Default: "10", Kind: KindInteger, Minimum: 1, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentMinPending, Environment: "ACD_INTENT_MIN_PENDING", Default: "10", Kind: KindInteger, Minimum: 1, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentSettleWindow, Environment: "ACD_INTENT_SETTLE_WINDOW", Default: "10s", Kind: KindDuration, AllowZero: true, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentMaxPendingAge, Environment: "ACD_INTENT_MAX_PENDING_AGE", Default: "5m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentRecentCommits, Environment: "ACD_INTENT_RECENT_COMMITS", Default: "5", Kind: KindInteger, Minimum: 1, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentDeferLimit, Environment: "ACD_INTENT_DEFER_LIMIT", Default: "1", Kind: KindInteger, AllowZero: true, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentRetryOnInvalid, Environment: "ACD_INTENT_RETRY_ON_INVALID", Default: "2", Kind: KindInteger, AllowZero: true, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentPathCoalescing, Environment: "ACD_INTENT_PATH_COALESCE", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentRepairEnabled, Environment: "ACD_INTENT_REPAIR_ENABLED", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentRepairHorizon, Environment: "ACD_INTENT_REPAIR_HORIZON", Default: "10m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentRepairMaxCommits, Environment: "ACD_INTENT_REPAIR_MAX_COMMITS", Default: "3", Kind: KindInteger, Minimum: 1, Maximum: 5, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldIntentVerification, Environment: "ACD_INTENT_VERIFICATION", Default: "none", Kind: KindString, Choices: []string{"none", "structural", "fast", "full"}, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldVerificationFastCommand, Environment: "ACD_VERIFICATION_FAST_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldVerificationFastTimeout, Environment: "ACD_VERIFICATION_FAST_TIMEOUT", Default: "2m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldVerificationFullCommand, Environment: "ACD_VERIFICATION_FULL_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldVerificationFullTimeout, Environment: "ACD_VERIFICATION_FULL_TIMEOUT", Default: "10m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
 	{Name: "capture.max_file_bytes", Environment: "ACD_MAX_FILE_BYTES", Default: "5242880", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
-	{Name: "capture.max_pending_events", Environment: "ACD_MAX_PENDING_EVENTS", Default: "50000", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
 	{Name: "capture.sensitive_globs", Environment: "ACD_SENSITIVE_GLOBS", Kind: KindString, Boundary: ApplyRestart, Sensitive: true, Persistable: true},
 	{Name: "capture.safe_ignore", Environment: "ACD_SAFE_IGNORE", Default: "true", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
 	{Name: "capture.safe_ignore_extra", Environment: "ACD_SAFE_IGNORE_EXTRA", Kind: KindString, Boundary: ApplyRestart, Persistable: true},
-	{Name: "watch.fsnotify", Environment: "ACD_FSNOTIFY_ENABLED", Default: "false", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
+	{Name: "watch.fsnotify", Environment: "ACD_FSNOTIFY_ENABLED", Default: "true", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
 	{Name: "trace.enabled", Environment: "ACD_TRACE", Default: "false", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
 	{Name: "trace.prompt", Environment: "ACD_AI_PROMPT_TRACE", Default: "false", Kind: KindBool, Boundary: ApplyRestart, Sensitive: true, Persistable: true},
-	{Name: "retention.event_days", Environment: "ACD_EVENT_RETENTION_DAYS", Default: "7", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
-	{Name: "recovery.rewind_grace", Environment: "ACD_REWIND_GRACE_SECONDS", Default: "60", Kind: KindInteger, AllowZero: true, Boundary: ApplyRestart, Persistable: true},
-	{Name: "recovery.shadow_generations", Environment: "ACD_SHADOW_RETENTION_GENERATIONS", Default: "1", Kind: KindInteger, AllowZero: true, Boundary: ApplyRestart, Persistable: true},
-	{Name: "client.ttl", Environment: "ACD_CLIENT_TTL_SECONDS", Default: "1800", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
 }
 
 func Catalog() []FieldDefinition { return append([]FieldDefinition(nil), fieldCatalog...) }
@@ -130,22 +101,23 @@ func LookupField(name string) (FieldDefinition, bool) {
 type Source string
 
 const (
-	SourceExperiment  Source = "experiment"
-	SourceRepository  Source = "repository"
-	SourceProfile     Source = "profile"
-	SourceGlobal      Source = "global"
-	SourceEnvironment Source = "environment"
-	SourcePreset      Source = "preset"
-	SourceDefault     Source = "default"
+	SourceDraft             Source = "draft"
+	SourceRepository        Source = "repository"
+	SourceProfile           Source = "profile"
+	SourceGlobal            Source = "global"
+	SourceEnvironment       Source = "environment"
+	SourceDefault           Source = "default"
+	SourceLegacyTranslation Source = "legacy_translation"
 )
 
 type ResolveInput struct {
-	Experiment Overrides
-	Repository Overrides
-	Profile    Overrides
-	Global     Overrides
-	Preset     Overrides
-	LookupEnv  func(string) (string, bool)
+	Draft Overrides
+	// LegacyDefaults preserves supported v1 preset choices below authored/env values.
+	LegacyDefaults Overrides
+	Repository     Overrides
+	Profile        Overrides
+	Global         Overrides
+	LookupEnv      func(string) (string, bool)
 }
 
 type ShadowedEnvironment struct {
@@ -168,18 +140,18 @@ func (r ResolvedField) EffectiveValue() string { return r.effectiveValue }
 func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 	field, ok := LookupField(name)
 	if !ok {
-		return ResolvedField{}, fmt.Errorf("acd config: unknown field %q", name)
+		return ResolvedField{}, UnsupportedFieldError(name)
 	}
 	lookup := input.LookupEnv
 	if lookup == nil {
 		lookup = func(string) (string, bool) { return "", false }
 	}
-	envValue, envSet := lookup(field.Environment)
+	envValue, envSet := TranslateLegacyEnvironment(lookup)(field.Environment)
 	layers := []struct {
 		source Source
 		values Overrides
 	}{
-		{SourceExperiment, input.Experiment}, {SourceRepository, input.Repository},
+		{SourceDraft, input.Draft}, {SourceRepository, input.Repository},
 		{SourceProfile, input.Profile}, {SourceGlobal, input.Global},
 	}
 	for _, layer := range layers {
@@ -200,6 +172,9 @@ func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 	}
 	if envSet {
 		value, err := normalizeValue(field, envValue)
+		if err != nil && field.Name == FieldCommitStrategy {
+			return ResolvedField{}, fmt.Errorf("acd config: %s: %w", field.Environment, err)
+		}
 		if err == nil {
 			return ResolvedField{
 				Definition: field, Value: displayValue(field, value),
@@ -207,14 +182,14 @@ func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 			}, nil
 		}
 	}
-	if raw, exists := input.Preset[name]; exists {
+	if raw, exists := input.LegacyDefaults[name]; exists {
 		value, err := validateRaw(field, raw, true)
 		if err != nil {
 			return ResolvedField{}, err
 		}
 		return ResolvedField{
 			Definition: field, Value: displayValue(field, value),
-			Source: SourcePreset, effectiveValue: value,
+			Source: SourceLegacyTranslation, effectiveValue: value,
 		}, nil
 	}
 	value, err := normalizeValue(field, field.Default)
@@ -228,7 +203,7 @@ func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 }
 
 // ResolveRestartEnvironment resolves the restart-bound catalog for one
-// repository using the same precedence as the settings lab. Returned keys are
+// repository using the same precedence as the settings editor. Returned keys are
 // environment variable names because the existing daemon consumers parse
 // their established environment contracts at process startup.
 func ResolveRestartEnvironment(
@@ -312,10 +287,10 @@ func validateGlobalSetupApproval(doc *Document) error {
 		return errors.New("acd config: global setup approval has an invalid fingerprint")
 	}
 	allowed := map[string]bool{
-		"endpoint_credentials": true,
-		"subprocess_execution": true,
-		"diff_egress":          true,
-		"intent_repair":        true,
+		"endpoint_credentials":          true,
+		"insecure_endpoint_credentials": true,
+		"subprocess_execution":          true,
+		"diff_egress":                   true,
 	}
 	seen := make(map[string]bool, len(approval.Confirmations))
 	for _, confirmation := range approval.Confirmations {
@@ -336,7 +311,7 @@ func validateOverrides(scope string, values Overrides) error {
 	for name, raw := range values {
 		field, ok := LookupField(name)
 		if !ok {
-			return fmt.Errorf("acd config: %s: unsupported field %q", scope, name)
+			return fmt.Errorf("acd config: %s: %w", scope, UnsupportedFieldError(name))
 		}
 		if !field.Persistable {
 			return fmt.Errorf("acd config: %s: field %q is secret or environment-only and cannot be persisted", scope, name)
@@ -380,6 +355,9 @@ func normalizeValue(field FieldDefinition, raw string) (string, error) {
 	value := strings.TrimSpace(raw)
 	switch field.Kind {
 	case KindString:
+		if field.Name == FieldCommitStrategy && value == "event" {
+			return "", errors.New("commit.strategy=event is legacy; choose local for an offline batch or run acd setup to upgrade")
+		}
 		if len(field.Choices) > 0 {
 			for _, choice := range field.Choices {
 				if value == choice {

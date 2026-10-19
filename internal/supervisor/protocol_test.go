@@ -19,11 +19,19 @@ import (
 )
 
 func TestRequestValidationCoversRequiredMethods(t *testing.T) {
-	methods := []string{"status", "enable_repository", "disable_repository", "checkpoint_barrier", "publication_drain_start", "publication_drain_status", "hint", "history", "restore_plan", "restore_apply", "repair", "shutdown", "maintenance_begin", "maintenance_renew", "maintenance_end", "restart_repository", "stop_repository", "worker_environment"}
+	methods := []string{"status", "enable_repository", "disable_repository", "checkpoint_barrier", "hint", "history", "restore_plan", "restore_apply", "repair", "shutdown", "maintenance_begin", "maintenance_renew", "maintenance_end", "restart_repository", "stop_repository", "worker_environment", "finish_start", "finish_status", "history_start", "history_status", "history_save"}
+	if len(validMethods) != len(methods) {
+		t.Fatalf("supported method count=%d, want %d", len(validMethods), len(methods))
+	}
 	for _, method := range methods {
 		request := Request{Version: ProtocolVersion, ID: "request", Method: method}
 		if err := request.Validate(); err != nil {
 			t.Fatalf("method %s: %v", method, err)
+		}
+	}
+	for _, method := range []string{"publication_drain_start", "publication_drain_status", "unknown"} {
+		if err := (Request{Version: ProtocolVersion, ID: "request", Method: method}).Validate(); err == nil {
+			t.Fatalf("unsupported method %s accepted", method)
 		}
 	}
 	if err := (Request{Version: 2, ID: "request", Method: "status"}).Validate(); err == nil {

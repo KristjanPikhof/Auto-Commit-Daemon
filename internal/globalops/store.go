@@ -13,6 +13,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 type Store struct {
@@ -69,7 +71,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	q.Add("_pragma", "synchronous(FULL)")
 	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "busy_timeout(5000)")
-	db, err := sql.Open("sqlite", "file:"+path+"?"+q.Encode())
+	db, err := sql.Open("sqlite", paths.DatabaseURI(path, q))
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +97,7 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 	q.Add("mode", "ro")
 	q.Add("immutable", "0")
 	q.Add("_pragma", "busy_timeout(5000)")
-	db, err := sql.Open("sqlite", "file:"+path+"?"+q.Encode())
+	db, err := sql.Open("sqlite", paths.DatabaseURI(path, q))
 	if err != nil {
 		return nil, err
 	}

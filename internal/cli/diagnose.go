@@ -11,19 +11,15 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 type diagnoseAnchorReport struct {
@@ -80,12 +76,6 @@ type diagnoseReport struct {
 	BackpressurePaused         bool                            `json:"backpressure_paused"`
 	BackpressurePausedAt       string                          `json:"backpressure_paused_at,omitempty"`
 	EventsDroppedTotal         int64                           `json:"events_dropped_total"`
-	IntentStrategy             intentStrategyReport            `json:"intent_strategy"`
-	RuntimeConfig              runtimeConfigReport             `json:"runtime_config"`
-	Configuration              configReadinessReport           `json:"configuration"`
-	Replay                     replayObservabilityReport       `json:"replay"`
-	IntentV2                   intentV2Report                  `json:"intent_v2"`
-	SelfPublication            selfPublicationReport           `json:"self_publication"`
 	BlockedHistogram           []diagnoseBlockedClass          `json:"blocked_histogram"`
 	RecentBlocked              []diagnoseBlockedEntry          `json:"recent_blocked"`
 	GeneratedPending           []diagnoseGeneratedPendingGroup `json:"generated_pending,omitempty"`
@@ -117,12 +107,6 @@ type diagnoseReport struct {
 	CheckpointPublishedByACD bool                         `json:"checkpoint_published_by_acd"`
 	CaptureHealth            state.CaptureHealth          `json:"capture_health"`
 	CheckpointMaintenance    checkpoint.MaintenanceStatus `json:"checkpoint_maintenance"`
-	PublicationDrain         publicationDrainReport       `json:"publication_drain"`
-}
-
-type replayConflictMeta struct {
-	Seq        int64  `json:"seq"`
-	ErrorClass string `json:"error_class"`
 }
 
 func newDiagnoseCmd() *cobra.Command {
@@ -178,118 +162,35 @@ func collectDiagnose(ctx context.Context, repo string) (diagnoseReport, error) {
 }
 
 func buildDiagnoseReport(ctx context.Context, rec central.RepoRecord) (diagnoseReport, error) {
-	report := diagnoseReport{
-		Repo:     rec.Path,
-		RepoHash: rec.RepoHash,
-		StateDB:  rec.StateDB,
-	}
-	if !fileExists(rec.StateDB) {
-		return report, fmt.Errorf("state.db missing for repo %s", rec.Path)
-	}
-
+	report := diagnoseReport{Repo: rec.Path, RepoHash: rec.RepoHash, StateDB: rec.StateDB}
 	before, err := fileSHA256(rec.StateDB)
 	if err != nil {
-		return report, fmt.Errorf("checksum before read: %w", err)
+		return report, err
 	}
 	report.StateDBChecksumBefore = before
-
-	conn, err := openStateDBReadOnly(ctx, rec.StateDB)
-	if err != nil {
-		return report, err
-	}
-	defer conn.Close()
-
-	report.Anchor, err = diagnoseAnchor(ctx, conn, rec.Path)
-	if err != nil {
-		return report, err
-	}
-	if err := diagnoseCapacity(ctx, conn, &report); err != nil {
-		return report, err
-	}
-	if err := diagnoseGeneratedPending(ctx, conn, rec.Path, &report); err != nil {
-		return report, err
-	}
-	if intentStrategy, err := loadIntentStrategyReportForPair(
-		ctx, conn, report.Anchor.DaemonBranchRef,
-		report.Anchor.DaemonBranchGeneration); err != nil {
-		return report, err
-	} else {
-		report.IntentStrategy = intentStrategy
-		report.IntentStrategy.RejectLogPath = plannerRejectLogPath(rec.StateDB)
-	}
-	if runtimeConfig, err := loadRuntimeConfigReport(ctx, conn, rec.RepoHash, time.Now()); err != nil {
-		return report, err
-	} else {
-		report.RuntimeConfig = runtimeConfig
-	}
-	if readiness, err := loadConfigReadinessReport(ctx, conn, time.Now()); err != nil {
-		return report, err
-	} else {
-		report.Configuration = readiness
-		if readiness.Configuration == "needs_attention" {
-			report.Remediation = append(report.Remediation,
-				"Run `acd config edit` to retry validation or select another experience.")
-		}
-	}
-	if intentV2, err := loadIntentV2Report(ctx, conn); err != nil {
-		return report, err
-	} else {
-		report.IntentV2 = intentV2
-	}
-	if replay, err := loadReplayObservabilityReport(ctx, conn); err != nil {
-		return report, err
-	} else {
-		report.Replay = replay
-	}
-	if publication, err := loadSelfPublicationReport(
-		ctx, conn, rec.StateDB, time.Now(),
-		len(findDaemonProcesses(ctx, rec.Path)),
-	); err != nil {
-		return report, err
-	} else {
-		report.SelfPublication = publication
-	}
-	if err := diagnoseBlocked(ctx, conn, &report); err != nil {
-		return report, err
-	}
-	if err := diagnoseBlockedCounts(ctx, conn, rec.Path, &report); err != nil {
-		return report, err
-	}
-	if err := diagnoseDeadBranchPrune(ctx, conn, &report); err != nil {
-		return report, err
-	}
-	if err := diagnoseOperationMarker(ctx, conn, rec.Path, &report); err != nil {
-		return report, err
-	}
 	status, err := buildStatusReport(ctx, rec, time.Now())
 	if err != nil {
-		return report, fmt.Errorf("status truth: %w", err)
+		return report, err
 	}
-	report.Busy = status.Busy
-	report.OperationalState = status.OperationalState
-	report.WorktreeClean = status.WorktreeClean
-	report.AllChangesCommittedInGit = status.AllChangesCommittedInGit
-	report.CheckpointPublishedByACD = status.CheckpointPublishedByACD
 	report.PublicationOutcome = status.PublicationOutcome
-	report.PublicationDrain = status.PublicationDrain
-	report.CheckpointMaintenance = status.CheckpointMaintenance
 	report.CaptureHealth = status.CaptureHealth
-	report.Remediation = diagnoseRemediation(report)
-	if status.CaptureHealth.State == "blocked" {
-		report.Remediation = append(report.Remediation, "Checkpoint protection is incomplete: "+status.CaptureHealth.Error)
+	report.CheckpointMaintenance = status.CheckpointMaintenance
+	report.Busy, report.OperationalState = status.Busy, status.OperationalState
+	report.WorktreeClean, report.AllChangesCommittedInGit = status.WorktreeClean, status.AllChangesCommittedInGit
+	report.CheckpointPublishedByACD = status.CheckpointPublishedByACD
+	control := controlResult{Enabled: true}
+	applyFinishControlStatus(&control, status, status.PublicationProgress.WorkerResponsive)
+	if control.NextAction != "No action needed." {
+		report.Remediation = []string{control.NextAction}
 	}
-	if details := maintenanceDetails(report.CheckpointMaintenance); details != "" {
-		report.Remediation = append(report.Remediation, details+" "+report.CheckpointMaintenance.NextAction())
-	}
-
 	after, err := fileSHA256(rec.StateDB)
 	if err != nil {
-		return report, fmt.Errorf("checksum after read: %w", err)
+		return report, err
 	}
 	report.StateDBChecksumAfter = after
 	report.StateDBChecksumVerified = before == after
-	if !report.StateDBChecksumVerified {
-		return report, fmt.Errorf("state.db checksum changed during read-only diagnose")
+	if before != after {
+		return report, errors.New("state.db changed while reading diagnostics")
 	}
 	return report, nil
 }
@@ -298,7 +199,7 @@ func openStateDBReadOnly(ctx context.Context, dbPath string) (*sql.DB, error) {
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
-	conn, err := sql.Open("sqlite", "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open("sqlite", paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return nil, fmt.Errorf("open state.db read-only: %w", err)
 	}
@@ -307,552 +208,6 @@ func openStateDBReadOnly(ctx context.Context, dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("ping state.db read-only: %w", err)
 	}
 	return conn, nil
-}
-
-func diagnoseAnchor(ctx context.Context, conn *sql.DB, repo string) (diagnoseAnchorReport, error) {
-	var anchor diagnoseAnchorReport
-	branch, err := git.RunBranchRef(ctx, repo)
-	if err != nil {
-		return anchor, fmt.Errorf("git symbolic-ref HEAD: %w", err)
-	}
-	anchor.GitHEADBranch = branch
-	anchor.GitHEADDetached = branch == ""
-
-	var branchRef sql.NullString
-	var branchGen sql.NullInt64
-	row := conn.QueryRowContext(ctx, `SELECT branch_ref, branch_generation FROM daemon_state WHERE id = 1`)
-	if err := row.Scan(&branchRef, &branchGen); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return anchor, fmt.Errorf("daemon_state anchor: %w", err)
-	}
-	if branchRef.Valid {
-		anchor.DaemonBranchRef = branchRef.String
-	}
-	if branchGen.Valid {
-		anchor.DaemonBranchGeneration = branchGen.Int64
-	}
-	if v, ok, err := metaLookup(ctx, conn, "branch_token"); err != nil {
-		return anchor, fmt.Errorf("branch_token: %w", err)
-	} else if ok {
-		anchor.BranchToken = v
-		if anchor.DaemonBranchRef == "" {
-			anchor.DaemonBranchRef = branchRefFromToken(v)
-		}
-	}
-	if v, ok, err := metaLookup(ctx, conn, "branch.generation"); err != nil {
-		return anchor, fmt.Errorf("branch.generation: %w", err)
-	} else if ok {
-		anchor.BranchGeneration = v
-	}
-	if v, ok, err := metaLookup(ctx, conn, "branch.head"); err != nil {
-		return anchor, fmt.Errorf("branch.head: %w", err)
-	} else if ok {
-		anchor.BranchHead = v
-	}
-
-	anchor.Mismatch = anchor.GitHEADBranch != anchor.DaemonBranchRef &&
-		(anchor.GitHEADBranch != "" || anchor.DaemonBranchRef != "")
-	return anchor, nil
-}
-
-func branchRefFromToken(token string) string {
-	parts := strings.Fields(token)
-	if len(parts) >= 2 && strings.HasPrefix(parts[1], "refs/") {
-		return parts[1]
-	}
-	return ""
-}
-
-// diagnoseCapacity surfaces the per-repo pending FIFO depth, the
-// daemon-recorded high watermark, the durable backpressure state, and the
-// cumulative dropped-events counter. Reads are best-effort: we do not
-// abort diagnose when the table is empty or a meta key is unset (those are
-// the "fresh repo" defaults).
-func diagnoseCapacity(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
-	var depth int
-	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
-		state.EventStatePending).Scan(&depth); err != nil {
-		return fmt.Errorf("pending depth: %w", err)
-	}
-	report.PendingDepth = depth
-	if err := conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM capture_events WHERE state = ?`,
-		state.EventStateFailed).Scan(&report.FailedEvents); err != nil {
-		return fmt.Errorf("failed events: %w", err)
-	}
-	if blockers, err := loadRecoveryBlockerCounts(ctx, conn, "", 0); err != nil {
-		return fmt.Errorf("failed blocking pending: %w", err)
-	} else {
-		report.FailedBlockingPending = blockers.FailedBarriersWithSuccessors
-	}
-
-	v, ok, err := metaLookup(ctx, conn, "capture.pending_high_water")
-	if err != nil {
-		return fmt.Errorf("pending_high_water: %w", err)
-	}
-	if ok && v != "" {
-		if hw, perr := strconv.ParseInt(v, 10, 64); perr == nil {
-			report.PendingHighWater = hw
-		}
-	}
-
-	// Backpressure meta key presence is the signal — empty value still
-	// means "active" (we always stamp a timestamp on entry, but a third
-	// party could have written a blank value via raw SQL; treat any
-	// presence as paused for the report).
-	bv, bok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at")
-	if err != nil {
-		return fmt.Errorf("backpressure_paused_at: %w", err)
-	}
-	if bok {
-		report.BackpressurePaused = true
-		report.BackpressurePausedAt = bv
-	}
-
-	dv, dok, err := metaLookup(ctx, conn, "capture.events_dropped_total")
-	if err != nil {
-		return fmt.Errorf("events_dropped_total: %w", err)
-	}
-	if dok && dv != "" {
-		if total, perr := strconv.ParseInt(dv, 10, 64); perr == nil {
-			report.EventsDroppedTotal = total
-		}
-	}
-	return nil
-}
-
-func diagnoseGeneratedPending(ctx context.Context, conn *sql.DB, repo string, report *diagnoseReport) error {
-	groups, err := state.ScanGeneratedPendingDeletes(ctx, conn, state.NewSafeIgnoreMatcher(), 0)
-	if err != nil {
-		return fmt.Errorf("generated pending deletes: %w", err)
-	}
-	if len(groups) == 0 {
-		return nil
-	}
-	roots := make([]string, 0, len(groups))
-	for _, group := range groups {
-		roots = append(roots, group.Root)
-	}
-	tracked, err := git.CountTrackedPathsUnder(ctx, repo, roots...)
-	if err != nil {
-		return fmt.Errorf("tracked generated roots: %w", err)
-	}
-	report.GeneratedPending = make([]diagnoseGeneratedPendingGroup, 0, len(groups))
-	for _, group := range groups {
-		report.GeneratedPending = append(report.GeneratedPending, diagnoseGeneratedPendingGroup{
-			Root:             group.Root,
-			Pattern:          group.Pattern,
-			BranchRef:        group.BranchRef,
-			BranchGeneration: group.BranchGeneration,
-			BaseHead:         group.BaseHead,
-			PendingCount:     group.PendingCount,
-			TrackedCount:     tracked[group.Root],
-			OldestSeq:        group.OldestSeq,
-			NewestSeq:        group.NewestSeq,
-			EventSeqs:        append([]int64(nil), group.EventSeqs...),
-		})
-	}
-	return nil
-}
-
-// diagnoseDeadBranchPrune surfaces the daemon-recorded last non-empty
-// dead-branch recovery action through legacy prune-named meta keys:
-//
-//   - dead_branch_prune.last_run_ts   unix seconds (string-encoded int)
-//   - dead_branch_prune.last_count    rows recovered (string-encoded int)
-//   - dead_branch_prune.last_refs     JSON-encoded []string of refs
-//
-// Missing keys default to zero / nil. The two int fields render as 0 in the
-// JSON (omitempty was dropped from the struct tag deliberately so 0 is the
-// documented "never ran" sentinel rather than an absent key). The slice keeps
-// `omitempty` so an empty list serializes as absent. Malformed values fail
-// open: a parse error zeros the affected field and we keep going (a corrupt
-// JSON refs blob does not abort diagnose).
-func diagnoseDeadBranchPrune(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
-	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_run_ts"); err != nil {
-		return fmt.Errorf("dead_branch_prune.last_run_ts: %w", err)
-	} else if ok && v != "" {
-		if ts, perr := strconv.ParseInt(v, 10, 64); perr == nil {
-			report.DeadBranchPruneLastRunTS = ts
-		}
-		// Parse error -> field stays at zero (omitempty drops it from JSON).
-	}
-	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_count"); err != nil {
-		return fmt.Errorf("dead_branch_prune.last_count: %w", err)
-	} else if ok && v != "" {
-		if n, perr := strconv.Atoi(v); perr == nil {
-			report.DeadBranchPruneLastCount = n
-		}
-	}
-	if v, ok, err := metaLookup(ctx, conn, "dead_branch_prune.last_refs"); err != nil {
-		return fmt.Errorf("dead_branch_prune.last_refs: %w", err)
-	} else if ok && v != "" {
-		var refs []string
-		if jerr := json.Unmarshal([]byte(v), &refs); jerr == nil {
-			report.DeadBranchPruneLastRefs = refs
-		}
-		// Malformed JSON -> leave nil; report stays consistent with "no
-		// refs recorded".
-	}
-	return nil
-}
-
-// diagnoseOperationMarker reports whether a git rebase / merge / cherry-pick
-// / bisect marker is currently making the daemon pause and how long it has
-// been doing so. The daemon never auto-clears these markers — operators are
-// expected to run `git rebase --abort` (or remove the marker) manually — so
-// when the elapsed time crosses 15 minutes AND HEAD has not advanced since the
-// marker was first recorded, the report flags it as stale.
-// A long-running but progressing operation (e.g. an interactive rebase that is
-// still picking commits) advances HEAD across ticks; that case is NOT stale.
-func diagnoseOperationMarker(ctx context.Context, conn *sql.DB, repoDir string, report *diagnoseReport) error {
-	op, ok, err := metaLookup(ctx, conn, "operation_in_progress")
-	if err != nil {
-		return fmt.Errorf("operation_in_progress: %w", err)
-	}
-	if !ok || op == "" {
-		return nil
-	}
-	report.OperationInProgress = op
-	setAtRaw, ok, err := metaLookup(ctx, conn, "operation_in_progress.set_at")
-	if err != nil {
-		return fmt.Errorf("operation_in_progress.set_at: %w", err)
-	}
-	if !ok || setAtRaw == "" {
-		return nil
-	}
-	setAtSec, err := strconv.ParseFloat(setAtRaw, 64)
-	if err != nil {
-		// Best-effort: a malformed timestamp does not abort diagnose.
-		return nil
-	}
-	setAt := time.Unix(0, int64(setAtSec*float64(time.Second)))
-	elapsed := time.Since(setAt)
-	if elapsed < 0 {
-		elapsed = 0
-	}
-	report.OperationMarkerDuration = elapsed.Round(time.Second).String()
-	if elapsed >= 15*time.Minute {
-		// Stale only when HEAD is also motionless. A progressing rebase
-		// advances HEAD tick-by-tick; the daemon records the HEAD SHA at
-		// marker onset in operation_in_progress.head_at. Compare against the
-		// live HEAD; if they differ the operation is still active.
-		headAtRecord, _, _ := metaLookup(ctx, conn, "operation_in_progress.head_at")
-		currentHead, headErr := git.RevParse(ctx, repoDir, "HEAD")
-		headMotionless := headErr != nil || headAtRecord == "" || currentHead == headAtRecord
-		if headMotionless {
-			report.StaleOperationMarker = true
-		}
-	}
-	return nil
-}
-
-func diagnoseBlocked(ctx context.Context, conn *sql.DB, report *diagnoseReport) error {
-	lastMeta, err := loadLastReplayConflictMeta(ctx, conn)
-	if err != nil {
-		return err
-	}
-	rows, err := conn.QueryContext(ctx,
-		`SELECT seq, state, branch_ref, branch_generation, operation, path, published_ts, error
-		 FROM capture_events
-		 WHERE state IN (?, ?)
-		 ORDER BY seq DESC`, state.EventStateBlockedConflict, state.EventStateFailed)
-	if err != nil {
-		return fmt.Errorf("terminal replay barriers: %w", err)
-	}
-	defer rows.Close()
-
-	counts := map[string]int{}
-	for rows.Next() {
-		var entry diagnoseBlockedEntry
-		var published sql.NullFloat64
-		var errMsg sql.NullString
-		if err := rows.Scan(&entry.Seq, &entry.State, &entry.BranchRef, &entry.BranchGeneration,
-			&entry.Operation, &entry.Path, &published, &errMsg); err != nil {
-			return fmt.Errorf("scan terminal replay barrier: %w", err)
-		}
-		if published.Valid {
-			entry.PublishedTS = int64(published.Float64)
-		}
-		if errMsg.Valid {
-			entry.Error = errMsg.String
-		}
-		entry.ErrorClass = classifyDiagnoseError(entry.Seq, entry.Error, lastMeta)
-		counts[entry.ErrorClass]++
-		if len(report.RecentBlocked) < 5 {
-			report.RecentBlocked = append(report.RecentBlocked, entry)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iter blocked conflicts: %w", err)
-	}
-
-	report.BlockedHistogram = make([]diagnoseBlockedClass, 0, len(counts))
-	for cls, count := range counts {
-		report.BlockedHistogram = append(report.BlockedHistogram, diagnoseBlockedClass{
-			ErrorClass: cls,
-			Count:      count,
-		})
-	}
-	sort.Slice(report.BlockedHistogram, func(i, j int) bool {
-		if report.BlockedHistogram[i].Count != report.BlockedHistogram[j].Count {
-			return report.BlockedHistogram[i].Count > report.BlockedHistogram[j].Count
-		}
-		return report.BlockedHistogram[i].ErrorClass < report.BlockedHistogram[j].ErrorClass
-	})
-	return nil
-}
-
-// diagnoseBlockedCounts computes two read-only metrics over blocked_conflict rows
-// on the active daemon anchor (branch_ref, branch_generation):
-//
-//   - AutoResolvableBlockedCount: rows that pass the same eligibility predicate
-//     the daemon self-heal uses, via scanAutoResolvableBlockedRows.
-//   - BarrierWithSuccessorsCount: blocked_conflict rows that still have pending
-//     rows at a higher seq, via countBarrierBlockedWithSuccessors.
-//
-// When the daemon anchor is unset (fresh or detached repo) both counts are zero.
-func diagnoseBlockedCounts(ctx context.Context, conn *sql.DB, repoDir string, report *diagnoseReport) error {
-	branchRef := report.Anchor.DaemonBranchRef
-	generation := report.Anchor.DaemonBranchGeneration
-	if branchRef == "" {
-		return nil
-	}
-
-	// BarrierWithSuccessorsCount is a pure SQL count — no git needed.
-	blockers, err := loadRecoveryBlockerCounts(ctx, conn, branchRef, generation)
-	if err != nil {
-		return fmt.Errorf("diagnose: barrier-with-successors count: %w", err)
-	}
-	report.BarrierWithSuccessorsCount = blockers.ActiveBlockedBarriersWithSuccessors
-
-	// AutoResolvableBlockedCount requires a live HEAD to probe blobs.
-	head, err := git.RevParse(ctx, repoDir, "HEAD")
-	if err != nil {
-		// No HEAD (empty repo) — auto-resolvable stays zero; not an error.
-		return nil
-	}
-	candidates, err := scanAutoResolvableBlockedRows(ctx, conn, repoDir, head, branchRef, generation)
-	if err != nil {
-		return fmt.Errorf("diagnose: auto-resolvable count: %w", err)
-	}
-	report.AutoResolvableBlockedCount = len(candidates)
-	return nil
-}
-
-func loadLastReplayConflictMeta(ctx context.Context, conn *sql.DB) (replayConflictMeta, error) {
-	var meta replayConflictMeta
-	v, ok, err := metaLookup(ctx, conn, "last_replay_conflict")
-	if err != nil || !ok || strings.TrimSpace(v) == "" {
-		return meta, err
-	}
-	trimmed := strings.TrimSpace(v)
-	if !strings.HasPrefix(trimmed, "{") {
-		return meta, nil
-	}
-	if err := json.Unmarshal([]byte(trimmed), &meta); err != nil {
-		return replayConflictMeta{}, fmt.Errorf("last_replay_conflict metadata: %w", err)
-	}
-	return meta, nil
-}
-
-func classifyDiagnoseError(seq int64, message string, last replayConflictMeta) string {
-	if last.Seq == seq && last.ErrorClass != "" {
-		return last.ErrorClass
-	}
-	var structured struct {
-		ErrorClass string `json:"error_class"`
-	}
-	if err := json.Unmarshal([]byte(message), &structured); err == nil && structured.ErrorClass != "" {
-		return structured.ErrorClass
-	}
-
-	switch {
-	case strings.Contains(message, "update-ref CAS failed"):
-		return "cas_fail"
-	case strings.Contains(message, "before-state mismatch"),
-		strings.Contains(message, "missing-in-index"),
-		strings.Contains(message, "create conflict"),
-		strings.Contains(message, "rename source"),
-		strings.Contains(message, "rename target"):
-		return "before_state_mismatch"
-	case strings.Contains(message, "commit-tree"),
-		strings.Contains(message, "write-tree"),
-		strings.Contains(message, "update-index"):
-		return "commit_build_failure"
-	case strings.Contains(message, "branch ref mismatch"):
-		return "ref_missing"
-	case strings.TrimSpace(message) == "":
-		return "unknown"
-	default:
-		return "validation"
-	}
-}
-
-func diagnoseRemediation(report diagnoseReport) []string {
-	var remediation []string
-	if report.Replay.State == "needs_attention" {
-		location := ""
-		if report.Replay.BlockedSeq > 0 {
-			location = fmt.Sprintf(" at seq %d", report.Replay.BlockedSeq)
-		}
-		remediation = append(remediation,
-			fmt.Sprintf("Replay failed %d consecutive time(s)%s; capture remains durable. Inspect the bounded error and candidate IDs above before retrying.",
-				report.Replay.ErrorRepeatCount, location))
-	} else if report.Replay.State == "degraded" {
-		remediation = append(remediation,
-			"Replay encountered one retryable error; capture remains durable and the daemon will retry automatically.")
-	}
-	if report.IntentV2.NeedsAttention != "" {
-		remediation = append(remediation,
-			"Intent v2 replay is stopped while durable capture continues: "+
-				report.IntentV2.NeedsAttention)
-	}
-	if report.Anchor.Mismatch {
-		remediation = append(remediation,
-			"Current git HEAD branch differs from the daemon anchor; switch back to the daemon branch or restart acd on the current branch.")
-	}
-	if report.AutoResolvableBlockedCount > 0 {
-		remediation = append(remediation,
-			fmt.Sprintf("Daemon will auto-resolve %d blocked row(s) on next tick (HEAD already matches captured after-state).", report.AutoResolvableBlockedCount))
-	}
-	// The two counts measure overlapping sets: a single blocked row can be
-	// both auto-resolvable AND have pending successors. Comparing cardinalities
-	// is unsafe (5 vs 5 could mean fully auto-healable OR fully purge-only).
-	// Emit the fix hint whenever any barrier-with-successors exists, since the
-	// operator's correct next step is still `acd fix --dry-run` even when
-	// every blocked row is auto-resolvable.
-	if report.BarrierWithSuccessorsCount > 0 {
-		remediation = append(remediation,
-			"Run acd fix --dry-run to preview safe actions. For stuck barriers with successors, acd fix --force --dry-run shows purge plan.")
-	}
-	if report.FailedBlockingPending > 0 {
-		remediation = append(remediation,
-			fmt.Sprintf("%d failed terminal barrier(s) block later pending replay; inspect the recent barriers and run `acd fix --dry-run` before purging.", report.FailedBlockingPending))
-	}
-	for _, group := range report.GeneratedPending {
-		remediation = append(remediation,
-			fmt.Sprintf("Generated root %s has %d queued delete(s); stop the daemon if it is running, run `acd fix --repo %s --dry-run`, then `acd fix --repo %s --yes` to clean ACD state only.",
-				group.Root, group.PendingCount, report.Repo, report.Repo))
-		if group.TrackedCount > 0 {
-			remediation = append(remediation,
-				fmt.Sprintf("Generated root %s still has %d tracked file(s) in Git; review `git status -- %s`, then run `git add -u -- %s` and `git commit -m \"Remove tracked generated cache files\"`.",
-					group.Root, group.TrackedCount, group.Root, group.Root))
-		}
-	}
-	if report.PendingDepth > 0 {
-		remediation = append(remediation,
-			"capture pending depth is non-zero; queue is waiting/draining. If depth keeps climbing toward ACD_MAX_PENDING_EVENTS, wait for replay, run acd flush --logical for intentional batch waits, or run acd resume if capture/replay is paused.")
-	}
-	if report.BackpressurePaused {
-		remediation = append(remediation,
-			fmt.Sprintf("capture is in durable backpressure (paused at %s, %d events dropped lifetime); replay must drain pending below the high-water mark, or run `acd resume --accept-overflow` to clear the gate and accept the loss.",
-				report.BackpressurePausedAt, report.EventsDroppedTotal))
-	}
-	if report.IntentStrategy.PlannerHealthWarning != "" {
-		remediation = append(remediation,
-			"Intent planner health metadata is invalid or unsupported; detailed circuit state was omitted and state.db was left unchanged. Check daemon logs and update ACD if the stored record uses a newer schema.")
-	}
-	if health := report.IntentStrategy.PlannerHealth; health != nil {
-		switch health.State {
-		case daemon.IntentPlannerCircuitOpen:
-			nextProbe := "when its backoff expires"
-			if health.NextProbeTS > 0 {
-				nextProbe = "at " + time.Unix(int64(health.NextProbeTS), 0).UTC().Format(time.RFC3339)
-			}
-			remediation = append(remediation,
-				fmt.Sprintf("intent planner connection is unavailable after %d consecutive %s failure(s); the next batch can retry after %s. Safe batches use evidence-based grouping meanwhile. Check provider connectivity and configuration; rejected plan summaries are in %s.",
-					health.ConsecutiveFailures,
-					valueOrUnset(string(health.LastFailureClass)),
-					nextProbe,
-					valueOrUnset(report.IntentStrategy.RejectLogPath)))
-		case daemon.IntentPlannerCircuitHalfOpen:
-			remediation = append(remediation,
-				"intent planner has one connection probe in progress; other safe batches use evidence-based grouping until it succeeds.")
-		}
-	}
-	if intentPlannerErrorNeedsRemediation(report) {
-		remediation = append(remediation,
-			fmt.Sprintf("intent planner last failed validation for seq %d (%s); affected pending work can use evidence-based local grouping while ACD retries semantic planning.",
-				report.IntentStrategy.LastPlannerErrorEventSeq, report.IntentStrategy.LastPlannerError))
-	}
-	if report.IntentStrategy.PlannerErrorRateRecentWarn {
-		// Surfaces sustained planner-error rates above the noise floor.
-		// Operators inspecting the exact worktree reject path get the
-		// raw model output for the last rotation window (5 MiB current +
-		// 5 MiB .1) so they can root-cause without re-running the planner.
-		remediation = append(remediation,
-			fmt.Sprintf("planner_error_rate_recent %s exceeds %s threshold (last %d decisions); review %s for rejected planner outputs.",
-				strconv.FormatFloat(report.IntentStrategy.PlannerErrorRateRecent, 'f', 3, 64),
-				strconv.FormatFloat(IntentPlannerErrorRateWarnThreshold, 'f', 3, 64),
-				IntentRecentDecisionWindow,
-				valueOrUnset(report.IntentStrategy.RejectLogPath),
-			))
-	}
-	if report.IntentStrategy.ForcedAgingReady > 0 {
-		remediation = append(remediation,
-			fmt.Sprintf("%d pending capture(s) reached the intent defer limit and are eligible for forced one-item planning windows.",
-				report.IntentStrategy.ForcedAgingReady))
-	}
-	if report.IntentStrategy.BatchWaitActive {
-		if report.IntentStrategy.BatchWaitReason == "skipped_due_intent_settle_window" {
-			wait := formatDurationCompact(time.Duration(report.IntentStrategy.SettleTriggerInSeconds) * time.Second)
-			remediation = append(remediation,
-				fmt.Sprintf("intent replay reached min pending and is waiting for the latest capture to stay quiet for %s (about %s remaining); wait, run `acd flush --logical --session-id <session>` to publish now, lower ACD_INTENT_SETTLE_WINDOW, or switch ACD_COMMIT_STRATEGY=event for immediate one-event commits.",
-					formatDurationCompact(time.Duration(report.IntentStrategy.SettleWindowSeconds)*time.Second),
-					wait))
-		} else {
-			wait := formatDurationCompact(time.Duration(report.IntentStrategy.AgeTriggerInSeconds) * time.Second)
-			need := report.IntentStrategy.MinPending - report.IntentStrategy.VisiblePendingEvents
-			if need < 0 {
-				need = 0
-			}
-			remediation = append(remediation,
-				fmt.Sprintf("intent replay is waiting for %d more pending capture(s) or the oldest pending capture to reach %s (about %s remaining); wait, run `acd flush --logical --session-id <session>` to publish now, lower ACD_INTENT_MIN_PENDING or ACD_INTENT_MAX_PENDING_AGE for sparse repos, or switch ACD_COMMIT_STRATEGY=event for immediate one-event commits.",
-					need,
-					formatDurationCompact(time.Duration(report.IntentStrategy.MaxPendingAgeSeconds)*time.Second),
-					wait))
-		}
-	}
-	if report.StaleOperationMarker {
-		remediation = append(remediation,
-			fmt.Sprintf("operation_in_progress=%s has been present for %s with no HEAD movement; run `git status` and `git rebase --abort` (or remove the marker file) to release the pause. acd does not auto-clear this state.",
-				report.OperationInProgress, report.OperationMarkerDuration))
-	}
-	if len(remediation) == 0 {
-		remediation = append(remediation, "No anchor mismatch or terminal replay barriers detected.")
-	}
-	return remediation
-}
-
-func intentPlannerErrorNeedsRemediation(report diagnoseReport) bool {
-	strategy := report.IntentStrategy
-	if strategy.LastPlannerError == "" || report.PendingDepth == 0 {
-		return false
-	}
-	window := strategy.LastPlannerWindow
-	health := strategy.PlannerHealth
-	if window == nil || health == nil ||
-		strategy.LastPlannerErrorTS <= 0 ||
-		window.PlannedTS < strategy.LastPlannerErrorTS ||
-		window.ValidationFailure != "" ||
-		window.ProviderCallSkipped != "" ||
-		health.State != daemon.IntentPlannerCircuitClosed ||
-		health.ConsecutiveFailures != 0 {
-		return true
-	}
-	if strategy.EffectiveProvider == "" ||
-		strategy.EffectiveProvider == (ai.DeterministicProvider{}).Name() ||
-		window.Provider != strategy.EffectiveProvider ||
-		window.Model != strategy.EffectiveModel {
-		return true
-	}
-	switch window.ResolutionMode {
-	case "provider", "completed_plan_reuse", "partial_replan", "repair_replan":
-		return false
-	default:
-		return true
-	}
 }
 
 func fileSHA256(path string) (string, error) {
@@ -865,6 +220,19 @@ func fileSHA256(path string) (string, error) {
 }
 
 func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
+	if r.PublicationOutcome.CheckpointAvailable {
+		fmt.Fprintf(out, "Repository: %s\n", r.Repo)
+		renderFinishOutcomeHuman(out, r.PublicationOutcome)
+		if r.CaptureHealth.Error != "" {
+			fmt.Fprintf(out, "Protection: %s\n", r.CaptureHealth.Error)
+		}
+		for _, next := range r.Remediation {
+			fmt.Fprintf(out, "Next: %s\n", next)
+		}
+		fmt.Fprintf(out, "Read-only state checksum unchanged: %s\n", yesNo(r.StateDBChecksumVerified))
+		return nil
+	}
+
 	fmt.Fprintf(out, "Repo: %s\n", r.Repo)
 	fmt.Fprintf(out, "State DB: %s\n", r.StateDB)
 	current := r.Anchor.GitHEADBranch
@@ -895,20 +263,13 @@ func renderDiagnoseHuman(out io.Writer, r diagnoseReport) error {
 	if r.FailedEvents > 0 {
 		fmt.Fprintf(out, "Failed terminal events: %d", r.FailedEvents)
 		if r.FailedBlockingPending > 0 {
-			fmt.Fprintf(out, " (%d blocking pending replay; run acd fix --dry-run)", r.FailedBlockingPending)
+			fmt.Fprintf(out, " (%d archived pending successors; run acd support recover --dry-run)", r.FailedBlockingPending)
 		}
 		fmt.Fprintln(out)
 	}
 	if r.BackpressurePaused {
 		fmt.Fprintf(out, "Backpressure: paused at %s\n", valueOrUnset(r.BackpressurePausedAt))
 	}
-	renderIntentStrategyHuman(out, r.IntentStrategy)
-	renderRuntimeConfigHuman(out, r.RuntimeConfig)
-	renderConfigReadinessHuman(out, r.Configuration)
-	renderReplayObservabilityHuman(out, r.Replay)
-	renderIntentV2Human(out, r.IntentV2)
-	renderSelfPublicationHuman(out, r.SelfPublication, "")
-	renderPublicationDrainHuman(out, r.PublicationDrain)
 
 	if r.OperationInProgress != "" {
 		stale := ""

@@ -26,7 +26,7 @@ func executeAuth(t *testing.T, input string, args ...string) (string, string, er
 func TestAuthSetStatusAndRemove(t *testing.T) {
 	roots := withIsolatedHome(t)
 	t.Setenv("ACD_AI_API_KEY", "")
-	out, errOut, err := executeAuth(t, "sk-cli-secret\n", "auth", "set", "--stdin")
+	out, errOut, err := executeAuth(t, "sk-cli-secret\n", "config", "credentials", "set", "--stdin")
 	if err != nil || errOut != "" || strings.Contains(out, "sk-cli-secret") {
 		t.Fatalf("auth set out=%q errOut=%q err=%v", out, errOut, err)
 	}
@@ -36,7 +36,7 @@ func TestAuthSetStatusAndRemove(t *testing.T) {
 		t.Fatalf("stored key set=%v err=%v", key != "", err)
 	}
 
-	out, _, err = executeAuth(t, "", "auth", "status", "--json")
+	out, _, err = executeAuth(t, "", "config", "credentials", "status", "--json")
 	if err != nil || strings.Contains(out, "sk-cli-secret") {
 		t.Fatalf("auth status out=%q err=%v", out, err)
 	}
@@ -51,10 +51,10 @@ func TestAuthSetStatusAndRemove(t *testing.T) {
 		t.Fatalf("status = %+v", status)
 	}
 
-	if _, _, err := executeAuth(t, "", "auth", "remove"); err == nil {
+	if _, _, err := executeAuth(t, "", "config", "credentials", "remove"); err == nil {
 		t.Fatal("auth remove succeeded without --yes")
 	}
-	out, _, err = executeAuth(t, "", "auth", "remove", "--yes")
+	out, _, err = executeAuth(t, "", "config", "credentials", "remove", "--yes")
 	if err != nil || !strings.Contains(out, "Removed") {
 		t.Fatalf("auth remove out=%q err=%v", out, err)
 	}
@@ -66,7 +66,7 @@ func TestAuthStatusEnvironmentPriorityIsSecretFree(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("ACD_AI_API_KEY", "sk-env-secret")
-	out, _, err := executeAuth(t, "", "--json", "auth", "status")
+	out, _, err := executeAuth(t, "", "--json", "config", "credentials", "status")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,15 +87,15 @@ func TestAuthStatusEnvironmentPriorityIsSecretFree(t *testing.T) {
 
 func TestAuthSetRejectsLiteralAndUnmaskedNonTerminalInput(t *testing.T) {
 	withIsolatedHome(t)
-	if _, _, err := executeAuth(t, "", "auth", "set", "sk-literal"); err == nil {
+	if _, _, err := executeAuth(t, "", "config", "credentials", "set", "sk-literal"); err == nil {
 		t.Fatal("literal positional secret accepted")
 	}
-	if _, _, err := executeAuth(t, "sk-unmasked\n", "auth", "set"); err == nil ||
+	if _, _, err := executeAuth(t, "sk-unmasked\n", "config", "credentials", "set"); err == nil ||
 		!strings.Contains(err.Error(), "--stdin") {
 		t.Fatalf("unmasked non-terminal error = %v", err)
 	}
 	root := newRootCmd()
-	auth, _, err := root.Find([]string{"auth", "set"})
+	auth, _, err := root.Find([]string{"config", "credentials", "set"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestAuthStatusRejectsInsecureFileWithoutLeakingBody(t *testing.T) {
 	if err := os.WriteFile(credentials.NewStore(roots).Path(), body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, errOut, err := executeAuth(t, "", "auth", "status", "--json")
+	out, errOut, err := executeAuth(t, "", "config", "credentials", "status", "--json")
 	if err == nil || strings.Contains(out+errOut+err.Error(), "sk-never-print") {
 		t.Fatalf("status out=%q errOut=%q err=%v", out, errOut, err)
 	}

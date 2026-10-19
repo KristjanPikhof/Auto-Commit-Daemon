@@ -14,7 +14,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
 func readIntentHistoryPlanRef(ctx context.Context, repo, ref string) (state.IntentHistoryPlan, bool, error) {
@@ -26,18 +25,18 @@ func readIntentHistoryPlanRef(ctx context.Context, repo, ref string) (state.Inte
 			return plan, false, err
 		}
 		if len(raw) > state.IntentHistoryPlanByteCap {
-			return plan, false, errors.New("acd history rewrite: saved plan exceeds size limit")
+			return plan, false, errors.New("history rewrite: saved plan exceeds size limit")
 		}
 		if err := json.Unmarshal(raw, &plan); err != nil {
 			return plan, false, err
 		}
-		return plan, plan.SourceBranchRef != "" && plan.Version == state.IntentHistoryPlanVersion, nil
+		return plan, plan.SourceBranchRef != "" && (plan.Version == 1 || plan.Version == state.IntentHistoryPlanVersion), nil
 	}
-	dbPath, err := rewriteStateDBPath(ctx, repo)
+	path, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
 		return plan, false, err
 	}
-	db, err := state.OpenReadOnly(ctx, dbPath)
+	db, err := state.OpenReadOnly(ctx, path)
 	if err != nil {
 		return plan, false, err
 	}
@@ -45,99 +44,105 @@ func readIntentHistoryPlanRef(ctx context.Context, repo, ref string) (state.Inte
 	return state.LoadIntentHistoryPlan(ctx, db, ref)
 }
 
-func generateIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, selection git.RewriteSelection, opts rewriteCommitsOptions, provider ai.Provider, cfg ai.ProviderConfig, jsonOut bool) error {
-	if len(selection.RecreateUnchanged) != 0 {
-		return errors.New("acd history rewrite: new-branch reconstruction must select through HEAD")
-	}
-	target := opts.newBranch
-	if !strings.HasPrefix(target, "refs/heads/") {
-		target = "refs/heads/" + target
-	}
-	if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "check-ref-format", target); err != nil {
-		return err
-	}
-	if target == selection.BranchRef {
-		return errors.New("acd history rewrite: --new-branch must preserve the source branch")
-	}
-	if _, err := git.RevParse(ctx, repo, target); err == nil {
-		return errors.New("acd history rewrite: target branch already exists; choose a new branch")
-	}
-	dbPath, err := rewriteStateDBPath(ctx, repo)
+func generateFinishHistoryPlan(ctx context.Context, out io.Writer, repo string, selection git.RewriteSelection, opts rewriteCommitsOptions, jsonOut bool) error {
+	lookup, err := loadControlRepo(ctx, repo)
 	if err != nil {
 		return err
 	}
-	if opts.planOut == "" {
-		version, err := state.ReadUserVersion(ctx, dbPath)
-		if err != nil || version != state.SchemaVersion {
-			return errors.New("acd history rewrite: use --plan-out FILE for a standalone preview until ACD is set up at the current schema; planning does not migrate an active worker")
-		}
+	if workerPublicationHeld(lookup.Roots.SetupPublicationHoldPath(), nil) {
+		return errors.New("history rewrite: setup currently holds publication; finish setup first")
 	}
-	var chain []string
-	for _, commit := range selection.Selected {
-		chain = append(chain, commit.OID)
-	}
-	if cfg.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
-		defer cancel()
-	}
-	plan, err := daemon.PlanIntentHistory(ctx, repo, selection.BranchRef, chain, provider, cfg.CommitFormat, cfg.DiffEgress)
+	runtime := &workerRuntime{roots: lookup.Roots, record: lookup.Record, worktree: lookup.Worktree}
+	path, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
 		return err
 	}
-	plan.TargetBranchRef = target
-	if opts.planOut != "" {
-		plan, err = state.PrepareIntentHistoryPlan(plan)
-	} else {
-		db, openErr := state.OpenRuntime(ctx, dbPath)
-		if openErr != nil {
-			return openErr
-		}
-		plan, err = state.SaveIntentHistoryPlan(ctx, db, plan)
-		db.Close()
+	if db, openErr := state.OpenReadOnly(ctx, path); openErr == nil {
+		runtime.db = db
+		defer db.Close()
+	} else if !errors.Is(openErr, os.ErrNotExist) {
+		return openErr
 	}
+	if opts.planOut == "" && (!lookup.Registered || lookup.Record.LifecycleDisabled()) {
+		return errors.New("history rewrite: use --plan-out FILE for a standalone plan, or run `acd on`")
+	}
+	cfg, err := resolveFinishWorkerConfigInputs(ctx, lookup.Roots, runtime, true)
 	if err != nil {
 		return err
 	}
-	ref := plan.ID
-	if opts.planOut != "" {
-		file, err := os.OpenFile(opts.planOut, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	var transport ai.FinishTransport
+	if cfg.Mode == "intent" {
+		var closer io.Closer
+		transport, closer, err = ai.BuildFinishTransport(cfg.Provider, cfg.Approved)
 		if err != nil {
 			return err
 		}
-		encoder := json.NewEncoder(file)
-		encoder.SetIndent("", "  ")
-		writeErr := encoder.Encode(plan)
-		closeErr := file.Close()
-		if writeErr != nil {
-			return writeErr
+		if closer != nil {
+			defer closer.Close()
 		}
-		if closeErr != nil {
-			return closeErr
+	}
+	var chain, suffix []string
+	for _, commit := range selection.Selected {
+		chain = append(chain, commit.OID)
+	}
+	for _, commit := range selection.RecreateUnchanged {
+		suffix = append(suffix, commit.OID)
+	}
+	timeout := cfg.Provider.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	plan, err := daemon.PlanFinishHistory(ctx, repo, selection.BranchRef, chain, suffix, transport, daemon.FinishHistoryOptions{Mode: cfg.Mode, Style: cfg.Style, MessagesOnly: opts.messagesOnly, DiffEgress: cfg.Provider.DiffEgress, Deadline: time.Now().Add(timeout), VerificationConfigDigest: cfg.ConfigDigest})
+	if err != nil {
+		return err
+	}
+	if opts.newBranch != "" {
+		target := opts.newBranch
+		if !strings.HasPrefix(target, "refs/heads/") {
+			target = "refs/heads/" + target
+		}
+		if target == selection.BranchRef {
+			return errors.New("history rewrite: new branch must differ from source")
+		}
+		if _, err := git.Run(ctx, git.RunOpts{Dir: repo}, "check-ref-format", target); err != nil {
+			return err
+		}
+		if _, err := git.RevParse(ctx, repo, target); err == nil {
+			return errors.New("history rewrite: target branch already exists")
+		}
+		plan.TargetBranchRef = target
+	}
+	ref := plan.ID
+	if opts.planOut != "" {
+		raw, err := json.MarshalIndent(plan, "", "  ")
+		if err != nil {
+			return err
+		}
+		if len(raw) > state.IntentHistoryPlanByteCap {
+			return errors.New("history rewrite: saved plan exceeds size limit")
+		}
+		if err := os.WriteFile(opts.planOut, append(raw, '\n'), 0600); err != nil {
+			return err
 		}
 		ref = opts.planOut
+	} else if _, err := historyRequest(ctx, lookup, "history_save", finishHistoryParams{Plan: plan}); err != nil {
+		return err
 	}
-	if !jsonOut {
-		printIntentHistoryPlan(out, plan)
-	}
-	if opts.planOnly || opts.dryRun || !opts.yes {
-		if jsonOut {
-			return json.NewEncoder(out).Encode(plan)
-		}
-		fmt.Fprintf(out, "Plan saved: %s\nPreview: acd history rewrite --apply %s --dry-run\n", ref, rewritePlanRefArg(ref))
-		return nil
-	}
-	if jsonOut {
+	if !opts.planOnly && opts.yes && !opts.dryRun {
 		if err := applyIntentHistoryPlan(ctx, io.Discard, repo, plan, false); err != nil {
 			return err
 		}
+	}
+	if jsonOut {
 		return json.NewEncoder(out).Encode(plan)
 	}
-	return applyIntentHistoryPlan(ctx, out, repo, plan, false)
+	printIntentHistoryPlan(out, plan)
+	fmt.Fprintf(out, "Plan saved: %s\nPreview: acd history rewrite --apply %s --dry-run\n", ref, rewritePlanRefArg(ref))
+	return nil
 }
 
 func printIntentHistoryPlan(out io.Writer, plan state.IntentHistoryPlan) {
-	fmt.Fprintf(out, "Intent history reconstruction: %d commits -> %d goals\nNew branch: %s\nOriginal branch: %s (preserved)\n", len(plan.SourceChain), len(plan.Goals), plan.TargetBranchRef, plan.SourceBranchRef)
+	fmt.Fprintf(out, "History rewrite: %d original commits -> %d goals\nSource: %s\nTarget: %s\n", len(plan.SourceChain), len(plan.Goals), plan.SourceBranchRef, plan.TargetBranchRef)
 	for _, goal := range plan.Goals {
 		fmt.Fprintf(out, "- %s\n  Purpose: %s\n  Boundary: %s\n", strings.SplitN(goal.Message, "\n", 2)[0], goal.Purpose, goal.Reason)
 	}
@@ -146,14 +151,14 @@ func printIntentHistoryPlan(out io.Writer, plan state.IntentHistoryPlan) {
 func showIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, jsonOut, previewPassed bool) error {
 	view := struct {
 		state.IntentHistoryPlan
-		WorkerRequest *state.IntentHistoryRequest `json:"worker_request,omitempty"`
+		WorkerRequest *state.FinishHistoryRequest `json:"worker_request,omitempty"`
 		PreviewPassed bool                        `json:"preview_passed,omitempty"`
 	}{IntentHistoryPlan: plan, PreviewPassed: previewPassed}
 	if path, err := rewriteStateDBPath(ctx, repo); err == nil {
 		if db, err := state.OpenReadOnly(ctx, path); err == nil {
 			defer db.Close()
-			if request, ok, err := state.LoadIntentHistoryRequest(ctx, db); err == nil && ok && request.PlanID == plan.ID {
-				view.WorkerRequest = &request
+			if r, ok, err := state.LoadFinishHistoryRequest(ctx, db, plan.ID); err == nil && ok {
+				view.WorkerRequest = &r
 			}
 		}
 	}
@@ -161,147 +166,123 @@ func showIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan
 		return json.NewEncoder(out).Encode(view)
 	}
 	printIntentHistoryPlan(out, plan)
-	if request := view.WorkerRequest; request != nil {
-		fmt.Fprintf(out, "Worker status: %s\n", request.Status)
-		if request.Error != "" {
-			fmt.Fprintln(out, request.Error)
-		}
-		if request.NewHead != "" {
-			fmt.Fprintf(out, "New HEAD: %s\nBackup: %s\n", request.NewHead, request.BackupRef)
+	if r := view.WorkerRequest; r != nil {
+		fmt.Fprintf(out, "Worker status: %s\n", r.Status)
+		if r.Error != "" {
+			fmt.Fprintln(out, r.Error)
 		}
 	}
 	return nil
 }
 
 func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, dryRun bool) error {
-	replacements, err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan)
-	if err != nil {
+	if err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
 		return err
-	}
-	dbPath, err := rewriteStateDBPath(ctx, repo)
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(dbPath); err == nil {
-		readDB, err := state.OpenReadOnly(ctx, dbPath)
-		if err != nil {
-			return err
-		}
-		completed, checkErr := acknowledgeCompletedIntentHistory(ctx, out, repo, readDB, plan, replacements)
-		readDB.Close()
-		if checkErr != nil || completed {
-			return checkErr
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if _, err := git.ApplyIntentHistoryReconstruction(ctx, repo, git.IntentHistoryReconstructionOptions{SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead, OldChain: plan.SourceChain, Replacements: replacements, PlanID: plan.ID, DryRun: true}); err != nil {
-		return err
-	}
-	printIntentHistoryPlan(out, plan)
-	if dryRun {
-		fmt.Fprintln(out, "Preview passed. The worker will verify each exact goal before creating the branch.")
-		return nil
 	}
 	lookup, err := loadControlRepo(ctx, repo)
 	if err != nil {
 		return err
 	}
 	if !lookup.Registered || lookup.Record.LifecycleDisabled() {
-		return errors.New("acd history rewrite: goal reconstruction requires an active worker to run the repository's approved verification; run acd on first")
+		return errors.New("history rewrite: approved tree verification requires the active protection worker; run `acd on`")
 	}
-	readDB, err := state.OpenReadOnly(ctx, dbPath)
+	r, err := historyRequest(ctx, lookup, "history_start", finishHistoryParams{Plan: plan, DryRun: dryRun})
 	if err != nil {
 		return err
 	}
-	defer readDB.Close()
-	worker, _, err := state.LoadDaemonState(ctx, readDB)
-	if err != nil {
-		return err
+	fmt.Fprintf(out, "History request saved: %s (attempt %d)\n", r.PlanID, r.Attempt)
+	for r.Status == "running" || r.Status == "prepared" {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("history rewrite: request %s is saved; reconnect with --show-plan %s: %w", r.PlanID, r.PlanID, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+		r, err = historyRequest(ctx, lookup, "history_status", finishHistoryParams{PlanID: plan.ID})
+		if err != nil {
+			return fmt.Errorf("history rewrite: request %s is saved; inspect --show-plan %s: %w", plan.ID, plan.ID, err)
+		}
 	}
-	var capability state.IntentHistoryWorker
-	ok, err := state.MetaGetJSON(ctx, readDB, state.MetaKeyIntentHistoryWorker, &capability)
-	if err != nil {
-		return err
+	if r.Status != "completed" {
+		return errors.New("history rewrite: " + r.Status + ": " + r.Error)
 	}
-	if !ok || capability.Protocol != state.IntentHistoryPlanVersion || capability.PID != worker.PID || capability.Fingerprint != daemonFingerprintToken(worker) || worker.PID <= 0 {
-		return errors.New("acd history rewrite: the active worker does not support goal reconstruction; rebuild and restart ACD before applying")
-	}
-	version, err := state.ReadUserVersion(ctx, dbPath)
-	if err != nil {
-		return err
-	}
-	if version != state.SchemaVersion {
-		return errors.New("acd history rewrite: active worker schema does not match the reconstruction protocol; run setup and restart first")
-	}
-	if err := proveIntentHistoryWorker(ctx, lookup, worker.PID); err != nil {
-		return err
-	}
-	db, err := state.OpenRuntime(ctx, dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	if completed, err := acknowledgeCompletedIntentHistory(ctx, out, repo, db, plan, replacements); err != nil || completed {
-		return err
-	}
-	plan, err = state.SaveIntentHistoryPlan(ctx, db, plan)
-	if err != nil {
-		return err
-	}
-	if err := state.EnqueueIntentHistoryRequest(ctx, db, plan.ID); err != nil {
-		return err
-	}
-	response, err := supervisor.DoWorker(ctx, supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), supervisor.Request{
-		Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("history-wake-%d", time.Now().UnixNano()),
-		Method: "hint", RepositoryID: lookup.Record.RepositoryID, WorktreeID: lookup.Record.WorktreeID,
-	}, 3*time.Second)
-	if err != nil {
-		return fmt.Errorf("acd history rewrite: request was saved, but worker wake failed: %w", err)
-	}
-	if !response.OK || response.Error != nil {
-		return errors.New("acd history rewrite: request was saved, but worker rejected the wake")
-	}
-	fmt.Fprintf(out, "Queued for the active worker: %s\nCapture protection continues. Run acd history rewrite --show-plan %s to inspect progress.\n", plan.ID, plan.ID)
-	return nil
-}
-
-// The worker socket is served only while its process holds the canonical
-// repository lock. Persisted PID and capability metadata alone cannot prove it.
-func proveIntentHistoryWorker(ctx context.Context, lookup controlRepoLookup, pid int) error {
-	response, err := supervisor.DoWorker(ctx, supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), supervisor.Request{
-		Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("history-owner-%d", time.Now().UnixNano()),
-		Method: "status", RepositoryID: lookup.Record.RepositoryID,
-	}, 3*time.Second)
-	if err != nil {
-		return fmt.Errorf("acd history rewrite: cannot prove the active worker owns this repository: %w", err)
-	}
-	ready, err := decodeProductData[supervisor.WorkerReadiness](response.Data)
-	if err != nil || !response.OK || response.Error != nil || !ready.Ready || ready.RepositoryID != lookup.Record.RepositoryID || ready.PID != pid {
-		return errors.New("acd history rewrite: active worker ownership does not match the saved capability; restart ACD before applying")
+	if dryRun {
+		fmt.Fprintln(out, "Preview passed: every output tree was verified. Branch references were unchanged.")
+	} else {
+		fmt.Fprintln(out, "History rewrite completed; original history remains reachable through its backup and evidence refs.")
 	}
 	return nil
 }
 
-func acknowledgeCompletedIntentHistory(ctx context.Context, out io.Writer, repo string, db *state.DB, plan state.IntentHistoryPlan, replacements []git.IntentRepairReplacement) (bool, error) {
-	request, ok, err := state.LoadIntentHistoryRequest(ctx, db)
-	if err != nil || !ok || request.PlanID != plan.ID || request.Status != "completed" {
-		return false, err
+// editFinishHistoryMessages creates a new identity for reviewed messages while
+// retaining every original tree, author and membership boundary.
+func editFinishHistoryMessages(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, opts rewriteCommitsOptions, jsonOut bool) error {
+	if plan.Mode != "local" && !plan.MessagesOnly {
+		return errors.New("history rewrite: immutable goal reconstruction requires a new plan")
 	}
-	head, err := git.RevParse(ctx, repo, plan.TargetBranchRef)
-	if err != nil || request.NewHead == "" || head != request.NewHead {
-		return true, errors.New("acd history rewrite: completed target is missing or changed; generate a new plan")
+	if err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
+		return err
 	}
-	result, err := git.RecoverIntentHistoryReconstruction(ctx, repo, git.IntentHistoryReconstructionOptions{
-		SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead,
-		OldChain: plan.SourceChain, Replacements: replacements, PlanID: plan.ID,
-	})
+	editable := state.RewritePlan{ID: plan.ID, CommitFormat: plan.CommitFormat}
+	for _, goal := range plan.Goals {
+		editable.Groups = append(editable.Groups, state.RewritePlanGroup{Members: []state.RewritePlanMember{{OldOID: goal.AuthorOID, OriginalMessage: goal.Message}}, ProposedMessage: goal.Message, GroupingReason: goal.Reason})
+	}
+	groups, changed, err := editRewritePlanWithEditor(editable, opts.editFormat)
 	if err != nil {
-		return true, fmt.Errorf("acd history rewrite: completed reconstruction no longer matches; generate a new plan: %w", err)
+		return err
 	}
-	if request.BackupRef != result.BackupRef {
-		return true, errors.New("acd history rewrite: completed reconstruction backup changed; generate a new plan")
+	if len(groups) != len(plan.Goals) {
+		return errors.New("history rewrite: message editing cannot regroup original commits")
 	}
-	fmt.Fprintf(out, "Already completed: %s\nNew branch: %s\n", plan.ID, plan.TargetBranchRef)
-	return true, nil
+	for index, group := range groups {
+		if len(group.Members) != 1 || group.Members[0].OldOID != plan.Goals[index].AuthorOID {
+			return errors.New("history rewrite: message editing cannot change membership or order")
+		}
+		plan.Goals[index].Message, plan.Goals[index].Reason = group.ProposedMessage, group.GroupingReason
+	}
+	ref := opts.editPlan
+	if changed {
+		plan.ID = ""
+		plan, err = state.PrepareIntentHistoryPlan(plan)
+		if err != nil {
+			return err
+		}
+		// Keep the same worktree namespace but give the reviewed revision its own source pin.
+		prefix := strings.Split(plan.SourceRef, "/history/")[0]
+		plan.SourceRef = prefix + "/history/" + plan.ID + "/source"
+		if _, err := git.EnsurePrivateRefDurable(ctx, repo, git.FinishRefPrefix, plan.SourceRef, plan.ExpectedHead); err != nil {
+			return err
+		}
+		if err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
+			return err
+		}
+		if file, err := os.Open(opts.editPlan); err == nil {
+			file.Close()
+			raw, err := json.MarshalIndent(plan, "", "  ")
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(opts.editPlan, append(raw, '\n'), 0600); err != nil {
+				return err
+			}
+		} else {
+			lookup, err := loadControlRepo(ctx, repo)
+			if err != nil {
+				return err
+			}
+			if _, err := historyRequest(ctx, lookup, "history_save", finishHistoryParams{Plan: plan}); err != nil {
+				return err
+			}
+			ref = plan.ID
+		}
+	}
+	if opts.yes && !opts.planOnly && !opts.dryRun {
+		if err := applyIntentHistoryPlan(ctx, io.Discard, repo, plan, false); err != nil {
+			return err
+		}
+	}
+	if jsonOut {
+		return json.NewEncoder(out).Encode(plan)
+	}
+	fmt.Fprintf(out, "Reviewed plan saved: %s\n", ref)
+	return nil
 }

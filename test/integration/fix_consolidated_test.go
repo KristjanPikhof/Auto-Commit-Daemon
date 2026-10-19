@@ -6,100 +6,16 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
+
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
+
 	"testing"
 	"time"
-
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
-
-func TestControlOnRecoversDuplicateCaptureWithLinkedWorktreeWorkerLive(t *testing.T) {
-	requireSQLite(t)
-	repo := tempRepo(t)
-	linked := filepath.Join(t.TempDir(), "linked")
-	runGitOK(t, repo, "worktree", "add", "-q", "-b", "linked-recovery", linked)
-	t.Cleanup(func() { _, _ = runGit(repo, "worktree", "remove", "--force", linked) })
-	env := withIsolatedHome(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	mainDB := initStateDBSchema(t, ctx, env, repo, "linked-recovery-main")
-	roots, repositoryID := prepareCheckpointRegistration(t, env, linked)
-	linkedRepositoryID := repositoryID
-	_, mainRepositoryID := prepareCheckpointRegistration(t, env, repo)
-	if linkedRepositoryID != mainRepositoryID {
-		t.Fatalf("linked worktrees have distinct repository ids: main=%s linked=%s", mainRepositoryID, linkedRepositoryID)
-	}
-
-	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
-	beforeOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:.gitignore"))
-	afterOID := gitHashObjectStdin(t, repo, "duplicate captured state\n")
-	now := nowFloatSeconds()
-	seed := fmt.Sprintf(`
-INSERT INTO capture_events(branch_ref,branch_generation,base_head,operation,path,fidelity,captured_ts,state,error)
-VALUES ('refs/heads/main',1,'%s','modify','.gitignore','rescan',%f,'blocked_conflict','history moved');
-INSERT INTO capture_ops(event_seq,ord,op,path,before_oid,before_mode,after_oid,after_mode,fidelity)
-VALUES (last_insert_rowid(),0,'modify','.gitignore','%s','100644','%s','100644','rescan');
-INSERT INTO capture_events(branch_ref,branch_generation,base_head,operation,path,fidelity,captured_ts,state)
-VALUES ('refs/heads/main',1,'%s','modify','.gitignore','rescan',%f,'pending');
-INSERT INTO capture_ops(event_seq,ord,op,path,before_oid,before_mode,after_oid,after_mode,fidelity)
-VALUES (last_insert_rowid(),0,'modify','.gitignore','%s','100644','%s','100644','rescan');
-`, head, now, beforeOID, afterOID, head, now+0.001, beforeOID, afterOID)
-	ensureCheckpointRuntime(t, env, repo, buildAcdBinary(t))
-	before := mustIntegrationWorkerStatus(t, ctx, roots, repositoryID)
-	off := runAcd(t, ctx, env, "off", "--repo", repo, "--json")
-	if off.ExitCode != 0 {
-		t.Fatalf("off exit=%d\nstdout=%s\nstderr=%s", off.ExitCode, off.Stdout, off.Stderr)
-	}
-	sqliteExec(t, mainDB, seed)
-
-	on := runAcd(t, ctx, env, "on", "--repo", repo, "--json")
-	if on.ExitCode != 0 || strings.Contains(on.Stdout, `"action_required": true`) {
-		t.Fatalf("on exit=%d\nstdout=%s\nstderr=%s", on.ExitCode, on.Stdout, on.Stderr)
-	}
-	if got := sqliteScalar(t, mainDB, "SELECT group_concat(state, ',') FROM (SELECT state FROM capture_events ORDER BY seq)"); got != "recovered,recovered" {
-		t.Fatalf("duplicate capture states=%q", got)
-	}
-	after := mustIntegrationWorkerStatus(t, ctx, roots, repositoryID)
-	if before.PID <= 0 || after.PID <= 0 {
-		t.Fatalf("shared worker missing: before=%+v after=%+v", before, after)
-	}
-	if before.PID != after.PID {
-		if err := syscall.Kill(before.PID, 0); !errors.Is(err, syscall.ESRCH) {
-			t.Fatalf("old shared worker pid %d survived recovery: %v", before.PID, err)
-		}
-	}
-	status := runAcd(t, ctx, env, "status", "--repo", repo, "--json")
-	if status.ExitCode != 0 || !strings.Contains(status.Stdout, `"pending_events": 0`) ||
-		!strings.Contains(status.Stdout, `"blocked_events": 0`) || strings.Contains(status.Stdout, `"action_required": true`) {
-		t.Fatalf("post-recovery status exit=%d\nstdout=%s\nstderr=%s", status.ExitCode, status.Stdout, status.Stderr)
-	}
-}
-
-func mustIntegrationWorkerStatus(t *testing.T, ctx context.Context, roots paths.Roots, repositoryID string) supervisor.WorkerStatus {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		status, err := checkpointRuntimeStatus(ctx, roots)
-		if err == nil {
-			for _, worker := range status.Workers {
-				if worker.RepositoryID == repositoryID && worker.PID > 0 && worker.State == "running" {
-					return worker
-				}
-			}
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	t.Fatalf("worker %s did not become ready", repositoryID)
-	return supervisor.WorkerStatus{}
-}
 
 // TestFix_ReconcilesWholeExactPairs pins the immutable recovery contract:
 // exact HEAD matches publish the full pair, while explicit --force archives a
@@ -109,8 +25,7 @@ func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 	requireSQLite(t)
 
 	repo := tempRepo(t)
-	env := withIsolatedHome(t)
-	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+	env := finishLaunchctlEnv(t, withIsolatedHome(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -124,7 +39,7 @@ func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 	publishedAOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:published-a.txt"))
 	publishedBOID := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD:published-b.txt"))
 
-	dbPath := initStateDBSchema(t, ctx, env, repo, "fix-barrier-init")
+	dbPath := initLegacySupportDB(t, ctx, env, repo)
 	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
 	if gen == "" {
 		gen = "1"
@@ -132,7 +47,7 @@ func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 
 	publishedPair := seedCreateRecoveryPair(t, dbPath, "refs/heads/main", gen, baseHead,
 		"published-a.txt", publishedAOID, "published-b.txt", publishedBOID)
-	apply := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
+	apply := runAcd(t, ctx, env, "support", "recover", "--repo", repo, "--yes", "--json")
 	if apply.ExitCode != 0 {
 		t.Fatalf("fix --yes exit=%d\nstdout=%s\nstderr=%s", apply.ExitCode, apply.Stdout, apply.Stderr)
 	}
@@ -157,7 +72,7 @@ func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 	archivePair := seedCreateRecoveryPair(t, dbPath, "refs/heads/main", gen, head,
 		"archive-a.txt", archiveAOID, "archive-b.txt", archiveBOID)
 	refsBefore := recoveryRefList(t, repo)
-	forceDry := runAcd(t, ctx, env, "fix", "--repo", repo, "--force", "--dry-run", "--json")
+	forceDry := runAcd(t, ctx, env, "support", "recover", "--repo", repo, "--force", "--dry-run", "--json")
 	if forceDry.ExitCode != 0 {
 		t.Fatalf("fix --force --dry-run exit=%d\nstdout=%s\nstderr=%s", forceDry.ExitCode, forceDry.Stdout, forceDry.Stderr)
 	}
@@ -176,7 +91,7 @@ func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 		t.Fatalf("--force --dry-run mutated recovery refs:\nbefore=%s\nafter=%s", refsBefore, refsAfter)
 	}
 
-	forceApply := runAcd(t, ctx, env, "fix", "--repo", repo, "--force", "--yes", "--json")
+	forceApply := runAcd(t, ctx, env, "support", "recover", "--repo", repo, "--force", "--yes", "--json")
 	if forceApply.ExitCode != 0 {
 		t.Fatalf("fix --force --yes exit=%d\nstdout=%s\nstderr=%s",
 			forceApply.ExitCode, forceApply.Stdout, forceApply.Stderr)
@@ -201,121 +116,12 @@ func TestFix_ReconcilesWholeExactPairs(t *testing.T) {
 	runGitOK(t, repo, "show-ref", "--verify", appliedAction.RecoveryRef)
 }
 
-// TestRecoverAndPurgeDeprecationWarnings asserts the legacy `acd recover`
-// and `acd purge-events` entrypoints retain their safe compatibility contract
-// while emitting the documented deprecation stderr line. Recover delegates to
-// immutable whole-pair recovery; purge refuses ambiguous selectors and requires
-// explicit --all before preserving every planned pair.
-func TestRecoverAndPurgeDeprecationWarnings(t *testing.T) {
-	t.Parallel()
-	requireSQLite(t)
-
-	repo := tempRepo(t)
-	env := withIsolatedHome(t)
-	t.Cleanup(func() { stopSessionForce(t, env, repo) })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	// Schema bootstrap + central registry entry.
-	dbPath := initStateDBSchema(t, ctx, env, repo, "deprec-init")
-
-	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
-	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
-	if gen == "" {
-		gen = "1"
-	}
-
-	staleAOID := gitHashObjectStdin(t, repo, "stale a\n")
-	staleBOID := gitHashObjectStdin(t, repo, "stale b\n")
-	stalePair := seedCreateRecoveryPair(t, dbPath, "refs/heads/stale", "99", head,
-		"stale-a.txt", staleAOID, "stale-b.txt", staleBOID)
-
-	// Deprecated path: acd recover --auto --yes.
-	recover := runAcd(t, ctx, env, "recover", "--repo", repo, "--auto", "--yes", "--json")
-	if recover.ExitCode != 0 {
-		t.Fatalf("acd recover --auto --yes exit=%d\nstdout=%s\nstderr=%s",
-			recover.ExitCode, recover.Stdout, recover.Stderr)
-	}
-	const wantRecoverDeprec = "warning: acd recover is a compatibility alias; use acd support recover"
-	if !strings.Contains(recover.Stderr, wantRecoverDeprec) {
-		t.Fatalf("recover stderr missing deprecation banner\nwant: %q\nstderr: %q",
-			wantRecoverDeprec, recover.Stderr)
-	}
-	recoverPlan := decodeFixPlan(t, recover.Stdout)
-	recoverAction := findFixActionForSeq(recoverPlan.Actions, "reconcile_unpublished_chain", stalePair.FirstSeq)
-	if recoverAction == nil || !recoverAction.Applied || recoverAction.State != "recovered" || recoverAction.RecoveryRef == "" {
-		t.Fatalf("recover alias action=%+v\n%s", recoverAction, recover.Stdout)
-	}
-	if got := sqliteScalar(t, dbPath, fmt.Sprintf(
-		"SELECT group_concat(value, ',') FROM (SELECT branch_ref || '|' || branch_generation || '|' || state AS value FROM capture_events WHERE seq IN (%s,%s) ORDER BY seq)",
-		stalePair.FirstSeq, stalePair.SecondSeq)); got != "refs/heads/stale|99|recovered,refs/heads/stale|99|recovered" {
-		t.Fatalf("recover alias retargeted or split stale pair: %q", got)
-	}
-	if rows := sqliteScalar(t, dbPath, fmt.Sprintf(
-		"SELECT COUNT(*) FROM capture_events WHERE seq IN (%s,%s)", stalePair.FirstSeq, stalePair.SecondSeq)); rows != "2" {
-		t.Fatalf("recover alias deleted captured rows: %s", rows)
-	}
-	runGitOK(t, repo, "show-ref", "--verify", recoverAction.RecoveryRef)
-
-	purgeAOID := gitHashObjectStdin(t, repo, "purge alias a\n")
-	purgeBOID := gitHashObjectStdin(t, repo, "purge alias b\n")
-	purgePair := seedCreateRecoveryPair(t, dbPath, "refs/heads/main", gen, head,
-		"purge-a.txt", purgeAOID, "purge-b.txt", purgeBOID)
-
-	// The old selective spelling is now fail-closed because delegating it to a
-	// whole-repository fix could preserve unrelated failed or stale pairs.
-	snapshotsBefore := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM recovery_snapshots")
-	purge := runAcd(t, ctx, env, "purge-events", "--repo", repo, "--blocked", "--yes", "--json")
-	if purge.ExitCode == 0 {
-		t.Fatalf("acd purge-events --blocked --yes unexpectedly succeeded\nstdout=%s\nstderr=%s",
-			purge.Stdout, purge.Stderr)
-	}
-	if !strings.Contains(purge.Stdout+purge.Stderr, "selective --blocked/--pending/--failed recovery is no longer supported") {
-		t.Fatalf("purge-events selective refusal missing\nstdout=%s\nstderr=%s",
-			purge.Stdout, purge.Stderr)
-	}
-	if got := exactPairStates(t, dbPath, purgePair); got != "blocked_conflict,pending" {
-		t.Fatalf("refused purge alias changed pair states=%q", got)
-	}
-	if got := sqliteScalar(t, dbPath, "SELECT COUNT(*) FROM recovery_snapshots"); got != snapshotsBefore {
-		t.Fatalf("refused purge alias snapshots=%s want unchanged %s", got, snapshotsBefore)
-	}
-
-	// Explicit --all retains the deprecated safe alias for one release.
-	purge = runAcd(t, ctx, env, "purge-events", "--repo", repo, "--all", "--yes", "--json")
-	if purge.ExitCode != 0 {
-		t.Fatalf("acd purge-events --all --yes exit=%d\nstdout=%s\nstderr=%s",
-			purge.ExitCode, purge.Stdout, purge.Stderr)
-	}
-	const wantPurgeDeprec = "acd purge-events is deprecated; use acd fix --force [--yes]. See acd fix --help."
-	if !strings.Contains(purge.Stderr, wantPurgeDeprec) {
-		t.Fatalf("purge-events stderr missing deprecation banner\nwant: %q\nstderr: %q",
-			wantPurgeDeprec, purge.Stderr)
-	}
-	purgePlan := decodeFixPlan(t, purge.Stdout)
-	purgeAction := findFixActionForSeq(purgePlan.Actions, "reconcile_unpublished_chain", purgePair.FirstSeq)
-	if purgeAction == nil || !purgeAction.Applied || purgeAction.State != "recovered" ||
-		!purgeAction.ArchiveOnly || purgeAction.RecoveryRef == "" {
-		t.Fatalf("purge alias action=%+v\n%s", purgeAction, purge.Stdout)
-	}
-	if got := exactPairStates(t, dbPath, purgePair); got != "recovered,recovered" {
-		t.Fatalf("purge alias pair states=%q", got)
-	}
-	if rows := sqliteScalar(t, dbPath, fmt.Sprintf(
-		"SELECT COUNT(*) FROM capture_events WHERE seq IN (%s,%s)", purgePair.FirstSeq, purgePair.SecondSeq)); rows != "2" {
-		t.Fatalf("purge alias deleted captured rows: %s", rows)
-	}
-	runGitOK(t, repo, "show-ref", "--verify", purgeAction.RecoveryRef)
-}
-
 func TestFix_GeneratedPendingCleanupKeepsGitManual(t *testing.T) {
 	t.Parallel()
 	requireSQLite(t)
 
 	repo := tempRepo(t)
-	env := withIsolatedHome(t)
-	t.Cleanup(func() { stopSessionForce(t, env, repo) })
+	env := finishLaunchctlEnv(t, withIsolatedHome(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -337,7 +143,7 @@ func TestFix_GeneratedPendingCleanupKeepsGitManual(t *testing.T) {
 	}
 	beforeStatus := runGitOK(t, repo, "status", "--short", "--", ".derivedData-provider-core")
 
-	dbPath := initStateDBSchema(t, ctx, env, repo, "fix-generated-init")
+	dbPath := initLegacySupportDB(t, ctx, env, repo)
 	head := strings.TrimSpace(runGitOK(t, repo, "rev-parse", "HEAD"))
 	gen := sqliteScalar(t, dbPath, "SELECT value FROM daemon_meta WHERE key = 'branch.generation'")
 	if gen == "" {
@@ -367,25 +173,33 @@ VALUES ('refs/heads/main', %s, '%s', 'delete', 'build/output.js', 'rescan', %f, 
 	}
 	prepareCheckpointRegistration(t, env, repo)
 
-	diagnose := runAcd(t, ctx, env, "diagnose", "--repo", repo, "--json")
+	diagnose := runAcd(t, ctx, env, "support", "diagnose", "--repo", repo, "--json")
 	if diagnose.ExitCode != 0 {
 		t.Fatalf("diagnose exit=%d\nstdout=%s\nstderr=%s", diagnose.ExitCode, diagnose.Stdout, diagnose.Stderr)
 	}
-	if !strings.Contains(diagnose.Stdout, `"generated_pending"`) ||
-		!strings.Contains(diagnose.Stdout, `"tracked_count": 2`) {
-		t.Fatalf("diagnose did not surface generated pending tracked count:\n%s", diagnose.Stdout)
+	if !strings.Contains(diagnose.Stdout, `"state_db_checksum_verified": true`) || !strings.Contains(diagnose.Stdout, `"reason_code": "legacy_activation_required"`) {
+		t.Fatalf("diagnose lost read-only retained legacy state: %s", diagnose.Stdout)
 	}
 
-	dryRun := runAcd(t, ctx, env, "fix", "--repo", repo, "--dry-run", "--json")
+	dryRun := runAcd(t, ctx, env, "support", "recover", "--repo", repo, "--dry-run", "--json")
 	if dryRun.ExitCode != 0 {
 		t.Fatalf("fix dry-run exit=%d\nstdout=%s\nstderr=%s", dryRun.ExitCode, dryRun.Stdout, dryRun.Stderr)
 	}
 	plan := decodeFixPlan(t, dryRun.Stdout)
-	if !hasFixActionKind(plan.Actions, "drop_generated_pending") {
-		t.Fatalf("fix dry-run missing drop_generated_pending:\n%s", dryRun.Stdout)
+	foundGenerated := false
+	for _, action := range plan.Actions {
+		if action.Kind == "drop_generated_pending" {
+			foundGenerated = true
+			if action.TrackedCount != 2 || action.PendingCount != 2 {
+				t.Fatalf("generated preview lost native tracked paths or archived membership: %+v", action)
+			}
+		}
+	}
+	if !foundGenerated {
+		t.Fatalf("recovery dry-run missing generated cleanup: %s", dryRun.Stdout)
 	}
 
-	apply := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
+	apply := runAcd(t, ctx, env, "support", "recover", "--repo", repo, "--yes", "--json")
 	if apply.ExitCode != 0 {
 		t.Fatalf("fix --yes exit=%d\nstdout=%s\nstderr=%s", apply.ExitCode, apply.Stdout, apply.Stderr)
 	}
@@ -429,6 +243,7 @@ type fixActionProbe struct {
 	BranchRef        string `json:"branch_ref"`
 	BranchGeneration int64  `json:"branch_generation"`
 	PendingCount     int    `json:"pending_count"`
+	TrackedCount     int    `json:"tracked_count"`
 	RequiresForce    bool   `json:"requires_force"`
 	ArchiveOnly      bool   `json:"archive_only"`
 	Applied          bool   `json:"applied"`
@@ -469,15 +284,6 @@ func decodeProductEnvelopeData(t *testing.T, body string, target any) {
 	if err := json.Unmarshal(payload, target); err != nil {
 		t.Fatalf("decode command data: %v\nbody=%s", err, body)
 	}
-}
-
-func hasFixActionKind(actions []fixActionProbe, kind string) bool {
-	for _, a := range actions {
-		if a.Kind == kind {
-			return true
-		}
-	}
-	return false
 }
 
 func findFixActionForSeq(actions []fixActionProbe, kind, seq string) *fixActionProbe {

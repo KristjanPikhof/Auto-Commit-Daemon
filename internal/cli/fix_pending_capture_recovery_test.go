@@ -6,12 +6,13 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-func TestFix_ForcePreservesPendingChainAndRecaptures(t *testing.T) {
+func TestFinishRemovalLegacyRecoveryPreservesLaterCheckpointAndStaging(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
 	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
@@ -77,23 +78,36 @@ func TestFix_ForcePreservesPendingChainAndRecaptures(t *testing.T) {
 	if contents, err := os.ReadFile(filepath.Join(repo, "second-recovery.txt")); err != nil || string(contents) != liveContents {
 		t.Fatalf("recovery replaced later work: %q err=%v", contents, err)
 	}
-	cctx := daemon.CaptureContext{BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: headBefore}
-	if _, err := daemon.BootstrapShadow(ctx, repo, db, cctx); err != nil {
-		t.Fatal(err)
+	assertLaterRecoveryCheckpoint(t, ctx, repo, db, headBefore, "second-recovery.txt", liveContents)
+	if after, err := fileSHA256(filepath.Join(repo, ".git", "index")); err != nil || after != indexBefore {
+		t.Fatalf("checkpoint changed staging: %s/%s err=%v", indexBefore, after, err)
 	}
+}
+
+// A recovery archive preserves the old captured version; subsequent protection
+// saves later live work without reopening the retired event queue.
+func assertLaterRecoveryCheckpoint(t *testing.T, ctx context.Context, repo string, db *state.DB, head, path, contents string) {
+	t.Helper()
 	checker := git.NewIgnoreChecker(repo)
 	defer checker.Close()
-	if _, err := daemon.Capture(ctx, repo, db, cctx, daemon.CaptureOpts{IgnoreChecker: checker, SensitiveMatcher: state.NewSensitiveMatcher()}); err != nil {
-		t.Fatal(err)
-	}
-	pending, err := state.PendingEvents(ctx, db, 0)
+	store := checkpoint.Store{DB: db}
+	_, err := daemon.ProtectWorktree(ctx, repo, db, daemon.CaptureContext{
+		BranchRef: "refs/heads/main", BranchGeneration: 1, BaseHead: head,
+	}, daemon.CaptureOpts{IgnoreChecker: checker, SensitiveMatcher: state.NewSensitiveMatcher(), CheckpointStore: &store})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, event := range pending {
-		if event.Path == "second-recovery.txt" && event.Seq > second {
-			return
-		}
+	projection, err := state.ReadCheckpointProjection(ctx, db.Path(), 1)
+	if err != nil || projection.Latest == nil {
+		t.Fatalf("checkpoint missing: %+v err=%v", projection, err)
 	}
-	t.Fatalf("later work was not recaptured: %+v", pending)
+	body, err := git.Run(ctx, git.RunOpts{Dir: repo}, "show", projection.Latest.CommitOID+":"+path)
+	if err != nil || string(body) != contents {
+		t.Fatalf("later work not protected: %q err=%v", body, err)
+	}
+	var pending int
+	err = db.ReadSQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM capture_events WHERE state=?`, state.EventStatePending).Scan(&pending)
+	if err != nil || pending != 0 {
+		t.Fatalf("checkpoint changed archived pending count: %d err=%v", pending, err)
+	}
 }

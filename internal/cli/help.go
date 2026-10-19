@@ -9,18 +9,18 @@ const rootHelpTemplate = `{{if eq .CommandPath "acd"}}{{with (or .Long .Short)}}
 Commands:
   setup       Safely install or upgrade ACD
   config      Edit global or repository settings
-  status      Show protection, Git publication, and the next step
+  status      Show protection, finish progress, and the next step
   on          Start protecting this repository
   off         Save a final checkpoint and stop protection
   list        Show protection across all enabled repositories
-  commit-all  Protect and publish all current changes
+  finish      Commit protected work when you are ready
   history     Show checkpoints and whether Git contains them
   restore     Preview or bring back a protected checkpoint
   doctor      Explain ACD problems and show how to fix them
   uninstall   Remove ACD and keep protected data by default
 
 Common tasks:
-  Preview publishing all:    acd commit-all --dry-run
+  Finish a change:           acd finish "Explain the completed work"
   Rewrite commit messages:   acd history rewrite --help
   Change settings:           acd config
   Manage repositories:       acd repo --help

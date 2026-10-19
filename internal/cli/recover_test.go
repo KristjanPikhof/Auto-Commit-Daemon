@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -25,18 +24,7 @@ func makeRegisteredGitRepoStateDB(t *testing.T) (repoDir, stateDB string, db *st
 	return repoDir, stateDB, db
 }
 
-func TestRecover_RequiresLegacySafetyFlags(t *testing.T) {
-	repo, _, _ := makeRegisteredGitRepoStateDB(t)
-	var out bytes.Buffer
-	if err := runRecover(context.Background(), &out, repo, false, false, false, true, false); err == nil || !strings.Contains(err.Error(), "pass --auto") {
-		t.Fatalf("runRecover err=%v want --auto refusal", err)
-	}
-	if err := runRecover(context.Background(), &out, repo, true, false, false, true, false); err == nil || !strings.Contains(err.Error(), "without --yes") {
-		t.Fatalf("runRecover err=%v want --yes refusal", err)
-	}
-}
-
-func TestRecover_DryRunDelegatesToReadOnlyFixPlan(t *testing.T) {
+func TestSupportRecover_DryRunDelegatesToReadOnlyFixPlan(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	stageRecoverableBarrierPair(t, context.Background(), repo, db, "refs/heads/main", 1)
 	before, err := fileSHA256(stateDB)
@@ -45,7 +33,7 @@ func TestRecover_DryRunDelegatesToReadOnlyFixPlan(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(context.Background(), &out, repo, true, true, false, true, false); err != nil {
+	if err := runFix(context.Background(), &out, repo, true, false, false, false, true); err != nil {
 		t.Fatalf("runRecover dry-run: %v\n%s", err, out.String())
 	}
 	var plan fixPlan
@@ -64,13 +52,13 @@ func TestRecover_DryRunDelegatesToReadOnlyFixPlan(t *testing.T) {
 	}
 }
 
-func TestRecover_ApplyPreservesStalePairInsteadOfRetargeting(t *testing.T) {
+func TestSupportRecover_ApplyPreservesStalePairInsteadOfRetargeting(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
 	first, _ := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/stale", 9)
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, false, true, true, false); err != nil {
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
 		t.Fatalf("runRecover apply: %v\n%s", err, out.String())
 	}
 	var branchRef, eventState string
@@ -85,7 +73,7 @@ func TestRecover_ApplyPreservesStalePairInsteadOfRetargeting(t *testing.T) {
 	}
 }
 
-func TestRecover_ClearPauseDelegatesExplicitRemoval(t *testing.T) {
+func TestSupportRecover_ClearPauseDelegatesExplicitRemoval(t *testing.T) {
 	repo, _, _ := makeRegisteredGitRepoStateDB(t)
 	markerPath := filepath.Join(repo, ".git", "acd", "paused")
 	if _, err := pausepkg.Write(markerPath, pausepkg.Marker{
@@ -95,7 +83,7 @@ func TestRecover_ClearPauseDelegatesExplicitRemoval(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(context.Background(), &out, repo, true, false, true, true, true); err != nil {
+	if err := runFix(context.Background(), &out, repo, false, true, false, true, true); err != nil {
 		t.Fatalf("runRecover --clear-pause: %v\n%s", err, out.String())
 	}
 	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
@@ -103,7 +91,7 @@ func TestRecover_ClearPauseDelegatesExplicitRemoval(t *testing.T) {
 	}
 }
 
-func TestRecover_QuiescesDaemonAndApplies(t *testing.T) {
+func TestSupportRecover_QuiescesDaemonAndApplies(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
 	first, second := stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
@@ -131,7 +119,7 @@ func TestRecover_QuiescesDaemonAndApplies(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, false, true, true, false); err != nil {
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
 		t.Fatalf("runRecover: %v\n%s", err, out.String())
 	}
 	if quiesceCalls != 1 {
@@ -141,7 +129,7 @@ func TestRecover_QuiescesDaemonAndApplies(t *testing.T) {
 	assertFixEventState(t, ctx, db, second, state.EventStateRecovered)
 }
 
-func TestRecover_DryRunDoesNotBootstrapSchema(t *testing.T) {
+func TestSupportRecover_DryRunDoesNotBootstrapSchema(t *testing.T) {
 	repo, stateDB, db := makeRegisteredGitRepoStateDB(t)
 	if _, err := db.SQL().ExecContext(context.Background(), `DROP TABLE recovery_snapshots`); err != nil {
 		t.Fatalf("drop recovery_snapshots: %v", err)
@@ -155,7 +143,7 @@ func TestRecover_DryRunDoesNotBootstrapSchema(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(context.Background(), &out, repo, true, true, false, true, false); err != nil {
+	if err := runFix(context.Background(), &out, repo, true, false, false, false, true); err != nil {
 		t.Fatalf("runRecover dry-run: %v", err)
 	}
 	after, err := fileSHA256(stateDB)
@@ -176,7 +164,7 @@ func TestRecover_DryRunDoesNotBootstrapSchema(t *testing.T) {
 	}
 }
 
-func TestRecover_DoesNotMutateHEADOrIndex(t *testing.T) {
+func TestSupportRecover_DoesNotMutateHEADOrIndex(t *testing.T) {
 	repo, _, db := makeRegisteredGitRepoStateDB(t)
 	ctx := context.Background()
 	stageRecoverableBarrierPair(t, ctx, repo, db, "refs/heads/main", 1)
@@ -190,7 +178,7 @@ func TestRecover_DoesNotMutateHEADOrIndex(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runRecover(ctx, &out, repo, true, false, true, true, false); err != nil {
+	if err := runFix(ctx, &out, repo, false, true, false, false, true); err != nil {
 		t.Fatalf("runRecover: %v", err)
 	}
 	headAfter, _ := git.RevParse(ctx, repo, "HEAD")

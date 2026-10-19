@@ -186,6 +186,72 @@ func TestRestartRepositoryReplacesManagedWorker(t *testing.T) {
 	}
 }
 
+func TestRepositoryWorkerSurvivesRequestCompletion(t *testing.T) {
+	for _, method := range []string{"maintenance_end", "restart_repository"} {
+		t.Run(method, func(t *testing.T) {
+			if runtime.GOOS == "windows" {
+				t.Skip("requires POSIX processes")
+			}
+			root := t.TempDir()
+			roots := paths.Roots{State: filepath.Join(root, "state"), Share: filepath.Join(root, "share"), Config: filepath.Join(root, "config")}
+			const repositoryID = "0123456789abcdef"
+			registry := central.NewRegistry()
+			registry.Repos = []central.RepoRecord{{Path: "/repo", StateDB: "/repo/state.db", RepositoryID: repositoryID, WorktreeID: "fedcba9876543210"}}
+			if err := central.Save(roots, registry); err != nil {
+				t.Fatal(err)
+			}
+			binary := filepath.Join(root, "worker")
+			if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec /bin/sleep 60\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			workerCtx, stopWorkers := context.WithCancel(context.Background())
+			defer stopWorkers()
+			server := &Server{workerCtx: workerCtx, Roots: roots, BinaryPath: binary, workers: make(map[string]*workerProcess), maintenance: map[string]MaintenanceLease{
+				repositoryID: {RepositoryID: repositoryID, Token: "owner-token", ExpiresAt: time.Now().Add(time.Minute)},
+			}}
+			if method == "restart_repository" {
+				server.maintenance = nil
+			}
+			t.Cleanup(func() {
+				server.shutdownWorkers()
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				if err := server.waitWorkersStopped(ctx); err != nil {
+					server.forceKillWorkers()
+					t.Error(err)
+				}
+			})
+			client, connection := net.Pipe()
+			defer client.Close()
+			done := make(chan struct{})
+			go func() {
+				server.serveConnection(workerCtx, connection)
+				close(done)
+			}()
+			params, _ := json.Marshal(map[string]string{"token": "owner-token"})
+			if err := json.NewEncoder(client).Encode(Request{Version: ProtocolVersion, ID: "worker-lifetime", Method: method, RepositoryID: repositoryID, Params: params}); err != nil {
+				t.Fatal(err)
+			}
+			var response Response
+			if err := json.NewDecoder(client).Decode(&response); err != nil || !response.OK {
+				t.Fatalf("maintenance response=%+v err=%v", response, err)
+			}
+			<-done // The request context has been canceled by serveConnection.
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			if err := server.waitRepositoryWorkerStopped(ctx, repositoryID); err == nil {
+				t.Fatal("successful request killed the replacement worker when its request completed")
+			}
+			stopWorkers()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+			defer shutdownCancel()
+			if err := server.waitRepositoryWorkerStopped(shutdownCtx, repositoryID); err != nil {
+				t.Fatalf("worker survived supervisor cancellation: %v", err)
+			}
+		})
+	}
+}
+
 func TestStopRepositoryWaitsForDisabledWorker(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires POSIX process signals")

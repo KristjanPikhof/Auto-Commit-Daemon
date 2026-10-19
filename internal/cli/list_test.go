@@ -6,16 +6,12 @@ import (
 	"encoding/json"
 	"io"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
-	pausepkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/pause"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 func TestListUseWatchMode(t *testing.T) {
@@ -94,7 +90,7 @@ func TestList_OnceProducesSingleSnapshot(t *testing.T) {
 	if strings.Contains(got, "Updated:") {
 		t.Fatalf("--once should not use watch frames:\n%s", got)
 	}
-	for _, want := range []string{"REPO", "SAFE", "MODE", "QUEUE", "TARGET", "LAST MOVE", "PHASE", "STATUS"} {
+	for _, want := range []string{"REPO", "SAFE", "MODE", "WORK", "TARGET", "LAST MOVE", "PHASE", "STATUS"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected compact table header %q:\n%s", want, got)
 		}
@@ -130,65 +126,6 @@ func TestList_JSONOnTTYUsesOneShot(t *testing.T) {
 	}
 	if !got.OK || got.State != productStateProtected || got.Data.Repos == nil {
 		t.Fatalf("unexpected product envelope: %+v", got)
-	}
-}
-
-func TestSummarizeRepoCountsOnlyLiveClients(t *testing.T) {
-	withIsolatedHome(t)
-	_, dbPath, db := makeRepoStateDB(t)
-	ctx := context.Background()
-	now := time.Now()
-	for _, client := range []state.Client{
-		{SessionID: "expired", Harness: "codex", LastSeenTS: float64(now.Add(-2 * time.Hour).Unix())},
-		{SessionID: "live", Harness: "codex", LastSeenTS: float64(now.Unix())},
-	} {
-		if err := state.RegisterClient(ctx, db, client); err != nil {
-			t.Fatal(err)
-		}
-	}
-	summary, err := summarizeRepo(ctx, dbPath, now, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if summary.clients != 1 {
-		t.Fatalf("live clients=%d, want 1", summary.clients)
-	}
-}
-
-func TestSummarizeRepoIntentWait(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		minPending int
-		reason     string
-		maxWait    int64
-	}{
-		{"batch", 3, "skipped_due_intent_batch_wait", 120},
-		{"settle", 2, "skipped_due_intent_settle_window", 60},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			withIsolatedHome(t)
-			_, dbPath, db := makeRepoStateDB(t)
-			ctx := context.Background()
-			now := time.Now()
-			if err := state.MetaSetMany(ctx, db, map[string]string{
-				"commit.strategy": "intent", "intent.window": "2",
-				"intent.min_pending": strconv.Itoa(tc.minPending), "intent.settle_window": "1m",
-				"intent.max_pending_age": "2m", "intent.defer_limit": "1",
-			}); err != nil {
-				t.Fatal(err)
-			}
-			appendIntentPendingEvent(t, ctx, db, "a.go", float64(now.Unix())-10)
-			appendIntentPendingEvent(t, ctx, db, "b.go", float64(now.Unix())-5)
-			summary, err := summarizeRepo(ctx, dbPath, now, time.Minute)
-			if err != nil {
-				t.Fatal(err)
-			}
-			wait := summary.intentWait
-			if wait == nil || wait.reason != tc.reason || wait.visiblePending != 2 || wait.minPending != tc.minPending ||
-				wait.waitSeconds <= 0 || wait.waitSeconds > tc.maxWait {
-				t.Fatalf("intent wait=%+v, want %s with 2/%d captures and 1..%d seconds", wait, tc.reason, tc.minPending, tc.maxWait)
-			}
-		})
 	}
 }
 
@@ -247,14 +184,6 @@ func disableRepoLifecycleForListTest(t *testing.T, roots paths.Roots, repo strin
 	}
 }
 
-func writePauseMarkerForStateDB(t *testing.T, stateDBPath string, marker pausepkg.Marker) {
-	t.Helper()
-	gitDir := filepath.Dir(filepath.Dir(stateDBPath))
-	if _, err := pausepkg.Write(pausepkg.Path(gitDir), marker, true); err != nil {
-		t.Fatalf("write pause marker: %v", err)
-	}
-}
-
 func TestListWatchIntervalFlagParsesGoDuration(t *testing.T) {
 	withIsolatedHome(t)
 
@@ -276,37 +205,5 @@ func TestListWatchIntervalFlagParsesGoDuration(t *testing.T) {
 	cmd.SetArgs([]string{"list", "--watch", "--interval", "250bad"})
 	if err := cmd.Execute(); err == nil {
 		t.Fatal("Execute invalid duration: got nil, want error")
-	}
-}
-
-func TestPauseState_GitDirDerivation_Pinned(t *testing.T) {
-	cases := []struct {
-		name    string
-		stateDB string
-		want    string
-	}{
-		{
-			name:    "unix",
-			stateDB: "/repo/.git/acd/state.db",
-			want:    "/repo/.git",
-		},
-		{
-			name:    "deeper-path",
-			stateDB: "/srv/repos/foo/.git/acd/state.db",
-			want:    "/srv/repos/foo/.git",
-		},
-		{
-			name:    "linked-worktree",
-			stateDB: "/repo/.git/worktrees/wt/acd/state.db",
-			want:    "/repo/.git/worktrees/wt",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := gitDirFromStateDB(tc.stateDB)
-			if got != tc.want {
-				t.Fatalf("gitDirFromStateDB(%q)=%q want %q", tc.stateDB, got, tc.want)
-			}
-		})
 	}
 }

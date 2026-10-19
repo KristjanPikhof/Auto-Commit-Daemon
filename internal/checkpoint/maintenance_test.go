@@ -127,15 +127,21 @@ func TestMaintenanceRefMovementRemainsNeedsAction(t *testing.T) {
 	ctx := context.Background()
 	repo, db := checkpointFixture(t, ctx)
 	store := Store{DB: db}
-	cp, err := store.Create(ctx, Request{RepoRoot: repo, WorktreeID: WorktreeID(repo), Reason: state.CheckpointReasonManualBarrier, ObservationEpoch: 1, CoverageEpoch: 1})
+	blob, err := gitpkg.HashObjectStdinDurable(ctx, repo, []byte("old protected bytes\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	dates := make([]time.Time, DefaultMinimumRetained+1)
+	for i := range dates {
+		dates[i] = time.Now().Add(-60*24*time.Hour + time.Duration(i)*time.Second)
+	}
+	checkpoints := seedPublishedRetentionCheckpoints(t, ctx, store, repo, WorktreeID(repo), blob, dates)
+	cp := Result{Checkpoint: checkpoints[0]}
 	items, err := state.RetentionCheckpoints(ctx, db, WorktreeID(repo))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := state.PrepareCheckpointPrune(ctx, db, items[0], "sha256:"+strings.Repeat("0", 64)); err != nil {
+	if _, err := state.PrepareCheckpointPrune(ctx, db, items[len(items)-1], "sha256:"+strings.Repeat("0", 64)); err != nil {
 		t.Fatal(err)
 	}
 	other, err := gitpkg.CommitTreeDurable(ctx, repo, cp.Checkpoint.TreeOID, "different checkpoint\n", IdentityName, IdentityEmail)

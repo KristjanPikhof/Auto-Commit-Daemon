@@ -30,6 +30,8 @@ func TestMacOSSessionSupervisorStartsWithoutLaunchd(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS session supervisor contract")
 	}
+	env := finishLaunchctlEnv(t, os.Environ())
+	t.Setenv("PATH", envValue(env, "PATH"))
 	root, err := os.MkdirTemp("/tmp", "acd-session-supervisor-")
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +89,8 @@ func TestMacOSCompatibleRuntimeUpgradeRestartsWithoutSetupMigration(t *testing.T
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS session supervisor contract")
 	}
+	env := finishLaunchctlEnv(t, os.Environ())
+	t.Setenv("PATH", envValue(env, "PATH"))
 	root, err := os.MkdirTemp("/tmp", "acd-compatible-upgrade-")
 	if err != nil {
 		t.Fatal(err)

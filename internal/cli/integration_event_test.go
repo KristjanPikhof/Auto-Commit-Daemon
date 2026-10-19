@@ -3,7 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+
 	"errors"
 	"os"
 	"path/filepath"
@@ -14,10 +14,9 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	gitpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-func TestEvaluateIntegrationRepoInactivePathsAreReadOnly(t *testing.T) {
+func TestFinishIntegrationHintsInactivePathsAreReadOnly(t *testing.T) {
 	tests := []struct {
 		name  string
 		state integrationRepoState
@@ -110,7 +109,7 @@ func TestEvaluateIntegrationRepoUsesNearestNestedGitRoot(t *testing.T) {
 	if decision.State != integrationRepoInactiveUnregistered || !central.SameRepoPath(decision.Root, inner) {
 		t.Fatalf("nested decision=%+v", decision)
 	}
-	if err := sendInternalHint(context.Background(), inner, "wake", false, "open", "session", "codex", 0); err != nil {
+	if err := sendInternalHint(context.Background(), inner); err != nil {
 		t.Fatalf("legacy hint should silently skip nested unregistered repo: %v", err)
 	}
 	if pathExists(filepath.Join(inner, ".git", "acd")) {
@@ -246,73 +245,31 @@ func TestEvaluateIntegrationRepoInvalidCanonicalIdentityIsIndeterminate(t *testi
 	}
 }
 
-func TestRunIntegrationEventMapsEachEventToOneSend(t *testing.T) {
-	tests := []struct {
-		event       string
-		wantKind    string
-		wantSession string
-	}{
-		{event: "session_open", wantKind: "wake", wantSession: "open"},
-		{event: "activity", wantKind: "wake", wantSession: "open"},
-		{event: "soft_boundary", wantKind: "soft_boundary"},
-		{event: "logical_boundary", wantKind: "logical_boundary"},
-		{event: "session_close", wantKind: "wake", wantSession: "close"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.event, func(t *testing.T) {
-			calls := 0
-			sender := func(_ context.Context, repo, kind string, drain bool, action, sessionID, harness string, watchPID int) error {
-				calls++
-				if repo != "/repo" || kind != tc.wantKind || drain || action != tc.wantSession ||
-					sessionID != "session" || harness != "opencode" || watchPID != 42 {
-					t.Fatalf("send args repo=%q kind=%q drain=%t action=%q session=%q harness=%q pid=%d",
-						repo, kind, drain, action, sessionID, harness, watchPID)
+func TestFinishIntegrationHintsEveryEventOnlyWakes(t *testing.T) {
+	for harness := range supportedIntegrationHarnesses {
+		for event := range supportedIntegrationEvents {
+			t.Run(harness+"/"+event, func(t *testing.T) {
+				calls := 0
+				sender := func(_ context.Context, repo string) error {
+					calls++
+					if repo != "/repo" {
+						t.Fatalf("unexpected hook repository: %q", repo)
+					}
+					return nil
 				}
-				return nil
-			}
-			err := runIntegrationEventWithSender(context.Background(), bytes.NewReader(nil), integrationEvent{
-				Harness: "opencode", Kind: tc.event, Repo: "/repo", SessionID: "session", WatchPID: 42,
-			}, sender)
-			if err != nil || calls != 1 {
-				t.Fatalf("run=(%v), sends=%d want 1", err, calls)
-			}
-		})
-	}
-}
 
-func TestRepeatedActivityRefreshesOneClient(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "state.db")
-	db, err := state.Open(context.Background(), dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	raw, err := json.Marshal(map[string]any{
-		"session_action": "open",
-		"session_id":     "same-session",
-		"harness":        "codex",
-		"watch_pid":      42,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for range 2 {
-		if err := applyWorkerSessionParams(context.Background(), db, raw); err != nil {
-			t.Fatal(err)
+				err := runIntegrationEventWithSender(t.Context(), strings.NewReader("ignored prompt text"), integrationEvent{Harness: harness, Kind: event, Repo: "/repo", SessionID: "ignored-session", WatchPID: 42}, sender)
+				if err != nil || calls != 1 {
+					t.Fatalf("run=%v calls=%d", err, calls)
+				}
+			})
 		}
 	}
-	exists, count, err := state.ReadClientRegistration(context.Background(), dbPath, "same-session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !exists || count != 1 {
-		t.Fatalf("client exists=%t count=%d want one refreshed client", exists, count)
-	}
 }
 
-func TestRunIntegrationEventFailsOpenAndLogsOnlySessionOpen(t *testing.T) {
+func TestFinishIntegrationHintsFailOpenQuietly(t *testing.T) {
 	_ = withIsolatedHome(t)
-	sender := func(context.Context, string, string, bool, string, string, string, int) error {
+	sender := func(context.Context, string) error {
 		return errors.New("supervisor unavailable")
 	}
 	logPath := harnessHookLogPath("codex")
@@ -338,10 +295,10 @@ func TestRunIntegrationEventFailsOpenAndLogsOnlySessionOpen(t *testing.T) {
 	}
 }
 
-func TestRunIntegrationEventPayloadFailuresFailOpen(t *testing.T) {
+func TestFinishIntegrationHintsPayloadFailuresFailOpen(t *testing.T) {
 	_ = withIsolatedHome(t)
 	senderCalls := 0
-	sender := func(context.Context, string, string, bool, string, string, string, int) error {
+	sender := func(context.Context, string) error {
 		senderCalls++
 		return nil
 	}
@@ -349,8 +306,8 @@ func TestRunIntegrationEventPayloadFailuresFailOpen(t *testing.T) {
 		harness string
 		payload string
 	}{
-		{harness: "codex", payload: `{"cwd":"/repo"}`},
-		{harness: "codex", payload: `{"session_id":"bad\nvalue","cwd":"/repo"}`},
+		{harness: "codex", payload: `{"cwd":42}`},
+		{harness: "codex", payload: `{"cwd":"bad\npath"}`},
 		{harness: "cursor", payload: `{"conversation_id":"session","workspace_roots":["bad\npath"]}`},
 		{harness: "codex", payload: strings.Repeat("x", hookStdinLimit+1)},
 	}
@@ -367,7 +324,7 @@ func TestRunIntegrationEventPayloadFailuresFailOpen(t *testing.T) {
 		t.Fatal("routine malformed payload wrote a hook log")
 	}
 	open := integrationEvent{Harness: "codex", Kind: "session_open"}
-	if err := runIntegrationEventWithSender(context.Background(), strings.NewReader(`{"cwd":"/repo"}`), open, sender); err != nil {
+	if err := runIntegrationEventWithSender(context.Background(), strings.NewReader(`{"cwd":42}`), open, sender); err != nil {
 		t.Fatal(err)
 	}
 	if !pathExists(harnessHookLogPath("codex")) {
@@ -376,7 +333,7 @@ func TestRunIntegrationEventPayloadFailuresFailOpen(t *testing.T) {
 }
 
 func TestRunIntegrationEventRejectsInvalidConfiguration(t *testing.T) {
-	sender := func(context.Context, string, string, bool, string, string, string, int) error { return nil }
+	sender := func(context.Context, string) error { return nil }
 	for _, event := range []integrationEvent{
 		{Harness: "unknown", Kind: "activity", Repo: "/repo", SessionID: "session"},
 		{Harness: "codex", Kind: "unknown", Repo: "/repo", SessionID: "session"},
@@ -387,15 +344,12 @@ func TestRunIntegrationEventRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
-func TestNormalizeIntegrationEventPiPIDFallback(t *testing.T) {
-	event, err := normalizeIntegrationEvent(bytes.NewReader(nil), integrationEvent{
-		Harness: "pi", Kind: "activity", Repo: "/repo", WatchPID: 1234,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if event.SessionID != "pi-1234" {
-		t.Fatalf("session=%q want pi-1234", event.SessionID)
+func TestFinishIntegrationHintsNeedNoSession(t *testing.T) {
+	for harness := range supportedIntegrationHarnesses {
+		event, err := normalizeIntegrationEvent(strings.NewReader("unread prompt"), integrationEvent{Harness: harness, Kind: "activity", Repo: "/repo"})
+		if err != nil || event.Repo != "/repo" || event.SessionID != "" {
+			t.Fatalf("%s: %+v err=%v", harness, event, err)
+		}
 	}
 }
 

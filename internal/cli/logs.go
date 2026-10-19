@@ -85,7 +85,7 @@ func collectLogTail(repo string, lines int) ([]string, string, int64, error) {
 	info, err := os.Stat(logPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, "", 0, fmt.Errorf("acd logs: daemon log missing for repo %s at %s (try `acd start --repo %s` or run `acd doctor`)", abs, logPath, abs)
+			return nil, "", 0, fmt.Errorf("acd logs: daemon log missing for repo %s at %s (try `acd on --repo %s` or run `acd doctor`)", abs, logPath, abs)
 		}
 		return nil, "", 0, fmt.Errorf("acd logs: stat daemon log %s: %w", logPath, err)
 	}

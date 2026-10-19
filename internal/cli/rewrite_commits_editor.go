@@ -3,7 +3,6 @@ package cli
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -208,20 +207,7 @@ func validateEditedRewriteGroups(base state.RewritePlan, groups []state.RewriteP
 }
 
 func validateEditedRewriteMessage(plan state.RewritePlan, group state.RewritePlanGroup) error {
-	if normalizeRewritePlanCommitFormat(plan.CommitFormat) != string(ai.CommitFormatConventional) {
-		return nil
-	}
-	parts := strings.SplitN(strings.TrimSpace(group.ProposedMessage), "\n\n", 2)
-	result := ai.Result{Subject: parts[0]}
-	if len(parts) == 2 {
-		result.Body = parts[1]
-	}
-	last := group.Members[len(group.Members)-1]
-	_, err := ai.ValidateCommitRewriteProposal(ai.CommitRewriteRequest{OldOID: last.OldOID, OriginalMessage: last.OriginalMessage, CommitFormat: ai.CommitFormatConventional}, result)
-	if err != nil {
-		return fmt.Errorf("acd history rewrite: invalid conventional message for group ending at %s: %w", last.OldOID, err)
-	}
-	return nil
+	return finish.ValidateMessage(normalizeRewritePlanCommitFormat(plan.CommitFormat), group.ProposedMessage)
 }
 
 func rewritePlanGroupsEqual(a, b []state.RewritePlanGroup) bool {
@@ -264,42 +250,6 @@ func flattenRewritePlanMemberOIDs(groups []state.RewritePlanGroup) []string {
 	return out
 }
 
-func promptRewriteYesNo(in io.Reader, out io.Writer, question string, defaultYes bool) (bool, error) {
-	if !isInteractiveInput(in) {
-		return false, errors.New("acd history rewrite: interactive prompt required; use --yes, --plan-only, --review/--no-review, or --apply-plan/--apply with --yes/--dry-run for noninteractive use")
-	}
-	suffix := "[y/N]"
-	if defaultYes {
-		suffix = "[Y/n]"
-	}
-	fmt.Fprintf(out, "%s %s ", question, suffix)
-	line, err := bufio.NewReader(in).ReadString('\n')
-	if err != nil && err != io.EOF {
-		return false, err
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	if answer == "" {
-		return defaultYes, nil
-	}
-	return answer == "y" || answer == "yes", nil
-}
-
-func inputOrStdin(in io.Reader) io.Reader {
-	if in != nil {
-		return in
-	}
-	return os.Stdin
-}
-
-func isInteractiveInput(in io.Reader) bool {
-	f, ok := in.(*os.File)
-	if !ok {
-		return true
-	}
-	st, err := f.Stat()
-	return err == nil && (st.Mode()&os.ModeCharDevice) != 0
-}
-
 func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.RewritePlanGroup, bool, error) {
 	initial, err := renderRewritePlanEdit(plan, format)
 	if err != nil {
@@ -338,37 +288,4 @@ func editRewritePlanWithEditor(plan state.RewritePlan, format string) ([]state.R
 		return nil, false, err
 	}
 	return groups, !rewritePlanGroupsEqual(plan.Groups, groups), nil
-}
-
-func persistEditedRewritePlan(ctx context.Context, repo string, plan state.RewritePlan, groups []state.RewritePlanGroup) (state.RewritePlan, error) {
-	if rewritePlanGroupsEqual(plan.Groups, groups) {
-		return plan, nil
-	}
-	if err := validateRewritePlanGroupsInRepo(ctx, repo, groups); err != nil {
-		return state.RewritePlan{}, err
-	}
-	if strings.TrimSpace(plan.ID) == "" {
-		return state.RewritePlan{}, errors.New("acd history rewrite: cannot save edited plan revision without a saved plan id")
-	}
-	dbPath, err := rewriteStateDBPath(ctx, repo)
-	if err != nil {
-		return state.RewritePlan{}, err
-	}
-	db, err := state.Open(ctx, dbPath)
-	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: open state db: %w", err)
-	}
-	defer db.Close()
-	id, err := state.CreateEditedRewritePlanRevision(ctx, db, plan.ID, groups, state.RewritePlanValidationValid)
-	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: save edited plan: %w", err)
-	}
-	updated, ok, err := state.LoadRewritePlan(ctx, db, id)
-	if err != nil {
-		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: load edited plan: %w", err)
-	}
-	if !ok {
-		return state.RewritePlan{}, fmt.Errorf("acd history rewrite: edited plan %q not found after save", id)
-	}
-	return updated, nil
 }

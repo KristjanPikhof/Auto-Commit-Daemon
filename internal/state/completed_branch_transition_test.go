@@ -11,7 +11,7 @@ import (
 const completedBranchTransitionTestDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func TestCompletedBranchTransitionChainRepairOnly(t *testing.T) {
-	db, _ := openTestDB(t)
+	db, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	const (
 		branch     = "refs/heads/main"
@@ -43,7 +43,7 @@ func TestCompletedBranchTransitionChainRepairOnly(t *testing.T) {
 }
 
 func TestCompletedBranchTransitionChainAcceptsNoncontiguousRepartition(t *testing.T) {
-	db, _ := openTestDB(t)
+	db, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	const (
 		branch     = "refs/heads/main"
@@ -69,7 +69,7 @@ func TestCompletedBranchTransitionChainAcceptsNoncontiguousRepartition(t *testin
 		{CandidateID: sql.NullString{String: "candidate-a", Valid: true}, OldOID: source, NewOID: sql.NullString{String: "new-a", Valid: true}},
 		{CandidateID: sql.NullString{String: "candidate-b", Valid: true}, OldOID: "old-b1", NewOID: sql.NullString{String: target, Valid: true}},
 	}
-	applied, err := TransitionIntentRepair(ctx, db, repairID, IntentRepairTransition{
+	applied, err := fixtureTransitionIntentRepair(ctx, db, repairID, IntentRepairTransition{
 		ExpectedStatus: IntentRepairPrepared,
 		Status:         IntentRepairGitApplied,
 		BackupRef: sql.NullString{
@@ -83,7 +83,7 @@ func TestCompletedBranchTransitionChainAcceptsNoncontiguousRepartition(t *testin
 	if err != nil || !applied {
 		t.Fatalf("mark Git-applied=(%t, %v)", applied, err)
 	}
-	completed, err := TransitionIntentRepair(ctx, db, repairID, IntentRepairTransition{
+	completed, err := fixtureTransitionIntentRepair(ctx, db, repairID, IntentRepairTransition{
 		ExpectedStatus: IntentRepairGitApplied,
 		Status:         IntentRepairCompleted,
 		TransitionTS:   3,
@@ -100,7 +100,7 @@ func TestCompletedBranchTransitionChainAcceptsNoncontiguousRepartition(t *testin
 }
 
 func TestCompletedBranchTransitionChainMixedSelfPublicationAndRepair(t *testing.T) {
-	db, _ := openTestDB(t)
+	db, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	const (
 		branch     = "refs/heads/main"
@@ -143,7 +143,7 @@ func TestCompletedBranchTransitionChainMixedSelfPublicationAndRepair(t *testing.
 }
 
 func TestCompletedBranchTransitionChainMissingExternal(t *testing.T) {
-	db, _ := openTestDB(t)
+	db, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 
 	chain, ok, err := CompletedBranchTransitionChain(
@@ -155,7 +155,7 @@ func TestCompletedBranchTransitionChainMissingExternal(t *testing.T) {
 }
 
 func TestCompletedBranchTransitionChainRejectsAmbiguousOutgoing(t *testing.T) {
-	db, _ := openTestDB(t)
+	db, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	const (
 		branch     = "refs/heads/main"
@@ -193,7 +193,7 @@ func TestCompletedBranchTransitionOwnsCheckpointTargetUsesRepairMembers(t *testi
 		{name: "pre-checkpoint legacy repair", legacy: true, checkpointTS: 10, want: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			db, _ := openTestDB(t)
+			db, _ := openLegacyTestDB(t)
 			ctx := context.Background()
 			const (
 				branch     = "refs/heads/main"
@@ -228,7 +228,7 @@ func TestCompletedBranchTransitionOwnsCheckpointTargetUsesRepairMembers(t *testi
 func TestCompletedBranchTransitionOwnsCheckpointTargetIgnoresFrozenRepairClockRollback(
 	t *testing.T,
 ) {
-	db, _ := openTestDB(t)
+	db, _ := openLegacyTestDB(t)
 	ctx := context.Background()
 	const (
 		branch       = "refs/heads/main"
@@ -264,7 +264,7 @@ func completeIntentRepairTransitionWithPendingMember(
 ) int64 {
 	t.Helper()
 	ctx := context.Background()
-	seq, err := AppendCaptureEvent(ctx, db, CaptureEvent{
+	seq, err := fixtureAppendCaptureEvent(ctx, db, CaptureEvent{
 		BranchRef: branch, BranchGeneration: generation,
 		BaseHead: source, Operation: "create", Path: id + ".go",
 		Fidelity: "full", State: EventStatePending,
@@ -273,19 +273,15 @@ func completeIntentRepairTransitionWithPendingMember(
 		t.Fatal(err)
 	}
 	candidateID := "candidate-" + id
-	if err := SaveIntentCandidate(ctx, db, IntentCandidate{
+	if err := fixtureSaveIntentCandidate(ctx, db, IntentCandidate{
 		ID: candidateID, BranchRef: branch, BranchGeneration: generation,
 		Status: IntentCandidateReady, Readiness: IntentReadinessReady,
 		Events: []IntentCandidateEvent{{EventSeq: seq, EventRole: "code"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	members, err := SnapshotIntentRepairMembers(
-		ctx, db, id, branch, generation, []string{candidateID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := SaveIntentRepair(ctx, db, IntentRepair{
+	members := []IntentRepairMember{{RepairID: id, CandidateID: candidateID, EventSeq: seq, PriorState: EventStatePending}}
+	if err := fixtureSaveIntentRepair(ctx, db, IntentRepair{
 		ID: id, BranchRef: branch, BranchGeneration: generation,
 		Status: IntentRepairPrepared, ExpectedHead: source,
 		PlanDigest: completedBranchTransitionTestDigest,
@@ -304,7 +300,7 @@ func completeIntentRepairTransitionWithPendingMember(
 		OldOID:      source,
 		NewOID:      sql.NullString{String: target, Valid: true},
 	}}
-	applied, err := TransitionIntentRepair(ctx, db, id, IntentRepairTransition{
+	applied, err := fixtureTransitionIntentRepair(ctx, db, id, IntentRepairTransition{
 		ExpectedStatus: IntentRepairPrepared,
 		Status:         IntentRepairGitApplied,
 		BackupRef: sql.NullString{
@@ -319,7 +315,7 @@ func completeIntentRepairTransitionWithPendingMember(
 	if err != nil || !applied {
 		t.Fatalf("mark Git-applied=(%t, %v)", applied, err)
 	}
-	completed, err := TransitionIntentRepair(ctx, db, id, IntentRepairTransition{
+	completed, err := fixtureTransitionIntentRepair(ctx, db, id, IntentRepairTransition{
 		ExpectedStatus: IntentRepairGitApplied,
 		Status:         IntentRepairCompleted,
 		TransitionTS:   createdTS + 2,
@@ -359,7 +355,7 @@ func completeIntentRepairTransition(
 		OldOID:      source,
 		NewOID:      sql.NullString{String: target, Valid: true},
 	}}
-	applied, err := TransitionIntentRepair(ctx, db, id, IntentRepairTransition{
+	applied, err := fixtureTransitionIntentRepair(ctx, db, id, IntentRepairTransition{
 		ExpectedStatus: IntentRepairPrepared,
 		Status:         IntentRepairGitApplied,
 		BackupRef: sql.NullString{
@@ -372,16 +368,16 @@ func completeIntentRepairTransition(
 		TransitionTS: createdTS + 1,
 	})
 	if err != nil || !applied {
-		t.Fatalf("TransitionIntentRepair git_applied %s=(%t,%v)",
+		t.Fatalf("fixtureTransitionIntentRepair git_applied %s=(%t,%v)",
 			id, applied, err)
 	}
-	completed, err := TransitionIntentRepair(ctx, db, id, IntentRepairTransition{
+	completed, err := fixtureTransitionIntentRepair(ctx, db, id, IntentRepairTransition{
 		ExpectedStatus: IntentRepairGitApplied,
 		Status:         IntentRepairCompleted,
 		TransitionTS:   createdTS + 2,
 	})
 	if err != nil || !completed {
-		t.Fatalf("TransitionIntentRepair completed %s=(%t,%v)",
+		t.Fatalf("fixtureTransitionIntentRepair completed %s=(%t,%v)",
 			id, completed, err)
 	}
 	stored, ok, err := IntentRepairByID(ctx, db, id)
@@ -414,9 +410,9 @@ func completeSelfPublicationTransition(
 		},
 		Members: []SelfPublicationMember{{EventSeq: seq}},
 	}
-	created, err := PrepareSelfPublication(ctx, db, publication)
+	created, err := fixturePrepareSelfPublication(ctx, db, publication)
 	if err != nil || !created {
-		t.Fatalf("PrepareSelfPublication %s=(%t,%v)", id, created, err)
+		t.Fatalf("fixturePrepareSelfPublication %s=(%t,%v)", id, created, err)
 	}
 	applied, err := MarkSelfPublicationGitApplied(
 		ctx, db, publication, createdTS+1)

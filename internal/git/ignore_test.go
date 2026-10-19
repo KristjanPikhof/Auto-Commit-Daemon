@@ -25,20 +25,23 @@ func writeGitignore(t *testing.T, dir, body string) {
 
 func TestIgnoreCheckerBatchedMatchesPerCall(t *testing.T) {
 	dir := initRepo(t)
-	writeGitignore(t, dir, "*.log\nbuild/\n!keep.log\n")
+	writeGitignore(t, dir, "*.log\nbuild/\n!keep.log\n:(exclude)ignored.txt\n")
 
 	ctx := context.Background()
 	checker := NewIgnoreChecker(dir)
 	t.Cleanup(func() { _ = checker.Close() })
 
 	paths := []string{
-		"src/main.go", // not ignored
-		"app.log",     // ignored (*.log)
-		"keep.log",    // not ignored (negation)
-		"build/x.o",   // ignored (build/)
-		"README.md",   // not ignored
+		"src/main.go",           // not ignored
+		"app.log",               // ignored (*.log)
+		"keep.log",              // not ignored (negation)
+		"build/x.o",             // ignored (build/)
+		"README.md",             // not ignored
+		":(exclude)config.go",   // ordinary eligible filename
+		":(exclude)ignored.txt", // ordinary ignored filename
+		"*.txt",                 // wildcard is a literal filename
 	}
-	want := []bool{false, true, false, true, false}
+	want := []bool{false, true, false, true, false, false, true, false}
 
 	got, err := checker.Check(ctx, paths)
 	if err != nil {

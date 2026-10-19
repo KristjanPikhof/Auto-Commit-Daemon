@@ -23,9 +23,6 @@ func prepareControlRepository(ctx context.Context, lookup controlRepoLookup) (co
 	if !needsPreparation {
 		return lookup, nil, nil
 	}
-	if err := ensureAttachedHEAD(ctx, lookup.Worktree.Root); err != nil {
-		return lookup, nil, err
-	}
 	if err := git.DurabilitySupport(ctx, lookup.Worktree.Root); err != nil {
 		return lookup, nil, fmt.Errorf("acd on: Git durability support: %w", err)
 	}

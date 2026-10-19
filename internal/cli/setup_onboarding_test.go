@@ -3,7 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+
 	"errors"
 	"io"
 	"path/filepath"
@@ -12,24 +12,24 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/credentials"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/installer"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/settingsui"
 )
 
-func TestSetupNonInteractiveRequiresExplicitProvider(t *testing.T) {
+func TestSetupNonInteractiveDefaultsToOfflineLocal(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "")
 	cmd := newSetupCommand(false)
 	roots := paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}
-	_, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{}, true, true)
-	if err == nil || !strings.Contains(err.Error(), "requires --provider") {
-		t.Fatalf("missing provider: %v", err)
-	}
-	state, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{Provider: "deterministic"}, true, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Selection.Provider != "deterministic" || state.Configuration.Values[config.FieldDiffEgress] != "false" || state.Credential != "" {
-		t.Fatalf("explicit offline setup changed: %+v", state.Selection)
+	for _, opts := range []setupOnboardingOptions{{}, {Provider: "deterministic"}} {
+		state, err := prepareSetupOnboarding(cmd, roots, opts, true, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.Selection.Strategy != "local" || state.Selection.Provider != "deterministic" || state.Configuration.Values[config.FieldDiffEgress] != "false" || state.Credential != "" {
+			t.Fatalf("offline setup changed: %+v", state.Selection)
+		}
 	}
 }
 
@@ -75,43 +75,14 @@ func TestSetupRepositoryConsentIsSeparateAndReportsPartialSuccess(t *testing.T) 
 	}
 }
 
-func TestSetupDryRunRecommendsEverydayAIWithoutCredentials(t *testing.T) {
-	t.Setenv(ai.EnvAPIKey, "")
-	cmd := newSetupCommand(false)
-	cmd.SetIn(strings.NewReader(""))
-	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetErr(&bytes.Buffer{})
-	state, err := prepareSetupOnboarding(cmd, paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}, setupOnboardingOptions{}, true, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	values := state.Configuration.Values
-	if values[config.FieldCommitStrategy] != "intent" ||
-		values[config.FieldCommitPreset] != "balanced" ||
-		values[config.FieldCommitFormat] != "imperative" ||
-		values[config.FieldProvider] != "openai-compat" ||
-		values[config.FieldModel] != "gpt-6-luna" ||
-		values[config.FieldDiffEgress] != "true" ||
-		values[config.FieldIntentRepairEnabled] != "true" {
-		t.Fatalf("fresh values = %+v", values)
-	}
-	body, err := json.Marshal(state.Configuration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(body), "API_KEY") || strings.Contains(string(body), "sk-") {
-		t.Fatalf("serialized setup contains credential material: %s", body)
-	}
-}
-
-func TestSetupDryRunOpenAIIncludesPublicConsents(t *testing.T) {
+func TestSetupDryRunIntentIncludesExactTransportConsents(t *testing.T) {
 	t.Setenv(ai.EnvAPIKey, "")
 	cmd := newSetupCommand(false)
 	cmd.SetIn(strings.NewReader(""))
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	state, err := prepareSetupOnboarding(cmd, paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}, setupOnboardingOptions{
-		Experience: "everyday", CommitFormat: "conventional",
+		Strategy: "intent", CommitFormat: "conventional",
 		Provider: "openai-compat", BaseURL: "http://gateway.example/v1/", Model: "model-one",
 	}, true, false)
 	if err != nil {
@@ -123,10 +94,11 @@ func TestSetupDryRunOpenAIIncludesPublicConsents(t *testing.T) {
 	want := map[ai.ConfirmationRequirement]bool{
 		ai.ConfirmationEndpointCredentials:         true,
 		ai.ConfirmationInsecureEndpointCredentials: true,
-		ai.ConfirmationDiffEgress:                  true,
-		ai.ConfirmationIntentRepair:                true,
 	}
 	for _, confirmation := range state.Configuration.Confirmations {
+		if confirmation == ai.ConfirmationDiffEgress {
+			t.Fatal("fresh setup authorized default diff transmission")
+		}
 		delete(want, confirmation)
 	}
 	if len(want) != 0 {
@@ -134,6 +106,9 @@ func TestSetupDryRunOpenAIIncludesPublicConsents(t *testing.T) {
 	}
 	if state.Configuration.Values[config.FieldCommitFormat] != "conventional" {
 		t.Fatalf("commit format = %q", state.Configuration.Values[config.FieldCommitFormat])
+	}
+	if state.Configuration.Values[config.FieldDiffEgress] != "false" {
+		t.Fatal("fresh setup enabled diff egress")
 	}
 }
 
@@ -154,11 +129,10 @@ func TestSetupNonTTYUsesAccessibleWizard(t *testing.T) {
 		opts settingsui.ConfigureWizardOptions,
 	) (settingsui.ConfigureSelection, error) {
 		accessible = opts.Accessible
-		if opts.Defaults[config.FieldProvider] != "openai-compat" {
-			t.Fatal("fresh setup did not recommend AI")
+		if opts.Defaults[config.FieldProvider] != "deterministic" || opts.Defaults[config.FieldCommitStrategy] != "local" || opts.Defaults[config.FieldCommitFormat] != "imperative" {
+			t.Fatalf("fresh accessible setup lost offline defaults: %+v", opts.Defaults)
 		}
 		selection := configureSelectionFromValues(opts.Defaults)
-		selection.Provider = "deterministic"
 		return selection, nil
 	}
 
@@ -189,10 +163,105 @@ func TestSetupRejectsUnsafeEndpointBeforeProviderCall(t *testing.T) {
 		"ftp://example.test/v1",
 	} {
 		_, err := prepareSetupOnboarding(cmd, paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}, setupOnboardingOptions{
-			Provider: "openai-compat", BaseURL: endpoint, Model: "model-one",
+			Strategy: "intent", Provider: "openai-compat", BaseURL: endpoint, Model: "model-one",
 		}, true, false)
 		if err == nil {
 			t.Fatalf("unsafe endpoint accepted: %s", endpoint)
 		}
+	}
+}
+
+func TestSetupPlanCredentialSummary(t *testing.T) {
+	for _, tc := range []struct {
+		name, strategy, provider, want string
+		source                         credentials.Source
+		store                          bool
+	}{
+		{name: "local", strategy: "local", provider: "deterministic", want: "Credential: not needed for Local mode."},
+		{name: "missing", strategy: "intent", provider: "openai-compat", want: "Credential: required; interactive setup will ask for an API key", source: credentials.SourceNone},
+		{name: "saved", strategy: "intent", provider: "openai-compat", want: "Credential: reuse the protected user credential file.", source: credentials.SourceFile},
+		{name: "new", strategy: "intent", provider: "openai-compat", want: "Credential: stored in the protected user credential file with mode 0600.", source: credentials.SourceFile, store: true},
+		{name: "environment", strategy: "intent", provider: "openai-compat", want: "Credential: ACD_AI_API_KEY from the environment.", source: credentials.SourceEnvironment},
+		{name: "subprocess", strategy: "intent", provider: "subprocess:acd-ai", want: "Credential: not needed for this provider."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newSetupCommand(false)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			plan := installer.Plan{Configuration: &installer.SetupConfiguration{Values: map[string]string{
+				config.FieldCommitStrategy: tc.strategy, config.FieldProvider: tc.provider,
+			}, CredentialSource: tc.source, StoreCredential: tc.store}}
+			if err := renderSetupPlan(cmd, plan, false); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("credential guidance missing %q:\n%s", tc.want, out.String())
+			}
+		})
+	}
+}
+
+func TestSetupDryRunMissingCredentialRemainsMissing(t *testing.T) {
+	t.Setenv(ai.EnvAPIKey, "")
+	cmd := newSetupCommand(false)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	state, err := prepareSetupOnboarding(cmd, paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}, setupOnboardingOptions{Strategy: "intent", Provider: "openai-compat"}, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Configuration.CredentialSource != credentials.SourceNone || state.Configuration.StoreCredential || state.Credential != "" {
+		t.Fatalf("preview invented a saved credential: %+v", state.Configuration)
+	}
+	if err := renderSetupPlan(cmd, installer.Plan{Configuration: &state.Configuration}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Credential: required;") {
+		t.Fatalf("missing-key preview guidance:\n%s", out.String())
+	}
+}
+
+func TestSetupExistingInstallRejectsFirstSetupOptions(t *testing.T) {
+	roots := withIsolatedHome(t)
+	chdirForTest(t, t.TempDir())
+	if err := config.NewStore(roots).Update(func(doc *config.Document) error {
+		doc.Settings.Global[config.FieldCommitStrategy] = []byte(`"local"`)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := fileSHA256(roots.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range []string{
+		"--strategy=intent", "--commit-format=conventional", "--provider=openai-compat",
+		"--base-url=https://example.test/v1", "--model=example-model", "--ca-file=example.pem",
+		"--credential-stdin", "--confirm-endpoint-credentials", "--confirm-insecure-http", "--confirm-diff-egress",
+	} {
+		t.Run(option, func(t *testing.T) {
+			cmd := newRootCmd()
+			cmd.SetOut(&bytes.Buffer{})
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs([]string{"setup", "--dry-run", "--integrations=none", option})
+			if err := cmd.ExecuteContext(t.Context()); err == nil || !strings.Contains(err.Error(), "use `acd config`") {
+				t.Fatalf("existing setup ignored %s: %v", option, err)
+			}
+		})
+	}
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"setup", "--dry-run", "--json", "--integrations=none"})
+	if err := cmd.ExecuteContext(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	plan := decodeSetupPlanEnvelope(t, out.Bytes())
+	if !plan.ExistingInstall || plan.FreshDefaults || plan.Configuration != nil {
+		t.Fatalf("existing upgrade replaced preferences: %+v", plan)
+	}
+	if after, err := fileSHA256(roots.ConfigPath()); err != nil || after != before {
+		t.Fatalf("setup preview changed existing preferences: %v", err)
 	}
 }

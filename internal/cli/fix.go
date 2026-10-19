@@ -442,6 +442,10 @@ func planUnpublishedChainReconciliation(
 	publicationDrainRuntimeContractAvailable bool,
 	plan *fixPlan,
 ) error {
+	hasCaptures, err := state.LegacyTableExists(ctx, conn, "capture_events")
+	if err != nil || !hasCaptures {
+		return err
+	}
 	decisionExpr := "0"
 	if hasDecisionRecords {
 		decisionExpr = `EXISTS (
@@ -503,7 +507,7 @@ func planUnpublishedChainReconciliation(
       )
 )`
 			queryArgs = append(queryArgs,
-				daemon.PublicationDrainSemanticMessageUnavailableReason)
+				"publication_drain_semantic_message_unavailable")
 		}
 	}
 	queryArgs = append(queryArgs, state.EventStatePending,
@@ -568,7 +572,7 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 				"publication drain for %s generation %d has no provable frozen runtime contract",
 				pair.branchRef, pair.generation))
 			plan.Suggestions = append(plan.Suggestions,
-				"Run `acd fix --force --dry-run` to review archive-only exact-chain recovery, then `acd fix --force --yes` to apply it without deleting captured work.")
+				"Run `acd support recover --force --dry-run` to review archive-only exact-chain recovery, then `acd support recover --force --yes` to apply it without deleting captured work.")
 			continue
 		}
 		if !pair.hasTerminal && !stalePair && !pair.decisionLed &&
@@ -578,7 +582,7 @@ ORDER BY e.branch_ref, e.branch_generation, e.seq`,
 				"the frozen semantic provider for %s generation %d exhausted its retry backoff",
 				pair.branchRef, pair.generation))
 			plan.Suggestions = append(plan.Suggestions,
-				"Run `acd fix --force --dry-run` to review whole-chain recovery, then `acd fix --force --yes` to preserve it and recapture under the active runtime.")
+				"Run `acd support recover --force --dry-run` to review whole-chain recovery, then `acd support recover --force --yes` to preserve it and recapture under the active runtime.")
 			continue
 		}
 		if !pair.hasTerminal && !stalePair && !pair.decisionLed &&
@@ -710,7 +714,11 @@ func planManualPauseFix(ctx context.Context, gitDir string, plan *fixPlan) error
 }
 
 func planBackpressureFix(ctx context.Context, conn *sql.DB, plan *fixPlan) error {
-	setAt, ok, err := metaLookup(ctx, conn, daemon.MetaKeyCaptureBackpressurePausedAt)
+	hasCaptures, err := state.LegacyTableExists(ctx, conn, "capture_events")
+	if err != nil || !hasCaptures {
+		return err
+	}
+	setAt, ok, err := metaLookup(ctx, conn, "capture.backpressure_paused_at")
 	if err != nil {
 		return fmt.Errorf("acd fix: read backpressure meta: %w", err)
 	}
@@ -773,36 +781,10 @@ func planGeneratedPendingCleanup(ctx context.Context, conn *sql.DB, repo string,
 			EventSeqs:         append([]int64(nil), group.EventSeqs...),
 		})
 		plan.Suggestions = append(plan.Suggestions, fmt.Sprintf(
-			"Generated root %s has %d queued delete(s) and %d tracked file(s); `acd fix --repo %s --yes` cleans ACD state only. To record the Git cleanup, review `git status -- %s`, then run `git add -u -- %s` and `git commit -m \"Remove tracked generated cache files\"`.",
+			"Generated root %s has %d queued delete(s) and %d tracked file(s); `acd support recover --repo %s --yes` cleans ACD state only. To record the Git cleanup, review `git status -- %s`, then run `git add -u -- %s` and `git commit -m \"Remove tracked generated cache files\"`.",
 			group.Root, group.PendingCount, trackedCount, plan.Repo, group.Root, group.Root))
 	}
 	return nil
-}
-
-func loadFixCaptureOps(ctx context.Context, conn *sql.DB, seq int64) ([]state.CaptureOp, error) {
-	rows, err := conn.QueryContext(ctx, `
-SELECT event_seq, ord, op, path, old_path,
-       before_oid, before_mode, after_oid, after_mode, fidelity
-FROM capture_ops
-WHERE event_seq = ?
-ORDER BY ord ASC`, seq)
-	if err != nil {
-		return nil, fmt.Errorf("acd fix: query capture ops for event %d: %w", seq, err)
-	}
-	defer rows.Close()
-	var ops []state.CaptureOp
-	for rows.Next() {
-		var op state.CaptureOp
-		if err := rows.Scan(&op.EventSeq, &op.Ord, &op.Op, &op.Path, &op.OldPath,
-			&op.BeforeOID, &op.BeforeMode, &op.AfterOID, &op.AfterMode, &op.Fidelity); err != nil {
-			return nil, fmt.Errorf("acd fix: scan capture op for event %d: %w", seq, err)
-		}
-		ops = append(ops, op)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("acd fix: iterate capture ops for event %d: %w", seq, err)
-	}
-	return ops, nil
 }
 
 func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
@@ -1009,7 +991,6 @@ func applyFixPlan(ctx context.Context, stateDB string, plan *fixPlan) error {
 		if err := removePlannedPauseMarker(plan); err != nil {
 			return err
 		}
-		stampManualPauseResume(ctx, plan.GitDir)
 		for i := range plan.Actions {
 			if plan.Actions[i].Kind == fixActionClearExpiredManualPause {
 				plan.Actions[i].Applied = true
@@ -1027,7 +1008,7 @@ func openFixBackupDB(ctx context.Context, stateDB string) (*sql.DB, error) {
 	q := url.Values{}
 	q.Add("mode", "rw")
 	q.Add("_pragma", "busy_timeout(5000)")
-	conn, err := sql.Open("sqlite", "file:"+stateDB+"?"+q.Encode())
+	conn, err := sql.Open("sqlite", paths.DatabaseURI(stateDB, q))
 	if err != nil {
 		return nil, fmt.Errorf("acd fix: open state.db for pre-migration backup: %w", err)
 	}
@@ -1250,7 +1231,7 @@ func applyFixAction(ctx context.Context, tx *sql.Tx, action fixAction, nowSec fl
 		return 0, nil
 	case fixActionClearDrainedBackpressure:
 		var changed int64
-		res, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, daemon.MetaKeyCaptureBackpressurePausedAt)
+		res, err := tx.ExecContext(ctx, `DELETE FROM daemon_meta WHERE key = ?`, "capture.backpressure_paused_at")
 		if err != nil {
 			return 0, fmt.Errorf("acd fix: clear backpressure: %w", err)
 		}

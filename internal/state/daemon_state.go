@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"os"
 	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 // DaemonState is the singleton row in the daemon_state table (§6.1). There is
@@ -47,7 +49,7 @@ func LoadDaemonStateReadOnly(ctx context.Context, dbPath string) (DaemonState, b
 	q := url.Values{}
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("mode", "ro")
-	conn, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	conn, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return DaemonState{}, false, fmt.Errorf("state: open state.db read-only: %w", err)
 	}

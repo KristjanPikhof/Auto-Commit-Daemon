@@ -43,7 +43,7 @@ func TestConfigDocumentPreservesKnownAndUnknownFields(t *testing.T) {
 }
 
 func TestConfigDocumentRejectsMalformedAndNewerVersion(t *testing.T) {
-	for _, body := range []string{``, `{`, `{} {}`, `{"version":2}`} {
+	for _, body := range []string{``, `{`, `{} {}`, `{"version":3}`} {
 		if _, err := ParseDocument([]byte(body)); err == nil {
 			t.Fatalf("ParseDocument(%q) succeeded", body)
 		}
@@ -122,7 +122,7 @@ func TestConfigStoreConcurrentWritersPreserveUpdatesAndPermissions(t *testing.T)
 			defer wg.Done()
 			errCh <- store.Update(func(doc *Document) error {
 				doc.Settings.Profiles[fmt.Sprintf("profile-%02d", i)] = Profile{
-					Fields: Overrides{FieldIntentWindow: json.RawMessage(fmt.Sprintf("%d", i+1))},
+					Fields: Overrides{FieldModel: rawString(fmt.Sprintf("model-%d", i+1))},
 				}
 				return nil
 			})
@@ -276,7 +276,7 @@ func TestConfigStoreExpectedGenerationRejectsStaleWriter(t *testing.T) {
 
 func TestResolvePrecedenceAndShadowedEnvironment(t *testing.T) {
 	input := ResolveInput{
-		Experiment: Overrides{FieldModel: rawString("experiment")},
+		Draft:      Overrides{FieldModel: rawString("draft")},
 		Repository: Overrides{FieldModel: rawString("repository")},
 		Profile:    Overrides{FieldModel: rawString("profile")},
 		Global:     Overrides{FieldModel: rawString("global")},
@@ -291,11 +291,11 @@ func TestResolvePrecedenceAndShadowedEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.Value != "experiment" || resolved.Source != SourceExperiment || resolved.ShadowedEnvironment == nil || resolved.ShadowedEnvironment.Value != "environment" {
+	if resolved.Value != "draft" || resolved.Source != SourceDraft || resolved.ShadowedEnvironment == nil || resolved.ShadowedEnvironment.Value != "environment" {
 		t.Fatalf("resolved = %#v", resolved)
 	}
 
-	delete(input.Experiment, FieldModel)
+	delete(input.Draft, FieldModel)
 	delete(input.Repository, FieldModel)
 	delete(input.Profile, FieldModel)
 	delete(input.Global, FieldModel)

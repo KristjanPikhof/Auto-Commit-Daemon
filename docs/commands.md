@@ -1,466 +1,323 @@
 # Command reference
 
-## Public root commands
+ACD saves eligible changes continuously to private checkpoints. Run `acd finish`
+when a complete piece of work is ready for local Git commits. Commands never push.
+Source changes do not update the installed CLI or workers; runtime upgrades use
+an explicitly reviewed `acd setup` plan.
 
-`acd` with no subcommand is identical to `acd status`. Root help exposes only:
+## Public commands
 
-| Command | Mutates | Confirmation |
-|---|---|---|
-| `acd config` | Reviewed settings, credentials, and runtime activation requests | Reviews changes and permissions before saving. |
-| `acd setup` | Shared binary, service, configuration, integrations, and enabled repository migrations during an incompatible upgrade | Shows one exact global plan and asks once. |
-| `acd status` | Nothing | None. |
-| `acd on` | Repository desired state through the supervisor | None; idempotent. |
-| `acd off` | Final checkpoint and repository desired state | `--force` only when protection cannot be confirmed. |
-| `acd list` | Nothing | None; live on a TTY and one-shot through a pipe or `--once`. |
-| `acd commit-all` | Checkpoint and normal local Git publication | Preview unless `--yes` is supplied. |
-| `acd history` | Nothing | None. |
-| `acd restore [ID]` | Preview, or working tree after confirmation | Bare command opens a terminal picker; ID route supports scripts. |
-| `acd doctor` | Nothing unless bundle output is requested | Bundle path is explicit. |
-| `acd uninstall` | Supervisor process, Linux service, binary, owned integrations and desired state | Shows a plan; data purge needs a second confirmation. |
+Bare `acd` is `acd status`. These are the public commands and the first-release
+compatibility alias:
 
-## Setup
+| Command | Purpose and mutation boundary |
+|---|---|
+| `acd config` | Review and save global or repository settings and permissions. |
+| `acd setup` | Review installation, integrations, and an explicit runtime upgrade. |
+| `acd status` | Read current protection, branch outcome, and explicit request state. |
+| `acd on` | Enable this worktree and confirm a complete checkpoint. |
+| `acd off` | Save a final checkpoint, disable protection, and stop its worker. |
+| `acd list` | Read the global protection dashboard. |
+| `acd finish [PURPOSE]` | Plan, check, and publish the frozen complete batch locally. |
+| `acd commit-all` | First-release deprecated delegate to finish. |
+| `acd history` | Read saved checkpoints; activity and rewrite are subcommands. |
+| `acd restore [ID]` | Preview a checkpoint restore, then apply after confirmation. |
+| `acd doctor` | Read problems and safe next steps; `--bundle` writes a sanitized archive. |
+| `acd uninstall` | Review removal of owned runtime files; preserve data by default. |
+
+`--repo PATH` resolves a directory inside the selected Git worktree to its root.
+Linked worktrees have separate protection and request identity. Global operations
+such as `list` reject `--repo`; they already operate across repositories.
+
+## Setup, on, and off
 
 ~~~bash
-acd setup
 acd setup --dry-run
-acd setup --integrations=auto
-acd setup --integrations=none
-acd setup --integrations=claude-code,codex
-acd setup --yes --non-interactive --expect-plan sha256:...
-acd setup --repo /path/to/repo
-~~~
-
-Setup is global and works outside Git. The compatibility `--repo` flag does
-not change setup scope. It prints a warning and the exact follow-up command:
-`acd on --repo /path/to/repo`.
-
-`--dry-run` performs no file write, command execution, supervisor or service
-action, provider call, integration change, migration, state open for writing,
-Git ref creation, or secret prompt. Fresh setup asks for an experience, commit
-format, and provider. An OpenAI-compatible provider also asks for the endpoint,
-model, and masked bearer token. The token is tested only after the final review.
-
-Fresh automation must first run `acd setup --dry-run --non-interactive --provider
-deterministic --json` (or explicitly choose `openai-compat`), retain its digest, then
-apply with `--yes --non-interactive --expect-plan`. Use `--experience`,
-`--commit-format`, `--provider`, `--base-url`, `--model`, and `--ca-file` to set
-the reviewed non-secret values. A bearer token may come only from
-`ACD_AI_API_KEY` or `--credential-stdin`. Add the matching confirmation flags
-for endpoint credentials, HTTP, diff egress, and Intent repair when the plan
-requires them.
-
-HTTP endpoints need `--confirm-insecure-http`. HTTP is not encrypted, so the
-token and later requests can be read or changed in transit. Redirects and URLs
-with embedded credentials, query strings, or fragments are refused.
-
-Setup validates the OS, architecture, platform lifecycle, disk space,
-configuration, and integration files. The installation transaction does not grant repository consent. After it
-succeeds, terminal setup offers a separate repository enablement confirmation.
-Unattended setup never grants this consent. During an incompatible upgrade, it checkpoints
-and migrates enabled repositories before committing the global transaction.
-Disabled repository records are preserved and their databases are left
-unchanged until their next `acd on`.
-
-The isolated setup self-test uses its own Git identity in a scratch repository.
-It checkpoints and publishes two small documentation guides, then restores and
-undoes that change to verify the file contents and Git integrity.
-Your global Git identity and repository settings are unchanged.
-
-Existing installations skip first-run questions and keep their current
-settings.
-
-Compatible setup plans inspect only the shared runtime and integrations. They
-do not scan repository databases, rerun migrations, or repeat the isolated
-migration self-test.
-
-## Status
-
-Every human status answers:
-
-1. Is ACD enabled?
-2. Are current eligible changes protected?
-3. Are they published to Git?
-4. Is user action required?
-5. What exact command should run next?
-
-State priority is `off`, `needs_action`, `publishing`, `waiting`, `protected`.
-The independent `protected` boolean may remain true in the middle three
-publication/repair states.
-
-A manual pause or independent safety block stays visible while capture retries.
-Status and list use the same checkpoint progress timestamp to detect stalled
-scans, including scans with no queued captures.
-
-Default status shows `Protection`, `Current changes saved`, `Branch commits`,
-an optional `Recovery` count, and `Next`. `acd status --verbose` adds operational
-detail. Branch publication and recovery preservation are distinct outcomes.
-
-JSON adds `publication_outcome` with nullable `branch_committed`, counts for
-`branch_changes`, `recovered_changes`, and `waiting_changes`, plus `reason_code`
-and `retry_at` when known. `pending_classification` identifies saved bytes
-waiting to enter the capture ledger. Null means unavailable. Existing `published` and
-`checkpoint_published_by_acd` fields are deprecated compatibility fields: their
-existing meaning still includes safely recovered work. History retains its
-old `published` boolean and adds `outcome`, `retained`, and `recovered_events`.
-Snapshots without capture membership report `saved`. Outcome counts for branch
-publication and waiting use the current branch generation; recovery counts
-retain historical preservation evidence. Exact current-branch tree proof permits
-a recovered-and-recaptured snapshot to report commitment without erasing its
-recovery history. If that proof is unavailable, `branch_committed` is null.
-
-If Git changes while AI is evaluating a target, ACD rejects that stale result.
-An exact match with externally committed work can resolve through the recovery
-proof (`recovery_published`). A chain containing both applied and reverted work
-may instead be preserved separately (`recovery_archived`). Neither outcome
-creates a duplicate branch commit or restores files over your edits.
-
-Read-only status falls back to existing v20 SQLite projections when the
-supervisor is unavailable. Mutations never fall back to direct unsupervised
-writes. On macOS, mutating commands first start or reuse the shared per-user
-supervisor. The owner-only socket verifies the peer UID, and the process uses
-the permissions inherited from the application that first started it. If the
-CLI and managed runtime do not match exactly, mutations stop and ask you to run
-`acd setup`.
-
-## On and off
-
-~~~bash
+acd setup
 acd on
 acd off
-acd off --force
 ~~~
 
-`on` first requires an installed, exactly matching managed runtime. It then
-registers an unknown repository, upgrades only that repository when needed,
-enables it, starts a new worker, and verifies a checkpoint before it succeeds.
-It does not migrate or enable any other repository.
+Repeating `acd on` keeps a healthy worker running. It waits for the selected
+worktree to become ready and confirms a complete checkpoint.
 
-`off` requests a complete checkpoint before disabling, then waits for the
-managed worker to stop. If the checkpoint fails, the repository stays enabled
-and the command returns `needs_action`. `--force` accepts disabling without a
-confirmed current checkpoint.
+`on` saves current changes, `finish` creates branch commits from the current
+protected work, and `history rewrite` takes its input from current Git commits.
+Old ACD archive records do not block these commands.
 
-## History and restore
+Setup works outside Git. Fresh setup defaults to Local mode and imperative
+messages, with no API key or connection test required. Intent setup asks for
+its provider settings and any necessary permissions. Ordinary setup and reviewed settings apply do not
+contact the provider. Any separate provider probe requires an explicit request;
+it is not a prerequisite for saving.
+
+For unattended installation, review and retain the exact plan ID first:
+
+~~~bash
+acd setup --dry-run --non-interactive --strategy local --json
+acd setup --yes --non-interactive --expect-plan PLAN_ID --strategy local
+~~~
+
+Use `--integrations auto|none|NAME,...`, `--strategy local|intent`,
+`--commit-format imperative|conventional`, and the provider's `--provider`,
+`--base-url`, `--model`, and `--ca-file` options for the reviewed plan. Bearer
+credentials come from `ACD_AI_API_KEY` or `--credential-stdin`, never a command-line
+secret argument. Intent endpoint access and optional redacted diff transmission
+require their exact permissions. HTTP additionally needs
+`--confirm-insecure-http`; URLs containing credentials, queries, or fragments
+and provider redirects are refused.
+
+Setup preview writes nothing and runs no provider, service, migration, or Git
+mutation. Apply uses the reviewed plan and preserves database backups and private
+provenance during an incompatible upgrade. Disabled repositories keep their old
+state until explicitly activated. Ambiguous legacy publication can remain
+`needs_attention` without blocking current protection, finish, or history rewrite. Current read-only
+commands inspect old records without upgrading them.
+
+Setup installation and repository enablement are separate consent steps.
+After installation, use `acd config` to change the finish mode, provider, or
+credentials. Setup upgrades preserve those settings and reject first-setup
+preference flags rather than ignoring them.
+Compatibility `setup --repo PATH` retains global scope and prints the follow-up
+`acd on --repo PATH`. Unattended setup does not grant repository consent.
+
+On a fresh machine, `on` can bootstrap the missing runtime with offline Local
+defaults, enable the selected worktree, and confirm protection. An existing
+incompatible runtime requires an explicit reviewed `acd setup` upgrade; it is
+not silently replaced. Normal protection uses no AI or project checks
+and creates no new publication request. Startup can recover an already authorized
+prepared publication only through its exact saved branch/index proof. Unknown or
+disabled worktrees are never enabled by hooks. `off` waits for a final complete checkpoint before disabling; failure keeps
+protection enabled. `off --force` explicitly accepts stopping without confirmed
+current coverage. Saved history remains available.
+
+## Finish
+
+~~~bash
+acd finish "Add offline checkout"
+acd finish --message "Update setup guidance"
+acd finish --dry-run
+acd finish --include-staged
+acd finish --retry REQUEST_ID
+~~~
+
+Finish itself authorizes local publication; it needs no `--yes`. Local mode
+creates one complete batch commit without provider or network access. Intent
+uses the approved provider to plan completed goals and valid intermediate trees.
+A provider failure ends this request; it never switches to Local automatically.
+
+The optional quoted purpose supplies context. `--message` supplies the complete
+subject and optional body for one batch commit. Both modes support imperative
+subjects (`Preserve staged content`) and scope-free conventional subjects
+(`fix: preserve staged content`). Change mode or style through reviewed settings.
+
+Each request freezes a fresh complete checkpoint, expected branch/HEAD, target
+tree, settings, and index identity. The entire chain must pass its checks before
+one branch update. Later edits remain protected for a later finish. Detached
+HEAD, conflicts, active Git operations, moved refs, and ambiguous same-branch
+linked worktrees prevent publication without disabling protection. An empty
+finish succeeds without creating a commit; an attached unborn branch can receive
+its first commit.
+
+Ordinary finish refuses staging. `--include-staged` approves only the exact
+current selection, including staged-only bytes and deletions. Unstaged changes
+on those paths remain live for later work. Excluded staged paths are refused.
+Later staging is preserved, including when publication needs crash recovery.
+Finish never checks out candidate trees over your live files.
+
+`--dry-run` plans and checks without moving the branch or index. It can write
+private checkpoints and request evidence and can contact the Intent provider.
+To publish afterward, run a new ordinary finish, which freezes current work.
+
+An identical active request reconnects. A different request reports busy.
+Disconnecting the terminal leaves the bounded request running; status/list show
+its durable result. A worker restart fails an unfinished planning/checking
+attempt without an automatic provider retry. A prepared publication recovers
+only through exact saved branch/index proof.
+
+`--retry ID` retains the failed target and starts one bounded attempt. It accepts
+`--dry-run`, `--repo`, `--json`, and `--quiet`, but rejects a new purpose, message,
+or staged selection. Changed branch/index ownership or approved settings require
+a new finish; retry never absorbs later files. Credentials can be refreshed for
+an explicit attempt with the same approved provider and privacy configuration.
+
+Verification always proves structure and target equality. `none` and
+`structural` do not imply that project tests ran. `fast` and `full` run the
+approved command in isolated candidate trees, under one bounded chain deadline.
+Output reports which checks actually ran. See the
+[finish contract](finish-contract.md) for exact request and safety rules.
+
+### Deprecated commit-all
+
+For the first finish-based release only, `commit-all` remains visible and delegates
+to finish. Bare `commit-all` directs you to finish; it requires `--dry-run` or
+`--yes`. `commit-all --yes` preserves its explicit consent to include the current
+staged selection. It has no separate drain, publication scheduler, or retry loop.
+
+## Status and list
+
+~~~bash
+acd status
+acd status --verbose
+acd list --once
+acd list --all --verbose
+acd list --json
+~~~
+
+Status distinguishes enabled protection, complete eligible coverage, saved work
+still awaiting finish, branch commits, explicit request results, and legacy
+preservation. Protection and worker liveness are separate facts. A failed finish
+can coexist with healthy protection and later saved edits.
+
+List refreshes in a terminal; a pipe or `--once` gives one snapshot. It shows
+recently active repositories and unfinished work; `--all` includes every enabled
+repository. Ctrl-C leaves the last completed dashboard visible.
+`--watch --interval 5s` explicitly streams human snapshots. JSON is
+one-shot and rejects streaming combinations. A bounded read can report unknown
+coverage rather than invent commitment. Historical resolved-work booleans keep
+their deprecated meanings; use `publication_outcome` for current branch,
+checkpoint, finish/history request, and legacy facts.
+
+`acd repo list` is the static registration inventory, including disabled and
+missing entries. Status, list, doctor, and diagnose do not migrate databases,
+resolve credentials, probe providers, or modify registry data.
+
+## Settings
+
+~~~bash
+acd config
+acd config --repo /path/to/repo
+acd config --accessible
+acd config get commit.strategy
+acd config set commit.strategy intent
+acd config set commit.format conventional
+acd config reset commit.format
+acd config credentials status
+~~~
+
+`config` and `config edit` open the same editor, initially at global scope. Use
+its scope menu, `--scope global|repo`, or `--repo PATH`. `--accessible` uses linear
+prompts. The editor rejects `--json`.
+
+`get`, `set`, and `reset` default to repository scope inside Git and global scope
+outside. They accept `--scope repo|profile|global`; profiles use `--profile NAME`.
+`get` shows resolved values and their sources without writing state. `set` and
+`reset` save a draft; follow the returned command to review and apply that scope.
+
+Saving in the editor validates the exact approved settings and permissions and
+applies them synchronously. It runs no provider probe or project command.
+A separate provider probe requires an explicit request. In-flight finish requests keep their
+frozen approved revision; the next request uses newly applied settings.
+Credential status never prints the token; `set` prompts securely and `remove`
+removes the protected stored credential. Local mode needs no credential.
+
+## History, rewrite, and restore
 
 ~~~bash
 acd history
-acd history --activity
+acd history activity
 acd history explain
-acd history rewrite
-acd restore cp-...
-acd restore cp-... --yes
-~~~
-
-Creating a new rewrite plan requires Intent mode and an explicitly configured
-non-deterministic AI provider that can plan commits. Showing, editing, or
-applying an existing saved plan makes no new AI call.
-
-History rewrite groups adjacent commits by intent unless you pass
-`--messages-only`. Its preview shows the selected and resulting commit counts,
-group membership, messages, and grouping reasons before any history changes.
-
-Use `--new-branch` when original commits mixed goals or interleaved related
-work. This reconstruction uses exact recorded path versions and preserves the
-original branch:
-
-~~~bash
-acd history rewrite --last 30 --new-branch feature-goals --plan-out goals.json
+acd history rewrite --last 5 --plan-out goals.json
 acd history rewrite --show-plan goals.json
 acd history rewrite --apply goals.json --dry-run
 acd history rewrite --apply goals.json --yes
-acd history rewrite --show-plan goals.json
+acd restore CHECKPOINT_ID
+acd restore CHECKPOINT_ID --yes
 ~~~
 
-Apply queues the reviewed plan for the active worker. Capture continues while
-it checks each proposed tree using the repository's approved verification.
-`status` and `list` show `history-reconstruct`; `--show-plan` reports completion
-or the failure reason. The source branch is unchanged, so select the new branch
-when ready. Reconstruction plans are immutable; generate a new plan to change
-them. Legacy adjacent-commit plans still support `--edit`.
+History reads completed checkpoints. Activity/explain also retain readable old
+provenance. A saved snapshot is not evidence that its changes were committed.
 
-Showing or previewing a plan does not migrate state. `--plan-out` can create a
-standalone preview before runtime setup. Apply requires a worker with the new
-reconstruction protocol and matching schema; an older worker is rejected
-without changing its database.
+Rewrite is explicit in both modes. Local uses deterministic existing order and
+grouping; Intent uses bounded goal planning. Selection is contiguous linear
+history with `--last`, `--from-sha`, `--from-nr`, `--range-sha`, or `--range-nr`.
+`--messages-only` keeps one output per selected commit. `--new-branch NAME`
+reconstructs onto a new branch while preserving the source. Saved-plan show
+makes no provider call. Apply checks exact saved evidence, author boundaries,
+per-commit trees, final tree, source backup, and native index ownership.
+Plans are rejected when stale; preview never authorizes apply. See
+[history rewrite](rewrite-commits.md) for plan editing and recovery limits.
 
-Checkpoint prefixes are accepted only when unique. Restore is full-checkpoint
-only. Preview reports create, modify, delete, mode, symlink, untracked-overwrite
-and staged-overlap counts. Apply revalidates the plan digest, `HEAD` token,
-worktree identity, index digest, and target ref.
+Restore accepts a unique checkpoint prefix. Bare restore in a terminal opens a
+picker; outside a terminal, supply an ID. Preview reports changed paths and
+staged overlaps. Apply revalidates the preview, creates an undo checkpoint, and
+preserves HEAD and native staging. It changes live files only after confirmation.
+Restore never runs finish automatically. Partial snapshots cannot be restored
+as complete worktree states.
 
-Bare `acd restore` in a terminal lists completed checkpoints. Select one to see
-changed files, confirm, and receive an undo checkpoint command. The picker and
-ID route share preview, overlap, staging-preservation, and stale-plan checks.
-Outside a terminal, supply an ID from `acd history`; no restore is applied.
-
-## Repository dashboard and commit-all
-
-~~~bash
-acd list
-acd list --once
-acd list --all
-acd list --verbose
-acd list --watch --interval 5s
-acd list --json
-acd commit-all --dry-run
-acd commit-all --yes
-~~~
-
-`list` shows enabled repositories with activity in the last hour, plus any
-repository with unfinished work. Activity includes agent hooks, captured edits,
-publication progress, commit-all requests, and applied history rewrites.
-Worker heartbeats, setup/readiness checkpoints and background maintenance do
-not count as activity. Slow detail checks keep known activity and unfinished
-work visible.
-
-A read that exceeds its time budget shows `refreshing`, with unknown protection
-marked as `protection_unknown` in JSON. A later successful read shows the current
-queue and publication phase.
-
-A repository with pending, blocked, stalled, or incompletely protected work
-stays visible until that work is resolved. An otherwise idle repository drops
-out after one hour, including repositories with maintenance warnings or a
-manual pause. There is no fixed row limit or filler from older repositories.
-
-The first snapshot sorts by recent activity. A terminal refreshes rows in place
-until Ctrl-C and appends newly active repositories. Use `--once` for one snapshot,
-`--all` for every enabled repository, and `--verbose` for worker, tool, blocker,
-last commit, maintenance error, and recovery details. `list` works globally
-from any directory. An empty compact view says `No active repositories`.
-
-`SAFE` confirms that the latest checkpoint is complete. `MODE` shows the
-configured commit strategy. `QUEUE` counts all pending work. `TARGET` appears
-for the bounded remainder of `commit-all` or automatic Intent recovery; it does
-not mean the strategy changed. `LAST MOVE` is the age of durable queue
-progress, not the worker heartbeat. `PHASE` distinguishes an ordinary Intent
-countdown from planning, publication, retry, and automatic recovery.
-`capture-retry` means readable work is saved while files stabilize;
-`capture-blocked` means current eligible coverage remains incomplete.
-`provider-wait` includes the retry countdown, `provider-call` means the retry
-request is in flight, and `verifying` means the approved repository check is
-running. A dash means that field does not apply or could not be read during
-that frame.
-
-| Status | Meaning |
-|---|---|
-| `healthy` | Protection is complete and no work is pending. |
-| `working` | ACD is checkpointing, planning, publishing, validating, starting, or retrying; `PHASE` gives the exact activity. |
-| `waiting` | Protected work is waiting for the countdown or safe condition shown in `PHASE`. |
-| `stalled` | The worker is responsive, but the queue or checkpoint scan has not made durable progress within the bounded threshold. ACD keeps retrying or recovering automatically; no action is needed unless the status changes to `needs action`. |
-| `paused` | Protection and publication are manually paused. |
-| `needs action` | A failure or safety block requires attention. |
-
-JSON remains exhaustive regardless of the compact view. It keeps the existing
-fields and adds `worker_state`, `operational_state`, `blocked_events`,
-`last_activity_at`, `publication_drain`, `unfinished_work`, and
-`checkpoint_maintenance`, and `capture_health`. Capture health includes failure
-onset, progress, affected-path samples, and the next retry, even with an empty
-queue. Maintenance details distinguish a failed check from
-measured storage use and include the next scheduled attempt.
-A needs-action result is printed
-before exit code 3 is returned. Human compact snapshots use only visible
-repositories to decide that exit status; `--all` and JSON use the exhaustive
-result. Hidden idle warnings do not fail a compact snapshot.
-
-Disabled, missing, and stale registration records remain available under hidden
-`acd repo list`. That command is the static maintenance inventory and does not
-refresh automatically.
-
-Before confirmation, `commit-all` lists changed paths, staged content, and
-already queued paths. The lists may overlap. Included staging is consumed only
-after checkpoint protection; ordinary background publication preserves staging.
-Interactive approval is rechecked against paths, queued work, and staging. The
-worker also checks every path in the frozen checkpoint target, including rename
-endpoints. If an unreviewed path arrives while checkpointing, the command shows
-a refreshed preview and asks again before creating a publication request or
-consuming staging. Further edits to already reviewed paths can enter that
-checkpoint. `--yes` accepts the current checkpoint scope without an interactive
-path review.
-Immediately before consuming staging, the worker locks the Git index and checks
-its saved approval identity. If you staged something else while it waited, ACD
-preserves that selection and asks you to review commit-all again. This check
-also survives a worker restart. Older requests without a saved staging identity
-require a new review before consuming staging.
-A fresh approval preserves the old request's captured work separately and
-recaptures the current files for a new target. The old staging approval stays
-unchanged; it is never reused to consume a newer selection.
-
-`commit-all` first completes a durable checkpoint, records the highest event
-sequence covered by the barrier, and drains only that bounded target through
-the managed worker. Later edits cannot extend the wait. Event mode may create
-one commit per capture; Intent mode may create several semantically atomic
-commits. The command never combines everything into one commit merely because
-of its name. If the terminal disconnects or the worker restarts, publication
-continues and the next `acd commit-all --yes` reconnects to the same drain.
-While waiting, the command follows that exact run even when newer work creates
-another run.
-This is a priority request: ACD interrupts background planning and reviews the
-protected target immediately. It brings an existing goal-review deadline
-forward once, without relaxing commit quality. For the first five minutes,
-planning corrections retry after 30, 60, then 90 seconds. Longer waits return
-to the background schedule. Provider outages retain their retry schedule.
-If the worker socket is unavailable, the command can still read the saved
-target and its last error. A saved active run does not prove that a worker is
-publishing it; worker recovery remains necessary before it can continue.
-Invalid Intent grouping can use the configured retry budget, capped at two
-corrections after the first plan. Repeated no-progress state then enters
-bounded replanning or a safe local unlock. A local group still requires a
-semantic commit message before publication.
-
-ACD can repair missing prerequisite declarations and their order, then resume
-a stopped run after proving that its target is protected. Later corrections
-and documentation reviews can use published work whose recorded version still
-matches Git, including work from a superseded goal. That context is never
-selected for another commit.
-
-Related documentation can form one goal when its added lines describe the same
-behavior. Missing companions require concrete evidence; a completed goal does
-not always need new tests. Protected Go comment updates can clarify a frozen
-goal only when code tokens match, with compiler directives and cgo excluded.
-Those updates remain outside the publication target. All changes still pass
-the [Intent goal and publication checks](intent-commit-flow.md).
-
-The barrier accepts only a completed checkpoint for the requested worktree,
-branch, generation, and observation. A checkpoint from another branch or
-linked worktree is ignored while the worker creates the matching checkpoint.
-
-## Doctor and support
+## Doctor, support, and repository maintenance
 
 ~~~bash
 acd doctor
-acd support diagnose
-acd support logs
-acd support repair
-acd support repair --yes
+acd doctor --bundle
+acd support diagnose --json
+acd support logs --lines 100
 acd support bundle
+acd support repair
+acd support recover --dry-run
+acd repo list
+acd repo remove --dry-run
+acd repo gc
+acd repo stats --since 30d
 ~~~
 
-`doctor` shows the worker's current state, its latest safe error, and a command
-that addresses that error. Start with `acd on` for a stopped or stale managed
-worker. Use the support commands only when doctor asks for them.
-A stopped commit-all run includes its recorded cause. `support diagnose --json`
-reports `needs_action` for that block even when checkpoint protection is healthy.
+Doctor reads saved configuration, worker and watcher facts, coverage, and request
+failures and prints a safe next step. `support logs` is raw local JSONL; review
+paths and contents before sharing. Use `support bundle` for a sanitized archive.
 
-Support repair previews a safely provable interrupted restore and, with
-`--yes`, completes its post-restore checkpoint. It refuses if the working tree
-no longer matches the interrupted restore target.
+Support repair previews a provable interrupted restore; `--yes` completes its
+checkpoint only when current files still match. Support recovery inspects
+preserved legacy work and exact recorded proofs. Any apply is explicitly reviewed;
+it cannot start the retired planner, infer a history rewrite, or replace live
+files or staging to repair a finish failure. New finish retries use `finish
+--retry ID`. Follow the reported remedy for ambiguous legacy attention.
 
-`acd support recover` proves or preserves unpublished work. It also completes
-a stale publication run when every frozen member is already published or
-recovered. Workers perform that completion automatically during startup and
-normal branch recovery; the command is a fallback for a worker that cannot run.
+## Uninstall and compatibility
 
-`acd support recover --force --dry-run` also previews preservation of a queue
-containing only pending work. Apply it with `--force --yes` to save the whole
-captured chain at a private recovery ref and restart capture from current files.
-Recovery keeps the working tree and staging intact. Preserved captures count as
-recovered work; branch commitment is reported separately.
+`acd uninstall --dry-run` previews removal. Apply stops owned workers and removes
+owned integrations, service/binary files, and desired enabled state while
+preserving databases and private refs. Data removal additionally requires
+`--purge-data` and `--confirm-purge-data`. Unattended apply needs
+`--yes --non-interactive --expect-plan PLAN_ID`.
 
-Recovery also reports incomplete capture coverage. With `--yes`, it asks the
-owning worker to retry a checkpoint and returns failure if coverage remains
-incomplete. A no-op check says `checked`, not `applied`. Healthy publication
-state cannot hide a capture failure, and a no-op repair does not claim to restart
-the shared runtime. Use `acd doctor` to see affected eligible paths and retries.
+For a clean start in every registered worktree, preview
+`acd uninstall --dry-run --purge-data`, then apply with
+`acd uninstall --purge-data --confirm-purge-data`. This removes ACD directories
+and databases under Git, all private `refs/acd/` checkpoints and archives, and
+ACD's runtime and registrations. It preserves project branches, tags, commits,
+the index, and working files. Unavailable worktrees are reported rather than
+deleted through an unverified path.
 
-## Uninstall
+Advanced `support` and `repo` namespaces are callable but hidden from root help.
+Internal worker/supervisor/hint entrypoints serve installed integrations.
+Earlier root aliases such as `start`, `stop`, `flush`, `configure`, `logs`, and
+`rewrite-commits` are removed. Use current namespaces. The deprecated
+`commit-all` delegate is the first-release compatibility window, not a second
+engine. `acd --version` reports the CLI version.
 
-~~~bash
-acd uninstall --dry-run
-acd uninstall
-acd uninstall --purge-data
-~~~
+## Flags, JSON, and exits
 
-Default uninstall completes checkpoint barriers, stops workers and the
-supervisor, removes only verified owned integration entries, removes the
-managed Linux service (when present) and binary, disables repositories, and
-preserves every state database and private ref. macOS has no installed service
-file in session mode.
-
-Data purge requires `--purge-data` plus the second
-`--confirm-purge-data` confirmation. Noninteractive apply also requires
-`--yes --non-interactive --expect-plan <digest>`.
-
-## Advanced namespaces
-
-~~~text
-acd config get|set|edit|reset|credentials
-acd support diagnose|logs|repair|recover|prompt|bundle
-acd repo list|remove|gc
-acd history activity|explain|rewrite
-~~~
-
-`config` is listed in root help and opens the settings editor without a subcommand.
-The other advanced namespaces are callable but hidden from root help.
-
-`config` and `config edit` open the same editor, initially at global scope.
-Use the scope menu or `--repo PATH` for repository settings. The editor accepts
-`--scope global|repo` and `--accessible` and rejects `--json`.
-
-`config get|set|reset` default to repository scope inside a worktree and global
-scope outside one. Their `--scope repo|profile|global` flag is explicit. Saved
-command-line changes still need review and activation through the editor.
-
-## Persistent flags
-
-| Flag | Contract |
+| Flag | Meaning |
 |---|---|
-| `--repo PATH` | Resolves a worktree target, or is rejected for global-only operations. |
-| `--json` | Uses the common envelope, or is rejected for interactive TUI operations. |
-| `--quiet` | Suppresses progress but never the final result. |
-| `--log-level LEVEL` | Configures the CLI logger for that invocation only. |
+| `--repo PATH` | Select a worktree; rejected by global-only commands. |
+| `--json` | Emit one machine-readable envelope; rejected by interactive editors and incompatible streaming routes. |
+| `--quiet` | Hide optional progress, preserve the final result. |
+| `--log-level LEVEL` | Set invocation logging to debug, info, warn, or error. |
 
-No accepted persistent flag is silently ignored.
-
-## JSON contract
-
-Every JSON response is written once to stdout, including nonzero exits:
-
-~~~json
-{
-  "ok": true,
-  "state": "protected",
-  "changed": false,
-  "actions": [],
-  "next_action": null,
-  "data": {},
-  "error": null
-}
-~~~
-
-`ok` means the command executed; it does not mean the repository is healthy.
-Errors use `code`, `message`, `retryable`, and redacted `details`. Actions are
-ordered objects with `kind`, `status`, `target`, and `detail`.
+JSON uses `ok`, `state`, `changed`, ordered `actions`, `next_action`, `data`, and
+`error`. Errors contain `code`, safe `message`, `retryable`, and redacted details.
+Request `data.state` is separate from the top-level repository state. Finish
+reports its request/attempt, frozen checkpoint and target, proven publication,
+verification, and failure reason. A saved or completed preview never means
+branch publication. A retryable error requires an explicit attempt.
 
 | Exit | Meaning |
 |---|---|
 | `0` | Completed with no required action. |
 | `1` | Unexpected internal failure. |
-| `2` | Invalid command or flag combination. |
-| `3` | Valid result that requires user action. |
-| `4` | Transient supervisor or worker unavailability. |
+| `2` | Invalid command, arguments, or retry identity. |
+| `3` | Valid result or refused mutation requiring user action. |
+| `4` | Transient worker/provider unavailability or detached result waiting. |
 
-## Compatibility aliases
-
-Aliases are retained for this release and the next, hidden from help, and may
-be removed no earlier than the third checkpoint-first release.
-
-| Old name | Destination |
-|---|---|
-| `configure`, `settings` | `config edit` |
-| `auth` | `config credentials` |
-| `events` | `history activity` |
-| `explain` | `history explain` |
-| `rewrite-commits` | `history rewrite` |
-| `diagnose`, `logs`, `fix`, `recover`, `prompt` | Matching `support` operation |
-| `stats`, `gc` | Matching `repo` operation |
-| `start`, `stop`, `wake`, `touch`, `flush` | Hidden internal session/hint protocol |
-| `daemon run` | Hidden internal worker entrypoint |
-| Hook extractors | Hidden internal integration helpers |
-| `version` | `acd --version` |
-| `setup <integration> --raw` | Hidden `setup integration <name> --print` route |
-
-Manual compatibility calls warn on stderr. Recognized integration calls
-suppress terminal warnings and emit only a rate-limited diagnostic.
-
-Failed JSON recovery commands preserve the reviewed or partial plan in `data`,
-with `ok: false` and a typed error, instead of discarding the plan on failure.
+See [settings](settings.md), [providers and privacy](ai-providers.md), and
+[user workflows](user-workflows.md) for detailed examples.

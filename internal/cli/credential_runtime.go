@@ -83,21 +83,14 @@ func refreshCredentialRuntime(ctx context.Context, out io.Writer, roots paths.Ro
 			return fmt.Errorf("credential saved, but active setting %s cannot be preserved; use acd config edit", key)
 		}
 	}
-	tested, err := service.TestProvider(ctx, values, confirmations)
-	if err != nil {
-		return err
-	}
-	if !tested.Success {
-		return errors.New("credential probe did not succeed; active runtime settings were preserved")
-	}
 	applied, err := service.Apply(ctx, settings.ApplyRequest{
-		Values: values, Confirmations: confirmations, TestedFingerprint: tested.Fingerprint,
+		Values: values, Confirmations: confirmations, TestedFingerprint: validated.Fingerprint,
 		ExpectedGeneration: snapshot.SavedGeneration, ExpectedDesiredRevision: snapshot.DesiredRevisionID,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "Credential verified. Runtime revision %d queued for %s; existing settings and approvals are preserved.\n", applied.RevisionID, worktree.Root)
+	fmt.Fprintf(out, "Credential saved. Revision %d applied to %s; existing settings and approvals are preserved.\n", applied.RevisionID, worktree.Root)
 	return nil
 }
 

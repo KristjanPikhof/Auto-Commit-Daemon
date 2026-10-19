@@ -993,8 +993,8 @@ func persistFreshDefaults(roots paths.Roots, repositoryID string, prepareCallbac
 	mutate := func(document *config.Document) error {
 		fields := config.Overrides{}
 		values := map[string]any{
-			config.FieldProvider: "deterministic", config.FieldCommitStrategy: "intent", config.FieldCommitPreset: "fast",
-			config.FieldIntentVerification: "structural", config.FieldIntentRepairEnabled: false, config.FieldDiffEgress: false,
+			config.FieldProvider: "deterministic", config.FieldCommitStrategy: "local", config.FieldCommitFormat: "imperative",
+			config.FieldIntentVerification: "none", config.FieldDiffEgress: false,
 		}
 		for key, value := range values {
 			body, _ := json.Marshal(value)
@@ -1018,8 +1018,8 @@ func persistFreshGlobalDefaults(roots paths.Roots, prepareCallbacks ...func([]by
 	}
 	mutate := func(document *config.Document) error {
 		values := map[string]any{
-			config.FieldProvider: "deterministic", config.FieldCommitStrategy: "intent", config.FieldCommitPreset: "fast",
-			config.FieldIntentVerification: "structural", config.FieldIntentRepairEnabled: false, config.FieldDiffEgress: false,
+			config.FieldProvider: "deterministic", config.FieldCommitStrategy: "local", config.FieldCommitFormat: "imperative",
+			config.FieldIntentVerification: "none", config.FieldDiffEgress: false,
 		}
 		for key, value := range values {
 			body, _ := json.Marshal(value)

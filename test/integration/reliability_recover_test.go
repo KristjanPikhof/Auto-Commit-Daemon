@@ -17,6 +17,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 func TestFixArchivesIncidentFixtureWithoutRetargeting(t *testing.T) {
@@ -33,12 +34,12 @@ func TestFixArchivesIncidentFixtureWithoutRetargeting(t *testing.T) {
 		if strings.HasPrefix(kv, "HOME=") ||
 			strings.HasPrefix(kv, "XDG_STATE_HOME=") ||
 			strings.HasPrefix(kv, "XDG_DATA_HOME=") ||
-			strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
+			strings.HasPrefix(kv, "XDG_CONFIG_HOME=") || strings.HasPrefix(kv, "ACD_") {
 			continue
 		}
 		env = append(env, kv)
 	}
-	env = append(env, "HOME="+home, "XDG_STATE_HOME=", "XDG_DATA_HOME=", "XDG_CONFIG_HOME=")
+	env = finishLaunchctlEnv(t, append(env, "HOME="+home, "XDG_STATE_HOME=", "XDG_DATA_HOME=", "XDG_CONFIG_HOME="))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -49,6 +50,9 @@ func TestFixArchivesIncidentFixtureWithoutRetargeting(t *testing.T) {
 		t.Fatalf("state.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	if err := testutil.InitLegacy(ctx, db); err != nil {
+		t.Fatal(err)
+	}
 	roots, err := paths.Resolve()
 	if err != nil {
 		t.Fatalf("paths.Resolve: %v", err)
@@ -90,7 +94,7 @@ VALUES (last_insert_rowid(), 0, 'create', 'recover.txt', '%s', '100644', 'exact'
 	}
 
 	refsBefore := recoveryRefList(t, repo)
-	dry := runAcd(t, ctx, env, "fix", "--repo", repo, "--dry-run", "--json")
+	dry := runAcd(t, ctx, env, "support", "recover", "--repo", repo, "--dry-run", "--json")
 	if dry.ExitCode != 0 {
 		t.Fatalf("acd fix dry-run exit=%d\nstdout=%s\nstderr=%s", dry.ExitCode, dry.Stdout, dry.Stderr)
 	}
@@ -104,7 +108,7 @@ VALUES (last_insert_rowid(), 0, 'create', 'recover.txt', '%s', '100644', 'exact'
 		t.Fatalf("dry-run mutated recovery refs:\nbefore=%s\nafter=%s", refsBefore, refsAfter)
 	}
 
-	applied := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
+	applied := runAcd(t, ctx, env, "support", "recover", "--repo", repo, "--yes", "--json")
 	if applied.ExitCode != 0 {
 		t.Fatalf("acd fix apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
 	}
@@ -171,12 +175,12 @@ func TestFixLeavesPublishedStaleLiveIndexUntouched(t *testing.T) {
 		if strings.HasPrefix(kv, "HOME=") ||
 			strings.HasPrefix(kv, "XDG_STATE_HOME=") ||
 			strings.HasPrefix(kv, "XDG_DATA_HOME=") ||
-			strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
+			strings.HasPrefix(kv, "XDG_CONFIG_HOME=") || strings.HasPrefix(kv, "ACD_") {
 			continue
 		}
 		env = append(env, kv)
 	}
-	env = append(env, "HOME="+home, "XDG_STATE_HOME=", "XDG_DATA_HOME=", "XDG_CONFIG_HOME=")
+	env = finishLaunchctlEnv(t, append(env, "HOME="+home, "XDG_STATE_HOME=", "XDG_DATA_HOME=", "XDG_CONFIG_HOME="))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -187,6 +191,9 @@ func TestFixLeavesPublishedStaleLiveIndexUntouched(t *testing.T) {
 		t.Fatalf("state.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	if err := testutil.InitLegacy(ctx, db); err != nil {
+		t.Fatal(err)
+	}
 	roots, err := paths.Resolve()
 	if err != nil {
 		t.Fatalf("paths.Resolve: %v", err)
@@ -228,7 +235,7 @@ VALUES (last_insert_rowid(), 0, 'create', 'legacy.txt', '%s', '100644', 'exact')
 		t.Fatalf("inject published fixture: %v\n%s", err, out)
 	}
 
-	applied := runAcd(t, ctx, env, "fix", "--repo", repo, "--yes", "--json")
+	applied := runAcd(t, ctx, env, "support", "recover", "--repo", repo, "--yes", "--json")
 	if applied.ExitCode != 0 {
 		t.Fatalf("acd fix apply exit=%d\nstdout=%s\nstderr=%s", applied.ExitCode, applied.Stdout, applied.Stderr)
 	}

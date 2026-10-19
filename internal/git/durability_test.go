@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -145,6 +146,31 @@ func TestEnsureCheckpointRefRejectsCollision(t *testing.T) {
 	}
 }
 
+func TestFinishWorkerPrivateTargetPin(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	tree, err := WriteTreeDurable(ctx, repo, filepath.Join(t.TempDir(), "target.index"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := CommitTreeDurable(ctx, repo, tree, "finish target", "ACD Checkpoint", "checkpoint@localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := FinishRefPrefix + "worktree/request/target"
+	created, err := EnsurePrivateRefDurable(ctx, repo, FinishRefPrefix, ref, commit)
+	if err != nil || !created {
+		t.Fatalf("create private target=%t error=%v", created, err)
+	}
+	created, err = EnsurePrivateRefDurable(ctx, repo, FinishRefPrefix, ref, commit)
+	if err != nil || created {
+		t.Fatalf("identical pin=%t error=%v", created, err)
+	}
+	if _, err := EnsurePrivateRefDurable(ctx, repo, FinishRefPrefix, "refs/heads/unsafe", commit); err == nil {
+		t.Fatal("target pin escaped its private namespace")
+	}
+}
+
 func TestEnsureCheckpointRefSupportsSHA256Repository(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
@@ -166,5 +192,78 @@ func TestEnsureCheckpointRefSupportsSHA256Repository(t *testing.T) {
 	ref := CheckpointRefPrefix + "0123456789abcdef/cp-1-0123456789abcdef"
 	if created, err := EnsureCheckpointRef(ctx, repo, ref, commit); err != nil || !created {
 		t.Fatalf("EnsureCheckpointRef=(%t,%v)", created, err)
+	}
+}
+
+func TestFinishPrivatePinsRejectSymbolicAliases(t *testing.T) {
+	for _, prefix := range []string{CheckpointRefPrefix, "refs/acd/migration/", FinishRefPrefix} {
+		for _, dangling := range []bool{false, true} {
+			t.Run(prefix+map[bool]string{false: "same-OID", true: "dangling"}[dangling], func(t *testing.T) {
+				repo := initRepo(t)
+				ctx := context.Background()
+				tree, err := WriteTreeDurable(ctx, repo, filepath.Join(t.TempDir(), "pin.index"), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				commit, err := CommitTreeDurable(ctx, repo, tree, "protected pin", "ACD Checkpoint", "checkpoint@localhost")
+				if err != nil {
+					t.Fatal(err)
+				}
+				target := "refs/acd/alias-target"
+				if !dangling {
+					if err := UpdateRef(ctx, repo, target, commit, ""); err != nil {
+						t.Fatal(err)
+					}
+				}
+				ref := prefix + "test/pin"
+				if _, err := Run(ctx, RunOpts{Dir: repo}, "symbolic-ref", ref, target); err != nil {
+					t.Fatal(err)
+				}
+				if created, err := EnsurePrivateRefDurable(ctx, repo, prefix, ref, commit); created || !errors.Is(err, ErrCheckpointRefCollision) {
+					t.Fatalf("symbolic pin accepted: created=%t error=%v", created, err)
+				}
+				called := false
+				if err := WithLockedPrivateRef(ctx, repo, ref, commit, func(context.Context) error { called = true; return nil }); !errors.Is(err, ErrCheckpointRefCollision) || called {
+					t.Fatalf("symbolic pin callback: called=%t error=%v", called, err)
+				}
+				if out, err := Run(ctx, RunOpts{Dir: repo}, "symbolic-ref", "--no-recurse", ref); err != nil || strings.TrimSpace(string(out)) != target {
+					t.Fatalf("alias changed: %q error=%v", out, err)
+				}
+				if got, err := RevParse(ctx, repo, target); dangling && !errors.Is(err, ErrRefNotFound) || !dangling && (err != nil || got != commit) {
+					t.Fatalf("alias target changed: %q error=%v", got, err)
+				}
+			})
+		}
+	}
+}
+
+func TestFinishPrivatePinRejectsPostCreateSymbolicReplacement(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	tree, err := WriteTreeDurable(ctx, repo, filepath.Join(t.TempDir(), "pin.index"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := CommitTreeDurable(ctx, repo, tree, "protected pin", "ACD Checkpoint", "checkpoint@localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const target = "refs/acd/alias-target"
+	if err := UpdateRef(ctx, repo, target, commit, ""); err != nil {
+		t.Fatal(err)
+	}
+	ref := CheckpointRefPrefix + "test/post-create"
+	// The committed hook runs after Git releases the creation lock, before
+	// Ensure returns. Replace the pin using ordinary Git, without direct file
+	// mutation, to exercise its required post-create proof.
+	hook := "#!/bin/sh\nif [ \"$1\" = committed ] && [ ! -e .git/alias-replaced ]; then\n  : > .git/alias-replaced\n  git -c core.hooksPath=/dev/null symbolic-ref " + ref + " " + target + " || exit 1\nfi\n"
+	if err := os.WriteFile(filepath.Join(repo, ".git", "hooks", "reference-transaction"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := EnsureCheckpointRef(ctx, repo, ref, commit); created || !errors.Is(err, ErrCheckpointRefCollision) {
+		t.Fatalf("post-create alias accepted: created=%t error=%v", created, err)
+	}
+	if out, err := Run(ctx, RunOpts{Dir: repo}, "symbolic-ref", "--no-recurse", ref); err != nil || strings.TrimSpace(string(out)) != target {
+		t.Fatalf("post-create alias changed: %q error=%v", out, err)
 	}
 }

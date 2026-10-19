@@ -1,64 +1,42 @@
 # ACD
 
-Latest release: [v2026-10-04](https://github.com/KristjanPikhof/Auto-Commit-Daemon/releases/tag/v2026-10-04)
+ACD saves your eligible file changes in private Git checkpoints while you work.
+When a change is ready, run `acd finish` to turn the saved work into local commits.
+ACD never pushes.
 
-ACD turns the changes you make in files into clean local Git history. You work
-normally. ACD captures the changes first, groups related work by intent, and
-creates semantic commits in the background.
-
-![From file changes to clean Git history](docs/assets/acd-workflow.png)
-
-The normal flow is simple:
-
-1. You change files.
-2. ACD captures those changes in a durable private checkpoint.
-3. ACD groups related changes by intent.
-4. ACD creates semantic local commits.
-5. You get a clean, reviewable Git history.
-
-If an AI-generated plan is invalid or unsafe, ACD rejects it. It retries or
-rebuilds the plan while the captured checkpoint stays protected. A provider
-outage, failed check, or Git operation can delay commits, but it does not undo
-a completed checkpoint.
-
-ACD never pushes. You decide when and where to publish your commits.
+Fresh installations use Local mode with imperative messages. Local finish works
+offline and creates one complete batch commit. Optional Intent mode uses your
+chosen AI provider to plan complete goals and meaningful commit boundaries.
+Both modes publish only when you ask.
 
 ## Requirements
 
 - macOS or Linux on `arm64` or `amd64`
-- Git installed and available on `PATH`
-- A normal Git worktree on an attached branch
-- A configured Git author name and email
+- Git on `PATH` and a normal Git worktree
 - A working systemd user manager on Linux
 
-Check your Git identity:
-
-~~~bash
-git config --global user.name
-git config --global user.email
-~~~
-
-Set either value if it is missing:
+Finish also needs an attached branch and a Git author name and email. Protection
+can continue during unsafe Git states, but publication waits until they are safe.
+An attached unborn branch can receive its first commit through finish.
 
 ~~~bash
 git config --global user.name "Your Name"
 git config --global user.email "you@example.com"
 ~~~
 
-The released binary does not require Go, a Git remote, a GitHub account, or
-Full Disk Access on macOS. AI connections may need credentials; Local automatic
-commits work without them.
+The installed binary needs no Go, Git remote, GitHub account, AI credentials, or
+Full Disk Access on macOS for ordinary Local use.
 
 ## Install
 
-### Homebrew
+With Homebrew:
 
 ~~~bash
 brew install KristjanPikhof/tap/acd
 acd --version
 ~~~
 
-### Verified release installer
+Or use the release installer:
 
 ~~~bash
 curl -fsSL \
@@ -66,178 +44,152 @@ curl -fsSL \
   bash
 ~~~
 
-The installer selects the correct macOS or Linux release, verifies its
-SHA-256 checksum, and installs `acd` in `$HOME/.local/bin` by default. If your
-shell cannot find it, add that directory to `PATH`:
+The installer selects the platform binary, verifies its SHA-256 checksum, and
+installs it in `$HOME/.local/bin` by default. It needs Bash, `curl`, `tar`,
+`install`, and `shasum` or `sha256sum`; `jq` is optional. Add the install directory
+to `PATH` if needed:
 
 ~~~bash
 export PATH="$HOME/.local/bin:$PATH"
-acd --version
 ~~~
 
-The installer needs Bash, `curl`, `tar`, `install`, and either `shasum` or
-`sha256sum`. `jq` is optional.
+## Start protecting, then finish a change
 
-## Set up once, then enable each repository
-
-### 1. Set up ACD for your user account
-
-~~~bash
-acd setup
-~~~
-
-Setup recommends **AI semantic commits** with Everyday structural checks and
-bounded repair of recent private ACD commits. Related code, tests, and docs can
-become one meaningful commit. Choose an AI connection, or choose **Local
-automatic commits** for offline operation with more limited grouping and messages.
-
-ACD shows one exact plan before changing anything. Once you approve it, setup
-installs the managed runtime, starts the background supervisor, and adds any
-integrations you selected.
-
-Setup is user-wide. In a terminal it offers a separate confirmation to protect
-the current repository. Declining leaves installation complete; run `acd on` later.
-Setup verifies running versions and protection for enabled repositories before
-reporting completion. Existing settings and repository opt-ins are preserved.
-
-To inspect the plan without making changes:
-
-~~~bash
-acd setup --dry-run
-~~~
-
-### 2. Enable one repository
+Run commands from any directory inside the worktree, or select it with
+`--repo /path/to/worktree`. Linked worktrees have separate protected batches.
 
 ~~~bash
 cd /path/to/repository
 acd on
-~~~
-
-`acd on` registers only that repository, starts its worker, and waits until
-the current eligible files have a verified checkpoint. You can run it again
-safely.
-
-Run `acd on` once in every repository that you want ACD to protect.
-
-### 3. Confirm protection
-
-~~~bash
+# Edit your files normally.
 acd status
+acd finish "Add offline checkout"
 ~~~
 
-Look for:
+First use initializes the missing runtime with offline defaults, enables only
+this repository, and confirms a durable checkpoint. `acd on` makes no AI request,
+reads no provider credentials, runs no project checks, and creates no branch
+commit. Repeating it is safe. Starting a worker can recover a previously
+authorized prepared publication, but only from its exact saved proof; it never
+starts a new finish. Existing installations that need an upgrade direct you to
+`acd setup`.
 
-~~~text
-Protection: on
-Current changes saved: yes
-Branch commits: 3 changes waiting for AI
-Next: No action needed.
-~~~
-
-ACD bounds AI planning time and can publish safe groups with local messages
-during an outage. Large files stream into Git; binary contents stay out of AI
-requests. If a file cannot be read, ACD saves readable work in a partial
-checkpoint and reports incomplete protection while retrying.
-`Recovery: N changes saved separately` means that work is preserved outside
-ordinary branch history.
-
-Use `acd status --verbose` for provider, queue, target, phase, and worker details.
-
-## Daily use
-
-You do not need to run `git add`, `git commit`, or `acd commit-all` during
-normal work. Keep editing files and use these commands when you want to check
-what ACD is doing:
-
-| Command | What it tells you |
-|---|---|
-| `acd` or `acd status` | Full protection and publication state for the current repository |
-| `acd list` | Live queue and phase across repositories |
-| `acd list --once --verbose` | One detailed dashboard snapshot |
-| `acd history` | Retained checkpoints and their local Git publication state |
-| `acd history activity` | Recent capture and publication activity |
-| `acd doctor` | The problem and the next safe command when action is required |
-| `acd off` | Save a final checkpoint and stop protecting this repository |
-| `acd on` | Start protection again |
-
-`acd list` works from any directory. It shows repositories active within the
-last hour and keeps unfinished work visible until it is resolved. Agent hooks,
-edits, commit-all requests, and applied history rewrites count as activity;
-worker heartbeats and maintenance checks do not. Rows stay in place as the
-terminal refreshes. Use `--all` to include idle repositories, including those
-with maintenance warnings.
-
-The dashboard columns show protection and publication separately:
-
-| Column | Meaning |
-|---|---|
-| `SAFE` | The latest complete observation has a durable checkpoint |
-| `MODE` | Intent or event commit mode |
-| `QUEUE` | Protected changes still waiting for local Git publication |
-| `TARGET` | Work left in a bounded drain or automatic recovery |
-| `LAST MOVE` | Time since durable queue progress, not a heartbeat |
-| `PHASE` | Grouping, provider call, verification, waiting, recovery, or publication |
-| `STATUS` | Healthy, working, waiting, stalled, paused, or needs action |
-
-`working`, `waiting`, and `stalled` can all be safe states. If protection is
-`yes` and `Action needed` is `no`, leave ACD running. It will retry or repair
-the publication path itself. Use `acd doctor` only when status says that you
-need to act.
-
-## Publish the current work now
-
-Normal Intent mode publishes automatically. When you explicitly want ACD to
-finish the currently protected work before you continue, preview a bounded
-drain:
+Check `Last observed work saved` in status. Saved work remains separate from
+branch commits until finish succeeds. If protection is incomplete, ACD keeps the
+last complete checkpoint, saves readable work in partial snapshots, and reports
+the paths that need attention. Partial checkpoints cannot become finish targets.
 
 ~~~bash
-acd commit-all --dry-run
-acd commit-all --yes
+acd list                  # Protection and finish progress across repositories
+acd history               # Saved, committed, and recovered checkpoint outcomes
+acd doctor                # Explain a problem and the next safe step
+acd off                   # Save a final checkpoint, then stop protection
 ~~~
 
-This does not switch to deterministic commits and does not squash everything
-into one commit. It freezes the current target and lets the configured Intent
-or event strategy publish it normally. Later edits stay outside that target.
+`acd off` retains the checkpoints and makes no branch commit. It refuses ordinary
+success if the final checkpoint cannot be proved. Start again with `acd on`.
+`acd list --all` includes idle repositories; unfinished work stays visible after
+an editor or agent exits. A worker heartbeat shows liveness, not publication.
 
-Do not use `commit-all` as a repair command. Check `acd status`, `acd list`, or
-`acd doctor` instead. ACD keeps retrying in the background if your terminal
-closes.
+## Finish options
 
-## How ACD keeps work safe
+~~~bash
+acd finish
+acd finish --message "Update setup guidance"
+acd finish --dry-run "Add offline checkout"
+acd finish --include-staged
+acd finish --retry REQUEST_ID
+~~~
 
-Protection and Git publication are separate:
+Finish freezes a fresh complete checkpoint, the attached branch and HEAD, and
+its options. It builds and checks the whole commit chain privately before one
+branch update. Later edits keep entering checkpoints for the next finish. The
+live worktree stays intact.
 
-1. ACD observes the worktree through file events, an adaptive safety poll, and
-   optional coding-tool hints.
-2. It writes the complete eligible state to a private Git checkpoint ref.
-3. Only completed checkpoints enter Intent planning.
-4. ACD validates grouping, dependencies, materialization, verification, and
-   the exact Git target before it publishes.
-5. Successful groups become ordinary local Git commits.
+Ordinary finish refuses staged changes. `--include-staged` authorizes the exact
+current staged selection, including deletions. It consumes that selection when
+published and preserves later staging; it does not grant consent for later edits.
 
-An invalid or incomplete AI plan is not trusted. ACD can reject it, retry the
-provider, or rebuild the plan from the still-protected captures. If the
-provider remains unavailable, publication waits without losing the
-checkpoint. ACD keeps capturing and retries after five minutes, ten minutes,
-then hourly. Retry times survive restarts, and status shows when the next probe
-is due. Unrelated changes and incomplete goals cannot pass merely because they
-have waited a long time.
+`--dry-run` plans and checks without moving the branch or index. It writes private
+request evidence and can run approved project checks or contact the Intent
+provider. A later ordinary finish freezes a new target.
 
-Normal publication appends commits. Optional Intent repair can rewrite only a
-bounded recent suffix that ACD proves is private, unshared, and ACD-owned. It
-does not rewrite pushed or user-owned history.
+A failed request leaves its checkpoint protected. Fix the reported cause and use
+`--retry ID` for the same frozen target, or run a new finish for current work.
+Retry cannot change the saved purpose, message, or staged consent. Branch or index
+movement can require a new request or manual inspection; ACD never guesses.
 
-For an explicit history cleanup, `acd history rewrite --new-branch NAME` can
-split mixed commits and regroup interleaved work from recorded path versions.
-It saves a reviewable plan and delegates verification to the active worker.
-The original branch is preserved, and capture continues during reconstruction.
+Closing the terminal detaches from the accepted bounded request. After a worker
+restart, interrupted planning requires an explicit retry. A prepared publication
+recovers only from its exact saved branch and index proof. Failed requests do not
+schedule background AI calls, checks, or publication, and Intent never silently
+switches to Local mode.
 
-Read [the architecture overview](docs/overview.md) and [protection and
-publication](docs/capture-replay.md) for the full durability protocol.
+For the first finish-based release, deprecated `acd commit-all --yes` delegates
+to finish and retains explicit staged-selection consent. Use `acd finish` for
+new workflows. The alias has no separate drain or publication engine.
 
-## Restore a checkpoint
+## Messages, providers, and checks
 
-Restore always previews first:
+Local uses one honest batch summary, or your supplied purpose/message. Intent
+plans goals before assigning paths. Implementation, callers, tests, generated
+output, and relevant docs stay together when they complete one goal. A split
+needs a useful review or revert boundary and a valid intermediate tree.
+
+Intent permits one planning call and at most one correction within its saved
+`ai.timeout` deadline. Provider rejection, missing credentials, timeout, or
+oversized evidence fails that explicit attempt. Binary content is metadata only;
+text evidence and serialized requests have fixed byte limits.
+
+Choose Local or Intent and either message style in the settings editor:
+
+~~~bash
+acd config --repo .
+~~~
+
+| Style | Example |
+|---|---|
+| Imperative (default) | `Preserve staged content during finish` |
+| Conventional | `fix: preserve staged content` |
+
+Conventional messages use the scope-free `type: subject` form. `--message` supplies
+the complete message and must match the selected style. It does not bypass the
+provider in Intent mode.
+
+Every finish checks coverage, dependencies, Git structure, and exact target
+equality. The default `none` policy and `structural` skip project commands.
+Approved `fast` or `full` policies run configured commands against each private
+candidate, outside your worktree. Status reports commands that ran, identical
+results reused, and checks that were not configured. Structural checks alone do
+not mean project tests passed.
+
+Git-ignored and sensitive paths stay outside protection. Excluded tracked entries
+and submodule entries remain in the finish base tree. Diff egress is off by
+default and needs explicit approval. Local sends nothing to a provider. Status,
+list, doctor, and diagnose read state without provider construction or migration.
+See [providers and privacy](docs/ai-providers.md).
+
+## Settings and optional integrations
+
+~~~bash
+acd config                 # Edit global defaults
+acd config --repo .        # Edit this repository
+acd config get             # Inspect values and their sources
+acd setup --dry-run        # Preview runtime changes and optional integrations
+~~~
+
+Review the editor's plan and choose Save changes. Saving and applying settings
+make no provider request; a connection test is a separate explicit action. Keys
+are masked and stored in the credential store. `acd config set` and `reset` save
+a draft for review in the editor. See [settings](docs/settings.md) and the
+[generated configuration reference](docs/configuration-reference.md).
+
+Coding-tool integrations only wake protection for already enabled repositories.
+They cannot enable a repository, call AI, run checks, or finish work.
+
+## Restore and rewrite history
+
+Restore previews before applying:
 
 ~~~bash
 acd history
@@ -245,56 +197,40 @@ acd restore cp-...
 acd restore cp-... --yes
 ~~~
 
-ACD checkpoints the current state before applying a restore. It leaves `HEAD`
-and the Git index unchanged and returns the pre-restore checkpoint as the undo
-target.
+ACD protects the current state before restoring and returns that checkpoint as
+the undo target. Restore preserves HEAD and the index.
 
-See [user workflows](docs/user-workflows.md) for restore, recovery, and support
-steps.
-
-## Privacy and providers
-
-Fresh interactive setup recommends AI semantic grouping and messages. You choose
-the connection and approve source sharing before activation. Local automatic
-commits remain an explicit offline option. Unattended first setup requires an
-explicit `--provider openai-compat` or `--provider deterministic`.
-
-Network diff egress is off until you approve it explicitly. Credentials never
-enter status, logs, diagnostics, traces, or plan fingerprints. Full provider
-payloads stay out of ordinary diagnostics. The advanced prompt-trace and raw
-reject-log options are explicit local opt-ins because their output can contain
-sensitive source text. Git-ignored files and configured sensitive paths remain
-outside the protected scope.
-
-See [AI providers](docs/ai-providers.md) for the provider and privacy contract.
-
-## Configuration
+Explicit history rewriting retains reviewable saved plans and backups:
 
 ~~~bash
-acd config                 # Edit global defaults; switch scope in the menu
-acd config --repo .        # Edit this repository
-acd config get             # Inspect saved values and their sources
+acd history rewrite --last 3 --plan-only
+acd history rewrite --show-plan PLAN_ID
+acd history rewrite --apply PLAN_ID --dry-run
+acd history rewrite --apply PLAN_ID --yes
 ~~~
 
-Select the model, endpoint, or API key to change it, then choose **Save changes**.
-ACD reviews, tests, saves, and queues the settings in one flow. Repository fields
-can inherit global defaults or override individual values. API keys are masked
-and stored securely after testing. Advanced settings cover verification,
-capture, repair, and retention.
-
-See [settings](docs/settings.md) and the generated [configuration
-reference](docs/configuration-reference.md).
+Local rewriting respects recorded order and authors. Intent can propose complete
+goals from exact versions. `--messages-only` preserves one commit per selected
+commit; purposeful `--new-branch NAME` reconstruction preserves the source branch.
+Saved-plan display and apply do not make a new AI request. See
+[history rewriting](docs/rewrite-commits.md) and [workflows](docs/user-workflows.md).
 
 ## Upgrade and uninstall
 
-Upgrade the CLI with the same method you used to install it, then apply the
-reviewed runtime plan:
+Source changes and a CLI upgrade do not replace the running supervisor or workers.
+An older active runtime can still create automatic commits until explicitly
+upgraded. Review and apply the runtime plan:
 
 ~~~bash
-brew upgrade acd        # Homebrew installation
+brew upgrade acd          # For a Homebrew installation
 acd setup --dry-run
 acd setup
 ~~~
+
+Upgrade preserves explicit Intent/style/privacy/verification choices. Legacy Event
+settings become Local batches. Old captured versions and prepared publication
+proofs remain protected; ambiguous evidence requires attention rather than an
+invented migration result. See [the finish contract](docs/finish-contract.md).
 
 Uninstall keeps protected repository data by default:
 
@@ -303,21 +239,27 @@ acd uninstall --dry-run
 acd uninstall
 ~~~
 
-## Detailed documentation
+For a clean ACD start across all registered worktrees:
 
-- [Command reference](docs/commands.md)
-- [User workflows](docs/user-workflows.md)
-- [Architecture overview](docs/overview.md)
-- [Protection and publication](docs/capture-replay.md)
-- [Intent commit flow](docs/intent-commit-flow.md)
-- [Settings](docs/settings.md)
-- [AI providers](docs/ai-providers.md)
-- [Commit-message rewriting](docs/rewrite-commits.md)
+~~~bash
+acd uninstall --dry-run --purge-data
+acd uninstall --purge-data --confirm-purge-data
+~~~
+
+Purge removes the installed runtime, owned integrations, registrations,
+repository ACD directories and databases, and private `refs/acd/` archives.
+Project branches, tags, commits, staging, and working files stay unchanged.
+
+## Documentation and development
+
+- [Commands](docs/commands.md)
+- [Architecture](docs/overview.md)
+- [Protection](docs/capture-replay.md)
+- [Intent planning](docs/intent-commit-flow.md)
+- [Integrations](docs/multi-tool.md)
 - [Changelog](CHANGELOG.md)
 
-## Development
-
-Building from source requires Go 1.26.9:
+Building from source requires Go 1.26.9 or later:
 
 ~~~bash
 make build
@@ -325,24 +267,11 @@ make lint
 make test
 ~~~
 
-The local gate and each hosted workflow have a five-minute execution target.
-CI runs package race tests, repeated stability cases, and the tagged production
-integration suite in four measured shards on both Linux and macOS. The release-style
-integration child binary is not race-instrumented; package tests cover internal
-concurrency.
+The local gate uses three core shards and at most two parallel tests per package.
+Hosted CI has four core and four production integration shards on Ubuntu and
+macOS, a support lane, six Ubuntu daemon stress runners, and two Git/state stress
+runners. Each leaf has a five-minute limit. The complete workflow and local gate
+have a five-minute target; keep checks sharded rather than dropping scenarios.
 
-For one production shard or real checkpoint measurements:
-
-~~~bash
-scripts/dev/test.sh integration 4 0
-scripts/dev/benchmark.sh
-~~~
-
-Set `ACD_TEST_RESULTS_DIR` to an output directory outside the checkout to retain
-JSON timings and complete shard manifests. Update measured weights with
-`python3 scripts/dev/test-manifest.py timings <jsonl-files...>` and review the
-result before replacing `scripts/dev/test-timings.json`. Tooling tests use
-`python3 -B -m unittest discover -s scripts/dev -p '*_test.py'`.
-
-Repository contribution and verification requirements are in
-[`CLAUDE.md`](CLAUDE.md). ACD is MIT licensed.
+Set `ACD_TEST_RESULTS_DIR` outside the checkout to retain JSON timings and shard
+manifests. Contribution rules are in [CLAUDE.md](CLAUDE.md). ACD is MIT licensed.

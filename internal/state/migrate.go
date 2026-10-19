@@ -82,6 +82,8 @@ ALTER TABLE decision_records_v6 RENAME TO decision_records;
 // strategy, active revision, and provider used by publication drains. v26
 // adds grouped history rewrite plans while retaining legacy commit rows. v27
 // adds the approved index digest without inventing consent for older drains.
+// v31 adds finish requests without reinterpreting legacy publication evidence.
+// v32 adds legacy cutover/object pins and explicit history journals without backfill.
 // New tables are pure DDL;
 // columns on existing tables are added
 // explicitly for upgraded databases.
@@ -157,7 +159,7 @@ SELECT repair_id,ord,candidate_id,old_oid,new_oid FROM intent_repair_commits;
 			return err
 		}
 		if rebuilt {
-			if _, err := tx.ExecContext(ctx, schemaDDL); err != nil {
+			if _, err := tx.ExecContext(ctx, LegacySchemaDDL); err != nil {
 				return fmt.Errorf("state: reapply schema after v6 decision_records migration: %w", err)
 			}
 		}

@@ -20,12 +20,6 @@ const (
 	ActivationApplied      = "applied"
 	ActivationRejected     = "rejected"
 	ActivationCancelled    = "cancelled"
-
-	ExperimentActive    = "active"
-	ExperimentCompleted = "completed"
-	ExperimentExpired   = "expired"
-	ExperimentFailed    = "failed"
-	ExperimentCancelled = "cancelled"
 )
 
 // ConfigRevision is an immutable, non-secret resolved runtime snapshot.
@@ -80,30 +74,6 @@ type ConfigActivationRequest struct {
 	AcknowledgedTS         sql.NullFloat64
 	CompletedTS            sql.NullFloat64
 	Error                  sql.NullString
-}
-
-// ConfigExperiment describes a bounded candidate-revision run.
-type ConfigExperiment struct {
-	ID                  int64
-	BaselineRevisionID  int64
-	CandidateRevisionID int64
-	WindowBudget        int
-	CompletedWindows    int
-	ExpiresTS           sql.NullFloat64
-	FailurePolicy       string
-	Status              string
-	CreatedTS           float64
-	UpdatedTS           float64
-	CompletedTS         sql.NullFloat64
-	TerminalReason      sql.NullString
-}
-
-type ConfigExperimentInput struct {
-	BaselineRevisionID  int64
-	CandidateRevisionID int64
-	WindowBudget        int
-	ExpiresTS           sql.NullFloat64
-	FailurePolicy       string
 }
 
 // InsertConfigRevision canonicalizes and validates a resolved JSON snapshot
@@ -168,29 +138,6 @@ func prepareConfigRevision(in ConfigRevisionInput) (preparedConfigRevision, erro
 		reason:           reason,
 		createdTS:        created,
 	}, nil
-}
-
-func insertConfigRevisionTx(
-	ctx context.Context,
-	tx *sql.Tx,
-	prepared preparedConfigRevision,
-) (int64, error) {
-	res, err := tx.ExecContext(ctx, `
-INSERT INTO config_revisions(
-    created_ts, profile, scope, snapshot_json, snapshot_hash,
-    source_generation, reason
-) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		prepared.createdTS, prepared.profile, prepared.scope,
-		string(prepared.canonical), prepared.hash, prepared.sourceGeneration,
-		prepared.reason)
-	if err != nil {
-		return 0, fmt.Errorf("state: insert config revision: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("state: config revision id: %w", err)
-	}
-	return id, nil
 }
 
 func ConfigRevisionByID(ctx context.Context, d *DB, id int64) (ConfigRevision, error) {
@@ -269,15 +216,6 @@ func requestConfigActivationTx(
 	if !equalNullInt64(current, expectedDesired) {
 		return ConfigActivationRequest{}, false, nil
 	}
-	var activeExperiment int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM config_experiments WHERE status='active')`,
-	).Scan(&activeExperiment); err != nil {
-		return ConfigActivationRequest{}, false, fmt.Errorf("state: read active config experiment: %w", err)
-	}
-	if activeExperiment != 0 {
-		return ConfigActivationRequest{}, false, errors.New("state: active config experiment blocks normal activation")
-	}
 	var exists int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM config_revisions WHERE id=?`, revisionID).Scan(&exists); err != nil || exists != 1 {
 		if err == nil {
@@ -349,14 +287,6 @@ WHERE id=1 AND desired_request_id=? AND desired_revision_id=?`,
 	return true, nil
 }
 
-func RejectConfigActivation(ctx context.Context, d *DB, requestID, revisionID int64, reason string) (bool, error) {
-	return transitionActivation(ctx, d, requestID, revisionID, "pending|acknowledged", ActivationRejected, reason)
-}
-
-func CancelConfigActivation(ctx context.Context, d *DB, requestID, revisionID int64, reason string) (bool, error) {
-	return transitionActivation(ctx, d, requestID, revisionID, "pending|acknowledged", ActivationCancelled, reason)
-}
-
 // RevertConfigActivation copies a known-good snapshot into a new immutable
 // revision and requests it with the same desired-revision CAS contract.
 func RevertConfigActivation(ctx context.Context, d *DB, sourceRevisionID int64, expectedDesired sql.NullInt64, sourceGeneration int64) (ConfigRevision, ConfigActivationRequest, bool, error) {
@@ -388,278 +318,6 @@ FROM config_activation_requests WHERE id=?`, id).Scan(
 		return ConfigActivationRequest{}, fmt.Errorf("state: get activation request: %w", err)
 	}
 	return out, nil
-}
-
-func CreateConfigExperiment(ctx context.Context, d *DB, in ConfigExperimentInput) (ConfigExperiment, error) {
-	if d == nil || in.BaselineRevisionID <= 0 || in.CandidateRevisionID <= 0 ||
-		in.BaselineRevisionID == in.CandidateRevisionID || in.WindowBudget <= 0 {
-		return ConfigExperiment{}, fmt.Errorf("state: CreateConfigExperiment: invalid input")
-	}
-	policy := strings.TrimSpace(in.FailurePolicy)
-	if policy == "" {
-		policy = "continue"
-	}
-	if _, err := safeConfigLabel("failure policy", policy); err != nil {
-		return ConfigExperiment{}, err
-	}
-	now := nowSeconds()
-	res, err := d.conn.ExecContext(ctx, `
-INSERT INTO config_experiments(
-    baseline_revision_id, candidate_revision_id, window_budget,
-    expires_ts, failure_policy, status, created_ts, updated_ts
-) SELECT ?, ?, ?, ?, ?, 'active', ?, ?
-WHERE EXISTS (SELECT 1 FROM config_revisions WHERE id=?)
-  AND EXISTS (SELECT 1 FROM config_revisions WHERE id=?)`,
-		in.BaselineRevisionID, in.CandidateRevisionID, in.WindowBudget,
-		in.ExpiresTS, policy, now, now, in.BaselineRevisionID, in.CandidateRevisionID)
-	if err != nil {
-		return ConfigExperiment{}, fmt.Errorf("state: create config experiment: %w", err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil || id == 0 {
-		if err == nil {
-			err = sql.ErrNoRows
-		}
-		return ConfigExperiment{}, fmt.Errorf("state: config experiment revisions: %w", err)
-	}
-	return ConfigExperimentByID(ctx, d, id)
-}
-
-// RequestConfigExperimentActivation makes the experiment visible before its
-// candidate can become desired. A daemon can therefore never lease the
-// candidate without the durable experiment ID used to count and revert it.
-func RequestConfigExperimentActivation(ctx context.Context, d *DB, in ConfigExperimentInput, expectedDesired sql.NullInt64) (ConfigExperiment, ConfigActivationRequest, bool, error) {
-	if d == nil || in.BaselineRevisionID <= 0 || in.CandidateRevisionID <= 0 ||
-		in.BaselineRevisionID == in.CandidateRevisionID || in.WindowBudget <= 0 {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: RequestConfigExperimentActivation: invalid input")
-	}
-	policy := strings.TrimSpace(in.FailurePolicy)
-	if policy == "" {
-		policy = "continue"
-	}
-	if _, err := safeConfigLabel("failure policy", policy); err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, err
-	}
-	tx, err := d.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: begin experiment activation: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := ensureRuntimeConfigState(ctx, tx); err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, err
-	}
-	var current sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT desired_revision_id FROM runtime_config_state WHERE id=1`).Scan(&current); err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: read desired revision: %w", err)
-	}
-	if !equalNullInt64(current, expectedDesired) || !current.Valid || current.Int64 != in.BaselineRevisionID {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, nil
-	}
-	var exists, active int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM config_revisions WHERE id IN (?,?)`, in.BaselineRevisionID, in.CandidateRevisionID).Scan(&exists); err != nil || exists != 2 {
-		if err == nil {
-			err = sql.ErrNoRows
-		}
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: experiment revisions: %w", err)
-	}
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM config_experiments WHERE status='active')`).Scan(&active); err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: read active experiment: %w", err)
-	}
-	if active != 0 {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: active config experiment already exists")
-	}
-	now := nowSeconds()
-	expRes, err := tx.ExecContext(ctx, `
-INSERT INTO config_experiments(
-    baseline_revision_id, candidate_revision_id, window_budget,
-    expires_ts, failure_policy, status, created_ts, updated_ts
-) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`, in.BaselineRevisionID,
-		in.CandidateRevisionID, in.WindowBudget, in.ExpiresTS, policy, now, now)
-	if err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: create config experiment activation: %w", err)
-	}
-	experimentID, err := expRes.LastInsertId()
-	if err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: experiment activation id: %w", err)
-	}
-	reqRes, err := tx.ExecContext(ctx, `
-INSERT INTO config_activation_requests(
-    revision_id, prior_desired_revision_id, status, requested_ts
-) VALUES (?, ?, 'pending', ?)`, in.CandidateRevisionID, current, now)
-	if err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: insert experiment activation request: %w", err)
-	}
-	requestID, err := reqRes.LastInsertId()
-	if err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: experiment activation request id: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-UPDATE runtime_config_state
-SET desired_revision_id=?, desired_request_id=?, desired_ts=?, last_error=NULL, updated_ts=?
-WHERE id=1`, in.CandidateRevisionID, requestID, now, now); err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: set experiment desired revision: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, fmt.Errorf("state: commit experiment activation: %w", err)
-	}
-	experiment, err := ConfigExperimentByID(ctx, d, experimentID)
-	if err != nil {
-		return ConfigExperiment{}, ConfigActivationRequest{}, false, err
-	}
-	request := ConfigActivationRequest{ID: requestID, RevisionID: in.CandidateRevisionID,
-		PriorDesiredRevisionID: current, Status: ActivationPending, RequestedTS: now}
-	return experiment, request, true, nil
-}
-
-func ConfigExperimentByID(ctx context.Context, d *DB, id int64) (ConfigExperiment, error) {
-	var out ConfigExperiment
-	err := d.readSQL().QueryRowContext(ctx, `
-SELECT id, baseline_revision_id, candidate_revision_id, window_budget,
-       completed_windows, expires_ts, failure_policy, status, created_ts,
-       updated_ts, completed_ts, terminal_reason
-FROM config_experiments WHERE id=?`, id).Scan(
-		&out.ID, &out.BaselineRevisionID, &out.CandidateRevisionID,
-		&out.WindowBudget, &out.CompletedWindows, &out.ExpiresTS,
-		&out.FailurePolicy, &out.Status, &out.CreatedTS, &out.UpdatedTS,
-		&out.CompletedTS, &out.TerminalReason)
-	if err != nil {
-		return ConfigExperiment{}, fmt.Errorf("state: get config experiment: %w", err)
-	}
-	return out, nil
-}
-
-func ActiveConfigExperiment(ctx context.Context, d *DB) (ConfigExperiment, bool, error) {
-	if d == nil {
-		return ConfigExperiment{}, false, fmt.Errorf("state: ActiveConfigExperiment: nil db")
-	}
-	var out ConfigExperiment
-	err := d.readSQL().QueryRowContext(ctx, `
-SELECT id, baseline_revision_id, candidate_revision_id, window_budget,
-       completed_windows, expires_ts, failure_policy, status, created_ts,
-       updated_ts, completed_ts, terminal_reason
-FROM config_experiments WHERE status='active' ORDER BY id DESC LIMIT 1`).Scan(
-		&out.ID, &out.BaselineRevisionID, &out.CandidateRevisionID,
-		&out.WindowBudget, &out.CompletedWindows, &out.ExpiresTS,
-		&out.FailurePolicy, &out.Status, &out.CreatedTS, &out.UpdatedTS,
-		&out.CompletedTS, &out.TerminalReason)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ConfigExperiment{}, false, nil
-	}
-	if err != nil {
-		return ConfigExperiment{}, false, fmt.Errorf("state: read active config experiment: %w", err)
-	}
-	return out, true, nil
-}
-
-// ConfigExperimentPendingRevert returns the experiment whose candidate is
-// still the desired revision. It includes active experiments so expiry can be
-// evaluated and terminal experiments so interrupted cleanup can be retried.
-func ConfigExperimentPendingRevert(ctx context.Context, d *DB) (ConfigExperiment, bool, error) {
-	if d == nil {
-		return ConfigExperiment{}, false, fmt.Errorf("state: ConfigExperimentPendingRevert: nil db")
-	}
-	var out ConfigExperiment
-	err := d.readSQL().QueryRowContext(ctx, `
-SELECT e.id, e.baseline_revision_id, e.candidate_revision_id, e.window_budget,
-       e.completed_windows, e.expires_ts, e.failure_policy, e.status,
-       e.created_ts, e.updated_ts, e.completed_ts, e.terminal_reason
-FROM config_experiments e
-JOIN runtime_config_state s ON s.desired_revision_id=e.candidate_revision_id
-WHERE e.status IN ('active','completed','expired','failed','cancelled')
-ORDER BY e.id DESC LIMIT 1`).Scan(
-		&out.ID, &out.BaselineRevisionID, &out.CandidateRevisionID,
-		&out.WindowBudget, &out.CompletedWindows, &out.ExpiresTS,
-		&out.FailurePolicy, &out.Status, &out.CreatedTS, &out.UpdatedTS,
-		&out.CompletedTS, &out.TerminalReason)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ConfigExperiment{}, false, nil
-	}
-	if err != nil {
-		return ConfigExperiment{}, false, fmt.Errorf("state: read config experiment pending revert: %w", err)
-	}
-	return out, true, nil
-}
-
-// RejectConfigActivationAndExperiment atomically rejects one desired
-// activation and fails an active experiment targeting the same candidate.
-// The rejected desired pointer remains intact for audit/diagnostic projection;
-// callers may queue the experiment's immutable baseline revert afterward.
-func RejectConfigActivationAndExperiment(
-	ctx context.Context,
-	d *DB,
-	requestID int64,
-	revisionID int64,
-	reason string,
-) (int64, bool, error) {
-	if d == nil || requestID <= 0 || revisionID <= 0 {
-		return 0, false, fmt.Errorf("state: RejectConfigActivationAndExperiment: invalid input")
-	}
-	tx, err := d.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, false, fmt.Errorf("state: begin rejected experiment activation: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	now := nowSeconds()
-	cleanReason := nullableSanitizedText(reason)
-	res, err := tx.ExecContext(ctx, `
-UPDATE config_activation_requests
-SET status='rejected', completed_ts=?, error=?
-WHERE id=? AND revision_id=? AND status IN ('pending','acknowledged')
-  AND EXISTS (SELECT 1 FROM runtime_config_state
-              WHERE id=1 AND desired_request_id=? AND desired_revision_id=?)`,
-		now, cleanReason, requestID, revisionID, requestID, revisionID)
-	if err != nil {
-		return 0, false, fmt.Errorf("state: reject config activation: %w", err)
-	}
-	changed, err := res.RowsAffected()
-	if err != nil {
-		return 0, false, fmt.Errorf("state: count rejected config activation: %w", err)
-	}
-	if changed == 0 {
-		return 0, false, nil
-	}
-	if _, err := tx.ExecContext(ctx, `
-UPDATE runtime_config_state SET last_error=?, updated_ts=?
-WHERE id=1 AND desired_request_id=? AND desired_revision_id=?`,
-		cleanReason, now, requestID, revisionID); err != nil {
-		return 0, false, fmt.Errorf("state: update rejected desired state: %w", err)
-	}
-	var experimentID int64
-	err = tx.QueryRowContext(ctx, `
-SELECT id FROM config_experiments
-WHERE candidate_revision_id=? AND status='active'
-ORDER BY id DESC LIMIT 1`, revisionID).Scan(&experimentID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, fmt.Errorf("state: read rejected config experiment: %w", err)
-	}
-	if err == nil {
-		if _, err := tx.ExecContext(ctx, `
-UPDATE config_experiments
-SET status='failed', updated_ts=?, completed_ts=?, terminal_reason=?
-WHERE id=? AND status='active'`, now, now, cleanReason, experimentID); err != nil {
-			return 0, false, fmt.Errorf("state: fail rejected config experiment: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, false, fmt.Errorf("state: commit rejected experiment activation: %w", err)
-	}
-	return experimentID, true, nil
-}
-
-func FinishConfigExperiment(ctx context.Context, d *DB, id int64, status, reason string) (bool, error) {
-	if status != ExperimentExpired && status != ExperimentFailed && status != ExperimentCancelled {
-		return false, fmt.Errorf("state: invalid terminal experiment status %q", status)
-	}
-	now := nowSeconds()
-	res, err := d.conn.ExecContext(ctx, `
-UPDATE config_experiments
-SET status=?, updated_ts=?, completed_ts=?, terminal_reason=?
-WHERE id=? AND status='active'`, status, now, now, nullableSanitizedText(reason), id)
-	if err != nil {
-		return false, fmt.Errorf("state: finish config experiment: %w", err)
-	}
-	n, err := res.RowsAffected()
-	return n == 1, err
 }
 
 func ensureRuntimeConfigState(ctx context.Context, tx *sql.Tx) error {
@@ -833,3 +491,14 @@ func nullableSanitizedText(value string) sql.NullString {
 func equalNullInt64(a, b sql.NullInt64) bool {
 	return a.Valid == b.Valid && (!a.Valid || a.Int64 == b.Int64)
 }
+
+func RejectConfigActivation(ctx context.Context, d *DB, requestID, revisionID int64, reason string) (bool, error) {
+	return transitionActivation(ctx, d, requestID, revisionID, "pending|acknowledged", ActivationRejected, reason)
+}
+
+func CancelConfigActivation(ctx context.Context, d *DB, requestID, revisionID int64, reason string) (bool, error) {
+	return transitionActivation(ctx, d, requestID, revisionID, "pending|acknowledged", ActivationCancelled, reason)
+}
+
+// RevertConfigActivation copies a known-good snapshot into a new immutable
+// revision and requests it with the same desired-revision CAS contract.

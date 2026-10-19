@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -144,6 +145,17 @@ type ApprovedCommand struct {
 	digest         string
 }
 
+type CommandIdentity struct {
+	ApprovalID string        `json:"approval_id"`
+	Mode       Mode          `json:"mode"`
+	Digest     string        `json:"digest"`
+	Timeout    time.Duration `json:"timeout"`
+}
+
+func (c ApprovedCommand) Identity() CommandIdentity {
+	return CommandIdentity{ApprovalID: c.approvalID, Mode: c.mode, Digest: c.digest, Timeout: c.timeout}
+}
+
 // NewApprovedCommand binds an exact shell command to one canonical repository
 // and approval identity. approvalID should identify the immutable config
 // revision during replay, or the explicit preview confirmation during setup.
@@ -205,16 +217,18 @@ type StructuralRequest struct {
 // to its final 64 KiB. Any non-passing result requires operator attention and
 // must not be used as publication approval.
 type Result struct {
-	Status         Status
-	NeedsAttention bool
-	Mode           Mode
-	ApprovalID     string
-	CommandDigest  string
-	CommitOID      string
-	ExitCode       int
-	TimedOut       bool
-	Duration       time.Duration
-	Output         string
+	Status            Status
+	NeedsAttention    bool
+	Mode              Mode
+	ApprovalID        string
+	CommandDigest     string
+	EnvironmentDigest string
+	Executed          bool
+	CommitOID         string
+	ExitCode          int
+	TimedOut          bool
+	Duration          time.Duration
+	Output            string
 }
 
 // CleanupResult reports only bounded workspace counts, never source paths.
@@ -319,6 +333,7 @@ func (r Runner) Run(ctx context.Context, request Request) (result Result, retErr
 		ws.environmentPath,
 		request.Command,
 		output,
+		&result,
 	)
 	result.Duration = time.Since(started)
 	result.Output = sanitizeOutput(output.Bytes())
@@ -659,6 +674,7 @@ func runApprovedCommand(
 	environmentRoot string,
 	approved ApprovedCommand,
 	output io.Writer,
+	evidence *Result,
 ) (runErr error, timedOut bool, cancelled bool) {
 	runCtx, cancel := context.WithTimeout(ctx, approved.timeout)
 	defer cancel()
@@ -670,6 +686,10 @@ func runApprovedCommand(
 	if err != nil {
 		return err, false, false
 	}
+	identityEnv := slices.Clone(env)
+	slices.Sort(identityEnv)
+	identityBytes, _ := json.Marshal(identityEnv)
+	evidence.EnvironmentDigest = fmt.Sprintf("%x", sha256.Sum256(identityBytes))
 	statusReader, statusWriter, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("verification: create command status pipe: %w", err), false, false
@@ -704,6 +724,7 @@ eval "$1"`
 		_ = statusWriter.Close()
 		return err, false, false
 	}
+	evidence.Executed = true
 	_ = statusWriter.Close()
 
 	waitDone := make(chan error, 1)

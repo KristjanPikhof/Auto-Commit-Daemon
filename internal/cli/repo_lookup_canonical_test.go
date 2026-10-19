@@ -92,26 +92,23 @@ func TestRepoLookupCommandsCanonicalizeSubdirBeforeRegistryLookup(t *testing.T) 
 		}
 	})
 
-	t.Run("stop", func(t *testing.T) {
-		if err := state.RegisterClient(ctx, db, state.Client{SessionID: "stop-session", Harness: "codex", LastSeenTS: nowFloat()}); err != nil {
-			t.Fatalf("register stop session: %v", err)
+	t.Run("off", func(t *testing.T) {
+		lookup, err := loadControlRepo(ctx, subdir)
+		if err != nil {
+			t.Fatalf("load off repository from subdir: %v", err)
 		}
-		if err := state.RegisterClient(ctx, db, state.Client{SessionID: "peer-session", Harness: "codex", LastSeenTS: nowFloat()}); err != nil {
-			t.Fatalf("register peer session: %v", err)
+		if !lookup.Registered || lookup.Worktree.Root != repo || lookup.Record.StateDB != stateDB {
+			t.Fatalf("off lookup did not find canonical registered repository: %+v", lookup)
 		}
+		registryBefore := mustSHA256(t, roots.RegistryPath())
+		stateBefore := mustSHA256(t, stateDB)
 		var out bytes.Buffer
-		if err := encodeStoppedRepositoryForTest(ctx, &out, repo, "stop-session", false); err != nil {
-			t.Fatalf("runStop from subdir: %v", err)
+		err = runControlOffWithForce(ctx, &out, subdir, true, false)
+		if ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "final checkpoint barrier failed") || !strings.Contains(err.Error(), "acd setup") {
+			t.Fatalf("off must require a proven checkpoint before disabling without an installed runtime: %v", err)
 		}
-		var rep stopRepoResult
-		if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
-			t.Fatalf("decode stop: %v\n%s", err, out.String())
-		}
-		if rep.Repo != repo {
-			t.Fatalf("stop repo=%q want canonical root %q", rep.Repo, repo)
-		}
-		if !rep.Deferred {
-			t.Fatalf("stop should defer with peer still registered, got %+v", rep)
+		if out.Len() != 0 || mustSHA256(t, roots.RegistryPath()) != registryBefore || mustSHA256(t, stateDB) != stateBefore {
+			t.Fatal("failed off changed registry/state or reported success")
 		}
 	})
 }

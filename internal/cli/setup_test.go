@@ -84,6 +84,34 @@ func snippetBody(t *testing.T, path string) string {
 	return string(b)
 }
 
+func TestFinishIntegrationHintsEmbeddedGuidance(t *testing.T) {
+	for _, harness := range []string{"claude-code", "codex", "cursor", "opencode", "pi", "shell"} {
+		t.Run(harness, func(t *testing.T) {
+			readme := snippetBody(t, harness+"/README.md")
+			for _, required := range []string{"acd finish --repo /path/to/worktree", "authorize committing", "Local", "Intent", "Fix setup retries", "fix: handle setup retries", "retry finish automatically", "prompt text"} {
+				if !strings.Contains(readme, required) {
+					t.Errorf("missing task completion guidance %q", required)
+				}
+			}
+			preview, _, err := runSetupCmd(t, harness, "--raw")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{"--event logical_boundary", "--event soft_boundary", "acd finish", "acd commit-all", "acd start", "acd flush"} {
+				if strings.Contains(preview, forbidden) {
+					t.Errorf("hook preview contains publication action %q", forbidden)
+				}
+			}
+			if harness != "shell" {
+				uninstall := snippetBody(t, harness+"/uninstall.md")
+				if !strings.Contains(uninstall, "never calls") || !strings.Contains(uninstall, "Saved checkpoints and history remain") {
+					t.Fatal("uninstall guidance lost final checkpoint or preservation boundary")
+				}
+			}
+		})
+	}
+}
+
 func assertTopLevelJSONKeys(t *testing.T, block []byte, want ...string) map[string]json.RawMessage {
 	t.Helper()
 	var top map[string]json.RawMessage
@@ -229,7 +257,7 @@ func TestSetup_ClaudeCode_HasCanonicalHookSchema(t *testing.T) {
 	required := []string{"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"}
 	expectedEvent := map[string]string{
 		"SessionStart": "session_open", "PreToolUse": "activity",
-		"PostToolUse": "activity", "Stop": "logical_boundary",
+		"PostToolUse": "activity", "Stop": "activity",
 		"SessionEnd": "session_close",
 	}
 	for _, ev := range required {
@@ -362,7 +390,7 @@ func TestSetup_Cursor_HasCanonicalHookSchema(t *testing.T) {
 	required := []string{"sessionStart", "postToolUse", "afterFileEdit", "stop", "sessionEnd"}
 	expectedEvent := map[string]string{
 		"sessionStart": "session_open", "postToolUse": "activity",
-		"afterFileEdit": "activity", "stop": "logical_boundary",
+		"afterFileEdit": "activity", "stop": "activity",
 		"sessionEnd": "session_close",
 	}
 	for _, ev := range required {
@@ -459,7 +487,7 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 	expectedEvent := map[string]string{
 		"SessionStart": "session_open", "UserPromptSubmit": "activity",
 		"PreToolUse": "activity", "PostToolUse": "activity",
-		"Stop": "soft_boundary",
+		"Stop": "activity",
 	}
 	for _, ev := range required {
 		entries, ok := settings.Hooks[ev]
@@ -490,15 +518,14 @@ func TestSetup_Codex_HasCanonicalHookSchema(t *testing.T) {
 			}
 		}
 	}
-	// Stop must record a soft boundary; unlike Claude's logical flush this
-	// requests evaluation without bypassing Intent v2 safety gates.
+	// Stop reports capture activity; completion requires explicit finish.
 	if stop := settings.Hooks["Stop"]; len(stop) > 0 && len(stop[0].Hooks) > 0 {
 		command := stop[0].Hooks[0].Command
-		if !integrationEventCommandOK("codex", "soft_boundary", command) {
-			t.Errorf("Stop hook must send a soft-boundary event: %s", command)
+		if !integrationEventCommandOK("codex", "activity", command) {
+			t.Errorf("Stop hook must send a capture activity: %s", command)
 		}
 		if strings.Contains(command, "acd flush --logical") {
-			t.Errorf("Codex Stop must remain a soft boundary, got hard flush: %s", command)
+			t.Errorf("Codex Stop must not request publication: %s", command)
 		}
 	}
 }
@@ -527,7 +554,7 @@ func TestSetup_Codex_AllHooksUseUnifiedEvents(t *testing.T) {
 				if ev == "SessionStart" {
 					expected = "session_open"
 				} else if ev == "Stop" {
-					expected = "soft_boundary"
+					expected = "activity"
 				}
 				assertUnifiedIntegrationEvent(t, fmt.Sprintf("%s entry %d hook %d", ev, i, j),
 					h.Command, "codex", expected)
@@ -577,8 +604,8 @@ func TestSetup_OpenCode_ActivityHooksUseUnifiedEvent(t *testing.T) {
 	}
 }
 
-// Claude Stop records a logical boundary without closing the session.
-func TestSetup_ClaudeCode_StopUsesLogicalBoundary(t *testing.T) {
+// Claude Stop only wakes protection.
+func TestSetup_ClaudeCode_StopOnlyWakesProtection(t *testing.T) {
 	out, _, _ := runSetupCmd(t, "claude-code")
 	start := strings.Index(out, "{")
 	end := strings.LastIndex(out, "}")
@@ -602,16 +629,16 @@ func TestSetup_ClaudeCode_StopUsesLogicalBoundary(t *testing.T) {
 		t.Fatalf("Stop hook missing")
 	}
 	cmd := stop[0].Hooks[0].Command
-	if !integrationEventCommandOK("claude-code", "logical_boundary", cmd) {
-		t.Errorf("Stop hook must send a logical-boundary event, got: %s", cmd)
+	if !integrationEventCommandOK("claude-code", "activity", cmd) {
+		t.Errorf("Stop hook must send a capture activity, got: %s", cmd)
 	}
 	if strings.Contains(cmd, "acd touch") {
 		t.Errorf("Stop hook still calls legacy `acd touch` — rewire incomplete: %s", cmd)
 	}
-	assertUnifiedIntegrationEvent(t, "Stop", cmd, "claude-code", "logical_boundary")
+	assertUnifiedIntegrationEvent(t, "Stop", cmd, "claude-code", "activity")
 }
 
-func TestSetup_OpenCode_IdleUsesLogicalBoundary(t *testing.T) {
+func TestSetup_OpenCode_IdleOnlyWakesProtection(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
 	// YAML harnesses use a comment-prefixed marker `# acd-managed: true`
 	// at the top of the snippet. The `# ` prefix is load-bearing — a
@@ -623,18 +650,18 @@ func TestSetup_OpenCode_IdleUsesLogicalBoundary(t *testing.T) {
 		t.Errorf("opencode snippet missing %q marker:\n%s", yamlMarker, body)
 	}
 	if strings.Contains(body, "- id: acd-touch-idle") {
-		t.Errorf("opencode snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
+		t.Errorf("opencode snippet still has legacy `acd-touch-idle` id; expected `acd-wake-idle`:\n%s", body)
 	}
-	block := yamlHookBlock(t, body, "acd-flush-idle")
-	if !integrationEventCommandOK("opencode", "logical_boundary", block) {
-		t.Errorf("opencode idle hook must send a logical-boundary event:\n%s", block)
+	block := yamlHookBlock(t, body, "acd-wake-idle")
+	if !integrationEventCommandOK("opencode", "activity", block) {
+		t.Errorf("opencode idle hook must send a capture activity:\n%s", block)
 	}
 	if !strings.Contains(block, "session.idle") {
-		t.Errorf("opencode acd-flush-idle must bind to session.idle event:\n%s", block)
+		t.Errorf("opencode acd-wake-idle must bind to session.idle event:\n%s", block)
 	}
 }
 
-func TestSetup_Pi_IdleUsesLogicalBoundary(t *testing.T) {
+func TestSetup_Pi_IdleOnlyWakesProtection(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
 	// Same YAML marker contract as opencode (P2 #18).
 	const yamlMarker = "# acd-managed: true"
@@ -642,20 +669,20 @@ func TestSetup_Pi_IdleUsesLogicalBoundary(t *testing.T) {
 		t.Errorf("pi snippet missing %q marker:\n%s", yamlMarker, body)
 	}
 	if strings.Contains(body, "- id: acd-touch-idle") {
-		t.Errorf("pi snippet still has legacy `acd-touch-idle` id; expected `acd-flush-idle`:\n%s", body)
+		t.Errorf("pi snippet still has legacy `acd-touch-idle` id; expected `acd-wake-idle`:\n%s", body)
 	}
-	block := yamlHookBlock(t, body, "acd-flush-idle")
-	if !integrationEventCommandOK("pi", "logical_boundary", block) {
-		t.Errorf("pi idle hook must send a logical-boundary event:\n%s", block)
+	block := yamlHookBlock(t, body, "acd-wake-idle")
+	if !integrationEventCommandOK("pi", "activity", block) {
+		t.Errorf("pi idle hook must send a capture activity:\n%s", block)
 	}
 	if !strings.Contains(block, "session.idle") {
-		t.Errorf("pi acd-flush-idle must bind to session.idle event:\n%s", block)
+		t.Errorf("pi acd-wake-idle must bind to session.idle event:\n%s", block)
 	}
 }
 
 func TestSetup_OpenCode_HooksHaveNoShellLogging(t *testing.T) {
 	body := snippetBody(t, "opencode/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-wake-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
 		if strings.Contains(block, "mkdir -p") || strings.Contains(block, "-hook.log") {
 			t.Errorf("%s: hook must leave diagnostics to the integration command:\n%s", id, block)
@@ -665,7 +692,7 @@ func TestSetup_OpenCode_HooksHaveNoShellLogging(t *testing.T) {
 
 func TestSetup_Pi_HooksHaveNoShellLogging(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-wake-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
 		if strings.Contains(block, "mkdir -p") || strings.Contains(block, "-hook.log") {
 			t.Errorf("%s: hook must leave diagnostics to the integration command:\n%s", id, block)
@@ -683,47 +710,14 @@ func TestSetup_OpenCode_ActivityHooksUseOneEvent(t *testing.T) {
 
 // --- pi ---------------------------------------------------------------------
 
-func TestSetup_Pi_ActiveHooksStartBeforeWakeAndSessionFallbackIsStable(t *testing.T) {
+func TestFinishIntegrationHintsPiNeedsNoSession(t *testing.T) {
 	body := snippetBody(t, "pi/hooks.snippet.yaml")
-	if strings.Contains(body, "uuidgen") {
-		t.Fatalf("pi snippet must not create one-off session ids with uuidgen:\n%s", body)
-	}
-	for _, id := range []string{"acd-wake-tool-before", "acd-wake-tool-after"} {
+	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-wake-idle", "acd-stop"} {
 		block := yamlHookBlock(t, body, id)
-		assertUnifiedIntegrationEvent(t, id, block, "pi", "activity")
-		if !strings.Contains(block, `--session-id "${PI_SESSION_ID:-}"`) || !strings.Contains(block, `--watch-pid "$PPID"`) {
-			t.Fatalf("%s must let the integration command derive the Pi PID fallback:\n%s", id, block)
-		}
-		// Must not regress to the shared "unknown" placeholder.
-		if strings.Contains(block, `PI_SESSION_ID:-unknown`) {
-			t.Fatalf("%s reverted to shared 'unknown' SID — concurrent Pi sessions would collapse:\n%s", id, block)
-		}
-	}
-}
-
-// TestSetup_Pi_AllHooksUsePerProcessSIDFallback guards that every Pi event
-// passes the same empty-value override and watch PID to the shared fallback.
-func TestSetup_Pi_AllHooksUsePerProcessSIDFallback(t *testing.T) {
-	body := snippetBody(t, "pi/hooks.snippet.yaml")
-	for _, id := range []string{"acd-start", "acd-wake-tool-before", "acd-wake-tool-after", "acd-flush-idle", "acd-stop"} {
-		block := yamlHookBlock(t, body, id)
-		if !strings.Contains(block, `--session-id "${PI_SESSION_ID:-}"`) ||
-			!strings.Contains(block, `--watch-pid "$PPID"`) {
-			t.Errorf("%s: must pass the Pi session value and watch PID:\n%s", id, block)
-		}
-	}
-}
-
-func TestPiSIDFallbackUsesWatchPID(t *testing.T) {
-	for _, watchPID := range []int{101, 202} {
-		event, err := normalizeIntegrationEvent(strings.NewReader(""), integrationEvent{
-			Harness: "pi", Kind: "activity", Repo: "/repo", WatchPID: watchPID,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if want := fmt.Sprintf("pi-%d", watchPID); event.SessionID != want {
-			t.Fatalf("watch PID %d produced session %q want %q", watchPID, event.SessionID, want)
+		for _, forbidden := range []string{"--session-id", "--watch-pid", "uuidgen", "finish", "logical_boundary"} {
+			if strings.Contains(block, forbidden) {
+				t.Fatalf("%s has obsolete hook action %s", id, forbidden)
+			}
 		}
 	}
 }
@@ -1027,34 +1021,23 @@ func TestSetup_NoArg_MultipleDetectedListsHarnesses(t *testing.T) {
 
 // --- alias tests ------------------------------------------------------------
 
-// TestSetup_InitAliasStillWorks verifies that invoking the command via the
-// hidden "init" compatibility command still produces the snippet on stdout and emits a deprecation
-// warning on stderr.
-func TestSetup_InitAliasStillWorks(t *testing.T) {
-	var outBuf, errBuf bytes.Buffer
-	// Simulate the user running: acd init claude-code
-	// Build the real root so Cobra resolves the hidden compatibility command.
+func TestSetup_InitAliasIsRemoved(t *testing.T) {
+	roots := withIsolatedHome(t)
+	var out, stderr bytes.Buffer
 	root := newRootCmd()
-	root.SetOut(&outBuf)
-	root.SetErr(&errBuf)
+	root.SetOut(&out)
+	root.SetErr(&stderr)
 	root.SetArgs([]string{"init", "claude-code"})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("expected exit 0 via init alias, got: %v\nstdout:\n%s\nstderr:\n%s",
-			err, outBuf.String(), errBuf.String())
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), `unknown command "init"`) {
+		t.Fatalf("retired init accepted: %v", err)
 	}
-
-	stdout := outBuf.String()
-	stderr := errBuf.String()
-
-	// The snippet must appear in stdout.
-	want := snippetBody(t, "claude-code/settings.snippet.json")
-	if !strings.Contains(stdout, strings.TrimSpace(want)) {
-		t.Errorf("init alias did not render claude-code snippet.\nwant substring:\n%s\ngot stdout:\n%s", want, stdout)
+	if strings.Contains(out.String(), "acd-managed") {
+		t.Fatal("retired command printed install snippet")
 	}
-
-	// A deprecation warning must appear in stderr.
-	if !strings.Contains(stderr, "compatibility alias") {
-		t.Errorf("init alias did not emit deprecation warning on stderr.\ngot stderr: %q", stderr)
+	for _, path := range []string{roots.RegistryPath(), roots.ManagedBinaryPath()} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("retired command mutated %s: %v", path, err)
+		}
 	}
 }
 
@@ -1062,8 +1045,7 @@ func TestSetup_InitAliasStillWorks(t *testing.T) {
 // "acd setup" in the Setup section and does not list "acd init" as a separate
 // visible command row.
 //
-// The compatibility command remains callable but is hidden from both root and
-// setup help. This test guards the root-help half of that contract.
+// The retired command must remain absent from root and setup help.
 func TestSetup_HelpHidesInitAlias(t *testing.T) {
 	root := newRootCmd()
 	var outBuf, errBuf bytes.Buffer
@@ -1137,8 +1119,8 @@ func TestSetupHelpExplainsMacOSSessionAccess(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	got := out.String()
-	for _, required := range []string{"macOS", "Full Disk Access is not required", "without credentials or network access", "AI semantic"} {
+	got := strings.Join(strings.Fields(out.String()), " ")
+	for _, required := range []string{"macOS", "Full Disk Access is not required", "without credentials or network access", "Intent and provider setup are optional"} {
 		if !strings.Contains(got, required) {
 			t.Fatalf("setup help missing %q:\n%s", required, got)
 		}

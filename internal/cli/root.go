@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -95,15 +94,6 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 
 func (w *countingWriter) BytesWritten() int64 { return w.written }
 
-type invocationContextKey struct{}
-
-type invocation struct {
-	Repo     string
-	JSON     bool
-	Quiet    bool
-	LogLevel slog.Level
-}
-
 type commandCapabilities struct {
 	Repository      bool
 	JSON            bool
@@ -157,11 +147,6 @@ func invocationCapabilities(command *cobra.Command) commandCapabilities {
 	}
 }
 
-func invocationFromContext(ctx context.Context) invocation {
-	value, _ := ctx.Value(invocationContextKey{}).(invocation)
-	return value
-}
-
 func newRootCmd() *cobra.Command {
 	var (
 		repoPath string
@@ -188,10 +173,6 @@ func newRootCmd() *cobra.Command {
 			if err := validateInvocationCapabilities(c); err != nil {
 				return err
 			}
-			ctx := context.WithValue(c.Context(), invocationContextKey{}, invocation{
-				Repo: repoPath, JSON: jsonOut, Quiet: quiet, LogLevel: level,
-			})
-			c.SetContext(ctx)
 			slog.SetDefault(slog.New(slog.NewTextHandler(c.ErrOrStderr(), &slog.HandlerOptions{Level: level})))
 			return nil
 		},
@@ -215,6 +196,7 @@ func newRootCmd() *cobra.Command {
 		withInvocationCapabilities(newOnCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newOffCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newProductListCmd(), commandCapabilities{JSON: true, Quiet: true, Interactive: true, Streaming: true}),
+		withInvocationCapabilities(newFinishCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newProductCommitAllCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newHistoryCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
 		withInvocationCapabilities(newRestoreCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}),
@@ -226,60 +208,7 @@ func newRootCmd() *cobra.Command {
 		newInternalCmd(),
 	)
 
-	cmd.AddCommand(
-		hideCompatibility(withInvocationCapabilities(newSetupInitCompatCmd(),
-			commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd setup", false),
-		hideCompatibility(withInvocationCapabilities(newConfigureCmd(),
-			commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}), "acd config edit", false),
-		hideCompatibility(withInvocationCapabilities(newSettingsCmd(),
-			commandCapabilities{Repository: true, Quiet: true, Interactive: true}), "acd config edit", false),
-		hideCompatibility(renameCompatibility(newConfigCredentialsCmd(), "auth"), "acd config credentials", false),
-		hideCompatibility(withInvocationCapabilities(newVersionCmd(), commandCapabilities{Quiet: true}), "acd --version", false),
-		hideCompatibility(withInvocationCapabilities(newCompatStartCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
-		hideCompatibility(withInvocationCapabilities(newCompatStopCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
-		hideCompatibility(withInvocationCapabilities(newCompatHintCmd("wake", "wake"), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
-		hideCompatibility(withInvocationCapabilities(newCompatHintCmd("touch", "soft_boundary"), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
-		hideCompatibility(withInvocationCapabilities(newCompatHintCmd("flush", "logical_boundary"), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "the managed ACD supervisor", true),
-		hideCompatibility(newEventsCompatibilityDelegate(), "acd history activity", false),
-		hideCompatibility(renameCompatibility(newSupportPromptCmd(), "prompt"), "acd support prompt", false),
-		hideCompatibility(renameCompatibility(newHistoryExplainCmd(), "explain"), "acd history explain", false),
-		hideCompatibility(renameCompatibility(newSupportRecoverCmd(), "fix"), "acd support recover", false),
-		hideCompatibility(newLogsCompatibilityDelegate(), "acd support logs", false),
-		hideCompatibility(renameCompatibility(newRepoStatsCmd(), "stats"), "acd repo stats", false),
-		hideCompatibility(renameCompatibility(newSupportDiagnoseCmd(), "diagnose"), "acd support diagnose", false),
-		hideCompatibility(newRecoverCompatibilityDelegate(), "acd support recover", false),
-		hideCompatibility(withInvocationCapabilities(newPauseCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd off", false),
-		hideCompatibility(withInvocationCapabilities(newResumeCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd on", false),
-		hideCompatibility(withInvocationCapabilities(newPurgeEventsCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd support recover", false),
-		hideCompatibility(newHookStdinExtractCmd(), "acd internal integration stdin-extract", true),
-		hideCompatibility(newHookCursorExtractCmd(), "acd internal integration cursor-extract", true),
-		hideCompatibility(withInvocationCapabilities(newGCCmd(), commandCapabilities{JSON: true, Quiet: true, Interactive: true}), "acd repo gc", false),
-		hideCompatibility(withInvocationCapabilities(newRewriteCommitsCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true, Interactive: true}), "acd history rewrite", false),
-		newRewriteAllHintCmd(),
-		hideCompatibility(withInvocationCapabilities(newCompatDaemonCmd(), commandCapabilities{Repository: true, JSON: true, Quiet: true}), "acd internal worker run", true),
-	)
-
 	return cmd
-}
-
-func newRewriteAllHintCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:    "rewrite-all",
-		Hidden: true,
-		Short:  "Use acd history rewrite to improve commit messages",
-		Long: `ACD does not rewrite all branch history automatically because that can
-change commits you do not own or intend to edit.
-
-Use acd history rewrite with an explicit selection. Start with --plan-only,
-review the plan, preview the apply with --dry-run, and finish with --yes.`,
-		Example: `  acd history rewrite --last 5 --plan-only
-  acd history rewrite --apply <plan-id-or-file> --dry-run
-  acd history rewrite --apply <plan-id-or-file> --yes`,
-		Args: cobra.NoArgs,
-		RunE: func(*cobra.Command, []string) error {
-			return invalidCommandError("acd rewrite-all does not rewrite history automatically; run `acd history rewrite --help`")
-		},
-	}
 }
 
 func parseLogLevel(value string) (slog.Level, error) {
@@ -347,11 +276,6 @@ func boolFlagEnabled(command *cobra.Command, name string) bool {
 	}
 	value, err := strconv.ParseBool(flag.Value.String())
 	return err == nil && value
-}
-
-func renameCompatibility(command *cobra.Command, use string) *cobra.Command {
-	command.Use = use
-	return command
 }
 
 func flagWasSet(command *cobra.Command, name string) bool {

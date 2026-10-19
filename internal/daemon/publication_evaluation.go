@@ -2,30 +2,21 @@ package daemon
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"strings"
 	"sync"
 	"time"
-
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 // publicationEvaluation keeps the canonical worker as the sole state writer.
 // Only an immutable provider/scratch/verification call runs in the background;
-// the worker protects new bytes while that call is outstanding. The enclosing
-// replay retains its runtime lease and frozen inputs until this returns.
+// the worker protects new bytes while that call is outstanding. The explicit
+// request retains its frozen inputs until this returns.
 type publicationEvaluation struct {
 	gate                           *sync.RWMutex
-	db                             *state.DB
 	cancel                         context.CancelFunc
 	identity                       func(context.Context) (string, error)
 	protect                        func(context.Context) error
 	wake, files, changes, shutdown <-chan struct{}
-	onShutdown                     func()
 	interval                       time.Duration
 }
 
@@ -107,9 +98,6 @@ func evaluatePublication[T any](ctx context.Context, run func(context.Context) (
 		case <-ctx.Done():
 			return abort(ctx.Err())
 		case <-evaluation.shutdown:
-			if evaluation.onShutdown != nil {
-				evaluation.onShutdown()
-			}
 			return abort(context.Canceled)
 		case <-evaluation.wake:
 			activity = true
@@ -142,104 +130,4 @@ func evaluatePublication[T any](ctx context.Context, run func(context.Context) (
 		}
 		timer.Reset(delay)
 	}
-}
-
-// Candidate membership, desired configuration and restore journals can change
-// without moving HEAD. Include them in the apply proof; protection-only
-// checkpoints intentionally do not affect it.
-func publicationEvaluationIdentity(ctx context.Context, repoRoot, gitDir string, db *state.DB, cctx CaptureContext) (string, error) {
-	token, err := BranchGenerationToken(ctx, repoRoot)
-	if err != nil {
-		return "", err
-	}
-	if _, active := gitOperationInProgress(gitDir); active {
-		return "", errPublicationEvaluationStale
-	}
-	pause, err := daemonPauseState(ctx, gitDir, db)
-	if err != nil {
-		return "", err
-	}
-	if pause.Active {
-		return "", errPublicationEvaluationStale
-	}
-	runtime, err := state.RuntimeConfigActivationState(ctx, db)
-	if err != nil {
-		return "", err
-	}
-	candidates, err := state.IntentCandidatesForPair(ctx, db, cctx.BranchRef, cctx.BranchGeneration, state.IntentCandidateMaxOpenPerPair)
-	if err != nil {
-		return "", err
-	}
-	var restores int64
-	var restoreTS float64
-	err = db.ReadSQL().QueryRowContext(ctx, "SELECT COUNT(*), COALESCE(MAX(updated_ts),0) FROM restore_operations").Scan(&restores, &restoreTS)
-	if err != nil {
-		return "", err
-	}
-	drain, err := PublicationDrainBarrierForPair(ctx, db, cctx.BranchRef, cctx.BranchGeneration)
-	if err != nil {
-		return "", err
-	}
-	var drainID string
-	var urgency intentPublicationUrgency
-	if drain != nil {
-		drainID = drain.ID
-	} else {
-		// A new foreground request cancels background evaluation. Reattaching
-		// to an already active target must not cancel its provider work.
-		_, err = state.MetaGetJSON(ctx, db, metaKeyIntentPublicationUrgency, &urgency)
-		if err != nil {
-			return "", err
-		}
-		if urgency.BranchRef != cctx.BranchRef || urgency.BranchGeneration != cctx.BranchGeneration {
-			urgency = intentPublicationUrgency{}
-		}
-	}
-	data, err := json.Marshal([]any{token, runtime.DesiredRevisionID, runtime.AppliedRevisionID, candidates, restores, restoreTS, drainID, urgency})
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
-}
-
-// Health bookkeeping runs on the worker, around the immutable message call.
-func generatePublicationMessage(ctx context.Context, fn MessageFn, event EventContext, health *IntentPlannerHealth) (string, error) {
-	var permit IntentPlannerHealthPermit
-	if health != nil {
-		var err error
-		permit, err = health.Acquire(ctx)
-		if err != nil {
-			return "", err
-		}
-	}
-	message, err := evaluatePublication(ctx, func(jobCtx context.Context) (string, error) { return fn(jobCtx, event) })
-	if err == nil && strings.TrimSpace(message) == "" {
-		err = errors.New("selected provider returned an empty message")
-	}
-	if ai.ProviderNeedsConfiguration(err) {
-		if health != nil {
-			_ = health.Complete(ctx, permit, nil)
-		}
-		return "", err
-	}
-	if health != nil {
-		var failure error
-		if err != nil {
-			failure = &IntentPlannerTransportFailure{Err: err}
-		}
-		if healthErr := health.Complete(ctx, permit, failure); healthErr != nil {
-			return "", healthErr
-		}
-	}
-	if err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		wait := &IntentPlannerCircuitOpenError{}
-		if health != nil {
-			wait.RetryAt = time.Unix(0, int64(health.Snapshot().NextProbeTS*1e9))
-		}
-		return "", wait
-	}
-	return message, nil
 }

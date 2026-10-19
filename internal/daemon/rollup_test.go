@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 	"testing"
 	"time"
 
@@ -29,7 +30,7 @@ func insertEventOn(t *testing.T, db *state.DB, when time.Time, path, evState, co
 	if commit != "" {
 		ev.CommitOID = sql.NullString{String: commit, Valid: true}
 	}
-	seq, err := state.AppendCaptureEvent(ctx, db, ev, []state.CaptureOp{{
+	seq, err := testutil.SeedLegacyCapture(ctx, db, ev, []state.CaptureOp{{
 		Op: "create", Path: path, Fidelity: "full",
 		AfterMode: sql.NullString{String: "100644", Valid: true},
 		AfterOID:  sql.NullString{String: "abcd", Valid: true},

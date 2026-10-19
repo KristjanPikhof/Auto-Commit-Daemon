@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 )
 
 // LegacyWorkSummary is the source-only v19 safety projection used when a
@@ -27,17 +29,23 @@ func ReadLegacyWorkSummary(ctx context.Context, dbPath string) (LegacyWorkSummar
 	q := url.Values{}
 	q.Add("mode", "ro")
 	q.Add("_pragma", "busy_timeout(5000)")
-	db, err := sql.Open(driverName, "file:"+dbPath+"?"+q.Encode())
+	db, err := sql.Open(driverName, paths.DatabaseURI(dbPath, q))
 	if err != nil {
 		return summary, err
 	}
 	defer db.Close()
-	if err := db.QueryRowContext(ctx, `
+	hasCaptures, err := legacyTableExists(ctx, db, "capture_events")
+	if err != nil {
+		return summary, err
+	}
+	if hasCaptures {
+		if err := db.QueryRowContext(ctx, `
 SELECT
   COALESCE(SUM(CASE WHEN state IN ('pending','blocked_conflict','failed') THEN 1 ELSE 0 END),0),
   COALESCE(SUM(CASE WHEN state IN ('blocked_conflict','failed') THEN 1 ELSE 0 END),0)
 FROM capture_events`).Scan(&summary.Unpublished, &summary.Terminal); err != nil {
-		return summary, fmt.Errorf("state: legacy work summary: %w", err)
+			return summary, fmt.Errorf("state: legacy work summary: %w", err)
+		}
 	}
 	var hasJournal int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='self_publications'`).Scan(&hasJournal); err != nil {

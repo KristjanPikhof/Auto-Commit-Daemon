@@ -64,8 +64,8 @@ func newConfigSetCmd() *cobra.Command {
 ACD validates the name and value before saving a draft. The next-step command
 opens the matching scope for review and activation.`,
 		Example: `  acd config set commit.strategy intent
-  acd config set commit.preset balanced
-  acd config set commit.strategy event --scope global`,
+  acd config set commit.format conventional
+  acd config set commit.strategy local --scope global`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -83,10 +83,10 @@ func newConfigResetCmd() *cobra.Command {
 		Long: `Remove one saved setting, or all settings in the selected scope when
 no key is supplied. ACD then uses the next inherited value.
 
-The command shows a preview unless --yes is supplied.`,
+The command saves a draft. Review the inherited settings with acd config before
+applying them.`,
 		Example: `  acd config reset commit.strategy
-  acd config reset commit.strategy --yes
-  acd config reset --scope global --yes`,
+  acd config reset --scope global`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -165,8 +165,8 @@ func runConfigGet(ctx context.Context, out io.Writer, repo string, options confi
 	if err != nil {
 		return err
 	}
-	input, selected := configInput(target)
-	resolved, _, err := config.ResolveAll(input, selected)
+	input, _ := configInput(target)
+	resolved, err := config.ResolveAll(input)
 	if err != nil {
 		return fmt.Errorf("acd config get: %w", err)
 	}
@@ -192,7 +192,7 @@ func runConfigGet(ctx context.Context, out io.Writer, repo string, options confi
 		fmt.Fprintf(out, "%s=%s\t%s\n", value.Name, value.Value, value.Source)
 	}
 	if target.Scope == "repo" {
-		fmt.Fprintf(out, "To inherit global defaults again: acd config edit --repo %s --inherit\n", productListShellQuote(target.Repo))
+		fmt.Fprintf(out, "To inherit global defaults again: acd config reset --repo %s\n", productListShellQuote(target.Repo))
 	}
 	return nil
 }
@@ -268,16 +268,18 @@ func runConfigReset(ctx context.Context, out io.Writer, repo string, options con
 }
 
 func configInput(target resolvedConfigTarget) (config.ResolveInput, config.Overrides) {
-	input := config.ResolveInput{Global: target.Document.Settings.Global, LookupEnv: os.LookupEnv}
+	input := config.ResolveInput{Global: target.Document.Settings.Global, LookupEnv: os.LookupEnv, LegacyDefaults: config.LegacyFinishDefaults(target.Document, []string{"global"}, os.LookupEnv)}
 	switch target.Scope {
 	case "repo":
 		repository := target.Document.Settings.Repositories[target.WorktreeID]
 		input.Repository = repository.Fields
 		input.Profile = target.Document.Settings.Profiles[repository.Profile].Fields
+		input.LegacyDefaults = config.LegacyFinishDefaults(target.Document, []string{"repository:" + target.WorktreeID, "profile:" + repository.Profile, "global"}, os.LookupEnv)
 		return input, repository.Fields
 	case "profile":
 		profile := target.Document.Settings.Profiles[target.Profile]
 		input.Profile = profile.Fields
+		input.LegacyDefaults = config.LegacyFinishDefaults(target.Document, []string{"profile:" + target.Profile, "global"}, os.LookupEnv)
 		return input, profile.Fields
 	default:
 		return input, target.Document.Settings.Global

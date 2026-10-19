@@ -20,6 +20,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 func TestProductListAllNeedsActionHumanRendersThenExitsThree(t *testing.T) {
@@ -65,7 +66,7 @@ func TestProductListOnceNeedsActionJSONRendersThenExitsThree(t *testing.T) {
 		t.Fatalf("unexpected repository aggregate: %+v", entry)
 	}
 	raw := out.String()
-	for _, field := range []string{`"worker_state"`, `"operational_state"`, `"blocked_events"`, `"last_activity_at"`, `"publication_drain"`} {
+	for _, field := range []string{`"worker_state"`, `"operational_state"`, `"blocked_events"`, `"last_activity_at"`, `"publication_outcome"`} {
 		if !strings.Contains(raw, field) {
 			t.Fatalf("JSON output missing additive field %s:\n%s", field, raw)
 		}
@@ -116,235 +117,6 @@ func TestProductListNeedsActionDominatesMixedStates(t *testing.T) {
 	}
 }
 
-func TestProductListDrainAndPendingLabels(t *testing.T) {
-	if got := productListMode(productListEntry{PublicationProgress: publicationProgressReport{
-		Strategy: "intent", TemporaryLocalFallback: true,
-	}}); got != "intent" {
-		t.Fatalf("configured Intent mode rendered as %q during local recovery", got)
-	}
-	entries := []productListEntry{
-		{Repo: "/active", Enabled: true, Protected: true,
-			State: productStatePublishing, PendingEvents: 22,
-			PublicationDrain:    publicationDrainReport{ID: "drain", Phase: "semantic", PublishedEvents: 7, TargetEvents: 12, RemainingEvents: 5},
-			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "commit_all", Phase: "intent_planning", QueuePending: 22, TargetRemaining: 5, TargetTotal: 12, LastProgressTS: 1, LastProgressAgeSeconds: 90}},
-		{Repo: "/pending", Enabled: true, Protected: true,
-			State: productStateWaiting, PendingEvents: 3,
-			PublicationProgress: publicationProgressReport{Strategy: "intent", Phase: "intent_wait", QueuePending: 3, WaitRemainingSeconds: 42, LastProgressTS: 1, LastProgressAgeSeconds: 8}},
-		{Repo: "/recovering", Enabled: true, Protected: true,
-			State: productStatePublishing, PendingEvents: 7,
-			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "intent_recovery", Phase: "intent_replanning", QueuePending: 7, TargetRemaining: 4, TargetTotal: 6, LastProgressTS: 1, LastProgressAgeSeconds: 12}},
-		{Repo: "/blocked", Enabled: true, Protected: true, ActionRequired: true,
-			State: productStateNeedsAction, PendingEvents: 7,
-			PublicationProgress: publicationProgressReport{Strategy: "intent", Origin: "intent_recovery", Phase: "needs_action", NeedsAttention: true, QueuePending: 7, TargetRemaining: 4, TargetTotal: 6, LastProgressTS: 1, LastProgressAgeSeconds: 12}},
-		{Repo: "/completed", Enabled: true, Protected: true,
-			State:               productStateProtected,
-			PublicationDrain:    publicationDrainReport{ID: "drain", Phase: "completed", PublishedEvents: 12, TargetEvents: 12},
-			PublicationProgress: publicationProgressReport{Strategy: "intent", Phase: "idle"}},
-	}
-
-	var out bytes.Buffer
-	if err := renderProductListDashboard(&out, entries, false, true); err != nil {
-		t.Fatalf("render table: %v", err)
-	}
-	for _, row := range []struct {
-		repo, mode, queue, target, phase string
-	}{
-		{"active", "intent", "22", "commit-all:5/12", "intent-plan"},
-		{"pending", "intent", "3", "-", "wait:42s"},
-		{"recovering", "intent", "7", "recover:4/6", "intent-replan"},
-		{"blocked", "intent", "7", "recover:4/6", "blocked"},
-		{"completed", "intent", "0", "-", "idle"},
-	} {
-		line := productListLineForRepo(t, out.String(), row.repo)
-		fields := strings.Fields(line)
-		if len(fields) < 8 || fields[2] != row.mode || fields[3] != row.queue ||
-			fields[4] != row.target || fields[6] != row.phase {
-			t.Fatalf("row %q progress=%v, want mode=%q queue=%q target=%q phase=%q:\n%s",
-				row.repo, fields, row.mode, row.queue, row.target, row.phase, line)
-		}
-	}
-	if line := productListLineForRepo(t, out.String(), "completed"); !strings.Contains(line, "healthy") {
-		t.Fatalf("completed drain did not return to healthy: %s", line)
-	}
-	if line := productListLineForRepo(t, out.String(), "blocked"); !strings.Contains(line, "needs action") {
-		t.Fatalf("exhausted recovery did not require action: %s", line)
-	}
-}
-
-func TestProductListDoesNotMaskActiveIntentRecoveryAsCheckpointing(t *testing.T) {
-	record := central.RepoRecord{
-		Path: "/repo", RepositoryID: "repo-id", WorktreeID: "worktree-id",
-	}
-	overview := productListRepoOverview{report: statusReport{
-		Daemon: "running", PID: os.Getpid(), PendingEvents: 7,
-		CheckpointProtectionAvailable: true, Protected: false, Busy: true,
-		OperationalState: "busy",
-		IntentStrategy:   intentStrategyReport{Strategy: "intent", Active: true},
-		PublicationProgress: publicationProgressReport{
-			Strategy: "intent", Origin: "intent_recovery",
-			Phase: "intent_replanning", QueuePending: 7,
-			TargetRemaining: 4, TargetTotal: 6,
-		},
-	}}
-	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
-		RepositoryID: record.RepositoryID, State: "running",
-	}, overview, nil)
-	if !strings.Contains(entry.Summary, "automatically rebuilding semantic") ||
-		strings.Contains(entry.Summary, "checkpointing") {
-		t.Fatalf("active recovery entry=%+v", entry)
-	}
-
-	overview.report.PublicationProgress.Phase = "needs_action"
-	overview.report.PublicationProgress.NeedsAttention = true
-	overview.report.PublicationProgress.AttentionReason =
-		"complete semantic prefix failed verification"
-	entry = productListEntryFromOverview(record, supervisor.WorkerStatus{
-		RepositoryID: record.RepositoryID, State: "running",
-	}, overview, nil)
-	if !entry.ActionRequired || entry.State != productStateNeedsAction ||
-		productListStatus(entry) != "needs action" ||
-		productListPhase(entry) != "blocked" ||
-		productListTarget(entry) != "recover:4/6" ||
-		entry.Summary != intentRecoveryVerificationAttentionSummary ||
-		!strings.Contains(entry.NextAction, "acd doctor") {
-		t.Fatalf("exhausted recovery entry=%+v", entry)
-	}
-}
-
-func TestProductListLoadsCurrentProviderWait(t *testing.T) {
-	t.Setenv("ACD_AI_TIMEOUT", "1m")
-	ctx := context.Background()
-	repo, dbPath, db := makeRepoStateDB(t)
-	now := time.Now().Truncate(time.Second)
-	branchRef := "refs/heads/main"
-	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
-		PID: os.Getpid(), Mode: "running", HeartbeatTS: float64(now.Unix()),
-		BranchRef: sql.NullString{String: branchRef, Valid: true},
-		BranchGeneration: sql.NullInt64{
-			Int64: 1, Valid: true,
-		},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := state.MetaSetMany(ctx, db, map[string]string{
-		daemon.MetaKeyProtectionObservationEpoch: "1",
-		daemon.MetaKeyProtectionCoveredEpoch:     "1",
-		daemon.MetaKeyProtectionCheckpointID:     "checkpoint",
-		daemon.MetaKeyProtectionComplete:         "true",
-		"commit.strategy":                        "intent",
-		"ai.provider":                            "openai-compat",
-		"ai.model":                               "gpt-test",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	seq, err := state.AppendCaptureEvent(ctx, db, state.CaptureEvent{
-		BranchRef: branchRef, BranchGeneration: 1, BaseHead: "head",
-		Operation: "modify", Path: "main.go", Fidelity: "exact",
-		CapturedTS: float64(now.Add(-10 * time.Minute).Unix()),
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
-		PlannedTS: float64(now.Add(-time.Minute).Unix()),
-		Provider:  sql.NullString{String: "openai-compat", Valid: true},
-		Model:     sql.NullString{String: "gpt-test", Valid: true},
-		BranchRef: branchRef, BranchGeneration: 1,
-		OfferedSeqs: []int64{seq}, VisibleOriginalSeqs: []int64{seq},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	run, err := state.EnsureIntentPlanRun(ctx, db, state.IntentPlanRun{
-		Fingerprint: "sha256:provider-wait", BranchRef: branchRef,
-		BranchGeneration: 1, AttemptLimit: 3,
-		Provider: sql.NullString{String: "openai-compat", Valid: true},
-		Model:    sql.NullString{String: "gpt-test", Valid: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	run.UnresolvedSeqs = []int64{seq}
-	run.ProgressState = sql.NullString{String: "waiting_message_rewrite", Valid: true}
-	run.ResolutionMode = sql.NullString{String: "waiting_message_rewrite", Valid: true}
-	if err := state.UpdateIntentPlanRun(ctx, db, run); err != nil {
-		t.Fatal(err)
-	}
-	// A newer window on another branch must not replace the active branch's
-	// locked-message state in the repository overview.
-	if _, err := state.AppendIntentPlannerWindow(ctx, db, state.IntentPlannerWindow{
-		PlannedTS: float64(now.Unix()), BranchRef: "refs/heads/other",
-		BranchGeneration: 1, OfferedSeqs: []int64{seq + 1},
-		VisibleOriginalSeqs: []int64{seq + 1},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	health := daemon.IntentPlannerHealthSnapshot{
-		State:               daemon.IntentPlannerCircuitOpen,
-		ProviderFingerprint: testPlannerHealthFingerprint(),
-		ConsecutiveFailures: 1,
-		NextProbeTS:         float64(now.Add(5 * time.Minute).Unix()),
-	}
-	if err := state.MetaSetJSON(ctx, db, daemon.MetaKeyIntentPlannerHealth, struct {
-		Version int `json:"version"`
-		daemon.IntentPlannerHealthSnapshot
-	}{Version: 1, IntentPlannerHealthSnapshot: health}); err != nil {
-		t.Fatal(err)
-	}
-
-	record := central.RepoRecord{
-		Path: repo, StateDB: dbPath, RepositoryID: "repository-id",
-		WorktreeID: "worktree-id",
-	}
-	overview, err := readProductListRepo(ctx, record, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	progress := overview.report.PublicationProgress
-	if progress.Phase != "provider_wait" || progress.PlannerProvider != "openai-compat" ||
-		overview.report.IntentStrategy.LastPlannerWindow == nil ||
-		overview.report.IntentStrategy.LastPlannerWindow.BranchRef != branchRef ||
-		overview.report.IntentStrategy.ResolutionMode != "waiting_message_rewrite" {
-		t.Fatalf("provider wait overview=%+v strategy=%+v",
-			progress, overview.report.IntentStrategy)
-	}
-	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
-		RepositoryID: record.RepositoryID, State: "running",
-	}, overview, nil)
-	if got := productListStatus(entry); got != "waiting" {
-		t.Fatalf("provider wait status=%q entry=%+v", got, entry)
-	}
-	if progress.WaitRemainingSeconds != 300 || overview.report.PublicationOutcome.RetryAt != health.NextProbeTS || productListPhase(entry) != "provider-wait:5m" {
-		t.Fatalf("list lost persisted retry deadline: progress=%+v outcome=%+v phase=%s", progress, overview.report.PublicationOutcome, productListPhase(entry))
-	}
-	for _, circuit := range []daemon.IntentPlannerCircuitState{
-		daemon.IntentPlannerCircuitOpen, daemon.IntentPlannerCircuitHalfOpen, daemon.IntentPlannerCircuitClosed,
-	} {
-		health.State = circuit
-		if err := state.MetaSetJSON(ctx, db, daemon.MetaKeyIntentPlannerHealth, struct {
-			Version int `json:"version"`
-			daemon.IntentPlannerHealthSnapshot
-		}{Version: 1, IntentPlannerHealthSnapshot: health}); err != nil {
-			t.Fatal(err)
-		}
-		overview, err := readProductListRepo(ctx, record, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		report, err := buildStatusReport(ctx, record, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		wantRetry := float64(0)
-		if circuit == daemon.IntentPlannerCircuitOpen {
-			wantRetry = health.NextProbeTS
-		}
-		if overview.report.PublicationOutcome.RetryAt != wantRetry || report.PublicationOutcome.RetryAt != wantRetry {
-			t.Fatalf("%s circuit exposed stale retry: list=%f status=%f want=%f", circuit,
-				overview.report.PublicationOutcome.RetryAt, report.PublicationOutcome.RetryAt, wantRetry)
-		}
-	}
-}
-
 func TestProductListNextActionTargetsQuotedRepository(t *testing.T) {
 	roots := withIsolatedHome(t)
 	repo := materializeProductListRepoWithSpaces(t)
@@ -372,7 +144,7 @@ func TestProductListWatchNeedsActionContinuesRefreshing(t *testing.T) {
 	defer cancel()
 	out := &productListFrameWriter{cancel: cancel, want: 2}
 
-	if err := runProductListWatchView(ctx, out, time.Millisecond, false, true); err != nil {
+	if err := runProductListWatchDisplay(ctx, out, time.Millisecond, false, true, false); err != nil {
 		t.Fatalf("watch: %v", err)
 	}
 	if frames := out.frameCount(); frames < 2 {
@@ -579,7 +351,7 @@ func TestProductListWatchWaitsAfterEachFrame(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	out := &productListFrameWriter{cancel: cancel, want: 2}
-	if err := runProductListWatchView(ctx, out, 20*time.Millisecond, false, false); err != nil {
+	if err := runProductListWatchDisplay(ctx, out, 20*time.Millisecond, false, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(started) < 2 {
@@ -601,7 +373,7 @@ func TestProductListWatchCancellationDoesNotRenderPartialFrame(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var out bytes.Buffer
-	if err := runProductListWatchView(ctx, &out, time.Second, false, false); err != nil {
+	if err := runProductListWatchDisplay(ctx, &out, time.Second, false, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if out.Len() != 0 {
@@ -656,7 +428,7 @@ func TestProductListWatchKeepsKnownAttentionAcrossUnknownRead(t *testing.T) {
 	t.Cleanup(func() { productListCollect = original })
 
 	out := &productListFrameWriter{cancel: cancel, want: 2}
-	if err := runProductListWatchView(ctx, out, time.Millisecond, false, false); err != nil {
+	if err := runProductListWatchDisplay(ctx, out, time.Millisecond, false, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if count := strings.Count(out.String(), "needs action"); count != 2 {
@@ -694,7 +466,7 @@ func TestProductListWatchShowsRefreshingAfterKnownWork(t *testing.T) {
 			}
 			t.Cleanup(func() { productListCollect = original })
 			out := &productListFrameWriter{cancel: cancel, want: 2}
-			if err := runProductListWatchView(ctx, out, time.Millisecond, false, false); err != nil {
+			if err := runProductListWatchDisplay(ctx, out, time.Millisecond, false, false, false); err != nil {
 				t.Fatal(err)
 			}
 			if strings.Count(out.String(), "refreshing") < 1 || strings.Count(out.String(), "healthy") > 1 {
@@ -718,8 +490,13 @@ func TestProductListReadFailuresDoNotMigrate(t *testing.T) {
 			t.Fatal(err)
 		}
 		record := central.RepoRecord{Path: t.TempDir(), StateDB: dbPath, RepositoryID: "repository-id", WorktreeID: "worktree-id"}
-		if _, err := readProductListRepo(context.Background(), record, time.Now()); err == nil {
-			t.Fatal("pre-checkpoint database unexpectedly produced a healthy overview")
+		overview, err := readProductListRepo(context.Background(), record, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := productListEntryFromOverview(record, supervisor.WorkerStatus{}, overview, nil)
+		if entry.Protected || !entry.ActionRequired {
+			t.Fatalf("pre-checkpoint state was reported protected: %+v", entry)
 		}
 		assertProductListSchemaUnchanged(t, dbPath, 19)
 	})
@@ -800,7 +577,8 @@ func TestProductListSortingUsesActivityThenPath(t *testing.T) {
 
 func TestProductListHooksCountButWorkerHeartbeatsDoNot(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "state.db")
+	repo := materializeTestRepo(t, true)
+	dbPath := filepath.Join(repo, ".git", "acd", "state.db")
 	db, err := state.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -811,16 +589,19 @@ func TestProductListHooksCountButWorkerHeartbeatsDoNot(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := state.RegisterClient(ctx, db, state.Client{
+	if err := testutil.SeedLegacyClient(ctx, db, testutil.LegacyClient{
 		SessionID: "session", Harness: "codex", LastSeenTS: float64(now.Unix()),
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MetaSet(ctx, db, "activity.last_event_ts", fmt.Sprint(now.Unix())); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	record := central.RepoRecord{
-		Path: t.TempDir(), StateDB: dbPath, LastSeenTS: 100,
+		Path: repo, StateDB: dbPath, LastSeenTS: 100,
 		RepositoryID: "repository-id", WorktreeID: "worktree-id",
 	}
 	overview, err := readProductListRepo(ctx, record, now)
@@ -868,50 +649,37 @@ func TestProductListStatusMapsOperationalWork(t *testing.T) {
 	}
 }
 
-func TestProductListStartingWorkerIsWorking(t *testing.T) {
-	record := central.RepoRecord{Path: "/repo", RepoHash: "abcdef", RepositoryID: "repository-id", WorktreeID: "worktree-id"}
-	overview := productListRepoOverview{
-		report: statusReport{Repo: record.Path, Daemon: "stopped", OperationalState: "stopped"},
-	}
-	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
-		RepositoryID: record.RepositoryID, State: "backoff", LastError: "retrying",
-	}, overview, nil)
-	if entry.ActionRequired || productListStatus(entry) != "working" {
-		t.Fatalf("retrying worker entry=%+v status=%q", entry, productListStatus(entry))
-	}
-
-	overview.report.PublicationDrain.Phase = state.PublicationDrainNeedsAction
-	entry = productListEntryFromOverview(record, supervisor.WorkerStatus{
-		RepositoryID: record.RepositoryID, State: "backoff", LastError: "retrying",
-	}, overview, nil)
-	if !entry.ActionRequired || productListStatus(entry) != "needs action" {
-		t.Fatalf("drain failure was hidden by worker retry: %+v status=%q", entry, productListStatus(entry))
-	}
-}
-
 func TestProductListIncompleteCheckpointIsWorking(t *testing.T) {
-	record := central.RepoRecord{
-		Path: "/repo", RepoHash: "abcdef", RepositoryID: "repository-id", WorktreeID: "worktree-id",
+	record, db, _ := finishStatusFixture(t)
+	finishStatusWrite(t, record.Path, "goal.txt", "saved")
+	finishStatusCheckpoint(t, record, db)
+	if _, err := daemon.BeginProtectionObservation(t.Context(), db); err != nil {
+		t.Fatal(err)
 	}
-	overview := productListRepoOverview{report: statusReport{
-		Repo: record.Path, Daemon: "running", PID: os.Getpid(),
-		CheckpointProtectionAvailable: true, Protected: false,
-		OperationalState: "waiting",
-	}}
+	report := finishStatusRead(t, record, db)
 	entry := productListEntryFromOverview(record, supervisor.WorkerStatus{
 		RepositoryID: record.RepositoryID, State: "running",
-	}, overview, nil)
+	}, productListRepoOverview{report: report}, nil)
 	if entry.Protected || entry.ActionRequired || productListStatus(entry) != "working" {
 		t.Fatalf("active checkpoint entry=%+v status=%q", entry, productListStatus(entry))
 	}
+	finishStatusAssertViews(t, record, db, report)
 
-	overview.report.checkpointNeedsAction = true
+	// An unsupported control-character path produces an actual partial scan
+	// on every platform, without relying on the test process's permissions.
+	finishStatusWrite(t, record.Path, "unstable\nname.txt", "not eligible for a complete snapshot")
+	if sum := finishStatusCheckpoint(t, record, db); !sum.Partial {
+		t.Fatal("fixture did not produce a partial checkpoint")
+	}
+	report = finishStatusRead(t, record, db)
 	entry = productListEntryFromOverview(record, supervisor.WorkerStatus{
 		RepositoryID: record.RepositoryID, State: "running",
-	}, overview, nil)
-	if !entry.ActionRequired || productListStatus(entry) != "needs action" {
+	}, productListRepoOverview{report: report}, nil)
+	if entry.Protected || !entry.ActionRequired || productListStatus(entry) != "needs action" ||
+		entry.CaptureHealth.IssueCount == 0 || !strings.Contains(entry.NextAction, "acd doctor") {
 		t.Fatalf("checkpoint failure was hidden: %+v status=%q", entry, productListStatus(entry))
 	}
+	finishStatusAssertViews(t, record, db, report)
 }
 
 func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
@@ -932,7 +700,7 @@ func TestProductListTransientReadFailureIsNotNeedsAction(t *testing.T) {
 		t.Fatalf("JSON hid the unavailable protection read: %s err=%v", encoded, err)
 	}
 	var out bytes.Buffer
-	if err := renderProductListDashboard(&out, []productListEntry{entry}, false, true); err != nil {
+	if err := renderProductListSelection(&out, []productListEntry{entry}, 0, false, true); err != nil {
 		t.Fatal(err)
 	}
 	if line := productListLineForRepo(t, out.String(), "repo"); !strings.Contains(line, "-     -") {
@@ -955,10 +723,10 @@ func TestProductListVerboseIncludesOperationalDetails(t *testing.T) {
 		NextAction: "Run `acd doctor --repo '/repo'`.",
 	}
 	var out bytes.Buffer
-	if err := renderProductListDashboard(&out, []productListEntry{entry}, true, false); err != nil {
+	if err := renderProductListSelection(&out, []productListEntry{entry}, 0, true, false); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"REPOSITORY", "WORKER", "LIVE TOOLS", "BLOCKED", "LAST COMMIT", "needs action", "acd doctor --repo '/repo'"} {
+	for _, want := range []string{"REPOSITORY", "WORKER", "LEGACY CLIENTS", "ISSUES", "LAST COMMIT", "needs action", "acd doctor --repo '/repo'"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("verbose output missing %q:\n%s", want, out.String())
 		}

@@ -18,6 +18,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 )
 
 // installStopSignal replaces signalProcess with a stub that on receiving
@@ -48,49 +49,12 @@ func installStopSignal(t *testing.T, repoDir string) (*atomic.Int32, func()) {
 	return &count, func() { signalProcess = prev }
 }
 
-func TestStop_DefaultDeferredWhenPeerAlive(t *testing.T) {
-	_ = withIsolatedHome(t)
-	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	for _, sid := range []string{"s1", "s2"} {
-		if err := state.RegisterClient(ctx, db, state.Client{
-			SessionID: sid, Harness: "claude-code",
-		}); err != nil {
-			t.Fatalf("register %s: %v", sid, err)
-		}
-	}
-	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
-		PID: 99999, Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon state: %v", err)
-	}
-	_ = db.Close()
-
-	count, restore := installStopSignal(t, repoDir)
-	defer restore()
-
-	var out bytes.Buffer
-	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "s1", false); err != nil {
-		t.Fatalf("runStop: %v", err)
-	}
-	if count.Load() != 0 {
-		t.Fatalf("expected no signal when peer remains, got %d", count.Load())
-	}
-	var got stopRepoResult
-	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !got.Deferred || got.Peers != 1 {
-		t.Fatalf("expected deferred with 1 peer, got %+v", got)
-	}
-}
-
 func TestStop_NoSessionStopsDaemonWithoutDeregisteringClients(t *testing.T) {
 	_ = withIsolatedHome(t)
 	ctx := context.Background()
 	repoDir, _, db := makeRepoStateDB(t)
 	for _, sid := range []string{"s1", "s2"} {
-		if err := state.RegisterClient(ctx, db, state.Client{
+		if err := testutil.SeedLegacyClient(ctx, db, testutil.LegacyClient{
 			SessionID: sid, Harness: "claude-code",
 		}); err != nil {
 			t.Fatalf("register %s: %v", sid, err)
@@ -130,7 +94,8 @@ func TestStop_NoSessionStopsDaemonWithoutDeregisteringClients(t *testing.T) {
 		t.Fatalf("reopen state db: %v", err)
 	}
 	defer reopened.Close()
-	clients, err := state.CountClients(ctx, reopened)
+	var clients int
+	err = reopened.ReadSQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM daemon_clients`).Scan(&clients)
 	if err != nil {
 		t.Fatalf("count clients: %v", err)
 	}
@@ -213,51 +178,6 @@ func TestStop_NoSessionStopsDaemonWithNewerSchema(t *testing.T) {
 	}
 	if version != futureVersion {
 		t.Fatalf("user_version = %d, want %d", version, futureVersion)
-	}
-}
-
-func TestStop_DefaultLastSession_SIGTERM(t *testing.T) {
-	_ = withIsolatedHome(t)
-	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-	if err := state.RegisterClient(ctx, db, state.Client{
-		SessionID: "only", Harness: "claude-code",
-	}); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	// Use current process PID so identity.Alive returns true and the
-	// SIGTERM branch fires.
-	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
-		PID: 1, Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon state: %v", err)
-	}
-	_ = db.Close()
-
-	// Use stop signal that stamps mode="stopped" — also ensures the
-	// daemon's PID looks alive via identity.Alive(1) which is true on
-	// Linux/macOS (init exists). We control via the stub.
-	count, restore := installStopSignal(t, repoDir)
-	defer restore()
-
-	// Tighten the timeout so the test stays fast.
-	prev := stopWaitTimeout
-	stopWaitTimeout = 1 * time.Second
-	defer func() { stopWaitTimeout = prev }()
-
-	var out bytes.Buffer
-	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "only", false); err != nil {
-		t.Fatalf("runStop: %v", err)
-	}
-	if count.Load() != 1 {
-		t.Fatalf("expected 1 SIGTERM, got %d", count.Load())
-	}
-	var got stopRepoResult
-	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !got.Stopped || got.Deferred {
-		t.Fatalf("expected stopped=true deferred=false, got %+v", got)
 	}
 }
 
@@ -548,62 +468,6 @@ func TestStopAll_RoutesFailuresToFailedBucket(t *testing.T) {
 	}
 }
 
-// TestStop_DeferredRemovesOnlyCallerCache pins the P1 #7 acceptance:
-// `acd stop --session-id A` against a repo with a peer alive must
-// remove A's per-session start-cache file but leave B's intact.
-func TestStop_DeferredRemovesOnlyCallerCache(t *testing.T) {
-	_ = withIsolatedHome(t)
-	ctx := context.Background()
-	repoDir, _, db := makeRepoStateDB(t)
-
-	for _, sid := range []string{"sess-A", "sess-B"} {
-		if err := state.RegisterClient(ctx, db, state.Client{
-			SessionID: sid, Harness: "claude-code",
-		}); err != nil {
-			t.Fatalf("register %s: %v", sid, err)
-		}
-	}
-	if err := state.SaveDaemonState(ctx, db, state.DaemonState{
-		PID: 99999, Mode: "running", HeartbeatTS: nowFloat(), UpdatedTS: nowFloat(),
-	}); err != nil {
-		t.Fatalf("save daemon state: %v", err)
-	}
-	_ = db.Close()
-
-	gitDir := filepath.Join(repoDir, ".git")
-	pathA := startCachePath(gitDir, "sess-A")
-	pathB := startCachePath(gitDir, "sess-B")
-	for _, sid := range []string{"sess-A", "sess-B"} {
-		if err := os.WriteFile(startCachePath(gitDir, sid), []byte(`{"version":2}`), 0o600); err != nil {
-			t.Fatalf("seed cache %s: %v", sid, err)
-		}
-	}
-
-	count, restore := installStopSignal(t, repoDir)
-	defer restore()
-
-	var out bytes.Buffer
-	if err := encodeStoppedRepositoryForTest(ctx, &out, repoDir, "sess-A", false); err != nil {
-		t.Fatalf("runStop: %v", err)
-	}
-	if count.Load() != 0 {
-		t.Fatalf("expected no signal when peer remains, got %d", count.Load())
-	}
-	var got stopRepoResult
-	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !got.Deferred {
-		t.Fatalf("expected deferred, got %+v", got)
-	}
-	if _, err := os.Stat(pathA); !os.IsNotExist(err) {
-		t.Fatalf("session-A cache still present after deferred stop: %v", err)
-	}
-	if _, err := os.Stat(pathB); err != nil {
-		t.Fatalf("session-B cache must survive: %v", err)
-	}
-}
-
 // TestStop_ForceFailedEscalationWipesCaches pins the P1 #7 second
 // acceptance: when --force escalation fails (daemon survived SIGKILL),
 // every per-session cache is removed so subsequent active hooks cannot
@@ -621,7 +485,7 @@ func TestStop_ForceFailedEscalationWipesCaches(t *testing.T) {
 
 	gitDir := filepath.Join(repoDir, ".git")
 	for _, sid := range []string{"sess-A", "sess-B"} {
-		if err := os.WriteFile(startCachePath(gitDir, sid), []byte(`{"version":2}`), 0o600); err != nil {
+		if err := os.WriteFile(legacyStartCachePath(gitDir, sid), []byte(`{"version":2}`), 0o600); err != nil {
 			t.Fatalf("seed cache %s: %v", sid, err)
 		}
 	}
@@ -656,7 +520,7 @@ func TestStop_ForceFailedEscalationWipesCaches(t *testing.T) {
 		t.Fatalf("expected stopped=false (survived SIGKILL fixture), got %+v", got)
 	}
 	for _, sid := range []string{"sess-A", "sess-B"} {
-		p := startCachePath(gitDir, sid)
+		p := legacyStartCachePath(gitDir, sid)
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Fatalf("force-failed should have wiped %s cache, err=%v", sid, err)
 		}

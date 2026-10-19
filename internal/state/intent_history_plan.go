@@ -2,22 +2,14 @@ package state
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-const IntentHistoryPlanVersion = 1
+const IntentHistoryPlanVersion = 2
 const IntentHistoryPlanByteCap = 8 << 20
-const MetaKeyIntentHistoryRequest = "intent.history.request"
-const MetaKeyIntentHistoryWorker = "intent.history.worker"
-
-type IntentHistoryWorker struct {
-	PID         int    `json:"pid"`
-	Fingerprint string `json:"fingerprint"`
-	Protocol    int    `json:"protocol"`
-}
 
 // IntentHistoryVersion identifies an existing Git path version. Plans retain
 // object IDs and lineage, never source contents or provider responses.
@@ -41,30 +33,32 @@ type IntentHistoryGoal struct {
 	Units               []int    `json:"units"`
 	TreeOID             string   `json:"tree_oid"`
 	DependsOnCandidates []string `json:"depends_on_candidates,omitempty"`
+	OldOIDs             []string `json:"old_oids,omitempty"`
+	AuthorOID           string   `json:"author_oid,omitempty"`
 }
 
 // IntentHistoryPlan freezes both original provenance and proposed goal trees.
-// Explicit reconstruction creates a new branch and leaves the source untouched.
+// The saved target chooses an in-place rewrite or a new branch.
 type IntentHistoryPlan struct {
-	Version         int                 `json:"version"`
-	ID              string              `json:"id"`
-	SourceBranchRef string              `json:"source_branch_ref"`
-	TargetBranchRef string              `json:"target_branch_ref"`
-	ExpectedHead    string              `json:"expected_head"`
-	CommitFormat    string              `json:"commit_format"`
-	BaseTree        string              `json:"base_tree"`
-	SourceChain     []string            `json:"source_chain"`
-	Units           []IntentHistoryUnit `json:"units"`
-	Goals           []IntentHistoryGoal `json:"goals"`
-}
-
-type IntentHistoryRequest struct {
-	PlanID    string  `json:"plan_id"`
-	Status    string  `json:"status"`
-	Error     string  `json:"error,omitempty"`
-	NewHead   string  `json:"new_head,omitempty"`
-	BackupRef string  `json:"backup_ref,omitempty"`
-	UpdatedTS float64 `json:"updated_ts"`
+	Version                  int                 `json:"version"`
+	ID                       string              `json:"id"`
+	SourceBranchRef          string              `json:"source_branch_ref"`
+	TargetBranchRef          string              `json:"target_branch_ref"`
+	ExpectedHead             string              `json:"expected_head"`
+	CommitFormat             string              `json:"commit_format"`
+	BaseTree                 string              `json:"base_tree"`
+	SourceChain              []string            `json:"source_chain"`
+	Units                    []IntentHistoryUnit `json:"units"`
+	Goals                    []IntentHistoryGoal `json:"goals"`
+	Mode                     string              `json:"mode"`
+	MessagesOnly             bool                `json:"messages_only"`
+	RecreateUnchanged        []string            `json:"recreate_unchanged,omitempty"`
+	SourceRef                string              `json:"source_ref"`
+	VerificationConfigDigest string              `json:"verification_config_digest"`
+	Disclosure               json.RawMessage     `json:"disclosure,omitempty"`
+	PlanningDeadlineTS       float64             `json:"planning_deadline_ts,omitempty"`
+	PlanningCalls            int                 `json:"planning_calls,omitempty"`
+	SharedPlan               *finish.Plan        `json:"shared_plan,omitempty"`
 }
 
 // PrepareIntentHistoryPlan gives a standalone preview the same identity as a
@@ -122,62 +116,8 @@ func LoadIntentHistoryPlan(ctx context.Context, db *DB, id string) (IntentHistor
 	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
 		return plan, false, err
 	}
-	if plan.Version != IntentHistoryPlanVersion || plan.ID != id {
+	if (plan.Version != 1 && plan.Version != IntentHistoryPlanVersion) || plan.ID != id {
 		return plan, false, errors.New("state: invalid history plan identity")
 	}
 	return plan, true, nil
-}
-
-// EnqueueIntentHistoryRequest serializes explicit repair with the canonical
-// worker. One immutable plan may be pending; completed requests are reusable.
-func EnqueueIntentHistoryRequest(ctx context.Context, db *DB, planID string) error {
-	if _, ok, err := LoadIntentHistoryPlan(ctx, db, planID); err != nil {
-		return err
-	} else if !ok {
-		return errors.New("state: history plan missing")
-	}
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	var raw string
-	err = tx.QueryRowContext(ctx, "SELECT value FROM daemon_meta WHERE key=?", MetaKeyIntentHistoryRequest).Scan(&raw)
-	if err == nil {
-		var current IntentHistoryRequest
-		if err := json.Unmarshal([]byte(raw), &current); err != nil {
-			return err
-		}
-		if current.Status == "completed" && current.PlanID == planID {
-			return tx.Commit()
-		}
-		if current.Status == "pending" || current.Status == "running" {
-			if current.PlanID != planID {
-				return fmt.Errorf("state: another history request is active: %s", current.PlanID)
-			}
-			return tx.Commit()
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	request := IntentHistoryRequest{PlanID: planID, Status: "pending", UpdatedTS: nowSeconds()}
-	body, err := json.Marshal(request)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO daemon_meta(key,value,updated_ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_ts=excluded.updated_ts`, MetaKeyIntentHistoryRequest, string(body), request.UpdatedTS); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func LoadIntentHistoryRequest(ctx context.Context, db *DB) (IntentHistoryRequest, bool, error) {
-	var request IntentHistoryRequest
-	ok, err := MetaGetJSON(ctx, db, MetaKeyIntentHistoryRequest, &request)
-	return request, ok, err
-}
-
-func SaveIntentHistoryRequest(ctx context.Context, db *DB, request IntentHistoryRequest) error {
-	request.UpdatedTS = nowSeconds()
-	return MetaSetJSON(ctx, db, MetaKeyIntentHistoryRequest, request)
 }

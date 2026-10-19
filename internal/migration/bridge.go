@@ -48,10 +48,6 @@ type Bridge struct {
 	errors      map[string]error
 }
 
-func StartBridge(ctx context.Context, operationID string, records []central.RepoRecord, interval time.Duration) (*Bridge, error) {
-	return StartBridgeWithProgress(ctx, operationID, records, interval, nil)
-}
-
 // StartBridgeWithProgress starts the migration bridge and reports each
 // repository before its initial protection scan. Later background rescans do
 // not emit progress because they overlap other setup phases.
