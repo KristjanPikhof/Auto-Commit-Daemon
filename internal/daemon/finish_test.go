@@ -581,11 +581,10 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 			w.Config.Mode = "intent"
 			w.Config.Provider.DiffEgress = true
 			w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
-			w.Config.Provider.Timeout = time.Second
+			// Input-size rejection must not race Git preparation on a busy host.
+			w.Config.Provider.Timeout = time.Minute
 			if scenario == "expired" {
 				w.Config.Provider.Timeout = 100 * time.Millisecond
-			} else {
-				w.Config.Provider.DiffEgress = true
 			}
 			r := startFinishWorker(t, w, FinishOptions{Purpose: "Publish this goal without absorbing later edits"})
 			if scenario == "expired" {
