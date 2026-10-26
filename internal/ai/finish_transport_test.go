@@ -235,3 +235,43 @@ func TestFinishRemovalOpenAITransportLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestFinishOpenAIRejectionExplainsCauseWithoutSecrets(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"message":"Maximum context length exceeded. API key: test-key; password=abcdefgh12345678"},"request_body":"private echoed code"}`,
+		`{"error":{"message":"Use a smaller context window","code":400}}`,
+		`{"error":{"message":"` + strings.Repeat("x", 2000) + `"}}`,
+		`{"error":{"message":""},"secret":"private echoed code"}`,
+		`not JSON with private echoed code`,
+	} {
+		t.Run(body[:min(32, len(body))], func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+			p := &OpenAIProvider{BaseURL: server.URL, APIKey: "test-key", HTTP: server.Client()}
+			_, err := p.ExchangeFinish(t.Context(), []byte(`{}`))
+			var rejection *ProviderHTTPError
+			if !errors.As(err, &rejection) || rejection.StatusCode != 400 || calls.Load() != 1 {
+				t.Fatalf("rejection lost or retried: %v calls=%d", err, calls.Load())
+			}
+			for _, secret := range []string{"test-key", "abcdefgh12345678", "private echoed code"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("provider rejection leaked %q", secret)
+				}
+			}
+			if len([]rune(rejection.Detail)) > plannerErrorCap {
+				t.Fatal("unbounded rejection detail")
+			}
+			if strings.Contains(body, "Maximum context") && !strings.Contains(rejection.Detail, "Maximum context length exceeded") {
+				t.Fatal("actionable cause was discarded")
+			}
+			if strings.Contains(body, "smaller context") && rejection.Detail != "Use a smaller context window" {
+				t.Fatal("numeric provider code hid the message")
+			}
+		})
+	}
+}

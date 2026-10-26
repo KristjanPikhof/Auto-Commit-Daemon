@@ -110,6 +110,10 @@ process group and join its readers within bounded cleanup.
 
 ## Failure behavior
 
+HTTP failures retain the provider's standard `error.message`, with credential
+redaction and bounded output. Nonstandard or unreadable responses report the
+HTTP status and a generic rejection; ACD never prints an arbitrary error body.
+
 Intent allows one planning exchange and at most one combined correction under
 a single persisted deadline. `ai.timeout` defaults to five minutes. Transport
 failure, missing credentials, invalid output, or deadline exhaustion fails the

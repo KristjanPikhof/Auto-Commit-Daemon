@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Preserve bounded, redacted OpenAI-compatible rejection messages so a failed
+  finish explains the provider error instead of hiding it behind HTTP status.
+
 - Replace Intent's 128 KiB per-file and 512 KiB request limits with one
   configurable `ai.max_input_bytes` budget, defaulting to 8 MiB and supporting
   up to 64 MiB. Keep complete diffs, redaction, and whole-target verification

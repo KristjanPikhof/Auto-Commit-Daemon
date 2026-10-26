@@ -109,13 +109,30 @@ func (p *OpenAIProvider) ExchangeFinish(ctx context.Context, body []byte) ([]byt
 		return nil, errors.New("openai-compat: response exceeds 1 MiB")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: "finish request rejected"}
+		return nil, &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: finishHTTPErrorDetail(raw, p.APIKey)}
 	}
 	arguments, err := parseFinishToolArguments(raw)
 	if err != nil {
 		return nil, &finishOutputError{Err: err, Raw: raw}
 	}
 	return arguments, nil
+}
+
+// Only use the standard error message, never echo an arbitrary response body.
+func finishHTTPErrorDetail(raw []byte, apiKey string) string {
+	var response struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &response) != nil || strings.TrimSpace(response.Error.Message) == "" {
+		return "finish request rejected"
+	}
+	message := response.Error.Message
+	if apiKey != "" {
+		message = strings.ReplaceAll(message, apiKey, "[REDACTED]")
+	}
+	return SanitizePlannerError(finishRedactText(message))
 }
 
 func parseFinishToolArguments(raw []byte) ([]byte, error) {
