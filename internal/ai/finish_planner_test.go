@@ -73,8 +73,8 @@ func finishTestGoal(evidence finish.Evidence) finish.Goal {
 func finishAssertError(t *testing.T, err error, code string) {
 	t.Helper()
 	var failure *FinishPlanningError
-	if !errors.As(err, &failure) || failure.Code != code || !failure.Retryable() {
-		t.Fatalf("error = %v, want retryable %s", err, code)
+	if !errors.As(err, &failure) || failure.Code != code || failure.Retryable() != (code != "provider_input_too_large") {
+		t.Fatalf("error = %v, want %s", err, code)
 	}
 }
 
@@ -286,6 +286,7 @@ func TestFinishIntentBoundsAndNoFallback(t *testing.T) {
 	for _, scenario := range []string{"transport failure", "budget", "expired", "missing deadline", "missing diff", "binary text", "per-path cap", "redaction cap", "aggregate cap", "serialized cap", "invalid purpose", "invalid identifiers", "no-op"} {
 		t.Run(scenario, func(t *testing.T) {
 			options := finishTestOptions(evidence)
+			options.MaxInputBytes = 128 << 10
 			input := evidence
 			code := ""
 			paid := 0
@@ -315,25 +316,25 @@ func TestFinishIntentBoundsAndNoFallback(t *testing.T) {
 			case "per-path cap":
 				code = "provider_input_too_large"
 				options.DiffEgress = true
-				options.Diffs = []FinishDiff{{ChangeID: "settings.go", Text: strings.Repeat("x", FinishDiffByteCap+1)}}
+				options.Diffs = []FinishDiff{{ChangeID: "settings.go", Text: strings.Repeat("x", (128<<10)+1)}}
 			case "redaction cap":
 				code = "provider_input_too_large"
 				options.DiffEgress = true
-				options.Diffs = []FinishDiff{{ChangeID: "settings.go", Text: strings.Repeat("token=12345678\n", FinishDiffByteCap/len("token=12345678\n"))}}
+				options.Diffs = []FinishDiff{{ChangeID: "settings.go", Text: strings.Repeat("token=12345678\n", (128<<10)/len("token=12345678\n"))}}
 			case "aggregate cap":
 				options.Diffs = nil
 				code = "provider_input_too_large"
 				options.DiffEgress = true
 				input = finish.Evidence{Base: finish.Tree{}, Target: finish.Tree{}}
-				for i := 0; i <= FinishEvidenceDiffByteCap/FinishDiffByteCap; i++ {
+				for i := 0; i <= 1; i++ {
 					path := fmt.Sprintf("file-%d.go", i)
 					input.Target[path] = finishTestEntry("b")
-					options.Diffs = append(options.Diffs, FinishDiff{ChangeID: path, Text: strings.Repeat("x", FinishDiffByteCap)})
+					options.Diffs = append(options.Diffs, FinishDiff{ChangeID: path, Text: strings.Repeat("x", (128 << 10))})
 				}
 				input.Changes = finish.NetChanges(input.Base, input.Target, "author-a")
 			case "serialized cap":
 				code = "provider_input_too_large"
-				provider.padding = FinishRequestByteCap
+				provider.padding = (128 << 10)
 			case "invalid purpose":
 				code = "invalid_options"
 				options.Purpose = "\x1b[31m unsafe"
@@ -377,6 +378,7 @@ func TestFinishIntentBoundsAndNoFallback(t *testing.T) {
 func TestFinishIntentExactSerializedCapAndCorrectionCap(t *testing.T) {
 	evidence := finishTestEvidence()
 	options := finishTestOptions(evidence)
+	options.MaxInputBytes = 128 << 10
 	provider := &finishFakeTransport{exchange: func(context.Context, FinishPlanRequest) ([]byte, error) {
 		return finishTestOutput(finishTestGoal(evidence)), nil
 	}}
@@ -385,15 +387,15 @@ func TestFinishIntentExactSerializedCapAndCorrectionCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := provider.EncodeFinishRequest(request)
-	provider.padding = FinishRequestByteCap - len(body)
+	provider.padding = (128 << 10) - len(body)
 	result, err := PlanFinish(context.Background(), provider, evidence, options)
-	if err != nil || result.Disclosure.RequestBytes[0] != FinishRequestByteCap {
+	if err != nil || result.Disclosure.RequestBytes[0] != (128<<10) {
 		t.Fatalf("exact cap result=%+v err=%v", result, err)
 	}
 	provider.requests = nil
 	provider.padding = 0
 	provider.exchange = func(context.Context, FinishPlanRequest) ([]byte, error) {
-		return []byte(strings.Repeat("x", FinishRequestByteCap)), nil
+		return []byte(strings.Repeat("x", (128 << 10))), nil
 	}
 	result, err = PlanFinish(context.Background(), provider, evidence, options)
 	finishAssertError(t, err, "provider_input_too_large")

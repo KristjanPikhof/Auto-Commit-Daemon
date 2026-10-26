@@ -14,12 +14,22 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-const FinishDiffByteCap = 128 << 10
-const FinishEvidenceDiffByteCap = 512 << 10
-const FinishRequestByteCap = 512 << 10
+// One request budget covers every full diff and the encoded provider input.
+const FinishDefaultInputByteCap = config.DefaultAIInputBytes
+
+func FinishInputByteLimit(configured int) (int, error) {
+	if configured == 0 {
+		return FinishDefaultInputByteCap, nil
+	}
+	if configured < 128<<10 || configured > config.MaxAIInputBytes {
+		return 0, finishFailure("invalid_options", errors.New("ai.max_input_bytes must be between 131072 and 67108864 bytes"))
+	}
+	return configured, nil
+}
 
 // FinishTransport encodes the complete request before a planning call is spent.
 // ExchangeFinish performs exactly one exchange, without retry.
@@ -56,6 +66,7 @@ type FinishPlanRequest struct {
 }
 
 type FinishOptions struct {
+	MaxInputBytes int
 	// Deadline is the persisted attempt deadline, never renewed for correction.
 	Deadline   time.Time
 	Style      string
@@ -101,13 +112,13 @@ func (e *FinishPlanningError) Error() string {
 }
 func (e *FinishPlanningError) Unwrap() error { return e.Err }
 func (e *FinishPlanningError) Retryable() bool {
-	return e.Code != "provider_context_required" && e.Code != "provider_diffs_required"
+	return e.Code != "provider_context_required" && e.Code != "provider_diffs_required" && e.Code != "provider_input_too_large"
 }
 
 func finishFailure(code string, err error) error { return &FinishPlanningError{Code: code, Err: err} }
 
 func finishInputLimit(size, limit int) error {
-	return finishFailure("provider_input_too_large", fmt.Errorf("evidence is %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch, or a smaller explicit history range", size, limit))
+	return finishFailure("provider_input_too_large", fmt.Errorf("evidence is %d bytes; limit is %d bytes; increase ai.max_input_bytes in acd config and start a new finish if your provider supports larger input; otherwise use an explicit local finish for the complete offline batch, or a smaller explicit history range", size, limit))
 }
 
 // BuildFinishTransport constructs only the configured, explicitly approved
@@ -140,6 +151,10 @@ func BuildFinishTransport(cfg ProviderConfig, approved []ConfirmationRequirement
 // the provider cannot replace trees, versions, authors, or dependencies.
 func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.Evidence, options FinishOptions) (FinishPlanResult, error) {
 	var result FinishPlanResult
+	inputLimit, err := FinishInputByteLimit(options.MaxInputBytes)
+	if err != nil {
+		return result, err
+	}
 	if err := finish.ValidateEvidence(evidence); err != nil {
 		return result, finishFailure("invalid_evidence", err)
 	}
@@ -189,8 +204,8 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		if err != nil {
 			return result, finishFailure("provider_input", err)
 		}
-		if len(body) > FinishRequestByteCap {
-			return result, finishInputLimit(len(body), FinishRequestByteCap)
+		if len(body) > inputLimit {
+			return result, finishInputLimit(len(body), inputLimit)
 		}
 		if err := ctx.Err(); err != nil {
 			return result, finishFailure("provider_deadline", err)
@@ -242,6 +257,10 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 }
 
 func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (FinishPlanRequest, FinishDisclosure, error) {
+	inputLimit, err := FinishInputByteLimit(options.MaxInputBytes)
+	if err != nil {
+		return FinishPlanRequest{}, FinishDisclosure{}, err
+	}
 	if !options.DiffEgress {
 		return FinishPlanRequest{}, FinishDisclosure{}, finishFailure("provider_diffs_required", ErrIntentDiffsRequired)
 	}
@@ -280,12 +299,12 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 		if diff.Binary {
 			disclosure.BinaryChangeIDs = append(disclosure.BinaryChangeIDs, diff.ChangeID)
 		}
-		if len(diff.Text) > FinishDiffByteCap {
-			return request, disclosure, finishInputLimit(len(diff.Text), FinishDiffByteCap)
+		if len(diff.Text) > inputLimit {
+			return request, disclosure, finishInputLimit(len(diff.Text), inputLimit)
 		}
 		total += len(diff.Text)
-		if total > FinishEvidenceDiffByteCap {
-			return request, disclosure, finishInputLimit(total, FinishEvidenceDiffByteCap)
+		if total > inputLimit {
+			return request, disclosure, finishInputLimit(total, inputLimit)
 		}
 		if diff.Text != "" {
 			redacted := finishRedactText(diff.Text)
@@ -293,12 +312,12 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 			diff.Text = redacted
 			disclosure.TextChangeIDs = append(disclosure.TextChangeIDs, diff.ChangeID)
 		}
-		if len(diff.Text) > FinishDiffByteCap {
-			return request, disclosure, finishInputLimit(len(diff.Text), FinishDiffByteCap)
+		if len(diff.Text) > inputLimit {
+			return request, disclosure, finishInputLimit(len(diff.Text), inputLimit)
 		}
 		transmittedTotal += len(diff.Text)
-		if transmittedTotal > FinishEvidenceDiffByteCap {
-			return request, disclosure, finishInputLimit(transmittedTotal, FinishEvidenceDiffByteCap)
+		if transmittedTotal > inputLimit {
+			return request, disclosure, finishInputLimit(transmittedTotal, inputLimit)
 		}
 		request.Diffs = append(request.Diffs, diff)
 	}

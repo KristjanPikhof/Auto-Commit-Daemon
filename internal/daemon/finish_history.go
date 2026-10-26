@@ -24,6 +24,7 @@ import (
 type FinishHistoryOptions struct {
 	Mode, Style, Purpose, VerificationConfigDigest string
 	MessagesOnly, DiffEgress                       bool
+	MaxInputBytes                                  int
 	Deadline                                       time.Time
 	BeforeCall                                     func(context.Context) error
 }
@@ -72,7 +73,11 @@ func finishHistoryEvidence(ctx context.Context, repo string, chain []string) (fi
 	return evidence, units, base, finish.ValidateEvidence(evidence)
 }
 
-func finishHistoryDiffs(ctx context.Context, repo string, evidence finish.Evidence) ([]ai.FinishDiff, error) {
+func finishHistoryDiffs(ctx context.Context, repo string, evidence finish.Evidence, maxInputBytes int) ([]ai.FinishDiff, error) {
+	inputLimit, err := ai.FinishInputByteLimit(maxInputBytes)
+	if err != nil {
+		return nil, err
+	}
 	var result []ai.FinishDiff
 	total := 0
 	for _, change := range evidence.Changes {
@@ -84,13 +89,13 @@ func finishHistoryDiffs(ctx context.Context, repo string, evidence finish.Eviden
 		if err != nil {
 			return nil, err
 		}
-		diffs, err := finishProviderDiffs(ctx, repo, base, change.Provenance, []finish.Change{change}, true)
+		diffs, err := finishProviderDiffs(ctx, repo, base, change.Provenance, []finish.Change{change}, true, inputLimit)
 		if err != nil {
 			return nil, err
 		}
 		total += len(diffs[0].Text)
-		if total > ai.FinishHistoryDiffByteCap {
-			return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact history diffs total %d bytes; limit %d bytes; use local mode or a smaller explicit history range", total, ai.FinishHistoryDiffByteCap)}
+		if total > inputLimit {
+			return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact history diffs total %d bytes; limit %d bytes; increase ai.max_input_bytes in acd config, use local mode, or select a smaller explicit history range", total, inputLimit)}
 		}
 		result = append(result, diffs[0])
 	}
@@ -141,7 +146,7 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 	}
 	var diffs []ai.FinishDiff
 	if options.Mode == "intent" && options.DiffEgress {
-		diffs, err = finishHistoryDiffs(ctx, repo, evidence)
+		diffs, err = finishHistoryDiffs(ctx, repo, evidence, options.MaxInputBytes)
 		if err != nil {
 			return plan, err
 		}
@@ -203,7 +208,7 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 			commits = append(commits, commit)
 		}
 		if options.Mode == "intent" {
-			goals, result, err := ai.PlanHistoryMessages(ctx, transport, evidence, commits, ai.FinishOptions{Deadline: options.Deadline, Style: options.Style, Purpose: options.Purpose, Diffs: diffs, DiffEgress: options.DiffEgress, BeforeCall: options.BeforeCall})
+			goals, result, err := ai.PlanHistoryMessages(ctx, transport, evidence, commits, ai.FinishOptions{MaxInputBytes: options.MaxInputBytes, Deadline: options.Deadline, Style: options.Style, Purpose: options.Purpose, Diffs: diffs, DiffEgress: options.DiffEgress, BeforeCall: options.BeforeCall})
 			if err != nil {
 				return plan, err
 			}
@@ -214,7 +219,7 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 			}
 		}
 	} else {
-		result, err := ai.PlanFinish(ctx, transport, evidence, ai.FinishOptions{Deadline: options.Deadline, Style: options.Style, Purpose: options.Purpose, Diffs: diffs, DiffEgress: options.DiffEgress, BeforeCall: options.BeforeCall})
+		result, err := ai.PlanFinish(ctx, transport, evidence, ai.FinishOptions{MaxInputBytes: options.MaxInputBytes, Deadline: options.Deadline, Style: options.Style, Purpose: options.Purpose, Diffs: diffs, DiffEgress: options.DiffEgress, BeforeCall: options.BeforeCall})
 		if err != nil {
 			return plan, err
 		}

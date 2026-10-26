@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Replace Intent's 128 KiB per-file and 512 KiB request limits with one
+  configurable `ai.max_input_bytes` budget, defaulting to 8 MiB and supporting
+  up to 64 MiB. Keep complete diffs, redaction, and whole-target verification
+  for finish and history planning. Size failures explain how to review the
+  budget and start a new request instead of suggesting an unchanged retry.
+
 - Require approved redacted code diffs for all Intent planning, including
   previews, exact messages, and history message rewrites. Intent setup includes
   sharing in its approval review. Existing privacy settings survive upgrade;

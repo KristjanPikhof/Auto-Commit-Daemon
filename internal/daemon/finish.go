@@ -165,7 +165,15 @@ func (w *FinishWorker) resolved(ctx context.Context) (git.Worktree, FinishWorker
 		}
 	}
 	provider := cfg.Provider
+	inputLimit, err := ai.FinishInputByteLimit(provider.MaxInputBytes)
+	if err != nil {
+		return wt, cfg, "", err
+	}
 	identity := []any{cfg.ConfigDigest, cfg.Mode, cfg.Style, provider.Mode, provider.BaseURL, provider.Model, provider.Timeout, provider.CAFile, provider.DiffEgress, cfg.Approved, cfg.VerificationMode, cfg.VerificationTimeout, cfg.Command.Identity(), cfg.AuthorName, cfg.AuthorEmail, cfg.Capture.MaxFileBytes, cfg.Capture.SubmodulePaths, cfg.Capture.SensitiveMatcher.Patterns(), cfg.Capture.SafeIgnoreMatcher.Patterns()}
+	// Preserve identities of saved requests using the default budget.
+	if inputLimit != ai.FinishDefaultInputByteCap {
+		identity = append(identity, inputLimit)
+	}
 	raw, err := json.Marshal(identity)
 	if err != nil {
 		return wt, cfg, "", err
@@ -792,14 +800,14 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		}
 		transport = configured
 	}
-	diffs, err := finishProviderDiffs(ctx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress)
+	diffs, err := finishProviderDiffs(ctx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress, cfg.Provider.MaxInputBytes)
 	if ctx.Err() != nil {
 		return finish.Plan{}, ai.FinishDisclosure{}, &ai.FinishPlanningError{Code: "provider_deadline", Err: ctx.Err()}
 	}
 	if err != nil {
 		return finish.Plan{}, ai.FinishDisclosure{}, err
 	}
-	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, BeforeCall: func(callCtx context.Context) error {
+	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, BeforeCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}})
@@ -874,9 +882,13 @@ func (w *FinishWorker) RecoverPrepared(ctx context.Context) (state.FinishRequest
 	return w.publish(ctx, wt, r, true)
 }
 
-func finishProviderDiffs(ctx context.Context, repo, base, target string, changes []finish.Change, egress bool) ([]ai.FinishDiff, error) {
+func finishProviderDiffs(ctx context.Context, repo, base, target string, changes []finish.Change, egress bool, maxInputBytes int) ([]ai.FinishDiff, error) {
 	if !egress {
 		return nil, nil
+	}
+	inputLimit, err := ai.FinishInputByteLimit(maxInputBytes)
+	if err != nil {
+		return nil, err
 	}
 	var diffs []ai.FinishDiff
 	totalBytes := 0
@@ -912,9 +924,9 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 			if change.BeforeTree != "" && change.AfterTree != "" {
 				diffBase, diffTarget = change.BeforeTree, change.AfterTree
 			}
-			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, ai.FinishDiffByteCap+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", diffBase, diffTarget, "--", ":(literal)"+change.Path)
-			if errors.Is(err, git.ErrStdoutOverflow) || len(out) > ai.FinishDiffByteCap {
-				return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diff is at least %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", len(out), ai.FinishDiffByteCap)}
+			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, int64(inputLimit-totalBytes)+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", diffBase, diffTarget, "--", ":(literal)"+change.Path)
+			if errors.Is(err, git.ErrStdoutOverflow) || len(out) > inputLimit-totalBytes {
+				return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diffs total at least %d bytes; limit is %d bytes; increase ai.max_input_bytes in acd config and start a new finish, or use an explicit local finish for the complete offline batch", totalBytes+len(out), inputLimit)}
 			}
 			if err != nil {
 				return nil, err
@@ -923,9 +935,6 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 				diff.Binary = true
 			} else {
 				totalBytes += len(out)
-				if totalBytes > ai.FinishEvidenceDiffByteCap {
-					return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diffs total %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", totalBytes, ai.FinishEvidenceDiffByteCap)}
-				}
 				diff.Text = string(out)
 			}
 		}

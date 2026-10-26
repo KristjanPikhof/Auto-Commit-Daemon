@@ -76,6 +76,10 @@ type ProviderConfig struct {
 	// resolves to DefaultProviderTimeout.
 	Timeout time.Duration
 
+	// MaxInputBytes bounds complete diff evidence and encoded planning requests.
+	// Zero uses the default. It does not alter the provider's context window.
+	MaxInputBytes int
+
 	// CAFile is an optional PEM bundle used to trust a private
 	// OpenAI-compatible HTTPS gateway.
 	CAFile string

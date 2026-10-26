@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -478,7 +479,7 @@ func TestFinishWorkerExactProviderEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	diffs, err := finishProviderDiffs(context.Background(), f.dir, base, r.Target.TargetTree, evidence.Changes, true)
+	diffs, err := finishProviderDiffs(context.Background(), f.dir, base, r.Target.TargetTree, evidence.Changes, true, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +574,7 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 			f, w := finishWorkerFixture(t)
 			body := "goal\n"
 			if scenario == "oversized" {
-				body = strings.Repeat("x", ai.FinishDiffByteCap+1024)
+				body = strings.Repeat("x", (128<<10)+1024)
 			}
 			finishWrite(t, f.dir, "goal.txt", body)
 			p := &finishTestTransport{exchange: func(_ context.Context, r ai.FinishPlanRequest) ([]byte, error) { return completeFinishTestPlan(r), nil }}
@@ -581,6 +582,7 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 			w.Config.Mode = "intent"
 			w.Config.Provider.DiffEgress = true
 			w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
+			w.Config.Provider.MaxInputBytes = 128 << 10
 			// Input-size rejection must not race Git preparation on a busy host.
 			w.Config.Provider.Timeout = time.Minute
 			if scenario == "expired" {
@@ -606,5 +608,63 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 				t.Fatal("failed preparation published")
 			}
 		})
+	}
+}
+
+func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	for i := 0; i < 156; i++ {
+		body := "first recorded value\n" + strings.Repeat("library entry with readable content\n", 300) + "final recorded value\n"
+		if i == 0 {
+			body = "first library entry\n" + strings.Repeat("large library entry\n", 100000) + "last library entry\n"
+		}
+		finishWrite(t, f.dir, fmt.Sprintf("library-%03d.txt", i), body)
+	}
+	w.Config.Mode = "intent"
+	w.Config.Provider.DiffEgress = true
+	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
+	w.Config.Provider.Timeout = time.Minute
+	p := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		if len(request.Changes) != 156 || len(request.Diffs) != 156 {
+			t.Fatalf("lost batch members: %d changes, %d diffs", len(request.Changes), len(request.Diffs))
+		}
+		for _, diff := range request.Diffs {
+			if !strings.Contains(diff.Text, "final recorded value") && !strings.Contains(diff.Text, "last library entry") {
+				t.Fatalf("diff missing its end: %s", diff.ChangeID)
+			}
+			if diff.ChangeID == "library-000.txt" && (len(diff.Text) < 1<<20 || strings.Count(diff.Text, "large library entry") != 100000) {
+				t.Fatal("large text evidence was clipped")
+			}
+		}
+		finishWrite(t, f.dir, "library-000.txt", "later edit stays outside accepted finish\n")
+		return completeFinishTestPlan(request), nil
+	}}
+	w.Transport = p
+	r := startFinishWorker(t, w, FinishOptions{})
+	completed, err := w.Execute(context.Background(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted || p.calls.Load() != 1 {
+		t.Fatalf("large finish: %+v calls=%d: %v", completed, p.calls.Load(), err)
+	}
+	if tree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); tree != r.Target.TargetTree {
+		t.Fatal("published tree lost full file contents")
+	}
+	body, _ := os.ReadFile(filepath.Join(f.dir, "library-000.txt"))
+	if string(body) != "later edit stays outside accepted finish\n" {
+		t.Fatal("finish overwrote later work")
+	}
+}
+
+func TestFinishWorkerInputBudgetIsFrozen(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "goal.txt", "saved goal\n")
+	w.Config.Mode = "intent"
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	w.Config.Provider.MaxInputBytes = ai.FinishDefaultInputByteCap
+	if _, _, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, DryRun: true}); err != nil {
+		t.Fatalf("explicit default changed saved identity: %v", err)
+	}
+	w.Config.Provider.MaxInputBytes = 16 << 20
+	if _, _, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, DryRun: true}); !errors.Is(err, state.ErrFinishIdentity) {
+		t.Fatalf("retry accepted a changed input budget: %v", err)
 	}
 }

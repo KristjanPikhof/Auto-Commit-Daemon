@@ -170,25 +170,26 @@ finish also needs supplied context or an exact message;
 `provider_context_required` needs a new request with that context. Local stays
 offline, and history selection remains independent of finish checkpoints.
 
-Provider inputs reuse existing byte limits. These bounds are separate from
-checkpoint storage; `capture.max_file_bytes` controls buffering and does not
-make large regular files ineligible for protection.
+`ai.max_input_bytes` bounds both aggregate complete textual evidence and each
+serialized provider request, including correction feedback. It defaults to
+8 MiB and accepts 128 KiB through 64 MiB. There is no smaller per-path cap.
+These bounds are separate from checkpoint storage; `capture.max_file_bytes`
+controls buffering and does not make large files ineligible for protection.
 
-| Evidence | Bound |
-|---|---|
-| One included textual path diff | `ai.FinishDiffByteCap`, 128 KiB |
-| Aggregate textual finish evidence | `ai.FinishEvidenceDiffByteCap`, 512 KiB |
-| Aggregate history rewrite diffs | `ai.FinishHistoryDiffByteCap`, 512 KiB |
-| Serialized provider planning request | `ai.FinishRequestByteCap`, 512 KiB |
+Measure raw and redacted aggregate text and actual serialized bytes before
+sending. Exceeding the configured budget fails with `provider_input_too_large`,
+the measured size, and limit. Direct the user to review `ai.max_input_bytes`
+for their provider and start a new finish, or choose an explicit local finish
+for a complete offline batch. History can also use a smaller explicit range.
+Retry keeps its original settings, so do not suggest an unchanged retry for
+this failure. Default-budget upgrades preserve existing consent and saved
+request identities; a custom budget participates in the approved identity.
 
-Measure actual serialized bytes and complete required evidence before sending.
-Exceeding a bound fails with `provider_input_too_large`, the measured size,
-limit, and actionable guidance: use an explicit local finish for a complete
-offline batch, or select a smaller explicit history range for rewriting. Keep
-all work protected. Never clip evidence, silently omit eligible changes,
+Keep all work protected. Never clip evidence, silently omit eligible changes,
 split by age, or send partial input while describing it as complete. Binary
 entries use declared object/type/size metadata and exact Git objects for tree
-validation; report that their content was not sent as text.
+validation; report that their content was not sent as text. A provider can still
+reject input below ACD's byte budget because of its own token or payload limit.
 
 Intent setup includes code sharing in its explicit approval review. Existing
 settings and approvals remain unchanged on upgrade. Intent must honor explicit

@@ -175,7 +175,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 	}
 	ok := r.State == state.FinishCompleted && !detached
-	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required" && r.ReasonCode != "provider_diffs_required"
+	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required" && r.ReasonCode != "provider_diffs_required" && r.ReasonCode != "provider_input_too_large"
 	exit, failureCode := finishExit(r, waitCode)
 	next := ""
 	if !ok {
@@ -183,12 +183,14 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			next = "acd doctor"
 		} else if r.ReasonCode == "provider_context_required" {
 			next = `acd finish "what changed and why"`
+		} else if r.ReasonCode == "provider_input_too_large" {
+			next = "Review ai.max_input_bytes in acd config, then start a new acd finish"
 		} else if r.ReasonCode == "provider_diffs_required" {
 			next = "Approve code sharing with acd config, then start a new acd finish"
 		} else {
 			next = "acd finish --retry " + r.ID
 		}
-		if r.DryRun && r.State != state.FinishNeedsAttention && r.ReasonCode != "provider_diffs_required" {
+		if r.DryRun && r.State != state.FinishNeedsAttention && r.ReasonCode != "provider_diffs_required" && r.ReasonCode != "provider_input_too_large" {
 			next += " --dry-run"
 		}
 	}

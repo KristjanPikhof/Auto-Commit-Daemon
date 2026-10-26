@@ -156,6 +156,21 @@ It does not commit the work. See [user workflows](user-workflows.md).
 buffering. Larger regular files stream into Git objects; the setting does not
 silently exclude them. Git-ignored and sensitive paths remain excluded.
 
+`ai.max_input_bytes` (`ACD_AI_MAX_INPUT_BYTES`) defaults to 8 MiB. It bounds
+complete textual diff evidence and the entire encoded planning request,
+including correction feedback. There is no separate per-file cap. Supported
+values range from 131072 (128 KiB) to 67108864 (64 MiB). For example, to allow
+requests up to 16 MiB in the current repository:
+
+~~~bash
+acd config set ai.max_input_bytes 16777216
+~~~
+
+Choose a budget your provider can accept. Bytes do not directly measure model
+tokens, so a provider may reject a request that fits this budget. The setting
+applies to new requests; retry preserves the original settings. Oversized input
+fails without clipping or omitting changes, and the checkpoint stays protected.
+
 `ai.timeout` (`ACD_AI_TIMEOUT`) defaults to five minutes. An Intent attempt has
 one persisted deadline for its initial planning exchange and optional combined
 correction. Restart does not renew it. Oversized provider input fails without

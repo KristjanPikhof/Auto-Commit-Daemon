@@ -92,7 +92,7 @@ func generateFinishHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
-	plan, err := daemon.PlanFinishHistory(ctx, repo, selection.BranchRef, chain, suffix, transport, daemon.FinishHistoryOptions{Mode: cfg.Mode, Style: cfg.Style, MessagesOnly: opts.messagesOnly, DiffEgress: cfg.Provider.DiffEgress, Deadline: time.Now().Add(timeout), VerificationConfigDigest: cfg.ConfigDigest})
+	plan, err := daemon.PlanFinishHistory(ctx, repo, selection.BranchRef, chain, suffix, transport, daemon.FinishHistoryOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Mode: cfg.Mode, Style: cfg.Style, MessagesOnly: opts.messagesOnly, DiffEgress: cfg.Provider.DiffEgress, Deadline: time.Now().Add(timeout), VerificationConfigDigest: cfg.ConfigDigest})
 	if err != nil {
 		return err
 	}

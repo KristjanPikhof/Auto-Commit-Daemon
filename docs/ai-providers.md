@@ -68,14 +68,22 @@ checkpoint storage:
 
 | Input | Maximum |
 |---|---|
-| One textual path diff | 128 KiB |
-| Aggregate finish diffs | 512 KiB |
-| Aggregate history diffs | 512 KiB |
-| Serialized planning request, including a correction | 512 KiB per exchange |
+| Complete textual diff evidence | `ai.max_input_bytes`, 8 MiB by default |
+| Serialized planning request, including a correction | Same configured budget per exchange |
 
-ACD measures complete input before sending. It fails oversized evidence with
-`provider_input_too_large` and guidance to choose Local or a smaller explicit
-history range. It does not clip text or silently omit eligible changes.
+There is no separate per-file limit. A single 1 MiB diff can be included in full
+when the complete request fits. `ai.max_input_bytes` accepts 128 KiB through
+64 MiB, in bytes, through `acd config` or `ACD_AI_MAX_INPUT_BYTES`.
+
+ACD measures complete input before sending. If it exceeds the configured
+budget, ACD fails with `provider_input_too_large` and the measured size and limit.
+Increase the budget for a provider that supports larger input, then start a new
+finish; retry keeps the original settings. Local remains an explicit offline
+alternative. ACD never clips diffs or omits eligible changes to fit.
+
+The byte budget is an ACD memory and request bound, not a model context limit.
+Providers can reject a request below it because their token or payload limit is
+smaller. Those failures keep the complete checkpoint protected.
 
 Saved disclosure identifies the attempted provider input and redaction. Encoded
 request byte counts measure attempted exchanges; they do not prove the peer

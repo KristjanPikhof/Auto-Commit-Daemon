@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,6 +53,10 @@ func resolveFinishWorkerConfigInputs(ctx context.Context, roots paths.Roots, run
 	out.Approved = approved
 	out.Capture = daemon.CaptureOpts{MaxFileBytes: runtime.policy.MaxFileBytes, SensitiveMatcher: runtime.policy.Sensitive, SafeIgnoreMatcher: runtime.policy.SafeIgnore}
 	out.Provider = ai.ProviderConfig{Mode: values[config.FieldProvider], BaseURL: values[config.FieldBaseURL], Model: values[config.FieldModel], CAFile: values[config.FieldCAFile], DiffEgress: values[config.FieldDiffEgress] == "true", CommitStrategy: ai.CommitStrategy(out.Mode), CommitFormat: ai.CommitFormat(out.Style)}
+	out.Provider.MaxInputBytes, err = strconv.Atoi(values[config.FieldMaxInputBytes])
+	if err != nil {
+		return out, err
+	}
 	out.Provider.Timeout, err = time.ParseDuration(values[config.FieldTimeout])
 	if err != nil {
 		return out, err

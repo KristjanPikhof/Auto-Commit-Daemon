@@ -371,3 +371,15 @@ func TestFinishCLIUnavailableOutputAndExit(t *testing.T) {
 		}
 	}
 }
+
+func TestFinishCLIInputLimitNeedsNewRequest(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	r := state.FinishRequest{ID: "finish-large", State: state.FinishFailed, ReasonCode: "provider_input_too_large", Reason: "Request exceeds ai.max_input_bytes"}
+	var out bytes.Buffer
+	if err := renderFinish(&out, lookup, r, false, ""); err == nil {
+		t.Fatal("expected unsuccessful finish")
+	}
+	if strings.Contains(out.String(), "--retry") || !strings.Contains(out.String(), "Review ai.max_input_bytes") {
+		t.Fatalf("misleading size guidance: %s", out.String())
+	}
+}
