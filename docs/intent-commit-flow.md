@@ -83,7 +83,10 @@ text diffs. Each encoded exchange is bounded to 512 KiB, or the smaller
 `ai.max_input_bytes` setting. A large file is divided into UTF-8 fragments without
 losing bytes. Every fragment gets a bounded factual observation before planning;
 ACD validates complete fragment coverage and records content digests, summaries,
-review-call counts, and attempted request sizes. The final planner receives all
+review-call counts, and attempted request sizes. A malformed or overlong review can be corrected once within the same call
+budget and deadline. ACD reserves context space for the feedback and retains
+accepted reviews. Provider transport and protocol failures still end the attempt.
+The final planner receives all
 original change identities and these observations together. Fragments, files,
 and review calls do not prescribe commit boundaries. Raw aggregate evidence
 still obeys `ai.max_input_bytes`; metadata or a global plan that cannot fit fails

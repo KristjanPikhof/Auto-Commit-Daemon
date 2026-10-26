@@ -80,10 +80,16 @@ func TestFinishEvidenceReviewFailsWithoutPlanning(t *testing.T) {
 					return nil, errors.New("provider refused review")
 				case "missing fragment":
 					return []byte(`{"observations":[]}`), nil
-				case "duplicate fragment":
-					return []byte(`{"observations":[{"id":"part-1","summary":"First valid observation"},{"id":"part-1","summary":"Second valid observation"}]}`), nil
-				case "verification claim":
-					return []byte(`{"observations":[{"id":"part-1","summary":"All tests passed"}]}`), nil
+				case "duplicate fragment", "verification claim":
+					var reply map[string][]map[string]string
+					_ = json.Unmarshal(finishTestReview(r), &reply)
+					if scenario == "duplicate fragment" {
+						reply["observations"][1]["id"] = reply["observations"][0]["id"]
+					} else {
+						reply["observations"][0]["summary"] = "All tests passed"
+					}
+					raw, _ := json.Marshal(reply)
+					return raw, nil
 				case "deadline":
 					cancel()
 					return finishTestReview(r), nil
@@ -91,8 +97,18 @@ func TestFinishEvidenceReviewFailsWithoutPlanning(t *testing.T) {
 				return nil, nil
 			}}
 			result, err := PlanFinish(ctx, provider, evidence, options)
-			if err == nil || result.Calls != 0 || len(result.Plan.Steps) != 0 || len(provider.requests) > 1 {
-				t.Fatalf("failed review retried or planned: %+v %v", result, err)
+			limit := 1
+			if scenario == "missing fragment" || scenario == "duplicate fragment" || scenario == "verification claim" {
+				limit = 2
+			}
+			if err == nil || result.Calls != 0 || len(result.Plan.Steps) != 0 || len(provider.requests) > limit {
+				t.Fatalf("failed review exceeded its correction allowance or reached planning: %+v %v", result, err)
+			}
+			if scenario == "duplicate fragment" && !strings.Contains(err.Error(), "appears more than once") {
+				t.Fatalf("duplicate membership was not diagnosed: %v", err)
+			}
+			if scenario == "verification claim" && !strings.Contains(err.Error(), "not claim tests or verification ran") {
+				t.Fatalf("unsupported verification claim was not diagnosed: %v", err)
 			}
 		})
 	}
@@ -202,5 +218,79 @@ func TestFinishReviewChunksDoNotDefineCommitBoundaries(t *testing.T) {
 	result, err := PlanFinish(t.Context(), provider, evidence, options)
 	if err != nil || len(result.Plan.Steps) != 2 || result.Calls != 1 || result.Disclosure.EvidenceCalls < 2 {
 		t.Fatalf("global boundaries %+v %v", result, err)
+	}
+}
+
+func TestFinishReviewCorrectsOnlyInvalidBatch(t *testing.T) {
+	evidence := finishTestEvidence()
+	options := finishTestOptions(evidence)
+	options.Diffs[0].Text = strings.Repeat("+ exact recorded value\n", 50000)
+	batches := map[string]int{}
+	initial := 0
+	badID := ""
+	corrections := 0
+	reservations := 0
+	options.BeforeEvidenceCall = func(context.Context) error { reservations++; return nil }
+	provider := &finishFakeTransport{exchange: func(_ context.Context, r FinishPlanRequest) ([]byte, error) {
+		if r.Review == nil {
+			return finishTestOutput(finishTestGoal(evidence)), nil
+		}
+		key := r.Review.Parts[0].ID
+		batches[key]++
+		if r.Correction != nil {
+			corrections++
+			if key != badID || r.Correction.PreviousOutput != "" || !strings.Contains(r.Correction.ValidationError, "maximum is 256") {
+				t.Fatal("correction lacked bounded, specific feedback")
+			}
+			return finishTestReview(r), nil
+		}
+		initial++
+		if initial == 2 {
+			badID = key
+			var reply map[string][]map[string]string
+			_ = json.Unmarshal(finishTestReview(r), &reply)
+			reply["observations"][0]["summary"] = strings.Repeat("overlong factual summary ", 20)
+			raw, _ := json.Marshal(reply)
+			return raw, nil
+		}
+		return finishTestReview(r), nil
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || result.Calls != 1 || corrections != 1 || result.Disclosure.EvidenceCalls != reservations || initial < 3 {
+		t.Fatalf("bounded correction %+v %v", result, err)
+	}
+	for id, n := range batches {
+		want := 1
+		if id == badID {
+			want = 2
+		}
+		if n != want {
+			t.Fatal("accepted review was repeated")
+		}
+	}
+	for _, r := range provider.requests {
+		body, _ := provider.EncodeFinishRequest(r)
+		if len(body) > FinishContextByteCap {
+			t.Fatal("correction exceeded context bound")
+		}
+	}
+}
+
+func TestFinishReviewCorrectionCannotBypassBudget(t *testing.T) {
+	evidence := finishTestEvidence()
+	options := finishTestOptions(evidence)
+	options.Diffs[0].Text = strings.Repeat("+ exact recorded value\n", 30000)
+	reservations := 0
+	options.BeforeEvidenceCall = func(context.Context) error {
+		reservations++
+		if reservations == 2 {
+			return errors.New("durable review budget exhausted")
+		}
+		return nil
+	}
+	provider := &finishFakeTransport{exchange: func(context.Context, FinishPlanRequest) ([]byte, error) { return []byte(`{"observations":[]}`), nil }}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err == nil || result.Calls != 0 || result.Disclosure.EvidenceCalls != 1 || len(provider.requests) != 1 {
+		t.Fatalf("correction bypassed budget %+v %v", result, err)
 	}
 }

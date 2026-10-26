@@ -135,10 +135,12 @@ worktree. Frozen request identity, author boundaries, and explicit history-rewri
 limits still apply.
 
 An Intent attempt may review large evidence in at most 32 bounded calls, then
-make one global planning call and at most one correction within one persisted
+make one global planning call and at most one global correction within one persisted
 deadline. Reviews cover every complete redacted diff, splitting large files
 without dropping bytes. Review fragments are evidence, never commit boundaries.
-Their counts are reserved durably and reported separately from planning calls.
+An invalid review gets at most one correction; accepted reviews are not repeated.
+Corrections consume the same 32-call budget and deadline. Their counts are
+reserved durably and reported separately from global planning calls.
 At most two immutable reviews run concurrently; budget reservations and state
 writes stay on the owning worker. Small requests skip review. Messages belong to the global plan. Provider rejection,
 timeout, unavailable evidence, or exhausted budget fails the explicit request;
