@@ -708,3 +708,33 @@ func TestFinishWorkerExplicitTimeoutPreservesFrozenIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestFinishWorkerExplicitTimeoutAlsoBoundsRealProviderExchange(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "goal.txt", "Complete the requested goal\n")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		// Simulate a response slower than the configured transport budget, while
+		// remaining well inside the explicitly accepted attempt deadline.
+		response := time.NewTimer(150 * time.Millisecond)
+		defer response.Stop()
+		select {
+		case <-request.Context().Done():
+			return
+		case <-response.C:
+		}
+		plan := string(completeFinishTestPlan(ai.FinishPlanRequest{Changes: []finish.Change{{ID: "goal.txt"}}}))
+		_ = json.NewEncoder(writer).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]string{"name": "finish_plan", "arguments": plan}}}}}}})
+	}))
+	defer server.Close()
+	w.Config.Mode = "intent"
+	w.Config.Provider = ai.ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, APIKey: "synthetic-key", Model: "test-model", Timeout: 30 * time.Millisecond, CommitStrategy: ai.CommitStrategyIntent, CommitFormat: ai.CommitFormatImperative, DiffEgress: true}
+	w.Config.Approved = []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials, ai.ConfirmationDiffEgress}
+	r := startFinishWorker(t, w, FinishOptions{Timeout: 20 * time.Second})
+	completed, err := w.Execute(t.Context(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 {
+		t.Fatalf("transport ignored accepted attempt budget: %+v %v", completed, err)
+	}
+	if w.Config.Provider.Timeout != 30*time.Millisecond {
+		t.Fatal("explicit timeout changed provider settings")
+	}
+}

@@ -23,7 +23,7 @@
   instructions match. Report completed and reused fragments. Add
   `acd finish --timeout 15m` to give a new attempt a bounded planning budget
   without changing provider settings or the saved target. Reconnection never
-  extends an active deadline.
+  extends an active deadline. Provider exchanges honor the same saved budget.
 
 - Correct an invalid evidence review once without repeating accepted reviews.
   Cap each review at 32 fragments. Keep the existing 32-call budget and deadline,

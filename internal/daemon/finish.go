@@ -814,7 +814,14 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	defer cancel()
 	transport := w.Transport
 	if transport == nil {
-		configured, closer, err := ai.BuildFinishTransport(cfg.Provider, cfg.Approved)
+		provider := cfg.Provider
+		// The persisted attempt bounds each exchange too. A caller's longer
+		// budget must not retain the shorter configured HTTP/process timeout.
+		provider.Timeout = time.Until(finishDeadline(r))
+		if provider.Timeout <= 0 {
+			return finish.Plan{}, ai.FinishDisclosure{}, &ai.FinishPlanningError{Code: "provider_deadline", Err: context.DeadlineExceeded}
+		}
+		configured, closer, err := ai.BuildFinishTransport(provider, cfg.Approved)
 		if err != nil {
 			return finish.Plan{}, ai.FinishDisclosure{}, err
 		}
