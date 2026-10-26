@@ -19,7 +19,8 @@
 ### Changed
 
 - Correct an invalid evidence review once without repeating accepted reviews.
-  Keep the existing 32-call budget and deadline, reserve context room for bounded
+  Cap each review at 32 fragments. Keep the existing 32-call budget and deadline,
+  reserve context room for bounded
   feedback, and identify the exact fragment and summary constraint on failure.
 
 - Review large Intent batches in bounded evidence calls before one global commit

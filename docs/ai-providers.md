@@ -120,6 +120,7 @@ HTTP status and a generic rejection; ACD never prints an arbitrary error body.
 
 Intent allows at most 32 bounded evidence reviews, one global planning exchange,
 and at most one combined correction under a single persisted deadline.
+Each review contains at most 32 fragments to bound response size and ID tracking.
 An invalid review may be corrected once with its complete original evidence
 and bounded validation feedback. Accepted reviews are retained. These corrections
 consume the same 32-call budget and deadline; transport and protocol failures are terminal.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -292,5 +293,32 @@ func TestFinishReviewCorrectionCannotBypassBudget(t *testing.T) {
 	result, err := PlanFinish(t.Context(), provider, evidence, options)
 	if err == nil || result.Calls != 0 || result.Disclosure.EvidenceCalls != 1 || len(provider.requests) != 1 {
 		t.Fatalf("correction bypassed budget %+v %v", result, err)
+	}
+}
+
+func TestFinishManySmallChangesBoundReviewOutput(t *testing.T) {
+	evidence := finish.Evidence{Base: finish.Tree{}, Target: finish.Tree{}}
+	for i := 0; i < 300; i++ {
+		evidence.Target[fmt.Sprintf("settings-%03d.go", i)] = finishTestEntry("b")
+	}
+	evidence.Changes = finish.NetChanges(evidence.Base, evidence.Target, "author-a")
+	options := finishTestOptions(evidence)
+	for i := range options.Diffs {
+		options.Diffs[i].Text = strings.Repeat("+ compatible shared default\n", 80)
+	}
+	provider := &finishFakeTransport{exchange: func(_ context.Context, r FinishPlanRequest) ([]byte, error) {
+		if r.Review != nil {
+			if len(r.Review.Parts) > 32 {
+				t.Fatal("review asked for an unbounded observation list")
+			}
+			return finishTestReview(r), nil
+		}
+		goal := finishTestGoal(evidence)
+		goal.Boundary = "Keep the compatible shared-default migration together"
+		return finishTestOutput(goal), nil
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || result.Calls != 1 || len(result.Disclosure.EvidenceReviews) != 300 || result.Disclosure.EvidenceCalls < 10 {
+		t.Fatalf("many small changes %+v %v", result, err)
 	}
 }

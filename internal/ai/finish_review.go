@@ -18,6 +18,7 @@ import (
 // bound. Large files are reviewed in parts, never omitted or made into commits.
 const FinishContextByteCap = 512 << 10
 const finishReviewSummaryRunes = 256
+const finishReviewPartLimit = 32
 
 type FinishReviewPart struct {
 	ID       string `json:"id"`
@@ -209,7 +210,7 @@ func finishReviewChunks(transport FinishTransport, request FinishPlanRequest, li
 		if err != nil {
 			return nil, finishFailure("provider_input", err)
 		}
-		if len(body) > limit {
+		if len(body) > limit || len(candidate.Review.Parts) > finishReviewPartLimit {
 			if len(chunk.Review.Parts) == 0 {
 				return nil, finishContextLimit(len(body), limit)
 			}
