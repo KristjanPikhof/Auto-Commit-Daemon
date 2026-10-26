@@ -148,7 +148,7 @@ Coverage and equality are structural evidence, not proof that project tests ran.
 
 One Intent attempt allows at most 32 evidence-review calls, one global planning
 call, and at most one global correction within one persisted `ai.timeout`
-deadline (default five minutes). At most two immutable evidence exchanges run concurrently; the worker reserves
+deadline (default five minutes). At most four immutable evidence exchanges run concurrently; the worker reserves
 budgets and writes state serially. Small requests skip evidence review. Every
 complete redacted diff is covered by exact UTF-8 fragments; every fragment must
 have exactly one bounded observation with a locally recorded content digest.

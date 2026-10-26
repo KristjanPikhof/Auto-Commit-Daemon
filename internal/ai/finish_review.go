@@ -19,6 +19,7 @@ import (
 const FinishContextByteCap = 512 << 10
 const finishReviewSummaryRunes = 256
 const finishReviewPartLimit = 32
+const finishReviewConcurrency = 4
 
 type FinishReviewPart struct {
 	ID       string `json:"id"`
@@ -84,7 +85,7 @@ func reviewFinishEvidence(ctx context.Context, transport FinishTransport, reques
 		count := 1
 		batch, parallel := transport.(finishReviewBatchTransport)
 		if parallel {
-			count = min(2, len(chunks)-start)
+			count = min(finishReviewConcurrency, len(chunks)-start)
 		}
 		var bodies [][]byte
 		for _, chunk := range chunks[start : start+count] {
@@ -314,14 +315,14 @@ func validateFinishReview(raw []byte, parts []FinishReviewPart) ([]FinishReviewO
 }
 
 // An optional immutable batch exchange lets the owning worker reserve calls
-// serially, then release its operation gate once around up to two HTTP calls.
+// serially, then release its operation gate once around bounded HTTP calls.
 type finishReviewBatchTransport interface {
 	ExchangeFinishReviews(context.Context, [][]byte) ([][]byte, error)
 }
 
 func ExchangeFinishReviews(ctx context.Context, transport FinishTransport, bodies [][]byte) ([][]byte, error) {
-	if len(bodies) == 0 || len(bodies) > 2 {
-		return nil, errors.New("evidence batch must contain one or two exchanges")
+	if len(bodies) == 0 || len(bodies) > finishReviewConcurrency {
+		return nil, fmt.Errorf("evidence batch must contain one to %d exchanges", finishReviewConcurrency)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()

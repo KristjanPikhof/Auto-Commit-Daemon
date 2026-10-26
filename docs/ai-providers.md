@@ -124,8 +124,8 @@ Each review contains at most 32 fragments to bound response size and ID tracking
 An invalid review may be corrected once with its complete original evidence
 and bounded validation feedback. Accepted reviews are retained. These corrections
 consume the same 32-call budget and deadline; transport and protocol failures are terminal.
-At most two evidence exchanges run concurrently; each is durably reserved
-before transmission, and cancellation joins both before closing the transport. `ai.timeout` defaults to five minutes. Transport
+At most four evidence exchanges run concurrently; each is durably reserved
+before transmission, and cancellation joins all exchanges before closing the transport. `ai.timeout` defaults to five minutes. Transport
 failure, missing credentials, invalid output, or deadline exhaustion fails the
 request. There is no automatic retry timer or Local fallback.
 

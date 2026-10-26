@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
@@ -320,5 +321,56 @@ func TestFinishManySmallChangesBoundReviewOutput(t *testing.T) {
 	result, err := PlanFinish(t.Context(), provider, evidence, options)
 	if err != nil || result.Calls != 1 || len(result.Disclosure.EvidenceReviews) != 300 || result.Disclosure.EvidenceCalls < 10 {
 		t.Fatalf("many small changes %+v %v", result, err)
+	}
+}
+
+type finishBarrierReviewTransport struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*finishBarrierReviewTransport) Name() string { return "barrier-review" }
+func (*finishBarrierReviewTransport) EncodeFinishRequest(FinishPlanRequest) ([]byte, error) {
+	return nil, nil
+}
+func (p *finishBarrierReviewTransport) ExchangeFinish(ctx context.Context, body []byte) ([]byte, error) {
+	p.started <- struct{}{}
+	select {
+	case <-p.release:
+		return body, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func TestFinishEvidenceBatchBoundsParallelWorkAndKeepsOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	provider := &finishBarrierReviewTransport{started: make(chan struct{}, 4), release: make(chan struct{})}
+	bodies := [][]byte{[]byte("first"), []byte("second"), []byte("third"), []byte("fourth")}
+	type outcome struct {
+		replies [][]byte
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() { r, e := ExchangeFinishReviews(ctx, provider, bodies); done <- outcome{r, e} }()
+	for range bodies {
+		select {
+		case <-provider.started:
+		case <-ctx.Done():
+			t.Fatal("reviews did not start together")
+		}
+	}
+	close(provider.release)
+	result := <-done
+	if result.err != nil || len(result.replies) != 4 {
+		t.Fatalf("bounded batch: %v", result.err)
+	}
+	for i, reply := range result.replies {
+		if string(reply) != string(bodies[i]) {
+			t.Fatal("parallel replies changed order")
+		}
+	}
+	if _, err := ExchangeFinishReviews(t.Context(), nil, make([][]byte, 5)); err == nil {
+		t.Fatal("unbounded parallel batch accepted")
 	}
 }

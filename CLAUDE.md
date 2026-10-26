@@ -142,7 +142,7 @@ Each review contains at most 32 fragments to bound its output.
 An invalid review gets at most one correction; accepted reviews are not repeated.
 Corrections consume the same 32-call budget and deadline. Their counts are
 reserved durably and reported separately from global planning calls.
-At most two immutable reviews run concurrently; budget reservations and state
+At most four immutable reviews run concurrently; budget reservations and state
 writes stay on the owning worker. Small requests skip review. Messages belong to the global plan. Provider rejection,
 timeout, unavailable evidence, or exhausted budget fails the explicit request;
 there is no background semantic retry or silent Local fallback.

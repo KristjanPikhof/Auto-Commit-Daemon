@@ -71,7 +71,7 @@ binary objects, deletions, and unchanged entries.
 Small requests use one planning exchange and at most one combined correction.
 Large requests first review the complete redacted evidence in bounded batches,
 then make one global plan across all recorded changes. At most 32 evidence
-reviews are allowed, with at most two immutable provider exchanges at once.
+reviews are allowed, with at most four immutable provider exchanges at once.
 The worker reserves each call before releasing its operation gate and continues
 protecting later edits while reviews run. All calls share the persisted `ai.timeout` deadline, five
 minutes by default. Messages

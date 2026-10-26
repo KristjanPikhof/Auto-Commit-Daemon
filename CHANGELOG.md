@@ -22,6 +22,8 @@
   Cap each review at 32 fragments. Keep the existing 32-call budget and deadline,
   reserve context room for bounded
   feedback, and identify the exact fragment and summary constraint on failure.
+  Run at most four immutable reviews concurrently to keep smaller observation
+  batches within the existing deadline; reserve budgets and write state serially.
 
 - Review large Intent batches in bounded evidence calls before one global commit
   plan. Preserve every diff byte, recorded identity, and whole-target verification;
