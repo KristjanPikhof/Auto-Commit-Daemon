@@ -261,7 +261,9 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 	if json.Unmarshal(r.Plan, &saved) == nil {
 		r.EvidenceCalls = max(r.EvidenceCalls, saved.Disclosure.EvidenceCalls)
 		r.ReviewedFragments = max(r.ReviewedFragments, len(saved.Disclosure.EvidenceReviews))
-		r.ReviewFragments = max(r.ReviewFragments, r.ReviewedFragments)
+		if r.PlanningCalls > 0 {
+			r.ReviewFragments = max(r.ReviewFragments, r.ReviewedFragments)
+		}
 		r.ReusedFragments = max(r.ReusedFragments, saved.Disclosure.ReusedFragments)
 	}
 	if len(r.Plan) > 0 {

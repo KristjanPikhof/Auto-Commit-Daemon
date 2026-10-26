@@ -419,3 +419,21 @@ func TestFinishCLIRejectsUnboundedTimeoutBeforeContactingWorker(t *testing.T) {
 		}
 	}
 }
+
+func TestFinishCLILegacyPartialReviewDoesNotClaimCompleteCoverage(t *testing.T) {
+	lookup, runtime, _ := finishCLIFixture(t)
+	worker := &daemon.FinishWorker{RepoPath: lookup.Worktree.Root, DB: runtime.db, Config: daemon.FinishWorkerConfig{Mode: "local", Style: "imperative", ConfigDigest: "test-config"}}
+	r, _, err := worker.Start(t.Context(), daemon.FinishOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := json.Marshal(daemon.FinishSavedPlan{Disclosure: ai.FinishDisclosure{EvidenceCalls: 1, EvidenceReviews: []ai.FinishReviewObservation{{ID: "part-1", Summary: "Preserve recorded library values"}}}})
+	failed, err := state.UpdateFinishRequest(t.Context(), runtime.db, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishFailed, Plan: plan, ReasonCode: "provider_deadline"})
+	if err != nil || failed.ReviewedFragments != 1 || failed.ReviewFragments != 0 {
+		t.Fatalf("legacy coverage was invented: %+v %v", failed, err)
+	}
+	report, err := readFinishStatus(t.Context(), runtime.db.ReadSQL(), r.Target.WorktreeID)
+	if err != nil || report.ReviewedFragments != 1 || report.ReviewFragments != 0 {
+		t.Fatalf("status/list invented legacy coverage: %+v %v", report, err)
+	}
+}

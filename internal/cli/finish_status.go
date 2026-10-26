@@ -110,7 +110,9 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 	if json.Unmarshal([]byte(plan), &savedReview) == nil {
 		report.EvidenceCalls = max(report.EvidenceCalls, savedReview.Disclosure.EvidenceCalls)
 		report.ReviewedFragments = max(report.ReviewedFragments, len(savedReview.Disclosure.EvidenceReviews))
-		report.ReviewFragments = max(report.ReviewFragments, report.ReviewedFragments)
+		if r.PlanningCalls > 0 {
+			report.ReviewFragments = max(report.ReviewFragments, report.ReviewedFragments)
+		}
 		report.ReusedFragments = max(report.ReusedFragments, savedReview.Disclosure.ReusedFragments)
 	}
 	if result != "" {
