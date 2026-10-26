@@ -103,6 +103,9 @@ func reviewFinishEvidence(ctx context.Context, transport FinishTransport, reques
 	}
 	disclosure.ReusedFragments = progress.ReusedFragments
 	save := func() error {
+		if err := ctx.Err(); err != nil {
+			return finishFailure("provider_deadline", err)
+		}
 		progress.Observations = nil
 		for _, chunk := range chunks {
 			for _, part := range chunk.Review.Parts {
@@ -118,6 +121,12 @@ func reviewFinishEvidence(ctx context.Context, transport FinishTransport, reques
 			}
 		}
 		return nil
+	}
+	accept := func(observations []FinishReviewObservation) error {
+		for _, observation := range observations {
+			reviewed[observation.ID] = observation
+		}
+		return save()
 	}
 	if err := save(); err != nil {
 		return err
@@ -148,49 +157,74 @@ func reviewFinishEvidence(ctx context.Context, transport FinishTransport, reques
 		} else {
 			var raw []byte
 			raw, err = transport.ExchangeFinish(ctx, bodies[0])
+			if err != nil {
+				raw = nil
+			}
 			replies = [][]byte{raw}
 		}
-		if err != nil {
-			return finishFailure("provider_failure", err)
-		}
+		exchangeErr := err
 		if err := ctx.Err(); err != nil {
+			if exchangeErr != nil {
+				return finishFailure("provider_failure", exchangeErr)
+			}
 			return finishFailure("provider_deadline", err)
 		}
 		if len(replies) != count {
+			if exchangeErr != nil {
+				return finishFailure("provider_failure", exchangeErr)
+			}
 			return finishFailure("invalid_evidence_review", errors.New("evidence batch returned incomplete replies"))
 		}
+		invalid := make([]error, count)
+		// Persist every valid peer before handling a failed exchange or an
+		// invalid review. A correction must not strand successful siblings.
 		for i, raw := range replies {
+			if exchangeErr != nil && len(raw) == 0 {
+				continue
+			}
+			observations, validationErr := validateFinishReview(raw, pending[start+i].Review.Parts)
+			if validationErr != nil {
+				invalid[i] = validationErr
+				continue
+			}
+			if err := accept(observations); err != nil {
+				if exchangeErr != nil {
+					return finishFailure("provider_failure", errors.Join(exchangeErr, err))
+				}
+				return err
+			}
+		}
+		if exchangeErr != nil {
+			return finishFailure("provider_failure", exchangeErr)
+		}
+		for i, validationErr := range invalid {
+			if validationErr == nil {
+				continue
+			}
 			chunk := pending[start+i]
+			// Re-send only this invalid review's complete evidence and bounded
+			// feedback, without echoing a potentially malformed response.
+			chunk.Correction = &FinishCorrection{ValidationError: SanitizePlannerError(finishCorrectionError(validationErr))}
+			body, err := reserveFinishReview(ctx, transport, chunk, options, disclosure, limit)
+			if err != nil {
+				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return finishFailure("provider_deadline", err)
+			}
+			disclosure.EvidenceRequestBytes = append(disclosure.EvidenceRequestBytes, len(body))
+			raw, err := transport.ExchangeFinish(ctx, body)
+			if err != nil {
+				return finishFailure("provider_failure", err)
+			}
+			if err := ctx.Err(); err != nil {
+				return finishFailure("provider_deadline", err)
+			}
 			observations, validationErr := validateFinishReview(raw, chunk.Review.Parts)
 			if validationErr != nil {
-				// Correct only this invalid review. Accepted reviews remain intact.
-				// Re-send its complete evidence with bounded feedback rather than
-				// echoing a potentially huge or malformed provider response.
-				chunk.Correction = &FinishCorrection{ValidationError: SanitizePlannerError(finishCorrectionError(validationErr))}
-				body, err := reserveFinishReview(ctx, transport, chunk, options, disclosure, limit)
-				if err != nil {
-					return err
-				}
-				if err := ctx.Err(); err != nil {
-					return finishFailure("provider_deadline", err)
-				}
-				disclosure.EvidenceRequestBytes = append(disclosure.EvidenceRequestBytes, len(body))
-				raw, err = transport.ExchangeFinish(ctx, body)
-				if err != nil {
-					return finishFailure("provider_failure", err)
-				}
-				if err := ctx.Err(); err != nil {
-					return finishFailure("provider_deadline", err)
-				}
-				observations, validationErr = validateFinishReview(raw, chunk.Review.Parts)
-				if validationErr != nil {
-					return finishFailure("invalid_evidence_review", validationErr)
-				}
+				return finishFailure("invalid_evidence_review", validationErr)
 			}
-			for _, observation := range observations {
-				reviewed[observation.ID] = observation
-			}
-			if err := save(); err != nil {
+			if err := accept(observations); err != nil {
 				return err
 			}
 		}
@@ -399,6 +433,7 @@ func validateFinishReview(raw []byte, parts []FinishReviewPart) ([]FinishReviewO
 
 // An optional immutable batch exchange lets the owning worker reserve calls
 // serially, then release its operation gate once around bounded HTTP calls.
+// Failed exchanges leave nil reply slots, even if they returned an error body.
 type finishReviewBatchTransport interface {
 	ExchangeFinishReviews(context.Context, [][]byte) ([][]byte, error)
 }
@@ -422,7 +457,9 @@ func ExchangeFinishReviews(ctx context.Context, transport FinishTransport, bodie
 	var firstError error
 	for range bodies {
 		r := <-done
-		results[r.index] = r.body
+		if r.err == nil {
+			results[r.index] = r.body
+		}
 		if r.err != nil && firstError == nil {
 			firstError = r.err
 			cancel()

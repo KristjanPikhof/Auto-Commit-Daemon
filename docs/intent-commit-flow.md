@@ -134,6 +134,9 @@ them only when the frozen evidence, redacted fragments, provider configuration,
 and review instructions still match. It reviews only missing evidence, then
 creates a fresh global plan. Restart never starts that work automatically.
 Reviews saved by older builds without this fingerprint cannot be reused.
+Valid completed reviews survive a parallel peer's failure. A successful retry
+preview also keeps its review evidence for a later publication attempt using
+the same request ID; that attempt still creates a fresh global plan.
 
 For a large batch, give a new attempt more planning time without changing its
 saved target or provider settings:

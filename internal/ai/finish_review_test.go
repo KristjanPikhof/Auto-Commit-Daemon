@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -456,5 +457,194 @@ func TestFinishReviewPersistenceFailureStopsPlanning(t *testing.T) {
 	result, err := PlanFinish(t.Context(), provider, evidence, options)
 	if err == nil || result.Calls != 0 || result.Disclosure.EvidenceCalls != 0 {
 		t.Fatalf("lost durability: %+v %v", result, err)
+	}
+}
+
+// Complete peers before rejecting one exchange, without depending on scheduling
+// delays. Retry can then prove that accepted siblings are not transmitted again.
+type finishPeerFailureTransport struct {
+	t                           *testing.T
+	rejectedID, invalidID       string
+	rejection                   error
+	correctionFailure           error
+	errorBody, waitForDeadline  bool
+	peers                       int32
+	completed                   atomic.Int32
+	reviews, corrections, plans atomic.Int32
+	ready                       chan struct{}
+	forbidden                   map[string]bool
+	goal                        finish.Goal
+}
+
+func (*finishPeerFailureTransport) Name() string { return "peer-failure-test" }
+func (*finishPeerFailureTransport) EncodeFinishRequest(request FinishPlanRequest) ([]byte, error) {
+	body, err := json.Marshal(request)
+	return append(body, []byte(strings.Repeat(" ", 80<<10))...), err
+}
+func (p *finishPeerFailureTransport) ExchangeFinish(ctx context.Context, body []byte) ([]byte, error) {
+	var request FinishPlanRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return nil, err
+	}
+	if request.Review == nil {
+		p.plans.Add(1)
+		return finishTestOutput(p.goal), nil
+	}
+	p.reviews.Add(1)
+	if request.Correction != nil {
+		p.corrections.Add(1)
+		if p.correctionFailure != nil {
+			return nil, p.correctionFailure
+		}
+	}
+	for _, part := range request.Review.Parts {
+		if p.forbidden[part.ID] {
+			p.t.Errorf("retry transmitted accepted peer fragment %s", part.ID)
+		}
+	}
+	if request.Review.Parts[0].ID == p.rejectedID {
+		select {
+		case <-p.ready:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if p.waitForDeadline {
+			<-ctx.Done()
+		}
+		var body []byte
+		if p.errorBody {
+			body = finishTestReview(request)
+		}
+		return body, p.rejection
+	}
+	reply := finishTestReview(request)
+	if request.Review.Parts[0].ID == p.invalidID {
+		reply = []byte(`{"observations":[]}`)
+	}
+	if p.peers > 0 && p.completed.Add(1) == p.peers {
+		close(p.ready)
+	}
+	return reply, nil
+}
+func (p *finishPeerFailureTransport) ExchangeFinishReviews(ctx context.Context, bodies [][]byte) ([][]byte, error) {
+	return ExchangeFinishReviews(ctx, p, bodies)
+}
+func finishPeerFailureFixture(t *testing.T) (finish.Evidence, FinishOptions, []FinishPlanRequest) {
+	t.Helper()
+	evidence := finishTestEvidence()
+	options := finishTestOptions(evidence)
+	options.MaxInputBytes = 128 << 10
+	options.Diffs[0].Text = strings.Repeat("+ preserve complete authored library values\n", 2500)
+	request, _, err := prepareFinishRequest(evidence, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := finishReviewChunks(&finishPeerFailureTransport{}, request, (128<<10)-(4<<10))
+	if err != nil || len(chunks) != 4 {
+		t.Fatalf("four-peer fixture: %d chunks, %v", len(chunks), err)
+	}
+	return evidence, options, chunks
+}
+func TestFinishReviewRetainsSuccessfulPeersAfterBatchFailure(t *testing.T) {
+	for _, scenario := range []string{"rejected peer", "errored body", "invalid peer"} {
+		t.Run(scenario, func(t *testing.T) {
+			evidence, options, chunks := finishPeerFailureFixture(t)
+			rejection := errors.New("one peer rejected evidence")
+			provider := &finishPeerFailureTransport{t: t, rejectedID: chunks[3].Review.Parts[0].ID, rejection: rejection, errorBody: scenario == "errored body", peers: 3, ready: make(chan struct{}), goal: finishTestGoal(evidence)}
+			if scenario == "invalid peer" {
+				provider.invalidID = chunks[0].Review.Parts[0].ID
+			}
+			var saved finish.ReviewProgress
+			options.SaveReviewProgress = func(_ context.Context, progress finish.ReviewProgress) error {
+				raw, _ := json.Marshal(progress)
+				return json.Unmarshal(raw, &saved)
+			}
+			result, err := PlanFinish(t.Context(), provider, evidence, options)
+			if !errors.Is(err, rejection) || result.Calls != 0 || provider.plans.Load() != 0 || provider.reviews.Load() != 4 || provider.corrections.Load() != 0 || result.Disclosure.EvidenceCalls != 4 {
+				t.Fatalf("batch failure changed or retried: %+v %v", result, err)
+			}
+			expected := 0
+			for _, chunk := range chunks[:3] {
+				if chunk.Review.Parts[0].ID != provider.invalidID {
+					expected += len(chunk.Review.Parts)
+				}
+			}
+			if provider.completed.Load() != 3 || len(saved.Observations) != expected {
+				t.Fatalf("successful peers lost: completed=%d, saved=%d, want=%d", provider.completed.Load(), len(saved.Observations), expected)
+			}
+			accepted := saved
+			forbidden := map[string]bool{}
+			for _, observation := range accepted.Observations {
+				forbidden[observation.ID] = true
+			}
+			for _, part := range chunks[3].Review.Parts {
+				if forbidden[part.ID] {
+					t.Fatal("an errored reply body was accepted")
+				}
+			}
+			options.ReviewProgress = accepted
+			retry := &finishPeerFailureTransport{t: t, forbidden: forbidden, goal: finishTestGoal(evidence)}
+			completed, err := PlanFinish(t.Context(), retry, evidence, options)
+			wantReviews := int32(1)
+			if scenario == "invalid peer" {
+				wantReviews = 2
+			}
+			if err != nil || completed.Calls != 1 || completed.Disclosure.ReusedFragments != expected || retry.reviews.Load() != wantReviews || retry.plans.Load() != 1 || retry.corrections.Load() != 0 || len(completed.Disclosure.EvidenceReviews) != saved.TotalFragments {
+				t.Fatalf("retry did not resume missing reviews: %+v %v", completed, err)
+			}
+		})
+	}
+}
+func TestFinishReviewDoesNotRetainPeersAfterDeadline(t *testing.T) {
+	evidence, options, chunks := finishPeerFailureFixture(t)
+	options.Deadline = time.Now().Add(5 * time.Second)
+	rejection := errors.New("peer failed after the attempt deadline")
+	provider := &finishPeerFailureTransport{t: t, rejectedID: chunks[3].Review.Parts[0].ID, rejection: rejection, waitForDeadline: true, peers: 3, ready: make(chan struct{}), goal: finishTestGoal(evidence)}
+	saved := 0
+	options.SaveReviewProgress = func(ctx context.Context, progress finish.ReviewProgress) error {
+		if ctx.Err() != nil {
+			t.Error("attempted a progress write after the deadline")
+		}
+		saved = len(progress.Observations)
+		return nil
+	}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if !errors.Is(err, rejection) || result.Calls != 0 || provider.completed.Load() != 3 || saved != 0 || len(result.Disclosure.EvidenceReviews) != 0 || provider.corrections.Load() != 0 {
+		t.Fatalf("late peer response was retained: %+v %v saved=%d", result, err, saved)
+	}
+}
+func TestFinishReviewRetainsPeersWhenCorrectionFails(t *testing.T) {
+	evidence, options, chunks := finishPeerFailureFixture(t)
+	failure := errors.New("review correction rejected")
+	provider := &finishPeerFailureTransport{t: t, invalidID: chunks[0].Review.Parts[0].ID, correctionFailure: failure, goal: finishTestGoal(evidence)}
+	saved := 0
+	options.SaveReviewProgress = func(_ context.Context, progress finish.ReviewProgress) error {
+		saved = len(progress.Observations)
+		return nil
+	}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	expected := 0
+	for _, chunk := range chunks[1:] {
+		expected += len(chunk.Review.Parts)
+	}
+	if !errors.Is(err, failure) || result.Calls != 0 || provider.reviews.Load() != 5 || provider.corrections.Load() != 1 || saved != expected {
+		t.Fatalf("correction failure stranded accepted peers: %+v %v saved=%d want=%d", result, err, saved, expected)
+	}
+}
+
+func TestFinishReviewPeerFailurePreservesProgressWriteError(t *testing.T) {
+	evidence, options, chunks := finishPeerFailureFixture(t)
+	rejection := errors.New("one peer rejected evidence")
+	diskFailure := errors.New("progress storage unavailable")
+	provider := &finishPeerFailureTransport{t: t, rejectedID: chunks[3].Review.Parts[0].ID, rejection: rejection, peers: 3, ready: make(chan struct{}), goal: finishTestGoal(evidence)}
+	options.SaveReviewProgress = func(_ context.Context, progress finish.ReviewProgress) error {
+		if len(progress.Observations) > 0 {
+			return diskFailure
+		}
+		return nil
+	}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if !errors.Is(err, rejection) || !errors.Is(err, diskFailure) || result.Calls != 0 || provider.corrections.Load() != 0 {
+		t.Fatalf("original failure or storage failure lost: %+v %v", result, err)
 	}
 }

@@ -18,6 +18,10 @@
 
 ### Changed
 
+- Keep validated evidence reviews after a retry preview and when another
+  parallel review fails. Size failures point to the reported bound rather
+  than suggesting that one setting can change every limit.
+
 - Save validated finish evidence reviews durably and reuse them on explicit
   retry only when the exact frozen evidence, provider configuration, and review
   instructions match. Report completed and reused fragments. Add
