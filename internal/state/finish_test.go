@@ -326,3 +326,49 @@ func TestFinishSchemaUpgradeAndReadOnly(t *testing.T) {
 		t.Fatal("readonly wrote call counter")
 	}
 }
+
+func TestFinishEvidenceBudgetSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	db, path := openTestDB(t)
+	r := startFinishFixture(t, db, finishFixture(t, db, 1))
+	for i := 1; i <= 32; i++ {
+		if n, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); err != nil || n != i {
+			t.Fatalf("review reservation %d: %d %v", i, n, err)
+		}
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("review limit bypassed", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, err := LoadFinishRequest(ctx, db, r.ID)
+	if err != nil || got.EvidenceCalls != 32 || got.PlanningCalls != 0 || got.Stage != "reviewing_evidence" || len(got.Plan) != 0 {
+		t.Fatalf("durable review progress: %+v %v", got, err)
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal(err)
+	}
+	if _, err := ConsumeFinishPlanningCall(ctx, db, r.ID, r.Attempt); err != nil {
+		t.Fatal("review consumed planning allowance", err)
+	}
+	if _, err := InterruptFinishRequests(ctx, db, r.Target.WorktreeID); err != nil {
+		t.Fatal(err)
+	}
+	interrupted, _ := LoadFinishRequest(ctx, db, r.ID)
+	if interrupted.EvidenceCalls != 32 || interrupted.State != FinishFailed {
+		t.Fatalf("restart discarded progress: %+v", interrupted)
+	}
+	retry, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, false)
+	if err != nil || retry.EvidenceCalls != 0 || retry.PlanningCalls != 0 || !reflect.DeepEqual(retry.Target, r.Target) {
+		t.Fatalf("retry changed target or retained spent budget: %+v %v", retry, err)
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("stale attempt reserved a call", err)
+	}
+}

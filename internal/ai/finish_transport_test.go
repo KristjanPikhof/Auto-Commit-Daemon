@@ -275,3 +275,34 @@ func TestFinishOpenAIRejectionExplainsCauseWithoutSecrets(t *testing.T) {
 		})
 	}
 }
+
+func TestFinishEvidenceToolMustMatchRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "finish_plan", "arguments": `{"observations":[]}`}}}}}}})
+	}))
+	defer server.Close()
+	p := &OpenAIProvider{BaseURL: server.URL, APIKey: "test-key", HTTP: server.Client()}
+	body, err := p.EncodeFinishRequest(FinishPlanRequest{Review: &FinishReviewTask{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ExchangeFinish(t.Context(), body); err == nil {
+		t.Fatal("wrong evidence tool accepted")
+	}
+}
+
+func TestFinishSubprocessEvidenceProtocol(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "review", "while IFS= read -r line; do printf '%s\\n' '{\"version\":1,\"finish_evidence\":{\"observations\":[{\"id\":\"part-1\",\"summary\":\"Preserve the recorded settings\"}]}}'; done\n")
+	p := NewSubprocessProvider("review", SubprocessOptions{LookPath: fixedLookPath("acd-provider-review", bin), Timeout: time.Second})
+	defer p.Close()
+	body, err := p.EncodeFinishRequest(FinishPlanRequest{Review: &FinishReviewTask{Parts: []FinishReviewPart{{ID: "part-1", ChangeID: "settings.go", Part: 1, Parts: 1, Text: "+ authored settings\n"}}}})
+	if err != nil || !strings.Contains(string(body), `"request_type":"finish_evidence"`) {
+		t.Fatalf("review protocol: %s %v", body, err)
+	}
+	raw, err := p.ExchangeFinish(t.Context(), body)
+	if err != nil || !strings.Contains(string(raw), "Preserve the recorded settings") {
+		t.Fatalf("evidence reply %s %v", raw, err)
+	}
+}

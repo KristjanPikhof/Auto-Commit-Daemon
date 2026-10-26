@@ -18,6 +18,13 @@
 
 ### Changed
 
+- Review large Intent batches in bounded evidence calls before one global commit
+  plan. Preserve every diff byte, recorded identity, and whole-target verification;
+  fragments never prescribe commits. Reserve up to 32 reviews durably under the
+  same deadline as planning, retain review provenance, and report review counts
+  separately. Small finishes keep their direct planning path. Reuse blob metadata
+  within a finish so repeated versions do not repeat identical Git reads.
+
 - Preserve bounded, redacted OpenAI-compatible rejection messages so a failed
   finish explains the provider error instead of hiding it behind HTTP status.
 

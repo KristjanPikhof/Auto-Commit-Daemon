@@ -244,6 +244,9 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		default:
 			fmt.Fprintln(out, commitCountLabel(result.CommitsCreated))
 		}
+		if r.EvidenceCalls > 0 {
+			fmt.Fprintf(out, "Evidence review calls: %d. Global planning calls: %d.\n", r.EvidenceCalls, r.PlanningCalls)
+		}
 		if !ok {
 			fmt.Fprintf(out, "Request: %s\n", safePreviewText(r.ID, 0))
 			if result.Protected {

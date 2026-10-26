@@ -68,13 +68,25 @@ binary objects, deletions, and unchanged entries.
 
 ## Bound the provider work
 
-One attempt allows one planning exchange and at most one combined correction.
-Both share the persisted `ai.timeout` deadline, five minutes by default. Messages
+Small requests use one planning exchange and at most one combined correction.
+Large requests first review the complete redacted evidence in bounded batches,
+then make one global plan across all recorded changes. At most 32 evidence
+reviews are allowed, with at most two immutable provider exchanges at once.
+The worker reserves each call before releasing its operation gate and continues
+protecting later edits while reviews run. All calls share the persisted `ai.timeout` deadline, five
+minutes by default. Messages
 are part of the same plan; they do not get a separate retry loop. Correction
 feedback includes all detected message and membership conflicts together.
 
 The request contains bounded metadata, redacted supplied context, and approved
-text diffs. ACD measures complete serialized input and fails oversized requests
+text diffs. Each encoded exchange is bounded to 512 KiB, or the smaller
+`ai.max_input_bytes` setting. A large file is divided into UTF-8 fragments without
+losing bytes. Every fragment gets a bounded factual observation before planning;
+ACD validates complete fragment coverage and records content digests, summaries,
+review-call counts, and attempted request sizes. The final planner receives all
+original change identities and these observations together. Fragments, files,
+and review calls do not prescribe commit boundaries. Raw aggregate evidence
+still obeys `ai.max_input_bytes`; metadata or a global plan that cannot fit fails
 instead of clipping evidence. Binary content is represented by metadata and
 verified Git objects. See [providers and privacy](ai-providers.md).
 

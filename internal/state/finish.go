@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
 const (
@@ -75,6 +77,7 @@ type FinishRequest struct {
 	Stage         string          `json:"stage"`
 	DeadlineTS    float64         `json:"deadline_ts"`
 	PlanningCalls int             `json:"planning_calls"`
+	EvidenceCalls int             `json:"evidence_calls,omitempty"`
 	PlanID        string          `json:"plan_id,omitempty"`
 	ResultID      string          `json:"result_id,omitempty"`
 	Plan          json.RawMessage `json:"plan,omitempty"`
@@ -230,8 +233,23 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 		return r, err
 	}
 	r.Plan = json.RawMessage(plan)
+
 	r.Result = json.RawMessage(result)
 	r.Publication = json.RawMessage(publication)
+	var progress struct {
+		EvidenceCalls int `json:"evidence_calls"`
+	}
+	if json.Unmarshal(r.Result, &progress) == nil {
+		r.EvidenceCalls = progress.EvidenceCalls
+	}
+	var saved struct {
+		Disclosure struct {
+			EvidenceCalls int `json:"evidence_calls"`
+		} `json:"disclosure"`
+	}
+	if json.Unmarshal(r.Plan, &saved) == nil {
+		r.EvidenceCalls = max(r.EvidenceCalls, saved.Disclosure.EvidenceCalls)
+	}
 	if len(r.Plan) > 0 {
 		r.PlanID = fmt.Sprintf("sha256:%x", sha256.Sum256(r.Plan))
 	}
@@ -544,7 +562,7 @@ func ConsumeFinishPlanningCall(ctx context.Context, db *DB, id string, attempt i
 		return 0, err
 	}
 	defer cleanup()
-	result, err := tx.ExecContext(ctx, `UPDATE finish_requests SET planning_calls=planning_calls+1,updated_ts=? WHERE request_id=? AND attempt=? AND state='running' AND planning_calls<2 AND deadline_ts>?`, nowSeconds(), id, attempt, nowSeconds())
+	result, err := tx.ExecContext(ctx, `UPDATE finish_requests SET planning_calls=planning_calls+1,stage='planning',updated_ts=? WHERE request_id=? AND attempt=? AND state='running' AND planning_calls<2 AND deadline_ts>?`, nowSeconds(), id, attempt, nowSeconds())
 	if err != nil {
 		return 0, err
 	}
@@ -557,6 +575,49 @@ func ConsumeFinishPlanningCall(ctx context.Context, db *DB, id string, attempt i
 	}
 	var calls int
 	if err := tx.QueryRowContext(ctx, `SELECT planning_calls FROM finish_requests WHERE request_id=? AND attempt=?`, id, attempt).Scan(&calls); err != nil {
+		return 0, err
+	}
+	return calls, tx.Commit()
+}
+
+// ConsumeFinishEvidenceCall reserves a review in the mutable attempt result
+// journal. The accepted plan remains immutable. Restart cannot reset this
+// separate budget or start another review after global planning has begun.
+func ConsumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt int) (int, error) {
+	tx, cleanup, err := beginFinishWrite(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	defer cleanup()
+	var raw string
+	if err := tx.QueryRowContext(ctx, `SELECT result_json FROM finish_requests WHERE request_id=? AND attempt=? AND state='running' AND planning_calls=0 AND plan_json='' AND deadline_ts>?`, id, attempt, nowSeconds()).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrFinishBudget
+		}
+		return 0, err
+	}
+	progress := map[string]json.RawMessage{}
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &progress); err != nil || progress == nil {
+			return 0, ErrFinishState
+		}
+	}
+	var calls int
+	if encoded, ok := progress["evidence_calls"]; ok {
+		if err := json.Unmarshal(encoded, &calls); err != nil {
+			return 0, ErrFinishState
+		}
+	}
+	if calls < 0 || calls >= finish.EvidenceReviewCallLimit {
+		return 0, ErrFinishBudget
+	}
+	calls++
+	progress["evidence_calls"], _ = json.Marshal(calls)
+	encoded, err := json.Marshal(progress)
+	if err != nil || len(encoded) > FinishJSONByteCap {
+		return 0, ErrFinishState
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE finish_requests SET result_json=?,stage='reviewing_evidence',updated_ts=? WHERE request_id=? AND attempt=?`, string(encoded), nowSeconds(), id, attempt); err != nil {
 		return 0, err
 	}
 	return calls, tx.Commit()

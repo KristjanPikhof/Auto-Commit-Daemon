@@ -636,6 +636,12 @@ func (t finishEvaluatedTransport) ExchangeFinish(ctx context.Context, body []byt
 	return evaluatePublication(ctx, func(jobCtx context.Context) ([]byte, error) { return t.FinishTransport.ExchangeFinish(jobCtx, body) })
 }
 
+func (t finishEvaluatedTransport) ExchangeFinishReviews(ctx context.Context, bodies [][]byte) ([][]byte, error) {
+	return evaluatePublication(ctx, func(jobCtx context.Context) ([][]byte, error) {
+		return ai.ExchangeFinishReviews(jobCtx, t.FinishTransport, bodies)
+	})
+}
+
 func (w *FinishWorker) evaluationContext(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, digest string, r state.FinishRequest) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 	evaluation := &publicationEvaluation{gate: w.OperationGate, cancel: cancel, wake: w.Wake, files: w.Files, changes: w.Changes, shutdown: w.Shutdown, interval: w.EvaluationInterval}
@@ -807,7 +813,10 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	if err != nil {
 		return finish.Plan{}, ai.FinishDisclosure{}, err
 	}
-	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, BeforeCall: func(callCtx context.Context) error {
+	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, BeforeEvidenceCall: func(callCtx context.Context) error {
+		_, err := state.ConsumeFinishEvidenceCall(callCtx, w.DB, r.ID, r.Attempt)
+		return err
+	}, BeforeCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}})
@@ -890,6 +899,11 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 	if err != nil {
 		return nil, err
 	}
+	type blobInfo struct {
+		size int64
+		text bool
+	}
+	blobs := make(map[string]blobInfo)
 	var diffs []ai.FinishDiff
 	totalBytes := 0
 	for _, change := range changes {
@@ -898,24 +912,28 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 			if entry.OID == "" {
 				continue
 			}
-			out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "cat-file", "-s", entry.OID)
-			if err != nil {
-				return nil, err
-			}
-			size, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-			if err != nil {
-				return nil, err
+			info, cached := blobs[entry.OID]
+			if !cached {
+				out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "cat-file", "-s", entry.OID)
+				if err != nil {
+					return nil, err
+				}
+				info.size, err = strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				info.text, err = git.FinishBlobIsText(ctx, repo, entry.OID)
+				if err != nil {
+					return nil, err
+				}
+				blobs[entry.OID] = info
 			}
 			if index == 0 {
-				diff.BeforeSize = size
+				diff.BeforeSize = info.size
 			} else {
-				diff.AfterSize = size
+				diff.AfterSize = info.size
 			}
-			text, err := git.FinishBlobIsText(ctx, repo, entry.OID)
-			if err != nil {
-				return nil, err
-			}
-			if !text {
+			if !info.text {
 				diff.Binary = true
 			}
 		}

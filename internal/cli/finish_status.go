@@ -30,6 +30,7 @@ type finishHistoryStatusReport struct {
 }
 
 type finishStatusReport struct {
+	EvidenceCalls  int                  `json:"evidence_calls,omitempty"`
 	RequestID      string               `json:"request_id"`
 	Attempt        int                  `json:"attempt"`
 	State          string               `json:"state"`
@@ -81,6 +82,20 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 		TargetTree: r.Target.TargetTree, BranchRef: r.Target.BranchRef, DryRun: r.DryRun,
 		ReasonCode: r.ReasonCode, Reason: r.Reason, UpdatedTS: r.UpdatedTS,
 		Verification: []daemon.FinishCheck{}, sourceTree: r.Target.CheckpointTree,
+	}
+	var progress struct {
+		EvidenceCalls int `json:"evidence_calls"`
+	}
+	if json.Unmarshal([]byte(result), &progress) == nil {
+		report.EvidenceCalls = progress.EvidenceCalls
+	}
+	var savedReview struct {
+		Disclosure struct {
+			EvidenceCalls int `json:"evidence_calls"`
+		} `json:"disclosure"`
+	}
+	if json.Unmarshal([]byte(plan), &savedReview) == nil {
+		report.EvidenceCalls = max(report.EvidenceCalls, savedReview.Disclosure.EvidenceCalls)
 	}
 	if result != "" {
 		var saved daemon.FinishResult

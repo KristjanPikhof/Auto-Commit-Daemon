@@ -383,3 +383,22 @@ func TestFinishCLIInputLimitNeedsNewRequest(t *testing.T) {
 		t.Fatalf("misleading size guidance: %s", out.String())
 	}
 }
+
+func TestFinishCLIReportsEvidenceReviewProgress(t *testing.T) {
+	lookup, runtime, _ := finishCLIFixture(t)
+	worker := &daemon.FinishWorker{RepoPath: lookup.Worktree.Root, DB: runtime.db, Config: daemon.FinishWorkerConfig{Mode: "local", Style: "imperative", ConfigDigest: "test-config"}}
+	r, _, err := worker.Start(t.Context(), daemon.FinishOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ConsumeFinishEvidenceCall(t.Context(), runtime.db, r.ID, r.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	report, err := readFinishStatus(t.Context(), runtime.db.ReadSQL(), r.Target.WorktreeID)
+	if err != nil || report == nil || report.EvidenceCalls != 1 || report.Stage != "reviewing_evidence" {
+		t.Fatalf("status/list review progress %+v %v", report, err)
+	}
+	if label := finishStageLabel(report.Stage); !strings.Contains(label, "Reviewing saved changes") {
+		t.Fatalf("hidden review phase: %s", label)
+	}
+}

@@ -624,15 +624,28 @@ func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
 	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	w.Config.Provider.Timeout = time.Minute
+	reviewed := make(map[string]string)
+	var reviewMu sync.Mutex
 	p := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
-		if len(request.Changes) != 156 || len(request.Diffs) != 156 {
-			t.Fatalf("lost batch members: %d changes, %d diffs", len(request.Changes), len(request.Diffs))
-		}
-		for _, diff := range request.Diffs {
-			if !strings.Contains(diff.Text, "final recorded value") && !strings.Contains(diff.Text, "last library entry") {
-				t.Fatalf("diff missing its end: %s", diff.ChangeID)
+		reviewMu.Lock()
+		defer reviewMu.Unlock()
+		if request.Review != nil {
+			var observations []map[string]string
+			for _, part := range request.Review.Parts {
+				reviewed[part.ChangeID] += part.Text
+				observations = append(observations, map[string]string{"id": part.ID, "summary": "Preserve recorded library entries and their consumers."})
 			}
-			if diff.ChangeID == "library-000.txt" && (len(diff.Text) < 1<<20 || strings.Count(diff.Text, "large library entry") != 100000) {
+			raw, _ := json.Marshal(map[string]any{"observations": observations})
+			return raw, nil
+		}
+		if len(request.Changes) != 156 || len(reviewed) != 156 || len(request.Reviews) < 156 {
+			t.Fatalf("lost batch members: %d changes, %d reviewed paths", len(request.Changes), len(reviewed))
+		}
+		for id, text := range reviewed {
+			if !strings.Contains(text, "final recorded value") && !strings.Contains(text, "last library entry") {
+				t.Fatalf("diff missing its end: %s", id)
+			}
+			if id == "library-000.txt" && (len(text) < 1<<20 || strings.Count(text, "large library entry") != 100000) {
 				t.Fatal("large text evidence was clipped")
 			}
 		}
@@ -642,7 +655,7 @@ func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
 	w.Transport = p
 	r := startFinishWorker(t, w, FinishOptions{})
 	completed, err := w.Execute(context.Background(), r.ID)
-	if err != nil || completed.State != state.FinishCompleted || p.calls.Load() != 1 {
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 || completed.EvidenceCalls < 2 || p.calls.Load() != int32(completed.EvidenceCalls+1) {
 		t.Fatalf("large finish: %+v calls=%d: %v", completed, p.calls.Load(), err)
 	}
 	if tree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); tree != r.Target.TargetTree {

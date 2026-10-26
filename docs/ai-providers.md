@@ -69,23 +69,27 @@ checkpoint storage:
 | Input | Maximum |
 |---|---|
 | Complete textual diff evidence | `ai.max_input_bytes`, 8 MiB by default |
-| Serialized planning request, including a correction | Same configured budget per exchange |
+| Each encoded review, global plan, or correction | 512 KiB, or the smaller configured budget |
 
-There is no separate per-file limit. A single 1 MiB diff can be included in full
-when the complete request fits. `ai.max_input_bytes` accepts 128 KiB through
-64 MiB, in bytes, through `acd config` or `ACD_AI_MAX_INPUT_BYTES`.
+There is no separate per-file rejection limit. Large files and batches are
+reviewed in bounded fragments before one global plan. Every complete redacted
+text diff reaches the provider across those fragments. Their factual summaries
+and original change identities enter the global plan together; a fragment does
+not become a commit. Small requests keep the direct planning path.
 
-ACD measures complete input before sending. If it exceeds the configured
-budget, ACD fails with `provider_input_too_large` and the measured size and limit.
-Increase the budget for a provider that supports larger input, then start a new
-finish; retry keeps the original settings. Local remains an explicit offline
-alternative. ACD never clips diffs or omits eligible changes to fit.
+`ai.max_input_bytes` accepts 128 KiB through 64 MiB, in bytes, through
+`acd config` or `ACD_AI_MAX_INPUT_BYTES`. It bounds aggregate evidence, while
+individual encoded exchanges stay within the smaller of that setting and
+512 KiB. Oversized global metadata, exhausted review budgets, or unavailable
+complete evidence fail explicitly. ACD never clips diffs or omits changes to fit.
 
 The byte budget is an ACD memory and request bound, not a model context limit.
 Providers can reject a request below it because their token or payload limit is
 smaller. Those failures keep the complete checkpoint protected.
 
-Saved disclosure identifies the attempted provider input and redaction. Encoded
+Saved disclosure identifies attempted provider input, redaction, review counts,
+fragment digests, and factual observations. Review calls and global planning calls
+are reported separately. Encoded
 request byte counts measure attempted exchanges; they do not prove the peer
 received a payload after a network failure.
 
@@ -104,7 +108,7 @@ request with bounded response size and cancellation.
 
 Subprocess providers are unsandboxed programs with worker privileges. Review
 the executable and its protocol before approving it. The retained transport
-accepts a Finish planning exchange; old event, candidate, and repair protocols
+accepts Finish planning and evidence-review exchanges; old event, candidate, and repair protocols
 are not planning alternatives. Cancellation and Close terminate the owned
 process group and join its readers within bounded cleanup.
 
@@ -114,8 +118,10 @@ HTTP failures retain the provider's standard `error.message`, with credential
 redaction and bounded output. Nonstandard or unreadable responses report the
 HTTP status and a generic rejection; ACD never prints an arbitrary error body.
 
-Intent allows one planning exchange and at most one combined correction under
-a single persisted deadline. `ai.timeout` defaults to five minutes. Transport
+Intent allows at most 32 bounded evidence reviews, one global planning exchange,
+and at most one combined correction under a single persisted deadline.
+At most two evidence exchanges run concurrently; each is durably reserved
+before transmission, and cancellation joins both before closing the transport. `ai.timeout` defaults to five minutes. Transport
 failure, missing credentials, invalid output, or deadline exhaustion fails the
 request. There is no automatic retry timer or Local fallback.
 
@@ -127,3 +133,11 @@ Completed checkpoints remain protected. Correct the cause and explicitly retry
 with `acd finish --retry REQUEST_ID`, or choose Local in reviewed settings and
 start a new finish. Retry keeps the frozen target; it does not include later
 edits. Status, list, and doctor never contact a provider.
+
+For large batches, subprocess protocol version 1 uses
+`request_type: "finish_evidence"` with `finish_request.evidence_review.parts`.
+Return `{"version":1,"finish_evidence":{"observations":[{"id":"part-1","summary":"Describe the recorded behavior and relevant dependencies."}]}}`.
+Every supplied part ID must appear exactly once, with a summary of at most 256
+characters. Unsupported review operations fail the explicit request; they do not
+fall back to another provider or Local. Ordinary `finish_plan` exchanges keep
+their existing protocol.

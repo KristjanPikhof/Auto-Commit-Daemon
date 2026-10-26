@@ -107,12 +107,16 @@ func NewSubprocessProvider(name string, opts SubprocessOptions) *SubprocessProvi
 func (p *SubprocessProvider) Name() string { return "subprocess:" + p.name }
 
 func (p *SubprocessProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte, error) {
+	requestType := "finish_plan"
+	if request.Review != nil {
+		requestType = "finish_evidence"
+	}
 	return json.Marshal(struct {
 		Version       int               `json:"version"`
 		RequestType   string            `json:"request_type"`
 		SystemPrompt  string            `json:"system_prompt"`
 		FinishRequest FinishPlanRequest `json:"finish_request"`
-	}{Version: 1, RequestType: "finish_plan", SystemPrompt: finishPrompt(request), FinishRequest: request})
+	}{Version: 1, RequestType: requestType, SystemPrompt: finishPrompt(request), FinishRequest: request})
 }
 
 // ExchangeFinish deliberately bypasses capability negotiation and the legacy
@@ -139,6 +143,15 @@ func (p *SubprocessProvider) ExchangeFinish(ctx context.Context, body []byte) ([
 	}
 	if response.Error != "" {
 		return nil, errors.New("subprocess finish: " + SanitizePlannerError(response.Error))
+	}
+	var sent struct {
+		RequestType string `json:"request_type"`
+	}
+	if json.Unmarshal(body, &sent) == nil && sent.RequestType == "finish_evidence" {
+		if response.Version != 1 || len(response.FinishEvidence) == 0 {
+			return nil, errors.New("subprocess provider must support version 1 finish_evidence for large batches")
+		}
+		return response.FinishEvidence, nil
 	}
 	if response.Version != 1 || len(response.FinishPlan) == 0 {
 		return nil, &finishOutputError{Err: errors.New("subprocess finish requires version 1 and finish_plan"), Raw: response.FinishPlan}
@@ -204,9 +217,10 @@ func (p *SubprocessProvider) markCrashed(session *pluginSession) {
 
 // subprocessResponse is the bounded Finish JSONL envelope.
 type subprocessResponse struct {
-	Version    int             `json:"version"`
-	Error      string          `json:"error,omitempty"`
-	FinishPlan json.RawMessage `json:"finish_plan"`
+	Version        int             `json:"version"`
+	Error          string          `json:"error,omitempty"`
+	FinishPlan     json.RawMessage `json:"finish_plan"`
+	FinishEvidence json.RawMessage `json:"finish_evidence,omitempty"`
 }
 
 // pluginRequest packages a request with its reply channel. The owner

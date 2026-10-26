@@ -49,6 +49,8 @@ func consoleProse(text string) string {
 
 func finishStageLabel(stage string) string {
 	switch stage {
+	case "reviewing_evidence":
+		return "Reviewing saved changes in bounded batches."
 	case "planning", "preparing":
 		return "Preparing your commits."
 	case "verifying":

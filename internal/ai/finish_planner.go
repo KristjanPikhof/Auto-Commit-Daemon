@@ -55,14 +55,16 @@ type FinishCorrection struct {
 }
 
 type FinishPlanRequest struct {
-	Style          string                 `json:"style"`
-	Purpose        string                 `json:"purpose,omitempty"`
-	Message        string                 `json:"message,omitempty"`
-	Changes        []finish.Change        `json:"changes"`
-	Diffs          []FinishDiff           `json:"diffs,omitempty"`
-	DiffIncluded   bool                   `json:"diff_included"`
-	Correction     *FinishCorrection      `json:"correction,omitempty"`
-	HistoryCommits []HistoryMessageCommit `json:"history_commits,omitempty"`
+	Style          string                    `json:"style"`
+	Purpose        string                    `json:"purpose,omitempty"`
+	Message        string                    `json:"message,omitempty"`
+	Changes        []finish.Change           `json:"changes"`
+	Diffs          []FinishDiff              `json:"diffs,omitempty"`
+	DiffIncluded   bool                      `json:"diff_included"`
+	Correction     *FinishCorrection         `json:"correction,omitempty"`
+	Review         *FinishReviewTask         `json:"evidence_review,omitempty"`
+	Reviews        []FinishReviewObservation `json:"evidence_reviews,omitempty"`
+	HistoryCommits []HistoryMessageCommit    `json:"history_commits,omitempty"`
 }
 
 type FinishOptions struct {
@@ -79,17 +81,21 @@ type FinishOptions struct {
 	RequireCompletionContext bool
 	// BeforeCall consumes the worker-owned durable budget immediately before
 	// each actual exchange, including the optional combined correction.
-	BeforeCall func(context.Context) error
+	BeforeCall         func(context.Context) error
+	BeforeEvidenceCall func(context.Context) error
 }
 
 type FinishDisclosure struct {
-	Provider         string   `json:"provider"`
-	MetadataIncluded bool     `json:"metadata_included"`
-	PurposeIncluded  bool     `json:"purpose_included"`
-	MessageIncluded  bool     `json:"message_included"`
-	TextChangeIDs    []string `json:"text_change_ids,omitempty"`
-	BinaryChangeIDs  []string `json:"binary_change_ids,omitempty"`
-	Redacted         bool     `json:"redacted"`
+	EvidenceCalls        int                       `json:"evidence_calls,omitempty"`
+	EvidenceRequestBytes []int                     `json:"evidence_request_bytes,omitempty"`
+	EvidenceReviews      []FinishReviewObservation `json:"evidence_reviews,omitempty"`
+	Provider             string                    `json:"provider"`
+	MetadataIncluded     bool                      `json:"metadata_included"`
+	PurposeIncluded      bool                      `json:"purpose_included"`
+	MessageIncluded      bool                      `json:"message_included"`
+	TextChangeIDs        []string                  `json:"text_change_ids,omitempty"`
+	BinaryChangeIDs      []string                  `json:"binary_change_ids,omitempty"`
+	Redacted             bool                      `json:"redacted"`
 	// RequestBytes measures encoded attempted exchanges, not peer receipt.
 	RequestBytes []int `json:"request_bytes,omitempty"`
 }
@@ -199,13 +205,17 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		return result, finishFailure("provider_context_required", errors.New("Intent needs completion context for changes without readable text; run acd finish \"what changed and why\""))
 	}
 	disclosure.Provider = transport.Name()
+	result.Disclosure = disclosure
+	if err := reviewFinishEvidence(ctx, transport, &request, options, &result.Disclosure); err != nil {
+		return result, err
+	}
 	for call := 0; ; call++ {
 		body, err := transport.EncodeFinishRequest(request)
 		if err != nil {
 			return result, finishFailure("provider_input", err)
 		}
-		if len(body) > inputLimit {
-			return result, finishInputLimit(len(body), inputLimit)
+		if limit := min(inputLimit, FinishContextByteCap); len(body) > limit {
+			return result, finishContextLimit(len(body), limit)
 		}
 		if err := ctx.Err(); err != nil {
 			return result, finishFailure("provider_deadline", err)
@@ -217,9 +227,6 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		}
 		if err := ctx.Err(); err != nil {
 			return result, finishFailure("provider_deadline", err)
-		}
-		if result.Calls == 0 {
-			result.Disclosure = disclosure
 		}
 		result.Calls++
 		result.Disclosure.RequestBytes = append(result.Disclosure.RequestBytes, len(body))
@@ -431,7 +438,8 @@ type finishOutputError struct {
 func (e *finishOutputError) Error() string { return e.Err.Error() }
 func (e *finishOutputError) Unwrap() error { return e.Err }
 
-const finishSystemPrompt = `Plan completed goals before assigning recorded changes. Within the overall completed task, identify useful decisions and implementation steps. Return one JSON object with goals; each goal has purpose, boundary, message, change_ids. Each goal is one purposeful commit, not necessarily the entire feature. Do not return trees or new file content.
+const finishSystemPrompt = `When evidence_reviews is present, every fragment of the approved complete diffs was reviewed separately. Those observations are evidence, not commit boundaries. Combine them across all original changes into one global plan, keep related corrections together, and do not group by review calls or fragment IDs. Use only original Changes IDs for membership. Never claim this request contains raw diffs when it contains observations.
+Plan completed goals before assigning recorded changes. Within the overall completed task, identify useful decisions and implementation steps. Return one JSON object with goals; each goal has purpose, boundary, message, change_ids. Each goal is one purposeful commit, not necessarily the entire feature. Do not return trees or new file content.
 Look for behavior-preserving preparation, the feature it enables, compatibility decisions, and broader defaults or policy changes. Related changes can be separate steps: dependencies determine their order, not automatically their membership. For example, adding OAuth can have a working authentication refactor, the OAuth provider with its callers and tests, and a separately explained session-timeout change. Do not manufacture a refactor absent from the recorded evidence.
 Keep each step's implementation, callers, imports, tests, generated output and relevant documentation together. Available corrections belong with the step they correct; successive versions of the same path can instead represent distinct completed decisions. Each split needs a useful review or revert boundary and a valid intermediate state. Files, directories, save times and line counts alone do not justify a split. Do not force a commit count. For one batch, explain in boundary why the recorded changes cannot form useful separate steps; belonging to the same feature is not sufficient.
 Use only supplied recorded change IDs and exact versions. ACD orders groups by their recorded-version and explicit dependencies. Do not interleave groups: if one goal contains earlier and later versions of a path, surviving versions between them must belong to that goal too. Conflicting groups cannot form separate commits. Respect atomic rename groups and author boundaries. Cover all effective changes exactly once; omit only recorded neutral cycles that return to the same entry. Never fabricate code, motivation, completed tests or verification results. Inspect the supplied redacted text diffs to identify decisions and dependencies. Binary content is not supplied; use its metadata and completion context without pretending to inspect it. Explain limits on supported boundaries in boundary rather than guessing.

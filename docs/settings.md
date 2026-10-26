@@ -157,10 +157,12 @@ buffering. Larger regular files stream into Git objects; the setting does not
 silently exclude them. Git-ignored and sensitive paths remain excluded.
 
 `ai.max_input_bytes` (`ACD_AI_MAX_INPUT_BYTES`) defaults to 8 MiB. It bounds
-complete textual diff evidence and the entire encoded planning request,
-including correction feedback. There is no separate per-file cap. Supported
+aggregate complete textual diff evidence. Each review, global plan, and
+correction exchange also stays within 512 KiB, or the smaller configured budget.
+Large batches review every diff in fragments before one global plan. There is
+no separate per-file rejection cap. Supported
 values range from 131072 (128 KiB) to 67108864 (64 MiB). For example, to allow
-requests up to 16 MiB in the current repository:
+up to 16 MiB of aggregate evidence in the current repository:
 
 ~~~bash
 acd config set ai.max_input_bytes 16777216

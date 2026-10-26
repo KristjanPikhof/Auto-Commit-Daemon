@@ -20,6 +20,9 @@ type HistoryMessageCommit struct {
 }
 
 func finishPrompt(request FinishPlanRequest) string {
+	if request.Review != nil {
+		return finishReviewPrompt
+	}
 	if len(request.HistoryCommits) == 0 {
 		return finishSystemPrompt
 	}
@@ -69,13 +72,17 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		request.HistoryCommits = append(request.HistoryCommits, commit)
 	}
 	disclosure.Provider = transport.Name()
+	result.Disclosure = disclosure
+	if err := reviewFinishEvidence(ctx, transport, &request, options, &result.Disclosure); err != nil {
+		return nil, result, err
+	}
 	for call := 0; call < 2; call++ {
 		body, err := transport.EncodeFinishRequest(request)
 		if err != nil {
 			return nil, result, err
 		}
-		if len(body) > inputLimit {
-			return nil, result, finishInputLimit(len(body), inputLimit)
+		if limit := min(inputLimit, FinishContextByteCap); len(body) > limit {
+			return nil, result, finishContextLimit(len(body), limit)
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, result, finishFailure("provider_deadline", err)
@@ -87,9 +94,6 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, result, finishFailure("provider_deadline", err)
-		}
-		if call == 0 {
-			result.Disclosure = disclosure
 		}
 		result.Calls++
 		result.Disclosure.RequestBytes = append(result.Disclosure.RequestBytes, len(body))

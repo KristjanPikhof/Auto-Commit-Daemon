@@ -146,8 +146,17 @@ The final candidate tree must equal the entire frozen target exactly, including
 unchanged entries, file modes, deletions, renames, symlinks, and binary objects.
 Coverage and equality are structural evidence, not proof that project tests ran.
 
-One Intent attempt allows one planning call plus at most one correction within
-one persisted `ai.timeout` deadline (default five minutes). Messages belong to
+One Intent attempt allows at most 32 evidence-review calls, one global planning
+call, and at most one global correction within one persisted `ai.timeout`
+deadline (default five minutes). At most two immutable evidence exchanges run concurrently; the worker reserves
+budgets and writes state serially. Small requests skip evidence review. Every
+complete redacted diff is covered by exact UTF-8 fragments; every fragment must
+have exactly one bounded observation with a locally recorded content digest.
+Review batches never define commit membership. The global planner sees all
+original change identities, dependencies, and observations together. Review
+reservations use the mutable attempt result journal, preserving accepted-plan
+immutability and the separate two-call planning budget. Restart retains the
+counts and interrupts the attempt; it does not resume provider work. Messages belong to
 that plan, so they have no separate retry loop. One batch must explain why the
 recorded changes do not support useful safe steps. Failed intermediate checks,
 provider failure, malformed or incomplete output, unavailable evidence, and
@@ -170,9 +179,10 @@ finish also needs supplied context or an exact message;
 `provider_context_required` needs a new request with that context. Local stays
 offline, and history selection remains independent of finish checkpoints.
 
-`ai.max_input_bytes` bounds both aggregate complete textual evidence and each
-serialized provider request, including correction feedback. It defaults to
-8 MiB and accepts 128 KiB through 64 MiB. There is no smaller per-path cap.
+`ai.max_input_bytes` bounds aggregate complete textual evidence. Each encoded
+provider exchange, including correction feedback, also has a 512 KiB context
+bound or the smaller configured byte budget. It defaults to
+8 MiB and accepts 128 KiB through 64 MiB. Large files are reviewed in parts without a per-file rejection threshold.
 These bounds are separate from checkpoint storage; `capture.max_file_bytes`
 controls buffering and does not make large files ineligible for protection.
 

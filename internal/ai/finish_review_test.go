@@ -1,0 +1,206 @@
+package ai
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
+)
+
+func finishTestReview(request FinishPlanRequest) []byte {
+	observations := []map[string]string{}
+	for _, part := range request.Review.Parts {
+		observations = append(observations, map[string]string{"id": part.ID, "summary": "Preserve explicit authored settings and their consumers."})
+	}
+	body, _ := json.Marshal(map[string]any{"observations": observations})
+	return body
+}
+
+func TestFinishLargeEvidenceReviewedBeforeGlobalPlan(t *testing.T) {
+	evidence := finishTestEvidence()
+	options := finishTestOptions(evidence)
+	text := "+ password=abcdefgh12345678\n" + strings.Repeat("+ preserve authored 界 values <>&\\\"\n", 16000) + "+ final evidence\n"
+	options.Diffs[0].Text = text
+	reviewed := ""
+	reservations := 0
+	options.BeforeEvidenceCall = func(context.Context) error { reservations++; return nil }
+	provider := &finishFakeTransport{exchange: func(_ context.Context, r FinishPlanRequest) ([]byte, error) {
+		if r.Review != nil {
+			for _, part := range r.Review.Parts {
+				if strings.Contains(part.Text, "abcdefgh12345678") {
+					t.Fatal("unredacted review")
+				}
+				reviewed += part.Text
+			}
+			return finishTestReview(r), nil
+		}
+		if reviewed != finishRedactText(text) {
+			t.Fatal("review lost, duplicated, or reordered bytes")
+		}
+		if len(r.Changes) != 1 || len(r.Reviews) < 2 || len(r.Diffs) != 1 || r.Diffs[0].Text != "" {
+			t.Fatal("global plan lost original identity or sent the whole diff again")
+		}
+		return finishTestOutput(finishTestGoal(evidence)), nil
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || result.Calls != 1 || result.Disclosure.EvidenceCalls != reservations || reservations < 2 || !result.Disclosure.Redacted {
+		t.Fatalf("large plan %+v %v", result, err)
+	}
+	for _, r := range provider.requests {
+		body, _ := provider.EncodeFinishRequest(r)
+		if len(body) > FinishContextByteCap {
+			t.Fatal("oversized exchange")
+		}
+	}
+	if len(result.Disclosure.EvidenceReviews) != len(provider.requests[len(provider.requests)-1].Reviews) {
+		t.Fatal("saved review provenance missing")
+	}
+}
+
+func TestFinishEvidenceReviewFailsWithoutPlanning(t *testing.T) {
+	for _, scenario := range []string{"rejected", "missing fragment", "duplicate fragment", "verification claim", "deadline", "budget"} {
+		t.Run(scenario, func(t *testing.T) {
+			evidence := finishTestEvidence()
+			options := finishTestOptions(evidence)
+			options.Diffs[0].Text = strings.Repeat("+ authored settings\n", 27000)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if scenario == "budget" {
+				options.BeforeEvidenceCall = func(context.Context) error { return errors.New("durable budget exhausted") }
+			}
+			provider := &finishFakeTransport{exchange: func(_ context.Context, r FinishPlanRequest) ([]byte, error) {
+				if r.Review == nil {
+					t.Fatal("failed review reached planning")
+				}
+				switch scenario {
+				case "rejected":
+					return nil, errors.New("provider refused review")
+				case "missing fragment":
+					return []byte(`{"observations":[]}`), nil
+				case "duplicate fragment":
+					return []byte(`{"observations":[{"id":"part-1","summary":"First valid observation"},{"id":"part-1","summary":"Second valid observation"}]}`), nil
+				case "verification claim":
+					return []byte(`{"observations":[{"id":"part-1","summary":"All tests passed"}]}`), nil
+				case "deadline":
+					cancel()
+					return finishTestReview(r), nil
+				}
+				return nil, nil
+			}}
+			result, err := PlanFinish(ctx, provider, evidence, options)
+			if err == nil || result.Calls != 0 || len(result.Plan.Steps) != 0 || len(provider.requests) > 1 {
+				t.Fatalf("failed review retried or planned: %+v %v", result, err)
+			}
+		})
+	}
+}
+
+func TestFinishDiffPartsPreserveLongUnicodeLines(t *testing.T) {
+	text := strings.Repeat("界", 30000) + "\n" + strings.Repeat("x", 100000)
+	parts := finishDiffParts(text, 16384)
+	if len(parts) < 2 || strings.Join(parts, "") != text {
+		t.Fatal("fragmentation clipped or reordered text")
+	}
+}
+
+func TestFinishReviewLimitRejectedBeforeProviderCalls(t *testing.T) {
+	evidence := finishTestEvidence()
+	options := finishTestOptions(evidence)
+	options.Diffs[0].Text = strings.Repeat("x", (33<<16)+1)
+	provider := &finishFakeTransport{padding: 440 << 10, exchange: func(context.Context, FinishPlanRequest) ([]byte, error) {
+		t.Fatal("exhausted review budget reached provider")
+		return nil, nil
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err == nil || result.Calls != 0 || result.Disclosure.EvidenceCalls != 0 || len(provider.requests) != 0 {
+		t.Fatalf("unbounded reviews %+v %v", result, err)
+	}
+}
+
+func TestFinishLargeHistoryKeepsOriginalMembership(t *testing.T) {
+	evidence := finishTestEvidence()
+	options := finishTestOptions(evidence)
+	options.Diffs[0].Text = strings.Repeat("+ authored settings\n", 30000)
+	commits := []HistoryMessageCommit{{ID: "original", Author: "author-a", TreeOID: strings.Repeat("b", 40), ChangeIDs: []string{"settings.go"}}}
+	provider := &finishFakeTransport{exchange: func(_ context.Context, r FinishPlanRequest) ([]byte, error) {
+		if r.Review != nil {
+			return finishTestReview(r), nil
+		}
+		if len(r.HistoryCommits) != 1 || len(r.Reviews) == 0 {
+			t.Fatal("history grouping context was lost")
+		}
+		return finishTestOutput(finish.Goal{Purpose: "Preserve authored settings", Boundary: "Keep original commit membership", Message: "Preserve authored settings\n\n- Keep explicit authored values ahead of defaults.", ChangeIDs: []string{"original"}}), nil
+	}}
+	goals, result, err := PlanHistoryMessages(t.Context(), provider, evidence, commits, options)
+	if err != nil || len(goals) != 1 || goals[0].ChangeIDs[0] != "original" || result.Disclosure.EvidenceCalls < 2 || result.Calls != 1 {
+		t.Fatalf("history %+v %+v %v", goals, result, err)
+	}
+}
+
+type finishBlockingReviewTransport struct {
+	started, stopped chan struct{}
+	failure          error
+}
+
+func (*finishBlockingReviewTransport) Name() string { return "blocking-review" }
+func (*finishBlockingReviewTransport) EncodeFinishRequest(FinishPlanRequest) ([]byte, error) {
+	return nil, nil
+}
+func (p *finishBlockingReviewTransport) ExchangeFinish(ctx context.Context, body []byte) ([]byte, error) {
+	if string(body) == "slow" {
+		close(p.started)
+		<-ctx.Done()
+		close(p.stopped)
+		return nil, ctx.Err()
+	}
+	<-p.started
+	return nil, p.failure
+}
+func TestFinishEvidenceBatchCancelsAndJoinsPeers(t *testing.T) {
+	failure := errors.New("provider rejected evidence")
+	provider := &finishBlockingReviewTransport{started: make(chan struct{}), stopped: make(chan struct{}), failure: failure}
+	_, err := ExchangeFinishReviews(t.Context(), provider, [][]byte{[]byte("slow"), []byte("reject")})
+	if !errors.Is(err, failure) {
+		t.Fatalf("original rejection lost: %v", err)
+	}
+	select {
+	case <-provider.stopped:
+	default:
+		t.Fatal("returned before joining cancelled exchange")
+	}
+}
+
+func TestFinishReviewChunksDoNotDefineCommitBoundaries(t *testing.T) {
+	evidence := finish.Evidence{Base: finish.Tree{}, Target: finish.Tree{"library.go": finishTestEntry("a"), "consumer.go": finishTestEntry("b"), "privacy.go": finishTestEntry("c")}}
+	evidence.Changes = finish.NetChanges(evidence.Base, evidence.Target, "author-a")
+	// Recorded prerequisites precede their consumers in valid evidence.
+	evidence.Changes[0], evidence.Changes[1] = evidence.Changes[1], evidence.Changes[0]
+	for i := range evidence.Changes {
+		if evidence.Changes[i].ID == "consumer.go" {
+			evidence.Changes[i].DependsOn = []string{"library.go"}
+		}
+	}
+	options := finishTestOptions(evidence)
+	for i := range options.Diffs {
+		options.Diffs[i].Text = strings.Repeat("+ recorded behavior\n", 16000)
+	}
+	provider := &finishFakeTransport{exchange: func(_ context.Context, r FinishPlanRequest) ([]byte, error) {
+		if r.Review != nil {
+			return finishTestReview(r), nil
+		}
+		if len(r.Changes) != 3 || len(r.Reviews) < 9 {
+			t.Fatal("global planner did not see all evidence together")
+		}
+		return finishTestOutput(
+			finish.Goal{Purpose: "Provide reusable parsing", Boundary: "Keep the parser and its working consumer together", Message: "Provide reusable parsing\n\n- Share recorded parsing behavior with its consumer.", ChangeIDs: []string{"library.go", "consumer.go"}},
+			finish.Goal{Purpose: "Preserve private defaults", Boundary: "Review the independent privacy policy separately", Message: "Preserve private defaults\n\n- Keep private defaults independent from parser configuration.", ChangeIDs: []string{"privacy.go"}},
+		), nil
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || len(result.Plan.Steps) != 2 || result.Calls != 1 || result.Disclosure.EvidenceCalls < 2 {
+		t.Fatalf("global boundaries %+v %v", result, err)
+	}
+}
