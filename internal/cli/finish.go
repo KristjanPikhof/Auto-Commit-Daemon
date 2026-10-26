@@ -199,7 +199,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		} else if r.ReasonCode == "provider_context_required" {
 			next = `acd finish "what changed and why"`
 		} else if r.ReasonCode == "provider_input_too_large" {
-			next = "Review ai.max_input_bytes in acd config, then start a new acd finish"
+			next = "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"
 		} else if r.ReasonCode == "provider_diffs_required" {
 			next = "Approve code sharing with acd config, then start a new acd finish"
 		} else {

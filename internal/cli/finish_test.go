@@ -374,13 +374,39 @@ func TestFinishCLIUnavailableOutputAndExit(t *testing.T) {
 
 func TestFinishCLIInputLimitNeedsNewRequest(t *testing.T) {
 	lookup, _, _ := finishCLIFixture(t)
-	r := state.FinishRequest{ID: "finish-large", State: state.FinishFailed, ReasonCode: "provider_input_too_large", Reason: "Request exceeds ai.max_input_bytes"}
-	var out bytes.Buffer
-	if err := renderFinish(&out, lookup, r, false, ""); err == nil {
-		t.Fatal("expected unsuccessful finish")
-	}
-	if strings.Contains(out.String(), "--retry") || !strings.Contains(out.String(), "Review ai.max_input_bytes") {
-		t.Fatalf("misleading size guidance: %s", out.String())
+	wantGuidance := "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"
+	for _, test := range []struct {
+		name, reason string
+	}{
+		{"budget", "evidence is 8388609 bytes; limit is 8388608 bytes; increase ai.max_input_bytes"},
+		{"context", "encoded planning context is 524289 bytes; per-exchange limit is 524288 bytes"},
+		{"reviews", "evidence needs 33 review calls; limit is 32"},
+	} {
+		for _, jsonOut := range []bool{false, true} {
+			format := "human"
+			if jsonOut {
+				format = "json"
+			}
+			t.Run(test.name+"/"+format, func(t *testing.T) {
+				r := state.FinishRequest{ID: "finish-large", State: state.FinishFailed, ReasonCode: "provider_input_too_large", Reason: test.reason}
+				var out bytes.Buffer
+				if err := renderFinish(&out, lookup, r, jsonOut, ""); err == nil {
+					t.Fatal("expected unsuccessful finish")
+				}
+				if strings.Contains(out.String(), "--retry") || !strings.Contains(out.String(), wantGuidance) {
+					t.Fatalf("misleading size guidance: %s", out.String())
+				}
+				if jsonOut {
+					var response productEnvelope
+					if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+						t.Fatal(err)
+					}
+					if response.NextAction == nil || *response.NextAction != wantGuidance || response.Error == nil || response.Error.Retryable || response.Error.Message != test.reason {
+						t.Fatalf("input limit action lost its reason or became retryable: %+v", response)
+					}
+				}
+			})
+		}
 	}
 }
 
