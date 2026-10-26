@@ -33,6 +33,16 @@ type FinishOptions struct {
 	DryRun        bool
 	IncludeStaged bool
 	RetryID       string
+	Timeout       time.Duration
+}
+
+// ValidateFinishTimeout bounds an explicit attempt without changing its target
+// or provider settings. Reconnecting never extends an accepted deadline.
+func ValidateFinishTimeout(timeout time.Duration) error {
+	if timeout != 0 && (timeout < time.Second || timeout > time.Hour) {
+		return errors.New("finish: --timeout must be between 1s and 1h")
+	}
+	return nil
 }
 
 // FinishWorkerConfig is one resolved, approved runtime snapshot. ConfigDigest
@@ -210,11 +220,18 @@ func finishBranchHead(ctx context.Context, repo string) (string, string, error) 
 // Start freezes one fresh complete checkpoint. Identical active callers attach
 // first, even if files or staging changed while the original job was running.
 func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.FinishRequest, bool, error) {
+	if err := ValidateFinishTimeout(options.Timeout); err != nil {
+		return state.FinishRequest{}, false, err
+	}
 	wt, cfg, digest, err := w.resolved(ctx)
 	if err != nil {
 		return state.FinishRequest{}, false, err
 	}
 	worktreeID := checkpoint.WorktreeID(wt.Root)
+	timeout := cfg.Provider.Timeout
+	if options.Timeout != 0 {
+		timeout = options.Timeout
+	}
 	if options.RetryID != "" {
 		if options.Purpose != "" || options.Message != "" || options.IncludeStaged {
 			return state.FinishRequest{}, false, errors.New("finish: retry cannot change purpose, message or staged consent")
@@ -238,7 +255,7 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 		if _, _, err := w.evidence(ctx, wt, old.Target); err != nil {
 			return old, false, err
 		}
-		retried, err := state.RetryFinishRequest(ctx, w.DB, old.ID, finishTimestamp(time.Now().Add(cfg.Provider.Timeout)), options.DryRun)
+		retried, err := state.RetryFinishRequest(ctx, w.DB, old.ID, finishTimestamp(time.Now().Add(timeout)), options.DryRun)
 		return retried, err == nil, err
 	}
 	if err := finish.ValidatePurpose(options.Purpose); err != nil {
@@ -332,7 +349,7 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 	if err := git.CheckFinishPublicationSafety(ctx, wt.Root, branch, head, index, options.IncludeStaged); err != nil {
 		return active, false, err
 	}
-	return state.StartFinishRequest(ctx, w.DB, state.FinishRequest{ID: id, Target: frozen, DryRun: options.DryRun, DeadlineTS: finishTimestamp(time.Now().Add(cfg.Provider.Timeout))})
+	return state.StartFinishRequest(ctx, w.DB, state.FinishRequest{ID: id, Target: frozen, DryRun: options.DryRun, DeadlineTS: finishTimestamp(time.Now().Add(timeout))})
 }
 
 func finishTimestamp(t time.Time) float64 { return float64(t.UnixNano()) / float64(time.Second) }
@@ -813,7 +830,13 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	if err != nil {
 		return finish.Plan{}, ai.FinishDisclosure{}, err
 	}
-	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, BeforeEvidenceCall: func(callCtx context.Context) error {
+	identity, err := json.Marshal(r.Target)
+	if err != nil {
+		return finish.Plan{}, ai.FinishDisclosure{}, err
+	}
+	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, ReviewIdentity: string(identity), ReviewProgress: r.ReviewProgress, SaveReviewProgress: func(saveCtx context.Context, progress finish.ReviewProgress) error {
+		return state.SaveFinishReviewProgress(saveCtx, w.DB, r.ID, r.Attempt, progress)
+	}, BeforeEvidenceCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishEvidenceCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}, BeforeCall: func(callCtx context.Context) error {

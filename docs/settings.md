@@ -174,9 +174,13 @@ applies to new requests; retry preserves the original settings. Oversized input
 fails without clipping or omitting changes, and the checkpoint stays protected.
 
 `ai.timeout` (`ACD_AI_TIMEOUT`) defaults to five minutes. An Intent attempt has
-one persisted deadline for its initial planning exchange and optional combined
-correction. Restart does not renew it. Oversized provider input fails without
-clipping, while the complete checkpoint stays protected.
+one persisted deadline covering evidence preparation, reviews, planning, and
+correction. Use `acd finish --timeout 15m` for a larger batch, or
+`acd finish --retry REQUEST_ID --timeout 15m` for the same saved target. This
+per-attempt override accepts 1 second through 1 hour and leaves provider settings
+unchanged. Reconnecting and restarting never extend an active deadline.
+Validated reviews survive restart and can be reused by an explicit retry when
+their exact evidence, provider configuration, and instructions still match.
 
 The generated [configuration reference](configuration-reference.md) lists
 supported fields, environment names, defaults, and apply boundaries.

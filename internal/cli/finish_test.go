@@ -394,11 +394,28 @@ func TestFinishCLIReportsEvidenceReviewProgress(t *testing.T) {
 	if _, err := state.ConsumeFinishEvidenceCall(t.Context(), runtime.db, r.ID, r.Attempt); err != nil {
 		t.Fatal(err)
 	}
+	progress := finish.ReviewProgress{Fingerprint: strings.Repeat("a", 64), TotalFragments: 2, ReusedFragments: 1, Observations: []finish.ReviewObservation{{ID: "part-1", Summary: "Preserve complete library values"}}}
+	if err := state.SaveFinishReviewProgress(t.Context(), runtime.db, r.ID, r.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
 	report, err := readFinishStatus(t.Context(), runtime.db.ReadSQL(), r.Target.WorktreeID)
-	if err != nil || report == nil || report.EvidenceCalls != 1 || report.Stage != "reviewing_evidence" {
+	if err != nil || report == nil || report.EvidenceCalls != 1 || report.Stage != "reviewing_evidence" || report.ReviewedFragments != 1 || report.ReviewFragments != 2 || report.ReusedFragments != 1 || report.DeadlineTS != r.DeadlineTS {
 		t.Fatalf("status/list review progress %+v %v", report, err)
 	}
 	if label := finishStageLabel(report.Stage); !strings.Contains(label, "Reviewing saved changes") {
 		t.Fatalf("hidden review phase: %s", label)
+	}
+	if label := finishStatusSummary(report); !strings.Contains(label, "1/2 fragments (1 reused)") {
+		t.Fatalf("hidden status/list review progress: %s", label)
+	}
+}
+
+func TestFinishCLIRejectsUnboundedTimeoutBeforeContactingWorker(t *testing.T) {
+	for _, timeout := range []string{"0s", "-1s", "1ms", "61m"} {
+		cmd := newRootCmd()
+		cmd.SetArgs([]string{"finish", "--timeout", timeout})
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "between 1s and 1h") {
+			t.Fatalf("invalid planning budget %s: %v", timeout, err)
+		}
 	}
 }

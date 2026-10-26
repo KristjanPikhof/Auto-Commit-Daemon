@@ -681,3 +681,30 @@ func TestFinishWorkerInputBudgetIsFrozen(t *testing.T) {
 		t.Fatalf("retry accepted a changed input budget: %v", err)
 	}
 }
+
+func TestFinishWorkerExplicitTimeoutPreservesFrozenIdentity(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "goal.txt", "frozen goal\n")
+	w.Config.Mode = "intent"
+	r := startFinishWorker(t, w, FinishOptions{Timeout: 15 * time.Minute})
+	if remaining := time.Until(finishDeadline(r)); remaining < 14*time.Minute || remaining > 15*time.Minute {
+		t.Fatalf("explicit timeout ignored: %v", remaining)
+	}
+	reconnected, created, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, Timeout: time.Hour})
+	if err != nil || created || reconnected.DeadlineTS != r.DeadlineTS {
+		t.Fatalf("reconnect renewed deadline: %+v %v", reconnected, err)
+	}
+	if _, err := w.fail(r, context.DeadlineExceeded); err == nil {
+		t.Fatal("failure not reported")
+	}
+	finishWrite(t, f.dir, "goal.txt", "later work\n")
+	retry, created, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, Timeout: 20 * time.Minute})
+	if err != nil || !created || !reflect.DeepEqual(retry.Target, r.Target) || time.Until(finishDeadline(retry)) < 19*time.Minute {
+		t.Fatalf("retry changed frozen target: %+v %v", retry, err)
+	}
+	for _, timeout := range []time.Duration{-time.Second, time.Millisecond, time.Hour + time.Second} {
+		if _, _, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, Timeout: timeout}); err == nil {
+			t.Fatal("invalid timeout accepted", timeout)
+		}
+	}
+}

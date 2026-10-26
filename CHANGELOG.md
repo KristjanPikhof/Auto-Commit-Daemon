@@ -18,6 +18,13 @@
 
 ### Changed
 
+- Save validated finish evidence reviews durably and reuse them on explicit
+  retry only when the exact frozen evidence, provider configuration, and review
+  instructions match. Report completed and reused fragments. Add
+  `acd finish --timeout 15m` to give a new attempt a bounded planning budget
+  without changing provider settings or the saved target. Reconnection never
+  extends an active deadline.
+
 - Correct an invalid evidence review once without repeating accepted reviews.
   Cap each review at 32 fragments. Keep the existing 32-call budget and deadline,
   reserve context room for bounded

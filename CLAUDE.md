@@ -143,7 +143,9 @@ An invalid review gets at most one correction; accepted reviews are not repeated
 Corrections consume the same 32-call budget and deadline. Their counts are
 reserved durably and reported separately from global planning calls.
 At most four immutable reviews run concurrently; budget reservations and state
-writes stay on the owning worker. Small requests skip review. Messages belong to the global plan. Provider rejection,
+writes stay on the owning worker. Validated reviews are checkpointed durably;
+explicit retry reuses only fingerprint-matched and revalidated frozen evidence.
+A fresh global plan still sees all changes and observations. Small requests skip review. Messages belong to the global plan. Provider rejection,
 timeout, unavailable evidence, or exhausted budget fails the explicit request;
 there is no background semantic retry or silent Local fallback.
 
@@ -153,7 +155,9 @@ per-file commits to escape a rejected plan.
 
 Client disconnect detaches from the accepted bounded job. Restart fails running
 planning retryably and recovers prepared publication without AI only through exact
-proof. Explicit retry preserves the frozen target and options; it cannot absorb
+proof. Explicit retry preserves the frozen target and options. An explicit `--timeout`
+can set a new attempt budget without changing that identity; reconnect never
+extends an accepted deadline. Retry cannot absorb
 later edits, silently rebase, or restore over the user's worktree.
 
 Keep legacy captures, journals, and immutable provenance readable for explicit

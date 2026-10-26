@@ -125,7 +125,8 @@ An invalid review may be corrected once with its complete original evidence
 and bounded validation feedback. Accepted reviews are retained. These corrections
 consume the same 32-call budget and deadline; transport and protocol failures are terminal.
 At most four evidence exchanges run concurrently; each is durably reserved
-before transmission, and cancellation joins all exchanges before closing the transport. `ai.timeout` defaults to five minutes. Transport
+before transmission, and cancellation joins all exchanges before closing the transport. `ai.timeout` defaults to five minutes; `acd finish --timeout 15m`
+sets a longer bounded planning window for a new attempt. Transport
 failure, missing credentials, invalid output, or deadline exhaustion fails the
 request. There is no automatic retry timer or Local fallback.
 
@@ -136,7 +137,10 @@ request even when the enclosed goals are valid.
 Completed checkpoints remain protected. Correct the cause and explicitly retry
 with `acd finish --retry REQUEST_ID`, or choose Local in reviewed settings and
 start a new finish. Retry keeps the frozen target; it does not include later
-edits. Status, list, and doctor never contact a provider.
+edits. Validated finish reviews are saved durably and reused by explicit retry
+only when the frozen evidence, provider configuration, and review instructions
+still match. A fresh global plan always sees all evidence. Status, list, and
+doctor never contact a provider.
 
 For large batches, subprocess protocol version 1 uses
 `request_type: "finish_evidence"` with `finish_request.evidence_review.parts`.

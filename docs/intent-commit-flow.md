@@ -73,8 +73,8 @@ Large requests first review the complete redacted evidence in bounded batches,
 then make one global plan across all recorded changes. At most 32 evidence
 reviews are allowed, with at most four immutable provider exchanges at once.
 The worker reserves each call before releasing its operation gate and continues
-protecting later edits while reviews run. All calls share the persisted `ai.timeout` deadline, five
-minutes by default. Messages
+protecting later edits while reviews run. All calls share one persisted deadline, using `ai.timeout` (five minutes by
+default) or an explicit `--timeout 15m` for the new attempt. Messages
 are part of the same plan; they do not get a separate retry loop. Correction
 feedback includes all detected message and membership conflicts together.
 
@@ -128,6 +128,24 @@ or explicitly retry a failed attempt:
 ~~~bash
 acd finish --retry REQUEST_ID
 ~~~
+
+Validated reviews are saved after each accepted batch. An explicit retry reuses
+them only when the frozen evidence, redacted fragments, provider configuration,
+and review instructions still match. It reviews only missing evidence, then
+creates a fresh global plan. Restart never starts that work automatically.
+Reviews saved by older builds without this fingerprint cannot be reused.
+
+For a large batch, give a new attempt more planning time without changing its
+saved target or provider settings:
+
+~~~bash
+acd finish --retry REQUEST_ID --timeout 15m
+~~~
+
+`--timeout` accepts 1 second through 1 hour. Reconnecting to a running attempt
+keeps its existing deadline. Progress reports reviewed and reused fragments,
+review calls, and time remaining. Call budgets apply to new exchanges in each
+explicit attempt; reused reviews consume no calls.
 
 Retry keeps the original target and consent. Corrected credentials may be used
 for the same approved provider; later file edits remain outside it. If the

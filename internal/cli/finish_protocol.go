@@ -16,11 +16,12 @@ import (
 )
 
 type finishStartParams struct {
-	Purpose       string `json:"purpose"`
-	Message       string `json:"message"`
-	DryRun        bool   `json:"dry_run"`
-	IncludeStaged bool   `json:"include_staged"`
-	RetryID       string `json:"retry_id"`
+	Purpose       string        `json:"purpose"`
+	Message       string        `json:"message"`
+	DryRun        bool          `json:"dry_run"`
+	IncludeStaged bool          `json:"include_staged"`
+	RetryID       string        `json:"retry_id"`
+	Timeout       time.Duration `json:"timeout,omitempty"`
 }
 
 func decodeFinishParams(raw json.RawMessage, dst any) error {
@@ -57,6 +58,9 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 	}
 	var params finishStartParams
 	if err := decodeFinishParams(request.Params, &params); err != nil {
+		return nil, protocolFailure("invalid_finish", err, false)
+	}
+	if err := daemon.ValidateFinishTimeout(params.Timeout); err != nil {
 		return nil, protocolFailure("invalid_finish", err, false)
 	}
 	runtime.finishMu.Lock()
@@ -109,7 +113,7 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 	}
 	worker := &daemon.FinishWorker{RepoPath: runtime.worktree.Root, RepositoryID: h.repositoryID, DB: runtime.db, Config: cfg, OperationGate: runtime.gate, ProtectionGate: runtime.protectionGate}
 	runtime.gate.RLock()
-	r, created, err := worker.Start(ctx, daemon.FinishOptions{Purpose: params.Purpose, Message: params.Message, DryRun: params.DryRun, IncludeStaged: params.IncludeStaged, RetryID: params.RetryID})
+	r, created, err := worker.Start(ctx, daemon.FinishOptions{Purpose: params.Purpose, Message: params.Message, DryRun: params.DryRun, IncludeStaged: params.IncludeStaged, RetryID: params.RetryID, Timeout: params.Timeout})
 	runtime.gate.RUnlock()
 	if err != nil {
 		return nil, finishProtocolError(err)

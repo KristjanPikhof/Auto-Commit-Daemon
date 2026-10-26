@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 	"testing"
 )
 
@@ -370,5 +373,50 @@ func TestFinishEvidenceBudgetSurvivesRestart(t *testing.T) {
 	}
 	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
 		t.Fatal("stale attempt reserved a call", err)
+	}
+}
+
+func TestFinishReviewsSurviveRestartAndExplicitRetry(t *testing.T) {
+	ctx := t.Context()
+	db, path := openTestDB(t)
+	r := startFinishFixture(t, db, finishFixture(t, db, 1))
+	progress := finish.ReviewProgress{Fingerprint: strings.Repeat("a", 64), TotalFragments: 2, Observations: []finish.ReviewObservation{{ID: "part-1", ChangeID: "change-1", Part: 1, Parts: 2, Digest: strings.Repeat("b", 64), Summary: "Preserve authored library values"}}}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, r.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := InterruptFinishRequests(ctx, db, r.Target.WorktreeID); err != nil {
+		t.Fatal(err)
+	}
+	interrupted, err := LoadFinishRequest(ctx, db, r.ID)
+	if err != nil || interrupted.State != FinishFailed || interrupted.EvidenceCalls != 1 || interrupted.ReviewedFragments != 1 || !reflect.DeepEqual(interrupted.ReviewProgress, progress) {
+		t.Fatalf("restart lost progress: %+v %v", interrupted, err)
+	}
+	retry, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+1200, false)
+	if err != nil || retry.Attempt != 2 || retry.EvidenceCalls != 0 || retry.PlanningCalls != 0 || !reflect.DeepEqual(retry.Target, r.Target) || !reflect.DeepEqual(retry.ReviewProgress, progress) {
+		t.Fatalf("retry lost proof: %+v %v", retry, err)
+	}
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, 1, progress); !errors.Is(err, ErrFinishState) {
+		t.Fatal("stale attempt wrote progress", err)
+	}
+	if _, err := ConsumeFinishPlanningCall(ctx, db, r.ID, retry.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, retry.Attempt, progress); !errors.Is(err, ErrFinishState) {
+		t.Fatal("review changed after planning", err)
+	}
+	var oldResult string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT result_json FROM finish_requests WHERE request_id=? AND attempt=1`, r.ID).Scan(&oldResult); err != nil || !strings.Contains(oldResult, "part-1") {
+		t.Fatal("old attempt evidence changed", err)
 	}
 }

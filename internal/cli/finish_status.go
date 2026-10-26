@@ -13,6 +13,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/central"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/identity"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/paths"
@@ -30,26 +31,31 @@ type finishHistoryStatusReport struct {
 }
 
 type finishStatusReport struct {
-	EvidenceCalls  int                  `json:"evidence_calls,omitempty"`
-	RequestID      string               `json:"request_id"`
-	Attempt        int                  `json:"attempt"`
-	State          string               `json:"state"`
-	Stage          string               `json:"stage,omitempty"`
-	Mode           string               `json:"mode"`
-	Style          string               `json:"style"`
-	CheckpointID   string               `json:"checkpoint_id"`
-	TargetTree     string               `json:"target_tree"`
-	BranchRef      string               `json:"branch_ref"`
-	DryRun         bool                 `json:"dry_run"`
-	Published      bool                 `json:"published"`
-	NoChanges      bool                 `json:"no_changes"`
-	CommitsCreated int                  `json:"commits_created"`
-	NewHead        string               `json:"new_head,omitempty"`
-	ReasonCode     string               `json:"reason_code,omitempty"`
-	Reason         string               `json:"reason,omitempty"`
-	Verification   []daemon.FinishCheck `json:"verification"`
-	UpdatedTS      float64              `json:"updated_ts"`
-	sourceTree     string
+	EvidenceCalls     int                  `json:"evidence_calls,omitempty"`
+	ReviewedFragments int                  `json:"reviewed_fragments,omitempty"`
+	ReviewFragments   int                  `json:"review_fragments,omitempty"`
+	ReusedFragments   int                  `json:"reused_fragments,omitempty"`
+	DeadlineTS        float64              `json:"deadline_ts"`
+	PlanningCalls     int                  `json:"planning_calls"`
+	RequestID         string               `json:"request_id"`
+	Attempt           int                  `json:"attempt"`
+	State             string               `json:"state"`
+	Stage             string               `json:"stage,omitempty"`
+	Mode              string               `json:"mode"`
+	Style             string               `json:"style"`
+	CheckpointID      string               `json:"checkpoint_id"`
+	TargetTree        string               `json:"target_tree"`
+	BranchRef         string               `json:"branch_ref"`
+	DryRun            bool                 `json:"dry_run"`
+	Published         bool                 `json:"published"`
+	NoChanges         bool                 `json:"no_changes"`
+	CommitsCreated    int                  `json:"commits_created"`
+	NewHead           string               `json:"new_head,omitempty"`
+	ReasonCode        string               `json:"reason_code,omitempty"`
+	Reason            string               `json:"reason,omitempty"`
+	Verification      []daemon.FinishCheck `json:"verification"`
+	UpdatedTS         float64              `json:"updated_ts"`
+	sourceTree        string
 }
 
 func readFinishStatus(ctx context.Context, db *sql.DB, worktree string) (*finishStatusReport, error) {
@@ -66,7 +72,7 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 	}
 	var r state.FinishRequest
 	var target, plan, result string
-	err := db.QueryRowContext(ctx, `SELECT request_id,attempt,target_json,state,stage,dry_run,plan_json,result_json,reason_code,reason,updated_ts FROM finish_requests WHERE worktree_id=? AND (?='' OR checkpoint_id=?) ORDER BY CASE WHEN state IN ('running','prepared','needs_attention') THEN 0 ELSE 1 END,created_ts DESC,attempt DESC LIMIT 1`, worktree, checkpointID, checkpointID).Scan(&r.ID, &r.Attempt, &target, &r.State, &r.Stage, &r.DryRun, &plan, &result, &r.ReasonCode, &r.Reason, &r.UpdatedTS)
+	err := db.QueryRowContext(ctx, `SELECT request_id,attempt,target_json,state,stage,dry_run,deadline_ts,planning_calls,plan_json,result_json,reason_code,reason,updated_ts FROM finish_requests WHERE worktree_id=? AND (?='' OR checkpoint_id=?) ORDER BY CASE WHEN state IN ('running','prepared','needs_attention') THEN 0 ELSE 1 END,created_ts DESC,attempt DESC LIMIT 1`, worktree, checkpointID, checkpointID).Scan(&r.ID, &r.Attempt, &target, &r.State, &r.Stage, &r.DryRun, &r.DeadlineTS, &r.PlanningCalls, &plan, &result, &r.ReasonCode, &r.Reason, &r.UpdatedTS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -82,20 +88,30 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 		TargetTree: r.Target.TargetTree, BranchRef: r.Target.BranchRef, DryRun: r.DryRun,
 		ReasonCode: r.ReasonCode, Reason: r.Reason, UpdatedTS: r.UpdatedTS,
 		Verification: []daemon.FinishCheck{}, sourceTree: r.Target.CheckpointTree,
+		DeadlineTS: r.DeadlineTS, PlanningCalls: r.PlanningCalls,
 	}
 	var progress struct {
-		EvidenceCalls int `json:"evidence_calls"`
+		EvidenceCalls int                   `json:"evidence_calls"`
+		Review        finish.ReviewProgress `json:"review_progress"`
 	}
 	if json.Unmarshal([]byte(result), &progress) == nil {
 		report.EvidenceCalls = progress.EvidenceCalls
+		report.ReviewedFragments = len(progress.Review.Observations)
+		report.ReviewFragments = progress.Review.TotalFragments
+		report.ReusedFragments = progress.Review.ReusedFragments
 	}
 	var savedReview struct {
 		Disclosure struct {
-			EvidenceCalls int `json:"evidence_calls"`
+			EvidenceCalls   int                        `json:"evidence_calls"`
+			EvidenceReviews []finish.ReviewObservation `json:"evidence_reviews"`
+			ReusedFragments int                        `json:"reused_fragments"`
 		} `json:"disclosure"`
 	}
 	if json.Unmarshal([]byte(plan), &savedReview) == nil {
 		report.EvidenceCalls = max(report.EvidenceCalls, savedReview.Disclosure.EvidenceCalls)
+		report.ReviewedFragments = max(report.ReviewedFragments, len(savedReview.Disclosure.EvidenceReviews))
+		report.ReviewFragments = max(report.ReviewFragments, report.ReviewedFragments)
+		report.ReusedFragments = max(report.ReusedFragments, savedReview.Disclosure.ReusedFragments)
 	}
 	if result != "" {
 		var saved daemon.FinishResult
@@ -537,6 +553,9 @@ func finishStatusSummary(f *finishStatusReport) string {
 		return "Failed: " + consoleCause(f.Reason) + " The requested changes remain saved."
 	case state.FinishNeedsAttention:
 		return "Needs attention: " + consoleCause(f.Reason) + " The requested changes remain saved."
+	}
+	if f.Stage == "reviewing_evidence" && f.ReviewFragments > 0 {
+		return fmt.Sprintf("Reviewing saved changes: %d/%d fragments (%d reused).", f.ReviewedFragments, f.ReviewFragments, f.ReusedFragments)
 	}
 	stage := f.Stage
 	if stage == "" {

@@ -83,12 +83,16 @@ type FinishOptions struct {
 	// each actual exchange, including the optional combined correction.
 	BeforeCall         func(context.Context) error
 	BeforeEvidenceCall func(context.Context) error
+	ReviewIdentity     string
+	ReviewProgress     finish.ReviewProgress
+	SaveReviewProgress func(context.Context, finish.ReviewProgress) error
 }
 
 type FinishDisclosure struct {
 	EvidenceCalls        int                       `json:"evidence_calls,omitempty"`
 	EvidenceRequestBytes []int                     `json:"evidence_request_bytes,omitempty"`
 	EvidenceReviews      []FinishReviewObservation `json:"evidence_reviews,omitempty"`
+	ReusedFragments      int                       `json:"reused_fragments,omitempty"`
 	Provider             string                    `json:"provider"`
 	MetadataIncluded     bool                      `json:"metadata_included"`
 	PurposeIncluded      bool                      `json:"purpose_included"`

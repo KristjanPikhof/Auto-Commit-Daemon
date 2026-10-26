@@ -34,7 +34,9 @@ Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
 --include-staged to include your exact current staged selection. Use --retry
 ID to reconnect or retry the same saved request; it keeps its original
-changes, purpose, message, and staged selection.`,
+changes, purpose, message, and staged selection. Validated evidence reviews
+are saved for explicit retries. --timeout 15m gives a new attempt more planning
+time; reconnecting never extends an accepted deadline.`,
 		Example: `  acd finish "Add offline checkout"
   acd finish --message "Update setup guidance"
   acd finish --dry-run
@@ -50,12 +52,19 @@ changes, purpose, message, and staged selection.`,
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
 			quiet, _ := cmd.Flags().GetBool("quiet")
+			if cmd.Flags().Changed("timeout") && params.Timeout == 0 {
+				return invalidCommandError("acd finish: --timeout must be between 1s and 1h")
+			}
+			if err := daemon.ValidateFinishTimeout(params.Timeout); err != nil {
+				return invalidCommandError("%s", err.Error())
+			}
 			return runFinish(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), repo, params, jsonOut, quiet)
 		}}
 	cmd.Flags().BoolVar(&params.DryRun, "dry-run", false, "Plan and check without moving the branch or index")
 	cmd.Flags().BoolVar(&params.IncludeStaged, "include-staged", false, "Include the exact current staged selection")
 	cmd.Flags().StringVar(&params.RetryID, "retry", "", "Retry or reconnect to a saved request")
 	cmd.Flags().StringVar(&params.Message, "message", "", "Create one batch commit with this exact message (disables splitting)")
+	cmd.Flags().DurationVar(&params.Timeout, "timeout", 0, "Intent planning budget for a new attempt, from 1s to 1h (default: ai.timeout)")
 	return cmd
 }
 
@@ -105,9 +114,15 @@ func runFinish(ctx context.Context, out, progress io.Writer, repo string, params
 	interval := 100 * time.Millisecond
 	lastStage := ""
 	for r.State == state.FinishRunning || r.State == state.FinishPrepared {
-		if !quiet && !jsonOut && r.Stage != lastStage {
-			fmt.Fprintln(progress, finishStageLabel(r.Stage))
-			lastStage = r.Stage
+		progressKey := fmt.Sprintf("%s/%d/%d", r.Stage, r.ReviewedFragments, r.EvidenceCalls)
+		if !quiet && !jsonOut && progressKey != lastStage {
+			label := finishStageLabel(r.Stage)
+			if r.Stage == "reviewing_evidence" && r.ReviewFragments > 0 {
+				remaining := max(time.Duration(0), time.Until(time.Unix(0, int64(r.DeadlineTS*float64(time.Second))))).Round(time.Second)
+				label = fmt.Sprintf("Reviewing saved changes: %d/%d fragments (%d reused); %s remaining.", r.ReviewedFragments, r.ReviewFragments, r.ReusedFragments, remaining)
+			}
+			fmt.Fprintln(progress, label)
+			lastStage = progressKey
 		}
 		timer := time.NewTimer(interval)
 		select {
@@ -246,6 +261,9 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 		if r.EvidenceCalls > 0 {
 			fmt.Fprintf(out, "Evidence review calls: %d. Global planning calls: %d.\n", r.EvidenceCalls, r.PlanningCalls)
+		}
+		if r.ReviewFragments > 0 {
+			fmt.Fprintf(out, "Reviewed fragments: %d/%d (%d reused).\n", r.ReviewedFragments, r.ReviewFragments, r.ReusedFragments)
 		}
 		if !ok {
 			fmt.Fprintf(out, "Request: %s\n", safePreviewText(r.ID, 0))

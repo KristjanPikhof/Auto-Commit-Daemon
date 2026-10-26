@@ -27,7 +27,7 @@ pushes to a remote.
 supplies context for messages and grouping. `--message` supplies the complete
 message; purpose can accompany it as explanation. Both become immutable when
 the target freezes. `--retry` may combine with `--dry-run`, `--repo`, `--json`,
-and `--quiet`; it rejects new purpose, message, or staged consent. Unknown IDs,
+`--timeout`, and `--quiet`; it rejects new purpose, message, or staged consent. Unknown IDs,
 foreign-worktree IDs, and attempts to retry a successful publication are errors.
 A completed preview does not publish later: the next ordinary finish freezes a
 fresh checkpoint. `--retry ID --dry-run` checks a failed target without applying
@@ -121,7 +121,8 @@ Different ref or index movement remains `needs_attention`.
 
 An explicit retry creates a new attempt and deadline for the same frozen target,
 with separate evidence. It checks current ownership before work and publication.
-It never changes options or silently rebases a stale target. If the branch
+It never changes frozen options or silently rebases a stale target. An explicit
+`--timeout` may set a new attempt deadline without changing that identity. If the branch
 moved, finish must report that a new request is needed rather than guessing.
 Credentials may be refreshed between explicit attempts. The saved provider,
 endpoint, trust settings, credential source policy, and egress consent stay fixed.
@@ -148,14 +149,19 @@ Coverage and equality are structural evidence, not proof that project tests ran.
 
 One Intent attempt allows at most 32 evidence-review calls, one global planning
 call, and at most one global correction within one persisted `ai.timeout`
-deadline (default five minutes). At most four immutable evidence exchanges run concurrently; the worker reserves
+deadline (default five minutes, overridden per attempt by `--timeout` from
+1 second through 1 hour). Reconnection never extends it. At most four immutable evidence exchanges run concurrently; the worker reserves
 budgets and writes state serially. Small requests skip evidence review. Every
 complete redacted diff is covered by exact UTF-8 fragments; every fragment must
 have exactly one bounded observation with a locally recorded content digest.
 Each review contains at most 32 fragments. An invalid review gets at most one correction, using the same complete evidence
 and bounded validation feedback. Accepted reviews are not repeated, and correction
 calls consume the same 32-call budget and deadline. Transport and protocol failures do not
-trigger a correction. Review batches never define commit membership. The global planner sees all
+trigger a correction. Validated reviews are checkpointed durably with a fingerprint of the frozen
+evidence, provider configuration, encoded input, and review instructions. Explicit
+retry reuses only matching, revalidated fragments and creates a fresh global
+plan; it never resumes provider work automatically. Legacy unkeyed observations
+are not imported. Review batches never define commit membership. The global planner sees all
 original change identities, dependencies, and observations together. Review
 reservations use the mutable attempt result journal, preserving accepted-plan
 immutability and the separate two-call planning budget. Restart retains the

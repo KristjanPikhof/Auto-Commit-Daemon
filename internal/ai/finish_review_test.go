@@ -374,3 +374,87 @@ func TestFinishEvidenceBatchBoundsParallelWorkAndKeepsOrder(t *testing.T) {
 		t.Fatal("unbounded parallel batch accepted")
 	}
 }
+
+func TestFinishReviewRetryReusesOnlyMatchingValidatedEvidence(t *testing.T) {
+	for _, scenario := range []string{"same", "identity", "diff", "transport", "digest", "summary"} {
+		t.Run(scenario, func(t *testing.T) {
+			evidence := finishTestEvidence()
+			options := finishTestOptions(evidence)
+			options.ReviewIdentity = "exact frozen target and provider revision"
+			options.MaxInputBytes = 128 << 10
+			options.Diffs[0].Text = strings.Repeat("+ preserve complete authored library values\n", 1700)
+			var saved finish.ReviewProgress
+			options.SaveReviewProgress = func(_ context.Context, progress finish.ReviewProgress) error {
+				raw, _ := json.Marshal(progress)
+				return json.Unmarshal(raw, &saved)
+			}
+			calls := 0
+			first := &finishFakeTransport{padding: 80 << 10, exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+				calls++
+				if calls == 2 {
+					return nil, context.DeadlineExceeded
+				}
+				return finishTestReview(request), nil
+			}}
+			result, err := PlanFinish(t.Context(), first, evidence, options)
+			if err == nil || result.Calls != 0 || len(saved.Observations) == 0 || len(saved.Observations) >= saved.TotalFragments {
+				t.Fatalf("accepted progress lost before timeout: %+v %v", saved, err)
+			}
+			options.ReviewProgress = saved
+			cached := map[string]bool{}
+			for _, observation := range saved.Observations {
+				cached[observation.ID] = true
+			}
+			switch scenario {
+			case "identity":
+				options.ReviewIdentity = "different provider approval or frozen target"
+			case "diff":
+				options.Diffs[0].Text += "+ another exact byte\n"
+			case "digest":
+				options.ReviewProgress.Observations[0].Digest = "unproven"
+			case "summary":
+				options.ReviewProgress.Observations[0].Summary = "All tests passed"
+			}
+			retry := &finishFakeTransport{padding: 80 << 10, exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+				if request.Review != nil {
+					for _, part := range request.Review.Parts {
+						if scenario == "same" && cached[part.ID] {
+							t.Fatal("accepted evidence was sent again")
+						}
+					}
+					return finishTestReview(request), nil
+				}
+				if len(request.Reviews) != saved.TotalFragments {
+					t.Fatal("global plan lacks complete review coverage")
+				}
+				return finishTestOutput(finishTestGoal(evidence)), nil
+			}}
+			if scenario == "transport" {
+				retry.padding++
+			}
+			options.Deadline = time.Now().Add(15 * time.Minute)
+			completed, err := PlanFinish(t.Context(), retry, evidence, options)
+			if err != nil || completed.Calls != 1 {
+				t.Fatalf("retry: %+v %v", completed, err)
+			}
+			if (completed.Disclosure.ReusedFragments > 0) != (scenario == "same") {
+				t.Fatalf("unproven cache reused for %s: %+v", scenario, completed.Disclosure)
+			}
+		})
+	}
+}
+
+func TestFinishReviewPersistenceFailureStopsPlanning(t *testing.T) {
+	evidence := finishTestEvidence()
+	options := finishTestOptions(evidence)
+	options.Diffs[0].Text = strings.Repeat("+ authored settings\n", 35000)
+	options.SaveReviewProgress = func(context.Context, finish.ReviewProgress) error { return errors.New("disk unavailable") }
+	provider := &finishFakeTransport{exchange: func(context.Context, FinishPlanRequest) ([]byte, error) {
+		t.Fatal("persistence failure reached provider")
+		return nil, nil
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err == nil || result.Calls != 0 || result.Disclosure.EvidenceCalls != 0 {
+		t.Fatalf("lost durability: %+v %v", result, err)
+	}
+}

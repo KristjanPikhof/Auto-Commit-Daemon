@@ -69,25 +69,29 @@ const FinishCheckpointLimit = 256
 // FinishRequest stores one attempt, not a background retry queue. Loading an ID
 // returns its latest attempt; older attempts retain their original evidence.
 type FinishRequest struct {
-	DryRun        bool            `json:"dry_run"`
-	ID            string          `json:"request_id"`
-	Attempt       int             `json:"attempt"`
-	Target        FinishTarget    `json:"target"`
-	State         string          `json:"state"`
-	Stage         string          `json:"stage"`
-	DeadlineTS    float64         `json:"deadline_ts"`
-	PlanningCalls int             `json:"planning_calls"`
-	EvidenceCalls int             `json:"evidence_calls,omitempty"`
-	PlanID        string          `json:"plan_id,omitempty"`
-	ResultID      string          `json:"result_id,omitempty"`
-	Plan          json.RawMessage `json:"plan,omitempty"`
-	Result        json.RawMessage `json:"result,omitempty"`
-	Publication   json.RawMessage `json:"publication,omitempty"`
-	ReasonCode    string          `json:"reason_code,omitempty"`
-	Reason        string          `json:"reason,omitempty"`
-	CreatedTS     float64         `json:"created_ts"`
-	UpdatedTS     float64         `json:"updated_ts"`
-	SupersededBy  string          `json:"superseded_by,omitempty"`
+	DryRun            bool                  `json:"dry_run"`
+	ID                string                `json:"request_id"`
+	Attempt           int                   `json:"attempt"`
+	Target            FinishTarget          `json:"target"`
+	State             string                `json:"state"`
+	Stage             string                `json:"stage"`
+	DeadlineTS        float64               `json:"deadline_ts"`
+	PlanningCalls     int                   `json:"planning_calls"`
+	EvidenceCalls     int                   `json:"evidence_calls,omitempty"`
+	ReviewedFragments int                   `json:"reviewed_fragments,omitempty"`
+	ReviewFragments   int                   `json:"review_fragments,omitempty"`
+	ReusedFragments   int                   `json:"reused_fragments,omitempty"`
+	ReviewProgress    finish.ReviewProgress `json:"-"`
+	PlanID            string                `json:"plan_id,omitempty"`
+	ResultID          string                `json:"result_id,omitempty"`
+	Plan              json.RawMessage       `json:"plan,omitempty"`
+	Result            json.RawMessage       `json:"result,omitempty"`
+	Publication       json.RawMessage       `json:"publication,omitempty"`
+	ReasonCode        string                `json:"reason_code,omitempty"`
+	Reason            string                `json:"reason,omitempty"`
+	CreatedTS         float64               `json:"created_ts"`
+	UpdatedTS         float64               `json:"updated_ts"`
+	SupersededBy      string                `json:"superseded_by,omitempty"`
 }
 
 // FinishUpdate only exposes mutable evidence. Attempt and state are the CAS
@@ -237,18 +241,28 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 	r.Result = json.RawMessage(result)
 	r.Publication = json.RawMessage(publication)
 	var progress struct {
-		EvidenceCalls int `json:"evidence_calls"`
+		EvidenceCalls int                   `json:"evidence_calls"`
+		Review        finish.ReviewProgress `json:"review_progress"`
 	}
 	if json.Unmarshal(r.Result, &progress) == nil {
 		r.EvidenceCalls = progress.EvidenceCalls
+		r.ReviewProgress = progress.Review
+		r.ReviewedFragments = len(progress.Review.Observations)
+		r.ReviewFragments = progress.Review.TotalFragments
+		r.ReusedFragments = progress.Review.ReusedFragments
 	}
 	var saved struct {
 		Disclosure struct {
-			EvidenceCalls int `json:"evidence_calls"`
+			EvidenceCalls   int                        `json:"evidence_calls"`
+			EvidenceReviews []finish.ReviewObservation `json:"evidence_reviews"`
+			ReusedFragments int                        `json:"reused_fragments"`
 		} `json:"disclosure"`
 	}
 	if json.Unmarshal(r.Plan, &saved) == nil {
 		r.EvidenceCalls = max(r.EvidenceCalls, saved.Disclosure.EvidenceCalls)
+		r.ReviewedFragments = max(r.ReviewedFragments, len(saved.Disclosure.EvidenceReviews))
+		r.ReviewFragments = max(r.ReviewFragments, r.ReviewedFragments)
+		r.ReusedFragments = max(r.ReusedFragments, saved.Disclosure.ReusedFragments)
 	}
 	if len(r.Plan) > 0 {
 		r.PlanID = fmt.Sprintf("sha256:%x", sha256.Sum256(r.Plan))
@@ -455,6 +469,17 @@ func RetryFinishRequest(ctx context.Context, db *DB, id string, deadline float64
 	if err := insertFinish(ctx, tx, r, targetJSON); err != nil {
 		return r, err
 	}
+	// Only validated review provenance can carry into the new attempt. Spent
+	// calls, accepted plans and publication evidence never become fresh work.
+	if r.ReviewProgress.Fingerprint != "" {
+		encoded, err := json.Marshal(map[string]any{"review_progress": r.ReviewProgress})
+		if err != nil || validateFinishJSON(encoded) != nil {
+			return r, ErrFinishIdentity
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE finish_requests SET result_json=? WHERE request_id=? AND attempt=?`, string(encoded), r.ID, r.Attempt); err != nil {
+			return r, err
+		}
+	}
 	saved, err := loadFinish(ctx, tx, id)
 	if err != nil {
 		return r, err
@@ -621,6 +646,48 @@ func ConsumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt i
 		return 0, err
 	}
 	return calls, tx.Commit()
+}
+
+// SaveFinishReviewProgress checkpoints accepted reviews on the owning worker.
+// It cannot overwrite another attempt or mutate an accepted global plan.
+func SaveFinishReviewProgress(ctx context.Context, db *DB, id string, attempt int, progress finish.ReviewProgress) error {
+	if len(progress.Fingerprint) != 64 || progress.TotalFragments < 1 || progress.TotalFragments > finish.EvidenceReviewCallLimit*32 ||
+		len(progress.Observations) > progress.TotalFragments || progress.ReusedFragments < 0 || progress.ReusedFragments > len(progress.Observations) {
+		return ErrFinishIdentity
+	}
+	tx, cleanup, err := beginFinishWrite(ctx, db)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	r, err := loadFinish(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if r.Attempt != attempt || r.State != FinishRunning || r.PlanningCalls != 0 || len(r.Plan) != 0 || !validFinishDeadline(r.DeadlineTS) {
+		return ErrFinishState
+	}
+	journal := map[string]json.RawMessage{}
+	if len(r.Result) > 0 {
+		if err := json.Unmarshal(r.Result, &journal); err != nil || journal == nil {
+			return ErrFinishState
+		}
+	}
+	journal["review_progress"], err = json.Marshal(progress)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(journal)
+	if err != nil {
+		return err
+	}
+	if err := validateFinishJSON(encoded); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE finish_requests SET result_json=?,stage='reviewing_evidence',updated_ts=? WHERE request_id=? AND attempt=?`, string(encoded), nowSeconds(), id, attempt); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // InterruptFinishRequests is called by the owning worker on restart only.
