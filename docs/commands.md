@@ -213,6 +213,8 @@ an explicit attempt with the same approved provider and privacy configuration.
 deadline. Validated evidence reviews are saved durably and reused by explicit
 retry only when the exact frozen evidence, provider configuration, and review
 instructions still match. Progress shows completed and reused fragments.
+Successful retry previews retain this evidence for a later real retry of the
+same ID. Each attempt still makes a fresh global plan.
 
 Verification always proves structure and target equality. `none` and
 `structural` do not imply that project tests ran. `fast` and `full` run the

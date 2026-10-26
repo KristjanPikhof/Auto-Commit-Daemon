@@ -551,6 +551,27 @@ func UpdateFinishRequest(ctx context.Context, db *DB, id string, attempt int, ex
 		r.Publication = u.Publication
 	}
 	if u.Result != nil {
+		if r.State == FinishRunning && u.State == FinishCompleted && r.DryRun && r.ReviewProgress.Fingerprint != "" {
+			// A retry preview remains eligible for an explicit publication retry.
+			// Keep its keyed review journal in this same terminal-state write.
+			var journal, result map[string]json.RawMessage
+			if json.Unmarshal(r.Result, &journal) != nil || json.Unmarshal(u.Result, &result) != nil || result == nil {
+				return r, ErrFinishIdentity
+			}
+			for _, key := range []string{"review_progress", "evidence_calls"} {
+				if value, ok := journal[key]; ok {
+					result[key] = value
+				}
+			}
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				return r, err
+			}
+			if err := validateFinishJSON(encoded); err != nil {
+				return r, err
+			}
+			u.Result = encoded
+		}
 		r.Result = u.Result
 	}
 	if u.State == FinishPrepared && (len(r.Plan) == 0 || len(r.Publication) == 0 || r.DryRun) {

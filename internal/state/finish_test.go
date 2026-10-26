@@ -420,3 +420,43 @@ func TestFinishReviewsSurviveRestartAndExplicitRetry(t *testing.T) {
 		t.Fatal("old attempt evidence changed", err)
 	}
 }
+
+func TestFinishReviewCacheSurvivesRetryPreview(t *testing.T) {
+	ctx := t.Context()
+	db, _ := openTestDB(t)
+	r := startFinishFixture(t, db, finishFixture(t, db, 1))
+	progress := finish.ReviewProgress{Fingerprint: strings.Repeat("a", 64), TotalFragments: 2, Observations: []finish.ReviewObservation{{ID: "part-1", ChangeID: "goal", Part: 1, Parts: 2, Digest: strings.Repeat("b", 64), Summary: "Preserve complete authored settings"}}}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, r.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	failFinishFixture(t, db, r)
+	preview, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, preview.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	progress.ReusedFragments = 1
+	progress.Observations = append(progress.Observations, finish.ReviewObservation{ID: "part-2", ChangeID: "goal", Part: 2, Parts: 2, Digest: strings.Repeat("c", 64), Summary: "Preserve the remaining authored settings"})
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, preview.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := UpdateFinishRequest(ctx, db, r.ID, preview.Attempt, FinishRunning, FinishUpdate{State: FinishCompleted, Result: json.RawMessage(`{"dry_run":true}`)})
+	if err != nil || !reflect.DeepEqual(completed.ReviewProgress, progress) || completed.EvidenceCalls != 1 {
+		t.Fatalf("preview discarded its journal: %+v %v", completed, err)
+	}
+	var result struct {
+		DryRun bool `json:"dry_run"`
+	}
+	if err := json.Unmarshal(completed.Result, &result); err != nil || !result.DryRun {
+		t.Fatalf("preview outcome lost: %s %v", completed.Result, err)
+	}
+	applied, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, false)
+	if err != nil || !reflect.DeepEqual(applied.Target, r.Target) || !reflect.DeepEqual(applied.ReviewProgress, progress) || applied.EvidenceCalls != 0 || applied.PlanningCalls != 0 {
+		t.Fatalf("publication retry lost proof or retained spent calls: %+v %v", applied, err)
+	}
+}
