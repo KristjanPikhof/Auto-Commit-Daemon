@@ -13,6 +13,10 @@ import (
 func SettingsFingerprint(values map[string]string) (string, error) {
 	payload := make(map[string]any)
 	for _, field := range Catalog() {
+		// Adding the default input budget must not revoke existing provider consent.
+		if field.Name == FieldMaxInputBytes && (values[field.Name] == "" || values[field.Name] == field.Default) {
+			continue
+		}
 		if field.Boundary == ApplyHot && field.Persistable && !field.Sensitive {
 			payload[field.Name] = values[field.Name]
 		}

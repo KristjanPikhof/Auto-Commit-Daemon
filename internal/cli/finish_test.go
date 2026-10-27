@@ -371,3 +371,95 @@ func TestFinishCLIUnavailableOutputAndExit(t *testing.T) {
 		}
 	}
 }
+
+func TestFinishCLIInputLimitNeedsNewRequest(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	wantGuidance := "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"
+	for _, test := range []struct {
+		name, reason string
+	}{
+		{"budget", "evidence is 8388609 bytes; limit is 8388608 bytes; increase ai.max_input_bytes"},
+		{"context", "encoded planning context is 524289 bytes; per-exchange limit is 524288 bytes"},
+		{"reviews", "evidence needs 33 review calls; limit is 32"},
+	} {
+		for _, jsonOut := range []bool{false, true} {
+			format := "human"
+			if jsonOut {
+				format = "json"
+			}
+			t.Run(test.name+"/"+format, func(t *testing.T) {
+				r := state.FinishRequest{ID: "finish-large", State: state.FinishFailed, ReasonCode: "provider_input_too_large", Reason: test.reason}
+				var out bytes.Buffer
+				if err := renderFinish(&out, lookup, r, jsonOut, ""); err == nil {
+					t.Fatal("expected unsuccessful finish")
+				}
+				if strings.Contains(out.String(), "--retry") || !strings.Contains(out.String(), wantGuidance) {
+					t.Fatalf("misleading size guidance: %s", out.String())
+				}
+				if jsonOut {
+					var response productEnvelope
+					if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+						t.Fatal(err)
+					}
+					if response.NextAction == nil || *response.NextAction != wantGuidance || response.Error == nil || response.Error.Retryable || response.Error.Message != test.reason {
+						t.Fatalf("input limit action lost its reason or became retryable: %+v", response)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFinishCLIReportsEvidenceReviewProgress(t *testing.T) {
+	lookup, runtime, _ := finishCLIFixture(t)
+	worker := &daemon.FinishWorker{RepoPath: lookup.Worktree.Root, DB: runtime.db, Config: daemon.FinishWorkerConfig{Mode: "local", Style: "imperative", ConfigDigest: "test-config"}}
+	r, _, err := worker.Start(t.Context(), daemon.FinishOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.ConsumeFinishEvidenceCall(t.Context(), runtime.db, r.ID, r.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	progress := finish.ReviewProgress{Fingerprint: strings.Repeat("a", 64), TotalFragments: 2, ReusedFragments: 1, Observations: []finish.ReviewObservation{{ID: "part-1", Summary: "Preserve complete library values"}}}
+	if err := state.SaveFinishReviewProgress(t.Context(), runtime.db, r.ID, r.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	report, err := readFinishStatus(t.Context(), runtime.db.ReadSQL(), r.Target.WorktreeID)
+	if err != nil || report == nil || report.EvidenceCalls != 1 || report.Stage != "reviewing_evidence" || report.ReviewedFragments != 1 || report.ReviewFragments != 2 || report.ReusedFragments != 1 || report.DeadlineTS != r.DeadlineTS {
+		t.Fatalf("status/list review progress %+v %v", report, err)
+	}
+	if label := finishStageLabel(report.Stage); !strings.Contains(label, "Reviewing saved changes") {
+		t.Fatalf("hidden review phase: %s", label)
+	}
+	if label := finishStatusSummary(report); !strings.Contains(label, "1/2 fragments (1 reused)") {
+		t.Fatalf("hidden status/list review progress: %s", label)
+	}
+}
+
+func TestFinishCLIRejectsUnboundedTimeoutBeforeContactingWorker(t *testing.T) {
+	for _, timeout := range []string{"0s", "-1s", "1ms", "61m"} {
+		cmd := newRootCmd()
+		cmd.SetArgs([]string{"finish", "--timeout", timeout})
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "between 1s and 1h") {
+			t.Fatalf("invalid planning budget %s: %v", timeout, err)
+		}
+	}
+}
+
+func TestFinishCLILegacyPartialReviewDoesNotClaimCompleteCoverage(t *testing.T) {
+	lookup, runtime, _ := finishCLIFixture(t)
+	worker := &daemon.FinishWorker{RepoPath: lookup.Worktree.Root, DB: runtime.db, Config: daemon.FinishWorkerConfig{Mode: "local", Style: "imperative", ConfigDigest: "test-config"}}
+	r, _, err := worker.Start(t.Context(), daemon.FinishOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := json.Marshal(daemon.FinishSavedPlan{Disclosure: ai.FinishDisclosure{EvidenceCalls: 1, EvidenceReviews: []ai.FinishReviewObservation{{ID: "part-1", Summary: "Preserve recorded library values"}}}})
+	failed, err := state.UpdateFinishRequest(t.Context(), runtime.db, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishFailed, Plan: plan, ReasonCode: "provider_deadline"})
+	if err != nil || failed.ReviewedFragments != 1 || failed.ReviewFragments != 0 {
+		t.Fatalf("legacy coverage was invented: %+v %v", failed, err)
+	}
+	report, err := readFinishStatus(t.Context(), runtime.db.ReadSQL(), r.Target.WorktreeID)
+	if err != nil || report.ReviewedFragments != 1 || report.ReviewFragments != 0 {
+		t.Fatalf("status/list invented legacy coverage: %+v %v", report, err)
+	}
+}

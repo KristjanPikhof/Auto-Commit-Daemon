@@ -33,6 +33,16 @@ type FinishOptions struct {
 	DryRun        bool
 	IncludeStaged bool
 	RetryID       string
+	Timeout       time.Duration
+}
+
+// ValidateFinishTimeout bounds an explicit attempt without changing its target
+// or provider settings. Reconnecting never extends an accepted deadline.
+func ValidateFinishTimeout(timeout time.Duration) error {
+	if timeout != 0 && (timeout < time.Second || timeout > time.Hour) {
+		return errors.New("finish: --timeout must be between 1s and 1h")
+	}
+	return nil
 }
 
 // FinishWorkerConfig is one resolved, approved runtime snapshot. ConfigDigest
@@ -165,7 +175,15 @@ func (w *FinishWorker) resolved(ctx context.Context) (git.Worktree, FinishWorker
 		}
 	}
 	provider := cfg.Provider
+	inputLimit, err := ai.FinishInputByteLimit(provider.MaxInputBytes)
+	if err != nil {
+		return wt, cfg, "", err
+	}
 	identity := []any{cfg.ConfigDigest, cfg.Mode, cfg.Style, provider.Mode, provider.BaseURL, provider.Model, provider.Timeout, provider.CAFile, provider.DiffEgress, cfg.Approved, cfg.VerificationMode, cfg.VerificationTimeout, cfg.Command.Identity(), cfg.AuthorName, cfg.AuthorEmail, cfg.Capture.MaxFileBytes, cfg.Capture.SubmodulePaths, cfg.Capture.SensitiveMatcher.Patterns(), cfg.Capture.SafeIgnoreMatcher.Patterns()}
+	// Preserve identities of saved requests using the default budget.
+	if inputLimit != ai.FinishDefaultInputByteCap {
+		identity = append(identity, inputLimit)
+	}
 	raw, err := json.Marshal(identity)
 	if err != nil {
 		return wt, cfg, "", err
@@ -202,11 +220,18 @@ func finishBranchHead(ctx context.Context, repo string) (string, string, error) 
 // Start freezes one fresh complete checkpoint. Identical active callers attach
 // first, even if files or staging changed while the original job was running.
 func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.FinishRequest, bool, error) {
+	if err := ValidateFinishTimeout(options.Timeout); err != nil {
+		return state.FinishRequest{}, false, err
+	}
 	wt, cfg, digest, err := w.resolved(ctx)
 	if err != nil {
 		return state.FinishRequest{}, false, err
 	}
 	worktreeID := checkpoint.WorktreeID(wt.Root)
+	timeout := cfg.Provider.Timeout
+	if options.Timeout != 0 {
+		timeout = options.Timeout
+	}
 	if options.RetryID != "" {
 		if options.Purpose != "" || options.Message != "" || options.IncludeStaged {
 			return state.FinishRequest{}, false, errors.New("finish: retry cannot change purpose, message or staged consent")
@@ -230,7 +255,7 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 		if _, _, err := w.evidence(ctx, wt, old.Target); err != nil {
 			return old, false, err
 		}
-		retried, err := state.RetryFinishRequest(ctx, w.DB, old.ID, finishTimestamp(time.Now().Add(cfg.Provider.Timeout)), options.DryRun)
+		retried, err := state.RetryFinishRequest(ctx, w.DB, old.ID, finishTimestamp(time.Now().Add(timeout)), options.DryRun)
 		return retried, err == nil, err
 	}
 	if err := finish.ValidatePurpose(options.Purpose); err != nil {
@@ -324,7 +349,7 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 	if err := git.CheckFinishPublicationSafety(ctx, wt.Root, branch, head, index, options.IncludeStaged); err != nil {
 		return active, false, err
 	}
-	return state.StartFinishRequest(ctx, w.DB, state.FinishRequest{ID: id, Target: frozen, DryRun: options.DryRun, DeadlineTS: finishTimestamp(time.Now().Add(cfg.Provider.Timeout))})
+	return state.StartFinishRequest(ctx, w.DB, state.FinishRequest{ID: id, Target: frozen, DryRun: options.DryRun, DeadlineTS: finishTimestamp(time.Now().Add(timeout))})
 }
 
 func finishTimestamp(t time.Time) float64 { return float64(t.UnixNano()) / float64(time.Second) }
@@ -628,6 +653,12 @@ func (t finishEvaluatedTransport) ExchangeFinish(ctx context.Context, body []byt
 	return evaluatePublication(ctx, func(jobCtx context.Context) ([]byte, error) { return t.FinishTransport.ExchangeFinish(jobCtx, body) })
 }
 
+func (t finishEvaluatedTransport) ExchangeFinishReviews(ctx context.Context, bodies [][]byte) ([][]byte, error) {
+	return evaluatePublication(ctx, func(jobCtx context.Context) ([][]byte, error) {
+		return ai.ExchangeFinishReviews(jobCtx, t.FinishTransport, bodies)
+	})
+}
+
 func (w *FinishWorker) evaluationContext(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, digest string, r state.FinishRequest) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 	evaluation := &publicationEvaluation{gate: w.OperationGate, cancel: cancel, wake: w.Wake, files: w.Files, changes: w.Changes, shutdown: w.Shutdown, interval: w.EvaluationInterval}
@@ -783,7 +814,14 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	defer cancel()
 	transport := w.Transport
 	if transport == nil {
-		configured, closer, err := ai.BuildFinishTransport(cfg.Provider, cfg.Approved)
+		provider := cfg.Provider
+		// The persisted attempt bounds each exchange too. A caller's longer
+		// budget must not retain the shorter configured HTTP/process timeout.
+		provider.Timeout = time.Until(finishDeadline(r))
+		if provider.Timeout <= 0 {
+			return finish.Plan{}, ai.FinishDisclosure{}, &ai.FinishPlanningError{Code: "provider_deadline", Err: context.DeadlineExceeded}
+		}
+		configured, closer, err := ai.BuildFinishTransport(provider, cfg.Approved)
 		if err != nil {
 			return finish.Plan{}, ai.FinishDisclosure{}, err
 		}
@@ -792,14 +830,23 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		}
 		transport = configured
 	}
-	diffs, err := finishProviderDiffs(ctx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress)
+	diffs, err := finishProviderDiffs(ctx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress, cfg.Provider.MaxInputBytes)
 	if ctx.Err() != nil {
 		return finish.Plan{}, ai.FinishDisclosure{}, &ai.FinishPlanningError{Code: "provider_deadline", Err: ctx.Err()}
 	}
 	if err != nil {
 		return finish.Plan{}, ai.FinishDisclosure{}, err
 	}
-	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, BeforeCall: func(callCtx context.Context) error {
+	identity, err := json.Marshal(r.Target)
+	if err != nil {
+		return finish.Plan{}, ai.FinishDisclosure{}, err
+	}
+	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, ReviewIdentity: string(identity), ReviewProgress: r.ReviewProgress, SaveReviewProgress: func(saveCtx context.Context, progress finish.ReviewProgress) error {
+		return state.SaveFinishReviewProgress(saveCtx, w.DB, r.ID, r.Attempt, progress)
+	}, BeforeEvidenceCall: func(callCtx context.Context) error {
+		_, err := state.ConsumeFinishEvidenceCall(callCtx, w.DB, r.ID, r.Attempt)
+		return err
+	}, BeforeCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}})
@@ -874,10 +921,19 @@ func (w *FinishWorker) RecoverPrepared(ctx context.Context) (state.FinishRequest
 	return w.publish(ctx, wt, r, true)
 }
 
-func finishProviderDiffs(ctx context.Context, repo, base, target string, changes []finish.Change, egress bool) ([]ai.FinishDiff, error) {
+func finishProviderDiffs(ctx context.Context, repo, base, target string, changes []finish.Change, egress bool, maxInputBytes int) ([]ai.FinishDiff, error) {
 	if !egress {
 		return nil, nil
 	}
+	inputLimit, err := ai.FinishInputByteLimit(maxInputBytes)
+	if err != nil {
+		return nil, err
+	}
+	type blobInfo struct {
+		size int64
+		text bool
+	}
+	blobs := make(map[string]blobInfo)
 	var diffs []ai.FinishDiff
 	totalBytes := 0
 	for _, change := range changes {
@@ -886,24 +942,28 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 			if entry.OID == "" {
 				continue
 			}
-			out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "cat-file", "-s", entry.OID)
-			if err != nil {
-				return nil, err
-			}
-			size, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-			if err != nil {
-				return nil, err
+			info, cached := blobs[entry.OID]
+			if !cached {
+				out, err := git.Run(ctx, git.RunOpts{Dir: repo}, "cat-file", "-s", entry.OID)
+				if err != nil {
+					return nil, err
+				}
+				info.size, err = strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				info.text, err = git.FinishBlobIsText(ctx, repo, entry.OID)
+				if err != nil {
+					return nil, err
+				}
+				blobs[entry.OID] = info
 			}
 			if index == 0 {
-				diff.BeforeSize = size
+				diff.BeforeSize = info.size
 			} else {
-				diff.AfterSize = size
+				diff.AfterSize = info.size
 			}
-			text, err := git.FinishBlobIsText(ctx, repo, entry.OID)
-			if err != nil {
-				return nil, err
-			}
-			if !text {
+			if !info.text {
 				diff.Binary = true
 			}
 		}
@@ -912,9 +972,9 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 			if change.BeforeTree != "" && change.AfterTree != "" {
 				diffBase, diffTarget = change.BeforeTree, change.AfterTree
 			}
-			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, ai.FinishDiffByteCap+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", diffBase, diffTarget, "--", ":(literal)"+change.Path)
-			if errors.Is(err, git.ErrStdoutOverflow) || len(out) > ai.FinishDiffByteCap {
-				return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diff is at least %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", len(out), ai.FinishDiffByteCap)}
+			out, err := git.RunWithLimit(ctx, git.RunOpts{Dir: repo}, int64(inputLimit-totalBytes)+1, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", diffBase, diffTarget, "--", ":(literal)"+change.Path)
+			if errors.Is(err, git.ErrStdoutOverflow) || len(out) > inputLimit-totalBytes {
+				return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diffs total at least %d bytes; limit is %d bytes; increase ai.max_input_bytes in acd config and start a new finish, or use an explicit local finish for the complete offline batch", totalBytes+len(out), inputLimit)}
 			}
 			if err != nil {
 				return nil, err
@@ -923,9 +983,6 @@ func finishProviderDiffs(ctx context.Context, repo, base, target string, changes
 				diff.Binary = true
 			} else {
 				totalBytes += len(out)
-				if totalBytes > ai.FinishEvidenceDiffByteCap {
-					return nil, &ai.FinishPlanningError{Code: "provider_input_too_large", Err: fmt.Errorf("exact textual diffs total %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch", totalBytes, ai.FinishEvidenceDiffByteCap)}
-				}
 				diff.Text = string(out)
 			}
 		}

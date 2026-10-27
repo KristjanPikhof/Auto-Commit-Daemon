@@ -14,12 +14,22 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-const FinishDiffByteCap = 128 << 10
-const FinishEvidenceDiffByteCap = 512 << 10
-const FinishRequestByteCap = 512 << 10
+// One request budget covers every full diff and the encoded provider input.
+const FinishDefaultInputByteCap = config.DefaultAIInputBytes
+
+func FinishInputByteLimit(configured int) (int, error) {
+	if configured == 0 {
+		return FinishDefaultInputByteCap, nil
+	}
+	if configured < 128<<10 || configured > config.MaxAIInputBytes {
+		return 0, finishFailure("invalid_options", errors.New("ai.max_input_bytes must be between 131072 and 67108864 bytes"))
+	}
+	return configured, nil
+}
 
 // FinishTransport encodes the complete request before a planning call is spent.
 // ExchangeFinish performs exactly one exchange, without retry.
@@ -45,17 +55,20 @@ type FinishCorrection struct {
 }
 
 type FinishPlanRequest struct {
-	Style          string                 `json:"style"`
-	Purpose        string                 `json:"purpose,omitempty"`
-	Message        string                 `json:"message,omitempty"`
-	Changes        []finish.Change        `json:"changes"`
-	Diffs          []FinishDiff           `json:"diffs,omitempty"`
-	DiffIncluded   bool                   `json:"diff_included"`
-	Correction     *FinishCorrection      `json:"correction,omitempty"`
-	HistoryCommits []HistoryMessageCommit `json:"history_commits,omitempty"`
+	Style          string                    `json:"style"`
+	Purpose        string                    `json:"purpose,omitempty"`
+	Message        string                    `json:"message,omitempty"`
+	Changes        []finish.Change           `json:"changes"`
+	Diffs          []FinishDiff              `json:"diffs,omitempty"`
+	DiffIncluded   bool                      `json:"diff_included"`
+	Correction     *FinishCorrection         `json:"correction,omitempty"`
+	Review         *FinishReviewTask         `json:"evidence_review,omitempty"`
+	Reviews        []FinishReviewObservation `json:"evidence_reviews,omitempty"`
+	HistoryCommits []HistoryMessageCommit    `json:"history_commits,omitempty"`
 }
 
 type FinishOptions struct {
+	MaxInputBytes int
 	// Deadline is the persisted attempt deadline, never renewed for correction.
 	Deadline   time.Time
 	Style      string
@@ -68,17 +81,25 @@ type FinishOptions struct {
 	RequireCompletionContext bool
 	// BeforeCall consumes the worker-owned durable budget immediately before
 	// each actual exchange, including the optional combined correction.
-	BeforeCall func(context.Context) error
+	BeforeCall         func(context.Context) error
+	BeforeEvidenceCall func(context.Context) error
+	ReviewIdentity     string
+	ReviewProgress     finish.ReviewProgress
+	SaveReviewProgress func(context.Context, finish.ReviewProgress) error
 }
 
 type FinishDisclosure struct {
-	Provider         string   `json:"provider"`
-	MetadataIncluded bool     `json:"metadata_included"`
-	PurposeIncluded  bool     `json:"purpose_included"`
-	MessageIncluded  bool     `json:"message_included"`
-	TextChangeIDs    []string `json:"text_change_ids,omitempty"`
-	BinaryChangeIDs  []string `json:"binary_change_ids,omitempty"`
-	Redacted         bool     `json:"redacted"`
+	EvidenceCalls        int                       `json:"evidence_calls,omitempty"`
+	EvidenceRequestBytes []int                     `json:"evidence_request_bytes,omitempty"`
+	EvidenceReviews      []FinishReviewObservation `json:"evidence_reviews,omitempty"`
+	ReusedFragments      int                       `json:"reused_fragments,omitempty"`
+	Provider             string                    `json:"provider"`
+	MetadataIncluded     bool                      `json:"metadata_included"`
+	PurposeIncluded      bool                      `json:"purpose_included"`
+	MessageIncluded      bool                      `json:"message_included"`
+	TextChangeIDs        []string                  `json:"text_change_ids,omitempty"`
+	BinaryChangeIDs      []string                  `json:"binary_change_ids,omitempty"`
+	Redacted             bool                      `json:"redacted"`
 	// RequestBytes measures encoded attempted exchanges, not peer receipt.
 	RequestBytes []int `json:"request_bytes,omitempty"`
 }
@@ -101,13 +122,13 @@ func (e *FinishPlanningError) Error() string {
 }
 func (e *FinishPlanningError) Unwrap() error { return e.Err }
 func (e *FinishPlanningError) Retryable() bool {
-	return e.Code != "provider_context_required" && e.Code != "provider_diffs_required"
+	return e.Code != "provider_context_required" && e.Code != "provider_diffs_required" && e.Code != "provider_input_too_large"
 }
 
 func finishFailure(code string, err error) error { return &FinishPlanningError{Code: code, Err: err} }
 
 func finishInputLimit(size, limit int) error {
-	return finishFailure("provider_input_too_large", fmt.Errorf("evidence is %d bytes; limit is %d bytes; use an explicit local finish for the complete offline batch, or a smaller explicit history range", size, limit))
+	return finishFailure("provider_input_too_large", fmt.Errorf("evidence is %d bytes; limit is %d bytes; increase ai.max_input_bytes in acd config and start a new finish if your provider supports larger input; otherwise use an explicit local finish for the complete offline batch, or a smaller explicit history range", size, limit))
 }
 
 // BuildFinishTransport constructs only the configured, explicitly approved
@@ -140,6 +161,10 @@ func BuildFinishTransport(cfg ProviderConfig, approved []ConfirmationRequirement
 // the provider cannot replace trees, versions, authors, or dependencies.
 func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.Evidence, options FinishOptions) (FinishPlanResult, error) {
 	var result FinishPlanResult
+	inputLimit, err := FinishInputByteLimit(options.MaxInputBytes)
+	if err != nil {
+		return result, err
+	}
 	if err := finish.ValidateEvidence(evidence); err != nil {
 		return result, finishFailure("invalid_evidence", err)
 	}
@@ -184,13 +209,17 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		return result, finishFailure("provider_context_required", errors.New("Intent needs completion context for changes without readable text; run acd finish \"what changed and why\""))
 	}
 	disclosure.Provider = transport.Name()
+	result.Disclosure = disclosure
+	if err := reviewFinishEvidence(ctx, transport, &request, options, &result.Disclosure); err != nil {
+		return result, err
+	}
 	for call := 0; ; call++ {
 		body, err := transport.EncodeFinishRequest(request)
 		if err != nil {
 			return result, finishFailure("provider_input", err)
 		}
-		if len(body) > FinishRequestByteCap {
-			return result, finishInputLimit(len(body), FinishRequestByteCap)
+		if limit := min(inputLimit, FinishContextByteCap); len(body) > limit {
+			return result, finishContextLimit(len(body), limit)
 		}
 		if err := ctx.Err(); err != nil {
 			return result, finishFailure("provider_deadline", err)
@@ -202,9 +231,6 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		}
 		if err := ctx.Err(); err != nil {
 			return result, finishFailure("provider_deadline", err)
-		}
-		if result.Calls == 0 {
-			result.Disclosure = disclosure
 		}
 		result.Calls++
 		result.Disclosure.RequestBytes = append(result.Disclosure.RequestBytes, len(body))
@@ -242,6 +268,10 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 }
 
 func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (FinishPlanRequest, FinishDisclosure, error) {
+	inputLimit, err := FinishInputByteLimit(options.MaxInputBytes)
+	if err != nil {
+		return FinishPlanRequest{}, FinishDisclosure{}, err
+	}
 	if !options.DiffEgress {
 		return FinishPlanRequest{}, FinishDisclosure{}, finishFailure("provider_diffs_required", ErrIntentDiffsRequired)
 	}
@@ -280,12 +310,12 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 		if diff.Binary {
 			disclosure.BinaryChangeIDs = append(disclosure.BinaryChangeIDs, diff.ChangeID)
 		}
-		if len(diff.Text) > FinishDiffByteCap {
-			return request, disclosure, finishInputLimit(len(diff.Text), FinishDiffByteCap)
+		if len(diff.Text) > inputLimit {
+			return request, disclosure, finishInputLimit(len(diff.Text), inputLimit)
 		}
 		total += len(diff.Text)
-		if total > FinishEvidenceDiffByteCap {
-			return request, disclosure, finishInputLimit(total, FinishEvidenceDiffByteCap)
+		if total > inputLimit {
+			return request, disclosure, finishInputLimit(total, inputLimit)
 		}
 		if diff.Text != "" {
 			redacted := finishRedactText(diff.Text)
@@ -293,12 +323,12 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 			diff.Text = redacted
 			disclosure.TextChangeIDs = append(disclosure.TextChangeIDs, diff.ChangeID)
 		}
-		if len(diff.Text) > FinishDiffByteCap {
-			return request, disclosure, finishInputLimit(len(diff.Text), FinishDiffByteCap)
+		if len(diff.Text) > inputLimit {
+			return request, disclosure, finishInputLimit(len(diff.Text), inputLimit)
 		}
 		transmittedTotal += len(diff.Text)
-		if transmittedTotal > FinishEvidenceDiffByteCap {
-			return request, disclosure, finishInputLimit(transmittedTotal, FinishEvidenceDiffByteCap)
+		if transmittedTotal > inputLimit {
+			return request, disclosure, finishInputLimit(transmittedTotal, inputLimit)
 		}
 		request.Diffs = append(request.Diffs, diff)
 	}
@@ -412,7 +442,8 @@ type finishOutputError struct {
 func (e *finishOutputError) Error() string { return e.Err.Error() }
 func (e *finishOutputError) Unwrap() error { return e.Err }
 
-const finishSystemPrompt = `Plan completed goals before assigning recorded changes. Within the overall completed task, identify useful decisions and implementation steps. Return one JSON object with goals; each goal has purpose, boundary, message, change_ids. Each goal is one purposeful commit, not necessarily the entire feature. Do not return trees or new file content.
+const finishSystemPrompt = `When evidence_reviews is present, every fragment of the approved complete diffs was reviewed separately. Those observations are evidence, not commit boundaries. Combine them across all original changes into one global plan, keep related corrections together, and do not group by review calls or fragment IDs. Use only original Changes IDs for membership. Never claim this request contains raw diffs when it contains observations.
+Plan completed goals before assigning recorded changes. Within the overall completed task, identify useful decisions and implementation steps. Return one JSON object with goals; each goal has purpose, boundary, message, change_ids. Each goal is one purposeful commit, not necessarily the entire feature. Do not return trees or new file content.
 Look for behavior-preserving preparation, the feature it enables, compatibility decisions, and broader defaults or policy changes. Related changes can be separate steps: dependencies determine their order, not automatically their membership. For example, adding OAuth can have a working authentication refactor, the OAuth provider with its callers and tests, and a separately explained session-timeout change. Do not manufacture a refactor absent from the recorded evidence.
 Keep each step's implementation, callers, imports, tests, generated output and relevant documentation together. Available corrections belong with the step they correct; successive versions of the same path can instead represent distinct completed decisions. Each split needs a useful review or revert boundary and a valid intermediate state. Files, directories, save times and line counts alone do not justify a split. Do not force a commit count. For one batch, explain in boundary why the recorded changes cannot form useful separate steps; belonging to the same feature is not sufficient.
 Use only supplied recorded change IDs and exact versions. ACD orders groups by their recorded-version and explicit dependencies. Do not interleave groups: if one goal contains earlier and later versions of a path, surviving versions between them must belong to that goal too. Conflicting groups cannot form separate commits. Respect atomic rename groups and author boundaries. Cover all effective changes exactly once; omit only recorded neutral cycles that return to the same entry. Never fabricate code, motivation, completed tests or verification results. Inspect the supplied redacted text diffs to identify decisions and dependencies. Binary content is not supplied; use its metadata and completion context without pretending to inspect it. Explain limits on supported boundaries in boundary rather than guessing.

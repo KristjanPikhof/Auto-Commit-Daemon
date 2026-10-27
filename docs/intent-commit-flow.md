@@ -68,13 +68,29 @@ binary objects, deletions, and unchanged entries.
 
 ## Bound the provider work
 
-One attempt allows one planning exchange and at most one combined correction.
-Both share the persisted `ai.timeout` deadline, five minutes by default. Messages
+Small requests use one planning exchange and at most one combined correction.
+Large requests first review the complete redacted evidence in bounded batches,
+then make one global plan across all recorded changes. At most 32 evidence
+reviews are allowed, with at most four immutable provider exchanges at once.
+The worker reserves each call before releasing its operation gate and continues
+protecting later edits while reviews run. All calls share one persisted deadline, using `ai.timeout` (five minutes by
+default) or an explicit `--timeout 15m` for the new attempt. Messages
 are part of the same plan; they do not get a separate retry loop. Correction
 feedback includes all detected message and membership conflicts together.
 
 The request contains bounded metadata, redacted supplied context, and approved
-text diffs. ACD measures complete serialized input and fails oversized requests
+text diffs. Each encoded exchange is bounded to 512 KiB, or the smaller
+`ai.max_input_bytes` setting. A large file is divided into UTF-8 fragments without
+losing bytes. Every fragment gets a bounded factual observation before planning;
+ACD validates complete fragment coverage and records content digests, summaries,
+review-call counts, and attempted request sizes. Each review contains at most 32 fragments so its output stays manageable.
+A malformed or overlong review can be corrected once within the same call
+budget and deadline. ACD reserves context space for the feedback and retains
+accepted reviews. Provider transport and protocol failures still end the attempt.
+The final planner receives all
+original change identities and these observations together. Fragments, files,
+and review calls do not prescribe commit boundaries. Raw aggregate evidence
+still obeys `ai.max_input_bytes`; metadata or a global plan that cannot fit fails
 instead of clipping evidence. Binary content is represented by metadata and
 verified Git objects. See [providers and privacy](ai-providers.md).
 
@@ -112,6 +128,27 @@ or explicitly retry a failed attempt:
 ~~~bash
 acd finish --retry REQUEST_ID
 ~~~
+
+Validated reviews are saved after each accepted batch. An explicit retry reuses
+them only when the frozen evidence, redacted fragments, provider configuration,
+and review instructions still match. It reviews only missing evidence, then
+creates a fresh global plan. Restart never starts that work automatically.
+Reviews saved by older builds without this fingerprint cannot be reused.
+Valid completed reviews survive a parallel peer's failure. A successful retry
+preview also keeps its review evidence for a later publication attempt using
+the same request ID; that attempt still creates a fresh global plan.
+
+For a large batch, give a new attempt more planning time without changing its
+saved target or provider settings:
+
+~~~bash
+acd finish --retry REQUEST_ID --timeout 15m
+~~~
+
+`--timeout` accepts 1 second through 1 hour. Reconnecting to a running attempt
+keeps its existing deadline. Progress reports reviewed and reused fragments,
+review calls, and time remaining. Call budgets apply to new exchanges in each
+explicit attempt; reused reviews consume no calls.
 
 Retry keeps the original target and consent. Corrected credentials may be used
 for the same approved provider; later file edits remain outside it. If the

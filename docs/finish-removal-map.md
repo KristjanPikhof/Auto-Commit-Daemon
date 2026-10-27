@@ -12,7 +12,8 @@ and project verification belong to explicit `acd finish` or history requests.
 The new engine uses a frozen complete checkpoint and builds the entire commit
 chain before one branch compare-and-swap (CAS). Later edits stay protected and
 outside that request. Local finish creates one honest batch commit without AI;
-Intent finish uses one planning call and at most one correction. Failed requests
+Intent finish uses bounded evidence reviews for large batches, then one global
+planning call and at most one correction. Failed requests
 remain retryable on request, with no background semantic retry or mode fallback.
 
 The source checkpoint contains eligible protected scope. The finish target is a

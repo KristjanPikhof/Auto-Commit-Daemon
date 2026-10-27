@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -478,7 +479,7 @@ func TestFinishWorkerExactProviderEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	diffs, err := finishProviderDiffs(context.Background(), f.dir, base, r.Target.TargetTree, evidence.Changes, true)
+	diffs, err := finishProviderDiffs(context.Background(), f.dir, base, r.Target.TargetTree, evidence.Changes, true, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +574,7 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 			f, w := finishWorkerFixture(t)
 			body := "goal\n"
 			if scenario == "oversized" {
-				body = strings.Repeat("x", ai.FinishDiffByteCap+1024)
+				body = strings.Repeat("x", (128<<10)+1024)
 			}
 			finishWrite(t, f.dir, "goal.txt", body)
 			p := &finishTestTransport{exchange: func(_ context.Context, r ai.FinishPlanRequest) ([]byte, error) { return completeFinishTestPlan(r), nil }}
@@ -581,6 +582,7 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 			w.Config.Mode = "intent"
 			w.Config.Provider.DiffEgress = true
 			w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
+			w.Config.Provider.MaxInputBytes = 128 << 10
 			// Input-size rejection must not race Git preparation on a busy host.
 			w.Config.Provider.Timeout = time.Minute
 			if scenario == "expired" {
@@ -606,5 +608,133 @@ func TestFinishWorkerPlanningDeadlineAndInputLimit(t *testing.T) {
 				t.Fatal("failed preparation published")
 			}
 		})
+	}
+}
+
+func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	for i := 0; i < 156; i++ {
+		body := "first recorded value\n" + strings.Repeat("library entry with readable content\n", 300) + "final recorded value\n"
+		if i == 0 {
+			body = "first library entry\n" + strings.Repeat("large library entry\n", 100000) + "last library entry\n"
+		}
+		finishWrite(t, f.dir, fmt.Sprintf("library-%03d.txt", i), body)
+	}
+	w.Config.Mode = "intent"
+	w.Config.Provider.DiffEgress = true
+	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
+	w.Config.Provider.Timeout = time.Minute
+	reviewed := make(map[string]string)
+	var reviewMu sync.Mutex
+	p := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		reviewMu.Lock()
+		defer reviewMu.Unlock()
+		if request.Review != nil {
+			var observations []map[string]string
+			for _, part := range request.Review.Parts {
+				reviewed[part.ChangeID] += part.Text
+				observations = append(observations, map[string]string{"id": part.ID, "summary": "Preserve recorded library entries and their consumers."})
+			}
+			raw, _ := json.Marshal(map[string]any{"observations": observations})
+			return raw, nil
+		}
+		if len(request.Changes) != 156 || len(reviewed) != 156 || len(request.Reviews) < 156 {
+			t.Fatalf("lost batch members: %d changes, %d reviewed paths", len(request.Changes), len(reviewed))
+		}
+		for id, text := range reviewed {
+			if !strings.Contains(text, "final recorded value") && !strings.Contains(text, "last library entry") {
+				t.Fatalf("diff missing its end: %s", id)
+			}
+			if id == "library-000.txt" && (len(text) < 1<<20 || strings.Count(text, "large library entry") != 100000) {
+				t.Fatal("large text evidence was clipped")
+			}
+		}
+		finishWrite(t, f.dir, "library-000.txt", "later edit stays outside accepted finish\n")
+		return completeFinishTestPlan(request), nil
+	}}
+	w.Transport = p
+	r := startFinishWorker(t, w, FinishOptions{})
+	completed, err := w.Execute(context.Background(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 || completed.EvidenceCalls < 2 || p.calls.Load() != int32(completed.EvidenceCalls+1) {
+		t.Fatalf("large finish: %+v calls=%d: %v", completed, p.calls.Load(), err)
+	}
+	if tree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); tree != r.Target.TargetTree {
+		t.Fatal("published tree lost full file contents")
+	}
+	body, _ := os.ReadFile(filepath.Join(f.dir, "library-000.txt"))
+	if string(body) != "later edit stays outside accepted finish\n" {
+		t.Fatal("finish overwrote later work")
+	}
+}
+
+func TestFinishWorkerInputBudgetIsFrozen(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "goal.txt", "saved goal\n")
+	w.Config.Mode = "intent"
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	w.Config.Provider.MaxInputBytes = ai.FinishDefaultInputByteCap
+	if _, _, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, DryRun: true}); err != nil {
+		t.Fatalf("explicit default changed saved identity: %v", err)
+	}
+	w.Config.Provider.MaxInputBytes = 16 << 20
+	if _, _, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, DryRun: true}); !errors.Is(err, state.ErrFinishIdentity) {
+		t.Fatalf("retry accepted a changed input budget: %v", err)
+	}
+}
+
+func TestFinishWorkerExplicitTimeoutPreservesFrozenIdentity(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "goal.txt", "frozen goal\n")
+	w.Config.Mode = "intent"
+	r := startFinishWorker(t, w, FinishOptions{Timeout: 15 * time.Minute})
+	if remaining := time.Until(finishDeadline(r)); remaining < 14*time.Minute || remaining > 15*time.Minute {
+		t.Fatalf("explicit timeout ignored: %v", remaining)
+	}
+	reconnected, created, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, Timeout: time.Hour})
+	if err != nil || created || reconnected.DeadlineTS != r.DeadlineTS {
+		t.Fatalf("reconnect renewed deadline: %+v %v", reconnected, err)
+	}
+	if _, err := w.fail(r, context.DeadlineExceeded); err == nil {
+		t.Fatal("failure not reported")
+	}
+	finishWrite(t, f.dir, "goal.txt", "later work\n")
+	retry, created, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, Timeout: 20 * time.Minute})
+	if err != nil || !created || !reflect.DeepEqual(retry.Target, r.Target) || time.Until(finishDeadline(retry)) < 19*time.Minute {
+		t.Fatalf("retry changed frozen target: %+v %v", retry, err)
+	}
+	for _, timeout := range []time.Duration{-time.Second, time.Millisecond, time.Hour + time.Second} {
+		if _, _, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, Timeout: timeout}); err == nil {
+			t.Fatal("invalid timeout accepted", timeout)
+		}
+	}
+}
+
+func TestFinishWorkerExplicitTimeoutAlsoBoundsRealProviderExchange(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "goal.txt", "Complete the requested goal\n")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		// Simulate a response slower than the configured transport budget, while
+		// remaining well inside the explicitly accepted attempt deadline.
+		response := time.NewTimer(150 * time.Millisecond)
+		defer response.Stop()
+		select {
+		case <-request.Context().Done():
+			return
+		case <-response.C:
+		}
+		plan := string(completeFinishTestPlan(ai.FinishPlanRequest{Changes: []finish.Change{{ID: "goal.txt"}}}))
+		_ = json.NewEncoder(writer).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]string{"name": "finish_plan", "arguments": plan}}}}}}})
+	}))
+	defer server.Close()
+	w.Config.Mode = "intent"
+	w.Config.Provider = ai.ProviderConfig{Mode: "openai-compat", BaseURL: server.URL, APIKey: "synthetic-key", Model: "test-model", Timeout: 30 * time.Millisecond, CommitStrategy: ai.CommitStrategyIntent, CommitFormat: ai.CommitFormatImperative, DiffEgress: true}
+	w.Config.Approved = []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationInsecureEndpointCredentials, ai.ConfirmationDiffEgress}
+	r := startFinishWorker(t, w, FinishOptions{Timeout: 20 * time.Second})
+	completed, err := w.Execute(t.Context(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 {
+		t.Fatalf("transport ignored accepted attempt budget: %+v %v", completed, err)
+	}
+	if w.Config.Provider.Timeout != 30*time.Millisecond {
+		t.Fatal("explicit timeout changed provider settings")
 	}
 }

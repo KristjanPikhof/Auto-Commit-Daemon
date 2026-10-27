@@ -15,6 +15,9 @@ import (
 // DefaultOpenAIModel is shared by settings, setup, and provider requests.
 const DefaultOpenAIModel = "gpt-6-luna"
 
+const DefaultAIInputBytes = 8 << 20
+const MaxAIInputBytes = 64 << 20
+
 type ApplyBoundary string
 
 const (
@@ -37,6 +40,7 @@ const (
 	FieldAPIKey                  = "ai.api_key"
 	FieldModel                   = "ai.model"
 	FieldTimeout                 = "ai.timeout"
+	FieldMaxInputBytes           = "ai.max_input_bytes"
 	FieldCAFile                  = "ai.ca_file"
 	FieldDiffEgress              = "ai.diff_egress"
 	FieldCommitStrategy          = "commit.strategy"
@@ -68,6 +72,7 @@ var fieldCatalog = []FieldDefinition{
 	{Name: FieldBaseURL, Environment: "ACD_AI_BASE_URL", Default: "https://api.openai.com/v1", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldAPIKey, Environment: "ACD_AI_API_KEY", Kind: KindString, Boundary: ApplyHot, Sensitive: true, Persistable: false},
 	{Name: FieldModel, Environment: "ACD_AI_MODEL", Default: DefaultOpenAIModel, Kind: KindString, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldMaxInputBytes, Environment: "ACD_AI_MAX_INPUT_BYTES", Default: strconv.Itoa(DefaultAIInputBytes), Kind: KindInteger, Minimum: 128 << 10, Maximum: MaxAIInputBytes, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldTimeout, Environment: "ACD_AI_TIMEOUT", Default: "5m", Kind: KindDuration, PlainSeconds: true, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCAFile, Environment: "ACD_AI_CA_FILE", Kind: KindString, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldDiffEgress, Environment: "ACD_AI_DIFF_EGRESS", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},

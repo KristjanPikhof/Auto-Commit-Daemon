@@ -27,7 +27,7 @@ pushes to a remote.
 supplies context for messages and grouping. `--message` supplies the complete
 message; purpose can accompany it as explanation. Both become immutable when
 the target freezes. `--retry` may combine with `--dry-run`, `--repo`, `--json`,
-and `--quiet`; it rejects new purpose, message, or staged consent. Unknown IDs,
+`--timeout`, and `--quiet`; it rejects new purpose, message, or staged consent. Unknown IDs,
 foreign-worktree IDs, and attempts to retry a successful publication are errors.
 A completed preview does not publish later: the next ordinary finish freezes a
 fresh checkpoint. `--retry ID --dry-run` checks a failed target without applying
@@ -121,7 +121,8 @@ Different ref or index movement remains `needs_attention`.
 
 An explicit retry creates a new attempt and deadline for the same frozen target,
 with separate evidence. It checks current ownership before work and publication.
-It never changes options or silently rebases a stale target. If the branch
+It never changes frozen options or silently rebases a stale target. An explicit
+`--timeout` may set a new attempt deadline without changing that identity. If the branch
 moved, finish must report that a new request is needed rather than guessing.
 Credentials may be refreshed between explicit attempts. The saved provider,
 endpoint, trust settings, credential source policy, and egress consent stay fixed.
@@ -146,8 +147,25 @@ The final candidate tree must equal the entire frozen target exactly, including
 unchanged entries, file modes, deletions, renames, symlinks, and binary objects.
 Coverage and equality are structural evidence, not proof that project tests ran.
 
-One Intent attempt allows one planning call plus at most one correction within
-one persisted `ai.timeout` deadline (default five minutes). Messages belong to
+One Intent attempt allows at most 32 evidence-review calls, one global planning
+call, and at most one global correction within one persisted `ai.timeout`
+deadline (default five minutes, overridden per attempt by `--timeout` from
+1 second through 1 hour). Reconnection never extends it. At most four immutable evidence exchanges run concurrently; the worker reserves
+budgets and writes state serially. Small requests skip evidence review. Every
+complete redacted diff is covered by exact UTF-8 fragments; every fragment must
+have exactly one bounded observation with a locally recorded content digest.
+Each review contains at most 32 fragments. An invalid review gets at most one correction, using the same complete evidence
+and bounded validation feedback. Accepted reviews are not repeated, and correction
+calls consume the same 32-call budget and deadline. Transport and protocol failures do not
+trigger a correction. Validated reviews are checkpointed durably with a fingerprint of the frozen
+evidence, provider configuration, encoded input, and review instructions. Explicit
+retry reuses only matching, revalidated fragments and creates a fresh global
+plan; it never resumes provider work automatically. Legacy unkeyed observations
+are not imported. Review batches never define commit membership. The global planner sees all
+original change identities, dependencies, and observations together. Review
+reservations use the mutable attempt result journal, preserving accepted-plan
+immutability and the separate two-call planning budget. Restart retains the
+counts and interrupts the attempt; it does not resume provider work. Messages belong to
 that plan, so they have no separate retry loop. One batch must explain why the
 recorded changes do not support useful safe steps. Failed intermediate checks,
 provider failure, malformed or incomplete output, unavailable evidence, and
@@ -170,25 +188,27 @@ finish also needs supplied context or an exact message;
 `provider_context_required` needs a new request with that context. Local stays
 offline, and history selection remains independent of finish checkpoints.
 
-Provider inputs reuse existing byte limits. These bounds are separate from
-checkpoint storage; `capture.max_file_bytes` controls buffering and does not
-make large regular files ineligible for protection.
+`ai.max_input_bytes` bounds aggregate complete textual evidence. Each encoded
+provider exchange, including correction feedback, also has a 512 KiB context
+bound or the smaller configured byte budget. It defaults to
+8 MiB and accepts 128 KiB through 64 MiB. Large files are reviewed in parts without a per-file rejection threshold.
+These bounds are separate from checkpoint storage; `capture.max_file_bytes`
+controls buffering and does not make large files ineligible for protection.
 
-| Evidence | Bound |
-|---|---|
-| One included textual path diff | `ai.FinishDiffByteCap`, 128 KiB |
-| Aggregate textual finish evidence | `ai.FinishEvidenceDiffByteCap`, 512 KiB |
-| Aggregate history rewrite diffs | `ai.FinishHistoryDiffByteCap`, 512 KiB |
-| Serialized provider planning request | `ai.FinishRequestByteCap`, 512 KiB |
+Measure raw and redacted aggregate text and actual serialized bytes before
+sending. Exceeding the configured budget fails with `provider_input_too_large`,
+the measured size, and limit. Direct the user to review `ai.max_input_bytes`
+for their provider and start a new finish, or choose an explicit local finish
+for a complete offline batch. History can also use a smaller explicit range.
+Retry keeps its original settings, so do not suggest an unchanged retry for
+this failure. Default-budget upgrades preserve existing consent and saved
+request identities; a custom budget participates in the approved identity.
 
-Measure actual serialized bytes and complete required evidence before sending.
-Exceeding a bound fails with `provider_input_too_large`, the measured size,
-limit, and actionable guidance: use an explicit local finish for a complete
-offline batch, or select a smaller explicit history range for rewriting. Keep
-all work protected. Never clip evidence, silently omit eligible changes,
+Keep all work protected. Never clip evidence, silently omit eligible changes,
 split by age, or send partial input while describing it as complete. Binary
 entries use declared object/type/size metadata and exact Git objects for tree
-validation; report that their content was not sent as text.
+validation; report that their content was not sent as text. A provider can still
+reject input below ACD's byte budget because of its own token or payload limit.
 
 Intent setup includes code sharing in its explicit approval review. Existing
 settings and approvals remain unchanged on upgrade. Intent must honor explicit

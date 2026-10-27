@@ -154,7 +154,7 @@ acd finish "Add offline checkout"
 acd finish --message "Update setup guidance"
 acd finish --dry-run
 acd finish --include-staged
-acd finish --retry REQUEST_ID
+acd finish --retry REQUEST_ID --timeout 15m
 ~~~
 
 Finish itself authorizes local publication; it needs no `--yes`. Local mode
@@ -203,10 +203,18 @@ attempt without an automatic provider retry. A prepared publication recovers
 only through exact saved branch/index proof.
 
 `--retry ID` retains the failed target and starts one bounded attempt. It accepts
-`--dry-run`, `--repo`, `--json`, and `--quiet`, but rejects a new purpose, message,
+`--dry-run`, `--repo`, `--json`, `--quiet`, and `--timeout`, but rejects a new purpose, message,
 or staged selection. Changed branch/index ownership or approved settings require
 a new finish; retry never absorbs later files. Credentials can be refreshed for
 an explicit attempt with the same approved provider and privacy configuration.
+
+`--timeout 15m` sets the planning budget for a new attempt (1 second through
+1 hour); otherwise `ai.timeout` applies. Reconnecting keeps the existing
+deadline. Validated evidence reviews are saved durably and reused by explicit
+retry only when the exact frozen evidence, provider configuration, and review
+instructions still match. Progress shows completed and reused fragments.
+Successful retry previews retain this evidence for a later real retry of the
+same ID. Each attempt still makes a fresh global plan.
 
 Verification always proves structure and target equality. `none` and
 `structural` do not imply that project tests ran. `fast` and `full` run the

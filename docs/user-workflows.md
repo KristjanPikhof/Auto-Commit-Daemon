@@ -112,8 +112,9 @@ It does not add later edits or change purpose, message, or staged consent.
 Use `--retry REQUEST_ID --dry-run` only for a failed target preview; it does not
 turn a completed dry run into publication.
 
-Intent has one planning exchange and at most one correction under a fixed
-deadline. It never falls back to Local. Correct credentials or the cause before
+Intent uses bounded evidence reviews for large batches, then one global planning
+exchange and at most one correction under a fixed deadline. Reviews cover every
+complete diff; their boundaries do not prescribe commits. It never falls back to Local. Correct credentials or the cause before
 retrying. To change the work or mode, review settings and start a new finish.
 Prepared publication recovers from exact saved proof after restart; an
 interrupted running attempt becomes failed rather than making new AI calls.

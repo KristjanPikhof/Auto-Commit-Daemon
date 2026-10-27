@@ -11,8 +11,6 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-const FinishHistoryDiffByteCap = FinishEvidenceDiffByteCap
-
 type HistoryMessageCommit struct {
 	ID              string   `json:"id"`
 	TreeOID         string   `json:"tree_oid"`
@@ -22,6 +20,9 @@ type HistoryMessageCommit struct {
 }
 
 func finishPrompt(request FinishPlanRequest) string {
+	if request.Review != nil {
+		return finishReviewPrompt
+	}
 	if len(request.HistoryCommits) == 0 {
 		return finishSystemPrompt
 	}
@@ -33,6 +34,10 @@ This request is an explicit messages-only history rewrite. Keep every history_co
 // may remove net-neutral changes. It uses one exchange and one combined correction.
 func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidence finish.Evidence, commits []HistoryMessageCommit, options FinishOptions) ([]finish.Goal, FinishPlanResult, error) {
 	var result FinishPlanResult
+	inputLimit, err := FinishInputByteLimit(options.MaxInputBytes)
+	if err != nil {
+		return nil, result, err
+	}
 	if options.Style == "" {
 		options.Style = finish.StyleImperative
 	}
@@ -66,23 +71,18 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		commit.OriginalMessage = redacted
 		request.HistoryCommits = append(request.HistoryCommits, commit)
 	}
-	for _, diffs := range [][]FinishDiff{options.Diffs, request.Diffs} {
-		total := 0
-		for _, diff := range diffs {
-			total += len(diff.Text)
-		}
-		if total > FinishHistoryDiffByteCap {
-			return nil, result, finishInputLimit(total, FinishHistoryDiffByteCap)
-		}
-	}
 	disclosure.Provider = transport.Name()
+	result.Disclosure = disclosure
+	if err := reviewFinishEvidence(ctx, transport, &request, options, &result.Disclosure); err != nil {
+		return nil, result, err
+	}
 	for call := 0; call < 2; call++ {
 		body, err := transport.EncodeFinishRequest(request)
 		if err != nil {
 			return nil, result, err
 		}
-		if len(body) > FinishRequestByteCap {
-			return nil, result, finishInputLimit(len(body), FinishRequestByteCap)
+		if limit := min(inputLimit, FinishContextByteCap); len(body) > limit {
+			return nil, result, finishContextLimit(len(body), limit)
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, result, finishFailure("provider_deadline", err)
@@ -94,9 +94,6 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, result, finishFailure("provider_deadline", err)
-		}
-		if call == 0 {
-			result.Disclosure = disclosure
 		}
 		result.Calls++
 		result.Disclosure.RequestBytes = append(result.Disclosure.RequestBytes, len(body))

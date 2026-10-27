@@ -7,11 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -522,4 +524,133 @@ func TestFinishFaultRunningRequestRestartRequiresFrozenRetry(t *testing.T) {
 	}
 	f.Barrier(t, t.Context())
 	finishAssertSavedViews(t, f, 2)
+}
+
+func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
+	var reviews, plans, corrections atomic.Int32
+	var f *finishFixture
+	large := "first recorded line\n" + strings.Repeat("complete library entry\n", 70000) + "last recorded line\n"
+	f = finishIntentFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > ai.FinishContextByteCap {
+			t.Error("oversized context reached real HTTP provider")
+			http.Error(w, "context window exceeded", http.StatusBadRequest)
+			return
+		}
+		request := decodeFinishChatRequest(t, r)
+		if request.Plan.Review != nil {
+			first := reviews.Add(1) == 1
+			if first {
+				writeFile(t, filepath.Join(f.Repo, "library.txt"), "later edit during evidence review\n")
+				f.Barrier(t, t.Context())
+			}
+			var observations []map[string]string
+			for _, part := range request.Plan.Review.Parts {
+				observations = append(observations, map[string]string{"id": part.ID, "summary": "Preserve the complete recorded library and its consumer."})
+			}
+			if first {
+				observations[0]["summary"] = strings.Repeat("overlong factual summary ", 20)
+			}
+			if request.Plan.Correction != nil {
+				corrections.Add(1)
+				if !strings.Contains(request.Plan.Correction.ValidationError, "maximum is 256") {
+					t.Error("review correction omitted specific feedback")
+				}
+			}
+			arguments, _ := json.Marshal(map[string]any{"observations": observations})
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "finish_evidence", "arguments": string(arguments)}}}}}}})
+			return
+		}
+		plans.Add(1)
+		if len(request.Plan.Reviews) < 2 || len(request.Plan.Changes) != 2 {
+			t.Error("global plan lacks complete review context or membership")
+		}
+		writeFile(t, filepath.Join(f.Repo, "library.txt"), "later edit stays outside this finish\n")
+		writeFinishChatResponse(t, w, request)
+	}, "60s")
+	writeFile(t, filepath.Join(f.Repo, "library.txt"), large)
+	writeFile(t, filepath.Join(f.Repo, "consumer.txt"), "Use the recorded library\n")
+	result := finishRunJSON(t, f, "finish", "Preserve completed library and consumer")
+	if !result.OK || !result.Data.Published || result.Data.PlanningCalls != 1 || result.Data.EvidenceCalls != int(reviews.Load()) || reviews.Load() < 3 || plans.Load() != 1 || corrections.Load() != 1 {
+		t.Fatalf("large real finish: %+v reviews=%d plans=%d", result, reviews.Load(), plans.Load())
+	}
+	if got := runGitOK(t, f.Repo, "show", "HEAD:library.txt"); got != large {
+		t.Fatal("published library lost full contents")
+	}
+	if tree := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD^{tree}")); tree != result.Data.Target.TargetTree {
+		t.Fatal("published tree differs from frozen target")
+	}
+	if got, err := os.ReadFile(filepath.Join(f.Repo, "library.txt")); err != nil || string(got) != "later edit stays outside this finish\n" {
+		t.Fatal("later work was overwritten", err)
+	}
+	f.Barrier(t, t.Context())
+	finishAssertSavedViews(t, f, 1)
+}
+
+func TestFinishReviewRetryResumesAfterWorkerRestart(t *testing.T) {
+	var reviews, plans atomic.Int32
+	var retry atomic.Bool
+	var mu sync.Mutex
+	accepted := map[string]bool{}
+	f := finishIntentFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		// A rejected peer cancels in-flight HTTP uploads. Those partial bodies
+		// are expected transport failures, not malformed provider requests.
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		request := decodeFinishChatRequest(t, r)
+		if request.Plan.Review != nil {
+			call := reviews.Add(1)
+			if !retry.Load() && call > 4 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"review interrupted"}}`))
+				return
+			}
+			var observations []map[string]string
+			mu.Lock()
+			for _, part := range request.Plan.Review.Parts {
+				if retry.Load() && accepted[part.ID] {
+					t.Error("accepted fragment sent again after restart")
+				}
+				if !retry.Load() {
+					accepted[part.ID] = true
+				}
+				observations = append(observations, map[string]string{"id": part.ID, "summary": "Preserve complete library entries and their consumers."})
+			}
+			mu.Unlock()
+			arguments, _ := json.Marshal(map[string]any{"observations": observations})
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "finish_evidence", "arguments": string(arguments)}}}}}}})
+			return
+		}
+		plans.Add(1)
+		writeFinishChatResponse(t, w, request)
+	}, "60s")
+	for i := 0; i < 156; i++ {
+		writeFile(t, filepath.Join(f.Repo, fmt.Sprintf("library-%03d.txt", i)), "Complete recorded library value\n")
+	}
+	writeFile(t, filepath.Join(f.Repo, "large.txt"), strings.Repeat("Complete readable library entry\n", 70000))
+	failed := finishRunJSON(t, f, "finish", "Preserve completed library and consumers", "--timeout", "90s")
+	if failed.OK || failed.Data.State != state.FinishFailed || failed.Data.ReviewedFragments == 0 || failed.Data.ReviewedFragments >= failed.Data.ReviewFragments || failed.Data.PlanningCalls != 0 || plans.Load() != 0 {
+		t.Fatalf("partial reviews not durable: %+v", failed)
+	}
+	f.Restart(t, t.Context())
+	writeFile(t, filepath.Join(f.Repo, "later.txt"), "Later work belongs to the next finish\n")
+	f.Barrier(t, t.Context())
+	retry.Store(true)
+	completed := finishRunJSON(t, f, "finish", "--retry", failed.Data.ID, "--timeout", "120s")
+	if !completed.OK || !completed.Data.Published || completed.Data.Attempt != 2 || completed.Data.ReusedFragments != failed.Data.ReviewedFragments || completed.Data.ReviewedFragments != completed.Data.ReviewFragments || completed.Data.PlanningCalls != 1 || plans.Load() != 1 || !reflect.DeepEqual(completed.Data.Target, failed.Data.Target) {
+		t.Fatalf("retry lost frozen proof or review progress: %+v", completed)
+	}
+	if completed.Data.DeadlineTS-completed.Data.CreatedTS < 119 {
+		t.Fatal("explicit retry timeout ignored")
+	}
+	if tree := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD^{tree}")); tree != failed.Data.Target.TargetTree {
+		t.Fatal("retry published later work")
+	}
+	if body, err := os.ReadFile(filepath.Join(f.Repo, "later.txt")); err != nil || string(body) != "Later work belongs to the next finish\n" {
+		t.Fatal("later edits overwritten", err)
+	}
+	f.Barrier(t, t.Context())
+	finishAssertSavedViews(t, f, 1)
 }

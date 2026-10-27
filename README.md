@@ -147,10 +147,14 @@ plans goals before assigning paths. Implementation, callers, tests, generated
 output, and relevant docs stay together when they complete one goal. A split
 needs a useful review or revert boundary and a valid intermediate tree.
 
-Intent permits one planning call and at most one correction within its saved
-`ai.timeout` deadline. Provider rejection, missing credentials, timeout, or
+Intent reviews large evidence in bounded batches, then makes one global
+planning call and at most one correction within its saved deadline. For large
+batches, use `acd finish --timeout 15m`. Validated reviews survive failures and
+can be reused by an explicit retry of the same frozen request.
+Small requests skip the review stage. Review batches do not define commits. Provider rejection, missing credentials, timeout, or
 oversized evidence fails that explicit attempt. Binary content is metadata only;
-text evidence and serialized requests have fixed byte limits.
+text evidence has an aggregate byte budget and each exchange has a separate
+context bound.
 
 Choose Local or Intent and either message style in the settings editor:
 

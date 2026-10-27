@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 	"testing"
 )
 
@@ -324,5 +327,136 @@ func TestFinishSchemaUpgradeAndReadOnly(t *testing.T) {
 	}
 	if _, err := ConsumeFinishPlanningCall(ctx, ro, original.ID, 1); err == nil {
 		t.Fatal("readonly wrote call counter")
+	}
+}
+
+func TestFinishEvidenceBudgetSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	db, path := openTestDB(t)
+	r := startFinishFixture(t, db, finishFixture(t, db, 1))
+	for i := 1; i <= 32; i++ {
+		if n, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); err != nil || n != i {
+			t.Fatalf("review reservation %d: %d %v", i, n, err)
+		}
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("review limit bypassed", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, err := LoadFinishRequest(ctx, db, r.ID)
+	if err != nil || got.EvidenceCalls != 32 || got.PlanningCalls != 0 || got.Stage != "reviewing_evidence" || len(got.Plan) != 0 {
+		t.Fatalf("durable review progress: %+v %v", got, err)
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal(err)
+	}
+	if _, err := ConsumeFinishPlanningCall(ctx, db, r.ID, r.Attempt); err != nil {
+		t.Fatal("review consumed planning allowance", err)
+	}
+	if _, err := InterruptFinishRequests(ctx, db, r.Target.WorktreeID); err != nil {
+		t.Fatal(err)
+	}
+	interrupted, _ := LoadFinishRequest(ctx, db, r.ID)
+	if interrupted.EvidenceCalls != 32 || interrupted.State != FinishFailed {
+		t.Fatalf("restart discarded progress: %+v", interrupted)
+	}
+	retry, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, false)
+	if err != nil || retry.EvidenceCalls != 0 || retry.PlanningCalls != 0 || !reflect.DeepEqual(retry.Target, r.Target) {
+		t.Fatalf("retry changed target or retained spent budget: %+v %v", retry, err)
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("stale attempt reserved a call", err)
+	}
+}
+
+func TestFinishReviewsSurviveRestartAndExplicitRetry(t *testing.T) {
+	ctx := t.Context()
+	db, path := openTestDB(t)
+	r := startFinishFixture(t, db, finishFixture(t, db, 1))
+	progress := finish.ReviewProgress{Fingerprint: strings.Repeat("a", 64), TotalFragments: 2, Observations: []finish.ReviewObservation{{ID: "part-1", ChangeID: "change-1", Part: 1, Parts: 2, Digest: strings.Repeat("b", 64), Summary: "Preserve authored library values"}}}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, r.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := InterruptFinishRequests(ctx, db, r.Target.WorktreeID); err != nil {
+		t.Fatal(err)
+	}
+	interrupted, err := LoadFinishRequest(ctx, db, r.ID)
+	if err != nil || interrupted.State != FinishFailed || interrupted.EvidenceCalls != 1 || interrupted.ReviewedFragments != 1 || !reflect.DeepEqual(interrupted.ReviewProgress, progress) {
+		t.Fatalf("restart lost progress: %+v %v", interrupted, err)
+	}
+	retry, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+1200, false)
+	if err != nil || retry.Attempt != 2 || retry.EvidenceCalls != 0 || retry.PlanningCalls != 0 || !reflect.DeepEqual(retry.Target, r.Target) || !reflect.DeepEqual(retry.ReviewProgress, progress) {
+		t.Fatalf("retry lost proof: %+v %v", retry, err)
+	}
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, 1, progress); !errors.Is(err, ErrFinishState) {
+		t.Fatal("stale attempt wrote progress", err)
+	}
+	if _, err := ConsumeFinishPlanningCall(ctx, db, r.ID, retry.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, retry.Attempt, progress); !errors.Is(err, ErrFinishState) {
+		t.Fatal("review changed after planning", err)
+	}
+	var oldResult string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT result_json FROM finish_requests WHERE request_id=? AND attempt=1`, r.ID).Scan(&oldResult); err != nil || !strings.Contains(oldResult, "part-1") {
+		t.Fatal("old attempt evidence changed", err)
+	}
+}
+
+func TestFinishReviewCacheSurvivesRetryPreview(t *testing.T) {
+	ctx := t.Context()
+	db, _ := openTestDB(t)
+	r := startFinishFixture(t, db, finishFixture(t, db, 1))
+	progress := finish.ReviewProgress{Fingerprint: strings.Repeat("a", 64), TotalFragments: 2, Observations: []finish.ReviewObservation{{ID: "part-1", ChangeID: "goal", Part: 1, Parts: 2, Digest: strings.Repeat("b", 64), Summary: "Preserve complete authored settings"}}}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, r.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	failFinishFixture(t, db, r)
+	preview, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, preview.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	progress.ReusedFragments = 1
+	progress.Observations = append(progress.Observations, finish.ReviewObservation{ID: "part-2", ChangeID: "goal", Part: 2, Parts: 2, Digest: strings.Repeat("c", 64), Summary: "Preserve the remaining authored settings"})
+	if err := SaveFinishReviewProgress(ctx, db, r.ID, preview.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := UpdateFinishRequest(ctx, db, r.ID, preview.Attempt, FinishRunning, FinishUpdate{State: FinishCompleted, Result: json.RawMessage(`{"dry_run":true}`)})
+	if err != nil || !reflect.DeepEqual(completed.ReviewProgress, progress) || completed.EvidenceCalls != 1 {
+		t.Fatalf("preview discarded its journal: %+v %v", completed, err)
+	}
+	var result struct {
+		DryRun bool `json:"dry_run"`
+	}
+	if err := json.Unmarshal(completed.Result, &result); err != nil || !result.DryRun {
+		t.Fatalf("preview outcome lost: %s %v", completed.Result, err)
+	}
+	applied, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, false)
+	if err != nil || !reflect.DeepEqual(applied.Target, r.Target) || !reflect.DeepEqual(applied.ReviewProgress, progress) || applied.EvidenceCalls != 0 || applied.PlanningCalls != 0 {
+		t.Fatalf("publication retry lost proof or retained spent calls: %+v %v", applied, err)
 	}
 }

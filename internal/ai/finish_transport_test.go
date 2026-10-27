@@ -235,3 +235,74 @@ func TestFinishRemovalOpenAITransportLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestFinishOpenAIRejectionExplainsCauseWithoutSecrets(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"message":"Maximum context length exceeded. API key: test-key; password=abcdefgh12345678"},"request_body":"private echoed code"}`,
+		`{"error":{"message":"Use a smaller context window","code":400}}`,
+		`{"error":{"message":"` + strings.Repeat("x", 2000) + `"}}`,
+		`{"error":{"message":""},"secret":"private echoed code"}`,
+		`not JSON with private echoed code`,
+	} {
+		t.Run(body[:min(32, len(body))], func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer server.Close()
+			p := &OpenAIProvider{BaseURL: server.URL, APIKey: "test-key", HTTP: server.Client()}
+			_, err := p.ExchangeFinish(t.Context(), []byte(`{}`))
+			var rejection *ProviderHTTPError
+			if !errors.As(err, &rejection) || rejection.StatusCode != 400 || calls.Load() != 1 {
+				t.Fatalf("rejection lost or retried: %v calls=%d", err, calls.Load())
+			}
+			for _, secret := range []string{"test-key", "abcdefgh12345678", "private echoed code"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("provider rejection leaked %q", secret)
+				}
+			}
+			if len([]rune(rejection.Detail)) > plannerErrorCap {
+				t.Fatal("unbounded rejection detail")
+			}
+			if strings.Contains(body, "Maximum context") && !strings.Contains(rejection.Detail, "Maximum context length exceeded") {
+				t.Fatal("actionable cause was discarded")
+			}
+			if strings.Contains(body, "smaller context") && rejection.Detail != "Use a smaller context window" {
+				t.Fatal("numeric provider code hid the message")
+			}
+		})
+	}
+}
+
+func TestFinishEvidenceToolMustMatchRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "finish_plan", "arguments": `{"observations":[]}`}}}}}}})
+	}))
+	defer server.Close()
+	p := &OpenAIProvider{BaseURL: server.URL, APIKey: "test-key", HTTP: server.Client()}
+	body, err := p.EncodeFinishRequest(FinishPlanRequest{Review: &FinishReviewTask{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.ExchangeFinish(t.Context(), body); err == nil {
+		t.Fatal("wrong evidence tool accepted")
+	}
+}
+
+func TestFinishSubprocessEvidenceProtocol(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	bin := writePluginScript(t, dir, "review", "while IFS= read -r line; do printf '%s\\n' '{\"version\":1,\"finish_evidence\":{\"observations\":[{\"id\":\"part-1\",\"summary\":\"Preserve the recorded settings\"}]}}'; done\n")
+	p := NewSubprocessProvider("review", SubprocessOptions{LookPath: fixedLookPath("acd-provider-review", bin), Timeout: time.Second})
+	defer p.Close()
+	body, err := p.EncodeFinishRequest(FinishPlanRequest{Review: &FinishReviewTask{Parts: []FinishReviewPart{{ID: "part-1", ChangeID: "settings.go", Part: 1, Parts: 1, Text: "+ authored settings\n"}}}})
+	if err != nil || !strings.Contains(string(body), `"request_type":"finish_evidence"`) {
+		t.Fatalf("review protocol: %s %v", body, err)
+	}
+	raw, err := p.ExchangeFinish(t.Context(), body)
+	if err != nil || !strings.Contains(string(raw), "Preserve the recorded settings") {
+		t.Fatalf("evidence reply %s %v", raw, err)
+	}
+}

@@ -273,3 +273,13 @@ func TestFinishCLIConfigSavedHistoryNeedsNoNewCodeApproval(t *testing.T) {
 		t.Fatalf("applying saved history required new code sharing: %+v %v", cfg, err)
 	}
 }
+
+func TestFinishCLIInputBudgetUsesApprovedSnapshot(t *testing.T) {
+	roots, runtime := finishConfigFixture(t)
+	finishConfigRevision(t, runtime.db, map[string]any{config.FieldMaxInputBytes: 16 << 20}, sql.NullInt64{}, true)
+	t.Setenv("ACD_AI_MAX_INPUT_BYTES", "1048576")
+	cfg, err := resolveFinishWorkerConfigInputs(t.Context(), roots, runtime, false)
+	if err != nil || cfg.Provider.MaxInputBytes != 16<<20 {
+		t.Fatalf("approved input budget = %d: %v", cfg.Provider.MaxInputBytes, err)
+	}
+}
