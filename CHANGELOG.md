@@ -18,6 +18,13 @@
 
 ### Changed
 
+- Require Go 1.27.3 or later for source builds and use Go 1.27.3 in CI and
+  releases, fixing the certificate verification vulnerability GO-2026-6809.
+- Update `golang.org/x/sys` to v0.49.0 and `modernc.org/sqlite` to v1.61.0,
+  with the matching `modernc.org/libc` v1.79.0 and required indirect dependencies.
+- Update `actions/upload-artifact` to v7.0.2 and `goreleaser/goreleaser-action`
+  to v7.3.0, keeping both actions pinned to their release commit hashes.
+
 - Save validated finish evidence reviews durably and reuse them on explicit
   retry only when the exact frozen evidence, provider configuration, and review
   instructions match. Report completed and reused fragments. Add

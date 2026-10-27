@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: '1.26.9'
+  GO_VERSION: '1.27.3'
   ACD_TEST_TIMEOUT: 4m15s
 
 jobs:
@@ -58,7 +58,7 @@ jobs:
         run: scripts/dev/test.sh core 4 ${{ matrix.shard.index }}
       - name: Preserve timing and selection evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: core-${{ matrix.os.label }}-${{ matrix.shard.index }}
           path: ${{ runner.temp }}/test-results
@@ -93,7 +93,7 @@ jobs:
         run: scripts/dev/test.sh integration 4 ${{ matrix.shard }}
       - name: Preserve timing and selection evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: integration-${{ matrix.os }}-${{ matrix.shard }}
           path: ${{ runner.temp }}/integration-results
@@ -131,7 +131,7 @@ jobs:
         run: scripts/dev/test.sh sensitive
       - name: Preserve timing evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: support-${{ matrix.os.label }}
           path: ${{ runner.temp }}/test-results
@@ -170,7 +170,7 @@ jobs:
         run: scripts/dev/test.sh stress-daemon 6 ${{ matrix.shard.index }}
       - name: Preserve timing and selection evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: stress-daemon-${{ matrix.shard.index }}
           path: ${{ runner.temp }}/test-results
@@ -201,7 +201,7 @@ jobs:
         run: scripts/dev/test.sh stress-support 2 ${{ matrix.shard.index }}
       - name: Preserve timing and selection evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: stress-support-${{ matrix.shard.index }}
           path: ${{ runner.temp }}/test-results
