@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestPrivateRefDeleteRejectsAliasUnderPreparedLock(t *testing.T) {
@@ -115,10 +114,11 @@ func TestPrivateRefDeleteLostCommitAcknowledgementReportsRemoved(t *testing.T) {
 		t.Fatal(err)
 	}
 	hook := filepath.Join(repo, ".git", "hooks", "reference-transaction")
-	if err := os.WriteFile(hook, []byte("#!/bin/sh\nif [ \"$1\" = committed ]; then sleep 5; fi\n"), 0755); err != nil {
+	// Lose the acknowledgement only after Git commits, regardless of startup time.
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nif [ \"$1\" = committed ]; then kill -KILL \"$PPID\"; fi\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	removed, err := deletePrivateRefsCAS(ctx, repo, refs, 500*time.Millisecond)
+	removed, err := DeletePrivateRefsCAS(ctx, repo, refs)
 	if err == nil || len(removed) != 2 {
 		t.Fatalf("committed removals not reported: %d %v", len(removed), err)
 	}
