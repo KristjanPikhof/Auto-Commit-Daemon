@@ -18,6 +18,8 @@
 
 ### Changed
 
+- Require Go 1.27.3 or later for source builds and use Go 1.27.3 in CI and releases.
+
 - Save validated finish evidence reviews durably and reuse them on explicit
   retry only when the exact frozen evidence, provider configuration, and review
   instructions match. Report completed and reused fragments. Add

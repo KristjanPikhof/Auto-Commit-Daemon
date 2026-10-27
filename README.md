@@ -276,7 +276,7 @@ Project branches, tags, commits, staging, and working files stay unchanged.
 - [Integrations](docs/multi-tool.md)
 - [Changelog](CHANGELOG.md)
 
-Building from source requires Go 1.26.9 or later:
+Building from source requires Go 1.27.3 or later:
 
 ~~~bash
 make build

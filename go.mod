@@ -1,8 +1,9 @@
 module github.com/KristjanPikhof/Auto-Commit-Daemon
 
-go 1.26.9
+go 1.27.3
 
 require (
+	charm.land/bubbles/v2 v2.2.1
 	charm.land/huh/v2 v2.0.3
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/fsnotify/fsnotify v1.10.1
@@ -13,7 +14,6 @@ require (
 )
 
 require (
-	charm.land/bubbles/v2 v2.2.1 // indirect
 	charm.land/bubbletea/v2 v2.0.10 // indirect
 	charm.land/lipgloss/v2 v2.0.6 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
