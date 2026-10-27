@@ -86,7 +86,7 @@ func TestFinishRemovalSubprocessLifecycle(t *testing.T) {
 	t.Run("concurrent exchanges and cleanup", func(t *testing.T) {
 		dir := t.TempDir()
 		bin := writePluginScript(t, dir, "concurrent", "while IFS= read -r line; do printf '%s\\n' '"+finishPluginReply+"'; done\n")
-		p := NewSubprocessProvider("concurrent", SubprocessOptions{LookPath: fixedLookPath("acd-provider-concurrent", bin), Stderr: io.Discard, Timeout: time.Second})
+		p := NewSubprocessProvider("concurrent", SubprocessOptions{LookPath: fixedLookPath("acd-provider-concurrent", bin), Stderr: io.Discard})
 		t.Cleanup(func() { _ = p.Close() })
 		body, err := p.EncodeFinishRequest(FinishPlanRequest{Style: "imperative"})
 		if err != nil {
@@ -128,7 +128,7 @@ func TestFinishRemovalSubprocessLifecycle(t *testing.T) {
 		marker := filepath.Join(dir, "spawned")
 		script := fmt.Sprintf("printf 'spawn\\n' >> '%s'\nIFS= read -r line || exit 1\nif [ ! -f '%s.first' ]; then touch '%s.first'; exit 7; fi\nprintf '%%s\\n' '%s'\n", marker, marker, marker, finishPluginReply)
 		bin := writePluginScript(t, dir, "crash", script)
-		p := NewSubprocessProvider("crash", SubprocessOptions{LookPath: fixedLookPath("acd-provider-crash", bin), Stderr: io.Discard, Timeout: time.Second})
+		p := NewSubprocessProvider("crash", SubprocessOptions{LookPath: fixedLookPath("acd-provider-crash", bin), Stderr: io.Discard})
 		defer p.Close()
 		if _, err := p.ExchangeFinish(t.Context(), []byte(`{}`)); err == nil {
 			t.Fatal("crash succeeded")
@@ -162,13 +162,17 @@ func TestFinishRemovalSubprocessLifecycle(t *testing.T) {
 		dir := t.TempDir()
 		script := "printf 'local diagnostic\\n' >&2\nn=0\nwhile IFS= read -r line; do n=$((n+1)); if [ \"$n\" -eq 1 ]; then printf '%s\\n' '{\"version\":1,\"error\":\"upstream unavailable\"}'; else printf '%s\\n' '" + finishPluginReply + "'; fi; done\n"
 		bin := writePluginScript(t, dir, "soft", script)
-		p := NewSubprocessProvider("soft", SubprocessOptions{LookPath: fixedLookPath("acd-provider-soft", bin), Timeout: time.Second})
+		p := NewSubprocessProvider("soft", SubprocessOptions{LookPath: fixedLookPath("acd-provider-soft", bin)})
 		defer p.Close()
-		if _, err := p.ExchangeFinish(t.Context(), []byte(`{}`)); err == nil {
-			t.Fatal("soft failure succeeded")
+		if _, err := p.ExchangeFinish(t.Context(), []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "upstream unavailable") {
+			t.Fatalf("expected provider rejection: %v", err)
 		}
+		session := p.plugin
 		if _, err := p.ExchangeFinish(t.Context(), []byte(`{}`)); err != nil {
 			t.Fatal("soft error restarted or wedged process", err)
+		}
+		if p.plugin != session {
+			t.Fatal("soft error restarted the provider process")
 		}
 		if err := p.Close(); err != nil {
 			t.Fatal(err)
@@ -295,7 +299,7 @@ func TestFinishSubprocessEvidenceProtocol(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	dir := t.TempDir()
 	bin := writePluginScript(t, dir, "review", "while IFS= read -r line; do printf '%s\\n' '{\"version\":1,\"finish_evidence\":{\"observations\":[{\"id\":\"part-1\",\"summary\":\"Preserve the recorded settings\"}]}}'; done\n")
-	p := NewSubprocessProvider("review", SubprocessOptions{LookPath: fixedLookPath("acd-provider-review", bin), Timeout: time.Second})
+	p := NewSubprocessProvider("review", SubprocessOptions{LookPath: fixedLookPath("acd-provider-review", bin)})
 	defer p.Close()
 	body, err := p.EncodeFinishRequest(FinishPlanRequest{Review: &FinishReviewTask{Parts: []FinishReviewPart{{ID: "part-1", ChangeID: "settings.go", Part: 1, Parts: 1, Text: "+ authored settings\n"}}}})
 	if err != nil || !strings.Contains(string(body), `"request_type":"finish_evidence"`) {
