@@ -14,43 +14,37 @@
 - Finish supports exact messages, checked previews, explicit staged consent,
   durable request progress, reconnect, and retry of the same frozen target.
 - Local finish works offline as one complete batch. Intent plans completed goals
-  with one provider call and at most one correction within a persisted deadline.
+  from approved redacted diffs within a persisted deadline.
 
 ### Changed
-
-- Keep validated evidence reviews after a retry preview and when another
-  parallel review fails. Size failures point to the reported bound rather
-  than suggesting that one setting can change every limit.
 
 - Save validated finish evidence reviews durably and reuse them on explicit
   retry only when the exact frozen evidence, provider configuration, and review
   instructions match. Report completed and reused fragments. Add
   `acd finish --timeout 15m` to give a new attempt a bounded planning budget
   without changing provider settings or the saved target. Reconnection never
-  extends an active deadline. Provider exchanges honor the same saved budget.
+  extends an active deadline.
 
 - Correct an invalid evidence review once without repeating accepted reviews.
   Cap each review at 32 fragments. Keep the existing 32-call budget and deadline,
-  reserve context room for bounded
-  feedback, and identify the exact fragment and summary constraint on failure.
+  reserve context room for bounded feedback, and identify the exact fragment
+  and summary constraint on failure.
   Run at most four immutable reviews concurrently to keep smaller observation
   batches within the existing deadline; reserve budgets and write state serially.
 
 - Review large Intent batches in bounded evidence calls before one global commit
   plan. Preserve every diff byte, recorded identity, and whole-target verification;
   fragments never prescribe commits. Reserve up to 32 reviews durably under the
-  same deadline as planning, retain review provenance, and report review counts
-  separately. Small finishes keep their direct planning path. Reuse blob metadata
-  within a finish so repeated versions do not repeat identical Git reads.
+  same deadline as one global plan and at most one global correction. Retain
+  review provenance and report review counts separately. Small finishes keep
+  their direct planning path. Reuse blob metadata within a finish so repeated
+  versions do not repeat identical Git reads.
 
-- Preserve bounded, redacted OpenAI-compatible rejection messages so a failed
-  finish explains the provider error instead of hiding it behind HTTP status.
-
-- Replace Intent's 128 KiB per-file and 512 KiB request limits with one
-  configurable `ai.max_input_bytes` budget, defaulting to 8 MiB and supporting
-  up to 64 MiB. Keep complete diffs, redaction, and whole-target verification
-  for finish and history planning. Size failures explain how to review the
-  budget and start a new request instead of suggesting an unchanged retry.
+- Remove the separate 128 KiB per-file diff limit. Bound complete textual
+  evidence for finish and history planning with `ai.max_input_bytes`, defaulting
+  to 8 MiB and configurable from 128 KiB through 64 MiB. Each encoded provider
+  exchange remains bounded to 512 KiB or the smaller configured budget. Keep
+  complete redacted diffs and whole-target verification.
 
 - Require approved redacted code diffs for all Intent planning, including
   previews, exact messages, and history message rewrites. Intent setup includes
@@ -93,6 +87,16 @@
   commits, recovery preservation, active requests, and required user action.
 
 ### Fixed
+
+- Retain validated evidence reviews after a retry preview and when another
+  parallel review fails, so explicit retries do not repeat completed reviews.
+- Honor the finish attempt's saved deadline in provider exchanges. An explicit
+  longer budget no longer hits the provider's shorter configured timeout.
+- Report partial evidence-review progress without treating an unknown total as
+  complete. Size failures identify the reported bound instead of suggesting
+  that one setting can change every limit.
+- Preserve bounded, redacted OpenAI-compatible rejection messages so a failed
+  finish explains the provider error instead of hiding it behind HTTP status.
 
 - Explain remaining uncommitted files after finish, show the saved snapshot's
   time, and print repeated project-check results once. Read only relevant paths
@@ -158,8 +162,6 @@
   planning through the same bounded correction used for invalid goals.
 - Report ambiguous finish and history publication as requiring action while
   continuing to report healthy checkpoint protection separately.
-- Accept complete finish and history diff evidence up to 512 KiB and individual
-  path diffs up to 128 KiB. Keep serialized provider requests bounded to 512 KiB.
 - Require Go 1.26.9 or later for the standard-library security fixes.
 - Exclude compiler index caches under `-Xcc/` from capture and watching.
 - Honor checkpoint deadlines and retain project command output, exit status, and
