@@ -45,7 +45,7 @@ type OpenAIProvider struct {
 func (*OpenAIProvider) Name() string { return "openai-compat" }
 
 func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte, error) {
-	data, err := json.Marshal(request)
+	data, err := json.Marshal(finishWireRequest(request))
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +56,10 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 			Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"observations"},
 				"properties": map[string]any{"observations": map[string]any{"type": "array", "items": map[string]any{
 					"type": "object", "additionalProperties": false, "required": []string{"id", "summary"},
-					"properties": map[string]any{"id": map[string]any{"type": "string"}, "summary": map[string]any{"type": "string", "maxLength": finishReviewSummaryRunes}},
+					"properties": map[string]any{"id": map[string]any{"type": "string"}, "summary": map[string]any{
+						"type": "string", "pattern": fmt.Sprintf(`^[\s\S]{1,%d}$`, finishReviewSummaryRunes),
+						"description": "One short factual sentence; aim for 160 characters, never exceed 256.",
+					}},
 				}}}},
 		})
 	}
@@ -250,6 +253,7 @@ type openAIMessage struct {
 type openAIFunctionDeclaration struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
+	Strict      bool           `json:"strict"`
 	Parameters  map[string]any `json:"parameters"`
 }
 
@@ -297,6 +301,7 @@ func marshalOpenAIToolRequest(opts openAIToolRequestOptions) ([]byte, error) {
 			Function: openAIFunctionDeclaration{
 				Name:        opts.ToolName,
 				Description: opts.ToolDescription,
+				Strict:      true,
 				Parameters:  opts.Parameters,
 			},
 		}},

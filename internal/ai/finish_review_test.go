@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +22,115 @@ func finishTestReview(request FinishPlanRequest) []byte {
 	}
 	body, _ := json.Marshal(map[string]any{"observations": observations})
 	return body
+}
+
+func TestFinishPlanningDeadlineIdentifiesEveryExchangePhase(t *testing.T) {
+	for _, phase := range []string{"review", "review correction", "global plan", "provider timeout"} {
+		t.Run(phase, func(t *testing.T) {
+			evidence := finishTestEvidence()
+			options := finishTestOptions(evidence)
+			options.MaxInputBytes = 128 << 10
+			options.Diffs[0].Text = strings.Repeat("+ authored settings\n", 3000)
+			options.Deadline = time.Now().Add(2 * time.Second)
+			if phase == "provider timeout" {
+				options.Deadline = time.Now().Add(time.Minute)
+			}
+			provider := &finishFakeTransport{padding: 90 << 10, exchange: func(ctx context.Context, request FinishPlanRequest) ([]byte, error) {
+				if phase == "provider timeout" {
+					return nil, context.DeadlineExceeded
+				}
+				if phase == "review correction" && request.Correction == nil {
+					return []byte(`{"observations":[]}`), nil
+				}
+				if phase == "global plan" && request.Review != nil {
+					return finishTestReview(request), nil
+				}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}}
+			result, err := PlanFinish(t.Context(), provider, evidence, options)
+			code := "provider_deadline"
+			if phase == "provider timeout" {
+				code = "provider_failure"
+			}
+			finishAssertError(t, err, code)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatal("deadline cause was lost", err)
+			}
+			if phase == "global plan" {
+				if result.Calls != 1 || len(result.Disclosure.EvidenceReviews) == 0 {
+					t.Fatal("completed reviews or global call count lost")
+				}
+			} else if result.Calls != 0 {
+				t.Fatal("failed evidence review reached global planning")
+			}
+		})
+	}
+}
+
+func TestFinishPlansTwoThousandIndependentGoals(t *testing.T) {
+	const count = 2000
+	evidence := finish.Evidence{Base: finish.Tree{}, Target: finish.Tree{}}
+	for i := 0; i < count; i++ {
+		evidence.Target[fmt.Sprintf("feature-%04d.txt", i)] = finishTestEntry("b")
+	}
+	evidence.Changes = finish.NetChanges(evidence.Base, evidence.Target, "author-a")
+	options := finishTestOptions(evidence)
+	options.Deadline = time.Now().Add(4 * time.Minute)
+	var reviews, plans atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var wire openAIToolRequest
+		if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+			t.Error(err)
+			return
+		}
+		var request FinishPlanRequest
+		if err := json.Unmarshal([]byte(wire.Messages[1].Content), &request); err != nil {
+			t.Error(err)
+			return
+		}
+		var arguments []byte
+		if request.Review != nil {
+			reviews.Add(1)
+			if r.ContentLength > FinishContextByteCap || len(request.Review.Parts) > 32 {
+				t.Error("scale bypassed bounded evidence reviews")
+			}
+			arguments = finishTestReview(request)
+		} else {
+			plans.Add(1)
+			if r.ContentLength > FinishPlanningByteCap {
+				t.Error("global catalogue exceeded its context budget")
+			}
+			if len(request.Changes) != count || len(request.Reviews) != count {
+				t.Error("global plan lost whole-batch context")
+			}
+			for _, observation := range request.Reviews {
+				if observation.Digest != "" {
+					t.Error("local cache digests wasted global planning context")
+				}
+			}
+			var goals []finish.Goal
+			for _, change := range request.Changes {
+				goals = append(goals, finish.Goal{Purpose: "Add independent feature " + change.ID, Boundary: "Review this independent feature separately", Message: "Add independent feature\n\n- Enable this feature without coupling it to other features.", ChangeIDs: []string{change.ID}})
+			}
+			arguments = finishTestOutput(goals...)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": wire.ToolChoice.Function.Name, "arguments": string(arguments)}}}}}}})
+	}))
+	defer server.Close()
+	provider := &OpenAIProvider{BaseURL: server.URL, APIKey: "fixture-key", HTTP: server.Client()}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Plan.Steps) != count || reviews.Load() <= 32 || plans.Load() != 1 || len(result.Disclosure.EvidenceReviews) != count {
+		t.Fatalf("large semantic plan incomplete: steps=%d reviews=%d plans=%d", len(result.Plan.Steps), reviews.Load(), plans.Load())
+	}
+	for _, observation := range result.Disclosure.EvidenceReviews {
+		if len(observation.Digest) != 64 {
+			t.Fatal("wire compaction lost durable review proof")
+		}
+	}
 }
 
 func TestFinishLargeEvidenceReviewedBeforeGlobalPlan(t *testing.T) {
@@ -128,7 +239,7 @@ func TestFinishDiffPartsPreserveLongUnicodeLines(t *testing.T) {
 func TestFinishReviewLimitRejectedBeforeProviderCalls(t *testing.T) {
 	evidence := finishTestEvidence()
 	options := finishTestOptions(evidence)
-	options.Diffs[0].Text = strings.Repeat("x", (33<<16)+1)
+	options.Diffs[0].Text = strings.Repeat("x", (finish.EvidenceReviewCallLimit+1)*((FinishContextByteCap-(4<<10))/8))
 	provider := &finishFakeTransport{padding: 440 << 10, exchange: func(context.Context, FinishPlanRequest) ([]byte, error) {
 		t.Fatal("exhausted review budget reached provider")
 		return nil, nil

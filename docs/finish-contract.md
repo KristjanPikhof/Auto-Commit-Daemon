@@ -147,7 +147,7 @@ The final candidate tree must equal the entire frozen target exactly, including
 unchanged entries, file modes, deletions, renames, symlinks, and binary objects.
 Coverage and equality are structural evidence, not proof that project tests ran.
 
-One Intent attempt allows at most 32 evidence-review calls, one global planning
+One Intent attempt allows at most 128 evidence-review calls, one global planning
 call, and at most one global correction within one persisted `ai.timeout`
 deadline (default five minutes, overridden per attempt by `--timeout` from
 1 second through 1 hour). Reconnection never extends it. At most four immutable evidence exchanges run concurrently; the worker reserves
@@ -156,7 +156,7 @@ complete redacted diff is covered by exact UTF-8 fragments; every fragment must
 have exactly one bounded observation with a locally recorded content digest.
 Each review contains at most 32 fragments. An invalid review gets at most one correction, using the same complete evidence
 and bounded validation feedback. Accepted reviews are not repeated, and correction
-calls consume the same 32-call budget and deadline. Transport and protocol failures do not
+calls consume the same 128-call budget and deadline. Transport and protocol failures do not
 trigger a correction. Validated reviews are checkpointed durably with a fingerprint of the frozen
 evidence, provider configuration, encoded input, and review instructions. Explicit
 retry reuses only matching, revalidated fragments and creates a fresh global
@@ -189,8 +189,9 @@ finish also needs supplied context or an exact message;
 offline, and history selection remains independent of finish checkpoints.
 
 `ai.max_input_bytes` bounds aggregate complete textual evidence. Each encoded
-provider exchange, including correction feedback, also has a 512 KiB context
-bound or the smaller configured byte budget. It defaults to
+evidence review, including correction feedback, has a 512 KiB context bound.
+The global catalogue and its correction have a 2 MiB bound. Both use the smaller
+configured byte budget when applicable. That setting defaults to
 8 MiB and accepts 128 KiB through 64 MiB. Large files are reviewed in parts without a per-file rejection threshold.
 These bounds are separate from checkpoint storage; `capture.max_file_bytes`
 controls buffering and does not make large files ineligible for protection.

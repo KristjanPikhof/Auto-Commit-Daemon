@@ -69,7 +69,8 @@ checkpoint storage:
 | Input | Maximum |
 |---|---|
 | Complete textual diff evidence | `ai.max_input_bytes`, 8 MiB by default |
-| Each encoded review, global plan, or correction | 512 KiB, or the smaller configured budget |
+| Each encoded evidence review or its correction | 512 KiB, or the smaller configured budget |
+| Global plan or its correction | 2 MiB, or the smaller configured budget |
 
 There is no separate per-file rejection limit. Large files and batches are
 reviewed in bounded fragments before one global plan. Every complete redacted
@@ -79,9 +80,10 @@ not become a commit. Small requests keep the direct planning path.
 
 `ai.max_input_bytes` accepts 128 KiB through 64 MiB, in bytes, through
 `acd config` or `ACD_AI_MAX_INPUT_BYTES`. It bounds aggregate evidence, while
-individual encoded exchanges stay within the smaller of that setting and
-512 KiB. Oversized global metadata, exhausted review budgets, or unavailable
-complete evidence fail explicitly. ACD never clips diffs or omits changes to fit.
+individual reviews stay within 512 KiB and the global catalogue within 2 MiB,
+both limited further by that setting. Oversized global metadata, exhausted
+review budgets, or unavailable complete evidence fail explicitly. ACD never
+clips diffs or omits changes to fit.
 
 The byte budget is an ACD memory and request bound, not a model context limit.
 Providers can reject a request below it because their token or payload limit is
@@ -104,6 +106,12 @@ ACD rejects redirects, embedded URL credentials, query strings, fragments,
 control characters, and unsupported schemes. Each exchange performs one HTTP
 request with bounded response size and cancellation.
 
+Finish requests enable strict function schemas. Evidence summaries use a
+supported string pattern to enforce the 256-character limit and ask for short
+sentences to leave room below it. ACD still validates every reply, including
+replies from compatible endpoints that ignore schema enforcement. Invalid
+summaries are corrected within the existing budget; they are never truncated.
+
 ## Subprocess providers
 
 Subprocess providers are unsandboxed programs with worker privileges. Review
@@ -118,17 +126,21 @@ HTTP failures retain the provider's standard `error.message`, with credential
 redaction and bounded output. Nonstandard or unreadable responses report the
 HTTP status and a generic rejection; ACD never prints an arbitrary error body.
 
-Intent allows at most 32 bounded evidence reviews, one global planning exchange,
+Intent allows at most 128 bounded evidence reviews, one global planning exchange,
 and at most one combined correction under a single persisted deadline.
 Each review contains at most 32 fragments to bound response size and ID tracking.
 An invalid review may be corrected once with its complete original evidence
 and bounded validation feedback. Accepted reviews are retained. These corrections
-consume the same 32-call budget and deadline; transport and protocol failures are terminal.
+consume the same 128-call budget and deadline; transport and protocol failures are terminal.
 At most four evidence exchanges run concurrently; each is durably reserved
 before transmission, and cancellation joins all exchanges before closing the transport. `ai.timeout` defaults to five minutes; `acd finish --timeout 15m`
 sets a longer bounded planning window for a new attempt. Transport
 failure, missing credentials, invalid output, or deadline exhaustion fails the
 request. There is no automatic retry timer or Local fallback.
+
+An exhausted attempt reports `provider_deadline` and suggests an explicit retry
+with more time, up to one hour. The default remains five minutes. Retrying a
+saved request keeps its target; starting a new finish captures current work.
 
 Messages-only history planning follows the same rule. Invalid response framing,
 including an unsupported protocol version, requires correction or fails the

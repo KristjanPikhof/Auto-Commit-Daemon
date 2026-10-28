@@ -116,7 +116,7 @@ func (p *SubprocessProvider) EncodeFinishRequest(request FinishPlanRequest) ([]b
 		RequestType   string            `json:"request_type"`
 		SystemPrompt  string            `json:"system_prompt"`
 		FinishRequest FinishPlanRequest `json:"finish_request"`
-	}{Version: 1, RequestType: requestType, SystemPrompt: finishPrompt(request), FinishRequest: request})
+	}{Version: 1, RequestType: requestType, SystemPrompt: finishPrompt(request), FinishRequest: finishWireRequest(request)})
 }
 
 // ExchangeFinish deliberately bypasses capability negotiation and the legacy

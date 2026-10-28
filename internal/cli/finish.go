@@ -204,6 +204,11 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			next = "Approve code sharing with acd config, then start a new acd finish"
 		} else {
 			next = "acd finish --retry " + r.ID
+			if !detached && r.ReasonCode == "provider_deadline" {
+				budget := time.Duration((r.DeadlineTS - r.CreatedTS) * float64(time.Second))
+				budget = min(time.Hour, max(15*time.Minute, 2*budget)).Round(time.Second)
+				next += " --timeout " + budget.String()
+			}
 		}
 		if r.DryRun && r.State != state.FinishNeedsAttention && r.ReasonCode != "provider_diffs_required" && r.ReasonCode != "provider_input_too_large" {
 			next += " --dry-run"

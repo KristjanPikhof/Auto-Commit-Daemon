@@ -334,7 +334,7 @@ func TestFinishEvidenceBudgetSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	db, path := openTestDB(t)
 	r := startFinishFixture(t, db, finishFixture(t, db, 1))
-	for i := 1; i <= 32; i++ {
+	for i := 1; i <= finish.EvidenceReviewCallLimit; i++ {
 		if n, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); err != nil || n != i {
 			t.Fatalf("review reservation %d: %d %v", i, n, err)
 		}
@@ -351,7 +351,7 @@ func TestFinishEvidenceBudgetSurvivesRestart(t *testing.T) {
 	}
 	defer db.Close()
 	got, err := LoadFinishRequest(ctx, db, r.ID)
-	if err != nil || got.EvidenceCalls != 32 || got.PlanningCalls != 0 || got.Stage != "reviewing_evidence" || len(got.Plan) != 0 {
+	if err != nil || got.EvidenceCalls != finish.EvidenceReviewCallLimit || got.PlanningCalls != 0 || got.Stage != "reviewing_evidence" || len(got.Plan) != 0 {
 		t.Fatalf("durable review progress: %+v %v", got, err)
 	}
 	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
@@ -364,7 +364,7 @@ func TestFinishEvidenceBudgetSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	interrupted, _ := LoadFinishRequest(ctx, db, r.ID)
-	if interrupted.EvidenceCalls != 32 || interrupted.State != FinishFailed {
+	if interrupted.EvidenceCalls != finish.EvidenceReviewCallLimit || interrupted.State != FinishFailed {
 		t.Fatalf("restart discarded progress: %+v", interrupted)
 	}
 	retry, err := RetryFinishRequest(ctx, db, r.ID, nowSeconds()+300, false)

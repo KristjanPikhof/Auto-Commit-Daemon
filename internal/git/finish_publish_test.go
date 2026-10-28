@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
 func finishGitRun(t *testing.T, repo string, args ...string) string {
@@ -138,6 +140,79 @@ func TestFinishPublicationVerificationFailureIsPrivate(t *testing.T) {
 	}
 	if digest, _ := IndexContentDigest(context.Background(), repo); digest != opts.IndexDigest {
 		t.Fatal("live index changed")
+	}
+}
+
+func TestFinishPublishesTwoThousandCommitsInOneCAS(t *testing.T) {
+	const count = 2000
+	ctx := t.Context()
+	repo, opts := finishGitFixture(t, false)
+	versions := opts.Commits
+	opts.Commits = make([]FinishCommit, count)
+	for i := range opts.Commits {
+		opts.Commits[i] = versions[i%len(versions)]
+	}
+	later := filepath.Join(repo, "later.txt")
+	if err := os.WriteFile(later, []byte("Keep later work intact\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	verified := 0
+	opts.Verify = func(context.Context, int, string, string) error { verified++; return nil }
+	proof := buildFinishFixture(t, repo, opts)
+	if verified != count || len(proof.Commits) != count || finishGitRun(t, repo, "rev-parse", "HEAD") != opts.ExpectedHead {
+		t.Fatal("large private chain was incomplete or published early")
+	}
+	before := finishGitRun(t, repo, "reflog", "show", "--format=%H", opts.BranchRef)
+	result, err := ApplyFinishPublication(ctx, repo, proof, false, nil)
+	if err != nil || !result.Published {
+		t.Fatalf("large publication: %+v %v", result, err)
+	}
+	if got := finishGitRun(t, repo, "rev-list", "--count", opts.ExpectedHead+"..HEAD"); got != "2000" {
+		t.Fatalf("large publication created %s commits", got)
+	}
+	if got := finishGitRun(t, repo, "rev-parse", "HEAD^{tree}"); got != opts.TargetTree {
+		t.Fatal("large publication missed its exact target")
+	}
+	after := strings.Split(finishGitRun(t, repo, "reflog", "show", "--format=%H", opts.BranchRef), "\n")
+	if strings.Join(after[1:], "\n") != before {
+		t.Fatal("large chain needed more than one branch update")
+	}
+	if body, err := os.ReadFile(later); err != nil || string(body) != "Keep later work intact\n" {
+		t.Fatal("large publication changed later work", err)
+	}
+}
+
+func TestFinishCommitBatchRejectsChangedProof(t *testing.T) {
+	repo, opts := finishGitFixture(t, false)
+	proof := buildFinishFixture(t, repo, opts)
+	if err := verifyFinishCommits(t.Context(), repo, proof.Commits); err != nil {
+		t.Fatal(err)
+	}
+	root := state.FinishPublicationCommit{OID: opts.ExpectedHead, TreeOID: finishGitRun(t, repo, "rev-parse", opts.ExpectedHead+"^{tree}")}
+	if err := verifyFinishCommits(t.Context(), repo, []state.FinishPublicationCommit{root}); err != nil {
+		t.Fatal("root commit did not retain its empty parent", err)
+	}
+	for _, kind := range []string{"tree", "parent", "missing", "noncommit", "invalid", "duplicate"} {
+		t.Run(kind, func(t *testing.T) {
+			commits := append([]state.FinishPublicationCommit(nil), proof.Commits...)
+			switch kind {
+			case "tree":
+				commits[0].TreeOID = opts.TargetTree
+			case "parent":
+				commits[0].ParentOID = ""
+			case "missing":
+				commits[0].OID = strings.Repeat("a", 40)
+			case "noncommit":
+				commits[0].OID = opts.TargetTree
+			case "invalid":
+				commits[0].OID = "--all"
+			case "duplicate":
+				commits = append(commits, commits[0])
+			}
+			if err := verifyFinishCommits(t.Context(), repo, commits); err == nil {
+				t.Fatal("changed proof passed bounded commit verification")
+			}
+		})
 	}
 }
 

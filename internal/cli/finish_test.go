@@ -372,6 +372,23 @@ func TestFinishCLIUnavailableOutputAndExit(t *testing.T) {
 	}
 }
 
+func TestFinishCLIDeadlineSuggestsLongerExplicitRetry(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	for _, budget := range []time.Duration{5 * time.Minute, 20 * time.Minute, time.Hour} {
+		for _, jsonOut := range []bool{false, true} {
+			r := state.FinishRequest{ID: "finish-timeout", State: state.FinishFailed, ReasonCode: "provider_deadline", Reason: "context deadline exceeded", CreatedTS: 100, DeadlineTS: 100 + budget.Seconds()}
+			var out bytes.Buffer
+			if err := renderFinish(&out, lookup, r, jsonOut, ""); ExitCode(err) != ExitUnavailable {
+				t.Fatal(err)
+			}
+			want := "acd finish --retry finish-timeout --timeout " + min(time.Hour, max(15*time.Minute, 2*budget)).String()
+			if !strings.Contains(out.String(), want) {
+				t.Fatalf("deadline retry did not increase the bounded budget: %s", out.String())
+			}
+		}
+	}
+}
+
 func TestFinishCLIInputLimitNeedsNewRequest(t *testing.T) {
 	lookup, _, _ := finishCLIFixture(t)
 	wantGuidance := "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"

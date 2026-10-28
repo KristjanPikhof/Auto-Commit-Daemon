@@ -2,7 +2,7 @@ package finish
 
 // EvidenceReviewCallLimit bounds one explicit attempt independently of its
 // single global plan and optional correction. It never authorizes retries.
-const EvidenceReviewCallLimit = 32
+const EvidenceReviewCallLimit = 128
 
 // ReviewObservation retains the exact redacted fragment behind a factual review.
 type ReviewObservation struct {
@@ -10,7 +10,7 @@ type ReviewObservation struct {
 	ChangeID string `json:"change_id"`
 	Part     int    `json:"part"`
 	Parts    int    `json:"parts"`
-	Digest   string `json:"digest"`
+	Digest   string `json:"digest,omitempty"`
 	Summary  string `json:"summary"`
 }
 

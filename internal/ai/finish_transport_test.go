@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,42 @@ import (
 )
 
 const finishPluginReply = `{"version":1,"finish_plan":{"goals":[{"purpose":"Confirm provider connection","message":"Confirm provider connection","change_ids":["probe"]}]}}`
+
+func TestFinishOpenAIRequestsStrictSchemas(t *testing.T) {
+	provider := &OpenAIProvider{}
+	for _, review := range []bool{false, true} {
+		request := FinishPlanRequest{Style: "imperative"}
+		if review {
+			request.Review = &FinishReviewTask{Parts: []FinishReviewPart{{ID: "part-90", Text: "+ recorded change\n"}}}
+		}
+		body, err := provider.EncodeFinishRequest(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire openAIToolRequest
+		if err := json.Unmarshal(body, &wire); err != nil {
+			t.Fatal(err)
+		}
+		if len(wire.Tools) != 1 || !wire.Tools[0].Function.Strict {
+			t.Fatal("finish schema was only a best-effort hint")
+		}
+		if !review {
+			continue
+		}
+		properties := wire.Tools[0].Function.Parameters["properties"].(map[string]any)
+		observations := properties["observations"].(map[string]any)
+		item := observations["items"].(map[string]any)
+		summary := item["properties"].(map[string]any)["summary"].(map[string]any)
+		pattern := regexp.MustCompile(summary["pattern"].(string))
+		for _, length := range []int{256, 257, 260} {
+			for _, character := range []string{"a", "界", "\n"} {
+				if pattern.MatchString(strings.Repeat(character, length)) != (length <= 256) {
+					t.Fatalf("schema did not enforce the summary bound: length=%d character=%q", length, character)
+				}
+			}
+		}
+	}
+}
 
 func TestFinishRemovalSubprocessCloseKillsDescendants(t *testing.T) {
 	skipIfWindows(t)

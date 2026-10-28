@@ -81,7 +81,7 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		if err != nil {
 			return nil, result, err
 		}
-		if limit := min(inputLimit, FinishContextByteCap); len(body) > limit {
+		if limit := min(inputLimit, FinishPlanningByteCap); len(body) > limit {
 			return nil, result, finishContextLimit(len(body), limit)
 		}
 		if err := ctx.Err(); err != nil {
@@ -98,15 +98,15 @@ func PlanHistoryMessages(ctx context.Context, transport FinishTransport, evidenc
 		result.Calls++
 		result.Disclosure.RequestBytes = append(result.Disclosure.RequestBytes, len(body))
 		raw, exchangeErr := transport.ExchangeFinish(ctx, body)
+		if err := ctx.Err(); err != nil {
+			return nil, result, finishDeadlineFailure(err, exchangeErr)
+		}
 		var outputError *finishOutputError
 		if exchangeErr != nil && !errors.As(exchangeErr, &outputError) {
 			return nil, result, finishFailure("provider_failure", exchangeErr)
 		}
 		if outputError != nil {
 			raw = outputError.Raw
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, result, finishFailure("provider_deadline", err)
 		}
 		var goals []finish.Goal
 		validationErr := exchangeErr

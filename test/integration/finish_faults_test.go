@@ -111,8 +111,9 @@ func finishIntentFixtureWithSettings(t *testing.T, handler http.HandlerFunc, tim
 }
 
 type finishCommandResult struct {
-	OK   bool `json:"ok"`
-	Data struct {
+	OK         bool   `json:"ok"`
+	NextAction string `json:"next_action"`
+	Data       struct {
 		state.FinishRequest
 		Published      bool   `json:"published"`
 		NoChanges      bool   `json:"no_changes"`
@@ -272,6 +273,9 @@ func TestFinishFaultProviderFailureRetryKeepsFrozenTarget(t *testing.T) {
 			wantCalls := int32(2)
 			if kind == "timeout" {
 				wantCalls = 1
+				if failed.Data.ReasonCode != "provider_deadline" || !strings.Contains(failed.NextAction, "--timeout 15m0s") {
+					t.Fatalf("planning deadline lost its cause or longer retry: %+v", failed)
+				}
 			}
 			if failed.OK || failed.Data.State != state.FinishFailed || calls.Load() != wantCalls || failed.Data.Published {
 				t.Fatalf("failure %+v calls=%d", failed, calls.Load())

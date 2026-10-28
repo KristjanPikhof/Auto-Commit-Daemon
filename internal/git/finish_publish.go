@@ -14,6 +14,7 @@ import (
 )
 
 const FinishRefPrefix = "refs/acd/finish/"
+const finishCommitBatchSize = 256
 
 var (
 	ErrFinishUnsafe = errors.New("git: finish publication ownership or Git state changed")
@@ -188,13 +189,24 @@ func BuildFinishChain(ctx context.Context, repo string, opts FinishBuildOptions)
 		return proof, err
 	}
 	proof = FinishPublicationProof{Version: state.FinishPublicationVersion, RequestID: opts.RequestID, Attempt: opts.Attempt, WorktreeID: opts.WorktreeID, GitDir: worktree.GitDir, BranchRef: opts.BranchRef, ExpectedHead: opts.ExpectedHead, TargetTree: opts.TargetTree, IndexDigest: opts.IndexDigest, IncludeStaged: opts.IncludeStaged, ObjectRef: opts.ObjectRef}
+	trees := make([]string, len(opts.Commits))
+	for i, candidate := range opts.Commits {
+		trees[i] = candidate.TreeOID
+	}
+	types, err := ObjectTypes(ctx, repo, trees)
+	if err != nil {
+		return proof, err
+	}
+	for _, tree := range trees {
+		if types[tree] != "tree" {
+			return proof, ErrFinishUnsafe
+		}
+	}
 	parent := opts.ExpectedHead
+	verified := 0
 	for index, candidate := range opts.Commits {
 		if strings.TrimSpace(candidate.Message) == "" || strings.ContainsRune(candidate.Message, 0) {
 			return proof, errors.New("git: invalid finish commit message")
-		}
-		if err := verifyObjectType(ctx, repo, candidate.TreeOID, "tree"); err != nil {
-			return proof, err
 		}
 		env := map[string]string{}
 		if candidate.AuthorName != "" || candidate.AuthorEmail != "" {
@@ -216,16 +228,22 @@ func BuildFinishChain(ctx context.Context, repo string, opts FinishBuildOptions)
 			return proof, err
 		}
 		oid := strings.TrimSpace(string(out))
-		if err := verifyFinishCommit(ctx, repo, state.FinishPublicationCommit{OID: oid, ParentOID: parent, TreeOID: candidate.TreeOID}); err != nil {
-			return proof, err
-		}
-		if opts.Verify != nil {
-			if err := opts.Verify(ctx, index, oid, candidate.TreeOID); err != nil {
-				return proof, err
-			}
-		}
 		proof.Commits = append(proof.Commits, state.FinishPublicationCommit{OID: oid, ParentOID: parent, TreeOID: candidate.TreeOID})
 		parent = oid
+		if len(proof.Commits)-verified == finishCommitBatchSize || index == len(opts.Commits)-1 {
+			if err := verifyFinishCommits(ctx, repo, proof.Commits[verified:]); err != nil {
+				return proof, err
+			}
+			for i := verified; i < len(proof.Commits); i++ {
+				commit := proof.Commits[i]
+				if opts.Verify != nil {
+					if err := opts.Verify(ctx, i, commit.OID, commit.TreeOID); err != nil {
+						return proof, err
+					}
+				}
+			}
+			verified = len(proof.Commits)
+		}
 	}
 	proof.NewHead = parent
 	proof.ObjectOID = parent
@@ -278,6 +296,38 @@ func verifyFinishCommit(ctx context.Context, repo string, commit state.FinishPub
 		}
 	} else if len(parents) != 1 || parents[0] != commit.ParentOID {
 		return ErrFinishUnsafe
+	}
+	return nil
+}
+
+// Recheck immutable commit trees and parents in bounded reads rather than
+// starting two Git processes per commit each time a large proof is inspected.
+func verifyFinishCommits(ctx context.Context, repo string, commits []state.FinishPublicationCommit) error {
+	for start := 0; start < len(commits); start += finishCommitBatchSize {
+		batch := commits[start:min(start+finishCommitBatchSize, len(commits))]
+		oids := make([]string, len(batch))
+		for i, commit := range batch {
+			if !exactObjectID(commit.OID) {
+				return ErrFinishUnsafe
+			}
+			oids[i] = commit.OID
+		}
+		out, err := RunWithLimit(ctx, RunOpts{Dir: repo, Stdin: strings.NewReader(strings.Join(oids, "\n") + "\n")},
+			int64(len(batch)*256), "log", "--no-walk=unsorted", "--no-show-signature", "--no-notes", "--format=%H%x00%T%x00%P", "--stdin")
+		if err != nil {
+			return err
+		}
+		lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+		if len(lines) != len(batch) {
+			return ErrFinishUnsafe
+		}
+		for i, line := range lines {
+			fields := strings.Split(line, "\x00")
+			commit := batch[i]
+			if len(fields) != 3 || fields[0] != commit.OID || fields[1] != commit.TreeOID || fields[2] != commit.ParentOID {
+				return ErrFinishUnsafe
+			}
+		}
 	}
 	return nil
 }
@@ -630,12 +680,7 @@ func verifyFinishProof(ctx context.Context, repo string, p FinishPublicationProo
 	if pin != p.ObjectOID {
 		return ErrFinishUnsafe
 	}
-	for _, commit := range p.Commits {
-		if err := verifyFinishCommit(ctx, repo, commit); err != nil {
-			return err
-		}
-	}
-	return nil
+	return verifyFinishCommits(ctx, repo, p.Commits)
 }
 
 // WithPreservedFinishPublication proves the saved chain remains pinned while
@@ -647,10 +692,8 @@ func WithPreservedFinishPublication(ctx context.Context, repo string, p FinishPu
 	}
 	// The original branch may have moved or disappeared. Only private chain
 	// evidence is needed to preserve the request, never to publish it.
-	for _, commit := range p.Commits {
-		if err := verifyFinishCommit(ctx, repo, commit); err != nil {
-			return err
-		}
+	if err := verifyFinishCommits(ctx, repo, p.Commits); err != nil {
+		return err
 	}
 	return WithLockedPrivateRef(ctx, repo, p.ObjectRef, p.ObjectOID, fn)
 }

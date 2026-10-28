@@ -157,8 +157,9 @@ buffering. Larger regular files stream into Git objects; the setting does not
 silently exclude them. Git-ignored and sensitive paths remain excluded.
 
 `ai.max_input_bytes` (`ACD_AI_MAX_INPUT_BYTES`) defaults to 8 MiB. It bounds
-aggregate complete textual diff evidence. Each review, global plan, and
-correction exchange also stays within 512 KiB, or the smaller configured budget.
+aggregate complete textual diff evidence. Each review and its correction stay
+within 512 KiB; the global plan and its correction stay within 2 MiB. The
+configured budget can lower either bound.
 Large batches review every diff in fragments before one global plan. There is
 no separate per-file rejection cap. Supported
 values range from 131072 (128 KiB) to 67108864 (64 MiB). For example, to allow

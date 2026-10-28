@@ -127,6 +127,13 @@ func (e *FinishPlanningError) Retryable() bool {
 
 func finishFailure(code string, err error) error { return &FinishPlanningError{Code: code, Err: err} }
 
+func finishDeadlineFailure(deadlineErr, exchangeErr error) error {
+	if !errors.Is(exchangeErr, deadlineErr) {
+		exchangeErr = errors.Join(deadlineErr, exchangeErr)
+	}
+	return finishFailure("provider_deadline", exchangeErr)
+}
+
 func finishInputLimit(size, limit int) error {
 	return finishFailure("provider_input_too_large", fmt.Errorf("evidence is %d bytes; limit is %d bytes; increase ai.max_input_bytes in acd config and start a new finish if your provider supports larger input; otherwise use an explicit local finish for the complete offline batch, or a smaller explicit history range", size, limit))
 }
@@ -218,7 +225,7 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		if err != nil {
 			return result, finishFailure("provider_input", err)
 		}
-		if limit := min(inputLimit, FinishContextByteCap); len(body) > limit {
+		if limit := min(inputLimit, FinishPlanningByteCap); len(body) > limit {
 			return result, finishContextLimit(len(body), limit)
 		}
 		if err := ctx.Err(); err != nil {
@@ -235,6 +242,9 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		result.Calls++
 		result.Disclosure.RequestBytes = append(result.Disclosure.RequestBytes, len(body))
 		raw, exchangeErr := transport.ExchangeFinish(ctx, body)
+		if err := ctx.Err(); err != nil {
+			return result, finishDeadlineFailure(err, exchangeErr)
+		}
 		var invalidOutput *finishOutputError
 		if exchangeErr != nil && !errors.As(exchangeErr, &invalidOutput) {
 			return result, finishFailure("provider_failure", exchangeErr)
@@ -244,9 +254,6 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		}
 		if len(raw) > subprocessResponseByteCap {
 			return result, finishFailure("provider_response_too_large", errors.New("provider response exceeds 1 MiB"))
-		}
-		if err := ctx.Err(); err != nil {
-			return result, finishFailure("provider_deadline", err)
 		}
 		var plan finish.Plan
 		validationErr := exchangeErr

@@ -70,7 +70,7 @@ binary objects, deletions, and unchanged entries.
 
 Small requests use one planning exchange and at most one combined correction.
 Large requests first review the complete redacted evidence in bounded batches,
-then make one global plan across all recorded changes. At most 32 evidence
+then make one global plan across all recorded changes. At most 128 evidence
 reviews are allowed, with at most four immutable provider exchanges at once.
 The worker reserves each call before releasing its operation gate and continues
 protecting later edits while reviews run. All calls share one persisted deadline, using `ai.timeout` (five minutes by
@@ -79,17 +79,24 @@ are part of the same plan; they do not get a separate retry loop. Correction
 feedback includes all detected message and membership conflicts together.
 
 The request contains bounded metadata, redacted supplied context, and approved
-text diffs. Each encoded exchange is bounded to 512 KiB, or the smaller
-`ai.max_input_bytes` setting. A large file is divided into UTF-8 fragments without
+text diffs. Each encoded review is bounded to 512 KiB. The global catalogue
+and its correction can use up to 2 MiB; `ai.max_input_bytes` can lower either
+limit. A large file is divided into UTF-8 fragments without
 losing bytes. Every fragment gets a bounded factual observation before planning;
 ACD validates complete fragment coverage and records content digests, summaries,
 review-call counts, and attempted request sizes. Each review contains at most 32 fragments so its output stays manageable.
 A malformed or overlong review can be corrected once within the same call
 budget and deadline. ACD reserves context space for the feedback and retains
 accepted reviews. Provider transport and protocol failures still end the attempt.
-The final planner receives all
-original change identities and these observations together. Fragments, files,
-and review calls do not prescribe commit boundaries. Raw aggregate evidence
+OpenAI-compatible requests enable strict schemas with a summary length pattern.
+Summaries aim below the 256-character limit; ACD also checks the complete reply
+locally and never cuts a summary to make it pass.
+The global planner receives all original change identities and observations
+together, without local cache digests. Its larger catalogue and review allowance support thousands
+of meaningful goals without enlarging raw-diff review calls. Commit counts come
+from useful boundaries, not review batches. Provider context limits and the
+attempt deadline still apply; a large batch may need an explicit longer timeout.
+Fragments, files, and review calls do not prescribe commit boundaries. Raw aggregate evidence
 still obeys `ai.max_input_bytes`; metadata or a global plan that cannot fit fails
 instead of clipping evidence. Binary content is represented by metadata and
 verified Git objects. See [providers and privacy](ai-providers.md).
@@ -149,6 +156,10 @@ acd finish --retry REQUEST_ID --timeout 15m
 keeps its existing deadline. Progress reports reviewed and reused fragments,
 review calls, and time remaining. Call budgets apply to new exchanges in each
 explicit attempt; reused reviews consume no calls.
+
+When an attempt exhausts its planning time, finish reports `provider_deadline`
+and suggests a longer bounded retry. Other provider failures keep their own
+cause. The suggested command is optional and starts no background work.
 
 Retry keeps the original target and consent. Corrected credentials may be used
 for the same approved provider; later file edits remain outside it. If the

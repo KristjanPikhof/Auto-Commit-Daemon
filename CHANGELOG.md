@@ -18,6 +18,17 @@
 
 ### Changed
 
+- Enforce strict function schemas for OpenAI-compatible finish requests, using
+  a supported summary length pattern and shorter evidence-review guidance.
+  Keep local validation and complete summaries. Report exhausted planning time
+  as `provider_deadline` and suggest a longer explicit retry of the saved target.
+- Allow up to 128 bounded evidence-review calls and a 2 MiB global catalogue for
+  large Intent finishes. Keep raw-diff reviews at 512 KiB, omit local cache
+  digests from provider context, and retain complete local review proof.
+- Recheck saved publication chains in bounded Git batches so thousands of
+  commits do not require thousands of extra process launches during publication
+  or preservation. Keep exact tree and parent verification.
+
 - Require Go 1.27.3 or later for source builds and use Go 1.27.3 in CI and
   releases, fixing the certificate verification vulnerability GO-2026-6809.
 - Update `golang.org/x/sys` to v0.49.0 and `modernc.org/sqlite` to v1.61.0,
@@ -33,7 +44,7 @@
   extends an active deadline.
 
 - Correct an invalid evidence review once without repeating accepted reviews.
-  Cap each review at 32 fragments. Keep the existing 32-call budget and deadline,
+  Cap each review at 32 fragments. Keep the bounded call budget and deadline,
   reserve context room for bounded feedback, and identify the exact fragment
   and summary constraint on failure.
   Run at most four immutable reviews concurrently to keep smaller observation
@@ -41,7 +52,7 @@
 
 - Review large Intent batches in bounded evidence calls before one global commit
   plan. Preserve every diff byte, recorded identity, and whole-target verification;
-  fragments never prescribe commits. Reserve up to 32 reviews durably under the
+  fragments never prescribe commits. Reserve review calls durably under the
   same deadline as one global plan and at most one global correction. Retain
   review provenance and report review counts separately. Small finishes keep
   their direct planning path. Reuse blob metadata within a finish so repeated
@@ -50,7 +61,7 @@
 - Remove the separate 128 KiB per-file diff limit. Bound complete textual
   evidence for finish and history planning with `ai.max_input_bytes`, defaulting
   to 8 MiB and configurable from 128 KiB through 64 MiB. Each encoded provider
-  exchange remains bounded to 512 KiB or the smaller configured budget. Keep
+  exchange remains bounded by its context and configured input limits. Keep
   complete redacted diffs and whole-target verification.
 
 - Require approved redacted code diffs for all Intent planning, including
