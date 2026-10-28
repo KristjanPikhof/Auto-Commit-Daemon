@@ -18,8 +18,12 @@
 
 ### Changed
 
+- Allow finish evidence summaries up to 4,096 characters per fragment. Keep
+  behavior and dependency details for the global planner without forcing a
+  one-sentence summary. Combined provider request limits still apply.
+
 - Enforce strict function schemas for OpenAI-compatible finish requests, using
-  a supported summary length pattern and shorter evidence-review guidance.
+  a supported summary length pattern and bounded evidence-review guidance.
   Keep local validation and complete summaries. Report exhausted planning time
   as `provider_deadline` and suggest a longer explicit retry of the saved target.
 - Allow up to 128 bounded evidence-review calls and a 2 MiB global catalogue for

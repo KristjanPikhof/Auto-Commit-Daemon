@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,13 +47,10 @@ func TestFinishOpenAIRequestsStrictSchemas(t *testing.T) {
 		observations := properties["observations"].(map[string]any)
 		item := observations["items"].(map[string]any)
 		summary := item["properties"].(map[string]any)["summary"].(map[string]any)
-		pattern := regexp.MustCompile(summary["pattern"].(string))
-		for _, length := range []int{256, 257, 260} {
-			for _, character := range []string{"a", "界", "\n"} {
-				if pattern.MatchString(strings.Repeat(character, length)) != (length <= 256) {
-					t.Fatalf("schema did not enforce the summary bound: length=%d character=%q", length, character)
-				}
-			}
+		// JSON Schema uses ECMA-262 regexes. Go's regexp rejects bounds over
+		// 1,000, so verify the wire constraint without substituting engines.
+		if summary["pattern"] != `^[\s\S]{1,4096}$` {
+			t.Fatalf("schema did not enforce the summary bound: %v", summary)
 		}
 	}
 }

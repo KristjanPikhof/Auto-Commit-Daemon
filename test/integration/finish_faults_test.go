@@ -533,6 +533,7 @@ func TestFinishFaultRunningRequestRestartRequiresFrozenRetry(t *testing.T) {
 func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 	var reviews, plans, corrections atomic.Int32
 	var f *finishFixture
+	richSummary := strings.Repeat("Preserve the complete recorded library and its consumer. ", 20)
 	large := "first recorded line\n" + strings.Repeat("complete library entry\n", 70000) + "last recorded line\n"
 	f = finishIntentFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.ContentLength > ai.FinishContextByteCap {
@@ -549,14 +550,14 @@ func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 			}
 			var observations []map[string]string
 			for _, part := range request.Plan.Review.Parts {
-				observations = append(observations, map[string]string{"id": part.ID, "summary": "Preserve the complete recorded library and its consumer."})
+				observations = append(observations, map[string]string{"id": part.ID, "summary": richSummary})
 			}
 			if first {
-				observations[0]["summary"] = strings.Repeat("overlong factual summary ", 20)
+				observations[0]["summary"] = strings.Repeat("overlong factual summary ", 200)
 			}
 			if request.Plan.Correction != nil {
 				corrections.Add(1)
-				if !strings.Contains(request.Plan.Correction.ValidationError, "maximum is 256") {
+				if !strings.Contains(request.Plan.Correction.ValidationError, "maximum is 4096") {
 					t.Error("review correction omitted specific feedback")
 				}
 			}
@@ -567,6 +568,11 @@ func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 		plans.Add(1)
 		if len(request.Plan.Reviews) < 2 || len(request.Plan.Changes) != 2 {
 			t.Error("global plan lacks complete review context or membership")
+		}
+		for _, observation := range request.Plan.Reviews {
+			if observation.Summary != richSummary {
+				t.Error("global plan lost details from a rich review summary")
+			}
 		}
 		writeFile(t, filepath.Join(f.Repo, "library.txt"), "later edit stays outside this finish\n")
 		writeFinishChatResponse(t, w, request)

@@ -89,8 +89,10 @@ A malformed or overlong review can be corrected once within the same call
 budget and deadline. ACD reserves context space for the feedback and retains
 accepted reviews. Provider transport and protocol failures still end the attempt.
 OpenAI-compatible requests enable strict schemas with a summary length pattern.
-Summaries aim below the 256-character limit; ACD also checks the complete reply
-locally and never cuts a summary to make it pass.
+Each summary can use up to 4,096 characters for behavior, dependencies, and
+other details needed by the global planner. Short notes are enough for simple
+fragments. ACD checks the complete reply locally and never cuts a summary to
+make it pass. Combined requests still obey the configured context limits.
 The global planner receives all original change identities and observations
 together, without local cache digests. Its larger catalogue and review allowance support thousands
 of meaningful goals without enlarging raw-diff review calls. Commit counts come

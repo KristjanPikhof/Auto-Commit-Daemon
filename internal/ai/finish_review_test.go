@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
@@ -22,6 +23,65 @@ func finishTestReview(request FinishPlanRequest) []byte {
 	}
 	body, _ := json.Marshal(map[string]any{"observations": observations})
 	return body
+}
+
+func TestFinishReviewSummaryLimitCountsCharacters(t *testing.T) {
+	parts := []FinishReviewPart{{ID: "part-1", ChangeID: "settings.go", Part: 1, Parts: 1, Text: "+ preserve settings\n"}}
+	for _, length := range []int{257, 4096, 4097} {
+		prefix := "Preserve authored settings and their consumers. "
+		summary := prefix + strings.Repeat("界", length-utf8.RuneCountInString(prefix))
+		raw, _ := json.Marshal(map[string]any{"observations": []map[string]string{{"id": "part-1", "summary": summary}}})
+		observations, err := validateFinishReview(raw, parts)
+		if length > 4096 {
+			if err == nil || !strings.Contains(err.Error(), "maximum is 4096") {
+				t.Fatalf("overlong summary was not rejected: %v", err)
+			}
+		} else if err != nil || len(observations) != 1 || observations[0].Summary != summary {
+			t.Fatalf("%d-character summary was rejected or changed: %v", length, err)
+		}
+	}
+}
+
+func TestFinishReviewRetainsLongSummariesAcrossRetry(t *testing.T) {
+	evidence := finishTestEvidence()
+	options := finishTestOptions(evidence)
+	options.Diffs[0].Text = strings.Repeat("+ authored settings\n", 30000)
+	prefix := "Preserve authored settings and their consumers. "
+	summary := prefix + strings.Repeat("界", 4096-utf8.RuneCountInString(prefix))
+	var saved finish.ReviewProgress
+	options.SaveReviewProgress = func(_ context.Context, progress finish.ReviewProgress) error { saved = progress; return nil }
+	retry := false
+	provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+		if request.Review != nil {
+			if retry || request.Correction != nil {
+				t.Fatal("valid long summaries were reviewed again")
+			}
+			var observations []map[string]string
+			for _, part := range request.Review.Parts {
+				observations = append(observations, map[string]string{"id": part.ID, "summary": summary})
+			}
+			return json.Marshal(map[string]any{"observations": observations})
+		}
+		if len(request.Reviews) < 2 {
+			t.Fatal("global plan lost reviewed evidence")
+		}
+		for _, observation := range request.Reviews {
+			if observation.Summary != summary {
+				t.Fatal("global plan lost details from a long summary")
+			}
+		}
+		return finishTestOutput(finishTestGoal(evidence)), nil
+	}}
+	first, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || first.Calls != 1 || first.Disclosure.EvidenceCalls == 0 || len(saved.Observations) == 0 {
+		t.Fatalf("long review did not reach planning: calls=%d %v", first.Calls, err)
+	}
+	retry = true
+	options.ReviewProgress = saved
+	second, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || second.Calls != 1 || second.Disclosure.EvidenceCalls != 0 || second.Disclosure.ReusedFragments != len(saved.Observations) {
+		t.Fatalf("retry lost long review evidence: calls=%d reused=%d %v", second.Calls, second.Disclosure.ReusedFragments, err)
+	}
 }
 
 func TestFinishPlanningDeadlineIdentifiesEveryExchangePhase(t *testing.T) {
@@ -353,7 +413,7 @@ func TestFinishReviewCorrectsOnlyInvalidBatch(t *testing.T) {
 		batches[key]++
 		if r.Correction != nil {
 			corrections++
-			if key != badID || r.Correction.PreviousOutput != "" || !strings.Contains(r.Correction.ValidationError, "maximum is 256") {
+			if key != badID || r.Correction.PreviousOutput != "" || !strings.Contains(r.Correction.ValidationError, "maximum is 4096") {
 				t.Fatal("correction lacked bounded, specific feedback")
 			}
 			return finishTestReview(r), nil
@@ -363,7 +423,7 @@ func TestFinishReviewCorrectsOnlyInvalidBatch(t *testing.T) {
 			badID = key
 			var reply map[string][]map[string]string
 			_ = json.Unmarshal(finishTestReview(r), &reply)
-			reply["observations"][0]["summary"] = strings.Repeat("overlong factual summary ", 20)
+			reply["observations"][0]["summary"] = strings.Repeat("overlong factual summary ", 200)
 			raw, _ := json.Marshal(reply)
 			return raw, nil
 		}

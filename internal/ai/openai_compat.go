@@ -58,7 +58,7 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 					"type": "object", "additionalProperties": false, "required": []string{"id", "summary"},
 					"properties": map[string]any{"id": map[string]any{"type": "string"}, "summary": map[string]any{
 						"type": "string", "pattern": fmt.Sprintf(`^[\s\S]{1,%d}$`, finishReviewSummaryRunes),
-						"description": "One short factual sentence; aim for 160 characters, never exceed 256.",
+						"description": fmt.Sprintf("Factual summary of recorded behavior, dependencies, and corrections; use up to %d characters when needed.", finishReviewSummaryRunes),
 					}},
 				}}}},
 		})

@@ -106,9 +106,9 @@ ACD rejects redirects, embedded URL credentials, query strings, fragments,
 control characters, and unsupported schemes. Each exchange performs one HTTP
 request with bounded response size and cancellation.
 
-Finish requests enable strict function schemas. Evidence summaries use a
-supported string pattern to enforce the 256-character limit and ask for short
-sentences to leave room below it. ACD still validates every reply, including
+Finish requests enable strict function schemas. Evidence summaries can use up
+to 4,096 characters per fragment to preserve behavior and dependency details.
+Simple fragments can use shorter notes. ACD still validates every reply, including
 replies from compatible endpoints that ignore schema enforcement. Invalid
 summaries are corrected within the existing budget; they are never truncated.
 
@@ -157,7 +157,7 @@ doctor never contact a provider.
 For large batches, subprocess protocol version 1 uses
 `request_type: "finish_evidence"` with `finish_request.evidence_review.parts`.
 Return `{"version":1,"finish_evidence":{"observations":[{"id":"part-1","summary":"Describe the recorded behavior and relevant dependencies."}]}}`.
-Every supplied part ID must appear exactly once, with a summary of at most 256
+Every supplied part ID must appear exactly once, with a summary of at most 4,096
 characters. Unsupported review operations fail the explicit request; they do not
 fall back to another provider or Local. Ordinary `finish_plan` exchanges keep
 their existing protocol.

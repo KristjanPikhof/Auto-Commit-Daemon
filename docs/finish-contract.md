@@ -154,7 +154,8 @@ deadline (default five minutes, overridden per attempt by `--timeout` from
 budgets and writes state serially. Small requests skip evidence review. Every
 complete redacted diff is covered by exact UTF-8 fragments; every fragment must
 have exactly one bounded observation with a locally recorded content digest.
-Each review contains at most 32 fragments. An invalid review gets at most one correction, using the same complete evidence
+Each review contains at most 32 fragments, with up to 4,096 characters per
+summary. An invalid review gets at most one correction, using the same complete evidence
 and bounded validation feedback. Accepted reviews are not repeated, and correction
 calls consume the same 128-call budget and deadline. Transport and protocol failures do not
 trigger a correction. Validated reviews are checkpointed durably with a fingerprint of the frozen
