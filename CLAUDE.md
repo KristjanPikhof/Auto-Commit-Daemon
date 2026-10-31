@@ -204,8 +204,9 @@ have a five-minute wall-clock target. The local gate uses three core shards
 with at most two parallel tests per package process.
 
 Hosted pull requests run four core shards, four production integration shards,
-and one support lane on both Ubuntu and macOS. The support lane runs timing-sensitive tests only after the other
-package tests finish. Repeated daemon stress uses six Ubuntu runners, while
+and separate AI and other support lanes on both Ubuntu and macOS. The other
+support lane runs timing-sensitive tests after its package tests finish.
+Repeated daemon stress uses six Ubuntu runners, while
 Git and state stress use two. Each leaf job should finish within four minutes
 and 30 seconds and has a hard five-minute timeout. If a lane exceeds that
 target, split or rebalance it without dropping cases or repetitions.

@@ -18,6 +18,10 @@
 
 ### Changed
 
+- Run AI package tests separately from the other support packages in hosted CI
+  so cold builds have room within the five-minute job limit. Keep all tests,
+  race checks, and the full local gate.
+
 - Allow finish evidence summaries up to 4,096 characters per fragment. Keep
   behavior and dependency details for the global planner without forcing a
   one-sentence summary. Combined provider request limits still apply.
