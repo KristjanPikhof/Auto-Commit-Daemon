@@ -111,7 +111,8 @@ jobs:
           - runner: macos-latest
             label: macos
             package-parallelism: 3
-    name: test-support (${{ matrix.os.label }})
+        group: [ai, other]
+    name: test-support (${{ matrix.os.label }}, ${{ matrix.group }})
     runs-on: ${{ matrix.os.runner }}
     timeout-minutes: 5
     steps:
@@ -124,8 +125,9 @@ jobs:
         env:
           ACD_TEST_PACKAGE_PARALLELISM: ${{ matrix.os.package-parallelism }}
           ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
-        run: scripts/dev/test.sh support
+        run: scripts/dev/test.sh support ${{ matrix.group }}
       - name: Run timing-sensitive verification test
+        if: matrix.group == 'other'
         env:
           ACD_TEST_RESULTS_DIR: ${{ runner.temp }}/test-results
         run: scripts/dev/test.sh sensitive
@@ -133,7 +135,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: support-${{ matrix.os.label }}
+          name: support-${{ matrix.os.label }}-${{ matrix.group }}
           path: ${{ runner.temp }}/test-results
 
   race-stress-daemon:

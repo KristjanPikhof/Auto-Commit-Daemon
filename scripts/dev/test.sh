@@ -31,7 +31,7 @@ usage() {
 usage: scripts/dev/test.sh
        scripts/dev/test.sh core <shard-count> <shard-index>
        scripts/dev/test.sh integration <shard-count> <shard-index>
-       scripts/dev/test.sh support
+       scripts/dev/test.sh support [ai|other]
        scripts/dev/test.sh sensitive
        scripts/dev/test.sh stress-daemon <shard-count> <shard-index>
        scripts/dev/test.sh stress-support <shard-count> <shard-index>
@@ -122,13 +122,25 @@ run_measured_tests() {
 }
 
 run_support() {
+  local group=${1:-all}
+  local name=support
   local package_list
   local package
   local packages=()
   local long_packages=()
 
+  case "$group" in
+    all) ;;
+    ai | other) name="support-$group" ;;
+    *) usage; return 2 ;;
+  esac
+
   package_list=$(go list ./...)
   while IFS= read -r package; do
+    if [[ "$group" == ai && "$package" != */internal/ai ]] ||
+      [[ "$group" == other && "$package" == */internal/ai ]]; then
+      continue
+    fi
     case "$package" in
       */internal/cli | */internal/daemon)
         ;;
@@ -143,7 +155,7 @@ run_support() {
 
   # Start the long suites together so a late state package cannot extend
   # the entire lane after the shorter packages have already finished.
-  run_measured_tests support -p "$package_parallelism" \
+  run_measured_tests "$name" -p "$package_parallelism" \
     ${long_packages[@]+"${long_packages[@]}"} ${packages[@]+"${packages[@]}"} \
     -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout" \
     -skip "$timing_sensitive_verification_tests"
@@ -226,11 +238,12 @@ case "${1:-}" in
     run_integration "$2" "$3"
     ;;
   support)
-    if (($# != 1)); then
+    if (($# > 2)); then
       usage
       exit 2
     fi
-    run_support
+    lane_index=${2:-all}
+    run_support "$lane_index"
     ;;
   sensitive)
     if (($# != 1)); then

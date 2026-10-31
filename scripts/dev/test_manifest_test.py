@@ -135,6 +135,43 @@ esac
                                             cwd=checkout, env=env, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 2)
 
+    def test_support_groups_cover_every_support_package_once(self):
+        checkout = pathlib.Path(__file__).resolve().parents[2]
+        packages = ["example/internal/" + name for name in
+                    ["cli", "daemon", "ai", "git", "state", "restore", "verification", "newpkg", "aihelper"]]
+        packages.append("example/cmd/acd")
+        with tempfile.TemporaryDirectory() as root:
+            discovery = pathlib.Path(root) / "packages"
+            discovery.write_text("\n".join(packages) + "\n")
+            arguments = pathlib.Path(root) / "args"
+            go = pathlib.Path(root) / "go"
+            go.write_text('#!/bin/sh\nif [ "$1" = list ]; then cat "$FAKE_PACKAGES"; exit 0; fi\nprintf "%s\\n" "$@" > "$FAKE_GO_ARGS"\n')
+            go.chmod(0o755)
+            env = dict(os.environ, PATH=root + os.pathsep + os.environ["PATH"],
+                       FAKE_PACKAGES=str(discovery), FAKE_GO_ARGS=str(arguments),
+                       ACD_TEST_RESULTS_DIR=root + "/results")
+            selected = {}
+            for group in [None, "ai", "other"]:
+                command = ["bash", "scripts/dev/test.sh", "support"] + ([group] if group else [])
+                run = subprocess.run(command, cwd=checkout, env=env, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                args = arguments.read_text().splitlines()
+                selected[group] = [arg for arg in args if arg.startswith("example/")]
+                self.assertIn("-race", args)
+                self.assertIn("-count=1", args)
+                self.assertIn("-skip", args)
+                self.assertIn("^(TestRunnerKillsBackgroundDescendantsAfterSuccessfulShell)$", args)
+            expected = [package for package in packages if not package.endswith(("/cli", "/daemon"))]
+            self.assertCountEqual(selected[None], expected)
+            self.assertEqual(selected["ai"], ["example/internal/ai"])
+            self.assertCountEqual(selected["other"], [package for package in expected if package != "example/internal/ai"])
+            self.assertCountEqual(selected["ai"] + selected["other"], selected[None])
+            arguments.unlink()
+            run = subprocess.run(["bash", "scripts/dev/test.sh", "support", "typo"],
+                                 cwd=checkout, env=env, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            self.assertFalse(arguments.exists())
+
     def test_support_failure_keeps_events_output_exit_and_wall_time(self):
         checkout = pathlib.Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as root:
@@ -146,19 +183,23 @@ esac
             ]
             fixture = pathlib.Path(root) / "fixture.jsonl"
             fixture.write_text("\n".join(json.dumps(event) for event in events) + "\n")
-            go.write_text('#!/bin/sh\nif [ "$1" = list ]; then echo example; exit 0; fi\ncat "$FAKE_EVENTS"\nexit 42\n')
+            go.write_text('#!/bin/sh\nif [ "$1" = list ]; then printf "example/internal/ai\\nexample/internal/other\\n"; exit 0; fi\ncat "$FAKE_EVENTS"\nexit 42\n')
             go.chmod(0o755)
             results = pathlib.Path(root) / "results"
             env = dict(os.environ, PATH=root + os.pathsep + os.environ["PATH"],
                        ACD_TEST_RESULTS_DIR=str(results), FAKE_EVENTS=str(fixture))
-            run = subprocess.run(["bash", "scripts/dev/test.sh", "support"], cwd=checkout, env=env, capture_output=True, text=True)
-            self.assertEqual(run.returncode, 42, run.stderr)
-            self.assertIn("useful failure details", run.stdout)
-            self.assertIn("compiler diagnostic", run.stdout)
-            self.assertEqual((results / "support.jsonl").read_bytes(), fixture.read_bytes())
-            summary = json.loads((results / "support-all.summary.json").read_text())
-            self.assertEqual(summary["exit_code"], 42)
-            self.assertGreaterEqual(summary["wall_seconds"], 0)
+            for group in [None, "ai", "other"]:
+                with self.subTest(group=group):
+                    command = ["bash", "scripts/dev/test.sh", "support"] + ([group] if group else [])
+                    run = subprocess.run(command, cwd=checkout, env=env, capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 42, run.stderr)
+                    self.assertIn("useful failure details", run.stdout)
+                    self.assertIn("compiler diagnostic", run.stdout)
+                    name = "support" + ("-" + group if group else "")
+                    self.assertEqual((results / (name + ".jsonl")).read_bytes(), fixture.read_bytes())
+                    summary = json.loads((results / ("support-" + (group or "all") + ".summary.json")).read_text())
+                    self.assertEqual(summary["exit_code"], 42)
+                    self.assertGreaterEqual(summary["wall_seconds"], 0)
 
     def test_package_timeout_reports_stack_without_individual_failure(self):
         with tempfile.TemporaryDirectory() as root:
