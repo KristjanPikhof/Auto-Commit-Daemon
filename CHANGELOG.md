@@ -18,6 +18,10 @@
 
 ### Changed
 
+- Refresh integration-test timings from complete Ubuntu and macOS CI runs so
+  the four shards share the current workload and leave room for runner setup
+  and cleanup within the five-minute job limit.
+
 - Run AI package tests separately from the other support packages in hosted CI
   so cold builds have room within the five-minute job limit. Keep all tests,
   race checks, and the full local gate.
