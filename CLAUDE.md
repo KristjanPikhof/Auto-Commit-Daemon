@@ -201,7 +201,8 @@ faster.
 
 The default local gate and the complete hosted GitHub Actions workflow each
 have a five-minute wall-clock target. The local gate uses three core shards
-with at most two parallel tests per package process.
+and three support packages in parallel, with at most two parallel tests per
+package process.
 
 Hosted pull requests run four core shards, four production integration shards,
 and separate AI and other support lanes on both Ubuntu and macOS. The other

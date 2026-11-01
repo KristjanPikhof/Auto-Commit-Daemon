@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Run three support packages at once in the default local gate and refresh CLI
+  shard weights from measured runtimes. Keep the two-test limit within each
+  package and all existing cases.
 - Wrap generated Intent message bodies without changing their wording, so long
   lines do not consume a provider correction. Keep exact user messages unchanged
   and continue to reject invalid structure and overlong subjects.
