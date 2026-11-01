@@ -45,6 +45,10 @@ type FinishReviewObservation = finish.ReviewObservation
 // Keep local proofs intact while omitting duplicate wire metadata. Annotated
 // diffs and selection_order already identify every selectable source line.
 func finishWireRequest(request FinishPlanRequest) FinishPlanRequest {
+	if len(request.SelectionOrder) > 0 {
+		request.SelectionFiles, _ = finishSelectionFiles(request.Changes, request.SourceEdits, request.SelectionOrder)
+		request.SelectionOrder = nil
+	}
 	request.SourceEdits = nil
 	request.Reviews = append([]FinishReviewObservation(nil), request.Reviews...)
 	for i := range request.Reviews {

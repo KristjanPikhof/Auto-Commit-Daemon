@@ -150,27 +150,32 @@ and bullet formatting. A missing reason or one left only in metadata needs
 correction. Advanced exact user messages retain their wording, optional body
 and single-batch contract.
 
-Source-selection requests include a complete `selection_order`. Their goals
-omit `change_ids` and the reply supplies `ownership` runs instead. Each run has
-`through_id`, one literal entry from that order, and `goal`, a 1-based goal
-number. A run starts after the previous endpoint and includes its own endpoint;
-the first starts at the first entry. Endpoints must advance, and the last must
-be the final entry. The runs cover every selection once without repairing or
-deduplicating the provider's answer.
+Source-selection requests include `selection_files`, with each change ID and its
+first and last selection IDs. Annotated diffs retain every selectable line in
+order. Goals omit `change_ids`; the reply supplies `file_ownership`, one entry
+per file, with its `change_id` and ordered `runs`. Each run names a `through_id`
+and a 1-based `goal` number. It starts after the preceding endpoint; the first
+starts at `first_id` and the last must end at `last_id`. A whole recorded change
+has matching first and last IDs and needs one run.
 
-For an order of `edit-000001`, `edit-000002`, and `asset.png`, this assigns the
-two edits to the first goal and the complete resource to the second:
+This assigns both source edits to the first goal and a resource to the second:
 
 ```json
-"ownership": [
-  {"through_id": "edit-000002", "goal": 1},
-  {"through_id": "asset.png", "goal": 2}
+"file_ownership": [
+  {"change_id": "camera.swift", "runs": [
+    {"through_id": "edit-000002", "goal": 1}
+  ]},
+  {"change_id": "asset.png", "runs": [
+    {"through_id": "asset.png", "goal": 2}
+  ]}
 ]
 ```
 
-The source-selection format applies to OpenAI-compatible tool calls and
-subprocess `finish_plan` replies. Older per-goal memberships remain readable and
-receive their existing strict validation; new source requests ask for runs.
+Every file and selection must appear exactly once. ACD rejects unknown files,
+duplicate ownership, gaps and endpoints from another file. It does not repair
+or deduplicate replies. This format applies to OpenAI-compatible tool calls and
+subprocess replies. Older global ownership runs and per-goal memberships retain
+their strict validation; formats cannot be mixed.
 
 If the supplied versions cannot separate independent purposes, return no goals
 and explain the missing evidence in `blocked_reason`. That explanation ends the

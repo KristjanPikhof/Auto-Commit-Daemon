@@ -8,6 +8,40 @@ import (
 	"testing"
 )
 
+func TestSourceDiagnosticLinesFollowExactSelections(t *testing.T) {
+	file := SourceFile{Before: []byte("a\nold\nz\n"), After: []byte("a\nnew\nextra\nz\n"), Edits: []SourceEdit{
+		{ID: "remove-old", Kind: "delete", BeforeLine: 1},
+		{ID: "add-new", Kind: "insert", BeforeLine: 1, AfterLine: 1},
+		{ID: "add-extra", Kind: "insert", BeforeLine: 1, AfterLine: 2},
+	}}
+	for _, test := range []struct {
+		selected []string
+		text     string
+		ids      []string
+	}{
+		{nil, "a\nold\nz\n", []string{"", "remove-old", ""}},
+		{[]string{"add-new", "add-extra"}, "a\nnew\nextra\nold\nz\n", []string{"", "add-new", "add-extra", "remove-old", ""}},
+		{[]string{"remove-old", "add-new", "add-extra"}, "a\nnew\nextra\nz\n", []string{"", "add-new", "add-extra", ""}},
+	} {
+		selected := make(map[string]bool)
+		for _, id := range test.selected {
+			selected[id] = true
+		}
+		source := sourceFile{before: sourceLines(file.Before), after: sourceLines(file.After), edits: file.Edits}
+		if string(source.compose(selected)) != test.text {
+			t.Fatal("diagnostic walk changed candidate bytes")
+		}
+		for line, id := range test.ids {
+			if got := file.LineSelection(selected, line); got != id {
+				t.Fatalf("line %d: got %q, want %q", line, got, id)
+			}
+		}
+		if file.LineSelection(selected, -1) != "" || file.LineSelection(selected, len(test.ids)) != "" {
+			t.Fatal("out-of-range diagnostic selected source")
+		}
+	}
+}
+
 func sourceFixture() (Evidence, []SourceFile, []Goal) {
 	before := []byte("package camera\ntype Status struct { Running bool }\nfunc Selected(s Status) string { return \"\" }\n")
 	after := []byte("package camera\ntype Status struct { Running bool; CameraID string }\nfunc Selected(s Status) string { return s.CameraID }\n")

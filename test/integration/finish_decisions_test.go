@@ -158,8 +158,8 @@ func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 				goals[group].ChangeIDs = append(goals[group].ChangeIDs, id)
 			}
 		}
-		if len(request.SelectionOrder) != 3 || len(request.SourceEdits) != 0 {
-			t.Errorf("expected three exact selections without duplicate coordinates, got %+v", request.SelectionOrder)
+		if len(request.SelectionFiles) != 1 || request.SelectionFiles[0].FirstID != "edit-000001" || request.SelectionFiles[0].LastID != "edit-000003" || len(request.SourceEdits) != 0 {
+			t.Errorf("expected three exact selections without duplicate coordinates, got %+v", request.SelectionFiles)
 		}
 		if request.Correction == nil {
 			goals[0], goals[1] = goals[1], goals[0]
@@ -256,13 +256,32 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 			}
 			goals[i].ChangeIDs = nil
 		}
-		var runs []map[string]any
-		for i, id := range request.SelectionOrder {
-			if i+1 == len(request.SelectionOrder) || owners[request.SelectionOrder[i+1]] != owners[id] {
-				runs = append(runs, map[string]any{"through_id": id, "goal": owners[id]})
+		var ownership []map[string]any
+		for _, file := range request.SelectionFiles {
+			var ids []string
+			if file.FirstID == file.LastID {
+				ids = []string{file.FirstID}
+			} else {
+				for _, diff := range request.Diffs {
+					if diff.ChangeID == file.ChangeID {
+						for _, line := range strings.Split(diff.Text, "\n") {
+							if strings.HasPrefix(line, "[") {
+								id, _, _ := strings.Cut(line[1:], "] ")
+								ids = append(ids, id)
+							}
+						}
+					}
+				}
 			}
+			var runs []map[string]any
+			for i, id := range ids {
+				if i+1 == len(ids) || owners[ids[i+1]] != owners[id] {
+					runs = append(runs, map[string]any{"through_id": id, "goal": owners[id]})
+				}
+			}
+			ownership = append(ownership, map[string]any{"change_id": file.ChangeID, "runs": runs})
 		}
-		raw, _ := json.Marshal(map[string]any{"goals": goals, "ownership": runs})
+		raw, _ := json.Marshal(map[string]any{"goals": goals, "file_ownership": ownership})
 		writeFinishChatArguments(t, w, string(raw))
 	}, "1m", map[string]string{config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "sh verify.sh", config.FieldVerificationFastTimeout: "30s"}, ai.ConfirmationVerificationCommand)
 	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "selected() { printf none; }\n")

@@ -26,7 +26,7 @@ func finishPrompt(request FinishPlanRequest) string {
 		return finishReviewPrompt
 	}
 	if len(request.SourceEdits) > 0 {
-		return finishSystemPrompt + finishSourcePrompt
+		return finishSourcePrompt
 	}
 	if len(request.HistoryCommits) == 0 {
 		return finishSystemPrompt

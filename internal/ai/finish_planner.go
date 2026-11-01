@@ -68,6 +68,7 @@ type FinishPlanRequest struct {
 	HistoryCommits []HistoryMessageCommit    `json:"history_commits,omitempty"`
 	SourceEdits    []FinishSourceEdit        `json:"source_edits,omitempty"`
 	SelectionOrder []string                  `json:"selection_order,omitempty"`
+	SelectionFiles []FinishSelectionFile     `json:"selection_files,omitempty"`
 	// Only names already present in approved redacted diffs are included.
 	ReferencedUnchangedPaths []string `json:"referenced_unchanged_paths,omitempty"`
 }
@@ -291,7 +292,9 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 				if !errors.As(checkErr, &rejected) {
 					return result, finishFailure("source_verification_failed", checkErr)
 				}
-				validationErr = sourceChecksFeedback(checkErr, approvedDiffs)
+				validationErr = sourceChecksFeedback(checkErr, approvedDiffs, func(failure *SourceCheckFailure) []string {
+					return sourceDiagnosticSelections(failure, *source, options.SourceFiles, evidence)
+				})
 			}
 		}
 		if validationErr == nil {
@@ -437,9 +440,10 @@ func finishRedactText(text string) string {
 }
 
 type finishPlanOutput struct {
-	Goals         []finish.Goal        `json:"goals"`
-	BlockedReason string               `json:"blocked_reason"`
-	Ownership     []finishOwnershipRun `json:"ownership,omitempty"`
+	Goals         []finish.Goal         `json:"goals"`
+	BlockedReason string                `json:"blocked_reason"`
+	Ownership     []finishOwnershipRun  `json:"ownership,omitempty"`
+	FileOwnership []finishFileOwnership `json:"file_ownership,omitempty"`
 }
 
 func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, error) {
@@ -478,7 +482,17 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 		if err != nil {
 			return finish.Plan{}, nil, err
 		}
-		if output.Ownership != nil {
+		if output.FileOwnership != nil {
+			if output.Ownership != nil {
+				return finish.Plan{}, nil, errors.New("do not mix file_ownership and ownership")
+			}
+			var order []string
+			for _, change := range qualityEvidence.Changes {
+				order = append(order, change.ID)
+			}
+			_, files := finishSelectionFiles(evidence.Changes, sourceEdits, order)
+			output.Goals, err = allocateFinishFileGoals(output.Goals, files, output.FileOwnership)
+		} else if output.Ownership != nil {
 			output.Goals, err = allocateFinishSourceGoals(output.Goals, qualityEvidence.Changes, output.Ownership)
 		} else {
 			// Older providers and saved replies retain strict membership validation.
@@ -487,7 +501,7 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 		if err != nil {
 			validationErrors = append(validationErrors, err)
 		}
-	} else if output.Ownership != nil {
+	} else if output.Ownership != nil || output.FileOwnership != nil {
 		return finish.Plan{}, nil, errors.New("ownership runs require a source-selection request")
 	}
 	for index, goal := range output.Goals {

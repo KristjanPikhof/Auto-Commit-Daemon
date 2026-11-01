@@ -143,7 +143,7 @@ lines, keeping independent features separate from Settings or layout work. No
 provider-written source is accepted. Keep scope labels and compiler dumps local;
 only approved redacted diff lines and edit metadata enter planning. Check every
 candidate before one publication. Collect failed source checks for the existing
-single global correction and deadline, sharing only diagnostic names already in the
+single global correction and deadline, sharing only diagnostic names and exact edit IDs already in the
 approved diffs. Older requests and retained-version plans keep their identity.
 Intent requires approved redacted code diffs on every planning path; completion
 context supplements that evidence. Local remains offline. Existing settings
@@ -165,7 +165,9 @@ reserved durably and reported separately from global planning calls.
 At most four immutable reviews run concurrently; budget reservations and state
 writes stay on the owning worker. Validated reviews are checkpointed durably;
 explicit retry reuses only fingerprint-matched and revalidated frozen evidence.
-A fresh global plan still sees all changes and observations. Small requests skip review. Messages belong to the global plan. Provider rejection,
+A fresh global plan still sees all changes and observations. Source ownership
+walks each file separately against one complete local catalogue; goals and their
+prerequisite order remain global. Small requests skip review. Messages belong to the global plan. Provider rejection,
 timeout, unavailable evidence, or exhausted budget fails the explicit request;
 there is no background semantic retry or silent Local fallback.
 

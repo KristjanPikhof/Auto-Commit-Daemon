@@ -79,11 +79,15 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 	if len(request.SelectionOrder) > 0 {
 		goal["required"] = []string{"purpose", "boundary", "reason", "message"}
 		delete(goal["properties"].(map[string]any), "change_ids")
-		properties["ownership"] = map[string]any{"type": "array", "items": map[string]any{
+		run := map[string]any{
 			"type": "object", "additionalProperties": false, "required": []string{"through_id", "goal"},
-			"properties": map[string]any{"through_id": map[string]any{"type": "string", "description": "One literal selection_order entry, never a range; endpoints strictly advance and finish at the last entry."}, "goal": map[string]any{"type": "integer", "description": "1-based index into goals."}},
+			"properties": map[string]any{"through_id": map[string]any{"type": "string", "description": "One literal selection ID from this file; endpoints advance and end at the file's last_id."}, "goal": map[string]any{"type": "integer", "description": "1-based index into goals."}},
+		}
+		properties["file_ownership"] = map[string]any{"type": "array", "items": map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"change_id", "runs"},
+			"properties": map[string]any{"change_id": map[string]any{"type": "string"}, "runs": map[string]any{"type": "array", "items": run}},
 		}}
-		required = append(required, "ownership")
+		required = append(required, "file_ownership")
 	}
 	return marshalOpenAIToolRequest(openAIToolRequestOptions{
 		Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),

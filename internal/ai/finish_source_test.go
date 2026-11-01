@@ -45,7 +45,7 @@ func TestFinishSourcePlanUsesOnlyFrozenSelections(t *testing.T) {
 		if strings.Contains(string(encoded), "PRIVATE_UNCHANGED_VALUE") || strings.Contains(string(encoded), "SourceFiles") {
 			t.Fatal("local frozen source escaped into the provider request")
 		}
-		if !strings.Contains(finishPrompt(request), "exact annotated source diffs and selection_order") {
+		if !strings.Contains(finishPrompt(request), "Exact annotated source diffs and selection_files") {
 			t.Fatal("source membership rules missing")
 		}
 		return json.Marshal(finishPlanOutput{Goals: goals})
@@ -110,7 +110,10 @@ func TestFinishSourceCorrectsFailedCheckWithoutSendingCommandOutput(t *testing.T
 			t.Fatal("source checks changed the accepted deadline or target")
 		}
 		if checks == 1 {
-			return &SourceCheckFailure{Step: 2, Output: "PRIVATE_COMMAND_OUTPUT /private/path: cannot find 'CameraID' in scope; undefined: SecretOutsideApprovedDiff"}
+			return errors.Join(
+				&SourceCheckFailure{Step: 2, Output: "PRIVATE_COMMAND_OUTPUT /private/path: cannot find 'CameraID' in scope; undefined: SecretOutsideApprovedDiff"},
+				&SourceCheckFailure{Step: 1, Output: "/private/build/camera.go:3:29: error: cannot assign callback type PRIVATE_SIGNATURE"},
+			)
 		}
 		return nil
 	}
@@ -119,8 +122,11 @@ func TestFinishSourceCorrectsFailedCheckWithoutSendingCommandOutput(t *testing.T
 			if request.Correction == nil || !strings.Contains(request.Correction.ValidationError, "step 2") || !strings.Contains(request.Correction.ValidationError, "CameraID") {
 				t.Fatalf("source correction lost approved diagnostic: %+v", request.Correction)
 			}
+			if !strings.Contains(request.Correction.ValidationError, "edit-000003") {
+				t.Fatal("type-only diagnostic lost the pending consumer edit")
+			}
 			wire, _ := json.Marshal(request)
-			for _, secret := range []string{"PRIVATE_COMMAND_OUTPUT", "/private/path", "SecretOutsideApprovedDiff"} {
+			for _, secret := range []string{"PRIVATE_COMMAND_OUTPUT", "/private/path", "SecretOutsideApprovedDiff", "/private/build", "PRIVATE_SIGNATURE"} {
 				if strings.Contains(string(wire), secret) {
 					t.Fatalf("command output escaped in provider correction: %s", secret)
 				}
@@ -296,6 +302,53 @@ func TestFinishSourceOwnershipPartitionsTheFrozenCatalogue(t *testing.T) {
 	}
 }
 
+func TestFinishSourceFileOwnershipCoversEverySelection(t *testing.T) {
+	evidence, options, goals := finishSourceFixture()
+	evidence.Target["notes.txt"] = finishTestEntry("c")
+	evidence.Changes = finish.NetChanges(evidence.Base, evidence.Target, "author")
+	options.Purpose = ""
+	options.Diffs = append(options.Diffs, FinishDiff{ChangeID: "notes.txt", Text: "+ Explain saved camera choices.\n"})
+	goals = append(goals, finish.Goal{Purpose: "Explain camera choices", Boundary: "Keep guidance independently reviewable", Reason: "Explain saved choices so users can configure their camera.", Message: "Explain camera choices\n\n- Explain saved choices so users can configure their camera."})
+	for i := range goals {
+		goals[i].ChangeIDs = nil
+	}
+	ownership := []finishFileOwnership{
+		{"notes.txt", []finishOwnershipRun{{"notes.txt", 3}}},
+		{"camera.go", []finishOwnershipRun{{"edit-000002", 1}, {"edit-000004", 2}}},
+	}
+	provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+		return json.Marshal(finishPlanOutput{Goals: goals, FileOwnership: ownership})
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || result.Source == nil || result.Calls != 1 || len(result.Plan.Steps) != 3 {
+		t.Fatalf("file-local plan without context: %+v %v", result, err)
+	}
+	edits, catalogue, _ := finishSourceCatalogue(evidence, options.SourceFiles)
+	var order []string
+	for _, c := range catalogue {
+		order = append(order, c.ID)
+	}
+	bounds, files := finishSelectionFiles(evidence.Changes, edits, order)
+	if len(bounds) != 2 || bounds[0].FirstID != "edit-000001" || bounds[0].LastID != "edit-000004" || bounds[1].FirstID != "notes.txt" {
+		t.Fatal("file bounds lost catalogue identities")
+	}
+	for _, bad := range [][]finishFileOwnership{
+		ownership[:1], {ownership[0], ownership[0]}, {ownership[0], {"unknown", ownership[1].Runs}},
+		{ownership[0], {"camera.go", []finishOwnershipRun{{"notes.txt", 1}}}},
+		{ownership[0], {"camera.go", []finishOwnershipRun{{"edit-000002", 1}}}},
+		{ownership[0], {"camera.go", []finishOwnershipRun{{"edit-000003", 1}, {"edit-000002", 2}}}},
+	} {
+		if _, err := allocateFinishFileGoals(goals, files, bad); err == nil {
+			t.Fatalf("accepted invalid file coverage: %+v", bad)
+		}
+	}
+	// An explicitly empty legacy array is still a conflicting format.
+	data, _ := json.Marshal(map[string]any{"goals": goals, "file_ownership": ownership, "ownership": []finishOwnershipRun{}})
+	if _, err := validateFinishOutput(data, evidence, options); err == nil {
+		t.Fatal("mixed ownership formats accepted")
+	}
+}
+
 func TestFinishSourceCheckFeedbackRetainsApprovedReceiver(t *testing.T) {
 	failure := &SourceCheckFailure{Step: 4, Output: "/private/path.swift: value of type 'MetalCompositor' has no member 'texture'; value of type 'UnapprovedType' has no member 'secret'"}
 	feedback := sourceCheckFeedback(failure, []FinishDiff{{Text: "-let texture = MetalCompositor()\n"}}).Error()
@@ -331,7 +384,7 @@ func TestFinishSourceCorrectionIncludesEveryFailedCandidate(t *testing.T) {
 	if err == nil || result.Calls != 2 {
 		t.Fatalf("combined failure bypassed verification or the correction limit: %+v %v", result, err)
 	}
-	feedback := sourceChecksFeedback(errors.Join(&SourceCheckFailure{Step: 1}, errors.New("PRIVATE_OUTPUT")), nil).Error()
+	feedback := sourceChecksFeedback(errors.Join(&SourceCheckFailure{Step: 1}, errors.New("PRIVATE_OUTPUT")), nil, nil).Error()
 	if strings.Contains(feedback, "PRIVATE_OUTPUT") {
 		t.Fatal("unrecognized joined output escaped diagnostic filtering")
 	}

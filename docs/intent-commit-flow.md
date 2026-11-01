@@ -131,17 +131,19 @@ source plan rejected by project checks can use that same correction. The
 worker checks every candidate within the original budget and collects failures
 for one combined correction. A failed chain is never pinned or prepared for
 publication. Feedback identifies failed steps, receiver/member names and file
-names already present in approved redacted diffs. Raw command output stays local. Every corrected
+names already present in approved redacted diffs. Compiler locations also map
+to exact frozen edit IDs, including a pending consumer update. Raw code,
+compiler output and signatures stay local. Every corrected
 candidate runs its checks again within the original deadline.
 
-Source planning assigns ownership by walking one frozen `selection_order`.
-Each `ownership` run names its last entry and a goal number; the next run starts
-at the following entry. This covers each selection once without overlapping
-per-goal ranges. The planner still chooses the purposes, owners and prerequisite
-order. ACD rejects invalid endpoints or missing coverage instead of repairing
-membership or combining unrelated goals.
-Annotated diffs retain every edit ID and its exact code. Duplicate per-line
-coordinates stay local so the planner can spend its context on the changes.
+Source planning assigns ownership within each frozen file. `selection_files`
+names each file's first and last selection IDs. Each `file_ownership` entry
+contains ordered runs ending at a selection ID and naming a goal number. ACD
+expands them against its complete local catalogue, covering every file and
+selection once. Unknown files, duplicate entries, gaps and invalid endpoints
+are rejected. The planner still chooses the purposes, owners and prerequisite
+order across all files. Annotated diffs retain every edit ID and its exact code;
+duplicate per-line coordinates and the full repeated ID list stay local.
 
 The request contains bounded metadata, redacted supplied context, and approved
 text diffs. Each encoded review is bounded to 512 KiB. The global catalogue

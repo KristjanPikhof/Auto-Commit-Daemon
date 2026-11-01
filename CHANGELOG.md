@@ -25,8 +25,10 @@
   Plan all independent outcomes before ownership, without a remainder goal.
   Allow tested feature prerequisites before their separate UI integration when
   the frozen caller line couples feature wiring to a new layout.
-- Assign source ownership through one ordered catalogue instead of overlapping
-  per-goal ranges. Preserve the global correction for useful planning feedback.
+- Assign source ownership within each file instead of overlapping per-goal
+  ranges or one long global list. Preserve the global correction for useful
+  planning feedback. Map compiler locations to already-approved frozen edit IDs
+  without sending source lines or signatures.
   New requests can stage new Go and Swift files from exact frozen lines, so
   independent features need not share a commit with Settings or layout work.
   Collect all candidate failures within the existing budget for one correction;
