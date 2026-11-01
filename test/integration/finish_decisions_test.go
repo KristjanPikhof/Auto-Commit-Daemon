@@ -261,7 +261,20 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 				t.Error("global planning lost the code-to-edit association")
 			}
 		}
-		raw, _ := json.Marshal(map[string]any{"goals": goals})
+		owners := make(map[string]int)
+		for i := range goals {
+			for _, id := range goals[i].ChangeIDs {
+				owners[id] = i + 1
+			}
+			goals[i].ChangeIDs = nil
+		}
+		var runs []map[string]any
+		for i, id := range request.SelectionOrder {
+			if i+1 == len(request.SelectionOrder) || owners[request.SelectionOrder[i+1]] != owners[id] {
+				runs = append(runs, map[string]any{"through_id": id, "goal": owners[id]})
+			}
+		}
+		raw, _ := json.Marshal(map[string]any{"goals": goals, "ownership": runs})
 		writeFinishChatArguments(t, w, string(raw))
 	}, "1m", map[string]string{config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "sh verify.sh", config.FieldVerificationFastTimeout: "30s"}, ai.ConfirmationVerificationCommand)
 	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "selected() { printf none; }\n")

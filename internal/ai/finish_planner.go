@@ -67,6 +67,7 @@ type FinishPlanRequest struct {
 	Reviews        []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	HistoryCommits []HistoryMessageCommit    `json:"history_commits,omitempty"`
 	SourceEdits    []FinishSourceEdit        `json:"source_edits,omitempty"`
+	SelectionOrder []string                  `json:"selection_order,omitempty"`
 	// Only names already present in approved redacted diffs are included.
 	ReferencedUnchangedPaths []string `json:"referenced_unchanged_paths,omitempty"`
 }
@@ -290,7 +291,7 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 				if !errors.As(checkErr, &rejected) {
 					return result, finishFailure("source_verification_failed", checkErr)
 				}
-				validationErr = sourceCheckFeedback(rejected, approvedDiffs)
+				validationErr = sourceChecksFeedback(checkErr, approvedDiffs)
 			}
 		}
 		if validationErr == nil {
@@ -319,9 +320,13 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress}
 	if len(options.SourceFiles) > 0 {
 		var err error
-		request.SourceEdits, _, err = finishSourceCatalogue(evidence, options.SourceFiles)
+		var catalogue []finish.Change
+		request.SourceEdits, catalogue, err = finishSourceCatalogue(evidence, options.SourceFiles)
 		if err != nil {
 			return request, FinishDisclosure{}, finishFailure("invalid_evidence", err)
+		}
+		for _, selection := range catalogue {
+			request.SelectionOrder = append(request.SelectionOrder, selection.ID)
 		}
 	}
 	disclosure := FinishDisclosure{MetadataIncluded: true, PurposeIncluded: options.Purpose != "", MessageIncluded: options.Message != "", Redacted: request.Purpose != options.Purpose || request.Message != options.Message}
@@ -432,8 +437,9 @@ func finishRedactText(text string) string {
 }
 
 type finishPlanOutput struct {
-	Goals         []finish.Goal `json:"goals"`
-	BlockedReason string        `json:"blocked_reason"`
+	Goals         []finish.Goal        `json:"goals"`
+	BlockedReason string               `json:"blocked_reason"`
+	Ownership     []finishOwnershipRun `json:"ownership,omitempty"`
 }
 
 func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, error) {
@@ -469,10 +475,17 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 		if err != nil {
 			return finish.Plan{}, nil, err
 		}
-		output.Goals, err = expandFinishSourceGoals(output.Goals, qualityEvidence.Changes, sourceEdits)
+		if output.Ownership != nil {
+			output.Goals, err = allocateFinishSourceGoals(output.Goals, qualityEvidence.Changes, output.Ownership)
+		} else {
+			// Older providers and saved replies retain strict membership validation.
+			output.Goals, err = expandFinishSourceGoals(output.Goals, qualityEvidence.Changes, sourceEdits)
+		}
 		if err != nil {
 			validationErrors = append(validationErrors, err)
 		}
+	} else if output.Ownership != nil {
+		return finish.Plan{}, nil, errors.New("ownership runs require a source-selection request")
 	}
 	for index, goal := range output.Goals {
 		if options.Message == "" {

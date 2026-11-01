@@ -55,6 +55,28 @@ func TestFinishOpenAIRequestsStrictSchemas(t *testing.T) {
 	}
 }
 
+func TestFinishOpenAISourceSchemaUsesExclusiveOwnership(t *testing.T) {
+	evidence, options, _ := finishSourceFixture()
+	request, _, err := prepareFinishRequest(evidence, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := (&OpenAIProvider{}).EncodeFinishRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire openAIToolRequest
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatal(err)
+	}
+	schema := wire.Tools[0].Function.Parameters
+	properties := schema["properties"].(map[string]any)
+	goal := properties["goals"].(map[string]any)["items"].(map[string]any)
+	if _, exists := goal["properties"].(map[string]any)["change_ids"]; exists || properties["ownership"] == nil || !strings.Contains(wire.Messages[0].Content, "Walk selection_order exactly once") {
+		t.Fatal("source schema still permits overlapping per-goal ownership")
+	}
+}
+
 func TestFinishRemovalSubprocessCloseKillsDescendants(t *testing.T) {
 	skipIfWindows(t)
 	for _, ignoresEOF := range []bool{false, true} {

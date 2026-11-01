@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -287,5 +288,76 @@ func TestFinishSourceReviewMapsSplitUTF8Lines(t *testing.T) {
 	}
 	if _, err := finishReviewSourceIDs(texts, []string{"edit-000003"}); err == nil {
 		t.Fatal("missing source annotation was accepted")
+	}
+}
+
+func TestFinishSourceOwnershipPartitionsTheFrozenCatalogue(t *testing.T) {
+	evidence, options, goals := finishSourceFixture()
+	for i := range goals {
+		goals[i].ChangeIDs = nil
+	}
+	provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+		if !slices.Equal(request.SelectionOrder, []string{"edit-000001", "edit-000002", "edit-000003", "edit-000004"}) || request.Purpose == "" {
+			t.Fatal("request lost the exact ownership order")
+		}
+		return json.Marshal(finishPlanOutput{Goals: goals, Ownership: []finishOwnershipRun{{"edit-000002", 1}, {"edit-000004", 2}}})
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || result.Source == nil || len(result.Plan.Steps) != 2 || !slices.Equal(result.Source.Selections[1].ChangeIDs, []string{"edit-000003", "edit-000004"}) {
+		t.Fatalf("ownership changed source membership: %+v %v", result, err)
+	}
+	_, catalogue, _ := finishSourceCatalogue(evidence, options.SourceFiles)
+	for _, runs := range [][]finishOwnershipRun{
+		{{"edit-000004", 0}}, {{"edit-000004", 3}}, {{"unseen", 1}}, {{"edit-000002", 1}},
+		{{"edit-000002", 1}, {"edit-000001", 2}}, {{"edit-000002", 1}, {"edit-000002", 2}},
+	} {
+		if _, err := allocateFinishSourceGoals(goals, catalogue, runs); err == nil {
+			t.Fatalf("invalid ownership was accepted: %+v", runs)
+		}
+	}
+	goals[0].ChangeIDs = []string{"edit-000001"}
+	if _, err := allocateFinishSourceGoals(goals, catalogue, []finishOwnershipRun{{"edit-000004", 1}}); err == nil {
+		t.Fatal("mixed run and legacy ownership was accepted")
+	}
+}
+
+func TestFinishSourceCheckFeedbackRetainsApprovedReceiver(t *testing.T) {
+	failure := &SourceCheckFailure{Step: 4, Output: "/private/path.swift: value of type 'MetalCompositor' has no member 'texture'; value of type 'UnapprovedType' has no member 'secret'"}
+	feedback := sourceCheckFeedback(failure, []FinishDiff{{Text: "-let texture = MetalCompositor()\n"}}).Error()
+	if !strings.Contains(feedback, "MetalCompositor, texture") || strings.Contains(feedback, "UnapprovedType") || strings.Contains(feedback, "secret") || strings.Contains(feedback, "/private/") {
+		t.Fatalf("receiver or privacy proof lost: %s", feedback)
+	}
+}
+
+func TestFinishSourceCorrectionIncludesEveryFailedCandidate(t *testing.T) {
+	evidence, options, goals := finishSourceFixture()
+	options.VerifySource = func(_ context.Context, _ finish.SourcePlan) error {
+		return errors.Join(
+			&SourceCheckFailure{Step: 1, Output: "/private/work/camera.go: cannot find 'CameraID' in scope"},
+			&SourceCheckFailure{Step: 2, Output: "/private/work/camera.go: value of type 'Status' has no member 'CameraID'"},
+		)
+	}
+	provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+		if request.Correction != nil {
+			feedback := request.Correction.ValidationError
+			for _, needed := range []string{"step 1", "step 2", "CameraID", "Status", "camera.go"} {
+				if !strings.Contains(feedback, needed) {
+					t.Fatalf("combined correction lost %s: %s", needed, feedback)
+				}
+			}
+			if strings.Contains(feedback, "/private/") {
+				t.Fatal("combined correction disclosed private command paths")
+			}
+		}
+		return json.Marshal(finishPlanOutput{Goals: goals})
+	}}
+	// Keep checks failing to prove that the one correction is shared and bounded.
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err == nil || result.Calls != 2 {
+		t.Fatalf("combined failure bypassed verification or the correction limit: %+v %v", result, err)
+	}
+	feedback := sourceChecksFeedback(errors.Join(&SourceCheckFailure{Step: 1}, errors.New("PRIVATE_OUTPUT")), nil).Error()
+	if strings.Contains(feedback, "PRIVATE_OUTPUT") {
+		t.Fatal("unrecognized joined output escaped diagnostic filtering")
 	}
 }

@@ -68,9 +68,10 @@ provider call; ACD does not substitute a metadata-only plan.
 
 Checked source selections add line positions and edit IDs to the approved diff
 evidence. Frozen file bytes, compiler dumps and scope labels stay local. If a
-project check rejects a constructed step, the one available global correction
-can include its step number and diagnostic names already visible in approved
-redacted code. It never includes raw command output or new diagnostic text.
+project check rejects constructed steps, ACD collects the candidate failures
+within the same budget for the one available global correction. Feedback can
+include step numbers, receiver/member names and file names already visible in
+approved redacted code. It never includes raw command output or unapproved names.
 
 Binary or invalid-text blobs are metadata only. Their complete objects remain
 available locally for exact tree verification. Limits are independent of
@@ -150,12 +151,34 @@ process group and join its readers within bounded cleanup.
 ## Failure behavior
 
 Planning replies contain `goals` and `blocked_reason` (empty on success). Each
-generated goal includes `purpose`, `boundary`, `reason`, `message`, and
-`change_ids`. Its reason explains the problem or constraint and the chosen
+generated goal includes `purpose`, `boundary`, `reason`, and `message`.
+Recorded-version replies also include `change_ids`. Its reason explains the problem or constraint and the chosen
 mechanism; the same wording must appear in the message body, allowing wrapping
 and bullet formatting. A missing reason or one left only in metadata needs
 correction. Advanced exact user messages retain their wording, optional body
 and single-batch contract.
+
+Source-selection requests include a complete `selection_order`. Their goals
+omit `change_ids` and the reply supplies `ownership` runs instead. Each run has
+`through_id`, one literal entry from that order, and `goal`, a 1-based goal
+number. A run starts after the previous endpoint and includes its own endpoint;
+the first starts at the first entry. Endpoints must advance, and the last must
+be the final entry. The runs cover every selection once without repairing or
+deduplicating the provider's answer.
+
+For an order of `edit-000001`, `edit-000002`, and `asset.png`, this assigns the
+two edits to the first goal and the complete resource to the second:
+
+```json
+"ownership": [
+  {"through_id": "edit-000002", "goal": 1},
+  {"through_id": "asset.png", "goal": 2}
+]
+```
+
+The source-selection format applies to OpenAI-compatible tool calls and
+subprocess `finish_plan` replies. Older per-goal memberships remain readable and
+receive their existing strict validation; new source requests ask for runs.
 
 If the supplied versions cannot separate independent purposes, return no goals
 and explain the missing evidence in `blocked_reason`. That explanation ends the

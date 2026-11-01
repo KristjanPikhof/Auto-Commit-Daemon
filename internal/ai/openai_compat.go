@@ -74,11 +74,21 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 			"change_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		},
 	}
+	properties := map[string]any{"goals": map[string]any{"type": "array", "items": goal}, "blocked_reason": map[string]any{"type": "string"}}
+	required := []string{"goals", "blocked_reason"}
+	if len(request.SelectionOrder) > 0 {
+		goal["required"] = []string{"purpose", "boundary", "reason", "message"}
+		delete(goal["properties"].(map[string]any), "change_ids")
+		properties["ownership"] = map[string]any{"type": "array", "items": map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"through_id", "goal"},
+			"properties": map[string]any{"through_id": map[string]any{"type": "string", "description": "One literal selection_order entry, never a range; endpoints strictly advance and finish at the last entry."}, "goal": map[string]any{"type": "integer", "description": "1-based index into goals."}},
+		}}
+		required = append(required, "ownership")
+	}
 	return marshalOpenAIToolRequest(openAIToolRequestOptions{
 		Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
 		ToolName: "finish_plan", ToolDescription: "Plan completed purposes, safe recorded changes, and grounded messages",
-		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"goals", "blocked_reason"},
-			"properties": map[string]any{"goals": map[string]any{"type": "array", "items": goal}, "blocked_reason": map[string]any{"type": "string"}}},
+		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": required, "properties": properties},
 	})
 }
 

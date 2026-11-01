@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Assign source ownership through one ordered catalogue instead of overlapping
+  per-goal ranges. Preserve the global correction for useful planning feedback.
+  New requests can stage new Go and Swift files from exact frozen lines, so
+  independent features need not share a commit with Settings or layout work.
+  Collect all candidate failures within the existing budget for one correction;
+  never pin or publish a rejected chain. Older frozen requests keep their rules.
 - Preserve code-to-edit associations through large Intent evidence reviews.
   Supply each fragment's exact edit IDs, require mapped summaries with complete
   coverage, and revalidate saved mappings before retry. Keep the existing review

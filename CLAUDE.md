@@ -136,11 +136,13 @@ state. Put prerequisites before consumers or in the same commit. Explain
 the reason or practical impact in each generated message, not only internal
 planning metadata. Explain broader defaults and behavior changes from evidence.
 New final-only Intent requests with approved fast/full checks may construct
-intermediate text versions from exact frozen base/target line selections. No
+intermediate text versions from exact frozen base/target line selections. New
+version-four requests may also stage new Go and Swift files from exact target
+lines, keeping independent features separate from Settings or layout work. No
 provider-written source is accepted. Keep scope labels and compiler dumps local;
 only approved redacted diff lines and edit metadata enter planning. Check every
-candidate before one publication. One failed source check may use the existing
-global correction and deadline, sharing only diagnostic names already in the
+candidate before one publication. Collect failed source checks for the existing
+single global correction and deadline, sharing only diagnostic names already in the
 approved diffs. Older requests and retained-version plans keep their identity.
 Intent requires approved redacted code diffs on every planning path; completion
 context supplements that evidence. Local remains offline. Existing settings

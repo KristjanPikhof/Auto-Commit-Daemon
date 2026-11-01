@@ -33,8 +33,11 @@ or `full` checks can split existing text files using exact lines from the frozen
 base and target. Each insertion or deletion belongs to one goal. ACD constructs
 the intermediate files locally; the provider cannot supply replacement code.
 Go and Swift scope information prevents identical lines in different functions
-from matching. Swift files require a working local Swift compiler. New files,
-renames, binary files and mode changes remain whole transitions. Older requests,
+from matching. Swift files require a working local Swift compiler. New Go and
+Swift files can also start from an empty base in complete working stages. A new
+Settings view can be introduced first, then gain an independent feature's
+controls later without inventing code. Other additions, renames, binary files
+and mode changes remain whole transitions. Requests frozen before version four,
 exact messages and structural-only requests retain their existing version rules.
 
 A dry run creates private planning and verification evidence and may call the
@@ -120,9 +123,18 @@ default) or an explicit `--timeout 15m` for the new attempt. Messages
 are part of the same plan; they do not get a separate retry loop. Correction
 feedback includes all detected message and membership conflicts together. A
 source plan rejected by project checks can use that same correction. The
-feedback identifies the failed step and diagnostic names already present in
-approved redacted diffs. Raw command output stays local. Every corrected
+worker checks every candidate within the original budget and collects failures
+for one combined correction. A failed chain is never pinned or prepared for
+publication. Feedback identifies failed steps, receiver/member names and file
+names already present in approved redacted diffs. Raw command output stays local. Every corrected
 candidate runs its checks again within the original deadline.
+
+Source planning assigns ownership by walking one frozen `selection_order`.
+Each `ownership` run names its last entry and a goal number; the next run starts
+at the following entry. This covers each selection once without overlapping
+per-goal ranges. The planner still chooses the purposes, owners and prerequisite
+order. ACD rejects invalid endpoints or missing coverage instead of repairing
+membership or combining unrelated goals.
 
 The request contains bounded metadata, redacted supplied context, and approved
 text diffs. Each encoded review is bounded to 512 KiB. The global catalogue
