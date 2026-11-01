@@ -82,6 +82,11 @@ Settings redesign, even when both were discovered during the same UI audit.
 A shortcut recorder, its saved bindings, conflict checks and menu hints can
 complete one feature.
 
+A complete testable API, model or processing module can precede a separate UI
+integration. When an exact target line connects a feature to a new layout, the
+later UI goal may own that connection without taking the feature implementation.
+ACD does not require an invented version of the old interface.
+
 When the available versions or source selections cannot separate independent
 purposes safely, the provider can return `blocked_reason` with no goals. Finish fails with
 the explanation and keeps the work protected. It does not combine unrelated
@@ -114,7 +119,7 @@ binary objects, deletions, and unchanged entries.
 ## Bound the provider work
 
 Small requests use one planning exchange and at most one combined correction.
-Large requests first review the complete redacted evidence in bounded batches,
+Requests exceeding the direct planning budget first review whole-file evidence in bounded batches,
 then make one global plan across all recorded changes. At most 128 evidence
 reviews are allowed, with at most four immutable provider exchanges at once.
 The worker reserves each call before releasing its operation gate and continues
@@ -139,8 +144,8 @@ membership or combining unrelated goals.
 The request contains bounded metadata, redacted supplied context, and approved
 text diffs. Each encoded review is bounded to 512 KiB. The global catalogue
 and its correction can use up to 2 MiB; `ai.max_input_bytes` can lower either
-limit. A large file is divided into UTF-8 fragments without
-losing bytes. Every fragment gets a bounded factual observation before planning;
+limit. Whole-file evidence that needs review is divided into UTF-8 fragments without
+losing bytes. Every reviewed fragment gets a bounded factual observation before planning;
 ACD validates complete fragment coverage and records content digests, summaries,
 review-call counts, and attempted request sizes. Each review contains at most 32 fragments so its output stays manageable.
 A malformed or overlong review can be corrected once within the same call
@@ -152,17 +157,14 @@ other details needed by the global planner. Short notes are enough for simple
 fragments. ACD checks the complete reply locally and never cuts a summary to
 make it pass. Combined requests still obey the configured context limits.
 The global planner receives all original change identities and observations
-together, without local cache digests. For checked source selections, each review
-fragment identifies the edit IDs belonging to its exact lines. Its summary maps
-each mechanism and supporting change to those IDs or inclusive ranges. ACD
-rejects missing, repeated, or foreign selections before global planning and
-rechecks those mappings before reusing a saved review. The planner uses the
-mapped summaries with the complete edit catalogue to choose commit boundaries.
-Selectable files also keep their exact approved annotated diffs in the global
-request. The planner needs their signatures, syntax and consumers to assign
-lines safely. Whole recorded changes use observations instead. If the exact
-selectable code cannot fit the global limit, ACD fails before spending review
-calls; it never replaces that code with a summary to make it fit.
+together, without local cache digests. Source-selection requests skip reviews
+when the complete evidence fits the existing global budget. Larger requests
+review whole recorded changes while keeping exact approved annotated code for
+selectable files in the global request. Signatures, syntax and edit IDs stay
+together; no prose mapping is needed to reconstruct them. If selectable code
+cannot fit the global limit, ACD fails before spending review calls rather than
+compressing it away.
+
 Its larger catalogue and review allowance support thousands
 of meaningful goals without enlarging raw-diff review calls. Commit counts come
 from useful boundaries, not review batches. Provider context limits and the

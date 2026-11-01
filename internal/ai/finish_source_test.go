@@ -162,74 +162,73 @@ func TestFinishSourceVerifierFailureDoesNotRequestSemanticCorrection(t *testing.
 	}
 }
 
-func TestFinishSourceReviewRetainsMappingsThroughCorrectionAndRetry(t *testing.T) {
+func TestFinishSourceCodeFitsGlobalBudgetWithoutReviews(t *testing.T) {
 	evidence, options, goals := finishSourceFixture()
-	options.MaxInputBytes = 1 << 20
-	options.Diffs[0].Text += strings.Repeat(" unchanged approved context\n", 6000)
+	options.Purpose = ""
+	options.Diffs[0].Text += " unchanged UTF-8 evidence: õun 界\n"
+	provider := &finishFakeTransport{padding: 600 << 10, exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+		if request.Review != nil || request.Purpose != "" || request.Diffs[0].Text != options.Diffs[0].Text {
+			t.Fatal("complete source code was summarized, clipped or given mandatory context")
+		}
+		return json.Marshal(finishPlanOutput{Goals: goals})
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || result.Calls != 1 || result.Disclosure.EvidenceCalls != 0 || result.Source == nil {
+		t.Fatalf("direct source plan: calls=%d reviews=%d %v", result.Calls, result.Disclosure.EvidenceCalls, err)
+	}
+}
+
+func TestFinishSourceCodeSurvivesReferenceReviewCorrectionAndRetry(t *testing.T) {
+	evidence, options, goals := finishSourceFixture()
+	evidence.Target["reference.txt"] = finishTestEntry("c")
+	evidence.Changes = finish.NetChanges(evidence.Base, evidence.Target, "author")
+	reference := strings.Repeat("+ imported reference entry\n", 90000)
+	options.Diffs = append(options.Diffs, FinishDiff{ChangeID: "reference.txt", Text: reference})
+	goals = append(goals, finish.Goal{Purpose: "Supply reference data", Boundary: "Keep imported reference data independently reviewable", Reason: "Make the imported reference available to its consumers.", Message: "Supply reference data\n\n- Make the imported reference available to its consumers.", ChangeIDs: []string{"reference.txt"}})
 	var saved finish.ReviewProgress
-	options.SaveReviewProgress = func(_ context.Context, progress finish.ReviewProgress) error { saved = progress; return nil }
+	options.SaveReviewProgress = func(_ context.Context, p finish.ReviewProgress) error { saved = p; return nil }
 	retry, invalidReview, invalidPlan := false, false, false
-	provider := &finishFakeTransport{padding: 400 << 10, exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+	reviewed := ""
+	provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
 		if request.Review != nil {
 			if retry {
-				t.Fatal("matching mapped reviews were not reused")
+				t.Fatal("matching whole-file reviews were not reused")
 			}
 			var observations []map[string]string
 			for _, part := range request.Review.Parts {
-				summary := "Retain the supplied unchanged context."
-				if len(part.SourceEditIDs) > 0 {
-					if !strings.Contains(finishPrompt(request), "Cover every supplied source_edit_ids entry exactly once") || len(part.SourceEditIDs) != 4 {
-						t.Fatal("review lost its scoped IDs or source instructions")
-					}
-					summary = "edit-000001..edit-000002 expose Status.CameraID; edit-000003..edit-000004 consume CameraID in selected, after its definition."
-					if !invalidReview {
-						invalidReview = true
-						summary = "Expose camera identity and synchronize the consumer."
-					} else if request.Correction == nil || !strings.Contains(request.Correction.ValidationError, "every supplied edit ID") {
-						t.Fatal("unmapped source evidence was not corrected with specific feedback")
-					}
+				if part.ChangeID != "reference.txt" {
+					t.Fatal("selectable source was redundantly summarized")
 				}
-				observations = append(observations, map[string]string{"id": part.ID, "summary": summary})
+				if request.Correction == nil {
+					reviewed += part.Text
+				}
+				observations = append(observations, map[string]string{"id": part.ID, "summary": "Retain the complete imported reference and its role."})
+			}
+			if !invalidReview {
+				invalidReview = true
+				observations[0]["summary"] = "All tests passed"
 			}
 			return json.Marshal(map[string]any{"observations": observations})
 		}
-		mapped := false
-		for _, observation := range request.Reviews {
-			if strings.Contains(observation.Summary, "edit-000003..edit-000004 consume CameraID") {
-				mapped = true
-			}
+		if reviewed != reference || request.Diffs[0].Text != options.Diffs[0].Text || request.Diffs[1].Text != "" || len(request.Reviews) == 0 {
+			t.Fatal("source code or complete reference review was lost")
 		}
-		if !mapped || len(request.SourceEdits) != 4 || request.Diffs[0].Text != options.Diffs[0].Text {
-			t.Fatal("global planner lost the mapped observations or exact selectable code")
-		}
-		bad := append([]finish.Goal(nil), goals...)
+		bad := slices.Clone(goals)
 		if !invalidPlan {
 			invalidPlan = true
 			bad[0].Reason = ""
-		} else if !retry && request.Correction == nil {
-			t.Fatal("global correction did not retain the mapped evidence")
 		}
 		return json.Marshal(finishPlanOutput{Goals: bad})
 	}}
 	first, err := PlanFinish(t.Context(), provider, evidence, options)
-	if err != nil || first.Calls != 2 || first.Source == nil || !invalidReview || len(saved.Observations) == 0 {
-		t.Fatalf("mapped review did not reach a corrected source plan: calls=%d %v", first.Calls, err)
+	if err != nil || first.Calls != 2 || first.Source == nil || len(saved.Observations) == 0 {
+		t.Fatalf("review and correction: calls=%d %v", first.Calls, err)
 	}
 	retry = true
 	options.ReviewProgress = saved
 	second, err := PlanFinish(t.Context(), provider, evidence, options)
 	if err != nil || second.Calls != 1 || second.Disclosure.EvidenceCalls != 0 || second.Disclosure.ReusedFragments != len(saved.Observations) || second.Source == nil {
-		t.Fatalf("retry lost mapped evidence: calls=%d reused=%d %v", second.Calls, second.Disclosure.ReusedFragments, err)
-	}
-	// Stored provenance cannot make an unmapped source summary reusable.
-	options.ReviewProgress.Observations[0].Summary = "Expose identity and synchronize the consumer."
-	request, _, err := prepareFinishRequest(evidence, options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	chunks, err := finishReviewChunks(provider, request, FinishContextByteCap-(4<<10))
-	if err != nil || cachedFinishReview(chunks[0].Review.Parts, options.ReviewProgress, saved.Fingerprint) != nil {
-		t.Fatalf("cache accepted an unmapped source summary: %v", err)
+		t.Fatalf("reference retry lost exact source: calls=%d reused=%d %v", second.Calls, second.Disclosure.ReusedFragments, err)
 	}
 }
 
@@ -242,52 +241,6 @@ func TestFinishSourceReviewRejectsOversizedGlobalCodeBeforeCalls(t *testing.T) {
 	finishAssertError(t, err, "provider_input_too_large")
 	if len(provider.requests) != 0 {
 		t.Fatal("oversized selectable code spent provider calls or lost code")
-	}
-}
-
-func TestFinishSourceReviewMappingValidation(t *testing.T) {
-	ids := []string{"_edit-000001", "_edit-000002", "_edit-000004"}
-	for _, test := range []struct{ name, summary string }{
-		{"missing", "_edit-000001 defines status; _edit-000004 consumes status."},
-		{"unknown", "_edit-000001.._edit-000004 changes status and its consumer."},
-		{"duplicate", "_edit-000001.._edit-000002 defines status; _edit-000002 and _edit-000004 consume status."},
-		{"backwards", "_edit-000002.._edit-000001 defines status; _edit-000004 consumes status."},
-		{"unmapped", "Define status and consume the available identity."},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if err := validateFinishReviewSourceIDs(test.summary, ids); err == nil {
-				t.Fatal("incomplete or invented source mapping was accepted")
-			}
-		})
-	}
-	if err := validateFinishReviewSourceIDs("_edit-000001.._edit-000002 define status; _edit-000004 consumes the available identity.", ids); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestFinishSourceReviewMapsSplitUTF8Lines(t *testing.T) {
-	text := "[edit-000001] +" + strings.Repeat("界", 200) + "\n[edit-000002] -previous value\n"
-	texts := finishDiffParts(text, 32)
-	mapped, err := finishReviewSourceIDs(texts, []string{"edit-000001", "edit-000002"})
-	if err != nil || strings.Join(texts, "") != text || len(mapped) != len(texts) {
-		t.Fatalf("mapping changed the fragment evidence: %v", err)
-	}
-	offset := 0
-	for i, fragment := range texts {
-		for _, id := range mapped[i] {
-			lineStart := strings.Index(text, "["+id+"] ")
-			lineEnd := lineStart + strings.IndexByte(text[lineStart:], '\n') + 1
-			if offset >= lineEnd || offset+len(fragment) <= lineStart {
-				t.Fatalf("%s was associated with unrelated fragment %d", id, i)
-			}
-		}
-		if len(mapped[i]) == 0 {
-			t.Fatalf("fragment %d lost its annotated line identity", i)
-		}
-		offset += len(fragment)
-	}
-	if _, err := finishReviewSourceIDs(texts, []string{"edit-000003"}); err == nil {
-		t.Fatal("missing source annotation was accepted")
 	}
 }
 

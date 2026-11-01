@@ -18,18 +18,17 @@
 
 ### Changed
 
+- Send complete source-selection evidence directly to global planning when it
+  fits the existing budget. Review only whole-file evidence that needs summaries,
+  preserving exact selectable code and removing redundant source-ID summaries.
+  Allow tested feature prerequisites before their separate UI integration when
+  the frozen caller line couples feature wiring to a new layout.
 - Assign source ownership through one ordered catalogue instead of overlapping
   per-goal ranges. Preserve the global correction for useful planning feedback.
   New requests can stage new Go and Swift files from exact frozen lines, so
   independent features need not share a commit with Settings or layout work.
   Collect all candidate failures within the existing budget for one correction;
   never pin or publish a rejected chain. Older frozen requests keep their rules.
-- Preserve code-to-edit associations through large Intent evidence reviews.
-  Supply each fragment's exact edit IDs, require mapped summaries with complete
-  coverage, and revalidate saved mappings before retry. Keep the existing review
-  format, bounded calls, and global commit planning. Retain exact approved
-  annotated diffs for selectable files in global planning; fail before review
-  calls if that code cannot fit the global request limit.
 - Keep finish context optional in Local and Intent. Accept longer handoffs with
   decisions and constraints for the planner to examine alongside code changes.
   Require reasons in AI-generated messages; preserve advanced exact overrides

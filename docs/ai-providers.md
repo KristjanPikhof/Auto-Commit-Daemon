@@ -91,20 +91,13 @@ adds no unchanged content, object identities, or unreferenced file names and
 requires no extra repository scan. It is conservative: unlisted dependencies
 are not necessarily missing.
 
-There is no separate per-file rejection limit. Large files and batches are
-reviewed in bounded fragments before one global plan. Every complete redacted
-text diff reaches the provider across those fragments. Their factual summaries
-and original change identities enter the global plan together; a fragment does
-not become a commit. For checked source selections, review fragments include
-`source_edit_ids`. Each summary must associate every supplied ID with the
-mechanism it implements, using individual IDs or inclusive ranges. ACD validates
-complete coverage before planning and before reusing a saved review. The global
-planner receives these associations alongside the complete edit catalogue.
-It also receives the exact approved annotated diffs for selectable files, so
-source ownership and prerequisite order can be checked against code. Whole
-recorded changes use observations. Selectable code must fit the global request
-limit; otherwise the attempt fails before any review calls.
-Small requests keep the direct planning path.
+There is no separate per-file rejection limit. Source-selection requests go
+straight to global planning when their complete approved evidence fits the
+existing global limit. Their annotated code is not replaced with summaries.
+When a larger request needs reviews, only whole recorded changes are summarized;
+selectable code remains complete in the global request. Every approved diff
+reaches the provider in full through one of those paths. Fragments never become
+commit boundaries. Small non-source requests keep their direct planning path.
 
 `ai.max_input_bytes` accepts 128 KiB through 64 MiB, in bytes, through
 `acd config` or `ACD_AI_MAX_INPUT_BYTES`. It bounds aggregate evidence, while
@@ -225,9 +218,3 @@ Every supplied part ID must appear exactly once, with a summary of at most 4,096
 characters. Unsupported review operations fail the explicit request; they do not
 fall back to another provider or Local. Ordinary `finish_plan` exchanges keep
 their existing protocol.
-
-When a part includes `source_edit_ids`, retain them in its summary. For example:
-`"edit-000001..edit-000002 define CameraID; edit-000003..edit-000004 read CameraID in the selection control."`
-Every supplied ID must appear exactly once, individually or in an inclusive
-range. Describe separate mechanisms with their own IDs; an unexplained list of
-IDs does not tell the planner how the code fits together.

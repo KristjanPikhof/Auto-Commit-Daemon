@@ -26,12 +26,11 @@ const finishReviewPartLimit = 32
 const finishReviewConcurrency = 4
 
 type FinishReviewPart struct {
-	ID            string   `json:"id"`
-	ChangeID      string   `json:"change_id"`
-	Part          int      `json:"part"`
-	Parts         int      `json:"parts"`
-	Text          string   `json:"text"`
-	SourceEditIDs []string `json:"source_edit_ids,omitempty"`
+	ID       string `json:"id"`
+	ChangeID string `json:"change_id"`
+	Part     int    `json:"part"`
+	Parts    int    `json:"parts"`
+	Text     string `json:"text"`
 }
 
 type FinishReviewTask struct {
@@ -68,7 +67,7 @@ func reviewFinishEvidence(ctx context.Context, transport FinishTransport, reques
 	if err != nil {
 		return finishFailure("provider_input", err)
 	}
-	if len(body) <= limit {
+	if len(body) <= limit || (len(request.SourceEdits) > 0 && len(body) <= min(inputLimit, FinishPlanningByteCap)) {
 		return nil
 	}
 	// Prove the global catalogue and selectable code fit before any review calls.
@@ -92,8 +91,17 @@ func reviewFinishEvidence(ctx context.Context, transport FinishTransport, reques
 	if planningLimit := min(inputLimit, FinishPlanningByteCap); len(metadata) > planningLimit {
 		return finishContextLimit(len(metadata), planningLimit)
 	}
+	// Selectable code stays complete in the global request; review only the
+	// whole-file evidence that actually needs summarizing.
+	review := *request
+	review.Diffs = nil
+	for _, diff := range request.Diffs {
+		if !selectable[diff.ChangeID] {
+			review.Diffs = append(review.Diffs, diff)
+		}
+	}
 	// Leave room for bounded validation feedback when a review needs correction.
-	chunks, err := finishReviewChunks(transport, *request, limit-(4<<10))
+	chunks, err := finishReviewChunks(transport, review, limit-(4<<10))
 	if err != nil {
 		return err
 	}
@@ -320,20 +328,12 @@ func finishReviewChunks(transport FinishTransport, request FinishPlanRequest, li
 	for _, change := range request.Changes {
 		changes[change.ID] = change
 	}
-	sourceIDs := make(map[string][]string)
-	for _, edit := range request.SourceEdits {
-		sourceIDs[edit.ChangeID] = append(sourceIDs[edit.ChangeID], edit.ID)
-	}
 	var parts []FinishReviewPart
 	for _, diff := range request.Diffs {
 		// Leave ample room for two JSON encodings and worst-case escaping.
 		texts := finishDiffParts(diff.Text, limit/8)
-		mapped, err := finishReviewSourceIDs(texts, sourceIDs[diff.ChangeID])
-		if err != nil {
-			return nil, finishFailure("invalid_evidence", err)
-		}
 		for i, text := range texts {
-			parts = append(parts, FinishReviewPart{ID: fmt.Sprintf("part-%d", len(parts)+1), ChangeID: diff.ChangeID, Part: i + 1, Parts: len(texts), Text: text, SourceEditIDs: mapped[i]})
+			parts = append(parts, FinishReviewPart{ID: fmt.Sprintf("part-%d", len(parts)+1), ChangeID: diff.ChangeID, Part: i + 1, Parts: len(texts), Text: text})
 		}
 	}
 	newChunk := func() FinishPlanRequest {
@@ -422,14 +422,13 @@ func validateFinishReview(raw []byte, parts []FinishReviewPart) ([]FinishReviewO
 		return nil, errors.New("evidence review must cover every fragment exactly once")
 	}
 	summaries := make(map[string]string, len(parts))
-	known := make(map[string]FinishReviewPart, len(parts))
+	known := make(map[string]bool, len(parts))
 	for _, part := range parts {
-		known[part.ID] = part
+		known[part.ID] = true
 	}
 	var problems []error
 	for _, observation := range output.Observations {
-		part, exists := known[observation.ID]
-		if !exists {
+		if !known[observation.ID] {
 			return nil, errors.New("evidence review included an unknown fragment ID")
 		}
 		if _, seen := summaries[observation.ID]; seen {
@@ -443,9 +442,6 @@ func validateFinishReview(raw []byte, parts []FinishReviewPart) ([]FinishReviewO
 		}
 		if finishVerificationClaim.MatchString(observation.Summary) {
 			problems = append(problems, fmt.Errorf("%s must describe recorded code, not claim tests or verification ran", observation.ID))
-		}
-		if err := validateFinishReviewSourceIDs(observation.Summary, part.SourceEditIDs); err != nil {
-			problems = append(problems, fmt.Errorf("%s: %w", part.ID, err))
 		}
 		summaries[observation.ID] = finishRedactText(observation.Summary)
 	}

@@ -203,28 +203,16 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 			var observations []map[string]string
 			for _, part := range request.Review.Parts {
 				summary := "Record the supplied operational conventions."
-				if len(part.SourceEditIDs) > 0 {
-					if part.ChangeID != "camera.sh" || len(part.SourceEditIDs) != 3 {
-						t.Errorf("review lost its scoped source identities: %+v", part)
-					}
-					var facts []string
-					for _, id := range part.SourceEditIDs {
-						fact := " updates selected to consume the available identity"
-						if strings.Contains(part.Text, "["+id+"] +active_identity()") {
-							fact = " defines active_identity before its consumer"
-						}
-						facts = append(facts, id+fact)
-					}
-					summary = strings.Join(facts, "; ") + "."
-					if !rejected.Swap(true) {
-						summary = "Expose identity and synchronize the consumer."
-					} else if request.Correction == nil || !strings.Contains(request.Correction.ValidationError, "every supplied edit ID") {
-						t.Error("unmapped source review bypassed bounded correction")
-					} else {
-						corrections.Add(1)
-					}
+				if part.ChangeID != "notes.txt" {
+					t.Error("selectable code was redundantly reviewed")
 				}
 				observations = append(observations, map[string]string{"id": part.ID, "summary": summary})
+			}
+			if !rejected.Swap(true) {
+				observations[0]["summary"] = "All tests passed"
+			}
+			if request.Correction != nil {
+				corrections.Add(1)
 			}
 			raw, _ := json.Marshal(map[string]any{"observations": observations})
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "finish_evidence", "arguments": string(raw)}}}}}}})
@@ -245,20 +233,17 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 				t.Error("global plan resent the whole recorded reference file")
 			}
 		}
-		for _, edit := range request.SourceEdits {
-			found := false
-			for _, observation := range request.Reviews {
-				group := 1
-				if strings.Contains(observation.Summary, edit.ID+" defines active_identity") {
-					group = 0
-				} else if !strings.Contains(observation.Summary, edit.ID+" updates selected") {
+		for _, diff := range request.Diffs {
+			for _, line := range strings.Split(diff.Text, "\n") {
+				if !strings.HasPrefix(line, "[") {
 					continue
 				}
-				goals[group].ChangeIDs = append(goals[group].ChangeIDs, edit.ID)
-				found = true
-			}
-			if !found {
-				t.Error("global planning lost the code-to-edit association")
+				id, _, _ := strings.Cut(line[1:], "] ")
+				group := 1
+				if strings.Contains(line, "] +active_identity()") {
+					group = 0
+				}
+				goals[group].ChangeIDs = append(goals[group].ChangeIDs, id)
 			}
 		}
 		owners := make(map[string]int)
@@ -284,7 +269,7 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 	f.BaseHead = strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
 	f.Barrier(t, t.Context())
 	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "active_identity() { printf camera; }\nselected() { active_identity; }\n")
-	writeFile(t, filepath.Join(f.Repo, "notes.txt"), strings.Repeat("Rule: retain the operational conventions for contributors.\n", 9000))
+	writeFile(t, filepath.Join(f.Repo, "notes.txt"), strings.Repeat("Rule: retain the operational conventions for contributors.\n", 40000))
 	completed := decodeFinishWorkflow(t, f.Run(t, t.Context(), "finish", "--json"))
 	if !completed.Published || completed.CommitsCreated != 3 || !completed.Target.SourceSelection || completed.EvidenceCalls != int(reviews.Load()) || corrections.Load() != 1 || plans.Load() != 1 {
 		t.Fatalf("reviewed source mappings were not published: %+v reviews=%d corrections=%d plans=%d", completed, reviews.Load(), corrections.Load(), plans.Load())
