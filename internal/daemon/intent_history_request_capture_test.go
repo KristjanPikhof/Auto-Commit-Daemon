@@ -17,8 +17,8 @@ func TestFinishHistoryRewriteProtectsLaterWorkDuringFrozenVerification(t *testin
 	f, w := finishWorkerFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	oldA := mustCommitPath(t, f.dir, "a.txt", "alpha\n", "Add alpha")
-	oldB := mustCommitPath(t, f.dir, "b.txt", "beta\n", "Add beta")
+	oldA := mustCommitPath(t, f.dir, "a.txt", "alpha\n", "Add alpha\n\n- Keep the authored alpha value available for rollback.")
+	oldB := mustCommitPath(t, f.dir, "b.txt", "beta\n", "Add beta\n\n- Keep the independent beta value available for rollback.")
 	f.cctx.BaseHead = oldB
 	plan, err := PlanFinishHistory(ctx, f.dir, f.cctx.BranchRef, []string{oldA, oldB}, nil, nil, FinishHistoryOptions{Mode: "local", Style: "imperative", VerificationConfigDigest: w.Config.ConfigDigest})
 	if err != nil {

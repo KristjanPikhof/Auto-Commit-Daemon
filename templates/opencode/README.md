@@ -34,7 +34,7 @@ that repository/worktree only if existing user and repository instructions
 authorize committing:
 
 ~~~bash
-acd finish --repo /path/to/worktree 'Complete the settings update'
+acd finish --repo /path/to/worktree 'Keep saved choices when settings reload'
 ~~~
 
 Describe the problem, approach, and constraints in the purpose so Intent can

@@ -20,7 +20,7 @@ func TestLegacyAttentionBoundsHumanEvidenceWithoutHidingRecovery(t *testing.T) {
 	report := statusReport{Daemon: "running", PID: os.Getpid(), Protected: true, PublicationOutcome: publicationOutcome{Legacy: legacy, PendingChanges: 1, CountsKnown: true}}
 	var result controlResult
 	applyFinishControlStatus(&result, report, true)
-	if result.NextAction != "Run `acd finish` when this work is complete." {
+	if result.NextAction != "Run `acd finish \"what changed and why\"` when this work is complete." {
 		t.Fatalf("archived evidence displaced current-work action: %s", result.NextAction)
 	}
 	var shared, product bytes.Buffer

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -27,7 +28,7 @@ func Local(evidence Evidence, options LocalOptions) (Plan, error) {
 	}
 	message := options.Message
 	if message != "" {
-		if err := ValidateMessage(options.Style, message); err != nil {
+		if err := ValidatePublicationMessage(options.Style, message); err != nil {
 			return Plan{}, err
 		}
 	}
@@ -35,62 +36,45 @@ func Local(evidence Evidence, options LocalOptions) (Plan, error) {
 		return Build(evidence, nil)
 	}
 	if message == "" {
-		message = localMessage(evidence, options)
-		if err := ValidateMessage(options.Style, message); err != nil {
+		if !strings.ContainsFunc(options.Purpose, unicode.IsLetter) {
+			return Plan{}, ErrCompletionContextRequired
+		}
+		message = localMessage(options)
+		if err := ValidatePublicationMessage(options.Style, message); err != nil {
 			return Plan{}, err
 		}
 	}
 	purpose := strings.TrimSpace(options.Purpose)
 	if purpose == "" {
-		purpose = "Save the complete protected batch"
+		purpose = strings.SplitN(message, "\n", 2)[0]
 	}
 	ids := make([]string, 0, len(evidence.Changes))
 	for _, change := range evidence.Changes {
 		ids = append(ids, change.ID)
 	}
-	return Build(evidence, []Goal{{Purpose: purpose, Message: message, ChangeIDs: ids}})
+	reason := strings.TrimSpace(options.Purpose)
+	if options.Message != "" {
+		_, reason, _ = strings.Cut(message, "\n\n")
+	}
+	return Build(evidence, []Goal{{Purpose: purpose, Reason: reason, Message: message, ChangeIDs: ids}})
 }
 
-func localMessage(evidence Evidence, options LocalOptions) string {
-	var added, updated, removed int
-	for _, name := range changedPaths(evidence.Base, evidence.Target) {
-		switch {
-		case evidence.Base[name] == (Entry{}):
-			added++
-		case evidence.Target[name] == (Entry{}):
-			removed++
-		default:
-			updated++
-		}
-	}
+func localMessage(options LocalOptions) string {
 	purpose := strings.Join(strings.Fields(options.Purpose), " ")
-	count := added + updated + removed
-	noun := "paths"
-	if count == 1 {
-		noun = "path"
-	}
-	subject := fmt.Sprintf("Save %d changed %s", count, noun)
-	if label := strings.TrimSpace(strings.TrimRight(purpose, ".")); label != "" {
-		subject = "Complete " + label
-	}
+	subject := strings.TrimSpace(strings.TrimRight(purpose, "."))
 	prefix := ""
 	if options.Style == StyleConventional {
 		prefix = "chore: "
 	}
-	if utf8.RuneCountInString(subject)+len(prefix) > SubjectLimit {
-		subject = "Complete protected batch"
+	if utf8.RuneCountInString(subject)+len(prefix) > SubjectLimit || ValidateMessage(StyleImperative, subject) != nil {
+		subject = "Complete requested work"
 	}
 	if prefix != "" {
-		subject = prefix + strings.ToLower(subject[:1]) + subject[1:]
+		characters := []rune(subject)
+		characters[0] = unicode.ToLower(characters[0])
+		subject = prefix + string(characters)
 	}
-	var body []string
-	if purpose != "" {
-		body = append(body, wrapLocalBullet("Purpose: "+purpose)...)
-	}
-	counts := fmt.Sprintf("Include %d added, %d updated, and %d removed paths.", added, updated, removed)
-	body = append(body, wrapLocalBullet(counts)...)
-	body = append(body, "- Save the entire frozen batch in one local commit.")
-	return subject + "\n\n" + strings.Join(body, "\n")
+	return subject + "\n\n" + strings.Join(wrapLocalBullet(purpose), "\n")
 }
 
 func wrapLocalBullet(text string) []string {

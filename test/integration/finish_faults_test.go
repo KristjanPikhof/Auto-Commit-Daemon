@@ -240,7 +240,7 @@ func TestFinishFaultOneCombinedCorrection(t *testing.T) {
 	if calls.Load() != 0 {
 		t.Fatal("checkpoint called provider")
 	}
-	result := finishRunJSON(t, f, "finish", "Complete parser goal", "--message", "Complete parser goal")
+	result := finishRunJSON(t, f, "finish", "Complete parser goal", "--message", "Complete parser goal\n\n- Keep the approved work separate from later edits.")
 	if !result.OK || !result.Data.Published || result.Data.CommitsCreated != 1 || result.Data.PlanningCalls != 2 || calls.Load() != 2 {
 		t.Fatalf("bounded correction result %+v calls=%d", result, calls.Load())
 	}
@@ -269,7 +269,7 @@ func TestFinishFaultProviderFailureRetryKeepsFrozenTarget(t *testing.T) {
 				writeFinishChatArguments(t, w, `{"goals":[{"purpose":"Invent unrelated work","message":"Complete unrelated work","change_ids":["not-recorded"]}]}`)
 			}, "10s")
 			writeFile(t, filepath.Join(f.Repo, "goal.txt"), "selected\n")
-			failed := finishRunJSON(t, f, "finish", "Complete selected goal", "--message", "Complete selected goal")
+			failed := finishRunJSON(t, f, "finish", "Complete selected goal", "--message", "Complete selected goal\n\n- Keep the approved work separate from later edits.")
 			wantCalls := int32(2)
 			if kind == "timeout" {
 				wantCalls = 1
@@ -327,7 +327,7 @@ func TestFinishFaultDisconnectedClientsReconnectToOneRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	resultCh := make(chan ExecResult, 1)
 	go func() {
-		resultCh <- f.Run(t, ctx, "finish", "Complete selected goal", "--message", "Complete selected goal", "--json")
+		resultCh <- f.Run(t, ctx, "finish", "Complete selected goal", "--message", "Complete selected goal\n\n- Keep the approved work separate from later edits.", "--json")
 	}()
 	select {
 	case <-entered:
@@ -375,7 +375,7 @@ func TestFinishFaultVerificationFailureKeepsCompleteBatch(t *testing.T) {
 		writeFinishChatResponse(t, w, decodeFinishChatRequest(t, r))
 	}, "10s", map[string]string{config.FieldIntentVerification: "full", config.FieldVerificationFullCommand: command, config.FieldVerificationFullTimeout: "5s"}, ai.ConfirmationVerificationCommand)
 	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "selected\n")
-	failed := finishRunJSON(t, f, "finish", "Complete checked goal", "--message", "Complete checked goal")
+	failed := finishRunJSON(t, f, "finish", "Complete checked goal", "--message", "Complete checked goal\n\n- Keep the approved work separate from later edits.")
 	if failed.OK || failed.Data.State != state.FinishFailed || calls.Load() != 1 || strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")) != f.BaseHead {
 		t.Fatalf("check failure %+v calls=%d", failed, calls.Load())
 	}
@@ -405,7 +405,7 @@ func TestFinishFaultSubprocessFailureDoesNotFallback(t *testing.T) {
 	f := newFinishFixture(t, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	f.Apply(t, t.Context(), map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "subprocess:fail", config.FieldTimeout: "2s"}, ai.ConfirmationSubprocessExecution, ai.ConfirmationDiffEgress)
 	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "protected\n")
-	failed := finishRunJSON(t, f, "finish", "Complete protected goal", "--message", "Complete protected goal")
+	failed := finishRunJSON(t, f, "finish", "Complete protected goal", "--message", "Complete protected goal\n\n- Keep the approved work separate from later edits.")
 	raw, err := os.ReadFile(spawns)
 	if failed.OK || failed.Data.State != state.FinishFailed || failed.Data.PlanningCalls != 1 || err != nil || strings.Count(string(raw), "spawn") != 1 || commitCount(t, f.Repo) != 1 {
 		t.Fatalf("subprocess failure fell back %+v spawns=%q %v", failed, raw, err)
@@ -456,7 +456,7 @@ func TestFinishFaultLargeAssetsStayProtectedDuringProviderOutage(t *testing.T) {
 	writeFile(t, filepath.Join(f.Repo, "settings.py"), "def save(value): return value\n")
 	runGitOK(t, f.Repo, "add", "settings.py")
 	before := runGitOK(t, f.Repo, "ls-files", "--stage")
-	failed := finishRunJSON(t, f, "finish", "Complete bundled autocomplete", "--include-staged", "--message", "Complete bundled autocomplete")
+	failed := finishRunJSON(t, f, "finish", "Complete bundled autocomplete", "--include-staged", "--message", "Complete bundled autocomplete\n\n- Keep the approved work separate from later edits.")
 	if failed.OK || failed.Data.State != state.FinishFailed || calls.Load() != 1 || runGitOK(t, f.Repo, "ls-files", "--stage") != before || commitCount(t, f.Repo) != 1 {
 		t.Fatalf("outage altered native state %+v calls=%d", failed, calls.Load())
 	}

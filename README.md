@@ -98,12 +98,19 @@ an editor or agent exits. A worker heartbeat shows liveness, not publication.
 ## Finish options
 
 ~~~bash
-acd finish
-acd finish --message "Update setup guidance"
+acd finish "Keep checkout available without a network"
+acd finish --message "Preserve saved choices
+
+- Reload settings without resetting the saved selection."
 acd finish --dry-run "Add offline checkout"
-acd finish --include-staged
+acd finish --include-staged "Keep approved staged choices"
 acd finish --retry REQUEST_ID
 ~~~
+
+Local needs your explanation of what changed and why, or an exact message with
+that explanation in its body. It cannot infer the reason offline. Missing
+context leaves the work saved and asks for a new finish. An empty target still
+succeeds without a commit.
 
 For Intent, give context about what changed and why so ACD can explain useful
 steps within the task. Generated messages include a short reason or concrete
@@ -139,10 +146,11 @@ switches to Local mode.
 For the first finish-based release, deprecated `acd commit-all --yes` delegates
 to finish and retains explicit staged-selection consent. Use `acd finish` for
 new workflows. The alias has no separate drain or publication engine.
+Local needs an explanation through `acd finish`; the alias has no context argument.
 
 ## Messages, providers, and checks
 
-Local uses one honest batch summary, or your supplied purpose/message. Intent
+Local uses your supplied explanation for one complete batch. Intent
 plans goals before assigning paths. Implementation, callers, tests, generated
 output, and relevant docs stay together when they complete one goal. A split
 needs a useful review or revert boundary and a valid intermediate tree.

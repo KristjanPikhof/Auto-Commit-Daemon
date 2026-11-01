@@ -1,6 +1,7 @@
 package finish
 
 import (
+	"errors"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -30,17 +31,17 @@ func TestFinishLocalOfflineBatch(t *testing.T) {
 	for _, style := range []string{StyleImperative, StyleConventional} {
 		t.Run(style, func(t *testing.T) {
 			evidence := localEvidence()
-			plan, err := Local(evidence, LocalOptions{Style: style})
+			plan, err := Local(evidence, LocalOptions{Style: style, Purpose: "Keep approved staging when later edits arrive"})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if len(plan.Steps) != 1 || !maps.Equal(plan.Steps[0].Tree, evidence.Target) || len(plan.Steps[0].ChangeIDs) != 3 {
 				t.Fatalf("not a complete batch: %+v", plan)
 			}
-			if !strings.Contains(plan.Steps[0].Message, "1 added, 1 updated, and 1 removed") {
-				t.Fatalf("missing grounded evidence: %q", plan.Steps[0].Message)
+			if !strings.Contains(plan.Steps[0].Message, "Keep approved staging when later edits arrive") || plan.Steps[0].Reason == "" {
+				t.Fatalf("missing supplied reason: %q", plan.Steps[0].Message)
 			}
-			again, err := Local(evidence, LocalOptions{Style: style})
+			again, err := Local(evidence, LocalOptions{Style: style, Purpose: "Keep approved staging when later edits arrive"})
 			if err != nil || !reflect.DeepEqual(plan, again) {
 				t.Fatalf("nondeterministic output: %+v, %v", again, err)
 			}
@@ -58,7 +59,7 @@ func TestFinishLocalPurposeAndExactMessage(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(plan.Steps[0].Message, "Complete staged content safety") && !strings.Contains(plan.Steps[0].Message, "complete staged content safety") {
+		if !strings.Contains(plan.Steps[0].Message, "staged content safety") || plan.Steps[0].Reason != "staged content safety" {
 			t.Fatalf("purpose was lost: %q", plan.Steps[0].Message)
 		}
 		message := "Preserve staged content\n\n- Keep the approved staged versions during publication.\n"
@@ -84,7 +85,7 @@ func TestFinishLocalLongPurposeIsRetained(t *testing.T) {
 			t.Fatalf("long Unicode purpose was clipped: %q", message)
 		}
 	}
-	if _, err := Local(localEvidence(), LocalOptions{Purpose: "..."}); err != nil {
+	if _, err := Local(localEvidence(), LocalOptions{Purpose: "..."}); !errors.Is(err, ErrCompletionContextRequired) {
 		t.Fatal(err)
 	}
 }
@@ -108,12 +109,12 @@ func TestFinishLocalRecordedSavesMakeOneCommit(t *testing.T) {
 		{ID: "save2", Path: "app", Before: planEntry("b"), After: planEntry("c"), Author: "one"},
 		{ID: "save3", Path: "app", Before: planEntry("c"), After: planEntry("d"), Author: "one"},
 	}}
-	plan, err := Local(evidence, LocalOptions{})
+	plan, err := Local(evidence, LocalOptions{Purpose: "Keep completed edits together rather than publishing each save"})
 	if err != nil || len(plan.Steps) != 1 || len(plan.Steps[0].ChangeIDs) != 3 || !maps.Equal(plan.Steps[0].Tree, evidence.Target) {
 		t.Fatalf("saved chronology leaked into commit boundaries: %+v, %v", plan, err)
 	}
 	evidence.Changes[1].Author = "other"
-	if _, err := Local(evidence, LocalOptions{}); err == nil {
+	if _, err := Local(evidence, LocalOptions{Purpose: "Keep completed edits together rather than publishing each save"}); err == nil {
 		t.Fatal("local batch erased a recorded author boundary")
 	}
 }

@@ -179,31 +179,6 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 					commit.Author = evidence.Changes[index].Author
 				}
 			}
-			if options.Mode == "local" && finish.ValidateMessage(options.Style, goal.Message) != nil {
-				before, err := git.IntentHistoryBaseTree(ctx, repo, oid)
-				if err != nil {
-					return plan, err
-				}
-				baseTree, err := readFinishTree(ctx, repo, before)
-				if err != nil {
-					return plan, err
-				}
-				target, err := readFinishTree(ctx, repo, oid)
-				if err != nil {
-					return plan, err
-				}
-				local, err := finish.Local(finish.Evidence{Base: baseTree, Target: target, Changes: finish.NetChanges(baseTree, target, "recorded")}, finish.LocalOptions{Style: options.Style})
-				if err != nil {
-					return plan, err
-				}
-				goal.Message = "Preserve recorded empty commit"
-				if options.Style == finish.StyleConventional {
-					goal.Message = "chore: preserve recorded empty commit"
-				}
-				if len(local.Steps) > 0 {
-					goal.Message = local.Steps[0].Message
-				}
-			}
 			plan.Goals = append(plan.Goals, goal)
 			commits = append(commits, commit)
 		}
@@ -409,6 +384,11 @@ func (w *FinishWorker) ExecuteFinishHistoryRequest(ctx context.Context, plan sta
 	}
 	if err := ValidateIntentHistoryPlan(ctx, w.RepoPath, plan); err != nil {
 		return fail(err)
+	}
+	for _, goal := range plan.Goals {
+		if err := finish.ValidatePublicationMessage(plan.CommitFormat, goal.Message); err != nil {
+			return fail(fmt.Errorf("history rewrite: review the message with --edit before applying: %w", err))
+		}
 	}
 	wt, cfg, digest, err := w.resolved(ctx)
 	if err != nil {

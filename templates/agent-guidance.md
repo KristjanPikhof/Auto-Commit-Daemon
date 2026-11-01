@@ -6,13 +6,14 @@ ACD protects changes in private checkpoints. `acd finish` creates branch commits
   `git add` or `git commit`. An error does not prove ACD is inactive. Use manual
   commits only after confirming it is inactive and repository rules allow them.
 - When committing is authorized, run `acd finish` with the completed change
-  and its reason, for example `acd finish "Preserve saved choices on reload"`,
+  and its reason, for example `acd finish "Keep saved choices when settings reload"`,
   after the task and relevant checks are complete, before handoff or a branch
   switch. During longer tasks, finish complete, verified milestones separately.
 - Supply context about the problem, chosen approach, and constraints so Intent
   can explain decisions and identify useful steps within the task. Use an exact
   `--message` only when the user supplies the text or explicitly requests one
   batch; it disables splitting. Let Intent write and split messages otherwise.
+  Local requires supplied context. Exact messages need an explanatory body.
   Review the actual commit boundaries and reasons before claiming success.
 - Name independent problems in the completion context. Explain the previous
   failure or constraint and the chosen mechanism, not just the files edited.

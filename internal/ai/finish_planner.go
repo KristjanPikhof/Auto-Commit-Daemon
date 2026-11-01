@@ -132,6 +132,9 @@ func (e *FinishPlanningError) Error() string {
 }
 func (e *FinishPlanningError) Unwrap() error { return e.Err }
 func (e *FinishPlanningError) Retryable() bool {
+	if errors.Is(e.Err, finish.ErrMessageReasonRequired) {
+		return false
+	}
 	return e.Code != "provider_context_required" && e.Code != "provider_diffs_required" && e.Code != "provider_input_too_large"
 }
 
@@ -203,7 +206,7 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		return result, finishFailure("invalid_options", err)
 	}
 	if options.Message != "" {
-		if err := finish.ValidateMessage(options.Style, options.Message); err != nil {
+		if err := finish.ValidatePublicationMessage(options.Style, options.Message); err != nil {
 			return result, finishFailure("invalid_options", err)
 		}
 	}

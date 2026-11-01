@@ -214,7 +214,7 @@ func TestFinishWorkerKeepsStagedAndExactMessageBatchesOutOfVersions(t *testing.T
 				finishWorkerGit(t, f.dir, "add", "auth.sh", "verify.sh")
 				options.IncludeStaged = true
 			} else {
-				options.Message = "Add Google authentication"
+				options.Message = "Add Google authentication\n\n- Route Google requests while preserving password authentication."
 			}
 			r := startFinishWorker(t, w, options)
 			if len(r.Target.Checkpoints) != 0 {
@@ -230,7 +230,7 @@ func TestFinishWorkerKeepsStagedAndExactMessageBatchesOutOfVersions(t *testing.T
 }
 
 func TestFinishWorkerRequiresDiffsEvenWithCompletionContext(t *testing.T) {
-	for _, options := range []FinishOptions{{Purpose: "Publish the completed protected goal"}, {DryRun: true, Purpose: "Preview the completed protected goal"}, {Message: "Preserve completed behavior"}} {
+	for _, options := range []FinishOptions{{Purpose: "Publish the completed protected goal"}, {DryRun: true, Purpose: "Preview the completed protected goal"}, {Message: "Preserve completed behavior\n\n- Keep completed work separate from later edits."}} {
 		t.Run(fmt.Sprintf("preview_%t_message_%t", options.DryRun, options.Message != ""), func(t *testing.T) {
 			f, w := finishWorkerFixture(t)
 			finishWrite(t, f.dir, "goal.txt", "protected\n")

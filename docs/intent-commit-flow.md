@@ -153,7 +153,8 @@ belonging to one feature is not enough. Failed intermediate checks never publish
 a partial chain or silently combine commits. A source plan that still fails
 after the available correction ends the request.
 
-`--message` requests one complete batch with that exact valid message and disables
+`--message` needs an explanatory body. It requests one complete batch with that
+exact valid message and disables
 automatic splitting. Use the quoted purpose for grouping context. In Intent
 mode an exact message still requires provider planning.
 

@@ -76,6 +76,38 @@ func TestFinishWorkflowSameFileDecisions(t *testing.T) {
 	assertFinishWorkflowStatus(t, t.Context(), f, true)
 }
 
+func TestFinishWorkflowRequiresExplanation(t *testing.T) {
+	f := newFinishFixture(t)
+	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "approved work\n")
+	failed := finishRunJSON(t, f, "finish")
+	if failed.OK || failed.Data.ReasonCode != "finish_context_required" || failed.Data.Published {
+		t.Fatalf("Local published without an explanation: %+v", failed)
+	}
+	exact := f.Run(t, t.Context(), "finish", "--message", "Preserve approved work")
+	if exact.ExitCode == 0 || !strings.Contains(exact.Stdout+exact.Stderr, "body") || strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")) != f.BaseHead {
+		t.Fatalf("exact message bypassed the reason requirement: %+v", exact)
+	}
+	f.Barrier(t, t.Context())
+	for _, command := range []string{"status", "list"} {
+		var result ExecResult
+		if command == "list" {
+			result = runAcd(t, t.Context(), f.Env, "list", "--once", "--json")
+		} else {
+			result = f.Run(t, t.Context(), command, "--json")
+		}
+		if result.ExitCode != 0 || !strings.Contains(result.Stdout, "what changed and why") || strings.Contains(result.Stdout, "--retry") {
+			t.Fatalf("%s lost saved work or requested an unchanged retry: %+v", command, result)
+		}
+	}
+	purpose := "Keep approved work separate from later edits"
+	completed := finishRunJSON(t, f, "finish", purpose)
+	if !completed.OK || !completed.Data.Published || completed.Data.CommitsCreated != 1 || !strings.Contains(runGitOK(t, f.Repo, "log", "-1", "--format=%B"), purpose) {
+		t.Fatalf("explained Local finish did not publish its reason: %+v", completed)
+	}
+	f.Barrier(t, t.Context())
+	assertFinishWorkflowStatus(t, t.Context(), f, true)
+}
+
 func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 	var calls atomic.Int32
 	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +227,7 @@ func TestFinishWorkflowSharesCodeInEveryPlanningExchange(t *testing.T) {
 	f.Barrier(t, t.Context())
 	for _, args := range [][]string{
 		{"finish", "Allow the completed policy", "--dry-run", "--json"},
-		{"finish", "--message", "Allow the completed policy", "--dry-run", "--json"},
+		{"finish", "--message", "Allow the completed policy\n\n- Keep the approved work separate from later edits.", "--dry-run", "--json"},
 		{"finish", "Allow the completed policy", "--json"},
 	} {
 		result := decodeFinishWorkflow(t, f.Run(t, t.Context(), args...))

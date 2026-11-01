@@ -1,6 +1,7 @@
 package finish
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -13,6 +14,22 @@ const (
 	SubjectLimit      = 50
 	BodyLineLimit     = 72
 )
+
+var ErrCompletionContextRequired = errors.New("Local finish needs a reason for the change. Start a new acd finish \"what changed and why\"; an unchanged retry cannot add context.")
+var ErrMessageReasonRequired = errors.New("Include a body explaining the problem and why the change helps. Separate it from the subject with a blank line and use a '- ' reason bullet.")
+
+// ValidatePublicationMessage adds the explanation required for new publication.
+// Recorded legacy messages can still use the format-only validator.
+func ValidatePublicationMessage(style, message string) error {
+	if err := ValidateMessage(style, message); err != nil {
+		return err
+	}
+	_, body, ok := strings.Cut(message, "\n\n")
+	if !ok || !strings.ContainsFunc(body, unicode.IsLetter) {
+		return ErrMessageReasonRequired
+	}
+	return nil
+}
 
 func ValidatePurpose(purpose string) error {
 	if !messageTextSafe(purpose) {

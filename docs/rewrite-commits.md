@@ -36,8 +36,9 @@ positions count from HEAD as 1. Merge commits and unsafe Git states are rejected
 Intent can split mixed commits and regroup interleaved work when exact versions,
 dependencies, rename groups, and author boundaries permit it. Neutral recorded
 changes remain provenance without fabricated output. Local does not claim
-semantic decomposition. It keeps valid original messages and uses deterministic
-style-compatible summaries when needed.
+semantic decomposition. It keeps original messages for review and never invents
+missing explanations from file counts. Add a reason with `--edit` before applying
+a message that lacks one. The selected style must still match the message.
 
 ~~~bash
 acd history rewrite --last 5 --messages-only --plan-only

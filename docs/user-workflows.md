@@ -55,13 +55,19 @@ Local creates one complete offline batch. Intent plans completed goals through
 the approved provider. Both verify exact trees and preserve live working files.
 Neither pushes. If the frozen target equals HEAD, finish reports no changes
 and creates no empty commit.
+Supply the problem and why the change helps. Local needs that explanation;
+without it, ACD keeps the changes saved and asks for a new finish with context.
 
 To supply an exact message that matches your selected style:
 
 ~~~bash
-acd finish --message "Preserve staged content during finish"
+acd finish --message "Preserve staged content
+
+- Keep the approved version when later edits arrive."
 # With commit.format=conventional:
-acd finish --message "fix: preserve staged content"
+acd finish --message "fix: preserve staged content
+
+- Keep the approved version when later edits arrive."
 ~~~
 
 A supplied message does not bypass the provider in Intent mode. Use reviewed
@@ -156,7 +162,8 @@ acd history rewrite --apply PLAN_ID --dry-run
 acd history rewrite --apply PLAN_ID --yes
 ~~~
 
-Local preserves original grouping and order without AI. Intent can reconstruct
+Local preserves original grouping, order and messages without AI. Use `--edit`
+to add missing reasons before applying; Local does not invent them. Intent can reconstruct
 completed goals. Use `--messages-only` to retain every original commit or
 `--new-branch NAME` to preserve the source branch. Read the
 [history rewrite guide](rewrite-commits.md) before applying.

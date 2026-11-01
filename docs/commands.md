@@ -151,9 +151,11 @@ project's tests passed.
 
 ~~~bash
 acd finish "Add offline checkout"
-acd finish --message "Update setup guidance"
-acd finish --dry-run
-acd finish --include-staged
+acd finish --message "Preserve saved choices
+
+- Reload settings without resetting the saved selection."
+acd finish --dry-run "Keep checkout available offline"
+acd finish --include-staged "Keep approved staged choices"
 acd finish --retry REQUEST_ID --timeout 15m
 ~~~
 
@@ -161,11 +163,13 @@ Finish itself authorizes local publication; it needs no `--yes`. Local mode
 creates one complete batch commit without provider or network access. Intent
 uses the approved provider to plan completed goals and valid intermediate trees.
 A provider failure ends this request; it never switches to Local automatically.
+Local needs supplied completion context or an exact message with an explanatory
+body. It keeps your explanation instead of substituting file counts.
 
 The quoted purpose supplies context about what changed and why. Intent uses it
 to identify useful steps and explain decisions. Intent requires approved
 redacted code diffs; binary-only work also needs context or an exact message. `--message` supplies the complete
-subject and optional body for one batch commit and disables automatic splitting.
+subject and explanatory body for one batch commit and disables automatic splitting.
 Generated Intent messages include a short reason or practical impact in the body.
 Both modes support imperative
 subjects (`Preserve staged content`) and scope-free conventional subjects
@@ -304,7 +308,9 @@ History reads completed checkpoints. Activity/explain also retain readable old
 provenance. A saved snapshot is not evidence that its changes were committed.
 
 Rewrite is explicit in both modes. Local uses deterministic existing order and
-grouping; Intent uses bounded goal planning. Selection is contiguous linear
+grouping. Add missing explanations with `--edit` before applying. Local cannot
+infer them from the code offline. Intent uses bounded goal
+planning. Selection is contiguous linear
 history with `--last`, `--from-sha`, `--from-nr`, `--range-sha`, or `--range-nr`.
 `--messages-only` keeps one output per selected commit. `--new-branch NAME`
 reconstructs onto a new branch while preserving the source. Saved-plan show

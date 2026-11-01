@@ -87,15 +87,36 @@ func TestFinishCLIHelpDistinguishesContextFromExactBatch(t *testing.T) {
 
 func TestFinishCLIContextFailureNeedsANewRequest(t *testing.T) {
 	lookup, _, _ := finishCLIFixture(t)
-	r := state.FinishRequest{ID: "finish-context", State: state.FinishFailed, ReasonCode: "provider_context_required", Reason: "Supply what changed and why", Target: state.FinishTarget{CheckpointID: "saved"}}
+	for _, code := range []string{"provider_context_required", "finish_context_required"} {
+		for _, staged := range []bool{false, true} {
+			r := state.FinishRequest{ID: "finish-context", State: state.FinishFailed, ReasonCode: code, Reason: "Supply what changed and why", Target: state.FinishTarget{CheckpointID: "saved", IncludeStaged: staged}}
+			var out bytes.Buffer
+			err := renderFinish(&out, lookup, r, true, "")
+			var response productEnvelope
+			if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if err == nil || response.Error == nil || response.Error.Retryable || response.NextAction == nil || !strings.Contains(*response.NextAction, "what changed and why") || strings.Contains(out.String(), "--retry") {
+				t.Fatalf("unchanged retry suggested for missing context: %s %v", out.String(), err)
+			}
+			if strings.Contains(*response.NextAction, "--include-staged") != staged {
+				t.Fatalf("staged consent missing from new-request guidance: %s", *response.NextAction)
+			}
+		}
+	}
+}
+
+func TestFinishCLIExactReasonFailureNeedsANewMessage(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	r := state.FinishRequest{ID: "finish-exact", State: state.FinishFailed, ReasonCode: "finish_message_reason_required", Reason: "Include an explanatory body", Target: state.FinishTarget{CheckpointID: "saved"}}
 	var out bytes.Buffer
 	err := renderFinish(&out, lookup, r, true, "")
 	var response productEnvelope
 	if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
 		t.Fatal(decodeErr)
 	}
-	if err == nil || response.Error == nil || response.Error.Retryable || response.NextAction == nil || !strings.Contains(*response.NextAction, "what changed and why") || strings.Contains(out.String(), "--retry") {
-		t.Fatalf("unchanged retry suggested for missing context: %s %v", out.String(), err)
+	if err == nil || response.Error == nil || response.Error.Retryable || response.NextAction == nil || !strings.Contains(*response.NextAction, "--message body") || strings.Contains(out.String(), "--retry") {
+		t.Fatalf("unchanged retry suggested for a missing exact reason: %s %v", out.String(), err)
 	}
 }
 
@@ -160,6 +181,18 @@ func TestFinishCLIPublishPreviewNoopAndStagedConsent(t *testing.T) {
 			}
 			index, _ := git.IndexContentDigest(t.Context(), lookup.Worktree.Root)
 			result, progress, err := finishCLIExecute(t, t.Context(), lookup.Worktree.Root, args...)
+			if scenario == "compatibility" {
+				if ExitCode(err) != ExitActionRequired || result.ReasonCode != "finish_context_required" || result.Published || result.StagedConsumed || !strings.Contains(progress, "deprecated") {
+					t.Fatalf("alias bypassed the reason requirement: %+v %s %v", result, progress, err)
+				}
+				if after, _ := git.IndexContentDigest(t.Context(), lookup.Worktree.Root); after != index {
+					t.Fatal("reasonless alias changed staging")
+				}
+				if after, _ := git.RevParse(t.Context(), lookup.Worktree.Root, "HEAD"); after != head {
+					t.Fatal("reasonless alias moved the branch")
+				}
+				return
+			}
 			if scenario == "staged-refusal" {
 				if ExitCode(err) != ExitActionRequired {
 					t.Fatalf("staging refusal: %v", err)
@@ -186,9 +219,6 @@ func TestFinishCLIPublishPreviewNoopAndStagedConsent(t *testing.T) {
 			} else if !result.Published || result.CommitsCreated != 1 || len(result.CommitOIDs) != 1 || result.CommitOIDs[0] != current {
 				t.Fatalf("actual OIDs %+v", result)
 			}
-			if scenario == "compatibility" && (!result.StagedConsumed || !strings.Contains(progress, "deprecated")) {
-				t.Fatalf("alias: %+v %s", result, progress)
-			}
 		})
 	}
 }
@@ -214,7 +244,7 @@ func TestFinishCLIClientDisconnectAndRetry(t *testing.T) {
 	// A client ends immediately after freeze; the detached worker must finish.
 	clientCtx, cancel := context.WithCancel(context.Background())
 	serveIntentHistoryWorker(t, lookup, finishDisconnectHandler{handler, cancel})
-	_, _, _ = finishCLIExecute(t, clientCtx, lookup.Worktree.Root, "finish")
+	_, _, _ = finishCLIExecute(t, clientCtx, lookup.Worktree.Root, "finish", "Publish accepted work after the client disconnects")
 	joined := make(chan struct{})
 	go func() {
 		runtime.finishJobs.Wait()
@@ -249,7 +279,7 @@ func TestFinishCLIRetryFrozenFailureAndReadOnlyStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := daemon.FinishWorker{RepoPath: lookup.Worktree.Root, RepositoryID: lookup.Record.RepositoryID, DB: runtime.db, Config: cfg, ProtectionGate: runtime.protectionGate}
-	r, _, err := w.Start(t.Context(), daemon.FinishOptions{})
+	r, _, err := w.Start(t.Context(), daemon.FinishOptions{Purpose: "Keep the accepted version separate from later edits"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +317,7 @@ func TestFinishCLIFlagsAndProtectionRemedy(t *testing.T) {
 	if ExitCode(err) != ExitActionRequired || !strings.Contains(err.Error(), "acd on") {
 		t.Fatalf("remedy: %v", err)
 	}
-	for _, args := range [][]string{{"finish", "--retry", "id", "--message", ""}, {"finish", "--retry", "id", "--include-staged=false"}, {"commit-all"}} {
+	for _, args := range [][]string{{"finish", "--retry", "id", "--message", ""}, {"finish", "--retry", "id", "--include-staged=false"}, {"finish", "--message", ""}, {"commit-all"}} {
 		_, _, err := finishCLIExecute(t, t.Context(), repo, args...)
 		if ExitCode(err) != ExitInvalid {
 			t.Fatalf("flags %v: %v", args, err)

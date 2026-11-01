@@ -7,7 +7,8 @@ Startup may recover an already authorized prepared mutation from its exact saved
 proof; it cannot start a new finish.
 
 Fresh installations use offline Local mode and imperative messages. Local finish
-creates one complete batch; optional Intent mode plans completed goals and safe
+requires supplied completion context or an exact message with an explanatory
+body and creates one complete batch; optional Intent mode plans completed goals and safe
 semantic boundaries. Both modes require explicit finish. ACD never pushes.
 
 Keep the three workflows independent: `on` captures current changes, `finish`

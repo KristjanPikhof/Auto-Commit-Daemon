@@ -25,10 +25,12 @@ Local mode creates one commit. Intent mode uses the approved AI provider to
 group completed work into commits. Later edits stay saved for your next
 finish. ACD never pushes.
 
-Supply PURPOSE as context describing what changed and why. Intent uses it to
+Supply PURPOSE as context describing what changed and why. Local requires this
+explanation unless you supply an exact message with a reason in its body. Intent uses it to
 explain decisions and choose useful steps. Intent requires approved redacted
 code diffs. Binary-only changes also need context. --message requests one batch
 with that exact message and disables automatic splitting, including in Intent.
+Its body must explain the problem and why the change helps.
 
 Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
@@ -38,9 +40,9 @@ changes, purpose, message, and staged selection. Validated evidence reviews
 are saved for explicit retries. --timeout 15m gives a new attempt more planning
 time; reconnecting never extends an accepted deadline.`,
 		Example: `  acd finish "Add offline checkout"
-  acd finish --message "Update setup guidance"
-  acd finish --dry-run
-  acd finish --include-staged
+  acd finish --message $'Preserve saved choices\n\n- Keep selections when settings reload.'
+  acd finish --dry-run "Keep checkout available offline"
+  acd finish --include-staged "Keep approved staged choices"
   acd finish --retry REQUEST_ID`,
 		Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
@@ -48,6 +50,9 @@ time; reconnecting never extends an accepted deadline.`,
 			}
 			if params.RetryID != "" && (len(args) > 0 || cmd.Flags().Changed("message") || cmd.Flags().Changed("include-staged")) {
 				return invalidCommandError("acd finish: --retry cannot change purpose, message or staged consent")
+			}
+			if cmd.Flags().Changed("message") && params.Message == "" {
+				return invalidCommandError("acd finish: --message needs a subject and an explanatory body")
 			}
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -63,7 +68,7 @@ time; reconnecting never extends an accepted deadline.`,
 	cmd.Flags().BoolVar(&params.DryRun, "dry-run", false, "Plan and check without moving the branch or index")
 	cmd.Flags().BoolVar(&params.IncludeStaged, "include-staged", false, "Include the exact current staged selection")
 	cmd.Flags().StringVar(&params.RetryID, "retry", "", "Retry or reconnect to a saved request")
-	cmd.Flags().StringVar(&params.Message, "message", "", "Create one batch commit with this exact message (disables splitting)")
+	cmd.Flags().StringVar(&params.Message, "message", "", "Create one batch commit with this exact message and an explanatory body (disables splitting)")
 	cmd.Flags().DurationVar(&params.Timeout, "timeout", 0, "Intent planning budget for a new attempt, from 1s to 1h (default: ai.timeout)")
 	return cmd
 }
@@ -190,14 +195,19 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 	}
 	ok := r.State == state.FinishCompleted && !detached
-	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required" && r.ReasonCode != "provider_diffs_required" && r.ReasonCode != "provider_input_too_large"
+	retryable := (r.State == state.FinishFailed || detached) && !finishNeedsNewRequest(r.ReasonCode)
 	exit, failureCode := finishExit(r, waitCode)
 	next := ""
 	if !ok {
 		if r.State == state.FinishNeedsAttention {
 			next = "acd doctor"
-		} else if r.ReasonCode == "provider_context_required" {
+		} else if r.ReasonCode == "provider_context_required" || r.ReasonCode == "finish_context_required" {
 			next = `acd finish "what changed and why"`
+			if r.Target.IncludeStaged {
+				next += " --include-staged"
+			}
+		} else if r.ReasonCode == "finish_message_reason_required" {
+			next = "Start a new acd finish with a --message body explaining what changed and why"
 		} else if r.ReasonCode == "provider_input_too_large" {
 			next = "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"
 		} else if r.ReasonCode == "provider_diffs_required" {
@@ -260,7 +270,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 					fmt.Fprintf(out, "  Boundary: %s\n", consoleProse(step.Boundary))
 				}
 			}
-			fmt.Fprintln(out, "Optional: Run `acd finish` when the current work is ready.")
+			fmt.Fprintln(out, "Optional: Run `acd finish \"what changed and why\"` when the current work is ready.")
 		default:
 			fmt.Fprintln(out, commitCountLabel(result.CommitsCreated))
 		}
@@ -293,7 +303,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 					fmt.Fprintf(out, "This finish used the snapshot saved at %s.\n", result.SnapshotSavedAt)
 				}
 				fmt.Fprintln(out, "Later edits and excluded files stay in your working copy.")
-				fmt.Fprintln(out, "Inspect them with `git status --short`. Run `acd finish` when the remaining work is ready.")
+				fmt.Fprintln(out, "Inspect them with `git status --short`. Run `acd finish \"what changed and why\"` when the remaining work is ready.")
 			}
 		} else if countErr == nil && saved.Published {
 			fmt.Fprintln(out, "Working copy: clean.")
@@ -335,7 +345,7 @@ func finishExit(r state.FinishRequest, waitCode string) (int, string) {
 	if r.State == state.FinishNeedsAttention {
 		return ExitActionRequired, "finish_needs_attention"
 	}
-	if r.ReasonCode == "provider_input_too_large" || r.ReasonCode == "provider_context_required" || r.ReasonCode == "provider_diffs_required" {
+	if finishNeedsNewRequest(r.ReasonCode) {
 		return ExitActionRequired, r.ReasonCode
 	}
 	return ExitActionRequired, "finish_failed"
@@ -359,4 +369,13 @@ func productWorktreeChangeCount(ctx context.Context, repo string) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+func finishNeedsNewRequest(code string) bool {
+	switch code {
+	case "finish_context_required", "finish_message_reason_required", "provider_context_required", "provider_diffs_required", "provider_input_too_large":
+		return true
+	default:
+		return false
+	}
 }

@@ -19,12 +19,18 @@ pushes to a remote.
 | `acd finish --dry-run [PURPOSE]` | Preview and verify a finish without publishing | Freeze a checkpoint, plan, and verify as an explicit request. Private objects and request evidence may be written, and Intent may contact its configured provider. Never change the branch, index, or live files. |
 | `acd finish --retry ID` | Retry the exact failed finish target | Start one new bounded attempt on the saved target. Keep its checkpoint, expected branch and HEAD, mode, style, context, message, index identity, and consent. Never absorb later edits. |
 | `acd finish --include-staged` | Include the frozen staged selection explicitly | Authorize only the exact frozen index selection. Publication uses the approved-index protocol below. Ordinary finish needs this flag. Compatibility `commit-all --yes` retains its existing staged-selection consent. |
-| `acd finish --message TEXT` | Use this complete commit message | Create one complete batch commit with the supplied subject and optional body. Validate the selected message style and reject empty or unsafe text. Intent still uses its configured provider and never silently becomes local mode. |
+| `acd finish --message TEXT` | Use this complete commit message | Create one complete batch commit with the supplied subject and explanatory body. Validate the selected message style and reject missing explanations or unsafe text. Intent still uses its configured provider and never silently becomes local mode. |
 | `acd history rewrite` | Preview or explicitly apply a saved history rewrite | Retain the selection, saved-plan, preview/apply, and source-history safety interfaces below. Never run it from protection or hooks. |
 | `acd commit-all` | Deprecated: use acd finish | Delegate to finish for the first finish-based release only. Retain no drain, fallback, retry loop, or second publication engine. Accept legacy `--yes` with its existing explicit staged-selection consent. |
 
-`PURPOSE` is one optional quoted argument describing the completed goal. It
-supplies context for messages and grouping. `--message` supplies the complete
+`PURPOSE` supplies context about the completed change for messages and grouping.
+Local requires it unless an exact explanatory message is supplied.
+Local cannot replace missing context with a file-count summary. A net-zero target
+still needs no explanation because it creates no commit. New exact messages need
+an explanatory body in both modes. Older messages and saved plans remain
+readable; unprepared publication without an explanation requires a new request
+or reviewed message. Prepared recovery keeps its exact accepted proof.
+`--message` supplies the complete
 message; purpose can accompany it as explanation. Both become immutable when
 the target freezes. `--retry` may combine with `--dry-run`, `--repo`, `--json`,
 `--timeout`, and `--quiet`; it rejects new purpose, message, or staged consent. Unknown IDs,
