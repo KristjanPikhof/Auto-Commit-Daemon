@@ -75,7 +75,7 @@ Finish obtains a fresh complete checkpoint and freezes the attached branch,
 expected HEAD, target tree, index identity, mode, style, settings, and consent.
 Later edits remain protected for another finish.
 
-Local creates one complete batch from your explanation without a provider. Intent plans useful
+Local creates one complete offline batch with optional context. Intent plans useful
 review or revert boundaries using recorded versions or checked selections of
 exact frozen source bytes. ACD materializes and checks every proposed tree
 privately, then prepares the whole commit chain

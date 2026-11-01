@@ -385,11 +385,6 @@ func (w *FinishWorker) ExecuteFinishHistoryRequest(ctx context.Context, plan sta
 	if err := ValidateIntentHistoryPlan(ctx, w.RepoPath, plan); err != nil {
 		return fail(err)
 	}
-	for _, goal := range plan.Goals {
-		if err := finish.ValidatePublicationMessage(plan.CommitFormat, goal.Message); err != nil {
-			return fail(fmt.Errorf("history rewrite: review the message with --edit before applying: %w", err))
-		}
-	}
 	wt, cfg, digest, err := w.resolved(ctx)
 	if err != nil {
 		return fail(err)

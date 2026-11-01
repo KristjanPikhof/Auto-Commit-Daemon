@@ -150,12 +150,10 @@ project's tests passed.
 ## Finish
 
 ~~~bash
-acd finish "Add offline checkout"
-acd finish --message "Preserve saved choices
-
-- Reload settings without resetting the saved selection."
-acd finish --dry-run "Keep checkout available offline"
-acd finish --include-staged "Keep approved staged choices"
+acd finish
+acd finish "Keep checkout available when the network is down"
+acd finish --dry-run
+acd finish --include-staged
 acd finish --retry REQUEST_ID --timeout 15m
 ~~~
 
@@ -163,14 +161,16 @@ Finish itself authorizes local publication; it needs no `--yes`. Local mode
 creates one complete batch commit without provider or network access. Intent
 uses the approved provider to plan completed goals and valid intermediate trees.
 A provider failure ends this request; it never switches to Local automatically.
-Local needs supplied completion context or an exact message with an explanatory
-body. It keeps your explanation instead of substituting file counts.
+The quoted purpose is optional context, not commit wording. It may span
+paragraphs explaining the problem, decisions and constraints. Intent examines
+it with the approved redacted code diffs to choose boundaries and write reasons.
+Without context, it infers purpose from the code. Binary-only work needs context
+or an exact message because the planner cannot read its content. Local includes
+supplied context or uses an offline batch description.
 
-The quoted purpose supplies context about what changed and why. Intent uses it
-to identify useful steps and explain decisions. Intent requires approved
-redacted code diffs; binary-only work also needs context or an exact message. `--message` supplies the complete
-subject and explanatory body for one batch commit and disables automatic splitting.
-Generated Intent messages include a short reason or practical impact in the body.
+Advanced: `--message` supplies the exact subject and optional body for one batch
+and disables splitting. Generated Intent messages always include a reason in
+the body; this requirement does not rewrite the exact user override.
 Both modes support imperative
 subjects (`Preserve staged content`) and scope-free conventional subjects
 (`fix: preserve staged content`). Change mode or style through reviewed settings.
@@ -308,9 +308,8 @@ History reads completed checkpoints. Activity/explain also retain readable old
 provenance. A saved snapshot is not evidence that its changes were committed.
 
 Rewrite is explicit in both modes. Local uses deterministic existing order and
-grouping. Add missing explanations with `--edit` before applying. Local cannot
-infer them from the code offline. Intent uses bounded goal
-planning. Selection is contiguous linear
+grouping and preserves valid original messages. Use `--edit` to revise them
+offline. Intent uses bounded goal planning with reasons in generated messages. Selection is contiguous linear
 history with `--last`, `--from-sha`, `--from-nr`, `--range-sha`, or `--range-nr`.
 `--messages-only` keeps one output per selected commit. `--new-branch NAME`
 reconstructs onto a new branch while preserving the source. Saved-plan show

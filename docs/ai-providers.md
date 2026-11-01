@@ -55,8 +55,12 @@ Approving text diffs permits their redacted content to be sent to the selected
 provider. A local subprocess is also a recipient; being local does not grant
 it implicit permission.
 
-Completion context explains the problem, approach, and constraints behind the
-code. It supplements the diffs rather than replacing them. A binary-only finish
+Optional completion context explains the problem, approach, and constraints
+behind the code, including decisions the diff cannot explain. It may span
+paragraphs and multiple completed changes; normal request-size and redaction
+limits apply without clipping it. Intent uses the context with the code to
+choose boundaries and write reasons. Context is not exact message wording or
+proof that checks passed. A binary-only finish
 needs context or an exact batch message because its content cannot enter a text
 request. When recorded intermediate versions are used, diffs describe each exact
 transition, not repeated final diffs. Missing text evidence fails before a
@@ -141,8 +145,8 @@ generated goal includes `purpose`, `boundary`, `reason`, `message`, and
 `change_ids`. Its reason explains the problem or constraint and the chosen
 mechanism; the same wording must appear in the message body, allowing wrapping
 and bullet formatting. A missing reason or one left only in metadata needs
-correction. Exact user messages need an explanatory body and retain their
-single-batch contract.
+correction. Advanced exact user messages retain their wording, optional body
+and single-batch contract.
 
 If the supplied versions cannot separate independent purposes, return no goals
 and explain the missing evidence in `blocked_reason`. That explanation ends the

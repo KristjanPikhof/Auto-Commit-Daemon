@@ -616,7 +616,7 @@ func applyFinishControlStatus(res *controlResult, report statusReport, alive boo
 			res.Summary = finishStatusSummary(f)
 		}
 		if res.NextAction == "No action needed." && (report.PublicationOutcome.PendingChanges > 0 || report.PublicationOutcome.WorktreeChanges > 0 || !report.PublicationOutcome.CountsKnown) {
-			res.NextAction = "Run `acd finish \"what changed and why\"` when this work is complete."
+			res.NextAction = "Run `acd finish` when this work is complete."
 		}
 	}
 	if legacy := report.PublicationOutcome.Legacy; legacy.State == "needs_attention" && res.OK {

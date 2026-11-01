@@ -6,10 +6,11 @@ provider, reads provider credentials, runs project checks, or starts publication
 Startup may recover an already authorized prepared mutation from its exact saved
 proof; it cannot start a new finish.
 
-Fresh installations use offline Local mode and imperative messages. Local finish
-requires supplied completion context or an exact message with an explanatory
-body and creates one complete batch; optional Intent mode plans completed goals and safe
-semantic boundaries. Both modes require explicit finish. ACD never pushes.
+Fresh installations use offline Local mode and imperative messages. Local creates
+one complete batch; optional Intent mode plans completed goals and safe semantic
+boundaries. Both modes accept optional completion context and require explicit
+finish. Generated Intent messages must explain why the change is needed. ACD
+never pushes.
 
 Keep the three workflows independent: `on` captures current changes, `finish`
 creates commits from a fresh protected target, and `history rewrite` uses the
@@ -80,8 +81,14 @@ ACD self-hosts this repository:
   automatic commits until explicitly upgraded; warnings do not make it inactive.
 - Do not run `git add` or `git commit`. Never force `acd commit-all` unless the
   user specifically requests it.
-- With a verified finish-based runtime, use `acd finish` for authorized completed
-  work. Finish the task and checks without waiting or polling for publication.
+- With a verified finish-based runtime, use `acd finish [PURPOSE]` for authorized
+  completed work. PURPOSE is optional context, not commit wording. Pass the
+  problem, approach, constraints and decisions the diff cannot explain; a quoted
+  argument may span paragraphs and independent completed changes. Intent reads
+  it with the code, chooses boundaries and writes messages with reasons. Report
+  checks and limits accurately; context is not verification proof. Reserve
+  `--message` for an authorized exact batch override.
+  Finish the task and checks without waiting or polling for publication.
   Report failed or pending requests accurately.
 - Do not pause ACD for ordinary edits, builds, or isolated tests. Pause only for
   history surgery, direct state recovery, or a test operating on this checkout.

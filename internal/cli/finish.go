@@ -25,12 +25,12 @@ Local mode creates one commit. Intent mode uses the approved AI provider to
 group completed work into commits. Later edits stay saved for your next
 finish. ACD never pushes.
 
-Supply PURPOSE as context describing what changed and why. Local requires this
-explanation unless you supply an exact message with a reason in its body. Intent uses it to
-explain decisions and choose useful steps. Intent requires approved redacted
-code diffs. Binary-only changes also need context. --message requests one batch
-with that exact message and disables automatic splitting, including in Intent.
-Its body must explain the problem and why the change helps.
+PURPOSE is optional context, not a commit message. It can span multiple lines
+describing the problem, decisions and constraints. Intent reads it alongside
+approved redacted code diffs to choose commits and explain why each is needed.
+Without context, Intent infers purpose from the changes. Binary-only changes
+need context because their content is unavailable to the planner. Local creates
+one offline batch and includes any supplied context.
 
 Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
@@ -38,11 +38,14 @@ save private snapshots, call AI in Intent mode, and run configured checks. Add
 ID to reconnect or retry the same saved request; it keeps its original
 changes, purpose, message, and staged selection. Validated evidence reviews
 are saved for explicit retries. --timeout 15m gives a new attempt more planning
-time; reconnecting never extends an accepted deadline.`,
-		Example: `  acd finish "Add offline checkout"
-  acd finish --message $'Preserve saved choices\n\n- Keep selections when settings reload.'
-  acd finish --dry-run "Keep checkout available offline"
-  acd finish --include-staged "Keep approved staged choices"
+time; reconnecting never extends an accepted deadline.
+
+Advanced: --message supplies an exact commit message for one complete batch.
+It disables automatic splitting, including in Intent.`,
+		Example: `  acd finish
+  acd finish "Keep checkout available when the network is down"
+  acd finish --dry-run
+  acd finish --include-staged
   acd finish --retry REQUEST_ID`,
 		Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
@@ -52,7 +55,7 @@ time; reconnecting never extends an accepted deadline.`,
 				return invalidCommandError("acd finish: --retry cannot change purpose, message or staged consent")
 			}
 			if cmd.Flags().Changed("message") && params.Message == "" {
-				return invalidCommandError("acd finish: --message needs a subject and an explanatory body")
+				return invalidCommandError("acd finish: --message needs a nonempty commit message")
 			}
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -68,7 +71,7 @@ time; reconnecting never extends an accepted deadline.`,
 	cmd.Flags().BoolVar(&params.DryRun, "dry-run", false, "Plan and check without moving the branch or index")
 	cmd.Flags().BoolVar(&params.IncludeStaged, "include-staged", false, "Include the exact current staged selection")
 	cmd.Flags().StringVar(&params.RetryID, "retry", "", "Retry or reconnect to a saved request")
-	cmd.Flags().StringVar(&params.Message, "message", "", "Create one batch commit with this exact message and an explanatory body (disables splitting)")
+	cmd.Flags().StringVar(&params.Message, "message", "", "Advanced: create one batch commit with this exact message (disables splitting)")
 	cmd.Flags().DurationVar(&params.Timeout, "timeout", 0, "Intent planning budget for a new attempt, from 1s to 1h (default: ai.timeout)")
 	return cmd
 }
@@ -201,13 +204,11 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 	if !ok {
 		if r.State == state.FinishNeedsAttention {
 			next = "acd doctor"
-		} else if r.ReasonCode == "provider_context_required" || r.ReasonCode == "finish_context_required" {
+		} else if r.ReasonCode == "provider_context_required" {
 			next = `acd finish "what changed and why"`
 			if r.Target.IncludeStaged {
 				next += " --include-staged"
 			}
-		} else if r.ReasonCode == "finish_message_reason_required" {
-			next = "Start a new acd finish with a --message body explaining what changed and why"
 		} else if r.ReasonCode == "provider_input_too_large" {
 			next = "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"
 		} else if r.ReasonCode == "provider_diffs_required" {
@@ -270,7 +271,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 					fmt.Fprintf(out, "  Boundary: %s\n", consoleProse(step.Boundary))
 				}
 			}
-			fmt.Fprintln(out, "Optional: Run `acd finish \"what changed and why\"` when the current work is ready.")
+			fmt.Fprintln(out, "Optional: Run `acd finish` when the current work is ready.")
 		default:
 			fmt.Fprintln(out, commitCountLabel(result.CommitsCreated))
 		}
@@ -303,7 +304,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 					fmt.Fprintf(out, "This finish used the snapshot saved at %s.\n", result.SnapshotSavedAt)
 				}
 				fmt.Fprintln(out, "Later edits and excluded files stay in your working copy.")
-				fmt.Fprintln(out, "Inspect them with `git status --short`. Run `acd finish \"what changed and why\"` when the remaining work is ready.")
+				fmt.Fprintln(out, "Inspect them with `git status --short`. Run `acd finish` when the remaining work is ready.")
 			}
 		} else if countErr == nil && saved.Published {
 			fmt.Fprintln(out, "Working copy: clean.")
@@ -373,7 +374,7 @@ func productWorktreeChangeCount(ctx context.Context, repo string) (int, error) {
 
 func finishNeedsNewRequest(code string) bool {
 	switch code {
-	case "finish_context_required", "finish_message_reason_required", "provider_context_required", "provider_diffs_required", "provider_input_too_large":
+	case "provider_context_required", "provider_diffs_required", "provider_input_too_large":
 		return true
 	default:
 		return false

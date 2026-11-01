@@ -33,31 +33,38 @@ func finishStatusFixture(t *testing.T) (central.RepoRecord, *state.DB, *daemon.F
 	return central.RepoRecord{Path: repo, StateDB: path, RepoHash: central.CanonicalID(repo), RepositoryID: central.CanonicalID(repo), WorktreeID: checkpoint.WorktreeID(repo)}, db, w
 }
 
-func TestFinishStatusMissingReasonKeepsSavedWorkVisible(t *testing.T) {
+func TestFinishStatusContextIsOptionalForSavedWork(t *testing.T) {
 	rec, db, worker := finishStatusFixture(t)
 	finishStatusWrite(t, rec.Path, "goal.txt", "approved work\n")
-	r, _, err := worker.Start(t.Context(), daemon.FinishOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	failed, err := worker.Execute(t.Context(), r.ID)
-	if err == nil || failed.ReasonCode != "finish_context_required" {
-		t.Fatalf("unexplained finish: %+v %v", failed, err)
-	}
 	finishStatusCheckpoint(t, rec, db)
 	report := finishStatusRead(t, rec, db)
 	var control controlResult
 	applyFinishControlStatus(&control, report, true)
 	entry := productListEntryFromOverview(rec, supervisor.WorkerStatus{}, productListRepoOverview{report: report}, nil)
-	if !report.PublicationOutcome.Protected || report.PublicationOutcome.PendingChanges != 1 || report.PublicationOutcome.Finish == nil || report.PublicationOutcome.Finish.ReasonCode != failed.ReasonCode {
-		t.Fatalf("failed reason gate lost protection or request progress: %+v", report.PublicationOutcome)
+	if !report.PublicationOutcome.Protected || report.PublicationOutcome.PendingChanges != 1 {
+		t.Fatalf("saved work lost protection: %+v", report.PublicationOutcome)
 	}
 	for _, action := range []string{control.NextAction, entry.NextAction} {
-		if !strings.Contains(action, "what changed and why") || strings.Contains(action, "--retry") {
-			t.Fatalf("saved work needs a new explanation: %s", action)
+		if !strings.Contains(action, "`acd finish") || strings.Contains(action, "what changed and why") {
+			t.Fatalf("status requires optional context: %s", action)
 		}
 	}
+	r, _, err := worker.Start(t.Context(), daemon.FinishOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := worker.Execute(t.Context(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted {
+		t.Fatalf("bare Local finish: %+v %v", completed, err)
+	}
+	finishStatusCheckpoint(t, rec, db)
+	report = finishStatusRead(t, rec, db)
+	if report.PublicationOutcome.PendingChanges != 0 || report.PublicationOutcome.Finish == nil || !report.PublicationOutcome.Finish.Published {
+		t.Fatalf("publication lost: %+v", report.PublicationOutcome)
+	}
+	finishStatusAssertViews(t, rec, db, report)
 }
+
 func finishStatusWrite(t *testing.T, repo, path, body string) {
 	t.Helper()
 	full := filepath.Join(repo, path)

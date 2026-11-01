@@ -1,7 +1,6 @@
 package finish
 
 import (
-	"errors"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -85,7 +84,7 @@ func TestFinishLocalLongPurposeIsRetained(t *testing.T) {
 			t.Fatalf("long Unicode purpose was clipped: %q", message)
 		}
 	}
-	if _, err := Local(localEvidence(), LocalOptions{Purpose: "..."}); !errors.Is(err, ErrCompletionContextRequired) {
+	if _, err := Local(localEvidence(), LocalOptions{Purpose: "..."}); err != nil {
 		t.Fatal(err)
 	}
 }

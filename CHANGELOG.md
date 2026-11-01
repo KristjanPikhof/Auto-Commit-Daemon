@@ -18,11 +18,11 @@
 
 ### Changed
 
-- Require completion context for Local finishes and an explanatory body for
-  exact messages in both modes. Keep supplied reasons instead of file-count
-  summaries. Missing input needs a new finish; older messages stay readable and
-  prepared recovery keeps its accepted proof. Local history preserves messages
-  for review and requires missing explanations before apply.
+- Keep finish context optional in Local and Intent. Accept longer handoffs with
+  decisions and constraints for the planner to examine alongside code changes.
+  Require reasons in AI-generated messages; preserve advanced exact overrides
+  and original Local history messages without requiring an explanatory body.
+  Keep exact overrides outside the main examples and clarify agent guidance.
 - Let new final-only Intent requests split existing text files by purpose using
   exact frozen lines when approved project checks are configured. Check every
   intermediate commit before publication and use the existing bounded correction

@@ -1,15 +1,18 @@
 package finish
 
 import (
-	"errors"
 	"strings"
 	"testing"
 )
 
-func TestFinishLocalRequiresCompletionReason(t *testing.T) {
+func TestFinishLocalContextIsOptional(t *testing.T) {
 	for _, purpose := range []string{"", "   ", "..."} {
-		if _, err := Local(localEvidence(), LocalOptions{Purpose: purpose}); !errors.Is(err, ErrCompletionContextRequired) {
-			t.Fatalf("unexplained local commit: purpose=%q error=%v", purpose, err)
+		plan, err := Local(localEvidence(), LocalOptions{Purpose: purpose})
+		if err != nil || len(plan.Steps) != 1 {
+			t.Fatalf("optional context blocked Local: purpose=%q plan=%+v error=%v", purpose, plan, err)
+		}
+		if strings.TrimSpace(purpose) == "" && (plan.Steps[0].Reason != "" || !strings.Contains(plan.Steps[0].Message, "offline commit")) {
+			t.Fatalf("Local invented motivation: %+v", plan.Steps[0])
 		}
 	}
 	purpose := "Keep the approved staged version when later edits arrive."
@@ -27,18 +30,16 @@ func TestFinishLocalRequiresCompletionReason(t *testing.T) {
 	}
 }
 
-func TestFinishExactMessageRequiresAnExplanation(t *testing.T) {
+func TestFinishExactMessagePreservesCallerWording(t *testing.T) {
 	for _, style := range []string{StyleImperative, StyleConventional} {
 		subject := "Preserve staged content"
 		if style == StyleConventional {
 			subject = "fix: preserve staged content"
 		}
 		for _, message := range []string{subject, subject + "\n\n- ...", subject + "\n\n- 123"} {
-			if ValidatePublicationMessage(style, message) == nil {
-				t.Fatalf("unexplained message accepted: %q", message)
-			}
-			if _, err := Local(localEvidence(), LocalOptions{Style: style, Message: message}); err == nil {
-				t.Fatalf("exact message bypassed reason gate: %q", message)
+			plan, err := Local(localEvidence(), LocalOptions{Style: style, Message: message})
+			if err != nil || plan.Steps[0].Message != message {
+				t.Fatalf("exact override was rejected or rewritten: %+v %v", plan, err)
 			}
 		}
 		message := subject + "\n\n- Keep the approved version when later edits arrive.\n"

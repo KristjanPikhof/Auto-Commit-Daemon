@@ -35,14 +35,20 @@ that repository/worktree only if existing user and repository instructions
 authorize committing:
 
 ~~~bash
-acd finish --repo /path/to/worktree 'Keep saved choices when settings reload'
+acd finish --repo /path/to/worktree
 ~~~
 
-Describe the problem, approach, and constraints in the purpose so Intent can
-explain decisions and choose useful steps within the task. Use `--message` only
-for an intentional single batch; it disables splitting. Review the actual commit
+The purpose is optional context, not a commit message. Describe the problem,
+approach, and constraints, plus decisions the diff cannot explain. A longer
+quoted argument can span paragraphs and multiple completed changes. Intent
+examines it with the code, chooses boundaries and writes reasons. Follow the
+longer example in [agent guidance](../agent-guidance.md). Review the actual commit
 boundaries and reasons before handoff. Keep prompt transcripts, secrets, and
 customer data out of the context. Hooks do not send or store prompt text.
+
+Advanced `--message` supplies an exact message for one intentional batch and
+disables splitting. Reserve it for a user-supplied message or an explicitly
+requested single batch.
 
 Local mode creates one complete batch without AI and is the default. Intent
 uses the approved provider to group completed goals. Either mode supports

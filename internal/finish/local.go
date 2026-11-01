@@ -28,7 +28,7 @@ func Local(evidence Evidence, options LocalOptions) (Plan, error) {
 	}
 	message := options.Message
 	if message != "" {
-		if err := ValidatePublicationMessage(options.Style, message); err != nil {
+		if err := ValidateMessage(options.Style, message); err != nil {
 			return Plan{}, err
 		}
 	}
@@ -36,11 +36,8 @@ func Local(evidence Evidence, options LocalOptions) (Plan, error) {
 		return Build(evidence, nil)
 	}
 	if message == "" {
-		if !strings.ContainsFunc(options.Purpose, unicode.IsLetter) {
-			return Plan{}, ErrCompletionContextRequired
-		}
 		message = localMessage(options)
-		if err := ValidatePublicationMessage(options.Style, message); err != nil {
+		if err := ValidateMessage(options.Style, message); err != nil {
 			return Plan{}, err
 		}
 	}
@@ -62,6 +59,10 @@ func Local(evidence Evidence, options LocalOptions) (Plan, error) {
 func localMessage(options LocalOptions) string {
 	purpose := strings.Join(strings.Fields(options.Purpose), " ")
 	subject := strings.TrimSpace(strings.TrimRight(purpose, "."))
+	if purpose == "" {
+		subject = "Save protected batch"
+		purpose = "Save the complete frozen batch in one offline commit."
+	}
 	prefix := ""
 	if options.Style == StyleConventional {
 		prefix = "chore: "

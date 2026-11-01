@@ -1,105 +1,118 @@
 package daemon
 
 import (
-	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
-func TestFinishWorkerLocalMissingReasonPreservesProtectedWork(t *testing.T) {
+func TestFinishWorkerLocalContextIsOptional(t *testing.T) {
 	t.Parallel()
 	f, w := finishWorkerFixture(t)
 	finishWrite(t, f.dir, "goal.txt", "approved work\n")
 	r := startFinishWorker(t, w, FinishOptions{})
+	finishWrite(t, f.dir, "goal.txt", "later edit\n")
 	completed, err := w.Execute(t.Context(), r.ID)
-	if err == nil || completed.State != state.FinishFailed || completed.ReasonCode != "finish_context_required" || finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != r.Target.ExpectedHead {
-		t.Fatalf("reasonless local publication: %+v %v", completed, err)
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 0 {
+		t.Fatalf("bare Local finish: %+v %v", completed, err)
 	}
-	if got := finishWorkerGit(t, f.dir, "show", r.Target.CheckpointTree+":goal.txt"); got != "approved work" {
-		t.Fatal("missing reason lost the checkpoint")
+	if finishWorkerGit(t, f.dir, "show", "HEAD:goal.txt") != "approved work" || finishWorkerGit(t, f.dir, "show", r.Target.CheckpointTree+":goal.txt") != "approved work" {
+		t.Fatal("Local lost the frozen work")
 	}
-	if got := finishWorkerGit(t, f.dir, "status", "--short"); !strings.Contains(got, "goal.txt") {
-		t.Fatal("missing reason removed live work")
+	if !strings.Contains(finishWorkerGit(t, f.dir, "status", "--short"), "goal.txt") {
+		t.Fatal("Local removed later live work")
 	}
 }
-func TestFinishWorkerExactMissingReasonStartsNoRequest(t *testing.T) {
+
+func TestFinishWorkerExactMessageKeepsNewAndLegacyRequests(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"local", "intent"} {
-		t.Run(mode, func(t *testing.T) {
-			f, w := finishWorkerFixture(t)
-			w.Config.Mode = mode
-			finishWrite(t, f.dir, "goal.txt", "approved work\n")
-			head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
-			if _, created, err := w.Start(t.Context(), FinishOptions{Message: "Preserve approved work"}); err == nil || created || !strings.Contains(err.Error(), "body") {
-				t.Fatalf("reasonless exact request accepted: created=%t %v", created, err)
-			}
-			if finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != head {
-				t.Fatal("invalid exact message moved the branch")
-			}
-		})
+		for _, legacy := range []bool{false, true} {
+			t.Run(mode+map[bool]string{false: "/new", true: "/legacy"}[legacy], func(t *testing.T) {
+				f, w := finishWorkerFixture(t)
+				w.Config.Mode = mode
+				w.Config.Provider.DiffEgress = true
+				w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
+				w.Config.Provider.Timeout = time.Minute
+				provider := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+					if request.Message != "Preserve approved work" || request.Purpose != "" {
+						t.Fatalf("exact override changed: %+v", request)
+					}
+					var plan struct {
+						Goals []finish.Goal `json:"goals"`
+					}
+					if err := json.Unmarshal(completeFinishTestPlan(request), &plan); err != nil {
+						t.Fatal(err)
+					}
+					plan.Goals[0].Message = request.Message
+					return json.Marshal(plan)
+				}}
+				w.Transport = provider
+				finishWrite(t, f.dir, "goal.txt", "approved work\n")
+				r := startFinishWorker(t, w, FinishOptions{Message: "Preserve approved work"})
+				if legacy {
+					if _, err := state.InterruptFinishRequests(t.Context(), f.db, r.Target.WorktreeID); err != nil {
+						t.Fatal(err)
+					}
+					target := r.Target
+					target.Version = 2
+					var created bool
+					var err error
+					r, created, err = state.StartFinishRequest(t.Context(), f.db, state.FinishRequest{ID: "legacy-exact-without-body", Target: target, DeadlineTS: r.DeadlineTS})
+					if err != nil || !created {
+						t.Fatalf("legacy request: %+v %v", r, err)
+					}
+				}
+				completed, err := w.Execute(t.Context(), r.ID)
+				calls := int32(0)
+				if mode == "intent" {
+					calls = 1
+				}
+				if err != nil || completed.State != state.FinishCompleted || provider.calls.Load() != calls || finishWorkerGit(t, f.dir, "log", "-1", "--format=%B") != r.Target.Message {
+					t.Fatalf("exact message failed or changed: %+v calls=%d %v", completed, provider.calls.Load(), err)
+				}
+			})
+		}
 	}
 }
-func TestFinishHistoryLocalRequiresReasonBeforeApply(t *testing.T) {
+
+func TestFinishWorkerLocalRetryKeepsOptionalContext(t *testing.T) {
+	t.Parallel()
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "goal.txt", "approved work\n")
+	r := startFinishWorker(t, w, FinishOptions{})
+	_, err := state.UpdateFinishRequest(t.Context(), f.db, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishFailed, ReasonCode: "finish_context_required", Reason: "Old runtime required context"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishWrite(t, f.dir, "goal.txt", "later edit\n")
+	retried := startFinishWorker(t, w, FinishOptions{RetryID: r.ID})
+	completed, err := w.Execute(t.Context(), retried.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.Target.Purpose != "" || completed.Target.TargetTree != r.Target.TargetTree || finishWorkerGit(t, f.dir, "show", "HEAD:goal.txt") != "approved work" {
+		t.Fatalf("old missing-context request cannot retry its frozen target: %+v %v", completed, err)
+	}
+}
+
+func TestFinishHistoryLocalPreservesTitleOnlyMessages(t *testing.T) {
 	t.Parallel()
 	f, w := finishWorkerFixture(t)
 	oid := mustCommitPath(t, f.dir, "goal.txt", "approved work\n", "Preserve approved work")
 	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{oid}, nil, nil, FinishHistoryOptions{Mode: "local", Style: "imperative", VerificationConfigDigest: w.Config.ConfigDigest})
 	if err != nil || plan.PlanningCalls != 0 || plan.Goals[0].Message != "Preserve approved work" {
-		t.Fatalf("Local must preserve the original message for review: %+v %v", plan, err)
+		t.Fatalf("Local must preserve the original message: %+v %v", plan, err)
 	}
-	r := historyStartTest(t, w, plan, false)
-	if failed, err := w.ExecuteFinishHistoryRequest(t.Context(), plan, r); err == nil || failed.Status != "failed" || !strings.Contains(err.Error(), "body") {
-		t.Fatalf("Local applied a message without a reason: %+v %v", failed, err)
-	}
-	if finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != oid {
-		t.Fatal("missing historical reason changed the branch")
-	}
-}
-
-func TestFinishWorkerLegacyExactMissingReasonNeedsANewRequest(t *testing.T) {
-	t.Parallel()
-	for _, mode := range []string{"local", "intent"} {
-		t.Run(mode, func(t *testing.T) {
-			f, w := finishWorkerFixture(t)
-			w.Config.Mode = mode
-			finishWrite(t, f.dir, "goal.txt", "approved work\n")
-			r := startFinishWorker(t, w, FinishOptions{Purpose: "Keep approved work separate from later edits"})
-			if _, err := state.InterruptFinishRequests(t.Context(), f.db, r.Target.WorktreeID); err != nil {
-				t.Fatal(err)
-			}
-			target := r.Target
-			target.Version, target.Purpose, target.Message = 2, "", "Preserve approved work"
-			legacy, created, err := state.StartFinishRequest(t.Context(), f.db, state.FinishRequest{ID: "legacy-exact-without-reason", Target: target, DeadlineTS: r.DeadlineTS})
-			if err != nil || !created {
-				t.Fatalf("legacy request: %+v %v", legacy, err)
-			}
-			failed, err := w.Execute(t.Context(), legacy.ID)
-			if err == nil || failed.State != state.FinishFailed || failed.ReasonCode != "finish_message_reason_required" || failed.PlanningCalls != 0 {
-				t.Fatalf("legacy exact message bypassed the reason gate: %+v %v", failed, err)
-			}
-			if finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != target.ExpectedHead || finishWorkerGit(t, f.dir, "show", target.CheckpointTree+":goal.txt") != "approved work" {
-				t.Fatal("missing legacy explanation moved the branch or lost protection")
-			}
-
-		})
-	}
-}
-
-func TestFinishHistoryLegacyMessageRemainsReadableBeforeRefusal(t *testing.T) {
-	t.Parallel()
-	f, w := finishWorkerFixture(t)
-	oid := mustCommitPath(t, f.dir, "goal.txt", "approved work\n", "Preserve approved work\n\n- Keep the approved value available for rollback.")
-	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{oid}, nil, nil, FinishHistoryOptions{Mode: "local", Style: "imperative", VerificationConfigDigest: w.Config.ConfigDigest})
-	if err != nil {
+	if err := ValidateIntentHistoryPlan(t.Context(), f.dir, plan); err != nil {
 		t.Fatal(err)
 	}
-	plan.Goals[0].Message = "Preserve approved work"
-	if err := ValidateIntentHistoryPlan(t.Context(), f.dir, plan); err != nil {
-		t.Fatalf("legacy message cannot be inspected: %v", err)
-	}
 	r := historyStartTest(t, w, plan, false)
-	failed, err := w.ExecuteFinishHistoryRequest(t.Context(), plan, r)
-	if err == nil || failed.Status != "failed" || !strings.Contains(err.Error(), "body") || finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != oid {
-		t.Fatalf("legacy history was published without an explanation: %+v %v", failed, err)
+	completed, err := w.ExecuteFinishHistoryRequest(t.Context(), plan, r)
+	if err != nil || completed.Status != "completed" || finishWorkerGit(t, f.dir, "log", "-1", "--format=%B") != "Preserve approved work" {
+		t.Fatalf("Local imposed generated-message policy on original history: %+v %v", completed, err)
 	}
 }

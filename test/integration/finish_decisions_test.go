@@ -16,12 +16,16 @@ import (
 )
 
 func TestFinishWorkflowSameFileDecisions(t *testing.T) {
+	purpose := "Problem: password dispatch needs a Google provider.\n\nDecision: extract dispatch without changing password behavior, then add Google.\n\n" + strings.Repeat("Constraint: keep password callers working at each step.\n", 20)
 	var calls atomic.Int32
 	var preparedBlob atomic.Value
 	preparedBlob.Store("")
 	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		request := decodeFinishChatRequest(t, r).Plan
+		if request.Purpose != purpose || request.Message != "" {
+			t.Error("long context changed or disabled splitting")
+		}
 		goals := []finish.Goal{
 			{Purpose: "Prepare password authentication for another provider", Boundary: "Review the behavior-preserving dispatch preparation", Reason: "Prepare dispatch while preserving existing password behavior.", Message: "Extract password authentication\n\n- Prepare dispatch while preserving existing password behavior."},
 			{Purpose: "Add Google authentication and its regression coverage", Boundary: "Review Google behavior separately from the refactor", Reason: "Route Google requests without changing password authentication.", Message: "Add Google authentication\n\n- Route Google requests without changing password authentication."},
@@ -54,7 +58,7 @@ func TestFinishWorkflowSameFileDecisions(t *testing.T) {
 	if calls.Load() != 0 {
 		t.Fatal("protection planned without finish")
 	}
-	result := decodeFinishWorkflow(t, f.Run(t, t.Context(), "finish", "Prepare dispatch, then add Google while preserving password behavior", "--json"))
+	result := decodeFinishWorkflow(t, f.Run(t, t.Context(), "finish", purpose, "--json"))
 	if !result.Published || result.CommitsCreated != 2 || calls.Load() != 1 || len(result.Target.Checkpoints) == 0 {
 		t.Fatalf("same-file decisions were not published: %+v calls=%d", result, calls.Load())
 	}
@@ -76,36 +80,56 @@ func TestFinishWorkflowSameFileDecisions(t *testing.T) {
 	assertFinishWorkflowStatus(t, t.Context(), f, true)
 }
 
-func TestFinishWorkflowRequiresExplanation(t *testing.T) {
+func TestFinishWorkflowOptionalContextAndExactOverride(t *testing.T) {
 	f := newFinishFixture(t)
-	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "approved work\n")
-	failed := finishRunJSON(t, f, "finish")
-	if failed.OK || failed.Data.ReasonCode != "finish_context_required" || failed.Data.Published {
-		t.Fatalf("Local published without an explanation: %+v", failed)
-	}
-	exact := f.Run(t, t.Context(), "finish", "--message", "Preserve approved work")
-	if exact.ExitCode == 0 || !strings.Contains(exact.Stdout+exact.Stderr, "body") || strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")) != f.BaseHead {
-		t.Fatalf("exact message bypassed the reason requirement: %+v", exact)
-	}
-	f.Barrier(t, t.Context())
-	for _, command := range []string{"status", "list"} {
-		var result ExecResult
-		if command == "list" {
-			result = runAcd(t, t.Context(), f.Env, "list", "--once", "--json")
-		} else {
-			result = f.Run(t, t.Context(), command, "--json")
+	purpose := "Problem: reloads reset saved choices.\n\nDecision: keep authored values ahead of defaults.\n\n" + strings.Repeat("Constraint: preserve offline settings and current callers.\n", 20)
+	for i, args := range [][]string{{"finish"}, {"finish", purpose}, {"finish", "--message", "Preserve approved work"}} {
+		writeFile(t, filepath.Join(f.Repo, "goal.txt"), strings.Repeat("approved work\n", i+1))
+		completed := finishRunJSON(t, f, args...)
+		if !completed.OK || !completed.Data.Published || completed.Data.CommitsCreated != 1 {
+			t.Fatalf("optional context blocked Local finish: %+v", completed)
 		}
-		if result.ExitCode != 0 || !strings.Contains(result.Stdout, "what changed and why") || strings.Contains(result.Stdout, "--retry") {
-			t.Fatalf("%s lost saved work or requested an unchanged retry: %+v", command, result)
+		message := strings.TrimSpace(runGitOK(t, f.Repo, "log", "-1", "--format=%B"))
+		if i == 0 && !strings.Contains(message, "offline commit") {
+			t.Fatalf("bare Local finish invented purpose: %s", message)
 		}
-	}
-	purpose := "Keep approved work separate from later edits"
-	completed := finishRunJSON(t, f, "finish", purpose)
-	if !completed.OK || !completed.Data.Published || completed.Data.CommitsCreated != 1 || !strings.Contains(runGitOK(t, f.Repo, "log", "-1", "--format=%B"), purpose) {
-		t.Fatalf("explained Local finish did not publish its reason: %+v", completed)
+		if i == 1 && completed.Data.Target.Purpose != purpose {
+			t.Fatal("long multiline context was clipped")
+		}
+		if i == 2 && message != "Preserve approved work" {
+			t.Fatalf("exact override changed: %s", message)
+		}
 	}
 	f.Barrier(t, t.Context())
 	assertFinishWorkflowStatus(t, t.Context(), f, true)
+	listed := runAcd(t, t.Context(), f.Env, "list", "--once", "--json")
+	if listed.ExitCode != 0 || strings.Contains(listed.Stdout, "what changed and why") {
+		t.Fatalf("list requires context after successful finish: %+v", listed)
+	}
+}
+
+func TestFinishWorkflowIntentInfersWithoutContext(t *testing.T) {
+	var calls atomic.Int32
+	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		request := decodeFinishChatRequest(t, r).Plan
+		if request.Purpose != "" || request.Message != "" {
+			t.Error("bare Intent finish added mandatory input")
+		}
+		var ids []string
+		for _, change := range request.Changes {
+			ids = append(ids, change.ID)
+		}
+		goal := finish.Goal{Purpose: "Preserve saved settings", Reason: "Keep authored values ahead of defaults so reloads preserve saved choices.", Message: "Preserve saved settings\n\n- Keep authored values ahead of defaults so reloads preserve saved choices.", ChangeIDs: ids}
+		raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{goal}})
+		writeFinishChatArguments(t, w, string(raw))
+	}, "30s", map[string]string{config.FieldDiffEgress: "true"}, ai.ConfirmationDiffEgress)
+	writeFile(t, filepath.Join(f.Repo, "settings.txt"), "prefer authored values over defaults\n")
+	completed := finishRunJSON(t, f, "finish")
+	message := runGitOK(t, f.Repo, "log", "-1", "--format=%B")
+	if !completed.OK || !completed.Data.Published || calls.Load() != 1 || !strings.Contains(strings.Join(strings.Fields(message), " "), "so reloads preserve saved choices") {
+		t.Fatalf("bare Intent finish lost inferred reason: %+v %s", completed, message)
+	}
 }
 
 func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {

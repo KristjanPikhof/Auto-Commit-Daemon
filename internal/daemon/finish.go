@@ -263,7 +263,7 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 		return state.FinishRequest{}, false, err
 	}
 	if options.Message != "" {
-		if err := finish.ValidatePublicationMessage(cfg.Style, options.Message); err != nil {
+		if err := finish.ValidateMessage(cfg.Style, options.Message); err != nil {
 			return state.FinishRequest{}, false, err
 		}
 	}
@@ -838,7 +838,7 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, r state.FinishRequest, evidence finish.Evidence, baseTree string) (finishPlanningResult, error) {
 	result := finishPlanningResult{Evidence: evidence}
 	if r.Target.Message != "" {
-		if err := finish.ValidatePublicationMessage(cfg.Style, r.Target.Message); err != nil {
+		if err := finish.ValidateMessage(cfg.Style, r.Target.Message); err != nil {
 			return result, err
 		}
 	}
@@ -946,12 +946,7 @@ func (w *FinishWorker) failPlan(r state.FinishRequest, plan FinishSavedPlan, cau
 	defer cancel()
 	code := "finish_failed"
 	var planning *ai.FinishPlanningError
-	switch {
-	case errors.Is(cause, finish.ErrCompletionContextRequired):
-		code = "finish_context_required"
-	case errors.Is(cause, finish.ErrMessageReasonRequired):
-		code = "finish_message_reason_required"
-	case errors.As(cause, &planning):
+	if errors.As(cause, &planning) {
 		code = planning.Code
 	}
 	var raw json.RawMessage
