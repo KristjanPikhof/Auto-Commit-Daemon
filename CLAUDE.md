@@ -154,9 +154,10 @@ limits still apply.
 
 An Intent attempt may review large evidence in at most 128 bounded calls, then
 make one global planning call and at most one global correction within one persisted
-deadline. Complete source evidence that fits the global budget goes directly to planning.
-When reviews are needed, selectable code stays exact in the global request and
-whole recorded changes are reviewed in bounded fragments without dropping bytes. Review fragments are evidence, never commit boundaries.
+deadline. Source requests up to 128 KiB go directly to planning. Larger inputs
+receive bounded reviews of mechanisms and prerequisites; selectable code stays
+exact in the global request alongside those observations. Reviews cover complete
+evidence without dropping bytes. Review fragments are evidence, never commit boundaries.
 Each review contains at most 32 fragments to bound its output.
 An invalid review gets at most one correction; accepted reviews are not repeated.
 Corrections consume the same 128-call budget and deadline. Their counts are

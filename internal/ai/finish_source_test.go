@@ -162,11 +162,11 @@ func TestFinishSourceVerifierFailureDoesNotRequestSemanticCorrection(t *testing.
 	}
 }
 
-func TestFinishSourceCodeFitsGlobalBudgetWithoutReviews(t *testing.T) {
+func TestFinishSmallSourceCodeSkipsReviews(t *testing.T) {
 	evidence, options, goals := finishSourceFixture()
 	options.Purpose = ""
 	options.Diffs[0].Text += " unchanged UTF-8 evidence: õun 界\n"
-	provider := &finishFakeTransport{padding: 600 << 10, exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+	provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
 		if request.Review != nil || request.Purpose != "" || request.Diffs[0].Text != options.Diffs[0].Text {
 			t.Fatal("complete source code was summarized, clipped or given mandatory context")
 		}
@@ -175,6 +175,31 @@ func TestFinishSourceCodeFitsGlobalBudgetWithoutReviews(t *testing.T) {
 	result, err := PlanFinish(t.Context(), provider, evidence, options)
 	if err != nil || result.Calls != 1 || result.Disclosure.EvidenceCalls != 0 || result.Source == nil {
 		t.Fatalf("direct source plan: calls=%d reviews=%d %v", result.Calls, result.Disclosure.EvidenceCalls, err)
+	}
+}
+
+func TestFinishLargeSourceReviewsSupplementExactCode(t *testing.T) {
+	evidence, options, goals := finishSourceFixture()
+	options.Purpose = ""
+	options.Diffs[0].Text += strings.Repeat(" unchanged UTF-8 evidence: õun 界\n", 5000)
+	var reviewed string
+	provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+		if request.Review != nil {
+			var observations []map[string]string
+			for _, part := range request.Review.Parts {
+				reviewed += part.Text
+				observations = append(observations, map[string]string{"id": part.ID, "summary": "Expose CameraID before selected consumes the running identity."})
+			}
+			return json.Marshal(map[string]any{"observations": observations})
+		}
+		if reviewed != options.Diffs[0].Text || request.Diffs[0].Text != reviewed || len(request.Reviews) == 0 || request.Purpose != "" {
+			t.Fatal("large source reviews replaced exact code or required context")
+		}
+		return json.Marshal(finishPlanOutput{Goals: goals})
+	}}
+	result, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || result.Calls != 1 || result.Disclosure.EvidenceCalls == 0 || result.Source == nil {
+		t.Fatalf("reviewed source plan: calls=%d reviews=%d %v", result.Calls, result.Disclosure.EvidenceCalls, err)
 	}
 }
 
@@ -188,7 +213,7 @@ func TestFinishSourceCodeSurvivesReferenceReviewCorrectionAndRetry(t *testing.T)
 	var saved finish.ReviewProgress
 	options.SaveReviewProgress = func(_ context.Context, p finish.ReviewProgress) error { saved = p; return nil }
 	retry, invalidReview, invalidPlan := false, false, false
-	reviewed := ""
+	reviewed := make(map[string]string)
 	provider := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
 		if request.Review != nil {
 			if retry {
@@ -196,11 +221,8 @@ func TestFinishSourceCodeSurvivesReferenceReviewCorrectionAndRetry(t *testing.T)
 			}
 			var observations []map[string]string
 			for _, part := range request.Review.Parts {
-				if part.ChangeID != "reference.txt" {
-					t.Fatal("selectable source was redundantly summarized")
-				}
 				if request.Correction == nil {
-					reviewed += part.Text
+					reviewed[part.ChangeID] += part.Text
 				}
 				observations = append(observations, map[string]string{"id": part.ID, "summary": "Retain the complete imported reference and its role."})
 			}
@@ -210,7 +232,7 @@ func TestFinishSourceCodeSurvivesReferenceReviewCorrectionAndRetry(t *testing.T)
 			}
 			return json.Marshal(map[string]any{"observations": observations})
 		}
-		if reviewed != reference || request.Diffs[0].Text != options.Diffs[0].Text || request.Diffs[1].Text != "" || len(request.Reviews) == 0 {
+		if reviewed["reference.txt"] != reference || reviewed["camera.go"] != options.Diffs[0].Text || request.Diffs[0].Text != options.Diffs[0].Text || request.Diffs[1].Text != "" || len(request.Reviews) == 0 {
 			t.Fatal("source code or complete reference review was lost")
 		}
 		bad := slices.Clone(goals)

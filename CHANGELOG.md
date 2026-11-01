@@ -18,9 +18,9 @@
 
 ### Changed
 
-- Send complete source-selection evidence directly to global planning when it
-  fits the existing budget. Review only whole-file evidence that needs summaries,
-  preserving exact selectable code and removing redundant source-ID summaries.
+- Preserve exact selectable code in global planning. Source requests up to
+  128 KiB go directly to planning; larger inputs receive bounded reviews of
+  mechanisms and prerequisites alongside the complete annotated source.
   Keep duplicate per-line coordinates local; retain every edit ID in its code.
   Plan all independent outcomes before ownership, without a remainder goal.
   Allow tested feature prerequisites before their separate UI integration when

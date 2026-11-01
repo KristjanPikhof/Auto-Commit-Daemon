@@ -119,7 +119,7 @@ binary objects, deletions, and unchanged entries.
 ## Bound the provider work
 
 Small requests use one planning exchange and at most one combined correction.
-Requests exceeding the direct planning budget first review whole-file evidence in bounded batches,
+Requests exceeding the direct planning budget first review complete evidence in bounded batches,
 then make one global plan across all recorded changes. At most 128 evidence
 reviews are allowed, with at most four immutable provider exchanges at once.
 The worker reserves each call before releasing its operation gate and continues
@@ -159,10 +159,10 @@ other details needed by the global planner. Short notes are enough for simple
 fragments. ACD checks the complete reply locally and never cuts a summary to
 make it pass. Combined requests still obey the configured context limits.
 The global planner receives all original change identities and observations
-together, without local cache digests. Source-selection requests skip reviews
-when the complete evidence fits the existing global budget. Larger requests
-review whole recorded changes while keeping exact approved annotated code for
-selectable files in the global request. Signatures, syntax and edit IDs stay
+together, without local cache digests. Source-selection requests up to 128 KiB
+skip reviews. Larger source requests get bounded observations of mechanisms
+and prerequisites while keeping exact approved annotated code for selectable
+files in the global request. Signatures, syntax and edit IDs stay
 together; no prose mapping is needed to reconstruct them. If selectable code
 cannot fit the global limit, ACD fails before spending review calls rather than
 compressing it away.

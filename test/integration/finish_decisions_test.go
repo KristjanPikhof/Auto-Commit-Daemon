@@ -203,8 +203,11 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 			var observations []map[string]string
 			for _, part := range request.Review.Parts {
 				summary := "Record the supplied operational conventions."
-				if part.ChangeID != "notes.txt" {
-					t.Error("selectable code was redundantly reviewed")
+				if part.ChangeID == "camera.sh" {
+					summary = "Supply active_identity before selected consumes it."
+					if !strings.Contains(part.Text, "] +active_identity()") {
+						t.Error("source review lost exact edit identities")
+					}
 				}
 				observations = append(observations, map[string]string{"id": part.ID, "summary": summary})
 			}

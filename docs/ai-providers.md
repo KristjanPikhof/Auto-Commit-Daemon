@@ -91,11 +91,10 @@ adds no unchanged content, object identities, or unreferenced file names and
 requires no extra repository scan. It is conservative: unlisted dependencies
 are not necessarily missing.
 
-There is no separate per-file rejection limit. Source-selection requests go
-straight to global planning when their complete approved evidence fits the
-existing global limit. Their annotated code is not replaced with summaries.
-When a larger request needs reviews, only whole recorded changes are summarized;
-selectable code remains complete in the global request. Every approved diff
+There is no separate per-file rejection limit. Source-selection requests up to
+128 KiB go straight to global planning. Larger inputs receive bounded reviews
+that identify mechanisms and prerequisites. Selectable code remains complete
+in the global request alongside those observations; summaries never replace it. Every approved diff
 reaches the provider in full through one of those paths. Fragments never become
 commit boundaries. Small non-source requests keep their direct planning path.
 
