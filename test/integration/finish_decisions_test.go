@@ -132,6 +132,66 @@ func TestFinishWorkflowIntentInfersWithoutContext(t *testing.T) {
 	}
 }
 
+func TestFinishWorkflowTerraResponsesWithoutContext(t *testing.T) {
+	var calls atomic.Int32
+	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var wire struct {
+			Input []struct {
+				Content string `json:"content"`
+			} `json:"input"`
+			Reasoning   map[string]string `json:"reasoning"`
+			Temperature *float64          `json:"temperature"`
+			Store       bool              `json:"store"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+			t.Error(err)
+			return
+		}
+		if r.URL.Path != "/responses" || wire.Reasoning["effort"] != "high" || wire.Temperature != nil || wire.Store || len(wire.Input) != 1 {
+			t.Error("Terra finish lost its reasoning request contract")
+			return
+		}
+		var request ai.FinishPlanRequest
+		if err := json.Unmarshal([]byte(wire.Input[0].Content), &request); err != nil {
+			t.Error(err)
+			return
+		}
+		if request.Purpose != "" || request.Message != "" || len(request.Changes) != 2 {
+			t.Error("bare Terra finish changed its frozen evidence")
+		}
+		goals := []finish.Goal{
+			{Purpose: "Prepare room generation", Boundary: "Keep room preparation independently reviewable", Reason: "Prepare room images so users can review them before application.", Message: "Prepare room generation\n\n- Prepare room images so users can review them before application."},
+			{Purpose: "Organize saved settings", Boundary: "Keep settings separate from room processing", Reason: "Keep saved choices ahead of defaults so reloads preserve preferences.", Message: "Organize saved settings\n\n- Keep saved choices ahead of defaults so reloads preserve preferences."},
+		}
+		for _, change := range request.Changes {
+			owner := 0
+			if change.Path == "settings.txt" {
+				owner = 1
+			}
+			goals[owner].ChangeIDs = append(goals[owner].ChangeIDs, change.ID)
+		}
+		arguments, _ := json.Marshal(map[string]any{"goals": goals})
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "completed", "output": []any{
+			map[string]any{"type": "reasoning", "summary": []any{}},
+			map[string]any{"type": "function_call", "name": "finish_plan", "arguments": string(arguments)},
+		}})
+	}, "1m", map[string]string{config.FieldModel: "gpt-6.1-terra"})
+	writeFile(t, filepath.Join(f.Repo, "rooms.txt"), "Review generated room images before applying them.\n")
+	writeFile(t, filepath.Join(f.Repo, "settings.txt"), "Keep authored values ahead of defaults.\n")
+	completed := finishRunJSON(t, f, "finish")
+	if !completed.OK || !completed.Data.Published || completed.Data.CommitsCreated != 2 || calls.Load() != 1 || completed.Data.Target.Purpose != "" {
+		t.Fatalf("bare Terra Responses finish failed: %+v", completed)
+	}
+	first := runGitOK(t, f.Repo, "show", "--format=", "--name-only", "HEAD~1")
+	last := runGitOK(t, f.Repo, "show", "--format=", "--name-only", "HEAD")
+	if strings.TrimSpace(first) != "rooms.txt" || strings.TrimSpace(last) != "settings.txt" {
+		t.Fatalf("Responses merged independent evidence: first=%s last=%s", first, last)
+	}
+	f.Barrier(t, t.Context())
+	assertFinishWorkflowStatus(t, t.Context(), f, true)
+}
+
 func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 	var calls atomic.Int32
 	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {

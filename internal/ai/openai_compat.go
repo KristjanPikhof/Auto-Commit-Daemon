@@ -50,7 +50,7 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 		return nil, err
 	}
 	if request.Review != nil {
-		return marshalOpenAIToolRequest(openAIToolRequestOptions{
+		return marshalFinishToolRequest(openAIToolRequestOptions{
 			Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
 			ToolName: "finish_evidence", ToolDescription: "Review exact diff fragments for one later global commit plan",
 			Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"observations"},
@@ -89,7 +89,7 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 		}}
 		required = append(required, "file_ownership")
 	}
-	return marshalOpenAIToolRequest(openAIToolRequestOptions{
+	return marshalFinishToolRequest(openAIToolRequestOptions{
 		Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
 		ToolName: "finish_plan", ToolDescription: "Plan completed purposes, safe recorded changes, and grounded messages",
 		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": required, "properties": properties},
@@ -110,7 +110,20 @@ func (p *OpenAIProvider) ExchangeFinish(ctx context.Context, body []byte) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	var sent struct {
+		Input      json.RawMessage `json:"input"`
+		ToolChoice struct {
+			Name     string               `json:"name"`
+			Function openAIFunctionChoice `json:"function"`
+		} `json:"tool_choice"`
+	}
+	_ = json.Unmarshal(body, &sent)
+	path := "chat/completions"
+	responses := len(sent.Input) > 0
+	if responses {
+		path = "responses"
+	}
+	endpoint, err := url.JoinPath(baseURL, path)
 	if err != nil {
 		return nil, err
 	}
@@ -145,13 +158,14 @@ func (p *OpenAIProvider) ExchangeFinish(ctx context.Context, body []byte) ([]byt
 		return nil, &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: finishHTTPErrorDetail(raw, p.APIKey)}
 	}
 	expectedTool := "finish_plan"
-	var sent struct {
-		ToolChoice openAIToolChoice `json:"tool_choice"`
-	}
-	if json.Unmarshal(body, &sent) == nil && sent.ToolChoice.Function.Name == "finish_evidence" {
+	if sent.ToolChoice.Function.Name == "finish_evidence" || sent.ToolChoice.Name == "finish_evidence" {
 		expectedTool = "finish_evidence"
 	}
-	arguments, err := parseFinishToolArgumentsFor(raw, expectedTool)
+	parse := parseFinishToolArgumentsFor
+	if responses {
+		parse = parseFinishResponseArguments
+	}
+	arguments, err := parse(raw, expectedTool)
 	if err != nil {
 		return nil, &finishOutputError{Err: err, Raw: raw}
 	}

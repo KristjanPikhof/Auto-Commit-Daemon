@@ -18,6 +18,10 @@
 
 ### Changed
 
+- Use Responses with high reasoning for `gpt-6.1-terra` global planning
+  and medium reasoning for evidence reviews,
+  retaining the configured model and endpoint. Keep strict tools, bounded
+  calls, cancellation and private checkpoints; never fall back to another API.
 - Preserve exact selectable code in global planning. Source requests up to
   128 KiB go directly to planning; larger inputs receive bounded reviews of
   mechanisms and prerequisites alongside the complete annotated source.
