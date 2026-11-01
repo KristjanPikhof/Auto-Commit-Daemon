@@ -121,6 +121,16 @@ run_measured_tests() {
   return "$status"
 }
 
+run_git_support() {
+  local index
+  local status=0
+  for index in 0 1; do
+    if ! run_package_shard "$1" 2 "$index" \
+      -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout"; then status=1; fi
+  done
+  return "$status"
+}
+
 run_support() {
   local group=${1:-all}
   local name=support
@@ -128,6 +138,10 @@ run_support() {
   local package
   local packages=()
   local long_packages=()
+  local git_package=
+  local git_pid=
+  local remaining_parallelism=$package_parallelism
+  local status=0
 
   case "$group" in
     all) ;;
@@ -144,7 +158,11 @@ run_support() {
     case "$package" in
       */internal/cli | */internal/daemon)
         ;;
-      */internal/git | */internal/restore | */internal/state)
+      */internal/git)
+        if [[ "$group" == all ]]; then git_package=./internal/git
+        else long_packages[${#long_packages[@]}]=$package; fi
+        ;;
+      */internal/ai | */internal/restore | */internal/state)
         long_packages[${#long_packages[@]}]=$package
         ;;
       *)
@@ -153,12 +171,24 @@ run_support() {
     esac
   done <<<"$package_list"
 
+  if [[ -n "$git_package" ]]; then
+    # One Git process at a time retains the support lane's process budget.
+    # Separate deadlines keep its complete scenario set below the leaf limit.
+    if ((package_parallelism > 1)); then
+      run_git_support "$git_package" &
+      git_pid=$!
+      remaining_parallelism=$((package_parallelism - 1))
+    elif ! run_git_support "$git_package"; then status=1; fi
+  fi
+
   # Start the long suites together so a late state package cannot extend
   # the entire lane after the shorter packages have already finished.
-  run_measured_tests "$name" -p "$package_parallelism" \
+  run_measured_tests "$name" -p "$remaining_parallelism" \
     ${long_packages[@]+"${long_packages[@]}"} ${packages[@]+"${packages[@]}"} \
     -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout" \
-    -skip "$timing_sensitive_verification_tests"
+    -skip "$timing_sensitive_verification_tests" || status=$?
+  if [[ -n "$git_pid" ]] && ! wait "$git_pid" && ((status == 0)); then status=1; fi
+  return "$status"
 }
 
 run_sensitive() {

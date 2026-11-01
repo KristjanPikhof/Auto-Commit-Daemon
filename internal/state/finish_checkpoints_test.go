@@ -3,6 +3,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -13,6 +14,16 @@ func TestFinishTargetVersionsPreserveLegacyRequestIdentity(t *testing.T) {
 		t.Fatalf("old frozen target was upgraded: %+v %v", legacy, err)
 	}
 	legacy.Mode = "intent"
+	legacy.Version = 2
+	if raw, err := finishTargetJSON(&legacy); err != nil || legacy.Version != 2 || strings.Contains(raw, "source_selection") {
+		t.Fatalf("version-two target changed identity: %s %v", raw, err)
+	}
+	legacy.SourceSelection = true
+	if _, err := finishTargetJSON(&legacy); !errors.Is(err, ErrFinishIdentity) {
+		t.Fatalf("old target accepted source construction: %v", err)
+	}
+	legacy.SourceSelection = false
+	legacy.Version = 1
 	legacy.Checkpoints = []FinishCheckpoint{{ID: "earlier", Ref: "refs/acd/finish/" + legacy.WorktreeID + "/request/versions/0", CommitOID: "commit", TreeOID: "tree"}}
 	if _, err := finishTargetJSON(&legacy); !errors.Is(err, ErrFinishIdentity) {
 		t.Fatalf("version-one target accepted new evidence: %v", err)
@@ -24,6 +35,34 @@ func TestFinishTargetVersionsPreserveLegacyRequestIdentity(t *testing.T) {
 	legacy.Version++
 	if _, err := finishTargetJSON(&legacy); !errors.Is(err, ErrFinishIdentity) {
 		t.Fatalf("unknown future version accepted: %v", err)
+	}
+}
+
+func TestFinishSourceSelectionIsPartOfFrozenIdentity(t *testing.T) {
+	db, _ := openTestDB(t)
+	r := finishFixture(t, db, 1)
+	r.Target.Version, r.Target.Mode, r.Target.SourceSelection = FinishVersion, "intent", true
+	saved := startFinishFixture(t, db, r)
+	failFinishFixture(t, db, saved)
+	retried, err := RetryFinishRequest(t.Context(), db, r.ID, nowSeconds()+300, false)
+	if err != nil || !retried.Target.SourceSelection || retried.Target.Version != FinishVersion {
+		t.Fatalf("retry changed source construction consent: %+v %v", retried.Target, err)
+	}
+	for _, scenario := range []string{"old", "local", "message", "versions"} {
+		candidate := r.Target
+		switch scenario {
+		case "old":
+			candidate.Version = 2
+		case "local":
+			candidate.Mode = "local"
+		case "message":
+			candidate.Message = "Preserve this exact batch"
+		case "versions":
+			candidate.Checkpoints = []FinishCheckpoint{{ID: "version", Ref: "refs/acd/finish/" + candidate.WorktreeID + "/request/versions/0", TreeOID: "tree", CommitOID: "commit"}}
+		}
+		if _, err := finishTargetJSON(&candidate); !errors.Is(err, ErrFinishIdentity) {
+			t.Fatalf("invalid source target accepted (%s): %v", scenario, err)
+		}
 	}
 }
 

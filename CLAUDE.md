@@ -127,6 +127,13 @@ Each split needs a useful review or revert boundary and a valid intermediate
 state. Put prerequisites before consumers or in the same commit. Explain
 the reason or practical impact in each generated message, not only internal
 planning metadata. Explain broader defaults and behavior changes from evidence.
+New final-only Intent requests with approved fast/full checks may construct
+intermediate text versions from exact frozen base/target line selections. No
+provider-written source is accepted. Keep scope labels and compiler dumps local;
+only approved redacted diff lines and edit metadata enter planning. Check every
+candidate before one publication. One failed source check may use the existing
+global correction and deadline, sharing only diagnostic names already in the
+approved diffs. Older requests and retained-version plans keep their identity.
 Intent requires approved redacted code diffs on every planning path; completion
 context supplements that evidence. Local remains offline. Existing settings
 retain their consent on upgrade. An exact `--message` requests one complete batch. Age and queue pressure

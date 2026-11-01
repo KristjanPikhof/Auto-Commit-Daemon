@@ -103,6 +103,7 @@ type FinishSavedPlan struct {
 	Version    int                 `json:"version"`
 	Steps      []FinishPlanStep    `json:"steps"`
 	Disclosure ai.FinishDisclosure `json:"disclosure"`
+	Source     *finishSourceProof  `json:"source,omitempty"`
 }
 
 type FinishResult struct {
@@ -332,6 +333,7 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 			return active, false, err
 		}
 	}
+	frozen.SourceSelection = cfg.Mode == "intent" && options.Message == "" && len(frozen.Checkpoints) == 0 && (cfg.VerificationMode == "fast" || cfg.VerificationMode == "full")
 	if tree != cp.TreeOID {
 		commit, err := git.CommitTreeDurable(ctx, wt.Root, tree, "acd finish target "+id, checkpoint.IdentityName, checkpoint.IdentityEmail)
 		if err != nil {
@@ -739,24 +741,68 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 	}
 	evalCtx, cancel := w.evaluationContext(ctx, wt, cfg, digest, r)
 	defer cancel()
-	plan, disclosure, err := w.plan(evalCtx, wt, cfg, r, evidence, baseTree)
+	planned, err := w.plan(evalCtx, wt, cfg, r, evidence, baseTree)
 	if err != nil {
-		return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: disclosure}, err)
+		if planned.Checked != nil {
+			return w.failPlan(r, planned.Checked.saved, err)
+		}
+		return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: planned.Disclosure, Source: planned.Source}, err)
 	}
-	if err := finish.Validate(evidence, plan); err != nil {
-		return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: disclosure}, err)
+	if err := finish.Validate(planned.Evidence, planned.Plan); err != nil {
+		return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: planned.Disclosure}, err)
 	}
-	if _, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishRunning, Stage: "verifying"}); err != nil {
-		return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: disclosure}, err)
+	var saved FinishSavedPlan
+	var proof git.FinishPublicationProof
+	if planned.Checked != nil {
+		saved, proof = planned.Checked.saved, planned.Checked.proof
+	} else {
+		if _, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishRunning, Stage: "verifying"}); err != nil {
+			return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: planned.Disclosure}, err)
+		}
+		saved, proof, err = w.prepare(evalCtx, wt, cfg, r, planned)
+		if err != nil {
+			return w.failPlan(r, saved, err)
+		}
 	}
-	saved := FinishSavedPlan{Version: 1, Disclosure: disclosure}
+	raw, err := json.Marshal(saved)
+	if err != nil {
+		return w.fail(r, err)
+	}
+	if r.DryRun {
+		result, _ := json.Marshal(FinishResult{DryRun: true})
+		completed, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishCompleted, Plan: raw, Result: result})
+		if err != nil {
+			return w.failPlan(r, saved, err)
+		}
+		return completed, nil
+	}
+	prepared, err := state.PrepareFinishPublication(ctx, w.DB, r.ID, r.Attempt, proof, raw)
+	if err != nil {
+		return w.failPlan(r, saved, err)
+	}
+	return w.publish(ctx, wt, prepared, false)
+}
+
+// prepare checks the complete private chain before any branch movement.
+func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, r state.FinishRequest, planned finishPlanningResult) (FinishSavedPlan, git.FinishPublicationProof, error) {
+	plan := planned.Plan
+	saved := FinishSavedPlan{Version: 1, Disclosure: planned.Disclosure, Source: planned.Source}
 	commits := make([]git.FinishCommit, 0, len(plan.Steps))
-	verifyCtx, verifyCancel := context.WithTimeout(evalCtx, cfg.VerificationTimeout)
+	verifyCtx, verifyCancel := context.WithTimeout(ctx, cfg.VerificationTimeout)
 	defer verifyCancel()
+	if planned.Source != nil && cfg.VerificationMode != "fast" && cfg.VerificationMode != "full" {
+		return saved, git.FinishPublicationProof{}, errors.New("constructed source versions require approved project checks")
+	}
+	for _, oid := range slices.Sorted(maps.Keys(planned.Blobs)) {
+		written, err := git.HashObjectStdinDurable(verifyCtx, wt.Root, planned.Blobs[oid])
+		if err != nil || written != oid {
+			return saved, git.FinishPublicationProof{}, errors.Join(err, state.ErrFinishIdentity)
+		}
+	}
 	for _, step := range plan.Steps {
 		tree, err := materializeFinishTree(verifyCtx, wt, w.DB, step.Tree)
 		if err != nil {
-			return w.failPlan(r, saved, err)
+			return saved, git.FinishPublicationProof{}, err
 		}
 		saved.Steps = append(saved.Steps, FinishPlanStep{Goal: step.Goal, TreeOID: tree, Author: step.Author})
 		commits = append(commits, git.FinishCommit{TreeOID: tree, Message: step.Message, AuthorName: cfg.AuthorName, AuthorEmail: cfg.AuthorEmail})
@@ -782,33 +828,19 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 		return nil
 	}})
 	if err != nil {
-		return w.failPlan(r, saved, err)
+		return saved, git.FinishPublicationProof{}, err
 	}
-	raw, err := json.Marshal(saved)
-	if err != nil {
-		return w.fail(r, err)
-	}
-	if r.DryRun {
-		result, _ := json.Marshal(FinishResult{DryRun: true})
-		completed, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishCompleted, Plan: raw, Result: result})
-		if err != nil {
-			return w.failPlan(r, saved, err)
-		}
-		return completed, nil
-	}
-	prepared, err := state.PrepareFinishPublication(ctx, w.DB, r.ID, r.Attempt, proof, raw)
-	if err != nil {
-		return w.failPlan(r, saved, err)
-	}
-	return w.publish(ctx, wt, prepared, false)
+	return saved, proof, nil
 }
 
-// plan keeps request preparation and durable call accounting on the worker
-// stack. Only the immutable provider exchange releases the operation gate.
-func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, r state.FinishRequest, evidence finish.Evidence, baseTree string) (finish.Plan, ai.FinishDisclosure, error) {
+// plan keeps durable accounting on the worker. Immutable source preparation and
+// provider exchanges release the operation gate while later work is protected.
+func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, r state.FinishRequest, evidence finish.Evidence, baseTree string) (finishPlanningResult, error) {
+	result := finishPlanningResult{Evidence: evidence}
 	if cfg.Mode == "local" {
 		plan, err := finish.Local(evidence, finish.LocalOptions{Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message})
-		return plan, ai.FinishDisclosure{}, err
+		result.Plan = plan
+		return result, err
 	}
 	ctx, cancel := context.WithDeadline(ctx, finishDeadline(r))
 	defer cancel()
@@ -819,11 +851,11 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		// budget must not retain the shorter configured HTTP/process timeout.
 		provider.Timeout = time.Until(finishDeadline(r))
 		if provider.Timeout <= 0 {
-			return finish.Plan{}, ai.FinishDisclosure{}, &ai.FinishPlanningError{Code: "provider_deadline", Err: context.DeadlineExceeded}
+			return result, &ai.FinishPlanningError{Code: "provider_deadline", Err: context.DeadlineExceeded}
 		}
 		configured, closer, err := ai.BuildFinishTransport(provider, cfg.Approved)
 		if err != nil {
-			return finish.Plan{}, ai.FinishDisclosure{}, err
+			return result, err
 		}
 		if closer != nil {
 			defer closer.Close()
@@ -832,16 +864,50 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	}
 	diffs, err := finishProviderDiffs(ctx, wt.Root, baseTree, r.Target.TargetTree, evidence.Changes, cfg.Provider.DiffEgress, cfg.Provider.MaxInputBytes)
 	if ctx.Err() != nil {
-		return finish.Plan{}, ai.FinishDisclosure{}, &ai.FinishPlanningError{Code: "provider_deadline", Err: ctx.Err()}
+		return result, &ai.FinishPlanningError{Code: "provider_deadline", Err: ctx.Err()}
 	}
 	if err != nil {
-		return finish.Plan{}, ai.FinishDisclosure{}, err
+		return result, err
+	}
+	var sourceFiles []finish.SourceFile
+	if r.Target.SourceSelection {
+		if cfg.VerificationMode != "fast" && cfg.VerificationMode != "full" {
+			return result, errors.New("source selections require approved project checks")
+		}
+		prepared, prepareErr := evaluatePublication(ctx, func(jobCtx context.Context) (finishSourcePreparation, error) {
+			files, updated, err := prepareFinishSources(jobCtx, wt.Root, evidence, diffs, cfg.Provider.MaxInputBytes)
+			return finishSourcePreparation{files: files, diffs: updated}, err
+		})
+		sourceFiles, diffs, err = prepared.files, prepared.diffs, prepareErr
+		if err != nil {
+			if ctx.Err() != nil {
+				return result, &ai.FinishPlanningError{Code: "provider_deadline", Err: ctx.Err()}
+			}
+			return result, err
+		}
 	}
 	identity, err := json.Marshal(r.Target)
 	if err != nil {
-		return finish.Plan{}, ai.FinishDisclosure{}, err
+		return result, err
 	}
-	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, ReviewIdentity: string(identity), ReviewProgress: r.ReviewProgress, SaveReviewProgress: func(saveCtx context.Context, progress finish.ReviewProgress) error {
+	var checked *finishPreparedPlan
+	verifySource := func(checkCtx context.Context, built finish.SourcePlan) error {
+		if _, err := state.UpdateFinishRequest(checkCtx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishRunning, Stage: "verifying"}); err != nil {
+			return err
+		}
+		candidate := finishPlanningResult{Plan: built.Plan, Evidence: built.Evidence, Blobs: built.Blobs, Source: sourceProof(evidence, sourceFiles, built.Selections)}
+		saved, proof, err := w.prepare(checkCtx, wt, cfg, r, candidate)
+		checked = &finishPreparedPlan{saved: saved, proof: proof}
+		if err != nil {
+			for i, step := range saved.Steps {
+				if step.Check.Executed && step.Check.Result.Status != verification.StatusPassed {
+					return &ai.SourceCheckFailure{Step: i + 1, Output: step.Check.Result.Output}
+				}
+			}
+		}
+		return err
+	}
+	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{SourceFiles: sourceFiles, VerifySource: verifySource, MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, ReviewIdentity: string(identity), ReviewProgress: r.ReviewProgress, SaveReviewProgress: func(saveCtx context.Context, progress finish.ReviewProgress) error {
 		return state.SaveFinishReviewProgress(saveCtx, w.DB, r.ID, r.Attempt, progress)
 	}, BeforeEvidenceCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishEvidenceCall(callCtx, w.DB, r.ID, r.Attempt)
@@ -850,7 +916,18 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}})
-	return planned.Plan, planned.Disclosure, err
+	result.Plan, result.Disclosure, result.Checked = planned.Plan, planned.Disclosure, checked
+	if len(sourceFiles) > 0 {
+		result.Source = sourceProof(evidence, sourceFiles, nil)
+	}
+	if planned.Source != nil {
+		result.Evidence, result.Blobs = planned.Source.Evidence, planned.Source.Blobs
+		result.Source.Selections = planned.Source.Selections
+	}
+	if checked != nil {
+		checked.saved.Disclosure = planned.Disclosure
+	}
+	return result, err
 }
 
 func (w *FinishWorker) fail(r state.FinishRequest, cause error) (state.FinishRequest, error) {

@@ -73,6 +73,16 @@ func TestFinishWorkerChecksFieldDefinitionsBeforeConsumers(t *testing.T) {
 					{Purpose: "Expose camera identity in status", Boundary: "Provide status data before its consumer", Reason: "Controls need the active camera identity to synchronize their selection.", Message: "Expose camera identity in status\n\n- Controls need the active camera identity to synchronize\n  their selection.", ChangeIDs: []string{"status.go"}},
 					{Purpose: "Synchronize the selected camera", Boundary: "Consume the status field after its definition", Reason: "Read the active camera identity so controls follow the running source.", Message: "Synchronize the selected camera\n\n- Read the active camera identity so controls follow the\n  running source.", ChangeIDs: []string{"controls.go"}},
 				}
+				if len(request.SourceEdits) > 0 {
+					goals[0].ChangeIDs, goals[1].ChangeIDs = nil, nil
+					for _, edit := range request.SourceEdits {
+						group := 0
+						if edit.ChangeID == "controls.go" {
+							group = 1
+						}
+						goals[group].ChangeIDs = append(goals[group].ChangeIDs, edit.ID)
+					}
+				}
 				if consumerFirst {
 					goals[0], goals[1] = goals[1], goals[0]
 				}

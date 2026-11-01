@@ -142,7 +142,12 @@ splits. Available unpublished corrections belong with the change they correct.
 
 Each changed entry belongs to exactly one goal. Respect rename chains,
 create/delete order, hard dependencies, and generated relationships. Materialize
-only recorded path versions; do not fabricate code or intermediate history.
+recorded versions or exact frozen source selections; never accept provider-written
+replacement code. Source construction is limited to new final-only requests
+with approved `fast` or `full` project checks. Existing regular text files can
+contribute exact insertions and deletions. New files, renames, binaries and mode
+changes stay whole. Persist the frozen witnesses, edit positions and selections
+with the checked plan; older requests keep their accepted version rules.
 The final candidate tree must equal the entire frozen target exactly, including
 unchanged entries, file modes, deletions, renames, symlinks, and binary objects.
 Coverage and equality are structural evidence, not proof that project tests ran.
@@ -168,7 +173,10 @@ reservations use the mutable attempt result journal, preserving accepted-plan
 immutability and the separate two-call planning budget. Restart retains the
 counts and interrupts the attempt; it does not resume provider work. Messages belong to
 that plan, so they have no separate retry loop. One batch must explain why the
-recorded changes do not support useful safe steps. Failed intermediate checks,
+recorded changes do not support useful safe steps. A failed constructed-source
+check can use the same global correction and deadline. Only its step number and
+diagnostic names already present in approved redacted diffs may enter feedback;
+raw check output stays local. Recheck every corrected candidate. Failed intermediate checks,
 provider failure, malformed or incomplete output, unavailable evidence, and
 exhausted budget fail the request instead of silently combining commits.
 

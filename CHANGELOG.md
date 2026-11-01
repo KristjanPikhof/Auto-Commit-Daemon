@@ -18,9 +18,17 @@
 
 ### Changed
 
+- Let new final-only Intent requests split existing text files by purpose using
+  exact frozen lines when approved project checks are configured. Check every
+  intermediate commit before publication and use the existing bounded correction
+  for failed source checks without sharing raw command output. Preserve older
+  request identities and prepared recovery proofs.
 - Run three support packages at once in the default local gate and refresh CLI
   shard weights from measured runtimes. Keep the two-test limit within each
   package and all existing cases.
+- Run local Git support cases in two sequential shards with measured weights.
+  Keep three support processes, share compiler artifacts across isolated test
+  homes, and avoid repeated Git fixture setup commands without dropping cases.
 - Wrap generated Intent message bodies without changing their wording, so long
   lines do not consume a provider correction. Keep exact user messages unchanged
   and continue to reject invalid structure and overlong subjects.

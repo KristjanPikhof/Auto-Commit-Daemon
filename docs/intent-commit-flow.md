@@ -26,7 +26,16 @@ explicit retries. Old requests without this evidence keep their original target.
 Only paths changed in the final eligible target can supply intermediate versions.
 Renames and deletions stay complete final transitions. Requests with staged
 consent use only the frozen final selection, so earlier unstaged versions cannot
-enter their commits. ACD never invents a missing intermediate file version.
+enter their commits.
+
+When no useful earlier versions exist, a new Intent request with approved `fast`
+or `full` checks can split existing text files using exact lines from the frozen
+base and target. Each insertion or deletion belongs to one goal. ACD constructs
+the intermediate files locally; the provider cannot supply replacement code.
+Go and Swift scope information prevents identical lines in different functions
+from matching. Swift files require a working local Swift compiler. New files,
+renames, binary files and mode changes remain whole transitions. Older requests,
+exact messages and structural-only requests retain their existing version rules.
 
 A dry run creates private planning and verification evidence and may call the
 provider or approved project commands. It does not move the branch, index, or
@@ -70,8 +79,8 @@ Settings redesign, even when both were discovered during the same UI audit.
 A shortcut recorder, its saved bindings, conflict checks and menu hints can
 complete one feature.
 
-When independent purposes share a file and no recorded version can separate
-them, the provider can return `blocked_reason` with no goals. Finish fails with
+When the available versions or source selections cannot separate independent
+purposes safely, the provider can return `blocked_reason` with no goals. Finish fails with
 the explanation and keeps the work protected. It does not combine unrelated
 behavior just to produce a commit. Finish coherent, verified milestones while
 working so their versions remain available for later planning. An unchanged
@@ -86,12 +95,12 @@ unless an exact batch message is supplied. Missing approval or context needs a
 new finish after correcting the input, since retry preserves the original
 settings and purpose. Previews show each proposed boundary.
 
-The planner chooses which changes belong together. ACD orders the commits by
-their version dependencies and replays selected versions in recorded order.
+The planner chooses which changes belong together. ACD orders recorded versions
+by their dependencies. Source selections use the provider's prerequisite order.
 Conflicting groups need a corrected plan; ACD does not merge them. It accepts
-only exact recorded path versions and rejects missing or duplicate membership,
+only recorded versions or verified selections of frozen source bytes. It rejects missing or duplicate membership,
 unsafe dependencies, split rename groups, mixed author boundaries,
-and fabricated intermediate content. Neutral recorded cycles can remain
+and provider-written replacement content. Neutral recorded cycles can remain
 provenance without creating a commit; a net-zero target creates no commits.
 The final tree must equal the entire frozen target, including modes, symlinks,
 binary objects, deletions, and unchanged entries.
@@ -106,7 +115,11 @@ The worker reserves each call before releasing its operation gate and continues
 protecting later edits while reviews run. All calls share one persisted deadline, using `ai.timeout` (five minutes by
 default) or an explicit `--timeout 15m` for the new attempt. Messages
 are part of the same plan; they do not get a separate retry loop. Correction
-feedback includes all detected message and membership conflicts together.
+feedback includes all detected message and membership conflicts together. A
+source plan rejected by project checks can use that same correction. The
+feedback identifies the failed step and diagnostic names already present in
+approved redacted diffs. Raw command output stays local. Every corrected
+candidate runs its checks again within the original deadline.
 
 The request contains bounded metadata, redacted supplied context, and approved
 text diffs. Each encoded review is bounded to 512 KiB. The global catalogue
@@ -136,8 +149,9 @@ verified Git objects. See [providers and privacy](ai-providers.md).
 Missing credentials, timeout, unavailable providers, or an invalid plan fail
 the attempt. ACD keeps the work protected and does not switch to Local. A single
 batch needs an explanation of why the recorded changes lack useful safe steps;
-belonging to one feature is not enough. A failed intermediate check fails the
-whole request rather than silently combining its commits.
+belonging to one feature is not enough. Failed intermediate checks never publish
+a partial chain or silently combine commits. A source plan that still fails
+after the available correction ends the request.
 
 `--message` requests one complete batch with that exact valid message and disables
 automatic splitting. Use the quoted purpose for grouping context. In Intent
@@ -146,7 +160,8 @@ mode an exact message still requires provider planning.
 ## Verify every tree
 
 ACD materializes the complete proposed chain privately. Structural checks prove
-recorded-version use, safe membership and ordering, and exact target equality.
+recorded versions or exact frozen-byte selections, safe membership and ordering,
+and exact target equality.
 They always run, including under `intent.verification=none`.
 
 Structural verification does not compile code. To catch a consumer whose field

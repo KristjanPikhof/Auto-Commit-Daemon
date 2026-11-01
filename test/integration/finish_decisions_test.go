@@ -76,6 +76,67 @@ func TestFinishWorkflowSameFileDecisions(t *testing.T) {
 	assertFinishWorkflowStatus(t, t.Context(), f, true)
 }
 
+func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
+	var calls atomic.Int32
+	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		request := decodeFinishChatRequest(t, r).Plan
+		goals := []finish.Goal{
+			{Purpose: "Expose the active camera identity", Boundary: "Provide identity before its consumer", Reason: "Expose the active identity so controls can follow the camera.", Message: "Expose the active camera identity\n\n- Expose the active identity so controls can follow the camera."},
+			{Purpose: "Synchronize camera selection", Boundary: "Consume the available camera identity", Reason: "Read the running camera identity instead of retaining an empty selection.", Message: "Synchronize camera selection\n\n- Read the running camera identity instead of retaining an empty selection."},
+		}
+		for _, diff := range request.Diffs {
+			for _, line := range strings.Split(diff.Text, "\n") {
+				if !strings.HasPrefix(line, "[") {
+					continue
+				}
+				id, _, ok := strings.Cut(strings.TrimPrefix(line, "["), "] ")
+				if !ok {
+					t.Error("source evidence lost its edit identity")
+					continue
+				}
+				group := 0
+				if strings.Contains(line, "selected()") {
+					group = 1
+				}
+				goals[group].ChangeIDs = append(goals[group].ChangeIDs, id)
+			}
+		}
+		if len(request.SourceEdits) != 3 {
+			t.Errorf("expected the complete three-edit catalogue, got %+v", request.SourceEdits)
+		}
+		if request.Correction == nil {
+			goals[0], goals[1] = goals[1], goals[0]
+		} else if !strings.Contains(request.Correction.ValidationError, "step 1") {
+			t.Errorf("failed project check was not used in correction: %+v", request.Correction)
+		}
+		response, _ := json.Marshal(map[string]any{"goals": goals})
+		writeFinishChatArguments(t, w, string(response))
+	}, "1m", map[string]string{config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "sh verify.sh", config.FieldVerificationFastTimeout: "5s"}, ai.ConfirmationVerificationCommand)
+	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "selected() { printf none; }\n")
+	writeFile(t, filepath.Join(f.Repo, "verify.sh"), ". ./camera.sh\nvalue=$(selected) || exit 1\ntest \"$value\" = none || test \"$value\" = camera\n")
+	runGitOK(t, f.Repo, "add", "camera.sh", "verify.sh")
+	runGitOK(t, f.Repo, "commit", "-m", "Seed camera controls")
+	f.BaseHead = strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	f.Barrier(t, t.Context())
+	final := "active_identity() { printf camera; }\nselected() { active_identity; }\n"
+	writeFile(t, filepath.Join(f.Repo, "camera.sh"), final)
+	result := decodeFinishWorkflow(t, f.Run(t, t.Context(), "finish", "Expose camera identity, then synchronize controls", "--json"))
+	if !result.Published || result.CommitsCreated != 2 || !result.Target.SourceSelection || calls.Load() != 2 || result.PlanningCalls != 2 {
+		t.Fatalf("checked source correction was not published: %+v calls=%d", result, calls.Load())
+	}
+	if got := runGitOK(t, f.Repo, "show", "HEAD:camera.sh"); got != final {
+		t.Fatalf("source correction changed final bytes: %q", got)
+	}
+	for _, check := range result.Verification {
+		if !check.Executed || check.Result.ExitCode != 0 {
+			t.Fatalf("corrected candidate was not checked: %+v", check)
+		}
+	}
+	f.Barrier(t, t.Context())
+	assertFinishWorkflowStatus(t, t.Context(), f, true)
+}
+
 func TestFinishWorkflowRejectsUnexplainedDecision(t *testing.T) {
 	var calls atomic.Int32
 	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {

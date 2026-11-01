@@ -99,8 +99,9 @@ below authored values until reviewed settings materialize those choices.
 
 ## Project checks
 
-Structural safety checks always run: recorded versions, safe membership and
-ordering, complete trees, and exact final target equality.
+Structural safety checks always run: recorded versions or exact frozen-byte
+selections, safe membership and ordering, complete trees, and exact final target
+equality.
 
 | `intent.verification` | Project command |
 |---|---|

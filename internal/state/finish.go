@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	FinishVersion        = 2
+	FinishVersion        = 3
 	FinishRunning        = "running"
 	FinishPrepared       = "prepared"
 	FinishCompleted      = "completed"
@@ -52,7 +52,8 @@ type FinishTarget struct {
 	Purpose         string `json:"purpose,omitempty"`
 	Message         string `json:"message,omitempty"`
 
-	Checkpoints []FinishCheckpoint `json:"checkpoints,omitempty"`
+	Checkpoints     []FinishCheckpoint `json:"checkpoints,omitempty"`
+	SourceSelection bool               `json:"source_selection,omitempty"`
 }
 
 // FinishCheckpoint pins an exact recorded version independently of checkpoint
@@ -183,7 +184,7 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 	if target.Version == 0 {
 		target.Version = FinishVersion
 	}
-	if (target.Version != 1 && target.Version != FinishVersion) || (target.Version == 1 && len(target.Checkpoints) > 0) || target.RepositoryID == "" || target.WorktreeID == "" ||
+	if (target.Version != 1 && target.Version != 2 && target.Version != FinishVersion) || (target.Version == 1 && len(target.Checkpoints) > 0) || target.RepositoryID == "" || target.WorktreeID == "" ||
 		!strings.HasPrefix(target.BranchRef, "refs/heads/") || target.CheckpointID == "" ||
 		target.CheckpointTree == "" || target.TargetTree == "" || target.IndexDigest == "" ||
 		target.ConfigDigest == "" || (target.Mode != "local" && target.Mode != "intent") ||
@@ -201,6 +202,9 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 		return "", ErrFinishIdentity
 	}
 	if len(target.Checkpoints) > FinishCheckpointLimit || (len(target.Checkpoints) > 0 && (target.Mode != "intent" || target.Message != "" || target.IncludeStaged)) {
+		return "", ErrFinishIdentity
+	}
+	if target.SourceSelection && (target.Version < 3 || target.Mode != "intent" || target.Message != "" || len(target.Checkpoints) > 0) {
 		return "", ErrFinishIdentity
 	}
 	seen := make(map[string]bool)

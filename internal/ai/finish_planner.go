@@ -66,6 +66,7 @@ type FinishPlanRequest struct {
 	Review         *FinishReviewTask         `json:"evidence_review,omitempty"`
 	Reviews        []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	HistoryCommits []HistoryMessageCommit    `json:"history_commits,omitempty"`
+	SourceEdits    []FinishSourceEdit        `json:"source_edits,omitempty"`
 	// Only names already present in approved redacted diffs are included.
 	ReferencedUnchangedPaths []string `json:"referenced_unchanged_paths,omitempty"`
 }
@@ -79,6 +80,11 @@ type FinishOptions struct {
 	Message    string
 	Diffs      []FinishDiff
 	DiffEgress bool
+	// Local frozen bytes; only edit descriptors and approved diffs enter requests.
+	SourceFiles []finish.SourceFile
+	// A source verifier may reject one candidate plan inside the same persisted
+	// deadline and combined-correction budget. It never publishes a branch.
+	VerifySource func(context.Context, finish.SourcePlan) error
 	// Binary-only finishes need supplied context because their content cannot
 	// enter a text request. History also has selected commit messages.
 	RequireCompletionContext bool
@@ -109,6 +115,7 @@ type FinishDisclosure struct {
 
 type FinishPlanResult struct {
 	Plan       finish.Plan
+	Source     *finish.SourcePlan
 	Calls      int
 	Disclosure FinishDisclosure
 }
@@ -178,6 +185,14 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 	if err := finish.ValidateEvidence(evidence); err != nil {
 		return result, finishFailure("invalid_evidence", err)
 	}
+	if len(options.SourceFiles) > 0 {
+		if options.Message != "" {
+			return result, finishFailure("invalid_options", errors.New("exact messages cannot select source edits"))
+		}
+		if _, _, err := finishSourceCatalogue(evidence, options.SourceFiles); err != nil {
+			return result, finishFailure("invalid_evidence", err)
+		}
+	}
 	if options.Style == "" {
 		options.Style = finish.StyleImperative
 	}
@@ -215,6 +230,7 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 	if err != nil {
 		return result, err
 	}
+	approvedDiffs := slices.Clone(request.Diffs)
 	if options.RequireCompletionContext && len(disclosure.TextChangeIDs) == 0 && strings.TrimSpace(request.Purpose) == "" && request.Message == "" {
 		return result, finishFailure("provider_context_required", errors.New("Intent needs completion context for changes without readable text; run acd finish \"what changed and why\""))
 	}
@@ -259,12 +275,27 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 			return result, finishFailure("provider_response_too_large", errors.New("provider response exceeds 1 MiB"))
 		}
 		var plan finish.Plan
+		var source *finish.SourcePlan
 		validationErr := exchangeErr
 		if validationErr == nil {
-			plan, validationErr = validateFinishOutput(raw, evidence, options)
+			plan, source, validationErr = validateFinishReply(raw, evidence, options)
+		}
+		if validationErr == nil && source != nil && options.VerifySource != nil {
+			checkErr := options.VerifySource(ctx, *source)
+			if ctx.Err() != nil {
+				return result, finishDeadlineFailure(ctx.Err(), checkErr)
+			}
+			if checkErr != nil {
+				var rejected *SourceCheckFailure
+				if !errors.As(checkErr, &rejected) {
+					return result, finishFailure("source_verification_failed", checkErr)
+				}
+				validationErr = sourceCheckFeedback(rejected, approvedDiffs)
+			}
 		}
 		if validationErr == nil {
 			result.Plan = plan
+			result.Source = source
 			return result, nil
 		}
 		if call == 1 {
@@ -286,6 +317,13 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 		return FinishPlanRequest{}, FinishDisclosure{}, finishFailure("provider_diffs_required", ErrIntentDiffsRequired)
 	}
 	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress}
+	if len(options.SourceFiles) > 0 {
+		var err error
+		request.SourceEdits, _, err = finishSourceCatalogue(evidence, options.SourceFiles)
+		if err != nil {
+			return request, FinishDisclosure{}, finishFailure("invalid_evidence", err)
+		}
+	}
 	disclosure := FinishDisclosure{MetadataIncluded: true, PurposeIncluded: options.Purpose != "", MessageIncluded: options.Message != "", Redacted: request.Purpose != options.Purpose || request.Message != options.Message}
 	ids := make(map[string]finish.Change, len(evidence.Changes))
 	for _, change := range evidence.Changes {
@@ -355,12 +393,22 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 func finishReferencedUnchangedPaths(evidence finish.Evidence, diffs []FinishDiff) []string {
 	paths := make(map[string]bool)
 	for _, diff := range diffs {
-		for _, token := range strings.FieldsFunc(diff.Text, func(r rune) bool {
-			return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune("_./-", r)
-		}) {
-			path := strings.TrimPrefix(token, "./")
-			if entry, exists := evidence.Target[path]; exists && entry == evidence.Base[path] {
-				paths[path] = true
+		for _, line := range strings.Split(diff.Text, "\n") {
+			if strings.HasPrefix(line, "diff ") || strings.HasPrefix(line, "index ") || strings.HasPrefix(line, "@@ ") || strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "\\ No newline") {
+				continue
+			}
+			if strings.HasPrefix(line, "[") {
+				if _, code, ok := strings.Cut(line, "] "); ok && (strings.HasPrefix(code, "+") || strings.HasPrefix(code, "-")) {
+					line = code
+				}
+			}
+			for _, token := range strings.FieldsFunc(line, func(r rune) bool {
+				return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune("_./-", r)
+			}) {
+				path := strings.TrimPrefix(token, "./")
+				if entry, exists := evidence.Target[path]; exists && entry == evidence.Base[path] {
+					paths[path] = true
+				}
 			}
 		}
 	}
@@ -389,25 +437,43 @@ type finishPlanOutput struct {
 }
 
 func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, error) {
+	plan, _, err := validateFinishReply(raw, evidence, options)
+	return plan, err
+}
+
+func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, *finish.SourcePlan, error) {
 	if !utf8.Valid(raw) {
-		return finish.Plan{}, errors.New("provider output is not valid UTF-8")
+		return finish.Plan{}, nil, errors.New("provider output is not valid UTF-8")
 	}
 	var output finishPlanOutput
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&output); err != nil {
-		return finish.Plan{}, fmt.Errorf("decode finish goals: %w", err)
+		return finish.Plan{}, nil, fmt.Errorf("decode finish goals: %w", err)
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		return finish.Plan{}, errors.New("provider output must contain exactly one JSON object")
+		return finish.Plan{}, nil, errors.New("provider output must contain exactly one JSON object")
 	}
 	if strings.TrimSpace(output.BlockedReason) != "" {
-		return finish.Plan{}, fmt.Errorf("cannot plan purposeful commits: %s", output.BlockedReason)
+		return finish.Plan{}, nil, fmt.Errorf("cannot plan purposeful commits: %s", output.BlockedReason)
 	}
 	if options.Message != "" && (len(output.Goals) != 1 || output.Goals[0].Message != finishRedactText(options.Message)) {
-		return finish.Plan{}, errors.New("supplied message requires one complete batch goal with the exact supplied message")
+		return finish.Plan{}, nil, errors.New("supplied message requires one complete batch goal with the exact supplied message")
 	}
 	var validationErrors []error
+	qualityEvidence := evidence
+	if len(options.SourceFiles) > 0 {
+		var err error
+		var sourceEdits []FinishSourceEdit
+		sourceEdits, qualityEvidence.Changes, err = finishSourceCatalogue(evidence, options.SourceFiles)
+		if err != nil {
+			return finish.Plan{}, nil, err
+		}
+		output.Goals, err = expandFinishSourceGoals(output.Goals, qualityEvidence.Changes, sourceEdits)
+		if err != nil {
+			validationErrors = append(validationErrors, err)
+		}
+	}
 	for index, goal := range output.Goals {
 		if options.Message == "" {
 			goal.Message = reflowGeneratedMessage(options.Style, goal.Message)
@@ -420,33 +486,41 @@ func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOp
 		if err := finish.ValidateMessage(options.Style, message); err != nil {
 			validationErrors = append(validationErrors, fmt.Errorf("goal %d: %w", index+1, err))
 		}
-		if (len(output.Goals) > 1 || (options.Message == "" && len(evidence.Changes) > 1)) && strings.TrimSpace(goal.Boundary) == "" {
+		if (len(output.Goals) > 1 || (options.Message == "" && len(qualityEvidence.Changes) > 1)) && strings.TrimSpace(goal.Boundary) == "" {
 			validationErrors = append(validationErrors, fmt.Errorf("goal %d: each proposed commit needs a useful review or revert boundary; a single batch must explain why useful separate steps are unavailable", index+1))
 		}
 		if options.Message == "" {
 			if err := validateGeneratedReason(goal); err != nil {
 				validationErrors = append(validationErrors, fmt.Errorf("goal %d: %w", index+1, err))
 			}
-			if err := validateFinishGoalQuality(goal, evidence); err != nil {
+			if err := validateFinishGoalQuality(goal, qualityEvidence); err != nil {
 				validationErrors = append(validationErrors, fmt.Errorf("goal %d: %w", index+1, err))
 			}
 		}
 	}
-	goals, err := orderFinishGoals(evidence, output.Goals)
 	var plan finish.Plan
-	if err == nil {
-		plan, err = finish.Build(evidence, goals)
+	var source *finish.SourcePlan
+	var err error
+	if len(options.SourceFiles) > 0 {
+		built, buildErr := finish.BuildSourcePlan(evidence, options.SourceFiles, output.Goals)
+		plan, source, err = built.Plan, &built, buildErr
+	} else {
+		var goals []finish.Goal
+		goals, err = orderFinishGoals(evidence, output.Goals)
+		if err == nil {
+			plan, err = finish.Build(evidence, goals)
+		}
 	}
 	if err != nil {
 		validationErrors = append(validationErrors, err)
 	}
 	if err := errors.Join(validationErrors...); err != nil {
-		return finish.Plan{}, err
+		return finish.Plan{}, nil, err
 	}
 	if options.Message != "" {
 		plan.Steps[0].Message = options.Message
 	}
-	return plan, nil
+	return plan, source, nil
 }
 
 // This checks that the planner's explanation reaches Git. Its truth and the
