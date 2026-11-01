@@ -55,6 +55,13 @@ func finishTestOptions(evidence finish.Evidence) FinishOptions {
 	return options
 }
 func finishTestOutput(goals ...finish.Goal) []byte {
+	goals = slices.Clone(goals)
+	for i := range goals {
+		if goals[i].Reason == "" {
+			_, body, _ := strings.Cut(goals[i].Message, "\n\n")
+			goals[i].Reason = strings.Join(strings.Fields(strings.TrimPrefix(body, "- ")), " ")
+		}
+	}
 	body, err := json.Marshal(struct {
 		Goals []finish.Goal `json:"goals"`
 	}{goals})
@@ -491,7 +498,7 @@ func TestFinishIntentSubprocessOneExchange(t *testing.T) {
 		t.Run(fmt.Sprint(crash), func(t *testing.T) {
 			dir := t.TempDir()
 			calls := filepath.Join(dir, "calls")
-			response := `printf '%s\n' '{"version":1,"finish_plan":{"goals":[{"purpose":"Preserve settings","message":"Preserve explicit settings\n\n- Keep authored values ahead of defaults.","change_ids":["settings.go"]}]}}'`
+			response := `printf '%s\n' '{"version":1,"finish_plan":{"goals":[{"purpose":"Preserve settings","reason":"Keep authored values ahead of defaults.","message":"Preserve explicit settings\n\n- Keep authored values ahead of defaults.","change_ids":["settings.go"]}]}}'`
 			if crash {
 				response = "exit 1"
 			}

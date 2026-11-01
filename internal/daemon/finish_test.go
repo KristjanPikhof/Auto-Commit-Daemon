@@ -78,7 +78,7 @@ func completeFinishTestPlan(request ai.FinishPlanRequest) []byte {
 	for _, change := range request.Changes {
 		ids = append(ids, change.ID)
 	}
-	raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Preserve completed changes", Boundary: "The supplied changes complete the requested batch", Message: "Preserve completed changes\n\n- Publish the requested goal without later edits.", ChangeIDs: ids}}})
+	raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Preserve completed changes", Boundary: "The supplied changes complete the requested batch", Reason: "Publish the requested goal without later edits.", Message: "Preserve completed changes\n\n- Publish the requested goal without later edits.", ChangeIDs: ids}}})
 	return raw
 }
 

@@ -42,10 +42,35 @@ revert boundary and a valid intermediate tree. Keep its callers, tests, imports,
 generated output, and relevant docs together. File names, save times, and line
 counts do not justify a split or a fixed commit count.
 
+Keep a new field, type, or method with its consumers or before them. Reviews
+retain those interface names so the planner can identify the dependency.
+A workflow's reconnection and stale-callback guards usually complete that
+workflow; separate test assertions alone do not justify separate commits.
+
 Generated messages name the change and include a short body explaining the
 reason or concrete impact from the supplied evidence. Reasons must appear in
 Git, not just internal planning metadata. Test counts and lists of components
 do not explain a decision. Available corrections stay with the step they correct.
+
+Each generated goal also supplies a `reason`: the previous problem or constraint,
+the chosen mechanism, and why it helps. ACD requires that explanation in the
+published body, allowing line wrapping and bullet formatting. This prevents a
+planner from leaving its explanation only in private metadata. The provider
+still judges whether the explanation and boundary follow from the evidence;
+ACD cannot prove a motivation from message wording alone.
+
+For example, ignoring unchanged API-key writes prevents a focus change from
+disconnecting a verified session. That bug fix has a separate purpose from a
+Settings redesign, even when both were discovered during the same UI audit.
+A shortcut recorder, its saved bindings, conflict checks and menu hints can
+complete one feature.
+
+When independent purposes share a file and no recorded version can separate
+them, the provider can return `blocked_reason` with no goals. Finish fails with
+the explanation and keeps the work protected. It does not combine unrelated
+behavior just to produce a commit. Finish coherent, verified milestones while
+working so their versions remain available for later planning. An unchanged
+retry cannot supply missing versions or missing context.
 
 Supply completion context describing the problem, approach, and constraints.
 Intent requires approved redacted diffs for every recorded text change. Setup
@@ -118,6 +143,10 @@ mode an exact message still requires provider planning.
 ACD materializes the complete proposed chain privately. Structural checks prove
 recorded-version use, safe membership and ordering, and exact target equality.
 They always run, including under `intent.verification=none`.
+
+Structural verification does not compile code. To catch a consumer whose field
+or method appears only in a later commit, configure an approved project command
+under `fast` or `full`.
 
 `fast` or `full` runs the approved configured project command for each candidate
 in isolation. Missing commands are reported as missing. Cached evidence is

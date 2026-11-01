@@ -69,8 +69,8 @@ func finishDecisionFixture(t *testing.T) (*captureFixture, *FinishWorker, state.
 func finishDecisionPlan(t *testing.T, request ai.FinishPlanRequest) []byte {
 	t.Helper()
 	goals := []finish.Goal{
-		{Purpose: "Extract password authentication before adding another provider", Boundary: "Review the behavior-preserving preparation independently", Message: "Extract password authentication\n\n- Keep password behavior while preparing a second provider."},
-		{Purpose: "Add Google authentication using the prepared dispatch", Boundary: "Review the new provider and its direct regression test", Message: "Add Google authentication\n\n- Dispatch Google requests while retaining password support."},
+		{Purpose: "Extract password authentication before adding another provider", Boundary: "Review the behavior-preserving preparation independently", Reason: "Keep password behavior while preparing a second provider.", Message: "Extract password authentication\n\n- Keep password behavior while preparing a second provider."},
+		{Purpose: "Add Google authentication using the prepared dispatch", Boundary: "Review the new provider and its direct regression test", Reason: "Dispatch Google requests while retaining password support.", Message: "Add Google authentication\n\n- Dispatch Google requests while retaining password support."},
 	}
 	for _, change := range request.Changes {
 		index := 1

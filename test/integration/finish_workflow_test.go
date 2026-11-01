@@ -125,8 +125,8 @@ func TestFinishWorkflowModesStylesAndCompleteGoals(t *testing.T) {
 					calls.Add(1)
 					request := decodeFinishChatRequest(t, r).Plan
 					goals := []finish.Goal{
-						{Purpose: "Preserve settings across reloads", Boundary: "Settings storage is an independent behavior", Message: message("Preserve settings across reloads", "Keep stored fields when settings are loaded")},
-						{Purpose: "Show disabled protection status", Boundary: "The status badge can be reviewed independently", Message: message("Show disabled protection status", "Explain when protection is disabled")},
+						{Purpose: "Preserve settings across reloads", Boundary: "Settings storage is an independent behavior", Reason: "Keep stored fields when settings are loaded", Message: message("Preserve settings across reloads", "Keep stored fields when settings are loaded")},
+						{Purpose: "Show disabled protection status", Boundary: "The status badge can be reviewed independently", Reason: "Explain when protection is disabled", Message: message("Show disabled protection status", "Explain when protection is disabled")},
 					}
 					for _, change := range request.Changes {
 						group := 0

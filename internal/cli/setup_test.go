@@ -126,7 +126,7 @@ func TestSetupAgentGuidanceRecommendation(t *testing.T) {
 	if !strings.Contains(out.String(), guidance) || !strings.Contains(out.String(), "Copy only. Instruction files stay unchanged.") {
 		t.Fatalf("missing copy-ready recommendation: %s", out.String())
 	}
-	for _, required := range []string{"acd status", "acd finish", "relevant checks", "before handoff", "Preserve unrelated work", "Preserve user staging", "Questions and reviews do not authorize commits", "Do not", "retry finish automatically", "chosen approach", "disables splitting", "actual commit boundaries"} {
+	for _, required := range []string{"acd status", "acd finish", "relevant checks", "before handoff", "Preserve unrelated work", "Preserve user staging", "Questions and reviews do not authorize commits", "Do not", "retry finish automatically", "chosen approach", "disables splitting", "actual commit boundaries", "previous", "chosen mechanism", "missing evidence"} {
 		if !strings.Contains(guidance, required) {
 			t.Errorf("agent instructions omit %q", required)
 		}

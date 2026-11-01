@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
@@ -128,9 +130,7 @@ func validateHistoryMessages(raw []byte, evidence finish.Evidence, commits []His
 	if len(raw) > subprocessResponseByteCap || !utf8.Valid(raw) {
 		return nil, errors.New("history messages: response is too large or invalid UTF-8")
 	}
-	var output struct {
-		Goals []finish.Goal `json:"goals"`
-	}
+	var output finishPlanOutput
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&output); err != nil {
@@ -138,6 +138,9 @@ func validateHistoryMessages(raw []byte, evidence finish.Evidence, commits []His
 	}
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return nil, errors.New("history messages: expected one response object")
+	}
+	if strings.TrimSpace(output.BlockedReason) != "" {
+		return nil, fmt.Errorf("cannot explain recorded commits: %s", output.BlockedReason)
 	}
 	if len(output.Goals) != len(commits) {
 		return nil, errors.New("history messages: preserve every original commit exactly once")
@@ -150,6 +153,9 @@ func validateHistoryMessages(raw []byte, evidence finish.Evidence, commits []His
 			return nil, err
 		}
 		if err := finish.ValidateMessage(options.Style, goal.Message); err != nil {
+			return nil, err
+		}
+		if err := validateGeneratedReason(goal); err != nil {
 			return nil, err
 		}
 		quality := goal
