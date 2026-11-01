@@ -160,3 +160,120 @@ func TestFinishSourceVerifierFailureDoesNotRequestSemanticCorrection(t *testing.
 		})
 	}
 }
+
+func TestFinishSourceReviewRetainsMappingsThroughCorrectionAndRetry(t *testing.T) {
+	evidence, options, goals := finishSourceFixture()
+	options.MaxInputBytes = 128 << 10
+	options.Diffs[0].Text += strings.Repeat(" unchanged approved context\n", 2800)
+	var saved finish.ReviewProgress
+	options.SaveReviewProgress = func(_ context.Context, progress finish.ReviewProgress) error { saved = progress; return nil }
+	retry, invalidReview, invalidPlan := false, false, false
+	provider := &finishFakeTransport{padding: 64 << 10, exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+		if request.Review != nil {
+			if retry {
+				t.Fatal("matching mapped reviews were not reused")
+			}
+			var observations []map[string]string
+			for _, part := range request.Review.Parts {
+				summary := "Retain the supplied unchanged context."
+				if len(part.SourceEditIDs) > 0 {
+					if !strings.Contains(finishPrompt(request), "Cover every supplied source_edit_ids entry exactly once") || len(part.SourceEditIDs) != 4 {
+						t.Fatal("review lost its scoped IDs or source instructions")
+					}
+					summary = "edit-000001..edit-000002 expose Status.CameraID; edit-000003..edit-000004 consume CameraID in selected, after its definition."
+					if !invalidReview {
+						invalidReview = true
+						summary = "Expose camera identity and synchronize the consumer."
+					} else if request.Correction == nil || !strings.Contains(request.Correction.ValidationError, "every supplied edit ID") {
+						t.Fatal("unmapped source evidence was not corrected with specific feedback")
+					}
+				}
+				observations = append(observations, map[string]string{"id": part.ID, "summary": summary})
+			}
+			return json.Marshal(map[string]any{"observations": observations})
+		}
+		mapped := false
+		for _, observation := range request.Reviews {
+			if strings.Contains(observation.Summary, "edit-000003..edit-000004 consume CameraID") {
+				mapped = true
+			}
+		}
+		if !mapped || len(request.SourceEdits) != 4 || request.Diffs[0].Text != "" {
+			t.Fatal("global planner lost the mapped code evidence or resent the raw diff")
+		}
+		bad := append([]finish.Goal(nil), goals...)
+		if !invalidPlan {
+			invalidPlan = true
+			bad[0].Reason = ""
+		} else if !retry && request.Correction == nil {
+			t.Fatal("global correction did not retain the mapped evidence")
+		}
+		return json.Marshal(finishPlanOutput{Goals: bad})
+	}}
+	first, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || first.Calls != 2 || first.Source == nil || !invalidReview || len(saved.Observations) == 0 {
+		t.Fatalf("mapped review did not reach a corrected source plan: calls=%d %v", first.Calls, err)
+	}
+	retry = true
+	options.ReviewProgress = saved
+	second, err := PlanFinish(t.Context(), provider, evidence, options)
+	if err != nil || second.Calls != 1 || second.Disclosure.EvidenceCalls != 0 || second.Disclosure.ReusedFragments != len(saved.Observations) || second.Source == nil {
+		t.Fatalf("retry lost mapped evidence: calls=%d reused=%d %v", second.Calls, second.Disclosure.ReusedFragments, err)
+	}
+	// Stored provenance cannot make an unmapped source summary reusable.
+	options.ReviewProgress.Observations[0].Summary = "Expose identity and synchronize the consumer."
+	request, _, err := prepareFinishRequest(evidence, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := finishReviewChunks(provider, request, (128<<10)-(4<<10))
+	if err != nil || cachedFinishReview(chunks[0].Review.Parts, options.ReviewProgress, saved.Fingerprint) != nil {
+		t.Fatalf("cache accepted an unmapped source summary: %v", err)
+	}
+}
+
+func TestFinishSourceReviewMappingValidation(t *testing.T) {
+	ids := []string{"_edit-000001", "_edit-000002", "_edit-000004"}
+	for _, test := range []struct{ name, summary string }{
+		{"missing", "_edit-000001 defines status; _edit-000004 consumes status."},
+		{"unknown", "_edit-000001.._edit-000004 changes status and its consumer."},
+		{"duplicate", "_edit-000001.._edit-000002 defines status; _edit-000002 and _edit-000004 consume status."},
+		{"backwards", "_edit-000002.._edit-000001 defines status; _edit-000004 consumes status."},
+		{"unmapped", "Define status and consume the available identity."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateFinishReviewSourceIDs(test.summary, ids); err == nil {
+				t.Fatal("incomplete or invented source mapping was accepted")
+			}
+		})
+	}
+	if err := validateFinishReviewSourceIDs("_edit-000001.._edit-000002 define status; _edit-000004 consumes the available identity.", ids); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFinishSourceReviewMapsSplitUTF8Lines(t *testing.T) {
+	text := "[edit-000001] +" + strings.Repeat("界", 200) + "\n[edit-000002] -previous value\n"
+	texts := finishDiffParts(text, 32)
+	mapped, err := finishReviewSourceIDs(texts, []string{"edit-000001", "edit-000002"})
+	if err != nil || strings.Join(texts, "") != text || len(mapped) != len(texts) {
+		t.Fatalf("mapping changed the fragment evidence: %v", err)
+	}
+	offset := 0
+	for i, fragment := range texts {
+		for _, id := range mapped[i] {
+			lineStart := strings.Index(text, "["+id+"] ")
+			lineEnd := lineStart + strings.IndexByte(text[lineStart:], '\n') + 1
+			if offset >= lineEnd || offset+len(fragment) <= lineStart {
+				t.Fatalf("%s was associated with unrelated fragment %d", id, i)
+			}
+		}
+		if len(mapped[i]) == 0 {
+			t.Fatalf("fragment %d lost its annotated line identity", i)
+		}
+		offset += len(fragment)
+	}
+	if _, err := finishReviewSourceIDs(texts, []string{"edit-000003"}); err == nil {
+		t.Fatal("missing source annotation was accepted")
+	}
+}

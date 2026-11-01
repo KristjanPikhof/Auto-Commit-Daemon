@@ -26,11 +26,12 @@ const finishReviewPartLimit = 32
 const finishReviewConcurrency = 4
 
 type FinishReviewPart struct {
-	ID       string `json:"id"`
-	ChangeID string `json:"change_id"`
-	Part     int    `json:"part"`
-	Parts    int    `json:"parts"`
-	Text     string `json:"text"`
+	ID            string   `json:"id"`
+	ChangeID      string   `json:"change_id"`
+	Part          int      `json:"part"`
+	Parts         int      `json:"parts"`
+	Text          string   `json:"text"`
+	SourceEditIDs []string `json:"source_edit_ids,omitempty"`
 }
 
 type FinishReviewTask struct {
@@ -311,12 +312,20 @@ func finishReviewChunks(transport FinishTransport, request FinishPlanRequest, li
 	for _, change := range request.Changes {
 		changes[change.ID] = change
 	}
+	sourceIDs := make(map[string][]string)
+	for _, edit := range request.SourceEdits {
+		sourceIDs[edit.ChangeID] = append(sourceIDs[edit.ChangeID], edit.ID)
+	}
 	var parts []FinishReviewPart
 	for _, diff := range request.Diffs {
 		// Leave ample room for two JSON encodings and worst-case escaping.
 		texts := finishDiffParts(diff.Text, limit/8)
+		mapped, err := finishReviewSourceIDs(texts, sourceIDs[diff.ChangeID])
+		if err != nil {
+			return nil, finishFailure("invalid_evidence", err)
+		}
 		for i, text := range texts {
-			parts = append(parts, FinishReviewPart{ID: fmt.Sprintf("part-%d", len(parts)+1), ChangeID: diff.ChangeID, Part: i + 1, Parts: len(texts), Text: text})
+			parts = append(parts, FinishReviewPart{ID: fmt.Sprintf("part-%d", len(parts)+1), ChangeID: diff.ChangeID, Part: i + 1, Parts: len(texts), Text: text, SourceEditIDs: mapped[i]})
 		}
 	}
 	newChunk := func() FinishPlanRequest {
@@ -405,13 +414,14 @@ func validateFinishReview(raw []byte, parts []FinishReviewPart) ([]FinishReviewO
 		return nil, errors.New("evidence review must cover every fragment exactly once")
 	}
 	summaries := make(map[string]string, len(parts))
-	known := make(map[string]bool, len(parts))
+	known := make(map[string]FinishReviewPart, len(parts))
 	for _, part := range parts {
-		known[part.ID] = true
+		known[part.ID] = part
 	}
 	var problems []error
 	for _, observation := range output.Observations {
-		if !known[observation.ID] {
+		part, exists := known[observation.ID]
+		if !exists {
 			return nil, errors.New("evidence review included an unknown fragment ID")
 		}
 		if _, seen := summaries[observation.ID]; seen {
@@ -425,6 +435,9 @@ func validateFinishReview(raw []byte, parts []FinishReviewPart) ([]FinishReviewO
 		}
 		if finishVerificationClaim.MatchString(observation.Summary) {
 			problems = append(problems, fmt.Errorf("%s must describe recorded code, not claim tests or verification ran", observation.ID))
+		}
+		if err := validateFinishReviewSourceIDs(observation.Summary, part.SourceEditIDs); err != nil {
+			problems = append(problems, fmt.Errorf("%s: %w", part.ID, err))
 		}
 		summaries[observation.ID] = finishRedactText(observation.Summary)
 	}

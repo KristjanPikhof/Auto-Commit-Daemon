@@ -142,7 +142,80 @@ func expandFinishSourceGoals(goals []finish.Goal, catalogue []finish.Change, edi
 const finishSourcePrompt = `
 This request provides source_edits. These rules replace recorded-version membership and ordering ONLY for the represented Changes entries. The Changes entries remain frozen file witnesses, not selectable whole-file IDs when source_edits refer to them. Assign every source_edits ID exactly once; assign every other Changes ID as one whole entry. An insertion copies the exact target line at its base-relative anchor; a deletion removes the exact base line. ACD constructs cumulative subsets from those immutable bytes. It cannot invent new code. You may abbreviate consecutive numeric edit IDs using an inclusive range such as edit-000001..edit-000008; every ID in the range must exist and belong to this goal.
 Return goals in a valid prerequisite order. ACD does not impose whole-file version order on independent source selections. Shared supporting edits belong once to the earliest goal that needs them; later consumers depend on that goal, not a repeated ID. Pair replacements and retain complete function and container syntax. Keep callback signatures with their consumers. Definitions must precede their first consumer. New files and rename groups remain whole. Scope and diff boundaries are evidence, never purposes. ACD will run approved project checks on every candidate before publication.
+When evidence_reviews is present, each summary maps distinct mechanisms to source edit IDs or ranges. Use those associations with the full source_edits catalogue to select complete steps; line positions alone do not describe a mechanism. Related observations may span fragments and files. The mappings describe code, not prescribed commit boundaries.
 Do not claim independent mechanisms are inseparable merely because they occur in one initializer, callback, file, or replacement region. Plan useful completed decisions first, then select their complete implementation, wiring and regression coverage. Respect actual byte constraints: if a line truly cannot be separated, choose a working prerequisite order or explain the concrete conflict. Retain the same grounded reason and message quality requirements. Refuse unsupported purposes rather than inventing code or merging unrelated outcomes to avoid selection work.`
 
 const finishSourceReviewPrompt = `
-Source edit IDs are embedded in the approved diff text. Preserve the edit IDs or inclusive ranges associated with each distinct mechanism and its prerequisites in your observations, so the global plan can assign the full catalogue. Do not group unrelated edits by fragment or scope. Positions are metadata; raw scope expressions stay local.`
+Each evidence_review.parts entry may include source_edit_ids for the exact annotated lines in that fragment. In its summary, associate each distinct mechanism and its supporting edits with their IDs or inclusive ranges such as edit-000001..edit-000008. Cover every supplied source_edit_ids entry exactly once. Use only that fragment's IDs; name cross-fragment prerequisites by interface instead. Pair replacements, and distinguish interface definitions, consumers, imports, tests and build wiring so the global planner can construct valid intermediate steps. Do not append an undifferentiated list of IDs to a file-level summary or group unrelated edits by fragment or scope. A long annotated line may span fragments; describe only the visible evidence for its supplied ID. The global planner receives these mapped summaries and the complete edit catalogue, not the raw diff text. Positions are metadata; raw scope expressions stay local.`
+
+// Associate fragments with exact annotated lines before splitting can separate
+// an ID from the rest of a long line. Neither code nor fragment bytes change.
+func finishReviewSourceIDs(texts []string, ids []string) ([][]string, error) {
+	mapped := make([][]string, len(texts))
+	if len(ids) == 0 {
+		return mapped, nil
+	}
+	remaining := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		remaining[id] = true
+	}
+	ends := make([]int, len(texts))
+	total := 0
+	for i, text := range texts {
+		total += len(text)
+		ends[i] = total
+	}
+	offset, fragment := 0, 0
+	for line := range strings.SplitAfterSeq(strings.Join(texts, ""), "\n") {
+		end := offset + len(line)
+		if strings.HasPrefix(line, "[") {
+			id, code, ok := strings.Cut(line[1:], "] ")
+			if ok && remaining[id] && (strings.HasPrefix(code, "+") || strings.HasPrefix(code, "-")) {
+				for fragment < len(ends) && ends[fragment] <= offset {
+					fragment++
+				}
+				for i := fragment; i < len(ends); i++ {
+					mapped[i] = append(mapped[i], id)
+					if ends[i] >= end {
+						break
+					}
+				}
+				delete(remaining, id)
+			}
+		}
+		offset = end
+	}
+	if len(remaining) != 0 {
+		return nil, errors.New("source review evidence must retain every edit annotation")
+	}
+	return mapped, nil
+}
+
+var finishReviewSourceSelection = regexp.MustCompile(`\b_*edit-[0-9]{6}(?:\.\._*edit-[0-9]{6})?\b`)
+
+func validateFinishReviewSourceIDs(summary string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	catalogue := make([]finish.Change, 0, len(ids))
+	edits := make([]FinishSourceEdit, 0, len(ids))
+	for _, id := range ids {
+		catalogue = append(catalogue, finish.Change{ID: id})
+		edits = append(edits, FinishSourceEdit{ID: id})
+	}
+	goals, err := expandFinishSourceGoals([]finish.Goal{{ChangeIDs: finishReviewSourceSelection.FindAllString(summary, -1)}}, catalogue, edits)
+	if err != nil {
+		return fmt.Errorf("source summary must map only its supplied edit IDs: %w", err)
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range goals[0].ChangeIDs {
+		if seen[id] {
+			return fmt.Errorf("source summary maps %s more than once", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != len(ids) {
+		return errors.New("source summary must associate every supplied edit ID with its mechanism using IDs or inclusive ranges")
+	}
+	return nil
+}

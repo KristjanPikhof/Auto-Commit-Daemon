@@ -140,7 +140,13 @@ other details needed by the global planner. Short notes are enough for simple
 fragments. ACD checks the complete reply locally and never cuts a summary to
 make it pass. Combined requests still obey the configured context limits.
 The global planner receives all original change identities and observations
-together, without local cache digests. Its larger catalogue and review allowance support thousands
+together, without local cache digests. For checked source selections, each review
+fragment identifies the edit IDs belonging to its exact lines. Its summary maps
+each mechanism and supporting change to those IDs or inclusive ranges. ACD
+rejects missing, repeated, or foreign selections before global planning and
+rechecks those mappings before reusing a saved review. The planner uses the
+mapped summaries with the complete edit catalogue to choose commit boundaries.
+Its larger catalogue and review allowance support thousands
 of meaningful goals without enlarging raw-diff review calls. Commit counts come
 from useful boundaries, not review batches. Provider context limits and the
 attempt deadline still apply; a large batch may need an explicit longer timeout.

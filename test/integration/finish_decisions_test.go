@@ -193,6 +193,97 @@ func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 	assertFinishWorkflowStatus(t, t.Context(), f, true)
 }
 
+func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
+	var reviews, corrections, plans atomic.Int32
+	var rejected atomic.Bool
+	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
+		request := decodeFinishChatRequest(t, r).Plan
+		if request.Review != nil {
+			reviews.Add(1)
+			var observations []map[string]string
+			for _, part := range request.Review.Parts {
+				summary := "Record the supplied operational conventions."
+				if len(part.SourceEditIDs) > 0 {
+					if part.ChangeID != "camera.sh" || len(part.SourceEditIDs) != 3 {
+						t.Errorf("review lost its scoped source identities: %+v", part)
+					}
+					var facts []string
+					for _, id := range part.SourceEditIDs {
+						fact := " updates selected to consume the available identity"
+						if strings.Contains(part.Text, "["+id+"] +active_identity()") {
+							fact = " defines active_identity before its consumer"
+						}
+						facts = append(facts, id+fact)
+					}
+					summary = strings.Join(facts, "; ") + "."
+					if !rejected.Swap(true) {
+						summary = "Expose identity and synchronize the consumer."
+					} else if request.Correction == nil || !strings.Contains(request.Correction.ValidationError, "every supplied edit ID") {
+						t.Error("unmapped source review bypassed bounded correction")
+					} else {
+						corrections.Add(1)
+					}
+				}
+				observations = append(observations, map[string]string{"id": part.ID, "summary": summary})
+			}
+			raw, _ := json.Marshal(map[string]any{"observations": observations})
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "finish_evidence", "arguments": string(raw)}}}}}}})
+			return
+		}
+		plans.Add(1)
+		goals := []finish.Goal{
+			{Purpose: "Expose the active camera identity", Boundary: "Supply identity before its consumer", Reason: "Expose the active identity so controls can follow the camera.", Message: "Expose the active camera identity\n\n- Expose the active identity so controls can follow the camera."},
+			{Purpose: "Synchronize camera selection", Boundary: "Consume the available camera identity", Reason: "Read the running camera identity instead of retaining an empty selection.", Message: "Synchronize camera selection\n\n- Read the running camera identity instead of retaining an empty selection."},
+			{Purpose: "Document operational conventions", Boundary: "Keep reference material independently reviewable", Reason: "Make operational conventions available to project contributors.", Message: "Document operational conventions\n\n- Make operational conventions available to project contributors.", ChangeIDs: []string{"notes.txt"}},
+		}
+		for _, diff := range request.Diffs {
+			if diff.Text != "" {
+				t.Error("reviewed global plan resent raw diffs")
+			}
+		}
+		for _, edit := range request.SourceEdits {
+			found := false
+			for _, observation := range request.Reviews {
+				group := 1
+				if strings.Contains(observation.Summary, edit.ID+" defines active_identity") {
+					group = 0
+				} else if !strings.Contains(observation.Summary, edit.ID+" updates selected") {
+					continue
+				}
+				goals[group].ChangeIDs = append(goals[group].ChangeIDs, edit.ID)
+				found = true
+			}
+			if !found {
+				t.Error("global planning lost the code-to-edit association")
+			}
+		}
+		raw, _ := json.Marshal(map[string]any{"goals": goals})
+		writeFinishChatArguments(t, w, string(raw))
+	}, "1m", map[string]string{config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "sh verify.sh", config.FieldVerificationFastTimeout: "30s"}, ai.ConfirmationVerificationCommand)
+	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "selected() { printf none; }\n")
+	writeFile(t, filepath.Join(f.Repo, "verify.sh"), ". ./camera.sh\nvalue=$(selected) || exit 1\ntest \"$value\" = none || test \"$value\" = camera\n")
+	runGitOK(t, f.Repo, "add", "camera.sh", "verify.sh")
+	runGitOK(t, f.Repo, "commit", "-m", "Seed camera controls")
+	f.BaseHead = strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	f.Barrier(t, t.Context())
+	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "active_identity() { printf camera; }\nselected() { active_identity; }\n")
+	writeFile(t, filepath.Join(f.Repo, "notes.txt"), strings.Repeat("Rule: retain the operational conventions for contributors.\n", 9000))
+	completed := decodeFinishWorkflow(t, f.Run(t, t.Context(), "finish", "--json"))
+	if !completed.Published || completed.CommitsCreated != 3 || !completed.Target.SourceSelection || completed.EvidenceCalls != int(reviews.Load()) || corrections.Load() != 1 || plans.Load() != 1 {
+		t.Fatalf("reviewed source mappings were not published: %+v reviews=%d corrections=%d plans=%d", completed, reviews.Load(), corrections.Load(), plans.Load())
+	}
+	if first := runGitOK(t, f.Repo, "show", "HEAD~2:camera.sh"); !strings.Contains(first, "active_identity()") || !strings.Contains(first, "printf none") {
+		t.Fatalf("first source step lost its independent prerequisite: %s", first)
+	}
+	for _, check := range completed.Verification {
+		if !check.Executed || check.Result.ExitCode != 0 {
+			t.Fatalf("reviewed intermediate source was not checked: %+v", check)
+		}
+	}
+	f.Barrier(t, t.Context())
+	assertFinishWorkflowStatus(t, t.Context(), f, true)
+}
+
 func TestFinishWorkflowRejectsUnexplainedDecision(t *testing.T) {
 	var calls atomic.Int32
 	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
