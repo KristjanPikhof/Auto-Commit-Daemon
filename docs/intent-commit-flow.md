@@ -59,6 +59,11 @@ planner from leaving its explanation only in private metadata. The provider
 still judges whether the explanation and boundary follow from the evidence;
 ACD cannot prove a motivation from message wording alone.
 
+ACD wraps generated body bullets at 72 characters without changing their words
+or the subject. This leaves the provider's correction available for decisions
+and dependencies. Invalid bullet structure and overlong subjects still fail
+validation. Exact `--message` text must already meet the format rules.
+
 For example, ignoring unchanged API-key writes prevents a focus change from
 disconnecting a verified session. That bug fix has a separate purpose from a
 Settings redesign, even when both were discovered during the same UI audit.

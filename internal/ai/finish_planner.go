@@ -409,6 +409,10 @@ func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOp
 	}
 	var validationErrors []error
 	for index, goal := range output.Goals {
+		if options.Message == "" {
+			goal.Message = reflowGeneratedMessage(options.Style, goal.Message)
+			output.Goals[index] = goal
+		}
 		message := goal.Message
 		if options.Message != "" {
 			message = options.Message

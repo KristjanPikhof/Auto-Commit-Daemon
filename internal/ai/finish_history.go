@@ -146,6 +146,8 @@ func validateHistoryMessages(raw []byte, evidence finish.Evidence, commits []His
 		return nil, errors.New("history messages: preserve every original commit exactly once")
 	}
 	for index, goal := range output.Goals {
+		goal.Message = reflowGeneratedMessage(options.Style, goal.Message)
+		output.Goals[index] = goal
 		if len(goal.ChangeIDs) != 1 || goal.ChangeIDs[0] != commits[index].ID {
 			return nil, errors.New("history messages: original commit order and membership must remain unchanged")
 		}

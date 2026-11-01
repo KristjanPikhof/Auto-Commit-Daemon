@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Wrap generated Intent message bodies without changing their wording, so long
+  lines do not consume a provider correction. Keep exact user messages unchanged
+  and continue to reject invalid structure and overlong subjects.
 - Require generated Intent messages to include the planner's specific decision
   reason in the published body. Separate distinct problems, keep cohesive
   features complete, and explain when recorded versions cannot support a useful
