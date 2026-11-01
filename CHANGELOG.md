@@ -21,6 +21,8 @@
 - Send complete source-selection evidence directly to global planning when it
   fits the existing budget. Review only whole-file evidence that needs summaries,
   preserving exact selectable code and removing redundant source-ID summaries.
+  Keep duplicate per-line coordinates local; retain every edit ID in its code.
+  Plan all independent outcomes before ownership, without a remainder goal.
   Allow tested feature prerequisites before their separate UI integration when
   the frozen caller line couples feature wiring to a new layout.
 - Assign source ownership through one ordered catalogue instead of overlapping

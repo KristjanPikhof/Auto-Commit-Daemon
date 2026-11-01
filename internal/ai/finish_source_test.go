@@ -45,7 +45,7 @@ func TestFinishSourcePlanUsesOnlyFrozenSelections(t *testing.T) {
 		if strings.Contains(string(encoded), "PRIVATE_UNCHANGED_VALUE") || strings.Contains(string(encoded), "SourceFiles") {
 			t.Fatal("local frozen source escaped into the provider request")
 		}
-		if !strings.Contains(finishPrompt(request), "source_edits") {
+		if !strings.Contains(finishPrompt(request), "exact annotated source diffs and selection_order") {
 			t.Fatal("source membership rules missing")
 		}
 		return json.Marshal(finishPlanOutput{Goals: goals})

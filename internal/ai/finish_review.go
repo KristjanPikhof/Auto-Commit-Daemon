@@ -41,9 +41,10 @@ type FinishReviewTask struct {
 // Observations supply context; only the global plan assigns original changes.
 type FinishReviewObservation = finish.ReviewObservation
 
-// Content digests prove local cache identity; sending them to the planner adds
-// tokens without explaining a change. Keep the durable observations intact.
+// Keep local proofs intact while omitting duplicate wire metadata. Annotated
+// diffs and selection_order already identify every selectable source line.
 func finishWireRequest(request FinishPlanRequest) FinishPlanRequest {
+	request.SourceEdits = nil
 	request.Reviews = append([]FinishReviewObservation(nil), request.Reviews...)
 	for i := range request.Reviews {
 		request.Reviews[i].Digest = ""

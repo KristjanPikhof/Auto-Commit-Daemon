@@ -158,8 +158,8 @@ func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 				goals[group].ChangeIDs = append(goals[group].ChangeIDs, id)
 			}
 		}
-		if len(request.SourceEdits) != 3 {
-			t.Errorf("expected the complete three-edit catalogue, got %+v", request.SourceEdits)
+		if len(request.SelectionOrder) != 3 || len(request.SourceEdits) != 0 {
+			t.Errorf("expected three exact selections without duplicate coordinates, got %+v", request.SelectionOrder)
 		}
 		if request.Correction == nil {
 			goals[0], goals[1] = goals[1], goals[0]

@@ -75,6 +75,26 @@ func TestFinishOpenAISourceSchemaUsesExclusiveOwnership(t *testing.T) {
 	if _, exists := goal["properties"].(map[string]any)["change_ids"]; exists || properties["ownership"] == nil || !strings.Contains(wire.Messages[0].Content, "Walk selection_order exactly once") {
 		t.Fatal("source schema still permits overlapping per-goal ownership")
 	}
+	var sent FinishPlanRequest
+	if err := json.Unmarshal([]byte(wire.Messages[1].Content), &sent); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent.SourceEdits) != 0 || len(request.SourceEdits) != 4 {
+		t.Fatal("wire repeated local coordinates or changed the local catalogue")
+	}
+	if len(sent.SelectionOrder) != 4 || len(sent.Diffs) != len(request.Diffs) {
+		t.Fatal("compact request lost selectable evidence")
+	}
+	for i, diff := range request.Diffs {
+		if sent.Diffs[i] != diff {
+			t.Fatal("compact request changed exact annotated code")
+		}
+	}
+	for i, id := range sent.SelectionOrder {
+		if id != request.SelectionOrder[i] || !strings.Contains(sent.Diffs[0].Text, "["+id+"] ") {
+			t.Fatalf("selection %q lost its code association", id)
+		}
+	}
 }
 
 func TestFinishRemovalSubprocessCloseKillsDescendants(t *testing.T) {

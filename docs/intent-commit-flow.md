@@ -140,6 +140,8 @@ at the following entry. This covers each selection once without overlapping
 per-goal ranges. The planner still chooses the purposes, owners and prerequisite
 order. ACD rejects invalid endpoints or missing coverage instead of repairing
 membership or combining unrelated goals.
+Annotated diffs retain every edit ID and its exact code. Duplicate per-line
+coordinates stay local so the planner can spend its context on the changes.
 
 The request contains bounded metadata, redacted supplied context, and approved
 text diffs. Each encoded review is bounded to 512 KiB. The global catalogue
