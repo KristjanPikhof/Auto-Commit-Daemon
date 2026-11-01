@@ -21,7 +21,9 @@
 - Preserve code-to-edit associations through large Intent evidence reviews.
   Supply each fragment's exact edit IDs, require mapped summaries with complete
   coverage, and revalidate saved mappings before retry. Keep the existing review
-  format, bounded calls, and global commit planning.
+  format, bounded calls, and global commit planning. Retain exact approved
+  annotated diffs for selectable files in global planning; fail before review
+  calls if that code cannot fit the global request limit.
 - Keep finish context optional in Local and Intent. Accept longer handoffs with
   decisions and constraints for the planner to examine alongside code changes.
   Require reasons in AI-generated messages; preserve advanced exact overrides

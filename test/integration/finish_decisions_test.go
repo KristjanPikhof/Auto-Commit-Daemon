@@ -237,8 +237,12 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 			{Purpose: "Document operational conventions", Boundary: "Keep reference material independently reviewable", Reason: "Make operational conventions available to project contributors.", Message: "Document operational conventions\n\n- Make operational conventions available to project contributors.", ChangeIDs: []string{"notes.txt"}},
 		}
 		for _, diff := range request.Diffs {
-			if diff.Text != "" {
-				t.Error("reviewed global plan resent raw diffs")
+			if diff.ChangeID == "camera.sh" {
+				if !strings.Contains(diff.Text, "] +active_identity()") || !strings.Contains(diff.Text, "] +selected()") {
+					t.Error("global plan lost exact selectable code")
+				}
+			} else if diff.Text != "" {
+				t.Error("global plan resent the whole recorded reference file")
 			}
 		}
 		for _, edit := range request.SourceEdits {

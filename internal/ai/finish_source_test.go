@@ -163,12 +163,12 @@ func TestFinishSourceVerifierFailureDoesNotRequestSemanticCorrection(t *testing.
 
 func TestFinishSourceReviewRetainsMappingsThroughCorrectionAndRetry(t *testing.T) {
 	evidence, options, goals := finishSourceFixture()
-	options.MaxInputBytes = 128 << 10
-	options.Diffs[0].Text += strings.Repeat(" unchanged approved context\n", 2800)
+	options.MaxInputBytes = 1 << 20
+	options.Diffs[0].Text += strings.Repeat(" unchanged approved context\n", 6000)
 	var saved finish.ReviewProgress
 	options.SaveReviewProgress = func(_ context.Context, progress finish.ReviewProgress) error { saved = progress; return nil }
 	retry, invalidReview, invalidPlan := false, false, false
-	provider := &finishFakeTransport{padding: 64 << 10, exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+	provider := &finishFakeTransport{padding: 400 << 10, exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
 		if request.Review != nil {
 			if retry {
 				t.Fatal("matching mapped reviews were not reused")
@@ -198,8 +198,8 @@ func TestFinishSourceReviewRetainsMappingsThroughCorrectionAndRetry(t *testing.T
 				mapped = true
 			}
 		}
-		if !mapped || len(request.SourceEdits) != 4 || request.Diffs[0].Text != "" {
-			t.Fatal("global planner lost the mapped code evidence or resent the raw diff")
+		if !mapped || len(request.SourceEdits) != 4 || request.Diffs[0].Text != options.Diffs[0].Text {
+			t.Fatal("global planner lost the mapped observations or exact selectable code")
 		}
 		bad := append([]finish.Goal(nil), goals...)
 		if !invalidPlan {
@@ -226,9 +226,21 @@ func TestFinishSourceReviewRetainsMappingsThroughCorrectionAndRetry(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	chunks, err := finishReviewChunks(provider, request, (128<<10)-(4<<10))
+	chunks, err := finishReviewChunks(provider, request, FinishContextByteCap-(4<<10))
 	if err != nil || cachedFinishReview(chunks[0].Review.Parts, options.ReviewProgress, saved.Fingerprint) != nil {
 		t.Fatalf("cache accepted an unmapped source summary: %v", err)
+	}
+}
+
+func TestFinishSourceReviewRejectsOversizedGlobalCodeBeforeCalls(t *testing.T) {
+	evidence, options, _ := finishSourceFixture()
+	options.MaxInputBytes = 128 << 10
+	options.Diffs[0].Text += strings.Repeat(" unchanged approved context\n", 2800)
+	provider := &finishFakeTransport{padding: 64 << 10}
+	_, err := PlanFinish(t.Context(), provider, evidence, options)
+	finishAssertError(t, err, "provider_input_too_large")
+	if len(provider.requests) != 0 {
+		t.Fatal("oversized selectable code spent provider calls or lost code")
 	}
 }
 

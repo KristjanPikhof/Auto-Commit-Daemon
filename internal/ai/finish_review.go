@@ -18,8 +18,8 @@ import (
 // bound. Large files are reviewed in parts, never omitted or made into commits.
 const FinishContextByteCap = 512 << 10
 
-// The global catalogue contains metadata and reviewed observations, not raw
-// diffs. Give it room for thousands of changes without enlarging review calls.
+// The global catalogue includes exact diffs for selectable source lines.
+// Whole recorded changes use observations without enlarging review calls.
 const FinishPlanningByteCap = 2 << 20
 const finishReviewSummaryRunes = 4096
 const finishReviewPartLimit = 32
@@ -71,11 +71,19 @@ func reviewFinishEvidence(ctx context.Context, transport FinishTransport, reques
 	if len(body) <= limit {
 		return nil
 	}
-	// Prove the global metadata can fit before spending any review calls.
+	// Prove the global catalogue and selectable code fit before any review calls.
 	global := *request
 	global.Diffs = append([]FinishDiff(nil), request.Diffs...)
+	selectable := make(map[string]bool)
+	for _, edit := range request.SourceEdits {
+		selectable[edit.ChangeID] = true
+	}
 	for i := range global.Diffs {
-		global.Diffs[i].Text = ""
+		// Selecting lines requires the exact code-to-ID association, including
+		// signatures and syntax that a factual summary may compress away.
+		if !selectable[global.Diffs[i].ChangeID] {
+			global.Diffs[i].Text = ""
+		}
 	}
 	metadata, err := transport.EncodeFinishRequest(global)
 	if err != nil {

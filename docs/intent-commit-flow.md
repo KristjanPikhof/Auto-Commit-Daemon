@@ -146,6 +146,11 @@ each mechanism and supporting change to those IDs or inclusive ranges. ACD
 rejects missing, repeated, or foreign selections before global planning and
 rechecks those mappings before reusing a saved review. The planner uses the
 mapped summaries with the complete edit catalogue to choose commit boundaries.
+Selectable files also keep their exact approved annotated diffs in the global
+request. The planner needs their signatures, syntax and consumers to assign
+lines safely. Whole recorded changes use observations instead. If the exact
+selectable code cannot fit the global limit, ACD fails before spending review
+calls; it never replaces that code with a summary to make it fit.
 Its larger catalogue and review allowance support thousands
 of meaningful goals without enlarging raw-diff review calls. Commit counts come
 from useful boundaries, not review batches. Provider context limits and the
