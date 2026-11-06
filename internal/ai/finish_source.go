@@ -192,6 +192,10 @@ func sourceChecksFeedback(err error, approved []FinishDiff, locate func(*SourceC
 		}
 		return errors.Join(feedback...)
 	}
+	var size *CommitSizeFailure
+	if errors.As(err, &size) {
+		return size
+	}
 	var failure *SourceCheckFailure
 	if errors.As(err, &failure) {
 		var ids []string

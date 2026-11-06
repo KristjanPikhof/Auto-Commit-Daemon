@@ -175,6 +175,12 @@ Both modes support imperative
 subjects (`Preserve staged content`) and scope-free conventional subjects
 (`fix: preserve staged content`). Change mode or style through reviewed settings.
 
+New generated Intent plans use 200 changed lines per commit as a review target.
+Previews show each step's measured line and file counts. A larger step requires
+an explanation in its body of why it cannot usefully be split. Size and project
+check failures use the existing single correction; required tests and callers
+stay together. Exact messages and older frozen requests retain their rules.
+
 Each request freezes a fresh complete checkpoint, expected branch/HEAD, target
 tree, settings, and index identity. The entire chain must pass its checks before
 one branch update. Later edits remain protected for a later finish. Detached

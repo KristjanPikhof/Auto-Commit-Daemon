@@ -18,6 +18,15 @@
 
 ### Changed
 
+- Measure each new generated Intent commit against a 200-line review target.
+  Require smaller complete steps or a concrete explanation in the Git body
+  when a larger change must stay together. Show measured sizes in previews and
+  combine size and project-check feedback within the existing single correction.
+  Preserve older frozen requests and exact-message behavior.
+- Reject placeholder explanations such as "fix both" in new generated plans.
+  When available versions cannot support useful boundaries, explain how to
+  start a new finish with project checks or smaller completed milestones.
+  Clarify the splitting capabilities of each verification setting.
 - Use Responses with high reasoning for `gpt-6.1-terra` global planning
   and medium reasoning for evidence reviews,
   retaining the configured model and endpoint. Keep strict tools, bounded

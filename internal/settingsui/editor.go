@@ -328,6 +328,9 @@ func editEditorField(ctx context.Context, field EditorField, scope string, opts 
 	}
 	var input huh.Field
 	if len(desc.Choices) > 0 {
+		if opts.Accessible && field.Key == "intent.verification" {
+			fmt.Fprintln(opts.Output, desc.Description)
+		}
 		choices := []huh.Option[string]{}
 		for _, choice := range desc.Choices {
 			label := choice
