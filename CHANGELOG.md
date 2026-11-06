@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Simplify Intent verification, error handling and finish guidance.
+  Use one candidate verifier and keep preview flags with their commands,
+  preserving checks, deadlines and command output.
 - Give each candidate check its approved command timeout in new generated
   Intent requests. Use the saved attempt deadline for the whole chain so several
   valid checks do not exhaust a single command's budget during preparation.
