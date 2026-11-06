@@ -954,12 +954,8 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}}
-	if options.ReviewLineTarget > 0 {
+	if len(sourceFiles) > 0 || options.ReviewLineTarget > 0 {
 		options.VerifyPlan = verifyPlan
-	} else {
-		options.VerifySource = func(checkCtx context.Context, built finish.SourcePlan) error {
-			return verifyPlan(checkCtx, built.Plan, &built)
-		}
 	}
 	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, options)
 	result.Plan, result.Disclosure, result.Checked = planned.Plan, planned.Disclosure, checked

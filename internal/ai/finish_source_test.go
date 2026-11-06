@@ -104,7 +104,7 @@ func TestFinishSourceAnnotationsDoNotDiscloseUnreferencedFiles(t *testing.T) {
 func TestFinishSourceCorrectsFailedCheckWithoutSendingCommandOutput(t *testing.T) {
 	evidence, options, goals := finishSourceFixture()
 	checks := 0
-	options.VerifySource = func(ctx context.Context, plan finish.SourcePlan) error {
+	options.VerifyPlan = func(ctx context.Context, _ finish.Plan, plan *finish.SourcePlan) error {
 		checks++
 		if deadline, ok := ctx.Deadline(); !ok || !deadline.Equal(options.Deadline) || !maps.Equal(plan.Plan.Target, evidence.Target) {
 			t.Fatal("source checks changed the accepted deadline or target")
@@ -146,7 +146,7 @@ func TestFinishSourceVerifierFailureDoesNotRequestSemanticCorrection(t *testing.
 			evidence, options, goals := finishSourceFixture()
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			options.VerifySource = func(context.Context, finish.SourcePlan) error {
+			options.VerifyPlan = func(context.Context, finish.Plan, *finish.SourcePlan) error {
 				if canceled {
 					cancel()
 				}
@@ -359,7 +359,7 @@ func TestFinishSourceCheckFeedbackRetainsApprovedReceiver(t *testing.T) {
 
 func TestFinishSourceCorrectionIncludesEveryFailedCandidate(t *testing.T) {
 	evidence, options, goals := finishSourceFixture()
-	options.VerifySource = func(_ context.Context, _ finish.SourcePlan) error {
+	options.VerifyPlan = func(context.Context, finish.Plan, *finish.SourcePlan) error {
 		return errors.Join(
 			&SourceCheckFailure{Step: 1, Output: "/private/work/camera.go: cannot find 'CameraID' in scope"},
 			&SourceCheckFailure{Step: 2, Output: "/private/work/camera.go: value of type 'Status' has no member 'CameraID'"},

@@ -85,11 +85,9 @@ type FinishOptions struct {
 	DiffEgress bool
 	// Local frozen bytes; only edit descriptors and approved diffs enter requests.
 	SourceFiles []finish.SourceFile
-	// A source verifier may reject one candidate plan inside the same persisted
-	// deadline and combined-correction budget. It never publishes a branch.
-	VerifySource func(context.Context, finish.SourcePlan) error
 	// VerifyPlan checks the materialized chain, including its measured sizes.
-	// It replaces VerifySource when set and shares the single correction budget.
+	// It shares the persisted deadline and single correction budget, and never
+	// publishes a branch.
 	VerifyPlan       func(context.Context, finish.Plan, *finish.SourcePlan) error
 	ReviewLineTarget int
 	// Binary-only finishes need supplied context because their content cannot
@@ -287,13 +285,8 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		if validationErr == nil {
 			plan, source, validationErr = validateFinishReply(raw, evidence, options)
 		}
-		if validationErr == nil && (options.VerifyPlan != nil || source != nil && options.VerifySource != nil) {
-			var checkErr error
-			if options.VerifyPlan != nil {
-				checkErr = options.VerifyPlan(ctx, plan, source)
-			} else {
-				checkErr = options.VerifySource(ctx, *source)
-			}
+		if validationErr == nil && options.VerifyPlan != nil {
+			checkErr := options.VerifyPlan(ctx, plan, source)
 			if ctx.Err() != nil {
 				return result, finishDeadlineFailure(ctx.Err(), checkErr)
 			}
