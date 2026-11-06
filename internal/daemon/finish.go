@@ -789,7 +789,14 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 	plan := planned.Plan
 	saved := FinishSavedPlan{Version: 1, Disclosure: planned.Disclosure, Source: planned.Source}
 	commits := make([]git.FinishCommit, 0, len(plan.Steps))
-	verifyCtx, verifyCancel := context.WithTimeout(ctx, cfg.VerificationTimeout)
+	reviewTarget := finishReviewTarget(r.Target)
+	verificationDeadline := time.Now().Add(cfg.VerificationTimeout)
+	if reviewTarget > 0 {
+		// The chain shares the attempt budget. The runner applies the approved
+		// command timeout separately to each candidate.
+		verificationDeadline = finishDeadline(r)
+	}
+	verifyCtx, verifyCancel := context.WithDeadline(ctx, verificationDeadline)
 	defer verifyCancel()
 	if planned.Source != nil && cfg.VerificationMode != "fast" && cfg.VerificationMode != "full" {
 		return saved, git.FinishPublicationProof{}, errors.New("constructed source versions require approved project checks")
@@ -800,7 +807,6 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 			return saved, git.FinishPublicationProof{}, errors.Join(err, state.ErrFinishIdentity)
 		}
 	}
-	reviewTarget := finishReviewTarget(r.Target)
 	previousTree := r.Target.ExpectedHead
 	if reviewTarget > 0 && previousTree == "" {
 		var err error

@@ -116,6 +116,10 @@ runs it in isolated candidate trees using the configured timeout. A missing
 command is reported as missing; a structural pass is not a test-suite pass.
 Reused evidence is labelled reused.
 
+New generated Intent requests give each candidate command its configured
+timeout. Preparing and checking the whole chain uses the saved finish deadline,
+including any correction.
+
 Without useful earlier checkpoint versions, `fast` or `full` also permits
 splitting eligible files into exact source-line selections. `none` and
 `structural` can only group recorded whole versions. Earlier snapshots may

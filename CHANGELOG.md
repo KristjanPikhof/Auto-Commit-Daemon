@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Give each candidate check its approved command timeout in new generated
+  Intent requests. Use the saved attempt deadline for the whole chain so several
+  valid checks do not exhaust a single command's budget during preparation.
 - Measure each new generated Intent commit against a 200-line review target.
   Require smaller complete steps or a concrete explanation in the Git body
   when a larger change must stay together. Show measured sizes in previews and
