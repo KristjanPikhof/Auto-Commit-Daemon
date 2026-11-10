@@ -516,7 +516,7 @@ func TestFinishCLIDeadlineSuggestsLongerExplicitRetry(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := "acd finish --retry finish-timeout --timeout " + min(time.Hour, max(15*time.Minute, 2*budget)).String()
-			if !strings.Contains(out.String(), want) {
+			if !strings.Contains(out.String(), want) || (!jsonOut && !strings.Contains(out.String(), "The Intent attempt ran out of time.")) {
 				t.Fatalf("deadline retry did not increase the bounded budget: %s", out.String())
 			}
 		}
@@ -582,7 +582,7 @@ func TestFinishCLIReportsEvidenceReviewProgress(t *testing.T) {
 	if label := finishStageLabel(report.Stage); !strings.Contains(label, "Reviewing saved changes") {
 		t.Fatalf("hidden review phase: %s", label)
 	}
-	if label := finishStatusSummary(report); !strings.Contains(label, "1/2 fragments (1 reused)") {
+	if label := finishStatusSummary(report); !strings.Contains(label, "1 of 2 fragments, 1 reused") {
 		t.Fatalf("hidden status/list review progress: %s", label)
 	}
 }

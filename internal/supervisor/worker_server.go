@@ -30,6 +30,15 @@ type WorkerHandler interface {
 	HandleWorkerRequest(context.Context, Request) (any, *ProtocolError)
 }
 
+type workerProgressKey struct{}
+
+// ReportWorkerProgress sends an optional update on the caller's connection.
+func ReportWorkerProgress(ctx context.Context, value any) {
+	if report, ok := ctx.Value(workerProgressKey{}).(func(any)); ok {
+		report(value)
+	}
+}
+
 func ServeWorker(ctx context.Context, socketPath string, handler WorkerHandler) error {
 	if handler == nil {
 		return errors.New("supervisor: nil worker handler")
@@ -83,9 +92,26 @@ func serveWorkerConnection(parent context.Context, conn net.Conn, handler Worker
 		ctx, cancel = context.WithTimeout(parent, 30*time.Second)
 	}
 	defer cancel()
+	encoder := json.NewEncoder(conn)
+	if request.Method == "finish_start" && request.ReportProgress {
+		disconnected := false
+		ctx = context.WithValue(ctx, workerProgressKey{}, func(value any) {
+			if disconnected {
+				return
+			}
+			raw, err := json.Marshal(value)
+			if err != nil {
+				return
+			}
+			// A client that stops reading must not stall checkpoint work.
+			_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+			disconnected = encoder.Encode(Response{Version: ProtocolVersion, ID: request.ID, Progress: raw}) != nil
+			_ = conn.SetWriteDeadline(time.Time{})
+		})
+	}
 	response.Data, response.Error = handler.HandleWorkerRequest(ctx, request)
 	response.OK = response.Error == nil
-	_ = json.NewEncoder(conn).Encode(response)
+	_ = encoder.Encode(response)
 }
 
 func DoWorker(ctx context.Context, socketPath string, request Request, timeout time.Duration) (Response, error) {

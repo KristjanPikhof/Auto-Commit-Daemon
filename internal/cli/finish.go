@@ -112,40 +112,34 @@ func runFinish(ctx context.Context, out, progress io.Writer, repo string, params
 	if !lookup.Registered || lookup.Record.LifecycleDisabled() {
 		return actionRequiredError("protection_required", "acd finish: enable protection first with `acd on`")
 	}
+	var display finishProgress
+	var onScan func(json.RawMessage)
 	if !quiet && !jsonOut {
+		display.out = progress
+		onScan = display.checkpointScan
 		if params.RetryID != "" {
 			fmt.Fprintln(progress, "Reconnecting to the saved finish request; later edits stay for the next finish.")
 		} else {
 			fmt.Fprintln(progress, "Saving current changes for this finish. Later edits stay for the next finish.")
 		}
 	}
-	r, err := finishRequest(ctx, lookup, "finish_start", params)
+	r, err := finishRequest(ctx, lookup, "finish_start", params, onScan)
 	if err != nil {
 		return err
 	}
 	interval := 100 * time.Millisecond
-	lastStage := ""
 	for r.State == state.FinishRunning || r.State == state.FinishPrepared {
-		progressKey := fmt.Sprintf("%s/%d/%d", r.Stage, r.ReviewedFragments, r.EvidenceCalls)
-		if !quiet && !jsonOut && progressKey != lastStage {
-			label := finishStageLabel(r.Stage)
-			if r.Stage == "reviewing_evidence" && r.ReviewFragments > 0 {
-				remaining := max(time.Duration(0), time.Until(time.Unix(0, int64(r.DeadlineTS*float64(time.Second))))).Round(time.Second)
-				label = fmt.Sprintf("Reviewing saved changes: %d/%d fragments (%d reused); %s remaining.", r.ReviewedFragments, r.ReviewFragments, r.ReusedFragments, remaining)
-			}
-			fmt.Fprintln(progress, label)
-			lastStage = progressKey
-		}
+		display.update(r, time.Now())
 		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return renderFinish(out, lookup, r, jsonOut, "finish_running")
+			return renderFinish(out, lookup, r.FinishRequest, jsonOut, "finish_running")
 		case <-timer.C:
 		}
-		next, readErr := finishRequest(ctx, lookup, "finish_status", map[string]string{"request_id": r.ID})
+		next, readErr := finishRequest(ctx, lookup, "finish_status", map[string]string{"request_id": r.ID}, nil)
 		if readErr != nil {
-			return renderFinish(out, lookup, r, jsonOut, "finish_status_unavailable")
+			return renderFinish(out, lookup, r.FinishRequest, jsonOut, "finish_status_unavailable")
 		}
 		r = next
 		if interval < time.Second {
@@ -155,7 +149,7 @@ func runFinish(ctx context.Context, out, progress io.Writer, repo string, params
 			}
 		}
 	}
-	return renderFinish(out, lookup, r, jsonOut, "")
+	return renderFinish(out, lookup, r.FinishRequest, jsonOut, "")
 }
 
 func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest, jsonOut bool, waitCode string) error {
@@ -277,7 +271,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			} else {
 				fmt.Fprintln(out, "Finish failed.")
 			}
-			fmt.Fprintf(out, "Reason: %s\n", consoleProse(consoleCause(r.Reason)))
+			fmt.Fprintf(out, "Reason: %s\n", consoleProse(finishFailureReason(r.ReasonCode, r.Reason)))
 		case saved.NoChanges:
 			fmt.Fprintln(out, "No changes to commit.")
 		case r.DryRun:

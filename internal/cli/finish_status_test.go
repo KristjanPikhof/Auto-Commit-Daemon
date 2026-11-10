@@ -716,7 +716,7 @@ func TestFinishStatusCompletedHistoryCannotOverrideCurrentFinish(t *testing.T) {
 			if strings.Contains(control.Summary, "old-history") || !control.OK || report.PublicationOutcome.History != nil {
 				t.Fatalf("old history overrode finish %+v", control)
 			}
-			if phase == "planning" && (!strings.Contains(control.Summary, "Preparing your commits.") || !report.Busy) {
+			if phase == "planning" && (!strings.Contains(control.Summary, "Waiting for Intent to propose commits.") || !report.Busy) {
 				t.Fatal("current planning phase lost")
 			}
 			if phase == "failed" {

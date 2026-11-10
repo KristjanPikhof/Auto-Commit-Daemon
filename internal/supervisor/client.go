@@ -12,6 +12,7 @@ import (
 type Client struct {
 	SocketPath string
 	Timeout    time.Duration
+	OnProgress func(json.RawMessage)
 }
 
 func (c Client) Do(ctx context.Context, request Request) (Response, error) {
@@ -55,21 +56,28 @@ func (c Client) Do(ctx context.Context, request Request) (Response, error) {
 		_ = conn.SetDeadline(time.Now())
 	})
 	defer stopCancellation()
+	request.ReportProgress = c.OnProgress != nil
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
 		if ctx.Err() != nil {
 			return Response{}, ctx.Err()
 		}
 		return Response{}, fmt.Errorf("send supervisor request: %w", err)
 	}
-	var response Response
-	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&response); err != nil {
-		if ctx.Err() != nil {
-			return Response{}, ctx.Err()
+	decoder := json.NewDecoder(bufio.NewReader(conn))
+	for {
+		var response Response
+		if err := decoder.Decode(&response); err != nil {
+			if ctx.Err() != nil {
+				return Response{}, ctx.Err()
+			}
+			return Response{}, fmt.Errorf("read supervisor response: %w", err)
 		}
-		return Response{}, fmt.Errorf("read supervisor response: %w", err)
+		if response.Version != ProtocolVersion || response.ID != request.ID {
+			return Response{}, fmt.Errorf("invalid supervisor response identity")
+		}
+		if response.Progress == nil || c.OnProgress == nil {
+			return response, nil
+		}
+		c.OnProgress(response.Progress)
 	}
-	if response.Version != ProtocolVersion || response.ID != request.ID {
-		return Response{}, fmt.Errorf("invalid supervisor response identity")
-	}
-	return response, nil
 }

@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Show checkpoint scan totals and retained versions during Intent finish.
+  Distinguish evidence preparation, planning, commit checks, and publication,
+  and explain when the Intent attempt runs out of time.
 - Read Intent checkpoints in batches so a branch with more than 256 saved
   checkpoints can finish. Verify the complete commit chain before publishing it
   in one branch update.

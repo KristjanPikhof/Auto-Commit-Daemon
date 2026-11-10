@@ -153,9 +153,17 @@ func TestFinishWorkerPublishesCheckedSameFileDecisions(t *testing.T) {
 				}
 				return finishDecisionPlan(t, request), nil
 			}}
+			var scans []FinishCheckpointProgress
+			w.OnCheckpointScan = func(scan FinishCheckpointProgress) { scans = append(scans, scan) }
+			var checks [][2]int
+			w.OnCommitCheck = func(commit, total int) { checks = append(checks, [2]int{commit, total}) }
 			r := startFinishWorker(t, w, FinishOptions{Purpose: "Prepare password authentication, then add Google"})
 			if len(r.Target.Checkpoints) != 1 || r.Target.Checkpoints[0].ID != source.ID {
 				t.Fatalf("recorded versions: %+v", r.Target.Checkpoints)
+			}
+			if !broken && (len(scans) != 3 || scans[0].Scanned != 0 || scans[1].Scanned != 256 ||
+				scans[1].Complete || !scans[2].Complete || scans[2].Scanned <= 256 || scans[2].Kept != 1) {
+				t.Fatalf("scan did not report its batches and retained version: %+v", scans)
 			}
 			finishWrite(t, f.dir, "auth.sh", "later live work\n")
 			completed, err := w.Execute(t.Context(), r.ID)
@@ -167,6 +175,9 @@ func TestFinishWorkerPublishesCheckedSameFileDecisions(t *testing.T) {
 			}
 			if err != nil || completed.State != state.FinishCompleted {
 				t.Fatalf("same-file publication: %+v %v", completed, err)
+			}
+			if !reflect.DeepEqual(checks, [][2]int{{0, 2}, {1, 2}, {2, 2}}) {
+				t.Fatalf("checks did not report candidate progress: %v", checks)
 			}
 			commits := strings.Fields(finishWorkerGit(t, f.dir, "rev-list", "--reverse", r.Target.ExpectedHead+"..HEAD"))
 			if len(commits) != 2 {

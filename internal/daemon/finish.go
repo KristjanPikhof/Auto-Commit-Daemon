@@ -76,6 +76,8 @@ type FinishWorker struct {
 	Wake, Files, Changes, Shutdown <-chan struct{}
 	EvaluationInterval             time.Duration
 	Runner                         verification.Runner
+	OnCheckpointScan               func(FinishCheckpointProgress)
+	OnCommitCheck                  func(commit, total int)
 	// Transport is an embedding/test override already approved by the caller.
 	// Nil builds the configured strict provider only for Intent execution.
 	Transport ai.FinishTransport
@@ -757,9 +759,6 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 	if planned.Checked != nil {
 		saved, proof = planned.Checked.saved, planned.Checked.proof
 	} else {
-		if _, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishRunning, Stage: "verifying"}); err != nil {
-			return w.failPlan(r, FinishSavedPlan{Version: 1, Disclosure: planned.Disclosure}, err)
-		}
 		saved, proof, err = w.prepare(evalCtx, wt, cfg, r, planned)
 		if err != nil {
 			return w.failPlan(r, saved, err)
@@ -788,6 +787,12 @@ func (w *FinishWorker) Execute(ctx context.Context, id string) (state.FinishRequ
 func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, r state.FinishRequest, planned finishPlanningResult) (FinishSavedPlan, git.FinishPublicationProof, error) {
 	plan := planned.Plan
 	saved := FinishSavedPlan{Version: 1, Disclosure: planned.Disclosure, Source: planned.Source}
+	if w.OnCommitCheck != nil {
+		w.OnCommitCheck(0, len(plan.Steps))
+	}
+	if _, err := state.UpdateFinishRequest(ctx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishRunning, Stage: "verifying"}); err != nil {
+		return saved, git.FinishPublicationProof{}, err
+	}
 	commits := make([]git.FinishCommit, 0, len(plan.Steps))
 	reviewTarget := finishReviewTarget(r.Target)
 	verificationDeadline := time.Now().Add(cfg.VerificationTimeout)
@@ -837,6 +842,9 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 		commits = append(commits, git.FinishCommit{TreeOID: tree, Message: step.Message, AuthorName: cfg.AuthorName, AuthorEmail: cfg.AuthorEmail})
 	}
 	proof, err := git.BuildFinishChain(verifyCtx, wt.Root, git.FinishBuildOptions{RequestID: r.ID, Attempt: r.Attempt, WorktreeID: r.Target.WorktreeID, BranchRef: r.Target.BranchRef, ExpectedHead: r.Target.ExpectedHead, TargetTree: r.Target.TargetTree, IndexDigest: r.Target.IndexDigest, IncludeStaged: r.Target.IncludeStaged, ObjectRef: git.FinishRefPrefix + r.Target.WorktreeID + "/" + r.ID + "/" + strconv.Itoa(r.Attempt) + "/chain", Commits: commits, Verify: func(checkCtx context.Context, index int, oid, tree string) error {
+		if w.OnCommitCheck != nil {
+			w.OnCommitCheck(index+1, len(commits))
+		}
 		check := FinishCheck{TreeOID: tree, Policy: cfg.VerificationMode}
 		result, checkErr := evaluatePublication(checkCtx, func(jobCtx context.Context) (verification.Result, error) {
 			candidateID := r.ID + "-" + strconv.Itoa(r.Attempt) + "-" + strconv.Itoa(index)
@@ -933,9 +941,6 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	}
 	var checked *finishPreparedPlan
 	verifyPlan := func(checkCtx context.Context, plan finish.Plan, built *finish.SourcePlan) error {
-		if _, err := state.UpdateFinishRequest(checkCtx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishRunning, Stage: "verifying"}); err != nil {
-			return err
-		}
 		candidate := finishPlanningResult{Plan: plan, Evidence: evidence}
 		if built != nil {
 			candidate.Evidence, candidate.Blobs = built.Evidence, built.Blobs
