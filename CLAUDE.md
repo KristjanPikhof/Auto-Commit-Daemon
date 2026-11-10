@@ -142,7 +142,7 @@ a concrete large-change explanation in the Git body. Keep required callers,
 tests and generated companions together; do not split solely to meet a count.
 Collect measured size failures and project-check failures for the same bounded
 correction. Older requests and exact messages retain their frozen rules.
-New final-only Intent requests with approved fast/full checks may construct
+New final-only Intent requests with an approved project check may construct
 intermediate text versions from exact frozen base/target line selections. New
 version-four requests may also stage new Go and Swift files from exact target
 lines, keeping independent features separate from Settings or layout work. No

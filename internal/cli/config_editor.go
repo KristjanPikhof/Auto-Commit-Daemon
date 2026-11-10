@@ -129,7 +129,7 @@ func (e *configEditor) projectDocument(doc *config.Document, scope string, chang
 			return editorProjection{}, fmt.Errorf("setting %s cannot be edited here", key)
 		}
 		if value == nil {
-			delete(selected, key)
+			config.ResetOverride(selected, key)
 			continue
 		}
 		if err := validateEditorField(key, *value); err != nil {
@@ -170,7 +170,8 @@ func (e *configEditor) projectDocument(doc *config.Document, scope string, chang
 		}
 		field := resolved[definition.Name]
 		value := field.EffectiveValue()
-		_, overridden := selected[definition.Name]
+		overridden := field.Source == config.SourceRepository ||
+			(scope == "global" && field.Source == config.SourceGlobal)
 		projection.values[definition.Name] = value
 		projection.fields = append(projection.fields, settingsui.EditorField{Key: definition.Name, Value: value, Source: string(field.Source), Overridden: overridden, Inherited: inherited[definition.Name].EffectiveValue()})
 	}
@@ -275,8 +276,7 @@ func (e *configEditor) prepare(ctx context.Context, draft settingsui.EditorDraft
 	}
 	defer service.Close()
 	if draft.Scope == "global" {
-		mode := projection.values[config.FieldIntentVerification]
-		if mode != "none" && mode != "structural" || projection.values[config.FieldVerificationFastCommand] != "" || projection.values[config.FieldVerificationFullCommand] != "" {
+		if projection.values[config.FieldIntentVerification] == config.VerificationProject || projection.values[config.FieldVerificationCommand] != "" {
 			return editorPlan{}, errors.New("project verification commands belong to a repository; switch Editing to This repository")
 		}
 	}
@@ -356,9 +356,7 @@ func writeEditorPermissions(out io.Writer, validation settings.Validation) {
 		case ai.ConfirmationSubprocessExecution:
 			fmt.Fprintln(out, "Allow running this local AI program: "+strconv.Quote(validation.ProviderConfig.Mode))
 		case ai.ConfirmationVerificationCommand:
-			mode := validation.ResolvedHot[config.FieldIntentVerification]
-			fmt.Fprintln(out, "Allow running this check command:", strconv.Quote(validation.ResolvedHot["verification."+mode+".command"]))
-
+			fmt.Fprintln(out, "Allow running this check command:", strconv.Quote(validation.ResolvedHot[config.FieldVerificationCommand]))
 		}
 	}
 }
@@ -410,7 +408,7 @@ func (e *configEditor) globalActivations(ctx context.Context, doc *config.Docume
 	updated.Settings.Global = maps.Clone(doc.Settings.Global)
 	for key, value := range draft.Changes {
 		if value == nil {
-			delete(updated.Settings.Global, key)
+			config.ResetOverride(updated.Settings.Global, key)
 		} else {
 			definition, _ := config.LookupField(key)
 			raw, err := normalizedConfigRaw(definition, *value)

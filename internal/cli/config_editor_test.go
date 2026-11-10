@@ -201,7 +201,8 @@ func TestFinishConfigEditorSaveSupersedesInterruptedApproval(t *testing.T) {
 			if err != nil || !found || approved.ID != runtime.AppliedRevisionID.Int64 {
 				t.Fatalf("new approved settings=%d/%t/%v", approved.ID, found, err)
 			}
-			values, _, err := finishSnapshotValues(approved.SnapshotJSON)
+			resolved, err := finishSnapshotValues(approved.SnapshotJSON)
+			values := resolved.values
 			if err != nil || values[config.FieldCommitFormat] != "conventional" {
 				t.Fatalf("approved style=%v/%v", values, err)
 			}
@@ -462,12 +463,51 @@ func TestFinishRemovalConfigEditorGlobalVerificationNeedsRepositoryScopeBeforePr
 		calls++
 		return ai.ProviderProbeResult{Success: true}, nil
 	}
-	draft := editorDraft(t, e, "global", map[string]*string{config.FieldIntentVerification: editorString("full"), config.FieldVerificationFullCommand: editorString("make test")})
+	draft := editorDraft(t, e, "global", map[string]*string{config.FieldIntentVerification: editorString("project"), config.FieldVerificationCommand: editorString("make test")})
 	if _, err := e.Review(context.Background(), draft); err == nil || !strings.Contains(err.Error(), "repository") {
 		t.Fatalf("err=%v", err)
 	}
 	if calls != 0 {
 		t.Fatal("invalid scope reached provider")
+	}
+}
+
+func TestConfigEditorReviewsAndDisablesOneProjectCheck(t *testing.T) {
+	e := editorFixture(t)
+	e.repo = materializeTestRepo(t, false)
+	ctx := t.Context()
+	command := "exit 42"
+	enable := editorDraft(t, e, "repo", map[string]*string{
+		config.FieldIntentVerification:  editorString("project"),
+		config.FieldVerificationCommand: &command,
+		config.FieldVerificationTimeout: editorString("30s"),
+	})
+	review, err := e.Review(ctx, enable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(review.Text, `Allow running this check command: "exit 42"`) {
+		t.Fatal(review.Text)
+	}
+	if result, err := review.Save(ctx); err != nil || !strings.Contains(result, "Settings applied:") {
+		t.Fatalf("save project check = %q: %v", result, err)
+	}
+	disable := editorDraft(t, e, "repo", map[string]*string{
+		config.FieldIntentVerification: editorString("none"),
+	})
+	review, err = e.Review(ctx, disable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(review.Text, "Allow running this check command") {
+		t.Fatal(review.Text)
+	}
+	if result, err := review.Save(ctx); err != nil || !strings.Contains(result, "Settings applied:") {
+		t.Fatalf("disable project check = %q: %v", result, err)
+	}
+	saved, err := e.project("repo", nil)
+	if err != nil || saved.values[config.FieldIntentVerification] != "none" || saved.values[config.FieldVerificationCommand] != command {
+		t.Fatalf("disabled settings = %v: %v", saved.values, err)
 	}
 }
 
@@ -519,7 +559,7 @@ func TestFinishRemovalLegacyConfigReadOnlyScopeParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct{ scope, profile, want string }{{"global", "", "structural"}, {"profile", "quality", "full"}, {"repo", "", "none"}} {
+	for _, tc := range []struct{ scope, profile, want string }{{"global", "", "none"}, {"profile", "quality", "project"}, {"repo", "", "none"}} {
 		t.Run(tc.scope, func(t *testing.T) {
 			target := resolvedConfigTarget{Document: doc, Scope: tc.scope, Profile: tc.profile, WorktreeID: id}
 			input, _ := configInput(target)
@@ -546,7 +586,7 @@ func TestFinishRemovalLegacyConfigReadOnlyScopeParity(t *testing.T) {
 		t.Fatalf("editor=%v err=%v", projection.values, err)
 	}
 	for _, f := range projection.fields {
-		if f.Key == config.FieldIntentVerification && f.Inherited != "full" {
+		if f.Key == config.FieldIntentVerification && f.Inherited != "project" {
 			t.Fatalf("inherited scope=%+v", f)
 		}
 	}

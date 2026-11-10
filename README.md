@@ -185,11 +185,9 @@ must match the selected style. Its body is optional. It does not bypass the
 provider in Intent mode; AI-generated messages always require a reason.
 
 Every finish checks coverage, dependencies, Git structure, and exact target
-equality. The default `none` policy and `structural` skip project commands.
-Approved `fast` or `full` policies run configured commands against each private
-candidate, outside your worktree. Status reports commands that ran, identical
-results reused, and checks that were not configured. Structural checks alone do
-not mean project tests passed.
+equality. The default, `none`, skips project commands. To run an approved
+command against each proposed commit in isolation, enable the
+[optional project check](docs/settings.md#project-checks) for that repository.
 
 Git-ignored and sensitive paths stay outside protection. Excluded tracked entries
 and submodule entries remain in the finish base tree. Intent setup includes

@@ -704,10 +704,10 @@ func finishReadOnlyConfigValues(ctx context.Context, roots paths.Roots, repo str
 			return nil, "", err
 		}
 		if found {
-			values, _, err := finishSnapshotValues(revision.SnapshotJSON)
-			return values, fmt.Sprintf("approved revision %d", revision.ID), err
+			resolved, err := finishSnapshotValues(revision.SnapshotJSON)
+			return resolved.values, fmt.Sprintf("approved revision %d", revision.ID), err
 		}
 	}
-	values, _, err := finishSavedValues(roots, repo)
-	return values, "saved settings", err
+	resolved, err := finishSavedValues(roots, repo)
+	return resolved.values, "saved settings", err
 }

@@ -18,6 +18,10 @@
 
 ### Changed
 
+- Replace Fast and Full with one optional project check. Setup defaults to
+  `none`. Existing checks keep their selected command and timeout, and saved
+  requests keep their verification identity.
+
 - Let checked Intent finishes split a named recorded file version by exact
   lines in the existing correction call when it blocks independent commits.
   Keep other recorded changes and completed reviews, and verify the full chain.

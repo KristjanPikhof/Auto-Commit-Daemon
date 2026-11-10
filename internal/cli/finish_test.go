@@ -98,7 +98,7 @@ func TestFinishCLIHelpDistinguishesContextFromExactBatch(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"PURPOSE is optional context", "decisions and constraints", "Advanced: --message", "disables automatic splitting", "approved fast/full project checks", "when no intermediate versions are saved", "acd config --repo ."} {
+	for _, want := range []string{"PURPOSE is optional context", "decisions and constraints", "Advanced: --message", "disables automatic splitting", "an approved project check", "when checkpoints don't separate the edits", "acd config --repo ."} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("help omitted %q:\n%s", want, out.String())
 		}
@@ -200,7 +200,7 @@ func TestFinishCLIBoundaryFailureExplainsNewRequest(t *testing.T) {
 				}
 				want := "Save smaller complete steps, then start a new request with `" + command + "`"
 				if scenario.configure {
-					want = "Run `acd config --repo " + productListShellQuote(lookup.Worktree.Root) + "` to approve fast/full project checks, then start a new request with `" + command + "`"
+					want = "Run `acd config --repo " + productListShellQuote(lookup.Worktree.Root) + "` to approve a project check, then start a new request with `" + command + "`"
 				}
 				if strings.Contains(out.String(), "--retry") || !strings.Contains(out.String(), want) {
 					t.Fatalf("boundary refusal gave an ineffective action: %s", out.String())

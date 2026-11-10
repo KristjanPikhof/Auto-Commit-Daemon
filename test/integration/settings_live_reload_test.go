@@ -46,7 +46,7 @@ func TestSettingsLiveReloadKeepsFrozenFinishAndUsesNewApprovalNext(t *testing.T)
 	extra := []string{trustEnv, "ACD_AI_API_KEY=settings-test-key"}
 	f := newFinishFixture(t, extra...)
 	approval := []ai.ConfirmationRequirement{ai.ConfirmationEndpointCredentials, ai.ConfirmationDiffEgress}
-	values := map[string]string{"commit.strategy": "intent", "commit.format": "imperative", "ai.provider": "openai-compat", "ai.base_url": server.URL + "/v1", "ai.model": "model-a", "ai.diff_egress": "true", "intent.verification": "structural"}
+	values := map[string]string{"commit.strategy": "intent", "commit.format": "imperative", "ai.provider": "openai-compat", "ai.base_url": server.URL + "/v1", "ai.model": "model-a", "ai.diff_egress": "true", "intent.verification": "none"}
 	a := f.Apply(t, ctx, values, approval...)
 	writeFile(t, filepath.Join(f.Repo, "revision-a.txt"), "approved A\n")
 	f.Barrier(t, ctx)

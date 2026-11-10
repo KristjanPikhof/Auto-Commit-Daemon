@@ -126,9 +126,9 @@ retrying. To change the work or mode, review settings and start a new finish.
 Prepared publication recovers from exact saved proof after restart; an
 interrupted running attempt becomes failed rather than making new AI calls.
 
-`none` and `structural` verification run safety checks without project commands.
-`fast` and `full` use approved configured commands. Read the reported evidence;
-missing or reused checks are not freshly executed tests.
+Every finish runs safety checks. The optional `project` setting also runs
+one approved command per proposed commit. Finish reports when it reuses an
+earlier result.
 
 ## Restore a checkpoint
 

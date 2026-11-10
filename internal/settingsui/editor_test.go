@@ -103,7 +103,7 @@ func TestEditorVerificationExplainsSourceSplitting(t *testing.T) {
 	if err != nil || inherited || value != "none" {
 		t.Fatalf("reading check options changed the selection: value=%q inherited=%v err=%v\n%s", value, inherited, err, out.String())
 	}
-	for _, want := range []string{"Quick/full project checks", "split edits within a file", "when no intermediate versions are saved", "Other modes group saved file versions"} {
+	for _, want := range []string{"No project check", "Run a project check", "split edits within a saved file version"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("checks selector omitted %q:\n%s", want, out.String())
 		}

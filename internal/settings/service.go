@@ -260,7 +260,7 @@ func (s *Service) Save(_ context.Context, req SaveRequest) (SaveResult, error) {
 				return err
 			}
 			if value == nil {
-				delete(target, name)
+				config.ResetOverride(target, name)
 				continue
 			}
 			raw, err := encodePersistedField(field, *value)
@@ -336,13 +336,11 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 	if len(validation.Missing) > 0 {
 		return SaveGlobalSetupResult{}, &ConfirmationRequiredError{Missing: validation.Missing}
 	}
-	if mode := validation.ResolvedHot[config.FieldIntentVerification]; mode != "none" && mode != "structural" {
+	if validation.ResolvedHot[config.FieldIntentVerification] == config.VerificationProject {
 		return SaveGlobalSetupResult{}, errors.New("acd settings: project verification is configured per repository")
 	}
-	for _, field := range []string{config.FieldVerificationFastCommand, config.FieldVerificationFullCommand} {
-		if strings.TrimSpace(req.Values[field]) != "" {
-			return SaveGlobalSetupResult{}, errors.New("acd settings: project verification commands cannot be saved by global setup")
-		}
+	if validation.ResolvedHot[config.FieldVerificationCommand] != "" {
+		return SaveGlobalSetupResult{}, errors.New("acd settings: project verification commands cannot be saved by global setup")
 	}
 	confirmations, err := globalSetupConfirmations(req.Confirmations)
 	if err != nil {
@@ -365,7 +363,7 @@ func (s *Service) SaveGlobalSetup(ctx context.Context, req SaveGlobalSetupReques
 				return err
 			}
 			if value == nil {
-				delete(doc.Settings.Global, name)
+				config.ResetOverride(doc.Settings.Global, name)
 				continue
 			}
 			raw, err := encodePersistedField(field, *value)
@@ -468,19 +466,10 @@ func (s *Service) Validate(ctx context.Context, draft map[string]string, confirm
 		}
 		required = append(required, providerValidation.Confirmations...)
 	}
-	verificationMode := resolved[config.FieldIntentVerification]
-	verificationCommand := ""
-	switch verificationMode {
-	case "fast":
-		verificationCommand = resolved[config.FieldVerificationFastCommand]
-	case "full":
-		verificationCommand = resolved[config.FieldVerificationFullCommand]
-	}
-	if (verificationMode == "fast" || verificationMode == "full") &&
-		strings.TrimSpace(verificationCommand) == "" {
-		return Validation{}, errors.New("acd settings: approved verification command is not configured")
-	}
-	if verificationMode == "fast" || verificationMode == "full" {
+	if resolved[config.FieldIntentVerification] == config.VerificationProject {
+		if resolved[config.FieldVerificationCommand] == "" {
+			return Validation{}, errors.New("acd settings: set a project check command or choose No project check")
+		}
 		required = append(required, ai.ConfirmationVerificationCommand)
 	}
 	confirmedSet := make(map[ai.ConfirmationRequirement]bool, len(confirmed))

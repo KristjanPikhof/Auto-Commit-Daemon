@@ -17,24 +17,18 @@ import (
 // ConfigureWizardOptions contains presentation-safe setup defaults. Credential
 // values are accepted only in ConfigureSelection and are never rendered.
 type ConfigureWizardOptions struct {
-	Input                io.Reader
-	Output               io.Writer
-	Accessible           bool
-	Defaults             map[string]string
-	DetectedCommand      string
-	DetectedQuickCommand string
-	DetectedQuickSource  string
-	DetectedFullCommand  string
-	DetectedFullSource   string
-	ExplicitMode         bool
-	RepositoryScoped     bool
-	HasCredential        bool
-	CredentialStatus     func() (bool, error)
-	CredentialFromStdin  bool
-	ProviderConfigured   bool
-	OpenAIConfigured     bool
-	IncludeCommitFormat  bool
-	IncludeCAFile        bool
+	Input               io.Reader
+	Output              io.Writer
+	Accessible          bool
+	Defaults            map[string]string
+	ExplicitMode        bool
+	HasCredential       bool
+	CredentialStatus    func() (bool, error)
+	CredentialFromStdin bool
+	ProviderConfigured  bool
+	OpenAIConfigured    bool
+	IncludeCommitFormat bool
+	IncludeCAFile       bool
 }
 
 // ConfigureSelection is an in-memory draft. Callers must discard Credential
@@ -51,12 +45,6 @@ type ConfigureSelection struct {
 	DiffContextApproved         bool
 	EndpointCredentialsApproved bool
 	SubprocessApproved          bool
-	VerificationMode            string
-	VerificationCommand         string
-	VerificationSource          string
-	ExecutionMode               string
-	VerificationApproved        bool
-	Confirmed                   bool
 }
 
 // RunConfigureWizard stages every setup choice in memory. It deliberately does
@@ -209,12 +197,6 @@ func RunConfigureWizard(ctx context.Context, opts ConfigureWizardOptions) (Confi
 		return ConfigureSelection{}, fmt.Errorf("configure wizard: unsupported provider %q", safeText(providerKind))
 	}
 
-	selection.VerificationMode = fallback(defaults["intent.verification"], "none")
-	if selection.VerificationMode == "fast" || selection.VerificationMode == "full" {
-		selection.VerificationCommand = strings.TrimSpace(defaults["verification."+selection.VerificationMode+".command"])
-		selection.VerificationSource = "saved setting"
-	}
-	selection.ExecutionMode = "explicit finish"
 	selection.DiffContextApproved = selection.Strategy == "intent"
 	selection.EndpointCredentialsApproved = selection.Provider == "openai-compat" && strings.TrimRight(strings.TrimSpace(selection.BaseURL), "/") != "https://api.openai.com/v1"
 	selection.SubprocessApproved = strings.HasPrefix(selection.Provider, "subprocess:")
@@ -271,50 +253,6 @@ func readConfigureSecretLine(input io.Reader, limit int) (string, error) {
 		}
 	}
 	return "", errors.New("credential exceeds safe input limit")
-}
-
-// ConfirmConfigurePreview is separate so callers can render the exact final
-// projection before asking for the single apply confirmation.
-type ConfigurePreviewApproval struct {
-	Verification bool
-	Apply        bool
-}
-
-type ConfigurePreviewApprovalOptions struct {
-	VerificationMode    string
-	VerificationCommand string
-	Global              bool
-	Action              string
-}
-
-// ConfirmConfigurePreview binds one consent to every permission shown in the
-// exact final preview.
-func ConfirmConfigurePreview(ctx context.Context, input io.Reader, output io.Writer, accessible bool, opts ConfigurePreviewApprovalOptions) (ConfigurePreviewApproval, error) {
-	approval := ConfigurePreviewApproval{}
-	title := "Approve these permissions, save, and enable ACD?"
-	if opts.Global {
-		title = "Approve these permissions and save the global defaults?"
-		if opts.Action == "replace_global" {
-			title = "Approve these permissions and replace the global defaults?"
-		}
-	} else if opts.Action == "inherit_global" {
-		title = "Use every global setting for this repository and enable ACD?"
-	}
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewConfirm().Key("apply").Title(title).
-			Value(&approval.Apply),
-	))
-	if accessible || os.Getenv("NO_COLOR") != "" {
-		form = form.WithTheme(huh.ThemeFunc(huh.ThemeBase))
-	}
-	form = form.WithAccessible(accessible)
-	if err := form.WithKeyMap(readableKeyMap()).WithInput(input).WithOutput(readableOutput(output, accessible)).
-		WithShowHelp(true).RunWithContext(ctx); err != nil {
-		return ConfigurePreviewApproval{}, err
-	}
-	approval.Verification = approval.Apply &&
-		(opts.VerificationMode == "fast" || opts.VerificationMode == "full")
-	return approval, nil
 }
 
 func runConfigureForm(ctx context.Context, form *huh.Form, opts ConfigureWizardOptions) error {

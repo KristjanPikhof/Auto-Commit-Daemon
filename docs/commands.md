@@ -231,9 +231,9 @@ instructions still match. Progress shows completed and reused fragments.
 Successful retry previews retain this evidence for a later real retry of the
 same ID. Each attempt still makes a fresh global plan.
 
-Verification always proves structure and target equality. `none` and
-`structural` do not imply that project tests ran. `fast` and `full` run the
-approved command in isolated candidate trees, under one bounded chain deadline.
+Verification always proves structure and target equality. With `project`, ACD
+also runs the approved command in isolated candidate trees within the finish
+deadline. The default `none` skips the command.
 Output reports which checks actually ran. See the
 [finish contract](finish-contract.md) for exact request and safety rules.
 

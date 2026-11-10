@@ -21,10 +21,9 @@ func TestFinishRemovalWizardStagesIntentWithoutTests(t *testing.T) {
 	var out bytes.Buffer
 	selection, err := RunConfigureWizard(context.Background(), ConfigureWizardOptions{
 		Input: &bytewiseReader{r: strings.NewReader(input)}, Output: &out,
-		Accessible: true, DetectedQuickCommand: "go test ./... -run '^$'",
-		DetectedQuickSource: "Go language default",
+		Accessible: true,
 		Defaults: map[string]string{
-			"commit.strategy": "intent", "intent.verification": "structural", "ai.diff_egress": "false",
+			"commit.strategy": "intent", "ai.diff_egress": "false",
 			"commit.format": "imperative", "ai.provider": "openai-compat",
 			"ai.model": "gpt-6-luna", "ai.base_url": "https://api.openai.com/v1",
 			"ai.timeout": "30s",
@@ -34,10 +33,7 @@ func TestFinishRemovalWizardStagesIntentWithoutTests(t *testing.T) {
 		t.Fatalf("wizard: %v\n%s", err, out.String())
 	}
 	if selection.Strategy != "intent" ||
-		selection.VerificationMode != "structural" ||
-		selection.VerificationCommand != "" ||
-		selection.ExecutionMode != "explicit finish" ||
-		selection.VerificationApproved || !selection.DiffContextApproved ||
+		!selection.DiffContextApproved ||
 		selection.Credential != "staged-secret" ||
 		selection.BaseURL != "https://gateway.example/v1" ||
 		selection.Model != "gateway-model" {
@@ -62,47 +58,6 @@ func TestFinishRemovalWizardStagesIntentWithoutTests(t *testing.T) {
 			t.Errorf("regular wizard rendered technical prompt %q:\n%s",
 				forbidden, out.String())
 		}
-	}
-}
-
-func TestFinishRemovalFinalApprovalBindsCommand(t *testing.T) {
-	var out bytes.Buffer
-	approval, err := ConfirmConfigurePreview(context.Background(),
-		&bytewiseReader{r: strings.NewReader("y\n")}, &out, true,
-		ConfigurePreviewApprovalOptions{
-			VerificationMode: "full", VerificationCommand: "make test\nunsafe",
-		})
-	if err != nil || !approval.Verification || !approval.Apply {
-		t.Fatalf("approval=%+v err=%v\n%s", approval, err, out.String())
-	}
-	view := out.String()
-	if !strings.Contains(view, "Approve these permissions") {
-		t.Errorf("single approval missing:\n%s", view)
-	}
-	if strings.Contains(view, "make test") || strings.Contains(view, "30m") {
-		t.Fatalf("single approval repeated preview details: %q", view)
-	}
-	if strings.Contains(view, "\x1b[") {
-		t.Fatalf("final approval used rich terminal rendering: %q", view)
-	}
-}
-
-func TestConfigureGlobalFinalApprovalDoesNotPromiseActivation(t *testing.T) {
-	t.Setenv("NO_COLOR", "1")
-	var out bytes.Buffer
-	approval, err := ConfirmConfigurePreview(
-		context.Background(),
-		&bytewiseReader{r: strings.NewReader("y\n")},
-		&out,
-		true,
-		ConfigurePreviewApprovalOptions{Global: true},
-	)
-	if err != nil || !approval.Apply {
-		t.Fatalf("approval=%+v err=%v\n%s", approval, err, out.String())
-	}
-	if !strings.Contains(out.String(), "save the global defaults") ||
-		strings.Contains(out.String(), "enable ACD") {
-		t.Fatalf("global approval prompt=%q", out.String())
 	}
 }
 

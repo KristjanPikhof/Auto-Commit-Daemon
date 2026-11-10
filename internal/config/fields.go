@@ -35,21 +35,21 @@ const (
 )
 
 const (
-	FieldProvider                = "ai.provider"
-	FieldBaseURL                 = "ai.base_url"
-	FieldAPIKey                  = "ai.api_key"
-	FieldModel                   = "ai.model"
-	FieldTimeout                 = "ai.timeout"
-	FieldMaxInputBytes           = "ai.max_input_bytes"
-	FieldCAFile                  = "ai.ca_file"
-	FieldDiffEgress              = "ai.diff_egress"
-	FieldCommitStrategy          = "commit.strategy"
-	FieldCommitFormat            = "commit.format"
-	FieldIntentVerification      = "intent.verification"
-	FieldVerificationFastCommand = "verification.fast.command"
-	FieldVerificationFastTimeout = "verification.fast.timeout"
-	FieldVerificationFullCommand = "verification.full.command"
-	FieldVerificationFullTimeout = "verification.full.timeout"
+	FieldProvider            = "ai.provider"
+	FieldBaseURL             = "ai.base_url"
+	FieldAPIKey              = "ai.api_key"
+	FieldModel               = "ai.model"
+	FieldTimeout             = "ai.timeout"
+	FieldMaxInputBytes       = "ai.max_input_bytes"
+	FieldCAFile              = "ai.ca_file"
+	FieldDiffEgress          = "ai.diff_egress"
+	FieldCommitStrategy      = "commit.strategy"
+	FieldCommitFormat        = "commit.format"
+	FieldIntentVerification  = "intent.verification"
+	FieldVerificationCommand = "verification.command"
+	FieldVerificationTimeout = "verification.timeout"
+	VerificationNone         = "none"
+	VerificationProject      = "project"
 )
 
 type FieldDefinition struct {
@@ -78,11 +78,9 @@ var fieldCatalog = []FieldDefinition{
 	{Name: FieldDiffEgress, Environment: "ACD_AI_DIFF_EGRESS", Default: "false", Kind: KindBool, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCommitStrategy, Environment: "ACD_COMMIT_STRATEGY", Default: "local", Kind: KindString, Choices: []string{"local", "intent"}, Boundary: ApplyHot, Persistable: true},
 	{Name: FieldCommitFormat, Environment: "ACD_COMMIT_FORMAT", Default: "imperative", Kind: KindString, Choices: []string{"imperative", "conventional"}, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldIntentVerification, Environment: "ACD_INTENT_VERIFICATION", Default: "none", Kind: KindString, Choices: []string{"none", "structural", "fast", "full"}, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldVerificationFastCommand, Environment: "ACD_VERIFICATION_FAST_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldVerificationFastTimeout, Environment: "ACD_VERIFICATION_FAST_TIMEOUT", Default: "2m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldVerificationFullCommand, Environment: "ACD_VERIFICATION_FULL_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},
-	{Name: FieldVerificationFullTimeout, Environment: "ACD_VERIFICATION_FULL_TIMEOUT", Default: "10m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldIntentVerification, Environment: "ACD_INTENT_VERIFICATION", Default: VerificationNone, Kind: KindString, Choices: []string{VerificationNone, VerificationProject}, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldVerificationCommand, Environment: "ACD_VERIFICATION_COMMAND", Kind: KindString, Boundary: ApplyHot, Persistable: true},
+	{Name: FieldVerificationTimeout, Environment: "ACD_VERIFICATION_TIMEOUT", Default: "2m", Kind: KindDuration, Boundary: ApplyHot, Persistable: true},
 	{Name: "capture.max_file_bytes", Environment: "ACD_MAX_FILE_BYTES", Default: "5242880", Kind: KindInteger, Minimum: 1, Boundary: ApplyRestart, Persistable: true},
 	{Name: "capture.sensitive_globs", Environment: "ACD_SENSITIVE_GLOBS", Kind: KindString, Boundary: ApplyRestart, Sensitive: true, Persistable: true},
 	{Name: "capture.safe_ignore", Environment: "ACD_SAFE_IGNORE", Default: "true", Kind: KindBool, Boundary: ApplyRestart, Persistable: true},
@@ -147,6 +145,16 @@ func ResolveField(name string, input ResolveInput) (ResolvedField, error) {
 	if !ok {
 		return ResolvedField{}, UnsupportedFieldError(name)
 	}
+	switch name {
+	case FieldIntentVerification, FieldVerificationCommand, FieldVerificationTimeout:
+		return resolveVerificationField(field, input)
+	default:
+		return resolveField(field, input)
+	}
+}
+
+func resolveField(field FieldDefinition, input ResolveInput) (ResolvedField, error) {
+	name := field.Name
 	lookup := input.LookupEnv
 	if lookup == nil {
 		lookup = func(string) (string, bool) { return "", false }
@@ -315,6 +323,9 @@ const sha256HexLength = 64
 func validateOverrides(scope string, values Overrides) error {
 	for name, raw := range values {
 		field, ok := LookupField(name)
+		if legacy, exists := legacyVerificationFields[name]; exists {
+			field, ok = legacy, true
+		}
 		if !ok {
 			return fmt.Errorf("acd config: %s: %w", scope, UnsupportedFieldError(name))
 		}
