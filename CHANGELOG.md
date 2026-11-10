@@ -18,6 +18,10 @@
 
 ### Changed
 
+- Let Intent assign whole files and coherent directories in one selection.
+  ACD expands the selections and checks coverage before verifying the chain.
+  A provider's uncertainty about coverage no longer appears as a proven
+  conflict in the saved versions.
 - Let Intent keep inseparable saved edits together when project checks are
   off. Keep the rest of the work in separate, verified commits.
 - Replace Fast and Full with one optional project check. Setup defaults to

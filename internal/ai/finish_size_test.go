@@ -155,12 +155,14 @@ func TestFinishWholeVersionPromptKeepsOnlyInseparableEditsTogether(t *testing.T)
 }
 
 func TestFinishReviewSchemaKeepsLegacyAndExactContracts(t *testing.T) {
-	for _, scenario := range []string{"new", "source", "legacy", "exact", "history"} {
+	for _, scenario := range []string{"new", "source", "paths", "legacy", "exact", "history"} {
 		request := FinishPlanRequest{Style: "imperative", ReviewLineTarget: FinishReviewLineTarget}
 		switch scenario {
 		case "source":
 			request.SelectionOrder = []string{"edit-000001"}
 			request.SourceEdits = []FinishSourceEdit{{ID: "edit-000001"}}
+		case "paths":
+			request.AllowPathOwnership = true
 		case "legacy":
 			request.ReviewLineTarget = 0
 		case "exact":
@@ -182,11 +184,17 @@ func TestFinishReviewSchemaKeepsLegacyAndExactContracts(t *testing.T) {
 		if err := json.Unmarshal(body, &wire); err != nil {
 			t.Fatal(err)
 		}
-		goal := wire.Tools[0].Function.Parameters["properties"].(map[string]any)["goals"].(map[string]any)["items"].(map[string]any)
+		properties := wire.Tools[0].Function.Parameters["properties"].(map[string]any)
+		goal := properties["goals"].(map[string]any)["items"].(map[string]any)
 		_, included := goal["properties"].(map[string]any)["large_change_reason"]
-		want := scenario == "new" || scenario == "source"
+		want := scenario == "new" || scenario == "source" || scenario == "paths"
 		if included != want || strings.Contains(finishPrompt(request), "smallest complete") != want {
 			t.Fatalf("%s changed its frozen schema or prompt contract", scenario)
+		}
+		for _, field := range []string{"path_ownership", "blocked_change_ids"} {
+			if _, present := properties[field]; present != (scenario == "paths") {
+				t.Fatalf("%s has the wrong schema for %s", scenario, field)
+			}
 		}
 	}
 }

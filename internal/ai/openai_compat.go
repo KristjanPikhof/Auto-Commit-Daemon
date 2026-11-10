@@ -76,6 +76,17 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 	}
 	properties := map[string]any{"goals": map[string]any{"type": "array", "items": goal}, "blocked_reason": map[string]any{"type": "string"}}
 	required := []string{"goals", "blocked_reason"}
+	if request.AllowPathOwnership {
+		properties["path_ownership"] = map[string]any{"type": "array", "items": map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"goal", "paths"},
+			"properties": map[string]any{
+				"goal":  map[string]any{"type": "integer", "description": "1-based index into goals."},
+				"paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			},
+		}}
+		properties["blocked_change_ids"] = map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+		required = append(required, "path_ownership", "blocked_change_ids")
+	}
 	if len(request.SelectionOrder) > 0 {
 		goal["required"] = []string{"purpose", "boundary", "reason", "message"}
 		delete(goal["properties"].(map[string]any), "change_ids")

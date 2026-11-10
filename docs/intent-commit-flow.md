@@ -177,6 +177,12 @@ are rejected. The planner still chooses the purposes, owners and prerequisite
 order across all files. Annotated diffs retain every edit ID and its exact code;
 duplicate per-line coordinates and the full repeated ID list stay local.
 
+Whole-version plans can name a file or directory once when all its recorded
+changes belong to the same goal. Intent still names exact change IDs when a
+file has versions in different commits. ACD expands the assignments against
+the saved catalogue and rejects overlaps or missing changes. It orders the
+recorded prerequisites before building and checking the chain.
+
 The request contains bounded metadata, redacted supplied context, and approved
 text diffs. Each encoded review is bounded to 512 KiB. The global catalogue
 and its correction can use up to 2 MiB; `ai.max_input_bytes` can lower either

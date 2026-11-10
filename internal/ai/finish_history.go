@@ -40,6 +40,9 @@ Some exact selections refine a recorded file transition. Finish all selections f
 		if request.GroupIndivisibleVersions {
 			prompt = strings.Replace(prompt, finishStrictBoundaries, finishWholeVersionBoundaries, 1)
 		}
+		if request.AllowPathOwnership {
+			prompt += finishPathOwnershipPrompt
+		}
 		if request.RefineRecorded {
 			return prompt + finishSmallStepsPrompt + `
 If a recorded version combines independent outcomes and blocks a useful split, include its exact change ID from changes in blocked_reason. ACD can offer exact lines for that version in the correction.`
@@ -52,6 +55,9 @@ If a recorded version combines independent outcomes and blocks a useful split, i
 	return finishSystemPrompt + `
 This request is an explicit messages-only history rewrite. Keep every history_commits record in its original order, including empty and net-neutral commits. Return exactly one goal for each original commit. Its change_ids must contain ONLY that original commit's id. Changes and recorded diffs provide context, not permission to regroup membership. Preserve authors and tree boundaries; only purpose, boundary and message are proposed. Explain the recorded change without inventing tests, verification, motivation, or file content.`
 }
+
+const finishPathOwnershipPrompt = `
+Return path_ownership alongside goals. In each entry, goal is a 1-based goal number and paths contains exact file paths or literal directory prefixes ending in "/". Each selector owns every recorded version of its matching files. Use this compact form for whole files and for directories whose changed files all support that goal. Use goal.change_ids only for files whose versions must be split, or for individual recorded changes. Never assign a change twice through overlapping paths or change IDs. File and directory layout help express membership, but the evidence determines the purpose. Check that every changed file is covered before responding. ACD expands ownership, orders the recorded prerequisites, and checks coverage and the exact final tree. Give your best complete grounded plan so those checks can resolve concrete problems. Uncertainty about bookkeeping or ordering is a reason to propose memberships for verification. For a successful proposal, set blocked_reason to "" and blocked_change_ids to []. If no complete plan is possible, name the exact conflicting change IDs in blocked_change_ids and explain the concrete conflict in blocked_reason.`
 
 // PlanHistoryMessages preserves commit membership, unlike a purpose plan that
 // may remove net-neutral changes. It uses one exchange and one combined correction.

@@ -22,7 +22,10 @@ func TestFinishWorkerProtectsWorkWhenDecisionsCannotBeExplained(t *testing.T) {
 			w.Config.Provider.DiffEgress = true
 			w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
 				if scenario == "inseparable purposes" {
-					return []byte(`{"goals":[],"blocked_reason":"The settings.swift version combines unrelated layout and credential behavior; separate versions are unavailable."}`), nil
+					return json.Marshal(map[string]any{
+						"blocked_reason":     "The settings.swift version combines unrelated layout and credential behavior; separate versions are unavailable.",
+						"blocked_change_ids": []string{request.Changes[0].ID},
+					})
 				}
 				var ids []string
 				for _, change := range request.Changes {
@@ -64,10 +67,10 @@ func TestFinishWorkerKeepsIndivisibleVersionTogether(t *testing.T) {
 	finishCaptureVersion(t, w)
 	final := "group() { printf 'active completed'; }\ncapture() { printf note; }\n"
 	finishWrite(t, f.dir, "tasks.sh", final)
-	finishWrite(t, f.dir, "operations.md", "Restart the relay before reconnecting.\n")
+	finishWrite(t, f.dir, "docs/operations.md", "Restart the relay before reconnecting.\n")
 
 	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
-		if !request.GroupIndivisibleVersions || request.RefineRecorded || len(request.SourceEdits) != 0 {
+		if !request.GroupIndivisibleVersions || !request.AllowPathOwnership || request.RefineRecorded || len(request.SourceEdits) != 0 {
 			t.Fatal("unchecked request did not restrict planning to whole versions")
 		}
 		var mixedID string
@@ -76,24 +79,27 @@ func TestFinishWorkerKeepsIndivisibleVersionTogether(t *testing.T) {
 			{Purpose: "Document relay restart order", Boundary: "Keep relay operations independent of task controls", Reason: "Tell operators when to restart the relay so they reconnect in order.", Message: "Document relay restart order\n\n- Tell operators when to restart the relay so they reconnect in order."},
 		}
 		for _, change := range request.Changes {
-			switch change.Path {
-			case "tasks.sh":
-				goals[0].ChangeIDs = append(goals[0].ChangeIDs, change.ID)
-				if strings.HasPrefix(change.ID, "checkpoint-") {
-					mixedID = change.ID
-				}
-			case "operations.md":
-				goals[1].ChangeIDs = append(goals[1].ChangeIDs, change.ID)
+			if change.Path == "tasks.sh" && strings.HasPrefix(change.ID, "checkpoint-") {
+				mixedID = change.ID
 			}
 		}
 		if mixedID == "" {
 			t.Fatal("missing mixed checkpoint")
 		}
 		if request.Correction == nil {
-			return json.Marshal(map[string]any{"blocked_reason": mixedID + " combines task grouping and dictated capture defaults."})
+			return json.Marshal(map[string]any{"blocked_reason": "Cannot guarantee a complete plan or dependency order."})
+		}
+		if !strings.Contains(request.Correction.ValidationError, "ACD checks coverage and orders recorded prerequisites") {
+			t.Fatalf("correction repeated an unsupported boundary refusal: %+v", request.Correction)
 		}
 		goals[0].Boundary = "The first saved version " + mixedID + " contains both task behaviors"
-		return json.Marshal(map[string]any{"goals": goals})
+		return json.Marshal(map[string]any{
+			"goals": goals,
+			"path_ownership": []map[string]any{
+				{"goal": 1, "paths": []string{"tasks.sh"}},
+				{"goal": 2, "paths": []string{"docs/"}},
+			},
+		})
 	}}
 
 	request := startFinishWorker(t, w, FinishOptions{})

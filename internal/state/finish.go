@@ -16,7 +16,8 @@ import (
 const (
 	FinishRecordedSourceVersion   = 6
 	FinishRecordedGroupingVersion = 7
-	FinishVersion                 = FinishRecordedGroupingVersion
+	FinishPathOwnershipVersion    = 8
+	FinishVersion                 = FinishPathOwnershipVersion
 	FinishRunning                 = "running"
 	FinishPrepared                = "prepared"
 	FinishCompleted               = "completed"

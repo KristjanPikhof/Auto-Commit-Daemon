@@ -184,6 +184,10 @@ Version-seven requests without project checks can keep independent outcomes
 together when one recorded version contains both and no intermediate version
 separates them. Keep that group as small as possible, explain the boundary,
 and preserve every useful split elsewhere in the plan.
+Version-eight whole-version plans can assign a literal file or directory to a
+goal. Expand against the frozen catalogue and keep the same coverage, version
+ordering, and verification checks. A provider refusal without exact conflicting
+change IDs is a planning failure.
 
 Client disconnect detaches from the accepted bounded job. Restart fails running
 planning retryably and recovers prepared publication without AI only through exact
