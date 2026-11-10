@@ -17,11 +17,12 @@ ID identifies that immutable input. Later saves receive their own checkpoints
 and stay outside the target.
 
 Intent also retains useful earlier checkpoint versions from the same worktree,
-branch, and HEAD. ACD considers at most 256 retained current checkpoints; a
-larger window reports that its evidence is too large instead of clipping it.
-Restore, migration, branch movement, and legacy captures end that window.
-Private finish refs keep the selected versions available across pruning and
-explicit retries. Old requests without this evidence keep their original target.
+branch, and HEAD. ACD reads checkpoints in batches of up to 256 and uses the
+useful versions in one plan for the complete frozen target. It verifies the
+whole chain before updating the branch once. The usual time and evidence size
+limits still apply. Restore, migration, branch movement, and legacy captures
+end the window. Private finish refs keep the selected versions available
+across pruning and explicit retries. Existing requests keep their frozen target.
 
 Only paths changed in the final eligible target can supply intermediate versions.
 Renames and deletions stay complete final transitions. Requests with staged

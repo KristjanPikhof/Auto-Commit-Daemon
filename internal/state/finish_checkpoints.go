@@ -2,22 +2,51 @@ package state
 
 import (
 	"context"
-	"fmt"
+	"database/sql"
 )
 
-// FinishCheckpoints reads only current protection snapshots in the same
+const finishCheckpointBatchSize = 256
+
+// WalkFinishCheckpoints reads only current protection snapshots in the same
 // uninterrupted observed branch/HEAD window. Legacy captures and restore or
 // migration snapshots never become a new finish's planning source.
-func FinishCheckpoints(ctx context.Context, db *DB, target Checkpoint) ([]Checkpoint, error) {
-	rows, err := db.ReadSQL().QueryContext(ctx, checkpointSelect+` WHERE worktree_id=? AND seq<?
- AND seq>COALESCE((SELECT MAX(seq) FROM checkpoints boundary WHERE worktree_id=? AND seq<? AND
+func WalkFinishCheckpoints(ctx context.Context, db *DB, target Checkpoint, visit func(Checkpoint) error) error {
+	tx, err := db.ReadSQL().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Use one read snapshot so retention cannot silently change which rows
+	// belong to later batches while the caller verifies the earlier ones.
+	var after int64
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM checkpoints boundary WHERE worktree_id=? AND seq<? AND
  (observed_ref<>? OR observed_head<>? OR reason NOT IN ('watch','poll','hint','manual_barrier')
- OR EXISTS(SELECT 1 FROM checkpoint_events ce WHERE ce.checkpoint_id=boundary.id))),0)
- AND observed_ref=? AND observed_head=? AND phase='completed' AND retained=1 AND coverage_complete=1
- AND reason IN ('watch','poll','hint','manual_barrier')
- AND NOT EXISTS(SELECT 1 FROM checkpoint_events ce WHERE ce.checkpoint_id=checkpoints.id)
- ORDER BY seq LIMIT ?`, target.WorktreeID, target.Seq, target.WorktreeID, target.Seq,
-		target.ObservedRef, target.ObservedHead, target.ObservedRef, target.ObservedHead, FinishCheckpointLimit+1)
+ OR EXISTS(SELECT 1 FROM checkpoint_events ce WHERE ce.checkpoint_id=boundary.id))`,
+		target.WorktreeID, target.Seq, target.ObservedRef, target.ObservedHead).Scan(&after)
+	if err != nil {
+		return err
+	}
+	for {
+		batch, err := finishCheckpointBatch(ctx, tx, target, after)
+		if err != nil {
+			return err
+		}
+		for _, cp := range batch {
+			if err := visit(cp); err != nil {
+				return err
+			}
+		}
+		if len(batch) < finishCheckpointBatchSize {
+			return nil
+		}
+		after = batch[len(batch)-1].Seq
+	}
+}
+
+func finishCheckpointBatch(ctx context.Context, tx *sql.Tx, target Checkpoint, after int64) ([]Checkpoint, error) {
+	rows, err := tx.QueryContext(ctx, checkpointSelect+` WHERE worktree_id=? AND seq>? AND seq<?
+ AND phase='completed' AND retained=1 AND coverage_complete=1 ORDER BY seq LIMIT ?`,
+		target.WorktreeID, after, target.Seq, finishCheckpointBatchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -30,11 +59,5 @@ func FinishCheckpoints(ctx context.Context, db *DB, target Checkpoint) ([]Checkp
 		}
 		result = append(result, cp)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if len(result) > FinishCheckpointLimit {
-		return nil, fmt.Errorf("finish: more than %d current checkpoints; recorded planning evidence is too large; choose Local for a complete offline batch", FinishCheckpointLimit)
-	}
-	return result, nil
+	return result, rows.Err()
 }

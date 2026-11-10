@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Read Intent checkpoints in batches so a branch with more than 256 saved
+  checkpoints can finish. Verify the complete commit chain before publishing it
+  in one branch update.
 - Simplify Intent verification, error handling and finish guidance.
   Use one candidate verifier and keep preview flags with their commands,
   preserving checks, deadlines and command output.
