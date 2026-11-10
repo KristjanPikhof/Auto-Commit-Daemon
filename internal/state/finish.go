@@ -14,14 +14,15 @@ import (
 )
 
 const (
-	FinishRecordedSourceVersion = 6
-	FinishVersion               = FinishRecordedSourceVersion
-	FinishRunning               = "running"
-	FinishPrepared              = "prepared"
-	FinishCompleted             = "completed"
-	FinishFailed                = "failed"
-	FinishNeedsAttention        = "needs_attention"
-	FinishJSONByteCap           = 8 << 20
+	FinishRecordedSourceVersion   = 6
+	FinishRecordedGroupingVersion = 7
+	FinishVersion                 = FinishRecordedGroupingVersion
+	FinishRunning                 = "running"
+	FinishPrepared                = "prepared"
+	FinishCompleted               = "completed"
+	FinishFailed                  = "failed"
+	FinishNeedsAttention          = "needs_attention"
+	FinishJSONByteCap             = 8 << 20
 )
 
 var (

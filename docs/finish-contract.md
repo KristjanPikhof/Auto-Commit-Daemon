@@ -154,6 +154,9 @@ with the checked plan; older requests keep their accepted version rules.
 The final candidate tree must equal the entire frozen target exactly, including
 unchanged entries, file modes, deletions, renames, symlinks, and binary objects.
 Coverage and equality are structural evidence, not proof that project tests ran.
+Starting with version seven, requests limited to whole saved versions can keep
+inseparable edits together in the smallest complete commit. The plan still
+needs useful boundaries for the rest of the work and the same structural proof.
 
 One Intent attempt allows at most 128 evidence-review calls, one global planning
 call, and at most one global correction within one persisted `ai.timeout`

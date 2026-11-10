@@ -36,14 +36,18 @@ Some exact selections refine a recorded file transition. Finish all selections f
 		return finishSourcePrompt
 	}
 	if len(request.HistoryCommits) == 0 {
+		prompt := finishSystemPrompt
+		if request.GroupIndivisibleVersions {
+			prompt = strings.Replace(prompt, finishStrictBoundaries, finishWholeVersionBoundaries, 1)
+		}
 		if request.RefineRecorded {
-			return finishSystemPrompt + finishSmallStepsPrompt + `
+			return prompt + finishSmallStepsPrompt + `
 If a recorded version combines independent outcomes and blocks a useful split, include its exact change ID from changes in blocked_reason. ACD can offer exact lines for that version in the correction.`
 		}
 		if request.ReviewLineTarget > 0 && request.Message == "" {
-			return finishSystemPrompt + finishSmallStepsPrompt
+			return prompt + finishSmallStepsPrompt
 		}
-		return finishSystemPrompt
+		return prompt
 	}
 	return finishSystemPrompt + `
 This request is an explicit messages-only history rewrite. Keep every history_commits record in its original order, including empty and net-neutral commits. Return exactly one goal for each original commit. Its change_ids must contain ONLY that original commit's id. Changes and recorded diffs provide context, not permission to regroup membership. Preserve authors and tree boundaries; only purpose, boundary and message are proposed. Explain the recorded change without inventing tests, verification, motivation, or file content.`
