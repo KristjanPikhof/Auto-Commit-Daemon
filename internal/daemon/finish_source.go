@@ -52,6 +52,93 @@ type finishSourcePreparation struct {
 	diffs []ai.FinishDiff
 }
 
+// Refine the named transition through the final version on its path so later
+// edits to either purpose can stay with that purpose. Preserve earlier
+// versions and all history on other paths.
+func prepareRecordedFinishSources(ctx context.Context, repo, targetTree string, evidence finish.Evidence, diffs []ai.FinishDiff, maxBytes int, reason string) (ai.FinishBoundaryRefinement, error) {
+	var result ai.FinishBoundaryRefinement
+	starts := make(map[string]finish.Change)
+	for _, change := range evidence.Changes {
+		if change.Provenance != "" && starts[change.Path].ID == "" && strings.Contains(reason, change.ID) {
+			starts[change.Path] = change
+			if len(starts) == 8 {
+				break
+			}
+		}
+	}
+	if len(starts) == 0 {
+		return result, nil
+	}
+	required := make(map[string]bool)
+	for _, change := range evidence.Changes {
+		for _, id := range change.DependsOn {
+			required[id] = true
+		}
+	}
+	// Skip paths where replacing versions would erase a recorded dependency,
+	// rename boundary or author boundary.
+	active := make(map[string]bool)
+	for _, change := range evidence.Changes {
+		start, ok := starts[change.Path]
+		if !ok {
+			continue
+		}
+		active[change.Path] = active[change.Path] || start.ID == change.ID
+		if active[change.Path] && (required[change.ID] || len(change.DependsOn) > 0 || change.AtomicGroup != "" || change.Author != start.Author) {
+			delete(starts, change.Path)
+		}
+	}
+	var selected finish.Evidence
+	for _, change := range evidence.Changes {
+		if starts[change.Path].ID == change.ID && change.Before != evidence.Target[change.Path] {
+			change.After, change.AfterTree = evidence.Target[change.Path], targetTree
+			selected.Changes = append(selected.Changes, change)
+		}
+	}
+	if len(selected.Changes) == 0 {
+		return result, nil
+	}
+	projectedDiffs, err := finishProviderDiffs(ctx, repo, "", targetTree, selected.Changes, true, maxBytes)
+	if err != nil {
+		return result, err
+	}
+	files, annotated, err := prepareFinishSources(ctx, repo, selected, projectedDiffs, maxBytes, true)
+	if err != nil || len(files) == 0 {
+		return result, err
+	}
+	byID := make(map[string]finish.Change)
+	for _, change := range selected.Changes {
+		byID[change.ID] = change
+	}
+	refined := make(map[string]finish.Change)
+	for _, file := range files {
+		refined[file.ChangeID] = byID[file.ChangeID]
+	}
+	result = ai.FinishBoundaryRefinement{Evidence: finish.Evidence{Base: evidence.Base, Target: evidence.Target}, Files: files, Replaced: make(map[string]string)}
+	replacedPath := make(map[string]string)
+	for _, change := range evidence.Changes {
+		if replacement, ok := refined[change.ID]; ok {
+			replacedPath[change.Path] = change.ID
+			result.Evidence.Changes = append(result.Evidence.Changes, replacement)
+		} else if id := replacedPath[change.Path]; id != "" {
+			result.Replaced[change.ID] = id
+		} else {
+			result.Evidence.Changes = append(result.Evidence.Changes, change)
+		}
+	}
+	for _, diff := range diffs {
+		if _, ok := refined[diff.ChangeID]; !ok && result.Replaced[diff.ChangeID] == "" {
+			result.Diffs = append(result.Diffs, diff)
+		}
+	}
+	for _, diff := range annotated {
+		if _, ok := refined[diff.ChangeID]; ok {
+			result.Diffs = append(result.Diffs, diff)
+		}
+	}
+	return result, nil
+}
+
 func sourceProof(evidence finish.Evidence, files []finish.SourceFile, selections []finish.Goal) *finishSourceProof {
 	proof := &finishSourceProof{Version: 1, Selections: selections}
 	byID := make(map[string]finish.Change)

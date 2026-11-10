@@ -66,7 +66,7 @@ are informational, and tests and required callers stay with their behavior.
 
 Size and project-check failures share the same single correction and deadline.
 ACD checks the complete corrected chain before publication. This policy applies
-to version-five generated Intent requests; older frozen requests, Local batches,
+to generated Intent requests from version five onward. Older frozen requests, Local batches,
 exact messages and messages-only history rewrites keep their existing rules.
 The size check enforces an explanation, not proof that the explanation is true.
 
@@ -105,20 +105,22 @@ integration. When an exact target line connects a feature to a new layout, the
 later UI goal may own that connection without taking the feature implementation.
 ACD does not require an invented version of the old interface.
 
-When the available versions or source selections cannot separate independent
-purposes safely, the provider can return `blocked_reason` with no goals. Finish fails with
-the explanation and keeps the work protected. It does not combine unrelated
-behavior just to produce a commit. Finish coherent, verified milestones while
-working so their versions remain available for later planning. An unchanged
-retry cannot supply missing versions or missing context.
+When a recorded version combines independent changes, Intent can name that
+version in its first reply. For new requests with approved `fast` or `full`
+checks, ACD can offer exact lines from before that change through the final
+saved version of the file in the one correction call. This lets later fixes
+stay with the change they fix. ACD keeps the other recorded changes and the
+completed evidence reviews.
+ACD checks every proposed commit and verifies that the chain reproduces the
+frozen target before updating the branch.
 
-If a new request still reports missing boundaries after correction, start a new
-finish with usable evidence. For final-only changes without project checks,
-approve a repository command and select `fast` or `full` in `acd config` first.
-Otherwise, finish smaller completed milestones while their versions are
-available. An earlier saved version can contain a useful refactor that final
-source lines cannot reconstruct, so checked requests retain those versions
-instead of discarding them to enable line selection.
+If the correction still cannot separate the changes safely, finish explains
+the problem and keeps the work protected. A new finish can use newly approved
+checks or checkpoints that capture smaller completed steps.
+
+Approve a repository command and select `fast` or `full` in `acd config` to
+let new requests construct and check intermediate versions. Earlier requests
+keep their original planning rules and frozen evidence on retry.
 
 Completion context is optional for readable code changes. It may span paragraphs
 with the problem, decisions, constraints and rejected alternatives. Intent reads

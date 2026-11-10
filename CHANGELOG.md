@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Let checked Intent finishes split a named recorded file version by exact
+  lines in the existing correction call when it blocks independent commits.
+  Keep other recorded changes and completed reviews, and verify the full chain.
 - Show checkpoint scan totals and retained versions during Intent finish.
   Distinguish evidence preparation, planning, commit checks, and publication,
   and explain when the Intent attempt runs out of time.

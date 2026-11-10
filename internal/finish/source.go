@@ -22,7 +22,7 @@ type SourceEdit struct {
 	AfterLine  int
 }
 
-// SourceFile binds a complete edit catalogue to one frozen net change. Modes,
+// SourceFile binds a complete edit catalogue to one frozen change. Modes,
 // paths, authors and object identities come from that change, not the planner.
 type SourceFile struct {
 	ChangeID string
@@ -43,7 +43,6 @@ type SourcePlan struct {
 }
 
 type sourceFile struct {
-	change Change
 	before [][]byte
 	after  [][]byte
 	edits  []SourceEdit
@@ -53,18 +52,25 @@ type sourceFile struct {
 // cannot accept new code, omit surviving edits, cross authors, or split renames.
 // Files without a source catalogue remain indivisible recorded changes.
 func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (SourcePlan, error) {
+	for _, change := range evidence.Changes {
+		if len(change.DependsOn) != 0 || change.Before != evidence.Base[change.Path] || change.After != evidence.Target[change.Path] {
+			return SourcePlan{}, planError("source selections require frozen net changes")
+		}
+	}
+	return BuildRecordedSourcePlan(evidence, files, goals)
+}
+
+// BuildRecordedSourcePlan replays whole recorded versions and selected lines in
+// the same chain. A partly selected version must finish before its successor.
+func BuildRecordedSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (SourcePlan, error) {
 	if err := ValidateEvidence(evidence); err != nil {
 		return SourcePlan{}, err
 	}
 	original := make(map[string]Change)
-	byPath := make(map[string]Change)
 	catalogue := make(map[string]Change)
-	for _, change := range evidence.Changes {
-		if _, exists := byPath[change.Path]; exists || len(change.DependsOn) != 0 ||
-			change.Before != evidence.Base[change.Path] || change.After != evidence.Target[change.Path] {
-			return SourcePlan{}, planError("source selections require frozen net changes")
-		}
-		original[change.ID], byPath[change.Path], catalogue[change.ID] = change, change, change
+	order := make(map[string]int)
+	for i, change := range evidence.Changes {
+		original[change.ID], catalogue[change.ID], order[change.ID] = change, change, i
 	}
 	sources := make(map[string]sourceFile)
 	for _, file := range files {
@@ -72,8 +78,8 @@ func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (Sourc
 		if !ok {
 			return SourcePlan{}, planError("unknown source change %q", file.ChangeID)
 		}
-		if _, exists := sources[change.Path]; exists {
-			return SourcePlan{}, planError("duplicate source file %q", change.Path)
+		if _, exists := sources[change.ID]; exists {
+			return SourcePlan{}, planError("duplicate source change %q", change.ID)
 		}
 		created := change.Before == (Entry{})
 		if change.AtomicGroup != "" || (change.After.Mode != "100644" && change.After.Mode != "100755") ||
@@ -85,7 +91,7 @@ func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (Sourc
 			(!created && sourceBlobOID(file.Before, len(change.Before.OID)) != change.Before.OID) || sourceBlobOID(file.After, len(change.After.OID)) != change.After.OID {
 			return SourcePlan{}, planError("source bytes do not match the frozen objects for %q", change.Path)
 		}
-		source := sourceFile{change: change, before: sourceLines(file.Before), after: sourceLines(file.After), edits: file.Edits}
+		source := sourceFile{before: sourceLines(file.Before), after: sourceLines(file.After), edits: file.Edits}
 		deletions, insertions := make(map[int]bool), make(map[int]bool)
 		delete(catalogue, change.ID)
 		for _, edit := range file.Edits {
@@ -118,10 +124,10 @@ func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (Sourc
 		for _, edit := range file.Edits {
 			all[edit.ID] = true
 		}
-		if !bytes.Equal(source.compose(all), file.After) {
+		if len(all) == 0 || !bytes.Equal(source.compose(all), file.After) {
 			return SourcePlan{}, planError("source edits do not reproduce the frozen target for %q", change.Path)
 		}
-		sources[change.Path] = source
+		sources[change.ID] = source
 	}
 	used := make(map[string]bool)
 	for _, goal := range goals {
@@ -137,10 +143,16 @@ func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (Sourc
 	}
 	result := SourcePlan{Evidence: Evidence{Base: CloneTree(evidence.Base), Target: CloneTree(evidence.Target)}, Blobs: make(map[string][]byte)}
 	current, selected := CloneTree(evidence.Base), make(map[string]bool)
+	lastVersion := make(map[string]int)
+	partial := make(map[string]string)
+	applied := make(map[string]int)
+	atomicOwners := make(map[string]int)
 	var derivedGoals []Goal
 	for index, goal := range goals {
 		previous := CloneTree(current)
-		touched := make(map[string]bool)
+		touched := make(map[string]Change)
+		counts := make(map[string]int)
+		var ordered []Change
 		var author string
 		for n, id := range goal.ChangeIDs {
 			change := catalogue[id]
@@ -149,29 +161,56 @@ func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (Sourc
 			}
 			author = change.Author
 			selected[id] = true
-			if _, exists := sources[change.Path]; exists {
-				touched[change.Path] = true
+			if counts[change.ID] == 0 {
+				ordered = append(ordered, change)
+			}
+			counts[change.ID]++
+		}
+		sort.Slice(ordered, func(i, j int) bool { return order[ordered[i].ID] < order[ordered[j].ID] })
+		for _, change := range ordered {
+			if order[change.ID] < lastVersion[change.Path] || (partial[change.Path] != "" && partial[change.Path] != change.ID) {
+				return SourcePlan{}, planError("recorded version order changed for %q", change.Path)
+			}
+			for _, prerequisite := range change.DependsOn {
+				if applied[prerequisite] == 0 || applied[prerequisite] < len(sources[prerequisite].edits) {
+					return SourcePlan{}, planError("change %q is missing prerequisite %q", change.ID, prerequisite)
+				}
+			}
+			if group := change.AtomicGroup; group != "" {
+				if owner, exists := atomicOwners[group]; exists && owner != index {
+					return SourcePlan{}, planError("atomic group %q was split", group)
+				}
+				atomicOwners[group] = index
+			}
+			if source, exists := sources[change.ID]; exists {
+				if applied[change.ID] == 0 && current[change.Path] != change.Before {
+					return SourcePlan{}, planError("source selection %q needs its recorded starting version", change.ID)
+				}
+				content := source.compose(selected)
+				oid := sourceBlobOID(content, len(change.After.OID))
+				current[change.Path] = Entry{Mode: change.After.Mode, OID: oid}
+				if oid != change.Before.OID && oid != change.After.OID {
+					result.Blobs[oid] = content
+				}
+				partial[change.Path] = change.ID
+				if applied[change.ID]+counts[change.ID] == len(source.edits) {
+					delete(partial, change.Path)
+				}
 			} else {
 				if err := apply(current, change); err != nil {
 					return SourcePlan{}, err
 				}
 			}
-		}
-		for path := range touched {
-			source := sources[path]
-			content := source.compose(selected)
-			oid := sourceBlobOID(content, len(source.change.After.OID))
-			current[path] = Entry{Mode: source.change.After.Mode, OID: oid}
-			if oid != source.change.Before.OID && oid != source.change.After.OID {
-				result.Blobs[oid] = content
-			}
+			applied[change.ID] += counts[change.ID]
+			lastVersion[change.Path] = order[change.ID]
+			touched[change.Path] = change
 		}
 		selection := goal
 		selection.ChangeIDs = append([]string(nil), goal.ChangeIDs...)
 		result.Selections = append(result.Selections, selection)
 		goal.ChangeIDs = nil
 		for n, change := range NetChanges(previous, current, author) {
-			origin := byPath[change.Path]
+			origin := touched[change.Path]
 			change.ID = fmt.Sprintf("source-step-%d-%d", index+1, n+1)
 			change.Author = origin.Author
 			change.AtomicGroup = origin.AtomicGroup

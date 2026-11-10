@@ -154,9 +154,10 @@ Local creates one offline batch with optional context. Intent
 plans goals before assigning paths. Implementation, callers, tests, generated
 output, and relevant docs stay together when they complete one goal. A split
 needs a useful review or revert boundary and a valid intermediate tree.
-With approved project checks, a new final-only Intent request can also split
-existing text files using exact frozen lines. Every intermediate commit must
-pass before the branch moves. See the [Intent flow](docs/intent-commit-flow.md).
+With approved project checks, Intent can use exact frozen lines to split
+eligible text changes. This includes a recorded version that blocks a split
+between independent changes. Every intermediate commit must pass before the
+branch moves. See the [Intent flow](docs/intent-commit-flow.md).
 
 Intent reviews large evidence in bounded batches, then makes one global
 planning call and at most one correction within its saved deadline. For large

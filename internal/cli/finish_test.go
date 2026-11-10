@@ -165,6 +165,7 @@ func TestFinishCLIBoundaryFailureExplainsNewRequest(t *testing.T) {
 		name                               string
 		source, configure, staged, preview bool
 		checkpoints                        []state.FinishCheckpoint
+		version                            int
 	}{
 		{name: "unchecked final files", configure: true},
 		{name: "unchecked staged preview", configure: true, staged: true, preview: true},
@@ -172,6 +173,7 @@ func TestFinishCLIBoundaryFailureExplainsNewRequest(t *testing.T) {
 		{name: "checked staged preview", source: true, staged: true, preview: true},
 		{name: "retained versions", checkpoints: []state.FinishCheckpoint{{ID: "earlier"}}},
 		{name: "retained preview", checkpoints: []state.FinishCheckpoint{{ID: "earlier"}}, preview: true},
+		{name: "new unchecked recorded versions", configure: true, checkpoints: []state.FinishCheckpoint{{ID: "earlier"}}, version: state.FinishVersion},
 	} {
 		for _, jsonOut := range []bool{false, true} {
 			format := "human"
@@ -182,7 +184,7 @@ func TestFinishCLIBoundaryFailureExplainsNewRequest(t *testing.T) {
 				r := state.FinishRequest{
 					ID: "finish-boundaries", DryRun: scenario.preview, State: state.FinishFailed,
 					ReasonCode: "provider_boundaries_unavailable", Reason: "The saved versions combine independent changes.",
-					Target: state.FinishTarget{Mode: "intent", CheckpointID: "saved", SourceSelection: scenario.source, Checkpoints: scenario.checkpoints, IncludeStaged: scenario.staged},
+					Target: state.FinishTarget{Version: scenario.version, Mode: "intent", CheckpointID: "saved", SourceSelection: scenario.source, Checkpoints: scenario.checkpoints, IncludeStaged: scenario.staged},
 				}
 				var out bytes.Buffer
 				err := renderFinish(&out, lookup, r, jsonOut, "")

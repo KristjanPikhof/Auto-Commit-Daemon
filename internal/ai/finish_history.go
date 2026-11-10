@@ -26,12 +26,20 @@ func finishPrompt(request FinishPlanRequest) string {
 		return finishReviewPrompt
 	}
 	if len(request.SourceEdits) > 0 {
+		if request.RefineRecorded {
+			return finishSourcePrompt + finishSmallStepsPrompt + `
+Some exact selections refine a recorded file transition. Finish all selections for that transition before advancing the same path to its next recorded version. Preserve prerequisite order and assign each unrefined recorded change as a whole.`
+		}
 		if request.ReviewLineTarget > 0 && request.Message == "" {
 			return finishSourcePrompt + finishSmallStepsPrompt
 		}
 		return finishSourcePrompt
 	}
 	if len(request.HistoryCommits) == 0 {
+		if request.RefineRecorded {
+			return finishSystemPrompt + finishSmallStepsPrompt + `
+If a recorded version combines independent outcomes and blocks a useful split, include its exact change ID from changes in blocked_reason. ACD can offer exact lines for that version in the correction.`
+		}
 		if request.ReviewLineTarget > 0 && request.Message == "" {
 			return finishSystemPrompt + finishSmallStepsPrompt
 		}

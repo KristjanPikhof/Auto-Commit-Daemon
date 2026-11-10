@@ -238,9 +238,16 @@ func sourceDiagnosticSelections(failure *SourceCheckFailure, plan finish.SourceP
 	return ids
 }
 
-func finishSourceCatalogue(evidence finish.Evidence, files []finish.SourceFile) ([]FinishSourceEdit, []finish.Change, error) {
+func (options FinishOptions) buildSourcePlan(evidence finish.Evidence, goals []finish.Goal) (finish.SourcePlan, error) {
+	if options.RefineBoundary != nil {
+		return finish.BuildRecordedSourcePlan(evidence, options.SourceFiles, goals)
+	}
+	return finish.BuildSourcePlan(evidence, options.SourceFiles, goals)
+}
+
+func (options FinishOptions) sourceCatalogue(evidence finish.Evidence) ([]FinishSourceEdit, []finish.Change, error) {
 	byChange := make(map[string]finish.SourceFile)
-	for _, file := range files {
+	for _, file := range options.SourceFiles {
 		if _, exists := byChange[file.ChangeID]; exists {
 			return nil, nil, fmt.Errorf("duplicate source catalogue %q", file.ChangeID)
 		}
@@ -264,7 +271,7 @@ func finishSourceCatalogue(evidence finish.Evidence, files []finish.SourceFile) 
 		}
 	}
 	// Prove the entire local catalogue before spending a provider call.
-	_, err := finish.BuildSourcePlan(evidence, files, []finish.Goal{{Purpose: "Validate frozen source selections", Message: "Validate frozen source selections", ChangeIDs: ids}})
+	_, err := options.buildSourcePlan(evidence, []finish.Goal{{Purpose: "Validate frozen source selections", Message: "Validate frozen source selections", ChangeIDs: ids}})
 	return edits, catalogue, err
 }
 

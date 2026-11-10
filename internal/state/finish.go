@@ -14,13 +14,14 @@ import (
 )
 
 const (
-	FinishVersion        = 5
-	FinishRunning        = "running"
-	FinishPrepared       = "prepared"
-	FinishCompleted      = "completed"
-	FinishFailed         = "failed"
-	FinishNeedsAttention = "needs_attention"
-	FinishJSONByteCap    = 8 << 20
+	FinishRecordedSourceVersion = 6
+	FinishVersion               = FinishRecordedSourceVersion
+	FinishRunning               = "running"
+	FinishPrepared              = "prepared"
+	FinishCompleted             = "completed"
+	FinishFailed                = "failed"
+	FinishNeedsAttention        = "needs_attention"
+	FinishJSONByteCap           = 8 << 20
 )
 
 var (
@@ -33,8 +34,9 @@ var (
 
 // FinishTarget is immutable across attempts. TargetRef pins the complete finish tree;
 // the source checkpoint remains the proof of the original worktree bytes.
-// Version five adds measured review sizes for generated Intent commits. Older
-// requests keep their original planning and verification contract on retry.
+// Version five adds measured review sizes. Version six can refine a blocked
+// recorded version with approved project checks. Older requests keep their
+// original planning and verification contract on retry.
 type FinishTarget struct {
 	Version         int    `json:"version"`
 	RepositoryID    string `json:"repository_id"`
@@ -54,8 +56,9 @@ type FinishTarget struct {
 	Purpose         string `json:"purpose,omitempty"`
 	Message         string `json:"message,omitempty"`
 
-	Checkpoints     []FinishCheckpoint `json:"checkpoints,omitempty"`
-	SourceSelection bool               `json:"source_selection,omitempty"`
+	Checkpoints             []FinishCheckpoint `json:"checkpoints,omitempty"`
+	SourceSelection         bool               `json:"source_selection,omitempty"`
+	RecordedSourceSelection bool               `json:"recorded_source_selection,omitempty"`
 }
 
 // FinishCheckpoint pins an exact recorded version independently of checkpoint
@@ -205,6 +208,9 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 		return "", ErrFinishIdentity
 	}
 	if target.SourceSelection && (target.Version < 3 || target.Mode != "intent" || target.Message != "" || len(target.Checkpoints) > 0) {
+		return "", ErrFinishIdentity
+	}
+	if target.RecordedSourceSelection && (target.Version < FinishRecordedSourceVersion || len(target.Checkpoints) == 0) {
 		return "", ErrFinishIdentity
 	}
 	seen := make(map[string]bool)
