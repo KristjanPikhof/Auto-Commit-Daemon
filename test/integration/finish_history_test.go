@@ -185,3 +185,36 @@ func TestFinishWorkflowHistoryPurposefulGoalsAndStaleRefusal(t *testing.T) {
 		t.Fatal("refused apply mutated saved plan")
 	}
 }
+
+func TestFinishWorkflowHistoryKeepsNewerMerge(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	f := newFinishFixture(t)
+	writeFile(t, filepath.Join(f.Repo, "selected.txt"), "selected completed change\n")
+	runGitOK(t, f.Repo, "add", "selected.txt")
+	runGitOK(t, f.Repo, "commit", "-qm", "Preserve selected change")
+	selected := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	runGitOK(t, f.Repo, "switch", "-c", "side", f.BaseHead)
+	writeFile(t, filepath.Join(f.Repo, "side.txt"), "independent side branch\n")
+	runGitOK(t, f.Repo, "add", "side.txt")
+	runGitOK(t, f.Repo, "commit", "-qm", "Preserve independent feature")
+	side := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	runGitOK(t, f.Repo, "switch", "main")
+	runGitOK(t, f.Repo, "merge", "--no-ff", "-m", "Merge independent feature", "side")
+	head := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	tree := runGitOK(t, f.Repo, "rev-parse", "HEAD^{tree}")
+	f.Barrier(t, ctx)
+	planPath := filepath.Join(t.TempDir(), "merge.json")
+	var plan state.IntentHistoryPlan
+	finishDecodeJSON(t, f.Run(t, ctx, "history", "rewrite", "--range-sha", f.BaseHead+".."+selected, "--plan-only", "--plan-out", planPath, "--json"), &plan)
+	if result := f.Run(t, ctx, "history", "rewrite", "--apply", planPath, "--yes"); result.ExitCode != 0 {
+		t.Fatalf("apply below newer merge: %+v", result)
+	}
+	parents := strings.Fields(runGitOK(t, f.Repo, "show", "-s", "--format=%P", "HEAD"))
+	if len(parents) != 2 || parents[1] != side || parents[0] == selected || runGitOK(t, f.Repo, "rev-parse", "HEAD^{tree}") != tree {
+		t.Fatal("history apply flattened the merge or changed final files")
+	}
+	if backup := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "refs/acd/rewrite-backups/"+plan.ID)); backup != head {
+		t.Fatal("original merge was not backed up")
+	}
+}

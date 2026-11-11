@@ -248,6 +248,56 @@ func TestFinishHistoryCompactPlanFitsWorkerMessage(t *testing.T) {
 	}
 }
 
+func TestFinishHistoryRewritePreservesNewerMerge(t *testing.T) {
+	f, w := finishSizeFixture(t)
+	base := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
+	finishWorkerGit(t, f.dir, "add", "routes.txt", "errors.txt")
+	finishWorkerGit(t, f.dir, "commit", "-m", "Add combined reference tables")
+	selected := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
+	finishWorkerGit(t, f.dir, "switch", "-c", "feature", base)
+	side := mustCommitPath(t, f.dir, "feature.txt", "independent merged feature\n", "Add independent feature")
+	finishWorkerGit(t, f.dir, "switch", "main")
+	finishWorkerGit(t, f.dir, "merge", "--no-ff", "-m", "Merge independent feature", "feature")
+	merge := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
+	tree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}")
+	if err := git.ValidateIntentHistoryChain(t.Context(), f.dir, []string{base}, []string{selected, merge}); err == nil || !strings.Contains(err.Error(), "retains selected commits") {
+		t.Fatal("rewrite accepted selected history retained through the side branch", err)
+	}
+	selection, err := git.ResolveRewriteSelection(t.Context(), f.dir, git.RewriteSelectionOptions{GitRange: base + ".." + selected})
+	if err != nil || len(selection.Selected) != 1 || len(selection.RecreateUnchanged) != 1 {
+		t.Fatalf("cannot select work beneath newer merge: %+v %v", selection, err)
+	}
+	transport := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		return json.Marshal(map[string]any{"goals": finishSizeGoals(request, request.Partition != nil)})
+	}}
+	w.Config.Mode, w.Config.Provider.DiffEgress = "intent", true
+	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{selected}, []string{merge}, transport,
+		FinishHistoryOptions{Mode: "intent", Style: "imperative", DiffEgress: true, Deadline: time.Now().Add(time.Minute), VerificationConfigDigest: w.Config.ConfigDigest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := historyStartTest(t, w, plan, false)
+	completed, err := w.ExecuteFinishHistoryRequest(t.Context(), plan, r)
+	if err != nil || completed.Status != "completed" {
+		t.Fatalf("rewrite below newer merge failed: %s %v", completed.Status, err)
+	}
+	parents := strings.Fields(finishWorkerGit(t, f.dir, "show", "-s", "--format=%P", "HEAD"))
+	if len(parents) != 2 || parents[1] != side || parents[0] == selected ||
+		finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}") != tree ||
+		finishWorkerGit(t, f.dir, "show", "-s", "--format=%B", "HEAD") != "Merge independent feature" ||
+		finishWorkerGit(t, f.dir, "rev-parse", "feature") != side {
+		t.Fatal("replayed merge changed its side history, message or final files")
+	}
+	var proof state.FinishHistoryProof
+	if json.Unmarshal(completed.Proof, &proof) != nil || proof.Version != 2 {
+		t.Fatal("merge-aware publication proof was not saved")
+	}
+	proof.Version = 1
+	if err := git.ValidateFinishHistoryProof(t.Context(), f.dir, proof); err == nil {
+		t.Fatal("older linear proof accepted merge parents")
+	}
+}
+
 func TestFinishHistoryRewriteVerificationFailureAndFrozenIndex(t *testing.T) {
 	for _, scenario := range []string{"verification_failure", "later_staging", "expired_deadline"} {
 		t.Run(scenario, func(t *testing.T) {
