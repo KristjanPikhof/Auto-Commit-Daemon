@@ -202,6 +202,7 @@ func showIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan
 }
 
 func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, dryRun bool, timeout time.Duration) error {
+	fmt.Fprintf(out, "Checking %d reviewed commit trees and %d later commits.\n", len(plan.Goals), len(plan.RecreateUnchanged))
 	if err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
 		return err
 	}
