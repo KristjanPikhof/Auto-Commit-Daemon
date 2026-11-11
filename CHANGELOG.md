@@ -18,6 +18,9 @@
 
 ### Changed
 
+- Fill omitted files in large Intent plans in bounded batches using the
+  existing goals and saved reviews. Report assignment progress separately
+  from review and global planning.
 - Let Intent assign whole files and coherent directories in one selection.
   ACD expands the selections and checks coverage before verifying the chain.
   A provider's uncertainty about coverage no longer appears as a proven

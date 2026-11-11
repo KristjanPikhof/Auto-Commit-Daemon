@@ -72,6 +72,17 @@ func namesRecordedConflict(changes []finish.Change, ids []string) bool {
 // Point out unassigned files in the correction. Build still proves partial
 // assignments and omitted neutral cycles against the complete frozen target.
 func finishPathCoverage(evidence finish.Evidence, goals []finish.Goal) error {
+	missing := unassignedFinishPaths(evidence, goals)
+	if len(missing) > 0 {
+		for i, path := range missing {
+			missing[i] = fmt.Sprintf("%q", path)
+		}
+		return fmt.Errorf("no goal covers these changed files: %s; assign each using path_ownership or exact change IDs", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func unassignedFinishPaths(evidence finish.Evidence, goals []finish.Goal) []string {
 	selected := map[string]bool{}
 	for _, goal := range goals {
 		for _, id := range goal.ChangeIDs {
@@ -88,11 +99,8 @@ func finishPathCoverage(evidence finish.Evidence, goals []finish.Goal) error {
 	for _, change := range evidence.Changes {
 		if !covered[change.Path] && evidence.Base[change.Path] != evidence.Target[change.Path] {
 			covered[change.Path] = true
-			missing = append(missing, fmt.Sprintf("%q", change.Path))
+			missing = append(missing, change.Path)
 		}
 	}
-	if len(missing) > 0 {
-		return fmt.Errorf("no goal covers these changed files: %s; assign each using path_ownership or exact change IDs", strings.Join(missing, ", "))
-	}
-	return nil
+	return missing
 }

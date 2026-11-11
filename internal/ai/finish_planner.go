@@ -64,6 +64,7 @@ type FinishPlanRequest struct {
 	DiffIncluded             bool                      `json:"diff_included"`
 	Correction               *FinishCorrection         `json:"correction,omitempty"`
 	Review                   *FinishReviewTask         `json:"evidence_review,omitempty"`
+	AssignPaths              *finishPathAssignmentTask `json:"assign_paths,omitempty"`
 	Reviews                  []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	HistoryCommits           []HistoryMessageCommit    `json:"history_commits,omitempty"`
 	SourceEdits              []FinishSourceEdit        `json:"source_edits,omitempty"`
@@ -104,11 +105,12 @@ type FinishOptions struct {
 	RequireCompletionContext bool
 	// BeforeCall consumes the worker-owned durable budget immediately before
 	// each actual exchange, including the optional combined correction.
-	BeforeCall         func(context.Context) error
-	BeforeEvidenceCall func(context.Context) error
-	ReviewIdentity     string
-	ReviewProgress     finish.ReviewProgress
-	SaveReviewProgress func(context.Context, finish.ReviewProgress) error
+	BeforeCall           func(context.Context) error
+	BeforeEvidenceCall   func(context.Context) error
+	BeforeAssignmentCall func(context.Context) error
+	ReviewIdentity       string
+	ReviewProgress       finish.ReviewProgress
+	SaveReviewProgress   func(context.Context, finish.ReviewProgress) error
 }
 
 type FinishBoundaryRefinement struct {
@@ -120,6 +122,7 @@ type FinishBoundaryRefinement struct {
 
 type FinishDisclosure struct {
 	EvidenceCalls        int                       `json:"evidence_calls,omitempty"`
+	AssignmentCalls      int                       `json:"assignment_calls,omitempty"`
 	EvidenceRequestBytes []int                     `json:"evidence_request_bytes,omitempty"`
 	EvidenceReviews      []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	ReusedFragments      int                       `json:"reused_fragments,omitempty"`
@@ -298,6 +301,12 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		var plan finish.Plan
 		var source *finish.SourcePlan
 		validationErr := exchangeErr
+		if validationErr == nil && request.AllowPathOwnership && len(request.Reviews) > 0 {
+			raw, err = completeFinishPathOwnership(ctx, transport, request, raw, evidence, options, &result.Disclosure)
+			if err != nil {
+				return result, err
+			}
+		}
 		if validationErr == nil {
 			plan, source, validationErr = validateFinishReply(raw, evidence, options)
 		}
@@ -524,18 +533,26 @@ func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOp
 	return plan, err
 }
 
-func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, *finish.SourcePlan, error) {
-	if !utf8.Valid(raw) {
-		return finish.Plan{}, nil, errors.New("provider output is not valid UTF-8")
-	}
+func decodeFinishPlanOutput(raw []byte) (finishPlanOutput, error) {
 	var output finishPlanOutput
+	if !utf8.Valid(raw) {
+		return output, errors.New("provider output is not valid UTF-8")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&output); err != nil {
-		return finish.Plan{}, nil, fmt.Errorf("decode finish goals: %w", err)
+		return output, fmt.Errorf("decode finish goals: %w", err)
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		return finish.Plan{}, nil, errors.New("provider output must contain exactly one JSON object")
+		return output, errors.New("provider output must contain exactly one JSON object")
+	}
+	return output, nil
+}
+
+func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, *finish.SourcePlan, error) {
+	output, decodeErr := decodeFinishPlanOutput(raw)
+	if decodeErr != nil {
+		return finish.Plan{}, nil, decodeErr
 	}
 	if strings.TrimSpace(output.BlockedReason) != "" {
 		if len(options.SourceFiles) > 0 {

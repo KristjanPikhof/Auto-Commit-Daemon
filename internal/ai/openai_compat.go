@@ -63,6 +63,17 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 				}}}},
 		})
 	}
+	if request.AssignPaths != nil {
+		return marshalFinishToolRequest(openAIToolRequestOptions{
+			Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
+			ToolName: "finish_assign_paths", ToolDescription: "Assign omitted files to existing commit goals",
+			Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"assignments"},
+				"properties": map[string]any{"assignments": map[string]any{"type": "array", "items": map[string]any{
+					"type": "object", "additionalProperties": false, "required": []string{"path", "goal"},
+					"properties": map[string]any{"path": map[string]any{"type": "string"}, "goal": map[string]any{"type": "integer"}},
+				}}}},
+		})
+	}
 	goal := map[string]any{
 		"type": "object", "additionalProperties": false,
 		"required": []string{"purpose", "boundary", "reason", "message", "change_ids"},
@@ -172,9 +183,12 @@ func (p *OpenAIProvider) ExchangeFinish(ctx context.Context, body []byte) ([]byt
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: finishHTTPErrorDetail(raw, p.APIKey)}
 	}
-	expectedTool := "finish_plan"
-	if sent.ToolChoice.Function.Name == "finish_evidence" || sent.ToolChoice.Name == "finish_evidence" {
-		expectedTool = "finish_evidence"
+	expectedTool := sent.ToolChoice.Function.Name
+	if responses {
+		expectedTool = sent.ToolChoice.Name
+	}
+	if expectedTool == "" {
+		expectedTool = "finish_plan"
 	}
 	parse := parseFinishToolArgumentsFor
 	if responses {

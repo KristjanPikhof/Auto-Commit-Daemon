@@ -158,8 +158,8 @@ never waive completeness checks. Judge the proposed commit tree, not the final
 worktree. Frozen request identity, author boundaries, and explicit history-rewrite safety
 limits still apply.
 
-An Intent attempt may review large evidence in at most 128 bounded calls, then
-make one global planning call and at most one global correction within one persisted
+An Intent attempt may use at most 128 bounded evidence review and file assignment
+calls, one global planning call, and at most one global correction within one persisted
 deadline. Source requests up to 128 KiB go directly to planning. Larger inputs
 receive bounded reviews of mechanisms and prerequisites; selectable code stays
 exact in the global request alongside those observations. Reviews cover complete
@@ -188,6 +188,9 @@ Version-eight whole-version plans can assign a literal file or directory to a
 goal. Expand against the frozen catalogue and keep the same coverage, version
 ordering, and verification checks. A provider refusal without exact conflicting
 change IDs is a planning failure.
+If a large reviewed proposal omits a whole file, assign it to an existing goal
+in a bounded call with its reviewed evidence. Keep existing assignments fixed.
+Unresolved omissions go through the same global correction and final checks.
 
 Client disconnect detaches from the accepted bounded job. Restart fails running
 planning retryably and recovers prepared publication without AI only through exact
