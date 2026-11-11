@@ -23,6 +23,8 @@
   from review and global planning.
 - Ignore empty path assignments in Intent replies and report the invalid goal
   number if a nonempty assignment cannot be used.
+- Use exact change assignments ahead of file and directory defaults. This
+  lets Intent split one file's versions while grouping its neighboring files.
 - Let Intent assign whole files and coherent directories in one selection.
   ACD expands the selections and checks coverage before verifying the chain.
   A provider's uncertainty about coverage no longer appears as a proven

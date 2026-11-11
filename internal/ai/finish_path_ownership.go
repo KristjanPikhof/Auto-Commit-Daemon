@@ -12,16 +12,15 @@ type finishPathOwnership struct {
 	Paths []string `json:"paths"`
 }
 
-// Selectors expand only against the frozen change catalogue. A directory ends
-// with a slash so similarly named files and directories cannot match it.
+// Selectors expand against the frozen catalogue. Explicit change IDs take
+// precedence over files, then the nearest matching directory supplies a default.
 func expandFinishPathOwnership(changes []finish.Change, goals []finish.Goal, assignments []finishPathOwnership) error {
-	byPath := make(map[string][]string)
+	known := make(map[string]bool)
 	for _, change := range changes {
-		byPath[change.Path] = append(byPath[change.Path], change.ID)
+		known[change.Path] = true
 		for i, b := range change.Path {
 			if b == '/' {
-				prefix := change.Path[:i+1]
-				byPath[prefix] = append(byPath[prefix], change.ID)
+				known[change.Path[:i+1]] = true
 			}
 		}
 	}
@@ -31,6 +30,7 @@ func expandFinishPathOwnership(changes []finish.Change, goals []finish.Goal, ass
 			selected[id] = true
 		}
 	}
+	owners := make(map[string]int)
 	for _, assignment := range assignments {
 		if len(assignment.Paths) == 0 {
 			continue
@@ -38,19 +38,32 @@ func expandFinishPathOwnership(changes []finish.Change, goals []finish.Goal, ass
 		if assignment.Goal < 1 || assignment.Goal > len(goals) {
 			return fmt.Errorf("path_ownership for %q names goal %d outside 1 through %d", assignment.Paths[0], assignment.Goal, len(goals))
 		}
-		goal := &goals[assignment.Goal-1]
 		for _, path := range assignment.Paths {
-			ids := byPath[path]
-			if len(ids) == 0 {
+			if !known[path] {
 				return fmt.Errorf("path_ownership selector %q matches no recorded changes", path)
 			}
-			for _, id := range ids {
-				if selected[id] {
-					return fmt.Errorf("path_ownership selector %q overlaps assigned change %q", path, id)
-				}
-				selected[id] = true
+			if prior := owners[path]; prior != 0 && prior != assignment.Goal {
+				return fmt.Errorf("path_ownership selector %q has conflicting goals %d and %d", path, prior, assignment.Goal)
 			}
-			goal.ChangeIDs = append(goal.ChangeIDs, ids...)
+			owners[path] = assignment.Goal
+		}
+	}
+	for _, change := range changes {
+		if selected[change.ID] {
+			continue
+		}
+		owner := owners[change.Path]
+		for prefix := change.Path; owner == 0; {
+			slash := strings.LastIndexByte(prefix, '/')
+			if slash < 0 {
+				break
+			}
+			owner = owners[prefix[:slash+1]]
+			prefix = prefix[:slash]
+		}
+		if owner != 0 {
+			goal := &goals[owner-1]
+			goal.ChangeIDs = append(goal.ChangeIDs, change.ID)
 		}
 	}
 	return nil

@@ -179,9 +179,10 @@ duplicate per-line coordinates and the full repeated ID list stay local.
 
 Whole-version plans can name a file or directory once when all its recorded
 changes belong to the same goal. Intent still names exact change IDs when a
-file has versions in different commits. ACD expands the assignments against
-the saved catalogue and rejects overlaps or missing changes. It orders the
-recorded prerequisites before building and checking the chain.
+file has versions in different commits. Exact change IDs take precedence over
+file assignments, and the most specific directory covers files left over. ACD
+rejects conflicting owners for the same selector and checks the complete
+coverage and prerequisite order before building the chain.
 If a large reviewed proposal leaves files unassigned, Intent can assign the
 omitted whole files to existing goals in batches of up to 16. These calls use
 the saved reviews and share the attempt's evidence call limit and deadline.

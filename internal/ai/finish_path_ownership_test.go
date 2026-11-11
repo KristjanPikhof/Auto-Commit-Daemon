@@ -22,7 +22,36 @@ func TestFinishPathOwnershipIgnoresEmptyEntries(t *testing.T) {
 	}
 }
 
-func TestFinishPathOwnershipRejectsOverlapAndMissingFiles(t *testing.T) {
+func TestFinishPathOwnershipUsesMostSpecificAssignment(t *testing.T) {
+	const gemini = "Assistant/AI/Services/GeminiService.swift"
+	changes := []finish.Change{
+		{ID: "checkpoint-35:" + gemini, Path: gemini},
+		{ID: "final:" + gemini, Path: gemini},
+		{ID: "provider", Path: "Assistant/AI/Services/OpenRouterService.swift"},
+		{ID: "settings", Path: "Assistant/AI/Settings.swift"},
+	}
+	goals := make([]finish.Goal, 4)
+	goals[0].ChangeIDs = []string{changes[0].ID}
+	assignments := []finishPathOwnership{
+		{Goal: 2, Paths: []string{"Assistant/AI/"}},
+		{Goal: 3, Paths: []string{"Assistant/AI/Services/"}},
+		{Goal: 4, Paths: []string{gemini, gemini}},
+	}
+	if err := expandFinishPathOwnership(changes, goals, assignments); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{changes[0].ID, "settings", "provider", changes[1].ID} {
+		if !slices.Equal(goals[i].ChangeIDs, []string{want}) {
+			t.Fatalf("goal %d owns %v, want %s", i+1, goals[i].ChangeIDs, want)
+		}
+	}
+	assignments = append(assignments, finishPathOwnership{Goal: 2, Paths: []string{gemini}})
+	if err := expandFinishPathOwnership(changes, goals, assignments); err == nil || !strings.Contains(err.Error(), "conflicting goals") {
+		t.Fatalf("conflicting identical selector passed: %v", err)
+	}
+}
+
+func TestFinishPathOwnershipRejectsUnknownAndMissingFiles(t *testing.T) {
 	evidence := finishTestEvidence()
 	evidence.Target["docs/guide.md"] = finishTestEntry("c")
 	evidence.Target["docs-extra/guide.md"] = finishTestEntry("d")
@@ -36,7 +65,6 @@ func TestFinishPathOwnershipRejectsOverlapAndMissingFiles(t *testing.T) {
 		paths []string
 		want  string
 	}{
-		{"overlap", []string{"docs/", "docs/guide.md"}, "overlaps assigned change"},
 		{"unknown", []string{"missing/"}, "matches no recorded changes"},
 		{"missing", []string{"docs/", "settings.go"}, "docs-extra/guide.md"},
 	} {
