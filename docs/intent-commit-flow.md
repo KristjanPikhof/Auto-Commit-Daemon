@@ -74,6 +74,12 @@ explanation. A split keeps the same complete target. Larger child groups are
 reviewed again. A group can stay large only after that focused review identifies
 the specific file and dependency that prevents a useful split. The reviewer
 still judges meaning from code, and ACD checks exact membership and tree safety.
+Focused reviews receive the exact approved diffs when they fit the request
+limit. Larger parents keep the complete validated observations; smaller child
+reviews can use the exact diffs again. A test file gaining checks for several
+features can accompany the last feature while earlier steps keep compatible
+existing tests. New test references and ordinary prerequisite order do not
+by themselves require one combined production commit.
 An invalid focused reply gets one correction with its exact validation error.
 Both calls share the existing evidence budget and deadline; transport failures
 stop the request.

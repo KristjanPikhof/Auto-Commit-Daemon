@@ -139,3 +139,93 @@ func TestFinishPartitionCorrectsMessagesWithinEvidenceBudget(t *testing.T) {
 		})
 	}
 }
+
+func TestFinishPartitionRechecksExactCodeAfterEvidenceReview(t *testing.T) {
+	for _, largeParent := range []bool{false, true} {
+		t.Run(fmt.Sprint("large_parent_", largeParent), func(t *testing.T) {
+			evidence := finishTestEvidence()
+			evidence.Target["retry.go"] = finishTestEntry("c")
+			evidence.Target["other.go"] = finishTestEntry("d")
+			evidence.Changes = finish.NetChanges(evidence.Base, evidence.Target, "author-a")
+			options := finishTestOptions(evidence)
+			options.ReviewLineTarget, options.PartitionOversized = 200, true
+			repetitions, lines := 7000, 120
+			if largeParent {
+				repetitions, lines = 12000, 300
+			}
+			text := strings.Repeat("+ old test calls remain valid\n", repetitions) + "+ final compatibility evidence\n"
+			for i := range options.Diffs {
+				options.Diffs[i].Text = text
+			}
+			options.MeasurePlan = func(_ context.Context, plan finish.Plan) ([]FinishStepSize, error) {
+				sizes := make([]FinishStepSize, len(plan.Steps))
+				for i, step := range plan.Steps {
+					sizes[i].ChangedLines = len(step.ChangeIDs) * lines
+				}
+				return sizes, nil
+			}
+			var exactCalls, summarizedCalls int
+			transport := &finishFakeTransport{exchange: func(_ context.Context, request FinishPlanRequest) ([]byte, error) {
+				if request.Review != nil {
+					var observations []map[string]string
+					for _, part := range request.Review.Parts {
+						observations = append(observations, map[string]string{"id": part.ID, "summary": "The test version adds checks for independently useful source interfaces."})
+					}
+					return json.Marshal(map[string]any{"observations": observations})
+				}
+				if request.Partition == nil {
+					goal := finishTestGoal(evidence)
+					goal.Boundary = "Keep the supplied settings and request interfaces available for review"
+					goal.ChangeIDs = nil
+					other := finishTestGoal(evidence)
+					other.Boundary = "Keep the independent source interface separately reviewable"
+					other.ChangeIDs = nil
+					for _, change := range request.Changes {
+						if change.Path == "other.go" {
+							other.ChangeIDs = append(other.ChangeIDs, change.ID)
+						} else {
+							goal.ChangeIDs = append(goal.ChangeIDs, change.ID)
+						}
+					}
+					return finishTestOutput(goal, other), nil
+				}
+				if len(request.Reviews) == 0 {
+					t.Fatal("focused review lost the complete validated observations")
+				}
+				if largeParent && len(request.Changes) == 2 {
+					summarizedCalls++
+					for _, diff := range request.Diffs {
+						if diff.Text != "" {
+							t.Fatal("oversized raw parent exceeded the bounded request")
+						}
+					}
+				} else {
+					exactCalls++
+					for _, diff := range request.Diffs {
+						if diff.Text != text {
+							t.Fatal("focused child lost exact compatibility evidence after the parent was summarized")
+						}
+					}
+				}
+				var goals []finish.Goal
+				for _, change := range request.Changes {
+					goal := finish.Goal{Purpose: "Preserve a compatible source interface", Boundary: "Keep the complete source interface independently reviewable", Reason: "Preserve existing test callers while adding the interface.", Message: "Preserve a compatible source interface\n\n- Preserve existing test callers while adding the interface.", ChangeIDs: []string{change.ID}}
+					if len(request.Changes) == 1 {
+						goal.LargeChangeReason = change.Path + " is the only complete supplied version."
+						goal.Message += "\n- " + goal.LargeChangeReason
+					}
+					goals = append(goals, goal)
+				}
+				return finishTestOutput(goals...), nil
+			}}
+			result, err := PlanFinish(t.Context(), transport, evidence, options)
+			wantExact, wantSummarized := 1, 0
+			if largeParent {
+				wantExact, wantSummarized = 3, 1
+			}
+			if err != nil || len(result.Plan.Steps) != 3 || result.Disclosure.EvidenceCalls == 0 || exactCalls != wantExact || summarizedCalls != wantSummarized {
+				t.Fatalf("exact split evidence: steps=%d exact=%d summarized=%d err=%v", len(result.Plan.Steps), exactCalls, summarizedCalls, err)
+			}
+		})
+	}
+}

@@ -86,7 +86,7 @@ func partitionFinishPlan(ctx context.Context, transport FinishTransport, request
 			return finish.Plan{}, err
 		}
 		focused := finishRequestForChanges(request, ids)
-		focused.Correction = nil
+		focused.ReferencedUnchangedPaths = request.ReferencedUnchangedPaths
 		focused.Changes = slices.Clone(subset.Changes)
 		for j := range focused.Changes {
 			focused.Changes[j].Provenance = ""
@@ -124,6 +124,7 @@ func partitionFinishPlan(ctx context.Context, transport FinishTransport, request
 // budget and deadline. It never consumes the global correction or retries a
 // transport failure.
 func reviewFinishPartition(ctx context.Context, transport FinishTransport, request FinishPlanRequest, evidence finish.Evidence, options FinishOptions, disclosure *FinishDisclosure) (finish.Plan, error) {
+	request.Diffs = slices.Clone(request.Diffs)
 	var validationErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		body, err := transport.EncodeFinishRequest(request)
@@ -134,7 +135,19 @@ func reviewFinishPartition(ctx context.Context, transport FinishTransport, reque
 		if err != nil {
 			return finish.Plan{}, err
 		}
-		if limit := min(inputLimit, FinishContextByteCap); len(body) > limit {
+		limit := min(inputLimit, FinishContextByteCap)
+		if len(body) > limit && len(request.Reviews) > 0 {
+			// Exact approved code is preferred. Oversized requests retain the
+			// complete validated observations, including on a correction.
+			for i := range request.Diffs {
+				request.Diffs[i].Text = ""
+			}
+			body, err = transport.EncodeFinishRequest(request)
+			if err != nil {
+				return finish.Plan{}, finishFailure("provider_input", err)
+			}
+		}
+		if len(body) > limit {
 			return finish.Plan{}, finishContextLimit(len(body), limit)
 		}
 		if disclosure.EvidenceCalls+disclosure.AssignmentCalls+disclosure.PartitionCalls >= finish.EvidenceReviewCallLimit {

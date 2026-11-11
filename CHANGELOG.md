@@ -18,6 +18,8 @@
 
 ### Changed
 
+- Give focused split reviews exact approved diffs when they fit, and
+  distinguish added shared-test coverage from real compatibility breaks.
 - Give focused split reviews the full commit-message rules and one bounded
   correction for invalid replies, without reusing global correction output.
 - Preserve untouched newer merges when rewriting an earlier linear range,
