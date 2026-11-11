@@ -65,6 +65,7 @@ type FinishPlanRequest struct {
 	Correction               *FinishCorrection         `json:"correction,omitempty"`
 	Review                   *FinishReviewTask         `json:"evidence_review,omitempty"`
 	AssignPaths              *finishPathAssignmentTask `json:"assign_paths,omitempty"`
+	ReviewSizes              []finishSizeReviewStep    `json:"review_sizes,omitempty"`
 	Reviews                  []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	HistoryCommits           []HistoryMessageCommit    `json:"history_commits,omitempty"`
 	SourceEdits              []FinishSourceEdit        `json:"source_edits,omitempty"`
@@ -95,6 +96,7 @@ type FinishOptions struct {
 	// A plan limited to whole versions can keep inseparable edits together.
 	GroupIndivisibleVersions bool
 	AllowPathOwnership       bool
+	RetrySizeReview          *FinishRetrySizeReview
 	// VerifyPlan checks the materialized chain, including its measured sizes.
 	// It shares the persisted deadline and single correction budget, and never
 	// publishes a branch.
@@ -209,6 +211,13 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 	if err := finish.ValidateEvidence(evidence); err != nil {
 		return result, finishFailure("invalid_evidence", err)
 	}
+	if retry := options.RetrySizeReview; retry != nil {
+		for _, failure := range retry.Failures {
+			if failure.Step < 1 || failure.Step > len(retry.Goals) {
+				return result, finishFailure("invalid_evidence", errors.New("size review identifies an unknown saved step"))
+			}
+		}
+	}
 	if len(options.SourceFiles) > 0 {
 		if options.Message != "" {
 			return result, finishFailure("invalid_options", errors.New("exact messages cannot select source edits"))
@@ -264,11 +273,24 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		return result, err
 	}
 	for call := 0; ; call++ {
-		body, err := transport.EncodeFinishRequest(request)
+		outgoing := request
+		reviewingSizes := call == 0 && options.RetrySizeReview != nil && len(options.RetrySizeReview.Failures) > 0
+		if reviewingSizes {
+			outgoing = finishSizeReviewRequest(request, options.RetrySizeReview)
+		}
+		body, err := transport.EncodeFinishRequest(outgoing)
 		if err != nil {
 			return result, finishFailure("provider_input", err)
 		}
-		if limit := min(inputLimit, FinishPlanningByteCap); len(body) > limit {
+		limit := min(inputLimit, FinishPlanningByteCap)
+		if reviewingSizes && len(body) > limit {
+			reviewingSizes = false
+			body, err = transport.EncodeFinishRequest(request)
+			if err != nil {
+				return result, finishFailure("provider_input", err)
+			}
+		}
+		if len(body) > limit {
 			return result, finishContextLimit(len(body), limit)
 		}
 		if err := ctx.Err(); err != nil {
@@ -301,6 +323,9 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		var plan finish.Plan
 		var source *finish.SourcePlan
 		validationErr := exchangeErr
+		if reviewingSizes {
+			raw, validationErr = applyFinishSizeReview(raw, options.RetrySizeReview, validationErr)
+		}
 		if validationErr == nil && request.AllowPathOwnership && len(request.Reviews) > 0 {
 			raw, err = completeFinishPathOwnership(ctx, transport, request, raw, evidence, options, &result.Disclosure)
 			if err != nil {

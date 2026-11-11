@@ -25,6 +25,8 @@
   number if a nonempty assignment cannot be used.
 - Use exact change assignments ahead of file and directory defaults. This
   lets Intent split one file's versions while grouping its neighboring files.
+- Let an explicit retry fill missing size explanations for an already checked
+  whole-version plan before rebuilding and verifying the chain.
 - Let Intent assign whole files and coherent directories in one selection.
   ACD expands the selections and checks coverage before verifying the chain.
   A provider's uncertainty about coverage no longer appears as a proven

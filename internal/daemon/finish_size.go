@@ -2,14 +2,18 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
 // FinishReviewSize describes the actual change introduced by one candidate.
@@ -24,6 +28,41 @@ func finishReviewTarget(target state.FinishTarget) int {
 		return ai.FinishReviewLineTarget
 	}
 	return 0
+}
+
+func (w *FinishWorker) retrySizeReview(ctx context.Context, current state.FinishRequest, evidence finish.Evidence) (*ai.FinishRetrySizeReview, error) {
+	prior, err := state.PriorFinishCandidate(ctx, w.DB, current.ID, current.Attempt)
+	if errors.Is(err, state.ErrFinishNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var saved FinishSavedPlan
+	if !reflect.DeepEqual(prior.Target, current.Target) || json.Unmarshal(prior.Plan, &saved) != nil || saved.Source != nil {
+		return nil, nil
+	}
+	review := &ai.FinishRetrySizeReview{}
+	limit := finishReviewTarget(current.Target)
+	for i, step := range saved.Steps {
+		if step.ReviewSize == nil || step.Check.TreeOID != step.TreeOID ||
+			step.Check.Result.Status != verification.StatusPassed || step.Check.Executed || step.Check.Result.NeedsAttention {
+			return nil, nil
+		}
+		review.Goals = append(review.Goals, step.Goal)
+		if step.ReviewSize.ChangedLines > limit && strings.TrimSpace(step.LargeChangeReason) == "" {
+			review.Failures = append(review.Failures, ai.CommitSizeFailure{
+				Step: i + 1, ChangedLines: step.ReviewSize.ChangedLines, ChangedFiles: step.ReviewSize.ChangedFiles, Limit: limit,
+			})
+		}
+	}
+	if len(review.Failures) == 0 {
+		return nil, nil
+	}
+	if _, err := finish.Build(evidence, review.Goals); err != nil {
+		return nil, nil
+	}
+	return review, nil
 }
 
 func measureFinishReviewSize(ctx context.Context, repo, before, after string) (FinishReviewSize, error) {

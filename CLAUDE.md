@@ -191,6 +191,9 @@ change IDs is a planning failure.
 If a large reviewed proposal omits a whole file, assign it to an existing goal
 in a bounded call with its reviewed evidence. Keep existing assignments fixed.
 Unresolved omissions go through the same global correction and final checks.
+An explicit retry may use a saved, structurally checked whole-version proposal
+that only lacks size explanations. The first planning call asks for the
+missing reasons. Rebuild and check the complete chain before publication.
 
 Client disconnect detaches from the accepted bounded job. Restart fails running
 planning retryably and recovers prepared publication without AI only through exact

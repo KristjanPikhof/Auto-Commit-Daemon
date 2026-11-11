@@ -315,6 +315,15 @@ func LoadFinishRequest(ctx context.Context, db *DB, id string) (FinishRequest, e
 	return loadFinish(ctx, db.readSQL(), id)
 }
 
+// Read an earlier rejected candidate chain as evidence for an explicit retry.
+// Its plan and publication state remain immutable.
+func PriorFinishCandidate(ctx context.Context, db *DB, id string, attempt int) (FinishRequest, error) {
+	return scanFinish(db.readSQL().QueryRowContext(ctx, finishSelect+` WHERE request_id=? AND attempt<?
+		AND state='failed' AND reason_code='invalid_provider_plan'
+		AND plan_json<>'' AND json_array_length(plan_json, '$.steps')>0
+		ORDER BY attempt DESC LIMIT 1`, id, attempt))
+}
+
 func activeFinish(ctx context.Context, q finishReader, worktree string) (FinishRequest, error) {
 	return scanFinish(q.QueryRowContext(ctx, finishSelect+` WHERE worktree_id=? AND state IN ('running','prepared','needs_attention')`, worktree))
 }
