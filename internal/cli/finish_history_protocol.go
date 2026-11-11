@@ -14,9 +14,10 @@ import (
 )
 
 type finishHistoryParams struct {
-	Plan   state.IntentHistoryPlan `json:"plan"`
-	PlanID string                  `json:"plan_id"`
-	DryRun bool                    `json:"dry_run"`
+	Plan    state.IntentHistoryPlan `json:"plan"`
+	PlanID  string                  `json:"plan_id"`
+	DryRun  bool                    `json:"dry_run"`
+	Timeout time.Duration           `json:"timeout,omitempty"`
 }
 
 func (h *repositoryWorkerHandler) handleFinishHistory(ctx context.Context, runtime *workerRuntime, request supervisor.Request) (any, *supervisor.ProtocolError) {
@@ -25,6 +26,9 @@ func (h *repositoryWorkerHandler) handleFinishHistory(ctx context.Context, runti
 	}
 	var params finishHistoryParams
 	if err := decodeFinishParams(request.Params, &params); err != nil {
+		return nil, protocolFailure("invalid_history", err, false)
+	}
+	if err := daemon.ValidateFinishTimeout(params.Timeout); err != nil {
 		return nil, protocolFailure("invalid_history", err, false)
 	}
 	if request.Method == "history_status" {
@@ -122,6 +126,9 @@ func (h *repositoryWorkerHandler) handleFinishHistory(ctx context.Context, runti
 	timeout := cfg.VerificationTimeout
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
+	}
+	if params.Timeout > 0 {
+		timeout = params.Timeout
 	}
 	r, created, err := state.StartFinishHistoryRequest(ctx, runtime.db, state.FinishHistoryRequest{PlanID: plan.ID, WorktreeID: request.WorktreeID, ConfigDigest: cfg.ConfigDigest, IndexDigest: index, DryRun: params.DryRun, DeadlineTS: float64(time.Now().Add(timeout).UnixNano()) / 1e9})
 	if err != nil {

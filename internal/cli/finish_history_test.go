@@ -62,7 +62,7 @@ func TestFinishHistoryRewriteCLICanonicalPreviewApplyAndReadonlyShow(t *testing.
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, true); err != nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "Each proposed commit passed the configured verification.") {
@@ -88,7 +88,7 @@ func TestFinishHistoryRewriteCLICanonicalPreviewApplyAndReadonlyShow(t *testing.
 	if !bytes.Equal(before, raw) {
 		t.Fatal("show mutated request")
 	}
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err != nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err != nil {
 		t.Fatal(err)
 	}
 	completed, _, err := state.LoadFinishHistoryRequest(t.Context(), runtime.db, plan.ID)
@@ -103,13 +103,13 @@ func TestFinishHistoryRewriteCLICanonicalPreviewApplyAndReadonlyShow(t *testing.
 	}
 	// A completed reconnect is provider/config free, but still proves target and backup.
 	t.Setenv("ACD_AI_API_KEY", "invalid\nsecret")
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err != nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := git.Run(t.Context(), git.RunOpts{Dir: runtime.worktree.Root}, "update-ref", "-d", plan.TargetBranchRef); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err == nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err == nil {
 		t.Fatal("deleted completed target silently recreated")
 	}
 }
@@ -118,7 +118,7 @@ func TestFinishHistoryRewriteCLIRejectsUnprovedWorkerStagingAndLegacy(t *testing
 	lookup, runtime, handler := finishCLIFixture(t)
 	plan := historyCLIPlan(t, runtime, lookup, "")
 	var out bytes.Buffer
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err == nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err == nil {
 		t.Fatal("absent owner accepted")
 	}
 	if _, ok, _ := state.LoadFinishHistoryRequest(t.Context(), runtime.db, plan.ID); ok {
@@ -129,7 +129,7 @@ func TestFinishHistoryRewriteCLIRejectsUnprovedWorkerStagingAndLegacy(t *testing
 	if _, err := git.Run(t.Context(), git.RunOpts{Dir: runtime.worktree.Root}, "add", "history.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err == nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err == nil {
 		t.Fatal("staging accepted without consent")
 	}
 	if _, ok, _ := state.LoadFinishHistoryRequest(t.Context(), runtime.db, plan.ID); ok {
@@ -149,7 +149,7 @@ func TestFinishHistoryRewriteCLIRejectsUnprovedWorkerStagingAndLegacy(t *testing
 	if err := showIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, read, true, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, read, false); err == nil || !strings.Contains(err.Error(), "legacy") {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, read, false, 0); err == nil || !strings.Contains(err.Error(), "legacy") {
 		t.Fatalf("legacy apply %v", err)
 	}
 }

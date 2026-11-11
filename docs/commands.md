@@ -308,6 +308,7 @@ acd history
 acd history activity
 acd history explain
 acd history rewrite --last 5 --plan-out goals.json
+acd history rewrite --last 5 --purpose 'Separate retry and rendering changes' --timeout 20m --plan-only
 acd history rewrite --show-plan goals.json
 acd history rewrite --apply goals.json --dry-run
 acd history rewrite --apply goals.json --yes

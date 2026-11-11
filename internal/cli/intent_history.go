@@ -92,7 +92,10 @@ func generateFinishHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
-	plan, err := daemon.PlanFinishHistory(ctx, repo, selection.BranchRef, chain, suffix, transport, daemon.FinishHistoryOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Mode: cfg.Mode, Style: cfg.Style, MessagesOnly: opts.messagesOnly, DiffEgress: cfg.Provider.DiffEgress, Deadline: time.Now().Add(timeout), VerificationConfigDigest: cfg.ConfigDigest})
+	if opts.timeout > 0 {
+		timeout = opts.timeout
+	}
+	plan, err := daemon.PlanFinishHistory(ctx, repo, selection.BranchRef, chain, suffix, transport, daemon.FinishHistoryOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Mode: cfg.Mode, Style: cfg.Style, Purpose: opts.purpose, MessagesOnly: opts.messagesOnly, DiffEgress: cfg.Provider.DiffEgress, Deadline: time.Now().Add(timeout), VerificationConfigDigest: cfg.ConfigDigest})
 	if err != nil {
 		return err
 	}
@@ -133,7 +136,7 @@ func generateFinishHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 		if jsonOut {
 			applyOut = io.Discard
 		}
-		if err := applyIntentHistoryPlan(ctx, applyOut, repo, plan, false); err != nil {
+		if err := applyIntentHistoryPlan(ctx, applyOut, repo, plan, false, opts.timeout); err != nil {
 			return err
 		}
 		if !jsonOut {
@@ -182,7 +185,7 @@ func showIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan
 	return nil
 }
 
-func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, dryRun bool) error {
+func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, plan state.IntentHistoryPlan, dryRun bool, timeout time.Duration) error {
 	if err := daemon.ValidateIntentHistoryPlan(ctx, repo, plan); err != nil {
 		return err
 	}
@@ -193,7 +196,7 @@ func applyIntentHistoryPlan(ctx context.Context, out io.Writer, repo string, pla
 	if !lookup.Registered || lookup.Record.LifecycleDisabled() {
 		return errors.New("history rewrite: approved tree verification requires the active protection worker; run `acd on`")
 	}
-	r, err := historyRequest(ctx, lookup, "history_start", finishHistoryParams{Plan: plan, DryRun: dryRun})
+	r, err := historyRequest(ctx, lookup, "history_start", finishHistoryParams{Plan: plan, DryRun: dryRun, Timeout: timeout})
 	if err != nil {
 		return err
 	}
@@ -297,7 +300,7 @@ func editFinishHistoryMessages(ctx context.Context, out io.Writer, repo string, 
 		if jsonOut {
 			applyOut = io.Discard
 		}
-		if err := applyIntentHistoryPlan(ctx, applyOut, repo, plan, false); err != nil {
+		if err := applyIntentHistoryPlan(ctx, applyOut, repo, plan, false, opts.timeout); err != nil {
 			return err
 		}
 		if !jsonOut {
