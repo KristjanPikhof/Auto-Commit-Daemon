@@ -229,3 +229,25 @@ func TestFinishPartitionRechecksExactCodeAfterEvidenceReview(t *testing.T) {
 		})
 	}
 }
+
+func TestFinishOrdersNewSourceBeforeProjectWiring(t *testing.T) {
+	project, source := "App.xcodeproj/project.pbxproj", "Runtime.swift"
+	evidence := finish.Evidence{Base: finish.Tree{project: finishTestEntry("a")}, Target: finish.Tree{project: finishTestEntry("b"), source: finishTestEntry("c")}}
+	evidence.Changes = finish.NetChanges(evidence.Base, evidence.Target, "author")
+	options := finishTestOptions(evidence)
+	options.PartitionOversized, options.ReviewLineTarget = true, 200
+	options.MeasurePlan = func(_ context.Context, plan finish.Plan) ([]FinishStepSize, error) {
+		return make([]FinishStepSize, len(plan.Steps)), nil
+	}
+	options.Diffs = []FinishDiff{{ChangeID: project, Text: "+ A = {isa = PBXFileReference; path = Runtime.swift; sourceTree = SOURCE_ROOT; };"}, {ChangeID: source, Text: "+ struct Runtime {}"}}
+	goal := func(path, message string) finish.Goal {
+		return finish.Goal{Purpose: message, Boundary: "Review the source module separately from its build wiring", Reason: "Keep required source available before project compilation.", Message: message + "\n\n- Keep required source available before project compilation.", ChangeIDs: []string{path}}
+	}
+	transport := &finishFakeTransport{exchange: func(context.Context, FinishPlanRequest) ([]byte, error) {
+		return finishTestOutput(goal(project, "Compile the runtime profile"), goal(source, "Define the runtime profile")), nil
+	}}
+	result, err := PlanFinish(t.Context(), transport, evidence, options)
+	if err != nil || result.Calls != 1 || len(result.Plan.Steps) != 2 || result.Plan.Steps[0].ChangeIDs[0] != source {
+		t.Fatalf("project build reference precedes missing source: %+v %v", result.Plan, err)
+	}
+}

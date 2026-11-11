@@ -52,7 +52,7 @@ func completeFinishPathOwnership(ctx context.Context, transport FinishTransport,
 	if len(missing) == 0 {
 		return raw, nil
 	}
-	if _, err := orderFinishGoals(evidence, goals); err != nil {
+	if _, err := OrderFinishGoals(evidence, goals); err != nil {
 		return raw, nil
 	}
 	inputLimit, err := FinishInputByteLimit(options.MaxInputBytes)

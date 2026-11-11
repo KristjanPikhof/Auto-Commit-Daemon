@@ -218,6 +218,12 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 	if err := finish.ValidateEvidence(evidence); err != nil {
 		return result, finishFailure("invalid_evidence", err)
 	}
+	if options.PartitionOversized {
+		evidence, err = InferFinishBuildDependencies(evidence, options.Diffs)
+		if err != nil {
+			return result, finishFailure("invalid_evidence", err)
+		}
+	}
 	if retry := options.RetrySizeReview; retry != nil {
 		for _, failure := range retry.Failures {
 			if failure.Step < 1 || failure.Step > len(retry.Goals) {
@@ -694,7 +700,7 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 		plan, source, err = built.Plan, &built, buildErr
 	} else {
 		var goals []finish.Goal
-		goals, err = orderFinishGoals(evidence, output.Goals)
+		goals, err = OrderFinishGoals(evidence, output.Goals)
 		if err == nil {
 			plan, err = finish.Build(evidence, goals)
 		}
