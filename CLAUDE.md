@@ -200,6 +200,8 @@ review for every oversized group, regardless of its existing explanation.
 Apply actual useful splits and review oversized children again. A remaining
 large goal needs a matching focused-review receipt naming its concrete file
 and coupling. Keep the full target and verify the final chain.
+Focused reviews use the full message contract and at most one correction in
+the shared evidence budget. Do not carry a global correction into a subset.
 
 Client disconnect detaches from the accepted bounded job. Restart fails running
 planning retryably and recovers prepared publication without AI only through exact

@@ -86,6 +86,7 @@ func partitionFinishPlan(ctx context.Context, transport FinishTransport, request
 			return finish.Plan{}, err
 		}
 		focused := finishRequestForChanges(request, ids)
+		focused.Correction = nil
 		focused.Changes = slices.Clone(subset.Changes)
 		for j := range focused.Changes {
 			focused.Changes[j].Provenance = ""
@@ -96,7 +97,36 @@ func partitionFinishPlan(ctx context.Context, transport FinishTransport, request
 			Purpose: finishRedactText(step.Purpose), Boundary: finishRedactText(step.Boundary),
 			ChangedLines: size.ChangedLines, ChangedFiles: size.ChangedFiles,
 		}
-		body, err := transport.EncodeFinishRequest(focused)
+		refined, err := reviewFinishPartition(ctx, transport, focused, subset, options, disclosure)
+		if err != nil {
+			return finish.Plan{}, err
+		}
+		if len(refined.Steps) == 1 {
+			goal := refined.Steps[0].Goal
+			disclosure.PartitionReviews = append(disclosure.PartitionReviews, FinishPartitionReview{
+				ChangeIDs: slices.Clone(goal.ChangeIDs), ChangedLines: size.ChangedLines, Reason: goal.LargeChangeReason,
+			})
+			goals = append(goals, goal)
+			continue
+		}
+		refined, err = partitionFinishPlan(ctx, transport, focused, subset, refined, options, disclosure)
+		if err != nil {
+			return finish.Plan{}, err
+		}
+		for _, child := range refined.Steps {
+			goals = append(goals, child.Goal)
+		}
+	}
+	return finish.Build(evidence, goals)
+}
+
+// A malformed focused proposal gets one correction within the same evidence
+// budget and deadline. It never consumes the global correction or retries a
+// transport failure.
+func reviewFinishPartition(ctx context.Context, transport FinishTransport, request FinishPlanRequest, evidence finish.Evidence, options FinishOptions, disclosure *FinishDisclosure) (finish.Plan, error) {
+	var validationErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		body, err := transport.EncodeFinishRequest(request)
 		if err != nil {
 			return finish.Plan{}, finishFailure("provider_input", err)
 		}
@@ -128,46 +158,40 @@ func partitionFinishPlan(ctx context.Context, transport FinishTransport, request
 		if err != nil && !errors.As(err, &invalid) {
 			return finish.Plan{}, finishFailure("provider_failure", err)
 		}
-		if err != nil {
-			return finish.Plan{}, fmt.Errorf("split review for %q: %w", step.Purpose, err)
+		if invalid != nil {
+			raw = invalid.Raw
 		}
-		if len(focused.Reviews) > 0 {
-			raw, err = completeFinishPathOwnership(ctx, transport, focused, raw, subset, options, disclosure)
-			if err != nil {
-				return finish.Plan{}, err
+		if len(raw) > subprocessResponseByteCap {
+			return finish.Plan{}, finishFailure("provider_response_too_large", errors.New("provider response exceeds 1 MiB"))
+		}
+		validationErr = err
+		if validationErr == nil && len(request.Reviews) > 0 {
+			raw, validationErr = completeFinishPathOwnership(ctx, transport, request, raw, evidence, options, disclosure)
+			var fatal *FinishPlanningError
+			if errors.As(validationErr, &fatal) {
+				return finish.Plan{}, validationErr
 			}
 		}
-		refined, _, err := validateFinishReply(raw, subset, options)
-		if err != nil {
-			return finish.Plan{}, fmt.Errorf("split review for %q: %w", step.Purpose, err)
+		var refined finish.Plan
+		if validationErr == nil {
+			refined, _, validationErr = validateFinishReply(raw, evidence, options)
 		}
-		if len(refined.Steps) == 1 {
-			goal := refined.Steps[0].Goal
-			specific := false
-			for _, change := range subset.Changes {
-				if strings.Contains(goal.LargeChangeReason, path.Base(change.Path)) {
-					specific = true
-					break
-				}
-			}
-			if !specific {
-				return finish.Plan{}, fmt.Errorf("split review for %q kept the entire group without naming the exact file that prevents a useful split", step.Purpose)
-			}
-			disclosure.PartitionReviews = append(disclosure.PartitionReviews, FinishPartitionReview{
-				ChangeIDs: slices.Clone(goal.ChangeIDs), ChangedLines: size.ChangedLines, Reason: goal.LargeChangeReason,
+		if validationErr == nil && len(refined.Steps) == 1 {
+			specific := slices.ContainsFunc(evidence.Changes, func(change finish.Change) bool {
+				return strings.Contains(refined.Steps[0].LargeChangeReason, path.Base(change.Path))
 			})
-			goals = append(goals, goal)
-			continue
+			if !specific {
+				validationErr = errors.New("keeping the whole group requires the exact filename and dependency that prevent a useful split")
+			}
 		}
-		refined, err = partitionFinishPlan(ctx, transport, focused, subset, refined, options, disclosure)
-		if err != nil {
-			return finish.Plan{}, err
+		if validationErr == nil {
+			return refined, nil
 		}
-		for _, child := range refined.Steps {
-			goals = append(goals, child.Goal)
+		request.Correction = &FinishCorrection{
+			PreviousOutput: finishRedactText(strings.ToValidUTF8(string(raw), "�")), ValidationError: finishCorrectionError(validationErr),
 		}
 	}
-	return finish.Build(evidence, goals)
+	return finish.Plan{}, finishFailure("invalid_provider_plan", fmt.Errorf("split review for %q: %w", request.Partition.Purpose, validationErr))
 }
 
 func encodeFinishGoals(plan finish.Plan) []byte {

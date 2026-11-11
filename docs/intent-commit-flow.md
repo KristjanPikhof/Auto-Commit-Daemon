@@ -74,6 +74,9 @@ explanation. A split keeps the same complete target. Larger child groups are
 reviewed again. A group can stay large only after that focused review identifies
 the specific file and dependency that prevents a useful split. The reviewer
 still judges meaning from code, and ACD checks exact membership and tree safety.
+An invalid focused reply gets one correction with its exact validation error.
+Both calls share the existing evidence budget and deadline; transport failures
+stop the request.
 
 Keep a new field, type, or method with its consumers or before them. Reviews
 retain those interface names so the planner can identify the dependency.

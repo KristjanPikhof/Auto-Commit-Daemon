@@ -18,6 +18,8 @@
 
 ### Changed
 
+- Give focused split reviews the full commit-message rules and one bounded
+  correction for invalid replies, without reusing global correction output.
 - Preserve untouched newer merges when rewriting an earlier linear range,
   including their exact side parents, message, author and final tree.
   Refuse a merge whose side branch would retain the selected old commits.

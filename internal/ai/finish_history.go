@@ -32,7 +32,8 @@ func finishPrompt(request FinishPlanRequest) string {
 		return finishReviewSizesPrompt
 	}
 	if request.Partition != nil {
-		return finishPartitionPrompt + finishSmallStepsPrompt + finishPathOwnershipPrompt
+		prompt := strings.Replace(finishSystemPrompt, finishStrictBoundaries, finishWholeVersionBoundaries, 1)
+		return prompt + "\n" + finishPartitionPrompt + finishSmallStepsPrompt + finishPathOwnershipPrompt
 	}
 	if len(request.SourceEdits) > 0 {
 		if request.RefineRecorded {
