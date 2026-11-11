@@ -2,11 +2,25 @@ package ai
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
+
+func TestFinishPathOwnershipIgnoresEmptyEntries(t *testing.T) {
+	evidence := finishTestEvidence()
+	goals := []finish.Goal{finishTestGoal(evidence)}
+	goals[0].ChangeIDs = nil
+	assignments := []finishPathOwnership{{}, {Goal: 1, Paths: []string{"settings.go"}}}
+	if err := expandFinishPathOwnership(evidence.Changes, goals, assignments); err != nil || !slices.Equal(goals[0].ChangeIDs, []string{"settings.go"}) {
+		t.Fatalf("empty entry changed ownership: %+v %v", goals, err)
+	}
+	if err := expandFinishPathOwnership(evidence.Changes, goals, []finishPathOwnership{{Goal: 0, Paths: []string{"settings.go"}}}); err == nil || !strings.Contains(err.Error(), "names goal 0") {
+		t.Fatalf("invalid goal for a real path was accepted: %v", err)
+	}
+}
 
 func TestFinishPathOwnershipRejectsOverlapAndMissingFiles(t *testing.T) {
 	evidence := finishTestEvidence()

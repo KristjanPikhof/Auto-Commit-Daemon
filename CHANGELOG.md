@@ -21,6 +21,8 @@
 - Fill omitted files in large Intent plans in bounded batches using the
   existing goals and saved reviews. Report assignment progress separately
   from review and global planning.
+- Ignore empty path assignments in Intent replies and report the invalid goal
+  number if a nonempty assignment cannot be used.
 - Let Intent assign whole files and coherent directories in one selection.
   ACD expands the selections and checks coverage before verifying the chain.
   A provider's uncertainty about coverage no longer appears as a proven

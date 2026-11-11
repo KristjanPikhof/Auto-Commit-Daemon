@@ -32,8 +32,11 @@ func expandFinishPathOwnership(changes []finish.Change, goals []finish.Goal, ass
 		}
 	}
 	for _, assignment := range assignments {
-		if assignment.Goal < 1 || assignment.Goal > len(goals) || len(assignment.Paths) == 0 {
-			return fmt.Errorf("path_ownership requires a valid goal number and at least one path")
+		if len(assignment.Paths) == 0 {
+			continue
+		}
+		if assignment.Goal < 1 || assignment.Goal > len(goals) {
+			return fmt.Errorf("path_ownership for %q names goal %d outside 1 through %d", assignment.Paths[0], assignment.Goal, len(goals))
 		}
 		goal := &goals[assignment.Goal-1]
 		for _, path := range assignment.Paths {
