@@ -251,3 +251,16 @@ func TestFinishOrdersNewSourceBeforeProjectWiring(t *testing.T) {
 		t.Fatalf("project build reference precedes missing source: %+v %v", result.Plan, err)
 	}
 }
+
+func TestFinishPartitionReviewSurvivesDependencyOrder(t *testing.T) {
+	goal := finish.Goal{ChangeIDs: []string{"source", "project"}, LargeChangeReason: "Keep the exact required build files together."}
+	size := FinishStepSize{ChangedLines: 250}
+	reviews := []FinishPartitionReview{{ChangeIDs: []string{"project", "source"}, ChangedLines: 250, Reason: goal.LargeChangeReason}}
+	if !HasFinishPartitionReview(goal, size, reviews) {
+		t.Fatal("ordering identical membership discarded its accepted review")
+	}
+	goal.ChangeIDs[0] = "unreviewed"
+	if HasFinishPartitionReview(goal, size, reviews) {
+		t.Fatal("a different membership reused the accepted review")
+	}
+}

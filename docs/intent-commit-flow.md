@@ -80,6 +80,9 @@ reviews can use the exact diffs again. A test file gaining checks for several
 features can accompany the last feature while earlier steps keep compatible
 existing tests. New test references and ordinary prerequisite order do not
 by themselves require one combined production commit.
+Explicit Xcode `SOURCE_ROOT` references and `$(SRCROOT)` input lists place
+newly created files before the build wiring that requires them. Reordering
+the same reviewed changes keeps their review; changing membership does not.
 An invalid focused reply gets one correction with its exact validation error.
 Both calls share the existing evidence budget and deadline; transport failures
 stop the request.

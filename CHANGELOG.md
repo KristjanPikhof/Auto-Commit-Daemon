@@ -18,6 +18,8 @@
 
 ### Changed
 
+- Order new Xcode source files and declared resource inputs before their
+  build references, while preserving reviewed commit memberships.
 - Give focused split reviews exact approved diffs when they fit, and
   distinguish added shared-test coverage from real compatibility breaks.
 - Give focused split reviews the full commit-message rules and one bounded
