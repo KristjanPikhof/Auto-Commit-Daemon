@@ -30,6 +30,32 @@ func finishReviewTarget(target state.FinishTarget) int {
 	return 0
 }
 
+func finishRequiresPartition(target state.FinishTarget) bool {
+	return target.Version >= state.FinishPartitionVersion && target.Mode == "intent" &&
+		target.Message == "" && !target.SourceSelection && !target.RecordedSourceSelection
+}
+
+func measureFinishPlan(ctx context.Context, repo string, plan finish.Plan) ([]ai.FinishStepSize, error) {
+	before, err := finishHistoryTree(ctx, repo, plan.Base)
+	if err != nil {
+		return nil, err
+	}
+	sizes := make([]ai.FinishStepSize, 0, len(plan.Steps))
+	for _, step := range plan.Steps {
+		tree, err := finishHistoryTree(ctx, repo, step.Tree)
+		if err != nil {
+			return nil, err
+		}
+		size, err := measureFinishReviewSize(ctx, repo, before, tree)
+		if err != nil {
+			return nil, err
+		}
+		sizes = append(sizes, ai.FinishStepSize{ChangedLines: size.ChangedLines, ChangedFiles: size.ChangedFiles})
+		before = tree
+	}
+	return sizes, nil
+}
+
 func (w *FinishWorker) retrySizeReview(ctx context.Context, current state.FinishRequest, evidence finish.Evidence) (*ai.FinishRetrySizeReview, error) {
 	prior, err := state.PriorFinishCandidate(ctx, w.DB, current.ID, current.Attempt)
 	if errors.Is(err, state.ErrFinishNotFound) {

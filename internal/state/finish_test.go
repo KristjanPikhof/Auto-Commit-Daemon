@@ -386,6 +386,9 @@ func TestFinishAssignmentCallsFollowPlanningAndReportProgress(t *testing.T) {
 	if _, err := ConsumeFinishAssignmentCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
 		t.Fatal("assigned files before a global plan", err)
 	}
+	if _, err := ConsumeFinishPartitionCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("split review ran before a global plan", err)
+	}
 	if _, err := ConsumeFinishPlanningCall(ctx, db, r.ID, r.Attempt); err != nil {
 		t.Fatal(err)
 	}
@@ -398,6 +401,18 @@ func TestFinishAssignmentCallsFollowPlanningAndReportProgress(t *testing.T) {
 	got, err := LoadFinishRequest(ctx, db, r.ID)
 	if err != nil || got.AssignmentCalls != 1 || got.PlanningCalls != 1 || got.EvidenceCalls != 0 || got.Stage != "assigning_paths" {
 		t.Fatalf("assignment progress: %+v %v", got, err)
+	}
+	for n := 1; n < finish.EvidenceReviewCallLimit; n++ {
+		if calls, err := ConsumeFinishPartitionCall(ctx, db, r.ID, r.Attempt); err != nil || calls != n {
+			t.Fatalf("reserve split review: %d %v", calls, err)
+		}
+	}
+	got, err = LoadFinishRequest(ctx, db, r.ID)
+	if err != nil || got.PartitionCalls != finish.EvidenceReviewCallLimit-1 || got.AssignmentCalls != 1 || got.Stage != "splitting_commits" {
+		t.Fatalf("split review progress: %+v %v", got, err)
+	}
+	if _, err := ConsumeFinishPartitionCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("split review exceeded the shared evidence budget", err)
 	}
 }
 

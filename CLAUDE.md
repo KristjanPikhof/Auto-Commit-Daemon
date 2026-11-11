@@ -194,6 +194,12 @@ Unresolved omissions go through the same global correction and final checks.
 An explicit retry may use a saved, structurally checked whole-version proposal
 that only lacks size explanations. The first planning call asks for the
 missing reasons. Rebuild and check the complete chain before publication.
+This explanation-only retry applies to version-eight requests. Version-nine
+whole-version requests and new Intent history plans require a focused partition
+review for every oversized group, regardless of its existing explanation.
+Apply actual useful splits and review oversized children again. A remaining
+large goal needs a matching focused-review receipt naming its concrete file
+and coupling. Keep the full target and verify the final chain.
 
 Client disconnect detaches from the accepted bounded job. Restart fails running
 planning retryably and recovers prepared publication without AI only through exact

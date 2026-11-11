@@ -68,7 +68,12 @@ Size and project-check failures share the same single correction and deadline.
 ACD checks the complete corrected chain before publication. This policy applies
 to generated Intent requests from version five onward. Older frozen requests, Local batches,
 exact messages and messages-only history rewrites keep their existing rules.
-The size check enforces an explanation, not proof that the explanation is true.
+Version-nine whole-version finishes independently review every oversized group
+for useful smaller boundaries, including groups that already have a size
+explanation. A split keeps the same complete target. Larger child groups are
+reviewed again. A group can stay large only after that focused review identifies
+the specific file and dependency that prevents a useful split. The reviewer
+still judges meaning from code, and ACD checks exact membership and tree safety.
 
 Keep a new field, type, or method with its consumers or before them. Reviews
 retain those interface names so the planner can identify the dependency.
@@ -264,8 +269,9 @@ acd finish --retry REQUEST_ID
 Validated reviews are saved after each accepted batch. An explicit retry reuses
 them only when the frozen evidence, redacted fragments, provider configuration,
 and review instructions still match. If a whole-version plan passed structural
-checks and only lacked size explanations, the retry first asks for those
-explanations and checks the same trees again. Other retries create a fresh
+checks and only lacked size explanations, version-eight retries can ask for
+those explanations and check the same trees again. New requests repeat the
+focused partition review. Other retries create a fresh
 global plan. Restart never starts that work automatically.
 Reviews saved by older builds without this fingerprint cannot be reused.
 Valid completed reviews survive a parallel peer's failure. A successful retry

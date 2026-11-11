@@ -836,7 +836,9 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 				return saved, git.FinishPublicationProof{}, err
 			}
 			savedStep.ReviewSize = &size
-			if size.ChangedLines > reviewTarget && strings.TrimSpace(step.LargeChangeReason) == "" {
+			unreviewed := finishRequiresPartition(r.Target) && !ai.HasFinishPartitionReview(step.Goal,
+				ai.FinishStepSize{ChangedLines: size.ChangedLines, ChangedFiles: size.ChangedFiles}, planned.PartitionReviews)
+			if size.ChangedLines > reviewTarget && (strings.TrimSpace(step.LargeChangeReason) == "" || unreviewed) {
 				candidateFailures = append(candidateFailures, &ai.CommitSizeFailure{Step: index + 1, ChangedLines: size.ChangedLines, ChangedFiles: size.ChangedFiles, Limit: reviewTarget})
 			}
 			previousTree = tree
@@ -943,8 +945,9 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		return result, err
 	}
 	var checked *finishPreparedPlan
+	var partitionReviews []ai.FinishPartitionReview
 	verifyPlan := func(checkCtx context.Context, plan finish.Plan, built *finish.SourcePlan) error {
-		candidate := finishPlanningResult{Plan: plan, Evidence: evidence}
+		candidate := finishPlanningResult{Plan: plan, Evidence: evidence, PartitionReviews: partitionReviews}
 		if built != nil {
 			candidate.Evidence, candidate.Blobs = built.Evidence, built.Blobs
 			candidate.Source = sourceProof(evidence, sourceFiles, built.Selections)
@@ -961,6 +964,9 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	}, BeforeAssignmentCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishAssignmentCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
+	}, BeforePartitionCall: func(callCtx context.Context) error {
+		_, err := state.ConsumeFinishPartitionCall(callCtx, w.DB, r.ID, r.Attempt)
+		return err
 	}, BeforeCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
@@ -968,7 +974,14 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	options.GroupIndivisibleVersions = r.Target.Version >= state.FinishRecordedGroupingVersion &&
 		r.Target.Message == "" && !r.Target.SourceSelection && !r.Target.RecordedSourceSelection
 	options.AllowPathOwnership = r.Target.Version >= state.FinishPathOwnershipVersion && options.GroupIndivisibleVersions
-	if options.AllowPathOwnership && r.Attempt > 1 {
+	options.PartitionOversized = finishRequiresPartition(r.Target)
+	options.MeasurePlan = func(ctx context.Context, plan finish.Plan) ([]ai.FinishStepSize, error) {
+		return measureFinishPlan(ctx, wt.Root, plan)
+	}
+	options.RecordPartitionReviews = func(reviews []ai.FinishPartitionReview) {
+		partitionReviews = slices.Clone(reviews)
+	}
+	if options.AllowPathOwnership && !options.PartitionOversized && r.Attempt > 1 {
 		options.RetrySizeReview, err = w.retrySizeReview(ctx, r, evidence)
 		if err != nil {
 			return result, err
@@ -993,6 +1006,7 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	}
 	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, options)
 	result.Plan, result.Disclosure, result.Checked = planned.Plan, planned.Disclosure, checked
+	result.PartitionReviews = planned.Disclosure.PartitionReviews
 	if len(sourceFiles) > 0 {
 		result.Source = sourceProof(evidence, sourceFiles, nil)
 	}

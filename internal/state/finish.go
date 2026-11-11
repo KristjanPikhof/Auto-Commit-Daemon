@@ -17,7 +17,8 @@ const (
 	FinishRecordedSourceVersion   = 6
 	FinishRecordedGroupingVersion = 7
 	FinishPathOwnershipVersion    = 8
-	FinishVersion                 = FinishPathOwnershipVersion
+	FinishPartitionVersion        = 9
+	FinishVersion                 = FinishPartitionVersion
 	FinishRunning                 = "running"
 	FinishPrepared                = "prepared"
 	FinishCompleted               = "completed"
@@ -85,6 +86,7 @@ type FinishRequest struct {
 	PlanningCalls     int                   `json:"planning_calls"`
 	EvidenceCalls     int                   `json:"evidence_calls,omitempty"`
 	AssignmentCalls   int                   `json:"assignment_calls,omitempty"`
+	PartitionCalls    int                   `json:"partition_calls,omitempty"`
 	ReviewedFragments int                   `json:"reviewed_fragments,omitempty"`
 	ReviewFragments   int                   `json:"review_fragments,omitempty"`
 	ReusedFragments   int                   `json:"reused_fragments,omitempty"`
@@ -256,11 +258,13 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 	var progress struct {
 		EvidenceCalls   int                   `json:"evidence_calls"`
 		AssignmentCalls int                   `json:"assignment_calls"`
+		PartitionCalls  int                   `json:"partition_calls"`
 		Review          finish.ReviewProgress `json:"review_progress"`
 	}
 	if json.Unmarshal(r.Result, &progress) == nil {
 		r.EvidenceCalls = progress.EvidenceCalls
 		r.AssignmentCalls = progress.AssignmentCalls
+		r.PartitionCalls = progress.PartitionCalls
 		r.ReviewProgress = progress.Review
 		r.ReviewedFragments = len(progress.Review.Observations)
 		r.ReviewFragments = progress.Review.TotalFragments
@@ -270,6 +274,7 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 		Disclosure struct {
 			EvidenceCalls   int                        `json:"evidence_calls"`
 			AssignmentCalls int                        `json:"assignment_calls"`
+			PartitionCalls  int                        `json:"partition_calls"`
 			EvidenceReviews []finish.ReviewObservation `json:"evidence_reviews"`
 			ReusedFragments int                        `json:"reused_fragments"`
 		} `json:"disclosure"`
@@ -277,6 +282,7 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 	if json.Unmarshal(r.Plan, &saved) == nil {
 		r.EvidenceCalls = max(r.EvidenceCalls, saved.Disclosure.EvidenceCalls)
 		r.AssignmentCalls = max(r.AssignmentCalls, saved.Disclosure.AssignmentCalls)
+		r.PartitionCalls = max(r.PartitionCalls, saved.Disclosure.PartitionCalls)
 		r.ReviewedFragments = max(r.ReviewedFragments, len(saved.Disclosure.EvidenceReviews))
 		if r.PlanningCalls > 0 {
 			r.ReviewFragments = max(r.ReviewFragments, r.ReviewedFragments)
@@ -656,17 +662,22 @@ func ConsumeFinishPlanningCall(ctx context.Context, db *DB, id string, attempt i
 
 // ConsumeFinishEvidenceCall reserves a review in the mutable attempt result
 // journal. The accepted plan remains immutable. Restart cannot reset this
-// separate budget or start another review after global planning has begun.
+// separate budget. Evidence review precedes global planning; path assignment
+// and focused split review follow it and share the same bounded budget.
 func ConsumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt int) (int, error) {
-	return consumeFinishEvidenceCall(ctx, db, id, attempt, false)
+	return consumeFinishEvidenceCall(ctx, db, id, attempt, "reviewing_evidence")
 }
 
 // Path assignments follow a global proposal and share its evidence call limit.
 func ConsumeFinishAssignmentCall(ctx context.Context, db *DB, id string, attempt int) (int, error) {
-	return consumeFinishEvidenceCall(ctx, db, id, attempt, true)
+	return consumeFinishEvidenceCall(ctx, db, id, attempt, "assigning_paths")
 }
 
-func consumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt int, assignment bool) (int, error) {
+func ConsumeFinishPartitionCall(ctx context.Context, db *DB, id string, attempt int) (int, error) {
+	return consumeFinishEvidenceCall(ctx, db, id, attempt, "splitting_commits")
+}
+
+func consumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt int, stage string) (int, error) {
 	tx, cleanup, err := beginFinishWrite(ctx, db)
 	if err != nil {
 		return 0, err
@@ -680,7 +691,7 @@ func consumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt i
 		}
 		return 0, err
 	}
-	if assignment != (planningCalls > 0) {
+	if (stage != "reviewing_evidence") != (planningCalls > 0) {
 		return 0, ErrFinishBudget
 	}
 	progress := map[string]json.RawMessage{}
@@ -692,20 +703,25 @@ func consumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt i
 	var counts struct {
 		Evidence   int `json:"evidence_calls"`
 		Assignment int `json:"assignment_calls"`
+		Partition  int `json:"partition_calls"`
 	}
 	if raw != "" {
 		if err := json.Unmarshal([]byte(raw), &counts); err != nil {
 			return 0, ErrFinishState
 		}
 	}
-	if counts.Evidence < 0 || counts.Assignment < 0 ||
-		counts.Evidence >= finish.EvidenceReviewCallLimit ||
-		counts.Assignment >= finish.EvidenceReviewCallLimit-counts.Evidence {
+	if counts.Evidence < 0 || counts.Assignment < 0 || counts.Partition < 0 ||
+		counts.Evidence > finish.EvidenceReviewCallLimit || counts.Assignment > finish.EvidenceReviewCallLimit ||
+		counts.Partition > finish.EvidenceReviewCallLimit ||
+		counts.Evidence+counts.Assignment+counts.Partition >= finish.EvidenceReviewCallLimit {
 		return 0, ErrFinishBudget
 	}
-	key, stage, calls := "evidence_calls", "reviewing_evidence", counts.Evidence+1
-	if assignment {
-		key, stage, calls = "assignment_calls", "assigning_paths", counts.Assignment+1
+	key, calls := "evidence_calls", counts.Evidence+1
+	switch stage {
+	case "assigning_paths":
+		key, calls = "assignment_calls", counts.Assignment+1
+	case "splitting_commits":
+		key, calls = "partition_calls", counts.Partition+1
 	}
 	progress[key], _ = json.Marshal(calls)
 	encoded, err := json.Marshal(progress)

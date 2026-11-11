@@ -293,7 +293,9 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		default:
 			fmt.Fprintln(out, commitCountLabel(result.CommitsCreated))
 		}
-		if r.AssignmentCalls > 0 {
+		if r.PartitionCalls > 0 {
+			fmt.Fprintf(out, "Evidence review calls: %d. File assignment calls: %d. Split review calls: %d. Global planning calls: %d.\n", r.EvidenceCalls, r.AssignmentCalls, r.PartitionCalls, r.PlanningCalls)
+		} else if r.AssignmentCalls > 0 {
 			fmt.Fprintf(out, "Evidence review calls: %d. File assignment calls: %d. Global planning calls: %d.\n", r.EvidenceCalls, r.AssignmentCalls, r.PlanningCalls)
 		} else if r.EvidenceCalls > 0 {
 			fmt.Fprintf(out, "Evidence review calls: %d. Global planning calls: %d.\n", r.EvidenceCalls, r.PlanningCalls)

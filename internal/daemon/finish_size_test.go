@@ -128,7 +128,7 @@ func TestFinishWorkerReviewSizeAllowsExplainedIndivisibleChange(t *testing.T) {
 	w.Config.Mode, w.Config.Provider.DiffEgress = "intent", true
 	w.Config.Provider.Timeout = time.Minute
 	finishWrite(t, f.dir, "compatibility.json", "[\n"+strings.Repeat("  {\"code\": 1},\n", 238)+"  {\"code\": 2}\n]\n")
-	const largeReason = "The imported compatibility table is one recorded version; partial tables would omit required protocol entries."
+	const largeReason = "The imported compatibility.json table is one recorded version; partial tables would omit required protocol entries."
 	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
 		goal := finish.Goal{Purpose: "Import the supported protocol compatibility table", Boundary: "Keep the complete versioned compatibility table together", Reason: "Supply the supported protocol entries so clients can recognize compatible values.", LargeChangeReason: largeReason, Message: "Import protocol compatibility entries\n\n- Supply the supported protocol entries so clients can recognize\n  compatible values.\n- " + largeReason}
 		for _, change := range request.Changes {
@@ -161,6 +161,15 @@ func TestFinishWorkerRetryExplainsAlreadyCheckedLargeSteps(t *testing.T) {
 		return json.Marshal(map[string]any{"goals": finishSizeGoals(request, true)})
 	}}
 	r := startFinishWorker(t, w, FinishOptions{})
+	if _, err := state.InterruptFinishRequests(t.Context(), f.db, r.Target.WorktreeID); err != nil {
+		t.Fatal(err)
+	}
+	target := r.Target
+	target.Version = state.FinishPathOwnershipVersion
+	r, _, err := state.StartFinishRequest(t.Context(), f.db, state.FinishRequest{ID: "legacy-size-retry", Target: target, DeadlineTS: r.DeadlineTS})
+	if err != nil {
+		t.Fatal(err)
+	}
 	failed, err := w.Execute(t.Context(), r.ID)
 	if err == nil || failed.ReasonCode != "invalid_provider_plan" ||
 		finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != r.Target.ExpectedHead {
@@ -197,6 +206,30 @@ func TestFinishWorkerRetryExplainsAlreadyCheckedLargeSteps(t *testing.T) {
 	message := finishWorkerGit(t, f.dir, "log", "-1", "--format=%B", "HEAD^")
 	if !strings.Contains(strings.Join(strings.Fields(message), " "), reason) {
 		t.Fatal("published commit body is missing the measured size explanation")
+	}
+}
+
+func TestFinishWorkerSplitsLargeGroupDespiteExplanation(t *testing.T) {
+	f, w := finishSizeFixture(t)
+	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		goals := finishSizeGoals(request, request.Partition != nil)
+		if request.Partition == nil {
+			goals[0].LargeChangeReason = "The protocol implementation and its reference entries need to change together for callers."
+			goals[0].Message += "\n- " + goals[0].LargeChangeReason
+		}
+		return json.Marshal(map[string]any{"goals": goals})
+	}}
+	r := startFinishWorker(t, w, FinishOptions{})
+	completed, err := w.Execute(t.Context(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.PartitionCalls != 1 {
+		t.Fatalf("focused split did not finish: %s %s %v", completed.State, completed.Reason, err)
+	}
+	var saved FinishSavedPlan
+	if json.Unmarshal(completed.Plan, &saved) != nil || len(saved.Steps) != 2 {
+		t.Fatal("large explanation bypassed the useful split")
+	}
+	if got := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); got != r.Target.TargetTree {
+		t.Fatal("focused splitting changed the saved target")
 	}
 }
 

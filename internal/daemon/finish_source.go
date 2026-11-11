@@ -34,12 +34,13 @@ type finishSourceProof struct {
 }
 
 type finishPlanningResult struct {
-	Plan       finish.Plan
-	Evidence   finish.Evidence
-	Disclosure ai.FinishDisclosure
-	Blobs      map[string][]byte
-	Source     *finishSourceProof
-	Checked    *finishPreparedPlan
+	Plan             finish.Plan
+	Evidence         finish.Evidence
+	Disclosure       ai.FinishDisclosure
+	Blobs            map[string][]byte
+	Source           *finishSourceProof
+	Checked          *finishPreparedPlan
+	PartitionReviews []ai.FinishPartitionReview
 }
 
 type finishPreparedPlan struct {

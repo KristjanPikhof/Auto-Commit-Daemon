@@ -33,6 +33,7 @@ type finishHistoryStatusReport struct {
 type finishStatusReport struct {
 	EvidenceCalls     int                  `json:"evidence_calls,omitempty"`
 	AssignmentCalls   int                  `json:"assignment_calls,omitempty"`
+	PartitionCalls    int                  `json:"partition_calls,omitempty"`
 	ReviewedFragments int                  `json:"reviewed_fragments,omitempty"`
 	ReviewFragments   int                  `json:"review_fragments,omitempty"`
 	ReusedFragments   int                  `json:"reused_fragments,omitempty"`
@@ -94,11 +95,13 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 	var progress struct {
 		EvidenceCalls   int                   `json:"evidence_calls"`
 		AssignmentCalls int                   `json:"assignment_calls"`
+		PartitionCalls  int                   `json:"partition_calls"`
 		Review          finish.ReviewProgress `json:"review_progress"`
 	}
 	if json.Unmarshal([]byte(result), &progress) == nil {
 		report.EvidenceCalls = progress.EvidenceCalls
 		report.AssignmentCalls = progress.AssignmentCalls
+		report.PartitionCalls = progress.PartitionCalls
 		report.ReviewedFragments = len(progress.Review.Observations)
 		report.ReviewFragments = progress.Review.TotalFragments
 		report.ReusedFragments = progress.Review.ReusedFragments
@@ -107,6 +110,7 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 		Disclosure struct {
 			EvidenceCalls   int                        `json:"evidence_calls"`
 			AssignmentCalls int                        `json:"assignment_calls"`
+			PartitionCalls  int                        `json:"partition_calls"`
 			EvidenceReviews []finish.ReviewObservation `json:"evidence_reviews"`
 			ReusedFragments int                        `json:"reused_fragments"`
 		} `json:"disclosure"`
@@ -114,6 +118,7 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 	if json.Unmarshal([]byte(plan), &savedReview) == nil {
 		report.EvidenceCalls = max(report.EvidenceCalls, savedReview.Disclosure.EvidenceCalls)
 		report.AssignmentCalls = max(report.AssignmentCalls, savedReview.Disclosure.AssignmentCalls)
+		report.PartitionCalls = max(report.PartitionCalls, savedReview.Disclosure.PartitionCalls)
 		report.ReviewedFragments = max(report.ReviewedFragments, len(savedReview.Disclosure.EvidenceReviews))
 		if r.PlanningCalls > 0 {
 			report.ReviewFragments = max(report.ReviewFragments, report.ReviewedFragments)
