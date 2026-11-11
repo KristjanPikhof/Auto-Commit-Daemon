@@ -30,7 +30,7 @@ func readIntentHistoryPlanRef(ctx context.Context, repo, ref string) (state.Inte
 		if err := json.Unmarshal(raw, &plan); err != nil {
 			return plan, false, err
 		}
-		return plan, plan.SourceBranchRef != "" && (plan.Version == 1 || plan.Version == state.IntentHistoryPlanVersion), nil
+		return plan, plan.SourceBranchRef != "" && plan.Version >= 1 && plan.Version <= state.IntentHistoryPlanVersion, nil
 	}
 	path, err := rewriteStateDBPath(ctx, repo)
 	if err != nil {
@@ -95,7 +95,23 @@ func generateFinishHistoryPlan(ctx context.Context, out io.Writer, repo string, 
 	if opts.timeout > 0 {
 		timeout = opts.timeout
 	}
-	plan, err := daemon.PlanFinishHistory(ctx, repo, selection.BranchRef, chain, suffix, transport, daemon.FinishHistoryOptions{MaxInputBytes: cfg.Provider.MaxInputBytes, Mode: cfg.Mode, Style: cfg.Style, Purpose: opts.purpose, MessagesOnly: opts.messagesOnly, DiffEgress: cfg.Provider.DiffEgress, Deadline: time.Now().Add(timeout), VerificationConfigDigest: cfg.ConfigDigest})
+	progress, err := newRewriteProgressSink(opts.progress, opts.quiet, opts.progressTo)
+	if err != nil {
+		return err
+	}
+	report := func(phase, message string) func(context.Context) error {
+		return func(context.Context) error {
+			return progress.Emit(rewriteProgressEvent{Phase: phase, Message: message})
+		}
+	}
+	plan, err := daemon.PlanFinishHistory(ctx, repo, selection.BranchRef, chain, suffix, transport, daemon.FinishHistoryOptions{
+		MaxInputBytes: cfg.Provider.MaxInputBytes, Mode: cfg.Mode, Style: cfg.Style, Purpose: opts.purpose,
+		MessagesOnly: opts.messagesOnly, DiffEgress: cfg.Provider.DiffEgress, Deadline: time.Now().Add(timeout),
+		VerificationConfigDigest: cfg.ConfigDigest, BeforeCall: report("planning", "Planning the complete commit chain"),
+		BeforeEvidenceCall:   report("reviewing", "Reviewing saved diff evidence"),
+		BeforePartitionCall:  report("splitting", "Splitting an oversized commit group"),
+		BeforeAssignmentCall: report("assigning", "Assigning omitted files to commit goals"),
+	})
 	if err != nil {
 		return err
 	}

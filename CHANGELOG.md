@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Independently partition oversized whole-version Intent commits before
+  publication, even when the original plan supplies a size explanation.
+  Apply the same measured split review to new Intent history rewrites.
+- Add boundary context and explicit time budgets to history rewrite.
+- Keep new history plans compact by rebuilding candidate trees from pinned
+  Git evidence, so larger repositories can retain useful smaller boundaries.
 - Fill omitted files in large Intent plans in bounded batches using the
   existing goals and saved reviews. Report assignment progress separately
   from review and global planning.

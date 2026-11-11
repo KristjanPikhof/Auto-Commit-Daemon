@@ -10,6 +10,7 @@ new rewrite.
 
 ~~~bash
 acd history rewrite --last 5 --plan-only
+acd history rewrite --last 5 --timeout 20m --purpose 'Separate retry behavior from prompt rendering' --plan-only
 acd history rewrite --show-plan PLAN_ID
 acd history rewrite --apply PLAN_ID --dry-run
 acd history rewrite --apply PLAN_ID --yes
@@ -39,6 +40,15 @@ changes remain provenance without fabricated output. Local does not claim
 semantic decomposition. It keeps original messages, including title-only ones.
 Use `--edit` to revise them offline. The selected style must match the message;
 Intent requires reasons in generated messages.
+
+New Intent plans measure each proposed commit and independently review groups
+above 200 changed lines for smaller useful steps. A written size explanation
+alone cannot skip that review. Necessary implementation, direct tests and
+generated companions stay together. Use `--purpose` for boundary context and
+`--timeout` to set a planning or apply budget of up to one hour.
+Saved plans retain exact memberships and pinned tree IDs. Validation rebuilds
+each candidate from the selected commits without repeating full repository
+trees in the plan file or worker request.
 
 ~~~bash
 acd history rewrite --last 5 --messages-only --plan-only

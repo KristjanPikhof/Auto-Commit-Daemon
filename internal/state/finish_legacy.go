@@ -286,7 +286,7 @@ func SavedIntentHistoryPlans(ctx context.Context, db *DB) ([]IntentHistoryPlan, 
 
 func decodeRetentionHistoryPlan(key, raw string) (IntentHistoryPlan, error) {
 	var p IntentHistoryPlan
-	if len(raw) > IntentHistoryPlanByteCap || json.Unmarshal([]byte(raw), &p) != nil || (p.Version != 1 && p.Version != IntentHistoryPlanVersion) || p.ID != strings.TrimPrefix(key, "intent.history.plan.") || p.ID == "" {
+	if len(raw) > IntentHistoryPlanByteCap || json.Unmarshal([]byte(raw), &p) != nil || (p.Version < 1 || p.Version > IntentHistoryPlanVersion) || p.ID != strings.TrimPrefix(key, "intent.history.plan.") || p.ID == "" {
 		return p, fmt.Errorf("state: saved history plan identity is invalid: %s", key)
 	}
 	for _, oid := range append(append([]string{p.ExpectedHead}, p.SourceChain...), p.RecreateUnchanged...) {
