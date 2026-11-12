@@ -24,6 +24,10 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Give focused split reviews exact approved diffs when they fit, and
+  distinguish added shared-test coverage from real compatibility breaks.
+- Give focused split reviews the full commit-message rules and one bounded
+  correction for invalid replies, without reusing global correction output.
 - Preserve untouched newer merges when rewriting an earlier linear range,
   including their exact side parents, message, author and final tree.
   Refuse a merge whose side branch would retain the selected old commits.

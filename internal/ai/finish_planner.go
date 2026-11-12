@@ -343,7 +343,9 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 			plan, source, validationErr = validateFinishReply(raw, evidence, options)
 		}
 		if validationErr == nil && options.PartitionOversized && source == nil {
-			plan, validationErr = partitionFinishPlan(ctx, transport, request, evidence, plan, options, &result.Disclosure)
+			partitionRequest := request
+			partitionRequest.Diffs = approvedDiffs
+			plan, validationErr = partitionFinishPlan(ctx, transport, partitionRequest, evidence, plan, options, &result.Disclosure)
 			var fatal *FinishPlanningError
 			if errors.As(validationErr, &fatal) {
 				return result, validationErr
