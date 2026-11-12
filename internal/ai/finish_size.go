@@ -32,18 +32,17 @@ func (failure *finishBoundariesError) Error() string {
 // All errors in a collected result must be approved correction feedback.
 // A compiler rejection cannot hide an operational failure in the same result.
 func correctableFinishCheck(err error) bool {
-	if combined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, failure := range combined.Unwrap() {
-			if !correctableFinishCheck(failure) {
+	switch failure := err.(type) {
+	case interface{ Unwrap() []error }:
+		causes := failure.Unwrap()
+		for _, cause := range causes {
+			if !correctableFinishCheck(cause) {
 				return false
 			}
 		}
-		return len(combined.Unwrap()) > 0
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return correctableFinishCheck(wrapped.Unwrap())
-	}
-	switch err.(type) {
+		return len(causes) > 0
+	case interface{ Unwrap() error }:
+		return correctableFinishCheck(failure.Unwrap())
 	case *SourceCheckFailure, *CommitSizeFailure:
 		return true
 	default:
