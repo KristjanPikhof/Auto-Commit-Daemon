@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -151,11 +152,11 @@ func TestFinishWorkerRefinesBlockedRecordedChange(t *testing.T) {
 	finishCaptureVersion(t, w)
 	final := "group() { printf 'active completed'; }\n\ncapture() { printf note; }\n"
 	finishWrite(t, f.dir, "tasks.sh", final)
-	var reviewCalls int
+	var reviewCalls atomic.Int32
 	var reviewed int
 	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
 		if request.Review != nil {
-			reviewCalls++
+			reviewCalls.Add(1)
 			var observations []map[string]string
 			for _, part := range request.Review.Parts {
 				observations = append(observations, map[string]string{"id": part.ID, "summary": "Review the supplied task control or operator note evidence."})
@@ -210,7 +211,7 @@ func TestFinishWorkerRefinesBlockedRecordedChange(t *testing.T) {
 		t.Fatal("request did not freeze recorded source consent")
 	}
 	completed, err := w.Execute(t.Context(), r.ID)
-	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 2 || completed.EvidenceCalls != reviewCalls {
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 2 || completed.EvidenceCalls != int(reviewCalls.Load()) {
 		t.Fatalf("refined finish did not publish: %s %v", completed.State, err)
 	}
 	first := finishWorkerGit(t, f.dir, "show", "HEAD~2:tasks.sh")
