@@ -204,7 +204,7 @@ have a five-minute wall-clock target. The local gate uses three core shards
 and three support packages in parallel, with at most two parallel tests per
 package process.
 
-Hosted pull requests run four core shards, four production integration shards,
+Hosted pull requests run four core shards, five production integration shards,
 and separate AI and other support lanes on both Ubuntu and macOS. The other
 support lane runs timing-sensitive tests after its package tests finish.
 Repeated daemon stress uses six Ubuntu runners, while

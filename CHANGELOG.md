@@ -18,6 +18,10 @@
 
 ### Changed
 
+- Run five hosted integration shards per platform so cold toolchain setup and
+  compilation fit the existing five-minute job limit without dropping tests.
+- Require Go 1.27.4 for source builds, CI, and releases to include the
+  standard-library security fixes that unblock vulnerability checks.
 - Run three support packages at once in the default local gate and refresh CLI
   shard weights from measured runtimes. Keep the two-test limit within each
   package and all existing cases.
