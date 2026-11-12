@@ -72,12 +72,6 @@ func selectionDraft(selection settingsui.ConfigureSelection) map[string]string {
 	out[config.FieldTimeout] = selection.ProviderTimeout
 	out[config.FieldCAFile] = selection.CAFile
 	out[config.FieldDiffEgress] = fmt.Sprintf("%t", selection.DiffContextApproved)
-	out[config.FieldIntentVerification] = selection.VerificationMode
-	if selection.VerificationMode == "fast" {
-		out[config.FieldVerificationFastCommand] = selection.VerificationCommand
-	} else if selection.VerificationMode == "full" {
-		out[config.FieldVerificationFullCommand] = selection.VerificationCommand
-	}
 	return out
 }
 
@@ -85,10 +79,6 @@ func configureSelectionFromValues(values map[string]string) settingsui.Configure
 	strategy := fallbackConfigureValue(values[config.FieldCommitStrategy], "local")
 	provider := fallbackConfigureValue(values[config.FieldProvider], "deterministic")
 	baseURL := fallbackConfigureValue(values[config.FieldBaseURL], ai.DefaultOpenAIBaseURL)
-	verification := fallbackConfigureValue(
-		values[config.FieldIntentVerification],
-		"none",
-	)
 	selection := settingsui.ConfigureSelection{
 		Strategy:            strategy,
 		CommitFormat:        fallbackConfigureValue(values[config.FieldCommitFormat], "imperative"),
@@ -97,19 +87,7 @@ func configureSelectionFromValues(values map[string]string) settingsui.Configure
 		BaseURL:             baseURL,
 		ProviderTimeout:     fallbackConfigureValue(values[config.FieldTimeout], ai.DefaultProviderTimeout.String()),
 		CAFile:              strings.TrimSpace(values[config.FieldCAFile]),
-		VerificationMode:    verification,
-		ExecutionMode:       "finish",
 		DiffContextApproved: values[config.FieldDiffEgress] == "true",
-	}
-	if verification == "fast" {
-		selection.VerificationCommand =
-			strings.TrimSpace(values[config.FieldVerificationFastCommand])
-	} else if verification == "full" {
-		selection.VerificationCommand =
-			strings.TrimSpace(values[config.FieldVerificationFullCommand])
-	}
-	if selection.VerificationCommand != "" {
-		selection.VerificationSource = "inherited global setting"
 	}
 	selection.EndpointCredentialsApproved = provider == "openai-compat" &&
 		strings.TrimRight(strings.TrimSpace(baseURL), "/") !=
@@ -139,14 +117,6 @@ func selectionProviderConfirmations(selection settingsui.ConfigureSelection) []a
 	}
 	if selection.DiffContextApproved {
 		out = append(out, ai.ConfirmationDiffEgress)
-	}
-	return out
-}
-
-func selectionConfirmations(selection settingsui.ConfigureSelection) []ai.ConfirmationRequirement {
-	out := selectionProviderConfirmations(selection)
-	if selection.VerificationApproved {
-		out = append(out, ai.ConfirmationVerificationCommand)
 	}
 	return out
 }

@@ -14,13 +14,17 @@ import (
 )
 
 const (
-	FinishVersion        = 2
-	FinishRunning        = "running"
-	FinishPrepared       = "prepared"
-	FinishCompleted      = "completed"
-	FinishFailed         = "failed"
-	FinishNeedsAttention = "needs_attention"
-	FinishJSONByteCap    = 8 << 20
+	FinishRecordedSourceVersion   = 6
+	FinishRecordedGroupingVersion = 7
+	FinishPathOwnershipVersion    = 8
+	FinishPartitionVersion        = 9
+	FinishVersion                 = FinishPartitionVersion
+	FinishRunning                 = "running"
+	FinishPrepared                = "prepared"
+	FinishCompleted               = "completed"
+	FinishFailed                  = "failed"
+	FinishNeedsAttention          = "needs_attention"
+	FinishJSONByteCap             = 8 << 20
 )
 
 var (
@@ -33,6 +37,9 @@ var (
 
 // FinishTarget is immutable across attempts. TargetRef pins the complete finish tree;
 // the source checkpoint remains the proof of the original worktree bytes.
+// Version five adds measured review sizes. Version six can refine a blocked
+// recorded version with approved project checks. Older requests keep their
+// original planning and verification contract on retry.
 type FinishTarget struct {
 	Version         int    `json:"version"`
 	RepositoryID    string `json:"repository_id"`
@@ -52,7 +59,9 @@ type FinishTarget struct {
 	Purpose         string `json:"purpose,omitempty"`
 	Message         string `json:"message,omitempty"`
 
-	Checkpoints []FinishCheckpoint `json:"checkpoints,omitempty"`
+	Checkpoints             []FinishCheckpoint `json:"checkpoints,omitempty"`
+	SourceSelection         bool               `json:"source_selection,omitempty"`
+	RecordedSourceSelection bool               `json:"recorded_source_selection,omitempty"`
 }
 
 // FinishCheckpoint pins an exact recorded version independently of checkpoint
@@ -63,8 +72,6 @@ type FinishCheckpoint struct {
 	CommitOID string `json:"commit_oid"`
 	TreeOID   string `json:"tree_oid"`
 }
-
-const FinishCheckpointLimit = 256
 
 // FinishRequest stores one attempt, not a background retry queue. Loading an ID
 // returns its latest attempt; older attempts retain their original evidence.
@@ -78,6 +85,8 @@ type FinishRequest struct {
 	DeadlineTS        float64               `json:"deadline_ts"`
 	PlanningCalls     int                   `json:"planning_calls"`
 	EvidenceCalls     int                   `json:"evidence_calls,omitempty"`
+	AssignmentCalls   int                   `json:"assignment_calls,omitempty"`
+	PartitionCalls    int                   `json:"partition_calls,omitempty"`
 	ReviewedFragments int                   `json:"reviewed_fragments,omitempty"`
 	ReviewFragments   int                   `json:"review_fragments,omitempty"`
 	ReusedFragments   int                   `json:"reused_fragments,omitempty"`
@@ -183,7 +192,7 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 	if target.Version == 0 {
 		target.Version = FinishVersion
 	}
-	if (target.Version != 1 && target.Version != FinishVersion) || (target.Version == 1 && len(target.Checkpoints) > 0) || target.RepositoryID == "" || target.WorktreeID == "" ||
+	if (target.Version < 1 || target.Version > FinishVersion) || (target.Version == 1 && len(target.Checkpoints) > 0) || target.RepositoryID == "" || target.WorktreeID == "" ||
 		!strings.HasPrefix(target.BranchRef, "refs/heads/") || target.CheckpointID == "" ||
 		target.CheckpointTree == "" || target.TargetTree == "" || target.IndexDigest == "" ||
 		target.ConfigDigest == "" || (target.Mode != "local" && target.Mode != "intent") ||
@@ -200,7 +209,13 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 	if target.TargetRef != "" && (!strings.HasPrefix(target.TargetRef, "refs/acd/") || target.TargetCommitOID == "") {
 		return "", ErrFinishIdentity
 	}
-	if len(target.Checkpoints) > FinishCheckpointLimit || (len(target.Checkpoints) > 0 && (target.Mode != "intent" || target.Message != "" || target.IncludeStaged)) {
+	if len(target.Checkpoints) > 0 && (target.Mode != "intent" || target.Message != "" || target.IncludeStaged) {
+		return "", ErrFinishIdentity
+	}
+	if target.SourceSelection && (target.Version < 3 || target.Mode != "intent" || target.Message != "" || len(target.Checkpoints) > 0) {
+		return "", ErrFinishIdentity
+	}
+	if target.RecordedSourceSelection && (target.Version < FinishRecordedSourceVersion || len(target.Checkpoints) == 0) {
 		return "", ErrFinishIdentity
 	}
 	seen := make(map[string]bool)
@@ -241,11 +256,15 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 	r.Result = json.RawMessage(result)
 	r.Publication = json.RawMessage(publication)
 	var progress struct {
-		EvidenceCalls int                   `json:"evidence_calls"`
-		Review        finish.ReviewProgress `json:"review_progress"`
+		EvidenceCalls   int                   `json:"evidence_calls"`
+		AssignmentCalls int                   `json:"assignment_calls"`
+		PartitionCalls  int                   `json:"partition_calls"`
+		Review          finish.ReviewProgress `json:"review_progress"`
 	}
 	if json.Unmarshal(r.Result, &progress) == nil {
 		r.EvidenceCalls = progress.EvidenceCalls
+		r.AssignmentCalls = progress.AssignmentCalls
+		r.PartitionCalls = progress.PartitionCalls
 		r.ReviewProgress = progress.Review
 		r.ReviewedFragments = len(progress.Review.Observations)
 		r.ReviewFragments = progress.Review.TotalFragments
@@ -254,12 +273,16 @@ func scanFinish(row interface{ Scan(...any) error }) (FinishRequest, error) {
 	var saved struct {
 		Disclosure struct {
 			EvidenceCalls   int                        `json:"evidence_calls"`
+			AssignmentCalls int                        `json:"assignment_calls"`
+			PartitionCalls  int                        `json:"partition_calls"`
 			EvidenceReviews []finish.ReviewObservation `json:"evidence_reviews"`
 			ReusedFragments int                        `json:"reused_fragments"`
 		} `json:"disclosure"`
 	}
 	if json.Unmarshal(r.Plan, &saved) == nil {
 		r.EvidenceCalls = max(r.EvidenceCalls, saved.Disclosure.EvidenceCalls)
+		r.AssignmentCalls = max(r.AssignmentCalls, saved.Disclosure.AssignmentCalls)
+		r.PartitionCalls = max(r.PartitionCalls, saved.Disclosure.PartitionCalls)
 		r.ReviewedFragments = max(r.ReviewedFragments, len(saved.Disclosure.EvidenceReviews))
 		if r.PlanningCalls > 0 {
 			r.ReviewFragments = max(r.ReviewFragments, r.ReviewedFragments)
@@ -296,6 +319,15 @@ func LoadFinishRequest(ctx context.Context, db *DB, id string) (FinishRequest, e
 		return FinishRequest{}, ErrSetupRequired
 	}
 	return loadFinish(ctx, db.readSQL(), id)
+}
+
+// Read an earlier rejected candidate chain as evidence for an explicit retry.
+// Its plan and publication state remain immutable.
+func PriorFinishCandidate(ctx context.Context, db *DB, id string, attempt int) (FinishRequest, error) {
+	return scanFinish(db.readSQL().QueryRowContext(ctx, finishSelect+` WHERE request_id=? AND attempt<?
+		AND state='failed' AND reason_code='invalid_provider_plan'
+		AND plan_json<>'' AND json_array_length(plan_json, '$.steps')>0
+		ORDER BY attempt DESC LIMIT 1`, id, attempt))
 }
 
 func activeFinish(ctx context.Context, q finishReader, worktree string) (FinishRequest, error) {
@@ -630,19 +662,37 @@ func ConsumeFinishPlanningCall(ctx context.Context, db *DB, id string, attempt i
 
 // ConsumeFinishEvidenceCall reserves a review in the mutable attempt result
 // journal. The accepted plan remains immutable. Restart cannot reset this
-// separate budget or start another review after global planning has begun.
+// separate budget. Evidence review precedes global planning; path assignment
+// and focused split review follow it and share the same bounded budget.
 func ConsumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt int) (int, error) {
+	return consumeFinishEvidenceCall(ctx, db, id, attempt, "reviewing_evidence")
+}
+
+// Path assignments follow a global proposal and share its evidence call limit.
+func ConsumeFinishAssignmentCall(ctx context.Context, db *DB, id string, attempt int) (int, error) {
+	return consumeFinishEvidenceCall(ctx, db, id, attempt, "assigning_paths")
+}
+
+func ConsumeFinishPartitionCall(ctx context.Context, db *DB, id string, attempt int) (int, error) {
+	return consumeFinishEvidenceCall(ctx, db, id, attempt, "splitting_commits")
+}
+
+func consumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt int, stage string) (int, error) {
 	tx, cleanup, err := beginFinishWrite(ctx, db)
 	if err != nil {
 		return 0, err
 	}
 	defer cleanup()
 	var raw string
-	if err := tx.QueryRowContext(ctx, `SELECT result_json FROM finish_requests WHERE request_id=? AND attempt=? AND state='running' AND planning_calls=0 AND plan_json='' AND deadline_ts>?`, id, attempt, nowSeconds()).Scan(&raw); err != nil {
+	var planningCalls int
+	if err := tx.QueryRowContext(ctx, `SELECT result_json,planning_calls FROM finish_requests WHERE request_id=? AND attempt=? AND state='running' AND plan_json='' AND deadline_ts>?`, id, attempt, nowSeconds()).Scan(&raw, &planningCalls); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, ErrFinishBudget
 		}
 		return 0, err
+	}
+	if (stage != "reviewing_evidence") != (planningCalls > 0) {
+		return 0, ErrFinishBudget
 	}
 	progress := map[string]json.RawMessage{}
 	if raw != "" {
@@ -650,22 +700,35 @@ func ConsumeFinishEvidenceCall(ctx context.Context, db *DB, id string, attempt i
 			return 0, ErrFinishState
 		}
 	}
-	var calls int
-	if encoded, ok := progress["evidence_calls"]; ok {
-		if err := json.Unmarshal(encoded, &calls); err != nil {
+	var counts struct {
+		Evidence   int `json:"evidence_calls"`
+		Assignment int `json:"assignment_calls"`
+		Partition  int `json:"partition_calls"`
+	}
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &counts); err != nil {
 			return 0, ErrFinishState
 		}
 	}
-	if calls < 0 || calls >= finish.EvidenceReviewCallLimit {
+	if counts.Evidence < 0 || counts.Assignment < 0 || counts.Partition < 0 ||
+		counts.Evidence > finish.EvidenceReviewCallLimit || counts.Assignment > finish.EvidenceReviewCallLimit ||
+		counts.Partition > finish.EvidenceReviewCallLimit ||
+		counts.Evidence+counts.Assignment+counts.Partition >= finish.EvidenceReviewCallLimit {
 		return 0, ErrFinishBudget
 	}
-	calls++
-	progress["evidence_calls"], _ = json.Marshal(calls)
+	key, calls := "evidence_calls", counts.Evidence+1
+	switch stage {
+	case "assigning_paths":
+		key, calls = "assignment_calls", counts.Assignment+1
+	case "splitting_commits":
+		key, calls = "partition_calls", counts.Partition+1
+	}
+	progress[key], _ = json.Marshal(calls)
 	encoded, err := json.Marshal(progress)
 	if err != nil || len(encoded) > FinishJSONByteCap {
 		return 0, ErrFinishState
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE finish_requests SET result_json=?,stage='reviewing_evidence',updated_ts=? WHERE request_id=? AND attempt=?`, string(encoded), nowSeconds(), id, attempt); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE finish_requests SET result_json=?,stage=?,updated_ts=? WHERE request_id=? AND attempt=?`, string(encoded), stage, nowSeconds(), id, attempt); err != nil {
 		return 0, err
 	}
 	return calls, tx.Commit()

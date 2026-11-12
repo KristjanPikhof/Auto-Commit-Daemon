@@ -112,7 +112,7 @@ func TestFinishIntentRequiresGroundedContext(t *testing.T) {
 				options.DiffEgress = true
 				options.Diffs = []FinishDiff{{ChangeID: "settings.go", Text: "- return defaults\n+ return authored\n"}}
 			case "exact message":
-				options.Message = "Preserve explicit settings"
+				options.Message = "Preserve explicit settings\n\n- Keep authored values ahead of defaults."
 			case "binary only":
 				options.DiffEgress = true
 				options.Diffs = []FinishDiff{{ChangeID: "settings.go", Binary: true}}
@@ -198,7 +198,7 @@ func TestIntentPlanningRequiresDiffsAcrossEntryPoints(t *testing.T) {
 					options.Diffs = nil
 				}
 				if entry == "exact message" {
-					options.Message = "Preserve authored settings"
+					options.Message = "Preserve authored settings\n\n- Keep authored values ahead of defaults."
 				}
 				paid := 0
 				options.BeforeCall = func(context.Context) error { paid++; return nil }

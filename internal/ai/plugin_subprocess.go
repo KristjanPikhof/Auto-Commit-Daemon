@@ -110,6 +110,10 @@ func (p *SubprocessProvider) EncodeFinishRequest(request FinishPlanRequest) ([]b
 	requestType := "finish_plan"
 	if request.Review != nil {
 		requestType = "finish_evidence"
+	} else if request.AssignPaths != nil {
+		requestType = "finish_assign_paths"
+	} else if len(request.ReviewSizes) > 0 {
+		requestType = "finish_review_sizes"
 	}
 	return json.Marshal(struct {
 		Version       int               `json:"version"`

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -95,30 +94,6 @@ func refreshCredentialRuntime(ctx context.Context, out io.Writer, roots paths.Ro
 }
 
 func credentialRuntimeContract(encoded string) (map[string]string, []ai.ConfirmationRequirement, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(encoded), &raw); err != nil {
-		return nil, nil, errors.New("active runtime settings are unreadable")
-	}
-	var confirmations []ai.ConfirmationRequirement
-	if data := raw["confirmations"]; len(data) > 0 {
-		if err := json.Unmarshal(data, &confirmations); err != nil {
-			return nil, nil, errors.New("active runtime approvals are unreadable")
-		}
-	}
-	values := make(map[string]string)
-	for _, field := range config.Catalog() {
-		if field.Sensitive {
-			continue
-		}
-		data, found := raw[field.Name]
-		if !found {
-			continue
-		}
-		var value string
-		if err := json.Unmarshal(data, &value); err != nil {
-			return nil, nil, fmt.Errorf("Active running ACD setting %s is unreadable.", field.Name)
-		}
-		values[field.Name] = value
-	}
-	return values, confirmations, nil
+	resolved, err := finishSnapshotValues(encoded)
+	return resolved.values, resolved.approved, err
 }

@@ -484,7 +484,7 @@ func productListDisplayStatus(entry productListEntry) string {
 		status = "checking protection"
 	}
 	if f := entry.PublicationOutcome.Finish; f != nil && (f.State == state.FinishRunning || f.State == state.FinishPrepared) {
-		status = finishStageLabel(f.Stage)
+		status = finishStatusSummary(f)
 	}
 	if h := entry.PublicationOutcome.History; h != nil {
 		status = "history rewrite: " + strings.ReplaceAll(h.State, "_", " ")

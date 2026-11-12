@@ -99,18 +99,26 @@ an editor or agent exits. A worker heartbeat shows liveness, not publication.
 
 ~~~bash
 acd finish
-acd finish --message "Update setup guidance"
-acd finish --dry-run "Add offline checkout"
+acd finish "Keep checkout available when the network is down"
+acd finish --dry-run
 acd finish --include-staged
 acd finish --retry REQUEST_ID
 ~~~
 
-For Intent, give context about what changed and why so ACD can explain useful
-steps within the task. Generated messages include a short reason or concrete
-impact. Intent requires approved redacted code diffs; binary-only changes also
-need completion context or an exact message.
-`--message` deliberately creates one batch and disables automatic splitting.
+The quoted text is optional completion context. It can span paragraphs with
+problems, decisions and constraints that help ACD understand the changes. Intent
+reads it alongside approved redacted diffs, chooses useful commit boundaries and
+writes messages explaining why. Without context, it infers purpose from the code.
+Binary-only changes need context or an exact message because their content is
+unavailable to the planner. Local creates one offline batch, includes any supplied
+context and otherwise uses an honest batch description. An empty target creates
+no commit.
 See the [Intent flow](docs/intent-commit-flow.md) for recorded versions and previews.
+
+New Intent requests aim for complete steps of at most 200 changed lines each.
+ACD measures each proposed commit against its predecessor. A larger step needs
+an explanation in its commit body of why it must stay together. Required callers
+and tests stay with their change; file counts do not determine the boundaries.
 
 Finish freezes a fresh complete checkpoint, the attached branch and HEAD, and
 its options. It builds and checks the whole commit chain privately before one
@@ -142,10 +150,14 @@ new workflows. The alias has no separate drain or publication engine.
 
 ## Messages, providers, and checks
 
-Local uses one honest batch summary, or your supplied purpose/message. Intent
+Local creates one offline batch with optional context. Intent
 plans goals before assigning paths. Implementation, callers, tests, generated
 output, and relevant docs stay together when they complete one goal. A split
 needs a useful review or revert boundary and a valid intermediate tree.
+With approved project checks, Intent can use exact frozen lines to split
+eligible text changes. This includes a recorded version that blocks a split
+between independent changes. Every intermediate commit must pass before the
+branch moves. See the [Intent flow](docs/intent-commit-flow.md).
 
 Intent reviews large evidence in bounded batches, then makes one global
 planning call and at most one correction within its saved deadline. For large
@@ -167,16 +179,15 @@ acd config --repo .
 | Imperative (default) | `Preserve staged content during finish` |
 | Conventional | `fix: preserve staged content` |
 
-Conventional messages use the scope-free `type: subject` form. `--message` supplies
-the complete message and must match the selected style. It does not bypass the
-provider in Intent mode.
+Conventional messages use the scope-free `type: subject` form. The advanced
+`--message` override supplies one exact commit message, disables splitting and
+must match the selected style. Its body is optional. It does not bypass the
+provider in Intent mode; AI-generated messages always require a reason.
 
 Every finish checks coverage, dependencies, Git structure, and exact target
-equality. The default `none` policy and `structural` skip project commands.
-Approved `fast` or `full` policies run configured commands against each private
-candidate, outside your worktree. Status reports commands that ran, identical
-results reused, and checks that were not configured. Structural checks alone do
-not mean project tests passed.
+equality. The default, `none`, skips project commands. To run an approved
+command against each proposed commit in isolation, enable the
+[optional project check](docs/settings.md#project-checks) for that repository.
 
 Git-ignored and sensitive paths stay outside protection. Excluded tracked entries
 and submodule entries remain in the finish base tree. Intent setup includes
@@ -276,7 +287,7 @@ Project branches, tags, commits, staging, and working files stay unchanged.
 - [Integrations](docs/multi-tool.md)
 - [Changelog](CHANGELOG.md)
 
-Building from source requires Go 1.27.3 or later:
+Building from source requires Go 1.27.4 or later:
 
 ~~~bash
 make build
@@ -285,11 +296,11 @@ make test
 ~~~
 
 The local gate uses three core shards and at most two parallel tests per package.
-Hosted CI has four core and four production integration shards on Ubuntu and
-macOS, separate AI and other support lanes, six Ubuntu daemon stress runners,
-and two Git/state stress runners. The other support lane runs the timing-sensitive
-verification test after its package tests finish. Each leaf has a five-minute
-limit. The complete workflow and local gate have a five-minute target; keep
+Hosted CI has four core and five production integration shards on Ubuntu and
+macOS, two AI support shards and one other support lane, six Ubuntu daemon
+stress runners, and two Git/state stress runners. The other support lane runs
+the timing-sensitive verification test after its package tests finish. Each leaf
+has a five-minute limit. The complete workflow and local gate have a five-minute target; keep
 checks sharded rather than dropping scenarios.
 
 Set `ACD_TEST_RESULTS_DIR` outside the checkout to retain JSON timings and shard

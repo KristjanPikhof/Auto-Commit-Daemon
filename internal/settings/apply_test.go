@@ -188,11 +188,11 @@ func TestSettingsIntentApplyRequiresCommandConsent(t *testing.T) {
 		return ai.ProviderProbeResult{Provider: "openai-compat", Success: true}, nil
 	})
 	draft := map[string]string{
-		config.FieldCommitStrategy:          "intent",
-		config.FieldDiffEgress:              "true",
-		config.FieldProvider:                "openai-compat",
-		config.FieldIntentVerification:      "fast",
-		config.FieldVerificationFastCommand: "go test ./...",
+		config.FieldCommitStrategy:      "intent",
+		config.FieldDiffEgress:          "true",
+		config.FieldProvider:            "openai-compat",
+		config.FieldIntentVerification:  "project",
+		config.FieldVerificationCommand: "go test ./...",
 	}
 	all := []ai.ConfirmationRequirement{
 		ai.ConfirmationDiffEgress,

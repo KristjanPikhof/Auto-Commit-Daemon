@@ -149,7 +149,7 @@ func TestFinishCLIConfigExactCommandConsentAndCredentials(t *testing.T) {
 			if consent {
 				confirmed = append(confirmed, string(ai.ConfirmationVerificationCommand))
 			}
-			finishConfigRevision(t, runtime.db, map[string]any{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldDiffEgress: true, config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "printf approved", config.FieldVerificationFastTimeout: "17s", "confirmations": confirmed}, sql.NullInt64{}, true)
+			finishConfigRevision(t, runtime.db, map[string]any{config.FieldCommitStrategy: "intent", config.FieldProvider: "openai-compat", config.FieldDiffEgress: true, config.FieldIntentVerification: "project", config.FieldVerificationCommand: "printf approved", config.FieldVerificationTimeout: "17s", "confirmations": confirmed}, sql.NullInt64{}, true)
 			t.Setenv("ACD_AI_API_KEY", "first-token")
 			got, err := resolveFinishWorkerConfig(context.Background(), roots, runtime)
 			if !consent {
@@ -201,6 +201,81 @@ func TestFinishCLIConfigGlobalApprovalBindsEffectiveValues(t *testing.T) {
 	}
 }
 
+func TestFinishCLIConfigLegacyApprovedProjectCheckKeepsIdentity(t *testing.T) {
+	for _, mode := range []string{"fast", "full", "structural"} {
+		t.Run(mode, func(t *testing.T) {
+			roots, runtime := finishConfigFixture(t)
+			payload := map[string]any{
+				config.FieldIntentVerification: mode,
+				"verification.fast.command":    "printf quick",
+				"verification.fast.timeout":    "17s",
+				"verification.full.command":    "printf complete",
+				"confirmations":                []string{"verification_command"},
+			}
+			revision, _ := finishConfigRevision(t, runtime.db, payload, sql.NullInt64{}, true)
+			resolved, err := finishSnapshotValues(revision.SnapshotJSON)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPolicy, wantCommand, wantTimeout := "project", "printf quick", "17s"
+			if mode == "full" {
+				wantCommand, wantTimeout = "printf complete", "10m0s"
+			} else if mode == "structural" {
+				wantPolicy, wantCommand, wantTimeout = "none", "", "2m0s"
+			}
+			values := resolved.values
+			if values[config.FieldIntentVerification] != wantPolicy ||
+				values[config.FieldVerificationCommand] != wantCommand ||
+				values[config.FieldVerificationTimeout] != wantTimeout {
+				t.Fatalf("displayed settings = %v", values)
+			}
+			got, err := resolveFinishWorkerConfig(t.Context(), roots, runtime)
+			if err != nil || got.VerificationMode != mode || got.ConfigDigest != fmt.Sprintf("revision:%d:%s", revision.ID, revision.SnapshotHash) {
+				t.Fatalf("legacy runtime identity changed: %+v: %v", got, err)
+			}
+			if identity := got.Command.Identity(); wantPolicy == "project" {
+				duration, _ := time.ParseDuration(wantTimeout)
+				if string(identity.Mode) != mode || identity.Timeout != duration || identity.ApprovalID != got.ConfigDigest {
+					t.Fatalf("legacy command identity changed: %+v", identity)
+				}
+			} else if identity.Digest != "" {
+				t.Fatalf("disabled project command was loaded: %+v", identity)
+			}
+		})
+	}
+}
+
+func TestFinishCLIConfigLegacyGlobalApprovalKeepsUncheckedIdentity(t *testing.T) {
+	roots, runtime := finishConfigFixture(t)
+	store := config.NewStore(roots)
+	var fingerprint string
+	if err := store.Update(func(doc *config.Document) error {
+		global := doc.Settings.Global
+		global[config.FieldCommitStrategy] = json.RawMessage(`"intent"`)
+		global[config.FieldProvider] = json.RawMessage(`"subprocess:approved"`)
+		global[config.FieldDiffEgress] = json.RawMessage(`true`)
+		global[config.FieldIntentVerification] = json.RawMessage(`"structural"`)
+		global["verification.fast.command"] = json.RawMessage(`"exit 42"`)
+		input := config.ResolveInput{Global: global}
+		values, err := finishResolveValues(input)
+		if err != nil {
+			return err
+		}
+		fingerprint, err = config.LegacyUncheckedFingerprint(values, input)
+		doc.Settings.GlobalSetupApproval = &config.GlobalSetupApproval{
+			Generation: doc.Generation + 1, Fingerprint: fingerprint,
+			Confirmations: []string{"diff_egress", "subprocess_execution"},
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveFinishWorkerConfig(t.Context(), roots, runtime)
+	if err != nil || got.ConfigDigest != fingerprint || got.VerificationMode != "structural" || got.Command.Identity().Digest != "" {
+		t.Fatalf("unchecked legacy config identity or approval changed: %+v: %v", got, err)
+	}
+}
+
 func TestFinishCLIConfigLegacyDefaultsAndAbsentAuthor(t *testing.T) {
 	roots, runtime := finishConfigFixture(t)
 	if err := os.MkdirAll(roots.Config, 0o700); err != nil {
@@ -216,8 +291,9 @@ func TestFinishCLIConfigLegacyDefaultsAndAbsentAuthor(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	values, approved, err := finishSavedValues(roots, runtime.worktree.Root)
-	if err != nil || values[config.FieldIntentVerification] != "full" || values[config.FieldDiffEgress] != "true" || len(approved) != 0 {
+	resolved, err := finishSavedValues(roots, runtime.worktree.Root)
+	values, approved := resolved.values, resolved.approved
+	if err != nil || values[config.FieldIntentVerification] != "project" || values[config.FieldDiffEgress] != "true" || len(approved) != 0 {
 		t.Fatalf("legacy choices/consent changed %v %v: %v", values, approved, err)
 	}
 	if _, err := resolveFinishWorkerConfig(context.Background(), roots, runtime); err == nil || !strings.Contains(err.Error(), "approval") {

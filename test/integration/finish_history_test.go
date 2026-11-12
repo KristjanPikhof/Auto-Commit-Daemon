@@ -38,7 +38,11 @@ func TestFinishWorkflowHistorySavedPlanPreservesMembershipAndAuthors(t *testing.
 						writeFile(t, filepath.Join(f.Repo, "stored.go"), spec.body)
 						runGitOK(t, f.Repo, "add", "stored.go")
 					}
-					runGitOK(t, f.Repo, "-c", "user.name="+spec.author, "-c", "user.email="+strings.ReplaceAll(spec.author, " ", "")+"@example.test", "commit", "--allow-empty", "-qm", spec.message)
+					message := spec.message + "\n\n- Keep this authored choice available as a separate rollback boundary."
+					if style == finish.StyleConventional {
+						message = "chore: " + strings.ToLower(message[:1]) + message[1:]
+					}
+					runGitOK(t, f.Repo, "-c", "user.name="+spec.author, "-c", "user.email="+strings.ReplaceAll(spec.author, " ", "")+"@example.test", "commit", "--allow-empty", "-qm", message)
 					originals = append(originals, strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")))
 				}
 				f.Barrier(t, ctx)
@@ -56,7 +60,7 @@ func TestFinishWorkflowHistorySavedPlanPreservesMembershipAndAuthors(t *testing.
 					if style == finish.StyleConventional {
 						message = "chore: " + message
 					}
-					goals = append(goals, finish.Goal{Purpose: "Preserve each recorded history boundary", Boundary: "Keep the original recorded membership", Message: message, ChangeIDs: []string{oid}})
+					goals = append(goals, finish.Goal{Purpose: "Preserve each recorded history boundary", Boundary: "Keep the original recorded membership", Reason: strings.TrimPrefix(strings.SplitN(message, "\n\n", 2)[1], "- "), Message: message, ChangeIDs: []string{oid}})
 				}
 				response, _ := json.Marshal(map[string]any{"version": 1, "finish_plan": map[string]any{"goals": goals}})
 				script := fmt.Sprintf("#!/bin/sh\nwhile IFS= read -r line; do printf 'call\\n' >> '%s'; printf '%%s\\n' '%s'; done\n", calls, response)
@@ -141,7 +145,7 @@ func TestFinishWorkflowHistoryPurposefulGoalsAndStaleRefusal(t *testing.T) {
 		runGitOK(t, f.Repo, "commit", "-qm", "Record protection changes")
 	}
 	f.Barrier(t, ctx)
-	response := `{"version":1,"finish_plan":{"goals":[{"purpose":"Require retained protection","boundary":"Protection behavior and its direct regression complete one change","message":"Require retained protection\n\n- Keep protection behavior and its direct test together","change_ids":["1","2"]}]}}`
+	response := `{"version":1,"finish_plan":{"goals":[{"purpose":"Require retained protection","reason":"Keep protection behavior and its direct test together","boundary":"Protection behavior and its direct regression complete one change","message":"Require retained protection\n\n- Keep protection behavior and its direct test together","change_ids":["1","2"]}]}}`
 	if err := os.WriteFile(filepath.Join(pluginDir, "acd-provider-purpose"), []byte("#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' '"+response+"'; done\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -179,5 +183,38 @@ func TestFinishWorkflowHistoryPurposefulGoalsAndStaleRefusal(t *testing.T) {
 	finishDecodeJSON(t, f.Run(t, ctx, "history", "rewrite", "--show-plan", planPath, "--json"), &saved)
 	if saved.ID != plan.ID {
 		t.Fatal("refused apply mutated saved plan")
+	}
+}
+
+func TestFinishWorkflowHistoryKeepsNewerMerge(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	f := newFinishFixture(t)
+	writeFile(t, filepath.Join(f.Repo, "selected.txt"), "selected completed change\n")
+	runGitOK(t, f.Repo, "add", "selected.txt")
+	runGitOK(t, f.Repo, "commit", "-qm", "Preserve selected change")
+	selected := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	runGitOK(t, f.Repo, "switch", "-c", "side", f.BaseHead)
+	writeFile(t, filepath.Join(f.Repo, "side.txt"), "independent side branch\n")
+	runGitOK(t, f.Repo, "add", "side.txt")
+	runGitOK(t, f.Repo, "commit", "-qm", "Preserve independent feature")
+	side := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	runGitOK(t, f.Repo, "switch", "main")
+	runGitOK(t, f.Repo, "merge", "--no-ff", "-m", "Merge independent feature", "side")
+	head := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	tree := runGitOK(t, f.Repo, "rev-parse", "HEAD^{tree}")
+	f.Barrier(t, ctx)
+	planPath := filepath.Join(t.TempDir(), "merge.json")
+	var plan state.IntentHistoryPlan
+	finishDecodeJSON(t, f.Run(t, ctx, "history", "rewrite", "--range-sha", f.BaseHead+".."+selected, "--plan-only", "--plan-out", planPath, "--json"), &plan)
+	if result := f.Run(t, ctx, "history", "rewrite", "--apply", planPath, "--yes"); result.ExitCode != 0 {
+		t.Fatalf("apply below newer merge: %+v", result)
+	}
+	parents := strings.Fields(runGitOK(t, f.Repo, "show", "-s", "--format=%P", "HEAD"))
+	if len(parents) != 2 || parents[1] != side || parents[0] == selected || runGitOK(t, f.Repo, "rev-parse", "HEAD^{tree}") != tree {
+		t.Fatal("history apply flattened the merge or changed final files")
+	}
+	if backup := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "refs/acd/rewrite-backups/"+plan.ID)); backup != head {
+		t.Fatal("original merge was not backed up")
 	}
 }

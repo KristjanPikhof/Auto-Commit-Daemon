@@ -37,6 +37,12 @@ var retiredFinishFields = map[string]bool{
 
 // UnsupportedFieldError distinguishes removed publication controls from typos.
 func UnsupportedFieldError(name string) error {
+	switch name {
+	case "verification.fast.command", "verification.full.command":
+		return fmt.Errorf("acd config: use %s in place of %s", FieldVerificationCommand, name)
+	case "verification.fast.timeout", "verification.full.timeout":
+		return fmt.Errorf("acd config: use %s in place of %s", FieldVerificationTimeout, name)
+	}
 	if retiredFinishFields[name] {
 		return fmt.Errorf("acd config: setting %q was removed; use acd finish for completed work and acd setup to upgrade legacy configuration", name)
 	}

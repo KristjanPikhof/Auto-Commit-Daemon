@@ -151,12 +151,12 @@ func TestFinishFaultPreparedRestartBeforeAndAfterCAS(t *testing.T) {
 				t.Fatal(err)
 			}
 			worker := daemon.FinishWorker{RepoPath: f.Repo, RepositoryID: f.RepositoryID, DB: db, Config: daemon.FinishWorkerConfig{Mode: "local", Style: "imperative", ConfigDigest: "approved-restart-fixture", AuthorName: "ACD Integration", AuthorEmail: "integration@example.com", VerificationMode: "none", VerificationTimeout: time.Minute}}
-			request, created, err := worker.Start(t.Context(), daemon.FinishOptions{Purpose: "Complete restart goal", Message: "Complete restart goal"})
+			request, created, err := worker.Start(t.Context(), daemon.FinishOptions{Purpose: "Complete restart goal", Message: "Complete restart goal\n\n- Recover the accepted publication without replanning."})
 			if err != nil || !created {
 				db.Close()
 				t.Fatalf("frozen restart request: %+v %v", request, err)
 			}
-			proof, err := gitpkg.BuildFinishChain(t.Context(), f.Repo, gitpkg.FinishBuildOptions{RequestID: request.ID, Attempt: request.Attempt, WorktreeID: request.Target.WorktreeID, BranchRef: request.Target.BranchRef, ExpectedHead: request.Target.ExpectedHead, TargetTree: request.Target.TargetTree, IndexDigest: request.Target.IndexDigest, ObjectRef: gitpkg.FinishRefPrefix + request.ID + "/prepared", Commits: []gitpkg.FinishCommit{{TreeOID: request.Target.TargetTree, Message: "Complete restart goal", AuthorName: "ACD Integration", AuthorEmail: "integration@example.com"}}})
+			proof, err := gitpkg.BuildFinishChain(t.Context(), f.Repo, gitpkg.FinishBuildOptions{RequestID: request.ID, Attempt: request.Attempt, WorktreeID: request.Target.WorktreeID, BranchRef: request.Target.BranchRef, ExpectedHead: request.Target.ExpectedHead, TargetTree: request.Target.TargetTree, IndexDigest: request.Target.IndexDigest, ObjectRef: gitpkg.FinishRefPrefix + request.ID + "/prepared", Commits: []gitpkg.FinishCommit{{TreeOID: request.Target.TargetTree, Message: "Complete restart goal\n\n- Recover the accepted publication without replanning.", AuthorName: "ACD Integration", AuthorEmail: "integration@example.com"}}})
 			if err != nil {
 				db.Close()
 				t.Fatal(err)
@@ -298,7 +298,7 @@ func TestFinishFaultRealScannerPrivacyAndSymlink(t *testing.T) {
 			t.Fatalf("excluded bytes entered checkpoint: %s", tree)
 		}
 	}
-	result := finishRunJSON(t, f, "finish", "Complete eligible goal", "--message", "Complete eligible goal")
+	result := finishRunJSON(t, f, "finish", "Complete eligible goal", "--message", "Complete eligible goal\n\n- Keep the approved work separate from later edits.")
 	if !result.OK || !result.Data.Published {
 		t.Fatalf("eligible finish %+v", result)
 	}
@@ -325,7 +325,7 @@ func TestFinishFaultExcludedTrackedDeleteAndUnsafeGitProtection(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "eligible goal\n")
 	f.Barrier(t, t.Context())
-	result := finishRunJSON(t, f, "finish", "Complete eligible goal", "--message", "Complete eligible goal")
+	result := finishRunJSON(t, f, "finish", "Complete eligible goal", "--message", "Complete eligible goal\n\n- Keep the approved work separate from later edits.")
 	if !result.OK || !result.Data.Published {
 		t.Fatalf("finish: %+v", result)
 	}

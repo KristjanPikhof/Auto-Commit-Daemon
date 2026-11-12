@@ -51,15 +51,28 @@ func finishStageLabel(stage string) string {
 	switch stage {
 	case "reviewing_evidence":
 		return "Reviewing saved changes in bounded batches."
-	case "planning", "preparing":
-		return "Preparing your commits."
+	case "preparing":
+		return "Preparing saved changes."
+	case "planning":
+		return "Waiting for Intent to propose commits."
+	case "assigning_paths":
+		return "Assigning remaining files to proposed commits."
+	case "splitting_commits":
+		return "Splitting oversized commits into complete changes."
 	case "verifying":
 		return "Checking the proposed commits."
 	case "publishing", "prepared":
-		return "Adding the prepared commits to your branch."
+		return "Publishing the verified commits to your branch."
 	default:
 		return "Finish is in progress."
 	}
+}
+
+func finishFailureReason(code, reason string) string {
+	if code == "provider_deadline" {
+		return "The Intent attempt ran out of time."
+	}
+	return consoleCause(reason)
 }
 
 func finishCheckLabel(check daemon.FinishCheck) string {

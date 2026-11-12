@@ -105,6 +105,13 @@ func (s *Service) Snapshot(ctx context.Context, scope Scope, profileName string)
 				activeValues[name] = cleanText(text)
 			}
 		}
+		for _, name := range []string{config.FieldIntentVerification, config.FieldVerificationCommand, config.FieldVerificationTimeout} {
+			value, err := config.ResolveField(name, config.ResolveInput{Global: raw})
+			if err != nil {
+				return Snapshot{}, sanitizeError(err)
+			}
+			activeValues[name] = value.EffectiveValue()
+		}
 	}
 	resolvedFields, err := config.ResolveAll(currentInput)
 	if err != nil {

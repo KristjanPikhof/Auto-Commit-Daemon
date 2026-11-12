@@ -88,13 +88,13 @@ func TestFinishConfigLegacyPresetFallbackPreservesEffectiveChoices(t *testing.T)
 		name, global, profile, repository, verification, egress string
 		env                                                     map[string]string
 	}{
-		{name: "quality approved command", global: `"commit.strategy":"intent","commit.preset":"quality","verification.full.command":"approved check"`, verification: "full", egress: "true"},
-		{name: "implicit balanced", global: `"commit.strategy":"intent"`, verification: "structural", egress: "true"},
+		{name: "quality approved command", global: `"commit.strategy":"intent","commit.preset":"quality","verification.full.command":"approved check"`, verification: "project", egress: "true"},
+		{name: "implicit balanced", global: `"commit.strategy":"intent"`, verification: "none", egress: "true"},
 		{name: "repository event overrides implicit balanced", global: `"commit.strategy":"intent"`, repository: `"commit.strategy":" event "`, verification: "none", egress: "false"},
-		{name: "inherited profile quality", global: `"commit.strategy":"intent"`, profile: `"commit.preset":"quality"`, verification: "full", egress: "true"},
-		{name: "explicit global policy overrides profile preset", global: `"commit.strategy":"intent","intent.verification":"fast","verification.fast.command":"approved check","ai.diff_egress":false`, profile: `"commit.preset":"quality"`, verification: "fast", egress: "false"},
+		{name: "inherited profile quality", global: `"commit.strategy":"intent"`, profile: `"commit.preset":"quality"`, verification: "project", egress: "true"},
+		{name: "explicit global policy overrides profile preset", global: `"commit.strategy":"intent","intent.verification":"fast","verification.fast.command":"approved check","ai.diff_egress":false`, profile: `"commit.preset":"quality"`, verification: "project", egress: "false"},
 		{name: "environment beats derived choice", global: `"commit.strategy":"intent","commit.preset":"quality"`, env: map[string]string{"ACD_INTENT_VERIFICATION": "none", "ACD_AI_DIFF_EGRESS": "false"}, verification: "none", egress: "false"},
-		{name: "legacy environment preset", env: map[string]string{"ACD_COMMIT_STRATEGY": "intent", "ACD_COMMIT_PRESET": "quality"}, verification: "full", egress: "true"},
+		{name: "legacy environment preset", env: map[string]string{"ACD_COMMIT_STRATEGY": "intent", "ACD_COMMIT_PRESET": "quality"}, verification: "project", egress: "true"},
 		{name: "event quality preserves privacy request", global: `"commit.strategy":"event","commit.preset":"quality"`, verification: "none", egress: "true"},
 	}
 	for _, tc := range cases {

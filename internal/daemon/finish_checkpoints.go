@@ -11,6 +11,12 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
+type FinishCheckpointProgress struct {
+	Scanned  int  `json:"scanned"`
+	Kept     int  `json:"kept"`
+	Complete bool `json:"complete"`
+}
+
 func finishVersionPaths(changes []finish.Change) []string {
 	var paths []string
 	for _, change := range changes {
@@ -65,15 +71,11 @@ func (w *FinishWorker) freezeFinishCheckpoints(ctx context.Context, wt git.Workt
 	if len(paths) == 0 {
 		return nil, nil
 	}
-	checkpoints, err := state.FinishCheckpoints(ctx, w.DB, cp)
-	if err != nil {
-		return nil, err
-	}
 	current := base
 	var versions []state.FinishCheckpoint
-	for _, source := range checkpoints {
+	visit := func(source state.Checkpoint) error {
 		proof := state.FinishCheckpoint{ID: source.ID, Ref: source.Ref, CommitOID: source.CommitOID, TreeOID: source.TreeOID}
-		err := withFinishVersion(ctx, wt.Root, proof, paths, func(locked context.Context, snapshot finish.Tree) error {
+		return withFinishVersion(ctx, wt.Root, proof, paths, func(locked context.Context, snapshot finish.Tree) error {
 			next := finishVersionTree(current, snapshot, paths)
 			if maps.Equal(current, next) || maps.Equal(next, frozen) {
 				return nil
@@ -87,9 +89,25 @@ func (w *FinishWorker) freezeFinishCheckpoints(ctx context.Context, wt git.Workt
 			current = next
 			return nil
 		})
-		if err != nil {
-			return nil, err
+	}
+	var scanned int
+	if w.OnCheckpointScan != nil {
+		w.OnCheckpointScan(FinishCheckpointProgress{})
+	}
+	err := state.WalkFinishCheckpointBatches(ctx, w.DB, cp, func(batch []state.Checkpoint, last bool) error {
+		for _, source := range batch {
+			if err := visit(source); err != nil {
+				return err
+			}
 		}
+		scanned += len(batch)
+		if w.OnCheckpointScan != nil {
+			w.OnCheckpointScan(FinishCheckpointProgress{Scanned: scanned, Kept: len(versions), Complete: last})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return versions, nil
 }

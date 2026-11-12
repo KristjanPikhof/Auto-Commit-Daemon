@@ -14,21 +14,23 @@ const (
 )
 
 type Request struct {
-	Version      int             `json:"version"`
-	ID           string          `json:"id"`
-	Method       string          `json:"method"`
-	RepositoryID string          `json:"repository_id,omitempty"`
-	WorktreeID   string          `json:"worktree_id,omitempty"`
-	DeadlineMS   int64           `json:"deadline_ms,omitempty"`
-	Params       json.RawMessage `json:"params,omitempty"`
+	Version        int             `json:"version"`
+	ID             string          `json:"id"`
+	Method         string          `json:"method"`
+	RepositoryID   string          `json:"repository_id,omitempty"`
+	WorktreeID     string          `json:"worktree_id,omitempty"`
+	DeadlineMS     int64           `json:"deadline_ms,omitempty"`
+	Params         json.RawMessage `json:"params,omitempty"`
+	ReportProgress bool            `json:"report_progress,omitempty"`
 }
 
 type Response struct {
-	Version int            `json:"version"`
-	ID      string         `json:"id"`
-	OK      bool           `json:"ok"`
-	Data    any            `json:"data,omitempty"`
-	Error   *ProtocolError `json:"error,omitempty"`
+	Version  int             `json:"version"`
+	ID       string          `json:"id"`
+	OK       bool            `json:"ok"`
+	Data     any             `json:"data,omitempty"`
+	Error    *ProtocolError  `json:"error,omitempty"`
+	Progress json.RawMessage `json:"progress,omitempty"`
 }
 
 type ProtocolError struct {

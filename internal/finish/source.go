@@ -1,0 +1,306 @@
+package finish
+
+import (
+	"bytes"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"hash"
+	"maps"
+	"sort"
+	"unicode/utf8"
+)
+
+// SourceEdit selects one existing line. A deletion names a BeforeLine; an
+// insertion copies AfterLine before BeforeLine in the original file. Positions
+// are zero-based and never refer to a partly constructed intermediate file.
+type SourceEdit struct {
+	ID         string
+	Kind       string
+	BeforeLine int
+	AfterLine  int
+}
+
+// SourceFile binds a complete edit catalogue to one frozen change. Modes,
+// paths, authors and object identities come from that change, not the planner.
+type SourceFile struct {
+	ChangeID string
+	Before   []byte
+	After    []byte
+	Edits    []SourceEdit
+}
+
+// SourcePlan translates source selections into exact file-version evidence for
+// the ordinary plan validator. Blobs must be written and the complete candidate
+// chain checked by the caller before publication. Structural validity alone
+// does not prove that intermediate code compiles or completes a useful purpose.
+type SourcePlan struct {
+	Evidence   Evidence
+	Plan       Plan
+	Selections []Goal
+	Blobs      map[string][]byte
+}
+
+type sourceFile struct {
+	before [][]byte
+	after  [][]byte
+	edits  []SourceEdit
+}
+
+// BuildSourcePlan accepts only selections of the supplied frozen bytes. It
+// cannot accept new code, omit surviving edits, cross authors, or split renames.
+// Files without a source catalogue remain indivisible recorded changes.
+func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (SourcePlan, error) {
+	for _, change := range evidence.Changes {
+		if len(change.DependsOn) != 0 || change.Before != evidence.Base[change.Path] || change.After != evidence.Target[change.Path] {
+			return SourcePlan{}, planError("source selections require frozen net changes")
+		}
+	}
+	return BuildRecordedSourcePlan(evidence, files, goals)
+}
+
+// BuildRecordedSourcePlan replays whole recorded versions and selected lines in
+// the same chain. A partly selected version must finish before its successor.
+func BuildRecordedSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (SourcePlan, error) {
+	if err := ValidateEvidence(evidence); err != nil {
+		return SourcePlan{}, err
+	}
+	original := make(map[string]Change)
+	catalogue := make(map[string]Change)
+	order := make(map[string]int)
+	for i, change := range evidence.Changes {
+		original[change.ID], catalogue[change.ID], order[change.ID] = change, change, i
+	}
+	sources := make(map[string]sourceFile)
+	for _, file := range files {
+		change, ok := original[file.ChangeID]
+		if !ok {
+			return SourcePlan{}, planError("unknown source change %q", file.ChangeID)
+		}
+		if _, exists := sources[change.ID]; exists {
+			return SourcePlan{}, planError("duplicate source change %q", change.ID)
+		}
+		created := change.Before == (Entry{})
+		if change.AtomicGroup != "" || (change.After.Mode != "100644" && change.After.Mode != "100755") ||
+			(!created && (change.Before.Mode != change.After.Mode || len(change.Before.OID) != len(change.After.OID))) {
+			return SourcePlan{}, planError("source selections require a new or unchanged-mode text file: %q", change.Path)
+		}
+		if !utf8.Valid(file.Before) || !utf8.Valid(file.After) || bytes.IndexByte(file.Before, 0) >= 0 || bytes.IndexByte(file.After, 0) >= 0 ||
+			(created && (len(file.Before) != 0 || len(file.After) == 0)) ||
+			(!created && sourceBlobOID(file.Before, len(change.Before.OID)) != change.Before.OID) || sourceBlobOID(file.After, len(change.After.OID)) != change.After.OID {
+			return SourcePlan{}, planError("source bytes do not match the frozen objects for %q", change.Path)
+		}
+		source := sourceFile{before: sourceLines(file.Before), after: sourceLines(file.After), edits: file.Edits}
+		deletions, insertions := make(map[int]bool), make(map[int]bool)
+		delete(catalogue, change.ID)
+		for _, edit := range file.Edits {
+			if edit.ID == "" || !safeText(edit.ID) {
+				return SourcePlan{}, planError("source edit needs a safe identifier")
+			}
+			if _, exists := catalogue[edit.ID]; exists {
+				return SourcePlan{}, planError("duplicate source edit %q", edit.ID)
+			}
+			if _, exists := original[edit.ID]; exists {
+				return SourcePlan{}, planError("source edit %q collides with a recorded change", edit.ID)
+			}
+			switch edit.Kind {
+			case "delete":
+				if edit.BeforeLine < 0 || edit.BeforeLine >= len(source.before) || edit.AfterLine != 0 || deletions[edit.BeforeLine] {
+					return SourcePlan{}, planError("invalid or repeated deletion %q", edit.ID)
+				}
+				deletions[edit.BeforeLine] = true
+			case "insert":
+				if edit.BeforeLine < 0 || edit.BeforeLine > len(source.before) || edit.AfterLine < 0 || edit.AfterLine >= len(source.after) || insertions[edit.AfterLine] {
+					return SourcePlan{}, planError("invalid or repeated insertion %q", edit.ID)
+				}
+				insertions[edit.AfterLine] = true
+			default:
+				return SourcePlan{}, planError("unknown source edit kind %q", edit.Kind)
+			}
+			catalogue[edit.ID] = change
+		}
+		all := make(map[string]bool)
+		for _, edit := range file.Edits {
+			all[edit.ID] = true
+		}
+		if len(all) == 0 || !bytes.Equal(source.compose(all), file.After) {
+			return SourcePlan{}, planError("source edits do not reproduce the frozen target for %q", change.Path)
+		}
+		sources[change.ID] = source
+	}
+	used := make(map[string]bool)
+	for _, goal := range goals {
+		for _, id := range goal.ChangeIDs {
+			if _, exists := catalogue[id]; !exists || used[id] {
+				return SourcePlan{}, planError("unknown or multiply assigned source selection %q", id)
+			}
+			used[id] = true
+		}
+	}
+	if len(used) != len(catalogue) {
+		return SourcePlan{}, planError("source plan must assign every frozen edit exactly once")
+	}
+	result := SourcePlan{Evidence: Evidence{Base: CloneTree(evidence.Base), Target: CloneTree(evidence.Target)}, Blobs: make(map[string][]byte)}
+	current, selected := CloneTree(evidence.Base), make(map[string]bool)
+	lastVersion := make(map[string]int)
+	partial := make(map[string]string)
+	applied := make(map[string]int)
+	atomicOwners := make(map[string]int)
+	var derivedGoals []Goal
+	for index, goal := range goals {
+		previous := CloneTree(current)
+		touched := make(map[string]Change)
+		counts := make(map[string]int)
+		var ordered []Change
+		var author string
+		for n, id := range goal.ChangeIDs {
+			change := catalogue[id]
+			if n > 0 && author != change.Author {
+				return SourcePlan{}, planError("source step %d crosses an author boundary", index+1)
+			}
+			author = change.Author
+			selected[id] = true
+			if counts[change.ID] == 0 {
+				ordered = append(ordered, change)
+			}
+			counts[change.ID]++
+		}
+		sort.Slice(ordered, func(i, j int) bool { return order[ordered[i].ID] < order[ordered[j].ID] })
+		for _, change := range ordered {
+			if order[change.ID] < lastVersion[change.Path] || (partial[change.Path] != "" && partial[change.Path] != change.ID) {
+				return SourcePlan{}, planError("recorded version order changed for %q", change.Path)
+			}
+			for _, prerequisite := range change.DependsOn {
+				if applied[prerequisite] == 0 || applied[prerequisite] < len(sources[prerequisite].edits) {
+					return SourcePlan{}, planError("change %q is missing prerequisite %q", change.ID, prerequisite)
+				}
+			}
+			if group := change.AtomicGroup; group != "" {
+				if owner, exists := atomicOwners[group]; exists && owner != index {
+					return SourcePlan{}, planError("atomic group %q was split", group)
+				}
+				atomicOwners[group] = index
+			}
+			if source, exists := sources[change.ID]; exists {
+				if applied[change.ID] == 0 && current[change.Path] != change.Before {
+					return SourcePlan{}, planError("source selection %q needs its recorded starting version", change.ID)
+				}
+				content := source.compose(selected)
+				oid := sourceBlobOID(content, len(change.After.OID))
+				current[change.Path] = Entry{Mode: change.After.Mode, OID: oid}
+				if oid != change.Before.OID && oid != change.After.OID {
+					result.Blobs[oid] = content
+				}
+				partial[change.Path] = change.ID
+				if applied[change.ID]+counts[change.ID] == len(source.edits) {
+					delete(partial, change.Path)
+				}
+			} else {
+				if err := apply(current, change); err != nil {
+					return SourcePlan{}, err
+				}
+			}
+			applied[change.ID] += counts[change.ID]
+			lastVersion[change.Path] = order[change.ID]
+			touched[change.Path] = change
+		}
+		selection := goal
+		selection.ChangeIDs = append([]string(nil), goal.ChangeIDs...)
+		result.Selections = append(result.Selections, selection)
+		goal.ChangeIDs = nil
+		for n, change := range NetChanges(previous, current, author) {
+			origin := touched[change.Path]
+			change.ID = fmt.Sprintf("source-step-%d-%d", index+1, n+1)
+			change.Author = origin.Author
+			change.AtomicGroup = origin.AtomicGroup
+			change.Provenance = origin.Provenance
+			if change.Provenance == "" {
+				change.Provenance = origin.ID
+			}
+			result.Evidence.Changes = append(result.Evidence.Changes, change)
+			goal.ChangeIDs = append(goal.ChangeIDs, change.ID)
+		}
+		derivedGoals = append(derivedGoals, goal)
+	}
+	if !maps.Equal(current, evidence.Target) {
+		return SourcePlan{}, planError("source plan changed the frozen target")
+	}
+	plan, err := Build(result.Evidence, derivedGoals)
+	if err != nil {
+		return SourcePlan{}, err
+	}
+	result.Plan = plan
+	return result, nil
+}
+
+func (source sourceFile) compose(selected map[string]bool) []byte {
+	var result bytes.Buffer
+	source.walk(selected, func(line []byte, _ string) { result.Write(line) })
+	return result.Bytes()
+}
+
+// LineSelection identifies the frozen edit at a zero-based candidate line.
+// An unchanged base line names its pending deletion when one exists, allowing
+// a diagnostic to identify a consumer that has not yet received its update.
+func (file SourceFile) LineSelection(selected map[string]bool, line int) string {
+	source := sourceFile{before: sourceLines(file.Before), after: sourceLines(file.After), edits: file.Edits}
+	index, id := 0, ""
+	source.walk(selected, func(_ []byte, selection string) {
+		if index == line {
+			id = selection
+		}
+		index++
+	})
+	return id
+}
+
+func (source sourceFile) walk(selected map[string]bool, emit func([]byte, string)) {
+	deleted := make(map[int]bool)
+	baseIDs := make(map[int]string)
+	inserted := make(map[int][]SourceEdit)
+	for _, edit := range source.edits {
+		if edit.Kind == "delete" {
+			baseIDs[edit.BeforeLine] = edit.ID
+		}
+		if !selected[edit.ID] {
+			continue
+		}
+		if edit.Kind == "delete" {
+			deleted[edit.BeforeLine] = true
+		} else {
+			inserted[edit.BeforeLine] = append(inserted[edit.BeforeLine], edit)
+		}
+	}
+	for index := 0; index <= len(source.before); index++ {
+		edits := inserted[index]
+		sort.Slice(edits, func(i, j int) bool { return edits[i].AfterLine < edits[j].AfterLine })
+		for _, edit := range edits {
+			emit(source.after[edit.AfterLine], edit.ID)
+		}
+		if index < len(source.before) && !deleted[index] {
+			emit(source.before[index], baseIDs[index])
+		}
+	}
+}
+
+func sourceLines(content []byte) [][]byte {
+	if len(content) == 0 {
+		return nil
+	}
+	lines := bytes.SplitAfter(content, []byte{'\n'})
+	if len(lines[len(lines)-1]) == 0 {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func sourceBlobOID(content []byte, oidLength int) string {
+	var digest hash.Hash = sha1.New()
+	if oidLength == 64 {
+		digest = sha256.New()
+	}
+	fmt.Fprintf(digest, "blob %d\x00", len(content))
+	digest.Write(content)
+	return hex.EncodeToString(digest.Sum(nil))
+}
