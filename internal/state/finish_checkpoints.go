@@ -7,10 +7,10 @@ import (
 
 const finishCheckpointBatchSize = 256
 
-// WalkFinishCheckpoints reads only current protection snapshots in the same
+// WalkFinishCheckpointBatches reads only current protection snapshots in the same
 // uninterrupted observed branch/HEAD window. Legacy captures and restore or
 // migration snapshots never become a new finish's planning source.
-func WalkFinishCheckpoints(ctx context.Context, db *DB, target Checkpoint, visit func(Checkpoint) error) error {
+func WalkFinishCheckpointBatches(ctx context.Context, db *DB, target Checkpoint, visit func([]Checkpoint, bool) error) error {
 	tx, err := db.ReadSQL().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
@@ -31,12 +31,11 @@ func WalkFinishCheckpoints(ctx context.Context, db *DB, target Checkpoint, visit
 		if err != nil {
 			return err
 		}
-		for _, cp := range batch {
-			if err := visit(cp); err != nil {
-				return err
-			}
+		last := len(batch) < finishCheckpointBatchSize
+		if err := visit(batch, last); err != nil {
+			return err
 		}
-		if len(batch) < finishCheckpointBatchSize {
+		if last {
 			return nil
 		}
 		after = batch[len(batch)-1].Seq

@@ -24,6 +24,18 @@ type finishStartParams struct {
 	Timeout       time.Duration `json:"timeout,omitempty"`
 }
 
+type finishCheckProgress struct {
+	requestID string
+	attempt   int
+	Commit    int `json:"commit"`
+	Total     int `json:"total"`
+}
+
+type finishWorkerResponse struct {
+	state.FinishRequest
+	Checking *finishCheckProgress `json:"checking,omitempty"`
+}
+
 func decodeFinishParams(raw json.RawMessage, dst any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -54,7 +66,11 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 		if err != nil {
 			return nil, finishProtocolError(err)
 		}
-		return r, nil
+		response := finishWorkerResponse{FinishRequest: r}
+		if check := runtime.finishCheck.Load(); r.Stage == "verifying" && check != nil && check.requestID == r.ID && check.attempt == r.Attempt {
+			response.Checking = check
+		}
+		return response, nil
 	}
 	var params finishStartParams
 	if err := decodeFinishParams(request.Params, &params); err != nil {
@@ -112,12 +128,18 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 		return nil, finishProtocolError(err)
 	}
 	worker := &daemon.FinishWorker{RepoPath: runtime.worktree.Root, RepositoryID: h.repositoryID, DB: runtime.db, Config: cfg, OperationGate: runtime.gate, ProtectionGate: runtime.protectionGate}
+	if request.ReportProgress {
+		worker.OnCheckpointScan = func(progress daemon.FinishCheckpointProgress) {
+			supervisor.ReportWorkerProgress(ctx, progress)
+		}
+	}
 	runtime.gate.RLock()
 	r, created, err := worker.Start(ctx, daemon.FinishOptions{Purpose: params.Purpose, Message: params.Message, DryRun: params.DryRun, IncludeStaged: params.IncludeStaged, RetryID: params.RetryID, Timeout: params.Timeout})
 	runtime.gate.RUnlock()
 	if err != nil {
 		return nil, finishProtocolError(err)
 	}
+	worker.OnCheckpointScan = nil
 	if created && r.State == state.FinishRunning {
 		runtime.finishJobs.Add(1)
 		runtime.activeFinishJobs.Add(1)
@@ -126,6 +148,9 @@ func (h *repositoryWorkerHandler) handleFinish(ctx context.Context, runtime *wor
 			defer runtime.activeFinishJobs.Add(-1)
 			runtime.gate.RLock()
 			defer runtime.gate.RUnlock()
+			worker.OnCommitCheck = func(commit, total int) {
+				runtime.finishCheck.Store(&finishCheckProgress{requestID: r.ID, attempt: r.Attempt, Commit: commit, Total: total})
+			}
 			_, _ = worker.Execute(runtime.workerCtx, r.ID)
 		}()
 	}
@@ -147,27 +172,28 @@ func finishProtocolError(err error) *supervisor.ProtocolError {
 	return &supervisor.ProtocolError{Code: code, Message: ai.SanitizePlannerError(err.Error()), Retryable: errors.Is(err, context.DeadlineExceeded)}
 }
 
-func finishRequest(ctx context.Context, lookup controlRepoLookup, method string, params any) (state.FinishRequest, error) {
+func finishRequest(ctx context.Context, lookup controlRepoLookup, method string, params any, onProgress func(json.RawMessage)) (finishWorkerResponse, error) {
 	raw, err := json.Marshal(params)
 	if err != nil {
-		return state.FinishRequest{}, err
+		return finishWorkerResponse{}, err
 	}
 	timeout := 30 * time.Second
 	if method == "finish_start" {
 		timeout = supervisor.CheckpointBarrierTimeout
 	}
-	response, err := supervisor.DoWorker(ctx, supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), supervisor.Request{Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("finish-%d", time.Now().UnixNano()), Method: method, RepositoryID: lookup.Record.RepositoryID, WorktreeID: lookup.Record.WorktreeID, Params: raw, DeadlineMS: time.Now().Add(timeout).UnixMilli()}, timeout)
+	client := supervisor.Client{SocketPath: supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), Timeout: timeout, OnProgress: onProgress}
+	response, err := client.Do(ctx, supervisor.Request{Version: supervisor.ProtocolVersion, ID: fmt.Sprintf("finish-%d", time.Now().UnixNano()), Method: method, RepositoryID: lookup.Record.RepositoryID, WorktreeID: lookup.Record.WorktreeID, Params: raw, DeadlineMS: time.Now().Add(timeout).UnixMilli()})
 	if err != nil {
-		return state.FinishRequest{}, unavailableError("acd finish: protection worker unavailable; run `acd on` or `acd setup` to update the runtime")
+		return finishWorkerResponse{}, unavailableError("acd finish: protection worker unavailable; run `acd on` or `acd setup` to update the runtime")
 	}
 	if response.Error != nil {
 		if response.Error.Code == "invalid_request" {
-			return state.FinishRequest{}, actionRequiredError("runtime_upgrade_required", "acd finish: runtime does not support finish; run `acd setup`")
+			return finishWorkerResponse{}, actionRequiredError("runtime_upgrade_required", "acd finish: runtime does not support finish; run `acd setup`")
 		}
 		if response.Error.Code == "finish_not_found" || response.Error.Code == "finish_identity_mismatch" {
-			return state.FinishRequest{}, &CommandError{Code: response.Error.Code, Message: response.Error.Message, Exit: ExitInvalid}
+			return finishWorkerResponse{}, &CommandError{Code: response.Error.Code, Message: response.Error.Message, Exit: ExitInvalid}
 		}
-		return state.FinishRequest{}, &CommandError{Code: response.Error.Code, Message: response.Error.Message, Exit: ExitActionRequired, Retryable: response.Error.Retryable}
+		return finishWorkerResponse{}, &CommandError{Code: response.Error.Code, Message: response.Error.Message, Exit: ExitActionRequired, Retryable: response.Error.Retryable}
 	}
-	return decodeProductData[state.FinishRequest](response.Data)
+	return decodeProductData[finishWorkerResponse](response.Data)
 }

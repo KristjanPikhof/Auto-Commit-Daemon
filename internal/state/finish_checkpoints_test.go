@@ -133,8 +133,8 @@ func TestFinishCheckpointsStayInsideCurrentProtectionWindow(t *testing.T) {
 			target := put(4, false)
 			put(5, false) // A later save is outside this frozen request.
 			var got []Checkpoint
-			err := WalkFinishCheckpoints(t.Context(), db, target, func(cp Checkpoint) error {
-				got = append(got, cp)
+			err := WalkFinishCheckpointBatches(t.Context(), db, target, func(batch []Checkpoint, _ bool) error {
+				got = append(got, batch...)
 				return nil
 			})
 			if err != nil || len(got) != 1 || got[0].ID != current.ID {

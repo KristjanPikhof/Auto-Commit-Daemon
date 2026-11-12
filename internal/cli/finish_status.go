@@ -552,12 +552,12 @@ func finishStatusSummary(f *finishStatusReport) string {
 		if f.ReasonCode == "finish_preserved" {
 			return "Interrupted finish preserved. Review current changes before a new finish."
 		}
-		return "Failed: " + consoleCause(f.Reason) + " The requested changes remain saved."
+		return "Failed: " + finishFailureReason(f.ReasonCode, f.Reason) + " The requested changes remain saved."
 	case state.FinishNeedsAttention:
 		return "Needs attention: " + consoleCause(f.Reason) + " The requested changes remain saved."
 	}
 	if f.Stage == "reviewing_evidence" && f.ReviewFragments > 0 {
-		return fmt.Sprintf("Reviewing saved changes: %d/%d fragments (%d reused).", f.ReviewedFragments, f.ReviewFragments, f.ReusedFragments)
+		return finishReviewProgressLabel(f.ReviewedFragments, f.ReviewFragments, f.ReusedFragments) + "."
 	}
 	stage := f.Stage
 	if stage == "" {

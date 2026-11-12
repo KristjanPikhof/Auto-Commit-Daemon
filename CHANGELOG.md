@@ -24,6 +24,9 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Show checkpoint scan totals and retained versions during Intent finish.
+  Distinguish evidence preparation, planning, commit checks, and publication,
+  and explain when the Intent attempt runs out of time.
 - Read Intent checkpoints in batches so a branch with more than 256 saved
   checkpoints can finish. Verify the complete commit chain before publishing it
   in one branch update.
