@@ -1,4 +1,4 @@
-// Package finish describes explicit completion plans using recorded file versions.
+// Package finish describes explicit completion plans using immutable file versions.
 // It owns no repository, provider, queue, or durable lifecycle state.
 package finish
 
