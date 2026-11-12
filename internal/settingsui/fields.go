@@ -23,7 +23,7 @@ var fieldDescriptors = []FieldDescriptor{
 	{Key: "ai.diff_egress", Label: "Share changes with AI", Description: "Required for Intent: send redacted code diffs to your AI service; filtering cannot guarantee that all secrets are removed", Choices: []string{"false", "true"}},
 	{Key: "commit.strategy", Label: "Finish mode", Description: "Local makes one commit; Intent asks AI to group completed work", Choices: []string{"local", "intent"}},
 	{Key: "commit.format", Label: "Commit format", Description: "Imperative or conventional", Choices: []string{"imperative", "conventional"}},
-	{Key: "intent.verification", Label: "Checks before committing", Description: "Checks ACD runs before adding finished work to Git", Choices: []string{"none", "structural", "fast", "full"}},
+	{Key: "intent.verification", Label: "Checks before committing", Description: "Quick/full project checks let Intent split edits within a file when no intermediate versions are saved. Other modes group saved file versions.", Choices: []string{"none", "structural", "fast", "full"}},
 	{Key: "verification.fast.command", Label: "Quick check command", Description: "Command ACD may run in this repository before committing"},
 	{Key: "verification.fast.timeout", Label: "Quick check time limit", Description: "Maximum time allowed for the quick check"},
 	{Key: "verification.full.command", Label: "Full check command", Description: "Command ACD may run in this repository before committing"},

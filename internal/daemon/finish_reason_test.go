@@ -32,7 +32,11 @@ func TestFinishWorkerProtectsWorkWhenDecisionsCannotBeExplained(t *testing.T) {
 			}}
 			r := startFinishWorker(t, w, FinishOptions{Purpose: "Keep the connection verified when focus writes the same key"})
 			completed, err := w.Execute(t.Context(), r.ID)
-			if err == nil || completed.State != state.FinishFailed || completed.ReasonCode != "invalid_provider_plan" {
+			wantReason := "invalid_provider_plan"
+			if scenario == "inseparable purposes" {
+				wantReason = "provider_boundaries_unavailable"
+			}
+			if err == nil || completed.State != state.FinishFailed || completed.ReasonCode != wantReason {
 				t.Fatalf("unexplained commit accepted: %+v %v", completed, err)
 			}
 			if finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != r.Target.ExpectedHead {

@@ -115,6 +115,11 @@ context and otherwise uses an honest batch description. An empty target creates
 no commit.
 See the [Intent flow](docs/intent-commit-flow.md) for recorded versions and previews.
 
+New Intent requests aim for complete steps of at most 200 changed lines each.
+ACD measures each proposed commit against its predecessor. A larger step needs
+an explanation in its commit body of why it must stay together. Required callers
+and tests stay with their change; file counts do not determine the boundaries.
+
 Finish freezes a fresh complete checkpoint, the attached branch and HEAD, and
 its options. It builds and checks the whole commit chain privately before one
 branch update. Later edits keep entering checkpoints for the next finish. The

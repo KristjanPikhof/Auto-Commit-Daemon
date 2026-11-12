@@ -92,9 +92,10 @@ type FinishCheck struct {
 
 type FinishPlanStep struct {
 	finish.Goal
-	TreeOID string      `json:"tree_oid"`
-	Author  string      `json:"author"`
-	Check   FinishCheck `json:"check"`
+	TreeOID    string            `json:"tree_oid"`
+	Author     string            `json:"author"`
+	Check      FinishCheck       `json:"check"`
+	ReviewSize *FinishReviewSize `json:"review_size,omitempty"`
 }
 
 // FinishSavedPlan avoids storing a full tree map for every candidate. Exact
@@ -799,15 +800,36 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 			return saved, git.FinishPublicationProof{}, errors.Join(err, state.ErrFinishIdentity)
 		}
 	}
-	for _, step := range plan.Steps {
+	reviewTarget := finishReviewTarget(r.Target)
+	previousTree := r.Target.ExpectedHead
+	if reviewTarget > 0 && previousTree == "" {
+		var err error
+		previousTree, err = materializeFinishTree(verifyCtx, wt, w.DB, plan.Base)
+		if err != nil {
+			return saved, git.FinishPublicationProof{}, err
+		}
+	}
+	var candidateFailures []error
+	for index, step := range plan.Steps {
 		tree, err := materializeFinishTree(verifyCtx, wt, w.DB, step.Tree)
 		if err != nil {
 			return saved, git.FinishPublicationProof{}, err
 		}
-		saved.Steps = append(saved.Steps, FinishPlanStep{Goal: step.Goal, TreeOID: tree, Author: step.Author})
+		savedStep := FinishPlanStep{Goal: step.Goal, TreeOID: tree, Author: step.Author}
+		if reviewTarget > 0 {
+			size, err := measureFinishReviewSize(verifyCtx, wt.Root, previousTree, tree)
+			if err != nil {
+				return saved, git.FinishPublicationProof{}, err
+			}
+			savedStep.ReviewSize = &size
+			if size.ChangedLines > reviewTarget && strings.TrimSpace(step.LargeChangeReason) == "" {
+				candidateFailures = append(candidateFailures, &ai.CommitSizeFailure{Step: index + 1, ChangedLines: size.ChangedLines, ChangedFiles: size.ChangedFiles, Limit: reviewTarget})
+			}
+			previousTree = tree
+		}
+		saved.Steps = append(saved.Steps, savedStep)
 		commits = append(commits, git.FinishCommit{TreeOID: tree, Message: step.Message, AuthorName: cfg.AuthorName, AuthorEmail: cfg.AuthorEmail})
 	}
-	var sourceFailures []error
 	proof, err := git.BuildFinishChain(verifyCtx, wt.Root, git.FinishBuildOptions{RequestID: r.ID, Attempt: r.Attempt, WorktreeID: r.Target.WorktreeID, BranchRef: r.Target.BranchRef, ExpectedHead: r.Target.ExpectedHead, TargetTree: r.Target.TargetTree, IndexDigest: r.Target.IndexDigest, IncludeStaged: r.Target.IncludeStaged, ObjectRef: git.FinishRefPrefix + r.Target.WorktreeID + "/" + r.ID + "/" + strconv.Itoa(r.Attempt) + "/chain", Commits: commits, Verify: func(checkCtx context.Context, index int, oid, tree string) error {
 		check := FinishCheck{TreeOID: tree, Policy: cfg.VerificationMode}
 		result, checkErr := evaluatePublication(checkCtx, func(jobCtx context.Context) (verification.Result, error) {
@@ -823,15 +845,15 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 		if checkErr != nil {
 			return checkErr
 		}
-		if planned.Source != nil && check.Executed && check.Result.Status == verification.StatusFailed {
-			sourceFailures = append(sourceFailures, &ai.SourceCheckFailure{Step: index + 1, Output: check.Result.Output})
+		if (planned.Source != nil || reviewTarget > 0) && check.Executed && check.Result.Status == verification.StatusFailed {
+			candidateFailures = append(candidateFailures, &ai.SourceCheckFailure{Step: index + 1, Output: check.Result.Output})
 		} else if check.Result.Status != verification.StatusPassed || check.Result.NeedsAttention {
 			return fmt.Errorf("finish: candidate verification %s", check.Result.Status)
 		}
 		// Fail inside the verifier after checking every candidate, before Git
 		// can pin or prepare a rejected chain for publication.
 		if index == len(saved.Steps)-1 {
-			return errors.Join(sourceFailures...)
+			return errors.Join(candidateFailures...)
 		}
 		return nil
 	}})
@@ -904,16 +926,20 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		return result, err
 	}
 	var checked *finishPreparedPlan
-	verifySource := func(checkCtx context.Context, built finish.SourcePlan) error {
+	verifyPlan := func(checkCtx context.Context, plan finish.Plan, built *finish.SourcePlan) error {
 		if _, err := state.UpdateFinishRequest(checkCtx, w.DB, r.ID, r.Attempt, state.FinishRunning, state.FinishUpdate{State: state.FinishRunning, Stage: "verifying"}); err != nil {
 			return err
 		}
-		candidate := finishPlanningResult{Plan: built.Plan, Evidence: built.Evidence, Blobs: built.Blobs, Source: sourceProof(evidence, sourceFiles, built.Selections)}
+		candidate := finishPlanningResult{Plan: plan, Evidence: evidence}
+		if built != nil {
+			candidate.Evidence, candidate.Blobs = built.Evidence, built.Blobs
+			candidate.Source = sourceProof(evidence, sourceFiles, built.Selections)
+		}
 		saved, proof, err := w.prepare(checkCtx, wt, cfg, r, candidate)
 		checked = &finishPreparedPlan{saved: saved, proof: proof}
 		return err
 	}
-	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{SourceFiles: sourceFiles, VerifySource: verifySource, MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, ReviewIdentity: string(identity), ReviewProgress: r.ReviewProgress, SaveReviewProgress: func(saveCtx context.Context, progress finish.ReviewProgress) error {
+	options := ai.FinishOptions{SourceFiles: sourceFiles, ReviewLineTarget: finishReviewTarget(r.Target), MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, ReviewIdentity: string(identity), ReviewProgress: r.ReviewProgress, SaveReviewProgress: func(saveCtx context.Context, progress finish.ReviewProgress) error {
 		return state.SaveFinishReviewProgress(saveCtx, w.DB, r.ID, r.Attempt, progress)
 	}, BeforeEvidenceCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishEvidenceCall(callCtx, w.DB, r.ID, r.Attempt)
@@ -921,7 +947,15 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	}, BeforeCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
-	}})
+	}}
+	if options.ReviewLineTarget > 0 {
+		options.VerifyPlan = verifyPlan
+	} else {
+		options.VerifySource = func(checkCtx context.Context, built finish.SourcePlan) error {
+			return verifyPlan(checkCtx, built.Plan, &built)
+		}
+	}
+	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, options)
 	result.Plan, result.Disclosure, result.Checked = planned.Plan, planned.Disclosure, checked
 	if len(sourceFiles) > 0 {
 		result.Source = sourceProof(evidence, sourceFiles, nil)

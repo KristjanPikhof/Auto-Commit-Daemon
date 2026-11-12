@@ -93,6 +93,23 @@ func TestEditorModelIsEditableAndSaveIsOneReviewedAction(t *testing.T) {
 		t.Fatal("accessible editor emitted control sequences")
 	}
 }
+
+func TestEditorVerificationExplainsSourceSplitting(t *testing.T) {
+	var out bytes.Buffer
+	field := EditorField{Key: config.FieldIntentVerification, Value: "none"}
+	value, inherited, err := editEditorField(t.Context(), field, "repo", EditorOptions{
+		Input: &bytewiseReader{strings.NewReader("1\n")}, Output: &out, Accessible: true, NoColor: true,
+	}, func(string) error { return nil })
+	if err != nil || inherited || value != "none" {
+		t.Fatalf("reading check options changed the selection: value=%q inherited=%v err=%v\n%s", value, inherited, err, out.String())
+	}
+	for _, want := range []string{"Quick/full project checks", "split edits within a file", "when no intermediate versions are saved", "Other modes group saved file versions"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("checks selector omitted %q:\n%s", want, out.String())
+		}
+	}
+}
+
 func TestEditorDeclinedReviewAndDirtyCancelNeverSave(t *testing.T) {
 	b := &editorFake{}
 	out, err := runEditorInput(t, b, "2\n1\nnew-model\n8\nn\n9\ny\n", "")

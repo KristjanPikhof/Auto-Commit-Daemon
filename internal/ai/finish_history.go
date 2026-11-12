@@ -26,9 +26,15 @@ func finishPrompt(request FinishPlanRequest) string {
 		return finishReviewPrompt
 	}
 	if len(request.SourceEdits) > 0 {
+		if request.ReviewLineTarget > 0 && request.Message == "" {
+			return finishSourcePrompt + finishSmallStepsPrompt
+		}
 		return finishSourcePrompt
 	}
 	if len(request.HistoryCommits) == 0 {
+		if request.ReviewLineTarget > 0 && request.Message == "" {
+			return finishSystemPrompt + finishSmallStepsPrompt
+		}
 		return finishSystemPrompt
 	}
 	return finishSystemPrompt + `

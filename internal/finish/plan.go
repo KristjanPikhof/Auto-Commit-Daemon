@@ -43,9 +43,12 @@ type Goal struct {
 	Boundary string `json:"boundary,omitempty"`
 	// Reason is the evidenced decision explanation also present in Message.
 	// Older saved plans and offline batches may not have this field.
-	Reason    string   `json:"reason,omitempty"`
-	Message   string   `json:"message"`
-	ChangeIDs []string `json:"change_ids"`
+	Reason string `json:"reason,omitempty"`
+	// LargeChangeReason explains why an unusually large step must stay together.
+	// New finish requests require this explanation in the published body.
+	LargeChangeReason string   `json:"large_change_reason,omitempty"`
+	Message           string   `json:"message"`
+	ChangeIDs         []string `json:"change_ids"`
 }
 
 type Step struct {

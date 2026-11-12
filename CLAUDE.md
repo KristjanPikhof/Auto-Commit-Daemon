@@ -136,6 +136,12 @@ Each split needs a useful review or revert boundary and a valid intermediate
 state. Put prerequisites before consumers or in the same commit. Explain
 the reason or practical impact in each generated message, not only internal
 planning metadata. Explain broader defaults and behavior changes from evidence.
+Version-five generated Intent requests measure each candidate against its
+preceding tree and use 200 changed lines as a review target. Larger steps need
+a concrete large-change explanation in the Git body. Keep required callers,
+tests and generated companions together; do not split solely to meet a count.
+Collect measured size failures and project-check failures for the same bounded
+correction. Older requests and exact messages retain their frozen rules.
 New final-only Intent requests with approved fast/full checks may construct
 intermediate text versions from exact frozen base/target line selections. New
 version-four requests may also stage new Go and Swift files from exact target

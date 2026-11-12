@@ -32,6 +32,10 @@ Without context, Intent infers purpose from the changes. Binary-only changes
 need context because their content is unavailable to the planner. Local creates
 one offline batch and includes any supplied context.
 
+With approved fast/full project checks, Intent can split edits within a file
+when no intermediate versions are saved. Otherwise, it groups saved file
+versions. Configure checks for this repository with acd config --repo .
+
 Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
 --include-staged to include your exact current staged selection. Use --retry
@@ -213,6 +217,19 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			next = "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"
 		} else if r.ReasonCode == "provider_diffs_required" {
 			next = "Approve code sharing with acd config, then start a new acd finish"
+		} else if r.ReasonCode == "provider_boundaries_unavailable" {
+			command := "acd finish --repo " + productListShellQuote(lookup.Worktree.Root)
+			if r.Target.IncludeStaged {
+				command += " --include-staged"
+			}
+			if r.DryRun {
+				command += " --dry-run"
+			}
+			if !r.Target.SourceSelection && len(r.Target.Checkpoints) == 0 {
+				next = fmt.Sprintf("Run `acd config --repo %s` to approve fast/full project checks, then start a new request with `%s`", productListShellQuote(lookup.Worktree.Root), command)
+			} else {
+				next = "Save smaller complete steps, then start a new request with `" + command + "`"
+			}
 		} else {
 			next = "acd finish --retry " + r.ID
 			if !detached && r.ReasonCode == "provider_deadline" {
@@ -221,7 +238,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 				next += " --timeout " + budget.String()
 			}
 		}
-		if r.DryRun && r.State != state.FinishNeedsAttention && r.ReasonCode != "provider_diffs_required" && r.ReasonCode != "provider_input_too_large" {
+		if r.DryRun && r.State != state.FinishNeedsAttention && r.ReasonCode != "provider_diffs_required" && r.ReasonCode != "provider_input_too_large" && r.ReasonCode != "provider_boundaries_unavailable" {
 			next += " --dry-run"
 		}
 	}
@@ -267,6 +284,9 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			}
 			for _, step := range plan.Steps {
 				fmt.Fprintf(out, "%s\n  %s\n", consoleProse(step.Message), finishCheckLabel(step.Check))
+				if step.ReviewSize != nil {
+					fmt.Fprintf(out, "  %d changed lines across %d files\n", step.ReviewSize.ChangedLines, step.ReviewSize.ChangedFiles)
+				}
 				if step.Boundary != "" {
 					fmt.Fprintf(out, "  Boundary: %s\n", consoleProse(step.Boundary))
 				}
@@ -311,7 +331,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 		if next != "" {
 			label := "Optional"
-			if r.State == state.FinishNeedsAttention {
+			if r.State == state.FinishNeedsAttention || r.ReasonCode == "provider_boundaries_unavailable" {
 				label = "Action required"
 			}
 			fmt.Fprintf(out, "\n%s: %s\n", label, next)
@@ -374,7 +394,7 @@ func productWorktreeChangeCount(ctx context.Context, repo string) (int, error) {
 
 func finishNeedsNewRequest(code string) bool {
 	switch code {
-	case "provider_context_required", "provider_diffs_required", "provider_input_too_large":
+	case "provider_context_required", "provider_diffs_required", "provider_input_too_large", "provider_boundaries_unavailable":
 		return true
 	default:
 		return false

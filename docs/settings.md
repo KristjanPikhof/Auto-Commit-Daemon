@@ -116,6 +116,13 @@ runs it in isolated candidate trees using the configured timeout. A missing
 command is reported as missing; a structural pass is not a test-suite pass.
 Reused evidence is labelled reused.
 
+Without useful earlier checkpoint versions, `fast` or `full` also permits
+splitting eligible files into exact source-line selections. `none` and
+`structural` can only group recorded whole versions. Earlier snapshots may
+contain useful intermediate steps absent from the final files, so ACD retains
+that planning path even when project checks are enabled. A finish that lacks
+usable boundaries needs a new request after changing its evidence or settings.
+
 ## Credentials and privacy
 
 ~~~bash

@@ -54,19 +54,36 @@ func finishCLIFixture(t *testing.T) (controlRepoLookup, *workerRuntime, *reposit
 
 func TestFinishCLIPreviewExplainsEvidenceAndDecisionBoundary(t *testing.T) {
 	lookup, _, _ := finishCLIFixture(t)
-	plan, _ := json.Marshal(daemon.FinishSavedPlan{Disclosure: ai.FinishDisclosure{MetadataIncluded: true}, Steps: []daemon.FinishPlanStep{{Goal: finish.Goal{
-		Message:  "Preserve selected models\n\n- Preference edits should not reset the selected model.",
-		Boundary: "Review model selection separately from Fast requests",
-	}}}})
-	r := state.FinishRequest{ID: "finish-preview", State: state.FinishCompleted, DryRun: true, Target: state.FinishTarget{Mode: "intent"}, Plan: plan, Result: json.RawMessage(`{"dry_run":true}`)}
-	var out bytes.Buffer
-	if err := renderFinish(&out, lookup, r, false, ""); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"code diffs were not shared", "Preference edits should not reset", "Boundary: Review model selection separately"} {
-		if !strings.Contains(out.String(), want) {
-			t.Fatalf("preview omitted %q:\n%s", want, out.String())
-		}
+	for _, scenario := range []struct {
+		name string
+		size *daemon.FinishReviewSize
+	}{
+		{name: "legacy plan"},
+		{name: "measured plan", size: &daemon.FinishReviewSize{ChangedLines: 42, ChangedFiles: 3}},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			plan, _ := json.Marshal(daemon.FinishSavedPlan{Disclosure: ai.FinishDisclosure{MetadataIncluded: true}, Steps: []daemon.FinishPlanStep{{Goal: finish.Goal{
+				Message:  "Preserve selected models\n\n- Preference edits should not reset the selected model.",
+				Boundary: "Review model selection separately from Fast requests",
+			}, ReviewSize: scenario.size}}})
+			r := state.FinishRequest{ID: "finish-preview", State: state.FinishCompleted, DryRun: true, Target: state.FinishTarget{Mode: "intent"}, Plan: plan, Result: json.RawMessage(`{"dry_run":true}`)}
+			var out bytes.Buffer
+			if err := renderFinish(&out, lookup, r, false, ""); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"code diffs were not shared", "Preference edits should not reset", "Boundary: Review model selection separately"} {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("preview omitted %q:\n%s", want, out.String())
+				}
+			}
+			if scenario.size == nil {
+				if strings.Contains(out.String(), "changed lines across") {
+					t.Fatalf("legacy preview invented measured size: %s", out.String())
+				}
+			} else if !strings.Contains(out.String(), "42 changed lines across 3 files") {
+				t.Fatalf("preview omitted measured candidate size: %s", out.String())
+			}
+		})
 	}
 }
 
@@ -81,7 +98,7 @@ func TestFinishCLIHelpDistinguishesContextFromExactBatch(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"PURPOSE is optional context", "decisions and constraints", "Advanced: --message", "disables automatic splitting"} {
+	for _, want := range []string{"PURPOSE is optional context", "decisions and constraints", "Advanced: --message", "disables automatic splitting", "approved fast/full project checks", "when no intermediate versions are saved", "acd config --repo ."} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("help omitted %q:\n%s", want, out.String())
 		}
@@ -132,6 +149,88 @@ func TestFinishCLIDiffApprovalFailureNeedsANewRequest(t *testing.T) {
 	}
 	if err == nil || response.Error == nil || response.Error.Code != "provider_diffs_required" || response.Error.Retryable || response.NextAction == nil || !strings.Contains(*response.NextAction, "acd config") || strings.Contains(out.String(), "--retry") {
 		t.Fatalf("unchanged retry suggested for missing code sharing: %s %v", out.String(), err)
+	}
+}
+
+func TestFinishCLIBoundaryFailureExplainsNewRequest(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	// A --repo request must keep its target even when the shell is elsewhere.
+	t.Chdir(t.TempDir())
+	for _, scenario := range []struct {
+		name                               string
+		source, configure, staged, preview bool
+		checkpoints                        []state.FinishCheckpoint
+	}{
+		{name: "unchecked final files", configure: true},
+		{name: "unchecked staged preview", configure: true, staged: true, preview: true},
+		{name: "checked source selections", source: true},
+		{name: "checked staged preview", source: true, staged: true, preview: true},
+		{name: "retained versions", checkpoints: []state.FinishCheckpoint{{ID: "earlier"}}},
+		{name: "retained preview", checkpoints: []state.FinishCheckpoint{{ID: "earlier"}}, preview: true},
+	} {
+		for _, jsonOut := range []bool{false, true} {
+			format := "human"
+			if jsonOut {
+				format = "json"
+			}
+			t.Run(scenario.name+"/"+format, func(t *testing.T) {
+				r := state.FinishRequest{
+					ID: "finish-boundaries", DryRun: scenario.preview, State: state.FinishFailed,
+					ReasonCode: "provider_boundaries_unavailable", Reason: "The saved versions combine independent changes.",
+					Target: state.FinishTarget{Mode: "intent", CheckpointID: "saved", SourceSelection: scenario.source, Checkpoints: scenario.checkpoints, IncludeStaged: scenario.staged},
+				}
+				var out bytes.Buffer
+				err := renderFinish(&out, lookup, r, jsonOut, "")
+				if ExitCode(err) != ExitActionRequired {
+					t.Fatalf("boundary refusal did not require action: %v", err)
+				}
+				command := "acd finish --repo " + productListShellQuote(lookup.Worktree.Root)
+				if scenario.staged {
+					command += " --include-staged"
+				}
+				if scenario.preview {
+					command += " --dry-run"
+				}
+				want := "Save smaller complete steps, then start a new request with `" + command + "`"
+				if scenario.configure {
+					want = "Run `acd config --repo " + productListShellQuote(lookup.Worktree.Root) + "` to approve fast/full project checks, then start a new request with `" + command + "`"
+				}
+				if strings.Contains(out.String(), "--retry") || !strings.Contains(out.String(), want) {
+					t.Fatalf("boundary refusal gave an ineffective action: %s", out.String())
+				}
+				if !jsonOut {
+					if !strings.Contains(out.String(), "Changes for this request: saved.") || !strings.Contains(out.String(), "Action required:") {
+						t.Fatalf("boundary refusal lost protection or action: %s", out.String())
+					}
+					return
+				}
+				var response productEnvelope
+				if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
+					t.Fatal(decodeErr)
+				}
+				if response.NextAction == nil || *response.NextAction != want || response.Error == nil || response.Error.Retryable || response.Error.Code != r.ReasonCode || response.Error.Message != r.Reason {
+					t.Fatalf("boundary refusal changed its reason or became retryable: %+v", response)
+				}
+			})
+		}
+	}
+}
+
+func TestFinishCLIInvalidPlansAndProviderFailuresRemainRetryable(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	for _, code := range []string{"invalid_provider_plan", "provider_failure"} {
+		t.Run(code, func(t *testing.T) {
+			r := state.FinishRequest{ID: "finish-retry", State: state.FinishFailed, ReasonCode: code, Reason: "Provider returned an invalid response", Target: state.FinishTarget{CheckpointID: "saved"}}
+			var out bytes.Buffer
+			err := renderFinish(&out, lookup, r, true, "")
+			var response productEnvelope
+			if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if err == nil || response.Error == nil || !response.Error.Retryable || response.NextAction == nil || *response.NextAction != "acd finish --retry finish-retry" {
+				t.Fatalf("retryable provider failure required new evidence: %s %v", out.String(), err)
+			}
+		})
 	}
 }
 

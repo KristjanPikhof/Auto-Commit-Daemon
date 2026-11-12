@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	FinishVersion        = 4
+	FinishVersion        = 5
 	FinishRunning        = "running"
 	FinishPrepared       = "prepared"
 	FinishCompleted      = "completed"
@@ -33,6 +33,8 @@ var (
 
 // FinishTarget is immutable across attempts. TargetRef pins the complete finish tree;
 // the source checkpoint remains the proof of the original worktree bytes.
+// Version five adds measured review sizes for generated Intent commits. Older
+// requests keep their original planning and verification contract on retry.
 type FinishTarget struct {
 	Version         int    `json:"version"`
 	RepositoryID    string `json:"repository_id"`

@@ -54,6 +54,21 @@ revert boundary and a valid intermediate tree. Keep its callers, tests, imports,
 generated output, and relevant docs together. File names, save times, and line
 counts do not justify a split or a fixed commit count.
 
+New requests use 200 added or deleted lines as a review target for each commit.
+ACD measures the actual difference from the preceding proposed tree, so repeated
+checkpoint edits do not inflate the count. It reports changed lines and files in
+the preview. A larger goal must either become smaller complete steps or provide
+a concrete `large_change_reason` in its published body. A required interface
+migration, indivisible recorded version, large deletion or generated companion
+can justify an exception. Sharing a task or feature is not enough. File counts
+are informational, and tests and required callers stay with their behavior.
+
+Size and project-check failures share the same single correction and deadline.
+ACD checks the complete corrected chain before publication. This policy applies
+to version-five generated Intent requests; older frozen requests, Local batches,
+exact messages and messages-only history rewrites keep their existing rules.
+The size check enforces an explanation, not proof that the explanation is true.
+
 Keep a new field, type, or method with its consumers or before them. Reviews
 retain those interface names so the planner can identify the dependency.
 A workflow's reconnection and stale-callback guards usually complete that
@@ -70,6 +85,8 @@ published body, allowing line wrapping and bullet formatting. This prevents a
 planner from leaving its explanation only in private metadata. The provider
 still judges whether the explanation and boundary follow from the evidence;
 ACD cannot prove a motivation from message wording alone.
+New requests reject placeholder conclusions such as "fix both"; name the
+mechanism and its effect instead.
 
 ACD wraps generated body bullets at 72 characters without changing their words
 or the subject. This leaves the provider's correction available for decisions
@@ -93,6 +110,14 @@ the explanation and keeps the work protected. It does not combine unrelated
 behavior just to produce a commit. Finish coherent, verified milestones while
 working so their versions remain available for later planning. An unchanged
 retry cannot supply missing versions or missing context.
+
+If a new request still reports missing boundaries after correction, start a new
+finish with usable evidence. For final-only changes without project checks,
+approve a repository command and select `fast` or `full` in `acd config` first.
+Otherwise, finish smaller completed milestones while their versions are
+available. An earlier saved version can contain a useful refactor that final
+source lines cannot reconstruct, so checked requests retain those versions
+instead of discarding them to enable line selection.
 
 Completion context is optional for readable code changes. It may span paragraphs
 with the problem, decisions, constraints and rejected alternatives. Intent reads

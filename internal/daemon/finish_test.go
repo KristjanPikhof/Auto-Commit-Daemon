@@ -631,6 +631,7 @@ func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
 	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	w.Config.Provider.Timeout = time.Minute
+	const largeReason = "The catalogue is imported as one complete dataset; publishing only some recorded entries would expose an incomplete catalogue."
 	reviewed := make(map[string]string)
 	var reviewMu sync.Mutex
 	p := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
@@ -657,16 +658,28 @@ func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
 			}
 		}
 		finishWrite(t, f.dir, "library-000.txt", "later edit stays outside accepted finish\n")
-		return completeFinishTestPlan(request), nil
+		goal := finish.Goal{Purpose: "Import the complete library catalogue", Boundary: "Keep the required catalogue entries in one complete import", Reason: "Preserve every imported catalogue entry while later edits remain outside the accepted request.", LargeChangeReason: largeReason, Message: "Import the complete library catalogue\n\n- Preserve every imported catalogue entry while later edits remain outside the accepted request.\n- " + largeReason}
+		for _, change := range request.Changes {
+			goal.ChangeIDs = append(goal.ChangeIDs, change.ID)
+		}
+		return json.Marshal(map[string]any{"goals": []finish.Goal{goal}})
 	}}
 	w.Transport = p
-	r := startFinishWorker(t, w, FinishOptions{})
+	r := startFinishWorker(t, w, FinishOptions{Purpose: "Import the complete library catalogue; all recorded entries are required in the published dataset"})
 	completed, err := w.Execute(context.Background(), r.ID)
 	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 || completed.EvidenceCalls < 2 || p.calls.Load() != int32(completed.EvidenceCalls+1) {
 		t.Fatalf("large finish: %+v calls=%d: %v", completed, p.calls.Load(), err)
 	}
 	if tree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); tree != r.Target.TargetTree {
 		t.Fatal("published tree lost full file contents")
+	}
+	var saved FinishSavedPlan
+	if err := json.Unmarshal(completed.Plan, &saved); err != nil || len(saved.Steps) != 1 || saved.Steps[0].ReviewSize == nil || *saved.Steps[0].ReviewSize != (FinishReviewSize{ChangedLines: 146812, ChangedFiles: 156}) || saved.Steps[0].LargeChangeReason != largeReason {
+		t.Fatalf("large catalogue lost its measured exception: %+v %v", saved, err)
+	}
+	message := finishWorkerGit(t, f.dir, "log", "-1", "--format=%B")
+	if !strings.Contains(strings.Join(strings.Fields(message), " "), largeReason) {
+		t.Fatal("published catalogue omitted its large-change explanation")
 	}
 	body, _ := os.ReadFile(filepath.Join(f.dir, "library-000.txt"))
 	if string(body) != "later edit stays outside accepted finish\n" {

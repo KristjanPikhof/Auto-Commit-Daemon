@@ -56,19 +56,20 @@ type FinishCorrection struct {
 }
 
 type FinishPlanRequest struct {
-	Style          string                    `json:"style"`
-	Purpose        string                    `json:"purpose,omitempty"`
-	Message        string                    `json:"message,omitempty"`
-	Changes        []finish.Change           `json:"changes"`
-	Diffs          []FinishDiff              `json:"diffs,omitempty"`
-	DiffIncluded   bool                      `json:"diff_included"`
-	Correction     *FinishCorrection         `json:"correction,omitempty"`
-	Review         *FinishReviewTask         `json:"evidence_review,omitempty"`
-	Reviews        []FinishReviewObservation `json:"evidence_reviews,omitempty"`
-	HistoryCommits []HistoryMessageCommit    `json:"history_commits,omitempty"`
-	SourceEdits    []FinishSourceEdit        `json:"source_edits,omitempty"`
-	SelectionOrder []string                  `json:"selection_order,omitempty"`
-	SelectionFiles []FinishSelectionFile     `json:"selection_files,omitempty"`
+	Style            string                    `json:"style"`
+	Purpose          string                    `json:"purpose,omitempty"`
+	Message          string                    `json:"message,omitempty"`
+	Changes          []finish.Change           `json:"changes"`
+	Diffs            []FinishDiff              `json:"diffs,omitempty"`
+	DiffIncluded     bool                      `json:"diff_included"`
+	Correction       *FinishCorrection         `json:"correction,omitempty"`
+	Review           *FinishReviewTask         `json:"evidence_review,omitempty"`
+	Reviews          []FinishReviewObservation `json:"evidence_reviews,omitempty"`
+	HistoryCommits   []HistoryMessageCommit    `json:"history_commits,omitempty"`
+	SourceEdits      []FinishSourceEdit        `json:"source_edits,omitempty"`
+	SelectionOrder   []string                  `json:"selection_order,omitempty"`
+	SelectionFiles   []FinishSelectionFile     `json:"selection_files,omitempty"`
+	ReviewLineTarget int                       `json:"review_line_target,omitempty"`
 	// Only names already present in approved redacted diffs are included.
 	ReferencedUnchangedPaths []string `json:"referenced_unchanged_paths,omitempty"`
 }
@@ -87,6 +88,10 @@ type FinishOptions struct {
 	// A source verifier may reject one candidate plan inside the same persisted
 	// deadline and combined-correction budget. It never publishes a branch.
 	VerifySource func(context.Context, finish.SourcePlan) error
+	// VerifyPlan checks the materialized chain, including its measured sizes.
+	// It replaces VerifySource when set and shares the single correction budget.
+	VerifyPlan       func(context.Context, finish.Plan, *finish.SourcePlan) error
+	ReviewLineTarget int
 	// Binary-only finishes need supplied context because their content cannot
 	// enter a text request. History also has selected commit messages.
 	RequireCompletionContext bool
@@ -134,7 +139,7 @@ func (e *FinishPlanningError) Error() string {
 }
 func (e *FinishPlanningError) Unwrap() error { return e.Err }
 func (e *FinishPlanningError) Retryable() bool {
-	return e.Code != "provider_context_required" && e.Code != "provider_diffs_required" && e.Code != "provider_input_too_large"
+	return e.Code != "provider_context_required" && e.Code != "provider_diffs_required" && e.Code != "provider_input_too_large" && e.Code != "provider_boundaries_unavailable"
 }
 
 func finishFailure(code string, err error) error { return &FinishPlanningError{Code: code, Err: err} }
@@ -282,17 +287,24 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		if validationErr == nil {
 			plan, source, validationErr = validateFinishReply(raw, evidence, options)
 		}
-		if validationErr == nil && source != nil && options.VerifySource != nil {
-			checkErr := options.VerifySource(ctx, *source)
+		if validationErr == nil && (options.VerifyPlan != nil || source != nil && options.VerifySource != nil) {
+			var checkErr error
+			if options.VerifyPlan != nil {
+				checkErr = options.VerifyPlan(ctx, plan, source)
+			} else {
+				checkErr = options.VerifySource(ctx, *source)
+			}
 			if ctx.Err() != nil {
 				return result, finishDeadlineFailure(ctx.Err(), checkErr)
 			}
 			if checkErr != nil {
-				var rejected *SourceCheckFailure
-				if !errors.As(checkErr, &rejected) {
+				if !correctableFinishCheck(checkErr) {
 					return result, finishFailure("source_verification_failed", checkErr)
 				}
 				validationErr = sourceChecksFeedback(checkErr, approvedDiffs, func(failure *SourceCheckFailure) []string {
+					if source == nil {
+						return nil
+					}
 					return sourceDiagnosticSelections(failure, *source, options.SourceFiles, evidence)
 				})
 			}
@@ -303,6 +315,10 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 			return result, nil
 		}
 		if call == 1 {
+			var blocked *finishBoundariesError
+			if options.ReviewLineTarget > 0 && errors.As(validationErr, &blocked) {
+				return result, finishFailure("provider_boundaries_unavailable", validationErr)
+			}
 			return result, finishFailure("invalid_provider_plan", validationErr)
 		}
 		request.Correction = &FinishCorrection{
@@ -320,7 +336,7 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 	if !options.DiffEgress {
 		return FinishPlanRequest{}, FinishDisclosure{}, finishFailure("provider_diffs_required", ErrIntentDiffsRequired)
 	}
-	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress}
+	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress, ReviewLineTarget: options.ReviewLineTarget}
 	if len(options.SourceFiles) > 0 {
 		var err error
 		var catalogue []finish.Change
@@ -466,9 +482,9 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 	}
 	if strings.TrimSpace(output.BlockedReason) != "" {
 		if len(options.SourceFiles) > 0 {
-			return finish.Plan{}, nil, fmt.Errorf("cannot plan purposeful commits: %s. Consider a complete independently testable API, model or processing prerequisite before the separate UI consumer. The later UI goal may connect the available feature without inventing an old-layout variant. Return complete ownership for candidate checks unless exact edit IDs demonstrate a conflict that no prerequisite-first order resolves", output.BlockedReason)
+			return finish.Plan{}, nil, &finishBoundariesError{Reason: fmt.Sprintf("%s. Consider a complete independently testable API, model or processing prerequisite before the separate UI consumer. The later UI goal may connect the available feature without inventing an old-layout variant. Return complete ownership for candidate checks unless exact edit IDs demonstrate a conflict that no prerequisite-first order resolves", output.BlockedReason)}
 		}
-		return finish.Plan{}, nil, fmt.Errorf("cannot plan purposeful commits: %s", output.BlockedReason)
+		return finish.Plan{}, nil, &finishBoundariesError{Reason: output.BlockedReason}
 	}
 	if options.Message != "" && (len(output.Goals) != 1 || output.Goals[0].Message != finishRedactText(options.Message)) {
 		return finish.Plan{}, nil, errors.New("supplied message requires one complete batch goal with the exact supplied message")
@@ -520,6 +536,11 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 			validationErrors = append(validationErrors, fmt.Errorf("goal %d: each proposed commit needs a useful review or revert boundary; a single batch must explain why useful separate steps are unavailable", index+1))
 		}
 		if options.Message == "" {
+			if options.ReviewLineTarget > 0 {
+				if err := validateReviewExplanation(goal); err != nil {
+					validationErrors = append(validationErrors, fmt.Errorf("goal %d: %w", index+1, err))
+				}
+			}
 			if err := validateGeneratedReason(goal); err != nil {
 				validationErrors = append(validationErrors, fmt.Errorf("goal %d: %w", index+1, err))
 			}
@@ -560,16 +581,11 @@ func validateGeneratedReason(goal finish.Goal) error {
 	if len(strings.Fields(reason)) < 3 || isGenericSubject(reason) {
 		return errors.New("each generated commit needs a specific reason: explain the previous problem or constraint and why this approach addresses it")
 	}
-	subject, body, _ := strings.Cut(goal.Message, "\n\n")
+	subject, _, _ := strings.Cut(goal.Message, "\n\n")
 	if strings.EqualFold(strings.TrimRight(reason, "."), subjectTailForQuality(subject)) {
 		return errors.New("reason must explain the decision, not repeat the title")
 	}
-	// Ignore Git bullet formatting and wrapping, but retain the actual wording.
-	var lines []string
-	for _, line := range strings.Split(body, "\n") {
-		lines = append(lines, strings.TrimPrefix(strings.TrimSpace(line), "- "))
-	}
-	if !strings.Contains(strings.Join(strings.Fields(strings.Join(lines, " ")), " "), reason) {
+	if !finishMessageContainsExplanation(goal.Message, reason) {
 		return errors.New("include the decision reason verbatim in the published message body; metadata alone does not explain the commit to its reader")
 	}
 	return nil

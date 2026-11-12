@@ -157,6 +157,16 @@ and bullet formatting. A missing reason or one left only in metadata needs
 correction. Advanced exact user messages retain their wording, optional body
 and single-batch contract.
 
+Version-five generated finish requests include `review_line_target: 200` and
+ask every goal for `large_change_reason`, normally an empty string. ACD measures
+added and deleted lines between consecutive candidate trees. A goal above the
+target needs a concrete explanation of necessary coupling or indivisible
+evidence, with the same wording in its published message body. Size failures
+and candidate check failures share the one global correction. Only measured
+counts and approved diagnostic names enter that feedback; raw command output
+stays local. Earlier frozen requests and exact-message batches keep their
+existing contract.
+
 Source-selection requests include `selection_files`, with each change ID and its
 first and last selection IDs. Annotated diffs retain every selectable line in
 order. Goals omit `change_ids`; the reply supplies `file_ownership`, one entry
@@ -189,6 +199,10 @@ and explain the missing evidence in `blocked_reason`. That explanation ends the
 request if the bounded correction cannot resolve it. It never authorizes a
 mixed batch or fabricated intermediate content. Earlier saved plans remain
 readable without the new reason field.
+New requests report a final refusal as `provider_boundaries_unavailable` and
+recommend a new finish with usable evidence or approved project checks. They
+do not suggest retrying the unchanged input. Malformed replies and transient
+provider failures keep their existing retry behavior.
 
 HTTP failures retain the provider's standard `error.message`, with credential
 redaction and bounded output. Nonstandard or unreadable responses report the

@@ -254,7 +254,7 @@ func TestFinishWorkerInfersAndSeparatesNewSettingsWithoutContext(t *testing.T) {
 	}}
 	r := startFinishWorker(t, w, FinishOptions{})
 	completed, err := w.Execute(t.Context(), r.ID)
-	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 2 || r.Target.Version != 4 || r.Target.Purpose != "" {
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 2 || r.Target.Version != state.FinishVersion || r.Target.Purpose != "" {
 		t.Fatalf("bare source finish: %+v %v", completed, err)
 	}
 	var saved FinishSavedPlan

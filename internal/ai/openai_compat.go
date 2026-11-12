@@ -89,6 +89,10 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 		}}
 		required = append(required, "file_ownership")
 	}
+	if request.ReviewLineTarget > 0 && request.Message == "" && len(request.HistoryCommits) == 0 {
+		goal["required"] = append(goal["required"].([]string), "large_change_reason")
+		goal["properties"].(map[string]any)["large_change_reason"] = map[string]any{"type": "string", "description": "Empty for small steps. For a step above review_line_target, explain concrete coupling or indivisible evidence and include this explanation in the message body."}
+	}
 	return marshalFinishToolRequest(openAIToolRequestOptions{
 		Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
 		ToolName: "finish_plan", ToolDescription: "Plan completed purposes, safe recorded changes, and grounded messages",
