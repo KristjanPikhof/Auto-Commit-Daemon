@@ -4,6 +4,7 @@ import unittest
 import sys
 import json
 import os
+import re
 import subprocess
 import tempfile
 
@@ -145,10 +146,23 @@ esac
             discovery.write_text("\n".join(packages) + "\n")
             arguments = pathlib.Path(root) / "args"
             go = pathlib.Path(root) / "go"
-            go.write_text('#!/bin/sh\nif [ "$1" = list ]; then cat "$FAKE_PACKAGES"; exit 0; fi\nprintf "%s\\n" "$@" > "$FAKE_GO_ARGS"\n')
+            go.write_text('''#!/bin/sh
+if [ "$1" = list ]; then cat "$FAKE_PACKAGES"; exit 0; fi
+case "$*" in *-list*) printf 'TestFirst\\nTestSecond\\n'; exit 0;; esac
+if [ "$2" = ./internal/git ]; then
+  printf '%s\\n' "$*" >> "$FAKE_GIT_ARGS"
+  if [ "$FAIL_GIT_FIRST" = 1 ]; then
+    case "$*" in *TestFirst*)
+      printf '%s\\n' '{"Action":"output","Package":"example/internal/git","Test":"TestFirst","Output":"git case failed\\n"}' '{"Action":"fail","Package":"example/internal/git","Test":"TestFirst"}'
+      exit 42;;
+    esac
+  fi
+else printf '%s\\n' "$@" > "$FAKE_GO_ARGS"; fi
+''')
             go.chmod(0o755)
             env = dict(os.environ, PATH=root + os.pathsep + os.environ["PATH"],
                        FAKE_PACKAGES=str(discovery), FAKE_GO_ARGS=str(arguments),
+                       FAKE_GIT_ARGS=root + "/git-args",
                        ACD_TEST_RESULTS_DIR=root + "/results")
             selected = {}
             for group in [None, "ai", "other"]:
@@ -157,6 +171,13 @@ esac
                 self.assertEqual(run.returncode, 0, run.stderr)
                 args = arguments.read_text().splitlines()
                 selected[group] = [arg for arg in args if arg.startswith("example/")]
+                if group is None:
+                    git_calls = pathlib.Path(env["FAKE_GIT_ARGS"]).read_text().splitlines()
+                    self.assertEqual(len(git_calls), 2)
+                    patterns = [call.split("-run ")[1] for call in git_calls]
+                    for name in ["TestFirst", "TestSecond"]:
+                        self.assertEqual(sum(bool(re.fullmatch(pattern, name)) for pattern in patterns), 1)
+                    selected[group].append("example/internal/git")
                 self.assertIn("-race", args)
                 self.assertIn("-count=1", args)
                 self.assertIn("-skip", args)
@@ -166,6 +187,14 @@ esac
             self.assertEqual(selected["ai"], ["example/internal/ai"])
             self.assertCountEqual(selected["other"], [package for package in expected if package != "example/internal/ai"])
             self.assertCountEqual(selected["ai"] + selected["other"], selected[None])
+            git_args = pathlib.Path(env["FAKE_GIT_ARGS"])
+            git_args.unlink()
+            failed = subprocess.run(["bash", "scripts/dev/test.sh", "support"], cwd=checkout,
+                                    env=dict(env, FAIL_GIT_FIRST="1"), capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 1, failed.stderr)
+            self.assertIn("git case failed", failed.stdout)
+            self.assertEqual(len(git_args.read_text().splitlines()), 2,
+                             "a failed first shard must not skip the second shard")
             arguments.unlink()
             run = subprocess.run(["bash", "scripts/dev/test.sh", "support", "typo"],
                                  cwd=checkout, env=env, capture_output=True, text=True)
@@ -200,6 +229,26 @@ esac
                     summary = json.loads((results / ("support-" + (group or "all") + ".summary.json")).read_text())
                     self.assertEqual(summary["exit_code"], 42)
                     self.assertGreaterEqual(summary["wall_seconds"], 0)
+
+    def test_gate_preserves_explicit_git_choice(self):
+        checkout = pathlib.Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as root:
+            git = pathlib.Path(root) / "git"
+            git.write_text('#!/bin/sh\nprintf "selected Git\\n"\n')
+            git.chmod(0o755)
+            go = pathlib.Path(root) / "go"
+            go.write_text('''#!/bin/sh
+if [ "$1" = list ]; then printf 'example/internal/ai\\n'; exit 0; fi
+git --version >> "$FAKE_GIT_RESULT"
+''')
+            go.chmod(0o755)
+            result = pathlib.Path(root) / "git-result"
+            env = dict(os.environ, PATH=root + os.pathsep + os.environ["PATH"],
+                       FAKE_GIT_RESULT=str(result), ACD_TEST_RESULTS_DIR=root + "/results")
+            run = subprocess.run(["bash", "scripts/dev/test.sh", "support", "ai"],
+                                 cwd=checkout, env=env, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(result.read_text(), "selected Git\n")
 
     def test_package_timeout_reports_stack_without_individual_failure(self):
         with tempfile.TemporaryDirectory() as root:

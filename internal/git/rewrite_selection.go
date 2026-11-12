@@ -96,8 +96,8 @@ func ResolveRewriteSelection(ctx context.Context, repoDir string, opts RewriteSe
 	if newest < 0 || oldest < newest || oldest >= len(chain) {
 		return RewriteSelection{}, fmt.Errorf("git rewrite selection: invalid selection bounds %d-%d", newest+1, oldest+1)
 	}
-	involvedNewestFirst := append([]string{}, chain[:oldest+1]...)
-	if err := rejectMergeCommits(ctx, repoDir, involvedNewestFirst); err != nil {
+	selectedNewestFirst := chain[newest : oldest+1]
+	if err := rejectMergeCommits(ctx, repoDir, selectedNewestFirst); err != nil {
 		return RewriteSelection{}, err
 	}
 	selected, err := commitRecords(ctx, repoDir, reverseStrings(chain[newest:oldest+1]))
@@ -322,7 +322,7 @@ func rejectMergeCommits(ctx context.Context, repoDir string, newestFirst []strin
 		}
 		fields := strings.Fields(string(out))
 		if len(fields) > 2 {
-			return fmt.Errorf("git rewrite selection: merge commit %s is in the selected or recreated chain; merges are not supported", shortCommitOID(oid))
+			return fmt.Errorf("git rewrite selection: merge commit %s is selected; splitting merges is not supported", shortCommitOID(oid))
 		}
 	}
 	return nil

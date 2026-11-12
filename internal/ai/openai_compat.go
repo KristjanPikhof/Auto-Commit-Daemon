@@ -50,7 +50,7 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 		return nil, err
 	}
 	if request.Review != nil {
-		return marshalOpenAIToolRequest(openAIToolRequestOptions{
+		return marshalFinishToolRequest(openAIToolRequestOptions{
 			Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
 			ToolName: "finish_evidence", ToolDescription: "Review exact diff fragments for one later global commit plan",
 			Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"observations"},
@@ -63,21 +63,73 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 				}}}},
 		})
 	}
+	if request.AssignPaths != nil {
+		return marshalFinishToolRequest(openAIToolRequestOptions{
+			Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
+			ToolName: "finish_assign_paths", ToolDescription: "Assign omitted files to existing commit goals",
+			Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"assignments"},
+				"properties": map[string]any{"assignments": map[string]any{"type": "array", "items": map[string]any{
+					"type": "object", "additionalProperties": false, "required": []string{"path", "goal"},
+					"properties": map[string]any{"path": map[string]any{"type": "string"}, "goal": map[string]any{"type": "integer"}},
+				}}}},
+		})
+	}
+	if len(request.ReviewSizes) > 0 {
+		return marshalFinishToolRequest(openAIToolRequestOptions{
+			Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
+			ToolName: "finish_review_sizes", ToolDescription: "Explain the necessary scope of larger proposed commits",
+			Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"reasons"},
+				"properties": map[string]any{"reasons": map[string]any{"type": "array", "items": map[string]any{
+					"type": "object", "additionalProperties": false, "required": []string{"step", "reason"},
+					"properties": map[string]any{"step": map[string]any{"type": "integer"}, "reason": map[string]any{"type": "string"}},
+				}}}},
+		})
+	}
 	goal := map[string]any{
 		"type": "object", "additionalProperties": false,
-		"required": []string{"purpose", "boundary", "message", "change_ids"},
+		"required": []string{"purpose", "boundary", "reason", "message", "change_ids"},
 		"properties": map[string]any{
 			"purpose":    map[string]any{"type": "string"},
 			"boundary":   map[string]any{"type": "string"},
+			"reason":     map[string]any{"type": "string", "description": "Specific problem or constraint and why this mechanism addresses it. Include this explanation verbatim in the message body."},
 			"message":    map[string]any{"type": "string"},
 			"change_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		},
 	}
-	return marshalOpenAIToolRequest(openAIToolRequestOptions{
+	properties := map[string]any{"goals": map[string]any{"type": "array", "items": goal}, "blocked_reason": map[string]any{"type": "string"}}
+	required := []string{"goals", "blocked_reason"}
+	if request.AllowPathOwnership {
+		properties["path_ownership"] = map[string]any{"type": "array", "items": map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"goal", "paths"},
+			"properties": map[string]any{
+				"goal":  map[string]any{"type": "integer", "description": "1-based index into goals."},
+				"paths": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			},
+		}}
+		properties["blocked_change_ids"] = map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+		required = append(required, "path_ownership", "blocked_change_ids")
+	}
+	if len(request.SelectionOrder) > 0 {
+		goal["required"] = []string{"purpose", "boundary", "reason", "message"}
+		delete(goal["properties"].(map[string]any), "change_ids")
+		run := map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"through_id", "goal"},
+			"properties": map[string]any{"through_id": map[string]any{"type": "string", "description": "One literal selection ID from this file; endpoints advance and end at the file's last_id."}, "goal": map[string]any{"type": "integer", "description": "1-based index into goals."}},
+		}
+		properties["file_ownership"] = map[string]any{"type": "array", "items": map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"change_id", "runs"},
+			"properties": map[string]any{"change_id": map[string]any{"type": "string"}, "runs": map[string]any{"type": "array", "items": run}},
+		}}
+		required = append(required, "file_ownership")
+	}
+	if request.ReviewLineTarget > 0 && request.Message == "" && len(request.HistoryCommits) == 0 {
+		goal["required"] = append(goal["required"].([]string), "large_change_reason")
+		goal["properties"].(map[string]any)["large_change_reason"] = map[string]any{"type": "string", "description": "Empty for small steps. For a step above review_line_target, explain concrete coupling or indivisible evidence and include this explanation in the message body."}
+	}
+	return marshalFinishToolRequest(openAIToolRequestOptions{
 		Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
 		ToolName: "finish_plan", ToolDescription: "Plan completed purposes, safe recorded changes, and grounded messages",
-		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"goals"},
-			"properties": map[string]any{"goals": map[string]any{"type": "array", "items": goal}}},
+		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": required, "properties": properties},
 	})
 }
 
@@ -95,7 +147,20 @@ func (p *OpenAIProvider) ExchangeFinish(ctx context.Context, body []byte) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := url.JoinPath(baseURL, "chat", "completions")
+	var sent struct {
+		Input      json.RawMessage `json:"input"`
+		ToolChoice struct {
+			Name     string               `json:"name"`
+			Function openAIFunctionChoice `json:"function"`
+		} `json:"tool_choice"`
+	}
+	_ = json.Unmarshal(body, &sent)
+	path := "chat/completions"
+	responses := len(sent.Input) > 0
+	if responses {
+		path = "responses"
+	}
+	endpoint, err := url.JoinPath(baseURL, path)
 	if err != nil {
 		return nil, err
 	}
@@ -129,14 +194,18 @@ func (p *OpenAIProvider) ExchangeFinish(ctx context.Context, body []byte) ([]byt
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, &ProviderHTTPError{StatusCode: resp.StatusCode, Detail: finishHTTPErrorDetail(raw, p.APIKey)}
 	}
-	expectedTool := "finish_plan"
-	var sent struct {
-		ToolChoice openAIToolChoice `json:"tool_choice"`
+	expectedTool := sent.ToolChoice.Function.Name
+	if responses {
+		expectedTool = sent.ToolChoice.Name
 	}
-	if json.Unmarshal(body, &sent) == nil && sent.ToolChoice.Function.Name == "finish_evidence" {
-		expectedTool = "finish_evidence"
+	if expectedTool == "" {
+		expectedTool = "finish_plan"
 	}
-	arguments, err := parseFinishToolArgumentsFor(raw, expectedTool)
+	parse := parseFinishToolArgumentsFor
+	if responses {
+		parse = parseFinishResponseArguments
+	}
+	arguments, err := parse(raw, expectedTool)
 	if err != nil {
 		return nil, &finishOutputError{Err: err, Raw: raw}
 	}

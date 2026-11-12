@@ -11,6 +11,10 @@ import (
 // settings. Runtime consumers can
 // use it to verify a stored global approval without importing settings.
 func SettingsFingerprint(values map[string]string) (string, error) {
+	return fingerprintPayload(settingsFingerprintPayload(values))
+}
+
+func settingsFingerprintPayload(values map[string]string) map[string]any {
 	payload := make(map[string]any)
 	for _, field := range Catalog() {
 		// Adding the default input budget must not revoke existing provider consent.
@@ -21,6 +25,10 @@ func SettingsFingerprint(values map[string]string) (string, error) {
 			payload[field.Name] = values[field.Name]
 		}
 	}
+	return payload
+}
+
+func fingerprintPayload(payload map[string]any) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("acd config: fingerprint: %w", err)

@@ -99,21 +99,38 @@ below authored values until reviewed settings materialize those choices.
 
 ## Project checks
 
-Structural safety checks always run: recorded versions, safe membership and
-ordering, complete trees, and exact final target equality.
+ACD always checks that the proposed commits are complete and ordered safely,
+and that the last commit matches the saved target. Setup defaults to `none`,
+which skips project commands.
 
-| `intent.verification` | Project command |
-|---|---|
-| `none` | None |
-| `structural` | None |
-| `fast` | Approved `verification.fast.command` |
-| `full` | Approved `verification.full.command` |
+To run one command against each proposed commit, open `acd config --repo .`.
+In Advanced settings, set **Project check** to **Run a project
+check**, enter a command, and review and save. You can also save the settings
+from the command line and then review them in the editor.
 
-The editor reviews command execution permission separately from provider and
-diff permissions. Applying that approval does not execute the command. Finish
-runs it in isolated candidate trees using the configured timeout. A missing
-command is reported as missing; a structural pass is not a test-suite pass.
-Reused evidence is labelled reused.
+~~~bash
+acd config set verification.command 'make check'
+acd config set verification.timeout 3m
+acd config set intent.verification project
+acd config --repo .
+~~~
+
+The default time limit is two minutes per commit. Finish runs the approved
+command in an isolated worktree for each proposed commit. Saving the settings
+doesn't run it. New generated Intent requests give each command its own time
+limit within the overall finish deadline.
+
+With a project check, Intent can use exact lines from the saved target to split
+edits within a file. If a recorded version blocks a split, ACD can offer exact
+lines for that path in the correction while keeping other recorded changes.
+With `none`, Intent groups whole recorded versions. If two edits were saved
+together and no checkpoint separates them, Intent can keep them in one commit
+while separating other work.
+
+Existing `fast` and `full` settings resolve to `project` using the selected
+command and its existing timeout. Old `structural` settings resolve to `none`.
+Existing approved revisions and frozen finish requests keep their verification
+identity.
 
 ## Credentials and privacy
 

@@ -48,24 +48,31 @@ Protection and branch publication are separate. Saved changes can remain
 uncommitted indefinitely until you explicitly finish them:
 
 ~~~bash
-acd finish "Add offline checkout"
+acd finish
+acd finish "Keep checkout available when the network is down"
 ~~~
 
 Local creates one complete offline batch. Intent plans completed goals through
 the approved provider. Both verify exact trees and preserve live working files.
 Neither pushes. If the frozen target equals HEAD, finish reports no changes
 and creates no empty commit.
+The quoted text is optional context. Intent uses it with the code to understand
+decisions and write reasons; without it, Intent infers purpose from the changes.
+Local uses supplied context or an offline batch description.
 
-To supply an exact message that matches your selected style:
+A working AI can pass a longer handoff with decisions the diff cannot explain:
 
 ~~~bash
-acd finish --message "Preserve staged content during finish"
-# With commit.format=conventional:
-acd finish --message "fix: preserve staged content"
+acd finish "Settings reloads reset saved choices. Preserve authored values ahead
+of defaults so reopening settings keeps the selection.
+
+Keep the separate preview allocation fix independently reviewable. Reuse the
+existing Metal context because preview needs textures, not effect pipelines."
 ~~~
 
-A supplied message does not bypass the provider in Intent mode. Use reviewed
-Local settings for an offline finish.
+Context can describe several completed changes. It does not set the commit text
+or force one batch. Omit transcripts, secrets and customer data. ACD redacts the
+provider copy and applies its normal input budgets.
 
 ## Preview and staged work
 
@@ -119,9 +126,9 @@ retrying. To change the work or mode, review settings and start a new finish.
 Prepared publication recovers from exact saved proof after restart; an
 interrupted running attempt becomes failed rather than making new AI calls.
 
-`none` and `structural` verification run safety checks without project commands.
-`fast` and `full` use approved configured commands. Read the reported evidence;
-missing or reused checks are not freshly executed tests.
+Every finish runs safety checks. The optional `project` setting also runs
+one approved command per proposed commit. Finish reports when it reuses an
+earlier result.
 
 ## Restore a checkpoint
 
@@ -156,10 +163,26 @@ acd history rewrite --apply PLAN_ID --dry-run
 acd history rewrite --apply PLAN_ID --yes
 ~~~
 
-Local preserves original grouping and order without AI. Intent can reconstruct
-completed goals. Use `--messages-only` to retain every original commit or
+Local preserves original grouping, order and messages without AI. Use `--edit`
+to revise messages offline. Intent reconstructs completed goals with reasons in
+generated messages. Use `--messages-only` to retain every original commit or
 `--new-branch NAME` to preserve the source branch. Read the
 [history rewrite guide](rewrite-commits.md) before applying.
+
+## Advanced exact message override
+
+`--message` supplies one complete message and disables automatic splitting.
+Its optional body and subject must match the selected style:
+
+~~~bash
+acd finish --message "Preserve staged content"
+# With commit.format=conventional:
+acd finish --message "fix: preserve staged content"
+~~~
+
+An exact override still uses the provider in Intent mode. Use reviewed Local
+settings for an offline finish. AI-generated messages always require a reason;
+manual overrides preserve the supplied wording.
 
 ## Turn protection off and on
 

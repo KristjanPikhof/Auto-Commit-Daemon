@@ -254,6 +254,11 @@ func editorMenu(snapshot EditorSnapshot, draft EditorDraft, advanced bool, repo 
 		if !exists {
 			return
 		}
+		if draft.Scope == "global" && (key == "verification.timeout" ||
+			(key == "intent.verification" && field.Value == "none") ||
+			(key == "verification.command" && field.Value == "")) {
+			return
+		}
 		desc := descriptor(key)
 		label := desc.Label + ": " + safePreviewValue(field.Value, 70)
 		if !field.Overridden {
@@ -328,12 +333,15 @@ func editEditorField(ctx context.Context, field EditorField, scope string, opts 
 	}
 	var input huh.Field
 	if len(desc.Choices) > 0 {
+		if opts.Accessible && field.Key == "intent.verification" {
+			fmt.Fprintln(opts.Output, desc.Description)
+		}
 		choices := []huh.Option[string]{}
 		for _, choice := range desc.Choices {
 			label := choice
 			switch field.Key {
 			case "intent.verification":
-				label = map[string]string{"none": "No project checks", "structural": "Structure checks only", "fast": "Quick project checks", "full": "Full project checks"}[choice]
+				label = map[string]string{"none": "No project check", "project": "Run a project check"}[choice]
 			case "commit.format":
 				label = map[string]string{"imperative": "Imperative: Fix setup retries", "conventional": "Conventional: fix: handle setup retries"}[choice]
 			}

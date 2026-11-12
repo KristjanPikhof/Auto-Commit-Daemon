@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -27,7 +28,8 @@ func TestFinishWorkerRetryPreviewRetainsAcceptedReviews(t *testing.T) {
 	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	w.Config.Provider.Timeout = time.Minute
-	var reviews, plans atomic.Int32
+	const largeReason = "The consumer.txt version requires the complete library.txt dataset; no smaller library versions were retained for safe intermediate commits."
+	var reviews, plans, partitions atomic.Int32
 	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
 		if request.Review != nil {
 			reviews.Add(1)
@@ -37,10 +39,16 @@ func TestFinishWorkerRetryPreviewRetainsAcceptedReviews(t *testing.T) {
 			}
 			return json.Marshal(map[string]any{"observations": observations})
 		}
-		if plans.Add(1) == 1 {
+		if request.Partition != nil {
+			partitions.Add(1)
+		} else if plans.Add(1) == 1 {
 			return nil, errors.New("provider unavailable after complete evidence review")
 		}
-		return completeFinishTestPlan(request), nil
+		goal := finish.Goal{Purpose: "Publish the complete library and consumer", Boundary: "Keep the consumer with the complete recorded library it requires", Reason: "Supply every recorded library entry so its consumer can use the complete dataset.", LargeChangeReason: largeReason, Message: "Publish the complete library and consumer\n\n- Supply every recorded library entry so its consumer can use the complete dataset.\n- " + largeReason}
+		for _, change := range request.Changes {
+			goal.ChangeIDs = append(goal.ChangeIDs, change.ID)
+		}
+		return json.Marshal(map[string]any{"goals": []finish.Goal{goal}})
 	}}
 	r := startFinishWorker(t, w, FinishOptions{Purpose: "Publish the completed library and consumer"})
 	failed, err := w.Execute(ctx, r.ID)
@@ -69,11 +77,15 @@ func TestFinishWorkerRetryPreviewRetainsAcceptedReviews(t *testing.T) {
 		t.Fatalf("preview changed the frozen request: %+v %v", preview, err)
 	}
 	previewed, err := w.Execute(ctx, r.ID)
-	if err != nil || previewed.State != state.FinishCompleted || reviews.Load() != acceptedReviews || previewed.ReusedFragments != len(failed.ReviewProgress.Observations) {
+	if err != nil || previewed.State != state.FinishCompleted || reviews.Load() != acceptedReviews || previewed.ReusedFragments != len(failed.ReviewProgress.Observations) || previewed.PartitionCalls != 1 {
 		t.Fatalf("preview repeated accepted evidence: %+v reviews=%d %v", previewed, reviews.Load(), err)
 	}
 	if previewed.ReviewProgress.Fingerprint != failed.ReviewProgress.Fingerprint {
 		t.Fatal("completed preview lost the keyed review journal")
+	}
+	var saved FinishSavedPlan
+	if err := json.Unmarshal(previewed.Plan, &saved); err != nil || len(saved.Steps) != 1 || saved.Steps[0].ReviewSize == nil || *saved.Steps[0].ReviewSize != (FinishReviewSize{ChangedLines: 22001, ChangedFiles: 2}) || saved.Steps[0].LargeChangeReason != largeReason || !strings.Contains(strings.Join(strings.Fields(saved.Steps[0].Message), " "), largeReason) {
+		t.Fatalf("preview lost the measured large-change explanation: %+v %v", saved, err)
 	}
 	if finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != head {
 		t.Fatal("preview published branch commits")
@@ -84,11 +96,15 @@ func TestFinishWorkerRetryPreviewRetainsAcceptedReviews(t *testing.T) {
 		t.Fatalf("publication retry changed the frozen request: %+v %v", retry, err)
 	}
 	completed, err := w.Execute(ctx, r.ID)
-	if err != nil || completed.State != state.FinishCompleted || reviews.Load() != acceptedReviews || completed.EvidenceCalls != 0 || completed.PlanningCalls != 1 || completed.ReusedFragments != len(failed.ReviewProgress.Observations) || plans.Load() != 3 {
+	if err != nil || completed.State != state.FinishCompleted || reviews.Load() != acceptedReviews || completed.EvidenceCalls != 0 || completed.PlanningCalls != 1 || completed.ReusedFragments != len(failed.ReviewProgress.Observations) || plans.Load() != 3 || completed.PartitionCalls != 1 || partitions.Load() != 2 {
 		t.Fatalf("publication repeated accepted evidence: %+v reviews=%d plans=%d %v", completed, reviews.Load(), plans.Load(), err)
 	}
 	if finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}") != r.Target.TargetTree {
 		t.Fatal("publication did not match the frozen tree")
+	}
+	message := finishWorkerGit(t, f.dir, "log", "-1", "--format=%B")
+	if !strings.Contains(strings.Join(strings.Fields(message), " "), largeReason) {
+		t.Fatal("published library omitted its large-change explanation")
 	}
 	body, err := os.ReadFile(filepath.Join(f.dir, "library.txt"))
 	if err != nil || string(body) != later {

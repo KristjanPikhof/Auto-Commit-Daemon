@@ -34,23 +34,21 @@ func resolveFinishWorkerConfigInputs(ctx context.Context, roots paths.Roots, run
 	if err != nil {
 		return out, err
 	}
-	var values map[string]string
-	var approved []ai.ConfirmationRequirement
+	var resolved finishConfigValues
 	if found {
-		values, approved, err = finishSnapshotValues(revision.SnapshotJSON)
+		resolved, err = finishSnapshotValues(revision.SnapshotJSON)
 		out.ConfigDigest = fmt.Sprintf("revision:%d:%s", revision.ID, revision.SnapshotHash)
 	} else {
-		values, approved, err = finishSavedValues(roots, runtime.worktree.Root)
-		if err == nil {
-			out.ConfigDigest, err = config.SettingsFingerprint(values)
-		}
+		resolved, err = finishSavedValues(roots, runtime.worktree.Root)
+		out.ConfigDigest = resolved.digest
 	}
 	if err != nil {
 		return out, err
 	}
+	values := resolved.values
 	out.Mode = values[config.FieldCommitStrategy]
 	out.Style = values[config.FieldCommitFormat]
-	out.Approved = approved
+	out.Approved = resolved.approved
 	out.Capture = daemon.CaptureOpts{MaxFileBytes: runtime.policy.MaxFileBytes, SensitiveMatcher: runtime.policy.Sensitive, SafeIgnoreMatcher: runtime.policy.SafeIgnore}
 	out.Provider = ai.ProviderConfig{Mode: values[config.FieldProvider], BaseURL: values[config.FieldBaseURL], Model: values[config.FieldModel], CAFile: values[config.FieldCAFile], DiffEgress: values[config.FieldDiffEgress] == "true", CommitStrategy: ai.CommitStrategy(out.Mode), CommitFormat: ai.CommitFormat(out.Style)}
 	out.Provider.MaxInputBytes, err = strconv.Atoi(values[config.FieldMaxInputBytes])
@@ -68,6 +66,9 @@ func resolveFinishWorkerConfigInputs(ctx context.Context, roots paths.Roots, run
 		return out, ai.ErrIntentDiffsRequired
 	}
 	out.VerificationMode = values[config.FieldIntentVerification]
+	if resolved.legacyMode != "" {
+		out.VerificationMode = resolved.legacyMode
+	}
 	if err := finishRequireApprovals(out); err != nil {
 		return out, err
 	}
@@ -78,14 +79,10 @@ func resolveFinishWorkerConfigInputs(ctx context.Context, roots paths.Roots, run
 		}
 	}
 	out.VerificationTimeout = 5 * time.Minute
-	if out.VerificationMode == "fast" || out.VerificationMode == "full" {
-		commandField, timeoutField := config.FieldVerificationFastCommand, config.FieldVerificationFastTimeout
-		if out.VerificationMode == "full" {
-			commandField, timeoutField = config.FieldVerificationFullCommand, config.FieldVerificationFullTimeout
-		}
-		out.VerificationTimeout, err = time.ParseDuration(values[timeoutField])
+	if verification.Mode(out.VerificationMode).RunsProjectCheck() {
+		out.VerificationTimeout, err = time.ParseDuration(values[config.FieldVerificationTimeout])
 		if err == nil {
-			out.Command, err = verification.NewApprovedCommand(runtime.worktree.Root, out.ConfigDigest, verification.Mode(out.VerificationMode), values[commandField], out.VerificationTimeout)
+			out.Command, err = verification.NewApprovedCommand(runtime.worktree.Root, out.ConfigDigest, verification.Mode(out.VerificationMode), values[config.FieldVerificationCommand], out.VerificationTimeout)
 		}
 		if err != nil {
 			return out, err
@@ -115,43 +112,73 @@ func finishApprovedRevision(ctx context.Context, db *state.DB) (state.ConfigRevi
 	return state.ConfigRevision{}, false, nil
 }
 
-func finishSnapshotValues(body string) (map[string]string, []ai.ConfirmationRequirement, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(body), &raw); err != nil || raw == nil {
-		return nil, nil, errors.New("finish: approved configuration snapshot is unreadable")
-	}
-	var confirmations []ai.ConfirmationRequirement
-	if encoded, exists := raw["confirmations"]; exists {
-		if err := json.Unmarshal(encoded, &confirmations); err != nil {
-			return nil, nil, errors.New("finish: approved configuration confirmations are unreadable")
-		}
-	}
-	values, err := finishResolveValues(config.ResolveInput{Global: finishTranslateEvent(raw)})
-	return values, confirmations, err
+type finishConfigValues struct {
+	values     map[string]string
+	approved   []ai.ConfirmationRequirement
+	digest     string
+	legacyMode string
 }
 
-func finishSavedValues(roots paths.Roots, repo string) (map[string]string, []ai.ConfirmationRequirement, error) {
+func finishSnapshotValues(body string) (finishConfigValues, error) {
+	var out finishConfigValues
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &raw); err != nil || raw == nil {
+		return out, errors.New("finish: approved configuration snapshot is unreadable")
+	}
+	if encoded, exists := raw["confirmations"]; exists {
+		if err := json.Unmarshal(encoded, &out.approved); err != nil {
+			return out, errors.New("finish: approved configuration confirmations are unreadable")
+		}
+	}
+	input := config.ResolveInput{Global: finishTranslateEvent(raw)}
+	var err error
+	out.values, err = finishResolveValues(input)
+	if err == nil {
+		out.legacyMode, err = config.LegacyVerificationMode(input)
+	}
+	return out, err
+}
+
+func finishSavedValues(roots paths.Roots, repo string) (finishConfigValues, error) {
+	var out finishConfigValues
 	doc, err := config.NewStore(roots).Load()
 	if err != nil {
-		return nil, nil, err
+		return out, err
 	}
 	id := central.CanonicalID(repo)
 	repository := doc.Settings.Repositories[id]
-	values, err := finishResolveValues(config.ResolveInput{Repository: repository.Fields, Profile: doc.Settings.Profiles[repository.Profile].Fields, Global: doc.Settings.Global, LookupEnv: os.LookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"repository:" + id, "profile:" + repository.Profile, "global"}, os.LookupEnv)})
+	input := config.ResolveInput{Repository: repository.Fields, Profile: doc.Settings.Profiles[repository.Profile].Fields, Global: doc.Settings.Global, LookupEnv: os.LookupEnv, LegacyDefaults: config.LegacyFinishDefaults(doc, []string{"repository:" + id, "profile:" + repository.Profile, "global"}, os.LookupEnv)}
+	out.values, err = finishResolveValues(input)
 	if err != nil {
-		return nil, nil, err
+		return out, err
 	}
-	fingerprint, err := config.SettingsFingerprint(values)
+	out.digest, err = config.SettingsFingerprint(out.values)
 	if err != nil {
-		return nil, nil, err
+		return out, err
 	}
-	var approved []ai.ConfirmationRequirement
-	if approval, exists := config.ActiveGlobalSetupApproval(doc); exists && approval.Fingerprint == fingerprint {
-		for _, scope := range approval.Confirmations {
-			approved = append(approved, ai.ConfirmationRequirement(scope))
+	approval, hasApproval := config.ActiveGlobalSetupApproval(doc)
+	if out.values[config.FieldIntentVerification] == config.VerificationNone &&
+		(!hasApproval || approval.Fingerprint != out.digest) {
+		legacyDigest, err := config.LegacyUncheckedFingerprint(out.values, input)
+		if err != nil {
+			return out, err
+		}
+		// Old global approval cannot grant command execution. Keep the old
+		// unchecked identity so an unchanged saved request can still retry.
+		if !hasApproval || approval.Fingerprint == legacyDigest {
+			out.digest = legacyDigest
+			out.legacyMode, err = config.LegacyVerificationMode(input)
+			if err != nil {
+				return out, err
+			}
 		}
 	}
-	return values, approved, nil
+	if hasApproval && approval.Fingerprint == out.digest {
+		for _, scope := range approval.Confirmations {
+			out.approved = append(out.approved, ai.ConfirmationRequirement(scope))
+		}
+	}
+	return out, nil
 }
 
 func finishResolveValues(input config.ResolveInput) (map[string]string, error) {
@@ -203,7 +230,7 @@ func finishRequireApprovals(cfg daemon.FinishWorkerConfig) error {
 			required = append(required, ai.ConfirmationDiffEgress)
 		}
 	}
-	if cfg.VerificationMode == "fast" || cfg.VerificationMode == "full" {
+	if verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 		required = append(required, ai.ConfirmationVerificationCommand)
 	}
 	for _, scope := range required {

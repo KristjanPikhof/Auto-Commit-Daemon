@@ -613,6 +613,7 @@ type workerRuntime struct {
 	finishMu         sync.Mutex
 	finishJobs       sync.WaitGroup
 	activeFinishJobs atomic.Int64
+	finishCheck      atomic.Pointer[finishCheckProgress]
 	historyJobs      map[string]bool
 	record           central.RepoRecord
 	worktree         git.Worktree

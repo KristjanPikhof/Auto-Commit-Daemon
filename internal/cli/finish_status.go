@@ -32,6 +32,8 @@ type finishHistoryStatusReport struct {
 
 type finishStatusReport struct {
 	EvidenceCalls     int                  `json:"evidence_calls,omitempty"`
+	AssignmentCalls   int                  `json:"assignment_calls,omitempty"`
+	PartitionCalls    int                  `json:"partition_calls,omitempty"`
 	ReviewedFragments int                  `json:"reviewed_fragments,omitempty"`
 	ReviewFragments   int                  `json:"review_fragments,omitempty"`
 	ReusedFragments   int                  `json:"reused_fragments,omitempty"`
@@ -91,11 +93,15 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 		DeadlineTS: r.DeadlineTS, PlanningCalls: r.PlanningCalls,
 	}
 	var progress struct {
-		EvidenceCalls int                   `json:"evidence_calls"`
-		Review        finish.ReviewProgress `json:"review_progress"`
+		EvidenceCalls   int                   `json:"evidence_calls"`
+		AssignmentCalls int                   `json:"assignment_calls"`
+		PartitionCalls  int                   `json:"partition_calls"`
+		Review          finish.ReviewProgress `json:"review_progress"`
 	}
 	if json.Unmarshal([]byte(result), &progress) == nil {
 		report.EvidenceCalls = progress.EvidenceCalls
+		report.AssignmentCalls = progress.AssignmentCalls
+		report.PartitionCalls = progress.PartitionCalls
 		report.ReviewedFragments = len(progress.Review.Observations)
 		report.ReviewFragments = progress.Review.TotalFragments
 		report.ReusedFragments = progress.Review.ReusedFragments
@@ -103,12 +109,16 @@ func readFinishStatusForCheckpoint(ctx context.Context, db *sql.DB, worktree, ch
 	var savedReview struct {
 		Disclosure struct {
 			EvidenceCalls   int                        `json:"evidence_calls"`
+			AssignmentCalls int                        `json:"assignment_calls"`
+			PartitionCalls  int                        `json:"partition_calls"`
 			EvidenceReviews []finish.ReviewObservation `json:"evidence_reviews"`
 			ReusedFragments int                        `json:"reused_fragments"`
 		} `json:"disclosure"`
 	}
 	if json.Unmarshal([]byte(plan), &savedReview) == nil {
 		report.EvidenceCalls = max(report.EvidenceCalls, savedReview.Disclosure.EvidenceCalls)
+		report.AssignmentCalls = max(report.AssignmentCalls, savedReview.Disclosure.AssignmentCalls)
+		report.PartitionCalls = max(report.PartitionCalls, savedReview.Disclosure.PartitionCalls)
 		report.ReviewedFragments = max(report.ReviewedFragments, len(savedReview.Disclosure.EvidenceReviews))
 		if r.PlanningCalls > 0 {
 			report.ReviewFragments = max(report.ReviewFragments, report.ReviewedFragments)
@@ -552,12 +562,12 @@ func finishStatusSummary(f *finishStatusReport) string {
 		if f.ReasonCode == "finish_preserved" {
 			return "Interrupted finish preserved. Review current changes before a new finish."
 		}
-		return "Failed: " + consoleCause(f.Reason) + " The requested changes remain saved."
+		return "Failed: " + finishFailureReason(f.ReasonCode, f.Reason) + " The requested changes remain saved."
 	case state.FinishNeedsAttention:
 		return "Needs attention: " + consoleCause(f.Reason) + " The requested changes remain saved."
 	}
 	if f.Stage == "reviewing_evidence" && f.ReviewFragments > 0 {
-		return fmt.Sprintf("Reviewing saved changes: %d/%d fragments (%d reused).", f.ReviewedFragments, f.ReviewFragments, f.ReusedFragments)
+		return finishReviewProgressLabel(f.ReviewedFragments, f.ReviewFragments, f.ReusedFragments) + "."
 	}
 	stage := f.Stage
 	if stage == "" {
@@ -704,10 +714,10 @@ func finishReadOnlyConfigValues(ctx context.Context, roots paths.Roots, repo str
 			return nil, "", err
 		}
 		if found {
-			values, _, err := finishSnapshotValues(revision.SnapshotJSON)
-			return values, fmt.Sprintf("approved revision %d", revision.ID), err
+			resolved, err := finishSnapshotValues(revision.SnapshotJSON)
+			return resolved.values, fmt.Sprintf("approved revision %d", revision.ID), err
 		}
 	}
-	values, _, err := finishSavedValues(roots, repo)
-	return values, "saved settings", err
+	resolved, err := finishSavedValues(roots, repo)
+	return resolved.values, "saved settings", err
 }

@@ -7,6 +7,7 @@ package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2}
 test_timeout=${ACD_TEST_TIMEOUT:-4m30s}
 timing_sensitive_verification_tests='^(TestRunnerKillsBackgroundDescendantsAfterSuccessfulShell)$'
 output_root=
+git_tools_root=
 started_seconds=$SECONDS
 lane_name=${1:-local}
 lane_index=${3:-all}
@@ -23,8 +24,27 @@ PY_SUMMARY
   if [[ -n "$output_root" ]]; then
     rm -rf "$output_root"
   fi
+  if [[ -n "$git_tools_root" ]]; then
+    rm -rf "$git_tools_root"
+  fi
 }
 trap cleanup EXIT
+
+prepare_git() {
+  # The macOS tool shim adds a process to every Git call. Invoke the same
+  # selected Git directly, while preserving any explicit choice on PATH.
+  if [[ "$(uname -s)" != Darwin || "$(command -v git)" != /usr/bin/git ]]; then
+    return
+  fi
+  local selected_git
+  selected_git=$(xcrun --find git 2>/dev/null) || return 0
+  if [[ "$selected_git" == /usr/bin/git || ! -x "$selected_git" ]]; then
+    return
+  fi
+  git_tools_root=$(mktemp -d "${TMPDIR:-/tmp}/acd-test-tools.XXXXXX")
+  ln -s "$selected_git" "$git_tools_root/git"
+  export PATH="$git_tools_root:$PATH"
+}
 
 usage() {
   cat >&2 <<'EOF'
@@ -121,6 +141,16 @@ run_measured_tests() {
   return "$status"
 }
 
+run_git_support() {
+  local index
+  local status=0
+  for index in 0 1; do
+    if ! run_package_shard "$1" 2 "$index" \
+      -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout"; then status=1; fi
+  done
+  return "$status"
+}
+
 run_support() {
   local group=${1:-all}
   local name=support
@@ -128,6 +158,10 @@ run_support() {
   local package
   local packages=()
   local long_packages=()
+  local git_package=
+  local git_pid=
+  local remaining_parallelism=$package_parallelism
+  local status=0
 
   case "$group" in
     all) ;;
@@ -144,7 +178,11 @@ run_support() {
     case "$package" in
       */internal/cli | */internal/daemon)
         ;;
-      */internal/git | */internal/restore | */internal/state)
+      */internal/git)
+        if [[ "$group" == all ]]; then git_package=./internal/git
+        else long_packages[${#long_packages[@]}]=$package; fi
+        ;;
+      */internal/ai | */internal/restore | */internal/state)
         long_packages[${#long_packages[@]}]=$package
         ;;
       *)
@@ -153,12 +191,24 @@ run_support() {
     esac
   done <<<"$package_list"
 
+  if [[ -n "$git_package" ]]; then
+    # One Git process at a time retains the support lane's process budget.
+    # Separate deadlines keep its complete scenario set below the leaf limit.
+    if ((package_parallelism > 1)); then
+      run_git_support "$git_package" &
+      git_pid=$!
+      remaining_parallelism=$((package_parallelism - 1))
+    elif ! run_git_support "$git_package"; then status=1; fi
+  fi
+
   # Start the long suites together so a late state package cannot extend
   # the entire lane after the shorter packages have already finished.
-  run_measured_tests "$name" -p "$package_parallelism" \
+  run_measured_tests "$name" -p "$remaining_parallelism" \
     ${long_packages[@]+"${long_packages[@]}"} ${packages[@]+"${packages[@]}"} \
     -race -count=1 -parallel "${ACD_TEST_CASE_PARALLELISM:-2}" -timeout "$test_timeout" \
-    -skip "$timing_sensitive_verification_tests"
+    -skip "$timing_sensitive_verification_tests" || status=$?
+  if [[ -n "$git_pid" ]] && ! wait "$git_pid" && ((status == 0)); then status=1; fi
+  return "$status"
 }
 
 run_sensitive() {
@@ -201,7 +251,7 @@ run_all() {
       >"$output_root/core-$index.log" 2>&1 &
     core_pids[$index]=$!
   done
-  GOMAXPROCS=${GOMAXPROCS:-2} package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2} run_support >"$output_root/support.log" 2>&1 &
+  GOMAXPROCS=${GOMAXPROCS:-2} package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-3} run_support >"$output_root/support.log" 2>&1 &
   support_pid=$!
 
   for ((index = 0; index < shard_count; index++)); do
@@ -221,6 +271,8 @@ run_all() {
   cat "$output_root/sensitive.log"
   return "$status"
 }
+
+prepare_git
 
 case "${1:-}" in
   '')

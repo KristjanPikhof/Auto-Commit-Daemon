@@ -150,8 +150,8 @@ project's tests passed.
 ## Finish
 
 ~~~bash
-acd finish "Add offline checkout"
-acd finish --message "Update setup guidance"
+acd finish
+acd finish "Keep checkout available when the network is down"
 acd finish --dry-run
 acd finish --include-staged
 acd finish --retry REQUEST_ID --timeout 15m
@@ -161,15 +161,25 @@ Finish itself authorizes local publication; it needs no `--yes`. Local mode
 creates one complete batch commit without provider or network access. Intent
 uses the approved provider to plan completed goals and valid intermediate trees.
 A provider failure ends this request; it never switches to Local automatically.
+The quoted purpose is optional context, not commit wording. It may span
+paragraphs explaining the problem, decisions and constraints. Intent examines
+it with the approved redacted code diffs to choose boundaries and write reasons.
+Without context, it infers purpose from the code. Binary-only work needs context
+or an exact message because the planner cannot read its content. Local includes
+supplied context or uses an offline batch description.
 
-The quoted purpose supplies context about what changed and why. Intent uses it
-to identify useful steps and explain decisions. Intent requires approved
-redacted code diffs; binary-only work also needs context or an exact message. `--message` supplies the complete
-subject and optional body for one batch commit and disables automatic splitting.
-Generated Intent messages include a short reason or practical impact in the body.
+Advanced: `--message` supplies the exact subject and optional body for one batch
+and disables splitting. Generated Intent messages always include a reason in
+the body; this requirement does not rewrite the exact user override.
 Both modes support imperative
 subjects (`Preserve staged content`) and scope-free conventional subjects
 (`fix: preserve staged content`). Change mode or style through reviewed settings.
+
+New generated Intent plans use 200 changed lines per commit as a review target.
+Previews show each step's measured line and file counts. A larger step requires
+an explanation in its body of why it cannot usefully be split. Size and project
+check failures use the existing single correction; required tests and callers
+stay together. Exact messages and older frozen requests retain their rules.
 
 Each request freezes a fresh complete checkpoint, expected branch/HEAD, target
 tree, settings, and index identity. The entire chain must pass its checks before
@@ -179,9 +189,14 @@ linked worktrees prevent publication without disabling protection. An empty
 finish succeeds without creating a commit; an attached unborn branch can receive
 its first commit.
 
-Finish announces that later edits belong to the next finish before preparing
-commits. If files still have uncommitted changes afterward, it shows their count
-and the saved snapshot's time. Use `git status --short` to inspect them, then run
+Intent finish reports how many checkpoints it scans and how many intermediate
+versions it keeps. The terminal distinguishes preparing changes, reviewing
+evidence, waiting for the plan, checking commits, and publishing. During
+planning and checks, long waits show elapsed time or the remaining Intent
+time budget.
+
+If files still have uncommitted changes afterward, finish shows their count and
+the saved snapshot's time. Use `git status --short` to inspect them, then run
 `acd finish` when that work is ready. Excluded files remain uncommitted.
 When nothing remains, finish reports a clean working copy. Repeated project-check
 results appear once; JSON keeps each commit's result.
@@ -216,9 +231,9 @@ instructions still match. Progress shows completed and reused fragments.
 Successful retry previews retain this evidence for a later real retry of the
 same ID. Each attempt still makes a fresh global plan.
 
-Verification always proves structure and target equality. `none` and
-`structural` do not imply that project tests ran. `fast` and `full` run the
-approved command in isolated candidate trees, under one bounded chain deadline.
+Verification always proves structure and target equality. With `project`, ACD
+also runs the approved command in isolated candidate trees within the finish
+deadline. The default `none` skips the command.
 Output reports which checks actually ran. See the
 [finish contract](finish-contract.md) for exact request and safety rules.
 
@@ -293,6 +308,7 @@ acd history
 acd history activity
 acd history explain
 acd history rewrite --last 5 --plan-out goals.json
+acd history rewrite --last 5 --purpose 'Separate retry and rendering changes' --timeout 20m --plan-only
 acd history rewrite --show-plan goals.json
 acd history rewrite --apply goals.json --dry-run
 acd history rewrite --apply goals.json --yes
@@ -304,7 +320,8 @@ History reads completed checkpoints. Activity/explain also retain readable old
 provenance. A saved snapshot is not evidence that its changes were committed.
 
 Rewrite is explicit in both modes. Local uses deterministic existing order and
-grouping; Intent uses bounded goal planning. Selection is contiguous linear
+grouping and preserves valid original messages. Use `--edit` to revise them
+offline. Intent uses bounded goal planning with reasons in generated messages. Selection is contiguous linear
 history with `--last`, `--from-sha`, `--from-nr`, `--range-sha`, or `--range-nr`.
 `--messages-only` keeps one output per selected commit. `--new-branch NAME`
 reconstructs onto a new branch while preserving the source. Saved-plan show

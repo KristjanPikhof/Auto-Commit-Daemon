@@ -6,9 +6,11 @@ provider, reads provider credentials, runs project checks, or starts publication
 Startup may recover an already authorized prepared mutation from its exact saved
 proof; it cannot start a new finish.
 
-Fresh installations use offline Local mode and imperative messages. Local finish
-creates one complete batch; optional Intent mode plans completed goals and safe
-semantic boundaries. Both modes require explicit finish. ACD never pushes.
+Fresh installations use offline Local mode and imperative messages. Local creates
+one complete batch; optional Intent mode plans completed goals and safe semantic
+boundaries. Both modes accept optional completion context and require explicit
+finish. Generated Intent messages must explain why the change is needed. ACD
+never pushes.
 
 Keep the three workflows independent: `on` captures current changes, `finish`
 creates commits from a fresh protected target, and `history rewrite` uses the
@@ -79,8 +81,14 @@ ACD self-hosts this repository:
   automatic commits until explicitly upgraded; warnings do not make it inactive.
 - Do not run `git add` or `git commit`. Never force `acd commit-all` unless the
   user specifically requests it.
-- With a verified finish-based runtime, use `acd finish` for authorized completed
-  work. Finish the task and checks without waiting or polling for publication.
+- With a verified finish-based runtime, use `acd finish [PURPOSE]` for authorized
+  completed work. PURPOSE is optional context, not commit wording. Pass the
+  problem, approach, constraints and decisions the diff cannot explain; a quoted
+  argument may span paragraphs and independent completed changes. Intent reads
+  it with the code, chooses boundaries and writes messages with reasons. Report
+  checks and limits accurately; context is not verification proof. Reserve
+  `--message` for an authorized exact batch override.
+  Finish the task and checks without waiting or polling for publication.
   Report failed or pending requests accurately.
 - Do not pause ACD for ordinary edits, builds, or isolated tests. Pause only for
   history surgery, direct state recovery, or a test operating on this checkout.
@@ -118,7 +126,8 @@ reason for grouping unrelated work.
 Plan useful completed steps within the overall goal before assigning changes.
 A feature can contain a working refactor, its consumer, and a broader policy
 decision. Dependencies determine order; they do not by themselves require one
-commit. Keep implementation,
+commit. A complete tested API or processing module may precede its UI integration when
+the exact caller line also introduces an independent layout change. Keep implementation,
 callers, tests, imports, generated output, and relevant documentation together
 when they complete one goal. Available unpublished corrections belong with the
 change they correct. Different files or screens do not justify a split.
@@ -127,6 +136,21 @@ Each split needs a useful review or revert boundary and a valid intermediate
 state. Put prerequisites before consumers or in the same commit. Explain
 the reason or practical impact in each generated message, not only internal
 planning metadata. Explain broader defaults and behavior changes from evidence.
+Version-five generated Intent requests measure each candidate against its
+preceding tree and use 200 changed lines as a review target. Larger steps need
+a concrete large-change explanation in the Git body. Keep required callers,
+tests and generated companions together; do not split solely to meet a count.
+Collect measured size failures and project-check failures for the same bounded
+correction. Older requests and exact messages retain their frozen rules.
+New final-only Intent requests with an approved project check may construct
+intermediate text versions from exact frozen base/target line selections. New
+version-four requests may also stage new Go and Swift files from exact target
+lines, keeping independent features separate from Settings or layout work. No
+provider-written source is accepted. Keep scope labels and compiler dumps local;
+only approved redacted diff lines and edit metadata enter planning. Check every
+candidate before one publication. Collect failed source checks for the existing
+single global correction and deadline, sharing only diagnostic names and exact edit IDs already in the
+approved diffs. Older requests and retained-version plans keep their identity.
 Intent requires approved redacted code diffs on every planning path; completion
 context supplements that evidence. Local remains offline. Existing settings
 retain their consent on upgrade. An exact `--message` requests one complete batch. Age and queue pressure
@@ -134,10 +158,12 @@ never waive completeness checks. Judge the proposed commit tree, not the final
 worktree. Frozen request identity, author boundaries, and explicit history-rewrite safety
 limits still apply.
 
-An Intent attempt may review large evidence in at most 128 bounded calls, then
-make one global planning call and at most one global correction within one persisted
-deadline. Reviews cover every complete redacted diff, splitting large files
-without dropping bytes. Review fragments are evidence, never commit boundaries.
+An Intent attempt may use at most 128 bounded evidence review and file assignment
+calls, one global planning call, and at most one global correction within one persisted
+deadline. Source requests up to 128 KiB go directly to planning. Larger inputs
+receive bounded reviews of mechanisms and prerequisites; selectable code stays
+exact in the global request alongside those observations. Reviews cover complete
+evidence without dropping bytes. Review fragments are evidence, never commit boundaries.
 Each review contains at most 32 fragments to bound its output.
 An invalid review gets at most one correction; accepted reviews are not repeated.
 Corrections consume the same 128-call budget and deadline. Their counts are
@@ -145,13 +171,42 @@ reserved durably and reported separately from global planning calls.
 At most four immutable reviews run concurrently; budget reservations and state
 writes stay on the owning worker. Validated reviews are checkpointed durably;
 explicit retry reuses only fingerprint-matched and revalidated frozen evidence.
-A fresh global plan still sees all changes and observations. Small requests skip review. Messages belong to the global plan. Provider rejection,
+A fresh global plan still sees all changes and observations. Source ownership
+walks each file separately against one complete local catalogue; goals and their
+prerequisite order remain global. Small requests skip review. Messages belong to the global plan. Provider rejection,
 timeout, unavailable evidence, or exhausted budget fails the explicit request;
 there is no background semantic retry or silent Local fallback.
 
 A valid grounded plan can become one whole-batch goal only when it passes the
 same dependency, materialization, and verification checks. Never create generic
 per-file commits to escape a rejected plan.
+Version-seven requests without project checks can keep independent outcomes
+together when one recorded version contains both and no intermediate version
+separates them. Keep that group as small as possible, explain the boundary,
+and preserve every useful split elsewhere in the plan.
+Version-eight whole-version plans can assign a literal file or directory to a
+goal. Expand against the frozen catalogue and keep the same coverage, version
+ordering, and verification checks. A provider refusal without exact conflicting
+change IDs is a planning failure.
+If a large reviewed proposal omits a whole file, assign it to an existing goal
+in a bounded call with its reviewed evidence. Keep existing assignments fixed.
+Unresolved omissions go through the same global correction and final checks.
+An explicit retry may use a saved, structurally checked whole-version proposal
+that only lacks size explanations. The first planning call asks for the
+missing reasons. Rebuild and check the complete chain before publication.
+This explanation-only retry applies to version-eight requests. Version-nine
+whole-version requests and new Intent history plans require a focused partition
+review for every oversized group, regardless of its existing explanation.
+Apply actual useful splits and review oversized children again. A remaining
+large goal needs a matching focused-review receipt naming its concrete file
+and coupling. Keep the full target and verify the final chain.
+Focused reviews use the full message contract and at most one correction in
+the shared evidence budget. Do not carry a global correction into a subset.
+Use exact approved diffs in focused reviews when they fit. A newly added test
+reference is not a reverse dependency: compatible existing tests can remain
+until the final shared test version accompanies its last covered feature.
+Combine those features only when an earlier step breaks an existing caller
+or assertion and its required replacement already depends on the later work.
 
 Client disconnect detaches from the accepted bounded job. Restart fails running
 planning retryably and recovers prepared publication without AI only through exact
@@ -201,11 +256,12 @@ faster.
 
 The default local gate and the complete hosted GitHub Actions workflow each
 have a five-minute wall-clock target. The local gate uses three core shards
-with at most two parallel tests per package process.
+and three support packages in parallel, with at most two parallel tests per
+package process.
 
-Hosted pull requests run four core shards, four production integration shards,
-and separate AI and other support lanes on both Ubuntu and macOS. The other
-support lane runs timing-sensitive tests after its package tests finish.
+Hosted pull requests run four core shards, five production integration shards,
+two AI support shards, and one other support lane on both Ubuntu and macOS.
+The other support lane runs timing-sensitive tests after its package tests finish.
 Repeated daemon stress uses six Ubuntu runners, while
 Git and state stress use two. Each leaf job should finish within four minutes
 and 30 seconds and has a hard five-minute timeout. If a lane exceeds that

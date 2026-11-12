@@ -75,10 +75,17 @@ func startFinishWorker(t *testing.T, w *FinishWorker, options FinishOptions) sta
 }
 func completeFinishTestPlan(request ai.FinishPlanRequest) []byte {
 	ids := make([]string, 0, len(request.Changes))
-	for _, change := range request.Changes {
-		ids = append(ids, change.ID)
+	selected := make(map[string]bool)
+	for _, edit := range request.SourceEdits {
+		selected[edit.ChangeID] = true
+		ids = append(ids, edit.ID)
 	}
-	raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Preserve completed changes", Boundary: "The supplied changes complete the requested batch", Message: "Preserve completed changes\n\n- Publish the requested goal without later edits.", ChangeIDs: ids}}})
+	for _, change := range request.Changes {
+		if !selected[change.ID] {
+			ids = append(ids, change.ID)
+		}
+	}
+	raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Preserve completed changes", Boundary: "The supplied changes complete the requested batch", Reason: "Publish the requested goal without later edits.", Message: "Preserve completed changes\n\n- Publish the requested goal without later edits.", ChangeIDs: ids}}})
 	return raw
 }
 
@@ -130,7 +137,7 @@ func TestFinishWorkerLocalFreezePreviewAndPublication(t *testing.T) {
 			if body := finishWorkerGit(t, f.dir, "show", r.Target.TargetTree+":goal.txt"); body != "frozen" {
 				t.Fatalf("target absorbed later bytes %q", body)
 			}
-			fresh := startFinishWorker(t, w, FinishOptions{DryRun: true})
+			fresh := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 			if fresh.Target.CheckpointID == r.Target.CheckpointID {
 				t.Fatal("new finish reused source checkpoint")
 			}
@@ -180,7 +187,7 @@ func TestFinishWorkerStagedOverlayAndExcludedBase(t *testing.T) {
 	if _, _, err := w.Start(context.Background(), FinishOptions{}); !errors.Is(err, git.ErrFinishStaged) {
 		t.Fatalf("default staged consent: %v", err)
 	}
-	r := startFinishWorker(t, w, FinishOptions{IncludeStaged: true})
+	r := startFinishWorker(t, w, FinishOptions{IncludeStaged: true, Purpose: "Preserve the approved staged version when later edits arrive"})
 	if r.Target.TargetTree == r.Target.CheckpointTree || r.Target.TargetRef == "" {
 		t.Fatal("overlay lacks distinct private target pin")
 	}
@@ -216,7 +223,7 @@ func TestFinishWorkerPreservesGitlinks(t *testing.T) {
 	finishWorkerGit(t, f.dir, "commit", "-m", "Seed tracked Gitlink")
 	finishWrite(t, f.dir, "vendor/sdk/later.txt", "nested work stays local\n")
 	finishWrite(t, f.dir, "goal.txt", "eligible change\n")
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 	if out := finishWorkerGit(t, f.dir, "ls-tree", r.Target.TargetTree, "--", "vendor/sdk"); !strings.Contains(out, "160000 commit "+linked) {
 		t.Fatalf("tracked Gitlink changed: %q", out)
 	}
@@ -376,7 +383,7 @@ func TestFinishWorkerCommandChecksAndRestart(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			f, w := finishWorkerFixture(t)
 			finishWrite(t, f.dir, "goal.txt", "approved\n")
-			r := startFinishWorker(t, w, FinishOptions{})
+			r := startFinishWorker(t, w, FinishOptions{Purpose: "Publish only the approved version after checking it"})
 			if scenario == "running_restart" {
 				recovery := &FinishWorker{RepoPath: f.dir, DB: f.db}
 				if _, err := recovery.RecoverPrepared(context.Background()); err != nil {
@@ -424,7 +431,7 @@ func TestFinishWorkerCommandChecksAndRestart(t *testing.T) {
 			}
 			w.Config.VerificationMode = "fast"
 			w.Config.Command = approved
-			r = startFinishWorker(t, w, FinishOptions{})
+			r = startFinishWorker(t, w, FinishOptions{Purpose: "Publish only the approved version after checking it"})
 			completed, err := w.Execute(context.Background(), r.ID)
 			if scenario == "failed" {
 				if err == nil || completed.State != state.FinishFailed {
@@ -470,7 +477,7 @@ func TestFinishWorkerExactProviderEvidence(t *testing.T) {
 	for path, body := range map[string]string{"*.txt": "wildcard file\n", "other.txt": "other file\n", ":(exclude)config.go": "exclude named file\n", "binary.dat": strings.Repeat("x", 9000) + "\x00tail", "unicode.txt": strings.Repeat("界", 4000)} {
 		finishWrite(t, f.dir, path, body)
 	}
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 	wt, _, _, err := w.resolved(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -519,7 +526,7 @@ func TestFinishWorkerRetainsRenameAtomicBoundary(t *testing.T) {
 	if err := os.Rename(filepath.Join(f.dir, "old.txt"), filepath.Join(f.dir, "new.txt")); err != nil {
 		t.Fatal(err)
 	}
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 	wt, _, _, _ := w.resolved(context.Background())
 	evidence, _, err := w.evidence(context.Background(), wt, r.Target)
 	if err != nil {
@@ -624,6 +631,7 @@ func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
 	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	w.Config.Provider.Timeout = time.Minute
+	const largeReason = "The library-000.txt version and its companion entries form one complete imported dataset; publishing only some entries would expose an incomplete catalogue."
 	reviewed := make(map[string]string)
 	var reviewMu sync.Mutex
 	p := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
@@ -650,16 +658,28 @@ func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
 			}
 		}
 		finishWrite(t, f.dir, "library-000.txt", "later edit stays outside accepted finish\n")
-		return completeFinishTestPlan(request), nil
+		goal := finish.Goal{Purpose: "Import the complete library catalogue", Boundary: "Keep the required catalogue entries in one complete import", Reason: "Preserve every imported catalogue entry while later edits remain outside the accepted request.", LargeChangeReason: largeReason, Message: "Import the complete library catalogue\n\n- Preserve every imported catalogue entry while later edits remain outside the accepted request.\n- " + largeReason}
+		for _, change := range request.Changes {
+			goal.ChangeIDs = append(goal.ChangeIDs, change.ID)
+		}
+		return json.Marshal(map[string]any{"goals": []finish.Goal{goal}})
 	}}
 	w.Transport = p
-	r := startFinishWorker(t, w, FinishOptions{})
+	r := startFinishWorker(t, w, FinishOptions{Purpose: "Import the complete library catalogue; all recorded entries are required in the published dataset"})
 	completed, err := w.Execute(context.Background(), r.ID)
-	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 || completed.EvidenceCalls < 2 || p.calls.Load() != int32(completed.EvidenceCalls+1) {
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 || completed.EvidenceCalls < 2 || completed.PartitionCalls != 1 || p.calls.Load() != int32(completed.EvidenceCalls+completed.PartitionCalls+1) {
 		t.Fatalf("large finish: %+v calls=%d: %v", completed, p.calls.Load(), err)
 	}
 	if tree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); tree != r.Target.TargetTree {
 		t.Fatal("published tree lost full file contents")
+	}
+	var saved FinishSavedPlan
+	if err := json.Unmarshal(completed.Plan, &saved); err != nil || len(saved.Steps) != 1 || saved.Steps[0].ReviewSize == nil || *saved.Steps[0].ReviewSize != (FinishReviewSize{ChangedLines: 146812, ChangedFiles: 156}) || saved.Steps[0].LargeChangeReason != largeReason {
+		t.Fatalf("large catalogue lost its measured exception: %+v %v", saved, err)
+	}
+	message := finishWorkerGit(t, f.dir, "log", "-1", "--format=%B")
+	if !strings.Contains(strings.Join(strings.Fields(message), " "), largeReason) {
+		t.Fatal("published catalogue omitted its large-change explanation")
 	}
 	body, _ := os.ReadFile(filepath.Join(f.dir, "library-000.txt"))
 	if string(body) != "later edit stays outside accepted finish\n" {
@@ -671,7 +691,7 @@ func TestFinishWorkerInputBudgetIsFrozen(t *testing.T) {
 	f, w := finishWorkerFixture(t)
 	finishWrite(t, f.dir, "goal.txt", "saved goal\n")
 	w.Config.Mode = "intent"
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 	w.Config.Provider.MaxInputBytes = ai.FinishDefaultInputByteCap
 	if _, _, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, DryRun: true}); err != nil {
 		t.Fatalf("explicit default changed saved identity: %v", err)

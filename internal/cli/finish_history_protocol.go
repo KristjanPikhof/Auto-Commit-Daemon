@@ -14,9 +14,10 @@ import (
 )
 
 type finishHistoryParams struct {
-	Plan   state.IntentHistoryPlan `json:"plan"`
-	PlanID string                  `json:"plan_id"`
-	DryRun bool                    `json:"dry_run"`
+	Plan    state.IntentHistoryPlan `json:"plan"`
+	PlanID  string                  `json:"plan_id"`
+	DryRun  bool                    `json:"dry_run"`
+	Timeout time.Duration           `json:"timeout,omitempty"`
 }
 
 func (h *repositoryWorkerHandler) handleFinishHistory(ctx context.Context, runtime *workerRuntime, request supervisor.Request) (any, *supervisor.ProtocolError) {
@@ -25,6 +26,9 @@ func (h *repositoryWorkerHandler) handleFinishHistory(ctx context.Context, runti
 	}
 	var params finishHistoryParams
 	if err := decodeFinishParams(request.Params, &params); err != nil {
+		return nil, protocolFailure("invalid_history", err, false)
+	}
+	if err := daemon.ValidateFinishTimeout(params.Timeout); err != nil {
 		return nil, protocolFailure("invalid_history", err, false)
 	}
 	if request.Method == "history_status" {
@@ -123,6 +127,9 @@ func (h *repositoryWorkerHandler) handleFinishHistory(ctx context.Context, runti
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
+	if params.Timeout > 0 {
+		timeout = params.Timeout
+	}
 	r, created, err := state.StartFinishHistoryRequest(ctx, runtime.db, state.FinishHistoryRequest{PlanID: plan.ID, WorktreeID: request.WorktreeID, ConfigDigest: cfg.ConfigDigest, IndexDigest: index, DryRun: params.DryRun, DeadlineTS: float64(time.Now().Add(timeout).UnixNano()) / 1e9})
 	if err != nil {
 		return nil, finishProtocolError(err)
@@ -160,9 +167,15 @@ func historyRequest(ctx context.Context, lookup controlRepoLookup, method string
 		return state.FinishHistoryRequest{}, err
 	}
 	timeout := 30 * time.Second
+	if method == "history_start" || method == "history_save" {
+		timeout = supervisor.CheckpointBarrierTimeout
+		if params.Timeout > 0 {
+			timeout = params.Timeout
+		}
+	}
 	response, err := supervisor.DoWorker(ctx, supervisor.WorkerSocketPath(lookup.Roots, lookup.Record.RepositoryID), supervisor.Request{Version: supervisor.ProtocolVersion, ID: "history-" + params.Plan.ID + params.PlanID, Method: method, RepositoryID: lookup.Record.RepositoryID, WorktreeID: lookup.Record.WorktreeID, Params: raw, DeadlineMS: time.Now().Add(timeout).UnixMilli()}, timeout)
 	if err != nil {
-		return state.FinishHistoryRequest{}, unavailableError("history rewrite: protection worker unavailable; run `acd on` or update with `acd setup`")
+		return state.FinishHistoryRequest{}, unavailableError("history rewrite: worker request did not complete\nDetails: " + err.Error())
 	}
 	if response.Error != nil {
 		return state.FinishHistoryRequest{}, &CommandError{Code: response.Error.Code, Message: response.Error.Message, Exit: ExitActionRequired, Retryable: response.Error.Retryable}

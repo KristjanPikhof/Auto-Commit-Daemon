@@ -98,7 +98,7 @@ func TestSettingsSnapshotReadOnlySecretSafeAndScoped(t *testing.T) {
 	store := config.NewStore(roots)
 	if err := store.Update(func(doc *config.Document) error {
 		doc.Settings.Global[config.FieldModel] = json.RawMessage(`"global-model"`)
-		doc.Settings.Profiles["fast"] = config.Profile{Fields: config.Overrides{config.FieldVerificationFullTimeout: json.RawMessage(`"4m"`)}}
+		doc.Settings.Profiles["fast"] = config.Profile{Fields: config.Overrides{config.FieldVerificationTimeout: json.RawMessage(`"4m"`)}}
 		doc.Settings.Repositories[svc.repoHash] = config.RepositorySettings{Profile: "fast", Fields: config.Overrides{config.FieldCommitStrategy: json.RawMessage(`"intent"`)}}
 		return nil
 	}); err != nil {
@@ -286,7 +286,7 @@ func TestGlobalServiceSavesFingerprintBoundSetupApproval(t *testing.T) {
 		config.FieldBaseURL:            "https://gateway.example/v1",
 		config.FieldModel:              "gateway-model",
 		config.FieldDiffEgress:         "true",
-		config.FieldIntentVerification: "structural",
+		config.FieldIntentVerification: "none",
 	}
 	confirmed := []ai.ConfirmationRequirement{
 		ai.ConfirmationEndpointCredentials,
@@ -318,7 +318,7 @@ func TestGlobalServiceSavesFingerprintBoundSetupApproval(t *testing.T) {
 		t.Fatalf("approval = %+v ok=%v", approval, ok)
 	}
 	if string(doc.Settings.Global[config.FieldModel]) != `"gateway-model"` ||
-		string(doc.Settings.Global[config.FieldIntentVerification]) != `"structural"` {
+		string(doc.Settings.Global[config.FieldIntentVerification]) != `"none"` {
 		t.Fatalf("saved globals = %+v", doc.Settings.Global)
 	}
 
@@ -412,7 +412,7 @@ func TestGlobalServiceRejectsRepositoryVerificationApproval(t *testing.T) {
 	svc, _ := testGlobalService(t, nil, nil)
 	draft := map[string]string{
 		config.FieldCommitStrategy:     "local",
-		config.FieldIntentVerification: "structural",
+		config.FieldIntentVerification: "none",
 	}
 	validation, err := svc.Validate(context.Background(), draft, nil)
 	if err != nil {
@@ -472,7 +472,7 @@ func TestSettingsActionSaveRoutesScopesAndRejectsStaleGeneration(t *testing.T) {
 	}
 	profileValue := "3m"
 	if _, err := svc.Save(context.Background(), SaveRequest{Scope: ScopeProfile, Profile: "fast",
-		Values: map[string]*string{config.FieldVerificationFullTimeout: &profileValue}, ExpectedGeneration: 1}); err != nil {
+		Values: map[string]*string{config.FieldVerificationTimeout: &profileValue}, ExpectedGeneration: 1}); err != nil {
 		t.Fatal(err)
 	}
 	doc, err := config.NewStore(roots).Load()
@@ -480,7 +480,7 @@ func TestSettingsActionSaveRoutesScopesAndRejectsStaleGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	if doc.Generation != 2 || string(doc.Settings.Repositories[svc.repoHash].Fields[config.FieldModel]) != `"repo-model"` ||
-		string(doc.Settings.Profiles["fast"].Fields[config.FieldVerificationFullTimeout]) != `"3m"` || len(doc.Settings.Global) != 0 {
+		string(doc.Settings.Profiles["fast"].Fields[config.FieldVerificationTimeout]) != `"3m"` || len(doc.Settings.Global) != 0 {
 		t.Fatalf("scoped document = %+v", doc.Settings)
 	}
 }
@@ -494,7 +494,7 @@ func TestSettingsActionClearsEmptyRepositoryOverride(t *testing.T) {
 		Scope:   ScopeProfile,
 		Profile: profile,
 		Values: map[string]*string{
-			config.FieldVerificationFullTimeout: &timeout,
+			config.FieldVerificationTimeout: &timeout,
 		},
 		ExpectedGeneration: 0,
 	}); err != nil {
@@ -572,12 +572,12 @@ func TestFinishConfigIntentRevisionContainsOnlySupportedFields(t *testing.T) {
 		return "", false
 	}
 	svc, _ := testService(t, lookup, nil)
-	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "structural"}
+	draft := map[string]string{config.FieldCommitStrategy: "intent", config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "none"}
 	validation, err := svc.Validate(context.Background(), draft, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if validation.ResolvedHot[config.FieldIntentVerification] != "structural" || validation.ResolvedHot[config.FieldDiffEgress] != "true" {
+	if validation.ResolvedHot[config.FieldIntentVerification] != "none" || validation.ResolvedHot[config.FieldDiffEgress] != "true" {
 		t.Fatalf("explicit values lost: %#v", validation.ResolvedHot)
 	}
 	body, err := revisionSnapshotJSON(validation.ResolvedHot, nil)

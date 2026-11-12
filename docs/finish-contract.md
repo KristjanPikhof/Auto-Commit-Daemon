@@ -23,9 +23,12 @@ pushes to a remote.
 | `acd history rewrite` | Preview or explicitly apply a saved history rewrite | Retain the selection, saved-plan, preview/apply, and source-history safety interfaces below. Never run it from protection or hooks. |
 | `acd commit-all` | Deprecated: use acd finish | Delegate to finish for the first finish-based release only. Retain no drain, fallback, retry loop, or second publication engine. Accept legacy `--yes` with its existing explicit staged-selection consent. |
 
-`PURPOSE` is one optional quoted argument describing the completed goal. It
-supplies context for messages and grouping. `--message` supplies the complete
-message; purpose can accompany it as explanation. Both become immutable when
+`PURPOSE` is optional completion context for messages and grouping. It may span
+paragraphs with problems, decisions and constraints. Intent reads it with the
+approved code evidence and infers purpose when it is absent; generated messages
+must explain why. Local includes supplied context or uses an offline batch
+description. Advanced `--message` supplies an exact message with an optional
+body; purpose may accompany it as context. Both become immutable when
 the target freezes. `--retry` may combine with `--dry-run`, `--repo`, `--json`,
 `--timeout`, and `--quiet`; it rejects new purpose, message, or staged consent. Unknown IDs,
 foreign-worktree IDs, and attempts to retry a successful publication are errors.
@@ -142,10 +145,18 @@ splits. Available unpublished corrections belong with the change they correct.
 
 Each changed entry belongs to exactly one goal. Respect rename chains,
 create/delete order, hard dependencies, and generated relationships. Materialize
-only recorded path versions; do not fabricate code or intermediate history.
+recorded versions or exact frozen source selections; never accept provider-written
+replacement code. Source construction is limited to new final-only requests
+with an approved project check. Existing regular text files can
+contribute exact insertions and deletions. New files, renames, binaries and mode
+changes stay whole. Persist the frozen witnesses, edit positions and selections
+with the checked plan; older requests keep their accepted version rules.
 The final candidate tree must equal the entire frozen target exactly, including
 unchanged entries, file modes, deletions, renames, symlinks, and binary objects.
 Coverage and equality are structural evidence, not proof that project tests ran.
+Starting with version seven, requests limited to whole saved versions can keep
+inseparable edits together in the smallest complete commit. The plan still
+needs useful boundaries for the rest of the work and the same structural proof.
 
 One Intent attempt allows at most 128 evidence-review calls, one global planning
 call, and at most one global correction within one persisted `ai.timeout`
@@ -168,7 +179,10 @@ reservations use the mutable attempt result journal, preserving accepted-plan
 immutability and the separate two-call planning budget. Restart retains the
 counts and interrupts the attempt; it does not resume provider work. Messages belong to
 that plan, so they have no separate retry loop. One batch must explain why the
-recorded changes do not support useful safe steps. Failed intermediate checks,
+recorded changes do not support useful safe steps. A failed constructed-source
+check can use the same global correction and deadline. Only its step number and
+diagnostic names already present in approved redacted diffs may enter feedback;
+raw check output stays local. Recheck every corrected candidate. Failed intermediate checks,
 provider failure, malformed or incomplete output, unavailable evidence, and
 exhausted budget fail the request instead of silently combining commits.
 
@@ -220,11 +234,10 @@ content sent to that provider. Local mode sends nothing. Status, list, doctor,
 and diagnose neither build providers nor migrate/write state. Logs, JSON,
 errors, and prompt traces must preserve credential redaction.
 
-Always verify structure and exact target equality. Preserve approved
-`intent.verification` policies (`none`, `structural`, `fast`, `full`) and their
-configured command/timeouts: `none` skips project commands, never the safety
-checks. Run approved commands in isolated candidate materializations, not the
-live worktree. Record each candidate tree, policy, command, environment
+Always verify structure and exact target equality. The `none` policy skips
+project commands. The `project` policy runs one approved command with its
+configured timeout in each isolated candidate worktree. Older approved revisions
+and frozen requests keep their verification identity. Record each candidate tree, policy, command, environment
 identity, result, duration, and output provenance. A cached result is reusable
 only for the identical tree, command, environment, and policy; label it reused
 and never claim it ran afresh. Report absent commands, structural-only checks,

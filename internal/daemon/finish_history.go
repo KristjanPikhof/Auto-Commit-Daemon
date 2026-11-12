@@ -22,11 +22,12 @@ import (
 )
 
 type FinishHistoryOptions struct {
-	Mode, Style, Purpose, VerificationConfigDigest string
-	MessagesOnly, DiffEgress                       bool
-	MaxInputBytes                                  int
-	Deadline                                       time.Time
-	BeforeCall                                     func(context.Context) error
+	Mode, Style, Purpose, VerificationConfigDigest                string
+	MessagesOnly, DiffEgress                                      bool
+	MaxInputBytes                                                 int
+	Deadline                                                      time.Time
+	BeforeCall                                                    func(context.Context) error
+	BeforeEvidenceCall, BeforePartitionCall, BeforeAssignmentCall func(context.Context) error
 }
 
 func finishHistoryEvidence(ctx context.Context, repo string, chain []string) (finish.Evidence, []git.IntentHistoryUnit, string, error) {
@@ -126,7 +127,7 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 		return plan, err
 	}
 	full := append(slices.Clone(chain), suffix...)
-	if _, err := git.ReadIntentHistoryUnits(ctx, repo, full); err != nil {
+	if err := git.ValidateIntentHistoryChain(ctx, repo, chain, suffix); err != nil {
 		return plan, err
 	}
 	plan, err = state.PrepareIntentHistoryPlan(state.IntentHistoryPlan{SourceBranchRef: branch, TargetBranchRef: branch, ExpectedHead: full[len(full)-1], BaseTree: base, SourceChain: slices.Clone(chain), RecreateUnchanged: slices.Clone(suffix), CommitFormat: options.Style, Mode: options.Mode, MessagesOnly: options.MessagesOnly, VerificationConfigDigest: options.VerificationConfigDigest, PlanningDeadlineTS: finishTimestamp(options.Deadline)})
@@ -179,31 +180,6 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 					commit.Author = evidence.Changes[index].Author
 				}
 			}
-			if options.Mode == "local" && finish.ValidateMessage(options.Style, goal.Message) != nil {
-				before, err := git.IntentHistoryBaseTree(ctx, repo, oid)
-				if err != nil {
-					return plan, err
-				}
-				baseTree, err := readFinishTree(ctx, repo, before)
-				if err != nil {
-					return plan, err
-				}
-				target, err := readFinishTree(ctx, repo, oid)
-				if err != nil {
-					return plan, err
-				}
-				local, err := finish.Local(finish.Evidence{Base: baseTree, Target: target, Changes: finish.NetChanges(baseTree, target, "recorded")}, finish.LocalOptions{Style: options.Style})
-				if err != nil {
-					return plan, err
-				}
-				goal.Message = "Preserve recorded empty commit"
-				if options.Style == finish.StyleConventional {
-					goal.Message = "chore: preserve recorded empty commit"
-				}
-				if len(local.Steps) > 0 {
-					goal.Message = local.Steps[0].Message
-				}
-			}
 			plan.Goals = append(plan.Goals, goal)
 			commits = append(commits, commit)
 		}
@@ -219,11 +195,22 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 			}
 		}
 	} else {
-		result, err := ai.PlanFinish(ctx, transport, evidence, ai.FinishOptions{MaxInputBytes: options.MaxInputBytes, Deadline: options.Deadline, Style: options.Style, Purpose: options.Purpose, Diffs: diffs, DiffEgress: options.DiffEgress, BeforeCall: options.BeforeCall})
+		result, err := ai.PlanFinish(ctx, transport, evidence, ai.FinishOptions{
+			MaxInputBytes: options.MaxInputBytes, Deadline: options.Deadline, Style: options.Style, Purpose: options.Purpose,
+			Diffs: diffs, DiffEgress: options.DiffEgress, BeforeCall: options.BeforeCall,
+			BeforeEvidenceCall: options.BeforeEvidenceCall, BeforePartitionCall: options.BeforePartitionCall,
+			BeforeAssignmentCall: options.BeforeAssignmentCall,
+			ReviewLineTarget:     ai.FinishReviewLineTarget, GroupIndivisibleVersions: true, AllowPathOwnership: true,
+			PartitionOversized: true, MeasurePlan: func(ctx context.Context, candidate finish.Plan) ([]ai.FinishStepSize, error) {
+				return measureFinishPlan(ctx, repo, candidate)
+			},
+		})
 		if err != nil {
 			return plan, err
 		}
-		plan.SharedPlan = &result.Plan
+		// Keep immutable memberships, rather than repeating the repository's
+		// complete tree for every candidate in the saved plan and worker RPC.
+		plan.SharedPlan = compactFinishHistoryPlan(result.Plan)
 		plan.Disclosure, _ = json.Marshal(result.Disclosure)
 		plan.PlanningCalls = result.Calls
 		for index, step := range result.Plan.Steps {
@@ -254,6 +241,14 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 	return plan, err
 }
 
+func compactFinishHistoryPlan(plan finish.Plan) *finish.Plan {
+	compact := &finish.Plan{NeutralChangeIDs: plan.NeutralChangeIDs}
+	for _, step := range plan.Steps {
+		compact.Steps = append(compact.Steps, finish.Step{Goal: step.Goal})
+	}
+	return compact
+}
+
 func finishHistoryTree(ctx context.Context, repo string, tree finish.Tree) (string, error) {
 	dir, err := os.MkdirTemp("", "acd-history-index-")
 	if err != nil {
@@ -271,7 +266,7 @@ func finishHistoryTree(ctx context.Context, repo string, tree finish.Tree) (stri
 // ValidateIntentHistoryPlan validates exact recorded membership or a shared
 // purpose plan. Version-one plans remain inspectable, never silently upgraded.
 func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.IntentHistoryPlan) error {
-	if plan.Version != state.IntentHistoryPlanVersion || len(plan.SourceChain) == 0 || (plan.Mode != "local" && plan.Mode != "intent") {
+	if (plan.Version != 2 && plan.Version != state.IntentHistoryPlanVersion) || len(plan.SourceChain) == 0 || (plan.Mode != "local" && plan.Mode != "intent") {
 		return errors.New("history rewrite: legacy/invalid plan; create a new plan with the current CLI")
 	}
 	if len(plan.ID) > 128 || strings.ContainsAny(plan.ID, "/\\ \t\r\n\x00") || plan.ID == "" {
@@ -301,7 +296,7 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 		return errors.New("history rewrite: recorded provenance differs from saved plan")
 	}
 	full := append(slices.Clone(plan.SourceChain), plan.RecreateUnchanged...)
-	if _, err := git.ReadIntentHistoryUnits(ctx, repo, full); err != nil {
+	if err := git.ValidateIntentHistoryChain(ctx, repo, plan.SourceChain, plan.RecreateUnchanged); err != nil {
 		return err
 	}
 	if full[len(full)-1] != plan.ExpectedHead {
@@ -331,13 +326,50 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 		if plan.Mode != "intent" || plan.SharedPlan == nil {
 			return errors.New("history rewrite: saved shared plan is required")
 		}
-		if err := finish.Validate(evidence, *plan.SharedPlan); err != nil {
+		shared := *plan.SharedPlan
+		if plan.Version >= 3 {
+			if shared.Base != nil || shared.Target != nil {
+				return errors.New("history rewrite: compact plan contains redundant trees")
+			}
+			goals := make([]finish.Goal, len(shared.Steps))
+			for i, step := range shared.Steps {
+				if step.Tree != nil || step.Author != "" {
+					return errors.New("history rewrite: compact step contains redundant tree or author")
+				}
+				goals[i] = step.Goal
+			}
+			rebuilt, err := finish.Build(evidence, goals)
+			if err != nil {
+				return err
+			}
+			if !slices.Equal(shared.NeutralChangeIDs, rebuilt.NeutralChangeIDs) {
+				return errors.New("history rewrite: compact plan changed neutral membership")
+			}
+			shared = rebuilt
+		}
+		if err := finish.Validate(evidence, shared); err != nil {
 			return err
 		}
-		if len(plan.Goals) != len(plan.SharedPlan.Steps) {
+		if plan.Version >= 3 {
+			sizes, err := measureFinishPlan(ctx, repo, shared)
+			if err != nil {
+				return err
+			}
+			var disclosure ai.FinishDisclosure
+			if err := json.Unmarshal(plan.Disclosure, &disclosure); err != nil {
+				return err
+			}
+			for i, step := range shared.Steps {
+				if sizes[i].ChangedLines > ai.FinishReviewLineTarget &&
+					!ai.HasFinishPartitionReview(step.Goal, sizes[i], disclosure.PartitionReviews) {
+					return fmt.Errorf("history rewrite: step %d lacks a focused split review", i+1)
+				}
+			}
+		}
+		if len(plan.Goals) != len(shared.Steps) {
 			return errors.New("history rewrite: goal count differs from shared plan")
 		}
-		for index, step := range plan.SharedPlan.Steps {
+		for index, step := range shared.Steps {
 			goal := plan.Goals[index]
 			pinned, err := git.RevParse(ctx, repo, strings.TrimSuffix(plan.SourceRef, "/source")+"/goal-"+strconv.Itoa(index+1)+"^{tree}")
 			if err != nil || pinned != goal.TreeOID {
@@ -435,7 +467,7 @@ func (w *FinishWorker) ExecuteFinishHistoryRequest(ctx context.Context, plan sta
 	}
 	proof, err := git.BuildFinishHistoryChain(verifyCtx, wt.Root, git.FinishHistoryBuildOptions{PlanID: plan.ID, WorktreeID: r.WorktreeID, SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead, IndexDigest: index, SourceRef: plan.SourceRef, LockToken: plan.ID + "-" + strconv.Itoa(r.Attempt), SourceChain: plan.SourceChain, RecreateUnchanged: plan.RecreateUnchanged, Goals: goals, Verify: func(callCtx context.Context, oid, tree string, index int) error {
 		result, err := evaluatePublication(callCtx, func(jobCtx context.Context) (verification.Result, error) {
-			if cfg.VerificationMode == "fast" || cfg.VerificationMode == "full" {
+			if verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 				return w.Runner.Run(jobCtx, verification.Request{RepoPath: wt.Root, CandidateID: plan.ID + "-" + strconv.Itoa(index), CommitOID: oid, Command: cfg.Command})
 			}
 			return w.Runner.CheckStructural(jobCtx, verification.StructuralRequest{RepoPath: wt.Root, CandidateID: plan.ID + "-" + strconv.Itoa(index), CommitOID: oid})

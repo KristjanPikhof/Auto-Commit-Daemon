@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
@@ -16,6 +17,36 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
 
+func TestHistoryStartValidationUsesRequestedBudget(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	serveIntentHistoryWorker(t, lookup, controlTestRPC(func(_ context.Context, req supervisor.Request) (any, *supervisor.ProtocolError) {
+		var params finishHistoryParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			t.Error(err)
+		}
+		want := 30 * time.Second
+		if req.Method == "history_start" || req.Method == "history_save" {
+			want = supervisor.CheckpointBarrierTimeout
+			if params.Timeout > 0 {
+				want = params.Timeout
+			}
+		}
+		remaining := time.Until(time.UnixMilli(req.DeadlineMS))
+		if remaining < want-5*time.Second || remaining > want {
+			t.Errorf("history validation deadline %s, want %s", remaining, want)
+		}
+		return state.FinishHistoryRequest{PlanID: "budget", Status: "saved"}, nil
+	}))
+	for _, scenario := range []struct {
+		method  string
+		timeout time.Duration
+	}{{"history_start", 2 * time.Minute}, {"history_save", 0}, {"history_status", 2 * time.Minute}} {
+		if _, err := historyRequest(t.Context(), lookup, scenario.method, finishHistoryParams{PlanID: "budget", Timeout: scenario.timeout}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func historyCLIPlan(t *testing.T, runtime *workerRuntime, lookup controlRepoLookup, target string) state.IntentHistoryPlan {
 	t.Helper()
 	for _, field := range config.Catalog() {
@@ -23,7 +54,7 @@ func historyCLIPlan(t *testing.T, runtime *workerRuntime, lookup controlRepoLook
 	}
 	repo := runtime.worktree.Root
 	writeRewriteTestFile(t, repo, "history.txt", "recorded history\n")
-	for _, args := range [][]string{{"add", "history.txt"}, {"commit", "-qm", "Preserve recorded history"}} {
+	for _, args := range [][]string{{"add", "history.txt"}, {"commit", "-qm", "Preserve recorded history\n\n- Keep the authored boundary available for rollback."}} {
 		if _, err := git.Run(t.Context(), git.RunOpts{Dir: repo}, args...); err != nil {
 			t.Fatal(err)
 		}
@@ -62,7 +93,7 @@ func TestFinishHistoryRewriteCLICanonicalPreviewApplyAndReadonlyShow(t *testing.
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, true); err != nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "Each proposed commit passed the configured verification.") {
@@ -88,7 +119,7 @@ func TestFinishHistoryRewriteCLICanonicalPreviewApplyAndReadonlyShow(t *testing.
 	if !bytes.Equal(before, raw) {
 		t.Fatal("show mutated request")
 	}
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err != nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err != nil {
 		t.Fatal(err)
 	}
 	completed, _, err := state.LoadFinishHistoryRequest(t.Context(), runtime.db, plan.ID)
@@ -103,13 +134,13 @@ func TestFinishHistoryRewriteCLICanonicalPreviewApplyAndReadonlyShow(t *testing.
 	}
 	// A completed reconnect is provider/config free, but still proves target and backup.
 	t.Setenv("ACD_AI_API_KEY", "invalid\nsecret")
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err != nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := git.Run(t.Context(), git.RunOpts{Dir: runtime.worktree.Root}, "update-ref", "-d", plan.TargetBranchRef); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err == nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err == nil {
 		t.Fatal("deleted completed target silently recreated")
 	}
 }
@@ -118,7 +149,7 @@ func TestFinishHistoryRewriteCLIRejectsUnprovedWorkerStagingAndLegacy(t *testing
 	lookup, runtime, handler := finishCLIFixture(t)
 	plan := historyCLIPlan(t, runtime, lookup, "")
 	var out bytes.Buffer
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err == nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err == nil {
 		t.Fatal("absent owner accepted")
 	}
 	if _, ok, _ := state.LoadFinishHistoryRequest(t.Context(), runtime.db, plan.ID); ok {
@@ -129,7 +160,7 @@ func TestFinishHistoryRewriteCLIRejectsUnprovedWorkerStagingAndLegacy(t *testing
 	if _, err := git.Run(t.Context(), git.RunOpts{Dir: runtime.worktree.Root}, "add", "history.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false); err == nil {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, plan, false, 0); err == nil {
 		t.Fatal("staging accepted without consent")
 	}
 	if _, ok, _ := state.LoadFinishHistoryRequest(t.Context(), runtime.db, plan.ID); ok {
@@ -149,7 +180,7 @@ func TestFinishHistoryRewriteCLIRejectsUnprovedWorkerStagingAndLegacy(t *testing
 	if err := showIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, read, true, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, read, false); err == nil || !strings.Contains(err.Error(), "legacy") {
+	if err := applyIntentHistoryPlan(t.Context(), &out, runtime.worktree.Root, read, false, 0); err == nil || !strings.Contains(err.Error(), "legacy") {
 		t.Fatalf("legacy apply %v", err)
 	}
 }
@@ -221,13 +252,24 @@ func TestFinishHistoryRewriteCLISetupHoldBlocksMutationAndKeepsReads(t *testing.
 func TestFinishHistoryRewriteCLIMessageEditorKeepsMembershipWithoutAI(t *testing.T) {
 	lookup, runtime, _ := finishCLIFixture(t)
 	plan := historyCLIPlan(t, runtime, lookup, "")
+	plan.Goals[0].Message = "Preserve recorded history"
 	file := filepath.Join(t.TempDir(), "review.json")
 	raw, _ := json.Marshal(plan)
 	if err := os.WriteFile(file, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
 	editor := filepath.Join(t.TempDir(), "edit.sh")
-	if err := os.WriteFile(editor, []byte("#!/bin/sh\nsed 's/Preserve recorded history/Clarify recorded history/g' \"$1\" > \"$1.new\"\nmv \"$1.new\" \"$1\"\n"), 0700); err != nil {
+	script := `#!/bin/sh
+awk '{
+ if ($0 == "Preserve recorded history") {
+  print "Clarify recorded history"
+  print ""
+  print "- Keep the authored boundary available for rollback."
+ } else { print }
+}' "$1" > "$1.new"
+mv "$1.new" "$1"
+`
+	if err := os.WriteFile(editor, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("EDITOR", editor)
@@ -239,7 +281,7 @@ func TestFinishHistoryRewriteCLIMessageEditorKeepsMembershipWithoutAI(t *testing
 	if err := json.Unmarshal(out.Bytes(), &edited); err != nil {
 		t.Fatal(err)
 	}
-	if edited.ID == plan.ID || edited.Goals[0].Message != "Clarify recorded history" || edited.Goals[0].TreeOID != plan.Goals[0].TreeOID || edited.Goals[0].AuthorOID != plan.Goals[0].AuthorOID {
+	if edited.ID == plan.ID || edited.Goals[0].Message != "Clarify recorded history\n\n- Keep the authored boundary available for rollback." || edited.Goals[0].TreeOID != plan.Goals[0].TreeOID || edited.Goals[0].AuthorOID != plan.Goals[0].AuthorOID {
 		t.Fatalf("edited %+v", edited)
 	}
 	if err := daemon.ValidateIntentHistoryPlan(t.Context(), runtime.worktree.Root, edited); err != nil {

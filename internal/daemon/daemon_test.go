@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/testutil"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +19,18 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// Keep Go's content-addressed compiler cache while isolating runtime homes.
+	// Otherwise every candidate check recompiles the standard library into a
+	// disposable HOME, making real compiler regressions dominate the local gate.
+	cache, err := exec.Command("go", "env", "GOCACHE").Output()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "daemon test compiler cache: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("GOCACHE", strings.TrimSpace(string(cache))); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "daemon test compiler cache: %v\n", err)
+		os.Exit(1)
+	}
 	_ = os.Setenv(ai.EnvProvider, "deterministic")
 	// Ordinary daemon tests exercise run-loop behavior, not host process
 	// discovery. Keep their lock acquisition deterministic and leave the real

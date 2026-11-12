@@ -260,8 +260,6 @@ func runTransactionalSetup(cmd *cobra.Command, dryRun, yes, nonInteractive bool,
 			setupModeLabel(onboardingState.Draft),
 			onboardingState.Selection.CommitFormat,
 			onboardingState.Selection.Provider)
-		if onboardingState.Selection.Strategy == "intent" {
-		}
 	}
 	if !nonInteractive && !yes && !quiet && settingsInputTTY(cmd.InOrStdin()) && settingsOutputTTY(cmd.OutOrStdout()) {
 		lookup, lookupErr := loadControlRepo(cmd.Context(), repo)
@@ -396,6 +394,7 @@ func renderSetupPlan(cmd *cobra.Command, plan installer.Plan, jsonOut bool) erro
 			fmt.Fprintf(cmd.OutOrStdout(), " at %s using %s", values["ai.base_url"], values["ai.model"])
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), ".")
+		fmt.Fprintln(cmd.OutOrStdout(), "Project check: off by default. Set it with acd config --repo PATH.")
 		if strings.HasPrefix(strings.ToLower(values["ai.base_url"]), "http://") {
 			fmt.Fprintln(cmd.OutOrStdout(), "Warning: This connection is not encrypted. Others could read your API key and requests.")
 		}

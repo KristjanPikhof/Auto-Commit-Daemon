@@ -8,7 +8,7 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-const IntentHistoryPlanVersion = 2
+const IntentHistoryPlanVersion = 3
 const IntentHistoryPlanByteCap = 8 << 20
 
 // IntentHistoryVersion identifies an existing Git path version. Plans retain
@@ -71,7 +71,9 @@ func PrepareIntentHistoryPlan(plan IntentHistoryPlan) (IntentHistoryPlan, error)
 		}
 		plan.ID = id
 	}
-	plan.Version = IntentHistoryPlanVersion
+	if plan.Version == 0 {
+		plan.Version = IntentHistoryPlanVersion
+	}
 	return plan, nil
 }
 
@@ -116,7 +118,7 @@ func LoadIntentHistoryPlan(ctx context.Context, db *DB, id string) (IntentHistor
 	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
 		return plan, false, err
 	}
-	if (plan.Version != 1 && plan.Version != IntentHistoryPlanVersion) || plan.ID != id {
+	if (plan.Version < 1 || plan.Version > IntentHistoryPlanVersion) || plan.ID != id {
 		return plan, false, errors.New("state: invalid history plan identity")
 	}
 	return plan, true, nil

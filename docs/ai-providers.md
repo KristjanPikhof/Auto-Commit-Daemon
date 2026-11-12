@@ -55,12 +55,23 @@ Approving text diffs permits their redacted content to be sent to the selected
 provider. A local subprocess is also a recipient; being local does not grant
 it implicit permission.
 
-Completion context explains the problem, approach, and constraints behind the
-code. It supplements the diffs rather than replacing them. A binary-only finish
+Optional completion context explains the problem, approach, and constraints
+behind the code, including decisions the diff cannot explain. It may span
+paragraphs and multiple completed changes; normal request-size and redaction
+limits apply without clipping it. Intent uses the context with the code to
+choose boundaries and write reasons. Context is not exact message wording or
+proof that checks passed. A binary-only finish
 needs context or an exact batch message because its content cannot enter a text
 request. When recorded intermediate versions are used, diffs describe each exact
 transition, not repeated final diffs. Missing text evidence fails before a
 provider call; ACD does not substitute a metadata-only plan.
+
+Checked source selections add line positions and edit IDs to the approved diff
+evidence. Frozen file bytes, compiler dumps and scope labels stay local. If a
+project check rejects constructed steps, ACD collects the candidate failures
+within the same budget for the one available global correction. Feedback can
+include step numbers, receiver/member names and file names already visible in
+approved redacted code. It never includes raw command output or unapproved names.
 
 Binary or invalid-text blobs are metadata only. Their complete objects remain
 available locally for exact tree verification. Limits are independent of
@@ -72,11 +83,20 @@ checkpoint storage:
 | Each encoded evidence review or its correction | 512 KiB, or the smaller configured budget |
 | Global plan or its correction | 2 MiB, or the smaller configured budget |
 
-There is no separate per-file rejection limit. Large files and batches are
-reviewed in bounded fragments before one global plan. Every complete redacted
-text diff reaches the provider across those fragments. Their factual summaries
-and original change identities enter the global plan together; a fragment does
-not become a commit. Small requests keep the direct planning path.
+`referenced_unchanged_paths` confirms which exact path tokens in approved
+redacted diffs already exist unchanged in the base and target. For example, an
+audio feature can reference an MP3 that was added earlier. The planner needs
+to distinguish that existing resource from a missing change. This metadata
+adds no unchanged content, object identities, or unreferenced file names and
+requires no extra repository scan. It is conservative: unlisted dependencies
+are not necessarily missing.
+
+There is no separate per-file rejection limit. Source-selection requests up to
+128 KiB go straight to global planning. Larger inputs receive bounded reviews
+that identify mechanisms and prerequisites. Selectable code remains complete
+in the global request alongside those observations; summaries never replace it. Every approved diff
+reaches the provider in full through one of those paths. Fragments never become
+commit boundaries. Small non-source requests keep their direct planning path.
 
 `ai.max_input_bytes` accepts 128 KiB through 64 MiB, in bytes, through
 `acd config` or `ACD_AI_MAX_INPUT_BYTES`. It bounds aggregate evidence, while
@@ -106,6 +126,13 @@ ACD rejects redirects, embedded URL credentials, query strings, fragments,
 control characters, and unsupported schemes. Each exchange performs one HTTP
 request with bounded response size and cancellation.
 
+The `gpt-6.1-terra` profile uses `/responses` with high reasoning for global
+planning, medium reasoning for evidence reviews, strict function tools and
+`store: false`, following [OpenAI's Terra tool guidance](https://developers.openai.com/api/docs/guides/latest-model#gpt-6-astra-gpt-61-terra).
+Other models keep their existing Chat Completions contract. A Terra endpoint
+must support Responses. Rejection fails the request with its checkpoint
+protected; ACD does not retry through another API or model.
+
 Finish requests enable strict function schemas. Evidence summaries can use up
 to 4,096 characters per fragment to preserve behavior and dependency details.
 Simple fragments can use shorter notes. ACD still validates every reply, including
@@ -121,6 +148,61 @@ are not planning alternatives. Cancellation and Close terminate the owned
 process group and join its readers within bounded cleanup.
 
 ## Failure behavior
+
+Planning replies contain `goals` and `blocked_reason` (empty on success). Each
+generated goal includes `purpose`, `boundary`, `reason`, and `message`.
+Recorded-version replies also include `change_ids`. Its reason explains the problem or constraint and the chosen
+mechanism; the same wording must appear in the message body, allowing wrapping
+and bullet formatting. A missing reason or one left only in metadata needs
+correction. Advanced exact user messages retain their wording, optional body
+and single-batch contract.
+
+Version-five generated finish requests include `review_line_target: 200` and
+ask every goal for `large_change_reason`, normally an empty string. ACD measures
+added and deleted lines between consecutive candidate trees. A goal above the
+target needs a concrete explanation of necessary coupling or indivisible
+evidence, with the same wording in its published message body. Size failures
+and candidate check failures share the one global correction. Only measured
+counts and approved diagnostic names enter that feedback; raw command output
+stays local. Earlier frozen requests and exact-message batches keep their
+existing contract.
+
+Source-selection requests include `selection_files`, with each change ID and its
+first and last selection IDs. Annotated diffs retain every selectable line in
+order. Goals omit `change_ids`; the reply supplies `file_ownership`, one entry
+per file, with its `change_id` and ordered `runs`. Each run names a `through_id`
+and a 1-based `goal` number. It starts after the preceding endpoint; the first
+starts at `first_id` and the last must end at `last_id`. A whole recorded change
+has matching first and last IDs and needs one run.
+
+This assigns both source edits to the first goal and a resource to the second:
+
+```json
+"file_ownership": [
+  {"change_id": "camera.swift", "runs": [
+    {"through_id": "edit-000002", "goal": 1}
+  ]},
+  {"change_id": "asset.png", "runs": [
+    {"through_id": "asset.png", "goal": 2}
+  ]}
+]
+```
+
+Every file and selection must appear exactly once. ACD rejects unknown files,
+duplicate ownership, gaps and endpoints from another file. It does not repair
+or deduplicate replies. This format applies to OpenAI-compatible tool calls and
+subprocess replies. Older global ownership runs and per-goal memberships retain
+their strict validation; formats cannot be mixed.
+
+If the supplied versions cannot separate independent purposes, return no goals
+and explain the missing evidence in `blocked_reason`. That explanation ends the
+request if the bounded correction cannot resolve it. It never authorizes a
+mixed batch or fabricated intermediate content. Earlier saved plans remain
+readable without the new reason field.
+New requests report a final refusal as `provider_boundaries_unavailable` and
+recommend a new finish with usable evidence or approved project checks. They
+do not suggest retrying the unchanged input. Malformed replies and transient
+provider failures keep their existing retry behavior.
 
 HTTP failures retain the provider's standard `error.message`, with credential
 redaction and bounded output. Nonstandard or unreadable responses report the

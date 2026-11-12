@@ -18,6 +18,123 @@
 
 ### Changed
 
+- Split hosted AI support tests into two shards per platform so setup and the
+  complete suite fit the existing five-minute job limit.
+- Run five hosted integration shards per platform so cold toolchain setup and
+  compilation fit the existing five-minute job limit without dropping tests.
+- Require Go 1.27.4 for source builds, CI, and releases to include the
+  standard-library security fixes that unblock vulnerability checks.
+- Shorten the shared agent guidance around when to use ACD, finishing checked
+  milestones, supplying useful context, and protecting shared work and staging.
+- Let history start and save validate large plans within the requested
+  budget instead of a fixed 30-second connection limit. Keep worker errors
+  visible and show the tree-check phase before acceptance.
+- Order new Xcode source files and declared resource inputs before their
+  build references, while preserving reviewed commit memberships.
+- Give focused split reviews exact approved diffs when they fit, and
+  distinguish added shared-test coverage from real compatibility breaks.
+- Give focused split reviews the full commit-message rules and one bounded
+  correction for invalid replies, without reusing global correction output.
+- Preserve untouched newer merges when rewriting an earlier linear range,
+  including their exact side parents, message, author and final tree.
+  Refuse a merge whose side branch would retain the selected old commits.
+- Independently partition oversized whole-version Intent commits before
+  publication, even when the original plan supplies a size explanation.
+  Apply the same measured split review to new Intent history rewrites.
+- Add boundary context and explicit time budgets to history rewrite.
+- Keep new history plans compact by rebuilding candidate trees from pinned
+  Git evidence, so larger repositories can retain useful smaller boundaries.
+- Fill omitted files in large Intent plans in bounded batches using the
+  existing goals and saved reviews. Report assignment progress separately
+  from review and global planning.
+- Ignore empty path assignments in Intent replies and report the invalid goal
+  number if a nonempty assignment cannot be used.
+- Use exact change assignments ahead of file and directory defaults. This
+  lets Intent split one file's versions while grouping its neighboring files.
+- Let an explicit retry fill missing size explanations for an already checked
+  whole-version plan before rebuilding and verifying the chain.
+- Let Intent assign whole files and coherent directories in one selection.
+  ACD expands the selections and checks coverage before verifying the chain.
+  A provider's uncertainty about coverage no longer appears as a proven
+  conflict in the saved versions.
+- Let Intent keep inseparable saved edits together when project checks are
+  off. Keep the rest of the work in separate, verified commits.
+- Replace Fast and Full with one optional project check. Setup defaults to
+  `none`. Existing checks keep their selected command and timeout, and saved
+  requests keep their verification identity.
+
+- Let checked Intent finishes split a named recorded file version by exact
+  lines in the existing correction call when it blocks independent commits.
+  Keep other recorded changes and completed reviews, and verify the full chain.
+- Show checkpoint scan totals and retained versions during Intent finish.
+  Distinguish evidence preparation, planning, commit checks, and publication,
+  and explain when the Intent attempt runs out of time.
+- Read Intent checkpoints in batches so a branch with more than 256 saved
+  checkpoints can finish. Verify the complete commit chain before publishing it
+  in one branch update.
+- Simplify Intent verification, error handling and finish guidance.
+  Use one candidate verifier and keep preview flags with their commands,
+  preserving checks, deadlines and command output.
+- Give each candidate check its approved command timeout in new generated
+  Intent requests. Use the saved attempt deadline for the whole chain so several
+  valid checks do not exhaust a single command's budget during preparation.
+- Measure each new generated Intent commit against a 200-line review target.
+  Require smaller complete steps or a concrete explanation in the Git body
+  when a larger change must stay together. Show measured sizes in previews and
+  combine size and project-check feedback within the existing single correction.
+  Preserve older frozen requests and exact-message behavior.
+- Reject placeholder explanations such as "fix both" in new generated plans.
+  When available versions cannot support useful boundaries, explain how to
+  start a new finish with project checks or smaller completed milestones.
+  Clarify the splitting capabilities of each verification setting.
+- Use Responses with high reasoning for `gpt-6.1-terra` global planning
+  and medium reasoning for evidence reviews,
+  retaining the configured model and endpoint. Keep strict tools, bounded
+  calls, cancellation and private checkpoints; never fall back to another API.
+- Preserve exact selectable code in global planning. Source requests up to
+  128 KiB go directly to planning; larger inputs receive bounded reviews of
+  mechanisms and prerequisites alongside the complete annotated source.
+  Keep duplicate per-line coordinates local; retain every edit ID in its code.
+  Plan all independent outcomes before ownership, without a remainder goal.
+  Allow tested feature prerequisites before their separate UI integration when
+  the frozen caller line couples feature wiring to a new layout.
+- Assign source ownership within each file instead of overlapping per-goal
+  ranges or one long global list. Preserve the global correction for useful
+  planning feedback. Map compiler locations to already-approved frozen edit IDs
+  without sending source lines or signatures.
+  New requests can stage new Go and Swift files from exact frozen lines, so
+  independent features need not share a commit with Settings or layout work.
+  Collect all candidate failures within the existing budget for one correction;
+  never pin or publish a rejected chain. Older frozen requests keep their rules.
+- Keep finish context optional in Local and Intent. Accept longer handoffs with
+  decisions and constraints for the planner to examine alongside code changes.
+  Require reasons in AI-generated messages; preserve advanced exact overrides
+  and original Local history messages without requiring an explanatory body.
+  Keep exact overrides outside the main examples and clarify agent guidance.
+- Let new final-only Intent requests split existing text files by purpose using
+  exact frozen lines when approved project checks are configured. Check every
+  intermediate commit before publication and use the existing bounded correction
+  for failed source checks without sharing raw command output. Preserve older
+  request identities and prepared recovery proofs.
+- Run three support packages at once in the default local gate and refresh CLI
+  shard weights from measured runtimes. Keep the two-test limit within each
+  package and all existing cases.
+- Run local Git support cases in two sequential shards with measured weights.
+  Keep three support processes, share compiler artifacts across isolated test
+  homes, and avoid repeated Git fixture setup commands without dropping cases.
+- Wrap generated Intent message bodies without changing their wording, so long
+  lines do not consume a provider correction. Keep exact user messages unchanged
+  and continue to reject invalid structure and overlong subjects.
+- Require generated Intent messages to include the planner's specific decision
+  reason in the published body. Separate distinct problems, keep cohesive
+  features complete, and explain when recorded versions cannot support a useful
+  split instead of publishing a mixed batch. Keep older saved plans readable.
+- Confirm unchanged paths referenced in approved diffs so Intent can recognize
+  an existing resource without receiving unrelated names or unchanged content.
+- Retain named interfaces and consumers in evidence reviews so planning can
+  keep definitions before their callers. Cover a real undefined-field split
+  with compiler checks before branch publication.
+
 - Refresh integration-test timings from complete Ubuntu and macOS CI runs so
   the four shards share the current workload and leave room for runner setup
   and cleanup within the five-minute job limit.
