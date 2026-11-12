@@ -70,6 +70,7 @@ type FinishPlanRequest struct {
 	SelectionOrder   []string                  `json:"selection_order,omitempty"`
 	SelectionFiles   []FinishSelectionFile     `json:"selection_files,omitempty"`
 	ReviewLineTarget int                       `json:"review_line_target,omitempty"`
+	RefineRecorded   bool                      `json:"refine_recorded,omitempty"`
 	// Only names already present in approved redacted diffs are included.
 	ReferencedUnchangedPaths []string `json:"referenced_unchanged_paths,omitempty"`
 }
@@ -85,6 +86,9 @@ type FinishOptions struct {
 	DiffEgress bool
 	// Local frozen bytes; only edit descriptors and approved diffs enter requests.
 	SourceFiles []finish.SourceFile
+	// RefineBoundary can add exact selections for a recorded version named in
+	// the first refusal. The correction reuses the completed evidence reviews.
+	RefineBoundary func(context.Context, string) (FinishBoundaryRefinement, error)
 	// VerifyPlan checks the materialized chain, including its measured sizes.
 	// It shares the persisted deadline and single correction budget, and never
 	// publishes a branch.
@@ -100,6 +104,13 @@ type FinishOptions struct {
 	ReviewIdentity     string
 	ReviewProgress     finish.ReviewProgress
 	SaveReviewProgress func(context.Context, finish.ReviewProgress) error
+}
+
+type FinishBoundaryRefinement struct {
+	Evidence finish.Evidence
+	Files    []finish.SourceFile
+	Diffs    []FinishDiff
+	Replaced map[string]string
 }
 
 type FinishDisclosure struct {
@@ -179,7 +190,7 @@ func BuildFinishTransport(cfg ProviderConfig, approved []ConfirmationRequirement
 }
 
 // PlanFinish plans completed purposes and their messages in one exchange, with
-// at most one combined correction. Validation always uses original evidence;
+// at most one combined correction. Validation always uses frozen evidence;
 // the provider cannot replace trees, versions, authors, or dependencies.
 func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.Evidence, options FinishOptions) (FinishPlanResult, error) {
 	var result FinishPlanResult
@@ -194,7 +205,7 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		if options.Message != "" {
 			return result, finishFailure("invalid_options", errors.New("exact messages cannot select source edits"))
 		}
-		if _, _, err := finishSourceCatalogue(evidence, options.SourceFiles); err != nil {
+		if _, _, err := options.sourceCatalogue(evidence); err != nil {
 			return result, finishFailure("invalid_evidence", err)
 		}
 	}
@@ -307,8 +318,8 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 			result.Source = source
 			return result, nil
 		}
+		var blocked *finishBoundariesError
 		if call == 1 {
-			var blocked *finishBoundariesError
 			if options.ReviewLineTarget > 0 && errors.As(validationErr, &blocked) {
 				return result, finishFailure("provider_boundaries_unavailable", validationErr)
 			}
@@ -318,7 +329,53 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 			PreviousOutput:  finishRedactText(strings.ToValidUTF8(string(raw), "�")),
 			ValidationError: finishCorrectionError(validationErr),
 		}
+		if options.RefineBoundary != nil && errors.As(validationErr, &blocked) {
+			refinement, err := options.RefineBoundary(ctx, blocked.Reason)
+			if ctx.Err() != nil {
+				return result, finishDeadlineFailure(ctx.Err(), err)
+			}
+			if err != nil {
+				return result, err
+			}
+			if len(refinement.Files) > 0 {
+				evidence = refinement.Evidence
+				options.SourceFiles, options.Diffs = refinement.Files, refinement.Diffs
+				refined, disclosure, err := prepareFinishRequest(evidence, options)
+				if err != nil {
+					return result, err
+				}
+				approvedDiffs = slices.Clone(refined.Diffs)
+				keepReviewedDiffs(&refined, request, refinement)
+				refined.Correction.ValidationError += ". The named versions now have exact selectable lines through the frozen final version of each affected path. Reviews of the replaced versions are historical context. Assign the selections with the rest of the frozen changes."
+				request = refined
+				result.Disclosure.Redacted = result.Disclosure.Redacted || disclosure.Redacted
+			}
+		}
 	}
+}
+
+// Keep prior reviews and their original change IDs. Send exact annotated
+// code for new selections alongside the same already-reviewed evidence.
+func keepReviewedDiffs(refined *FinishPlanRequest, original FinishPlanRequest, refinement FinishBoundaryRefinement) {
+	keepText := make(map[string]bool)
+	for _, diff := range original.Diffs {
+		keepText[diff.ChangeID] = diff.Text != ""
+	}
+	for _, file := range refinement.Files {
+		keepText[file.ChangeID] = true
+	}
+	for i := range refined.Diffs {
+		if !keepText[refined.Diffs[i].ChangeID] {
+			refined.Diffs[i].Text = ""
+		}
+	}
+	refined.Reviews = slices.Clone(original.Reviews)
+	for i, review := range refined.Reviews {
+		if replacement, ok := refinement.Replaced[review.ChangeID]; ok {
+			refined.Reviews[i].ChangeID = replacement
+		}
+	}
+	refined.Correction = original.Correction
 }
 
 func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (FinishPlanRequest, FinishDisclosure, error) {
@@ -329,11 +386,11 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 	if !options.DiffEgress {
 		return FinishPlanRequest{}, FinishDisclosure{}, finishFailure("provider_diffs_required", ErrIntentDiffsRequired)
 	}
-	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress, ReviewLineTarget: options.ReviewLineTarget}
+	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress, ReviewLineTarget: options.ReviewLineTarget, RefineRecorded: options.RefineBoundary != nil}
 	if len(options.SourceFiles) > 0 {
 		var err error
 		var catalogue []finish.Change
-		request.SourceEdits, catalogue, err = finishSourceCatalogue(evidence, options.SourceFiles)
+		request.SourceEdits, catalogue, err = options.sourceCatalogue(evidence)
 		if err != nil {
 			return request, FinishDisclosure{}, finishFailure("invalid_evidence", err)
 		}
@@ -487,7 +544,7 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 	if len(options.SourceFiles) > 0 {
 		var err error
 		var sourceEdits []FinishSourceEdit
-		sourceEdits, qualityEvidence.Changes, err = finishSourceCatalogue(evidence, options.SourceFiles)
+		sourceEdits, qualityEvidence.Changes, err = options.sourceCatalogue(evidence)
 		if err != nil {
 			return finish.Plan{}, nil, err
 		}
@@ -546,7 +603,7 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 	var source *finish.SourcePlan
 	var err error
 	if len(options.SourceFiles) > 0 {
-		built, buildErr := finish.BuildSourcePlan(evidence, options.SourceFiles, output.Goals)
+		built, buildErr := options.buildSourcePlan(evidence, output.Goals)
 		plan, source, err = built.Plan, &built, buildErr
 	} else {
 		var goals []finish.Goal

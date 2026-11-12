@@ -336,7 +336,10 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 			return active, false, err
 		}
 	}
-	frozen.SourceSelection = cfg.Mode == "intent" && options.Message == "" && len(frozen.Checkpoints) == 0 && (cfg.VerificationMode == "fast" || cfg.VerificationMode == "full")
+	if cfg.Mode == "intent" && options.Message == "" && (cfg.VerificationMode == "fast" || cfg.VerificationMode == "full") {
+		frozen.SourceSelection = len(frozen.Checkpoints) == 0
+		frozen.RecordedSourceSelection = len(frozen.Checkpoints) > 0
+	}
 	if tree != cp.TreeOID {
 		commit, err := git.CommitTreeDurable(ctx, wt.Root, tree, "acd finish target "+id, checkpoint.IdentityName, checkpoint.IdentityEmail)
 		if err != nil {
@@ -961,6 +964,20 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	}}
 	if len(sourceFiles) > 0 || options.ReviewLineTarget > 0 {
 		options.VerifyPlan = verifyPlan
+	}
+	if r.Target.RecordedSourceSelection {
+		if cfg.VerificationMode != "fast" && cfg.VerificationMode != "full" {
+			return result, errors.New("recorded source selections require approved project checks")
+		}
+		options.RefineBoundary = func(refineCtx context.Context, reason string) (ai.FinishBoundaryRefinement, error) {
+			refinement, err := evaluatePublication(refineCtx, func(jobCtx context.Context) (ai.FinishBoundaryRefinement, error) {
+				return prepareRecordedFinishSources(jobCtx, wt.Root, r.Target.TargetTree, evidence, diffs, cfg.Provider.MaxInputBytes, reason)
+			})
+			if err == nil && len(refinement.Files) > 0 {
+				evidence, sourceFiles = refinement.Evidence, refinement.Files
+			}
+			return refinement, err
+		}
 	}
 	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, options)
 	result.Plan, result.Disclosure, result.Checked = planned.Plan, planned.Disclosure, checked

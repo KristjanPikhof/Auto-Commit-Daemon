@@ -287,7 +287,7 @@ func TestFinishSourceOwnershipPartitionsTheFrozenCatalogue(t *testing.T) {
 	if err != nil || result.Source == nil || len(result.Plan.Steps) != 2 || !slices.Equal(result.Source.Selections[1].ChangeIDs, []string{"edit-000003", "edit-000004"}) {
 		t.Fatalf("ownership changed source membership: %+v %v", result, err)
 	}
-	_, catalogue, _ := finishSourceCatalogue(evidence, options.SourceFiles)
+	_, catalogue, _ := options.sourceCatalogue(evidence)
 	for _, runs := range [][]finishOwnershipRun{
 		{{"edit-000004", 0}}, {{"edit-000004", 3}}, {{"unseen", 1}}, {{"edit-000002", 1}},
 		{{"edit-000002", 1}, {"edit-000001", 2}}, {{"edit-000002", 1}, {"edit-000002", 2}},
@@ -323,7 +323,7 @@ func TestFinishSourceFileOwnershipCoversEverySelection(t *testing.T) {
 	if err != nil || result.Source == nil || result.Calls != 1 || len(result.Plan.Steps) != 3 {
 		t.Fatalf("file-local plan without context: %+v %v", result, err)
 	}
-	edits, catalogue, _ := finishSourceCatalogue(evidence, options.SourceFiles)
+	edits, catalogue, _ := options.sourceCatalogue(evidence)
 	var order []string
 	for _, c := range catalogue {
 		order = append(order, c.ID)

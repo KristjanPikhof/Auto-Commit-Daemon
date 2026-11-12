@@ -132,6 +132,24 @@ func TestBuildSourcePlanRequiresEveryExistingEditOnce(t *testing.T) {
 	}
 }
 
+func TestBuildRecordedSourcePlanRequiresCompletePrerequisites(t *testing.T) {
+	evidence, files, goals := sourceFixture()
+	evidence.Target["asset"] = planEntry("d")
+	evidence.Changes = append(evidence.Changes, Change{
+		ID: "asset", Path: "asset", After: evidence.Target["asset"],
+		Author: "author", DependsOn: []string{"camera.go"},
+	})
+	goals[0].ChangeIDs = append(goals[0].ChangeIDs, "asset")
+	if _, err := BuildRecordedSourcePlan(evidence, files, goals); err == nil || !strings.Contains(err.Error(), "missing prerequisite") {
+		t.Fatalf("a partially applied version satisfied a recorded prerequisite: %v", err)
+	}
+	goals[0].ChangeIDs = goals[0].ChangeIDs[:2]
+	goals[1].ChangeIDs = append(goals[1].ChangeIDs, "asset")
+	if _, err := BuildRecordedSourcePlan(evidence, files, goals); err != nil {
+		t.Fatalf("the complete version did not satisfy its prerequisite: %v", err)
+	}
+}
+
 func TestBuildSourcePlanPreservesWholeEntryAndAuthorBoundaries(t *testing.T) {
 	evidence, files, goals := sourceFixture()
 	evidence.Target["asset.bin"] = planEntry("d")

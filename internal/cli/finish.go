@@ -222,7 +222,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			if r.DryRun {
 				command += " --dry-run"
 			}
-			if !r.Target.SourceSelection && len(r.Target.Checkpoints) == 0 {
+			if !r.Target.SourceSelection && !r.Target.RecordedSourceSelection && (len(r.Target.Checkpoints) == 0 || r.Target.Version >= state.FinishRecordedSourceVersion) {
 				next = fmt.Sprintf("Run `acd config --repo %s` to approve fast/full project checks, then start a new request with `%s`", productListShellQuote(lookup.Worktree.Root), command)
 			} else {
 				next = "Save smaller complete steps, then start a new request with `" + command + "`"

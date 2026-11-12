@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,6 +127,108 @@ func TestFinishWorkerSourceSelectionDoesNotWaiveStagedConsent(t *testing.T) {
 	after, err := git.IndexContentDigest(t.Context(), f.dir)
 	if err != nil || before != after {
 		t.Fatalf("refused source finish changed the index: %s != %s, %v", before, after, err)
+	}
+}
+
+func TestFinishWorkerRefinesBlockedRecordedChange(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "tasks.sh", "group() { printf flat; }\n\ncapture() { printf task; }\n")
+	finishWrite(t, f.dir, "notes.txt", "initial notes\n")
+	finishWorkerGit(t, f.dir, "add", "tasks.sh", "notes.txt")
+	finishWorkerGit(t, f.dir, "commit", "-m", "Seed task controls")
+	w.Config.Mode, w.Config.VerificationMode = "intent", "fast"
+	w.Config.Provider.DiffEgress = true
+	w.Config.Provider.Timeout = time.Minute
+	check, err := verification.NewApprovedCommand(f.dir, w.Config.ConfigDigest, verification.ModeFast, "sh -n tasks.sh", 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Config.Command = check
+
+	finishWrite(t, f.dir, "notes.txt", "draft notes\n")
+	finishCaptureVersion(t, w)
+	finishWrite(t, f.dir, "tasks.sh", "group() { printf active; }\n\ncapture() { printf note; }\n")
+	finishWrite(t, f.dir, "notes.txt", strings.Repeat("reviewed notes ", 36_000)+"\n")
+	finishCaptureVersion(t, w)
+	final := "group() { printf 'active completed'; }\n\ncapture() { printf note; }\n"
+	finishWrite(t, f.dir, "tasks.sh", final)
+	var reviewCalls atomic.Int32
+	var reviewed int
+	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		if request.Review != nil {
+			reviewCalls.Add(1)
+			var observations []map[string]string
+			for _, part := range request.Review.Parts {
+				observations = append(observations, map[string]string{"id": part.ID, "summary": "Review the supplied task control or operator note evidence."})
+			}
+			return json.Marshal(map[string]any{"observations": observations})
+		}
+		if !request.RefineRecorded {
+			t.Fatal("recorded source construction was unavailable")
+		}
+		if request.Correction == nil {
+			reviewed = len(request.Reviews)
+			for _, change := range request.Changes {
+				if change.Path == "tasks.sh" && strings.HasPrefix(change.ID, "checkpoint-") {
+					return json.Marshal(map[string]any{"goals": []finish.Goal{}, "blocked_reason": change.ID + " combines task grouping and capture defaults."})
+				}
+			}
+			t.Fatal("initial request lost the mixed checkpoint")
+		}
+		if reviewed == 0 || len(request.Reviews) != reviewed {
+			t.Fatal("correction did not retain the completed reviews")
+		}
+		goals := []finish.Goal{
+			{Purpose: "Group tasks by status", Boundary: "Review the list grouping separately", Reason: "Show active and completed tasks in separate groups.", Message: "Group tasks by status\n\n- Show active and completed tasks in separate groups."},
+			{Purpose: "Default capture to note", Boundary: "Review capture defaults independently", Reason: "Open new captures as notes by default.", Message: "Default capture to note\n\n- Open new captures as notes by default."},
+			{Purpose: "Update operator notes", Boundary: "Keep the notes separately reviewable", Reason: "Keep the operator notes current for reviewers.", Message: "Update operator notes\n\n- Keep the operator notes current for reviewers."},
+		}
+		for _, change := range request.Changes {
+			if change.Path == "notes.txt" {
+				goals[2].ChangeIDs = append(goals[2].ChangeIDs, change.ID)
+			}
+		}
+		for _, diff := range request.Diffs {
+			for _, line := range strings.Split(diff.Text, "\n") {
+				if !strings.HasPrefix(line, "[") {
+					continue
+				}
+				id, code, _ := strings.Cut(line[1:], "] ")
+				group := 0
+				if strings.Contains(code, "capture()") {
+					group = 1
+				}
+				goals[group].ChangeIDs = append(goals[group].ChangeIDs, id)
+			}
+		}
+		if len(goals[0].ChangeIDs) == 0 || len(goals[1].ChangeIDs) == 0 || len(goals[2].ChangeIDs) != 2 {
+			t.Fatal("correction lost exact selections or unrelated recorded versions")
+		}
+		return json.Marshal(map[string]any{"goals": goals})
+	}}
+	r := startFinishWorker(t, w, FinishOptions{})
+	if !r.Target.RecordedSourceSelection || r.Target.SourceSelection {
+		t.Fatal("request did not freeze recorded source consent")
+	}
+	completed, err := w.Execute(t.Context(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 2 || completed.EvidenceCalls != int(reviewCalls.Load()) {
+		t.Fatalf("refined finish did not publish: %s %v", completed.State, err)
+	}
+	first := finishWorkerGit(t, f.dir, "show", "HEAD~2:tasks.sh")
+	if !strings.Contains(first, "active completed") || !strings.Contains(first, "printf task") {
+		t.Fatalf("first commit lost the grouping correction or included capture: %s", first)
+	}
+	if head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); head != r.Target.TargetTree {
+		t.Fatal("refinement changed the frozen final tree")
+	}
+	var saved FinishSavedPlan
+	if err := json.Unmarshal(completed.Plan, &saved); err != nil || saved.Source == nil || len(saved.Steps) != 3 {
+		t.Fatalf("refinement lost its verification proof: %v", err)
+	}
+	for _, step := range saved.Steps {
+		if !step.Check.Executed || step.Check.Result.Status != verification.StatusPassed {
+			t.Fatalf("refined candidate did not pass its approved check: %+v", step.Check)
+		}
 	}
 }
 
