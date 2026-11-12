@@ -201,7 +201,7 @@ run_all() {
       >"$output_root/core-$index.log" 2>&1 &
     core_pids[$index]=$!
   done
-  GOMAXPROCS=${GOMAXPROCS:-2} package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-2} run_support >"$output_root/support.log" 2>&1 &
+  GOMAXPROCS=${GOMAXPROCS:-2} package_parallelism=${ACD_TEST_PACKAGE_PARALLELISM:-3} run_support >"$output_root/support.log" 2>&1 &
   support_pid=$!
 
   for ((index = 0; index < shard_count; index++)); do
