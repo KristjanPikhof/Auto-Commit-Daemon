@@ -24,6 +24,10 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Use Responses with high reasoning for `gpt-6.1-terra` global planning
+  and medium reasoning for evidence reviews,
+  retaining the configured model and endpoint. Keep strict tools, bounded
+  calls, cancellation and private checkpoints; never fall back to another API.
 - Preserve exact selectable code in global planning. Source requests up to
   128 KiB go directly to planning; larger inputs receive bounded reviews of
   mechanisms and prerequisites alongside the complete annotated source.

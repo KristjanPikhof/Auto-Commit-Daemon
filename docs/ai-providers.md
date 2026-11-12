@@ -126,6 +126,13 @@ ACD rejects redirects, embedded URL credentials, query strings, fragments,
 control characters, and unsupported schemes. Each exchange performs one HTTP
 request with bounded response size and cancellation.
 
+The `gpt-6.1-terra` profile uses `/responses` with high reasoning for global
+planning, medium reasoning for evidence reviews, strict function tools and
+`store: false`, following [OpenAI's Terra tool guidance](https://developers.openai.com/api/docs/guides/latest-model#gpt-6-astra-gpt-61-terra).
+Other models keep their existing Chat Completions contract. A Terra endpoint
+must support Responses. Rejection fails the request with its checkpoint
+protected; ACD does not retry through another API or model.
+
 Finish requests enable strict function schemas. Evidence summaries can use up
 to 4,096 characters per fragment to preserve behavior and dependency details.
 Simple fragments can use shorter notes. ACD still validates every reply, including
