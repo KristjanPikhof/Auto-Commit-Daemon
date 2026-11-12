@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Split hosted AI support tests into two shards per platform so setup and the
+  complete suite fit the existing five-minute job limit.
+- Run five hosted integration shards per platform so cold toolchain setup and
+  compilation fit the existing five-minute job limit without dropping tests.
+- Require Go 1.27.4 for source builds, CI, and releases to include the
+  standard-library security fixes that unblock vulnerability checks.
 - Preserve untouched newer merges when rewriting an earlier linear range,
   including their exact side parents, message, author and final tree.
   Refuse a merge whose side branch would retain the selected old commits.
