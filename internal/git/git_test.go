@@ -35,14 +35,13 @@ func initRepo(t *testing.T) string {
 	}
 	// commit-tree refuses to run without an author; configure repo-local
 	// values so we don't rely on the host's ~/.gitconfig.
-	for _, kv := range [][2]string{
-		{"user.email", "acd-test@example.com"},
-		{"user.name", "ACD Test"},
-		{"commit.gpgsign", "false"},
-	} {
-		if _, err := Run(ctx, RunOpts{Dir: dir}, "config", kv[0], kv[1]); err != nil {
-			t.Fatalf("git config %s: %v", kv[0], err)
-		}
+	config, err := os.OpenFile(filepath.Join(dir, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := config.WriteString("\n[user]\n email = acd-test@example.com\n name = ACD Test\n[commit]\n gpgsign = false\n")
+	if err := config.Close(); writeErr != nil || err != nil {
+		t.Fatalf("write fixture identity: %v, %v", writeErr, err)
 	}
 	return dir
 }

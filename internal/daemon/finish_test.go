@@ -75,8 +75,15 @@ func startFinishWorker(t *testing.T, w *FinishWorker, options FinishOptions) sta
 }
 func completeFinishTestPlan(request ai.FinishPlanRequest) []byte {
 	ids := make([]string, 0, len(request.Changes))
+	selected := make(map[string]bool)
+	for _, edit := range request.SourceEdits {
+		selected[edit.ChangeID] = true
+		ids = append(ids, edit.ID)
+	}
 	for _, change := range request.Changes {
-		ids = append(ids, change.ID)
+		if !selected[change.ID] {
+			ids = append(ids, change.ID)
+		}
 	}
 	raw, _ := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Preserve completed changes", Boundary: "The supplied changes complete the requested batch", Reason: "Publish the requested goal without later edits.", Message: "Preserve completed changes\n\n- Publish the requested goal without later edits.", ChangeIDs: ids}}})
 	return raw

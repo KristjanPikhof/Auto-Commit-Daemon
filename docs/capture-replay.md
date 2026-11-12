@@ -86,7 +86,9 @@ a new ordinary finish freezes current work again.
 
 ## Verification and publication
 
-Every candidate must use recorded path versions and produce a complete tree.
+Every candidate must use recorded path versions or checked selections of exact
+frozen source bytes and produce a complete tree. Source construction requires
+approved `fast` or `full` checks; structural-only requests use recorded versions.
 ACD checks dependencies, rename groups, author boundaries, coverage, and exact
 final target equality. These structural checks always run.
 

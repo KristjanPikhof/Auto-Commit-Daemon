@@ -62,6 +62,12 @@ request. When recorded intermediate versions are used, diffs describe each exact
 transition, not repeated final diffs. Missing text evidence fails before a
 provider call; ACD does not substitute a metadata-only plan.
 
+Checked source selections add line positions and edit IDs to the approved diff
+evidence. Frozen file bytes, compiler dumps and scope labels stay local. If a
+project check rejects a constructed step, the one available global correction
+can include its step number and diagnostic names already visible in approved
+redacted code. It never includes raw command output or new diagnostic text.
+
 Binary or invalid-text blobs are metadata only. Their complete objects remain
 available locally for exact tree verification. Limits are independent of
 checkpoint storage:

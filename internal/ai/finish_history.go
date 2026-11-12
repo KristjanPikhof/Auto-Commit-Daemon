@@ -23,7 +23,13 @@ type HistoryMessageCommit struct {
 
 func finishPrompt(request FinishPlanRequest) string {
 	if request.Review != nil {
+		if len(request.SourceEdits) > 0 {
+			return finishReviewPrompt + finishSourceReviewPrompt
+		}
 		return finishReviewPrompt
+	}
+	if len(request.SourceEdits) > 0 {
+		return finishSystemPrompt + finishSourcePrompt
 	}
 	if len(request.HistoryCommits) == 0 {
 		return finishSystemPrompt
