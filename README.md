@@ -286,10 +286,10 @@ make test
 
 The local gate uses three core shards and at most two parallel tests per package.
 Hosted CI has four core and five production integration shards on Ubuntu and
-macOS, separate AI and other support lanes, six Ubuntu daemon stress runners,
-and two Git/state stress runners. The other support lane runs the timing-sensitive
-verification test after its package tests finish. Each leaf has a five-minute
-limit. The complete workflow and local gate have a five-minute target; keep
+macOS, two AI support shards and one other support lane, six Ubuntu daemon
+stress runners, and two Git/state stress runners. The other support lane runs
+the timing-sensitive verification test after its package tests finish. Each leaf
+has a five-minute limit. The complete workflow and local gate have a five-minute target; keep
 checks sharded rather than dropping scenarios.
 
 Set `ACD_TEST_RESULTS_DIR` outside the checkout to retain JSON timings and shard
