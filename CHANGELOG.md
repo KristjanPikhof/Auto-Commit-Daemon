@@ -18,6 +18,10 @@
 
 ### Changed
 
+- Run five hosted integration shards per platform so cold toolchain setup and
+  compilation fit the existing five-minute job limit without dropping tests.
+- Require Go 1.27.4 for source builds, CI, and releases to include the
+  standard-library security fixes that unblock vulnerability checks.
 - Wrap generated Intent message bodies without changing their wording, so long
   lines do not consume a provider correction. Keep exact user messages unchanged
   and continue to reject invalid structure and overlong subjects.
