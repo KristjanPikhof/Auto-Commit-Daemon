@@ -18,6 +18,8 @@
 
 ### Changed
 
+- Require Go 1.27.4 for source builds, CI, and releases to include the
+  standard-library security fixes that unblock vulnerability checks.
 - Refresh integration-test timings from complete Ubuntu and macOS CI runs so
   the four shards share the current workload and leave room for runner setup
   and cleanup within the five-minute job limit.
