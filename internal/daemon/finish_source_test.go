@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,6 +141,15 @@ func TestFinishWorkerSourceSelectionsRejectBrokenIntermediate(t *testing.T) {
 	if err := json.Unmarshal(completed.Plan, &saved); err != nil || saved.Source == nil || !strings.Contains(saved.Steps[0].Check.Result.Output, "CameraID") {
 		t.Fatalf("compiler failure or source proof lost: %+v %v", saved, err)
 	}
+	for _, step := range saved.Steps {
+		if !step.Check.Executed {
+			t.Fatal("source correction did not collect the complete candidate feedback")
+		}
+	}
+	ref := git.FinishRefPrefix + r.Target.WorktreeID + "/" + r.ID + "/1/chain"
+	if _, err := git.RevParse(t.Context(), f.dir, ref); !errors.Is(err, git.ErrRefNotFound) {
+		t.Fatalf("rejected source chain was pinned for publication: %v", err)
+	}
 	if live, err := os.ReadFile(filepath.Join(f.dir, "camera.go")); err != nil || string(live) != final {
 		t.Fatal("failed source planning replaced the working file")
 	}
@@ -182,6 +192,85 @@ func TestFinishWorkerSourceSelectionsRepairFailedCheck(t *testing.T) {
 	for _, step := range saved.Steps {
 		if !step.Check.Executed || step.Check.Result.Status != verification.StatusPassed {
 			t.Fatalf("corrected chain was not checked: %+v", step)
+		}
+	}
+}
+
+func TestFinishWorkerInfersAndSeparatesNewSettingsWithoutContext(t *testing.T) {
+	f, w, _ := sourceWorkerFixture(t, false)
+	finishWrite(t, f.dir, "settings.go", "package camera\nfunc Settings() string { return \"camera\" }\nfunc RoomControls() string { return GenerateRoom() }\n")
+	finishWrite(t, f.dir, "room.go", "package camera\nfunc GenerateRoom() string { return \"generated room\" }\n")
+	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		if request.Purpose != "" || len(request.SelectionOrder) == 0 {
+			return nil, errors.New("bare finish lost its exclusive source ownership catalogue")
+		}
+		goals := []finish.Goal{
+			{Purpose: "Expose camera identity", Boundary: "Supply identity before its consumer", Reason: "Controls need the active camera identity.", Message: "Expose camera identity\n\n- Controls need the active camera identity."},
+			{Purpose: "Synchronize camera selection", Boundary: "Consume the available status field", Reason: "Read status so controls follow the running camera.", Message: "Synchronize camera selection\n\n- Read status so controls follow the running camera."},
+			{Purpose: "Organize camera settings", Boundary: "Introduce working Settings without the independent room feature", Reason: "Give camera controls a dedicated settings entry point.", Message: "Organize camera settings\n\n- Give camera controls a dedicated settings entry point."},
+			{Purpose: "Add room generation", Boundary: "Keep the optional room feature independently revertible", Reason: "Generate a room when users cannot capture an empty room.", Message: "Add room generation\n\n- Generate a room when users cannot capture an empty room."},
+		}
+		owners := make(map[string]int)
+		for _, diff := range request.Diffs {
+			for _, line := range strings.Split(diff.Text, "\n") {
+				if !strings.HasPrefix(line, "[") {
+					continue
+				}
+				id, _, _ := strings.Cut(line[1:], "] ")
+				owner := 1
+				switch diff.ChangeID {
+				case "room.go":
+					owner = 4
+				case "settings.go":
+					owner = 3
+					if strings.Contains(line, "RoomControls") && request.Correction != nil {
+						owner = 4
+					}
+				default:
+					if strings.Contains(line, "Selected") {
+						owner = 2
+					}
+				}
+				if request.Correction == nil && owner <= 2 {
+					owner = 3 - owner // Recreate an undefined-field intermediate.
+				}
+				owners[id] = owner
+			}
+		}
+		if request.Correction != nil {
+			for _, needed := range []string{"step 1", "step 3", "CameraID", "GenerateRoom"} {
+				if !strings.Contains(request.Correction.ValidationError, needed) {
+					return nil, errors.New("correction lost a failed intermediate diagnostic: " + needed)
+				}
+			}
+		}
+		var runs []map[string]any
+		for index, id := range request.SelectionOrder {
+			if index+1 == len(request.SelectionOrder) || owners[request.SelectionOrder[index+1]] != owners[id] {
+				runs = append(runs, map[string]any{"through_id": id, "goal": owners[id]})
+			}
+		}
+		return json.Marshal(map[string]any{"goals": goals, "ownership": runs})
+	}}
+	r := startFinishWorker(t, w, FinishOptions{})
+	completed, err := w.Execute(t.Context(), r.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 2 || r.Target.Version != 4 || r.Target.Purpose != "" {
+		t.Fatalf("bare source finish: %+v %v", completed, err)
+	}
+	var saved FinishSavedPlan
+	if err := json.Unmarshal(completed.Plan, &saved); err != nil || len(saved.Steps) != 4 {
+		t.Fatalf("source plan lost independent settings and feature goals: %+v %v", saved, err)
+	}
+	settings := finishWorkerGit(t, f.dir, "show", saved.Steps[2].TreeOID+":settings.go")
+	if !strings.Contains(settings, "func Settings()") || strings.Contains(settings, "RoomControls") {
+		t.Fatalf("settings were combined with room generation: %s", settings)
+	}
+	if _, err := git.Run(t.Context(), git.RunOpts{Dir: f.dir}, "cat-file", "-e", saved.Steps[2].TreeOID+":room.go"); err == nil {
+		t.Fatal("room implementation entered the Settings commit")
+	}
+	for _, step := range saved.Steps {
+		if !step.Check.Executed || step.Check.Result.Status != verification.StatusPassed {
+			t.Fatalf("source candidate was not checked: %+v", step)
 		}
 	}
 }

@@ -126,7 +126,8 @@ reason for grouping unrelated work.
 Plan useful completed steps within the overall goal before assigning changes.
 A feature can contain a working refactor, its consumer, and a broader policy
 decision. Dependencies determine order; they do not by themselves require one
-commit. Keep implementation,
+commit. A complete tested API or processing module may precede its UI integration when
+the exact caller line also introduces an independent layout change. Keep implementation,
 callers, tests, imports, generated output, and relevant documentation together
 when they complete one goal. Available unpublished corrections belong with the
 change they correct. Different files or screens do not justify a split.
@@ -136,11 +137,13 @@ state. Put prerequisites before consumers or in the same commit. Explain
 the reason or practical impact in each generated message, not only internal
 planning metadata. Explain broader defaults and behavior changes from evidence.
 New final-only Intent requests with approved fast/full checks may construct
-intermediate text versions from exact frozen base/target line selections. No
+intermediate text versions from exact frozen base/target line selections. New
+version-four requests may also stage new Go and Swift files from exact target
+lines, keeping independent features separate from Settings or layout work. No
 provider-written source is accepted. Keep scope labels and compiler dumps local;
 only approved redacted diff lines and edit metadata enter planning. Check every
-candidate before one publication. One failed source check may use the existing
-global correction and deadline, sharing only diagnostic names already in the
+candidate before one publication. Collect failed source checks for the existing
+single global correction and deadline, sharing only diagnostic names and exact edit IDs already in the
 approved diffs. Older requests and retained-version plans keep their identity.
 Intent requires approved redacted code diffs on every planning path; completion
 context supplements that evidence. Local remains offline. Existing settings
@@ -151,8 +154,10 @@ limits still apply.
 
 An Intent attempt may review large evidence in at most 128 bounded calls, then
 make one global planning call and at most one global correction within one persisted
-deadline. Reviews cover every complete redacted diff, splitting large files
-without dropping bytes. Review fragments are evidence, never commit boundaries.
+deadline. Source requests up to 128 KiB go directly to planning. Larger inputs
+receive bounded reviews of mechanisms and prerequisites; selectable code stays
+exact in the global request alongside those observations. Reviews cover complete
+evidence without dropping bytes. Review fragments are evidence, never commit boundaries.
 Each review contains at most 32 fragments to bound its output.
 An invalid review gets at most one correction; accepted reviews are not repeated.
 Corrections consume the same 128-call budget and deadline. Their counts are
@@ -160,7 +165,9 @@ reserved durably and reported separately from global planning calls.
 At most four immutable reviews run concurrently; budget reservations and state
 writes stay on the owning worker. Validated reviews are checkpointed durably;
 explicit retry reuses only fingerprint-matched and revalidated frozen evidence.
-A fresh global plan still sees all changes and observations. Small requests skip review. Messages belong to the global plan. Provider rejection,
+A fresh global plan still sees all changes and observations. Source ownership
+walks each file separately against one complete local catalogue; goals and their
+prerequisite order remain global. Small requests skip review. Messages belong to the global plan. Provider rejection,
 timeout, unavailable evidence, or exhausted budget fails the explicit request;
 there is no background semantic retry or silent Local fallback.
 

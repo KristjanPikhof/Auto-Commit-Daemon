@@ -24,6 +24,21 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Preserve exact selectable code in global planning. Source requests up to
+  128 KiB go directly to planning; larger inputs receive bounded reviews of
+  mechanisms and prerequisites alongside the complete annotated source.
+  Keep duplicate per-line coordinates local; retain every edit ID in its code.
+  Plan all independent outcomes before ownership, without a remainder goal.
+  Allow tested feature prerequisites before their separate UI integration when
+  the frozen caller line couples feature wiring to a new layout.
+- Assign source ownership within each file instead of overlapping per-goal
+  ranges or one long global list. Preserve the global correction for useful
+  planning feedback. Map compiler locations to already-approved frozen edit IDs
+  without sending source lines or signatures.
+  New requests can stage new Go and Swift files from exact frozen lines, so
+  independent features need not share a commit with Settings or layout work.
+  Collect all candidate failures within the existing budget for one correction;
+  never pin or publish a rejected chain. Older frozen requests keep their rules.
 - Keep finish context optional in Local and Intent. Accept longer handoffs with
   decisions and constraints for the planner to examine alongside code changes.
   Require reasons in AI-generated messages; preserve advanced exact overrides

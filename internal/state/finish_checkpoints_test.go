@@ -23,6 +23,11 @@ func TestFinishTargetVersionsPreserveLegacyRequestIdentity(t *testing.T) {
 		t.Fatalf("old target accepted source construction: %v", err)
 	}
 	legacy.SourceSelection = false
+	legacy.Version, legacy.SourceSelection = 3, true
+	if raw, err := finishTargetJSON(&legacy); err != nil || legacy.Version != 3 || !strings.Contains(raw, "source_selection") {
+		t.Fatalf("version-three source target changed identity: %s %v", raw, err)
+	}
+	legacy.SourceSelection = false
 	legacy.Version = 1
 	legacy.Checkpoints = []FinishCheckpoint{{ID: "earlier", Ref: "refs/acd/finish/" + legacy.WorktreeID + "/request/versions/0", CommitOID: "commit", TreeOID: "tree"}}
 	if _, err := finishTargetJSON(&legacy); !errors.Is(err, ErrFinishIdentity) {

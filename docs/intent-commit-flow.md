@@ -33,8 +33,11 @@ or `full` checks can split existing text files using exact lines from the frozen
 base and target. Each insertion or deletion belongs to one goal. ACD constructs
 the intermediate files locally; the provider cannot supply replacement code.
 Go and Swift scope information prevents identical lines in different functions
-from matching. Swift files require a working local Swift compiler. New files,
-renames, binary files and mode changes remain whole transitions. Older requests,
+from matching. Swift files require a working local Swift compiler. New Go and
+Swift files can also start from an empty base in complete working stages. A new
+Settings view can be introduced first, then gain an independent feature's
+controls later without inventing code. Other additions, renames, binary files
+and mode changes remain whole transitions. Requests frozen before version four,
 exact messages and structural-only requests retain their existing version rules.
 
 A dry run creates private planning and verification evidence and may call the
@@ -79,6 +82,11 @@ Settings redesign, even when both were discovered during the same UI audit.
 A shortcut recorder, its saved bindings, conflict checks and menu hints can
 complete one feature.
 
+A complete testable API, model or processing module can precede a separate UI
+integration. When an exact target line connects a feature to a new layout, the
+later UI goal may own that connection without taking the feature implementation.
+ACD does not require an invented version of the old interface.
+
 When the available versions or source selections cannot separate independent
 purposes safely, the provider can return `blocked_reason` with no goals. Finish fails with
 the explanation and keeps the work protected. It does not combine unrelated
@@ -111,7 +119,7 @@ binary objects, deletions, and unchanged entries.
 ## Bound the provider work
 
 Small requests use one planning exchange and at most one combined correction.
-Large requests first review the complete redacted evidence in bounded batches,
+Requests exceeding the direct planning budget first review complete evidence in bounded batches,
 then make one global plan across all recorded changes. At most 128 evidence
 reviews are allowed, with at most four immutable provider exchanges at once.
 The worker reserves each call before releasing its operation gate and continues
@@ -120,15 +128,28 @@ default) or an explicit `--timeout 15m` for the new attempt. Messages
 are part of the same plan; they do not get a separate retry loop. Correction
 feedback includes all detected message and membership conflicts together. A
 source plan rejected by project checks can use that same correction. The
-feedback identifies the failed step and diagnostic names already present in
-approved redacted diffs. Raw command output stays local. Every corrected
+worker checks every candidate within the original budget and collects failures
+for one combined correction. A failed chain is never pinned or prepared for
+publication. Feedback identifies failed steps, receiver/member names and file
+names already present in approved redacted diffs. Compiler locations also map
+to exact frozen edit IDs, including a pending consumer update. Raw code,
+compiler output and signatures stay local. Every corrected
 candidate runs its checks again within the original deadline.
+
+Source planning assigns ownership within each frozen file. `selection_files`
+names each file's first and last selection IDs. Each `file_ownership` entry
+contains ordered runs ending at a selection ID and naming a goal number. ACD
+expands them against its complete local catalogue, covering every file and
+selection once. Unknown files, duplicate entries, gaps and invalid endpoints
+are rejected. The planner still chooses the purposes, owners and prerequisite
+order across all files. Annotated diffs retain every edit ID and its exact code;
+duplicate per-line coordinates and the full repeated ID list stay local.
 
 The request contains bounded metadata, redacted supplied context, and approved
 text diffs. Each encoded review is bounded to 512 KiB. The global catalogue
 and its correction can use up to 2 MiB; `ai.max_input_bytes` can lower either
-limit. A large file is divided into UTF-8 fragments without
-losing bytes. Every fragment gets a bounded factual observation before planning;
+limit. Whole-file evidence that needs review is divided into UTF-8 fragments without
+losing bytes. Every reviewed fragment gets a bounded factual observation before planning;
 ACD validates complete fragment coverage and records content digests, summaries,
 review-call counts, and attempted request sizes. Each review contains at most 32 fragments so its output stays manageable.
 A malformed or overlong review can be corrected once within the same call
@@ -140,7 +161,15 @@ other details needed by the global planner. Short notes are enough for simple
 fragments. ACD checks the complete reply locally and never cuts a summary to
 make it pass. Combined requests still obey the configured context limits.
 The global planner receives all original change identities and observations
-together, without local cache digests. Its larger catalogue and review allowance support thousands
+together, without local cache digests. Source-selection requests up to 128 KiB
+skip reviews. Larger source requests get bounded observations of mechanisms
+and prerequisites while keeping exact approved annotated code for selectable
+files in the global request. Signatures, syntax and edit IDs stay
+together; no prose mapping is needed to reconstruct them. If selectable code
+cannot fit the global limit, ACD fails before spending review calls rather than
+compressing it away.
+
+Its larger catalogue and review allowance support thousands
 of meaningful goals without enlarging raw-diff review calls. Commit counts come
 from useful boundaries, not review batches. Provider context limits and the
 attempt deadline still apply; a large batch may need an explicit longer timeout.

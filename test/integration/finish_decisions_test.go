@@ -158,8 +158,8 @@ func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 				goals[group].ChangeIDs = append(goals[group].ChangeIDs, id)
 			}
 		}
-		if len(request.SourceEdits) != 3 {
-			t.Errorf("expected the complete three-edit catalogue, got %+v", request.SourceEdits)
+		if len(request.SelectionFiles) != 1 || request.SelectionFiles[0].FirstID != "edit-000001" || request.SelectionFiles[0].LastID != "edit-000003" || len(request.SourceEdits) != 0 {
+			t.Errorf("expected three exact selections without duplicate coordinates, got %+v", request.SelectionFiles)
 		}
 		if request.Correction == nil {
 			goals[0], goals[1] = goals[1], goals[0]
@@ -187,6 +187,121 @@ func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 	for _, check := range result.Verification {
 		if !check.Executed || check.Result.ExitCode != 0 {
 			t.Fatalf("corrected candidate was not checked: %+v", check)
+		}
+	}
+	f.Barrier(t, t.Context())
+	assertFinishWorkflowStatus(t, t.Context(), f, true)
+}
+
+func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
+	var reviews, corrections, plans atomic.Int32
+	var rejected atomic.Bool
+	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
+		request := decodeFinishChatRequest(t, r).Plan
+		if request.Review != nil {
+			reviews.Add(1)
+			var observations []map[string]string
+			for _, part := range request.Review.Parts {
+				summary := "Record the supplied operational conventions."
+				if part.ChangeID == "camera.sh" {
+					summary = "Supply active_identity before selected consumes it."
+					if !strings.Contains(part.Text, "] +active_identity()") {
+						t.Error("source review lost exact edit identities")
+					}
+				}
+				observations = append(observations, map[string]string{"id": part.ID, "summary": summary})
+			}
+			if !rejected.Swap(true) {
+				observations[0]["summary"] = "All tests passed"
+			}
+			if request.Correction != nil {
+				corrections.Add(1)
+			}
+			raw, _ := json.Marshal(map[string]any{"observations": observations})
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"function": map[string]any{"name": "finish_evidence", "arguments": string(raw)}}}}}}})
+			return
+		}
+		plans.Add(1)
+		goals := []finish.Goal{
+			{Purpose: "Expose the active camera identity", Boundary: "Supply identity before its consumer", Reason: "Expose the active identity so controls can follow the camera.", Message: "Expose the active camera identity\n\n- Expose the active identity so controls can follow the camera."},
+			{Purpose: "Synchronize camera selection", Boundary: "Consume the available camera identity", Reason: "Read the running camera identity instead of retaining an empty selection.", Message: "Synchronize camera selection\n\n- Read the running camera identity instead of retaining an empty selection."},
+			{Purpose: "Document operational conventions", Boundary: "Keep reference material independently reviewable", Reason: "Make operational conventions available to project contributors.", Message: "Document operational conventions\n\n- Make operational conventions available to project contributors.", ChangeIDs: []string{"notes.txt"}},
+		}
+		for _, diff := range request.Diffs {
+			if diff.ChangeID == "camera.sh" {
+				if !strings.Contains(diff.Text, "] +active_identity()") || !strings.Contains(diff.Text, "] +selected()") {
+					t.Error("global plan lost exact selectable code")
+				}
+			} else if diff.Text != "" {
+				t.Error("global plan resent the whole recorded reference file")
+			}
+		}
+		for _, diff := range request.Diffs {
+			for _, line := range strings.Split(diff.Text, "\n") {
+				if !strings.HasPrefix(line, "[") {
+					continue
+				}
+				id, _, _ := strings.Cut(line[1:], "] ")
+				group := 1
+				if strings.Contains(line, "] +active_identity()") {
+					group = 0
+				}
+				goals[group].ChangeIDs = append(goals[group].ChangeIDs, id)
+			}
+		}
+		owners := make(map[string]int)
+		for i := range goals {
+			for _, id := range goals[i].ChangeIDs {
+				owners[id] = i + 1
+			}
+			goals[i].ChangeIDs = nil
+		}
+		var ownership []map[string]any
+		for _, file := range request.SelectionFiles {
+			var ids []string
+			if file.FirstID == file.LastID {
+				ids = []string{file.FirstID}
+			} else {
+				for _, diff := range request.Diffs {
+					if diff.ChangeID == file.ChangeID {
+						for _, line := range strings.Split(diff.Text, "\n") {
+							if strings.HasPrefix(line, "[") {
+								id, _, _ := strings.Cut(line[1:], "] ")
+								ids = append(ids, id)
+							}
+						}
+					}
+				}
+			}
+			var runs []map[string]any
+			for i, id := range ids {
+				if i+1 == len(ids) || owners[ids[i+1]] != owners[id] {
+					runs = append(runs, map[string]any{"through_id": id, "goal": owners[id]})
+				}
+			}
+			ownership = append(ownership, map[string]any{"change_id": file.ChangeID, "runs": runs})
+		}
+		raw, _ := json.Marshal(map[string]any{"goals": goals, "file_ownership": ownership})
+		writeFinishChatArguments(t, w, string(raw))
+	}, "1m", map[string]string{config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "sh verify.sh", config.FieldVerificationFastTimeout: "30s"}, ai.ConfirmationVerificationCommand)
+	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "selected() { printf none; }\n")
+	writeFile(t, filepath.Join(f.Repo, "verify.sh"), ". ./camera.sh\nvalue=$(selected) || exit 1\ntest \"$value\" = none || test \"$value\" = camera\n")
+	runGitOK(t, f.Repo, "add", "camera.sh", "verify.sh")
+	runGitOK(t, f.Repo, "commit", "-m", "Seed camera controls")
+	f.BaseHead = strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
+	f.Barrier(t, t.Context())
+	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "active_identity() { printf camera; }\nselected() { active_identity; }\n")
+	writeFile(t, filepath.Join(f.Repo, "notes.txt"), strings.Repeat("Rule: retain the operational conventions for contributors.\n", 40000))
+	completed := decodeFinishWorkflow(t, f.Run(t, t.Context(), "finish", "--json"))
+	if !completed.Published || completed.CommitsCreated != 3 || !completed.Target.SourceSelection || completed.EvidenceCalls != int(reviews.Load()) || corrections.Load() != 1 || plans.Load() != 1 {
+		t.Fatalf("reviewed source mappings were not published: %+v reviews=%d corrections=%d plans=%d", completed, reviews.Load(), corrections.Load(), plans.Load())
+	}
+	if first := runGitOK(t, f.Repo, "show", "HEAD~2:camera.sh"); !strings.Contains(first, "active_identity()") || !strings.Contains(first, "printf none") {
+		t.Fatalf("first source step lost its independent prerequisite: %s", first)
+	}
+	for _, check := range completed.Verification {
+		if !check.Executed || check.Result.ExitCode != 0 {
+			t.Fatalf("reviewed intermediate source was not checked: %+v", check)
 		}
 	}
 	f.Barrier(t, t.Context())

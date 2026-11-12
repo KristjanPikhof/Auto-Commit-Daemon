@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	FinishVersion        = 3
+	FinishVersion        = 4
 	FinishRunning        = "running"
 	FinishPrepared       = "prepared"
 	FinishCompleted      = "completed"
@@ -184,7 +184,7 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 	if target.Version == 0 {
 		target.Version = FinishVersion
 	}
-	if (target.Version != 1 && target.Version != 2 && target.Version != FinishVersion) || (target.Version == 1 && len(target.Checkpoints) > 0) || target.RepositoryID == "" || target.WorktreeID == "" ||
+	if (target.Version < 1 || target.Version > FinishVersion) || (target.Version == 1 && len(target.Checkpoints) > 0) || target.RepositoryID == "" || target.WorktreeID == "" ||
 		!strings.HasPrefix(target.BranchRef, "refs/heads/") || target.CheckpointID == "" ||
 		target.CheckpointTree == "" || target.TargetTree == "" || target.IndexDigest == "" ||
 		target.ConfigDigest == "" || (target.Mode != "local" && target.Mode != "intent") ||

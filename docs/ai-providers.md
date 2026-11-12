@@ -68,9 +68,10 @@ provider call; ACD does not substitute a metadata-only plan.
 
 Checked source selections add line positions and edit IDs to the approved diff
 evidence. Frozen file bytes, compiler dumps and scope labels stay local. If a
-project check rejects a constructed step, the one available global correction
-can include its step number and diagnostic names already visible in approved
-redacted code. It never includes raw command output or new diagnostic text.
+project check rejects constructed steps, ACD collects the candidate failures
+within the same budget for the one available global correction. Feedback can
+include step numbers, receiver/member names and file names already visible in
+approved redacted code. It never includes raw command output or unapproved names.
 
 Binary or invalid-text blobs are metadata only. Their complete objects remain
 available locally for exact tree verification. Limits are independent of
@@ -90,11 +91,12 @@ adds no unchanged content, object identities, or unreferenced file names and
 requires no extra repository scan. It is conservative: unlisted dependencies
 are not necessarily missing.
 
-There is no separate per-file rejection limit. Large files and batches are
-reviewed in bounded fragments before one global plan. Every complete redacted
-text diff reaches the provider across those fragments. Their factual summaries
-and original change identities enter the global plan together; a fragment does
-not become a commit. Small requests keep the direct planning path.
+There is no separate per-file rejection limit. Source-selection requests up to
+128 KiB go straight to global planning. Larger inputs receive bounded reviews
+that identify mechanisms and prerequisites. Selectable code remains complete
+in the global request alongside those observations; summaries never replace it. Every approved diff
+reaches the provider in full through one of those paths. Fragments never become
+commit boundaries. Small non-source requests keep their direct planning path.
 
 `ai.max_input_bytes` accepts 128 KiB through 64 MiB, in bytes, through
 `acd config` or `ACD_AI_MAX_INPUT_BYTES`. It bounds aggregate evidence, while
@@ -141,12 +143,39 @@ process group and join its readers within bounded cleanup.
 ## Failure behavior
 
 Planning replies contain `goals` and `blocked_reason` (empty on success). Each
-generated goal includes `purpose`, `boundary`, `reason`, `message`, and
-`change_ids`. Its reason explains the problem or constraint and the chosen
+generated goal includes `purpose`, `boundary`, `reason`, and `message`.
+Recorded-version replies also include `change_ids`. Its reason explains the problem or constraint and the chosen
 mechanism; the same wording must appear in the message body, allowing wrapping
 and bullet formatting. A missing reason or one left only in metadata needs
 correction. Advanced exact user messages retain their wording, optional body
 and single-batch contract.
+
+Source-selection requests include `selection_files`, with each change ID and its
+first and last selection IDs. Annotated diffs retain every selectable line in
+order. Goals omit `change_ids`; the reply supplies `file_ownership`, one entry
+per file, with its `change_id` and ordered `runs`. Each run names a `through_id`
+and a 1-based `goal` number. It starts after the preceding endpoint; the first
+starts at `first_id` and the last must end at `last_id`. A whole recorded change
+has matching first and last IDs and needs one run.
+
+This assigns both source edits to the first goal and a resource to the second:
+
+```json
+"file_ownership": [
+  {"change_id": "camera.swift", "runs": [
+    {"through_id": "edit-000002", "goal": 1}
+  ]},
+  {"change_id": "asset.png", "runs": [
+    {"through_id": "asset.png", "goal": 2}
+  ]}
+]
+```
+
+Every file and selection must appear exactly once. ACD rejects unknown files,
+duplicate ownership, gaps and endpoints from another file. It does not repair
+or deduplicate replies. This format applies to OpenAI-compatible tool calls and
+subprocess replies. Older global ownership runs and per-goal memberships retain
+their strict validation; formats cannot be mixed.
 
 If the supplied versions cannot separate independent purposes, return no goals
 and explain the missing evidence in `blocked_reason`. That explanation ends the

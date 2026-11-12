@@ -67,6 +67,8 @@ type FinishPlanRequest struct {
 	Reviews        []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	HistoryCommits []HistoryMessageCommit    `json:"history_commits,omitempty"`
 	SourceEdits    []FinishSourceEdit        `json:"source_edits,omitempty"`
+	SelectionOrder []string                  `json:"selection_order,omitempty"`
+	SelectionFiles []FinishSelectionFile     `json:"selection_files,omitempty"`
 	// Only names already present in approved redacted diffs are included.
 	ReferencedUnchangedPaths []string `json:"referenced_unchanged_paths,omitempty"`
 }
@@ -290,7 +292,9 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 				if !errors.As(checkErr, &rejected) {
 					return result, finishFailure("source_verification_failed", checkErr)
 				}
-				validationErr = sourceCheckFeedback(rejected, approvedDiffs)
+				validationErr = sourceChecksFeedback(checkErr, approvedDiffs, func(failure *SourceCheckFailure) []string {
+					return sourceDiagnosticSelections(failure, *source, options.SourceFiles, evidence)
+				})
 			}
 		}
 		if validationErr == nil {
@@ -319,9 +323,13 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress}
 	if len(options.SourceFiles) > 0 {
 		var err error
-		request.SourceEdits, _, err = finishSourceCatalogue(evidence, options.SourceFiles)
+		var catalogue []finish.Change
+		request.SourceEdits, catalogue, err = finishSourceCatalogue(evidence, options.SourceFiles)
 		if err != nil {
 			return request, FinishDisclosure{}, finishFailure("invalid_evidence", err)
+		}
+		for _, selection := range catalogue {
+			request.SelectionOrder = append(request.SelectionOrder, selection.ID)
 		}
 	}
 	disclosure := FinishDisclosure{MetadataIncluded: true, PurposeIncluded: options.Purpose != "", MessageIncluded: options.Message != "", Redacted: request.Purpose != options.Purpose || request.Message != options.Message}
@@ -432,8 +440,10 @@ func finishRedactText(text string) string {
 }
 
 type finishPlanOutput struct {
-	Goals         []finish.Goal `json:"goals"`
-	BlockedReason string        `json:"blocked_reason"`
+	Goals         []finish.Goal         `json:"goals"`
+	BlockedReason string                `json:"blocked_reason"`
+	Ownership     []finishOwnershipRun  `json:"ownership,omitempty"`
+	FileOwnership []finishFileOwnership `json:"file_ownership,omitempty"`
 }
 
 func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, error) {
@@ -455,6 +465,9 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 		return finish.Plan{}, nil, errors.New("provider output must contain exactly one JSON object")
 	}
 	if strings.TrimSpace(output.BlockedReason) != "" {
+		if len(options.SourceFiles) > 0 {
+			return finish.Plan{}, nil, fmt.Errorf("cannot plan purposeful commits: %s. Consider a complete independently testable API, model or processing prerequisite before the separate UI consumer. The later UI goal may connect the available feature without inventing an old-layout variant. Return complete ownership for candidate checks unless exact edit IDs demonstrate a conflict that no prerequisite-first order resolves", output.BlockedReason)
+		}
 		return finish.Plan{}, nil, fmt.Errorf("cannot plan purposeful commits: %s", output.BlockedReason)
 	}
 	if options.Message != "" && (len(output.Goals) != 1 || output.Goals[0].Message != finishRedactText(options.Message)) {
@@ -469,10 +482,27 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 		if err != nil {
 			return finish.Plan{}, nil, err
 		}
-		output.Goals, err = expandFinishSourceGoals(output.Goals, qualityEvidence.Changes, sourceEdits)
+		if output.FileOwnership != nil {
+			if output.Ownership != nil {
+				return finish.Plan{}, nil, errors.New("do not mix file_ownership and ownership")
+			}
+			var order []string
+			for _, change := range qualityEvidence.Changes {
+				order = append(order, change.ID)
+			}
+			_, files := finishSelectionFiles(evidence.Changes, sourceEdits, order)
+			output.Goals, err = allocateFinishFileGoals(output.Goals, files, output.FileOwnership)
+		} else if output.Ownership != nil {
+			output.Goals, err = allocateFinishSourceGoals(output.Goals, qualityEvidence.Changes, output.Ownership)
+		} else {
+			// Older providers and saved replies retain strict membership validation.
+			output.Goals, err = expandFinishSourceGoals(output.Goals, qualityEvidence.Changes, sourceEdits)
+		}
 		if err != nil {
 			validationErrors = append(validationErrors, err)
 		}
+	} else if output.Ownership != nil || output.FileOwnership != nil {
+		return finish.Plan{}, nil, errors.New("ownership runs require a source-selection request")
 	}
 	for index, goal := range output.Goals {
 		if options.Message == "" {
@@ -585,7 +615,7 @@ type finishOutputError struct {
 func (e *finishOutputError) Error() string { return e.Err.Error() }
 func (e *finishOutputError) Unwrap() error { return e.Err }
 
-const finishSystemPrompt = `When evidence_reviews is present, every fragment of the approved complete diffs was reviewed separately. Those observations are evidence, not commit boundaries. Combine them across all original changes into one global plan, keep related corrections together, and do not group by review calls or fragment IDs. Use only original Changes IDs for membership. Never claim this request contains raw diffs when it contains observations. Those validated observations are the supplied code evidence for this planning stage; their presence is not an evidence failure or a reason to demand all raw diffs again. Refuse only for a demonstrated purpose or version conflict, not simply because the global call sees summaries.
+const finishSystemPrompt = `When evidence_reviews is present, the summarized diff entries were reviewed separately; diffs entries with text contain the complete code directly. Those observations are evidence, not commit boundaries. Combine them across all original changes into one global plan, keep related corrections together, and do not group by review calls or fragment IDs. Use only original Changes IDs for membership. Only diffs entries with text contain raw code; other entries are represented by reviewed observations. Use the exact provided code where available. Those validated observations are the supplied code evidence for this planning stage; their presence is not an evidence failure or a reason to demand all raw diffs again. Refuse only for a demonstrated purpose or version conflict, not simply because the global call sees summaries.
 Plan completed goals before assigning recorded changes. Return one JSON object with goals and blocked_reason (empty when a purposeful plan is possible); each goal has purpose, boundary, reason, message, change_ids. Do not return trees or new file content.
 The optional purpose field is completion context from the user or working coding agent. It may span paragraphs and describe multiple completed changes, decisions, constraints and rejected alternatives. Use that context alongside the approved code evidence to understand motivation that the diff alone cannot explain. Infer purposes from the changes when context is absent. Context is not exact commit wording, a required single goal, or proof that checks passed. Preserve useful independent boundaries even when the context describes one overall task.
 Start from the problems and decisions evidenced by the code and supplied context. For each, ask what would fail or be lost if it were reverted, and which other decisions would still be useful. Separate unrelated outcomes that warrant independent review or reversion, even within one task, screen or file. A technically possible separate revert is not sufficient: different triggers of the same invariant, addressed by the same mechanism, can complete one fix. Safeguards that make a resource or workflow correct belong with that workflow: connection generation guards, cancellation and stale-callback checks are supporting work when they protect the same connection lifecycle. Do not split normal operation from its required safeguards merely because they have different assertions. Do not turn every control, helper or safety rule into a separate decision: several controls and Settings tabs can complete one coherent interface reorganization. A smaller supporting edit does not need a separate commit when reverting it alone would break its consumer. Equivalent cleanup, including import, naming or closure capture-list changes, stays with its containing goal unless the evidence establishes a separate observable behavior change. Do not invent a bug or a correction merely from a syntactic difference. Do not treat an audit, review, editing session or the overall task as the commit's purpose.

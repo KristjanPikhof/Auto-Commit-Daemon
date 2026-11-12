@@ -55,6 +55,48 @@ func TestFinishOpenAIRequestsStrictSchemas(t *testing.T) {
 	}
 }
 
+func TestFinishOpenAISourceSchemaUsesExclusiveOwnership(t *testing.T) {
+	evidence, options, _ := finishSourceFixture()
+	request, _, err := prepareFinishRequest(evidence, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := (&OpenAIProvider{}).EncodeFinishRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire openAIToolRequest
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatal(err)
+	}
+	schema := wire.Tools[0].Function.Parameters
+	properties := schema["properties"].(map[string]any)
+	goal := properties["goals"].(map[string]any)["items"].(map[string]any)
+	if _, exists := goal["properties"].(map[string]any)["change_ids"]; exists || properties["file_ownership"] == nil || !strings.Contains(wire.Messages[0].Content, "Work through one file at a time") {
+		t.Fatal("source schema still permits overlapping per-goal ownership")
+	}
+	var sent FinishPlanRequest
+	if err := json.Unmarshal([]byte(wire.Messages[1].Content), &sent); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent.SourceEdits) != 0 || len(request.SourceEdits) != 4 {
+		t.Fatal("wire repeated local coordinates or changed the local catalogue")
+	}
+	if len(sent.SelectionOrder) != 0 || len(sent.SelectionFiles) != 1 || sent.SelectionFiles[0].FirstID != "edit-000001" || sent.SelectionFiles[0].LastID != "edit-000004" || len(sent.Diffs) != len(request.Diffs) {
+		t.Fatal("compact request lost selectable evidence")
+	}
+	for i, diff := range request.Diffs {
+		if sent.Diffs[i] != diff {
+			t.Fatal("compact request changed exact annotated code")
+		}
+	}
+	for _, id := range request.SelectionOrder {
+		if !strings.Contains(sent.Diffs[0].Text, "["+id+"] ") {
+			t.Fatalf("selection %q lost its code association", id)
+		}
+	}
+}
+
 func TestFinishRemovalSubprocessCloseKillsDescendants(t *testing.T) {
 	skipIfWindows(t)
 	for _, ignoresEOF := range []bool{false, true} {

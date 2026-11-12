@@ -72,7 +72,7 @@ const finishSourceEditLimit = ai.FinishPlanningByteCap / 128
 
 // Only frozen objects are read here. Scope hashes stay local; the provider sees
 // selected diff lines and their IDs, never compiler dumps or enclosing secrets.
-func prepareFinishSources(ctx context.Context, repo string, evidence finish.Evidence, diffs []ai.FinishDiff, maxBytes int) ([]finish.SourceFile, []ai.FinishDiff, error) {
+func prepareFinishSources(ctx context.Context, repo string, evidence finish.Evidence, diffs []ai.FinishDiff, maxBytes int, newFiles bool) ([]finish.SourceFile, []ai.FinishDiff, error) {
 	limit, err := ai.FinishInputByteLimit(maxBytes)
 	if err != nil {
 		return nil, nil, err
@@ -102,16 +102,22 @@ func prepareFinishSources(ctx context.Context, repo string, evidence finish.Evid
 	usedBytes, nextID := 0, 0
 	for _, change := range evidence.Changes {
 		i, exists := byID[change.ID]
+		created := change.Before == (finish.Entry{})
 		if !exists || result[i].Binary || change.AtomicGroup != "" ||
-			(change.Before.Mode != "100644" && change.Before.Mode != "100755") || change.Before.Mode != change.After.Mode {
+			(change.After.Mode != "100644" && change.After.Mode != "100755") ||
+			(!created && change.Before.Mode != change.After.Mode) ||
+			(created && (!newFiles || result[i].AfterSize == 0 || (filepath.Ext(change.Path) != ".swift" && filepath.Ext(change.Path) != ".go"))) {
 			continue
 		}
 		if result[i].BeforeSize+result[i].AfterSize > int64(limit-usedBytes) {
 			continue // This file remains one complete, fully evidenced transition.
 		}
-		before, err := git.CatFileBlobLimited(ctx, repo, change.Before.OID, int64(limit-usedBytes))
-		if err != nil {
-			return nil, nil, err
+		var before []byte
+		if !created {
+			before, err = git.CatFileBlobLimited(ctx, repo, change.Before.OID, int64(limit-usedBytes))
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 		after, err := git.CatFileBlobLimited(ctx, repo, change.After.OID, int64(limit-usedBytes-len(before)))
 		if err != nil {

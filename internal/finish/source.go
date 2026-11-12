@@ -75,12 +75,14 @@ func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (Sourc
 		if _, exists := sources[change.Path]; exists {
 			return SourcePlan{}, planError("duplicate source file %q", change.Path)
 		}
-		if change.AtomicGroup != "" || (change.Before.Mode != "100644" && change.Before.Mode != "100755") ||
-			change.Before.Mode != change.After.Mode || len(change.Before.OID) != len(change.After.OID) {
-			return SourcePlan{}, planError("source selections require an existing text file with unchanged mode: %q", change.Path)
+		created := change.Before == (Entry{})
+		if change.AtomicGroup != "" || (change.After.Mode != "100644" && change.After.Mode != "100755") ||
+			(!created && (change.Before.Mode != change.After.Mode || len(change.Before.OID) != len(change.After.OID))) {
+			return SourcePlan{}, planError("source selections require a new or unchanged-mode text file: %q", change.Path)
 		}
 		if !utf8.Valid(file.Before) || !utf8.Valid(file.After) || bytes.IndexByte(file.Before, 0) >= 0 || bytes.IndexByte(file.After, 0) >= 0 ||
-			sourceBlobOID(file.Before, len(change.Before.OID)) != change.Before.OID || sourceBlobOID(file.After, len(change.After.OID)) != change.After.OID {
+			(created && (len(file.Before) != 0 || len(file.After) == 0)) ||
+			(!created && sourceBlobOID(file.Before, len(change.Before.OID)) != change.Before.OID) || sourceBlobOID(file.After, len(change.After.OID)) != change.After.OID {
 			return SourcePlan{}, planError("source bytes do not match the frozen objects for %q", change.Path)
 		}
 		source := sourceFile{change: change, before: sourceLines(file.Before), after: sourceLines(file.After), edits: file.Edits}
@@ -158,8 +160,8 @@ func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (Sourc
 		for path := range touched {
 			source := sources[path]
 			content := source.compose(selected)
-			oid := sourceBlobOID(content, len(source.change.Before.OID))
-			current[path] = Entry{Mode: source.change.Before.Mode, OID: oid}
+			oid := sourceBlobOID(content, len(source.change.After.OID))
+			current[path] = Entry{Mode: source.change.After.Mode, OID: oid}
 			if oid != source.change.Before.OID && oid != source.change.After.OID {
 				result.Blobs[oid] = content
 			}
@@ -194,9 +196,34 @@ func BuildSourcePlan(evidence Evidence, files []SourceFile, goals []Goal) (Sourc
 }
 
 func (source sourceFile) compose(selected map[string]bool) []byte {
+	var result bytes.Buffer
+	source.walk(selected, func(line []byte, _ string) { result.Write(line) })
+	return result.Bytes()
+}
+
+// LineSelection identifies the frozen edit at a zero-based candidate line.
+// An unchanged base line names its pending deletion when one exists, allowing
+// a diagnostic to identify a consumer that has not yet received its update.
+func (file SourceFile) LineSelection(selected map[string]bool, line int) string {
+	source := sourceFile{before: sourceLines(file.Before), after: sourceLines(file.After), edits: file.Edits}
+	index, id := 0, ""
+	source.walk(selected, func(_ []byte, selection string) {
+		if index == line {
+			id = selection
+		}
+		index++
+	})
+	return id
+}
+
+func (source sourceFile) walk(selected map[string]bool, emit func([]byte, string)) {
 	deleted := make(map[int]bool)
+	baseIDs := make(map[int]string)
 	inserted := make(map[int][]SourceEdit)
 	for _, edit := range source.edits {
+		if edit.Kind == "delete" {
+			baseIDs[edit.BeforeLine] = edit.ID
+		}
 		if !selected[edit.ID] {
 			continue
 		}
@@ -206,18 +233,16 @@ func (source sourceFile) compose(selected map[string]bool) []byte {
 			inserted[edit.BeforeLine] = append(inserted[edit.BeforeLine], edit)
 		}
 	}
-	var result bytes.Buffer
 	for index := 0; index <= len(source.before); index++ {
 		edits := inserted[index]
 		sort.Slice(edits, func(i, j int) bool { return edits[i].AfterLine < edits[j].AfterLine })
 		for _, edit := range edits {
-			result.Write(source.after[edit.AfterLine])
+			emit(source.after[edit.AfterLine], edit.ID)
 		}
 		if index < len(source.before) && !deleted[index] {
-			result.Write(source.before[index])
+			emit(source.before[index], baseIDs[index])
 		}
 	}
-	return result.Bytes()
 }
 
 func sourceLines(content []byte) [][]byte {

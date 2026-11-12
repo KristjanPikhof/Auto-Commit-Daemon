@@ -74,11 +74,25 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 			"change_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		},
 	}
+	properties := map[string]any{"goals": map[string]any{"type": "array", "items": goal}, "blocked_reason": map[string]any{"type": "string"}}
+	required := []string{"goals", "blocked_reason"}
+	if len(request.SelectionOrder) > 0 {
+		goal["required"] = []string{"purpose", "boundary", "reason", "message"}
+		delete(goal["properties"].(map[string]any), "change_ids")
+		run := map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"through_id", "goal"},
+			"properties": map[string]any{"through_id": map[string]any{"type": "string", "description": "One literal selection ID from this file; endpoints advance and end at the file's last_id."}, "goal": map[string]any{"type": "integer", "description": "1-based index into goals."}},
+		}
+		properties["file_ownership"] = map[string]any{"type": "array", "items": map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"change_id", "runs"},
+			"properties": map[string]any{"change_id": map[string]any{"type": "string"}, "runs": map[string]any{"type": "array", "items": run}},
+		}}
+		required = append(required, "file_ownership")
+	}
 	return marshalOpenAIToolRequest(openAIToolRequestOptions{
 		Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
 		ToolName: "finish_plan", ToolDescription: "Plan completed purposes, safe recorded changes, and grounded messages",
-		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"goals", "blocked_reason"},
-			"properties": map[string]any{"goals": map[string]any{"type": "array", "items": goal}, "blocked_reason": map[string]any{"type": "string"}}},
+		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": required, "properties": properties},
 	})
 }
 

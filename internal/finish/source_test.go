@@ -8,6 +8,40 @@ import (
 	"testing"
 )
 
+func TestSourceDiagnosticLinesFollowExactSelections(t *testing.T) {
+	file := SourceFile{Before: []byte("a\nold\nz\n"), After: []byte("a\nnew\nextra\nz\n"), Edits: []SourceEdit{
+		{ID: "remove-old", Kind: "delete", BeforeLine: 1},
+		{ID: "add-new", Kind: "insert", BeforeLine: 1, AfterLine: 1},
+		{ID: "add-extra", Kind: "insert", BeforeLine: 1, AfterLine: 2},
+	}}
+	for _, test := range []struct {
+		selected []string
+		text     string
+		ids      []string
+	}{
+		{nil, "a\nold\nz\n", []string{"", "remove-old", ""}},
+		{[]string{"add-new", "add-extra"}, "a\nnew\nextra\nold\nz\n", []string{"", "add-new", "add-extra", "remove-old", ""}},
+		{[]string{"remove-old", "add-new", "add-extra"}, "a\nnew\nextra\nz\n", []string{"", "add-new", "add-extra", ""}},
+	} {
+		selected := make(map[string]bool)
+		for _, id := range test.selected {
+			selected[id] = true
+		}
+		source := sourceFile{before: sourceLines(file.Before), after: sourceLines(file.After), edits: file.Edits}
+		if string(source.compose(selected)) != test.text {
+			t.Fatal("diagnostic walk changed candidate bytes")
+		}
+		for line, id := range test.ids {
+			if got := file.LineSelection(selected, line); got != id {
+				t.Fatalf("line %d: got %q, want %q", line, got, id)
+			}
+		}
+		if file.LineSelection(selected, -1) != "" || file.LineSelection(selected, len(test.ids)) != "" {
+			t.Fatal("out-of-range diagnostic selected source")
+		}
+	}
+}
+
 func sourceFixture() (Evidence, []SourceFile, []Goal) {
 	before := []byte("package camera\ntype Status struct { Running bool }\nfunc Selected(s Status) string { return \"\" }\n")
 	after := []byte("package camera\ntype Status struct { Running bool; CameraID string }\nfunc Selected(s Status) string { return s.CameraID }\n")
@@ -169,6 +203,37 @@ func TestBuildSourcePlanPreservesFrozenProvenance(t *testing.T) {
 	for _, change := range result.Evidence.Changes {
 		if change.Provenance != "frozen-capture" {
 			t.Fatalf("source selection replaced immutable provenance: %+v", change)
+		}
+	}
+}
+
+func TestBuildSourcePlanStagesNewFileWithoutInventingCode(t *testing.T) {
+	for _, oidLength := range []int{40, 64} {
+		body := []byte("package settings\nfunc Camera() string { return \"camera\" }\nfunc GenerateRoom() string { return \"room\" }\n")
+		target := Tree{"settings.go": {Mode: "100755", OID: sourceBlobOID(body, oidLength)}}
+		evidence := Evidence{Base: Tree{}, Target: target, Changes: NetChanges(Tree{}, target, "author")}
+		file := SourceFile{ChangeID: "settings.go", After: body, Edits: []SourceEdit{
+			{ID: "header", Kind: "insert", AfterLine: 0}, {ID: "settings", Kind: "insert", AfterLine: 1}, {ID: "room", Kind: "insert", AfterLine: 2},
+		}}
+		goals := []Goal{
+			{Purpose: "Organize camera settings", Boundary: "Introduce working settings before the independent room feature", Message: "Organize camera settings", ChangeIDs: []string{"header", "settings"}},
+			{Purpose: "Add room generation", Boundary: "Keep the optional room feature independently revertible", Message: "Add room generation", ChangeIDs: []string{"room"}},
+		}
+		plan, err := BuildSourcePlan(evidence, []SourceFile{file}, goals)
+		if err != nil || !maps.Equal(plan.Plan.Target, target) || len(plan.Plan.Steps) != 2 {
+			t.Fatalf("new file stages: %+v %v", plan, err)
+		}
+		first := plan.Plan.Steps[0].Tree["settings.go"]
+		if first.Mode != "100755" || string(plan.Blobs[first.OID]) != "package settings\nfunc Camera() string { return \"camera\" }\n" {
+			t.Fatalf("new file lost exact bytes or mode: %+v", first)
+		}
+		// A new file stays absent until its owner runs, including preceding goals.
+		evidence.Target["notes"] = planEntry("d")
+		evidence.Changes = NetChanges(evidence.Base, evidence.Target, "author")
+		goals = append([]Goal{{Purpose: "Document camera behavior", Boundary: "Keep independent notes separate from source changes", Message: "Document camera behavior", ChangeIDs: []string{"notes"}}}, goals...)
+		plan, err = BuildSourcePlan(evidence, []SourceFile{file}, goals)
+		if err != nil || plan.Plan.Steps[0].Tree["settings.go"] != (Entry{}) {
+			t.Fatalf("new file appeared before its first selection: %+v %v", plan, err)
 		}
 	}
 }

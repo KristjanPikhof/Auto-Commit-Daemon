@@ -807,6 +807,7 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 		saved.Steps = append(saved.Steps, FinishPlanStep{Goal: step.Goal, TreeOID: tree, Author: step.Author})
 		commits = append(commits, git.FinishCommit{TreeOID: tree, Message: step.Message, AuthorName: cfg.AuthorName, AuthorEmail: cfg.AuthorEmail})
 	}
+	var sourceFailures []error
 	proof, err := git.BuildFinishChain(verifyCtx, wt.Root, git.FinishBuildOptions{RequestID: r.ID, Attempt: r.Attempt, WorktreeID: r.Target.WorktreeID, BranchRef: r.Target.BranchRef, ExpectedHead: r.Target.ExpectedHead, TargetTree: r.Target.TargetTree, IndexDigest: r.Target.IndexDigest, IncludeStaged: r.Target.IncludeStaged, ObjectRef: git.FinishRefPrefix + r.Target.WorktreeID + "/" + r.ID + "/" + strconv.Itoa(r.Attempt) + "/chain", Commits: commits, Verify: func(checkCtx context.Context, index int, oid, tree string) error {
 		check := FinishCheck{TreeOID: tree, Policy: cfg.VerificationMode}
 		result, checkErr := evaluatePublication(checkCtx, func(jobCtx context.Context) (verification.Result, error) {
@@ -822,8 +823,15 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 		if checkErr != nil {
 			return checkErr
 		}
-		if check.Result.Status != verification.StatusPassed || check.Result.NeedsAttention {
+		if planned.Source != nil && check.Executed && check.Result.Status == verification.StatusFailed {
+			sourceFailures = append(sourceFailures, &ai.SourceCheckFailure{Step: index + 1, Output: check.Result.Output})
+		} else if check.Result.Status != verification.StatusPassed || check.Result.NeedsAttention {
 			return fmt.Errorf("finish: candidate verification %s", check.Result.Status)
+		}
+		// Fail inside the verifier after checking every candidate, before Git
+		// can pin or prepare a rejected chain for publication.
+		if index == len(saved.Steps)-1 {
+			return errors.Join(sourceFailures...)
 		}
 		return nil
 	}})
@@ -880,7 +888,7 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 			return result, errors.New("source selections require approved project checks")
 		}
 		prepared, prepareErr := evaluatePublication(ctx, func(jobCtx context.Context) (finishSourcePreparation, error) {
-			files, updated, err := prepareFinishSources(jobCtx, wt.Root, evidence, diffs, cfg.Provider.MaxInputBytes)
+			files, updated, err := prepareFinishSources(jobCtx, wt.Root, evidence, diffs, cfg.Provider.MaxInputBytes, r.Target.Version >= 4)
 			return finishSourcePreparation{files: files, diffs: updated}, err
 		})
 		sourceFiles, diffs, err = prepared.files, prepared.diffs, prepareErr
@@ -903,13 +911,6 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		candidate := finishPlanningResult{Plan: built.Plan, Evidence: built.Evidence, Blobs: built.Blobs, Source: sourceProof(evidence, sourceFiles, built.Selections)}
 		saved, proof, err := w.prepare(checkCtx, wt, cfg, r, candidate)
 		checked = &finishPreparedPlan{saved: saved, proof: proof}
-		if err != nil {
-			for i, step := range saved.Steps {
-				if step.Check.Executed && step.Check.Result.Status != verification.StatusPassed {
-					return &ai.SourceCheckFailure{Step: i + 1, Output: step.Check.Result.Output}
-				}
-			}
-		}
 		return err
 	}
 	planned, err := ai.PlanFinish(ctx, finishEvaluatedTransport{transport}, evidence, ai.FinishOptions{SourceFiles: sourceFiles, VerifySource: verifySource, MaxInputBytes: cfg.Provider.MaxInputBytes, Deadline: finishDeadline(r), Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message, Diffs: diffs, DiffEgress: cfg.Provider.DiffEgress, RequireCompletionContext: true, ReviewIdentity: string(identity), ReviewProgress: r.ReviewProgress, SaveReviewProgress: func(saveCtx context.Context, progress finish.ReviewProgress) error {

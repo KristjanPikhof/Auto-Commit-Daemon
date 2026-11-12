@@ -32,6 +32,9 @@ var sourceFunctionPrefix = regexp.MustCompile(`\b(func|init|deinit)\b`)
 
 func finishSourceScopes(ctx context.Context, dir, path string, content []byte) ([]string, error) {
 	lines := finishSourceLines(content)
+	if len(lines) == 0 {
+		return nil, nil
+	}
 	var symbols, blocks []finishSourceScope
 	switch filepath.Ext(path) {
 	case ".swift":
