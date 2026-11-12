@@ -35,9 +35,12 @@ func TestFinishCLIShowsCheckpointScanAndCommitProgress(t *testing.T) {
 			r.Stage = "planning"
 			r.PlanningCalls = 1
 		case 3:
+			r.Stage = "splitting_commits"
+			r.PartitionCalls = 1
+		case 4:
 			r.Stage = "verifying"
 			r.Checking = &finishCheckProgress{Commit: 2, Total: 2}
-		case 4:
+		case 5:
 			r.State, r.Stage = state.FinishPrepared, "publishing"
 			r.Publication = json.RawMessage(`{"commits":[{},{}]}`)
 		default:
@@ -68,7 +71,8 @@ func TestFinishCLIShowsCheckpointScanAndCommitProgress(t *testing.T) {
 				"Scanning saved checkpoints.", "Scanned 256 checkpoints.", "Scanned 512 checkpoints.",
 				"Scanned 600 checkpoints and kept 19 intermediate versions for planning.",
 				"Preparing saved changes for Intent.", "Reviewing saved changes (128 of 801 fragments, 64 reused).",
-				"Waiting for Intent to propose commits.", "Checking commit 2 of 2.", "Publishing 2 verified commits to your branch.",
+				"Waiting for Intent to propose commits.", "Splitting oversized commits into complete changes.",
+				"Checking commit 2 of 2.", "Publishing 2 verified commits to your branch.",
 			} {
 				_, after, found := strings.Cut(remaining, want)
 				if !found {

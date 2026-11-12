@@ -28,8 +28,8 @@ func TestFinishWorkerRetryPreviewRetainsAcceptedReviews(t *testing.T) {
 	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	w.Config.Provider.Timeout = time.Minute
-	const largeReason = "The recorded library must stay complete with its consumer; no smaller library versions were retained for safe intermediate commits."
-	var reviews, plans atomic.Int32
+	const largeReason = "The consumer.txt version requires the complete library.txt dataset; no smaller library versions were retained for safe intermediate commits."
+	var reviews, plans, partitions atomic.Int32
 	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
 		if request.Review != nil {
 			reviews.Add(1)
@@ -39,7 +39,9 @@ func TestFinishWorkerRetryPreviewRetainsAcceptedReviews(t *testing.T) {
 			}
 			return json.Marshal(map[string]any{"observations": observations})
 		}
-		if plans.Add(1) == 1 {
+		if request.Partition != nil {
+			partitions.Add(1)
+		} else if plans.Add(1) == 1 {
 			return nil, errors.New("provider unavailable after complete evidence review")
 		}
 		goal := finish.Goal{Purpose: "Publish the complete library and consumer", Boundary: "Keep the consumer with the complete recorded library it requires", Reason: "Supply every recorded library entry so its consumer can use the complete dataset.", LargeChangeReason: largeReason, Message: "Publish the complete library and consumer\n\n- Supply every recorded library entry so its consumer can use the complete dataset.\n- " + largeReason}
@@ -75,7 +77,7 @@ func TestFinishWorkerRetryPreviewRetainsAcceptedReviews(t *testing.T) {
 		t.Fatalf("preview changed the frozen request: %+v %v", preview, err)
 	}
 	previewed, err := w.Execute(ctx, r.ID)
-	if err != nil || previewed.State != state.FinishCompleted || reviews.Load() != acceptedReviews || previewed.ReusedFragments != len(failed.ReviewProgress.Observations) {
+	if err != nil || previewed.State != state.FinishCompleted || reviews.Load() != acceptedReviews || previewed.ReusedFragments != len(failed.ReviewProgress.Observations) || previewed.PartitionCalls != 1 {
 		t.Fatalf("preview repeated accepted evidence: %+v reviews=%d %v", previewed, reviews.Load(), err)
 	}
 	if previewed.ReviewProgress.Fingerprint != failed.ReviewProgress.Fingerprint {
@@ -94,7 +96,7 @@ func TestFinishWorkerRetryPreviewRetainsAcceptedReviews(t *testing.T) {
 		t.Fatalf("publication retry changed the frozen request: %+v %v", retry, err)
 	}
 	completed, err := w.Execute(ctx, r.ID)
-	if err != nil || completed.State != state.FinishCompleted || reviews.Load() != acceptedReviews || completed.EvidenceCalls != 0 || completed.PlanningCalls != 1 || completed.ReusedFragments != len(failed.ReviewProgress.Observations) || plans.Load() != 3 {
+	if err != nil || completed.State != state.FinishCompleted || reviews.Load() != acceptedReviews || completed.EvidenceCalls != 0 || completed.PlanningCalls != 1 || completed.ReusedFragments != len(failed.ReviewProgress.Observations) || plans.Load() != 3 || completed.PartitionCalls != 1 || partitions.Load() != 2 {
 		t.Fatalf("publication repeated accepted evidence: %+v reviews=%d plans=%d %v", completed, reviews.Load(), plans.Load(), err)
 	}
 	if finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}") != r.Target.TargetTree {

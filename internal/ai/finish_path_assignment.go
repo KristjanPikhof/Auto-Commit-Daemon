@@ -83,7 +83,7 @@ func completeFinishPathOwnership(ctx context.Context, transport FinishTransport,
 		if body == nil {
 			continue
 		}
-		if disclosure.EvidenceCalls+disclosure.AssignmentCalls >= finish.EvidenceReviewCallLimit {
+		if disclosure.EvidenceCalls+disclosure.AssignmentCalls+disclosure.PartitionCalls >= finish.EvidenceReviewCallLimit {
 			break // Keep the remaining coverage error for normal correction.
 		}
 		if err := ctx.Err(); err != nil {

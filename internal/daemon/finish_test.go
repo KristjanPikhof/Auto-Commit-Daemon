@@ -631,7 +631,7 @@ func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
 	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	w.Config.Provider.Timeout = time.Minute
-	const largeReason = "The catalogue is imported as one complete dataset; publishing only some recorded entries would expose an incomplete catalogue."
+	const largeReason = "The library-000.txt version and its companion entries form one complete imported dataset; publishing only some entries would expose an incomplete catalogue."
 	reviewed := make(map[string]string)
 	var reviewMu sync.Mutex
 	p := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
@@ -667,7 +667,7 @@ func TestFinishWorkerLargeBatchPublishesCompleteFrozenTarget(t *testing.T) {
 	w.Transport = p
 	r := startFinishWorker(t, w, FinishOptions{Purpose: "Import the complete library catalogue; all recorded entries are required in the published dataset"})
 	completed, err := w.Execute(context.Background(), r.ID)
-	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 || completed.EvidenceCalls < 2 || p.calls.Load() != int32(completed.EvidenceCalls+1) {
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 || completed.EvidenceCalls < 2 || completed.PartitionCalls != 1 || p.calls.Load() != int32(completed.EvidenceCalls+completed.PartitionCalls+1) {
 		t.Fatalf("large finish: %+v calls=%d: %v", completed, p.calls.Load(), err)
 	}
 	if tree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); tree != r.Target.TargetTree {

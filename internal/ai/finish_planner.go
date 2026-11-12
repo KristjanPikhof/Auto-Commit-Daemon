@@ -66,6 +66,7 @@ type FinishPlanRequest struct {
 	Review                   *FinishReviewTask         `json:"evidence_review,omitempty"`
 	AssignPaths              *finishPathAssignmentTask `json:"assign_paths,omitempty"`
 	ReviewSizes              []finishSizeReviewStep    `json:"review_sizes,omitempty"`
+	Partition                *FinishPartitionTask      `json:"partition,omitempty"`
 	Reviews                  []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	HistoryCommits           []HistoryMessageCommit    `json:"history_commits,omitempty"`
 	SourceEdits              []FinishSourceEdit        `json:"source_edits,omitempty"`
@@ -97,6 +98,9 @@ type FinishOptions struct {
 	GroupIndivisibleVersions bool
 	AllowPathOwnership       bool
 	RetrySizeReview          *FinishRetrySizeReview
+	PartitionOversized       bool
+	MeasurePlan              func(context.Context, finish.Plan) ([]FinishStepSize, error)
+	RecordPartitionReviews   func([]FinishPartitionReview)
 	// VerifyPlan checks the materialized chain, including its measured sizes.
 	// It shares the persisted deadline and single correction budget, and never
 	// publishes a branch.
@@ -110,6 +114,7 @@ type FinishOptions struct {
 	BeforeCall           func(context.Context) error
 	BeforeEvidenceCall   func(context.Context) error
 	BeforeAssignmentCall func(context.Context) error
+	BeforePartitionCall  func(context.Context) error
 	ReviewIdentity       string
 	ReviewProgress       finish.ReviewProgress
 	SaveReviewProgress   func(context.Context, finish.ReviewProgress) error
@@ -125,6 +130,8 @@ type FinishBoundaryRefinement struct {
 type FinishDisclosure struct {
 	EvidenceCalls        int                       `json:"evidence_calls,omitempty"`
 	AssignmentCalls      int                       `json:"assignment_calls,omitempty"`
+	PartitionCalls       int                       `json:"partition_calls,omitempty"`
+	PartitionReviews     []FinishPartitionReview   `json:"partition_reviews,omitempty"`
 	EvidenceRequestBytes []int                     `json:"evidence_request_bytes,omitempty"`
 	EvidenceReviews      []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	ReusedFragments      int                       `json:"reused_fragments,omitempty"`
@@ -334,6 +341,19 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		}
 		if validationErr == nil {
 			plan, source, validationErr = validateFinishReply(raw, evidence, options)
+		}
+		if validationErr == nil && options.PartitionOversized && source == nil {
+			plan, validationErr = partitionFinishPlan(ctx, transport, request, evidence, plan, options, &result.Disclosure)
+			var fatal *FinishPlanningError
+			if errors.As(validationErr, &fatal) {
+				return result, validationErr
+			}
+			if validationErr == nil {
+				raw = encodeFinishGoals(plan)
+				if options.RecordPartitionReviews != nil {
+					options.RecordPartitionReviews(result.Disclosure.PartitionReviews)
+				}
+			}
 		}
 		if validationErr == nil && options.VerifyPlan != nil {
 			checkErr := options.VerifyPlan(ctx, plan, source)
