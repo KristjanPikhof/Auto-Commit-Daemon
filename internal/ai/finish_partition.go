@@ -34,8 +34,13 @@ type FinishPartitionReview struct {
 
 func HasFinishPartitionReview(goal finish.Goal, size FinishStepSize, reviews []FinishPartitionReview) bool {
 	for _, review := range reviews {
-		if size.ChangedLines == review.ChangedLines && slices.Equal(goal.ChangeIDs, review.ChangeIDs) &&
-			goal.LargeChangeReason == review.Reason && review.Reason != "" {
+		if size.ChangedLines != review.ChangedLines || goal.LargeChangeReason != review.Reason || review.Reason == "" || len(goal.ChangeIDs) != len(review.ChangeIDs) {
+			continue
+		}
+		ids, reviewed := slices.Clone(goal.ChangeIDs), slices.Clone(review.ChangeIDs)
+		slices.Sort(ids)
+		slices.Sort(reviewed)
+		if slices.Equal(ids, reviewed) {
 			return true
 		}
 	}

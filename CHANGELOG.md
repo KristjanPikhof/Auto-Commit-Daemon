@@ -24,6 +24,8 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Order new Xcode source files and declared resource inputs before their
+  build references, while preserving reviewed commit memberships.
 - Give focused split reviews exact approved diffs when they fit, and
   distinguish added shared-test coverage from real compatibility breaks.
 - Give focused split reviews the full commit-message rules and one bounded

@@ -10,9 +10,9 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
 )
 
-// The provider chooses membership. Exact versions and explicit prerequisites
-// determine replay order; conflicting groups need correction, never merging.
-func orderFinishGoals(evidence finish.Evidence, goals []finish.Goal) ([]finish.Goal, error) {
+// OrderFinishGoals preserves provider membership while ordering exact versions
+// and explicit prerequisites. Conflicting groups need correction, never merging.
+func OrderFinishGoals(evidence finish.Evidence, goals []finish.Goal) ([]finish.Goal, error) {
 	order := make(map[string]int, len(evidence.Changes))
 	for index, change := range evidence.Changes {
 		order[change.ID] = index
