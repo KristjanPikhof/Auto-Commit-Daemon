@@ -24,6 +24,9 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Simplify Intent verification, error handling and finish guidance.
+  Use one candidate verifier and keep preview flags with their commands,
+  preserving checks, deadlines and command output.
 - Give each candidate check its approved command timeout in new generated
   Intent requests. Use the saved attempt deadline for the whole chain so several
   valid checks do not exhaust a single command's budget during preparation.

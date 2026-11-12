@@ -213,6 +213,9 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			if r.Target.IncludeStaged {
 				next += " --include-staged"
 			}
+			if r.DryRun {
+				next += " --dry-run"
+			}
 		} else if r.ReasonCode == "provider_input_too_large" {
 			next = "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"
 		} else if r.ReasonCode == "provider_diffs_required" {
@@ -237,9 +240,9 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 				budget = min(time.Hour, max(15*time.Minute, 2*budget)).Round(time.Second)
 				next += " --timeout " + budget.String()
 			}
-		}
-		if r.DryRun && r.State != state.FinishNeedsAttention && r.ReasonCode != "provider_diffs_required" && r.ReasonCode != "provider_input_too_large" && r.ReasonCode != "provider_boundaries_unavailable" {
-			next += " --dry-run"
+			if r.DryRun {
+				next += " --dry-run"
+			}
 		}
 	}
 	stateName := productStateProtected

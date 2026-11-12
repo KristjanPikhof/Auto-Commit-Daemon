@@ -107,19 +107,24 @@ func TestFinishCLIHelpDistinguishesContextFromExactBatch(t *testing.T) {
 
 func TestFinishCLIContextFailureNeedsANewRequest(t *testing.T) {
 	lookup, _, _ := finishCLIFixture(t)
-	for _, staged := range []bool{false, true} {
-		r := state.FinishRequest{ID: "finish-context", State: state.FinishFailed, ReasonCode: "provider_context_required", Reason: "Supply what changed and why", Target: state.FinishTarget{CheckpointID: "saved", IncludeStaged: staged}}
+	for _, test := range []struct {
+		staged, dryRun bool
+		want           string
+	}{
+		{false, false, `acd finish "what changed and why"`},
+		{true, false, `acd finish "what changed and why" --include-staged`},
+		{false, true, `acd finish "what changed and why" --dry-run`},
+		{true, true, `acd finish "what changed and why" --include-staged --dry-run`},
+	} {
+		r := state.FinishRequest{ID: "finish-context", DryRun: test.dryRun, State: state.FinishFailed, ReasonCode: "provider_context_required", Reason: "Supply what changed and why", Target: state.FinishTarget{CheckpointID: "saved", IncludeStaged: test.staged}}
 		var out bytes.Buffer
 		err := renderFinish(&out, lookup, r, true, "")
 		var response productEnvelope
 		if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
 			t.Fatal(decodeErr)
 		}
-		if err == nil || response.Error == nil || response.Error.Retryable || response.NextAction == nil || !strings.Contains(*response.NextAction, "what changed and why") || strings.Contains(out.String(), "--retry") {
+		if err == nil || response.Error == nil || response.Error.Retryable || response.NextAction == nil || *response.NextAction != test.want || strings.Contains(out.String(), "--retry") {
 			t.Fatalf("unchanged retry suggested for missing context: %s %v", out.String(), err)
-		}
-		if strings.Contains(*response.NextAction, "--include-staged") != staged {
-			t.Fatalf("staged consent missing from new-request guidance: %s", *response.NextAction)
 		}
 	}
 }
@@ -220,15 +225,23 @@ func TestFinishCLIInvalidPlansAndProviderFailuresRemainRetryable(t *testing.T) {
 	lookup, _, _ := finishCLIFixture(t)
 	for _, code := range []string{"invalid_provider_plan", "provider_failure"} {
 		t.Run(code, func(t *testing.T) {
-			r := state.FinishRequest{ID: "finish-retry", State: state.FinishFailed, ReasonCode: code, Reason: "Provider returned an invalid response", Target: state.FinishTarget{CheckpointID: "saved"}}
-			var out bytes.Buffer
-			err := renderFinish(&out, lookup, r, true, "")
-			var response productEnvelope
-			if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
-				t.Fatal(decodeErr)
-			}
-			if err == nil || response.Error == nil || !response.Error.Retryable || response.NextAction == nil || *response.NextAction != "acd finish --retry finish-retry" {
-				t.Fatalf("retryable provider failure required new evidence: %s %v", out.String(), err)
+			for _, test := range []struct {
+				dryRun bool
+				want   string
+			}{
+				{false, "acd finish --retry finish-retry"},
+				{true, "acd finish --retry finish-retry --dry-run"},
+			} {
+				r := state.FinishRequest{ID: "finish-retry", DryRun: test.dryRun, State: state.FinishFailed, ReasonCode: code, Reason: "Provider returned an invalid response", Target: state.FinishTarget{CheckpointID: "saved"}}
+				var out bytes.Buffer
+				err := renderFinish(&out, lookup, r, true, "")
+				var response productEnvelope
+				if decodeErr := json.Unmarshal(out.Bytes(), &response); decodeErr != nil {
+					t.Fatal(decodeErr)
+				}
+				if err == nil || response.Error == nil || !response.Error.Retryable || response.NextAction == nil || *response.NextAction != test.want {
+					t.Fatalf("retryable provider failure required new evidence: %s %v", out.String(), err)
+				}
 			}
 		})
 	}
