@@ -14,6 +14,7 @@ import (
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/finish"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
@@ -48,7 +49,44 @@ func TestFinishVersionReadsOnlyChangedPaths(t *testing.T) {
 	}
 }
 
-func finishDecisionFixture(t *testing.T) (*captureFixture, *FinishWorker, state.Checkpoint) {
+func seedFinishCheckpointHistory(t *testing.T, w *FinishWorker, count int) {
+	t.Helper()
+	// Reuse two real checkpoint trees to model repeated edits to a file
+	// that was gone by finish time.
+	finishWrite(t, w.RepoPath, "scratch.txt", "temporary notes\n")
+	withScratch := finishCaptureVersion(t, w)
+	if err := os.Remove(filepath.Join(w.RepoPath, "scratch.txt")); err != nil {
+		t.Fatal(err)
+	}
+	withoutScratch := finishCaptureVersion(t, w)
+	ctx := t.Context()
+	checkpoints := make([]state.Checkpoint, 0, count)
+	var refs strings.Builder
+	for i := range count {
+		cp := withScratch
+		if i%2 == 1 {
+			cp = withoutScratch
+		}
+		cp.ID = fmt.Sprintf("cp-%d-0123456789abcdef", i+1)
+		cp.OperationID = "test-" + cp.ID
+		cp.Ref = git.CheckpointRefPrefix + cp.WorktreeID + "/" + cp.ID
+		if _, err := state.PrepareCheckpoint(ctx, w.DB, cp, "sha256:"+strings.Repeat("a", 64)); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&refs, "create %s %s\n", cp.Ref, cp.CommitOID)
+		checkpoints = append(checkpoints, cp)
+	}
+	if _, err := git.Run(ctx, git.RunOpts{Dir: w.RepoPath, Stdin: strings.NewReader(refs.String())}, "update-ref", "--stdin"); err != nil {
+		t.Fatal(err)
+	}
+	for _, cp := range checkpoints {
+		if err := state.CompleteCheckpoint(ctx, w.DB, cp.ID, cp.Ref, cp.CommitOID, cp.CompletedTS.Float64); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func finishDecisionFixture(t *testing.T, earlierCheckpoints int) (*captureFixture, *FinishWorker, state.Checkpoint) {
 	t.Helper()
 	f, w := finishWorkerFixture(t)
 	finishWrite(t, f.dir, "auth.sh", "authenticate() { printf password; }\n")
@@ -59,6 +97,9 @@ func finishDecisionFixture(t *testing.T) (*captureFixture, *FinishWorker, state.
 	w.Config.Provider.CommitStrategy = ai.CommitStrategyIntent
 	w.Config.Provider.DiffEgress = true
 	w.Config.Provider.Timeout = time.Minute
+	if earlierCheckpoints > 0 {
+		seedFinishCheckpointHistory(t, w, earlierCheckpoints)
+	}
 	finishWrite(t, f.dir, "auth.sh", "local_auth() { printf password; }\nauthenticate() { local_auth; }\n")
 	version := finishCaptureVersion(t, w)
 	finishWrite(t, f.dir, "auth.sh", "local_auth() { printf password; }\nauthenticate() { case \"$1\" in google) printf google;; *) local_auth;; esac; }\n")
@@ -88,8 +129,13 @@ func finishDecisionPlan(t *testing.T, request ai.FinishPlanRequest) []byte {
 
 func TestFinishWorkerPublishesCheckedSameFileDecisions(t *testing.T) {
 	for _, broken := range []bool{false, true} {
-		t.Run(map[bool]string{false: "working steps", true: "broken intermediate"}[broken], func(t *testing.T) {
-			f, w, _ := finishDecisionFixture(t)
+		t.Run(map[bool]string{false: "working steps after first batch", true: "broken intermediate"}[broken], func(t *testing.T) {
+			earlierCheckpoints := 257
+			if broken {
+				earlierCheckpoints = 0
+			}
+			f, w, source := finishDecisionFixture(t, earlierCheckpoints)
+			reflog := finishWorkerGit(t, f.dir, "reflog", "show", "--format=%H", "refs/heads/main")
 			command := "sh verify.sh"
 			if broken {
 				// This command requires the final feature. It must fail on the
@@ -108,7 +154,7 @@ func TestFinishWorkerPublishesCheckedSameFileDecisions(t *testing.T) {
 				return finishDecisionPlan(t, request), nil
 			}}
 			r := startFinishWorker(t, w, FinishOptions{Purpose: "Prepare password authentication, then add Google"})
-			if len(r.Target.Checkpoints) != 1 {
+			if len(r.Target.Checkpoints) != 1 || r.Target.Checkpoints[0].ID != source.ID {
 				t.Fatalf("recorded versions: %+v", r.Target.Checkpoints)
 			}
 			finishWrite(t, f.dir, "auth.sh", "later live work\n")
@@ -125,6 +171,9 @@ func TestFinishWorkerPublishesCheckedSameFileDecisions(t *testing.T) {
 			commits := strings.Fields(finishWorkerGit(t, f.dir, "rev-list", "--reverse", r.Target.ExpectedHead+"..HEAD"))
 			if len(commits) != 2 {
 				t.Fatalf("want two useful steps: %v", commits)
+			}
+			if got := finishWorkerGit(t, f.dir, "reflog", "show", "--format=%H", r.Target.BranchRef); got != commits[1]+"\n"+reflog {
+				t.Fatalf("finish did not publish both commits in one branch update: %s", got)
 			}
 			if body := finishWorkerGit(t, f.dir, "show", commits[0]+":auth.sh"); strings.Contains(body, "google") || !strings.Contains(body, "local_auth") {
 				t.Fatalf("invalid preparation: %s", body)
@@ -154,7 +203,7 @@ func TestFinishWorkerPublishesCheckedSameFileDecisions(t *testing.T) {
 }
 
 func TestFinishWorkerRetriesPinnedVersionsAfterRestartAndPrune(t *testing.T) {
-	f, w, source := finishDecisionFixture(t)
+	f, w, source := finishDecisionFixture(t, 0)
 	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
 		return finishDecisionPlan(t, request), nil
 	}}
@@ -192,7 +241,7 @@ func TestFinishWorkerRetriesPinnedVersionsAfterRestartAndPrune(t *testing.T) {
 }
 
 func TestFinishWorkerRejectsMovedVersionProof(t *testing.T) {
-	f, w, _ := finishDecisionFixture(t)
+	f, w, _ := finishDecisionFixture(t, 0)
 	r := startFinishWorker(t, w, FinishOptions{Purpose: "Prepare password authentication, then add Google"})
 	finishWorkerGit(t, f.dir, "update-ref", r.Target.Checkpoints[0].Ref, r.Target.ExpectedHead)
 	provider := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
@@ -208,7 +257,7 @@ func TestFinishWorkerRejectsMovedVersionProof(t *testing.T) {
 func TestFinishWorkerKeepsStagedAndExactMessageBatchesOutOfVersions(t *testing.T) {
 	for _, staged := range []bool{false, true} {
 		t.Run(map[bool]string{false: "exact message", true: "staged selection"}[staged], func(t *testing.T) {
-			f, w, _ := finishDecisionFixture(t)
+			f, w, _ := finishDecisionFixture(t, 0)
 			options := FinishOptions{Purpose: "Complete Google authentication"}
 			if staged {
 				finishWorkerGit(t, f.dir, "add", "auth.sh", "verify.sh")

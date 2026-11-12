@@ -65,15 +65,11 @@ func (w *FinishWorker) freezeFinishCheckpoints(ctx context.Context, wt git.Workt
 	if len(paths) == 0 {
 		return nil, nil
 	}
-	checkpoints, err := state.FinishCheckpoints(ctx, w.DB, cp)
-	if err != nil {
-		return nil, err
-	}
 	current := base
 	var versions []state.FinishCheckpoint
-	for _, source := range checkpoints {
+	err := state.WalkFinishCheckpoints(ctx, w.DB, cp, func(source state.Checkpoint) error {
 		proof := state.FinishCheckpoint{ID: source.ID, Ref: source.Ref, CommitOID: source.CommitOID, TreeOID: source.TreeOID}
-		err := withFinishVersion(ctx, wt.Root, proof, paths, func(locked context.Context, snapshot finish.Tree) error {
+		return withFinishVersion(ctx, wt.Root, proof, paths, func(locked context.Context, snapshot finish.Tree) error {
 			next := finishVersionTree(current, snapshot, paths)
 			if maps.Equal(current, next) || maps.Equal(next, frozen) {
 				return nil
@@ -87,9 +83,9 @@ func (w *FinishWorker) freezeFinishCheckpoints(ctx context.Context, wt git.Workt
 			current = next
 			return nil
 		})
-		if err != nil {
-			return nil, err
-		}
+	})
+	if err != nil {
+		return nil, err
 	}
 	return versions, nil
 }

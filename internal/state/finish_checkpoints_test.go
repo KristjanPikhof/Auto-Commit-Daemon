@@ -71,6 +71,26 @@ func TestFinishSourceSelectionIsPartOfFrozenIdentity(t *testing.T) {
 	}
 }
 
+func TestFinishTargetAcceptsMoreThanOneBatchOfVersions(t *testing.T) {
+	db, _ := openTestDB(t)
+	const requestID = "multiple-batches"
+	var versions []FinishCheckpoint
+	for i := 1; i <= finishCheckpointBatchSize+1; i++ {
+		source := finishFixture(t, db, i).Target
+		versions = append(versions, FinishCheckpoint{
+			ID: source.CheckpointID, CommitOID: fmt.Sprintf("commit-%d", i), TreeOID: source.CheckpointTree,
+			Ref: fmt.Sprintf("refs/acd/finish/%s/%s/versions/%d", source.WorktreeID, requestID, i-1),
+		})
+	}
+	r := finishFixture(t, db, len(versions)+1)
+	r.ID = requestID
+	r.Target.Version, r.Target.Mode, r.Target.Checkpoints = FinishVersion, "intent", versions
+	startFinishFixture(t, db, r)
+	if saved, err := LoadFinishRequest(t.Context(), db, r.ID); err != nil || len(saved.Target.Checkpoints) != len(versions) {
+		t.Fatalf("loaded %d of %d versions: %v", len(saved.Target.Checkpoints), len(versions), err)
+	}
+}
+
 func TestFinishCheckpointsStayInsideCurrentProtectionWindow(t *testing.T) {
 	for _, boundary := range []string{"head", "branch", "restore", "migration", "legacy captures"} {
 		t.Run(boundary, func(t *testing.T) {
@@ -112,7 +132,11 @@ func TestFinishCheckpointsStayInsideCurrentProtectionWindow(t *testing.T) {
 			current := put(3, false)
 			target := put(4, false)
 			put(5, false) // A later save is outside this frozen request.
-			got, err := FinishCheckpoints(t.Context(), db, target)
+			var got []Checkpoint
+			err := WalkFinishCheckpoints(t.Context(), db, target, func(cp Checkpoint) error {
+				got = append(got, cp)
+				return nil
+			})
 			if err != nil || len(got) != 1 || got[0].ID != current.ID {
 				t.Fatalf("versions crossed the %s boundary: %+v %v", boundary, got, err)
 			}

@@ -67,8 +67,6 @@ type FinishCheckpoint struct {
 	TreeOID   string `json:"tree_oid"`
 }
 
-const FinishCheckpointLimit = 256
-
 // FinishRequest stores one attempt, not a background retry queue. Loading an ID
 // returns its latest attempt; older attempts retain their original evidence.
 type FinishRequest struct {
@@ -203,7 +201,7 @@ func finishTargetJSON(target *FinishTarget) (string, error) {
 	if target.TargetRef != "" && (!strings.HasPrefix(target.TargetRef, "refs/acd/") || target.TargetCommitOID == "") {
 		return "", ErrFinishIdentity
 	}
-	if len(target.Checkpoints) > FinishCheckpointLimit || (len(target.Checkpoints) > 0 && (target.Mode != "intent" || target.Message != "" || target.IncludeStaged)) {
+	if len(target.Checkpoints) > 0 && (target.Mode != "intent" || target.Message != "" || target.IncludeStaged) {
 		return "", ErrFinishIdentity
 	}
 	if target.SourceSelection && (target.Version < 3 || target.Mode != "intent" || target.Message != "" || len(target.Checkpoints) > 0) {
