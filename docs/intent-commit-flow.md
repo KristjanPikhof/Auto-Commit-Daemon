@@ -86,8 +86,11 @@ behavior just to produce a commit. Finish coherent, verified milestones while
 working so their versions remain available for later planning. An unchanged
 retry cannot supply missing versions or missing context.
 
-Supply completion context describing the problem, approach, and constraints.
-Intent requires approved redacted diffs for every recorded text change. Setup
+Completion context is optional for readable code changes. It may span paragraphs
+with the problem, decisions, constraints and rejected alternatives. Intent reads
+it alongside the code to infer useful purposes; it is not a required title,
+single-goal instruction or proof of verification. Intent requires approved
+redacted diffs for every recorded text change. Setup
 includes sharing in its approval review. Existing installations must approve it
 in `acd config`; upgrades and retries keep the original privacy settings.
 Completion context supplements the code and is required for binary-only work
@@ -153,9 +156,10 @@ belonging to one feature is not enough. Failed intermediate checks never publish
 a partial chain or silently combine commits. A source plan that still fails
 after the available correction ends the request.
 
-`--message` requests one complete batch with that exact valid message and disables
-automatic splitting. Use the quoted purpose for grouping context. In Intent
-mode an exact message still requires provider planning.
+Advanced `--message` requests one complete batch with that exact valid message
+and disables automatic splitting. Its body is optional. Use the quoted purpose
+for optional context so Intent can choose boundaries and write reasons. An exact
+message still requires provider planning in Intent mode.
 
 ## Verify every tree
 

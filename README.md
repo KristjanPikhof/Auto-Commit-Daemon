@@ -99,17 +99,20 @@ an editor or agent exits. A worker heartbeat shows liveness, not publication.
 
 ~~~bash
 acd finish
-acd finish --message "Update setup guidance"
-acd finish --dry-run "Add offline checkout"
+acd finish "Keep checkout available when the network is down"
+acd finish --dry-run
 acd finish --include-staged
 acd finish --retry REQUEST_ID
 ~~~
 
-For Intent, give context about what changed and why so ACD can explain useful
-steps within the task. Generated messages include a short reason or concrete
-impact. Intent requires approved redacted code diffs; binary-only changes also
-need completion context or an exact message.
-`--message` deliberately creates one batch and disables automatic splitting.
+The quoted text is optional completion context. It can span paragraphs with
+problems, decisions and constraints that help ACD understand the changes. Intent
+reads it alongside approved redacted diffs, chooses useful commit boundaries and
+writes messages explaining why. Without context, it infers purpose from the code.
+Binary-only changes need context or an exact message because their content is
+unavailable to the planner. Local creates one offline batch, includes any supplied
+context and otherwise uses an honest batch description. An empty target creates
+no commit.
 See the [Intent flow](docs/intent-commit-flow.md) for recorded versions and previews.
 
 Finish freezes a fresh complete checkpoint, the attached branch and HEAD, and
@@ -142,7 +145,7 @@ new workflows. The alias has no separate drain or publication engine.
 
 ## Messages, providers, and checks
 
-Local uses one honest batch summary, or your supplied purpose/message. Intent
+Local creates one offline batch with optional context. Intent
 plans goals before assigning paths. Implementation, callers, tests, generated
 output, and relevant docs stay together when they complete one goal. A split
 needs a useful review or revert boundary and a valid intermediate tree.
@@ -170,9 +173,10 @@ acd config --repo .
 | Imperative (default) | `Preserve staged content during finish` |
 | Conventional | `fix: preserve staged content` |
 
-Conventional messages use the scope-free `type: subject` form. `--message` supplies
-the complete message and must match the selected style. It does not bypass the
-provider in Intent mode.
+Conventional messages use the scope-free `type: subject` form. The advanced
+`--message` override supplies one exact commit message, disables splitting and
+must match the selected style. Its body is optional. It does not bypass the
+provider in Intent mode; AI-generated messages always require a reason.
 
 Every finish checks coverage, dependencies, Git structure, and exact target
 equality. The default `none` policy and `structural` skip project commands.

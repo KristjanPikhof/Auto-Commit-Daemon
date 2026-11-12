@@ -137,7 +137,7 @@ func TestFinishWorkerLocalFreezePreviewAndPublication(t *testing.T) {
 			if body := finishWorkerGit(t, f.dir, "show", r.Target.TargetTree+":goal.txt"); body != "frozen" {
 				t.Fatalf("target absorbed later bytes %q", body)
 			}
-			fresh := startFinishWorker(t, w, FinishOptions{DryRun: true})
+			fresh := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 			if fresh.Target.CheckpointID == r.Target.CheckpointID {
 				t.Fatal("new finish reused source checkpoint")
 			}
@@ -187,7 +187,7 @@ func TestFinishWorkerStagedOverlayAndExcludedBase(t *testing.T) {
 	if _, _, err := w.Start(context.Background(), FinishOptions{}); !errors.Is(err, git.ErrFinishStaged) {
 		t.Fatalf("default staged consent: %v", err)
 	}
-	r := startFinishWorker(t, w, FinishOptions{IncludeStaged: true})
+	r := startFinishWorker(t, w, FinishOptions{IncludeStaged: true, Purpose: "Preserve the approved staged version when later edits arrive"})
 	if r.Target.TargetTree == r.Target.CheckpointTree || r.Target.TargetRef == "" {
 		t.Fatal("overlay lacks distinct private target pin")
 	}
@@ -223,7 +223,7 @@ func TestFinishWorkerPreservesGitlinks(t *testing.T) {
 	finishWorkerGit(t, f.dir, "commit", "-m", "Seed tracked Gitlink")
 	finishWrite(t, f.dir, "vendor/sdk/later.txt", "nested work stays local\n")
 	finishWrite(t, f.dir, "goal.txt", "eligible change\n")
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 	if out := finishWorkerGit(t, f.dir, "ls-tree", r.Target.TargetTree, "--", "vendor/sdk"); !strings.Contains(out, "160000 commit "+linked) {
 		t.Fatalf("tracked Gitlink changed: %q", out)
 	}
@@ -383,7 +383,7 @@ func TestFinishWorkerCommandChecksAndRestart(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			f, w := finishWorkerFixture(t)
 			finishWrite(t, f.dir, "goal.txt", "approved\n")
-			r := startFinishWorker(t, w, FinishOptions{})
+			r := startFinishWorker(t, w, FinishOptions{Purpose: "Publish only the approved version after checking it"})
 			if scenario == "running_restart" {
 				recovery := &FinishWorker{RepoPath: f.dir, DB: f.db}
 				if _, err := recovery.RecoverPrepared(context.Background()); err != nil {
@@ -431,7 +431,7 @@ func TestFinishWorkerCommandChecksAndRestart(t *testing.T) {
 			}
 			w.Config.VerificationMode = "fast"
 			w.Config.Command = approved
-			r = startFinishWorker(t, w, FinishOptions{})
+			r = startFinishWorker(t, w, FinishOptions{Purpose: "Publish only the approved version after checking it"})
 			completed, err := w.Execute(context.Background(), r.ID)
 			if scenario == "failed" {
 				if err == nil || completed.State != state.FinishFailed {
@@ -477,7 +477,7 @@ func TestFinishWorkerExactProviderEvidence(t *testing.T) {
 	for path, body := range map[string]string{"*.txt": "wildcard file\n", "other.txt": "other file\n", ":(exclude)config.go": "exclude named file\n", "binary.dat": strings.Repeat("x", 9000) + "\x00tail", "unicode.txt": strings.Repeat("界", 4000)} {
 		finishWrite(t, f.dir, path, body)
 	}
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 	wt, _, _, err := w.resolved(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -526,7 +526,7 @@ func TestFinishWorkerRetainsRenameAtomicBoundary(t *testing.T) {
 	if err := os.Rename(filepath.Join(f.dir, "old.txt"), filepath.Join(f.dir, "new.txt")); err != nil {
 		t.Fatal(err)
 	}
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 	wt, _, _, _ := w.resolved(context.Background())
 	evidence, _, err := w.evidence(context.Background(), wt, r.Target)
 	if err != nil {
@@ -678,7 +678,7 @@ func TestFinishWorkerInputBudgetIsFrozen(t *testing.T) {
 	f, w := finishWorkerFixture(t)
 	finishWrite(t, f.dir, "goal.txt", "saved goal\n")
 	w.Config.Mode = "intent"
-	r := startFinishWorker(t, w, FinishOptions{DryRun: true})
+	r := startFinishWorker(t, w, FinishOptions{DryRun: true, Purpose: "Keep Gitlinks unchanged while checking eligible work"})
 	w.Config.Provider.MaxInputBytes = ai.FinishDefaultInputByteCap
 	if _, _, err := w.Start(t.Context(), FinishOptions{RetryID: r.ID, DryRun: true}); err != nil {
 		t.Fatalf("explicit default changed saved identity: %v", err)

@@ -23,7 +23,7 @@ func historyCLIPlan(t *testing.T, runtime *workerRuntime, lookup controlRepoLook
 	}
 	repo := runtime.worktree.Root
 	writeRewriteTestFile(t, repo, "history.txt", "recorded history\n")
-	for _, args := range [][]string{{"add", "history.txt"}, {"commit", "-qm", "Preserve recorded history"}} {
+	for _, args := range [][]string{{"add", "history.txt"}, {"commit", "-qm", "Preserve recorded history\n\n- Keep the authored boundary available for rollback."}} {
 		if _, err := git.Run(t.Context(), git.RunOpts{Dir: repo}, args...); err != nil {
 			t.Fatal(err)
 		}
@@ -221,13 +221,24 @@ func TestFinishHistoryRewriteCLISetupHoldBlocksMutationAndKeepsReads(t *testing.
 func TestFinishHistoryRewriteCLIMessageEditorKeepsMembershipWithoutAI(t *testing.T) {
 	lookup, runtime, _ := finishCLIFixture(t)
 	plan := historyCLIPlan(t, runtime, lookup, "")
+	plan.Goals[0].Message = "Preserve recorded history"
 	file := filepath.Join(t.TempDir(), "review.json")
 	raw, _ := json.Marshal(plan)
 	if err := os.WriteFile(file, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
 	editor := filepath.Join(t.TempDir(), "edit.sh")
-	if err := os.WriteFile(editor, []byte("#!/bin/sh\nsed 's/Preserve recorded history/Clarify recorded history/g' \"$1\" > \"$1.new\"\nmv \"$1.new\" \"$1\"\n"), 0700); err != nil {
+	script := `#!/bin/sh
+awk '{
+ if ($0 == "Preserve recorded history") {
+  print "Clarify recorded history"
+  print ""
+  print "- Keep the authored boundary available for rollback."
+ } else { print }
+}' "$1" > "$1.new"
+mv "$1.new" "$1"
+`
+	if err := os.WriteFile(editor, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("EDITOR", editor)
@@ -239,7 +250,7 @@ func TestFinishHistoryRewriteCLIMessageEditorKeepsMembershipWithoutAI(t *testing
 	if err := json.Unmarshal(out.Bytes(), &edited); err != nil {
 		t.Fatal(err)
 	}
-	if edited.ID == plan.ID || edited.Goals[0].Message != "Clarify recorded history" || edited.Goals[0].TreeOID != plan.Goals[0].TreeOID || edited.Goals[0].AuthorOID != plan.Goals[0].AuthorOID {
+	if edited.ID == plan.ID || edited.Goals[0].Message != "Clarify recorded history\n\n- Keep the authored boundary available for rollback." || edited.Goals[0].TreeOID != plan.Goals[0].TreeOID || edited.Goals[0].AuthorOID != plan.Goals[0].AuthorOID {
 		t.Fatalf("edited %+v", edited)
 	}
 	if err := daemon.ValidateIntentHistoryPlan(t.Context(), runtime.worktree.Root, edited); err != nil {

@@ -230,6 +230,26 @@ else printf '%s\\n' "$@" > "$FAKE_GO_ARGS"; fi
                     self.assertEqual(summary["exit_code"], 42)
                     self.assertGreaterEqual(summary["wall_seconds"], 0)
 
+    def test_gate_preserves_explicit_git_choice(self):
+        checkout = pathlib.Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as root:
+            git = pathlib.Path(root) / "git"
+            git.write_text('#!/bin/sh\nprintf "selected Git\\n"\n')
+            git.chmod(0o755)
+            go = pathlib.Path(root) / "go"
+            go.write_text('''#!/bin/sh
+if [ "$1" = list ]; then printf 'example/internal/ai\\n'; exit 0; fi
+git --version >> "$FAKE_GIT_RESULT"
+''')
+            go.chmod(0o755)
+            result = pathlib.Path(root) / "git-result"
+            env = dict(os.environ, PATH=root + os.pathsep + os.environ["PATH"],
+                       FAKE_GIT_RESULT=str(result), ACD_TEST_RESULTS_DIR=root + "/results")
+            run = subprocess.run(["bash", "scripts/dev/test.sh", "support", "ai"],
+                                 cwd=checkout, env=env, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(result.read_text(), "selected Git\n")
+
     def test_package_timeout_reports_stack_without_individual_failure(self):
         with tempfile.TemporaryDirectory() as root:
             source = pathlib.Path(root) / "events.jsonl"

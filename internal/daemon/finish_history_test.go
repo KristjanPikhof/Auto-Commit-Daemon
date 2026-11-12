@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,13 +58,19 @@ func TestFinishHistoryRewriteLocalPreservesEmptyNeutralAuthorsAndStyles(t *testi
 		t.Run(style, func(t *testing.T) {
 			f, w := finishWorkerFixture(t)
 			w.Config.Style = style
-			a := mustCommitPath(t, f.dir, "goal.txt", "a\n", "Add recorded goal")
+			message := func(subject, reason string) string {
+				if style == finish.StyleConventional {
+					subject = "chore: " + strings.ToLower(subject[:1]) + subject[1:]
+				}
+				return subject + "\n\n- " + reason
+			}
+			a := mustCommitPath(t, f.dir, "goal.txt", "a\n", message("Add recorded goal", "Keep the initial approved value available for rollback."))
 			finishWorkerGit(t, f.dir, "config", "user.name", "Second Author")
 			finishWorkerGit(t, f.dir, "config", "user.email", "second@example.com")
-			finishWorkerGit(t, f.dir, "commit", "--allow-empty", "-qm", "Preserve empty checkpoint")
+			finishWorkerGit(t, f.dir, "commit", "--allow-empty", "-qm", message("Preserve empty checkpoint", "Mark an authored boundary without changing the selected tree."))
 			empty := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
-			b := mustCommitPath(t, f.dir, "goal.txt", "b\n", "Refine recorded goal")
-			neutral := mustCommitPath(t, f.dir, "goal.txt", "a\n", "Restore recorded goal")
+			b := mustCommitPath(t, f.dir, "goal.txt", "b\n", message("Refine recorded goal", "Try the alternate value before deciding what to retain."))
+			neutral := mustCommitPath(t, f.dir, "goal.txt", "a\n", message("Restore recorded goal", "Keep the approved value after trying the alternative."))
 			plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{a, empty, b, neutral}, nil, nil, FinishHistoryOptions{Mode: "local", Style: style, VerificationConfigDigest: w.Config.ConfigDigest})
 			if err != nil {
 				t.Fatal(err)
@@ -172,7 +179,7 @@ func TestFinishHistoryRewriteVerificationFailureAndFrozenIndex(t *testing.T) {
 	for _, scenario := range []string{"verification_failure", "later_staging", "expired_deadline"} {
 		t.Run(scenario, func(t *testing.T) {
 			f, w := finishWorkerFixture(t)
-			a := mustCommitPath(t, f.dir, "goal.txt", "recorded\n", "Preserve recorded goal")
+			a := mustCommitPath(t, f.dir, "goal.txt", "recorded\n", "Preserve recorded goal\n\n- Keep the authored value available for rollback.")
 			if scenario == "verification_failure" {
 				w.Config.VerificationMode = "fast"
 				command, err := verification.NewApprovedCommand(f.dir, w.Config.ConfigDigest, verification.ModeFast, "exit 7", time.Second)

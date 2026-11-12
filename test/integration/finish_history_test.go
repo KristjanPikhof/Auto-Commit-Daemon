@@ -38,7 +38,11 @@ func TestFinishWorkflowHistorySavedPlanPreservesMembershipAndAuthors(t *testing.
 						writeFile(t, filepath.Join(f.Repo, "stored.go"), spec.body)
 						runGitOK(t, f.Repo, "add", "stored.go")
 					}
-					runGitOK(t, f.Repo, "-c", "user.name="+spec.author, "-c", "user.email="+strings.ReplaceAll(spec.author, " ", "")+"@example.test", "commit", "--allow-empty", "-qm", spec.message)
+					message := spec.message + "\n\n- Keep this authored choice available as a separate rollback boundary."
+					if style == finish.StyleConventional {
+						message = "chore: " + strings.ToLower(message[:1]) + message[1:]
+					}
+					runGitOK(t, f.Repo, "-c", "user.name="+spec.author, "-c", "user.email="+strings.ReplaceAll(spec.author, " ", "")+"@example.test", "commit", "--allow-empty", "-qm", message)
 					originals = append(originals, strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")))
 				}
 				f.Barrier(t, ctx)

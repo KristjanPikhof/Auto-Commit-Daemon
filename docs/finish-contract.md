@@ -23,9 +23,12 @@ pushes to a remote.
 | `acd history rewrite` | Preview or explicitly apply a saved history rewrite | Retain the selection, saved-plan, preview/apply, and source-history safety interfaces below. Never run it from protection or hooks. |
 | `acd commit-all` | Deprecated: use acd finish | Delegate to finish for the first finish-based release only. Retain no drain, fallback, retry loop, or second publication engine. Accept legacy `--yes` with its existing explicit staged-selection consent. |
 
-`PURPOSE` is one optional quoted argument describing the completed goal. It
-supplies context for messages and grouping. `--message` supplies the complete
-message; purpose can accompany it as explanation. Both become immutable when
+`PURPOSE` is optional completion context for messages and grouping. It may span
+paragraphs with problems, decisions and constraints. Intent reads it with the
+approved code evidence and infers purpose when it is absent; generated messages
+must explain why. Local includes supplied context or uses an offline batch
+description. Advanced `--message` supplies an exact message with an optional
+body; purpose may accompany it as context. Both become immutable when
 the target freezes. `--retry` may combine with `--dry-run`, `--repo`, `--json`,
 `--timeout`, and `--quiet`; it rejects new purpose, message, or staged consent. Unknown IDs,
 foreign-worktree IDs, and attempts to retry a successful publication are errors.

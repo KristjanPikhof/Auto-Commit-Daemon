@@ -837,6 +837,11 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 // provider exchanges release the operation gate while later work is protected.
 func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWorkerConfig, r state.FinishRequest, evidence finish.Evidence, baseTree string) (finishPlanningResult, error) {
 	result := finishPlanningResult{Evidence: evidence}
+	if r.Target.Message != "" {
+		if err := finish.ValidateMessage(cfg.Style, r.Target.Message); err != nil {
+			return result, err
+		}
+	}
 	if cfg.Mode == "local" {
 		plan, err := finish.Local(evidence, finish.LocalOptions{Style: cfg.Style, Purpose: r.Target.Purpose, Message: r.Target.Message})
 		result.Plan = plan

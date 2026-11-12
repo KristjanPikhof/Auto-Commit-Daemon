@@ -24,6 +24,11 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Keep finish context optional in Local and Intent. Accept longer handoffs with
+  decisions and constraints for the planner to examine alongside code changes.
+  Require reasons in AI-generated messages; preserve advanced exact overrides
+  and original Local history messages without requiring an explanatory body.
+  Keep exact overrides outside the main examples and clarify agent guidance.
 - Let new final-only Intent requests split existing text files by purpose using
   exact frozen lines when approved project checks are configured. Check every
   intermediate commit before publication and use the existing bounded correction
@@ -41,8 +46,7 @@
 - Require generated Intent messages to include the planner's specific decision
   reason in the published body. Separate distinct problems, keep cohesive
   features complete, and explain when recorded versions cannot support a useful
-  split instead of publishing a mixed batch. Keep older saved plans readable
-  and preserve Local and exact-message behavior.
+  split instead of publishing a mixed batch. Keep older saved plans readable.
 - Confirm unchanged paths referenced in approved diffs so Intent can recognize
   an existing resource without receiving unrelated names or unchanged content.
 - Retain named interfaces and consumers in evidence reviews so planning can

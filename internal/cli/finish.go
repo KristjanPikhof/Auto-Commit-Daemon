@@ -25,10 +25,12 @@ Local mode creates one commit. Intent mode uses the approved AI provider to
 group completed work into commits. Later edits stay saved for your next
 finish. ACD never pushes.
 
-Supply PURPOSE as context describing what changed and why. Intent uses it to
-explain decisions and choose useful steps. Intent requires approved redacted
-code diffs. Binary-only changes also need context. --message requests one batch
-with that exact message and disables automatic splitting, including in Intent.
+PURPOSE is optional context, not a commit message. It can span multiple lines
+describing the problem, decisions and constraints. Intent reads it alongside
+approved redacted code diffs to choose commits and explain why each is needed.
+Without context, Intent infers purpose from the changes. Binary-only changes
+need context because their content is unavailable to the planner. Local creates
+one offline batch and includes any supplied context.
 
 Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
@@ -36,9 +38,12 @@ save private snapshots, call AI in Intent mode, and run configured checks. Add
 ID to reconnect or retry the same saved request; it keeps its original
 changes, purpose, message, and staged selection. Validated evidence reviews
 are saved for explicit retries. --timeout 15m gives a new attempt more planning
-time; reconnecting never extends an accepted deadline.`,
-		Example: `  acd finish "Add offline checkout"
-  acd finish --message "Update setup guidance"
+time; reconnecting never extends an accepted deadline.
+
+Advanced: --message supplies an exact commit message for one complete batch.
+It disables automatic splitting, including in Intent.`,
+		Example: `  acd finish
+  acd finish "Keep checkout available when the network is down"
   acd finish --dry-run
   acd finish --include-staged
   acd finish --retry REQUEST_ID`,
@@ -48,6 +53,9 @@ time; reconnecting never extends an accepted deadline.`,
 			}
 			if params.RetryID != "" && (len(args) > 0 || cmd.Flags().Changed("message") || cmd.Flags().Changed("include-staged")) {
 				return invalidCommandError("acd finish: --retry cannot change purpose, message or staged consent")
+			}
+			if cmd.Flags().Changed("message") && params.Message == "" {
+				return invalidCommandError("acd finish: --message needs a nonempty commit message")
 			}
 			repo, _ := cmd.Flags().GetString("repo")
 			jsonOut, _ := cmd.Flags().GetBool("json")
@@ -63,7 +71,7 @@ time; reconnecting never extends an accepted deadline.`,
 	cmd.Flags().BoolVar(&params.DryRun, "dry-run", false, "Plan and check without moving the branch or index")
 	cmd.Flags().BoolVar(&params.IncludeStaged, "include-staged", false, "Include the exact current staged selection")
 	cmd.Flags().StringVar(&params.RetryID, "retry", "", "Retry or reconnect to a saved request")
-	cmd.Flags().StringVar(&params.Message, "message", "", "Create one batch commit with this exact message (disables splitting)")
+	cmd.Flags().StringVar(&params.Message, "message", "", "Advanced: create one batch commit with this exact message (disables splitting)")
 	cmd.Flags().DurationVar(&params.Timeout, "timeout", 0, "Intent planning budget for a new attempt, from 1s to 1h (default: ai.timeout)")
 	return cmd
 }
@@ -190,7 +198,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 		}
 	}
 	ok := r.State == state.FinishCompleted && !detached
-	retryable := (r.State == state.FinishFailed || detached) && r.ReasonCode != "provider_context_required" && r.ReasonCode != "provider_diffs_required" && r.ReasonCode != "provider_input_too_large"
+	retryable := (r.State == state.FinishFailed || detached) && !finishNeedsNewRequest(r.ReasonCode)
 	exit, failureCode := finishExit(r, waitCode)
 	next := ""
 	if !ok {
@@ -198,6 +206,9 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 			next = "acd doctor"
 		} else if r.ReasonCode == "provider_context_required" {
 			next = `acd finish "what changed and why"`
+			if r.Target.IncludeStaged {
+				next += " --include-staged"
+			}
 		} else if r.ReasonCode == "provider_input_too_large" {
 			next = "Review the reported input limit; use acd config for supported settings or explicit Local mode, then start a new finish"
 		} else if r.ReasonCode == "provider_diffs_required" {
@@ -335,7 +346,7 @@ func finishExit(r state.FinishRequest, waitCode string) (int, string) {
 	if r.State == state.FinishNeedsAttention {
 		return ExitActionRequired, "finish_needs_attention"
 	}
-	if r.ReasonCode == "provider_input_too_large" || r.ReasonCode == "provider_context_required" || r.ReasonCode == "provider_diffs_required" {
+	if finishNeedsNewRequest(r.ReasonCode) {
 		return ExitActionRequired, r.ReasonCode
 	}
 	return ExitActionRequired, "finish_failed"
@@ -359,4 +370,13 @@ func productWorktreeChangeCount(ctx context.Context, repo string) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+func finishNeedsNewRequest(code string) bool {
+	switch code {
+	case "provider_context_required", "provider_diffs_required", "provider_input_too_large":
+		return true
+	default:
+		return false
+	}
 }
