@@ -373,7 +373,7 @@ func TestFinishFaultVerificationFailureKeepsCompleteBatch(t *testing.T) {
 	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		writeFinishChatResponse(t, w, decodeFinishChatRequest(t, r))
-	}, "10s", map[string]string{config.FieldIntentVerification: "full", config.FieldVerificationFullCommand: command, config.FieldVerificationFullTimeout: "5s"}, ai.ConfirmationVerificationCommand)
+	}, "10s", map[string]string{config.FieldIntentVerification: "project", config.FieldVerificationCommand: command, config.FieldVerificationTimeout: "5s"}, ai.ConfirmationVerificationCommand)
 	writeFile(t, filepath.Join(f.Repo, "goal.txt"), "selected\n")
 	failed := finishRunJSON(t, f, "finish", "Complete checked goal", "--message", "Complete checked goal\n\n- Keep the approved work separate from later edits.")
 	if failed.OK || failed.Data.State != state.FinishFailed || calls.Load() != 1 || strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")) != f.BaseHead {

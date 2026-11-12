@@ -183,7 +183,7 @@ func runConfigGet(ctx context.Context, out io.Writer, repo string, options confi
 		values = append(values, configValue{Name: definition.Name, Value: value, Source: field.Source})
 	}
 	if key != "" && len(values) == 0 {
-		return invalidCommandError("acd config get: unknown field %q", key)
+		return invalidCommandError("%v", config.UnsupportedFieldError(key))
 	}
 	if jsonOut {
 		return renderJSONEnvelope(out, productEnvelope{OK: true, State: configProductState(target), Actions: []productAction{}, Data: map[string]any{"scope": target.Scope, "profile": target.Profile, "values": values}})
@@ -203,7 +203,10 @@ func runConfigSet(ctx context.Context, out io.Writer, repo string, options confi
 		return err
 	}
 	definition, ok := config.LookupField(key)
-	if !ok || !definition.Persistable || definition.Sensitive {
+	if !ok {
+		return invalidCommandError("%v", config.UnsupportedFieldError(key))
+	}
+	if !definition.Persistable || definition.Sensitive {
 		return invalidCommandError("Field %q cannot be saved; use `acd config credentials` for secrets.", key)
 	}
 	raw, err := normalizedConfigRaw(definition, value)
@@ -237,7 +240,7 @@ func runConfigReset(ctx context.Context, out io.Writer, repo string, options con
 	}
 	if key != "" {
 		if _, ok := config.LookupField(key); !ok {
-			return invalidCommandError("acd config reset: unknown field %q", key)
+			return invalidCommandError("%v", config.UnsupportedFieldError(key))
 		}
 	}
 	err = target.Store.UpdateExpected(target.Document.Generation, func(document *config.Document) error {
@@ -247,7 +250,7 @@ func runConfigReset(ctx context.Context, out io.Writer, repo string, options con
 				delete(overrides, name)
 			}
 		} else {
-			delete(overrides, key)
+			config.ResetOverride(overrides, key)
 		}
 		return saveConfigOverrides(document, target, overrides)
 	})

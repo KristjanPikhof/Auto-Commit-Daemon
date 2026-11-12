@@ -118,8 +118,8 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 		selection, err = runConfigureWizard(cmd.Context(), settingsui.ConfigureWizardOptions{
 			Input: cmd.InOrStdin(), Output: cmd.OutOrStdout(), Accessible: accessible,
 			Defaults: values, ExplicitMode: strings.TrimSpace(opts.Strategy) != "",
-			CredentialStatus: credentialStatus,
-			RepositoryScoped: false, HasCredential: hasCredential,
+			CredentialStatus:    credentialStatus,
+			HasCredential:       hasCredential,
 			CredentialFromStdin: opts.CredentialStdin,
 			ProviderConfigured:  strings.TrimSpace(opts.Provider) != "",
 			OpenAIConfigured:    strings.TrimSpace(opts.BaseURL) != "" && strings.TrimSpace(opts.Model) != "",
@@ -131,7 +131,9 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 		if credential != "" {
 			selection.Credential = credential
 		}
-		values = selectionDraft(selection)
+		for name, value := range selectionDraft(selection) {
+			values[name] = value
+		}
 	} else {
 		selection.Credential = credential
 	}
@@ -154,7 +156,7 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	}
 	values[config.FieldDiffEgress] = fmt.Sprint(selection.Strategy == "intent")
 	selection.DiffContextApproved = values[config.FieldDiffEgress] == "true"
-	confirmations := selectionConfirmations(selection)
+	confirmations := selectionProviderConfirmations(selection)
 	if nonInteractive && !dryRun {
 		if err := requireSetupConfirmations(opts, confirmations); err != nil {
 			return nil, err
@@ -184,7 +186,7 @@ func prepareSetupOnboarding(cmd *cobra.Command, roots paths.Roots, opts setupOnb
 	storeCredential := selection.Strategy == "intent" && selection.Provider == "openai-compat" && selection.Credential != "" && credentialSource != credentials.SourceEnvironment
 	return &setupOnboardingState{
 		Configuration: installer.SetupConfiguration{
-			Values: values, Fingerprint: validation.Fingerprint,
+			Values: validation.ResolvedHot, Fingerprint: validation.Fingerprint,
 			Confirmations: confirmations, SourceGeneration: validation.SourceGeneration,
 			CredentialSource: credentialSource, StoreCredential: storeCredential,
 			ProviderTestStatus: "optional_connection_test",

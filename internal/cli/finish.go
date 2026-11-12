@@ -32,9 +32,10 @@ Without context, Intent infers purpose from the changes. Binary-only changes
 need context because their content is unavailable to the planner. Local creates
 one offline batch and includes any supplied context.
 
-With approved fast/full project checks, Intent can split edits within a file
-when no intermediate versions are saved. Otherwise, it groups saved file
-versions. Configure checks for this repository with acd config --repo .
+With an approved project check, Intent can build and check intermediate
+versions from exact saved lines when checkpoints don't separate the edits.
+Without a project check, Intent groups whole saved file versions.
+Configure a project check with acd config --repo .
 
 Use --dry-run to plan and check without adding commits to your branch. It can
 save private snapshots, call AI in Intent mode, and run configured checks. Add
@@ -223,7 +224,7 @@ func renderFinish(out io.Writer, lookup controlRepoLookup, r state.FinishRequest
 				command += " --dry-run"
 			}
 			if !r.Target.SourceSelection && !r.Target.RecordedSourceSelection && (len(r.Target.Checkpoints) == 0 || r.Target.Version >= state.FinishRecordedSourceVersion) {
-				next = fmt.Sprintf("Run `acd config --repo %s` to approve fast/full project checks, then start a new request with `%s`", productListShellQuote(lookup.Worktree.Root), command)
+				next = fmt.Sprintf("Run `acd config --repo %s` to approve a project check, then start a new request with `%s`", productListShellQuote(lookup.Worktree.Root), command)
 			} else {
 				next = "Save smaller complete steps, then start a new request with `" + command + "`"
 			}

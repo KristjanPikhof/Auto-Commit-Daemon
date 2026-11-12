@@ -29,8 +29,8 @@ Renames and deletions stay complete final transitions. Requests with staged
 consent use only the frozen final selection, so earlier unstaged versions cannot
 enter their commits.
 
-When no useful earlier versions exist, a new Intent request with approved `fast`
-or `full` checks can split existing text files using exact lines from the frozen
+When no useful earlier versions exist, a new Intent request with an approved
+project check can split existing text files using exact lines from the frozen
 base and target. Each insertion or deletion belongs to one goal. ACD constructs
 the intermediate files locally; the provider cannot supply replacement code.
 Go and Swift scope information prevents identical lines in different functions
@@ -106,8 +106,8 @@ later UI goal may own that connection without taking the feature implementation.
 ACD does not require an invented version of the old interface.
 
 When a recorded version combines independent changes, Intent can name that
-version in its first reply. For new requests with approved `fast` or `full`
-checks, ACD can offer exact lines from before that change through the final
+version in its first reply. For new requests with an approved project
+check, ACD can offer exact lines from before that change through the final
 saved version of the file in the one correction call. This lets later fixes
 stay with the change they fix. ACD keeps the other recorded changes and the
 completed evidence reviews.
@@ -118,8 +118,8 @@ If the correction still cannot separate the changes safely, finish explains
 the problem and keeps the work protected. A new finish can use newly approved
 checks or checkpoints that capture smaller completed steps.
 
-Approve a repository command and select `fast` or `full` in `acd config` to
-let new requests construct and check intermediate versions. Earlier requests
+Enable and approve a project check in `acd config` to let new requests
+construct and check intermediate versions. Earlier requests
 keep their original planning rules and frozen evidence on retry.
 
 Completion context is optional for readable code changes. It may span paragraphs
@@ -226,11 +226,9 @@ and exact target equality.
 They always run, including under `intent.verification=none`.
 
 Structural verification does not compile code. To catch a consumer whose field
-or method appears only in a later commit, configure an approved project command
-under `fast` or `full`.
+or method appears only in a later commit, enable a project check.
 
-`fast` or `full` runs the approved configured project command for each candidate
-in isolation. Missing commands are reported as missing. Cached evidence is
+Finish runs the approved command in isolation for each candidate. Missing commands are reported as missing. Cached evidence is
 labelled reused and applies only to the identical tree, command, environment,
 and policy. ACD does not claim that an imagined or unexecuted test passed.
 

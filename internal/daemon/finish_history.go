@@ -410,7 +410,7 @@ func (w *FinishWorker) ExecuteFinishHistoryRequest(ctx context.Context, plan sta
 	}
 	proof, err := git.BuildFinishHistoryChain(verifyCtx, wt.Root, git.FinishHistoryBuildOptions{PlanID: plan.ID, WorktreeID: r.WorktreeID, SourceBranchRef: plan.SourceBranchRef, TargetBranchRef: plan.TargetBranchRef, ExpectedHead: plan.ExpectedHead, IndexDigest: index, SourceRef: plan.SourceRef, LockToken: plan.ID + "-" + strconv.Itoa(r.Attempt), SourceChain: plan.SourceChain, RecreateUnchanged: plan.RecreateUnchanged, Goals: goals, Verify: func(callCtx context.Context, oid, tree string, index int) error {
 		result, err := evaluatePublication(callCtx, func(jobCtx context.Context) (verification.Result, error) {
-			if cfg.VerificationMode == "fast" || cfg.VerificationMode == "full" {
+			if verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 				return w.Runner.Run(jobCtx, verification.Request{RepoPath: wt.Root, CandidateID: plan.ID + "-" + strconv.Itoa(index), CommitOID: oid, Command: cfg.Command})
 			}
 			return w.Runner.CheckStructural(jobCtx, verification.StructuralRequest{RepoPath: wt.Root, CandidateID: plan.ID + "-" + strconv.Itoa(index), CommitOID: oid})

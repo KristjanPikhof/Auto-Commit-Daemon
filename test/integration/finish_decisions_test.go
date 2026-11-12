@@ -42,7 +42,7 @@ func TestFinishWorkflowSameFileDecisions(t *testing.T) {
 		}
 		response, _ := json.Marshal(map[string]any{"goals": goals})
 		writeFinishChatArguments(t, w, string(response))
-	}, "30s", map[string]string{config.FieldDiffEgress: "true", config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "sh verify.sh", config.FieldVerificationFastTimeout: "5s"}, ai.ConfirmationDiffEgress, ai.ConfirmationVerificationCommand)
+	}, "30s", map[string]string{config.FieldDiffEgress: "true", config.FieldIntentVerification: "project", config.FieldVerificationCommand: "sh verify.sh", config.FieldVerificationTimeout: "5s"}, ai.ConfirmationDiffEgress, ai.ConfirmationVerificationCommand)
 	writeFile(t, filepath.Join(f.Repo, "auth.sh"), "authenticate() { printf password; }\n")
 	writeFile(t, filepath.Join(f.Repo, "verify.sh"), ". ./auth.sh\ntest \"$(authenticate local)\" = password\n")
 	runGitOK(t, f.Repo, "add", "auth.sh", "verify.sh")
@@ -228,7 +228,7 @@ func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 		}
 		response, _ := json.Marshal(map[string]any{"goals": goals})
 		writeFinishChatArguments(t, w, string(response))
-	}, "1m", map[string]string{config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "sh verify.sh", config.FieldVerificationFastTimeout: "5s"}, ai.ConfirmationVerificationCommand)
+	}, "1m", map[string]string{config.FieldIntentVerification: "project", config.FieldVerificationCommand: "sh verify.sh", config.FieldVerificationTimeout: "5s"}, ai.ConfirmationVerificationCommand)
 	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "selected() { printf none; }\n")
 	writeFile(t, filepath.Join(f.Repo, "verify.sh"), ". ./camera.sh\nvalue=$(selected) || exit 1\ntest \"$value\" = none || test \"$value\" = camera\n")
 	runGitOK(t, f.Repo, "add", "camera.sh", "verify.sh")
@@ -343,7 +343,7 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 		}
 		raw, _ := json.Marshal(map[string]any{"goals": goals, "file_ownership": ownership})
 		writeFinishChatArguments(t, w, string(raw))
-	}, "1m", map[string]string{config.FieldIntentVerification: "fast", config.FieldVerificationFastCommand: "sh verify.sh", config.FieldVerificationFastTimeout: "30s"}, ai.ConfirmationVerificationCommand)
+	}, "1m", map[string]string{config.FieldIntentVerification: "project", config.FieldVerificationCommand: "sh verify.sh", config.FieldVerificationTimeout: "30s"}, ai.ConfirmationVerificationCommand)
 	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "selected() { printf none; }\n")
 	writeFile(t, filepath.Join(f.Repo, "verify.sh"), ". ./camera.sh\nvalue=$(selected) || exit 1\ntest \"$value\" = none || test \"$value\" = camera\n")
 	runGitOK(t, f.Repo, "add", "camera.sh", "verify.sh")

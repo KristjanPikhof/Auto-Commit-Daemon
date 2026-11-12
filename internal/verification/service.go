@@ -119,9 +119,15 @@ type Mode string
 
 const (
 	ModeStructural Mode = "structural"
-	ModeFast       Mode = "fast"
-	ModeFull       Mode = "full"
+	ModeProject    Mode = "project"
+	// Old approved revisions retain these values in their frozen identities.
+	ModeFast Mode = "fast"
+	ModeFull Mode = "full"
 )
+
+func (m Mode) RunsProjectCheck() bool {
+	return m == ModeProject || m == ModeFast || m == ModeFull
+}
 
 type Status string
 
@@ -173,7 +179,7 @@ func NewApprovedCommand(
 	if err := boundedLabel("approval id", approvalID, maxApprovalIDBytes); err != nil {
 		return ApprovedCommand{}, err
 	}
-	if mode != ModeFast && mode != ModeFull {
+	if !mode.RunsProjectCheck() {
 		return ApprovedCommand{}, fmt.Errorf("verification approval: unsupported mode %q", mode)
 	}
 	if strings.TrimSpace(command) == "" {

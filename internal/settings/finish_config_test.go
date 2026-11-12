@@ -107,7 +107,7 @@ func TestFinishConfigLegacySnapshotIsReadonlyAndScoped(t *testing.T) {
 	if fieldByName(t, repo, config.FieldCommitStrategy).DraftValue != "intent" || fieldByName(t, global, config.FieldCommitStrategy).DraftValue != "local" || fieldByName(t, repo, config.FieldCommitFormat).DraftValue != "conventional" {
 		t.Fatalf("scope choices lost: repo=%+v global=%+v", repo, global)
 	}
-	if fieldByName(t, repo, config.FieldIntentVerification).DraftValue != "full" || fieldByName(t, repo, config.FieldDiffEgress).DraftValue != "true" || fieldByName(t, global, config.FieldIntentVerification).DraftValue != "none" {
+	if fieldByName(t, repo, config.FieldIntentVerification).DraftValue != "project" || fieldByName(t, repo, config.FieldDiffEgress).DraftValue != "true" || fieldByName(t, global, config.FieldIntentVerification).DraftValue != "none" {
 		t.Fatal("legacy scoped verification/privacy defaults lost")
 	}
 	for _, field := range repo.Fields {
@@ -151,7 +151,7 @@ func TestFinishConfigApplyApprovesCommandWithoutExecutingIt(t *testing.T) {
 			})
 			marker := filepath.Join(t.TempDir(), "project-check-ran")
 			command := "touch '" + marker + "'"
-			draft := map[string]string{config.FieldCommitStrategy: mode, config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "full", config.FieldVerificationFullCommand: command}
+			draft := map[string]string{config.FieldCommitStrategy: mode, config.FieldDiffEgress: "true", config.FieldProvider: "openai-compat", config.FieldIntentVerification: "project", config.FieldVerificationCommand: command}
 			svc.credentialLookup = func(string) (string, bool) { return "approved-key", true }
 			validation, err := svc.Validate(context.Background(), draft, []ai.ConfirmationRequirement{ai.ConfirmationDiffEgress})
 			if err != nil {

@@ -152,9 +152,9 @@ func (w *FinishWorker) resolved(ctx context.Context) (git.Worktree, FinishWorker
 		return wt, cfg, "", errors.New("finish: unsupported message style")
 	}
 	if cfg.VerificationMode == "" {
-		cfg.VerificationMode = "structural"
+		cfg.VerificationMode = "none"
 	}
-	if cfg.VerificationMode != "none" && cfg.VerificationMode != "structural" && cfg.VerificationMode != "fast" && cfg.VerificationMode != "full" {
+	if cfg.VerificationMode != "none" && cfg.VerificationMode != "structural" && !verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 		return wt, cfg, "", errors.New("finish: unsupported verification policy")
 	}
 	if cfg.VerificationTimeout <= 0 {
@@ -172,7 +172,7 @@ func (w *FinishWorker) resolved(ctx context.Context) (git.Worktree, FinishWorker
 	if cfg.ConfigDigest == "" {
 		return wt, cfg, "", errors.New("finish: approved configuration identity is required")
 	}
-	if cfg.VerificationMode == "fast" || cfg.VerificationMode == "full" {
+	if verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 		identity := cfg.Command.Identity()
 		if string(identity.Mode) != cfg.VerificationMode || identity.Digest == "" {
 			return wt, cfg, "", errors.New("finish: exact approved verification command is required")
@@ -336,7 +336,7 @@ func (w *FinishWorker) Start(ctx context.Context, options FinishOptions) (state.
 			return active, false, err
 		}
 	}
-	if cfg.Mode == "intent" && options.Message == "" && (cfg.VerificationMode == "fast" || cfg.VerificationMode == "full") {
+	if cfg.Mode == "intent" && options.Message == "" && verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 		frozen.SourceSelection = len(frozen.Checkpoints) == 0
 		frozen.RecordedSourceSelection = len(frozen.Checkpoints) > 0
 	}
@@ -806,7 +806,7 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 	}
 	verifyCtx, verifyCancel := context.WithDeadline(ctx, verificationDeadline)
 	defer verifyCancel()
-	if planned.Source != nil && cfg.VerificationMode != "fast" && cfg.VerificationMode != "full" {
+	if planned.Source != nil && !verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 		return saved, git.FinishPublicationProof{}, errors.New("constructed source versions require approved project checks")
 	}
 	for _, oid := range slices.Sorted(maps.Keys(planned.Blobs)) {
@@ -851,7 +851,7 @@ func (w *FinishWorker) prepare(ctx context.Context, wt git.Worktree, cfg FinishW
 		check := FinishCheck{TreeOID: tree, Policy: cfg.VerificationMode}
 		result, checkErr := evaluatePublication(checkCtx, func(jobCtx context.Context) (verification.Result, error) {
 			candidateID := r.ID + "-" + strconv.Itoa(r.Attempt) + "-" + strconv.Itoa(index)
-			if cfg.VerificationMode == "none" || cfg.VerificationMode == "structural" {
+			if !verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 				return w.Runner.CheckStructural(jobCtx, verification.StructuralRequest{RepoPath: wt.Root, CandidateID: candidateID, CommitOID: oid})
 			}
 			return w.Runner.Run(jobCtx, verification.Request{RepoPath: wt.Root, CandidateID: candidateID, CommitOID: oid, Command: cfg.Command})
@@ -923,7 +923,7 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	}
 	var sourceFiles []finish.SourceFile
 	if r.Target.SourceSelection {
-		if cfg.VerificationMode != "fast" && cfg.VerificationMode != "full" {
+		if !verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 			return result, errors.New("source selections require approved project checks")
 		}
 		prepared, prepareErr := evaluatePublication(ctx, func(jobCtx context.Context) (finishSourcePreparation, error) {
@@ -966,7 +966,7 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		options.VerifyPlan = verifyPlan
 	}
 	if r.Target.RecordedSourceSelection {
-		if cfg.VerificationMode != "fast" && cfg.VerificationMode != "full" {
+		if !verification.Mode(cfg.VerificationMode).RunsProjectCheck() {
 			return result, errors.New("recorded source selections require approved project checks")
 		}
 		options.RefineBoundary = func(refineCtx context.Context, reason string) (ai.FinishBoundaryRefinement, error) {

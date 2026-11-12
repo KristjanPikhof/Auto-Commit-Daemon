@@ -147,7 +147,7 @@ Each changed entry belongs to exactly one goal. Respect rename chains,
 create/delete order, hard dependencies, and generated relationships. Materialize
 recorded versions or exact frozen source selections; never accept provider-written
 replacement code. Source construction is limited to new final-only requests
-with approved `fast` or `full` project checks. Existing regular text files can
+with an approved project check. Existing regular text files can
 contribute exact insertions and deletions. New files, renames, binaries and mode
 changes stay whole. Persist the frozen witnesses, edit positions and selections
 with the checked plan; older requests keep their accepted version rules.
@@ -231,11 +231,10 @@ content sent to that provider. Local mode sends nothing. Status, list, doctor,
 and diagnose neither build providers nor migrate/write state. Logs, JSON,
 errors, and prompt traces must preserve credential redaction.
 
-Always verify structure and exact target equality. Preserve approved
-`intent.verification` policies (`none`, `structural`, `fast`, `full`) and their
-configured command/timeouts: `none` skips project commands, never the safety
-checks. Run approved commands in isolated candidate materializations, not the
-live worktree. Record each candidate tree, policy, command, environment
+Always verify structure and exact target equality. The `none` policy skips
+project commands. The `project` policy runs one approved command with its
+configured timeout in each isolated candidate worktree. Older approved revisions
+and frozen requests keep their verification identity. Record each candidate tree, policy, command, environment
 identity, result, duration, and output provenance. A cached result is reusable
 only for the identical tree, command, environment, and policy; label it reused
 and never claim it ran afresh. Report absent commands, structural-only checks,

@@ -6,6 +6,7 @@ import (
 
 	"errors"
 	"io"
+	"maps"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -111,6 +112,8 @@ func TestSetupDryRunIntentIncludesExactTransportConsents(t *testing.T) {
 }
 
 func TestSetupNonTTYUsesAccessibleWizard(t *testing.T) {
+	t.Setenv("ACD_INTENT_VERIFICATION", "project")
+	t.Setenv("ACD_VERIFICATION_COMMAND", "exit 42")
 	oldWizard := runConfigureWizard
 	oldInputTTY := settingsInputTTY
 	oldOutputTTY := settingsOutputTTY
@@ -138,14 +141,26 @@ func TestSetupNonTTYUsesAccessibleWizard(t *testing.T) {
 	cmd.SetIn(strings.NewReader(""))
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
-	_, err := prepareSetupOnboarding(cmd,
-		paths.Roots{Config: filepath.Join(t.TempDir(), "acd")},
-		setupOnboardingOptions{}, false, false)
+	roots := paths.Roots{Config: filepath.Join(t.TempDir(), "acd")}
+	interactive, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{}, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !accessible {
 		t.Fatal("non-terminal setup did not select the accessible wizard")
+	}
+	dryRun, err := prepareSetupOnboarding(cmd, roots, setupOnboardingOptions{}, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(interactive.Configuration.Values, dryRun.Configuration.Values) ||
+		interactive.Configuration.Fingerprint != dryRun.Configuration.Fingerprint {
+		t.Fatal("interactive and dry-run setup resolved different settings")
+	}
+	values := interactive.Configuration.Values
+	if values[config.FieldIntentVerification] != "none" || values[config.FieldVerificationCommand] != "" ||
+		values[config.FieldVerificationTimeout] != "2m0s" {
+		t.Fatalf("setup changed the default project check: %v", values)
 	}
 }
 

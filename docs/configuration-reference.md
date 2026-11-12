@@ -29,8 +29,6 @@ Run `acd config get` to inspect effective repository settings and environment ov
 | `intent.verification` | `ACD_INTENT_VERIFICATION` | `none` | next work boundary | yes | no |
 | `trace.enabled` | `ACD_TRACE` | `false` | restart required | yes | no |
 | `trace.prompt` | `ACD_AI_PROMPT_TRACE` | not shown | restart required | yes | yes |
-| `verification.fast.command` | `ACD_VERIFICATION_FAST_COMMAND` | none | next work boundary | yes | no |
-| `verification.fast.timeout` | `ACD_VERIFICATION_FAST_TIMEOUT` | `2m` | next work boundary | yes | no |
-| `verification.full.command` | `ACD_VERIFICATION_FULL_COMMAND` | none | next work boundary | yes | no |
-| `verification.full.timeout` | `ACD_VERIFICATION_FULL_TIMEOUT` | `10m` | next work boundary | yes | no |
+| `verification.command` | `ACD_VERIFICATION_COMMAND` | none | next work boundary | yes | no |
+| `verification.timeout` | `ACD_VERIFICATION_TIMEOUT` | `2m` | next work boundary | yes | no |
 | `watch.fsnotify` | `ACD_FSNOTIFY_ENABLED` | `true` | restart required | yes | no |

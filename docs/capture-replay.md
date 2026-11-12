@@ -88,12 +88,12 @@ a new ordinary finish freezes current work again.
 
 Every candidate must use recorded path versions or checked selections of exact
 frozen source bytes and produce a complete tree. Source construction requires
-approved `fast` or `full` checks; structural-only requests use recorded versions.
+an approved project check. Requests without a project check use recorded versions.
 ACD checks dependencies, rename groups, author boundaries, coverage, and exact
 final target equality. These structural checks always run.
 
-`none` and `structural` do not run project commands. `fast` and `full` use the
-approved configured command in an isolated candidate tree. Results distinguish
+`none` skips project commands. `project` runs the approved command in an
+isolated candidate tree. Results distinguish
 executed checks, reused results, missing commands, and structural-only evidence.
 A structural pass is not a claim that tests ran.
 
