@@ -110,8 +110,11 @@ func TestFinishWorkerReviewSizeRejectsUnexplainedLargePlan(t *testing.T) {
 	}}
 	r := startFinishWorker(t, w, FinishOptions{})
 	failed, err := w.Execute(t.Context(), r.ID)
-	if err == nil || failed.State != state.FinishFailed || failed.PlanningCalls != 2 || finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != r.Target.ExpectedHead {
+	if err == nil || failed.State != state.FinishFailed || failed.ReasonCode != "invalid_provider_plan" || !strings.Contains(err.Error(), "split review") || finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != r.Target.ExpectedHead {
 		t.Fatalf("unexplained oversized plan was accepted: %+v %v", failed, err)
+	}
+	if failed.PlanningCalls != 1 || failed.PartitionCalls != 2 {
+		t.Fatalf("rejection did not retain one global plan and one corrected focused review: %+v", failed)
 	}
 	ref := git.FinishRefPrefix + r.Target.WorktreeID + "/" + r.ID + "/1/chain"
 	if _, err := git.RevParse(t.Context(), f.dir, ref); !errors.Is(err, git.ErrRefNotFound) {
