@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Split hosted AI support tests into two shards per platform so setup and the
+  complete suite fit the existing five-minute job limit.
+- Run five hosted integration shards per platform so cold toolchain setup and
+  compilation fit the existing five-minute job limit without dropping tests.
+- Require Go 1.27.4 for source builds, CI, and releases to include the
+  standard-library security fixes that unblock vulnerability checks.
 - Measure each new generated Intent commit against a 200-line review target.
   Require smaller complete steps or a concrete explanation in the Git body
   when a larger change must stay together. Show measured sizes in previews and
