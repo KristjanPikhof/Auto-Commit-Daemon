@@ -1,46 +1,26 @@
-## Commits: ACD (Auto-Commit-Daemon)
+## When and how to use ACD for commits
 
-ACD protects changes in private checkpoints. `acd finish` creates branch commits.
+ACD (Auto-Commit-Daemon) continuously saves changes in private Git checkpoints.
+Its Intent mode uses AI to group completed work into commits and explain why
+each change was needed.
 
-- Check `acd status` once before editing. When active, use ACD instead of
-  `git add` or `git commit`. An error does not prove ACD is inactive. Use manual
-  commits only after confirming it is inactive and repository rules allow them.
-- When committing is authorized, run `acd finish [PURPOSE]` after the task and
-  relevant checks are complete, before handoff or a branch switch. Finish
-  complete, verified milestones separately during longer tasks.
-- PURPOSE is optional context for the committing AI, not a commit message.
-  Pass the problem, chosen approach, and constraints, including decisions and
-  rejected alternatives the diff cannot explain. A quoted argument may span
-  paragraphs and multiple completed changes. Name independent problems and
-  distinguish results from assumptions. Omit transcripts, secrets and customer
-  data.
-- Intent examines the code and supplied context, chooses useful boundaries and
-  writes messages explaining why. Let it keep coherent features complete and
-  separate unrelated fixes even in one file. If the evidence cannot support a
-  safe split, keep the work protected and report the missing evidence.
-- Local creates one offline batch with optional context; it does not infer
-  motivation. Use advanced `--message` only for a user-supplied exact message or
-  an explicitly requested single batch; it disables splitting. Review the actual
-  commit boundaries and reasons before claiming success.
-- Do not use an exact message to force a mixed batch after Intent refuses a
-  plan. Improve the evidence or report the limit; keep the work protected.
-- Review the whole diff first: finish includes all eligible pending changes in
-  the worktree. Preserve unrelated work and use an isolated worktree when needed.
-  Preserve user staging; use `--include-staged` only for an authorized selection.
-- Questions and reviews do not authorize commits. Honor requests to leave work
-  uncommitted and stricter repository instructions.
-- Enable new worktrees with `acd on --repo PATH` only when authorized. Do not
-  install, upgrade, restart, rewrite history, release, or push without permission.
-- Report whether work is protected, committed, or needs attention. Follow the
-  installed runtime's commands. Do not force `commit-all`, poll for commits,
-  retry finish automatically, or switch modes to bypass a provider failure.
-
-For example, pass decisions that would be lost when this chat ends:
-
-~~~bash
-acd finish "Settings reloads reset saved choices. Preserve authored values ahead
-of defaults so reopening settings keeps the selection.
-
-Keep the separate preview allocation fix independently reviewable. Reuse the
-existing Metal context because preview needs textures, not effect pipelines."
-~~~
+- At session start, run `acd status`. If ACD is active for the current Git
+  working directory, follow the rules below. Otherwise, use the normal repository
+  workflow. If status fails, resolve the uncertainty before committing.
+- Do not enable or reconfigure ACD unless asked. While active, use it instead of
+  `git add` and `git commit`.
+- When committing is allowed, run `acd finish` after each completed feature,
+  fix, or independently useful step has passed its relevant checks. Then continue
+  working. Checkpoints alone do not create branch commits.
+- Supply context as a quoted argument: `acd finish "Problem, reason for the change, and decisions the diff cannot explain"`.
+  ACD uses this context to choose commit boundaries and messages. Omit secrets
+  and customer data.
+- Review all pending changes first. Finish includes all changes allowed by
+  ACD's ignore and safety rules, excluding ignored files, sensitive paths,
+  generated caches, and submodule contents. It does not select only your task's
+  files.
+- Preserve unrelated work and user staging. Coordinate with other agents sharing
+  the working directory before finishing. Ordinary finish refuses staged changes;
+  do not include them without authorization.
+- Verify the result before reporting that work is committed. If finish fails,
+  report it. Do not bypass ACD with manual commits or retry automatically.

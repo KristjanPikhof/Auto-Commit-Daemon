@@ -34,7 +34,7 @@ The purpose is optional context, not a commit message. Describe the problem,
 approach, and constraints, plus decisions the diff cannot explain. A longer
 quoted argument can span paragraphs and multiple completed changes. Intent
 examines it with the code, chooses boundaries and writes reasons. Follow the
-longer example in [agent guidance](../agent-guidance.md). Review the actual commit
+[shared agent guidance](../agent-guidance.md). Review the actual commit
 boundaries and reasons before handoff. Keep prompt transcripts, secrets, and
 customer data out of the context. Hooks do not send or store prompt text.
 
