@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Split hosted AI support tests into two shards per platform so setup and the
+  complete suite fit the existing five-minute job limit.
+- Run five hosted integration shards per platform so cold toolchain setup and
+  compilation fit the existing five-minute job limit without dropping tests.
+- Require Go 1.27.4 for source builds, CI, and releases to include the
+  standard-library security fixes that unblock vulnerability checks.
 - Show checkpoint scan totals and retained versions during Intent finish.
   Distinguish evidence preparation, planning, commit checks, and publication,
   and explain when the Intent attempt runs out of time.
