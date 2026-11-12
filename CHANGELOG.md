@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Split hosted AI support tests into two shards per platform so setup and the
+  complete suite fit the existing five-minute job limit.
+- Run five hosted integration shards per platform so cold toolchain setup and
+  compilation fit the existing five-minute job limit without dropping tests.
+- Require Go 1.27.4 for source builds, CI, and releases to include the
+  standard-library security fixes that unblock vulnerability checks.
 - Preserve exact selectable code in global planning. Source requests up to
   128 KiB go directly to planning; larger inputs receive bounded reviews of
   mechanisms and prerequisites alongside the complete annotated source.
