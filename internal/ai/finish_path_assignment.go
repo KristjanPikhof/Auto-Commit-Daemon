@@ -127,15 +127,22 @@ func finishAssignmentRequest(request FinishPlanRequest, paths []string, catalogu
 	for _, path := range paths {
 		selected[path] = true
 	}
-	subset := FinishPlanRequest{
-		Purpose: request.Purpose, DiffIncluded: true,
-		AssignPaths: &finishPathAssignmentTask{Paths: paths, Goals: catalogue},
-	}
 	ids := make(map[string]bool)
 	for _, change := range request.Changes {
 		if selected[change.Path] {
-			subset.Changes = append(subset.Changes, change)
 			ids[change.ID] = true
+		}
+	}
+	subset := finishRequestForChanges(request, ids)
+	subset.AssignPaths = &finishPathAssignmentTask{Paths: paths, Goals: catalogue}
+	return subset
+}
+
+func finishRequestForChanges(request FinishPlanRequest, ids map[string]bool) FinishPlanRequest {
+	subset := FinishPlanRequest{Purpose: request.Purpose, DiffIncluded: true}
+	for _, change := range request.Changes {
+		if ids[change.ID] {
+			subset.Changes = append(subset.Changes, change)
 		}
 	}
 	for _, diff := range request.Diffs {

@@ -263,8 +263,10 @@ acd finish --retry REQUEST_ID
 
 Validated reviews are saved after each accepted batch. An explicit retry reuses
 them only when the frozen evidence, redacted fragments, provider configuration,
-and review instructions still match. It reviews only missing evidence, then
-creates a fresh global plan. Restart never starts that work automatically.
+and review instructions still match. If a whole-version plan passed structural
+checks and only lacked size explanations, the retry first asks for those
+explanations and checks the same trees again. Other retries create a fresh
+global plan. Restart never starts that work automatically.
 Reviews saved by older builds without this fingerprint cannot be reused.
 Valid completed reviews survive a parallel peer's failure. A successful retry
 preview also keeps its review evidence for a later publication attempt using

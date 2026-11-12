@@ -151,6 +151,55 @@ func TestFinishWorkerReviewSizeAllowsExplainedIndivisibleChange(t *testing.T) {
 	}
 }
 
+func TestFinishWorkerRetryExplainsAlreadyCheckedLargeSteps(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	w.Config.Mode, w.Config.Provider.DiffEgress = "intent", true
+	w.Config.Provider.Timeout = time.Minute
+	finishWrite(t, f.dir, "routes.txt", strings.Repeat("recorded route\n", 240))
+	finishWrite(t, f.dir, "errors.txt", "Describe failed lookups.\n")
+	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		return json.Marshal(map[string]any{"goals": finishSizeGoals(request, true)})
+	}}
+	r := startFinishWorker(t, w, FinishOptions{})
+	failed, err := w.Execute(t.Context(), r.ID)
+	if err == nil || failed.ReasonCode != "invalid_provider_plan" ||
+		finishWorkerGit(t, f.dir, "rev-parse", "HEAD") != r.Target.ExpectedHead {
+		t.Fatalf("unexplained plan was published: %s %v", failed.State, err)
+	}
+
+	const reason = "The complete route table is one recorded file version and clients need all supported routes together."
+	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		if len(request.ReviewSizes) != 1 || len(request.Changes) != 1 || request.Changes[0].Path != "routes.txt" {
+			t.Fatalf("retry did not scope the question to the oversized step: %+v", request.ReviewSizes)
+		}
+		size := request.ReviewSizes[0]
+		if size.Step != 1 || size.ChangedLines != 240 || size.ChangedFiles != 1 {
+			t.Fatalf("retry lost measured size: %+v", size)
+		}
+		return json.Marshal(map[string]any{"reasons": []map[string]any{{"step": size.Step, "reason": reason}}})
+	}}
+	retried := startFinishWorker(t, w, FinishOptions{RetryID: r.ID})
+	completed, err := w.Execute(t.Context(), retried.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 1 ||
+		finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}") != r.Target.TargetTree {
+		t.Fatalf("retry did not publish the exact checked plan: %s %v", completed.State, err)
+	}
+	var old, updated FinishSavedPlan
+	if json.Unmarshal(failed.Plan, &old) != nil || json.Unmarshal(completed.Plan, &updated) != nil ||
+		len(old.Steps) != 2 || len(updated.Steps) != 2 {
+		t.Fatal("retry lost the original commit boundaries")
+	}
+	for i, step := range updated.Steps {
+		if step.TreeOID != old.Steps[i].TreeOID || step.Check.Result.Status != verification.StatusPassed {
+			t.Fatalf("retry changed the tree or skipped checking step %d", i+1)
+		}
+	}
+	message := finishWorkerGit(t, f.dir, "log", "-1", "--format=%B", "HEAD^")
+	if !strings.Contains(strings.Join(strings.Fields(message), " "), reason) {
+		t.Fatal("published commit body is missing the measured size explanation")
+	}
+}
+
 func TestFinishWorkerReviewSizePreservesLegacyAndExactOverrides(t *testing.T) {
 	t.Parallel()
 	for _, kind := range []string{"legacy", "exact"} {

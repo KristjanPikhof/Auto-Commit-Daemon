@@ -968,6 +968,12 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	options.GroupIndivisibleVersions = r.Target.Version >= state.FinishRecordedGroupingVersion &&
 		r.Target.Message == "" && !r.Target.SourceSelection && !r.Target.RecordedSourceSelection
 	options.AllowPathOwnership = r.Target.Version >= state.FinishPathOwnershipVersion && options.GroupIndivisibleVersions
+	if options.AllowPathOwnership && r.Attempt > 1 {
+		options.RetrySizeReview, err = w.retrySizeReview(ctx, r, evidence)
+		if err != nil {
+			return result, err
+		}
+	}
 	if len(sourceFiles) > 0 || options.ReviewLineTarget > 0 {
 		options.VerifyPlan = verifyPlan
 	}

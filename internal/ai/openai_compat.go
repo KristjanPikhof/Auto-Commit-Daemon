@@ -74,6 +74,17 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 				}}}},
 		})
 	}
+	if len(request.ReviewSizes) > 0 {
+		return marshalFinishToolRequest(openAIToolRequestOptions{
+			Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
+			ToolName: "finish_review_sizes", ToolDescription: "Explain the necessary scope of larger proposed commits",
+			Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"reasons"},
+				"properties": map[string]any{"reasons": map[string]any{"type": "array", "items": map[string]any{
+					"type": "object", "additionalProperties": false, "required": []string{"step", "reason"},
+					"properties": map[string]any{"step": map[string]any{"type": "integer"}, "reason": map[string]any{"type": "string"}},
+				}}}},
+		})
+	}
 	goal := map[string]any{
 		"type": "object", "additionalProperties": false,
 		"required": []string{"purpose", "boundary", "reason", "message", "change_ids"},
