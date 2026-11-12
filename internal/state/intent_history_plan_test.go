@@ -35,3 +35,12 @@ func TestIntentHistoryPlanRemainsImmutableAcrossRestart(t *testing.T) {
 		t.Fatalf("read-only plan: %+v %v", loaded, err)
 	}
 }
+
+func TestOlderIntentHistoryPlanKeepsFrozenVersion(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		plan, err := PrepareIntentHistoryPlan(IntentHistoryPlan{Version: version})
+		if err != nil || plan.Version != version {
+			t.Fatalf("version %d changed to %d: %v", version, plan.Version, err)
+		}
+	}
+}

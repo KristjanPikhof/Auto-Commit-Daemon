@@ -9,10 +9,12 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/ai"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
@@ -51,6 +53,8 @@ type rewriteCommitsOptions struct {
 	progress     string
 	progressTo   io.Writer
 	quiet        bool
+	purpose      string
+	timeout      time.Duration
 	in           io.Reader
 }
 
@@ -59,7 +63,7 @@ func newRewriteCommitsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "rewrite-commits (--from-nr <n> | --from-sha <sha> | --range-nr <start-end> | --range-sha <base>..<head> | --last <n>) [--plan-out FILE] | --edit <plan-id-or-file>",
 		Aliases: []string{"edit-commits", "edit-commit"},
-		Short:   "Review and improve commit messages on this branch",
+		Short:   "Split and regroup selected commits on this branch",
 		Long: `Review and change selected commits on this branch.
 
 1. Select commits with --last, --from-sha, --from-nr, --range-sha or --range-nr.
@@ -109,6 +113,8 @@ for details.`,
 	cmd.Flags().StringVar(&opts.base, "base", "", "Deprecated alias for --git-range <base>..<head>: exclusive base revision")
 	cmd.Flags().StringVar(&opts.head, "head", "", "Deprecated alias for --git-range <base>..<head>: inclusive head revision (default HEAD when --base is set)")
 	cmd.Flags().StringVar(&opts.planOut, "plan-out", "", "Write the generated rewrite plan to FILE")
+	cmd.Flags().StringVar(&opts.purpose, "purpose", "", "Context for useful commit boundaries in a new plan")
+	cmd.Flags().DurationVar(&opts.timeout, "timeout", 0, "Planning or apply time budget, from 1s to 1h")
 	cmd.Flags().StringVar(&opts.showPlan, "show-plan", "", "Display a saved plan without creating a new AI request")
 	cmd.Flags().StringVar(&opts.editPlan, "edit", "", "Edit a saved plan by plan ID or file path")
 	cmd.Flags().StringVar(&opts.applyPlan, "apply-plan", "", "Apply a saved rewrite plan file; bypasses the plan-generation provider gate")
@@ -156,12 +162,12 @@ func runRewriteCommits(ctx context.Context, out io.Writer, repoFlag string, opts
 					return errors.New("acd history rewrite: --apply requires --yes or --dry-run")
 				}
 				if jsonOut {
-					if err := applyIntentHistoryPlan(ctx, io.Discard, repo, plan, opts.dryRun); err != nil {
+					if err := applyIntentHistoryPlan(ctx, io.Discard, repo, plan, opts.dryRun, opts.timeout); err != nil {
 						return err
 					}
 					return showIntentHistoryPlan(ctx, out, repo, plan, true, opts.dryRun)
 				}
-				return applyIntentHistoryPlan(ctx, out, repo, plan, opts.dryRun)
+				return applyIntentHistoryPlan(ctx, out, repo, plan, opts.dryRun, opts.timeout)
 			}
 		}
 		return applySavedRewritePlan(ctx, out, repoFlag, opts)
@@ -330,6 +336,12 @@ func normalizeRewritePlanCommitFormat(format string) string {
 }
 
 func normalizeAndValidateRewriteOptions(opts *rewriteCommitsOptions) error {
+	if err := daemon.ValidateFinishTimeout(opts.timeout); err != nil {
+		return err
+	}
+	if opts.purpose != "" && (opts.applyPlan != "" || opts.showPlan != "" || opts.editPlan != "") {
+		return errors.New("history rewrite: --purpose applies only to a new plan")
+	}
 	opts.fromSHA = strings.TrimSpace(opts.fromSHA)
 	opts.rangeNR = strings.TrimSpace(opts.rangeNR)
 	opts.rangeSHA = strings.TrimSpace(opts.rangeSHA)

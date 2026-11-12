@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -172,6 +173,78 @@ func TestFinishHistoryRewriteIntentInterleavedPurposeAndSavedProof(t *testing.T)
 	recovered, err = w.ExecuteFinishHistoryRequest(t.Context(), state.IntentHistoryPlan{}, recovered)
 	if err != nil || recovered.Status != "completed" {
 		t.Fatalf("recover %s %v", recovered.Status, err)
+	}
+}
+
+func TestFinishHistorySplitsLargeMixedCommit(t *testing.T) {
+	f, w := finishSizeFixture(t)
+	finishWorkerGit(t, f.dir, "add", "routes.txt", "errors.txt")
+	finishWorkerGit(t, f.dir, "commit", "-m", "Add combined protocol tables")
+	head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD")
+	finalTree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}")
+	w.Config.Mode, w.Config.Provider.DiffEgress = "intent", true
+	transport := &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		goals := finishSizeGoals(request, request.Partition != nil)
+		if request.Partition == nil {
+			goals[0].LargeChangeReason = "The complete protocol reference tables accompany the same client-facing interface change."
+			goals[0].Message += "\n- " + goals[0].LargeChangeReason
+		}
+		return json.Marshal(map[string]any{"goals": goals})
+	}}
+	plan, err := PlanFinishHistory(t.Context(), f.dir, f.cctx.BranchRef, []string{head}, nil, transport,
+		FinishHistoryOptions{Mode: "intent", Style: "imperative", DiffEgress: true, Deadline: time.Now().Add(time.Minute), VerificationConfigDigest: w.Config.ConfigDigest})
+	if err != nil || len(plan.Goals) != 2 || plan.Version != state.IntentHistoryPlanVersion {
+		t.Fatalf("history retained the mixed boundary: goals=%d err=%v", len(plan.Goals), err)
+	}
+	raw, err := json.Marshal(plan)
+	if err != nil || json.Unmarshal(raw, &plan) != nil || plan.SharedPlan.Base != nil || plan.SharedPlan.Steps[0].Tree != nil {
+		t.Fatal("saved history repeated full trees or lost its compact memberships", err)
+	}
+	withoutReview := plan
+	withoutReview.Version = 2
+	if err := ValidateIntentHistoryPlan(t.Context(), f.dir, withoutReview); err == nil {
+		t.Fatal("compact plan was accepted under older full-tree rules")
+	}
+	evidence, _, _, err := finishHistoryEvidence(t.Context(), f.dir, []string{head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var goals []finish.Goal
+	for _, step := range plan.SharedPlan.Steps {
+		goals = append(goals, step.Goal)
+	}
+	full, err := finish.Build(evidence, goals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := plan
+	legacy.Version, legacy.SharedPlan = 2, &full
+	if err := ValidateIntentHistoryPlan(t.Context(), f.dir, legacy); err != nil {
+		t.Fatal("older full-tree history plan lost compatibility", err)
+	}
+	request := historyStartTest(t, w, plan, false)
+	completed, err := w.ExecuteFinishHistoryRequest(t.Context(), plan, request)
+	if err != nil || completed.Status != "completed" {
+		t.Fatalf("history publication failed: %s %v", completed.Status, err)
+	}
+	if tree := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); tree != finalTree {
+		t.Fatal("history split changed final files")
+	}
+}
+
+func TestFinishHistoryCompactPlanFitsWorkerMessage(t *testing.T) {
+	// Repeated full repository trees must not limit useful commit boundaries.
+	large := finish.Tree{}
+	for i := 0; i < 5000; i++ {
+		large[strconv.Itoa(i)+strings.Repeat("a", 100)] = finish.Entry{Mode: "100644", OID: strings.Repeat("a", 40)}
+	}
+	plan := finish.Plan{Base: large, Target: large}
+	for i := 0; i < 20; i++ {
+		plan.Steps = append(plan.Steps, finish.Step{Tree: large, Goal: finish.Goal{Purpose: "Complete one independent change", ChangeIDs: []string{strconv.Itoa(i)}}})
+	}
+	raw, err := json.Marshal(compactFinishHistoryPlan(plan))
+	if err != nil || len(raw) >= 1<<20 || len(compactFinishHistoryPlan(plan).Steps) != len(plan.Steps) {
+		t.Fatalf("compact plan cannot cross worker RPC: bytes=%d err=%v", len(raw), err)
 	}
 }
 

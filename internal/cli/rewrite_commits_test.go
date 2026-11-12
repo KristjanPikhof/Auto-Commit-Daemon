@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -105,6 +106,7 @@ func TestRewriteCommitsParserFlags(t *testing.T) {
 	_ = opts
 
 	for _, args := range [][]string{
+		{"--last", "14", "--purpose", "Separate request retries from prompt rendering", "--timeout", "30m", "--plan-only"},
 		{"--from-sha", "8f4c2a1", "--plan-only"},
 		{"--from-nr", "5", "--plan-only"},
 		{"--range-nr", "5-12", "--plan-only"},
@@ -116,6 +118,10 @@ func TestRewriteCommitsParserFlags(t *testing.T) {
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("execute parser flags %v: %v", args, err)
 		}
+	}
+
+	if err := normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, timeout: 2 * time.Hour}); err == nil {
+		t.Fatal("rewrite accepted a timeout beyond the supported budget")
 	}
 
 	err := normalizeAndValidateRewriteOptions(&rewriteCommitsOptions{selection: git.RewriteSelectionOptions{Last: 1}, review: true, noReview: true, editFormat: "text"})

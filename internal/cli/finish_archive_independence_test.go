@@ -176,7 +176,7 @@ func TestFinishHistoryCurrentGitRangeIgnoresMissingLegacyArchive(t *testing.T) {
 	}
 	for _, dryRun := range []bool{true, false} {
 		out.Reset()
-		if err := applyIntentHistoryPlan(t.Context(), &out, repo, plan, dryRun); err != nil {
+		if err := applyIntentHistoryPlan(t.Context(), &out, repo, plan, dryRun, 0); err != nil {
 			t.Fatal(err)
 		}
 		r, ok, err := state.LoadFinishHistoryRequest(t.Context(), runtime.db, plan.ID)
