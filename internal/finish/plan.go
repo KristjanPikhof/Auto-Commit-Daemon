@@ -39,8 +39,11 @@ type Evidence struct {
 // Goal explains one complete step before assigning its recorded changes.
 // Boundary explains why a split is useful to review or revert.
 type Goal struct {
-	Purpose   string   `json:"purpose"`
-	Boundary  string   `json:"boundary,omitempty"`
+	Purpose  string `json:"purpose"`
+	Boundary string `json:"boundary,omitempty"`
+	// Reason is the evidenced decision explanation also present in Message.
+	// Older saved plans and offline batches may not have this field.
+	Reason    string   `json:"reason,omitempty"`
 	Message   string   `json:"message"`
 	ChangeIDs []string `json:"change_ids"`
 }

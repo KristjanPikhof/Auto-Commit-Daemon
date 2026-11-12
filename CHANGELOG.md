@@ -22,6 +22,20 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Wrap generated Intent message bodies without changing their wording, so long
+  lines do not consume a provider correction. Keep exact user messages unchanged
+  and continue to reject invalid structure and overlong subjects.
+- Require generated Intent messages to include the planner's specific decision
+  reason in the published body. Separate distinct problems, keep cohesive
+  features complete, and explain when recorded versions cannot support a useful
+  split instead of publishing a mixed batch. Keep older saved plans readable
+  and preserve Local and exact-message behavior.
+- Confirm unchanged paths referenced in approved diffs so Intent can recognize
+  an existing resource without receiving unrelated names or unchanged content.
+- Retain named interfaces and consumers in evidence reviews so planning can
+  keep definitions before their callers. Cover a real undefined-field split
+  with compiler checks before branch publication.
+
 - Refresh integration-test timings from complete Ubuntu and macOS CI runs so
   the four shards share the current workload and leave room for runner setup
   and cleanup within the five-minute job limit.

@@ -65,10 +65,11 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 	}
 	goal := map[string]any{
 		"type": "object", "additionalProperties": false,
-		"required": []string{"purpose", "boundary", "message", "change_ids"},
+		"required": []string{"purpose", "boundary", "reason", "message", "change_ids"},
 		"properties": map[string]any{
 			"purpose":    map[string]any{"type": "string"},
 			"boundary":   map[string]any{"type": "string"},
+			"reason":     map[string]any{"type": "string", "description": "Specific problem or constraint and why this mechanism addresses it. Include this explanation verbatim in the message body."},
 			"message":    map[string]any{"type": "string"},
 			"change_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		},
@@ -76,8 +77,8 @@ func (p *OpenAIProvider) EncodeFinishRequest(request FinishPlanRequest) ([]byte,
 	return marshalOpenAIToolRequest(openAIToolRequestOptions{
 		Model: p.resolvedModel(), SystemPrompt: finishPrompt(request), UserPrompt: string(data),
 		ToolName: "finish_plan", ToolDescription: "Plan completed purposes, safe recorded changes, and grounded messages",
-		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"goals"},
-			"properties": map[string]any{"goals": map[string]any{"type": "array", "items": goal}}},
+		Parameters: map[string]any{"type": "object", "additionalProperties": false, "required": []string{"goals", "blocked_reason"},
+			"properties": map[string]any{"goals": map[string]any{"type": "array", "items": goal}, "blocked_reason": map[string]any{"type": "string"}}},
 	})
 }
 

@@ -23,8 +23,8 @@ func TestFinishWorkflowSameFileDecisions(t *testing.T) {
 		calls.Add(1)
 		request := decodeFinishChatRequest(t, r).Plan
 		goals := []finish.Goal{
-			{Purpose: "Prepare password authentication for another provider", Boundary: "Review the behavior-preserving dispatch preparation", Message: "Extract password authentication\n\n- Prepare dispatch while preserving existing password behavior."},
-			{Purpose: "Add Google authentication and its regression coverage", Boundary: "Review Google behavior separately from the refactor", Message: "Add Google authentication\n\n- Route Google requests without changing password authentication."},
+			{Purpose: "Prepare password authentication for another provider", Boundary: "Review the behavior-preserving dispatch preparation", Reason: "Prepare dispatch while preserving existing password behavior.", Message: "Extract password authentication\n\n- Prepare dispatch while preserving existing password behavior."},
+			{Purpose: "Add Google authentication and its regression coverage", Boundary: "Review Google behavior separately from the refactor", Reason: "Route Google requests without changing password authentication.", Message: "Add Google authentication\n\n- Route Google requests without changing password authentication."},
 		}
 		for _, change := range request.Changes {
 			group := 1
@@ -74,6 +74,36 @@ func TestFinishWorkflowSameFileDecisions(t *testing.T) {
 	}
 	f.Barrier(t, t.Context())
 	assertFinishWorkflowStatus(t, t.Context(), f, true)
+}
+
+func TestFinishWorkflowRejectsUnexplainedDecision(t *testing.T) {
+	var calls atomic.Int32
+	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		request := decodeFinishChatRequest(t, r).Plan
+		var ids []string
+		for _, change := range request.Changes {
+			ids = append(ids, change.ID)
+		}
+		// A plausible title and edit list used to pass without a reason.
+		arguments, err := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: "Preserve verified credentials", Boundary: "The observer and its regression complete one fix", Message: "Preserve verified credentials\n\n- Update the key observer and its regression.", ChangeIDs: ids}}})
+		if err != nil {
+			t.Error(err)
+		}
+		writeFinishChatArguments(t, w, string(arguments))
+	}, "30s", map[string]string{config.FieldDiffEgress: "true"}, ai.ConfirmationDiffEgress)
+	writeFile(t, filepath.Join(f.Repo, "settings.swift"), "if key != oldValue { invalidateConnection() }\n")
+	result := f.Run(t, t.Context(), "finish", "Keep the connection when focus writes the unchanged key")
+	if result.ExitCode == 0 || !strings.Contains(result.Stdout+result.Stderr, "reason") || calls.Load() != 2 {
+		t.Fatalf("unexplained decision was not corrected then refused: %+v calls=%d", result, calls.Load())
+	}
+	if head := strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD")); head != f.BaseHead {
+		t.Fatal("unexplained decision moved the branch")
+	}
+	f.Barrier(t, t.Context())
+	if status := runGitOK(t, f.Repo, "status", "--short"); !strings.Contains(status, "settings.swift") {
+		t.Fatalf("rejected decision lost live work: %s", status)
+	}
 }
 
 func TestFinishWorkflowSharesCodeInEveryPlanningExchange(t *testing.T) {

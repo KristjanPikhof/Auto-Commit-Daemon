@@ -75,7 +75,7 @@ func writeFinishChatResponse(t *testing.T, w http.ResponseWriter, r finishChatRe
 	if r.Plan.Message == "" {
 		message += "\n\n- Keep the completed request separate from later edits."
 	}
-	arguments, err := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: r.Plan.Purpose, Boundary: "Keep the supplied complete request together", Message: message, ChangeIDs: ids}}})
+	arguments, err := json.Marshal(map[string]any{"goals": []finish.Goal{{Purpose: r.Plan.Purpose, Boundary: "Keep the supplied complete request together", Reason: "Keep the completed request separate from later edits.", Message: message, ChangeIDs: ids}}})
 	if err != nil {
 		t.Error(err)
 		return

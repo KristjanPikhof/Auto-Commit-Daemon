@@ -56,7 +56,7 @@ func TestFinishWorkflowHistorySavedPlanPreservesMembershipAndAuthors(t *testing.
 					if style == finish.StyleConventional {
 						message = "chore: " + message
 					}
-					goals = append(goals, finish.Goal{Purpose: "Preserve each recorded history boundary", Boundary: "Keep the original recorded membership", Message: message, ChangeIDs: []string{oid}})
+					goals = append(goals, finish.Goal{Purpose: "Preserve each recorded history boundary", Boundary: "Keep the original recorded membership", Reason: strings.TrimPrefix(strings.SplitN(message, "\n\n", 2)[1], "- "), Message: message, ChangeIDs: []string{oid}})
 				}
 				response, _ := json.Marshal(map[string]any{"version": 1, "finish_plan": map[string]any{"goals": goals}})
 				script := fmt.Sprintf("#!/bin/sh\nwhile IFS= read -r line; do printf 'call\\n' >> '%s'; printf '%%s\\n' '%s'; done\n", calls, response)
@@ -141,7 +141,7 @@ func TestFinishWorkflowHistoryPurposefulGoalsAndStaleRefusal(t *testing.T) {
 		runGitOK(t, f.Repo, "commit", "-qm", "Record protection changes")
 	}
 	f.Barrier(t, ctx)
-	response := `{"version":1,"finish_plan":{"goals":[{"purpose":"Require retained protection","boundary":"Protection behavior and its direct regression complete one change","message":"Require retained protection\n\n- Keep protection behavior and its direct test together","change_ids":["1","2"]}]}}`
+	response := `{"version":1,"finish_plan":{"goals":[{"purpose":"Require retained protection","reason":"Keep protection behavior and its direct test together","boundary":"Protection behavior and its direct regression complete one change","message":"Require retained protection\n\n- Keep protection behavior and its direct test together","change_ids":["1","2"]}]}}`
 	if err := os.WriteFile(filepath.Join(pluginDir, "acd-provider-purpose"), []byte("#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' '"+response+"'; done\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}

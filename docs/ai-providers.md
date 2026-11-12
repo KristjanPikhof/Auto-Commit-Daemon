@@ -72,6 +72,14 @@ checkpoint storage:
 | Each encoded evidence review or its correction | 512 KiB, or the smaller configured budget |
 | Global plan or its correction | 2 MiB, or the smaller configured budget |
 
+`referenced_unchanged_paths` confirms which exact path tokens in approved
+redacted diffs already exist unchanged in the base and target. For example, an
+audio feature can reference an MP3 that was added earlier. The planner needs
+to distinguish that existing resource from a missing change. This metadata
+adds no unchanged content, object identities, or unreferenced file names and
+requires no extra repository scan. It is conservative: unlisted dependencies
+are not necessarily missing.
+
 There is no separate per-file rejection limit. Large files and batches are
 reviewed in bounded fragments before one global plan. Every complete redacted
 text diff reaches the provider across those fragments. Their factual summaries
@@ -121,6 +129,19 @@ are not planning alternatives. Cancellation and Close terminate the owned
 process group and join its readers within bounded cleanup.
 
 ## Failure behavior
+
+Planning replies contain `goals` and `blocked_reason` (empty on success). Each
+generated goal includes `purpose`, `boundary`, `reason`, `message`, and
+`change_ids`. Its reason explains the problem or constraint and the chosen
+mechanism; the same wording must appear in the message body, allowing wrapping
+and bullet formatting. A missing reason or one left only in metadata needs
+correction. Exact user messages retain their existing single-batch contract.
+
+If the supplied versions cannot separate independent purposes, return no goals
+and explain the missing evidence in `blocked_reason`. That explanation ends the
+request if the bounded correction cannot resolve it. It never authorizes a
+mixed batch or fabricated intermediate content. Earlier saved plans remain
+readable without the new reason field.
 
 HTTP failures retain the provider's standard `error.message`, with credential
 redaction and bounded output. Nonstandard or unreadable responses report the
