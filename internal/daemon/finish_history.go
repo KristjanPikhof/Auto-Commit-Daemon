@@ -127,7 +127,7 @@ func PlanFinishHistory(ctx context.Context, repo, branch string, chain, suffix [
 		return plan, err
 	}
 	full := append(slices.Clone(chain), suffix...)
-	if _, err := git.ReadIntentHistoryUnits(ctx, repo, full); err != nil {
+	if err := git.ValidateIntentHistoryChain(ctx, repo, chain, suffix); err != nil {
 		return plan, err
 	}
 	plan, err = state.PrepareIntentHistoryPlan(state.IntentHistoryPlan{SourceBranchRef: branch, TargetBranchRef: branch, ExpectedHead: full[len(full)-1], BaseTree: base, SourceChain: slices.Clone(chain), RecreateUnchanged: slices.Clone(suffix), CommitFormat: options.Style, Mode: options.Mode, MessagesOnly: options.MessagesOnly, VerificationConfigDigest: options.VerificationConfigDigest, PlanningDeadlineTS: finishTimestamp(options.Deadline)})
@@ -296,7 +296,7 @@ func ValidateIntentHistoryPlan(ctx context.Context, repo string, plan state.Inte
 		return errors.New("history rewrite: recorded provenance differs from saved plan")
 	}
 	full := append(slices.Clone(plan.SourceChain), plan.RecreateUnchanged...)
-	if _, err := git.ReadIntentHistoryUnits(ctx, repo, full); err != nil {
+	if err := git.ValidateIntentHistoryChain(ctx, repo, plan.SourceChain, plan.RecreateUnchanged); err != nil {
 		return err
 	}
 	if full[len(full)-1] != plan.ExpectedHead {

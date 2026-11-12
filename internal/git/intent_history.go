@@ -157,6 +157,38 @@ func ReadIntentHistoryUnits(ctx context.Context, repoDir string, chain []string)
 	return units, nil
 }
 
+// ValidateIntentHistoryChain keeps selected commits linear. Newer merges can
+// be replayed unchanged when their other parents do not retain selected work.
+func ValidateIntentHistoryChain(ctx context.Context, repo string, selected, suffix []string) error {
+	if _, err := ReadIntentHistoryUnits(ctx, repo, selected); err != nil {
+		return err
+	}
+	if len(selected)+len(suffix) > MaxIntentHistoryCommits {
+		return errors.New("git intent history: source chain limit exceeded")
+	}
+	previous := selected[len(selected)-1]
+	for _, oid := range suffix {
+		parents, err := parentsOf(ctx, repo, oid)
+		if err != nil {
+			return err
+		}
+		if len(parents) == 0 || parents[0] != previous {
+			return errors.New("git intent history: recreated suffix must follow the selected first-parent chain")
+		}
+		for _, parent := range parents[1:] {
+			retains, err := IsAncestor(ctx, repo, selected[0], parent)
+			if err != nil {
+				return err
+			}
+			if retains {
+				return errors.New("git intent history: merge side parent retains selected commits; rewriting this graph is not supported")
+			}
+		}
+		previous = oid
+	}
+	return nil
+}
+
 func intentHistoryEntry(path, mode, oid string) TreeEntry {
 	typeName := "blob"
 	if mode == "160000" {

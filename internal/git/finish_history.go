@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
@@ -47,7 +48,7 @@ func BuildFinishHistoryChain(ctx context.Context, repo string, options FinishHis
 	if chain[len(chain)-1] != options.ExpectedHead {
 		return p, ErrFinishUnsafe
 	}
-	if _, err := ReadIntentHistoryUnits(ctx, repo, chain); err != nil {
+	if err := ValidateIntentHistoryChain(ctx, repo, options.SourceChain, options.RecreateUnchanged); err != nil {
 		return p, err
 	}
 	base, err := firstParent(ctx, repo, chain[0])
@@ -85,6 +86,18 @@ func BuildFinishHistoryChain(ctx context.Context, repo string, options FinishHis
 		args := []string{"commit-tree", goal.TreeOID, "-F", "-"}
 		if parent != "" {
 			args = append(args, "-p", parent)
+		}
+		if index >= len(options.Goals) {
+			parents, err := parentsOf(ctx, repo, goal.AuthorOID)
+			if err != nil {
+				return p, err
+			}
+			if len(parents) > 1 {
+				p.Version = 2
+			}
+			for _, other := range parents[1:] {
+				args = append(args, "-p", other)
+			}
 		}
 		out, err := runDurableWithEnv(ctx, repo, strings.NewReader(goal.Message), author, "loose-object", args...)
 		if err != nil {
@@ -128,7 +141,7 @@ func BuildFinishHistoryChain(ctx context.Context, repo string, options FinishHis
 }
 
 func ValidateFinishHistoryProof(ctx context.Context, repo string, p state.FinishHistoryProof) error {
-	if p.Version != 1 || p.PlanID == "" || p.NewHead == "" || p.LockToken == "" || !isFullBranchRef(p.SourceBranchRef) || !isFullBranchRef(p.TargetBranchRef) || !strings.HasPrefix(p.SourceRef, FinishRefPrefix) || !strings.HasPrefix(p.ObjectRef, FinishRefPrefix) || p.BackupRef != "refs/acd/rewrite-backups/"+p.PlanID {
+	if (p.Version != 1 && p.Version != 2) || p.PlanID == "" || p.NewHead == "" || p.LockToken == "" || !isFullBranchRef(p.SourceBranchRef) || !isFullBranchRef(p.TargetBranchRef) || !strings.HasPrefix(p.SourceRef, FinishRefPrefix) || !strings.HasPrefix(p.ObjectRef, FinishRefPrefix) || p.BackupRef != "refs/acd/rewrite-backups/"+p.PlanID {
 		return ErrFinishUnsafe
 	}
 	for ref, expected := range map[string]string{p.SourceRef: p.ExpectedHead, p.ObjectRef: p.NewHead} {
@@ -145,7 +158,7 @@ func ValidateFinishHistoryProof(ctx context.Context, repo string, p state.Finish
 		if commit.ParentOID != parent {
 			return ErrFinishUnsafe
 		}
-		if err := verifyFinishCommit(ctx, repo, state.FinishPublicationCommit{OID: commit.OID, ParentOID: parent, TreeOID: commit.TreeOID}); err != nil {
+		if err := verifyFinishHistoryCommit(ctx, repo, p.Version, commit); err != nil {
 			return err
 		}
 		message, err := commitMessage(ctx, repo, commit.OID)
@@ -176,6 +189,40 @@ func ValidateFinishHistoryProof(ctx context.Context, repo string, p state.Finish
 	}
 	after, err := RevParse(ctx, repo, p.NewHead+"^{tree}")
 	if err != nil || before != after {
+		return errors.Join(err, ErrFinishUnsafe)
+	}
+	return nil
+}
+
+func verifyFinishHistoryCommit(ctx context.Context, repo string, version int, commit state.FinishHistoryCommit) error {
+	if version == 1 {
+		return verifyFinishCommit(ctx, repo, state.FinishPublicationCommit{OID: commit.OID, ParentOID: commit.ParentOID, TreeOID: commit.TreeOID})
+	}
+	parents, err := parentsOf(ctx, repo, commit.AuthorOID)
+	if err != nil {
+		return err
+	}
+	expected := []string{}
+	if commit.ParentOID != "" {
+		expected = append(expected, commit.ParentOID)
+	}
+	if len(parents) > 1 {
+		expected = append(expected, parents[1:]...)
+		tree, err := RevParse(ctx, repo, commit.AuthorOID+"^{tree}")
+		if err != nil || tree != commit.TreeOID {
+			return errors.Join(err, ErrFinishUnsafe)
+		}
+		message, err := commitMessage(ctx, repo, commit.AuthorOID)
+		if err != nil || strings.TrimRight(message, "\n") != strings.TrimRight(commit.Message, "\n") {
+			return errors.Join(err, ErrFinishUnsafe)
+		}
+	}
+	actual, err := parentsOf(ctx, repo, commit.OID)
+	if err != nil || !slices.Equal(actual, expected) {
+		return errors.Join(err, ErrFinishUnsafe)
+	}
+	tree, err := RevParse(ctx, repo, commit.OID+"^{tree}")
+	if err != nil || tree != commit.TreeOID {
 		return errors.Join(err, ErrFinishUnsafe)
 	}
 	return nil

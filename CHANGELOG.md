@@ -24,6 +24,9 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Preserve untouched newer merges when rewriting an earlier linear range,
+  including their exact side parents, message, author and final tree.
+  Refuse a merge whose side branch would retain the selected old commits.
 - Independently partition oversized whole-version Intent commits before
   publication, even when the original plan supplies a size explanation.
   Apply the same measured split review to new Intent history rewrites.

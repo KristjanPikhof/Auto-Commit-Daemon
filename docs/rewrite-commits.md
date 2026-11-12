@@ -19,7 +19,10 @@ acd history rewrite --apply PLAN_ID --yes
 Use `--plan-out rewrite.json` for a standalone plan file. `--show-plan` and
 `--apply` accept a saved ID or file. Select a contiguous linear range with
 `--last`, `--from-sha`, `--from-nr`, `--range-sha`, or `--range-nr`. Numeric
-positions count from HEAD as 1. Merge commits and unsafe Git states are rejected.
+positions count from HEAD as 1. Selecting a merge or an unsafe Git state is
+rejected. Newer merges outside the selected range retain their side parents,
+message, author and tree. ACD refuses the rewrite if a side branch would keep
+the selected old commits reachable.
 
 ## Choose the rewrite
 
