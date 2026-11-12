@@ -123,7 +123,9 @@ limit within the overall finish deadline.
 With a project check, Intent can use exact lines from the saved target to split
 edits within a file. If a recorded version blocks a split, ACD can offer exact
 lines for that path in the correction while keeping other recorded changes.
-With `none`, Intent groups whole recorded versions.
+With `none`, Intent groups whole recorded versions. If two edits were saved
+together and no checkpoint separates them, Intent can keep them in one commit
+while separating other work.
 
 Existing `fast` and `full` settings resolve to `project` using the selected
 command and its existing timeout. Old `structural` settings resolve to `none`.

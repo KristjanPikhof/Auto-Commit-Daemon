@@ -24,6 +24,8 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Let Intent keep inseparable saved edits together when project checks are
+  off. Keep the rest of the work in separate, verified commits.
 - Replace Fast and Full with one optional project check. Setup defaults to
   `none`. Existing checks keep their selected command and timeout, and saved
   requests keep their verification identity.

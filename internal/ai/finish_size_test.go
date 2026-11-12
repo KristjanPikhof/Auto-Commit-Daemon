@@ -143,6 +143,17 @@ func TestFinishBlockedNewPolicyNeedsNewEvidence(t *testing.T) {
 	}
 }
 
+func TestFinishWholeVersionPromptKeepsOnlyInseparableEditsTogether(t *testing.T) {
+	strict := finishPrompt(FinishPlanRequest{RefineRecorded: true})
+	grouped := finishPrompt(FinishPlanRequest{GroupIndivisibleVersions: true})
+	if !strings.Contains(strict, finishStrictBoundaries) || !strings.Contains(strict, "exact change ID") {
+		t.Fatal("checked refinement lost its boundary instructions")
+	}
+	if strings.Contains(grouped, finishStrictBoundaries) || !strings.Contains(grouped, finishWholeVersionBoundaries) {
+		t.Fatal("whole-version planning received conflicting boundary instructions")
+	}
+}
+
 func TestFinishReviewSchemaKeepsLegacyAndExactContracts(t *testing.T) {
 	for _, scenario := range []string{"new", "source", "legacy", "exact", "history"} {
 		request := FinishPlanRequest{Style: "imperative", ReviewLineTarget: FinishReviewLineTarget}

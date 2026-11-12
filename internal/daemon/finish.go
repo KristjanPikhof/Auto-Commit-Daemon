@@ -962,6 +962,8 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}}
+	options.GroupIndivisibleVersions = r.Target.Version >= state.FinishRecordedGroupingVersion &&
+		r.Target.Message == "" && !r.Target.SourceSelection && !r.Target.RecordedSourceSelection
 	if len(sourceFiles) > 0 || options.ReviewLineTarget > 0 {
 		options.VerifyPlan = verifyPlan
 	}

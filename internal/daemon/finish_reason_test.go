@@ -52,6 +52,69 @@ func TestFinishWorkerProtectsWorkWhenDecisionsCannotBeExplained(t *testing.T) {
 	}
 }
 
+func TestFinishWorkerKeepsIndivisibleVersionTogether(t *testing.T) {
+	f, w := finishWorkerFixture(t)
+	finishWrite(t, f.dir, "tasks.sh", "group() { printf flat; }\ncapture() { printf task; }\n")
+	finishWorkerGit(t, f.dir, "add", "tasks.sh")
+	finishWorkerGit(t, f.dir, "commit", "-m", "Seed task controls")
+	w.Config.Mode, w.Config.VerificationMode = "intent", "none"
+	w.Config.Provider.DiffEgress = true
+
+	finishWrite(t, f.dir, "tasks.sh", "group() { printf active; }\ncapture() { printf note; }\n")
+	finishCaptureVersion(t, w)
+	final := "group() { printf 'active completed'; }\ncapture() { printf note; }\n"
+	finishWrite(t, f.dir, "tasks.sh", final)
+	finishWrite(t, f.dir, "operations.md", "Restart the relay before reconnecting.\n")
+
+	w.Transport = &finishTestTransport{exchange: func(_ context.Context, request ai.FinishPlanRequest) ([]byte, error) {
+		if !request.GroupIndivisibleVersions || request.RefineRecorded || len(request.SourceEdits) != 0 {
+			t.Fatal("unchecked request did not restrict planning to whole versions")
+		}
+		var mixedID string
+		goals := []finish.Goal{
+			{Purpose: "Group tasks and default captures to notes", Reason: "Separate active and completed tasks and open dictated captures as notes by default.", Message: "Group tasks and default captures to notes\n\n- Separate active and completed tasks and open dictated captures as\n  notes by default."},
+			{Purpose: "Document relay restart order", Boundary: "Keep relay operations independent of task controls", Reason: "Tell operators when to restart the relay so they reconnect in order.", Message: "Document relay restart order\n\n- Tell operators when to restart the relay so they reconnect in order."},
+		}
+		for _, change := range request.Changes {
+			switch change.Path {
+			case "tasks.sh":
+				goals[0].ChangeIDs = append(goals[0].ChangeIDs, change.ID)
+				if strings.HasPrefix(change.ID, "checkpoint-") {
+					mixedID = change.ID
+				}
+			case "operations.md":
+				goals[1].ChangeIDs = append(goals[1].ChangeIDs, change.ID)
+			}
+		}
+		if mixedID == "" {
+			t.Fatal("missing mixed checkpoint")
+		}
+		if request.Correction == nil {
+			return json.Marshal(map[string]any{"blocked_reason": mixedID + " combines task grouping and dictated capture defaults."})
+		}
+		goals[0].Boundary = "The first saved version " + mixedID + " contains both task behaviors"
+		return json.Marshal(map[string]any{"goals": goals})
+	}}
+
+	request := startFinishWorker(t, w, FinishOptions{})
+	completed, err := w.Execute(t.Context(), request.ID)
+	if err != nil || completed.State != state.FinishCompleted || completed.PlanningCalls != 2 {
+		t.Fatalf("finish did not publish the complete plan: %s %v", completed.State, err)
+	}
+	var plan FinishSavedPlan
+	if err := json.Unmarshal(completed.Plan, &plan); err != nil || len(plan.Steps) != 2 || plan.Source != nil {
+		t.Fatalf("finish did not preserve two whole-version steps: %+v: %v", plan.Steps, err)
+	}
+	for _, step := range plan.Steps {
+		if step.Check.Executed || step.Check.Result.Status != verification.StatusPassed {
+			t.Fatalf("unexpected project check or failed structural check: %+v", step.Check)
+		}
+	}
+	if head := finishWorkerGit(t, f.dir, "rev-parse", "HEAD^{tree}"); head != request.Target.TargetTree {
+		t.Fatal("published tree differs from the saved target")
+	}
+}
+
 func TestFinishWorkerChecksFieldDefinitionsBeforeConsumers(t *testing.T) {
 	for _, consumerFirst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "valid prerequisite", true: "broken intermediate"}[consumerFirst], func(t *testing.T) {

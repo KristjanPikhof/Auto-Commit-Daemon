@@ -180,6 +180,10 @@ there is no background semantic retry or silent Local fallback.
 A valid grounded plan can become one whole-batch goal only when it passes the
 same dependency, materialization, and verification checks. Never create generic
 per-file commits to escape a rejected plan.
+Version-seven requests without project checks can keep independent outcomes
+together when one recorded version contains both and no intermediate version
+separates them. Keep that group as small as possible, explain the boundary,
+and preserve every useful split elsewhere in the plan.
 
 Client disconnect detaches from the accepted bounded job. Restart fails running
 planning retryably and recovers prepared publication without AI only through exact

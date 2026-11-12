@@ -118,6 +118,10 @@ If the correction still cannot separate the changes safely, finish explains
 the problem and keeps the work protected. A new finish can use newly approved
 checks or checkpoints that capture smaller completed steps.
 
+With project checks off, Intent can keep both outcomes in the smallest
+complete commit that uses the indivisible version. It still splits other
+separable work and checks the entire chain before publishing.
+
 Enable and approve a project check in `acd config` to let new requests
 construct and check intermediate versions. Earlier requests
 keep their original planning rules and frozen evidence on retry.
