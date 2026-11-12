@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/config"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
@@ -15,6 +16,36 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/supervisor"
 )
+
+func TestHistoryStartValidationUsesRequestedBudget(t *testing.T) {
+	lookup, _, _ := finishCLIFixture(t)
+	serveIntentHistoryWorker(t, lookup, controlTestRPC(func(_ context.Context, req supervisor.Request) (any, *supervisor.ProtocolError) {
+		var params finishHistoryParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			t.Error(err)
+		}
+		want := 30 * time.Second
+		if req.Method == "history_start" || req.Method == "history_save" {
+			want = supervisor.CheckpointBarrierTimeout
+			if params.Timeout > 0 {
+				want = params.Timeout
+			}
+		}
+		remaining := time.Until(time.UnixMilli(req.DeadlineMS))
+		if remaining < want-5*time.Second || remaining > want {
+			t.Errorf("history validation deadline %s, want %s", remaining, want)
+		}
+		return state.FinishHistoryRequest{PlanID: "budget", Status: "saved"}, nil
+	}))
+	for _, scenario := range []struct {
+		method  string
+		timeout time.Duration
+	}{{"history_start", 2 * time.Minute}, {"history_save", 0}, {"history_status", 2 * time.Minute}} {
+		if _, err := historyRequest(t.Context(), lookup, scenario.method, finishHistoryParams{PlanID: "budget", Timeout: scenario.timeout}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func historyCLIPlan(t *testing.T, runtime *workerRuntime, lookup controlRepoLookup, target string) state.IntentHistoryPlan {
 	t.Helper()

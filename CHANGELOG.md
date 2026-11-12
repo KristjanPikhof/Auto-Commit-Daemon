@@ -24,6 +24,9 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Let history start and save validate large plans within the requested
+  budget instead of a fixed 30-second connection limit. Keep worker errors
+  visible and show the tree-check phase before acceptance.
 - Order new Xcode source files and declared resource inputs before their
   build references, while preserving reviewed commit memberships.
 - Give focused split reviews exact approved diffs when they fit, and
