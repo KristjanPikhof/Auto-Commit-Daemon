@@ -55,6 +55,8 @@ func finishStageLabel(stage string) string {
 		return "Preparing saved changes."
 	case "planning":
 		return "Waiting for Intent to propose commits."
+	case "assigning_paths":
+		return "Assigning remaining files to proposed commits."
 	case "verifying":
 		return "Checking the proposed commits."
 	case "publishing", "prepared":

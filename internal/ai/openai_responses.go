@@ -14,7 +14,7 @@ func marshalFinishToolRequest(opts openAIToolRequestOptions) ([]byte, error) {
 		return marshalOpenAIToolRequest(opts)
 	}
 	effort := "high"
-	if opts.ToolName == "finish_evidence" {
+	if opts.ToolName != "finish_plan" {
 		effort = "medium"
 	}
 	return json.Marshal(struct {

@@ -958,12 +958,16 @@ func (w *FinishWorker) plan(ctx context.Context, wt git.Worktree, cfg FinishWork
 	}, BeforeEvidenceCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishEvidenceCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
+	}, BeforeAssignmentCall: func(callCtx context.Context) error {
+		_, err := state.ConsumeFinishAssignmentCall(callCtx, w.DB, r.ID, r.Attempt)
+		return err
 	}, BeforeCall: func(callCtx context.Context) error {
 		_, err := state.ConsumeFinishPlanningCall(callCtx, w.DB, r.ID, r.Attempt)
 		return err
 	}}
 	options.GroupIndivisibleVersions = r.Target.Version >= state.FinishRecordedGroupingVersion &&
 		r.Target.Message == "" && !r.Target.SourceSelection && !r.Target.RecordedSourceSelection
+	options.AllowPathOwnership = r.Target.Version >= state.FinishPathOwnershipVersion && options.GroupIndivisibleVersions
 	if len(sourceFiles) > 0 || options.ReviewLineTarget > 0 {
 		options.VerifyPlan = verifyPlan
 	}

@@ -85,8 +85,13 @@ func writeFinishChatResponse(t *testing.T, w http.ResponseWriter, r finishChatRe
 
 func writeFinishChatArguments(t *testing.T, w http.ResponseWriter, arguments string) {
 	t.Helper()
+	writeFinishChatToolArguments(t, w, "finish_plan", arguments)
+}
+
+func writeFinishChatToolArguments(t *testing.T, w http.ResponseWriter, tool, arguments string) {
+	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"type": "function", "function": map[string]any{"name": "finish_plan", "arguments": arguments}}}}}}})
+	err := json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]any{"tool_calls": []any{map[string]any{"type": "function", "function": map[string]any{"name": tool, "arguments": arguments}}}}}}})
 	if err != nil {
 		t.Error(err)
 	}
@@ -531,7 +536,7 @@ func TestFinishFaultRunningRequestRestartRequiresFrozenRetry(t *testing.T) {
 }
 
 func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
-	var reviews, plans, corrections atomic.Int32
+	var reviews, plans, corrections, assignments atomic.Int32
 	var f *finishFixture
 	richSummary := strings.Repeat("Preserve the complete recorded library and its consumer. ", 20)
 	large := "first recorded line\n" + strings.Repeat("complete library entry\n", 70000) + "last recorded line\n"
@@ -542,6 +547,16 @@ func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 			return
 		}
 		request := decodeFinishChatRequest(t, r)
+		if task := request.Plan.AssignPaths; task != nil {
+			assignments.Add(1)
+			if len(task.Paths) != 1 || task.Paths[0] != "consumer.txt" ||
+				len(task.Goals) != 1 || len(request.Plan.Reviews) != 1 ||
+				request.Plan.Reviews[0].ChangeID != "consumer.txt" {
+				t.Error("assignment did not receive the omitted consumer and its saved review")
+			}
+			writeFinishChatToolArguments(t, w, "finish_assign_paths", `{"assignments":[{"path":"consumer.txt","goal":1}]}`)
+			return
+		}
 		if request.Plan.Review != nil {
 			first := reviews.Add(1) == 1
 			if first {
@@ -575,13 +590,13 @@ func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 			}
 		}
 		writeFile(t, filepath.Join(f.Repo, "library.txt"), "later edit stays outside this finish\n")
-		writeFinishChatResponse(t, w, request)
+		writeFinishLibraryProposal(t, w, []string{"library.txt"})
 	}, "60s")
 	writeFile(t, filepath.Join(f.Repo, "library.txt"), large)
 	writeFile(t, filepath.Join(f.Repo, "consumer.txt"), "Use the recorded library\n")
 	result := finishRunJSON(t, f, "finish", "Preserve completed library and consumer")
-	if !result.OK || !result.Data.Published || result.Data.PlanningCalls != 1 || result.Data.EvidenceCalls != int(reviews.Load()) || reviews.Load() < 3 || plans.Load() != 1 || corrections.Load() != 1 {
-		t.Fatalf("large real finish: %+v reviews=%d plans=%d", result, reviews.Load(), plans.Load())
+	if !result.OK || !result.Data.Published || result.Data.PlanningCalls != 1 || result.Data.EvidenceCalls != int(reviews.Load()) || result.Data.AssignmentCalls != 1 || assignments.Load() != 1 || reviews.Load() < 3 || plans.Load() != 1 || corrections.Load() != 1 {
+		t.Fatalf("large real finish: %s reviews=%d assignments=%d plans=%d", result.Data.Reason, reviews.Load(), assignments.Load(), plans.Load())
 	}
 	if got := runGitOK(t, f.Repo, "show", "HEAD:library.txt"); got != large {
 		t.Fatal("published library lost full contents")
@@ -594,6 +609,23 @@ func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 	}
 	f.Barrier(t, t.Context())
 	finishAssertSavedViews(t, f, 1)
+}
+
+func writeFinishLibraryProposal(t *testing.T, w http.ResponseWriter, ids []string) {
+	t.Helper()
+	const reason = "Keep the complete recorded library available with the files that use its entries."
+	const sizeReason = "The complete library data is one recorded version, and its companion files use the entries from that version."
+	goal := finish.Goal{
+		Purpose: "Preserve the complete library", Boundary: "Keep the recorded library entries with their consumers",
+		Reason: reason, LargeChangeReason: sizeReason,
+		Message: "Preserve the complete library\n\n- " + reason + "\n- " + sizeReason, ChangeIDs: ids,
+	}
+	body, err := json.Marshal(map[string]any{"goals": []finish.Goal{goal}})
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	writeFinishChatArguments(t, w, string(body))
 }
 
 func TestFinishReviewRetryResumesAfterWorkerRestart(t *testing.T) {
@@ -634,7 +666,11 @@ func TestFinishReviewRetryResumesAfterWorkerRestart(t *testing.T) {
 			return
 		}
 		plans.Add(1)
-		writeFinishChatResponse(t, w, request)
+		ids := make([]string, 0, len(request.Plan.Changes))
+		for _, change := range request.Plan.Changes {
+			ids = append(ids, change.ID)
+		}
+		writeFinishLibraryProposal(t, w, ids)
 	}, "60s")
 	for i := 0; i < 156; i++ {
 		writeFile(t, filepath.Join(f.Repo, fmt.Sprintf("library-%03d.txt", i)), "Complete recorded library value\n")
@@ -650,7 +686,7 @@ func TestFinishReviewRetryResumesAfterWorkerRestart(t *testing.T) {
 	retry.Store(true)
 	completed := finishRunJSON(t, f, "finish", "--retry", failed.Data.ID, "--timeout", "120s")
 	if !completed.OK || !completed.Data.Published || completed.Data.Attempt != 2 || completed.Data.ReusedFragments != failed.Data.ReviewedFragments || completed.Data.ReviewedFragments != completed.Data.ReviewFragments || completed.Data.PlanningCalls != 1 || plans.Load() != 1 || !reflect.DeepEqual(completed.Data.Target, failed.Data.Target) {
-		t.Fatalf("retry lost frozen proof or review progress: %+v", completed)
+		t.Fatalf("retry lost frozen proof or review progress: %s reused=%d reviewed=%d/%d", completed.Data.Reason, completed.Data.ReusedFragments, completed.Data.ReviewedFragments, completed.Data.ReviewFragments)
 	}
 	if completed.Data.DeadlineTS-completed.Data.CreatedTS < 119 {
 		t.Fatal("explicit retry timeout ignored")

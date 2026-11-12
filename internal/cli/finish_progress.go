@@ -45,7 +45,7 @@ func (p *finishProgress) update(r finishWorkerResponse, now time.Time) {
 	}
 	p.label, p.lastPrinted = label, now
 	switch r.Stage {
-	case "reviewing_evidence", "planning":
+	case "reviewing_evidence", "planning", "assigning_paths":
 		if r.DeadlineTS > 0 {
 			label += fmt.Sprintf(" (%s remaining)", formatDurationCompact(finishProgressTime(r.DeadlineTS).Sub(now)))
 		}

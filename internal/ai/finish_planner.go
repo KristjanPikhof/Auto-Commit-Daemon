@@ -64,6 +64,7 @@ type FinishPlanRequest struct {
 	DiffIncluded             bool                      `json:"diff_included"`
 	Correction               *FinishCorrection         `json:"correction,omitempty"`
 	Review                   *FinishReviewTask         `json:"evidence_review,omitempty"`
+	AssignPaths              *finishPathAssignmentTask `json:"assign_paths,omitempty"`
 	Reviews                  []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	HistoryCommits           []HistoryMessageCommit    `json:"history_commits,omitempty"`
 	SourceEdits              []FinishSourceEdit        `json:"source_edits,omitempty"`
@@ -72,6 +73,7 @@ type FinishPlanRequest struct {
 	ReviewLineTarget         int                       `json:"review_line_target,omitempty"`
 	RefineRecorded           bool                      `json:"refine_recorded,omitempty"`
 	GroupIndivisibleVersions bool                      `json:"group_indivisible_versions,omitempty"`
+	AllowPathOwnership       bool                      `json:"allow_path_ownership,omitempty"`
 	// Only names already present in approved redacted diffs are included.
 	ReferencedUnchangedPaths []string `json:"referenced_unchanged_paths,omitempty"`
 }
@@ -92,6 +94,7 @@ type FinishOptions struct {
 	RefineBoundary func(context.Context, string) (FinishBoundaryRefinement, error)
 	// A plan limited to whole versions can keep inseparable edits together.
 	GroupIndivisibleVersions bool
+	AllowPathOwnership       bool
 	// VerifyPlan checks the materialized chain, including its measured sizes.
 	// It shares the persisted deadline and single correction budget, and never
 	// publishes a branch.
@@ -102,11 +105,12 @@ type FinishOptions struct {
 	RequireCompletionContext bool
 	// BeforeCall consumes the worker-owned durable budget immediately before
 	// each actual exchange, including the optional combined correction.
-	BeforeCall         func(context.Context) error
-	BeforeEvidenceCall func(context.Context) error
-	ReviewIdentity     string
-	ReviewProgress     finish.ReviewProgress
-	SaveReviewProgress func(context.Context, finish.ReviewProgress) error
+	BeforeCall           func(context.Context) error
+	BeforeEvidenceCall   func(context.Context) error
+	BeforeAssignmentCall func(context.Context) error
+	ReviewIdentity       string
+	ReviewProgress       finish.ReviewProgress
+	SaveReviewProgress   func(context.Context, finish.ReviewProgress) error
 }
 
 type FinishBoundaryRefinement struct {
@@ -118,6 +122,7 @@ type FinishBoundaryRefinement struct {
 
 type FinishDisclosure struct {
 	EvidenceCalls        int                       `json:"evidence_calls,omitempty"`
+	AssignmentCalls      int                       `json:"assignment_calls,omitempty"`
 	EvidenceRequestBytes []int                     `json:"evidence_request_bytes,omitempty"`
 	EvidenceReviews      []FinishReviewObservation `json:"evidence_reviews,omitempty"`
 	ReusedFragments      int                       `json:"reused_fragments,omitempty"`
@@ -296,6 +301,12 @@ func PlanFinish(ctx context.Context, transport FinishTransport, evidence finish.
 		var plan finish.Plan
 		var source *finish.SourcePlan
 		validationErr := exchangeErr
+		if validationErr == nil && request.AllowPathOwnership && len(request.Reviews) > 0 {
+			raw, err = completeFinishPathOwnership(ctx, transport, request, raw, evidence, options, &result.Disclosure)
+			if err != nil {
+				return result, err
+			}
+		}
 		if validationErr == nil {
 			plan, source, validationErr = validateFinishReply(raw, evidence, options)
 		}
@@ -389,7 +400,7 @@ func prepareFinishRequest(evidence finish.Evidence, options FinishOptions) (Fini
 	if !options.DiffEgress {
 		return FinishPlanRequest{}, FinishDisclosure{}, finishFailure("provider_diffs_required", ErrIntentDiffsRequired)
 	}
-	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress, ReviewLineTarget: options.ReviewLineTarget, RefineRecorded: options.RefineBoundary != nil, GroupIndivisibleVersions: options.GroupIndivisibleVersions}
+	request := FinishPlanRequest{Style: options.Style, Purpose: finishRedactText(options.Purpose), Message: finishRedactText(options.Message), DiffIncluded: options.DiffEgress, ReviewLineTarget: options.ReviewLineTarget, RefineRecorded: options.RefineBoundary != nil, GroupIndivisibleVersions: options.GroupIndivisibleVersions, AllowPathOwnership: options.AllowPathOwnership}
 	if len(options.SourceFiles) > 0 {
 		var err error
 		var catalogue []finish.Change
@@ -509,10 +520,12 @@ func finishRedactText(text string) string {
 }
 
 type finishPlanOutput struct {
-	Goals         []finish.Goal         `json:"goals"`
-	BlockedReason string                `json:"blocked_reason"`
-	Ownership     []finishOwnershipRun  `json:"ownership,omitempty"`
-	FileOwnership []finishFileOwnership `json:"file_ownership,omitempty"`
+	Goals            []finish.Goal         `json:"goals"`
+	BlockedReason    string                `json:"blocked_reason"`
+	BlockedChangeIDs []string              `json:"blocked_change_ids,omitempty"`
+	Ownership        []finishOwnershipRun  `json:"ownership,omitempty"`
+	FileOwnership    []finishFileOwnership `json:"file_ownership,omitempty"`
+	PathOwnership    []finishPathOwnership `json:"path_ownership,omitempty"`
 }
 
 func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, error) {
@@ -520,22 +533,33 @@ func validateFinishOutput(raw []byte, evidence finish.Evidence, options FinishOp
 	return plan, err
 }
 
-func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, *finish.SourcePlan, error) {
-	if !utf8.Valid(raw) {
-		return finish.Plan{}, nil, errors.New("provider output is not valid UTF-8")
-	}
+func decodeFinishPlanOutput(raw []byte) (finishPlanOutput, error) {
 	var output finishPlanOutput
+	if !utf8.Valid(raw) {
+		return output, errors.New("provider output is not valid UTF-8")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&output); err != nil {
-		return finish.Plan{}, nil, fmt.Errorf("decode finish goals: %w", err)
+		return output, fmt.Errorf("decode finish goals: %w", err)
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		return finish.Plan{}, nil, errors.New("provider output must contain exactly one JSON object")
+		return output, errors.New("provider output must contain exactly one JSON object")
+	}
+	return output, nil
+}
+
+func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOptions) (finish.Plan, *finish.SourcePlan, error) {
+	output, decodeErr := decodeFinishPlanOutput(raw)
+	if decodeErr != nil {
+		return finish.Plan{}, nil, decodeErr
 	}
 	if strings.TrimSpace(output.BlockedReason) != "" {
 		if len(options.SourceFiles) > 0 {
 			return finish.Plan{}, nil, &finishBoundariesError{Reason: fmt.Sprintf("%s. Consider a complete independently testable API, model or processing prerequisite before the separate UI consumer. The later UI goal may connect the available feature without inventing an old-layout variant. Return complete ownership for candidate checks unless exact edit IDs demonstrate a conflict that no prerequisite-first order resolves", output.BlockedReason)}
+		}
+		if options.AllowPathOwnership && !namesRecordedConflict(evidence.Changes, output.BlockedChangeIDs) {
+			return finish.Plan{}, nil, fmt.Errorf("provider did not propose a complete plan: %s. Return the best grounded memberships using path_ownership for whole files and coherent directories. ACD checks coverage and orders recorded prerequisites. Name exact conflicting change IDs only when no complete plan is possible", output.BlockedReason)
 		}
 		return finish.Plan{}, nil, &finishBoundariesError{Reason: output.BlockedReason}
 	}
@@ -572,6 +596,19 @@ func validateFinishReply(raw []byte, evidence finish.Evidence, options FinishOpt
 		}
 	} else if output.Ownership != nil || output.FileOwnership != nil {
 		return finish.Plan{}, nil, errors.New("ownership runs require a source-selection request")
+	}
+	if len(output.PathOwnership) > 0 {
+		if !options.AllowPathOwnership || len(options.SourceFiles) > 0 {
+			return finish.Plan{}, nil, errors.New("path_ownership requires a whole-version finish request")
+		}
+		if err := expandFinishPathOwnership(evidence.Changes, output.Goals, output.PathOwnership); err != nil {
+			return finish.Plan{}, nil, err
+		}
+	}
+	if options.AllowPathOwnership {
+		if err := finishPathCoverage(evidence, output.Goals); err != nil {
+			validationErrors = append(validationErrors, err)
+		}
 	}
 	for index, goal := range output.Goals {
 		if options.Message == "" {

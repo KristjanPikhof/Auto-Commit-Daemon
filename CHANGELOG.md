@@ -24,6 +24,17 @@
   compilation fit the existing five-minute job limit without dropping tests.
 - Require Go 1.27.4 for source builds, CI, and releases to include the
   standard-library security fixes that unblock vulnerability checks.
+- Fill omitted files in large Intent plans in bounded batches using the
+  existing goals and saved reviews. Report assignment progress separately
+  from review and global planning.
+- Ignore empty path assignments in Intent replies and report the invalid goal
+  number if a nonempty assignment cannot be used.
+- Use exact change assignments ahead of file and directory defaults. This
+  lets Intent split one file's versions while grouping its neighboring files.
+- Let Intent assign whole files and coherent directories in one selection.
+  ACD expands the selections and checks coverage before verifying the chain.
+  A provider's uncertainty about coverage no longer appears as a proven
+  conflict in the saved versions.
 - Let Intent keep inseparable saved edits together when project checks are
   off. Keep the rest of the work in separate, verified commits.
 - Replace Fast and Full with one optional project check. Setup defaults to

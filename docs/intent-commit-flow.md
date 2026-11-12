@@ -153,7 +153,7 @@ binary objects, deletions, and unchanged entries.
 Small requests use one planning exchange and at most one combined correction.
 Requests exceeding the direct planning budget first review complete evidence in bounded batches,
 then make one global plan across all recorded changes. At most 128 evidence
-reviews are allowed, with at most four immutable provider exchanges at once.
+review and file assignment calls are allowed, with up to four reviews at once.
 The worker reserves each call before releasing its operation gate and continues
 protecting later edits while reviews run. All calls share one persisted deadline, using `ai.timeout` (five minutes by
 default) or an explicit `--timeout 15m` for the new attempt. Messages
@@ -176,6 +176,17 @@ selection once. Unknown files, duplicate entries, gaps and invalid endpoints
 are rejected. The planner still chooses the purposes, owners and prerequisite
 order across all files. Annotated diffs retain every edit ID and its exact code;
 duplicate per-line coordinates and the full repeated ID list stay local.
+
+Whole-version plans can name a file or directory once when all its recorded
+changes belong to the same goal. Intent still names exact change IDs when a
+file has versions in different commits. Exact change IDs take precedence over
+file assignments, and the most specific directory covers files left over. ACD
+rejects conflicting owners for the same selector and checks the complete
+coverage and prerequisite order before building the chain.
+If a large reviewed proposal leaves files unassigned, Intent can assign the
+omitted whole files to existing goals in batches of up to 16. These calls use
+the saved reviews and share the attempt's evidence call limit and deadline.
+Only the global plan or its correction can introduce or change a goal.
 
 The request contains bounded metadata, redacted supplied context, and approved
 text diffs. Each encoded review is bounded to 512 KiB. The global catalogue

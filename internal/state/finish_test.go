@@ -360,6 +360,9 @@ func TestFinishEvidenceBudgetSurvivesRestart(t *testing.T) {
 	if _, err := ConsumeFinishPlanningCall(ctx, db, r.ID, r.Attempt); err != nil {
 		t.Fatal("review consumed planning allowance", err)
 	}
+	if _, err := ConsumeFinishAssignmentCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("assignment bypassed the spent review budget", err)
+	}
 	if _, err := InterruptFinishRequests(ctx, db, r.Target.WorktreeID); err != nil {
 		t.Fatal(err)
 	}
@@ -373,6 +376,28 @@ func TestFinishEvidenceBudgetSurvivesRestart(t *testing.T) {
 	}
 	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
 		t.Fatal("stale attempt reserved a call", err)
+	}
+}
+
+func TestFinishAssignmentCallsFollowPlanningAndReportProgress(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := t.Context()
+	r := startFinishFixture(t, db, finishFixture(t, db, 1))
+	if _, err := ConsumeFinishAssignmentCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("assigned files before a global plan", err)
+	}
+	if _, err := ConsumeFinishPlanningCall(ctx, db, r.ID, r.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ConsumeFinishEvidenceCall(ctx, db, r.ID, r.Attempt); !errors.Is(err, ErrFinishBudget) {
+		t.Fatal("review ran after global planning", err)
+	}
+	if n, err := ConsumeFinishAssignmentCall(ctx, db, r.ID, r.Attempt); err != nil || n != 1 {
+		t.Fatalf("reserve assignment: %d %v", n, err)
+	}
+	got, err := LoadFinishRequest(ctx, db, r.ID)
+	if err != nil || got.AssignmentCalls != 1 || got.PlanningCalls != 1 || got.EvidenceCalls != 0 || got.Stage != "assigning_paths" {
+		t.Fatalf("assignment progress: %+v %v", got, err)
 	}
 }
 
