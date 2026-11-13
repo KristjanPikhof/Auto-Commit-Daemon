@@ -106,7 +106,7 @@ func (f *finishFixture) Restart(t *testing.T, ctx context.Context) {
 		RepositoryID: f.RepositoryID, WorktreeID: f.WorktreeID,
 	})
 	if err != nil || !response.OK {
-		t.Fatalf("restart worker: response=%+v err=%v", response, err)
+		t.Fatalf("restart worker: response=%+v worker error=%+v transport error=%v", response, response.Error, err)
 	}
 	// Restart acceptance precedes the replacement worker binding its socket.
 	// Retry only connection absence; an accepted worker error is meaningful.

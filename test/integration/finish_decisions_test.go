@@ -254,6 +254,7 @@ func TestFinishWorkflowRepairsCheckedSourceSelections(t *testing.T) {
 }
 
 func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
+	const referenceReason = "The imported notes.txt reference is one recorded file version; splitting its entries would invent an unrecorded partial reference."
 	var reviews, corrections, plans atomic.Int32
 	var rejected atomic.Bool
 	f := finishIntentFixtureWithSettings(t, func(w http.ResponseWriter, r *http.Request) {
@@ -285,7 +286,7 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 		goals := []finish.Goal{
 			{Purpose: "Expose the active camera identity", Boundary: "Supply identity before its consumer", Reason: "Expose the active identity so controls can follow the camera.", Message: "Expose the active camera identity\n\n- Expose the active identity so controls can follow the camera."},
 			{Purpose: "Synchronize camera selection", Boundary: "Consume the available camera identity", Reason: "Read the running camera identity instead of retaining an empty selection.", Message: "Synchronize camera selection\n\n- Read the running camera identity instead of retaining an empty selection."},
-			{Purpose: "Document operational conventions", Boundary: "Keep reference material independently reviewable", Reason: "Make operational conventions available to project contributors.", Message: "Document operational conventions\n\n- Make operational conventions available to project contributors.", ChangeIDs: []string{"notes.txt"}},
+			{Purpose: "Document operational conventions", Boundary: "Keep reference material independently reviewable", Reason: "Make operational conventions available to project contributors.", LargeChangeReason: referenceReason, Message: "Document operational conventions\n\n- Make operational conventions available to project contributors.\n- " + referenceReason, ChangeIDs: []string{"notes.txt"}},
 		}
 		for _, diff := range request.Diffs {
 			if diff.ChangeID == "camera.sh" {
