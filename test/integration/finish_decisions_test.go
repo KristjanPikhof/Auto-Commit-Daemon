@@ -352,10 +352,17 @@ func TestFinishWorkflowReviewedSourceMappings(t *testing.T) {
 	f.BaseHead = strings.TrimSpace(runGitOK(t, f.Repo, "rev-parse", "HEAD"))
 	f.Barrier(t, t.Context())
 	writeFile(t, filepath.Join(f.Repo, "camera.sh"), "active_identity() { printf camera; }\nselected() { active_identity; }\n")
+	f.Barrier(t, t.Context())
 	writeFile(t, filepath.Join(f.Repo, "notes.txt"), strings.Repeat("Rule: retain the operational conventions for contributors.\n", 40000))
-	completed := decodeFinishWorkflow(t, f.Run(t, t.Context(), "finish", "--json"))
+	// This scenario exercises final-only ownership, even when protection has
+	// already retained the camera edit. Explicit staged consent freezes that path.
+	runGitOK(t, f.Repo, "add", "camera.sh", "notes.txt")
+	completed := decodeFinishWorkflow(t, f.Run(t, t.Context(), "finish", "--include-staged", "--json"))
 	if !completed.Published || completed.CommitsCreated != 3 || !completed.Target.SourceSelection || completed.EvidenceCalls != int(reviews.Load()) || corrections.Load() != 1 || plans.Load() != 1 {
 		t.Fatalf("reviewed source mappings were not published: %+v reviews=%d corrections=%d plans=%d", completed, reviews.Load(), corrections.Load(), plans.Load())
+	}
+	if !completed.Target.IncludeStaged || len(completed.Target.Checkpoints) != 0 {
+		t.Fatal("final-only source mapping reused an earlier checkpoint")
 	}
 	if first := runGitOK(t, f.Repo, "show", "HEAD~2:camera.sh"); !strings.Contains(first, "active_identity()") || !strings.Contains(first, "printf none") {
 		t.Fatalf("first source step lost its independent prerequisite: %s", first)
