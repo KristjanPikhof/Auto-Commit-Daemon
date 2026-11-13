@@ -13,6 +13,7 @@ import (
 	"time"
 
 	checkpointpkg "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/checkpoint"
+	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/git"
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/state"
 )
 
@@ -41,7 +42,18 @@ func finishProtectionHas(t *testing.T, f *captureFixture, path, body string) boo
 	if cp == nil {
 		return false
 	}
-	return strings.TrimSpace(finishWorkerGit(t, f.dir, "show", cp.CommitOID+":"+path)) == strings.TrimSpace(body)
+	entries, err := git.LsTree(t.Context(), f.dir, cp.CommitOID, false, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		return false
+	}
+	content, err := git.CatFileBlob(t.Context(), f.dir, entries[0].OID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(content)) == strings.TrimSpace(body)
 }
 func finishProtectionRun(t *testing.T, f *captureFixture, change func(*Options)) (chan struct{}, func()) {
 	t.Helper()
@@ -138,10 +150,16 @@ func TestFinishProtectionSavesIdleAndStopNeverPublish(t *testing.T) {
 func TestFinishProtectionUnsafeGitAndHeadTransitions(t *testing.T) {
 	f := newCaptureFixture(t)
 	wake, stop := finishProtectionRun(t, f, nil)
+	if finishProtectionHas(t, f, "detached.txt", "protected") {
+		t.Fatal("initial checkpoint contains a future edit")
+	}
 	finishWorkerGit(t, f.dir, "checkout", "--detach", "-q")
 	finishWrite(t, f.dir, "detached.txt", "protected")
 	wake <- struct{}{}
-	finishProtectionWait(t, func() bool { cp := finishProtectionLatest(t, f); return cp != nil && cp.ObservedRef == "" })
+	finishProtectionWait(t, func() bool {
+		cp := finishProtectionLatest(t, f)
+		return cp != nil && cp.ObservedRef == "" && finishProtectionHas(t, f, "detached.txt", "protected")
+	})
 	if !finishProtectionHas(t, f, "detached.txt", "protected") {
 		t.Fatal("detached edit missing")
 	}
@@ -153,7 +171,7 @@ func TestFinishProtectionUnsafeGitAndHeadTransitions(t *testing.T) {
 	wake <- struct{}{}
 	finishProtectionWait(t, func() bool {
 		cp := finishProtectionLatest(t, f)
-		return cp != nil && cp.ObservedRef == "refs/heads/next"
+		return cp != nil && cp.ObservedRef == "refs/heads/next" && finishProtectionHas(t, f, "conflicted.txt", "still protected")
 	})
 	if !finishProtectionHas(t, f, "conflicted.txt", "still protected") {
 		t.Fatal("unsafe Git stopped protection")

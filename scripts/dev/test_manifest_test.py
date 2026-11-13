@@ -74,6 +74,34 @@ class ManifestTests(unittest.TestCase):
                 "_parallel_tests": {"./internal/git": ["TestParallel"]},
             })
 
+    def test_timings_include_parallel_children_without_charging_scheduler_wait(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = pathlib.Path(root) / "events.jsonl"
+            package = "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+            events = [
+                {"Time": "2026-11-13T11:30:00Z", "Action": "run", "Test": "TestParent"},
+                {"Time": "2026-11-13T11:30:01Z", "Action": "pause", "Test": "TestParent"},
+                {"Time": "2026-11-13T11:31:00Z", "Action": "cont", "Test": "TestParent"},
+                {"Time": "2026-11-13T11:31:00Z", "Action": "run", "Test": "TestParent/child"},
+                {"Time": "2026-11-13T11:31:35Z", "Action": "pass", "Test": "TestParent/child", "Elapsed": 35},
+                {"Time": "2026-11-13T11:31:35Z", "Action": "pass", "Test": "TestParent", "Elapsed": 0},
+                {"Time": "2026-11-13T11:31:36Z", "Action": "run", "Test": "TestParent"},
+                {"Time": "2026-11-13T11:31:37Z", "Action": "pass", "Test": "TestParent", "Elapsed": 1},
+            ]
+            source.write_text("\n".join(json.dumps(dict(event, Package=package)) for event in events))
+            self.assertEqual(module.timings([source]), {
+                "./internal/daemon": {"TestParent": 36},
+                "_parallel_tests": {"./internal/daemon": ["TestParent"]},
+            })
+
+    def test_timings_do_not_carry_unfinished_tests_between_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            package = "github.com/KristjanPikhof/Auto-Commit-Daemon/internal/daemon"
+            first, second = pathlib.Path(root) / "first.jsonl", pathlib.Path(root) / "second.jsonl"
+            first.write_text(json.dumps({"Time": "2026-11-13T11:30:00Z", "Action": "run", "Package": package, "Test": "TestParent"}))
+            second.write_text(json.dumps({"Time": "2026-11-13T11:35:00Z", "Action": "pass", "Package": package, "Test": "TestParent", "Elapsed": 2}))
+            self.assertEqual(module.timings([first, second]), {"./internal/daemon": {"TestParent": 2}})
+
     def test_balance_cli_reads_parallel_metadata_at_actual_concurrency(self):
         with tempfile.TemporaryDirectory() as root:
             names = pathlib.Path(root) / "names"

@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Measure parallel subtests in shard timings and refresh the recorded workloads
+  so long tests no longer appear to take almost no time.
+- Correct finish integration fixtures, wait for checkpoint contents during
+  branch transitions, and keep temporary Git locks out of copied test repos.
+- Prepare the Go compiler dependencies once before source-check test deadlines,
+  while retaining real compilation and the existing timeout checks.
 - Split hosted AI support tests into two shards per platform so setup and the
   complete suite fit the existing five-minute job limit.
 - Run five hosted integration shards per platform so cold toolchain setup and

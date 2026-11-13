@@ -149,7 +149,7 @@ func finishStartRPC(t *testing.T, f *finishFixture, params map[string]any) state
 	}
 	response, err := supervisor.DoWorker(t.Context(), supervisor.WorkerSocketPath(f.Roots, f.RepositoryID), supervisor.Request{Version: supervisor.ProtocolVersion, ID: "fixture-finish-start", Method: "finish_start", RepositoryID: f.RepositoryID, WorktreeID: f.WorktreeID, Params: raw}, 10*time.Second)
 	if err != nil || !response.OK {
-		t.Fatalf("finish RPC: %+v %v", response, err)
+		t.Fatalf("finish RPC: %+v worker error=%+v transport error=%v", response, response.Error, err)
 	}
 	data, err := json.Marshal(response.Data)
 	if err != nil {
@@ -314,6 +314,7 @@ func TestFinishFaultProviderFailureRetryKeepsFrozenTarget(t *testing.T) {
 
 func TestFinishFaultDisconnectedClientsReconnectToOneRequest(t *testing.T) {
 	t.Parallel()
+	const message = "Complete selected goal\n\n- Keep the approved work separate from later edits."
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{}, 1)
 	defer close(release)
@@ -332,7 +333,7 @@ func TestFinishFaultDisconnectedClientsReconnectToOneRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	resultCh := make(chan ExecResult, 1)
 	go func() {
-		resultCh <- f.Run(t, ctx, "finish", "Complete selected goal", "--message", "Complete selected goal\n\n- Keep the approved work separate from later edits.", "--json")
+		resultCh <- f.Run(t, ctx, "finish", "Complete selected goal", "--message", message, "--json")
 	}()
 	select {
 	case <-entered:
@@ -341,7 +342,7 @@ func TestFinishFaultDisconnectedClientsReconnectToOneRequest(t *testing.T) {
 	}
 	cancel()
 	<-resultCh
-	same := finishStartRPC(t, f, map[string]any{"purpose": "Complete selected goal", "message": "Complete selected goal"})
+	same := finishStartRPC(t, f, map[string]any{"purpose": "Complete selected goal", "message": message})
 	if same.State != state.FinishRunning || calls.Load() != 1 {
 		t.Fatalf("disconnected job %+v calls=%d", same, calls.Load())
 	}
@@ -536,7 +537,7 @@ func TestFinishFaultRunningRequestRestartRequiresFrozenRetry(t *testing.T) {
 }
 
 func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
-	var reviews, plans, corrections, assignments atomic.Int32
+	var reviews, plans, corrections, assignments, partitions atomic.Int32
 	var f *finishFixture
 	richSummary := strings.Repeat("Preserve the complete recorded library and its consumer. ", 20)
 	large := "first recorded line\n" + strings.Repeat("complete library entry\n", 70000) + "last recorded line\n"
@@ -547,6 +548,15 @@ func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 			return
 		}
 		request := decodeFinishChatRequest(t, r)
+		if request.Plan.Partition != nil {
+			partitions.Add(1)
+			var ids []string
+			for _, change := range request.Plan.Changes {
+				ids = append(ids, change.ID)
+			}
+			writeFinishLibraryProposal(t, w, ids, "library.txt")
+			return
+		}
 		if task := request.Plan.AssignPaths; task != nil {
 			assignments.Add(1)
 			if len(task.Paths) != 1 || task.Paths[0] != "consumer.txt" ||
@@ -590,12 +600,12 @@ func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 			}
 		}
 		writeFile(t, filepath.Join(f.Repo, "library.txt"), "later edit stays outside this finish\n")
-		writeFinishLibraryProposal(t, w, []string{"library.txt"})
+		writeFinishLibraryProposal(t, w, []string{"library.txt"}, "library.txt")
 	}, "60s")
 	writeFile(t, filepath.Join(f.Repo, "library.txt"), large)
 	writeFile(t, filepath.Join(f.Repo, "consumer.txt"), "Use the recorded library\n")
 	result := finishRunJSON(t, f, "finish", "Preserve completed library and consumer")
-	if !result.OK || !result.Data.Published || result.Data.PlanningCalls != 1 || result.Data.EvidenceCalls != int(reviews.Load()) || result.Data.AssignmentCalls != 1 || assignments.Load() != 1 || reviews.Load() < 3 || plans.Load() != 1 || corrections.Load() != 1 {
+	if !result.OK || !result.Data.Published || result.Data.PlanningCalls != 1 || result.Data.EvidenceCalls != int(reviews.Load()) || result.Data.AssignmentCalls != 1 || assignments.Load() != 1 || reviews.Load() < 3 || plans.Load() != 1 || corrections.Load() != 1 || result.Data.PartitionCalls != 1 || partitions.Load() != 1 {
 		t.Fatalf("large real finish: %s reviews=%d assignments=%d plans=%d", result.Data.Reason, reviews.Load(), assignments.Load(), plans.Load())
 	}
 	if got := runGitOK(t, f.Repo, "show", "HEAD:library.txt"); got != large {
@@ -611,10 +621,10 @@ func TestFinishLargeTextReviewsThenPublishesFrozenBatch(t *testing.T) {
 	finishAssertSavedViews(t, f, 1)
 }
 
-func writeFinishLibraryProposal(t *testing.T, w http.ResponseWriter, ids []string) {
+func writeFinishLibraryProposal(t *testing.T, w http.ResponseWriter, ids []string, library string) {
 	t.Helper()
 	const reason = "Keep the complete recorded library available with the files that use its entries."
-	const sizeReason = "The complete library data is one recorded version, and its companion files use the entries from that version."
+	sizeReason := fmt.Sprintf("The complete %s dataset is one recorded file version; its entries cannot be split without inventing an unrecorded intermediate dataset.", library)
 	goal := finish.Goal{
 		Purpose: "Preserve the complete library", Boundary: "Keep the recorded library entries with their consumers",
 		Reason: reason, LargeChangeReason: sizeReason,
@@ -629,7 +639,7 @@ func writeFinishLibraryProposal(t *testing.T, w http.ResponseWriter, ids []strin
 }
 
 func TestFinishReviewRetryResumesAfterWorkerRestart(t *testing.T) {
-	var reviews, plans atomic.Int32
+	var reviews, plans, partitions atomic.Int32
 	var retry atomic.Bool
 	var mu sync.Mutex
 	accepted := map[string]bool{}
@@ -642,6 +652,15 @@ func TestFinishReviewRetryResumesAfterWorkerRestart(t *testing.T) {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		request := decodeFinishChatRequest(t, r)
+		if request.Plan.Partition != nil {
+			partitions.Add(1)
+			var ids []string
+			for _, change := range request.Plan.Changes {
+				ids = append(ids, change.ID)
+			}
+			writeFinishLibraryProposal(t, w, ids, "large.txt")
+			return
+		}
 		if request.Plan.Review != nil {
 			call := reviews.Add(1)
 			if !retry.Load() && call > 4 {
@@ -670,7 +689,7 @@ func TestFinishReviewRetryResumesAfterWorkerRestart(t *testing.T) {
 		for _, change := range request.Plan.Changes {
 			ids = append(ids, change.ID)
 		}
-		writeFinishLibraryProposal(t, w, ids)
+		writeFinishLibraryProposal(t, w, ids, "large.txt")
 	}, "60s")
 	for i := 0; i < 156; i++ {
 		writeFile(t, filepath.Join(f.Repo, fmt.Sprintf("library-%03d.txt", i)), "Complete recorded library value\n")
@@ -685,7 +704,7 @@ func TestFinishReviewRetryResumesAfterWorkerRestart(t *testing.T) {
 	f.Barrier(t, t.Context())
 	retry.Store(true)
 	completed := finishRunJSON(t, f, "finish", "--retry", failed.Data.ID, "--timeout", "120s")
-	if !completed.OK || !completed.Data.Published || completed.Data.Attempt != 2 || completed.Data.ReusedFragments != failed.Data.ReviewedFragments || completed.Data.ReviewedFragments != completed.Data.ReviewFragments || completed.Data.PlanningCalls != 1 || plans.Load() != 1 || !reflect.DeepEqual(completed.Data.Target, failed.Data.Target) {
+	if !completed.OK || !completed.Data.Published || completed.Data.Attempt != 2 || completed.Data.ReusedFragments != failed.Data.ReviewedFragments || completed.Data.ReviewedFragments != completed.Data.ReviewFragments || completed.Data.PlanningCalls != 1 || plans.Load() != 1 || completed.Data.PartitionCalls != 1 || partitions.Load() != 1 || !reflect.DeepEqual(completed.Data.Target, failed.Data.Target) {
 		t.Fatalf("retry lost frozen proof or review progress: %s reused=%d reviewed=%d/%d", completed.Data.Reason, completed.Data.ReusedFragments, completed.Data.ReviewedFragments, completed.Data.ReviewFragments)
 	}
 	if completed.Data.DeadlineTS-completed.Data.CreatedTS < 119 {

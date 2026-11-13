@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +21,9 @@ import (
 	"github.com/KristjanPikhof/Auto-Commit-Daemon/internal/verification"
 )
 
+var sourceCompilerOnce sync.Once
+var sourceCompilerErr error
+
 func sourceWorkerFixture(t *testing.T, consumerFirst bool) (*captureFixture, *FinishWorker, string) {
 	t.Helper()
 	f, w := finishWorkerFixture(t)
@@ -26,13 +32,26 @@ func sourceWorkerFixture(t *testing.T, consumerFirst bool) (*captureFixture, *Fi
 	finishWrite(t, f.dir, "camera_test.go", "package camera\nimport \"testing\"\nfunc TestSelected(t *testing.T) { if Selected(Status{}) != \"\" { t.Fatal(\"unexpected\") } }\n")
 	finishWorkerGit(t, f.dir, "add", "go.mod", "camera.go", "camera_test.go")
 	finishWorkerGit(t, f.dir, "commit", "-m", "Seed camera selection")
+	// Prepare the normal (non-race) testing dependencies once, before timing
+	// candidate checks. Concurrent cold compilers can consume their whole budget.
+	sourceCompilerOnce.Do(func() {
+		cmd := exec.CommandContext(t.Context(), "go", "test", "-p=1", "./...")
+		cmd.Dir = f.dir
+		cmd.Env = append(os.Environ(), "GOWORK=off")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			sourceCompilerErr = fmt.Errorf("prepare source compiler: %w\n%s", err, out)
+		}
+	})
+	if sourceCompilerErr != nil {
+		t.Fatal(sourceCompilerErr)
+	}
 	final := "package camera\ntype Status struct { Running bool; CameraID string }\nfunc Selected(s Status) string { return s.CameraID }\n"
 	finishWrite(t, f.dir, "camera.go", final)
 	finishWrite(t, f.dir, "camera_test.go", "package camera\nimport \"testing\"\nfunc TestCameraIdentity(t *testing.T) { if (Status{CameraID: \"camera-A\"}).CameraID != \"camera-A\" { t.Fatal(\"identity\") } }\nfunc TestSelected(t *testing.T) { if Selected(Status{CameraID: \"camera-A\"}) != \"camera-A\" { t.Fatal(\"wrong selection\") } }\n")
 	w.Config.Mode, w.Config.VerificationMode = "intent", "fast"
 	w.Config.Provider.DiffEgress = true
 	w.Config.VerificationTimeout = time.Minute
-	command, err := verification.NewApprovedCommand(f.dir, w.Config.ConfigDigest, verification.ModeFast, "GOWORK=off go test ./...", 30*time.Second)
+	command, err := verification.NewApprovedCommand(f.dir, w.Config.ConfigDigest, verification.ModeFast, "GOWORK=off go test -p=1 ./...", 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

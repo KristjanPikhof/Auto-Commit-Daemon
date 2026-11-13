@@ -304,4 +304,8 @@ has a five-minute limit. The complete workflow and local gate have a five-minute
 checks sharded rather than dropping scenarios.
 
 Set `ACD_TEST_RESULTS_DIR` outside the checkout to retain JSON timings and shard
-manifests. Contribution rules are in [CLAUDE.md](CLAUDE.md). ACD is MIT licensed.
+manifests. Timing estimates include parallel subtests and exclude time spent
+waiting for a parallel slot. Refresh the recorded timings from complete Ubuntu
+and macOS artifacts when the test workload changes; new tests otherwise receive
+a one-second estimate. Contribution rules are in [CLAUDE.md](CLAUDE.md).
+ACD is MIT licensed.
