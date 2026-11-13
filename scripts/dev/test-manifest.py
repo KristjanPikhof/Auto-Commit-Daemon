@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Balance Go top-level tests using recorded durations, retaining every name."""
 import argparse
+import datetime
 import json
 import pathlib
 import re
@@ -35,6 +36,7 @@ def timings(paths):
     result = {}
     parallel = set()
     for path in paths:
+        started, elapsed = {}, {}
         with open(path) as source:
             for line in source:
                 try:
@@ -45,13 +47,29 @@ def timings(paths):
                 if not name or "/" in name:
                     continue
                 package = "./" + event["Package"].split("Auto-Commit-Daemon/", 1)[-1]
-                if event.get("Action") == "pause":
-                    parallel.add((package, name))
+                key = package, name
+                action = event.get("Action")
+                stamp = event.get("Time")
+                now = (datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+                       if stamp else None)
+                if action == "run":
+                    elapsed[key] = 0.0
+                    started.pop(key, None)
+                    if now is not None:
+                        started[key] = now
+                elif action == "cont" and now is not None:
+                    started[key] = now
+                elif action in ("pause", "pass", "fail") and now is not None and key in started:
+                    elapsed[key] = elapsed.get(key, 0.0) + now - started.pop(key)
+                if action == "pause":
+                    parallel.add(key)
                     continue
-                if event.get("Action") not in ("pass", "fail"):
+                if action not in ("pass", "fail"):
                     continue
                 bucket = result.setdefault(package, {})
-                bucket[name] = max(bucket.get(name, 0), event.get("Elapsed", 0.0), 0.001)
+                # Go's Elapsed excludes time spent waiting for parallel subtests.
+                duration = max(event.get("Elapsed", 0.0), elapsed.pop(key, 0.0), 0.001)
+                bucket[name] = max(bucket.get(name, 0), round(duration, 6))
     observed = {}
     for package, name in sorted(parallel):
         if name in result.get(package, {}):
