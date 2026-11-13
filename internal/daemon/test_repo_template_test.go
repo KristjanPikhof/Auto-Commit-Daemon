@@ -82,6 +82,8 @@ func buildDaemonTestRepoTemplate(root, name string, gitignore []byte) (daemonTes
 		{"user.email", "acd-test@example.com"},
 		{"user.name", "ACD Test"},
 		{"commit.gpgsign", "false"},
+		{"maintenance.auto", "false"},
+		{"gc.auto", "0"},
 	} {
 		if _, err := git.Run(ctx, git.RunOpts{Dir: dir}, "config", kv[0], kv[1]); err != nil {
 			return daemonTestRepoTemplate{}, fmt.Errorf("configure %s template %s: %w", name, kv[0], err)

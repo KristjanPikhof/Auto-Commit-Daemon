@@ -750,6 +750,8 @@ func initRepoTemplate() {
 		{"config", "user.email", "acd-integration@example.com"},
 		{"config", "user.name", "ACD Integration"},
 		{"config", "commit.gpgsign", "false"},
+		{"config", "maintenance.auto", "false"},
+		{"config", "gc.auto", "0"},
 	} {
 		if out, err := runGit(dir, args...); err != nil {
 			repoTemplateErr = fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
@@ -778,6 +780,11 @@ func copyRepoTemplate(src, dst string) error {
 			return err
 		}
 		if rel == "." {
+			return nil
+		}
+		// Git's background maintenance can remove a lock after WalkDir sees it.
+		// Locks belong to the source process, never to a copied fixture.
+		if strings.HasPrefix(filepath.ToSlash(rel), ".git/") && strings.HasSuffix(rel, ".lock") {
 			return nil
 		}
 		target := filepath.Join(dst, rel)
